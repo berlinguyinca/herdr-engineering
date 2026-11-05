@@ -27,17 +27,20 @@ Conventions:
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
 import secrets
 import time
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import asyncpg
 
+from .artifact_members import MemberStore, is_member_principal
 from .jsonl_ingest import JsonlIngestor, open_regular
 from .jsonl_ingest import transaction as _transaction
 from .share_bundle import BundleIndex
@@ -116,16 +119,129 @@ def _clean_list(values: Any, what: str, pattern: re.Pattern | None = None, lower
     return out
 
 
+def _member_actor(actor: str | None) -> dict:
+    return {"kind": "member" if is_member_principal(actor) else "operator", "id": actor or "unknown"}
+
+
+async def _may_share(conn: Any, artifact_id: str, principal: str) -> bool:
+    """``ArtifactStore.report_permission(.., "share")``: the owner, or a live grant holding ``share`` or ``admin``."""
+    artifact = await conn.fetchrow("SELECT created_by FROM artifacts WHERE artifact_id=$1", artifact_id)
+    if artifact is None:
+        return False
+    if artifact["created_by"] == principal:
+        return True
+    grant = await conn.fetchrow(
+        "SELECT permissions FROM artifact_acl WHERE artifact_id=$1 AND principal_id=$2 "
+        "AND (expires_at IS NULL OR expires_at > now())", artifact_id, principal)
+    if not grant:
+        return False
+    permissions = grant["permissions"]
+    if isinstance(permissions, str):
+        permissions = json.loads(permissions)
+    return "share" in permissions or "admin" in permissions
+
+
+_SPEND_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext('artifact_share_live_bytes'))"
+
+
 class ShareStore:
-    def __init__(self, conn: Any):
+    def __init__(self, conn: Any, *, lock_connect: Any = None):
+        """``lock_connect`` (an async callable returning a fresh connection) lets ``acquire_spend`` hold the spend lock
+        on a connection of its own, for a store that sits behind a shared adapter connection."""
         self._conn = conn
+        self._lock_connect = lock_connect
+        self._spend: tuple[Any, Any] | None = None
+
+    @asynccontextmanager
+    async def spend_lock(self):
+        """Cross-process lock around reading the live-bytes total and spending it (``mark_live``).
+
+        A transaction-scoped Postgres advisory lock: the API and the worker are different processes, so an in-process
+        lock cannot serialise their approvals.  Released when the transaction ends.
+        """
+        async with _transaction(self._conn) as conn:
+            await conn.execute(_SPEND_LOCK_SQL)
+            yield
+
+    async def acquire_spend(self) -> None:
+        """The same lock as ``spend_lock`` for callers that cannot wrap the work in ``async with`` (a synchronous caller
+        on another thread): held until ``release_spend``.  Not re-entrant."""
+        if self._spend is not None:
+            raise RuntimeError("the spend lock is already held by this store")
+        conn = self._conn if self._lock_connect is None else await self._lock_connect()
+        tx = conn.transaction()
+        try:
+            await tx.start()
+            await conn.execute(_SPEND_LOCK_SQL)
+        except BaseException:
+            await self._end_spend(conn, tx)
+            raise
+        self._spend = (conn, tx)
+
+    async def release_spend(self) -> None:
+        """End the transaction ``acquire_spend`` began.  Commit, so audit rows written meanwhile survive."""
+        held, self._spend = self._spend, None
+        if held is not None:
+            await self._end_spend(*held)
+
+    async def _end_spend(self, conn: Any, tx: Any) -> None:
+        try:
+            try:
+                await tx.commit()
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    await tx.rollback()
+                raise           # a commit that failed means nothing was approved: never report success
+        finally:
+            if conn is not self._conn:
+                await conn.close()
+
+    async def _member_event(self, conn: Any, principal: str, action: str, *, actor: str | None, artifact_id: str | None,
+                            share_id: str | None, audience: str | None, outcome: str, code: str | None = None,
+                            detail: dict | None = None) -> None:
+        await MemberStore(conn).record(
+            principal, action, actor=_member_actor(actor), artifact_id=artifact_id, share_id=share_id,
+            audience=audience if audience in AUDIENCES else None, outcome=outcome, code=code, detail=detail)
 
     # ----------------------------------------------------------------- shares
     async def create(self, *, artifact_id: str, version_id: str, audience: str,
                      allow_emails: list[str] | None = None, allow_groups: list[str] | None = None,
                      expires_at: datetime | None = None, entry: str | None = None,
-                     title: str | None = None, created_by: str | None = None) -> dict:
-        """Create a ``pending`` share after validating the audience rules; returns the row (no token)."""
+                     title: str | None = None, created_by: str | None = None,
+                     member_groups: frozenset[str] | None = None,
+                     member_emails: frozenset[str] | None = None) -> dict:
+        """Create a ``pending`` share after validating the audience rules; returns the row (no token).
+
+        A ``member:`` creator additionally needs the ``share`` permission on the artifact (else ``not_found``) and, for a
+        lab share, an allow-list inside ``member_groups`` / ``member_emails`` (``None`` refuses: fail closed; the caller
+        supplies them, nothing is merged in here).  Every member outcome writes an ``artifact_member_events`` row.
+        """
+        if isinstance(created_by, str) and created_by.startswith(("collab:", "member:")) \
+                and not is_member_principal(created_by):
+            # collab principals never create shares; a malformed "member:" string must not slip into the operator class
+            # (``live_total_bytes`` splits on the SQL prefix ``member:%``, so the two definitions must not disagree).
+            raise ShareError("not found", code="not_found")
+        if not is_member_principal(created_by):
+            return await self._create(artifact_id, version_id, audience, allow_emails, allow_groups, expires_at, entry,
+                                      title, created_by, None, None)
+        try:
+            return await self._create(artifact_id, version_id, audience, allow_emails, allow_groups, expires_at, entry,
+                                      title, created_by, member_groups, member_emails)
+        except ShareError as exc:
+            await self._member_event(self._conn, created_by, "share_create", actor=created_by,
+                                     artifact_id=artifact_id, share_id=None, audience=audience, outcome="refused",
+                                     code=exc.code or "invalid", detail={"reason": str(exc)})
+            raise
+
+    async def _create(self, artifact_id, version_id, audience, allow_emails, allow_groups, expires_at, entry, title,
+                      created_by, member_groups, member_emails) -> dict:
+        member = is_member_principal(created_by)
+        if member:
+            for name, scope in (("member_groups", member_groups), ("member_emails", member_emails)):
+                if isinstance(scope, (str, bytes)):
+                    raise TypeError(f"{name} must be a collection of strings, not a bare string")
+            if member_emails is not None:
+                member_emails = frozenset(e.strip().lower() for e in member_emails)
         if audience not in AUDIENCES:
             raise ShareError("audience must be 'lab' or 'public'")
         emails = _clean_list(allow_emails, "allow_emails", _EMAIL, lower=True)
@@ -148,6 +264,21 @@ class ShareStore:
                 raise ShareError(f"a public share must expire within {PUBLIC_MIN_DAYS}-{PUBLIC_MAX_DAYS} days")
         share_id = "share_" + secrets.token_hex(12)
         async with _transaction(self._conn) as conn:
+            if member:
+                # The usage row lock serialises this insert with the operator's disable-sharing (which updates that
+                # row, then lists open shares): a link is either refused here or visible to that revocation.
+                from .artifact_member_quota import _lock_usage
+                await _lock_usage(conn, created_by)
+                if await conn.fetchval("SELECT sharing_disabled FROM artifact_member_usage WHERE member_principal=$1",
+                                       created_by):
+                    raise ShareError("sharing is disabled for this member", code="sharing_disabled")
+                if not await _may_share(conn, artifact_id, created_by):
+                    raise ShareError("not found", code="not_found")
+                if audience == "lab":
+                    if (member_groups is None or member_emails is None or not set(groups) <= set(member_groups)
+                            or not set(emails) <= set(member_emails)):
+                        raise ShareError("the audience is outside what this member may share with",
+                                         code="member_audience_refused")
             if await conn.fetchval("SELECT 1 FROM artifact_versions WHERE version_id=$1 AND artifact_id=$2",
                                    version_id, artifact_id) is None:
                 raise ShareError("version does not belong to that artifact")
@@ -157,6 +288,9 @@ class ShareStore:
                 f"RETURNING {_COLUMNS}",
                 share_id, artifact_id, version_id, audience, emails, groups, entry, title, expires_at, created_by)
             await self._event(conn, share_id, "created", created_by or "unknown", {"audience": audience})
+            if member:
+                await self._member_event(conn, created_by, "share_create", actor=created_by, artifact_id=artifact_id,
+                                         share_id=share_id, audience=audience, outcome="ok")
         return _row(record)
 
     async def get(self, share_id: str) -> dict | None:
@@ -173,21 +307,46 @@ class ShareStore:
         return [_row(r) for r in records]
 
     async def mark_live(self, share_id: str, *, token_hash: str, index: BundleIndex, approved_by: str) -> dict:
-        """pending -> live, recording the bundle summary and the token hash.  Refused for any other state."""
+        """pending -> live, recording the bundle summary and the token hash.  Refused for any other state.
+
+        For a member-created share the creator's ``share`` permission is re-checked (a grant revoked since create
+        refuses with ``not_found`` and the share stays pending); the outcome is a member event either way.
+        """
         if not isinstance(token_hash, str) or not _HEX64.match(token_hash):
             raise ShareError("token_hash must be 64 lowercase hex characters")
+        seen = await self._conn.fetchrow("SELECT created_by, artifact_id, audience FROM artifact_shares "
+                                         "WHERE share_id=$1", share_id)
+        member = seen is not None and is_member_principal(seen["created_by"])
+        try:
+            return await self._mark_live(share_id, token_hash, index, approved_by, member)
+        except ShareError as exc:
+            if member:
+                await self._member_event(self._conn, seen["created_by"], "share_approve", actor=approved_by,
+                                         artifact_id=seen["artifact_id"], share_id=share_id,
+                                         audience=seen["audience"], outcome="refused", code=exc.code or "invalid",
+                                         detail={"reason": str(exc)})
+            raise
+
+    async def _mark_live(self, share_id: str, token_hash: str, index: BundleIndex, approved_by: str,
+                         member: bool) -> dict:
         async with _transaction(self._conn) as conn:
-            current = await conn.fetchrow("SELECT state, expires_at FROM artifact_shares WHERE share_id=$1 FOR UPDATE",
-                                          share_id)
-            if current is None:
-                raise ShareError("unknown share")
-            if current["state"] != "pending":
-                raise ShareError(f"share is {current['state']}, not pending")
+            # Lock order: the artifact row first (FOR SHARE), then the share row. Purge holds the artifact row FOR UPDATE
+            # and then rewrites the artifact's share rows, so taking them the other way round could deadlock.
             # FOR SHARE: a concurrent delete (which locks the artifact row FOR UPDATE) either finished first, so the link
             # is refused here, or waits for this commit and then revokes the link it finds live
-            lifecycle = await conn.fetchval(
-                "SELECT lifecycle FROM artifacts WHERE artifact_id = (SELECT artifact_id FROM artifact_shares "
-                "WHERE share_id=$1) FOR SHARE", share_id)
+            owner_artifact = await conn.fetchval("SELECT artifact_id FROM artifact_shares WHERE share_id=$1", share_id)
+            lifecycle = None
+            if owner_artifact is not None:
+                lifecycle = await conn.fetchval("SELECT lifecycle FROM artifacts WHERE artifact_id=$1 FOR SHARE",
+                                                owner_artifact)
+            current = await conn.fetchrow("SELECT state, expires_at, created_by, artifact_id, audience FROM "
+                                          "artifact_shares WHERE share_id=$1 FOR UPDATE", share_id)
+            if current is None:
+                raise ShareError("unknown share")
+            if member and not await _may_share(conn, current["artifact_id"], current["created_by"]):
+                raise ShareError("not found", code="not_found")
+            if current["state"] != "pending":
+                raise ShareError(f"share is {current['state']}, not pending")
             if lifecycle is not None and lifecycle != "active":
                 raise ShareError("artifact is not active")
             if current["expires_at"] is not None and current["expires_at"] <= datetime.now(UTC):
@@ -203,6 +362,11 @@ class ShareStore:
                 raise ShareError("token hash already in use") from exc
             await self._event(conn, share_id, "approved", approved_by,
                               {"file_count": len(index.files), "total_bytes": index.total_bytes})
+            if member:
+                await self._member_event(conn, current["created_by"], "share_approve", actor=approved_by,
+                                         artifact_id=current["artifact_id"], share_id=share_id,
+                                         audience=current["audience"], outcome="ok",
+                                         detail={"total_bytes": index.total_bytes})
         return _row(record)
 
     async def mark_revoked(self, share_id: str, *, actor: str) -> dict:
@@ -218,6 +382,10 @@ class ShareStore:
                 f"UPDATE artifact_shares SET state='revoked', revoked_at=now() WHERE share_id=$1 RETURNING {_COLUMNS}",
                 share_id)
             await self._event(conn, share_id, "revoked", actor, {"was": current["state"]})
+            if is_member_principal(current["created_by"]):
+                await self._member_event(conn, current["created_by"], "share_revoke", actor=actor,
+                                         artifact_id=current["artifact_id"], share_id=share_id,
+                                         audience=current["audience"], outcome="ok", detail={"was": current["state"]})
         return _row(record)
 
     async def live_expired(self, now: datetime) -> list[dict]:
@@ -238,9 +406,11 @@ class ShareStore:
         records = await self._conn.fetch("SELECT share_id, state FROM artifact_shares")
         return {r["share_id"]: r["state"] for r in records}
 
-    async def live_total_bytes(self) -> int:
+    async def live_total_bytes(self, *, member: bool) -> int:
+        """Bytes of live shares created by members (``member=True``) or by everyone else (operators, ``False``)."""
         return int(await self._conn.fetchval(
-            "SELECT COALESCE(SUM(total_bytes), 0) FROM artifact_shares WHERE state='live'"))
+            "SELECT COALESCE(SUM(total_bytes), 0) FROM artifact_shares WHERE state='live' "
+            "AND COALESCE(created_by LIKE 'member:%', false) = $1", member))
 
     # ----------------------------------------------------------------- events
     async def _event(self, conn: Any, share_id: str, kind: str, actor: str, detail: dict | None,

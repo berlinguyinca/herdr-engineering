@@ -273,6 +273,39 @@ When the owner revokes a grant, the agent loses read and write access within a f
 second); commits that were already waiting are checked against the grant again before they are applied. If the
 owner's system stops publishing, every artifact tool fails closed after at most two minutes.
 
+### Publishing your own artifacts
+
+If your operator has turned on member artifacts and you belong to the member group, you can own artifacts: upload
+files, publish them as versions, and share them by link. Open the artifacts address your operator gave you, sign in,
+and use **My artifacts** (`/my/`). The same actions are available to your agent through MCP tools: `artifact_create`,
+`artifact_upload_chunk` (with `artifact_upload_status` and `artifact_upload_abort`), `artifact_publish`,
+`artifact_head`, `artifact_history`, `artifact_delete`, and the share tools `artifact_share_create`,
+`artifact_share_approve`, `artifact_share_list`, `artifact_share_events` and `artifact_share_revoke`. Slow
+operations return a ticket; poll it with `artifact_result`.
+
+* **Limits.** There are no built-in size or count caps. The operator can see how much each member uses and may set
+  optional limits; if one applies, the page and the tool answer say which. Large files are uploaded in chunks; the
+  page shows progress, and an interrupted upload resumes where it stopped (start the same upload again).
+* **Sharing.** You can share only an artifact you own, and only while it is active. Choose who may open it:
+  * **Lab**: signed-in lab members. A lab link is for exactly the lab group, not for individuals. It expires after
+    30 days unless you pick a date, and never later than 90 days.
+  * **Public**: anyone with the link. It must expire within 90 days.
+* **What can be shared.** A member's HTML page is limited to 2 MiB. SVG, PDF, XHTML and XML files cannot be shared
+  through a public member link, and a page whose markup cannot be proven safe to label (for example a script
+  containing `a <!b`, or content before `<body>` other than head elements) is refused rather than shared.
+* **The "Shared by" banner.** Pages opened through your link carry a banner naming you, so readers know who
+  published them. It is added to HTML pages only, and it is a hint, not a guarantee: the page's own styles or
+  scripts can hide it. The real limits are the sandbox the page runs in, the audience, the expiry and revoking.
+* **The link is shown once.** The secret link appears a single time, when you approve the share. If you lose it,
+  revoke that share and share again. Nobody, including the operator, can show it to you a second time.
+* **Operator oversight.** The operator can see every member link and revoke any of them.
+* **Delete and purge.** Deleting an artifact is a tombstone: its links stop working immediately, and the operator can
+  restore it. Only the operator can purge it for good. Purging removes the files and anonymises other people's
+  annotations, share events and feedback on it.
+* **Losing access.** If you are removed from the member group or the feature is switched off, your links are
+  revoked, but not instantly: group changes are noticed after a delay (up to about a day) plus a grace period
+  (about an hour by default).
+
 ### The flow of work (live graph)
 
 Every room has a **Flow of work** panel (not shown to guests): people on the left, agents to the right, one line per

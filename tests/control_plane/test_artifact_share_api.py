@@ -89,6 +89,21 @@ class Registry:
         self.versions["v_pdf"] = {"version_id": "v_pdf", "artifact_id": AID, "state": "ready",
                                   "output_manifest": [output("paper.pdf", b"%PDF-1.4 fake",
                                                              media_type="application/pdf")]}
+        page = b"<!DOCTYPE HTML><HTML><BODY CLASS=x><P>upper</P></BODY></HTML>"
+        svg = b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>"
+        xhtml = b"<html xmlns='http://www.w3.org/1999/xhtml'><body>x</body></html>"
+        big = b"<html><body>" + b"x" * (2 * 1024 * 1024) + b"</body></html>"
+        utf16 = "<html><body>hi</body></html>".encode("utf-16")
+        utf32 = "<html><body>hi</body></html>".encode("utf-32")
+        hidden = b"<template><body></template><p>nothing visible"
+        for data in (page, svg, xhtml, big, utf16, utf32, hidden):
+            blobs.add(data)
+        for vid, files in {"v_upper": [("index.html", page)], "v_svg": [("index.html", page), ("pic.svg", svg)],
+                           "v_xhtml": [("index.html", page), ("doc.xhtml", xhtml)], "v_big": [("index.html", big)],
+                           "v_utf16": [("index.html", utf16)], "v_utf32": [("index.html", utf32)],
+                           "v_hidden": [("index.html", hidden)]}.items():
+            self.versions[vid] = {"version_id": vid, "artifact_id": AID, "state": "ready",
+                                  "output_manifest": [output(n, d) for n, d in files]}
         self.versions["v_building"] = {**copy.deepcopy(self.versions["v_pdf"]), "version_id": "v_building",
                                        "state": "building"}
         self.versions["v_csv"] = {"version_id": "v_csv", "artifact_id": AID, "state": "ready",
@@ -143,6 +158,12 @@ class Shares:
 
     def sync_call(self, method, *args, **kwargs):
         return getattr(self, method)(*args, **kwargs)
+
+    def acquire_spend(self):          # the real store's cross-process lock; approvals here are already serialised
+        self.spend_held = getattr(self, "spend_held", 0) + 1
+
+    def release_spend(self):
+        self.spend_held -= 1
 
     def _public(self, row):
         return {k: v for k, v in row.items() if k != "token_hash"}
@@ -207,7 +228,7 @@ class Shares:
                                     "actor": actor, "detail": {"was": was}})
         return self._public(row)
 
-    def live_total_bytes(self):
+    def live_total_bytes(self, *, member=False):
         return self.live_bytes_extra + sum(r["total_bytes"] or 0 for r in self.rows.values() if r["state"] == "live")
 
     def events(self, share_id, limit=200):
@@ -812,3 +833,17 @@ def test_a_public_share_ignores_the_owner_emails(tmp_path):
     with share_server(tmp_path, owner_emails=["owner@lab.test"]) as (base, *_):
         status, body = create(base, audience="public")
         assert status == 201 and not body["share"].get("allow_emails")
+
+
+def test_share_settings_public_host_derives_the_link_base():
+    from herdr_engineering.control_plane.artifact_share_api import share_settings_config
+    only_host = share_settings_config({}, public_url=None, public_host="artifacts.example.org")
+    assert only_host["public_url"] == "https://artifacts.example.org"
+    same = share_settings_config({}, public_url="https://artifacts.example.org/", public_host="artifacts.example.org")
+    assert same["public_url"] == "https://artifacts.example.org"
+    with pytest.raises(ValueError, match="disagree"):
+        share_settings_config({}, public_url="https://old.example.org", public_host="artifacts.example.org")
+    for bad in ("Artifacts.example.org", "https://a.example.org", "a.example.org:443", "", "localhost"):
+        with pytest.raises(ValueError, match="public_host"):
+            share_settings_config({}, public_url=None, public_host=bad)
+    assert share_settings_config({}, public_url="https://x.example/")["public_url"] == "https://x.example/"

@@ -25,7 +25,9 @@ CLI, and wants outside parties to be able to *work on* an artifact, not just vie
 * Signed-in group members (lab viewers) can **annotate** shared content; an agent integrates open annotations into a
   new revision.
 * Group members can **create and share their own artifacts** from the artifact skill in Claude, Codex, Pi and
-  OpenCode, through the collaboration MCP server. Members can share to the group only — never publicly.
+  OpenCode, through the collaboration MCP server, and from a small web UI ("My artifacts") at the share host. Members
+  may create lab or public links on artifacts where they hold the `share` permission, under the operator's rules
+  (see section E; amended 2026-10-30 by operator decision, reverses the earlier lab-audience-only rule).
 
 ## Non-goals / anti-goals
 
@@ -37,8 +39,10 @@ CLI, and wants outside parties to be able to *work on* an artifact, not just vie
 * Anti-goal: silently overwriting either side. A merge that is not clean is never applied.
 * Existing share links stay frozen copies; a collaborator commit never changes a live share link.
 * Anonymous visitors (public links) have **no edit rights at all**: no annotations, no writes.
-* **Members can never create a public link** (server-enforced, not just hidden in the UI). Public links remain an
-  operator-only capability.
+* Public visitors have **no edit or annotation rights**, whoever created the link. (Amended 2026-10-30 by operator
+  decision: members may now create public links where they hold `share`; the earlier ban on member public
+  links is reversed. Every member link is audited, carries a "Shared by" banner, and the operator sees and
+  revokes all of them.)
 
 ## Current state (what exists)
 
@@ -219,33 +223,98 @@ frame markup. The raw `f/` route and the owner `live` route serve an artifact's 
 
 ### E. Members share their own artifacts
 
-Today the control plane is single-operator. This section makes it multi-user for artifacts, narrowly.
+> **Amended 2026-10-30 by operator decision; reverses the earlier group-only rule.** This section describes the
+> as-built behaviour (plan 5, `docs/superpowers/plans/2026-10-30-member-owned-artifacts.md`, decisions D1-D10). The
+> earlier text (group-only sharing, no public audience, 25 MiB per artifact / 200 MiB per member / 20 artifacts, no
+> member web UI) no longer applies.
 
-* **Ownership.** `artifacts` gets an `owner_principal` (existing artifacts: the operator). A member sees and manages
-  only artifacts they own, plus artifacts explicitly granted to them (section B), plus artifacts shared with them via a
-  lab link (read-only viewing through the share page). The operator sees everything.
-* **Who is a member.** A collab agent whose owner is a user in the configured group (`collab.cognito_group`, as
-  already used by the collab service). Disabled users lose access immediately.
-* **MCP tools for members** (offered only to such agents, acting on the caller's own artifacts only):
-  `artifact_create`, `artifact_publish` (new version of an own artifact; chunked upload), `artifact_share_create`,
-  `artifact_share_approve`, `artifact_share_list`, `artifact_share_revoke`, `artifact_share_events`. Share creation
-  from a member accepts **only the lab audience** (group and/or listed emails of pool users); `audience: public` is
-  refused with a clear error and an audit row, regardless of caller. Expiry and the summary/confirm flow are the same
-  as for the operator; the member's agent shows the exact file list to its human before approving.
-* **Upload.** MCP requests are small, so file content goes in chunks (`artifact_upload_chunk`, ~512 KiB each,
-  hash-checked, assembled in a quarantine area by the worker); caps per member: 25 MiB per artifact, 200 MiB total,
-  20 artifacts live. Bundles larger than that are an operator action. Content types follow the share rules (PDF, HTML,
-  HTML + parquet); the same bundle scanner and sandbox CSP apply, and members' bundles get an extra warning banner
-  in the lab viewer ("shared by <name>").
-* **Writes go through the intents queue** (section B): intent → worker validates ownership/quotas against the
-  control-plane tables → applies as the member's principal → result file. Every action is audited; a revoked or
-  disabled member's pending intents are rejected.
-* **Skill.** The existing artifact skill (`skills/herdr-artifact`, installed for Claude, Codex, Pi and OpenCode) gets
-  an **MCP mode**: the same commands (`create`, `publish`, `share`, `list`, `revoke`) call the MCP tools when the
-  collaboration server is configured and the control-plane CLI is unreachable or not configured. The skill reference
-  and `packages/collab-guide.md` document the tool set; harness install/update paths stay as they are.
-* **Operator controls.** A Members panel (operator only): list members' artifacts and shares, revoke any share, set
-  per-member quotas, disable a member's sharing.
+Today's control plane was single-operator. This section makes it multi-user for artifacts, narrowly.
+
+* **Ownership (no new column).** An artifact's owner is its existing `created_by`; a member's principal is
+  `member:<cognito username, else sub>`, derived in one place. A member sees and manages the artifacts they own, plus
+  artifacts explicitly granted to them (section B), plus artifacts shared with them via a lab link (read-only viewing
+  through the share page). `collab:` principals (grant collaborators) never create shares.
+* **Operator access (D4).** The operator has **read** and **share** (not edit or commit) on member-owned artifacts and
+  may create lab or public links on them (active artifacts only; not publications). One rule, `operator_member_access`,
+  feeds every permission check.
+* **Who is a member.** An *actor* is `Actor(kind, id)`: a collab agent (`kind: agent`) or a signed-in Cognito user
+  (`kind: user`, the web UI). The user must be approved, not disabled and in the configured group
+  (`collab.cognito_group`); an agent must also be active and **not external** (external agents are never members).
+  Membership is read from a directory feed with a tri-state status (`approved`, `disabled`, `removed`, `unknown`).
+  Only positive evidence is destructive: `disabled` acts at once, `removed` only after a grace period (default 3600 s,
+  `collab.members.removed_grace`), and an absent or stale directory (restart, expired claims) revokes and deletes
+  nothing and fails closed for writes. Revocation therefore takes effect within seconds for disabling and up to the
+  grace period (plus the claim lifetime) for group removal.
+* **Two front ends, one service layer.** The MCP tools and the web API call the same transport-neutral member service,
+  so they behave identically. MCP tools (offered only to members): `artifact_create`, `artifact_publish`,
+  `artifact_upload_chunk`, `artifact_share_create`, `artifact_share_approve`, `artifact_share_list`,
+  `artifact_share_revoke`, `artifact_share_events`, `artifact_delete`, plus listing, history and usage reads. Member
+  annotation tools are out of scope in v1. Members still do not grant collaborators; the operator does.
+* **Web UI (D2).** "My artifacts" is served by `collab-public` at `share.public_host` (the artifacts host, replacing
+  the old host's `/s/`: share links live on the new host only, no redirects). Sign-in reuses the lab Cognito login; the
+  browser exchanges it for a short member session (own signing domain, `Authorization: Member` header, never a cookie,
+  kept in memory/sessionStorage). The page is plain DOM, no iframe/frame/object/embed, and is served with a strict
+  **exact-path CSP** (the edge passes the application's CSP through unchanged). Features: list, chunked upload with
+  progress, version history, share (lab or public), list and revoke own links, delete, usage. The member web API is
+  mounted only for the configured host; on any other host it is a plain 404.
+* **Sharing (D3, D8).** A member may create a lab or public link on any artifact where their principal holds the `share`
+  permission (their own, or granted with `share` or `admin`; `read`/`edit`/`review` alone do not include it). A `share` holder can create and open a link, so `share` effectively
+  lets them read the bytes even though the member API stays gated on `read`. The rules
+  are the operator's: a pinned immutable version, an expiry, revocable, and a two-step create then approve with
+  `confirm: true` by a `share` holder (the creator). Public links default to 30 days and cap at 90; lab links likewise
+  default to 30 days and cap at 90. A member's **lab** audience is exactly the lab group (`collab.cognito_group`); the
+  per-member allow-list of emails must belong to known pool users (`member_audience_refused` otherwise). Member
+  shares have their own caps (`collab.members.share_limits`, `null` = unlimited) and rate limits; the global
+  `control_plane.share.max_share_bytes` / `max_total_bytes` keep applying to operator-created shares only.
+  Denial is a non-disclosing `not_found`.
+* **Share URL travels back once.** The approve result never carries the token. The URL is written to a read-once
+  secret file on the volume shared by the worker and `collab-public`, deleted on first read and swept after 60 s; the
+  share row holds only the hash. Because the worker and `collab-public` run as different uids, the secrets directory
+  is group-shared (`members.secrets_gid`, falling back to the worker's `HERDR_COLLAB_CERT_UID`); with no resolvable
+  gid, members **fail closed** at start-up rather than approving links nobody can read.
+* **"Shared by" banner.** Every link created by a member (lab or public) is labelled "Shared by <name> — content was
+  not reviewed by the operator". The name is server-authoritative (display name, else user id, stored in the share's
+  `state.json`); operator links carry no label and stay byte-identical. The bar is injected server-side into HTML on
+  the `v/`, `a/` and raw `f/` pages, after a strict tokenizer gate; member links refuse types that cannot be labelled
+  (SVG, XHTML/XML, PDF) and HTML over 2 MiB, with odd charsets or with markup the gate cannot prove renders the bar
+  (fail closed). The banner is a best-effort provenance hint, not a security boundary (page script or CSS can hide
+  it); containment is the sandbox CSP, the opaque origin, the group/expiry and revocation. Public visitors get no
+  annotation or edit UI.
+* **Upload and storage (D1, D10).** There are **no default storage caps**. Usage is always accounted (bytes, artifact
+  and version counts per member, soft-deleted artifacts reported separately until purged) and shown to the member and
+  the operator. Limits exist only as optional YAML values (`collab.members.limits`, default `null` = unlimited) with
+  per-member overrides set by the operator. Anti-abuse rate limits and per-request sanity limits stay, all
+  configurable (default per-file limit 1 TiB, `request_limits.max_upload_bytes`, `null` = only the structural bound; the effective limit is the smaller of it and the collab_artifacts bridge limits). File bytes use plan 3's chunk protocol
+  unchanged (fixed 512 KiB chunks, base64 on MCP, sha256 and size verified at assembly, idempotent resumable), staged
+  under a per-member owner key so an upload resumes across MCP and web, bounded by a staging cap and swept by TTL;
+  the worker assembles at publish, so multi-GB uploads do not ride the 60 s intent clock. Content types follow the
+  share rules (HTML, PDF, HTML + parquet) with the same bundle scanner and sandbox CSP (members' lab/public links add
+  the type restrictions above).
+* **Writes go through the intents queue** (section B): an intent carries the actor and the worker re-checks
+  membership, the `share` permission and any configured limit against Postgres, then applies it as the member's
+  principal and writes a result file. Intents expire after 60 s; a disabled or removed member's pending intents are
+  rejected. Every member share create/approve/revoke (lab and public) writes an `artifact_member_events` audit row
+  with principal, actor, artifact, share id, audience and outcome, besides the existing share events.
+* **Delete and purge (D5).** A member can delete their own artifact: it is retracted, its live links are revoked, open
+  uploads aborted, and it is **tombstoned** (hidden from readers and the member's lists). Only the operator can
+  **purge** (remove the bytes), with an explicit confirmation that repeats the artifact id; purge composes the existing
+  tombstone-and-purge lifecycle, refuses artifacts under legal hold or without a purge date, revokes any open links
+  first, and **anonymises** the member's third-party data (annotation text and author identity, share-event viewers,
+  staged names, display name and original filename become `[removed]`; the feedback table is redacted through an
+  append-only-safe migration path).
+* **Disabling (D6).** Disabling a member (directory `disabled`, removal from the group after the grace period, or
+  sharing disabled by the operator) revokes the live and pending links they created; the existing sweep runs it and
+  is idempotent.
+* **Operator controls.** A Members area (operator API `/api/v1/artifact-members` and `herdr-eng artifacts members`
+  list|show|links|limits|disable-sharing|enable-sharing|revoke-share|purge, plus the dashboard view): list members,
+  usage and every member link (filterable), revoke any link, set per-member limits, disable or re-enable a member's
+  sharing, purge. All operator routes need the operator role, check same-origin, and answer 404 for unknown targets.
+* **Skill.** The existing artifact skill (`skills/herdr-artifact`, installed for Claude, Codex, Pi and OpenCode) has an
+  **MCP mode**: the same commands (`create`, `publish`, `share`, `list`, `revoke`) call the MCP tools when the
+  collaboration server is configured and the control-plane CLI is unreachable or not configured. Very large files
+  should go through the web UI (over MCP a 1 TiB file is ~2 M chunks). `packages/collab-guide.md` documents the set.
+* **Schema.** Migration `0048` adds the member usage/limits and audit tables and indexes; `0049` adds the purge
+  redaction path for feedback. (`0047` belongs to the artifact-delete work.)
 
 ## Decisions made by me (operator may overrule)
 
@@ -260,8 +329,11 @@ Today the control plane is single-operator. This section makes it multi-user for
 * Default agent grant lifetime 30 days; commit rate 30/min.
 * Annotations: lab members and the owner only, text-quote anchored (HTML) or page anchored (PDF), shown in a Feedback
   tab; the agent integrates them via MCP and a new revision never changes a live link by itself.
-* Members: group-only sharing, no public audience ever, 25 MiB/artifact and 200 MiB/member default caps, 20 live
-  artifacts, chunked upload through MCP. Operator public links are unchanged.
+* Members (amended 2026-10-30 by operator decision; reverses the earlier lab-only rule): lab or public links on
+  artifacts where they hold `share`, under the operator's rules, audited, with a "Shared by" banner; no default storage
+  caps (accounting plus optional YAML limits); a member web UI at `share.public_host`; delete (member) and purge
+  (operator); operator read + share on member content; member share caps separate from the operator's. Public visitors
+  keep no edit or annotation rights.
 
 ## Builder-check resolutions (my calls unless marked)
 
@@ -287,11 +359,11 @@ Today the control plane is single-operator. This section makes it multi-user for
   a timestamp the worker rejects after 60 s. Honest promise: revocation/disabling takes effect within seconds, not
   instantly. `collab-public` also writes a read-only `agents.json` feed (agent id → owner user, status, external flag,
   group membership) that the worker uses to confirm an agent is still active when applying an intent.
-* **Members have no web UI.** Members use the artifact skill / MCP tools only (as the operator described). Members'
-  own Feedback and history are read through MCP tools (`artifact_annotations`, `artifact_history`). Members do not
-  grant collaborators in v1; the operator does.
-* **Share URL travels back once.** The approve result for a member is written to a 0600 result file on the volume
-  shared only by the worker and `collab-public`, deleted on first read by the MCP tool and swept after 60 s. The token is
+* **Members use the skill/MCP tools and a web UI** (amended 2026-10-30; the earlier "no web UI" call is superseded, see
+  section E). Members do not grant collaborators in v1; the operator does. Member annotation MCP tools are out of
+  scope in v1.
+* **Share URL travels back once.** The approve result for a member is written to a read-once secret file (group-shared
+  between the worker and `collab-public`, see section E), deleted on first read and swept after 60 s. The token is
   never stored in plain text elsewhere (the share row still holds only its hash).
 * **Ownership and permissions reuse what exists.** No `owner_principal` column: an artifact's owner is its existing
   `created_by`. Member principal = `member:<cognito sub>`; collaborator grants are rows in the existing

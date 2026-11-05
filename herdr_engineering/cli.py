@@ -367,6 +367,8 @@ def _build_parser() -> argparse.ArgumentParser:
     add_share_subparser(asub)
     from .artifact_collab_client import add_collab_subparser
     add_collab_subparser(asub)
+    from .artifact_members_client import add_members_subparser
+    add_members_subparser(asub)
     from .artifact_delete_client import add_delete_subparsers
     add_delete_subparsers(asub)
     from .artifact_browse_client import add_browse_subparsers
@@ -3927,7 +3929,8 @@ def _share_wiring(cp: dict, dsn: str | None):
         return None, None, None
     from .control_plane.artifact_share_api import share_settings_config
     try:
-        settings = share_settings_config(share, public_url=share.get("public_url"))
+        settings = share_settings_config(share, public_url=share.get("public_url"),
+                                          public_host=share.get("public_host"))
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
     from .control_plane import artifact_adapter
@@ -3935,9 +3938,25 @@ def _share_wiring(cp: dict, dsn: str | None):
 
     async def create_share_store():
         import asyncpg
-        return ShareStore(await asyncpg.connect(dsn))
+        return ShareStore(await asyncpg.connect(dsn), lock_connect=lambda: asyncpg.connect(dsn))
 
     return artifact_adapter.SyncArtifactAdapter(create_share_store), Path(share.get("shares_dir") or "/shares"), settings
+
+
+def _member_admin_wiring(cp: dict, dsn: str | None):
+    """The operator member controls (adapter over ``MemberAdmin``) when ``control_plane.collab.members`` is enabled and a
+    DSN exists, else None (the routes answer 503). The configured limit defaults feed the effective limits shown."""
+    got = _members_settings(cp)
+    if got is None or not dsn:
+        return None
+    from .control_plane import artifact_adapter
+    from .control_plane.artifact_members_api import MemberAdmin
+
+    async def create():
+        import asyncpg
+        return MemberAdmin(await asyncpg.connect(dsn), defaults=got["defaults"])
+
+    return artifact_adapter.SyncArtifactAdapter(create)
 
 
 def _collab_grant_wiring(cp: dict, dsn: str | None):
@@ -4000,6 +4019,7 @@ def _cmd_cp_web(args) -> int:
         merged = {str(k): str(v) for k, v in file_keys.items()}
         merged.update(api_keys or {})
         api_keys = merged or None
+        _refuse_keyless_members(cp, api_keys)
         from .control_plane.federation import PEER_KINDS, FederationConfigError, parse_federation
         if any(str(v).strip() in PEER_KINDS for v in (api_keys or {}).values()):
             raise SystemExit("api_keys: role 'peer'/'peer-user' is not an API key role; a federated peer is configured "
@@ -4133,6 +4153,7 @@ def _cmd_cp_web(args) -> int:
         artifact_jobs.load(artifact_adapter("load_jobs"))
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
     annotation_store = _annotation_wiring(cp, dsn)
+    member_admin = _member_admin_wiring(cp, dsn)
     try:
         from .control_plane.artifact_delete_api import owner_digests_config
         artifact_delete = owner_digests_config(cp.get("artifact_delete"))
@@ -4183,7 +4204,10 @@ def _cmd_cp_web(args) -> int:
                                       approver_groups=args.collab_approver_group)
         collab = CollabService(auth, sink=sink, public_config=public, approval=approval,
                                delegation_enabled=_delegation_switch(args, cp),
-                               summary_fix=getattr(args, "collab_summary_fix", None))
+                               summary_fix=getattr(args, "collab_summary_fix", None),
+                               **_collab_member_kwargs(cp, state_dir=(
+                                   os.path.dirname(os.path.abspath(args.collab_log_file))
+                                   if args.collab_only and args.collab_log_file else None)))
         collab.task_lease_seconds = _task_lease(args, cp)
         if args.collab_only:
             collab.hydrate_or_degrade(sink.load)       # T16 H1: any replay failure disables collaboration only
@@ -4228,6 +4252,7 @@ def _cmd_cp_web(args) -> int:
         rakazo_bridge_config(cp.get("rakazo_bridge"))      # an enabled but malformed bridge stops startup here, clearly
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    member_web = _member_web(cp, collab, args)
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              rakazo_bridge=cp.get("rakazo_bridge"), rakazo_bridge_dsn=dsn, assistant_apps_dsn=dsn,
                              federation_source=federation_source,
@@ -4266,9 +4291,11 @@ def _cmd_cp_web(args) -> int:
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
-                             annotation_store=annotation_store, artifact_delete_owners=artifact_delete.digests,
+                             annotation_store=annotation_store, member_admin=member_admin,
+                             artifact_delete_owners=artifact_delete.digests,
                              artifact_delete_allow_keyless_owner=artifact_delete.allow_keyless,
-                             collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled)
+                             collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled,
+                             member_web=member_web)
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read
         svr.artifact_graph_gate.load_retractions(artifact_adapter("load_retractions"))
@@ -4306,6 +4333,8 @@ def _cmd_cp_web(args) -> int:
             artifact_bridge.stop()
         if artifact_adapter is not None:
             artifact_adapter.close()
+        if member_admin is not None:
+            member_admin.close()
         if share_store is not None:
             share_store.close()
         if annotation_store is not None:
@@ -4391,7 +4420,7 @@ def _share_public_server(fleet_config, *, shares_dir, events_dir, sync_dir, host
         pool_id=collab.get("cognito_pool"),
         client_ids=tuple(c for c in clients if isinstance(c, str)) if isinstance(clients, list) else (),
         web_client_id=collab.get("cognito_web_client"), cognito_domain=collab.get("cognito_domain"),
-        public_url=share.get("public_url"),
+        public_url=share.get("public_url"), public_host=share.get("public_host"),
         signing_secret=secret.encode("utf-8") if isinstance(secret, str) else b"",
         session_seconds=share.get("session_seconds", 14400), annotations=annotation_settings(share.get("annotations")),
         annotations_path=Path(events_dir) / "annotations.jsonl")
@@ -4468,6 +4497,7 @@ COLLAB_CONFIG_KEYS = {
     # team collaboration slice 3: the coordinator role with limits; external people only behind a second flag; YAML only, off
     "coordinators": ("collab_coordinators", dict),
     "skills": ("collab_skills", dict),                    # public collaboration skill catalog/config
+    "members": ("collab_members", dict),                  # plan 5 member-owned artifacts; YAML only, off by default
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
     "summary_fix": ("collab_summary_fix", dict),
 }
@@ -4485,6 +4515,10 @@ def _apply_collab_config(args, cp) -> None:
         if key not in collab:
             continue
         value = collab[key]
+        if key == "members":
+            _members_settings({"collab": {"members": value}, "share": cp.get("share")})   # validated here, read again where used
+            setattr(args, dest, dict(value))
+            continue
         if kind is dict and key == "summary_fix":
             from .control_plane.collab import summary_fix_config
             try:
@@ -4605,6 +4639,94 @@ def _task_lease_value(value) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not 60 <= value <= 7 * 86400:
         raise SystemExit("fleet config control_plane.collab.task_lease_seconds must be a number of seconds, 60 to 604800")
     return float(value)
+
+
+def _members_settings(cp) -> dict | None:
+    """``control_plane.collab.members`` (YAML only): None unless ``enabled`` is exactly true. An enabled section needs
+    a ``group``, a ``session_secret`` and ``control_plane.share.public_host``; see ``members_config``. A bad section
+    stops the start."""
+    from .control_plane.members_config import parse_members
+    collab = cp.get("collab") if isinstance(cp, dict) else None
+    raw = collab.get("members") if isinstance(collab, dict) else None
+    share = cp.get("share") if isinstance(cp, dict) else None
+    host = share.get("public_host") if isinstance(share, dict) else None
+    seconds = share.get("session_seconds") if isinstance(share, dict) else None
+    try:
+        return parse_members(raw, public_host=host, session_seconds=seconds)
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+
+
+def _refuse_keyless_members(cp, api_keys) -> None:
+    """Members need API keys (from the fleet config, --api-key or --api-keys, already merged): with none, every caller on
+    the listener is the operator and could read and share member artifacts (D4). Stops the start."""
+    if _members_settings(cp) is not None and not api_keys:
+        raise SystemExit("fleet config control_plane.collab.members.enabled needs at least one API key "
+                         "(control_plane.api_keys, --api-key or --api-keys): without keys every caller is the operator")
+
+
+def _member_web(cp, collab, args):
+    """The member web API for collab-public (None unless members are enabled on a collab-only server)."""
+    got = _members_settings(cp)
+    if got is None or collab is None or not getattr(args, "collab_only", False):
+        return None
+    from .control_plane.member_web import MemberWeb
+    return MemberWeb(collab, public_host=got["public_host"], session_secret=got["session_secret"].encode("utf-8"),
+                     session_seconds=got["session_seconds"],
+                     web_root=getattr(args, "web_root", None), public_config=collab.public_config,
+                     require_https=bool(getattr(args, "collab_require_https", False)))
+
+
+def _collab_member_kwargs(cp, *, state_dir=None) -> dict:
+    """``CollabService`` keyword arguments for the member group (empty when members are off). ``state_dir`` (the
+    collab log's directory) holds ``member-groups.json``, the last-seen group claims, so a restart is not amnesia."""
+    got = _members_settings(cp)
+    if got is None:
+        return {}
+    out = {"member_group": got["group"], "member_groups_ttl": got["groups_ttl"]}
+    if state_dir is not None:
+        out["member_groups_path"] = Path(state_dir) / "member-groups.json"
+    return out
+
+
+def _secrets_gid(got) -> int | None:
+    """The group that may read and delete member share secrets: ``members.secrets_gid``, else the group of the
+    collab-public container (compose runs it as ``HERDR_COLLAB_CERT_UID:HERDR_COLLAB_CERT_UID``); None = root-private."""
+    if got["secrets_gid"] is not None:
+        return got["secrets_gid"]
+    raw = os.environ.get("HERDR_COLLAB_CERT_UID", "").strip()
+    return int(raw) if re.fullmatch(r"[0-9]+", raw) else None
+
+
+def _members_runtime(cp, settings: CollabArtifactsSettings):
+    """The worker's ``MemberRuntime`` (None when members are off). ``shares_root`` is the share bundle directory only
+    when ``control_plane.share`` is enabled; without it only share rows are revoked."""
+    import time
+
+    from .control_plane.artifact_member_intents import MemberRuntime
+    got = _members_settings(cp)
+    if got is None:
+        return None
+    secret_gid = _secrets_gid(got)
+    if secret_gid is None:      # fail closed: an approve would go live with a URL collab-public can never read
+        raise SystemExit("fleet config control_plane.collab.members.secrets_gid is not set and HERDR_COLLAB_CERT_UID is "
+                         "not in the worker's environment: members cannot start (the share URL could not reach "
+                         "collab-public)")
+    share = _share_worker_settings(cp)
+    share_settings = None
+    if share["enabled"]:
+        from .control_plane.artifact_share_api import share_settings_config
+        raw = (cp or {}).get("share") or {}
+        try:
+            share_settings = {**share_settings_config(raw, public_url=raw.get("public_url"),
+                                                     public_host=raw.get("public_host")),
+                              "member_share_limits": got["share_limits"]}
+        except ValueError as exc:
+            raise SystemExit(f"fleet config {exc}") from None
+    return MemberRuntime(outbox=settings.outbox_dir, mirror_root=settings.mirror_dir, group=got["group"], enabled=True,
+                         defaults=got["defaults"], removed_grace=got["removed_grace"],
+                         shares_root=Path(share["shares_dir"]) if share["enabled"] else None,
+                         share_settings=share_settings, clock=time.time, secret_gid=secret_gid)
 
 
 def _task_lease(args, cp):
@@ -5088,14 +5210,15 @@ def _build_collab_mirror(settings: CollabArtifactsSettings, *, rustfs):
     return CollabMirror(settings.mirror_dir, rustfs=rustfs, limits=settings.limits, clock=time.time)
 
 
-def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rustfs, connect, lineage):
+def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rustfs, connect, lineage, members=None):
     """The worker's bridge loop: ONE gate, ONE ``BridgeLimits`` and ONE clock shared by the mirror and the applier; the
     applier gets the mirror (post-commit refresh) and registers the ``commit`` kind (plan 5 adds its own kinds, extras
-    and staging owner here). ``mirror`` comes from ``_build_collab_mirror``."""
+    and staging owner here). ``mirror`` comes from ``_build_collab_mirror``. ``members`` is a ``MemberRuntime`` (``_members_runtime``); None leaves the member kinds answering ``members_disabled``."""
     from .control_plane import worker as cp_worker
     from .control_plane.annotation_intents import (
         register_annotation_resolve,  # registers the kind at import
     )
+    from .control_plane.artifact_member_intents import publish_member_views, register_member_intents
     from .control_plane.artifact_scope import ArtifactGraphGate
     from .control_plane.collab_intents import CollabIntentApplier
     clock = mirror.clock
@@ -5108,11 +5231,13 @@ def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rust
                 return {"skipped": "retracted"}
             return post(version)
     applier = CollabIntentApplier(settings.outbox_dir, mirror, rustfs=rustfs, limits=settings.limits,
-                                  spool_dir=settings.spool_dir, lineage=lineage, context_extras={}, clock=clock,
-                                  gate=gate)
+                                  spool_dir=settings.spool_dir, lineage=lineage, context_extras={} if members is None else {"members": members},
+                                  clock=clock, gate=gate)
     applier.register_commit()
     register_annotation_resolve(applier)
-    return cp_worker.CollabBridgeLoop(connect, mirror, applier)
+    register_member_intents(applier)
+    publisher = None if members is None else (lambda conn: publish_member_views(conn, members))
+    return cp_worker.CollabBridgeLoop(connect, mirror, applier, members_publisher=publisher)
 
 
 def _wire_collab_artifacts_bridge(service, cp, mirror_dir, outbox_dir):
@@ -5125,10 +5250,15 @@ def _wire_collab_artifacts_bridge(service, cp, mirror_dir, outbox_dir):
     from .control_plane.collab_artifacts import CollabArtifactBridge
     bridge = CollabArtifactBridge(service, Path(mirror_dir), Path(outbox_dir))
     service.artifact_bridge = bridge
+    if getattr(service, "member_group", None):
+        from .control_plane.artifact_member_service import MemberService
+        got = _members_settings(cp)
+        service.member_service = MemberService(service, bridge, got["limits"] if got else None)
     try:
         bridge.start()
     except BaseException:
         service.artifact_bridge = None
+        service.member_service = None
         bridge.stop()
         raise
     return bridge
@@ -5157,7 +5287,9 @@ def _cmd_cp_worker(args) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # validated before anything connects: an invalid collab_artifacts section refuses the start (also with --once)
-    collab_settings = _collab_artifacts_settings(_worker_control_plane_section(getattr(args, "fleet_config", None)))
+    worker_cp = _worker_control_plane_section(getattr(args, "fleet_config", None))
+    collab_settings = _collab_artifacts_settings(worker_cp)
+    member_runtime = _members_runtime(worker_cp, collab_settings) if collab_settings.enabled else None
 
     async def _run():
         cp = _cp_config(getattr(args, "fleet_config", None))
@@ -5203,7 +5335,7 @@ def _cmd_cp_worker(args) -> int:
                 if mirror is not None:
                     bridge_loop = _build_collab_bridge_loop(
                         collab_settings, mirror=mirror, rustfs=rustfs, connect=lambda: _cp_connect(dsn),
-                        lineage=_collab_lineage_hook(worker_cfg))
+                        lineage=_collab_lineage_hook(worker_cfg), members=member_runtime)
             except BaseException:
                 if mirror is not None:
                     mirror.close()

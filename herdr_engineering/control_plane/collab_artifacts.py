@@ -81,7 +81,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from . import annotation_intents, collab_waiters
+from . import annotation_intents, artifact_member_intents, collab_waiters  # noqa: F401 - registers the member kinds
 from .collab import CollabError, Principal
 from .collab_bridge_files import (
     AUDITED_MARKER,
@@ -122,6 +122,7 @@ from .collab_mirror import ANNOTATIONS_NAME, ARTIFACTS_DIR, BLOBS_DIR, GRANTS_NA
 
 log = logging.getLogger(__name__)
 
+MEMBER_DIRECTORY_FEED = "member-directory.json"   # artifact_member_intents.MEMBER_DIRECTORY (worker side)
 AGENTS_FEED = "agents.json"                 # the worker reads it as collab_intents.AGENTS_FEED
 UNAVAILABLE = "collaboration bridge unavailable"
 NOT_FOUND = "not found"
@@ -764,6 +765,12 @@ class CollabArtifactBridge:
                 self._tickets.popitem(last=False)
                 self.stats["tickets_evicted"] += 1
 
+    def release_owner_usage(self, owner_key: str) -> None:
+        """Forget the cached staging usage of ``owner_key`` (after its upload dir was removed), so the freed
+        reservation counts at once instead of after the cache ages out."""
+        with self._staging_lock:
+            self._owner_usage.pop(owner_key, None)
+
     def append_intent(self, actor: Actor, kind: str, payload: dict, *, artifact_id: str | None,
                       idempotency_key: str | None, ticket: str | None = None) -> str:
         """Write one intent for ``actor`` and return its ticket. The CALLER authorizes (``commit`` does for agents).
@@ -1061,6 +1068,7 @@ class CollabArtifactBridge:
                 agents[agent_id] = {
                     "owner": a["owner"], "status": "active" if svc._ok(a["owner"]) else "disabled",
                     "expires_at": a.get("expires_at"), "external": bool(x),
+                    "groups": svc._groups_of(a["owner"]), "harness_type": a.get("harness_type"),
                     "join_id": join_ids.get(a.get("join")) if a.get("join") else None,
                     "hard_expiry": x.get("hard_expiry") if isinstance(x, dict) else None}
         return {"generated_at": self.clock(), "agents": agents}
@@ -1070,6 +1078,13 @@ class CollabArtifactBridge:
         try:
             with self._feed_lock:
                 body = self._feed()
+                directory = self.service.member_directory()
+                # Directory first (private, 0600: it carries e-mail addresses), then the agents feed. Two files cannot
+                # be swapped together; both carry the same generated_at/updated, and a reader pairing the new agents
+                # feed with the previous directory only lags one pass (the worker fails closed on a stale one).
+                if directory is not None:
+                    atomic_write_json(self.outbox, MEMBER_DIRECTORY_FEED,
+                                      {**directory, "updated": body["generated_at"]}, mode=0o600)
                 atomic_write_json(self.outbox, AGENTS_FEED, body)
                 self._feed_at = body["generated_at"]
             self.stats["feed_writes"] += 1

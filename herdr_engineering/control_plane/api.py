@@ -311,10 +311,10 @@ class ControlPlaneServer:
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
-                 share_store=None, shares_root=None, share_settings=None, annotation_store=None,
+                 share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
-                 assistant_workers=None, assistant_judge=None):
+                 assistant_workers=None, assistant_judge=None, member_web=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -451,6 +451,8 @@ class ControlPlaneServer:
         self.share_store = share_store
         self.shares_root = shares_root
         self.share_settings = share_settings
+        # Operator controls for member-owned artifacts (a SyncArtifactAdapter over MemberAdmin): absent -> 503.
+        self.member_admin = member_admin
         # Owner annotation API (list/dismiss): a SyncArtifactAdapter over AnnotationStore, or the routes answer 503.
         self.annotation_store = annotation_store
         # Key digests allowed to delete/purge/restore artifacts (control_plane.artifact_delete.owner_key_digests).
@@ -609,6 +611,7 @@ class ControlPlaneServer:
             self.assistant.host_candidates = lambda: (
                 self.collab.assistant_runtime_host_candidates() if self.collab is not None else [])
         self.collab_require_https = collab_require_https
+        self.member_web = member_web          # member_web.MemberWeb or None: the member host's web API (Task 11)
         # ADR-0008 P2: signed read-only export endpoints (/api/v1/federation/*). Inert unless the hot YAML switches
         # `control_plane.federation` on; the gateway is rebuilt if `collab` is swapped (tests do).
         self.federation_source = federation_source
@@ -2002,6 +2005,8 @@ def _make_handler(server, public=False, operator=False):
                             supplied[0].encode(), server.ci_fix_config["agent_api_key"].encode()):
                         return "agent"
                     return None
+                # With no api keys EVERY caller on this listener is the operator, including for member-owned
+                # artifacts (D4); members therefore require api keys (fleet-config check refuses otherwise).
                 # open — only reachable via loopback or an explicit --allow-open
                 # (Tailnet trust boundary); the fail-closed guard enforces this
                 return "operator"
@@ -2066,9 +2071,10 @@ def _make_handler(server, public=False, operator=False):
             digest = hashlib.sha256(supplied.encode()).hexdigest()[:16]
             return f"api-key:{digest}:{self._role() or 'local'}"
 
-        def _artifact_version_allowed(self, artifact_id, version_id, permission):
-            """Permission on the artifact AND the version must belong to it (registry-backed only)."""
-            if not self._artifact_allowed(artifact_id, permission):
+        def _artifact_version_allowed(self, artifact_id, version_id, permission, *, operator_member=True):
+            """Permission on the artifact AND the version must belong to it (registry-backed only).
+            ``operator_member=False`` withholds the plan 5 D4 operator grant (publications never reach member content)."""
+            if not self._artifact_allowed(artifact_id, permission, operator_member=operator_member):
                 return False
             if server.artifact_store is None:
                 return True
@@ -2091,18 +2097,26 @@ def _make_handler(server, public=False, operator=False):
                     artifact_id, lambda: self._artifact_call("tombstoned_ids"))
             return self._artifact_call("lifecycle_of", artifact_id) == "tombstoned"
 
-        def _artifact_allowed(self, artifact_id, permission):
+        def _artifact_allowed(self, artifact_id, permission, *, operator_member=True):
             if server.artifact_acl is None:
                 return not self._artifact_is_deleted(artifact_id, permission)
             if self._artifact_acl_allows(artifact_id, permission):
                 # only an ACL-authorized caller reaches the store: an unauthorized read must never touch it
                 return not self._artifact_is_deleted(artifact_id, permission)
+            # Plan 5 D4: an operator key reads and shares (never edits) member-owned artifacts. Gated on the operator
+            # principal first, so any other unauthorized read still never reaches the store.
+            if (operator_member and permission in ("read", "share") and server.artifact_store is not None and artifact_id
+                    and self._resource_principal().endswith(":operator")
+                    and self._artifact_call("operator_member_access", artifact_id, self._resource_principal(),
+                                            permission)):
+                return True
             # Versioned-registry artifacts (native reports) are also private to their
             # durable owner and grants, which the registry itself records. Reads stay
             # ACL-only: an unauthorized read must never reach the store.
+            extra = {} if operator_member else {"operator_member": False}
             return bool(permission != "read" and server.artifact_store is not None
                         and artifact_id and self._artifact_call(
-                "report_permission", artifact_id, self._resource_principal(), permission))
+                "report_permission", artifact_id, self._resource_principal(), permission, **extra))
 
         def _artifact_acl_allows(self, artifact_id, permission):
             principal = self._resource_principal()
@@ -2183,6 +2197,18 @@ def _make_handler(server, public=False, operator=False):
             """Everything not on the allow-list is a plain 404: the legacy API, the
             dashboard and its static files do not exist on this listener."""
             path = self.path.split("?")[0]
+            mw = server.member_web
+            if mw is not None:
+                # The member host (exactly one Host header naming it) is served by the member web API alone; on any
+                # other Host its API paths do not exist.
+                if mw.owns(self):
+                    cl = self.headers.get_all("Content-Length") or []
+                    if (len(cl) > 1 or "Transfer-Encoding" in self.headers
+                            or (self.command == "GET" and cl and cl[0].strip() not in ("", "0"))):
+                        return self._deny(400, "ambiguous request framing")
+                    return mw.handle(self)
+                if path.startswith("/api/member/") or self.command == "PUT":
+                    return self._deny(404, "not found")
             # Request framing must be unambiguous: the edge and this server must agree where a
             # request ends, or a pipelined second request could be smuggled behind the first.
             cl = self.headers.get_all("Content-Length") or []
@@ -2269,7 +2295,8 @@ def _make_handler(server, public=False, operator=False):
         def handle_expect_100(self):
             """``Expect: 100-continue`` on POST /mcp is answered only after the large-body gate has decided (see
             ``_continue_100``); inviting the body first would defeat the pre-authentication gate."""
-            if self.command == "POST" and self.path.split("?")[0] == "/mcp":
+            if (self.command == "POST" and self.path.split("?")[0] == "/mcp") or (
+                    self.command == "PUT" and public and self.path.startswith("/api/member/")):
                 self._expect_100_pending = True
                 return True
             return super().handle_expect_100()
@@ -2597,6 +2624,8 @@ def _make_handler(server, public=False, operator=False):
         def do_PUT(self):
             # PUT exists only for assistant-apps (client credentials, blocked calendars); everything else keeps its flat
             # 501, decided before any listener-specific handler (operator/public/federation/collab) sees the request.
+            if public and server.member_web is not None and self.path.startswith("/api/member/"):
+                return self._timed_request(self._public)      # the member run upload (only on the member host)
             if operator or public or not self.path.startswith("/api/v1/assistant-apps/"):
                 return self._timed_request(lambda: self._send_json(501, {"error": "not implemented"}))
             return self._timed_request(self._mutate_verb)
@@ -3093,6 +3122,9 @@ def _make_handler(server, public=False, operator=False):
             if self._rate_limit():
                 return None
             try:
+                from .artifact_members_api import route_members
+                if route_members(self, server, parts, resource):
+                    return None
                 from .artifact_delete_api import route_delete
                 if route_delete(self, server, parts, resource):
                     return None
@@ -4130,7 +4162,8 @@ def _make_handler(server, public=False, operator=False):
             if resource == "publications" and server.publication_controller is not None:
                 if len(parts) == 5 and parts[4] == "requests":
                     body = self._read_json() or {}
-                    if not self._artifact_version_allowed(body.get('resource_id', ''), body.get('version_id'), 'share'):
+                    if not self._artifact_version_allowed(body.get('resource_id', ''), body.get('version_id'), 'share',
+                                                       operator_member=False):
                         return self._artifact_forbidden()
                     return self._json(server.publication_controller.request(
                         resource_id=body.get("resource_id"), version_id=body.get("version_id"),
@@ -4142,7 +4175,8 @@ def _make_handler(server, public=False, operator=False):
                     if publication is None:
                         return self._json({'error': 'not found'}, 404)
                     if not self._artifact_version_allowed(
-                            publication['resource_id'], publication['pinned_version_id'], 'share'):
+                            publication['resource_id'], publication['pinned_version_id'], 'share',
+                            operator_member=parts[5] == "revoke"):
                         return self._artifact_forbidden()
                     if parts[5] == "approve":
                         result = server.publication_controller.approve(parts[4], approver=self._resource_principal())

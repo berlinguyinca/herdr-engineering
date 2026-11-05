@@ -398,7 +398,7 @@ class ShareFixture:
                 self._event(share_id, "revoked", actor, {"was": was})
             return self._public(share_id)
 
-    async def live_total_bytes(self):
+    async def live_total_bytes(self, *, member=False):
         with _LOCK:
             return sum(r["total_bytes"] or 0 for r in self.rows.values() if r["state"] == "live")
 

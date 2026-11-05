@@ -40,7 +40,7 @@ SHARE_URL = "https://artifacts.example.test/"
 SHARE_HOST = "artifacts.example.test"
 
 
-def _central(tmp_path, share=None, collab=COLLAB):
+def _central(tmp_path, share=None, collab=COLLAB, extra=None):
     central = tmp_path / "fleet" / "fleet-config.yaml"
     central.parent.mkdir(parents=True)
     fcc.init_config(central, dict(_ds.ANSWERS))
@@ -51,6 +51,7 @@ def _central(tmp_path, share=None, collab=COLLAB):
         cpv["collab"] = dict(collab)
     if share is not None:
         cpv["share"] = dict(share)
+    cpv.update(extra or {})
     central.unlink()
     fcc.write_private_file(central, yaml.safe_dump(data, sort_keys=False))
     return central
