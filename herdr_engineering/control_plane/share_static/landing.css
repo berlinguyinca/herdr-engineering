@@ -4,7 +4,7 @@
   --herdr-surface: #fff;
   --herdr-border: #d9d9e3;
   --herdr-text: #353740;
-  --herdr-accent: #10a37f;
+  --herdr-accent: #0b7a5e;   /* the dashboard accent, darkened so white text on it is >= 4.5:1 */
   --herdr-radius: 8px;
   color-scheme: light;
 }
@@ -23,7 +23,7 @@ html, body {
   background: var(--herdr-surface);
   color: var(--herdr-text);
   border-bottom: 1px solid var(--herdr-border);
-  font: 500 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: 500 14px/1.4 var(--font-sans, Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
 }
 
 .herdr-landing-notice {
@@ -39,7 +39,7 @@ html, body {
   color: #fff;
   border: 0;
   border-radius: var(--herdr-radius);
-  font: 600 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: 600 14px/1.4 var(--font-sans, Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
   cursor: pointer;
 }
 

@@ -56,6 +56,8 @@ _DIGITS = re.compile(r"[0-9]{1,15}\Z")
 _HTML: Final = "text/html; charset=utf-8"
 _JS: Final = "text/javascript; charset=utf-8"
 _CSS: Final = "text/css; charset=utf-8"
+_FONT: Final = "font/woff2"
+FONT_CACHE: Final = "public, max-age=86400"   # fixed file names: one day, not immutable
 # Every file the page loads, by EXACT path (url -> (source, content type)).  A source is relative to ``web_root``, or
 # ("share_static", name) for the sign-in helpers shared with the share viewer.  The page CSP names exactly these paths
 # (never 'self'), so adding a file here is the one place a new script or style is admitted.
@@ -68,7 +70,9 @@ _STATIC: Final = {"/": ("member-artifacts.html", _HTML),
                   "/my/sha256-stream.js": ("sha256-stream.js", _JS),
                   "/my/herdr-web-components/util.js": ("herdr-web-components/util.js", _JS),
                   "/my/lab-signin.js": (("share_static", "lab-signin.js"), _JS),
-                  "/my/theme.css": ("herdr-design-system/theme.css", _CSS),
+                  "/my/tokens.css": (("share_static", "tokens.css"), _CSS),
+                  "/my/fonts/inter-latin-400.woff2": (("share_static", "fonts/inter-latin-400.woff2"), _FONT),
+                  "/my/fonts/inter-latin-600.woff2": (("share_static", "fonts/inter-latin-600.woff2"), _FONT),
                   "/my/base.css": ("herdr-design-system/base.css", _CSS),
                   "/my/member-artifacts.css": ("member-artifacts.css", _CSS)}
 _SHARE_STATIC: Final = Path(__file__).resolve().parent / "share_static"
@@ -187,7 +191,8 @@ class MemberWeb:
         h._response_status = status
         h.send_response(status)
         h.send_header("Content-Type", ctype)
-        h.send_header("Cache-Control", "no-store")
+        if "Cache-Control" not in (headers or {}):
+            h.send_header("Cache-Control", "no-store")
         h.send_header("X-Content-Type-Options", "nosniff")
         h.send_header("Referrer-Policy", "no-referrer")
         h.send_header("Content-Length", str(len(payload)))
@@ -270,9 +275,12 @@ class MemberWeb:
         scripts = " ".join(f"{self.origin}{u}" for u in _STATIC if u.endswith(".js"))
         styles = " ".join(f"{self.origin}{u}" for u in _STATIC if u.endswith(".css"))
         csp = (f"default-src 'none'; script-src {scripts}; style-src {styles}; "
-               f"img-src 'self' data:; connect-src {connect}; frame-src 'none'; object-src 'none'; "
+               f"img-src 'self' data:; font-src 'self'; connect-src {connect}; frame-src 'none'; object-src 'none'; "
                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-        self._send(h, 200, target.read_bytes(), ctype, {"Content-Security-Policy": csp, "X-Frame-Options": "DENY"})
+        extra = {"Content-Security-Policy": csp, "X-Frame-Options": "DENY"}
+        if ctype == _FONT:
+            extra["Cache-Control"] = FONT_CACHE
+        self._send(h, 200, target.read_bytes(), ctype, extra)
 
     def _cognito_origin(self) -> str | None:
         domain = self.public_config.get("hosted_ui_domain")

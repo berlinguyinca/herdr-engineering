@@ -316,7 +316,7 @@ def test_the_page_csp_names_exact_files_and_never_a_bare_self_for_scripts(stack)
             "member-artifacts-app.js", "member-artifacts-view.js", "member-api.js", "member-upload.js", "sha256-stream.js",
             "herdr-web-components/util.js", "lab-signin.js"))
         assert sorted(parts["style-src"]) == sorted(f"{ORIGIN}/my/{n}" for n in (
-            "theme.css", "base.css", "member-artifacts.css"))
+            "tokens.css", "base.css", "member-artifacts.css"))
         assert parts["frame-src"] == ["'none'"] and parts["object-src"] == ["'none'"]
         assert "'unsafe-inline'" not in csp and "'unsafe-eval'" not in csp
         assert parts["connect-src"] == [f"{ORIGIN}/api/member/", "https://auth.lab.example"]
@@ -335,13 +335,13 @@ def test_config_exposes_only_the_public_sign_in_facts(stack):
 
 def test_every_page_file_is_served_with_its_type_and_the_same_csp(stack):
     for name in ("member-artifacts-app.js", "member-artifacts-view.js", "member-api.js", "member-upload.js", "sha256-stream.js",
-                 "member-artifacts.css", "herdr-web-components/util.js", "herdr-design-system/theme.css",
+                 "member-artifacts.css", "herdr-web-components/util.js",
                  "herdr-design-system/base.css"):
         target = stack.web / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(f"/* {name} */")
     for path, kind in (("member-artifacts-app.js", "text/javascript"), ("member-artifacts.css", "text/css"),
-                       ("herdr-web-components/util.js", "text/javascript"), ("theme.css", "text/css"),
+                       ("herdr-web-components/util.js", "text/javascript"), ("tokens.css", "text/css"),
                        ("lab-signin.js", "text/javascript")):
         got = req(stack, "GET", f"/my/{path}", member=None)
         assert got.status == 200 and got.headers["content-type"].startswith(kind), path

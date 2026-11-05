@@ -152,7 +152,10 @@ VIEWER_FILE = "viewer.html"
 STATIC_FILES = {"lab-signin.js": "text/javascript; charset=utf-8", "share.js": "text/javascript; charset=utf-8", "share.css": "text/css; charset=utf-8",
                 "annotate.js": "text/javascript; charset=utf-8", "anchor.js": "text/javascript; charset=utf-8",
                 "annotate.css": "text/css; charset=utf-8", "landing.js": "text/javascript; charset=utf-8",
-                "landing.css": "text/css; charset=utf-8"}
+                "landing.css": "text/css; charset=utf-8", "tokens.css": "text/css; charset=utf-8"}
+# The bundled Inter files (``share_static/fonts/``).  The names carry no version, so the cache is one day, not immutable.
+FONT_FILES = {"inter-latin-400.woff2": "font/woff2", "inter-latin-600.woff2": "font/woff2"}
+FONT_CACHE = "public, max-age=86400"
 VIEW_FILE = "view.html"
 ANNOTATIONS_MAX_BYTES = 32 * 1024 * 1024     # the annotations file cap (the worker rotates it long before)
 ANNOTATION_LINE_MAX = 65536                  # the worker's max_line_bytes: a longer line would be dropped at ingest
@@ -1781,6 +1784,8 @@ class ShareHandler(BaseHTTPRequestHandler):
                 return self._send_viewer_bytes(lab, lab.config_json, "application/json")
             if name in STATIC_FILES:
                 return self._send_static(lab, name, STATIC_FILES[name])
+        if len(parts) == 5 and parts[2:4] == ["static", "fonts"] and parts[4] in FONT_FILES:
+            return self._send_static(lab, parts[4], FONT_FILES[parts[4]], subdir=("fonts",))
         if len(parts) == 6 and parts[2:5] == ["static", "vendor", "pdfjs"] and parts[5] in VENDOR_FILES:
             return self._send_static(lab, parts[5], VENDOR_FILES[parts[5]], subdir=("vendor", "pdfjs"))
         return deny(self, None, "unknown_route")
@@ -1788,7 +1793,7 @@ class ShareHandler(BaseHTTPRequestHandler):
     def _send_static(self, lab: LabSettings, name: str, content_type: str, subdir: tuple[str, ...] = ()):
         """One allow-listed file straight from ``static_dir`` (no directory walk, no symlink), or the 404.
         ``subdir`` is the fixed vendored-library directory: bigger cap, immutable cache (the path pins the release)."""
-        opened = _open_beneath(lab.static_dir, [*subdir, name], max_size=VENDOR_MAX_BYTES if subdir else STATIC_MAX_BYTES)
+        opened = _open_beneath(lab.static_dir, [*subdir, name], max_size=VENDOR_MAX_BYTES if subdir == ("vendor", "pdfjs") else STATIC_MAX_BYTES)
         if opened is None:
             return deny(self, None, "static_missing")
         fd, st = opened
@@ -1805,6 +1810,8 @@ class ShareHandler(BaseHTTPRequestHandler):
         body = b"".join(chunks)
         if not subdir:
             return self._send_viewer_bytes(lab, body, content_type)
+        if subdir == ("fonts",):
+            return self._send_viewer_bytes(lab, body, content_type, FONT_CACHE)
         etag = vendor_etag(body)
         if etag_matches(self.headers.get("If-None-Match"), etag):
             return self._send_viewer_bytes(lab, body, content_type, VENDOR_CACHE, etag=etag, status=304)
