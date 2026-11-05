@@ -132,3 +132,16 @@ def test_fleet_config_commands_never_print_the_member_secret(tmp_path, capsys):
 def test_central_file_yaml_round_trips(tmp_path):
     central = _central(tmp_path, share=share(), collab={**COLLAB, "members": members()})
     assert yaml.safe_load(central.read_text())
+
+
+def test_member_locations_are_in_the_edge_only_when_members_are_enabled():
+    from pathlib import Path
+
+    from herdr_engineering import fleet_config_cli as fcc
+    edge = Path(fcc.__file__).resolve().parents[1] / "deploy" / "control-plane" / "collab-edge" / "nginx.conf"
+    off = fcc.render_edge_conf(edge.read_text(), share=True, share_host="artifacts.example.test")
+    on = fcc.render_edge_conf(edge.read_text(), share=True, share_host="artifacts.example.test", members=True)
+    assert "/api/member/" not in off and "@member-locations@" not in off
+    assert "location /api/member/ {" in on and "location = / {" in on and "location /my/ {" in on
+    assert "proxy_request_buffering off;" in on and "client_max_body_size 17m;" in on
+    assert on.count("location / { return 404; }") == off.count("location / { return 404; }")

@@ -462,8 +462,12 @@ EDGE_SHARE_SNIPPET = "share-http.conf"
 EDGE_SHARE_HOST_MARKER = "@share_host@"
 
 
+EDGE_MEMBER_MARKER = "    # @member-locations@\n"
+EDGE_MEMBER_SNIPPET = "member-http.conf"
+
+
 def render_edge_conf(template: str, *, share: bool, share_host: str | None = None,
-                     snippets_dir: Path | None = None) -> str:
+                     snippets_dir: Path | None = None, members: bool = False) -> str:
     """The edge's nginx.conf: the template, plus the share host's zones, upstream and server when ``share`` is true.
 
     ``share_host`` (required then) is the share origin's host, lowercase, a port allowed; the server answers to the
@@ -481,7 +485,17 @@ def render_edge_conf(template: str, *, share: bool, share_host: str | None = Non
     if EDGE_SHARE_HOST_MARKER not in snippet:
         raise FleetConfigError(f"{EDGE_SHARE_SNIPPET} must hold {EDGE_SHARE_HOST_MARKER}")
     snippet = snippet.replace(EDGE_SHARE_HOST_MARKER, share_host.split(":")[0])
+    if snippet.count(EDGE_MEMBER_MARKER) != 1:
+        raise FleetConfigError(f"{EDGE_SHARE_SNIPPET} must hold the marker line {EDGE_MEMBER_MARKER.strip()!r} once")
+    member = (base / EDGE_MEMBER_SNIPPET).read_text(encoding="utf-8") if members else ""
+    snippet = snippet.replace(EDGE_MEMBER_MARKER, member)      # members off: the share host serves /s/ and nothing else
     return template.replace(EDGE_SHARE_MARKER, snippet)
+
+
+def _members_enabled(cfg: FleetConfig) -> bool:
+    collab = cfg.section("control_plane").get("collab")
+    members = collab.get("members") if isinstance(collab, dict) else None
+    return isinstance(members, dict) and members.get("enabled") is True
 
 
 def render_edge(cfg: FleetConfig, template: Path, out: Path) -> None:
@@ -493,7 +507,7 @@ def render_edge(cfg: FleetConfig, template: Path, out: Path) -> None:
         origin = https_origin(share_values(cfg)["share"]["public_url"])
         share_host = origin.removeprefix("https://") if origin else None
     text = render_edge_conf(template.read_text(encoding="utf-8"), share=share, share_host=share_host,
-                            snippets_dir=template.parent)
+                            snippets_dir=template.parent, members=share and _members_enabled(cfg))
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")

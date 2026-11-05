@@ -313,7 +313,7 @@ class ControlPlaneServer:
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
-                 assistant_workers=None):
+                 assistant_workers=None, member_web=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -603,6 +603,7 @@ class ControlPlaneServer:
             self.assistant.host_candidates = lambda: (
                 self.collab.assistant_runtime_host_candidates() if self.collab is not None else [])
         self.collab_require_https = collab_require_https
+        self.member_web = member_web          # member_web.MemberWeb or None: the member host's web API (Task 11)
         # ADR-0008 P2: signed read-only export endpoints (/api/v1/federation/*). Inert unless the hot YAML switches
         # `control_plane.federation` on; the gateway is rebuilt if `collab` is swapped (tests do).
         self.federation_source = federation_source
@@ -2160,6 +2161,18 @@ def _make_handler(server, public=False, operator=False):
             """Everything not on the allow-list is a plain 404: the legacy API, the
             dashboard and its static files do not exist on this listener."""
             path = self.path.split("?")[0]
+            mw = server.member_web
+            if mw is not None:
+                # The member host (exactly one Host header naming it) is served by the member web API alone; on any
+                # other Host its API paths do not exist.
+                if mw.owns(self):
+                    cl = self.headers.get_all("Content-Length") or []
+                    if (len(cl) > 1 or "Transfer-Encoding" in self.headers
+                            or (self.command == "GET" and cl and cl[0].strip() not in ("", "0"))):
+                        return self._deny(400, "ambiguous request framing")
+                    return mw.handle(self)
+                if path.startswith("/api/member/") or self.command == "PUT":
+                    return self._deny(404, "not found")
             # Request framing must be unambiguous: the edge and this server must agree where a
             # request ends, or a pipelined second request could be smuggled behind the first.
             cl = self.headers.get_all("Content-Length") or []
@@ -2246,7 +2259,8 @@ def _make_handler(server, public=False, operator=False):
         def handle_expect_100(self):
             """``Expect: 100-continue`` on POST /mcp is answered only after the large-body gate has decided (see
             ``_continue_100``); inviting the body first would defeat the pre-authentication gate."""
-            if self.command == "POST" and self.path.split("?")[0] == "/mcp":
+            if (self.command == "POST" and self.path.split("?")[0] == "/mcp") or (
+                    self.command == "PUT" and public and self.path.startswith("/api/member/")):
                 self._expect_100_pending = True
                 return True
             return super().handle_expect_100()
@@ -2570,6 +2584,8 @@ def _make_handler(server, public=False, operator=False):
         def do_PUT(self):
             # PUT exists only for assistant-apps (client credentials, blocked calendars); everything else keeps its flat
             # 501, decided before any listener-specific handler (operator/public/federation/collab) sees the request.
+            if public and server.member_web is not None and self.path.startswith("/api/member/"):
+                return self._timed_request(self._public)      # the member run upload (only on the member host)
             if operator or public or not self.path.startswith("/api/v1/assistant-apps/"):
                 return self._timed_request(lambda: self._send_json(501, {"error": "not implemented"}))
             return self._timed_request(self._mutate_verb)

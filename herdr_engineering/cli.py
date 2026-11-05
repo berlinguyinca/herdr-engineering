@@ -4071,6 +4071,7 @@ def _cmd_cp_web(args) -> int:
         rakazo_bridge_config(cp.get("rakazo_bridge"))      # an enabled but malformed bridge stops startup here, clearly
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    member_web = _member_web(cp, collab, args)
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              rakazo_bridge=cp.get("rakazo_bridge"), rakazo_bridge_dsn=dsn, assistant_apps_dsn=dsn,
                              federation_source=federation_source,
@@ -4110,7 +4111,8 @@ def _cmd_cp_web(args) -> int:
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
                              annotation_store=annotation_store, member_admin=member_admin,
-                             collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled)
+                             collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled,
+                             member_web=member_web)
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read
         svr.artifact_graph_gate.load_retractions(artifact_adapter("load_retractions"))
@@ -4465,6 +4467,19 @@ def _members_settings(cp) -> dict | None:
         return parse_members(raw, public_host=host)
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+
+
+def _member_web(cp, collab, args):
+    """The member web API for collab-public (None unless members are enabled on a collab-only server)."""
+    got = _members_settings(cp)
+    if got is None or collab is None or not getattr(args, "collab_only", False):
+        return None
+    from .control_plane.member_web import MemberWeb
+    share = cp.get("share") if isinstance(cp.get("share"), dict) else {}
+    return MemberWeb(collab, public_host=got["public_host"], session_secret=got["session_secret"].encode("utf-8"),
+                     session_seconds=int(share.get("session_seconds", 14400)),
+                     web_root=getattr(args, "web_root", None), public_config=collab.public_config,
+                     require_https=bool(getattr(args, "collab_require_https", False)))
 
 
 def _collab_member_kwargs(cp, *, state_dir=None) -> dict:
@@ -5005,7 +5020,8 @@ def _wire_collab_artifacts_bridge(service, cp, mirror_dir, outbox_dir):
     service.artifact_bridge = bridge
     if getattr(service, "member_group", None):
         from .control_plane.artifact_member_service import MemberService
-        service.member_service = MemberService(service, bridge)
+        got = _members_settings(cp)
+        service.member_service = MemberService(service, bridge, got["limits"] if got else None)
     try:
         bridge.start()
     except BaseException:
