@@ -140,3 +140,90 @@ test('invalid timestamps and zone-less strings are treated as missing', () => {
 test('rejects an invalid time zone', () => {
   assert.throws(() => weekWindow({now, timeZone: 'Mars/Base', weekStartsOn: 1}), RangeError);
 });
+
+// ---- G1: server lifecycle events (GET /api/v1/work/weekly-events) ----
+const ev = (kind, work_id, occurred_at, o = {}) => ({kind, work_id, source: work_id.startsWith('session:') ? 'session' : 'mission', entity_id: work_id.split(':').slice(1).join(':'), occurred_at, evidence: {ref: `ev-${kind}-${work_id}`, event_type: 'X'}, ...o});
+const cov = (o = {}) => ({complete: false, horizon: '2026-10-01T00:00:00Z', truncated: false, reasons: ['r'], ...o});
+const hist = (events, coverage = cov()) => ({events, coverage});
+
+test('G1: server started/finished events supply real timestamps, including work no longer in the snapshot', () => {
+  const out = week([item('live')], {serverHistory: hist([
+    ev('started', 'mission:live', '2026-11-03T10:00:00Z'),
+    ev('started', 'mission:gone', '2026-11-03T11:00:00Z'), ev('finished', 'mission:gone', '2026-11-04T09:00:00Z'),
+    ev('started', 'mission:old', '2026-10-20T11:00:00Z'), ev('finished', 'mission:old', '2026-11-03T12:00:00Z')])});
+  assert.equal(out.started.count, 2);          // live + gone; old started last month
+  assert.equal(out.finished.count, 2);         // gone + old
+  assert.equal(out.started.coverage, 'partial');
+  assert.equal(out.started.horizon, '2026-10-01T00:00:00.000Z');
+});
+test('G1: complete only when the server says complete, untruncated, and the horizon precedes the window', () => {
+  const events = [ev('started', 'mission:a', '2026-11-03T10:00:00Z')];
+  const ok = week([item('a')], {serverHistory: hist(events, cov({complete: true}))});
+  assert.equal(ok.started.coverage, 'complete');
+  assert.equal(ok.finished.coverage, 'complete');
+  for (const bad of [cov({complete: true, truncated: true}), cov({complete: true, horizon: '2026-11-05T00:00:00Z'}), cov({complete: true, horizon: null}), cov({complete: 'true'}), cov({complete: false})]) {
+    assert.equal(week([item('a')], {serverHistory: hist(events, bad)}).started.coverage, 'partial', JSON.stringify(bad));
+  }
+});
+test('G1: historyComplete:true from the caller alone never makes server-less data complete', () => {
+  assert.equal(week([item('a', {started_at: '2026-11-03T10:00:00Z'})], {serverHistory: hist([], cov({complete: false})), historyComplete: true}).started.coverage, 'partial');
+});
+test('G1: duplicate events and snapshot + event for the same work count once', () => {
+  const out = week([item('a', {started_at: '2026-11-03T10:00:00Z'})], {serverHistory: hist([
+    ev('started', 'mission:a', '2026-11-03T10:00:00Z'), ev('started', 'mission:a', '2026-11-03T10:00:00Z'),
+    ev('started', 'mission:a', '2026-11-03T10:00:00Z', {evidence: {ref: 'other'}})])});
+  assert.equal(out.started.count, 1);
+});
+test('G1: conflicting server timestamps for one item degrade to partial and keep the earliest', () => {
+  const out = week([], {serverHistory: hist([ev('started', 'mission:a', '2026-11-03T10:00:00Z'), ev('started', 'mission:a', '2026-11-03T12:00:00Z')], cov({complete: true}))});
+  assert.equal(out.started.count, 1);
+  assert.equal(out.started.coverage, 'partial');
+});
+test('G1: sessions owned by a mission are not counted separately (reassociation), standalone ones are', () => {
+  const out = week([], {serverHistory: hist([
+    ev('started', 'mission:pi:m1', '2026-11-03T10:00:00Z', {mission_key: 'pi:m1'}),
+    ev('started', 'session:h1/s-owned', '2026-11-03T10:00:01Z', {mission_key: 'pi:m1', host_id: 'h1'}),
+    ev('started', 'session:h1/s-free', '2026-11-03T10:00:02Z', {host_id: 'h1'})])});
+  assert.equal(out.started.count, 2);
+});
+test('G1: a snapshot standalone session that the server knows belongs to a mission is dropped', () => {
+  const snapshot = {work_id: 'session:h1/s1', title: 's1', source: 'session', source_ref: 's1', session_ids: ['s1'], pane_refs: [], links: [], evidence: [], lifecycle: 'running', coverage: 'partial', started_at: '2026-11-03T10:00:00Z'};
+  const out = week([snapshot], {serverHistory: hist([ev('started', 'session:h1/s1', '2026-11-03T10:00:00Z', {mission_key: 'pi:m1'})])});
+  assert.equal(out.started.count, 0);
+  assert.equal(out.total_items, 0);
+});
+test('G1: DST fall-back week window decides membership by instant (server events)', () => {
+  const n = Date.parse('2026-11-03T12:00:00Z');
+  const out = weeklyActivity({items: [], now: n, timeZone: LA, weekStartsOn: 0, serverHistory: hist([
+    ev('started', 'mission:a', '2026-11-01T06:59:59Z'),   // 23:59:59 PDT Sat: previous week
+    ev('started', 'mission:b', '2026-11-01T07:00:00Z'),   // 00:00 PDT Sun: in
+    ev('started', 'mission:c', '2026-11-01T08:30:00Z'),   // repeated 01:30 PST hour: in, once
+    ev('started', 'mission:d', '2026-11-08T08:00:00Z')])}); // next week start: out
+  assert.equal(out.started.count, 2);
+});
+test('G1: horizon in the middle of the week stays partial and exposes the horizon', () => {
+  const out = week([], {serverHistory: hist([ev('started', 'mission:a', '2026-11-04T10:00:00Z')], cov({complete: true, horizon: '2026-11-04T00:00:00Z'}))});
+  assert.equal(out.started.coverage, 'partial');
+  assert.equal(out.started.horizon, '2026-11-04T00:00:00.000Z');
+});
+test('G1: no server history (read failed) keeps the old partial behaviour and shows no horizon', () => {
+  const out = week([item('a', {started_at: '2026-11-03T10:00:00Z'})], {serverHistory: null});
+  assert.equal(out.started.coverage, 'partial');
+  assert.equal(out.started.horizon, undefined);
+});
+test('G1: a successful read with no events is a bounded zero, not unknown', () => {
+  const out = week([], {serverHistory: hist([])});
+  assert.equal(out.started.count, 0);
+  assert.equal(out.started.coverage, 'partial');
+  assert.equal(out.finished.count, 0);
+});
+test('G1: malformed events are ignored (no title/shape guessing)', () => {
+  const out = week([], {serverHistory: hist([null, 7, {kind: 'started'}, ev('started', 'mission:a', 'not-a-date'), ev('started', 'mission:b', '2026-11-03T10:00:00'), ev('bogus', 'mission:c', '2026-11-03T10:00:00Z'), ev('started', 'mission:ok', '2026-11-03T10:00:00Z')])});
+  assert.equal(out.started.count, 1);
+});
+test('G1: server quota-pause event supplies evidence for a snapshot paused item', () => {
+  const paused = item('q', {lifecycle: 'paused_quota'});
+  const out = week([paused], {serverHistory: hist([ev('paused_quota', 'mission:q', '2026-11-03T10:00:00Z')])});
+  assert.equal(out.paused_quota.count, 1);
+  assert.equal(out.paused_quota.unevidenced, 0);
+});

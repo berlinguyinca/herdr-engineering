@@ -11,7 +11,7 @@ import { createResourcePoller } from './refresh-bus.js';
 import { requestErrorDetail } from './dashboard-load-state.js';
 import { morph, handOff } from './patch.js';
 import { workSummaries } from './work-summary.js';
-import { weeklyActivity } from './work-week.js';
+import { weeklyActivity, weekWindow } from './work-week.js';
 
 const records = value => Array.isArray(value) ? value.filter(v => v && typeof v === 'object' && !Array.isArray(v)) : [];
 const text = value => typeof value === 'string' ? value : '';
@@ -181,7 +181,7 @@ export function weekCardModel(data = {}, states = {}, received = Date.now(), now
   const timeZone = userTimeZone(data);
   const loaded = WEEK_SOURCES.filter(key => states[key]?.loaded), missing = WEEK_SOURCES.filter(key => !states[key]?.loaded);
   const items = workSummaries({projections: records(data.projections), recorded: records(data.missions), sessions: records(data.sessions), received, now});
-  const week = weeklyActivity({items, now, timeZone, historyComplete: false});
+  const week = weeklyActivity({items, now, timeZone, historyComplete: false, serverHistory: data.weeklyHistory ?? null});
   const start = Date.parse(week.window.start), end = Date.parse(week.window.end);
   const inWindow = value => { const ms = Date.parse(text(value)); return ms >= start && ms < end; };
   const visible = items.filter(item => {
@@ -193,12 +193,14 @@ export function weekCardModel(data = {}, states = {}, received = Date.now(), now
   const sorted = [...visible].sort((a, b) => rank(a) - rank(b) || (Date.parse(b.updated_at || '') || 0) - (Date.parse(a.updated_at || '') || 0));
   const groups = ['active', 'paused', 'completed', 'unconfirmed'].map(key => ({key, items: sorted.filter(item => weekGroup(item) === key)})).filter(group => group.items.length);
   const partial = missing.length > 0 || ['started', 'finished', 'open', 'paused_quota', 'attention_needed'].some(key => week[key].coverage !== 'complete');
-  return {week, groups, timeZone, loaded, missing, partial, total: items.length};
+  return {week, groups, timeZone, loaded, missing, partial, total: items.length, history: Boolean(data.weeklyHistory), historyFailed: Boolean(states.weekly?.error)};
 }
-function weekMetric(label, m) {
+const dayIn = (iso, timeZone) => { try { return new Intl.DateTimeFormat('en-CA', {timeZone, year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date(iso)); } catch { return String(iso).slice(0, 10); } };
+function weekMetric(label, m, timeZone = 'UTC') {
   const unknown = m.count === null, partial = m.coverage === 'partial';
   const value = unknown ? '—' : String(m.count);
-  const badge = unknown ? 'unknown' : partial ? `at least ${m.count} (partial)` : 'complete';
+  const horizon = partial && m.horizon ? ` · history from ${dayIn(m.horizon, timeZone)}` : '';
+  const badge = unknown ? 'unknown' : partial ? `at least ${m.count} (partial)${horizon}` : 'complete';
   const full = `${label}: ${unknown ? 'unknown' : partial ? `at least ${m.count}, partial data` : m.count}${m.basis === 'snapshot' ? ', current snapshot' : ''}`;
   return `<div class="ov-metric wk-metric" role="group" aria-label="${esc(full)}"><strong>${esc(value)}</strong><span>${esc(label)}</span><small class="wk-badge" data-coverage="${esc(m.coverage)}">${esc(badge)}${m.basis === 'snapshot' ? ' · snapshot' : ''}</small></div>`;
 }
@@ -222,10 +224,14 @@ export function renderWeekCard(data = {}, states = {}, received = Date.now(), no
     return `${heading}${errors}${failed.length ? '' : `<div data-skeleton aria-busy="true" role="status" aria-label="Loading this week"><div class="hd-skeleton ov-skeleton" aria-hidden="true"></div>${loadingProgress('this week')}</div>`}`;
   }
   const m = weekCardModel(data, states, received, now), w = m.week;
-  const banner = m.partial ? `<p class="ov-warning wk-banner" role="status">Partial data: ${m.missing.length ? `still waiting for ${esc(m.missing.map(key => SOURCE_LABELS[key].toLowerCase()).join(', '))}. ` : ''}Started and Finished only count work with recorded timestamps in the current snapshot, so they are lower bounds. Open, Paused and Needs attention are snapshots of right now.</p>` : '';
+  const historyComplete = w.started.coverage === 'complete' && w.finished.coverage === 'complete';
+  const historyNote = historyComplete ? ''
+    : m.history ? `History is read from stored start and finish events since ${w.started.horizon ? esc(dayIn(w.started.horizon, m.timeZone)) : 'the first stored event'}; work before that, or work the control plane never saw start or finish, is not counted, so Started and Finished are lower bounds. `
+    : `${m.historyFailed ? 'The weekly history could not be read, so ' : ''}Started and Finished only count work with recorded timestamps in the current snapshot, so they are lower bounds. `;
+  const banner = m.partial ? `<p class="ov-warning wk-banner" role="status">Partial data: ${m.missing.length ? `still waiting for ${esc(m.missing.map(key => SOURCE_LABELS[key].toLowerCase()).join(', '))}. ` : ''}${historyNote}Open, Paused and Needs attention are snapshots of right now.</p>` : '';
   const rows = m.groups.map(group => `<h3 class="ov-sub">${GROUP_LABEL[group.key]} <span class="wk-count">(${group.items.length})</span></h3><ul class="ov-list" aria-label="${esc(GROUP_LABEL[group.key])} work">${group.items.slice(0, WEEK_ROW_LIMIT).map(weekRow).join('')}</ul>${group.items.length > WEEK_ROW_LIMIT ? empty(`Showing ${WEEK_ROW_LIMIT} of ${group.items.length}.`) : ''}`).join('');
   return `${heading}${errors}
-    <div class="ov-metrics wk-metrics">${weekMetric('Started', w.started)}${weekMetric('Finished', w.finished)}${weekMetric('Open', w.open)}${weekMetric('Quota-paused', w.paused_quota)}${weekMetric('Needs attention', w.attention_needed)}</div>
+    <div class="ov-metrics wk-metrics">${weekMetric('Started', w.started, m.timeZone)}${weekMetric('Finished', w.finished, m.timeZone)}${weekMetric('Open', w.open)}${weekMetric('Quota-paused', w.paused_quota)}${weekMetric('Needs attention', w.attention_needed)}</div>
     ${banner}${rows || empty('No work items are reported yet.')}
     <p class="ov-note">Week of ${esc(w.window.start.slice(0, 10))} (${esc(m.timeZone)}), counted from recorded timestamps. Progress is shown only where a mission reports measured evidence.</p>`;
 }
@@ -511,6 +517,23 @@ export function mountOverview(container, client, { freshness = () => null, workC
     else data.snoozed.clear();
     saveSnoozed(data.snoozed);signatures.delete('missions');userChange=true;draw();
   });
+  // G1: one read of the server's stored lifecycle events for the current week per overview load (no polling). A failed or
+  // malformed read leaves the card on its snapshot-only partial counts; coverage comes only from the server's answer.
+  const weeklyAbort=new AbortController();
+  if(workCenter && typeof client.weeklyEvents==='function') {
+    states.weekly={loaded:false,error:false};
+    let window_;
+    try { const win=weekWindow({now:Date.now(),timeZone:userTimeZone(data)}); window_={since:new Date(win.start).toISOString(),until:new Date(win.end).toISOString()}; } catch { window_=null; }
+    Promise.resolve(window_ && client.weeklyEvents({...window_,limit:500,signal:weeklyAbort.signal})).then(body=>{
+      if(disposed || !window_)return;
+      if(!Array.isArray(body?.events) || !body.coverage || typeof body.coverage!=='object')throw new Error('Invalid response');
+      data.weeklyHistory={events:body.events,coverage:body.coverage};
+      states.weekly={loaded:true,error:false};draw();
+    }).catch(error=>{
+      if(disposed || weeklyAbort.signal.aborted)return;
+      states.weekly={loaded:false,error:`Could not read weekly history: ${requestErrorDetail(error)}`};draw();
+    });
+  }
   document.addEventListener('visibilitychange',visibility);visibility();
-  return {refresh,dispose(){disposed=true;clearInterval(clock);polling.dispose();document.removeEventListener('visibilitychange',visibility);}};
+  return {refresh,dispose(){disposed=true;weeklyAbort.abort();clearInterval(clock);polling.dispose();document.removeEventListener('visibilitychange',visibility);}};
 }

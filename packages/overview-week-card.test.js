@@ -63,3 +63,35 @@ test('loading, error and no-timezone states', () => {
   assert.equal(userTimeZone({timeZone: 'Not/AZone'}), 'UTC');
   assert.ok(userTimeZone({}).length > 0);
 });
+
+// ---- G1: server weekly history on the card ----
+const startedEv = (id, at, o = {}) => ({kind: 'started', work_id: `mission:${id}`, source: 'mission', entity_id: id, occurred_at: at, evidence: {ref: `e-${id}`, event_type: 'MissionStarted'}, ...o});
+const history = (events, coverage = {}) => ({events, coverage: {complete: false, horizon: '2026-10-20T00:00:00Z', truncated: false, reasons: ['x'], ...coverage}});
+
+test('G1: server events drive Started and the badge shows the history horizon', () => {
+  const html = render({weeklyHistory: history([startedEv('a', '2026-11-03T10:00:00Z'), startedEv('b', '2026-11-02T10:00:00Z')])});
+  assert.match(html, /<strong>2<\/strong><span>Started<\/span><small[^>]*data-coverage="partial">at least 2 \(partial\) · history from 2026-10-20/);
+  assert.match(html, /wk-banner/);
+  assert.match(html, /History is read from stored start and finish events since 2026-10-20/);
+});
+test('G1: complete shows only when the server says complete, with no banner for history', () => {
+  const html = render({weeklyHistory: history([startedEv('a', '2026-11-03T10:00:00Z')], {complete: true}), projections: [], missions: [], sessions: []});
+  assert.match(html, /<span>Started<\/span><small[^>]*data-coverage="complete">complete/);
+  assert.match(html, /<span>Finished<\/span><small[^>]*data-coverage="complete">complete/);
+  assert.doesNotMatch(html, /Started and Finished only count work with recorded timestamps/);
+});
+test('G1: truncated or mid-week horizon stays partial', () => {
+  const t = render({weeklyHistory: history([startedEv('a', '2026-11-03T10:00:00Z')], {complete: true, truncated: true})});
+  assert.match(t, /<span>Started<\/span><small[^>]*data-coverage="partial">/);
+  const h = render({weeklyHistory: history([startedEv('a', '2026-11-03T10:00:00Z')], {complete: true, horizon: '2026-11-03T00:00:00Z'})});
+  assert.match(h, /<span>Started<\/span><small[^>]*data-coverage="partial">at least 1 \(partial\) · history from 2026-11-03/);
+});
+test('G1: failed weekly read keeps the old partial card and says the history could not be read', () => {
+  const html = render({projections: [projection()], missions: [{mission_id: 'MSN-1', title: 'x', created_at: '2026-11-03T10:00:00Z', updated_at: '2026-11-03T11:00:00Z'}]}, {...loaded, weekly: {error: 'HTTP 500'}});
+  assert.match(html, /at least 1 \(partial\)/);
+  assert.doesNotMatch(html, /history from/);
+  assert.match(html, /weekly history could not be read/i);
+});
+test('G1: model never hardcodes complete without server coverage', () => {
+  assert.equal(weekCardModel({timeZone: 'UTC'}, loaded, now, now).week.started.coverage === 'complete', false);
+});

@@ -19,7 +19,8 @@ Status: code complete on branch `feat/wc001-s6-validation-rollout`; **nothing is
 - The flag does not change any permission: the same read endpoints, same credentials, no writes.
 
 ## What the numbers mean
-- **Started / Finished**: missions with a recorded timestamp in the current Monday-to-Monday week (browser time zone). They are lower bounds: the card says "at least N (partial)" because the server has no weekly history, so work that left the snapshot cannot be counted. "unknown" with a dash means no timestamps exist at all; it is never shown as 0.
+- **Started / Finished (G1)**: one read of `GET /api/v1/work/weekly-events` per Overview load (flag on only; no polling) supplies stored started/finished events, merged by work id. The badge reads "at least N (partial) - history from <date>" where the date is the earliest stored lifecycle event (the horizon). "complete" appears only if the server says `coverage.complete:true` for the whole week; this build never does (see Known gaps). If the read fails the card falls back to the snapshot-only numbers and says so.
+- **Started / Finished (snapshot fallback)**: missions with a recorded timestamp in the current Monday-to-Monday week (browser time zone). They are lower bounds: the card says "at least N (partial)" because the server has no weekly history, so work that left the snapshot cannot be counted. "unknown" with a dash means no timestamps exist at all; it is never shown as 0.
 - **Open / Quota-paused / Needs attention**: snapshots of right now. Quota-paused counts only missions whose status says quota. Needs attention is blocked, in review or failed with an update this week (approximation).
 - **Coverage words**: *complete* = every source loaded and nothing ambiguous; *partial* = a source is missing/failed or something was ambiguous, so the number is a lower bound; *unknown* = no evidence, no number is shown.
 - **Unconfirmed** group: the report is stale, disconnected or only recorded, so the state may have changed.
@@ -28,7 +29,7 @@ Status: code complete on branch `feat/wc001-s6-validation-rollout`; **nothing is
 - The card shows at most 5 rows per group ("Showing 5 of N").
 
 ## Known gaps
-- No server-side weekly history (no windowed event query; the intel store keeps no mission lifecycle events), so Started/Finished stay partial and the partial banner is always visible.
+- Weekly history (G1): `GET /api/v1/work/weekly-events?since=&until=&limit=&after=` reads the in-memory event streams (same source and auth as `/api/v1/events`; 404 when the flag is off; max 31-day span, limit max 500). It cannot prove completeness: start events are written when the control plane first sees the work (not the true start), the durable Postgres sink is best-effort and not retried, and work that never ends has no finish event. So `coverage.complete` is always false here, Started/Finished stay "at least N (partial)", and the banner stays visible. Quota-paused history is not emitted by any Python code, so no paused_quota events exist yet.
 - Issue cards never link to Herdr: no issue-to-mission relationship is recorded anywhere.
 - A PR links only for missions that have a stored outcome (ended missions); a PR recorded by a still-running mission verifies after it ends. The board reads refs once per page load.
 - The week uses the browser time zone (no user setting) and starts on Monday.

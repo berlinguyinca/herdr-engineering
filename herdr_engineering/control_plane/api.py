@@ -3612,6 +3612,18 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(r.usage_analytics(
                         mission_id=_q(self.path, "mission")))
                 return self._json({"error": "unknown analytics kind"}, 404)
+            if resource == "work":
+                # G1: read-only cross-entity lifecycle window; same viewer-level read auth as /events, gated by work_center_v1.
+                if not getattr(server, "work_center_enabled", False) or parts[4:] != ["weekly-events"]:
+                    return self._json({"error": "not found"}, 404)
+                from .work_weekly import weekly_events
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                for key in ("since", "until", "limit", "after"):
+                    if len(query.get(key, [])) > 1:
+                        raise ValueError(f"{key} must be supplied once")
+                return self._json(weekly_events(
+                    r, since=query.get("since", [None])[0], until=query.get("until", [None])[0],
+                    limit=query.get("limit", [None])[0], after=query.get("after", [None])[0]))
             if resource == "events":
                 if len(parts) > 4 and parts[4] == "stream":
                     return self._sse()

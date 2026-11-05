@@ -82,14 +82,63 @@ function history(inWindow, withTs, total, items, historyComplete) {
   return metric(inWindow, full ? 'complete' : 'partial');
 }
 
+const EVENT_KINDS = new Set(['started', 'finished', 'failed', 'paused_quota']);
+/** Validate and index server lifecycle events by work_id and kind. Malformed rows are ignored, never repaired. */
+function indexServerEvents(history) {
+  const byKey = new Map(); // `${work_id}\u0000${kind}` -> {ms, ref, conflict}
+  const ownedSessions = new Set();
+  let conflict = false;
+  for (const e of Array.isArray(history?.events) ? history.events : []) {
+    if (!e || typeof e !== 'object' || typeof e.work_id !== 'string' || !e.work_id || !EVENT_KINDS.has(e.kind)) continue;
+    const ms = parseTime(e.occurred_at);
+    if (ms === null) continue;
+    if (e.source === 'session' && typeof e.mission_key === 'string' && e.mission_key) { ownedSessions.add(e.work_id); continue; }
+    const key = `${e.work_id}\u0000${e.kind}`, prev = byKey.get(key);
+    if (!prev) byKey.set(key, {ms, ref: e.evidence?.ref});
+    else if (prev.ms !== ms) { conflict = true; if (ms < prev.ms) byKey.set(key, {ms, ref: e.evidence?.ref}); }
+  }
+  return {byKey, ownedSessions, conflict};
+}
+/** Complete only on the server's say-so, an untruncated answer, and a horizon at or before the window start. */
+function serverCoverage(history, windowStart, conflict) {
+  const c = history?.coverage, horizon = parseTime(c?.horizon);
+  const complete = c?.complete === true && c?.truncated !== true && horizon !== null && horizon <= windowStart && !conflict;
+  return {complete, horizon: horizon === null ? undefined : new Date(horizon).toISOString()};
+}
+function serverMetrics(work, index, win, cov) {
+  const inWin = ms => ms !== undefined && ms !== null && ms >= win.start && ms < win.end;
+  const ids = new Set(work.map(i => i.work_id));
+  for (const key of index.byKey.keys()) ids.add(key.split('\u0000')[0]);
+  const byId = new Map(work.map(i => [i.work_id, i]));
+  let started = 0, finished = 0;
+  for (const id of ids) {
+    const item = byId.get(id);
+    const s = index.byKey.get(`${id}\u0000started`)?.ms ?? parseTime(item?.started_at);
+    const f = index.byKey.get(`${id}\u0000finished`)?.ms ?? (item?.lifecycle === 'finished' ? parseTime(item.completed_at) : null);
+    if (inWin(s)) started++;
+    if (inWin(f)) finished++;
+  }
+  const extra = {basis: 'server_events', ...(cov.horizon ? {horizon: cov.horizon} : {})};
+  const coverage = cov.complete ? 'complete' : 'partial';
+  return {started: metric(started, coverage, extra), finished: metric(finished, coverage, extra)};
+}
+
 /**
  * @param {{items: object[], now: number|string|Date, timeZone: string, weekStartsOn?: number, historyComplete?: boolean}} input
  * historyComplete must be asserted by the caller when the items cover every work item that existed in the window
  * (a present snapshot alone never does, so default false caps started/finished at 'partial').
+ * serverHistory ({events, coverage} from GET /api/v1/work/weekly-events, G1) supplies real lifecycle timestamps; with it,
+ * 'complete' comes ONLY from coverage.complete (untruncated, horizon <= window start), never from historyComplete.
  */
-export function weeklyActivity({items = [], now, timeZone, weekStartsOn = 1, historyComplete = false}) {
+export function weeklyActivity({items = [], now, timeZone, weekStartsOn = 1, historyComplete = false, serverHistory = null}) {
   const win = weekWindow({now, timeZone, weekStartsOn});
-  const work = dropOwnedSessions(dedupe(Array.isArray(items) ? items : []));
+  const index = serverHistory && typeof serverHistory === 'object' ? indexServerEvents(serverHistory) : null;
+  let work = dropOwnedSessions(dedupe(Array.isArray(items) ? items : []));
+  if (index) {
+    work = work.filter(i => !index.ownedSessions.has(i.work_id));
+    work = work.map(i => index.byKey.has(`${i.work_id}\u0000paused_quota`) && i.lifecycle === 'paused_quota' && !quotaEvidenced(i)
+      ? {...i, evidence: [...(i.evidence || []), {kind: 'quota_status', ref: index.byKey.get(`${i.work_id}\u0000paused_quota`).ref, timestamp: new Date(index.byKey.get(`${i.work_id}\u0000paused_quota`).ms).toISOString()}]} : i);
+  }
   const inWin = ms => ms !== null && ms >= win.start && ms < win.end;
   const asOf = new Date(toMs(now)).toISOString();
 
@@ -110,11 +159,13 @@ export function weeklyActivity({items = [], now, timeZone, weekStartsOn = 1, his
     (i.lifecycle === 'failed' && inWin(parseTime(i.updated_at))));
   const snapCov = work.length ? (work.some(degraded) ? 'partial' : 'complete') : 'unknown';
 
+  const server = index ? serverMetrics(work, index, win, serverCoverage(serverHistory, win.start, index.conflict)) : null;
+
   return {
     window: {start: new Date(win.start).toISOString(), end: new Date(win.end).toISOString(), timeZone, weekStartsOn, interval: '[start,end)'},
     total_items: work.length,
-    started: history(started.filter(inWin).length, startedWithTs, work.length, work, historyComplete),
-    finished: finishedMetric,
+    started: server ? server.started : history(started.filter(inWin).length, startedWithTs, work.length, work, historyComplete),
+    finished: server ? server.finished : finishedMetric,
     open: metric(open.length, snapCov, {basis: 'snapshot', as_of: asOf}),
     paused_quota: metric(paused.length, pausedAll.length > paused.length ? 'partial' : snapCov, {basis: 'snapshot', as_of: asOf, unevidenced: pausedAll.length - paused.length}),
     attention_needed: metric(attention.length, snapCov, {basis: 'snapshot', as_of: asOf}),

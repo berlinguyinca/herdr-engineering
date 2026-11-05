@@ -76,3 +76,53 @@ test('desktop and mobile layouts: no horizontal scroll, screenshots saved',async
  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true,'no horizontal scroll on mobile');
  await page.locator(card).screenshot({path:path.join(shots,'wc003-overview-week-mobile.png')});
 }));
+
+// ---- G1: server weekly history (stub API) ----
+const ev=(kind,id,at,o={})=>({kind,work_id:`mission:${id}`,source:'mission',entity_id:id,occurred_at:at,evidence:{ref:`e-${kind}-${id}`,event_type:'X'},...o});
+const WEEKLY='/api/v1/work/weekly-events';
+const weeklyBody=(coverage={})=>({window:{interval:'[since,until)'},next_cursor:null,events:[
+ ev('started','pi:MSN-1','2025-12-31T12:00:00Z',{mission_key:'pi:MSN-1'}),
+ ev('started','pi:MSN-2','2025-12-30T12:00:00Z',{mission_key:'pi:MSN-2'}),
+ ev('started','pi:GONE','2025-12-30T13:00:00Z',{mission_key:'pi:GONE'}),ev('finished','pi:GONE','2025-12-31T13:00:00Z',{mission_key:'pi:GONE'}),
+ ev('started','pi:LAST-MONTH','2025-11-30T13:00:00Z')],
+ coverage:{complete:false,horizon:'2025-12-01T12:00:00Z',truncated:false,reasons:['start events are written when the control plane first sees the work'],...coverage}});
+
+test('G1: one weekly-events read per load feeds Started/Finished; partial shows the history horizon',async()=>withPage(async(page,base)=>{
+ const calls=[];
+ const h=withFlag((p,url)=>{if(p===WEEKLY){calls.push(url.searchParams.toString());return weeklyBody();}return rawHandler(p);});
+ await boot(page,base,'/overview',h);
+ await page.locator(`${card} .wk-row`).first().waitFor({timeout:8000});
+ await until(async()=>/history from/.test(await page.locator(card).innerText()),'history badge');
+ const started=page.locator(`${card} .wk-metric`,{hasText:'Started'});
+ assert.match(await started.innerText(),/^4\s/);                                   // MSN-1, MSN-2, GONE from the server + MSN-9 from the snapshot; the last-month start is outside the window
+ assert.match(await started.innerText(),/at least 4 \(partial\) · history from 2025-12-01/);
+ assert.match(await page.locator(`${card} .wk-metric`,{hasText:'Finished'}).innerText(),/^1\s/);
+ assert.match(await page.locator(`${card} .wk-banner`).innerText(),/stored start and finish events since 2025-12-01/);
+ await page.clock.runFor(95000);await sleep(100);                                    // three poll cycles
+ assert.equal(calls.length,1,'one read per overview load, no polling');
+ const q=new URLSearchParams(calls[0]);
+ assert.match(q.get('since'),/Z$/);assert.match(q.get('until'),/Z$/);assert.equal(q.get('limit'),'500');
+ assert.equal(Date.parse(q.get('until'))-Date.parse(q.get('since')),7*86400e3,'a 7-day (DST-free) half-open window');
+ await page.setViewportSize({width:1200,height:900});
+ await page.locator(card).screenshot({path:path.join(shots,'wc-g1-overview-week-partial-desktop.png')});
+ await page.setViewportSize({width:390,height:844});await sleep(100);
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),true);
+ await page.locator(card).screenshot({path:path.join(shots,'wc-g1-overview-week-partial-mobile.png')});
+}));
+
+test('G1: complete is shown only when the server says complete; a failed read keeps the snapshot-only partial card',async()=>withPage(async(page,base)=>{
+ const h=withFlag((p)=>p===WEEKLY?weeklyBody({complete:true}):rawHandler(p));
+ await boot(page,base,'/overview',h);
+ await page.locator(`${card} .wk-row`).first().waitFor({timeout:8000});
+ await until(async()=>/complete/.test(await page.locator(`${card} .wk-metric`,{hasText:'Started'}).innerText()),'complete badge');
+ assert.match(await page.locator(`${card} .wk-metric`,{hasText:'Finished'}).innerText(),/complete/);
+ assert.doesNotMatch(await page.locator(card).innerText(),/Started and Finished only count|stored start and finish events/);
+ await page.locator(card).screenshot({path:path.join(shots,'wc-g1-overview-week-server-complete.png')});
+}));
+test('G1: failed weekly read falls back to the snapshot and says so',async()=>withPage(async(page,base)=>{
+ await boot(page,base,'/overview',withFlag((p)=>p===WEEKLY?{__status:500,json:{error:'down'}}:rawHandler(p)));
+ await page.locator(`${card} .wk-row`).first().waitFor({timeout:8000});
+ await until(async()=>/weekly history could not be read/i.test(await page.locator(card).innerText()),'fallback note');
+ assert.doesNotMatch(await page.locator(card).innerText(),/history from/);
+ assert.match(await page.locator(`${card} .wk-metric`,{hasText:'Started'}).getAttribute('aria-label'),/partial|unknown/);
+}));
