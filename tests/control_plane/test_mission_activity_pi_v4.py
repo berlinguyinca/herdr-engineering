@@ -6,8 +6,14 @@ from datetime import UTC, datetime
 import pytest
 
 from herdr_engineering.control_plane.ingest import IngestService
-from herdr_engineering.control_plane.mission_activity import MAX_LINKS, MissionActivityStore, clean_pi_fields
-from herdr_engineering.control_plane.mission_outcome import issue_refs_by_mission, pr_refs_by_mission
+from herdr_engineering.control_plane.mission_activity import (
+    MAX_LINKS,
+    clean_pi_fields,
+)
+from herdr_engineering.control_plane.mission_outcome import (
+    issue_refs_by_mission,
+    pr_refs_by_mission,
+)
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 NOW = 1_800_000_000

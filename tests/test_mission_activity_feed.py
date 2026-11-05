@@ -541,7 +541,8 @@ def test_next_action_crosses_feed_and_store_summaries_unchanged_and_bounded():
     assert len(clean['nextAction']) <= 1024 and 'prompt' not in clean and 'reasoning' not in clean
     now = 1_800_000_000
     store = MissionActivityStore(now=lambda: now)
-    iso = lambda epoch: __import__('datetime').datetime.fromtimestamp(epoch, __import__('datetime').UTC).isoformat()
+    def iso(epoch):
+        return __import__('datetime').datetime.fromtimestamp(epoch, __import__('datetime').UTC).isoformat()
     payload = {'contract_version': 1, 'host_id': 'h', 'instance_id': 'i', 'session_id': 's', 'observed_at': iso(now),
                'snapshot_at': iso(now), 'mission_revision': 1, 'connection': 'connected',
                'mission': {'id': 'MSN-1', 'title': 't', 'status': 'RUNNING'},
