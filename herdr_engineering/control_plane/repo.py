@@ -196,8 +196,11 @@ class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
     def __init__(self, *, now=None, sink=None, service_archive_days=7, host_aliases=None,
-                 inspector_limits=None):
-        """``sink`` is an optional durable writer (e.g. DurableEventSink) called
+                 inspector_limits=None, mission_activity_mirror=False):
+        """``mission_activity_mirror`` turns the G8-C durable Pi activity mirror on (write, hydrate and prune); the server
+        wiring passes ``work_center_v1``, so with the flag off nothing new is persisted.
+
+        ``sink`` is an optional durable writer (e.g. DurableEventSink) called
         with each recorded event so ingestion survives a restart.
 
         ``host_aliases`` maps an alternate host name to the canonical one (one
@@ -257,7 +260,8 @@ class ControlPlaneRepo:
             verify_noop=bool(getattr(self._sink, "verify_agent_identity_noop", False)))
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
-        self.mission_activity = MissionActivityStore(now=self._now, persist=self._persist_mission_activity)
+        self.mission_activity_mirror = mission_activity_mirror is True
+        self.mission_activity = self._new_mission_activity()
         self._mission_activity_pruned_at = 0.0
         self.mission_outcomes = None   # set by the server (control_plane.missions); None writes no outcomes
         # Lineage graph (T02): derived from ``lineage`` envelope events, rebuilt
@@ -334,6 +338,10 @@ class ControlPlaneRepo:
         self._sink.record({"event_id": new_id("event"), "schema_version": 1,
                            "source_timestamp": stamp, "ingest_timestamp": stamp,
                            "mission_id": None, "session_id": None, **ev})
+
+    def _new_mission_activity(self):
+        return MissionActivityStore(now=self._now,
+                                    persist=self._persist_mission_activity if self.mission_activity_mirror else None)
 
     def _persist_mission_activity(self, ev):
         """G8-C: mirror the Pi activity projection through the same private sink path as host metrics, and drop rows past
@@ -3818,8 +3826,8 @@ class ControlPlaneRepo:
         for key in [k for k in self._events if k[0] == MISSION_ACTIVITY_ENTITY]:
             activity_rows.extend(self._events.pop(key))
         self._event_order = [t for t in self._event_order if t[0] != MISSION_ACTIVITY_ENTITY]
-        self.mission_activity = MissionActivityStore(now=self._now, persist=self._persist_mission_activity)
-        counts = self.mission_activity.hydrate(activity_rows)
+        self.mission_activity = self._new_mission_activity()
+        counts = self.mission_activity.hydrate(activity_rows) if self.mission_activity_mirror else {"skipped": 0}
         if counts["skipped"]:
             logging.getLogger(__name__).warning("skipped %d unusable mission_activity row(s) on restore", counts["skipped"])
 

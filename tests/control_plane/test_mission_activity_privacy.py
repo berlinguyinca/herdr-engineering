@@ -58,7 +58,7 @@ def test_events_route_hides_the_mirror_stream_from_a_viewer(pg):
     loop = asyncio.new_event_loop()
     conn = loop.run_until_complete(asyncpg.connect(pg.dsn))
     try:
-        repo = ControlPlaneRepo(now=lambda: t, sink=DurableEventSink(conn=conn, run=loop.run_until_complete))
+        repo = ControlPlaneRepo(now=lambda: t, sink=DurableEventSink(conn=conn, run=loop.run_until_complete), mission_activity_mirror=True)
         IngestService(repo).ingest(snapshot('MSN-1', t))
     finally:
         loop.run_until_complete(conn.close())
@@ -87,7 +87,7 @@ def test_postgres_feeds_exclude_the_mirror_and_restart_still_hydrates(pg):
     loop = asyncio.new_event_loop()
     conn = loop.run_until_complete(asyncpg.connect(pg.dsn))
     try:
-        repo = ControlPlaneRepo(now=lambda: clock[0], sink=DurableEventSink(conn=conn, run=loop.run_until_complete))
+        repo = ControlPlaneRepo(now=lambda: clock[0], sink=DurableEventSink(conn=conn, run=loop.run_until_complete), mission_activity_mirror=True)
         IngestService(repo).ingest(snapshot('MSN-1', t))
         repo.upsert_mission('m-public', title='Visible', stage='implementation', source='pi')
         assert pg.query('SELECT count(*) AS n FROM fabric_events WHERE entity_type=$1', ENTITY_TYPE)[0]['n'] == 1
@@ -109,7 +109,7 @@ def test_postgres_feeds_exclude_the_mirror_and_restart_still_hydrates(pg):
     loop = asyncio.new_event_loop()
     conn = loop.run_until_complete(asyncpg.connect(pg.dsn))
     try:
-        again = ControlPlaneRepo(now=lambda: clock[0])
+        again = ControlPlaneRepo(now=lambda: clock[0], mission_activity_mirror=True)
         load_into(again, PostgresSource(conn, run=loop.run_until_complete))
     finally:
         loop.run_until_complete(conn.close())

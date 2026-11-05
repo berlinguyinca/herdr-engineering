@@ -4269,7 +4269,9 @@ def _cmd_cp_web(args) -> int:
         from .control_plane.collab import FileEventLog
         sink = FileEventLog(args.collab_log_file)
     repo = ControlPlaneRepo(sink=sink, host_aliases=_host_aliases_from(cp),
-                            inspector_limits=inspector_limits)
+                            inspector_limits=inspector_limits,
+                            mission_activity_mirror=isinstance(cp.get("work_center"), dict)
+                            and cp["work_center"].get("enabled") is True)
     if args.seed_demo:
         _seed_demo(repo)
     rustfs = _maybe_rustfs_client(cp)

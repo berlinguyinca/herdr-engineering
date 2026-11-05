@@ -63,7 +63,7 @@ def restart(db, clock):
     loop = asyncio.new_event_loop()
     conn = loop.run_until_complete(asyncpg.connect(db.dsn))
     try:
-        repo = ControlPlaneRepo(now=lambda: clock[0])
+        repo = ControlPlaneRepo(now=lambda: clock[0], mission_activity_mirror=True)
         load_into(repo, PostgresSource(conn, run=loop.run_until_complete))
         return repo
     finally:
@@ -77,7 +77,7 @@ def test_write_restart_read_then_prune_on_real_postgres(db):
     loop = asyncio.new_event_loop()
     conn = loop.run_until_complete(asyncpg.connect(db.dsn))
     try:
-        repo = ControlPlaneRepo(now=lambda: clock[0], sink=DurableEventSink(conn=conn, run=loop.run_until_complete))
+        repo = ControlPlaneRepo(now=lambda: clock[0], sink=DurableEventSink(conn=conn, run=loop.run_until_complete), mission_activity_mirror=True)
         service = IngestService(repo)
         # An expired row, written 48 h ago by the same store (the first persist also arms the hourly prune).
         service.ingest(snapshot("MSN-OLD", clock[0]))
@@ -119,7 +119,7 @@ def test_an_expired_row_already_in_postgres_is_ignored_on_restart_even_if_never_
     loop = asyncio.new_event_loop()
     conn = loop.run_until_complete(asyncpg.connect(db.dsn))
     try:
-        repo = ControlPlaneRepo(now=lambda: clock[0], sink=DurableEventSink(conn=conn, run=loop.run_until_complete))
+        repo = ControlPlaneRepo(now=lambda: clock[0], sink=DurableEventSink(conn=conn, run=loop.run_until_complete), mission_activity_mirror=True)
         IngestService(repo).ingest(snapshot("MSN-OLD", clock[0]))
     finally:
         loop.run_until_complete(conn.close())
