@@ -100,6 +100,9 @@ class Registry:
     def sync_call(self, method, *args, **kwargs):
         return asyncio.run(getattr(self, method)(*args, **kwargs))
 
+    async def lifecycle_of(self, artifact_id):
+        return "active"
+
     async def report_permission(self, aid, principal, permission):
         return aid == AID and OWNER in principal and permission in {"read", "edit", "review", "share", "admin"}
 

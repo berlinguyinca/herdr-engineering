@@ -932,6 +932,8 @@ class CollabIntentApplier:
         if artifact is None:
             return _rejected(REASON_NO_ARTIFACT)
         await self._load_gate(store)
+        if artifact["lifecycle"] == "tombstoned":                  # deleted: as if it did not exist
+            return _rejected(REASON_NO_ARTIFACT)
         if artifact["lifecycle"] == "retracted" or self.gate.artifact_retracted(aid):
             return _rejected(REASON_RETRACTED)
         base = await store.get_version(payload.base_version_id, aid)

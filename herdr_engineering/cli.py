@@ -365,6 +365,8 @@ def _build_parser() -> argparse.ArgumentParser:
     add_share_subparser(asub)
     from .artifact_collab_client import add_collab_subparser
     add_collab_subparser(asub)
+    from .artifact_delete_client import add_delete_subparsers
+    add_delete_subparsers(asub)
     from .artifact_browse_client import add_browse_subparsers
     add_browse_subparsers(asub)
     from .teams_client import add_teams_subparser
@@ -4117,6 +4119,11 @@ def _cmd_cp_web(args) -> int:
         artifact_jobs.load(artifact_adapter("load_jobs"))
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
     annotation_store = _annotation_wiring(cp, dsn)
+    try:
+        from .control_plane.artifact_delete_api import owner_digests_config
+        artifact_delete = owner_digests_config(cp.get("artifact_delete"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
     collab_grant_store, collab_artifacts_enabled = _collab_grant_wiring(cp, dsn)
     collab = None
     artifact_bridge = None
@@ -4245,7 +4252,8 @@ def _cmd_cp_web(args) -> int:
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
-                             annotation_store=annotation_store,
+                             annotation_store=annotation_store, artifact_delete_owners=artifact_delete.digests,
+                             artifact_delete_allow_keyless_owner=artifact_delete.allow_keyless,
                              collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled)
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read

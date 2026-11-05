@@ -178,6 +178,33 @@ export class HerdrClient {
     return this.request(`/api/v1/artifacts${query.size ? `?${query}` : ''}`, { signal });
   }
 
+  // Owner-only delete (tombstone / purge now) and restore. The server answers a non-owner with a plain 404.
+  artifactDeleteAccess({ signal } = {}) {
+    return this.request('/api/v1/artifacts/delete-access', { signal });
+  }
+
+  listTombstonedArtifacts({ signal } = {}) {
+    return this.request('/api/v1/artifacts/tombstoned', { signal });
+  }
+
+  // A permanent delete must carry the typed count as a string: it is refused here, before any request, if it does not.
+  async deleteArtifacts(ids, { mode = 'tombstone', reason, holdDays, confirm, requestKey, signal } = {}) {
+    if (!Array.isArray(ids) || !ids.length) throw new Error('Select at least one artifact');
+    if (ids.length > 200) throw new Error('At most 200 artifacts per request');
+    if (mode === 'purge_now' && confirm !== String(new Set(ids).size)) throw new Error('A permanent delete needs its typed confirm count');
+    const body = { ids, mode, reason };
+    if (holdDays !== undefined) body.hold_days = holdDays;
+    if (mode === 'purge_now') body.confirm = confirm;
+    if (requestKey) body.request_key = requestKey;
+    return this.request('/api/v1/artifacts/delete', { method: 'POST', body, signal });
+  }
+
+  async restoreArtifacts(ids, { requestKey, signal } = {}) {
+    if (!Array.isArray(ids) || !ids.length) throw new Error('Select at least one artifact');
+    if (ids.length > 200) throw new Error('At most 200 artifacts per request');
+    return this.request('/api/v1/artifacts/restore', { method: 'POST', body: requestKey ? { ids, request_key: requestKey } : { ids }, signal });
+  }
+
   // Artifacts bound to a project, issue, task or room (P03). The server filters by what the caller may read.
   artifactsForContext(kind, ref, { q, mediaType, limit, cursor, signal } = {}) {
     const query = new URLSearchParams();

@@ -39,6 +39,12 @@ class Store:
     def sync_call(self, method, *args, **kwargs):
         return asyncio.run(getattr(self, method)(*args, **kwargs))
 
+    async def tombstoned_ids(self):
+        return []
+
+    async def lifecycle_of(self, aid):
+        return "active"
+
     async def report_permission(self, aid, principal, permission):
         return aid == "artifact_report" and hashlib.sha256(b"owner-key").hexdigest()[:16] in principal
 

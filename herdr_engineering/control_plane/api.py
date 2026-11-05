@@ -312,6 +312,7 @@ class ControlPlaneServer:
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None,
+                 artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
                  assistant_workers=None, assistant_judge=None):
         """
@@ -452,6 +453,12 @@ class ControlPlaneServer:
         self.share_settings = share_settings
         # Owner annotation API (list/dismiss): a SyncArtifactAdapter over AnnotationStore, or the routes answer 503.
         self.annotation_store = annotation_store
+        # Key digests allowed to delete/purge/restore artifacts (control_plane.artifact_delete.owner_key_digests).
+        self.artifact_delete_owners = frozenset(artifact_delete_owners)
+        self.artifact_delete_allow_keyless_owner = bool(artifact_delete_allow_keyless_owner)
+        # ids the registry holds tombstoned: the legacy read path (ACL + repo projection) must treat them as nonexistent
+        from .artifact_delete_api import TombstoneCache
+        self.tombstone_cache = TombstoneCache()
         # Collaborator grants (control_plane.collab_artifacts.enabled): both, or the collaborator routes answer 503.
         self.collab_grant_store = collab_grant_store
         self.collab_artifacts_enabled = collab_artifacts_enabled
@@ -2073,11 +2080,23 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(404, "not found")
             return self._deny(403, "forbidden")
 
+        def _artifact_is_deleted(self, artifact_id, permission="read"):
+            """True when the registry holds the artifact tombstoned. Deleted means nonexistent for everyone, on the legacy
+            read path too (the in-memory ACL and the repo projection never see the registry lifecycle). Reads use the
+            short-lived cache of tombstoned ids (refreshed on every local delete/restore); writes ask the database."""
+            if server.artifact_store is None or not artifact_id:
+                return False
+            if permission == "read":
+                return server.tombstone_cache.contains(
+                    artifact_id, lambda: self._artifact_call("tombstoned_ids"))
+            return self._artifact_call("lifecycle_of", artifact_id) == "tombstoned"
+
         def _artifact_allowed(self, artifact_id, permission):
             if server.artifact_acl is None:
-                return True
+                return not self._artifact_is_deleted(artifact_id, permission)
             if self._artifact_acl_allows(artifact_id, permission):
-                return True
+                # only an ACL-authorized caller reaches the store: an unauthorized read must never touch it
+                return not self._artifact_is_deleted(artifact_id, permission)
             # Versioned-registry artifacts (native reports) are also private to their
             # durable owner and grants, which the registry itself records. Reads stay
             # ACL-only: an unauthorized read must never reach the store.
@@ -3074,6 +3093,9 @@ def _make_handler(server, public=False, operator=False):
             if self._rate_limit():
                 return None
             try:
+                from .artifact_delete_api import route_delete
+                if route_delete(self, server, parts, resource):
+                    return None
                 from .artifact_collab_api import route_collab
                 if route_collab(self, server, parts, resource):
                     return None
@@ -3723,6 +3745,8 @@ def _make_handler(server, public=False, operator=False):
                         query=_q(self.path, "q"), artifact_type=_q(self.path, "type"),
                         status=_q(self.path, "status"), created_by=_q(self.path, "created_by"),
                         limit=_qint(self.path, "limit", 200), offset=_qint(self.path, "offset", 0))
+                if server.artifact_store is not None:
+                    artifacts = [a for a in artifacts if not self._artifact_is_deleted(a["artifact_id"])]
                 if server.artifact_acl is not None:
                     artifacts = [a for a in artifacts if self._artifact_allowed(a['artifact_id'], 'read')]
                 return self._json({"artifacts": artifacts})
@@ -3733,7 +3757,8 @@ def _make_handler(server, public=False, operator=False):
                     legacy = r.get_artifact(parts[4])
                     if legacy and not legacy.get('created_by'):
                         artifact = legacy
-                if artifact and not self._artifact_allowed(parts[4], "read"):
+                if artifact and (self._artifact_is_deleted(parts[4])
+                                 or not self._artifact_allowed(parts[4], "read")):
                     artifact = None
                 return self._json(artifact) if artifact else self._json({"error": "not found"}, 404)
             if resource == "artifacts" and server.artifact_store is not None:
@@ -4866,7 +4891,12 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": str(exc)}, 400)
 
         def _assistant_get(self, parts, resource):
-            from .assistant import AssistantError, AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant import (
+                AssistantError,
+                AssistantNotFound,
+                AssistantUnavailable,
+                RateLimited,
+            )
             try:
                 tenant_id, user_id = self._assistant_scope()
                 svc = server.assistant
@@ -5885,6 +5915,8 @@ def _make_handler(server, public=False, operator=False):
             if version_id is not None and (not isinstance(version_id, str) or not version_id):
                 return self._json({"error": "version_id must be a non-empty string"}, 400)
             if server.artifact_store is not None:
+                if self._artifact_call("lifecycle_of", artifact_id) == "tombstoned":
+                    return self._deny(404, "not found")             # deleted: nothing may write to it
                 known = (self._artifact_call("get_version", version_id, artifact_id) if version_id
                          else self._artifact_call("get_record", artifact_id, principal_id=self._resource_principal()))
                 if known is None:
@@ -6120,6 +6152,8 @@ def _make_handler(server, public=False, operator=False):
 
             ``want(record) -> bool`` may veto reading the bytes (they are then None) for callers that need only the record."""
             r = server.repo
+            if self._artifact_is_deleted(artifact_id):
+                return None, None
             data = r.get_artifact_data(artifact_id)
             a = r.get_artifact(artifact_id)
             if a is None and server.artifact_store is not None:
