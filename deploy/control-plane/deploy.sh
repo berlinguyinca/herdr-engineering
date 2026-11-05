@@ -6,6 +6,9 @@
 #                                  [--deploy-lock-wait SECONDS]
 #                                  [--with-memory [--memory-checkout PATH]]
 #                                  [--memory-client-config PATH]
+#                                  [--memory-private-egress --memory-private-egress-gateway IPV4/32]
+#                                  [--memory-private-egress-cidr CIDR]
+#                                  [--memory-private-egress-recover SAVED_ATTEMPT]
 #                                  [--allow-divergent]
 #   HEAD expressions use the caller worktree only after common-repository proof.
 #   Normal rollouts must descend from the verified deployed commit; intentional
@@ -108,6 +111,9 @@
 set -euo pipefail
 
 REF="origin/main"; DRY=0; FETCH=1; ALLOW_DIVERGENT=0; COLLAB_LOCK_WAIT=300; DEPLOY_LOCK_WAIT=600
+MEMORY_PRIVATE_EGRESS=0; MEMORY_PRIVATE_EGRESS_RECOVER=""
+MEMORY_PRIVATE_EGRESS_CIDR="172.31.252.0/29"
+MEMORY_PRIVATE_EGRESS_GATEWAY="${HERDR_CP_MEMORY_PRIVATE_EGRESS_GATEWAY:-}"
 MEMORY=0; MEMORY_CHECKOUT="${HERDR_MEMORY_CHECKOUT:-}"
 MEMORY_CLIENT_CONFIG="${HERDR_CP_MEMORY_CLIENT_CONFIG:-}"
 CENTRAL="$HOME/.config/herdr-engineering/fleet/fleet-config.yaml"
@@ -120,6 +126,10 @@ while [ $# -gt 0 ]; do
     --fleet-config) CENTRAL="${2:?--fleet-config needs a value}"; shift 2 ;;
     --collab-lock-wait) COLLAB_LOCK_WAIT="${2:?--collab-lock-wait needs a value}"; shift 2 ;;
     --deploy-lock-wait) DEPLOY_LOCK_WAIT="${2:?--deploy-lock-wait needs a value}"; shift 2 ;;
+    --memory-private-egress-recover) MEMORY_PRIVATE_EGRESS_RECOVER="${2:?needs the saved deploy attempt}"; shift 2 ;;
+    --memory-private-egress) MEMORY_PRIVATE_EGRESS=1; shift ;;
+    --memory-private-egress-cidr) MEMORY_PRIVATE_EGRESS_CIDR="${2:?needs a CIDR}"; shift 2 ;;
+    --memory-private-egress-gateway) MEMORY_PRIVATE_EGRESS_GATEWAY="${2:?needs an explicit IPv4/32}"; shift 2 ;;
     --with-memory) MEMORY=1; shift ;;
     --memory-checkout) MEMORY_CHECKOUT="${2:?--memory-checkout needs a value}"; shift 2 ;;
     --memory-client-config) MEMORY_CLIENT_CONFIG="${2:?--memory-client-config needs a path}"; shift 2 ;;
@@ -155,6 +165,23 @@ STATE_DIR="$HOME/.local/state/herdr-engineering/deploys"
 STATE_HELPER="$HERE/deploy-state.py"
 # shellcheck source=deploy-lock.sh
 source "$HERE/deploy-lock.sh"
+
+# Permission-only hard-interruption recovery. Reuse the SAME lock and saved
+# attempt; never guess or recreate an image/config/profile from partial state.
+if [ -n "$MEMORY_PRIVATE_EGRESS_RECOVER" ]; then
+  [ "$DRY" = 0 ] || { echo "permission recovery is explicit and cannot run in --dry-run; no changes made" >&2; exit 2; }
+  deploy_lock_acquire || exit $?
+  trap 'deploy_lock_cleanup' EXIT
+  trap '' INT TERM HUP
+  deploy_compat_lock_acquire || exit $?
+  source "$HERE/web-egress-deploy.sh"
+  RECOVER_ATTEMPT="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$MEMORY_PRIVATE_EGRESS_RECOVER")" || exit 3
+  web_egress_cmd recover --current "$STATE_DIR/web-egress/current.json" \
+    --attempt "$RECOVER_ATTEMPT/web-egress" --lock-fd "$DEPLOY_LOCK_FD" \
+    --lock-path "$STATE_DIR/rollout.lock" || exit 3
+  echo "private egress permission recovery phase finished; network/image/config/profile restoration is NOT completed; preserve and review the saved attempt" >&2
+  exit 3
+fi
 MOUNT_TARGET="/etc/herdr/fleet/fleet-config.yaml"
 # Collaboration network (HCN) is opt-in per host: it is layered on only when this
 # marker file exists, so an ordinary deploy never switches it on elsewhere.
@@ -381,6 +408,9 @@ MEMORY_CLIENT_LIB="$WORK/deploy/control-plane/memory-client-deploy.sh"
 [ -f "$MEMORY_CLIENT_LIB" ] || MEMORY_CLIENT_LIB="$HERE/memory-client-deploy.sh"
 . "$MEMORY_CLIENT_LIB"
 memory_client_preflight || exit 1
+# Private bridge activation is an explicit, separately reviewed opt-in.
+source "$HERE/web-egress-deploy.sh"
+web_egress_preflight || exit 1
 
 # only_file <dir> <name>: the directory (mounted whole into a container) holds nothing else
 only_file() {
@@ -503,6 +533,11 @@ if [ "$COLLAB" = 1 ]; then
 fi
 
 COMPOSE_FILES=(-f "$WORK/deploy/control-plane/compose.yaml" "${COLLAB_FILES[@]}")
+if [ "$WEB_EGRESS_COMPOSE_ENABLED" = 1 ]; then
+  COMPOSE_FILES+=(-f "$WEB_EGRESS_OVERLAY")
+fi
+export HERDR_CP_WEB_EGRESS_CIDR="$MEMORY_PRIVATE_EGRESS_CIDR"
+export HERDR_CP_WEB_EGRESS_GENERATION="$WEB_EGRESS_GENERATION"
 # Every service of ours that runs the herdr-engineering image and reads the fleet
 # config: rolled forward (and back) together on one tag.
 APP_SERVICES=(control-plane-web control-plane-worker llm-proxy)
@@ -780,6 +815,7 @@ install_private() {   # <src> <dest>: 0600 file in a 0700 dir, atomic
 }
 
 memory_client_snapshot || exit 1
+web_egress_snapshot || exit 1
 
 # compose_run <worktree> <env file> <image tag> <commit> <compose args...>: that
 # worktree's compose files with the given env file and this deploy's paths. Rollback
@@ -788,10 +824,12 @@ compose_run() {
   local tree="$1" envf="$2" tag="$3" commit="$4"; shift 4
   local files=(-f "$tree/deploy/control-plane/compose.yaml")
   if [ "$COLLAB" = 1 ]; then files+=(-f "$tree/deploy/control-plane/compose.collab.yaml"); fi
+  if [ "$WEB_EGRESS_COMPOSE_ENABLED" = 1 ]; then files+=(-f "$WEB_EGRESS_OVERLAY"); fi
   if [ -n "$ROLLBACK_IMAGES" ]; then files+=(-f "$ROLLBACK_IMAGES"); fi
   # TRANSITION: a rollback to the release BEFORE the apps mount builds that release's compose.yaml, which still
   # requires HERDR_CP_GOOGLE_DIR (mounted at /etc/herdr/google:ro). Docker would create a missing bind source as
   # root, so point it at $APPS_DIR (exists, read-only, harmless). Remove after the next release.
+  HERDR_CP_WEB_EGRESS_CIDR="$MEMORY_PRIVATE_EGRESS_CIDR" HERDR_CP_WEB_EGRESS_GENERATION="$WEB_EGRESS_GENERATION" \
   HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_LLM_SLICE_DIR="$LLM_DIR" \
     HERDR_CP_GITHUB_APP_DIR="$GITHUB_APP_DIR" HERDR_CP_APPS_DIR="$APPS_DIR" HERDR_CP_GOOGLE_DIR="$APPS_DIR" HERDR_CP_PIPELINES_DIR="$PIPELINES_DIR" HERDR_CP_IMAGE_TAG="$tag" HERDR_CP_GIT_COMMIT="$commit" \
     docker compose --env-file "$envf" -p "$PROJECT" "${files[@]}" "$@"
@@ -897,6 +935,7 @@ stop_share_public() {   # never fatal; plain docker, so it works whichever compo
 forward() {
   deploy_lock_phase forward || return 1
   HOST_MUTATED=1
+  web_egress_before forward || return 1
   install_private "$NEW_LLM" "$LLM_DIR/llm-config.json" || return 1
   # mount sources of web/worker (and share-public): created here, after the build, never before
   mkdir -p "$HERDR_SHARES_DIR" "$HERDR_SHARE_EVENTS_DIR" && chmod 755 "$HERDR_SHARES_DIR" "$HERDR_SHARE_EVENTS_DIR" \
@@ -956,6 +995,7 @@ forward() {
     compose_up "$WORK" "$ENV_FILE" "$TAG" "$SHA" >/dev/null || return 1
   fi
   memory_client_apply forward "$WORK" || return 1
+  web_egress_after forward || return 1
   # The edge resolves collab-public once, at (re)load: a recreated collab-public has a
   # new address, so reload the edge after every collab up, not only on a new conf.
   if [ "$COLLAB" = 1 ]; then EDGE_CONF_CHANGED=1; reload_edge_if_changed || return 1; fi
@@ -985,6 +1025,9 @@ rollback() {
   trap '' INT TERM HUP
   DEPLOY_FINISHED=1
   deploy_lock_phase rollback || true
+  if declare -F web_egress_before >/dev/null; then
+    web_egress_before rollback || { echo "private egress revocation failed; preserving network and recovery state" >&2; return 3; }
+  fi
 
   echo "deploy of $SHA failed (an install step or compose up failed, the health check did not report $SHA, or a recreated service is not running)" >&2
   # Host files go back first (slices rendered by the previous deploy, its nginx.conf and
@@ -1025,10 +1068,13 @@ rollback() {
       && prev_render \
       && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
       && memory_client_apply rollback "$PREV_WORK" \
+      && { ! declare -F web_egress_after >/dev/null || web_egress_after rollback; } \
       && rollback_share \
       && { [ "$COLLAB" = 0 ] || { EDGE_CONF_CHANGED=1; reload_edge_if_changed || true; }; } \
       && python3 "$STATE_HELPER" verify-rollback "$ATTEMPT" \
       && verify "$PREV_SHA"; then
+    if declare -F web_egress_commit >/dev/null; then web_egress_commit rollback || return 3; fi
+    if declare -F web_egress_cleanup >/dev/null; then web_egress_cleanup rollback || echo "owned egress network retained; inspect saved receipt" >&2; fi
     python3 "$STATE_HELPER" outcome "$ATTEMPT" rolled_back || return 3
     echo "rolled back to $PREVIOUS_IMAGE (commit $PREV_SHA) and healthy (all of: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}); the deploy of $SHA FAILED" >&2
     return 1
@@ -1045,8 +1091,10 @@ if forward; then
   # slice) - never configuration. json.dumps: a ref may contain quotes.
   python3 "$STATE_HELPER" receipt "$ATTEMPT" "$STATE_DIR/$SHA.json" "$REF" \
     "herdr-engineering:$TAG" "$PREVIOUS_IMAGE" "$COLLAB_HASH" "$(date -u +%FT%TZ)"
+  web_egress_commit forward || exit 1
   python3 "$STATE_HELPER" outcome "$ATTEMPT" succeeded
   DEPLOY_FINISHED=1
+  web_egress_cleanup forward || echo "owned egress network retained; inspect saved receipt" >&2
   echo "ok: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}} running $SHA (receipt $STATE_DIR/$SHA.json)"
   if [ "$SHARE" = 1 ] && [ -n "${SHARE_HOST_NAME:-}" ]; then
     # Smoke line, never fatal: an unknown token on the share host's own TLS name answers a bare 404 when the DNS
