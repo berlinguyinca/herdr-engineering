@@ -75,8 +75,11 @@ class Store:
     async def lifecycle_of(self, aid):
         return "active"
 
-    async def report_permission(self, aid, principal, permission):
+    async def report_permission(self, aid, principal, permission, **_):
         return aid in self.records and OWNER in principal
+
+    async def operator_member_access(self, aid, principal, permission):
+        return False    # no member-owned artifacts in this store
 
     async def get_version(self, vid, aid=None):
         outputs = self.outputs.get((aid, vid))

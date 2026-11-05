@@ -122,6 +122,8 @@ def test_durable_upload_is_visible_and_downloadable_without_the_legacy_projectio
             if method == 'report_permission':
                 record = self.records.get(args[0])
                 return bool(record and record['created_by'] == args[1])
+            if method == 'operator_member_access':
+                return False    # no member-owned artifacts in this store
             raise AssertionError(method)
 
     with running(artifact_store=Durable(), rustfs=blobs) as server:

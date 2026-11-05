@@ -11,6 +11,7 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -35,8 +36,18 @@ from tests.control_plane.test_member_share_flow import (
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def _chownable(gid: int) -> bool:
+    """A supplementary group the kernel will actually let this user chown to (a CI exec host may list groups it cannot use, EINVAL)."""
+    with tempfile.NamedTemporaryFile() as probe:
+        try:
+            os.chown(probe.name, -1, gid)
+        except OSError:
+            return False
+    return True
+
+
 def other_gid() -> int | None:
-    return next((g for g in os.getgroups() if g != os.getgid()), None)
+    return next((g for g in os.getgroups() if g != os.getgid() and _chownable(g)), None)
 
 
 needs_group = pytest.mark.skipif(other_gid() is None, reason="the user has no second group")

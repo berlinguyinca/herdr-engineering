@@ -390,21 +390,23 @@ def intents_in(outbox) -> list[dict]:
 
 def test_a_read_grant_reads_history_but_no_door_can_turn_it_into_a_share(registry_pg, tmp_path, stack):
     """Alice holds only ``read`` on Bob's artifact.  Through the real MCP tools and the real web API she may read
-    its history; her share requests are queued as the doors do and the worker, which decides, refuses every one
-    (public and lab, with no row), as it refuses the very same intent forged by hand."""
+    its history, and both doors refuse her share request at once (404, no ticket, no intent queued); the worker, which
+    decides, also refuses the same intents forged by hand (public and lab, with no row)."""
     stack.w.view("op", [ART], shared=["art_sh1"])
     hist = mcp(stack, "artifact_history", artifact_id="art_sh1")
     assert hist["versions"][0]["version_id"] == "v_9" and hist["truncated"] is True
     assert req(stack, "GET", "/api/member/artifacts/art_sh1/history").json == hist
     before = len(intents_in(stack.w.outbox))
     for audience in ("public", "lab"):
-        mcp(stack, "artifact_share_create", artifact_id="art_sh1", version_id="v_9", audience=audience)
+        with pytest.raises((MemberServiceError, CollabError)) as exc:
+            mcp(stack, "artifact_share_create", artifact_id="art_sh1", version_id="v_9", audience=audience)
+        assert exc.value.status == 404
         web = req(stack, "POST", "/api/member/artifacts/art_sh1/shares",
                   body={"version_id": "v_9", "audience": audience})
-        assert web.status == 200
-    sent = intents_in(stack.w.outbox)[before:]
-    assert len(sent) == 4 and {i["kind"] for i in sent} == {"member.share_create"}
-    assert {i["actor"]["kind"] for i in sent} == {"agent", "user"}
+        assert web.status == 404
+    assert len(intents_in(stack.w.outbox)) == before
+    sent = [{"actor": {"kind": kind}, "payload": {"version_id": "v_9", "audience": audience}}
+            for kind in ("agent", "user") for audience in ("public", "lab")]
 
     async def body(env, rt):
         aid, vid = await published(env, user("bob"), owner=BOB)
