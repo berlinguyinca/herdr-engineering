@@ -232,7 +232,7 @@ def test_archive_restore_tombstone_and_purge_respect_sharing_and_keep_evidence(r
         with pytest.raises(ArtifactError, match="purged"):
             await store.restore_artifact(a, actor="o")
         # c's hold is cleared, so its unshared bytes are deleted but the version row and hashes remain.
-        await connection.execute("UPDATE artifacts SET purge_after=now() - interval '1 day' WHERE artifact_id=$1", c)
+        await connection.execute("UPDATE artifacts SET legal_hold=false, purge_after=now() - interval '1 day' WHERE artifact_id=$1", c)   # the operator releases the hold
         assert [r["artifact_id"] for r in await store.purge_due()] == [c]
         assert not blobs.head(vc["output_manifest"][0]["storage_key"])
         assert (await store.get_version(vc["version_id"]))["output_manifest"] == vc["output_manifest"]
@@ -319,6 +319,11 @@ def test_resumable_upload_out_of_order_replay_verify_and_cleanup(registry_pg):
         with pytest.raises(ArtifactError, match="idempotency"):
             await store.create_upload(artifact_id, principal_id="o", filename="other", media_type="application/octet-stream",
                                       size_bytes=64, sha256=digest, part_size=20, idempotency_key="idem-1")
+        for bad_media in ("text/html\r\nX-Evil: 1", "text/plain\x00", "a/b\x7f", "application/pdf;a=1,text/html",
+                          'text/html;a="b', "text/html;a=\\b", "no-slash", "a b/c"):
+            with pytest.raises(ArtifactError, match="media_type"):
+                await store.create_upload(artifact_id, principal_id="o", filename="big.bin", media_type=bad_media,
+                                          size_bytes=64, sha256=digest, part_size=20, idempotency_key="idem-bad")
         upload = session["upload_id"]
         chunks = [payload[0:20], payload[20:40], payload[40:60], payload[60:64]]
         with pytest.raises(ArtifactError, match="exactly"):

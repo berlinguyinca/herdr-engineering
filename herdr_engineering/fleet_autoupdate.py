@@ -221,6 +221,32 @@ def run_update() -> dict:
         return fleet_update()
 
 
+def failure_reason(report: dict) -> str | None:
+    """Why `fleet_update()` said no, in the one line the doctor prints.
+
+    `fleet_update()` fails two ways: it raises nothing and sets `error` (a precondition it refused),
+    or it completes the deploy and returns `ok: false` because the post-deploy parity check found a
+    host that does not match. The second kind carries no `error` at all - the reason lives in
+    `steps.revision_parity` - so recording `report.get("error")` wrote `reason: null`, and
+    `herdr-eng memory doctor` printed `unattended update failed: None` for a fleet whose deploy had
+    succeeded everywhere and whose only complaint was one host's agent state.
+    """
+    error = report.get("error")
+    if error:
+        return str(error)
+    if not report.get("ok"):
+        parity = (report.get("steps") or {}).get("revision_parity") or {}
+        for key in ("missing_hosts", "mismatched_hosts", "invalid_hosts",
+                    "unexpected_hosts", "duplicate_hosts"):
+            hosts = parity.get(key)
+            if hosts:
+                return f"revision parity failed: {key[:-1]} {', '.join(str(h) for h in hosts)}"
+        if parity:
+            return "revision parity failed (no host detail recorded)"
+        return "fleet update failed without reporting a reason"
+    return None
+
+
 def main() -> int:
     runner: dict = {}
     try:
@@ -240,7 +266,7 @@ def main() -> int:
         record_run("failed", reason=str(exc), detail=runner or None)
     else:
         record_run("updated" if report.get("ok") else "failed",
-                   reason=report.get("error"), revision=report.get("revision"),
+                   reason=failure_reason(report), revision=report.get("revision"),
                    detail=runner or None)
     print(json.dumps(report, sort_keys=True))
     return 0 if report.get("ok") else 1

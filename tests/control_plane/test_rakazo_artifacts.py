@@ -126,7 +126,9 @@ def test_pages_and_spaces_are_separate(srv, alice, reg):
 def test_bad_uploads_are_refused(srv, alice, reg):
     _, api = srv
     base = {"name": "a.txt", "mimeType": "text/plain", "contentBase64": b64(b"x")}
-    for change in ({"contentBase64": "not base64!!"}, {"name": "a/b"}, {"name": ""}, {"botId": "nope"},
+    for change in ({"contentBase64": "not base64!!"}, {"name": "a/b"}, {"mimeType": "application/pdf;a=1,text/html"},
+                   {"mimeType": 'text/html;a="b'}, {"mimeType": "text/html;a=\\b"}, {"mimeType": "text/html\r\nX: 1"},
+                   {"mimeType": "nonsense"}, {"name": ""}, {"botId": "nope"},
                    {"description": "x" * 281}, {"contentBase64": b64(b"x" * (8 * 1024 * 1024 + 1))}):
         assert rpc(api, "artifacts/create", {**base, **change}, alice) in (400, 404), change
     assert not reg.records

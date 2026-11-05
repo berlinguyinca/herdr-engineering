@@ -1,5 +1,5 @@
 # ruff: noqa: F811  (imported pytest fixtures are used as test arguments)
-"""Task 8a: the seven artifact tools on the collab MCP server, through ``collab_mcp.handle`` over a real service,
+"""Task 8a: the nine artifact tools on the collab MCP server, through ``collab_mcp.handle`` over a real service,
 a real bridge and a hand-written mirror (the fixtures of test_collab_artifacts.py)."""
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from tests.control_plane.test_collab_artifacts import (  # noqa: F401  (fixtures
 from tests.control_plane.test_collab_external import enroll
 
 TOOLS = {"artifacts_list", "artifact_head", "artifact_read", "artifact_history", "artifact_stage_chunk",
-         "artifact_commit", "artifact_commit_result"}
+         "artifact_commit", "artifact_commit_result", "artifact_annotations", "artifact_annotation_resolve"}
 NOTICE = collab_mcp.UNTRUSTED
 
 
@@ -65,7 +65,11 @@ def test_an_agent_without_grants_sees_no_artifact_tools_and_calls_are_unknown(wo
     assert err(world, info, "artifacts_list") == {"error": "unknown tool", "status": 404}
 
 
-def test_a_granted_agent_gets_all_seven(world):
+def test_the_artifact_tool_set_is_exactly_these_nine():
+    assert collab_mcp.ARTIFACT_TOOL_NAMES == TOOLS and len(collab_mcp._ARTIFACT_TOOLS) == 9
+
+
+def test_a_granted_agent_gets_all_nine(world):
     assert TOOLS <= names(world, world.a_info)
     assert TOOLS <= names(world, world.b_info)          # a read grant lists them too
 
@@ -106,6 +110,9 @@ CALLS = {
     "artifact_history": {"artifact_id": X}, "artifact_commit_result": {"ticket": "t"},
     "artifact_stage_chunk": chunk_args(X, BIG, 0) | {"data_b64": "AA=="},
     "artifact_commit": commit_args(),
+    "artifact_annotations": {"artifact_id": X},
+    "artifact_annotation_resolve": {"artifact_id": X, "version_id": "v_x2", "annotation_ids": ["ann_" + "a" * 22],
+                                    "idempotency_key": "k"},
 }
 
 

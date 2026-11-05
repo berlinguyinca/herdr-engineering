@@ -206,7 +206,7 @@ def service_ownership(record, session=None):
     return _observed_service_ownership(record, session)
 
 
-def service_catalog(record, session=None):
+def service_catalog(record, session=None, *, project_index=None):
     name = str(record.get("service_name") or "")
     process = str(record.get("owner") or name.split(" on ", 1)[0]).lower()
     category, label = "other", "Other services"
@@ -243,7 +243,7 @@ def service_catalog(record, session=None):
     return dict(**service_ownership(record, session), **git,
                 metadata_observation=record.get("metadata_observation"),
                 endpoint_scope=record.get("endpoint_scope"),
-                project_id=project_for_repository(git["repository_id"]),
+                project_id=project_for_repository(git["repository_id"], project_index=project_index),
                 category=category, label=label, purpose=purpose,
                 project=project or None, project_source=project_source, source_port=source_port)
 

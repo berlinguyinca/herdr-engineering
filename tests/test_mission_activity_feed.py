@@ -579,3 +579,40 @@ def test_unknown_contract_version_is_not_published(tmp_path):
         _rewrite_snapshot(project, snapshot, contractVersion=5)
         feed.MissionActivityFeed(url, host_id='host', control_dir=root).run_once()
         assert all(p['payload']['connection'] != 'connected' for p in posts)
+
+
+def test_real_pi_v4_golden_reaches_the_feed_store_and_outcome_refs_end_to_end(tmp_path):
+    """G9: Pi's real v4 golden shape (trimmed copy) -> collector -> real server ingest -> HTTP read."""
+    import urllib.request
+
+    from herdr_engineering.control_plane.api import ControlPlaneServer
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    golden = json.loads((Path(__file__).parent / 'fixtures/pi-snapshot-v4-golden-trimmed.json').read_text())
+    repo = ControlPlaneRepo()
+    server = ControlPlaneServer(repo, host='127.0.0.1', port=0)
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    server.wait_until_ready()
+    try:
+        with native_session(tmp_path) as (root, project, status, _, _):
+            ids = [m['id'] for m in golden['missions']]
+            status['missionIds'] = ids
+            status['missions'] = [dict(id=m['id'], status='RUNNING', revision=m['revision']) for m in golden['missions']]
+            _rewrite_snapshot(project, golden)
+            collector = feed.MissionActivityFeed(f'http://127.0.0.1:{server.port}', host_id='host', control_dir=root)
+            assert collector.run_once()['posted'] == 2
+
+        def get(route):
+            with urllib.request.urlopen(f'http://127.0.0.1:{server.port}{route}', timeout=5) as response:
+                return json.load(response)
+        by_id = {a['mission']['id']: a for a in get('/api/v1/mission-activity')['activities']}
+        full, nulls = by_id['MSN-golden-full']['mission'], by_id['MSN-golden-nulls']['mission']
+        assert full['created_at'] == '2026-10-14T12:00:00+00:00' and full['completed_at'] == '2026-10-14T11:30:00+00:00'
+        assert nulls['created_at'] == '2026-10-14T12:00:00+00:00' and 'completed_at' not in nulls
+        assert by_id['MSN-golden-full']['activity']['nextAction'] == 'verify'
+        outcomes = get('/api/v1/mission-outcomes')
+        assert outcomes['issue_refs'] == {'pi:MSN-golden-full': [{'repository': 'org/repo', 'number': 5}]}
+        assert outcomes['pr_refs'] == {'pi:MSN-golden-full': [{'repository': 'org/repo', 'number': 9}]}
+    finally:
+        server.shutdown()
+        thread.join(1)

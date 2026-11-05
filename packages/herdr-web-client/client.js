@@ -178,6 +178,33 @@ export class HerdrClient {
     return this.request(`/api/v1/artifacts${query.size ? `?${query}` : ''}`, { signal });
   }
 
+  // Owner-only delete (tombstone / purge now) and restore. The server answers a non-owner with a plain 404.
+  artifactDeleteAccess({ signal } = {}) {
+    return this.request('/api/v1/artifacts/delete-access', { signal });
+  }
+
+  listTombstonedArtifacts({ signal } = {}) {
+    return this.request('/api/v1/artifacts/tombstoned', { signal });
+  }
+
+  // A permanent delete must carry the typed count as a string: it is refused here, before any request, if it does not.
+  async deleteArtifacts(ids, { mode = 'tombstone', reason, holdDays, confirm, requestKey, signal } = {}) {
+    if (!Array.isArray(ids) || !ids.length) throw new Error('Select at least one artifact');
+    if (ids.length > 200) throw new Error('At most 200 artifacts per request');
+    if (mode === 'purge_now' && confirm !== String(new Set(ids).size)) throw new Error('A permanent delete needs its typed confirm count');
+    const body = { ids, mode, reason };
+    if (holdDays !== undefined) body.hold_days = holdDays;
+    if (mode === 'purge_now') body.confirm = confirm;
+    if (requestKey) body.request_key = requestKey;
+    return this.request('/api/v1/artifacts/delete', { method: 'POST', body, signal });
+  }
+
+  async restoreArtifacts(ids, { requestKey, signal } = {}) {
+    if (!Array.isArray(ids) || !ids.length) throw new Error('Select at least one artifact');
+    if (ids.length > 200) throw new Error('At most 200 artifacts per request');
+    return this.request('/api/v1/artifacts/restore', { method: 'POST', body: requestKey ? { ids, request_key: requestKey } : { ids }, signal });
+  }
+
   // Artifacts bound to a project, issue, task or room (P03). The server filters by what the caller may read.
   artifactsForContext(kind, ref, { q, mediaType, limit, cursor, signal } = {}) {
     const query = new URLSearchParams();
@@ -226,6 +253,31 @@ export class HerdrClient {
     return `${this.base}/api/v1/artifacts/${encodeURIComponent(id)}/download`;
   }
 
+  // Static (sanitised) copy of the current file: { kind, html, too_large }.
+  artifactRender(id, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/render`, { signal });
+  }
+
+  // Static copy of one legacy report output of a version.
+  artifactOutputRender(id, versionId, index, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/outputs/${encodeURIComponent(index)}/render`, { signal });
+  }
+
+  // Static copy of a report version's lightweight preview.
+  artifactReportPreviewRender(id, versionId, { signal } = {}) {
+    return this.request(`${this.artifactReportPath(id, versionId)}/preview/render`, { signal });
+  }
+
+  // The sandboxed raw view, opened in a new tab (never framed).
+  artifactLiveUrl(id) {
+    return `${this.base}/api/v1/artifacts/${encodeURIComponent(id)}/live`;
+  }
+
+  // The current file's bytes (the /download route, with this client's headers).
+  artifactBytes(id, { signal } = {}) {
+    return this.artifactReportContent(`/api/v1/artifacts/${encodeURIComponent(id)}/download`, 'buffer', signal);
+  }
+
   artifactVersions(id, { signal, summary = false } = {}) {
     return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/versions${summary ? '?summary=true' : ''}`, { signal });
   }
@@ -261,6 +313,58 @@ export class HerdrClient {
 
   artifactShareEvents(id, shareId, { signal } = {}) {
     return this.request(`${this.artifactSharesPath(id, shareId)}/events`, { signal });
+  }
+
+  // Operator controls for member-owned artifacts (/api/v1/artifact-members); a viewer key answers 403.
+  artifactMemberPath(member, ...rest) {
+    return ['/api/v1/artifact-members', encodeURIComponent(member), ...rest.map(encodeURIComponent)].join('/');
+  }
+
+  listArtifactMembers({ signal } = {}) {
+    return this.request('/api/v1/artifact-members', { signal });
+  }
+
+  getArtifactMember(member, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member), { signal });
+  }
+
+  listArtifactMemberLinks({ audience, state, signal } = {}) {
+    const query = new URLSearchParams();
+    if (audience) query.set('audience', audience);
+    if (state) query.set('state', state);
+    const text = query.toString();
+    return this.request(`/api/v1/artifact-members/links${text ? `?${text}` : ''}`, { signal });
+  }
+
+  /** `limits` holds any of max_artifact_bytes / max_member_bytes / max_artifacts; null clears an override. */
+  setArtifactMemberLimits(member, limits, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member, 'limits'), { method: 'POST', body: limits, signal });
+  }
+
+  setArtifactMemberSharing(member, enabled, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member, 'sharing'), { method: 'POST', body: { enabled }, signal });
+  }
+
+  revokeArtifactMemberShare(member, shareId, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member, 'shares', shareId, 'revoke'), { method: 'POST', body: {}, signal });
+  }
+
+  /** Permanent: `confirm` must repeat the artifact id exactly. */
+  purgeArtifactMemberArtifact(member, artifactId, confirm, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member, 'artifacts', artifactId, 'purge'), { method: 'POST', body: { confirm }, signal });
+  }
+
+  /** Annotations on an artifact's shares (owner view): one page, newest first; pass the returned `next` as `before`. */
+  listArtifactAnnotations(id, { status = 'open', limit, before, signal } = {}) {
+    const query = new URLSearchParams({ status });
+    if (limit !== undefined && limit !== null) query.set('limit', String(limit));
+    if (before !== undefined && before !== null) query.set('before', before);
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/annotations?${query}`, { signal });
+  }
+
+  dismissArtifactAnnotation(id, annotationId, { signal } = {}) {
+    return this.request(`/api/v1/artifacts/${encodeURIComponent(id)}/annotations/${encodeURIComponent(annotationId)}/dismiss`,
+      { method: 'POST', body: {}, signal });
   }
 
   // Artifact collaborators (owner view): grants for agents, one-time invite grants, activity, version diffs.
@@ -384,7 +488,7 @@ export class HerdrClient {
       error.requestId = response.headers?.get?.('X-Request-ID') || '';
       throw error;
     }
-    return kind === 'text' ? response.text() : response.blob();
+    return kind === 'text' ? response.text() : kind === 'buffer' ? response.arrayBuffer() : response.blob();
   }
 
   listPublications({ signal } = {}) {
@@ -500,6 +604,19 @@ export class HerdrClient {
   // -- services / hosts ---------------------------------------------------
   listServices({ signal } = {}) {
     return this.request('/api/v1/services', { signal });
+  }
+
+  listServiceCatalog({scope='herdr', status='current', includeArchived=false,
+    search='', hostId='', groupBy='project', limit=100, cursor, signal} = {}) {
+    const query = new URLSearchParams({view:'catalog', scope:scope==='local'?'unassigned':scope,
+      status, include_archived:String(includeArchived), search, host_id:hostId,
+      group_by:groupBy, limit:String(limit)});
+    if(cursor != null)query.set('cursor',cursor);
+    return this.request(`/api/v1/services?${query}`, {signal});
+  }
+
+  getService(serviceId, {signal} = {}) {
+    return this.request(`/api/v1/services/${encodeURIComponent(serviceId)}`, {signal});
   }
 
   /** Canonical fabric URLs for URLs in agent output (read-only; originals are never changed). */

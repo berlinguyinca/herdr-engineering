@@ -31,8 +31,8 @@ Paths below are relative to `herdr_engineering/control_plane/` unless they start
 ## 2. Trust boundaries
 1. Internet -> `collab-edge` nginx (TLS, rate limits, route allow-list) -> `collab-public` container started `--collab-only`,
    with no Postgres or object-store credentials (`deploy/control-plane/compose.collab.yaml`, `collab-edge/nginx.conf`).
-2. Internet -> `/s/` on the same edge -> `share-public` (`share_public.py`), a database-free process that reads a read-only
-   volume (`deploy/control-plane/collab-edge/share-location.conf`).
+2. Internet -> the share host's own server on the same edge (`/s/` only; the MCP host serves no `/s/`) -> `share-public`
+   (`share_public.py`), a database-free process that reads a read-only volume (`deploy/control-plane/collab-edge/share-http.conf`).
 3. Tailnet operator -> `control-plane-web` (keyed `/api/v1/*`, roles viewer/operator) and the operator listener (`:8082`),
    which refuses the share network's subnet (`nginx.conf`, `deny 172.31.251.0/28`).
 4. Signed-in person (Cognito) vs agent (enrolled credential) vs guest (expiring membership) inside collab (`collab.py`
@@ -133,7 +133,7 @@ Mitigations (read in code):
   (`sandbox allow-scripts allow-downloads`, fetch directives limited to `'self'`, `form-action 'none'`); the lab viewer page has a
   strict CSP with no inline script (`share_public.py` `_CSP_TEMPLATE`, `VIEWER_CSP`). Tokens live only in `sessionStorage`
   (`share_static/share.js`) and are not logged; nginx has `access_log off` on `/s/` and enforces method, body and rate limits
-  (`share-location.conf`).
+  (`share-http.conf`).
 - Per-share bytes, file counts and total live bytes are capped (`DEFAULTS` in `artifact_share_api.py`).
 - `share-public` has no database and no registry access; the operator listener refuses the share network.
 
@@ -394,7 +394,7 @@ with the flag off (migrations are additive, so the image can be ahead of the fla
 | `control_plane.collab.team_roles.enabled` (also needs `team_rooms`) | off | Set `true` (hot); assign people to roles per room and team; set the policy per team (default escalate) | `task_reminded` / `task_escalated` events, `blocked` tasks in the owner's attention, 409 `no_role_holder` rate | `false` or `kill_switch: true`: new fields unknown, routes 404, sweep stops. Do NOT roll the image back while a person task newer than ~8 days exists (R-TR14); roll back the flag. See `docs/operations/team-rooms.md` |
 | `control_plane.collab.coordinators.enabled` (also needs `team_rooms`, `team_roles`) | off | Set `true` (hot); designate an agent per team; `external.enabled` is a second flag and the per-team opt-in a third | `team_coordinator_set`, `task_requeued` events, 429 `coordinator_rate` / `coordinator_open`, 400 `coordination_loop`, 403 audit events from coordinators | `external-coordination off` per team, then `external.enabled: false`, then `enabled: false`; cancel what you do not want. Do not roll the image back (R-TC5) |
 | `control_plane.personal_assistant.team_briefs.enabled` (also needs `personal_assistant.enabled`, a persistence DSN, `team_rooms`) | off | Set `true` with a topic list; restart the control plane (read at start); attach a team to a room first | `suggestion_submitted` events with `source: assistant_brief`, 429 `brief_rate`, pending queue age, assistant audit `assistant.team_brief.*` | `false` and restart: both routes 404, the in-process door closes, briefs already filed stay in the queue (decide or reject them). Do NOT roll the image back (R-TB5). See `docs/operations/team-rooms.md` |
-| Share links `control_plane.share.enabled` (+ `signing_secret`, collab `public_url`) | off | Complete the share block; `deploy.sh` refuses incomplete config, renders the edge with `/s/`, starts `share-public` | share `events` (`opened`, `denied`), 404 rate on `/s/`, live bytes | Revoke individual shares first (`POST .../shares/{sid}/revoke` removes state, then bundle); then `enabled: false` and deploy: the edge stops routing `/s/` and `share-public` is stopped |
+| Share links `control_plane.share.enabled` (+ `signing_secret`, `share.public_url`) | off | Complete the share block; `deploy.sh` refuses incomplete config, renders the edge with `/s/`, starts `share-public` | share `events` (`opened`, `denied`), 404 rate on `/s/`, live bytes | Revoke individual shares first (`POST .../shares/{sid}/revoke` removes state, then bundle); then `enabled: false` and deploy: the edge stops routing `/s/` and `share-public` is stopped |
 | Per-user rollout | not built | The spec asks for it; every flag today is global | | |
 
 Revert order: `room_artifact_access`, then `enabled`, then restart; revoke public shares before disabling the share edge so the

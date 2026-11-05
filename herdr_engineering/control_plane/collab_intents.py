@@ -230,8 +230,11 @@ COMMIT_OUTCOMES = frozenset({"created", "merged"})
 GATE_RELOAD = 30.0                  # the worker-local retraction gate is reloaded at least this often (seconds)
 LINEAGE_QUEUE_MAX = 1000            # versions waiting for lineage emission; the oldest is dropped beyond this
 
-_RESULT_KEYS = ("version_id", "version_number", "head_version_id", "merged_names", "conflicts", "reason")
-_STR_KEYS = ("reason", "version_id", "head_version_id", "attempt_id")
+_RESULT_KEYS = ("version_id", "version_number", "head_version_id", "merged_names", "conflicts", "reason", "resolved",
+                "skipped", "artifact_id", "share_id", "audience", "secret_result", "summary", "events")
+MAX_RESOLVED = 50                       # annotation_resolve: ids resolved / skipped in one outcome
+_STR_KEYS = ("reason", "version_id", "head_version_id", "attempt_id", "artifact_id", "share_id", "audience")
+MAX_SHARE_EVENTS = 50                   # member.share_events: rows in one outcome
 _OUTCOME = re.compile(r"[a-z_]{1,32}\Z")
 _INTENT_FILE = re.compile(TICKET_RE[:-2] + r"\.json\Z")
 _KIND_NAME = re.compile(r"[a-z][a-z0-9_.]{0,47}\Z")
@@ -930,6 +933,8 @@ class CollabIntentApplier:
         if artifact is None:
             return _rejected(REASON_NO_ARTIFACT)
         await self._load_gate(store)
+        if artifact["lifecycle"] == "tombstoned":                  # deleted: as if it did not exist
+            return _rejected(REASON_NO_ARTIFACT)
         if artifact["lifecycle"] == "retracted" or self.gate.artifact_retracted(aid):
             return _rejected(REASON_RETRACTED)
         base = await store.get_version(payload.base_version_id, aid)
@@ -1405,11 +1410,12 @@ class CollabIntentApplier:
             except ValueError:
                 continue
             payload = raw.get("payload") if isinstance(raw, dict) else None
-            changes = payload.get("changes") if isinstance(payload, dict) else None
-            for change in changes if isinstance(changes, list) else ():
-                upload_id = change.get("upload_id") if isinstance(change, dict) else None
-                if isinstance(upload_id, str):
-                    out.add(upload_id)
+            for field in ("changes", "files"):           # commit changes; member.publish files
+                listed = payload.get(field) if isinstance(payload, dict) else None
+                for item in listed if isinstance(listed, list) else ():
+                    upload_id = item.get("upload_id") if isinstance(item, dict) else None
+                    if isinstance(upload_id, str):
+                        out.add(upload_id)
         return out
 
     def _remove_upload(self, owner: str, upload_id: str) -> bool:
@@ -1476,6 +1482,28 @@ def _check_outcome(out) -> None:
         raise TypeError("invalid outcome field")
     conflicts = out.get("conflicts")
     if conflicts is not None and (not isinstance(conflicts, list) or not all(isinstance(c, dict) for c in conflicts)):
+        raise TypeError("invalid outcome field")
+    resolved = out.get("resolved")
+    if resolved is not None and (not isinstance(resolved, list) or len(resolved) > MAX_RESOLVED
+                                 or not all(isinstance(r, str) for r in resolved)):
+        raise TypeError("invalid outcome field")
+    skipped = out.get("skipped")
+    if skipped is not None and (
+            not isinstance(skipped, list) or len(skipped) > MAX_RESOLVED
+            or not all(isinstance(s, dict) and set(s) <= {"annotation_id", "reason"}
+                       and isinstance(s.get("reason"), str) and len(s["reason"]) <= 64
+                       and (s.get("annotation_id") is None or (isinstance(s["annotation_id"], str)
+                                                               and len(s["annotation_id"]) <= 64)) for s in skipped)):
+        raise TypeError("invalid outcome field")
+    secret = out.get("secret_result")
+    if secret is not None and secret is not True:
+        raise TypeError("invalid outcome field")
+    summary = out.get("summary")
+    if summary is not None and not isinstance(summary, dict):
+        raise TypeError("invalid outcome field")
+    events = out.get("events")
+    if events is not None and (not isinstance(events, list) or len(events) > MAX_SHARE_EVENTS
+                               or not all(isinstance(e, dict) for e in events)):
         raise TypeError("invalid outcome field")
     json.dumps(out, ensure_ascii=False, allow_nan=False)   # TypeError/ValueError: not writable as a result
 

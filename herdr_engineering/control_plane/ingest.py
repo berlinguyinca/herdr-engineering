@@ -128,12 +128,18 @@ def validate_ai_sync(entity_id, event_type, payload) -> dict:
     return clean
 
 
+def validate_fleet_rollout(entity_id, event_type, payload) -> dict:
+    """Strict allow-list for a fleet rollout event (docs/specs/herdr-fleet-rollout-watcher-20261104, section 8)."""
+    from .fleet_rollout import validate_fleet_rollout as _validate
+    return _validate(entity_id, event_type, payload)
+
+
 # Entity types an ingest principal may write. Dispatched types have handlers; the generic ones are
 # plain activity records nothing authoritative reads back. Adding a type here is a security decision.
 DISPATCHED_ENTITY_TYPES = frozenset({"lineage", "host", "session", "mission", "service", "inspector",
                                      "mission_activity", "test_run", "build", "review",
                                      "review_finding", "pull_request", "token_usage", "resource_usage",
-                                     "ai_sync"})
+                                     "ai_sync", "fleet_rollout"})
 # ledger / platform / lifecycle are the Pi envelope adapters' activity streams (envelopeAdapters.ts)
 # repository / request / span are the opt-in system-graph adapter's lifecycle streams (graph_ingest.py, runbook
 # docs/specs/herdr-system-graph-20261020/11-p0-p6-status-and-runbook.md). They were accepted before T16, nothing
@@ -466,6 +472,8 @@ class IngestService:
             _git_identity(payload)
         if entity_type == "ai_sync":
             validate_ai_sync(entity_id, event_type, payload)
+        if entity_type == "fleet_rollout":
+            validate_fleet_rollout(entity_id, event_type, payload)
         if entity_type == "service" and any(
                 k in payload for k in ("repository_id", "forge_url", "repository_url",
                                        "repo_url", "clone_url", "commit_sha")):
@@ -560,6 +568,13 @@ class IngestService:
             # Latest-per-host config-sync status; the event stream is the durable record (repo.list_ai_sync).
             self.repo.record_event("ai_sync", entity_id, event_type, validate_ai_sync(entity_id, event_type, payload))
             return {"entity_type": "ai_sync", "entity_id": entity_id, "event_type": event_type}
+        if entity_type == "fleet_rollout":
+            # Append-only per-rollout stream; a replay of the same seq is a no-op (repo.list_fleet_rollouts reads it).
+            from .fleet_rollout import record_event as record_fleet_rollout
+            stored = record_fleet_rollout(self.repo, entity_id, event_type,
+                                          validate_fleet_rollout(entity_id, event_type, payload))
+            return {"entity_type": "fleet_rollout", "entity_id": entity_id, "event_type": event_type,
+                    "duplicate": not stored}
         if entity_type == "host":
             return self._ingest_host(entity_id, event_type, payload, source)
         if entity_type == "session":
