@@ -195,6 +195,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # google ---------------------------------------------------------------
     from .google_setup_cli import register as _register_google
     _register_google(sub)
+    from .fleet_watch.cli import register as _register_fleet_watch
+    _register_fleet_watch(sub)
 
     # fleet ----------------------------------------------------------------
     p = sub.add_parser("fleet", help="one-command fleet onboarding + version sync")
