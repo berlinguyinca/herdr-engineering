@@ -7,7 +7,7 @@ THEME = (ROOT / "packages/herdr-design-system/theme.css").read_text()
 
 
 def test_share_css_tokens_match_the_design_system():
-    for value in ("#f7f7f8", "#d9d9e3", "#353740", "#6e6e80", "#10a37f", "#17181c", "#1f2026", "#3a3b45",
+    for value in ("#f7f7f8", "#d9d9e3", "#353740", "#5a5a6e", "#0a7258", "#17181c", "#1f2026", "#3a3b45",
                   "#e6e6ea", "#a4a4b3", "#2fc59c"):
         assert value in CSS and value in THEME, value
     assert '"Inter"' in CSS and "prefers-color-scheme: dark" in CSS and "var(--radius)" in CSS
