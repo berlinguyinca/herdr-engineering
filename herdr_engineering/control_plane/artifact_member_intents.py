@@ -1074,11 +1074,15 @@ async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: 
 
 
 async def _after(ctx: IntentContext, intent: Intent, out: dict, private: dict) -> None:
-    """Rewrite the acting member's view once the outcome is durable."""
+    """Rewrite the acting member's view once the outcome is durable.
+
+    The pool fill is capped by the same per-tick byte budget as the publish tick, and a rejected intent fills nothing
+    (it changed no content): whatever is not pooled yet waits for the next tick."""
     principal, rt = private.get("_principal"), ctx.extras.get("members")
     if isinstance(principal, str) and isinstance(rt, MemberRuntime):
+        budget = [0 if out.get("result") == "rejected" else POOL_TICK_FILL_BYTES]
         await write_member_view(ctx.conn, principal, rt.mirror_root, defaults=rt.defaults, rt=rt,
-                                rustfs=getattr(ctx.store, "rustfs", None))
+                                rustfs=getattr(ctx.store, "rustfs", None), budget=budget)
 
 
 # ----------------------------------------------------------------------------- secret results

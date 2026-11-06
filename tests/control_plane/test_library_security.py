@@ -771,6 +771,42 @@ def test_claim_cookie_has_its_own_mac_domain(sandbox):
     sandbox(body)
 
 
+def pooled_files(env):
+    return sorted(p.name for p in (env.mirror_root / POOL).rglob("*") if p.is_file())
+
+
+def test_an_intent_rewrite_has_a_byte_budget_and_a_rejected_one_fills_nothing(sandbox, monkeypatch):
+    from herdr_engineering.control_plane import artifact_member_intents as ami
+
+    async def body(env, rt, web, shares):
+        a = await create(env, user("alice"), title="Fill")
+        await put_files(env, a, {"index.html": HTML}, actor=user("alice"))
+        await tick(env, rt)
+        assert len(pooled_files(env)) == 1                                  # the unbudgeted baseline: pooled
+        for p in (env.mirror_root / POOL).rglob("*"):
+            if p.is_file():
+                p.unlink()
+        # a rejected intent (a folder that does not exist) rewrites the view but fetches nothing
+        out = await send_intent(env, user("alice"), "library_folder_delete", {"folder_id": GHOST_FLD})
+        assert out["result"] == "rejected", out
+        assert pooled_files(env) == []
+        assert item(env, ALICE, a)["files"] == []                           # the tick fills the rest
+        await tick(env, rt)
+        assert len(pooled_files(env)) == 1 and item(env, ALICE, a)["files"]
+        # an accepted intent is capped by the same per-tick budget as the publish tick
+        for p in (env.mirror_root / POOL).rglob("*"):
+            if p.is_file():
+                p.unlink()
+        monkeypatch.setattr(ami, "POOL_TICK_FILL_BYTES", 1)
+        out = await send_intent(env, user("alice"), "library_folder_create", {"name": "X"})
+        assert out["result"] == "created", out
+        assert pooled_files(env) == [] and item(env, ALICE, a)["files"] == []
+        monkeypatch.undo()
+        await tick(env, rt)
+        assert len(pooled_files(env)) == 1
+    sandbox(body)
+
+
 def test_a_claimed_item_serves_the_pinned_version_not_head(sandbox):
     async def body(env, rt, web, shares):
         s = await scenario(env, rt, web, shares)
