@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from ..assistant import AssistantStore
     from .workers import Worker
 
-__all__ = ["DeployCheck", "Status", "STATUSES", "FINAL", "sanitize_check", "short_label", "NOT_OPENED", "DEFAULT_CHECK_MINUTES", "DEFAULT_WINDOW_MINUTES", "open_check",
+__all__ = ["DeployCheck", "Status", "STATUSES", "FINAL", "sanitize_check", "short_label", "NOT_OPENED", "NO_CHECK", "DEFAULT_CHECK_MINUTES", "DEFAULT_WINDOW_MINUTES", "open_check",
            "verify_deploy", "record_exit", "check_minutes", "describe_status"]
 
 Status = Literal["awaiting", "healthy", "rolled_back", "failed_rollback", "unconfirmed"]
@@ -220,7 +220,11 @@ def verify_deploy(store: AssistantStore, check: DeployCheck, health: Any, now: d
         if not error and not isinstance(commit, str):
             error, commit = "bad_reply", None
         seen = commit[:12] if isinstance(commit, str) else ""
-        if isinstance(commit, str) and _matches(commit, cur.sha):
+        matched = isinstance(commit, str) and _matches(commit, cur.sha)
+        window_over = now >= _utc(cur.window_ends)
+        if matched and window_over:
+            # the target has been serving through the whole window (a restarted hub sees itself at once, so a first
+            # sighting alone is only provisional: deploy.sh may still roll back after it)
             note = ""
             if reverify is not None:
                 try:
@@ -230,8 +234,9 @@ def verify_deploy(store: AssistantStore, check: DeployCheck, health: Any, now: d
             done = _finish(store, cur.check_id, cur.tenant_id, cur.user_id, "healthy", now, ("awaiting",),
                            last_error="", seen_commit=seen, reverified=note)
             return done or cur
-        if (isinstance(commit, str) and _HEX.fullmatch(commit) and len(commit) >= MIN_PREFIX
-                and now >= _utc(cur.window_ends)):
+        target_seen = _matches(cur.seen_commit, cur.sha)   # the target was served earlier and something else is now
+        if (not matched and isinstance(commit, str) and _HEX.fullmatch(commit) and len(commit) >= MIN_PREFIX
+                and (window_over or target_seen)):
             if lineage is not None:
                 try:
                     relation = lineage(cur, commit)
@@ -259,30 +264,52 @@ def verify_deploy(store: AssistantStore, check: DeployCheck, health: Any, now: d
         return check
 
 
+NO_CHECK = "no_hub_check"        # last_error of the urgent row written when exit 3 was reported and no check existed
+_NO_SHA = "0" * 40
+
+
 def record_exit(store: AssistantStore, worker: Worker, task_id: str | None, exit_code: int,
                 now: datetime) -> DeployCheck | None:
-    """The worker reported ``deploy.sh`` exited with ``exit_code``.  Exit 3 (failed to roll back) raises the worker's
-    most recent unfinished-or-not-yet-failed check to ``failed_rollback``; other codes are only stored.  Returns the
-    check when it changed to ``failed_rollback`` (the caller posts the urgent ask), else None.  Scoped to the worker's
+    """The worker reported what ``deploy.sh`` exited with.  Its word can only make the owner look sooner, never mark
+    a deploy healthy: exit 0 changes nothing; exit 1 (rolled back) makes the worker's check ``rolled_back`` and exit 3
+    (failed to roll back) makes it ``failed_rollback``, at ANY time, including after the hub saw the target serving.
+    The check is the worker's one for ``task_id``, else its most recent one.  Exit 3 with no check at all leaves an
+    urgent row of its own.  Returns the check that changed (the caller posts it), else None.  Scoped to the worker's
     own tenant, user and worker id."""
     with store._lock:
-        mine = [c for c in store.list_deploy_checks(worker.tenant_id, worker.user_id, worker_id=worker.worker_id)
-                if task_id is None or c.task_id == task_id]
+        every = store.list_deploy_checks(worker.tenant_id, worker.user_id, worker_id=worker.worker_id)
+        mine = [c for c in every if task_id is not None and c.task_id == task_id] or every
         if not mine:
-            return None
+            return _unchecked_exit(store, worker, task_id, exit_code, now) if exit_code == 3 else None
         target = mine[-1]                          # most recent
-        if exit_code != 3:
-            if target.exit_code != exit_code:
+        status = {1: "rolled_back", 3: "failed_rollback"}.get(exit_code)
+        if status is None or target.status == "failed_rollback" or (status == "rolled_back"
+                                                                    and target.status == "rolled_back"):
+            if exit_code != 0 and target.exit_code != exit_code:
                 store.put_deploy_check(replace(target, exit_code=exit_code))
             return None
-        if target.status in ("failed_rollback", "healthy"):
-            return None                            # healthy was seen by the hub itself: the claim does not undo it
-        new = replace(target, status="failed_rollback", exit_code=3, finished_at=_utc(now), notified=False)
+        new = replace(target, status=status, exit_code=exit_code, finished_at=_utc(now), notified=False,
+                      last_error="")
         store.put_deploy_check(new)
         store.audit_record(tenant_id=new.tenant_id, user_id=new.user_id, actor=f"worker:{worker.worker_id}",
                            action="assistant.deploy.outcome", subject_id=new.check_id,
-                           detail=f"check={new.check_id} status=failed_rollback sha12={new.sha[:12]} exit=3")
+                           detail=f"check={new.check_id} status={status} sha12={new.sha[:12]} exit={exit_code}")
         return new
+
+
+def _unchecked_exit(store: AssistantStore, worker: Worker, task_id: str | None, exit_code: int,
+                    now: datetime) -> DeployCheck:
+    """Exit 3 and the hub never opened a check: still an urgent, persisted row so the owner is told."""
+    now = _utc(now)
+    row = DeployCheck(
+        check_id="dc_" + secrets.token_urlsafe(12), tenant_id=worker.tenant_id, user_id=worker.user_id, sha=_NO_SHA,
+        status="failed_rollback", started_at=now, deadline=now, window_ends=now, finished_at=now,
+        worker_id=worker.worker_id, task_id=task_id or "", exit_code=exit_code, last_error=NO_CHECK)
+    store.audit_record(tenant_id=row.tenant_id, user_id=row.user_id, actor=f"worker:{worker.worker_id}",
+                       action="assistant.deploy.outcome", subject_id=row.check_id,
+                       detail=f"check={row.check_id} status=failed_rollback exit=3 no_hub_check=yes")
+    store.put_deploy_check(row)
+    return row
 
 
 _WORDS = {
@@ -297,6 +324,10 @@ _LABELS = {"awaiting": "still being checked", "healthy": "healthy", "rolled_back
 
 
 def describe_status(check: DeployCheck) -> str:
+    if check.status == "rolled_back" and check.exit_code == 1:
+        return "NOT live: deploy.sh reported it rolled back"
+    if check.status == "failed_rollback" and check.last_error == NO_CHECK:
+        return "FAILED TO ROLL BACK per the worker (the hub had no check for this deploy; needs you now)"
     if check.status == "unconfirmed" and check.last_error == NOT_OPENED:
         return "NOT verified by the hub (its check could not be opened); do not assume it worked"
     return _WORDS.get(check.status, _WORDS["unconfirmed"])

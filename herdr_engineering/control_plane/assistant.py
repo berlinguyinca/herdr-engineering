@@ -2345,6 +2345,7 @@ class AssistantStore:
                 return None
             row.status = "unconfirmed"
             row.last_error = "bad_state"
+            row.notified = False                        # the owner has not been told about THIS state
         try:
             return sanitize_check(row)
         except Exception:                               # noqa: BLE001

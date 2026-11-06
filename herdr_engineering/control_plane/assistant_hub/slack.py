@@ -27,7 +27,15 @@ from typing import Any
 from ..assistant import AssistantStore
 from .actiongrants import ActionRequestRow, GrantState, as_utc
 from .deploy import DeployMatch, scope_key, scope_mode
-from .deploycheck import FINAL, NOT_OPENED, DeployCheck, describe_status, short_label, verify_deploy
+from .deploycheck import (
+    FINAL,
+    NO_CHECK,
+    NOT_OPENED,
+    DeployCheck,
+    describe_status,
+    short_label,
+    verify_deploy,
+)
 from .evidence import propose_if_ready
 from .policy import (
     ActivationRefused,
@@ -826,6 +834,10 @@ class SlackRuntime:
     def _outcome_text(check: DeployCheck) -> str:
         """Ids, the short sha and fixed words only: no command, no remote text."""
         head = f"`{slack_text(check.project, 64)}/{slack_text(check.scope, 64)}` at `{slack_text(check.sha[:12], 12)}`"
+        if check.status == "failed_rollback" and check.last_error == NO_CHECK:
+            return (f":rotating_light: *URGENT: worker `{slack_text(check.worker_id)}` reported deploy.sh exit 3 "
+                    "(failed to roll back), but the hub has no deploy check for it.* The control plane may be broken "
+                    "or half-updated. This needs you now.")
         if check.status == "failed_rollback":
             return (f":rotating_light: *URGENT: the deploy of {head} failed to roll back.* The control plane may be "
                     f"broken or half-updated. Worker `{slack_text(check.worker_id)}` reported deploy.sh exit 3. "
@@ -839,6 +851,9 @@ class SlackRuntime:
             elif check.reverified != "on_main":
                 line += " Main could not be re-checked after the deploy."
             return line
+        if check.status == "rolled_back" and check.exit_code == 1:
+            return (f"*Deploy not live:* {head} was rolled back: worker `{slack_text(check.worker_id)}` reported "
+                    "deploy.sh exit 1.")
         if check.status == "rolled_back":
             return (f"*Deploy not live:* {head} is not serving. A different version is serving "
                     f"(`{slack_text(check.seen_commit, 12)}`); the new version is not live; cause unknown.")

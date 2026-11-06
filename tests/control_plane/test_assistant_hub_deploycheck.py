@@ -117,13 +117,17 @@ def test_healthy_when_health_reports_the_target_commit(hl):
     still = verify_deploy(store, check, health, T0 + timedelta(minutes=1))
     assert still.status == "awaiting" and still.seen_commit == OLD[:12]            # the old version is still serving
     hl.commit = SHA
-    done = verify_deploy(store, check, health, T0 + timedelta(minutes=2))
-    assert done.status == "healthy" and done.finished_at == T0 + timedelta(minutes=2)
+    first = verify_deploy(store, check, health, T0 + timedelta(minutes=2))
+    assert first.status == "awaiting" and first.seen_commit == SHA[:12]       # seen once: only provisional
+    assert not [e for e in store.audit if e["action"] == "assistant.deploy.outcome"]
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=9)).status == "awaiting"
+    done = verify_deploy(store, check, health, T0 + timedelta(minutes=10))     # still serving through the window
+    assert done.status == "healthy" and done.finished_at == T0 + timedelta(minutes=10)
     assert store.get_deploy_check(check.check_id, tenant_id=T, user_id=U).status == "healthy"
     (audit,) = [e for e in store.audit if e["action"] == "assistant.deploy.outcome"]
     assert "status=healthy" in audit["detail"] and SHA not in audit["detail"]
     hl.commit = "9" * 40                                        # a final check never changes again
-    assert verify_deploy(store, check, health, T0 + timedelta(minutes=3)).status == "healthy"
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=11)).status == "healthy"
 
 
 def test_a_prefix_of_at_least_twelve_characters_counts_but_a_short_one_does_not(hl):
@@ -133,7 +137,8 @@ def test_a_prefix_of_at_least_twelve_characters_counts_but_a_short_one_does_not(
     hl.commit = SHA[:8]
     assert verify_deploy(store, check, health, T0 + timedelta(minutes=1)).status == "awaiting"
     hl.commit = SHA[:12]
-    assert verify_deploy(store, check, health, T0 + timedelta(minutes=2)).status == "healthy"
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=2)).seen_commit == SHA[:12]
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=10)).status == "healthy"
 
 
 def test_rolled_back_only_after_the_deploy_window(hl):
@@ -175,7 +180,8 @@ def test_listener_down_for_a_while_then_up_is_still_healthy(hl):
         assert step.status == "awaiting" and step.last_error == "unreachable"
     hl.commit = SHA
     hl.up()                                                     # same port, new version
-    done = verify_deploy(store, check, health, T0 + timedelta(minutes=4))
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=4)).status == "awaiting"
+    done = verify_deploy(store, check, health, T0 + timedelta(minutes=10))
     assert done.status == "healthy" and done.last_error == ""
 
 
@@ -221,10 +227,13 @@ def test_checks_are_tenant_and_user_scoped(hl):
     assert [c.check_id for c in store.list_deploy_checks(T, U)] == [mine.check_id]
     assert [c.check_id for c in store.list_deploy_checks("other", "u9")] == [theirs.check_id]
     assert [c.check_id for c in store.list_deploy_checks(T, U, worker_id="w2")] == []
-    # one tenant's exit-3 report can never touch another tenant's check
-    assert record_exit(store, mk_worker("w1", tenant="third", user="u3"), "t1", 3, T0) is None
+    # one tenant's exit-3 report can never touch another tenant's check (it leaves only its OWN urgent row)
+    stray = record_exit(store, mk_worker("w1", tenant="third", user="u3"), "t1", 3, T0)
+    assert stray is not None and stray.tenant_id == "third" and stray.last_error == "no_hub_check"
     assert store.get_deploy_check(mine.check_id, tenant_id=T, user_id=U).status == "awaiting"
-    assert record_exit(store, mk_worker("w2", tenant=T, user=U), "t1", 3, T0) is None      # same tenant, other worker
+    other = record_exit(store, mk_worker("w2", tenant=T, user=U), "t1", 3, T0)             # same tenant, other worker
+    assert other is not None and other.check_id != mine.check_id and other.worker_id == "w2"
+    assert store.get_deploy_check(mine.check_id, tenant_id=T, user_id=U).status == "awaiting"
 
 
 def test_asking_again_for_the_same_open_deploy_keeps_one_check(hl):
@@ -346,9 +355,13 @@ def test_healthy_outcome_is_posted_once_to_slack(sw, hl):
     cfg = install(sw, hl.url)
     hl.commit = SHA
     check = open_check(sw.store, cfg, sw.auths["a"][0], match_for(cfg), "t1", "", HUB_NOW)
+    assert sw.listener.wait_for(lambda: hl.hits >= 2)                  # the new version is seen serving ...
+    settle(sw)
+    assert outcome_posts(sw) == []                                     # ... but that alone is not an outcome
+    sw.clock.now = HUB_NOW + timedelta(minutes=11)                     # still serving at the end of the window
     assert sw.listener.wait_for(lambda: len(outcome_posts(sw)) == 1)
     assert sw.store.get_deploy_check(check.check_id, tenant_id="t1", user_id="u1").status == "healthy"
-    settle(sw)
+    settle(sw, 1)
     (text,) = outcome_posts(sw)
     assert "Deploy healthy" in text and SHA[:12] in text and SHA not in text
     assert "Main could not be re-checked" in text                      # no GitHub client: said so, not assumed
@@ -389,6 +402,7 @@ def test_main_is_re_verified_after_a_healthy_deploy(tmp_path, hl):
         hl.commit = SHA
         stack.r.tip = "c" * 40
         stack.r.compare = "diverged"                                   # the deployed commit fell off main's history
+        w.clock.now = HUB_NOW + timedelta(minutes=11)
         open_check(w.store, cfg, w.auths["a"][0], match_for(cfg), "t1", "", HUB_NOW)
         assert w.listener.wait_for(lambda: len(outcome_posts(w)) == 1)
         assert "no longer on main's history" in outcome_posts(w)[0]
@@ -416,6 +430,7 @@ def test_a_restarted_runtime_resumes_an_awaiting_check(sw, hl):
     assert still.status == "awaiting"
     hl.commit = SHA
     hl.up()
+    sw.clock.now = HUB_NOW + timedelta(minutes=11)                     # the new process finds the target serving
     rt2 = runtime_for(sw, restored)
     rt2.start_checks()                                                 # Slack off: checks still resume
     try:
@@ -460,7 +475,7 @@ def test_other_exit_codes_are_only_stored_and_never_urgent(sw, hl):
     cfg = install(sw, hl.url)
     check = open_check(sw.store, cfg, sw.auths["a"][0], match_for(cfg), "t1", "", HUB_NOW)
     hl.commit = OLD                                                  # before the window: the checker leaves it awaiting
-    for code in (0, 1, 2):
+    for code in (0, 2):
         assert sw.report("a", text="exit", kind="outcome", payload={"deploy_exit": code})["isError"] is False
     assert sw.report("a", text="exit", kind="decision", payload={"deploy_exit": 3})["isError"] is False   # wrong kind
     assert sw.report("a", text="exit", kind="outcome", payload={"deploy_exit": "3"})["isError"] is False  # not an int
@@ -470,14 +485,114 @@ def test_other_exit_codes_are_only_stored_and_never_urgent(sw, hl):
     assert not any("URGENT" in t for t in outcome_posts(sw))
 
 
-def test_a_healthy_check_is_not_undone_by_a_workers_exit_three(sw, hl):
+def _healthy_and_posted(sw, hl):
     cfg = install(sw, hl.url)
     hl.commit = SHA
+    sw.clock.now = HUB_NOW + timedelta(minutes=11)
     check = open_check(sw.store, cfg, sw.auths["a"][0], match_for(cfg), "t1", "", HUB_NOW)
-    assert sw.listener.wait_for(lambda: sw.store.get_deploy_check(check.check_id, tenant_id="t1",
-                                                                  user_id="u1").status == "healthy")
+    assert sw.listener.wait_for(lambda: len(outcome_posts(sw)) == 1)
+    got = sw.store.get_deploy_check(check.check_id, tenant_id="t1", user_id="u1")
+    assert got.status == "healthy" and got.notified is True
+    return check
+
+
+def _stored(sw, check):
+    return sw.store.get_deploy_check(check.check_id, tenant_id="t1", user_id="u1")
+
+
+def test_exit_three_after_a_healthy_check_overrides_it_with_an_urgent_message(sw, hl):
+    check = _healthy_and_posted(sw, hl)
     sw.report("a", text="claim", kind="outcome", payload={"deploy_exit": 3})
-    assert sw.store.get_deploy_check(check.check_id, tenant_id="t1", user_id="u1").status == "healthy"
+    assert sw.listener.wait_for(lambda: any("URGENT" in t for t in outcome_posts(sw)))
+    stored = _stored(sw, check)
+    assert stored.status == "failed_rollback" and stored.exit_code == 3
+    settle(sw)
+    assert len([t for t in outcome_posts(sw) if "URGENT" in t]) == 1
+    hl.commit = SHA                                                      # a later poll cannot undo it
+    sw.runtime.run_deploy_checks()
+    assert _stored(sw, check).status == "failed_rollback"
+
+
+def test_exit_one_after_a_healthy_check_makes_it_rolled_back_and_says_so(sw, hl):
+    check = _healthy_and_posted(sw, hl)
+    sw.report("a", text="claim", kind="outcome", payload={"deploy_exit": 1})
+    assert sw.listener.wait_for(lambda: len(outcome_posts(sw)) == 2)
+    stored = _stored(sw, check)
+    assert stored.status == "rolled_back" and stored.exit_code == 1
+    text = outcome_posts(sw)[1]
+    assert "Deploy not live" in text and "exit 1" in text and "URGENT" not in text
+    settle(sw)
+    assert len(outcome_posts(sw)) == 2                                   # said once
+
+
+def test_exit_one_on_an_awaiting_check_is_rolled_back_and_notified(sw, hl):
+    cfg = install(sw, hl.url)
+    hl.commit = OLD
+    check = open_check(sw.store, cfg, sw.auths["a"][0], match_for(cfg), "t1", "", HUB_NOW)
+    sw.report("a", text="rolled back", kind="outcome", payload={"deploy_exit": 1})
+    assert sw.listener.wait_for(lambda: len(outcome_posts(sw)) == 1)
+    assert _stored(sw, check).status == "rolled_back"
+    assert "Deploy not live" in outcome_posts(sw)[0] and "healthy" not in outcome_posts(sw)[0].lower()
+
+
+def test_exit_zero_never_upgrades_anything(sw, hl):
+    cfg = install(sw, hl.url)
+    hl.commit = OLD
+    check = open_check(sw.store, cfg, sw.auths["a"][0], match_for(cfg), "t1", "", HUB_NOW)
+    sw.report("a", text="ok", kind="outcome", payload={"deploy_exit": 0})
+    assert _stored(sw, check).status == "awaiting"
+    sw.report("a", text="bad", kind="outcome", payload={"deploy_exit": 3})
+    assert sw.listener.wait_for(lambda: any("URGENT" in t for t in outcome_posts(sw)))
+    sw.report("a", text="ok", kind="outcome", payload={"deploy_exit": 0})
+    assert _stored(sw, check).status == "failed_rollback"                # a clean claim does not clear a failure
+    settle(sw)
+    assert len([t for t in outcome_posts(sw) if "URGENT" in t]) == 1
+
+
+def test_a_task_id_that_matches_no_check_falls_back_to_the_workers_latest(sw, hl):
+    cfg = install(sw, hl.url)
+    hl.commit = OLD
+    open_check(sw.store, cfg, sw.auths["a"][0], match_for(cfg), "t1", "", HUB_NOW)
+    latest = open_check(sw.store, cfg, sw.auths["a"][0], match_for(cfg, SHA2), "t2", "", HUB_NOW)
+    sw.report("a", text="bad", kind="outcome", payload={"deploy_exit": 3}, task_id="some-other-task")
+    assert sw.listener.wait_for(lambda: any("URGENT" in t for t in outcome_posts(sw)))
+    assert _stored(sw, latest).status == "failed_rollback"
+    assert [c.status for c in sw.store.list_deploy_checks("t1", "u1")].count("failed_rollback") == 1
+
+
+def test_exit_three_with_no_hub_check_still_posts_an_urgent_message(sw, hl):
+    assert sw.store.list_deploy_checks("t1", "u1") == []
+    sw.report("a", text="bad", kind="outcome", payload={"deploy_exit": 3})
+    assert sw.listener.wait_for(lambda: any("URGENT" in t for t in outcome_posts(sw)))
+    (text,) = [t for t in outcome_posts(sw) if "URGENT" in t]
+    assert "exit 3" in text and "no deploy check" in text
+    (row,) = sw.store.list_deploy_checks("t1", "u1")
+    assert row.status == "failed_rollback" and row.notified is True and row.last_error == "no_hub_check"
+    settle(sw)
+    assert len([t for t in outcome_posts(sw) if "URGENT" in t]) == 1
+
+
+def test_target_seen_then_something_else_serving_is_rolled_back_before_the_window(hl):
+    store, cfg = AssistantStore(), cfg_for(hl.url)
+    check = opened(store, cfg)
+    health = HealthClient(timeout=5)
+    hl.commit = SHA
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=1)).status == "awaiting"
+    hl.commit = OLD                                                      # deploy.sh rolled the new version back
+    done = verify_deploy(store, check, health, T0 + timedelta(minutes=2))
+    assert done.status == "rolled_back" and done.seen_commit == OLD[:12]
+
+
+def test_target_seen_then_unreachable_is_not_healthy_until_seen_again(hl):
+    store, cfg = AssistantStore(), cfg_for(hl.url)
+    check = opened(store, cfg)
+    health = HealthClient(timeout=5)
+    hl.commit = SHA
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=1)).status == "awaiting"
+    hl.down()
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=10)).status == "awaiting"
+    gone = verify_deploy(store, check, health, T0 + timedelta(minutes=20))
+    assert gone.status == "unconfirmed" and gone.last_error == "unreachable"
 
 
 def test_the_summary_includes_the_deploy_status_and_never_says_success(sw, hl):
