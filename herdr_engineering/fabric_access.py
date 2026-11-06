@@ -39,12 +39,24 @@ class _UnixHTTP(http.client.HTTPConnection):
         self.sock.connect(self._path)
 
 
+def whois_path(ip: str) -> str:
+    """The LocalAPI whois request path for an address; tailscaled wants ``host:port``, so an IPv6 literal is bracketed."""
+    host = f"[{ip}]" if ":" in ip and not ip.startswith("[") else ip
+    return f"/localapi/v0/whois?addr={quote(host + ':1')}"
+
+
+def sidecar_path(ip: str) -> str:
+    """The request path of the whois sidecar (``herdr-eng fabric whois-proxy``): the bare address, nothing else."""
+    return f"/whois?addr={quote(ip.strip('[]'))}"
+
+
 class TailscaleWhois:
     """Identify a tailnet peer through tailscaled's LocalAPI (works from a host-network container with the socket mounted)."""
 
-    def __init__(self, sockets: Iterable[str] = DEFAULT_SOCKETS, timeout: float = 2.0) -> None:
+    def __init__(self, sockets: Iterable[str] = DEFAULT_SOCKETS, timeout: float = 2.0, *, proxy: bool = False) -> None:
         self.sockets = tuple(sockets)
         self.timeout = timeout
+        self.proxy = proxy          # the socket is a whois sidecar (``GET /whois?addr=<ip>``), not tailscaled's LocalAPI
 
     def lookup(self, ip: str) -> Identity | None:
         """The peer's identity, or None when tailscaled does not know the address. Raises OSError if unreachable."""
@@ -52,7 +64,7 @@ class TailscaleWhois:
         for path in self.sockets:
             try:
                 conn = _UnixHTTP(path, self.timeout)
-                conn.request("GET", f"/localapi/v0/whois?addr={quote(ip + ':1')}", headers={"Host": "local-tailscaled.sock"})
+                conn.request("GET", sidecar_path(ip) if self.proxy else whois_path(ip), headers={"Host": "local-tailscaled.sock"})
                 resp = conn.getresponse()
                 body = resp.read()
                 conn.close()

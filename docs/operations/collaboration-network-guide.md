@@ -863,6 +863,8 @@ refuse names that could be DNS-rebound and writes that come from another website
   20 projects and 10 agents per person; 100 members per room.
 * Helpers (5.1f): only with `spawn_helpers` and a room profile that allows a family; boxed with no network but
   the room's allowlist; never more than their parent; the panic switch stops them all. Read its residual risks.
+* Agents on the operator's own tailnet machines can use token-free `Authorization: Fabric` auth when the operator and the agent's owner
+  switch it on: see [fabric-trust.md](fabric-trust.md) and its [threat model](fabric-trust-threat-model.md).
 * Reporting a problem: tell the operator, revoke any agent you are unsure about.
 
 ## 7. Troubleshooting

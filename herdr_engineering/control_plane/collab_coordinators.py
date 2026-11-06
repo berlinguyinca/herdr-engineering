@@ -199,6 +199,11 @@ class CoordinatorsMixin:
         if have is not None:
             self._tc_by_holder.pop((room_id, have["holder"]), None)
         self._tc_ext.pop((room_id, team_id), None)
+        for g in (self._rooms.get(room_id) or {}).get("grants", {}).values():      # slice 4: a coordinate grant ends with its team
+            if g.get("coordinate_team") == team_id:
+                g["actions"] = [a for a in g["actions"] if a != "coordinate"]
+                g.pop("coordinate_team", None)
+                g.pop("coordinate_roles", None)
 
     def _tc_recount(self) -> dict:
         """Designations and opt-ins that can still emit a revocation (pre-paid, see ``REVOCABLE_CREATE``)."""
@@ -211,7 +216,10 @@ class CoordinatorsMixin:
             return None
         team = self._tc_by_holder.get((room_id, pr.key))
         if team is None:
-            return None
+            granted = ((self._rooms.get(room_id) or {}).get("grants", {}).get(pr.id) or {}).get("coordinate_team") if pr.is_agent else None
+            if granted is None:                                 # slice 4: an agent the owner granted `coordinate` for one team
+                return None
+            return {"team_id": granted, "key": pr.key, "kind": "operator", "room_id": room_id, "grant": True}
         return {"team_id": team, "key": pr.key, "kind": "operator" if pr.is_agent else "external", "room_id": room_id}
 
     def _tc_for(self, pr, room_id: str) -> dict | None:
@@ -224,6 +232,14 @@ class CoordinatorsMixin:
 
     def _tc_holder_active(self, room: dict, team_id: str, key: str) -> bool:
         rid = room["id"]
+        grant = room["grants"].get(key[6:]) if key.startswith("agent:") else None
+        if grant is not None and grant.get("coordinate_team") == team_id:      # slice 4: the owner's `coordinate` grant
+            from .collab import COORDINATE, Principal
+            a = self._agents.get(key[6:])
+            if not a or a["status"] != "active" or a.get("external") or not self.coordinators_active():
+                return False
+            eff = self._effective(Principal("agent", key[6:], a["owner"]), room)
+            return bool(eff and COORDINATE in eff[0] and self._tr2_attached(rid, team_id) is not None)
         have = self._tc_coord.get((rid, team_id))
         if have is None or have["holder"] != key or not self.coordinators_active():
             return False
@@ -242,13 +258,19 @@ class CoordinatorsMixin:
         m = self._member(room, key[5:])
         return bool(opt and opt["enabled"] and m and m["role"] == "guest" and self._ok(key[5:]))
 
+    def _tc_granted_agents(self) -> set[str]:
+        """Agents holding the owner's ``coordinate`` grant for a team right now (a detach or a revoke removes the marker)."""
+        return {"agent:" + aid for room in self._rooms.values() for aid, g in room["grants"].items() if g.get("coordinate_team")}
+
     def _tc_is_coordinator_agent(self, agent_id: str) -> bool:
-        return any(h == "agent:" + agent_id for (_, h) in self._tc_by_holder)
+        return (any(h == "agent:" + agent_id for (_, h) in self._tc_by_holder)
+                or "agent:" + agent_id in self._tc_granted_agents())
 
     def _tc_assistants(self) -> set[str]:
         """Assistant-kind agents, derived from the log and never from a label the client sent (``harness_type`` is free text):
         every designated coordinator agent, in any room, and every agent an assistant runtime claimed."""
         out = {h for (_, h) in self._tc_by_holder if h.startswith("agent:")}
+        out |= self._tc_granted_agents()                       # slice 4: an agent granted `coordinate` fans out by role too
         out |= {"agent:" + r["agent_id"] for r in self._assistant_runtimes.values() if r.get("agent_id")}
         return out
 
@@ -258,7 +280,11 @@ class CoordinatorsMixin:
         from .collab_team_rooms import TEAM_ROLE_ACTIONS
         cfg = self.coordinators_cfg()
         if ident["kind"] == "operator":
-            return {"roles": sorted(TEAM_ROLE_ACTIONS), "tasks_per_hour": cfg["tasks_per_hour"], "max_open": cfg["max_open"],
+            roles = sorted(TEAM_ROLE_ACTIONS)
+            if ident.get("grant"):          # slice 4: exactly the owner's list for this agent; none recorded means none allowed
+                g = (self._rooms.get(ident["room_id"]) or {}).get("grants", {}).get(ident["key"][6:]) or {}
+                roles = sorted(r for r in g.get("coordinate_roles") or [] if r in TEAM_ROLE_ACTIONS)
+            return {"roles": roles, "tasks_per_hour": cfg["tasks_per_hour"], "max_open": cfg["max_open"],
                     "max_depth": MAX_TASK_DEPTH, "max_items_per_request": None}
         ceil = cfg["external"]
         have = (self._tc_ext.get((ident["room_id"], ident["team_id"])) or {}).get("limits") or {}
@@ -283,25 +309,43 @@ class CoordinatorsMixin:
                 out.append(t)
         return out
 
-    def _tc_check_caps(self, ident: dict, limits: dict, root_id: str | None, depth: int) -> None:
-        """The cap is counted from the replayed tasks (not an in-memory counter), so a restart cannot reset it."""
+    def _tc_check_caps(self, ident: dict, limits: dict, root_id: str | None, depth: int, pr=None) -> None:
+        """The cap is counted from the replayed tasks (not an in-memory counter), so a restart cannot reset it. With ``pr`` a refusal
+        also leaves an audit event under the coordinator's own identity."""
         use = self._tc_usage(ident)
-        if depth > limits["max_depth"]:
-            raise _err(400, "task chain is too deep for this coordinator", code="coordinator_depth")
-        if use["created_last_hour"] >= limits["tasks_per_hour"]:
-            raise _err(429, "coordinator task rate limit exceeded: too many tasks in the last hour", code="coordinator_rate")
-        if use["open"] >= limits["max_open"]:
-            raise _err(429, "coordinator has too many open tasks", code="coordinator_open")
         cap = limits["max_items_per_request"]
-        if cap is not None and root_id is not None and sum(
+        refusal = None
+        if depth > limits["max_depth"]:
+            refusal = (400, "task chain is too deep for this coordinator", "coordinator_depth")
+        elif use["created_last_hour"] >= limits["tasks_per_hour"]:
+            refusal = (429, "coordinator task rate limit exceeded: too many tasks in the last hour", "coordinator_rate")
+        elif use["open"] >= limits["max_open"]:
+            refusal = (429, "coordinator has too many open tasks", "coordinator_open")
+        elif cap is not None and root_id is not None and sum(
                 1 for t in self._tc_mine(ident) if t["coord"]["root"] == root_id) >= cap:
-            raise _err(429, "this request already has the most items a coordinator may make for it", code="coordinator_items")
+            refusal = (429, "this request already has the most items a coordinator may make for it", "coordinator_items")
+        if refusal is None:
+            return
+        if pr is not None:
+            room = self._rooms[ident["room_id"]]
+            self._audit_denied(pr, "task.create", refusal[2], room_id=ident["room_id"], project_ids=[room["project_id"]],
+                               resource_id=ident["room_id"])
+        raise _err(refusal[0], refusal[1], code=refusal[2])
 
     # ----------------------------------------------------------------- create-path hooks
     def _tc_authorize_create(self, pr, room_id: str):
         """``create_task``'s first check. A designated external coordinator is a guest by room role and has no ``task`` right, so
         they are authorised here by ``coordinate`` (read + the opt-in), or refused with 403 and an audit event under their own
         identity. Everyone else is checked exactly as before."""
+        if pr.is_agent:
+            ident = self._tc_designated(pr, room_id)
+            if ident is not None and ident.get("grant"):           # slice 4: authorised by `coordinate`, not by `instruct`
+                room, first = self._authorize(pr, room_id, "coordinate", "task.create")
+                if not self._tc_holder_active(room, ident["team_id"], pr.key):
+                    self._audit_denied(pr, "task.create", "coordination_revoked", room_id=room_id,
+                                       project_ids=[room["project_id"]], resource_id=room_id)
+                    raise _err(403, "forbidden: you may not coordinate this team now", code="coordination_revoked")
+                return room, first
         if not pr.is_agent:
             ident = self._tc_designated(pr, room_id)
             if ident is not None:

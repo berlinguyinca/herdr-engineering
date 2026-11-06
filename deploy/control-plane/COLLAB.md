@@ -400,6 +400,25 @@ Agent ids starting with `room:` are refused by every collaborator route (grant, 
 before that rule cannot be revoked by id any more: use `collab restrict <artifact_id>` (it revokes every collaborator
 grant of the artifact).
 
+## Fabric listener (optional)
+
+Set `control_plane.collab.fabric_trust.listen_host` (a tailnet address) and `listen_port` (and `whois_socket: /run/fabric-whois/whois.sock`)
+and `deploy.sh` layers `compose.collab-fabric.yaml`: a `fabric-whois` sidecar (no network, tailscaled's socket directory read-only, its own
+socket directory) and a port published from `collab-public` on that tailnet address only. Without those keys nothing changes. Before relying
+on it, check that Docker preserves the caller's source address, and read the rollback caveat: `docs/operations/fabric-trust.md` section 9.
+
+Three host steps `deploy.sh` cannot do for you (it warns while they are missing):
+
+- **Firewall (required).** The `fabric` network is not internal (Docker cannot publish a port from an internal network) and masquerade-off does not remove
+  its default route, so `collab-public` could reach the host's own addresses, other containers' ports and the LAN. As root:
+  `deploy/control-plane/collab-fabric-firewall.sh --install` (`--check`, `--remove`); it drops NEW connections from `172.30.213.0/24` in `DOCKER-USER`
+  and `INPUT`. Re-apply at boot.
+- **Boot order.** Install `deploy/control-plane/docker-after-tailscale.conf` as `/etc/systemd/system/docker.service.d/after-tailscale.conf`
+  (`systemctl daemon-reload`): docker then starts after tailscaled and waits for the tailnet address, otherwise the port bind can fail at boot and the
+  PUBLIC site stays down.
+- **The collab host trusts itself.** A local process, `ssh -L`/`socat` relay or host-network container reaches the listener as the host's own tailnet IP and is
+  accepted as that machine if the host is in `machines`. Run no relays or L4 fronts on the collab host and omit it from `machines` unless its own agents need it.
+
 ## Verify
 
 The MCP URL is `https://mcp.local.metabolomics.us`. `localdev.mcp.metabolomics.us` is a deprecated alias the edge serves on the same server block during the overlap (the certbot lineage keeps that name).

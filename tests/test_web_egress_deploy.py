@@ -95,6 +95,7 @@ compose_up() {{
 }}
 memory_phase() {{ echo backend-repair >> "{log}"; }}
 rollback_share() {{ return 0; }}
+rollback_services() {{ return 0; }}
 verify() {{ echo "verify:$1" >> "{log}"; }}
 git() {{ return 0; }}
 {function("forward")}
