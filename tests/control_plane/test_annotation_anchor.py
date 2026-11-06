@@ -211,3 +211,60 @@ def test_anchor_text_control_chars_refused(field, value):
     assert code(clean_anchor, anchor) == "bad_chars"
     pdf = {"kind": "pdf_page", "file": "a", "page": 1, "exact": "\x00"}
     assert code(clean_anchor, pdf) == "bad_chars"
+
+
+BIDI = [chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))]
+
+
+@pytest.mark.parametrize("ch", BIDI)
+def test_bidi_controls_are_refused_in_comments_and_anchors(ch):
+    """Plan 4 C4: an explicit directional embedding / override / isolate can reorder what the owner reads (Trojan Source)."""
+    assert code(clean_comment, f"safe {ch} text") == "bad_chars"
+    for field in ("exact", "prefix", "suffix"):
+        anchor = {"kind": "text_quote", "file": "a", "exact": "x", field: f"a{ch}b"}
+        assert code(clean_anchor, anchor) == "bad_chars", field
+    assert code(clean_anchor, {"kind": "pdf_page", "file": "a", "page": 1, "exact": f"a{ch}"}) == "bad_chars"
+
+
+def test_ordinary_bidi_text_and_marks_are_still_accepted():
+    assert clean_comment("שלום עולם مرحبا ‏‎ ok") == "שלום עולם مرحبا ‏‎ ok"
+
+
+INVISIBLE = [chr(c) for c in (0x80, 0x85, 0x9F, 0xAD, 0x2028, 0x2029, 0x2060, 0x2064, 0x206A, 0x206F, 0xFEFF, 0xFFF9, 0xFFFB,
+                              0xE0001, 0xE0041, 0xE007F, 0xE000, 0x0378,
+                              0x034F, 0x115F, 0x1160, 0x17B4, 0x3164, 0xFFA0)]
+
+
+@pytest.mark.parametrize("ch", INVISIBLE, ids=lambda c: f"U+{ord(c):04X}")
+def test_invisible_characters_are_refused_by_unicode_category(ch):
+    """Plan 4 C4: Cc, Cf, Cs, Co and Cn are refused (C1 controls, tag characters, invisible operators, BOM, annotation
+    anchors, private use, unassigned) apart from an explicit allow-list."""
+    assert code(clean_comment, f"hello {ch} world") == "bad_chars"
+    assert code(clean_anchor, {"kind": "text_quote", "file": "a", "exact": f"a{ch}b"}) == "bad_chars"
+    assert code(clean_anchor, {"kind": "text_quote", "file": "a", "exact": "x", "prefix": ch}) == "bad_chars"
+
+
+def test_joiners_and_directional_marks_are_still_accepted():
+    for ok in ("‍", "‌", "‎", "‏", "؜"):
+        assert clean_comment(f"a{ok}b") == f"a{ok}b"
+    assert clean_comment("👨‍👩‍👧 family\n\tindented") == "👨‍👩‍👧 family\n\tindented"
+
+
+def test_emoji_variation_selector_is_still_accepted():
+    assert clean_comment("\u2764\ufe0f ok") == "\u2764\ufe0f ok"
+
+
+def test_ideographic_variation_selectors_and_braille_blank_are_accepted():
+    text = "\u845b\U000e0100 \u2800\u2801"
+    assert clean_comment(text) == text
+    assert clean_anchor({"kind": "text_quote", "file": "a", "exact": text})["exact"] == text
+
+
+def test_the_worker_does_not_judge_unassigned_code_points_but_the_edge_does():
+    unassigned = "ok \u0378 ok"            # unassigned in every Unicode version so far; a newer table may assign others
+    assert code(clean_comment, unassigned) == "bad_chars"
+    assert clean_comment(unassigned, unassigned=False) == unassigned
+    anchor = {"kind": "text_quote", "file": "a", "exact": unassigned}
+    assert code(clean_anchor, anchor) == "bad_chars"
+    assert clean_anchor(anchor, unassigned=False)["exact"] == unassigned
+    assert code(lambda v: clean_comment(v, unassigned=False), "x\u202ey") == "bad_chars"       # real format chars still refused

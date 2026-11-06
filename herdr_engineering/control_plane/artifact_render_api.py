@@ -254,6 +254,7 @@ def route_render(handler, server, parts, resource) -> bool:
     versioned = route in ("output", "preview", "rich")
     try:
         if not handler._artifact_allowed(artifact_id, "read") or (
+                not versioned and not handler._registry_read_ok(artifact_id)) or (
                 versioned and (server.artifact_store is None or not _access(handler, artifact_id, "read"))):
             handler._deny(404, "not found")
             return True
