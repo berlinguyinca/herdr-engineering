@@ -4507,11 +4507,15 @@ def _cmd_cp_web(args) -> int:
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
                  "host": args.host, "port": args.port,
                  "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})
+    from .control_plane import stall_watch
+    watch = stall_watch.install()
+    logging.info("froze %d boot objects out of garbage collection", stall_watch.freeze_boot_heap())
     try:
         svr.serve()
     except KeyboardInterrupt:
         pass
     finally:
+        watch.stop()
         if hub_server is not None:
             try:
                 hub_server.shutdown()
