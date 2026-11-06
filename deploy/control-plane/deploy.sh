@@ -1137,7 +1137,7 @@ rollback() {
       && prev_render \
       && rollback_services \
       && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
-      && { [ "$FABRIC_SERVICE_ORPHAN" = 0 ] || { stop_fabric_whois; true; }; } \
+      && { [ "${FABRIC_SERVICE_ORPHAN:-0}" = 0 ] || { stop_fabric_whois; true; }; } \
       && memory_client_apply rollback "$PREV_WORK" \
       && { ! declare -F web_egress_after >/dev/null || web_egress_after rollback; } \
       && rollback_share \
