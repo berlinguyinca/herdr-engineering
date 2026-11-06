@@ -287,6 +287,11 @@ export class HerdrClient {
     return this.request(`${this.artifactReportPath(id, versionId)}/preview/render`, { signal });
   }
 
+  // A report version's HTML asset, served under a no-script sandbox CSP: the only URL the dashboard frames.
+  artifactRichUrl(id, versionId) {
+    return `${this.base}${this.artifactReportPath(id, versionId)}/rich`;
+  }
+
   // The sandboxed raw view, opened in a new tab (never framed).
   artifactLiveUrl(id) {
     return `${this.base}/api/v1/artifacts/${encodeURIComponent(id)}/live`;
