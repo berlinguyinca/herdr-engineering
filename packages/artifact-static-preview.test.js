@@ -33,6 +33,7 @@ class Node {
   }
 }
 const doc = { createElement: tag => new Node(tag) };
+const themed = theme => ({ createElement: tag => new Node(tag), documentElement: { getAttribute: name => (name === 'data-theme' ? theme : null) } });
 const mount = html => {
   const container = new Node('div');
   const wrapper = mountStaticHtml(container, html, { label: 'Report preview', document: doc });
@@ -84,4 +85,22 @@ test('every pdf.js getDocument call disables eval and XFA, and no frame element 
   for (const call of calls) assert.match(call, /isEvalSupported: false[^)]*enableXfa: false/);
   assert.match(source, /AnnotationMode\.DISABLE/);
   assert.doesNotMatch(source, /iframe|srcdoc|createElement\('(?:frame|object|embed)'\)/i);
+});
+
+test('the static preview container follows the theme tokens instead of forcing white', () => {
+  const css = readFileSync(new URL('./artifact-static-preview.css', import.meta.url), 'utf8');
+  const rule = css.split('\n').find(line => line.startsWith('[data-static-preview]'));
+  assert.match(rule, /background: var\(--surface/);
+  assert.match(rule, /color: var\(--text/);
+  assert.doesNotMatch(rule, /#fff;|#111;/);
+});
+
+test('the dashboard theme drives the preview host; no or unknown theme leaves it to the OS', () => {
+  for (const [theme, expected] of [['dark', 'dark'], ['light', 'light'], [null, null], ['sepia', null]]) {
+    const wrapper = mountStaticHtml(new Node('div'), '<p>x</p>', { document: themed(theme) });
+    assert.equal(wrapper.children[0].getAttribute('data-theme'), expected, String(theme));
+  }
+  assert.equal(mountStaticHtml(new Node('div'), '', { document: doc }).children[0].getAttribute('data-theme'), null);
+  const explicit = mountStaticHtml(new Node('div'), '', { document: themed('light'), theme: 'dark' });
+  assert.equal(explicit.children[0].getAttribute('data-theme'), 'dark');
 });
