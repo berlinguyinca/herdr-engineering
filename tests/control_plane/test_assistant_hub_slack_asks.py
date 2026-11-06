@@ -437,7 +437,8 @@ def test_ratelimited_waits_for_retry_after(aw):
 
 
 def test_task_bookkeeping_is_pruned_and_capped(aw):
-    aw.cfg = {**aw.cfg, "max_asks_per_task_per_hour": 1}
+    aw.cfg = {**aw.cfg, "max_asks_per_task_per_hour": 1, "max_asks_per_worker_per_hour": 1000,
+              "max_asks_per_hour": 10000}                                # only the per-task window is under test
     aw.runtime = aw.new_runtime(max_task_keys=5)
     aw.runtime.start()
     for i in range(12):
@@ -448,7 +449,9 @@ def test_task_bookkeeping_is_pruned_and_capped(aw):
     aw.clock.now = NOW + timedelta(hours=3)                              # everything is older than an hour
     aw.decide(task="later")
     assert aw.listener.wait_for(lambda: aw.runtime.queued() == 0)
-    assert aw.listener.wait_for(lambda: set(aw.runtime._posted) == {(T, U, "w1", "later", "action")}
+    assert aw.listener.wait_for(lambda: set(aw.runtime._posted) == {(T, U, "w1", "later", "action"),
+                                                                     (T, U, "w1", "*", "action"),
+                                                                     ("*", "*", "*", "*", "action")}
                                 and aw.runtime._batches == {})
 
 

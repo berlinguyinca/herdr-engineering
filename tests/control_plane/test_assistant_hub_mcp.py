@@ -375,4 +375,4 @@ def test_report_tool_tells_the_worker_to_relay_a_failed_deploy_exit_3_report():
     hub = make_hub()
     _, body = rpc(hub, enrol(hub), "tools/list")
     (tool,) = [t for t in body["result"]["tools"] if t["name"] == "report"]
-    assert "exit 3" in tool["description"] and "tell the user directly" in tool["description"]
+    assert "exits 3" in tool["description"] and "tell the user directly" in tool["description"]

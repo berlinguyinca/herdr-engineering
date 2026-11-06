@@ -245,6 +245,7 @@ def test_green_deploy_with_a_standing_grant_is_authorized_verified_and_summarize
     (check,) = world.store.list_deploy_checks(TENANT, PID)
     assert check.status == "awaiting" and check.sha == SHA
     world.stack.r.deployed = SHA                                            # the new version starts serving
+    world.clock.now = NOW + timedelta(minutes=11)                           # healthy is provisional until the window ends
     assert world.slack.wait_for(lambda: len(world.outcome_posts()) == 1, timeout=10)
     assert "Deploy healthy" in world.outcome_posts()[0] and SHA[:12] in world.outcome_posts()[0]
     assert world.store.get_deploy_check(check.check_id, tenant_id=TENANT, user_id=PID).status == "healthy"
