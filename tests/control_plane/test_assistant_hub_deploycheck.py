@@ -120,14 +120,14 @@ def test_healthy_when_health_reports_the_target_commit(hl):
     first = verify_deploy(store, check, health, T0 + timedelta(minutes=2))
     assert first.status == "awaiting" and first.seen_commit == SHA[:12]       # seen once: only provisional
     assert not [e for e in store.audit if e["action"] == "assistant.deploy.outcome"]
-    assert verify_deploy(store, check, health, T0 + timedelta(minutes=9)).status == "awaiting"
-    done = verify_deploy(store, check, health, T0 + timedelta(minutes=10))     # still serving through the window
-    assert done.status == "healthy" and done.finished_at == T0 + timedelta(minutes=10)
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=11)).status == "awaiting"   # < 10 min of sightings
+    done = verify_deploy(store, check, health, T0 + timedelta(minutes=12))     # seen serving for a whole window
+    assert done.status == "healthy" and done.finished_at == T0 + timedelta(minutes=12)
     assert store.get_deploy_check(check.check_id, tenant_id=T, user_id=U).status == "healthy"
     (audit,) = [e for e in store.audit if e["action"] == "assistant.deploy.outcome"]
     assert "status=healthy" in audit["detail"] and SHA not in audit["detail"]
     hl.commit = "9" * 40                                        # a final check never changes again
-    assert verify_deploy(store, check, health, T0 + timedelta(minutes=11)).status == "healthy"
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=13)).status == "healthy"
 
 
 def test_a_prefix_of_at_least_twelve_characters_counts_but_a_short_one_does_not(hl):
@@ -138,7 +138,8 @@ def test_a_prefix_of_at_least_twelve_characters_counts_but_a_short_one_does_not(
     assert verify_deploy(store, check, health, T0 + timedelta(minutes=1)).status == "awaiting"
     hl.commit = SHA[:12]
     assert verify_deploy(store, check, health, T0 + timedelta(minutes=2)).seen_commit == SHA[:12]
-    assert verify_deploy(store, check, health, T0 + timedelta(minutes=10)).status == "healthy"
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=11)).status == "awaiting"
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=12)).status == "healthy"
 
 
 def test_rolled_back_only_after_the_deploy_window(hl):
@@ -181,7 +182,7 @@ def test_listener_down_for_a_while_then_up_is_still_healthy(hl):
     hl.commit = SHA
     hl.up()                                                     # same port, new version
     assert verify_deploy(store, check, health, T0 + timedelta(minutes=4)).status == "awaiting"
-    done = verify_deploy(store, check, health, T0 + timedelta(minutes=10))
+    done = verify_deploy(store, check, health, T0 + timedelta(minutes=14))     # a whole window after first seen at +4
     assert done.status == "healthy" and done.last_error == ""
 
 
@@ -346,6 +347,13 @@ def settle(w: SumWorld, n: int = 0) -> None:
     assert w.listener.wait_for(lambda: len(w.summaries()) > before)
 
 
+def wait_seen(w: SumWorld, *checks: DeployCheck) -> None:
+    """The runtime has stamped the first sighting of the target on every given check."""
+    for c in checks:
+        assert w.listener.wait_for(lambda c=c: w.store.get_deploy_check(
+            c.check_id, tenant_id="t1", user_id="u1").target_seen_at.year > 1970)
+
+
 def outcome_posts(w: SumWorld) -> list[str]:
     return [str(p.get("text", "")) + " " + json.dumps(p.get("blocks", [])) for p in w.posts()
             if "eploy" in str(p.get("text", "")) or "URGENT" in str(p.get("text", ""))]
@@ -358,7 +366,8 @@ def test_healthy_outcome_is_posted_once_to_slack(sw, hl):
     assert sw.listener.wait_for(lambda: hl.hits >= 2)                  # the new version is seen serving ...
     settle(sw)
     assert outcome_posts(sw) == []                                     # ... but that alone is not an outcome
-    sw.clock.now = HUB_NOW + timedelta(minutes=11)                     # still serving at the end of the window
+    wait_seen(sw, check)
+    sw.clock.now = HUB_NOW + timedelta(minutes=11)                     # still serving a whole window after first seen
     assert sw.listener.wait_for(lambda: len(outcome_posts(sw)) == 1)
     assert sw.store.get_deploy_check(check.check_id, tenant_id="t1", user_id="u1").status == "healthy"
     settle(sw, 1)
@@ -402,13 +411,16 @@ def test_main_is_re_verified_after_a_healthy_deploy(tmp_path, hl):
         hl.commit = SHA
         stack.r.tip = "c" * 40
         stack.r.compare = "diverged"                                   # the deployed commit fell off main's history
+        first = open_check(w.store, cfg, w.auths["a"][0], match_for(cfg), "t1", "", HUB_NOW)
+        wait_seen(w, first)
         w.clock.now = HUB_NOW + timedelta(minutes=11)
-        open_check(w.store, cfg, w.auths["a"][0], match_for(cfg), "t1", "", HUB_NOW)
         assert w.listener.wait_for(lambda: len(outcome_posts(w)) == 1)
         assert "no longer on main's history" in outcome_posts(w)[0]
         stack.r.compare = "ahead"                                      # still an ancestor of main's tip
-        open_check(w.store, cfg, w.auths["a"][0], match_for(cfg, SHA2), "t1", "", HUB_NOW)
         hl.commit = SHA2
+        second = open_check(w.store, cfg, w.auths["a"][0], match_for(cfg, SHA2), "t1", "", w.clock.now)
+        wait_seen(w, second)
+        w.clock.now = HUB_NOW + timedelta(minutes=22)
         assert w.listener.wait_for(lambda: len(outcome_posts(w)) == 2)
         assert "no longer" not in outcome_posts(w)[1] and "could not be re-checked" not in outcome_posts(w)[1]
         assert {c.reverified for c in w.store.list_deploy_checks("t1", "u1")} == {"off_main", "on_main"}
@@ -419,16 +431,16 @@ def test_main_is_re_verified_after_a_healthy_deploy(tmp_path, hl):
 
 def test_a_restarted_runtime_resumes_an_awaiting_check(sw, hl):
     cfg = install(sw, hl.url)
+    hl.commit = SHA
     check = open_check(sw.store, cfg, sw.auths["a"][0], match_for(cfg), "t1", "", HUB_NOW)
-    assert sw.listener.wait_for(lambda: hl.hits >= 1)                  # the first runtime has been polling
+    wait_seen(sw, check)                                               # the first runtime saw the target once
     snap = json.loads(json.dumps(sw.store.snapshot(), default=str))
     sw.runtime.stop()
     hl.down()                                                          # the hub's container is replaced ...
     restored = AssistantStore()
     restored.restore(snap)                                             # ... and the new process loads its state
     (still,) = restored.list_deploy_checks("t1", "u1")
-    assert still.status == "awaiting"
-    hl.commit = SHA
+    assert still.status == "awaiting" and still.target_seen_at == HUB_NOW      # the first sighting survives a restart
     hl.up()
     sw.clock.now = HUB_NOW + timedelta(minutes=11)                     # the new process finds the target serving
     rt2 = runtime_for(sw, restored)
@@ -488,8 +500,9 @@ def test_other_exit_codes_are_only_stored_and_never_urgent(sw, hl):
 def _healthy_and_posted(sw, hl):
     cfg = install(sw, hl.url)
     hl.commit = SHA
-    sw.clock.now = HUB_NOW + timedelta(minutes=11)
     check = open_check(sw.store, cfg, sw.auths["a"][0], match_for(cfg), "t1", "", HUB_NOW)
+    wait_seen(sw, check)
+    sw.clock.now = HUB_NOW + timedelta(minutes=11)
     assert sw.listener.wait_for(lambda: len(outcome_posts(sw)) == 1)
     got = sw.store.get_deploy_check(check.check_id, tenant_id="t1", user_id="u1")
     assert got.status == "healthy" and got.notified is True
@@ -566,6 +579,7 @@ def test_exit_three_with_no_hub_check_still_posts_an_urgent_message(sw, hl):
     assert sw.listener.wait_for(lambda: any("URGENT" in t for t in outcome_posts(sw)))
     (text,) = [t for t in outcome_posts(sw) if "URGENT" in t]
     assert "exit 3" in text and "no deploy check" in text
+    assert sw.listener.wait_for(lambda: all(c.notified for c in sw.store.list_deploy_checks("t1", "u1")))
     (row,) = sw.store.list_deploy_checks("t1", "u1")
     assert row.status == "failed_rollback" and row.notified is True and row.last_error == "no_hub_check"
     settle(sw)
@@ -827,3 +841,61 @@ def test_a_corrupt_datetime_row_already_notified_is_renotified_as_unconfirmed(hl
     (c,) = fresh.list_deploy_checks(T, U)
     assert c.status == "unconfirmed" and c.notified is False
     assert [x.check_id for x in fresh.list_deploy_checks_any(unnotified=True)] == [cid]
+
+
+def test_an_exit_three_landing_during_the_healthy_post_is_not_marked_notified(sw, hl):
+    cfg = install(sw, hl.url)
+    hl.commit = SHA
+    check = open_check(sw.store, cfg, sw.auths["a"][0], match_for(cfg), "t1", "", HUB_NOW)
+    wait_seen(sw, check)
+    fired: list[str] = []
+
+    def race(method: str) -> None:                 # runs inside the Slack call that posts "healthy"
+        if method == "chat.postMessage" and not fired:
+            fired.append(method)
+            sw.report("a", text="claim", kind="outcome", payload={"deploy_exit": 3})
+
+    sw.listener.on_request = race
+    sw.clock.now = HUB_NOW + timedelta(minutes=11)
+    assert sw.listener.wait_for(lambda: any("URGENT" in t for t in outcome_posts(sw)))
+    stored = _stored(sw, check)
+    assert stored.status == "failed_rollback" and stored.exit_code == 3 and stored.notified is True
+    assert len([t for t in outcome_posts(sw) if "URGENT" in t]) == 1
+
+
+def test_the_serving_window_starts_at_the_first_sighting_not_at_authorization(hl):
+    store, cfg = AssistantStore(), cfg_for(hl.url)
+    check = opened(store, cfg)                                  # window_ends = T0 + 10, deadline = T0 + 20
+    health = HealthClient(timeout=5)
+    hl.commit = OLD
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=2)).status == "awaiting"
+    hl.commit = SHA                                             # a long build: the target first appears after window_ends
+    first = verify_deploy(store, check, health, T0 + timedelta(minutes=11))
+    assert first.status == "awaiting" and first.target_seen_at == T0 + timedelta(minutes=11)
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=15)).status == "awaiting"
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=15)).target_seen_at == T0 + timedelta(minutes=11)
+    hl.down()                                                   # a poll gap does not reset the first sighting
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=18)).target_seen_at == T0 + timedelta(minutes=11)
+    hl.up()
+    hl.commit = SHA
+    done = verify_deploy(store, check, health, T0 + timedelta(minutes=19))
+    assert done.status == "awaiting"                            # 8 minutes seen: not yet a whole window
+    final = verify_deploy(store, check, health, T0 + timedelta(minutes=20))   # the deadline wins: not healthy
+    assert final.status == "unconfirmed"
+
+
+def test_target_first_seen_late_becomes_healthy_a_window_later_when_the_deadline_allows(hl):
+    store, cfg = AssistantStore(), cfg_for(hl.url, deploy_check_minutes=60)
+    check = opened(store, cfg)
+    health = HealthClient(timeout=5)
+    hl.commit = SHA
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=30)).status == "awaiting"
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=39)).status == "awaiting"
+    assert verify_deploy(store, check, health, T0 + timedelta(minutes=40)).status == "healthy"
+
+
+def test_target_seen_at_is_sanitized_on_restore(hl):
+    snap, _ = stored_snapshot(hl)
+    snap["deploy_checks"][0]["target_seen_at"] = {"$dt": "not-a-date"}
+    (c,) = restored(snap).list_deploy_checks(T, U)
+    assert c.status == "unconfirmed" and c.last_error == "bad_state"

@@ -823,7 +823,10 @@ class SlackRuntime:
         self.client.post_message(channel, blocks, text)
         with self.store._lock:
             current = self.store.get_deploy_check(check.check_id, tenant_id=check.tenant_id, user_id=check.user_id)
-            if current is not None:
+            # only what was actually posted is marked: an override (exit 1/3) that landed during the Slack call is a
+            # different outcome and stays un-notified, so the sweep posts the correction
+            if current is not None and (current.status, current.exit_code, current.last_error) == (
+                    check.status, check.exit_code, check.last_error):
                 current.notified = True
                 self.store.put_deploy_check(current)
         self.store.audit_record(tenant_id=check.tenant_id, user_id=check.user_id, actor=SLACK_ACTOR,

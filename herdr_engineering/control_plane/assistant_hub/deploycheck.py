@@ -60,9 +60,10 @@ class DeployCheck:
     reverified: str = ""            # after a healthy result: on_main | off_main | unverified | newer | ""
     finished_at: datetime = _EPOCH
     seen_commit: str = ""           # the last commit health reported (12 chars)
+    target_seen_at: datetime = _EPOCH   # first poll that saw the target serving (epoch = not yet); persisted
 
 
-_DATES = ("started_at", "deadline", "window_ends", "finished_at")
+_DATES = ("started_at", "deadline", "window_ends", "finished_at", "target_seen_at")
 
 
 def sanitize_check(row: DeployCheck) -> DeployCheck | None:
@@ -222,8 +223,12 @@ def verify_deploy(store: AssistantStore, check: DeployCheck, health: Any, now: d
         seen = commit[:12] if isinstance(commit, str) else ""
         matched = isinstance(commit, str) and _matches(commit, cur.sha)
         window_over = now >= _utc(cur.window_ends)
-        if matched and window_over:
-            # the target has been serving through the whole window (a restarted hub sees itself at once, so a first
+        first_seen = _utc(cur.target_seen_at)
+        if matched and first_seen == _EPOCH:
+            first_seen = now                       # first sighting: the serving window starts HERE, not at authorization
+        serving_long_enough = matched and now >= first_seen + (_utc(cur.window_ends) - _utc(cur.started_at))
+        if serving_long_enough:
+            # the target has been SEEN serving for a whole window (a restarted hub sees itself at once, so a first
             # sighting alone is only provisional: deploy.sh may still roll back after it)
             note = ""
             if reverify is not None:
@@ -255,10 +260,13 @@ def verify_deploy(store: AssistantStore, check: DeployCheck, health: Any, now: d
             return done or cur
         with store._lock:                          # still waiting: remember only what was seen
             latest = store.get_deploy_check(cur.check_id, tenant_id=cur.tenant_id, user_id=cur.user_id)
-            if latest is not None and latest.status == "awaiting" and (latest.last_error, latest.seen_commit) != (
-                    error, seen or latest.seen_commit):
-                latest = replace(latest, last_error=error, seen_commit=seen or latest.seen_commit)
-                store.put_deploy_check(latest)
+            if latest is not None and latest.status == "awaiting":
+                stamp = first_seen if _utc(latest.target_seen_at) == _EPOCH and matched else latest.target_seen_at
+                if (latest.last_error, latest.seen_commit, latest.target_seen_at) != (
+                        error, seen or latest.seen_commit, stamp):
+                    latest = replace(latest, last_error=error, seen_commit=seen or latest.seen_commit,
+                                     target_seen_at=stamp)
+                    store.put_deploy_check(latest)
             return latest or cur
     except Exception:                              # noqa: BLE001 - one bad poll never takes the checker down
         return check
