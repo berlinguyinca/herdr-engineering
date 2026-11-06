@@ -1160,6 +1160,30 @@ async def sweep_disabled_members(conn: Any, rt: MemberRuntime) -> int:
     return revoked
 
 
+async def _lab_share_recipients(conn: Any, rt: MemberRuntime) -> set[str]:
+    """Approved directory members that match a live lab share (email or group): they need a view before any intent."""
+    from .artifact_members import member_principal
+    shares = await conn.fetch("SELECT allow_emails, allow_groups FROM artifact_shares WHERE state='live'"
+                              " AND audience='lab' AND (expires_at IS NULL OR expires_at > now())")
+    if not shares:
+        return set()
+    emails = {e.strip().lower() for r in shares for e in r["allow_emails"] or [] if isinstance(e, str)}
+    groups = {g for r in shares for g in r["allow_groups"] or [] if isinstance(g, str)}
+    directory = await asyncio.to_thread(load_directory, rt) or {}       # a stale directory fails closed: no extra views
+    found: set[str] = set()
+    for user_id, entry in directory.items():
+        if entry.get("status") != "approved":
+            continue
+        email = entry.get("email")
+        held = {g for g in entry.get("groups") or [] if isinstance(g, str)}
+        if (isinstance(email, str) and email.strip().lower() in emails) or held & groups:
+            try:
+                found.add(member_principal(user_id))
+            except ValueError:
+                continue
+    return found
+
+
 async def publish_member_views(conn: Any, rt: MemberRuntime) -> int:
     """Rewrite the view of every known member, then run ``sweep_disabled_members``; returns the views written."""
     rows = await conn.fetch(
@@ -1168,12 +1192,13 @@ async def publish_member_views(conn: Any, rt: MemberRuntime) -> int:
         " UNION SELECT principal_id FROM artifact_acl WHERE principal_id LIKE 'member:%'"
         " UNION SELECT 'member:' || member_id FROM artifact_share_claims"      # a member who only opens links
         " UNION SELECT owner FROM artifact_library_folders WHERE owner LIKE 'member:%'")
+    principals = {r["p"] for r in rows} | await _lab_share_recipients(conn, rt)
     written, failed = 0, False
     referenced: set[str] = set()
     budget = [POOL_TICK_FILL_BYTES]
-    for r in rows:
+    for principal in sorted(principals):
         try:
-            referenced |= await write_member_view(conn, r["p"], rt.mirror_root, defaults=rt.defaults, rt=rt,
+            referenced |= await write_member_view(conn, principal, rt.mirror_root, defaults=rt.defaults, rt=rt,
                                                    budget=budget)
             written += 1
         except Exception as exc:

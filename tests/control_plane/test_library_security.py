@@ -35,7 +35,7 @@ from herdr_engineering.control_plane.artifact_member_intents import (
     take_secret,
 )
 from herdr_engineering.control_plane.artifact_member_service import MemberService
-from herdr_engineering.control_plane.artifact_members import claim_resolver
+from herdr_engineering.control_plane.artifact_members import claim_resolver, member_owner_key
 from herdr_engineering.control_plane.artifact_shares import ShareStore
 from herdr_engineering.control_plane.collab import ApprovalPolicy, CollabService, FileEventLog
 from herdr_engineering.control_plane.collab_artifacts import CollabArtifactBridge
@@ -785,6 +785,21 @@ def test_a_lab_share_recipient_is_pinned_to_the_shared_version(sandbox):
         assert miss.status == 404 and b"draft" not in miss.raw
         own = await web.req("GET", f"/api/member/artifacts/{s.b}/content/index.html", member="bob")      # the owner keeps head
         assert own.status == 200 and b"v2" in own.raw
+    sandbox(body)
+
+
+def test_a_member_who_only_receives_a_lab_share_gets_a_view_after_one_tick(sandbox):
+    async def body(env, rt, web, shares):
+        s = await scenario(env, rt, web, shares)
+        carol = "member:carol"
+        assert not (env.mirror_root / "member-views" / (member_owner_key(carol) + ".json")).exists()
+        await lab_share(env, s, allow_emails=["Carol@lab.example.org"])
+        await tick(env, rt)                       # carol never sent an intent, never opened a link
+        row = item(env, carol, s.b)
+        assert row and row["source"] == "assigned" and [f["path"] for f in row["files"]] == ["index.html"]
+        await lab_share(env, s, allow_groups=["lab"])
+        await tick(env, rt)
+        assert item(env, "member:bob", s.b)["source"] == "mine"
     sandbox(body)
 
 
