@@ -1,4 +1,9 @@
 # HANDOFF (rolling; newest section first)
+## Update 2026-11-05: UI and typecheck follow-ups (branch feat/build-cache-ui-followups, not pushed)
+
+Done, each verified by running it: (1) `deploy/pi-build-gate/tsconfig.json` (strict, noEmit) plus devDependencies `typescript` 7.0.2, `@types/node`, `@earendil-works/pi-coding-agent` 1.5.0 (pinned); `npm run typecheck:pi-build-gate` exits 0, no type errors in `build-gate.ts`; `packages/pi-build-gate.test.js` 15 passed. (2) Builds table is stacked labelled rows at <=40rem with explicit ARIA roles; `packages/build-cache-view.test.js` 6 passed, `tests/playwright/build-cache.test.mjs` 14 passed (new 390 px test; the stale hostile-trace assertion was updated because the API now drops non-identifier trace ids). (3) `npm run test:ui-gates`: 299 of 300 passed, 0 skipped; the 1 failure was an `ERR_NETWORK_CHANGED` environment flake and passed on re-run. Python env for the Playwright servers: `uv venv .venv && uv pip install -e .` then `PYTHON=$PWD/.venv/bin/python`.
+Not verified: appearance on a real phone; the two small tables (sccache counters, cleanup candidates) still scroll.
+
 ## Update 2026-11-04: tailnet gap fixed in code
 
 Cause: `AgentForwarder._rewrite_head` rewrote `Host`, which SigV4 signs. Fix: signed requests pass through untouched (tests in `tests/test_fabric_agent.py`, `*sigv4*`). Proven via a throwaway forwarder on 100.104.39.6 (aws-cli + sccache cold/warm). ACTIVATES ONLY AFTER THE OPERATOR RESTARTS THE AGENT: `systemctl --user restart herdr-eng-fabric-agent.service` (not done here). Still untested: a real second host.
