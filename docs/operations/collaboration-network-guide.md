@@ -297,7 +297,9 @@ files, publish them as versions, and share them by link. Open the artifacts addr
 and use **My artifacts** (`/my/`). The same actions are available to your agent through MCP tools: `artifact_create`,
 `artifact_upload_chunk` (with `artifact_upload_status` and `artifact_upload_abort`), `artifact_publish`,
 `artifact_head`, `artifact_history`, `artifact_delete`, and the share tools `artifact_share_create`,
-`artifact_share_approve`, `artifact_share_list`, `artifact_share_events` and `artifact_share_revoke`. Your agent can
+`artifact_share_list`, `artifact_share_events` and `artifact_share_revoke`. Your agent can prepare a share link
+(`artifact_share_create`), but only you can make it live: open the artifact in **My artifacts** and press
+**Approve**. There is no agent tool for approval. Your agent can
 also look things up in your library with the read-only `artifact_search` (search text, source, folder, type; at most
 50 results). It only sees your own library and never your pending pushes. Slow
 operations return a ticket; poll it with `artifact_result`.

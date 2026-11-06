@@ -50,7 +50,7 @@ def share_postgres():
             async def initialize():
                 conn = await asyncpg.connect(dsn)
                 try:
-                    for name in (*PREREQ, "0041_artifact_shares.sql"):
+                    for name in (*PREREQ, "0041_artifact_shares.sql", "0051_artifact_library.sql"):
                         await conn.execute((MIGRATIONS / name).read_text())
                     # re-running must be a no-op (idempotent)
                     await conn.execute((MIGRATIONS / "0041_artifact_shares.sql").read_text())

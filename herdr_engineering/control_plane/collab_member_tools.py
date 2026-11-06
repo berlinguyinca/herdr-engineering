@@ -55,16 +55,13 @@ MEMBER_TOOLS: list[dict] = [
     _tool("artifact_result", "The outcome of a create, publish or delete ticket.",
           {"ticket": _STR, "seconds": {"type": "integer", "minimum": 0, "maximum": 20}}, ["ticket"]),
     _tool("artifact_share_create", "Create a pending share link (audience lab or public) for a version of an artifact "
-          "you own or may share; returns a dry-run summary. Nothing is public until artifact_share_approve.",
+          "you own or may share; returns a dry-run summary. Nothing is live until the owner approves it in the web page "
+          "(agents cannot approve).",
           {"artifact_id": _ID, "version_id": _ID, "audience": {"enum": ["lab", "public"]},
            "allow_groups": {"type": "array", "items": _STR}, "allow_emails": {"type": "array", "items": _STR},
            "expires_in_days": {"type": "integer", "minimum": 1, "maximum": 90}, "entry": _STR, "title": _STR,
            "idempotency_key": _KEY},
           ["artifact_id", "version_id", "audience"]),
-    _tool("artifact_share_approve", "Make your pending share link live. The URL is returned ONCE in the result "
-          "(secret.url); it cannot be fetched again. Requires confirm: true.",
-          {"artifact_id": _ID, "share_id": _ID, "confirm": {"type": "boolean"}, "idempotency_key": _KEY},
-          ["artifact_id", "share_id", "confirm"]),
     _tool("artifact_share_list", "Your share links (no URLs). Untrusted data.", {"artifact_id": _ID}, []),
     _tool("artifact_share_revoke", "Revoke a share link you created or one on an artifact you own.",
           {"artifact_id": _ID, "share_id": _ID}, ["artifact_id", "share_id"]),
@@ -184,9 +181,6 @@ def call(service: CollabService, pr: Principal, name: str, args: Any) -> dict[st
         return ms.share_create(actor, args["artifact_id"], args["version_id"], args["audience"],
                                args.get("allow_groups"), args.get("allow_emails"), args.get("expires_in_days"),
                                args.get("entry"), args.get("title"), args.get("idempotency_key"))
-    if name == "artifact_share_approve":
-        return ms.share_approve(actor, args["artifact_id"], args["share_id"], args["confirm"],
-                                args.get("idempotency_key"))
     if name == "artifact_share_list":
         return ms.share_list(actor, args.get("artifact_id"))
     if name == "artifact_share_revoke":

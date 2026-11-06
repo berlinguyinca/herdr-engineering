@@ -484,6 +484,23 @@ def test_a_failed_secret_write_revokes_the_link_it_could_not_hand_over(registry_
     srun(registry_pg, tmp_path, body)
 
 
+def test_an_agent_creates_a_pending_share_but_only_the_user_approves_it(registry_pg, tmp_path):
+    async def body(env, rt):
+        aid, vid = await published(env, user("alice"))
+        made = await share(env, agent("ag1"), aid, vid)
+        assert made["result"] == "created", made
+        sid = made["share_id"]
+        assert (await sql(env, "SELECT state FROM artifact_shares"))[0]["state"] == "pending"
+        raw = env.intent(agent("ag1"), kind="member.share_approve", payload={"share_id": sid, "confirm": True},
+                         artifact_id=aid)
+        await settle(env)
+        assert env.result(raw["ticket"]) is None or env.result(raw["ticket"])["result"] == "rejected"
+        assert (await sql(env, "SELECT state FROM artifact_shares"))[0]["state"] == "pending"     # still waiting
+        _, done = await approve(env, user("alice"), aid, sid)
+        assert done["result"] == "live", done
+    srun(registry_pg, tmp_path, body)
+
+
 def test_the_validators_are_registered_by_the_light_module():
     for kind in ("member.share_create", "member.share_approve", "member.share_revoke", "member.share_events"):
         assert kind in cbf._INTENT_KINDS
@@ -642,7 +659,7 @@ def test_an_approval_of_a_share_made_before_the_artifact_went_pending_is_refused
         s = await share(env, ag, aid, vid, expires_in_days=7)
         assert s["result"] == "created", s
         await sql(env, "UPDATE artifacts SET intake='pending' WHERE artifact_id=$1", aid)
-        ticket, done = await approve(env, ag, aid, s["share_id"])
+        ticket, done = await approve(env, user("alice"), aid, s["share_id"])
         assert done["result"] == "rejected" and done["reason"] == "pending_not_accepted", done
         (st,) = await sql(env, "SELECT state FROM artifact_shares WHERE share_id=$1", s["share_id"])
         assert st["state"] == "pending"

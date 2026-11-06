@@ -280,8 +280,9 @@ def _share_ref(kind: str, extra: frozenset[str] = frozenset()):
 
 _BOTH = frozenset({"agent", "user"})
 register_intent_kind(KIND_SHARE_CREATE, validate_share_create_payload, actors=_BOTH, requires_artifact=True)
-register_intent_kind(KIND_SHARE_APPROVE, _share_ref(KIND_SHARE_APPROVE, frozenset({"confirm"})), actors=_BOTH,
-                     requires_artifact=True)
+# Making a link live is a human decision: users only.  An agent may create a pending share, never approve it.
+register_intent_kind(KIND_SHARE_APPROVE, _share_ref(KIND_SHARE_APPROVE, frozenset({"confirm"})),
+                     actors=frozenset({"user"}), requires_artifact=True)
 register_intent_kind(KIND_SHARE_REVOKE, _share_ref(KIND_SHARE_REVOKE), actors=_BOTH, requires_artifact=True)
 register_intent_kind(KIND_SHARE_EVENTS, _share_ref(KIND_SHARE_EVENTS), actors=_BOTH, requires_artifact=True)
 register_intent_kind(KIND_CREATE, validate_create_payload, actors=_BOTH, requires_artifact=False)

@@ -395,8 +395,8 @@ def test_writes_return_what_the_mcp_tools_return(stack):
         assert strip(web.json) == strip(collab_member_tools.call(stack.s, pr, name,
                                                                   {"artifact_id": ART, "share_id": "share_111111111111111111111111"}))
     web = req(stack, "POST", f"/api/member/artifacts/{ART}/shares/share_111111111111111111111111/approve", body={"confirm": True})
-    assert strip(web.json) == strip(collab_member_tools.call(
-        stack.s, pr, "artifact_share_approve", {"artifact_id": ART, "share_id": "share_111111111111111111111111", "confirm": True}))
+    assert web.status == 200 and web.json["status"] == "pending"        # the owner approves in the web page ...
+    assert "artifact_share_approve" not in {t["name"] for t in collab_member_tools.MEMBER_TOOLS}   # ... never an agent
 
 
 def test_a_public_share_matches_the_mcp_tool_too(stack):

@@ -299,6 +299,9 @@ class MemberService:
     def share_approve(self, actor: Mapping[str, Any], artifact_id: Any, share_id: Any, confirm: Any,
                       idempotency_key: Any = None) -> dict[str, Any]:
         who = self._caller(actor, "share_approve")
+        if who.pr.is_agent:
+            raise self._fail(who.pr, "share_approve", "agent_cannot_approve", 403, "forbidden",
+                             "an agent cannot approve a share link; the owner approves it in the web page", artifact_id)
         if confirm is not True:
             raise MemberServiceError(400, "bad_request", "confirm must be true to make a share link live")
         self._shareable(who, "share_approve", artifact_id)
