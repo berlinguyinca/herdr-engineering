@@ -858,6 +858,8 @@ def test_an_exit_three_landing_during_the_healthy_post_is_not_marked_notified(sw
     sw.listener.on_request = race
     sw.clock.now = HUB_NOW + timedelta(minutes=11)
     assert sw.listener.wait_for(lambda: any("URGENT" in t for t in outcome_posts(sw)))
+    # `notified` is set after the Slack call returns, so wait for it rather than racing the post
+    assert sw.listener.wait_for(lambda: _stored(sw, check).notified is True)
     stored = _stored(sw, check)
     assert stored.status == "failed_rollback" and stored.exit_code == 3 and stored.notified is True
     assert len([t for t in outcome_posts(sw) if "URGENT" in t]) == 1
