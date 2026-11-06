@@ -337,3 +337,52 @@ def test_an_unposted_question_is_posted_after_a_restart(tmp_path):
     finally:
         fresh.stop()
         w.listener.close()
+
+
+SECRET = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def test_a_secret_in_a_question_reaches_neither_slack_nor_the_stored_state(qw):
+    out = qw.question(text=f"Should I push with token={SECRET}?", options=[f"use {SECRET}", "no"],
+                      context=f"I found GITHUB_TOKEN={SECRET} in the env")
+    assert qw.listener.wait_for(lambda: len(qw.posts()) == 1)
+    posted = json.dumps(qw.posts()[0])
+    assert SECRET not in posted and "ghp_abcdefgh" not in posted
+    assert "Should I push" in posted                                  # the rest of the question still arrives
+    everything = json.dumps(qw.store.snapshot(), default=str)
+    assert SECRET not in everything and "ghp_abcdefgh" not in everything
+    assert out["status"] == "pending"
+
+
+def test_many_task_ids_do_not_buy_many_windows_for_one_worker(tmp_path):
+    w = QWorld(tmp_path, max_asks_per_task_per_hour=100, max_asks_per_worker_per_hour=2, ask_ttl_minutes=120)
+    w.enroll("a")
+    w.runtime.start()
+    try:
+        outs = [w.call("a", "assistant_ask", {"question": f"q{n}?", "session_id": f"task-{n}"})[0] for n in range(5)]
+        assert w.listener.wait_for(lambda: len(w.listener.calls_to("chat.update")) >= 2, timeout=5)
+        shown = [o for o in outs if w.stored(o["ask_id"]).ts]
+        assert len(shown) == 2                                           # the worker's window, whatever the task ids
+        assert len(w.posts()) == 3                                       # two asks plus ONE folded line
+        assert "(many tasks)" in json.dumps(w.posts()[-1]["blocks"])
+        assert all(w.poll("a", o["ask_id"])[0] == {"status": "pending"} for o in outs)
+    finally:
+        w.runtime.stop()
+        w.listener.close()
+
+
+def test_the_global_window_holds_across_workers(tmp_path):
+    w = QWorld(tmp_path, max_asks_per_task_per_hour=100, max_asks_per_worker_per_hour=100, max_asks_per_hour=2,
+               ask_ttl_minutes=120)
+    w.enroll("a")
+    w.enroll("b")
+    w.runtime.start()
+    try:
+        outs = [w.call(name, "assistant_ask", {"question": f"q{n}?", "session_id": f"{name}{n}"})[0]
+                for n in range(2) for name in ("a", "b")]
+        assert w.listener.wait_for(lambda: len(w.listener.calls_to("chat.update")) >= 1, timeout=5)
+        assert len([o for o in outs if w.stored(o["ask_id"]).ts]) == 2
+        assert len(w.posts()) == 3 and "all workers" in json.dumps(w.posts()[-1]["blocks"])
+    finally:
+        w.runtime.stop()
+        w.listener.close()

@@ -19,7 +19,8 @@ def _on(**extra: Any) -> dict[str, Any]:
 def test_defaults() -> None:
     assert _slack() == {"enabled": False, "base_url": "https://slack.com/api", "bot_token_file": "",
                         "app_token_file": "", "owner_user_id": "", "channel": "", "ask_ttl_minutes": 15,
-                        "max_asks_per_task_per_hour": 6, "summary_idle_minutes": 30}
+                        "max_asks_per_task_per_hour": 6, "max_asks_per_worker_per_hour": 20,
+                        "max_asks_per_hour": 60, "summary_idle_minutes": 30}
     assert assistant_config({})["slack"] == _slack()
 
 
@@ -27,6 +28,11 @@ def test_valid_block() -> None:
     s = _slack(_on(channel="C01ABC23DEF", ask_ttl_minutes=120, max_asks_per_task_per_hour=2))
     assert s["enabled"] is True and s["channel"] == "C01ABC23DEF" and s["ask_ttl_minutes"] == 120
     assert s["bot_token_file"] == "/etc/slack/bot.tok" and s["owner_user_id"] == "U01ABC23DEF"
+
+
+def test_ask_caps_are_accepted() -> None:
+    s = _slack(_on(max_asks_per_worker_per_hour=3, max_asks_per_hour=9))
+    assert (s["max_asks_per_worker_per_hour"], s["max_asks_per_hour"]) == (3, 9)
 
 
 def test_loopback_http_allowed() -> None:
@@ -56,6 +62,8 @@ def test_inline_secret_rejected(name: str) -> None:
     {"channel": "general"}, {"channel": "#general"},
     {"ask_ttl_minutes": 0}, {"ask_ttl_minutes": 121}, {"ask_ttl_minutes": True}, {"ask_ttl_minutes": 1.5},
     {"max_asks_per_task_per_hour": 0}, {"max_asks_per_task_per_hour": True},
+    {"max_asks_per_worker_per_hour": 0}, {"max_asks_per_worker_per_hour": 1001}, {"max_asks_per_worker_per_hour": True},
+    {"max_asks_per_hour": 0}, {"max_asks_per_hour": 10001}, {"max_asks_per_hour": "5"},
 ])
 def test_bad_values_rejected(bad: dict[str, Any]) -> None:
     with pytest.raises(ValueError, match=r"personal_assistant\.slack"):

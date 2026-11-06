@@ -644,7 +644,8 @@ def _judge_config(raw: Any) -> dict[str, Any]:
 
 
 _SLACK_KEYS = {"enabled", "base_url", "bot_token_file", "app_token_file", "owner_user_id", "channel", "ask_ttl_minutes",
-               "max_asks_per_task_per_hour", "summary_idle_minutes"}
+               "max_asks_per_task_per_hour", "max_asks_per_worker_per_hour", "max_asks_per_hour",
+               "summary_idle_minutes"}
 _SLACK_INLINE_SECRETS = {"bot_token", "app_token", "token", "secret"}
 
 
@@ -695,12 +696,19 @@ def _slack_config(raw: Any) -> dict[str, Any]:
     cap = raw.get("max_asks_per_task_per_hour", 6)
     if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 1000:
         raise ValueError(f"{where}.max_asks_per_task_per_hour must be an integer between 1 and 1000")
+    worker_cap = raw.get("max_asks_per_worker_per_hour", 20)
+    if isinstance(worker_cap, bool) or not isinstance(worker_cap, int) or not 1 <= worker_cap <= 1000:
+        raise ValueError(f"{where}.max_asks_per_worker_per_hour must be an integer between 1 and 1000")
+    total_cap = raw.get("max_asks_per_hour", 60)
+    if isinstance(total_cap, bool) or not isinstance(total_cap, int) or not 1 <= total_cap <= 10000:
+        raise ValueError(f"{where}.max_asks_per_hour must be an integer between 1 and 10000")
     idle = raw.get("summary_idle_minutes", 30)
     if isinstance(idle, bool) or not isinstance(idle, int) or not 1 <= idle <= 1440:
         raise ValueError(f"{where}.summary_idle_minutes must be an integer between 1 and 1440")
     return {"enabled": enabled, "base_url": base_url, "bot_token_file": files["bot_token_file"],
             "app_token_file": files["app_token_file"], "owner_user_id": owner, "channel": channel.strip(),
-            "ask_ttl_minutes": ttl, "max_asks_per_task_per_hour": cap, "summary_idle_minutes": idle}
+            "ask_ttl_minutes": ttl, "max_asks_per_task_per_hour": cap,
+            "max_asks_per_worker_per_hour": worker_cap, "max_asks_per_hour": total_cap, "summary_idle_minutes": idle}
 
 
 DEPLOY_REQUIRE = ("on_main", "ci_green", "descends_from_deployed")

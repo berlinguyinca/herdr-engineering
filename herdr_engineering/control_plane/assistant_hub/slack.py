@@ -240,6 +240,8 @@ class _Batch:
     since: datetime
 
 
+DEFAULT_WORKER_ASKS = 20            # asks per worker per hour across all its task ids
+DEFAULT_GLOBAL_ASKS = 60            # asks per hour across every worker
 _HOUR = timedelta(hours=1)
 _MAX_OPEN_SUMMARIES = 50           # unfinished task trackers one worker may hold (task ids are worker-controlled)
 _SUMMARY_GIVE_UP = timedelta(hours=24)       # a summary that could not be posted for this long is dropped
@@ -929,17 +931,24 @@ class SlackRuntime:
             if any(a.ts and a.ask_id != own and a.status in ("open", "decided")
                    for a in self.store.slack_asks_for_request(item.request_id)):
                 return True                  # a duplicate queue entry (sweep vs notify): one ask per request
-        key = (item.tenant_id, item.user_id, item.worker_id, item.task_id, item.kind)   # questions count apart
-        stamps = self._posted.pop(key, None) or deque()
-        self._posted[key] = stamps                           # most recently used last, so the cap drops the idlest
-        while stamps and now - stamps[0] >= _HOUR:
-            stamps.popleft()
-        if len(stamps) >= int(cfg.get("max_asks_per_task_per_hour") or 6):
-            if question and item.ask is not None and item.ask.ask_id in self._batched:
-                return True                  # already counted in the batch line; the sweep offers it again later
-            return self._batch(item, key, cfg, now)
-        if question and item.ask is not None:
-            self._batched.pop(item.ask.ask_id, None)
+        # three windows, questions counting apart from actions: the task's, the worker's (task ids are the worker's own
+        # words, so many ids must not buy many windows) and a global one; the first one that is full takes the item
+        windows = (((item.tenant_id, item.user_id, item.worker_id, item.task_id, item.kind),
+                    int(cfg.get("max_asks_per_task_per_hour") or 6), "task"),
+                   ((item.tenant_id, item.user_id, item.worker_id, "*", item.kind),
+                    int(cfg.get("max_asks_per_worker_per_hour") or DEFAULT_WORKER_ASKS), "worker"),
+                   (("*", "*", "*", "*", item.kind), int(cfg.get("max_asks_per_hour") or DEFAULT_GLOBAL_ASKS), "all"))
+        all_stamps: list[deque[datetime]] = []
+        for key, limit, scope in windows:
+            stamps = self._posted.pop(key, None) or deque()
+            self._posted[key] = stamps                       # most recently used last, so the cap drops the idlest
+            while stamps and now - stamps[0] >= _HOUR:
+                stamps.popleft()
+            all_stamps.append(stamps)
+            if len(stamps) >= limit:
+                if question and item.ask is not None and item.ask.ask_id in self._batched:
+                    return True              # already counted in the batch line; the sweep offers it again later
+                return self._batch(item, key, cfg, now, scope)
         channel = self._target(cfg)
         ttl = timedelta(minutes=int(cfg.get("ask_ttl_minutes") or 15))
         ask = item.ask
@@ -957,7 +966,8 @@ class SlackRuntime:
         ts = self.client.post_message(channel, blocks, text)
         ask.ts, ask.channel, ask.created_at, ask.expires_at = ts, channel, now, now + ttl
         self.store.put_slack_ask(ask)
-        stamps.append(now)
+        for stamps in all_stamps:
+            stamps.append(now)
         self.store.audit_record(tenant_id=item.tenant_id, user_id=item.user_id, actor=SLACK_ACTOR,
                                 action="assistant.slack.ask_posted", subject_id=ask.ask_id,
                                 detail=f"ask={ask.ask_id} request={item.request_id} worker={_short_id(item.worker_id)}"
@@ -995,18 +1005,21 @@ class SlackRuntime:
                                                  button("Deny", "ask_deny", "danger"),
                                                  button("Approve and remember", "ask_remember")]}]
 
-    def _batch(self, item: _Queued, key: tuple[str, str, str, str, str], cfg: dict[str, Any], now: datetime) -> bool:
-        """Over the per-task limit: one line per hour, edited to say how many more are waiting."""
+    def _batch(self, item: _Queued, key: tuple[str, str, str, str, str], cfg: dict[str, Any], now: datetime,
+               scope: str = "task") -> bool:
+        """Over the per-task, per-worker or global limit: one line per hour and limit, edited to say how many more are
+        waiting."""
         batch = self._batches.get(key)
         if batch is not None and now - batch.since >= _HOUR:
             batch = None
         count = (batch.count if batch else 0) + 1
+        who = {"task": f"worker {slack_text(item.worker_id)}, "
+                       f"{'session' if item.kind == 'question' else 'task'} {slack_text(item.task_id)}",
+               "worker": f"worker {slack_text(item.worker_id)} (many tasks)", "all": "all workers"}[scope]
         if item.kind == "question":
-            text = (f"{count} more questions from worker {slack_text(item.worker_id)}, session {slack_text(item.task_id)}"
-                    " waiting (limit reached; they are posted as the hour allows)")
+            text = f"{count} more questions from {who} waiting (limit reached; they are posted as the hour allows)"
         else:
-            text = (f"{count} more waiting from worker {slack_text(item.worker_id)}, task {slack_text(item.task_id)}"
-                    " (limit reached; decide them in the dashboard)")
+            text = f"{count} more waiting from {who} (limit reached; decide them in the dashboard)"
         blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
         if batch is None:
             channel = self._target(cfg)

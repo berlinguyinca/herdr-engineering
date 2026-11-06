@@ -277,8 +277,13 @@ def _ask(hub: Hub, worker: Worker, args: dict) -> dict:
     event = _record(hub, worker, kind="ask", provenance="worker_reported", session_id=session_id, payload=payload)
     if not live:
         return _text({"status": "no_decision", "mode": "shadow", "event_id": event.event_id})
-    new_id = hub.slack.ask_question(worker.tenant_id, worker.user_id, worker.worker_id, session_id,
-                                    payload["question"], payload.get("options", []), payload.get("context", ""))
+    recorded = event.payload              # the SCRUBBED copy: the raw arguments may hold a secret and are never posted
+    options = recorded.get("options")
+    context = recorded.get("context")
+    new_id = hub.slack.ask_question(
+        worker.tenant_id, worker.user_id, worker.worker_id, session_id, str(recorded.get("question", "")),
+        [o for o in options if isinstance(o, str)] if isinstance(options, list) else [],
+        context if isinstance(context, str) else "")
     return _text({"status": "pending", "ask_id": new_id, "event_id": event.event_id})
 
 
