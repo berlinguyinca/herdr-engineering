@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "image": {
+    "repository": "ghcr.io/berlinguyinca/herdr-engineering",
+    "digest": "sha256:fef44e51eea0c6533d611b828ed36160aa2966a5dfc787b5683d12e8150c7221"
+  },
+  "commit": "0123456789abcdef0123456789abcdef01234567"
+}

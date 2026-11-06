@@ -2,3 +2,5 @@
 # Screenshot baselines (docs/operations/ui-gates.md, "Baseline policy"): binary, never diffed as text or normalised; total size is capped by the gate.
 docs/assets/screenshots/*.png binary
 tests/playwright/fonts/*.ttf binary
+# Release fixtures (tests/test_release_pipeline.py): their sha256 is asserted, so never normalise line endings.
+tests/fixtures/release/*.json -text

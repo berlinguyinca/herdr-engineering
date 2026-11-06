@@ -1,0 +1,6 @@
+{
+  "buildx.build.ref": "herdr-release/herdr-release0/abcdef",
+  "containerimage.descriptor": {"mediaType": "application/vnd.oci.image.index.v1+json", "digest": "sha256:fef44e51eea0c6533d611b828ed36160aa2966a5dfc787b5683d12e8150c7221", "size": 600},
+  "containerimage.digest": "sha256:fef44e51eea0c6533d611b828ed36160aa2966a5dfc787b5683d12e8150c7221",
+  "image.name": "ghcr.io/berlinguyinca/herdr-engineering"
+}

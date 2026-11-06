@@ -1,0 +1,109 @@
+# Woodpecker CI (ci.metabolomics.us) -- publish the herdr-engineering image by digest on a release tag (docs/releases.md).
+#
+# Woodpecker, not GitHub Actions: Actions is disabled organisation-wide (ui-gates.yml) and every other gate of this repo is a
+# Woodpecker pipeline. A SEPARATE pipeline from unit-gates/ui-gates because it needs a Docker daemon and those run on the Slurm
+# exec agents, which have none; like inferweave's fry-gateway-image.yaml, it is routed to a docker-backend agent by the
+# `backend` label every agent reports. On that backend `image:` is a real container image, so every one is pinned by digest.
+#
+#  * Trigger: a tag event for refs/tags/v* only. Never pull_request, push or manual, so no fork or PR ever reaches the secrets.
+#    The verify-tag step then refuses anything but strict semver vX.Y.Z equal to pyproject.toml's version. Creating that tag
+#    is the owner's act and is the manual release gate.
+#  * skip_clone: the default clone image is not pinned; the checkout step fetches the tagged commit with a pinned git image,
+#    proves HEAD is that commit and that it is on main.
+#  * Secrets by name only (from_secret): ghcr_push_token (build-push, read-back, tag-image) and github_release_token
+#    (github-release). Restrict both to the `tag` event in the repo's secret settings.
+#  * The docker socket is a host volume: the repository must be TRUSTED (volumes) in Woodpecker, or the pipeline is refused.
+#  * Order is the safety argument: push by digest -> read the digest back and verify it is the multi-arch index -> only then
+#    tag the image and write the GitHub release with release.json. Any failure stops before the release exists.
+#  * Commands use plain $VAR: Woodpecker substitutes braced references in the YAML text before parsing. Shell logic lives in
+#    scripts/release/ so it is shellchecked and tested (tests/test_release_pipeline.py).
+when:
+  - event: tag
+    ref: refs/tags/v*
+
+labels:
+  backend: docker
+
+skip_clone: true
+
+variables:
+  - &git_image alpine/git:v2.47.2@sha256:062a01ad7a0eb17cff382bc5e26086b4d710e56dfdfdf001109a49b6d9bd378c
+  - &python_image python:3.12-slim@sha256:4840d514c583a4d3d8cad3940e68dee6f0f6f3635c12fcd0a3d74c21a5b93a54
+  - &docker_image docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+  - &repository ghcr.io/berlinguyinca/herdr-engineering
+  - &docker_socket /var/run/docker.sock:/var/run/docker.sock
+
+steps:
+  - name: checkout
+    image: *git_image
+    commands:
+      - 'set -eu'
+      - 'git init -q .'
+      - 'git remote add origin "https://github.com/$CI_REPO.git"'
+      - 'git fetch -q --no-tags origin "+refs/heads/main:refs/remotes/origin/main" "$CI_COMMIT_SHA"'
+      - 'git checkout -q --detach "$CI_COMMIT_SHA"'
+      - 'test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA" || { echo "checked out $(git rev-parse HEAD), expected $CI_COMMIT_SHA" >&2; exit 1; }'
+      - 'git merge-base --is-ancestor "$CI_COMMIT_SHA" refs/remotes/origin/main || { echo "$CI_COMMIT_SHA is not on main; a release tag must point at a main commit" >&2; exit 1; }'
+      - 'git --no-pager log --oneline -1'
+
+  - name: verify-tag
+    image: *python_image
+    commands:
+      - 'python3 scripts/release/release.py check-tag --tag "$CI_COMMIT_TAG" --pyproject pyproject.toml'
+
+  - name: build-push
+    image: *docker_image
+    volumes:
+      - *docker_socket
+    environment:
+      HERDR_RELEASE_REPOSITORY: *repository
+      HERDR_BUILDKIT_IMAGE: moby/buildkit:v0.20.2@sha256:c457984bd29f04d6acc90c8d9e717afe3922ae14665f3187e0096976fe37b1c8
+      HERDR_RUNTIME_BASE: *python_image
+      GHCR_PUSH_TOKEN:
+        from_secret: ghcr_push_token
+    commands:
+      - 'sh scripts/release/build-push.sh'
+
+  - name: digest
+    image: *python_image
+    commands:
+      - 'python3 scripts/release/release.py digest --metadata .release/build-metadata.json --out .release/digest'
+
+  - name: read-back
+    image: *docker_image
+    volumes:
+      - *docker_socket
+    environment:
+      HERDR_RELEASE_REPOSITORY: *repository
+      GHCR_PUSH_TOKEN:
+        from_secret: ghcr_push_token
+    commands:
+      - 'sh scripts/release/read-back.sh'
+
+  - name: release-json
+    image: *python_image
+    environment:
+      HERDR_RELEASE_REPOSITORY: *repository
+    commands:
+      - 'set -eu'
+      - 'python3 scripts/release/release.py verify-index --raw .release/index.json --digest-file .release/digest'
+      - 'python3 scripts/release/release.py assemble --tag "$CI_COMMIT_TAG" --pyproject pyproject.toml --repository "$HERDR_RELEASE_REPOSITORY" --digest-file .release/digest --commit "$CI_COMMIT_SHA" --out-json .release/release.json --out-notes .release/release-notes.md'
+
+  - name: tag-image
+    image: *docker_image
+    volumes:
+      - *docker_socket
+    environment:
+      HERDR_RELEASE_REPOSITORY: *repository
+      GHCR_PUSH_TOKEN:
+        from_secret: ghcr_push_token
+    commands:
+      - 'sh scripts/release/tag-image.sh'
+
+  - name: github-release
+    image: *python_image
+    environment:
+      GITHUB_RELEASE_TOKEN:
+        from_secret: github_release_token
+    commands:
+      - 'python3 scripts/release/release.py publish-github --repo "$CI_REPO" --tag "$CI_COMMIT_TAG" --notes .release/release-notes.md --release-json .release/release.json'

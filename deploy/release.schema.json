@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/berlinguyinca/herdr-engineering/blob/main/deploy/release.schema.json",
+  "title": "herdr-engineering release.json",
+  "description": "The machine-readable record of one release, attached to its GitHub release by .woodpecker/release.yml (docs/releases.md). Consumers (herdr-fleet init, herdr-fleet pins update) pin image.repository@image.digest; no tag appears here because no mutable tag is trusted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "image", "commit"],
+  "properties": {
+    "version": {
+      "description": "The release version X.Y.Z; its git tag is vX.Y.Z and equals pyproject.toml [project].version.",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "digest"],
+      "properties": {
+        "repository": {
+          "description": "Registry repository without tag or digest, e.g. ghcr.io/berlinguyinca/herdr-engineering.",
+          "type": "string",
+          "pattern": "^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9]+([._-][a-z0-9]+)*)+$"
+        },
+        "digest": {
+          "description": "Digest of the multi-arch image index (linux/amd64, linux/arm64), never a per-architecture manifest.",
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "commit": {
+      "description": "Full git sha of the tagged commit the image was built from.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    }
+  }
+}

@@ -1,0 +1,42 @@
+#!/bin/sh
+# Shared by the docker steps of .woodpecker/release.yml (docs/releases.md). Sourced, not run.
+
+fail() { printf 'release: %s\n' "$*" >&2; exit 1; }
+
+require_env() {
+  for name in "$@"; do
+    eval "value=\${$name:-}"
+    [ -n "$value" ] || fail "$name is not set"
+  done
+}
+
+# The digest the digest step wrote, checked again: it is interpolated into registry references below.
+release_digest() {
+  digest=$(cat .release/digest) || fail "no .release/digest (the digest step did not run)"
+  case "$digest" in
+    sha256:*) ;;
+    *) fail ".release/digest is not a sha256 digest" ;;
+  esac
+  hex=${digest#sha256:}
+  [ "${#hex}" -eq 64 ] || fail ".release/digest is not a sha256 digest"
+  case "$hex" in *[!0-9a-f]*) fail ".release/digest is not a sha256 digest" ;; esac
+  printf '%s\n' "$digest"
+}
+
+# Log in to the registry of HERDR_RELEASE_REPOSITORY with the push token, in a private DOCKER_CONFIG that is removed on exit.
+# The token goes over stdin only: it is never an argument, never printed, never written to the workspace.
+registry_login() {
+  require_env HERDR_RELEASE_REPOSITORY GHCR_PUSH_TOKEN CI_REPO_OWNER
+  DOCKER_CONFIG=$(mktemp -d)
+  export DOCKER_CONFIG
+  registry=${HERDR_RELEASE_REPOSITORY%%/*}
+  printf '%s' "$GHCR_PUSH_TOKEN" | docker login "$registry" --username "$CI_REPO_OWNER" --password-stdin >/dev/null \
+    || fail "docker login to $registry failed"
+}
+
+registry_logout() {
+  if [ -n "${DOCKER_CONFIG:-}" ]; then
+    docker logout "${HERDR_RELEASE_REPOSITORY%%/*}" >/dev/null 2>&1 || true
+    rm -rf "$DOCKER_CONFIG"
+  fi
+}
