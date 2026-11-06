@@ -85,3 +85,11 @@ test('every pdf.js getDocument call disables eval and XFA, and no frame element 
   assert.match(source, /AnnotationMode\.DISABLE/);
   assert.doesNotMatch(source, /iframe|srcdoc|createElement\('(?:frame|object|embed)'\)/i);
 });
+
+test('the static preview container follows the theme tokens instead of forcing white', () => {
+  const css = readFileSync(new URL('./artifact-static-preview.css', import.meta.url), 'utf8');
+  const rule = css.split('\n').find(line => line.startsWith('[data-static-preview]'));
+  assert.match(rule, /background: var\(--surface/);
+  assert.match(rule, /color: var\(--text/);
+  assert.doesNotMatch(rule, /#fff;|#111;/);
+});
