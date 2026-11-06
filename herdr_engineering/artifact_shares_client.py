@@ -172,6 +172,7 @@ def _pool_id(args):
     if args.fleet_config:
         try:
             from pathlib import Path
+
             from .fleet_config import load_fleet_config
             return load_fleet_config(Path(args.fleet_config)).section("control_plane")["collab"]["cognito_pool"]
         except Exception:
@@ -266,6 +267,8 @@ def run_command(args):
                 body["entry"] = args.entry
             if args.title:
                 body["title"] = args.title
+            if getattr(args, "include_author_html", False):
+                body["include_author_html"] = True
             if args.check_pool and args.email:
                 try:
                     _check_pool(args, args.email)
@@ -364,6 +367,9 @@ def configure_parser(parser):
             c.add_argument("--expires-in-days", type=int, help=f"1..{MAX_DAYS}; public links default to the server's 30")
             c.add_argument("--entry")
             c.add_argument("--title")
+            c.add_argument("--include-author-html", action="store_true",
+                           help="report shares: also share the author's own HTML page as a sandboxed 'Rich view' "
+                                "(the approval plan lists it)")
             c.add_argument("--check-pool", action="store_true", help="warn about emails without a Cognito account")
             c.add_argument("--pool-id")
             c.add_argument("--fleet-config", help="fleet config file to read control_plane.collab.cognito_pool from")
