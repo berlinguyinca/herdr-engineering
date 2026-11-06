@@ -264,7 +264,8 @@ def _dispatch(handler, server, action: str, parts: list[str], viewer: Viewer) ->
         handler._json({"deleted": parts[5]})
     elif action == "file":
         body = _body(handler, _ITEM_FIELDS)
-        call("file_artifact", principal, _text(body, "folder_id"), _text(body, "artifact_id"))
+        call("file_artifact", principal, _text(body, "folder_id"), _text(body, "artifact_id"),
+             member_id=viewer.member_id or None, member_email=viewer.email or "", member_groups=viewer.groups)
         handler._json({"filed": body["artifact_id"], "folder_id": body["folder_id"]}, 201)
     elif action == "unfile":
         call("unfile_artifact", principal, parts[5], parts[7])

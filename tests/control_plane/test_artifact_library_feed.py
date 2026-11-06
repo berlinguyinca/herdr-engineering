@@ -383,3 +383,47 @@ def test_revoked_opened_row_has_blank_type_and_size(dsn):
         assert (item.status, item.artifact_type, item.size_bytes) == ("revoked", "", 0)
 
     run(dsn, body)
+
+
+def test_filing_follows_the_feed_not_ownership_or_acl(dsn):
+    async def body(store, pool):
+        folder = await store.create_folder(ME_P, "Papers")
+        who = {"member_email": EMAIL, "member_groups": frozenset({G1})}
+        lab = await artifact(pool, YOU_P)
+        await share(pool, lab, emails=[EMAIL])
+        grp = await artifact(pool, YOU_P)
+        await share(pool, grp, groups=[G1])
+        opened = await artifact(pool, YOU_P)
+        await store.record_claim(ME, await share(pool, opened, audience="public"))
+        mine_pending = await artifact(pool, ME_P, intake="pending")
+        for aid in (lab, grp, opened, mine_pending):
+            await store.file_artifact(ME_P, folder.folder_id, aid, **who)
+        assert {i.artifact_id for i in (await feed(store, groups=frozenset({G1}), sources=frozenset({"mine", "assigned", "opened", "pending"}), folder_id=folder.folder_id)).items} \
+            == {lab, grp, opened, mine_pending}
+        await store.unfile_artifact(ME_P, folder.folder_id, opened)
+
+    run(dsn, body)
+
+
+def test_filing_refuses_what_the_feed_hides_with_one_identical_404(dsn):
+    async def body(store, pool):
+        folder = await store.create_folder(ME_P, "Papers")
+        who = {"member_email": EMAIL, "member_groups": frozenset({G1})}
+        stranger = await artifact(pool, YOU_P)
+        others_pending = await artifact(pool, YOU_P, intake="pending")
+        await share(pool, others_pending, emails=[EMAIL])                       # a lab share of a pending push is not visible
+        wrong_group = await artifact(pool, YOU_P)
+        await share(pool, wrong_group, groups=["not-mine"])
+        revoked = await artifact(pool, YOU_P)
+        await store.record_claim(ME, sid := await share(pool, revoked, audience="public"))
+        await pool.execute("UPDATE artifact_shares SET state='revoked' WHERE share_id=$1", sid)
+        unclaimed = await artifact(pool, YOU_P)
+        await share(pool, unclaimed, audience="public")                         # live public link never opened by me
+        seen = []
+        for aid in (stranger, others_pending, wrong_group, revoked, unclaimed, "artifact_missing"):
+            with pytest.raises(LibraryError) as e:
+                await store.file_artifact(ME_P, folder.folder_id, aid, **who)
+            seen.append((e.value.status, e.value.code, str(e.value)))
+        assert len(set(seen)) == 1 and seen[0][:2] == (404, "not_found"), seen
+
+    run(dsn, body)

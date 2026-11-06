@@ -284,11 +284,31 @@ class LibraryStore:
         return [Folder.from_row(r) for r in rows]
 
     async def file_artifact(
-        self, owner: str, folder_id: str, artifact_id: str, *, source: FolderSource = "manual"
+        self,
+        owner: str,
+        folder_id: str,
+        artifact_id: str,
+        *,
+        source: FolderSource = "manual",
+        member_id: str | None = None,
+        member_email: str = "",
+        member_groups: frozenset[str] = frozenset(),
     ) -> None:
+        """File an artifact the member can see in their feed (own, own pending, assigned by ACL or lab share, opened
+        through a live link): the feed-visibility rule, so any row the UI offers can be filed.  Anything else is the
+        same ``not_found`` as a missing artifact."""
         async with self._pool.acquire() as conn:
             await self._require_folder(conn, owner, folder_id)
-            if await conn.fetchval(READABLE_SQL, owner, artifact_id) is None:
+            visible = await conn.fetchval(
+                f"WITH c AS ({_CANDIDATES_SQL}) SELECT 1 FROM c WHERE c.artifact_id=$5 "
+                "AND c.status IN ('active','pending') LIMIT 1",
+                owner,
+                member_id or owner.removeprefix("member:"),
+                (member_email or "").lower(),
+                sorted(member_groups),
+                artifact_id,
+            )
+            if visible is None:
                 raise LibraryError(*NOT_FOUND)
             await conn.execute(
                 "INSERT INTO artifact_library_items (folder_id, artifact_id, source) VALUES ($1,$2,$3) "

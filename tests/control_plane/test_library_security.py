@@ -803,6 +803,31 @@ def test_a_member_who_only_receives_a_lab_share_gets_a_view_after_one_tick(sandb
     sandbox(body)
 
 
+def test_a_member_can_file_lab_assigned_and_opened_rows_but_not_a_strangers(sandbox):
+    async def body(env, rt, web, shares):
+        s = await scenario(env, rt, web, shares)
+        path = f"/api/member/folders/{s.fa}/items"
+        stranger = await web.write("POST", path, {"artifact_id": s.b})            # alice has no route to bob's artifact yet
+        assert stranger["result"] == "rejected" and stranger["reason"] == "not_found", stranger
+        ghost = await web.write("POST", path, {"artifact_id": GHOST_ART})
+        assert (ghost["result"], ghost["reason"]) == (stranger["result"], stranger["reason"])
+        await claim(env, rt, shares, s)                                              # opened through the public link
+        out = await web.write("POST", path, {"artifact_id": s.b})
+        assert out["result"] == "filed", out
+        await web.write("DELETE", f"/api/member/folders/{s.fa}/items/{s.b}")
+        c = await create(env, user("bob"), title="Lab only")
+        vc = await put_files(env, c, {"index.html": HTML}, actor=user("bob"), owner=BOB)
+        made = await share(env, user("bob"), c, vc, "lab", allow_emails=["alice@lab.example.org"])
+        ticket, done = await approve(env, user("bob"), c, made["share_id"])
+        assert done["result"] == "live", done
+        await tick(env, rt)
+        out = await web.write("POST", path, {"artifact_id": c})                      # assigned by a lab share
+        assert out["result"] == "filed", out
+        other = await web.write("POST", f"/api/member/folders/{s.fb}/items", {"artifact_id": c})   # bob's folder is not alice's
+        assert other["result"] == "rejected" and other["reason"] == "not_found"
+    sandbox(body)
+
+
 def test_a_revoked_row_serves_nothing_and_never_falls_back_to_a_filename(sandbox):
     async def body(env, rt, web, shares):
         s = await scenario(env, rt, web, shares)

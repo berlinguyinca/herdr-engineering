@@ -708,7 +708,7 @@ class _OneConn:
 
 
 def _library_handler(action: str, run: Callable[..., Any], result: str):
-    """A user-only library intent: ``run(store, member_id, principal, intent)`` returns extra result fields.
+    """A user-only library intent: ``run(store, principal, intent, who)`` returns extra result fields.
     Results carry no ids (the view has them). A ``LibraryError`` becomes a rejection with its code (``not_found`` for another member's folder, as for a missing one)."""
     async def handle(ctx: IntentContext, intent: Intent) -> dict:
         from .artifact_library import LibraryError, LibraryStore
@@ -718,7 +718,7 @@ def _library_handler(action: str, run: Callable[..., Any], result: str):
         store = LibraryStore(_OneConn(ctx.conn))
         try:
             async with ctx.conn.transaction():
-                extra = await run(store, who.principal, intent)
+                extra = await run(store, who.principal, intent, who)
         except LibraryError as exc:
             out = _rejected(exc.code)
         else:
@@ -731,7 +731,7 @@ def _folder_json(folder: Any) -> dict:
     return {"folder_id": folder.folder_id, "name": folder.name, "item_count": folder.item_count}
 
 
-async def _folder_create(store: Any, principal: str, intent: Intent) -> dict:
+async def _folder_create(store: Any, principal: str, intent: Intent, _who: Any) -> dict:
     """Create-or-get by name, so a replayed intent (or a double click) yields the same folder.  This deliberately
     differs from ``LibraryStore.create_folder`` (409 ``duplicate_name``): replays must be idempotent.  The member's lane is
     serial, so looking first cannot race; an insert that failed would abort the transaction."""
@@ -741,27 +741,29 @@ async def _folder_create(store: Any, principal: str, intent: Intent) -> dict:
     return {}
 
 
-async def _folder_rename(store: Any, principal: str, intent: Intent) -> dict:
+async def _folder_rename(store: Any, principal: str, intent: Intent, _who: Any) -> dict:
     await store.rename_folder(principal, intent.payload["folder_id"], intent.payload["name"])
     return {}
 
 
-async def _folder_delete(store: Any, principal: str, intent: Intent) -> dict:
+async def _folder_delete(store: Any, principal: str, intent: Intent, _who: Any) -> dict:
     await store.delete_folder(principal, intent.payload["folder_id"])
     return {}
 
 
-async def _file(store: Any, principal: str, intent: Intent) -> dict:
-    await store.file_artifact(principal, intent.payload["folder_id"], intent.artifact_id)
+async def _file(store: Any, principal: str, intent: Intent, who: Any) -> dict:
+    email, groups = await _member_identity(principal, who.rt)      # a stale directory fails closed: own items only
+    await store.file_artifact(principal, intent.payload["folder_id"], intent.artifact_id,
+                              member_email=email, member_groups=groups)
     return {}
 
 
-async def _unfile(store: Any, principal: str, intent: Intent) -> dict:
+async def _unfile(store: Any, principal: str, intent: Intent, _who: Any) -> dict:
     await store.unfile_artifact(principal, intent.payload["folder_id"], intent.artifact_id)
     return {}
 
 
-async def _claim(store: Any, principal: str, intent: Intent) -> dict:
+async def _claim(store: Any, principal: str, intent: Intent, _who: Any) -> dict:
     await store.record_claim(principal.removeprefix("member:"), intent.payload["share_id"])
     return {}
 
