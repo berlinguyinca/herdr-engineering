@@ -40,7 +40,7 @@ _CORE_CSS = (
     ":root[data-theme=\"dark\"],:host([data-theme=\"dark\"]){" + _DARK + "}"
     "body{margin:0;background:var(--bg)}"
     ".rp{max-width:860px;margin:0 auto;padding:32px 16px 64px;background:var(--bg);color:var(--text);"
-    "font:15px/1.6 var(--sans);overflow-wrap:anywhere}a{color:var(--link)}"
+    "font:15px/1.6 var(--sans);overflow-wrap:break-word}a{color:var(--link)}"
 )
 _FULL_CSS = _CORE_CSS + (
     ".rp *{box-sizing:border-box}.rp section{margin:40px 0 0;min-width:0}"
@@ -67,7 +67,7 @@ _FULL_CSS = _CORE_CSS + (
     "table{border-collapse:collapse;width:100%;min-width:560px;font-size:13.5px}"
     "th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:top}"
     "th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);background:var(--surface-2)}"
-    "tr:last-child td{border-bottom:0}td.num{white-space:nowrap}"
+    "tr:last-child td{border-bottom:0}td.num{white-space:nowrap}td:first-child{min-width:12rem}td .chip{white-space:nowrap}"
     "code,.mono{font:12.5px var(--mono);background:var(--surface-2);padding:1px 5px;border-radius:4px}"
     ".callout{background:var(--accent-weak);border-radius:var(--radius);padding:10px 14px;margin:10px 0;font-size:14px}"
     ".callout b{display:block;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--link)}"

@@ -318,3 +318,9 @@ def test_theme_override_selectors_are_in_the_stylesheet():
     assert ':root:not([data-theme="light"])' in page and ':host(:not([data-theme="light"]))' in page
     # none of the override machinery needs a script or an attribute the sanitiser strips from the markup
     assert "<script" not in page and 'data-theme="' not in page.split("</style>")[1]
+
+
+def test_table_cells_do_not_break_words_character_by_character():
+    page = _render()
+    assert "overflow-wrap:anywhere" not in page and "overflow-wrap:break-word" in page
+    assert "td .chip{white-space:nowrap}" in page
