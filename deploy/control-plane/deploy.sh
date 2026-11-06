@@ -443,7 +443,9 @@ fi
 # Fabric-trust listener (SPEC 6a): only with the collab overlay AND control_plane.collab.fabric_trust.listen_* set.
 # The address was validated (tailnet range) by the config; docker publishes exactly that host:port.
 FABRIC=0
-if [ "$COLLAB" = 1 ]; then
+# An older candidate (a rollback target, a pinned --ref) has neither the helper nor the overlay: no listener then.
+if [ "$COLLAB" = 1 ] && grep -q 'fabric-listener' "$WORK/herdr_engineering/cli.py" 2>/dev/null \
+    && [ -f "$WORK/deploy/control-plane/compose.collab-fabric.yaml" ]; then
   if ! FABRIC_LISTEN="$(herdr_eng fleet config fabric-listener --path "$CENTRAL")"; then
     echo "control_plane.collab.fabric_trust is invalid in $CENTRAL" >&2
     exit 1
