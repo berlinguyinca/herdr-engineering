@@ -3969,7 +3969,11 @@ def _library_wiring(dsn: str | None):
         import asyncpg
         return await asyncpg.create_pool(dsn, min_size=1, max_size=3)
 
-    return make_library_adapter(pool)
+    try:
+        return make_library_adapter(pool)
+    except RuntimeError as exc:  # database unreachable at start: the library routes answer 503, the dashboard still starts
+        print(f"warning: artifact library unavailable ({exc.__cause__ or exc})", file=sys.stderr)
+        return None
 
 
 def _library_viewers(cp) -> dict[str, str]:
