@@ -42,3 +42,22 @@ def test_missing_handoff_is_a_warning_unless_strict(monkeypatch):
         report = run_doctor(config=dict(DEFAULTS), strict=strict).to_dict()
         check = next(item for item in report["checks"] if item["name"] == "handoff")
         assert check["status"] == expected
+
+
+def test_build_cache_toolchain_checks_are_read_only_warnings(monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", str(tmp_path))  # no sccache/rustc/cargo anywhere
+    checks = {c["name"]: c for c in run_doctor(config=dict(DEFAULTS)).to_dict()["checks"]}
+    assert checks["build_cache_sccache"]["status"] == "warn"
+    assert "scripts/install.sh --build-cache-tools-only" in checks["build_cache_sccache"]["detail"]
+    assert checks["build_cache_rust"]["status"] == "warn"
+    assert checks["build_cache_python_deps"]["status"] == "ok"
+
+
+def test_build_cache_toolchain_old_sccache_warns_new_ok(monkeypatch, tmp_path):
+    exe = tmp_path / "sccache"
+    for ver, want in (("0.18.0", "warn"), ("0.19.0", "ok")):
+        exe.write_text(f"#!/bin/sh\necho 'sccache {ver}'\n")
+        exe.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+        checks = {c["name"]: c for c in run_doctor(config=dict(DEFAULTS)).to_dict()["checks"]}
+        assert checks["build_cache_sccache"]["status"] == want

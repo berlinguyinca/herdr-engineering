@@ -311,6 +311,8 @@ class CoordinatorsMixin:
                                        project_ids=[room["project_id"]], resource_id=room_id)
                     raise _err(403, "forbidden: you may not coordinate this team now", code="coordination_revoked")
                 return room, first
+            if self._dg_applies(pr, room_id):         # the Direct guest level: read here, the limits are judged by _dg_create
+                return self._authorize(pr, room_id, "read", "task.create")
         return self._authorize(pr, room_id, "instruct" if pr.is_agent else "task", "task.create")
 
     def _tc_check_body(self, pr, room_id: str, ident: dict, limits: dict, body: dict) -> None:

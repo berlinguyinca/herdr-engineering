@@ -81,3 +81,18 @@ def test_scheduler_mutations_enforce_same_origin_with_operator_credentials(serve
     status, row = post(server, route, request(), {
         "X-API-Key": "ops", "Origin": f"http://127.0.0.1:{server.port}"})
     assert status == 201 and row["state"] == "queued"
+
+
+def test_mode_only_policy_edit_preserves_restrictions_and_rejects_stale_revision(server):
+    post(server, "/api/v1/fleet/config/telemetry", sample(), {"X-Host-Token": "host-secret"})
+    server.repo.set_host_policy("fleet-linux", mode="automatic", expected_revision=0,
+                               allow_tags=["coding"], deny_tags=["benchmark"])
+    body = {"host_uid": sample()["host_uid"], "mode": "disabled", "expected_revision": 1}
+    route = "/api/v1/scheduler/host-policy"
+    status, policy = post(server, route, body, {"X-API-Key": "ops"})
+    assert status == 200
+    assert policy["allow_tags"] == ["coding"] and policy["deny_tags"] == ["benchmark"]
+    assert post(server, route, body, {"X-API-Key": "ops"})[0] == 409
+    assert server.repo.get_host("fleet-linux")["scheduler_policy"] == policy
+    status, cleared = post(server, route, {**body, "expected_revision": 2, "allow_tags": []}, {"X-API-Key": "ops"})
+    assert status == 200 and cleared["allow_tags"] == [] and cleared["deny_tags"] == ["benchmark"]

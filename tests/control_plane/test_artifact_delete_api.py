@@ -25,8 +25,8 @@ CREATOR = f"api-key:{hashlib.sha256(b'creator-key').hexdigest()[:16]}:operator"
 
 
 class Env:
-    def __init__(self, base, adapter, blobs):
-        self.base, self.adapter, self.blobs = base, adapter, blobs
+    def __init__(self, base, adapter, blobs, server=None):
+        self.base, self.adapter, self.blobs, self.server = base, adapter, blobs, server
 
     def seed(self, data=None, *, owner=CREATOR, name="a.md", media="text/markdown"):
         data = data or b"payload " + uid("d").encode()
@@ -55,7 +55,7 @@ def api(pg, *, owners=(OWNER_DIGEST,), keys=KEYS, store=True, keyless_owner=Fals
     threading.Thread(target=server.serve, daemon=True).start()
     server.wait_until_ready()
     try:
-        yield Env(f"http://127.0.0.1:{server.port}", adapter, blobs)
+        yield Env(f"http://127.0.0.1:{server.port}", adapter, blobs, server)
     finally:
         server.shutdown()
         adapter.close()
@@ -363,3 +363,22 @@ def test_i1_tombstone_revokes_live_shares_removes_their_bundles_and_blocks_new_o
             assert got == 409 and out == {"error": "artifact is not active"}
     finally:
         shares.close()
+
+
+def test_the_reviews_list_of_a_registry_artifact_is_as_private_as_its_versions(registry_pg):
+    """Without an in-memory ACL the registry's own permission decides; the reviews route used to skip it."""
+    from herdr_engineering.control_plane.artifact_reviews import ArtifactReviewManager
+    reviews = ArtifactReviewManager()
+    with api(registry_pg, extra={"artifact_review_manager": reviews}) as env:
+        aid, _ = env.seed()
+        reviews.request(artifact_id=aid, version_id="v1", requested_by=CREATOR)
+        path = f"/api/v1/artifacts/{aid}"
+        got, body = request(env.base, f"{path}/reviews", key="creator-key")
+        assert got == 200 and len(body["reviews"]) == 1                      # the owner still reads
+        missing = request(env.base, "/api/v1/artifacts/art-nope/reviews", key="member-key")
+        assert missing[0] == 404
+        for caller in ("member-key", "viewer-key"):                           # authenticated, no permission
+            assert request(env.base, f"{path}/reviews", key=caller) == missing, caller
+            assert request(env.base, f"{path}/versions", key=caller) == missing, caller   # the sibling route agrees
+        assert request(env.base, f"{path}/reviews", key=None)[0] in (401, 404)
+        assert request(env.base, f"{path}/reviews", key="wrong-key")[0] in (401, 404)

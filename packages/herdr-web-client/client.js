@@ -132,8 +132,27 @@ export class HerdrClient {
     return this.request(`/api/v1/memory/search?${params}`, { signal });
   }
 
-  getMemoryRecord(id, { signal } = {}) {
-    return this.request(`/api/v1/memory/${encodeURIComponent(id)}`, { signal });
+  getMemoryRecord(id, { signal, kind, scope, project } = {}) {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries({ kind, scope, project })) {
+      if (value != null && value !== '') params.set(key, value);
+    }
+    const query = params.toString();
+    // A caller's close/replace signal must not remove request()'s 15 s bound.
+    let bounded = signal;
+    if (signal) {
+      const deadline = AbortSignal.timeout(15000);
+      if (AbortSignal.any) bounded = AbortSignal.any([signal, deadline]);
+      else {
+        const controller = new AbortController();
+        for (const source of [signal, deadline]) {
+          if (source.aborted) controller.abort(source.reason);
+          else source.addEventListener('abort', () => controller.abort(source.reason), { once: true });
+        }
+        bounded = controller.signal;
+      }
+    }
+    return this.request(`/api/v1/memory/${encodeURIComponent(id)}${query ? `?${query}` : ''}`, { signal: bounded });
   }
 
   getMemoryServiceStatus({ signal } = {}) {
@@ -266,6 +285,11 @@ export class HerdrClient {
   // Static copy of a report version's lightweight preview.
   artifactReportPreviewRender(id, versionId, { signal } = {}) {
     return this.request(`${this.artifactReportPath(id, versionId)}/preview/render`, { signal });
+  }
+
+  // A report version's HTML asset, served under a no-script sandbox CSP: the only URL the dashboard frames.
+  artifactRichUrl(id, versionId) {
+    return `${this.base}${this.artifactReportPath(id, versionId)}/rich`;
   }
 
   // The sandboxed raw view, opened in a new tab (never framed).
@@ -513,6 +537,10 @@ export class HerdrClient {
 
   schedulerPlan(request, { signal } = {}) {
     return this.request('/api/v1/scheduler/plan', { method: 'POST', body: request, signal });
+  }
+
+  schedulerSetHostPolicy(request, { signal } = {}) {
+    return this.request('/api/v1/scheduler/host-policy', { method: 'POST', body: request, signal });
   }
 
   // -- missions -----------------------------------------------------------

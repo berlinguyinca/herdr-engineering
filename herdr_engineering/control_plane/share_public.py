@@ -120,6 +120,7 @@ from .share_render import (
     share_resolver,
     wrap_content,
 )
+from .share_rich_view import MAX_RICH_BYTES, RICH_NAME, SHARE_RICH_HEADERS
 from .share_session import (
     MIN_SECRET_BYTES,
     check_csrf,
@@ -599,6 +600,9 @@ def _prepare(raw: dict) -> _Prepared:
         return bad("invalid_state")
     if entry not in index:
         return bad("invalid_state")
+    rich = raw.get("rich")
+    if "rich" in raw and (rich != RICH_NAME or rich not in index or rich == entry or index[rich]["size"] > MAX_RICH_BYTES):
+        return bad("invalid_state")       # the author page is one fixed, bounded, non-entry file or nothing
     shared_by = raw.get("shared_by")
     if "shared_by" in raw and (not isinstance(shared_by, str) or not shared_by or len(shared_by) > SHARED_BY_MAX):
         return bad("invalid_state")       # the banner name is ours to bound: a bad one fails closed like any bad state
@@ -994,6 +998,8 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
         if st.st_size != size:
             deny(handler, state, "size_mismatch", actor)
             return False
+        if name == state.get("rich"):
+            return _serve_rich(handler, state, item, fd, actor)
         etag = f'"{item["sha256"]}"'
         csp = sandbox_csp(getattr(handler.server, "public_origin", None), token)
         injected = None
@@ -1076,6 +1082,23 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
         return True
     finally:
         os.close(fd)
+
+
+def _serve_rich(handler, state: dict, item: dict, fd: int, actor: str) -> bool:
+    """The opted-in author page of a report share: hash-verified, under the dashboard Rich view's no-script headers
+    (``share_rich_view.SHARE_RICH_HEADERS``: the dashboard's minus frame-ancestors / X-Frame-Options, which an
+    opaque-origin parent can never satisfy), never the bundle's permissive policy. No CORS, no ranges, no conditionals."""
+    data = _read_all(fd, item["size"])
+    if data is None or hashlib.sha256(data).hexdigest() != item["sha256"]:
+        deny(handler, state, "size_mismatch", actor)
+        return False
+    if _announces_body(handler):
+        handler.close_connection = True
+    _send_headers(handler, 200, [*SHARE_RICH_HEADERS, ("X-Robots-Tag", "noindex"), ("Content-Length", str(len(data)))],
+                  cors=False)
+    if handler.command != "HEAD":
+        _write_body(handler, data)
+    return True
 
 
 def _serve_with_link(handler, state: dict, name: str, item: dict, body: bytes, csp: str, *, cors: bool,
@@ -1343,6 +1366,8 @@ class ShareHandler(BaseHTTPRequestHandler):
         actor = got["identity"]
         if origin is None or name is None or item is None:
             return deny(self, state, "not_in_bundle" if origin is not None else "invalid_state", actor)
+        if name == state.get("rich"):
+            return deny(self, state, "not_in_mode", actor)     # the author page is framed from the preview, never annotated
         kind = render_kind(name)
         if kind == "html" and mode == "live":
             return deny(self, state, "not_in_mode", actor)

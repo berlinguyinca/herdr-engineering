@@ -9,6 +9,7 @@ role (spec 63); it speaks the public HTTPS API only.
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import hmac
 import http.client
@@ -194,6 +195,19 @@ class ProxyState:
             self._catalog_lock.release()
         return self._catalog
 
+    @staticmethod
+    def _ready(item: dict, required) -> bool:
+        """A catalog entry that can serve a request of ``required`` tokens now: hot/warm, text, ungrouped, with slots."""
+        context = item.get("ctx_per_request")
+        if context is None:
+            context = item.get("x_context_window")
+        slots = item.get("slots")
+        return not (not isinstance(item.get("id"), str) or not item["id"] or item.get("x_group")
+                    or item.get("x_state") not in ("hot", "warm")
+                    or item.get("x_modality") not in (None, "", "text", "chat")
+                    or type(context) is not int or type(required) is not int or context < required
+                    or type(slots) is not int or slots <= 0)
+
     def _fabric_model(self, custom: dict) -> str | None:
         wanted = custom.get("fabric_model")
         if not isinstance(wanted, str) or not wanted:
@@ -205,25 +219,39 @@ class ProxyState:
                        and wanted in item["aliases"]]
         if len(matches) != 1:
             return None
-        item = matches[0]
-        context = item.get("ctx_per_request")
-        if context is None:
-            context = item.get("x_context_window")
-        slots = item.get("slots")
-        required = custom.get("context_window", 8192)
-        if (not isinstance(item.get("id"), str) or not item["id"] or item.get("x_group")
-                or item.get("x_state") not in ("hot", "warm")
-                or item.get("x_modality") not in (None, "", "text", "chat")
-                or type(context) is not int or type(required) is not int or context < required
-                or type(slots) is not int or slots <= 0):
-            return None
-        return item["id"]
+        return matches[0]["id"] if self._ready(matches[0], custom.get("context_window", 8192)) else None
 
-    def custom_route(self, custom: dict, model: str | None) -> tuple[str, str | None, str | None]:
+    def _fallback_model(self, custom: dict) -> str | None:
+        """First ``fallback_models`` pattern with a ready gateway model; among its matches the one with most free slots."""
+        patterns = custom.get("fallback_models")
+        if not isinstance(patterns, list):
+            return None
+        catalog = self._fabric_catalog()
+        required = custom.get("context_window", 8192)
+        for pattern in patterns:
+            ready = [item for item in catalog if isinstance(item.get("id"), str)
+                     and fnmatch.fnmatchcase(item["id"].lower(), str(pattern).lower()) and self._ready(item, required)]
+            if ready:
+                return max(ready, key=lambda item: (item["slots"], item["id"]))["id"]
+        return None
+
+    def resolve_route(self, custom: dict, model: str | None) -> tuple[str, str | None, str | None, str]:
+        """(base_url, bearer, upstream model, kind) for a registered model: the advertised model on the gateway
+        ("fabric"), else a gateway model matching ``fallback_models`` ("fallback"), else the private service ("cpu")."""
         concrete = self._fabric_model(custom)
         if concrete:
-            return self.upstream, self.upstream_key, concrete
-        return custom["base_url"], None, custom.get("upstream_model") or model
+            return self.upstream, self.upstream_key, concrete, "fabric"
+        return self.degraded_route(custom, model)
+
+    def degraded_route(self, custom: dict, model: str | None) -> tuple[str, str | None, str | None, str]:
+        """Where a registered model goes when its advertised gateway model is not usable."""
+        concrete = self._fallback_model(custom)
+        if concrete:
+            return self.upstream, self.upstream_key, concrete, "fallback"
+        return custom.get("base_url"), None, custom.get("upstream_model") or model, "cpu"
+
+    def custom_route(self, custom: dict, model: str | None) -> tuple[str, str | None, str | None]:
+        return self.resolve_route(custom, model)[:3]
 
     def egress_check(self, model: str | None, data_class: str | None) -> tuple[bool, str]:
         """Classified-content gate. Route kinds come from operator config (``egress.upstream_kind``,
@@ -459,12 +487,11 @@ def make_handler(state: ProxyState):
                     and custom["project"] != key["project"]):
                 meta.update(status=403, error_class="model_project_mismatch")
                 return self._json(403, {"error": {"code": "model_project_mismatch"}})
-            base, bearer, upstream_model = (state.custom_route(custom, model) if custom
-                                            else (state.upstream, state.upstream_key, model))
+            base, bearer, upstream_model, route_kind = (state.resolve_route(custom, model) if custom
+                                                        else (state.upstream, state.upstream_key, model, "cpu"))
             policy = bool(custom and custom.get("fabric_model"))
-            route_kind = "fabric" if policy and bearer is not None else "cpu"
             stream = bool(body and body.get("stream"))
-            may_fall_back = bool(policy and bearer is not None and not stream)
+            may_fall_back = bool(policy and route_kind == "fabric" and not stream)
             sent_headers = False
             conn = None
             try:
@@ -479,6 +506,10 @@ def make_handler(state: ProxyState):
                             opts["include_usage"] = True
                             outbound["stream_options"] = opts
                         raw = json.dumps(outbound).encode()
+                    if base is None:        # no gateway fallback and no private service: nothing to send to
+                        meta.update(status=503, error_class="model_unavailable")
+                        return self._json(503, {"error": {"code": "model_unavailable",
+                                                         "message": "no route is available for this model"}})
                     parts = urlsplit(base + self.path)
                     conn_cls = (http.client.HTTPSConnection if parts.scheme == "https"
                                 else http.client.HTTPConnection)
@@ -497,15 +528,15 @@ def make_handler(state: ProxyState):
                         resp = conn.getresponse()
                         if not may_fall_back or resp.status not in {429, 503}:
                             break
+                        if state.degraded_route(custom, model)[0] is None:
+                            break           # nowhere else to go: the caller gets the gateway's own answer
                     except (OSError, http.client.HTTPException):
-                        if not may_fall_back:
+                        if not may_fall_back or state.degraded_route(custom, model)[0] is None:
                             raise
                     conn.close()
                     may_fall_back = False
                     meta["fallback"] = True
-                    route_kind = "cpu"
-                    base, bearer, upstream_model = (custom["base_url"], None,
-                                                    custom.get("upstream_model") or model)
+                    base, bearer, upstream_model, route_kind = state.degraded_route(custom, model)
                 meta.update(status=resp.status, error_class=_upstream_error_class(resp.status))
                 try:
                     self.send_response(resp.status)

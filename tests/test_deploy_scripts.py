@@ -1991,3 +1991,239 @@ def test_a_bad_apps_dir_is_refused_before_anything_runs(env, fault, needle):
     r = deploy(env, "--dry-run")
     assert r.returncode != 0 and needle in r.stderr
     assert not env["log"].exists()
+
+
+def _dashboard_memory_policy(e):
+    from herdr_engineering.fleet_memory import init_memory
+    init_memory(e["central"], enable=True, endpoint="https://memory.example.test",
+                model_dir=str(e["tmp"] / "model"))
+    data = yaml.safe_load(e["central"].read_text())
+    data["sections"]["control_plane"]["values"]["memory"]["viewers"] = {
+        "open-listener": {"projects": ["canary"], "scopes": []}}
+    e["central"].write_text(yaml.safe_dump(data))
+    e["central"].chmod(0o600)
+
+
+def _dashboard_memory_client(e):
+    from herdr_engineering.memory_install import PINNED_CLIENT_VERSION
+    directory = e["tmp"] / "operator-profile"
+    directory.mkdir(mode=0o700)
+    key = directory / "project.key"
+    key.write_text("private-client-fixture-value")
+    key.chmod(0o600)
+    profile = directory / "config.json"
+    profile.write_text(json.dumps({
+        "url": "https://memory.example.test", "default_project": "canary",
+        "cache_dir": str(e["tmp"] / "operator-cache"),
+        "projects": {"canary": {"credentials": {"codex": str(key)}}}}))
+    profile.chmod(0o600)
+    executable = Path(e["env"]["PATH"].split(os.pathsep)[0]) / "herdr-memory"
+    executable.write_text("#!/usr/bin/env python3\nimport json,sys\n"
+                          f"print(json.dumps({{'valid':True,'contract':1,'client':{PINNED_CLIENT_VERSION!r}}}))\n")
+    executable.chmod(0o755)
+    return profile
+
+
+def test_memory_dashboard_viewers_require_explicit_profile_before_build(env):
+    _dashboard_memory_policy(env)
+    result = deploy(env, "--dry-run")
+    assert result.returncode != 0
+    assert "explicit client profile" in result.stderr
+    assert "docker build" not in (env["log"].read_text() if env["log"].exists() else "")
+
+
+def test_memory_client_profile_dry_run_is_secret_safe_and_preserves_user_state(env):
+    _dashboard_memory_policy(env)
+    profile = _dashboard_memory_client(env)
+    before = profile.read_bytes()
+    result = deploy(env, "--dry-run", "--memory-client-config", str(profile))
+    assert result.returncode == 0, result.stderr
+    assert "private-client-fixture-value" not in result.stdout + result.stderr + env["log"].read_text()
+    assert profile.read_bytes() == before
+    assert not (env["tmp"] / "operator-cache").exists()
+    assert not list(env["home"].rglob("profile.tar"))
+    assert "docker build" not in env["log"].read_text()
+
+
+def test_memory_client_flag_does_not_read_source_with_no_viewer_grants(env):
+    result = deploy(env, "--dry-run", "--memory-client-config", str(env["tmp"] / "missing.json"))
+    assert result.returncode == 0, result.stderr
+    assert "docker build" not in env["log"].read_text()
+
+
+def _egress_inspection_stubs(env):
+    """Only host/Docker metadata reads; the real deploy + policy code still run."""
+    bindir = Path(env['env']['PATH'].split(os.pathsep)[0])
+    docker = bindir / 'docker'
+    body = docker.read_text()
+    facts = {'Id':'a'*64,'Config':{'Labels':{'com.docker.compose.project':'herdr-control-plane',
+                'com.docker.compose.service':'control-plane-web'}},
+             'NetworkSettings':{'Networks':{'herdr-control-plane_default':{'GwPriority':0}}}}
+    extra = f'''if [ "$1 ${{2:-}}" = "network ls" ]; then exit 0; fi
+if [ "$1" = inspect ] && [[ "$*" == *NetworkSettings.Networks* ]]; then
+  printf '%s\\n' '{json.dumps(facts)}'; exit 0
+fi
+'''
+    docker.write_text(body.replace('\n', '\n' + extra, 1))
+    ip = bindir / 'ip'
+    ip.write_text('''#!/bin/bash
+case "$*" in
+  *address*) echo '[{"addr_info":[{"local":"100.104.39.6","family":"inet"}]}]' ;;
+  *) echo '[]' ;;
+esac
+''')
+    ip.chmod(0o755)
+    # A test failure if any root executor is reached during a dry run.
+    sudo = bindir / 'sudo'
+    sudo.write_text(f'''#!/bin/bash
+case "$*" in
+  "-n -- /usr/sbin/ufw status")
+    echo root-read-status >> "{env['log']}"
+    case "${{STUB_UFW_PREFLIGHT:-active}}" in
+      missing) exit 127 ;; sudo-password) exit 1 ;; inactive) echo 'Status: inactive'; exit 0 ;;
+    esac
+    echo 'Status: active'; exit 0 ;;
+  "-n -- /usr/sbin/ufw show added") echo root-read-added >> "{env['log']}"; exit 0 ;;
+esac
+echo ROOT-EXECUTOR-FORBIDDEN >> "{env['log']}"
+exit 99
+''')
+    sudo.chmod(0o755)
+
+
+def test_private_egress_real_deploy_dry_run_adds_overlay_without_root_or_network_changes(env):
+    _egress_inspection_stubs(env)
+    result = deploy(env, '--dry-run', '--memory-private-egress',
+                    '--memory-private-egress-gateway', '100.104.39.6/32')
+    assert result.returncode == 0, result.stderr
+    calls = env['log'].read_text()
+    assert 'compose.web-egress.yaml' in calls
+    assert 'ROOT-EXECUTOR-FORBIDDEN' not in calls
+    assert 'network create' not in calls and 'network connect' not in calls
+    assert not (env['home']/'.local/state/herdr-engineering/deploys/web-egress').exists()
+
+
+def test_private_egress_requires_explicit_gateway_before_dry_run_can_activate(env):
+    _egress_inspection_stubs(env)
+    result = deploy(env, '--dry-run', '--memory-private-egress')
+    assert result.returncode != 0
+    assert 'explicit assigned private' in result.stderr
+    assert not env['log'].exists()
+
+
+def test_disabled_deploy_dry_run_has_no_egress_overlay_or_executor(env):
+    _egress_inspection_stubs(env)
+    result = deploy(env, '--dry-run')
+    assert result.returncode == 0, result.stderr
+    assert 'compose.web-egress.yaml' not in env['log'].read_text()
+    assert 'ROOT-EXECUTOR-FORBIDDEN' not in env['log'].read_text()
+
+
+@pytest.mark.parametrize('failure', ['missing', 'sudo-password', 'inactive'])
+def test_private_egress_root_preflight_refuses_before_recreate_or_profile(env, failure):
+    _egress_inspection_stubs(env)
+    env['env']['STUB_UFW_PREFLIGHT'] = failure
+    result = deploy(env, '--dry-run', '--memory-private-egress',
+                    '--memory-private-egress-gateway', '100.104.39.6/32')
+    assert result.returncode != 0
+    assert 'preflight' in result.stderr
+    calls = env['log'].read_text()
+    assert 'ROOT-EXECUTOR-FORBIDDEN' not in calls
+    assert ' up ' not in calls and 'docker build' not in calls
+    assert not (env['home']/'.local/state/herdr-engineering/deploys/web-egress').exists()
+
+
+def test_explicit_permission_recovery_uses_existing_lock_and_no_fleet_or_compose(env):
+    """The real coordinator runs the real restrictive executor against a root stub."""
+    from herdr_engineering.web_egress_runtime import make_record, private_json
+    state=env['home']/'.local/state/herdr-engineering/deploys'
+    state.mkdir(parents=True,mode=0o700)
+    attempt=state/'attempt-recovery'
+    record=make_record('172.31.252.0/29','100.104.39.6/32','a'*32)
+    record['network_id']='c'*64
+    record['rule_may_exist']=True
+    private_json(attempt/'web-egress/candidate.json',record)
+    private_json(attempt/'web-egress/previous.json',{'enabled':False})
+    private_json(state/'web-egress/pending.json',{'attempt':str((attempt/'web-egress').resolve()),'direction':'forward'})
+    bindir=Path(env['env']['PATH'].split(os.pathsep)[0])
+    sudo=bindir/'sudo'
+    sudo.write_text(f'''#!/bin/bash
+case "$*" in
+  "-n -- /usr/sbin/ufw status") echo 'Status: inactive'; exit 0 ;;
+  "-n -- /usr/sbin/ufw show added")
+    echo 'ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.104.39.6 port 443 comment herdr-cp-web-egress-v1'; exit 0 ;;
+  "-n -- /usr/sbin/ufw --force delete allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.104.39.6/32 port 443 comment herdr-cp-web-egress-v1")
+    echo owned-root-delete >> "{env['log']}"; exit 0 ;;
+esac
+exit 99
+''')
+    sudo.chmod(0o755)
+    result=run(DEPLOY,env,'--no-fetch','--memory-private-egress-recover',str(attempt),
+               '--fleet-config',str(env['tmp']/'missing-fleet-config'))
+    assert result.returncode==3,result.stderr
+    assert 'restoration is NOT completed' in result.stderr
+    calls=env['log'].read_text()
+    assert 'owned-root-delete' in calls
+    assert 'compose ' not in calls and 'docker build' not in calls
+    assert (state/'web-egress/pending.json').exists()
+    assert (state/'rollout.lock').exists()
+
+
+def _approved_private_egress(env):
+    """Existing approved network and receipt, with no real Docker/UFW calls."""
+    from herdr_engineering import web_egress as policy
+    from herdr_engineering.web_egress_runtime import make_record, private_json
+    _egress_inspection_stubs(env)
+    record=make_record('172.30.254.0/29','100.71.1.7/32','e'*32)
+    record.update(network_id='c'*64,rule_may_exist=True)
+    current=env['home']/'.local/state/herdr-engineering/deploys/web-egress/current.json'
+    private_json(current,record)
+    web={'Id':'a'*64,'Config':{'Labels':{'com.docker.compose.project':policy.PROJECT,
+          'com.docker.compose.service':'control-plane-web'}},'NetworkSettings':{'Networks':{
+          policy.DEFAULT:{'GwPriority':0},policy.NETWORK:{'NetworkID':'c'*64,'IPAddress':'172.30.254.2',
+          'IPPrefixLen':29,'Gateway':'172.30.254.1','GwPriority':100}}}}
+    network={'Id':'c'*64,'Name':policy.NETWORK,'Driver':'bridge','Internal':False,'EnableIPv6':False,
+         'Labels':{**policy.LABELS,'io.herdr.web-egress.generation':'e'*32},
+         'Options':{'com.docker.network.bridge.name':policy.BRIDGE},
+         'IPAM':{'Config':[{'Subnet':record['cidr'],'Gateway':'172.30.254.1'}]},
+         'Containers':{'a'*64:{'Name':'herdr-cp-web','IPv4Address':'172.30.254.2/29'}}}
+    bindir=Path(env['env']['PATH'].split(os.pathsep)[0])
+    docker=bindir/'docker'
+    prefix=f'''if [ "$1 ${{2:-}}" = "network ls" ]; then echo owned-network; exit 0; fi
+if [ "$1 ${{2:-}}" = "network inspect" ]; then printf '%s\\n' '{json.dumps([network])}'; exit 0; fi
+if [ "$1" = inspect ] && [[ "$*" == *NetworkSettings.Networks* ]]; then
+  printf '%s\\n' '{json.dumps(web)}'; exit 0
+fi
+if [ "$1" = compose ]; then echo "egress-env:$HERDR_CP_WEB_EGRESS_CIDR:$HERDR_CP_WEB_EGRESS_GENERATION" >> "{env['log']}"; fi
+'''
+    docker.write_text(docker.read_text().replace('\n','\n'+prefix,1))
+    ip=bindir/'ip'
+    ip.write_text('''#!/bin/bash
+case "$*" in *address*) echo '[{"addr_info":[{"family":"inet","local":"100.71.1.7"}]}]' ;; *) echo '[]' ;; esac
+''')
+    return current
+
+
+def test_ordinary_deploy_preserves_last_owned_egress_selection_without_flags(env):
+    current=_approved_private_egress(env)
+    before=current.read_bytes()
+    result=deploy(env,'--dry-run')
+    assert result.returncode==0,result.stderr
+    calls=env['log'].read_text()
+    assert 'compose.web-egress.yaml' in calls
+    assert 'egress-env:172.30.254.0/29:'+('e'*32) in calls
+    assert 'ROOT-EXECUTOR-FORBIDDEN' not in calls
+    assert current.read_bytes()==before
+
+
+def test_explicit_no_egress_removes_selector_and_accepts_inactive_cleanup(env):
+    current=_approved_private_egress(env)
+    before=current.read_bytes()
+    env['env']['STUB_UFW_PREFLIGHT']='inactive'
+    result=deploy(env,'--dry-run','--no-memory-private-egress')
+    assert result.returncode==0,result.stderr
+    calls=env['log'].read_text()
+    assert 'compose.web-egress.yaml' not in calls
+    assert 'root-read-status' in calls
+    assert 'ROOT-EXECUTOR-FORBIDDEN' not in calls
+    assert current.read_bytes()==before  # dry-run never revokes or rewrites policy

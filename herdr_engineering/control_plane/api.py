@@ -47,11 +47,15 @@ from .work_graph_service import handle as work_graph_handle
 
 log = logging.getLogger(__name__)
 
+
+class TombstoneUnavailable(Exception):
+    """The tombstone cache could not be refreshed within its staleness window: the request answers the fixed 503."""
+
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
 # The per-host worker that runs full /summary reports where the session records live (ingest role).
-_HOST_REPORT = re.compile(r"^/api/v1/host/summary-reports/(?:claim|result|publish)$")
+_HOST_REPORT = re.compile(r"^/api/v1/host/(?:summary-reports/(?:claim|result|publish)|build-cache/report)$")
 # Terminal broker, host side: the relay's output POST (per-host token like the fleet routes, never an API key).
 _HOST_TERMINAL_OUT = re.compile(r"^/api/v1/host/terminal/[^/]+/output$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
@@ -309,7 +313,7 @@ class ControlPlaneServer:
                  request_workers=128, request_queue=256, single_operator=False,
                  assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
-                 scheduler_admission=False, scheduler_limits=None, skill_registry=None,
+                 scheduler_admission=False, scheduler_limits=None, skill_registry=None, build_cache=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
@@ -490,6 +494,9 @@ class ControlPlaneServer:
         self.skills, self.skill_transfer = build_skill_registry(
             skill_registry, artifact_store=artifact_store, rustfs=rustfs, acl=artifact_acl,
             record_event=repo.record_event)
+        # control_plane.build_cache (flag off by default: nothing is constructed and the routes answer 404).
+        from .build_cache_routes import build_build_cache
+        self.build_cache = build_build_cache(build_cache, record_event=repo.record_event)
         from .handoffs import HandoffRegistry
         self.handoffs = handoff_registry or HandoffRegistry(repo)
         from .scheduler_service import SchedulerService
@@ -1621,6 +1628,8 @@ class ControlPlaneServer:
             caps.append("unified_workspace_v1")
         if getattr(self, "skills", None) is not None:
             caps.append("skill_registry_v1")
+        if getattr(self, "build_cache", None) is not None:
+            caps.append("build_cache_v1")
         try:
             if self.deployment_definitions.status()["configured"]:
                 caps.append("deployments_v1")     # the read-only Deployments page
@@ -1755,6 +1764,7 @@ class ControlPlaneServer:
                 try:
                     collab.sweep_team_roles()
                     collab.sweep_coordinators()
+                    collab.sweep_direct()
                     interval = collab.team_roles_cfg()["sweep_interval_seconds"]
                 except Exception as exc:                        # noqa: BLE001 - a sweep failure must never stop the loop
                     log.warning("team roles sweep failed: %s", type(exc).__name__)
@@ -2103,8 +2113,12 @@ def _make_handler(server, public=False, operator=False):
             if server.artifact_store is None or not artifact_id:
                 return False
             if permission == "read":
-                return server.tombstone_cache.contains(
-                    artifact_id, lambda: self._artifact_call("tombstoned_ids"))
+                try:
+                    return server.tombstone_cache.contains(
+                        artifact_id, lambda: self._artifact_call("tombstoned_ids"))
+                except Exception as exc:        # noqa: BLE001 - fail closed: no fresh answer, nothing is served
+                    log.exception("tombstone cache unavailable")
+                    raise TombstoneUnavailable() from exc
             return self._artifact_call("lifecycle_of", artifact_id) == "tombstoned"
 
         def _artifact_allowed(self, artifact_id, permission, *, operator_member=True):
@@ -2423,6 +2437,9 @@ def _make_handler(server, public=False, operator=False):
             self._request_cause = None
             try:
                 return dispatch()
+            except TombstoneUnavailable as exc:
+                self._request_cause = type(exc).__name__
+                return self._json({"error": "artifact store unavailable"}, 503)
             except Exception as exc:
                 # A client closing while we write a dependency error must not
                 # replace the already-recorded reason that the request failed.
@@ -3160,6 +3177,9 @@ def _make_handler(server, public=False, operator=False):
                 from .skill_routes import route_skills
                 if route_skills(self, server, parts, resource):
                     return None
+                from .build_cache_routes import route_build_cache
+                if route_build_cache(self, server, parts, resource):
+                    return None
                 if self.command == "GET":
                     return self._api_get(parts, resource)
                 return self._api_post(parts, resource)
@@ -3191,6 +3211,9 @@ def _make_handler(server, public=False, operator=False):
             except ArtifactError as exc:
                 return self._send_json(404 if str(exc).startswith("no artifact") else 400,
                                        {"error": str(exc)})
+            except TombstoneUnavailable as exc:
+                self._request_cause = type(exc).__name__
+                return self._send_json(503, {"error": "artifact store unavailable"})
             except RuntimeError as exc:
                 self._request_cause = type(exc).__name__
                 if resource == 'events':
@@ -3506,7 +3529,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"handoffs": server.handoffs.list(state=_q(self.path, "state"))})
             if resource == "scheduler":
                 if len(parts) == 4:
-                    return self._json(server.scheduler.overview())
+                    return self._json({**server.scheduler.overview(), "admission_enabled": server.scheduler_admission})
                 if parts[4:] == ["queue"]:
                     return self._json({"queue": server.scheduler.overview()["queue"]})
                 return self._json({"error": "not found"}, 404)
@@ -3688,6 +3711,14 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"error": "not configured"}, 404)
             if resource == "ai-sync" and len(parts) == 4:
                 return self._etag_json({"hosts": r.list_ai_sync(_q(self.path, "host_id"))})
+            if resource == "fleet-rollouts" and len(parts) in (4, 5):
+                if len(parts) == 4:
+                    return self._etag_json({"rollouts": r.list_fleet_rollouts(
+                        min(max(_qint(self.path, "limit", 50), 1), 200), _q(self.path, "repo"))})
+                if parts[4] == "versions":
+                    return self._etag_json(r.fleet_rollout_versions())
+                found = r.get_fleet_rollout(parts[4])
+                return self._etag_json(found) if found else self._json({"error": "not found"}, 404)
             if resource == "hosts":
                 if len(parts) > 5 and parts[5] == "telemetry":
                     rng = _q(self.path, "range")
@@ -3816,6 +3847,12 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(version) if version else self._json({"error": "not found"}, 404)
             if resource == "artifacts" and server.artifact_review_manager is not None:
                 if len(parts) == 6 and parts[5] == "reviews":
+                    # without an ACL the registry decides (like the versions routes); with one, the blanket guard above already did
+                    # (legacy uploads have no registry row). No answer reveals that the artifact exists
+                    if (server.artifact_store is not None and server.artifact_acl is None
+                            and not self._artifact_call(
+                            "report_permission", parts[4], self._resource_principal(), "read")):
+                        return self._json({"error": "not found"}, 404)
                     return self._json({"artifact_id": parts[4],
                                        "reviews": server.artifact_review_manager.list_for_artifact(parts[4])})
             if resource == 'artifacts' and len(parts) == 6 and r.get_artifact(parts[4]):
@@ -4228,8 +4265,8 @@ def _make_handler(server, public=False, operator=False):
                             return self._json({"error": "host not found"}, 404)
                         updated = r.set_host_policy(host["host_id"], mode=body.get("mode"),
                                                     expected_revision=body.get("expected_revision"),
-                                                    allow_tags=body.get("allow_tags", ()),
-                                                    deny_tags=body.get("deny_tags", ()),
+                                                    allow_tags=body.get("allow_tags"),
+                                                    deny_tags=body.get("deny_tags"),
                                                     reason=body.get("reason"))
                         return self._json(updated)
                 except KeyError:
@@ -4439,7 +4476,8 @@ def _make_handler(server, public=False, operator=False):
                     r.upsert_custom_model(body.get("name"), body.get("base_url"),
                                           body.get("upstream_model"), body.get("project"),
                                           fabric_model=body.get("fabric_model"),
-                                          context_window=body.get("context_window", 8192))
+                                          context_window=body.get("context_window", 8192),
+                                          fallback_models=body.get("fallback_models"))
                     return self._json({"ok": True})
                 if what == "models" and len(parts) == 7 and parts[6] == "delete":
                     r.delete_custom_model(parts[5])

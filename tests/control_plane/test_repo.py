@@ -132,6 +132,18 @@ def test_service_description_derived_for_imported_records():
     assert "mac.lan" in svc["description"]
 
 
+def test_container_ids_are_not_hosts():
+    """A docker container id with no tailnet address is not a machine: it is left out of the host list (and so out of
+    attention), while a real host, even one named like a hex id but reachable on the tailnet, stays."""
+    r = repo.ControlPlaneRepo()
+    r.upsert_host("bender", "bender", "100.64.0.1")
+    r.upsert_host("0982873b6ca5", "0982873b6ca5", None, status="unknown")
+    r.upsert_host("a" * 64, "a" * 64, None, status="unknown")
+    r.upsert_host("deadbeef0001", "deadbeef0001", "100.64.0.9")
+    assert [h["host_name"] for h in r.list_hosts()] == ["bender", "deadbeef0001"]
+    assert r.get_host("0982873b6ca5") is not None      # the raw record is kept, only the listing ignores it
+
+
 def test_host_heartbeat_and_unavailable():
     r = repo.ControlPlaneRepo()
     hid = r.register_host("bender", "100.104.39.6")
