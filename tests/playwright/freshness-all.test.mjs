@@ -81,3 +81,15 @@ test('the GitHub chip shows sync status, stale, partial and deferred repositorie
  [chip]=await chips(page);
  assert.equal(chip.state,'fresh');
 }));
+
+test('the Team map empty state (no project named) asks for a project, makes no graph request and keeps one calm chip',async()=>{
+ await withPage(async(page,base)=>{
+  const seen=[];
+  await boot(page,base,'/team-map',p=>{seen.push(p);return OK;});
+  await until(async()=>/Enter a project/.test(await page.locator('#view').innerText()),'the project prompt',25000);
+  const all=await chips(page);
+  assert.equal(all.length,1,`one chip, got ${all.length}`);
+  assert.notEqual(all[0].state,'error',all[0].text);
+  assert.deepEqual(seen.filter(p=>/graph\/work/.test(p)),[],'no graph/work read without a project');
+ });
+});
