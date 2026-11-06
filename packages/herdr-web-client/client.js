@@ -132,8 +132,27 @@ export class HerdrClient {
     return this.request(`/api/v1/memory/search?${params}`, { signal });
   }
 
-  getMemoryRecord(id, { signal } = {}) {
-    return this.request(`/api/v1/memory/${encodeURIComponent(id)}`, { signal });
+  getMemoryRecord(id, { signal, kind, scope, project } = {}) {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries({ kind, scope, project })) {
+      if (value != null && value !== '') params.set(key, value);
+    }
+    const query = params.toString();
+    // A caller's close/replace signal must not remove request()'s 15 s bound.
+    let bounded = signal;
+    if (signal) {
+      const deadline = AbortSignal.timeout(15000);
+      if (AbortSignal.any) bounded = AbortSignal.any([signal, deadline]);
+      else {
+        const controller = new AbortController();
+        for (const source of [signal, deadline]) {
+          if (source.aborted) controller.abort(source.reason);
+          else source.addEventListener('abort', () => controller.abort(source.reason), { once: true });
+        }
+        bounded = controller.signal;
+      }
+    }
+    return this.request(`/api/v1/memory/${encodeURIComponent(id)}${query ? `?${query}` : ''}`, { signal: bounded });
   }
 
   getMemoryServiceStatus({ signal } = {}) {
@@ -268,6 +287,11 @@ export class HerdrClient {
     return this.request(`${this.artifactReportPath(id, versionId)}/preview/render`, { signal });
   }
 
+  // A report version's HTML asset, served under a no-script sandbox CSP: the only URL the dashboard frames.
+  artifactRichUrl(id, versionId) {
+    return `${this.base}${this.artifactReportPath(id, versionId)}/rich`;
+  }
+
   // The sandboxed raw view, opened in a new tab (never framed).
   artifactLiveUrl(id) {
     return `${this.base}/api/v1/artifacts/${encodeURIComponent(id)}/live`;
@@ -313,6 +337,45 @@ export class HerdrClient {
 
   artifactShareEvents(id, shareId, { signal } = {}) {
     return this.request(`${this.artifactSharesPath(id, shareId)}/events`, { signal });
+  }
+
+  // Operator controls for member-owned artifacts (/api/v1/artifact-members); a viewer key answers 403.
+  artifactMemberPath(member, ...rest) {
+    return ['/api/v1/artifact-members', encodeURIComponent(member), ...rest.map(encodeURIComponent)].join('/');
+  }
+
+  listArtifactMembers({ signal } = {}) {
+    return this.request('/api/v1/artifact-members', { signal });
+  }
+
+  getArtifactMember(member, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member), { signal });
+  }
+
+  listArtifactMemberLinks({ audience, state, signal } = {}) {
+    const query = new URLSearchParams();
+    if (audience) query.set('audience', audience);
+    if (state) query.set('state', state);
+    const text = query.toString();
+    return this.request(`/api/v1/artifact-members/links${text ? `?${text}` : ''}`, { signal });
+  }
+
+  /** `limits` holds any of max_artifact_bytes / max_member_bytes / max_artifacts; null clears an override. */
+  setArtifactMemberLimits(member, limits, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member, 'limits'), { method: 'POST', body: limits, signal });
+  }
+
+  setArtifactMemberSharing(member, enabled, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member, 'sharing'), { method: 'POST', body: { enabled }, signal });
+  }
+
+  revokeArtifactMemberShare(member, shareId, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member, 'shares', shareId, 'revoke'), { method: 'POST', body: {}, signal });
+  }
+
+  /** Permanent: `confirm` must repeat the artifact id exactly. */
+  purgeArtifactMemberArtifact(member, artifactId, confirm, { signal } = {}) {
+    return this.request(this.artifactMemberPath(member, 'artifacts', artifactId, 'purge'), { method: 'POST', body: { confirm }, signal });
   }
 
   /** Annotations on an artifact's shares (owner view): one page, newest first; pass the returned `next` as `before`. */
@@ -474,6 +537,10 @@ export class HerdrClient {
 
   schedulerPlan(request, { signal } = {}) {
     return this.request('/api/v1/scheduler/plan', { method: 'POST', body: request, signal });
+  }
+
+  schedulerSetHostPolicy(request, { signal } = {}) {
+    return this.request('/api/v1/scheduler/host-policy', { method: 'POST', body: request, signal });
   }
 
   // -- missions -----------------------------------------------------------

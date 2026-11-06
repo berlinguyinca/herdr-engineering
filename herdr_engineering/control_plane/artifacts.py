@@ -6,6 +6,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import tempfile
 import uuid
 from collections.abc import Sequence
@@ -17,10 +18,14 @@ from typing import Any
 from . import ids
 from .artifact_context import ArtifactContextMixin
 from .artifact_lifecycle import ArtifactLifecycleMixin
+from .artifact_members import is_member_principal
 from .artifact_merge import FileConflict, merge_manifests
 from .artifact_provenance import ProvenanceError, context_links, normalize_origin
 from .artifact_uploads import ArtifactUploadMixin
 from .rustfs import IntegrityError, RustFSClient
+
+OPERATOR_MEMBER_PERMISSIONS = frozenset({"read", "share"})
+_OPERATOR_PRINCIPAL = re.compile(r"^api-key:[0-9a-f]{16}:operator$")
 
 __all__ = ["ArtifactStore", "ArtifactError", "ArtifactConflict", "ArtifactMergeConflict", "IntegrityError"]
 
@@ -79,6 +84,11 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
     def __init__(self, conn: Any, rustfs: RustFSClient):
         self._conn = conn
         self._rf = rustfs
+
+    @property
+    def rustfs(self) -> RustFSClient:
+        """The object store this registry reads and writes (the share bundle builder streams from it)."""
+        return self._rf
 
     async def register_logical(self, *, original_filename: str,
                                artifact_type: str = "other",
@@ -481,6 +491,11 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
                 try:
                     # one savepoint: a failed check leaves neither scoped blob rows nor a version behind
                     async with _transaction(self._conn):
+                        # every digest this transaction will lock, in ONE sorted pass: the registrations and
+                        # commit_version each lock on their own, and a purge locks the same digests in sorted order
+                        await self._lock_digests_shared(
+                            [e["storage_key"] for e in registrations]
+                            + [e.get("storage_key") or e.get("blob_sha256") for e in merge.files])
                         for entry in registrations:
                             await self.register_report_blob(
                                 artifact_id, storage_key=entry["storage_key"], sha256=entry["sha256"],
@@ -622,7 +637,8 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         return {**entry, "name": name, "media_type": media_type, "storage_key": key, "sha256": digest,
                 "size_bytes": len(data)}
 
-    async def report_permission(self, artifact_id: str, principal_id: str, permission: str) -> bool:
+    async def report_permission(self, artifact_id: str, principal_id: str, permission: str, *,
+                                operator_member: bool = True) -> bool:
         """Private report operations use durable owner/grant authority, not a guessed context."""
         if not principal_id or permission not in {"read", "edit", "review", "share", "admin"}:
             return False
@@ -631,6 +647,8 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         if artifact is None or artifact.get("lifecycle") == "tombstoned":
             return False            # a deleted artifact is invisible and read-only to everyone; the owner restores it first
         if artifact.get("created_by") == principal_id:
+            return True
+        if operator_member and await self.operator_member_access(artifact_id, principal_id, permission):
             return True
         grant = await self._conn.fetchrow(
             "SELECT permissions FROM artifact_acl WHERE artifact_id=$1 AND principal_id=$2 "
@@ -641,6 +659,21 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
         if isinstance(permissions, str):
             permissions = json.loads(permissions)
         return permission in permissions or "admin" in permissions
+
+    async def operator_member_access(self, artifact_id: str, principal_id: str, permission: str) -> bool:
+        """Plan 5 D4: an operator API key may ``read`` and ``share`` (never edit or commit) a member-owned artifact
+        that is not tombstoned (``share`` only while it is active), so the generic share routes work on member content. ``principal_id`` is the
+        server-derived ``api-key:<hash>:operator``; a member or collab principal never matches. The open
+        listener's ``open-listener`` principal does not match either, but a deployment with NO api keys makes every
+        caller an operator by role, so members must not be enabled without api keys (``fleet-config check`` refuses it)."""
+        if permission not in OPERATOR_MEMBER_PERMISSIONS or not _OPERATOR_PRINCIPAL.fullmatch(principal_id or ""):
+            return False
+        row = await self._conn.fetchrow(
+            "SELECT created_by, lifecycle FROM artifacts WHERE artifact_id=$1", artifact_id)
+        if not row or not is_member_principal(row["created_by"]):
+            return False
+        # share needs live content (no fresh links on what the member deleted or archived); read stays for inspection
+        return row["lifecycle"] == "active" if permission == "share" else row["lifecycle"] != "tombstoned"
 
     async def _validate_existing_blob_scope(self, artifact_id, reference, **metadata):
         # Inspect the actual reference, never the caller's optional SHA metadata:
@@ -990,8 +1023,9 @@ class ArtifactStore(ArtifactContextMixin, ArtifactUploadMixin, ArtifactLifecycle
             "(a.created_by=$2 OR EXISTS (SELECT 1 FROM artifact_acl acl "
             "WHERE acl.artifact_id=a.artifact_id AND acl.principal_id=$2 "
             "AND (acl.expires_at IS NULL OR acl.expires_at > now()) "
-            "AND (acl.permissions ? 'read' OR acl.permissions ? 'admin'))) ",
-            artifact_id, principal_id)
+            "AND (acl.permissions ? 'read' OR acl.permissions ? 'admin')) "
+            "OR (a.created_by LIKE 'member:%' AND a.lifecycle <> 'tombstoned' AND $2 ~ $3)) ",
+            artifact_id, principal_id, _OPERATOR_PRINCIPAL.pattern)
         return self._row(row)
 
     async def materialize_version(self, version_id: str, *, host_id: str,

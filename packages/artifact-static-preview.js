@@ -1,10 +1,10 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 
-// Dashboard previews without frames. Rendered foreign markup is the server's nh3 copy (scripts, frames, forms and
+// Dashboard previews without frames (the one exception, a sandboxed report page, lives in artifact-rich-view.js). Rendered foreign markup is the server's nh3 copy (scripts, frames, forms and
 // event handlers are gone) and is placed inside an open shadow root under a paint-contained wrapper. PDFs are drawn on
 // canvases by the vendored pdf.js. The raw file is only reachable through the sandboxed live route in a new tab.
 
-export const STATIC_NOTE = 'Scripts, frames and embedded media are not shown in this static copy';
+export const STATIC_NOTE = 'Scripts, frames, audio and video are not shown in this static copy';
 export const PDF_FAILED = 'This PDF could not be drawn';
 const PDFJS_MODULE = '/vendor/pdfjs/pdf.min.mjs';
 const PDFJS_WORKER = '/vendor/pdfjs/pdf.worker.min.mjs';
@@ -19,7 +19,7 @@ export const isKeptHref = href => typeof href === 'string' && KEPT_HREF.test(hre
  * (position: fixed on the shadow host included) can paint outside it; the shadow root is on an inner element.
  * Links that are not absolute are unwrapped so a fragment link can never drive the SPA's hash router.
  */
-export function mountStaticHtml(container, html, { label = 'Static preview', document: doc = globalThis.document } = {}) {
+export function mountStaticHtml(container, html, { label = 'Static preview', document: doc = globalThis.document, theme } = {}) {
   const note = doc.createElement('p');
   note.className = 'hd-note';
   note.setAttribute('data-static-note', '');
@@ -30,6 +30,10 @@ export function mountStaticHtml(container, html, { label = 'Static preview', doc
   wrapper.setAttribute('aria-label', label);
   wrapper.setAttribute('style', 'contain:paint;overflow:auto;max-height:640px');
   const host = doc.createElement('div');
+  // The dashboard's own theme (data-theme on the document root) drives the copy's light/dark; the copy's stylesheet
+  // reads data-theme on its shadow host and falls back to the OS scheme when it is absent.
+  const forced = theme ?? doc.documentElement?.getAttribute('data-theme');
+  if (forced === 'light' || forced === 'dark') host.setAttribute('data-theme', forced);
   wrapper.append(host);
   container.replaceChildren(note, wrapper);
   // The declarative template element does not attach through innerHTML, so the root is attached imperatively.

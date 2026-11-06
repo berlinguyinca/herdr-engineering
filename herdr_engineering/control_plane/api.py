@@ -47,11 +47,15 @@ from .work_graph_service import handle as work_graph_handle
 
 log = logging.getLogger(__name__)
 
+
+class TombstoneUnavailable(Exception):
+    """The tombstone cache could not be refreshed within its staleness window: the request answers the fixed 503."""
+
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
 # The per-host worker that runs full /summary reports where the session records live (ingest role).
-_HOST_REPORT = re.compile(r"^/api/v1/host/summary-reports/(?:claim|result|publish)$")
+_HOST_REPORT = re.compile(r"^/api/v1/host/(?:summary-reports/(?:claim|result|publish)|build-cache/report)$")
 # Terminal broker, host side: the relay's output POST (per-host token like the fleet routes, never an API key).
 _HOST_TERMINAL_OUT = re.compile(r"^/api/v1/host/terminal/[^/]+/output$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
@@ -309,12 +313,12 @@ class ControlPlaneServer:
                  request_workers=128, request_queue=256, single_operator=False,
                  assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
-                 scheduler_admission=False, scheduler_limits=None, skill_registry=None,
+                 scheduler_admission=False, scheduler_limits=None, skill_registry=None, build_cache=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
-                 share_store=None, shares_root=None, share_settings=None, annotation_store=None,
+                 share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
-                 assistant_workers=None, assistant_judge=None, assistant_slack=None):
+                 assistant_workers=None, assistant_judge=None, assistant_slack=None, member_web=None):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -451,6 +455,8 @@ class ControlPlaneServer:
         self.share_store = share_store
         self.shares_root = shares_root
         self.share_settings = share_settings
+        # Operator controls for member-owned artifacts (a SyncArtifactAdapter over MemberAdmin): absent -> 503.
+        self.member_admin = member_admin
         # Owner annotation API (list/dismiss): a SyncArtifactAdapter over AnnotationStore, or the routes answer 503.
         self.annotation_store = annotation_store
         # Key digests allowed to delete/purge/restore artifacts (control_plane.artifact_delete.owner_key_digests).
@@ -488,6 +494,9 @@ class ControlPlaneServer:
         self.skills, self.skill_transfer = build_skill_registry(
             skill_registry, artifact_store=artifact_store, rustfs=rustfs, acl=artifact_acl,
             record_event=repo.record_event)
+        # control_plane.build_cache (flag off by default: nothing is constructed and the routes answer 404).
+        from .build_cache_routes import build_build_cache
+        self.build_cache = build_build_cache(build_cache, record_event=repo.record_event)
         from .handoffs import HandoffRegistry
         self.handoffs = handoff_registry or HandoffRegistry(repo)
         from .scheduler_service import SchedulerService
@@ -610,6 +619,7 @@ class ControlPlaneServer:
             self.assistant.host_candidates = lambda: (
                 self.collab.assistant_runtime_host_candidates() if self.collab is not None else [])
         self.collab_require_https = collab_require_https
+        self.member_web = member_web          # member_web.MemberWeb or None: the member host's web API (Task 11)
         # ADR-0008 P2: signed read-only export endpoints (/api/v1/federation/*). Inert unless the hot YAML switches
         # `control_plane.federation` on; the gateway is rebuilt if `collab` is swapped (tests do).
         self.federation_source = federation_source
@@ -712,6 +722,7 @@ class ControlPlaneServer:
         self.intelligence.single_operator_fn = lambda: self.single_operator
         if self.rakazo is not None:
             self.rakazo.agents.repo = self.repo
+            self.rakazo.apps_fn = lambda: self.apps
             self.rakazo.terminal.repo = self.repo
             self.rakazo.desk.routes = self.intelligence      # board proposals as phone cards (scope: assistant_viewers)
             self.intelligence.board.on_new = self.rakazo.notify_proposal      # and as push notifications
@@ -1609,6 +1620,8 @@ class ControlPlaneServer:
             caps.append("unified_workspace_v1")
         if getattr(self, "skills", None) is not None:
             caps.append("skill_registry_v1")
+        if getattr(self, "build_cache", None) is not None:
+            caps.append("build_cache_v1")
         try:
             if self.deployment_definitions.status()["configured"]:
                 caps.append("deployments_v1")     # the read-only Deployments page
@@ -1743,6 +1756,7 @@ class ControlPlaneServer:
                 try:
                     collab.sweep_team_roles()
                     collab.sweep_coordinators()
+                    collab.sweep_direct()
                     interval = collab.team_roles_cfg()["sweep_interval_seconds"]
                 except Exception as exc:                        # noqa: BLE001 - a sweep failure must never stop the loop
                     log.warning("team roles sweep failed: %s", type(exc).__name__)
@@ -2003,6 +2017,8 @@ def _make_handler(server, public=False, operator=False):
                             supplied[0].encode(), server.ci_fix_config["agent_api_key"].encode()):
                         return "agent"
                     return None
+                # With no api keys EVERY caller on this listener is the operator, including for member-owned
+                # artifacts (D4); members therefore require api keys (fleet-config check refuses otherwise).
                 # open — only reachable via loopback or an explicit --allow-open
                 # (Tailnet trust boundary); the fail-closed guard enforces this
                 return "operator"
@@ -2067,9 +2083,10 @@ def _make_handler(server, public=False, operator=False):
             digest = hashlib.sha256(supplied.encode()).hexdigest()[:16]
             return f"api-key:{digest}:{self._role() or 'local'}"
 
-        def _artifact_version_allowed(self, artifact_id, version_id, permission):
-            """Permission on the artifact AND the version must belong to it (registry-backed only)."""
-            if not self._artifact_allowed(artifact_id, permission):
+        def _artifact_version_allowed(self, artifact_id, version_id, permission, *, operator_member=True):
+            """Permission on the artifact AND the version must belong to it (registry-backed only).
+            ``operator_member=False`` withholds the plan 5 D4 operator grant (publications never reach member content)."""
+            if not self._artifact_allowed(artifact_id, permission, operator_member=operator_member):
                 return False
             if server.artifact_store is None:
                 return True
@@ -2088,22 +2105,34 @@ def _make_handler(server, public=False, operator=False):
             if server.artifact_store is None or not artifact_id:
                 return False
             if permission == "read":
-                return server.tombstone_cache.contains(
-                    artifact_id, lambda: self._artifact_call("tombstoned_ids"))
+                try:
+                    return server.tombstone_cache.contains(
+                        artifact_id, lambda: self._artifact_call("tombstoned_ids"))
+                except Exception as exc:        # noqa: BLE001 - fail closed: no fresh answer, nothing is served
+                    log.exception("tombstone cache unavailable")
+                    raise TombstoneUnavailable() from exc
             return self._artifact_call("lifecycle_of", artifact_id) == "tombstoned"
 
-        def _artifact_allowed(self, artifact_id, permission):
+        def _artifact_allowed(self, artifact_id, permission, *, operator_member=True):
             if server.artifact_acl is None:
                 return not self._artifact_is_deleted(artifact_id, permission)
             if self._artifact_acl_allows(artifact_id, permission):
                 # only an ACL-authorized caller reaches the store: an unauthorized read must never touch it
                 return not self._artifact_is_deleted(artifact_id, permission)
+            # Plan 5 D4: an operator key reads and shares (never edits) member-owned artifacts. Gated on the operator
+            # principal first, so any other unauthorized read still never reaches the store.
+            if (operator_member and permission in ("read", "share") and server.artifact_store is not None and artifact_id
+                    and self._resource_principal().endswith(":operator")
+                    and self._artifact_call("operator_member_access", artifact_id, self._resource_principal(),
+                                            permission)):
+                return True
             # Versioned-registry artifacts (native reports) are also private to their
             # durable owner and grants, which the registry itself records. Reads stay
             # ACL-only: an unauthorized read must never reach the store.
+            extra = {} if operator_member else {"operator_member": False}
             return bool(permission != "read" and server.artifact_store is not None
                         and artifact_id and self._artifact_call(
-                "report_permission", artifact_id, self._resource_principal(), permission))
+                "report_permission", artifact_id, self._resource_principal(), permission, **extra))
 
         def _artifact_acl_allows(self, artifact_id, permission):
             principal = self._resource_principal()
@@ -2184,6 +2213,18 @@ def _make_handler(server, public=False, operator=False):
             """Everything not on the allow-list is a plain 404: the legacy API, the
             dashboard and its static files do not exist on this listener."""
             path = self.path.split("?")[0]
+            mw = server.member_web
+            if mw is not None:
+                # The member host (exactly one Host header naming it) is served by the member web API alone; on any
+                # other Host its API paths do not exist.
+                if mw.owns(self):
+                    cl = self.headers.get_all("Content-Length") or []
+                    if (len(cl) > 1 or "Transfer-Encoding" in self.headers
+                            or (self.command == "GET" and cl and cl[0].strip() not in ("", "0"))):
+                        return self._deny(400, "ambiguous request framing")
+                    return mw.handle(self)
+                if path.startswith("/api/member/") or self.command == "PUT":
+                    return self._deny(404, "not found")
             # Request framing must be unambiguous: the edge and this server must agree where a
             # request ends, or a pipelined second request could be smuggled behind the first.
             cl = self.headers.get_all("Content-Length") or []
@@ -2270,7 +2311,8 @@ def _make_handler(server, public=False, operator=False):
         def handle_expect_100(self):
             """``Expect: 100-continue`` on POST /mcp is answered only after the large-body gate has decided (see
             ``_continue_100``); inviting the body first would defeat the pre-authentication gate."""
-            if self.command == "POST" and self.path.split("?")[0] == "/mcp":
+            if (self.command == "POST" and self.path.split("?")[0] == "/mcp") or (
+                    self.command == "PUT" and public and self.path.startswith("/api/member/")):
                 self._expect_100_pending = True
                 return True
             return super().handle_expect_100()
@@ -2387,6 +2429,9 @@ def _make_handler(server, public=False, operator=False):
             self._request_cause = None
             try:
                 return dispatch()
+            except TombstoneUnavailable as exc:
+                self._request_cause = type(exc).__name__
+                return self._json({"error": "artifact store unavailable"}, 503)
             except Exception as exc:
                 # A client closing while we write a dependency error must not
                 # replace the already-recorded reason that the request failed.
@@ -2598,6 +2643,8 @@ def _make_handler(server, public=False, operator=False):
         def do_PUT(self):
             # PUT exists only for assistant-apps (client credentials, blocked calendars); everything else keeps its flat
             # 501, decided before any listener-specific handler (operator/public/federation/collab) sees the request.
+            if public and server.member_web is not None and self.path.startswith("/api/member/"):
+                return self._timed_request(self._public)      # the member run upload (only on the member host)
             if operator or public or not self.path.startswith("/api/v1/assistant-apps/"):
                 return self._timed_request(lambda: self._send_json(501, {"error": "not implemented"}))
             return self._timed_request(self._mutate_verb)
@@ -3096,6 +3143,9 @@ def _make_handler(server, public=False, operator=False):
             if self._rate_limit():
                 return None
             try:
+                from .artifact_members_api import route_members
+                if route_members(self, server, parts, resource):
+                    return None
                 from .artifact_delete_api import route_delete
                 if route_delete(self, server, parts, resource):
                     return None
@@ -3120,6 +3170,9 @@ def _make_handler(server, public=False, operator=False):
                     return None
                 from .skill_routes import route_skills
                 if route_skills(self, server, parts, resource):
+                    return None
+                from .build_cache_routes import route_build_cache
+                if route_build_cache(self, server, parts, resource):
                     return None
                 if self.command == "GET":
                     return self._api_get(parts, resource)
@@ -3152,6 +3205,9 @@ def _make_handler(server, public=False, operator=False):
             except ArtifactError as exc:
                 return self._send_json(404 if str(exc).startswith("no artifact") else 400,
                                        {"error": str(exc)})
+            except TombstoneUnavailable as exc:
+                self._request_cause = type(exc).__name__
+                return self._send_json(503, {"error": "artifact store unavailable"})
             except RuntimeError as exc:
                 self._request_cause = type(exc).__name__
                 if resource == 'events':
@@ -3467,7 +3523,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"handoffs": server.handoffs.list(state=_q(self.path, "state"))})
             if resource == "scheduler":
                 if len(parts) == 4:
-                    return self._json(server.scheduler.overview())
+                    return self._json({**server.scheduler.overview(), "admission_enabled": server.scheduler_admission})
                 if parts[4:] == ["queue"]:
                     return self._json({"queue": server.scheduler.overview()["queue"]})
                 return self._json({"error": "not found"}, 404)
@@ -3649,6 +3705,14 @@ def _make_handler(server, public=False, operator=False):
                     return self._json({"error": "not configured"}, 404)
             if resource == "ai-sync" and len(parts) == 4:
                 return self._etag_json({"hosts": r.list_ai_sync(_q(self.path, "host_id"))})
+            if resource == "fleet-rollouts" and len(parts) in (4, 5):
+                if len(parts) == 4:
+                    return self._etag_json({"rollouts": r.list_fleet_rollouts(
+                        min(max(_qint(self.path, "limit", 50), 1), 200), _q(self.path, "repo"))})
+                if parts[4] == "versions":
+                    return self._etag_json(r.fleet_rollout_versions())
+                found = r.get_fleet_rollout(parts[4])
+                return self._etag_json(found) if found else self._json({"error": "not found"}, 404)
             if resource == "hosts":
                 if len(parts) > 5 and parts[5] == "telemetry":
                     rng = _q(self.path, "range")
@@ -3777,6 +3841,12 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(version) if version else self._json({"error": "not found"}, 404)
             if resource == "artifacts" and server.artifact_review_manager is not None:
                 if len(parts) == 6 and parts[5] == "reviews":
+                    # without an ACL the registry decides (like the versions routes); with one, the blanket guard above already did
+                    # (legacy uploads have no registry row). No answer reveals that the artifact exists
+                    if (server.artifact_store is not None and server.artifact_acl is None
+                            and not self._artifact_call(
+                            "report_permission", parts[4], self._resource_principal(), "read")):
+                        return self._json({"error": "not found"}, 404)
                     return self._json({"artifact_id": parts[4],
                                        "reviews": server.artifact_review_manager.list_for_artifact(parts[4])})
             if resource == 'artifacts' and len(parts) == 6 and r.get_artifact(parts[4]):
@@ -4137,7 +4207,8 @@ def _make_handler(server, public=False, operator=False):
             if resource == "publications" and server.publication_controller is not None:
                 if len(parts) == 5 and parts[4] == "requests":
                     body = self._read_json() or {}
-                    if not self._artifact_version_allowed(body.get('resource_id', ''), body.get('version_id'), 'share'):
+                    if not self._artifact_version_allowed(body.get('resource_id', ''), body.get('version_id'), 'share',
+                                                       operator_member=False):
                         return self._artifact_forbidden()
                     return self._json(server.publication_controller.request(
                         resource_id=body.get("resource_id"), version_id=body.get("version_id"),
@@ -4149,7 +4220,8 @@ def _make_handler(server, public=False, operator=False):
                     if publication is None:
                         return self._json({'error': 'not found'}, 404)
                     if not self._artifact_version_allowed(
-                            publication['resource_id'], publication['pinned_version_id'], 'share'):
+                            publication['resource_id'], publication['pinned_version_id'], 'share',
+                            operator_member=parts[5] == "revoke"):
                         return self._artifact_forbidden()
                     if parts[5] == "approve":
                         result = server.publication_controller.approve(parts[4], approver=self._resource_principal())
@@ -4189,8 +4261,8 @@ def _make_handler(server, public=False, operator=False):
                             return self._json({"error": "host not found"}, 404)
                         updated = r.set_host_policy(host["host_id"], mode=body.get("mode"),
                                                     expected_revision=body.get("expected_revision"),
-                                                    allow_tags=body.get("allow_tags", ()),
-                                                    deny_tags=body.get("deny_tags", ()),
+                                                    allow_tags=body.get("allow_tags"),
+                                                    deny_tags=body.get("deny_tags"),
                                                     reason=body.get("reason"))
                         return self._json(updated)
                 except KeyError:
@@ -4400,7 +4472,8 @@ def _make_handler(server, public=False, operator=False):
                     r.upsert_custom_model(body.get("name"), body.get("base_url"),
                                           body.get("upstream_model"), body.get("project"),
                                           fabric_model=body.get("fabric_model"),
-                                          context_window=body.get("context_window", 8192))
+                                          context_window=body.get("context_window", 8192),
+                                          fallback_models=body.get("fallback_models"))
                     return self._json({"ok": True})
                 if what == "models" and len(parts) == 7 and parts[6] == "delete":
                     r.delete_custom_model(parts[5])

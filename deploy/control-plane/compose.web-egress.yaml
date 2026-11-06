@@ -1,0 +1,24 @@
+# Explicit opt-in only. Not loaded by deploy.sh until route proof and review.
+# Host-input permission only: this is not outbound confinement or an SNI policy.
+name: herdr-control-plane
+services:
+  control-plane-web:
+    networks:
+      default:
+        gw_priority: 0
+      web-egress:
+        gw_priority: 100
+networks:
+  default: {}
+  web-egress:
+    name: herdr-control-plane_web-egress
+    driver: bridge
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: br-herdr-cp-eg
+    labels:
+      io.herdr.web-egress.policy: v1
+      io.herdr.web-egress.generation: ${HERDR_CP_WEB_EGRESS_GENERATION:?private egress transaction required}
+    ipam:
+      config:
+        - subnet: ${HERDR_CP_WEB_EGRESS_CIDR:-172.31.252.0/29}

@@ -21,6 +21,8 @@ import re
 from collections.abc import Callable
 from typing import Any
 
+from .artifact_members import is_member_principal
+
 MIN_HOLD_DAYS = 1.0
 DEFAULT_HOLD_DAYS = 30.0
 MAX_BULK = 200
@@ -226,10 +228,19 @@ class ArtifactLifecycleMixin:
         """Serialise purge decisions on one content digest for the rest of the transaction."""
         await self._conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", self._digest_of(key))
 
+    async def _lock_digests(self, keys: list[str]) -> None:
+        """Exclusive digest locks for several keys, always in sorted digest order (the order every shared taker uses):
+        two transactions over overlapping digest sets then queue instead of deadlocking."""
+        # sorted by digest text, not by the lock's hash key: every taker uses this order, and two digests whose hashes
+        # collide in a way that inverts it are a theoretical concern only
+        for digest in sorted({self._digest_of(k) for k in keys if k}):
+            await self._conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", digest)
+
     async def _lock_digests_shared(self, keys: list[str]) -> None:
         """Writers of a reference to content-addressed bytes call this inside their committing transaction, then
         re-check the object exists. It excludes a concurrent purge sweep (exclusive lock on the same digest) until the
         reference commits, after which the sweep sees the reference and keeps the bytes."""
+        # sorted by digest text, not by the lock's hash key (see _lock_digests)
         for digest in sorted({self._digest_of(k) for k in keys if k}):
             await self._conn.execute("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))", digest)
 
@@ -247,6 +258,7 @@ class ArtifactLifecycleMixin:
         for row in rows:
             artifact_id = row["artifact_id"]
             async with _transaction(self._conn):
+                await self._lock_owner_usage(artifact_id)
                 locked = await self._conn.fetchrow(
                     "SELECT lifecycle, legal_hold, purge_after FROM artifacts WHERE artifact_id=$1 FOR UPDATE",
                     artifact_id)
@@ -256,6 +268,14 @@ class ArtifactLifecycleMixin:
             purged["deleted"], purged["warning"] = await self._drain_after_commit(purged["queued"])
             results.append({k: v for k, v in purged.items() if k != "queued"})
         return results
+
+    async def _lock_owner_usage(self, artifact_id: str) -> None:
+        """A member owner's usage row is locked BEFORE the artifact row (publish takes them in that order), so the
+        ``settle`` at the end of a purge cannot deadlock against a publish."""
+        owner = await self._conn.fetchval("SELECT created_by FROM artifacts WHERE artifact_id=$1", artifact_id)
+        if is_member_principal(owner):
+            from .artifact_member_quota import _lock_usage
+            await _lock_usage(self._conn, owner)
 
     async def _purge_locked(self, artifact_id: str, *, actor: str, reason: str, request_key: str | None = None,
                             extra: dict | None = None) -> dict:
@@ -276,8 +296,8 @@ class ArtifactLifecycleMixin:
         normalised = {canonical for canonical in map(self._canonical_key, keys) if canonical}
         # the purge event comes first: _key_shared must already see this artifact as purged only after commit, so the
         # decision below excludes it explicitly
+        await self._lock_digests(sorted(normalised))
         for key in sorted(normalised):
-            await self._lock_digest(key)
             if await self._key_shared(artifact_id, key):
                 retained.append(key)
             else:
@@ -298,7 +318,64 @@ class ArtifactLifecycleMixin:
             "request_key, detail) VALUES ($1,'purge','tombstoned','tombstoned',$2,$3,$4,$5::jsonb)",
             artifact_id, actor, reason, request_key,
             json.dumps({"queued_delete": queued, "retained_shared": retained, **(extra or {})}))
+        owner = await self._conn.fetchval("SELECT created_by FROM artifacts WHERE artifact_id=$1", artifact_id)
+        if is_member_principal(owner):
+            await self._anonymise_member_data(artifact_id)
+            from .artifact_member_quota import settle
+            await settle(self._conn, owner)
         return {"artifact_id": artifact_id, "queued": queued, "deleted": [], "retained_shared": retained}
+
+    async def _anonymise_member_data(self, artifact_id: str) -> None:
+        """Per-member data tied to a purged artifact: the recipients and titles of its links, the free-text detail of
+        its member audit rows and its access grants. The rows (who did what, when) remain; nothing identifying does."""
+        await self._conn.execute(
+            "UPDATE artifact_shares SET allow_emails='{}', allow_groups='{}', title=NULL, entry=NULL"
+            " WHERE artifact_id=$1",
+            artifact_id)
+        await self._conn.execute(
+            "UPDATE artifact_member_events SET detail='{}'::jsonb WHERE artifact_id=$1", artifact_id)
+        await self._conn.execute("DELETE FROM artifact_acl WHERE artifact_id=$1", artifact_id)
+        # Personal data collected through the artifact's links: comment text and author identity, the viewers recorded
+        # on opened/denied events (the rows stay, so the audit trail of what happened does), staged upload names, and
+        # the artifact's own title and filename.
+        # The anchor keeps its structural keys (file, offsets) but loses the text quoted from the report.
+        await self._conn.execute(
+            "UPDATE artifact_annotations SET body='[removed]', author_identity='[removed]', author_email='[removed]',"
+            " file_name='[removed]', resolved_by=NULL, anchor=(anchor - 'exact' - 'prefix' - 'suffix')"
+            " WHERE artifact_id=$1", artifact_id)
+        # Every share event whose actor is not one of our own principals (a member or an api key, i.e. the owner or an
+        # operator) names a viewer: opened, denied and the annotation kinds alike. Cleared by actor, not by kind.
+        await self._conn.execute(
+            "UPDATE artifact_share_events SET actor='[removed]', detail='{}'::jsonb"
+            " WHERE actor NOT LIKE 'member:%' AND actor NOT LIKE 'api-key:%' AND actor <> '[removed]'"
+            " AND share_id IN (SELECT share_id FROM artifact_shares WHERE artifact_id=$1)", artifact_id)
+        # Third-party feedback on the report: text and author go, the rows (that feedback was given) stay; the
+        # owner's own feedback is kept. artifact_annotation_ops holds only ingest keys and ids, nothing personal.
+        await self._conn.execute("SET LOCAL herdr.purge_redaction = 'on'")
+        await self._conn.execute(
+            "UPDATE artifact_report_feedback SET body='[removed]', actor='[removed]' WHERE artifact_id=$1"
+            " AND actor IS DISTINCT FROM (SELECT created_by FROM artifacts WHERE artifact_id=$1)", artifact_id)
+        # The file names in each version's manifest and the commit message / entry file in its provenance name the
+        # same things the columns above did. storage_key and sha256 stay: _key_shared and the audit trail need them.
+        await self._conn.execute(
+            "UPDATE artifact_versions SET"
+            " output_manifest=CASE WHEN jsonb_typeof(output_manifest)='array' THEN (SELECT coalesce(jsonb_agg("
+            "  CASE WHEN jsonb_typeof(e)='object' AND e ? 'name' THEN jsonb_set(e, '{name}', '\"[removed]\"') ELSE e END"
+            "  ORDER BY o), '[]'::jsonb) FROM jsonb_array_elements(output_manifest) WITH ORDINALITY AS t(e, o))"
+            "  ELSE output_manifest END,"
+            " provenance=(provenance - 'message' - 'entry')"
+            "   || CASE WHEN provenance ? 'message' THEN jsonb_build_object('message', '[removed]') ELSE '{}'::jsonb END"
+            "   || CASE WHEN provenance ? 'entry' THEN jsonb_build_object('entry', '[removed]') ELSE '{}'::jsonb END"
+            " WHERE artifact_id=$1", artifact_id)
+        await self._conn.execute("SET LOCAL herdr.purge_redaction = 'off'")
+        await self._conn.execute("UPDATE artifact_collab_uploads SET name='[removed]' WHERE artifact_id=$1", artifact_id)
+        # collaborator merge attempts carry the file names of their conflicts and a free-text message
+        await self._conn.execute(
+            "UPDATE artifact_collab_attempts SET message=CASE WHEN message IS NULL THEN NULL ELSE '[removed]' END,"
+            " conflict_names='[]'::jsonb WHERE artifact_id=$1", artifact_id)
+        await self._conn.execute(
+            "UPDATE artifacts SET display_name=NULL, original_filename='[removed]' WHERE artifact_id=$1", artifact_id)
+
 
     async def drain_pending_deletes(self, keys: list[str] | None = None, *, limit: int = 100) -> list[str]:
         """Delete queued objects (all, or just ``keys``), re-checking at delete time that nothing references them any
@@ -386,6 +463,7 @@ class ArtifactLifecycleMixin:
                "deleted": [], "retained_shared": [], "warning": None}
         refusal = None
         async with _transaction(self._conn):
+            await self._lock_owner_usage(artifact_id)
             row = await self._conn.fetchrow(
                 "SELECT lifecycle, legal_hold, purge_after FROM artifacts WHERE artifact_id=$1 FOR UPDATE",
                 artifact_id)

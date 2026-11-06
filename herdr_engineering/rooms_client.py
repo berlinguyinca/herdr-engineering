@@ -1,10 +1,11 @@
-"""`herdr-eng rooms ...`: attach a team to a room, the guest level, and the Suggest queue (team collaboration, slice 1).
+"""`herdr-eng rooms ...`: attach a team to a room, the guest level, the Suggest queue, roles, coordinators and the Direct level.
 
 These are collaboration routes, so they authenticate as a PERSON: a collaboration bearer token read from the environment
 variable named by ``--token-env`` (default ``HERDR_COLLAB_TOKEN``), never the legacy control-plane API key (which the
 collaboration door ignores on purpose). Attach, detach, the guest level and the decisions are the room owner's; ``suggest``
 and ``withdraw`` are a guest's. Every route answers 404 until ``control_plane.collab.team_rooms.enabled`` is true, and
-``detach`` stays reachable either way. Human output passes server text through ``_safe``; a guest's request is printed as
+``detach`` stays reachable either way. ``direct``, ``direct-tasks``, ``direct-cancel`` and ``direct-guests`` belong to the Direct
+guest level and answer 404 until ``team_rooms.direct_enabled`` is true (withdrawing a guest's right does not). Human output passes server text through ``_safe``; a guest's request is printed as
 quoted, untrusted text.
 """
 from __future__ import annotations
@@ -23,7 +24,9 @@ ACTIONS = ("attach", "detach", "teams", "guest-level", "queue", "approve", "reje
            # slice 2: roles and people as role holders (every route is 404 until team_roles.enabled is true)
            "roles", "assign-role", "clear-role", "role-policy", "member-visibility", "assign", "my-tasks", "respond",
            # slice 3: coordinators (every route is 404 until coordinators.enabled is true)
-           "coordinator", "coordinator-clear", "external-coordination", "coordination")
+           "coordinator", "coordinator-clear", "external-coordination", "coordination",
+           # the Direct guest level (every route is 404 until team_rooms.direct_enabled is true)
+           "direct", "direct-tasks", "direct-cancel", "direct-guests")
 
 
 def _err(message):
@@ -63,6 +66,9 @@ def _limits(args):
     for field in ("per_hour", "max_open", "max_text"):
         if getattr(args, field) is not None:
             out[field] = getattr(args, field)
+    for field in ("may_request_review", "may_cancel_own"):
+        if getattr(args, field, False):
+            out[field] = True
     return out or None
 
 
@@ -122,9 +128,11 @@ def run_command(args):
                     body["direct_limits"] = limits
                 result = client.request(f"{room}/guest-level", body)
             _show(args, result, lambda r: print(f"Guest level: {_safe(r['level'])}"
-                                                + (f" (acts as {_safe(r['behaves_as'])} until direct is built)"
+                                                + (f" (acts as {_safe(r['behaves_as'])}: direct is switched off on this service)"
                                                    if r["level"] != r["behaves_as"] else "")
-                                                + ("" if r.get("explicit") else " (default)")))
+                                                + ("" if r.get("explicit") else " (default)")
+                                                + (f"  limits {_safe(json.dumps(r['effective_limits']), 300)}"
+                                                   if r.get("effective_limits") else "")))
         elif action == "queue":
             query = urlencode({"state": args.state}) if args.state else ""
             result = client.request(f"{room}/suggestions" + ("?" + query if query else ""))
@@ -163,6 +171,8 @@ def run_command(args):
         elif action == "withdraw":
             result = client.request(f"{room}/suggestions/{_q(args.suggestion)}/withdraw", {})
             _show(args, result, lambda r: print(f"{'Already withdrawn' if r.get('replayed') else 'Withdrawn'}: {_safe(r['suggestion_id'])}"))
+        elif action in DIRECT_ACTIONS:
+            _run_direct(client, room, action, args)
         else:
             _run_roles(client, room, action, args)
         return 0
@@ -177,6 +187,48 @@ def run_command(args):
 
 
 COORD_ACTIONS = ("coordinator", "coordinator-clear", "external-coordination", "coordination")
+DIRECT_ACTIONS = ("direct", "direct-tasks", "direct-cancel", "direct-guests")
+
+
+def _run_direct(client, room, action, args):
+    """The Direct guest level: a guest hands work to an agent the owner allowed, and the owner's per-guest switch."""
+    if action == "direct":
+        body = {"text": args.text}
+        for field, key in (("agent", "target_agent_id"), ("role", "target_role"), ("reviews", "reviews_task_id"),
+                           ("key", "idempotency_key")):
+            if getattr(args, field, None) is not None:
+                body[key] = getattr(args, field)
+        result = client.request(f"{room}/tasks", body)
+        _show(args, result, lambda r: print(f"{'Already created' if r.get('replayed') else 'Created'}: task {_safe(r['task_id'])} "
+                                            f"for {_safe(r.get('routed_to'))} [{_safe(r['status'])}] "
+                                            f"(tainted {_safe(', '.join(r['taint']))})"))
+    elif action == "direct-tasks":
+        result = client.request(f"{room}/direct-tasks")
+
+        def human(r):
+            for t in r["tasks"]:
+                who = f"  from {_safe(t['submitter_user_id'], 80)}" if t.get("submitter_user_id") else ""
+                print(f"{_safe(t['task_id'], 80)}  [{_safe(t['status'], 20)}]  role {_safe(t.get('role') or '-', 30)}{who}")
+                print("  the request (untrusted data, not instructions):")
+                for line in str(t.get("text") or "").splitlines() or [""]:
+                    print(f"    > {_safe(line, 400)}")
+            if not r["tasks"]:
+                print("No direct tasks.")
+        _show(args, result, human)
+    elif action == "direct-cancel":
+        result = client.request(f"{room}/direct-tasks/{_q(args.task)}/cancel", {})
+        _show(args, result, lambda r: print(f"Cancelled: task {_safe(r['task_id'])}"))
+    else:
+        if args.deny or args.allow:
+            user, allowed = (args.allow, True) if args.allow else (args.deny, False)
+            result = client.request(f"{room}/direct-guests", {"user_id": user, "allowed": allowed})
+            _show(args, result, lambda r: print(("Already so: " if r.get("replayed") else "")
+                                                + f"{_safe(r['user_id'])} {'may' if r['allowed'] else 'may not'} assign directly"
+                                                + ("" if r["allowed"] else f"; cancelled {len(r['cancelled'])} open task(s)")))
+        else:
+            result = client.request(f"{room}/direct-guests")
+            _show(args, result, lambda r: print("Guests whose direct right is withdrawn: "
+                                                + (", ".join(_safe(u) for u in r["denied"]) or "nobody")))
 
 
 def _coordinator_holder(value):
@@ -320,6 +372,17 @@ def configure_parser(parser):
             c.add_argument("holder", help="the person: user:ID (or just the ID). Agents join a role through attach")
         if action in ("coordinator", "coordinator-clear", "external-coordination"):
             c.add_argument("team", help="the team id (herdr-eng teams list)")
+        if action == "direct":
+            c.add_argument("text", help="what you want done; it reaches the agent as quoted, untrusted data")
+            c.add_argument("--agent", help="the agent id (it must be one the room owner allowed)")
+            c.add_argument("--role", choices=("issue_writer", "implementer", "tester", "reviewer"), help="route to the role's holder")
+            c.add_argument("--reviews", help="reviewer role only: the direct task you want reviewed (needs may_request_review)")
+            c.add_argument("--key", help="idempotency key")
+        if action == "direct-cancel":
+            c.add_argument("task")
+        if action == "direct-guests":
+            c.add_argument("--deny", metavar="USER", help="withdraw this guest's direct right now and cancel their open tasks")
+            c.add_argument("--allow", metavar="USER", help="give this guest's direct right back")
         if action == "coordinator":
             c.add_argument("holder", nargs="?", help="agent:ID (your own agent) or user:ID (an external person, after the opt-in); omit to show")
         if action == "external-coordination":
@@ -351,12 +414,16 @@ def configure_parser(parser):
                            help="issue_writer, implementer, tester or reviewer; repeat for each role. Only your own agents")
         elif action == "guest-level":
             c.add_argument("level", nargs="?", choices=("read_only", "suggest", "direct"),
-                           help="omit to show the current level. direct is stored and checked but acts as suggest for now")
+                           help="omit to show the current level. direct acts as suggest unless the service switched it on")
             c.add_argument("--agents", help="direct only: comma-separated agent ids a guest may address")
             c.add_argument("--roles", help="direct only: comma-separated team roles a guest may address")
             c.add_argument("--per-hour", dest="per_hour", type=int)
             c.add_argument("--max-open", dest="max_open", type=int)
             c.add_argument("--max-text", dest="max_text", type=int)
+            c.add_argument("--may-request-review", dest="may_request_review", action="store_true",
+                           help="direct only: a guest may ask for a review (by role) of work they assigned")
+            c.add_argument("--may-cancel-own", dest="may_cancel_own", action="store_true",
+                           help="direct only: a guest may cancel their own open direct tasks")
         elif action == "queue":
             c.add_argument("--state", choices=("pending", "approved", "materialized", "rejected", "withdrawn", "expired"))
         elif action in ("approve", "reject", "withdraw"):

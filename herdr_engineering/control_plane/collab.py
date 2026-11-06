@@ -28,7 +28,7 @@ import threading
 import time
 from collections import defaultdict
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 from urllib.parse import urlparse
 
 from ..assistant_packages import ManifestError, agent_package_record
@@ -39,6 +39,7 @@ from . import collab_models, ids, logfile_lock, placement
 from .collab_attention import AttentionMixin
 from .collab_context import ContextMixin
 from .collab_coordinators import CoordinatorsMixin
+from .collab_direct import DirectMixin
 from .collab_federation import FederationMixin
 from .collab_team_briefs import BRIEF_NOTE as _TR_BRIEF_NOTE
 from .collab_team_briefs import TeamBriefsMixin
@@ -95,7 +96,8 @@ REVOCABLE_CREATE = {"member_added": "member", "agent_granted": "grant", "agent_e
                     "egress_decided": "egress", "egress_promoted": "egress", "room_profile_set": "egress",
                     "federation_share_granted": "fedshare", "federation_peer_enabled": "fedpeer",
                     "team_attached": "teamattach", "team_role_assigned": "teamrole",
-                    "team_coordinator_set": "teamcoord", "team_external_coordination_set": "teamext"}
+                    "team_coordinator_set": "teamcoord", "team_external_coordination_set": "teamext",
+                    "room_guest_level_set": "dglevel"}
 # every event that can change what _recount() returns (the cache is cleared when one is committed)
 COUNT_EVENTS = frozenset(REVOCABLE_CREATE) | {
     "member_removed", "agent_grant_revoked", "agent_grant_expired", "agent_revoked", "join_token_revoked",
@@ -396,8 +398,17 @@ class FileEventLog:
     record = record_required
 
 
+class _GroupClaim(NamedTuple):
+    """The last accepted group claim of a user: when seen, the groups, the token's ``iat`` (None when it had none) and
+    since when the claims have continuously lacked the member group (None while they include it)."""
+    at: float
+    groups: tuple[str, ...]
+    iat: float | None
+    removed_since: float | None
+
+
 class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixin, TeamRoomsMixin, TeamRolesMixin,
-                    CoordinatorsMixin, TeamBriefsMixin):
+                    CoordinatorsMixin, TeamBriefsMixin, DirectMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -408,8 +419,27 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                  max_log_events: int = 200_000, guest_ttl: float = 7 * 24 * 3600.0,
                  default_grant_ttl: float = 30 * 24 * 3600.0,
                  approval: ApprovalPolicy | None = None, delegation_enabled: bool = False,
-                 summary_fix: dict | None = None):
+                 summary_fix: dict | None = None, member_group: str | None = None,
+                 member_groups_ttl: float = 24 * 3600.0, member_groups_path: Any = None):
         self.auth = authenticator
+        # Member-owned artifacts (plan 5): the Cognito group whose people own artifacts as ``member:<user_id>``.
+        # None = feature off here. Group claims are only seen at sign-in, so the last claims per user are kept in
+        # memory (never logged) and forgotten after ``member_groups_ttl`` seconds without a sign-in.
+        if member_group is not None and (not isinstance(member_group, str) or not member_group.strip()):
+            raise ValueError("member_group must be a non-empty string")
+        if isinstance(member_groups_ttl, bool) or not isinstance(member_groups_ttl, (int, float)) \
+                or not member_groups_ttl > 0:
+            raise ValueError("member_groups_ttl must be a positive number")
+        self.member_group = member_group
+        self.member_groups_ttl = float(member_groups_ttl)
+        self._user_groups: dict[str, _GroupClaim] = {}
+        # Last-seen claims survive a restart in a private file (0600); a claim older than the TTL is "unknown", never
+        # "removed", so a restart or a quiet day cannot look like leaving the group to the worker.
+        self._groups_path = None if member_groups_path is None else str(member_groups_path)
+        self._groups_io = threading.Lock()
+        self._groups_saved = 0.0
+        if self._groups_path is not None and member_group is not None:
+            self._load_groups()
         self._revocable: dict[str, int] = {}                   # outstanding revocable things per kind (H2), from state
         self._outstanding_key = None
         self.degraded: str | None = None     # set when the durable log failed its startup integrity check
@@ -538,6 +568,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         # plan 3: the collab-public artifact bridge (collab_artifacts.CollabArtifactBridge), wired by the server
         # when control_plane.collab_artifacts is enabled; None = no artifact tools
         self.artifact_bridge = None
+        self.member_service: Any = None     # MemberService, set by the cli wiring when a member group is configured
         self.stats = defaultdict(int)
         self._init_workbench()
         self._init_context()
@@ -641,6 +672,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             return payload.get("paused") is True          # resuming helpers is an ordinary write
         if event_type == "team_external_coordination_set" and payload is not None:
             return payload.get("enabled") is False        # turning the opt-in OFF is a revocation; ON is an ordinary write
+        if event_type == "room_guest_level_set" and payload is not None:
+            return payload.get("revokes_direct") is True  # leaving Direct is a revocation (pre-paid by setting it); other toggles are ordinary
+        if event_type == "guest_direct_set" and payload is not None:
+            return payload.get("allowed") is False        # withdrawing one guest's Direct right is a revocation
         return event_type in SAFETY_EVENTS
 
     def _creation_cost(self, event_type: str, payload: dict | None) -> int:
@@ -653,6 +688,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             return 1 if payload.get("state") == "approved" else 0
         if event_type == "team_external_coordination_set":
             return 1 if payload.get("enabled") else 0
+        if event_type == "room_guest_level_set":
+            return 1 if payload.get("level") == "direct" else 0       # only Direct has something to take back
         if event_type == "room_profile_set":
             room = self._rooms.get(payload.get("room_id")) or {}
             have = set((room.get("profile") or {}).get("permanent_hosts") or ())
@@ -797,7 +834,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
         if (self._apply_workbench(ev) or self._apply_context(ev) or self._apply_attention(ev)
                 or self._apply_federation(ev) or self._apply_team_rooms(ev) or self._apply_team_roles(ev)
-                or self._apply_coordinators(ev)):
+                or self._apply_coordinators(ev) or self._apply_direct(ev)):
             return
         if t == "external_usage_reserved":
             k = (p["scope"], p["key"])
@@ -939,6 +976,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "updated_at": p["created_at"], "seq": seq}
             self._tr2_fold_created(p["task_id"], p)
             self._tc_fold_created(p["task_id"], p)
+            self._dg_fold_created(p["task_id"], p)
             if p.get("reviews_task_id"):
                 self._tasks[p["task_id"]]["reviews"] = p["reviews_task_id"]
             if p.get("origin"):          # team rooms: written only by the server (a suggestion's approval), never by a request body
@@ -1305,6 +1343,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             raise CollabError(401, "unauthorized")
         if scheme == "Bearer":
             claims = getattr(self.auth, "verify_claims", None)
+            c = None
             if claims is not None:
                 c = claims(token)
                 got, groups = ((c["user"], c["exp"]), c["groups"]) if c else (None, [])
@@ -1316,6 +1355,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             if self.degraded:                      # only a caller with a VALID token learns that collaboration is down
                 raise CollabError(503, "collaboration is disabled; ask the operator")
             pr = Principal("user", got[0], got[0], exp=got[1])
+            if claims is not None:
+                self._note_groups(got[0], groups, c.get("iat") if c else None, bool(c and c.get("groups_capped")))
             if self.approval is not None:
                 self._admit(pr, set(groups))
             return pr
@@ -1349,6 +1390,181 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
 
     _REFUSED = {"denied": "your request to join was declined", "disabled": "your account is disabled",
                 "kicked": "your access was removed"}
+
+    # ---------------------------------------------------------- member-owned artifacts (plan 5)
+    MAX_NOTED_GROUPS = 64
+
+    MEMBER_FORGET_AFTER = 30 * 24 * 3600.0     # an unrefreshed claim is "unknown" for this long, then forgotten
+    GROUPS_SAVE_EVERY = 300.0
+
+    def _note_groups(self, uid: str, groups: Any, iat: Any = None, capped: bool = False) -> None:
+        """Remember the group claims of a verified sign-in; wake the feed when the set changed.
+
+        Evidence rules (a claim that cannot be trusted to be the newest is ignored, never read as "left the group"):
+        an empty claim proves nothing; a claim capped by the verifier that lacks the member group proves nothing (the
+        group may be past the cap); a token older (``iat``) than the one already recorded is ignored; a token with no
+        ``iat`` can confirm membership but never record a removal."""
+        clean = tuple(sorted({g for g in (groups if isinstance(groups, (list, tuple, set, frozenset)) else ())
+                              if isinstance(g, str) and 0 < len(g) <= 128}))[:self.MAX_NOTED_GROUPS]
+        if not clean:
+            return
+        member = self.member_group is not None and self.member_group in clean
+        if capped and not member:
+            return
+        stamp = None if isinstance(iat, bool) or not isinstance(iat, (int, float)) or not math.isfinite(iat) \
+            else float(iat)
+        if stamp is None and not member:
+            return
+        with self._lock:
+            old = self._user_groups.get(uid)
+            if old is not None and stamp is not None and old.iat is not None and stamp < old.iat:
+                return
+            now = self._now()
+            if stamp is None and old is not None:
+                stamp = old.iat
+            removed_since = None
+            if not member and self.member_group is not None:
+                removed_since = old.removed_since if old is not None and old.removed_since is not None else now
+            self._user_groups[uid] = _GroupClaim(now, clean, stamp, removed_since)
+            changed = old is None or old.groups != clean
+            persist = changed or now - self._groups_saved >= self.GROUPS_SAVE_EVERY
+        if persist:
+            self._save_groups()
+        bridge = self.artifact_bridge
+        if changed and bridge is not None and self.member_group is not None:
+            bridge.agents_changed()
+
+    def _save_groups(self) -> None:
+        """Atomically (tmp + fsync + rename, mode 0600) persist the last-seen claims; failure is logged by type only."""
+        path = self._groups_path
+        if path is None:
+            return
+        with self._lock:
+            snap = {u: {"at": c.at, "groups": list(c.groups), "iat": c.iat, "removed_since": c.removed_since}
+                    for u, c in self._user_groups.items()}
+            self._groups_saved = self._now()
+        data = json.dumps({"version": 1, "users": snap}, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        try:
+            with self._groups_io:
+                directory = os.path.dirname(path) or "."
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                tmp = f"{path}.tmp-{os.getpid()}"
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+                try:
+                    os.fchmod(fd, 0o600)
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(fd, view):]
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.replace(tmp, path)
+        except OSError as exc:
+            print(f"collab: member group claims not saved error={type(exc).__name__}", file=sys.stderr)
+
+    def _load_groups(self) -> None:
+        """Read the persisted claims; a missing, damaged or hostile file (any parse failure, including deeply nested
+        JSON) means no knowledge: everyone starts unseen. Never raises."""
+        try:
+            with open(self._groups_path, "rb") as fh:
+                doc = json.loads(fh.read(8 * 1024 * 1024))
+            users = doc["users"]
+            if not isinstance(users, dict):
+                return
+            loaded: dict[str, _GroupClaim] = {}
+            for uid, row in users.items():
+                try:
+                    at, groups = float(row["at"]), row["groups"]
+                    iat, since = row.get("iat"), row.get("removed_since")
+                    iat = float(iat) if isinstance(iat, (int, float)) and not isinstance(iat, bool) else None
+                    since = float(since) if isinstance(since, (int, float)) and not isinstance(since, bool) else None
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    continue
+                if isinstance(uid, str) and math.isfinite(at) and isinstance(groups, list) \
+                        and all(x is None or math.isfinite(x) for x in (iat, since)):
+                    clean = tuple(sorted({g for g in groups if isinstance(g, str) and 0 < len(g) <= 128}))[
+                        :self.MAX_NOTED_GROUPS]
+                    if clean:
+                        loaded[uid] = _GroupClaim(at, clean, iat, since)
+            self._user_groups.update(loaded)
+        except Exception:  # incl. RecursionError, MemoryError
+            return
+
+    def _member_status(self, uid: str) -> tuple[str, list[str]] | None:
+        """``(status, groups)`` for a user whose claims were ever seen, else None. Caller holds the lock.
+
+        approved/disabled: fresh claims include the member group.  removed: fresh claims do not (positive evidence).
+        unknown: the claims are older than the TTL (or from the future): they prove nothing about group membership.
+
+        The account record is positive evidence whatever the claim age: a disabled account (last seen in the member
+        group) reports ``disabled`` even when idle past the TTL. Only the group part goes stale, so group REMOVAL
+        still needs a fresh sign-in claim (there is no synced directory to consult)."""
+        seen = self._user_groups.get(uid)
+        if seen is None or self.member_group is None:
+            return None
+        age = self._now() - seen.at
+        if not 0 <= age <= self.member_groups_ttl:
+            if not 0 <= age <= self.MEMBER_FORGET_AFTER:
+                return None
+            if (self.member_group in seen.groups and self.approval is not None and uid in self._users
+                    and not self._ok(uid)):
+                return "disabled", list(seen.groups)
+            return "unknown", list(seen.groups)
+        groups = list(seen.groups)
+        if self.member_group not in groups:
+            return "removed", groups
+        if self.approval is not None and uid not in self._users:   # no account record (e.g. log not replayed): no proof
+            return "unknown", groups
+        return ("approved" if self._ok(uid) else "disabled"), groups
+
+    def _groups_of(self, uid: str) -> list[str]:
+        """The fresh last-seen groups of ``uid`` (``[]`` when never seen or older than the TTL). Caller holds the lock."""
+        seen = self._user_groups.get(uid)
+        if seen is None or not 0 <= self._now() - seen.at <= self.member_groups_ttl:
+            return []
+        return list(seen.groups)
+
+    def member_directory(self) -> dict | None:
+        """``member-directory.json``'s body, or None when no member group is configured.
+
+        Every user whose claims were seen is listed with an explicit status: approved / disabled (in the group),
+        removed (fresh claims without it) or unknown (claims expired). The worker destroys only on disabled/removed."""
+        group = self.member_group
+        if group is None:
+            return None
+        users: dict[str, dict] = {}
+        with self._lock:
+            for uid in list(self._user_groups):
+                got = self._member_status(uid)
+                if got is None:
+                    continue
+                status, groups = got
+                email = self._user_email.get(uid) if status != "removed" else None
+                users[uid] = {"email": email, "display_name": email.split("@")[0] if email else uid,
+                              "status": status, "groups": groups}
+                if status == "removed":
+                    users[uid]["removed_since"] = self._user_groups[uid].removed_since
+        return {"group": group, "users": users}
+
+    def member_check(self, pr: Principal):
+        """The ``member_for_actor`` verdict for an authenticated principal (an agent is judged by its owner)."""
+        from .artifact_members import MemberCheck, member_for_actor
+        group = self.member_group
+        if group is None:
+            return MemberCheck(False, None, "members_disabled")
+        with self._lock:
+            if pr.is_agent:
+                a = self._agents.get(pr.id)
+                if a is None:
+                    return MemberCheck(False, None, "unknown_agent")
+                actor = {"kind": "agent", "agent_id": pr.id}
+                agents = {pr.id: {"owner": a["owner"], "status": a.get("status"), "external": bool(a.get("external"))}}
+                uid = a["owner"]
+            else:
+                actor, agents, uid = {"kind": "user", "user_id": pr.id}, {}, pr.id
+            got = self._member_status(uid)
+            directory = {} if got is None else {uid: {"status": got[0], "groups": got[1]}}
+        return member_for_actor(actor, agents=agents, group=group, directory=directory)
 
     def _admit(self, pr: Principal, groups: set) -> None:
         """Approval mode: record a first sign-in, apply the automatic rules, refuse the refused. Someone
@@ -1679,6 +1895,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 resource_id=room_id))
             self._expire_helpers()                   # their helpers in this room end now and free their slots
             self._tc_reconcile_room(room_id)         # slice 3: a removed coordinator's open assignments are requeued now
+            self._dg_reconcile_room(room_id)         # Direct: a removed guest's open tasks are cancelled now
         self._xlink_sweep(room_id)          # T14: links this person made no longer stand
         return {"ok": True}
 
@@ -4546,6 +4763,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         gives work to ONE agent that the owner approved with "execute"."""
         with self._lock:
             room, first = self._tc_authorize_create(pr, room_id)
+            if self._dg_applies(pr, room_id):              # the Direct guest level: its own path, its own limits
+                return self._dg_create(pr, room, room_id, body)
             roles_on = self.team_roles_active()
             bad = [k for k in body if k not in ("target_agent_id", "text", "parent_task_id", "idempotency_key",
                                                 "reviews_task_id") and not (roles_on and k in ROLE_FIELDS)]
@@ -4579,6 +4798,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         or pt["seq"] < first or self._task_status(pt) != "accepted"
                         or not self._creator_valid(pt, room)):
                     raise CollabError(400, "agents delegate: parent_task_id must be a task you accepted in this room")
+                self._dg_refuse_child(pr, room, pt)                  # T-TC5: a guest's task is not handed on
                 if pt["by_kind"] == "agent" and pt["by_id"] == tid_:
                     raise CollabError(400, "cannot hand a task straight back to the agent that gave it")
                 self._tc_loop_check(pr, pt, "agent:" + tid_)         # slice 3: no loop through a third agent, no assistant chain
@@ -5465,6 +5685,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
 
     def _creator_valid(self, t: dict, room: dict) -> bool:
         """A task is only as good as its requester's CURRENT authority."""
+        if t.get("origin") == "guest-direct":
+            return self._dg_creator_valid(t, room)           # a guest's authority is the room's Direct level, not a member right
         c = t.get("coord")
         if c is not None and t["by_kind"] == "user" and c["key"] == "user:" + t["by_id"]:
             return self._tc_holder_active(room, c["team"], c["key"])    # an external coordinator: authority is `coordinate`
@@ -6613,6 +6835,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.get_member_visibility(pr, rid)
                     if parts[2:] == ["guest-level"]:
                         return 200, self.get_guest_level(pr, rid)
+                    if parts[2:] == ["direct-tasks"]:
+                        return 200, self.direct_tasks(pr, rid)
+                    if parts[2:] == ["direct-guests"]:
+                        return 200, self.direct_guests(pr, rid)
                     if parts[2:] == ["suggestions"]:
                         return 200, self.list_suggestions(pr, rid, query)
                     if n == 4 and parts[2] == "suggestions":
@@ -6823,6 +7049,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.attach_team(pr, rid, parts[3], body)
                     if n == 5 and parts[2] == "teams" and parts[4] == "detach":
                         return 200, self.detach_team(pr, rid, parts[3])
+                    if n == 5 and parts[2] == "direct-tasks" and parts[4] == "cancel":
+                        return 200, self.cancel_direct_task(pr, rid, parts[3])
+                    if parts[2:] == ["direct-guests"]:
+                        return 200, self.set_direct_guest(pr, rid, body)
                     if parts[2:] == ["suggestions"]:
                         out = self.submit_suggestion(pr, rid, body)
                         return (200 if out["replayed"] else 201), out

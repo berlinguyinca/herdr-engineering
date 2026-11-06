@@ -642,6 +642,18 @@ class AgentForwarder:
             pass
         return buf
 
+    @staticmethod
+    def _is_sigv4(target: bytes, header_lines: list[bytes]) -> bool:
+        low = target.lower()
+        if b"x-amz-algorithm=aws4-hmac-sha256" in low or b"x-amz-signature=" in low:
+            return True
+        for line in header_lines:
+            name, _sep, value = line.partition(b":")
+            if (name.strip().lower() == b"authorization"
+                    and value.strip().upper().startswith(b"AWS4-HMAC-SHA256")):
+                return True
+        return False
+
     def _rewrite_head(self, data: bytes) -> bytes:
         """Point a fabric-addressed ``Host`` at the loopback target.
 
@@ -664,6 +676,11 @@ class AgentForwarder:
         first = lines[0].split(b" ")
         if (len(first) != 3 or first[0] not in (b"GET", b"HEAD")
                 or not first[2].startswith(b"HTTP/1.")):
+            return data
+        # AWS SigV4 (S3/rustfs/MinIO, sccache) signs the Host header, so
+        # rewriting it makes the backend answer SignatureDoesNotMatch. A signed
+        # request is forwarded byte-for-byte; the backend verifies it itself.
+        if self._is_sigv4(first[1], lines[1:]):
             return data
         host_at = None
         host = ""

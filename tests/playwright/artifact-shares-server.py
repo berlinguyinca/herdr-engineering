@@ -67,6 +67,10 @@ def _blob(data: bytes) -> dict:
 class ArtifactFixture:
     """The registry calls the artifact detail page, the report reader, restore and share bundling make."""
 
+    async def tombstoned_ids(self):
+        """The detail route reads the tombstone set before it serves an artifact; this fixture deletes none."""
+        return []
+
     def __init__(self):
         self.blobs = {}
         self.records = {
@@ -301,6 +305,12 @@ class ShareFixture:
     def sync_call(self, method, *args, **kwargs):
         return asyncio.run(getattr(self, method)(*args, **kwargs))
 
+    async def acquire_spend(self):
+        """ShareStore holds a cross-process spend lock around approve; one in-memory process needs none."""
+
+    async def release_spend(self):
+        """Counterpart of acquire_spend."""
+
     def _public(self, share_id, keep_hash=False):
         row = {k: copy.deepcopy(self.rows[share_id][k]) for k in self.COLUMNS}
         if keep_hash:
@@ -398,7 +408,7 @@ class ShareFixture:
                 self._event(share_id, "revoked", actor, {"was": was})
             return self._public(share_id)
 
-    async def live_total_bytes(self):
+    async def live_total_bytes(self, *, member=False):
         with _LOCK:
             return sum(r["total_bytes"] or 0 for r in self.rows.values() if r["state"] == "live")
 

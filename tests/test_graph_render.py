@@ -136,15 +136,15 @@ def metric_graph(**totals):
     first, second = g["segments"]
     first.update(worked_s=2520, span_s=3 * 3600, fresh=180_000, cached=3_100_000)
     second.update(worked_s=600, span_s=600, fresh=None, cached=None)
-    g["drift"].update(worked_s=3300, fresh=1_400_000, cached=9_000_000)
+    g["drift"].update(worked_s=3300, span_s=7200, fresh=1_400_000, cached=9_000_000)
     g["totals"] = {"worked_s": 3120, "span_s": 4 * 3600, "fresh": 1_580_000, "cached": 12_100_000, "main_only": False, **totals}
     return g
 
 
-def test_box_shows_time_worked_span_and_fresh_over_cached_tokens():
+def test_box_shows_time_worked_wall_time_and_fresh_over_cached_tokens():
     text = "\n".join(render(metric_graph(), 200))
-    assert "42m worked · 3h span" in text and "180k fresh · 3.1M cached" in text
-    assert "10m worked" in text and "10m worked ·" not in text        # span equal to worked is not repeated
+    assert "42m worked · 3h wall" in text and "180k fresh · 3.1M cached" in text
+    assert "10m worked · 10m wall" in text                            # wall time is always shown, even when equal
 
 
 def test_a_segment_without_usage_shows_no_token_text_and_never_a_zero():
@@ -157,9 +157,9 @@ def test_a_segment_without_usage_shows_no_token_text_and_never_a_zero():
 
 def test_total_line_and_the_cost_of_the_drift():
     text = "\n".join(render(metric_graph(), 200))
-    assert "52m worked" in text and "1.6M fresh" in text and "12M cached" in text
+    assert "52m worked · 4h wall" in text and "1.6M fresh" in text and "12M cached" in text
     drift = [line for line in text.split("\n") if "55m worked" in line]
-    assert drift and "1.4M fresh" in drift[0]
+    assert drift and "55m worked · 2h wall" in drift[0] and "1.4M fresh" in drift[0]
 
 
 def test_main_session_only_is_said_when_children_exist():

@@ -45,8 +45,11 @@ class Store:
     async def lifecycle_of(self, aid):
         return "active"
 
-    async def report_permission(self, aid, principal, permission):
+    async def report_permission(self, aid, principal, permission, **_):
         return aid == "artifact_report" and hashlib.sha256(b"owner-key").hexdigest()[:16] in principal
+
+    async def operator_member_access(self, aid, principal, permission):
+        return False
 
     async def get_report(self, aid, vid):
         if aid != "artifact_report" or vid not in {"v1", "v2"}:
@@ -106,9 +109,10 @@ class Store:
 
     async def get_report_asset(self, aid, vid, asset):
         await self.get_report(aid, vid)
-        if asset != "data1":
+        listed = [a for a in self.descriptor["assets"] if a["id"] == asset]
+        if not listed:
             raise ArtifactError("no artifact report asset")
-        value = copy.deepcopy(self.descriptor["assets"][0])
+        value = copy.deepcopy(listed[0])
         sha = value["sha256"]
         return {**value, "storage_key": f"sha256/{sha[:2]}/{sha[2:4]}/{sha}"}
 
@@ -176,6 +180,22 @@ def test_report_preview_reads_metadata_not_supporting_blob(reports_server):
     assert b"Generic investigation" in preview
     assert blobs.downloads == 0
     assert "script-src 'none'" in headers["Content-Security-Policy"]
+
+
+def test_report_preview_embeds_a_verified_image_figure_and_allows_data_images_in_its_csp(reports_server):
+    base, store, blobs = reports_server
+    blobs.data = b"\x89PNG\r\n\x1a\n" + b"\x07" * 20
+    sha = hashlib.sha256(blobs.data).hexdigest()
+    store.descriptor["assets"].append({"id": "pic", "name": "pic.png", "role": "figure", "media_type": "image/png",
+                                       "sha256": sha, "size_bytes": len(blobs.data)})
+    store.descriptor["figures"] = [{"id": "fig", "title": "Pic", "asset_id": "pic", "caption": "A picture."}]
+    status, preview, headers = request(base, PREFIX + "/preview")
+    assert status == 200 and b'<img class="fig-img" alt="Pic" src="data:image/png;base64,' in preview
+    assert "img-src data:" in headers["Content-Security-Policy"] and "script-src 'none'" in headers["Content-Security-Policy"]
+    assert request(base, PREFIX + "/preview", key="other-key")[0] == 404
+    blobs.data = b"tampered bytes of the same size!!"   # integrity failure: the figure degrades to caption and link
+    status, preview, _ = request(base, PREFIX + "/preview")
+    assert status == 200 and b"<img" not in preview and b"A picture." in preview and b"Download figure" in preview
 
 
 def test_private_scope_and_foreign_versions_are_nondisclosing(reports_server):

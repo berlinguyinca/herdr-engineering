@@ -122,6 +122,8 @@ def test_durable_upload_is_visible_and_downloadable_without_the_legacy_projectio
             if method == 'report_permission':
                 record = self.records.get(args[0])
                 return bool(record and record['created_by'] == args[1])
+            if method == 'operator_member_access':
+                return False    # no member-owned artifacts in this store
             raise AssertionError(method)
 
     with running(artifact_store=Durable(), rustfs=blobs) as server:
@@ -152,3 +154,15 @@ def test_native_delivery_includes_artifact_references_after_identity_verificatio
     server._dispatch_native_message({'terminal_id': 'term1', 'agent_session': 'conversation1',
         'host_id': socket.gethostname(), 'herdr_session': 'workspace1'}, 'Please inspect', ['artifact_1'])
     assert received == [('term1', 'Please inspect\n\nAttached HerdR artifact references:\n- herdr-artifact://artifact_1')]
+
+
+def test_artifact_reviews_list_needs_read_permission_with_the_acl_too():
+    reviews = ArtifactReviewManager()
+    reviews.request(artifact_id='private', version_id='v1', requested_by=principal('owner'))
+    with running(artifact_review_manager=reviews) as server:
+        server.artifact_acl.grant('private', principal('owner'), {'admin'})
+        path = '/api/v1/artifacts/private/reviews'
+        assert len(json.loads(call(server, 'GET', path)[1])['reviews']) == 1
+        missing = call(server, 'GET', '/api/v1/artifacts/nope/reviews', key='other')
+        assert missing[0] == 404 and call(server, 'GET', path, key='other') == missing
+        assert call(server, 'GET', path, key='')[0] in (401, 404)

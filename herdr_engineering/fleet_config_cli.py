@@ -198,6 +198,7 @@ COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "co
                          "skills",
                          "summary_fix",   # summary_fix: ids of the operator's summary-fix room and agent, no secret
                          "delegation_enabled",
+                         "members",       # plan 5 member web: carries session_secret (the slice is 0600, collab-public only)
                          "task_lease_seconds"})   # a number of seconds, no secret
 
 
@@ -260,7 +261,63 @@ def collab_values(cfg: FleetConfig) -> dict:
         summary_fix_config(collab.get("summary_fix"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
+    _check_members(collab, _share_mapping(cfg)[0], cfg)
     return dict(collab)
+
+
+def _check_members(collab: dict, share: dict, cfg: FleetConfig | None = None) -> None:
+    """Validate ``control_plane.collab.members`` (the member web host comes from ``control_plane.share.public_host``).
+
+    Messages name keys, never values: the section carries ``session_secret``."""
+    host = share.get("public_host")
+    if host is not None and host == _loose_hostname(collab.get("public_url")):
+        raise FleetConfigError("control_plane.share.public_host must be a host other than control_plane.collab."
+                               "public_url's: the member web and share links live there, MCP stays on the collab host")
+    members = collab.get("members")
+    if members is None:
+        return
+    from .control_plane.members_config import parse_members
+    for key in ("public_host", "session_seconds"):
+        if isinstance(members, dict) and key in members:
+            raise FleetConfigError(f"control_plane.collab.members.{key} is not authored here: set "
+                                   f"control_plane.share.{key} (the deploy tooling copies it into the slice)")
+    try:
+        parse_members(members, public_host=host, session_seconds=share.get("session_seconds"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
+    if members.get("enabled") is True and cfg is not None:
+        _check_members_prerequisites(cfg, share)
+
+
+def _check_members_prerequisites(cfg: FleetConfig, share: dict) -> None:
+    """Members that cannot work are refused here instead of failing silently at runtime (404 everywhere, no routes)."""
+    try:
+        values = cfg.section(CONTROL_PLANE_SECTION)
+    except FleetConfigError:
+        return
+    if share.get("enabled") is not True:
+        raise FleetConfigError("control_plane.collab.members.enabled needs control_plane.share.enabled: true "
+                               "(the member host is routed by the share edge)")
+    bridge = values.get("collab_artifacts")
+    if not (isinstance(bridge, dict) and bridge.get("enabled") is True):
+        raise FleetConfigError("control_plane.collab.members.enabled needs control_plane.collab_artifacts.enabled: "
+                               "true (members publish through the collab artifact bridge)")
+    keys = values.get("api_keys")
+    if not keys:
+        raise FleetConfigError("control_plane.collab.members.enabled needs control_plane.api_keys: without keys the "
+                               "API treats every caller as the operator, who may read and share member artifacts")
+
+
+def _members_with_host(values: dict, share: dict) -> dict:
+    """``values`` with the share host and session lifetime copied into an ENABLED members section (collab-public only
+    loads this slice, never ``control_plane.share``, so it reads both there)."""
+    members = values.get("members")
+    if isinstance(members, dict) and members.get("enabled") is True:
+        slice_ = {**members, "public_host": share.get("public_host")}
+        if share.get("session_seconds") is not None:
+            slice_["session_seconds"] = share["session_seconds"]
+        return {**values, "members": slice_}
+    return values
 
 
 def _collab_artifacts_slice(cfg: FleetConfig) -> dict:
@@ -280,7 +337,8 @@ def render_collab(cfg: FleetConfig, out: Path) -> None:
     ``collab_artifacts: {enabled: <bool>}`` switch."""
     data = {"version": SCHEMA_VERSION,
             "sections": {CONTROL_PLANE_SECTION: {"roles": ["control-plane"],
-                                                 "values": {"collab": collab_values(cfg), **_collab_artifacts_slice(cfg)}}},
+                                                 "values": {"collab": _members_with_host(collab_values(cfg), _share_mapping(cfg)[0]),
+                                                        **_collab_artifacts_slice(cfg)}}},
             "hosts": {}}
     _parse(data)
     write_private_file(Path(out), json.dumps(data, indent=2, sort_keys=True) + "\n")
@@ -294,10 +352,10 @@ SHARE_SECTION_KEY = "share"
 # control_plane.share as authored; an unknown key (which could be a secret meant elsewhere) is refused.
 SHARE_KEYS = frozenset({"enabled", "max_share_bytes", "max_total_bytes", "max_files", "default_public_days",
                         "session_seconds", "signing_secret", "shares_dir", "events_dir", "marker_dir",
-                        "annotations", "owner_emails", "public_url"})
+                        "annotations", "owner_emails", "public_url", "public_host"})
 # What share-public gets: no directories (its mounts are fixed), nothing else from the central file.
 SHARE_SLICE_KEYS = ("enabled", "max_share_bytes", "max_total_bytes", "max_files", "default_public_days",
-                    "session_seconds", "signing_secret", "annotations", "public_url")
+                    "session_seconds", "signing_secret", "annotations", "public_url", "public_host")
 # Cognito identifiers share-public needs for lab sign-in (public values; no group, no operator).
 SHARE_COLLAB_KEYS = ("cognito_pool", "cognito_clients", "cognito_web_client", "cognito_domain", "public_url")
 SHARE_FIXED_DIRS = {"shares_dir": "/shares", "events_dir": "/share-events",
@@ -359,6 +417,16 @@ def share_values(cfg: FleetConfig) -> dict:
         clean_owner_emails(share.get("owner_emails"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
+    if share.get("public_host") is not None:
+        from .control_plane.members_config import valid_public_host
+        host = share["public_host"]
+        if not valid_public_host(host):
+            raise FleetConfigError("control_plane.share.public_host must be a lowercase DNS name (no scheme, port or "
+                                   "path): share links and the member web live there")
+        if share.get("public_url") is not None and https_origin(share["public_url"]) != f"https://{host}":
+            raise FleetConfigError("control_plane.share.public_url disagrees with control_plane.share.public_host: "
+                                   "set only public_host")
+        share = {**share, "public_url": f"https://{host}"}
     if share.get("enabled") is not True:
         return {"share": {"enabled": False}}
     from .control_plane.share_session import MIN_SECRET_BYTES
@@ -424,8 +492,17 @@ EDGE_SHARE_SNIPPET = "share-http.conf"
 EDGE_SHARE_HOST_MARKER = "@share_host@"
 
 
+EDGE_MEMBER_MARKER = "    # @member-locations@\n"
+EDGE_MEMBER_SNIPPET = "member-http.conf"
+EDGE_MEMBER_ZONES_MARKER = "  # @member-zones@\n"
+EDGE_MEMBER_ZONES = (
+    "  # The member web UI and API: their own zones (the share zones are for /s/).\n"
+    "  limit_req_zone $remote_addr zone=member_req:10m rate=10r/s;\n"
+    "  limit_conn_zone $remote_addr zone=member_conn:10m;\n")
+
+
 def render_edge_conf(template: str, *, share: bool, share_host: str | None = None,
-                     snippets_dir: Path | None = None) -> str:
+                     snippets_dir: Path | None = None, members: bool = False) -> str:
     """The edge's nginx.conf: the template, plus the share host's zones, upstream and server when ``share`` is true.
 
     ``share_host`` (required then) is the share origin's host, lowercase, a port allowed; the server answers to the
@@ -443,7 +520,20 @@ def render_edge_conf(template: str, *, share: bool, share_host: str | None = Non
     if EDGE_SHARE_HOST_MARKER not in snippet:
         raise FleetConfigError(f"{EDGE_SHARE_SNIPPET} must hold {EDGE_SHARE_HOST_MARKER}")
     snippet = snippet.replace(EDGE_SHARE_HOST_MARKER, share_host.split(":")[0])
+    if snippet.count(EDGE_MEMBER_MARKER) != 1:
+        raise FleetConfigError(f"{EDGE_SHARE_SNIPPET} must hold the marker line {EDGE_MEMBER_MARKER.strip()!r} once")
+    member = (base / EDGE_MEMBER_SNIPPET).read_text(encoding="utf-8") if members else ""
+    if snippet.count(EDGE_MEMBER_ZONES_MARKER) != 1:
+        raise FleetConfigError(f"{EDGE_SHARE_SNIPPET} must hold the marker line {EDGE_MEMBER_ZONES_MARKER.strip()!r} once")
+    snippet = snippet.replace(EDGE_MEMBER_ZONES_MARKER, EDGE_MEMBER_ZONES if members else "")
+    snippet = snippet.replace(EDGE_MEMBER_MARKER, member)      # members off: the share host serves /s/ and nothing else
     return template.replace(EDGE_SHARE_MARKER, snippet)
+
+
+def _members_enabled(cfg: FleetConfig) -> bool:
+    collab = cfg.section("control_plane").get("collab")
+    members = collab.get("members") if isinstance(collab, dict) else None
+    return isinstance(members, dict) and members.get("enabled") is True
 
 
 def render_edge(cfg: FleetConfig, template: Path, out: Path) -> None:
@@ -455,7 +545,7 @@ def render_edge(cfg: FleetConfig, template: Path, out: Path) -> None:
         origin = https_origin(share_values(cfg)["share"]["public_url"])
         share_host = origin.removeprefix("https://") if origin else None
     text = render_edge_conf(template.read_text(encoding="utf-8"), share=share, share_host=share_host,
-                            snippets_dir=template.parent)
+                            snippets_dir=template.parent, members=share and _members_enabled(cfg))
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")

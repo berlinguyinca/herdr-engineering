@@ -724,14 +724,20 @@ test('service catalog filters, archive inspection and groups survive live refres
     assert.equal(await page.locator('.sc-row').filter({hasText:'Archived parser'}).count(),0);
     assert.equal(await page.locator('.sc-row').filter({hasText:'Inactive parser'}).count(),0);
     await page.locator('[data-filter=unknown]').click();
+    // paged catalogs refetch on filter/search, so the rows settle asynchronously
+    await page.waitForFunction(t=>{const r=document.querySelectorAll('.sc-row');return r.length===1&&r[0].innerText.includes(t);},'Stale healthy parser');
     assert.equal(await page.locator('.sc-row').count(),1);
     assert.match(await page.locator('.sc-row').innerText(), /Stale healthy parser/);
     assert.match(await page.locator('.sc-health').innerText(), /Unconfirmed/);
     await page.locator('[data-filter=archived]').click();
+    // paged catalogs refetch on filter/search, so the rows settle asynchronously
+    await page.waitForFunction(t=>{const r=document.querySelectorAll('.sc-row');return r.length===1&&r[0].innerText.includes(t);},'Archived parser');
     assert.equal(await page.locator('.sc-row').count(),1);
     assert.match(await page.locator('.sc-row').innerText(), /Archived parser/);
     await page.locator('[data-filter=current]').click();
     await page.locator('#sc-search').fill('spectra 8080');
+    // paged catalogs refetch on filter/search, so the rows settle asynchronously
+    await page.waitForFunction(t=>{const r=document.querySelectorAll('.sc-row');return r.length===1&&r[0].innerText.includes(t);},'Parse experimental spectra');
     assert.equal(await page.locator('.sc-row').count(),1);
     assert.match(await page.locator('.sc-row').innerText(), /Parse experimental spectra/);
     await page.locator('#sc-expand').click();
@@ -1695,8 +1701,10 @@ test('mission detail links to the delivery section pages', async () => {
     await page.goto(`${base}/#/missions/${encodeURIComponent(key)}`);
     await page.locator('a:has-text("Tests & builds")').first().waitFor({ timeout: 15000 });
     await page.locator('a:has-text("Reviews & PRs")').first().click();
+    // The detail page's own story grid also says "Pull requests", so wait for
+    // the reviews route and for its PR card, not for that shared heading.
     await page.waitForFunction(
-      () => (document.body ? document.body.innerText : '').includes('Pull requests'),
+      () => (document.getElementById('mission-reviews')?.innerText || '').includes('PR #7'),
       null, { timeout: 15000 });
     assert.ok((await bodyText(page)).includes('PR #7'), 'review section must render via detail nav');
   }, { BURST: '0' });

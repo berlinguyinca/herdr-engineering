@@ -186,7 +186,8 @@ class SchedulerService:
                 "aliases": list(snapshot.aliases), "platform": snapshot.platform,
                 "owned": snapshot.owned, "trusted": snapshot.trusted,
                 "reachable": snapshot.reachable,
-                "policy": {"mode": snapshot.policy.mode.value, "revision": snapshot.policy.revision},
+                "policy": {"mode": snapshot.policy.mode.value, "revision": snapshot.policy.revision,
+                           "allow_tags": sorted(snapshot.policy.allow_tags), "deny_tags": sorted(snapshot.policy.deny_tags)},
                 "telemetry": {"at": snapshot.telemetry_at.isoformat() if snapshot.telemetry_at else None,
                               "freshness_seconds": age},
                 "capacity": record.get("scheduler_capacity") or {},
@@ -202,14 +203,49 @@ class SchedulerService:
         # belong in dashboard history, even for an authenticated viewer.
         fields = ("reservation_id", "request_id", "host_uid", "state", "expires_at",
                   "execution_claimed", "execution_claimed_at", "requested_cpu", "requested_memory")
-        history = [{key: row.get(key) for key in fields} for row in reservations]
-        return {"hosts": self._host_cards(), "history": history[-200:],
+        history = []
+        for row in reservations:
+            entry = {key: row.get(key) for key in fields}
+            request = row.get("request_snapshot") if isinstance(row.get("request_snapshot"), dict) else {}
+            decision = row.get("decision") if isinstance(row.get("decision"), dict) else {}
+            entry.update(agent_family=request.get("agent_family"), priority=request.get("priority"),
+                         created_at=row.get("queued_at") or decision.get("created_at"),
+                         queued_at=row.get("queued_at"), decision_at=decision.get("created_at"))
+            explanations = {}
+            details = decision.get("explanations") if isinstance(decision.get("explanations"), dict) else {}
+            for uid, explanation in details.items():
+                if not isinstance(explanation, dict):
+                    continue
+                measured = explanation.get("measured") if isinstance(explanation.get("measured"), dict) else {}
+                reasons = explanation.get("reason_codes")
+                explanations[uid] = {
+                    "reason_codes": [reason for reason in (reasons if isinstance(reasons, (list, tuple)) else [])
+                                     if isinstance(reason, str)][:32],
+                    "score": explanation.get("score") if type(explanation.get("score")) in (int, float)
+                             and math.isfinite(explanation["score"]) else None,
+                    "measured": {key: measured[key] for key in (
+                        "total_cpu", "available_cpu", "total_memory_gib", "available_memory_gib")
+                        if type(measured.get(key)) in (int, float) and math.isfinite(measured[key])},
+                }
+                if isinstance(explanation.get("host_name"), str):
+                    explanations[uid]["host_name"] = explanation["host_name"][:255]
+            entry["explanations"] = explanations
+            history.append(entry)
+        def newest(entry):
+            try:
+                stamp = datetime.fromisoformat(entry.get("created_at") or entry.get("queued_at") or "")
+                epoch = stamp.timestamp() if stamp.tzinfo else 0
+            except (TypeError, ValueError, OverflowError, OSError):
+                epoch = 0
+            return epoch, str(entry.get("reservation_id") or "")
+        history.sort(key=newest, reverse=True)
+        return {"hosts": self._host_cards(), "history": history[:200],
                 "queued_agents": sum(row.get("state") == "queued" for row in reservations),
                 "claimed_executions": sum(row.get("state") == "committed" and bool(row.get("execution_claimed"))
                                           for row in reservations),
                 "reserved_cpu": sum(float(row.get("requested_cpu", 0)) for row in reservations
                                     if row.get("state") in {"reserved", "committed"}),
-                "queue": [row for row in history if row.get("state") == "queued"]}
+                "queue": [row for row in history if row.get("state") == "queued"][:200]}
 
 
     def plan(self, body, principal):

@@ -5,6 +5,7 @@ content-addressed in-memory object store; races are made deterministic with real
 import asyncio
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -257,6 +258,37 @@ def test_n12_a_link_is_not_issued_for_an_artifact_deleted_meanwhile(registry_pg)
     run(with_store(registry_pg["dsn"], blobs, body))
 
 
+def test_approving_a_link_and_the_purge_rewrite_of_its_share_row_share_one_lock_order(registry_pg):
+    """The purge holds the artifact row and then rewrites the artifact's share rows; an approve used to lock the share row
+    and then wait for the artifact row, a deadlock. Both sides must now take the artifact row first (two real connections)."""
+    blobs = FakeBlobs()
+
+    async def body(store, conn):
+        a, va = await publish(store, blobs, owner="o", name="a.md", media="text/markdown", data=data_for("lockorder"))
+        shares = ShareStore(conn)
+        share = await shares.create(artifact_id=a, version_id=va["version_id"], audience="lab",
+                                    allow_emails=["x@example.org"])
+        purge = await asyncpg.connect(registry_pg["dsn"])
+        approve = await asyncpg.connect(registry_pg["dsn"])
+        try:
+            tx = purge.transaction()
+            await tx.start()
+            await purge.fetchval("SELECT 1 FROM artifacts WHERE artifact_id=$1 FOR UPDATE", a)   # what purge_now holds
+            index = BundleIndex("a.md", [BundleFile("a.md", "a" * 64, 1, "text/markdown")], 1, [])
+            approving = asyncio.ensure_future(ShareStore(approve).mark_live(
+                share["share_id"], token_hash="b" * 64, index=index, approved_by="op"))
+            await asyncio.sleep(0.6)                                       # the approve is now waiting on a lock
+            await purge.execute("UPDATE artifact_shares SET title=NULL WHERE artifact_id=$1", a)  # anonymisation
+            await tx.commit()
+            live = await asyncio.wait_for(approving, 10)                   # neither side was aborted as a deadlock victim
+            assert live["state"] == "live"
+        finally:
+            await purge.close()
+            await approve.close()
+
+    run(with_store(registry_pg["dsn"], blobs, body))
+
+
 # ------------------------------------------------------------------------------------------------ N4
 def test_n4_a_version_retract_cannot_touch_a_deleted_artifact(registry_pg):
     with api(registry_pg) as env:
@@ -319,7 +351,7 @@ def test_n1_writes_on_a_deleted_legacy_upload_ask_the_database(registry_pg):
         assert got == 404
 
 
-def test_n1_the_tombstone_cache_fails_closed_keeps_the_last_answer_and_expires():
+def test_n1_the_tombstone_cache_fails_closed_inside_the_window_only_and_expires():
     clock = [0.0]
     cache = TombstoneCache(ttl=5.0, clock=lambda: clock[0])
 
@@ -328,13 +360,38 @@ def test_n1_the_tombstone_cache_fails_closed_keeps_the_last_answer_and_expires()
     with pytest.raises(RuntimeError):                           # never loaded: the failure propagates (503), no answer
         cache.contains("a", broken)
     assert cache.contains("a", lambda: ["a"]) is True and cache.contains("b", lambda: ["a"]) is False
+    clock[0] = 4.0
+    assert cache.contains("a", broken) is True                  # inside the staleness window the last answer is fine
     clock[0] = 10.0
-    assert cache.contains("a", broken) is True                  # store down: the last answer stays in force
-    assert cache.contains("a", lambda: []) is False             # a restore elsewhere is seen after the ttl
+    with pytest.raises(RuntimeError):                           # I1: past the window an unrefreshable cache is no answer
+        cache.contains("a", broken)
+    with pytest.raises(RuntimeError):
+        cache.contains("zzz", broken)                           # not even for ids it never listed as tombstoned
+    assert cache.contains("a", lambda: []) is False             # a restore elsewhere is seen after the store recovers
     cache.add(["c"])
     assert cache.contains("c", broken) is True
     cache.invalidate()
+    with pytest.raises(RuntimeError):                           # an invalidated cache that cannot refresh is no answer
+        cache.contains("c", broken)
     assert cache.contains("c", lambda: []) is False
+
+
+def test_i1_a_tombstoned_artifact_is_never_served_once_the_store_cannot_refresh_the_cache(registry_pg):
+    with api(registry_pg, extra={"artifact_acl": ArtifactAcl()}) as env:
+        env.server.tombstone_cache = TombstoneCache(ttl=0.3)
+        aid, _ = legacy_upload(env)
+        assert status_of(env, f"{ROOT}/{aid}")[0] == 200                  # warms the cache: not tombstoned
+        # another process tombstones it; this process' cache still says "live" until the window ends
+        env.adapter("tombstone_artifact", aid, actor=OWNER, reason="gone")
+        # the real store connection dies, so the cache cannot refresh
+        asyncio.run_coroutine_threadsafe(env.adapter._store._conn.close(), env.adapter._loop).result()
+        time.sleep(0.5)                                                    # past the staleness window
+        for path in (f"{ROOT}/{aid}", f"{ROOT}/{aid}/download", f"{ROOT}/{aid}/reviews"):
+            code, body = status_of(env, path)
+            assert code != 200, (path, code)                               # a dead store never serves the artifact
+            assert b"legacy secret" not in body
+        # the legacy read path consults only the cache: it answers the fixed 503, not a stale "live"
+        assert status_of(env, f"{ROOT}/{aid}/download") == (503, b'{"error": "artifact store unavailable"}')
 
 
 # ------------------------------------------------------------------------------------------------ N3
@@ -487,3 +544,15 @@ def test_n3_register_report_blob_and_commit_version_wait_for_the_sweep_and_reche
                 await task
 
     run(with_store(registry_pg["dsn"], blobs, body))
+
+
+def test_the_reviews_list_of_a_legacy_upload_follows_the_acl_when_a_store_exists(registry_pg):
+    """A legacy event-projection upload has no registry row: the ACL alone decides, as for artifact-reviews/{id}."""
+    from herdr_engineering.control_plane.artifact_reviews import ArtifactReviewManager
+    reviews = ArtifactReviewManager()
+    with api(registry_pg, extra={"artifact_acl": ArtifactAcl(), "artifact_review_manager": reviews}) as env:
+        aid, _ = legacy_upload(env)
+        reviews.request(artifact_id=aid, version_id="v1", requested_by="x")
+        got, body = request(env.base, f"{ROOT}/{aid}/reviews", key="creator-key")
+        assert got == 200 and len(body["reviews"]) == 1
+        assert request(env.base, f"{ROOT}/{aid}/reviews", key="member-key")[0] == 404

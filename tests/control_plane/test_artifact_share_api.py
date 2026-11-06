@@ -49,6 +49,15 @@ def report_document():
                                        "media_type": "text/csv", "sha256": sha, "size_bytes": 8}]}
 
 
+HOSTILE_SVG = (b'<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><script>alert(2)</script>'
+               b'<style>@import url(http://evil.example/x.css);</style><foreignObject><iframe src="http://e.example"/>'
+               b'</foreignObject><image href="http://evil.example/p.png"/><use href="http://evil.example/s.svg#a"/></svg>')
+FIGURE_FILES = [("svg", "image/svg+xml", HOSTILE_SVG), ("png", "image/png", b"\x89PNG\r\n\x1a\n" + b"\x01" * 30),
+                ("html", "text/html", b"<script>alert(3)</script>"),
+                ("blob", "application/octet-stream", b"\x00\x01\x02"),
+                ("huge", "image/png", b"\x02" * 200_000)]
+
+
 class Bytes:
     """RustFS stand-in: content-addressed bytes, served in small chunks, counting reads."""
 
@@ -89,13 +98,42 @@ class Registry:
         self.versions["v_pdf"] = {"version_id": "v_pdf", "artifact_id": AID, "state": "ready",
                                   "output_manifest": [output("paper.pdf", b"%PDF-1.4 fake",
                                                              media_type="application/pdf")]}
+        page = b"<!DOCTYPE HTML><HTML><BODY CLASS=x><P>upper</P></BODY></HTML>"
+        svg = b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>"
+        xhtml = b"<html xmlns='http://www.w3.org/1999/xhtml'><body>x</body></html>"
+        big = b"<html><body>" + b"x" * (2 * 1024 * 1024) + b"</body></html>"
+        utf16 = "<html><body>hi</body></html>".encode("utf-16")
+        utf32 = "<html><body>hi</body></html>".encode("utf-32")
+        hidden = b"<template><body></template><p>nothing visible"
+        for data in (page, svg, xhtml, big, utf16, utf32, hidden):
+            blobs.add(data)
+        for vid, files in {"v_upper": [("index.html", page)], "v_svg": [("index.html", page), ("pic.svg", svg)],
+                           "v_xhtml": [("index.html", page), ("doc.xhtml", xhtml)], "v_big": [("index.html", big)],
+                           "v_utf16": [("index.html", utf16)], "v_utf32": [("index.html", utf32)],
+                           "v_hidden": [("index.html", hidden)]}.items():
+            self.versions[vid] = {"version_id": vid, "artifact_id": AID, "state": "ready",
+                                  "output_manifest": [output(n, d) for n, d in files]}
         self.versions["v_building"] = {**copy.deepcopy(self.versions["v_pdf"]), "version_id": "v_building",
                                        "state": "building"}
         self.versions["v_csv"] = {"version_id": "v_csv", "artifact_id": AID, "state": "ready",
                                   "output_manifest": [output("t.csv", b"a,b\n1,2\n", media_type="text/csv")]}
+        self.versions["v_figs"] = self._figure_version(blobs)
         self.versions["v_report"] = {"version_id": "v_report", "artifact_id": AID, "state": "ready",
                                      "report_descriptor": report_document(),
                                      "output_manifest": [output("data.csv", b"evidence", media_type="text/csv")]}
+
+    @staticmethod
+    def _figure_version(blobs):
+        figures, assets = [], []
+        for name, media, data in FIGURE_FILES:
+            sha = blobs.add(data)
+            assets.append({"id": name, "name": f"{name}.bin", "role": "figure", "media_type": media,
+                           "sha256": sha, "size_bytes": len(data)})
+            figures.append({"id": f"fig-{name}", "title": f"Figure {name}", "asset_id": name, "caption": f"cap {name}"})
+        document = report_document()
+        document["figures"], document["assets"] = figures, document["assets"] + assets
+        return {"version_id": "v_figs", "artifact_id": AID, "state": "ready", "report_descriptor": document,
+                "output_manifest": [output("data.csv", b"evidence", media_type="text/csv")]}
 
     def sync_call(self, method, *args, **kwargs):
         return asyncio.run(getattr(self, method)(*args, **kwargs))
@@ -123,6 +161,13 @@ class Registry:
     async def get_report_descriptor(self, aid, vid):
         return copy.deepcopy(self.versions[vid]["report_descriptor"])
 
+    async def get_report_asset(self, aid, vid, asset_id):
+        descriptor = self.versions[vid]["report_descriptor"]
+        asset = next((a for a in descriptor["assets"] if a["id"] == asset_id), None)
+        if asset is None:
+            raise ArtifactError("no artifact report asset")
+        return {**asset, "storage_key": key_for(asset["sha256"])}
+
     async def verify_share_outputs(self, aid, vid):
         if vid in self.foreign:
             raise ArtifactError("report reference must be uploaded in this artifact scope")
@@ -143,6 +188,12 @@ class Shares:
 
     def sync_call(self, method, *args, **kwargs):
         return getattr(self, method)(*args, **kwargs)
+
+    def acquire_spend(self):          # the real store's cross-process lock; approvals here are already serialised
+        self.spend_held = getattr(self, "spend_held", 0) + 1
+
+    def release_spend(self):
+        self.spend_held -= 1
 
     def _public(self, row):
         return {k: v for k, v in row.items() if k != "token_hash"}
@@ -207,7 +258,7 @@ class Shares:
                                     "actor": actor, "detail": {"was": was}})
         return self._public(row)
 
-    def live_total_bytes(self):
+    def live_total_bytes(self, *, member=False):
         return self.live_bytes_extra + sum(r["total_bytes"] or 0 for r in self.rows.values() if r["state"] == "live")
 
     def events(self, share_id, limit=200):
@@ -444,6 +495,33 @@ def test_report_version_gets_generated_preview_html_entry(env):
     assert shares.rows[share_id]["entry"] == "preview.html"
     state_files = list((root / "by-token").glob("*/state.json"))
     assert len(state_files) == 1 and json.loads(state_files[0].read_text())["entry"] == "preview.html"
+
+
+def test_report_share_embeds_safe_figure_images_inline_and_nothing_else(env):
+    import re
+
+    from herdr_engineering.control_plane import share_render as sr
+
+    base, _, shares, blobs, root = env
+    status, body = create(base, version="v_figs")
+    assert status == 201, body
+    share_id = body["share"]["share_id"]
+    status, body = approve(base, share_id)
+    assert status == 200, body
+    preview = (root / share_id / "files" / "preview.html").read_bytes()
+    text = preview.decode()
+    sources = re.findall(r'<img class="fig-img" alt="([^"]*)" src="([^"]*)">', text)
+    assert sorted(alt for alt, _ in sources) == ["Figure png", "Figure svg"]   # html, octet-stream and oversize: links only
+    assert {src.split(";")[0] for _, src in sources} == {"data:image/svg+xml", "data:image/png"}
+    for needle in ("<svg", "<script", "onload", "evil.example", "javascript:", "alert("):
+        assert needle not in text, needle
+    for caption in ("cap html", "cap blob", "cap huge"):
+        assert caption in text                       # the figure is still described
+    assert "shortened or omitted" in text            # the oversize image was dropped, and the page says so
+    # the share view's real sanitiser (nh3 in its killable child) keeps both images and nothing else
+    out = sr.sanitize_html(preview, resolve=lambda _context, url: url)
+    assert out.count("<img") == 2 and "data:image/svg+xml;base64," in out and "data:image/png;base64," in out
+    assert "<svg" not in out and "<script" not in out and "src=\"http" not in out
 
 
 def test_caps_enforced_including_total_live_bytes(tmp_path):
@@ -812,3 +890,17 @@ def test_a_public_share_ignores_the_owner_emails(tmp_path):
     with share_server(tmp_path, owner_emails=["owner@lab.test"]) as (base, *_):
         status, body = create(base, audience="public")
         assert status == 201 and not body["share"].get("allow_emails")
+
+
+def test_share_settings_public_host_derives_the_link_base():
+    from herdr_engineering.control_plane.artifact_share_api import share_settings_config
+    only_host = share_settings_config({}, public_url=None, public_host="artifacts.example.org")
+    assert only_host["public_url"] == "https://artifacts.example.org"
+    same = share_settings_config({}, public_url="https://artifacts.example.org/", public_host="artifacts.example.org")
+    assert same["public_url"] == "https://artifacts.example.org"
+    with pytest.raises(ValueError, match="disagree"):
+        share_settings_config({}, public_url="https://old.example.org", public_host="artifacts.example.org")
+    for bad in ("Artifacts.example.org", "https://a.example.org", "a.example.org:443", "", "localhost"):
+        with pytest.raises(ValueError, match="public_host"):
+            share_settings_config({}, public_url=None, public_host=bad)
+    assert share_settings_config({}, public_url="https://x.example/")["public_url"] == "https://x.example/"

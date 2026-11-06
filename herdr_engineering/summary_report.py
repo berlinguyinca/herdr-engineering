@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -251,11 +252,12 @@ def _close_if_alive(sidecar, run, env, herdr):
             run([herdr, "pane", "close", previous], capture_output=True, text=True, timeout=10, env=env)
 
 
-def _split(run, env, herdr, parent, direction, cwd, *extra):
+def _split(run, env, herdr, parent, direction, cwd, *extra, focus=False):
     if env.get("PYTHONPATH"):                  # a pane's shell starts from Herdr's environment, not ours
         extra = (*extra, "--env", f"PYTHONPATH={env['PYTHONPATH']}")
-    done = run([herdr, "pane", "split", "--pane", parent, "--direction", direction, *extra, "--no-focus",
-                "--cwd", str(cwd)], capture_output=True, text=True, timeout=10, env=env)
+    done = run([herdr, "pane", "split", "--pane", parent, "--direction", direction, *extra,
+                "--focus" if focus else "--no-focus", "--cwd", str(cwd)],
+               capture_output=True, text=True, timeout=10, env=env)
     return json.loads(done.stdout)["result"]["pane"]["pane_id"] if done.returncode == 0 else None
 
 
@@ -279,16 +281,79 @@ def _build_graph(file, raw, agent, session_id, history):
     return graph
 
 
+def _viewer_pid(pidfile, file):
+    """Pid of the live viewer that wrote ``pidfile`` for ``file``, else None (a recycled pid is told by its argv)."""
+    try:
+        pid = int(Path(pidfile).read_text().strip())
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (OSError, ValueError):
+        return None
+    return pid if str(file).encode() in argv else None
+
+
+def _live_pane(file, suffix, run, env, herdr):
+    """``(pane_id, viewer_pid)`` of a report viewer still open from an earlier publish, else ``(None, None)``."""
+    sidecar = Path(str(file) + suffix + ".pane") if suffix else Path(str(file) + ".pane")
+    pane = sidecar.read_text().strip() if sidecar.is_file() else ""
+    pid = _viewer_pid(Path(str(file) + suffix + ".viewer.pid"), file)
+    if not (pane and pid):
+        return None, None
+    alive = run([herdr, "pane", "get", pane], capture_output=True, text=True, timeout=10, env=env)
+    return (pane, pid) if alive.returncode == 0 else (None, None)
+
+
+def _refresh(*pids):
+    """Wake viewers so they re-read the files: the viewer loop redraws on SIGWINCH."""
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGWINCH)
+        except (OSError, TypeError):
+            pass
+
+
+def _focus(run, env, herdr, agent_pane):
+    run([herdr, "pane", "focus", "--pane", agent_pane, "--direction", "right"], capture_output=True, text=True,
+        timeout=10, env=env)
+
+
+def _reuse_panes(file, pane_id, env, run, herdr, build):
+    """Refresh the viewers of a still-open pair in place. ``None`` when the pair cannot be reused as it stands."""
+    target, pid = _live_pane(file, "", run, env, herdr)
+    if not target:
+        return None
+    graph_pane, graph_pid = _live_pane(file, ".graph", run, env, herdr)
+    try:
+        graph = build()
+    except Exception as exc:
+        return None if graph_pane else ({"ok": True, "pane_id": target, "reused": True},
+                                        {"ok": False, "error": exc.__class__.__name__})
+    if bool(graph) != bool(graph_pane):
+        return None                       # a graph appeared or went away: the viewers' peer ids would be stale
+    _refresh(pid, graph_pid)
+    _focus(run, env, herdr, pane_id)
+    return ({"ok": True, "pane_id": target, "reused": True},
+            {"ok": True, "pane_id": graph_pane, "reused": True} if graph_pane else {"ok": False, "skipped": True})
+
+
 def _open_panes(file, pane_id, env, run, herdr, build):
     """Show the report in a pane to the right of the caller's own and, if ``build()`` gives a graph, the graph under it.
 
     The summary pane is split first so it exists at once; its viewer starts after the graph is known, because
     it must be told its peer's id. A pair that is still alive is replaced whole.
     """
+    built = []
+
+    def build_once():
+        if not built:
+            built.append(build())
+        return built[0]
     try:
+        reused = _reuse_panes(file, pane_id, env, run, herdr, build_once)
+        if reused:
+            return reused
         _close_if_alive(Path(str(file) + ".pane"), run, env, herdr)
         _close_if_alive(Path(str(file) + ".graph.pane"), run, env, herdr)
-        target = _split(run, env, herdr, pane_id, "right", Path(file).parent)
+        target = _split(run, env, herdr, pane_id, "right", Path(file).parent, focus=True)
         if not target:
             return {"ok": False, "error": "split_failed"}, {"ok": False, "skipped": True}
         Path(str(file) + ".pane").write_text(target)
@@ -297,7 +362,7 @@ def _open_panes(file, pane_id, env, run, herdr, build):
 
     graph_pane, info = None, {"ok": False, "skipped": True}
     try:
-        graph = build()
+        graph = build_once()
         if graph:
             graph_pane = _split(run, env, herdr, target, "down", Path(file).parent, "--ratio", str(1 - GRAPH_RATIO))
             info = {"ok": True, "pane_id": graph_pane} if graph_pane else {"ok": False, "error": "split_failed"}
@@ -327,16 +392,27 @@ def _close_panes(run, herdr, *panes):
                 pass
 
 
-def _view(draw, out, viewer, title, scroll, run, herdr, close_pane, peer_pane):
-    """Run ``draw(width, height) -> lines`` in the viewer loop, or print it without a terminal; then close the panes."""
+def _view(draw, out, viewer, title, scroll, run, herdr, close_pane, peer_pane, pidfile=None):
+    """Run ``draw(width, height) -> lines`` in the viewer loop, or print it without a terminal; then close the panes.
+
+    While the loop runs, ``pidfile`` holds our pid so a later publish can find this viewer, ask it to redraw
+    (SIGWINCH) and reuse the pane instead of closing and splitting again.
+    """
     try:
         if not out.isatty():
             out.write("\n".join(draw(100, 24)) + "\n")
             return 0
+        if pidfile:
+            try:
+                Path(pidfile).write_text(str(os.getpid()))
+            except OSError:
+                pass
         return viewer(draw, scroll=scroll, title=title, out=out)
     except (Exception, KeyboardInterrupt):
         return 1
     finally:
+        if pidfile:
+            Path(pidfile).unlink(missing_ok=True)
         _close_panes(run, herdr, peer_pane, close_pane)
 
 
@@ -352,14 +428,19 @@ def view_report(file, *, close_pane=None, peer_pane=None, run=subprocess.run, ou
     out = out or sys.stdout
     color = os.environ.get("NO_COLOR") is None
     try:
-        text = Path(file).read_text()
+        Path(file).read_text()
     except OSError:
         _close_panes(run, herdr, peer_pane, close_pane)
         return 1
 
     def draw(width, _height):
+        try:                                   # re-read: a republish rewrites the file under a live viewer
+            text = Path(file).read_text()
+        except OSError:
+            text = "(the report file is no longer available)"
         return render_markdown(text, width=min(max(width - 2, 40), 110), color=color).split("\n")
-    return _view(draw, out, viewer or run_viewer, "session summary", True, run, herdr, close_pane, peer_pane)
+    return _view(draw, out, viewer or run_viewer, "session summary", True, run, herdr, close_pane, peer_pane,
+                 pidfile=str(file) + ".viewer.pid")
 
 
 def view_graph(file, *, close_pane=None, peer_pane=None, run=subprocess.run, out=None, herdr="herdr",
@@ -383,8 +464,30 @@ def view_graph(file, *, close_pane=None, peer_pane=None, run=subprocess.run, out
     unicode = "utf" in (getattr(out, "encoding", None) or "utf-8").lower()
 
     def draw(width, _height):
-        return render_graph(graph, width, unicode=unicode, color=color)
-    return _view(draw, out, viewer or run_viewer, "drift graph", True, run, herdr, close_pane, peer_pane)
+        current = graph
+        try:                                   # re-read: a republish rewrites the sidecar under a live viewer
+            fresh = json.loads(Path(str(file) + ".graph.json").read_text())
+            current = fresh if isinstance(fresh, dict) and fresh.get("segments") else graph
+        except (OSError, ValueError):
+            pass
+        return render_graph(current, width, unicode=unicode, color=color)
+    return _view(draw, out, viewer or run_viewer, "drift graph", True, run, herdr, close_pane, peer_pane,
+                 pidfile=str(file) + ".graph.viewer.pid")
+
+
+def _digest(report, file, agent, session_id, out):
+    """A few lines the terminal can show: status, the opening of the report, where it lives, dashboard state."""
+    lines = [row.strip() for row in report.splitlines() if row.strip()]
+    status = next((row for row in lines if row.lower().startswith("**overall status:**")), "")
+    opening = [row for row in lines if not row.startswith("#") and row != status
+               and not row.startswith("**Session:**")][:2]
+    dash = out["dashboard"]
+    dashboard = (f"dashboard Summary view ({agent} session {session_id})" if dash["ok"]
+                 else f"not posted ({dash.get('error', 'skipped')})" if not dash.get("skipped") else "not requested")
+    parts = [status or "Overall status: not stated in the report"]
+    parts += [row[:200] for row in opening]
+    parts += [f"Report file: {file}", f"Dashboard: {dashboard}"]
+    return "\n".join(parts)
 
 
 def publish_report(agent, session_id, text, *, home=None, environ=None, run=subprocess.run,
@@ -430,4 +533,5 @@ def publish_report(agent, session_id, text, *, home=None, environ=None, run=subp
     out["ok"] = bool(places)
     out["message"] = (f"Session summary published to {' and '.join(places)}; it is not repeated here."
                       if places else "")
+    out["digest"] = _digest(report, file, agent, session_id, out) if places else ""
     return out

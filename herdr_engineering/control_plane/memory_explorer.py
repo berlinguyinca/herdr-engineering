@@ -6,7 +6,7 @@ The control plane never talks to Hindsight and holds no memory store. Everything
 Fail-closed rules:
 
 * Off unless ``control_plane.memory.enabled``; disabled answers 404.
-* The viewer is the authenticated API-key principal mapped in YAML
+* The viewer is the operator-configured API principal (including an approved open-listener) mapped in YAML
   (``control_plane.memory.viewers: {"key:<digest>": {projects: [..] | "*", scopes: ["global", "infra"]}}``). An
   unmapped principal, or a role other than viewer/operator, is refused (403). Nothing here consults a request header.
 * Every returned memory is authorized by its *bank* on the server, whatever the CLI returned. A memory in a bank the
@@ -33,6 +33,7 @@ MAX_QUERY = 500
 MAX_LIMIT = 50
 MAX_OFFSET = 500
 MAX_PROJECT_CALLS = 8
+MAX_LOOKUP_CALLS = MAX_PROJECT_CALLS + 2
 RECALL_CAP = 200
 STATUSES = ("candidate", "verified", "superseded", "retracted")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -50,6 +51,12 @@ class MemoryUnavailable(Exception):
 
 class MemoryNotFound(Exception):
     """The CLI says the memory does not exist."""
+
+
+def collection_kind(value):
+    if value not in ("fact", "summary"):
+        raise ValueError("unknown memory collection kind")
+    return value
 
 
 class MemoryAdapter:
@@ -76,15 +83,16 @@ class MemoryAdapter:
         if not isinstance(data, dict):
             raise MemoryUnavailable("unexpected herdr-memory output")
         if code != 0:
-            if str(data.get("error") or data.get("code") or "").lower().replace(" ", "_") in {"not_found", "notfound"}:
+            if str(data.get("error") or data.get("code") or "").lower().replace(" ", "_") in {"not_found", "notfound", "memory_not_found"}:
                 raise MemoryNotFound()
             raise MemoryUnavailable("herdr-memory reported an error")
         return data
 
-    def recall(self, query, *, scope=None, project=None, max_results=RECALL_CAP):
+    def recall(self, query, *, scope=None, project=None, max_results=RECALL_CAP, kind="fact"):
+        kind = collection_kind(kind)
         # `--project` is a top-level option of herdr-memory: argparse rejects it after the action.
         args = ["--project", project] if project else []
-        args += ["recall", query, "--max-results", str(int(max_results))]
+        args += ["recall", query, "--max-results", str(int(max_results)), "--kind", kind]
         if scope:
             args += ["--scope", scope]
         data = self._call(*args)
@@ -92,9 +100,10 @@ class MemoryAdapter:
             raise MemoryUnavailable("herdr-memory recall is not contract v1")
         return data
 
-    def get(self, memory_id, *, scope="project", project=None):
+    def get(self, memory_id, *, scope="project", project=None, kind="fact"):
+        kind = collection_kind(kind)
         args = ["--project", project] if project else []
-        return self._call(*args, "get", memory_id, "--scope", scope)
+        return self._call(*args, "get", memory_id, "--scope", scope, "--kind", kind)
 
     def status(self):
         data = self._call("status")
@@ -232,12 +241,16 @@ class MemoryExplorer:
             self._audit(principal, "-".join(parts[:1]) or "root", "forbidden")
             return 403, {"error": "forbidden"}
         try:
+            kind = collection_kind(query.get("kind", "fact"))
+        except ValueError:
+            return 400, {"error": "unknown kind"}
+        try:
             if parts == ["status"]:
                 return self._status(principal)
             if parts == ["search"]:
-                return self._search(query, principal, viewer)
+                return self._search(query, principal, viewer, kind=kind)
             if len(parts) == 1 and _ID.match(parts[0]):
-                return self._detail(parts[0], principal, viewer)
+                return self._detail(parts[0], query, principal, viewer, kind=kind)
         except MemoryUnavailable:
             self._audit(principal, parts[0] if parts else "root", "unavailable")
             return 503, {"error": "memory service unavailable", "state": "unavailable"}
@@ -256,24 +269,60 @@ class MemoryExplorer:
         self._audit(principal, "status", "ok")
         return 200, out
 
-    def _detail(self, memory_id, principal, viewer):
-        raw = None
-        # herdr-memory `get` is per scope (one bank each) and the route carries none: try the shared scopes first.
-        for scope in ("global", "infra", "project"):
+    @staticmethod
+    def _targets(scopes, project, viewer):
+        """Only granted targets; finite project grants never use the CLI's implicit project."""
+        calls = []
+        for scope in dict.fromkeys(scopes):
+            if (scope == "project" or scope.startswith("mission:")) and not project and not viewer.all_projects:
+                projects = [name for name in sorted(viewer.projects) if viewer.may_read_project(name)]
+                calls.extend((scope, name) for name in projects[:MAX_PROJECT_CALLS])
+            else:
+                calls.append((scope, project if scope not in ("global", "infra") else None))
+        return calls[:MAX_LOOKUP_CALLS]
+
+    @staticmethod
+    def _matches(memory, kind, project=None, scopes=None):
+        if project and memory["project"] != project:
+            return False
+        if scopes is not None and memory["scope"] not in scopes:
+            return False
+        # fact is a collection selector, not a semantic subtype: decisions and
+        # procedures in a facts bank remain facts-collection results.
+        if memory["scope"] == "project" and not memory["bank_id"].endswith(
+                "-summaries" if kind == "summary" else "-facts"):
+            return False
+        return (memory["kind"] == "summary") == (kind == "summary")
+
+    def _detail(self, memory_id, query, principal, viewer, *, kind="fact"):
+        plan = self._plan(query, viewer)
+        if plan == "bad scope":
+            return 400, {"error": "unknown scope"}
+        if plan == "forbidden":
+            self._audit(principal, "detail", "forbidden")
+            return 403, {"error": "forbidden"}
+        scopes, project = plan
+        if not query.get("scope"):
+            scopes = [scope for scope in ("global", "infra", "project") if scope in scopes]
+        adapter = self.adapter()
+        for scope, proj in self._targets(scopes, project, viewer):
             try:
-                raw = self.adapter().get(memory_id, scope=scope)
-                break
+                raw = adapter.get(memory_id, scope=scope, project=proj, kind=kind)
             except MemoryNotFound:
                 continue
-        if isinstance(raw, dict) and isinstance(raw.get("memory"), dict):
-            raw = {**raw["memory"], "revisions": raw.get("revisions", raw["memory"].get("revisions"))}
-        memory = clean_memory(raw, viewer, detail=True)
-        if memory is None or memory["memory_id"] != memory_id:   # unreadable and missing look the same
-            self._audit(principal, "detail", "not_found", memory_id=memory_id)
-            return 404, {"error": "not found"}
-        self._audit(principal, "detail", "ok", memory_id=memory_id, scope=memory["scope"])
-        return 200, {"memory": memory, "retrieval_history": {
-            "state": "unknown", "events": [], "reason": "herdr-memory contract v1 does not expose retrieval events"}}
+            # Transport/auth errors intentionally escape: only a recognized miss
+            # permits another authorized lookup, never a fallback on failure.
+            if isinstance(raw, dict) and isinstance(raw.get("memory"), dict):
+                raw = {**raw["memory"], "revisions": raw.get("revisions", raw["memory"].get("revisions"))}
+            memory = clean_memory(raw, viewer, detail=True)
+            if (memory is None or memory["memory_id"] != memory_id
+                    or not self._matches(memory, kind, project=project or proj, scopes=[scope])):
+                continue
+            self._audit(principal, "detail", "ok", memory_id=memory_id, scope=memory["scope"])
+            return 200, {"memory": memory, "retrieval_history": {
+                "state": "unknown", "events": [], "reason": "herdr-memory contract v1 does not expose retrieval events"}}
+        self._audit(principal, "detail", "not_found", memory_id=memory_id)
+        return 404, {"error": "not found"}
 
     def _plan(self, query, viewer):
         """(scopes to ask, project filter) or an error string. A filter the viewer may not use is a refusal."""
@@ -292,7 +341,7 @@ class MemoryExplorer:
                                 if s in viewer.scopes or (s == "project" and (viewer.all_projects or viewer.projects))]
         return scopes, project
 
-    def _search(self, query, principal, viewer):
+    def _search(self, query, principal, viewer, *, kind="fact"):
         q = (query.get("q") or "").strip()
         if not q or len(q) > MAX_QUERY:
             return 400, {"error": "q is required (1-500 characters)"}
@@ -308,19 +357,16 @@ class MemoryExplorer:
             self._audit(principal, "search", "forbidden")
             return 403, {"error": "forbidden"}
         scopes, project = plan
-        kind, status = query.get("kind") or None, query.get("status") or None
+        status = query.get("status") or None
         if status and status not in STATUSES:
             return 400, {"error": "unknown status"}
-        calls = []
-        for scope in scopes:
-            if scope == "project" and not project and not viewer.all_projects:
-                calls += [(scope, p) for p in sorted(viewer.projects)[:MAX_PROJECT_CALLS]]
-            else:
-                calls.append((scope, project if scope != "global" and scope != "infra" else None))
+        calls = self._targets(scopes, project, viewer)
         adapter, merged, failures, degraded, offline = self.adapter(), {}, 0, False, False
         for scope, proj in calls:
             try:
-                data = adapter.recall(q, scope=scope, project=proj, max_results=min(RECALL_CAP, offset + limit + 1))
+                data = adapter.recall(q, scope=scope, project=proj, kind=kind, max_results=min(RECALL_CAP, offset + limit + 1))
+            except MemoryNotFound:
+                continue
             except MemoryUnavailable:
                 failures += 1
                 continue
@@ -333,7 +379,7 @@ class MemoryExplorer:
         if calls and failures == len(calls):
             raise MemoryUnavailable("every recall failed")
         items = [i for i in merged.values()
-                 if (not project or i["project"] == project) and (not kind or i["kind"] == kind)
+                 if self._matches(i, kind, project=project, scopes=scopes if query.get("scope") else None)
                  and (not status or i["status"] == status)
                  and (not query.get("harness") or i["provenance"].get("harness_id") == query["harness"])
                  and (not query.get("host") or i["provenance"].get("host_id") == query["host"])]
