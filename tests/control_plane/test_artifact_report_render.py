@@ -324,3 +324,23 @@ def test_table_cells_do_not_break_words_character_by_character():
     page = _render()
     assert "overflow-wrap:anywhere" not in page and "overflow-wrap:break-word" in page
     assert "td .chip{white-space:nowrap}" in page
+
+
+def test_public_preview_has_no_dangling_report_links_when_referenced_evidence_is_omitted():
+    """Chips for omitted evidence fall back to href="report"; the public copy must not keep that dead link."""
+    from herdr_engineering.control_plane.artifact_report_render import render_report_preview
+    from herdr_engineering.control_plane.artifact_share_api import _report_preview
+    from herdr_engineering.control_plane import share_render as sr
+
+    report = descriptor()
+    report["evidence"] = [{"id": f"e{i}", "title": f"Evidence {i}", "description": "d " * 900, "asset_ids": ["data"]}
+                          for i in range(40)]
+    report["findings"][0]["evidence_ids"] = ["e39", "e0"]
+    # the cap-limited renderer really leaves the chip pointing at the descriptor...
+    small = render_report_preview(report, max_bytes=16 * 1024)
+    assert '<a class="chip" href="report">' in small
+    # ...so the public copy at the same cap must turn it into plain text, before and after the sanitiser
+    public = _report_preview(report, max_bytes=16 * 1024)
+    for page in (public.decode(), sr.sanitize_html(public, resolve=lambda _context, url: url)):
+        assert 'href="report"' not in page and 'href="#"' not in page
+        assert "e39" in page  # the id stays visible as plain text

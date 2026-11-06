@@ -149,12 +149,14 @@ def _share_body(handler, allowed):
     return value
 
 
-def _report_preview(descriptor: dict) -> bytes:
+def _report_preview(descriptor: dict, *, max_bytes: int | None = None) -> bytes:
     """The rendered report preview with asset and descriptor links reduced to plain text (assets are not shared)."""
     from .artifact_report_render import render_report_preview
-    page = render_report_preview(descriptor, asset_url=lambda asset: "#")
+    options = {} if max_bytes is None else {"max_bytes": max_bytes}
+    page = render_report_preview(descriptor, asset_url=lambda asset: "#", **options)
     page = re.sub(r'<a class="btn" href="#" download>.*?</a>', "", page)  # a download button has no target here
-    page = re.sub(r'<a (class="[a-z ]+") href="#">(.*?)</a>', r"<span \1>\2</span>", page)  # keep chip styling
+    # keep chip styling; a chip whose target was omitted points at the descriptor ("report"), which is not shared
+    page = re.sub(r'<a (class="[a-z ]+") href="(?:#|report)">(.*?)</a>', r"<span \1>\2</span>", page)
     return re.sub(r'<a href="(?:#|report)">(.*?)</a>', r"\1", page).encode("utf-8")
 
 
