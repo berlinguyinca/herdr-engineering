@@ -1262,14 +1262,20 @@ class SlackRuntime:
                 self.store.put_slack_ask(wish)
         if refusal is not None and ask.activation == "pending":
             tail = "" if refusal == "not_rememberable" else " I will try again after your next approval of this action."
-            self._say(ask, f"Approved, but not remembered yet: {_SENTENCES.get(refusal, _SENTENCES['judge_error'])}."
-                           f"{tail}")
+            sentence = _SENTENCES.get(refusal, _SENTENCES['judge_error'])
+            if refusal == "not_rememberable" and row.verb in (Verb.DEPLOY_PROD.value, Verb.DEPLOY_CANARY.value):
+                sentence = ("a deploy approval is bound to one commit and cannot be remembered; to let this worker "
+                            "deploy a scope without asking, confirm auto-deploy for the scope "
+                            "(POST /api/v1/assistant-deploys/<project>/<scope>/auto)")
+            self._say(ask, f"Approved, but not remembered yet: {sentence}.{tail}")
 
     def _activate(self, ask: SlackAsk, row: ActionRequestRow, uid: str, now: datetime) -> str | None:
         """None when the grant is active (now or already), otherwise the refusal code."""
         cfg = self.service.config["grants"]
         if row.verb == Verb.UNKNOWN.value or not row.key_canonical:
             return "not_rememberable"
+        if row.verb in (Verb.DEPLOY_PROD.value, Verb.DEPLOY_CANARY.value):
+            return "not_rememberable"            # a sha-bound deploy approval is never a standing permission
         key = ActionKey.from_canonical(row.key_canonical)
         if key.key_id() != row.key_id:
             return "not_rememberable"

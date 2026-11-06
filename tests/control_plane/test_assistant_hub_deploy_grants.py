@@ -470,3 +470,19 @@ def test_deploy_tool_for_a_configured_repo_is_scope_gated_never_one_shot(dw):
 def test_deploy_tool_for_an_unconfigured_repo_keeps_the_ordinary_key(dw):
     d = _tool_deploy(dw, repo="nobody/unlisted")
     assert d.source != "deploy_mode"
+
+
+def test_a_one_shot_deploy_is_audited_as_authorized(dw):
+    d = dw.deploy()
+    record_owner_decision(dw.store, dw.cfg, NOW, T, U, d.request_id, True, "slack:U0OWNER01", provenance="owner_slack")
+    assert dw.deploy().outcome == "authorized"
+    (entry,) = dw.audits("assistant.deploy.authorized")
+    assert SHA[:12] in entry["detail"] and "one_shot=1" in entry["detail"]
+
+
+def test_the_owner_notice_names_the_matched_project_and_scope(dw):
+    seen: list[str] = []
+    decide(dw.store, dw.cfg, dw.worker, RawAction(tool="Bash", command=f"{CMD} --ref {SHA}", repo=REPO.upper()),
+           "s", "t", NOW, judge=dw.judge, deploy_cfg=DEPLOY,
+           notify=lambda row, display, why, *, project="": seen.append(project))
+    assert seen == ["herdr-engineering/control-plane"]

@@ -211,3 +211,17 @@ def test_a_kept_wish_does_not_fire_on_an_approval_for_another_worker_key_tenant_
         w.runtime.stop()
         w.listener.close()
         w.judge_listener._stop.set()
+
+
+def test_remember_on_a_sha_bound_deploy_ask_is_refused_and_points_to_the_scope_flow(rw):
+    from tests.control_plane.test_assistant_hub_deploy_grants import CMD, DEPLOY, REPO, SHA
+    d = decide(rw.store, rw.service.config["grants"], rw.worker,
+               RawAction(tool="Bash", command=f"{CMD} --ref {SHA}", repo=REPO), "s1", "t1", rw.clock.now,
+               judge=rw.judge, deploy_cfg=DEPLOY)
+    assert d.outcome == "pending"
+    ask = rw.ask(d.request_id, created_at=rw.clock.now, expires_at=rw.clock.now + timedelta(minutes=15))
+    rw.tap(ask, "ask_remember")
+    assert rw.grants() == []
+    assert rw.stored(ask).activation == ""
+    (said,) = rw.thread(ask)
+    assert "/auto" in said["text"] and "commit" in said["text"]

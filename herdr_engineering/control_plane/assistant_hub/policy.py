@@ -226,12 +226,16 @@ def _submit_to_recorder(judge: JudgeRuntime | None, worker: Worker, derived: Der
         pass
 
 
-def _notify_owner(notify: Notify | None, row: ActionRequestRow, raw: RawAction) -> None:
+def _notify_owner(notify: Notify | None, row: ActionRequestRow, raw: RawAction,
+                  derived: Derived | None = None) -> None:
     """A NEW pending row is offered to the owner's Slack once.  The notifier only enqueues; a failure changes nothing."""
     if notify is None:
         return
     try:
-        notify(row, row.display, row.reason, project=raw.repo or "")
+        m = derived.deploy if derived is not None else None
+        # the hub-matched project/scope is what the owner should see, not the worker-supplied repo string
+        project = f"{m.project}/{m.scope}" if m is not None else (raw.repo or "")
+        notify(row, row.display, row.reason, project=project)
     except Exception:
         pass
 
@@ -245,7 +249,7 @@ def _pending(store: AssistantStore, worker: Worker, raw: RawAction, derived: Der
         _audit(store, worker, POLICY_ACTOR, "assistant.action.requested", row.request_id,
                f"source={source} key_id={row.key_id}{extra}")
         _submit_to_recorder(judge, worker, derived, row.request_id, session_id, task_id)
-        _notify_owner(notify, row, raw)
+        _notify_owner(notify, row, raw, derived)
     return Decision("pending", reason, row.request_id, None, None, source)
 
 
@@ -399,6 +403,10 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
         consumed = _consume_approval(store, cfg, worker, derived.key.key_id(), now)
         if consumed is not None:
             if derived.deploy is not None:
+                m = derived.deploy
+                _audit(store, worker, POLICY_ACTOR, "assistant.deploy.authorized", consumed.request_id,
+                       f"project={m.project} scope={m.scope} sha12={m.sha[:12]} one_shot=1 "
+                       f"request={consumed.request_id} worker={worker.worker_id}")
                 _open_deploy_check(store, deploy_cfg, worker, derived.deploy, task_id, consumed.request_id, now)
             return Decision("authorized", "Authorized once by the owner's approval of this exact action.",
                             consumed.request_id, None, None, "owner")
