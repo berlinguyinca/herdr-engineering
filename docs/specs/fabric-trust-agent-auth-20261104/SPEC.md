@@ -97,6 +97,14 @@ Security rules (review of 75689743):
 3. Agent task routes + CLI auto agent-mode.
 4. `coordinate` action + coordinator-agent create-by-role + limits + audit.
 5. Dashboard shows `via: fabric`/machine on events; docs (`docs/operations/fabric-trust.md`), threat-model update.
+6a. Dedicated fabric listener (proposal, operator decisions pending):
+   - `collab-public` gains `--collab-fabric-host/--collab-fabric-port` (suggest `100.104.39.6:9483` on bender): the collab API
+     only (no MCP/A2A, web UI or operator API), no proxy and no TLS in front, `Authorization: Fabric` only (Bearer/Agent are
+     refused there). Lives in the same process as the main handler: the event log has ONE writer.
+   - whois goes through a host-side sidecar that exposes only `whois <ip>` on a unix socket in a shared volume; the tailscaled
+     LocalAPI socket is NOT mounted into the isolated `collab-public` container.
+   - Verify first that Docker's published port preserves the real source IP (userland-proxy shows the bridge gateway and Fabric
+     would fail closed). Fallback: `network_mode: host` for this listener only.
 6. Rollout: enable on bender+beast, register `bender-coordinator`, end-to-end drill: coordinator assigns 3 benchmark jobs by
    role to beast agents, one times out and escalates, results collected.
 
