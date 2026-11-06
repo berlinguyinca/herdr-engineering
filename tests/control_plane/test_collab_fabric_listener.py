@@ -46,6 +46,13 @@ ROOT = Path(__file__).resolve().parents[2]
 def start_sidecar(tmp_path, localapi_sock, name="whois.sock"):
     sock = str(tmp_path / name)
     code_ = "import sys; from herdr_engineering.cli import main; sys.exit(main(sys.argv[1:]))"
+    ip = lan_ip()
+    if ip is not None and ipaddress.ip_address(ip) not in TAILNET:
+        # a host with no tailnet address (CI): the tests talk over this host's own address, so widen the sidecar's tailnet-only
+        # check to that single address, inside the sidecar PROCESS only (the production module is untouched)
+        code_ = ("import ipaddress, sys, herdr_engineering.fabric_whois_proxy as w; "
+                 f"w.TAILNET_NETS = (*w.TAILNET_NETS, ipaddress.ip_network('{ip}/32')); "
+                 "from herdr_engineering.cli import main; sys.exit(main(sys.argv[1:]))")
     proc = subprocess.Popen([sys.executable, "-c", code_, "fabric", "whois-proxy", "--listen-socket", sock,
                              "--tailscaled-socket", localapi_sock], cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT)},
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
