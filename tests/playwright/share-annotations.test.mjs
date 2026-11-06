@@ -12,7 +12,10 @@ import * as playwright from 'playwright';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
 const PYTHON = process.env.PYTHON || (fs.existsSync(path.join(ROOT, '.venv/bin/python')) ? path.join(ROOT, '.venv/bin/python') : 'python3');
-const WANTED = ['chromium', 'firefox', 'webkit'];
+// Chromium is the gate and Firefox the second engine; WebKit is opt-in (BROWSERS=chromium,firefox,webkit) because its
+// Linux build needs system libraries (libjxl, libbacktrace) that are not on every host, and without them its content
+// process crashes on these pages.
+const WANTED = (process.env.BROWSERS || 'chromium,firefox').split(',').map((b) => b.trim()).filter(Boolean);
 const PANEL = 'aside[data-annotate-panel]';
 
 let server;
