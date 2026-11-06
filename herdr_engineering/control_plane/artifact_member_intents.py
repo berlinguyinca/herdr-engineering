@@ -77,7 +77,6 @@ KIND_LIBRARY_FOLDER_RENAME = "library_folder_rename"
 KIND_LIBRARY_FOLDER_DELETE = "library_folder_delete"
 KIND_LIBRARY_FILE = "library_file"
 KIND_LIBRARY_UNFILE = "library_unfile"
-KIND_LIBRARY_CLAIM = "library_claim"
 KIND_SHARE_CREATE = "member.share_create"
 KIND_SHARE_APPROVE = "member.share_approve"
 KIND_SHARE_REVOKE = "member.share_revoke"
@@ -330,8 +329,7 @@ for _kind, _keys, _needs_artifact in (
         (KIND_LIBRARY_FOLDER_RENAME, frozenset({"folder_id", "name"}), False),
         (KIND_LIBRARY_FOLDER_DELETE, frozenset({"folder_id"}), False),
         (KIND_LIBRARY_FILE, frozenset({"folder_id"}), True),
-        (KIND_LIBRARY_UNFILE, frozenset({"folder_id"}), True),
-        (KIND_LIBRARY_CLAIM, frozenset({"share_id"}), False)):
+        (KIND_LIBRARY_UNFILE, frozenset({"folder_id"}), True)):
     register_intent_kind(_kind, _folder_payload(_kind, _keys), actors=_USER, requires_artifact=_needs_artifact)
 
 
@@ -442,7 +440,7 @@ async def _own(conn: Any, artifact_id: str | None, principal: str) -> Mapping[st
 async def _conclude(ctx: IntentContext, who: _Who, action: str, out: dict, *, artifact_id: str | None) -> dict:
     """Audit the outcome, stamp ``last_used_at`` and hand the principal to the after-hook."""
     from .artifact_members import MemberStore
-    ok = out.get("result") in ("created", "deleted", "accepted", "renamed", "filed", "unfiled", "claimed")
+    ok = out.get("result") in ("created", "deleted", "accepted", "renamed", "filed", "unfiled")
     await MemberStore(ctx.conn).record(
         who.principal, action, actor=_actor_json(who.actor), artifact_id=artifact_id,
         outcome="ok" if ok else "refused", code=None if ok else str(out.get("reason") or out.get("result")))
@@ -763,18 +761,12 @@ async def _unfile(store: Any, principal: str, intent: Intent, _who: Any) -> dict
     return {}
 
 
-async def _claim(store: Any, principal: str, intent: Intent, _who: Any) -> dict:
-    await store.record_claim(principal.removeprefix("member:"), intent.payload["share_id"])
-    return {}
-
-
 LIBRARY_HANDLERS = (
     (KIND_LIBRARY_FOLDER_CREATE, _library_handler("library_folder_create", _folder_create, "created")),
     (KIND_LIBRARY_FOLDER_RENAME, _library_handler("library_folder_rename", _folder_rename, "renamed")),
     (KIND_LIBRARY_FOLDER_DELETE, _library_handler("library_folder_delete", _folder_delete, "deleted")),
     (KIND_LIBRARY_FILE, _library_handler("library_file", _file, "filed")),
     (KIND_LIBRARY_UNFILE, _library_handler("library_unfile", _unfile, "unfiled")),
-    (KIND_LIBRARY_CLAIM, _library_handler("library_claim", _claim, "claimed")),
 )
 
 

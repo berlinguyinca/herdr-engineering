@@ -30,13 +30,21 @@ FOLDER_CREATE, FOLDER_RENAME, FOLDER_DELETE = (
     "library_folder_rename",
     "library_folder_delete",
 )
-FILE, UNFILE, CLAIM, ACCEPT, DISCARD = (
+FILE, UNFILE, ACCEPT, DISCARD = (
     "library_file",
     "library_unfile",
-    "library_claim",
     "library_accept",
     "library_discard",
 )
+
+
+async def claim(env, rt, member_id, share_id):
+    """What the share-event ingest does for an opened link (there is no intent for it): record, then rewrite the view."""
+    from herdr_engineering.control_plane.artifact_member_intents import write_member_view
+    await LibraryStore(env.pool).record_claim(member_id, share_id)
+    async with env.pool.acquire() as conn:
+        await write_member_view(conn, f"member:{member_id}", rt.mirror_root, defaults=rt.defaults, rt=rt,
+                                rustfs=env.applier.rustfs)
 
 
 def lrun(pg, tmp_path, body):
@@ -125,7 +133,7 @@ def test_each_intent_updates_db_and_view_file(registry_pg, tmp_path):
         assert view_of(env, ALICE)["library"]["folders"][0]["item_count"] == 0
 
         sid = await live_share(env, mine, groups=("nobody",))
-        assert (await send(env, user("bob"), CLAIM, {"share_id": sid}))["result"] == "claimed"
+        await claim(env, rt, "bob", sid)
         assert (await sql(env, "SELECT member_id FROM artifact_share_claims"))[0][0] == "bob"
         (opened,) = [i for i in view_of(env, BOB)["library"]["items"] if i["artifact_id"] == mine]
         assert opened["source"] == "opened" and opened["share_id"] == sid
@@ -216,7 +224,7 @@ def test_replayed_intent_is_idempotent(registry_pg, tmp_path):
         assert (await sql(env, "SELECT count(*) FROM artifact_library_items"))[0][0] == 1
         sid = await live_share(env, mine)
         for _ in range(2):
-            assert (await send(env, user("bob"), CLAIM, {"share_id": sid}))["result"] == "claimed"
+            await claim(env, rt, "bob", sid)
         assert (await sql(env, "SELECT count(*) FROM artifact_share_claims"))[0][0] == 1
         # create is create-or-get by name: a second, differently keyed request yields the same single folder
         dup = await send(env, user("alice"), FOLDER_CREATE, {"name": "A"})
@@ -310,7 +318,7 @@ def test_view_files_end_when_access_ends(registry_pg, tmp_path):
         aid = await create(env, title="Doc")
         await publish(env, aid)
         sid = await live_share(env, aid, groups=("nobody",))
-        assert (await send(env, user("bob"), CLAIM, {"share_id": sid}))["result"] == "claimed"
+        await claim(env, rt, "bob", sid)
         await tick(env, rt)
         assert files_of(env, BOB, aid)
         await sql(env, "UPDATE artifact_shares SET state='revoked' WHERE share_id=$1", sid)
@@ -377,7 +385,7 @@ def test_claimed_item_lists_the_share_pinned_version_not_the_head(registry_pg, t
             0
         ][0]
         sid = await live_share(env, aid, groups=("nobody",))
-        assert (await send(env, user("bob"), CLAIM, {"share_id": sid}))["result"] == "claimed"
+        await claim(env, rt, "bob", sid)
         await publish(env, aid, {"index.html": HTML, "v2-only.css": b"b{}"}, base=v1)
         await tick(env, rt)
         assert {f["path"] for f in files_of(env, BOB, aid)} == {"index.html"}  # v1 only
