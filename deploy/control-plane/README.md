@@ -29,6 +29,16 @@ Compose project (spec 0190). It is the structured-state backbone the unified
 - **Bridge networking (not host).** Unlike `deploy/fabric-stack` (which needs
   host networking for the gateway + CoreDNS), this project only needs the
   services to reach each other, so they resolve by service name.
+- **Member artifact pool: the collab-public group must be configured.** The
+  member blob pool is chowned to the collab-public group so only the collab-public
+  container can read it. If that group id is unknown or the chown is refused, the
+  pool falls back to world-readable `0644` files (a warning is logged), still
+  confined to the mirror volume. Configure the group on every host that serves
+  member artifacts and treat that warning as a deploy failure.
+- **Revoke and expiry are not instant for recipients.** Member views and the blob
+  pool are rewritten by the periodic tick, so after a share is revoked or expires,
+  claimants may still open its content for up to 60 s. The owner's own deletes
+  take effect immediately.
 
 ## Configuration and deploy
 
