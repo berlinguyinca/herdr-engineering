@@ -46,6 +46,15 @@ _FIELDS = ("event", "ts", "build_id", "host", "slot", "cmd_kind", "exit_code", "
            "unavailable")
 _EVENT_FIELDS = ("ts", "build_id", "host", "slot", "cmd_kind", "exit_code", "elapsed_s")
 _SIMPLE = (str, int, float, bool, type(None))
+# Contract events written by the build side to contract-events.jsonl (build_metrics.emit_event); allowlisted fields.
+_CONTRACT_FIELDS = {
+    "cache_stats_updated": ("ts", "build_id", "host", "cache_applied"),
+    "storage_degraded": ("ts", "build_id", "host", "tier", "reason"),
+    "lease_changed": ("ts", "host", "change", "scope_id", "attempt_id", "epoch"),
+    "cleanup_completed": ("ts", "host", "kind", "status", "removed_count", "removed_bytes"),
+}
+_LOGS = ("builds.jsonl", "contract-events.jsonl")
+_BUILD_EVENTS = ("build_started", "build_finished")
 
 
 def build_cache_config(cfg) -> dict:
@@ -117,8 +126,7 @@ class BuildCacheService:
         self.record_event = record_event
         self._now = now
         self._lock = threading.Lock()
-        self._offset: int | None = None
-        self._inode: int | None = None
+        self._cursors: dict[str, list[int | None]] = {}      # log name -> [offset, inode]
         self._hosts: tuple[float, list] | None = None
 
     @property
@@ -195,61 +203,77 @@ class BuildCacheService:
 
     # ---------------------------------------------------------------- events
     def sync_events(self) -> int:
-        """Publish builds.jsonl lines appended since the last call. The first call sets the baseline only."""
+        """Publish log lines appended since the last call (builds.jsonl and contract-events.jsonl).
+
+        The first call sets the baseline only.
+        """
         if self.record_event is None:
             return 0
         with self._lock:
+            return sum(self._sync_log(name) for name in _LOGS)
+
+    def _sync_log(self, name: str) -> int:
+        path = self.state_dir / name
+        cur = self._cursors.setdefault(name, [None, None])
+        try:
+            st = os.stat(path)
+        except OSError:
+            if cur[0] is None:
+                cur[0] = 0                                        # no log yet: a file created later is read from its start
+            return 0
+        if cur[0] is None:
+            cur[0], cur[1] = st.st_size, st.st_ino
+            return 0
+        if st.st_ino != cur[1] or st.st_size < cur[0]:
+            cur[0], cur[1] = 0, st.st_ino                          # rotated or truncated: read the new file
+        if st.st_size == cur[0]:
+            return 0
+        try:
+            with open(path, "rb") as f:
+                f.seek(cur[0])
+                data = f.read(_SYNC_MAX_BYTES)
+        except OSError:
+            return 0
+        end = data.rfind(b"\n")
+        if end < 0:
+            if len(data) >= _SYNC_MAX_BYTES:
+                cur[0] += len(data)                                # one absurd line: skip it
+            return 0
+        published = 0
+        consumed = 0
+        for raw in data[:end + 1].splitlines(keepends=True):
+            if published >= _SYNC_MAX_EVENTS:
+                break
+            consumed += len(raw)
             try:
-                st = os.stat(self.log_path)
-            except OSError:
-                if self._offset is None:
-                    self._offset = 0                              # no log yet: a file created later is read from its start
-                return 0
-            if self._offset is None:
-                self._offset, self._inode = st.st_size, st.st_ino
-                return 0
-            if st.st_ino != self._inode or st.st_size < self._offset:
-                self._offset, self._inode = 0, st.st_ino           # rotated or truncated: read the new file
-            if st.st_size == self._offset:
-                return 0
-            try:
-                with open(self.log_path, "rb") as f:
-                    f.seek(self._offset)
-                    data = f.read(_SYNC_MAX_BYTES)
-            except OSError:
-                return 0
-            end = data.rfind(b"\n")
-            if end < 0:
-                if len(data) >= _SYNC_MAX_BYTES:
-                    self._offset += len(data)                      # one absurd line: skip it
-                return 0
-            published = 0
-            consumed = 0
-            for raw in data[:end + 1].splitlines(keepends=True):
-                if published >= _SYNC_MAX_EVENTS:
-                    break
-                consumed += len(raw)
-                try:
-                    rec = json.loads(raw)
-                except ValueError:
-                    continue
-                if not isinstance(rec, dict) or rec.get("event") not in ("build_started", "build_finished"):
-                    continue
-                self._publish(rec)
-                published += 1
-            self._offset += consumed
-            return published
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict) or rec.get("event") not in (*_BUILD_EVENTS, *_CONTRACT_FIELDS):
+                continue
+            self._publish(rec)
+            published += 1
+        cur[0] += consumed
+        return published
 
     def _publish(self, rec: dict) -> None:
-        payload = {k: rec[k] for k in _EVENT_FIELDS if k in rec and isinstance(rec[k], _SIMPLE)}
-        trace = _trace(rec.get("trace"))
-        if trace:
-            payload["trace"] = trace
-        if isinstance(rec.get("cache"), dict):
-            payload["cache_applied"] = rec["cache"].get("applied") is True
+        kind = rec["event"]
+        if kind in _CONTRACT_FIELDS:
+            payload = {k: rec[k] for k in _CONTRACT_FIELDS[kind] if k in rec and isinstance(rec[k], _SIMPLE)}
+            if kind == "cache_stats_updated" and isinstance(rec.get("sccache_stats"), dict):
+                payload["sccache_stats"] = {str(k)[:64]: v for k, v in list(rec["sccache_stats"].items())[:64]
+                                            if isinstance(v, (int, float)) and not isinstance(v, bool)}
+            trace = None
+        else:
+            payload = {k: rec[k] for k in _EVENT_FIELDS if k in rec and isinstance(rec[k], _SIMPLE)}
+            trace = _trace(rec.get("trace"))
+            if trace:
+                payload["trace"] = trace
+            if isinstance(rec.get("cache"), dict):
+                payload["cache_applied"] = rec["cache"].get("applied") is True
         host = str(rec.get("host") or "unknown")[:64]
         try:
-            self.record_event("build_cache", host, f"build_cache.{rec['event']}", redact_payload(payload),
+            self.record_event("build_cache", host, f"build_cache.{kind}", redact_payload(payload),
                               session_id=(trace or {}).get("session"))
         except Exception:  # noqa: BLE001 - publishing must never break a read
             pass

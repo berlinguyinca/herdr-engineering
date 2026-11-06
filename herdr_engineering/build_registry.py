@@ -422,7 +422,15 @@ class Registry:
                          "epoch=excluded.epoch", (attempt_id, norm, epoch))
             return Lease(norm, attempt_id, epoch, float(ttl_s))
 
-        return self._tx(work)
+        lease = self._tx(work)
+        self._emit_lease("acquired", lease.scope, attempt_id, lease.epoch)
+        return lease
+
+    def _emit_lease(self, change: str, scope: str, attempt_id: str, epoch: int | None) -> None:
+        """``lease_changed`` contract event; scope is an opaque digest, never a path. Never raises."""
+        from .build_metrics import emit_event
+        emit_event(self.path.parent, "lease_changed", change=change, scope_id=_scope_id(scope),
+                   attempt_id=attempt_id, epoch=epoch)
 
     @staticmethod
     def _check_fence(conn: sqlite3.Connection, lease: Lease) -> None:
@@ -448,6 +456,7 @@ class Registry:
             conn.execute("UPDATE leases SET released_ts=? WHERE scope=?",
                          (self._now(), lease.scope))
         self._tx(work)
+        self._emit_lease("released", lease.scope, lease.attempt_id, lease.epoch)
 
     # -- transitions
     def _holds_active_lease(self, conn: sqlite3.Connection, attempt_id: str) -> bool:
@@ -602,6 +611,7 @@ class Registry:
                 return True
             if self._tx(work):
                 failed.append(r["aid"])
+                self._emit_lease("reconciled", r["scope"], r["aid"], None)
         return failed
 
 
@@ -626,6 +636,10 @@ def active_scopes(state_dir: str | os.PathLike[str], *, now: float | None = None
         raise RegistryError(f"cannot read registry: {exc}") from exc
     finally:
         conn.close()
+
+
+def _scope_id(scope: str) -> str:
+    return hashlib.sha256(scope.encode()).hexdigest()[:16]
 
 
 # --- build-path wrapper (never raises) ---------------------------------------------

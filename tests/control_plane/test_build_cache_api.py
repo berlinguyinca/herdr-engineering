@@ -314,3 +314,40 @@ def test_build_cache_event_stream_is_bounded():
     assert BUILD_CACHE_STREAM_MAX <= len(stream) <= BUILD_CACHE_STREAM_MAX * 2
     assert stream[-1]["payload"]["build_id"] == f"b{n - 1}" and stream[-1]["sequence"] == n - 1
     assert len([e for e in repo.recent_events(limit=100000) if e["entity_type"] == "build_cache"]) == len(stream)
+
+
+# ---------------------------------------------------------------------------------------------- contract events
+def _write_contract(state, rows):
+    state.mkdir(parents=True, exist_ok=True)
+    with open(state / "contract-events.jsonl", "a") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
+def test_contract_events_become_allowlisted_redacted_stream_events(served):
+    base, state, repo = served
+    call(base, "GET", "/api/v1/build-cache/status", "k-view")               # baseline
+    ts = "2026-11-05T00:00:00Z"
+    _write_contract(state, [
+        {"event": "cache_stats_updated", "ts": ts, "host": "h1", "build_id": "b1", "cache_applied": True,
+         "sccache_stats": {"compile_requests": 5, "bad": "x"}, "argv": [SECRET]},
+        {"event": "storage_degraded", "ts": ts, "host": "h1", "tier": "shared",
+         "reason": "shared_unavailable:endpoint_down", "note": SECRET},
+        {"event": "lease_changed", "ts": ts, "host": "h1", "change": "reconciled", "scope_id": "abc",
+         "attempt_id": "a1", "epoch": None, "path": "/home/x"},
+        {"event": "cleanup_completed", "ts": ts, "host": "h1", "kind": "eviction", "status": "applied",
+         "removed_count": 4, "removed_bytes": 4000},
+        {"event": "something_else", "ts": ts, "host": "h1"},
+    ])
+    call(base, "GET", "/api/v1/build-cache/builds", "k-view")
+    evs = {e["event_type"]: e["payload"] for e in repo.recent_events(limit=100) if e["entity_type"] == "build_cache"}
+    assert sorted(evs) == ["build_cache.cache_stats_updated", "build_cache.cleanup_completed",
+                           "build_cache.lease_changed", "build_cache.storage_degraded"]
+    assert evs["build_cache.cache_stats_updated"]["sccache_stats"] == {"compile_requests": 5}
+    assert evs["build_cache.storage_degraded"] == {"ts": ts, "host": "h1", "tier": "shared", "reason": "shared_unavailable:endpoint_down"}
+    assert evs["build_cache.lease_changed"]["change"] == "reconciled"
+    assert evs["build_cache.cleanup_completed"]["removed_bytes"] == 4000
+    dump = json.dumps(evs)
+    assert SECRET not in dump and "argv" not in dump and "/home/x" not in dump
+    call(base, "GET", "/api/v1/build-cache/builds", "k-view")               # never published twice
+    assert len([e for e in repo.recent_events(limit=100) if e["entity_type"] == "build_cache"]) == 4

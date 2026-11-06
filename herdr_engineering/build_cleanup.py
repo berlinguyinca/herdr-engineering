@@ -249,6 +249,10 @@ def run_once(
         if result["errors"]:
             result["status"] = "error"
         _write_status(state_dir, result)
+        if not dry_run:
+            from .build_metrics import emit_event
+            emit_event(state_dir, "cleanup_completed", kind="cleanup", status=result["status"],
+                       removed_count=result["removed_count"], removed_bytes=result["removed_bytes"])
         return result
     finally:
         os.close(lock_fd)
