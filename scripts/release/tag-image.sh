@@ -7,9 +7,9 @@ set -eu
 . scripts/release/lib.sh
 
 require_env CI_COMMIT_TAG
-trap registry_logout EXIT
+on_exit registry_logout
 registry_login
 digest=$(release_digest)
 docker buildx imagetools create --tag "$HERDR_RELEASE_REPOSITORY:$CI_COMMIT_TAG" "$HERDR_RELEASE_REPOSITORY@$digest" >/dev/null
-tagged=$(docker buildx imagetools inspect --raw "$HERDR_RELEASE_REPOSITORY:$CI_COMMIT_TAG" | sha256sum | cut -d' ' -f1)
+tagged=$(docker buildx imagetools inspect --raw "$HERDR_RELEASE_REPOSITORY:$CI_COMMIT_TAG" | sha256_hex)
 [ "sha256:$tagged" = "$digest" ] || fail "$HERDR_RELEASE_REPOSITORY:$CI_COMMIT_TAG resolves to sha256:$tagged, not $digest"

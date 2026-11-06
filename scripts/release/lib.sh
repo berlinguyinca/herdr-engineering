@@ -3,6 +3,21 @@
 
 fail() { printf 'release: %s\n' "$*" >&2; exit 1; }
 
+# Run $1 on every exit, including a cancelled step: Woodpecker stops a step's container with SIGTERM before it kills it,
+# and a signal trap that exits makes the EXIT trap run. Only SIGKILL skips it (docs/releases.md, Builder cleanup).
+on_exit() {
+  # shellcheck disable=SC2064 # $1 is expanded now on purpose
+  trap "$1" EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+# sha256 of stdin as hex: busybox/coreutils sha256sum in the step image, shasum elsewhere (the tests run on macOS too).
+sha256_hex() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1
+}
+
 require_env() {
   for name in "$@"; do
     eval "value=\${$name:-}"

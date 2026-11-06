@@ -16,7 +16,7 @@ cleanup() {
   docker buildx rm --force "$builder" >/dev/null 2>&1 || true
   registry_logout
 }
-trap cleanup EXIT
+on_exit cleanup
 registry_login
 
 # A throwaway BuildKit builder from a pinned image, so the build tooling does not float with the agent host's docker.

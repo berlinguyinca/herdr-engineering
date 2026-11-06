@@ -14,7 +14,10 @@
 #    (github-release). Restrict both to the `tag` event in the repo's secret settings.
 #  * The docker socket is a host volume: the repository must be TRUSTED (volumes) in Woodpecker, or the pipeline is refused.
 #  * Order is the safety argument: push by digest -> read the digest back and verify it is the multi-arch index -> only then
-#    tag the image and write the GitHub release with release.json. Any failure stops before the release exists.
+#    tag the image and write the GitHub release: a draft, release.json uploaded and read back, then published. A failure
+#    leaves at most an unpublished draft that a re-run completes.
+#  * These checks are NOT a security boundary: this file is read from the tagged commit. The GitHub tag ruleset that lets
+#    only the owner create v* tags is (docs/releases.md, required before the first release).
 #  * Commands use plain $VAR: Woodpecker substitutes braced references in the YAML text before parsing. Shell logic lives in
 #    scripts/release/ so it is shellchecked and tested (tests/test_release_pipeline.py).
 when:
@@ -49,7 +52,7 @@ steps:
   - name: verify-tag
     image: *python_image
     commands:
-      - 'python3 scripts/release/release.py check-tag --tag "$CI_COMMIT_TAG" --pyproject pyproject.toml'
+      - 'python3 scripts/release/release.py check-tag --tag "$CI_COMMIT_TAG"'
 
   - name: build-push
     image: *docker_image
@@ -87,7 +90,7 @@ steps:
     commands:
       - 'set -eu'
       - 'python3 scripts/release/release.py verify-index --raw .release/index.json --digest-file .release/digest'
-      - 'python3 scripts/release/release.py assemble --tag "$CI_COMMIT_TAG" --pyproject pyproject.toml --repository "$HERDR_RELEASE_REPOSITORY" --digest-file .release/digest --commit "$CI_COMMIT_SHA" --out-json .release/release.json --out-notes .release/release-notes.md'
+      - 'python3 scripts/release/release.py assemble --tag "$CI_COMMIT_TAG" --repository "$HERDR_RELEASE_REPOSITORY" --digest-file .release/digest --commit "$CI_COMMIT_SHA" --out-json .release/release.json --out-notes .release/release-notes.md'
 
   - name: tag-image
     image: *docker_image

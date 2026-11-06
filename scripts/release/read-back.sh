@@ -6,7 +6,7 @@ set -eu
 # shellcheck source=scripts/release/lib.sh
 . scripts/release/lib.sh
 
-trap registry_logout EXIT
+on_exit registry_logout
 registry_login
 digest=$(release_digest)
 docker buildx imagetools inspect --raw "$HERDR_RELEASE_REPOSITORY@$digest" >.release/index.json \

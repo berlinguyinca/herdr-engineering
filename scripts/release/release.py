@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Release helpers for .woodpecker/release.yml (docs/releases.md). Standard library only: the CI step image is a bare python.
 
-    release.py check-tag --tag vX.Y.Z [--pyproject pyproject.toml]   strict semver tag that equals the repo version
+    release.py check-tag --tag vX.Y.Z [--root .]                      strict semver tag equal to every version source
     release.py digest --metadata FILE --out FILE                      the image digest from `buildx build --metadata-file`
     release.py verify-index --raw FILE --digest-file FILE             the read-back bytes ARE the multi-arch index digest
-    release.py assemble --tag vX.Y.Z [--pyproject F] --repository R --digest-file F --commit SHA --out-json F --out-notes F
+    release.py assemble --tag vX.Y.Z [--root .] --repository R --digest-file F --commit SHA --out-json F --out-notes F
     release.py publish-github --repo OWNER/NAME --tag T --notes F --release-json F   (token from GITHUB_RELEASE_TOKEN)
 
 Every failure exits 1 with one line on stderr; nothing here ever prints a token.
@@ -36,20 +36,34 @@ INDEX_MEDIA_TYPES = {
 }
 REQUIRED_PLATFORMS = ("linux/amd64", "linux/arm64")
 GITHUB_API = "https://api.github.com"
+# Besides pyproject.toml, the version the CLI and /api/v1/health report: all must equal the tag.
+VERSION_FILES = ("herdr_engineering/version.py", "herdr_engineering/control_plane/__init__.py")
+PY_VERSION = re.compile(r'^__version__ = "([^"]*)"$', re.M)
 
 
 class ReleaseError(Exception):
     pass
 
 
-def check_tag(tag: str, pyproject_text: str) -> str:
-    """The version for `tag`, which must be strict semver `vX.Y.Z` and equal pyproject.toml's [project].version."""
+def check_tag(tag: str, pyproject_text: str, python_sources: dict[str, str] | None = None) -> str:
+    """The version for `tag`: strict semver `vX.Y.Z`, equal to pyproject.toml's [project].version and to the
+    `__version__` of every file in `python_sources` ({path: text})."""
     if not TAG_PATTERN.fullmatch(tag):
         raise ReleaseError(f"tag {tag!r} is not a strict semver release tag (v[0-9]+.[0-9]+.[0-9]+)")
-    version = tomllib.loads(pyproject_text).get("project", {}).get("version")
+    project = tomllib.loads(pyproject_text).get("project", {})
+    version = project.get("version") if isinstance(project, dict) else None
     if tag[1:] != version:
         raise ReleaseError(f"tag {tag} does not match pyproject.toml [project].version {version!r}")
+    for path, text in (python_sources or {}).items():
+        found = PY_VERSION.findall(text)
+        if found != [version]:
+            raise ReleaseError(f"tag {tag} does not match {path} __version__ {found[0] if len(found) == 1 else found!r}")
     return version
+
+
+def check_tag_in(tag: str, root: str) -> str:
+    base = Path(root)
+    return check_tag(tag, (base / "pyproject.toml").read_text(), {p: (base / p).read_text() for p in VERSION_FILES})
 
 
 def require_digest(digest: str, what: str) -> str:
@@ -60,6 +74,8 @@ def require_digest(digest: str, what: str) -> str:
 
 def digest_from_metadata(metadata: dict) -> str:
     """`containerimage.digest` of a multi-platform build is the digest of the pushed image index."""
+    if not isinstance(metadata, dict):
+        raise ReleaseError("buildx metadata is not a JSON object, so it has no containerimage.digest")
     return require_digest(metadata.get("containerimage.digest"), "buildx metadata containerimage.digest")
 
 
@@ -73,11 +89,13 @@ def verify_index(raw: bytes, digest: str) -> None:
         manifest = json.loads(raw)
     except ValueError as exc:
         raise ReleaseError(f"the manifest read back from the registry is not JSON: {exc}") from None
-    if manifest.get("mediaType") not in INDEX_MEDIA_TYPES:
-        raise ReleaseError(f"{digest} is a {manifest.get('mediaType')!r}, not a multi-arch image index")
-    platforms = {
-        f"{m.get('platform', {}).get('os')}/{m.get('platform', {}).get('architecture')}" for m in manifest.get("manifests", [])
-    }
+    if not isinstance(manifest, dict) or manifest.get("mediaType") not in INDEX_MEDIA_TYPES:
+        kind = manifest.get("mediaType") if isinstance(manifest, dict) else type(manifest).__name__
+        raise ReleaseError(f"{digest} is a {kind!r}, not a multi-arch image index")
+    entries = manifest.get("manifests")
+    if not isinstance(entries, list) or not all(isinstance(m, dict) and isinstance(m.get("platform"), dict) for m in entries):
+        raise ReleaseError(f"the image index {digest} has a malformed manifests list")
+    platforms = {f"{m['platform'].get('os')}/{m['platform'].get('architecture')}" for m in entries}
     missing = [p for p in REQUIRED_PLATFORMS if p not in platforms]
     if missing:
         raise ReleaseError(f"the image index {digest} lacks {', '.join(missing)}")
@@ -115,6 +133,16 @@ def _request(url: str, token: str, *, method: str = "GET", data: bytes | None = 
     return urllib.request.Request(url, data=data, method=method, headers=headers)
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib re-sends the Authorization header on a redirect, to any host: never follow one with the token."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, f"refusing to follow a redirect ({msg})", headers, fp)
+
+
+OPENER = urllib.request.build_opener(NoRedirect())
+
+
 def _call(opener, request, what: str):
     try:
         with opener(request, timeout=60) as response:
@@ -126,30 +154,51 @@ def _call(opener, request, what: str):
         raise ReleaseError(f"{what}: {exc.reason}") from None
 
 
-def publish_github(repo: str, tag: str, notes: str, release_json: bytes, token: str, *, opener=urllib.request.urlopen) -> str:
-    """Create the GitHub release for `tag` with `notes` and attach release.json; refuse if the release exists."""
+def publish_github(repo: str, tag: str, notes: str, release_json: bytes, token: str, *, opener=OPENER.open) -> str:
+    """Publish the GitHub release for `tag` with `notes` and release.json, never public without the asset.
+
+    A draft is created (or the existing draft for `tag`, left by a failed run, is reused), its release.json is
+    replaced by `release_json`, the asset is read back, and only then is the draft published. A release that is
+    already published is never touched.
+    """
     if not token:
         raise ReleaseError("GITHUB_RELEASE_TOKEN is empty")
     base = f"{GITHUB_API}/repos/{repo}"
-    try:
-        with opener(_request(f"{base}/releases/tags/{urllib.parse.quote(tag)}", token), timeout=60):
-            pass
-    except urllib.error.HTTPError as exc:
-        if exc.code != 404:
-            raise ReleaseError(f"looking up release {tag}: GitHub answered {exc.code} {exc.reason}") from None
-    except urllib.error.URLError as exc:
-        raise ReleaseError(f"looking up release {tag}: {exc.reason}") from None
+
+    def call(url, what, **kw):
+        if "data" in kw and not isinstance(kw["data"], bytes):
+            kw["data"] = json.dumps(kw["data"]).encode()
+            kw.setdefault("content_type", "application/json")
+        return _call(opener, _request(url, token, **kw), what)
+
+    # The by-tag endpoint does not return drafts; the list does (to a token with push access). Drafts are newest-first.
+    releases = call(f"{base}/releases?per_page=100", f"listing releases for {tag}")
+    mine = [r for r in releases if isinstance(r, dict) and r.get("tag_name") == tag] if isinstance(releases, list) else []
+    if any(not r.get("draft") for r in mine):
+        raise ReleaseError(f"a GitHub release for {tag} is already published; it is never overwritten (docs/releases.md)")
+    if mine:
+        draft = mine[0]
     else:
-        raise ReleaseError(f"a GitHub release for {tag} already exists; it is never overwritten (docs/releases.md)")
-    body = {"tag_name": tag, "name": tag, "body": notes, "draft": False, "prerelease": False}
-    created = _call(opener, _request(f"{base}/releases", token, method="POST", data=json.dumps(body).encode(),
-                                     content_type="application/json"), f"creating release {tag}")
-    upload_url = str(created.get("upload_url", "")).split("{", 1)[0]
-    if not upload_url.startswith("https://"):
-        raise ReleaseError(f"creating release {tag}: no upload_url in GitHub's answer")
-    _call(opener, _request(f"{upload_url}?name=release.json", token, method="POST", data=release_json,
-                           content_type="application/json"), "uploading release.json")
-    return str(created.get("html_url", ""))
+        draft = call(f"{base}/releases", f"creating draft release {tag}", method="POST",
+                     data={"tag_name": tag, "name": tag, "body": notes, "draft": True, "prerelease": False})
+    rid = draft.get("id")
+    upload_url = str(draft.get("upload_url", "")).split("{", 1)[0]
+    if not isinstance(rid, int) or not upload_url.startswith("https://"):
+        raise ReleaseError(f"draft release {tag}: no id or upload_url in GitHub's answer")
+    for asset in draft.get("assets") or []:
+        if isinstance(asset, dict) and asset.get("name") == "release.json":
+            call(f"{base}/releases/assets/{asset.get('id')}", "removing the stale release.json", method="DELETE")
+    call(f"{upload_url}?name=release.json", "uploading release.json", method="POST", data=release_json,
+         content_type="application/json")
+    assets = call(f"{base}/releases/{rid}/assets", "reading back release.json")
+    if not any(isinstance(a, dict) and a.get("name") == "release.json" and a.get("size") == len(release_json)
+               for a in (assets if isinstance(assets, list) else [])):
+        raise ReleaseError(f"release.json is not on draft release {tag} after the upload; the draft stays unpublished")
+    published = call(f"{base}/releases/{rid}", f"publishing release {tag}", method="PATCH",
+                     data={"draft": False, "body": notes, "name": tag})
+    if not isinstance(published, dict) or published.get("draft") is not False:
+        raise ReleaseError(f"release {tag} is still a draft after publishing")
+    return str(published.get("html_url", ""))
 
 
 def _read_digest_file(path: str) -> str:
@@ -161,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("check-tag")
     p.add_argument("--tag", required=True)
-    p.add_argument("--pyproject", default="pyproject.toml")
+    p.add_argument("--root", default=".")
     p = sub.add_parser("digest")
     p.add_argument("--metadata", required=True)
     p.add_argument("--out", required=True)
@@ -169,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--raw", required=True)
     p.add_argument("--digest-file", required=True)
     p = sub.add_parser("assemble")
-    p.add_argument("--pyproject", default="pyproject.toml")
+    p.add_argument("--root", default=".")
     for name in ("--tag", "--repository", "--digest-file", "--commit", "--out-json", "--out-notes"):
         p.add_argument(name, required=True)
     p = sub.add_parser("publish-github")
@@ -178,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "check-tag":
-            print(check_tag(args.tag, Path(args.pyproject).read_text()))
+            print(check_tag_in(args.tag, args.root))
         elif args.command == "digest":
             digest = digest_from_metadata(json.loads(Path(args.metadata).read_text()))
             Path(args.out).write_text(digest + "\n")
@@ -188,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
             verify_index(Path(args.raw).read_bytes(), digest)
             print(f"verified: {digest} is the multi-arch index ({', '.join(REQUIRED_PLATFORMS)})")
         elif args.command == "assemble":
-            version = check_tag(args.tag, Path(args.pyproject).read_text())
+            version = check_tag_in(args.tag, args.root)
             doc = assemble(version, args.repository, _read_digest_file(args.digest_file), args.commit)
             Path(args.out_json).write_text(json.dumps(doc, indent=2) + "\n")
             Path(args.out_notes).write_text(release_notes(doc))
