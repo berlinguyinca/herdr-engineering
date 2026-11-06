@@ -33,7 +33,7 @@ SECRET = b"k" * 48
 NOW0 = 1_900_000_000.0          # Env's injected clock (PyJWT checks exp against the real clock, which is earlier)
 STATIC_DIR = Path(share_public.__file__).parent / "share_static"
 VIEWER_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self' https://auth.lab.example; "
-              "img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+              "img-src 'self' data:; font-src https://share.example/s/static/; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
 
 def jwks_doc(key=KEY, kid="k1"):
@@ -540,8 +540,8 @@ def test_public_share_refuses_sessions(tmp_path):
     e = Env(tmp_path, audience="public", config_extra=lab_config(tmp_path), state_extra=LAB_ALLOW)
     try:
         ref = reference(e)
-        status, _, body = open_session(e)
-        assert status == 404 and body == ref
+        status, h, body = open_session(e)           # a public link's session is only its claim cookie, never a /k/ path
+        assert status == 200 and "/k/" not in body.decode() and h["set-cookie"].startswith("herdr_claim=")
         good = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email="alice@lab.example", basis="e")
         assert e.request("GET", f"/s/{TOKEN}/k/{good}/f/index.html")[2] == ref
         status, h, _ = e.request("GET", f"/s/{TOKEN}/")                   # public behaviour is unchanged

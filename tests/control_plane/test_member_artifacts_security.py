@@ -221,6 +221,8 @@ def test_a_disabled_member_feature_refuses_every_forged_member_intent(registry_p
                 ("member.share_revoke", {"share_id": GHOST_SHARE}),
                 ("member.share_events", {"share_id": GHOST_SHARE})):
             for actor in (user("alice"), agent_actor("ag1")):
+                if kind == "member.share_approve" and actor["kind"] == "agent":
+                    continue                                    # not an agent intent at all: see the agent-approval test
                 out = await send(env, actor, kind, payload, aid=None if kind == "member.artifact_create" else "art_whatever1")
                 assert out["result"] == "rejected" and out["reason"] == "members_disabled", (kind, out)
         assert not await sql(env, "SELECT 1 FROM artifacts")
@@ -340,8 +342,6 @@ def test_no_mcp_tool_or_web_route_tells_a_foreign_artifact_from_a_missing_one(st
         "delete": lambda a: mcp(stack, "artifact_delete", artifact_id=a, confirm=True),
         "share_create": lambda a: mcp(stack, "artifact_share_create", artifact_id=a, version_id="v_1",
                                       audience="public"),
-        "share_approve": lambda a: mcp(stack, "artifact_share_approve", artifact_id=a,
-                                       share_id="share_" + "1" * 24, confirm=True),
         "upload_abort": lambda a: mcp(stack, "artifact_upload_abort", artifact_id=a, upload_id="upl_" + "2" * 24),
     }
     queued = {   # no front-door precheck: the worker decides, and decides alike (section A); both are queued the same

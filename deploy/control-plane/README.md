@@ -29,6 +29,16 @@ Compose project (spec 0190). It is the structured-state backbone the unified
 - **Bridge networking (not host).** Unlike `deploy/fabric-stack` (which needs
   host networking for the gateway + CoreDNS), this project only needs the
   services to reach each other, so they resolve by service name.
+- **Member artifact pool: the collab-public group must be configured.** The
+  member blob pool is chowned to the collab-public group so only the collab-public
+  container can read it. If that group id is unknown or the chown is refused, the
+  pool falls back to world-readable `0644` files (a warning is logged), still
+  confined to the mirror volume. Configure the group on every host that serves
+  member artifacts and treat that warning as a deploy failure.
+- **Revoke and expiry are not instant for recipients.** Member views and the blob
+  pool are rewritten by the periodic tick, so after a share is revoked or expires,
+  claimants may still open its content for up to 60 s. The owner's own deletes
+  take effect immediately.
 
 ## Configuration and deploy
 
@@ -736,6 +746,28 @@ proposals (as on the dashboard). Only the first bot's thread carries cards. Appr
 8 s timeout, but execution is claimed once, so retrying is safe.
 attachments, memory, routines, skills, connections, bot editing/archiving, spaces other than "Herdr", and ActionBoard
 proposals (those stay on the dashboard). `threads/send` does not deduplicate a retried `clientNonce`.
+
+## Dashboard artifact library (`control_plane.artifact_library`)
+
+The dashboard's `/library` page and `/api/v1/library...` routes use the same store as the member site. A dashboard key is
+not a Cognito member, so by default a key sees its **own** library: the artifacts it created, ACL grants to it and its own
+pending pushes. Rows for a person (lab shares to their email or group, claimed links, agent-pushed pending) appear only
+when that key is mapped to the person:
+
+```yaml
+control_plane:
+  artifact_library:
+    viewers:
+      "key:0123456789ab": "<cognito user id>"     # key:<first 12 hex of sha256(api key)>, the id logged for the key
+```
+
+The key is the same `key:<digest>` identity that `project_intelligence.viewers` uses, taken from the authenticated
+`X-API-Key`; the client-sent `X-Herdr-User` header is never consulted. A mapped key uses `member:<id>` as the owner of
+folders, filing and pending, with email and groups from the member directory (the collab service's, in process). A missing
+or stale directory, or an unlisted member, answers `503 directory_stale` and shows nothing; a disabled or removed member
+answers `403 not_a_member`. Discarding a pending push as a mapped member runs the member delete (shares revoked in the same
+transaction, quota settled). A mapped member's row that the dashboard's own artifact ACL will not open is shown without a
+link. A malformed entry stops the start. Without a DSN the library routes answer 503.
 
 ## Scheduled CI watch (assistant)
 

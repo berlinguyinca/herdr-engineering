@@ -452,8 +452,10 @@ def test_importing_collab_artifacts_registers_the_kind():
             "print(sorted(c._INTENT_KINDS))")
     proc = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip() == ("['annotation_resolve', 'commit', 'member.artifact_create', 'member.artifact_delete', "
-                                   "'member.publish', 'member.share_approve', 'member.share_create', 'member.share_events', "
+    assert proc.stdout.strip() == ("['annotation_resolve', 'commit', 'library_accept', 'library_discard', "
+                                   "'library_file', 'library_folder_create', 'library_folder_delete', "
+                                   "'library_folder_rename', 'library_unfile', 'member.artifact_create', "
+                                   "'member.artifact_delete', 'member.publish', 'member.share_approve', 'member.share_create', 'member.share_events', "
                                    "'member.share_revoke']")
 
 

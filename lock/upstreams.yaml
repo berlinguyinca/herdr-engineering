@@ -19,7 +19,6 @@ dependencies:
     maintenance: "active; private Hindsight-backed memory client (contract v1, client 0.1.7)"
 
     note: "Optional managed harness config via herdr-eng memory install; also the canonical dashboard CLI when authorized viewers are configured. Pin must match herdr_engineering.memory_install.PINNED_REVISION and PINNED_CLIENT_VERSION (0.1.7). Offline validate-config checks schema/URL without credentials, network or cache state (herdr-memory#15)."
- origin/main
   herdr-memory-deploy:
     source: "berlinguyinca/herdr-memory"
     revision: "c4e0c64"

@@ -4148,6 +4148,34 @@ def _member_admin_wiring(cp: dict, dsn: str | None):
     return artifact_adapter.SyncArtifactAdapter(create)
 
 
+def _library_wiring(dsn: str | None):
+    """The dashboard artifact library (adapter over ``LibraryStore`` on its own small pool) when a DSN exists, else None."""
+    if not dsn:
+        return None
+    from .control_plane.artifact_library_api import make_library_adapter
+
+    async def pool():
+        import asyncpg
+        return await asyncpg.create_pool(dsn, min_size=1, max_size=3)
+
+    try:
+        return make_library_adapter(pool)
+    except RuntimeError as exc:  # database unreachable at start: the library routes answer 503, the dashboard still starts
+        print(f"warning: artifact library unavailable ({exc.__cause__ or exc})", file=sys.stderr)
+        return None
+
+
+def _library_viewers(cp) -> dict[str, str]:
+    """``control_plane.artifact_library.viewers`` (YAML only): ``{"key:<digest>": "<member id>"}``, the dashboard keys that
+    read a member's library.  A malformed entry stops the start (it would silently show the wrong library)."""
+    from .control_plane.artifact_library_api import parse_library_viewers
+    section = cp.get("artifact_library") if isinstance(cp, dict) else None
+    try:
+        return parse_library_viewers(section.get("viewers") if isinstance(section, dict) else None)
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+
+
 def _collab_grant_wiring(cp: dict, dsn: str | None):
     """(grant store adapter, enabled) when control_plane.collab_artifacts.enabled is exactly true and a DSN exists, else
     (None, False). The owner routes for collaborators, activity and diffs use the adapter's call path."""
@@ -4343,6 +4371,7 @@ def _cmd_cp_web(args) -> int:
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
     annotation_store = _annotation_wiring(cp, dsn)
     member_admin = _member_admin_wiring(cp, dsn)
+    library = _library_wiring(dsn)
     try:
         from .control_plane.artifact_delete_api import owner_digests_config
         artifact_delete = owner_digests_config(cp.get("artifact_delete"))
@@ -4481,7 +4510,8 @@ def _cmd_cp_web(args) -> int:
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
-                             annotation_store=annotation_store, member_admin=member_admin,
+                             annotation_store=annotation_store, member_admin=member_admin, library=library,
+                             library_viewers=_library_viewers(cp),
                              artifact_delete_owners=artifact_delete.digests,
                              artifact_delete_allow_keyless_owner=artifact_delete.allow_keyless,
                              collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled,
@@ -4529,6 +4559,9 @@ def _cmd_cp_web(args) -> int:
             artifact_adapter.close()
         if member_admin is not None:
             member_admin.close()
+        if library is not None:
+            library("close")        # the pool first, then the adapter's loop
+            library.close()
         if share_store is not None:
             share_store.close()
         if annotation_store is not None:
@@ -5178,7 +5211,7 @@ def _share_worker_settings(cp):
     return out
 
 
-def _worker_share_housekeeper(fleet_config_path):
+def _worker_share_housekeeper(fleet_config_path, member_runtime=None):
     """The share housekeeper when the fleet file enables shares, else None."""
     from pathlib import Path
 
@@ -5193,7 +5226,8 @@ def _worker_share_housekeeper(fleet_config_path):
     settings = _share_worker_settings(cp)
     if not settings["enabled"]:
         return None
-    return ShareHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"])
+    return ShareHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"],
+                            member_runtime=member_runtime)
 
 
 def _worker_annotation_housekeeper(fleet_config_path, mirror=None):
@@ -5430,7 +5464,11 @@ def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rust
     applier.register_commit()
     register_annotation_resolve(applier)
     register_member_intents(applier)
-    publisher = None if members is None else (lambda conn: publish_member_views(conn, members))
+    publisher = None
+    if members is not None:
+        import dataclasses
+        pooled = dataclasses.replace(members, rustfs=rustfs)     # the view tick fills the library content pool
+        publisher = lambda conn: publish_member_views(conn, pooled)  # noqa: E731
     return cp_worker.CollabBridgeLoop(connect, mirror, applier, members_publisher=publisher)
 
 
@@ -5506,7 +5544,7 @@ def _cmd_cp_worker(args) -> int:
             worker_id = args.host_id or socket.gethostname()
             snapshotter = _worker_snapshot_writer(getattr(args, "fleet_config", None))
             compactor = _worker_fabric_compactor(getattr(args, "fleet_config", None))
-            share_hk = _worker_share_housekeeper(getattr(args, "fleet_config", None))
+            share_hk = _worker_share_housekeeper(getattr(args, "fleet_config", None), member_runtime)
             reconciler = _worker_artifact_reconciler(getattr(args, "fleet_config", None), rustfs)
             if args.once:
                 return await run_one_pass(conn, worker_id=worker_id,
