@@ -101,8 +101,8 @@ telemetry is `builds.jsonl`, the host-local API/SSE and the dashboard panel.
 - (Closed 2026-11-04) the credentialed per-policy server start exists
   (`build_cache_server.py`). Tailnet SigV4 rejection fixed in code (agent restart required, `systemctl --user restart herdr-eng-fabric-agent.service`); still untested: a real second host; sccache does not authenticate objects; same-uid code can read server env.
 - `slurm.*` overlaps `execution.slurm_enabled/allowed_partitions`; authority unsettled.
-- Dashboard table is cramped on mobile (tables scroll in focusable regions).
-- ui-gates not run; typecheck of the Pi extension not run.
+- (Closed 2026-11-05) Builds table on the dashboard stacks into labelled rows at <=40rem (verified at 390, 375, 320 px by `tests/playwright/build-cache.test.mjs`). The small sccache-counter and cleanup-candidate tables still scroll in their focusable regions.
+- (Closed 2026-11-05) Pi extension typechecks: `npm run typecheck:pi-build-gate` exits 0 (tsc 7.0.2, strict). ui-gates: `npm run test:ui-gates` 299 of 300 passed; the one failure (`visual regression: tablet dark`, `ERR_NETWORK_CHANGED` opening the collaboration room) passed on re-run alone. No ui-gates test names the build cache page; they were run as a regression check of the shared dashboard shell, not as build-cache coverage.
 - M6: SIGKILL of the record-mode wrapper orphans the build (no PDEATHSIG); documented, mitigated by lease expiry and cleanup refusing.
 - Also: fenced finish leaves rows non-terminal; eviction has no timer; S3 quota not enforced; Herdr-side corrupt-entry quarantine not implemented; (rollback doc route drift fixed).
 - Upstream sccache claims (TOML `region`, `key_prefix`, path-style, read-only enforcement) are UNVERIFIED against a live binary.
