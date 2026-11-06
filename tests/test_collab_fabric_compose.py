@@ -84,6 +84,29 @@ def test_overlay_is_static_and_isolated():
     assert doc["networks"]["fabric"]["driver_opts"]["com.docker.network.bridge.enable_ip_masquerade"] == "false"
 
 
+def test_fabric_network_has_a_fixed_subnet_and_the_comments_do_not_claim_no_route():
+    text = (CP / "compose.collab-fabric.yaml").read_text()
+    doc = yaml.safe_load(text)
+    net = doc["networks"]["fabric"]
+    assert net["ipam"]["config"][0]["subnet"] == "172.30.213.0/24"
+    assert "internal" not in net or net["internal"] is False          # a published port needs a non-internal network
+    low = text.lower()
+    assert "no outbound route" not in low and "adds no route" not in low
+    assert "collab-fabric-firewall.sh" in text
+
+
+def test_the_boot_order_drop_in_waits_for_the_tailnet_address():
+    drop = (CP / "docker-after-tailscale.conf").read_text()
+    assert "After=tailscaled.service" in drop and "Wants=tailscaled.service" in drop
+    assert "ExecStartPre=" in drop and "tailscale ip" in drop
+
+
+def test_deploy_script_warns_about_the_firewall_and_the_drop_in():
+    sh = (CP / "deploy.sh").read_text()
+    assert "collab-fabric-firewall.sh" in sh and "--check" in sh
+    assert "/etc/systemd/system/docker.service.d/after-tailscale.conf" in sh
+
+
 def test_base_collab_command_carries_the_inert_bind_flag():
     cmd = yaml.safe_load((CP / "compose.collab.yaml").read_text())["services"]["collab-public"]["command"]
     assert cmd[cmd.index("--collab-fabric-bind-host") + 1] == "0.0.0.0"

@@ -2254,6 +2254,17 @@ def _make_handler(server, public=False, operator=False, fabric=False):
 
         # ------------------------------------------------------------ routes
         # -------------------------------------------- public (collab-only) listener
+        def _fabric_hosts(self):
+            """Host header values the fabric listener answers to: ``<listen_host>:<port>`` (IPv6 bracketed), plus the bare
+            host only when the port is the scheme default (80), the one case a client omits it."""
+            host, _ = server.fabric_listen
+            port = server.fabric_port
+            name = f"[{host}]" if ":" in host else host
+            allowed = {f"{name}:{port}".lower()}
+            if port == 80:
+                allowed.add(name.lower())
+            return allowed
+
         def _fabric_listener(self):
             """The dedicated fabric listener (tailnet address, no proxy, no TLS): the collab API and nothing else, and ONLY
             ``Authorization: Fabric``. Any other scheme (or none) is a 401 before the service sees it, so a Bearer token or an
@@ -2262,6 +2273,10 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             if (len(cl) > 1 or "Transfer-Encoding" in self.headers
                     or (self.command in ("GET", "DELETE") and cl and cl[0].strip() not in ("", "0"))):
                 return self._deny(400, "ambiguous request framing")
+            # DNS rebinding: a browser that resolved an attacker name to this address sends that name as Host. Only the
+            # address the listener is published on is accepted, and it is checked before routing or authentication.
+            if self.headers.get("Host", "").lower() not in self._fabric_hosts():
+                return self._deny(421, "misdirected request")
             if not self._is_collab_path() or server.collab is None:
                 return self._deny(404, "not found")
             scheme, _, rest = self.headers.get("Authorization", "").partition(" ")
@@ -3118,7 +3133,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                                           self.headers.get("Authorization", ""),
                                           self.headers.get("X-Herdr-Device"),
                                           operator=server.operator_user if operator else None,
-                                          client=self._proxied_client(), **self._fabric_args())
+                                          client=self._proxied_client(), fabric_listener=fabric,
+                                          **self._fabric_args())
             except Exception:
                 return self._json({"error": "internal error"}, 500)  # never echo internals
             if isinstance(result, tuple):

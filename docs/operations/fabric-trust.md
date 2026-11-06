@@ -117,6 +117,10 @@ With `listen_host` and `listen_port` set, the collab server (same process as the
 opens a second HTTP listener that:
 
 - serves only the collab API routes (`/api/v1/collab/...`); the MCP, A2A, web UI and operator API paths are 404 there;
+- answers only to its own address: the `Host` header must be `<listen_host>:<listen_port>` (IPv6 in brackets), otherwise `421` before routing or
+  authentication, so a DNS-rebinding page (attacker name resolved to the tailnet address) gets nothing, and its `Origin == Host` pair does not help;
+- does not serve the routes that run before authentication (`agents/enrollment/complete`, `agents/join`, `agents/join-link`, `config`): 404 there, they
+  stay on the public listener;
 - accepts only `Authorization: Fabric ...`; `Bearer` and `Agent` get 401 without being evaluated (no token check, no failure counting);
 - passes the real TCP peer address (`client_address[0]`) to the whois check and refuses any request carrying a forwarding header
   (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `X-Forwarded-Host`, `X-Forwarded-Server`, `Tailscale-User-Login`, `Tailscale-User-Name`, `Via`);
@@ -138,7 +142,8 @@ and login. With `fabric_trust.whois_socket` set, the collab server asks that soc
 `herdr-eng fleet config fabric-listener`). It adds the `fabric-whois` service (no network, read-only root, no capabilities, non-root, tailscaled's
 socket directory mounted read-only, one writable directory for its own socket), mounts that directory read-only in `collab-public`, and
 publishes `listen_host:listen_port` from `collab-public`. `collab-public` gains no capability, no tailscaled mount and no environment. The
-new `fabric` network has IP masquerade off, so it adds no route out. `HERDR_COLLAB_TAILSCALED_DIR` (default `/var/run/tailscale`) names the
+new `fabric` network (fixed subnet `172.30.213.0/24`) is NOT internal, because Docker cannot publish a port from an internal-only network. Its IP
+masquerade is off, but that does not remove the default route; see "Required hardening" below. `HERDR_COLLAB_TAILSCALED_DIR` (default `/var/run/tailscale`) names the
 host directory that holds tailscaled.sock. Removing `listen_*` from the config stops the sidecar on the next deploy.
 
 ### Checking the source address (do this before trusting the listener)
@@ -154,6 +159,54 @@ would fail closed (every Fabric request 401). On the collab host, after a deploy
 4. Fallback if the source address cannot be preserved: run `collab-public` with `network_mode: host` and set
    `listen_host` to the host's tailnet address (the publish step goes away; the `internal` collab network no longer applies, so firewall the
    other ports of that process and keep the edge pointed at 127.0.0.1). This weakens `collab-public`'s isolation and is a conscious choice.
+
+### Required hardening: the fabric network has a default route
+
+Be precise about what the overlay does NOT do: it does not cut `collab-public` off from the network. With the `fabric` network non-internal, a
+process inside `collab-public` (a compromise of the internet-facing collab server) has a default route and can open new connections to:
+
+- the Docker host itself through the bridge gateway (172.30.213.1) and the host's own addresses: its tailnet and LAN IPs, and every service listening
+  on them or on `0.0.0.0`, including services run with host networking and the operator listener if it is bound to a non-loopback address;
+- other containers' published ports on the host, and other Docker networks;
+- the LAN (when something routes it; masquerade is off so replies need a return route, which a LAN router may supply) and, where the host forwards
+  and NATs for the subnet, the internet.
+
+That is a path from the internet-facing process toward the operator plane, which the isolated `collab` network was built to prevent. Close it. This is
+**required**, not optional, on any host that enables `listen_*`:
+
+```
+sudo deploy/control-plane/collab-fabric-firewall.sh --install     # idempotent
+sudo deploy/control-plane/collab-fabric-firewall.sh --check       # exit 0 present, 1 absent, 2 not readable (not root)
+sudo deploy/control-plane/collab-fabric-firewall.sh --remove
+```
+
+It inserts, in `DOCKER-USER` (forwarded traffic) and in `INPUT` (traffic to the host itself, which `DOCKER-USER` never sees), a rule that drops every NEW
+connection whose source is the fabric subnet. Inbound connections to the published port are untouched (their source is the caller) and so are their replies.
+The network has no IPv6, so no `ip6tables` rule applies. The rules are kernel state: re-run `--install` at boot (a oneshot unit `After=docker.service`) and
+after anything that flushes iptables. `deploy.sh` only warns while `--check` does not succeed (it cannot install them: root); it never fails the deploy.
+Verify: from `docker exec herdr-collab-public` open a TCP connection to the host's tailnet IP; it must hang, not connect.
+
+### Boot order: docker must start after the tailnet address exists
+
+The port is published on the tailnet address. If dockerd starts before tailscaled has that address, binding fails, `collab-public` does not start, and the
+PUBLIC collab site is down until someone restarts it. Install the drop-in kept in the repository (root, once):
+
+```
+sudo install -D -m 0644 deploy/control-plane/docker-after-tailscale.conf /etc/systemd/system/docker.service.d/after-tailscale.conf
+sudo systemctl daemon-reload      # applies at the next docker start; do not restart docker mid-day
+```
+
+It sets `After=tailscaled.service` and `Wants=tailscaled.service` and an `ExecStartPre` that waits up to 90 s for `tailscale ip -4` (then starts docker
+anyway). `deploy.sh` warns while the file is missing. Nothing in this repository changes systemd for you.
+
+### The collab host trusts itself
+
+Any local process on the collab host (a shell, `ssh -L`, `socat`, a host-network container, anything that can connect to `<listen_host>:<listen_port>`)
+reaches the listener with the host's OWN tailnet IP as the peer address. If the collab host is in `machines`, that connection is accepted as that
+machine, and a fabric-bit agent bound to it can be named by any local process. Therefore:
+
+- never run a relay, port forward or L4/SNI front on the collab host that reaches the listener on behalf of other machines;
+- omit the collab host from `machines` unless agents running on that very host need fabric auth.
 
 ### Rollback
 

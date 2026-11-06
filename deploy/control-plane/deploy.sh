@@ -537,6 +537,8 @@ fi
 # Fabric-trust listener (SPEC 6a): only with the collab overlay AND control_plane.collab.fabric_trust.listen_* set.
 # The address was validated (tailnet range) by the config; docker publishes exactly that host:port.
 FABRIC=0
+FABRIC_SERVICE_ORPHAN=0
+FABRIC_SERVICE=()   # the services only the fabric overlay defines; rebuilt per checkout on rollback
 # An older candidate (a rollback target, a pinned --ref) has neither the helper nor the overlay: no listener then.
 if [ "$COLLAB" = 1 ] && grep -q 'fabric-listener' "$WORK/herdr_engineering/cli.py" 2>/dev/null \
     && [ -f "$WORK/deploy/control-plane/compose.collab-fabric.yaml" ]; then
@@ -552,7 +554,18 @@ if [ "$COLLAB" = 1 ] && grep -q 'fabric-listener' "$WORK/herdr_engineering/cli.p
     else export HERDR_COLLAB_FABRIC_WHOIS_DIR="$HOME/.local/share/herdr-engineering/collab-fabric-whois"; fi
     COLLAB_FILES+=(-f "$WORK/deploy/control-plane/compose.collab-fabric.yaml")
     EDGE_SERVICE=(fabric-whois "${EDGE_SERVICE[@]}")
+    FABRIC_SERVICE=(fabric-whois)
     echo "fabric-trust listener: $FABRIC_HOST:$FABRIC_PORT (whois sidecar fabric-whois)"
+    # Host hardening the listener relies on but a deploy cannot install (root): warn, never fail.
+    FABRIC_FW="$WORK/deploy/control-plane/collab-fabric-firewall.sh"
+    if [ -x "$FABRIC_FW" ] && ! "$FABRIC_FW" --check >/dev/null 2>&1; then
+      echo "WARNING: fabric network firewall is not confirmed present (or not readable without root): collab-public's network has a default route" \
+        "and can reach this host's own addresses. As root run: $FABRIC_FW --install  (docs/operations/fabric-trust.md, Required hardening)" >&2
+    fi
+    if [ ! -e /etc/systemd/system/docker.service.d/after-tailscale.conf ]; then
+      echo "WARNING: docker is not ordered after tailscaled: after a reboot the published fabric port may fail to bind and the PUBLIC collab site" \
+        "stay down. Install $WORK/deploy/control-plane/docker-after-tailscale.conf as /etc/systemd/system/docker.service.d/after-tailscale.conf" >&2
+    fi
   fi
 fi
 
@@ -1027,7 +1040,7 @@ forward() {
     # once, alone, first - and leave it out of the up below. Recreating it twice back to
     # back is what raced Docker's removal of the old container (2026-10-29).
     compose_up_retry "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build --force-recreate collab-public >/dev/null || return 1
-    compose_up_retry "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build "${APP_SERVICES[@]}" collab-edge >/dev/null || return 1
+    compose_up_retry "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build "${APP_SERVICES[@]}" collab-edge "${FABRIC_SERVICE[@]}" >/dev/null || return 1
   else
     compose_up "$WORK" "$ENV_FILE" "$TAG" "$SHA" >/dev/null || return 1
   fi
@@ -1045,6 +1058,23 @@ forward() {
   python3 "$STATE_HELPER" verify-forward "$ATTEMPT" || return 1
   verify "$SHA" || return 1
   memory_client_promote
+}
+
+# rollback_services: the service list for the checkout being rolled back to. A checkout without the fabric overlay
+# cannot name fabric-whois (compose fails "no such service"), so drop it for the whole rollback and stop the sidecar
+# the failed forward deploy started (it is an orphan there: nothing of that checkout talks to it).
+rollback_services() {
+  local svc kept=()
+  FABRIC_SERVICE_ORPHAN=0
+  [ "$FABRIC" = 1 ] || return 0
+  [ ! -f "$PREV_WORK/deploy/control-plane/compose.collab-fabric.yaml" ] || return 0
+  for svc in "${EDGE_SERVICE[@]}"; do
+    [ "$svc" != fabric-whois ] || continue
+    kept+=("$svc")
+  done
+  EDGE_SERVICE=("${kept[@]}")
+  FABRIC_SERVICE=()
+  FABRIC_SERVICE_ORPHAN=1
 }
 
 rollback_share() {
@@ -1105,7 +1135,9 @@ rollback() {
   if [ "$RESTORED" = 1 ] \
       && git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
       && prev_render \
+      && rollback_services \
       && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
+      && { [ "$FABRIC_SERVICE_ORPHAN" = 0 ] || { stop_fabric_whois; true; }; } \
       && memory_client_apply rollback "$PREV_WORK" \
       && { ! declare -F web_egress_after >/dev/null || web_egress_after rollback; } \
       && rollback_share \

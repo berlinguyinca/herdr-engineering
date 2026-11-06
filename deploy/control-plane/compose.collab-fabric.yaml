@@ -13,9 +13,15 @@
 # Source address. The listener decides who a caller is from the TCP peer address, so Docker must hand it the real
 # tailnet source IP. A published port on a bridge network keeps it when Docker uses iptables DNAT (the default with
 # the userland proxy off, or for non-loopback sources); verify it on the host (docs/operations/fabric-trust.md,
-# "Checking the source address") before trusting the listener. The `fabric` network below is not internal (a
-# published port needs that) but has IP masquerade disabled, so containers on it have no outbound route.
-# Fallback when the check fails: run collab-public with `network_mode: host` and bind the listener to the tailnet IP.
+# "Checking the source address") before trusting the listener. Fallback when the check fails: run collab-public with
+# `network_mode: host` and bind the listener to the tailnet IP.
+#
+# Egress (READ THIS). Docker cannot publish a port from an `internal: true` network, so the `fabric` network is NOT
+# internal. IP masquerade is off, which only stops NAT of replies for a LAN/internet destination: it does NOT remove
+# the default route. A process in collab-public can still open connections to the host's own addresses (tailnet,
+# LAN, the bridge gateway, host-network services, other containers' published ports), i.e. toward the operator plane.
+# The required hardening is deploy/control-plane/collab-fabric-firewall.sh --install (DOCKER-USER + INPUT rules for
+# this fixed subnet); deploy.sh warns while it is absent. See docs/operations/fabric-trust.md, "Required hardening".
 #
 # The collab-public command is NOT repeated here (compose replaces command lists): the base overlay already passes
 # `--collab-fabric-bind-host 0.0.0.0`, inert unless fabric_trust.listen_* is set; the in-container port is the
@@ -67,5 +73,8 @@ services:
 
 networks:
   fabric:
+    ipam:
+      config:
+        - subnet: 172.30.213.0/24   # fixed so collab-fabric-firewall.sh can name it (keep both in step)
     driver_opts:
       com.docker.network.bridge.enable_ip_masquerade: "false"

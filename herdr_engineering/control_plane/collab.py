@@ -6837,9 +6837,16 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
     # --------------------------------------------------------------- routing
     def dispatch(self, method: str, parts: list[str], query: dict, body: dict,
                  authorization: str, device: str | None, operator: str | None = None,
-                 client: str | None = None, peer_ip: str | None = None, machine: str | None = None):
-        """parts: path segments after /api/v1/collab. Returns (status, json) or a Stream."""
+                 client: str | None = None, peer_ip: str | None = None, machine: str | None = None,
+                 fabric_listener: bool = False):
+        """parts: path segments after /api/v1/collab. Returns (status, json) or a Stream.
+
+        ``fabric_listener``: the request came in on the dedicated fabric listener, where the routes that run BEFORE
+        authentication (enrollment, join, join-link, the public config) do not exist: a 404, whatever the headers."""
         try:
+            if fabric_listener and (parts[:1] == ["agents"] and parts[1:] in (["enrollment", "complete"], ["join"], ["join-link"])
+                                    or parts == ["config"]):
+                raise CollabError(404, "not found")
             if parts == ["agents", "enrollment", "complete"] and method == "POST":
                 return 201, self.complete_enrollment(body)
             if parts == ["agents", "join"] and method == "POST":

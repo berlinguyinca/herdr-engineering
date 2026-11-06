@@ -150,6 +150,11 @@ if [ "$1" = compose ]; then
     prev="$a"
   done
   echo "composefiles tag=${{HERDR_CP_IMAGE_TAG:-}}$files" >> {log}
+  if [ "$up" = 1 ]; then   # like compose: an up naming fabric-whois needs the overlay that defines it
+    case " $* " in *" fabric-whois "*)
+      case "$files" in *compose.collab-fabric.yaml*) ;; *)
+        echo "no such service: fabric-whois" >&2; exit 1 ;; esac ;; esac
+  fi
   lock="$HOME/.local/share/herdr-engineering/collab-sync.lock"
   if [ "$up" = 1 ] && [ -e "$lock" ]; then
     if flock -n "$lock" true; then echo "collablock free" >> {log}; else echo "collablock held" >> {log}; fi
@@ -1192,6 +1197,78 @@ def test_full_collab_rollback_pins_edge_without_replacing_command_overlay(env):
     rb = next(line for line in log.splitlines() if line.startswith(f"composefiles tag={prev_tag} "))
     assert "compose.collab.yaml" in rb and rb.endswith("rollback-images.json")
     assert "collab-public collab-edge" in log
+
+
+FABRIC_TRUST = {"enabled": True, "tailnet_suffix": "tail1234.ts.net", "machines": ["beast"],
+                "listen_host": "100.64.0.7", "listen_port": 8484, "whois_socket": "/run/fabric-whois/whois.sock"}
+
+
+def _overlay_free_layout_commit():
+    """A rollback target that has the collab overlay and layout marker but predates the fabric overlay."""
+    for c in _git("log", "--format=%H", "-S", "x-herdr-deploy-layout: 2", "--",
+                  "deploy/control-plane/compose.yaml").splitlines():
+        have = subprocess.run(["git", "cat-file", "-e", f"{c}:deploy/control-plane/compose.collab-fabric.yaml"],
+                              cwd=ROOT, capture_output=True).returncode == 0
+        collab = subprocess.run(["git", "cat-file", "-e", f"{c}:deploy/control-plane/compose.collab.yaml"],
+                                cwd=ROOT, capture_output=True).returncode == 0
+        if collab and not have and c != _git("rev-parse", "HEAD"):
+            return c
+    pytest.skip("no older layout-2 commit without the fabric overlay")
+
+
+def test_forward_deploy_with_the_listener_starts_the_sidecar_even_when_the_slice_changed(env):
+    _with_collab(env, dict(COLLAB, fabric_trust=FABRIC_TRUST))
+    _seed_previous(env, _layout_commit(), {"collab_slice_sha256": "0" * 64})
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    ups = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("docker compose") and " up " in ln]
+    assert any("fabric-whois" in ln for ln in ups), ups
+
+
+def test_dry_run_with_the_listener_warns_non_fatally_about_firewall_and_boot_order(env):
+    _with_collab(env, dict(COLLAB, fabric_trust=FABRIC_TRUST))
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: fabric network firewall" in r.stderr and "collab-fabric-firewall.sh --install" in r.stderr
+    if not Path("/etc/systemd/system/docker.service.d/after-tailscale.conf").exists():
+        assert "WARNING: docker is not ordered after tailscaled" in r.stderr and "docker-after-tailscale.conf" in r.stderr
+
+
+def test_rollback_to_a_checkout_without_the_fabric_overlay_drops_the_sidecar_service(env):
+    _with_collab(env, dict(COLLAB, fabric_trust=FABRIC_TRUST))
+    prev_full, prev_tag = _seed_previous(env, _overlay_free_layout_commit())
+    env["env"]["STUB_UNHEALTHY_TAGS"] = _head()
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    assert "NOT rolled back" not in r.stderr and "FAILED TO ROLL BACK" not in r.stderr, r.stderr
+    assert f"rolled back to herdr-engineering:{prev_tag}" in r.stderr and "and healthy" in r.stderr
+    log = env["log"].read_text().splitlines()
+    fwd = [ln for ln in log if ln.startswith("docker compose") and " up " in ln and "fabric-whois" in ln]
+    assert fwd, "the forward deploy did start the sidecar"
+    files = [ln for ln in log if ln.startswith(f"composefiles tag={prev_tag} ")]
+    assert files and not any("compose.collab-fabric.yaml" in ln for ln in files)
+    after = log[log.index(files[0]):]
+    assert not any(ln.startswith("docker compose") and "fabric-whois" in ln for ln in after)
+    assert "docker stop herdr-collab-fabric-whois" in after                       # the orphan sidecar is stopped
+    assert "all of: control-plane-web control-plane-worker llm-proxy collab-public collab-edge)" in r.stderr
+
+
+def test_rollback_to_a_checkout_with_the_fabric_overlay_keeps_the_sidecar(env):
+    _with_collab(env, dict(COLLAB, fabric_trust=FABRIC_TRUST))
+    _, prev_tag = _seed_previous(env, _head_parent_with_overlay())
+    env["env"]["STUB_UNHEALTHY_TAGS"] = _head()
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    assert "and healthy" in r.stderr and "fabric-whois" in r.stderr.split("all of:")[1]
+    assert "docker stop herdr-collab-fabric-whois" not in env["log"].read_text()
+
+
+def _head_parent_with_overlay():
+    parent = _git("rev-parse", "HEAD~1")
+    if subprocess.run(["git", "cat-file", "-e", f"{parent}:deploy/control-plane/compose.collab-fabric.yaml"],
+                      cwd=ROOT, capture_output=True).returncode != 0:
+        pytest.skip("HEAD~1 has no fabric overlay")
+    return parent
 
 
 def _collab_ups(e):

@@ -332,3 +332,56 @@ def test_without_listener_config_nothing_extra_is_bound(fw):
     finally:
         srv.shutdown()
         t.join(timeout=5)
+
+
+# ---- review findings: Host allow-list and pre-authentication routes -------------------------------------------------------------------
+
+def test_a_foreign_host_header_is_refused_even_with_valid_fabric_auth(lw):
+    w = lw
+    info = fabric_agent(w)
+    w.localapi["nodes"][w.lan] = "bender.tail1234.ts.net."
+    path = f"{BASE}/rooms/{w.room}/events?cursor=0"
+    good = f"{w.lan}:{w.fabric_port}"
+    assert freq(w, "GET", path, headers={**auth(info), "Host": good})[0] == 200
+    assert freq(w, "GET", path, headers=auth(info))[0] == 200                          # http.client's own Host is the right one
+    for bad in ("evil.example", "evil.example:%d" % w.fabric_port, f"{w.lan}", f"{w.lan}:{w.fabric_port + 1}",
+                "localhost:%d" % w.fabric_port, "127.0.0.1:%d" % w.fabric_port, ""):
+        before = w.s.stats["auth_failures"]
+        s, _ = freq(w, "GET", path, headers={**auth(info), "Host": bad})
+        assert s == 421, (bad, s)
+        assert w.s.stats["auth_failures"] == before                                    # refused before authentication
+    # the case of the name does not matter
+    assert freq(w, "GET", path, headers={**auth(info), "Host": good.upper()})[0] == 200
+
+
+def test_a_rebound_browser_origin_equal_to_its_foreign_host_is_refused(lw):
+    w = lw
+    info = fabric_agent(w)
+    w.localapi["nodes"][w.lan] = "bender.tail1234.ts.net."
+    rebound = f"rebind.attacker.example:{w.fabric_port}"
+    h = {**auth(info), "Host": rebound, "Origin": f"http://{rebound}"}
+    assert freq(w, "POST", f"{BASE}/rooms/{w.room}/messages", headers=h, body={"text": "x", "idempotency_key": "rb1"})[0] == 421
+    assert freq(w, "GET", f"{BASE}/rooms/{w.room}/events?cursor=0", headers=h)[0] == 421
+    assert not [e for e in w.s._log if e["event_type"] == "message" and e["payload"].get("text") == "x"]
+    ok = {**auth(info), "Origin": f"http://{w.lan}:{w.fabric_port}"}                  # Origin == the allowed Host still passes
+    assert freq(w, "POST", f"{BASE}/rooms/{w.room}/messages", headers=ok, body={"text": "y", "idempotency_key": "rb2"})[0] in (200, 201)
+
+
+def test_pre_auth_routes_do_not_exist_on_the_fabric_listener_but_work_on_the_public_one(lw):
+    w = lw
+    info = fabric_agent(w)
+    w.localapi["nodes"][w.lan] = "bender.tail1234.ts.net."
+    h = auth(info)
+    routes = (("POST", f"{BASE}/agents/enrollment/complete"), ("POST", f"{BASE}/agents/join"),
+              ("POST", f"{BASE}/agents/join-link"), ("GET", f"{BASE}/config"))
+    for method, path in routes:
+        body = {} if method == "POST" else None
+        assert freq(w, method, path, headers=h, body=body)[0] == 404, (method, path)       # with a valid Fabric header
+        assert freq(w, method, path, body=body)[0] == 401, (method, path)                   # without one: the usual 401
+    # still served by the public handler (the listener's 404 is not what they answer there)
+    s, _ = freq(w, "GET", f"{BASE}/config", port=w.public_port)
+    assert s == 200
+    for _, path in routes[:3]:
+        s, _ = freq(w, "POST", path, port=w.public_port, body={})
+        assert s not in (404, 421), (path, s)                                               # reaches the service
+    assert freq(w, "GET", f"{BASE}/rooms/{w.room}/events?cursor=0", headers=h)[0] == 200  # authenticated routes unaffected
