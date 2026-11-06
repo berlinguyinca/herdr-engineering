@@ -475,3 +475,17 @@ def test_gc_skip_after_a_failed_view_write_is_logged(registry_pg, tmp_path, capl
         assert "garbage collection skipped" in caplog.text
 
     lrun(registry_pg, tmp_path, body)
+
+
+def test_folder_caps_are_refused_with_a_message(registry_pg, tmp_path):
+    from herdr_engineering.control_plane.artifact_library import MAX_FOLDERS
+
+    async def body(env, rt):
+        await sql(env, "INSERT INTO artifact_library_folders (folder_id, owner, name) "
+                       "SELECT 'fld_' || substr(md5(g::text), 1, 24), $1, 'f' || g FROM generate_series(1, $2) g",
+                  ALICE, MAX_FOLDERS)
+        out = await send(env, user("alice"), FOLDER_CREATE, {"name": "one too many"})
+        assert out["result"] == "rejected" and out["reason"] == "folder_cap" and "200" in out["message"], out
+        assert (await sql(env, "SELECT count(*) FROM artifact_library_folders"))[0][0] == MAX_FOLDERS
+
+    lrun(registry_pg, tmp_path, body)

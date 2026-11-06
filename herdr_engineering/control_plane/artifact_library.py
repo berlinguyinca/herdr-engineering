@@ -22,6 +22,8 @@ DEFAULT_SOURCES: frozenset[Source] = frozenset({"mine", "assigned", "opened"})  
 MAX_PAGE = 200
 
 MAX_FOLDER_NAME = 80
+MAX_FOLDERS = 200          # per member
+MAX_FOLDER_ITEMS = 2000    # per folder
 
 # Same visibility as ArtifactRegistry.list_records: owned, or an unexpired ACL read/admin grant; tombstoned excluded.
 READABLE_SQL = (
@@ -242,6 +244,9 @@ class LibraryStore:
     async def create_folder(self, owner: str, name: str) -> Folder:
         cleaned = _clean_name(name)
         folder_id = "fld_" + secrets.token_hex(12)
+        if int(await self._pool.fetchval("SELECT count(*) FROM artifact_library_folders WHERE owner=$1", owner)) \
+                >= MAX_FOLDERS:
+            raise LibraryError(429, "folder_cap", f"You have {MAX_FOLDERS} folders; delete one before creating another.")
         try:
             await self._pool.execute(
                 "INSERT INTO artifact_library_folders (folder_id, owner, name) VALUES ($1,$2,$3)",
@@ -310,6 +315,11 @@ class LibraryStore:
             )
             if visible is None:
                 raise LibraryError(*NOT_FOUND)
+            if await conn.fetchval("SELECT 1 FROM artifact_library_items WHERE folder_id=$1 AND artifact_id=$2",
+                                   folder_id, artifact_id) is None and int(await conn.fetchval(
+                    "SELECT count(*) FROM artifact_library_items WHERE folder_id=$1", folder_id)) >= MAX_FOLDER_ITEMS:
+                raise LibraryError(429, "folder_items_cap",
+                                   f"A folder holds at most {MAX_FOLDER_ITEMS} items; use another folder.")
             await conn.execute(
                 "INSERT INTO artifact_library_items (folder_id, artifact_id, source) VALUES ($1,$2,$3) "
                 "ON CONFLICT (folder_id, artifact_id) DO NOTHING",

@@ -719,6 +719,8 @@ def _library_handler(action: str, run: Callable[..., Any], result: str):
                 extra = await run(store, who.principal, intent, who)
         except LibraryError as exc:
             out = _rejected(exc.code)
+            if exc.status == 429:                  # a cap: the member is told why, in words
+                out["message"] = exc.message
         else:
             out = {"result": result, **extra}
         return await _conclude(ctx, who, action, out, artifact_id=intent.artifact_id)

@@ -296,6 +296,7 @@ export function contentMode(type) {
 /** The worker answers a refusal with HTTP 200 {result: 'rejected', reason}; this is the message, or null when it was not refused. */
 export function rejectionText(out) {
   if (!out || out.result !== 'rejected') return null;
+  if (typeof out.message === 'string' && out.message) return out.message;      // a cap explains itself
   return out.reason ? `Refused: ${out.reason}` : 'Refused.';
 }
 

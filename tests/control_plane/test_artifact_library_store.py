@@ -158,3 +158,32 @@ def test_name_length_and_blank_refused(dsn):
             await store.rename_folder(ME, ok.folder_id, " ")
         assert e.value.status == 400
     run(dsn, body)
+
+
+def test_folders_per_member_and_items_per_folder_are_capped(dsn):
+    from herdr_engineering.control_plane.artifact_library import MAX_FOLDERS, MAX_FOLDER_ITEMS
+
+    async def body(store, pool):
+        await pool.execute(
+            "INSERT INTO artifact_library_folders (folder_id, owner, name) "
+            "SELECT 'fld_' || substr(md5($1 || g::text), 1, 24), $1, 'f' || g FROM generate_series(1, $2) g", ME, MAX_FOLDERS)
+        with pytest.raises(LibraryError) as e:
+            await store.create_folder(ME, "one too many")
+        assert (e.value.status, e.value.code) == (429, "folder_cap") and "200" in e.value.message
+        await store.create_folder(YOU, "someone else is unaffected")
+        await store.delete_folder(ME, "fld_" + __import__("hashlib").md5((ME + "1").encode()).hexdigest()[:24])
+        folder = await store.create_folder(ME, "fits again")
+        mine = await artifact(pool)
+        await pool.execute(
+            "INSERT INTO artifacts (artifact_id, created_by) SELECT 'artifact_cap' || md5($1 || g::text), $1 "
+            "FROM generate_series(1, $2) g", ME, MAX_FOLDER_ITEMS)
+        await pool.execute(
+            "INSERT INTO artifact_library_items (folder_id, artifact_id, source) SELECT $1, artifact_id, 'manual' FROM artifacts "
+            "WHERE artifact_id LIKE 'artifact_cap%' AND created_by=$2", folder.folder_id, ME)
+        with pytest.raises(LibraryError) as e:
+            await store.file_artifact(ME, folder.folder_id, mine)
+        assert (e.value.status, e.value.code) == (429, "folder_items_cap")
+        again = (await pool.fetchval("SELECT artifact_id FROM artifact_library_items WHERE folder_id=$1 LIMIT 1",
+                                     folder.folder_id))
+        await store.file_artifact(ME, folder.folder_id, again)       # already filed: idempotent, not a new item
+    run(dsn, body)

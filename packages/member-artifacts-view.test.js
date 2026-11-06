@@ -286,6 +286,7 @@ test('contentMode shows only the server inline types; html, css, js, xml, svg an
 
 test('rejectionText reads the worker refusal (HTTP 200 result rejected) and nothing else', () => {
   assert.match(rejectionText({ result: 'rejected', reason: 'pending_cap' }), /pending_cap/);
+  assert.equal(rejectionText({ result: 'rejected', reason: 'folder_cap', message: 'You have 200 folders' }), 'You have 200 folders');
   assert.match(rejectionText({ result: 'rejected' }), /refused/i);
   assert.equal(rejectionText({ result: 'created' }), null);
   assert.equal(rejectionText(null), null);
