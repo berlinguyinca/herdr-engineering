@@ -347,9 +347,9 @@ def test_table_cells_do_not_break_words_character_by_character():
 
 def test_public_preview_has_no_dangling_report_links_when_referenced_evidence_is_omitted():
     """Chips for omitted evidence fall back to href="report"; the public copy must not keep that dead link."""
+    from herdr_engineering.control_plane import share_render as sr
     from herdr_engineering.control_plane.artifact_report_render import render_report_preview
     from herdr_engineering.control_plane.artifact_share_api import _report_preview
-    from herdr_engineering.control_plane import share_render as sr
 
     report = descriptor()
     report["evidence"] = [{"id": f"e{i}", "title": f"Evidence {i}", "description": "d " * 900, "asset_ids": ["data"]}
