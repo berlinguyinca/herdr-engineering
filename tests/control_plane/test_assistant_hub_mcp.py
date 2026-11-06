@@ -369,3 +369,10 @@ def test_per_worker_event_rate_limit_applies_to_ask_and_report_only_for_that_wor
     assert call(hub, calm, "assistant_ask", {"question": "q", "session_id": "s"})["isError"] is False
     assert call(hub, busy, "grants_list")["isError"] is False   # reads are not event writes
     assert len(list_events(hub.store, tenant_id="t1", user_id="u1", limit=500)) == 31
+
+
+def test_report_tool_tells_the_worker_to_relay_a_failed_deploy_exit_3_report():
+    hub = make_hub()
+    _, body = rpc(hub, enrol(hub), "tools/list")
+    (tool,) = [t for t in body["result"]["tools"] if t["name"] == "report"]
+    assert "exit 3" in tool["description"] and "tell the user directly" in tool["description"]

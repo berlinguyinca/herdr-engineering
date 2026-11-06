@@ -86,7 +86,8 @@ _TOOLS: dict[str, tuple[str, str, dict]] = {
                        "session_id": _STR}}),
     "report": ("report", "Report a decision, correction, stated rule or outcome from your session. It is recorded as "
                "worker-reported; it never grants anything. With task_id and final=true it says the task is finished "
-               "and the owner gets one summary of it.", {
+               "and the owner gets one summary of it. If deploy.sh exits 3 the hub is usually down and this report may fail: "
+               "then tell the user directly, the hub cannot.", {
         "type": "object", "required": ["kind", "session_id"], "additionalProperties": False,
         "properties": {"kind": {"enum": list(REPORT_KINDS)}, "text": {"type": "string", "maxLength": 2000},
                        "payload": {"type": "object"}, "session_id": _STR,

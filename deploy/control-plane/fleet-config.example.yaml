@@ -243,6 +243,7 @@ sections:
       #     grant_ttl_days: 30           # lifetime of a proposed grant, and of an active one from activation
       #     extra_vetoes: []             # extra hard denies: [{code: no_prod, reason: "...", argv_contains: "prod"}]
       #     policy_version: 1            # bump to invalidate every existing grant
+      #     approval_ttl_minutes: 15     # how long an owner's one-shot approval of an exact action can be spent
       #   # OPTIONAL: the action judge (Phase 3). It can only ADD friction: an active grant is honoured only when the
       #   # judge answers AND does not escalate; unreachable/disabled => the owner decides. Register the key with
       #   # `herdr-eng control-plane assistant-judge register --endpoint URL --key-file PATH --key-stdin` (stdin only).
@@ -275,6 +276,11 @@ sections:
       #     channel: ""                  # channel id; empty = the owner's DM
       #     ask_ttl_minutes: 15          # integer 1..120
       #     max_asks_per_task_per_hour: 6
+      #     max_asks_per_worker_per_hour: 20   # integer 1..1000; across all of a worker's task ids
+      #     max_asks_per_hour: 60              # integer 1..10000; across all workers; overflow is batched
+      #     summary_idle_minutes: 30     # integer 1..1440
+      #   # The Slack runtime serves ONE owner (owner_user_id from THIS YAML, not from worker registration)
+      #   # and every principal visible to it.
       #   # OPTIONAL: per-project, per-scope deploy permission (Phase 4). A worker's command maps to a project and scope
       #   # ONLY when it is exactly `<command> --ref <40 lowercase hex chars>` and its repo agrees. `mode: auto` is only a
       #   # candidate: it takes effect after YOU confirm it with a Slack tap (POST /api/v1/assistant-deploys/<project>/<scope>/auto)
@@ -291,6 +297,8 @@ sections:
       #             health_url: http://127.0.0.1:8080/api/v1/health   # REQUIRED with an explicit descends_from_deployed: the hub
       #                                         # reads the deployed commit from `<health_url>?probe=1` (loopback http or https)
       #     precondition_timeout_seconds: 10   # overall deadline for the hub's checks per request, 1..60
+      #     deploy_check_minutes: 20     # integer 1..240; how long the hub polls health before "unconfirmed"
+      #     deploy_window_minutes: 10    # integer 1..240, <= deploy_check_minutes; the target must keep serving through it for "healthy"
       #   # Off-box anchor for the audit chain head (see runbook "Anchoring the audit head"):
       #   audit:
       #     hmac_key_file: "/etc/herdr/assistant-audit.key"   # PATH only (>= 16 bytes)

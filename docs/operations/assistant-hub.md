@@ -515,7 +515,14 @@ personal_assistant:
     ask_ttl_minutes: 15               # 1..120; an unanswered ask then stays pending
     max_asks_per_task_per_hour: 6     # 1..1000; further asks are batched into one line
     summary_idle_minutes: 30          # 1..1440; a task with no final report gets a summary after this much quiet
+    max_asks_per_worker_per_hour: 20  # 1..1000; per worker across ALL its task ids (task ids are worker-controlled)
+    max_asks_per_hour: 60             # 1..10000; across all workers; overflow folds into the batched line
 ```
+
+`owner_user_id` comes from this YAML, never from worker registration. The Slack runtime serves one owner and every
+principal visible to it: a tap or reply from `owner_user_id` is honoured for any tenant/user the hub holds asks for.
+`grants.approval_ttl_minutes` (default 15, in the `grants` block) is how long a one-shot owner approval of an exact action
+stays spendable before it lapses.
 
 Inline tokens (`bot_token`, `app_token`, `token`, `secret`) are rejected at load, and the two files must differ.
 
@@ -547,7 +554,8 @@ Refused taps write `assistant.slack.refused` with a reason. A worker is never to
   (`answered` plus the text, returned as untrusted data). A reply is never an approval: a reply on an action ask is refused
   with `reason=not_question`. A question the hub could not post yet reports `pending` and is posted when Slack is back;
   past its ttl it is `expired` (`reason: not_asked` if it was never shown). Another worker, tenant or user sees `ask not found`.
-- **Rate limit.** `max_asks_per_task_per_hour` bounds posts per worker and task; the rest are folded into one batched line and
+- **Rate limit.** `max_asks_per_task_per_hour` bounds posts per worker and task; `max_asks_per_worker_per_hour` and
+  `max_asks_per_hour` bound them per worker (whatever task ids it invents) and globally; the rest are folded into one batched line and
   posted as the window frees. A burst of questions does not delay an action ask on the same task.
 - **Per-task summaries.** When a worker's `report` for a `task_id` is marked `final: true` (or the task has been quiet for
   `summary_idle_minutes`), the hub posts **one** summary per worker and task: counts (authorized under grants, one-shot
@@ -610,10 +618,12 @@ polls `<health_url>?probe=1` itself; the worker's word is never used for "health
 | Status | Meaning | Slack |
 |---|---|---|
 | `awaiting` | still polling; an unreachable endpoint is expected while the container is replaced | nothing yet; summaries say "still being checked" |
-| `healthy` | health reports the target commit (a prefix of at least 12 characters), or a newer commit that contains it | `Deploy healthy` (with a note if main moved or could not be re-checked) |
-| `rolled_back` | after `deploy_window_minutes` a different version is serving | `Deploy not live: ... is not serving. A different version is serving (...); the new version is not live; cause unknown.` The hub does **not** claim a rollback happened or that the old version "is back" |
+| `healthy` | **provisional**: the check stays `awaiting` while the target is seen, and finalizes only once the target has been seen on polls through `deploy_window_minutes` (a prefix of at least 12 characters, or a newer commit that contains it). The hub runs inside the web process `deploy.sh` recreates, so it sees its own new version at once; a later worker-reported nonzero `deploy_exit` overrides even `healthy` | `Deploy healthy` (with a note if main moved or could not be re-checked) |
+| `rolled_back` | after `deploy_window_minutes` (or once the target was seen and then replaced) a different version is serving; or the worker reported `{"deploy_exit": 1}` | `Deploy not live: ... is not serving. A different version is serving (...); the new version is not live; cause unknown.` The hub does **not** claim a rollback happened or that the old version "is back" |
 | `unconfirmed` | `deploy_check_minutes` ran out without a confirmed result, or there is no `health_url` | `Deploy unconfirmed ... Do not assume it worked` |
-| `failed_rollback` | the worker reported `{"deploy_exit": 3}` in an `outcome` report | `URGENT: the deploy ... failed to roll back`, never batched or rate-limited |
+| `failed_rollback` | the worker reported `{"deploy_exit": 3}` in an `outcome` report, at any time, even after `healthy` (matched by `task_id`, else the worker's most recent check). With no hub check at all, the hub still posts `URGENT: ... reported deploy.sh exit 3 ..., but the hub has no deploy check for it` | `URGENT: the deploy ... failed to roll back`, never batched or rate-limited |
+
+Exit 0 never upgrades any status. Exit 1 posts a `rolled back` notice.
 
 A deploy whose lineage cannot be verified is never reported healthy; a check that could not even be opened is posted as
 `Deploy NOT verified by the hub`. The `rolled_back` status name is historical: it means "a different version is serving", nothing more.
@@ -627,6 +637,12 @@ A deploy whose lineage cannot be verified is never reported healthy; a check tha
   hub cannot see which checkout or working directory the worker then runs `deploy.sh` from. A hint can only make matching
   stricter (a mismatch leaves the request unmatched); it cannot widen it. What the hub does bind is the exact argv and the 40-character
   sha, which it verifies against GitHub, Woodpecker and the health endpoint. Run deploy workers only from the intended checkout.
+- **Deploy exit 3 and the worker's report.** When `deploy.sh` exits 3 (rollback failed) the hub is usually down, so the
+  worker's `report` may itself fail. A failed report on deploy exit 3 must be relayed to the user directly, by the worker.
+  An out-of-process notifier is deferred.
+- **Scope-gated deploys.** For a repo configured in `deploy.projects`, the generic `deploy` tool (`deploy.prod` /
+  `deploy.canary`) is never grantable and never one-shot: it is always `pending` and points to the scope `/auto` flow.
+  "Approve and remember" on a sha-bound deploy ask is refused with the same pointer.
 - Slack taps widen the owner boundary as described above; the Socket Mode link has no per-request signing secret, so the
   app-level token plus the user id and nonce checks are the whole authentication.
 
