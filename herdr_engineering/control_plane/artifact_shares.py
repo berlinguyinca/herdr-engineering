@@ -78,6 +78,9 @@ _COLUMNS = ("share_id, artifact_id, version_id, audience, allow_emails, allow_gr
             "total_bytes, title, expires_at, created_by, created_at, approved_by, approved_at, revoked_at")
 
 
+PENDING_NOT_ACCEPTED = "pending_not_accepted"      # an agent push the owner has not accepted yet is never shareable
+
+
 class ShareError(ValueError):
     """A share request or transition that violates the rules (never a server fault).
 
@@ -299,6 +302,8 @@ class ShareStore:
                             or not set(emails) <= set(member_emails)):
                         raise ShareError("the audience is outside what this member may share with",
                                          code="member_audience_refused")
+            if await conn.fetchval("SELECT intake FROM artifacts WHERE artifact_id=$1", artifact_id) == "pending":
+                raise ShareError("an agent push must be accepted before it can be shared", code=PENDING_NOT_ACCEPTED)
             if await conn.fetchval("SELECT 1 FROM artifact_versions WHERE version_id=$1 AND artifact_id=$2",
                                    version_id, artifact_id) is None:
                 raise ShareError("version does not belong to that artifact")
@@ -355,10 +360,11 @@ class ShareStore:
             # FOR SHARE: a concurrent delete (which locks the artifact row FOR UPDATE) either finished first, so the link
             # is refused here, or waits for this commit and then revokes the link it finds live
             owner_artifact = await conn.fetchval("SELECT artifact_id FROM artifact_shares WHERE share_id=$1", share_id)
-            lifecycle = None
+            lifecycle = intake = None
             if owner_artifact is not None:
-                lifecycle = await conn.fetchval("SELECT lifecycle FROM artifacts WHERE artifact_id=$1 FOR SHARE",
-                                                owner_artifact)
+                found = await conn.fetchrow("SELECT lifecycle, intake FROM artifacts WHERE artifact_id=$1 FOR SHARE",
+                                            owner_artifact)
+                lifecycle, intake = (found["lifecycle"], found["intake"]) if found else (None, None)
             current = await conn.fetchrow("SELECT state, expires_at, created_by, artifact_id, audience FROM "
                                           "artifact_shares WHERE share_id=$1 FOR UPDATE", share_id)
             if current is None:
@@ -369,6 +375,8 @@ class ShareStore:
                 raise ShareError(f"share is {current['state']}, not pending")
             if lifecycle is not None and lifecycle != "active":
                 raise ShareError("artifact is not active")
+            if intake == "pending":
+                raise ShareError("an agent push must be accepted before it can be shared", code=PENDING_NOT_ACCEPTED)
             if current["expires_at"] is not None and current["expires_at"] <= datetime.now(UTC):
                 raise ShareError("share has already expired", code="expired")
             if await conn.fetchval("SELECT 1 FROM artifact_shares WHERE token_hash=$1", token_hash) is not None:

@@ -603,3 +603,61 @@ def test_approved_member_link_records_the_directory_display_name_or_the_user_id(
             (state,) = [s for s in _states(tmp_path) if s["share_id"] == out["share_id"]]
             assert state["shared_by"] == expected
     srun(registry_pg, tmp_path, body)
+
+
+# ----------------------------------------------------------------------------- security: a pending push is not shareable
+
+async def _pending_push(env, who):
+    aid = await create_artifact(env, who)
+    out = await publish(env, aid, actor=who, owner=ALICE)
+    assert out["result"] == "created", out
+    (row,) = await sql(env, "SELECT intake FROM artifacts WHERE artifact_id=$1", aid)
+    return aid, out["version_id"], row["intake"]
+
+
+@pytest.mark.parametrize("audience,extra", [("public", {"expires_in_days": 7}),
+                                            ("lab", {"allow_groups": ["lab"], "expires_in_days": 7})])
+def test_a_pending_agent_push_cannot_be_shared_until_accepted(registry_pg, tmp_path, audience, extra):
+    async def body(env, rt):
+        ag = agent("ag1")
+        aid, vid, intake = await _pending_push(env, ag)
+        assert intake == "pending"
+        out = await share(env, ag, aid, vid, audience=audience, **extra)
+        assert out["result"] == "rejected" and out["reason"] == "pending_not_accepted", out
+        assert await sql(env, "SELECT 1 FROM artifact_shares") == []
+        out = await share(env, user("alice"), aid, vid, audience=audience, **extra)      # the owner too: accept first
+        assert out["result"] == "rejected" and out["reason"] == "pending_not_accepted", out
+        accepted = await send(env, user("alice"), "library_accept", {}, aid=aid)
+        assert accepted["result"] == "accepted"
+        out = await share(env, ag, aid, vid, audience=audience, **extra)
+        assert out["result"] == "created", out
+    srun(registry_pg, tmp_path, body)
+
+
+def test_an_approval_of_a_share_made_before_the_artifact_went_pending_is_refused(registry_pg, tmp_path):
+    async def body(env, rt):
+        ag = agent("ag1")
+        aid, vid, _ = await _pending_push(env, ag)
+        await sql(env, "UPDATE artifacts SET intake='accepted' WHERE artifact_id=$1", aid)
+        s = await share(env, ag, aid, vid, expires_in_days=7)
+        assert s["result"] == "created", s
+        await sql(env, "UPDATE artifacts SET intake='pending' WHERE artifact_id=$1", aid)
+        ticket, done = await approve(env, ag, aid, s["share_id"])
+        assert done["result"] == "rejected" and done["reason"] == "pending_not_accepted", done
+        (st,) = await sql(env, "SELECT state FROM artifact_shares WHERE share_id=$1", s["share_id"])
+        assert st["state"] == "pending"
+    srun(registry_pg, tmp_path, body)
+
+
+def test_the_share_store_itself_refuses_a_pending_artifact_for_any_creator(registry_pg, tmp_path):
+    from herdr_engineering.control_plane.artifact_shares import ShareError
+
+    async def body(env, rt):
+        aid, vid, _ = await _pending_push(env, agent("ag1"))
+        for creator in (None, "operator", ALICE):
+            with pytest.raises(ShareError) as exc:
+                await ShareStore(await asyncpg.connect(registry_pg["dsn"])).create(
+                    artifact_id=aid, version_id=vid, audience="public", created_by=creator,
+                    expires_at=datetime.now(UTC) + timedelta(days=7))
+            assert exc.value.code == "pending_not_accepted"
+    srun(registry_pg, tmp_path, body)
