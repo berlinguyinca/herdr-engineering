@@ -10,6 +10,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - The share host serves `/s/<token>/f/author-page.html` with the dashboard Rich view headers minus the two framing controls (bare `sandbox` CSP with no `allow-*`, nosniff, no-referrer, no-store, noindex; no `frame-ancestors` or `X-Frame-Options`, which an opaque-origin parent can never satisfy; the dashboard route is unchanged), with the preview's access, revocation and expiry checks. The preview of an opted-in share gets a "Rich view" toggle that mounts `<iframe sandbox="">` ("Scripts are disabled in this view") The preview keeps its opaque origin (no `allow-same-origin`); only its meta CSP gains `script-src 'sha256-...'; frame-src 'self'`.
 - `test_no_frames.py` allow-lists `share_static/rich-toggle.js` with a pinned shape; variations are asserted rejected. Tests: `test_share_rich_view.py` (21), real-Chromium `tests/playwright/share-rich-view.test.mjs` (4).
 
+### Report preview hides sections the byte budget leaves empty
+- When a section's share of the byte cap fits none of its entries (for example Evidence at a 12000-byte cap), the preview no longer shows a bare heading and table header: the section and its Contents chip are left out. The omission note still appears and keeps the counts ("Shown: 0 of 3 evidence entries."). Sections that are empty in the descriptor are unchanged (still absent).
+
 ### Build cache backend follow-ups (all default off)
 - `Registry.reconcile` now runs at build start and in the cleanup sweep (expired leases with dead owners only).
 - New contract events `cache_stats_updated`, `storage_degraded`, `lease_changed`, `cleanup_completed` (`contract-events.jsonl`), published on the build-cache stream.
