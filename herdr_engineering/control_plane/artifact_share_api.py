@@ -153,6 +153,8 @@ def _report_preview(descriptor: dict) -> bytes:
     """The rendered report preview with asset and descriptor links reduced to plain text (assets are not shared)."""
     from .artifact_report_render import render_report_preview
     page = render_report_preview(descriptor, asset_url=lambda asset: "#")
+    page = re.sub(r'<a class="btn" href="#" download>.*?</a>', "", page)  # a download button has no target here
+    page = re.sub(r'<a (class="[a-z ]+") href="#">(.*?)</a>', r"<span \1>\2</span>", page)  # keep chip styling
     return re.sub(r'<a href="(?:#|report)">(.*?)</a>', r"\1", page).encode("utf-8")
 
 
