@@ -6,7 +6,8 @@ import assert from 'node:assert/strict';
 import {withPage} from './helpers/fixture.mjs';
 import {boot,until,sleep} from './helpers/live.mjs';
 
-const TOLERANCE_PX=16;
+// 80: the desktop placeholder is sized between an empty assistant list (372px) and two assistants (574px).
+const TOLERANCE_PX=80;
 const now='2026-10-29T10:00:00Z';
 const assistant=(id,name)=>({assistant_id:id,name,persona:'helpful',status:'ready',instructions:'',model_policy:'auto',enabled:true,created_at:now,updated_at:now});
 const answer=path=>{

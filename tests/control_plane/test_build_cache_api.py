@@ -314,3 +314,244 @@ def test_build_cache_event_stream_is_bounded():
     assert BUILD_CACHE_STREAM_MAX <= len(stream) <= BUILD_CACHE_STREAM_MAX * 2
     assert stream[-1]["payload"]["build_id"] == f"b{n - 1}" and stream[-1]["sequence"] == n - 1
     assert len([e for e in repo.recent_events(limit=100000) if e["entity_type"] == "build_cache"]) == len(stream)
+
+
+# ---------------------------------------------------------------------------------------------- contract events
+def _write_contract(state, rows):
+    state.mkdir(parents=True, exist_ok=True)
+    with open(state / "contract-events.jsonl", "a") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
+def test_contract_events_become_allowlisted_redacted_stream_events(served):
+    base, state, repo = served
+    call(base, "GET", "/api/v1/build-cache/status", "k-view")               # baseline
+    ts = "2026-11-05T00:00:00Z"
+    _write_contract(state, [
+        {"event": "cache_stats_updated", "ts": ts, "host": "h1", "build_id": "b1", "cache_applied": True,
+         "sccache_stats": {"compile_requests": 5, "bad": "x"}, "argv": [SECRET]},
+        {"event": "storage_degraded", "ts": ts, "host": "h1", "tier": "shared",
+         "reason": "shared_unavailable:endpoint_down", "note": SECRET},
+        {"event": "lease_changed", "ts": ts, "host": "h1", "change": "reconciled", "scope_id": "abc",
+         "attempt_id": "a1", "epoch": None, "path": "/home/x"},
+        {"event": "cleanup_completed", "ts": ts, "host": "h1", "kind": "eviction", "status": "applied",
+         "removed_count": 4, "removed_bytes": 4000},
+        {"event": "something_else", "ts": ts, "host": "h1"},
+    ])
+    call(base, "GET", "/api/v1/build-cache/builds", "k-view")
+    evs = {e["event_type"]: e["payload"] for e in repo.recent_events(limit=100) if e["entity_type"] == "build_cache"}
+    assert sorted(evs) == ["build_cache.cache_stats_updated", "build_cache.cleanup_completed",
+                           "build_cache.lease_changed", "build_cache.storage_degraded"]
+    assert evs["build_cache.cache_stats_updated"]["sccache_stats"] == {"compile_requests": 5}
+    assert evs["build_cache.storage_degraded"] == {"ts": ts, "host": "h1", "tier": "shared", "reason": "shared_unavailable:endpoint_down"}
+    assert evs["build_cache.lease_changed"]["change"] == "reconciled"
+    assert evs["build_cache.cleanup_completed"]["removed_bytes"] == 4000
+    dump = json.dumps(evs)
+    assert SECRET not in dump and "argv" not in dump and "/home/x" not in dump
+    call(base, "GET", "/api/v1/build-cache/builds", "k-view")               # never published twice
+    assert len([e for e in repo.recent_events(limit=100) if e["entity_type"] == "build_cache"]) == 4
+
+
+# ---------------------------------------------------------------------------------------------- SSE resume
+def _read_frames(base, key, want, last_id=None, path="/api/v1/build-cache/events/stream"):
+    headers = {"X-API-Key": key}
+    if last_id:
+        headers["Last-Event-ID"] = last_id
+    frames, cur = [], {}
+    with urllib.request.urlopen(urllib.request.Request(base + path, headers=headers), timeout=10) as r:
+        assert r.headers["Content-Type"].startswith("text/event-stream")
+        while len(frames) < want:
+            line = r.readline().decode().rstrip("\n")
+            if line == "":
+                if "data" in cur:
+                    frames.append(cur)
+                cur = {}
+            elif not line.startswith(":") and ": " in line:
+                k, v = line.split(": ", 1)
+                cur[k] = v
+    return frames
+
+
+def test_build_cache_stream_has_ids_and_resumes_after_last_event_id(served):
+    base, state, repo = served
+    call(base, "GET", "/api/v1/build-cache/status", "k-view")               # baseline
+    _write_builds(state, [_started(1), _finished(1), _started(2), _finished(2)])
+    call(base, "GET", "/api/v1/build-cache/builds", "k-view")               # publishes 4 events
+    first = _read_frames(base, "k-view", 4, last_id="never-seen-0")          # unknown id: whole retained ring
+    ids = [f["id"] for f in first]
+    assert len(set(ids)) == 4 and all(f["event"].startswith("build_cache.") for f in first)
+    body = json.loads(first[0]["data"])
+    assert body["entity_id"] == "h1" and isinstance(body["sequence"], int) and body["payload"]["build_id"] == "b1"
+    resumed = _read_frames(base, "k-view", 2, last_id=ids[1])
+    assert [f["id"] for f in resumed] == ids[2:]                             # exactly the events after the given id
+
+
+def test_build_cache_stream_delivers_live_events_while_connected(served):
+    base, state, repo = served
+    call(base, "GET", "/api/v1/build-cache/status", "k-view")
+    threading.Timer(0.5, _write_builds, args=(state, [_finished(7)])).start()
+    [frame] = _read_frames(base, "k-view", 1)                                # no Last-Event-ID: live only
+    assert json.loads(frame["data"])["payload"]["build_id"] == "b7"
+    assert frame["id"]
+
+
+def test_build_cache_stream_requires_auth_and_flag(served, tmp_path):
+    base, _, _ = served
+    assert call(base, "GET", "/api/v1/build-cache/events/stream")[0] == 401
+    svr, off, _ = _serve({"enabled": False}, KEYS)
+    try:
+        assert call(off, "GET", "/api/v1/build-cache/events/stream", "k-view")[0] == 404
+    finally:
+        svr.shutdown()
+
+
+# ---------------------------------------------------------------------------------------------- remote host ingest
+REPORT = "/api/v1/host/build-cache/report"
+
+
+def _serve_ingest(tmp_path, ingest=None, keys=None):
+    cfg = {"enabled": True, "state_dir": str(tmp_path / "state"), "fabric_build_cache": SECTION}
+    if ingest is not None:
+        cfg["ingest"] = ingest
+    return _serve(cfg, keys or {**KEYS, "k-host": "ingest"})
+
+
+def _rec(host, i, event="build_finished", **kw):
+    base = {"event": event, "ts": f"2026-11-05T00:00:{i:02d}Z", "build_id": f"{host}-b{i}", "host": host,
+            "cmd_kind": "cargo build", "exit_code": 0, "elapsed_s": 2.0, "unavailable": [], "cache": {"applied": True}}
+    return {**base, **kw}
+
+
+def test_ingest_config_defaults_off_and_validates():
+    assert build_cache_config({"enabled": True})["ingest"]["enabled"] is False
+    with pytest.raises(ValueError):
+        build_cache_config({"enabled": True, "ingest": {"enabled": "yes"}})
+    with pytest.raises(ValueError):
+        build_cache_config({"enabled": True, "ingest": {"bogus": 1}})
+    with pytest.raises(ValueError):
+        build_cache_config({"enabled": True, "ingest": {"max_hosts": 0}})
+
+
+def test_ingest_is_off_by_default_even_with_the_capability_on(tmp_path):
+    svr, base, _ = _serve_ingest(tmp_path)
+    try:
+        code, _ = call(base, "POST", REPORT, "k-host", {"host_id": "h2", "builds": [_rec("h2", 1)]})
+        assert code == 404
+        assert call(base, "GET", "/api/v1/build-cache/status", "k-view")[1]["ingest"]["remote_hosts"] is False
+    finally:
+        svr.shutdown()
+
+
+def test_ingest_auth(tmp_path):
+    svr, base, _ = _serve_ingest(tmp_path, {"enabled": True})
+    try:
+        body = {"host_id": "h2", "builds": [_rec("h2", 1)]}
+        assert call(base, "POST", REPORT, None, body)[0] == 401
+        assert call(base, "POST", REPORT, "k-view", body)[0] == 403
+        assert call(base, "POST", REPORT, "k-host", body)[0] == 200
+        assert call(base, "POST", REPORT, "k-op", body)[0] == 200
+    finally:
+        svr.shutdown()
+
+
+def test_ingested_builds_show_up_per_host_redacted_and_filterable(tmp_path):
+    svr, base, repo = _serve_ingest(tmp_path, {"enabled": True})
+    try:
+        _write_builds(tmp_path / "state", [_started(1), _finished(1)])        # local host h1
+        sec = _rec("h2", 1, argv=[SECRET], note=SECRET, trace={"session": "s9", "mission": "m9"})
+        spoof = _rec("h1", 2)                                                  # claims to be the local host
+        code, out = call(base, "POST", REPORT, "k-host", {"host_id": "h2", "builds": [sec, spoof]})
+        assert code == 200 and out["accepted"] == 2
+        everything = call(base, "GET", "/api/v1/build-cache/builds", "k-view")[1]["builds"]
+        assert {b["host"] for b in everything} == {"h1", "h2"}                 # spoofed host is rewritten to h2
+        assert sum(1 for b in everything if b["host"] == "h2") == 2
+        only = call(base, "GET", "/api/v1/build-cache/builds?host=h2", "k-view")[1]
+        assert {b["host"] for b in only["builds"]} == {"h2"}
+        one = call(base, "GET", "/api/v1/build-cache/builds/h2-b1", "k-view")[1]
+        assert one["host"] == "h2" and one["trace"] == {"session": "s9", "mission": "m9"}
+        assert SECRET not in json.dumps(everything) and "argv" not in json.dumps(everything)
+        hosts = call(base, "GET", "/api/v1/build-cache/hosts", "k-view")[1]
+        reported = [h for h in hosts["hosts"] if h.get("source") == "reported"]
+        assert [h["host_id"] for h in reported] == ["h2"] and reported[0]["builds"] == 2
+        assert call(base, "GET", "/api/v1/build-cache/status", "k-view")[1]["ingest"]["remote_hosts"] is True
+    finally:
+        svr.shutdown()
+
+
+def test_ingest_publishes_events_once_and_merges_started_with_finished(tmp_path):
+    svr, base, repo = _serve_ingest(tmp_path, {"enabled": True})
+    try:
+        body = {"host_id": "h2", "builds": [_rec("h2", 1, event="build_started"), _rec("h2", 1)]}
+        call(base, "POST", REPORT, "k-host", body)
+        call(base, "POST", REPORT, "k-host", body)                             # replay of the same window
+        evs = [e for e in repo.recent_events(limit=100) if e["entity_type"] == "build_cache"]
+        assert sorted(e["event_type"] for e in evs) == ["build_cache.build_finished", "build_cache.build_started"]
+        assert all(e["entity_id"] == "h2" for e in evs)
+        rows = call(base, "GET", "/api/v1/build-cache/builds?host=h2", "k-view")[1]["builds"]
+        assert len(rows) == 1 and rows[0]["status"] == "completed" and "started" in rows[0]
+    finally:
+        svr.shutdown()
+
+
+def test_ingest_retention_is_bounded_per_host_and_in_hosts(tmp_path):
+    svr, base, _ = _serve_ingest(tmp_path, {"enabled": True, "per_host_builds": 3, "max_hosts": 2})
+    try:
+        call(base, "POST", REPORT, "k-host", {"host_id": "h2", "builds": [_rec("h2", i) for i in range(1, 6)]})
+        rows = call(base, "GET", "/api/v1/build-cache/builds?host=h2", "k-view")[1]["builds"]
+        assert sorted(r["build_id"] for r in rows) == ["h2-b3", "h2-b4", "h2-b5"]      # oldest evicted
+        assert call(base, "POST", REPORT, "k-host", {"host_id": "h3", "builds": [_rec("h3", 1)]})[0] == 200
+        code, out = call(base, "POST", REPORT, "k-host", {"host_id": "h4", "builds": [_rec("h4", 1)]})
+        assert code == 429 and "hosts" in out["error"]
+        assert call(base, "POST", REPORT, "k-host", {"host_id": "h2", "builds": [_rec("h2", 9)]})[0] == 200
+    finally:
+        svr.shutdown()
+
+
+@pytest.mark.parametrize("body", [
+    {"builds": [_rec("h2", 1)]},                                   # no host_id
+    {"host_id": "h2"},                                             # no builds
+    {"host_id": "h 2", "builds": []},                              # bad host id
+    {"host_id": "h2", "builds": "x"},
+    {"host_id": "h2", "builds": [{"event": "build_finished"}]},   # no build_id
+    {"host_id": "h2", "builds": [_rec("h2", 1, event="evil")]},
+    {"host_id": "h2", "builds": [_rec("h2", i) for i in range(101)]},
+    {"host_id": "h2", "builds": [], "extra": 1},
+])
+def test_ingest_rejects_bad_bodies(tmp_path, body):
+    svr, base, _ = _serve_ingest(tmp_path, {"enabled": True})
+    try:
+        assert call(base, "POST", REPORT, "k-host", body)[0] == 400
+    finally:
+        svr.shutdown()
+
+
+def test_sender_posts_the_local_summary_non_secret_fields_only(tmp_path):
+    from herdr_engineering.build_cache_report import report_builds
+    svr, base, _ = _serve_ingest(tmp_path / "server", {"enabled": True})
+    try:
+        local = tmp_path / "local"
+        _write_builds(local, [_started(1, argv=[SECRET]), _finished(1, argv=[SECRET], cwd="/home/secret/place")])
+        out = report_builds(local, base, "k-host", host_id="h7")
+        assert out["accepted"] == 2
+        rows = call(base, "GET", "/api/v1/build-cache/builds?host=h7", "k-view")[1]["builds"]
+        assert [r["build_id"] for r in rows] == ["b1"] and rows[0]["host"] == "h7"
+        assert SECRET not in json.dumps(rows) and "/home/secret" not in json.dumps(rows)
+    finally:
+        svr.shutdown()
+
+
+@pytest.mark.parametrize("bad_ts", [5, 1.5, True])
+def test_ingest_non_string_ts_cannot_break_build_reads(tmp_path, bad_ts):
+    svr, base, _ = _serve_ingest(tmp_path, {"enabled": True})
+    try:
+        _write_builds(tmp_path / "state", [_started(1), _finished(1)])        # local rows carry string ts
+        rec = _rec("h2", 1)
+        rec["ts"] = bad_ts
+        assert call(base, "POST", REPORT, "k-host", {"host_id": "h2", "builds": [rec]})[0] == 400
+        ok = call(base, "POST", REPORT, "k-host", {"host_id": "h2", "builds": [_rec("h2", 2)]})
+        assert ok[0] == 200                                                   # a string ts is still accepted
+        code, out = call(base, "GET", "/api/v1/build-cache/builds", "k-view")
+        assert code == 200 and {b["host"] for b in out["builds"]} == {"h1", "h2"}
+    finally:
+        svr.shutdown()
