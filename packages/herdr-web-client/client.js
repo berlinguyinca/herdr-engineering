@@ -197,6 +197,45 @@ export class HerdrClient {
     return this.request(`/api/v1/artifacts${query.size ? `?${query}` : ''}`, { signal });
   }
 
+  // The dashboard artifact library (same feed and folders as the member site). Writes need an operator key; the viewer is
+  // always the authenticated key, never a field of the request.
+  listLibrary({ q, sources, folderId, type, since, until, offset, limit, signal } = {}) {
+    const query = new URLSearchParams();
+    const wanted = { q, sources: Array.isArray(sources) ? sources.join(',') : sources, folder_id: folderId, type, since, until, offset, limit };
+    for (const [key, value] of Object.entries(wanted)) {
+      if (value != null && value !== '') query.set(key, String(value));
+    }
+    return this.request(`/api/v1/library${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  createFolder(name, { signal } = {}) {
+    return this.request('/api/v1/library/folders', { method: 'POST', body: { name }, signal });
+  }
+
+  renameFolder(folderId, name, { signal } = {}) {
+    return this.request(`/api/v1/library/folders/${encodeURIComponent(folderId)}`, { method: 'PUT', body: { name }, signal });
+  }
+
+  deleteFolder(folderId, { signal } = {}) {
+    return this.request(`/api/v1/library/folders/${encodeURIComponent(folderId)}`, { method: 'DELETE', signal });
+  }
+
+  fileItem(folderId, artifactId, { signal } = {}) {
+    return this.request('/api/v1/library/items', { method: 'POST', body: { folder_id: folderId, artifact_id: artifactId }, signal });
+  }
+
+  unfileItem(folderId, artifactId, { signal } = {}) {
+    return this.request(`/api/v1/library/folders/${encodeURIComponent(folderId)}/items/${encodeURIComponent(artifactId)}`, { method: 'DELETE', signal });
+  }
+
+  acceptPending(artifactId, { signal } = {}) {
+    return this.request(`/api/v1/library/pending/${encodeURIComponent(artifactId)}/accept`, { method: 'POST', body: {}, signal });
+  }
+
+  discardPending(artifactId, { signal } = {}) {
+    return this.request(`/api/v1/library/pending/${encodeURIComponent(artifactId)}/discard`, { method: 'POST', body: {}, signal });
+  }
+
   // Owner-only delete (tombstone / purge now) and restore. The server answers a non-owner with a plain 404.
   artifactDeleteAccess({ signal } = {}) {
     return this.request('/api/v1/artifacts/delete-access', { signal });
@@ -285,6 +324,11 @@ export class HerdrClient {
   // Static copy of a report version's lightweight preview.
   artifactReportPreviewRender(id, versionId, { signal } = {}) {
     return this.request(`${this.artifactReportPath(id, versionId)}/preview/render`, { signal });
+  }
+
+  // A report version's HTML asset, served under a no-script sandbox CSP: the only URL the dashboard frames.
+  artifactRichUrl(id, versionId) {
+    return `${this.base}${this.artifactReportPath(id, versionId)}/rich`;
   }
 
   // The sandboxed raw view, opened in a new tab (never framed).

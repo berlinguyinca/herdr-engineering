@@ -56,7 +56,11 @@ const stats = async (srv) => (await fetch(`${srv.ctl}/stats`)).json();
 async function signIn(page, srv) {
   await page.goto(`${srv.base}/`);
   await page.locator('[data-action="signin"]').click();
-  await page.locator('[data-empty], [data-artifact-row], [data-not-member]').first().waitFor({ timeout: 15000 });
+  // the library feed is the landing page now; these tests exercise the owner page, which lives at #/mine
+  await page.locator('[data-feed-row], [data-empty], [data-not-member]').first().waitFor({ timeout: 15000 });
+  if (await page.locator('[data-not-member]').count()) return;
+  await page.evaluate(() => { location.hash = '#/mine'; });
+  await page.locator('[data-empty], [data-artifact-row]').first().waitFor({ timeout: 15000 });
 }
 
 function bytes(n) { return crypto.randomBytes(n); }
@@ -156,7 +160,7 @@ for (const [label, viewport, colorScheme] of COMBOS) {
       assert.match(await dialog.innerText(), /Its links stop working\. Only the operator can recover or purge it\./);
       await dialog.locator('[data-action="confirm-delete"]').click();
       await page.locator('[data-delete-dialog]').waitFor({ state: 'detached', timeout: 15000 });
-      await page.goto(page.url().replace(/#.*$/, '') + '#/');
+      await page.goto(page.url().replace(/#.*$/, '') + '#/mine');
       await page.locator('[data-empty]').first().waitFor({ timeout: 15000 });
       assert.equal(await page.locator('[data-artifact-row]').count(), 0, 'the deleted artifact is no longer listed');
       await page.goto(page.url().replace(/#.*$/, '') + '#/links');

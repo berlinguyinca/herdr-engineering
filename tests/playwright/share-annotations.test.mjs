@@ -12,7 +12,10 @@ import * as playwright from 'playwright';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
 const PYTHON = process.env.PYTHON || (fs.existsSync(path.join(ROOT, '.venv/bin/python')) ? path.join(ROOT, '.venv/bin/python') : 'python3');
-const WANTED = ['chromium', 'firefox', 'webkit'];
+// Chromium is the gate and Firefox the second engine; WebKit is opt-in (BROWSERS=chromium,firefox,webkit) because its
+// Linux build needs system libraries (libjxl, libbacktrace) that are not on every host, and without them its content
+// process crashes on these pages.
+const WANTED = (process.env.BROWSERS || 'chromium,firefox').split(',').map((b) => b.trim()).filter(Boolean);
 const PANEL = 'aside[data-annotate-panel]';
 
 let server;
@@ -851,6 +854,61 @@ matrix('image: the keyboard alternative marks a region', async (name) => {
   assert.equal(made.kind, 'image_region');
   assert.ok(Math.abs(made.x - 0.39) < 0.011 && Math.abs(made.w - 0.3) < 0.011 && Math.abs(made.h - 0.32) < 0.011, JSON.stringify(made));
   assert.ok(made.x + made.w <= 1 && made.y + made.h <= 1);
+  await context.close();
+});
+
+matrix('PDF: the keyboard alone annotates a page and a region (Tab, Enter, Space, arrows, Escape)', async (name) => {
+  const context = await newContext(name);
+  const session = await signin('pdf', freshUser());
+  const { page, seen } = await open(context, annotateUrl(session, 'report.pdf'));
+  await waitPanel(page);
+  await page.locator('.herdr-pdf-page[data-page="1"][data-drawn=true]').waitFor();
+  const active = () => page.evaluate(() => document.activeElement?.getAttribute('data-page'));
+  const before = (await lines()).length;
+
+  // Tab order: every page is a tab stop, in document order
+  assert.equal(await page.locator('.herdr-pdf-page[tabindex="0"]').count(), 3);
+  await page.locator('.herdr-pdf-page[data-page="1"]').focus();
+  await page.keyboard.press('Tab');
+  assert.equal(await active(), '2');
+
+  // Enter comments on the whole focused page and moves focus to the comment box
+  await page.keyboard.press('Enter');
+  await page.locator(`${PANEL} .anchor-title`).filter({ hasText: /Page 2/ }).waitFor();
+  assert.equal(await page.evaluate(() => document.querySelector('aside').shadowRoot.activeElement?.id), 'comment');
+  await submitComment(page, 'keyboard page');
+  await page.locator(`${PANEL} .row-body`).filter({ hasText: 'keyboard page' }).waitFor();
+  const wholePage = (await annotationLines(before))[0].anchor;
+  assert.deepEqual([wholePage.kind, wholePage.page, wholePage.region], ['pdf_page', 2, undefined]);
+
+  // Space does the same on another page
+  await page.locator('.herdr-pdf-page[data-page="3"]').focus();
+  await page.keyboard.press('Space');
+  await page.locator(`${PANEL} .anchor-title`).filter({ hasText: /Page 3/ }).waitFor();
+
+  // the Mark region button is operable by keyboard, then the arrows move a region on the focused page
+  await page.locator(`${PANEL} button:has-text("Mark region")`).focus();
+  await page.keyboard.press('Space');
+  assert.equal(await page.locator(`${PANEL} button:has-text("Mark region")`).getAttribute('aria-pressed'), 'true');
+  await page.locator('.herdr-pdf-page[data-page="1"]').focus();
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('Shift+ArrowDown');
+  assert.equal(await page.locator('.herdr-pdf-page[data-page="1"] .herdr-region-live').count(), 1, 'a live region is shown');
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('.herdr-pdf-page .herdr-region-live').count(), 0, 'Escape drops the region');
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('Shift+ArrowDown');
+  await page.keyboard.press('Enter');
+  await page.locator(`${PANEL} .anchor-title`).filter({ hasText: /Page 1, region/ }).waitFor();
+  assert.equal(await page.evaluate(() => document.querySelector('aside').shadowRoot.activeElement?.id), 'comment');
+  await submitComment(page, 'keyboard pdf region');
+  await page.locator(`${PANEL} .row-body`).filter({ hasText: 'keyboard pdf region' }).waitFor();
+  const made = (await annotationLines(before)).at(-1).anchor;
+  assert.equal(made.page, 1);
+  assert.ok(Math.abs(made.region.x - 0.39) < 0.011 && Math.abs(made.region.w - 0.3) < 0.011 && Math.abs(made.region.h - 0.32) < 0.011, JSON.stringify(made));
+  noErrors(seen);
   await context.close();
 });
 

@@ -47,7 +47,9 @@ def test_member_session_is_not_a_share_session_whatever_the_share_id():
 
 
 def test_domain_tags_differ():
-    assert ms._DOMAIN != ss._DOMAIN and ms._DOMAIN == b"herdr-member-session-v1"
+    assert ms._DOMAIN == b"herdr-member-session-v1"
+    share_tags = (ss._VERSION, ss._KEY_LABEL, ss._CSRF_DOMAIN, ss._WRITE_DOMAIN)
+    assert ms._DOMAIN not in share_tags and len(set(share_tags)) == len(share_tags)
 
 
 @pytest.mark.parametrize("args", [(b"short", "u", NOW), (SECRET, "", NOW), (SECRET, "a b", NOW),

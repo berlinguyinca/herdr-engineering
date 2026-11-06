@@ -508,3 +508,72 @@ def test_image_markup_is_not_injectable_through_the_figure_title():
     report["figures"][0]["title"] = '"><script>alert(1)</script>'
     page = _render(report, figure_images={"figure": ("image/png", PNG)})
     assert "<script" not in page and "&lt;script" in page
+
+
+# --- a section whose budget fits none of its entries is hidden, but never silently ---------------
+
+_SECTIONS = {"questions": "Questions", "findings": "Findings", "figures": "Figures", "evidence": "Evidence",
+             "downloads": "Separate downloads", "analysis": "Analysis", "limitations": "Limitations",
+             "next-checks": "Next checks"}
+
+
+def _evidence_heavy():
+    report = descriptor()
+    report["evidence"] = [{"id": f"e{i}", "title": f"Evidence {i}", "description": "d " * 900, "asset_ids": ["data"]}
+                          for i in range(3)]
+    report["findings"][0]["evidence_ids"] = ["e0", "e2"]
+    return report
+
+
+def _check_no_empty_or_dangling_sections(page: str):
+    document = _Document()
+    document.feed(page)
+    assert not document.stack
+    toc = re.search(r'<nav class="toc".*?</nav>', page).group()
+    for anchor, title in _SECTIONS.items():
+        has_heading = f'<section id="sec-{anchor}">' in page
+        assert has_heading == (f'href="#sec-{anchor}"' in toc)  # a chip exactly when the section is there
+        if has_heading:
+            body = re.search(rf'<section id="sec-{anchor}">(.*?)</section>', page, re.S).group(1)
+            assert re.search(r'<(tr><td|tr id|li|article|dt)', body), f"{anchor} has a heading but no entry"
+    assert 'href="#sec-' not in page.replace(toc, "") and not [
+        link for link in document.links if link.startswith("#") and link[1:] not in document.ids]
+
+
+@pytest.mark.parametrize("cap", [3000, 6000, 12000, 40000])
+def test_a_section_with_no_room_is_hidden_with_its_chip_and_the_note_stays_truthful(cap):
+    from herdr_engineering.control_plane.artifact_report_render import render_report_preview
+
+    report = _evidence_heavy()
+    report["title"] = "T"
+    page = render_report_preview(report, max_bytes=max(cap, 4096))
+    assert len(page.encode()) <= max(cap, 4096)
+    _check_no_empty_or_dangling_sections(page)
+    shown = len(re.findall(r'<tr id="evidence-', page))
+    if shown < 3:
+        note = _note(page)
+        assert note and f"{shown} of 3 evidence entries" in note and 'href="report"' in note
+    if '<section id="sec-evidence">' not in page:
+        assert "0 of 3 evidence entries" in _note(page)
+        assert "<th>Evidence</th>" not in page
+
+
+def test_hidden_evidence_section_is_actually_exercised_and_a_full_render_is_unchanged():
+    page = _render(_evidence_heavy(), max_bytes=12000)
+    assert '<section id="sec-evidence">' not in page and "0 of 3 evidence entries" in _note(page)
+    full = _render()
+    assert all(f'<section id="sec-{a}">' in full for a in _SECTIONS)
+    assert _note(full) is None
+
+
+def test_public_share_path_has_no_dangling_links_when_a_section_is_hidden():
+    from herdr_engineering.control_plane import share_render as sr
+    from herdr_engineering.control_plane.artifact_share_api import _report_preview
+
+    for cap in (6000, 12000, 40000):
+        public = _report_preview(_evidence_heavy(), max_bytes=cap)
+        for page in (public.decode(), sr.sanitize_html(public, resolve=lambda _context, url: url)):
+            assert 'href="report"' not in page and 'href="#"' not in page
+            document = _Document()
+            document.feed(page)
+            assert not [link for link in document.links if link.startswith("#") and link[1:] not in document.ids]

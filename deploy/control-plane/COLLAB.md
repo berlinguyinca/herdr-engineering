@@ -206,6 +206,8 @@ edge (nginx, server_name <public_host>): /s/ -> share-public:8083
   therefore sets that directory to group `control_plane.collab.members.secrets_gid` (default: the worker's
   `HERDR_COLLAB_CERT_UID`, which compose passes with collab-public's default), mode 0770, files 0640; others get
   nothing. With no gid the worker refuses to start members rather than issue links nobody can receive.
+- Approving a share link is a human action: `member.share_approve` accepts user actors only and the agent tool
+  `artifact_share_approve` no longer exists; an agent can only create a pending share that the owner approves in the web page.
 - A `share` grant is not read-protected: a grantee holding only `share` can create and approve a link, receives the
   read-once URL, and so can open it and read the bytes. The member API (head, history, view tools) stays gated on
   `read`; do not hand out `share` expecting it to hide content.

@@ -134,6 +134,6 @@ a.hd-btn { text-decoration: none; display: inline-flex; align-items: center; }
 .pa-adot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; opacity: .35; }
 .pa-adot--ready { background: var(--status-ok); opacity: 1; }
 .pa-adot--setup { background: var(--status-attention); opacity: 1; }
-/* The first-load placeholder is as tall as the loaded page (measured: 410px -> 574px wide, 871px once the shell stacks under 900px). */
-.pa-skeleton .hd-skeleton-group { min-height: 524px; }
+/* The loaded page is 372px with no assistants and 574px with two (871px once the shell stacks under 900px). The desktop placeholder sits between the two so neither case jumps by more than the tolerance in the tests. */
+.pa-skeleton .hd-skeleton-group { min-height: 452px; }
 @media (max-width: 900px) { .pa-skeleton .hd-skeleton-group { min-height: 820px; } }

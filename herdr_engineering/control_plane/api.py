@@ -55,7 +55,7 @@ class TombstoneUnavailable(Exception):
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
 # The per-host worker that runs full /summary reports where the session records live (ingest role).
-_HOST_REPORT = re.compile(r"^/api/v1/host/summary-reports/(?:claim|result|publish)$")
+_HOST_REPORT = re.compile(r"^/api/v1/host/(?:summary-reports/(?:claim|result|publish)|build-cache/report)$")
 # Terminal broker, host side: the relay's output POST (per-host token like the fleet routes, never an API key).
 _HOST_TERMINAL_OUT = re.compile(r"^/api/v1/host/terminal/[^/]+/output$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
@@ -319,7 +319,8 @@ class ControlPlaneServer:
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None, build_cache=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
-                 share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None,
+                 share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None, library=None,
+                 library_viewers=None, member_directory=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
                  assistant_workers=None, assistant_judge=None, member_web=None,
@@ -462,6 +463,13 @@ class ControlPlaneServer:
         self.share_settings = share_settings
         # Operator controls for member-owned artifacts (a SyncArtifactAdapter over MemberAdmin): absent -> 503.
         self.member_admin = member_admin
+        # Dashboard artifact library (a SyncArtifactAdapter over LibraryStore): absent -> the routes answer 503.
+        self.library = library
+        # ``control_plane.artifact_library.viewers``: {"key:<digest>": "<member id>"}.  A mapped key reads and writes that
+        # member's library (feed, folders, pending); everything else keeps its own key library.  ``member_directory``
+        # returns the member directory body (``{"group", "users": {...}}``) or None; default: the collab service's.
+        self.library_viewers = dict(library_viewers or {})
+        self.member_directory = member_directory
         # Owner annotation API (list/dismiss): a SyncArtifactAdapter over AnnotationStore, or the routes answer 503.
         self.annotation_store = annotation_store
         # Key digests allowed to delete/purge/restore artifacts (control_plane.artifact_delete.owner_key_digests).
@@ -2180,6 +2188,17 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         and artifact_id and self._artifact_call(
                 "report_permission", artifact_id, self._resource_principal(), permission, **extra))
 
+        def _registry_read_ok(self, artifact_id):
+            """Principal check for registry-backed reads when no in-memory ACL exists (embedded/test setups).
+
+            With an ``ArtifactAcl`` the ACL already decided (production: unchanged, True here). Without one but with a
+            registry store, the registry's ``report_permission`` decides; a caller it refuses gets the same plain 404 as a
+            missing id."""
+            if server.artifact_store is None or server.artifact_acl is not None:
+                return True
+            return bool(artifact_id and self._artifact_call(
+                "report_permission", artifact_id, self._resource_principal(), "read"))
+
         def _artifact_acl_allows(self, artifact_id, permission):
             principal = self._resource_principal()
             if server.artifact_acl.can(artifact_id, principal, permission):
@@ -2725,7 +2744,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             # 501, decided before any listener-specific handler (operator/public/federation/collab) sees the request.
             if public and server.member_web is not None and self.path.startswith("/api/member/"):
                 return self._timed_request(self._public)      # the member run upload (only on the member host)
-            if operator or public or fabric or not self.path.startswith("/api/v1/assistant-apps/"):
+            if operator or public or fabric or not self.path.startswith(("/api/v1/assistant-apps/", "/api/v1/library/")):
                 return self._timed_request(lambda: self._send_json(501, {"error": "not implemented"}))
             return self._timed_request(self._mutate_verb)
 
@@ -2760,8 +2779,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             segs = path.split("/")
             resource = unquote(segs[3]) if (len(segs) > 3 and segs[:3] == ["", "api", "v1"]
                                             and path.startswith("/api/v1/")) else ""
-            if resource not in self._ASSISTANT_MUTABLE_RESOURCES or (
-                    self.command == "PUT" and resource != "assistant-apps"):
+            if resource not in self._ASSISTANT_MUTABLE_RESOURCES | {"library"} or (
+                    self.command == "PUT" and resource not in {"assistant-apps", "library"}):
                 # preserve the pre-existing 501 for PATCH/DELETE elsewhere
                 return self._send_json(501, {"error": "not implemented"})
             err = self._require("operator")
@@ -3239,6 +3258,9 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             try:
                 from .artifact_members_api import route_members
                 if route_members(self, server, parts, resource):
+                    return None
+                from .artifact_library_api import route_library
+                if route_library(self, server, parts, resource):
                     return None
                 from .artifact_delete_api import route_delete
                 if route_delete(self, server, parts, resource):
@@ -3821,8 +3843,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         {"error": "not found"}, 404)
                 return self._etag_json({"hosts": r.list_hosts()})
             if resource == "activity":
-                evs = [_redact_event(e) for e in r.recent_events(
-                    limit=_qint(self.path, "limit", 50))]
+                evs = [_redact_event(e) for e in r.recent_events(limit=_qint(self.path, "limit", 50))
+                       if self._sse_readable(e)]        # artifact events only for callers who may read that artifact
                 return self._json({"events": evs})
             if resource == "analytics":
                 kind = parts[4]
@@ -3860,6 +3882,10 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     if not etype or not eid:
                         return self._json(
                             {"error": "entity_type and entity_id required"}, 400)
+                    if etype == "artifact" and not (self._artifact_allowed(eid, "read") and self._registry_read_ok(eid)):
+                        # An id the caller may not read answers exactly as one that does not exist: the lookup runs
+                        # against an id no artifact can have (never NUL: Postgres text cannot hold it).
+                        eid = "artifact_unreadable_by_caller"
                     query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
                     if "limit" in query or "before" in query:
                         try:
@@ -3877,6 +3903,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         return self._json({**page, "events": [_redact_event(event) for event in page["events"]]})
                     return self._json({"events": [_redact_event(event) for event in r.stream(etype, eid)]})
             if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
+                if not self._registry_read_ok(parts[4]):
+                    return self._json({"error": "not found"}, 404)
                 a, data = self._artifact_current_file(parts[4])
                 if data is None or a is None:
                     return self._json({"error": "not found"}, 404)
@@ -3937,9 +3965,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 if len(parts) == 6 and parts[5] == "reviews":
                     # without an ACL the registry decides (like the versions routes); with one, the blanket guard above already did
                     # (legacy uploads have no registry row). No answer reveals that the artifact exists
-                    if (server.artifact_store is not None and server.artifact_acl is None
-                            and not self._artifact_call(
-                            "report_permission", parts[4], self._resource_principal(), "read")):
+                    if not self._registry_read_ok(parts[4]):
                         return self._json({"error": "not found"}, 404)
                     return self._json({"artifact_id": parts[4],
                                        "reviews": server.artifact_review_manager.list_for_artifact(parts[4])})
@@ -3954,7 +3980,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                            else server.artifact_job_manager.get(parts[4]))
                     if job is None:
                         return self._json({'error': 'not found'}, 404)
-                    if not self._artifact_allowed(job['artifact_id'], 'read'):
+                    if (not self._artifact_allowed(job['artifact_id'], 'read')
+                            or not self._registry_read_ok(job['artifact_id'])):
                         return self._json({'error': 'not found'}, 404)
                     server.artifact_job_manager.load([job])
                     if job.get("profile") == "report" and server.artifact_store is not None:
@@ -3965,17 +3992,20 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             if resource == "artifact-reviews" and server.artifact_review_manager is not None:
                 if len(parts) == 5:
                     review = server.artifact_review_manager.get(parts[4])
-                    if review and not self._artifact_allowed(review['artifact_id'], 'read'):
+                    if review and (not self._artifact_allowed(review['artifact_id'], 'read')
+                                   or not self._registry_read_ok(review['artifact_id'])):
                         return self._json({'error': 'not found'}, 404)
                     return self._json(review) if review else self._json({"error": "not found"}, 404)
             if resource == "publications" and server.publication_controller is not None:
                 if len(parts) == 4:
                     publications = [p for p in server.publication_controller.list()
-                                    if self._artifact_allowed(p['resource_id'], 'read')]
+                                    if self._artifact_allowed(p['resource_id'], 'read')
+                                    and self._registry_read_ok(p['resource_id'])]
                     return self._json({"publications": publications})
                 if len(parts) == 5:
                     publication = server.publication_controller.get(parts[4])
-                    if publication and not self._artifact_allowed(publication['resource_id'], 'read'):
+                    if publication and (not self._artifact_allowed(publication['resource_id'], 'read')
+                                        or not self._registry_read_ok(publication['resource_id'])):
                         return self._json({'error': 'not found'}, 404)
                     return self._json(publication) if publication else self._json({"error": "not found"}, 404)
             if resource == "leases":
@@ -5878,6 +5908,16 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             return self._json(r.get_artifact(aid))
 
         # ------------------------------------------------------------ SSE
+        def _sse_readable(self, event) -> bool:
+            """Artifact events reach only subscribers who may read that artifact (same rule as the per-entity stream)."""
+            if not isinstance(event, dict) or event.get("entity_type") != "artifact":
+                return True
+            try:
+                artifact_id = event.get("entity_id")
+                return bool(self._artifact_allowed(artifact_id, "read") and self._registry_read_ok(artifact_id))
+            except Exception:       # noqa: BLE001 - fail closed: an unanswerable check shows nothing
+                return False
+
         def _sse(self):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -5898,29 +5938,43 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 self.wfile.flush()
                 # replay recent history so a fresh client catches up (Spec §52)
                 for ev in reversed(server.repo.recent_events(limit=100)):
-                    self.wfile.write(_sse_frame(ev))
-                    self.wfile.flush()
-                started = time.monotonic()
-                # Bounded lifetime frees threads held by half-open clients;
-                # EventSource reconnects and replays.
-                while time.monotonic() - started < _MAX_SSE_SECONDS:
-                    try:
-                        ev = q.get(timeout=_SSE_IDLE_SECONDS)
-                    except queue.Empty:
-                        if q not in server._subscribers:
-                            break  # dropped as a slow subscriber: close so the client reconnects
-                        # A data frame (not an SSE comment, which EventSource never surfaces)
-                        # keeps proxies from timing out AND tells the UI the stream is alive on
-                        # a quiet fleet; the client filters it out like StreamConnected.
-                        self.wfile.write(_sse_frame({
-                            "event_type": "StreamKeepalive",
-                            "entity_type": "stream", "entity_id": "control-plane",
-                            "sequence": 0, "payload": {},
-                        }))
-                        self.wfile.flush()
+                    if not self._sse_readable(ev):
                         continue
                     self.wfile.write(_sse_frame(ev))
                     self.wfile.flush()
+                started = time.monotonic()
+                last_write = started       # keepalives run on the wall clock from the last WRITE: a skipped event is no write
+                # Bounded lifetime frees threads held by half-open clients;
+                # EventSource reconnects and replays.
+                while time.monotonic() - started < _MAX_SSE_SECONDS:
+                    wait = _SSE_IDLE_SECONDS - (time.monotonic() - last_write)
+                    ev = None
+                    if wait > 0:
+                        try:
+                            ev = q.get(timeout=wait)
+                        except queue.Empty:
+                            ev = None
+                    if ev is not None:
+                        if not self._sse_readable(ev):
+                            continue
+                        self.wfile.write(_sse_frame(ev))
+                        self.wfile.flush()
+                        last_write = time.monotonic()
+                        continue
+                    if time.monotonic() - last_write < _SSE_IDLE_SECONDS:
+                        continue
+                    if q not in server._subscribers:
+                        break  # dropped as a slow subscriber: close so the client reconnects
+                    # A data frame (not an SSE comment, which EventSource never surfaces)
+                    # keeps proxies from timing out AND tells the UI the stream is alive on
+                    # a quiet fleet; the client filters it out like StreamConnected.
+                    self.wfile.write(_sse_frame({
+                        "event_type": "StreamKeepalive",
+                        "entity_type": "stream", "entity_id": "control-plane",
+                        "sequence": 0, "payload": {},
+                    }))
+                    self.wfile.flush()
+                    last_write = time.monotonic()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             finally:

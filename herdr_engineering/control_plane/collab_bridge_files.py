@@ -637,7 +637,7 @@ def _copy_fd(src: int, dst: int) -> None:
 
 def stream_new_beneath(root: Path, parts: list[str], name: str, chunks, *, max_bytes: int,
                        accept: Callable[[bytes, bool], bool] | None = None, mode: int = 0o644,
-                       dir_mode: int = 0o755) -> bool:
+                       dir_mode: int = 0o755, gid: int | None = None) -> bool:
     """Create ``root/parts.../name`` from the byte iterable ``chunks`` unless it exists; never replaced, never partial.
 
     Missing directories are created no-follow with ``dir_mode``. True when the file is present afterwards (written now,
@@ -647,21 +647,26 @@ def stream_new_beneath(root: Path, parts: list[str], name: str, chunks, *, max_b
     that is not a regular file (a planted symlink) raises ``FileExistsError``.
 
     The data goes into an unnamed ``O_TMPFILE`` that ``linkat`` names only once complete; without ``O_TMPFILE`` a
-    ``.tmp-<rand>`` (mode 0600 until complete) is linked and unlinked instead. Blocking: run it off the event loop.
+    ``.tmp-<rand>`` (mode 0600 until complete) is linked and unlinked instead. With ``gid`` the file and the last
+    directory component get that group (the directory is repaired to ``dir_mode``); ``OSError`` when that is refused.
+    Blocking: run it off the event loop.
     """
     if not _safe_part(name) or name.startswith(".tmp-"):
         raise BridgeError("unsafe file name")
     dfd = _make_dirs_beneath(root, parts, dir_mode)
     try:
+        if gid is not None:
+            os.fchown(dfd, -1, gid)
+            os.fchmod(dfd, dir_mode)
         if _file_exists_at(dfd, name):
             close = getattr(chunks, "close", None)
             if close is not None:
                 close()
             return True
         try:
-            linked = _stream_tmpfile(dfd, name, chunks, max_bytes, accept, mode)
+            linked = _stream_tmpfile(dfd, name, chunks, max_bytes, accept, mode, gid)
             if linked is None:
-                linked = _stream_named_tmp(dfd, name, chunks, max_bytes, accept, mode)
+                linked = _stream_named_tmp(dfd, name, chunks, max_bytes, accept, mode, gid)
         except _Rejected:
             return False
         if not linked:
@@ -685,7 +690,8 @@ def _file_exists_at(dfd: int, name: str) -> bool:
         os.close(fd)
 
 
-def _stream_tmpfile(dfd: int, name: str, chunks, max_bytes: int, accept, mode: int) -> bool | None:
+def _stream_tmpfile(dfd: int, name: str, chunks, max_bytes: int, accept, mode: int,
+                    gid: int | None = None) -> bool | None:
     """The ``O_TMPFILE`` path: True linked, False the name exists, None when ``O_TMPFILE`` is unsupported."""
     try:
         fd = _open_tmpfile(dfd)
@@ -696,23 +702,26 @@ def _stream_tmpfile(dfd: int, name: str, chunks, max_bytes: int, accept, mode: i
     try:
         _fill(fd, chunks, max_bytes, accept)
         os.fchmod(fd, mode)
+        if gid is not None:
+            os.fchown(fd, -1, gid)
         os.fsync(fd)
         try:
             os.link(f"/proc/self/fd/{fd}", name, dst_dir_fd=dfd, follow_symlinks=True)
         except FileExistsError:
             return False
         except FileNotFoundError:          # no /proc: the stream is consumed, so copy into a named tmp instead
-            return _link_named(dfd, name, lambda tfd: _copy_fd(fd, tfd), mode)
+            return _link_named(dfd, name, lambda tfd: _copy_fd(fd, tfd), mode, gid)
         return True
     finally:
         os.close(fd)
 
 
-def _stream_named_tmp(dfd: int, name: str, chunks, max_bytes: int, accept, mode: int) -> bool:
-    return _link_named(dfd, name, lambda tfd: _fill(tfd, chunks, max_bytes, accept), mode)
+def _stream_named_tmp(dfd: int, name: str, chunks, max_bytes: int, accept, mode: int,
+                      gid: int | None = None) -> bool:
+    return _link_named(dfd, name, lambda tfd: _fill(tfd, chunks, max_bytes, accept), mode, gid)
 
 
-def _link_named(dfd: int, name: str, fill: Callable[[int], None], mode: int) -> bool:
+def _link_named(dfd: int, name: str, fill: Callable[[int], None], mode: int, gid: int | None = None) -> bool:
     tmp = _tmp_name()
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
     try:
@@ -720,6 +729,8 @@ def _link_named(dfd: int, name: str, fill: Callable[[int], None], mode: int) -> 
             os.fchmod(fd, 0o600)
             fill(fd)
             os.fchmod(fd, mode)
+            if gid is not None:
+                os.fchown(fd, -1, gid)
             os.fsync(fd)
         finally:
             os.close(fd)

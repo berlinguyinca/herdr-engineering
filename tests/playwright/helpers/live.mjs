@@ -17,7 +17,11 @@ export async function boot(page,base,hash,handler){
  await page.route('**/api/v1/**',async route=>{
   const url=new URL(route.request().url());const p=url.pathname;
   reads[p]=(reads[p]||0)+1;
-  const body=await handler(p,url);
+  let body=await handler(p,url);
+  // A build id the stub knows nothing about is a 404 on the real server (and the
+  // view treats 404 as a calm "not found"). Answering it {} reads as an invalid
+  // build and turns the freshness chip red on every route-loop test.
+  if(/^\/api\/v1\/build-cache\/builds\/[^/]+$/.test(p)&&!(body&&(body.__hang||body.__status||body.__raw!==undefined||typeof body.build_id==='string')))body={__status:404,json:{error:'not found'}};
   if(body&&body.__hang)return; // never settles
   if(body&&body.__raw!==undefined)return route.fulfill({status:body.__status||200,body:body.__raw});
   if(body&&body.__status)return route.fulfill({status:body.__status,json:body.json||{}});

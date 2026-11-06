@@ -724,14 +724,20 @@ test('service catalog filters, archive inspection and groups survive live refres
     assert.equal(await page.locator('.sc-row').filter({hasText:'Archived parser'}).count(),0);
     assert.equal(await page.locator('.sc-row').filter({hasText:'Inactive parser'}).count(),0);
     await page.locator('[data-filter=unknown]').click();
+    // paged catalogs refetch on filter/search, so the rows settle asynchronously
+    await page.waitForFunction(t=>{const r=document.querySelectorAll('.sc-row');return r.length===1&&r[0].innerText.includes(t);},'Stale healthy parser');
     assert.equal(await page.locator('.sc-row').count(),1);
     assert.match(await page.locator('.sc-row').innerText(), /Stale healthy parser/);
     assert.match(await page.locator('.sc-health').innerText(), /Unconfirmed/);
     await page.locator('[data-filter=archived]').click();
+    // paged catalogs refetch on filter/search, so the rows settle asynchronously
+    await page.waitForFunction(t=>{const r=document.querySelectorAll('.sc-row');return r.length===1&&r[0].innerText.includes(t);},'Archived parser');
     assert.equal(await page.locator('.sc-row').count(),1);
     assert.match(await page.locator('.sc-row').innerText(), /Archived parser/);
     await page.locator('[data-filter=current]').click();
     await page.locator('#sc-search').fill('spectra 8080');
+    // paged catalogs refetch on filter/search, so the rows settle asynchronously
+    await page.waitForFunction(t=>{const r=document.querySelectorAll('.sc-row');return r.length===1&&r[0].innerText.includes(t);},'Parse experimental spectra');
     assert.equal(await page.locator('.sc-row').count(),1);
     assert.match(await page.locator('.sc-row').innerText(), /Parse experimental spectra/);
     await page.locator('#sc-expand').click();
@@ -744,6 +750,7 @@ test('service catalog filters, archive inspection and groups survive live refres
     await page.locator('#sc-host').selectOption('beast');
     await page.locator('#sc-expand').click();
     const archived=page.locator('.sc-row').filter({hasText:'Archived parser'});
+    await archived.first().waitFor();
     assert.equal(await archived.count(),1);
     assert.equal(await page.locator('a[href^="javascript:"]').count(),0);
     assert.equal(await page.evaluate(()=>window.catalogXss),undefined);

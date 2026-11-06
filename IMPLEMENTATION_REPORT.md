@@ -96,15 +96,13 @@ telemetry is `builds.jsonl`, the host-local API/SSE and the dashboard panel.
 
 ## Known gaps
 
-- `Registry.reconcile` has no caller (no controller or startup hook).
-- SSE has no `id:`/Last-Event-ID; no resume beyond the shared stream's last-100 replay.
-- No ingest of other hosts' builds; API/panel show the control-plane host only; no migration 0046.
-- Missing events: `cache_stats_updated`, `storage_degraded`, `lease_changed`, `cleanup_completed`.
+- Closed 2026-11-05 (feat/build-cache-backend-followups): `Registry.reconcile` is called at build start and in the cleanup sweep; the four contract events are emitted (to `contract-events.jsonl`); the build-cache SSE stream has `id:`/Last-Event-ID resume; other hosts' builds can be ingested (opt-in, in memory).
+- Still open after that work: ingest is in memory only (lost on control-plane restart; hosts must re-send) and nothing schedules `build_cache_report.report_builds` yet (no timer or CLI); ingest was exercised only against a real control-plane server on loopback, never with a real second host; SSE ids are a service-wide counter with a 500-event ring (older ids replay at-least-once); the shared `/api/v1/events/stream` still has no ids; `lease_changed`/`storage_degraded` are emitted only by code paths that run on the build host, so remote hosts do not report them.
 - (Closed 2026-11-04) the credentialed per-policy server start exists
   (`build_cache_server.py`). Tailnet SigV4 rejection fixed in code (agent restart required, `systemctl --user restart herdr-eng-fabric-agent.service`); still untested: a real second host; sccache does not authenticate objects; same-uid code can read server env.
 - `slurm.*` overlaps `execution.slurm_enabled/allowed_partitions`; authority unsettled.
-- Dashboard table is cramped on mobile (tables scroll in focusable regions).
-- ui-gates not run; typecheck of the Pi extension not run.
+- (Closed 2026-11-05) Builds table on the dashboard stacks into labelled rows at <=40rem (verified at 390, 375, 320 px by `tests/playwright/build-cache.test.mjs`). The small sccache-counter and cleanup-candidate tables still scroll in their focusable regions.
+- (Closed 2026-11-05) Pi extension typechecks: `npm run typecheck:pi-build-gate` exits 0 (tsc 7.0.2, strict). ui-gates: `npm run test:ui-gates` 299 of 300 passed; the one failure (`visual regression: tablet dark`, `ERR_NETWORK_CHANGED` opening the collaboration room) passed on re-run alone. No ui-gates test names the build cache page; they were run as a regression check of the shared dashboard shell, not as build-cache coverage.
 - M6: SIGKILL of the record-mode wrapper orphans the build (no PDEATHSIG); documented, mitigated by lease expiry and cleanup refusing.
 - Also: fenced finish leaves rows non-terminal; eviction has no timer; S3 quota not enforced; Herdr-side corrupt-entry quarantine not implemented; (rollback doc route drift fixed).
 - Upstream sccache claims (TOML `region`, `key_prefix`, path-style, read-only enforcement) are UNVERIFIED against a live binary.

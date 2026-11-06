@@ -15,6 +15,7 @@ import pytest
 from herdr_engineering.control_plane import share_render
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
+from herdr_engineering.control_plane.artifacts import ArtifactError
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 OWNER = hashlib.sha256(b"owner-key").hexdigest()[:16]
@@ -35,10 +36,12 @@ def key_of(data):
 class Blobs:
     def __init__(self):
         self.objects = {}
+        self.objects_by_sha = {}
 
     def add(self, data):
         key, digest = key_of(data)
         self.objects[key] = data
+        self.objects_by_sha[digest] = data
         return {"storage_key": key, "sha256": digest, "size_bytes": len(data)}
 
     def get(self, key, digest):
@@ -55,6 +58,7 @@ class Store:
         self.blobs = blobs
         self.records = {}
         self.outputs = {}
+        self.descriptors = {}       # (artifact, version) -> descriptor overriding the generic one
         self.dead = False
 
     def add(self, aid, name, mime, data):
@@ -91,9 +95,16 @@ class Store:
         for name, media, data in self.figure_assets:
             if name == asset_id:
                 return {"id": name, "media_type": media, **self.blobs.add(data)}
-        raise ValueError("no artifact report asset")
+        descriptor = await self.get_report_descriptor(aid, vid)
+        asset = next((a for a in descriptor["assets"] if a["id"] == asset_id), None)
+        if asset is None:
+            raise ArtifactError("no artifact report asset")
+        key, _ = key_of(self.blobs.objects_by_sha[asset["sha256"]])
+        return {**asset, "storage_key": key}
 
     async def get_report_descriptor(self, aid, vid):
+        if (aid, vid) in self.descriptors:
+            return self.descriptors[(aid, vid)]
         if vid == "vfig":
             base = await self.get_report_descriptor(aid, "v1")
             assets = [{"id": n, "name": f"{n}.bin", "role": "figure", "media_type": m,

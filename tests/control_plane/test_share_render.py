@@ -439,7 +439,7 @@ def test_constants() -> None:
     assert sr.RENDER_VERSION == 1
     assert sr.MAX_RENDER_INPUT == 2 * 1024 * 1024
     assert sr.MAX_RENDER_OUTPUT == 4 * 1024 * 1024
-    assert sr.STATIC_NOTE == "Scripts, frames and embedded media are not shown in this static copy"
+    assert sr.STATIC_NOTE == "Scripts, frames, audio and video are not shown in this static copy"
 
 
 def test_cache_hit_and_eviction_by_count() -> None:
@@ -852,3 +852,15 @@ def test_child_module_imports_only_nh3_and_stdlib() -> None:
     )
     out = subprocess.run([sys.executable, "-I", "-c", code, _REPO], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "['herdr_engineering.control_plane.share_render_worker']"
+
+
+def test_sanitiser_output_never_carries_an_author_referrer_policy() -> None:
+    """Plan 4 C1: a meta referrer (any case / spelling) and a per-element referrerpolicy cannot survive the a/ render."""
+    res = sr.share_resolver("index.html", IDX)
+    page = (b'<meta name="referrer" content="unsafe-url"><META NAME=Referrer CONTENT=origin>'
+            b'<meta http-equiv="refresh" content="0;url=https://evil.example/">'
+            b'<a href="https://example.org" referrerpolicy="unsafe-url">x</a>'
+            b'<img src="img/p.png" referrerpolicy="unsafe-url"><p>kept</p>')
+    out = sr.sanitize_html(page, resolve=res).lower()
+    assert "meta" not in out and "referrer" not in out.replace("noreferrer", "") and "unsafe-url" not in out
+    assert "refresh" not in out and "evil.example" not in out and "kept" in out
