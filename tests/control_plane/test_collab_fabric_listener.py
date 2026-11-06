@@ -344,8 +344,8 @@ def test_a_foreign_host_header_is_refused_even_with_valid_fabric_auth(lw):
     good = f"{w.lan}:{w.fabric_port}"
     assert freq(w, "GET", path, headers={**auth(info), "Host": good})[0] == 200
     assert freq(w, "GET", path, headers=auth(info))[0] == 200                          # http.client's own Host is the right one
-    for bad in ("evil.example", "evil.example:%d" % w.fabric_port, f"{w.lan}", f"{w.lan}:{w.fabric_port + 1}",
-                "localhost:%d" % w.fabric_port, "127.0.0.1:%d" % w.fabric_port, ""):
+    for bad in ("evil.example", f"evil.example:{w.fabric_port}", f"{w.lan}", f"{w.lan}:{w.fabric_port + 1}",
+                f"localhost:{w.fabric_port}", f"127.0.0.1:{w.fabric_port}", ""):
         before = w.s.stats["auth_failures"]
         s, _ = freq(w, "GET", path, headers={**auth(info), "Host": bad})
         assert s == 421, (bad, s)
