@@ -221,8 +221,8 @@ def test_preview_palettes_tokens_layout_and_print():
     assert "<script" not in page and "@import" not in page and "http:" not in page and "https:" not in page and "url(" not in page
 
 
-def test_csp_is_unchanged():
-    csp = ("default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'")
+def test_csp_only_gained_data_images():
+    csp = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'")
     assert f'<meta http-equiv="Content-Security-Policy" content="{csp}">' in _render()
 
 
@@ -427,3 +427,84 @@ def test_card_shadow_is_a_token_with_a_dark_value_and_buttons_use_the_button_tok
     light, dark = _palettes(page)
     assert light["shadow"] != dark["shadow"] and "box-shadow:var(--shadow)" in page
     assert "background:var(--btn)" in page and "color:var(--on-accent)" in page
+
+
+# ------------------------------------------------------------------------------------------------ inline figures
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 40
+HOSTILE_SVG = (b'<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><script>alert(2)</script>'
+               b'<style>@import url(http://evil.example/x.css);</style>'
+               b'<foreignObject><iframe src="http://evil.example"/></foreignObject>'
+               b'<image href="http://evil.example/p.png"/><use href="http://evil.example/s.svg#a"/></svg>')
+
+
+def _img_src(page):
+    found = re.findall(r'<img class="fig-img" alt="([^"]*)" src="([^"]*)">', page)
+    return found
+
+
+def test_figure_is_embedded_as_an_opaque_data_uri_above_its_caption_and_keeps_the_download_link():
+    import base64
+
+    page = _render(figure_images={"figure": ("image/svg+xml", HOSTILE_SVG)})
+    ((alt, src),) = _img_src(page)
+    assert alt == "Duration chart"
+    assert re.fullmatch(r"data:image/svg\+xml;base64,[A-Za-z0-9+/=]+", src)
+    assert base64.b64decode(src.split(",", 1)[1]) == HOSTILE_SVG
+    for needle in ("<svg", "<script", "onload", "foreignObject", "evil.example", "@import", "javascript:"):
+        assert needle not in page, needle
+    assert page.index("fig-img\" alt") < page.index("<p>Units: seconds.</p>")
+    assert 'download>Download figure</a>' in page
+    assert _note(page) is None  # nothing was dropped
+
+
+def test_raster_types_are_embedded_and_other_types_are_not():
+    for media in ("image/png", "image/jpeg", "image/gif", "image/webp"):
+        assert len(_img_src(_render(figure_images={"figure": (media, PNG)}))) == 1, media
+    for media in ("text/html", "application/octet-stream", "image/svg+xml; charset=utf-8", "text/csv"):
+        page = _render(figure_images={"figure": (media, b"<html>x</html>")})
+        assert "<img" not in page and "data:" not in page.split("</style>", 1)[1], media
+
+
+def test_absent_images_leave_the_caption_and_link_and_only_a_failed_attempt_is_disclosed():
+    page = _render()  # the caller supplied nothing: nothing was dropped
+    assert "<img" not in page and "Units: seconds." in page and "Download figure" in page
+    assert _note(page) is None
+    for images in ({}, {"data": ("image/png", PNG)}):  # tried, but the figure's own asset has no bytes
+        page = _render(figure_images=images)
+        assert "<img" not in page and "Units: seconds." in page and "Download figure" in page
+        assert "shortened or omitted" in _note(page)
+
+
+def test_an_oversize_image_degrades_to_caption_and_link_and_is_disclosed():
+    big = b"\x00" * 120_000  # 160k chars of base64: over the per-figure cap
+    page = _render(figure_images={"figure": ("image/png", big)})
+    assert "<img" not in page and "Units: seconds." in page and "Download figure" in page
+    assert "shortened or omitted" in _note(page)
+
+
+def test_images_are_given_up_before_any_text_entry_and_the_cap_still_holds():
+    report = descriptor()
+    picture = ("image/png", b"\x00" * 60_000)  # about 80k chars
+    roomy = _render(report, figure_images={"figure": picture})
+    assert len(_img_src(roomy)) == 1
+    tight = _render(report, figure_images={"figure": picture}, max_bytes=40_000)
+    assert "<img" not in tight and len(tight.encode()) <= 40_000
+    assert "Collect comparable observations." in tight and "Mixed evidence" in tight
+    assert "Download figure" in tight and "shortened or omitted" in _note(tight)
+    plain = _render(report, max_bytes=40_000)
+    assert "<img" not in plain and _note(plain) is None
+
+
+def test_the_smallest_cap_holds_with_hostile_figures_and_images():
+    report = descriptor()
+    report["figures"] = [dict(report["figures"][0], id="chart" if i == 0 else f"c{i}", title="T" * 3000, caption="C" * 5000)
+                         for i in range(30)]
+    page = _render(report, max_bytes=4096, figure_images={"figure": ("image/png", PNG)})
+    assert len(page.encode()) <= 4096
+
+
+def test_image_markup_is_not_injectable_through_the_figure_title():
+    report = descriptor()
+    report["figures"][0]["title"] = '"><script>alert(1)</script>'
+    page = _render(report, figure_images={"figure": ("image/png", PNG)})
+    assert "<script" not in page and "&lt;script" in page

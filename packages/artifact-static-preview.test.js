@@ -104,3 +104,9 @@ test('the dashboard theme drives the preview host; no or unknown theme leaves it
   const explicit = mountStaticHtml(new Node('div'), '', { document: themed('light'), theme: 'dark' });
   assert.equal(explicit.children[0].getAttribute('data-theme'), 'dark');
 });
+
+test('mountStaticHtml leaves inline data-URI figure images in the copy untouched', () => {
+  const html = '<article><h3>Fig</h3><img class="fig-img" alt="Fig" src="data:image/svg+xml;base64,PHN2Zz4="><p>cap</p></article>';
+  const { shadow } = mount(html);
+  assert.equal(shadow.innerHTML, html);
+});

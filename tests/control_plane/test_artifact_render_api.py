@@ -85,7 +85,23 @@ class Store:
         outputs = self.outputs.get((aid, vid))
         return None if outputs is None else {"version_id": vid, "artifact_id": aid, "output_manifest": outputs}
 
+    figure_assets = ()    # (id, media_type, bytes) shown as figures of version "vfig"
+
+    async def get_report_asset(self, aid, vid, asset_id):
+        for name, media, data in self.figure_assets:
+            if name == asset_id:
+                return {"id": name, "media_type": media, **self.blobs.add(data)}
+        raise ValueError("no artifact report asset")
+
     async def get_report_descriptor(self, aid, vid):
+        if vid == "vfig":
+            base = await self.get_report_descriptor(aid, "v1")
+            assets = [{"id": n, "name": f"{n}.bin", "role": "figure", "media_type": m,
+                       "sha256": hashlib.sha256(d).hexdigest(), "size_bytes": len(d)}
+                      for n, m, d in self.figure_assets]
+            figures = [{"id": f"fig-{n}", "title": f"Figure {n}", "asset_id": n, "caption": f"cap {n}"}
+                       for n, _, _ in self.figure_assets]
+            return {**base, "figures": figures, "assets": base["assets"] + assets}
         return {"schema_version": 1, "title": "Generic investigation", "summary": "Open evidence",
                 "questions": [{"id": "q1", "text": "What is known?"}],
                 "evidence": [{"id": "e1", "title": "Account", "description": "Observed information.",
@@ -205,6 +221,40 @@ def test_pdf_and_image_renders_do_not_read_the_blob(world):
         assert envelope(base, path)[0] == 200
     assert reads == []
     assert envelope(base, "/api/v1/artifacts/h1/render")[1]["kind"] == "html" and len(reads) == 1
+
+
+SCRIPTED_SVG = (b'<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><script>window.__x=1</script>'
+                b'<foreignObject><iframe src="http://evil.example"/></foreignObject>'
+                b'<image href="http://evil.example/p.png"/><use href="http://evil.example/s.svg#a"/>'
+                b'<style>@import url(http://evil.example/x.css);</style></svg>')
+
+
+def test_dashboard_report_preview_shows_safe_figure_images_through_the_real_sanitiser(world):
+    import re
+    base, store = world
+    store.outputs[("h1", "vfig")] = []
+    store.figure_assets = (("svg", "image/svg+xml", SCRIPTED_SVG), ("png", "image/png", b"\x89PNG\r\n\x1a\n"),
+                           ("html", "text/html", b"<script>alert(1)</script>"),
+                           ("blob", "application/octet-stream", b"\x00\x01"))
+    status, body, _ = envelope(base, "/api/v1/artifacts/h1/versions/vfig/preview/render")
+    assert status == 200 and body["kind"] == "html"
+    html = body["html"]
+    images = re.findall(r'<img[^>]*>', html)
+    assert len(images) == 2
+    for tag in images:
+        assert re.fullmatch(r'<img class="fig-img" alt="Figure (svg|png)" src="data:image/(svg\+xml|png);base64,[A-Za-z0-9+/=]+">', tag), tag
+    for needle in ("<svg", "<script", "onload", "evil.example", "javascript:", "window.__x", "<iframe", "foreignobject"):
+        assert needle not in html.lower(), needle
+    assert "cap html" in html and "cap blob" in html and "Download figure" in html
+
+
+def test_dashboard_report_preview_without_figure_assets_or_permission_embeds_nothing(world):
+    base, store = world
+    store.outputs[("h1", "vfig")] = []
+    store.figure_assets = ()
+    assert "<img" not in envelope(base, "/api/v1/artifacts/h1/versions/vfig/preview/render")[1]["html"]
+    store.figure_assets = (("svg", "image/svg+xml", SCRIPTED_SVG),)
+    assert get(base, "/api/v1/artifacts/h1/versions/vfig/preview/render", key="other-key")[0] == 404
 
 
 def test_preview_and_outputs_render_win_over_the_report_routes(world):

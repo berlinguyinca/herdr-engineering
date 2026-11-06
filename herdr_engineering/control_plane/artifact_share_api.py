@@ -149,11 +149,11 @@ def _share_body(handler, allowed):
     return value
 
 
-def _report_preview(descriptor: dict, *, max_bytes: int | None = None) -> bytes:
+def _report_preview(descriptor: dict, *, max_bytes: int | None = None, figure_images=None) -> bytes:
     """The rendered report preview with asset and descriptor links reduced to plain text (assets are not shared)."""
     from .artifact_report_render import render_report_preview
     options = {} if max_bytes is None else {"max_bytes": max_bytes}
-    page = render_report_preview(descriptor, asset_url=lambda asset: "#", **options)
+    page = render_report_preview(descriptor, asset_url=lambda asset: "#", figure_images=figure_images, **options)
     page = re.sub(r'<a class="btn" href="#" download>.*?</a>', "", page)  # a download button has no target here
     # keep chip styling; a chip whose target was omitted points at the descriptor ("report"), which is not shared
     page = re.sub(r'<a (class="[a-z ]+") href="(?:#|report)">(.*?)</a>', r"<span \1>\2</span>", page)
@@ -224,7 +224,11 @@ def _plan(server, artifact_id: str, version_id: str, entry: str | None,
             raise ShareHTTPError(400, f"report version is not rendered (rendered check: {rendered})")
         if entry not in (None, PREVIEW_NAME):
             raise ShareHTTPError(400, f"a report share's entry is its generated {PREVIEW_NAME}")
-        page = _report_preview(_call(registry, "get_report_descriptor", artifact_id, version_id))
+        from .artifact_report_figures import load_figure_images
+        descriptor = _call(registry, "get_report_descriptor", artifact_id, version_id)
+        images = load_figure_images(descriptor, server.rustfs, lambda asset_id: _call(
+            registry, "get_report_asset", artifact_id, version_id, asset_id))
+        page = _report_preview(descriptor, figure_images=images)
         (preview_name,) = shared_file_names(version)
         files = [{"name": preview_name, "sha256": hashlib.sha256(page).hexdigest(), "size_bytes": len(page),
                   "data": page}]
