@@ -46,6 +46,8 @@ from herdr_engineering.control_plane.member_web import MemberWeb
 from herdr_engineering.control_plane.members_config import MembersConfig
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from herdr_engineering.control_plane.share_public import ShareConfig, make_share_server
+from herdr_engineering.control_plane.share_session import CLAIM_DOMAIN
+from herdr_engineering.control_plane.share_session import check_session as check_share_session
 from herdr_engineering.control_plane.share_session import mint_session as mint_share_session
 from tests.control_plane.registry_pg import registry_pg  # noqa: F401 - imported fixture
 from tests.control_plane.test_artifact_member_intents import (
@@ -737,6 +739,35 @@ def test_claim_cookie_and_lab_session_do_not_cross(sandbox):
         # a session minted for one share is no session for another
         other = mint_share_session(SHARE_SECRET, s.share_id, "carol", exp, email=eml, basis="e")
         assert (await shares.get(f"/s/{lab_token}/k/{other}/f/index.html"))[0] == 404
+    sandbox(body)
+
+
+def test_claim_cookie_has_its_own_mac_domain(sandbox):
+    """Same secret, same share id, same identity: the two credentials still never validate as each other."""
+    async def body(env, rt, web, shares):
+        s = await scenario(env, rt, web, shares)
+        lab_id, lab_token = await lab_share(env, s, allow_emails=["carol@lab.example.org"])
+        exp = int(time.time()) + 600
+        eml = "carol@lab.example.org"
+        # a claim-domain credential minted for the LAB share's own id is no /k/ session
+        claim_for_lab = mint_share_session(SHARE_SECRET, lab_id, "carol", exp, email=eml, basis="g", domain=CLAIM_DOMAIN)
+        lab_for_lab = mint_share_session(SHARE_SECRET, lab_id, "carol", exp, email=eml, basis="g")
+        assert (await shares.get(f"/s/{lab_token}/k/{lab_for_lab}/f/index.html"))[0] == 200           # control
+        got = await shares.get(f"/s/{lab_token}/k/{claim_for_lab}/f/index.html")
+        ref = await shares.get(f"/s/{other_token(lab_token)}/k/{lab_for_lab}/f/index.html")
+        assert got[0] == 404 and got[2] == ref[2]
+        # a lab-domain session minted for the PUBLIC share's own id is no claim cookie
+        lab_for_public = mint_share_session(SHARE_SECRET, s.share_id, "carol", exp, email=eml, basis="g")
+        claim_for_public = mint_share_session(SHARE_SECRET, s.share_id, "carol", exp, email=eml, basis="g", domain=CLAIM_DOMAIN)
+        signed_out = await shares.get(f"/s/{s.token}/f/index.html", DOC)
+        refused = await shares.get(f"/s/{s.token}/f/index.html", {**DOC, "Cookie": f"herdr_claim={lab_for_public}"})
+        assert refused[0] == signed_out[0] and refused[2] == signed_out[2]
+        accepted = await shares.get(f"/s/{s.token}/f/index.html", {**DOC, "Cookie": f"herdr_claim={claim_for_public}"})
+        assert accepted[0] == 200 and accepted[2] != signed_out[2]                                     # control
+        # the cookie the server itself issues is claim-domain: a lab check refuses it, a claim check accepts it
+        value = cookie_of((await shares.exchange(s.token, "carol"))[1]).split("=", 1)[1]
+        assert check_share_session(SHARE_SECRET, s.share_id, value, time.time()) is None
+        assert check_share_session(SHARE_SECRET, s.share_id, value, time.time(), domain=CLAIM_DOMAIN) is not None
     sandbox(body)
 
 

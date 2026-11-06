@@ -121,6 +121,7 @@ from .share_render import (
     wrap_content,
 )
 from .share_session import (
+    CLAIM_DOMAIN,
     MIN_SECRET_BYTES,
     check_csrf,
     check_session,
@@ -1423,7 +1424,7 @@ class ShareHandler(BaseHTTPRequestHandler):
                     values.append(value)
         if len(values) != 1 or not _SESSION_SEGMENT.fullmatch(values[0]):
             return None
-        got = check_session(lab.secret, state["share_id"], values[0], self.server.now())
+        got = check_session(lab.secret, state["share_id"], values[0], self.server.now(), CLAIM_DOMAIN)
         return None if got is None else (got["identity"], values[0])
 
     def _signin_page(self, state: ShareState, token: str):
@@ -1492,7 +1493,7 @@ class ShareHandler(BaseHTTPRequestHandler):
         if until_int <= now:
             return deny(self, state, "token_expired", user)
         try:
-            session = mint_session(lab.secret, share_id, user, until_int, email=email, basis="g")
+            session = mint_session(lab.secret, share_id, user, until_int, email=email, basis="g", domain=CLAIM_DOMAIN)
         except ValueError:
             return deny(self, state, "bad_identity", user)
         cookie = (f"{CLAIM_COOKIE}={session}; Max-Age={until_int - int(now)}; Path=/s/{token}/; HttpOnly; Secure; "

@@ -17,6 +17,8 @@ import math
 import re
 
 _DOMAIN = b"herdr-share-session-v3"
+CLAIM_DOMAIN = b"herdr-claim-v1"      # the public link's verified-visitor cookie: never valid as a lab session, nor back
+LAB_DOMAIN = _DOMAIN
 BASES = ("e", "g")
 _CSRF_DOMAIN = b"herdr-annotate-csrf-v1"
 MIN_SECRET_BYTES = 32
@@ -44,13 +46,15 @@ def _field(value: str) -> bytes:
     return len(raw).to_bytes(4, "big") + raw
 
 
-def _mac(secret: bytes, share_id: str, identity: str, email: str, basis: str, exp: int) -> bytes:
-    msg = (_DOMAIN + b"\x00" + _field(share_id) + _field(identity) + _field(email) + _field(basis)
+def _mac(secret: bytes, share_id: str, identity: str, email: str, basis: str, exp: int,
+         domain: bytes = _DOMAIN) -> bytes:
+    msg = (domain + b"\x00" + _field(share_id) + _field(identity) + _field(email) + _field(basis)
            + _field(str(exp)))
     return hmac.new(secret, msg, hashlib.sha256).digest()
 
 
-def mint_session(secret: bytes, share_id: str, identity: str, exp: float, *, email: str, basis: str) -> str:
+def mint_session(secret: bytes, share_id: str, identity: str, exp: float, *, email: str, basis: str,
+                 domain: bytes = _DOMAIN) -> str:
     """The session for ``identity`` on ``share_id`` valid until ``exp`` (epoch seconds, floored). Raises ValueError."""
     if not isinstance(secret, bytes) or len(secret) < MIN_SECRET_BYTES:
         raise ValueError("signing secret is missing or too short")
@@ -62,17 +66,19 @@ def mint_session(secret: bytes, share_id: str, identity: str, exp: float, *, ema
         raise ValueError("bad email")
     if basis not in BASES:
         raise ValueError("bad basis")
+    if domain not in (LAB_DOMAIN, CLAIM_DOMAIN):
+        raise ValueError("bad domain")
     if not isinstance(exp, (int, float)) or isinstance(exp, bool) or not math.isfinite(exp) or exp < 1:
         raise ValueError("bad expiry")
     exp_int = int(math.floor(exp))
     if exp_int < 1 or exp_int >= 10 ** 12:
         raise ValueError("bad expiry")
-    mac = _mac(secret, share_id, identity, email, basis, exp_int)
+    mac = _mac(secret, share_id, identity, email, basis, exp_int, domain)
     return f"{_b64(identity.encode('ascii'))}.{_b64(email.encode('ascii'))}.{basis}.{exp_int}.{_b64(mac)}"
 
 
-def check_session(secret: bytes, share_id: str, session: str, now: float) -> dict | None:
-    """``{"identity", "exp", "email", "basis"}`` when ``session`` was minted with ``secret`` for ``share_id`` and ``now < exp``; else None.
+def check_session(secret: bytes, share_id: str, session: str, now: float, domain: bytes = _DOMAIN) -> dict | None:
+    """``{"identity", "exp", "email", "basis"}`` when ``session`` was minted with ``secret`` for ``share_id`` in ``domain`` and ``now < exp``; else None.
 
     Never raises: malformed, oversize, tampered, truncated, expired or other-share sessions are all None.
     """
@@ -97,7 +103,7 @@ def check_session(secret: bytes, share_id: str, session: str, now: float) -> dic
         if _b64(given) != mac_part:
             return None
         exp = int(exp_part)
-        if not hmac.compare_digest(given, _mac(secret, share_id, identity, email, basis, exp)):
+        if not hmac.compare_digest(given, _mac(secret, share_id, identity, email, basis, exp, domain)):
             return None
         if not isinstance(now, (int, float)) or not now < exp:
             return None
