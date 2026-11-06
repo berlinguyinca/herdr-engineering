@@ -27,7 +27,7 @@ Lab shares (``audience: lab``) add, only when the lab settings are complete (els
   generated ``/s/static/config.json`` -- a fixed allow-list read from ``static_dir`` with ``O_NOFOLLOW``, served with
   the strict ``VIEWER_CSP`` (no inline script or style) and no CORS.
 * ``POST /s/<token>/session`` (body-less; ``Authorization: Bearer <access>`` and ``X-Id-Token``, exactly one each) ->
-  ``share_lab.authorise`` against the share's allow-list, then a ``share_session`` HMAC session capped at the earliest of
+  ``share_lab.authorise`` against the share's allow-list, then a ``share_session`` AEAD session (identity and email encrypted inside) capped at the earliest of
   ``session_seconds``, the share's expiry and the access token's ``exp``. Rate-limited per share and globally. OPTIONS
   on it is the 404, so a cross-origin page cannot get a preflight for the ``Authorization`` header.
 * ``GET/HEAD/OPTIONS /s/<token>/k/<session>/f/<path>`` -> the session is checked against the share's CURRENT state on
@@ -716,6 +716,8 @@ def _send_headers(handler, status: int, headers, *, cors: bool = True, close: bo
     handler.send_header("Date", handler.date_time_string())
     for name, value in headers:
         handler.send_header(name, value)
+    if not any(name.lower() == "referrer-policy" for name, _ in headers):
+        handler.send_header("Referrer-Policy", "no-referrer")     # every response: the URL path may carry a session
     if cors:
         for name, value in CORS_HEADERS:
             handler.send_header(name, value)
@@ -1556,12 +1558,13 @@ class ShareHandler(BaseHTTPRequestHandler):
                     return self._annotate_error(state, got, 400, "bad_file")
                 annotation_id = "ann_" + secrets.token_urlsafe(16)
                 record = {"v": 1, "op": "create", "annotation_id": annotation_id, "share_id": share_id,
-                          "author_identity": identity, "author_email": got["email"], "at": at, "anchor": anchor,
+                          "author_identity": identity, "author_email": got["email"], "basis": got["basis"], "at": at,
+                          "anchor": anchor,
                           "body": comment}
             else:
                 verb = parts[7]
                 record = {"v": 1, "op": verb, "annotation_id": annotation_id, "share_id": share_id,
-                          "author_identity": identity, "at": at}
+                          "author_identity": identity, "author_email": got["email"], "basis": got["basis"], "at": at}
                 if verb == "edit":
                     record["body"] = parse_edit_request(raw, max_chars=max_chars)
                 else:
@@ -1680,6 +1683,9 @@ class ShareHandler(BaseHTTPRequestHandler):
             session = mint_session(lab.secret, share_id, grant["identity"], exp_int, email=grant["email"], basis=grant["basis"])
         except ValueError:
             return deny(self, state, "bad_identity", grant["identity"])
+        except RuntimeError:
+            log.error("cryptography missing for lab sessions: no session can be minted")    # no secrets in the message
+            return deny(self, state, "session_unavailable", grant["identity"])
         entry = state["entry"]
         kind = "f" if content_type_for(entry).split(";")[0].strip() == "text/html" else "v"
         landing = f"/s/{token}/k/{session}/{kind}/{quote(entry, safe='/')}"
