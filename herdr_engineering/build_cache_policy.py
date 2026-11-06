@@ -233,6 +233,8 @@ def run_eviction(cfg: BuildCacheConfig, state_dir: Path | str, *, apply: bool = 
         try:
             entries = scan_cache(cache_dir) if cache_dir.is_dir() else []
         except OSError as exc:
+            from .build_metrics import emit_event
+            emit_event(state, "storage_degraded", tier="local", reason="scan_failed")
             return {**out, "status": "error", "reason": str(exc)}
         plan = plan_eviction(entries, capacity_bytes=capacity, hard_cap_bytes=hard,
                              now=when, min_idle_s=idle,
@@ -250,6 +252,9 @@ def run_eviction(cfg: BuildCacheConfig, state_dir: Path | str, *, apply: bool = 
         out.update(status="applied", removed_count=len(removed),
                    removed_bytes=sum(v.size for v in plan.victims if v.path in set(removed)),
                    recheck_skipped=[{"path": p, "reason": r} for p, r in skipped[:_MAX_REPORTED]])
+        from .build_metrics import emit_event
+        emit_event(state, "cleanup_completed", kind="eviction", status="applied",
+                   removed_count=out["removed_count"], removed_bytes=out["removed_bytes"])
         return out
     finally:
         if lock_fd is not None:

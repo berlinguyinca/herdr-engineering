@@ -102,8 +102,8 @@ test('hostile server strings are inert text in the list, the detail and the link
   assert.equal(await page.locator('#view img').count(), 0);
   assert.equal(await page.evaluate(() => window.__pwned), undefined);
   assert.match(await page.locator('[data-bc-build="b119"]').innerText(), /<img src=x onerror="window\.__pwned=1">/);
-  // The server now refuses non-identifier trace ids (sanitize_trace_id), so the hostile session never becomes a link.
-  assert.equal(await page.locator('[data-bc-build="b119"] a[href^="#/herd/session/"]').count(), 0);
+  // The API refuses trace ids that are not plain identifiers (sanitize_trace_id), so a hostile session/mission never becomes a link.
+  assert.equal(await page.locator('[data-bc-build="b119"] a[href*="/herd/session/"], [data-bc-build="b119"] a[href*="/missions/"]').count(), 0);
   await open(page, base, '#/build-cache/b119');
   await step('detail', () => page.locator('[data-bc-detail]').waitFor({timeout: WAIT}));
   assert.equal(await page.locator('#view img').count(), 0);
@@ -205,3 +205,24 @@ for (const [label, viewport] of [['desktop', {width: 1280, height: 800}], ['phon
     await page.locator('[data-bc-preview-out] [data-bc-plan]').waitFor({timeout: WAIT});
   }, {viewport}));
 }
+
+test('phone 390: builds table stacks into labelled rows, no inner scroll, still keyboard reachable', () => withServer('populated', async (page, base) => {
+  await open(page, base); await loaded(page);
+  const wrap = page.locator('.bc-wrap', {has: page.locator('[data-bc-builds]')});
+  const {inner, outer} = await wrap.evaluate((e) => ({inner: e.scrollWidth, outer: e.clientWidth}));
+  assert.ok(inner <= outer + 1, `builds table scrolls inside its region (${inner} > ${outer})`);
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'page scrolls horizontally');
+  const row = page.locator('[data-bc-builds] tbody tr').first();
+  assert.equal(await row.evaluate((e) => getComputedStyle(e).display), 'block');
+  // each value shows its column name next to it
+  const labels = await row.locator('td').evaluateAll((els) => els.map((e) => getComputedStyle(e, '::before').content));
+  assert.ok(labels.length >= 9 && labels.every((l) => l && l !== 'none' && l !== 'normal'), JSON.stringify(labels));
+  // table semantics survive the layout change
+  assert.equal(await page.locator('[data-bc-builds]').getAttribute('role'), 'table');
+  assert.equal(await row.getAttribute('role'), 'row');
+  // keyboard: the region and the first build link are reachable by Tab
+  await wrap.focus();
+  assert.equal(await wrap.evaluate((e) => document.activeElement === e), true);
+  await page.keyboard.press('Tab');
+  assert.equal(await page.evaluate(() => document.activeElement?.closest('[data-bc-build]') != null), true);
+}, {viewport: {width: 390, height: 844}}));

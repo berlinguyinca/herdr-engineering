@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Build cache backend follow-ups (all default off)
+- `Registry.reconcile` now runs at build start and in the cleanup sweep (expired leases with dead owners only).
+- New contract events `cache_stats_updated`, `storage_degraded`, `lease_changed`, `cleanup_completed` (`contract-events.jsonl`), published on the build-cache stream.
+- `GET /api/v1/build-cache/events/stream` with SSE `id:` and Last-Event-ID resume.
+- Opt-in ingest of other hosts' builds: `POST /api/v1/host/build-cache/report`, `control_plane.build_cache.ingest`, bounded in-memory retention, no migration.
+
 ### Report figures inline
 - Report previews (dashboard, raw preview route and public share links) show each image figure inline as a `data:` `<img>` above its caption (PNG/JPEG/GIF/WebP, and SVG as an opaque image, so its script never runs); other types, oversize images (over about 150k characters) and anything that does not verify keep the caption and download link, and the omission note says so. The sanitiser's data-image allowlist gained `svg+xml`; no tags were added.
 
