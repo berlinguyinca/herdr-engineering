@@ -352,8 +352,10 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
     for anchor, title_text, label, items, kind, selected, _ in chosen:
         pieces = [upgraded.get(position, items[position][0]) if anchor == "figures" else items[position][0]
                   for position in selected]
-        bodies.append(wrap(anchor, title_text, kind, "".join(pieces)))
         counts.append((label, len(selected), len(items)))
+        if not selected:
+            continue  # the budget fit none of its entries: no heading, empty table or contents chip; the note counts it
+        bodies.append(wrap(anchor, title_text, kind, "".join(pieces)))
         kept_anchors.append((anchor, title_text))
     left_out = (summary_omitted or summary_shortened or title_shortened or kept_shortened or image_dropped
                 or any(kept < total for _, kept, total in counts))

@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Report preview hides sections the byte budget leaves empty
+- When a section's share of the byte cap fits none of its entries (for example Evidence at a 12000-byte cap), the preview no longer shows a bare heading and table header: the section and its Contents chip are left out. The omission note still appears and keeps the counts ("Shown: 0 of 3 evidence entries."). Sections that are empty in the descriptor are unchanged (still absent).
+
 ### Report figures inline
 - Report previews (dashboard, raw preview route and public share links) show each image figure inline as a `data:` `<img>` above its caption (PNG/JPEG/GIF/WebP, and SVG as an opaque image, so its script never runs); other types, oversize images (over about 150k characters) and anything that does not verify keep the caption and download link, and the omission note says so. The sanitiser's data-image allowlist gained `svg+xml`; no tags were added.
 
