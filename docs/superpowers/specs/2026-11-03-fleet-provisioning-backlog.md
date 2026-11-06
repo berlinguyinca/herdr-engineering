@@ -68,3 +68,15 @@ Questions: which filesystem do other operators use (NFS, Lustre, none); where wo
 - Mac needs Python 3.12 or newer for the relay (and a Python for the other host tools).
 - Control-plane log noise: `ConnectionResetError` on idle connections (about 80 tracebacks in 5 minutes); quiet it like the ingest fix.
 - Ansible install task for the relay, and a relay restart in the fleet update after a herdr upgrade.
+
+## Parked for Task 21 (from Task 12, host-agent)
+
+deploy-fleet-agents.sh must not retire until each of these has an owner (host-agent does not do them):
+- the pi-recover wrapper (`~/.local/bin/herdr-pi-recover`) and its controller inventory: the `herdr.pi-recovery` plugin is installed but its actions are inert without them;
+- native agent hooks (`herdr integration install codex|claude|pi`), which the script runs by default;
+- the terminal relay (opt-in in the script; see "Pending from the terminal work");
+- the pi build gate (`deploy/pi-build-gate/build-gate.ts`, a pi extension);
+- other [eng] native units no task claims yet: `herdr-eng-ai-sync-{enforce,feed}`, `herdr-pi-snapshot-feed` (`herdr-gateway-monitor` belongs to `jobs`).
+- Host token: a controller-side `herdr-fleet` command that decrypts `control_plane.fleet_config`, runs `herdr-eng fleet join`/`fleet config token` and re-encrypts (host-agent only reports `blocked: needs-host-token` with that exact command; minting on the control host's copy is undone by the control-plane role).
+- A stronger "report visible" check for a controller-side verify: [eng]'s `GET /api/v1/fleet/config/status` (`applied_revision` per host; operator-authenticated, in memory), not usable with the host token.
+- Ask the owner where bender's capacity watchdog lives (not in the [eng] repo) before anything retires.
