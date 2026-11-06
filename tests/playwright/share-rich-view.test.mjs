@@ -66,7 +66,8 @@ test('the author page renders, its script does not run, and the frame cannot rea
     const response = await page.request.get(new URL('author-page.html', url).href);
     assert.match(response.headers()['content-security-policy'], /^sandbox;/);
     assert.doesNotMatch(response.headers()['content-security-policy'], /allow-/);
-    assert.equal(response.headers()['x-frame-options'], 'SAMEORIGIN');
+    assert.doesNotMatch(response.headers()['content-security-policy'], /frame-ancestors/);
+    assert.equal(response.headers()['x-frame-options'], undefined);
     await page.getByText('Scripts are disabled in this view', { exact: true }).waitFor();
     // directly navigated, the page is still inert
     await page.goto(new URL('author-page.html', url).href);

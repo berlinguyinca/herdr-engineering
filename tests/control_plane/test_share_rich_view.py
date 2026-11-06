@@ -28,8 +28,8 @@ HOSTILE = (b"<!doctype html><html><body><h1>Pretty</h1><script>window.top.docume
            b"<style>h1{color:#c00}</style></body></html>")
 RICH_HEADERS = {
     "content-security-policy": ("sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; "
-                                "base-uri 'none'; form-action 'none'; frame-ancestors 'self'"),
-    "x-frame-options": "SAMEORIGIN", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer",
+                                "base-uri 'none'; form-action 'none'"),
+    "x-content-type-options": "nosniff", "referrer-policy": "no-referrer",
     "cache-control": "private, no-store"}
 
 
@@ -137,11 +137,15 @@ def test_opt_in_serves_hostile_html_verbatim_under_the_dashboard_sandbox_headers
     assert status == 200 and body == HOSTILE
     for name, value in RICH_HEADERS.items():
         assert headers[name] == value, name
-    assert headers["content-security-policy"] == dashboard.RICH_CSP
-    assert "allow-" not in headers["content-security-policy"] and "access-control-allow-origin" not in headers
+    assert headers["content-security-policy"] == RICH_HEADERS["content-security-policy"]
+    assert "allow-" not in headers["content-security-policy"] and "frame-ancestors" not in headers["content-security-policy"]
+    assert "x-frame-options" not in headers and "access-control-allow-origin" not in headers
+    assert headers["x-robots-tag"] == "noindex"
+    # the dashboard route keeps its framing controls
+    assert "frame-ancestors 'self'" in dashboard.RICH_CSP and ("X-Frame-Options", "SAMEORIGIN") in dashboard.RICH_HEADERS
     assert headers["content-type"] == "text/html; charset=utf-8" and headers["content-length"] == str(len(HOSTILE))
     status, headers, body = host.get(f"/s/{token}/f/author-page.html", "HEAD")
-    assert status == 200 and body == b"" and headers["content-security-policy"] == dashboard.RICH_CSP
+    assert status == 200 and body == b"" and headers["content-security-policy"] == RICH_HEADERS["content-security-policy"]
     # the preview keeps its own policy and gains the toggle (hidden until its script runs)
     status, headers, preview = host.get(f"/s/{token}/f/preview.html")
     assert status == 200 and b"data-rich-view hidden" in preview and b"Show rich view" in preview
@@ -294,11 +298,12 @@ def test_only_an_opted_in_preview_lets_one_hashed_script_and_frames_run(world):
     assert "script-src" not in off_meta and "frame-src" not in off_meta
 
 
-def test_only_the_opted_in_preview_keeps_a_real_origin_to_host_the_frame(world):
+def test_no_preview_ever_gets_allow_same_origin(world):
     _, _, _, _, _, host = world
     _, _, token_on = shared(world, flag=True)
     _, _, token_off = shared(world, flag=False, vid="v_plain")
     on = host.get(f"/s/{token_on}/f/preview.html")[1]
     off = host.get(f"/s/{token_off}/f/preview.html")[1]
-    assert "allow-same-origin" in on["content-security-policy"].split(";")[0]
-    assert "allow-same-origin" not in off["content-security-policy"]
+    for h in (on, off):
+        assert h["content-security-policy"].startswith("sandbox allow-scripts allow-downloads;")
+        assert "allow-same-origin" not in h["content-security-policy"]

@@ -120,7 +120,7 @@ from .share_render import (
     share_resolver,
     wrap_content,
 )
-from .share_rich_view import MAX_RICH_BYTES, RICH_NAME
+from .share_rich_view import MAX_RICH_BYTES, RICH_NAME, SHARE_RICH_HEADERS
 from .share_session import (
     MIN_SECRET_BYTES,
     check_csrf,
@@ -1002,11 +1002,6 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
             return _serve_rich(handler, state, item, fd, actor)
         etag = f'"{item["sha256"]}"'
         csp = sandbox_csp(getattr(handler.server, "public_origin", None), token)
-        if state.get("rich") and name == state.get("entry"):
-            # The opted-in report preview hosts the Rich view frame. That frame's frame-ancestors 'self' and
-            # X-Frame-Options SAMEORIGIN need a parent with a real origin, so the preview (sanitised markup, a meta
-            # CSP that allows one hash-pinned script) keeps its own origin instead of an opaque one.
-            csp = csp.replace("sandbox allow-scripts", "sandbox allow-scripts allow-same-origin", 1)
         injected = None
         is_html = content_type_for(name).split(";")[0].strip() == "text/html"
         shared_by = state.get("shared_by") if is_html else None
@@ -1091,15 +1086,15 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
 
 def _serve_rich(handler, state: dict, item: dict, fd: int, actor: str) -> bool:
     """The opted-in author page of a report share: hash-verified, under the dashboard Rich view's no-script headers
-    (``artifact_rich_view.RICH_HEADERS``), never the bundle's permissive policy. No CORS, no ranges, no conditionals."""
-    from .artifact_rich_view import RICH_HEADERS
+    (``share_rich_view.SHARE_RICH_HEADERS``: the dashboard's minus frame-ancestors / X-Frame-Options, which an
+    opaque-origin parent can never satisfy), never the bundle's permissive policy. No CORS, no ranges, no conditionals."""
     data = _read_all(fd, item["size"])
     if data is None or hashlib.sha256(data).hexdigest() != item["sha256"]:
         deny(handler, state, "size_mismatch", actor)
         return False
     if _announces_body(handler):
         handler.close_connection = True
-    _send_headers(handler, 200, [*RICH_HEADERS, ("X-Robots-Tag", "noindex"), ("Content-Length", str(len(data)))],
+    _send_headers(handler, 200, [*SHARE_RICH_HEADERS, ("X-Robots-Tag", "noindex"), ("Content-Length", str(len(data)))],
                   cors=False)
     if handler.command != "HEAD":
         _write_body(handler, data)

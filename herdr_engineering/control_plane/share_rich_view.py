@@ -21,6 +21,13 @@ from .artifact_report_render import _CSP as PREVIEW_CSP
 RICH_NAME = "author-page.html"
 PENDING_MARK = "preview.html+author-html"
 MAX_RICH_BYTES = dashboard_rich.MAX_RICH_BYTES
+# The dashboard's headers minus the two framing controls: the share preview is served in a sandbox (opaque origin), and
+# an opaque parent never matches 'self' or SAMEORIGIN. The page stays inert through the bare ``sandbox`` CSP directive
+# (no allow-*), and only the preview's meta CSP (``frame-src 'self'``) lets it be framed at all.
+SHARE_RICH_CSP = "; ".join(d for d in dashboard_rich.RICH_CSP.split("; ") if not d.startswith("frame-ancestors"))
+SHARE_RICH_HEADERS = tuple(
+    ("Content-Security-Policy", SHARE_RICH_CSP) if k == "Content-Security-Policy" else (k, v)
+    for k, v in dashboard_rich.RICH_HEADERS if k != "X-Frame-Options")
 _TOGGLE_JS = Path(__file__).with_name("share_static") / "rich-toggle.js"
 
 _PANEL = ('<style>[data-rich-view]{margin:16px 0}[data-rich-view] button{border:0;cursor:pointer;font:inherit;'
