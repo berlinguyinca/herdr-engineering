@@ -341,11 +341,16 @@ def test_runtime_reconnects_after_a_dropped_connection(world):
     assert env in world.listener.acks
 
 
+def _supervisors() -> set[threading.Thread]:
+    return {t for t in threading.enumerate() if t.name == "slack-socket-mode"}
+
+
 def test_runtime_survives_a_dead_endpoint_and_stop_is_idempotent(world):
+    earlier = _supervisors()                               # other tests' threads are not this runtime's business
     world.cfg = {**world.cfg, "base_url": "http://127.0.0.1:1/api"}
     world.runtime.start()
     world.runtime.start()                                  # second start is a no-op
-    threads = [t for t in threading.enumerate() if t.name == "slack-socket-mode"]
+    threads = list(_supervisors() - earlier)               # exactly the supervisors THIS runtime started
     assert len(threads) == 1 and threads[0].is_alive()
     world.cfg = {**world.cfg, "base_url": world.listener.base_url}      # endpoint comes back: it connects on its own
     assert world.listener.wait_for(lambda: world.listener.ws_alive == 1)
@@ -384,6 +389,7 @@ def test_socket_mode_link_ignores_environment_proxies(world, monkeypatch):
 def test_stop_timeout_keeps_the_handle_and_start_refuses_a_second_supervisor(world):
     world.runtime = SlackRuntime(world.store, world.service, lambda: world.cfg, world.clock,
                                  min_backoff=0.05, max_backoff=0.2, ping_interval=0.3, stop_timeout=0.2)
+    earlier = _supervisors()
     gate = threading.Event()
     world.listener.on_request = lambda method: gate.wait(3) if method == "apps.connections.open" else None
     world.runtime.start()
@@ -391,13 +397,15 @@ def test_stop_timeout_keeps_the_handle_and_start_refuses_a_second_supervisor(wor
                                                for r in world.listener.requests))
     assert world.runtime.stop() is False                        # timed out: the supervisor is still running
     world.runtime.start()                                       # refused while the old supervisor is alive
-    assert len([t for t in threading.enumerate() if t.name == "slack-socket-mode"]) == 1
+    ours = _supervisors() - earlier
+    assert len(ours) == 1                                       # this runtime has exactly one supervisor, not two
     gate.set()
-    assert world.listener.wait_for(
-        lambda: not any(t.name == "slack-socket-mode" for t in threading.enumerate()), timeout=5)
+    assert world.listener.wait_for(lambda: not any(t.is_alive() for t in ours), timeout=5)
     assert world.runtime.stop() is True
     world.runtime.start()                                       # the old one is gone, so a new start works
     assert world.listener.wait_for(lambda: world.listener.ws_alive == 1)
+    world.runtime.stop()                                        # leave no supervisor behind for later tests
+    assert world.listener.wait_for(lambda: not any(t.is_alive() for t in _supervisors() - earlier), timeout=5)
 
 
 def test_tap_on_request_decided_elsewhere_closes_the_ask_and_removes_buttons(world):

@@ -23,6 +23,7 @@ from herdr_engineering.control_plane.assistant import (
     _slack_config,
     assistant_config,
 )
+from herdr_engineering.control_plane.assistant_hub.canonical import RawAction, derive
 from herdr_engineering.control_plane.assistant_hub.mcp import Hub
 from herdr_engineering.control_plane.assistant_hub.preconditions import HealthClient
 from herdr_engineering.control_plane.assistant_hub.slack import SlackRuntime
@@ -48,6 +49,10 @@ TENANT = "acme"
 OPERATOR = "p4-e2e-operator-key"
 PID = "key:" + hashlib.sha256(OPERATOR.encode()).hexdigest()[:12]
 ACT = ("ask", "report", "read", "act")
+PUSH = "git push origin main"
+RISK = derive(RawAction(tool="Bash", command=PUSH, repo="acme/repo")).key.risk_class.value
+TINY = {"required_approvals": {"local_reversible": 3, "remote_reversible": 3, "outward": 3},
+        "min_sessions": 3, "min_tasks": 2}
 DEPLOY_PATH = "/api/v1/assistant-deploys/herdr-engineering/control-plane/auto"
 
 
@@ -68,7 +73,7 @@ class Phase4World:
         scope = {"command": CMD, "mode": "auto", "health_url": self.stack.health_url}
         self.config = assistant_config({"personal_assistant": {
             "enabled": True, "tenancy": {"principals": {PID: TENANT}}, "hub": {"tenant": TENANT},
-            "grants": {"shadow_started_at": T0.isoformat(), "shadow_days": 1},
+            "grants": {"shadow_started_at": T0.isoformat(), "shadow_days": 1, **TINY},
             "deploy": {"projects": {"herdr-engineering": {"repo": REPO, "scopes": {"control-plane": scope}}}}}})
         self.service = AssistantService(store=self.store, now=self.clock, config=self.config)
         self.judge_listener = WireListener(success_body(SAFE))
@@ -96,9 +101,9 @@ class Phase4World:
         assert self.slack.wait_for(lambda: self.slack.ws_alive == 1)
 
     # -- worker side (MCP) ---------------------------------------------------------------------------
-    def act(self, command: str, repo: str = "acme/repo", task: str = "t1") -> dict:
+    def act(self, command: str, repo: str = "acme/repo", task: str = "t1", session: str = "s1") -> dict:
         out = call(self.hub, self.auth, "action_request", {"tool": "Bash", "command": command, "repo": repo,
-                                                           "session_id": "s1", "task_id": task})
+                                                           "session_id": session, "task_id": task})
         assert out["isError"] is False, out
         return body_of(out)
 
@@ -153,6 +158,26 @@ class Phase4World:
         env = self.tap(ask, "deploy_confirm")
         assert self.slack.wait_for(lambda: len(self.store.list_action_grants(TENANT, PID)) == 1, timeout=10)
         assert self.slack.wait_for(lambda: env in self.slack.acks, timeout=10)
+
+    def approve_cycle(self, n: int, action: str = "ask_approve"):
+        """One owner decision on a fresh request; the session/task spread meets the diversity floor.  The one-shot
+        approval is spent right away by asking again."""
+        session, task = f"s{n}", f"t{1 + n % 2}"
+        first = self.act(PUSH, task=task, session=session)
+        assert first["outcome"] == "pending"
+        ask = self.posted_ask(request_id=first["request_id"])
+        self.tap(ask, action)
+        assert self.slack.wait_for(lambda: self.request_status(first["request_id"]) == "approved", timeout=10)
+        assert self.slack.wait_for(lambda: self.stored_ask(ask).status == "decided", timeout=10)
+        spent = self.act(PUSH, task=task, session=session)
+        assert (spent["outcome"], spent["source"]) == ("authorized", "owner")
+        return ask
+
+    def stored_ask(self, ask):
+        return self.store.get_slack_ask(ask.ask_id, tenant_id=TENANT, user_id=PID)
+
+    def thread_said(self, ask) -> list[str]:
+        return [str(c.get("text", "")) for c in self.posts() if c.get("thread_ts") == ask.ts]
 
     def posts(self) -> list[dict]:
         return self.slack.calls_to("chat.postMessage")
@@ -252,7 +277,9 @@ def test_red_ci_keeps_the_deploy_pending_and_asks_the_owner(world):
     assert "failed ci_green" in decision["reason"]
     assert world.store.list_deploy_checks(TENANT, PID) == []
     ask = world.posted_ask(request_id=decision["request_id"])
-    assert any(b["type"] == "actions" for b in world.posts()[-1]["blocks"])
+    (post,) = [p for p in world.posts() if any(
+        e.get("value") == button_value(ask) for b in p["blocks"] if b["type"] == "actions" for e in b["elements"])]
+    assert post["channel"] == ask.channel
     assert world.request_status(ask.request_id) == "pending"                # the owner has not been bypassed
 
 
@@ -266,3 +293,35 @@ def test_mode_flipped_to_ask_refuses_the_standing_grant(world):
     assert len(world.store.list_action_grants(TENANT, PID)) == 1            # the grant is kept, just ignored
     scope["mode"] = "auto"
     assert world.deploy()["outcome"] == "authorized"                        # and works again once auto is back
+
+
+# ------------------------------------------------------------------------------------------------ remember
+def test_approve_and_remember_with_the_gate_satisfied_lets_the_next_request_through_without_slack(world):
+    satisfy_gate(world.store, world.judge, RISK, TENANT, PID)
+    world.approve_cycle(1)
+    world.approve_cycle(2)
+    ask = world.approve_cycle(3, "ask_remember")
+    assert world.slack.wait_for(lambda: any(g.state.value == "active" for g in
+                                            world.store.list_action_grants(TENANT, PID)), timeout=10)
+    (grant,) = world.store.list_action_grants(TENANT, PID)
+    assert grant.confirmed_by == f"slack:{OWNER}" and world.stored_ask(ask).remember is True
+    assert world.slack.wait_for(lambda: any("remember" in t.lower() for t in world.thread_said(ask)), timeout=10)
+    asks_before = len(world.asks(kind="action"))
+    later = world.act(PUSH, task="t9", session="s9")
+    assert (later["outcome"], later["source"], later["grant_id"]) == ("authorized", "grant", grant.grant_id)
+    assert len(world.asks(kind="action")) == asks_before                                   # nobody was asked in Slack
+
+
+def test_approve_and_remember_with_the_gate_unsatisfied_tells_the_owner_and_keeps_the_intent(world):
+    world.approve_cycle(1)
+    world.approve_cycle(2)
+    ask = world.approve_cycle(3, "ask_remember")                             # the judge gate has no labels
+    assert world.slack.wait_for(lambda: any("labeled" in t.lower() for t in world.thread_said(ask)), timeout=10)
+    (grant,) = world.store.list_action_grants(TENANT, PID)
+    assert grant.state.value == "proposed"
+    assert world.stored_ask(ask).remember is True and world.stored_ask(ask).activation == "pending"
+    assert not any("insufficient_labels" in t for t in world.thread_said(ask))
+    satisfy_gate(world.store, world.judge, RISK, TENANT, PID)
+    world.approve_cycle(4)                                                    # the next qualifying approval retries
+    assert world.slack.wait_for(lambda: world.store.list_action_grants(TENANT, PID)[0].state.value == "active",
+                                timeout=10)

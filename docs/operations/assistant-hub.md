@@ -586,8 +586,9 @@ rejected at load. `health_url` is `https`, or `http` for loopback only, with no 
   confirmed by `slack:<owner>`), through the same judge gate and shadow period; if a gate refuses, the thread says what is missing and
   nothing is created. `DELETE` the same path with `?worker_id=...` revokes it. `GET /api/v1/assistant-deploys` lists configured
   scopes and live standing grants.
-- **`mode` is the owner's kill switch, read live on every request.** Setting `mode: ask` (and reloading the config) makes every
-  deploy for that scope `pending` with source `deploy_mode` at once; the standing grant stays stored but is ignored until
+- **`mode` is the owner's kill switch, read from the hub's live config on every request** (not cached per grant or per
+  request). There is no hot-reload path for the assistant config: edit the YAML and restart the control plane. Once the hub runs with `mode: ask`, every
+  deploy for that scope is `pending` with source `deploy_mode`; the standing grant stays stored but is ignored until
   `mode` is `auto` again. Removing the scope from the config has the same effect.
 - **Standing permission is not a bypass.** It replaces only the approval count and session/task diversity for the deploy
   scope. Vetoes, the global shadow period, `effective_state` (judge version, policy version, expiry) and the judge all still apply, and the
@@ -610,7 +611,7 @@ polls `<health_url>?probe=1` itself; the worker's word is never used for "health
 |---|---|---|
 | `awaiting` | still polling; an unreachable endpoint is expected while the container is replaced | nothing yet; summaries say "still being checked" |
 | `healthy` | health reports the target commit (a prefix of at least 12 characters), or a newer commit that contains it | `Deploy healthy` (with a note if main moved or could not be re-checked) |
-| `rolled_back` | after `deploy_window_minutes` a different version is serving | `Deploy not live ... a different version is serving ... the new version is not live; cause unknown`. The hub does **not** claim a rollback happened or that the old version "is back" |
+| `rolled_back` | after `deploy_window_minutes` a different version is serving | `Deploy not live: ... is not serving. A different version is serving (...); the new version is not live; cause unknown.` The hub does **not** claim a rollback happened or that the old version "is back" |
 | `unconfirmed` | `deploy_check_minutes` ran out without a confirmed result, or there is no `health_url` | `Deploy unconfirmed ... Do not assume it worked` |
 | `failed_rollback` | the worker reported `{"deploy_exit": 3}` in an `outcome` report | `URGENT: the deploy ... failed to roll back`, never batched or rate-limited |
 
