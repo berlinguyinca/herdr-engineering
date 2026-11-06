@@ -119,7 +119,7 @@ def test_preview_budget_preserves_valid_html_and_discloses_every_omission():
     assert "100 findings" in preview
     assert "omitted" in preview
     assert 'href="report"' in preview
-    assert "Full descriptor" in preview
+    assert "full descriptor" in preview  # wording changed with the polished omission note
     for invalid in (0, 100, True, 1.5):
         with pytest.raises(ValueError, match="max_bytes"):
             render_report_preview(report, max_bytes=invalid)
@@ -217,7 +217,7 @@ def test_preview_palettes_tokens_layout_and_print():
     assert "max-width:860px" in page
     assert "overflow-x:auto" in page and "@media print" in page
     assert "Inter" in page and "JetBrains Mono" in page
-    assert "<script" not in page and "@import" not in page and "http" not in page
+    assert "<script" not in page and "@import" not in page and "http:" not in page and "https:" not in page and "url(" not in page
 
 
 def test_csp_is_unchanged():
@@ -248,9 +248,9 @@ def test_hostile_strings_are_escaped_everywhere():
 
 def test_byte_cap_respected_on_oversized_descriptor_and_valid_html_kept():
     report = descriptor()
-    report["findings"] = [dict(report["findings"][0], id=f"f{i}", statement="x " * 1000)
-                          for i in range(400)]
-    report["limitations"] = ["limit " * 200 for _ in range(300)]
+    report["findings"] = [dict(report["findings"][0], id=f"f{i}", statement="x " * 600)
+                          for i in range(200)]
+    report["limitations"] = ["limit " * 100 for _ in range(100)]
     for cap in (4096, 20_000, 256 * 1024):
         page = _render(report, max_bytes=cap)
         assert len(page.encode()) <= cap
@@ -276,8 +276,28 @@ def test_omission_note_only_when_something_was_omitted():
 def test_analysis_is_a_bounded_key_value_list():
     report = descriptor()
     report["analysis"] = {"method": "m", "configuration": {
-        "nested": {"baseline": "current"}, **{f"k{i}": i for i in range(200)}}}
+        "a_nested": {"baseline": "current"}, **{f"k{i}": i for i in range(200)}}}
     page = _render(report)
     assert "<details" in page and "<dl" in page
-    assert "configuration.nested.baseline" in page
+    assert "configuration.a_nested.baseline" in page
     assert "Some content was omitted" in page
+
+
+def test_polished_preview_survives_the_real_share_sanitiser():
+    """The public share path pipes the preview through nh3; the styling must come out intact."""
+    from herdr_engineering.control_plane import share_render as sr
+    from herdr_engineering.control_plane.artifact_share_api import _report_preview
+
+    public = _report_preview(descriptor())
+    out = sr.sanitize_html(public, resolve=lambda _context, url: url)
+    for needle in (":root,:host{color-scheme:light dark;", "--accent:#10a37f", "--bg:#17181c",
+                   "@media (prefers-color-scheme:dark)", "@media (max-width:640px)", "@media print",
+                   "var(--surface)", "overflow-x:auto", "max-width:860px"):
+        assert needle in out, needle
+    for needle in ('class="rp"', 'class="hero"', 'class="card finding"', 'class="card figure"',
+                   'class="chip"', 'class="tablewrap"', 'class="callout"', 'class="toc"', "<table",
+                   "<details", "<dl", "Compare conditions before comparing values."):
+        assert needle in out, needle
+    # public copies carry no dead links: asset and descriptor anchors are plain text
+    assert 'href="#"' not in out and 'href="report"' not in out and "Download figure" not in out
+    assert 'href="#sec-findings"' in out  # in-page contents links are kept

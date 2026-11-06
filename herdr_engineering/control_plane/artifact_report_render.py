@@ -23,13 +23,89 @@ def _asset_link(value: str) -> str:
     return html.escape(value, quote=True)
 
 
+_CORE_CSS = (
+    ":root,:host{color-scheme:light dark;--bg:#f7f7f8;--surface:#fff;--surface-2:#ececf1;--border:#d9d9e3;"
+    "--text:#353740;--muted:#6e6e80;--accent:#10a37f;--accent-weak:#d2f0e8;--link:#0d8f6f;--warn:#9b5d00;"
+    "--warn-bg:#fff4e5;--on-accent:#fff;--radius:8px;--sans:\"Inter\",-apple-system,BlinkMacSystemFont,\"Segoe UI\","
+    "Roboto,Helvetica,Arial,sans-serif;--mono:\"JetBrains Mono\",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}"
+    "@media (prefers-color-scheme:dark){:root,:host{--bg:#17181c;--surface:#1f2026;--surface-2:#2a2b33;"
+    "--border:#3a3b45;--text:#e6e6ea;--muted:#a4a4b3;--accent:#2fc59c;--accent-weak:#153d33;--link:#4ad6b0;"
+    "--warn:#fbbf24;--warn-bg:#2b2310;--on-accent:#07211a}}"
+    "body{margin:0;background:var(--bg)}"
+    ".rp{max-width:860px;margin:0 auto;padding:32px 16px 64px;background:var(--bg);color:var(--text);"
+    "font:15px/1.6 var(--sans);overflow-wrap:anywhere}a{color:var(--link)}"
+)
+_FULL_CSS = _CORE_CSS + (
+    ".rp *{box-sizing:border-box}.rp section{margin:40px 0 0;min-width:0}"
+    ".hero{padding-bottom:20px;border-bottom:1px solid var(--border)}"
+    "h1{font:700 30px/1.2 var(--sans);letter-spacing:-.02em;margin:0 0 12px;text-wrap:balance}"
+    "h2{font:600 20px/1.3 var(--sans);margin:0 0 16px;text-wrap:balance}"
+    "h3{font:600 16px/1.4 var(--sans);margin:0 0 8px}"
+    ".lede{font-size:17px;color:var(--muted);margin:0;max-width:68ch}"
+    "p{margin:0 0 12px;max-width:68ch}"
+    ".toc{display:flex;flex-wrap:wrap;gap:8px;margin:20px 0 0;font-size:13px}"
+    ".toc a{padding:3px 10px;border:1px solid var(--border);border-radius:999px;background:var(--surface);"
+    "text-decoration:none;color:var(--muted)}.toc a:hover{border-color:var(--accent);color:var(--link)}"
+    ".card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;"
+    "margin:0 0 14px;box-shadow:0 1px 2px rgba(16,24,40,.05)}.finding{border-left:4px solid var(--accent)}"
+    ".chips{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 0;align-items:center}"
+    ".chips b{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600}"
+    ".chip{font:500 12px/1.5 var(--mono);padding:1px 8px;border:1px solid var(--border);border-radius:999px;"
+    "background:var(--surface-2);color:var(--text);text-decoration:none}.chip:hover{border-color:var(--accent)}"
+    ".sub{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:14px 0 4px}"
+    "ul,ol{margin:0 0 12px;padding-left:20px;max-width:68ch}li{margin-bottom:6px}"
+    ".qlist{list-style:none;padding:0}.qlist li{display:flex;gap:10px;align-items:baseline}.qlist .chip{flex:none;white-space:nowrap}"
+    ".tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface)}"
+    "table{border-collapse:collapse;width:100%;min-width:560px;font-size:13.5px}"
+    "th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:top}"
+    "th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);background:var(--surface-2)}"
+    "tr:last-child td{border-bottom:0}td.num{white-space:nowrap}"
+    "code,.mono{font:12.5px var(--mono);background:var(--surface-2);padding:1px 5px;border-radius:4px}"
+    ".callout{background:var(--accent-weak);border-radius:var(--radius);padding:10px 14px;margin:10px 0;font-size:14px}"
+    ".callout b{display:block;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--link)}"
+    ".btn{display:inline-block;padding:5px 14px;border-radius:4px;background:var(--accent);color:var(--on-accent);"
+    "font-weight:600;font-size:13px;text-decoration:none}.btn:hover{filter:brightness(1.08)}"
+    "details{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 16px}"
+    "summary{cursor:pointer;font-weight:600}dl{display:grid;grid-template-columns:minmax(0,max-content) 1fr;"
+    "gap:6px 16px;margin:12px 0 0;font-size:13.5px}dt{font-family:var(--mono);color:var(--muted)}dd{margin:0}"
+    ".notice{margin-top:40px;padding:10px 14px;border:1px dashed var(--warn);border-radius:var(--radius);"
+    "background:var(--warn-bg);font-size:13px;color:var(--text)}"
+    "@media (max-width:640px){h1{font-size:25px}.rp{padding-top:20px}}"
+    "@media print{body,.rp{background:#fff;color:#000}.rp{max-width:none;padding:0}.toc{display:none}"
+    ".card,.tablewrap{break-inside:avoid;box-shadow:none}a{color:#000}.btn{border:1px solid #000;background:none;color:#000}}"
+)
+_FULL_CSS_MARGIN = 1200  # a cap below css + this much falls back to the core styles
+_CSP = ("default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'")
+_ANALYSIS_PAIR_LIMIT = 40
+
+
+def _size(value: int) -> str:
+    size = float(value)
+    for unit in ("bytes", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{int(size)} bytes" if unit == "bytes" else f"{size:.1f} {unit}"
+        size /= 1024
+    raise AssertionError("unreachable")
+
+
+def _flatten(value, prefix: str = ""):
+    """Yield (dotted key, scalar text) pairs; lists and scalars are rendered compactly."""
+    if isinstance(value, dict):
+        for key in sorted(value):
+            yield from _flatten(value[key], f"{prefix}.{key}" if prefix else str(key))
+    else:
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+        yield prefix, text
+
+
 def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] | None = None,
                           max_bytes: int = DEFAULT_PREVIEW_BYTES) -> str:
-    """Render a preview without opening evidence blobs or executing report source.
+    """Render a styled preview without opening evidence blobs or executing report source.
 
     Every section has a bounded share of the byte budget so an oversized evidence
     inventory cannot suppress all findings. Whole entries are omitted rather than
-    cutting HTML, and counts plus the full-descriptor link disclose omissions.
+    cutting HTML; one small note with counts and the full-descriptor link discloses
+    omissions or shortened text, and appears only when something was left out.
     """
     from .artifact_report_descriptor import validate_report_descriptor
 
@@ -47,95 +123,152 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
             value = value[:limit] + " … [text shortened; see full descriptor]"
         return html.escape(value, quote=True)
 
-    def references(kind: str, identifiers: list[str]) -> str:
-        return ", ".join(f'<a href="#{kind}-{quote(identifier, safe="")}">{text(identifier, 128)}</a>'
-                         for identifier in identifiers)
+    def esc_id(identifier: str) -> str:
+        return html.escape(identifier, quote=True)
+
+    def chips(label: str, kind: str, identifiers: list[str]) -> str:
+        if not identifiers:
+            return ""
+        return (f'<p class="chips"><b>{label}</b>'
+                + "".join(f'<a class="chip" href="#{kind}-{quote(identifier, safe="")}">'
+                          f'{text(identifier, 128)}</a>' for identifier in identifiers) + "</p>")
 
     def bullets(values: list[str]) -> str:
         return "<ul>" + "".join(f"<li>{text(value)}</li>" for value in values) + "</ul>" if values else ""
 
-    questions = [f'<article id="question-{html.escape(row["id"], quote=True)}"><strong>{text(row["id"], 128)}</strong>'
-                 f'<p>{text(row["text"])}</p></article>' for row in report["questions"]]
-    findings = []
-    for row in report["findings"]:
-        findings.append(
-            f'<article id="finding-{html.escape(row["id"], quote=True)}"><h3>{text(row["title"], 256)}</h3>'
-            f'<p>{text(row["statement"])}</p>'
-            f'<p>Question: {references("question", row["question_ids"])}. '
-            f'Evidence: {references("evidence", row["evidence_ids"])}.</p>'
-            + (f'<p>Figures: {references("figure", row["figure_ids"])}.</p>' if row.get("figure_ids") else "")
-            + ("<h4>Limits</h4>" + bullets(row["limitations"]) if row.get("limitations") else "")
-            + ("<h4>Next checks</h4>" + bullets(row["next_steps"]) if row.get("next_steps") else "")
-            + "</article>")
-    figures = [f'<article id="figure-{html.escape(row["id"], quote=True)}"><h3>{text(row["title"], 256)}</h3>'
-               f'<p>{text(row["caption"])}</p>'
-               + (f'<p><strong>How to read:</strong> {text(row["reading_guide"])}</p>' if row.get("reading_guide") else "")
-               + f'<a href="{links[row["asset_id"]]}">Download figure</a></article>'
-               for row in report["figures"]]
-    evidence = [f'<article id="evidence-{html.escape(row["id"], quote=True)}"><h3>{text(row["title"], 256)}</h3>'
-                f'<p>{text(row["description"])}</p>'
-                + " ".join(f'<a href="{links[asset_id]}">Download {text(asset_id, 128)}</a>'
-                           for asset_id in row.get("asset_ids", [])) + "</article>"
-                for row in report["evidence"]]
-    assets = [f'<li><a href="{links[row["id"]]}">{text(row["name"], 256)}</a> '
-              f'({text(row["role"])}; {text(row["media_type"])}; {row["size_bytes"]} bytes) '
-              f'<code>{row["sha256"]}</code></li>' for row in report["assets"]]
-    overview = [f'<h2>{text(report.get("title", "Report"), 256)}</h2>'
-                + (f'<p>{text(report["summary"])}</p>' if report.get("summary") else "")]
-    analysis = [f'<pre>{text(json.dumps(report["analysis"], sort_keys=True, indent=2), 4096)}</pre>'] \
-        if report.get("analysis") else []
+    def finding(row: dict) -> str:
+        return (f'<article class="card finding" id="finding-{esc_id(row["id"])}"><h3>{text(row["title"], 256)}</h3>'
+                f'<p>{text(row["statement"])}</p>'
+                + chips("Question", "question", row["question_ids"])
+                + chips("Evidence", "evidence", row["evidence_ids"])
+                + chips("Figure", "figure", row.get("figure_ids", []))
+                + ('<p class="sub">Limits</p>' + bullets(row["limitations"]) if row.get("limitations") else "")
+                + ('<p class="sub">Next checks</p>' + bullets(row["next_steps"]) if row.get("next_steps") else "")
+                + "</article>")
+
+    def figure(row: dict) -> str:
+        return (f'<article class="card figure" id="figure-{esc_id(row["id"])}"><h3>{text(row["title"], 256)}</h3>'
+                f'<p>{text(row["caption"])}</p>'
+                + (f'<div class="callout"><b>How to read</b>{text(row["reading_guide"])}</div>'
+                   if row.get("reading_guide") else "")
+                + f'<a class="btn" href="{links[row["asset_id"]]}" download>Download figure</a></article>')
+
+    def evidence_row(row: dict) -> str:
+        files = " ".join(f'<a class="chip" href="{links[asset_id]}">{text(asset_id, 128)}</a>'
+                         for asset_id in row.get("asset_ids", [])) or "&mdash;"
+        return (f'<tr id="evidence-{esc_id(row["id"])}"><td><strong>{text(row["title"], 256)}</strong>'
+                f'<br><span class="mono">{text(row["id"], 128)}</span></td>'
+                f'<td>{text(row["description"])}</td><td>{files}</td></tr>')
+
+    def asset_row(row: dict) -> str:
+        return (f'<tr><td><a href="{links[row["id"]]}">{text(row["name"], 256)}</a></td>'
+                f'<td>{text(row["role"])}</td><td>{text(row["media_type"])}</td>'
+                f'<td class="num" title="{int(row["size_bytes"])} bytes">{_size(int(row["size_bytes"]))}'
+                f' ({int(row["size_bytes"])} bytes)</td>'
+                f'<td><code>{text(row["sha256"][:12], 12)}</code></td></tr>')
+
+    pairs = []
+    analysis = report.get("analysis") or {}
+    for key in ("method", "code_revision"):
+        if analysis.get(key):
+            pairs.append((key, analysis[key]))
+    for key in ("configuration", "source_hashes"):
+        pairs.extend(_flatten(analysis.get(key, {}), key))
+    pair_items = [f'<dt>{text(key, 256)}</dt><dd>{text(value, 512)}</dd>' for key, value in pairs]
+
+    # (anchor, title, label, items, weight, kind, item limit)
     sections = [
-        ("Overview", "overview entries", overview, 1),
-        ("Questions", "questions", questions, 1),
-        ("Findings", "findings", findings, 4),
-        ("Figures", "figures", figures, 2),
-        ("Evidence", "evidence entries", evidence, 2),
-        ("Separate downloads", "assets", assets, 2),
-        ("Analysis configuration", "analysis entries", analysis, 1),
-        ("Limitations", "limitations", [f"<li>{text(value)}</li>" for value in report.get("limitations", [])], 1),
-        ("Next checks", "next checks", [f"<li>{text(value)}</li>" for value in report.get("next_steps", [])], 1),
+        ("questions", "Questions", "questions",
+         [f'<li id="question-{esc_id(row["id"])}"><span class="chip">{text(row["id"], 128)}</span>'
+          f'<span>{text(row["text"])}</span></li>' for row in report["questions"]], 1, "qlist", None),
+        ("findings", "Findings", "findings", [finding(row) for row in report["findings"]], 4, "div", None),
+        ("figures", "Figures", "figures", [figure(row) for row in report["figures"]], 2, "div", None),
+        ("evidence", "Evidence", "evidence entries", [evidence_row(row) for row in report["evidence"]], 2,
+         "table:Evidence|Description|Files", None),
+        ("downloads", "Separate downloads", "downloads", [asset_row(row) for row in report["assets"]], 2,
+         "table:Name|Role|Type|Size|SHA-256", None),
+        ("analysis", "Analysis", "analysis entries", pair_items, 1, "dl", _ANALYSIS_PAIR_LIMIT),
+        ("limitations", "Limitations", "limitations",
+         [f"<li>{text(value)}</li>" for value in report.get("limitations", [])], 1, "ul", None),
+        ("next-checks", "Next checks", "next checks",
+         [f"<li>{text(value)}</li>" for value in report.get("next_steps", [])], 1, "ul", None),
     ]
-    prefix = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
-              '<meta name="viewport" content="width=device-width,initial-scale=1">'
-              '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
-              'style-src \'unsafe-inline\'; base-uri \'none\'; form-action \'none\'">'
-              '<title>Artifact report preview</title><style>'
-              ':root{color-scheme:light dark;--fg:#213447;--bg:#fff;--rule:#537b9b;--link:#174f7c}'
-              '@media (prefers-color-scheme:dark){:root{--fg:#dbe5ee;--bg:#111826;--rule:#6f9cc0;--link:#8cc0ea}}'
-              'body{font:16px/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg);margin:24px;max-width:1000px}'
-              'article{border-left:3px solid var(--rule);padding:0 14px;margin:16px 0}'
-              'pre,code{white-space:pre-wrap;overflow-wrap:anywhere}a{color:var(--link)}'
-              '</style></head><body><main><h1>Artifact report preview</h1>'
-              '<p>Evidence files are separate downloads. Rendering checks format; '
-              'evidence checking and review are separate recorded stages.</p>')
-    footer_start = '<section aria-label="Preview coverage"><h2>Preview coverage</h2>'
-    footer_end = ('<p>Entries or excerpts omitted here remain in the '
-                  '<a href="report">Full descriptor</a> and authorized evidence downloads. '
-                  'Preview coverage is not evidence quality or a review outcome.</p></section></main></body></html>')
-    # Each count is no wider than its total. Reserving all sections' headings and
-    # coverage records guarantees valid closing tags within the requested cap.
-    coverage_reserve = sum(len(f'<p>{len(items)} of {len(items)} {label}; {len(items)} omitted.</p>'.encode())
-                           for _, label, items, _ in sections) + 100
-    wrappers = [f'<section><h2>{title}</h2><ul></ul></section>' for title, _, _, _ in sections]
-    remaining = max_bytes - len((prefix + footer_start + footer_end + "".join(wrappers)).encode()) - coverage_reserve
+
+    def wrap(anchor: str, title: str, kind: str, body: str) -> str:
+        if kind == "qlist":
+            inner = f'<ul class="qlist">{body}</ul>'
+        elif kind == "ul":
+            inner = f"<ul>{body}</ul>"
+        elif kind == "dl":
+            inner = f"<details><summary>Method and configuration</summary><dl>{body}</dl></details>"
+        elif kind.startswith("table:"):
+            heads = "".join(f"<th>{name}</th>" for name in kind[6:].split("|"))
+            inner = (f'<div class="tablewrap"><table><thead><tr>{heads}</tr></thead>'
+                     f"<tbody>{body}</tbody></table></div>")
+        else:
+            inner = body
+        return f'<section id="sec-{anchor}"><h2>{title}</h2>{inner}</section>'
+
+    def toc(anchors: list[tuple[str, str]]) -> str:
+        return ('<nav class="toc" aria-label="Contents">'
+                + "".join(f'<a href="#sec-{anchor}">{title}</a>' for anchor, title in anchors) + "</nav>")
+
+    def note(counts: list[tuple[str, int, int]], was_shortened: bool) -> str:
+        shown = ", ".join(f"{kept} of {total} {label}" for label, kept, total in counts if kept < total)
+        parts = ["Some content was omitted; see the <a href=\"report\">full descriptor</a>."]
+        if shown:
+            parts.append(f"Shown: {shown}.")
+        if was_shortened:
+            parts.append("Some text was shortened.")
+        return f'<aside class="notice" role="note">{" ".join(parts)}</aside>'
+
+    present_sections = [(a, t, label, items) for a, t, label, items, *_ in sections if items]
+    title = text(report.get("title", "Report"), 256)
+    summary_html = f'<p class="lede">{text(report["summary"])}</p>' if report.get("summary") else ""
+    shortened_by_summary, shortened = shortened, False
+
+    def document(css: str, hero_summary: str, nav: str, body: str, footer: str) -> str:
+        return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                f'<meta http-equiv="Content-Security-Policy" content="{_CSP}">'
+                f'<title>{title}</title><style>{css}</style></head><body><main class="rp">'
+                f'<header class="hero"><h1>{title}</h1>{hero_summary}{nav}</header>{body}{footer}'
+                "</main></body></html>")
+
+    css = _FULL_CSS if len(document(_FULL_CSS, "", "", "", "").encode()) + _FULL_CSS_MARGIN <= max_bytes \
+        else _CORE_CSS
+    # Reserve the largest possible contents list and omission note (every count is no wider than its
+    # total), then give the hero summary at most a quarter of what is left; sections share the rest.
+    worst_note = note([(label, 0, len(items)) for _, _, label, items in present_sections], True)
+    fixed = len(document(css, "", toc([(a, t) for a, t, *_ in present_sections]), "", worst_note).encode())
+    wrappers = sum(len(wrap(a, t, k, "").encode()) for a, t, _, _, _, k, _ in sections)
+    remaining = max_bytes - fixed - wrappers
     if remaining < 0:
         raise ValueError("max_bytes is too small for the preview envelope")
-    total_weight = sum(weight for _, _, items, weight in sections if items)
-    bodies, coverage = [], []
-    for title, label, items, weight in sections:
-        quota = remaining * weight // total_weight if items else 0
+    summary_omitted = bool(summary_html) and len(summary_html.encode()) > remaining // 4
+    if summary_omitted:
+        summary_html = ""
+    else:
+        remaining -= len(summary_html.encode())
+    total_weight = sum(weight for _, _, _, items, weight, _, _ in sections if items)
+    bodies, counts, kept_anchors = [], [], []
+    for anchor, title_text, label, items, weight, kind, limit in sections:
+        if not items:
+            continue
+        quota = remaining * weight // total_weight
         selected, used = [], 0
         for item in items:
             size = len(item.encode())
-            if used + size <= quota:
+            if used + size <= quota and (limit is None or len(selected) < limit):
                 selected.append(item)
                 used += size
-        is_list = title in {"Separate downloads", "Limitations", "Next checks"}
-        body = "".join(selected)
-        bodies.append(f'<section><h2>{title}</h2>' + (f'<ul>{body}</ul>' if is_list else body) + '</section>')
-        coverage.append(f'<p>{len(selected)} of {len(items)} {label}; {len(items) - len(selected)} omitted.</p>')
-    notice = '<p>Some text excerpts were shortened.</p>' if shortened else ""
-    result = prefix + "".join(bodies) + footer_start + "".join(coverage) + notice + footer_end
+        bodies.append(wrap(anchor, title_text, kind, "".join(selected)))
+        counts.append((label, len(selected), len(items)))
+        kept_anchors.append((anchor, title_text))
+    omitted = summary_omitted or any(kept < total for _, kept, total in counts)
+    footer = note(counts, shortened or shortened_by_summary or summary_omitted) \
+        if omitted or shortened or shortened_by_summary else ""
+    result = document(css, summary_html, toc(kept_anchors), "".join(bodies), footer)
     present = set(re.findall(r' id="([^"]+)"', result))
     result = re.sub(r'href="#([^"]+)"',
                     lambda match: match.group() if unquote(match.group(1)) in present else 'href="report"',
