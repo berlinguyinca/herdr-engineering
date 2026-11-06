@@ -102,7 +102,8 @@ test('hostile server strings are inert text in the list, the detail and the link
   assert.equal(await page.locator('#view img').count(), 0);
   assert.equal(await page.evaluate(() => window.__pwned), undefined);
   assert.match(await page.locator('[data-bc-build="b119"]').innerText(), /<img src=x onerror="window\.__pwned=1">/);
-  assert.equal(await page.locator('[data-bc-build="b119"] a[href^="#/herd/session/%3Cimg"]').count(), 1);
+  // The server now refuses non-identifier trace ids (sanitize_trace_id), so the hostile session never becomes a link.
+  assert.equal(await page.locator('[data-bc-build="b119"] a[href^="#/herd/session/"]').count(), 0);
   await open(page, base, '#/build-cache/b119');
   await step('detail', () => page.locator('[data-bc-detail]').waitFor({timeout: WAIT}));
   assert.equal(await page.locator('#view img').count(), 0);
