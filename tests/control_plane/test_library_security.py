@@ -764,6 +764,30 @@ def test_a_claimed_item_serves_the_pinned_version_not_head(sandbox):
     sandbox(body)
 
 
+def test_a_lab_share_recipient_is_pinned_to_the_shared_version(sandbox):
+    async def body(env, rt, web, shares):
+        s = await scenario(env, rt, web, shares)
+        lab_id, _ = await lab_share(env, s, allow_groups=["lab"])
+        await tick(env, rt)
+        v1 = b"<html>bob v1</html>"
+        row = item(env, ALICE, s.b)
+        assert row and row["source"] == "assigned" and row["share_id"] == lab_id
+        assert [f["path"] for f in row["files"]] == ["index.html"]
+        v2 = await put_files(env, s.b, {"index.html": b"<html>bob v2 SECRET DRAFT</html>", "draft.html": b"<html>draft</html>"},
+                             actor=user("bob"), owner=BOB, base=s.vb)
+        assert v2 != s.vb
+        await tick(env, rt)
+        row = item(env, ALICE, s.b)
+        assert [f["path"] for f in row["files"]] == ["index.html"], row["files"]
+        got = await web.req("GET", f"/api/member/artifacts/{s.b}/content/index.html", member="alice")
+        assert got.status == 200 and got.raw == v1, got.raw
+        miss = await web.req("GET", f"/api/member/artifacts/{s.b}/content/draft.html", member="alice")
+        assert miss.status == 404 and b"draft" not in miss.raw
+        own = await web.req("GET", f"/api/member/artifacts/{s.b}/content/index.html", member="bob")      # the owner keeps head
+        assert own.status == 200 and b"v2" in own.raw
+    sandbox(body)
+
+
 def test_a_revoked_row_serves_nothing_and_never_falls_back_to_a_filename(sandbox):
     async def body(env, rt, web, shares):
         s = await scenario(env, rt, web, shares)

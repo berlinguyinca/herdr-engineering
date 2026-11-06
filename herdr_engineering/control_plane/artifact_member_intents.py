@@ -905,7 +905,8 @@ async def _attach_files(conn: Any, items: list[dict], rustfs: Any, root: Path, r
                         budget: list[int] | None = None) -> set[str]:
     """Give every active or pending item its files and pool their bytes; the pooled shas.
 
-    Owned, assigned and pending items list the head version; an opened (claimed) one the version its share pinned.
+    Owned, ACL-assigned and pending items list the head version; a row with a ``share_id`` (opened, or assigned by a
+    lab share) the version its share pinned.
 
     Anything else (revoked, expired, no head, over a cap, bytes unavailable) gets ``files: []``; an item over a cap is
     also marked ``too_large`` (the owner is told, nobody else).  Access ends when the view is rewritten."""
@@ -919,8 +920,7 @@ async def _attach_files(conn: Any, items: list[dict], rustfs: Any, root: Path, r
         " ON v.version_id=a.current_version_id WHERE a.artifact_id = ANY($1::text[])"
         " AND a.lifecycle NOT IN ('retracted','tombstoned') AND v.state <> 'retracted'", wanted)
     heads = {r["artifact_id"]: _json(r["output_manifest"]) for r in rows}
-    claimed = [i["share_id"] for i in items if i["status"] in ("active", "pending") and i["source"] == "opened"
-               and i.get("share_id")]
+    claimed = [i["share_id"] for i in items if i["status"] in ("active", "pending") and i.get("share_id")]
     pinned: dict[str, Any] = {}
     if claimed:
         for r in await conn.fetch(
@@ -932,7 +932,8 @@ async def _attach_files(conn: Any, items: list[dict], rustfs: Any, root: Path, r
     perms = _pool_perms(rt)
     pooled: set[str] = set()
     for item in items:
-        manifest = pinned.get(item.get("share_id")) if item["source"] == "opened" else heads.get(item["artifact_id"])
+        # a row that came through a share (opened, or assigned by a lab share) shows only the version the share pinned
+        manifest = pinned.get(item["share_id"]) if item.get("share_id") else heads.get(item["artifact_id"])
         if item["status"] not in ("active", "pending") or not isinstance(manifest, list):
             continue
         entries: list[dict] = []
