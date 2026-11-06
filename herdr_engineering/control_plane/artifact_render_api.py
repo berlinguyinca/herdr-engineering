@@ -76,7 +76,7 @@ def _absolute_link(cleaned: str) -> str | None:
 def dashboard_resolver(siblings: dict[str, str] | None = None, name: str = "") -> Resolver:
     """URL rewriting for the dashboard's static copy.
 
-    Absolute http(s)/mailto links and ``data:image/(png|jpeg|gif|webp)`` images survive; every relative reference is
+    Absolute http(s)/mailto links and ``data:image/(png|jpeg|gif|webp|svg+xml)`` images survive; every relative reference is
     dropped (a fragment link would drive the SPA's hash router). ``siblings`` maps the normalised name of each other
     output of the same version to its outputs-route URL; an ``img`` reference naming one of them is
     rewritten to it, resolved relative to ``name``.
@@ -279,7 +279,10 @@ def route_render(handler, server, parts, resource) -> bool:
             if descriptor is None:
                 handler._deny(404, "not found")
                 return True
-            page = render_report_preview(descriptor, asset_url=lambda asset: "#").encode("utf-8")
+            from .artifact_report_figures import load_figure_images
+            images = load_figure_images(descriptor, server.rustfs, lambda asset_id: handler._artifact_call(
+                "get_report_asset", artifact_id, version_id, asset_id))
+            page = render_report_preview(descriptor, asset_url=lambda asset: "#", figure_images=images).encode("utf-8")
             _send_render(handler, "html", page, dashboard_resolver(), None)
             return True
         if not _INDEX.fullmatch(parts[8]):

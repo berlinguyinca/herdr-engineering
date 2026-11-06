@@ -288,8 +288,13 @@ def test_share_resolver_images() -> None:
     res = sr.share_resolver("index.html", IDX)
     out = sr.sanitize_html(b'<img src="img/p.png">', resolve=res)
     assert 'src="../f/img/p.png"' in out
+    # an SVG data image is an opaque <img> source (a browser runs no script and loads nothing from it)
     out = sr.sanitize_html(b'<img src="data:image/svg+xml;base64,PHN2Zz4=">', resolve=res)
+    assert 'src="data:image/svg+xml;base64,PHN2Zz4="' in out
+    out = sr.sanitize_html(b'<img src="data:image/svg+xml,%3Csvg%3E"><img src="data:image/svg+xml;utf8,<svg>">', resolve=res)
     assert "src" not in out
+    out = sr.sanitize_html(b'<svg><image href="data:image/svg+xml;base64,PHN2Zz4="/></svg>', resolve=res)
+    assert "svg" not in out and "image" not in out
     out = sr.sanitize_html(b'<img src="data:image/png;base64,iVBORw0KGgo=">', resolve=res)
     assert 'src="data:image/png;base64,iVBORw0KGgo="' in out
     out = sr.sanitize_html(b'<img src="https://evil/x.png"><img src="//evil/x.png">', resolve=res)
