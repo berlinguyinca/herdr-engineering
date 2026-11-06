@@ -351,3 +351,56 @@ def test_contract_events_become_allowlisted_redacted_stream_events(served):
     assert SECRET not in dump and "argv" not in dump and "/home/x" not in dump
     call(base, "GET", "/api/v1/build-cache/builds", "k-view")               # never published twice
     assert len([e for e in repo.recent_events(limit=100) if e["entity_type"] == "build_cache"]) == 4
+
+
+# ---------------------------------------------------------------------------------------------- SSE resume
+def _read_frames(base, key, want, last_id=None, path="/api/v1/build-cache/events/stream"):
+    headers = {"X-API-Key": key}
+    if last_id:
+        headers["Last-Event-ID"] = last_id
+    frames, cur = [], {}
+    with urllib.request.urlopen(urllib.request.Request(base + path, headers=headers), timeout=10) as r:
+        assert r.headers["Content-Type"].startswith("text/event-stream")
+        while len(frames) < want:
+            line = r.readline().decode().rstrip("\n")
+            if line == "":
+                if "data" in cur:
+                    frames.append(cur)
+                cur = {}
+            elif not line.startswith(":") and ": " in line:
+                k, v = line.split(": ", 1)
+                cur[k] = v
+    return frames
+
+
+def test_build_cache_stream_has_ids_and_resumes_after_last_event_id(served):
+    base, state, repo = served
+    call(base, "GET", "/api/v1/build-cache/status", "k-view")               # baseline
+    _write_builds(state, [_started(1), _finished(1), _started(2), _finished(2)])
+    call(base, "GET", "/api/v1/build-cache/builds", "k-view")               # publishes 4 events
+    first = _read_frames(base, "k-view", 4, last_id="never-seen-0")          # unknown id: whole retained ring
+    ids = [f["id"] for f in first]
+    assert len(set(ids)) == 4 and all(f["event"].startswith("build_cache.") for f in first)
+    body = json.loads(first[0]["data"])
+    assert body["entity_id"] == "h1" and isinstance(body["sequence"], int) and body["payload"]["build_id"] == "b1"
+    resumed = _read_frames(base, "k-view", 2, last_id=ids[1])
+    assert [f["id"] for f in resumed] == ids[2:]                             # exactly the events after the given id
+
+
+def test_build_cache_stream_delivers_live_events_while_connected(served):
+    base, state, repo = served
+    call(base, "GET", "/api/v1/build-cache/status", "k-view")
+    threading.Timer(0.5, _write_builds, args=(state, [_finished(7)])).start()
+    [frame] = _read_frames(base, "k-view", 1)                                # no Last-Event-ID: live only
+    assert json.loads(frame["data"])["payload"]["build_id"] == "b7"
+    assert frame["id"]
+
+
+def test_build_cache_stream_requires_auth_and_flag(served, tmp_path):
+    base, _, _ = served
+    assert call(base, "GET", "/api/v1/build-cache/events/stream")[0] == 401
+    svr, off, _ = _serve({"enabled": False}, KEYS)
+    try:
+        assert call(off, "GET", "/api/v1/build-cache/events/stream", "k-view")[0] == 404
+    finally:
+        svr.shutdown()

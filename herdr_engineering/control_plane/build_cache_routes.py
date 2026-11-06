@@ -14,7 +14,8 @@ Scope, stated honestly:
   not push their records to the control plane (no ingest, no table, no migration), so other hosts are not visible.
 * ``POST cleanup/preview`` runs the existing dry-run planner; there is no apply endpoint (apply stays CLI-only).
 * Lifecycle changes are published with ``repo.record_event`` (redacted, allowlisted). The shared SSE stream has no
-  event ids, so there is no ``Last-Event-ID`` resume; a new client only gets the shared stream's 100-event replay.
+  event ids; ``GET /build-cache/events/stream`` is the resumable one (``id:`` + ``Last-Event-ID``, 500-event ring
+  kept in memory, so a control-plane restart replays the ring on reconnect instead of resuming exactly).
 * Events are published when a read request notices new ``builds.jsonl`` lines (no background thread). A quiet API
   therefore delays events; the first read after start only sets the baseline and never replays history.
 """
@@ -23,9 +24,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import re
 import threading
 import time
+import uuid
+from collections import deque
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -53,6 +57,9 @@ _CONTRACT_FIELDS = {
     "lease_changed": ("ts", "host", "change", "scope_id", "attempt_id", "epoch"),
     "cleanup_completed": ("ts", "host", "kind", "status", "removed_count", "removed_bytes"),
 }
+STREAM_RING = 500            # events a reconnecting client can replay
+_STREAM_MAX_S = 3600
+_STREAM_TICK_S = 1.0
 _LOGS = ("builds.jsonl", "contract-events.jsonl")
 _BUILD_EVENTS = ("build_started", "build_finished")
 
@@ -125,7 +132,11 @@ class BuildCacheService:
         self.state_dir = Path(state_dir)
         self.record_event = record_event
         self._now = now
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._boot = uuid.uuid4().hex[:8]                    # ids from another boot cannot be ordered against ours
+        self._seq = 0
+        self._ring: deque = deque(maxlen=STREAM_RING)         # (n, frame)
+        self._subs: set = set()
         self._cursors: dict[str, list[int | None]] = {}      # log name -> [offset, inode]
         self._hosts: tuple[float, list] | None = None
 
@@ -273,10 +284,53 @@ class BuildCacheService:
                 payload["cache_applied"] = rec["cache"].get("applied") is True
         host = str(rec.get("host") or "unknown")[:64]
         try:
-            self.record_event("build_cache", host, f"build_cache.{kind}", redact_payload(payload),
-                              session_id=(trace or {}).get("session"))
+            ev = self.record_event("build_cache", host, f"build_cache.{kind}", redact_payload(payload),
+                                   session_id=(trace or {}).get("session"))
         except Exception:  # noqa: BLE001 - publishing must never break a read
-            pass
+            return
+        self._fan_out(ev, host, f"build_cache.{kind}", redact_payload(payload))
+
+    # ---------------------------------------------------------------- resumable stream
+    def _fan_out(self, ev, host: str, event_type: str, payload: dict) -> None:
+        """Give the published event a stream id and hand it to the ring and to connected clients.
+
+        The id is ``<boot>-<n>`` with a service-wide counter: the repo's per-host ``sequence`` (carried in the frame)
+        is only ordered within one host, so it cannot resume a stream that mixes hosts.
+        """
+        seq = ev.get("sequence") if isinstance(ev, dict) else None
+        with self._lock:
+            self._seq += 1
+            frame = {"id": f"{self._boot}-{self._seq}", "event_type": event_type, "entity_type": "build_cache",
+                     "entity_id": host, "sequence": seq, "payload": payload}
+            self._ring.append((self._seq, frame))
+            subs = list(self._subs)
+        for q in subs:
+            try:
+                q.put_nowait(frame)
+            except queue.Full:
+                with self._lock:
+                    self._subs.discard(q)                      # slow client: drop it, it reconnects with Last-Event-ID
+
+    def subscribe(self, last_event_id: str | None) -> tuple[queue.Queue, list[dict]]:
+        """Register a client; returns its live queue and the frames to replay first.
+
+        No id: no replay. An id from this boot: the retained events after it. Any other id (another boot, garbage,
+        or older than the ring): the whole retained ring, so a reconnect never silently loses events (at-least-once;
+        clients de-duplicate on the id).
+        """
+        q: queue.Queue = queue.Queue(maxsize=256)
+        with self._lock:
+            replay: list[dict] = []
+            if last_event_id:
+                m = re.fullmatch(r"([0-9a-f]{8})-([0-9]{1,12})", last_event_id)
+                after = int(m.group(2)) if m and m.group(1) == self._boot else -1
+                replay = [f for n, f in self._ring if n > after]
+            self._subs.add(q)
+        return q, replay
+
+    def unsubscribe(self, q: queue.Queue) -> None:
+        with self._lock:
+            self._subs.discard(q)
 
     # ---------------------------------------------------------------- reads
     def status(self) -> dict:
@@ -284,7 +338,7 @@ class BuildCacheService:
         out = {
             "enabled": True, "policy_enabled": self.cfg.enabled, "apply": "cli_only",
             "ingest": {"remote_hosts": False, "source": "local_host_state_files"},
-            "sse": {"resumable": False, "note": "shared stream has no event ids; 100-event replay only"},
+            "sse": {"resumable": True, "path": "/api/v1/build-cache/events/stream", "replay_events": STREAM_RING},
             "log_present": self.log_path.exists(),
             "summary": summarize(self.log_path) if self.cfg.enabled else None,
             "policy": self.cfg.public_view(),
@@ -339,6 +393,56 @@ def _parse_int(query, name, default, lo, hi):
     return value
 
 
+def _frame(frame: dict) -> bytes:
+    data = json.dumps({k: v for k, v in frame.items() if k != "id"}, separators=(",", ":"))
+    return f"id: {frame['id']}\nevent: {frame['event_type']}\ndata: {data}\n\n".encode()
+
+
+def _stream(handler, service) -> None:
+    """``GET /build-cache/events/stream``: SSE with ``id:``; ``Last-Event-ID`` (or ``?last_event_id=``) resumes."""
+    query = parse_qs(urlsplit(handler.path).query)
+    last = handler.headers.get("Last-Event-ID") or (query.get("last_event_id") or [None])[0]
+    if last is not None and len(last) > 64:
+        last = None
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("X-Accel-Buffering", "no")
+    handler.send_header("Connection", "close")
+    handler.end_headers()
+    handler.close_connection = True
+    try:
+        handler.connection.settimeout(30)
+    except OSError:
+        pass
+    q, replay = service.subscribe(last)
+    try:
+        handler.wfile.write(b"retry: 3000\n\n")
+        for frame in replay:
+            handler.wfile.write(_frame(frame))
+        handler.wfile.flush()
+        started = last_write = time.monotonic()
+        while time.monotonic() - started < _STREAM_MAX_S:
+            try:
+                frame = q.get(timeout=_STREAM_TICK_S)
+            except queue.Empty:
+                service.sync_events()                           # no background thread: poll the logs while connected
+                if q not in service._subs:
+                    break                                       # dropped as a slow client
+                if time.monotonic() - last_write >= 15:
+                    handler.wfile.write(b": keep-alive\n\n")
+                    handler.wfile.flush()
+                    last_write = time.monotonic()
+                continue
+            handler.wfile.write(_frame(frame))
+            handler.wfile.flush()
+            last_write = time.monotonic()
+    except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+        pass
+    finally:
+        service.unsubscribe(q)
+
+
 def route_build_cache(handler, server, parts, resource) -> bool:
     """Handle ``/api/v1/build-cache*``. Returns True when the request was answered.
 
@@ -358,7 +462,9 @@ def route_build_cache(handler, server, parts, resource) -> bool:
     try:
         if method == "GET":
             service.sync_events()
-            if tail == ["status"]:
+            if tail == ["events", "stream"]:
+                _stream(handler, service)
+            elif tail == ["status"]:
                 handler._json(service.status())
             elif tail == ["hosts"]:
                 handler._json(service.hosts())
