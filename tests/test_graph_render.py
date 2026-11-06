@@ -1,4 +1,5 @@
 """The drift graph drawn with line characters: must fit any width."""
+import re
 from datetime import UTC, timezone
 
 import pytest
@@ -179,3 +180,71 @@ def test_metrics_never_overflow_any_width_or_charset(width, unicode):
         assert visible_width(line) <= width, (width, line)
     if not unicode:
         assert "\n".join(render(metric_graph(), width, unicode=False)).isascii()
+
+
+# --- layout router: fill the pane instead of leaving half of it empty -------------------------------
+
+def _labelled(n, drift_index=None):
+    segs = [seg(f"topic {i + 1}", i * 5 + 1, i * 5 + 5) for i in range(n)]
+    drift = {"at": segs[drift_index]["from_prompt"], "note": "new"} if drift_index is not None else None
+    return {"total_prompts": n * 5, "segments": segs, "drift": drift}
+
+
+def _box_count_per_row(lines):
+    return [len(re.findall("┌─+┐", line)) for line in lines if re.search("┌─+┐", line)]
+
+
+@pytest.mark.parametrize("width", [60, 80, 110, 130])
+def test_boxes_wrap_into_rows_that_fill_the_pane(width):
+    lines = render(_labelled(8), width)
+    per_row = _box_count_per_row(lines)
+    assert len(per_row) > 1 and max(per_row) > 1                       # a grid, not one long column
+    assert max(visible_width(line) for line in lines) >= width * 0.6   # and it uses the width it has
+    column = render(_labelled(8), 32)
+    assert len(lines) < len(column)
+
+
+def test_wrapped_rows_are_balanced_not_left_with_an_orphan():
+    per_row = _box_count_per_row(render(_labelled(7), 110))
+    assert len(per_row) > 1 and max(per_row) > 1 and max(per_row) - min(per_row) <= 1
+
+
+def test_every_box_after_the_first_has_exactly_one_incoming_arrow():
+    for width in (60, 80, 110, 200):
+        text = "\n".join(render(_labelled(8), width))
+        assert text.count("▶") + text.count("▼") == 7, width
+
+
+def test_row_to_row_connector_runs_from_the_end_of_one_row_to_the_start_of_the_next():
+    lines = render(_labelled(8), 80)
+    assert max(_box_count_per_row(lines)) > 1
+    down = next(i for i, line in enumerate(lines) if "▼" in line)
+    assert lines[down - 3].lstrip().startswith("└") and "│" in lines[down - 2]    # leaves the end of the row
+    elbow = lines[down - 1]
+    assert ("┘" in elbow and "┌" in elbow) or ("└" in elbow and "┐" in elbow)
+    assert lines[down].index("▼") < 20                                  # lands on the first box of the next row
+
+
+@pytest.mark.parametrize("drift_index", [1, 2, 3, 4, 7])
+def test_drift_marker_stays_under_its_own_box_in_a_grid(drift_index):
+    lines = render(_labelled(8, drift_index), 80)
+    label = f"topic {drift_index + 1}"
+    row = next(i for i, line in enumerate(lines) if f"│ {label} " in line)      # the label line of that box
+    line = lines[row]
+    col = line.index(label)
+    left = line.rfind("│", 0, col)
+    right = line.find("│", col)
+    marker = next(m for m in lines[row:] if "▲" in m)
+    assert left < marker.index("▲") < right
+    assert sum(m.count("▲") for m in lines) == 1
+
+
+@pytest.mark.parametrize("width", [40, 50, 70, 90, 120])
+@pytest.mark.parametrize("unicode", [True, False])
+def test_grid_never_overflows_and_ascii_stays_ascii(width, unicode):
+    for n in (2, 5, 8, 12):
+        for drift_index in (None, 1, n - 1):
+            lines = render(_labelled(n, drift_index), width, unicode=unicode)
+            assert all(visible_width(line) <= width for line in lines)
+            if not unicode:
+                assert all(line.isascii() for line in lines)

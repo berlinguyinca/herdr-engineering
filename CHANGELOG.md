@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Drift graph layout router
+- The graph no longer falls into one tall column that leaves half the pane empty: boxes are packed into balanced rows (label width 40 down to 8 tried) joined by arrows, with an elbow connector from the end of a row to the start of the next, and the arrangement with the fewest lines wins. A single column remains for panes too narrow for two boxes; the drift marker stays under its own box, including at the end of a row. ASCII and the width guarantee are unchanged.
+
 ### `/handoff` skill and `/summary` visibility
 - New `handoff` skill (`/handoff [pi|claude|codex|opencode]`), installed by `herdr-eng summary install` (`--skill summary|handoff|all`) with the same manifest and never-overwrite contract; no Pi prompt template (Pi's built-in `/handoff` keeps its name). Default target is the current harness, from the new `herdr-eng handoff harness` (explicit, ancestor process, pane agent, marker env; exit 2 when undetectable). Needs herdr-handoff 0.2.0 (envelope v2, `--from-json`, pane-less `launch`). Opt-in trigger ideas: `docs/operations/handoff-auto-triggers.md`.
 - `summary publish` now returns a `digest`, reuses a still-open report viewer pane (refreshed with SIGWINCH) instead of closing and re-splitting, and focuses the report pane.
