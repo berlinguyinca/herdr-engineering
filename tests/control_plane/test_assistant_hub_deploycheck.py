@@ -815,3 +815,15 @@ def test_a_failed_rollback_jumps_the_queue_and_survives_overflow(tmp_path, hl):
     finally:
         rt.stop()
         w.close()
+
+
+def test_a_corrupt_datetime_row_already_notified_is_renotified_as_unconfirmed(hl):
+    snap, cid = stored_snapshot(hl)
+    row = snap["deploy_checks"][0]
+    row["notified"] = True
+    row["status"] = "healthy"
+    row["deadline"] = {"$dt": "not-a-date"}
+    fresh = restored(snap)
+    (c,) = fresh.list_deploy_checks(T, U)
+    assert c.status == "unconfirmed" and c.notified is False
+    assert [x.check_id for x in fresh.list_deploy_checks_any(unnotified=True)] == [cid]
