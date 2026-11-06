@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 from .artifact_members import is_member_principal
 from .artifact_report_api import CHUNK_BYTES, PinnedOutputError, _access, pinned_output
 from .artifact_shares import ShareError, new_token
+from .artifacts import ArtifactError
 from .share_bundle import (
     BundleLimits,
     ShareBundleError,
@@ -45,13 +46,21 @@ from .share_public import (
     labelled_html,
     shared_by_bar,
 )
+from .share_rich_view import (
+    MAX_RICH_BYTES,
+    PENDING_MARK,
+    RICH_NAME,
+    select_author_asset,
+    with_toggle,
+)
 
 DEFAULTS = {"max_share_bytes": 512 * 1024 * 1024, "max_files": 20000, "max_total_bytes": 2 * 1024 * 1024 * 1024,
             "default_public_days": 30}
 PREVIEW_NAME = "preview.html"
 LISTED_FILES = 200
 MAX_DAYS = 3650
-CREATE_FIELDS = {"version_id", "audience", "allow_emails", "allow_groups", "expires_in_days", "entry", "title", "room_id"}
+CREATE_FIELDS = {"version_id", "audience", "allow_emails", "allow_groups", "expires_in_days", "entry", "title", "room_id",
+                 "include_author_html"}
 # Serialises approvals in this process: the live-bytes budget is read, then spent, and a bundle directory is created.
 _APPROVE_LOCK = threading.Lock()
 
@@ -149,7 +158,8 @@ def _share_body(handler, allowed):
     return value
 
 
-def _report_preview(descriptor: dict, *, max_bytes: int | None = None, figure_images=None) -> bytes:
+def _report_preview(descriptor: dict, *, max_bytes: int | None = None, figure_images=None,
+                    rich_view: bool = False) -> bytes:
     """The rendered report preview with asset and descriptor links reduced to plain text (assets are not shared)."""
     from .artifact_report_render import render_report_preview
     options = {} if max_bytes is None else {"max_bytes": max_bytes}
@@ -157,7 +167,8 @@ def _report_preview(descriptor: dict, *, max_bytes: int | None = None, figure_im
     page = re.sub(r'<a class="btn" href="#" download>.*?</a>', "", page)  # a download button has no target here
     # keep chip styling; a chip whose target was omitted points at the descriptor ("report"), which is not shared
     page = re.sub(r'<a (class="[a-z ]+") href="(?:#|report)">(.*?)</a>', r"<span \1>\2</span>", page)
-    return re.sub(r'<a href="(?:#|report)">(.*?)</a>', r"\1", page).encode("utf-8")
+    page = re.sub(r'<a href="(?:#|report)">(.*?)</a>', r"\1", page)
+    return (with_toggle(page) if rich_view else page).encode("utf-8")
 
 
 def _chunks(server, item):
@@ -206,6 +217,24 @@ def shared_file_names(version: dict) -> frozenset[str]:
     return frozenset(names)
 
 
+def _author_html(server, artifact_id: str, version_id: str, descriptor: dict) -> tuple[dict, bytes]:
+    """The report's one HTML page, chosen as the dashboard Rich view does, size- and hash-verified; 400 when unusable."""
+    from .artifact_rich_view import _read_verified
+    picked = select_author_asset(descriptor)
+    if picked is None:
+        raise ShareHTTPError(400, "include_author_html: the report has no single HTML asset to include")
+    if picked.get("size_bytes", 0) > MAX_RICH_BYTES:
+        raise ShareHTTPError(400, f"include_author_html: {picked.get('name')} is over {MAX_RICH_BYTES} bytes")
+    try:
+        asset = _call(server.artifact_store, "get_report_asset", artifact_id, version_id, picked["id"])
+        data = _read_verified(server, asset) if getattr(server, "rustfs", None) is not None else None
+    except (ArtifactError, ValueError, KeyError):
+        raise ShareHTTPError(400, "include_author_html: the HTML asset could not be read and verified") from None
+    if data is None:
+        raise ShareHTTPError(400, f"include_author_html: {picked.get('name')} is over {MAX_RICH_BYTES} bytes")
+    return asset, data
+
+
 def _plan(server, artifact_id: str, version_id: str, entry: str | None,
           created_by: str | None = None) -> tuple[list[dict], str, list[str]]:
     """Dry run: the files a bundle of this version holds, its entry and warnings. No object bytes are read."""
@@ -222,17 +251,30 @@ def _plan(server, artifact_id: str, version_id: str, entry: str | None,
         rendered = ((report.get("checks") or {}).get("rendered") or {}).get("status")
         if rendered != "passed":
             raise ShareHTTPError(400, f"report version is not rendered (rendered check: {rendered})")
-        if entry not in (None, PREVIEW_NAME):
+        include_html = entry == PENDING_MARK
+        if entry not in (None, PREVIEW_NAME, PENDING_MARK):
             raise ShareHTTPError(400, f"a report share's entry is its generated {PREVIEW_NAME}")
         from .artifact_report_figures import load_figure_images
         descriptor = _call(registry, "get_report_descriptor", artifact_id, version_id)
         images = load_figure_images(descriptor, server.rustfs, lambda asset_id: _call(
             registry, "get_report_asset", artifact_id, version_id, asset_id))
-        page = _report_preview(descriptor, figure_images=images)
+        if include_html and is_member_principal(created_by):
+            raise ShareHTTPError(400, "include_author_html is not available for member-created links")
+        page = _report_preview(descriptor, figure_images=images, rich_view=include_html)
         (preview_name,) = shared_file_names(version)
         files = [{"name": preview_name, "sha256": hashlib.sha256(page).hexdigest(), "size_bytes": len(page),
                   "data": page}]
-        return files, PREVIEW_NAME, ["report evidence files are not included; the preview lists them as text"]
+        warnings = ["report evidence files are not included; the preview lists them as text"]
+        if include_html:
+            asset, html_bytes = _author_html(server, artifact_id, version_id, descriptor)
+            files.append({"name": RICH_NAME, "sha256": hashlib.sha256(html_bytes).hexdigest(),
+                          "size_bytes": len(html_bytes), "data": html_bytes})
+            warnings.append(f"the author's own HTML page ({asset.get('name')}, {len(html_bytes)} bytes) IS included as "
+                            f"{RICH_NAME}: anyone holding the link can view it as a 'Rich view' (scripts disabled, "
+                            "isolated frame); approve only if you accept that")
+        return files, PREVIEW_NAME, warnings
+    if entry == PENDING_MARK:
+        raise ShareHTTPError(400, "include_author_html only applies to a report version")
     files = []
     for position, output in enumerate(version.get("output_manifest") or []):
         try:
@@ -275,6 +317,7 @@ def _summary(files, entry, warnings, audience, expires_at, total=None) -> dict:
     return {"entry": entry, "file_count": len(files),
             "total_bytes": total if total is not None else sum(known),
             "files": [{"name": f["name"], "size_bytes": f["size_bytes"]} for f in files[:LISTED_FILES]],
+            "author_html": any(f["name"] == RICH_NAME for f in files),
             "audience": audience, "expires_at": _jsonable(expires_at), "warnings": list(warnings)}
 
 
@@ -385,6 +428,7 @@ def approve_share(server, share: dict, *, approved_by: str | None = None,
                 **extra, "share_id": share_id, "audience": share["audience"], "state": "live",
                 "expires_at": _jsonable(expires_at), "allow_emails": list(share.get("allow_emails") or []),
                 "allow_groups": list(share.get("allow_groups") or []), "entry": index.entry, "title": share.get("title"),
+                **({"rich": RICH_NAME} if share.get("entry") == PENDING_MARK else {}),
                 "files": [{"name": f.name, "sha256": f.sha256, "size": f.size, "content_type": f.content_type}
                           for f in index.files]})
             try:
@@ -400,6 +444,7 @@ def approve_share(server, share: dict, *, approved_by: str | None = None,
         raise
     url = settings["public_url"].rstrip("/") + "/s/" + token + "/"
     summary = {"entry": index.entry, "file_count": len(index.files), "total_bytes": index.total_bytes,
+               "author_html": share.get("entry") == PENDING_MARK,
                "expires_at": _jsonable(expires_at), "audience": share["audience"],
                "warnings": warnings + index.warnings}
     return url, summary
@@ -438,6 +483,15 @@ def _create(handler, server, artifact_id):
     entry, title = body.get("entry"), body.get("title")
     if entry is not None and not isinstance(entry, str):
         raise ValueError("entry must be a string")
+    if entry == PENDING_MARK:
+        raise ValueError("entry is reserved; use include_author_html")
+    include_html = body.get("include_author_html", False)
+    if not isinstance(include_html, bool):
+        raise ValueError("include_author_html must be true or false")
+    if include_html:
+        if entry not in (None, PREVIEW_NAME):
+            raise ValueError("include_author_html only applies to a report share (entry preview.html)")
+        entry = PENDING_MARK
     if title is not None and (not isinstance(title, str) or len(title) > 240):
         raise ValueError("title must be a string of up to 240 characters")
     allow_emails = body.get("allow_emails")

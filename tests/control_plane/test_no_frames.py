@@ -39,7 +39,9 @@ ROOT = Path(__file__).resolve().parents[2]
 TAG = re.compile(r"<\s*(iframe|frame|frameset|object|embed|portal|fencedframe)(?=[\s/>])", re.I)
 API = re.compile(r"createElement\(\s*['\"`](iframe|frame|object|embed)|\.srcdoc\b|\bsrcdoc=|postMessage\(", re.I)
 RICH_VIEW = "packages/artifact-rich-view.js"
+SHARE_RICH = "herdr_engineering/control_plane/share_static/rich-toggle.js"
 ALLOWED: dict[str, str] = {       # "relative/path" -> reason; a new entry needs a reason a reviewer can check
+    SHARE_RICH: "share Rich view (opt-in, 2026-11-05): one iframe with an empty sandbox whose src is the bundled author page",
     RICH_VIEW: "report Rich view: one iframe with an empty sandbox, whose src can only be the rich route (pinned below)",
 }
 SCANNED_SUFFIXES = {".js", ".mjs", ".html", ".css"}
@@ -119,8 +121,59 @@ def test_the_rich_view_is_the_one_allowed_frame_shape():
     # no other shipped script or page may name the rich frame's pieces: the exception is exactly one file
     for path in _scanned_files():
         rel = path.relative_to(ROOT).as_posix()
-        if rel != RICH_VIEW and path.suffix == ".js":
+        if rel not in (RICH_VIEW, SHARE_RICH) and path.suffix == ".js":
             assert "createElement('iframe')" not in path.read_text(encoding="utf-8", errors="replace"), rel
+
+
+def share_rich_shape_problems(text: str) -> list[str]:
+    """Why ``text`` is not the share viewer's one allowed frame (empty list when it is)."""
+    problems = []
+    if len(re.findall(r"createElement\(\s*'iframe'\s*\)", text)) != 1:
+        problems.append("exactly one createElement('iframe') is allowed")
+    if re.findall(r"createElement\(\s*['\"`](?!iframe|p\b)", text, re.I) or re.search(
+            r"<\s*(?:iframe|frame|frameset|object|embed|portal|fencedframe)\b", text, re.I):
+        problems.append("no other frame, plugin or markup element")
+    if len(re.findall(r"setAttribute\(\s*'sandbox'\s*,\s*''\s*\)", text)) != 1:
+        problems.append("sandbox must be set to the empty string")
+    if "allow-" in text or re.search(r"\bsandbox\s*\.\s*(?:add|value|toggle)|\.sandbox\s*=", text):
+        problems.append("no sandbox token of any kind")
+    if re.search(r"srcdoc|postMessage|contentWindow|contentDocument", text):
+        problems.append("no srcdoc, postMessage or contentWindow")
+    if re.findall(r"setAttribute\(\s*'src'\s*,\s*([^)]*)\)", text) != ["SRC"] or "var SRC = 'author-page.html';" not in text:
+        problems.append("src must be the one fixed relative author page")
+    return problems
+
+
+def test_the_share_rich_view_is_the_one_allowed_share_frame_shape():
+    text = (ROOT / SHARE_RICH).read_text(encoding="utf-8")
+    assert share_rich_shape_problems(text) == []
+
+
+@pytest.mark.parametrize("old, new", [
+    ("setAttribute('sandbox', '')", "setAttribute('sandbox', 'allow-scripts')"),
+    ("setAttribute('sandbox', '')", "setAttribute('sandbox', 'allow-same-origin')"),
+    ("var SRC = 'author-page.html';", "var SRC = 'https://evil.example/';"),
+    ("var SRC = 'author-page.html';", "var SRC = '/s/static/share.js';"),
+    ("frame.setAttribute('src', SRC);", "frame.setAttribute('src', SRC); frame.setAttribute('srcdoc', '<p>');"),
+    ("frame.setAttribute('src', SRC);", "frame.setAttribute('src', SRC); frame.sandbox.add('allow-scripts');"),
+    ("frame.setAttribute('src', SRC);", "frame.setAttribute('src', SRC); frame.contentWindow.postMessage(1, '*');"),
+    ("frame.setAttribute('src', SRC);", "frame.setAttribute('src', location.hash.slice(1));"),
+    ("var frame = document.createElement('iframe');",
+     "var frame = document.createElement('iframe'); document.createElement('iframe');"),
+    ("var frame = document.createElement('iframe');",
+     "var frame = document.createElement('iframe'); document.createElement('embed');"),
+])
+def test_any_other_share_frame_shape_is_rejected(old, new):
+    text = (ROOT / SHARE_RICH).read_text(encoding="utf-8")
+    assert old in text, old
+    assert share_rich_shape_problems(text.replace(old, new, 1)), new
+
+
+def test_share_html_pages_still_carry_no_frame_markup_by_default():
+    """The toggle script is inlined only into an opted-in preview; the static pages and viewer stay frame-free."""
+    static = ROOT / "herdr_engineering/control_plane/share_static"
+    for page in static.glob("*.html"):
+        assert not TAG.search(page.read_text()) and not API.search(page.read_text()), page.name
 
 
 @pytest.mark.parametrize("old, new", [
