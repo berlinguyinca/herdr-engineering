@@ -2006,6 +2006,7 @@ _PUBLIC_STATIC = {
     "/collab-tabs.js": ("collab-tabs.js", "text/javascript"),
     "/collab-proposals.js": ("collab-proposals.js", "text/javascript"),
     "/collab-lineage.js": ("collab-lineage.js", "text/javascript"),
+    "/collab-fabric.js": ("collab-fabric.js", "text/javascript"),
     "/collab-attention.js": ("collab-attention.js", "text/javascript"),
     "/collab-mention.js": ("collab-mention.js", "text/javascript"),
     "/collab-context.js": ("collab-context.js", "text/javascript"),
