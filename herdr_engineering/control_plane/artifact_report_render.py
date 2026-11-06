@@ -231,7 +231,9 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
         return f'<aside class="notice" role="note">{" ".join(parts)}</aside>'
 
     present_sections = [(a, t, label, items) for a, t, label, items, *_ in sections if items]
-    title = text(report.get("title", "Report"), 256)
+    title_source = report.get("title", "Report")
+    title = ""
+    title_shortened = False
     summary_html = f'<p class="lede">{text(report["summary"])}</p>' if report.get("summary") else ""
     shortened_by_summary, shortened = shortened, False
 
@@ -243,15 +245,21 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
                 f'<header class="hero"><h1>{title}</h1>{hero_summary}{nav}</header>{body}{footer}'
                 "</main></body></html>")
 
-    css = _FULL_CSS if len(document(_FULL_CSS, "", "", "", "").encode()) + _FULL_CSS_MARGIN <= max_bytes \
-        else _CORE_CSS
     # Reserve the largest possible contents list and omission note (every count is no wider than its
-    # total), then give the hero summary at most a quarter of what is left; sections share the rest.
+    # total). The title appears twice, so it is cut until the envelope fits even the smallest cap.
     worst_note = note([(label, 0, len(items)) for _, _, label, items in present_sections], True)
-    fixed = len(document(css, "", toc([(a, t) for a, t, *_ in present_sections]), "", worst_note).encode())
+    nav_html = toc([(a, t) for a, t, *_ in present_sections])
     wrappers = sum(len(wrap(a, t, k, "").encode()) for a, t, _, _, _, k, _ in sections)
-    remaining = max_bytes - fixed - wrappers
-    if remaining < 0:
+    for title_limit in (256, 128, 64, 32, 16, 8, 0):
+        title_shortened = len(title_source) > title_limit
+        title = html.escape(title_source[:title_limit] + ("\u2026" if title_shortened else ""), quote=True)
+        css = _FULL_CSS if len(document(_FULL_CSS, "", "", "", "").encode()) + _FULL_CSS_MARGIN <= max_bytes \
+            else _CORE_CSS
+        fixed = len(document(css, "", nav_html, "", worst_note).encode())
+        remaining = max_bytes - fixed - wrappers
+        if remaining >= 0:
+            break
+    else:
         raise ValueError("max_bytes is too small for the preview envelope")
     summary_omitted = bool(summary_html) and len(summary_html.encode()) > remaining // 4
     if summary_omitted:
@@ -274,8 +282,8 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
         counts.append((label, len(selected), len(items)))
         kept_anchors.append((anchor, title_text))
     omitted = summary_omitted or any(kept < total for _, kept, total in counts)
-    footer = note(counts, shortened or shortened_by_summary or summary_omitted) \
-        if omitted or shortened or shortened_by_summary else ""
+    footer = note(counts, shortened or shortened_by_summary or summary_omitted or title_shortened) \
+        if omitted or shortened or shortened_by_summary or title_shortened else ""
     result = document(css, summary_html, toc(kept_anchors), "".join(bodies), footer)
     present = set(re.findall(r' id="([^"]+)"', result))
     result = re.sub(r'href="#([^"]+)"',

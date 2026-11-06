@@ -344,3 +344,15 @@ def test_public_preview_has_no_dangling_report_links_when_referenced_evidence_is
     for page in (public.decode(), sr.sanitize_html(public, resolve=lambda _context, url: url)):
         assert 'href="report"' not in page and 'href="#"' not in page
         assert "e39" in page  # the id stays visible as plain text
+
+
+@pytest.mark.parametrize("char", ['"', "\U0001F9EA", "<", "&", "x"])
+def test_minimum_cap_holds_for_the_longest_hostile_title(char):
+    report = descriptor()
+    report["title"] = char * 256
+    page = _render(report, max_bytes=4096)
+    assert len(page.encode()) <= 4096
+    document = _Document()
+    document.feed(page)
+    assert not document.stack
+    assert page.count("<h1>") == 1 and "<script" not in page
