@@ -23,14 +23,21 @@ def _asset_link(value: str) -> str:
     return html.escape(value, quote=True)
 
 
+_LIGHT = ("--bg:#f7f7f8;--surface:#fff;--surface-2:#ececf1;--border:#d9d9e3;"
+          "--text:#353740;--muted:#6e6e80;--accent:#10a37f;--accent-weak:#d2f0e8;--link:#0d8f6f;--warn:#9b5d00;"
+          "--warn-bg:#fff4e5;--on-accent:#fff;")
+_DARK = ("color-scheme:dark;--bg:#17181c;--surface:#1f2026;--surface-2:#2a2b33;--border:#3a3b45;--text:#e6e6ea;"
+         "--muted:#a4a4b3;--accent:#2fc59c;--accent-weak:#153d33;--link:#4ad6b0;--warn:#fbbf24;"
+         "--warn-bg:#2b2310;--on-accent:#07211a;")
+# Light is the base; dark applies when the OS asks for it unless the host forces light, or whenever the host forces
+# dark. The host sets data-theme on :root (standalone page) or on the shadow host (dashboard), never in the markup.
 _CORE_CSS = (
-    ":root,:host{color-scheme:light dark;--bg:#f7f7f8;--surface:#fff;--surface-2:#ececf1;--border:#d9d9e3;"
-    "--text:#353740;--muted:#6e6e80;--accent:#10a37f;--accent-weak:#d2f0e8;--link:#0d8f6f;--warn:#9b5d00;"
-    "--warn-bg:#fff4e5;--on-accent:#fff;--radius:8px;--sans:\"Inter\",-apple-system,BlinkMacSystemFont,\"Segoe UI\","
+    ":root,:host{color-scheme:light dark;" + _LIGHT + "--radius:8px;--sans:\"Inter\",-apple-system,BlinkMacSystemFont,\"Segoe UI\","
     "Roboto,Helvetica,Arial,sans-serif;--mono:\"JetBrains Mono\",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}"
-    "@media (prefers-color-scheme:dark){:root,:host{--bg:#17181c;--surface:#1f2026;--surface-2:#2a2b33;"
-    "--border:#3a3b45;--text:#e6e6ea;--muted:#a4a4b3;--accent:#2fc59c;--accent-weak:#153d33;--link:#4ad6b0;"
-    "--warn:#fbbf24;--warn-bg:#2b2310;--on-accent:#07211a}}"
+    "@media (prefers-color-scheme:dark){:root:not([data-theme=\"light\"]),:host(:not([data-theme=\"light\"])){"
+    + _DARK + "}}"
+    ":root[data-theme=\"light\"],:host([data-theme=\"light\"]){color-scheme:light}"
+    ":root[data-theme=\"dark\"],:host([data-theme=\"dark\"]){" + _DARK + "}"
     "body{margin:0;background:var(--bg)}"
     ".rp{max-width:860px;margin:0 auto;padding:32px 16px 64px;background:var(--bg);color:var(--text);"
     "font:15px/1.6 var(--sans);overflow-wrap:anywhere}a{color:var(--link)}"
@@ -54,7 +61,8 @@ _FULL_CSS = _CORE_CSS + (
     "background:var(--surface-2);color:var(--text);text-decoration:none}.chip:hover{border-color:var(--accent)}"
     ".sub{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:14px 0 4px}"
     "ul,ol{margin:0 0 12px;padding-left:20px;max-width:68ch}li{margin-bottom:6px}"
-    ".qlist{list-style:none;padding:0}.qlist li{display:flex;gap:10px;align-items:baseline}.qlist .chip{flex:none;white-space:nowrap}"
+    ".qlist{list-style:none;padding:0}.qlist li{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:4px 12px;align-items:baseline}"
+    ".qlist .chip,.chips .chip{white-space:nowrap;overflow-wrap:normal;justify-self:start}"
     ".tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface)}"
     "table{border-collapse:collapse;width:100%;min-width:560px;font-size:13.5px}"
     "th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:top}"

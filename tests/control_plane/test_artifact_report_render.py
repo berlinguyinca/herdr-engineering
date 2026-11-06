@@ -1,4 +1,5 @@
 import json
+import re
 from html.parser import HTMLParser
 
 import pytest
@@ -291,7 +292,7 @@ def test_polished_preview_survives_the_real_share_sanitiser():
     public = _report_preview(descriptor())
     out = sr.sanitize_html(public, resolve=lambda _context, url: url)
     for needle in (":root,:host{color-scheme:light dark;", "--accent:#10a37f", "--bg:#17181c",
-                   "@media (prefers-color-scheme:dark)", "@media (max-width:640px)", "@media print",
+                   "@media (prefers-color-scheme:dark)", ":host([data-theme=\"dark\"])", "@media (max-width:640px)", "@media print",
                    "var(--surface)", "overflow-x:auto", "max-width:860px"):
         assert needle in out, needle
     for needle in ('class="rp"', 'class="hero"', 'class="card finding"', 'class="card figure"',
@@ -301,3 +302,19 @@ def test_polished_preview_survives_the_real_share_sanitiser():
     # public copies carry no dead links: asset and descriptor anchors are plain text
     assert 'href="#"' not in out and 'href="report"' not in out and "Download figure" not in out
     assert 'href="#sec-findings"' in out  # in-page contents links are kept
+
+
+def test_question_id_chips_never_wrap_or_collapse_into_blobs():
+    page = _render()
+    rule = re.search(r"\.qlist \.chip,\.chips \.chip\{([^}]*)\}", page).group(1)
+    assert "white-space:nowrap" in rule and "overflow-wrap:normal" in rule
+    assert "grid-template-columns:max-content" in page
+    assert "border-radius:999px" in re.search(r"\.chip\{([^}]*)\}", page).group(1)
+
+
+def test_theme_override_selectors_are_in_the_stylesheet():
+    page = _render()
+    assert ':root[data-theme="dark"]' in page and ':host([data-theme="dark"])' in page
+    assert ':root:not([data-theme="light"])' in page and ':host(:not([data-theme="light"]))' in page
+    # none of the override machinery needs a script or an attribute the sanitiser strips from the markup
+    assert "<script" not in page and 'data-theme="' not in page.split("</style>")[1]
