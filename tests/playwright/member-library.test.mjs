@@ -117,8 +117,13 @@ test('library feed: render, chips, search, expired row, pending, folders, openin
     const [saved] = await Promise.all([page.waitForEvent('download'), page.locator('[data-feed-row="lib_mine"] [data-action="open"]').click()]);
     assert.equal(saved.suggestedFilename(), 'index.html');
     assert.equal(context.pages().length, 1, 'HTML did not open a window');
+    const downloads = [];
+    page.on('download', (d) => downloads.push(d.suggestedFilename()));
     const [popup] = await Promise.all([context.waitForEvent('page'), page.locator('[data-feed-row="lib_assigned"] [data-action="open"]').click()]);
     await popup.waitForLoadState();
+    assert.equal(await popup.evaluate(() => window.opener), null, 'the new window has no opener');
+    assert.deepEqual(downloads, [], 'an inline open does not also download the file');
+    assert.doesNotMatch(await page.locator('#status, [role="status"], [data-status]').first().innerText().catch(() => ''), /blocked/i);
     assert.match(popup.url(), /^blob:/);
     assert.ok(!popup.url().includes('shr_hidden'));
     assert.equal(await popup.evaluate(() => document.contentType), 'text/plain');
@@ -127,7 +132,9 @@ test('library feed: render, chips, search, expired row, pending, folders, openin
     const [img] = await Promise.all([context.waitForEvent('page'), page.locator('[data-feed-row="lib_opened"] [data-action="open"]').click()]);
     await img.waitForLoadState();
     assert.equal(await img.evaluate(() => document.contentType), 'image/png');
+    assert.equal(await img.evaluate(() => window.opener), null);
     await img.close();
+    assert.deepEqual(downloads, [], 'inline opens never downloaded');
 
     // Pending: Accept moves a row into the library, Discard removes one
     await page.locator('[data-chip="pending"]').click();

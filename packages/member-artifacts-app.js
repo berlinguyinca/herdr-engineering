@@ -271,7 +271,10 @@ async function openContent(el) {
   if (V.contentMode(type) !== 'inline') { saveBlob(blob, name); return; }
   const shown = type.startsWith('text/') ? new Blob([blob], { type: 'text/plain;charset=utf-8' }) : blob;
   const url = URL.createObjectURL(shown);
-  const win = window.open(url, '_blank', 'noopener');
+  // 'noopener' in the features string makes window.open return null (indistinguishable from a blocked popup), so the
+  // opener is cut by hand: the new window is a blob of an inline type (text, image, pdf) and runs no script anyway.
+  const win = window.open(url, '_blank');
+  if (win !== null) win.opener = null;
   if (win === null) { URL.revokeObjectURL(url); saveBlob(blob, name); say('Your browser blocked the new window, so the file was saved instead.'); return; }
   setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
