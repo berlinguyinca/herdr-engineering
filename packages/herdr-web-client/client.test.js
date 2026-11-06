@@ -605,3 +605,36 @@ test('the log slice request names the step, the line range and the test it expec
  assert.equal(query.pathname,'/api/v1/ci/log-slice');
  assert.deepEqual(Object.fromEntries(query.searchParams),{repository:'17',number:'12',step:'4',start:'10',end:'14',context:'40',expect:'TestBeta',provider_url:'https://ci.example'});
 });
+
+test('memory detail encodes optional selectors and preserves id-only callers and signal', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
+    calls.push({ url, signal: opts.signal });
+    return { ok: true, status: 200, text: async () => '{}' };
+  } });
+  const controller = new AbortController();
+  await client.getMemoryRecord('fixture:a/b');
+  await client.getMemoryRecord('fixture:a/b', { kind: 'summary', scope: 'mission:release', project: 'other&project', signal: controller.signal });
+  assert.equal(calls[0].url, '/api/v1/memory/fixture%3Aa%2Fb');
+  const selected = new URL(calls[1].url, 'http://fixture.test');
+  assert.deepEqual(Object.fromEntries(selected.searchParams), { kind: 'summary', scope: 'mission:release', project: 'other&project' });
+  assert.equal(calls[1].signal.aborted, false);
+  controller.abort();
+  assert.equal(calls[1].signal.aborted, true);
+});
+
+test('memory detail caller cancellation still aborts in-flight fetch without AbortSignal.any', async () => {
+  const nativeAny = AbortSignal.any;
+  AbortSignal.any = undefined;
+  const controller = new AbortController();
+  try {
+    const client = new HerdrClient('', { fetchImpl: (url, opts) => new Promise((resolve, reject) => {
+      opts.signal.addEventListener('abort', () => reject(opts.signal.reason), { once: true });
+    }) });
+    const pending = client.getMemoryRecord('fixture', { signal: controller.signal, kind: 'summary' });
+    controller.abort();
+    await assert.rejects(pending, { name: 'AbortError' });
+  } finally {
+    AbortSignal.any = nativeAny;
+  }
+});

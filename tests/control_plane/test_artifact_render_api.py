@@ -15,6 +15,7 @@ import pytest
 from herdr_engineering.control_plane import share_render
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
+from herdr_engineering.control_plane.artifacts import ArtifactError
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 OWNER = hashlib.sha256(b"owner-key").hexdigest()[:16]
@@ -35,10 +36,12 @@ def key_of(data):
 class Blobs:
     def __init__(self):
         self.objects = {}
+        self.objects_by_sha = {}
 
     def add(self, data):
         key, digest = key_of(data)
         self.objects[key] = data
+        self.objects_by_sha[digest] = data
         return {"storage_key": key, "sha256": digest, "size_bytes": len(data)}
 
     def get(self, key, digest):
@@ -55,6 +58,7 @@ class Store:
         self.blobs = blobs
         self.records = {}
         self.outputs = {}
+        self.descriptors = {}       # (artifact, version) -> descriptor overriding the generic one
         self.dead = False
 
     def add(self, aid, name, mime, data):
@@ -85,7 +89,30 @@ class Store:
         outputs = self.outputs.get((aid, vid))
         return None if outputs is None else {"version_id": vid, "artifact_id": aid, "output_manifest": outputs}
 
+    figure_assets = ()    # (id, media_type, bytes) shown as figures of version "vfig"
+
+    async def get_report_asset(self, aid, vid, asset_id):
+        for name, media, data in self.figure_assets:
+            if name == asset_id:
+                return {"id": name, "media_type": media, **self.blobs.add(data)}
+        descriptor = await self.get_report_descriptor(aid, vid)
+        asset = next((a for a in descriptor["assets"] if a["id"] == asset_id), None)
+        if asset is None:
+            raise ArtifactError("no artifact report asset")
+        key, _ = key_of(self.blobs.objects_by_sha[asset["sha256"]])
+        return {**asset, "storage_key": key}
+
     async def get_report_descriptor(self, aid, vid):
+        if (aid, vid) in self.descriptors:
+            return self.descriptors[(aid, vid)]
+        if vid == "vfig":
+            base = await self.get_report_descriptor(aid, "v1")
+            assets = [{"id": n, "name": f"{n}.bin", "role": "figure", "media_type": m,
+                       "sha256": hashlib.sha256(d).hexdigest(), "size_bytes": len(d)}
+                      for n, m, d in self.figure_assets]
+            figures = [{"id": f"fig-{n}", "title": f"Figure {n}", "asset_id": n, "caption": f"cap {n}"}
+                       for n, _, _ in self.figure_assets]
+            return {**base, "figures": figures, "assets": base["assets"] + assets}
         return {"schema_version": 1, "title": "Generic investigation", "summary": "Open evidence",
                 "questions": [{"id": "q1", "text": "What is known?"}],
                 "evidence": [{"id": "e1", "title": "Account", "description": "Observed information.",
@@ -205,6 +232,40 @@ def test_pdf_and_image_renders_do_not_read_the_blob(world):
         assert envelope(base, path)[0] == 200
     assert reads == []
     assert envelope(base, "/api/v1/artifacts/h1/render")[1]["kind"] == "html" and len(reads) == 1
+
+
+SCRIPTED_SVG = (b'<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><script>window.__x=1</script>'
+                b'<foreignObject><iframe src="http://evil.example"/></foreignObject>'
+                b'<image href="http://evil.example/p.png"/><use href="http://evil.example/s.svg#a"/>'
+                b'<style>@import url(http://evil.example/x.css);</style></svg>')
+
+
+def test_dashboard_report_preview_shows_safe_figure_images_through_the_real_sanitiser(world):
+    import re
+    base, store = world
+    store.outputs[("h1", "vfig")] = []
+    store.figure_assets = (("svg", "image/svg+xml", SCRIPTED_SVG), ("png", "image/png", b"\x89PNG\r\n\x1a\n"),
+                           ("html", "text/html", b"<script>alert(1)</script>"),
+                           ("blob", "application/octet-stream", b"\x00\x01"))
+    status, body, _ = envelope(base, "/api/v1/artifacts/h1/versions/vfig/preview/render")
+    assert status == 200 and body["kind"] == "html"
+    html = body["html"]
+    images = re.findall(r'<img[^>]*>', html)
+    assert len(images) == 2
+    for tag in images:
+        assert re.fullmatch(r'<img class="fig-img" alt="Figure (svg|png)" src="data:image/(svg\+xml|png);base64,[A-Za-z0-9+/=]+">', tag), tag
+    for needle in ("<svg", "<script", "onload", "evil.example", "javascript:", "window.__x", "<iframe", "foreignobject"):
+        assert needle not in html.lower(), needle
+    assert "cap html" in html and "cap blob" in html and "Download figure" in html
+
+
+def test_dashboard_report_preview_without_figure_assets_or_permission_embeds_nothing(world):
+    base, store = world
+    store.outputs[("h1", "vfig")] = []
+    store.figure_assets = ()
+    assert "<img" not in envelope(base, "/api/v1/artifacts/h1/versions/vfig/preview/render")[1]["html"]
+    store.figure_assets = (("svg", "image/svg+xml", SCRIPTED_SVG),)
+    assert get(base, "/api/v1/artifacts/h1/versions/vfig/preview/render", key="other-key")[0] == 404
 
 
 def test_preview_and_outputs_render_win_over_the_report_routes(world):

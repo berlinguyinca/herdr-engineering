@@ -27,7 +27,7 @@ Lab shares (``audience: lab``) add, only when the lab settings are complete (els
   generated ``/s/static/config.json`` -- a fixed allow-list read from ``static_dir`` with ``O_NOFOLLOW``, served with
   the strict ``VIEWER_CSP`` (no inline script or style) and no CORS.
 * ``POST /s/<token>/session`` (body-less; ``Authorization: Bearer <access>`` and ``X-Id-Token``, exactly one each) ->
-  ``share_lab.authorise`` against the share's allow-list, then a ``share_session`` HMAC session capped at the earliest of
+  ``share_lab.authorise`` against the share's allow-list, then a ``share_session`` AEAD session (identity and email encrypted inside) capped at the earliest of
   ``session_seconds``, the share's expiry and the access token's ``exp``. Rate-limited per share and globally. OPTIONS
   on it is the 404, so a cross-origin page cannot get a preflight for the ``Authorization`` header.
 * ``GET/HEAD/OPTIONS /s/<token>/k/<session>/f/<path>`` -> the session is checked against the share's CURRENT state on
@@ -120,6 +120,7 @@ from .share_render import (
     share_resolver,
     wrap_content,
 )
+from .share_rich_view import MAX_RICH_BYTES, RICH_NAME, SHARE_RICH_HEADERS
 from .share_session import (
     CLAIM_DOMAIN,
     MIN_SECRET_BYTES,
@@ -638,6 +639,9 @@ def _prepare(raw: dict) -> _Prepared:
         return bad("invalid_state")
     if entry not in index:
         return bad("invalid_state")
+    rich = raw.get("rich")
+    if "rich" in raw and (rich != RICH_NAME or rich not in index or rich == entry or index[rich]["size"] > MAX_RICH_BYTES):
+        return bad("invalid_state")       # the author page is one fixed, bounded, non-entry file or nothing
     shared_by = raw.get("shared_by")
     if "shared_by" in raw and (not isinstance(shared_by, str) or not shared_by or len(shared_by) > SHARED_BY_MAX):
         return bad("invalid_state")       # the banner name is ours to bound: a bad one fails closed like any bad state
@@ -751,6 +755,8 @@ def _send_headers(handler, status: int, headers, *, cors: bool = True, close: bo
     handler.send_header("Date", handler.date_time_string())
     for name, value in headers:
         handler.send_header(name, value)
+    if not any(name.lower() == "referrer-policy" for name, _ in headers):
+        handler.send_header("Referrer-Policy", "no-referrer")     # every response: the URL path may carry a session
     if cors:
         for name, value in CORS_HEADERS:
             handler.send_header(name, value)
@@ -1063,6 +1069,8 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
         if st.st_size != size:
             deny(handler, state, "size_mismatch", actor)
             return False
+        if name == state.get("rich"):
+            return _serve_rich(handler, state, item, fd, actor)
         etag = f'"{item["sha256"]}"'
         csp = sandbox_csp(getattr(handler.server, "public_origin", None), token)
         injected = None
@@ -1152,6 +1160,23 @@ def serve_bundle_file(handler, state: dict, rel_path: str, *, cors: bool = True,
 def _landing_tag(landing: bytes) -> str:
     """An ETag part for the landing bar: its bytes change with the viewer's state and the days left."""
     return LANDING_ETAG_SUFFIX + hashlib.sha256(landing).hexdigest()[:10]
+
+
+def _serve_rich(handler, state: dict, item: dict, fd: int, actor: str) -> bool:
+    """The opted-in author page of a report share: hash-verified, under the dashboard Rich view's no-script headers
+    (``share_rich_view.SHARE_RICH_HEADERS``: the dashboard's minus frame-ancestors / X-Frame-Options, which an
+    opaque-origin parent can never satisfy), never the bundle's permissive policy. No CORS, no ranges, no conditionals."""
+    data = _read_all(fd, item["size"])
+    if data is None or hashlib.sha256(data).hexdigest() != item["sha256"]:
+        deny(handler, state, "size_mismatch", actor)
+        return False
+    if _announces_body(handler):
+        handler.close_connection = True
+    _send_headers(handler, 200, [*SHARE_RICH_HEADERS, ("X-Robots-Tag", "noindex"), ("Content-Length", str(len(data)))],
+                  cors=False)
+    if handler.command != "HEAD":
+        _write_body(handler, data)
+    return True
 
 
 def _serve_with_link(handler, state: dict, name: str, item: dict, body: bytes, csp: str, *, cors: bool,
@@ -1550,6 +1575,8 @@ class ShareHandler(BaseHTTPRequestHandler):
         actor = got["identity"]
         if origin is None or name is None or item is None:
             return deny(self, state, "not_in_bundle" if origin is not None else "invalid_state", actor)
+        if name == state.get("rich"):
+            return deny(self, state, "not_in_mode", actor)     # the author page is framed from the preview, never annotated
         kind = render_kind(name)
         if kind == "html" and mode == "live":
             return deny(self, state, "not_in_mode", actor)
@@ -1740,12 +1767,13 @@ class ShareHandler(BaseHTTPRequestHandler):
                     return self._annotate_error(state, got, 400, "bad_file")
                 annotation_id = "ann_" + secrets.token_urlsafe(16)
                 record = {"v": 1, "op": "create", "annotation_id": annotation_id, "share_id": share_id,
-                          "author_identity": identity, "author_email": got["email"], "at": at, "anchor": anchor,
+                          "author_identity": identity, "author_email": got["email"], "basis": got["basis"], "at": at,
+                          "anchor": anchor,
                           "body": comment}
             else:
                 verb = parts[7]
                 record = {"v": 1, "op": verb, "annotation_id": annotation_id, "share_id": share_id,
-                          "author_identity": identity, "at": at}
+                          "author_identity": identity, "author_email": got["email"], "basis": got["basis"], "at": at}
                 if verb == "edit":
                     record["body"] = parse_edit_request(raw, max_chars=max_chars)
                 else:
@@ -1868,6 +1896,9 @@ class ShareHandler(BaseHTTPRequestHandler):
             session = mint_session(lab.secret, share_id, grant["identity"], exp_int, email=grant["email"], basis=grant["basis"])
         except ValueError:
             return deny(self, state, "bad_identity", grant["identity"])
+        except RuntimeError:
+            log.error("cryptography missing for lab sessions: no session can be minted")    # no secrets in the message
+            return deny(self, state, "session_unavailable", grant["identity"])
         entry = state["entry"]
         kind = "f" if content_type_for(entry).split(";")[0].strip() == "text/html" else "v"
         landing = f"/s/{token}/k/{session}/{kind}/{quote(entry, safe='/')}"

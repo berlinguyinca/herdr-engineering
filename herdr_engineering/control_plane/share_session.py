@@ -1,10 +1,13 @@
-"""Stateless lab-share sessions: an HMAC path segment binding (share id, verified identity, expiry).
+"""Stateless lab-share sessions: an AEAD path segment binding (share id, verified identity, email, basis, expiry).
 
-A session is ``<b64url(identity)>.<b64url(email)>.<basis>.<exp>.<b64url(mac)>`` where ``mac = HMAC-SHA256(secret, domain
-tag || len-prefixed share_id || identity || email || basis || exp)``. ``basis`` is how the viewer was admitted: ``e`` (their
-email is on the share's allow-list) or ``g`` (a group claim); it is MAC'd, so a viewer cannot upgrade it. It is a bearer secret for one verified identity (and the verified
-email it signed in with) on one share until ``exp`` (exclusive); the
-server keeps no session state, so revoking the share (its ``state.json``) is what ends every live session at once.
+A session is ``<basis>.<exp>.<b64url(nonce || ciphertext || tag)>`` (version 5). The ciphertext is ChaCha20-Poly1305 over a
+fixed-size block holding the verified identity and the verified email (padded, so the length reveals neither), under a key
+derived from the signing secret with its own label. The associated data is the version label, the share id, the basis and the
+expiry, so none of them can be changed or moved to another share. Nothing user-derived appears in the clear: a URL that
+leaks (history, Referer, a pasted link) discloses neither address nor user name. The tag is verified BEFORE anything is
+parsed, and every failure (malformed, tampered, truncated, wrong share, old format, expired) is the same ``None``.
+``basis`` is how the viewer was admitted: ``e`` (email on the allow-list) or ``g`` (group claim); ``exp`` is exclusive. The
+server keeps no session state, so revoking the share (its ``state.json``) ends every live session at once.
 Only the URL-safe alphabet and ``.`` appear, so a session never contains ``/`` and is safe as one path segment.
 """
 from __future__ import annotations
@@ -14,23 +17,28 @@ import binascii
 import hashlib
 import hmac
 import math
+import os
 import re
 
-_DOMAIN = b"herdr-share-session-v3"
+_VERSION = b"herdr-share-session-v5"
+_KEY_LABEL = b"herdr-share-session-aead-key-v5"
+_DOMAIN = _VERSION                    # the lab-session domain (the default)
 CLAIM_DOMAIN = b"herdr-claim-v1"      # the public link's verified-visitor cookie: never valid as a lab session, nor back
 LAB_DOMAIN = _DOMAIN
+_CLAIM_KEY_LABEL = b"herdr-claim-aead-key-v1"
+_KEY_LABELS = {LAB_DOMAIN: _KEY_LABEL, CLAIM_DOMAIN: _CLAIM_KEY_LABEL}   # each domain has its own derived key
 BASES = ("e", "g")
 _CSRF_DOMAIN = b"herdr-annotate-csrf-v1"
 MIN_SECRET_BYTES = 32
 MAX_IDENTITY = 128
 MAX_EMAIL = 254
 MAX_SESSION = 768
+_NONCE = 12
+_PLAIN = 1 + MAX_IDENTITY + 1 + MAX_EMAIL            # idlen, identity (padded), emaillen, email (padded)
+_BLOB_B64 = (( _NONCE + _PLAIN + 16) * 4 + 2) // 3    # unpadded base64 length of nonce || ciphertext || tag
 _IDENTITY_RE = re.compile(rf"[\x21-\x7e]{{1,{MAX_IDENTITY}}}")       # printable ASCII, no space
 _EMAIL_RE = re.compile(rf"[\x21-\x7e]{{3,{MAX_EMAIL}}}")             # printable ASCII, no space
-_ID_B64_MAX = 4 * MAX_IDENTITY // 3 + 4
-_EMAIL_B64_MAX = 4 * MAX_EMAIL // 3 + 4
-_SESSION_RE = re.compile(rf"([A-Za-z0-9_-]{{2,{_ID_B64_MAX}}})\.([A-Za-z0-9_-]{{4,{_EMAIL_B64_MAX}}})\."
-                         rf"([eg])\.([1-9][0-9]{{0,11}})\.([A-Za-z0-9_-]{{43}})")
+_SESSION_RE = re.compile(rf"([eg])\.([1-9][0-9]{{0,11}})\.([A-Za-z0-9_-]{{{_BLOB_B64}}})")
 
 
 def _b64(data: bytes) -> str:
@@ -46,11 +54,20 @@ def _field(value: str) -> bytes:
     return len(raw).to_bytes(4, "big") + raw
 
 
-def _mac(secret: bytes, share_id: str, identity: str, email: str, basis: str, exp: int,
-         domain: bytes = _DOMAIN) -> bytes:
-    msg = (domain + b"\x00" + _field(share_id) + _field(identity) + _field(email) + _field(basis)
-           + _field(str(exp)))
-    return hmac.new(secret, msg, hashlib.sha256).digest()
+def _aead(secret: bytes, domain: bytes = _DOMAIN):
+    """The session cipher. ``cryptography`` is imported here, not at module level, so this module (``MIN_SECRET_BYTES``,
+    the CSRF and cookie helpers) and everything that imports it load on a host without the package."""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    except ImportError as exc:
+        raise RuntimeError("lab-share sessions need the 'cryptography' package (pip install 'herdr-engineering[share]')") from exc
+    return ChaCha20Poly1305(hmac.new(secret, _KEY_LABELS[domain], hashlib.sha256).digest())
+
+
+def _ad(share_id: str, basis: str, exp: int, domain: bytes = _DOMAIN) -> bytes:
+    """Associated data. For the lab domain this is exactly the version label; the claim domain has its own label AND its own
+    key, so a claim cookie never decrypts as a lab session and a lab session never as a claim cookie."""
+    return domain + b"\x00" + _field(share_id) + _field(basis) + _field(str(exp))
 
 
 def mint_session(secret: bytes, share_id: str, identity: str, exp: float, *, email: str, basis: str,
@@ -73,14 +90,18 @@ def mint_session(secret: bytes, share_id: str, identity: str, exp: float, *, ema
     exp_int = int(math.floor(exp))
     if exp_int < 1 or exp_int >= 10 ** 12:
         raise ValueError("bad expiry")
-    mac = _mac(secret, share_id, identity, email, basis, exp_int, domain)
-    return f"{_b64(identity.encode('ascii'))}.{_b64(email.encode('ascii'))}.{basis}.{exp_int}.{_b64(mac)}"
+    ident, mail = identity.encode("ascii"), email.encode("ascii")
+    plain = (bytes([len(ident)]) + ident.ljust(MAX_IDENTITY, b"\x00")
+             + bytes([len(mail)]) + mail.ljust(MAX_EMAIL, b"\x00"))
+    nonce = os.urandom(_NONCE)
+    blob = nonce + _aead(secret, domain).encrypt(nonce, plain, _ad(share_id, basis, exp_int, domain))
+    return f"{basis}.{exp_int}.{_b64(blob)}"
 
 
 def check_session(secret: bytes, share_id: str, session: str, now: float, domain: bytes = _DOMAIN) -> dict | None:
     """``{"identity", "exp", "email", "basis"}`` when ``session`` was minted with ``secret`` for ``share_id`` in ``domain`` and ``now < exp``; else None.
 
-    Never raises: malformed, oversize, tampered, truncated, expired or other-share sessions are all None.
+    Never raises, and every failure is the same None: the tag is checked before anything inside is parsed.
     """
     try:
         if (not isinstance(secret, bytes) or len(secret) < MIN_SECRET_BYTES or not isinstance(share_id, str)
@@ -89,21 +110,26 @@ def check_session(secret: bytes, share_id: str, session: str, now: float, domain
         match = _SESSION_RE.fullmatch(session)
         if match is None:
             return None
-        id_part, email_part, basis, exp_part, mac_part = match.groups()
+        basis, exp_part, blob_part = match.groups()
         try:
-            identity = _unb64(id_part).decode("ascii")
-            email = _unb64(email_part).decode("ascii")
-            given = _unb64(mac_part)
+            blob = _unb64(blob_part)
         except (binascii.Error, ValueError):
             return None
-        if not _IDENTITY_RE.fullmatch(identity) or _b64(identity.encode("ascii")) != id_part:
+        if _b64(blob) != blob_part:
             return None      # one canonical encoding only
-        if not _EMAIL_RE.fullmatch(email) or _b64(email.encode("ascii")) != email_part:
-            return None
-        if _b64(given) != mac_part:
-            return None
         exp = int(exp_part)
-        if not hmac.compare_digest(given, _mac(secret, share_id, identity, email, basis, exp, domain)):
+        cipher = _aead(secret, domain)          # a missing package raises RuntimeError: caught below, so every check fails closed
+        try:
+            plain = cipher.decrypt(blob[:_NONCE], blob[_NONCE:], _ad(share_id, basis, exp, domain))
+        except Exception:               # noqa: BLE001 - InvalidTag, or any malformed input: one uniform answer
+            return None
+        n = plain[0]
+        m = plain[1 + MAX_IDENTITY]
+        if n > MAX_IDENTITY or m > MAX_EMAIL:
+            return None
+        identity = plain[1:1 + n].decode("ascii")
+        email = plain[2 + MAX_IDENTITY:2 + MAX_IDENTITY + m].decode("ascii")
+        if not _IDENTITY_RE.fullmatch(identity) or not _EMAIL_RE.fullmatch(email):
             return None
         if not isinstance(now, (int, float)) or not now < exp:
             return None

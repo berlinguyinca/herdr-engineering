@@ -47,11 +47,15 @@ from .work_graph_service import handle as work_graph_handle
 
 log = logging.getLogger(__name__)
 
+
+class TombstoneUnavailable(Exception):
+    """The tombstone cache could not be refreshed within its staleness window: the request answers the fixed 503."""
+
 # Routes a host-side tool (session run, plannotator bridge) may POST with the
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
 # The per-host worker that runs full /summary reports where the session records live (ingest role).
-_HOST_REPORT = re.compile(r"^/api/v1/host/summary-reports/(?:claim|result|publish)$")
+_HOST_REPORT = re.compile(r"^/api/v1/host/(?:summary-reports/(?:claim|result|publish)|build-cache/report)$")
 # Terminal broker, host side: the relay's output POST (per-host token like the fleet routes, never an API key).
 _HOST_TERMINAL_OUT = re.compile(r"^/api/v1/host/terminal/[^/]+/output$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
@@ -309,7 +313,7 @@ class ControlPlaneServer:
                  request_workers=128, request_queue=256, single_operator=False,
                  assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
-                 scheduler_admission=False, scheduler_limits=None, skill_registry=None,
+                 scheduler_admission=False, scheduler_limits=None, skill_registry=None, build_cache=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None, library=None,
                  library_viewers=None, member_directory=None,
@@ -498,6 +502,9 @@ class ControlPlaneServer:
         self.skills, self.skill_transfer = build_skill_registry(
             skill_registry, artifact_store=artifact_store, rustfs=rustfs, acl=artifact_acl,
             record_event=repo.record_event)
+        # control_plane.build_cache (flag off by default: nothing is constructed and the routes answer 404).
+        from .build_cache_routes import build_build_cache
+        self.build_cache = build_build_cache(build_cache, record_event=repo.record_event)
         from .handoffs import HandoffRegistry
         self.handoffs = handoff_registry or HandoffRegistry(repo)
         from .scheduler_service import SchedulerService
@@ -1620,6 +1627,8 @@ class ControlPlaneServer:
             caps.append("unified_workspace_v1")
         if getattr(self, "skills", None) is not None:
             caps.append("skill_registry_v1")
+        if getattr(self, "build_cache", None) is not None:
+            caps.append("build_cache_v1")
         try:
             if self.deployment_definitions.status()["configured"]:
                 caps.append("deployments_v1")     # the read-only Deployments page
@@ -1754,6 +1763,7 @@ class ControlPlaneServer:
                 try:
                     collab.sweep_team_roles()
                     collab.sweep_coordinators()
+                    collab.sweep_direct()
                     interval = collab.team_roles_cfg()["sweep_interval_seconds"]
                 except Exception as exc:                        # noqa: BLE001 - a sweep failure must never stop the loop
                     log.warning("team roles sweep failed: %s", type(exc).__name__)
@@ -2102,8 +2112,12 @@ def _make_handler(server, public=False, operator=False):
             if server.artifact_store is None or not artifact_id:
                 return False
             if permission == "read":
-                return server.tombstone_cache.contains(
-                    artifact_id, lambda: self._artifact_call("tombstoned_ids"))
+                try:
+                    return server.tombstone_cache.contains(
+                        artifact_id, lambda: self._artifact_call("tombstoned_ids"))
+                except Exception as exc:        # noqa: BLE001 - fail closed: no fresh answer, nothing is served
+                    log.exception("tombstone cache unavailable")
+                    raise TombstoneUnavailable() from exc
             return self._artifact_call("lifecycle_of", artifact_id) == "tombstoned"
 
         def _artifact_allowed(self, artifact_id, permission, *, operator_member=True):
@@ -2126,6 +2140,17 @@ def _make_handler(server, public=False, operator=False):
             return bool(permission != "read" and server.artifact_store is not None
                         and artifact_id and self._artifact_call(
                 "report_permission", artifact_id, self._resource_principal(), permission, **extra))
+
+        def _registry_read_ok(self, artifact_id):
+            """Principal check for registry-backed reads when no in-memory ACL exists (embedded/test setups).
+
+            With an ``ArtifactAcl`` the ACL already decided (production: unchanged, True here). Without one but with a
+            registry store, the registry's ``report_permission`` decides; a caller it refuses gets the same plain 404 as a
+            missing id."""
+            if server.artifact_store is None or server.artifact_acl is not None:
+                return True
+            return bool(artifact_id and self._artifact_call(
+                "report_permission", artifact_id, self._resource_principal(), "read"))
 
         def _artifact_acl_allows(self, artifact_id, permission):
             principal = self._resource_principal()
@@ -2422,6 +2447,9 @@ def _make_handler(server, public=False, operator=False):
             self._request_cause = None
             try:
                 return dispatch()
+            except TombstoneUnavailable as exc:
+                self._request_cause = type(exc).__name__
+                return self._json({"error": "artifact store unavailable"}, 503)
             except Exception as exc:
                 # A client closing while we write a dependency error must not
                 # replace the already-recorded reason that the request failed.
@@ -3162,6 +3190,9 @@ def _make_handler(server, public=False, operator=False):
                 from .skill_routes import route_skills
                 if route_skills(self, server, parts, resource):
                     return None
+                from .build_cache_routes import route_build_cache
+                if route_build_cache(self, server, parts, resource):
+                    return None
                 if self.command == "GET":
                     return self._api_get(parts, resource)
                 return self._api_post(parts, resource)
@@ -3193,6 +3224,9 @@ def _make_handler(server, public=False, operator=False):
             except ArtifactError as exc:
                 return self._send_json(404 if str(exc).startswith("no artifact") else 400,
                                        {"error": str(exc)})
+            except TombstoneUnavailable as exc:
+                self._request_cause = type(exc).__name__
+                return self._send_json(503, {"error": "artifact store unavailable"})
             except RuntimeError as exc:
                 self._request_cause = type(exc).__name__
                 if resource == 'events':
@@ -3508,7 +3542,7 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"handoffs": server.handoffs.list(state=_q(self.path, "state"))})
             if resource == "scheduler":
                 if len(parts) == 4:
-                    return self._json(server.scheduler.overview())
+                    return self._json({**server.scheduler.overview(), "admission_enabled": server.scheduler_admission})
                 if parts[4:] == ["queue"]:
                     return self._json({"queue": server.scheduler.overview()["queue"]})
                 return self._json({"error": "not found"}, 404)
@@ -3712,8 +3746,8 @@ def _make_handler(server, public=False, operator=False):
                         {"error": "not found"}, 404)
                 return self._etag_json({"hosts": r.list_hosts()})
             if resource == "activity":
-                evs = [_redact_event(e) for e in r.recent_events(
-                    limit=_qint(self.path, "limit", 50))]
+                evs = [_redact_event(e) for e in r.recent_events(limit=_qint(self.path, "limit", 50))
+                       if self._sse_readable(e)]        # artifact events only for callers who may read that artifact
                 return self._json({"events": evs})
             if resource == "analytics":
                 kind = parts[4]
@@ -3751,6 +3785,10 @@ def _make_handler(server, public=False, operator=False):
                     if not etype or not eid:
                         return self._json(
                             {"error": "entity_type and entity_id required"}, 400)
+                    if etype == "artifact" and not (self._artifact_allowed(eid, "read") and self._registry_read_ok(eid)):
+                        # An id the caller may not read answers exactly as one that does not exist: the lookup runs
+                        # against an id no artifact can have (never NUL: Postgres text cannot hold it).
+                        eid = "artifact_unreadable_by_caller"
                     query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
                     if "limit" in query or "before" in query:
                         try:
@@ -3768,6 +3806,8 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({**page, "events": [_redact_event(event) for event in page["events"]]})
                     return self._json({"events": [_redact_event(event) for event in r.stream(etype, eid)]})
             if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
+                if not self._registry_read_ok(parts[4]):
+                    return self._json({"error": "not found"}, 404)
                 a, data = self._artifact_current_file(parts[4])
                 if data is None or a is None:
                     return self._json({"error": "not found"}, 404)
@@ -3826,6 +3866,10 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(version) if version else self._json({"error": "not found"}, 404)
             if resource == "artifacts" and server.artifact_review_manager is not None:
                 if len(parts) == 6 and parts[5] == "reviews":
+                    # without an ACL the registry decides (like the versions routes); with one, the blanket guard above already did
+                    # (legacy uploads have no registry row). No answer reveals that the artifact exists
+                    if not self._registry_read_ok(parts[4]):
+                        return self._json({"error": "not found"}, 404)
                     return self._json({"artifact_id": parts[4],
                                        "reviews": server.artifact_review_manager.list_for_artifact(parts[4])})
             if resource == 'artifacts' and len(parts) == 6 and r.get_artifact(parts[4]):
@@ -3839,7 +3883,8 @@ def _make_handler(server, public=False, operator=False):
                            else server.artifact_job_manager.get(parts[4]))
                     if job is None:
                         return self._json({'error': 'not found'}, 404)
-                    if not self._artifact_allowed(job['artifact_id'], 'read'):
+                    if (not self._artifact_allowed(job['artifact_id'], 'read')
+                            or not self._registry_read_ok(job['artifact_id'])):
                         return self._json({'error': 'not found'}, 404)
                     server.artifact_job_manager.load([job])
                     if job.get("profile") == "report" and server.artifact_store is not None:
@@ -3850,17 +3895,20 @@ def _make_handler(server, public=False, operator=False):
             if resource == "artifact-reviews" and server.artifact_review_manager is not None:
                 if len(parts) == 5:
                     review = server.artifact_review_manager.get(parts[4])
-                    if review and not self._artifact_allowed(review['artifact_id'], 'read'):
+                    if review and (not self._artifact_allowed(review['artifact_id'], 'read')
+                                   or not self._registry_read_ok(review['artifact_id'])):
                         return self._json({'error': 'not found'}, 404)
                     return self._json(review) if review else self._json({"error": "not found"}, 404)
             if resource == "publications" and server.publication_controller is not None:
                 if len(parts) == 4:
                     publications = [p for p in server.publication_controller.list()
-                                    if self._artifact_allowed(p['resource_id'], 'read')]
+                                    if self._artifact_allowed(p['resource_id'], 'read')
+                                    and self._registry_read_ok(p['resource_id'])]
                     return self._json({"publications": publications})
                 if len(parts) == 5:
                     publication = server.publication_controller.get(parts[4])
-                    if publication and not self._artifact_allowed(publication['resource_id'], 'read'):
+                    if publication and (not self._artifact_allowed(publication['resource_id'], 'read')
+                                        or not self._registry_read_ok(publication['resource_id'])):
                         return self._json({'error': 'not found'}, 404)
                     return self._json(publication) if publication else self._json({"error": "not found"}, 404)
             if resource == "leases":
@@ -4236,8 +4284,8 @@ def _make_handler(server, public=False, operator=False):
                             return self._json({"error": "host not found"}, 404)
                         updated = r.set_host_policy(host["host_id"], mode=body.get("mode"),
                                                     expected_revision=body.get("expected_revision"),
-                                                    allow_tags=body.get("allow_tags", ()),
-                                                    deny_tags=body.get("deny_tags", ()),
+                                                    allow_tags=body.get("allow_tags"),
+                                                    deny_tags=body.get("deny_tags"),
                                                     reason=body.get("reason"))
                         return self._json(updated)
                 except KeyError:
@@ -4447,7 +4495,8 @@ def _make_handler(server, public=False, operator=False):
                     r.upsert_custom_model(body.get("name"), body.get("base_url"),
                                           body.get("upstream_model"), body.get("project"),
                                           fabric_model=body.get("fabric_model"),
-                                          context_window=body.get("context_window", 8192))
+                                          context_window=body.get("context_window", 8192),
+                                          fallback_models=body.get("fallback_models"))
                     return self._json({"ok": True})
                 if what == "models" and len(parts) == 7 and parts[6] == "delete":
                     r.delete_custom_model(parts[5])
@@ -5762,6 +5811,16 @@ def _make_handler(server, public=False, operator=False):
             return self._json(r.get_artifact(aid))
 
         # ------------------------------------------------------------ SSE
+        def _sse_readable(self, event) -> bool:
+            """Artifact events reach only subscribers who may read that artifact (same rule as the per-entity stream)."""
+            if not isinstance(event, dict) or event.get("entity_type") != "artifact":
+                return True
+            try:
+                artifact_id = event.get("entity_id")
+                return bool(self._artifact_allowed(artifact_id, "read") and self._registry_read_ok(artifact_id))
+            except Exception:       # noqa: BLE001 - fail closed: an unanswerable check shows nothing
+                return False
+
         def _sse(self):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -5782,29 +5841,43 @@ def _make_handler(server, public=False, operator=False):
                 self.wfile.flush()
                 # replay recent history so a fresh client catches up (Spec §52)
                 for ev in reversed(server.repo.recent_events(limit=100)):
-                    self.wfile.write(_sse_frame(ev))
-                    self.wfile.flush()
-                started = time.monotonic()
-                # Bounded lifetime frees threads held by half-open clients;
-                # EventSource reconnects and replays.
-                while time.monotonic() - started < _MAX_SSE_SECONDS:
-                    try:
-                        ev = q.get(timeout=_SSE_IDLE_SECONDS)
-                    except queue.Empty:
-                        if q not in server._subscribers:
-                            break  # dropped as a slow subscriber: close so the client reconnects
-                        # A data frame (not an SSE comment, which EventSource never surfaces)
-                        # keeps proxies from timing out AND tells the UI the stream is alive on
-                        # a quiet fleet; the client filters it out like StreamConnected.
-                        self.wfile.write(_sse_frame({
-                            "event_type": "StreamKeepalive",
-                            "entity_type": "stream", "entity_id": "control-plane",
-                            "sequence": 0, "payload": {},
-                        }))
-                        self.wfile.flush()
+                    if not self._sse_readable(ev):
                         continue
                     self.wfile.write(_sse_frame(ev))
                     self.wfile.flush()
+                started = time.monotonic()
+                last_write = started       # keepalives run on the wall clock from the last WRITE: a skipped event is no write
+                # Bounded lifetime frees threads held by half-open clients;
+                # EventSource reconnects and replays.
+                while time.monotonic() - started < _MAX_SSE_SECONDS:
+                    wait = _SSE_IDLE_SECONDS - (time.monotonic() - last_write)
+                    ev = None
+                    if wait > 0:
+                        try:
+                            ev = q.get(timeout=wait)
+                        except queue.Empty:
+                            ev = None
+                    if ev is not None:
+                        if not self._sse_readable(ev):
+                            continue
+                        self.wfile.write(_sse_frame(ev))
+                        self.wfile.flush()
+                        last_write = time.monotonic()
+                        continue
+                    if time.monotonic() - last_write < _SSE_IDLE_SECONDS:
+                        continue
+                    if q not in server._subscribers:
+                        break  # dropped as a slow subscriber: close so the client reconnects
+                    # A data frame (not an SSE comment, which EventSource never surfaces)
+                    # keeps proxies from timing out AND tells the UI the stream is alive on
+                    # a quiet fleet; the client filters it out like StreamConnected.
+                    self.wfile.write(_sse_frame({
+                        "event_type": "StreamKeepalive",
+                        "entity_type": "stream", "entity_id": "control-plane",
+                        "sequence": 0, "payload": {},
+                    }))
+                    self.wfile.flush()
+                    last_write = time.monotonic()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             finally:

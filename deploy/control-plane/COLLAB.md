@@ -125,7 +125,7 @@ edge (nginx, the share host's own server: /s/ only) -> herdr-share-public:8083 (
 - Certificate: the edge presents ONE certificate for both hosts (`/etc/acme`); `collab-sync.sh` is unchanged and
   still manages one lineage. Before enabling shares, add the share host to the existing lineage once, on the
   certbot host, with the same DNS-01 plugin and flags the lineage was created with:
-  `certbot certonly --cert-name localdev.mcp.metabolomics.us --expand -d localdev.mcp.metabolomics.us -d <share host>`
+  `certbot certonly --cert-name localdev.mcp.metabolomics.us --expand -d localdev.mcp.metabolomics.us -d mcp.local.metabolomics.us -d artifacts.local.metabolomics.us -d <share host>`
   (every name the lineage already has must be repeated). Renewals then cover both names. The router and SNI front
   must also send the share host's name to the edge's port.
 - Edge limits (trade-off): `/s/` allows 100 requests/s per client address with a burst of 300 (parquet range
@@ -402,10 +402,12 @@ grant of the artifact).
 
 ## Verify
 
+The MCP URL is `https://mcp.local.metabolomics.us`. `localdev.mcp.metabolomics.us` is a deprecated alias the edge serves on the same server block during the overlap (the certbot lineage keeps that name).
+
 ```
-curl -s https://localdev.mcp.metabolomics.us/api/v1/collab/config        # 200
-curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/collab/rooms   # 401
-curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/hosts          # 404
+curl -s https://mcp.local.metabolomics.us/api/v1/collab/config        # 200
+curl -s -o /dev/null -w '%{http_code}' https://mcp.local.metabolomics.us/api/v1/collab/rooms   # 401
+curl -s -o /dev/null -w '%{http_code}' https://mcp.local.metabolomics.us/api/v1/hosts          # 404
 curl -s http://<tailnet-ip>:9482/api/v1/collab/config                    # operator block present
-curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/s/unknown/           # 404 (the MCP host serves no /s/)
+curl -s -o /dev/null -w '%{http_code}' https://mcp.local.metabolomics.us/s/unknown/           # 404 (the MCP host serves no /s/)
 ```

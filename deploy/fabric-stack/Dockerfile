@@ -12,7 +12,8 @@
 #
 # Build context = repository root:
 #   docker build -f deploy/fabric-stack/Dockerfile .
-FROM python:3.12-slim
+ARG RUNTIME_BASE=python:3.12-slim
+FROM ${RUNTIME_BASE}
 
 # Optional build stamp surfaced by /api/v1/health (commit=). Passed via
 # `docker compose build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD)`;
@@ -30,7 +31,7 @@ WORKDIR /app
 # Install the package (no dev deps). [build-system] is setuptools.
 COPY pyproject.toml README.md LICENSE ./
 COPY herdr_engineering/ ./herdr_engineering/
-RUN pip install --no-cache-dir ".[collab,review-gate]"
+RUN pip install --no-cache-dir ".[collab,review-gate,share]"
 
 # Build-free frontend assets (ES modules + Web Components, no bundler). Copied
 # into the image so the control-plane web is self-contained; serve via

@@ -47,9 +47,10 @@ class TombstoneCache:
     """The registry's tombstoned artifact ids, for request paths that must not query the store per row.
 
     Refreshed at most every ``ttl`` seconds and immediately on every delete/restore this process performs (``add`` /
-    ``invalidate``); another process's delete is visible within ``ttl``. If the store cannot be asked, the last known
-    set stays in force, and before the first successful load the failure propagates (the caller answers the fixed 503,
-    so nothing is served unchecked)."""
+    ``invalidate``); another process's delete is visible within ``ttl``. It fails closed: if the store cannot be
+    asked, the last known set stays in force only while it is younger than ``ttl`` (and not invalidated); past that,
+    and before the first successful load, the failure propagates (the caller answers the fixed 503, so nothing is
+    served from a stale "not tombstoned")."""
 
     def __init__(self, ttl: float = 5.0, clock=time.monotonic) -> None:
         self._ttl, self._clock = ttl, clock
@@ -64,9 +65,9 @@ class TombstoneCache:
             if self._ids is None or self._dirty or now - self._loaded > self._ttl:
                 try:
                     self._ids, self._loaded, self._dirty = frozenset(load()), now, False
-                except Exception:                       # noqa: BLE001 - keep the last answer, try again next call
+                except Exception:                       # noqa: BLE001 - tolerated only inside the staleness window
                     _LOG.exception("tombstone cache refresh failed")
-                    if self._ids is None:
+                    if self._ids is None or self._dirty or now - self._loaded > self._ttl:
                         raise
             return artifact_id in self._ids
 

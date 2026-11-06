@@ -514,7 +514,7 @@ async def handle_publish(ctx: IntentContext, intent: Intent) -> dict:
 
 
 async def _publish(ctx: IntentContext, intent: Intent, who: _Who) -> dict:
-    from .artifact_member_quota import QuotaExceeded, check_publish, settle
+    from .artifact_member_quota import QuotaExceeded, _lock_usage, check_publish, settle
     from .artifacts import ArtifactConflict, ArtifactError
     from .collab_intents import REASON_MAX, REASON_UPLOAD_NOT_FOUND, UploadRefused
     aid, payload = intent.artifact_id, intent.payload
@@ -563,6 +563,7 @@ async def _publish(ctx: IntentContext, intent: Intent, who: _Who) -> dict:
     if payload.entry is not None:
         provenance["entry"] = payload.entry
     async with ctx.conn.transaction():                          # stage 3: recheck, commit and settle together
+        await _lock_usage(ctx.conn, who.principal)              # usage row BEFORE the artifact row, as purge does
         row = await ctx.conn.fetchrow("SELECT lifecycle FROM artifacts WHERE artifact_id=$1 FOR UPDATE", aid)
         if row is None or row["lifecycle"] != "active":
             return _rejected("deleted")

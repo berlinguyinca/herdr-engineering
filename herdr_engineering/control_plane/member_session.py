@@ -1,11 +1,11 @@
 """Stateless member-web sessions: an HMAC bearer binding one verified user id to an expiry.
 
 ``<b64url(identity)>.<exp>.<b64url(mac)>`` with ``mac = HMAC-SHA256(secret, domain || len-prefixed scope || identity ||
-exp)``.  The domain tag (``herdr-member-session-v1``) and the fixed scope ``member`` are MAC'd, and the shape (three
-parts, no email or basis) differs from a share session's five, so neither kind validates as the other whatever the
-secret: a member session is refused by ``share_session.check_session`` and the reverse.  The session is sent as
+exp)``.  The domain tag (``herdr-member-session-v1``) and the fixed scope ``member`` are MAC'd, and the two kinds differ in shape and key use: a share session is
+``<basis>.<exp>.<AEAD blob>`` (ChaCha20-Poly1305, a single ``e``/``g`` first), so neither kind validates as the other
+whatever the secret: a member session is refused by ``share_session.check_session`` and the reverse.  The session is sent as
 ``Authorization: Member <session>``; the server keeps no session state, so the per-request re-check of the user's
-approval (done by the web layer) is what ends access.  ``share_session`` is deliberately left untouched.
+approval (done by the web layer) is what ends access.  ``share_session`` is a separate format.
 """
 from __future__ import annotations
 

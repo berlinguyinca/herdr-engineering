@@ -72,6 +72,9 @@ from .service_catalog import (
 #: Hard bound on one durable deployment write made under a store lock (seconds).
 DEPLOYMENT_DURABLE_WRITE_TIMEOUT_S = 10
 
+# build_cache events arrive per build on every host; keep a bounded recent window
+# per host stream (older ones stay in the durable sink). Trimmed at 2x to amortise.
+BUILD_CACHE_STREAM_MAX = 500
 _CI_EVENT_KINDS = frozenset({"ci_report", "ci_observation", "ci_telemetry", "ci_logtests"})
 
 _STAGES = {
@@ -186,6 +189,8 @@ class _BootPhases:
         self._log.info("boot %s: %s took %.1fs (total %.1fs)", self._name, phase, now - self._last, now - self._start)
         self._last = now
 
+
+_CONTAINER_ID = re.compile(r"[0-9a-f]{12}|[0-9a-f]{64}")
 
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
@@ -1132,8 +1137,14 @@ class ControlPlaneRepo:
                 base["inventory"] = _copy(rec["inventory"])
         return merged
 
+    @staticmethod
+    def _is_container_id(host):
+        """A docker container id (12 or 64 hex digits) that never reported a tailnet address: a container, not a machine."""
+        return bool(_CONTAINER_ID.fullmatch(str(host.get("host_name") or host.get("host_id") or ""))) and not host.get("tailnet_ip")
+
     def list_hosts(self):
-        hosts = [self._with_problems(h) for h in self._merged_hosts().values()]
+        """Machines only: container ids with no tailnet address are kept in the store but never listed."""
+        hosts = [self._with_problems(h) for h in self._merged_hosts().values() if not self._is_container_id(h)]
         return _sort_by(hosts, "host_name")
 
     def host_snapshot(self, host_id):
@@ -1172,7 +1183,7 @@ class ControlPlaneRepo:
             ),
         )
 
-    def set_host_policy(self, host_id, *, mode, expected_revision, allow_tags=(), deny_tags=(), reason=None):
+    def set_host_policy(self, host_id, *, mode, expected_revision, allow_tags=None, deny_tags=None, reason=None):
         """Update scheduler policy with optimistic concurrency and an audit event."""
         with self.scheduler_admission():
             return self._set_host_policy(host_id, mode=mode, expected_revision=expected_revision,
@@ -1189,8 +1200,10 @@ class ControlPlaneRepo:
         next_policy = {
             "mode": mode.value,
             "revision": int(current.get("revision", 0)) + 1,
-            "allow_tags": sorted({str(v).strip().lower() for v in allow_tags if str(v).strip()}),
-            "deny_tags": sorted({str(v).strip().lower() for v in deny_tags if str(v).strip()}),
+            "allow_tags": sorted({str(v).strip().lower() for v in (
+                current.get("allow_tags", ()) if allow_tags is None else allow_tags) if str(v).strip()}),
+            "deny_tags": sorted({str(v).strip().lower() for v in (
+                current.get("deny_tags", ()) if deny_tags is None else deny_tags) if str(v).strip()}),
             "reason": str(reason)[:300] if reason else None,
         }
         self.record_event("host", host_id, "HostPolicyChanged", next_policy, require_durable=True)
@@ -2885,6 +2898,11 @@ class ControlPlaneRepo:
                     self._event_order.append((entity_type, entity_id, seq))
             if self._durable_history is not None and entity_type in {'service','session'}:
                 stream[:] = stream[-1:]
+            if entity_type == "build_cache" and len(stream) > 2 * BUILD_CACHE_STREAM_MAX:
+                cutoff = stream[-BUILD_CACHE_STREAM_MAX]["sequence"]
+                del stream[:-BUILD_CACHE_STREAM_MAX]
+                self._event_order = [t for t in self._event_order
+                                     if not (t[0] == entity_type and t[1] == entity_id and t[2] < cutoff)]
             if self._sink is not None and not require_durable:
                 try:
                     self._sink.record(ev)
@@ -3447,23 +3465,34 @@ class ControlPlaneRepo:
         return [{k: v for k, v in key.items() if k != "key_hash"}
                 for key in self._llm_keys()]
 
-    def upsert_custom_model(self, name, base_url, upstream_model=None, project=None, *,
-                            fabric_model=None, context_window=8192):
-        if not name or not base_url:
-            raise ValueError("name and base_url are required")
-        if not str(base_url).startswith(("http://", "https://")):
+    def upsert_custom_model(self, name, base_url=None, upstream_model=None, project=None, *,
+                            fabric_model=None, context_window=8192, fallback_models=None):
+        """``base_url`` is the optional private service; ``fallback_models`` are fnmatch patterns of gateway models used
+        instead when the advertised ``fabric_model`` is not ready. One of the two must exist."""
+        if fallback_models is not None:
+            if (not isinstance(fallback_models, list) or not 1 <= len(fallback_models) <= 8
+                    or any(not isinstance(p, str) or not p or len(p) > 128 or not p.isprintable()
+                           or any(c.isspace() for c in p) for p in fallback_models)):
+                raise ValueError("fallback_models must be one to eight gateway model patterns without whitespace")
+        if not name or not (base_url or fallback_models):
+            raise ValueError("name and a base_url or fallback_models are required")
+        if base_url and not str(base_url).startswith(("http://", "https://")):
             raise ValueError("base_url must be http(s)")
-        payload = {"name": name, "base_url": base_url.rstrip("/"),
-                   "upstream_model": upstream_model or name, "project": project,
-                   "deleted": False}
+        payload = {"name": name, "upstream_model": upstream_model or name, "project": project, "deleted": False}
+        if base_url:
+            payload["base_url"] = base_url.rstrip("/")
         if fabric_model is not None:
             if (not isinstance(fabric_model, str) or not fabric_model
                     or len(fabric_model) > 256 or not fabric_model.isprintable()
                     or any(c.isspace() for c in fabric_model)):
                 raise ValueError("fabric_model must be a bounded model identity without whitespace")
+            payload["fabric_model"] = fabric_model
+        if fabric_model is not None or fallback_models:
             if type(context_window) is not int or not 1 <= context_window <= 1048576:
                 raise ValueError("context_window must be an integer between 1 and 1048576")
-            payload.update(fabric_model=fabric_model, context_window=context_window)
+            payload["context_window"] = context_window
+        if fallback_models:
+            payload["fallback_models"] = list(fallback_models)
         return self.record_event("custom_model", name, "custom_model.upserted", payload)
 
     def delete_custom_model(self, name):
