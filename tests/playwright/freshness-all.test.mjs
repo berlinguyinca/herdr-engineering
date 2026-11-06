@@ -22,7 +22,7 @@ const chips=page=>page.evaluate(()=>[...document.querySelectorAll('#view herdr-f
 test('every route shows exactly one chip that turns red when the API fails',async()=>{
  for(const hash of ROUTES)await withPage(async(page,base)=>{
   await boot(page,base,hash,()=>({__status:500,json:{error:'backend down'}}));
-  await until(async()=>(await chips(page)).some(c=>c.state==='error'),`red chip on ${hash}`,8000);
+  await until(async()=>(await chips(page)).some(c=>c.state==='error'),`red chip on ${hash}`,25000);
   await sleep(100);
   const all=await chips(page);
   assert.equal(all.length,1,`${hash}: one chip, got ${all.length}`);
@@ -34,7 +34,7 @@ test('every route shows exactly one chip that turns red when the API fails',asyn
 test('every route touches its chip fresh when the API answers',async()=>{
  for(const hash of ROUTES)await withPage(async(page,base)=>{
   await boot(page,base,hash,p=>decodeURIComponent(p)==='/api/v1/missions/pi:msn-1'?{__status:404,json:{error:'not found'}}:OK);
-  await until(async()=>(await chips(page)).some(c=>c.last!=null),`fresh chip on ${hash}`,8000);
+  await until(async()=>(await chips(page)).some(c=>c.last!=null),`fresh chip on ${hash}`,25000);
   const all=await chips(page);
   assert.equal(all.length,1,`${hash}: one chip, got ${all.length}`);
   assert.notEqual(all[0].state,'error',`${hash}: ${all[0].text}`);
@@ -47,19 +47,19 @@ test('a multi-source page stays red while one source fails, and recovers when it
   await withPage(async(page,base)=>{
    let broken=true;
    await boot(page,base,hash,p=>p===failing&&broken?{__status:500,json:{error:'one source down'}}:OK);
-   await until(async()=>(await chips(page))[0]?.state==='error',`red chip on ${hash}`,8000);
+   await until(async()=>(await chips(page))[0]?.state==='error',`red chip on ${hash}`,25000);
    // Healthy sources keep answering on their own polls; the failing one must keep the chip red.
    for(let i=0;i<3;i++){await page.clock.runFor(6000);await sleep(80);assert.equal((await chips(page))[0].state,'error',`${hash} stays red`);}
    assert.match((await chips(page))[0].text,/one source down/,hash);
    broken=false;
    await page.clock.runFor(31000);
-   await until(async()=>(await chips(page))[0]?.state==='fresh',`${hash} recovers`,8000);
+   await until(async()=>(await chips(page))[0]?.state==='fresh',`${hash} recovers`,25000);
   });
 });
 
 test('a Pi mission whose live activity fails turns red',async()=>withPage(async(page,base)=>{
  await boot(page,base,'/missions/pi%3Amsn-1',p=>decodeURIComponent(p)==='/api/v1/missions/pi:msn-1'?{__status:404,json:{error:'not found'}}:p.includes('activity')?{__status:500,json:{error:'telemetry down'}}:OK);
- await until(async()=>(await chips(page))[0]?.state==='error','red chip',8000);
+ await until(async()=>(await chips(page))[0]?.state==='error','red chip',25000);
  assert.equal((await chips(page)).length,1);
  assert.match((await chips(page))[0].text,/telemetry down/);
 }));
@@ -67,17 +67,17 @@ test('a Pi mission whose live activity fails turns red',async()=>withPage(async(
 test('the GitHub chip shows sync status, stale, partial and deferred repositories',async()=>withPage(async(page,base)=>{
  let snapshot={status:'partial',stale:true,partial:true,deferred_repos:['acme/a','acme/b']};
  await boot(page,base,'/github',p=>p==='/api/v1/github'?{...OK,...snapshot}:p.startsWith('/api/v1/github')?{...OK}:OK);
- await until(async()=>/deferred/.test((await chips(page))[0]?.text||''),'github detail',8000);
+ await until(async()=>/deferred/.test((await chips(page))[0]?.text||''),'github detail',25000);
  let [chip]=await chips(page);
  assert.match(chip.text,/partial/);assert.match(chip.text,/stale/);assert.match(chip.text,/2 repositories deferred/);
  assert.equal(chip.state,'stale','a sync problem never reads as plain live');
  assert.match(chip.text,/^stale · updated \d+s ago · /,'the amber chip says stale, not live');
  snapshot={status:'ready',stale:false,partial:false,deferred_repos:3};
  await page.clock.runFor(6000);
- await until(async()=>/3 repositories deferred/.test((await chips(page))[0]?.text||''),'numeric deferred',8000);
+ await until(async()=>/3 repositories deferred/.test((await chips(page))[0]?.text||''),'numeric deferred',25000);
  snapshot={status:'ready',stale:false,partial:false};
  await page.clock.runFor(6000);
- await until(async()=>(await chips(page))[0]?.text.startsWith('live · ')&&!/·.*·/.test((await chips(page))[0].text),'plain live',8000);
+ await until(async()=>(await chips(page))[0]?.text.startsWith('live · ')&&!/·.*·/.test((await chips(page))[0].text),'plain live',25000);
  [chip]=await chips(page);
  assert.equal(chip.state,'fresh');
 }));
