@@ -58,13 +58,18 @@ def cw(http_world):
     return w
 
 
-def coordinator(w, owner="alice", team=TEAM, actions=("read", "post", "execute", "coordinate"), grant=True):
-    """An agent (fabric bit on, machine bender) and, when ``grant``, the owner's ``coordinate`` grant for ``team``."""
+ALL_ROLES = ["implementer", "issue_writer", "reviewer", "tester"]
+
+
+def coordinator(w, owner="alice", team=TEAM, actions=("read", "post", "execute", "coordinate"), grant=True, roles=None):
+    """An agent (fabric bit on, machine bender) and, when ``grant``, the owner's ``coordinate`` grant for ``team`` with the role
+    allow-list ``roles`` (every team role by default)."""
     pr = getattr(w, owner)
     info = w.s.connect_agent(pr, {"harness_type": "claude-code", "machine": "bender"})
     w.s.set_agent_fabric(pr, info["agent_id"], {"fabric": True})
     if grant:
-        out = w.s.grant_agent(w.alice, w.room, {"agent_id": info["agent_id"], "actions": list(actions), "team_id": team})
+        out = w.s.grant_agent(w.alice, w.room, {"agent_id": info["agent_id"], "actions": list(actions), "team_id": team,
+                                                   "roles": list(ALL_ROLES if roles is None else roles)})
         assert out["status"] == "granted", out
     return info
 
@@ -105,7 +110,8 @@ def test_owner_grants_and_revokes_coordinate(cw):
     assert "coordinate" in w.s.agent_rooms(pr)["rooms"][0]["actions"]
     w.s.grant_agent(w.alice, w.room, {"agent_id": info["agent_id"], "actions": ["read", "post", "execute"]})   # revoke by narrowing
     assert "coordinate" not in w.s.agent_rooms(pr)["rooms"][0]["actions"]
-    w.s.grant_agent(w.alice, w.room, {"agent_id": info["agent_id"], "actions": ["read", "post", "execute", "coordinate"], "team_id": TEAM})
+    w.s.grant_agent(w.alice, w.room, {"agent_id": info["agent_id"], "actions": ["read", "post", "execute", "coordinate"], "team_id": TEAM,
+                                       "roles": ALL_ROLES})
     assert "coordinate" in w.s.agent_rooms(pr)["rooms"][0]["actions"]
     w.s.remove_agent_from_room(w.alice, w.room, info["agent_id"])                                             # and by removal
     assert w.s.agent_rooms(pr) == {"rooms": []}
@@ -264,13 +270,58 @@ def test_cross_team_is_403_with_an_audit_event(cw):
     assert s == 409, b
 
 
-def test_role_not_on_the_allow_list_is_403(cw):
+def test_a_role_not_on_the_coordinators_list_is_exactly_403_and_audited(cw):
     w = cw
-    info = coordinator(w)
+    info = coordinator(w, roles=["implementer"])
     root = root_task(w, info)
-    s, b = make(w, info, "credential", target_role="janitor", parent_task_id=root)
-    assert s in (400, 403), b
-    assert len([e for e in w.s._log if e["event_type"] == "task_created" and e["payload"].get("origin") == "coordinator"]) == 0
+    n = len(denials(w))
+    s, b = make(w, info, "credential", target_role="reviewer", parent_task_id=root)         # a real team role, not on the list
+    assert s == 403 and b["code"] == "coordinator_role_not_allowed", b
+    assert "coordinator_role_not_allowed" in denials(w)[n:][-1]["reason"]
+    assert not [e for e in w.s._log if e["event_type"] == "task_created" and e["payload"].get("origin") == "coordinator"]
+
+
+def test_a_role_on_the_coordinators_list_is_201(cw):
+    w = cw
+    info = coordinator(w, roles=["implementer"])
+    root = root_task(w, info)
+    s, b = make(w, info, "credential", target_role="implementer", parent_task_id=root)
+    assert s == 201, b
+
+
+def test_the_role_list_is_what_the_view_reports(cw):
+    w = cw
+    info = coordinator(w, roles=["tester", "implementer"])
+    pr = w.s.authenticate(f"Agent {info['credential']}", info["device_id"])
+    assert w.s.coordination_view(pr, w.room)["limits"]["roles"] == ["implementer", "tester"]
+
+
+def test_a_coordinate_grant_needs_a_non_empty_list_of_real_team_roles(cw):
+    w = cw
+    info = w.s.connect_agent(w.alice, {"harness_type": "claude-code"})
+    base = {"agent_id": info["agent_id"], "actions": ["read", "coordinate"], "team_id": TEAM}
+    assert code(w.s.grant_agent, w.alice, w.room, base) == 400                                  # no roles at all
+    for bad in ([], "implementer", ["janitor"], ["implementer", 3], ["implementer", "implementer"], [None]):
+        assert code(w.s.grant_agent, w.alice, w.room, {**base, "roles": bad}) == 400, bad
+    assert code(w.s.grant_agent, w.alice, w.room, {"agent_id": info["agent_id"], "actions": ["read"], "roles": ["tester"]}) == 400
+    assert w.s.grant_agent(w.alice, w.room, {**base, "roles": ["tester"]})["status"] == "granted"
+
+
+def test_a_regrant_replaces_the_list_and_revoke_and_detach_clear_it(cw):
+    w = cw
+    info = coordinator(w, roles=["implementer"])
+    aid = info["agent_id"]
+    grant = lambda: w.s._rooms[w.room]["grants"][aid]                                           # noqa: E731
+    assert grant()["coordinate_roles"] == ["implementer"]
+    w.s.grant_agent(w.alice, w.room, {"agent_id": aid, "actions": ["read", "post", "execute", "coordinate"], "team_id": TEAM,
+                                      "roles": ["reviewer", "tester"]})
+    assert grant()["coordinate_roles"] == ["reviewer", "tester"]
+    w.s.grant_agent(w.alice, w.room, {"agent_id": aid, "actions": ["read", "post", "execute"]})
+    assert "coordinate_roles" not in grant() and "coordinate_team" not in grant()
+    w.s.grant_agent(w.alice, w.room, {"agent_id": aid, "actions": ["read", "post", "execute", "coordinate"], "team_id": TEAM,
+                                      "roles": ["tester"]})
+    w.s.detach_team(w.alice, w.room, TEAM)
+    assert "coordinate_roles" not in grant() and "coordinate_team" not in grant()
 
 
 def test_lease_and_policy_are_rejected(cw):
@@ -313,7 +364,8 @@ def test_revoking_coordinate_stops_creation_and_detaching_the_team_ends_it(cw):
     assert make(w, info, "credential", target_role="implementer", parent_task_id=root)[0] == 201
     w.s.grant_agent(w.alice, w.room, {"agent_id": info["agent_id"], "actions": ["read", "post", "execute"]})
     assert make(w, info, "credential", target_role="implementer", parent_task_id=root)[0] == 403
-    w.s.grant_agent(w.alice, w.room, {"agent_id": info["agent_id"], "actions": ["read", "post", "execute", "coordinate"], "team_id": TEAM})
+    w.s.grant_agent(w.alice, w.room, {"agent_id": info["agent_id"], "actions": ["read", "post", "execute", "coordinate"], "team_id": TEAM,
+                                       "roles": ALL_ROLES})
     root = root_task(w, info)                                       # a re-grant starts afresh: the old root task predates it
     assert make(w, info, "credential", target_role="implementer", parent_task_id=root)[0] == 201
     w.s.detach_team(w.alice, w.room, TEAM)
@@ -324,14 +376,105 @@ def test_revoking_coordinate_stops_creation_and_detaching_the_team_ends_it(cw):
     assert make(w, info, "credential", target_role="implementer", parent_task_id=root)[0] == 403   # not revived by re-attaching
 
 
-def test_the_grant_survives_a_restart_from_the_log(cw):
+def restarted(w, rows=None):
+    """A second service that only replays the durable log, with the same flags: nothing is carried over from the first."""
+    fresh = CollabService(w.s.auth, now=w.s._now)
+    fresh.team_rooms, fresh.team_roles, fresh.coordinators = w.s.team_rooms, w.s.team_roles, w.s.coordinators
+    fresh.work_graph_handle = None
+    fresh.fabric_trust, fresh.fabric_resolver = w.s.fabric_trust, w.s.fabric_resolver
+    fresh.hydrate(list(w.s._log) if rows is None else rows)
+    return fresh
+
+
+def test_the_grant_and_its_roles_survive_a_real_restart_and_still_gate_creation(cw):
+    w = cw
+    info = coordinator(w, roles=["implementer"])
+    root = root_task(w, info)
+    events = [e for e in w.s._log if e["event_type"] == "agent_granted" and e["payload"]["agent_id"] == info["agent_id"]]
+    assert events[-1]["payload"]["coordinate_team"] == TEAM and events[-1]["payload"]["coordinate_roles"] == ["implementer"]
+    fresh = restarted(w)
+    g = fresh._rooms[w.room]["grants"][info["agent_id"]]
+    assert g["coordinate_team"] == TEAM and g["coordinate_roles"] == ["implementer"]
+    pr = fresh.authenticate(f"Agent {info['credential']}", info["device_id"])
+    with pytest.raises(CollabError) as e:                                                      # off the list, after replay
+        fresh.create_task(pr, w.room, {"target_role": "reviewer", "text": "x", "parent_task_id": root})
+    assert e.value.status == 403
+    assert fresh.create_task(pr, w.room, {"target_role": "implementer", "text": "x", "parent_task_id": root})["routed_to"]
+
+
+def test_an_old_grant_event_without_roles_replays_as_an_empty_list_and_fails_closed(cw):
     w = cw
     info = coordinator(w)
-    events = [e for e in w.s._log if e["event_type"] == "agent_granted" and e["payload"]["agent_id"] == info["agent_id"]]
-    assert events[-1]["payload"]["coordinate_team"] == TEAM
-    fresh = CollabService(w.s.auth, now=w.s._now)
-    fresh.hydrate(list(w.s._log))
-    assert fresh._rooms[w.room]["grants"][info["agent_id"]]["coordinate_team"] == TEAM
+    root = root_task(w, info)
+    rows = []
+    for e in w.s._log:
+        e = {**e, "payload": dict(e["payload"])}
+        if e["event_type"] == "agent_granted":
+            e["payload"].pop("coordinate_roles", None)                                         # as written before the roles existed
+        rows.append(e)
+    fresh = restarted(w, rows)
+    assert fresh._rooms[w.room]["grants"][info["agent_id"]]["coordinate_roles"] == []
+    pr = fresh.authenticate(f"Agent {info['credential']}", info["device_id"])
+    for role in ALL_ROLES:
+        with pytest.raises(CollabError) as e:
+            fresh.create_task(pr, w.room, {"target_role": role, "text": "x", "parent_task_id": root})
+        assert e.value.status == 403
+
+
+def test_revoking_coordinate_makes_the_sweep_cancel_the_coordinators_open_tasks(cw):
+    w = cw
+    info = coordinator(w)
+    root = root_task(w, info)
+    made = [make(w, info, "credential", target_role="implementer", parent_task_id=root, text=f"j{i}")[1]["task_id"] for i in range(2)]
+    assert w.s.sweep_coordinators()["cancelled"] == 0                                           # still authorised: nothing to do
+    w.s.grant_agent(w.alice, w.room, {"agent_id": info["agent_id"], "actions": ["read", "post", "execute"]})   # revoke
+    out = w.s.sweep_coordinators()
+    assert out["cancelled"] == 2
+    assert {w.s._task_status(w.s._tasks[t]) for t in made} == {"cancelled"}
+    assert w.s.sweep_coordinators()["cancelled"] == 0                                           # idempotent
+
+
+def test_a_helper_cannot_be_granted_coordinate_and_does_not_list_it(cw):
+    w = cw
+    w.mallory.admin = True
+    w.s.set_room_profile(w.alice, w.room, {"allowed_families": ["claude-code"]})
+    parent = coordinator(w, actions=("read", "post", "spawn_helpers", "coordinate"))
+    ppr = w.s.authenticate(f"Agent {parent['credential']}", parent["device_id"])
+    h = w.s.request_helper(ppr, {"room_id": w.room, "role": "reviewer", "task": "look at it"})
+    c = w.s.claim_helper(w.mallory, h["helper_id"])
+    granted = [e for e in w.s._log if e["event_type"] == "agent_granted" and e["payload"]["agent_id"] == c["helper_agent_id"]]
+    assert granted and "coordinate" not in granted[-1]["payload"]["actions"]
+    assert code(w.s.grant_agent, w.alice, w.room, {"agent_id": c["helper_agent_id"], "actions": ["read", "coordinate"], "team_id": TEAM,
+                                                   "roles": ["tester"]}) == 400
+
+
+def test_granted_coordinator_refusals_are_audited_under_its_own_identity(cw):
+    w = cw
+    info = coordinator(w)
+    n = len(denials(w))
+    s, _ = req(w, "POST", f"{BASE}/rooms/{w.room}/agents", headers=cred(info),
+               body={"agent_id": info["agent_id"], "actions": ["read"]})
+    assert s == 403
+    new = denials(w)[n:]
+    assert new and new[-1]["actor_agent_id"] == info["agent_id"] and "agent_principal" in new[-1]["reason"]
+
+
+def test_a_granted_coordinator_counts_as_an_assistant_in_the_chain_guards(cw):
+    w = cw
+    # asst is a designated coordinator in room 2 (assistant-kind) and an ordinary instructing agent in room 1
+    asst = w.s.connect_agent(w.alice, {"harness_type": "claude-code"})
+    team3 = "team-" + "e" * 20
+    w.s.attach_team(w.alice, w.room2, team3, {"roles": {"implementer": [w.s.connect_agent(w.alice, {})["agent_id"]]}})
+    w.s.set_team_coordinator(w.alice, w.room2, team3, {"holder": "agent:" + asst["agent_id"]})
+    assert w.s.grant_agent(w.alice, w.room, {"agent_id": asst["agent_id"], "actions": ["read", "post", "execute", "instruct"]})["status"] == "granted"
+    g = coordinator(w)
+    root = w.s.create_task(w.alice, w.room, {"target_agent_id": asst["agent_id"], "text": "start"})["task_id"]
+    assert req(w, "POST", f"{BASE}/rooms/{w.room}/agent/tasks/{root}/respond", headers=cred(asst), body={"status": "accepted"})[0] == 200
+    s, b = make(w, asst, "credential", target_agent_id=g["agent_id"], parent_task_id=root)
+    assert s == 400 and b["code"] == "coordination_loop", b
+    assert w.s._tc_is_coordinator_agent(g["agent_id"])
+    w.s.grant_agent(w.alice, w.room, {"agent_id": g["agent_id"], "actions": ["read", "post", "execute"]})   # once revoked, it is plain
+    assert not w.s._tc_is_coordinator_agent(g["agent_id"])
 
 
 # ------------------------------------------------------------------ regressions

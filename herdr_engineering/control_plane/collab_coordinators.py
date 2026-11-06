@@ -203,6 +203,7 @@ class CoordinatorsMixin:
             if g.get("coordinate_team") == team_id:
                 g["actions"] = [a for a in g["actions"] if a != "coordinate"]
                 g.pop("coordinate_team", None)
+                g.pop("coordinate_roles", None)
 
     def _tc_recount(self) -> dict:
         """Designations and opt-ins that can still emit a revocation (pre-paid, see ``REVOCABLE_CREATE``)."""
@@ -257,13 +258,19 @@ class CoordinatorsMixin:
         m = self._member(room, key[5:])
         return bool(opt and opt["enabled"] and m and m["role"] == "guest" and self._ok(key[5:]))
 
+    def _tc_granted_agents(self) -> set[str]:
+        """Agents holding the owner's ``coordinate`` grant for a team right now (a detach or a revoke removes the marker)."""
+        return {"agent:" + aid for room in self._rooms.values() for aid, g in room["grants"].items() if g.get("coordinate_team")}
+
     def _tc_is_coordinator_agent(self, agent_id: str) -> bool:
-        return any(h == "agent:" + agent_id for (_, h) in self._tc_by_holder)
+        return (any(h == "agent:" + agent_id for (_, h) in self._tc_by_holder)
+                or "agent:" + agent_id in self._tc_granted_agents())
 
     def _tc_assistants(self) -> set[str]:
         """Assistant-kind agents, derived from the log and never from a label the client sent (``harness_type`` is free text):
         every designated coordinator agent, in any room, and every agent an assistant runtime claimed."""
         out = {h for (_, h) in self._tc_by_holder if h.startswith("agent:")}
+        out |= self._tc_granted_agents()                       # slice 4: an agent granted `coordinate` fans out by role too
         out |= {"agent:" + r["agent_id"] for r in self._assistant_runtimes.values() if r.get("agent_id")}
         return out
 
@@ -273,7 +280,11 @@ class CoordinatorsMixin:
         from .collab_team_rooms import TEAM_ROLE_ACTIONS
         cfg = self.coordinators_cfg()
         if ident["kind"] == "operator":
-            return {"roles": sorted(TEAM_ROLE_ACTIONS), "tasks_per_hour": cfg["tasks_per_hour"], "max_open": cfg["max_open"],
+            roles = sorted(TEAM_ROLE_ACTIONS)
+            if ident.get("grant"):          # slice 4: exactly the owner's list for this agent; none recorded means none allowed
+                g = (self._rooms.get(ident["room_id"]) or {}).get("grants", {}).get(ident["key"][6:]) or {}
+                roles = sorted(r for r in g.get("coordinate_roles") or [] if r in TEAM_ROLE_ACTIONS)
+            return {"roles": roles, "tasks_per_hour": cfg["tasks_per_hour"], "max_open": cfg["max_open"],
                     "max_depth": MAX_TASK_DEPTH, "max_items_per_request": None}
         ceil = cfg["external"]
         have = (self._tc_ext.get((ident["room_id"], ident["team_id"])) or {}).get("limits") or {}

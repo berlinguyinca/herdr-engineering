@@ -57,6 +57,18 @@ A coordinator agent may create tasks BY ROLE within its own attached team, using
 read other rooms. Results flow back: assignee `respond done` -> task result readable by the creator and the owner; dashboard
 shows the task and escalation unchanged. The bender Claude session is registered as its own agent (`bender-coordinator`).
 
+Implementation notes (slice 4 hardening after review):
+- The grant must carry `roles`: a non-empty list of team roles (subset of `TEAM_ROLE_ACTIONS`). It is stored in the `agent_granted`
+  event (`coordinate_roles`) and is the coordinator's exact role allow-list. A grant without `roles` is 400. Re-granting replaces
+  the list; revoke or detach clears it. An old event without `roles` replays as an EMPTY list (fail closed: owner must re-grant).
+- It needs a person-given root task (`parent_task_id`, accepted by the agent) and the `execute` action on the agent.
+- It works only while `team_rooms`, `team_roles` and `coordinators.enabled` are on and `kill_switch` is off. With the kill switch
+  on, tasks already created become creator-invalid.
+- Caps (`tasks_per_hour`, `max_open`, items) are per room/team/agent. The bound across rooms is the generic task throttle.
+- `instruct` plus `coordinate` agents lose direct `target_agent_id` assignment while the flag is on (coordinators assign by role).
+- Any owner re-grant resets `granted_seq`, so the coordinator needs a fresh root task.
+- A granted coordinator counts as assistant-kind in the chain/loop guards, like a designated coordinator.
+
 ### 3.5 CLI/config
 - `rooms ...` resolution order: `--token-env` token if set; else fabric agent mode if eligible; else error as today.
 - `relay join` likewise. YAML only, no env vars for config:
@@ -117,6 +129,8 @@ tries to grant `coordinate` -> 403; token path unchanged (regression).
 ## 6. Rollback
 `fabric_trust.enabled: false` or `kill_switch: true` -> every Fabric request is 401, nothing deleted, tokens and credentials
 unaffected. New events are additive and ignored by older images; revoke `coordinate`/`fabric` bits before an image rollback.
+An old image does not know `coordinate`: it treats a coordinator's open tasks as creator-invalid, and its sweep turns them into
+permanent cancellations. Revoke `coordinate` deliberately (and let the sweep run) before rolling the image back.
 
 ## 7. Open points for review
 - Which agent session names map to `HERDR_AGENT_ID` per harness (Claude/Pi/Codex/OpenCode) and how join.sh records `machine`.
