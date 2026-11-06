@@ -3,7 +3,7 @@
 // route, so the page stays inert even if this attribute were lost. The element is built by API with exactly this shape;
 // tests/control_plane/test_no_frames.py allows this file and nothing else, and pins the shape.
 
-export const RICH_NOTE = 'Scripts are disabled in this view; open the file for the interactive version';
+export const RICH_NOTE = 'Scripts are disabled in this view; download the HTML asset to run it';
 const RICH_ROUTE = /^(?:[a-z][a-z0-9+.-]*:\/\/[^/]+)?\/api\/v1\/artifacts\/[^/?#]+\/versions\/[^/?#]+\/rich$/i;
 
 /** True for a media type that is HTML (parameters ignored). */

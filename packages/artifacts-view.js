@@ -299,7 +299,7 @@ async function renderReportReader(container, client, id, artifact, versions, { v
       const options = versions.filter(version => version.version_id !== selected && version.is_report !== false).map(version => `<option value="${esc(version.version_id)}">v${esc(version.version_number)} · ${esc(version.version_id)}</option>`).join('');
       body.innerHTML = `<p class="hd-note" data-report-selected>Immutable version: <strong>${esc(selected)}</strong> · ${esc(report.state || 'No review state available')}</p>${descriptorHtml(descriptor)}${checkHtml(report.checks)}<section class="hd-card"><h2>Meaningful version differences</h2><label>Compare against<select class="hd-input" data-report-diff-base><option value="">Choose another version</option>${options}</select></label><button type="button" class="hd-btn" data-report-compare>Compare versions</button><div role="status" data-report-diff-result></div></section>${feedbackHtml(report)}<section class="hd-card"><h2>Lightweight preview</h2><p>The preview contains bounded report content. Supporting datasets are downloaded separately.</p><button type="button" class="hd-btn" data-report-preview>Load lightweight preview</button><div role="status" data-report-preview-result></div></section>${hasRichView(assets) ? richViewHtml() : ''}${assetHtml(assets)}`;
       const richPanel = body.querySelector('[data-rich-view]');
-      if (richPanel) wireRichView(richPanel, { url: client.artifactRichUrl(id, selected), liveUrl: client.artifactLiveUrl(id), title: `Rich view of ${selected}` });
+      if (richPanel) wireRichView(richPanel, { url: client.artifactRichUrl(id, selected), title: `Rich view of ${selected}` });
 
       // Delegation also covers feedback anchors appended by later pages.
       body.onclick = event => {

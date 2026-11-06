@@ -74,8 +74,8 @@ test('the author page renders, scripts do not run, and the frame cannot reach th
     assert.match(response.headers()['content-security-policy'], /^sandbox;/);
     assert.doesNotMatch(response.headers()['content-security-policy'], /allow-/);
     // the honest hint and the way out
-    await page.getByText('Scripts are disabled in this view; open the file for the interactive version').waitFor();
-    assert.match(await page.locator('[data-rich-open]').getAttribute('href'), /\/api\/v1\/artifacts\/report_1\/live$/);
+    await page.getByText('Scripts are disabled in this view; download the HTML asset to run it').waitFor();
+    assert.match(await page.locator('[data-rich-open]').getAttribute('href'), /\/api\/v1\/artifacts\/report_1\/versions\/version_2\/rich$/);
     // hiding removes the frame again
     await page.getByRole('button', { name: 'Hide rich view', exact: true }).click();
     assert.equal(await page.locator('iframe').count(), 0);
