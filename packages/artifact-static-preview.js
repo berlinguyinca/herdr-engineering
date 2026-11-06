@@ -4,7 +4,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 // event handlers are gone) and is placed inside an open shadow root under a paint-contained wrapper. PDFs are drawn on
 // canvases by the vendored pdf.js. The raw file is only reachable through the sandboxed live route in a new tab.
 
-export const STATIC_NOTE = 'Scripts, frames and embedded media are not shown in this static copy';
+export const STATIC_NOTE = 'Scripts, frames, audio and video are not shown in this static copy';
 export const PDF_FAILED = 'This PDF could not be drawn';
 const PDFJS_MODULE = '/vendor/pdfjs/pdf.min.mjs';
 const PDFJS_WORKER = '/vendor/pdfjs/pdf.worker.min.mjs';
