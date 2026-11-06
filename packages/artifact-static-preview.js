@@ -1,6 +1,6 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 
-// Dashboard previews without frames. Rendered foreign markup is the server's nh3 copy (scripts, frames, forms and
+// Dashboard previews without frames (the one exception, a sandboxed report page, lives in artifact-rich-view.js). Rendered foreign markup is the server's nh3 copy (scripts, frames, forms and
 // event handlers are gone) and is placed inside an open shadow root under a paint-contained wrapper. PDFs are drawn on
 // canvases by the vendored pdf.js. The raw file is only reachable through the sandboxed live route in a new tab.
 

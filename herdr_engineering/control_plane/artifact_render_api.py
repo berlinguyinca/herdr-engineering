@@ -5,6 +5,8 @@ Routes (``GET`` only; each needs the same read permission as ``/download`` / the
 * ``/api/v1/artifacts/{id}/render``: ``{"kind", "html", "too_large"}`` for the current file.
 * ``/api/v1/artifacts/{id}/versions/{vid}/outputs/{i}/render``: the same for a legacy report output.
 * ``/api/v1/artifacts/{id}/versions/{vid}/preview/render``: ``{"kind": "html", "html", "too_large"}`` for the report preview.
+* ``/api/v1/artifacts/{id}/versions/{vid}/rich``: the report's HTML asset under a no-script sandbox CSP, for a frame
+  (``artifact_rich_view``).
 * ``/api/v1/artifacts/{id}/live``: the raw bytes under a sandbox CSP, for a new tab (never framed).
 
 These paths must be tried BEFORE ``route_report``, which claims versioned ``preview`` and ``outputs`` paths of any depth.
@@ -243,11 +245,13 @@ def route_render(handler, server, parts, resource) -> bool:
         route = "output"
     elif count == 9 and parts[5] == "versions" and parts[7] == "preview" and parts[8] == "render":
         route = "preview"
+    elif count == 8 and parts[5] == "versions" and parts[7] == "rich":
+        route = "rich"
     else:
         return False
     handler._render_started = False
     artifact_id = parts[4]
-    versioned = route in ("output", "preview")
+    versioned = route in ("output", "preview", "rich")
     try:
         if not handler._artifact_allowed(artifact_id, "read") or (
                 versioned and (server.artifact_store is None or not _access(handler, artifact_id, "read"))):
@@ -272,6 +276,10 @@ def route_render(handler, server, parts, resource) -> bool:
             _send_render(handler, kind, data or b"", dashboard_resolver(), key)
             return True
         version_id = parts[6]
+        if route == "rich":
+            from .artifact_rich_view import serve_rich
+            serve_rich(handler, server, artifact_id, version_id)
+            return True
         if route == "preview":
             from .artifact_report_render import render_report_preview
             descriptor = (handler._artifact_call("get_report_descriptor", artifact_id, version_id)

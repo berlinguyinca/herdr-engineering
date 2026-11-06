@@ -176,6 +176,8 @@ uses `postMessage` between documents (the vendored pdf.js posts to its own worke
 (`tests/control_plane/test_no_frames.py`) scans the sources, checks every rendered response and runs the sanitiser on
 frame markup. The raw `f/` route and the owner `live` route serve an artifact's own bytes and are the only exceptions.
 
+**Amendment 2026-11-05 (report Rich view).** One deliberate exception in the owner dashboard: a report's own HTML page may be shown in a single `<iframe sandbox="">` (empty sandbox, no `allow-*` token, no `srcdoc`) whose `src` is the owner route `/api/v1/artifacts/{id}/versions/{vid}/rich`. That route answers with `Content-Security-Policy: sandbox; default-src 'none'; …; frame-ancestors 'self'`, so the page is inert even without the attribute. `/live` stays unframeable (`frame-ancestors 'none'`, `X-Frame-Options: DENY`). The share host has no such frame. `tests/control_plane/test_no_frames.py` allow-lists only `packages/artifact-rich-view.js` and pins that exact shape.
+
 * **Share host.** Share links live on their own host, `control_plane.share.public_url` (for example
   `https://artifacts.metabolomics.us`), served by `share-public`. The collaboration (MCP) host serves no `/s/`.
   Sessions, the CSRF token and the Cognito callback (`/s/callback`) belong to the share host.
