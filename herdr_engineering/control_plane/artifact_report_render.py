@@ -131,6 +131,14 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
             value = value[:limit] + " … [text shortened; see full descriptor]"
         return html.escape(value, quote=True)
 
+    def tracked(build: Callable, *args) -> tuple[str, bool]:
+        """Build one entry and report whether its own text was cut (so dropped entries never count)."""
+        nonlocal shortened
+        shortened = False
+        built = build(*args)
+        cut, shortened = shortened, False
+        return built, cut
+
     def esc_id(identifier: str) -> str:
         return html.escape(identifier, quote=True)
 
@@ -182,24 +190,33 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
             pairs.append((key, analysis[key]))
     for key in ("configuration", "source_hashes"):
         pairs.extend(_flatten(analysis.get(key, {}), key))
-    pair_items = [f'<dt>{text(key, 256)}</dt><dd>{text(value, 512)}</dd>' for key, value in pairs]
+    def pair(key: str, value: str) -> str:
+        return f'<dt>{text(key, 256)}</dt><dd>{text(value, 512)}</dd>'
+
+    def question(row: dict) -> str:
+        return (f'<li id="question-{esc_id(row["id"])}"><span class="chip">{text(row["id"], 128)}</span>'
+                f'<span>{text(row["text"])}</span></li>')
+
+    def list_item(value: str) -> str:
+        return f"<li>{text(value)}</li>"
+
+    pair_items = [tracked(pair, key, value) for key, value in pairs]
 
     # (anchor, title, label, items, weight, kind, item limit)
     sections = [
-        ("questions", "Questions", "questions",
-         [f'<li id="question-{esc_id(row["id"])}"><span class="chip">{text(row["id"], 128)}</span>'
-          f'<span>{text(row["text"])}</span></li>' for row in report["questions"]], 1, "qlist", None),
-        ("findings", "Findings", "findings", [finding(row) for row in report["findings"]], 4, "div", None),
-        ("figures", "Figures", "figures", [figure(row) for row in report["figures"]], 2, "div", None),
-        ("evidence", "Evidence", "evidence entries", [evidence_row(row) for row in report["evidence"]], 2,
+        ("questions", "Questions", "questions", [tracked(question, row) for row in report["questions"]], 1,
+         "qlist", None),
+        ("findings", "Findings", "findings", [tracked(finding, row) for row in report["findings"]], 4, "div", None),
+        ("figures", "Figures", "figures", [tracked(figure, row) for row in report["figures"]], 2, "div", None),
+        ("evidence", "Evidence", "evidence entries", [tracked(evidence_row, row) for row in report["evidence"]], 2,
          "table:Evidence|Description|Files", None),
-        ("downloads", "Separate downloads", "downloads", [asset_row(row) for row in report["assets"]], 2,
+        ("downloads", "Separate downloads", "downloads", [tracked(asset_row, row) for row in report["assets"]], 2,
          "table:Name|Role|Type|Size|SHA-256", None),
         ("analysis", "Analysis", "analysis entries", pair_items, 1, "dl", _ANALYSIS_PAIR_LIMIT),
         ("limitations", "Limitations", "limitations",
-         [f"<li>{text(value)}</li>" for value in report.get("limitations", [])], 1, "ul", None),
+         [tracked(list_item, value) for value in report.get("limitations", [])], 1, "ul", None),
         ("next-checks", "Next checks", "next checks",
-         [f"<li>{text(value)}</li>" for value in report.get("next_steps", [])], 1, "ul", None),
+         [tracked(list_item, value) for value in report.get("next_steps", [])], 1, "ul", None),
     ]
 
     def wrap(anchor: str, title: str, kind: str, body: str) -> str:
@@ -221,13 +238,11 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
         return ('<nav class="toc" aria-label="Contents">'
                 + "".join(f'<a href="#sec-{anchor}">{title}</a>' for anchor, title in anchors) + "</nav>")
 
-    def note(counts: list[tuple[str, int, int]], was_shortened: bool) -> str:
+    def note(counts: list[tuple[str, int, int]]) -> str:
         shown = ", ".join(f"{kept} of {total} {label}" for label, kept, total in counts if kept < total)
-        parts = ["Some content was omitted; see the <a href=\"report\">full descriptor</a>."]
+        parts = ["Some content was shortened or omitted; see the <a href=\"report\">full descriptor</a>."]
         if shown:
             parts.append(f"Shown: {shown}.")
-        if was_shortened:
-            parts.append("Some text was shortened.")
         return f'<aside class="notice" role="note">{" ".join(parts)}</aside>'
 
     present_sections = [(a, t, label, items) for a, t, label, items, *_ in sections if items]
@@ -235,7 +250,7 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
     title = ""
     title_shortened = False
     summary_html = f'<p class="lede">{text(report["summary"])}</p>' if report.get("summary") else ""
-    shortened_by_summary, shortened = shortened, False
+    summary_shortened, shortened = shortened, False
 
     def document(css: str, hero_summary: str, nav: str, body: str, footer: str) -> str:
         return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -247,7 +262,7 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
 
     # Reserve the largest possible contents list and omission note (every count is no wider than its
     # total). The title appears twice, so it is cut until the envelope fits even the smallest cap.
-    worst_note = note([(label, 0, len(items)) for _, _, label, items in present_sections], True)
+    worst_note = note([(label, 0, len(items)) for _, _, label, items in present_sections])
     nav_html = toc([(a, t) for a, t, *_ in present_sections])
     wrappers = sum(len(wrap(a, t, k, "").encode()) for a, t, _, _, _, k, _ in sections)
     for title_limit in (256, 128, 64, 32, 16, 8, 0):
@@ -268,22 +283,24 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
         remaining -= len(summary_html.encode())
     total_weight = sum(weight for _, _, _, items, weight, _, _ in sections if items)
     bodies, counts, kept_anchors = [], [], []
+    kept_shortened = False
     for anchor, title_text, label, items, weight, kind, limit in sections:
         if not items:
             continue
         quota = remaining * weight // total_weight
         selected, used = [], 0
-        for item in items:
+        for item, cut in items:
             size = len(item.encode())
             if used + size <= quota and (limit is None or len(selected) < limit):
                 selected.append(item)
                 used += size
+                kept_shortened = kept_shortened or cut
         bodies.append(wrap(anchor, title_text, kind, "".join(selected)))
         counts.append((label, len(selected), len(items)))
         kept_anchors.append((anchor, title_text))
-    omitted = summary_omitted or any(kept < total for _, kept, total in counts)
-    footer = note(counts, shortened or shortened_by_summary or summary_omitted or title_shortened) \
-        if omitted or shortened or shortened_by_summary or title_shortened else ""
+    left_out = (summary_omitted or summary_shortened or title_shortened or kept_shortened
+                or any(kept < total for _, kept, total in counts))
+    footer = note(counts) if left_out else ""
     result = document(css, summary_html, toc(kept_anchors), "".join(bodies), footer)
     present = set(re.findall(r' id="([^"]+)"', result))
     result = re.sub(r'href="#([^"]+)"',

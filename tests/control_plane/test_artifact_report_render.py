@@ -260,18 +260,37 @@ def test_byte_cap_respected_on_oversized_descriptor_and_valid_html_kept():
         assert not document.stack
 
 
-def test_omission_note_only_when_something_was_omitted():
-    assert "omitted" not in _render()
+def _note(page: str) -> str | None:
+    found = re.search(r'<aside class="notice" role="note">(.*?)</aside>', page)
+    return found.group(1) if found else None
+
+
+def test_note_is_present_exactly_when_something_was_omitted_or_shortened():
+    assert _note(_render()) is None  # nothing left out
+
+    omitted = descriptor()
+    omitted["findings"] = [dict(omitted["findings"][0], id=f"f{i}", statement="x " * 400) for i in range(100)]
+    note = _note(_render(omitted, max_bytes=8192))
+    assert note and "shortened or omitted" in note and 'href="report"' in note and "of 100 findings" in note
+
+    for field in ("summary", "limitations"):  # kept but cut short: still disclosed, nothing omitted
+        shortened = descriptor()
+        shortened[field] = "word " * 1000 if field == "summary" else ["word " * 1000]
+        note = _note(_render(shortened))
+        assert note and "shortened or omitted" in note
+        assert "Shown:" not in note
+
+
+def test_text_cut_only_inside_dropped_entries_adds_nothing_beyond_the_omission_counts():
     report = descriptor()
-    report["findings"] = [dict(report["findings"][0], id=f"f{i}", statement="x " * 400)
-                          for i in range(100)]
-    page = _render(report, max_bytes=8192)
-    assert "Some content was omitted" in page and 'href="report"' in page
-    assert "100 findings" in page
-    shortened = descriptor()
-    shortened["summary"] = "word " * 1000
-    note = _render(shortened)
-    assert "Some content was omitted" in note and "shortened" in note
+    # f0 is short and kept; the 99 long ones are dropped. Their cut text must not claim a kept entry was shortened.
+    report["findings"] = [dict(report["findings"][0], id="f0")] + [
+        dict(report["findings"][0], id=f"f{i}", statement="y" * 5000) for i in range(1, 100)]
+    page = _render(report, max_bytes=16384)
+    note = _note(page)
+    assert note and "of 100 findings" in note
+    assert "text shortened" not in page and "Some text was shortened" not in note
+    assert 'id="finding-f0"' in page
 
 
 def test_analysis_is_a_bounded_key_value_list():
@@ -281,7 +300,7 @@ def test_analysis_is_a_bounded_key_value_list():
     page = _render(report)
     assert "<details" in page and "<dl" in page
     assert "configuration.a_nested.baseline" in page
-    assert "Some content was omitted" in page
+    assert "shortened or omitted" in page
 
 
 def test_polished_preview_survives_the_real_share_sanitiser():
