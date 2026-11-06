@@ -440,6 +440,26 @@ if [ "$COLLAB" = 1 ]; then
   fi
 fi
 
+# Fabric-trust listener (SPEC 6a): only with the collab overlay AND control_plane.collab.fabric_trust.listen_* set.
+# The address was validated (tailnet range) by the config; docker publishes exactly that host:port.
+FABRIC=0
+if [ "$COLLAB" = 1 ]; then
+  if ! FABRIC_LISTEN="$(herdr_eng fleet config fabric-listener --path "$CENTRAL")"; then
+    echo "control_plane.collab.fabric_trust is invalid in $CENTRAL" >&2
+    exit 1
+  fi
+  if [ -n "$FABRIC_LISTEN" ]; then
+    FABRIC=1
+    read -r FABRIC_HOST FABRIC_PORT <<< "$FABRIC_LISTEN"
+    export HERDR_COLLAB_FABRIC_BIND="$FABRIC_HOST" HERDR_COLLAB_FABRIC_PORT="$FABRIC_PORT"
+    if [ "$DRY" = 1 ]; then export HERDR_COLLAB_FABRIC_WHOIS_DIR="$ENV_DIR/fabric-whois"
+    else export HERDR_COLLAB_FABRIC_WHOIS_DIR="$HOME/.local/share/herdr-engineering/collab-fabric-whois"; fi
+    COLLAB_FILES+=(-f "$WORK/deploy/control-plane/compose.collab-fabric.yaml")
+    EDGE_SERVICE=(fabric-whois "${EDGE_SERVICE[@]}")
+    echo "fabric-trust listener: $FABRIC_HOST:$FABRIC_PORT (whois sidecar fabric-whois)"
+  fi
+fi
+
 COMPOSE_FILES=(-f "$WORK/deploy/control-plane/compose.yaml" "${COLLAB_FILES[@]}")
 # Every service of ours that runs the herdr-engineering image and reads the fleet
 # config: rolled forward (and back) together on one tag.
@@ -682,6 +702,9 @@ compose_run() {
   local tree="$1" envf="$2" tag="$3" commit="$4"; shift 4
   local files=(-f "$tree/deploy/control-plane/compose.yaml")
   if [ "$COLLAB" = 1 ]; then files+=(-f "$tree/deploy/control-plane/compose.collab.yaml"); fi
+  if [ "$FABRIC" = 1 ] && [ -f "$tree/deploy/control-plane/compose.collab-fabric.yaml" ]; then
+    files+=(-f "$tree/deploy/control-plane/compose.collab-fabric.yaml")
+  fi
   if [ -n "$ROLLBACK_IMAGES" ]; then files+=(-f "$ROLLBACK_IMAGES"); fi
   # TRANSITION: a rollback to the release BEFORE the apps mount builds that release's compose.yaml, which still
   # requires HERDR_CP_GOOGLE_DIR (mounted at /etc/herdr/google:ro). Docker would create a missing bind source as
@@ -751,7 +774,7 @@ container_of() {
   case "$1" in
     control-plane-web) echo herdr-cp-web ;; control-plane-worker) echo herdr-cp-worker ;;
     llm-proxy) echo herdr-llm-proxy ;; collab-public) echo herdr-collab-public ;;
-    collab-edge) echo herdr-collab-edge ;; share-public) echo herdr-share-public ;; *) echo "$1" ;;
+    collab-edge) echo herdr-collab-edge ;; fabric-whois) echo herdr-collab-fabric-whois ;; share-public) echo herdr-share-public ;; *) echo "$1" ;;
   esac
 }
 services_settled() {
@@ -788,6 +811,13 @@ stop_share_public() {   # never fatal; plain docker, so it works whichever compo
   fi
 }
 
+stop_fabric_whois() {   # never fatal: the listener is not configured, so the sidecar a previous deploy started has no job
+  if docker inspect herdr-collab-fabric-whois >/dev/null 2>&1; then
+    docker stop herdr-collab-fabric-whois >/dev/null 2>&1 \
+      || echo "WARNING: could not stop herdr-collab-fabric-whois (fabric_trust.listen_* is not configured)" >&2
+  fi
+}
+
 forward() {
   install_private "$NEW_LLM" "$LLM_DIR/llm-config.json" || return 1
   # mount sources of web/worker (and share-public): created here, after the build, never before
@@ -806,6 +836,9 @@ forward() {
   if [ "$COLLAB" = 1 ]; then
     install_private "$NEW_COLLAB" "$COLLAB_CONFIG" || return 1
     mkdir -p "$HERDR_COLLAB_DATA_DIR" && chmod 700 "$HERDR_COLLAB_DATA_DIR" || return 1
+    if [ "$FABRIC" = 1 ]; then   # the sidecar's socket directory: created before either container mounts it
+      mkdir -p "$HERDR_COLLAB_FABRIC_WHOIS_DIR" && chmod 700 "$HERDR_COLLAB_FABRIC_WHOIS_DIR" || return 1
+    fi
     # keys + membership files, the edge certificate, the 1-minute timer and the cert renew
     # timer (pool, group and the invite provisioner's operator come from the slice; the
     # provisioner reads collab-public's log in the data dir it mounts). Runs BEFORE the new nginx.conf lands, so
@@ -840,6 +873,7 @@ forward() {
   # Shares disabled: the edge no longer routes /s/; stop a share-public a previous deploy started (its
   # bundles stay on disk). Never fatal.
   if [ "$SHARE" = 0 ] && [ -n "$NEW_SHARE" ]; then stop_share_public; fi
+  if [ "$COLLAB" = 1 ] && [ "$FABRIC" = 0 ]; then stop_fabric_whois; fi
   python3 "$STATE_HELPER" verify-forward "$ATTEMPT" || return 1
   verify "$SHA"
 }

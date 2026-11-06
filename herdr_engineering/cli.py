@@ -181,6 +181,15 @@ def _build_parser() -> argparse.ArgumentParser:
     rp = rsub.add_parser("status", help="show the room, agent, rights and expiry from the state file")
     rp.add_argument("--config", required=True)
     rp.set_defaults(func=_cmd_relay_status)
+    # fabric ---------------------------------------------------------------
+    p = sub.add_parser("fabric", help="fabric trust helpers (control_plane.collab.fabric_trust)")
+    fasub = p.add_subparsers(dest="fabric_command", required=True)
+    fp = fasub.add_parser("whois-proxy", help="serve ONLY `GET /whois?addr=<tailnet ip>` on a unix socket (0660) by asking tailscaled; "
+                          "mounted read-only into the isolated collab-public container instead of the tailscaled socket")
+    fp.add_argument("--listen-socket", required=True, help="unix socket to create (its directory is what the container mounts)")
+    fp.add_argument("--tailscaled-socket", action="append", default=[],
+                    help="tailscaled LocalAPI socket (default: /var/run/tailscale/tailscaled.sock, /run/tailscale/tailscaled.sock)")
+    fp.set_defaults(func=_cmd_fabric_whois_proxy)
     # bridge ---------------------------------------------------------------
     p = sub.add_parser("bridge", help="Rakazo mobile bridge helpers (control_plane.rakazo_bridge)")
     bsub = p.add_subparsers(dest="bridge_command", required=True)
@@ -233,6 +242,7 @@ def _build_parser() -> argparse.ArgumentParser:
                       ("revoke", "remove a host (its token stops working); backup first"),
                       ("render-compose", "write the compose env file (0600)"),
                       ("render-collab", "write the collab container's config slice (0600)"),
+                      ("fabric-listener", "print `HOST PORT` of control_plane.collab.fabric_trust's dedicated listener (nothing when not configured)"),
                       ("render-llm", "write the llm-proxy container's config slice (0600)"),
                       ("render-share", "write the share-public container's config slice (0600)"),
                       ("render-edge", "write the collab edge's nginx.conf (with /s/ when shares are enabled)")):
@@ -872,6 +882,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--collab-artifacts-outbox", default=None,
                     help="with --collab-only: the outbox directory collab-public writes intents and staging into "
                          "(see --collab-artifacts-mirror)")
+    p2.add_argument("--collab-fabric-bind-host", default=None,
+                    help="with control_plane.collab.fabric_trust.listen_host: the address this process binds for the fabric listener "
+                         "when it cannot own the tailnet address itself (inside a container whose published port lands here, e.g. "
+                         "0.0.0.0). Omit it to bind listen_host directly (host network)")
     p2.add_argument("--collab-operator-port", type=int, default=None,
                     help="with --collab-only: also serve the collaboration API WITHOUT sign-in on this "
                          "port, as --collab-operator-user, for the local owner's dashboard (publish it "
@@ -1067,7 +1081,13 @@ def _cmd_host_terminal_relay(args) -> int:
     the control plane could not be reached for the first configuration), 2 only when restarting cannot help (host.json
     missing or incomplete, token revoked). argparse usage errors also exit 2, but never under a unit file."""
     from .herdr_pane_client import HerdrPaneClient
-    from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config, host_token
+    from .host_config import (
+        ConfigRefresher,
+        HostConfigUnavailable,
+        exit_unavailable,
+        host_config,
+        host_token,
+    )
     from .terminal_relay import (
         ControlPlaneHttp,
         RelayLocked,
@@ -1481,6 +1501,10 @@ def _cmd_fleet_config(args) -> int:
         elif cmd == "render-collab":
             fcc.render_collab(load_fleet_config(path), Path(args.out).expanduser())
             print(f"wrote {args.out} (0600)")
+        elif cmd == "fabric-listener":
+            listener = fcc.fabric_listener(load_fleet_config(path))
+            if listener:
+                print(f"{listener[0]} {listener[1]}")
         elif cmd == "render-llm":
             fcc.render_llm(load_fleet_config(path), Path(args.out).expanduser())
             print(f"wrote {args.out} (0600)")
@@ -4038,6 +4062,9 @@ def _cmd_cp_web(args) -> int:
         from .control_plane.collab_fabric_trust import normalize_fabric_trust
         collab.fabric_trust = normalize_fabric_trust(getattr(args, "collab_fabric_trust", None))
         _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
+    fabric_listen = None
+    if collab is not None and collab.fabric_trust.get("listen_host"):      # slice 6a: startup-only, a restart applies a change
+        fabric_listen = (collab.fabric_trust["listen_host"], collab.fabric_trust["listen_port"])
     from .control_plane.rakazo_bridge import rakazo_bridge_config
     try:
         rakazo_bridge_config(cp.get("rakazo_bridge"))      # an enabled but malformed bridge stops startup here, clearly
@@ -4073,6 +4100,8 @@ def _cmd_cp_web(args) -> int:
                              ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn, ci_log_tests=ci_log_tests,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
+                             fabric_listen=fabric_listen,
+                             fabric_bind_host=getattr(args, "collab_fabric_bind_host", None),
                              collab_only=args.collab_only,
                              operator_port=args.collab_operator_port,
                              operator_user=args.collab_operator_user,
@@ -4533,6 +4562,13 @@ def _cmd_relay_status(args):
     left = int(client.state["expires_at"] - time.time())
     print(f"room {client.room_id}, agent {client.agent_id}, can post: {client.can_post}, "
           f"invite expires in {left // 3600} h" if left > 0 else "the invite has expired; ask the room owner for a new one")
+    return 0
+
+
+def _cmd_fabric_whois_proxy(args):
+    from .fabric_access import DEFAULT_SOCKETS
+    from .fabric_whois_proxy import serve
+    serve(args.listen_socket, tuple(args.tailscaled_socket) or DEFAULT_SOCKETS)
     return 0
 
 

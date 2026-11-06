@@ -1,0 +1,71 @@
+# Fabric-trust listener overlay (SPEC 6a); layered on by deploy.sh ONLY when the collab overlay is on AND
+# control_plane.collab.fabric_trust.listen_host / listen_port are configured. Never used otherwise.
+#
+# What it adds
+#   * fabric-whois: a tiny sidecar from the same image (`herdr-eng fabric whois-proxy`). It is the ONLY container
+#     that touches tailscaled's LocalAPI socket (mounted read-only; connecting to a socket still works), and it
+#     answers just `GET /whois?addr=<tailnet ip>` on its own unix socket in a shared directory. No network at all,
+#     read-only root, no capabilities, non-root.
+#   * collab-public gains (a) that socket directory, READ-ONLY, so its resolver can ask the sidecar, and (b) a published
+#     port on the tailnet address for the dedicated fabric listener. The listener serves only the collab API routes
+#     and only `Authorization: Fabric`. collab-public gets NO tailscaled socket and NO new capability.
+#
+# Source address. The listener decides who a caller is from the TCP peer address, so Docker must hand it the real
+# tailnet source IP. A published port on a bridge network keeps it when Docker uses iptables DNAT (the default with
+# the userland proxy off, or for non-loopback sources); verify it on the host (docs/operations/fabric-trust.md,
+# "Checking the source address") before trusting the listener. The `fabric` network below is not internal (a
+# published port needs that) but has IP masquerade disabled, so containers on it have no outbound route.
+# Fallback when the check fails: run collab-public with `network_mode: host` and bind the listener to the tailnet IP.
+#
+# The collab-public command is NOT repeated here (compose replaces command lists): the base overlay already passes
+# `--collab-fabric-bind-host 0.0.0.0`, inert unless fabric_trust.listen_* is set; the in-container port is the
+# configured listen_port.
+name: herdr-control-plane
+
+services:
+  fabric-whois:
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}
+    container_name: herdr-collab-fabric-whois
+    restart: unless-stopped
+    # Deliberately no env_file / environment.
+    user: "${HERDR_COLLAB_CERT_UID:-1000}:${HERDR_COLLAB_CERT_UID:-1000}"   # same uid as collab-public: the socket is 0660
+    command:
+      - "fabric"
+      - "whois-proxy"
+      - "--listen-socket"
+      - "/run/fabric-whois/whois.sock"
+      - "--tailscaled-socket"
+      - "/var/run/tailscale/tailscaled.sock"
+    read_only: true
+    tmpfs:
+      - /tmp:size=1m,mode=1777
+    volumes:
+      - ${HERDR_COLLAB_TAILSCALED_DIR:-/var/run/tailscale}:/var/run/tailscale:ro
+      - ${HERDR_COLLAB_FABRIC_WHOIS_DIR:?run deploy.sh}:/run/fabric-whois   # its only writable mount: its own socket
+    network_mode: none
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.5
+    healthcheck:
+      # The socket exists and is a socket; a request would need a real tailnet address.
+      test: ["CMD", "python3", "-c", "import os,stat,sys; sys.exit(0 if stat.S_ISSOCK(os.stat('/run/fabric-whois/whois.sock').st_mode) else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  collab-public:
+    volumes:   # appended to the collab overlay's list
+      - ${HERDR_COLLAB_FABRIC_WHOIS_DIR:?run deploy.sh}:/run/fabric-whois:ro
+    ports:     # appended; the tailnet address only, never 0.0.0.0
+      - "${HERDR_COLLAB_FABRIC_BIND:?run deploy.sh}:${HERDR_COLLAB_FABRIC_PORT:?run deploy.sh}:${HERDR_COLLAB_FABRIC_PORT:?run deploy.sh}"
+    networks: [collab, fabric]
+
+networks:
+  fabric:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"

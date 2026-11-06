@@ -109,7 +109,7 @@ Security rules (review of 75689743):
 3. Agent task routes + CLI auto agent-mode.
 4. `coordinate` action + coordinator-agent create-by-role + limits + audit.
 5. Dashboard shows `via: fabric`/machine on events; docs (`docs/operations/fabric-trust.md`), threat-model update.
-6a. Dedicated fabric listener (proposal, operator decisions pending):
+6a. Dedicated fabric listener (status: implemented; config keys `fabric_trust.listen_host/listen_port/whois_socket`, see `docs/operations/fabric-trust.md` section 9):
    - `collab-public` gains `--collab-fabric-host/--collab-fabric-port` (suggest `100.104.39.6:9483` on bender): the collab API
      only (no MCP/A2A, web UI or operator API), no proxy and no TLS in front, `Authorization: Fabric` only (Bearer/Agent are
      refused there). Lives in the same process as the main handler: the event log has ONE writer.

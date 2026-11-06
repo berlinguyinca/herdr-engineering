@@ -280,6 +280,14 @@ def _collab_artifacts_slice(cfg: FleetConfig) -> dict:
     return {"collab_artifacts": {"enabled": enabled}}
 
 
+def fabric_listener(cfg: FleetConfig) -> tuple[str, int] | None:
+    """(host, port) of control_plane.collab.fabric_trust's dedicated listener, or None when it is not configured. The
+    values were validated (tailnet address only) by ``collab_values``; deploy.sh publishes exactly this address and port."""
+    from .control_plane.collab_fabric_trust import normalize_fabric_trust
+    trust = normalize_fabric_trust(collab_values(cfg).get("fabric_trust"))
+    return (trust["listen_host"], trust["listen_port"]) if trust["listen_host"] else None
+
+
 def render_collab(cfg: FleetConfig, out: Path) -> None:
     """Write a minimal fleet file (JSON, valid YAML, 0600) holding only control_plane.collab and the
     ``collab_artifacts: {enabled: <bool>}`` switch."""

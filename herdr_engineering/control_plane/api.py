@@ -202,6 +202,10 @@ class _DaemonThreadingServer(ThreadingHTTPServer):
             self._request_slots.release()
 
 
+class _DaemonThreadingServerV6(_DaemonThreadingServer):
+    address_family = socket.AF_INET6
+
+
 
 def _dashboard_host_ok(host_header, extra_hosts):
     """A Host an attacker cannot make point here: an IP literal, localhost, or a configured name.
@@ -308,7 +312,7 @@ class ControlPlaneServer:
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
-                 assistant_workers=None):
+                 assistant_workers=None, fabric_listen=None, fabric_bind_host=None, fabric_allow_any_host: bool = False):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -605,6 +609,27 @@ class ControlPlaneServer:
         if public_port is not None and collab is None:
             raise ValueError("a public collaboration listener needs collab enabled")
         self.collab_only = collab_only
+        # Fabric trust slice 6a: a dedicated listener on a TAILNET address that serves the collab API and nothing else and accepts
+        # only ``Authorization: Fabric``. Same process as the other handlers (the event log has one writer). ``fabric_bind_host``
+        # is what the process binds when it cannot own the tailnet address itself (inside a container whose published port lands
+        # here); ``fabric_allow_any_host`` is a test-only escape hatch and is never fed from configuration.
+        self.fabric_listen, self.fabric_bind_host = None, fabric_bind_host
+        if fabric_listen is not None:
+            from .collab_fabric_trust import validate_listen_host
+            if collab is None:
+                raise ValueError("a fabric listener needs collab enabled")
+            f_host, f_port = fabric_listen
+            if fabric_allow_any_host:
+                ipaddress.ip_address(f_host)
+            else:
+                f_host = validate_listen_host(f_host, "fabric listener host")
+            if isinstance(f_port, bool) or not isinstance(f_port, int) or not 0 <= f_port <= 65535:
+                raise ValueError("fabric listener port must be an integer 0-65535")
+            if fabric_bind_host is not None:
+                ipaddress.ip_address(fabric_bind_host)
+            self.fabric_listen = (f_host, f_port)
+        self.fabric_port = None
+        self._fabric_httpd = None
         if operator_port is not None and not (collab_only and operator_user and operator_hosts):
             raise ValueError("the operator listener needs collab-only mode, a user and allowed hosts")
         self.operator_port, self.operator_user = operator_port, operator_user
@@ -1673,6 +1698,20 @@ class ControlPlaneServer:
             self._serving_listeners.add(httpd)
         httpd.serve_forever()
 
+    def _start_fabric_listener(self):
+        """Bind the dedicated fabric listener when configured. A bind failure propagates: configured means required, and
+        ``serve`` tears everything down and re-raises it."""
+        if self.fabric_listen is None:
+            return
+        host, port = self.fabric_listen
+        bind = self.fabric_bind_host or host
+        self._fabric_httpd = (_DaemonThreadingServerV6 if ":" in bind else _DaemonThreadingServer)(
+            (bind, port), _make_handler(self, fabric=True),
+            request_workers=self.request_workers, request_queue=self.request_queue)
+        self.fabric_port = self._fabric_httpd.server_address[1]
+        self._start_background_thread(self._fabric_httpd.serve_forever)
+        self._serving_listeners.add(self._fabric_httpd)
+
     def _start_server(self):
         if self.collab_only:
             # No operator listener at all: this process serves the public collab surface only.
@@ -1685,6 +1724,7 @@ class ControlPlaneServer:
                 self.operator_port = self._operator_httpd.server_address[1]
                 self._start_background_thread(self._operator_httpd.serve_forever)
                 self._serving_listeners.add(self._operator_httpd)
+            self._start_fabric_listener()
             self._ready.set()
             return self._httpd
         self._httpd = _DaemonThreadingServer(
@@ -1697,6 +1737,7 @@ class ControlPlaneServer:
             self.public_port = self._public_httpd.server_address[1]
             self._start_background_thread(self._public_httpd.serve_forever)
             self._serving_listeners.add(self._public_httpd)
+        self._start_fabric_listener()
         if self.agent_summaries and self.agent_summaries.config.enabled:
             self.agent_summaries.start()
             self._summary_scanner = threading.Thread(target=self._summary_loop, daemon=True)
@@ -1830,7 +1871,7 @@ class ControlPlaneServer:
         self.github_monitor.close()
         if getattr(self, "work_graph", None) is not None:
             self.work_graph.close()
-        for attr in ("_operator_httpd", "_public_httpd", "_httpd"):
+        for attr in ("_operator_httpd", "_public_httpd", "_fabric_httpd", "_httpd"):
             listener = getattr(self, attr)
             if listener is not None:
                 # BaseServer.shutdown waits forever if serve_forever was never
@@ -1963,7 +2004,7 @@ _FORWARDING_HEADERS = ("X-Forwarded-For", "Forwarded", "X-Real-IP", "X-Forwarded
                        "Tailscale-User-Login", "Tailscale-User-Name", "Via")
 
 
-def _make_handler(server, public=False, operator=False):
+def _make_handler(server, public=False, operator=False, fabric=False):
     class _Handler(BaseHTTPRequestHandler):
         server_version = "HerdrControlPlane/0.1"
         protocol_version = "HTTP/1.1"
@@ -2154,6 +2195,21 @@ def _make_handler(server, public=False, operator=False):
 
         # ------------------------------------------------------------ routes
         # -------------------------------------------- public (collab-only) listener
+        def _fabric_listener(self):
+            """The dedicated fabric listener (tailnet address, no proxy, no TLS): the collab API and nothing else, and ONLY
+            ``Authorization: Fabric``. Any other scheme (or none) is a 401 before the service sees it, so a Bearer token or an
+            agent credential presented here is never evaluated. Everything outside /api/v1/collab is the single 404."""
+            cl = self.headers.get_all("Content-Length") or []
+            if (len(cl) > 1 or "Transfer-Encoding" in self.headers
+                    or (self.command in ("GET", "DELETE") and cl and cl[0].strip() not in ("", "0"))):
+                return self._deny(400, "ambiguous request framing")
+            if not self._is_collab_path() or server.collab is None:
+                return self._deny(404, "not found")
+            scheme, _, rest = self.headers.get("Authorization", "").partition(" ")
+            if scheme != "Fabric" or not rest.strip():
+                return self._deny(401, "unauthorized")
+            return self._collab()
+
         def _public(self):
             """Everything not on the allow-list is a plain 404: the legacy API, the
             dashboard and its static files do not exist on this listener."""
@@ -2386,6 +2442,8 @@ def _make_handler(server, public=False, operator=False):
             super().end_headers()
 
         def _do_GET(self):
+            if fabric:
+                return self._fabric_listener()
             if operator:
                 return self._operator()
             if public:
@@ -2432,6 +2490,8 @@ def _make_handler(server, public=False, operator=False):
             return self._timed_request(self._do_POST)
 
         def _do_POST(self):
+            if fabric:
+                return self._fabric_listener()
             if operator:
                 return self._operator()
             if public:
@@ -2568,7 +2628,7 @@ def _make_handler(server, public=False, operator=False):
         def do_PUT(self):
             # PUT exists only for assistant-apps (client credentials, blocked calendars); everything else keeps its flat
             # 501, decided before any listener-specific handler (operator/public/federation/collab) sees the request.
-            if operator or public or not self.path.startswith("/api/v1/assistant-apps/"):
+            if operator or public or fabric or not self.path.startswith("/api/v1/assistant-apps/"):
                 return self._timed_request(lambda: self._send_json(501, {"error": "not implemented"}))
             return self._timed_request(self._mutate_verb)
 
@@ -2581,6 +2641,8 @@ def _make_handler(server, public=False, operator=False):
                                         "assistant-action-requests", "assistant-grants"}
 
         def _mutate_verb(self):
+            if fabric:
+                return self._fabric_listener()
             if operator:
                 return self._operator()
             if public:
@@ -2934,14 +2996,14 @@ def _make_handler(server, public=False, operator=False):
             is per-user / per-agent (collab.authenticate)."""
             service = server.collab
             if service is None:
-                if server.collab_operator_url and not operator and not public:
+                if server.collab_operator_url and not operator and not public and not fabric:
                     return self._collab_proxy()
                 return self._deny(404, "not found")
             if self._rate_limit(self._proxied_client()):
                 return None
             # On a shared plain-HTTP listener, refuse collaboration unless the request
             # came through the TLS-terminating proxy (`tailscale serve` sets this header).
-            if (server.collab_require_https and not operator
+            if (server.collab_require_https and not operator and not fabric
                     and self.headers.get("X-Forwarded-Proto", "").lower() != "https"):
                 return self._deny(400, "collaboration is only served over https")
             if self.command == "POST":
@@ -3027,6 +3089,8 @@ def _make_handler(server, public=False, operator=False):
             """Behind `tailscale serve` every peer is 127.0.0.1; key the limiter on the
             forwarded address, but only trust it from a loopback peer (the proxy)."""
             peer = self.client_address[0]
+            if fabric:          # the dedicated listener has no proxy in front: a forwarded address is never believed
+                return peer
             fwd = self.headers.get("X-Forwarded-For", "").split(",")[-1].strip()
             # The public listener is reachable only from the host's own proxy (possibly
             # across the Docker bridge), so a private peer is trusted there too.

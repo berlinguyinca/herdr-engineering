@@ -38,9 +38,11 @@ carries an unexpired owner-set `fabric` bit. Trust is therefore in: the tailnet'
 ### Residual risks
 1. **Weaker attribution than a secret.** Possession of nothing proves identity; the machine does. Two agents of one owner on one host
    are distinguishable only by the claimed id. Mitigated by audit and the opt-in bit, not removed.
-2. **Listener is not yet dedicated.** Fabric rides on the main collab handler, whose port also serves other callers; the checks above are
-   the boundary. Slice 6a (a tailnet-bound, Fabric-only listener plus a whois sidecar) is proposed and awaits an operator decision. Until
-   then Fabric does not work behind proxies at all (fails closed).
+2. **The dedicated listener shares the process with the public handler.** Fabric is accepted only on a tailnet-bound, Fabric-only listener
+   that serves the collab routes alone; the public and operator handlers refuse it. A compromise of the collab process is still a compromise
+   of both listeners. The whois answer comes from a sidecar that exposes only `GET /whois` over a unix socket, so `collab-public` never holds
+   tailscaled's LocalAPI socket. Docker's published-port path must preserve the real source address (procedure in the guide, section 9);
+   if it does not, Fabric fails closed.
 3. **tailscaled is trusted.** A wrong whois answer, an ACL mistake letting an unintended node reach the port, or a node key theft is
    a fabric identity. Tailnet ACLs should limit who may connect to the collab port.
 4. **Operator error in `machines`** (section 10 of the guide).

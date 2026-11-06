@@ -1,6 +1,6 @@
 # Fabric trust: collaboration without tokens for agents inside the fabric
 
-Status: slices 1-5 implemented; the dedicated listener (slice 6a) is not. Design: `docs/specs/fabric-trust-agent-auth-20261104/SPEC.md`.
+Status: slices 1-5 and the dedicated listener with its whois sidecar (slice 6a) are implemented; the rollout drill (slice 6) is not. Design: `docs/specs/fabric-trust-agent-auth-20261104/SPEC.md`.
 Threat model: [fabric-trust-threat-model.md](fabric-trust-threat-model.md).
 
 ## 1. What it is
@@ -27,8 +27,8 @@ External agents and helpers can never use `Fabric`. A fabric caller cannot set t
 - tailscaled runs on the collab host and the control-plane user can reach its LocalAPI socket. The code tries
   `/var/run/tailscale/tailscaled.sock` and `/run/tailscale/tailscaled.sock`. Give that user access with
   `tailscale set --operator=<user>` or a group on the socket. If tailscaled is unreachable, Fabric fails closed (401).
-- The collab service sees the real peer. Fabric works only on the MAIN collab handler, with a peer inside `100.64.0.0/10` or
-  `fd7a:115c:a1e0::/48`. See section 9 for what that means today.
+- The collab service sees the real peer. Fabric works only on the dedicated fabric listener (section 9), with a peer inside
+  `100.64.0.0/10` or `fd7a:115c:a1e0::/48`.
 - Every machine you list is an ordinary end host (see section 10).
 
 ## 4. Configuration
@@ -45,7 +45,13 @@ control_plane:
       tailnet_suffix: tail0c50da.ts.net # REQUIRED when enabled: a node is a machine only if its FULL name is <machine>.<suffix>
       agent_ttl_seconds: 2592000        # how long the owner's "fabric" bit stays valid (default 30 d, 300..7776000)
       whois_cache_seconds: 30           # 0..3600
+      listen_host: 100.104.39.6         # the dedicated listener (section 9); tailnet range only; with listen_port, or neither
+      listen_port: 9483
+      whois_socket: /run/fabric-whois/whois.sock   # ask the whois sidecar instead of tailscaled (section 9); absolute path
 ```
+
+`listen_host`, `listen_port` and `whois_socket` are read at startup only (an edit needs a restart or a deploy); everything else stays hot.
+`listen_host` outside `100.64.0.0/10` / `fd7a:115c:a1e0::/48` is refused at config time; there is no config switch to relax that.
 
 Unknown keys, wrong types, `enabled` without `machines` or without `tailnet_suffix` are rejected (`herdr-eng` refuses the config). A source
 that fails to read or validate means OFF with the kill switch on. The machine is matched on the FULL MagicDNS name
@@ -105,13 +111,54 @@ agent mode applies when no token is set in `--token-env`, or when `--as-agent` i
   tasks as creator-invalid, and its sweep turns them into permanent cancellations.
 - Any owner re-grant of a coordinator resets its grant sequence, so it needs a fresh root task.
 
-## 9. Listener limitation (read this)
+## 9. The dedicated fabric listener
 
-Fabric works only on the main collab handler and only with a real tailnet peer. The `public` (internet-facing, `/mcp`, `/a2a`) and `operator`
-handlers never pass a peer, so Fabric is always 401 there. A request with any forwarding header (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`,
-`X-Forwarded-Host`, `X-Forwarded-Server`, `Tailscale-User-Login`, `Tailscale-User-Name`, `Via`) is refused as Fabric, and loopback, LAN and
-public peers never qualify. Consequence today: behind the public edge, `tailscale serve` or any local proxy, Fabric requests always 401. The
-real fix is a dedicated tailnet listener (slice 6a); the operator decision on it is pending.
+With `listen_host` and `listen_port` set, the collab server (same process as the public handler, so the event log still has one writer)
+opens a second HTTP listener that:
+
+- serves only the collab API routes (`/api/v1/collab/...`); the MCP, A2A, web UI and operator API paths are 404 there;
+- accepts only `Authorization: Fabric ...`; `Bearer` and `Agent` get 401 without being evaluated (no token check, no failure counting);
+- passes the real TCP peer address (`client_address[0]`) to the whois check and refuses any request carrying a forwarding header
+  (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `X-Forwarded-Host`, `X-Forwarded-Server`, `Tailscale-User-Login`, `Tailscale-User-Name`, `Via`);
+- is plain HTTP on the tailnet (WireGuard encrypts the hop); no TLS and no proxy in front.
+
+The public (internet-facing) and operator handlers never pass a peer, so `Fabric` is always 401 there. A bind failure is a loud startup error.
+Loopback, LAN and public peers never qualify, so `tailscale serve` or any local proxy still yields 401.
+
+### The whois sidecar
+
+The isolated `collab-public` container must not see tailscaled's LocalAPI socket. `herdr-eng fabric whois-proxy --listen-socket PATH
+[--tailscaled-socket PATH]` runs as a separate container from the same image. It serves ONLY `GET /whois?addr=<tailnet ip>` on a unix socket
+(mode 0660), answers 400 for a malformed address and 404 for every other path or non-tailnet address, and returns only the node name, tags
+and login. With `fabric_trust.whois_socket` set, the collab server asks that socket (same JSON shape) instead of tailscaled.
+
+### Deploy
+
+`deploy.sh` layers `compose.collab-fabric.yaml` only when the collab overlay is on and `fabric_trust.listen_*` is set (it reads the address with
+`herdr-eng fleet config fabric-listener`). It adds the `fabric-whois` service (no network, read-only root, no capabilities, non-root, tailscaled's
+socket directory mounted read-only, one writable directory for its own socket), mounts that directory read-only in `collab-public`, and
+publishes `listen_host:listen_port` from `collab-public`. `collab-public` gains no capability, no tailscaled mount and no environment. The
+new `fabric` network has IP masquerade off, so it adds no route out. `HERDR_COLLAB_TAILSCALED_DIR` (default `/var/run/tailscale`) names the
+host directory that holds tailscaled.sock. Removing `listen_*` from the config stops the sidecar on the next deploy.
+
+### Checking the source address (do this before trusting the listener)
+
+The listener decides identity from the TCP peer, so Docker must show it the real tailnet address, not the bridge gateway (172.x), which
+would fail closed (every Fabric request 401). On the collab host, after a deploy:
+
+1. From another tailnet machine: `curl -s -o /dev/null -w '%{http_code}\n' -H 'Authorization: Fabric some-agent' http://<listen_host>:<listen_port>/api/v1/collab/config`.
+2. A recognised, switched-on fabric agent gets 200; for a refused one, see the audit reason (section 11). A consistent refusal for every machine means the peer is the gateway.
+3. Confirm directly: run `sudo conntrack -L -p tcp --dport <listen_port>` (or `sudo tcpdump -ni any port <listen_port>`) while a request is in flight: the original source must be the machine's 100.x address and the
+   DNAT target the container. If `docker info` shows the userland proxy in use (`"userland-proxy": true` in daemon.json) for that port and the
+   source is the gateway, set `"userland-proxy": false` and restart the daemon, then re-check.
+4. Fallback if the source address cannot be preserved: run `collab-public` with `network_mode: host` and set
+   `listen_host` to the host's tailnet address (the publish step goes away; the `internal` collab network no longer applies, so firewall the
+   other ports of that process and keep the edge pointed at 127.0.0.1). This weakens `collab-public`'s isolation and is a conscious choice.
+
+### Rollback
+
+An image older than slice 6a rejects the new keys. Remove `listen_host`, `listen_port` and `whois_socket` from the config BEFORE rolling the
+image back (the overlay then drops out and the sidecar is stopped).
 
 ## 10. What NOT to put in `machines`
 

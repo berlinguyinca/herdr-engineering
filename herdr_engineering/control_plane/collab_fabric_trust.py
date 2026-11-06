@@ -19,13 +19,26 @@ from typing import Any
 
 from ..fabric_access import TailscaleWhois
 
-FABRIC_TRUST_KEYS = frozenset({"enabled", "kill_switch", "machines", "whois_cache_seconds", "tailnet_suffix", "agent_ttl_seconds"})
+FABRIC_TRUST_KEYS = frozenset({"enabled", "kill_switch", "machines", "whois_cache_seconds", "tailnet_suffix", "agent_ttl_seconds",
+                               "listen_host", "listen_port", "whois_socket"})
 AGENT_TTL_DEFAULT, AGENT_TTL_MIN, AGENT_TTL_MAX = 2592000, 300, 7776000      # 30 days; 5 minutes..90 days
 FABRIC_PEER_NETS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))   # tailnet addresses only
 _SUFFIX = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+\Z")
 _SHORT_NAME = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\Z")
 _NAME = "control_plane.collab.fabric_trust"
 _MAX_CACHE = 1024
+
+
+def validate_listen_host(host: Any, name: str = f"{_NAME}.listen_host") -> str:
+    """The dedicated fabric listener binds a tailnet address only (100.64.0.0/10 or fd7a:115c:a1e0::/48): never loopback, a LAN
+    address, a wildcard or a name. Returns the normalized literal; raises ValueError otherwise."""
+    try:
+        ip = ipaddress.ip_address(host) if isinstance(host, str) and host == host.strip() else None
+    except ValueError:
+        ip = None
+    if ip is None or not any(ip in net for net in FABRIC_PEER_NETS):
+        raise ValueError(f"{name} must be a tailnet address (100.64.0.0/10 or fd7a:115c:a1e0::/48)")
+    return str(ip)
 
 
 def normalize_fabric_trust(raw: Any) -> dict:
@@ -41,7 +54,8 @@ def normalize_fabric_trust(raw: Any) -> dict:
     if unknown:
         raise ValueError(f"{_NAME}: unknown keys: " + ", ".join(unknown))
     cfg: dict[str, Any] = {"enabled": False, "kill_switch": False, "machines": [], "whois_cache_seconds": 30,
-                   "tailnet_suffix": None, "agent_ttl_seconds": AGENT_TTL_DEFAULT}
+                   "tailnet_suffix": None, "agent_ttl_seconds": AGENT_TTL_DEFAULT,
+                   "listen_host": None, "listen_port": None, "whois_socket": None}
     for key, value in raw.items():
         name = f"{_NAME}.{key}"
         if key in ("enabled", "kill_switch"):
@@ -57,6 +71,15 @@ def normalize_fabric_trust(raw: Any) -> dict:
             if not isinstance(value, str) or not _SUFFIX.match(value.strip().strip(".").lower()):
                 raise ValueError(f"{name} must be the tailnet MagicDNS domain, e.g. tail0c50da.ts.net")
             value = value.strip().strip(".").lower()
+        elif key == "listen_host":
+            value = validate_listen_host(value, name)
+        elif key == "listen_port":
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+                raise ValueError(f"{name} must be an integer 1-65535")
+        elif key == "whois_socket":
+            if (not isinstance(value, str) or not value.startswith("/") or "\0" in value or len(value) > 107
+                    or ".." in value.split("/")):
+                raise ValueError(f"{name} must be an absolute unix socket path")
         elif key == "agent_ttl_seconds":
             if isinstance(value, bool) or not isinstance(value, int) or not AGENT_TTL_MIN <= value <= AGENT_TTL_MAX:
                 raise ValueError(f"{name} must be an integer {AGENT_TTL_MIN}-{AGENT_TTL_MAX}")
@@ -64,6 +87,8 @@ def normalize_fabric_trust(raw: Any) -> dict:
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 3600:
                 raise ValueError(f"{name} must be an integer 0-3600")
         cfg[key] = value
+    if (cfg["listen_host"] is None) != (cfg["listen_port"] is None):
+        raise ValueError(f"{_NAME}.listen_host and listen_port must be given together")
     if cfg["enabled"] and not cfg["machines"]:
         raise ValueError(f"{_NAME}.machines must list at least one machine when enabled")
     if cfg["enabled"] and not cfg["tailnet_suffix"]:
@@ -81,7 +106,8 @@ class FabricPeerResolver:
     def __init__(self, config: Callable[[], dict], *, whois: TailscaleWhois | None = None,
                  now: Callable[[], float] = time.monotonic) -> None:
         self.config = config
-        self.whois = whois if whois is not None else TailscaleWhois()
+        self.whois = whois                                     # injected (tests); else chosen per config: sidecar or tailscaled
+        self._sidecars: dict[str, TailscaleWhois] = {}
         self.now = now
         self._cache: dict[str, tuple[float, str | None]] = {}
         self._lock = threading.Lock()
@@ -94,7 +120,7 @@ class FabricPeerResolver:
             if not peer_ip:
                 return None
             ip = str(ipaddress.ip_address(peer_ip.split("%")[0]))
-            fqdn = self._node_name(ip, float(cfg["whois_cache_seconds"]))
+            fqdn = self._node_name(ip, float(cfg["whois_cache_seconds"]), cfg.get("whois_socket"))
             suffix = cfg["tailnet_suffix"]
             if not fqdn or not suffix:
                 return None
@@ -105,13 +131,20 @@ class FabricPeerResolver:
             return None
         return None
 
-    def _node_name(self, ip: str, ttl: float) -> str | None:
+    def _whois_for(self, socket_path: str | None) -> TailscaleWhois:
+        if self.whois is not None:
+            return self.whois
+        if not socket_path:
+            return self._sidecars.setdefault("", TailscaleWhois())
+        return self._sidecars.setdefault(socket_path, TailscaleWhois(sockets=(socket_path,), proxy=True))
+
+    def _node_name(self, ip: str, ttl: float, socket_path: str | None = None) -> str | None:
         t = self.now()
         with self._lock:
             hit = self._cache.get(ip)
         if hit and t - hit[0] < ttl:
             return hit[1]
-        ident = self.whois.lookup(ip)                          # OSError / bad JSON propagates: not cached, caller fails closed
+        ident = self._whois_for(socket_path).lookup(ip)                          # OSError / bad JSON propagates: not cached, caller fails closed
         fqdn = ident.node.rstrip(".").lower() if ident and ident.node else None
         with self._lock:
             if len(self._cache) >= _MAX_CACHE:

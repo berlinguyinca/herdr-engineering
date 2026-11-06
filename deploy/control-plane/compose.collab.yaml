@@ -87,6 +87,10 @@ services:
       - "/collab-mirror"
       - "--collab-artifacts-outbox"
       - "/collab-outbox"
+      # Where the fabric listener (control_plane.collab.fabric_trust.listen_*) binds INSIDE the container; inert unless
+      # that is configured, and then compose.collab-fabric.yaml publishes the port on the tailnet address only.
+      - "--collab-fabric-bind-host"
+      - "0.0.0.0"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777

@@ -154,7 +154,8 @@ def test_spoofed_forwarded_for_cannot_even_be_passed(localapi):
 # ---------------------------------------------------------------- config
 def test_absent_config_is_off():
     assert normalize_fabric_trust(None) == {"enabled": False, "kill_switch": False, "machines": [], "whois_cache_seconds": 30,
-                                            "tailnet_suffix": None, "agent_ttl_seconds": 2592000}
+                                            "tailnet_suffix": None, "agent_ttl_seconds": 2592000,
+                                            "listen_host": None, "listen_port": None, "whois_socket": None}
 
 
 def test_valid_config_is_normalized():

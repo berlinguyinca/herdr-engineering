@@ -289,6 +289,13 @@ Agent ids starting with `room:` are refused by every collaborator route (grant, 
 before that rule cannot be revoked by id any more: use `collab restrict <artifact_id>` (it revokes every collaborator
 grant of the artifact).
 
+## Fabric listener (optional)
+
+Set `control_plane.collab.fabric_trust.listen_host` (a tailnet address) and `listen_port` (and `whois_socket: /run/fabric-whois/whois.sock`)
+and `deploy.sh` layers `compose.collab-fabric.yaml`: a `fabric-whois` sidecar (no network, tailscaled's socket directory read-only, its own
+socket directory) and a port published from `collab-public` on that tailnet address only. Without those keys nothing changes. Before relying
+on it, check that Docker preserves the caller's source address, and read the rollback caveat: `docs/operations/fabric-trust.md` section 9.
+
 ## Verify
 
 ```
