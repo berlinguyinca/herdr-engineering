@@ -5,6 +5,7 @@ Config (YAML only, never environment variables)::
     control_plane:
       build_cache:
         enabled: false              # default; when off the routes answer 404 and nothing is constructed
+        ingest: {enabled: false, max_hosts: 64, per_host_builds: 200}   # other hosts' reports (default off)
         state_dir: /path            # optional; default is the build-gate state dir of THIS host
         fabric_build_cache: {...}   # optional; the host's ``fabric_build_cache`` section (default: the host config)
 
@@ -44,6 +45,7 @@ _SYNC_MAX_EVENTS = 200
 _HOSTS_TTL_S = 30.0
 _KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
 _FILTERS = ("mission", "session", "host", "cmd_kind")
 _FIELDS = ("event", "ts", "build_id", "host", "slot", "cmd_kind", "exit_code", "elapsed_s", "user_cpu_s", "sys_cpu_s",
            "max_rss_kb", "rusage_oublock", "proc_io_write_bytes", "host_disk_write_bytes_delta", "host_disk_scope",
@@ -57,6 +59,7 @@ _CONTRACT_FIELDS = {
     "lease_changed": ("ts", "host", "change", "scope_id", "attempt_id", "epoch"),
     "cleanup_completed": ("ts", "host", "kind", "status", "removed_count", "removed_bytes"),
 }
+INGEST_MAX_RECORDS = 100
 STREAM_RING = 500            # events a reconnecting client can replay
 _STREAM_MAX_S = 3600
 _STREAM_TICK_S = 1.0
@@ -64,11 +67,15 @@ _LOGS = ("builds.jsonl", "contract-events.jsonl")
 _BUILD_EVENTS = ("build_started", "build_finished")
 
 
+class IngestFull(Exception):
+    """The reporting-host bound is reached."""
+
+
 def build_cache_config(cfg) -> dict:
     cfg = {} if cfg is None else cfg
     if not isinstance(cfg, dict):
         raise ValueError("control_plane.build_cache must be a mapping")
-    unknown = set(cfg) - {"enabled", "state_dir", "fabric_build_cache"}
+    unknown = set(cfg) - {"enabled", "state_dir", "fabric_build_cache", "ingest"}
     if unknown:
         raise ValueError(f"control_plane.build_cache: unknown keys {sorted(unknown)}")
     if cfg.get("enabled", False) not in (True, False):
@@ -79,7 +86,26 @@ def build_cache_config(cfg) -> dict:
     section = cfg.get("fabric_build_cache")
     if section is not None and not isinstance(section, dict):
         raise ValueError("control_plane.build_cache.fabric_build_cache must be a mapping")
-    return {"enabled": cfg.get("enabled", False) is True, "state_dir": state_dir, "fabric_build_cache": section}
+    return {"enabled": cfg.get("enabled", False) is True, "state_dir": state_dir, "fabric_build_cache": section,
+            "ingest": _ingest_config(cfg.get("ingest"))}
+
+
+def _ingest_config(cfg) -> dict:
+    cfg = {} if cfg is None else cfg
+    if not isinstance(cfg, dict):
+        raise ValueError("control_plane.build_cache.ingest must be a mapping")
+    unknown = set(cfg) - {"enabled", "max_hosts", "per_host_builds"}
+    if unknown:
+        raise ValueError(f"control_plane.build_cache.ingest: unknown keys {sorted(unknown)}")
+    if cfg.get("enabled", False) not in (True, False):
+        raise ValueError("control_plane.build_cache.ingest.enabled must be true or false")
+    out = {"enabled": cfg.get("enabled", False) is True}
+    for name, default, hi in (("max_hosts", 64, 1024), ("per_host_builds", 200, 5000)):
+        value = cfg.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= hi:
+            raise ValueError(f"control_plane.build_cache.ingest.{name} must be an integer in 1..{hi}")
+        out[name] = value
+    return out
 
 
 def build_build_cache(cfg, *, record_event):
@@ -96,7 +122,7 @@ def build_build_cache(cfg, *, record_event):
     if state is None:
         from ..build_coord import _default_state_dir
         state = _default_state_dir()
-    return BuildCacheService(validate(section), state, record_event=record_event)
+    return BuildCacheService(validate(section), state, record_event=record_event, ingest=config["ingest"])
 
 
 def _trace(value):
@@ -127,8 +153,12 @@ def _slim(rec: dict) -> dict:
 
 
 class BuildCacheService:
-    def __init__(self, cfg, state_dir: Path, *, record_event=None, now=time.monotonic):
+    def __init__(self, cfg, state_dir: Path, *, record_event=None, now=time.monotonic, ingest=None):
         self.cfg = cfg
+        self.ingest_cfg = ingest or _ingest_config(None)
+        # host_id -> build_id -> {event: slim record}; in memory only (see ingest()).
+        self._remote: dict[str, dict[str, dict[str, dict]]] = {}
+        self._remote_ts: dict[str, str] = {}
         self.state_dir = Path(state_dir)
         self.record_event = record_event
         self._now = now
@@ -168,9 +198,18 @@ class BuildCacheService:
         return out
 
     def _builds(self) -> list[dict]:
-        """Merged started/finished per build id, newest activity first."""
+        """Merged started/finished per build id, newest activity first (local log plus reported hosts)."""
+        rows = self._merge(self._tail_lines())
+        if self.ingest_cfg["enabled"] and self._remote:
+            with self._lock:
+                remote = [r for h in self._remote.values() for slot in h.values() for r in slot.values()]
+            rows = sorted(rows + self._merge(remote), key=lambda r: r.get("ts") or "", reverse=True)
+        return rows
+
+    @staticmethod
+    def _merge(records) -> list[dict]:
         merged: dict[str, dict] = {}
-        for rec in self._tail_lines():
+        for rec in records:
             slot = merged.pop(rec["build_id"], {})          # pop + reinsert keeps recency order
             slot["finished" if rec["event"] == "build_finished" else "started"] = rec
             merged[rec["build_id"]] = slot
@@ -204,7 +243,8 @@ class BuildCacheService:
         page = rows[cursor:cursor + limit]
         more = cursor + limit < len(rows)
         return {"builds": page, "limit": limit, "next_cursor": str(cursor + limit) if more else None,
-                "source": "local_builds_jsonl", "window_bytes": _TAIL_BYTES}
+                "source": "local_builds_jsonl+reported" if self.ingest_cfg["enabled"] else "local_builds_jsonl",
+                "window_bytes": _TAIL_BYTES}
 
     def get_build(self, build_id: str) -> dict | None:
         for row in self._builds():
@@ -332,12 +372,54 @@ class BuildCacheService:
         with self._lock:
             self._subs.discard(q)
 
+    # ---------------------------------------------------------------- remote hosts
+    def ingest(self, host_id: str, body) -> dict:
+        """Store another host's ``build-coordinate --record`` summary (spec 09 follow-up; in memory, no migration).
+
+        Records are re-sliced through the same allowlist as local rows (no argv, env, cwd or paths) and their host is
+        forced to the authenticated ``host_id``. Retention: ``per_host_builds`` builds per host, ``max_hosts`` hosts.
+        State is lost on restart; hosts re-send their recent window (replays are idempotent).
+        """
+        if not isinstance(body, dict) or set(body) - {"host_id", "builds"}:
+            raise ValueError("JSON object with host_id and builds required")
+        builds = body.get("builds")
+        if not isinstance(builds, list) or len(builds) > INGEST_MAX_RECORDS:
+            raise ValueError(f"builds must be a list of at most {INGEST_MAX_RECORDS} records")
+        records = []
+        for raw in builds:
+            if not isinstance(raw, dict) or raw.get("event") not in _BUILD_EVENTS \
+                    or not isinstance(raw.get("build_id"), str) or not _ID_RE.match(raw["build_id"]):
+                raise ValueError("each record needs event (build_started|build_finished) and a valid build_id")
+            rec = {k: (v[:256] if isinstance(v, str) else v) for k, v in _slim(raw).items()}
+            rec["host"] = host_id
+            records.append(rec)
+        new = []
+        with self._lock:
+            if host_id not in self._remote and len(self._remote) >= self.ingest_cfg["max_hosts"]:
+                raise IngestFull("too many reporting hosts")
+            store = self._remote.setdefault(host_id, {})
+            for rec in records:
+                slot = store.pop(rec["build_id"], {})            # pop + reinsert keeps recency order
+                if rec["event"] not in slot:
+                    new.append(rec)
+                slot[rec["event"]] = rec
+                store[rec["build_id"]] = slot
+                while len(store) > self.ingest_cfg["per_host_builds"]:
+                    del store[next(iter(store))]
+            self._remote_ts[host_id] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        if self.record_event is not None:
+            for rec in new:
+                self._publish(rec)
+        return {"accepted": len(records), "new": len(new), "host_id": host_id}
+
     # ---------------------------------------------------------------- reads
     def status(self) -> dict:
         from ..build_metrics import summarize
         out = {
             "enabled": True, "policy_enabled": self.cfg.enabled, "apply": "cli_only",
-            "ingest": {"remote_hosts": False, "source": "local_host_state_files"},
+            "ingest": ({"remote_hosts": True, "source": "local_host_state_files+reports", "hosts": len(self._remote),
+                        "retention": "in_memory"} if self.ingest_cfg["enabled"]
+                       else {"remote_hosts": False, "source": "local_host_state_files"}),
             "sse": {"resumable": True, "path": "/api/v1/build-cache/events/stream", "replay_events": STREAM_RING},
             "log_present": self.log_path.exists(),
             "summary": summarize(self.log_path) if self.cfg.enabled else None,
@@ -351,8 +433,14 @@ class BuildCacheService:
             from ..build_cache_inventory import collect
             cap = collect(self.cfg, state_dir=self.state_dir)
             self._hosts = (now, [cap.public_view()] if cap else [])
-        rows = self._hosts[1]
-        return {"hosts": rows, "total": len(rows), "source": "local_host_only", "cached_s": _HOSTS_TTL_S}
+        rows = list(self._hosts[1])
+        source = "local_host_only"
+        if self.ingest_cfg["enabled"]:
+            source = "local_plus_reported"
+            with self._lock:
+                rows += [{"host_id": h, "source": "reported", "last_report_ts": self._remote_ts.get(h),
+                          "builds": len(b)} for h, b in sorted(self._remote.items())]
+        return {"hosts": rows, "total": len(rows), "source": source, "cached_s": _HOSTS_TTL_S}
 
     def policies(self) -> dict:
         return {"policy": self.cfg.public_view(), "source": "control_plane_host_config", "scope": "this_host"}
@@ -443,6 +531,32 @@ def _stream(handler, service) -> None:
         service.unsubscribe(q)
 
 
+def _route_report(handler, server) -> bool:
+    """``POST /api/v1/host/build-cache/report`` {host_id, builds: [...]}: a host reports its recorded builds.
+
+    Same conventions as the other host-report routes: ingest-role key (gated in ``_require`` via ``_HOST_REPORT``),
+    ``host_id`` in the body checked with ``_host_key_allowed``. Off unless ``control_plane.build_cache.ingest.enabled``
+    (then indistinguishable from an unknown route, returning False so normal routing answers 404).
+    """
+    service = getattr(server, "build_cache", None)
+    if service is None or not service.ingest_cfg["enabled"]:
+        return False
+    try:
+        body = handler._read_json(512 * 1024)
+        host_id = body.get("host_id") if isinstance(body, dict) else None
+        if not isinstance(host_id, str) or not _HOST_RE.match(host_id):
+            raise ValueError("host_id is required")
+        if not handler._host_key_allowed(host_id):
+            handler._json({"error": "this API key may not act for that host"}, 403)
+            return True
+        handler._json(service.ingest(host_id, body))
+    except IngestFull as exc:
+        handler._json({"error": f"{exc}: raise control_plane.build_cache.ingest.max_hosts"}, 429)
+    except ValueError as exc:
+        handler._json({"error": str(exc)}, 400)
+    return True
+
+
 def route_build_cache(handler, server, parts, resource) -> bool:
     """Handle ``/api/v1/build-cache*``. Returns True when the request was answered.
 
@@ -450,6 +564,8 @@ def route_build_cache(handler, server, parts, resource) -> bool:
     (``_require``): 401 without a valid key, 403 for a non-operator POST. The control plane has no per-tenant keys,
     so there is no tenant dimension to check here; the data is this host's own.
     """
+    if resource == "host" and parts[4:] == ["build-cache", "report"] and handler.command == "POST":
+        return _route_report(handler, server)
     if resource != "build-cache":
         return False
     service = getattr(server, "build_cache", None)

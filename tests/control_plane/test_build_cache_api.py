@@ -404,3 +404,138 @@ def test_build_cache_stream_requires_auth_and_flag(served, tmp_path):
         assert call(off, "GET", "/api/v1/build-cache/events/stream", "k-view")[0] == 404
     finally:
         svr.shutdown()
+
+
+# ---------------------------------------------------------------------------------------------- remote host ingest
+REPORT = "/api/v1/host/build-cache/report"
+
+
+def _serve_ingest(tmp_path, ingest=None, keys=None):
+    cfg = {"enabled": True, "state_dir": str(tmp_path / "state"), "fabric_build_cache": SECTION}
+    if ingest is not None:
+        cfg["ingest"] = ingest
+    return _serve(cfg, keys or {**KEYS, "k-host": "ingest"})
+
+
+def _rec(host, i, event="build_finished", **kw):
+    base = {"event": event, "ts": f"2026-11-05T00:00:{i:02d}Z", "build_id": f"{host}-b{i}", "host": host,
+            "cmd_kind": "cargo build", "exit_code": 0, "elapsed_s": 2.0, "unavailable": [], "cache": {"applied": True}}
+    return {**base, **kw}
+
+
+def test_ingest_config_defaults_off_and_validates():
+    assert build_cache_config({"enabled": True})["ingest"]["enabled"] is False
+    with pytest.raises(ValueError):
+        build_cache_config({"enabled": True, "ingest": {"enabled": "yes"}})
+    with pytest.raises(ValueError):
+        build_cache_config({"enabled": True, "ingest": {"bogus": 1}})
+    with pytest.raises(ValueError):
+        build_cache_config({"enabled": True, "ingest": {"max_hosts": 0}})
+
+
+def test_ingest_is_off_by_default_even_with_the_capability_on(tmp_path):
+    svr, base, _ = _serve_ingest(tmp_path)
+    try:
+        code, _ = call(base, "POST", REPORT, "k-host", {"host_id": "h2", "builds": [_rec("h2", 1)]})
+        assert code == 404
+        assert call(base, "GET", "/api/v1/build-cache/status", "k-view")[1]["ingest"]["remote_hosts"] is False
+    finally:
+        svr.shutdown()
+
+
+def test_ingest_auth(tmp_path):
+    svr, base, _ = _serve_ingest(tmp_path, {"enabled": True})
+    try:
+        body = {"host_id": "h2", "builds": [_rec("h2", 1)]}
+        assert call(base, "POST", REPORT, None, body)[0] == 401
+        assert call(base, "POST", REPORT, "k-view", body)[0] == 403
+        assert call(base, "POST", REPORT, "k-host", body)[0] == 200
+        assert call(base, "POST", REPORT, "k-op", body)[0] == 200
+    finally:
+        svr.shutdown()
+
+
+def test_ingested_builds_show_up_per_host_redacted_and_filterable(tmp_path):
+    svr, base, repo = _serve_ingest(tmp_path, {"enabled": True})
+    try:
+        _write_builds(tmp_path / "state", [_started(1), _finished(1)])        # local host h1
+        sec = _rec("h2", 1, argv=[SECRET], note=SECRET, trace={"session": "s9", "mission": "m9"})
+        spoof = _rec("h1", 2)                                                  # claims to be the local host
+        code, out = call(base, "POST", REPORT, "k-host", {"host_id": "h2", "builds": [sec, spoof]})
+        assert code == 200 and out["accepted"] == 2
+        everything = call(base, "GET", "/api/v1/build-cache/builds", "k-view")[1]["builds"]
+        assert {b["host"] for b in everything} == {"h1", "h2"}                 # spoofed host is rewritten to h2
+        assert sum(1 for b in everything if b["host"] == "h2") == 2
+        only = call(base, "GET", "/api/v1/build-cache/builds?host=h2", "k-view")[1]
+        assert {b["host"] for b in only["builds"]} == {"h2"}
+        one = call(base, "GET", "/api/v1/build-cache/builds/h2-b1", "k-view")[1]
+        assert one["host"] == "h2" and one["trace"] == {"session": "s9", "mission": "m9"}
+        assert SECRET not in json.dumps(everything) and "argv" not in json.dumps(everything)
+        hosts = call(base, "GET", "/api/v1/build-cache/hosts", "k-view")[1]
+        reported = [h for h in hosts["hosts"] if h.get("source") == "reported"]
+        assert [h["host_id"] for h in reported] == ["h2"] and reported[0]["builds"] == 2
+        assert call(base, "GET", "/api/v1/build-cache/status", "k-view")[1]["ingest"]["remote_hosts"] is True
+    finally:
+        svr.shutdown()
+
+
+def test_ingest_publishes_events_once_and_merges_started_with_finished(tmp_path):
+    svr, base, repo = _serve_ingest(tmp_path, {"enabled": True})
+    try:
+        body = {"host_id": "h2", "builds": [_rec("h2", 1, event="build_started"), _rec("h2", 1)]}
+        call(base, "POST", REPORT, "k-host", body)
+        call(base, "POST", REPORT, "k-host", body)                             # replay of the same window
+        evs = [e for e in repo.recent_events(limit=100) if e["entity_type"] == "build_cache"]
+        assert sorted(e["event_type"] for e in evs) == ["build_cache.build_finished", "build_cache.build_started"]
+        assert all(e["entity_id"] == "h2" for e in evs)
+        rows = call(base, "GET", "/api/v1/build-cache/builds?host=h2", "k-view")[1]["builds"]
+        assert len(rows) == 1 and rows[0]["status"] == "completed" and "started" in rows[0]
+    finally:
+        svr.shutdown()
+
+
+def test_ingest_retention_is_bounded_per_host_and_in_hosts(tmp_path):
+    svr, base, _ = _serve_ingest(tmp_path, {"enabled": True, "per_host_builds": 3, "max_hosts": 2})
+    try:
+        call(base, "POST", REPORT, "k-host", {"host_id": "h2", "builds": [_rec("h2", i) for i in range(1, 6)]})
+        rows = call(base, "GET", "/api/v1/build-cache/builds?host=h2", "k-view")[1]["builds"]
+        assert sorted(r["build_id"] for r in rows) == ["h2-b3", "h2-b4", "h2-b5"]      # oldest evicted
+        assert call(base, "POST", REPORT, "k-host", {"host_id": "h3", "builds": [_rec("h3", 1)]})[0] == 200
+        code, out = call(base, "POST", REPORT, "k-host", {"host_id": "h4", "builds": [_rec("h4", 1)]})
+        assert code == 429 and "hosts" in out["error"]
+        assert call(base, "POST", REPORT, "k-host", {"host_id": "h2", "builds": [_rec("h2", 9)]})[0] == 200
+    finally:
+        svr.shutdown()
+
+
+@pytest.mark.parametrize("body", [
+    {"builds": [_rec("h2", 1)]},                                   # no host_id
+    {"host_id": "h2"},                                             # no builds
+    {"host_id": "h 2", "builds": []},                              # bad host id
+    {"host_id": "h2", "builds": "x"},
+    {"host_id": "h2", "builds": [{"event": "build_finished"}]},   # no build_id
+    {"host_id": "h2", "builds": [_rec("h2", 1, event="evil")]},
+    {"host_id": "h2", "builds": [_rec("h2", i) for i in range(101)]},
+    {"host_id": "h2", "builds": [], "extra": 1},
+])
+def test_ingest_rejects_bad_bodies(tmp_path, body):
+    svr, base, _ = _serve_ingest(tmp_path, {"enabled": True})
+    try:
+        assert call(base, "POST", REPORT, "k-host", body)[0] == 400
+    finally:
+        svr.shutdown()
+
+
+def test_sender_posts_the_local_summary_non_secret_fields_only(tmp_path):
+    from herdr_engineering.build_cache_report import report_builds
+    svr, base, _ = _serve_ingest(tmp_path / "server", {"enabled": True})
+    try:
+        local = tmp_path / "local"
+        _write_builds(local, [_started(1, argv=[SECRET]), _finished(1, argv=[SECRET], cwd="/home/secret/place")])
+        out = report_builds(local, base, "k-host", host_id="h7")
+        assert out["accepted"] == 2
+        rows = call(base, "GET", "/api/v1/build-cache/builds?host=h7", "k-view")[1]["builds"]
+        assert [r["build_id"] for r in rows] == ["b1"] and rows[0]["host"] == "h7"
+        assert SECRET not in json.dumps(rows) and "/home/secret" not in json.dumps(rows)
+    finally:
+        svr.shutdown()
