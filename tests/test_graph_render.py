@@ -225,7 +225,7 @@ def test_row_to_row_connector_runs_from_the_end_of_one_row_to_the_start_of_the_n
     assert lines[down].index("▼") < 20                                  # lands on the first box of the next row
 
 
-@pytest.mark.parametrize("drift_index", [1, 2, 3, 4, 7])
+@pytest.mark.parametrize("drift_index", [1, 2, 3, 4, 5, 7])   # 2 and 5 end a row at width 80
 def test_drift_marker_stays_under_its_own_box_in_a_grid(drift_index):
     lines = render(_labelled(8, drift_index), 80)
     label = f"topic {drift_index + 1}"
