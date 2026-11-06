@@ -19,7 +19,7 @@ export const isKeptHref = href => typeof href === 'string' && KEPT_HREF.test(hre
  * (position: fixed on the shadow host included) can paint outside it; the shadow root is on an inner element.
  * Links that are not absolute are unwrapped so a fragment link can never drive the SPA's hash router.
  */
-export function mountStaticHtml(container, html, { label = 'Static preview', document: doc = globalThis.document } = {}) {
+export function mountStaticHtml(container, html, { label = 'Static preview', document: doc = globalThis.document, theme } = {}) {
   const note = doc.createElement('p');
   note.className = 'hd-note';
   note.setAttribute('data-static-note', '');
@@ -30,6 +30,10 @@ export function mountStaticHtml(container, html, { label = 'Static preview', doc
   wrapper.setAttribute('aria-label', label);
   wrapper.setAttribute('style', 'contain:paint;overflow:auto;max-height:640px');
   const host = doc.createElement('div');
+  // The dashboard's own theme (data-theme on the document root) drives the copy's light/dark; the copy's stylesheet
+  // reads data-theme on its shadow host and falls back to the OS scheme when it is absent.
+  const forced = theme ?? doc.documentElement?.getAttribute('data-theme');
+  if (forced === 'light' || forced === 'dark') host.setAttribute('data-theme', forced);
   wrapper.append(host);
   container.replaceChildren(note, wrapper);
   // The declarative template element does not attach through innerHTML, so the root is attached imperatively.
