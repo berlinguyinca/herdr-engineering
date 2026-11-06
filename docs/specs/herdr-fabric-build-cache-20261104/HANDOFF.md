@@ -1,4 +1,15 @@
 # HANDOFF (rolling; newest section first)
+## Update 2026-11-05: backend follow-ups (branch feat/build-cache-backend-followups, not pushed, not deployed)
+
+Four commits: 96a5b8aa reconcile wiring, 52595948 contract events, 1ef7b6c0 SSE resume, 7058dac6 ingest.
+- Reconcile: `BuildRun.open` and the cleanup sweep call `Registry.reconcile`; the sweep first probes the registry read-only so an unreadable registry stays fail-closed. Only expired leases with a provably dead owner are released; nothing is deleted by reconcile.
+- Events: `cache_stats_updated`, `storage_degraded`, `lease_changed`, `cleanup_completed` go to `contract-events.jsonl` (separate from `builds.jsonl`, whose last line existing consumers assume is a build event). Lease events carry a hashed scope id, never a path.
+- SSE: `GET /api/v1/build-cache/events/stream`, ids `<boot>-<n>`, 500-event ring, Last-Event-ID or `?last_event_id=`; unknown id replays the ring (at-least-once).
+- Ingest: YAML `control_plane.build_cache.ingest {enabled: false, max_hosts: 64, per_host_builds: 200}`. `POST /api/v1/host/build-cache/report` (ingest-role key, `host_id` checked by `_host_key_allowed`, allowlisted non-secret fields, host forced to the authenticated id, 429 when max_hosts is hit). Merged into the existing GET builds/hosts/status with the host filter. Sender: `herdr_engineering/build_cache_report.py` (`report_builds`).
+- Migration decision: NO migration 0046. Reports are a re-sendable recent window, so in-memory storage loses nothing durable; add a table only if history must survive restarts.
+- Tests: tests/test_build_*.py, tests/control_plane/test_build_cache_api.py, tests/test_fabric_agent.py (see final report for counts).
+- Not done: scheduled sender, real second host, deploy.
+
 ## Update 2026-11-04: tailnet gap fixed in code
 
 Cause: `AgentForwarder._rewrite_head` rewrote `Host`, which SigV4 signs. Fix: signed requests pass through untouched (tests in `tests/test_fabric_agent.py`, `*sigv4*`). Proven via a throwaway forwarder on 100.104.39.6 (aws-cli + sccache cold/warm). ACTIVATES ONLY AFTER THE OPERATOR RESTARTS THE AGENT: `systemctl --user restart herdr-eng-fabric-agent.service` (not done here). Still untested: a real second host.

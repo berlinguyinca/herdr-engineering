@@ -11,8 +11,9 @@ Config (YAML only, never environment variables)::
 
 Scope, stated honestly:
 
-* Read-only data comes from THIS control-plane host's local state files (``builds.jsonl``, host probe). Build hosts do
-  not push their records to the control plane (no ingest, no table, no migration), so other hosts are not visible.
+* Read-only data comes from THIS control-plane host's local state files (``builds.jsonl``, host probe). Other hosts
+  are visible only when ``ingest.enabled`` is set and they POST to ``/api/v1/host/build-cache/report``; those
+  reports are held in memory with bounded retention (no table, no migration; hosts re-send after a restart).
 * ``POST cleanup/preview`` runs the existing dry-run planner; there is no apply endpoint (apply stays CLI-only).
 * Lifecycle changes are published with ``repo.record_event`` (redacted, allowlisted). The shared SSE stream has no
   event ids; ``GET /build-cache/events/stream`` is the resumable one (``id:`` + ``Last-Event-ID``, 500-event ring

@@ -96,10 +96,8 @@ telemetry is `builds.jsonl`, the host-local API/SSE and the dashboard panel.
 
 ## Known gaps
 
-- `Registry.reconcile` has no caller (no controller or startup hook).
-- SSE has no `id:`/Last-Event-ID; no resume beyond the shared stream's last-100 replay.
-- No ingest of other hosts' builds; API/panel show the control-plane host only; no migration 0046.
-- Missing events: `cache_stats_updated`, `storage_degraded`, `lease_changed`, `cleanup_completed`.
+- Closed 2026-11-05 (feat/build-cache-backend-followups): `Registry.reconcile` is called at build start and in the cleanup sweep; the four contract events are emitted (to `contract-events.jsonl`); the build-cache SSE stream has `id:`/Last-Event-ID resume; other hosts' builds can be ingested (opt-in, in memory).
+- Still open after that work: ingest is in memory only (lost on control-plane restart; hosts must re-send) and nothing schedules `build_cache_report.report_builds` yet (no timer or CLI); ingest was exercised only against a real control-plane server on loopback, never with a real second host; SSE ids are a service-wide counter with a 500-event ring (older ids replay at-least-once); the shared `/api/v1/events/stream` still has no ids; `lease_changed`/`storage_degraded` are emitted only by code paths that run on the build host, so remote hosts do not report them.
 - (Closed 2026-11-04) the credentialed per-policy server start exists
   (`build_cache_server.py`). Tailnet SigV4 rejection fixed in code (agent restart required, `systemctl --user restart herdr-eng-fabric-agent.service`); still untested: a real second host; sccache does not authenticate objects; same-uid code can read server env.
 - `slurm.*` overlaps `execution.slurm_enabled/allowed_partitions`; authority unsettled.
