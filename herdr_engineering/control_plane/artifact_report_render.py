@@ -24,11 +24,13 @@ def _asset_link(value: str) -> str:
 
 
 _LIGHT = ("--bg:#f7f7f8;--surface:#fff;--surface-2:#ececf1;--border:#d9d9e3;"
-          "--text:#353740;--muted:#6e6e80;--accent:#10a37f;--accent-weak:#d2f0e8;--link:#0d8f6f;--warn:#9b5d00;"
-          "--warn-bg:#fff4e5;--on-accent:#fff;")
+          "--text:#353740;--muted:#666678;--accent:#10a37f;--accent-weak:#d2f0e8;--link:#0a7058;--warn:#9b5d00;"
+          "--warn-bg:#fff4e5;--btn:#0b7a60;--on-accent:#fff;--shadow:0 1px 2px rgba(16,24,40,.05);")
+# WCAG AA (4.5:1) in light needed three deviations from theme.css: --muted #6e6e80 -> #666678 (4.2 on --surface-2),
+# --link #0d8f6f -> #0a7058 (3.4 on --accent-weak), and white-on-#10a37f (3.2) -> a darker --btn fill; --accent stays.
 _DARK = ("color-scheme:dark;--bg:#17181c;--surface:#1f2026;--surface-2:#2a2b33;--border:#3a3b45;--text:#e6e6ea;"
          "--muted:#a4a4b3;--accent:#2fc59c;--accent-weak:#153d33;--link:#4ad6b0;--warn:#fbbf24;"
-         "--warn-bg:#2b2310;--on-accent:#07211a;")
+         "--warn-bg:#2b2310;--btn:#2fc59c;--on-accent:#07211a;--shadow:0 1px 3px rgba(0,0,0,.5);")
 # Light is the base; dark applies when the OS asks for it unless the host forces light, or whenever the host forces
 # dark. The host sets data-theme on :root (standalone page) or on the shadow host (dashboard), never in the markup.
 _CORE_CSS = (
@@ -54,7 +56,7 @@ _FULL_CSS = _CORE_CSS + (
     ".toc a{padding:3px 10px;border:1px solid var(--border);border-radius:999px;background:var(--surface);"
     "text-decoration:none;color:var(--muted)}.toc a:hover{border-color:var(--accent);color:var(--link)}"
     ".card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;"
-    "margin:0 0 14px;box-shadow:0 1px 2px rgba(16,24,40,.05)}.finding{border-left:4px solid var(--accent)}"
+    "margin:0 0 14px;box-shadow:var(--shadow)}.finding{border-left:4px solid var(--accent)}"
     ".chips{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 0;align-items:center}"
     ".chips b{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600}"
     ".chip{font:500 12px/1.5 var(--mono);padding:1px 8px;border:1px solid var(--border);border-radius:999px;"
@@ -71,7 +73,7 @@ _FULL_CSS = _CORE_CSS + (
     "code,.mono{font:12.5px var(--mono);background:var(--surface-2);padding:1px 5px;border-radius:4px}"
     ".callout{background:var(--accent-weak);border-radius:var(--radius);padding:10px 14px;margin:10px 0;font-size:14px}"
     ".callout b{display:block;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--link)}"
-    ".btn{display:inline-block;padding:5px 14px;border-radius:4px;background:var(--accent);color:var(--on-accent);"
+    ".btn{display:inline-block;padding:5px 14px;border-radius:4px;background:var(--btn);color:var(--on-accent);"
     "font-weight:600;font-size:13px;text-decoration:none}.btn:hover{filter:brightness(1.08)}"
     "details{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 16px}"
     "summary{cursor:pointer;font-weight:600}dl{display:grid;grid-template-columns:minmax(0,max-content) 1fr;"

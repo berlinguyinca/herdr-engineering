@@ -375,3 +375,55 @@ def test_minimum_cap_holds_for_the_longest_hostile_title(char):
     document.feed(page)
     assert not document.stack
     assert page.count("<h1>") == 1 and "<script" not in page
+
+
+def _luminance(colour: str) -> float:
+    digits = colour.lstrip("#")
+    digits = digits if len(digits) == 6 else "".join(char * 2 for char in digits)
+    linear = [(v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4)
+              for v in (int(digits[i:i + 2], 16) / 255 for i in (0, 2, 4))]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def _contrast(foreground: str, background: str) -> float:
+    light, dark = sorted((_luminance(foreground), _luminance(background)), reverse=True)
+    return (light + 0.05) / (dark + 0.05)
+
+
+def _tokens(block: str) -> dict[str, str]:
+    return dict(re.findall(r"--([a-z0-9-]+):([^;}]+)", block))
+
+
+def _palettes(page: str) -> tuple[dict[str, str], dict[str, str]]:
+    light = _tokens(re.search(r":root,:host\{([^}]*)\}", page).group(1))
+    dark = _tokens(re.search(r':root\[data-theme="dark"\],:host\(\[data-theme="dark"\]\)\{([^}]*)\}', page).group(1))
+    return light, dark
+
+
+# (text token, background token): every text/background pairing the stylesheet actually draws
+_TEXT_PAIRS = [("text", "bg"), ("text", "surface"), ("text", "surface-2"), ("text", "accent-weak"),
+               ("text", "warn-bg"), ("muted", "bg"), ("muted", "surface"), ("muted", "surface-2"),
+               ("link", "bg"), ("link", "surface"), ("link", "surface-2"), ("link", "accent-weak"),
+               ("on-accent", "btn"), ("warn", "warn-bg")]
+
+
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+def test_both_palettes_meet_wcag_aa_for_every_text_pairing(scheme):
+    light, dark = _palettes(_render())
+    palette = light if scheme == "light" else {**light, **dark}
+    failures = {(fg, bg): round(_contrast(palette[fg], palette[bg]), 2) for fg, bg in _TEXT_PAIRS
+                if _contrast(palette[fg], palette[bg]) < 4.5}
+    assert not failures
+
+
+def test_contrast_helper_matches_known_wcag_values():
+    assert round(_contrast("#000", "#fff"), 1) == 21.0
+    assert round(_contrast("#fff", "#fff"), 1) == 1.0
+    assert round(_contrast("#777", "#fff"), 2) == 4.48  # the classic just-failing grey
+
+
+def test_card_shadow_is_a_token_with_a_dark_value_and_buttons_use_the_button_token():
+    page = _render()
+    light, dark = _palettes(page)
+    assert light["shadow"] != dark["shadow"] and "box-shadow:var(--shadow)" in page
+    assert "background:var(--btn)" in page and "color:var(--on-accent)" in page
