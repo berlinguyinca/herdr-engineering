@@ -750,6 +750,7 @@ test('service catalog filters, archive inspection and groups survive live refres
     await page.locator('#sc-host').selectOption('beast');
     await page.locator('#sc-expand').click();
     const archived=page.locator('.sc-row').filter({hasText:'Archived parser'});
+    await archived.first().waitFor();
     assert.equal(await archived.count(),1);
     assert.equal(await page.locator('a[href^="javascript:"]').count(),0);
     assert.equal(await page.evaluate(()=>window.catalogXss),undefined);
