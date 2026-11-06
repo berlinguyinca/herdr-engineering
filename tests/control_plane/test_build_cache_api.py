@@ -539,3 +539,19 @@ def test_sender_posts_the_local_summary_non_secret_fields_only(tmp_path):
         assert SECRET not in json.dumps(rows) and "/home/secret" not in json.dumps(rows)
     finally:
         svr.shutdown()
+
+
+@pytest.mark.parametrize("bad_ts", [5, 1.5, True])
+def test_ingest_non_string_ts_cannot_break_build_reads(tmp_path, bad_ts):
+    svr, base, _ = _serve_ingest(tmp_path, {"enabled": True})
+    try:
+        _write_builds(tmp_path / "state", [_started(1), _finished(1)])        # local rows carry string ts
+        rec = _rec("h2", 1)
+        rec["ts"] = bad_ts
+        assert call(base, "POST", REPORT, "k-host", {"host_id": "h2", "builds": [rec]})[0] == 400
+        ok = call(base, "POST", REPORT, "k-host", {"host_id": "h2", "builds": [_rec("h2", 2)]})
+        assert ok[0] == 200                                                   # a string ts is still accepted
+        code, out = call(base, "GET", "/api/v1/build-cache/builds", "k-view")
+        assert code == 200 and {b["host"] for b in out["builds"]} == {"h1", "h2"}
+    finally:
+        svr.shutdown()

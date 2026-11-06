@@ -204,7 +204,7 @@ class BuildCacheService:
         if self.ingest_cfg["enabled"] and self._remote:
             with self._lock:
                 remote = [r for h in self._remote.values() for slot in h.values() for r in slot.values()]
-            rows = sorted(rows + self._merge(remote), key=lambda r: r.get("ts") or "", reverse=True)
+            rows = sorted(rows + self._merge(remote), key=lambda r: str(r.get("ts") or ""), reverse=True)
         return rows
 
     @staticmethod
@@ -391,6 +391,8 @@ class BuildCacheService:
             if not isinstance(raw, dict) or raw.get("event") not in _BUILD_EVENTS \
                     or not isinstance(raw.get("build_id"), str) or not _ID_RE.match(raw["build_id"]):
                 raise ValueError("each record needs event (build_started|build_finished) and a valid build_id")
+            if not isinstance(raw.get("ts", ""), str):                # a non-string ts would break the newest-first sort
+                raise ValueError("ts must be a string")
             rec = {k: (v[:256] if isinstance(v, str) else v) for k, v in _slim(raw).items()}
             rec["host"] = host_id
             records.append(rec)
