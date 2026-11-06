@@ -609,7 +609,7 @@ class TeamRolesMixin:
         root_id = None
         if coord is not None:
             root_id = pt["coord"]["root"] if pt.get("coord") else parent
-            self._tc_check_caps(coord, limits, root_id, depth)
+            self._tc_check_caps(coord, limits, root_id, depth, pr)
         self._prune()
         work = self._tr2_work(room_id, reviews) if reviews is not None else None
         why = self._tr2_disqualified(work) if work is not None else {}

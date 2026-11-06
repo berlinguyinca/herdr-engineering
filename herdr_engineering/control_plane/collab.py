@@ -132,6 +132,9 @@ class ApprovalPolicy:
         self.auto_groups = frozenset(auto_groups)
         self.approver_groups = frozenset(approver_groups)
 AGENT_ACTIONS = frozenset({"read", "post", "instruct", "execute", "spawn_helpers"})  # an agent can never invite/grant/administer
+# Fabric trust slice 4: "coordinate" is NOT in AGENT_ACTIONS (the ceiling every other path intersects with). Only the room owner's
+# direct grant, naming one attached team, carries it; see grant_agent and _effective.
+COORDINATE = "coordinate"
 PROJECT_ROLES = frozenset({"manager", "contributor"})
 
 MAX_TEXT = 8000
@@ -1132,7 +1135,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 self._rooms_by_agent[aid].discard(runtime["room_id"])
         elif t == "agent_granted":
             self._rooms[p["room_id"]]["grants"][p["agent_id"]] = {
-                "actions": list(p["actions"]), "expires_at": p.get("expires_at"), "granted_seq": seq}
+                "actions": list(p["actions"]), "expires_at": p.get("expires_at"), "granted_seq": seq,
+                **({"coordinate_team": p["coordinate_team"]} if p.get("coordinate_team") else {})}
             self._agent_projects[p["agent_id"]].add(p["project_id"])
             self._rooms_by_agent[p["agent_id"]].add(p["room_id"])
         elif t == "workspace_linked":
@@ -1497,6 +1501,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         if not m or not self._ok(agent["owner"]):
             return None  # owner lost membership: the agent loses it too
         allowed = frozenset(grant["actions"]) & ROLE_ACTIONS[m["role"]] & AGENT_ACTIONS
+        if COORDINATE in grant["actions"] and grant.get("coordinate_team") and m["role"] == "owner":
+            allowed |= {COORDINATE}          # slice 4: the owner's own agent, granted by the owner for one team; never inherited
         bound = agent.get("external")
         if bound:
             # An external agent is bound to the room it was invited into: a later grant anywhere else
@@ -3677,8 +3683,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             aid = body["agent_id"]
             if (room["grants"].get(aid) or {}).get("team_id"):
                 raise CollabError(409, "this agent's access comes from an attached team; detach the team to change it")
-            actions = _actions(body.get("actions"))
+            actions = _actions(body.get("actions"), allow_coordinate=True)
             m = self._member(room, pr.id)
+            coordinate_team = self._grant_coordinate(pr, room, room_id, aid, actions, body, m)
             existing = room["grants"].get(aid)
             self._name_free(room, aid, agent["name"])
             narrowing = bool(existing) and set(actions) <= set(existing["actions"])
@@ -3691,7 +3698,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 self._commit("agent_granted", self._actor(
                     pr, project_id=room["project_id"], room_id=room_id, agent_id=aid,
                     actions=actions, expires_at=exp, action="agent.grant", outcome="allowed",
-                    project_ids=[room["project_id"]], resource_id=aid))
+                    project_ids=[room["project_id"]], resource_id=aid,
+                    **({"coordinate_team": coordinate_team} if coordinate_team else {})))
                 return {"room_id": room_id, "agent_id": aid, "actions": actions, "status": "granted"}
             now = self._now()
             open_here = [r for r in map(self._requests.get, self._requests_by_room.get(room_id, ()))
@@ -3705,6 +3713,27 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 actions=actions, created_epoch=now, action="agent.request", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=aid))
         return {"room_id": room_id, "agent_id": aid, "actions": actions, "status": "pending", "request_id": rid}
+
+    def _grant_coordinate(self, pr: Principal, room: dict, room_id: str, aid: str, actions: list[str], body: dict, m: dict) -> str | None:
+        """Fabric trust slice 4. ``coordinate`` is granted by the room OWNER alone, directly (never by request and never by an agent:
+        grant_agent is a person's route), for ONE attached team of this room, to the owner's own ordinary agent."""
+        team = body.get("team_id")
+        if COORDINATE not in actions:
+            if team is not None:
+                raise CollabError(400, "team_id goes with the coordinate action")
+            return None
+        if m["role"] != "owner":
+            self._audit_denied(pr, "agent.grant", "coordinate_owner_only", room_id=room_id,
+                               project_ids=[room["project_id"]], resource_id=aid)
+            self.stats["policy_denied"] += 1
+            raise CollabError(403, "forbidden: only the room owner grants coordinate")
+        if aid in self._helper_minted or aid in self._helper_by_agent:
+            raise CollabError(400, "a helper cannot coordinate")
+        if not isinstance(team, str):
+            raise CollabError(400, "coordinate names the attached team it coordinates: team_id")
+        if self._tr2_attached(room_id, team) is None:
+            raise CollabError(404, "no such team in this room")
+        return team
 
     def _helper_room_only(self, agent_id: str, room_id: str) -> None:
         h = self._helper_by_agent.get(agent_id)
@@ -5533,7 +5562,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         if not creator:
             return False
         eff = self._effective(Principal("agent", t["by_id"], creator["owner"]), room)
-        return bool(eff and "instruct" in eff[0])
+        if eff and "instruct" in eff[0]:
+            return True
+        c = t.get("coord")             # slice 4: a coordinator the owner granted `coordinate` is a creator while that holds
+        return bool(eff and c and COORDINATE in eff[0] and self._tc_holder_active(room, c["team"], "agent:" + t["by_id"]))
 
     def _task_json(self, tid: str, t: dict, *, bounds: bool = False, quoted: bool = False) -> dict:
         a = self._agents.get(t["target"], {})
@@ -5686,6 +5718,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
     def agent_room_tasks(self, pr: Principal, room_id: str) -> dict:
         out = self.task_inbox(pr, room_id=room_id)
         return {"tasks": [dict(t, untrusted=True) for t in out["tasks"]]}
+
+    def agent_created_tasks(self, pr: Principal, room_id: str) -> dict:
+        """The tasks THIS coordinator agent made in this room, with status and result (the owner reads them as in any task list)."""
+        if not pr.is_agent or pr.external:
+            raise CollabError(403, "forbidden")
+        return self.coordination_view(pr, room_id)
 
     def agent_respond_task(self, pr: Principal, room_id: str, task_id: str, body: dict) -> dict:
         if not pr.is_agent or pr.external:
@@ -6666,6 +6704,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.list_agent_requests(pr, rid)
                     if parts[2:] == ["agent", "tasks"]:
                         return 200, self.agent_room_tasks(pr, rid)
+                    if parts[2:] == ["agent", "tasks", "created"]:
+                        return 200, self.agent_created_tasks(pr, rid)
                     if parts[2:] == ["tasks"]:
                         return 200, self.list_tasks(pr, rid)
                     if parts[2:] == ["artifacts"]:
@@ -7191,8 +7231,9 @@ def _skills(value: Any) -> list[str] | None:
     return sorted(set(value))
 
 
-def _actions(value: Any) -> list[str]:
+def _actions(value: Any, allow_coordinate: bool = False) -> list[str]:
+    ok = AGENT_ACTIONS | {COORDINATE} if allow_coordinate else AGENT_ACTIONS     # only grant_agent passes allow_coordinate
     if (not isinstance(value, list) or not value
-            or not all(isinstance(a, str) and a in AGENT_ACTIONS for a in value)):
+            or not all(isinstance(a, str) and a in ok for a in value)):
         raise CollabError(400, "actions must be a non-empty subset of read, post, instruct, execute, spawn_helpers")
     return sorted(set(value))
