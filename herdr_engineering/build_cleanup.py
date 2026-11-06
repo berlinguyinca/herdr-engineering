@@ -232,6 +232,7 @@ def run_once(
         "timestamp": datetime.now(UTC).isoformat(), "status": "ok", "dry_run": dry_run,
         "roots": [], "removed_count": 0, "removed_bytes": 0, "reclaimed_bytes": 0,
         "removed": [], "would_remove": [], "skipped": [], "errors": [], "warnings": [],
+        "reconciled": [],
     }
     lock_fd = os.open(state_dir / "build-maintenance.lock",
                       os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -241,6 +242,7 @@ def run_once(
         except BlockingIOError:
             result["status"] = "busy"
             return result
+        _reconcile_registry(state_dir, result)
         _sweep(roots, state_dir, result, high_water, low_water, min_age_hours)
         if result["warnings"]:
             result["status"] = "warning"
@@ -250,6 +252,22 @@ def run_once(
         return result
     finally:
         os.close(lock_fd)
+
+
+def _reconcile_registry(state_dir: Path, result: dict) -> None:
+    """Fail attempts whose lease expired and whose owner is provably dead. Only registry rows change; no
+    artifact is touched, and an existing registry is required (the sweep never creates one)."""
+    from .build_registry import Registry, RegistryError, active_scopes, db_path
+    if not db_path(state_dir).exists():
+        return
+    try:
+        active_scopes(state_dir)  # read-only probe: an unreadable registry must stay unreadable (fail closed)
+    except RegistryError:
+        return
+    try:
+        result["reconciled"] = Registry(state_dir).reconcile()
+    except Exception as exc:  # noqa: BLE001 - a registry fault must not stop the sweep
+        result["warnings"].append(f"registry reconcile failed: {type(exc).__name__}")
 
 
 def _skip_for_registry(state_dir: Path, target: Path, name: str, result: dict) -> bool:

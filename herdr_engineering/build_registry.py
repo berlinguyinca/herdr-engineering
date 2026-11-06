@@ -675,6 +675,10 @@ class BuildRun:
         run._ttl = DEFAULT_LEASE_TTL_S if ttl_s is None else ttl_s
         try:
             run.registry = Registry(state_dir)
+            try:
+                run.registry.reconcile()  # expired leases of provably dead owners; never touches artifacts
+            except Exception:  # noqa: BLE001 - housekeeping must not block the build
+                pass
             repo_id, rev, digest = _identity(cwd)
             profile = "release" if "--release" in cmd or "-r" in cmd[1:] else "dev"
             run.reg = run.registry.register(
