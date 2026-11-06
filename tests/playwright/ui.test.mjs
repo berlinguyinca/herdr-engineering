@@ -1695,8 +1695,10 @@ test('mission detail links to the delivery section pages', async () => {
     await page.goto(`${base}/#/missions/${encodeURIComponent(key)}`);
     await page.locator('a:has-text("Tests & builds")').first().waitFor({ timeout: 15000 });
     await page.locator('a:has-text("Reviews & PRs")').first().click();
+    // The detail page's own story grid also says "Pull requests", so wait for
+    // the reviews route and for its PR card, not for that shared heading.
     await page.waitForFunction(
-      () => (document.body ? document.body.innerText : '').includes('Pull requests'),
+      () => (document.getElementById('mission-reviews')?.innerText || '').includes('PR #7'),
       null, { timeout: 15000 });
     assert.ok((await bodyText(page)).includes('PR #7'), 'review section must render via detail nav');
   }, { BURST: '0' });
