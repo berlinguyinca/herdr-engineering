@@ -381,7 +381,7 @@ def test_a_standing_grant_authorizes_nothing_but_matched_deploys(dw):
         assert d.outcome == "pending"
     d = decide(dw.store, dw.cfg, dw.worker, RawAction(tool="deploy", repo=REPO, environment="prod"), "s", "t", NOW,
                judge=dw.judge, deploy_cfg=DEPLOY)
-    assert (d.outcome, d.source) == ("pending", "owner")                           # the deploy TOOL key is another key
+    assert (d.outcome, d.source) == ("pending", "deploy_mode")                     # the deploy TOOL is scope-gated
 
 
 def test_a_one_shot_approved_deploy_is_authorized_once_without_preconditions(dw):
@@ -449,3 +449,24 @@ def test_a_scope_or_config_removed_never_authorizes(dw):
 def test_without_a_grant_a_mode_ask_scope_is_an_ordinary_owner_ask(dw):
     dw.gate()
     assert dw.deploy(deploy_cfg=with_mode("ask")).source == "owner"
+
+
+def _tool_deploy(dw, repo=REPO, env="prod", cfg=DEPLOY):
+    return decide(dw.store, dw.cfg, dw.worker, RawAction(tool="deploy", repo=repo, environment=env), "s", "t",
+                  dw.clock.now, judge=dw.judge, deploy_cfg=cfg)
+
+
+def test_deploy_tool_for_a_configured_repo_is_scope_gated_never_one_shot(dw):
+    d = _tool_deploy(dw)
+    assert (d.outcome, d.source) == ("pending", "deploy_mode")
+    assert "/auto" in d.reason
+    assert dw.grants() == []
+    record_owner_decision(dw.store, dw.cfg, NOW, T, U, d.request_id, True, "slack:U0OWNER01", provenance="owner_slack")
+    again = _tool_deploy(dw)
+    assert again.outcome == "pending"
+    assert dw.grants() == []
+
+
+def test_deploy_tool_for_an_unconfigured_repo_keeps_the_ordinary_key(dw):
+    d = _tool_deploy(dw, repo="nobody/unlisted")
+    assert d.source != "deploy_mode"

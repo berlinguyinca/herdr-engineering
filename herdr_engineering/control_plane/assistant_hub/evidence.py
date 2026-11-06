@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from ..assistant import AssistantStore
-from .actiongrants import ActionEvidence, ActionGrant, GrantState, as_utc
+from .actiongrants import STANDING_SOURCE, ActionEvidence, ActionGrant, GrantState, as_utc
 from .verbs import ActionKey, RiskClass, Verb
 
 log = logging.getLogger(__name__)
@@ -61,7 +61,8 @@ def required_approvals(risk: RiskClass, cfg: Mapping, scope_is_new_for_confirmed
 def _scope_is_new_for_confirmed_verb(grants: Sequence[ActionGrant], worker_id: str, key: ActionKey) -> bool:
     # REVOKED confirmed grants intentionally stop lowering the requirement: revocation withdraws that confirmation.
     scope = key.resource_scope.casefold()
-    return any(g.worker_id == worker_id and g.verb == key.verb.value and g.confirmed_by
+    # an owner_standing grant is a confirmed deploy SCOPE, not an earned verb: it never lowers an earned grant's bar
+    return any(g.worker_id == worker_id and g.verb == key.verb.value and g.confirmed_by and g.source != STANDING_SOURCE
                and g.state in (GrantState.ACTIVE, GrantState.EXPIRED) and g.activated_at is not None
                and g.resource_scope.casefold() != scope
                for g in grants)

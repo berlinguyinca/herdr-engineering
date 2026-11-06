@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+STANDING_SOURCE = "owner_standing"      # ActionGrant.source of a deploy scope the owner confirmed in Slack
 
 
 def as_utc(value: datetime) -> datetime:

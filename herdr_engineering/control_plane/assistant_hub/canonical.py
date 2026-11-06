@@ -69,6 +69,7 @@ class Derived:
     hint_cwd: str = ""
     one_shot_safe: bool = False   # True only when key.target digests the WHOLE action (see policy one-shot approvals)
     deploy: Any = None            # a deploy.DeployMatch when the hub matched a configured deploy scope (else None)
+    scope_gated: bool = False     # a ``deploy`` tool call for a repo with configured deploy scopes: only the scope flow
 
 
 @dataclass(frozen=True)
@@ -1057,12 +1058,28 @@ def _with_deploy(raw: RawAction, derived: Derived, deploy_cfg: Any) -> Derived:
                    details=details)
 
 
+def _scope_gated(derived: Derived, deploy_cfg: Any) -> Derived:
+    """A ``deploy`` tool call for a repo that has configured deploy scopes must not be a way around them: it is never
+    one-shot and never grantable (its key becomes unknown), so it is always pending and the owner is pointed at the
+    scope flow.  A repo with no configured scope keeps the ordinary deploy key."""
+    from .deploy import _scopes
+    key = derived.key
+    if key is None or key.verb not in (Verb.DEPLOY_PROD, Verb.DEPLOY_CANARY):
+        return derived
+    if not any(repo.casefold() == key.resource_scope.casefold() for _, _, repo, _ in _scopes(deploy_cfg)):
+        return derived
+    unknown = mk_key("deploy", Verb.UNKNOWN, key.resource_scope, raw_digest(key.verb.value))
+    return replace(derived, key=unknown, elements=(unknown,), owner_decides=True, one_shot_safe=False,
+                   scope_gated=True, reason="deploys of this repo are authorized per configured scope")
+
+
 def derive(raw: RawAction, deploy_cfg: Any = None) -> Derived:
     tool = raw.tool.strip().lower()
     hint = _hint(raw)
     facts: list[str] = []
     if tool in _TOOLS:
-        return _TOOLS[tool](raw, hint, facts)
+        derived = _TOOLS[tool](raw, hint, facts)
+        return _scope_gated(derived, deploy_cfg) if tool == "deploy" and deploy_cfg else derived
     if tool in SHELL_TOOLS:
         try:
             derived = _shell(raw, hint, facts)

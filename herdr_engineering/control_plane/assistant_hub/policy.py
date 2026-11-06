@@ -17,7 +17,15 @@ from datetime import datetime, timedelta
 from typing import Literal
 
 from ..assistant import AssistantStore
-from .actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, GrantState, as_utc, revoke
+from .actiongrants import (
+    STANDING_SOURCE,
+    ActionEvidence,
+    ActionGrant,
+    ActionRequestRow,
+    GrantState,
+    as_utc,
+    revoke,
+)
 from .calibration import build_report, gate_satisfied
 from .canonical import Derived, RawAction, derive
 from .deploy import DeployMatch, scope_config, scope_key, scope_mode
@@ -162,7 +170,7 @@ def _deny(store: AssistantStore, worker: Worker, raw: RawAction, derived: Derive
     return Decision("denied", f"Denied by the {veto.code} rule: {veto.reason}.", row.request_id, None, veto.code, "veto")
 
 
-STANDING = "owner_standing"      # ActionGrant.source of a deploy scope the owner confirmed in Slack
+STANDING = STANDING_SOURCE      # ActionGrant.source of a deploy scope the owner confirmed in Slack
 
 
 def _live_grant(store: AssistantStore, cfg: dict, worker: Worker, key: ActionKey, now: datetime,
@@ -394,6 +402,11 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
                 _open_deploy_check(store, deploy_cfg, worker, derived.deploy, task_id, consumed.request_id, now)
             return Decision("authorized", "Authorized once by the owner's approval of this exact action.",
                             consumed.request_id, None, None, "owner")
+    if derived.scope_gated:
+        return _pending(store, worker, raw, derived, session_id, task_id, now, "deploy_mode",
+                        "Deploys of this repo are authorized per configured scope, not by this tool: the owner decides, "
+                        "or confirms auto-deploy for the scope (POST /api/v1/assistant-deploys/<project>/<scope>/auto).",
+                        judge, notify=notify)
     if derived.owner_decides or derived.key is None:
         return _pending(store, worker, raw, derived, session_id, task_id, now, "unknown",
                         "The action could not be classified with certainty, so the owner decides.", judge, notify=notify)
