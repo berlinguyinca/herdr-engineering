@@ -1,0 +1,136 @@
+# Fabric trust: collaboration without tokens for agents inside the fabric
+
+Status: slices 1-5 implemented; the dedicated listener (slice 6a) is not. Design: `docs/specs/fabric-trust-agent-auth-20261104/SPEC.md`.
+Threat model: [fabric-trust-threat-model.md](fabric-trust-threat-model.md).
+
+## 1. What it is
+
+An agent that runs on a machine of your own tailnet (bender, beast, zapp, ...) can use the collaboration API without holding a secret.
+The control plane asks the local tailscaled who owns the TCP peer address; if that node is on an allow-list, and the agent was bound
+to that machine and switched on by its owner, the request is accepted as that agent, with exactly the grants and ceilings the same agent
+has with a credential. Tokens stay for external users (people through Cognito or a static bearer, external coworker agents through an
+invite credential). Off by default; YAML only (no environment variables).
+
+## 2. The three auth schemes
+
+| Header | Who | Secret |
+|---|---|---|
+| `Authorization: Bearer <token>` | people (Cognito or static token) | the token |
+| `Authorization: Agent <credential>` + `X-Herdr-Device` | agents and external coworker agents | the credential |
+| `Authorization: Fabric <agent_id>` (+ optional `X-Herdr-Machine: <name>`) | agents of the owner, on an allow-listed machine | none; the tailnet machine vouches |
+
+`X-Herdr-Machine` is informational. The whois result decides; a header that names a different machine is a 401 (`fabric_header_mismatch`).
+External agents and helpers can never use `Fabric`. A fabric caller cannot set the fabric bit and cannot rotate a credential (403).
+
+## 3. Prerequisites
+
+- tailscaled runs on the collab host and the control-plane user can reach its LocalAPI socket. The code tries
+  `/var/run/tailscale/tailscaled.sock` and `/run/tailscale/tailscaled.sock`. Give that user access with
+  `tailscale set --operator=<user>` or a group on the socket. If tailscaled is unreachable, Fabric fails closed (401).
+- The collab service sees the real peer. Fabric works only on the MAIN collab handler, with a peer inside `100.64.0.0/10` or
+  `fd7a:115c:a1e0::/48`. See section 9 for what that means today.
+- Every machine you list is an ordinary end host (see section 10).
+
+## 4. Configuration
+
+In the fleet/control-plane YAML (read per request, so an edit takes effect without a restart):
+
+```yaml
+control_plane:
+  collab:
+    fabric_trust:
+      enabled: false           # absent = off
+      kill_switch: false       # true = every Fabric request is 401 at once
+      machines: [bender, beast, zapp]   # tailscale MagicDNS short names
+      tailnet_suffix: tail0c50da.ts.net # REQUIRED when enabled: a node is a machine only if its FULL name is <machine>.<suffix>
+      agent_ttl_seconds: 2592000        # how long the owner's "fabric" bit stays valid (default 30 d, 300..7776000)
+      whois_cache_seconds: 30           # 0..3600
+```
+
+Unknown keys, wrong types, `enabled` without `machines` or without `tailnet_suffix` are rejected (`herdr-eng` refuses the config). A source
+that fails to read or validate means OFF with the kill switch on. The machine is matched on the FULL MagicDNS name
+(`<machine>.<tailnet_suffix>`, trailing dot stripped, case-insensitive), never on the first label alone.
+
+## 5. Enrolling an agent and switching it on
+
+1. Enrol the agent with its machine recorded. With `join.sh`: `... | HERDR_JOIN_TOKEN='hcj_...' bash -s -- --machine bender [--count N ...]`
+   (`--machine NAME`: the MagicDNS short name). Enrolment records the machine and never turns the bit on.
+2. The room owner grants the agent its room permissions as usual.
+3. The agent's OWNER sets the bit: `POST /api/v1/collab/agents/{agent_id}/fabric` with `{"fabric": true}` (optionally `"machine": "bender"` to
+   (re)bind). An agent without a recorded machine gets 400. Only the owner can call it; agents (fabric ones too) cannot. Clearing the bit
+   (`{"fabric": false}`) is a revocation and takes effect at once, including on open streams.
+4. **Expiry and renewal.** Setting the bit records `fabric_expires_at` = now + `agent_ttl_seconds` (30 days by default). After that every
+   Fabric request is refused with `fabric_expired`. Setting the bit again renews it. Logs written before this field existed count as
+   expired (fail closed). The agent list (`list_my_agents`) shows `machine`, `fabric` and `fabric_expires_at`, and the dashboard marks an
+   expired bit "fabric expired".
+
+## 6. Granting `coordinate`
+
+A coordinator agent (the bender Claude session, registered as its own agent) creates tasks BY ROLE inside one attached team. The room OWNER
+grants it directly: `POST /api/v1/collab/rooms/{room_id}/agents` with `actions` including `coordinate`, plus `team_id` (an attached team of
+that room) and `roles`, a non-empty list of team roles (`implementer`, `issue_writer`, `reviewer`, `tester`). A grant without `roles` is 400.
+`roles` is the exact allow-list; re-granting replaces it; revoking or detaching clears it. Not self-grantable, not by an agent, not by a
+request approval, never for helpers. It needs `team_rooms`, `team_roles` and `coordinators.enabled` on and `coordinators.kill_switch` off
+(and the agent also needs `execute`, plus a person-given root task, passed as `parent_task_id`, that it accepted). The coordinator posts to
+`rooms/{room_id}/tasks` with `target_role` (not `target_agent_id`), within `coordinators.tasks_per_hour` / `max_open` and depth limits.
+`GET rooms/{room_id}/agent/tasks/created` lists the tasks it created with status and result. The dashboard shows
+"coordinator: <team> · roles <list>" on the agent.
+
+## 7. Agent task routes and CLI
+
+Agent-principal routes (credential or Fabric), under `/api/v1/collab`:
+
+- `GET rooms/{room_id}/agent/tasks` - this agent's tasks.
+- `POST rooms/{room_id}/agent/tasks/{task_id}/respond` - body `status` (`accepted`, `done`, `declined`, `failed`), optional `result`, `attempt`.
+- `GET rooms/{room_id}/agent/tasks/created` - coordinator's own tasks.
+
+CLI (`herdr-eng rooms my-tasks ROOM` and `herdr-eng rooms respond ROOM TASK [STATUS] [--status S] [--result TEXT] [--attempt N]`):
+agent mode applies when no token is set in `--token-env`, or when `--as-agent` is given (an explicit `--as-agent` wins over a token).
+- `--as-agent AGENT_ID` sends `Authorization: Fabric AGENT_ID`.
+- `--machine NAME` is the informational machine header; default is asked of `tailscale status --json` (its `Self.DNSName` first label).
+- Agent identity sources, in order: `--as-agent`; `HERDR_AGENT_ID`; the single agent in `~/herdr-agents/*.json` (`$HERDR_AGENT_DIR`; only
+  its `agent_id` is read, never the credential). Several agents on one host is ambiguous: pass `--as-agent`.
+- `--attempt N` (from `my-tasks`) is the lease fence; with a bearer token it is ignored (a message says so).
+
+## 8. Operating notes
+
+- **Audit.** Every event an agent principal commits carries `actor_agent_id` and, for fabric callers, `via: "fabric"` and `machine`
+  (events from the read routes, the stream and the project audit route `GET audit?project_id=...` show both fields). Refusals of an otherwise
+  recognised agent (right allow-listed machine) are audited as `audit_denied` with action `auth.agent` and the reason below, at most once
+  per (agent, reason) per 60 s; the `auth_failures` counter counts every attempt. Refusals before the machine is known are not logged.
+- **Kill switch.** `kill_switch: true` (or `enabled: false`): every Fabric request is 401. Nothing is deleted; tokens and credentials are
+  unaffected. Open Fabric streams end at the next re-check.
+- **Rollback (SPEC 6).** New events are additive and ignored by an older image. Before rolling the IMAGE back, revoke the `fabric` bit of
+  agents and revoke `coordinate` deliberately, and let the sweep run first: an old image does not know `coordinate`, treats a coordinator's open
+  tasks as creator-invalid, and its sweep turns them into permanent cancellations.
+- Any owner re-grant of a coordinator resets its grant sequence, so it needs a fresh root task.
+
+## 9. Listener limitation (read this)
+
+Fabric works only on the main collab handler and only with a real tailnet peer. The `public` (internet-facing, `/mcp`, `/a2a`) and `operator`
+handlers never pass a peer, so Fabric is always 401 there. A request with any forwarding header (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`,
+`X-Forwarded-Host`, `X-Forwarded-Server`, `Tailscale-User-Login`, `Tailscale-User-Name`, `Via`) is refused as Fabric, and loopback, LAN and
+public peers never qualify. Consequence today: behind the public edge, `tailscale serve` or any local proxy, Fabric requests always 401. The
+real fix is a dedicated tailnet listener (slice 6a); the operator decision on it is pending.
+
+## 10. What NOT to put in `machines`
+
+Never an L4/SNI proxy, a subnet router or an exit node: such a node presents its own tailnet address for traffic that originates elsewhere, so
+whois would vouch for the wrong party. Only ordinary end hosts that run the agents themselves.
+
+## 11. Troubleshooting
+
+All Fabric refusals return the same generic `401 unauthorized`; the reason is in the audit (`audit_denied`, action `auth.agent`).
+
+| Reason (audit) | Meaning and fix |
+|---|---|
+| (none, generic 401) | feature off or kill switch on; peer not a tailnet address, loopback, or relayed (forwarding header); tailscaled unreachable; node not on `machines` or not `<machine>.<tailnet_suffix>`; unknown agent id |
+| `fabric_header_mismatch` | `X-Herdr-Machine` names a different machine than whois found; drop the header or fix `--machine` |
+| `fabric_agent_inactive` | the agent is not active (revoked or ended) |
+| `fabric_agent_kind` | external or helper agent: these can never use Fabric |
+| `fabric_owner_disabled` | the owner's account is no longer approved |
+| `fabric_machine_unbound` | the agent has no recorded machine or it is bound to another one: re-bind with `POST agents/{id}/fabric` and `machine` |
+| `fabric_not_enabled` | the owner has not set the bit (or cleared it) |
+| `fabric_expired` | the bit's `agent_ttl_seconds` window ended: the owner sets it again |
+| 400 on `POST agents/{id}/fabric` | no machine recorded: pass `machine` |
+| 403 `forbidden: only the room owner grants coordinate` | grant `coordinate` as the room owner |

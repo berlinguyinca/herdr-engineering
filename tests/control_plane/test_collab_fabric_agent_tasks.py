@@ -638,3 +638,17 @@ def test_cli_requeued_task_answered_without_attempt_is_409_send_the_attempt(vouc
         "bender",
     )
     assert rc == 1 and "send the attempt" in err
+
+
+def test_cli_default_machine_header_is_the_short_name_not_the_full_dns_name(vouched, tmp_path):
+    """Regression (slice 5): tailscale reports bender.<tailnet>.ts.net, the control plane compares the short name; the default
+    header must not turn every default-machine call into fabric_header_mismatch."""
+    w = vouched
+    info = fabric_agent(w)
+    bindir = tmp_path / "tsbin"
+    bindir.mkdir()
+    ts = bindir / "tailscale"
+    ts.write_text('#!/bin/sh\necho \'{"Self": {"DNSName": "Bender.tail1234.ts.net."}}\'\n')
+    ts.chmod(0o755)
+    rc, out, err = cli(w, tmp_path, "my-tasks", w.room, "--as-agent", info["agent_id"], env_extra={"PATH": str(bindir)})
+    assert rc == 0, err

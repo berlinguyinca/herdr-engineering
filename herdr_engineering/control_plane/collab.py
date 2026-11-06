@@ -404,6 +404,11 @@ class FileEventLog:
     record = record_required
 
 
+def _coordinator_view(grant: dict) -> dict:
+    """What a room member may see of an agent's ``coordinate`` grant: the team and its exact role allow-list."""
+    return {"team_id": grant["coordinate_team"], "roles": sorted(grant.get("coordinate_roles") or [])}
+
+
 class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixin, TeamRoomsMixin, TeamRolesMixin,
                     CoordinatorsMixin, TeamBriefsMixin, FabricTrustMixin, FabricAuthMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
@@ -2869,7 +2874,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             out = []
             for aid in self._agents_by_owner.get(pr.id, ()):
                 a = self._agents[aid]
-                rooms = [{"room_id": rid, "name": self._rooms[rid]["name"], "actions": g["actions"]}
+                rooms = [{"room_id": rid, "name": self._rooms[rid]["name"], "actions": g["actions"],
+                          **({"coordinator": _coordinator_view(g)} if g.get("coordinate_team") else {})}
                          for rid in self._rooms_by_agent.get(aid, ()) if (g := self._rooms[rid]["grants"].get(aid))]
                 pending = [{"room_id": r["room_id"], "name": self._rooms[r["room_id"]]["name"],
                             "actions": r["actions"]} for r in map(self._requests.get, self._requests_by_agent.get(aid, ()))
@@ -3949,7 +3955,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         "status": "active" if g and a.get("status") == "active" else "removed",
                         "instance_id": a.get("instance_id") if a.get("owner") == pr.id else None,
                         "parent_agent_id": a.get("parent") if a.get("parent") in room["grants"] else None,
-                        "group": _herd_group(a.get("name", ""))}
+                        "group": _herd_group(a.get("name", "")),
+                        **({"coordinator": _coordinator_view(g)} if g and g.get("coordinate_team") else {})}
                 return nodes[key]
 
             def user_node(uid: str) -> dict:
@@ -4058,7 +4065,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                                 "owner_user_id": a["owner"], "actions": g["actions"],
                                 "external": bool(a.get("external")), "address": self._address(aid),
                                 "aliases": list(a.get("aliases", ())), "skills": list(a.get("skills", ())),
-                                "online": self._online(room_id, "agent", aid)})
+                                "online": self._online(room_id, "agent", aid),
+                                **({"coordinator": _coordinator_view(g)} if g.get("coordinate_team") else {})})
         return {"agents": out}
 
     # -- room <-> workspace and mission links
@@ -6439,6 +6447,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                "project_id": p.get("project_id"), "created_at": p["created_at"],
                "correlation_id": p.get("correlation_id"), "causation_id": p.get("causation_id"),
                "visibility_scope": p.get("visibility_scope", "room")}
+        if p.get("via"):                              # additive: the actor was identified by its tailnet machine
+            out.update(via=p["via"], machine=p.get("machine"))
         if t == "message":
             out.update(sender={"type": "external" if p.get("sender_external") else p["sender_kind"],
                                "id": p["sender_id"], "owner_user_id": p["actor_user_id"]},
@@ -6552,6 +6562,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                             "actor_kind": p.get("actor_kind"), "client_ip": p.get("client_ip"),
                             "room_id": p.get("room_id"), "resource_id": p.get("resource_id"),
                             "created_at": p["created_at"], "correlation_id": p.get("correlation_id")})
+                if p.get("via"):
+                    out[-1].update(via=p["via"], machine=p.get("machine"))
                 if ev["event_type"].startswith("helper_"):
                     out[-1]["helper"] = {"helper_id": p.get("helper_id"), "role": p.get("role"), "model": p.get("model")}
                 elif ev["event_type"] == "helpers_paused":

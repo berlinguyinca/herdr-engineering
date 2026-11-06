@@ -263,7 +263,8 @@ def run_command(args):
 
         client = ShareClient(resolve_control_plane(args.control_plane))
         if agent is not None:
-            machine = machine_opt or _tailscale_machine()
+            # the control plane compares the MagicDNS SHORT name; tailscale reports the full name
+            machine = machine_opt or (_tailscale_machine() or "").split(".")[0] or None
             client.headers = {
                 "Authorization": f"Fabric {agent}",
                 **({"X-Herdr-Machine": machine} if machine else {}),
