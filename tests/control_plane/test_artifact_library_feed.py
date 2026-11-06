@@ -174,11 +174,10 @@ def test_lab_share_for_other_group_not_listed(dsn):
 def test_dedupe_one_row_badge_priority_mine_over_assigned_over_opened(dsn):
     async def body(store, pool):
         a = await artifact(pool, ME_P)
-        sid = await share(pool, a, emails=[EMAIL])
+        sid = await share(pool, a, audience="public")
         await store.record_claim(ME, sid)
         b = await artifact(pool, YOU_P)
-        sid_b = await share(pool, b, emails=[EMAIL])
-        await store.record_claim(ME, sid_b)
+        await share(pool, b, emails=[EMAIL])
         page = await feed(store)
         assert {i.artifact_id: i.source for i in page.items} == {a: "mine", b: "assigned"}
         assert page.total == 2
@@ -254,11 +253,13 @@ def test_retracted_artifact_vanishes_for_grantee_lab_recipient_and_claimant(dsn)
             ME_P,
             YOU_P,
         )
-        sid = await share(pool, a, groups=[G1])
+        await share(pool, a, groups=[G1])
+        c = await artifact(pool, YOU_P, name="Gone link")
+        sid = await share(pool, c, audience="public")
         await store.record_claim(ME, sid)
         everything = frozenset({"mine", "assigned", "opened"})
-        assert (await feed(store, groups=frozenset({G1}), sources=everything)).total == 1
-        await pool.execute("UPDATE artifacts SET lifecycle='retracted' WHERE artifact_id=$1", a)
+        assert (await feed(store, groups=frozenset({G1}), sources=everything)).total == 2
+        await pool.execute("UPDATE artifacts SET lifecycle='retracted' WHERE artifact_id IN ($1,$2)", a, c)
         for who, kw in ((ME, {"groups": frozenset({G1})}), (YOU, {})):
             page = await feed(store, member=who, sources=everything, **kw)
             assert page.items == [], who

@@ -1373,7 +1373,7 @@ class ShareHandler(BaseHTTPRequestHandler):
             serve_bundle_file(self, state, "/".join(parts[6:]), actor=got["identity"], token=parts[2],
                               mode_switch=link, sandbox_pdf=True,
                               landing=self._landing(state, "/".join(parts[6:]), parts[2], signed_in=True),
-                              claim=(got["identity"], session))
+                              claim=None)                  # a lab share is decided by its allow-list, never claimed
             return None
         if route == "lab_view":
             if parts[5] == "v":
@@ -1591,7 +1591,6 @@ class ShareHandler(BaseHTTPRequestHandler):
         _send_headers(self, 200, headers, cors=False)
         if self.command == "GET" and name == state.get("entry"):
             _record_event(server.events.opened, share_id, actor, {"file": name[:200], "mode": mode})
-            _record_claim(self, share_id, (got["identity"], parts[4]))
         if self.command != "HEAD":
             _write_body(self, body)
         return None

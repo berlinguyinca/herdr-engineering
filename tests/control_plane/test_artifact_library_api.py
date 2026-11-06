@@ -308,12 +308,12 @@ def mapped(registry_pg, tmp_path):
         yield value
 
 
-def add_share(env, aid, state="live"):
+def add_share(env, aid, state="live", audience="lab"):
     vid, sid = "ver_" + uuid.uuid4().hex, "share_" + uuid.uuid4().hex[:24]
     env.sql("INSERT INTO artifact_versions (version_id,artifact_id,version_number,state) VALUES ($1,$2,1,'ready')",
             vid, aid)
     env.sql("INSERT INTO artifact_shares (share_id,artifact_id,version_id,audience,state,created_by)"
-            " VALUES ($1,$2,$3,'lab',$4,$5)", sid, aid, vid, state, BOB)
+            " VALUES ($1,$2,$3,$6,$4,$5)", sid, aid, vid, state, BOB, audience)
     return sid
 
 
@@ -323,7 +323,7 @@ def seed_member_rows(env):
     env.sql("INSERT INTO artifact_acl (artifact_id, principal_id, permissions, granted_by)"
             " VALUES ($1,$2,'[\"read\"]'::jsonb,$3)", assigned, A_PRINCIPAL, BOB)
     claimed = env.artifact(BOB, name="Claimed")
-    claimed_share = add_share(env, claimed, "live")
+    claimed_share = add_share(env, claimed, "live", "public")
     env.sql("INSERT INTO artifact_share_claims (member_id, share_id, title, sharer) VALUES ($1,$2,'Claimed',$3)",
             MEMBER_A, claimed_share, BOB)
     pending = env.artifact(A_PRINCIPAL, name="Pushed", intake="pending")

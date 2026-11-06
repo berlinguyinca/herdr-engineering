@@ -196,7 +196,7 @@ def test_expires_text():
     assert share_public.expires_text(-10, 0) == "expires today"
 
 
-def test_lab_share_pages_record_a_claim_for_the_verified_session(tmp_path):
+def test_lab_share_pages_record_no_claim(tmp_path):
     e = Env(tmp_path, audience="lab", expires_in=None, config_extra=lab_config(tmp_path),
             state_extra={"allow_emails": ["alice@lab.example"], "allow_groups": []})
     try:
@@ -207,7 +207,6 @@ def test_lab_share_pages_record_a_claim_for_the_verified_session(tmp_path):
         base = re.match(r"(/s/[^/]+/k/[^/]+/)", landing).group(1)
         for _ in range(2):
             assert e.request("GET", base + "f/index.html", DOC)[0] == 200
-        got = claims(e)
-        assert len(got) == 1 and got[0]["actor"] == "alice" and got[0]["detail"] == {"share_id": "shr-1"}
+        assert claims(e) == []              # a lab share is decided by its allow-list, never kept in a library
     finally:
         e.close()

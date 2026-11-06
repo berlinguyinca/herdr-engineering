@@ -68,7 +68,7 @@ async def new_folder(env, who="alice", name="Papers"):
     )[0][0]
 
 
-async def live_share(env, aid, *, groups=("lab",)):
+async def live_share(env, aid, *, groups=("lab",), audience="lab"):
     vid = (await sql(env, "SELECT current_version_id FROM artifacts WHERE artifact_id=$1", aid))[0][
         0
     ]
@@ -84,12 +84,13 @@ async def live_share(env, aid, *, groups=("lab",)):
     await sql(
         env,
         "INSERT INTO artifact_shares (share_id,artifact_id,version_id,audience,allow_groups,state,title,created_by) "
-        "VALUES ($1,$2,$3,'lab',$4,'live','Shared',$5)",
+        "VALUES ($1,$2,$3,$6,$4,'live','Shared',$5)",
         sid,
         aid,
         vid,
         list(groups),
         ALICE,
+        audience,
     )
     return sid
 
@@ -132,7 +133,7 @@ def test_each_intent_updates_db_and_view_file(registry_pg, tmp_path):
         assert (await sql(env, "SELECT count(*) FROM artifact_library_items"))[0][0] == 0
         assert view_of(env, ALICE)["library"]["folders"][0]["item_count"] == 0
 
-        sid = await live_share(env, mine, groups=("nobody",))
+        sid = await live_share(env, mine, groups=("nobody",), audience="public")
         await claim(env, rt, "bob", sid)
         assert (await sql(env, "SELECT member_id FROM artifact_share_claims"))[0][0] == "bob"
         (opened,) = [i for i in view_of(env, BOB)["library"]["items"] if i["artifact_id"] == mine]
@@ -222,7 +223,7 @@ def test_replayed_intent_is_idempotent(registry_pg, tmp_path):
                 "result"
             ] == "filed"
         assert (await sql(env, "SELECT count(*) FROM artifact_library_items"))[0][0] == 1
-        sid = await live_share(env, mine)
+        sid = await live_share(env, mine, audience="public")
         for _ in range(2):
             await claim(env, rt, "bob", sid)
         assert (await sql(env, "SELECT count(*) FROM artifact_share_claims"))[0][0] == 1
@@ -317,7 +318,7 @@ def test_view_files_end_when_access_ends(registry_pg, tmp_path):
     async def body(env, rt):
         aid = await create(env, title="Doc")
         await publish(env, aid)
-        sid = await live_share(env, aid, groups=("nobody",))
+        sid = await live_share(env, aid, groups=("nobody",), audience="public")
         await claim(env, rt, "bob", sid)
         await tick(env, rt)
         assert files_of(env, BOB, aid)
@@ -384,7 +385,7 @@ def test_claimed_item_lists_the_share_pinned_version_not_the_head(registry_pg, t
         v1 = (await sql(env, "SELECT current_version_id FROM artifacts WHERE artifact_id=$1", aid))[
             0
         ][0]
-        sid = await live_share(env, aid, groups=("nobody",))
+        sid = await live_share(env, aid, groups=("nobody",), audience="public")
         await claim(env, rt, "bob", sid)
         await publish(env, aid, {"index.html": HTML, "v2-only.css": b"b{}"}, base=v1)
         await tick(env, rt)

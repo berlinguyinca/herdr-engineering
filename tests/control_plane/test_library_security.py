@@ -870,6 +870,33 @@ def test_a_member_who_only_receives_a_lab_share_gets_a_view_after_one_tick(sandb
     sandbox(body)
 
 
+def test_a_claim_on_a_lab_share_is_refused_and_never_outlives_lab_admission(sandbox):
+    async def body(env, rt, web, shares):
+        from herdr_engineering.control_plane.artifact_library import LibraryError, LibraryStore
+        s = await scenario(env, rt, web, shares)
+        lab_id, _ = await lab_share(env, s, allow_groups=["lab"])
+        await tick(env, rt)
+        row = item(env, ALICE, s.b)
+        assert row and row["source"] == "assigned" and row["share_id"] == lab_id
+        with pytest.raises(LibraryError) as err:                        # the store refuses a lab share outright
+            await LibraryStore(env.pool).record_claim(ALICE, lab_id)
+        assert (err.value.status, err.value.code) == (404, "not_found")
+        assert (await sql(env, "SELECT count(*) AS n FROM artifact_share_claims WHERE share_id=$1", lab_id))[0]["n"] == 0
+        # a claim row that is already stored (written before this fix) must not keep the item either
+        await sql(env, "INSERT INTO artifact_share_claims (member_id, share_id, title, sharer) VALUES ($1,$2,'t','bob')",
+                  ALICE, lab_id)
+        await sql(env, "UPDATE artifact_shares SET allow_groups='{}' WHERE share_id=$1", lab_id)   # alice leaves the group
+        await tick(env, rt)
+        assert item(env, ALICE, s.b) is None, "a lab claim must not outlive the allow-list"
+        got = await web.req("GET", f"/api/member/artifacts/{s.b}/content/index.html", member="alice")
+        assert got.status == 404
+        # a public claim still works
+        await claim(env, rt, shares, s)
+        opened = item(env, ALICE, s.b)
+        assert opened and opened["source"] == "opened" and opened["share_id"] == s.share_id
+    sandbox(body)
+
+
 def test_a_member_can_file_lab_assigned_and_opened_rows_but_not_a_strangers(sandbox):
     async def body(env, rt, web, shares):
         s = await scenario(env, rt, web, shares)

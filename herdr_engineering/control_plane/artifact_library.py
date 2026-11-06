@@ -174,7 +174,7 @@ SELECT a.artifact_id, coalesce(nullif(c.title,''), nullif(s.title,''), {_TITLE})
             THEN 0 ELSE coalesce(a.size_bytes,0) END
   FROM artifact_share_claims c JOIN artifact_shares s ON s.share_id=c.share_id
   JOIN artifacts a ON a.artifact_id=s.artifact_id
- WHERE c.member_id=$2 AND a.lifecycle NOT IN ('retracted','tombstoned') AND a.intake='accepted'
+ WHERE c.member_id=$2 AND s.audience='public' AND a.lifecycle NOT IN ('retracted','tombstoned') AND a.intake='accepted'
 """
 
 
@@ -358,11 +358,11 @@ class LibraryStore:
             raise LibraryError(*NOT_FOUND)
 
     async def record_claim(self, member_id: str, share_id: str) -> None:
-        """Keep a received share in the member's library.  Only a currently live share can be claimed; title and
+        """Keep a received share in the member's library.  Only a currently live public share can be claimed (a lab share is decided by its allow-list, never kept); title and
         sharer are snapshotted by the first claim and kept by later ones."""
         live = await self._pool.fetchval(
             "SELECT 1 FROM artifact_shares s JOIN artifacts a ON a.artifact_id=s.artifact_id "
-            "WHERE s.share_id=$1 AND s.state='live' AND (s.expires_at IS NULL OR s.expires_at > now()) "
+            "WHERE s.share_id=$1 AND s.state='live' AND s.audience='public' AND (s.expires_at IS NULL OR s.expires_at > now()) "
             "AND a.lifecycle NOT IN ('retracted','tombstoned') AND a.intake='accepted'",
             share_id,
         )
