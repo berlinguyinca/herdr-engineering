@@ -1,14 +1,29 @@
 """Bounded, inert report previews built only from descriptor metadata."""
 from __future__ import annotations
 
+import base64
 import html
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import PurePosixPath
 from urllib.parse import quote, unquote, urlsplit
 
 DEFAULT_PREVIEW_BYTES = 256 * 1024
+# Figures are embedded as opaque data: URIs on <img> (a browser never runs script or loads anything from an SVG
+# shown that way). Only these types qualify, and one URI may not exceed the cap (the sanitiser's own limit is 262144).
+IMAGE_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"})
+MAX_FIGURE_DATA_URI = 150_000
+FigureImages = Mapping[str, tuple[str, bytes]]
+
+
+def figure_data_uri(media_type: str, data: bytes) -> str | None:
+    """The data: URI for one figure image, or None when its type is not an image type or it is over the cap."""
+    if media_type not in IMAGE_MEDIA_TYPES or not isinstance(data, bytes) or not data:
+        return None
+    if (len(data) + 2) // 3 * 4 + len(f"data:{media_type};base64,") > MAX_FIGURE_DATA_URI:
+        return None
+    return f"data:{media_type};base64," + base64.b64encode(data).decode("ascii")
 
 
 def _asset_link(value: str) -> str:
@@ -42,7 +57,7 @@ _CORE_CSS = (
     ":root[data-theme=\"dark\"],:host([data-theme=\"dark\"]){" + _DARK + "}"
     "body{margin:0;background:var(--bg)}"
     ".rp{max-width:860px;margin:0 auto;padding:32px 16px 64px;background:var(--bg);color:var(--text);"
-    "font:15px/1.6 var(--sans);overflow-wrap:break-word}a{color:var(--link)}"
+    "font:15px/1.6 var(--sans);overflow-wrap:break-word}a{color:var(--link)}.fig-img{max-width:100%;height:auto}"
 )
 _FULL_CSS = _CORE_CSS + (
     ".rp *{box-sizing:border-box}.rp section{margin:40px 0 0;min-width:0}"
@@ -73,6 +88,8 @@ _FULL_CSS = _CORE_CSS + (
     "code,.mono{font:12.5px var(--mono);background:var(--surface-2);padding:1px 5px;border-radius:4px}"
     ".callout{background:var(--accent-weak);border-radius:var(--radius);padding:10px 14px;margin:10px 0;font-size:14px}"
     ".callout b{display:block;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--link)}"
+    ".fig-img{display:block;margin:4px 0 12px;padding:8px;background:#fff;border:1px solid var(--border);"
+    "border-radius:var(--radius)}"
     ".btn{display:inline-block;padding:5px 14px;border-radius:4px;background:var(--btn);color:var(--on-accent);"
     "font-weight:600;font-size:13px;text-decoration:none}.btn:hover{filter:brightness(1.08)}"
     "details{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 16px}"
@@ -85,7 +102,7 @@ _FULL_CSS = _CORE_CSS + (
     ".card,.tablewrap{break-inside:avoid;box-shadow:none}a{color:#000}.btn{border:1px solid #000;background:none;color:#000}}"
 )
 _FULL_CSS_MARGIN = 1200  # a cap below css + this much falls back to the core styles
-_CSP = ("default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'")
+_CSP = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'")
 _ANALYSIS_PAIR_LIMIT = 40
 
 
@@ -109,13 +126,18 @@ def _flatten(value, prefix: str = ""):
 
 
 def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] | None = None,
-                          max_bytes: int = DEFAULT_PREVIEW_BYTES) -> str:
+                          max_bytes: int = DEFAULT_PREVIEW_BYTES,
+                          figure_images: FigureImages | None = None) -> str:
     """Render a styled preview without opening evidence blobs or executing report source.
 
     Every section has a bounded share of the byte budget so an oversized evidence
     inventory cannot suppress all findings. Whole entries are omitted rather than
     cutting HTML; one small note with counts and the full-descriptor link discloses
     omissions or shortened text, and appears only when something was left out.
+
+    ``figure_images`` maps an asset id to ``(media_type, bytes)``; a figure whose asset is present, is an image
+    type and fits the per-figure cap is shown inline. Images are the first thing given up when the budget is
+    tight: they only use what the text entries left over, and a figure without one keeps its caption and link.
     """
     from .artifact_report_descriptor import validate_report_descriptor
 
@@ -164,9 +186,16 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
                 + ('<p class="sub">Next checks</p>' + bullets(row["next_steps"]) if row.get("next_steps") else "")
                 + "</article>")
 
-    def figure(row: dict) -> str:
+    supplied = figure_images or {}
+
+    def figure_uri(row: dict) -> str | None:
+        found = supplied.get(row["asset_id"])
+        return figure_data_uri(*found) if found else None
+
+    def figure(row: dict, uri: str | None = None) -> str:
+        image = (f'<img class="fig-img" alt="{html.escape(row["title"][:256], quote=True)}" src="{uri}">' if uri else "")
         return (f'<article class="card figure" id="figure-{esc_id(row["id"])}"><h3>{text(row["title"], 256)}</h3>'
-                f'<p>{text(row["caption"])}</p>'
+                + image + f'<p>{text(row["caption"])}</p>'
                 + (f'<div class="callout"><b>How to read</b>{text(row["reading_guide"])}</div>'
                    if row.get("reading_guide") else "")
                 + f'<a class="btn" href="{links[row["asset_id"]]}" download>Download figure</a></article>')
@@ -284,23 +313,49 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
     else:
         remaining -= len(summary_html.encode())
     total_weight = sum(weight for _, _, _, items, weight, _, _ in sections if items)
-    bodies, counts, kept_anchors = [], [], []
-    kept_shortened = False
+    chosen, kept_shortened = [], False
     for anchor, title_text, label, items, weight, kind, limit in sections:
         if not items:
             continue
         quota = remaining * weight // total_weight
         selected, used = [], 0
-        for item, cut in items:
+        for position, (item, cut) in enumerate(items):
             size = len(item.encode())
             if used + size <= quota and (limit is None or len(selected) < limit):
-                selected.append(item)
+                selected.append(position)
                 used += size
                 kept_shortened = kept_shortened or cut
-        bodies.append(wrap(anchor, title_text, kind, "".join(selected)))
+        chosen.append([anchor, title_text, label, items, kind, selected, used])
+    # Images come last: they only spend what every text entry left over, in report order.
+    spare = remaining - sum(entry[6] for entry in chosen)
+    upgraded: dict[int, str] = {}
+    image_typed = {asset["id"]: asset["media_type"] in IMAGE_MEDIA_TYPES for asset in report["assets"]}
+    image_dropped = False
+    for entry in chosen:
+        if entry[0] != "figures":
+            continue
+        for position in entry[5]:
+            uri = figure_uri(report["figures"][position])
+            if uri is None:
+                # a caller that tried to supply images and has none for an image-type figure: it is not shown
+                image_dropped = image_dropped or (figure_images is not None and image_typed.get(
+                    report["figures"][position]["asset_id"], False))
+                continue
+            richer = figure(report["figures"][position], uri)
+            extra = len(richer.encode()) - len(entry[3][position][0].encode())
+            if extra <= spare:
+                spare -= extra
+                upgraded[position] = richer
+            else:
+                image_dropped = True
+    bodies, counts, kept_anchors = [], [], []
+    for anchor, title_text, label, items, kind, selected, _ in chosen:
+        pieces = [upgraded.get(position, items[position][0]) if anchor == "figures" else items[position][0]
+                  for position in selected]
+        bodies.append(wrap(anchor, title_text, kind, "".join(pieces)))
         counts.append((label, len(selected), len(items)))
         kept_anchors.append((anchor, title_text))
-    left_out = (summary_omitted or summary_shortened or title_shortened or kept_shortened
+    left_out = (summary_omitted or summary_shortened or title_shortened or kept_shortened or image_dropped
                 or any(kept < total for _, kept, total in counts))
     footer = note(counts) if left_out else ""
     result = document(css, summary_html, toc(kept_anchors), "".join(bodies), footer)

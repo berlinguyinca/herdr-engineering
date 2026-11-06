@@ -315,7 +315,7 @@ export function mountBuildCache(container, client, { freshness = () => null } = 
     if (disposed || controller) return;
     const request = controller = new AbortController();
     retry.hidden = true;
-    if (!loaded) content.innerHTML = skeleton('build cache', { rows: 3, height: 64 });
+    if (!loaded) content.innerHTML = skeleton('build cache', { rows: 3, height: 120 });
     try {
       const res = await loadBuildCache(client);
       if (disposed || request.signal.aborted) return;
