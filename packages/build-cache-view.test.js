@@ -54,3 +54,11 @@ test('pageFailure maps 401/403/501 to explicit kinds and ignores partial failure
   assert.equal(pageFailure({ status: { error: 'x', status: 501 }, hosts: ok, builds: ok }).kind, 'disabled');
   assert.equal(pageFailure({ status: ok, hosts: { error: 'h' }, builds: ok }), null);
 });
+
+test('builds table cells carry their column name and explicit ARIA roles for the stacked phone layout', () => {
+  const html = renderBuildCache({ status: { data: { summary: {} } }, hosts: { data: { hosts: [] } }, builds: [{ build_id: 'b1', status: 'completed' }], more: false });
+  const row = html.slice(html.indexOf('<tr role="row" data-bc-build="b1">'), html.indexOf('</tr>', html.indexOf('data-bc-build="b1"')));
+  const labels = [...row.matchAll(/data-label="([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(labels, ['Build', 'Status', 'Command', 'Host', 'Time', 'Elapsed', 'Cache', 'Logical writes (lower bound)', 'Host disk delta', 'Trace']);
+  assert.match(html, /<table class="hd-table" role="table" data-bc-builds>/);
+});

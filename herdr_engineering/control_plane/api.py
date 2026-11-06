@@ -55,7 +55,7 @@ class TombstoneUnavailable(Exception):
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
 # The per-host worker that runs full /summary reports where the session records live (ingest role).
-_HOST_REPORT = re.compile(r"^/api/v1/host/summary-reports/(?:claim|result|publish)$")
+_HOST_REPORT = re.compile(r"^/api/v1/host/(?:summary-reports/(?:claim|result|publish)|build-cache/report)$")
 # Terminal broker, host side: the relay's output POST (per-host token like the fleet routes, never an API key).
 _HOST_TERMINAL_OUT = re.compile(r"^/api/v1/host/terminal/[^/]+/output$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.

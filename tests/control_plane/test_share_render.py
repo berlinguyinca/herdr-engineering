@@ -439,7 +439,7 @@ def test_constants() -> None:
     assert sr.RENDER_VERSION == 1
     assert sr.MAX_RENDER_INPUT == 2 * 1024 * 1024
     assert sr.MAX_RENDER_OUTPUT == 4 * 1024 * 1024
-    assert sr.STATIC_NOTE == "Scripts, frames and embedded media are not shown in this static copy"
+    assert sr.STATIC_NOTE == "Scripts, frames, audio and video are not shown in this static copy"
 
 
 def test_cache_hit_and_eviction_by_count() -> None:
