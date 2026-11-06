@@ -180,3 +180,104 @@ def test_stable_identifiers_with_colons_have_resolvable_fragment_links():
     preview = render_report_preview(report)
     assert 'id="evidence-observed:1"' in preview
     assert 'href="#evidence-observed%3A1"' in preview
+
+
+# --- polished preview: structure, themes, honesty ---------------------------------------------
+
+
+def _render(report=None, **kwargs):
+    from herdr_engineering.control_plane.artifact_report_render import render_report_preview
+
+    return render_report_preview(report or descriptor(), **kwargs)
+
+
+def test_preview_has_hero_cards_chips_tables_and_toc_without_debug_text():
+    page = _render()
+    assert "Artifact report preview" not in page
+    assert "Preview coverage" not in page
+    assert "Evidence files are separate downloads" not in page
+    assert page.count("<h1") == 1 and "<h1" in page.split("<main")[1]
+    assert '<header class="hero">' in page and "Method comparison" in page
+    assert 'class="card finding"' in page
+    assert 'class="chip"' in page
+    assert page.count("<table") == 2  # evidence + separate downloads
+    assert "<th" in page and "bbbbbbbbbbbb" in page and "b" * 64 not in page  # short sha only
+    assert 'class="card figure"' in page and 'class="callout"' in page
+    assert 'class="btn"' in page and "Compare conditions before comparing values." in page
+    assert '<nav class="toc"' in page and 'href="#sec-findings"' in page
+    assert "<pre" not in page
+    assert "Descriptive comparison" in page and "baseline" in page
+
+
+def test_preview_palettes_tokens_layout_and_print():
+    page = _render()
+    assert "color-scheme:light dark" in page
+    assert "@media (prefers-color-scheme:dark)" in page
+    assert "#17181c" in page and "#10a37f" in page  # theme.css values, light and dark
+    assert "max-width:860px" in page
+    assert "overflow-x:auto" in page and "@media print" in page
+    assert "Inter" in page and "JetBrains Mono" in page
+    assert "<script" not in page and "@import" not in page and "http" not in page
+
+
+def test_csp_is_unchanged():
+    csp = ("default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'")
+    assert f'<meta http-equiv="Content-Security-Policy" content="{csp}">' in _render()
+
+
+def test_hostile_strings_are_escaped_everywhere():
+    report = descriptor()
+    hostile = '<script>alert(1)</script>"\'><img src=x onerror=alert(2)>'
+    report["title"] = hostile
+    report["summary"] = hostile
+    report["questions"][0]["text"] = hostile
+    report["evidence"][0]["title"] = hostile
+    report["findings"][0]["title"] = hostile
+    report["figures"][0]["caption"] = hostile
+    report["figures"][0]["reading_guide"] = hostile
+    report["assets"][0]["name"] = hostile
+    report["analysis"] = {"method": hostile, "configuration": {hostile: hostile}}
+    report["limitations"] = [hostile]
+    page = _render(report)
+    assert "<script" not in page and "<img" not in page and "onerror=alert(2)>" not in page
+    document = _Document()
+    document.feed(page)
+    assert not document.stack
+    assert "script" not in document.tags and "img" not in document.tags
+
+
+def test_byte_cap_respected_on_oversized_descriptor_and_valid_html_kept():
+    report = descriptor()
+    report["findings"] = [dict(report["findings"][0], id=f"f{i}", statement="x " * 1000)
+                          for i in range(400)]
+    report["limitations"] = ["limit " * 200 for _ in range(300)]
+    for cap in (4096, 20_000, 256 * 1024):
+        page = _render(report, max_bytes=cap)
+        assert len(page.encode()) <= cap
+        document = _Document()
+        document.feed(page)
+        assert not document.stack
+
+
+def test_omission_note_only_when_something_was_omitted():
+    assert "omitted" not in _render()
+    report = descriptor()
+    report["findings"] = [dict(report["findings"][0], id=f"f{i}", statement="x " * 400)
+                          for i in range(100)]
+    page = _render(report, max_bytes=8192)
+    assert "Some content was omitted" in page and 'href="report"' in page
+    assert "100 findings" in page
+    shortened = descriptor()
+    shortened["summary"] = "word " * 1000
+    note = _render(shortened)
+    assert "Some content was omitted" in note and "shortened" in note
+
+
+def test_analysis_is_a_bounded_key_value_list():
+    report = descriptor()
+    report["analysis"] = {"method": "m", "configuration": {
+        "nested": {"baseline": "current"}, **{f"k{i}": i for i in range(200)}}}
+    page = _render(report)
+    assert "<details" in page and "<dl" in page
+    assert "configuration.nested.baseline" in page
+    assert "Some content was omitted" in page
