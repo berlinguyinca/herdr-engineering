@@ -23,7 +23,8 @@
 #     filesystem, no capabilities, non-root, resource limits, and a network of its own.
 #   * collab-edge (nginx) terminates TLS, rate-limits and allowlists routes in front of it.
 # Moving hosts: change control_plane.collab.public_url and the app client's callback/logout
-# URLs together.
+# URLs together. Share links have their own host (control_plane.share.public_url) and their own
+# <host>/s/callback entry in the same client.
 name: herdr-control-plane
 
 services:
@@ -151,7 +152,7 @@ services:
       - /tmp:size=16m,mode=1777
     volumes:
       - ${HERDR_SHARES_DIR:?run deploy.sh}:/shares:ro
-      - ${HERDR_SHARE_EVENTS_DIR:?run deploy.sh}:/share-events   # its only writable mount (events.jsonl)
+      - ${HERDR_SHARE_EVENTS_DIR:?run deploy.sh}:/share-events   # its only writable mount (events.jsonl and annotations.jsonl)
       - ${HERDR_COLLAB_SYNC_DIR:?run deploy.sh}:/sync:ro   # Cognito keys, written by collab-sync.sh
       - ${HERDR_SHARE_CONFIG_DIR:?run deploy.sh}:/etc/herdr/share:ro   # holds only the render-share slice
     # Internal network shared with the edge only: no route out, no postgres/rustfs/control plane.

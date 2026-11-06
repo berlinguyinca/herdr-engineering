@@ -26,7 +26,7 @@ from uuid import uuid4
 
 from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliases
 from ..llm_session_id import dashboard_form
-from . import llm_stats, usage_spend
+from . import llm_stats, review_refs, usage_spend
 from .agent_identity import (
     AgentIdentityConflict,
     AgentIdentityRegistry,
@@ -54,7 +54,6 @@ from .ids import new_id, validate_mission_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .mission_activity import MissionActivityStore
 from .redact import redact_payload
-from . import review_refs
 from .service_catalog import (
     INACTIVE,
     capture_service_origin,
@@ -73,6 +72,9 @@ from .service_catalog import (
 #: Hard bound on one durable deployment write made under a store lock (seconds).
 DEPLOYMENT_DURABLE_WRITE_TIMEOUT_S = 10
 
+# build_cache events arrive per build on every host; keep a bounded recent window
+# per host stream (older ones stay in the durable sink). Trimmed at 2x to amortise.
+BUILD_CACHE_STREAM_MAX = 500
 _CI_EVENT_KINDS = frozenset({"ci_report", "ci_observation", "ci_telemetry", "ci_logtests"})
 
 _STAGES = {
@@ -188,6 +190,8 @@ class _BootPhases:
         self._last = now
 
 
+_CONTAINER_ID = re.compile(r"[0-9a-f]{12}|[0-9a-f]{64}")
+
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
@@ -233,6 +237,10 @@ class ControlPlaneRepo:
         self._telemetry = {}  # host_id -> [sample, ...]
         self._events = {}  # (entity_type, entity_id) -> [event, ...]
         self._event_order = []  # (entity_type, entity_id, seq) chronological
+        self._durable_history = None
+        self._durable_public_count = 0
+        self._durable_row_count = 0
+        self._service_catalog_pager = None
         # Rebuilding delivery projections replays stored events into the upsert
         # methods, which would otherwise re-record the very events being rebuilt.
         self._suppress_record_events = False
@@ -985,11 +993,12 @@ class ControlPlaneRepo:
             return None
         return self._service_projection(s)
 
-    def _service_projection(self, record):
+    def _service_projection(self, record, *, project_index=None):
         result = _copy(self._ensure_service_desc(record))
         result["project"] = normalize_project(result.get("project"))
         result["source_port"] = normalize_source_port(result.get("source_port"))
-        result["catalog"] = service_catalog(result, self._sessions.get(result.get("session_id")))
+        result["catalog"] = service_catalog(result, self._sessions.get(result.get("session_id")),
+                                           project_index=project_index)
         for field in ("repository_id", "commit_sha", "project_id"):
             result[field] = result["catalog"][field]
         result["lifecycle"] = service_lifecycle(
@@ -1000,6 +1009,22 @@ class ControlPlaneRepo:
         services = [self._service_projection(s) for s in self._services.values()]
         return _sort_by([s for s in services if include_archived
                          or not s["lifecycle"]["archived"]], "created_at", reverse=True)
+
+    def service_catalog_page(self, *, scope='herdr', status='current', include_archived=False,
+                             search='', host_id='', group_by='project', limit=100, cursor=None):
+        from .project_links import load_project_index
+        from .service_catalog_query import ServiceCatalogPager
+        if self._service_catalog_pager is None:
+            self._service_catalog_pager = ServiceCatalogPager(now=self._now)
+
+        def rows():
+            index = load_project_index()
+            return [self._service_projection(record, project_index=index)
+                    for record in list(self._services.values())]
+
+        return self._service_catalog_pager.page(rows, scope=scope, status=status,
+            include_archived=include_archived, search=search, host_id=host_id,
+            group_by=group_by, limit=limit, cursor=cursor)
 
     def retire_services(self, *, older_than_days=7.0, states=("unknown",), dry_run=True, limit=5000):
         """Archive services with no report for ``older_than_days`` (operator action).
@@ -1112,8 +1137,14 @@ class ControlPlaneRepo:
                 base["inventory"] = _copy(rec["inventory"])
         return merged
 
+    @staticmethod
+    def _is_container_id(host):
+        """A docker container id (12 or 64 hex digits) that never reported a tailnet address: a container, not a machine."""
+        return bool(_CONTAINER_ID.fullmatch(str(host.get("host_name") or host.get("host_id") or ""))) and not host.get("tailnet_ip")
+
     def list_hosts(self):
-        hosts = [self._with_problems(h) for h in self._merged_hosts().values()]
+        """Machines only: container ids with no tailnet address are kept in the store but never listed."""
+        hosts = [self._with_problems(h) for h in self._merged_hosts().values() if not self._is_container_id(h)]
         return _sort_by(hosts, "host_name")
 
     def host_snapshot(self, host_id):
@@ -1152,7 +1183,7 @@ class ControlPlaneRepo:
             ),
         )
 
-    def set_host_policy(self, host_id, *, mode, expected_revision, allow_tags=(), deny_tags=(), reason=None):
+    def set_host_policy(self, host_id, *, mode, expected_revision, allow_tags=None, deny_tags=None, reason=None):
         """Update scheduler policy with optimistic concurrency and an audit event."""
         with self.scheduler_admission():
             return self._set_host_policy(host_id, mode=mode, expected_revision=expected_revision,
@@ -1169,8 +1200,10 @@ class ControlPlaneRepo:
         next_policy = {
             "mode": mode.value,
             "revision": int(current.get("revision", 0)) + 1,
-            "allow_tags": sorted({str(v).strip().lower() for v in allow_tags if str(v).strip()}),
-            "deny_tags": sorted({str(v).strip().lower() for v in deny_tags if str(v).strip()}),
+            "allow_tags": sorted({str(v).strip().lower() for v in (
+                current.get("allow_tags", ()) if allow_tags is None else allow_tags) if str(v).strip()}),
+            "deny_tags": sorted({str(v).strip().lower() for v in (
+                current.get("deny_tags", ()) if deny_tags is None else deny_tags) if str(v).strip()}),
             "reason": str(reason)[:300] if reason else None,
         }
         self.record_event("host", host_id, "HostPolicyChanged", next_policy, require_durable=True)
@@ -2858,7 +2891,18 @@ class ControlPlaneRepo:
                 self._ci_sequence = seq + 1
             stream.append(ev)
             if feed:
-                self._event_order.append((entity_type, entity_id, seq))
+                if self._durable_history is not None:
+                    self._durable_public_count += 1
+                    self._durable_row_count += 1
+                if self._durable_history is None or entity_type not in {'service','session'}:
+                    self._event_order.append((entity_type, entity_id, seq))
+            if self._durable_history is not None and entity_type in {'service','session'}:
+                stream[:] = stream[-1:]
+            if entity_type == "build_cache" and len(stream) > 2 * BUILD_CACHE_STREAM_MAX:
+                cutoff = stream[-BUILD_CACHE_STREAM_MAX]["sequence"]
+                del stream[:-BUILD_CACHE_STREAM_MAX]
+                self._event_order = [t for t in self._event_order
+                                     if not (t[0] == entity_type and t[1] == entity_id and t[2] < cutoff)]
             if self._sink is not None and not require_durable:
                 try:
                     self._sink.record(ev)
@@ -2924,6 +2968,8 @@ class ControlPlaneRepo:
                                             i['entity_id'] or ''))
 
     def stream(self, entity_type, entity_id):
+        if callable(getattr(self._durable_history, 'stream', None)):
+            return self._durable_history.stream(entity_type, entity_id)
         if self._durable_history is not None and entity_type in {"host", "session", "service"}:
             return self._durable_history.history_stream(entity_type, entity_id)
         return [_copy(e) for e in self._events.get((entity_type, entity_id), [])]
@@ -2935,6 +2981,8 @@ class ControlPlaneRepo:
         the cursor stale instead of silently skipping history. Sequence numbers
         are metadata only: duplicates and gaps retain their stored ordering.
         """
+        if callable(getattr(self._durable_history, 'stream_page', None)):
+            return self._durable_history.stream_page(entity_type, entity_id, limit=limit, before=before)
         if self._durable_history is not None and entity_type in {"host", "session", "service"}:
             return self._durable_history.history_page(entity_type, entity_id, limit=limit, before=before)
         import base64
@@ -2995,8 +3043,25 @@ class ControlPlaneRepo:
                 latest.append({k: v for k, v in stream[-1]["payload"].items() if not k.startswith("_")})
         return latest
 
+    def list_fleet_rollouts(self, limit=50, repo_name=None):
+        """Rollout summaries (newest first) derived from the ``fleet_rollout`` event streams."""
+        from . import fleet_rollout
+        return fleet_rollout.list_rollouts(self, limit, repo_name)
+
+    def get_fleet_rollout(self, rollout_id):
+        """One rollout: summary, per-host rows and the ordered events; None when unknown."""
+        from . import fleet_rollout
+        return fleet_rollout.rollout_detail(self, rollout_id)
+
+    def fleet_rollout_versions(self):
+        """What each host runs, the newest observed heads, the last lock pin and the watched sources' state."""
+        from . import fleet_rollout
+        return fleet_rollout.versions(self)
+
     def entity_ids(self, entity_type):
         """Ids of every entity of ``entity_type`` that has at least one event."""
+        if callable(getattr(self._durable_history, 'entity_ids', None)):
+            return self._durable_history.entity_ids(entity_type)
         with self._event_lock:
             return [eid for (etype, eid), stream in self._events.items()
                     if etype == entity_type and stream]
@@ -3009,6 +3074,8 @@ class ControlPlaneRepo:
                     for e in stream]
 
     def recent_events(self, limit=50):
+        if callable(getattr(self._durable_history, 'recent_events', None)):
+            return self._durable_history.recent_events(limit)
         out = []
         by_sequence = {}
         with self._event_lock:
@@ -3398,23 +3465,34 @@ class ControlPlaneRepo:
         return [{k: v for k, v in key.items() if k != "key_hash"}
                 for key in self._llm_keys()]
 
-    def upsert_custom_model(self, name, base_url, upstream_model=None, project=None, *,
-                            fabric_model=None, context_window=8192):
-        if not name or not base_url:
-            raise ValueError("name and base_url are required")
-        if not str(base_url).startswith(("http://", "https://")):
+    def upsert_custom_model(self, name, base_url=None, upstream_model=None, project=None, *,
+                            fabric_model=None, context_window=8192, fallback_models=None):
+        """``base_url`` is the optional private service; ``fallback_models`` are fnmatch patterns of gateway models used
+        instead when the advertised ``fabric_model`` is not ready. One of the two must exist."""
+        if fallback_models is not None:
+            if (not isinstance(fallback_models, list) or not 1 <= len(fallback_models) <= 8
+                    or any(not isinstance(p, str) or not p or len(p) > 128 or not p.isprintable()
+                           or any(c.isspace() for c in p) for p in fallback_models)):
+                raise ValueError("fallback_models must be one to eight gateway model patterns without whitespace")
+        if not name or not (base_url or fallback_models):
+            raise ValueError("name and a base_url or fallback_models are required")
+        if base_url and not str(base_url).startswith(("http://", "https://")):
             raise ValueError("base_url must be http(s)")
-        payload = {"name": name, "base_url": base_url.rstrip("/"),
-                   "upstream_model": upstream_model or name, "project": project,
-                   "deleted": False}
+        payload = {"name": name, "upstream_model": upstream_model or name, "project": project, "deleted": False}
+        if base_url:
+            payload["base_url"] = base_url.rstrip("/")
         if fabric_model is not None:
             if (not isinstance(fabric_model, str) or not fabric_model
                     or len(fabric_model) > 256 or not fabric_model.isprintable()
                     or any(c.isspace() for c in fabric_model)):
                 raise ValueError("fabric_model must be a bounded model identity without whitespace")
+            payload["fabric_model"] = fabric_model
+        if fabric_model is not None or fallback_models:
             if type(context_window) is not int or not 1 <= context_window <= 1048576:
                 raise ValueError("context_window must be an integer between 1 and 1048576")
-            payload.update(fabric_model=fabric_model, context_window=context_window)
+            payload["context_window"] = context_window
+        if fallback_models:
+            payload["fallback_models"] = list(fallback_models)
         return self.record_event("custom_model", name, "custom_model.upserted", payload)
 
     def delete_custom_model(self, name):
@@ -3479,7 +3557,7 @@ class ControlPlaneRepo:
                 "unavailable": total - healthy}
 
     # --------------------------------------------------- backup / restore
-    def export_state(self):
+    def export_state(self, *, include_history=True):
         """Serialize the full structured state for backup/restore (Spec §102)."""
         # Do not hold the event lock while exporting the source ledger/graph:
         # ingestion takes those locks before writing events. Capture only the
@@ -3496,6 +3574,13 @@ class ControlPlaneRepo:
                            for (t, i), stream in self._events.items()},
                 "event_order": list(self._event_order),
             }
+        if include_history and callable(getattr(self._durable_history, 'export_events', None)):
+            events, event_order = self._durable_history.export_events()
+        else:
+            events = {key: (stream if include_history or key.split('|', 1)[0] not in {'service','session'} else stream[-1:])
+                      for key, stream in scheduler_state['events'].items()}
+            event_order = [entry for entry in scheduler_state['event_order']
+                           if include_history or entry[0] not in {'service','session'}]
         return {
             "version": 1,
             "missions": _copy(self._missions),
@@ -3520,17 +3605,21 @@ class ControlPlaneRepo:
                                     for k, v in self._resource_usage.items()},
                 "stage_runs": _copy(self._stage_runs),
             },
-            "events": scheduler_state["events"],
-            "event_order": scheduler_state["event_order"],
+            "events": events,
+            "event_order": list(event_order),
             "ci_sequence": self._ci_sequence,
             "ci_history_truncated": sorted(self._ci_history_truncated),
-            "agent_projections": copy.deepcopy(list(self._agent_records.values())),
+            "agent_projections": copy.deepcopy([self._agent_records[key]
+                                                for key in sorted(self._agent_records)]),
             "agent_identity_history": copy.deepcopy(self._agent_identity_history),
         }
 
     def import_state(self, state):
         """Restore state from an export (used by restore tests / recovery)."""
         self._durable_history = None
+        self._collab_replay = []
+        self.collab_quarantine = []
+        self.collab_quarantine_reasons = []
         phase = _BootPhases("import_state")
         self._missions = dict(state.get("missions", {}))
         self._sessions = dict(state.get("sessions", {}))
@@ -3593,7 +3682,10 @@ class ControlPlaneRepo:
                 if payload:
                     self._scheduler_reservations[entity_id] = _deep_copy(payload)
         phase("scheduler state")
-        self.ledger.hydrate([e for stream in self._events.values() for e in stream])
+        if 'source_ledger' in state:
+            self.ledger.restore_checkpoint(state['source_ledger'])
+        else:
+            self.ledger.hydrate([e for stream in self._events.values() for e in stream])
         phase("ledger")
         self._rebuild_graph()
         phase("lineage graph")
@@ -3718,7 +3810,8 @@ class ControlPlaneRepo:
             metrics.extend(self._events.pop(key))
         self._event_order = [t for t in self._event_order if t[0] != HOST_METRICS_ENTITY]
         self.host_metrics = self._new_host_metrics()
-        for hid, rec in self.host_metrics.hydrate(metrics).items():
+        self._checkpoint_host_projection = self.host_metrics.hydrate(metrics)
+        for hid, rec in self._checkpoint_host_projection.items():
             host = self._hosts.get(hid)
             if host is not None:
                 host.update({k: v for k, v in rec.items() if v is not None})
@@ -3917,7 +4010,10 @@ class ControlPlaneRepo:
         # itself cannot know about its source.
         return {
             "status": "ok",
-            "events": {"ingested": len(self._event_order)},
+            "events": ({"ingested": self._durable_public_count,
+                        "cached": len(self._event_order), "durable_total": self._durable_row_count}
+                       if callable(getattr(self._durable_history, 'export_events', None))
+                       else {"ingested": len(self._event_order)}),
             "missions": len(self._missions), "sessions": len(self._sessions),
             "hosts": len(self._hosts), "services": len(self._services),
             "inspector": self.inspector.health(),

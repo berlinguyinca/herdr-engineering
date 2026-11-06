@@ -8,6 +8,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .media_type import safe_media_type
+
 
 @dataclass(frozen=True)
 class GatewayResponse:
@@ -44,7 +46,7 @@ class PublicArtifactGateway:
             return GatewayResponse(404)
         body, media_type = resolved
         headers = {
-            "Content-Type": media_type,
+            "Content-Type": safe_media_type(media_type),
             "Content-Length": str(len(body)),
             "Cache-Control": "no-store",
             "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",

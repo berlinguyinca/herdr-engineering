@@ -2,6 +2,20 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { renderSchedulingView } from './scheduler-view.js';
 
+test('dashboard exposes revision-bound policy controls and safe placement explanations', () => {
+  const html = renderSchedulingView({ hosts: [{ host_uid: 'host-a', host_name: '<script>host</script>',
+    policy: { mode: 'manual_only', revision: 7 }, telemetry: {} }], history: [{
+    request_id: '<img src=x onerror=boom>', state: 'queued', agent_family: 'codex',
+    explanations: { 'host-a': { reason_codes: ['HOST_MANUAL_ONLY'], score: 0 } },
+  }], queue: [] });
+  assert.match(html, /data-scheduler-policy/);
+  assert.match(html, /data-policy-reload/);
+  assert.match(html, /Recent placement requests/);
+  assert.match(html, /HOST_MANUAL_ONLY/);
+  assert.match(html, /&lt;img/);
+  assert.doesNotMatch(html, /<script>|<img src=x/);
+});
+
 test('eligibility metrics exclude stale automatic hosts', () => {
   const html = renderSchedulingView({ hosts: [{ host_uid: 'stale', trusted: true,
     owned: true, reachable: true, policy: { mode: 'automatic' },

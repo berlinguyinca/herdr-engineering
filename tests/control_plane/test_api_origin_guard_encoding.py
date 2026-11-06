@@ -33,6 +33,8 @@ ROUTES = [
     ("/api/v1/steering/ab/ack", "/api/v1/steering/a%2Fb/ack"),
     ("/api/v1/sessions/ab/summary/fix", "/api/v1/sessions/a%2Fb/summary/fix"),
     ("/api/v1/artifacts/a1/collab-restrict", "/api/v1/artifacts/a%2Fb%2F1/collab-restrict"),
+    ("/api/v1/artifacts/a1/annotations/ann_x/dismiss", "/api/v1/%61rtifacts/a1/%61nnotations/ann_x/%64ismiss"),
+    ("/api/v1/artifacts/a1/annotations/ann_x/dismiss", "/api/v1/artifacts/a%2F1/annotations/ann%2Fx/dismiss"),
 ]
 
 

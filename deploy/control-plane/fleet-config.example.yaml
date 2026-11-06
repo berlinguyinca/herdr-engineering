@@ -94,9 +94,8 @@ sections:
         operator_user: "REDACTED"                    # Cognito username the dashboard's no-sign-in
                                                      # collaboration acts as (required)
         # operator_email: "owner@example.test"       # optional, shown for the operator
-        # public_url must be a bare https origin (empty path or "/") when shares are enabled: links and the lab
-        # sign-in callback live at <public_url>/s/... and the web client needs <public_url>/s/callback as an
-        # allowed callback + logout URL (see COLLAB.md, "Share links").
+        # Share links do NOT live here: they use control_plane.share.public_url (a different host); this URL stays
+        # the MCP host (see COLLAB.md, "Share links").
         # T15 attention inbox, evidence-based progress, analytics (everything off unless enabled):
         # insights:
         #   enabled: false                 # kill_switch: true turns every route off at once
@@ -104,6 +103,46 @@ sections:
         #   evidence_writers: ["key:ci-service"]   # ONLY these writers' merged/validated marks count as evidence
         #   min_group_size: 5              # aggregates over fewer items are hidden
         #   reads_per_minute: 60
+        # OPTIONAL: member-owned artifacts (members of one Cognito group upload, publish and share their own
+        # artifacts in the browser at share.public_host). OFF unless `enabled: true` (exactly true); when false the
+        # member API answers 404 and the worker refuses every member intent. A disabled block is still validated, so
+        # a typo shows now and not on the day you switch it on. Enabling also needs control_plane.share.public_host.
+        # There are NO default size or count caps: leave the three limits and share_limits null and usage stays
+        # visible to the operator (Members panel); set a positive integer (bytes, or a count) to cap.
+        # @members-begin
+        # members:
+        #   enabled: false
+        #   group: "staff"                       # Cognito group whose members may use it (required when enabled)
+        #   # session_secret: <paste `openssl rand -hex 32` here, at least 32 bytes, when enabling>
+        #   # Generate it locally; never commit it, print it or pass it as a flag. The line above is a comment on
+        #   # purpose: an empty or short value is refused, and no placeholder is ever a usable secret.
+        #   groups_ttl: 86400                    # seconds a signed-in user's group claim is trusted
+        #   removed_grace: 3600                  # seconds of continuous "not in the group" before shares are revoked (0-2592000)
+        #   max_artifact_bytes: null             # per artifact; null = no cap
+        #   max_member_bytes: null               # per member, all artifacts; null = no cap
+        #   max_artifacts: null                  # per member; null = no cap
+        #   share_limits:
+        #     max_share_bytes: null              # one member share bundle; null = the share defaults above
+        #     max_total_bytes: null              # all live member bundles
+        #   share_creates_per_hour: 20           # per member (counted per process, in memory)
+        #   request_limits:
+        #     http_chunks_per_request: 32        # at most 32 (the edge accepts 17 MiB per upload request)
+        #     max_publish_files: 200
+        #     max_message_chars: 500
+        #     max_upload_bytes: 1099511627776    # one file, 1 TiB; null = only the structural bound. The effective limit is
+        #                                        # the smaller of this and collab_artifacts max_file_bytes
+        #     result_wait_seconds: 5.0           # 0-20
+        #   rate_limits:
+        #     chunks_per_minute: 1200
+        #     writes_per_minute: 30
+        #     session_exchanges_per_minute: 20   # sign-ins, per client address
+        #   staging:
+        #     staging_bytes_per_member: 1099511627776   # reserved by declared size, 1 TiB; null = only the 1 TiB bound.
+        #                                               # Effective cap = min(this, collab_artifacts staging caps)
+        #   # secrets_gid: 1000    # numeric gid shared by the worker and collab-public so the worker can hand over the
+        #                          # read-once share URL; needed only when collab-public does not run as the default uid
+        #                          # (members refuse to start without a usable gid). Prefer a dedicated group.
+        # @members-end
       # OPTIONAL: Hindsight shared memory (compose profile `memory`; docs/operations/memory-hindsight.md). OFF unless
       # `enabled: true` AND `deploy.sh --with-memory`. Do NOT write the secrets by hand: run
       #   herdr-eng fleet config memory init --enable --endpoint https://memory.dev.lan --model-dir /abs/path/to/e5-model
@@ -121,11 +160,23 @@ sections:
       #     global: "REDACTED"
       #     infra: "REDACTED"
       #     personal: "REDACTED"                                  # the personal-assistant tenant: never shared
-      # OPTIONAL: artifact share links (/s/ on collab.public_url). OFF unless `enabled: true`, which needs the
+      # OPTIONAL: member-owned artifacts host (COLLAB.md, "Member artifacts"). One DNS name serves share links (/s/),
+      # the member API and the member page. A bare lowercase host: no scheme, port or path. It replaces
+      # share.public_url (set only one of the two; a disagreeing public_url is refused) and must differ from the host
+      # of collab.public_url. Both `https://<host>/s/callback` and `https://<host>/my/callback` must be callback and
+      # logout URLs of the web app client (operator step, see COLLAB.md). Needs collab.members below to turn on.
+      # @members-begin
+      # share:
+      #   public_host: "artifacts.example.test"
+      # @members-end
+      # OPTIONAL: artifact share links (/s/ on share.public_url). OFF unless `enabled: true`, which needs the
       # collab marker and a signing_secret: deploy.sh refuses otherwise. share-public gets only the serving keys
-      # below plus collab's cognito_pool/cognito_clients/cognito_web_client/cognito_domain/public_url (render-share).
+      # below plus collab's cognito_pool/cognito_clients/cognito_web_client/cognito_domain (render-share).
       # share:
       #   enabled: false
+      #   public_url: "https://artifacts.example.test/"   # required when enabled: a bare lowercase https origin on a
+      #                                    # host other than collab.public_url's; links are <it>/s/<token>/ and the web
+      #                                    # client needs <it>/s/callback as an allowed callback + logout URL
       #   signing_secret: "REDACTED"       # >= 32 bytes; generate locally, never commit or print it:
       #                                    #   openssl rand -hex 32   (paste the output here)
       #   session_seconds: 14400           # lab session lifetime cap; also never past the share's expiry NOR the
@@ -134,6 +185,15 @@ sections:
       #   max_share_bytes: 536870912       # one bundle
       #   max_total_bytes: 2147483648      # all live bundles
       #   max_files: 20000                 # files per bundle
+      #   owner_emails: ["owner@example.test"]   # lowercase; their annotations carry the owner role
+      #   annotations:                     # all optional; the defaults apply when omitted
+      #     enabled: true
+      #     max_comment_chars: 4000
+      #     per_user_per_minute: 60
+      #     per_share_per_minute: 600
+      #     global_per_minute: 3000
+      #     per_user_per_day: 2000
+      #     max_per_share: 20000
       #   # container paths; keep the defaults with deploy.sh (its mounts are fixed):
       #   # shares_dir: /shares   events_dir: /share-events   marker_dir: /var/lib/herdr/share-markers
       # OPTIONAL: the collaborator bridge (external agents read and commit artifacts through collab-public's MCP tools).
@@ -219,7 +279,7 @@ sections:
       #     worker_ttl_days: 90          # redeemed worker credential lifetime
       #     # tenant: default            # defaults to the assistant's default tenant
       #   # OPTIONAL: earned action grants for hub workers with the `act` scope (docs/operations/assistant-hub.md).
-      #   # Nothing is autonomous yet: activation answers 409 until the Phase 3 judge gate exists.
+      #   # Activation answers 409 until the judge below is enabled, confirmed and calibrated (Phase 3).
       #   grants:
       #     shadow_days: 14              # global shadow period before any grant can be activated or honoured
       #     shadow_started_at: null      # ISO-8601 with offset; null = stamped on first start
@@ -232,6 +292,26 @@ sections:
       #     grant_ttl_days: 30           # lifetime of a proposed grant, and of an active one from activation
       #     extra_vetoes: []             # extra hard denies: [{code: no_prod, reason: "...", argv_contains: "prod"}]
       #     policy_version: 1            # bump to invalidate every existing grant
+      #   # OPTIONAL: the action judge (Phase 3). It can only ADD friction: an active grant is honoured only when the
+      #   # judge answers AND does not escalate; unreachable/disabled => the owner decides. Register the key with
+      #   # `herdr-eng control-plane assistant-judge register --endpoint URL --key-file PATH --key-stdin` (stdin only).
+      #   # See docs/operations/assistant-hub.md ("Phase 3"). Inline secrets (api_key, key, token) are rejected.
+      #   judge:
+      #     enabled: false
+      #     provider: jev                # only "jev" (System One) exists
+      #     endpoint: ""                 # https URL of System One; http only for loopback. Required when enabled; changing it resets grants
+      #     model: laya-auto             # must appear in GET <endpoint>/v1/models; changing it resets every grant to shadow
+      #     api_key_file: ""             # absolute PATH only, never the key itself; 0600, owned by the service user
+      #     timeout_seconds: 5           # integer 1..60; budget on the authorize path (real Laya may need more; see docs)
+      #     fail_mode: closed            # only "closed": judge unavailable => pending
+      #     backend_confirmed: false     # set true ONLY after you verified a real model (not the mock) serves this
+      #     thresholds:                  # escalate when any answer reaches its threshold (changing them resets grants)
+      #       destructive: 0.30
+      #       irreversible: 0.30
+      #       severity_score: 2.0        # expected severity, 0 informational .. 3 critical
+      #     calibration:                 # the activation gate, evaluated per risk class
+      #       min_labeled_decisions: 200 # minimum 20
+      #       max_false_negative_bound: 0.05   # exclusive upper bound; accepted range 0 < x <= 0.5
       #   # Off-box anchor for the audit chain head (see runbook "Anchoring the audit head"):
       #   audit:
       #     hmac_key_file: "/etc/herdr/assistant-audit.key"   # PATH only (>= 16 bytes)

@@ -12,14 +12,17 @@
 # The operator invite provisioner (collab-provision.py) gets the operator, pool and group from
 # the same slice, and reads collab-public's log under --data-dir (the directory collab-public
 # mounts at /data; deploy.sh passes it).
-# Usage: collab-sync.sh once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR]
+# --share-host HOST (shares enabled): the edge presents this one certificate for the share host too, so a
+# certificate whose subjectAltName lacks HOST is refused (never copied to the edge; `once` and the timer exit
+# non-zero) and `cert-host` checks the staged copy. deploy.sh passes it and install writes it into the unit.
+# Usage: collab-sync.sh once|install|renew-check|cert-host [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR]
 #          [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]
 # Unless --certbot is explicit, Certbot is read from the ACME directory's sibling DIR-venv.
 # --lock-held: the caller (deploy.sh) already holds SYNC_DIR.lock for its whole container work,
 # which is what keeps the minute timer's run out of a deploy; without the flag this run would
 # see that lock and skip its own refresh. Never written into a unit.
 set -euo pipefail
-USAGE="usage: $0 once|install|renew-check [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME] [--lock-held]"
+USAGE="usage: $0 once|install|renew-check|cert-host [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME] [--share-host HOST] [--lock-held]"
 ACTION="${1:-once}"; [ $# -gt 0 ] && shift
 CONFIG="$HOME/.config/herdr-engineering/collab/collab-config.json"
 FLEET="$HOME/.config/herdr-engineering/fleet/fleet-config.yaml"
@@ -31,6 +34,7 @@ ACME="$HOME/.local/share/herdr-engineering/collab-acme"
 CERT_SRC=""
 CERTBOT=""
 LOCK_HELD=0
+SHARE_HOST=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG="${2:?--config needs a value}"; shift 2 ;;
@@ -42,6 +46,7 @@ while [ $# -gt 0 ]; do
     --acme-dir) ACME="${2:?--acme-dir needs a value}"; shift 2 ;;
     --certbot) CERTBOT="${2:?--certbot needs a value}"; shift 2 ;;
     --cert-name) CERT_NAME="${2:?--cert-name needs a value}"; shift 2 ;;
+    --share-host) SHARE_HOST="${2:?--share-host needs a value}"; shift 2 ;;
     --lock-held) LOCK_HELD=1; shift ;;
     *) echo "$USAGE" >&2; exit 2 ;;
   esac
@@ -108,11 +113,34 @@ PY
   certs
 }
 
+# <pem> <host>: 0 when the certificate's subjectAltName names the host (exactly, or by a one-label wildcard).
+cert_covers_host() {
+  local sans
+  sans="$(openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null)" || return 1
+  python3 - "$2" "$sans" <<'PY'
+import sys
+host = sys.argv[1].lower()
+names = [part.strip()[4:].lower() for part in sys.argv[2].replace("\n", ",").split(",") if part.strip().startswith("DNS:")]
+first, _, rest = host.partition(".")
+sys.exit(0 if host in names or (rest and "*." + rest in names) else 1)
+PY
+}
+
+check_cert_host() {   # <pem> <where>: the loud refusal
+  [ -z "$SHARE_HOST" ] && return 0
+  cert_covers_host "$1" "$SHARE_HOST" && return 0
+  echo "ERROR: the $2 certificate ($1) does not name the share host $SHARE_HOST in its subjectAltName;" \
+       "browsers would fail the TLS handshake. Run certbot --expand to add it (or fix the DNS-01 plugin for its zone)" \
+       "before deploying; the previous certificate stays in place." >&2
+  return 1
+}
+
 # Hand the edge ONLY its own certificate. Mounting certbot's whole config dir would give the
 # internet-facing container every lineage's private key and the ACME account key.
 certs() {
   local src="$CERT_SRC" dst="$CERT_DIR" changed=0 f
   mkdir -p "$dst"; chmod 700 "$dst"
+  check_cert_host "$src/fullchain.pem" "certbot" || return 1    # an unusable certificate never reaches the edge
   for f in fullchain.pem privkey.pem; do
     if ! cmp -s "$src/$f" "$dst/$f"; then
       install -m 0600 "$src/$f" "$dst/$f.new"; mv -f "$dst/$f.new" "$dst/$f"; changed=1
@@ -204,7 +232,7 @@ install_timer() {
 Description=Refresh collab Cognito membership and keys
 [Service]
 Type=oneshot
-ExecStart="$bin" once --config "$CONFIG" --dir "$DIR" --data-dir "$DATA_DIR" --cert-dir "$CERT_DIR" --cert-src "$CERT_SRC"
+ExecStart="$bin" once --config "$CONFIG" --dir "$DIR" --data-dir "$DATA_DIR" --cert-dir "$CERT_DIR" --cert-src "$CERT_SRC"${SHARE_HOST:+ --share-host "$SHARE_HOST"}
 UNIT
   cat > "$u/herdr-collab-sync.timer" <<UNIT
 [Unit]
@@ -222,4 +250,4 @@ UNIT
   install_spawn_timer
 }
 
-case "$ACTION" in once) once ;; install) once; install_timer ;; renew-check) certbot_dry_run ;; *) echo "$USAGE" >&2; exit 2 ;; esac
+case "$ACTION" in once) once ;; install) once; install_timer ;; renew-check) certbot_dry_run ;; cert-host) check_cert_host "$CERT_DIR/fullchain.pem" "staged edge" ;; *) echo "$USAGE" >&2; exit 2 ;; esac

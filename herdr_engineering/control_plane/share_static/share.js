@@ -6,22 +6,26 @@
  * a URL, the console or the page. The share path travels in sessionStorage keyed to a random `state`, never to Cognito.
  * Any failure shows one neutral message and never says why. No HTML is ever built from data (textContent only).
  */
-(function () {
+import { sessionStore, validConfig, beginPkce, exchangeCode } from "/s/static/lab-signin.js";
+
+{
   "use strict";
 
   var SHARE_PATH = /^\/s\/[A-Za-z0-9_-]{43}\/$/;
-  var BASE_PATH = /^\/s\/[A-Za-z0-9_-]{43}\/k\/[A-Za-z0-9_.-]{1,512}\/f\/$/;
-  var ORIGIN = /^https:\/\/[A-Za-z0-9.-]+(:[0-9]{1,5})?$/;
+  // /s/<token>/k/<session>/<f|v>/<entry>: the entry is one or more plain path segments (no backslash, query, fragment,
+  // control or space character, no empty segment) so the browser cannot resolve it anywhere but under the share.
+  var LANDING_PATH = /^\/s\/[A-Za-z0-9_-]{43}\/k\/[A-Za-z0-9_.-]{1,768}\/[fv]\/[^\/\\?#\x00-\x20\x7f]+(?:\/[^\/\\?#\x00-\x20\x7f]+)*$/;
+  var DOT_SEGMENT = /(?:^|\/)(?:\.|\.\.|%2e|\.%2e|%2e\.|%2e%2e)(?:\/|$)/i;
+  var ENCODED_SEPARATOR = /%(?:2f|5c|00|3f|23)/i;
+
+  function safeLanding(landing, sharePath) {
+    return typeof landing === "string" && LANDING_PATH.test(landing) && landing.indexOf(sharePath) === 0
+      && !DOT_SEGMENT.test(landing) && !ENCODED_SEPARATOR.test(landing);
+  }
   var PENDING_KEY = "herdr-share-pkce";
   var TOKENS_KEY = "herdr-share-tokens";
 
-  function store() {
-    try {
-      return window.sessionStorage;
-    } catch (e) {
-      return null;
-    }
-  }
+  var store = sessionStore;
 
   function forget() {
     var s = store();
@@ -41,84 +45,35 @@
     }
   }
 
-  function b64url(bytes) {
-    var bin = "";
-    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  }
-
-  function randomString(n) {
-    var bytes = new Uint8Array(n);
-    crypto.getRandomValues(bytes);
-    return b64url(bytes);
-  }
-
   async function loadConfig() {
     var r = await fetch("/s/static/config.json", { cache: "no-store", credentials: "omit" });
     if (!r.ok) throw new Error("config");
     var c = await r.json();
-    if (!c || typeof c.cognito_domain !== "string" || !ORIGIN.test(c.cognito_domain)
-        || typeof c.client_id !== "string" || !c.client_id
-        || typeof c.redirect_uri !== "string" || c.redirect_uri.indexOf("https://") !== 0) {
-      throw new Error("config");
-    }
+    if (!validConfig(c)) throw new Error("config");
     return c;
   }
 
   async function signIn(cfg, sharePath) {
-    var verifier = randomString(32);
-    var state = randomString(24);
-    var digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
-    store().setItem(PENDING_KEY, JSON.stringify({ state: state, verifier: verifier, share: sharePath }));
-    var query = new URLSearchParams({
-      response_type: "code",
-      client_id: cfg.client_id,
-      redirect_uri: cfg.redirect_uri,
-      scope: "openid email",
-      state: state,
-      code_challenge: b64url(new Uint8Array(digest)),
-      code_challenge_method: "S256"
-    });
-    location.assign(cfg.cognito_domain + "/oauth2/authorize?" + query.toString());
-  }
-
-  async function exchangeCode(cfg, code, verifier) {
-    var body = new URLSearchParams({
-      grant_type: "authorization_code",
-      client_id: cfg.client_id,
-      code: code,
-      redirect_uri: cfg.redirect_uri,
-      code_verifier: verifier
-    });
-    var r = await fetch(cfg.cognito_domain + "/oauth2/token", {
-      method: "POST",
-      cache: "no-store",
-      credentials: "omit",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: body.toString()
-    });
-    if (!r.ok) throw new Error("token");
-    var t = await r.json();
-    if (!t || typeof t.access_token !== "string" || typeof t.id_token !== "string") throw new Error("token");
-    return { access: t.access_token, id: t.id_token };
+    var p = await beginPkce(cfg);
+    store().setItem(PENDING_KEY, JSON.stringify({ state: p.state, verifier: p.verifier, share: sharePath }));
+    location.assign(p.url);
   }
 
   async function openShare(sharePath, tokens) {
+    // same-origin: the response sets the HttpOnly write cookie that the annotation routes require
     var r = await fetch(sharePath + "session", {
       method: "POST",
       cache: "no-store",
-      credentials: "omit",
+      credentials: "same-origin",
       headers: { "Authorization": "Bearer " + tokens.access, "X-Id-Token": tokens.id }
     });
     forget(); // the session path replaces the tokens; nothing is kept either way
     if (!r.ok) throw new Error("session");
     var got = await r.json();
-    if (!got || typeof got.base !== "string" || typeof got.entry !== "string" || !got.entry
-        || !BASE_PATH.test(got.base) || got.base.indexOf(sharePath) !== 0) {
+    if (!got || !safeLanding(got.landing, sharePath)) {
       throw new Error("session");
     }
-    var entry = got.entry.split("/").map(encodeURIComponent).join("/");
-    location.replace(got.base + entry);
+    location.replace(got.landing);
   }
 
   async function callback() {
@@ -149,4 +104,4 @@
   }
 
   main().catch(fail);
-})();
+}

@@ -7,6 +7,8 @@ import tempfile
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, quote, urlsplit
 
+from ..media_type import safe_media_type
+
 MAX_ASSET_BYTES = 1024 * 1024 * 1024
 CHUNK_BYTES = 1024 * 1024
 
@@ -82,8 +84,8 @@ def _text(handler, data, *, mime="text/html; charset=utf-8", status=200):
     handler.send_header("X-Content-Type-Options", "nosniff")
     handler.send_header("Referrer-Policy", "no-referrer")
     handler.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; "
-                        "script-src 'none'; img-src 'none'; base-uri 'none'; form-action 'none'; "
-                        "frame-ancestors 'self'; sandbox")
+                        "script-src 'none'; img-src data:; base-uri 'none'; form-action 'none'; "
+                        "frame-ancestors 'none'; sandbox")
     handler.end_headers()
     handler.wfile.write(payload)
 
@@ -113,7 +115,7 @@ def _download(handler, server, asset):
         spool.seek(0)
         handler._response_status = 200
         handler.send_response(200)
-        handler.send_header("Content-Type", asset["media_type"])
+        handler.send_header("Content-Type", safe_media_type(asset["media_type"]))
         handler.send_header("Content-Length", str(size))
         handler.send_header("Content-Disposition", "attachment; filename*=UTF-8''" +
                             quote(PurePosixPath(asset["name"]).name, safe=""))
@@ -272,7 +274,10 @@ def route_report(handler, server, parts, resource):
             from .artifact_report_render import render_report_preview
             descriptor = handler._artifact_call("get_report_descriptor", artifact_id, version_id)
             prefix = f"/api/v1/artifacts/{quote(artifact_id, safe='')}/versions/{quote(version_id, safe='')}/assets/"
-            _text(handler, render_report_preview(descriptor,
+            from .artifact_report_figures import load_figure_images
+            images = load_figure_images(descriptor, server.rustfs, lambda asset_id: handler._artifact_call(
+                "get_report_asset", artifact_id, version_id, asset_id))
+            _text(handler, render_report_preview(descriptor, figure_images=images,
                 asset_url=lambda asset: prefix + quote(asset["id"], safe="")))
         elif action in {"report", "checks"}:
             report = handler._artifact_call("get_report", artifact_id, version_id)
