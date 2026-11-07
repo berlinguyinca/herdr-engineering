@@ -12,6 +12,16 @@ export const isHtmlType = type => typeof type === 'string' && type.split(';', 1)
 /** True when the report version has an HTML asset to show (the server decides which one, or refuses). */
 export const hasRichView = assets => Array.isArray(assets) && assets.some(asset => isHtmlType(asset?.media_type));
 
+/**
+ * True when exactly one HTML asset is the author's page: the only text/html asset, or, when several, the only one with
+ * role `preview`. Mirrors pick_html_asset in artifact_rich_view.py (the server decides again at share time).
+ */
+export function hasSingleHtmlAsset(assets) {
+  let html = Array.isArray(assets) ? assets.filter(asset => isHtmlType(asset?.media_type)) : [];
+  if (html.length > 1) html = html.filter(asset => asset.role === 'preview');
+  return html.length === 1;
+}
+
 /** True only for the rich route of a version: the single `src` this view will frame. */
 export const isRichUrl = url => typeof url === 'string' && RICH_ROUTE.test(url);
 
