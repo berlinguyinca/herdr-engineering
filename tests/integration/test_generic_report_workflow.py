@@ -225,7 +225,13 @@ def test_authenticated_report_build_diff_review_feedback_and_bounded_preview(wor
     assert b"Observed difference needs a controlled evaluation" in preview
     assert b"data-1" in preview and b"plot-1" in preview
     assert "script-src 'none'" in headers["Content-Security-Policy"]
-    assert workflow.transport.get_keys == reads, "Metadata/preview fetched supporting asset bytes"
+    # Previews inline figures (image assets only, capped); the multi-megabyte evidence file must never be read.
+    figure_keys = {key for key, body in workflow.transport.objects.items() if body == figure}
+    evidence_keys = {key for key, body in workflow.transport.objects.items() if body == evidence}
+    assert figure_keys and evidence_keys
+    assert set(workflow.transport.get_keys[len(reads):]) <= figure_keys, "Preview fetched non-figure asset bytes"
+    assert not evidence_keys & set(workflow.transport.get_keys), "Preview fetched the evidence file"
+    reads = list(workflow.transport.get_keys)
     downloaded, headers = workflow.request(endpoint + "/assets/data-1")
     assert downloaded == evidence
     assert "attachment" in headers["Content-Disposition"]
