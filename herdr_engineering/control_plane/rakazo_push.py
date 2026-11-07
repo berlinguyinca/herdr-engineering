@@ -28,7 +28,7 @@ MAX_QUEUE = 64
 SEEN_LIMIT = 2000
 TIMEOUT_SECONDS = 10
 MAX_RESPONSE = 64 * 1024
-_TOKEN_RE = re.compile(r"(?:Exponent|Expo)PushToken\[[^\]]*\]")
+_TOKEN_RE = re.compile(r"(?:Exponent|Expo)PushToken\[[^\]\s;,]*\]?")
 
 
 class PostgresPushPersistence:
