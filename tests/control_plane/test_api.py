@@ -543,6 +543,37 @@ def test_services_archive_filter_is_optional_and_detail_history_remains(server):
     assert data['services'] == [] and data['summary']['total'] == 0  # summary follows the filter
 
 
+def test_services_list_is_paged_with_default_cap_and_next_offset(server):
+    c, repo = server
+    for port in range(8000, 8007):
+        repo.register_service(f'svc{port}', 'host', port, status='healthy')
+    # No parameters: the capped default page, with an explicit marker.
+    _, _, body = c.get('/api/v1/services')
+    data = json.loads(body)
+    assert len(data['services']) == 7
+    assert data['pagination'] == {'total': 7, 'limit': 500, 'offset': 0,
+                                  'next_offset': None, 'truncated': False}
+    # Explicit paging walks the whole inventory exactly once, summary spans all.
+    seen, offset = [], 0
+    while offset is not None:
+        _, _, body = c.get(f'/api/v1/services?limit=3&offset={offset}')
+        data = json.loads(body)
+        assert data['summary']['total'] == 7
+        assert len(data['services']) <= 3
+        seen += [s['service_id'] for s in data['services']]
+        offset = data['pagination']['next_offset']
+    assert len(seen) == 7 and len(set(seen)) == 7
+    _, _, body = c.get('/api/v1/services?limit=3')
+    page = json.loads(body)['pagination']
+    assert page == {'total': 7, 'limit': 3, 'offset': 0, 'next_offset': 3, 'truncated': True}
+    # Feed projection pages the same way.
+    _, _, body = c.get('/api/v1/services?host_id=host&fields=feed&limit=2&offset=6')
+    data = json.loads(body)
+    assert len(data['services']) == 1 and data['pagination']['next_offset'] is None
+    for bad in ('limit=0', 'limit=abc', 'limit=100000', 'offset=-1', 'offset=x'):
+        assert c.get(f'/api/v1/services?{bad}')[0] == 400
+
+
 def test_retire_endpoint_is_a_dry_run_unless_told_otherwise(server):
     c, repo = server
     clock = [1_800_000_000]

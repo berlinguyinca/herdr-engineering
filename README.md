@@ -459,6 +459,25 @@ curl -XPOST -H 'X-API-Key: $OPERATOR_KEY' -d '{"older_than_days":7,"states":["un
   http://dev.lan/api/v1/services/retire
 ```
 
+### Paged list endpoints
+
+`GET /api/v1/services` and `GET /api/v1/ci/history` return capped pages instead
+of the whole inventory (the live services reply had reached ~22 MB). Both take
+`limit` and `offset` (`limit` defaults to 500 for services and 1000 for CI
+history; the maximum is 1000 and 2000; invalid values return 400). Requests with
+no parameters still work and return the first capped page. Every reply carries
+a marker:
+
+```json
+"pagination": {"total": 7312, "limit": 500, "offset": 0, "next_offset": 500, "truncated": true}
+```
+
+Follow `next_offset` until it is `null`. `summary` (services) and
+`repos`/`coverage` (CI history) describe the whole inventory on every page.
+The web client's `listServices()` and `getCiHistory()` follow `next_offset` and
+merge pages (pass `{all:false}` for the first page only), and the ownership
+feed does the same. The existing `view=catalog` cursor API is unchanged.
+
 Note: the web hydrates from Postgres **once at startup**, so it reflects a
 snapshot of durable state; live updates flow over SSE. Restart the web to
 re-hydrate after external writes.
