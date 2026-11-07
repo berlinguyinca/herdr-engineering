@@ -23,9 +23,9 @@ runs the service.
 | `fabric-gateway` | `herdr-engineering:0.1.0` (built) | The `dev:<port>` front door (spec 0110 #3): control API + per-port router + probe loop. |
 
 `herdr-web` (the spec 0060 web/mobile surface on `127.0.0.1:8787`) is **retired** (2026-11-07): the control plane's
-UI replaced it. A container left from it on the master host is removed by the herdr-fleet `control-plane` role's
-adoption, not by hand and not by `scripts/fabric-stack.sh` (which skips `--remove-orphans` while it exists). Until
-then the node's ts.net route in `config.yaml` still points at it.
+UI replaced it. A container left from it on the master host is not removed by this repository, by
+`scripts/fabric-stack.sh` (which skips `--remove-orphans` while it exists) or by herdr-fleet's adoption (which leaves
+it in place): the operator removes it by hand (`docker rm -f herdr-web`; keep the `herdr-engineering:0.1.0` image tag, which fabric-gateway uses) once the gateway's ts.net route is repointed or dropped (open owner decision). Until then the node's ts.net route in `config.yaml` still points at it.
 
 The per-host **auto-registration agent** is intentionally *not* containerized:
 it must see host listeners via `ss`/`lsof`, so it stays a host service on

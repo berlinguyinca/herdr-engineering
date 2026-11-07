@@ -84,8 +84,8 @@ stop_old_host_services() {
     fi
 }
 
-# A container of the retired herdr-web service (no longer in compose). This script never stops or removes it;
-# the control-plane role's adoption does.
+# A container of the retired herdr-web service (no longer in compose). Nothing in this repository or in
+# herdr-fleet stops or removes it: the operator does, by hand, once the gateway's ts.net route is repointed or dropped.
 left_herdr_web() { docker inspect --type container herdr-web >/dev/null 2>&1; }
 
 up() {
@@ -94,15 +94,14 @@ up() {
     "${COMPOSE[@]}" build fabric-gateway
     # The optional Hindsight memory containers belong to compose profile `memory`, managed by deploy.sh --with-memory.
     # While they exist, never ask compose to remove "orphans": this script's env file carries no memory variables.
-    # Nor while a container of the retired herdr-web service is left: the control-plane role's adoption
-    # removes it, never this script.
+    # Nor while a container of the retired herdr-web service is left: this script never removes it.
     local orphans=(--remove-orphans)
     if docker inspect --type container herdr-hindsight >/dev/null 2>&1 || docker inspect --type container herdr-hindsight-db >/dev/null 2>&1; then
         orphans=()
         warn "Hindsight memory containers present: not using --remove-orphans (managed by deploy.sh --with-memory)"
     elif left_herdr_web; then
         orphans=()
-        warn "retired herdr-web container present: not using --remove-orphans (the control-plane role's adoption removes it)"
+        warn "retired herdr-web container present: not using --remove-orphans (remove it by hand with 'docker rm -f herdr-web' once the gateway's ts.net route no longer points at it)"
     fi
     "${COMPOSE[@]}" up -d ${orphans[@]+"${orphans[@]}"}
     "${COMPOSE[@]}" ps
@@ -156,7 +155,7 @@ status() {
 down() {  # not the control plane
     "${COMPOSE[@]}" stop coredns fabric-gateway
     if left_herdr_web; then
-        warn "retired herdr-web container left running (not part of this stack any more; the control-plane role's adoption removes it)"
+        warn "retired herdr-web container left running (not part of this stack any more; remove it by hand with 'docker rm -f herdr-web' once the gateway's ts.net route no longer points at it)"
     fi
 }
 

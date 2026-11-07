@@ -22,8 +22,9 @@ fabric:
   tailscale_cert: "bender.tail0c50da.ts.net"
   tailnet_cert_dir: /tailnet-cert
   routes:
-    # The node's ts.net name still goes to the RETIRED herdr-web (127.0.0.1:8787; spec 0060), whose container stays
-    # until the control-plane role's adoption removes it. Repoint or drop this route before then (owner decision).
+    # The node's ts.net name still goes to the RETIRED herdr-web (127.0.0.1:8787; spec 0060). Its container stays: no
+    # code here or in herdr-fleet removes it. Repoint or drop this route (owner decision), then the operator removes
+    # the container by hand (`docker rm -f herdr-web`; keep the herdr-engineering:0.1.0 tag, fabric-gateway uses it).
     - "bender.tail0c50da.ts.net=127.0.0.1:8787"
     # Hindsight shared memory (docs/operations/memory-hindsight.md). OFF until `scripts/fabric-stack.sh memory-route
     # enable` (it uncomments exactly the two marked lines): HTTPS only, through this gateway's existing certificates

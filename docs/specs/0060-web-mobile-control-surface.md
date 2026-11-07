@@ -1,6 +1,6 @@
 # 0060 — Web and Mobile Control Surface
 
-**Status:** retired · **Retired:** 2026-11-07 · **Why:** nobody used it; the control plane's UI (`herdr-eng control-plane web`) is the web surface. Removed: `herdr_engineering/web.py`, `herdr-eng web`, the `herdr-web` compose service, the `herdr-eng-web` user unit and its Ansible task, the Agent Mine fleet playbook (its only reader was this surface's `/api/agent-mine`). A `herdr-web` container left on the control host is removed by the herdr-fleet `control-plane` role's adoption. The text below is kept as the historical record.
+**Status:** retired · **Retired:** 2026-11-07 · **Why:** nobody used it; the control plane's UI (`herdr-eng control-plane web`) is the web surface. Removed: `herdr_engineering/web.py`, `herdr-eng web`, the `herdr-web` compose service, the `herdr-eng-web` user unit and its Ansible task, the Agent Mine fleet playbook (its only reader was this surface's `/api/agent-mine`). A `herdr-web` container left on the control host is not removed by this repository or by herdr-fleet's adoption; the operator removes it by hand (`docker rm -f herdr-web`; keep the `herdr-engineering:0.1.0` image tag, which fabric-gateway uses) once the gateway's ts.net route is repointed or dropped (open owner decision). The text below is kept as the historical record.
 
 ## Goal
 

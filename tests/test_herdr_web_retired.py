@@ -1,7 +1,7 @@
 """herdr-web is retired (fleet provisioning, Task 19): no compose service, no CLI command, no module.
 
-The container that may still run on the control host is removed by the control-plane role's adoption,
-not by anything in this repository.
+A container that may still run on the control host is removed by neither this repository nor herdr-fleet's
+adoption: the operator removes it by hand once the gateway's ts.net route is repointed or dropped.
 """
 from __future__ import annotations
 
@@ -67,7 +67,8 @@ def test_fabric_stack_down_leaves_a_left_herdr_web_container_alone_and_says_so()
     down = _function(_fabric_stack(), "down")
     assert '"${COMPOSE[@]}" stop coredns fabric-gateway\n' in down  # the service is not named
     assert "left_herdr_web" in down and "warn " in down
-    assert "docker stop" not in down and "docker rm" not in down and " rm " not in down
+    commands = "\n".join(line for line in down.splitlines() if not line.strip().startswith("warn "))
+    assert "docker stop" not in commands and "docker rm" not in commands and " rm " not in commands  # only the hint says it
 
 
 def test_fabric_stack_up_never_removes_a_left_herdr_web_container():

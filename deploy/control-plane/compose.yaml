@@ -32,8 +32,9 @@
 # name), while coredns and fabric-gateway (formerly the separate
 # `herdr-fabric` project in deploy/fabric-stack) keep `network_mode: host`,
 # which the gateway and CoreDNS require. See deploy/fabric-stack/README.md for
-# what those two do. (herdr-web, the old spec 0060 surface, is retired; a
-# container left from it is removed by the control-plane role's adoption.)
+# what those two do. (herdr-web, the old spec 0060 surface, is retired; nothing
+# here or in herdr-fleet removes a container left from it: the operator does, by
+# hand, after the gateway's ts.net route is repointed or dropped.)
 #
 # CONFIGURATION: the central fleet file (~/.config/herdr-engineering/fleet/fleet-config.yaml,
 # created by `herdr-eng fleet config init`) is the only source. The web and worker

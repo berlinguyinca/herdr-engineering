@@ -604,8 +604,8 @@ evidence: [`docs/architecture/dev-fabric-gateway.md`](docs/architecture/dev-fabr
 The stdlib web/mobile surface (`herdr-eng web`, `web.py`, the `herdr-web` container and the
 `herdr-eng-web` user unit) was retired on 2026-11-07; nobody used it. The control plane's UI
 (`herdr-eng control-plane web`) is the web surface. A `herdr-web` container left on the control
-host is removed by the herdr-fleet `control-plane` role's adoption; `scripts/fabric-stack.sh` neither
-stops nor removes it (`down` leaves it running and says so).
+host is not removed by this repository or by herdr-fleet's adoption: the operator removes it by hand (`docker rm -f herdr-web`; keep the `herdr-engineering:0.1.0` image tag, which fabric-gateway uses) once the gateway's ts.net route is repointed or dropped (open owner decision). `scripts/fabric-stack.sh`
+neither stops nor removes it (`down` leaves it running and says so).
 
 ## Lineage continuity, artifact visibility and delivery metrics
 

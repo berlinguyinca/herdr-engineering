@@ -175,8 +175,8 @@ service is stateless except for the store directory).
 The private control surface `herdr-eng web` (spec 0060: `web.py` on loopback `127.0.0.1:8787`, the
 `herdr-eng-web` user unit with `tailscale serve --bg 8787`, later the `herdr-web` container) was retired on
 2026-11-07; nobody used it. The control plane's UI is the web surface. A `herdr-web` container left on the
-gateway host is removed by the herdr-fleet `control-plane` role's adoption. Until then the gateway's ts.net
-route in `deploy/fabric-stack/config.yaml` still points at `127.0.0.1:8787`.
+gateway host is not removed by this repository or by herdr-fleet's adoption; the operator removes it by hand (`docker rm -f herdr-web`; keep the `herdr-engineering:0.1.0` image tag, which fabric-gateway uses) once the gateway's ts.net route is repointed or dropped (open owner decision). Until then the
+gateway's ts.net route in `deploy/fabric-stack/config.yaml` still points at `127.0.0.1:8787`.
 
 ## Shared `dev.lan` domain (Option B)
 

@@ -277,6 +277,8 @@ unit-tested; only live convergence/validation is pending.
       is retired, so there is nothing to validate there. **Open owner decision:**
       the gateway still routes the node's ts.net name to `127.0.0.1:8787`
       (`deploy/fabric-stack/config.yaml`); repoint it to the control plane or
-      drop it before the control-plane role's adoption removes the container.
+      drop it; then the operator removes the leftover container by hand
+      (`docker rm -f herdr-web`, keeping the `herdr-engineering:0.1.0` tag that
+      fabric-gateway uses). Neither this repo nor herdr-fleet's adoption removes it.
 - [x] README commands match the real shipped implementation. Updated with real
       `herdr-eng` commands and observed output.
