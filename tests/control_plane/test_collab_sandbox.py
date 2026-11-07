@@ -105,7 +105,8 @@ def test_it_refuses_to_run_outside_the_work_area_or_without_bwrap(home, tmp_path
 
 @needs_box
 def test_a_fork_bomb_is_stopped_by_the_process_cap(home):
-    if subprocess.run(["systemd-run", "--user", "--scope", "-q", "true"], capture_output=True).returncode != 0:
+    if not shutil.which("systemd-run") or subprocess.run(
+            ["systemd-run", "--user", "--scope", "-q", "true"], capture_output=True).returncode != 0:
         pytest.skip("no systemd user scope here")
     r = subprocess.run(["bash", str(SANDBOX), str(home / "herdr-agents/work/fb"), ':(){ :|:& };: ; sleep 2; echo alive'],
                        capture_output=True, text=True, timeout=60, env={**os.environ, "HERDR_SANDBOX_TASKS": "64"})

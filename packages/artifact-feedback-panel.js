@@ -34,9 +34,9 @@ export function renderAnnotationRow(annotation, { artifactId = '', busy = false 
   const dismiss = a.status === 'open'
     ? `<button type="button" class="hd-btn" data-feedback-action="dismiss" data-annotation-id="${esc(a.annotation_id ?? '')}"${busy ? ' disabled' : ''}>Dismiss</button>` : '';
   const when = formatWhen(a.created_at);
-  return `<li data-feedback-row><p style="overflow-wrap:anywhere"><strong>${esc(a.author_email ?? 'unknown')}</strong>${a.author_role === 'owner' ? ' <span class="hd-badge">owner</span>' : ''}`
+  return `<li data-feedback-row><p style="overflow-wrap:anywhere"><strong><bdi>${esc(a.author_email ?? 'unknown')}</bdi></strong>${a.author_role === 'owner' ? ' <span class="hd-badge">owner</span>' : ''}`
     + ` · v${esc(a.version_number ?? '?')} · ${renderAnchor(a.anchor)}${a.edited_at ? ' <em>(edited)</em>' : ''}${when ? ` · <time>${esc(when)}</time>` : ''}</p>`
-    + `<p style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(a.body ?? '')}</p>`
+    + `<p dir="auto" style="white-space:pre-wrap;overflow-wrap:anywhere;unicode-bidi:plaintext">${esc(a.body ?? '')}</p>`
     + `<p class="hd-note">${esc(a.status ?? '')}${addressed}</p>${dismiss}</li>`;
 }
 

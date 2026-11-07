@@ -200,6 +200,13 @@ them is run by the build. Do them in this order, and do not deploy a partial set
 
 ### Before you deploy: what changes for existing links
 
+- **Drain the annotation spool first.** The previous edge wrote no `basis` (and no `author_email` on edits and
+  deletes); the worker now refuses such lines as `invalid`. Lines spooled but not yet ingested at the cutover would be
+  lost: wait until the worker has ingested the spool, or stop share-public before deploying and start it after the
+  worker runs the new code. Existing lab sessions are invalidated (the session format changed), so viewers sign in again.
+- **Version skew.** The edge refuses unassigned code points (category Cn) using its Python's Unicode tables; keep the
+  edge's Python current so brand-new characters are not refused (the worker does not check Cn).
+
 - **Every outstanding share link stops working.** Links issued so far point at the MCP host
   (`localdev.mcp.metabolomics.us/s/<token>/`); that host no longer serves `/s/` and a temporary redirect was
   deliberately not added. Tokens are shown once and cannot be re-derived: list the live shares first
@@ -224,8 +231,12 @@ them is run by the build. Do them in this order, and do not deploy a partial set
   single sanitiser lane is the real bound.
 - **A scripted `f/` page sees its own session URL (mitigated by a write cookie).** Author JavaScript in a raw HTML
   file (sandboxed, opaque origin) can read `location.href`, which carries the viewer's session, and an author
-  `<meta name="referrer" content="unsafe-url">` overrides our `Referrer-Policy: no-referrer` header, so a click or a
-  meta refresh can send the session URL to another site in the `Referer` (Firefox and WebKit, even without script).
+  `<meta name="referrer" content="unsafe-url">` overrides our `Referrer-Policy: no-referrer` header (which the share host
+  now sends on every response, including 206/304/412/416/204/404), so a click or a meta refresh can send the session
+  URL to another site in the `Referer` (Firefox and WebKit, even without script). The raw `f/` bytes are deliberately
+  served as authored (stripping the meta would not close this: `referrerpolicy` attributes on `a`/`img`/`iframe`,
+  script-created metas and `location.href` itself all remain); the `a/` render drops `<meta>` and `referrerpolicy`
+  (`test_sanitiser_output_never_carries_an_author_referrer_policy`), and the write cookie below is the mitigation.
   That URL alone no longer reads or writes annotations: the session exchange also sets
   `hw_<hash>=<MAC>; Path=/s/<token>/; HttpOnly; Secure; SameSite=Strict`, a MAC under its own domain label
   (`herdr-annotate-write-v1`), and both annotation routes (GET and POST) require it in addition to the CSRF token,
@@ -234,8 +245,12 @@ them is run by the build. Do them in this order, and do not deploy a partial set
   from `f/` to `a/` still works, and the `a/` page's own requests carry the cookie). Verified in Chromium, Firefox
   and WebKit (`tests/playwright/share-annotations.test.mjs`). What remains: the stolen URL still opens the share's
   files (`f/`, `v/`, `a/` page including its CSRF meta) until the session expires, because the author already holds
-  those files; the viewer's email is part of the session segment and therefore of the URL (removing it would mean
-  changing the session format; deferred); and a cookie is bound to the session, not to a device, so it protects
+  those files; neither the viewer's email nor their user name is readable from the URL any more: the session segment is
+  `<basis>.<exp>.<ChaCha20-Poly1305 blob>`, with identity and email padded inside the encrypted block (key derived from
+  the signing secret under its own label; the tag is checked before anything is parsed, and the basis, expiry and share id
+  are authenticated). Sessions minted before this change stop working and the viewer signs in again. The image needs the
+  `cryptography` package (declared in the `share`, `collab` and `review-gate` extras; the fabric image installs `share`);
+  and a cookie is bound to the session, not to a device, so it protects
   against URL leaks, not against malware in the viewer's browser. Lab PDFs on `f/` are now served under the sandbox
   policy as well; where a browser refuses to show a sandboxed PDF inline, use the `v/` view.
 - **Stored media types.** Responses never carry a stored media type's parameters: `/live`, `/download`, report asset
@@ -246,11 +261,24 @@ them is run by the build. Do them in this order, and do not deploy a partial set
   error) on one `annotations.jsonl` line aborts every ingest pass at that offset; the batch rolls back and the marker
   does not move. The worker logs a warning with a consecutive-failure counter so an operator sees it; clearing it
   means fixing or removing that line. Only a compromised edge can write such lines.
-- The worker does not re-check an annotation author against the share's allow-list when it ingests a line (the edge
-  does); a compromised edge could mint unlisted or owner-role authors.
-- Comments and anchor text may contain bidirectional and zero-width format characters (they render as text, but can
-  spoof layout in the owner's panel).
-- PDF annotation is pointer-only: keyboard users can comment on the whole PDF but cannot choose a page or region.
+- The worker re-checks the author against the share's CURRENT allow-list when it ingests a line (`not_on_list`, a
+  `denied` event), with the same rule as the edge (`still_admitted`, no owner exception) and ONLY on the basis the line
+  names: `e` needs the email on `allow_emails`, `g` needs the share to still have `allow_groups` (the worker holds no group
+  names, like the edge). Every line (create, edit, delete) must carry `basis` `e` or `g`; a missing or other value is
+  refused (`invalid`). A member removed from the list can neither create, edit nor withdraw: the edge refuses their POST,
+  and a line the edge accepted just before the removal is acknowledged (202 "pending") and then dropped by the worker.
+  A compromised edge, which holds the signing secret, can still claim any listed email.
+- Emails longer than 200 characters are refused by ingest (`invalid`) although a session allows 254.
+- Comments and anchor text are refused (`bad_chars`) at the edge when they contain a character of Unicode category Cc, Cf,
+  Cs, Co or Cn (C0/C1 controls, bidi embeddings/overrides/isolates, tag characters, invisible operators, BOM, private use,
+  unassigned) or U+2028/2029, or one of U+034F, U+115F, U+1160, U+17B4/17B5, U+3164, U+FFA0, except ZWJ, ZWNJ, the directional
+  marks U+200E/200F/061C, `\n` and `\t`. Ideographic variation selectors (U+E0100-E01EF) and braille blank U+2800 are accepted
+  because real text uses them. The worker applies the same checks except the unassigned (Cn) one, so Python-version skew
+  between edge and worker cannot drop an acknowledged line. Rows stored earlier are cleaned in the MCP
+  `artifact_annotations` view and the owner list's `body` (`clean_text`); anchor quotes are returned as stored. Viewer
+  text is rendered with `dir="auto"` / `<bdi>`.
+- PDF pages are keyboard-operable (Tab to a page, Enter or Space for the whole page; after "Mark region" the arrows move
+  a region, Shift+arrows resize it, Enter uses it, Escape drops it), like the image view.
 - Purged or tombstoned artifacts keep their annotation rows and author emails; there is no retention rule yet.
 - Test-suite gaps, tracked separately: a few unit tests use fakes (fake DOM, a scripted render child, `FakeBlobs`),
   and the PostgreSQL-backed tests skip when the host has no `initdb`.

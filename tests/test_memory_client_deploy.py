@@ -214,6 +214,7 @@ restore_host_state() {{ return 0; }}
 git() {{ return 0; }}
 compose_up() {{ return 0; }}
 rollback_share() {{ return 0; }}
+rollback_services() {{ return 0; }}
 verify() {{ printf '%s\\n' '{{"action":"verify-rollback","args":[]}}' >> "{harness['log']}"; }}
 cleanup() {{ return 0; }}
 {rollback}

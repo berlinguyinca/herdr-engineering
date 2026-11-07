@@ -43,3 +43,8 @@ def fake_host_config(monkeypatch):
         monkeypatch.setattr(hc, "host_config", lambda: cfg)
         return cfg
     return install
+
+
+def pytest_addoption(parser):
+    parser.addoption("--allow-fabric-http-skip", action="store_true", default=False,
+                     help="skip (instead of fail) the Fabric HTTP tests on a host with no non-loopback address")

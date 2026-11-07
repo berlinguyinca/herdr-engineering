@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import unicodedata
 from typing import Final
 
 from .share_bundle import ShareBundleError, normalise_name
@@ -98,20 +99,40 @@ def annotation_settings(raw: dict[str, object] | None) -> dict[str, bool | int]:
     return out
 
 
-def _bad_chars(text: str, *, allow_whitespace: bool) -> bool:
+# Format and control characters that are still wanted: the joiners emoji and Indic/Arabic text need, and the directional
+# marks (U+200E/F, U+061C ALM), which do not reorder surrounding text the way embeddings, overrides and isolates do.
+_ALLOWED_FORMAT: Final = frozenset("\u200c\u200d\u200e\u200f\u061c")
+_BAD_CATEGORIES: Final = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
+# Invisible or blank-looking characters outside those categories: combining grapheme joiner, Hangul and Halfwidth fillers,
+# Khmer inherent vowels. Not refused, because real text needs them: variation selectors (emoji FE0F, ideographic
+# U+E0100-E01EF) and braille blank U+2800; the owner/agent views clean them on output.
+_BLANK: Final = frozenset("\u034f\u115f\u1160\u17b4\u17b5\u3164\uffa0")
+
+
+def _bad_chars(text: str, *, allow_whitespace: bool, unassigned: bool = True) -> bool:
+    """True when ``text`` has a character in the Unicode categories Cc, Cf, Cs, Co or Cn that is not explicitly allowed.
+
+    That covers C0/C1 controls, surrogates, private use and unassigned code points, and every invisible format character:
+    the bidi embeddings/overrides/isolates (U+202A-202E, U+2066-2069), tag characters (U+E0000-E007F), invisible operators
+    (U+2060-2064, U+206A-206F), U+FEFF, interlinear annotation (U+FFF9-FFFB), soft hyphen. U+2028/2029 are categories
+    Zl/Zp and are refused as well. Allowed: ZWJ, ZWNJ, the directional marks and, with ``allow_whitespace``, ``\\n`` and ``\\t``."""
     for ch in text:
-        o = ord(ch)
-        if 0xD800 <= o <= 0xDFFF or o == 0 or o == 0x7F:
-            return True
-        if o < 0x20 and not (allow_whitespace and ch in "\n\t"):
+        if ch in _ALLOWED_FORMAT:
+            continue
+        if allow_whitespace and ch in "\n\t":
+            continue
+        category = unicodedata.category(ch)
+        if category == "Cn" and not unassigned:
+            continue      # the worker does not judge assignment: runtimes with other Unicode tables must not drop a line
+        if ch in "\u2028\u2029" or ch in _BLANK or category in _BAD_CATEGORIES:
             return True
     return False
 
 
-def clean_comment(value: object, *, max_chars: int = MAX_COMMENT_CHARS) -> str:
+def clean_comment(value: object, *, max_chars: int = MAX_COMMENT_CHARS, unassigned: bool = True) -> str:
     if not isinstance(value, str):
         raise AnnotationInputError("bad_anchor", "comment must be a string")
-    if _bad_chars(value, allow_whitespace=True):
+    if _bad_chars(value, allow_whitespace=True, unassigned=unassigned):
         raise AnnotationInputError("bad_chars", "comment has a control character or surrogate")
     text = value.strip()
     if not text:
@@ -121,7 +142,7 @@ def clean_comment(value: object, *, max_chars: int = MAX_COMMENT_CHARS) -> str:
     return text
 
 
-def _text_field(raw: dict[str, object], key: str, limit: int, *, required: bool) -> str | None:
+def _text_field(raw: dict[str, object], key: str, limit: int, *, required: bool, unassigned: bool = True) -> str | None:
     if key not in raw:
         if required:
             raise AnnotationInputError("bad_anchor", f"{key} is required")
@@ -129,7 +150,7 @@ def _text_field(raw: dict[str, object], key: str, limit: int, *, required: bool)
     value = raw[key]
     if not isinstance(value, str):
         raise AnnotationInputError("bad_anchor", f"{key} must be a string")
-    if _bad_chars(value, allow_whitespace=True):
+    if _bad_chars(value, allow_whitespace=True, unassigned=unassigned):
         raise AnnotationInputError("bad_chars", f"{key} has a control character or surrogate")
     if required and not value:
         raise AnnotationInputError("bad_anchor", f"{key} is empty")
@@ -159,7 +180,7 @@ def _box(raw: object) -> dict[str, float]:
     return out
 
 
-def clean_anchor(value: object) -> dict[str, object]:
+def clean_anchor(value: object, *, unassigned: bool = True) -> dict[str, object]:
     if not isinstance(value, dict):
         raise AnnotationInputError("bad_anchor", "anchor must be an object")
     kind = value.get("kind")
@@ -175,9 +196,9 @@ def clean_anchor(value: object) -> dict[str, object]:
     raw = {k: v for k, v in value.items() if k in _ALLOWED_KEYS[kind]}
     out: dict[str, object] = {"kind": kind, "file": name}
     if kind == "text_quote":
-        out["exact"] = _text_field(raw, "exact", MAX_EXACT_CHARS, required=True)
-        out["prefix"] = _text_field(raw, "prefix", MAX_CONTEXT_CHARS, required=False) or ""
-        out["suffix"] = _text_field(raw, "suffix", MAX_CONTEXT_CHARS, required=False) or ""
+        out["exact"] = _text_field(raw, "exact", MAX_EXACT_CHARS, required=True, unassigned=unassigned)
+        out["prefix"] = _text_field(raw, "prefix", MAX_CONTEXT_CHARS, required=False, unassigned=unassigned) or ""
+        out["suffix"] = _text_field(raw, "suffix", MAX_CONTEXT_CHARS, required=False, unassigned=unassigned) or ""
     elif kind == "pdf_page":
         page = raw.get("page")
         if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= MAX_PAGE:
@@ -186,7 +207,7 @@ def clean_anchor(value: object) -> dict[str, object]:
             )
         out["page"] = page
         exact = (
-            _text_field(raw, "exact", MAX_EXACT_CHARS, required=True) if "exact" in raw else None
+            _text_field(raw, "exact", MAX_EXACT_CHARS, required=True, unassigned=unassigned) if "exact" in raw else None
         )
         if exact is not None:
             out["exact"] = exact

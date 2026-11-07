@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Drift graph layout router
+- The graph no longer falls into one tall column that leaves half the pane empty: boxes are packed into balanced rows (label width 40 down to 8 tried) joined by arrows, with an elbow connector from the end of a row to the start of the next, and the arrangement with the fewest lines wins. A single column remains for panes too narrow for two boxes; the drift marker stays under its own box, including at the end of a row. ASCII and the width guarantee are unchanged.
+
 ### Report share Rich view (opt-in)
 - A public share link of a report can include the author's own single HTML page, only on an explicit `include_author_html` (CLI `shares create --include-author-html`; default off; refused for member-created links). The page is picked by the dashboard's `pick_html_asset`, capped at 2 MiB and SHA-256-verified; the approval plan lists `author-page.html` (name and size, `author_html: true`) with a warning that anyone holding the link can view it. Without the opt-in the bundle never contains it and the route answers 404. Approval and revocation work as before; no migration (the flag rides a sentinel in the free-text `entry` column until approval writes `rich` into `state.json`).
 - The share host serves `/s/<token>/f/author-page.html` with the dashboard Rich view headers minus the two framing controls (bare `sandbox` CSP with no `allow-*`, nosniff, no-referrer, no-store, noindex; no `frame-ancestors` or `X-Frame-Options`, which an opaque-origin parent can never satisfy; the dashboard route is unchanged), with the preview's access, revocation and expiry checks. The preview of an opted-in share gets a "Rich view" toggle that mounts `<iframe sandbox="">` ("Scripts are disabled in this view") The preview keeps its opaque origin (no `allow-same-origin`); only its meta CSP gains `script-src 'sha256-...'; frame-src 'self'`.
