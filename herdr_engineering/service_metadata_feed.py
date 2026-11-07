@@ -27,6 +27,7 @@ from .fabric_agent import (
 from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
 
 MAX_BYTES = 4 * 1024 * 1024
+MAX_INVENTORY_PAGES = 100
 MAX_RECORDS = 4096
 MAX_BATCH = 256
 
@@ -187,6 +188,37 @@ class ServiceMetadataFeed:
             raise ValueError("invalid fabric state")
         return state
 
+    def _read_inventory(self, query):
+        """Follow the server's ``next_offset`` marker; bounded and duplicate-safe.
+
+        Rows can shift between page requests (the server keeps no snapshot), so
+        records are deduplicated by ``service_id``. A non-advancing, non-integer
+        or empty-page cursor is a broken server and aborts rather than looping.
+        """
+        body, offset, pages = self.client.request(f"/api/v1/services?{query}"), 0, 1
+        merged, seen = [], set()
+        while True:
+            page = body.get("services") if isinstance(body, dict) else None
+            if not isinstance(page, list):
+                raise ValueError("invalid service inventory")
+            for service in page:
+                sid = service.get("service_id") if isinstance(service, dict) else None
+                if isinstance(sid, str):
+                    if sid in seen:
+                        continue
+                    seen.add(sid)
+                merged.append(service)
+            if len(merged) > MAX_RECORDS:
+                raise ValueError("invalid service inventory")
+            next_offset = (body.get("pagination") or {}).get("next_offset")
+            if next_offset is None:
+                return merged
+            if (isinstance(next_offset, bool) or not isinstance(next_offset, int)
+                    or next_offset <= offset or not page or pages >= MAX_INVENTORY_PAGES):
+                raise ValueError("invalid service inventory pagination")
+            offset, pages = next_offset, pages + 1
+            body = self.client.request(f"/api/v1/services?{query}&offset={offset}")
+
     def collect(self):
         summary = dict(registered=0, mapped=0, observed=0, owned=0, system=0,
                        linked=0, unconfirmed=0, unmapped=0, ambiguous=0,
@@ -202,7 +234,7 @@ class ServiceMetadataFeed:
             # Only this host's records matter, and the full fleet inventory can
             # outgrow the reply cap, which silently stops every observation.
             query = urlencode({"host_id": self.host_id, "fields": "feed"})
-            services = self.client.request(f"/api/v1/services?{query}").get("services")
+            services = self._read_inventory(query)
             if not isinstance(services, list) or len(services) > MAX_RECORDS:
                 raise ValueError("invalid service inventory")
             listeners = scan_listening_ports()
