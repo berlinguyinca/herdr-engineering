@@ -15,6 +15,7 @@ import hmac
 import http.client
 import json
 import logging
+import queue
 import re
 import threading
 import time
@@ -72,6 +73,57 @@ class ControlPlaneClient:
         self._call("/api/v1/token-usage", {"records": records})
 
 
+class ReportQueue:
+    """Usage records leave the request thread: ``submit`` never blocks, one daemon thread delivers (``attempts`` tries,
+    ``retry_delay`` apart), and a full queue drops the newest record with a count rather than stalling a request. A slow
+    or briefly unreachable control plane used to cost every request up to the client timeout
+    ('token report failed: timed out')."""
+
+    def __init__(self, control, maxsize: int = 1000, attempts: int = 3, retry_delay: float = 1.0):
+        self._control, self._attempts, self._retry_delay = control, attempts, retry_delay
+        self._q: queue.Queue = queue.Queue(maxsize)
+        self.dropped = 0
+        self._thread = threading.Thread(target=self._run, name="llm-proxy-report", daemon=True)
+        self._thread.start()
+
+    def submit(self, record: dict) -> None:
+        try:
+            self._q.put_nowait(record)
+        except queue.Full:
+            self.dropped += 1
+            log.warning("token report dropped: queue full (%d dropped so far)", self.dropped)
+
+    def flush(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while self._q.unfinished_tasks:
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.01)
+        return True
+
+    def close(self) -> None:
+        self._q.put(None)
+
+    def _run(self) -> None:
+        while True:
+            record = self._q.get()
+            if record is None:
+                self._q.task_done()
+                return
+            try:
+                for attempt in range(1, self._attempts + 1):
+                    try:
+                        self._control.report(record)
+                        break
+                    except Exception as exc:  # accounting must never fail anything
+                        if attempt == self._attempts:
+                            log.warning("token report failed after %d attempts: %s", attempt, exc)
+                        else:
+                            time.sleep(self._retry_delay)
+            finally:
+                self._q.task_done()
+
+
 class ProxyState:
     """Key and custom-model tables, refreshed from the control plane."""
 
@@ -91,6 +143,7 @@ class ProxyState:
         self._catalog_lock = threading.Lock()
         self._catalog_last = float("-inf")
         self._catalog: list[dict] = []
+        self.reports: ReportQueue | None = None      # set by serve(); None = report inline (tests)
 
     def refresh(self, force: bool = False) -> None:
         if not force and time.monotonic() - self._last < self.refresh_seconds:
@@ -619,7 +672,10 @@ def make_handler(state: ProxyState):
                       "usage_known": usage is not None,
                       **{k: (usage or {}).get(k) for k in _TOKEN_FIELDS}}
             try:
-                state.control.report(record)
+                if state.reports is not None:
+                    state.reports.submit(record)
+                else:
+                    state.control.report(record)
             except Exception as exc:  # accounting must never fail the request
                 log.warning("token report failed: %s", exc)
 
@@ -631,6 +687,7 @@ def serve(host: str, port: int, control_url: str, upstream: str, upstream_key: s
           max_inflight: int = DEFAULT_MAX_INFLIGHT, wait_seconds: float = DEFAULT_QUEUE_WAIT_SECONDS):
     state = ProxyState(ControlPlaneClient(control_url), upstream, upstream_key,
                        max_inflight=max_inflight, wait_seconds=wait_seconds)
+    state.reports = ReportQueue(state.control)
     state.refresh(force=True)
     httpd = ThreadingHTTPServer((host, port), make_handler(state))
     httpd.daemon_threads = True
