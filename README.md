@@ -478,6 +478,15 @@ The web client's `listServices()` and `getCiHistory()` follow `next_offset` and
 merge pages (pass `{all:false}` for the first page only), and the ownership
 feed does the same. The existing `view=catalog` cursor API is unchanged.
 
+Ordering is deterministic (services: newest `created_at`, then `service_id`; CI
+history: newest `created_at`, then repository and run number), but pages are
+**not a snapshot**: the server keeps no cursor state, so rows created or removed
+between two page requests can shift later pages. Clients therefore de-duplicate
+by id (`service_id`; repository plus run number) and treat a `next_offset` that
+does not advance as an error (the web client reports it as
+`pagination.truncated` plus `pagination.error`). CI history pages copy only the
+requested slice, so the cost of a page request scales with the page.
+
 Note: the web hydrates from Postgres **once at startup**, so it reflects a
 snapshot of durable state; live updates flow over SSE. Restart the web to
 re-hydrate after external writes.

@@ -4094,10 +4094,10 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                                                      max_limit=CI_HISTORY_PAGE_MAX)
                     except ValueError as exc:
                         return self._json({"error": str(exc)}, 400)
-                    snapshot = server.ci_monitor.history()
-                    rows, pagination = _page_slice(list(snapshot.get("pipelines") or []), limit, offset)
-                    # Slice before annotating: annotation copies every row it is given.
-                    view = annotate_ci_history({**snapshot, "pipelines": rows}, r,
+                    # Only the requested window is copied, then annotated.
+                    snapshot = server.ci_monitor.history(window=(offset, limit))
+                    pagination = snapshot.pop("pagination")
+                    view = annotate_ci_history(snapshot, r,
                         repository_languages=cached_github_languages(server.github_monitor))
                     view["pagination"] = pagination
                     return self._json(view)
