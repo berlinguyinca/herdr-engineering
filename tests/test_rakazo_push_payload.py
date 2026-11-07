@@ -1,7 +1,6 @@
 """Expo rejects the WHOLE batch with HTTP 400 VALIDATION_ERROR when any field is null (observed live:
 ``0.collapseId: Expected string, received null``). Real local HTTP server standing in for exp.host."""
 import json
-import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
