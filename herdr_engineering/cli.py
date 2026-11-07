@@ -1247,10 +1247,8 @@ def _cmd_cp_llm_proxy(args) -> int:
     httpd = serve(args.host, args.port, args.control_plane, upstream, key,
                   max_inflight=max_inflight, wait_seconds=wait_seconds)
     print(f"llm-proxy listening on {args.host}:{httpd.server_address[1]}", flush=True)
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    from .llm_proxy import run_until_stopped
+    run_until_stopped(httpd)
     return 0
 
 
