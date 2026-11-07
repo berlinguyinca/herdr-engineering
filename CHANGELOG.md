@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Share panel: include the author's HTML page
+- The dashboard Share card now has an unchecked "Include the author's HTML page (Rich view)" box with the caution "Anyone with the link can view this page. It is shown without scripts." It appears only for a public share of a report version with exactly one HTML asset (same choice as `pick_html_asset`, read from the version's report descriptor; no new endpoint). Checked sends `include_author_html: true`; unchecked sends no such field.
+- A pending share that includes the page lists `author-page.html` and the server's warning, shows an "Includes author page" badge, and no longer exposes the internal entry `preview.html+author-html` (it shows `preview.html`).
+- Tests: `artifact-share-panel.test.js` (+9), real Chromium and Firefox `tests/playwright/share-author-html.test.mjs`.
+
 ### Drift graph layout router
 - The graph no longer falls into one tall column that leaves half the pane empty: boxes are packed into balanced rows (label width 40 down to 8 tried) joined by arrows, with an elbow connector from the end of a row to the start of the next, and the arrangement with the fewest lines wins. A single column remains for panes too narrow for two boxes; the drift marker stays under its own box, including at the end of a row. ASCII and the width guarantee are unchanged.
 
