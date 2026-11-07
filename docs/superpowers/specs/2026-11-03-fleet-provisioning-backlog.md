@@ -90,3 +90,14 @@ deploy-fleet-agents.sh must not retire until each of these has an owner (host-ag
 - pi-runtime: pin AutoSpec (its `autospec-fleet-sync` timer self-updates from unpinned main and retires).
 - Owner: where GitHub automerge runs (no unit in herdr-engineering).
 
+
+## Parked for later tasks (from Task 15, backup)
+
+- Schedule: `herdr-fleet backup now` runs on the controller (the key and the target credentials are there; the dumps need `docker exec` on the source host). The controller role (Task 16) should install the timer for it; until then the operator runs it by hand or from their own timer. The memory role's native `herdr-hindsight-backup.timer` keeps running meanwhile. The backup role's `JOB_PROVIDERS` entry offers only `not_ready` jobs.
+- Owner decision still open (from Task 13): Docker-socket access for the scheduler. Backups do not need it with the controller-side design; if the owner grants it later, the jobs could only dump (the key must stay off the hosts), never seal or upload.
+- The real Postgres/MinIO paths are proven only against the stub docker; `tests/containers/test_backup_scenarios.py` (real postgres:16-alpine, MinIO, a health container on this machine's Docker) must run green in CI before Task 21 (and before adopting bender, Task 17/19: "backup first").
+- MinIO is copied as a file-level tar of the live volume (no `mc mirror`): an object written during the copy may be missing or partial in that backup. If that matters, add an `mc mirror` method (needs a pinned `minio/mc` image and the root credentials from the central fleet config).
+- Not in any `state:` yet: the Woodpecker database (ci-server role), the collab outbox/spool (in flight), the ACME directories (re-issued). `pg_dumpall --globals-only` (roles) is not taken; restore relies on the rebuilt Postgres' user.
+- Restore of `managed: "false"` items (the herdr-memory candidate) is manual from the decrypted dump.
+- Retention leaves `.partial` backups alone (reported); an operator removes them by hand.
+- `herdr-fleet init` template does not scaffold a `backup:` section yet (the example config has it, commented).
