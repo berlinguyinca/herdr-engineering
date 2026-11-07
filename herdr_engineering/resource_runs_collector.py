@@ -27,6 +27,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -191,17 +192,38 @@ def default_cwd_of(pid: int) -> str | None:
     return _listener_cwd(pid, timeout=1.0)
 
 
-def default_project_of(cwd: str) -> str | None:
-    """The main checkout's directory name, so every worktree of a repo is one project. ``None`` outside a git
-    checkout: a session started in ``$HOME`` or a folder of many repos has no project and is never reported (the
-    cwd's own name would attribute it to the login name or to that folder)."""
-    from .fabric_agent import ListenerGitMetadata
+class _NoCheckout:
+    """``project_of`` answer for a directory that is definitely not inside a git checkout (remembered)."""
+
+    def __repr__(self) -> str:
+        return "NO_CHECKOUT"
+
+
+NO_CHECKOUT = _NoCheckout()
+#: Lookups (cwd, then git) a session gets before it is given up as unresolved; each is bounded by its own timeout.
+MAX_RESOLVE_ATTEMPTS = 10
+
+
+def default_project_of(cwd: str):
+    """The main checkout's directory name, so every worktree of a repo is one project.
+
+    Returns the name; ``NO_CHECKOUT`` when git says the directory is not in a checkout (a session started in
+    ``$HOME`` or a folder of many repos: the cwd's own name would attribute it to the login name or to that folder);
+    ``None`` when the answer is unknown (git missing, timed out, or failed otherwise), so it is asked again."""
     git = shutil.which("git")
     if not git:
         return None
-    out = ListenerGitMetadata._git(git, cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                                   time.monotonic() + 1.0)
-    if not out or not os.path.isabs(out):
+    env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+    try:
+        result = subprocess.run([git, "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=cwd, env=env,
+                                capture_output=True, text=True, timeout=1.0)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if result.returncode != 0:
+        return NO_CHECKOUT if "not a git repository" in result.stderr[:4096] else None
+    out = result.stdout.strip()
+    if not out or len(out) > 4096 or not os.path.isabs(out):
         return None
     common = Path(out)
     return (common.parent.name if common.name == ".git" else common.name.removesuffix(".git")) or None
@@ -235,7 +257,8 @@ def _valid_session(sid, s) -> bool:
             and (s.get("disk0") is None or type(s.get("disk0")) is int)
             and isinstance(s.get("cpu"), dict) and len(s["cpu"]) <= MAX_TREE
             and all(isinstance(k, str) and _is_num(v) for k, v in s["cpu"].items())
-            and _opt(s.get("cgroup"), str) and _valid_cg(s.get("cg")))
+            and _opt(s.get("cgroup"), str) and _valid_cg(s.get("cg"))
+            and _opt(s.get("skip"), str) and type(s.get("attempts", 0)) is int and type(s.get("logged", False)) is bool)
 
 
 def _valid_envelope(envelope) -> dict | None:
@@ -338,6 +361,7 @@ class RunCollector:
             root = roots.get(session["pid"])
             if (root is not None and root["command"] == session["agent_kind"]
                     and abs((now - root["elapsed_s"]) - session["start"]) <= START_TOLERANCE_S):
+                self._resolve(sid, session, deadline)
                 self._sample(session, process_tree(root["pid"], children), by_pid, now)
                 alive.add(root["pid"])
             else:
@@ -360,20 +384,46 @@ class RunCollector:
         start = now - root["elapsed_s"]
         sid = "run-" + hashlib.sha256(f"{self.host}|{root['pid']}|{int(start)}|{root['command']}"
                                       .encode()).hexdigest()[:24]
-        cwd = self.cwd_of(root["pid"])
-        project = None
-        if cwd:
-            try:
-                project = valid_project(self.project_of(cwd))
-            except ValueError:
-                project = None   # not a project name the control plane accepts: tracked, never reported
         cgroup = cgroup_of(root["pid"], self.proc_root) if self.linux else None
         session = {"pid": root["pid"], "agent_kind": root["command"], "start": start, "last_seen": now,
-                   "project": project, "cwd": cwd if project else None,
-                   "disk0": dir_bytes(cwd, deadline) if project else None,
+                   "project": None, "cwd": None, "disk0": None, "skip": None, "attempts": 0, "logged": False,
                    "peak_b": 0, "cpu": {}, "cgroup": cgroup, "cg": None}
         self.sessions[sid] = session
+        self._resolve(sid, session, deadline)
         self._sample(session, tree, by_pid, now)
+
+    def _resolve(self, sid: str, session: dict, deadline: float) -> None:
+        """Find the session's project. A lookup that could not answer (lsof or git slow or failing) is retried on the
+        next tick, up to ``MAX_RESOLVE_ATTEMPTS``; a definite answer ("not in a checkout", "not a valid project
+        name") is remembered and logged once."""
+        if session["project"] is not None or session.get("skip") is not None:
+            return
+        session["attempts"] = session.get("attempts", 0) + 1
+        cwd = self.cwd_of(session["pid"])
+        answer = self.project_of(cwd) if cwd else None
+        if answer is NO_CHECKOUT:
+            self._skip(sid, session, "not in a git checkout")
+        elif answer is not None:
+            try:
+                session["project"] = valid_project(answer)
+            except ValueError:
+                self._skip(sid, session, "project name not accepted by the control plane")
+                return
+            session["cwd"], session["disk0"] = cwd, dir_bytes(cwd, deadline)
+        elif session["attempts"] >= MAX_RESOLVE_ATTEMPTS:
+            self._skip(sid, session, "project unresolved")
+
+    def _skip(self, sid: str, session: dict, reason: str) -> None:
+        session["skip"] = reason
+        self._log_skip(sid, session, reason)
+
+    @staticmethod
+    def _log_skip(sid: str, session: dict, reason: str) -> None:
+        """One line per session, ever: its id, agent kind, pid and why. Never its cwd, paths or command line."""
+        if session.get("logged"):
+            return
+        session["logged"] = True
+        log.info("resource run %s (%s, pid %d) is not reported: %s", sid, session["agent_kind"], session["pid"], reason)
 
     def _sample(self, session: dict, tree: list[int], by_pid: dict, now: float) -> None:
         session["last_seen"] = now
@@ -399,7 +449,10 @@ class RunCollector:
                          "oom_kill": counters["oom_kill"] - base["oom_kill"], "max": counters["max"] - base["max"]}
 
     def _finish(self, sid: str, session: dict, deadline: float) -> dict | None:
-        if session.get("project") is None or sid in self.sent or any(e["entity_id"] == sid for e in self.outbox):
+        if session.get("project") is None:
+            self._log_skip(sid, session, session.get("skip") or "project unresolved")
+            return None
+        if sid in self.sent or any(e["entity_id"] == sid for e in self.outbox):
             return None
         cg = session.get("cg") if session.get("cgroup") else None
         if cg:

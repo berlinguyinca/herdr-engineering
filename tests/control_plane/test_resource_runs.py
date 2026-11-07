@@ -375,6 +375,24 @@ def test_the_accepted_years_start_in_2000_even_for_a_short_run():
         == "2000-01-01T00:00:00+00:00"
 
 
+NON_ASCII = ["٢٠٢٦-١١-٠٤T10:00:00Z", "2026-11-04T١٠:00:00Z", "２０２６-11-04T10:00:00Z", "2026-11-04T10:00:00.５Z"]
+
+
+@pytest.mark.parametrize("value", NON_ASCII)
+def test_the_timestamp_pattern_itself_accepts_ascii_digits_only(value):
+    assert rr._TIMESTAMP.fullmatch(value) is None             # not left to fromisoformat
+    with pytest.raises(ValueError):
+        rr.validate_resource_run("run-1", rr.EVENT_TYPE, run(started_at=value))
+
+
+@pytest.mark.parametrize("value", NON_ASCII)
+def test_non_ascii_digits_are_a_400_over_http(server, value):
+    post, get, *_ = server
+    assert post(envelope(run(started_at=value)))[0] == 400
+    assert post(envelope(run(ended_at=value)))[0] == 400
+    assert get()[1]["profiles"] == []
+
+
 def test_timestamps_are_stored_in_one_normalized_form():
     clean = rr.validate_resource_run("run-1", rr.EVENT_TYPE, run(started_at="2026-11-04T10:00:00Z",
                                                                  ended_at="2026-11-04T10:30:00.5Z"))

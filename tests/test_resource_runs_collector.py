@@ -577,4 +577,126 @@ def test_default_project_is_the_main_checkout_for_every_worktree(tmp_path):
     assert rc.default_project_of(str(tree)) == "herdr-engineering"
     plain = tmp_path / "scratch-dir"      # not a checkout: no project (never the folder's own name)
     plain.mkdir()
-    assert rc.default_project_of(str(plain)) is None
+    assert rc.default_project_of(str(plain)) is rc.NO_CHECKOUT
+    assert rc.default_project_of(str(tmp_path / "gone")) is None      # cannot ask: unknown, asked again later
+
+
+# --------------------------------------------------------------------------- skipped sessions: retried or remembered, logged once
+
+def _codex_listing(elapsed_s):
+    return f"    1     0  11712 117:26.55 05-15:12:19 /sbin/launchd\n  700     1  50000   0:01.00 " \
+           f"{elapsed_s // 60:02d}:{elapsed_s % 60:02d} /opt/homebrew/bin/codex\n"
+
+
+def _codex_collector(tmp_path, post, ticks, project_of, cwd_of, clock):
+    gone = "    1     0  11712 117:26.55 05-15:12:19 /sbin/launchd\n"          # the session has ended
+    listings = [_codex_listing(20 + 30 * i) for i in range(ticks)] + [gone]
+    feed = iter(listings)
+    return rc.RunCollector(host="mac-1", state_path=tmp_path / "state" / "resource-runs.json", post=post,
+                           ps=lambda: next(feed), cwd_of=cwd_of, project_of=project_of, clock=clock, linux=False)
+
+
+def _run_ticks(c, clock, n):
+    out = []
+    for i in range(n):
+        clock.t = T + 30 * i
+        out += c.tick()
+    return out
+
+
+def test_a_transient_lookup_failure_is_retried_and_the_run_is_reported(tmp_path, cp, caplog):
+    post, _, posted, _ = cp
+    work = tmp_path / "pi-engineering"
+    work.mkdir()
+    answers = iter([None, "pi-engineering"])                 # git timed out once, then answered
+    cwds = iter([None, str(work), str(work)])                 # lsof timed out once
+    calls = []
+
+    def project_of(cwd):
+        calls.append(cwd)
+        return next(answers)
+    clock = Clock()
+    c = _codex_collector(tmp_path, post, 4, project_of, lambda pid: next(cwds), clock)
+    with caplog.at_level("INFO", logger="herdr_engineering.resource_runs_collector"):
+        [run] = _run_ticks(c, clock, 5)
+    assert run["project"] == "pi-engineering" and len(calls) == 2
+    assert [e["entity_id"] for e in posted] == [run["session_id"]]
+    assert "not reported" not in caplog.text
+
+
+def test_a_session_outside_a_checkout_is_remembered_skipped_and_logged_once(tmp_path, cp, caplog):
+    post, _, posted, _ = cp
+    secret_dir = tmp_path / "home-with-token-ghp_abc"
+    secret_dir.mkdir()
+    calls = []
+
+    def project_of(cwd):
+        calls.append(cwd)
+        return rc.NO_CHECKOUT
+    clock = Clock()
+    c = _codex_collector(tmp_path, post, 6, project_of, lambda pid: str(secret_dir), clock)
+    with caplog.at_level("INFO", logger="herdr_engineering.resource_runs_collector"):
+        assert _run_ticks(c, clock, 1) == []
+        # logged when it is known, not only when the (possibly long-lived) session ends
+        assert sum("not reported" in r.getMessage() for r in caplog.records) == 1
+        clock.t = T + 30
+        assert c.tick() == []
+        for i in range(2, 7):
+            clock.t = T + 30 * i
+            assert c.tick() == []
+    assert len(calls) == 1 and posted == []                  # asked once, remembered
+    lines = [r.getMessage() for r in caplog.records if "not reported" in r.getMessage()]
+    assert len(lines) == 1 and "not in a git checkout" in lines[0] and "codex" in lines[0] and "pid 700" in lines[0]
+    assert str(tmp_path) not in caplog.text and "ghp_" not in caplog.text
+
+
+def test_lookups_are_bounded_then_the_session_is_skipped_once(tmp_path, cp, caplog, monkeypatch):
+    monkeypatch.setattr(rc, "MAX_RESOLVE_ATTEMPTS", 3)
+    post, _, posted, _ = cp
+    calls = []
+    clock = Clock()
+    c = _codex_collector(tmp_path, post, 6, lambda cwd: calls.append(cwd), lambda pid: "/nowhere", clock)
+    with caplog.at_level("INFO", logger="herdr_engineering.resource_runs_collector"):
+        assert _run_ticks(c, clock, 7) == []
+    assert len(calls) == 3 and posted == []
+    lines = [r.getMessage() for r in caplog.records if "not reported" in r.getMessage()]
+    assert len(lines) == 1 and "project unresolved" in lines[0] and "/nowhere" not in lines[0]
+
+
+def test_a_session_that_ends_before_its_project_resolves_is_logged_at_finish(tmp_path, cp, caplog):
+    post, _, posted, _ = cp
+    clock = Clock()
+    c = _codex_collector(tmp_path, post, 1, lambda cwd: None, lambda pid: None, clock)
+    with caplog.at_level("INFO", logger="herdr_engineering.resource_runs_collector"):
+        assert _run_ticks(c, clock, 2) == []
+    lines = [r.getMessage() for r in caplog.records if "not reported" in r.getMessage()]
+    assert len(lines) == 1 and "project unresolved" in lines[0] and posted == []
+
+
+def test_the_skip_is_remembered_across_a_restart(tmp_path, cp, caplog):
+    post, *_ = cp
+    calls = []
+
+    def project_of(cwd):
+        calls.append(cwd)
+        return rc.NO_CHECKOUT
+    clock = Clock()
+    first = _codex_collector(tmp_path, post, 2, project_of, lambda pid: "/x", clock)
+    _run_ticks(first, clock, 2)
+    clock.t = T + 60
+    again = _codex_collector(tmp_path, post, 1, project_of, lambda pid: "/x", clock)
+    feed = iter([_codex_listing(80)])
+    again.ps = lambda: next(feed)
+    with caplog.at_level("INFO", logger="herdr_engineering.resource_runs_collector"):
+        again.tick()
+    assert len(calls) == 1 and "not reported" not in caplog.text
+
+
+def test_a_git_that_fails_for_another_reason_is_unknown_not_no_checkout(tmp_path, monkeypatch):
+    false = shutil.which("false")
+    if false is None:
+        pytest.skip("no false(1)")
+    monkeypatch.setattr(rc.shutil, "which", lambda name: false)    # a real program that exits 1, no message
+    assert rc.default_project_of(str(tmp_path)) is None
+    monkeypatch.setattr(rc.shutil, "which", lambda name: None)     # no git at all
+    assert rc.default_project_of(str(tmp_path)) is None

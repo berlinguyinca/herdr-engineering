@@ -66,7 +66,7 @@ def valid_project(value) -> str:
 #: The ONE accepted timestamp form: extended calendar date and time in UTC, ``Z`` or ``+00:00``, optional fraction.
 #: ``datetime.fromisoformat`` alone also takes week dates, ordinal dates, the basic format and a space separator, which
 #: Postgres then refuses (a 503 for a bad value); those are a 400 here.
-_TIMESTAMP = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,6})?(Z|\+00:00)")
+_TIMESTAMP = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,6})?(Z|\+00:00)", re.ASCII)
 MIN_YEAR, MAX_YEAR = 2000, 2999
 
 
