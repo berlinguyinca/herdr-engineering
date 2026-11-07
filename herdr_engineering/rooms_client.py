@@ -53,7 +53,14 @@ ACTIONS = (
     "direct-tasks",
     "direct-cancel",
     "direct-guests",
+    # slice 5: approval-gated external actions (every route is 404 until personal_assistant.external_actions.enabled is true)
+    "issue-target",
+    "external-list",
+    "external-file",
+    "external-decide",
+    "external-retry",
 )
+EXTERNAL_ACTIONS = ("issue-target", "external-list", "external-file", "external-decide", "external-retry")
 
 
 AGENT_MODE_ACTIONS = ("my-tasks", "respond")
@@ -290,6 +297,8 @@ def run_command(args):
             _run_agent(client, room, action, args)
         elif action in COORD_ACTIONS:
             _run_coordinators(client, room, action, args)
+        elif action in EXTERNAL_ACTIONS:
+            _run_external(client, room, action, args)
         elif action == "attach":
             result = client.request(
                 f"{room}/teams/{_q(args.team)}/attach", {"roles": _roles(args.role)}
@@ -604,6 +613,53 @@ def _run_coordinators(client, room, action, args):
         _show(args, result, human)
 
 
+def _print_action(row):
+    print(f"{_safe(row['action_id'], 80)}  [{_safe(row['state'], 20)}]  {_safe(row['kind'], 30)}  team {_safe(row.get('team_id') or '-', 40)}")
+    card = row.get("card")
+    if card:                                  # only the room owner is sent the content; it is the owner's to read and approve
+        print(f"  {_safe(card['will'], 120)}")
+        for field in ("repository", "to", "title", "subject", "labels"):
+            if card.get(field):
+                value = card[field]
+                print(f"  {field}: {_safe(', '.join(value) if isinstance(value, list) else value, 200)}")
+        print("  body (untrusted data, exactly what will be sent):")
+        for line in str(card.get("body", "")).splitlines() or [""]:
+            print(f"    | {_safe(line, 400)}")
+        print(f"  approve with --sha256 {_safe(row['sha256'], 64)}")
+    if row.get("failure"):
+        print(f"  {_safe(row['failure']['outcome'], 20)}: {_safe(row['failure']['reason'], 80)} (only you can retry)")
+    if row.get("result"):
+        print(f"  result: {_safe(row['result']['ref'], 200)}")
+
+
+def _run_external(client, room, action, args):
+    """Slice 5: the issue repository of a team, and the approval-gated external actions of a room (the room owner decides)."""
+    if action == "issue-target":
+        path = f"{room}/teams/{_q(args.team)}/issue-target"
+        result = client.request(path, {"repo": args.repo}) if args.repo else client.request(path)
+        _show(args, result, lambda r: print(f"Issue repository of {_safe(r['team_id'])}: {_safe(r['repo'] or 'not set')}"))
+    elif action == "external-list":
+        result = client.request(f"{room}/external-actions")
+        _show(args, result, lambda r: ([_print_action(x) for x in r["actions"]] or print("No external actions.")))
+    elif action == "external-file":
+        body = {"kind": args.kind, "reference": args.reference}
+        for field in ("title", "body"):
+            if getattr(args, field) is not None:
+                body[field] = getattr(args, field)
+        if args.label:
+            body["labels"] = args.label
+        result = client.request(f"{room}/external-actions", body)
+        _show(args, result, lambda r: print(f"{'Already filed' if r.get('replayed') else 'Filed'}: {_safe(r['action_id'], 80)} "
+                                            f"[{_safe(r['state'], 20)}]; it waits for the room owner's approval"))
+    else:
+        path = f"{room}/external-actions/{_q(args.action_id)}/" + ("decide" if action == "external-decide" else "retry")
+        body = {"expected_sha256": args.sha256}
+        if action == "external-decide":
+            body["decision"] = args.decision
+        result = client.request(path, body)
+        _show(args, result, _print_action)
+
+
 def _holder(value):
     return value if value.startswith("user:") else "user:" + value
 
@@ -741,8 +797,21 @@ def configure_parser(parser):
                 "holder",
                 help="the person: user:ID (or just the ID). Agents join a role through attach",
             )
-        if action in ("coordinator", "coordinator-clear", "external-coordination"):
+        if action in ("coordinator", "coordinator-clear", "external-coordination", "issue-target"):
             c.add_argument("team", help="the team id (herdr-eng teams list)")
+        if action == "issue-target":
+            c.add_argument("repo", nargs="?", help="OWNER/NAME; omit to show. Owner only")
+        if action == "external-file":
+            c.add_argument("kind", choices=("github_issue_create", "email_reply_draft"))
+            c.add_argument("reference", help="the approved email brief's reference (bref-...)")
+            c.add_argument("--title", help="issue only")
+            c.add_argument("--label", action="append", help="issue only; one of the operator's allowed labels; repeatable")
+            c.add_argument("--body", help="draft only: the reply text (plain, up to 800 characters)")
+        if action in ("external-decide", "external-retry"):
+            c.add_argument("action_id")
+            c.add_argument("--sha256", required=True, help="the sha256 of the content you were shown (external-list prints it)")
+        if action == "external-decide":
+            c.add_argument("decision", choices=("approved", "rejected"))
         if action == "direct":
             c.add_argument("text", help="what you want done; it reaches the agent as quoted, untrusted data")
             c.add_argument("--agent", help="the agent id (it must be one the room owner allowed)")
