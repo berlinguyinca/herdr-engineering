@@ -96,6 +96,19 @@ for (const [status, text] of [[503, /unavailable/], [404, /could not be found/]]
   });
 }
 
+test('Load more never renders the same annotation twice (a row that moved across the cursor)', async () => {
+  const client = { listArtifactAnnotations: async (id, o) => (o.before
+    ? { annotations: [base, { ...base, annotation_id: 'a2', body: 'second' }], next: null }
+    : { annotations: [base], next: 'cur' }) };
+  const c = fake(); const h = mountFeedbackPanel(c, client, 'art1', {});
+  await tick();
+  c.fire('click', { disabled: false, dataset: { feedbackAction: 'more' } }); await tick();
+  const ids = [...c.html.matchAll(/data-annotation-id="([^"]*)"/g)].map(m => m[1]);
+  assert.deepEqual(ids, ['a1', 'a2']);
+  assert.equal(c.html.match(/data-feedback-row/g).length, 2);
+  h.dispose();
+});
+
 test('Dismiss asks confirm, disables in flight, then refreshes; declined confirm does nothing', async () => {
   let dismissed = 0, release;
   const gate = new Promise(r => { release = r; });
