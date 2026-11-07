@@ -230,6 +230,15 @@ def _build_parser() -> argparse.ArgumentParser:
     rp = rsub.add_parser("status", help="show the room, agent, rights and expiry from the state file")
     rp.add_argument("--config", required=True)
     rp.set_defaults(func=_cmd_relay_status)
+    # fabric ---------------------------------------------------------------
+    p = sub.add_parser("fabric", help="fabric trust helpers (control_plane.collab.fabric_trust)")
+    fasub = p.add_subparsers(dest="fabric_command", required=True)
+    fp = fasub.add_parser("whois-proxy", help="serve ONLY `GET /whois?addr=<tailnet ip>` on a unix socket (0660) by asking tailscaled; "
+                          "mounted read-only into the isolated collab-public container instead of the tailscaled socket")
+    fp.add_argument("--listen-socket", required=True, help="unix socket to create (its directory is what the container mounts)")
+    fp.add_argument("--tailscaled-socket", action="append", default=[],
+                    help="tailscaled LocalAPI socket (default: /var/run/tailscale/tailscaled.sock, /run/tailscale/tailscaled.sock)")
+    fp.set_defaults(func=_cmd_fabric_whois_proxy)
     # bridge ---------------------------------------------------------------
     p = sub.add_parser("bridge", help="Rakazo mobile bridge helpers (control_plane.rakazo_bridge)")
     bsub = p.add_subparsers(dest="bridge_command", required=True)
@@ -284,6 +293,7 @@ def _build_parser() -> argparse.ArgumentParser:
                       ("revoke", "remove a host (its token stops working); backup first"),
                       ("render-compose", "write the compose env file (0600)"),
                       ("render-collab", "write the collab container's config slice (0600)"),
+                      ("fabric-listener", "print `HOST PORT` of control_plane.collab.fabric_trust's dedicated listener (nothing when not configured)"),
                       ("render-llm", "write the llm-proxy container's config slice (0600)"),
                       ("render-share", "write the share-public container's config slice (0600)"),
                       ("render-edge", "write the collab edge's nginx.conf (with /s/ when shares are enabled)")):
@@ -880,6 +890,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--control-plane", default=None, help="status|check: control-plane base URL (default: host.json)")
     p2.add_argument("--api-key-file", default=None, help="status|check: PATH to a file holding an operator API key")
     p2.set_defaults(func=_cmd_cp_assistant_judge)
+    p2 = csub.add_parser("assistant-slack", help="register the Slack bot/app tokens, or show local token-file status")
+    p2.add_argument("action", choices=["register", "status"])
+    p2.add_argument("--base-url", default="https://slack.com/api", help="register: the Slack Web API base URL (https; http only for loopback)")
+    p2.add_argument("--bot-token-file", default=None, help="absolute PATH of the 0600 bot token file (xoxb-)")
+    p2.add_argument("--app-token-file", default=None, help="absolute PATH of the 0600 app-level token file (xapp-)")
+    p2.add_argument("--key-stdin", action="store_true",
+                    help="register: read the bot token then the app token from stdin, one per line (the only way; never argv)")
+    p2.set_defaults(func=_cmd_cp_assistant_slack)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -957,6 +975,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--collab-artifacts-outbox", default=None,
                     help="with --collab-only: the outbox directory collab-public writes intents and staging into "
                          "(see --collab-artifacts-mirror)")
+    p2.add_argument("--collab-fabric-bind-host", default=None,
+                    help="with control_plane.collab.fabric_trust.listen_host: the address this process binds for the fabric listener "
+                         "when it cannot own the tailnet address itself (inside a container whose published port lands here, e.g. "
+                         "0.0.0.0). Omit it to bind listen_host directly (host network)")
     p2.add_argument("--collab-operator-port", type=int, default=None,
                     help="with --collab-only: also serve the collaboration API WITHOUT sign-in on this "
                          "port, as --collab-operator-user, for the local owner's dashboard (publish it "
@@ -1592,6 +1614,10 @@ def _cmd_fleet_config(args) -> int:
         elif cmd == "render-collab":
             fcc.render_collab(load_fleet_config(path), Path(args.out).expanduser())
             print(f"wrote {args.out} (0600)")
+        elif cmd == "fabric-listener":
+            listener = fcc.fabric_listener(load_fleet_config(path))
+            if listener:
+                print(f"{listener[0]} {listener[1]}")
         elif cmd == "render-llm":
             fcc.render_llm(load_fleet_config(path), Path(args.out).expanduser())
             print(f"wrote {args.out} (0600)")
@@ -3750,6 +3776,81 @@ def _cmd_cp_assistant_judge(args) -> int:
     return 1
 
 
+def _assistant_slack_register(args) -> int:
+    """``assistant-slack register``: both tokens come from stdin only (bot first) and are never printed. 0/1/2."""
+    from .control_plane.assistant_hub.slack_register import (
+        MAX_KEY_CHARS,
+        SlackRegisterError,
+        register_tokens,
+    )
+
+    if not (args.bot_token_file and args.app_token_file and args.key_stdin):
+        print("assistant-slack register needs --bot-token-file, --app-token-file and --key-stdin (tokens are never "
+              "taken from argv)", file=sys.stderr)
+        return 2
+    if sys.stdin.isatty():
+        import getpass
+        lines = [getpass.getpass("Slack bot token (xoxb-): "), getpass.getpass("Slack app token (xapp-): ")]
+    else:
+        lines = sys.stdin.read(2 * MAX_KEY_CHARS + 4).splitlines()
+    tokens = [line.strip() for line in lines if line.strip()]
+    if len(tokens) != 2 or any(any(c.isspace() for c in t) for t in tokens):
+        print("assistant-slack register failed: need exactly two tokens on stdin (bot token, then app token), one per line",
+              file=sys.stderr)
+        return 2
+    try:
+        done = register_tokens(args.base_url, args.bot_token_file, args.app_token_file, tokens[0], tokens[1])
+    except SlackRegisterError as exc:
+        print(f"assistant-slack register failed: {exc.code}", file=sys.stderr)
+        return 1
+    print(f"registered: bot_fingerprint={done.bot_fingerprint} app_fingerprint={done.app_fingerprint} "
+          f"team={_tty_safe(done.team) or '-'} bot_user_id={_tty_safe(done.bot_user_id) or '-'}")
+    print("next: add bot_token_file, app_token_file and owner_user_id to control_plane.personal_assistant.slack in your "
+          "fleet YAML (this command does not edit it) and set enabled: true.")
+    return 0
+
+
+def _slack_file_state(label: str, path: str) -> tuple[bool, str]:
+    """One status line for a token file; reads it only to fingerprint it, never prints its text."""
+    import stat as _stat
+    from pathlib import Path
+
+    from .control_plane.assistant_hub.slack_register import fingerprint
+
+    p = Path(path)
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return False, f"{label}: missing path={_tty_safe(path)}"
+    except OSError as exc:
+        return False, f"{label}: unreadable ({_tty_safe(exc.strerror)}) path={_tty_safe(path)}"
+    if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISREG(st.st_mode):
+        return False, f"{label}: not a regular file path={_tty_safe(path)}"
+    if _stat.S_IMODE(st.st_mode) & 0o077:
+        return False, f"{label}: unsafe mode {_stat.S_IMODE(st.st_mode):04o} (want 0600) path={_tty_safe(path)}"
+    try:
+        token = p.read_text(encoding="ascii").strip()
+    except (OSError, ValueError):
+        return False, f"{label}: unreadable path={_tty_safe(path)}"
+    if not token:
+        return False, f"{label}: empty path={_tty_safe(path)}"
+    return True, f"{label}: ok fingerprint={fingerprint(token)} path={_tty_safe(path)}"
+
+
+def _cmd_cp_assistant_slack(args) -> int:
+    """``control-plane assistant-slack register|status``: 0 ok, 1 failure, 2 usage. ``status`` is local only."""
+    if args.action == "register":
+        return _assistant_slack_register(args)
+    if not (args.bot_token_file and args.app_token_file):
+        print("assistant-slack status needs --bot-token-file and --app-token-file", file=sys.stderr)
+        return 2
+    ok_bot, line_bot = _slack_file_state("bot_token", args.bot_token_file)
+    ok_app, line_app = _slack_file_state("app_token", args.app_token_file)
+    print(line_bot)
+    print(line_app)
+    return 0 if ok_bot and ok_app else 1
+
+
 def _cmd_cp_assistant_hub_owner(args) -> int:
     """``control-plane assistant-action list|approve|deny`` and ``assistant-grant list|revoke|activate``.
 
@@ -4148,6 +4249,34 @@ def _member_admin_wiring(cp: dict, dsn: str | None):
     return artifact_adapter.SyncArtifactAdapter(create)
 
 
+def _library_wiring(dsn: str | None):
+    """The dashboard artifact library (adapter over ``LibraryStore`` on its own small pool) when a DSN exists, else None."""
+    if not dsn:
+        return None
+    from .control_plane.artifact_library_api import make_library_adapter
+
+    async def pool():
+        import asyncpg
+        return await asyncpg.create_pool(dsn, min_size=1, max_size=3)
+
+    try:
+        return make_library_adapter(pool)
+    except RuntimeError as exc:  # database unreachable at start: the library routes answer 503, the dashboard still starts
+        print(f"warning: artifact library unavailable ({exc.__cause__ or exc})", file=sys.stderr)
+        return None
+
+
+def _library_viewers(cp) -> dict[str, str]:
+    """``control_plane.artifact_library.viewers`` (YAML only): ``{"key:<digest>": "<member id>"}``, the dashboard keys that
+    read a member's library.  A malformed entry stops the start (it would silently show the wrong library)."""
+    from .control_plane.artifact_library_api import parse_library_viewers
+    section = cp.get("artifact_library") if isinstance(cp, dict) else None
+    try:
+        return parse_library_viewers(section.get("viewers") if isinstance(section, dict) else None)
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+
+
 def _collab_grant_wiring(cp: dict, dsn: str | None):
     """(grant store adapter, enabled) when control_plane.collab_artifacts.enabled is exactly true and a DSN exists, else
     (None, False). The owner routes for collaborators, activity and diffs use the adapter's call path."""
@@ -4343,6 +4472,7 @@ def _cmd_cp_web(args) -> int:
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
     annotation_store = _annotation_wiring(cp, dsn)
     member_admin = _member_admin_wiring(cp, dsn)
+    library = _library_wiring(dsn)
     try:
         from .control_plane.artifact_delete_api import owner_digests_config
         artifact_delete = owner_digests_config(cp.get("artifact_delete"))
@@ -4435,7 +4565,12 @@ def _cmd_cp_web(args) -> int:
         collab.team_roles = normalize_team_roles(getattr(args, "collab_team_roles", None))
         from .control_plane.collab_coordinators import normalize_coordinators
         collab.coordinators = normalize_coordinators(getattr(args, "collab_coordinators", None))
+        from .control_plane.collab_fabric_trust import normalize_fabric_trust
+        collab.fabric_trust = normalize_fabric_trust(getattr(args, "collab_fabric_trust", None))
         _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
+    fabric_listen = None
+    if collab is not None and collab.fabric_trust.get("listen_host"):      # slice 6a: startup-only, a restart applies a change
+        fabric_listen = (collab.fabric_trust["listen_host"], collab.fabric_trust["listen_port"])
     from .control_plane.rakazo_bridge import rakazo_bridge_config
     try:
         rakazo_bridge_config(cp.get("rakazo_bridge"))      # an enabled but malformed bridge stops startup here, clearly
@@ -4473,6 +4608,8 @@ def _cmd_cp_web(args) -> int:
                              ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn, ci_log_tests=ci_log_tests,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
+                             fabric_listen=fabric_listen,
+                             fabric_bind_host=getattr(args, "collab_fabric_bind_host", None),
                              collab_only=args.collab_only,
                              operator_port=args.collab_operator_port,
                              operator_user=args.collab_operator_user,
@@ -4481,7 +4618,8 @@ def _cmd_cp_web(args) -> int:
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
-                             annotation_store=annotation_store, member_admin=member_admin,
+                             annotation_store=annotation_store, member_admin=member_admin, library=library,
+                             library_viewers=_library_viewers(cp),
                              artifact_delete_owners=artifact_delete.digests,
                              artifact_delete_allow_keyless_owner=artifact_delete.allow_keyless,
                              collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled,
@@ -4518,10 +4656,14 @@ def _cmd_cp_web(args) -> int:
         watch.stop()
         if hub_server is not None:
             try:
-                hub_server.shutdown()
+                try:
+                    hub_server.shutdown()
+                finally:
+                    if hub_server.hub.judge is not None:
+                        hub_server.hub.judge.recorder.stop()
             finally:
-                if hub_server.hub.judge is not None:
-                    hub_server.hub.judge.recorder.stop()
+                if hub_server.hub.slack is not None:
+                    hub_server.hub.slack.stop()
         svr.shutdown()
         if artifact_bridge is not None:
             artifact_bridge.stop()
@@ -4529,6 +4671,9 @@ def _cmd_cp_web(args) -> int:
             artifact_adapter.close()
         if member_admin is not None:
             member_admin.close()
+        if library is not None:
+            library("close")        # the pool first, then the adapter's loop
+            library.close()
         if share_store is not None:
             share_store.close()
         if annotation_store is not None:
@@ -4690,6 +4835,8 @@ COLLAB_CONFIG_KEYS = {
     "team_roles": ("collab_team_roles", dict),
     # team collaboration slice 3: the coordinator role with limits; external people only behind a second flag; YAML only, off
     "coordinators": ("collab_coordinators", dict),
+    # fabric trust slice 1: which tailnet machines may be recognised as fabric peers; YAML only, off by default
+    "fabric_trust": ("collab_fabric_trust", dict),
     "skills": ("collab_skills", dict),                    # public collaboration skill catalog/config
     "members": ("collab_members", dict),                  # plan 5 member-owned artifacts; YAML only, off by default
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
@@ -4731,12 +4878,13 @@ def _apply_collab_config(args, cp) -> None:
             from .control_plane.collab_attention import normalize_insights
             from .control_plane.collab_context import normalize_contextual
             from .control_plane.collab_coordinators import normalize_coordinators
+            from .control_plane.collab_fabric_trust import normalize_fabric_trust
             from .control_plane.collab_team_roles import normalize_team_roles
             from .control_plane.collab_team_rooms import normalize_team_rooms
             from .control_plane.collab_workbench import normalize_steering
             try:
                 {"contextual": normalize_contextual, "insights": normalize_insights, "coordinators": normalize_coordinators,
-                 "team_rooms": normalize_team_rooms, "team_roles": normalize_team_roles}.get(key, normalize_steering)(value)
+                 "fabric_trust": normalize_fabric_trust, "team_rooms": normalize_team_rooms, "team_roles": normalize_team_roles}.get(key, normalize_steering)(value)
             except ValueError as exc:
                 raise SystemExit(f"fleet config {exc}") from None
             setattr(args, dest, dict(value))
@@ -4764,6 +4912,7 @@ HOT_COLLAB_SWITCHES = {
     "team_rooms": ("team_rooms_source", "dict"),
     "team_roles": ("team_roles_source", "dict"),
     "coordinators": ("coordinators_source", "dict"),
+    "fabric_trust": ("fabric_trust_source", "dict"),
     "delegation_enabled": ("delegation_source", "bool"),
     "replay_history": ("replay_history_source", "str"),
 }
@@ -4790,12 +4939,13 @@ def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
     from .control_plane.collab_attention import normalize_insights
     from .control_plane.collab_context import normalize_contextual
     from .control_plane.collab_coordinators import normalize_coordinators
+    from .control_plane.collab_fabric_trust import normalize_fabric_trust
     from .control_plane.collab_team_roles import normalize_team_roles
     from .control_plane.collab_team_rooms import normalize_team_rooms
     from .control_plane.collab_workbench import normalize_steering
     normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights,
                    "team_rooms": normalize_team_rooms, "team_roles": normalize_team_roles,
-                   "coordinators": normalize_coordinators}
+                   "coordinators": normalize_coordinators, "fabric_trust": normalize_fabric_trust}
 
     def check(key, value):
         return normalizers[key](value) if key in normalizers else value
@@ -5045,6 +5195,13 @@ def _cmd_relay_status(args):
     return 0
 
 
+def _cmd_fabric_whois_proxy(args):
+    from .fabric_access import DEFAULT_SOCKETS
+    from .fabric_whois_proxy import serve
+    serve(args.listen_socket, tuple(args.tailscaled_socket) or DEFAULT_SOCKETS)
+    return 0
+
+
 def _cmd_bridge_hash_password(args):
     """Print ``scrypt$N$r$p$salt$hash`` for a password read from a TTY prompt (asked twice) or from stdin. Nothing but the
     hash reaches stdout; the password is never an argument, an environment variable or a file."""
@@ -5101,8 +5258,15 @@ def _start_assistant_hub(service):
     from .control_plane.assistant_hub.workers import WorkerRegistry
     registry = WorkerRegistry(service.store, enrollment_ttl=timedelta(seconds=hub_cfg["enrollment_ttl_seconds"]),
                               worker_ttl=timedelta(days=hub_cfg["worker_ttl_days"]))
+    from .control_plane.assistant_hub.slack import SlackRuntime
+    judge = _build_judge_runtime(service)
+    from .control_plane.assistant_hub.preconditions import default_clients
+    clients = default_clients()
+    slack = SlackRuntime(service.store, service, lambda: service.config.get("slack") or {}, service.now, judge=judge,
+                         health=clients.health, preconditions=clients)
     try:
-        server = HubServer(Hub(registry=registry, service=service, store=service.store, judge=_build_judge_runtime(service)),
+        server = HubServer(Hub(registry=registry, service=service, store=service.store,
+                               judge=judge, slack=slack, preconditions=clients),
                            host=hub_cfg["host"],
                            port=hub_cfg["port"], allowed_networks=hub_cfg["allowed_networks"],
                            allowed_hosts=hub_cfg["allowed_hosts"])
@@ -5110,6 +5274,10 @@ def _start_assistant_hub(service):
         raise SystemExit(f"assistant hub cannot start: {type(exc).__name__}: {exc}") from None
     server.start()
     server.hub.judge.recorder.start()          # a thread exists only when the judge is enabled
+    if (service.config.get("slack") or {}).get("enabled") is True:
+        slack.start()                          # Socket Mode link and the ask poster; stopped by the caller
+    else:
+        slack.start_checks()                   # deploy outcome checks do not need Slack; open ones resume here
     return server, registry
 
 
@@ -5121,6 +5289,7 @@ def _wire_assistant_hub(svr):
     hub_server, registry = _start_assistant_hub(service)
     svr.assistant_workers = registry
     svr.assistant_judge = hub_server.hub.judge if hub_server is not None else None   # same runtime as the hub
+    svr.assistant_slack = hub_server.hub.slack if hub_server is not None else None
     return hub_server
 
 
@@ -5178,7 +5347,7 @@ def _share_worker_settings(cp):
     return out
 
 
-def _worker_share_housekeeper(fleet_config_path):
+def _worker_share_housekeeper(fleet_config_path, member_runtime=None):
     """The share housekeeper when the fleet file enables shares, else None."""
     from pathlib import Path
 
@@ -5193,7 +5362,8 @@ def _worker_share_housekeeper(fleet_config_path):
     settings = _share_worker_settings(cp)
     if not settings["enabled"]:
         return None
-    return ShareHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"])
+    return ShareHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"],
+                            member_runtime=member_runtime)
 
 
 def _worker_annotation_housekeeper(fleet_config_path, mirror=None):
@@ -5430,7 +5600,11 @@ def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rust
     applier.register_commit()
     register_annotation_resolve(applier)
     register_member_intents(applier)
-    publisher = None if members is None else (lambda conn: publish_member_views(conn, members))
+    publisher = None
+    if members is not None:
+        import dataclasses
+        pooled = dataclasses.replace(members, rustfs=rustfs)     # the view tick fills the library content pool
+        publisher = lambda conn: publish_member_views(conn, pooled)  # noqa: E731
     return cp_worker.CollabBridgeLoop(connect, mirror, applier, members_publisher=publisher)
 
 
@@ -5506,7 +5680,7 @@ def _cmd_cp_worker(args) -> int:
             worker_id = args.host_id or socket.gethostname()
             snapshotter = _worker_snapshot_writer(getattr(args, "fleet_config", None))
             compactor = _worker_fabric_compactor(getattr(args, "fleet_config", None))
-            share_hk = _worker_share_housekeeper(getattr(args, "fleet_config", None))
+            share_hk = _worker_share_housekeeper(getattr(args, "fleet_config", None), member_runtime)
             reconciler = _worker_artifact_reconciler(getattr(args, "fleet_config", None), rustfs)
             if args.once:
                 return await run_one_pass(conn, worker_id=worker_id,

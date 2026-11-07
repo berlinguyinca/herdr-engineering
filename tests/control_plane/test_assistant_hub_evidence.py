@@ -292,3 +292,20 @@ def test_grant_cap_returns_none():
     _fill(store, k, 10)
     assert _propose(store, cfg, k) is None
     assert len(store.list_action_grants(T, U)) == 1
+
+
+def test_an_owner_standing_grant_never_lowers_the_bar_for_an_earned_verb():
+    from herdr_engineering.control_plane.assistant_hub.evidence import (
+        _scope_is_new_for_confirmed_verb,
+    )
+    k = _key(scope="repo-b")
+    other = _key(scope="repo-a")
+
+    def grant(source: str) -> ActionGrant:
+        return ActionGrant(grant_id="g" + source, tenant_id=T, user_id=U, worker_id=W, key_id=other.key_id(),
+                           resource_scope="repo-a", verb=k.verb.value, key_canonical=other.canonical(),
+                           state=GrantState.ACTIVE, created_at=T0, activated_at=T0, expires_at=LATE,
+                           confirmed_by="owner", source=source)
+
+    assert _scope_is_new_for_confirmed_verb([grant("")], W, k) is True
+    assert _scope_is_new_for_confirmed_verb([grant("owner_standing")], W, k) is False

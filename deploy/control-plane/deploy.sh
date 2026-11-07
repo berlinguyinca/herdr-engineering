@@ -534,6 +534,41 @@ if [ "$COLLAB" = 1 ]; then
   fi
 fi
 
+# Fabric-trust listener (SPEC 6a): only with the collab overlay AND control_plane.collab.fabric_trust.listen_* set.
+# The address was validated (tailnet range) by the config; docker publishes exactly that host:port.
+FABRIC=0
+FABRIC_SERVICE_ORPHAN=0
+FABRIC_SERVICE=()   # the services only the fabric overlay defines; rebuilt per checkout on rollback
+# An older candidate (a rollback target, a pinned --ref) has neither the helper nor the overlay: no listener then.
+if [ "$COLLAB" = 1 ] && grep -q 'fabric-listener' "$WORK/herdr_engineering/cli.py" 2>/dev/null \
+    && [ -f "$WORK/deploy/control-plane/compose.collab-fabric.yaml" ]; then
+  if ! FABRIC_LISTEN="$(herdr_eng fleet config fabric-listener --path "$CENTRAL")"; then
+    echo "control_plane.collab.fabric_trust is invalid in $CENTRAL" >&2
+    exit 1
+  fi
+  if [ -n "$FABRIC_LISTEN" ]; then
+    FABRIC=1
+    read -r FABRIC_HOST FABRIC_PORT <<< "$FABRIC_LISTEN"
+    export HERDR_COLLAB_FABRIC_BIND="$FABRIC_HOST" HERDR_COLLAB_FABRIC_PORT="$FABRIC_PORT"
+    if [ "$DRY" = 1 ]; then export HERDR_COLLAB_FABRIC_WHOIS_DIR="$ENV_DIR/fabric-whois"
+    else export HERDR_COLLAB_FABRIC_WHOIS_DIR="$HOME/.local/share/herdr-engineering/collab-fabric-whois"; fi
+    COLLAB_FILES+=(-f "$WORK/deploy/control-plane/compose.collab-fabric.yaml")
+    EDGE_SERVICE=(fabric-whois "${EDGE_SERVICE[@]}")
+    FABRIC_SERVICE=(fabric-whois)
+    echo "fabric-trust listener: $FABRIC_HOST:$FABRIC_PORT (whois sidecar fabric-whois)"
+    # Host hardening the listener relies on but a deploy cannot install (root): warn, never fail.
+    FABRIC_FW="$WORK/deploy/control-plane/collab-fabric-firewall.sh"
+    if [ -x "$FABRIC_FW" ] && ! "$FABRIC_FW" --check >/dev/null 2>&1; then
+      echo "WARNING: fabric network firewall is not confirmed present (or not readable without root): collab-public's network has a default route" \
+        "and can reach this host's own addresses. As root run: $FABRIC_FW --install  (docs/operations/fabric-trust.md, Required hardening)" >&2
+    fi
+    if [ ! -e /etc/systemd/system/docker.service.d/after-tailscale.conf ]; then
+      echo "WARNING: docker is not ordered after tailscaled: after a reboot the published fabric port may fail to bind and the PUBLIC collab site" \
+        "stay down. Install $WORK/deploy/control-plane/docker-after-tailscale.conf as /etc/systemd/system/docker.service.d/after-tailscale.conf" >&2
+    fi
+  fi
+fi
+
 COMPOSE_FILES=(-f "$WORK/deploy/control-plane/compose.yaml" "${COLLAB_FILES[@]}")
 if [ "$WEB_EGRESS_COMPOSE_ENABLED" = 1 ]; then
   COMPOSE_FILES+=(-f "$WEB_EGRESS_OVERLAY")
@@ -826,6 +861,9 @@ compose_run() {
   local tree="$1" envf="$2" tag="$3" commit="$4"; shift 4
   local files=(-f "$tree/deploy/control-plane/compose.yaml")
   if [ "$COLLAB" = 1 ]; then files+=(-f "$tree/deploy/control-plane/compose.collab.yaml"); fi
+  if [ "$FABRIC" = 1 ] && [ -f "$tree/deploy/control-plane/compose.collab-fabric.yaml" ]; then
+    files+=(-f "$tree/deploy/control-plane/compose.collab-fabric.yaml")
+  fi
   if [ "$WEB_EGRESS_COMPOSE_ENABLED" = 1 ]; then files+=(-f "$WEB_EGRESS_OVERLAY"); fi
   if [ -n "$ROLLBACK_IMAGES" ]; then files+=(-f "$ROLLBACK_IMAGES"); fi
   # TRANSITION: a rollback to the release BEFORE the apps mount builds that release's compose.yaml, which still
@@ -897,7 +935,7 @@ container_of() {
   case "$1" in
     control-plane-web) echo herdr-cp-web ;; control-plane-worker) echo herdr-cp-worker ;;
     llm-proxy) echo herdr-llm-proxy ;; collab-public) echo herdr-collab-public ;;
-    collab-edge) echo herdr-collab-edge ;; share-public) echo herdr-share-public ;; *) echo "$1" ;;
+    collab-edge) echo herdr-collab-edge ;; fabric-whois) echo herdr-collab-fabric-whois ;; share-public) echo herdr-share-public ;; *) echo "$1" ;;
   esac
 }
 services_settled() {
@@ -934,6 +972,13 @@ stop_share_public() {   # never fatal; plain docker, so it works whichever compo
   fi
 }
 
+stop_fabric_whois() {   # never fatal: the listener is not configured, so the sidecar a previous deploy started has no job
+  if docker inspect herdr-collab-fabric-whois >/dev/null 2>&1; then
+    docker stop herdr-collab-fabric-whois >/dev/null 2>&1 \
+      || echo "WARNING: could not stop herdr-collab-fabric-whois (fabric_trust.listen_* is not configured)" >&2
+  fi
+}
+
 forward() {
   deploy_lock_phase forward || return 1
   HOST_MUTATED=1
@@ -955,6 +1000,9 @@ forward() {
   if [ "$COLLAB" = 1 ]; then
     install_private "$NEW_COLLAB" "$COLLAB_CONFIG" || return 1
     mkdir -p "$HERDR_COLLAB_DATA_DIR" && chmod 700 "$HERDR_COLLAB_DATA_DIR" || return 1
+    if [ "$FABRIC" = 1 ]; then   # the sidecar's socket directory: created before either container mounts it
+      mkdir -p "$HERDR_COLLAB_FABRIC_WHOIS_DIR" && chmod 700 "$HERDR_COLLAB_FABRIC_WHOIS_DIR" || return 1
+    fi
     # keys + membership files, the edge certificate, the 1-minute timer and the cert renew
     # timer (pool, group and the invite provisioner's operator come from the slice; the
     # provisioner reads collab-public's log in the data dir it mounts). Runs BEFORE the new nginx.conf lands, so
@@ -992,7 +1040,7 @@ forward() {
     # once, alone, first - and leave it out of the up below. Recreating it twice back to
     # back is what raced Docker's removal of the old container (2026-10-29).
     compose_up_retry "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build --force-recreate collab-public >/dev/null || return 1
-    compose_up_retry "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build "${APP_SERVICES[@]}" collab-edge >/dev/null || return 1
+    compose_up_retry "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build "${APP_SERVICES[@]}" collab-edge "${FABRIC_SERVICE[@]}" >/dev/null || return 1
   else
     compose_up "$WORK" "$ENV_FILE" "$TAG" "$SHA" >/dev/null || return 1
   fi
@@ -1005,10 +1053,28 @@ forward() {
   # Shares disabled: the edge no longer serves the share host; stop a share-public a previous deploy started (its
   # bundles stay on disk). Never fatal.
   if [ "$SHARE" = 0 ] && [ -n "$NEW_SHARE" ]; then stop_share_public; fi
+  if [ "$COLLAB" = 1 ] && [ "$FABRIC" = 0 ]; then stop_fabric_whois; fi
   deploy_lock_phase verify || return 1
   python3 "$STATE_HELPER" verify-forward "$ATTEMPT" || return 1
   verify "$SHA" || return 1
   memory_client_promote
+}
+
+# rollback_services: the service list for the checkout being rolled back to. A checkout without the fabric overlay
+# cannot name fabric-whois (compose fails "no such service"), so drop it for the whole rollback and stop the sidecar
+# the failed forward deploy started (it is an orphan there: nothing of that checkout talks to it).
+rollback_services() {
+  local svc kept=()
+  FABRIC_SERVICE_ORPHAN=0
+  [ "$FABRIC" = 1 ] || return 0
+  [ ! -f "$PREV_WORK/deploy/control-plane/compose.collab-fabric.yaml" ] || return 0
+  for svc in "${EDGE_SERVICE[@]}"; do
+    [ "$svc" != fabric-whois ] || continue
+    kept+=("$svc")
+  done
+  EDGE_SERVICE=("${kept[@]}")
+  FABRIC_SERVICE=()
+  FABRIC_SERVICE_ORPHAN=1
 }
 
 rollback_share() {
@@ -1069,7 +1135,9 @@ rollback() {
   if [ "$RESTORED" = 1 ] \
       && git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
       && prev_render \
+      && rollback_services \
       && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
+      && { [ "${FABRIC_SERVICE_ORPHAN:-0}" = 0 ] || { stop_fabric_whois; true; }; } \
       && memory_client_apply rollback "$PREV_WORK" \
       && { ! declare -F web_egress_after >/dev/null || web_egress_after rollback; } \
       && rollback_share \

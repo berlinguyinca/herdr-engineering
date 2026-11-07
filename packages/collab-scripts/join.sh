@@ -12,6 +12,7 @@
 #   --tools         let the harness use its tools on task text (default: text answers only; codex needs this)
 #   --cmd 'COMMAND' run COMMAND for each task instead of the family's own (task text arrives on stdin)
 #   --no-sandbox    do not run tasks inside bubblewrap (default: boxed whenever bwrap works)
+#   --machine NAME  record NAME (MagicDNS short name) as this machine; only matters for Fabric trust, which the owner still enables
 #   --status        show the agents in ~/herdr-agents and whether their workers run
 #   --stop          stop the background workers started by this script
 #   --help          this text
@@ -21,7 +22,7 @@ main() {
   set -euo pipefail
   BASE='__HERDR_BASE__'
   DIR="${HERDR_AGENT_DIR:-$HOME/herdr-agents}"
-  COUNT=1; START=0; USE_HERDR=0; TOOLS=0; CMD_OVERRIDE=""; SANDBOX_ON=1; MODE=join
+  COUNT=1; START=0; USE_HERDR=0; TOOLS=0; CMD_OVERRIDE=""; SANDBOX_ON=1; MODE=join; MACHINE=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --count) COUNT="${2:?--count needs a number}"; shift 2 ;;
@@ -29,10 +30,11 @@ main() {
       --herdr) USE_HERDR=1; START=1; shift ;;
       --tools) TOOLS=1; shift ;;
       --cmd) CMD_OVERRIDE="${2:?--cmd needs a command}"; shift 2 ;;
+      --machine) MACHINE="${2:?--machine needs a name}"; shift 2 ;;
       --no-sandbox) SANDBOX_ON=0; shift ;;
       --status) MODE=status; shift ;;
       --stop) MODE=stop; shift ;;
-      --help|-h) sed -n '2,22p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null || true; echo "usage: curl -fsSL $BASE/api/v1/collab/scripts/join.sh | HERDR_JOIN_TOKEN=... bash -s -- --count N [--start] [--herdr] [--tools]"; return 0 ;;
+      --help|-h) sed -n '2,23p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null || true; echo "usage: curl -fsSL $BASE/api/v1/collab/scripts/join.sh | HERDR_JOIN_TOKEN=... bash -s -- --count N [--start] [--herdr] [--tools]"; return 0 ;;
       *) echo "join.sh: unknown option $1 (try --help)" >&2; return 2 ;;
     esac
   done
@@ -82,7 +84,9 @@ main() {
 
   FAMILY=""; NAMES=(); PREFIXES=(); PARENTS=(); IDS=()
   for i in $(seq 1 "$COUNT"); do
-    body=$(T="$TOKEN" python3 -c 'import os,sys,json;print(json.dumps({"token":os.environ["T"],"instance_id":sys.argv[1]}))' "$(hostname)-$$-$i")
+    body=$(T="$TOKEN" python3 -c 'import os,sys,json;d={"token":os.environ["T"],"instance_id":sys.argv[1]}
+if sys.argv[2]: d["machine"]=sys.argv[2]
+print(json.dumps(d))' "$(hostname)-$$-$i" "$MACHINE")
     resp=$(mktemp); code=$(curl -sS -o "$resp" -w '%{http_code}' -X POST "$BASE/api/v1/collab/agents/join" -H 'content-type: application/json' -d "$body" </dev/null) || code=000
     if [ "$code" != 200 ] && [ "$code" != 201 ]; then
       echo "join.sh: the server refused agent $i (HTTP $code): the token is wrong, expired, revoked or used up." >&2; rm -f "$resp"; break

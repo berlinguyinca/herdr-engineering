@@ -253,8 +253,8 @@ def test_the_public_listener_never_routes_to_the_operator_cancel(w, monkeypatch)
     rec = ask(w)
     real = w.s.authenticate
 
-    def admin_auth(authorization, device):
-        pr = real(authorization, device)
+    def admin_auth(authorization, device, **kw):
+        pr = real(authorization, device, **kw)
         pr.admin = True
         return pr
     monkeypatch.setattr(w.s, "authenticate", admin_auth)

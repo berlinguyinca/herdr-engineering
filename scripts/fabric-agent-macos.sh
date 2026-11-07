@@ -43,6 +43,9 @@
 set -euo pipefail
 
 LABEL="com.herdr-engineering.fabric-agent"
+# Overridable so the load/verify contract below can be tested where launchd does not exist
+# (the unit gate runs the whole suite on Linux). Never point it at anything that mutates state.
+LAUNCHCTL="${HERDR_LAUNCHCTL:-launchctl}"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST="$LAUNCH_AGENTS_DIR/$LABEL.plist"
 WRAPPER="$HOME/bin/herdr-fabric-agent.sh"
@@ -83,9 +86,9 @@ done
 if [ "$CMD" = "status" ]; then
   if [ ! -f "$PLIST" ]; then echo "LaunchAgent not installed: $PLIST"; exit 1; fi
   UID_="$(id -u)"
-  if launchctl print "gui/$UID_/$LABEL" >/dev/null 2>&1; then
+  if "$LAUNCHCTL" print "gui/$UID_/$LABEL" >/dev/null 2>&1; then
     echo "LaunchAgent running: $LABEL"
-    launchctl print "gui/$UID_/$LABEL" 2>/dev/null | grep -E "state =|pid =" | head -2
+    "$LAUNCHCTL" print "gui/$UID_/$LABEL" 2>/dev/null | grep -E "state =|pid =" | head -2
   else
     echo "LaunchAgent installed but NOT running: $LABEL"
     exit 1
@@ -97,8 +100,8 @@ fi
 if [ "$CMD" = "uninstall" ]; then
   step "stopping + removing LaunchAgent ($LABEL)"
   UID_="$(id -u)"
-  launchctl bootout "gui/$UID_/$LABEL" 2>/dev/null || true
-  launchctl remove "$LABEL" 2>/dev/null || true
+  "$LAUNCHCTL" bootout "gui/$UID_/$LABEL" 2>/dev/null || true
+  "$LAUNCHCTL" remove "$LABEL" 2>/dev/null || true
   rm -f "$PLIST" "$WRAPPER"
   echo "  removed $PLIST"
   echo "  removed $WRAPPER"
@@ -194,28 +197,10 @@ cat > "$PLIST" <<PLIST
 </plist>
 PLIST
 
-# (re)load the agent into the GUI login domain
-UID_="$(id -u)"
-# HERDR_FABRIC_AGENT_NO_RESTART=1 (the Ansible fleet update): leave a loaded
-# agent alone; the caller restarts it once, after all of its updates succeeded.
-if [ "${HERDR_FABRIC_AGENT_NO_RESTART:-}" = "1" ] \
-    && launchctl print "gui/$UID_/$LABEL" >/dev/null 2>&1; then
-  echo "  loaded agent left alone (HERDR_FABRIC_AGENT_NO_RESTART=1; caller restarts it)"
-else
-  launchctl bootout "gui/$UID_/$LABEL" 2>/dev/null || true
-  launchctl bootstrap "gui/$UID_" "$PLIST" || { launchctl load -w "$PLIST" 2>/dev/null || true; }
-  launchctl enable "gui/$UID_/$LABEL" 2>/dev/null || true
-  launchctl kickstart -k "gui/$UID_/$LABEL" 2>/dev/null || true
-  sleep 3
-fi
-
-if launchctl print "gui/$UID_/$LABEL" >/dev/null 2>&1; then
-  echo "  LaunchAgent running: $LABEL"
-else
-  warn "LaunchAgent did not come up — check the log:"
-  warn "  tail ~/.local/share/herdr-engineering/fabric-agent.log"
-fi
-
+# (re)load the agent into the GUI login domain, and fail if it did not end up loaded. The contract
+# lives in scripts/fabric-agent-load.sh so it can be tested where launchd does not exist; a warning
+# here once let the fleet's mac agents stay stopped while the installer exited 0.
+"$(dirname "${BASH_SOURCE[0]}")/fabric-agent-load.sh" "$LABEL" "$PLIST"
 echo
 echo "fabric agent installed (macOS launchd)."
 echo "  Status: scripts/fabric-agent-macos.sh status"

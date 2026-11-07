@@ -206,6 +206,8 @@ edge (nginx, server_name <public_host>): /s/ -> share-public:8083
   therefore sets that directory to group `control_plane.collab.members.secrets_gid` (default: the worker's
   `HERDR_COLLAB_CERT_UID`, which compose passes with collab-public's default), mode 0770, files 0640; others get
   nothing. With no gid the worker refuses to start members rather than issue links nobody can receive.
+- Approving a share link is a human action: `member.share_approve` accepts user actors only and the agent tool
+  `artifact_share_approve` no longer exists; an agent can only create a pending share that the owner approves in the web page.
 - A `share` grant is not read-protected: a grantee holding only `share` can create and approve a link, receives the
   read-once URL, and so can open it and read the bytes. The member API (head, history, view tools) stays gated on
   `read`; do not hand out `share` expecting it to hide content.
@@ -397,6 +399,25 @@ They call the control plane with an API key read from the environment variable n
 Agent ids starting with `room:` are refused by every collaborator route (grant, revoke, invite). A grant made under such an id
 before that rule cannot be revoked by id any more: use `collab restrict <artifact_id>` (it revokes every collaborator
 grant of the artifact).
+
+## Fabric listener (optional)
+
+Set `control_plane.collab.fabric_trust.listen_host` (a tailnet address) and `listen_port` (and `whois_socket: /run/fabric-whois/whois.sock`)
+and `deploy.sh` layers `compose.collab-fabric.yaml`: a `fabric-whois` sidecar (no network, tailscaled's socket directory read-only, its own
+socket directory) and a port published from `collab-public` on that tailnet address only. Without those keys nothing changes. Before relying
+on it, check that Docker preserves the caller's source address, and read the rollback caveat: `docs/operations/fabric-trust.md` section 9.
+
+Three host steps `deploy.sh` cannot do for you (it warns while they are missing):
+
+- **Firewall (required).** The `fabric` network is not internal (Docker cannot publish a port from an internal network) and masquerade-off does not remove
+  its default route, so `collab-public` could reach the host's own addresses, other containers' ports and the LAN. As root:
+  `deploy/control-plane/collab-fabric-firewall.sh --install` (`--check`, `--remove`); it drops NEW connections from `172.30.213.0/24` in `DOCKER-USER`
+  and `INPUT`. Re-apply at boot.
+- **Boot order.** Install `deploy/control-plane/docker-after-tailscale.conf` as `/etc/systemd/system/docker.service.d/after-tailscale.conf`
+  (`systemctl daemon-reload`): docker then starts after tailscaled and waits for the tailnet address, otherwise the port bind can fail at boot and the
+  PUBLIC site stays down.
+- **The collab host trusts itself.** A local process, `ssh -L`/`socat` relay or host-network container reaches the listener as the host's own tailnet IP and is
+  accepted as that machine if the host is in `machines`. Run no relays or L4 fronts on the collab host and omit it from `machines` unless its own agents need it.
 
 ## Verify
 

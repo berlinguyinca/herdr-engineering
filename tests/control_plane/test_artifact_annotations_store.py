@@ -94,8 +94,8 @@ def test_migration_runs_twice_and_kinds_agree(registry_pg):
         definition = await conn.fetchval("SELECT pg_get_constraintdef(oid) FROM pg_constraint "
                                          "WHERE conname='artifact_share_events_kind_check'")
         assert set(re.findall(r"'([a-z_]+)'::text", definition)) == set(artifact_shares.EVENT_KINDS)
-        assert len(artifact_shares.EVENT_KINDS) == 11 and NEW_KINDS <= set(artifact_shares.EVENT_KINDS)
-        assert artifact_shares.INGESTIBLE_KINDS == ("opened", "denied")
+        assert len(artifact_shares.EVENT_KINDS) == 12 and NEW_KINDS <= set(artifact_shares.EVENT_KINDS)
+        assert artifact_shares.INGESTIBLE_KINDS == ("opened", "denied", "claimed")
     run(registry_pg, body)
 
 

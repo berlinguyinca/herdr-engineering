@@ -280,7 +280,9 @@ files, publish them as versions, and share them by link. Open the artifacts addr
 and use **My artifacts** (`/my/`). The same actions are available to your agent through MCP tools: `artifact_create`,
 `artifact_upload_chunk` (with `artifact_upload_status` and `artifact_upload_abort`), `artifact_publish`,
 `artifact_head`, `artifact_history`, `artifact_delete`, and the share tools `artifact_share_create`,
-`artifact_share_approve`, `artifact_share_list`, `artifact_share_events` and `artifact_share_revoke`. Slow
+`artifact_share_list`, `artifact_share_events` and `artifact_share_revoke`. Your agent can prepare a share link
+(`artifact_share_create`), but only you can make it live: open the artifact in **My artifacts** and press
+**Approve**. There is no agent tool for approval. Slow
 operations return a ticket; poll it with `artifact_result`.
 
 * **Limits.** There are no built-in size or count caps. The operator can see how much each member uses and may set
