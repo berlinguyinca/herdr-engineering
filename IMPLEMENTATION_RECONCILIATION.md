@@ -82,8 +82,9 @@ workstation). Playbooks are real and idempotent by design; convergence evidence
 is pending fleet access.
 
 ### 2.10 Web/mobile control surface
-`herdr_engineering/web.py` is a private-by-default stdlib HTTP server with a
-mobile-first responsive UI. **EXISTING**. `herdr-web` upstream is **ADAPT** lead.
+`herdr_engineering/web.py` was a private-by-default stdlib HTTP server with a
+mobile-first responsive UI. **RETIRED 2026-11-07** (nobody used it; the control
+plane's UI replaced it). `herdr-web` upstream is **ADAPT** lead.
 
 ### 2.11 Browser preview + Plannotator
 `herdr_engineering/browser.py` — Playwright screenshot capture as ArtifactRef,
@@ -117,9 +118,9 @@ TestEvent, normalized tree, native-command rerun. **EXISTING**.
 cleanup. **EXISTING**.
 
 ### 2.18 Unified UX
-`herdr_engineering/web.py` navigation surfaces Fleet/Sessions/Activity/Dev/
-Tests/CI/Attention with shared context. **EXISTING** (deep unified IA is
-PARTIAL — see spec 0150).
+`herdr_engineering/web.py` navigation surfaced Fleet/Sessions/Activity/Dev/
+Tests/CI/Attention with shared context (retired 2026-11-07 with spec 0060; the
+control plane's UI carries these views; deep unified IA is PARTIAL — see spec 0150).
 
 ### 2.19 Attention/notifications
 `herdr_engineering/attention.py` — coalescing attention registry, policy,
@@ -143,7 +144,7 @@ preflight, rollback. `lock/upstreams.yaml` populated. **EXISTING**.
 | Model/GPU routing | Tern | config points to `https://llm.metabolomics.us` |
 | CI execution | Woodpecker/Pileated | `ci.py` (adapter only) |
 | Review semantics | Plannotator | `browser.py` (adapter only) |
-| Private network | Tailscale | `devfabric.py`, `web.py` (private-only) |
+| Private network | Tailscale | `devfabric.py` (private-only) |
 | Git truth | Git/GitHub | worktrees/commits/PRs |
 
 ## 4. Conflicts vs archived specs

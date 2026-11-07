@@ -10,8 +10,8 @@ The fleet has two roles:
 
 - **Master / gateway host** — one machine runs the whole front door as a
   Docker Compose stack: CoreDNS (authoritative for the shared `dev.lan`
-  domain), the fabric gateway (`dev:<port>` registry + router + probe loop),
-  and the private web UI. Only one machine runs this.
+  domain) and the fabric gateway (`dev:<port>` registry + router + probe
+  loop). Only one machine runs this.
 - **Fleet hosts** — every other machine (including the master) runs a
   lightweight **auto-registration agent** that watches for web services
   starting locally and registers them with the gateway, so they appear at a
@@ -22,7 +22,7 @@ The fleet has two roles:
  any tailnet device (desktop / phone / iPad)
       │  http://dev.lan:18052
       ▼
- master host:  CoreDNS + fabric gateway + web UI   (deploy/fabric-stack, Docker Compose)
+ master host:  CoreDNS + fabric gateway   (deploy/fabric-stack, Docker Compose)
       │  http://dev.lan:29999  (control API)
       ▼
  fleet hosts (incl. master):  auto-registration agent  (systemd on Linux / launchd on macOS)
@@ -53,8 +53,8 @@ scripts/fabric-stack.sh up-replace   # builds image, renders CoreDNS, starts sta
 scripts/fabric-stack.sh status       # verify gateway healthz + dev.lan resolution
 ```
 
-`up-replace` also stops any previously host-run gateway process and the
-`herdr-eng-web` systemd unit that would collide on the same ports.
+`up-replace` also stops any previously host-run gateway process and the old
+(retired) `herdr-eng-web` systemd unit if it is still active.
 
 ### One external admin step (cannot be automated from the host)
 
@@ -171,7 +171,7 @@ scripts/fabric-offboard.sh --leave-tailnet --purge
 ```
 
 The CoreDNS + gateway containers are removed; the `herdr-state` named volume
-(leases) can be removed with `docker compose -f deploy/control-plane/compose.yaml rm -sf coredns fabric-gateway herdr-web  && docker volume rm herdr-fabric_herdr-state`.
+(leases) can be removed with `docker compose -f deploy/control-plane/compose.yaml rm -sf coredns fabric-gateway && docker volume rm herdr-fabric_herdr-state`.
 
 ---
 

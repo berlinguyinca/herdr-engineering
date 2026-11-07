@@ -35,7 +35,7 @@ companion.
 |---|---|---|---|---|---|
 | Herdr core | official binary (0.9.1) | **ADOPT** | proprietary/internal | active | Base primitive. Build on, never fork. |
 | herdr-browser | `StructuPath/herdr-browser` | **ADAPT** | verify upstream | community | Browser preview; our `browser.py` adapts and falls back safely. |
-| herdr-web | `eyalev/herdr-web` | **ADAPT** | verify upstream | community | Preferred web surface; `web.py` is the private stdlib fallback. |
+| herdr-web | `eyalev/herdr-web` | **ADAPT** | verify upstream | community | Preferred web surface if one is wanted again; our stdlib fallback `web.py` was retired on 2026-11-07 (spec 0060). |
 | herdr-plannotator | `plannotator/herdr-plannotator` | **ADOPT** | verify upstream | active | Review authority; `PlannotatorAdapter` preserves review identity/decision/evidence. |
 | herdr-swarm | upstream swarm | **OPTIONAL** | verify upstream | community | Optional parallel-agent helpers; not required for core integration. |
 | herdr-worktreeinclude | `eightHundreds/...` | **OPTIONAL** | verify upstream | community | Worktree include helper; native worktrees may suffice. |

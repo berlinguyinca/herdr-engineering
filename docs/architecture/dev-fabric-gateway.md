@@ -170,53 +170,13 @@ The gateway is a candidate for fleet Ansible deployment (systemd unit) once
 the host choice is finalized (bender today; a dedicated node later — the
 service is stateless except for the store directory).
 
-## Persistent private web UI (gateway host)
+## Persistent private web UI (retired)
 
-The fleet-wide private control surface (`herdr-eng web`, spec 0060) follows
-the same one-gateway model: it runs **persistently on the designated gateway
-host** (bender today) as a systemd **user** service, and is exposed tailnet-only
-via `tailscale serve`.
-
-```
- tailnet (any device: desktop / phone / iPad)
-      │  https://<gateway-magicdns>/   (tailscale serve, HTTPS)
-      ▼
- gateway host (bender):  herdr-eng-web.service (systemd user unit)
-      │  herdr-eng web --host 127.0.0.1 --port 8787
-      ▼
- loopback only 127.0.0.1:8787   (private-by-default invariant)
-```
-
-- **Private-by-default invariant.** `web.py` binds loopback only and its
-  defaults are **not** changed. The systemd unit additionally pins
-  `--host 127.0.0.1` so a machine-local config can never turn it into a public
-  listener. There is no public listener, ever.
-- **One gateway host.** Only the designated gateway host (bender today) runs
-  the service. Other fleet hosts reach the UI via the stable
-  `https://<gateway-magicdns>` URL or an SSH tunnel
-  (`ssh -L 8787:127.0.0.1:8787 <gateway>`), never by running their own
-  public listener.
-- **Persistent.** A systemd user unit (`scripts/herdr-eng-web.service`) keeps it
-  running across reboots/logout via `loginctl enable-linger`.
-- **Tailscale serve.** `tailscale serve --bg 8787` maps `https://<gateway-magicdns>`
-  → `127.0.0.1:8787`. The serve feature must be enabled once on the tailnet
-  (admin console); until then the setup script prints the exact command and
-  continues gracefully.
-
-### Deploy
-
-```bash
-# On the gateway host (bender), from a checkout:
-scripts/web-serve.sh          # idempotent; enables linger, installs+starts the
-                              # user unit, then `tailscale serve --bg 8787`
-```
-
-The same deployment is driven by Ansible on the gateway host
-(`ansible/playbooks/site.yml`, the "Deploy private web UI ..." block, gated by
-`herdr_engineering_gateway_host`). It copies the unit + `scripts/web-serve.sh`
-to the host and runs the script as the fleet user. See the README section
-"Persistent private web UI (gateway)" for the full model and `ansible/README.md`
-for fleet convergence notes.
+The private control surface `herdr-eng web` (spec 0060: `web.py` on loopback `127.0.0.1:8787`, the
+`herdr-eng-web` user unit with `tailscale serve --bg 8787`, later the `herdr-web` container) was retired on
+2026-11-07; nobody used it. The control plane's UI is the web surface. A `herdr-web` container left on the
+gateway host is removed by the herdr-fleet `control-plane` role's adoption. Until then the gateway's ts.net
+route in `deploy/fabric-stack/config.yaml` still points at `127.0.0.1:8787`.
 
 ## Shared `dev.lan` domain (Option B)
 
@@ -238,10 +198,10 @@ we run our own authoritative nameserver and use Tailscale **split-DNS**:
   gateway and proxies to the owning host.
 
 The whole front door runs as one Docker Compose project on the master host —
-CoreDNS + fabric gateway + private web UI — in **`deploy/fabric-stack/`**
+CoreDNS + fabric gateway — in **`deploy/fabric-stack/`**
 (see its `README.md`). All services use `network_mode: host` (the gateway must
 bind the tailnet IP + the whole `18000–28999` range and route to other hosts;
-CoreDNS must answer on the tailnet IP:53; the web UI stays loopback-only).
+CoreDNS must answer on the tailnet IP:53).
 CoreDNS binds only `127.0.0.1` + the tailnet IP to avoid colliding with
 systemd-resolved (`127.0.0.53/127.0.0.54`) and libvirt dnsmasq
 (`192.168.122.1`) on port 53.

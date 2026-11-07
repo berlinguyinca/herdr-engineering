@@ -26,7 +26,7 @@
 #      bind address) from the central file into a transient 0600 env file inside a
 #      0700 directory (`herdr-eng fleet config render-compose`), removed on exit
 #   4. recreates control-plane-web, control-plane-worker and llm-proxy on that one
-#      image tag (postgres, rustfs, coredns, gateway, herdr-web untouched) using the
+#      image tag (postgres, rustfs, coredns, gateway untouched) using the
 #      compose files from that same commit; the central file's DIRECTORY is
 #      mounted read-only at /etc/herdr/fleet/ (a single-file mount would keep the old
 #      inode after a rename-replace, so edits would never reach the server).

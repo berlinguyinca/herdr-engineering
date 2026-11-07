@@ -44,7 +44,7 @@ collection warnings. Real command + live-fleet snapshots are captured under
 | 0030 Native Herdr contracts | COMPLETE | `herdr_adapter.py`, `herdr-eng capabilities`, adapter tests |
 | 0040 Fleet bootstrap & Ansible | COMPLETE (impl); live-converged + idempotent: `mac`, `beast`, `bender`; `fry` BLOCKED (not on the tailnet) | `ansible/playbooks/site.yml`, linux+macos roles, `ansible/README.md` |
 | 0050 Powerpack distribution & lifecycle | COMPLETE | `powerpack.py`, `herdr-eng powerpack`, doctor tests |
-| 0060 Web/mobile control surface | COMPLETE (impl); live tailnet `BLOCKED_EXTERNAL` | `web.py`, `herdr-eng web`, web tests |
+| 0060 Web/mobile control surface | RETIRED 2026-11-07 (nobody used it; the control plane's UI replaced it) | `web.py` and `herdr-eng web` removed; `tests/test_herdr_web_retired.py` |
 | 0070 Browser preview & Plannotator | COMPLETE (impl); live Chromium `BLOCKED_EXTERNAL` | `browser.py`, `herdr-eng browser`, `herdr-eng review` |
 | 0080 Shared artifact workspace | COMPLETE | `artifacts.py`, `herdr-eng artifacts`, artifact tests |
 | 0090 Session journal & timeline | COMPLETE | `journal.py`, `herdr-eng journal`, journal tests |
@@ -53,7 +53,7 @@ collection warnings. Real command + live-fleet snapshots are captured under
 | 0120 Unified test explorer | COMPLETE | `tests.py`, `herdr-eng tests`, adapter tests |
 | 0130 Woodpecker/Pileated CI | COMPLETE (impl + live); raw step-log text `BLOCKED_EXTERNAL` (WebSocket-only) | `ci.py`, `herdr-eng ci {repos,agents,pipelines,pipeline,logs,debug}`, CI tests |
 | 0140 Multi-agent worktree comparison | COMPLETE | `candidates.py`, `herdr-eng candidates`, candidate tests |
-| 0150 Unified engineering UX | COMPLETE | `web.py` navigation surfaces |
+| 0150 Unified engineering UX | COMPLETE | was `web.py` navigation (retired 2026-11-07 with 0060); the control plane's UI |
 | 0160 Attention/notifications/review | COMPLETE | `attention.py`, `herdr-eng attention`, attention tests |
 | 0170 Observability/security/update/rollback | COMPLETE | `observability.py`, `doctor.py`, listener tests |
 | 0180 Fleet validation/release/docs | COMPLETE (docs/repo/CI); live fleet `BLOCKED_EXTERNAL` | README, `.github/workflows/ci.yml`, `scripts/`, acceptance matrix |
@@ -93,7 +93,7 @@ overridden by repo `config/herdr-engineering.yaml`, then `$HERDR_ENGINEERING_CON
   capabilities (`machines=True snapshot=True plugins=True worktrees=False`),
   public-listener scan, tailscale, artifact workspace.
 - **Powerpack** — `herdr-eng powerpack status|enable|disable|snapshot|preflight|rollback`.
-- **Web** — `herdr-eng web --port 8787` private-by-default mobile-first UI.
+- **Web** — `herdr-eng web` was retired on 2026-11-07 (spec 0060); the control plane's UI is the web surface.
 - **Contracts** — five typed dataclasses (ActivityEvent, ArtifactRef,
   DevServiceLease, TestEvent, CIEvent) in `herdr_engineering/contracts.py`.
 

@@ -137,7 +137,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # agent-mine -----------------------------------------------------------
     p = sub.add_parser("agent-mine", help="mine this host's agent transcripts into a redacted "
-                                          "JSON summary (fleet dashboard / HPC-ssh adoption)")
+                                          "JSON summary (tool usage / HPC-ssh adoption)")
     p.add_argument("--agents", default="claude,pi,codex,opencode")
     p.add_argument("--days", type=int, default=45, help="0 = all time")
     p.add_argument("--full", action="store_true", help="include truncated command bodies")
@@ -792,11 +792,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = csub.add_parser("id", help="deterministic candidate id")
     p2.add_argument("--repo", required=True); p2.add_argument("--worktree", required=True)
     p2.add_argument("--branch", required=True); p2.set_defaults(func=_cmd_cand_id)
-
-    # web ------------------------------------------------------------------
-    p = sub.add_parser("web", help="private web/mobile control surface (spec 0060)")
-    p.add_argument("--host", default=None); p.add_argument("--port", type=int, default=None)
-    p.set_defaults(func=_cmd_web)
 
     from .architecture import command as _architecture_command
     _architecture_command.register(sub)
@@ -3480,11 +3475,6 @@ def _cmd_cand_id(args) -> int:
     from .candidates import candidate_id
     _print_json({"candidate_id": candidate_id(args.repo, args.worktree, args.branch)})
     return 0
-
-
-def _cmd_web(args) -> int:
-    from .web import serve
-    return serve(host=args.host, port=args.port)
 
 
 def _cp_migrations_dir() -> str:

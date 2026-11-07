@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Retired: `herdr-web` (spec 0060; nobody uses it)
+- Removed `herdr_engineering/web.py`, the `herdr-eng web` command, the `herdr-web` service from `deploy/control-plane/compose.yaml`, the old `herdr-eng-web` user unit with `scripts/web-serve.sh` and its `site.yml` task, and `ansible/playbooks/agent-mine.yml` with `agent_mine.fleet_rollup` (their only reader was the retired `/api/agent-mine` panel). Spec 0060 is marked retired (2026-11-07). The control plane's UI (`herdr-eng control-plane web`) is the web surface.
+- Kept: `herdr-eng agent-mine` and `agent_mine.py` (a standalone per-host report; `session_history.py` does not import it), the `web:` config defaults (the dev agent still excludes port 8787 from auto-registration), and the `herdr-web-client`/`herdr-web-components` packages (the control plane's UI).
+- Nothing is stopped or deleted on a host: a `herdr-web` container left on the control host is removed by the herdr-fleet `control-plane` role's adoption. `scripts/fabric-stack.sh up` no longer passes `--remove-orphans` while that container exists, and `down` no longer names the service. The gateway's ts.net route in `deploy/fabric-stack/config.yaml` still points at `127.0.0.1:8787` until the owner repoints or drops it.
+- `tests/test_herdr_web_retired.py` pins the removal.
+
 ### CI: a push to `main` is now gated (#691)
 - `.woodpecker/structural-gates.yml` is the first pipeline that triggers on `event: push, branch: main`. `unit-gates.yml` and `ui-gates.yml` trigger on `pull_request` and `manual` only — deliberately, so a push to a PR branch does not build twice — but the same filter also excluded `main`, so a commit that broke `main` was never detected by `main`. It surfaced as a red pipeline on the next unrelated PR that rebased onto it, which cost two misdirected investigations on 2026-11-05/06.
 - It is not a cheaper `unit-gates`. `main` takes ~85 commits a day (251 on the busiest recent day) and `unit-gates` takes ~55 minutes, so gating every push to `main` with it would need ~78 runner-hours a day and starve PR CI. The new gate answers the questions whose failures actually reached `main` — every tracked YAML/JSON/TOML file parses, no tracked file carries an unresolved conflict marker, and `memory_install.PINNED_REVISION` equals the lock — in **1.34 seconds** over 2858 tracked files, so ~85 runs a day cost about two minutes of runner time. The full suite still runs on every pull request.

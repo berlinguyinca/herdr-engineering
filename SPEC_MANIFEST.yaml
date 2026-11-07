@@ -30,6 +30,7 @@ phases:
   - id: "0060"
     file: docs/specs/0060-web-mobile-control-surface.md
     depends_on: ["0050"]
+    status: retired  # 2026-11-07; see the spec's status line
   - id: "0070"
     file: docs/specs/0070-browser-preview-and-plannotator.md
     depends_on: ["0050", "0060"]

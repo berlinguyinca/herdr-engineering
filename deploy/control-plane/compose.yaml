@@ -29,10 +29,11 @@
 #
 # ONE project for everything on the master host: the control plane services
 # above use ordinary bridge networking (they resolve each other by service
-# name), while coredns, fabric-gateway and herdr-web (formerly the separate
+# name), while coredns and fabric-gateway (formerly the separate
 # `herdr-fabric` project in deploy/fabric-stack) keep `network_mode: host`,
 # which the gateway and CoreDNS require. See deploy/fabric-stack/README.md for
-# what those three do.
+# what those two do. (herdr-web, the old spec 0060 surface, is retired; a
+# container left from it is removed by the control-plane role's adoption.)
 #
 # CONFIGURATION: the central fleet file (~/.config/herdr-engineering/fleet/fleet-config.yaml,
 # created by `herdr-eng fleet config init`) is the only source. The web and worker
@@ -535,28 +536,6 @@ services:
       # probe that address (substituted from the rendered env file).
       test: ["CMD", "curl", "-fsS", "http://${GATEWAY_HEALTH_HOST:?run deploy.sh (derived from GATEWAY_TAILNET_IP)}:29999/healthz"]
       interval: 15s
-      timeout: 3s
-      retries: 3
-      start_period: 5s
-
-  herdr-web:
-    image: herdr-engineering:0.1.0
-    container_name: herdr-web
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ../fabric-stack/config.yaml:/app/config.yaml:ro
-      # Agent Mine fleet store: the private web UI's /api/agent-mine reads
-      # $HOME/.cache/agent-mine/fleet/ (the container runs as root, HOME=/root).
-      # Bind the controller's fleet store read-only so the dashboard can serve the
-      # per-site summaries written by playbooks/agent-mine.yml.
-      - ~/.cache/agent-mine:/root/.cache/agent-mine:ro
-    environment:
-      HERDR_ENGINEERING_CONFIG: /app/config.yaml
-    command: ["web", "--host", "127.0.0.1", "--port", "8787"]
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/"]
-      interval: 30s
       timeout: 3s
       retries: 3
       start_period: 5s

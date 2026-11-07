@@ -50,8 +50,7 @@
     # Agents use the fabric LLM gateway (per-project keys, token accounting); it
     # forwards to https://llm.metabolomics.us with the single lab key.
     llm_endpoint: "http://dev.lan:8088"
-    # ONE designated gateway host runs the persistent private web UI and
-    # exposes it tailnet-only via `tailscale serve` (https://<gateway-magicdns>).
+    # ONE designated gateway (main) host: it runs the daily fleet update cron entry (below).
     herdr_engineering_gateway_host: "bender"
     herdr_engineering_repo_root: "{{ playbook_dir }}/../.."
     # Shared fleet-wide dev domain (Option B): the master-host stack
@@ -110,20 +109,6 @@
         # become runs the tasks as root on Linux; without this the config
         # file is created root-owned and the fleet user cannot read it.
         owner: "{{ fleet_user }}"
-
-    # ----------------------------------------------------------------------
-    # Private web UI as a persistent service (spec 0060 + dev-fabric-gateway
-    # model). Runs on the ONE designated gateway host (bender today), binds
-    # loopback only (private-by-default invariant — web.py defaults unchanged)
-    # and is exposed fleet-wide as https://<gateway-magicdns> via
-    # `tailscale serve`. Other fleet hosts use that stable URL or an SSH
-    # tunnel. No public listeners. Idempotent: delegates to
-    # scripts/web-serve.sh, which is idempotent and graceful when tailscale
-    # serve is not yet enabled. No secrets live in the repo.
-    # ----------------------------------------------------------------------
-    - name: "Deploy private web UI as a persistent systemd user service (gateway host only)"
-      ansible.builtin.include_tasks: ../tasks/web-serve.yml
-      when: inventory_hostname == herdr_engineering_gateway_host
 
     # ----------------------------------------------------------------------
     # Dev-fabric auto-registration agent (spec 0110). Runs on EVERY fleet

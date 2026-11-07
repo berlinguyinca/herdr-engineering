@@ -1,10 +1,9 @@
-# HerdR Engineering runtime image — fabric gateway + private web UI.
+# HerdR Engineering runtime image — fabric gateway and the control plane.
 #
 # Built for the master-host (bender) container stack. Every service uses
 # `network_mode: host` so the containers share the host network stack: the
 # gateway binds the host's tailnet IP + the whole dev:<port> range
-# (18000-28999) and routes to other tailnet hosts; the web UI binds loopback
-# only (private-by-default invariant).
+# (18000-28999) and routes to other tailnet hosts.
 #
 # The `tailscale` CLI is intentionally NOT installed: the container relies on
 # explicit `--bind` / `--url-base` from the compose command instead of

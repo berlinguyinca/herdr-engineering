@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Deploy the HerdR Engineering master-host stack (CoreDNS + fabric gateway +
-# private web UI) as a single Docker Compose project on the master host.
+# Deploy the HerdR Engineering master-host stack (CoreDNS + fabric gateway)
+# as part of the single Docker Compose project on the master host.
 #
 # This replaces the manually-started fabric gateway process and the
 # herdr-eng-web systemd unit with containers. The per-host auto-registration
@@ -89,10 +89,15 @@ up() {
     "${COMPOSE[@]}" build fabric-gateway
     # The optional Hindsight memory containers belong to compose profile `memory`, managed by deploy.sh --with-memory.
     # While they exist, never ask compose to remove "orphans": this script's env file carries no memory variables.
+    # Nor while a container of the retired herdr-web service is left: the control-plane role's adoption
+    # removes it, never this script.
     local orphans=(--remove-orphans)
     if docker inspect herdr-hindsight >/dev/null 2>&1 || docker inspect herdr-hindsight-db >/dev/null 2>&1; then
         orphans=()
         warn "Hindsight memory containers present: not using --remove-orphans (managed by deploy.sh --with-memory)"
+    elif docker inspect herdr-web >/dev/null 2>&1; then
+        orphans=()
+        warn "retired herdr-web container present: not using --remove-orphans (the control-plane role's adoption removes it)"
     fi
     "${COMPOSE[@]}" up -d ${orphans[@]+"${orphans[@]}"}
     "${COMPOSE[@]}" ps
@@ -143,7 +148,7 @@ status() {
     fi
 }
 
-down() { "${COMPOSE[@]}" stop coredns fabric-gateway herdr-web; }  # not the control plane
+down() { "${COMPOSE[@]}" stop coredns fabric-gateway; }  # not the control plane
 
 cmd="${1:-up}"
 case "$cmd" in

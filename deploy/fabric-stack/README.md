@@ -1,6 +1,6 @@
 # HerdR Engineering master-host stack (`dev.lan` front door)
 
-Runs the entire fleet front door. Its three services are defined in the **same compose file as the control plane** (`deploy/control-plane/compose.yaml`, project `herdr-control-plane`); this directory holds only their Dockerfile, config and CoreDNS templates, and `scripts/fabric-stack.sh` drives them. Together with the control plane they form **one Docker Compose project** on the
+Runs the entire fleet front door. Its two services are defined in the **same compose file as the control plane** (`deploy/control-plane/compose.yaml`, project `herdr-control-plane`); this directory holds only their Dockerfile, config and CoreDNS templates, and `scripts/fabric-stack.sh` drives them. Together with the control plane they form **one Docker Compose project** on the
 master/gateway host (bender today). From any Tailscale device you reach any
 fleet service at `http://dev.lan:<port>` — regardless of which host actually
 runs the service.
@@ -21,7 +21,11 @@ runs the service.
 |---|---|---|
 | `coredns` | `coredns/coredns:1.11.4` | Private nameserver for the shared `dev.lan` domain (Option B split-DNS). |
 | `fabric-gateway` | `herdr-engineering:0.1.0` (built) | The `dev:<port>` front door (spec 0110 #3): control API + per-port router + probe loop. |
-| `herdr-web` | `herdr-engineering:0.1.0` (built) | Private web/mobile control surface (spec 0060), loopback-only, tailnet-only via `tailscale serve`. |
+
+`herdr-web` (the spec 0060 web/mobile surface on `127.0.0.1:8787`) is **retired** (2026-11-07): the control plane's
+UI replaced it. A container left from it on the master host is removed by the herdr-fleet `control-plane` role's
+adoption, not by hand and not by `scripts/fabric-stack.sh` (which skips `--remove-orphans` while it exists). Until
+then the node's ts.net route in `config.yaml` still points at it.
 
 The per-host **auto-registration agent** is intentionally *not* containerized:
 it must see host listeners via `ss`/`lsof`, so it stays a host service on
@@ -74,8 +78,8 @@ The script writes `deploy/fabric-stack/.env` with `GATEWAY_TAILNET_IP` (from
 `tailscale ip -4`), renders `coredns/generated/*` from the `.tmpl` files, builds
 the `herdr-engineering` image, and starts the stack.
 
-To replace the previously host-run gateway process + the `herdr-eng-web`
-systemd unit (they would conflict on ports `29999` / `8787` / `18000+`):
+To replace a previously host-run gateway process and stop the old (retired) `herdr-eng-web`
+systemd unit if it is still active (they would conflict on ports `29999` / `18000+`):
 
 ```bash
 scripts/fabric-stack.sh up-replace
@@ -114,9 +118,8 @@ curl http://dev.lan:18052                # reaches the leased service
 
 - **`network_mode: host` everywhere** — required. The gateway must bind the
   host's tailnet IP and the whole `18000–28999` dev range, and reach other
-  tailnet hosts; CoreDNS must answer on the host's tailnet IP:53; the web UI
-  binds loopback only (private-by-default invariant) and is exposed via
-  `tailscale serve --bg 8787`. No port remapping is done.
+  tailnet hosts; CoreDNS must answer on the host's tailnet IP:53. No port
+  remapping is done.
 - **CoreDNS binds only `127.0.0.1` + the tailnet IP** (not `0.0.0.0`): the host
   already runs systemd-resolved on `127.0.0.53/127.0.0.54` and a libvirt
   dnsmasq on `192.168.122.1`, all on port 53.
@@ -125,7 +128,7 @@ curl http://dev.lan:18052                # reaches the leased service
   (`magicdns_name`/`tailnet_ipv4`) is not used; explicit bind + url_base are
   passed on the command line.
 - **`tailscale` CLI is not in the image** on purpose — keeps it slim and
-  deterministic; the gateway and web only need explicit host/url config.
+  deterministic; the gateway only needs explicit host/url config.
 - **Gateway store** (`leases.json`, `gateway.lock`) lives in the `herdr-state`
   named volume. Leases survive gateway restarts.
 - **HTTPS**: the router is a byte-transparent TCP proxy, so
@@ -162,5 +165,5 @@ deploy/fabric-stack/certs-sync.sh renew       # what the timer runs (certbot ren
 ```
 
 Order for the switch-over: `certs-sync.sh install`, `tailscale serve --https=443 off`, `docker compose up -d fabric-gateway`.
-The `:9447` serve rule is unaffected. Roll back with `tailscale serve --bg --https=443 http://127.0.0.1:8787` and the
-previous gateway command.
+The `:9447` serve rule is unaffected. The old 443 serve rule pointed at the retired herdr-web on `127.0.0.1:8787`,
+so it is no longer a rollback target; roll back with the previous gateway command.

@@ -10,7 +10,7 @@ Every node has a stable ``id``. Leaf nodes carry a ``detail``-able id that the
 web surface can pass to :func:`node_detail` to render a click-through panel.
 
 The projection is fail-closed: if an adapter throws, that subtree degrades to
-an empty list rather than blocking the whole view (mirrors ``web.py``).
+an empty list rather than blocking the whole view.
 """
 from __future__ import annotations
 

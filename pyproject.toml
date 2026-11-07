@@ -27,9 +27,8 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP"]
-# E501 (line length) is intentionally relaxed: web.py embeds HTML and cli.py
-# contains long URLs. E702 (semicolon chaining) is used deliberately in the
-# argparse builder for compact set_defaults wiring.
+# E501 (line length) is intentionally relaxed: cli.py contains long URLs.
+# E702 (semicolon chaining) is used deliberately in the argparse builder for compact set_defaults wiring.
 extend-ignore = ["E501", "E702"]
 
 [tool.setuptools.packages.find]

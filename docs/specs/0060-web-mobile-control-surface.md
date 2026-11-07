@@ -1,5 +1,7 @@
 # 0060 — Web and Mobile Control Surface
 
+**Status:** retired · **Retired:** 2026-11-07 · **Why:** nobody used it; the control plane's UI (`herdr-eng control-plane web`) is the web surface. Removed: `herdr_engineering/web.py`, `herdr-eng web`, the `herdr-web` compose service, the `herdr-eng-web` user unit and its Ansible task, the Agent Mine fleet playbook (its only reader was this surface's `/api/agent-mine`). A `herdr-web` container left on the control host is removed by the herdr-fleet `control-plane` role's adoption. The text below is kept as the historical record.
+
 ## Goal
 
 Make the HerdR cockpit usable from desktop browsers, iPhone and iPad over the private tailnet without replacing the native terminal UI.

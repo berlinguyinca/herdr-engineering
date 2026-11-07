@@ -73,6 +73,10 @@ unit-tested; only live convergence/validation is pending.
 
 ## Web/mobile
 
+> **Retired 2026-11-07.** `herdr-eng web` (`web.py`), its `herdr-web` container and the `herdr-eng-web`
+> unit were removed (spec 0060 is retired; nobody used it). The items below are the historical record;
+> the control plane's UI is the web surface now.
+
 - [x] Web UI is accessible only through the private tailnet by default.
       `web.py` defaults to `private_only=True`, host `127.0.0.1`.
 - [x] Web UI runs persistently on ONE designated gateway host and is exposed

@@ -318,7 +318,6 @@ cat <<EOF
     herdr-eng doctor            # health/capability/security checks
     herdr-eng name --prompt "add a health endpoint"
     herdr-eng machines --json   # read-only view of saved Herdr machines
-    herdr-eng web --port 8787   # private web/mobile control surface
 
   This machine is now in the private inventory at: $INVENTORY
   Herdr was NOT modified; your running agent sessions are unaffected.

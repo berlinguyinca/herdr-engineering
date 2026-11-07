@@ -53,7 +53,7 @@ dependencies:
     decision: ADAPT
     license: "check upstream"
     maintenance: "community"
-    note: "Preferred web surface when compatible; our web.py provides a private stdlib fallback (spec 0060)."
+    note: "Preferred web surface when compatible; our stdlib fallback web.py was retired on 2026-11-07 (spec 0060)."
   herdr-plannotator:
     source: "plannotator/herdr-plannotator"
     revision: null

@@ -237,12 +237,7 @@ herdr-eng powerpack snapshot pre-release-1
 herdr-eng powerpack preflight
 herdr-eng powerpack rollback
 
-# 6) private web/mobile control surface (binds 127.0.0.1 by default)
-herdr-eng web --port 8787
-#    ... or, for the persistent gateway deployment on the designated host:
-#    scripts/web-serve.sh   # systemd user unit + linger + `tailscale serve --bg 8787`
-
-# 7) other integration surfaces
+# 6) other integration surfaces
 herdr-eng machines --json
 herdr-eng workspaces --json
 herdr-eng devfabric list
@@ -571,7 +566,6 @@ macOS convergence is a documented `BLOCKED_EXTERNAL` item pending a fleet run.
 | `herdr-eng: command not found` | `source .venv/bin/activate` or re-run `scripts/install.sh` (symlinks into `~/.local/bin`) |
 | doctor: `tailscale` warn | `tailscale status`; if down, `sudo tailscale up` (key via `TS_AUTH_KEY`, see installer) |
 | doctor: `public listener` warn | `herdr-eng doctor --json` lists it; stop the offending process or scope it to the tailnet |
-| web UI not reachable from phone | confirm `tailscale up` on both, then open `http://<tailnet-ip>:8787` (web is private-only) |
 | dev service not forwarding | `herdr-eng devfabric list` (lease active?) then run `herdr-eng devfabric serve <lease>` |
 | config not taking effect | `herdr-eng doctor --json` shows the config file in use; precedence is machine-local < repo < `$HERDR_ENGINEERING_CONFIG` |
 | stale dev port | `herdr-eng devfabric reconcile` expires stale leases |
@@ -605,36 +599,12 @@ warning when it is not reachable. The control API is tailnet+loopback only
 and bearer-token protected when a token is configured. Design and live
 evidence: [`docs/architecture/dev-fabric-gateway.md`](docs/architecture/dev-fabric-gateway.md).
 
-## Persistent private web UI (gateway)
+## Retired: `herdr-eng web` (spec 0060)
 
-`herdr-eng web` (spec 0060) is the fleet-wide private control surface. It runs
-**persistently on ONE designated gateway host** (bender today) and is exposed
-tailnet-only. The model mirrors the dev-fabric gateway:
-
-- **Private-by-default invariant.** `web.py` binds loopback only and its
-  defaults are **not** changed. The systemd user unit pins
-  `--host 127.0.0.1` so a machine-local config can never turn it into a public
-  listener. There is no public listener, ever.
-- **One gateway host.** Only the designated host runs the service. Other fleet
-  hosts reach the UI via the stable `https://<gateway-magicdns>` URL or an SSH
-  tunnel (`ssh -L 8787:127.0.0.1:8787 <gateway>`), never via a public listener.
-- **Persistent.** A systemd **user** unit (`scripts/herdr-eng-web.service`)
-  keeps it running across reboots/logout (linger enabled).
-- **Tailscale serve.** `tailscale serve --bg 8787` maps
-  `https://<gateway-magicdns>` → `127.0.0.1:8787`. The serve feature must be
-  enabled once on the tailnet (admin console); until then the setup script
-  prints the exact command and continues gracefully.
-
-```bash
-# on the gateway host (bender), from a checkout:
-scripts/web-serve.sh   # idempotent: installs+starts the user unit, enables
-                       # linger, then `tailscale serve --bg 8787`
-```
-
-Ansible deploys the same unit + script on the designated gateway host
-(`ansible/playbooks/site.yml`, gated by `herdr_engineering_gateway_host`).
-Design and deployment model:
-[`docs/architecture/dev-fabric-gateway.md`](docs/architecture/dev-fabric-gateway.md).
+The stdlib web/mobile surface (`herdr-eng web`, `web.py`, the `herdr-web` container and the
+`herdr-eng-web` user unit) was retired on 2026-11-07; nobody used it. The control plane's UI
+(`herdr-eng control-plane web`) is the web surface. A `herdr-web` container left on the control
+host is removed by the herdr-fleet `control-plane` role's adoption.
 
 ## Lineage continuity, artifact visibility and delivery metrics
 
