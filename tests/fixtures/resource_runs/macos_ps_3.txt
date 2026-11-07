@@ -1,0 +1,4 @@
+    1     0  11712 117:26.70 05-15:13:19 /sbin/launchd
+  500     1   4096   0:00.22    11:00 /bin/zsh
+  700     1  20000   0:00.10    00:05 /opt/homebrew/bin/codex
+  810     1 250000  12:01.50 02-03:05:05 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome

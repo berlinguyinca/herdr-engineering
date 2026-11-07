@@ -319,6 +319,7 @@ class ControlPlaneServer:
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None, build_cache=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
+                 resource_runs_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None, library=None,
                  library_viewers=None, member_directory=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
@@ -570,7 +571,11 @@ class ControlPlaneServer:
             digest = hashlib.sha256(str(key).encode()).hexdigest()[:12]
             scopes[f"key:{digest}"] = {"rooms": frozenset(allow.get("rooms") or ()),
                                        "missions": frozenset(allow.get("missions") or ())}
-        self.ingest = IngestService(repo, key_scopes=scopes, system_graph=system_graph)
+        from .resource_runs import build_store as build_resource_runs
+        # Per-run resource capture: the resource_runs table (migration 0052) with a DSN, else in memory.
+        self.resource_runs = build_resource_runs(resource_runs_dsn)
+        self.ingest = IngestService(repo, key_scopes=scopes, system_graph=system_graph,
+                                    resource_runs=self.resource_runs)
         # ADR-0008 P1: hot `control_plane.federation` section (None = off). Nothing mints a peer principal yet.
         self.ingest.peer_source = federation_source
         self._limiter = _RateLimiter()
@@ -3834,6 +3839,13 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     return self._json({"error": "not configured"}, 404)
             if resource == "ai-sync" and len(parts) == 4:
                 return self._etag_json({"hosts": r.list_ai_sync(_q(self.path, "host_id"))})
+            if resource == "resource-profiles" and len(parts) == 4:
+                # Read only. ?project= is required, validated, and the one parameter accepted.
+                from .resource_runs import valid_project
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                if set(query) != {"project"} or len(query["project"]) != 1:
+                    raise ValueError("resource-profiles takes exactly one project parameter")
+                return self._etag_json(server.resource_runs.profiles(valid_project(query["project"][0])))
             if resource == "fleet-rollouts" and len(parts) in (4, 5):
                 if len(parts) == 4:
                     return self._etag_json({"rollouts": r.list_fleet_rollouts(

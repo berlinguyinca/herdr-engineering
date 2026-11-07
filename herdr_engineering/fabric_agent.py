@@ -838,6 +838,7 @@ class FabricAgent:
         self._git_metadata = ListenerGitMetadata()
         self._resource_probe = None
         self._resource_report_at = 0.0
+        self._resource_runs = None
         self._store: dict[str, dict[str, Any]] = self._load_store()
         self._forwards: dict[int, AgentForwarder] = {}
         self._warned_unleased: set[int] = set()
@@ -1346,6 +1347,16 @@ class FabricAgent:
             body = build_host_report(
                 self._machine, self._machine, self.cfg.tailnet_ip, telemetry,
                 self._slow_data if include_slow else None)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("host telemetry report failed: %s", exc)
+            return None
+        return self._post_ingest(body, "host telemetry report", timeout=timeout)
+
+    def _post_ingest(self, body: dict[str, Any], what: str, *, timeout: float = 2.0) -> int | None:
+        """POST one envelope to the control plane's ingest route; the HTTP status, or ``None`` (never raises)."""
+        if not self.cfg.control_plane_url:
+            return None
+        try:
             url = f"{self.cfg.control_plane_url.rstrip('/')}/api/v1/ingest"
             req = urllib.request.Request(
                 url, data=json.dumps(body, default=str).encode(),
@@ -1353,11 +1364,24 @@ class FabricAgent:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return int(resp.status)
         except urllib.error.HTTPError as exc:
-            log.warning("host telemetry report rejected: HTTP %s", exc.code)
+            log.warning("%s rejected: HTTP %s", what, exc.code)
             return int(exc.code)
         except Exception as exc:  # control plane down: never break the agent
-            log.warning("host telemetry report failed: %s", exc)
+            log.warning("%s failed: %s", what, exc)
             return None
+
+    def _collect_runs(self) -> None:
+        """Per-run resource capture (resource_runs_collector): one event per ended agent session. Never raises."""
+        try:
+            if self._resource_runs is None:
+                from .resource_runs_collector import RunCollector
+                self._resource_runs = RunCollector(
+                    host=self._machine, state_path=self.cfg.store_path.parent / "resource-runs.json",
+                    post=lambda envelope: self._post_ingest(envelope, "resource run report"),
+                    agent_binaries=self.cfg.agent_binaries)
+            self._resource_runs.tick()
+        except Exception as exc:  # noqa: BLE001 - capture must not interrupt telemetry or leases
+            log.warning("resource run capture failed: %s", type(exc).__name__)
 
     def _report_resources(self):
         if not self.cfg.control_plane_url or time.monotonic() - self._resource_report_at < 15:
@@ -1415,6 +1439,14 @@ class FabricAgent:
                 self._host_tick()
             except Exception:  # noqa: BLE001
                 log.exception("host telemetry tick failed")
+            stop.wait(self.cfg.host_report_interval)
+
+    def _runs_loop(self, stop: threading.Event) -> None:
+        """Own thread, on the host-report cadence: a working-directory walk or a slow ``lsof`` for a new session
+        must never delay the heartbeat."""
+        while not stop.is_set():
+            if self.cfg.control_plane_url:
+                self._collect_runs()
             stop.wait(self.cfg.host_report_interval)
 
     def _slow_loop(self, stop: threading.Event) -> None:
@@ -1489,6 +1521,8 @@ class FabricAgent:
                          name="agent-host-report").start()
         threading.Thread(target=self._slow_loop, args=(stop,), daemon=True,
                          name="agent-host-slow").start()
+        threading.Thread(target=self._runs_loop, args=(stop,), daemon=True,
+                         name="agent-resource-runs").start()
         try:
             while not stop.is_set():
                 try:

@@ -32,6 +32,8 @@ from .graph import validate_lineage
 from .host_metrics_store import STATE_KEYS, clean_metrics, clean_state
 from .ids import validate_mission_id
 from .project_links import canonical_repository
+from .resource_runs import ENTITY_TYPE as RESOURCE_RUN
+from .resource_runs import MemoryResourceRuns, validate_resource_run
 from .sink import EventAlreadyStored
 
 log = logging.getLogger(__name__)
@@ -139,7 +141,7 @@ def validate_fleet_rollout(entity_id, event_type, payload) -> dict:
 DISPATCHED_ENTITY_TYPES = frozenset({"lineage", "host", "session", "mission", "service", "inspector",
                                      "mission_activity", "test_run", "build", "review",
                                      "review_finding", "pull_request", "token_usage", "resource_usage",
-                                     "ai_sync", "fleet_rollout"})
+                                     "ai_sync", "fleet_rollout", RESOURCE_RUN})
 # ledger / platform / lifecycle are the Pi envelope adapters' activity streams (envelopeAdapters.ts)
 # repository / request / span are the opt-in system-graph adapter's lifecycle streams (graph_ingest.py, runbook
 # docs/specs/herdr-system-graph-20261020/11-p0-p6-status-and-runbook.md). They were accepted before T16, nothing
@@ -166,8 +168,11 @@ _AGENT_ONLY_HOST_KEYS = ("telemetry", "cpu", "mem", "disk", "inventory")
 class IngestService:
     """Translates lifecycle event envelopes into idempotent repo mutations."""
 
-    def __init__(self, repo, key_scopes=None, system_graph: bool = False):
+    def __init__(self, repo, key_scopes=None, system_graph: bool = False, resource_runs=None):
         self.repo = repo
+        # Per-run resource capture (resource_runs.py): the server passes its table-backed store; without one the
+        # same contract runs in memory.
+        self.resource_runs = resource_runs if resource_runs is not None else MemoryResourceRuns()
         # Per-key room/mission allow-lists for lineage addressed to a room or mission (operator YAML
         # `control_plane.lineage_key_scopes`, resolved by the server to principal ids):
         # {principal_id: {"rooms": set, "missions": set}}. A key with no entry may write only
@@ -474,6 +479,8 @@ class IngestService:
             validate_ai_sync(entity_id, event_type, payload)
         if entity_type == "fleet_rollout":
             validate_fleet_rollout(entity_id, event_type, payload)
+        if entity_type == RESOURCE_RUN:
+            validate_resource_run(entity_id, event_type, payload)
         if entity_type == "service" and any(
                 k in payload for k in ("repository_id", "forge_url", "repository_url",
                                        "repo_url", "clone_url", "commit_sha")):
@@ -574,6 +581,11 @@ class IngestService:
             stored = record_fleet_rollout(self.repo, entity_id, event_type,
                                           validate_fleet_rollout(entity_id, event_type, payload))
             return {"entity_type": "fleet_rollout", "entity_id": entity_id, "event_type": event_type,
+                    "duplicate": not stored}
+        if entity_type == RESOURCE_RUN:
+            # One row per (host, session_id) in resource_runs; a replay inserts nothing and says so.
+            stored = self.resource_runs.record(validate_resource_run(entity_id, event_type, payload))
+            return {"entity_type": RESOURCE_RUN, "entity_id": entity_id, "event_type": event_type,
                     "duplicate": not stored}
         if entity_type == "host":
             return self._ingest_host(entity_id, event_type, payload, source)

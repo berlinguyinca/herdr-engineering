@@ -151,7 +151,12 @@ def _top_of(ps_rows: list[dict], limit: int = TOP_N) -> dict:
 
 
 def count_agents(rows: list[dict], binaries) -> int:
-    """Distinct agent processes: rows whose command name is exactly one of
+    """Distinct agent processes (see ``agent_roots``)."""
+    return len(agent_roots(rows, binaries))
+
+
+def agent_roots(rows: list[dict], binaries) -> list[dict]:
+    """The agent processes themselves: rows whose command name is exactly one of
     ``binaries`` and that have no matching ancestor.
 
     The match is on the process name (``comm``), never a substring, so
@@ -175,7 +180,7 @@ def count_agents(rows: list[dict], binaries) -> int:
             pid = parent["ppid"]
         return False
 
-    return sum(1 for r in matches if not has_agent_ancestor(r))
+    return [r for r in matches if not has_agent_ancestor(r)]
 
 
 def _herdr_data_dir() -> str:

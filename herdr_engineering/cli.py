@@ -4579,6 +4579,7 @@ def _cmd_cp_web(args) -> int:
     member_web = _member_web(cp, collab, args)
     svr = ControlPlaneServer(repo, api_keys=api_keys, lineage_key_scopes=lineage_key_scopes,
                              rakazo_bridge=cp.get("rakazo_bridge"), rakazo_bridge_dsn=dsn, assistant_apps_dsn=dsn,
+                             resource_runs_dsn=dsn,
                              federation_source=federation_source,
                              system_graph=system_graph,
                              host=args.host, port=args.port, source=source,
