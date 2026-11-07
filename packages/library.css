@@ -1,0 +1,34 @@
+/* Artifact library (dashboard). Uses the dashboard theme tokens only, so it follows the light/dark theme. */
+.library { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 16px; align-items: start; }
+.library-main h2 { margin: 0 0 8px; }
+.library .search { display: flex; flex-direction: column; gap: 4px; margin: 0 0 12px; max-width: 420px; }
+.library .rows { list-style: none; margin: 0 0 16px; padding: 0; }
+.library .row { background: var(--surface); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 12px; margin: 0 0 8px; display: grid; gap: 4px; }
+.library .row-title { font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+.library a.row-open { text-decoration: underline; }
+.library a.row-open:hover { color: var(--accent); }
+.library .row-meta, .library .empty { color: var(--text-secondary); font-size: .9rem; overflow-wrap: anywhere; }
+.library .row-actions, .library .folder-manage { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.library .row-muted, .library .row-expired { background: var(--surface-2); border-style: dashed; color: var(--text-secondary); }
+.library .row-muted .row-title { color: var(--text-secondary); font-weight: 400; }
+.library .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+.library .chip { font: inherit; font-size: .85rem; padding: 3px 12px; min-height: 28px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--text); cursor: pointer; display: inline-flex; align-items: center; }
+.library .chip:hover { background: var(--surface-hover); }
+.library .chip[aria-pressed="true"] { background: var(--accent-weak); border-color: var(--accent); color: var(--text); font-weight: 600; }
+.library .chip-count { opacity: .85; }
+.library .folders { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.library .folders h3 { margin: 0 0 8px; font-size: 1rem; }
+.library .folder-list { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 2px; }
+.library .folder-list .tab { display: block; padding: 6px 10px; border-radius: 8px; color: var(--text-secondary); text-decoration: none; overflow-wrap: anywhere; }
+.library .folder-list .tab:hover { background: var(--surface-hover); color: var(--text); }
+.library .folder-list .tab[aria-current="page"] { background: var(--accent-weak); color: var(--text); font-weight: 600; }
+.library [data-folder-form] { display: grid; gap: 6px; }
+.library .badge { display: inline-block; padding: 1px 8px; border-radius: 4px; font-size: .75rem; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); }
+.library .badge-mine, .library .badge-assigned { background: var(--accent-weak); border-color: transparent; }
+.library .badge-pending { border-color: var(--status-attention); }
+.library .badge-expired, .library .badge-revoked { background: transparent; border-color: var(--status-failed); }
+.library .btn { font: inherit; padding: 6px 12px; min-height: 32px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); cursor: pointer; }
+.library .btn:hover { background: var(--surface-hover); }
+.library .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--text-on-accent); }
+.library .btn-danger { color: var(--status-failed); border-color: var(--status-failed); }
+@media (max-width: 720px) { .library { grid-template-columns: 1fr; } }

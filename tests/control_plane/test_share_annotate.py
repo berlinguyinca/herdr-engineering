@@ -278,7 +278,12 @@ def test_public_share_and_disabled_annotations_are_untouched(tmp_path):
     pub_dir.mkdir()
     pub = Env(pub_dir, audience="public", files=FILES, config_extra=lab_config(pub_dir))
     try:
-        assert_raw(pub, f"/s/{TOKEN}/f/index.html", {"Sec-Fetch-Dest": "document"}, "index.html", HTML)
+        # a public share gets the recipient landing bar (Task 8) but never the annotation layer
+        status, _headers, body = pub.request("GET", f"/s/{TOKEN}/f/index.html", {"Sec-Fetch-Dest": "document"})
+        assert status == 200 and b"data-herdr-landing" in body and b"<p>hello</p></BODY></html>" in body
+        assert b"annotate" not in body.lower()
+        status, _headers, body = pub.request("GET", f"/s/{TOKEN}/f/index.html", {"Sec-Fetch-Dest": "empty"})
+        assert status == 200 and body == HTML
     finally:
         pub.close()
     off_dir = tmp_path / "off"

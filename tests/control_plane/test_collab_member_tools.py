@@ -155,23 +155,21 @@ def test_idempotency_key_is_in_the_create_and_publish_schemas_and_reaches_the_in
 
 
 def test_share_tools_are_on_the_menu_with_strict_schemas(world):
-    share = {"artifact_share_create", "artifact_share_approve", "artifact_share_list", "artifact_share_revoke",
-             "artifact_share_events"}
+    share = {"artifact_share_create", "artifact_share_list", "artifact_share_revoke", "artifact_share_events"}
     assert share <= names(world, world.info)
+    assert "artifact_share_approve" not in names(world, world.info)      # approval is the owner's, in the web page
     schemas = {t["name"]: t["inputSchema"] for t in world_tools(world, world.info)}
     for name in share:
         assert schemas[name]["additionalProperties"] is False
     assert not names(world, world.agent("mal")[1]) & share
 
 
-def test_share_create_approve_revoke_events_go_through_the_service(world):
+def test_share_create_revoke_events_go_through_the_service(world):
     out = ok_json(tool(world, world.info, "artifact_share_create", artifact_id=ART, version_id="v_1",
                        audience="public")[1])
     assert out["status"] == "pending" and out["ticket"]
     assert err(world, world.info, "artifact_share_approve", artifact_id=ART, share_id="share_" + "a" * 24,
-               confirm=False)["status"] == 400
-    assert err(world, world.info, "artifact_share_approve", artifact_id=ART, share_id="share_" + "a" * 24)[
-        "status"] == 400
+               confirm=True)["status"] in (400, 404)                        # no such tool any more
     for name in ("artifact_share_revoke", "artifact_share_events"):
         assert ok_json(tool(world, world.info, name, artifact_id=ART, share_id="share_" + "a" * 24)[1])[
             "status"] == "pending"

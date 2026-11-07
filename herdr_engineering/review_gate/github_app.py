@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
@@ -110,6 +110,23 @@ class CommitRange:
     commits: tuple[CommitInfo, ...]
     total: int
     truncated: bool
+    # GitHub's own comparison verdict ("ahead", "behind", "identical", "diverged") and counts; empty/None when absent.
+    status: str = field(default="", compare=False)
+    ahead_by: int | None = field(default=None, compare=False)
+    behind_by: int | None = field(default=None, compare=False)
+
+
+@dataclass(frozen=True)
+class CombinedStatus:
+    state: str          # GitHub's combined state: pending | success | failure | error
+    count: int          # number of commit statuses behind it (0: none were ever reported)
+
+
+@dataclass(frozen=True)
+class CheckRunInfo:
+    name: str
+    status: str         # queued | in_progress | completed | ...
+    conclusion: str     # "" until completed
 
 
 def pr_number_from_subject(subject: str) -> int | None:
@@ -148,9 +165,19 @@ class GitHubAppClient:
     repo-scoped read-only token, writes the ``review_gate`` capability token (refused unless ``github.app.write``
     lists it). ``config`` is then unused."""
 
-    def __init__(self, config: AppConfig | None, *, client=None, now=time.time, credentials=None):
+    def __init__(self, config: AppConfig | None, *, client=None, now=time.time, credentials=None,
+                 api_base: str = API, timeout: float = TIMEOUT):
         if config is None and credentials is None:
             raise ValueError("GitHubAppClient needs an AppConfig or a shared credentials provider")
+        # ``api_base`` exists so a test can point the real client at a local listener.  It is a constructor argument,
+        # never configuration, and is checked: https, or plain http only to a loopback host.
+        parts = urllib.parse.urlsplit(api_base)
+        loopback = parts.hostname in ("127.0.0.1", "::1", "localhost")
+        if (parts.scheme not in ("https", "http") or (parts.scheme == "http" and not loopback) or not parts.hostname
+                or parts.username or parts.password or parts.query or parts.fragment or parts.path not in ("", "/")):
+            raise ValueError("api_base must be an https origin (http only for a loopback host)")
+        self._api = api_base.rstrip("/")
+        self._timeout = timeout
         self._credentials = credentials
         self._config = config
         self._client = client or urllib.request.build_opener(_NoRedirect())
@@ -256,7 +283,7 @@ class GitHubAppClient:
     def _transport(self, method, path, body, bearer):
         """Return (True, data) or (False, error); never raises, so no traceback holds the credential."""
         request = urllib.request.Request(
-            API + path,
+            self._api + path,
             method=method,
             data=None if body is None else json.dumps(body).encode(),
             headers={
@@ -268,7 +295,7 @@ class GitHubAppClient:
             },
         )
         try:
-            with self._client.open(request, timeout=TIMEOUT) as response:
+            with self._client.open(request, timeout=self._timeout) as response:
                 raw = response.read(MAX_RESPONSE + 1)
             if len(raw) > MAX_RESPONSE:
                 return False, GitHubAppError("invalid_response")
@@ -605,7 +632,53 @@ class GitHubAppClient:
             failed = True
         if failed:
             raise GitHubAppError("invalid_response")
-        return CommitRange(tuple(out), total, total > len(out))
+        status = data.get("status")
+        ahead, behind = data.get("ahead_by"), data.get("behind_by")
+        return CommitRange(
+            tuple(out), total, total > len(out),
+            status=status if isinstance(status, str) else "",
+            ahead_by=ahead if type(ahead) is int and ahead >= 0 else None,
+            behind_by=behind if type(behind) is int and behind >= 0 else None,
+        )
+
+    def commit_status(self, repo: str, sha: str) -> CombinedStatus:
+        """The combined commit-status state for ``sha`` and how many statuses back it.  GitHub reports ``pending`` for
+        a commit with no statuses at all, so callers must look at ``count`` before trusting a state."""
+        slug, sha = _repo_path(repo), _sha(sha)
+        data = self._send("GET", f"/repos/{slug}/commits/{sha}/status?per_page=1")
+        state = data.get("state") if isinstance(data, dict) else None
+        count = data.get("total_count") if isinstance(data, dict) else None
+        if state not in _STATES or type(count) is not int or count < 0:
+            raise GitHubAppError("invalid_response")
+        return CombinedStatus(state, count)
+
+    def check_runs(self, repo: str, sha: str) -> tuple[CheckRunInfo, ...]:
+        """Every check run for ``sha`` (up to 500).  A response that is incomplete or malformed raises, so the caller can
+        never mistake a partial list for the whole."""
+        slug, sha = _repo_path(repo), _sha(sha)
+        runs: list[CheckRunInfo] = []
+        for page in range(1, 6):
+            data = self._send("GET", f"/repos/{slug}/commits/{sha}/check-runs?per_page=100&page={page}")
+            items = data.get("check_runs") if isinstance(data, dict) else None
+            total = data.get("total_count") if isinstance(data, dict) else None
+            if not isinstance(items, list) or type(total) is not int or total < len(items):
+                raise GitHubAppError("invalid_response")
+            bad = False
+            for item in items:
+                name, status, conclusion = (item.get("name"), item.get("status"), item.get("conclusion")) \
+                    if isinstance(item, dict) else (None, None, None)
+                if not isinstance(name, str) or not isinstance(status, str) \
+                        or not (conclusion is None or isinstance(conclusion, str)):
+                    bad = True
+                    break
+                runs.append(CheckRunInfo(name[:200], status, conclusion or ""))
+            if bad:
+                raise GitHubAppError("invalid_response")
+            if len(runs) >= total:
+                return tuple(runs)
+            if not items:
+                break
+        raise GitHubAppError("invalid_response")      # more runs than we read: never report a partial list
 
     def patch_id(self, repo: str, base_sha: str, head_sha: str) -> str:
         """Hash of the per-file patches between base and head, hunk line offsets ignored.

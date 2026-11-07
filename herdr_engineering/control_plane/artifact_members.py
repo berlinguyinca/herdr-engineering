@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
@@ -84,6 +84,22 @@ def member_for_actor(actor: Mapping[str, Any], *, agents: Mapping[str, Mapping[s
         return MemberCheck(True, member_principal(user_id), None)
     except ValueError:
         return _refuse("unknown_user")
+
+
+def claim_resolver(directory: Mapping[str, Mapping[str, Any]] | None, group: str) -> Callable[[str], str | None]:
+    """actor (a verified Cognito user id) -> member id, for ingesting ``claimed`` share events.
+
+    Same rules as ``member_for_actor`` for a user actor: only an ``approved`` user of ``group`` maps to a member id (the
+    id without the ``member:`` prefix); an unknown or unapproved user, or no usable ``directory`` (None: stale or
+    missing), maps to None and the event is ignored."""
+    def resolve(actor: str) -> str | None:
+        if directory is None:
+            return None
+        check = member_for_actor({"kind": "user", "user_id": actor}, agents={}, group=group, directory=directory)
+        if not check.ok or check.principal is None:
+            return None
+        return check.principal.removeprefix(MEMBER_PREFIX)
+    return resolve
 
 
 def positively_out(entry: Mapping[str, Any] | None, group: str, *, now: float, grace: float) -> bool:

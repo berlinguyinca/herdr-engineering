@@ -89,7 +89,7 @@ async def _sweep_orphans(store, shares_root: Path, now: float) -> int:
 
 
 async def share_housekeeping(store, shares_root: Path, events_path: Path, now: float, *,
-                             marker_path: Path | None = None) -> dict:
+                             marker_path: Path | None = None, members=None) -> dict:
     """Expire due shares, ingest the share container's audit events, and remove orphaned projections/bundles."""
     shares_root, events_path = Path(shares_root), Path(events_path)
     result = {"expired": 0, "ingested": 0, "orphans_removed": 0}
@@ -97,7 +97,9 @@ async def share_housekeeping(store, shares_root: Path, events_path: Path, now: f
     try:
         # reads events.jsonl (and a pending events.jsonl.1) to the end and rotates it past EVENTS_ROTATE_BYTES:
         # share-public drops lines once the file reaches its cap, so an unrotated file would silence audit
-        result["ingested"] = await store.ingest_and_rotate_events(events_path, marker_path=marker_path, now=now)
+        # ``members`` (actor -> member id) lets ``claimed`` events through for approved members only
+        extra = {} if members is None else {"members": members}
+        result["ingested"] = await store.ingest_and_rotate_events(events_path, marker_path=marker_path, now=now, **extra)
     except Exception:  # noqa: BLE001
         log.exception("share events ingest failed")
     try:
@@ -110,10 +112,24 @@ async def share_housekeeping(store, shares_root: Path, events_path: Path, now: f
 class ShareHousekeeper:
     """Runs ``share_housekeeping`` at most once per ``interval`` seconds; never raises out of the worker pass."""
 
-    def __init__(self, shares_root, events_dir, marker_dir, *, interval: float = SHARE_INTERVAL, clock=time.time):
+    def __init__(self, shares_root, events_dir, marker_dir, *, interval: float = SHARE_INTERVAL, clock=time.time,
+                 member_runtime=None):
         self.shares_root, self.events_dir, self.marker_dir = Path(shares_root), Path(events_dir), Path(marker_dir)
         self.interval, self._clock = interval, clock
+        self.member_runtime = member_runtime      # ``MemberRuntime`` or None: without it no claim is kept
         self._last: float | None = None
+
+    async def _claim_resolver(self):
+        """actor -> member id from the fresh member directory, or None when members are off (claims are then dropped)."""
+        rt = self.member_runtime
+        if rt is None or not getattr(rt, "enabled", False):
+            return None
+        import asyncio
+
+        from .artifact_member_intents import load_directory
+        from .artifact_members import claim_resolver
+        directory = await asyncio.to_thread(load_directory, rt)
+        return claim_resolver(directory, rt.group)
 
     async def tick(self, conn) -> dict | str:
         from .artifact_shares import ShareStore
@@ -127,8 +143,12 @@ class ShareHousekeeper:
             except OSError:
                 log.exception("share marker dir %s not creatable", self.marker_dir)
             store = conn if hasattr(conn, "live_expired") else ShareStore(conn)
+            extra = {}
+            resolver = await self._claim_resolver()
+            if resolver is not None:
+                extra["members"] = resolver
             return await share_housekeeping(store, self.shares_root, self.events_dir / "events.jsonl", now,
-                                            marker_path=self.marker_dir / "events.marker.json")
+                                            marker_path=self.marker_dir / "events.marker.json", **extra)
         except Exception:  # noqa: BLE001
             log.exception("share housekeeping failed")
             return "error"

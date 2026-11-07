@@ -195,6 +195,7 @@ COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "co
                          "cognito_domain", "public_url", "operator_user", "operator_email",
                          "open_signup", "approver_groups", "dashboard_hosts", "replay_history", "steering",
                          "contextual", "insights", "team_rooms", "team_roles", "coordinators",
+                         "fabric_trust",   # machine short names only, no secret
                          "skills",
                          "summary_fix",   # summary_fix: ids of the operator's summary-fix room and agent, no secret
                          "delegation_enabled",
@@ -254,6 +255,11 @@ def collab_values(cfg: FleetConfig) -> dict:
     from .control_plane.collab_coordinators import normalize_coordinators
     try:
         normalize_coordinators(collab.get("coordinators"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
+    from .control_plane.collab_fabric_trust import normalize_fabric_trust
+    try:
+        normalize_fabric_trust(collab.get("fabric_trust"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
     from .control_plane.collab import summary_fix_config
@@ -330,6 +336,14 @@ def _collab_artifacts_slice(cfg: FleetConfig) -> dict:
         section = None
     enabled = isinstance(section, dict) and section.get("enabled") is True
     return {"collab_artifacts": {"enabled": enabled}}
+
+
+def fabric_listener(cfg: FleetConfig) -> tuple[str, int] | None:
+    """(host, port) of control_plane.collab.fabric_trust's dedicated listener, or None when it is not configured. The
+    values were validated (tailnet address only) by ``collab_values``; deploy.sh publishes exactly this address and port."""
+    from .control_plane.collab_fabric_trust import normalize_fabric_trust
+    trust = normalize_fabric_trust(collab_values(cfg).get("fabric_trust"))
+    return (trust["listen_host"], trust["listen_port"]) if trust["listen_host"] else None
 
 
 def render_collab(cfg: FleetConfig, out: Path) -> None:

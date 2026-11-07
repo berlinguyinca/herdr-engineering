@@ -7,11 +7,13 @@
  * Any failure shows one neutral message and never says why. No HTML is ever built from data (textContent only).
  */
 import { sessionStore, validConfig, beginPkce, exchangeCode } from "/s/static/lab-signin.js";
+import { renderLandingBar, renderSigninCard, rememberReturn, takeReturn } from "/s/static/landing.js";
 
 {
   "use strict";
 
   var SHARE_PATH = /^\/s\/[A-Za-z0-9_-]{43}\/$/;
+  var SIGNIN_PATH = /^(\/s\/[A-Za-z0-9_-]{43}\/)signin$/;
   // /s/<token>/k/<session>/<f|v>/<entry>: the entry is one or more plain path segments (no backslash, query, fragment,
   // control or space character, no empty segment) so the browser cannot resolve it anywhere but under the share.
   var LANDING_PATH = /^\/s\/[A-Za-z0-9_-]{43}\/k\/[A-Za-z0-9_.-]{1,768}\/[fv]\/[^\/\\?#\x00-\x20\x7f]+(?:\/[^\/\\?#\x00-\x20\x7f]+)*$/;
@@ -19,6 +21,7 @@ import { sessionStore, validConfig, beginPkce, exchangeCode } from "/s/static/la
   var ENCODED_SEPARATOR = /%(?:2f|5c|00|3f|23)/i;
 
   function safeLanding(landing, sharePath) {
+    if (landing === sharePath) return true;      // a public link: the share path itself, which redirects to the entry
     return typeof landing === "string" && LANDING_PATH.test(landing) && landing.indexOf(sharePath) === 0
       && !DOT_SEGMENT.test(landing) && !ENCODED_SEPARATOR.test(landing);
   }
@@ -73,7 +76,10 @@ import { sessionStore, validConfig, beginPkce, exchangeCode } from "/s/static/la
     if (!got || !safeLanding(got.landing, sharePath)) {
       throw new Error("session");
     }
-    location.replace(got.landing);
+    // a public link returns to where the visitor was (kept in sessionStorage, validated on read); a lab session
+    // goes to its own landing
+    var back = got.landing === sharePath ? takeReturn(store()) : null;
+    location.replace(back && back.indexOf(sharePath) === 0 ? back : got.landing);
   }
 
   async function callback() {
@@ -95,10 +101,34 @@ import { sessionStore, validConfig, beginPkce, exchangeCode } from "/s/static/la
     await openShare(pending.share, tokens);
   }
 
+  // The sign-in step of a public link: the card, one button. The way back is remembered in sessionStorage only.
+  function signinCard(cfg, sharePath) {
+    var main = document.querySelector("main");
+    var info = null;
+    var data = document.getElementById("herdr-landing");
+    try { info = data ? JSON.parse(data.textContent) : null; } catch (e) { info = null; }
+    var go = function () {
+      rememberReturn(store(), sharePath);
+      signIn(cfg, sharePath).catch(fail);
+    };
+    var card = renderSigninCard(document, go);
+    if (main && main.parentNode) {
+      if (info) {
+        info.now = Date.now() / 1000;
+        info.signedIn = false;
+        var bar = renderLandingBar(document, info, go);
+        main.parentNode.insertBefore(bar, main);
+      }
+      main.parentNode.replaceChild(card, main);
+    }
+  }
+
   async function main() {
     if (!store() || !window.crypto || !crypto.subtle) throw new Error("unsupported");
     var path = location.pathname;
     if (path === "/s/callback") return callback();
+    var signin = SIGNIN_PATH.exec(path);
+    if (signin) return signinCard(await loadConfig(), signin[1]);
     if (SHARE_PATH.test(path)) return signIn(await loadConfig(), path);
     throw new Error("route");
   }

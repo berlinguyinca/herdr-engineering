@@ -118,6 +118,21 @@ export function createMemberApi({ sessions, refresh, onSignedOut, base = '', fet
   }
 
   const key = () => crypto.randomUUID();
+  const F = (id) => `/api/member/folders/${encodeURIComponent(id)}`;
+  const contentUrl = (id, path) => `${A(id)}/content/${String(path).split('/').map(encodeURIComponent).join('/')}`;
+  /** One library file as a Blob (the content route needs the member session header, so a plain link cannot carry it). */
+  async function fetchContent(id, path, { signal } = {}) {
+    const session = sessions.get();
+    if (!session) { onSignedOut?.(); throw new ApiError(401, 'unauthorized', 'sign in again'); }
+    const r = await fetchFn(base + contentUrl(id, path), { method: 'GET', headers: { Authorization: `Member ${session}` }, signal, cache: 'no-store', credentials: 'omit' });
+    if (r.status === 401) { onSignedOut?.(); throw new ApiError(401, 'unauthorized', 'sign in again'); }
+    if (!r.ok) {
+      let data = null;
+      try { data = await r.json(); } catch { /* not JSON */ }
+      throw new ApiError(r.status, data?.error, data?.message);
+    }
+    return { blob: await r.blob(), type: (r.headers.get('Content-Type') || '').split(';')[0].trim().toLowerCase() };
+  }
   const write = async (method, path, body, opts) => settle(await request(method, path, { body, ...opts }), opts);
 
   return {
@@ -133,6 +148,16 @@ export function createMemberApi({ sessions, refresh, onSignedOut, base = '', fet
     shareApprove: (id, sid, o) => write('POST', `${A(id)}/shares/${encodeURIComponent(sid)}/approve`, { confirm: true, idempotency_key: o?.idempotencyKey || key() }, o),
     shareRevoke: (id, sid, o) => write('POST', `${A(id)}/shares/${encodeURIComponent(sid)}/revoke`, undefined, o),
     shareEvents: (id, sid, o) => write('POST', `${A(id)}/shares/${encodeURIComponent(sid)}/events`, undefined, o),
+    // the library (Task 10)
+    library: (o) => request('GET', '/api/member/library', o),
+    createFolder: (name, o) => write('POST', '/api/member/folders', { name }, o),
+    renameFolder: (id, name, o) => write('PUT', F(id), { name }, o),
+    deleteFolder: (id, o) => write('DELETE', F(id), undefined, o),
+    fileItem: (folderId, artifactId, o) => write('POST', `${F(folderId)}/items`, { artifact_id: artifactId }, o),
+    unfileItem: (folderId, artifactId, o) => write('DELETE', `${F(folderId)}/items/${encodeURIComponent(artifactId)}`, undefined, o),
+    acceptPending: (id, o) => write('POST', `/api/member/pending/${encodeURIComponent(id)}/accept`, undefined, o),
+    discardPending: (id, o) => write('POST', `/api/member/pending/${encodeURIComponent(id)}/discard`, undefined, o),
+    contentUrl, fetchContent,
     // the uploader's client contract (member-upload.js)
     status: (id, body, o) => request('POST', `${A(id)}/uploads/status`, { body, signal: o?.signal, retry429: false }),
     putRun: (id, uploadId, firstIndex, bytes, meta) => request('PUT',

@@ -211,6 +211,10 @@ class _DaemonThreadingServer(ThreadingHTTPServer):
             self._request_slots.release()
 
 
+class _DaemonThreadingServerV6(_DaemonThreadingServer):
+    address_family = socket.AF_INET6
+
+
 
 def _dashboard_host_ok(host_header, extra_hosts):
     """A Host an attacker cannot make point here: an IP literal, localhost, or a configured name.
@@ -315,10 +319,12 @@ class ControlPlaneServer:
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None, build_cache=None,
                  memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
-                 share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None,
+                 share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None, library=None,
+                 library_viewers=None, member_directory=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
-                 assistant_workers=None, assistant_judge=None, member_web=None):
+                 assistant_workers=None, assistant_judge=None, assistant_slack=None, member_web=None,
+                 fabric_listen=None, fabric_bind_host=None, fabric_allow_any_host: bool = False):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -457,6 +463,13 @@ class ControlPlaneServer:
         self.share_settings = share_settings
         # Operator controls for member-owned artifacts (a SyncArtifactAdapter over MemberAdmin): absent -> 503.
         self.member_admin = member_admin
+        # Dashboard artifact library (a SyncArtifactAdapter over LibraryStore): absent -> the routes answer 503.
+        self.library = library
+        # ``control_plane.artifact_library.viewers``: {"key:<digest>": "<member id>"}.  A mapped key reads and writes that
+        # member's library (feed, folders, pending); everything else keeps its own key library.  ``member_directory``
+        # returns the member directory body (``{"group", "users": {...}}``) or None; default: the collab service's.
+        self.library_viewers = dict(library_viewers or {})
+        self.member_directory = member_directory
         # Owner annotation API (list/dismiss): a SyncArtifactAdapter over AnnotationStore, or the routes answer 503.
         self.annotation_store = annotation_store
         # Key digests allowed to delete/purge/restore artifacts (control_plane.artifact_delete.owner_key_digests).
@@ -522,6 +535,7 @@ class ControlPlaneServer:
         # The tailnet hub's WorkerRegistry (ONE instance, shared with the HubServer); None while the hub is off.
         # The owner routes /api/v1/assistant-workers read it at request time, so it may be attached after startup.
         self.assistant_workers = assistant_workers
+        self.assistant_slack = assistant_slack       # SlackRuntime | None; None: the status route reports it off
         self.assistant_judge = assistant_judge       # JudgeRuntime | None; None: the activation gate refuses
         # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
@@ -630,6 +644,27 @@ class ControlPlaneServer:
         if public_port is not None and collab is None:
             raise ValueError("a public collaboration listener needs collab enabled")
         self.collab_only = collab_only
+        # Fabric trust slice 6a: a dedicated listener on a TAILNET address that serves the collab API and nothing else and accepts
+        # only ``Authorization: Fabric``. Same process as the other handlers (the event log has one writer). ``fabric_bind_host``
+        # is what the process binds when it cannot own the tailnet address itself (inside a container whose published port lands
+        # here); ``fabric_allow_any_host`` is a test-only escape hatch and is never fed from configuration.
+        self.fabric_listen, self.fabric_bind_host = None, fabric_bind_host
+        if fabric_listen is not None:
+            from .collab_fabric_trust import validate_listen_host
+            if collab is None:
+                raise ValueError("a fabric listener needs collab enabled")
+            f_host, f_port = fabric_listen
+            if fabric_allow_any_host:
+                ipaddress.ip_address(f_host)
+            else:
+                f_host = validate_listen_host(f_host, "fabric listener host")
+            if isinstance(f_port, bool) or not isinstance(f_port, int) or not 0 <= f_port <= 65535:
+                raise ValueError("fabric listener port must be an integer 0-65535")
+            if fabric_bind_host is not None:
+                ipaddress.ip_address(fabric_bind_host)
+            self.fabric_listen = (f_host, f_port)
+        self.fabric_port = None
+        self._fabric_httpd = None
         if operator_port is not None and not (collab_only and operator_user and operator_hosts):
             raise ValueError("the operator listener needs collab-only mode, a user and allowed hosts")
         self.operator_port, self.operator_user = operator_port, operator_user
@@ -1703,6 +1738,20 @@ class ControlPlaneServer:
             self._serving_listeners.add(httpd)
         httpd.serve_forever()
 
+    def _start_fabric_listener(self):
+        """Bind the dedicated fabric listener when configured. A bind failure propagates: configured means required, and
+        ``serve`` tears everything down and re-raises it."""
+        if self.fabric_listen is None:
+            return
+        host, port = self.fabric_listen
+        bind = self.fabric_bind_host or host
+        self._fabric_httpd = (_DaemonThreadingServerV6 if ":" in bind else _DaemonThreadingServer)(
+            (bind, port), _make_handler(self, fabric=True),
+            request_workers=self.request_workers, request_queue=self.request_queue)
+        self.fabric_port = self._fabric_httpd.server_address[1]
+        self._start_background_thread(self._fabric_httpd.serve_forever)
+        self._serving_listeners.add(self._fabric_httpd)
+
     def _start_server(self):
         if self.collab_only:
             # No operator listener at all: this process serves the public collab surface only.
@@ -1715,6 +1764,7 @@ class ControlPlaneServer:
                 self.operator_port = self._operator_httpd.server_address[1]
                 self._start_background_thread(self._operator_httpd.serve_forever)
                 self._serving_listeners.add(self._operator_httpd)
+            self._start_fabric_listener()
             self._ready.set()
             return self._httpd
         self._httpd = _DaemonThreadingServer(
@@ -1727,6 +1777,7 @@ class ControlPlaneServer:
             self.public_port = self._public_httpd.server_address[1]
             self._start_background_thread(self._public_httpd.serve_forever)
             self._serving_listeners.add(self._public_httpd)
+        self._start_fabric_listener()
         if self.agent_summaries and self.agent_summaries.config.enabled:
             self.agent_summaries.start()
             self._summary_scanner = threading.Thread(target=self._summary_loop, daemon=True)
@@ -1861,7 +1912,7 @@ class ControlPlaneServer:
         self.github_monitor.close()
         if getattr(self, "work_graph", None) is not None:
             self.work_graph.close()
-        for attr in ("_operator_httpd", "_public_httpd", "_httpd"):
+        for attr in ("_operator_httpd", "_public_httpd", "_fabric_httpd", "_httpd"):
             listener = getattr(self, attr)
             if listener is not None:
                 # BaseServer.shutdown waits forever if serve_forever was never
@@ -1964,6 +2015,7 @@ _PUBLIC_STATIC = {
     "/collab-tabs.js": ("collab-tabs.js", "text/javascript"),
     "/collab-proposals.js": ("collab-proposals.js", "text/javascript"),
     "/collab-lineage.js": ("collab-lineage.js", "text/javascript"),
+    "/collab-fabric.js": ("collab-fabric.js", "text/javascript"),
     "/collab-attention.js": ("collab-attention.js", "text/javascript"),
     "/collab-mention.js": ("collab-mention.js", "text/javascript"),
     "/collab-context.js": ("collab-context.js", "text/javascript"),
@@ -1990,7 +2042,11 @@ _PUBLIC_CSP = ("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-
                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
-def _make_handler(server, public=False, operator=False):
+_FORWARDING_HEADERS = ("X-Forwarded-For", "Forwarded", "X-Real-IP", "X-Forwarded-Host", "X-Forwarded-Server",
+                       "Tailscale-User-Login", "Tailscale-User-Name", "Via")
+
+
+def _make_handler(server, public=False, operator=False, fabric=False):
     class _Handler(BaseHTTPRequestHandler):
         server_version = "HerdrControlPlane/0.1"
         protocol_version = "HTTP/1.1"
@@ -2219,6 +2275,36 @@ def _make_handler(server, public=False, operator=False):
 
         # ------------------------------------------------------------ routes
         # -------------------------------------------- public (collab-only) listener
+        def _fabric_hosts(self):
+            """Host header values the fabric listener answers to: ``<listen_host>:<port>`` (IPv6 bracketed), plus the bare
+            host only when the port is the scheme default (80), the one case a client omits it."""
+            host, _ = server.fabric_listen
+            port = server.fabric_port
+            name = f"[{host}]" if ":" in host else host
+            allowed = {f"{name}:{port}".lower()}
+            if port == 80:
+                allowed.add(name.lower())
+            return allowed
+
+        def _fabric_listener(self):
+            """The dedicated fabric listener (tailnet address, no proxy, no TLS): the collab API and nothing else, and ONLY
+            ``Authorization: Fabric``. Any other scheme (or none) is a 401 before the service sees it, so a Bearer token or an
+            agent credential presented here is never evaluated. Everything outside /api/v1/collab is the single 404."""
+            cl = self.headers.get_all("Content-Length") or []
+            if (len(cl) > 1 or "Transfer-Encoding" in self.headers
+                    or (self.command in ("GET", "DELETE") and cl and cl[0].strip() not in ("", "0"))):
+                return self._deny(400, "ambiguous request framing")
+            # DNS rebinding: a browser that resolved an attacker name to this address sends that name as Host. Only the
+            # address the listener is published on is accepted, and it is checked before routing or authentication.
+            if self.headers.get("Host", "").lower() not in self._fabric_hosts():
+                return self._deny(421, "misdirected request")
+            if not self._is_collab_path() or server.collab is None:
+                return self._deny(404, "not found")
+            scheme, _, rest = self.headers.get("Authorization", "").partition(" ")
+            if scheme != "Fabric" or not rest.strip():
+                return self._deny(401, "unauthorized")
+            return self._collab()
+
         def _public(self):
             """Everything not on the allow-list is a plain 404: the legacy API, the
             dashboard and its static files do not exist on this listener."""
@@ -2366,7 +2452,7 @@ def _make_handler(server, public=False, operator=False):
                     return self._deny(400, "ambiguous request framing")
                 try:
                     principal = server.collab.authenticate(
-                        self.headers.get("Authorization", ""), self.headers.get("X-Herdr-Device"))
+                        self.headers.get("Authorization", ""), self.headers.get("X-Herdr-Device"), **self._fabric_args())
                     big_tools = collab_mcp.admitted_tools(server.collab, principal) if principal.is_agent else frozenset()
                 except Exception:
                     big_tools = frozenset()
@@ -2387,7 +2473,7 @@ def _make_handler(server, public=False, operator=False):
                 extra = {} if principal is None else {"principal": principal}
                 status, payload = handle(
                     server.collab, message, self.headers.get("Authorization", ""),
-                    self.headers.get("X-Herdr-Device"), **extra)
+                    self.headers.get("X-Herdr-Device"), **extra, **self._fabric_args())
             except Exception:
                 return self._json({"jsonrpc": "2.0", "id": None,
                                    "error": {"code": -32603, "message": "internal error"}}, 500)
@@ -2470,6 +2556,8 @@ def _make_handler(server, public=False, operator=False):
             super().end_headers()
 
         def _do_GET(self):
+            if fabric:
+                return self._fabric_listener()
             if operator:
                 return self._operator()
             if public:
@@ -2516,6 +2604,8 @@ def _make_handler(server, public=False, operator=False):
             return self._timed_request(self._do_POST)
 
         def _do_POST(self):
+            if fabric:
+                return self._fabric_listener()
             if operator:
                 return self._operator()
             if public:
@@ -2554,7 +2644,7 @@ def _make_handler(server, public=False, operator=False):
             res = segs[3] if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
             if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers",
                                     "assistant-action-requests", "assistant-grants", "assistant-judges",
-                                    "assistant-team-briefs"}
+                                    "assistant-slack", "assistant-deploys", "assistant-team-briefs"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
                     or _TERMINAL_ATTACH.match(dpath) or _HOST_TERMINAL_OUT.match(dpath) or _STEER_ACK.match(dpath)
@@ -2655,7 +2745,7 @@ def _make_handler(server, public=False, operator=False):
             # 501, decided before any listener-specific handler (operator/public/federation/collab) sees the request.
             if public and server.member_web is not None and self.path.startswith("/api/member/"):
                 return self._timed_request(self._public)      # the member run upload (only on the member host)
-            if operator or public or not self.path.startswith("/api/v1/assistant-apps/"):
+            if operator or public or fabric or not self.path.startswith(("/api/v1/assistant-apps/", "/api/v1/library/")):
                 return self._timed_request(lambda: self._send_json(501, {"error": "not implemented"}))
             return self._timed_request(self._mutate_verb)
 
@@ -2665,9 +2755,12 @@ def _make_handler(server, public=False, operator=False):
                                         "assistant-delegations", "assistant-proposals",
                                         "assistant-notifications", "assistant-apps",
                                         "assistant-reminders", "assistant-workers",
-                                        "assistant-action-requests", "assistant-grants", "assistant-judges"}
+                                        "assistant-action-requests", "assistant-grants", "assistant-judges",
+                                        "assistant-slack", "assistant-deploys"}
 
         def _mutate_verb(self):
+            if fabric:
+                return self._fabric_listener()
             if operator:
                 return self._operator()
             if public:
@@ -2688,15 +2781,16 @@ def _make_handler(server, public=False, operator=False):
             segs = path.split("/")
             resource = unquote(segs[3]) if (len(segs) > 3 and segs[:3] == ["", "api", "v1"]
                                             and path.startswith("/api/v1/")) else ""
-            if resource not in self._ASSISTANT_MUTABLE_RESOURCES or (
-                    self.command == "PUT" and resource != "assistant-apps"):
+            if resource not in self._ASSISTANT_MUTABLE_RESOURCES | {"library"} or (
+                    self.command == "PUT" and resource not in {"assistant-apps", "library"}):
                 # preserve the pre-existing 501 for PATCH/DELETE elsewhere
                 return self._send_json(501, {"error": "not implemented"})
             err = self._require("operator")
             if err:
                 return err
             if resource in ("assistant-apps", "assistant-reminders", "assistant-workers",
-                            "assistant-action-requests", "assistant-grants", "assistant-judges"):
+                            "assistant-action-requests", "assistant-grants", "assistant-judges",
+                            "assistant-slack", "assistant-deploys"):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -3021,14 +3115,14 @@ def _make_handler(server, public=False, operator=False):
             is per-user / per-agent (collab.authenticate)."""
             service = server.collab
             if service is None:
-                if server.collab_operator_url and not operator and not public:
+                if server.collab_operator_url and not operator and not public and not fabric:
                     return self._collab_proxy()
                 return self._deny(404, "not found")
             if self._rate_limit(self._proxied_client()):
                 return None
             # On a shared plain-HTTP listener, refuse collaboration unless the request
             # came through the TLS-terminating proxy (`tailscale serve` sets this header).
-            if (server.collab_require_https and not operator
+            if (server.collab_require_https and not operator and not fabric
                     and self.headers.get("X-Forwarded-Proto", "").lower() != "https"):
                 return self._deny(400, "collaboration is only served over https")
             if self.command == "POST":
@@ -3062,7 +3156,8 @@ def _make_handler(server, public=False, operator=False):
                                           self.headers.get("Authorization", ""),
                                           self.headers.get("X-Herdr-Device"),
                                           operator=server.operator_user if operator else None,
-                                          client=self._proxied_client())
+                                          client=self._proxied_client(), fabric_listener=fabric,
+                                          **self._fabric_args())
             except Exception:
                 return self._json({"error": "internal error"}, 500)  # never echo internals
             if isinstance(result, tuple):
@@ -3099,10 +3194,23 @@ def _make_handler(server, public=False, operator=False):
                 frames.close()
             return None
 
+        def _fabric_args(self):
+            """What ``Authorization: Fabric`` may use to identify the caller: the REAL socket peer and the informational
+            machine header, nothing else. A request that carries any forwarding header was relayed by something, so the socket
+            peer is that relay and not the caller: no peer is offered and Fabric fails closed. (Behind `tailscale serve` the
+            peer is 127.0.0.1, which the service refuses on its own.) X-Forwarded-For is never read as an address."""
+            if public or operator:      # Fabric is for the main collab listener only: never the internet-facing or operator ones
+                return {}
+            relayed = any(h in self.headers for h in _FORWARDING_HEADERS)
+            return {"peer_ip": None if relayed else self.client_address[0],
+                    "machine": self.headers.get("X-Herdr-Machine")}
+
         def _proxied_client(self):
             """Behind `tailscale serve` every peer is 127.0.0.1; key the limiter on the
             forwarded address, but only trust it from a loopback peer (the proxy)."""
             peer = self.client_address[0]
+            if fabric:          # the dedicated listener has no proxy in front: a forwarded address is never believed
+                return peer
             fwd = self.headers.get("X-Forwarded-For", "").split(",")[-1].strip()
             # The public listener is reachable only from the host's own proxy (possibly
             # across the Docker bridge), so a private peer is trusted there too.
@@ -3153,6 +3261,9 @@ def _make_handler(server, public=False, operator=False):
             try:
                 from .artifact_members_api import route_members
                 if route_members(self, server, parts, resource):
+                    return None
+                from .artifact_library_api import route_library
+                if route_library(self, server, parts, resource):
                     return None
                 from .artifact_delete_api import route_delete
                 if route_delete(self, server, parts, resource):
@@ -4051,6 +4162,10 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_hub_owner(parts, resource)
             if resource == "assistant-judges":
                 return self._assistant_judges(parts)
+            if resource == "assistant-slack":
+                return self._assistant_slack(parts)
+            if resource == "assistant-deploys":
+                return self._assistant_deploys(parts)
             if resource in ("assistant-team-briefs", "assistant-references"):
                 return self._assistant_briefs(parts, resource, None)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types", "assistant-placement", "assistant-route",
@@ -4530,6 +4645,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_hub_owner(parts, resource, body)
             if resource == "assistant-judges":
                 return self._assistant_judges(parts, body)
+            if resource == "assistant-deploys":
+                return self._assistant_deploys(parts, body)
             if resource == "assistant-team-briefs":
                 return self._assistant_briefs(parts, resource, body)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
@@ -4915,6 +5032,125 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({"error": "body must be empty"}, 400)
                     return self._json(check_view(judge, fallback))
                 return self._json({"error": "not found"}, 404)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+
+        def _assistant_deploys(self, parts, body=None):
+            """Owner-only deploy permission per project and scope.
+
+            GET    /api/v1/assistant-deploys                              configured projects/scopes, live standing grants
+            POST   /api/v1/assistant-deploys/<project>/<scope>/auto       {"worker_id", "confirm": true}: ASKS in Slack
+            DELETE /api/v1/assistant-deploys/<project>/<scope>/auto?worker_id=...   revokes the standing grant
+
+            The POST only posts a confirmation to the owner's Slack; the standing grant is created by the owner's
+            verified Confirm tap and by nothing else.  No token, token path or secret is ever returned."""
+            from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant_hub.actiongrants import GrantState
+            from .assistant_hub.deploy import DeployMatch, scope_key
+            from .assistant_hub.policy import STANDING, current_judge_version, revoke_action_grant
+            from .assistant_hub.slack import SlackError
+            if self._require("operator"):
+                return None
+            try:
+                svc = server.assistant
+                svc._require_enabled()
+                tenant_id, user_id = self._assistant_scope()
+                svc.check_rate_limit(key=f"{tenant_id}:{user_id}")
+                projects = (svc.config.get("deploy") or {}).get("projects") or {}
+                policy, now = int(svc.config["grants"]["policy_version"]), svc.now()
+                version = current_judge_version(server.assistant_judge)
+
+                def standing(match):
+                    key_id = scope_key(match).key_id()
+                    return [g for g in svc.store.list_action_grants(tenant_id, user_id)
+                            if g.key_id == key_id and g.source == STANDING
+                            and g.effective_state(now, policy, version) is GrantState.ACTIVE]
+
+                if len(parts) == 4 and self.command == "GET":
+                    out = []
+                    for pid, proj in projects.items():
+                        scopes = []
+                        for sid, scope in proj["scopes"].items():
+                            workers = sorted({g.worker_id for g in standing(DeployMatch(pid, sid, proj["repo"], "", ""))})
+                            scopes.append({"scope": sid, "mode": scope["mode"], "command": scope["command"],
+                                           "require": list(scope["require"]), "standing_grant": bool(workers),
+                                           "workers": workers})
+                        out.append({"project": pid, "repo": proj["repo"], "scopes": scopes})
+                    return self._json({"projects": out})
+                if len(parts) != 7 or parts[6] != "auto" or self.command not in ("POST", "DELETE"):
+                    return self._json({"error": "not found"}, 404)
+                proj = projects.get(parts[4])
+                if proj is None or parts[5] not in proj["scopes"]:
+                    return self._json({"error": "not found"}, 404)
+                project, scope = parts[4], parts[5]
+                if self.command == "POST" and proj["scopes"][scope]["mode"] != "auto":
+                    return self._json({"error": "this scope is not set to mode: auto in the config, so auto-deploy "
+                                                "cannot be confirmed", "code": "mode_not_auto"}, 409)
+
+                def active_worker(worker_id):
+                    w = svc.store.workers.get(worker_id) if isinstance(worker_id, str) else None
+                    return (w is not None and w.status == "active"
+                            and (w.tenant_id, w.user_id) == (tenant_id, user_id))
+
+                runtime = server.assistant_slack
+                if self.command == "POST":
+                    if (not isinstance(body, dict) or set(body) != {"worker_id", "confirm"} or body["confirm"] is not True
+                            or not isinstance(body["worker_id"], str)
+                            or not re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", body["worker_id"])):
+                        return self._json({"error": 'body must be exactly {"worker_id": "...", "confirm": true}'}, 400)
+                    if not active_worker(body["worker_id"]):
+                        return self._json({"error": "not found"}, 404)
+                    if runtime is None or not runtime.is_enabled():
+                        return self._json({"error": "Slack is not enabled, so the confirmation cannot be asked",
+                                           "code": "unavailable"}, 503)
+                    try:
+                        ask = runtime.ask_deploy_auto(tenant_id, user_id, project, scope, body["worker_id"])
+                    except SlackError as exc:
+                        return self._json({"error": "the confirmation could not be posted to Slack",
+                                           "code": exc.code}, 502)
+                    return self._json({"status": "awaiting_confirmation", "ask_id": ask.ask_id,
+                                       "expires_at": self._iso(ask.expires_at)}, 202)
+                from urllib.parse import parse_qs, urlsplit
+                worker_id = _q(self.path, "worker_id")
+                if (set(parse_qs(urlsplit(self.path).query)) != {"worker_id"} or not worker_id
+                        or not re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", worker_id)):
+                    return self._json({"error": "exactly one query parameter, worker_id, is required"}, 400)
+                if runtime is not None:
+                    runtime.retire_deploy_asks(tenant_id, user_id, project, scope, worker_id)
+                live = [g for g in standing(DeployMatch(project, scope, proj["repo"], "", "")) if g.worker_id == worker_id]
+                if not live:
+                    return self._json({"error": "no standing grant"}, 404)
+                for g in live:
+                    revoke_action_grant(svc.store, now, tenant_id, user_id, g.grant_id, revoked_by=user_id,
+                                        policy_version=policy, judge_version=version)
+                return self._json({"revoked": len(live)})
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+
+        def _assistant_slack(self, parts):
+            """Owner-only Slack front door status: whether it is on and connected, when it last heard from Slack and
+            how many asks are open.  Read-only; no token, token path or message text ever leaves here."""
+            from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
+            if self._require("operator"):
+                return None
+            try:
+                server.assistant._require_enabled()
+                tenant_id, user_id = self._assistant_scope()
+                server.assistant.check_rate_limit(key=f"{tenant_id}:{user_id}")
+                if len(parts) != 4 or self.command != "GET":
+                    return self._json({"error": "not found"}, 404)
+                runtime = server.assistant_slack
+                if runtime is None:
+                    return self._json({"enabled": False, "connected": False, "last_event_at": None, "open_asks": 0})
+                return self._json(runtime.status(tenant_id, user_id))
             except AssistantUnavailable as exc:
                 return self._json({"error": str(exc), "code": "unavailable"}, 503)
             except RateLimited as exc:

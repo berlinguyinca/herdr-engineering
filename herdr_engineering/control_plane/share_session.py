@@ -22,6 +22,11 @@ import re
 
 _VERSION = b"herdr-share-session-v5"
 _KEY_LABEL = b"herdr-share-session-aead-key-v5"
+_DOMAIN = _VERSION                    # the lab-session domain (the default)
+CLAIM_DOMAIN = b"herdr-claim-v1"      # the public link's verified-visitor cookie: never valid as a lab session, nor back
+LAB_DOMAIN = _DOMAIN
+_CLAIM_KEY_LABEL = b"herdr-claim-aead-key-v1"
+_KEY_LABELS = {LAB_DOMAIN: _KEY_LABEL, CLAIM_DOMAIN: _CLAIM_KEY_LABEL}   # each domain has its own derived key
 BASES = ("e", "g")
 _CSRF_DOMAIN = b"herdr-annotate-csrf-v1"
 MIN_SECRET_BYTES = 32
@@ -49,21 +54,24 @@ def _field(value: str) -> bytes:
     return len(raw).to_bytes(4, "big") + raw
 
 
-def _aead(secret: bytes):
+def _aead(secret: bytes, domain: bytes = _DOMAIN):
     """The session cipher. ``cryptography`` is imported here, not at module level, so this module (``MIN_SECRET_BYTES``,
     the CSRF and cookie helpers) and everything that imports it load on a host without the package."""
     try:
         from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
     except ImportError as exc:
         raise RuntimeError("lab-share sessions need the 'cryptography' package (pip install 'herdr-engineering[share]')") from exc
-    return ChaCha20Poly1305(hmac.new(secret, _KEY_LABEL, hashlib.sha256).digest())
+    return ChaCha20Poly1305(hmac.new(secret, _KEY_LABELS[domain], hashlib.sha256).digest())
 
 
-def _ad(share_id: str, basis: str, exp: int) -> bytes:
-    return _VERSION + b"\x00" + _field(share_id) + _field(basis) + _field(str(exp))
+def _ad(share_id: str, basis: str, exp: int, domain: bytes = _DOMAIN) -> bytes:
+    """Associated data. For the lab domain this is exactly the version label; the claim domain has its own label AND its own
+    key, so a claim cookie never decrypts as a lab session and a lab session never as a claim cookie."""
+    return domain + b"\x00" + _field(share_id) + _field(basis) + _field(str(exp))
 
 
-def mint_session(secret: bytes, share_id: str, identity: str, exp: float, *, email: str, basis: str) -> str:
+def mint_session(secret: bytes, share_id: str, identity: str, exp: float, *, email: str, basis: str,
+                 domain: bytes = _DOMAIN) -> str:
     """The session for ``identity`` on ``share_id`` valid until ``exp`` (epoch seconds, floored). Raises ValueError."""
     if not isinstance(secret, bytes) or len(secret) < MIN_SECRET_BYTES:
         raise ValueError("signing secret is missing or too short")
@@ -75,6 +83,8 @@ def mint_session(secret: bytes, share_id: str, identity: str, exp: float, *, ema
         raise ValueError("bad email")
     if basis not in BASES:
         raise ValueError("bad basis")
+    if domain not in (LAB_DOMAIN, CLAIM_DOMAIN):
+        raise ValueError("bad domain")
     if not isinstance(exp, (int, float)) or isinstance(exp, bool) or not math.isfinite(exp) or exp < 1:
         raise ValueError("bad expiry")
     exp_int = int(math.floor(exp))
@@ -84,12 +94,12 @@ def mint_session(secret: bytes, share_id: str, identity: str, exp: float, *, ema
     plain = (bytes([len(ident)]) + ident.ljust(MAX_IDENTITY, b"\x00")
              + bytes([len(mail)]) + mail.ljust(MAX_EMAIL, b"\x00"))
     nonce = os.urandom(_NONCE)
-    blob = nonce + _aead(secret).encrypt(nonce, plain, _ad(share_id, basis, exp_int))
+    blob = nonce + _aead(secret, domain).encrypt(nonce, plain, _ad(share_id, basis, exp_int, domain))
     return f"{basis}.{exp_int}.{_b64(blob)}"
 
 
-def check_session(secret: bytes, share_id: str, session: str, now: float) -> dict | None:
-    """``{"identity", "exp", "email", "basis"}`` when ``session`` was minted with ``secret`` for ``share_id`` and ``now < exp``; else None.
+def check_session(secret: bytes, share_id: str, session: str, now: float, domain: bytes = _DOMAIN) -> dict | None:
+    """``{"identity", "exp", "email", "basis"}`` when ``session`` was minted with ``secret`` for ``share_id`` in ``domain`` and ``now < exp``; else None.
 
     Never raises, and every failure is the same None: the tag is checked before anything inside is parsed.
     """
@@ -108,9 +118,9 @@ def check_session(secret: bytes, share_id: str, session: str, now: float) -> dic
         if _b64(blob) != blob_part:
             return None      # one canonical encoding only
         exp = int(exp_part)
-        cipher = _aead(secret)          # a missing package raises RuntimeError: caught below, so every check fails closed
+        cipher = _aead(secret, domain)          # a missing package raises RuntimeError: caught below, so every check fails closed
         try:
-            plain = cipher.decrypt(blob[:_NONCE], blob[_NONCE:], _ad(share_id, basis, exp))
+            plain = cipher.decrypt(blob[:_NONCE], blob[_NONCE:], _ad(share_id, basis, exp, domain))
         except Exception:               # noqa: BLE001 - InvalidTag, or any malformed input: one uniform answer
             return None
         n = plain[0]

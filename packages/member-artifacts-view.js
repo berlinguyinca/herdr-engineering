@@ -2,6 +2,8 @@
 // Every value that came from the API or from a file name goes through esc(); nothing here touches the DOM.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 
+export { esc };
+
 const KIB = 1024;
 const MIB = KIB * 1024;
 const GIB = MIB * 1024;
@@ -197,7 +199,7 @@ export function renderDeleteDialog(title) {
 export function renderNav(route, signedIn) {
   if (!signedIn) return '';
   const tab = (href, label, key) => `<a href="${href}" class="tab"${route === key ? ' aria-current="page"' : ''}>${esc(label)}</a>`;
-  return `${tab('#/', 'My artifacts', 'mine')}${tab('#/shared', 'Shared with me', 'shared')}${tab('#/links', 'My links', 'links')}${tab('#/usage', 'Usage', 'usage')}`;
+  return `${tab('#/', 'Library', 'library')}${tab('#/mine', 'My artifacts', 'mine')}${tab('#/shared', 'Shared with me', 'shared')}${tab('#/links', 'My links', 'links')}${tab('#/usage', 'Usage', 'usage')}`;
 }
 
 export function renderError(message) {
@@ -246,4 +248,123 @@ export function renderUploadPicker() {
 
 export function renderDeleteButton() {
   return '<button type="button" class="btn btn-danger" data-action="delete">Delete artifact</button>';
+}
+
+// ------------------------------------------------------------------------------------------------ the library (Task 10)
+const DEFAULT_SOURCES = ['mine', 'assigned', 'opened'];
+const SOURCE_BADGE = { mine: ['mine', 'Mine'], assigned: ['assigned', 'Assigned'], opened: ['opened', 'Opened via link'], pending: ['pending', 'Pending'] };
+const GONE = { expired: 'Expired', revoked: 'Revoked' };
+const CHIPS = [['all', 'All'], ['assigned', 'Assigned to me'], ['opened', 'Opened via link'], ['mine', 'Mine']];
+const time = (iso) => { const t = Date.parse(iso); return Number.isNaN(t) ? 0 : t; };
+const readable = (row) => row.status !== 'expired' && row.status !== 'revoked';
+
+/** Client-side twin of the server feed filter (the view is capped at 2000 items): same rules, newest first. */
+export function filterFeed(items, { q, sources, folderId, type, since, until, folders } = {}) {
+  const wanted = new Set(Array.isArray(sources) && sources.length ? sources : DEFAULT_SOURCES);
+  const needle = String(q || '').trim().toLowerCase();
+  const names = new Map(list(folders).map((f) => [f.folder_id, String(f.name || '').toLowerCase()]));
+  const from = since ? time(since) : null;
+  const to = until ? time(until) : null;
+  const has = (value) => String(value ?? '').toLowerCase().includes(needle);
+  return list(items).filter((row) => {
+    if (!wanted.has(row.source)) return false;
+    if (folderId && !(row.folder_ids || []).includes(folderId)) return false;
+    if (type && String(row.artifact_type || '').toLowerCase() !== String(type).toLowerCase()) return false;
+    const at = time(row.shared_at);
+    if (from !== null && at < from) return false;
+    if (to !== null && at >= to) return false;
+    if (!needle) return true;
+    return has(row.title) || has(row.sharer) || has(row.artifact_type)
+      || (readable(row) && list(row.files).some((f) => has(f.path)))
+      || (row.folder_ids || []).some((id) => (names.get(id) || '').includes(needle));
+  }).sort((a, b) => time(b.shared_at) - time(a.shared_at) || String(a.artifact_id).localeCompare(String(b.artifact_id)));
+}
+
+/** The file a row opens: index.html when there is one, else the first file. */
+export function chooseEntry(row) {
+  const files = list(row?.files).filter((f) => typeof f.path === 'string');
+  return files.find((f) => f.path === 'index.html') || files[0] || null;
+}
+
+const INLINE_TYPES = new Set(['text/plain', 'application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+/** 'inline' only for the types the server itself serves inline (member_web _INLINE_TYPES); everything else is saved, never rendered. */
+export function contentMode(type) {
+  const base = String(type || '').split(';', 1)[0].trim().toLowerCase();
+  return INLINE_TYPES.has(base) ? 'inline' : 'download';
+}
+
+/** The worker answers a refusal with HTTP 200 {result: 'rejected', reason}; this is the message, or null when it was not refused. */
+export function rejectionText(out) {
+  if (!out || out.result !== 'rejected') return null;
+  if (typeof out.message === 'string' && out.message) return out.message;      // a cap explains itself
+  return out.reason ? `Refused: ${out.reason}` : 'Refused.';
+}
+
+/** `href(row)` (optional) makes the title a plain link instead of an open button: the dashboard opens its own detail page. */
+export function renderFeedRow(row, { folders = [], activeFolder = null, href = null } = {}) {
+  const [badgeKey, badgeText] = SOURCE_BADGE[row.source] || ['opened', row.source || 'Unknown'];
+  const gone = GONE[row.status];
+  const when = formatDate(row.shared_at);
+  const sharer = `<span data-sharer>${esc(row.sharer || 'unknown')}</span>`;
+  const badge = `<span class="badge badge-${badgeKey}">${esc(badgeText)}</span>`;
+  if (gone) {
+    return `<li class="row row-muted row-expired" data-feed-row="${esc(row.artifact_id)}" data-status="${esc(row.status)}">
+<span class="row-title">${esc(row.title || row.artifact_id)}</span>
+<span class="row-meta"><span class="badge badge-${row.status === 'expired' ? 'expired' : 'revoked'}">${esc(gone)}</span> ${sharer} <span data-date>${esc(when)}</span></span>
+</li>`;
+  }
+  const entry = chooseEntry(row);
+  const title = esc(row.title || row.artifact_id);
+  const target = href ? href(row) : null;
+  const open = target
+    ? `<a class="row-title row-open" data-action="open" data-artifact="${esc(row.artifact_id)}" href="${esc(target)}">${title}</a>`
+    : entry
+    ? `<button type="button" class="row-title row-open" data-action="open" data-artifact="${esc(row.artifact_id)}" data-path="${esc(entry.path)}">${title}</button>`
+    : `<span class="row-title">${title}</span>`;
+  const expiry = row.source === 'opened' && row.expires_at ? ` <span data-expiry>Expires ${esc(formatDate(row.expires_at))}</span>` : '';
+  const id = esc(row.artifact_id);
+  const pending = row.source === 'pending' || row.status === 'pending'
+    ? `<span class="row-actions"><button type="button" class="btn btn-primary" data-action="accept" data-artifact="${id}">Accept</button>
+<button type="button" class="btn" data-action="discard" data-artifact="${id}">Discard</button></span>`
+    : '';
+  const choices = list(folders).filter((f) => !(row.folder_ids || []).includes(f.folder_id));
+  const file = choices.length && !pending
+    ? `<select data-action="file" data-artifact="${id}" aria-label="File ${title} in a folder"><option value="">File in folder</option>${choices.map((f) => `<option value="${esc(f.folder_id)}">${esc(f.name)}</option>`).join('')}</select>`
+    : '';
+  const unfile = activeFolder && (row.folder_ids || []).includes(activeFolder)
+    ? `<button type="button" class="btn" data-action="unfile" data-artifact="${id}" data-folder="${esc(activeFolder)}">Remove from folder</button>`
+    : '';
+  return `<li class="row" data-feed-row="${id}" data-source="${esc(row.source)}">
+${open}
+<span class="row-meta">${badge} ${sharer} <span data-date>${esc(when)}</span>${expiry}</span>
+${pending}${file}${unfile}
+</li>`;
+}
+
+export function renderFeedList(items, opts = {}) {
+  const rows = list(items);
+  if (!rows.length) return '<p class="empty" data-empty>Nothing here yet</p>';
+  return `<ul class="rows" data-feed>${rows.map((r) => renderFeedRow(r, opts)).join('')}</ul>`;
+}
+
+export function renderChips(counts = {}, active = 'all') {
+  const chips = [...CHIPS, ...(Number(counts.pending) > 0 ? [['pending', 'Pending']] : [])];
+  const current = chips.some(([key]) => key === active) ? active : 'all';
+  return `<div class="chips" role="group" aria-label="Filter">${chips.map(([key, label]) => {
+    const n = counts[key];
+    return `<button type="button" class="chip" data-chip="${key}" aria-pressed="${key === current}">${esc(label)}${n === undefined ? '' : ` <span class="chip-count">${esc(n)}</span>`}</button>`;
+  }).join('')}</div>`;
+}
+
+/** `allHref` / `folderHref(id)` (optional) point the folder links at another router (the dashboard's `#/library`). */
+export function renderFolderSidebar(folders, activeId = null, { allHref = '#/', folderHref = (id) => `#/f/${encodeURIComponent(id)}` } = {}) {
+  const rows = list(folders);
+  const active = rows.find((f) => f.folder_id === activeId);
+  return `<aside class="folders" aria-label="Folders">
+<h3>Folders</h3>
+<ul class="folder-list"><li><a class="tab" href="${esc(allHref)}"${activeId ? '' : ' aria-current="page"'}>All items</a></li>${rows.map((f) => `<li><a class="tab" href="${esc(folderHref(f.folder_id))}"${f.folder_id === activeId ? ' aria-current="page"' : ''}>${esc(f.name)}${f.item_count === undefined ? '' : ` <span class="row-meta">${esc(f.item_count)}</span>`}</a></li>`).join('')}</ul>
+<form data-folder-form><label>New folder <input name="name" required maxlength="80" autocomplete="off"></label><button type="submit" class="btn">Create folder</button></form>
+${active ? `<div class="folder-manage"><button type="button" class="btn" data-action="rename-folder" data-folder="${esc(active.folder_id)}">Rename</button>
+<button type="button" class="btn btn-danger" data-action="delete-folder" data-folder="${esc(active.folder_id)}">Delete folder</button></div>` : ''}
+</aside>`;
 }
