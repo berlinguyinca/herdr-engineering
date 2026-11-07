@@ -21,6 +21,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -73,25 +74,47 @@ class ControlPlaneClient:
         self._call("/api/v1/token-usage", {"records": records})
 
 
+def _permanent(exc: BaseException) -> bool:
+    """A 4xx answer (bad record, project required) will never succeed on retry; 408/429 are transient."""
+    return (isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500
+            and exc.code not in (408, 429))
+
+
 class ReportQueue:
     """Usage records leave the request thread: ``submit`` never blocks, one daemon thread delivers (``attempts`` tries,
     ``retry_delay`` apart), and a full queue drops the newest record with a count rather than stalling a request. A slow
     or briefly unreachable control plane used to cost every request up to the client timeout
-    ('token report failed: timed out')."""
+    ('token report failed: timed out').
+
+    Retries may resend a record the control plane already processed (a client timeout does not mean the POST failed),
+    so every record carries a ``request_id`` and the control plane dedupes on it. Permanent 4xx answers are not
+    retried."""
 
     def __init__(self, control, maxsize: int = 1000, attempts: int = 3, retry_delay: float = 1.0):
         self._control, self._attempts, self._retry_delay = control, attempts, retry_delay
         self._q: queue.Queue = queue.Queue(maxsize)
-        self.dropped = 0
+        self._dropped = 0
+        self._dropped_lock = threading.Lock()
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="llm-proxy-report", daemon=True)
         self._thread.start()
+
+    @property
+    def dropped(self) -> int:
+        with self._dropped_lock:
+            return self._dropped
+
+    def _drop(self, why: str) -> None:
+        with self._dropped_lock:
+            self._dropped += 1
+            total = self._dropped
+        log.warning("token report dropped: %s (%d dropped so far)", why, total)
 
     def submit(self, record: dict) -> None:
         try:
             self._q.put_nowait(record)
         except queue.Full:
-            self.dropped += 1
-            log.warning("token report dropped: queue full (%d dropped so far)", self.dropped)
+            self._drop("queue full")
 
     def flush(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -102,26 +125,42 @@ class ReportQueue:
         return True
 
     def close(self) -> None:
-        self._q.put(None)
+        """Stop the delivery thread once the queue drains; never blocks, even when the queue is full."""
+        self._stop.set()
+        try:
+            self._q.put_nowait(None)
+        except queue.Full:
+            pass                      # the thread also exits when it sees _stop on an empty queue
 
     def _run(self) -> None:
         while True:
-            record = self._q.get()
+            try:
+                record = self._q.get(timeout=0.2)
+            except queue.Empty:
+                if self._stop.is_set():
+                    return
+                continue
             if record is None:
                 self._q.task_done()
                 return
             try:
-                for attempt in range(1, self._attempts + 1):
-                    try:
-                        self._control.report(record)
-                        break
-                    except Exception as exc:  # accounting must never fail anything
-                        if attempt == self._attempts:
-                            log.warning("token report failed after %d attempts: %s", attempt, exc)
-                        else:
-                            time.sleep(self._retry_delay)
+                self._deliver(record)
             finally:
                 self._q.task_done()
+
+    def _deliver(self, record: dict) -> None:
+        for attempt in range(1, self._attempts + 1):
+            try:
+                self._control.report(record)
+                return
+            except Exception as exc:  # accounting must never fail anything
+                if _permanent(exc):
+                    self._drop(f"rejected by control plane: {exc}")
+                    return
+                if attempt == self._attempts:
+                    self._drop(f"failed after {attempt} attempts: {exc}")
+                else:
+                    time.sleep(self._retry_delay)
 
 
 class ProxyState:
@@ -662,7 +701,7 @@ def make_handler(state: ProxyState):
             """Send one schema-2 usage record: metadata only, never request or response text."""
             usage = meta["usage"]
             status, error_class = meta["status"], meta["error_class"]
-            record = {"schema": 2, "source": "llm-proxy", "project": key["project"],
+            record = {"schema": 2, "source": "llm-proxy", "request_id": uuid.uuid4().hex, "project": key["project"],
                       "key_id": key["key_id"], "model": meta["model"] or "unknown",
                       **{k: meta[k] for k in ("upstream_model", "session_id", "agent_id", "route",
                                               "fallback", "stream", "status", "error_class",
@@ -692,3 +731,27 @@ def serve(host: str, port: int, control_url: str, upstream: str, upstream_key: s
     httpd = ThreadingHTTPServer((host, port), make_handler(state))
     httpd.daemon_threads = True
     return httpd
+
+
+def run_until_stopped(httpd, flush_seconds: float = 5.0) -> None:
+    """Serve until Ctrl-C or SIGTERM, then flush queued usage reports (so a restart does not lose them) and close."""
+    import signal
+
+    def _terminate(_signum, _frame):
+        # shutdown() waits for serve_forever to return, so it cannot run on the thread that is serving.
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _terminate)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        reports = getattr(getattr(getattr(httpd, "RequestHandlerClass", None), "state", None), "reports", None)
+        if reports is not None:
+            reports.flush(flush_seconds)
+            reports.close()
+        close = getattr(httpd, "server_close", None)
+        if close:
+            close()

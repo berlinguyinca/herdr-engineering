@@ -268,3 +268,20 @@ def test_accounts_added_after_start_are_found_through_the_same_lookup(make_serve
     svr.rakazo._by_id[late.account_id] = late                     # added like a Cognito account: not in .accounts
     svr.rakazo._by_principal[late.principal_id] = late
     assert late.account_id in {a.account_id for a in svr.rakazo._operator_accounts()}
+
+
+def test_error_detail_redacts_truncated_and_complete_tokens():
+    import io
+    import json as _json
+    import urllib.error
+
+    from herdr_engineering.control_plane.rakazo_push import _error_detail
+
+    def detail(message):
+        body = _json.dumps({"errors": [{"code": "BAD", "message": message}]}).encode()
+        return _error_detail(urllib.error.HTTPError("u", 400, "bad", {}, io.BytesIO(body)))
+
+    assert "secret" not in detail("bad ExponentPushToken[secret123] here")
+    assert "secret" not in detail("truncated ExpoPushToken[secret123")          # no closing bracket
+    assert "secret" not in detail("ExpoPushToken[secret123 and more text")
+    assert "more text" in detail("ExpoPushToken[secret123 and more text")

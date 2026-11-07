@@ -3154,6 +3154,10 @@ class ControlPlaneRepo:
                   "mission_id": _usage_id(row.get("mission_id")),
                   "key_id": _usage_str(row.get("key_id"), 128),
                   "duration_ms": _usage_int(row.get("duration_ms"))}
+        # Idempotent on request_id: the proxy retries a POST whose reply it never saw, and the first
+        # attempt may have been recorded. ``_token_usage`` is rebuilt from events, so this survives restarts.
+        if common["request_id"] and common["request_id"] in self._token_usage:
+            return self._token_usage[common["request_id"]]
         tokens = [_usage_int(row.get(k)) for k in _TOKEN_FIELDS]
         source = (row.get("source") if row.get("source") in ("llm-proxy", "transcript", "llm-gateway")
                   else "llm-proxy")
