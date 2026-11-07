@@ -67,6 +67,17 @@ class Host:
         finally:
             conn.close()
 
+    def raw_header_names(self, path):
+        """Every header name as sent, duplicates kept (``get`` folds them into a dict)."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        try:
+            conn.request("GET", path)
+            response = conn.getresponse()
+            response.read()
+            return [k.lower() for k, _ in response.getheaders()]
+        finally:
+            conn.close()
+
     def close(self):
         self.server.shutdown()
         self.server.server_close()
@@ -123,6 +134,16 @@ def test_approver_sees_the_author_page_in_the_plan(world):
     status, body = request(base, f"{SHARES}/{made['share']['share_id']}")
     shown = json.loads(body)["summary"]
     assert shown["author_html"] is True and "author-page.html" in [f["name"] for f in shown["files"]]
+
+
+def test_every_share_response_sends_each_security_header_once(world):
+    _, _, _, _, _, host = world
+    _, _, token = shared(world, flag=True)
+    for name in ("author-page.html", "preview.html"):
+        names = host.raw_header_names(f"/s/{token}/f/{name}")
+        assert names.count("referrer-policy") == 1, (name, names)
+        for single in ("content-security-policy", "x-content-type-options", "cache-control"):
+            assert names.count(single) <= 1, (name, single, names)
 
 
 def test_opt_in_serves_hostile_html_verbatim_under_the_dashboard_sandbox_headers(world):
