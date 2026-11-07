@@ -13,6 +13,7 @@ use belong to the Slurm project.
 """
 from __future__ import annotations
 
+import heapq
 import logging
 import math
 import re
@@ -62,14 +63,29 @@ def valid_project(value) -> str:
     return _token("project", value, _PROJECT, 128)
 
 
+#: The ONE accepted timestamp form: extended calendar date and time in UTC, ``Z`` or ``+00:00``, optional fraction.
+#: ``datetime.fromisoformat`` alone also takes week dates, ordinal dates, the basic format and a space separator, which
+#: Postgres then refuses (a 503 for a bad value); those are a 400 here.
+_TIMESTAMP = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,6})?(Z|\+00:00)")
+MIN_YEAR, MAX_YEAR = 2000, 2999
+
+
 def _utc(name: str, value) -> datetime:
-    try:
-        parsed = datetime.fromisoformat(value) if isinstance(value, str) and len(value) <= 40 else None
-    except ValueError:
-        parsed = None
-    if parsed is None or parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
-        raise _bad(f"{name} must be an ISO-8601 UTC timestamp")
+    match = _TIMESTAMP.fullmatch(value) if isinstance(value, str) else None
+    parsed = None
+    if match and MIN_YEAR <= int(match.group(1)) <= MAX_YEAR:
+        try:
+            parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+        except ValueError:
+            parsed = None   # e.g. 2026-02-30, 24:00:00, 23:59:60
+    if parsed is None:
+        raise _bad(f"{name} must be a UTC timestamp like 2026-11-04T10:00:00Z (years {MIN_YEAR}-{MAX_YEAR})")
     return parsed
+
+
+def canonical_time(parsed: datetime) -> str:
+    """The stored form: always ``+00:00``, microseconds only when present."""
+    return parsed.astimezone(UTC).isoformat()
 
 
 def _bytes(name: str, value, nullable: bool = False):
@@ -81,8 +97,9 @@ def _bytes(name: str, value, nullable: bool = False):
 
 
 def _seconds(name: str, value) -> float:
-    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
-            or not 0 <= value <= MAX_CPU_SECONDS):
+    # The range is compared on the value as sent (an int far beyond float range would overflow ``float()`` and
+    # ``math.isfinite``); NaN fails every comparison, so it is out of range too.
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= MAX_CPU_SECONDS:
         raise _bad(f"{name} must be a finite non-negative number of at most {MAX_CPU_SECONDS:.0f}")
     return float(value)
 
@@ -118,8 +135,8 @@ def validate_resource_run(entity_id, event_type, payload, *, now: datetime | Non
         "agent_kind": _token("agent_kind", payload["agent_kind"], _AGENT_KIND, 32),
         "session_id": session_id,
         "host": _token("host", payload["host"], _HOST, 64),
-        "started_at": payload["started_at"],
-        "ended_at": payload["ended_at"],
+        "started_at": canonical_time(started),
+        "ended_at": canonical_time(ended),
         "peak_memory_bytes": _bytes("peak_memory_bytes", payload["peak_memory_bytes"]),
         "cpu_seconds": _seconds("cpu_seconds", payload["cpu_seconds"]),
         "disk_growth_bytes": _bytes("disk_growth_bytes", payload["disk_growth_bytes"], nullable=True),
@@ -172,33 +189,39 @@ class MemoryResourceRuns:
 
     def __init__(self, max_runs: int = MAX_MEMORY_RUNS):
         self._rows: dict[tuple[str, str], dict] = {}
+        self._ended: dict[tuple[str, str], datetime] = {}
+        self._heap: list[tuple[datetime, tuple[str, str]]] = []   # oldest ended_at first, for eviction
         self._max = max_runs
         self._lock = threading.Lock()
 
     def record(self, run: dict) -> bool:
         key = (run["host"], run["session_id"])
+        ended = _utc("ended_at", run["ended_at"])
         with self._lock:
             if key in self._rows:
                 return False
-            self._rows[key] = dict(run)
+            self._rows[key], self._ended[key] = dict(run), ended
+            heapq.heappush(self._heap, (ended, key))
             while len(self._rows) > self._max:
-                oldest = min(self._rows, key=lambda k: _utc("ended_at", self._rows[k]["ended_at"]))
-                del self._rows[oldest]
+                _, oldest = heapq.heappop(self._heap)
+                del self._rows[oldest], self._ended[oldest]
         return True
 
     def profiles(self, project: str) -> dict:
+        """The same window as ``_WINDOW``: the newest runs per kind (ties by session id), the first kinds by name."""
         with self._lock:
-            runs = [r for r in self._rows.values() if r["project"] == project]
-        runs.sort(key=lambda r: _utc("ended_at", r["ended_at"]), reverse=True)
+            runs = [(self._ended[k], r) for k, r in self._rows.items() if r["project"] == project]
+        kinds = set(sorted({r["agent_kind"] for _, r in runs})[:MAX_AGENT_KINDS])
+        runs.sort(key=lambda item: item[1]["session_id"])
+        runs.sort(key=lambda item: item[0], reverse=True)
         per_kind: dict[str, int] = {}
         rows = []
-        for r in runs:
-            if per_kind.get(r["agent_kind"], 0) >= PROFILE_WINDOW:
+        for _, r in runs:
+            kind = r["agent_kind"]
+            if kind not in kinds or per_kind.get(kind, 0) >= PROFILE_WINDOW:
                 continue
-            if r["agent_kind"] not in per_kind and len(per_kind) >= MAX_AGENT_KINDS:
-                continue
-            per_kind[r["agent_kind"]] = per_kind.get(r["agent_kind"], 0) + 1
-            rows.append((r["agent_kind"], *(r[m] for m in METRICS)))
+            per_kind[kind] = per_kind.get(kind, 0) + 1
+            rows.append((kind, *(r[m] for m in METRICS)))
         return build_profiles(project, rows)
 
 

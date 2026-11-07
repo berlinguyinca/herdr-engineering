@@ -369,6 +369,10 @@ class IngestService:
             valid = lambda: (outer is None or outer()) and self._peer_policy(principal) is not None  # noqa: E731
         if env is None and entity_type == "lineage":
             raise ValueError("lineage events require schema_version 2")
+        if env is not None and entity_type == RESOURCE_RUN:
+            # A v2 envelope row is persisted before dispatch: a store outage would then turn the sender's retry into a
+            # ledger duplicate and the run would never reach resource_runs. The table key already makes v1 idempotent.
+            raise ValueError("resource_run events use schema_version 1")
         if env is not None and entity_type == "lineage":
             self._check_peer_namespace(env, event_type, payload, entity_id)
             self._check_lineage_scope(env)

@@ -192,17 +192,63 @@ def default_cwd_of(pid: int) -> str | None:
 
 
 def default_project_of(cwd: str) -> str | None:
-    """The main checkout's directory name (so every worktree of a repo is one project), else the cwd's name."""
+    """The main checkout's directory name, so every worktree of a repo is one project. ``None`` outside a git
+    checkout: a session started in ``$HOME`` or a folder of many repos has no project and is never reported (the
+    cwd's own name would attribute it to the login name or to that folder)."""
     from .fabric_agent import ListenerGitMetadata
-    name = None
     git = shutil.which("git")
-    if git:
-        out = ListenerGitMetadata._git(git, cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                                       time.monotonic() + 1.0)
-        if out and os.path.isabs(out):
-            common = Path(out)
-            name = common.parent.name if common.name == ".git" else common.name.removesuffix(".git")
-    return name or Path(cwd).name or None
+    if not git:
+        return None
+    out = ListenerGitMetadata._git(git, cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                   time.monotonic() + 1.0)
+    if not out or not os.path.isabs(out):
+        return None
+    common = Path(out)
+    return (common.parent.name if common.name == ".git" else common.name.removesuffix(".git")) or None
+
+
+_SID = re.compile(r"run-[0-9a-f]{24}")
+
+
+def _is_num(value) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and 0 <= value < 2 ** 63
+
+
+def _opt(value, kind) -> bool:
+    return value is None or isinstance(value, kind)
+
+
+def _valid_cg(cg) -> bool:
+    if cg is None:
+        return True
+    return (isinstance(cg, dict) and all(_is_num(cg.get(k)) for k in ("peak_b", "usage_usec"))
+            and all(isinstance(cg.get(k), int) for k in ("oom_kill", "max"))
+            and isinstance(cg.get("base"), dict) and all(_is_num(cg["base"].get(k)) for k in ("oom_kill", "max")))
+
+
+def _valid_session(sid, s) -> bool:
+    """A restored session must have every field ``tick`` reads, with the right type; anything else is dropped."""
+    return (isinstance(sid, str) and bool(_SID.fullmatch(sid)) and isinstance(s, dict)
+            and type(s.get("pid")) is int and s["pid"] > 0 and isinstance(s.get("agent_kind"), str)
+            and _is_num(s.get("start")) and _is_num(s.get("last_seen")) and type(s.get("peak_b")) is int
+            and s["peak_b"] >= 0 and _opt(s.get("project"), str) and _opt(s.get("cwd"), str)
+            and (s.get("disk0") is None or type(s.get("disk0")) is int)
+            and isinstance(s.get("cpu"), dict) and len(s["cpu"]) <= MAX_TREE
+            and all(isinstance(k, str) and _is_num(v) for k, v in s["cpu"].items())
+            and _opt(s.get("cgroup"), str) and _valid_cg(s.get("cg")))
+
+
+def _valid_envelope(envelope) -> dict | None:
+    """A queued event is re-validated with the control plane's allow-list and rebuilt from the clean payload."""
+    if not isinstance(envelope, dict) or set(envelope) != {"source", "entity_type", "entity_id", "event_type",
+                                                          "payload"}:
+        return None
+    try:
+        payload = validate_resource_run(envelope["entity_id"], envelope["event_type"], envelope["payload"])
+    except ValueError:
+        return None
+    return {"source": SOURCE, "entity_type": ENTITY_TYPE, "entity_id": payload["session_id"],
+            "event_type": EVENT_TYPE, "payload": payload}
 
 
 def _iso(epoch: float) -> str:
@@ -246,9 +292,16 @@ class RunCollector:
                 or not isinstance(data.get("sent"), list)):
             log.warning("resource-run state has an unknown shape; starting fresh")
             return
-        self.sessions = dict(list(data["sessions"].items())[:MAX_SESSIONS])
-        self.outbox = [e for e in data["outbox"] if isinstance(e, dict)][-MAX_OUTBOX:]
-        self.sent = [s for s in data["sent"] if isinstance(s, str)][-MAX_SENT:]
+        sessions = [(sid, s) for sid, s in data["sessions"].items() if _valid_session(sid, s)]
+        outbox = [e for e in (_valid_envelope(e) for e in data["outbox"]) if e is not None]
+        sent = [s for s in data["sent"] if isinstance(s, str) and _SID.fullmatch(s)]
+        dropped = (len(data["sessions"]) - len(sessions)) + (len(data["outbox"]) - len(outbox)) \
+            + (len(data["sent"]) - len(sent))
+        if dropped:
+            log.warning("resource-run state: dropped %d malformed entries", dropped)
+        self.sessions = dict(sessions[:MAX_SESSIONS])
+        self.outbox = outbox[-MAX_OUTBOX:]
+        self.sent = sent[-MAX_SENT:]
 
     def _save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

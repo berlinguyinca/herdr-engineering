@@ -352,6 +352,146 @@ def test_linux_without_cgroup_v2_uses_process_stats(tmp_path, cp):
     assert run["cpu_seconds"] == 15.0 and run["peak_memory_bytes"] == 500000 * KIB
 
 
+def _write_cgroup(root, *, oom_kill, max_events, peak=None, current=None, usage_usec=10_000_000, procs="600\n601\n"):
+    folder = root / "user.slice" / "agent-600.scope"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "cgroup.procs").write_text(procs)
+    (folder / "cpu.stat").write_text(f"usage_usec {usage_usec}\nuser_usec 1\nsystem_usec 1\n")
+    (folder / "memory.events").write_text(f"low 0\nhigh 0\nmax {max_events}\noom 0\noom_kill {oom_kill}\n")
+    for name, value in (("memory.peak", peak), ("memory.current", current)):
+        if value is None:
+            (folder / name).unlink(missing_ok=True)
+        else:
+            (folder / name).write_text(f"{value}\n")
+
+
+def _linux_run(tmp_path, cp, steps):
+    """steps: cgroup counters written before ticks 1 and 2 (process alive); tick 3 sees it gone."""
+    post, *_ = cp
+    work = tmp_path / "herdr-engineering"
+    work.mkdir(exist_ok=True)
+    cg_root = tmp_path / "cgroup"
+    clock = Clock()
+    c = collector(tmp_path, post, ps_of("linux_ps_1.txt", "linux_ps_2.txt", "linux_ps_3.txt"), clock,
+                  {600: str(work)}, linux=True, proc_root=FIX / "linux" / "proc", cgroup_root=cg_root)
+    for i, counters in enumerate(steps):
+        clock.t = T + 30 * i
+        _write_cgroup(cg_root, **counters)
+        assert c.tick() == []
+    clock.t = T + 60
+    [run] = c.tick()
+    return run
+
+
+def test_an_oom_before_the_session_does_not_mark_its_run_oom(tmp_path, cp):
+    run = _linux_run(tmp_path, cp, [dict(oom_kill=2, max_events=5, peak=1 << 30),
+                                    dict(oom_kill=2, max_events=5, peak=1 << 30)])
+    assert run["exit_reason"] == "exited" and run["hit_limit"] is False
+
+
+def test_hitting_memory_max_without_an_oom_sets_hit_limit_only(tmp_path, cp):
+    run = _linux_run(tmp_path, cp, [dict(oom_kill=2, max_events=5, peak=1 << 30),
+                                    dict(oom_kill=2, max_events=6, peak=1 << 30)])
+    assert run["exit_reason"] == "exited" and run["hit_limit"] is True
+
+
+def test_an_oom_during_the_session_marks_it_oom(tmp_path, cp):
+    run = _linux_run(tmp_path, cp, [dict(oom_kill=2, max_events=5, peak=1 << 30),
+                                    dict(oom_kill=3, max_events=5, peak=1 << 30)])
+    assert run["exit_reason"] == "oom" and run["hit_limit"] is True
+
+
+def test_the_cgroup_peak_is_the_highest_reading_when_only_memory_current_exists(tmp_path, cp):
+    run = _linux_run(tmp_path, cp, [dict(oom_kill=0, max_events=0, current=3 << 30, usage_usec=5_000_000),
+                                    dict(oom_kill=0, max_events=0, current=1 << 30, usage_usec=9_000_000)])
+    assert run["peak_memory_bytes"] == 3 << 30 and run["cpu_seconds"] == 9.0
+
+
+def test_memory_peak_is_preferred_over_memory_current(tmp_path, cp):
+    run = _linux_run(tmp_path, cp, [dict(oom_kill=0, max_events=0, peak=4 << 30, current=1 << 30),
+                                    dict(oom_kill=0, max_events=0, peak=4 << 30, current=2 << 30)])
+    assert run["peak_memory_bytes"] == 4 << 30
+
+
+def test_a_cgroup_with_too_many_processes_is_not_this_sessions(tmp_path, cp, monkeypatch):
+    monkeypatch.setattr(rc, "MAX_CGROUP_PROCS", 1)
+    run = _linux_run(tmp_path, cp, [dict(oom_kill=0, max_events=0, peak=9 << 30),
+                                    dict(oom_kill=0, max_events=0, peak=9 << 30)])
+    assert run["peak_memory_bytes"] == 500000 * KIB      # process stats, not the cgroup
+
+
+def test_a_shrinking_working_directory_is_zero_growth(tmp_path, cp):
+    post, *_ = cp
+    work = tmp_path / "w"
+    work.mkdir()
+    (work / "big").write_bytes(b"x" * 4000)
+    clock = Clock()
+    c = collector(tmp_path, post, ps_of("macos_ps_1.txt", "macos_ps_2.txt"), clock, {700: str(work)})
+    c.tick()
+    (work / "big").unlink()
+    clock.t = T + 30
+    [run] = c.tick()
+    assert run["disk_growth_bytes"] == 0
+
+
+def test_another_agent_on_the_same_pid_is_a_new_session(tmp_path, cp):
+    post, _, posted, _ = cp
+    work = tmp_path / "w"
+    work.mkdir()
+    first = ps_of("macos_ps_1.txt")[0]
+    # 30 s later pid 700 is a claude process with a consistent start time: a different agent, not codex
+    other = (first.replace("  700     1  50000   0:01.00    00:20 /opt/homebrew/bin/codex",
+                           "  700     1  50000   0:01.00    00:50 /opt/homebrew/bin/claude")
+             .replace("  600   500 400000   0:10.00    01:40", "  600   500 400000   0:10.00    02:10"))
+    assert other != first
+    clock = Clock()
+    c = collector(tmp_path, post, [first, other], clock, {600: str(work), 700: str(work)})
+    c.tick()
+    clock.t = T + 30
+    [ended] = c.tick()
+    assert ended["agent_kind"] == "codex"
+    assert sorted(s["agent_kind"] for s in c.sessions.values()) == ["claude", "claude"]
+
+
+def test_malformed_state_entries_are_dropped_and_capture_keeps_working(tmp_path, cp):
+    post, _, posted, _ = cp
+    work = tmp_path / "w"
+    work.mkdir()
+    clock = Clock()
+    c = collector(tmp_path, post, ps_of("macos_ps_1.txt"), clock, {600: str(work), 700: str(work)})
+    c.tick()
+    data = json.loads(c.state_path.read_text())
+    good_sid = next(iter(data["sessions"]))
+    data["sessions"]["run-" + "0" * 24] = {"pid": 9}                         # missing fields
+    data["sessions"]["not-an-id"] = dict(data["sessions"][good_sid])
+    data["sessions"]["run-" + "1" * 24] = {**data["sessions"][good_sid], "pid": "700"}
+    data["outbox"] = [{"entity_id": "run-x"}, {"source": "fabric-agent", "entity_type": "resource_run",
+                                               "entity_id": "run-y", "event_type": "resource_run.ended",
+                                               "payload": {"session_id": "run-y"}}, 7]
+    data["sent"] = ["run-" + "2" * 24, 5, "x" * 500]
+    c.state_path.write_text(json.dumps(data))
+    again = collector(tmp_path, post, ps_of("macos_ps_2.txt"), clock, {600: str(work)})
+    assert set(again.sessions) == set(data["sessions"]) - {"run-" + "0" * 24, "not-an-id", "run-" + "1" * 24}
+    assert again.outbox == [] and again.sent == ["run-" + "2" * 24]
+    clock.t = T + 30
+    [codex] = again.tick()                                                   # still works
+    assert [e["entity_id"] for e in posted] == [codex["session_id"]]
+
+
+def test_a_valid_queued_event_survives_a_reload(tmp_path, cp):
+    post, profiles, _, state = cp
+    state["up"] = False
+    work = tmp_path / "pi-engineering"
+    work.mkdir()
+    clock = Clock()
+    c = collector(tmp_path, post, ps_of("macos_ps_1.txt", "macos_ps_2.txt"), clock, {700: str(work)})
+    c.tick()
+    clock.t = T + 30
+    c.tick()
+    again = collector(tmp_path, post, [], clock, {})
+    assert again.outbox == c.outbox and len(again.outbox) == 1
+
+
 def test_cgroup_paths_are_v2_and_never_escape_the_root(tmp_path):
     proc = tmp_path / "proc"
     for pid, text in ((1, "0::/\n"), (2, "12:memory:/x\n"), (3, "0::/../../etc\n"), (4, "0::/a.slice/b.scope\n")):
@@ -435,6 +575,6 @@ def test_default_project_is_the_main_checkout_for_every_worktree(tmp_path):
     subprocess.run([git, "-C", str(main), "worktree", "add", "-q", str(tree)], check=True, env=env)
     assert rc.default_project_of(str(main)) == "herdr-engineering"
     assert rc.default_project_of(str(tree)) == "herdr-engineering"
-    plain = tmp_path / "scratch-dir"
+    plain = tmp_path / "scratch-dir"      # not a checkout: no project (never the folder's own name)
     plain.mkdir()
-    assert rc.default_project_of(str(plain)) == "scratch-dir"
+    assert rc.default_project_of(str(plain)) is None

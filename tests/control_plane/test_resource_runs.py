@@ -85,6 +85,9 @@ def test_a_valid_run_returns_a_clean_copy():
     ("run-1", rr.EVENT_TYPE, run(cpu_seconds=float("inf"))),
     ("run-1", rr.EVENT_TYPE, run(cpu_seconds=1e9 + 1)),
     ("run-1", rr.EVENT_TYPE, run(cpu_seconds=False)),
+    ("run-1", rr.EVENT_TYPE, run(cpu_seconds=10 ** 400)),                       # beyond float range
+    ("run-1", rr.EVENT_TYPE, run(cpu_seconds=2 ** 64)),
+    ("run-1", rr.EVENT_TYPE, run(cpu_seconds=-(10 ** 400))),
     ("run-1", rr.EVENT_TYPE, run(disk_growth_bytes=-5)),
     ("run-1", rr.EVENT_TYPE, run(disk_growth_bytes=2 ** 50 + 1)),
     ("run-1", rr.EVENT_TYPE, run(exit_reason="segfault")),                      # closed enum
@@ -333,6 +336,80 @@ def test_the_store_error_never_carries_the_dsn():
     assert "secret" not in str(err.value) and err.value.__cause__ is None
 
 
+BAD_TIMES = ["2026-W45-3T10:00:00+00:00",        # ISO week date
+             "2026-308T10:00:00+00:00",           # ordinal date
+             "20261104T100000Z",                  # basic format
+             "2026-11-04 10:00:00+00:00",         # space separator
+             "2026-11-04T10:00:00z",              # lower-case z
+             "2026-11-04T10:00Z",                 # no seconds
+             "2026-11-04T10:00:00.1234567Z",      # seven fraction digits
+             "2026-11-04T10:00:00+01:00",         # not UTC
+             "2026-11-04T10:00:00-00:00",
+             "2026-11-04T10:00:00",               # naive
+             "2026-11-04",                        # date only
+             "2026-02-30T10:00:00Z",              # no such day
+             "2026-11-04T24:00:00Z",
+             "2026-11-04T23:59:60Z",              # leap second
+             "1999-12-31T23:59:59Z",              # before the accepted years
+             "3000-01-01T00:00:00Z",              # after them
+             "0001-01-01T00:00:00Z",
+             "+12026-11-04T10:00:00Z",
+             " 2026-11-04T10:00:00Z",
+             "2026-11-04T10:00:00Z\n",
+             "２０２６-11-04T10:00:00Z"]              # non-ASCII digits
+
+
+@pytest.mark.parametrize("value", BAD_TIMES)
+def test_only_the_canonical_utc_form_is_accepted(value):
+    for field in ("started_at", "ended_at"):
+        with pytest.raises(ValueError):
+            rr.validate_resource_run("run-1", rr.EVENT_TYPE, run(**{field: value}))
+
+
+def test_the_accepted_years_start_in_2000_even_for_a_short_run():
+    for when in ("1999-12-31T23:00:00Z", "0001-01-01T00:00:00Z"):
+        with pytest.raises(ValueError):
+            rr.validate_resource_run("run-1", rr.EVENT_TYPE, run(started_at=when, ended_at=when))
+    first = "2000-01-01T00:00:00Z"
+    assert rr.validate_resource_run("run-1", rr.EVENT_TYPE, run(started_at=first, ended_at=first))["ended_at"] \
+        == "2000-01-01T00:00:00+00:00"
+
+
+def test_timestamps_are_stored_in_one_normalized_form():
+    clean = rr.validate_resource_run("run-1", rr.EVENT_TYPE, run(started_at="2026-11-04T10:00:00Z",
+                                                                 ended_at="2026-11-04T10:30:00.5Z"))
+    assert clean["started_at"] == "2026-11-04T10:00:00+00:00"
+    assert clean["ended_at"] == "2026-11-04T10:30:00.500000+00:00"
+    again = rr.validate_resource_run("run-1", rr.EVENT_TYPE, clean)
+    assert again == clean
+
+
+def test_the_memory_store_caps_agent_kinds_like_the_sql_window(monkeypatch):
+    monkeypatch.setattr(rr, "MAX_AGENT_KINDS", 2)
+    store = rr.MemoryResourceRuns()
+    for kind in ("zeta", "alpha", "beta"):
+        store.record(run(f"{kind}-1", agent_kind=kind))
+    assert [p["agent_kind"] for p in store.profiles("herdr-engineering")["profiles"]] == ["alpha", "beta"]
+
+
+def test_a_schema_v2_resource_run_is_refused(server):
+    post, get, *_ = server
+    body = {**envelope(run()), "schema_version": 2, "event_id": "e" * 32, "source_sequence": 1,
+            "occurred_at": T1}
+    assert post(body)[0] == 400
+    assert get()[1]["profiles"] == []
+
+
+@pytest.mark.parametrize("payload", [run(cpu_seconds=10 ** 400), run(cpu_seconds=2 ** 64),
+                                     *(run(started_at=t) for t in BAD_TIMES[:8]),
+                                     *(run(ended_at=t) for t in BAD_TIMES[11:16])])
+def test_overflowing_numbers_and_odd_timestamps_are_a_400_over_http(server, payload):
+    post, get, *_ = server
+    status, body = post(envelope(payload))
+    assert status == 400 and "resource_run" in body["error"]
+    assert get()[1]["profiles"] == []
+
+
 # --------------------------------------------------------------------------- migration 0052
 
 def test_down_drops_exactly_the_table_created_here():
@@ -342,9 +419,10 @@ def test_down_drops_exactly_the_table_created_here():
     assert text.count("CREATE INDEX IF NOT EXISTS") == 1
 
 
-def test_migration_is_the_next_number_and_its_enums_match_the_validator():
-    names = sorted(p.name for p in SQL.parent.glob("*.sql"))
-    assert names[-1] == SQL.name and SQL.name.startswith("0052_")
+def test_migration_has_its_own_number_right_after_0051_and_its_enums_match_the_validator():
+    numbers = sorted({int(p.name[:4]) for p in SQL.parent.glob("*.sql")})
+    assert SQL.is_file() and [p.name for p in SQL.parent.glob("0052_*.sql")] == [SQL.name]
+    assert 51 in numbers and numbers[numbers.index(52) - 1] == 51     # contiguous with the migration it follows
     text = SQL.read_text()
     enum = re.search(r"exit_reason IN \(([^)]*)\)", text, re.S).group(1)
     assert tuple(re.findall(r"'(\w+)'", enum)) == rr.EXIT_REASONS
@@ -412,10 +490,16 @@ def test_migration_up_rerun_constraints_store_and_down_on_postgres(postgres):
     insert = f"INSERT INTO resource_runs ({columns}) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
     good = ("beast", "run-x", "p", "claude", T0, T1, 1, 1.0, None, "exited", False)
     for index, bad in ((6, -1), (7, -0.5), (8, -1), (9, "segfault"), (5, "2026-11-04T09:00:00+00:00"),
-                       (3, "Claude"), (0, "bad host")):
+                       (3, "Claude"), (0, "bad host"), (2, "p" * 129), (2, ""), (7, 1e9 + 1),
+                       (6, 2 ** 50 + 1), (8, 2 ** 50 + 1), (1, "run 1"), (1, "-run"), (0, "h" * 65)):
         row = list(good)
         row[index] = bad
         with pytest.raises(psycopg2.errors.CheckViolation):
+            _sql(postgres, insert, tuple(row))
+    for index in (0, 1, 2, 3, 4, 5, 6, 7, 9, 10):   # every column but disk_growth_bytes is NOT NULL
+        row = list(good)
+        row[index] = None
+        with pytest.raises(psycopg2.errors.NotNullViolation):
             _sql(postgres, insert, tuple(row))
     _sql(postgres, insert, good)
     for i in range(1, 21):
@@ -433,3 +517,69 @@ def test_migration_up_rerun_constraints_store_and_down_on_postgres(postgres):
     assert _sql(postgres, "SELECT count(*) FROM pg_indexes WHERE indexname = 'resource_runs_profile_idx'")[0][0] == 0
     _sql(postgres, SQL.read_text())   # and up again after down
     assert _sql(postgres, "SELECT count(*) FROM resource_runs")[0][0] == 0
+
+
+def _pg_server(dsn):
+    _sql(dsn, SQL.read_text())
+    _sql(dsn, "TRUNCATE resource_runs")
+    svr = ControlPlaneServer(ControlPlaneRepo(), resource_runs_dsn=dsn)
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    return svr
+
+
+def test_bad_values_are_a_400_and_never_reach_postgres(postgres):
+    svr = _pg_server(postgres)
+    base = f"http://127.0.0.1:{svr.port}"
+
+    def post(payload):
+        req = urllib.request.Request(base + "/api/v1/ingest", data=json.dumps(envelope(payload)).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+    try:
+        for payload in (run(cpu_seconds=10 ** 400), *(run(started_at=t) for t in BAD_TIMES),
+                        *(run(ended_at=t) for t in BAD_TIMES)):
+            assert post(payload) == 400, payload
+        assert _sql(postgres, "SELECT count(*) FROM resource_runs")[0][0] == 0
+        assert post(run(started_at="2026-11-04T10:00:00Z", ended_at="2026-11-04T10:30:00.25Z")) == 200
+        [(started, ended)] = _sql(postgres, "SELECT started_at, ended_at FROM resource_runs")
+        assert started == datetime(2026, 11, 4, 10, 0, tzinfo=UTC)
+        assert ended == datetime(2026, 11, 4, 10, 30, 0, 250000, tzinfo=UTC)
+    finally:
+        svr.shutdown()
+
+
+def test_the_postgres_window_keeps_the_newest_runs_per_kind_and_caps_the_kinds(postgres, monkeypatch):
+    _sql(postgres, SQL.read_text())
+    _sql(postgres, "TRUNCATE resource_runs")
+    monkeypatch.setattr(rr, "PROFILE_WINDOW", 3)
+    monkeypatch.setattr(rr, "MAX_AGENT_KINDS", 2)
+    store = rr.PostgresResourceRuns(postgres)
+    memory = rr.MemoryResourceRuns()
+    start = datetime(2026, 11, 1, tzinfo=UTC)
+    # kind "alpha": cpu 0..5 ending one hour apart, inserted newest first so table order is not time order
+    rows = [("alpha", i) for i in reversed(range(6))] + [("beta", i) for i in range(4)] + [("gamma", 0)]
+    for kind, i in rows:
+        payload = rr.validate_resource_run(f"{kind}-{i}", rr.EVENT_TYPE, run(
+            f"{kind}-{i}", agent_kind=kind, started_at=start.isoformat(),
+            ended_at=(start + timedelta(hours=i)).isoformat(), cpu_seconds=float(i), peak_memory_bytes=i))
+        assert store.record(payload) and memory.record(payload)
+    # ties on ended_at: three more beta runs at hour 3, broken by session id (beta-z must fall out)
+    for sid, peak in (("beta-z", 99), ("beta-a", 30), ("beta-m", 31)):
+        payload = rr.validate_resource_run(sid, rr.EVENT_TYPE, run(
+            sid, agent_kind="beta", started_at=start.isoformat(),
+            ended_at=(start + timedelta(hours=3)).isoformat(), cpu_seconds=30.0, peak_memory_bytes=peak))
+        assert store.record(payload) and memory.record(payload)
+    result = store.profiles("herdr-engineering")
+    assert [p["agent_kind"] for p in result["profiles"]] == ["alpha", "beta"]      # gamma is past the kind cap
+    alpha, beta = result["profiles"]
+    assert alpha["count"] == 3 and alpha["metrics"]["cpu_seconds"] == {
+        "count": 3, "median": 4.0, "p95": pytest.approx(4.9), "max": 5.0}         # the newest three: 3, 4, 5
+    # four beta runs tie at hour 3; by session id the window keeps beta-3 (3), beta-a (30), beta-m (31)
+    assert beta["count"] == 3 and beta["metrics"]["peak_memory_bytes"] == {
+        "count": 3, "median": 30.0, "p95": pytest.approx(30.9), "max": 31}
+    assert memory.profiles("herdr-engineering") == result                          # both stores agree
