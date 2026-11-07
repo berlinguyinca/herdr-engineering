@@ -39,13 +39,29 @@ parity. Everything is idempotent and non-disruptive to running agents.
 ## Working directory (important)
 
 This skill orchestrates the **herdr-engineering repo**'s own scripts and
-ansible playbooks — it does not bundle them. Run it from the controller's
-repo checkout, e.g. `/home/wohlgemuth/IdeaProjects/herdr-engineering`, and
-resolve every path below relative to that repo root. If you don't know where
-the checkout is, locate it first (`find ~ -name 'fleet-join.sh' 2>/dev/null`)
-and `cd` there before running anything. The controller is the machine that
-holds the ansible inventory (`ansible/inventory/hosts.yml`) and SSH keys to
-the fleet.
+ansible playbooks — it does not bundle them. Run everything from the **fleet
+controller checkout** and resolve paths relative to that repo root.
+
+The controller checkout is the tree the unattended updater drives, so read it
+from the updater instead of guessing (this fleet keeps it at
+`~/fleet/herdr-engineering`):
+
+```bash
+systemctl --user cat herdr-eng-fleet-update.service | grep HERDR_ENGINEERING_REPO
+```
+
+It must be clean and on `main`; `git status -sb` before trusting anything it
+reports. The controller is also the machine holding the ansible inventory
+(`ansible/inventory/hosts.yml`) and the SSH keys to the fleet.
+
+> **Never run fleet playbooks from a developer checkout.** A dev tree can be
+> hundreds of commits behind and carry uncommitted work, and its
+> `ansible/tasks/*` are then stale — so even a read-only check reports defects
+> that are already fixed upstream. Observed in the field: an old
+> `fleet-fingerprint.yml` asked launchd for the wrong label and reported
+> `agent=inactive` for a running macOS fabric agent. `find ~ -name
+> 'fleet-join.sh'` is a bad way to locate the controller — it matches every
+> checkout and worktree on the machine.
 
 ## Operations
 
@@ -122,6 +138,13 @@ ansible-playbook -i ansible/inventory/hosts.yml \
   `fleet-config.yaml` (`fabric.url`), not a credential file.
 - A host with no `herdr-eng` yet is provisioned by `fabric-agent.yml`; the pi
   build-gate extension no-ops gracefully until then.
+- **A host's canonical id is configuration, not its hostname.** The fleet
+  identity is the `hosts:` key in `fleet-config.yaml`, and
+  `control_plane.values.host_aliases` maps drifting OS/mDNS hostnames onto it
+  (e.g. `Gerts-MacBook-Pro.local=mac.lan`). A host's token is bound to that id,
+  so never "normalize" a `host.json` `host_id` by hand — re-issue credentials
+  (`herdr-eng fleet config token`). An ansible inventory alias that differs from
+  the canonical id is cosmetic.
 
 ## Files
 
