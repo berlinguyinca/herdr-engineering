@@ -181,9 +181,13 @@ def test_busy_is_rechecked_right_before_the_restart():
 
 
 def test_fabric_agent_scripts_honour_no_restart():
-    for script in ("fabric-agent.sh", "fabric-agent-macos.sh"):
+    for script in ("fabric-agent.sh", "fabric-agent-load.sh"):
         text = (REPO / "scripts" / script).read_text()
         assert '"${HERDR_FABRIC_AGENT_NO_RESTART:-}" = "1"' in text, script
+    # The macOS installer delegates the load/restart decision rather than re-implementing it, so the
+    # contract cannot drift from the copy the tests exercise.
+    installer = (REPO / "scripts" / "fabric-agent-macos.sh").read_text()
+    assert "fabric-agent-load.sh" in installer
     fa = (ROOT / "tasks" / "fabric-agent.yml").read_text()
     assert "HERDR_FABRIC_AGENT_NO_RESTART" in fa and "fabric_agent_defer_restart" in fa
     assert "changed_when: true" not in fa.split("Install the selected HerdR release")[1].split("- name:")[0]
@@ -194,6 +198,28 @@ def test_macos_restart_is_best_effort():
     assert k["failed_when"] is False
     note = _by_name("note the failed macOS restart")[0]
     assert note["ansible.builtin.set_fact"]["fleet_update_reason"] == "agent restart failed"
+
+
+def test_the_agent_installer_failure_is_not_swallowed():
+    """The kickstart may be best-effort; installing the agent may not be.
+
+    On 2026-11-05 the macOS installer ran `bootout`, failed to `bootstrap`, warned, and exited 0; the
+    best-effort kickstart then failed against a service that was never loaded, and the nightly fleet
+    update reported success with the mac's fabric agent stopped. The installer now exits 1 when the
+    agent is not loaded afterwards, and this task must let that reach the play - otherwise the only
+    thing that notices is the next run's parity check.
+    """
+    import yaml
+    tasks = yaml.safe_load((ROOT / "tasks" / "fabric-agent.yml").read_text())
+    step = None
+    for element in tasks:
+        for task in element.get("block", [element]):
+            if "Install/enable the agent service" in json.dumps(task):
+                step = task
+                break
+    assert step is not None, "the agent installer task was renamed or removed"
+    assert step.get("failed_when", True) is not False, json.dumps(step)[:200]
+    assert "ignore_errors" not in step, json.dumps(step)[:200]
 
 
 def test_serial_and_stop_on_failure():
