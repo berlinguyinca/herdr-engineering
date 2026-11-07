@@ -890,6 +890,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--control-plane", default=None, help="status|check: control-plane base URL (default: host.json)")
     p2.add_argument("--api-key-file", default=None, help="status|check: PATH to a file holding an operator API key")
     p2.set_defaults(func=_cmd_cp_assistant_judge)
+    p2 = csub.add_parser("assistant-slack", help="register the Slack bot/app tokens, or show local token-file status")
+    p2.add_argument("action", choices=["register", "status"])
+    p2.add_argument("--base-url", default="https://slack.com/api", help="register: the Slack Web API base URL (https; http only for loopback)")
+    p2.add_argument("--bot-token-file", default=None, help="absolute PATH of the 0600 bot token file (xoxb-)")
+    p2.add_argument("--app-token-file", default=None, help="absolute PATH of the 0600 app-level token file (xapp-)")
+    p2.add_argument("--key-stdin", action="store_true",
+                    help="register: read the bot token then the app token from stdin, one per line (the only way; never argv)")
+    p2.set_defaults(func=_cmd_cp_assistant_slack)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -3768,6 +3776,81 @@ def _cmd_cp_assistant_judge(args) -> int:
     return 1
 
 
+def _assistant_slack_register(args) -> int:
+    """``assistant-slack register``: both tokens come from stdin only (bot first) and are never printed. 0/1/2."""
+    from .control_plane.assistant_hub.slack_register import (
+        MAX_KEY_CHARS,
+        SlackRegisterError,
+        register_tokens,
+    )
+
+    if not (args.bot_token_file and args.app_token_file and args.key_stdin):
+        print("assistant-slack register needs --bot-token-file, --app-token-file and --key-stdin (tokens are never "
+              "taken from argv)", file=sys.stderr)
+        return 2
+    if sys.stdin.isatty():
+        import getpass
+        lines = [getpass.getpass("Slack bot token (xoxb-): "), getpass.getpass("Slack app token (xapp-): ")]
+    else:
+        lines = sys.stdin.read(2 * MAX_KEY_CHARS + 4).splitlines()
+    tokens = [line.strip() for line in lines if line.strip()]
+    if len(tokens) != 2 or any(any(c.isspace() for c in t) for t in tokens):
+        print("assistant-slack register failed: need exactly two tokens on stdin (bot token, then app token), one per line",
+              file=sys.stderr)
+        return 2
+    try:
+        done = register_tokens(args.base_url, args.bot_token_file, args.app_token_file, tokens[0], tokens[1])
+    except SlackRegisterError as exc:
+        print(f"assistant-slack register failed: {exc.code}", file=sys.stderr)
+        return 1
+    print(f"registered: bot_fingerprint={done.bot_fingerprint} app_fingerprint={done.app_fingerprint} "
+          f"team={_tty_safe(done.team) or '-'} bot_user_id={_tty_safe(done.bot_user_id) or '-'}")
+    print("next: add bot_token_file, app_token_file and owner_user_id to control_plane.personal_assistant.slack in your "
+          "fleet YAML (this command does not edit it) and set enabled: true.")
+    return 0
+
+
+def _slack_file_state(label: str, path: str) -> tuple[bool, str]:
+    """One status line for a token file; reads it only to fingerprint it, never prints its text."""
+    import stat as _stat
+    from pathlib import Path
+
+    from .control_plane.assistant_hub.slack_register import fingerprint
+
+    p = Path(path)
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return False, f"{label}: missing path={_tty_safe(path)}"
+    except OSError as exc:
+        return False, f"{label}: unreadable ({_tty_safe(exc.strerror)}) path={_tty_safe(path)}"
+    if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISREG(st.st_mode):
+        return False, f"{label}: not a regular file path={_tty_safe(path)}"
+    if _stat.S_IMODE(st.st_mode) & 0o077:
+        return False, f"{label}: unsafe mode {_stat.S_IMODE(st.st_mode):04o} (want 0600) path={_tty_safe(path)}"
+    try:
+        token = p.read_text(encoding="ascii").strip()
+    except (OSError, ValueError):
+        return False, f"{label}: unreadable path={_tty_safe(path)}"
+    if not token:
+        return False, f"{label}: empty path={_tty_safe(path)}"
+    return True, f"{label}: ok fingerprint={fingerprint(token)} path={_tty_safe(path)}"
+
+
+def _cmd_cp_assistant_slack(args) -> int:
+    """``control-plane assistant-slack register|status``: 0 ok, 1 failure, 2 usage. ``status`` is local only."""
+    if args.action == "register":
+        return _assistant_slack_register(args)
+    if not (args.bot_token_file and args.app_token_file):
+        print("assistant-slack status needs --bot-token-file and --app-token-file", file=sys.stderr)
+        return 2
+    ok_bot, line_bot = _slack_file_state("bot_token", args.bot_token_file)
+    ok_app, line_app = _slack_file_state("app_token", args.app_token_file)
+    print(line_bot)
+    print(line_app)
+    return 0 if ok_bot and ok_app else 1
+
+
 def _cmd_cp_assistant_hub_owner(args) -> int:
     """``control-plane assistant-action list|approve|deny`` and ``assistant-grant list|revoke|activate``.
 
@@ -4573,10 +4656,14 @@ def _cmd_cp_web(args) -> int:
         watch.stop()
         if hub_server is not None:
             try:
-                hub_server.shutdown()
+                try:
+                    hub_server.shutdown()
+                finally:
+                    if hub_server.hub.judge is not None:
+                        hub_server.hub.judge.recorder.stop()
             finally:
-                if hub_server.hub.judge is not None:
-                    hub_server.hub.judge.recorder.stop()
+                if hub_server.hub.slack is not None:
+                    hub_server.hub.slack.stop()
         svr.shutdown()
         if artifact_bridge is not None:
             artifact_bridge.stop()
@@ -5171,8 +5258,15 @@ def _start_assistant_hub(service):
     from .control_plane.assistant_hub.workers import WorkerRegistry
     registry = WorkerRegistry(service.store, enrollment_ttl=timedelta(seconds=hub_cfg["enrollment_ttl_seconds"]),
                               worker_ttl=timedelta(days=hub_cfg["worker_ttl_days"]))
+    from .control_plane.assistant_hub.slack import SlackRuntime
+    judge = _build_judge_runtime(service)
+    from .control_plane.assistant_hub.preconditions import default_clients
+    clients = default_clients()
+    slack = SlackRuntime(service.store, service, lambda: service.config.get("slack") or {}, service.now, judge=judge,
+                         health=clients.health, preconditions=clients)
     try:
-        server = HubServer(Hub(registry=registry, service=service, store=service.store, judge=_build_judge_runtime(service)),
+        server = HubServer(Hub(registry=registry, service=service, store=service.store,
+                               judge=judge, slack=slack, preconditions=clients),
                            host=hub_cfg["host"],
                            port=hub_cfg["port"], allowed_networks=hub_cfg["allowed_networks"],
                            allowed_hosts=hub_cfg["allowed_hosts"])
@@ -5180,6 +5274,10 @@ def _start_assistant_hub(service):
         raise SystemExit(f"assistant hub cannot start: {type(exc).__name__}: {exc}") from None
     server.start()
     server.hub.judge.recorder.start()          # a thread exists only when the judge is enabled
+    if (service.config.get("slack") or {}).get("enabled") is True:
+        slack.start()                          # Socket Mode link and the ask poster; stopped by the caller
+    else:
+        slack.start_checks()                   # deploy outcome checks do not need Slack; open ones resume here
     return server, registry
 
 
@@ -5191,6 +5289,7 @@ def _wire_assistant_hub(svr):
     hub_server, registry = _start_assistant_hub(service)
     svr.assistant_workers = registry
     svr.assistant_judge = hub_server.hub.judge if hub_server is not None else None   # same runtime as the hub
+    svr.assistant_slack = hub_server.hub.slack if hub_server is not None else None
     return hub_server
 
 

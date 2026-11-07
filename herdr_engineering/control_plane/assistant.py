@@ -46,10 +46,13 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from . import placement, slurm_placement
-from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
-from .assistant_hub.events import WorkerEvent, event_size
 from .assistant_briefs import TeamBriefRecord, TeamBriefService, team_briefs_config
+from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
+from .assistant_hub.deploycheck import FINAL as DEPLOY_FINAL
+from .assistant_hub.deploycheck import DeployCheck, sanitize_check
+from .assistant_hub.events import WorkerEvent, event_size
 from .assistant_hub.shadow import JudgeRecord
+from .assistant_hub.slack_asks import SlackAsk
 from .assistant_hub.verbs import Verb
 from .assistant_hub.vetoes import FIXED_VETOES
 from .assistant_hub.workers import Enrollment, Worker
@@ -380,6 +383,10 @@ def assistant_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "grants": _grants_config(section.get("grants")),
         # Action judge (jev): off unless enabled; the API key is read from api_key_file, never inline.
         "judge": _judge_config(section.get("judge")),
+        # Slack front door: off unless enabled; tokens are read from files, never inline.
+        "slack": _slack_config(section.get("slack")),
+        # Per-project, per-scope deploy permission (Phase 4): ``mode: auto`` is only a candidate until the owner confirms.
+        "deploy": _deploy_config(section.get("deploy")),
     }
 
 
@@ -437,7 +444,7 @@ def _hub_config(raw: Any, default_tenant: str) -> dict[str, Any]:
 
 
 _GRANTS_KEYS = {"shadow_days", "shadow_started_at", "required_approvals", "min_sessions", "min_tasks",
-                "grant_ttl_days", "extra_vetoes", "policy_version"}
+                "grant_ttl_days", "extra_vetoes", "policy_version", "approval_ttl_minutes"}
 _GRANTS_RISKS = ("local_reversible", "remote_reversible", "outward")
 _GRANTS_APPROVALS = {"local_reversible": 5, "remote_reversible": 10, "outward": 30}
 
@@ -476,6 +483,12 @@ def _grants_extra_vetoes(value: Any, where: str) -> list[dict[str, str]]:
     return out
 
 
+def _approval_ttl(value: Any, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 120:
+        raise ValueError(f"{where} must be an integer from 1 to 120")
+    return value
+
+
 def _grants_config(raw: Any) -> dict[str, Any]:
     """``personal_assistant.grants``. ``shadow_started_at`` null means the hub stamps it on first start."""
     where = "control_plane.personal_assistant.grants"
@@ -511,6 +524,7 @@ def _grants_config(raw: Any) -> dict[str, Any]:
         "grant_ttl_days": _hub_pos_int(raw.get("grant_ttl_days", 30), f"{where}.grant_ttl_days"),
         "extra_vetoes": _grants_extra_vetoes(raw.get("extra_vetoes", []), f"{where}.extra_vetoes"),
         "policy_version": _hub_pos_int(raw.get("policy_version", 1), f"{where}.policy_version"),
+        "approval_ttl_minutes": _approval_ttl(raw.get("approval_ttl_minutes", 15), f"{where}.approval_ttl_minutes"),
     }
 
 
@@ -627,6 +641,191 @@ def _judge_config(raw: Any) -> dict[str, Any]:
                                                                   f"{where}.calibration.max_false_negative_bound",
                                                                   0.0, 0.5, low_open=True)},
     }
+
+
+_SLACK_KEYS = {"enabled", "base_url", "bot_token_file", "app_token_file", "owner_user_id", "channel", "ask_ttl_minutes",
+               "max_asks_per_task_per_hour", "max_asks_per_worker_per_hour", "max_asks_per_hour",
+               "summary_idle_minutes"}
+_SLACK_INLINE_SECRETS = {"bot_token", "app_token", "token", "secret"}
+
+
+def _slack_config(raw: Any) -> dict[str, Any]:
+    """``personal_assistant.slack``. Off by default; secrets only via ``bot_token_file`` / ``app_token_file``."""
+    where = "control_plane.personal_assistant.slack"
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    inline = sorted(set(raw) & _SLACK_INLINE_SECRETS)
+    if inline:
+        raise ValueError(f"{where} must not hold secrets inline ({inline}); put each token in a file and set "
+                         "bot_token_file / app_token_file")
+    unknown = set(raw) - _SLACK_KEYS
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(unknown)}")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"{where}.enabled must be true or false (not a string)")
+    base_url = _judge_endpoint(raw.get("base_url", "https://slack.com/api"), f"{where}.base_url")
+    if not base_url:
+        raise ValueError(f"{where}.base_url must not be empty")
+    files: dict[str, str] = {}
+    for name in ("bot_token_file", "app_token_file"):
+        value = raw.get(name, "")
+        if not isinstance(value, str):
+            raise ValueError(f"{where}.{name} must be a path string")
+        value = value.strip()
+        if value and not value.startswith("/"):
+            raise ValueError(f"{where}.{name} must be an absolute path")
+        if enabled and not value:
+            raise ValueError(f"{where}.{name} is required when Slack is enabled")
+        files[name] = value
+    if files["bot_token_file"] and files["bot_token_file"] == files["app_token_file"]:
+        raise ValueError(f"{where}.bot_token_file and app_token_file must be different files")
+    owner = raw.get("owner_user_id", "")
+    if not isinstance(owner, str) or (owner and not re.fullmatch(r"U[A-Z0-9]+", owner.strip())):
+        raise ValueError(f"{where}.owner_user_id must be a Slack user id like U01ABC23DEF")
+    owner = owner.strip()
+    if enabled and not owner:
+        raise ValueError(f"{where}.owner_user_id is required when Slack is enabled")
+    channel = raw.get("channel", "")
+    if not isinstance(channel, str) or not re.fullmatch(r"([CGD][A-Z0-9]+)?", channel.strip()):
+        raise ValueError(f"{where}.channel must be a Slack channel id like C01ABC23DEF (empty = the owner's DM)")
+    ttl = raw.get("ask_ttl_minutes", 15)
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not 1 <= ttl <= 120:
+        raise ValueError(f"{where}.ask_ttl_minutes must be an integer between 1 and 120")
+    cap = raw.get("max_asks_per_task_per_hour", 6)
+    if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 1000:
+        raise ValueError(f"{where}.max_asks_per_task_per_hour must be an integer between 1 and 1000")
+    worker_cap = raw.get("max_asks_per_worker_per_hour", 20)
+    if isinstance(worker_cap, bool) or not isinstance(worker_cap, int) or not 1 <= worker_cap <= 1000:
+        raise ValueError(f"{where}.max_asks_per_worker_per_hour must be an integer between 1 and 1000")
+    total_cap = raw.get("max_asks_per_hour", 60)
+    if isinstance(total_cap, bool) or not isinstance(total_cap, int) or not 1 <= total_cap <= 10000:
+        raise ValueError(f"{where}.max_asks_per_hour must be an integer between 1 and 10000")
+    idle = raw.get("summary_idle_minutes", 30)
+    if isinstance(idle, bool) or not isinstance(idle, int) or not 1 <= idle <= 1440:
+        raise ValueError(f"{where}.summary_idle_minutes must be an integer between 1 and 1440")
+    return {"enabled": enabled, "base_url": base_url, "bot_token_file": files["bot_token_file"],
+            "app_token_file": files["app_token_file"], "owner_user_id": owner, "channel": channel.strip(),
+            "ask_ttl_minutes": ttl, "max_asks_per_task_per_hour": cap,
+            "max_asks_per_worker_per_hour": worker_cap, "max_asks_per_hour": total_cap, "summary_idle_minutes": idle}
+
+
+DEPLOY_REQUIRE = ("on_main", "ci_green", "descends_from_deployed")
+_DEPLOY_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+_DEPLOY_REPO = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
+_DEPLOY_COMMAND = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+/-]*")
+_DEPLOY_SECRET_WORDS = ("token", "secret", "password", "passwd", "api_key", "apikey", "key", "credential", "webhook")
+
+
+def _deploy_command(value: Any, where: str) -> str:
+    if (not isinstance(value, str) or not 0 < len(value) <= 200 or not value.isascii()
+            or not _DEPLOY_COMMAND.fullmatch(value)):
+        raise ValueError(f"{where}.command must be a relative path like deploy/app/deploy.sh (letters, digits and "
+                         "_ . + - /; no leading / or ./, no .., no spaces or shell characters)")
+    parts = value.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise ValueError(f"{where}.command must be a clean relative path (no empty, . or .. parts)")
+    return value
+
+
+def _deploy_scope(raw: Any, where: str) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    inline = sorted(k for k in raw if isinstance(k, str) and any(w in k.lower() for w in _DEPLOY_SECRET_WORDS))
+    if inline:
+        raise ValueError(f"{where} must not hold secrets inline ({inline}); a deploy scope has no secret settings")
+    unknown = set(raw) - {"mode", "command", "require", "health_url"}
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(map(str, unknown))}")
+    mode = raw.get("mode", "ask")
+    if not isinstance(mode, str) or mode not in ("ask", "auto"):
+        raise ValueError(f"{where}.mode must be 'ask' or 'auto' (auto is only a candidate until you confirm it in Slack)")
+    if "command" not in raw:
+        raise ValueError(f"{where}.command is required")
+    command = _deploy_command(raw["command"], where)
+    require = raw.get("require", list(DEPLOY_REQUIRE))
+    if not isinstance(require, list) or not require or not all(isinstance(r, str) for r in require):
+        raise ValueError(f"{where}.require must be a non-empty list drawn from {list(DEPLOY_REQUIRE)}")
+    if len(set(require)) != len(require):
+        raise ValueError(f"{where}.require has a duplicate entry")
+    if not set(require) <= set(DEPLOY_REQUIRE):
+        raise ValueError(f"{where}.require may only hold {list(DEPLOY_REQUIRE)}")
+    out: dict[str, Any] = {"mode": mode, "command": command, "require": [r for r in DEPLOY_REQUIRE if r in require]}
+    if "health_url" in raw:
+        health = _judge_endpoint(raw["health_url"], f"{where}.health_url")
+        if not health:
+            raise ValueError(f"{where}.health_url must not be empty")
+        out["health_url"] = health
+    elif "require" in raw and "descends_from_deployed" in require:
+        # an explicit list naming the check needs the URL the hub reads the deployed commit from; with the default list
+        # a missing URL is not a config error, the check just stays unverified (pending) at run time
+        raise ValueError(f"{where}.health_url is required when require includes descends_from_deployed")
+    return out
+
+
+def _deploy_config(raw: Any) -> dict[str, Any]:
+    """``personal_assistant.deploy``: ``{projects: {<id>: {repo, scopes: {<id>: {mode, command, require}}}}}``.
+
+    Strict and fail closed.  ``mode: auto`` is a candidate only: nothing here authorizes a deploy; the owner's Slack
+    confirmation stores the standing grant that does."""
+    where = "control_plane.personal_assistant.deploy"
+    if raw is None:
+        return {"projects": {}}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be a mapping")
+    unknown = set(raw) - {"projects", "precondition_timeout_seconds", "deploy_check_minutes", "deploy_window_minutes"}
+    if unknown:
+        raise ValueError(f"{where} has unknown keys: {sorted(map(str, unknown))}")
+    minutes: dict[str, int] = {}
+    for name in ("deploy_check_minutes", "deploy_window_minutes"):
+        if name in raw:
+            if type(raw[name]) is not int or not 1 <= raw[name] <= 240:
+                raise ValueError(f"{where}.{name} must be an integer from 1 to 240")
+            minutes[name] = raw[name]
+    if minutes.get("deploy_window_minutes", 1) > minutes.get("deploy_check_minutes", 20):
+        raise ValueError(f"{where}.deploy_window_minutes must not exceed deploy_check_minutes")
+    timeout = raw.get("precondition_timeout_seconds")
+    if "precondition_timeout_seconds" in raw and (type(timeout) is not int or not 1 <= timeout <= 60):
+        raise ValueError(f"{where}.precondition_timeout_seconds must be an integer from 1 to 60")
+    projects = raw.get("projects", {})
+    if not isinstance(projects, dict):
+        raise ValueError(f"{where}.projects must be a mapping")
+    if len(projects) > 50:
+        raise ValueError(f"{where}.projects has too many entries (at most 50)")
+    out: dict[str, Any] = {}
+    seen: set[tuple[str, str]] = set()
+    for pid, proj in projects.items():
+        if not isinstance(pid, str) or not _DEPLOY_ID.fullmatch(pid):
+            raise ValueError(f"{where}: project id {pid!r} must match [a-z0-9][a-z0-9_-]{{0,63}}")
+        pwhere = f"{where}.projects.{pid}"
+        if not isinstance(proj, dict):
+            raise ValueError(f"{pwhere} must be a mapping")
+        inline = sorted(k for k in proj if isinstance(k, str) and any(w in k.lower() for w in _DEPLOY_SECRET_WORDS))
+        if inline:
+            raise ValueError(f"{pwhere} must not hold secrets inline ({inline})")
+        unknown = set(proj) - {"repo", "scopes"}
+        if unknown:
+            raise ValueError(f"{pwhere} has unknown keys: {sorted(map(str, unknown))}")
+        repo = proj.get("repo")
+        if (not isinstance(repo, str) or not _DEPLOY_REPO.fullmatch(repo) or repo.endswith(".git")
+                or any(part in (".", "..") for part in repo.split("/"))):
+            raise ValueError(f"{pwhere}.repo must be owner/name")
+        scopes = proj.get("scopes")
+        if not isinstance(scopes, dict) or not scopes or len(scopes) > 20:
+            raise ValueError(f"{pwhere}.scopes must be a mapping of 1 to 20 scopes")
+        norm: dict[str, Any] = {}
+        for sid, scope in scopes.items():
+            if not isinstance(sid, str) or not _DEPLOY_ID.fullmatch(sid):
+                raise ValueError(f"{pwhere}: scope id {sid!r} must match [a-z0-9][a-z0-9_-]{{0,63}}")
+            norm[sid] = _deploy_scope(scope, f"{pwhere}.scopes.{sid}")
+            ident = (repo.casefold(), norm[sid]["command"])
+            if ident in seen:
+                raise ValueError(f"{pwhere}.scopes.{sid}: duplicate repo and command (another scope already runs it)")
+            seen.add(ident)
+        out[pid] = {"repo": repo, "scopes": norm}
+    return {"projects": out, **minutes,
+            **({"precondition_timeout_seconds": timeout} if timeout is not None else {})}
 
 
 def apps_config(raw: Any) -> dict[str, Any]:
@@ -2081,6 +2280,12 @@ class AssistantStore:
         self._judge_index: dict[str, dict[str, None]] = {}
         self.max_action_rows_per_tenant = 5000
         self.max_action_grants_per_tenant = 2000
+        self.slack_asks: dict[str, SlackAsk] = {}                   # insertion order == oldest first
+        self.max_slack_asks_per_tenant = 2000
+        self._slack_index: dict[str, dict[str, None]] = {}
+        self.deploy_checks: dict[str, DeployCheck] = {}             # insertion order == oldest first
+        self.max_deploy_checks_per_tenant = 500
+        self._deploy_index: dict[str, dict[str, None]] = {}
         self._request_index: dict[str, dict[str, None]] = {}        # tenant -> request ids, oldest first
         self._evidence_index: dict[str, dict[str, None]] = {}
         self.policy_state: dict[str, Any] = {}                      # small durable policy facts (shadow start)
@@ -2132,6 +2337,28 @@ class AssistantStore:
             kwargs[f.name] = v
         return cls(**kwargs)
 
+    @classmethod
+    def _restore_deploy_check(cls, d: Any) -> DeployCheck | None:
+        """A stored deploy check, read back fail closed: unreadable parts make it ``unconfirmed``, an untrustworthy
+        row (no ids, malformed sha) is dropped.  Never raises."""
+        if not isinstance(d, dict):
+            return None
+        try:
+            row = cls._e_from_dict(DeployCheck, d)
+        except Exception:                               # noqa: BLE001 - e.g. a corrupt datetime
+            try:
+                row = cls._e_from_dict(DeployCheck, {k: v for k, v in d.items()
+                                                     if not (isinstance(v, dict) and "$dt" in v)})
+            except Exception:                           # noqa: BLE001
+                return None
+            row.status = "unconfirmed"
+            row.last_error = "bad_state"
+            row.notified = False                        # the owner has not been told about THIS state
+        try:
+            return sanitize_check(row)
+        except Exception:                               # noqa: BLE001
+            return None
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -2156,6 +2383,8 @@ class AssistantStore:
                 "action_requests": [self._e_to_dict(x) for x in self.action_requests.values()],
                 "action_evidence": [self._e_to_dict(x) for x in self.action_evidence.values()],
                 "judge_records": [self._e_to_dict(x) for x in self.judge_records.values()],
+                "slack_asks": [self._e_to_dict(x) for x in self.slack_asks.values()],
+                "deploy_checks": [self._e_to_dict(x) for x in self.deploy_checks.values()],
                 "policy_state": dict(self.policy_state),
                 "routine_fired": sorted(self._routine_fired),
                 "audit": [dict(e) for e in self._audit],
@@ -2214,7 +2443,17 @@ class AssistantStore:
                                     (self._e_from_dict(ActionEvidence, d) for d in snap.get("action_evidence", []))}
             self.judge_records = {x.record_id: x for x in
                                   (self._e_from_dict(JudgeRecord, d) for d in snap.get("judge_records", []))}
+            self.slack_asks = {x.ask_id: x for x in
+                               (self._e_from_dict(SlackAsk, d) for d in snap.get("slack_asks", []))}
+            self.deploy_checks = {x.check_id: x for x in
+                                  (self._restore_deploy_check(d) for d in snap.get("deploy_checks", [])) if x}
             self._request_index, self._evidence_index, self._judge_index = {}, {}, {}
+            self._slack_index = {}
+            self._deploy_index = {}
+            for dc in self.deploy_checks.values():
+                self._deploy_index.setdefault(dc.tenant_id, {})[dc.check_id] = None
+            for sa in self.slack_asks.values():
+                self._slack_index.setdefault(sa.tenant_id, {})[sa.ask_id] = None
             for j in self.judge_records.values():
                 self._judge_index.setdefault(j.tenant_id, {})[j.record_id] = None
             for r in self.action_requests.values():
@@ -2222,11 +2461,13 @@ class AssistantStore:
             for ev in self.action_evidence.values():
                 self._evidence_index.setdefault(ev.tenant_id, {})[ev.evidence_id] = None
             self.policy_state = dict(snap.get("policy_state", {}))
-            for rows, index in ((self.action_requests, self._request_index),
-                                (self.action_evidence, self._evidence_index),
-                                (self.judge_records, self._judge_index)):
+            for rows, index, cap in ((self.action_requests, self._request_index, self.max_action_rows_per_tenant),
+                                     (self.action_evidence, self._evidence_index, self.max_action_rows_per_tenant),
+                                     (self.judge_records, self._judge_index, self.max_action_rows_per_tenant),
+                                     (self.slack_asks, self._slack_index, self.max_slack_asks_per_tenant),
+                                     (self.deploy_checks, self._deploy_index, self.max_deploy_checks_per_tenant)):
                 for idx in index.values():           # an oversized snapshot must not stay over the cap
-                    while len(idx) > self.max_action_rows_per_tenant:
+                    while len(idx) > cap:
                         rows.pop(next(iter(idx)), None)
                         del idx[next(iter(idx))]
             self._routine_fired = set(snap.get("routine_fired", []))
@@ -2256,16 +2497,18 @@ class AssistantStore:
 
     # -- action grants, requests and evidence (assistant hub) -------------------
     def _bounded_put(self, rows: dict[str, Any], index: dict[str, dict[str, None]], tenant_id: str, row_id: str,
-                     row: Any) -> None:
+                     row: Any, cap: int | None = None) -> None:
         existing = rows.get(row_id)
         if existing is not None and existing.tenant_id != tenant_id:
             raise ValueError(f"id {row_id!r} already belongs to another tenant")     # ids are immutable per tenant
         rows[row_id] = row
         idx = index.setdefault(tenant_id, {})
         idx[row_id] = None                  # re-putting an id keeps its original position
-        while len(idx) > self.max_action_rows_per_tenant:
+        limit = self.max_action_rows_per_tenant if cap is None else cap
+        while len(idx) > limit:
             # decided rows go first, so a flood of vetoed or decided requests never pushes out a pending one
-            old = next((k for k in idx if getattr(rows.get(k), "status", "") in ("vetoed", "denied", "approved")),
+            old = next((k for k in idx if getattr(rows.get(k), "status", "") in
+                        ("vetoed", "denied", "approved", "decided", "expired")),
                        None) or next(iter(idx))
             del idx[old]
             rows.pop(old, None)
@@ -2309,6 +2552,119 @@ class AssistantStore:
             return self._sorted_copies([r for r in self.action_requests.values()
                                         if r.tenant_id == tenant_id and r.user_id == user_id
                                         and (status is None or r.status == status)])
+
+    def list_pending_action_requests_any(self) -> list[ActionRequestRow]:
+        """Every tenant's pending requests, oldest first, as copies (the Slack sweep's one cross-tenant read)."""
+        with self._lock:
+            return self._sorted_copies([r for r in self.action_requests.values() if r.status == "pending"])
+
+    def slack_asks_for_request(self, request_id: str) -> list[SlackAsk]:
+        with self._lock:
+            return [replace(a) for a in self.slack_asks.values() if a.request_id == request_id]
+
+    # -- Slack asks (assistant hub) ---------------------------------------------
+    def put_slack_ask(self, ask: SlackAsk) -> None:
+        with self._lock:
+            self._bounded_put(self.slack_asks, self._slack_index, ask.tenant_id, ask.ask_id, replace(ask),
+                              cap=self.max_slack_asks_per_tenant)
+            self._after_mutation()
+
+    def get_slack_ask(self, ask_id: str, *, tenant_id: str, user_id: str) -> SlackAsk | None:
+        with self._lock:
+            a = self.slack_asks.get(ask_id)
+            return replace(a) if a and a.tenant_id == tenant_id and a.user_id == user_id else None
+
+    def find_slack_ask(self, ask_id: str) -> SlackAsk | None:
+        """Look an ask up by id alone. Only for the Slack runtime, which has just a button's id and needs the ask's own
+        tenant and user to scope everything else (audit included); every other caller uses ``get_slack_ask``."""
+        with self._lock:
+            a = self.slack_asks.get(ask_id)
+            return replace(a) if a else None
+
+    def find_slack_ask_by_message(self, channel: str, ts: str) -> SlackAsk | None:
+        """The ask the hub posted as message ``ts`` in ``channel`` (a thread reply names its parent this way)."""
+        if not channel or not ts:
+            return None
+        with self._lock:
+            for a in self.slack_asks.values():
+                if a.ts == ts and a.channel == channel:
+                    return replace(a)
+            return None
+
+    def list_unposted_slack_questions(self) -> list[SlackAsk]:
+        """Open questions that never reached Slack (a restart or an outage), oldest first, across tenants."""
+        with self._lock:
+            return [replace(a) for a in self.slack_asks.values()
+                    if a.kind == "question" and a.status == "open" and not a.ts]
+
+    def find_summary_ask(self, tenant_id: str, user_id: str, worker_id: str, task_id: str) -> SlackAsk | None:
+        """The one summary row (tracker, then record) of this worker's task, scoped to tenant and user."""
+        with self._lock:
+            for a in self.slack_asks.values():
+                if (a.kind == "summary" and a.tenant_id == tenant_id and a.user_id == user_id
+                        and a.worker_id == worker_id and a.task_id == task_id):
+                    return replace(a)
+            return None
+
+    def list_open_summaries(self, tenant_id: str | None = None, user_id: str | None = None,
+                            worker_id: str | None = None) -> list[SlackAsk]:
+        """Summary rows still waiting to be posted (no message yet), oldest first.  No filter: every tenant's."""
+        with self._lock:
+            return [replace(a) for a in self.slack_asks.values()
+                    if a.kind == "summary" and a.status == "open" and not a.ts
+                    and (tenant_id is None or a.tenant_id == tenant_id) and (user_id is None or a.user_id == user_id)
+                    and (worker_id is None or a.worker_id == worker_id)]
+
+    def task_activity(self, tenant_id: str, user_id: str, worker_id: str, task_id: str) -> dict[str, int]:
+        """Counts for one worker's task: grant and one-shot authorizations (from the action_request events), plus
+        owner-denied and vetoed requests (from the request rows).  Every row is scoped by tenant, user and worker."""
+        with self._lock:
+            events = [e for e in self.worker_events.values()
+                      if e.kind == "action_request" and e.tenant_id == tenant_id and e.user_id == user_id
+                      and e.worker_id == worker_id and e.payload.get("task_id") == task_id
+                      and e.payload.get("outcome") == "authorized"]
+            rows = [r for r in self.action_requests.values()
+                    if r.tenant_id == tenant_id and r.user_id == user_id and r.worker_id == worker_id
+                    and r.task_id == task_id]
+        return {"grant": sum(1 for e in events if e.payload.get("source") == "grant"),
+                "one_shot": sum(1 for e in events if e.payload.get("source") == "owner"),
+                "denied": sum(1 for r in rows if r.status == "denied"),
+                "vetoed": sum(1 for r in rows if r.status == "vetoed")}
+
+    # -- deploy outcome checks (assistant hub) ----------------------------------
+    def put_deploy_check(self, check: DeployCheck) -> None:
+        with self._lock:
+            self._bounded_put(self.deploy_checks, self._deploy_index, check.tenant_id, check.check_id, replace(check),
+                              cap=self.max_deploy_checks_per_tenant)
+            self._after_mutation()
+
+    def get_deploy_check(self, check_id: str, *, tenant_id: str, user_id: str) -> DeployCheck | None:
+        with self._lock:
+            c = self.deploy_checks.get(check_id)
+            return replace(c) if c and c.tenant_id == tenant_id and c.user_id == user_id else None
+
+    def list_deploy_checks(self, tenant_id: str, user_id: str, *, worker_id: str | None = None,
+                           task_id: str | None = None) -> list[DeployCheck]:
+        """This tenant's and user's checks, oldest first (by start), optionally of one worker and task."""
+        with self._lock:
+            rows = [c for c in self.deploy_checks.values() if c.tenant_id == tenant_id and c.user_id == user_id
+                    and (worker_id is None or c.worker_id == worker_id) and (task_id is None or c.task_id == task_id)]
+            return [replace(c) for c in sorted(rows, key=lambda c: c.started_at)]
+
+    def list_deploy_checks_any(self, *, status: str | None = None, unnotified: bool = False) -> list[DeployCheck]:
+        """Every tenant's checks of one status (or the finished ones whose Slack message is not posted), oldest first:
+        the checker's and the Slack sweep's one cross-tenant read."""
+        with self._lock:
+            rows = [c for c in self.deploy_checks.values()
+                    if (status is None or c.status == status) and (not unnotified or (c.status in DEPLOY_FINAL
+                                                                                       and not c.notified))]
+            return [replace(c) for c in sorted(rows, key=lambda c: c.started_at)]
+
+    def list_slack_asks(self, tenant_id: str, user_id: str, status: str | None = None) -> list[SlackAsk]:
+        with self._lock:
+            return self._sorted_copies([a for a in self.slack_asks.values()
+                                        if a.tenant_id == tenant_id and a.user_id == user_id
+                                        and (status is None or a.status == status)])
 
     def add_action_evidence(self, evidence: ActionEvidence) -> None:
         with self._lock:
