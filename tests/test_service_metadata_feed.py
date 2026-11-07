@@ -3,6 +3,7 @@ import copy
 import io
 import json
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -419,3 +420,24 @@ def test_registered_work_reserves_budget_for_dynamic_discovery(setup):
 def test_feed_asks_only_for_its_own_hosts_services(setup):
     setup.feed.collect()
     assert setup.client.service_routes == ["/api/v1/services?host_id=host&fields=feed"]
+
+
+def test_inventory_is_read_across_every_page_the_server_offers(setup):
+    real = setup.client.services
+    filler = [{"service_id": f"other-{i}", "host_id": "host", "service_name": "x", "source_port": 20000 + i}
+              for i in range(3)]
+    inventory = filler + real  # the matching record is on the last page
+    routes = []
+
+    def request(route, body=None):
+        if not route.startswith("/api/v1/services"):
+            return Client.request(setup.client, route, body)
+        routes.append(route)
+        offset = int(parse_qs(urlsplit(route).query).get("offset", ["0"])[0])
+        more = offset + 2 < len(inventory)
+        return {"services": copy.deepcopy(inventory[offset:offset + 2]),
+                "pagination": {"next_offset": offset + 2 if more else None}}
+
+    setup.client.request = request
+    assert setup.feed.run_once()["observed"] == 1
+    assert len(routes) == 2 and "offset=2" in routes[1]

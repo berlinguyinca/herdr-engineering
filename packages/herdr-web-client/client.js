@@ -669,8 +669,27 @@ export class HerdrClient {
   }
 
   // -- services / hosts ---------------------------------------------------
-  listServices({ signal } = {}) {
-    return this.request('/api/v1/services', { signal });
+  /**
+   * Services arrive in capped pages (`pagination.next_offset`). By default the
+   * remaining pages are fetched one request at a time and merged, so callers
+   * still receive the whole inventory; pass `all:false` for the first page only.
+   */
+  listServices({ signal, all = true } = {}) {
+    return this._collectPages('/api/v1/services', 'services', { signal, all });
+  }
+
+  async _collectPages(path, field, { signal, all }) {
+    let body = await this.request(path, { signal });
+    let next = body?.pagination?.next_offset;
+    if (!all || next == null) return body;
+    const rows = [...(body[field] || [])];
+    for (let pages = 1; next != null && pages < 200; pages++) {
+      const page = await this.request(`${path}?offset=${encodeURIComponent(next)}`, { signal });
+      rows.push(...(page?.[field] || []));
+      next = page?.pagination?.next_offset;
+    }
+    return { ...body, [field]: rows,
+      pagination: { ...body.pagination, limit: rows.length, next_offset: null, truncated: next != null } };
   }
 
   listServiceCatalog({scope='herdr', status='current', includeArchived=false,
@@ -920,8 +939,9 @@ export class HerdrClient {
     return this.request(`/api/v1/ci/performance?${query}`, { signal });
   }
 
-  getCiHistory({ signal } = {}) {
-    return this.request('/api/v1/ci/history', { signal });
+  /** Pipelines are paged server-side; see listServices for the merge behaviour. */
+  getCiHistory({ signal, all = true } = {}) {
+    return this._collectPages('/api/v1/ci/history', 'pipelines', { signal, all });
   }
 
   getCiPipeline(repository, number, { signal, providerUrl } = {}) {

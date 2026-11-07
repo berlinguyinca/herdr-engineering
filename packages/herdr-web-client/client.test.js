@@ -387,6 +387,33 @@ test('CI report history reads use viewer GET and forward cancellation',async()=>
  } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
 });
 
+test('listServices and getCiHistory lazily follow next_offset and merge pages',async()=>{
+ const calls=[];
+ const server=createServer((req,res)=>{
+  calls.push(req.url);
+  const offset=Number(new URL(req.url,'http://x').searchParams.get('offset')||0);
+  const key=req.url.startsWith('/api/v1/services')?'services':'pipelines';
+  const next=offset<2?offset+1:null;
+  res.setHeader('Content-Type','application/json');
+  res.end(JSON.stringify({[key]:[{id:offset}],summary:{total:3},repos:[],coverage:{},pagination:{total:3,limit:1,offset,next_offset:next,truncated:next!==null}}));
+ });
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ try {
+  const client=new HerdrClient(`http://127.0.0.1:${server.address().port}`);
+  const services=await client.listServices();
+  assert.deepEqual(services.services,[{id:0},{id:1},{id:2}]);
+  assert.equal(services.pagination.next_offset,null);
+  assert.deepEqual(calls,['/api/v1/services','/api/v1/services?offset=1','/api/v1/services?offset=2']);
+  calls.length=0;
+  const history=await client.getCiHistory();
+  assert.deepEqual(history.pipelines,[{id:0},{id:1},{id:2}]);
+  assert.deepEqual(calls,['/api/v1/ci/history','/api/v1/ci/history?offset=1','/api/v1/ci/history?offset=2']);
+  calls.length=0;
+  assert.equal((await client.listServices({all:false})).services.length,1);
+  assert.deepEqual(calls,['/api/v1/services']);
+ } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+});
+
 test('CI heatmap history uses the viewer endpoint and supports cancellation',async()=>{
  const calls=[];
  const server=createServer((req,res)=>{calls.push({url:req.url,method:req.method});res.setHeader('Content-Type','application/json');res.end(JSON.stringify({repos:[],pipelines:[],coverage:{}}));});

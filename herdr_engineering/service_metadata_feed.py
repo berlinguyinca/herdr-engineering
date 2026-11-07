@@ -202,7 +202,16 @@ class ServiceMetadataFeed:
             # Only this host's records matter, and the full fleet inventory can
             # outgrow the reply cap, which silently stops every observation.
             query = urlencode({"host_id": self.host_id, "fields": "feed"})
-            services = self.client.request(f"/api/v1/services?{query}").get("services")
+            body = self.client.request(f"/api/v1/services?{query}")
+            services = body.get("services")
+            # The server caps each reply; follow its next_offset marker.
+            while isinstance(services, list) and len(services) <= MAX_RECORDS:
+                next_offset = (body.get("pagination") or {}).get("next_offset")
+                if next_offset is None:
+                    break
+                body = self.client.request(f"/api/v1/services?{query}&offset={int(next_offset)}")
+                page = body.get("services")
+                services = services + page if isinstance(page, list) else None
             if not isinstance(services, list) or len(services) > MAX_RECORDS:
                 raise ValueError("invalid service inventory")
             listeners = scan_listening_ports()
