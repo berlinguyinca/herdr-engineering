@@ -28,7 +28,8 @@ but never the private dashboard. The dashboard integrates the library as a read-
 - No dashboard write path: no approve, revoke, file, delete from the dashboard. (Owner actions stay in the member page.)
 - No call from the host to the control plane, ever; no shared Postgres, RustFS bucket or mounted directory.
 - No dark mode on public pages. No phase-2 learning work here (the host is built so phase 2 can live in it).
-- CI-report and agent-report artifacts stay in the control plane; they are not member artifacts.
+- CI-report and agent-report artifacts stay in the control plane and are NOT listed in the dashboard `/library`, which
+  shows member artifacts only (owner decision); the dashboard's own Artifacts page keeps showing the reports.
 
 ## Architecture
 
