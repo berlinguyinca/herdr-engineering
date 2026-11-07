@@ -180,15 +180,15 @@ The CoreDNS + gateway containers are removed; the `herdr-state` named volume
 | Script | Platform | Role |
 |---|---|---|
 | `scripts/install.sh` | Linux + macOS | Install herdr-engineering, enroll the machine in the fleet inventory, join the tailnet. |
-| `scripts/fabric-stack.sh` | master host | Deploy the CoreDNS + gateway + web Compose stack. Subcommands: `up`, `up-replace`, `down`, `status`, `stop-old`. |
+| `scripts/fabric-stack.sh` | master host | Deploy the CoreDNS + gateway Compose stack. Subcommands: `up`, `up-replace`, `down`, `status`, `stop-old`. |
 | `scripts/fabric-agent.sh` | Linux | Install + start the auto-registration agent as a systemd **user** unit (linger). |
 | `scripts/fabric-agent-macos.sh` | macOS | Install + start the auto-registration agent as a **launchd LaunchAgent** (uv + Python 3.12). Subcommands: `install`, `status`, `uninstall [--purge]`. |
 | `scripts/fabric-offboard.sh` | Linux + macOS | Stop the agent, close this host's leases, remove it from the fleet inventory. Flags: `--host`, `--gateway`, `--leave-tailnet`, `--purge`. |
 
 ## Design notes / invariants
 
-- **Private by default.** The gateway router, control API, agent forwarders,
-  and web UI all bind loopback / tailnet interfaces only — never `0.0.0.0`,
+- **Private by default.** The gateway router, control API and agent forwarders
+  all bind loopback / tailnet interfaces only — never `0.0.0.0`,
   never a public address.
 - **No secrets in the repo.** Control-API bearer tokens live only in the
   environment or a machine-local gitignored file. The gateway URL lives in

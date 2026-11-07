@@ -49,14 +49,36 @@ def test_old_host_unit_and_its_ansible_task_are_gone():
     assert "web-serve.yml" not in (ROOT / "ansible" / "playbooks" / "site.yml").read_text()
 
 
-def test_fabric_stack_script_names_no_herdr_web_service():
-    text = (ROOT / "scripts" / "fabric-stack.sh").read_text()
-    down = next(line for line in text.splitlines() if line.startswith("down()"))
-    assert "herdr-web" not in down
+def _fabric_stack() -> str:
+    return (ROOT / "scripts" / "fabric-stack.sh").read_text()
+
+
+def _function(text: str, name: str) -> str:
+    start = text.index(f"\n{name}() {{")
+    return text[start:text.index("\n}", start + 1)]
+
+
+def test_fabric_stack_looks_for_the_left_container_by_type():
+    helper = next(line for line in _fabric_stack().splitlines() if line.startswith("left_herdr_web()"))
+    assert "docker inspect --type container herdr-web" in helper
+
+
+def test_fabric_stack_down_leaves_a_left_herdr_web_container_alone_and_says_so():
+    down = _function(_fabric_stack(), "down")
+    assert '"${COMPOSE[@]}" stop coredns fabric-gateway\n' in down  # the service is not named
+    assert "left_herdr_web" in down and "warn " in down
+    assert "docker stop" not in down and "docker rm" not in down and " rm " not in down
 
 
 def test_fabric_stack_up_never_removes_a_left_herdr_web_container():
-    text = (ROOT / "scripts" / "fabric-stack.sh").read_text()
-    up = text[text.index("\nup() {"):text.index("\nmemory_status() {")]
-    guard = up.index("docker inspect herdr-web")
-    assert up.index("orphans=()", guard) < up.index('up -d ${orphans[@]+"${orphans[@]}"}')
+    up = _function(_fabric_stack(), "up")
+    guard = up.index("elif left_herdr_web; then")
+    cleared = up.index("orphans=()", guard)
+    run = up.index('up -d ${orphans[@]+"${orphans[@]}"}')
+    assert cleared < run
+    assert "orphans=(--remove-orphans)" not in up[guard:run]  # nothing re-enables it after the guard
+
+
+def test_install_writes_no_web_block():
+    # the dev agent's 8787 exclusion comes from config.py's defaults, so new machine configs need no `web:`
+    assert "\nweb:\n" not in (ROOT / "scripts" / "install.sh").read_text()

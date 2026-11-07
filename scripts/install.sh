@@ -164,11 +164,6 @@ else
 # Private-by-default. No secrets here; add per-host overrides below.
 version: 1
 
-web:
-  private_only: true
-  host: 127.0.0.1
-  port: 8787
-
 artifacts:
   provider: filesystem
   retention_days: 30

@@ -631,7 +631,7 @@ def _build_parser() -> argparse.ArgumentParser:
                          "100.104.39.6:80. Needs the named listener (--acme-domain) and a certificate for the name")
     p2.add_argument("--route", action="append", default=[], metavar="HOST=UP:PORT",
                     help="send one exact host name on the named port to an upstream (repeatable), e.g. "
-                         "bender.tail0c50da.ts.net=127.0.0.1:8787 to take over a `tailscale serve` rule")
+                         "node.example.ts.net=127.0.0.1:8080 to take over a `tailscale serve` rule")
     p2.add_argument("--tailscale-cert", default=None, metavar="NAME",
                     help="also serve this node's ts.net NAME with the certificate `tailscale cert` provides")
     p2.add_argument("--no-named-urls", action="store_true", help="do not serve stable service-name URLs")

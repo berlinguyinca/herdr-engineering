@@ -269,8 +269,8 @@ herdr-eng browser http://localhost:5173 --json
 ```
 
 Run `herdr-eng --help` for the full command set. Every command that emits
-structured data supports `--json`. The web UI is private by default
-(`private_only: true`, host `127.0.0.1`); expose it only via the tailnet.
+structured data supports `--json`. The control plane's web UI is private by
+default (it binds loopback unless configured otherwise); expose it only via the tailnet.
 
 ### Security model (control plane)
 
@@ -604,7 +604,8 @@ evidence: [`docs/architecture/dev-fabric-gateway.md`](docs/architecture/dev-fabr
 The stdlib web/mobile surface (`herdr-eng web`, `web.py`, the `herdr-web` container and the
 `herdr-eng-web` user unit) was retired on 2026-11-07; nobody used it. The control plane's UI
 (`herdr-eng control-plane web`) is the web surface. A `herdr-web` container left on the control
-host is removed by the herdr-fleet `control-plane` role's adoption.
+host is removed by the herdr-fleet `control-plane` role's adoption; `scripts/fabric-stack.sh` neither
+stops nor removes it (`down` leaves it running and says so).
 
 ## Lineage continuity, artifact visibility and delivery metrics
 

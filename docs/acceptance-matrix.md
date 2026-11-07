@@ -156,8 +156,8 @@ unit-tested; only live convergence/validation is pending.
       forwarder bound to `100.104.39.6:18000` (bender's tailnet IP, private,
       not public); `curl http://100.104.39.6:18000/` → HTTP 200. The remaining
       step is a human opening that address on an actual phone/iPad (the same
-      phone/iPad tailnet UI path also serves the private web UI via the stable
-      `https://<gateway-magicdns>` URL — see the Web/mobile rows above).
+      phone/iPad tailnet UI path once served the private web UI via the stable
+      `https://<gateway-magicdns>` URL; that surface is retired — see the Web/mobile note above).
 - [x] HTTP works. **Live-verified** via `herdr-eng devfabric serve` (TCP
       forwarder) proxying a real HTTP server through the leased port.
 - [x] WebSocket/SSE/HMR/generic TCP work where declared by service type. The
@@ -271,9 +271,12 @@ unit-tested; only live convergence/validation is pending.
       SSH and a second run was idempotent (`changed=0`); herdr/pi/brew tools
       verified present on the machine afterwards. Note: the host was renamed
       `macbook-m4` → `mac` to match the real tailnet name.
-- [ ] phone/iPad tailnet validation passes via the persistent gateway URL
-      (`https://<gateway-magicdns>`, `tailscale serve` → `127.0.0.1:8787`).
-      **BLOCKED_EXTERNAL** — deployment artifacts live; requires a physical
-      phone/iPad on the tailnet to open the stable URL.
+- [x] ~~phone/iPad tailnet validation passes via the persistent gateway URL
+      (`https://<gateway-magicdns>`, `tailscale serve` → `127.0.0.1:8787`).~~
+      **Resolved by retirement (2026-11-07):** the 8787 web surface (spec 0060)
+      is retired, so there is nothing to validate there. **Open owner decision:**
+      the gateway still routes the node's ts.net name to `127.0.0.1:8787`
+      (`deploy/fabric-stack/config.yaml`); repoint it to the control plane or
+      drop it before the control-plane role's adoption removes the container.
 - [x] README commands match the real shipped implementation. Updated with real
       `herdr-eng` commands and observed output.

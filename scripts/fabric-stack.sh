@@ -2,8 +2,9 @@
 # Deploy the HerdR Engineering master-host stack (CoreDNS + fabric gateway)
 # as part of the single Docker Compose project on the master host.
 #
-# This replaces the manually-started fabric gateway process and the
-# herdr-eng-web systemd unit with containers. The per-host auto-registration
+# This replaces the manually-started fabric gateway process with containers
+# (`up-replace` also stops the old, retired herdr-eng-web unit if it is still
+# active). The per-host auto-registration
 # agent stays a host systemd unit (it must see host listeners via ss/lsof).
 #
 #   ./scripts/fabric-stack.sh            # detect IP, write .env, build+up
@@ -83,6 +84,10 @@ stop_old_host_services() {
     fi
 }
 
+# A container of the retired herdr-web service (no longer in compose). This script never stops or removes it;
+# the control-plane role's adoption does.
+left_herdr_web() { docker inspect --type container herdr-web >/dev/null 2>&1; }
+
 up() {
     write_env
     gen_coredns
@@ -92,10 +97,10 @@ up() {
     # Nor while a container of the retired herdr-web service is left: the control-plane role's adoption
     # removes it, never this script.
     local orphans=(--remove-orphans)
-    if docker inspect herdr-hindsight >/dev/null 2>&1 || docker inspect herdr-hindsight-db >/dev/null 2>&1; then
+    if docker inspect --type container herdr-hindsight >/dev/null 2>&1 || docker inspect --type container herdr-hindsight-db >/dev/null 2>&1; then
         orphans=()
         warn "Hindsight memory containers present: not using --remove-orphans (managed by deploy.sh --with-memory)"
-    elif docker inspect herdr-web >/dev/null 2>&1; then
+    elif left_herdr_web; then
         orphans=()
         warn "retired herdr-web container present: not using --remove-orphans (the control-plane role's adoption removes it)"
     fi
@@ -148,7 +153,12 @@ status() {
     fi
 }
 
-down() { "${COMPOSE[@]}" stop coredns fabric-gateway; }  # not the control plane
+down() {  # not the control plane
+    "${COMPOSE[@]}" stop coredns fabric-gateway
+    if left_herdr_web; then
+        warn "retired herdr-web container left running (not part of this stack any more; the control-plane role's adoption removes it)"
+    fi
+}
 
 cmd="${1:-up}"
 case "$cmd" in
@@ -156,7 +166,7 @@ case "$cmd" in
         up
         ;;
     up-replace)
-        stop_old_host_services   # must free ports 8787/29999/18000+ first
+        stop_old_host_services   # must free ports 29999/18000+ first
         up
         ;;
     down)
