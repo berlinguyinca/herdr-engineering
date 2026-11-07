@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Release pipeline (not enabled until the owner turns it on)
+- A Woodpecker pipeline (`.woodpecker/release.yml`) runs on a `v*` tag only: it verifies the tag against the version sources, builds the multi-arch `herdr-engineering` image with digest-pinned tooling, pushes it by digest, reads it back, and attaches `release.json` (`deploy/release.schema.json`) to a draft GitHub release that is published last. Nothing is published until the owner creates the tag ruleset, secrets and agent described in `docs/releases.md`; the first release must be `v0.1.1` or later, and the memory-client variant is never published.
+
 ### Drift graph layout router
 - The graph no longer falls into one tall column that leaves half the pane empty: boxes are packed into balanced rows (label width 40 down to 8 tried) joined by arrows, with an elbow connector from the end of a row to the start of the next, and the arrangement with the fewest lines wins. A single column remains for panes too narrow for two boxes; the drift marker stays under its own box, including at the end of a row. ASCII and the width guarantee are unchanged.
 

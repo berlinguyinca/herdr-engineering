@@ -161,7 +161,7 @@ def test_docs_describe_the_manual_gate():
     text = (ROOT / "docs" / "releases.md").read_text()
     for needle in ("owner", "v[0-9]+.[0-9]+.[0-9]+", "release.json", "ghcr_push_token", "github_release_token", "@sha256:",
                    "Tag ruleset", "required before the first release", "not a security boundary", "## Rollback",
-                   "never re-tag", "## Known gap", "base image only", "keep deploying with `deploy.sh`", "classic",
+                   "never re-tag", "## Memory-client variant", "base image only", "memory-client-not-pinned", "images.memory-client", "v0.1.1", "classic",
                    "fine-grained", "draft", "## Builder cleanup"):
         assert needle.lower() in text.lower(), needle
     binfmt = re.search(r"tonistiigi/binfmt\S*", text).group(0)

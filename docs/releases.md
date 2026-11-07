@@ -33,14 +33,14 @@ already published is never touched; the run fails instead. So a published releas
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "image": {"repository": "ghcr.io/berlinguyinca/herdr-engineering", "digest": "sha256:<64 hex>"},
   "commit": "<40-hex git sha>"
 }
 ```
 
 Deploy with `image.repository@image.digest`. The `vX.Y.Z` image tag is mutable and only for browsing the registry;
-`herdr-fleet init` and `herdr-fleet pins update` read `release.json` and never resolve a tag.
+`herdr-fleet pins update --from release.json` reads it and never resolves a tag (`herdr-fleet init` does not read it).
 
 ## The manual gate: the owner cuts the release
 
@@ -58,7 +58,8 @@ the step fetches the full history of `main` together with the tagged commit (no 
 
 To cut a release, the owner:
 
-1. bumps `[project].version` in `pyproject.toml` on `main` (through a normal PR);
+1. bumps the version on `main` (through a normal PR) in all three sources named above. **A `v0.1.0` tag already exists
+   (annotated, 2026-09-24), so the first release must be `v0.1.1` or later;**
 2. creates and pushes an annotated tag on that main commit: `git tag -a vX.Y.Z -m vX.Y.Z <sha> && git push origin vX.Y.Z`;
 3. watches the `release` pipeline; on success, checks the GitHub release lists the digest and has `release.json`.
 
@@ -82,10 +83,17 @@ deleted in GHCR. Leftover drafts of abandoned versions may be deleted in GitHub.
   - Scope both to the `tag` event only. Do not restrict them by image: Woodpecker hands image-restricted secrets only to
     plugin steps, and these steps run commands. No pull request ever receives them, because this pipeline never runs
     on `pull_request` and the other pipelines do not reference them.
-- **Trusted repository** (Woodpecker, "volumes"): the docker steps mount the agent's docker socket. Trust lets every
-  pipeline of the repo mount host volumes, so the tag ruleset and the branch protection of `main` (which already gate
-  every `.woodpecker/*.yml` change through review) are what keep that safe.
-- **Docker agent**: a Woodpecker agent with the docker backend (`labels: backend: docker`), like the one inferweave's
+- **Trusted repository** (Woodpecker, "volumes"): the docker steps mount the agent's docker socket, which needs the repo
+  to be marked trusted. **Marking it trusted is the owner's call, and it widens exposure.** Woodpecker reads a
+  `pull_request` pipeline's config from the PR head, so on a trusted repo any PR pipeline can add a step with
+  `labels: backend: docker` and `/var/run/docker.sock`, which is root on the docker agent. Neither the tag ruleset nor
+  the branch protection of `main` prevents that: `main` has only a ruleset that requires a PR with 0 approvals, so any
+  writer can merge their own PR, and PR pipelines run before any merge. A PR pipeline cannot read the tag-scoped
+  secrets, but it controls the host that later runs a release. Recommended before trusting the repo:
+  - enable Woodpecker "require approval for pull requests" (at least forks; all PRs if the docker agent is shared);
+  - run the release pipeline on a **dedicated docker agent** (label-restricted to this repo), not a shared one;
+  - or avoid trusting this repo at all by moving the release job to a separate repo or agent.
+- **Docker agent** (dedicated, see above): a Woodpecker agent with the docker backend (`labels: backend: docker`), like the one inferweave's
   `fry-gateway-image` pipeline uses. Agent prerequisites: buildx in the step image (`docker:27.5.1-cli` ships it) and
   arm64 emulation registered on the host, once as root and again after each reboot (or via the host's binfmt service):
   `docker run --privileged --rm tonistiigi/binfmt:qemu-v9.2.2@sha256:1b804311fe87047a4c96d38b4b3ef6f62fca8cd125265917a9e3dc3c996c39e6 --install arm64`.
@@ -105,21 +113,28 @@ superseded by the next patch version; its GitHub release can be edited to say "d
 
 ## Builder cleanup
 
-`build-push.sh` creates a BuildKit container (`buildx_buildkit_herdr-release-<pipeline>0`) and removes it on every
-exit: success, failure and cancel. Woodpecker stops a cancelled step with SIGTERM first, and the trap turns that into an
-exit that runs the cleanup (`tests/test_release_pipeline.py` cancels a run and checks). Only a SIGKILL (agent crash, the
-stop grace period elapsing) can leave it behind. Find and remove leftovers on the agent host with
+`build-push.sh` creates a BuildKit container (`buildx_buildkit_herdr-release-<pipeline>0`) and installs an EXIT trap
+(plus HUP, INT and TERM traps that turn the signal into an exit) that removes it. The removal is **best effort**. On a
+normal success or failure exit the trap runs. On a cancel, Woodpecker sends SIGTERM, but the step's commands run under
+`sh` as PID 1, which defers the trap until the foreground `buildx build` returns, so the builder may be removed late
+or, if the step is then killed (SIGKILL, agent crash, the stop grace period elapsing), not at all. The reliable path is
+to find and remove leftovers on the agent host:
 `docker ps -a --filter name=buildx_buildkit_herdr-release- --format '{{.Names}}' | xargs -r docker rm -f`.
+The registry logout runs in the same trap, so it is best effort too; the token is passed only through
+`--password-stdin` and the step's environment ends with the step.
 
-## Known gap: the memory-client variant
+## Memory-client variant (not published)
 
-The published image is the **base image only**, built on `python:3.12-slim`. `deploy/control-plane/deploy.sh`
-(lines 729-731) builds a different image when the fleet config enables the memory client: it uses
-`RUNTIME_BASE=herdr-memory-client:<sha>`, built from the private `herdr-memory` repository
-(`deploy/control-plane/memory-client-deploy.sh`, `prepare-memory-client.sh`). That variant is not published yet. The
-memory role will deliver it later as a second published variant with its own digest. **Until then, fleets with the
-memory client enabled keep deploying with `deploy.sh`** and must not adopt the release digest: the published image has
-no memory CLI, its health checks still pass, and memory features would break silently.
+The published image is the **base image only**, built on `python:3.12-slim`. When the fleet config enables the memory
+client, `deploy/control-plane/deploy.sh` builds a different image (`RUNTIME_BASE=herdr-memory-client:<sha>`, from the
+private `herdr-memory` repository; `memory-client-deploy.sh`, `prepare-memory-client.sh`). That variant contains private
+code, so **public CI cannot publish it**. A memory-enabled fleet works like this:
+
+- the operator builds the memory-client variant and pins it as `images.memory-client`;
+- the control-plane role on memory hosts runs that pinned image;
+- a base web image that already has the memory CLI blocks with `memory-client-not-pinned`;
+- never adopt the base release digest for control-plane-web/-worker on a memory host: the base image has no memory CLI,
+  its health checks still pass, and memory features would break silently.
 
 ## Pins and their upkeep
 

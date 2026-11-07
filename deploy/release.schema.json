@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/berlinguyinca/herdr-engineering/blob/main/deploy/release.schema.json",
   "title": "herdr-engineering release.json",
-  "description": "The machine-readable record of one release, attached to its GitHub release by .woodpecker/release.yml (docs/releases.md). Consumers (herdr-fleet init, herdr-fleet pins update) pin image.repository@image.digest; no tag appears here because no mutable tag is trusted.",
+  "description": "The machine-readable record of one release, attached to its GitHub release by .woodpecker/release.yml (docs/releases.md). Consumers (herdr-fleet pins update --from release.json) pin image.repository@image.digest; no tag appears here because no mutable tag is trusted.",
   "type": "object",
   "additionalProperties": false,
   "required": ["version", "image", "commit"],
