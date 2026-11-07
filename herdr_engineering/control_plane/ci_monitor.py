@@ -182,8 +182,8 @@ class CIMonitor:
         self._measurements.observe(view, sum(map(len, view['pipelines'].values())), view['stale'])
         return view
 
-    def history(self, *, start=True):
-        return self._history.snapshot(start=start)
+    def history(self, *, start=True, window=None):
+        return self._history.snapshot(start=start, window=window)
 
     def summary_snapshot(self, *, start=True):
         return self._history.summary_snapshot(start=start)

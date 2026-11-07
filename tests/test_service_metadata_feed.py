@@ -441,3 +441,60 @@ def test_inventory_is_read_across_every_page_the_server_offers(setup):
     setup.client.request = request
     assert setup.feed.run_once()["observed"] == 1
     assert len(routes) == 2 and "offset=2" in routes[1]
+
+
+def _serve_pages(setup, pages):
+    """Serve scripted inventory replies; returns the list of routes asked."""
+    routes = []
+
+    def request(route, body=None):
+        if not route.startswith("/api/v1/services"):
+            return Client.request(setup.client, route, body)
+        routes.append(route)
+        return copy.deepcopy(pages(len(routes) - 1, route))
+
+    setup.client.request = request
+    return routes
+
+
+@pytest.mark.parametrize("cursor", [
+    "empty-page-with-next",
+    "repeated-offset",
+    "backwards-offset",
+    "non-int",
+    "bool",
+    "never-ends",
+])
+def test_inventory_paging_never_loops_on_a_broken_cursor(setup, cursor):
+    real = setup.client.services
+
+    def pages(n, route):
+        if cursor == "empty-page-with-next":
+            return {"services": [] if n else real, "pagination": {"next_offset": 5}}
+        if cursor == "repeated-offset":
+            return {"services": real, "pagination": {"next_offset": 3}}
+        if cursor == "backwards-offset":
+            return {"services": real, "pagination": {"next_offset": [3, 2][min(n, 1)]}}
+        if cursor == "non-int":
+            return {"services": real, "pagination": {"next_offset": "3"}}
+        if cursor == "bool":
+            return {"services": real, "pagination": {"next_offset": True}}
+        return {"services": [{**real[0], "service_id": f"s{n}"}], "pagination": {"next_offset": n + 1}}
+
+    routes = _serve_pages(setup, pages)
+    _, summary = setup.feed.collect()
+    assert summary["errors"] == 1
+    assert len(routes) <= 101
+
+
+def test_inventory_rows_shifted_between_pages_are_not_duplicated(setup):
+    real = setup.client.services
+    rows = real + [{"service_id": "extra", "host_id": "host", "service_name": "x", "source_port": 20001}]
+
+    def pages(n, route):
+        if n == 0:
+            return {"services": rows[:1], "pagination": {"next_offset": 1}}
+        return {"services": rows[:], "pagination": {"next_offset": None}}  # shifted: first row again
+
+    _serve_pages(setup, pages)
+    assert setup.feed._read_inventory("host_id=host") == rows
