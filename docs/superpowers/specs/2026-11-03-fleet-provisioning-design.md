@@ -44,7 +44,7 @@ The herdr system grew around one person and has no setup process: bender runs ab
 |---|---|---|
 | `host-agent` | the herdr plugins (session feed, Pi recovery), the service feed, the fabric agent, mission feed, build cleanup, `host.json` | every host, native |
 | `control-plane` | control plane web and worker, Postgres, rustfs, LLM proxy, collab, share, fabric gateway and DNS | the control host, containers |
-| `jobs` | the scheduler container that runs the former timers (collab sync, certificate renewal, CI relay, pipelines sync, gateway monitor, backups, fabric certificates) from the same image | the control host, container |
+| `jobs` | the scheduler container that runs the former timers (collab sync, certificate renewal, CI relay, pipelines sync, gateway monitor, backups) from the same image or a pinned jobs variant of it; the fabric certificates' renewal stays a host timer of `host-agent` | the control host, container |
 | `memory` | Hindsight and the memory API with their databases and backups | containers |
 | `powerpack` | the herdr plugin bundle (Roamgate and others) at its pinned commit | every host, native |
 | `agent-image` | build and pin the single agent image (Pi, Claude Code, Codex) from our Dockerfile plus the operator's config overlay | build, containers |

@@ -80,3 +80,13 @@ deploy-fleet-agents.sh must not retire until each of these has an owner (host-ag
 - Host token: a controller-side `herdr-fleet` command that decrypts `control_plane.fleet_config`, runs `herdr-eng fleet join`/`fleet config token` and re-encrypts (host-agent only reports `blocked: needs-host-token` with that exact command; minting on the control host's copy is undone by the control-plane role).
 - A stronger "report visible" check for a controller-side verify: [eng]'s `GET /api/v1/fleet/config/status` (`applied_revision` per host; operator-authenticated, in memory), not usable with the host token.
 - Ask the owner where bender's capacity watchdog lives (not in the [eng] repo) before anything retires.
+
+## Parked for later tasks (from Task 13, jobs)
+
+- A `jobs` image target in herdr-engineering's Dockerfile, published by digest with the same release.json as the main image: the main image plus git, openssh-client, awscli and certbot (with its Route 53 plugin), no docker. Until it exists `images.jobs` is the operator's, and `ci-report-relay` and `pipelines-sync` cannot run on the stock image (no git, ssh).
+- Owner decision: Docker-socket access for the jobs that need it (`collab-sync` reloads the collab edge with `docker exec`; `gateway-monitor` reads the gateway with `docker inspect`/`stats`/`exec`). Options: give the scheduler the socket, or move the reload into the edge and the monitor into host-agent. Both timers stay native until decided.
+- `collab-cert-renew`: certbot's lineage files hold the host's absolute paths; renew on the host (a host-agent unit) or mount the ACME directory at its host path.
+- Adoption (Task 17/19): copy `~/.local/state/herdr-ci-report-relay` (0700) into the scheduler's HOME before the relay job replaces its timer, or it re-sends every report.
+- pi-runtime: pin AutoSpec (its `autospec-fleet-sync` timer self-updates from unpinned main and retires).
+- Owner: where GitHub automerge runs (no unit in herdr-engineering).
+
