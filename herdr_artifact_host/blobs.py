@@ -59,10 +59,12 @@ class BlobStore:
                 os.fsync(out.fileno())
             sha = Sha256(digest.hexdigest())
             final = self._path(sha)
-            if final.is_file():
-                return sha
-            final.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(tmp_name, final)  # atomic; concurrent identical puts write identical bytes
+            if final.is_file() and self._intact(final, sha):
+                return sha  # dedupe hit on verified bytes
+            # absent, or present but corrupt: install the verified bytes atomically (concurrent identical puts
+            # write identical bytes, so the last rename winning is harmless)
+            self._mkdirs(final.parent)
+            os.replace(tmp_name, final)
             self._fsync_dir(final.parent)
             return sha
         finally:
@@ -70,6 +72,25 @@ class BlobStore:
                 os.unlink(tmp_name)
             except FileNotFoundError:
                 pass
+
+    @staticmethod
+    def _intact(path: Path, sha: str) -> bool:
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                while chunk := handle.read(_CHUNK):
+                    digest.update(chunk)
+        except FileNotFoundError:
+            return False
+        return digest.hexdigest() == sha
+
+    def _mkdirs(self, leaf: Path) -> None:
+        """Create the two shard levels, fsyncing each parent so the new directory entries are durable."""
+        shard1 = leaf.parent
+        for d in (shard1, leaf):
+            if not d.exists():
+                d.mkdir(exist_ok=True)
+                self._fsync_dir(d.parent)
 
     @staticmethod
     def _fsync_dir(path: Path) -> None:

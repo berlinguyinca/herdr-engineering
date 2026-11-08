@@ -159,3 +159,92 @@ def test_member_usage_counters_nonnegative(migrated_dsn: str) -> None:
             await c.execute("UPDATE member_usage SET bytes_used = -1 WHERE member_id='m1'")
 
     with_conn(migrated_dsn, go)
+
+
+def test_cross_artifact_version_references_rejected(migrated_dsn: str) -> None:
+    async def go(c: asyncpg.Connection) -> None:
+        for aid in ("a1", "a2"):
+            sql, args = _artifact(aid)
+            await c.execute(sql, *args)
+        await c.execute("INSERT INTO artifact_versions (version_id, artifact_id, version_number) VALUES ('v1','a1',1)")
+        await c.execute("INSERT INTO artifact_versions (version_id, artifact_id, version_number) VALUES ('v2','a2',1)")
+        # current version of a2 may not be a1's version
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await c.execute("UPDATE artifacts SET current_version_id='v1' WHERE artifact_id='a2'")
+        await c.execute("UPDATE artifacts SET current_version_id='v2' WHERE artifact_id='a2'")
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await c.execute("INSERT INTO shares (share_id, artifact_id, version_id, audience)"
+                            " VALUES ('s1','a2','v1','lab')")
+        await c.execute("INSERT INTO shares (share_id, artifact_id, version_id, audience)"
+                        " VALUES ('s1','a1','v1','lab')")
+        ann = ("INSERT INTO annotations (annotation_id, artifact_id, version_id, share_id, file_name, anchor, body,"
+               " author_identity, author_email, author_role, status, addressed_in_version_id, created_at)"
+               " VALUES ($1,'a1',$2,'s1','f','{}','b','i','e','member',$3,$4, now())")
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await c.execute(ann, "ann_" + "A" * 22, "v2", "open", None)
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            await c.execute(ann, "ann_" + "B" * 22, "v1", "addressed", "v2")
+        await c.execute(ann, "ann_" + "C" * 22, "v1", "addressed", "v1")
+
+    with_conn(migrated_dsn, go)
+
+
+def test_current_version_can_be_set_in_the_same_transaction_as_the_artifact(migrated_dsn: str) -> None:
+    async def go(c: asyncpg.Connection) -> None:
+        async with c.transaction():
+            await c.execute("INSERT INTO artifacts (artifact_id, owner, current_version_id) VALUES ('a1','m1','v1')")
+            await c.execute("INSERT INTO artifact_versions (version_id, artifact_id, version_number)"
+                            " VALUES ('v1','a1',1)")
+        assert await c.fetchval("SELECT current_version_id FROM artifacts WHERE artifact_id='a1'") == "v1"
+
+    with_conn(migrated_dsn, go)
+
+
+def test_retracted_lifecycle_and_member_tables(migrated_dsn: str) -> None:
+    async def go(c: asyncpg.Connection) -> None:
+        sql, args = _artifact("a1", lifecycle="retracted")
+        await c.execute(sql, *args)
+        sql, args = _artifact("a2", lifecycle="bogus")
+        with pytest.raises(asyncpg.CheckViolationError):
+            await c.execute(sql, *args)
+        ins = "INSERT INTO artifact_member_creates (member_id, idempotency_key, request_hash, artifact_id)" \
+              " VALUES ('m1','k','h','a1')"
+        await c.execute(ins)
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await c.execute(ins)
+        await c.execute("INSERT INTO artifact_member_events (member_id, action, outcome) VALUES ('m1','create','ok')")
+        with pytest.raises(asyncpg.CheckViolationError):
+            await c.execute("INSERT INTO artifact_member_events (member_id, action, outcome)"
+                            " VALUES ('m1','create','weird')")
+
+    with_conn(migrated_dsn, go)
+
+
+def test_substring_search_uses_trigram_index(migrated_dsn: str) -> None:
+    async def go(c: asyncpg.Connection) -> None:
+        rows = [("a1", "Quarterly Report", "q3.pdf", "pdf", "alice"), ("a2", None, "notes.md", "markdown", "bob"),
+                ("a3", "", "plot.png", "image", "carol"), ("a4", "100%_done", "x.txt", "text", "dave")]
+        for aid, name, fname, typ, owner in rows:
+            await c.execute("INSERT INTO artifacts (artifact_id, owner, display_name, original_filename,"
+                            " artifact_type) VALUES ($1,$2,$3,$4,$5)", aid, owner, name, fname, typ)
+
+        async def hits(pattern: str) -> list[str]:
+            got = await c.fetch("SELECT artifact_id FROM artifacts WHERE search_text ILIKE $1 ESCAPE '\\'"
+                                " ORDER BY artifact_id", pattern)
+            return [r["artifact_id"] for r in got]
+
+        assert await hits("%terly rep%") == ["a1"]      # title substring
+        assert await hits("%NOTES.md%") == ["a2"]        # filename, case-insensitive
+        assert await hits("%markdown%") == ["a2"]        # type
+        assert await hits("%carol%") == ["a3"]           # owner
+        assert await hits("%a3%") == ["a3"]              # title falls back to the artifact id
+        assert await hits("%100\\%\\_done%") == ["a4"]   # escaped wildcards
+        assert await hits("%zzz%") == []
+
+        async with c.transaction():
+            await c.execute("SET LOCAL enable_seqscan = off")
+            plan = "\n".join(r[0] for r in await c.fetch(
+                "EXPLAIN SELECT artifact_id FROM artifacts WHERE search_text ILIKE '%terly rep%'"))
+        assert "ix_artifacts_search_trgm" in plan, plan
+
+    with_conn(migrated_dsn, go)

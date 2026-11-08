@@ -19,8 +19,16 @@ from herdr_artifact_host.db import Migrator, create_pool
 
 @pytest.fixture(scope="session")
 def host_postgres_server() -> Iterator[tuple[str, Path]]:
+    strict = bool(os.environ.get("CI")) or os.environ.get("HERDR_REQUIRE_PG") == "1"
+
+    def unavailable(reason: str) -> None:
+        # In CI (or when forced) a missing database is a failure, never a silent skip.
+        if strict:
+            pytest.fail(reason)
+        pytest.skip(reason)
+
     if os.getuid() == 0:
-        pytest.skip("isolated initdb cannot run as root")
+        unavailable("isolated initdb cannot run as root")
     candidates: list[Path] = []
     config = shutil.which("pg_config")
     if config:
@@ -28,7 +36,7 @@ def host_postgres_server() -> Iterator[tuple[str, Path]]:
     candidates += sorted(Path("/usr/lib/postgresql").glob("*/bin/initdb"), reverse=True)
     initdb = next((c for c in candidates if c.is_file()), None)
     if initdb is None:
-        pytest.skip("PostgreSQL server binaries unavailable")
+        unavailable("PostgreSQL server binaries unavailable")
     bindir = initdb.parent
     with tempfile.TemporaryDirectory(prefix="host-pg-") as folder:
         area = Path(folder)
@@ -49,7 +57,6 @@ def host_postgres_server() -> Iterator[tuple[str, Path]]:
 def host_dsn_factory(host_postgres_server: tuple[str, Path]) -> Iterator[Callable[[], str]]:
     """Returns a function creating a fresh empty database and yielding its DSN."""
     admin_dsn, area = host_postgres_server
-    made: list[str] = []
 
     def make() -> str:
         name = "h_" + uuid.uuid4().hex[:12]
@@ -62,7 +69,6 @@ def host_dsn_factory(host_postgres_server: tuple[str, Path]) -> Iterator[Callabl
                 await conn.close()
 
         asyncio.run(go())
-        made.append(name)
         return f"postgresql:///{name}?host={area}"
 
     yield make

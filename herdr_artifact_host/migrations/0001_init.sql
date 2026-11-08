@@ -1,6 +1,8 @@
 -- Artifact host schema (standalone; member-owned artifacts only).  Derived from control-plane migrations
 -- 0041, 0045-0051 minus CI/agent report columns.  Applied by herdr_artifact_host.db.Migrator.
 
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 CREATE TYPE intake_state AS ENUM ('accepted', 'pending', 'discarded');
 
 CREATE TABLE artifact_blobs (
@@ -19,7 +21,7 @@ CREATE TABLE artifacts (
   media_type        text,
   size_bytes        bigint NOT NULL DEFAULT 0 CHECK (size_bytes >= 0),
   intake            intake_state NOT NULL DEFAULT 'accepted',
-  lifecycle         text NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active', 'archived', 'tombstoned')),
+  lifecycle         text NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active', 'archived', 'retracted', 'tombstoned')),
   legal_hold        boolean NOT NULL DEFAULT false,
   current_version_id text,
   tombstoned_at     timestamptz,
@@ -27,13 +29,17 @@ CREATE TABLE artifacts (
   created_by        text,                                -- principal: member:<id> or agent:<id>
   created_at        timestamptz NOT NULL DEFAULT now(),
   updated_at        timestamptz NOT NULL DEFAULT now(),
+  -- Substring search (ILIKE '%q%') text: title (display name, falling back to the artifact id), filename, type and
+  -- owner.  Folder names (the caller's own folders) and share/claim titles live in other tables, so Task 4's feed
+  -- query must OR those in itself; they cannot be part of a generated column.
   search_text       text GENERATED ALWAYS AS
-    (lower(coalesce(display_name, '') || ' ' || coalesce(original_filename, '') || ' ' || artifact_type)) STORED
+    (lower(coalesce(nullif(display_name, ''), artifact_id) || ' ' || coalesce(original_filename, '') || ' '
+           || artifact_type || ' ' || owner)) STORED
 );
 CREATE INDEX ix_artifacts_owner_feed ON artifacts (owner, created_at DESC, artifact_id);
 CREATE INDEX ix_artifacts_pending_intake ON artifacts (owner) WHERE intake = 'pending';
 CREATE INDEX ix_artifacts_purge_due ON artifacts (purge_after) WHERE lifecycle = 'tombstoned';
-CREATE INDEX ix_artifacts_fts ON artifacts USING gin (to_tsvector('simple', search_text));
+CREATE INDEX ix_artifacts_search_trgm ON artifacts USING gin (search_text gin_trgm_ops);
 
 CREATE TABLE artifact_versions (
   version_id          text PRIMARY KEY,
@@ -54,8 +60,10 @@ CREATE TABLE artifact_versions (
       OR (created_via = 'collaborator' AND collaborator_agent_id IS NOT NULL))
 );
 CREATE INDEX ix_artifact_versions_artifact ON artifact_versions (artifact_id, version_number DESC);
+-- Composite: the current version must belong to this artifact (NULL current_version_id is not checked).
 ALTER TABLE artifacts ADD CONSTRAINT fk_artifacts_current_version
-  FOREIGN KEY (current_version_id) REFERENCES artifact_versions (version_id) DEFERRABLE INITIALLY DEFERRED;
+  FOREIGN KEY (current_version_id, artifact_id) REFERENCES artifact_versions (version_id, artifact_id)
+  DEFERRABLE INITIALLY DEFERRED;
 
 CREATE TABLE artifact_acl (
   artifact_id  text NOT NULL REFERENCES artifacts (artifact_id) ON DELETE CASCADE,
@@ -88,7 +96,7 @@ CREATE INDEX ix_library_items_artifact ON library_items (artifact_id);
 CREATE TABLE shares (
   share_id     text PRIMARY KEY,
   artifact_id  text NOT NULL REFERENCES artifacts (artifact_id) ON DELETE CASCADE,
-  version_id   text NOT NULL REFERENCES artifact_versions (version_id),
+  version_id   text NOT NULL,
   audience     text NOT NULL CHECK (audience IN ('lab', 'public')),
   token_hash   text CHECK (token_hash ~ '^[0-9a-f]{64}$'),
   allow_emails text[] NOT NULL DEFAULT '{}',
@@ -103,7 +111,8 @@ CREATE TABLE shares (
   created_at   timestamptz NOT NULL DEFAULT now(),
   approved_by  text,
   approved_at  timestamptz,
-  revoked_at   timestamptz
+  revoked_at   timestamptz,
+  FOREIGN KEY (version_id, artifact_id) REFERENCES artifact_versions (version_id, artifact_id)
 );
 CREATE UNIQUE INDEX ux_shares_token_hash ON shares (token_hash) WHERE token_hash IS NOT NULL;
 CREATE INDEX ix_shares_artifact ON shares (artifact_id, created_at DESC);
@@ -137,7 +146,7 @@ CREATE INDEX ix_share_claims_member ON share_claims (member_id, claimed_at DESC)
 CREATE TABLE annotations (
   annotation_id           text PRIMARY KEY CHECK (annotation_id ~ '^ann_[A-Za-z0-9_-]{22}$'),
   artifact_id             text NOT NULL REFERENCES artifacts (artifact_id) ON DELETE CASCADE,
-  version_id              text NOT NULL REFERENCES artifact_versions (version_id),
+  version_id              text NOT NULL,
   share_id                text NOT NULL REFERENCES shares (share_id) ON DELETE CASCADE,
   file_name               text NOT NULL,
   anchor                  jsonb NOT NULL,
@@ -146,7 +155,7 @@ CREATE TABLE annotations (
   author_email            text NOT NULL,
   author_role             text NOT NULL CHECK (author_role IN ('member', 'owner')),
   status                  text NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'addressed', 'dismissed', 'withdrawn')),
-  addressed_in_version_id text REFERENCES artifact_versions (version_id),
+  addressed_in_version_id text,
   resolved_by             text,
   resolved_at             timestamptz,
   edited_at               timestamptz,
@@ -155,7 +164,9 @@ CREATE TABLE annotations (
   ingested_at             timestamptz NOT NULL DEFAULT now(),
   updated_at              timestamptz NOT NULL DEFAULT now(),
   ingest_key              text UNIQUE,
-  CHECK ((status = 'addressed') = (addressed_in_version_id IS NOT NULL))
+  CHECK ((status = 'addressed') = (addressed_in_version_id IS NOT NULL)),
+  FOREIGN KEY (version_id, artifact_id) REFERENCES artifact_versions (version_id, artifact_id),
+  FOREIGN KEY (addressed_in_version_id, artifact_id) REFERENCES artifact_versions (version_id, artifact_id)
 );
 CREATE INDEX ix_annotations_artifact ON annotations (artifact_id, status, created_at DESC, annotation_id);
 CREATE INDEX ix_annotations_author ON annotations (share_id, author_identity, created_at DESC);
@@ -182,3 +193,26 @@ CREATE TABLE agent_tokens (
   revoked_at timestamptz
 );
 CREATE INDEX ix_agent_tokens_member ON agent_tokens (member_id);
+
+-- member.artifact_create idempotency: one row per (member, key), whatever actor sent it.
+CREATE TABLE artifact_member_creates (
+  member_id        text NOT NULL,
+  idempotency_key  text NOT NULL,
+  request_hash     text NOT NULL,
+  artifact_id      text NOT NULL,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (member_id, idempotency_key)
+);
+
+-- Append-only audit trail of member actions (mirrors control-plane 0048).
+CREATE TABLE artifact_member_events (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  member_id  text NOT NULL,
+  action     text NOT NULL,
+  outcome    text NOT NULL CHECK (outcome IN ('ok', 'refused', 'error')),
+  code       text,
+  share_id   text,
+  audience   text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_artifact_member_events_member ON artifact_member_events (member_id, created_at DESC);

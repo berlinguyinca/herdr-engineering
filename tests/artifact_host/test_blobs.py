@@ -80,3 +80,37 @@ def test_concurrent_puts_of_same_content_are_safe(tmp_path: Path) -> None:
     with store.open(shas[0]) as handle:
         assert handle.read() == data
     assert list((tmp_path / "tmp").iterdir()) == []
+
+
+def test_reput_repairs_corrupt_blob(tmp_path: Path) -> None:
+    store = BlobStore(tmp_path)
+    sha = store.put(io.BytesIO(b"good bytes"))
+    path = tmp_path / "sha256" / sha[:2] / sha[2:4] / sha
+    path.write_bytes(b"rotten")
+    with pytest.raises(BlobCorrupt):
+        store.open(sha)
+    assert store.put(io.BytesIO(b"good bytes")) == sha
+    with store.open(sha) as handle:
+        assert handle.read() == b"good bytes"
+
+
+class _Exploding(io.RawIOBase):
+    def __init__(self) -> None:
+        self.sent = False
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        if not self.sent:
+            self.sent = True
+            return b"partial"
+        raise OSError("connection reset")
+
+
+def test_failed_stream_leaves_no_temp_or_blob(tmp_path: Path) -> None:
+    store = BlobStore(tmp_path)
+    with pytest.raises(OSError):
+        store.put(_Exploding())  # type: ignore[arg-type]
+    assert list((tmp_path / "tmp").iterdir()) == []
+    assert [p for p in (tmp_path / "sha256").rglob("*") if p.is_file()] == []
