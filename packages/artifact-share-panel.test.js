@@ -731,6 +731,34 @@ test('the panel offers Links, Collaborators, Activity and Feedback tabs with the
   panel.dispose();
 });
 
+test('the tabs follow the ARIA tabs pattern: roving tabindex, ids, aria-controls, labelled panels, arrow keys', async () => {
+  const container = withPanes(fakeContainer());
+  const panel = mountSharePanel(container, fakeClient(), 'art1', { versions, headVersionId: 'v2' });
+  await tick();
+  const html = container.innerHTML;
+  assert.match(html, /class="hd-tabs" data-panel-tabs/);
+  assert.equal((html.match(/role="tab"[^>]*tabindex="0"/g) || []).length, 1);
+  assert.equal((html.match(/role="tab"[^>]*tabindex="-1"/g) || []).length, 3);
+  for (const key of ['links', 'collaborators', 'activity', 'feedback']) {
+    const tabId = html.match(new RegExp(`id="([^"]+)" data-panel-tab="${key}" aria-controls="([^"]+)"`));
+    assert.ok(tabId, key);
+    assert.match(html, new RegExp(`id="${tabId[2]}" role="tabpanel" aria-labelledby="${tabId[1]}" data-panel-pane="${key}"`));
+  }
+  const press = (from, key) => { let prevented = false; for (const fn of container.listeners.keydown || []) fn({ key, preventDefault() { prevented = true; }, target: { closest: s => (s === '[data-panel-tab]' ? { dataset: { panelTab: from } } : null) } }); return prevented; };
+  container.contains = () => true;
+  assert.equal(press('links', 'ArrowRight'), true);
+  assert.equal(container.panes.collaborators.hidden, false);
+  assert.equal(press('collaborators', 'End'), true);
+  assert.equal(container.panes.feedback.hidden, false);
+  assert.equal(press('feedback', 'ArrowRight'), true);
+  assert.equal(container.panes.links.hidden, false, 'wraps to the first tab');
+  assert.equal(press('links', 'ArrowLeft'), true);
+  assert.equal(container.panes.feedback.hidden, false, 'wraps to the last tab');
+  assert.equal(press('feedback', 'Home'), true);
+  assert.equal(press('links', 'a'), false, 'other keys are left alone');
+  panel.dispose();
+});
+
 test('the Feedback tab mounts its panel once, lazily', async () => {
   const container = withPanes(fakeContainer());
   let lists = 0;
@@ -920,4 +948,10 @@ test('a resumed pending author-page share shows its files, warning and badge, ne
   assert.match(html, /author-page\.html/);
   assert.match(html, /anyone holding the link/);
   assert.match(html, /Includes author page/);
+});
+
+test('Version and Audience labels stack their select with a gap instead of butting against it', () => {
+  const html = renderShareForm(formState());
+  assert.match(html, /<label style="display:inline-flex;flex-direction:column;gap:4px">Version<select/);
+  assert.match(html, /<label style="display:inline-flex;flex-direction:column;gap:4px">Audience<select/);
 });

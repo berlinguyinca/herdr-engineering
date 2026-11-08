@@ -31,12 +31,12 @@ SHARE_RICH_HEADERS = tuple(
 _TOGGLE_JS = Path(__file__).with_name("share_static") / "rich-toggle.js"
 
 _PANEL = ('<style>[data-rich-view]{margin:16px 0}[data-rich-view] button{border:0;cursor:pointer;font:inherit;'
-          'font-weight:600;font-size:13px}[data-rich-frame]{display:block;width:100%;height:70vh;margin-top:12px;'
+          'font-weight:600;font-size:13px}[data-rich-view] button:focus-visible{outline:2px solid var(--text);outline-offset:2px}[data-rich-frame]{display:block;width:100%;height:70vh;margin-top:12px;'
           'border:1px solid var(--border);border-radius:var(--radius);background:#fff}</style>'
           '<section class="card" data-rich-view hidden><h2>Rich view</h2>'
           "<p>The author's own page, shown in an isolated frame.</p>"
-          '<button type="button" class="btn" data-rich-toggle aria-expanded="false">Show rich view</button>'
-          "<div data-rich-slot></div></section>")
+          '<button type="button" class="btn" data-rich-toggle aria-expanded="false" aria-controls="rich-view-slot">Show rich view</button>'
+          '<div id="rich-view-slot" data-rich-slot></div></section>')
 
 
 def with_toggle(page: str) -> str:
