@@ -309,6 +309,32 @@ def test_history_is_viewer_readable_flat_and_memory_only(server):
     assert request(server, 'ci/history', key='invalid')[0] == 401
 
 
+def test_history_pipelines_are_paged_with_default_cap_and_next_offset(server):
+    from tests.control_plane.test_ci_history import MemoryProvider, runs
+
+    server.ci_monitor.close()
+    server.ci_monitor = CIMonitor(provider_factory=lambda: MemoryProvider(runs(7)))
+    server.ci_monitor._history.refresh()
+    status, data = request(server, 'ci/history')
+    assert status == 200
+    total = len(data['pipelines'])
+    assert total == 7
+    assert data['pagination'] == {'total': 7, 'limit': 1000, 'offset': 0,
+                                  'next_offset': None, 'truncated': False}
+    seen, offset = [], 0
+    while offset is not None:
+        status, page = request(server, f'ci/history?limit=3&offset={offset}')
+        assert status == 200 and len(page['pipelines']) <= 3
+        assert page['repos'] == data['repos'] and page['coverage'].keys() == data['coverage'].keys()
+        seen += [p['run_number'] for p in page['pipelines']]
+        offset = page['pagination']['next_offset']
+    assert seen == [p['run_number'] for p in data['pipelines']]
+    _, first = request(server, 'ci/history?limit=3')
+    assert first['pagination'] == {'total': 7, 'limit': 3, 'offset': 0, 'next_offset': 3, 'truncated': True}
+    for bad in ('limit=0', 'limit=abc', 'limit=100000', 'offset=-1', 'offset=x'):
+        assert request(server, f'ci/history?{bad}')[0] == 400
+
+
 @pytest.mark.parametrize('path', ['ci', 'ci/history'])
 def test_ci_routes_use_cached_language_metadata_and_preserve_history_scope(server, path):
     from tests.control_plane.test_project_links import snapshot
@@ -318,7 +344,7 @@ def test_ci_routes_use_cached_language_metadata_and_preserve_history_scope(serve
     if path.endswith('history'):
         view['pipelines'] = [row for rows in view['pipelines'].values() for row in rows]
     server.ci_monitor.snapshot = lambda: view
-    server.ci_monitor.history = lambda: view
+    server.ci_monitor.history = lambda **kw: {**view, "pagination": {}}
     server.github_monitor.repository_languages = lambda: {'github.com/org/frontend': 'Rust'}
     status, data = request(server, path)
     assert status == 200
@@ -339,7 +365,7 @@ def test_ci_remains_available_when_language_monitor_is_unavailable(server, path)
     if path.endswith('history'):
         view['pipelines'] = [row for rows in view['pipelines'].values() for row in rows]
     server.ci_monitor.snapshot = lambda: view
-    server.ci_monitor.history = lambda: view
+    server.ci_monitor.history = lambda **kw: {**view, "pagination": {}}
     server.github_monitor = SimpleNamespace(close=lambda: None)
     assert request(server, path)[1]['repos'][0]['language'] is None
 
@@ -883,3 +909,52 @@ def test_compatibility_reports_redact_retained_provider_urls_without_mutation(se
     assert view['reports'][0]['summary']['passed'] == 1
     assert server.repo.export_state() == before
     assert transport.requests == []
+
+
+def _ci_server_with(server, rows):
+    from tests.control_plane.test_ci_history import MemoryProvider
+
+    server.ci_monitor.close()
+    server.ci_monitor = CIMonitor(provider_factory=lambda: MemoryProvider(rows))
+    server.ci_monitor._history.refresh()
+
+
+def test_history_order_is_stable_with_identical_timestamps(server):
+    from tests.control_plane.test_ci_history import runs
+
+    rows = [{**r, 'created_at': '2026-10-01T00:00:00+00:00'} for r in runs(6)]
+    _ci_server_with(server, rows)
+    full = [p['run_number'] for p in request(server, 'ci/history')[1]['pipelines']]
+    assert full == sorted(full, reverse=True)
+    paged = []
+    for offset in range(0, 6, 2):
+        paged += [p['run_number'] for p in request(server, f'ci/history?limit=2&offset={offset}')[1]['pipelines']]
+    assert paged == full
+
+
+def test_history_offset_beyond_total_is_an_empty_final_page(server):
+    from tests.control_plane.test_ci_history import runs
+
+    _ci_server_with(server, runs(3))
+    status, data = request(server, 'ci/history?limit=2&offset=99')
+    assert status == 200 and data['pipelines'] == []
+    assert data['pagination'] == {'total': 3, 'limit': 2, 'offset': 99, 'next_offset': None, 'truncated': False}
+
+
+def test_history_page_copies_only_its_own_rows(server):
+    from tests.control_plane.test_ci_history import runs
+
+    copied = []
+
+    class Row(dict):
+        def __deepcopy__(self, memo):
+            copied.append(self['run_number'])
+            return Row(self)
+
+    _ci_server_with(server, runs(40))
+    history = server.ci_monitor._history
+    with history._lock:
+        history._view['pipelines'] = [Row(p) for p in history._view['pipelines']]
+    status, data = request(server, 'ci/history?limit=5&offset=10')
+    assert status == 200 and len(data['pipelines']) == 5
+    assert len(copied) <= 5 * 2  # snapshot slice plus annotation, never the whole 40
