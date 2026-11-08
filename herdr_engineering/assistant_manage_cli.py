@@ -188,6 +188,26 @@ def run_command(args: argparse.Namespace) -> int:
             result = client.request("/api/v1/assistant-team-briefs")
         elif op == "brief-reference":
             result = client.request("/api/v1/assistant-references/" + quote(args.reference, safe=""))
+        elif op in ("external-list", "external-show", "external-file", "external-decide", "external-retry"):
+            # team collaboration slice 5: only the account owner (this API key) files, decides and retries; nothing is sent from here
+            ext = "/api/v1/assistant-external-actions"
+            if op == "external-list":
+                result = client.request(ext + (f"?state={quote(args.state, safe='')}" if args.state else ""))
+            elif op == "external-show":
+                result = client.request(f"{ext}/{quote(args.action_id, safe='')}")
+            elif op == "external-file":
+                body = {"kind": args.kind, "room_id": args.room, "reference": args.reference}
+                for field in ("title", "body"):
+                    if getattr(args, field) is not None:
+                        body[field] = getattr(args, field)
+                if args.label:
+                    body["labels"] = args.label
+                result = client.request(ext, body)
+            else:
+                body = {"expected_sha256": args.sha256}
+                if op == "external-decide":
+                    body["decision"] = args.decision
+                result = client.request(f"{ext}/{quote(args.action_id, safe='')}/" + ("decision" if op == "external-decide" else "retry"), body)
         else:  # pragma: no cover - argparse constrains this
             raise RefError("unknown assistant operation")
         print(tree if tree is not None else json.dumps(_success(result), indent=2, sort_keys=True))
@@ -267,6 +287,29 @@ def register_management(groups: argparse._SubParsersAction) -> None:
     c = groups.add_parser("brief-reference", help="follow a brief's opaque reference back to the message (only you can)")
     c.add_argument("reference")
     _common(c, "brief-reference")
+    c = groups.add_parser("external-list", help="your external actions (GitHub issue, Gmail draft) and their state")
+    c.add_argument("--state", choices=("awaiting_approval", "approved", "rejected", "expired", "executed", "failed", "unknown"))
+    _common(c, "external-list")
+    c = groups.add_parser("external-show", help="one external action, with the exact content you would approve")
+    c.add_argument("action_id")
+    _common(c, "external-show")
+    c = groups.add_parser("external-file", help="propose an external action for an approved email brief (it waits for your approval)")
+    c.add_argument("room", help="the room you own")
+    c.add_argument("kind", choices=("github_issue_create", "email_reply_draft"))
+    c.add_argument("reference", help="the approved brief's reference")
+    c.add_argument("--title", help="issue only")
+    c.add_argument("--label", action="append", help="issue only; one of the allowed labels; repeatable")
+    c.add_argument("--body", help="draft only: the reply text. A draft is only SAVED in Gmail; nothing is ever sent")
+    _common(c, "external-file")
+    c = groups.add_parser("external-decide", help="approve (runs it once) or reject an external action")
+    c.add_argument("action_id")
+    c.add_argument("decision", choices=("approved", "rejected"))
+    c.add_argument("--sha256", required=True, help="the sha256 of the content you were shown (external-show prints it)")
+    _common(c, "external-decide")
+    c = groups.add_parser("external-retry", help="run a failed or unknown external action again (it looks for the earlier result first)")
+    c.add_argument("action_id")
+    c.add_argument("--sha256", required=True)
+    _common(c, "external-retry")
     c = groups.add_parser("graph", help="your assistants, delegations and where they run")
     c.add_argument("--tree", action="store_true", help="indented text instead of JSON")
     _common(c, "graph")

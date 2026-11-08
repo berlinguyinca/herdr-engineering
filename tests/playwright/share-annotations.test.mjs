@@ -42,6 +42,12 @@ async function launch(name) {
     options.args = ['--no-sandbox'];
     if (process.env.PLAYWRIGHT_CHROMIUM) options.executablePath = process.env.PLAYWRIGHT_CHROMIUM;
   }
+  if (name === 'webkit') {
+    // Hosts with the NVIDIA EGL driver segfault WebKit's compositor thread (a null function pointer in the driver) on pages that
+    // animate or transition, which reads as "page crashed". Software Mesa renders the same pages, so use it when it is installed.
+    const mesa = '/usr/share/glvnd/egl_vendor.d/50_mesa.json';
+    if (fs.existsSync(mesa)) options.env = { ...process.env, __EGL_VENDOR_LIBRARY_FILENAMES: mesa, LIBGL_ALWAYS_SOFTWARE: '1' };
+  }
   return playwright[name].launch(options);
 }
 

@@ -1,0 +1,42 @@
+# Woodpecker CI (ci.metabolomics.us) -- the structural gates (scripts/ci/structural-gates.sh): every tracked data file parses, no
+# tracked file carries a merge artifact, and the memory client pin matches lock/upstreams.yaml.
+#
+# This is the only pipeline that runs on a push to `main`, and that is the point. unit-gates.yml and ui-gates.yml trigger on
+# `pull_request` and `manual` only -- deliberately, so a push to a PR branch does not build twice -- but the same filter also
+# excludes `main`, so a commit that breaks `main` is never detected by `main`. It surfaces as a red pipeline on the next unrelated
+# PR that rebases onto it. That cost two misdirected investigations on 2026-11-05/06 (see issues #691 and #692), one of which was
+# a squash-merge that landed an invalid `lock/upstreams.yaml`: a conflict resolved into text rather than into markers, so nothing
+# that greps for `<<<<<<<` could see it.
+#
+# Not the full suite, and not a cheaper version of it. `main` takes ~85 commits a day (251 on the busiest recent day) and
+# unit-gates takes ~55 minutes, so gating every push to `main` with it would need ~78 runner-hours a day and would starve PR CI.
+# This gate answers the questions whose failures actually reached `main`, in seconds, so the cost is negligible; the full suite
+# still runs on every pull request.
+#
+# Same conventions as unit-gates.yml: `image:` names an executable on the agent, skip_clone plus a plain git checkout with the
+# staged credential, and the step logic lives in the script so `bash scripts/ci/structural-gates.sh` reproduces CI locally.
+when:
+  - event: manual
+  - event: pull_request
+  - event: push
+    branch: main
+
+skip_clone: true
+
+steps:
+  - name: checkout
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
+      - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
+      - 'git remote add origin "https://github.com/${CI_REPO}.git"'
+      - 'git fetch --no-tags origin "$CI_COMMIT_SHA"'
+      - 'git checkout -q FETCH_HEAD'
+      - 'git --no-pager log --oneline -1'
+
+  - name: structural-gates
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'bash scripts/ci/structural-gates.sh'
