@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Report sections and findings have stable, linkable anchors
+
+- Every section heading, finding and figure in a report preview now has a stable id (`sec-<section>`, `finding-<id>`, `figure-<id>`, derived from the descriptor id, never the title) and a visible `#` permalink in its heading: a 24px target, always visible, keyboard-focusable with a visible focus ring, accessible name "Link to this finding" described by the heading. No free text reaches an attribute (the share sanitiser aborts a render whose attribute looks like a script), so a finding titled `onerror=` still renders. Previews under the 16 KiB budget stay plain (no permalinks).
+- Opening a URL with `#finding-f1` scrolls to and highlights the target on the public share page (CSS `:target`, no script). In the dashboard preview (a shadow root, where `:target` cannot work, and where the server drops relative hrefs and the report stylesheet) `artifact-static-preview.js` rebuilds each permalink as a real link, scrolls and highlights on click and moves focus to the target; `#/artifacts/<id>?version=<v>&at=<anchor>` opens the preview and reveals that section.
+- The sanitiser allowlist is unchanged. Tests: `tests/control_plane/test_artifact_report_render.py`, `packages/artifact-static-preview.test.js`, `tests/playwright/report-anchors.test.mjs` (light/dark, desktop/390px, keyboard, hostile title).
+
 ### Share panel and share viewer: accessibility sweep
 
 - Fix: the dashboard share panel's Links/Collaborators/Activity/Feedback tabs now follow the ARIA tabs pattern: roving `tabindex` (one tab stop), Arrow/Home/End move and select, per-mount ids with `aria-controls` on tabs and `aria-labelledby` on panels. They use the design system's `.hd-tabs`, so the selected tab is visibly distinct (all four were identical filled buttons).

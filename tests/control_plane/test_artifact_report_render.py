@@ -536,7 +536,8 @@ def _check_no_empty_or_dangling_sections(page: str):
         if has_heading:
             body = re.search(rf'<section id="sec-{anchor}">(.*?)</section>', page, re.S).group(1)
             assert re.search(r'<(tr><td|tr id|li|article|dt)', body), f"{anchor} has a heading but no entry"
-    assert 'href="#sec-' not in page.replace(toc, "") and not [
+    # (a heading's own permalink points at its own section; the contents chips are the only other section links)
+    assert 'href="#sec-' not in re.sub(r'<a class="anchor"[^>]*>#</a>', "", page.replace(toc, "")) and not [
         link for link in document.links if link.startswith("#") and link[1:] not in document.ids]
 
 
@@ -592,7 +593,7 @@ def test_print_stylesheet_forces_light_hides_chrome_and_controls_page_breaks():
         assert selector in printed
     assert "--bg:#fff" in printed and "--text:#000" in printed and "color-scheme:light" in printed
     # no chrome: contents pills, download buttons, the opt-in Rich view panel
-    assert ".toc,.btn{display:none}" in printed and ".rp>section:not([id]){display:none!important}" in printed
+    assert ".toc,.btn,.anchor{display:none}" in printed and ".rp>section:not([id]){display:none!important}" in printed
     # page-break control around findings and figures; a table row and its header
     assert "break-inside:avoid" in printed and ".finding" in printed and ".figure" in printed
     assert "break-after:avoid" in printed and "thead{display:table-header-group}" in printed
@@ -609,3 +610,95 @@ def test_print_light_override_survives_the_tight_core_stylesheet_and_the_share_s
     assert "@media print" in small and "--bg:#fff" in small  # a dark screen theme never reaches paper, even then
     out = sr.sanitize_html(_report_preview(descriptor()), resolve=lambda _context, url: url)
     assert "details::details-content" in out and "break-inside:avoid" in out and "table-header-group" in out
+
+
+# --- finding anchors -------------------------------------------------------------------------------------------------
+
+
+def _anchor_links(page: str) -> list[tuple[str, str]]:
+    return re.findall(r'<a class="anchor" href="#([^"]+)" title="([^"]*)" aria-label="[^"]*" aria-describedby="[^"]*">#</a>', page)
+
+
+def test_every_section_finding_and_figure_heading_has_a_permalink_to_an_existing_unique_id():
+    from urllib.parse import unquote
+
+    page = _render()
+    ids = re.findall(r' id="([^"]+)"', page)
+    assert len(ids) == len(set(ids)), "ids are unique"
+    targets = [unquote(href) for href, _ in _anchor_links(page)]
+    assert set(targets) >= {f"sec-{key}" for key in _SECTIONS} | {"finding-f1", "figure-chart"}
+    assert all(target in ids for target in targets)
+    assert len(targets) == len(set(targets))
+    described = re.findall(r'aria-describedby="([^"]+)"', page)
+    assert described and all(name in ids for name in described), "each permalink is described by an existing heading"
+    # the link sits inside its own heading, so the visible '#' is next to what it names
+    assert re.search(r'<h3 id="h-finding-f1">Mixed evidence<a class="anchor" href="#finding-f1"', page)
+    assert re.search(r'<h2 id="h-sec-findings">Findings<a class="anchor" href="#sec-findings"', page)
+    assert ".anchor:focus-visible{outline" in page and ".card:target" in page and "min-width:24px" in page
+    assert ".toc,.btn,.anchor{display:none}" in page, "the permalink is screen-only"
+
+
+def test_anchor_ids_are_stable_across_renders_and_follow_the_descriptor_id_not_the_title():
+    first, again = _render(), _render()
+    assert first == again
+    retitled = descriptor()
+    retitled["findings"][0]["title"] = "A completely different title"
+    changed = _render(retitled)
+    assert 'id="finding-f1"' in changed and 'href="#finding-f1"' in changed
+    assert [h for h, _ in _anchor_links(first)] == [h for h, _ in _anchor_links(changed)]
+
+
+def test_permalinks_escape_hostile_titles_and_percent_encode_unusual_ids():
+    from urllib.parse import unquote
+
+    hostile = descriptor()
+    title = '"><img src=x onerror=alert(1)><script>alert(2)</script> \' & </h3>'
+    hostile["findings"][0].update(id="f:1.a", title=title)
+    hostile["figures"][0]["title"] = title
+    page = _render(hostile)
+    assert "<script>alert" not in page and "<img src=x" not in page and 'onerror=alert(1)>' not in page.replace("&gt;", "")
+    document = _Document()
+    document.feed(page)
+    assert not document.stack
+    assert 'id="finding-f:1.a"' in page and 'href="#finding-f%3A1.a"' in page
+    assert unquote("finding-f%3A1.a") in document.ids
+    assert 'aria-label="Link to this finding"' in page and 'Link to finding: ' not in page
+
+
+def test_a_tight_budget_stays_plain_without_permalinks():
+    small = _render(dict(descriptor(), findings=[], figures=[], evidence=[], assets=[], analysis={}), max_bytes=12000)
+    assert 'class="anchor"' not in small and 'href="#sec-' in small  # contents chips stay; no per-heading links
+
+
+def test_permalinks_and_ids_survive_the_public_share_sanitiser():
+    from herdr_engineering.control_plane import share_render as sr
+    from herdr_engineering.control_plane.artifact_share_api import _report_preview
+
+    out = sr.sanitize_html(_report_preview(descriptor()), resolve=sr.share_resolver("preview.html", {"preview.html"}))
+    assert 'id="finding-f1"' in out and 'class="anchor"' in out and 'href="#finding-f1"' in out
+
+
+def test_dashboard_static_copy_keeps_the_ids_and_anchor_class_the_client_wires_up():
+    """The dashboard resolver drops relative hrefs (a fragment would drive the hash router), so the client rebuilds each
+    permalink's link from the nearest id: that needs the id, the class and the title to survive, nothing wider."""
+    from herdr_engineering.control_plane import artifact_render_api as api
+
+    page = _render(asset_url=lambda asset: "#").encode()
+    html = api._envelope("html", page, api.dashboard_resolver(), None)["html"]
+    assert 'id="finding-f1"' in html and 'id="sec-findings"' in html
+    tags = re.findall(r'<a class="anchor"[^>]*>#</a>', html)
+    assert tags and all("href=" not in tag for tag in tags)
+    assert any('title="Link to this finding"' in tag and 'aria-label="Link to this finding"' in tag and 'aria-describedby="h-finding-f1"' in tag
+               for tag in tags)
+
+
+@pytest.mark.parametrize("title", ["x onerror=alert(1) y", "javascript:alert(1)", "a <b> & \"q\" title"])
+def test_a_script_looking_title_never_fails_the_dashboard_or_share_render(title):
+    """The sanitiser aborts a whole render on a ``title`` attribute that looks like a script, so a permalink must never
+    copy free text into ``title`` (only into ``aria-label``); a finding titled ``onerror=`` still renders."""
+    from herdr_engineering.control_plane import artifact_render_api as api
+
+    base = descriptor()
+    page = _render(dict(base, findings=[dict(base["findings"][0], title=title)] + base["findings"][1:]), asset_url=lambda asset: "#").encode()
+    html = api._envelope("html", page, api.dashboard_resolver(), None)["html"]
+    assert 'class="anchor"' in html and 'id="finding-f1"' in html

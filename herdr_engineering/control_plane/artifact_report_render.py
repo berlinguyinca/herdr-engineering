@@ -62,7 +62,7 @@ _PRINT_BASE = ("@media print{" + _PRINT_SELECTORS + "{" + _PRINT_VARS + "}"
 _PRINT_FULL = (
     "@media print{"
     # no chrome: the contents pills, download buttons and the Rich view toggle mean nothing on paper
-    + ".toc,.btn{display:none}.hero{padding-bottom:10pt}h1{font-size:22pt}h2{font-size:15pt}h3{font-size:12pt}"
+    + ".toc,.btn,.anchor{display:none}.hero{padding-bottom:10pt}h1{font-size:22pt}h2{font-size:15pt}h3{font-size:12pt}"
     ".rp section{margin-top:18pt}p,li{orphans:3;widows:3}"
     # page-break control: a heading stays with what follows, and a finding, figure, row or callout is never split
     "h1,h2,h3,.sub,summary{break-after:avoid}.card,.finding,.figure,.callout,.notice,.qlist li,tr,figure,img"
@@ -73,7 +73,8 @@ _PRINT_FULL = (
     ".tablewrap{overflow:visible;border-color:#8a8a94}table{min-width:0;font-size:10pt}thead{display:table-header-group}"
     "th{background:#fff;color:#000;border-bottom:1pt solid #000}th,td{padding:4pt 6pt}td:first-child{min-width:0}"
     ".chip{border-color:#555;background:#fff;color:#000}.callout{border:1px solid #8a8a94;background:#fff}"
-    "details{border-color:#8a8a94}"
+    "details{border-color:#8a8a94}.card:target,.card.is-target{outline:0;background:#fff}"
+    "section:target>h2,section.is-target>h2,li:target,li.is-target,tr:target td,tr.is-target td{background:none}"
     # closed <details> (the analysis block) is printed open: older engines show the content, newer ones need ::details-content
     "details>:not(summary){display:block}details::details-content{content-visibility:visible;display:block}"
     # a link to the outside shows where it goes; in-page chips and local file links are not underlined or expanded
@@ -129,9 +130,20 @@ _FULL_CSS = _CORE_CSS + (
     "gap:6px 16px;margin:12px 0 0;font-size:13.5px}dt{font-family:var(--mono);color:var(--muted)}dd{margin:0}"
     ".notice{margin-top:40px;padding:10px 14px;border:1px dashed var(--warn);border-radius:var(--radius);"
     "background:var(--warn-bg);font-size:13px;color:var(--text)}"
+    # permalinks: always visible (not hover-only), a 24px target, and a highlight for the fragment's target
+    ".anchor{display:inline-block;min-width:24px;min-height:24px;line-height:24px;margin-left:6px;text-align:center;"
+    "font-weight:400;color:var(--muted);text-decoration:none;border-radius:4px}"
+    ".anchor:hover{color:var(--link);background:var(--surface-2)}"
+    ".anchor:focus-visible{outline:2px solid var(--accent);outline-offset:1px;color:var(--link)}"
+    ".rp :target,.rp .is-target{scroll-margin-top:16px}"
+    ".card:target,.card.is-target{outline:2px solid var(--accent);outline-offset:2px;background:var(--accent-weak)}"
+    "section:target>h2,section.is-target>h2,li:target,li.is-target,tr:target td,tr.is-target td"
+    "{background:var(--accent-weak);border-radius:4px}"
     "@media (max-width:640px){h1{font-size:25px}.rp{padding-top:20px}}"
     + _PRINT_FULL
 )
+# Heading permalinks cost ~130 bytes each; a cap below this keeps the page plain rather than starving its content.
+_ANCHOR_MIN_BYTES = 16 * 1024
 _FULL_CSS_MARGIN = 2000  # a cap below css + this much falls back to the core styles
 _CSP = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'")
 _ANALYSIS_PAIR_LIMIT = 40
@@ -178,6 +190,7 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
     make_url = asset_url or (lambda asset: "assets/" + quote(asset["id"], safe=""))
     links = {asset["id"]: _asset_link(make_url(asset)) for asset in report["assets"]}
     shortened = False
+    anchors = max_bytes >= _ANCHOR_MIN_BYTES
 
     def text(value: str, limit: int = 2048) -> str:
         nonlocal shortened
@@ -197,6 +210,22 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
     def esc_id(identifier: str) -> str:
         return html.escape(identifier, quote=True)
 
+    def hid(anchor: str) -> str:
+        """The id attribute of the heading a permalink describes (``h-`` + the section's own anchor)."""
+        return f' id="h-{esc_id(anchor)}"' if anchors else ""
+
+    def permalink(anchor: str, what: str) -> str:
+        """A visible, keyboard-focusable ``#`` link to the heading's own anchor. ``anchor`` is either a fixed section
+        key or ``kind-<descriptor id>`` where the id passed the descriptor's ``[A-Za-z0-9][A-Za-z0-9_.:-]`` check;
+        it is percent-encoded for the href exactly like the chips. No free text goes into an attribute: the share
+        sanitiser fails the whole render on an attribute value that looks like a script (``x onerror=``,
+        ``javascript:``). The accessible name is fixed ("Link to this finding") and ``aria-describedby`` points at the
+        heading, so a screen reader announces the title as the description."""
+        if not anchors:
+            return ""
+        return (f'<a class="anchor" href="#{quote(anchor, safe="")}" title="Link to this {what}" '
+                f'aria-label="Link to this {what}" aria-describedby="h-{esc_id(anchor)}">#</a>')
+
     def chips(label: str, kind: str, identifiers: list[str]) -> str:
         if not identifiers:
             return ""
@@ -208,7 +237,8 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
         return "<ul>" + "".join(f"<li>{text(value)}</li>" for value in values) + "</ul>" if values else ""
 
     def finding(row: dict) -> str:
-        return (f'<article class="card finding" id="finding-{esc_id(row["id"])}"><h3>{text(row["title"], 256)}</h3>'
+        return (f'<article class="card finding" id="finding-{esc_id(row["id"])}"><h3{hid("finding-" + row["id"])}>{text(row["title"], 256)}'
+                f'{permalink("finding-" + row["id"], "finding")}</h3>'
                 f'<p>{text(row["statement"])}</p>'
                 + chips("Question", "question", row["question_ids"])
                 + chips("Evidence", "evidence", row["evidence_ids"])
@@ -225,7 +255,8 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
 
     def figure(row: dict, uri: str | None = None) -> str:
         image = (f'<img class="fig-img" alt="{html.escape(row["title"][:256], quote=True)}" src="{uri}">' if uri else "")
-        return (f'<article class="card figure" id="figure-{esc_id(row["id"])}"><h3>{text(row["title"], 256)}</h3>'
+        return (f'<article class="card figure" id="figure-{esc_id(row["id"])}"><h3{hid("figure-" + row["id"])}>{text(row["title"], 256)}'
+                + permalink("figure-" + row["id"], "figure") + "</h3>"
                 + image + f'<p>{text(row["caption"])}</p>'
                 + (f'<div class="callout"><b>How to read</b>{text(row["reading_guide"])}</div>'
                    if row.get("reading_guide") else "")
@@ -294,7 +325,8 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
                      f"<tbody>{body}</tbody></table></div>")
         else:
             inner = body
-        return f'<section id="sec-{anchor}"><h2>{title}</h2>{inner}</section>'
+        return (f'<section id="sec-{anchor}"><h2{hid("sec-" + anchor)}>{title}{permalink("sec-" + anchor, "section")}</h2>'
+                f"{inner}</section>")
 
     def toc(anchors: list[tuple[str, str]]) -> str:
         return ('<nav class="toc" aria-label="Contents">'

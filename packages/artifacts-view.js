@@ -207,7 +207,7 @@ export function renderReportDiff(diff, base, selected) {
   }).join('')}`;
 }
 
-async function renderReportReader(container, client, id, artifact, versions, { versionId, signal: outer } = {}) {
+async function renderReportReader(container, client, id, artifact, versions, { versionId, anchor, signal: outer } = {}) {
   const shell = document.createElement('div');
   shell.dataset.artifactDetail = id;
   // The app shell owns the "← Artifacts" back link.
@@ -219,6 +219,7 @@ async function renderReportReader(container, client, id, artifact, versions, { v
   let disposed = false;
   let generation = 0;
   let selectedVersion = versionId;
+  let pendingAnchor = anchor || undefined;
   let controller = new AbortController();
   // Route cancellation (outer signal) disposes this reader and aborts its reads.
   const stop = () => { disposed = true; generation += 1; controller.abort(); revokeBlobs(); };
@@ -233,7 +234,20 @@ async function renderReportReader(container, client, id, artifact, versions, { v
       output.innerHTML = `<p role="alert">${render?.too_large ? 'This output exceeds the preview limit. Download it instead.' : 'This output type has no static preview. Download it instead.'}</p>`;
       return;
     }
-    mountStaticHtml(output, render.html, { label: 'Report preview' });
+    // A "#" permalink inside the copy becomes a real deep link (#/artifacts/<id>?version=<v>&at=<anchor>); `anchor`
+    // is the deep link this page was opened with, revealed once.
+    const focus = pendingAnchor;
+    pendingAnchor = undefined;
+    mountStaticHtml(output, render.html, {
+      label: 'Report preview',
+      focus,
+      permalink: at => `${location.origin}${location.pathname}${location.search}#/artifacts/${encodeURIComponent(id)}?version=${encodeURIComponent(selectedVersion ?? '')}&at=${encodeURIComponent(at)}`,
+      onNavigate: (at, url) => {
+        try { history.replaceState(history.state, '', url); } catch { /* the address bar is a convenience */ }
+        const status = output.querySelector('[data-permalink-status]') || output.insertAdjacentElement?.('afterbegin', Object.assign(document.createElement('p'), { className: 'hd-note' }));
+        if (status) { status.setAttribute('data-permalink-status', ''); status.setAttribute('role', 'status'); status.textContent = 'The address bar now links to this section.'; }
+      },
+    });
   }
 
   function showLegacyVersion(version, selected, ticket, signal) {
@@ -399,6 +413,8 @@ async function renderReportReader(container, client, id, artifact, versions, { v
           if (alive(ticket)) { output.innerHTML = `<p role="alert">Preview unavailable: ${failure(error)}</p>`; body.querySelector('[data-report-preview]').disabled = false; }
         }
       });
+      // Opened from a deep link (&at=<id>): load the preview now so the linked section can be revealed.
+      if (pendingAnchor) body.querySelector('[data-report-preview]').click();
       body.querySelectorAll('[data-report-download]').forEach(button => button.addEventListener('click', async () => {
         const asset = assets.find(item => item.id === button.dataset.reportDownload);
         if (!asset) return;
@@ -445,7 +461,7 @@ async function renderReportReader(container, client, id, artifact, versions, { v
   return { errors };
 }
 
-export async function renderArtifactDetail(container, client, id, { signal, versionId } = {}) {
+export async function renderArtifactDetail(container, client, id, { signal, versionId, anchor } = {}) {
   // Each read has its own deadline; the caller's signal only represents route cancellation.
   const bounded = () => signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000);
   const artifact = await client.getArtifact(id, { signal: bounded() });
@@ -457,7 +473,7 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
     // A report is always read through its version history; a failure is the caller's visible error.
     const { versions } = await versionsRead;
     if (signal?.aborted || !container.isConnected) return;
-    return renderReportReader(container, client, id, artifact, Array.isArray(versions) ? versions : [], { signal, versionId });
+    return renderReportReader(container, client, id, artifact, Array.isArray(versions) ? versions : [], { signal, versionId, anchor });
   }
   versionsRead.catch(() => {});
   const mime = artifact.mime_type || 'application/octet-stream';
@@ -480,7 +496,7 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
   if (signal?.aborted || !container.isConnected) return;
   // A logical artifact whose history declares reports opens the report reader without fetching its download.
   if (results[0].status === 'fulfilled' && Array.isArray(results[0].value?.versions) && declaresReport(results[0].value.versions)) {
-    return renderReportReader(container, client, id, artifact, results[0].value.versions, { signal, versionId });
+    return renderReportReader(container, client, id, artifact, results[0].value.versions, { signal, versionId, anchor });
   }
   // Share card: its own list read and errors (kept out of the route's errors); the route signal disposes it.
   const share = mountSharePanel(container.querySelector('[data-artifact-share]'), client, id, {
