@@ -64,7 +64,7 @@ def _set(e, section: dict | None, *, collab: bool = True, share: dict | None = N
     if section is not None:
         cpv["artifact_host"] = section
         cpv["artifact_library"] = {
-            "host_url": "http://artifact-host-internal:8091",
+            "host_url": "http://artifact-host-relay:8091",
             "host_key": "k" * 40,
         }
     if share is not None:
@@ -229,6 +229,19 @@ def test_a_successful_backup_is_kept_private(env) -> None:
     assert stat.S_IMODE((ah / "backups").stat().st_mode) == 0o700
 
 
+def test_a_library_pointing_anywhere_but_the_relay_is_refused_by_the_deploy(env) -> None:
+    _set(env, _section())
+    _cert(env, MCP_HOST, HOST)
+    data = yaml.safe_load(env["central"].read_text())
+    data["sections"]["control_plane"]["values"]["artifact_library"]["host_url"] = "http://artifact-host-internal:8091"
+    env["central"].unlink()
+    fcc.write_private_file(env["central"], yaml.safe_dump(data, sort_keys=False))
+    r = _ds.deploy(env, "--dry-run")
+    assert r.returncode != 0
+    assert "central fleet config is invalid" in r.stderr
+    assert not (env["log"].exists() and "compose" in env["log"].read_text())
+
+
 def test_the_certificate_must_name_the_artifact_host(env) -> None:
     _set(env, _section())
     _cert(env, MCP_HOST)  # a certificate that does not name the host
@@ -341,16 +354,22 @@ def test_failed_disable_restores_the_overlay_and_the_host(env) -> None:
     _ds._assert_deploy_worktrees_removed(env)
 
 
-def test_rollback_after_a_migration_fails_loudly_with_the_manual_steps(env) -> None:
-    """Enabled before and now: the roles and the schema were touched, so the host is NOT silently reverted."""
+def _enabled_before_and_failing_now(env):
     prev_full, prev_tag = _ds._seed_previous(env, _host_commit())
     _set(env, _section())
+    _cert(env, MCP_HOST, HOST)
     _mark(env, "enabled")
     ah = env["home"] / ".config/herdr-engineering/artifact-host"
     ah.mkdir(parents=True)
     (ah / "roles.sql").write_text("-- previous\n")
-    _cert(env, MCP_HOST, HOST)
     env["env"]["FAIL_COMPOSE_TAGS"] = _ds._head()
+    return prev_tag
+
+
+def test_rollback_after_a_migration_fails_loudly_with_the_manual_steps(env) -> None:
+    """Enabled before and now, and this deploy applied a migration: the host is NOT silently reverted."""
+    prev_tag = _enabled_before_and_failing_now(env)
+    env["env"]["STUB_AH_SCHEMA_BEFORE"], env["env"]["STUB_AH_SCHEMA_AFTER"] = "3", "4"
     r = _ds.deploy(env)
     assert r.returncode == 3, r.stdout + r.stderr
     assert "ARTIFACT HOST NOT REVERTED" in r.stderr
@@ -364,6 +383,31 @@ def test_rollback_after_a_migration_fails_loudly_with_the_manual_steps(env) -> N
         "rollback-worktree/deploy/artifact-host/compose.yaml" in ln for ln in _host_log(env)
     ), "the previous host code is not started against a changed database"
     _no_secrets(r.stdout + r.stderr)
+
+
+def test_a_failed_migration_with_a_previous_host_also_needs_the_manual_steps(env) -> None:
+    """The migration may have applied some steps before it failed: the schema is not known to be the old one."""
+    _enabled_before_and_failing_now(env)
+    del env["env"]["FAIL_COMPOSE_TAGS"]
+    env["env"]["STUB_FAIL_AH"] = "artifact-host-migrate"
+    r = _ds.deploy(env)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "ARTIFACT HOST NOT REVERTED" in r.stderr and "pg_restore" in r.stderr
+
+
+def test_a_deploy_that_migrated_nothing_rolls_the_previous_host_back_automatically(env) -> None:
+    """Same schema before and after: only roles and images moved, so the previous release's host is brought back."""
+    prev_tag = _enabled_before_and_failing_now(env)
+    env["env"]["STUB_AH_SCHEMA_BEFORE"] = env["env"]["STUB_AH_SCHEMA_AFTER"] = "3"
+    r = _ds.deploy(env)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert f"rolled back to herdr-engineering:{prev_tag}" in r.stderr
+    assert "NOT REVERTED" not in r.stderr and "NOT FULLY" not in r.stderr
+    prev_host = [ln for ln in _host_log(env) if "rollback-worktree/deploy/artifact-host/compose.yaml" in ln]
+    assert any(" up " in ln and "artifact-host-public" in ln for ln in prev_host), prev_host
+    assert any(" exec -T artifact-host-db psql " in ln and "-f -" in ln for ln in prev_host), "the roles are re-applied"
+    ah = env["home"] / ".config/herdr-engineering/artifact-host"
+    assert (ah / "roles.sql").read_text() == "-- previous\n"
 
 
 def test_a_failed_migration_with_no_previous_host_is_rolled_back_and_the_host_stopped(env) -> None:

@@ -138,6 +138,10 @@ if [ "$1" = compose ]; then
     echo "$@" >> {log}
     # STUB_FAIL_AH="<word>": a host-project call containing that word (e.g. migrate, pg_dump) fails
     [ -z "${{STUB_FAIL_AH:-}}" ] || case " $* " in *" $STUB_FAIL_AH "*) exit 1 ;; esac
+    # the migrate service marks the schema as moved; a schema_migrations count query answers the value before / after it
+    case " $* " in *" artifact-host-migrate "*) touch {log}.migrated ;; esac
+    case " $* " in *schema_migrations*)
+      if [ -f {log}.migrated ]; then echo "${{STUB_AH_SCHEMA_AFTER:-3}}"; else echo "${{STUB_AH_SCHEMA_BEFORE:-3}}"; fi ;; esac
     exit 0 ;; esac
   echo "composeenv fleetdir=${{HERDR_CP_FLEET_DIR:-}} tag=${{HERDR_CP_IMAGE_TAG:-}} collabdir=${{HERDR_COLLAB_CONFIG_DIR:-}} llmdir=${{HERDR_LLM_SLICE_DIR:-}} githubappdir=${{HERDR_CP_GITHUB_APP_DIR:-}}" >> {log}
   if [ -n "${{HERDR_LLM_SLICE_DIR:-}}" ]; then echo "llmslice $(cat "$HERDR_LLM_SLICE_DIR/llm-config.json" | tr -d '\n')" >> {log}; fi

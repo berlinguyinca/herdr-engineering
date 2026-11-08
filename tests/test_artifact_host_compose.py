@@ -1060,6 +1060,15 @@ class _Stack:
             check=False,
         )
 
+    def reapply_roles(self) -> None:
+        """roles.sql again, as every later deploy does: this time the tables exist, so the `ON ALL TABLES` grants act."""
+        again = self.host(
+            "exec", "-T", "artifact-host-db", "psql", "-U", "artifact_admin", "-d", "artifact_host",
+            "-X", "-q", "-v", "ON_ERROR_STOP=1", "-f", "-",
+            input=(self.dir / "roles.sql").read_text(), check=False,
+        )
+        assert again.returncode == 0, again.stderr
+
     def psql_session(self, user: str, *statements: str) -> subprocess.CompletedProcess:
         """Several statements as `user` in ONE session (each its own transaction, unlike one `-c` with semicolons), stopping at
         the first error: a SET in an earlier statement is still in force for the later ones."""
@@ -1429,6 +1438,7 @@ _INTERNAL_WRITES = (
 @pytest.mark.parametrize("sql", _INTERNAL_WRITES)
 def test_the_internal_role_is_refused_by_privilege_when_read_only_is_switched_off(stack: _Stack, sql: str) -> None:
     """default_transaction_read_only is a session setting the role may change: it must not be what keeps the role read-only."""
+    stack.reapply_roles()
     out = stack.psql_session("artifact_internal", "SET default_transaction_read_only = off", sql)
     assert out.returncode != 0 and "permission denied" in out.stderr, (sql, out.stderr)
     explicit = stack.psql_session("artifact_internal", "BEGIN READ WRITE", sql, "ROLLBACK")
@@ -1436,6 +1446,7 @@ def test_the_internal_role_is_refused_by_privilege_when_read_only_is_switched_of
 
 
 def test_the_internal_role_holds_no_privilege_but_select_on_any_table_or_sequence(stack: _Stack) -> None:
+    stack.reapply_roles()
     held = stack.psql(
         "artifact_admin",
         "SELECT c.relname || ':' || p FROM pg_class c, unnest(ARRAY['INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER']) p "

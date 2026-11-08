@@ -540,7 +540,7 @@ ah_run() {
     docker compose -p "$AH_PROJECT" -f "$tree/deploy/artifact-host/compose.yaml" "$@"
 }
 ah_compose() { ah_run "$WORK" "$TAG" "$@"; }
-AH_MIGRATED=0        # set the moment the deploy starts changing the database (roles, then schema)
+AH_MIGRATED=0        # set when the deploy may have changed the SCHEMA (a failed migration, or the applied-migration count moved)
 AH_MANUAL=0          # a rollback that could not revert the host and says so
 AH_BACKUP_FILE=""
 
@@ -1094,16 +1094,28 @@ backup_ah_database() {
   return 0
 }
 
+# ah_schema_count: how many migrations the host database has applied ("" before the first migration has created the table).
+ah_schema_count() {
+  ah_compose exec -T artifact-host-db psql -U artifact_admin -d artifact_host -X -A -t \
+    -c "SELECT count(*) FROM schema_migrations" 2>/dev/null | tr -d '[:space:]' || true
+}
+
 # artifact_host_up: database first (never force-recreated: its data directory is not touched by a routine deploy), then the
 # roles, a backup, the schema (as the owner role), and last the three services recreated (they read their slice at startup)
 # and waited on until healthy. Runs BEFORE the control plane's compose up, which attaches control-plane-web and the edge to
 # the networks created here.
 artifact_host_up() {
+  local before after
   ah_compose up -d --no-build --wait --wait-timeout 120 artifact-host-db >/dev/null || return 1
-  AH_MIGRATED=1
   apply_ah_roles "$WORK" "$TAG" || return 1
+  before="$(ah_schema_count)"
   backup_ah_database || return 1
-  ah_compose run --rm artifact-host-migrate >/dev/null || return 1
+  # AH_MIGRATED means the SCHEMA may differ from what the previous release's code expects. Roles alone are not that
+  # (a rollback re-applies the previous roles.sql), so it is set when the migration failed (it may have applied some of
+  # its steps) or when the applied-migrations count changed, and not on a deploy that migrated nothing.
+  ah_compose run --rm artifact-host-migrate >/dev/null || { AH_MIGRATED=1; return 1; }
+  after="$(ah_schema_count)"
+  [ "$before" = "$after" ] || AH_MIGRATED=1
   ah_compose up -d --no-build --no-deps --force-recreate --wait --wait-timeout 180 \
     artifact-host-public artifact-host-internal artifact-host-relay >/dev/null || return 1
 }
