@@ -11,6 +11,18 @@ const PDFJS_WORKER = '/vendor/pdfjs/pdf.worker.min.mjs';
 const MAX_PDF_PAGES = 200;
 const KEPT_HREF = /^(?:https?:\/\/[^\s\\]|mailto:)/i;
 
+// On paper the scroll box must not clip the copy to its 640px screen height, and the screen-only note is dropped.
+export const PRINT_CSS = '@media print{[data-static-preview]{max-height:none!important;overflow:visible!important;contain:none!important}[data-static-note]{display:none!important}}';
+
+function ensurePrintStyle(doc) {
+  const head = doc.head;
+  if (!head || doc.querySelector?.('style[data-static-print]')) return;
+  const style = doc.createElement('style');
+  style.setAttribute('data-static-print', '');
+  style.textContent = PRINT_CSS;
+  head.append(style);
+}
+
 /** True for an absolute http(s) or mailto link: the only links a static copy keeps. */
 export const isKeptHref = href => typeof href === 'string' && KEPT_HREF.test(href.trim());
 
@@ -20,6 +32,7 @@ export const isKeptHref = href => typeof href === 'string' && KEPT_HREF.test(hre
  * Links that are not absolute are unwrapped so a fragment link can never drive the SPA's hash router.
  */
 export function mountStaticHtml(container, html, { label = 'Static preview', document: doc = globalThis.document, theme } = {}) {
+  ensurePrintStyle(doc);
   const note = doc.createElement('p');
   note.className = 'hd-note';
   note.setAttribute('data-static-note', '');

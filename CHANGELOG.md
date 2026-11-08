@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Reports print and save as PDF cleanly
+
+- The report stylesheet (`artifact_report_render.py`, used by the dashboard preview and the public share page) has a full `@media print` section: paper is always light and black-on-white whatever the screen theme or forced `data-theme`; the contents pills, download buttons and the opt-in Rich view panel are hidden; findings, figures, callouts, notices and table rows are never split and headings stay with what follows; a figure taller than a page shrinks to fit (180mm); tables lose their scroll box and repeat their header row on each page; the closed "Method and configuration" details prints open; an `http(s)` link spells out its URL. The tight-budget core stylesheet keeps the light override too.
+- `packages/artifact-static-preview.js` adds a one-off print rule so the dashboard's 640px scroll box does not clip a printed report. Printing the dashboard page itself still includes the app chrome.
+- `tests/playwright/report-print.test.mjs` emulates print in chromium (light and dark, OS-driven and forced) and checks `page.pdf()` text: page count, no clipped content, no finding or figure card split across pages. Unit tests: `tests/control_plane/test_artifact_report_render.py`, `packages/artifact-static-preview.test.js`. `_FULL_CSS_MARGIN` rose 1200 to 2000 because the stylesheet grew.
+
 ### Compaction publishes a projection checkpoint
 
 - `control_plane.fabric_compaction.publish_projection_checkpoint` (default off) makes a drained compaction pass that moved rows publish a fresh projection checkpoint, so web boot does not replay the journal after a backlog drain exceeds the incremental budget. `projection_lock_wait_seconds` (default 60) bounds the wait for the materializer lock; a busy lock or failed publish logs a warning and retries on the next drained pass. The compaction lock is released before the publish.

@@ -577,3 +577,35 @@ def test_public_share_path_has_no_dangling_links_when_a_section_is_hidden():
             document = _Document()
             document.feed(page)
             assert not [link for link in document.links if link.startswith("#") and link[1:] not in document.ids]
+
+
+# --- print / save-as-PDF -----------------------------------------------------------------------------------------
+
+
+def test_print_stylesheet_forces_light_hides_chrome_and_controls_page_breaks():
+    page = _render()
+    css = page.split("<style>")[1].split("</style>")[0]
+    printed = css[css.index("@media print"):]
+    # light variables re-declared for every theme selector, after the dark rules (so they win in any theme)
+    assert css.rindex("@media print") > css.index("--bg:#17181c")
+    for selector in (":root[data-theme]", ":host([data-theme])", ":root:not([data-theme=\"light\"])"):
+        assert selector in printed
+    assert "--bg:#fff" in printed and "--text:#000" in printed and "color-scheme:light" in printed
+    # no chrome: contents pills, download buttons, the opt-in Rich view panel
+    assert ".toc,.btn{display:none}" in printed and ".rp>section:not([id]){display:none!important}" in printed
+    # page-break control around findings and figures; a table row and its header
+    assert "break-inside:avoid" in printed and ".finding" in printed and ".figure" in printed
+    assert "break-after:avoid" in printed and "thead{display:table-header-group}" in printed
+    # closed details print open; external URLs are spelled out; tall figures shrink to a page
+    assert "details::details-content" in printed and 'a[href^="http"]::after' in printed
+    assert "max-height:180mm" in printed
+
+
+def test_print_light_override_survives_the_tight_core_stylesheet_and_the_share_sanitiser():
+    from herdr_engineering.control_plane import share_render as sr
+    from herdr_engineering.control_plane.artifact_share_api import _report_preview
+
+    small = _render(dict(descriptor(), findings=[], figures=[], evidence=[], assets=[], analysis={}), max_bytes=4096)
+    assert "@media print" in small and "--bg:#fff" in small  # a dark screen theme never reaches paper, even then
+    out = sr.sanitize_html(_report_preview(descriptor()), resolve=lambda _context, url: url)
+    assert "details::details-content" in out and "break-inside:avoid" in out and "table-header-group" in out
