@@ -1674,6 +1674,32 @@ class ControlPlaneServer:
             caps.append("architecture_v1")
             if self.architecture.explain_config:
                 caps.append("architecture_explain_v1")
+        caps.extend(self._service_capabilities())
+        return caps
+
+    def _service_capabilities(self):
+        """Flags for the optional services the Settings page lists. Each mirrors the exact guard its routes apply (the 503
+        "not enabled" checks), so a flag is never true while the route refuses. Presence and booleans only, never values."""
+        caps = []
+        store = self.artifact_store is not None
+        stored = self.share_store is not None and self.shares_root is not None and store
+        if stored and self.share_settings is not None:
+            caps.append("share_v1")
+        if stored and self.member_admin is not None:      # the member routes do not need share_settings
+            caps.append("members_v1")
+        if self.collab_artifacts_enabled and self.collab_grant_store is not None and store:
+            caps.append("collab_artifacts_v1")
+        if getattr(self, "gate_service", None) is not None:
+            caps.append("review_gate_v1")
+        if store and (self.artifact_delete_owners or self.artifact_delete_allow_keyless_owner):
+            caps.append("artifact_delete_v1")
+        if self.ci_monitor.actions_enabled:
+            caps.append("ci_actions_v1")
+        try:
+            if self.deployment_actions_enabled() and self.deployment_definitions.status()["configured"]:
+                caps.append("deployment_actions_v1")
+        except Exception:  # noqa: BLE001 - health must answer even if the definitions cannot be read
+            pass
         return caps
 
     def _health_probe(self, with_capabilities=True):

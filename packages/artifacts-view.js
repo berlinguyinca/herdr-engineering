@@ -2,6 +2,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { skeleton } from './motion.js';
 import { morph } from './patch.js';
 import { pollWhileVisible } from './refresh-bus.js';
+import { retireWhenOff, serviceOff } from './service-gates.js';
 import { mountSharePanel } from './artifact-share-panel.js';
 import { mountMembersPanel } from './artifact-members-panel.js';
 import { mountHistory } from './artifact-history.js';
@@ -128,12 +129,13 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
     act(() => client.deleteArtifacts([...selected], { mode: 'purge_now', confirm: typed, reason: 'Permanently deleted from the dashboard', requestKey: key() }), 'permanently deleted');
   });
   // Only an owner sees the controls; a failed probe leaves them hidden. The server enforces this on every call.
-  client.artifactDeleteAccess?.().then(access => { if (!disposed && access?.owner === true) { owner = true; syncOwner(); render({ replace: true }); } }, () => {});
+  client.artifactDeleteAccess?.().then(async access => { if (!disposed && access?.owner === true && !(await serviceOff(client, 'artifact_delete_v1'))) { owner = true; syncOwner(); render({ replace: true }); } }, () => {});
   const stop = pollWhileVisible(render, 30000);
   void render();
   // The operator Members section shows itself only when the members list loads; a 403 leaves it hidden.
   const membersAbort = new AbortController();
   const members = mountMembersPanel(container.querySelector('[data-artifact-members]'), client, { signal: membersAbort.signal });
+  retireWhenOff(client, 'members_v1', container.querySelector('[data-artifact-members]'));
   return { refresh: render, dispose() { disposed = true; clearTimeout(timer); stop(); controller?.abort(); membersAbort.abort(); members.dispose(); } };
 }
 
@@ -427,6 +429,7 @@ async function renderReportReader(container, client, id, artifact, versions, { v
   // The Share card lives outside the per-version body (replaced on every version switch); the route signal disposes it.
   // Its errors stay inside the card and never reach the route's freshness errors.
   if (!disposed) mountSharePanel(shell.querySelector('[data-artifact-share]'), client, id, { versions, headVersionId: artifact.current_version_id, signal: outer, allowEntry: false });
+  retireWhenOff(client, 'share_v1', shell.querySelector('[data-artifact-share-card]'));
   try {
     header.innerHTML = `<h2>${esc(artifact.display_name || artifact.original_filename || id)}</h2><p class="hd-note">Report artifact ${esc(id)}</p>`;
     if (!versions.length) { body.innerHTML = '<p>No immutable report version has been committed yet.</p>'; return { errors }; }
@@ -484,6 +487,7 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
     versions: results[0].status === 'fulfilled' && Array.isArray(results[0].value?.versions) ? results[0].value.versions : [],
     headVersionId: artifact.current_version_id, signal,
   });
+  retireWhenOff(client, 'share_v1', container.querySelector('[data-artifact-share-card]'));
   // Only a non-report artifact may fetch the download for its preview.
   const previewSlot = container.querySelector('[data-artifact-preview]');
   const imageHtml = `<img src="${esc(url)}" alt="${esc(artifact.original_filename || id)}" style="max-width:100%;max-height:640px;object-fit:contain">`;
