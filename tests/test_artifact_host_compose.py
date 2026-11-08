@@ -29,6 +29,11 @@ CP = ROOT / "deploy" / "control-plane"
 HOST_COMPOSE = ROOT / "deploy" / "artifact-host" / "compose.yaml"
 OVERLAY = CP / "compose.artifact-host.yaml"
 EDGE_DIR = CP / "collab-edge"
+RELAY_CONF = ROOT / "deploy" / "artifact-host" / "relay" / "nginx.conf"
+# the image the collab edge runs in production (digest included), so nginx -t checks the conf with the binary it will meet
+_PRODUCTION_NGINX = yaml.safe_load((CP / "compose.collab.yaml").read_text(encoding="utf-8"))["services"][
+    "collab-edge"
+]["image"]
 HOST = "artifacts.example.test"
 MCP_HOST = "mcp.example.test"
 
@@ -156,11 +161,13 @@ def test_the_edge_network_subnet_is_fixed_and_refused_on_the_operator_listener(h
     default = re.search(r"\$\{HERDR_ARTIFACT_EDGE_SUBNET:-([0-9./]+)\}", subnet)
     assert default is not None
     nginx = (EDGE_DIR / "nginx.conf").read_text(encoding="utf-8")
-    assert f"deny {default.group(1)};" in nginx, (
-        "nginx.conf must refuse the artifact-edge subnet on :8082"
-    )
-    # the other fixed subnets stay distinct
-    assert default.group(1) not in nginx.replace(f"deny {default.group(1)};", "")
+    # directives only, inside the :8082 server: a comment that names the subnet must not satisfy this
+    operator = _code(nginx[nginx.index("listen 8082;") :])
+    denies = re.findall(r"^\s*deny\s+([0-9./]+)\s*;", operator, re.M)
+    assert default.group(1) in denies, "nginx.conf must refuse the artifact-edge subnet on :8082"
+    assert denies.count(default.group(1)) == 1 and len(set(denies)) == len(denies)
+    # the subnet is NOT a deploy knob: deploy.sh refuses the override (see test_artifact_host_deploy.py), so the deny
+    # above can never describe a different network than the one Docker creates
 
 
 def test_roles_are_hardened_and_have_their_own_healthcheck(host: dict) -> None:
@@ -343,10 +350,10 @@ def _server_block(conf: str, name: str) -> str:
             return conf[begin:i]
 
 
-def _locations(block: str) -> dict[str, str]:
-    """location header -> its body, for the outermost locations of one server block."""
+def _locations(block: str, indent: str = "    ") -> dict[str, str]:
+    """location header -> its body, for the locations at one nesting depth of a block."""
     out: dict[str, str] = {}
-    for m in re.finditer(r"^    location (.+?) \{", block, re.M):
+    for m in re.finditer(rf"^{indent}location (.+?) \{{", block, re.M):
         i, depth = m.end(), 1
         while depth:
             depth += {"{": 1, "}": -1}.get(block[i], 0)
@@ -367,28 +374,81 @@ def test_the_artifact_server_routes_the_public_surface_to_the_public_role_only(
 ) -> None:
     block = _server_block(rendered_edge, HOST)
     locs = _locations(block)
-    for needed in ("/s/", "/api/member/", "= /", "/my/"):
+    upstream_for = {
+        "/s/": "share",
+        "/api/member/": "member",
+        "= /": "member",
+        "/my/": "member",
+    }
+    for needed, upstream in upstream_for.items():
         assert needed in locs, needed
-        assert "proxy_pass http://artifact_host;" in locs[needed], needed
+        assert f"proxy_pass http://artifact_host_{upstream};" in locs[needed], needed
     assert "server artifact-host-public:8090 " in rendered_edge
     for text in (_code(rendered_edge),):
         assert "8091" not in text, "nothing at the edge may name the internal listener"
         assert "artifact-host-internal" not in text and "artifact-internal" not in text
         assert "artifact-host-db" not in text and "herdr-cp-" not in text
     # every proxy_pass in the host's server goes to the one upstream
-    assert set(re.findall(r"proxy_pass (\S+);", block)) == {"http://artifact_host"}
+    assert set(re.findall(r"proxy_pass (\S+);", block)) == {
+        "http://artifact_host_share",
+        "http://artifact_host_member",
+        "http://artifact_host_upload",
+    }
 
 
 def _select(locs: dict[str, str], path: str) -> str | None:
-    """The body of the location nginx would choose for ``path`` (exact, then longest prefix, then the first regex)."""
-    exact = [h for h in locs if h.startswith("= ") and h[2:] == path]
-    if exact:
-        return locs[exact[0]]
-    prefixes = [h for h in locs if not h.startswith(("= ", "~")) and path.startswith(h)]
+    """The body of the location nginx would choose for ``path``: exact match; else the longest matching prefix (a ``^~``
+    prefix that is the longest wins outright); else the first matching regex in file order; else that longest prefix.
+    Locations nested in the chosen one are selected the same way, on the same path."""
+    chosen = _select_one(locs, path)
+    if chosen is None:
+        return None
+    nested = _locations(chosen, indent="        ")
+    return (_select(nested, path) if nested else None) or chosen
+
+
+def _select_one(locs: dict[str, str], path: str) -> str | None:
     for header, body in locs.items():
-        if header.startswith("~ ") and re.search(header[2:].strip('"').replace("\\z", "\\Z"), path):
+        if header.startswith("= ") and header[2:].strip() == path:
             return body
-    return locs[max(prefixes, key=len)] if prefixes else None
+    best: tuple[int, str, str] | None = None
+    for header, body in locs.items():
+        if header.startswith(("= ", "~")):
+            continue
+        prefix = header[3:] if header.startswith("^~ ") else header
+        if path.startswith(prefix) and (best is None or len(prefix) > best[0]):
+            best = (len(prefix), header, body)
+    if best is not None and best[1].startswith("^~ "):
+        return best[2]
+    for header, body in locs.items():
+        flags = 0
+        if header.startswith("~* "):
+            pattern, flags = header[3:], re.I
+        elif header.startswith("~ "):
+            pattern = header[2:]
+        else:
+            continue
+        if re.search(pattern.strip('"').replace("\\z", "\\Z"), path, flags):
+            return body
+    return best[2] if best else None
+
+
+def test_the_location_matcher_follows_nginx_rules() -> None:
+    """The routing assertions below are only as good as this matcher: pin its behaviour on a made-up server."""
+    locs = {
+        "/a/": "plain",
+        "^~ /b/": "carat",
+        "~ ^/b/x$": "regex",
+        "= /c": "exact",
+        "/d/": "outer\n        location ~ ^/d/n$ {\n nested\n        }\n",
+    }
+    assert _select(locs, "/a/q") == "plain"
+    assert _select(locs, "/b/x") == "carat"  # ^~ stops the regex search
+    assert _select(locs, "/c") == "exact"
+    assert _select({"/b/": "prefix", "~ ^/b/x$": "regex"}, "/b/x") == "regex"  # no ^~: the regex wins
+    assert _select(locs, "/zzz") is None
+    assert (_select(locs, "/d/n") or "").strip() == "nested"  # a location nested in the chosen one is followed
+    assert _select(locs, "/d/other").startswith("outer")
 
 
 def test_healthz_and_internal_are_never_forwarded(rendered_edge: str) -> None:
@@ -424,6 +484,65 @@ def test_the_forwarded_for_header_is_overwritten_never_appended(rendered_edge: s
         assert re.search(rf'proxy_set_header {header} "";', block), header
 
 
+def test_each_route_family_has_its_own_upstream_budget_below_the_roles_connection_cap(
+    rendered_edge: str,
+) -> None:
+    """One shared upstream let a stalled /s/ download or upload take every connection the role accepts (128), starving the
+    member page.  Each family has its own max_conns and idle pool; together they stay under the cap."""
+    ups = {
+        m.group(1): int(m.group(2))
+        for m in re.finditer(
+            r"upstream (artifact_host_\w+)\s*\{[^}]*?max_conns=(\d+)", _code(rendered_edge)
+        )
+    }
+    assert set(ups) == {
+        "artifact_host_share",
+        "artifact_host_member",
+        "artifact_host_upload",
+        "artifact_host_mcp",
+    }
+    assert sum(ups.values()) < 128, ups
+    assert "upstream artifact_host " not in _code(rendered_edge), "no shared upstream remains"
+    locs = _locations(_server_block(rendered_edge, HOST))
+    nested = _locations(locs["/api/member/"], indent="      ")
+    upload = next(b for h, b in nested.items() if "runs" in h)
+    assert "proxy_pass http://artifact_host_upload;" in upload
+    # the page's budget is not the downloads' or the uploads'
+    assert ups["artifact_host_member"] >= 32
+    # every pool keeps few idle connections (they count against the role's cap while idle)
+    assert all(int(k) <= 8 for k in re.findall(r"keepalive (\d+);", _code(rendered_edge).split("upstream artifact_host_share")[1].split("server {")[0]))
+
+
+def test_the_artifact_server_is_never_the_default_and_unknown_names_are_dropped(
+    rendered_edge: str,
+) -> None:
+    """Connecting by IP (no SNI, or another name) must not land on the artifact host's server: it is not a
+    default_server, it needs its own name, and the one default on the port rejects the handshake."""
+    code = _code(rendered_edge)
+    block = _server_block(rendered_edge, HOST)
+    assert "default_server" not in _code(block)
+    assert f"server_name {HOST};" in _code(block)
+    defaults = re.findall(r"listen 8443[^;]*default_server[^;]*;", code)
+    assert len(defaults) == 1
+    first = code[code.rindex("server {", 0, code.index(defaults[0])) :]
+    assert "ssl_reject_handshake on;" in first.split("server {")[1]
+    assert "if ($hcn_from_edge = 0) { return 444; }" in _code(block)
+
+
+def test_mcp_artifacts_strips_client_identity_headers_and_keeps_the_servers_set(
+    rendered_edge: str,
+) -> None:
+    mcp = _locations(_server_block(rendered_edge, "mcp.local.metabolomics.us"))["= /mcp/artifacts"]
+    for header in ("Forwarded", "X-Real-IP", "X-Forwarded-Host"):
+        assert re.search(rf'proxy_set_header {header} "";', mcp), header
+    # a location-level proxy_set_header replaces the whole inherited set: what the server sets must be repeated
+    server = _server_block(rendered_edge, "mcp.local.metabolomics.us")
+    inherited = set(re.findall(r"^    proxy_set_header (\S+) ", server, re.M))
+    here = set(re.findall(r"proxy_set_header (\S+) ", mcp))
+    assert inherited <= here, inherited - here
+    assert "proxy_set_header X-Forwarded-For $remote_addr;" in mcp
+
+
 def test_share_bodies_are_capped_and_never_forwarded_for_reads(rendered_edge: str) -> None:
     locs = _locations(_server_block(rendered_edge, HOST))
     reads = locs["/s/"]
@@ -444,7 +563,7 @@ def test_mcp_artifacts_is_routed_on_the_mcp_host_with_the_mcp_budget(rendered_ed
     mcp = _locations(_server_block(rendered_edge, "mcp.local.metabolomics.us"))
     assert "= /mcp/artifacts" in mcp
     body = mcp["= /mcp/artifacts"]
-    assert "proxy_pass http://artifact_host;" in body
+    assert "proxy_pass http://artifact_host_mcp;" in body
     assert "limit_req zone=hcn_mcp" in body and "client_max_body_size 768k;" in body
     assert "if ($request_method !~ ^POST$) { return 404; }" in body
     # the artifact host's own name does not serve MCP
@@ -711,7 +830,25 @@ def test_nginx_accepts_the_rendered_edge_conf(
         f"{conf}:/etc/nginx/nginx.conf:ro",
         "-v",
         f"{acme}:/etc/acme:ro",
-        "nginx:1.29-alpine",
+        _PRODUCTION_NGINX,
+        "nginx",
+        "-t",
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr[-2000:]
+
+
+def test_nginx_accepts_the_relay_conf(docker_ok: None, host: dict) -> None:
+    """The relay's own configuration, tested by the image digest compose runs it with."""
+    image = host["services"]["artifact-host-relay"]["image"]
+    run = _docker(
+        "run",
+        "--rm",
+        "--add-host",
+        "artifact-host-internal:127.0.0.1",
+        "-v",
+        f"{RELAY_CONF}:/etc/nginx/nginx.conf:ro",
+        image,
         "nginx",
         "-t",
         check=False,
