@@ -149,6 +149,13 @@ def _parse(data: Any) -> FleetConfig:
                 parse_ai_sync(sec["values"]["ai_sync"])
             except ValueError as exc:
                 raise FleetConfigError(f"section {name}: {exc}") from None
+        if name == CONTROL_PLANE_SECTION and "agent_rules" in sec["values"]:
+            from herdr_engineering.control_plane.agent_rules_config import parse_agent_rules
+
+            try:
+                parse_agent_rules(sec["values"]["agent_rules"])
+            except ValueError as exc:
+                raise FleetConfigError(f"section {name}: {exc}") from None
         if name == "github" and sec["values"].get("app") not in (None, {}):
             from herdr_engineering.github_auth import GitHubAuthError, parse_app_config
 

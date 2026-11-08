@@ -1,0 +1,21 @@
+---
+# Shared agent rules (github.com/berlinguyinca/agent-rules): clone/fetch into ~/.agent-rules, check out the pinned ref and
+# run its install.sh (links AGENTS.md into the harness dirs, ensures the @import in ~/.claude/CLAUDE.md). Skipped when no
+# pin is supplied: `agent_rules_ref` comes from control_plane.agent_rules in the fleet config (fleet join/update pass it
+# as extra vars) or from the inventory. A ref missing from the repo fails the play rather than leaving rules floating.
+- name: "Install the pinned shared agent rules"
+  become: false
+  when: agent_rules_ref is defined
+  environment:
+    HOME: "{{ fleet_home }}"
+  block:
+    - name: "Sync ~/.agent-rules to the pinned ref and run install.sh"
+      ansible.builtin.command:
+        argv:
+          - bash
+          - "{{ herdr_engineering_repo_root }}/scripts/agent-rules-sync.sh"
+          - "{{ agent_rules_repo_url | default('git@github.com:berlinguyinca/agent-rules.git') }}"
+          - "{{ agent_rules_ref }}"
+          - "{{ fleet_home }}/.agent-rules"
+      register: agent_rules_sync
+      changed_when: "'changed=true' in (agent_rules_sync.stdout_lines | last | default(''))"

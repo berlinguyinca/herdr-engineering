@@ -1676,7 +1676,8 @@ def _cmd_fleet_update(args) -> int:
         for h in report.get("status", {}).get("hosts", []):
             print(f"  {h['host']:12} herdr-eng={h['herdr_eng']} build-gate={h['build_gate']} "
                   f"agent={h['agent']} revision={h.get('revision', 'unknown')} "
-                  f"cleanup={h.get('cleanup', 'unknown')} summary={h.get('summary', 'unknown')}")
+                  f"cleanup={h.get('cleanup', 'unknown')} summary={h.get('summary', 'unknown')} "
+                  f"rules={h.get('rules', 'unknown')}")
         fs = report.get("steps", {}).get("fleet_sync", {})
         if fs.get("rc") != 0 and fs.get("stderr"):
             print(f"  !! {fs['stderr']}")

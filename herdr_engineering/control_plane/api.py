@@ -3871,6 +3871,15 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         {"error": "not configured"}, 404)
                 except ValueError:
                     return self._json({"error": "not configured"}, 404)
+            if resource == "agent-rules" and parts[4:] == ["config"]:
+                # Read-only, from the central fleet YAML; an unusable or invalid section reads as not configured.
+                from .agent_rules_config import parse_agent_rules
+                raw = server._control_plane_value(server.fleet_config, "agent_rules")
+                try:
+                    return self._json(parse_agent_rules(raw)) if raw is not None else self._json(
+                        {"error": "not configured"}, 404)
+                except ValueError:
+                    return self._json({"error": "not configured"}, 404)
             if resource == "ai-sync" and len(parts) == 4:
                 return self._etag_json({"hosts": r.list_ai_sync(_q(self.path, "host_id"))})
             if resource == "fleet-rollouts" and len(parts) in (4, 5):

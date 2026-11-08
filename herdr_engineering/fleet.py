@@ -250,6 +250,8 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
         playbook = root / "ansible" / "playbooks" / "fleet-sync.yml"
         cmd = ["ansible-playbook", "-i", str(inv), str(playbook), "-l", host,
                "-e", f"fabric_agent_gateway_url={gateway}"]
+        for key, value in _playbook_vars(fleet_config).items():
+            cmd += ["-e", f"{key}={value}"]
         rc, out, err = _run(cmd)
         report["steps"]["provision"] = {"ok": rc == 0, "rc": rc,
                                         "stderr": err.strip()[-500:] or None}
@@ -409,6 +411,7 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
 
     playbook = root / "ansible" / "playbooks" / "fleet-sync.yml"
     variables = {"fabric_agent_gateway_url": gateway, "herdr_engineering_revision": revision}
+    variables.update(_playbook_vars())
     if pi_revision:
         variables["pi_engineering_revision"] = pi_revision
     cmd = ["ansible-playbook", "-i", str(inv), str(playbook), "-e", json.dumps(variables)]
@@ -454,8 +457,22 @@ def fleet_status(*, inventory: Path | None = None, host: str | None = None) -> d
                           "cleanup": _clean(parts[5]).removeprefix("cleanup=") if len(parts) > 5 else "unknown",
                           "pi_revision": _clean(parts[6]).removeprefix("pi-revision=") if len(parts) > 6 else "unknown",
                           "pi_path": _clean(parts[7]).removeprefix("pi-path=") if len(parts) > 7 else "",
-                          "summary": _summary_state(parts, root)})
+                          "summary": _summary_state(parts, root),
+                          "rules": _rules_revision(parts)})
     return {"rc": rc, "hosts": hosts, "stderr": err.strip()[-300:] or None}
+
+
+def _rules_revision(parts: list[str]) -> str:
+    """Short sha of the host's ~/.agent-rules checkout, 'MISSING' when not installed, 'unknown' for old fingerprints."""
+    raw = next((p.strip().rstrip('"').strip() for p in parts if p.strip().startswith("rules=")), None)
+    return "unknown" if raw is None else raw.removeprefix("rules=")
+
+
+def _playbook_vars(fleet_config: Path | None = None) -> dict[str, str]:
+    """Extra vars for the fleet playbooks from the central fleet config (pinned shared agent rules)."""
+    from .control_plane.agent_rules_config import agent_rules_vars
+    from .fleet_config_cli import DEFAULT_CONFIG_PATH
+    return agent_rules_vars(fleet_config or DEFAULT_CONFIG_PATH)
 
 
 def _summary_state(parts: list[str], root: Path) -> str:
@@ -508,6 +525,7 @@ _UPDATERS = {
     "codex": "npm install -g @openai/codex@{version}",
     "pi": "pi-engineering-update   # moves pi-engineering; pi itself follows its own release channel",
     "herdr-eng": "herdr-eng fleet update --host {host}",
+    "rules": "herdr-eng fleet update --host {host}",
 }
 
 
