@@ -40,7 +40,7 @@
 ## File Structure
 
 - Create `herdr_artifact_host/operator_shares.py`: the create-share rules and SQL (one responsibility; does not live in `member_api.py`, which stays owner-scoped).
-- Modify `herdr_artifact_host/internal_server.py`, `host_config.py`, `roles.py`, `cli.py`, `migrations/` (new `0008_internal_share_grants.sql`), `deploy/artifact-host/*`.
+- Modify `herdr_artifact_host/internal_server.py`, `host_config.py`, `roles.py`, `cli.py`, `migrations/` (new `0008_operator_share_role.sql`), `deploy/artifact-host/*`.
 - Create `herdr_engineering/control_plane/library_content_token.py` (sign/verify only) and `artifact_library_content_api.py` (mint + prefix route); modify `artifact_host_client.py`, `artifact_library_api.py`, `api.py` (route wiring only).
 - Modify `packages/library-frame.js`, `packages/library-view.js`, `packages/herdr-web-client/client.js`; create `packages/library-share-dialog.js` and `packages/library-fullscreen.js` (small, separately testable).
 
@@ -49,8 +49,8 @@
 ### Task 1: Host operator-share service
 
 **Files:**
-- Create: `herdr_artifact_host/operator_shares.py`, `herdr_artifact_host/migrations/0008_internal_share_grants.sql`
-- Modify: `herdr_artifact_host/roles.py` (internal role grants), `deploy/artifact-host/roles.sql` or wherever `roles.sql` is rendered (grep `GRANT` under `herdr_artifact_host/` and `deploy/`)
+- Create: `herdr_artifact_host/operator_shares.py`, `herdr_artifact_host/migrations/0008_operator_share_role.sql`
+- Modify: `herdr_artifact_host/roles.py` and the rendered `roles.sql` (grep `GRANT` under `herdr_artifact_host/` and `deploy/`): add a FOURTH Postgres role `operator_share` (not a superuser; own password secret). The `internal` read role is NOT changed
 - Test: `tests/artifact_host/test_operator_shares.py`
 
 **Interfaces:**
@@ -59,23 +59,24 @@
   - `class OperatorShareError(Exception)`: `status: int`, `code: str`
   - `@dataclass(frozen=True) class CreatedShare`: `share_id: str`, `token: str`, `url: str`, `expires_at: datetime`
   - `async def create_operator_share(pool: asyncpg.Pool, *, artifact_id: str, version_id: str, expires_in_days: int | None, operator: str, public_origin: str | None, now: Callable[[], datetime]) -> CreatedShare`
-  - Migration `0008`: `GRANT INSERT ON shares, share_events` and `SELECT` on `member_usage` to the internal role only (no UPDATE/DELETE anywhere).
+  - Role `operator_share`: `INSERT` on `shares` and `share_events`; `SELECT` only on `artifacts`, `artifact_versions`, `member_usage`, `shares` (needed for the rules and the `FOR SHARE` lock); no UPDATE, DELETE or TRUNCATE; no `default_transaction_read_only` on it. The `internal` role keeps SELECT-only plus `default_transaction_read_only=on`. Migration `0008` holds any schema-level grants; role creation lives in `roles.sql` like the other three roles.
 
 - [ ] **Step 1: Write failing tests** in `test_operator_shares.py` (real Postgres via the existing `host`/`migrated_dsn` fixtures, using the `internal` DB role pool):
   - `test_creates_a_live_public_share_for_the_owner`: row has `state='live'`, `audience='public'`, `created_by == artifact owner`, `approved_by == "operator:alice"`, `token_hash == token_digest(token)`, `expires_at` = now + 30 d; one `share_events` row `kind='created'` with `actor == "operator:alice"` and `detail->>'via' == 'dashboard'`; the token is not stored anywhere in clear (grep every text column of both tables).
   - `test_expiry_bounds`: `None`->30 d, `1` and `90` ok; `0`, `91`, `True`, `"5"`, `1.5` -> `OperatorShareError(400, "invalid_expiry")`.
   - `test_refusals_write_nothing` (parametrized): unknown item 404 `not_found`; lifecycle `retracted` and `tombstoned` 404; intake `discarded` 404; version `purged` and `draft` 409 `version_not_ready`; version of another artifact 404; member with `member_usage.removed_since` set 403 `member_removed`. Each asserts `count(shares)` and `count(share_events)` unchanged.
   - `test_appears_in_the_owner_share_list`: `MemberService` share listing for the owner includes the new share as live.
-  - `test_internal_role_cannot_update_or_delete_shares`: raw `UPDATE shares` / `DELETE FROM share_events` as the internal role raises `InsufficientPrivilegeError`.
+  - `test_operator_share_role_is_insert_only`: as `operator_share`, raw `UPDATE shares`, `DELETE FROM share_events`, `INSERT INTO artifacts`, `UPDATE artifact_versions` raise `InsufficientPrivilegeError`.
+  - `test_internal_read_role_still_cannot_dml`: as `internal`, `INSERT INTO shares`, `INSERT INTO share_events`, `UPDATE shares` raise `InsufficientPrivilegeError`; at runtime that role's connection reports `SHOW default_transaction_read_only` = `on`; the existing privilege and `ReadOnlyPool` tests in `test_internal.py` and the roles tests stay unchanged and green.
 - [ ] **Step 2: Run** `uv run --extra dev pytest tests/artifact_host/test_operator_shares.py -q`. Expected: FAIL (module missing).
 - [ ] **Step 3: Implement** `create_operator_share` in one transaction (`SELECT ... FOR SHARE` on the artifact row so a concurrent retract serialises); entry via `choose_entry(None, names)`; `file_count`/`total_bytes` from the manifest as `member_api._share_create_once` does; token `secrets.token_urlsafe(32)`, share id `"shr_" + secrets.token_hex(12)`; URL `f"{public_origin}/s/{token}/"` (empty origin -> relative). No per-member rate limit and no `sharing_disabled` bypass: if `member_usage.sharing_disabled` is true refuse 403 `sharing_disabled` (operator must not override an owner-level block silently).
 - [ ] **Step 4: Implement migration 0008 and grants**; re-run the file. Expected: PASS.
-- [ ] **Step 5: Commit** `feat(artifact-host): operator share service and minimal internal-role grants`.
+- [ ] **Step 5: Commit** `feat(artifact-host): operator share service and insert-only operator_share role`.
 
 ### Task 2: Internal listener write key and the one POST route
 
 **Files:**
-- Modify: `herdr_artifact_host/internal_server.py` (`InternalConfig`, `handle`, `route`), `herdr_artifact_host/host_config.py` (`internal_write_key_digest`, internal slice), `herdr_artifact_host/roles.py` (route table), `herdr_artifact_host/cli.py:112`
+- Modify: `herdr_artifact_host/internal_server.py` (`InternalConfig`, `handle`, `route`), `herdr_artifact_host/host_config.py` (`internal_write_key_digest`, `operator_share_dsn`, internal slice), `herdr_artifact_host/roles.py` (route table), `herdr_artifact_host/cli.py:112`
 - Test: `tests/artifact_host/test_internal.py` (update `test_non_get_is_405`, `test_route_tables_are_disjoint_and_complete`, `test_read_only_pool_refuses_writes`, `test_a_full_read_sweep_writes_nothing`), `tests/artifact_host/test_internal_share_create.py` (new)
 
 **Interfaces:**
@@ -94,7 +95,7 @@
   - `test_the_read_sweep_still_writes_nothing`: the existing sweep proof stays green (GET path unchanged).
   - Update `test_non_get_is_405` to exclude the one POST route, and the route-table test to list `POST /v1/items/{id}/versions/{id}/shares` under `Role.INTERNAL` only (public role still 404 on it).
 - [ ] **Step 2: Run** each file separately. Expected: FAIL.
-- [ ] **Step 3: Implement.** Keep `ReadOnlyPool` for GETs; the write route uses a second `asyncpg.Pool` handle (`InternalSurface.writer`) built by `cli.py` from the same internal DB role. Bearer parsing is shared; `authorised(request, *, write: bool)` compares against the matching digest only.
+- [ ] **Step 3: Implement.** Keep `ReadOnlyPool` for GETs; the write route uses a second `asyncpg.Pool` (`InternalSurface.writer`, passed to `create_operator_share`) built by `cli.py` from the `operator_share` DB role via new config key `operator_share_dsn` (internal slice only, secret from its own file); GET handlers never touch it, and with the write key unset no writer pool is created. Bearer parsing is shared; `authorised(request, *, write: bool)` compares against the matching digest only.
 - [ ] **Step 4: Run** the files. Expected: PASS. Also run `tests/artifact_host/test_roles.py` if present.
 - [ ] **Step 5: Commit** `feat(artifact-host): internal create-share route behind a separate write key`.
 
@@ -105,7 +106,7 @@
 - Test: `tests/artifact_host/test_internal.py` (`test_content_is_served_sandboxed`, `test_csp_on_every_response`)
 
 **Interfaces:**
-- Produces: `share_http.dashboard_content_csp() -> str` equals `sandbox_csp(None, None)` with `frame-ancestors 'none'` replaced by `frame-ancestors 'self'` (the dashboard must be able to frame it; the public policy forbids framing). Everything else byte-identical to the public template. Content responses carry exactly this. Non-content responses (API, errors) carry `API_CSP = "default-src 'none'; frame-ancestors 'none'; sandbox"`. `CONTENT_CSP` is deleted.
+- Produces: `share_http.dashboard_content_csp() -> str` equals `sandbox_csp(None, None)` with `frame-ancestors 'none'` replaced by `frame-ancestors 'self'` (owner-accepted: the only difference from the public policy; the proxy accepts exactly this string). Everything else byte-identical to the public template. Content responses carry exactly this. Non-content responses (API, errors) carry `API_CSP = "default-src 'none'; frame-ancestors 'none'; sandbox"`. `CONTENT_CSP` is deleted.
 
 - [ ] **Step 1: Write failing tests:** content response `Content-Security-Policy == dashboard_content_csp()`; it starts with `sandbox allow-scripts allow-downloads;`, contains no `allow-same-origin`, `allow-forms`, `allow-popups`, `allow-top-navigation`; differs from `share_http.CSP` only in `frame-ancestors`; every non-content response (feed, 401, 404, 405, 429) carries `API_CSP`; `rg CONTENT_CSP herdr_artifact_host herdr_engineering tests` finds nothing (asserted by a test reading sources).
 - [ ] **Step 2: Run.** Expected: FAIL.
@@ -116,13 +117,13 @@
 ### Task 4: Relay and compose
 
 **Files:**
-- Modify: `deploy/artifact-host/relay/nginx.conf`, `deploy/artifact-host/compose.yaml`, `herdr_engineering/cli.py` render-artifact-host and `deploy/control-plane/deploy.sh` (render `internal_write_key_digest` into `internal.json` from `control_plane.artifact_library.host_write_key`)
+- Modify: `deploy/artifact-host/relay/nginx.conf`, `deploy/artifact-host/compose.yaml` (new secret `artifact-operator-share-password` mounted only into `artifact-host-internal`; no new network or port), `herdr_engineering/cli.py` render-artifact-host and `deploy/control-plane/deploy.sh` (render `internal_write_key_digest` into `internal.json` from `control_plane.artifact_library.host_write_key`)
 - Test: `tests/test_artifact_host_compose.py` (`test_the_relay_allows_only_get_and_nothing_outside_v1`, `test_the_relay_is_a_pinned_hardened_one_way_nginx`), plus its docker smoke test if one exists there
 
 **Interfaces:**
 - Produces: nginx `location ~ ^/v1/items/[A-Za-z0-9_-]+/versions/[A-Za-z0-9_-]+/shares$ { limit_except POST { deny all; } ... client_max_body_size 1k; }` placed before `location /v1/`; the generic `/v1/` block stays `limit_except GET`. Fleet config gains `control_plane.artifact_library.host_write_key` (>= 32 chars, must differ from `host_key`); only its sha256 is written to the host slice.
 
-- [ ] **Step 1: Write failing tests:** relay conf has exactly two proxying locations, the generic one `GET`-only and the share one `POST`-only; `POST` appears in code exactly once; the share location regex rejects `/v1/items/a/versions/b/shares/x`, `/v1/items//versions/b/shares`, `/v1/shares`, `/v1/items/a/shares`; `proxy_pass` set is unchanged; no `internal` health route forwarded. Config parsing: `host_write_key` missing leaves the route disabled, equal to `host_key` is a `ValueError` naming the key but not its value; rendered slice contains the digest and never the key.
+- [ ] **Step 1: Write failing tests:** relay conf has exactly two proxying locations, the generic one `GET`-only and the share one `POST`-only; `POST` appears in code exactly once; the share location regex rejects `/v1/items/a/versions/b/shares/x`, `/v1/items//versions/b/shares`, `/v1/shares`, `/v1/items/a/shares`; `proxy_pass` set is unchanged; no `internal` health route forwarded. Compose/roles: the `operator_share` password secret is attached to `artifact-host-internal` only (not public, not relay), `roles.sql` creates the role INSERT-only, and the three existing roles' statements are unchanged. Config parsing: `host_write_key` missing leaves the route disabled, equal to `host_key` is a `ValueError` naming the key but not its value; rendered slice contains the digest and never the key.
 - [ ] **Step 2: Run.** Expected: FAIL.
 - [ ] **Step 3: Implement** nginx, compose (no new ports or networks; relay stays one-way), config render.
 - [ ] **Step 4: Run** the compose test file and the fleet-config tests one at a time; if the existing docker smoke runs there, run it and assert from inside the relay that `POST /v1/items/x/versions/y/shares` reaches the host (401 without key) and `POST /v1/feed` is 403.
@@ -246,7 +247,7 @@
 **Files:** none (review output goes to the PR).
 
 - [ ] **Step 1: Ask the owner for explicit approval** to run an Opus 5.5 subagent (standing rule), then dispatch it with the diff of this branch since the end of host Task 12, the spec, and this plan's Review Focus.
-- [ ] **Step 2: Reviewer must try to break** each of: frame escape to dashboard origin; signed-URL forgery/replay/traversal; prefix-exemption leakage; read/write key confusion; token leakage (logs, list responses, error bodies, `Referer`, history); relay widening beyond one POST; CSP drift between host and proxy; fullscreen/`allow-downloads` abuse; operator-actor spoofing; removed/retracted/purged item sharing.
+- [ ] **Step 2: Reviewer must try to break** each of (WebKit/Safari is an explicit known risk in scope: the CSP uses `'self'`, which WebKit matches against the opaque origin; the repo has no Playwright `webkit` project, so Safari behavior is an UNVERIFIED RESIDUAL listed in the PR, unless `npx playwright install webkit` works in CI, in which case add a `webkit` run of the Task 10 first test and record the result): frame escape to dashboard origin; signed-URL forgery/replay/traversal; prefix-exemption leakage; read/write key confusion; token leakage (logs, list responses, error bodies, `Referer`, history); relay widening beyond one POST; CSP drift between host and proxy; fullscreen/`allow-downloads` abuse; operator-actor spoofing; the `operator_share` role's reach (insert-only, only the internal container holds its secret); removed/retracted/purged item sharing.
 - [ ] **Step 3: Fix every finding** with a failing test first in the owning task's file; re-run the affected files and the Playwright suite.
 - [ ] **Step 4: Run** `/code-review` on the final diff; merge via PR with CI green.
 
