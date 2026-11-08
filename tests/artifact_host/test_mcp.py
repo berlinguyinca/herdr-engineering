@@ -7,6 +7,7 @@ import base64
 import json
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from herdr_artifact_host.mcp import PROTOCOL
@@ -828,7 +829,6 @@ def test_agent_token_housekeeping(migrated_dsn, tmp_path) -> None:
         (host.sync_dir / "members.json").write_text(
             json.dumps({"updated": time.time(), "groups": {"local.dev": ["bob"]}})
         )
-        host.surface.member.s.authenticator._checked.clear()
         assert on_loop(host, host.surface.mcp.sweep_removed_members_agent_tokens()) == 1
         rows = {
             r["member_id"]: r["revoked_at"] is not None
@@ -914,3 +914,157 @@ def sign_in_on(host: Host, hostname: str, user: str = "alice") -> str:
     )
     assert r.status == 200, r.body
     return r.json()["session"]
+
+
+# ---------------------------------------------------------------- fix round 2
+
+
+def _members_json(host: Host, listed: list[str], *, age: float = 0.0) -> None:
+    (host.sync_dir / "members.json").write_text(
+        json.dumps({"updated": time.time() - age, "groups": {"local.dev": listed}})
+    )
+
+
+def _active_tokens(host: Host) -> int:
+    return len(host.rows("SELECT 1 FROM agent_tokens WHERE revoked_at IS NULL"))
+
+
+def test_the_removed_member_sweep_revokes_only_on_a_fresh_listing_without_the_member(
+    migrated_dsn, tmp_path
+) -> None:
+    with running_host(migrated_dsn, tmp_path) as host:
+        for who in ("alice", "bob"):
+            s = sign_in(host, who)
+            mint(host, s)
+            mint(host, s)
+        sweep = host.surface.mcp.sweep_removed_members_agent_tokens
+        # no evidence: no directory file at all (a cold start or a deployment without the sync job)
+        assert on_loop(host, sweep()) == 0 and _active_tokens(host) == 4
+        # a stale directory (older than the sync's max age) says nothing
+        _members_json(host, ["bob"], age=1000)
+        assert on_loop(host, sweep()) == 0 and _active_tokens(host) == 4
+        # an unreadable / malformed directory says nothing
+        (host.sync_dir / "members.json").write_text("{not json")
+        assert on_loop(host, sweep()) == 0 and _active_tokens(host) == 4
+        (host.sync_dir / "members.json").write_text(json.dumps({"updated": time.time()}))
+        assert on_loop(host, sweep()) == 0 and _active_tokens(host) == 4
+        # a fresh but EMPTY listing looks like a failed sync, not a mass removal
+        _members_json(host, [])
+        assert on_loop(host, sweep()) == 0 and _active_tokens(host) == 4
+        # a fresh listing that lacks alice revokes alice's tokens and nobody else's
+        _members_json(host, ["bob"])
+        assert on_loop(host, sweep()) == 2
+        rows = host.rows("SELECT member_id, revoked_at IS NOT NULL AS gone FROM agent_tokens")
+        assert {(r["member_id"], r["gone"]) for r in rows} == {("alice", True), ("bob", False)}
+        assert on_loop(host, sweep()) == 0
+
+
+def test_a_replayed_key_never_returns_another_actors_artifact(host: Host) -> None:
+    agent, session, _ = agent_for(host)
+    svc = host.surface.member.svc
+    user = Actor(ActorKind.USER, "alice")
+    # create: a key the owner used on the web is not answered to the agent
+    made = call(
+        host,
+        session,
+        "POST",
+        "/artifacts",
+        {"title": "T", "filename": "a.html", "profile": "web", "idempotency_key": "shared-key-1"},
+    )
+    assert made.status == 200
+    err, body = agent.tool(
+        "artifact_create",
+        title="T",
+        filename="a.html",
+        profile="web",
+        idempotency_key="shared-key-1",
+    )
+    assert err and body["error"] == "not_found" and made.json()["artifact_id"] not in str(body)
+    # publish and share_create on a web-made artifact: replaying the owner's key is not_found for the agent
+    web_aid, web_vid = published(host, session)
+    spec = {"name": "again.txt", "size_bytes": 1, "file_sha256": sha(b"x")}
+    from tests.artifact_host.member_support import upload
+
+    upload(host, session, web_aid, "again.txt", b"x")
+    first = on_loop(
+        host,
+        svc.publish(
+            user,
+            web_aid,
+            base_version_id=web_vid,
+            files=[spec],
+            message=None,
+            entry=None,
+            idempotency_key="replay-pub-1",
+        ),
+    )
+    err, body = agent.tool(
+        "artifact_publish",
+        artifact_id=web_aid,
+        base_version_id=web_vid,
+        files=[spec],
+        idempotency_key="replay-pub-1",
+    )
+    assert err and body["error"] == "not_found" and first["version_id"] not in str(body)
+    share = {"version_id": web_vid, "audience": "public", "idempotency_key": "replay-shr-1"}
+    on_loop(host, svc.share_create(user, web_aid, share))
+    err, body = agent.tool("artifact_share_create", artifact_id=web_aid, **share)
+    assert err and body["error"] == "not_found"
+    # and after the agent's own artifact is deleted its stored answers are gone too
+    aid = agent.ok("artifact_create", title="t", filename="a.html", profile="web")["artifact_id"]
+    data = b"<html>k</html>"
+    spec2 = {"name": "a.html", "size_bytes": len(data), "file_sha256": sha(data)}
+    agent.ok(
+        "artifact_upload_chunk",
+        artifact_id=aid,
+        **spec2,
+        index=0,
+        total=1,
+        sha256=sha(data),
+        data_b64=base64.b64encode(data).decode(),
+    )
+    agent.ok("artifact_publish", artifact_id=aid, files=[spec2], idempotency_key="own-key-1")
+    agent.ok("artifact_delete", artifact_id=aid, confirm=True)
+    err, body = agent.tool(
+        "artifact_publish", artifact_id=aid, files=[spec2], idempotency_key="own-key-1"
+    )
+    assert err and body["error"] == "not_found"
+
+
+def test_share_events_and_listing_show_the_true_actor(host: Host) -> None:
+    agent, session, _ = agent_for(host)
+    aid, vid = accepted_push(agent, host, session)
+    mine = call(
+        host, session, "POST", f"/artifacts/{aid}/shares", {"version_id": vid, "audience": "public"}
+    ).json()["share_id"]
+    theirs = agent.ok("artifact_share_create", artifact_id=aid, version_id=vid, audience="public")
+    agent.ok("artifact_share_revoke", artifact_id=aid, share_id=theirs["share_id"])
+    created = host.rows(
+        "SELECT kind, actor FROM share_events WHERE share_id=$1 ORDER BY event_id",
+        theirs["share_id"],
+    )
+    assert created == [
+        {"kind": "created", "actor": "agent:alice"},
+        {"kind": "revoked", "actor": "agent:alice"},
+    ]
+    assert host.rows("SELECT actor FROM share_events WHERE share_id=$1", mine) == [
+        {"actor": "alice"}
+    ]
+    links = call(host, session, "GET", f"/artifacts/{aid}/shares").json()["links"]
+    assert {x["share_id"]: x["created_via"] for x in links} == {
+        mine: "web",
+        theirs["share_id"]: "agent",
+    }
+    html = (Path(__file__).parents[2] / "herdr_artifact_host/member_static/member.js").read_text()
+    assert "created_via" in html  # the member page tells agent-made links apart
+
+
+def test_a_forwarded_value_that_is_not_an_address_is_ignored(host: Host) -> None:
+    _, _, token = agent_for(host)
+    junk = [
+        Agent(host, "hat_" + "C" * 43, headers={"X-Forwarded-For": f"not-an-ip-{i}"})
+        for i in range(61)
+    ]
+    codes = [a.rpc("ping").status for a in junk]
+    assert codes[:60] == [401] * 60 and codes[60] == 429  # every junk value is the socket peer
+    assert Agent(host, token, headers={"X-Forwarded-For": "10.7.7.7"}).rpc("ping").status == 200

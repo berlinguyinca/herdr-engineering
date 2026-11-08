@@ -342,3 +342,37 @@ def test_substring_search_uses_trigram_index(migrated_dsn: str) -> None:
         assert "ix_artifacts_search_trgm" in plan, plan
 
     with_conn(migrated_dsn, go)
+
+
+def test_migration_0005_shortens_existing_long_labels(host_dsn: str, tmp_path: Path) -> None:
+    from herdr_artifact_host.db import packaged_migrations
+
+    for p in packaged_migrations().iterdir():
+        if p.name.endswith(".sql") and p.name < "0005":
+            (tmp_path / p.name).write_text(p.read_text(encoding="utf-8"))
+
+    async def go() -> list[int]:
+        pool = await create_pool(host_dsn)
+        try:
+            assert await Migrator(pool, tmp_path).migrate() == [
+                "0001_init.sql",
+                "0002_member_identity.sql",
+                "0003_member_sessions.sql",
+                "0004_agent_tokens.sql",
+            ]
+            for i, n in enumerate((65, 80, 10)):
+                await pool.execute(
+                    "INSERT INTO agent_tokens (token_id, member_id, label, digest) VALUES ($1,'a',$2,$3)",
+                    f"atk_{i:016x}",
+                    "x" * n,
+                    f"{i:064x}",
+                )
+            assert await Migrator(pool).migrate() == ["0005_agent_scope.sql"]
+            rows = await pool.fetch(
+                "SELECT char_length(label) AS n FROM agent_tokens ORDER BY token_id"
+            )
+            return [r["n"] for r in rows]
+        finally:
+            await pool.close()
+
+    assert asyncio.run(go()) == [64, 64, 10]

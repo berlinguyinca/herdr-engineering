@@ -514,15 +514,19 @@ class McpSurface:
             book.move_to_end(ticket)
         return found
 
-    # -- housekeeping (called by the host's periodic task)
+    # -- housekeeping (Task 7 housekeeping calls these)
 
     async def sweep_agent_tokens(self) -> int:
         """Delete tokens revoked more than 90 days ago."""
         return await self.svc.tokens.prune()
 
     async def sweep_removed_members_agent_tokens(self) -> int:
-        """Revoke the tokens of members the directory no longer lists, so they stop counting toward the cap too."""
-        return await self.svc.tokens.revoke_for_absent_members(self.s.authenticator.exists)
+        """Revoke the tokens of members a FRESH directory listing no longer names (they stop counting toward the cap).
+
+        Without such evidence (stale, missing, unreachable, no sync) nothing is revoked.
+        """
+        listed = await asyncio.to_thread(self.s.listed_members)
+        return await self.svc.tokens.revoke_for_absent_members(listed)
 
     # -- tools
 

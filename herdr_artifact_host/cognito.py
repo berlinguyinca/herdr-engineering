@@ -273,6 +273,21 @@ class SyncedDirectory:
             raise RuntimeError("group membership sync is stale")
         return [self.group] if user in data["groups"].get(self.group, []) else []
 
+    def members(self) -> frozenset[str]:
+        """The group's members from a FRESH, well-formed, non-empty listing; raises otherwise (no evidence)."""
+        data = self._load("members.json")
+        age = self._now() - float(data["updated"])
+        if age > self.max_age or age < -60:
+            raise RuntimeError("group membership sync is stale")
+        listed = data["groups"][self.group]
+        if (
+            not isinstance(listed, list)
+            or not listed
+            or not all(isinstance(m, str) for m in listed)
+        ):
+            raise RuntimeError("group membership listing is empty or malformed")
+        return frozenset(listed)
+
 
 def boto_group_lookup(pool_id: str, region: str) -> Callable[[str], list[str] | None]:
     """Group lookup through AdminListGroupsForUser (needs cognito-idp:AdminListGroupsForUser)."""

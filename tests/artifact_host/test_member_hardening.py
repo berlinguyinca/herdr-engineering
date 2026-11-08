@@ -556,3 +556,17 @@ def test_sign_in_and_use_under_the_product_defaults(migrated_dsn, tmp_path) -> N
         assert call(host, s, "GET", f"/artifacts/{aid}").status == 200
         # not listed in members.json: refused
         assert exchange(host, "dave").status == 401
+
+
+def test_rotating_many_keys_does_not_reset_a_blocked_one() -> None:
+    from herdr_artifact_host.share_http import RateLimiter
+
+    clock = [1000.0]
+    lim = RateLimiter(3, lambda: clock[0])
+    assert [lim.allow("attacker") for _ in range(4)] == [True, True, True, False]
+    assert lim.blocked("attacker")
+    for i in range(5000):  # more keys than the table holds
+        lim.allow(f"other-{i}")
+    assert lim.blocked("attacker") and lim.allow("attacker") is False
+    clock[0] += 61  # the window passes and the key is free again
+    assert lim.allow("attacker") is True

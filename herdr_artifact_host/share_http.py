@@ -13,6 +13,7 @@ import os
 import re
 import stat
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import unquote_to_bytes
@@ -208,7 +209,7 @@ class RateLimiter:
     ):
         self.limit, self.now, self.window, self.max_keys = limit, now, window, max_keys
         self._lock = threading.Lock()
-        self._windows: dict[str, tuple[float, int]] = {}
+        self._windows: OrderedDict[str, tuple[float, int]] = OrderedDict()
 
     def blocked(self, key: str) -> bool:
         """True when ``key`` has used its whole window (nothing is counted)."""
@@ -226,9 +227,21 @@ class RateLimiter:
             if count >= self.limit:
                 return False
             if key not in self._windows and len(self._windows) >= self.max_keys:
-                self._windows.clear()
+                self._evict(now)
             self._windows[key] = (start, count + 1)
+            self._windows.move_to_end(key)
             return True
+
+    def _evict(self, now: float) -> None:
+        """Make room: drop the least-recently-used keys that are not blocked; blocked ones are kept."""
+        for k in list(self._windows):
+            start, count = self._windows[k]
+            if not (count >= self.limit and 0 <= now - start < self.window):
+                del self._windows[k]
+                if len(self._windows) < self.max_keys:
+                    return
+        # every key is blocked: refuse to grow past the bound by dropping the oldest window
+        self._windows.popitem(last=False)
 
 
 def decode_rel_path(raw: str) -> str | None:

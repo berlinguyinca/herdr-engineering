@@ -8,13 +8,11 @@ Listing never returns a secret or a digest.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
 import re
 import secrets
 import time
-from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Final
 
@@ -150,8 +148,14 @@ class AgentTokenStore:
         )
         return int(done.rsplit(" ", 1)[-1])
 
-    async def revoke_for_absent_members(self, exists: Callable[[str], bool]) -> int:
-        """Revoke every active token of a member for whom ``exists`` is false (left the group); returns the count."""
+    async def revoke_for_absent_members(self, listed: frozenset[str] | None) -> int:
+        """Revoke the active tokens of members missing from ``listed``; returns the count.
+
+        ``listed`` is positive evidence: a fresh, successfully read directory listing. None (stale, missing,
+        unreachable, cold) revokes nothing, because revocation is irreversible.
+        """
+        if listed is None:
+            return 0
         members = [
             r["member_id"]
             for r in await self._pool.fetch(
@@ -160,7 +164,7 @@ class AgentTokenStore:
         ]
         total = 0
         for member in members:
-            if await asyncio.to_thread(exists, member):
+            if member in listed:
                 continue
             done = await self._pool.execute(
                 "UPDATE agent_tokens SET revoked_at=now() WHERE member_id=$1 AND revoked_at IS NULL",

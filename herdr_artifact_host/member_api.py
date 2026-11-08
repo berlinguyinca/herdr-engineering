@@ -6,6 +6,9 @@ in the same transaction as the change they describe.
 
 Contract carried over:
 
+* Idempotency keys are serialised by a per-process lock and recorded after the work commits, so with several replicas
+  (or a crash between the work and the record) a retry can run the work twice.  Known single-replica limitation: the
+  (member_id, idempotency_key) primary key cannot close it because the record is not in the work's transaction.
 * Served only for the configured public Host (the surface checks it first); anything unconfigured is the uniform 404.
 * The session is ``Authorization: Member <session>`` (``member_session``: its own domain tag, never a cookie, so there is
   no ambient credential for a foreign site to ride on).  A claim cookie, a lab session, a write cookie, a Bearer agent
@@ -231,6 +234,7 @@ class MemberSettings:
         False  # members.json optional: the token's group claim decides when it is absent
     )
     directory_present: Callable[[], bool] = lambda: True
+    listed_members: Callable[[], frozenset[str] | None] = lambda: None  # None: no fresh evidence
 
 
 def synced_lookup(directory: SyncedDirectory, required: bool) -> Callable[[str], list[str] | None]:
@@ -279,6 +283,11 @@ class MemberService:
     @staticmethod
     def _agent(actor: Actor) -> bool:
         return actor.kind is ActorKind.AGENT
+
+    @staticmethod
+    def _who(actor: Actor, member: str) -> str:
+        """The share_events actor: the member, or ``agent:<member>`` when an agent token acted."""
+        return f"agent:{member}" if actor.kind is ActorKind.AGENT else member
 
     @staticmethod
     def _member(actor: Actor) -> str:
@@ -572,6 +581,8 @@ class MemberService:
                     idempotency_key,
                 )
                 if prior is not None:
+                    # an agent is never answered with an artifact it did not create (a web-made one, or a deleted one)
+                    await self._owned(conn, member, prior["artifact_id"], agent=self._agent(actor))
                     if prior["request_hash"] != request_hash:
                         raise MemberError(
                             409, "conflict", "idempotency_key was used with other arguments"
@@ -658,7 +669,7 @@ class MemberService:
                 "AND state<>'revoked' RETURNING share_id) "
                 "INSERT INTO share_events (share_id, kind, actor) SELECT share_id, 'revoked', $2 FROM r",
                 artifact_id,
-                member,
+                self._who(actor, member),
             )
             await settle_quota(conn, member, int(row["size_bytes"]))
         await self._drop_staging(member, artifact_id)
@@ -1039,6 +1050,8 @@ class MemberService:
         request: object,
         artifact_id: str,
         run: Callable[[], Awaitable[dict[str, Any]]],
+        *,
+        actor: Actor,
     ) -> dict[str, Any]:
         """Run ``run`` once per (member, scope, artifact, key): a retry with the same request gets the first answer, the
         same key with another request is a 409.  Calls of one member that carry a key are serialised."""
@@ -1046,6 +1059,8 @@ class MemberService:
             return await run()
         if not isinstance(key, str) or not _IDEMPOTENCY.fullmatch(key):
             raise _bad("idempotency_key is invalid")
+        # ownership first: a stored answer is never replayed to someone who could not have made the call
+        await self._owned(self.pool, member, artifact_id, agent=self._agent(actor))
         # the spaces cannot occur in a validated create key, so these never collide with artifact_create's keys
         full = f"{scope} {artifact_id} {key}"
         digest = hashlib.sha256(
@@ -1100,7 +1115,8 @@ class MemberService:
             idempotency_key,
             [base_version_id, files, message, entry],
             artifact_id,
-            lambda: self._publish_once(
+            actor=actor,
+            run=lambda: self._publish_once(
                 actor,
                 artifact_id,
                 base_version_id=base_version_id,
@@ -1304,7 +1320,8 @@ class MemberService:
             body.get("idempotency_key"),
             request,
             artifact_id,
-            lambda: self._share_create_once(actor, artifact_id, request),
+            actor=actor,
+            run=lambda: self._share_create_once(actor, artifact_id, request),
         )
 
     async def _share_create_once(
@@ -1392,7 +1409,7 @@ class MemberService:
             await conn.execute(
                 "INSERT INTO share_events (share_id, kind, actor, detail) VALUES ($1,'created',$2,$3::jsonb)",
                 share_id,
-                member,
+                self._who(actor, member),
                 json.dumps({"audience": audience}),
             )
         await self._audit(member, "share_create", "ok", None, share_id, audience)
@@ -1509,7 +1526,7 @@ class MemberService:
             await conn.execute(
                 "INSERT INTO share_events (share_id, kind, actor, detail) VALUES ($1,'approved',$2,$3::jsonb)",
                 share_id,
-                member,
+                self._who(actor, member),
                 json.dumps({"idempotency_key": idempotency_key} if idempotency_key else {}),
             )
         await self._audit(member, "share_approve", "ok", None, share_id, row["audience"])
@@ -1537,7 +1554,7 @@ class MemberService:
                 await conn.execute(
                     "INSERT INTO share_events (share_id, kind, actor) VALUES ($1,'revoked',$2)",
                     share_id,
-                    member,
+                    self._who(actor, member),
                 )
         await self._audit(member, "share_revoke", "ok", None, share_id, row["audience"])
         return {"share_id": share_id, "state": "revoked"}
@@ -1576,7 +1593,7 @@ class MemberService:
         member = self._member(actor)
         rows = await self.pool.fetch(
             "SELECT s.share_id, s.artifact_id, s.version_id, s.audience, s.state, s.entry, s.title, "
-            "s.expires_at, s.created_at, s.approved_at, s.revoked_at, s.allow_emails, s.allow_groups "
+            "s.expires_at, s.created_at, s.approved_at, s.revoked_at, s.allow_emails, s.allow_groups, s.created_via "
             "FROM shares s JOIN artifacts a ON a.artifact_id=s.artifact_id WHERE a.owner=$1 "
             "AND a.lifecycle NOT IN ('retracted','tombstoned') AND ($2::text IS NULL OR s.artifact_id=$2) "
             "ORDER BY s.created_at DESC LIMIT 500",
@@ -1596,6 +1613,7 @@ class MemberService:
                     "version_id": r["version_id"],
                     "audience": r["audience"],
                     "state": r["state"],
+                    "created_via": r["created_via"],
                     "status": status,
                     "entry": r["entry"],
                     "title": r["title"],
@@ -1780,7 +1798,12 @@ class MemberSurface:
             trusted = address.is_loopback or address.is_private
         except ValueError:
             trusted = False
-        return forwarded[:64] if forwarded and trusted else peer
+        if forwarded and trusted:
+            try:
+                return str(ipaddress.ip_address(forwarded))
+            except ValueError:
+                pass  # not an address: a spoofed key must not mint fresh limiter buckets
+        return peer
 
     async def _session(self, request: web.Request) -> web.Response:
         client = self._client(request)
@@ -2267,6 +2290,13 @@ class MemberSurface:
         return self._json(200, result)
 
 
+def _fresh_members(directory: SyncedDirectory) -> frozenset[str] | None:
+    try:
+        return directory.members()
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return None
+
+
 def build_member_settings(
     *,
     secret: bytes,
@@ -2331,4 +2361,5 @@ def build_member_settings(
         limits=limits,
         claim_fallback=not sync_required,
         directory_present=lambda: (Path(sync_dir) / "members.json").is_file(),
+        listed_members=lambda: _fresh_members(directory),
     )
