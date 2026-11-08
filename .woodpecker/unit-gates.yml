@@ -7,11 +7,14 @@
 # Whole suites, not scoped subsets; nothing is deselected. Green on the hive exec host (Python 3.13) once the host-dependent
 # tests were made host-independent. Still timing-sensitive under load: test_ci_api.py's telemetry race and a few fabric tests.
 # To use the larger hive pool, add `labels: {cluster: hive}` (queues are long, 10+ minutes).
+#
+# No `when: {path: ...}` here, deliberately. A path-filtered pipeline is never created, so on a docs-only PR this context never
+# reports - and a context that never reports cannot be a required check, which is the only reason unit-gates is optional and the
+# reason a PR with a failing unit-gates has been mergeable (issue #719). The path decision moved into the applicability step, so
+# the pipeline always exists and always reports a verdict; a docs-only PR pays seconds and gets a green that says why it was fast.
 when:
   - event: manual
   - event: pull_request
-    path:
-      include: ['herdr_engineering/**', 'tests/**', 'packages/**', 'pyproject.toml', 'scripts/ci/unit-gates.sh', '.woodpecker/unit-gates.yml']
 
 skip_clone: true
 
@@ -27,8 +30,19 @@ steps:
       - 'git checkout -q FETCH_HEAD'
       - 'git --no-pager log --oneline -1'
 
+  # exit 0 = run the suite, 3 = nothing covered changed, anything else = fail the pipeline. It fails open: a guard that cannot
+  # work out the diff runs the suite rather than handing back a green it did not earn.
+  - name: applicability
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'rm -f .ci-unit-gates-not-applicable'
+      - 'rc=0; bash scripts/ci/unit-gates-applicable.sh || rc=$?'
+      - 'if [ "$rc" = 3 ]; then touch .ci-unit-gates-not-applicable; elif [ "$rc" != 0 ]; then exit "$rc"; fi'
+
   - name: unit-gates
     image: bash
     commands:
       - 'set -eu'
+      - 'if [ -f .ci-unit-gates-not-applicable ]; then echo "unit-gates: no covered path changed; nothing to run"; exit 0; fi'
       - 'bash scripts/ci/unit-gates.sh'
