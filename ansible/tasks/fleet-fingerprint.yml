@@ -2,7 +2,7 @@
 # Gather a version/registration fingerprint for the current host (no changes).
 # Requires fleet_home / fleet_user to be set (see playbook preamble).
 # Registers:
-#   fp_herdr_version, fp_herdr_path, fp_buildgate_md5, fp_summary_sha, fp_agent, fp_revision, fp_cleanup
+#   fp_herdr_version, fp_herdr_path, fp_buildgate_md5, fp_summary_sha, fp_agent, fp_revision, fp_cleanup, fp_rules, fp_rules_value
 - name: "Capture herdr-eng version fingerprint"
   # become: false — must read the FLEET user's venv/services, not root's.
   become: false
@@ -136,3 +136,17 @@
   register: fp_autospec_cli
   changed_when: false
   failed_when: false
+
+- name: "Capture installed shared agent rules revision (short sha of ~/.agent-rules)"
+  become: false
+  ansible.builtin.shell: |
+    git -C {{ fleet_home | quote }}/.agent-rules rev-parse --short=7 HEAD 2>/dev/null || echo MISSING
+  args:
+    executable: /bin/bash
+  register: fp_rules
+  changed_when: false
+  failed_when: false
+
+- name: "Combine the installed rules revision with any failure recorded by agent-rules.yml"
+  ansible.builtin.set_fact:
+    fp_rules_value: "{{ ('FAILED:' ~ agent_rules_failure) if agent_rules_failure is defined else (fp_rules.stdout | default('MISSING', true) | trim) }}"

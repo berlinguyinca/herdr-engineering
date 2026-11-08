@@ -361,6 +361,8 @@ def _build_parser() -> argparse.ArgumentParser:
     pu.add_argument("--no-pull", action="store_true", help="skip controller git pull")
     pu.add_argument("--no-reinstall", action="store_true",
                     help="skip controller local pip reinstall")
+    pu.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
+                    help="central fleet config file holding control_plane.agent_rules (the pinned shared rules)")
     pu.add_argument("--json", action="store_true")
     pu.set_defaults(func=_cmd_fleet_update)
     ps = fsub.add_parser("status", help="read-only fleet version/registration status")
@@ -1549,6 +1551,7 @@ def _cmd_fleet_join(args) -> int:
         attach=not args.no_attach,
         provision=not args.no_provision,
         fleet_config=None if args.no_credentials else Path(args.fleet_config).expanduser(),
+        agent_rules_config=Path(args.fleet_config).expanduser(),
         roles=([r.strip() for r in args.roles.split(",") if r.strip()] if args.roles else None),
         control_plane_url=args.control_plane_url,
     )
@@ -1662,6 +1665,7 @@ def _cmd_fleet_update(args) -> int:
         gateway=DEFAULT_GATEWAY,
         pull_controller=not args.no_pull,
         reinstall_local=not args.no_reinstall,
+        fleet_config=Path(args.fleet_config).expanduser(),
     )
     if args.json:
         _print_json(report)
@@ -1676,7 +1680,8 @@ def _cmd_fleet_update(args) -> int:
         for h in report.get("status", {}).get("hosts", []):
             print(f"  {h['host']:12} herdr-eng={h['herdr_eng']} build-gate={h['build_gate']} "
                   f"agent={h['agent']} revision={h.get('revision', 'unknown')} "
-                  f"cleanup={h.get('cleanup', 'unknown')} summary={h.get('summary', 'unknown')}")
+                  f"cleanup={h.get('cleanup', 'unknown')} summary={h.get('summary', 'unknown')} "
+                  f"rules={h.get('rules', 'unknown')}")
         fs = report.get("steps", {}).get("fleet_sync", {})
         if fs.get("rc") != 0 and fs.get("stderr"):
             print(f"  !! {fs['stderr']}")
