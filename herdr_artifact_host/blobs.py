@@ -19,7 +19,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import BinaryIO, NewType
 
@@ -139,6 +139,21 @@ class BlobStore:
         except FileNotFoundError:
             return False
         return True
+
+    def iter_blobs(self) -> Iterator[tuple[str, float]]:
+        """Every stored blob as ``(sha, mtime)``; entries that are not a well-formed sha file are skipped.  Blocking."""
+        base = self._root / "sha256"
+        for first in sorted(base.iterdir()) if base.is_dir() else ():
+            for second in sorted(first.iterdir()) if first.is_dir() else ():
+                for leaf in sorted(second.iterdir()) if second.is_dir() else ():
+                    if not _SHA.fullmatch(leaf.name):
+                        continue
+                    try:
+                        st = leaf.stat()
+                    except OSError:
+                        continue
+                    if leaf.is_file() and leaf.parent.name == leaf.name[2:4]:
+                        yield leaf.name, st.st_mtime
 
     def exists(self, sha: str) -> bool:
         return self._path(sha).is_file()

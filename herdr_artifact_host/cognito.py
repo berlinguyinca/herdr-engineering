@@ -19,6 +19,7 @@ import threading
 import time
 import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
 
 _POOL_RE = re.compile(r"^([a-z]{2}-[a-z]+-\d)_[A-Za-z0-9]+$")
 _USER_RE = re.compile(
@@ -241,6 +242,12 @@ class CognitoAuthenticator:
         return ok
 
 
+@dataclass(frozen=True)
+class DirectorySnapshot:
+    members: frozenset[str]
+    disabled: frozenset[str] = frozenset()
+
+
 class SyncedDirectory:
     """Cognito JWKS and group membership read from files a host-side job refreshes.
 
@@ -275,6 +282,11 @@ class SyncedDirectory:
 
     def members(self) -> frozenset[str]:
         """The group's members from a FRESH, well-formed, non-empty listing; raises otherwise (no evidence)."""
+        return self.snapshot().members
+
+    def snapshot(self) -> DirectorySnapshot:
+        """One read of ``members.json`` as evidence: the group's listed members plus the optional ``disabled`` list
+        (accounts the sync saw disabled).  Raises unless the file is fresh and well formed with a non-empty listing."""
         data = self._load("members.json")
         age = self._now() - float(data["updated"])
         if age > self.max_age or age < -60:
@@ -286,7 +298,10 @@ class SyncedDirectory:
             or not all(isinstance(m, str) for m in listed)
         ):
             raise RuntimeError("group membership listing is empty or malformed")
-        return frozenset(listed)
+        off = data.get("disabled", [])
+        if not isinstance(off, list) or not all(isinstance(m, str) for m in off):
+            raise RuntimeError("disabled listing is malformed")
+        return DirectorySnapshot(frozenset(listed), frozenset(off))
 
 
 def boto_group_lookup(pool_id: str, region: str) -> Callable[[str], list[str] | None]:

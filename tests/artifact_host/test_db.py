@@ -52,6 +52,7 @@ def test_migrate_twice_is_idempotent(host_dsn: str) -> None:
         "0003_member_sessions.sql",
         "0004_agent_tokens.sql",
         "0005_agent_scope.sql",
+        "0006_removed_since.sql",
     ]
     assert second == []
 
@@ -65,7 +66,7 @@ def test_concurrent_migrators_apply_once(host_dsn: str) -> None:
             await pool.close()
 
     results = asyncio.run(go())
-    assert sorted(len(r) for r in results) == [0, 0, 0, 5]
+    assert sorted(len(r) for r in results) == [0, 0, 0, 6]
 
 
 def test_failed_migration_rolls_back_and_is_not_recorded(host_dsn: str, tmp_path: Path) -> None:
@@ -367,7 +368,10 @@ def test_migration_0005_shortens_existing_long_labels(host_dsn: str, tmp_path: P
                     "x" * n,
                     f"{i:064x}",
                 )
-            assert await Migrator(pool).migrate() == ["0005_agent_scope.sql"]
+            assert await Migrator(pool).migrate() == [
+                "0005_agent_scope.sql",
+                "0006_removed_since.sql",
+            ]
             rows = await pool.fetch(
                 "SELECT char_length(label) AS n FROM agent_tokens ORDER BY token_id"
             )

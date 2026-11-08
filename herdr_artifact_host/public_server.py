@@ -64,6 +64,7 @@ from .annotation_anchor import (
 )
 from .blobs import BlobAborted, BlobCorrupt, BlobMissing, BlobStore, InvalidSha
 from .cognito import CognitoAuthenticator, SyncedDirectory
+from .housekeeping import DEFAULT_INTERVAL, Housekeeper
 from .https_origin import https_origin
 from .library import LibraryError, LibraryStore, Viewer
 from .mcp import MCP_PATH, McpSurface
@@ -1898,14 +1899,34 @@ class PublicServer:
     """Runs ``build_app`` on a TCP socket and ``build_health_app`` on a second, loopback-only one (the deploy entry
     point and the tests)."""
 
-    def __init__(self, app: web.Application, health_app: web.Application | None = None) -> None:
+    def __init__(
+        self,
+        app: web.Application,
+        health_app: web.Application | None = None,
+        *,
+        housekeeper: Housekeeper | None = None,
+        housekeeping: bool = True,
+        housekeeping_interval: float = DEFAULT_INTERVAL,
+    ) -> None:
         self.app = app
+        surface = app[SURFACE]
+        if housekeeper is None and housekeeping and surface.member is not None:
+            housekeeper = Housekeeper.for_member_surface(
+                surface.pool, surface.blobs, surface.member
+            )
+        self.housekeeper = housekeeper
+        self.housekeeping_interval = housekeeping_interval
+        self._housekeeping_task: asyncio.Task[None] | None = None
         self.health_app = (
             health_app if health_app is not None else build_health_app(app[SURFACE].pool)
         )
         self._runners: list[_UniformRunner] = []
         self.port = 0
         self.health_port = 0
+
+    @property
+    def housekeeping_running(self) -> bool:
+        return self._housekeeping_task is not None and not self._housekeeping_task.done()
 
     @property
     def _runner(self) -> _UniformRunner | None:
@@ -1940,6 +1961,10 @@ class PublicServer:
             self.health_port = await self._serve(self.health_app, HEALTH_HOST, health_port)
             await verify_uniform_listener(self.port, probe_host(host))
             await verify_uniform_listener(self.health_port, probe_host(HEALTH_HOST))
+            if self.housekeeper is not None and self._housekeeping_task is None:
+                self._housekeeping_task = asyncio.create_task(
+                    self.housekeeper.run_forever(self.housekeeping_interval)
+                )
         except BaseException:
             try:
                 await self.stop()
@@ -1952,6 +1977,17 @@ class PublicServer:
         """Clean up every runner even when one cleanup raises; the first error is re-raised afterwards."""
         runners, self._runners = list(reversed(self._runners)), []
         first: BaseException | None = None
+        task, self._housekeeping_task = self._housekeeping_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                me = asyncio.current_task()
+                if me is not None and me.cancelling():
+                    raise  # this stop() was itself cancelled: do not swallow that
+            except Exception as exc:
+                first = exc
         for runner in runners:
             try:
                 await runner.cleanup()

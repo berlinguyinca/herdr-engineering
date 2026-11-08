@@ -60,7 +60,7 @@ from aiohttp import web
 
 from .agent_tokens import TOKEN_ID_RE, AgentTokenStore, TokenError
 from .blobs import BlobCorrupt, BlobMissing, BlobStore
-from .cognito import CognitoAuthenticator, SyncedDirectory
+from .cognito import CognitoAuthenticator, DirectorySnapshot, SyncedDirectory
 from .db import LOCK_NS_BLOB
 from .library import (
     PENDING_CAP,
@@ -235,6 +235,9 @@ class MemberSettings:
     )
     directory_present: Callable[[], bool] = lambda: True
     listed_members: Callable[[], frozenset[str] | None] = lambda: None  # None: no fresh evidence
+    directory_snapshot: Callable[[], DirectorySnapshot | None] = lambda: (
+        None
+    )  # housekeeping's evidence
 
 
 def synced_lookup(directory: SyncedDirectory, required: bool) -> Callable[[str], list[str] | None]:
@@ -2297,6 +2300,13 @@ def _fresh_members(directory: SyncedDirectory) -> frozenset[str] | None:
         return None
 
 
+def _fresh_snapshot(directory: SyncedDirectory) -> DirectorySnapshot | None:
+    try:
+        return directory.snapshot()
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return None
+
+
 def build_member_settings(
     *,
     secret: bytes,
@@ -2362,4 +2372,5 @@ def build_member_settings(
         claim_fallback=not sync_required,
         directory_present=lambda: (Path(sync_dir) / "members.json").is_file(),
         listed_members=lambda: _fresh_members(directory),
+        directory_snapshot=lambda: _fresh_snapshot(directory),
     )
