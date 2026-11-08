@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { isKeptHref, liveLink, mountStaticHtml, STATIC_NOTE } from './artifact-static-preview.js';
+import { isKeptHref, liveLink, mountStaticHtml, PRINT_CSS, STATIC_NOTE } from './artifact-static-preview.js';
 
 // A document stub with just enough DOM for mountStaticHtml: the shadow root "parses" the anchors of its html.
 class Node {
@@ -109,4 +109,15 @@ test('mountStaticHtml leaves inline data-URI figure images in the copy untouched
   const html = '<article><h3>Fig</h3><img class="fig-img" alt="Fig" src="data:image/svg+xml;base64,PHN2Zz4="><p>cap</p></article>';
   const { shadow } = mount(html);
   assert.equal(shadow.innerHTML, html);
+});
+
+test('a print rule lifts the scroll box clip once per document and a document without a head is left alone', () => {
+  const head = new Node('head');
+  const withHead = { createElement: tag => new Node(tag), head, querySelector: () => head.children.find(child => child.tag === 'style') ?? null };
+  mountStaticHtml(new Node('div'), '', { document: withHead });
+  mountStaticHtml(new Node('div'), '', { document: withHead });
+  assert.equal(head.children.length, 1, 'one style element for any number of mounts');
+  assert.equal(head.children[0].textContent, PRINT_CSS);
+  assert.match(PRINT_CSS, /^@media print\{\[data-static-preview\]\{max-height:none!important;overflow:visible!important/);
+  assert.doesNotThrow(() => mountStaticHtml(new Node('div'), '', { document: doc }));
 });
