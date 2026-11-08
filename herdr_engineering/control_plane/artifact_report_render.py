@@ -48,6 +48,39 @@ _DARK = ("color-scheme:dark;--bg:#17181c;--surface:#1f2026;--surface-2:#2a2b33;-
          "--warn-bg:#2b2310;--btn:#2fc59c;--on-accent:#07211a;--shadow:0 1px 3px rgba(0,0,0,.5);")
 # Light is the base; dark applies when the OS asks for it unless the host forces light, or whenever the host forces
 # dark. The host sets data-theme on :root (standalone page) or on the shadow host (dashboard), never in the markup.
+# Print / save-as-PDF. Paper is always light, whatever the screen theme or the host's forced data-theme: the variables are
+# re-declared with the same specificity as every theme rule above and later in the sheet, so they win in any theme.
+_PRINT_VARS = ("color-scheme:light;--bg:#fff;--surface:#fff;--surface-2:#fff;--border:#8a8a94;--text:#000;--muted:#333;"
+               "--accent:#000;--accent-weak:#fff;--link:#000;--warn:#000;--warn-bg:#fff;--btn:#fff;--on-accent:#000;"
+               "--shadow:none;")
+_PRINT_SELECTORS = (":root,:root[data-theme],:root:not([data-theme=\"light\"]),:host,:host([data-theme]),"
+                    ":host(:not([data-theme=\"light\"]))")
+_PRINT_BASE = ("@media print{" + _PRINT_SELECTORS + "{" + _PRINT_VARS + "}"
+               "body,.rp{background:#fff;color:#000}.rp{max-width:none;padding:0;font-size:11pt;line-height:1.45}"
+               # the opt-in Rich view panel (the only id-less section a host adds after the header) is screen-only
+               ".rp>section:not([id]){display:none!important}}")
+_PRINT_FULL = (
+    "@media print{"
+    # no chrome: the contents pills, download buttons and the Rich view toggle mean nothing on paper
+    + ".toc,.btn,.anchor,.howto{display:none}.hero{padding-bottom:10pt}h1{font-size:22pt}h2{font-size:15pt}h3{font-size:12pt}"
+    ".rp section{margin-top:18pt}p,li{orphans:3;widows:3}"
+    # page-break control: a heading stays with what follows, and a finding, figure, row or callout is never split
+    "h1,h2,h3,.sub,summary{break-after:avoid}.card,.finding,.figure,.callout,.notice,.qlist li,tr,figure,img"
+    "{break-inside:avoid}.card{box-shadow:none;border-color:#8a8a94}.finding{border-left:3pt solid #000}"
+    # a figure that is taller than a page shrinks to fit one (object-fit keeps its proportions)
+    ".fig-img{max-width:100%;max-height:180mm;width:auto;height:auto;object-fit:contain;margin-left:auto;margin-right:auto}"
+    # tables paginate with a repeating header instead of scrolling inside a clipped box
+    ".tablewrap{overflow:visible;border-color:#8a8a94}table{min-width:0;font-size:10pt}thead{display:table-header-group}"
+    "th{background:#fff;color:#000;border-bottom:1pt solid #000}th,td{padding:4pt 6pt}td:first-child{min-width:0}"
+    ".chip{border-color:#555;background:#fff;color:#000}.callout{border:1px solid #8a8a94;background:#fff}"
+    "details{border-color:#8a8a94}.card:target,.card.is-target{outline:0;background:#fff}"
+    "section:target>h2,section.is-target>h2,li:target,li.is-target,tr:target td,tr.is-target td{background:none}"
+    # closed <details> (the analysis block) is printed open: older engines show the content, newer ones need ::details-content
+    "details>:not(summary){display:block}details::details-content{content-visibility:visible;display:block}"
+    # a link to the outside shows where it goes; in-page chips and local file links are not underlined or expanded
+    "a{color:#000}a[href^=\"http\"]::after{content:\" (\" attr(href) \")\";font-size:.85em}"
+    ".chip,.toc a{text-decoration:none}}"
+)
 _CORE_CSS = (
     ":root,:host{color-scheme:light dark;" + _LIGHT + "--radius:8px;--sans:\"Inter\",-apple-system,BlinkMacSystemFont,\"Segoe UI\","
     "Roboto,Helvetica,Arial,sans-serif;--mono:\"JetBrains Mono\",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}"
@@ -58,7 +91,7 @@ _CORE_CSS = (
     "body{margin:0;background:var(--bg)}"
     ".rp{max-width:860px;margin:0 auto;padding:32px 16px 64px;background:var(--bg);color:var(--text);"
     "font:15px/1.6 var(--sans);overflow-wrap:break-word}a{color:var(--link)}.fig-img{max-width:100%;height:auto}"
-)
+) + _PRINT_BASE
 _FULL_CSS = _CORE_CSS + (
     ".rp *{box-sizing:border-box}.rp section{margin:40px 0 0;min-width:0}"
     ".hero{padding-bottom:20px;border-bottom:1px solid var(--border)}"
@@ -97,11 +130,27 @@ _FULL_CSS = _CORE_CSS + (
     "gap:6px 16px;margin:12px 0 0;font-size:13.5px}dt{font-family:var(--mono);color:var(--muted)}dd{margin:0}"
     ".notice{margin-top:40px;padding:10px 14px;border:1px dashed var(--warn);border-radius:var(--radius);"
     "background:var(--warn-bg);font-size:13px;color:var(--text)}"
+    # permalinks: always visible (not hover-only), a 24px target, and a highlight for the fragment's target
+    ".anchor{display:inline-block;min-width:24px;min-height:24px;line-height:24px;margin-left:6px;text-align:center;"
+    "font-weight:400;color:var(--muted);text-decoration:none;border-radius:4px}"
+    ".anchor:hover{color:var(--link);background:var(--surface-2)}"
+    ".anchor:focus-visible{outline:2px solid var(--accent);outline-offset:1px;color:var(--link)}"
+    ".rp :target,.rp .is-target{scroll-margin-top:16px}"
+    ".card:target,.card.is-target{outline:2px solid var(--accent);outline-offset:2px;background:var(--accent-weak)}"
+    "section:target>h2,section.is-target>h2,li:target,li.is-target,tr:target td,tr.is-target td"
+    "{background:var(--accent-weak);border-radius:4px}"
+    # "How to read this report": a collapsed legend; screen-only (paper keeps every label self-explanatory)
+    ".howto{margin:16px 0 0;font-size:14px;max-width:68ch}.howto summary{min-height:24px;line-height:24px}"
+    ".howto summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}"
+    ".howto dl{grid-template-columns:minmax(0,12rem) 1fr;font-size:13.5px}"
+    ".howto dt{font-family:inherit;font-weight:600;color:var(--text)}.howto dd{color:var(--muted)}"
+    "@media (max-width:640px){.howto dl{grid-template-columns:1fr;gap:2px 0}.howto dd{margin-bottom:8px}}"
     "@media (max-width:640px){h1{font-size:25px}.rp{padding-top:20px}}"
-    "@media print{body,.rp{background:#fff;color:#000}.rp{max-width:none;padding:0}.toc{display:none}"
-    ".card,.tablewrap{break-inside:avoid;box-shadow:none}a{color:#000}.btn{border:1px solid #000;background:none;color:#000}}"
+    + _PRINT_FULL
 )
-_FULL_CSS_MARGIN = 1200  # a cap below css + this much falls back to the core styles
+# Heading permalinks cost ~130 bytes each; a cap below this keeps the page plain rather than starving its content.
+_ANCHOR_MIN_BYTES = 16 * 1024
+_FULL_CSS_MARGIN = 2000  # a cap below css + this much falls back to the core styles
 _CSP = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'")
 _ANALYSIS_PAIR_LIMIT = 40
 
@@ -123,6 +172,43 @@ def _flatten(value, prefix: str = ""):
     else:
         text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
         yield prefix, text
+
+
+def _how_to_read(report: dict, anchors: bool) -> str:
+    """The collapsed "How to read this report" legend. Static text only (no descriptor text is copied in), and a term
+    is explained only when this report actually shows it: the labels are the ones ``render_report_preview`` prints.
+    The descriptor has no severity or confidence field, and the legend says so rather than inventing a scale."""
+    findings = report["findings"]
+    if not (findings or report["figures"] or report["assets"] or report.get("analysis")):
+        return ""  # nothing to explain beyond questions and lists
+    rows: list[tuple[str, str]] = []
+    if findings:
+        rows.append(("Finding", "A claim the author makes. It names the questions it answers and cites at least one "
+                                "evidence entry."))
+        tags = ["Question", "Evidence"] + (["Figure"] if any(row.get("figure_ids") for row in findings) else [])
+        rows.append((" \u00b7 ".join(tags), "The small tags under a finding. Each names an entry in this report; "
+                                           "select one to jump to it."))
+        if any(row.get("limitations") for row in findings):
+            rows.append(("Limits", "What that finding does not establish."))
+        if any(row.get("next_steps") for row in findings):
+            rows.append(("Next checks", "What the author suggests checking next."))
+        rows.append(("Severity, confidence", "Not used: findings are not ranked or scored. Judge how much weight one "
+                                             "deserves from its evidence and its limits."))
+    if any(row.get("reading_guide") for row in report["figures"]):
+        rows.append(("How to read", "The author's note under a figure, explaining how to read that chart."))
+    if report["assets"]:
+        rows.append(("Evidence and downloads", "Evidence rows link the files they came from. The downloads table gives "
+                                               "each file's type, size and the first 12 characters of its SHA-256 to "
+                                               "check a download."))
+    if report.get("analysis"):
+        rows.append(("Method and configuration", "Folded away: how the result was produced."))
+    if anchors:
+        rows.append(("#", "Beside each section, finding and figure heading. It links to exactly that part; copy it to "
+                          "share."))
+    rows.append(("Shortened or omitted", "A notice at the end means this is a size-limited preview; the full "
+                                         "descriptor has everything."))
+    return ('<details class="howto"><summary>How to read this report</summary><dl>'
+            + "".join(f"<dt>{term}</dt><dd>{meaning}</dd>" for term, meaning in rows) + "</dl></details>")
 
 
 def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] | None = None,
@@ -147,6 +233,7 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
     make_url = asset_url or (lambda asset: "assets/" + quote(asset["id"], safe=""))
     links = {asset["id"]: _asset_link(make_url(asset)) for asset in report["assets"]}
     shortened = False
+    anchors = max_bytes >= _ANCHOR_MIN_BYTES
 
     def text(value: str, limit: int = 2048) -> str:
         nonlocal shortened
@@ -166,6 +253,22 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
     def esc_id(identifier: str) -> str:
         return html.escape(identifier, quote=True)
 
+    def hid(anchor: str) -> str:
+        """The id attribute of the heading a permalink describes (``h-`` + the section's own anchor)."""
+        return f' id="h-{esc_id(anchor)}"' if anchors else ""
+
+    def permalink(anchor: str, what: str) -> str:
+        """A visible, keyboard-focusable ``#`` link to the heading's own anchor. ``anchor`` is either a fixed section
+        key or ``kind-<descriptor id>`` where the id passed the descriptor's ``[A-Za-z0-9][A-Za-z0-9_.:-]`` check;
+        it is percent-encoded for the href exactly like the chips. No free text goes into an attribute: the share
+        sanitiser fails the whole render on an attribute value that looks like a script (``x onerror=``,
+        ``javascript:``). The accessible name is fixed ("Link to this finding") and ``aria-describedby`` points at the
+        heading, so a screen reader announces the title as the description."""
+        if not anchors:
+            return ""
+        return (f'<a class="anchor" href="#{quote(anchor, safe="")}" title="Link to this {what}" '
+                f'aria-label="Link to this {what}" aria-describedby="h-{esc_id(anchor)}">#</a>')
+
     def chips(label: str, kind: str, identifiers: list[str]) -> str:
         if not identifiers:
             return ""
@@ -177,7 +280,8 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
         return "<ul>" + "".join(f"<li>{text(value)}</li>" for value in values) + "</ul>" if values else ""
 
     def finding(row: dict) -> str:
-        return (f'<article class="card finding" id="finding-{esc_id(row["id"])}"><h3>{text(row["title"], 256)}</h3>'
+        return (f'<article class="card finding" id="finding-{esc_id(row["id"])}"><h3{hid("finding-" + row["id"])}>{text(row["title"], 256)}'
+                f'{permalink("finding-" + row["id"], "finding")}</h3>'
                 f'<p>{text(row["statement"])}</p>'
                 + chips("Question", "question", row["question_ids"])
                 + chips("Evidence", "evidence", row["evidence_ids"])
@@ -194,7 +298,8 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
 
     def figure(row: dict, uri: str | None = None) -> str:
         image = (f'<img class="fig-img" alt="{html.escape(row["title"][:256], quote=True)}" src="{uri}">' if uri else "")
-        return (f'<article class="card figure" id="figure-{esc_id(row["id"])}"><h3>{text(row["title"], 256)}</h3>'
+        return (f'<article class="card figure" id="figure-{esc_id(row["id"])}"><h3{hid("figure-" + row["id"])}>{text(row["title"], 256)}'
+                + permalink("figure-" + row["id"], "figure") + "</h3>"
                 + image + f'<p>{text(row["caption"])}</p>'
                 + (f'<div class="callout"><b>How to read</b>{text(row["reading_guide"])}</div>'
                    if row.get("reading_guide") else "")
@@ -263,7 +368,8 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
                      f"<tbody>{body}</tbody></table></div>")
         else:
             inner = body
-        return f'<section id="sec-{anchor}"><h2>{title}</h2>{inner}</section>'
+        return (f'<section id="sec-{anchor}"><h2{hid("sec-" + anchor)}>{title}{permalink("sec-" + anchor, "section")}</h2>'
+                f"{inner}</section>")
 
     def toc(anchors: list[tuple[str, str]]) -> str:
         return ('<nav class="toc" aria-label="Contents">'
@@ -283,12 +389,14 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
     summary_html = f'<p class="lede">{text(report["summary"])}</p>' if report.get("summary") else ""
     summary_shortened, shortened = shortened, False
 
+    legend = _how_to_read(report, anchors) if anchors else ""   # same size gate as the permalinks
+
     def document(css: str, hero_summary: str, nav: str, body: str, footer: str) -> str:
         return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
                 '<meta name="viewport" content="width=device-width,initial-scale=1">'
                 f'<meta http-equiv="Content-Security-Policy" content="{_CSP}">'
                 f'<title>{title}</title><style>{css}</style></head><body><main class="rp">'
-                f'<header class="hero"><h1>{title}</h1>{hero_summary}{nav}</header>{body}{footer}'
+                f'<header class="hero"><h1>{title}</h1>{hero_summary}{nav}{legend if css is _FULL_CSS else ""}</header>{body}{footer}'
                 "</main></body></html>")
 
     # Reserve the largest possible contents list and omission note (every count is no wider than its
