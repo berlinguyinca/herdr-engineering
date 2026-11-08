@@ -296,7 +296,7 @@ def _build_parser() -> argparse.ArgumentParser:
                       ("fabric-listener", "print `HOST PORT` of control_plane.collab.fabric_trust's dedicated listener (nothing when not configured)"),
                       ("render-llm", "write the llm-proxy container's config slice (0600)"),
                       ("render-share", "write the share-public container's config slice (0600)"),
-                      ("render-artifact-host", "write the artifact host's config (0600; nothing when disabled)"),
+                      ("render-artifact-host", "write the artifact host's per-role config slices into a directory (0600; nothing when disabled)"),
                       ("render-edge", "write the collab edge's nginx.conf (with /s/ when shares are enabled)")):
         sp = csub.add_parser(name, help=hlp)
         sp.add_argument("--path", default=FLEET_CONFIG_DEFAULT)
@@ -331,8 +331,9 @@ def _build_parser() -> argparse.ArgumentParser:
                                  "identifiers; refused when share is enabled but incomplete")
         if name == "render-artifact-host":
             sp.add_argument("--out", required=True,
-                            help="file to write (0600): the host's whole configuration; written only when "
-                                 "control_plane.artifact_host.enabled is true, refused when it is incomplete")
+                            help="directory to write (0700; files 0600): one config slice per role, the database "
+                                 "admin password and roles.sql; written only when control_plane.artifact_host.enabled "
+                                 "is true, refused when it is incomplete")
         if name == "render-edge":
             sp.add_argument("--template", required=True, help="collab-edge/nginx.conf (snippets beside it)")
             sp.add_argument("--out", required=True, help="nginx.conf to write")
@@ -1636,7 +1637,7 @@ def _cmd_fleet_config(args) -> int:
             fcc.render_artifact_host(cfg, Path(args.out).expanduser())
             # deploy.sh reads the last word: whether the host runs and the edge routes to it
             on = fcc.artifact_host_enabled(cfg)
-            print(f"{'wrote ' + args.out + ' (0600)' if on else 'wrote nothing'} "
+            print(f"{'wrote ' + args.out + '/ (0600 files)' if on else 'wrote nothing'} "
                   f"artifact_host={'enabled' if on else 'disabled'}")
         elif cmd == "render-edge":
             fcc.render_edge(load_fleet_config(path), Path(args.template).expanduser(), Path(args.out).expanduser())

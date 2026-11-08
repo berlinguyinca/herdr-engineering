@@ -20,6 +20,7 @@ CLAIM = "c" * 40
 def good() -> dict:
     return {
         "version": 1,
+        "role": "public",
         "public_host": "artifacts.example.test",
         "public_url": "https://artifacts.example.test",
         "mcp_public_hosts": ["mcp.example.test"],
@@ -33,9 +34,26 @@ def good() -> dict:
         },
         "session_secret": SECRET,
         "claim_key": CLAIM,
-        "internal_key_digest": hashlib.sha256(b"k" * 40).hexdigest(),
         "health_port": 8092,
-        "database": {"user": "artifact_host", "password": "p" * 20},
+        "database": {"user": "artifact_public", "password": "p" * 20},
+    }
+
+
+def good_internal() -> dict:
+    return {
+        "version": 1,
+        "role": "internal",
+        "internal_key_digest": hashlib.sha256(b"k" * 40).hexdigest(),
+        "bind": "172.31.252.18",
+        "database": {"user": "artifact_internal", "password": "i" * 20},
+    }
+
+
+def good_migrate() -> dict:
+    return {
+        "version": 1,
+        "role": "migrate",
+        "database": {"user": "artifact_owner", "password": "o" * 20},
     }
 
 
@@ -132,9 +150,46 @@ def test_healthcheck_fails_on_a_non_200(tmp_path: Path) -> None:
         server.server_close()
 
 
-def test_internal_probe_targets_the_internal_port(tmp_path: Path) -> None:
-    cfg = host_config.load(write(tmp_path, good()))
-    assert cli.probe_url("internal", cfg).endswith(f":{host_config.INTERNAL_PORT}/internal/healthz")
+def test_internal_probe_targets_the_bind_address_and_port(tmp_path: Path) -> None:
+    cfg = host_config.load(write(tmp_path, good_internal()))
+    assert cli.probe_url("internal", cfg) == (
+        f"http://172.31.252.18:{host_config.INTERNAL_PORT}/internal/healthz"
+    )
+
+
+def test_each_role_slice_loads_and_carries_only_its_own_secrets(tmp_path: Path) -> None:
+    internal = host_config.load(write(tmp_path, good_internal()))
+    assert internal.role == "internal" and internal.bind == "172.31.252.18"
+    assert internal.session_secret == b"" and internal.claim_key == b""
+    assert internal.db_user == "artifact_internal"
+    migrate = host_config.load(write(tmp_path, good_migrate()))
+    assert migrate.role == "migrate" and migrate.db_user == "artifact_owner"
+    assert host_config.load(write(tmp_path, good())).db_user == "artifact_public"
+
+
+@pytest.mark.parametrize(
+    ("base", "mutate", "key"),
+    [
+        (good_internal, lambda d: d.update(session_secret=SECRET), "session_secret"),
+        (good_internal, lambda d: d.update(claim_key=CLAIM), "claim_key"),
+        (good_internal, lambda d: d.update(cognito={}), "cognito"),
+        (good_internal, lambda d: d.update(bind="0.0.0.0"), "bind"),
+        (good_internal, lambda d: d.update(bind="artifact-host-internal"), "bind"),
+        (good_internal, lambda d: d["database"].update(user="artifact_owner"), "database.user"),
+        (good_migrate, lambda d: d.update(internal_key_digest="a" * 64), "internal_key_digest"),
+        (good_migrate, lambda d: d["database"].update(user="artifact_public"), "database.user"),
+        (good, lambda d: d.update(internal_key_digest="a" * 64), "internal_key_digest"),
+        (good, lambda d: d["database"].update(user="artifact_owner"), "database.user"),
+        (good, lambda d: d.update(role="superuser"), "role"),
+        (good, lambda d: d.pop("role"), "role"),
+    ],
+)
+def test_a_role_slice_refuses_what_belongs_to_another_role(base, mutate, key: str) -> None:
+    data = copy.deepcopy(base())
+    mutate(data)
+    with pytest.raises(ValueError) as err:
+        host_config.parse(data)
+    assert key in str(err.value)
 
 
 def test_every_role_subcommand_is_registered_and_a_bad_config_exits_2(
@@ -143,5 +198,7 @@ def test_every_role_subcommand_is_registered_and_a_bad_config_exits_2(
     missing = str(tmp_path / "nope.json")
     for cmd in ("public", "internal", "migrate"):
         assert cli.main([cmd, "--config", missing]) == 2
+    path = write(tmp_path, good_internal())
+    assert cli.main(["public", "--config", str(path)]) == 2  # a slice for another role is refused
     assert cli.main(["healthcheck", "internal", "--config", missing]) == 2
     assert "cannot read" in capsys.readouterr().err

@@ -512,7 +512,6 @@ ARTIFACT_HOST_KEYS = frozenset(
         "session_secret",
         "claim_key",
         "health_port",
-        "db_user",
         "db_password",
     }
 )
@@ -521,8 +520,39 @@ ARTIFACT_HOST_SCHEMA_VERSION = (
 )
 ARTIFACT_HOST_MIN_SECRET_BYTES = 32
 ARTIFACT_HOST_MIN_PASSWORD = 16
+ARTIFACT_HOST_MIN_DISTINCT = 10  # distinct characters a secret must hold ("a" * 32 and "ab" * 16 are refused)
+# Fixed, not configurable: these must match deploy/artifact-host/compose.yaml (a test keeps them in step).
+ARTIFACT_HOST_INTERNAL_BIND = "172.31.252.18"
+ARTIFACT_HOST_SLICE_FILES = ("public.json", "internal.json", "migrate.json")
+ARTIFACT_HOST_ADMIN_PASSWORD_FILE = "db-admin-password"
+ARTIFACT_HOST_ROLES_SQL = "roles.sql"
+ARTIFACT_HOST_ROLE_DB_USERS = {
+    "public": "artifact_public",
+    "internal": "artifact_internal",
+    "migrate": "artifact_owner",
+}
 ARTIFACT_HOST_DEFAULT_HEALTH_PORT = 8092
 _ARTIFACT_HOST_SECRET_HINT = "generate one locally (e.g. `openssl rand -hex 32`) and store it in the fleet YAML; it is never printed"
+
+
+def artifact_host_db_passwords(db_password: str) -> dict[str, str]:
+    """One database password per role (and the bootstrap admin's), each HMAC-SHA256(db_password, role).
+
+    The fleet YAML therefore holds ONE value to generate and rotate, yet no container's slice holds a password that works
+    for another role (an HMAC does not reveal its key or its siblings).  Rotating db_password changes every role's
+    password at the next deploy (roles.sql re-applies them)."""
+    import hmac
+
+    return {
+        role: hmac.new(
+            db_password.encode("utf-8"), f"artifact-host-db:{role}".encode(), hashlib.sha256
+        ).hexdigest()
+        for role in (*ARTIFACT_HOST_ROLE_DB_USERS, "admin")
+    }
+
+
+def _distinct_enough(value: str) -> bool:
+    return len(set(value)) >= ARTIFACT_HOST_MIN_DISTINCT
 
 
 def _artifact_host_mapping(cfg: FleetConfig) -> dict:
@@ -548,8 +578,8 @@ def artifact_host_public_host(cfg: FleetConfig) -> str | None:
     return _artifact_host_mapping(cfg).get("public_host") if artifact_host_enabled(cfg) else None
 
 
-def artifact_host_slice(cfg: FleetConfig) -> dict | None:
-    """The host's configuration (herdr_artifact_host.host_config schema), or None when it is disabled.
+def artifact_host_slices(cfg: FleetConfig) -> dict[str, dict] | None:
+    """The host's per-role configuration slices (herdr_artifact_host.host_config schema), or None when it is disabled.
 
     Cognito identifiers come from control_plane.collab; the dashboard's bearer key is control_plane.artifact_library.host_key
     (only its sha256 digest travels into the host).  Errors name keys, never values."""
@@ -593,6 +623,11 @@ def artifact_host_slice(cfg: FleetConfig) -> dict | None:
                 f"control_plane.artifact_host.{key} is missing or shorter than "
                 f"{ARTIFACT_HOST_MIN_SECRET_BYTES} bytes: {_ARTIFACT_HOST_SECRET_HINT}"
             )
+        if not _distinct_enough(value):
+            raise FleetConfigError(
+                f"control_plane.artifact_host.{key} is too repetitive (fewer than "
+                f"{ARTIFACT_HOST_MIN_DISTINCT} distinct characters): {_ARTIFACT_HOST_SECRET_HINT}"
+            )
         secrets_[key] = value
     if secrets_["session_secret"] == secrets_["claim_key"]:
         raise FleetConfigError(
@@ -604,9 +639,11 @@ def artifact_host_slice(cfg: FleetConfig) -> dict | None:
             "control_plane.artifact_host.db_password is missing or shorter than "
             f"{ARTIFACT_HOST_MIN_PASSWORD} characters: {_ARTIFACT_HOST_SECRET_HINT}"
         )
-    user = section.get("db_user", "artifact_host")
-    if not isinstance(user, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", user):
-        raise FleetConfigError("control_plane.artifact_host.db_user must be a plain identifier")
+    if not _distinct_enough(password):
+        raise FleetConfigError(
+            "control_plane.artifact_host.db_password is too repetitive (fewer than "
+            f"{ARTIFACT_HOST_MIN_DISTINCT} distinct characters): {_ARTIFACT_HOST_SECRET_HINT}"
+        )
     seconds = section.get("session_seconds", 14400)
     if isinstance(seconds, bool) or not isinstance(seconds, int) or not 60 <= seconds <= 7 * 86400:
         raise FleetConfigError(
@@ -624,6 +661,16 @@ def artifact_host_slice(cfg: FleetConfig) -> dict | None:
             "8090 and 8091"
         )
     collab = _share_mapping(cfg)[1]
+    taken = {_loose_hostname(collab.get("public_url"))}
+    dashboard_hosts = collab.get("dashboard_hosts")
+    if isinstance(dashboard_hosts, list):
+        taken |= {_loose_hostname(h) for h in dashboard_hosts}
+    if host in taken:
+        raise FleetConfigError(
+            "control_plane.artifact_host.public_host must differ from the collaboration MCP host "
+            "(control_plane.collab.public_url) and control_plane.collab.dashboard_hosts: the edge "
+            "serves each name with its own server block"
+        )
     cognito = {
         "pool_id": collab.get("cognito_pool"),
         "client_ids": collab.get("cognito_clients"),
@@ -649,26 +696,99 @@ def artifact_host_slice(cfg: FleetConfig) -> dict | None:
             "control_plane.artifact_host needs control_plane.artifact_library.host_key (the "
             "dashboard's bearer key; only its sha256 digest reaches the host)"
         )
+    passwords = artifact_host_db_passwords(password)
+    users = ARTIFACT_HOST_ROLE_DB_USERS
+
+    def database(role: str) -> dict[str, str]:
+        return {"user": users[role], "password": passwords[role]}
+
     return {
-        "version": ARTIFACT_HOST_SCHEMA_VERSION,
-        "public_host": host,
-        "public_url": f"https://{host}",
-        "mcp_public_hosts": list(mcp_hosts),
-        "session_seconds": seconds,
-        "cognito": cognito,
-        "session_secret": secrets_["session_secret"],
-        "claim_key": secrets_["claim_key"],
-        "internal_key_digest": hashlib.sha256(key.encode("utf-8")).hexdigest(),
-        "health_port": health,
-        "database": {"user": user, "password": password},
+        "public": {
+            "version": ARTIFACT_HOST_SCHEMA_VERSION,
+            "role": "public",
+            "public_host": host,
+            "public_url": f"https://{host}",
+            "mcp_public_hosts": list(mcp_hosts),
+            "session_seconds": seconds,
+            "cognito": cognito,
+            "session_secret": secrets_["session_secret"],
+            "claim_key": secrets_["claim_key"],
+            "health_port": health,
+            "database": database("public"),
+        },
+        # Only the digest of the dashboard's key, and no session or claim key: this role serves the dashboard.
+        "internal": {
+            "version": ARTIFACT_HOST_SCHEMA_VERSION,
+            "role": "internal",
+            "internal_key_digest": hashlib.sha256(key.encode("utf-8")).hexdigest(),
+            "bind": ARTIFACT_HOST_INTERNAL_BIND,
+            "database": database("internal"),
+        },
+        "migrate": {
+            "version": ARTIFACT_HOST_SCHEMA_VERSION,
+            "role": "migrate",
+            "database": database("migrate"),
+        },
     }
 
 
+def artifact_host_roles_sql(cfg: FleetConfig) -> str:
+    """The idempotent role/grant script deploy.sh pipes into the database container as its bootstrap admin on every deploy.
+
+    Three non-superuser login roles: ``artifact_owner`` owns the database and runs the migrations (DDL),
+    ``artifact_public`` gets DML only, ``artifact_internal`` gets SELECT only (and ``default_transaction_read_only``).  The
+    script runs before the migration so default privileges apply to every table the owner creates."""
+    slices = artifact_host_slices(cfg)
+    if slices is None:
+        raise FleetConfigError("control_plane.artifact_host is not enabled")
+    users = {r: slices[r]["database"] for r in ARTIFACT_HOST_ROLE_DB_USERS}
+    owner, public, internal = users["migrate"], users["public"], users["internal"]
+    lines = [
+        "-- generated by `herdr-eng fleet config render-artifact-host`; idempotent; contains role passwords",
+        "\\set ON_ERROR_STOP on",
+    ]
+    for u in (owner, public, internal):
+        name, pw = u["user"], u["password"]
+        lines += [
+            f"SELECT 'CREATE ROLE {name} LOGIN' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{name}')\\gexec",
+            f"ALTER ROLE {name} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '{pw}';",
+        ]
+    o, p, i = owner["user"], public["user"], internal["user"]
+    lines += [
+        f"ALTER DATABASE artifact_host OWNER TO {o};",
+        "REVOKE ALL ON DATABASE artifact_host FROM PUBLIC;",
+        f"GRANT CONNECT ON DATABASE artifact_host TO {o}, {p}, {i};",
+        f"ALTER SCHEMA public OWNER TO {o};",
+        "REVOKE ALL ON SCHEMA public FROM PUBLIC;",
+        f"GRANT USAGE ON SCHEMA public TO {p}, {i};",
+        f"ALTER ROLE {i} SET default_transaction_read_only = on;",
+        f"ALTER ROLE {p} SET default_transaction_read_only = off;",
+        f"ALTER DEFAULT PRIVILEGES FOR ROLE {o} IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {p};",
+        f"ALTER DEFAULT PRIVILEGES FOR ROLE {o} IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {p};",
+        f"ALTER DEFAULT PRIVILEGES FOR ROLE {o} IN SCHEMA public GRANT SELECT ON TABLES TO {i};",
+        f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {p};",
+        f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {p};",
+        f"GRANT SELECT ON ALL TABLES IN SCHEMA public TO {i};",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def render_artifact_host(cfg: FleetConfig, out: Path) -> None:
-    """Write the host's configuration (JSON, 0600) when it is enabled; when disabled write nothing and remove nothing."""
-    data = artifact_host_slice(cfg)
-    if data is not None:
-        write_private_file(Path(out), json.dumps(data, indent=2, sort_keys=True) + "\n")
+    """Write the host's files into the directory ``out`` (created 0700; every file 0600) when it is enabled; when disabled
+    write nothing and remove nothing: one JSON slice per role, the bootstrap admin's password and roles.sql."""
+    slices = artifact_host_slices(cfg)
+    if slices is None:
+        return
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    out.chmod(0o700)
+    for role, name in zip(ARTIFACT_HOST_ROLE_DB_USERS, ARTIFACT_HOST_SLICE_FILES, strict=True):
+        write_private_file(out / name, json.dumps(slices[role], indent=2, sort_keys=True) + "\n")
+    section = _artifact_host_mapping(cfg)
+    admin = artifact_host_db_passwords(section["db_password"])["admin"]
+    write_private_file(out / ARTIFACT_HOST_ADMIN_PASSWORD_FILE, admin)
+    write_private_file(out / ARTIFACT_HOST_ROLES_SQL, artifact_host_roles_sql(cfg))
 
 
 # Marker line in collab-edge/nginx.conf replaced by the share snippet (zones, upstream and the share host's own
@@ -1281,7 +1401,7 @@ def validate_config(path: Path) -> dict:
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
     check_artifact_library(cfg)
-    artifact_host_slice(cfg)   # names the missing or weak key when the host is enabled but incomplete
+    artifact_host_slices(cfg)   # names the missing or weak key when the host is enabled but incomplete
     return {"revision": cfg.revision, "hosts": len(cfg.status()["hosts"])}
 
 

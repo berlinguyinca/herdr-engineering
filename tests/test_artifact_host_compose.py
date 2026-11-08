@@ -50,11 +50,13 @@ def overlay() -> dict:
     return _yaml(OVERLAY)
 
 
-def test_the_host_project_has_exactly_the_three_services_volumes_and_networks(host: dict) -> None:
+def test_the_host_project_has_exactly_these_services_volumes_and_networks(host: dict) -> None:
     assert set(host["services"]) == {
         "artifact-host-db",
         "artifact-host-public",
         "artifact-host-internal",
+        "artifact-host-migrate",
+        "artifact-host-relay",
     }
     assert set(host["volumes"]) == {"artifact-host-blobs", "artifact-host-db"}
     assert set(host["networks"]) == {
@@ -62,6 +64,7 @@ def test_the_host_project_has_exactly_the_three_services_volumes_and_networks(ho
         "artifact-db-internal",
         "artifact-edge",
         "artifact-internal",
+        "artifact-relay",
     }
 
 
@@ -74,31 +77,53 @@ def test_no_host_container_publishes_a_port_or_pins_a_name(host: dict) -> None:
         assert "network_mode" not in svc, name
 
 
-def test_every_host_network_is_internal_so_nothing_has_a_route_out(host: dict) -> None:
+def test_every_host_network_is_internal_and_gives_the_docker_host_no_address_on_it(host: dict) -> None:
+    """`internal: true` removes the gateway route, but the daemon host still gets an address on the bridge and (by default)
+    answers on every host port there (sshd at .1:22 was reached from the roles).  `gateway_mode_ipv4: isolated` removes it."""
     for name, net in host["networks"].items():
         assert net.get("internal") is True, name
+        assert net["driver_opts"]["com.docker.network.bridge.gateway_mode_ipv4"] == "isolated", name
+
+
+def _nets(svc: dict) -> set[str]:
+    return set(svc["networks"])
 
 
 def test_public_and_internal_roles_share_no_network(host: dict) -> None:
-    public = set(host["services"]["artifact-host-public"]["networks"])
-    internal = set(host["services"]["artifact-host-internal"]["networks"])
+    public = _nets(host["services"]["artifact-host-public"])
+    internal = _nets(host["services"]["artifact-host-internal"])
     assert public == {"artifact-host", "artifact-edge"}
     assert internal == {"artifact-db-internal", "artifact-internal"}
     assert not public & internal
-    assert set(host["services"]["artifact-host-db"]["networks"]) == {
-        "artifact-host",
-        "artifact-db-internal",
-    }
+    assert _nets(host["services"]["artifact-host-db"]) == {"artifact-host", "artifact-db-internal"}
+    assert _nets(host["services"]["artifact-host-migrate"]) == {"artifact-host"}
+    assert _nets(host["services"]["artifact-host-relay"]) == {"artifact-internal", "artifact-relay"}
 
 
-def test_only_the_internal_role_and_the_dashboard_are_on_artifact_internal(
+def test_the_internal_role_binds_the_address_the_compose_file_gives_it(host: dict) -> None:
+    """The internal listener binds its artifact-internal address (config `bind`), not 0.0.0.0: the fleet slice and the
+    compose file name the same fixed address."""
+    net = host["services"]["artifact-host-internal"]["networks"]["artifact-internal"]
+    assert net["ipv4_address"] == "${HERDR_ARTIFACT_INTERNAL_IP:-" + fcc.ARTIFACT_HOST_INTERNAL_BIND + "}"
+    subnet = host["networks"]["artifact-internal"]["ipam"]["config"][0]["subnet"]
+    assert re.search(r"\$\{HERDR_ARTIFACT_INTERNAL_SUBNET:-172\.31\.252\.16/28\}", subnet)
+    import ipaddress
+
+    assert ipaddress.ip_address(fcc.ARTIFACT_HOST_INTERNAL_BIND) in ipaddress.ip_network("172.31.252.16/28")
+
+
+def test_the_dashboard_is_on_the_relay_network_only_never_on_artifact_internal(
     host: dict, overlay: dict
 ) -> None:
-    on_internal = {n for n, s in host["services"].items() if "artifact-internal" in s["networks"]}
-    assert on_internal == {"artifact-host-internal"}
-    assert [n for n, s in overlay["services"].items() if "artifact-internal" in s["networks"]] == [
+    on_internal = {n for n, s in host["services"].items() if "artifact-internal" in _nets(s)}
+    assert on_internal == {"artifact-host-internal", "artifact-host-relay"}
+    on_relay = {n for n, s in host["services"].items() if "artifact-relay" in _nets(s)}
+    assert on_relay == {"artifact-host-relay"}
+    assert [n for n, s in overlay["services"].items() if "artifact-relay" in s["networks"]] == [
         "control-plane-web"
     ]
+    for svc in overlay["services"].values():
+        assert "artifact-internal" not in svc["networks"]
 
 
 def test_only_the_edge_joins_artifact_edge_and_no_cp_service_joins_the_other_host_networks(
@@ -109,20 +134,20 @@ def test_only_the_edge_joins_artifact_edge_and_no_cp_service_joins_the_other_hos
     ]
     assert set(overlay["services"]) == {"control-plane-web", "collab-edge"}
     for svc in overlay["services"].values():
-        assert not {"artifact-host", "artifact-db-internal"} & set(svc["networks"])
+        assert not {"artifact-host", "artifact-db-internal", "artifact-internal"} & set(svc["networks"])
     assert all(net.get("external") is True for net in overlay["networks"].values())
-    assert set(overlay["networks"]) == {"artifact-internal", "artifact-edge"}
+    assert set(overlay["networks"]) == {"artifact-relay", "artifact-edge"}
 
 
 def test_the_overlay_keeps_the_networks_the_services_already_have(overlay: dict) -> None:
-    """Naming `networks:` replaces the implicit default; the real services' own networks must be listed again."""
+    """Naming `networks:` replaces the implicit default network; the real services' own networks must be listed again."""
     base = _yaml(CP / "compose.collab.yaml")["services"]["collab-edge"]["networks"]
     assert set(base) <= set(overlay["services"]["collab-edge"]["networks"])
     assert "default" in overlay["services"]["control-plane-web"]["networks"]
 
 
 def test_network_names_line_up_between_the_two_files(host: dict, overlay: dict) -> None:
-    for net in ("artifact-internal", "artifact-edge"):
+    for net in ("artifact-relay", "artifact-edge"):
         assert host["networks"][net]["name"] == overlay["networks"][net]["name"]
 
 
@@ -139,19 +164,38 @@ def test_the_edge_network_subnet_is_fixed_and_refused_on_the_operator_listener(h
 
 
 def test_roles_are_hardened_and_have_their_own_healthcheck(host: dict) -> None:
-    for name in ("artifact-host-public", "artifact-host-internal"):
+    for name in ("artifact-host-public", "artifact-host-internal", "artifact-host-migrate"):
         svc = host["services"][name]
         assert svc["read_only"] is True and svc["cap_drop"] == ["ALL"], name
         assert "no-new-privileges:true" in svc["security_opt"], name
         assert svc["user"] == "10001:10001", name
         assert svc["depends_on"]["artifact-host-db"]["condition"] == "service_healthy", name
-        assert svc["healthcheck"]["test"][:3] == ["CMD", "herdr-artifact-host", "healthcheck"], name
+    for name in ("artifact-host-public", "artifact-host-internal"):
+        assert host["services"][name]["healthcheck"]["test"][:3] == ["CMD", "herdr-artifact-host", "healthcheck"], name
     roles = [
         host["services"][n]["healthcheck"]["test"][3]
         for n in ("artifact-host-public", "artifact-host-internal")
     ]
     assert roles == ["public", "internal"]
     assert host["services"]["artifact-host-db"]["healthcheck"]["test"][0] == "CMD-SHELL"
+    assert "-U artifact_admin" in host["services"]["artifact-host-db"]["healthcheck"]["test"][1]
+    assert host["services"]["artifact-host-migrate"]["profiles"] == ["migrate"]
+
+
+def test_the_relay_is_a_pinned_hardened_one_way_nginx(host: dict) -> None:
+    svc = host["services"]["artifact-host-relay"]
+    assert re.fullmatch(r"nginx:\S+@sha256:[0-9a-f]{64}", svc["image"])
+    assert svc["read_only"] is True and svc["cap_drop"] == ["ALL"]
+    assert "no-new-privileges:true" in svc["security_opt"] and svc["user"] == "10001:10001"
+    assert "ports" not in svc
+    conf = (ROOT / "deploy" / "artifact-host" / "relay" / "nginx.conf").read_text(encoding="utf-8")
+    code = _code(conf)
+    assert "limit_except GET" in code and "deny all" in code
+    assert "proxy_pass http://artifact_host_internal" in code
+    assert "location /v1/" in code and "location /" in code
+    assert "/internal" not in code, "the relay never forwards the health route"
+    assert "Authorization" not in code.replace("proxy_set_header Authorization $http_authorization", "")
+    assert any(v.endswith("/etc/nginx/nginx.conf:ro") for v in svc["volumes"])
 
 
 def test_the_internal_role_cannot_write_the_blobs_and_only_the_public_role_sees_the_sync_dir(
@@ -166,18 +210,32 @@ def test_the_internal_role_cannot_write_the_blobs_and_only_the_public_role_sees_
     assert not any("/sync" in v for v in internal)
 
 
-def test_secrets_are_the_config_slice_and_the_db_password_only(host: dict) -> None:
-    assert set(host["secrets"]) == {"artifact-host-config", "artifact-host-db-password"}
-    assert host["services"]["artifact-host-public"]["secrets"] == ["artifact-host-config"]
-    assert host["services"]["artifact-host-db"]["secrets"] == ["artifact-host-db-password"]
+def test_each_role_mounts_only_its_own_slice_at_the_same_path(host: dict) -> None:
+    assert set(host["secrets"]) == {
+        "artifact-host-public-config",
+        "artifact-host-internal-config",
+        "artifact-host-migrate-config",
+        "artifact-host-db-admin-password",
+    }
+    mounts = {
+        "artifact-host-public": "artifact-host-public-config",
+        "artifact-host-internal": "artifact-host-internal-config",
+        "artifact-host-migrate": "artifact-host-migrate-config",
+    }
+    for service, source in mounts.items():
+        assert host["services"][service]["secrets"] == [{"source": source, "target": "artifact-host-config"}], service
+    assert host["services"]["artifact-host-db"]["secrets"] == ["artifact-host-db-admin-password"]
+    for name, secret in host["secrets"].items():
+        assert secret["file"].startswith("${HERDR_ARTIFACT_HOST_DIR:?"), name
     # Compose ignores uid/gid/mode on file secrets (it says so at `up`); the file must not pretend otherwise.
-    assert "uid" not in json.dumps(host["x-role"]["secrets"])
+    assert "uid" not in json.dumps(host["secrets"]) and "uid" not in json.dumps(host["x-role"])
     env = host["services"]["artifact-host-db"]["environment"]
+    assert env["POSTGRES_USER"] == "artifact_admin"
     assert (
         "POSTGRES_PASSWORD" not in env
-        and env["POSTGRES_PASSWORD_FILE"] == "/run/secrets/artifact-host-db-password"
+        and env["POSTGRES_PASSWORD_FILE"] == "/run/secrets/artifact-host-db-admin-password"
     )
-    for name in ("artifact-host-public", "artifact-host-internal"):
+    for name in ("artifact-host-public", "artifact-host-internal", "artifact-host-migrate"):
         assert "environment" not in host["services"][name], (
             "roles read their configuration from the secret only"
         )
@@ -429,35 +487,77 @@ def test_render_edge_picks_the_host_from_the_fleet_config(tmp_path: Path) -> Non
 # ---------------------------------------------------------------------------------------------- the fleet slice
 
 
-def test_the_slice_is_accepted_by_the_hosts_own_parser_and_the_key_sets_agree(
+def _render(tmp_path: Path, **over: object) -> tuple[Path, dict[str, dict]]:
+    central = _central(tmp_path, host_section=_host_section(**over))
+    out = tmp_path / "ah"
+    fcc.render_artifact_host(load_fleet_config(central), out)
+    return out, {r: json.loads((out / f"{r}.json").read_text()) for r in ("public", "internal", "migrate")}
+
+
+def test_every_role_slice_is_accepted_by_the_hosts_own_parser_and_the_constants_agree(
     tmp_path: Path,
 ) -> None:
-    central = _central(tmp_path, host_section=_host_section(health_port=9300))
-    out = tmp_path / "artifact-host-config.json"
-    fcc.render_artifact_host(load_fleet_config(central), out)
-    assert oct(out.stat().st_mode & 0o777) == "0o600"
-    data = json.loads(out.read_text())
-    cfg = host_config.parse(data)
-    assert set(data) == set(host_config.TOP_KEYS)
-    assert fcc.ARTIFACT_HOST_SCHEMA_VERSION == host_config.SCHEMA_VERSION
-    assert (
-        cfg.public_host == HOST and cfg.mcp_public_hosts == (MCP_HOST,) and cfg.health_port == 9300
+    out, data = _render(tmp_path, health_port=9300)
+    assert oct(out.stat().st_mode & 0o777) == "0o700"
+    assert sorted(p.name for p in out.iterdir()) == sorted(
+        ["public.json", "internal.json", "migrate.json", "db-admin-password", "roles.sql"]
     )
-    assert (
-        cfg.group == "team.test"
-        and cfg.pool_id == "us-west-2_TESTPOOL"
-        and cfg.client_ids == ("client-a",)
-    )
+    for p in out.iterdir():
+        assert oct(p.stat().st_mode & 0o777) == "0o600", p.name
+    cfgs = {r: host_config.parse(d) for r, d in data.items()}
+    for role, d in data.items():
+        assert set(d) <= host_config.ROLE_KEYS[role] and {"version", "role", "database"} <= set(d)
+    pub = cfgs["public"]
+    assert pub.public_host == HOST and pub.mcp_public_hosts == (MCP_HOST,) and pub.health_port == 9300
+    assert pub.group == "team.test" and pub.pool_id == "us-west-2_TESTPOOL" and pub.client_ids == ("client-a",)
     import hashlib
 
-    assert cfg.internal_key_digest == hashlib.sha256(b"k" * 40).hexdigest()
-    assert "k" * 40 not in out.read_text(), "the dashboard's key itself never reaches the host"
+    assert cfgs["internal"].internal_key_digest == hashlib.sha256(b"k" * 40).hexdigest()
+    assert cfgs["internal"].bind == fcc.ARTIFACT_HOST_INTERNAL_BIND
+    assert fcc.ARTIFACT_HOST_SCHEMA_VERSION == host_config.SCHEMA_VERSION
     assert fcc.ARTIFACT_HOST_MIN_SECRET_BYTES == host_config.MIN_SECRET_BYTES
+    assert fcc.ARTIFACT_HOST_ROLE_DB_USERS == host_config.ROLE_DB_USER
+    assert "k" * 40 not in "".join(p.read_text() for p in out.iterdir()), "the dashboard's key never reaches the host"
+
+
+def test_no_role_holds_another_roles_secrets_or_password(tmp_path: Path) -> None:
+    section_args = {"session_secret": secrets.token_hex(32), "claim_key": secrets.token_hex(32), "db_password": secrets.token_hex(16)}
+    out, data = _render(tmp_path, **section_args)
+    internal = (out / "internal.json").read_text()
+    migrate = (out / "migrate.json").read_text()
+    for value in (section_args["session_secret"], section_args["claim_key"], section_args["db_password"]):
+        assert value not in internal and value not in migrate
+    assert section_args["db_password"] not in "".join(p.read_text() for p in out.iterdir())
+    pws = [data[r]["database"]["password"] for r in data]
+    admin = (out / "db-admin-password").read_text()
+    assert len({*pws, admin}) == 4, "one distinct password per role plus the admin"
+    assert data["internal"]["database"]["password"] not in (out / "public.json").read_text()
+    assert admin not in "".join(p.read_text() for p in out.glob("*.json"))
+    # rotating the one fleet value rotates all of them; the same value renders the same passwords
+    out2, data2 = _render(tmp_path / "again", **section_args)
+    assert data2 == data
+    out3, data3 = _render(tmp_path / "rotated", **{**section_args, "db_password": secrets.token_hex(16)})
+    assert all(data3[r]["database"]["password"] != data[r]["database"]["password"] for r in data)
+
+
+def test_roles_sql_makes_three_non_superuser_roles_with_least_privilege(tmp_path: Path) -> None:
+    out, data = _render(tmp_path)
+    sql = (out / "roles.sql").read_text()
+    assert "SUPERUSER" not in sql.replace("NOSUPERUSER", "")
+    for role, user in host_config.ROLE_DB_USER.items():
+        assert f"ALTER ROLE {user} LOGIN NOSUPERUSER" in sql
+        assert data[role]["database"]["password"] in sql
+    assert "ALTER ROLE artifact_internal SET default_transaction_read_only = on" in sql
+    grants = [ln for ln in sql.splitlines() if ln.startswith(("GRANT", "ALTER DEFAULT"))]
+    internal_grants = [ln for ln in grants if ln.endswith("artifact_internal") or "TO artifact_public, artifact_internal" in ln]
+    assert all("SELECT ON" in ln or "USAGE ON SCHEMA" in ln or "CONNECT ON" in ln for ln in internal_grants), internal_grants
+    assert "REVOKE ALL ON DATABASE artifact_host FROM PUBLIC" in sql
+    assert "ALTER DATABASE artifact_host OWNER TO artifact_owner" in sql
 
 
 def test_disabled_renders_nothing_and_is_reported_as_disabled(tmp_path: Path) -> None:
     central = _central(tmp_path, host_section=None)
-    out = tmp_path / "x.json"
+    out = tmp_path / "x"
     fcc.render_artifact_host(load_fleet_config(central), out)
     assert not out.exists()
     assert fcc.artifact_host_enabled(load_fleet_config(central)) is False
@@ -475,6 +575,10 @@ def test_disabled_renders_nothing_and_is_reported_as_disabled(tmp_path: Path) ->
         ({"health_port": 8090}, "health_port"),
         ({"session_seconds": 5}, "session_seconds"),
         ({"surprise": 1}, "unknown keys"),
+        ({"db_user": "artifact_host"}, "unknown keys"),
+        ({"session_secret": "ab" * 20}, "too repetitive"),
+        ({"db_password": "a" * 20}, "too repetitive"),
+        ({"public_host": "mcp.example.test", "mcp_public_hosts": []}, "must differ from the collaboration"),
     ],
 )
 def test_a_weak_or_malformed_slice_is_refused_naming_keys_only(
@@ -483,24 +587,24 @@ def test_a_weak_or_malformed_slice_is_refused_naming_keys_only(
     section = _host_section(**override)
     central = _central(tmp_path, host_section=section)
     with pytest.raises(FleetConfigError, match=message) as err:
-        fcc.render_artifact_host(load_fleet_config(central), tmp_path / "x.json")
+        fcc.render_artifact_host(load_fleet_config(central), tmp_path / "x")
     for value in (section["session_secret"], section["db_password"]):
         if len(str(value)) >= 16:
             assert str(value) not in str(err.value)
-    assert not (tmp_path / "x.json").exists()
+    assert not (tmp_path / "x").exists()
 
 
 def test_the_two_secrets_must_differ(tmp_path: Path) -> None:
     same = secrets.token_hex(32)
     central = _central(tmp_path, host_section=_host_section(session_secret=same, claim_key=same))
     with pytest.raises(FleetConfigError, match="must differ"):
-        fcc.render_artifact_host(load_fleet_config(central), tmp_path / "x.json")
+        fcc.render_artifact_host(load_fleet_config(central), tmp_path / "x")
 
 
 def test_the_dashboard_key_is_required_and_share_public_is_exclusive(tmp_path: Path) -> None:
     nokey = _central(tmp_path / "a", host_section=_host_section(), library_key=None)
     with pytest.raises(FleetConfigError, match="artifact_library.host_key"):
-        fcc.render_artifact_host(load_fleet_config(nokey), tmp_path / "x.json")
+        fcc.render_artifact_host(load_fleet_config(nokey), tmp_path / "x")
     both = _central(
         tmp_path / "b",
         host_section=_host_section(),
@@ -511,7 +615,7 @@ def test_the_dashboard_key_is_required_and_share_public_is_exclusive(tmp_path: P
         },
     )
     with pytest.raises(FleetConfigError, match="cannot both be enabled"):
-        fcc.render_artifact_host(load_fleet_config(both), tmp_path / "x.json")
+        fcc.render_artifact_host(load_fleet_config(both), tmp_path / "x")
 
 
 def test_fleet_validate_names_an_incomplete_host(tmp_path: Path) -> None:
@@ -526,12 +630,17 @@ _STRICT = bool(os.environ.get("CI")) or os.environ.get("HERDR_REQUIRE_DOCKER") =
 
 
 def _docker(
-    *args: str, check: bool = True, timeout: int = 600, env: dict | None = None
+    *args: str,
+    check: bool = True,
+    timeout: int = 600,
+    env: dict | None = None,
+    input: str | None = None,  # noqa: A002
 ) -> subprocess.CompletedProcess:
     run = subprocess.run(
         ["docker", *args],
         capture_output=True,
         text=True,
+        input=input,
         timeout=timeout,
         env={**os.environ, **(env or {})},
     )
@@ -543,6 +652,8 @@ def _docker(
 @pytest.fixture(scope="module")
 def docker_ok() -> None:
     reason = None
+    if os.environ.get("HERDR_SKIP_DOCKER") == "1":  # parse-level iteration only; CI never sets it
+        pytest.skip("HERDR_SKIP_DOCKER=1")
     if shutil.which("docker") is None:
         reason = "docker is not installed"
     elif subprocess.run(["docker", "info"], capture_output=True, timeout=60).returncode != 0:
@@ -616,7 +727,8 @@ services:
     entrypoint: [python, -c, "import time; time.sleep(3600)"]
   control-plane-web:
     image: {image}
-    entrypoint: [python, -c, "import time; time.sleep(3600)"]
+    # listens, so "the internal role cannot reach the dashboard" is a refusal of a reachable-looking target, not a silent port
+    entrypoint: [python, -m, http.server, "8080", --bind, "0.0.0.0"]
   collab-edge:
     image: {image}
     entrypoint: [python, -c, "import time; time.sleep(3600)"]
@@ -642,17 +754,29 @@ if kind == "connect":
     except OSError:
         sys.exit(1)
     sys.exit(0)
+req = urllib.request.Request(target, data=b"x" if kind == "post" else None, method="POST" if kind == "post" else "GET")
+if len(sys.argv) > 3:
+    req.add_header("Authorization", sys.argv[3])
 try:
-    print(urllib.request.urlopen(target, timeout=5).status)
+    print(urllib.request.urlopen(req, timeout=5).status)
 except urllib.error.HTTPError as exc:
     print(exc.code)
 except OSError:
     sys.exit(2)
 """
 
+# Subnets for the throwaway stack: next to (never the same as) the live 172.31.252.0/28 and .16/28.
+_TEST_EDGE_SUBNET = "172.31.253.0/28"
+_TEST_INTERNAL_SUBNET = "172.31.253.16/28"
+_TEST_INTERNAL_IP = "172.31.253.18"
+_DASHBOARD_KEY = "k" * 40
+
 
 class _Stack:
-    """A throwaway host project plus stand-in control-plane services on the real overlay."""
+    """A throwaway host project plus stand-in control-plane services on the real overlay.
+
+    The role slices, passwords and roles.sql are the REAL output of `render-artifact-host` (only the internal slice's bind
+    is moved to the test subnet)."""
 
     def __init__(self, tmp: Path, image: str, tag: str) -> None:
         token = uuid.uuid4().hex[:8]
@@ -662,47 +786,31 @@ class _Stack:
         sync.mkdir()
         (sync / "jwks.json").write_text("{}")
         (sync / "members.json").write_text(json.dumps({"updated": 0, "groups": {}, "disabled": []}))
-        password = "pw-" + secrets.token_hex(12)
-        config = {
-            "version": 1,
-            "public_host": HOST,
-            "public_url": f"https://{HOST}",
-            "mcp_public_hosts": [MCP_HOST],
-            "session_seconds": 14400,
-            "cognito": {
-                "pool_id": "us-west-2_T",
-                "client_ids": ["c"],
-                "web_client_id": "w",
-                "domain": "https://p.example.test",
-                "group": "team",
-            },
-            "session_secret": secrets.token_hex(32),
-            "claim_key": secrets.token_hex(32),
-            "internal_key_digest": "a" * 64,
-            "health_port": 8092,
-            "database": {"user": "artifact_host", "password": password},
-        }
-        (tmp / "config.json").write_text(json.dumps(config))
-        (tmp / "dbpw").write_text(password)
-        for name in (
-            "config.json",
-            "dbpw",
-        ):  # Compose ignores secret uid/mode: the host file's own mode decides
-            (tmp / name).chmod(0o644)
+        self.section = _host_section()
+        central = _central(tmp / "fleet", host_section=self.section, library_key=_DASHBOARD_KEY)
+        self.dir = tmp / "ah"
+        fcc.render_artifact_host(load_fleet_config(central), self.dir)
+        internal = json.loads((self.dir / "internal.json").read_text())
+        internal["bind"] = _TEST_INTERNAL_IP
+        (self.dir / "internal.json").write_text(json.dumps(internal))
+        self.dir.chmod(0o755)
+        for f in self.dir.iterdir():  # Compose ignores secret uid/mode: the host file's own mode decides
+            f.chmod(0o644)
         (tmp / "standin.yaml").write_text(_STAND_IN.format(image=image))
         self.env = {
             "HERDR_ARTIFACT_HOST_PROJECT": self.project,
             "HERDR_ARTIFACT_HOST_TAG": tag,
             "HERDR_ARTIFACT_NET_PREFIX": self.project,
-            "HERDR_ARTIFACT_EDGE_SUBNET": "172.31.253.0/28",
-            "HERDR_ARTIFACT_HOST_CONFIG": str(tmp / "config.json"),
-            "HERDR_ARTIFACT_HOST_DB_PASSWORD_FILE": str(tmp / "dbpw"),
+            "HERDR_ARTIFACT_EDGE_SUBNET": _TEST_EDGE_SUBNET,
+            "HERDR_ARTIFACT_INTERNAL_SUBNET": _TEST_INTERNAL_SUBNET,
+            "HERDR_ARTIFACT_INTERNAL_IP": _TEST_INTERNAL_IP,
+            "HERDR_ARTIFACT_HOST_DIR": str(self.dir),
             "HERDR_COLLAB_SYNC_DIR": str(sync),
         }
 
-    def host(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    def host(self, *args: str, check: bool = True, input: str | None = None) -> subprocess.CompletedProcess:  # noqa: A002
         return _docker(
-            "compose", "-p", self.project, "-f", str(HOST_COMPOSE), *args, check=check, env=self.env
+            "compose", "-p", self.project, "-f", str(HOST_COMPOSE), *args, check=check, env=self.env, input=input
         )
 
     def cp(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -719,15 +827,32 @@ class _Stack:
             env=self.env,
         )
 
-    def probe(self, where: str, kind: str, target: str) -> subprocess.CompletedProcess:
+    def probe(self, where: str, kind: str, target: str, *extra: str) -> subprocess.CompletedProcess:
         """Run the probe inside a container of the host project (`host:<service>`) or the stand-in project."""
         side, service = where.split(":")
         run = self.host if side == "host" else self.cp
-        return run("exec", "-T", service, "python", "-c", _PROBE, kind, target, check=False)
+        return run("exec", "-T", service, "python", "-c", _PROBE, kind, target, *extra, check=False)
+
+    def container(self, side: str, service: str) -> str:
+        run = self.host if side == "host" else self.cp
+        return run("ps", "-q", service).stdout.strip()
+
+    def ip(self, side: str, service: str, network: str) -> str:
+        prefix = self.project
+        name = f"{prefix}-{network}" if network in {"edge", "internal", "relay"} else f"{self.project}_{network}"
+        fmt = '{{(index .NetworkSettings.Networks "' + name + '").IPAddress}}'
+        return _docker("inspect", "-f", fmt, self.container(side, service)).stdout.strip()
+
+    def psql(self, user: str, sql: str) -> subprocess.CompletedProcess:
+        """SQL as `user` over the database container's local socket (the image trusts it; roles are separate by privilege)."""
+        return self.host(
+            "exec", "-T", "artifact-host-db", "psql", "-U", user, "-d", "artifact_host", "-X", "-A", "-t", "-c", sql,
+            check=False,
+        )
 
     def down(self) -> None:
         self.cp("down", "-v", "--remove-orphans", check=False)
-        self.host("down", "-v", "--remove-orphans", check=False)
+        self.host("--profile", "migrate", "down", "-v", "--remove-orphans", check=False)
 
 
 @pytest.fixture(scope="module")
@@ -746,14 +871,14 @@ def stack(docker_ok: None, tmp_path_factory: pytest.TempPathFactory):
     )
     s = _Stack(tmp_path_factory.mktemp("artifact-host-stack"), image, tag)
     try:
+        # the deploy.sh order: database, roles, schema (as the owner), then everything else
+        s.host("up", "-d", "--wait", "--wait-timeout", "120", "artifact-host-db")
         s.host(
-            "run",
-            "--rm",
-            "artifact-host-public",
-            "migrate",
-            "--config",
-            "/run/secrets/artifact-host-config",
+            "exec", "-T", "artifact-host-db", "psql", "-U", "artifact_admin", "-d", "artifact_host",
+            "-X", "-q", "-v", "ON_ERROR_STOP=1", "-f", "-",
+            input=(s.dir / "roles.sql").read_text(),
         )
+        s.host("run", "--rm", "artifact-host-migrate")
         s.host("up", "-d", "--wait", "--wait-timeout", "180")
         s.cp("up", "-d")
         yield s
@@ -772,12 +897,16 @@ def test_the_stack_comes_up_healthy_without_publishing_any_port(stack: _Stack) -
         "artifact-host-db",
         "artifact-host-public",
         "artifact-host-internal",
+        "artifact-host-relay",
     }
     assert all(r["Health"] == "healthy" for r in rows), rows
     assert all(
         not r.get("Publishers") or all(p.get("PublishedPort", 0) == 0 for p in r["Publishers"])
         for r in rows
     )
+
+
+# ------------------------------------------------------------------------------------------------ names and paths
 
 
 @pytest.mark.parametrize(
@@ -788,24 +917,25 @@ def test_control_plane_names_do_not_resolve_from_the_public_role(stack: _Stack, 
 
 
 @pytest.mark.parametrize(
-    "name", ["postgres", "herdr-cp-postgres", "collab-edge", "artifact-host-public"]
+    "name",
+    ["postgres", "herdr-cp-postgres", "control-plane-web", "collab-edge", "artifact-host-public"],
 )
-def test_the_internal_role_sees_neither_the_cp_database_nor_the_public_role(
+def test_the_internal_role_sees_neither_the_cp_services_nor_the_public_role(
     stack: _Stack, name: str
 ) -> None:
     assert stack.probe("host:artifact-host-internal", "resolve", name).returncode == 1
 
 
-def test_the_public_role_does_not_see_the_internal_role_or_the_dashboard(stack: _Stack) -> None:
-    assert (
-        stack.probe("host:artifact-host-public", "resolve", "artifact-host-internal").returncode
-        == 1
-    )
-    assert stack.probe("host:artifact-host-public", "resolve", "control-plane-web").returncode == 1
+def test_the_public_role_does_not_see_the_internal_role_the_relay_or_the_dashboard(
+    stack: _Stack,
+) -> None:
+    for name in ("artifact-host-internal", "artifact-host-relay", "control-plane-web"):
+        assert stack.probe("host:artifact-host-public", "resolve", name).returncode == 1, name
 
 
 @pytest.mark.parametrize(
-    "name", ["artifact-host-internal", "artifact-host-db", "artifact-host-public"]
+    "name",
+    ["artifact-host-internal", "artifact-host-db", "artifact-host-public"],
 )
 def test_stand_in_cp_postgres_reaches_no_host_service(stack: _Stack, name: str) -> None:
     assert stack.probe("cp:postgres", "resolve", name).returncode == 1
@@ -815,41 +945,126 @@ def test_the_edge_reaches_the_public_role_and_only_it(stack: _Stack) -> None:
     assert stack.probe("cp:collab-edge", "resolve", "artifact-host-public").returncode == 0
     reach = stack.probe("cp:collab-edge", "http", "http://artifact-host-public:8090/s/nothing/")
     assert reach.returncode == 0 and reach.stdout.strip() == "404", reach.stdout + reach.stderr
-    for name in ("artifact-host-internal", "artifact-host-db"):
+    for name in ("artifact-host-internal", "artifact-host-db", "artifact-host-relay"):
         assert stack.probe("cp:collab-edge", "resolve", name).returncode == 1, name
     # /healthz is not on the public listener: the same uniform 404
     health = stack.probe("cp:collab-edge", "http", "http://artifact-host-public:8090/healthz")
     assert health.stdout.strip() == "404"
 
 
-def test_the_dashboard_reaches_the_internal_role_which_demands_its_key(stack: _Stack) -> None:
-    health = stack.probe(
-        "cp:control-plane-web", "http", "http://artifact-host-internal:8091/internal/healthz"
+def test_the_dashboard_reaches_the_internal_role_only_through_the_one_way_relay(stack: _Stack) -> None:
+    web = "cp:control-plane-web"
+    relay = "http://artifact-host-relay:8091"
+    assert stack.probe(web, "http", f"{relay}/relay-healthz").stdout.strip() == "200"
+    # GET /v1/... reaches the internal role, which demands its key: without it the answer is its own 401
+    got = stack.probe(web, "http", f"{relay}/v1/content/a/1/index.html")
+    assert got.returncode == 0 and got.stdout.strip() == "401", got.stdout + got.stderr
+    # the bearer key is passed through unread: the internal role accepts it and answers (404: there is no such artifact)
+    keyed = stack.probe(web, "http", f"{relay}/v1/content/a/1/index.html", f"Bearer {_DASHBOARD_KEY}")
+    assert keyed.stdout.strip() == "404", keyed.stdout + keyed.stderr
+    # one way: no other method, no health route, nothing outside /v1/
+    assert stack.probe(web, "post", f"{relay}/v1/content/a/1/index.html").stdout.strip() == "403"
+    assert stack.probe(web, "http", f"{relay}/internal/healthz").stdout.strip() == "404"
+    assert stack.probe(web, "http", f"{relay}/").stdout.strip() == "404"
+    # the dashboard cannot name or reach the internal role, the public role or the database directly
+    for name in ("artifact-host-internal", "artifact-host-public", "artifact-host-db"):
+        assert stack.probe(web, "resolve", name).returncode == 1, name
+    assert stack.probe(web, "connect", f"{_TEST_INTERNAL_IP}:8091").returncode == 1
+
+
+def test_the_internal_role_cannot_reach_the_dashboard(stack: _Stack) -> None:
+    web_ip = stack.ip("cp", "control-plane-web", "relay")
+    assert web_ip
+    # positive control: the relay shares artifact-relay with the dashboard and does reach the stand-in listener
+    relay_web = stack.host(
+        "exec", "-T", "artifact-host-relay", "wget", "-q", "-O", "/dev/null", "-T", "3", f"http://{web_ip}:8080/", check=False
     )
-    assert health.stdout.strip() == "200", health.stdout + health.stderr
-    # anything else needs the bearer key: a request without it is refused
-    got = stack.probe(
-        "cp:control-plane-web", "http", "http://artifact-host-internal:8091/internal/v1/artifacts"
+    assert relay_web.returncode == 0, relay_web.stderr
+    for role in ("artifact-host-internal", "artifact-host-public", "artifact-host-db"):
+        if role == "artifact-host-db":
+            out = stack.host("exec", "-T", role, "nc", "-z", "-w", "3", web_ip, "8080", check=False)
+            assert out.returncode != 0, role
+        else:
+            assert stack.probe(f"host:{role}", "connect", f"{web_ip}:8080").returncode == 1, role
+
+
+def test_the_internal_listener_binds_only_its_artifact_internal_address(stack: _Stack) -> None:
+    # the relay (same network) reaches it at that address (positive control) ...
+    ok = stack.host(
+        "exec", "-T", "artifact-host-relay", "wget", "-q", "-O", "/dev/null", "-T", "3",
+        f"http://{_TEST_INTERNAL_IP}:8091/internal/healthz", check=False,
     )
-    assert got.returncode == 0 and got.stdout.strip() in {"401", "404"}, got.stdout + got.stderr
-    assert stack.probe("cp:control-plane-web", "resolve", "artifact-host-public").returncode == 1
-    assert stack.probe("cp:control-plane-web", "resolve", "artifact-host-db").returncode == 1
+    assert ok.returncode == 0, ok.stderr
+    # ... but not on loopback, and not on its database-network address, which the database container can reach
+    assert stack.probe("host:artifact-host-internal", "connect", "127.0.0.1:8091").returncode == 1
+    db_side = stack.ip("host", "artifact-host-internal", "artifact-db-internal")
+    assert db_side and db_side != _TEST_INTERNAL_IP
+    out = stack.host("exec", "-T", "artifact-host-db", "nc", "-z", "-w", "3", db_side, "8091", check=False)
+    assert out.returncode != 0
 
 
 @pytest.mark.parametrize(
-    "service", ["artifact-host-public", "artifact-host-internal", "artifact-host-db"]
+    "service", ["artifact-host-public", "artifact-host-internal", "artifact-host-relay", "artifact-host-db"]
 )
 def test_no_host_container_has_any_route_out(stack: _Stack, service: str) -> None:
-    if (
-        service == "artifact-host-db"
-    ):  # postgres has no python: use the stand-in probe through its shell instead
-        out = stack.host(
-            "exec", "-T", service, "sh", "-c", "timeout 3 nc -z 1.1.1.1 443; echo $?", check=False
-        )
-        assert out.stdout.strip().splitlines()[-1] != "0"
+    if service in {"artifact-host-db", "artifact-host-relay"}:  # no python in these images: busybox nc
+        out = stack.host("exec", "-T", service, "nc", "-z", "-w", "3", "1.1.1.1", "443", check=False)
+        assert out.returncode != 0
         return
     assert stack.probe(f"host:{service}", "connect", "1.1.1.1:443").returncode == 1
     assert stack.probe(f"host:{service}", "resolve", "example.com").returncode == 1
+
+
+def test_the_docker_host_is_not_reachable_at_a_gateway_address_of_any_host_network(
+    stack: _Stack, docker_ok: None
+) -> None:
+    """`internal: true` alone leaves the daemon host with an address on the bridge and its own listeners answer there
+    (sshd at .1:22 from the roles).  A listener on this machine is dialled at each network's .1 from the roles on it; the
+    same dial from a plain internal network (control) succeeds, so the probe is shown to see a leak when there is one."""
+    import ipaddress
+    import socket
+
+    # The target is the daemon host's own sshd (port 22): host firewalls commonly drop bridge-to-host traffic on ephemeral ports,
+    # so a listener of ours would prove nothing.  No sshd answering on this machine means there is nothing to dial.
+    try:
+        socket.create_connection(("127.0.0.1", 22), timeout=2).close()
+    except OSError:
+        pytest.skip("no sshd on this machine to dial from the networks")
+    port = 22
+    listener = socket.socket()
+    try:
+        def gateway(net: str) -> str:
+            cfg = json.loads(_docker("network", "inspect", net).stdout)[0]["IPAM"]["Config"][0]
+            return str(next(ipaddress.ip_network(cfg["Subnet"]).hosts()))
+
+        # control: an internal network WITHOUT gateway_mode isolated
+        ctrl = f"{stack.project}-ctrl"
+        _docker("network", "create", "--internal", "--subnet", "172.31.253.32/28", ctrl)
+        try:
+            image = f"herdr-artifact-host:{stack.env['HERDR_ARTIFACT_HOST_TAG']}"
+            leak = _docker(
+                "run", "--rm", "--network", ctrl, "--entrypoint", "python", image, "-c", _PROBE, "connect",
+                f"{gateway(ctrl)}:{port}", check=False,
+            )
+            if leak.returncode != 0:
+                pytest.skip("this machine's firewall drops bridge-to-host traffic: the control cannot show a leak")
+        finally:
+            _docker("network", "rm", ctrl, check=False)
+        reach = {
+            "artifact-host-public": ("artifact-host", "edge"),
+            "artifact-host-internal": ("artifact-db-internal", "internal"),
+        }
+        for service, nets in reach.items():
+            for net in nets:
+                name = f"{stack.project}-{net}" if net in {"edge", "internal"} else f"{stack.project}_{net}"
+                assert stack.probe(f"host:{service}", "connect", f"{gateway(name)}:{port}").returncode == 1, (service, net)
+        for net in ("relay",):
+            relay = stack.host(
+                "exec", "-T", "artifact-host-relay", "nc", "-z", "-w", "3", gateway(f"{stack.project}-{net}"), str(port), check=False
+            )
+            assert relay.returncode != 0
+    finally:
+        listener.close()
 
 
 def test_the_roots_are_read_only_and_the_blobs_follow_the_roles(stack: _Stack) -> None:
@@ -886,3 +1101,101 @@ def test_the_roots_are_read_only_and_the_blobs_follow_the_roles(stack: _Stack) -
         "exec", "-T", "artifact-host-public", "python", "-c", write, "/sync/probe", check=False
     )
     assert sync.returncode == 1, "the synced directory is mounted read-only"
+
+
+# ---------------------------------------------------------------------------------------- secrets and database roles
+
+
+def test_each_role_holds_only_its_own_secrets(stack: _Stack) -> None:
+    def config(service: str) -> str:
+        return stack.host("exec", "-T", service, "cat", "/run/secrets/artifact-host-config").stdout
+
+    public, internal = config("artifact-host-public"), config("artifact-host-internal")
+    sec = stack.section
+    assert sec["session_secret"] in public and sec["claim_key"] in public
+    assert sec["session_secret"] not in internal and sec["claim_key"] not in internal
+    assert json.loads(internal)["role"] == "internal" and json.loads(public)["role"] == "public"
+    assert json.loads(public)["database"]["password"] != json.loads(internal)["database"]["password"]
+    assert sec["db_password"] not in public + internal
+    # the migrate slice is not mounted in the long-running roles, and the admin password is mounted nowhere but the database
+    for service in ("artifact-host-public", "artifact-host-internal"):
+        listing = stack.host("exec", "-T", service, "ls", "/run/secrets", check=False).stdout.split()
+        assert listing == ["artifact-host-config"], (service, listing)
+
+
+def test_no_application_role_is_a_superuser_and_the_admin_is_the_only_one(stack: _Stack) -> None:
+    rows = stack.psql(
+        "artifact_admin", "SELECT rolname, rolsuper FROM pg_roles WHERE rolname LIKE 'artifact_%' ORDER BY 1"
+    ).stdout.split()
+    assert rows == [
+        "artifact_admin|t",
+        "artifact_internal|f",
+        "artifact_owner|f",
+        "artifact_public|f",
+    ]
+
+
+def test_the_public_role_cannot_run_programs_or_change_the_schema(stack: _Stack) -> None:
+    program = stack.psql("artifact_public", "COPY (SELECT 1) TO PROGRAM 'id'")
+    assert program.returncode != 0 and "permission denied" in program.stderr
+    for sql in (
+        "CREATE TABLE intruder (x int)",
+        "DROP TABLE schema_migrations",
+        "ALTER TABLE schema_migrations ADD COLUMN x int",
+        "CREATE ROLE intruder",
+        "CREATE EXTENSION IF NOT EXISTS file_fdw",
+    ):
+        out = stack.psql("artifact_public", sql)
+        assert out.returncode != 0, sql
+    # but it does have DML (the positive control)
+    assert stack.psql("artifact_public", "DELETE FROM schema_migrations WHERE false").returncode == 0
+    assert stack.psql("artifact_public", "SELECT count(*) FROM schema_migrations").returncode == 0
+
+
+def test_the_internal_role_can_only_read(stack: _Stack) -> None:
+    assert stack.psql("artifact_internal", "SELECT count(*) FROM schema_migrations").returncode == 0
+    for sql in (
+        "DELETE FROM schema_migrations WHERE false",
+        "INSERT INTO schema_migrations SELECT * FROM schema_migrations WHERE false",
+        "SET default_transaction_read_only = off; DELETE FROM schema_migrations WHERE false",
+        "COPY (SELECT 1) TO PROGRAM 'id'",
+        "CREATE TABLE intruder (x int)",
+    ):
+        assert stack.psql("artifact_internal", sql).returncode != 0, sql
+
+
+def test_the_owner_role_runs_the_schema_but_is_not_a_superuser(stack: _Stack) -> None:
+    assert stack.psql("artifact_owner", "COPY (SELECT 1) TO PROGRAM 'id'").returncode != 0
+    assert stack.psql("artifact_owner", "SELECT count(*) FROM schema_migrations").returncode == 0
+    tables = stack.psql("artifact_admin", "SELECT DISTINCT tableowner FROM pg_tables WHERE schemaname = 'public'")
+    assert tables.stdout.split() == ["artifact_owner"]
+
+
+def test_roles_sql_is_idempotent_and_a_rotated_password_takes_effect(stack: _Stack) -> None:
+    again = stack.host(
+        "exec", "-T", "artifact-host-db", "psql", "-U", "artifact_admin", "-d", "artifact_host",
+        "-X", "-q", "-v", "ON_ERROR_STOP=1", "-f", "-",
+        input=(stack.dir / "roles.sql").read_text(),
+        check=False,
+    )
+    assert again.returncode == 0, again.stderr
+    # loopback is trusted by the official image; the container's own network address is password-checked
+    db_ip = stack.host("exec", "-T", "artifact-host-db", "hostname", "-i").stdout.split()[0]
+    rotated = "rot-" + secrets.token_hex(12)
+    stack.psql("artifact_admin", f"ALTER ROLE artifact_public PASSWORD '{rotated}'")
+    over_tcp = stack.host(
+        "exec", "-T", "-e", f"PGPASSWORD={rotated}", "artifact-host-db",
+        "psql", "-h", db_ip, "-U", "artifact_public", "-d", "artifact_host", "-X", "-A", "-t", "-c", "SELECT 1",
+        check=False,
+    )
+    assert over_tcp.returncode == 0 and over_tcp.stdout.strip() == "1", over_tcp.stderr
+    old = json.loads((stack.dir / "public.json").read_text())["database"]["password"]
+    stale = stack.host(
+        "exec", "-T", "-e", f"PGPASSWORD={old}", "artifact-host-db",
+        "psql", "-h", db_ip, "-U", "artifact_public", "-d", "artifact_host", "-X", "-c", "SELECT 1", check=False,
+    )
+    assert stale.returncode != 0
+    stack.host(  # put the rendered password back for the tests after this one
+        "exec", "-T", "artifact-host-db", "psql", "-U", "artifact_admin", "-d", "artifact_host",
+        "-X", "-q", "-v", "ON_ERROR_STOP=1", "-f", "-", input=(stack.dir / "roles.sql").read_text(),
+    )

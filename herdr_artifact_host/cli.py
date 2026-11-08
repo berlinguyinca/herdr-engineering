@@ -1,7 +1,7 @@
 """Command line entry point: ``herdr-artifact-host {public,internal,migrate,healthcheck,import}``.
 
-Every role reads the one configuration file (``--config``, default the compose secret ``/run/secrets/artifact-host-config``;
-see ``host_config``).  Nothing is read from the environment.  ``public`` and ``internal`` run until SIGTERM/SIGINT.
+Every role reads its own configuration slice (``--config``, default the compose secret ``/run/secrets/artifact-host-config``;
+see ``host_config``) and refuses a slice rendered for another role.  Nothing is read from the environment.  ``public`` and ``internal`` run until SIGTERM/SIGINT.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ SUBCOMMANDS: dict[str, str] = {
     "healthcheck": "probe a running role from inside its container (exit 0 when healthy)",
     "import": "import artifacts from a control-plane export",
 }
-BIND_HOST = "0.0.0.0"  # noqa: S104 - a container listener; the compose networks decide who can reach it
+BIND_HOST = "0.0.0.0"  # noqa: S104 - the public listener; the internal listener binds the address in its slice
 PROBE_TIMEOUT = 3.0
 
 
@@ -112,7 +112,7 @@ async def run_internal(cfg: HostConfig) -> None:
             BlobStore(Path(BLOB_DIR)),
         )
         server = InternalServer(app)
-        await server.start(BIND_HOST, INTERNAL_PORT)
+        await server.start(cfg.bind, INTERNAL_PORT)
         try:
             await _until_signalled()
         finally:
@@ -136,7 +136,7 @@ async def run_migrate(cfg: HostConfig) -> list[str]:
 def probe_url(role: str, cfg: HostConfig) -> str:
     if role == "public":
         return f"http://127.0.0.1:{cfg.health_port}/healthz"
-    return f"http://127.0.0.1:{INTERNAL_PORT}/internal/healthz"
+    return f"http://{cfg.bind}:{INTERNAL_PORT}/internal/healthz"
 
 
 def healthy(role: str, cfg: HostConfig) -> bool:
@@ -160,6 +160,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         cfg = load(ns.config)
     except ValueError as exc:  # names keys only, never values
         print(f"herdr-artifact-host {ns.command}: {exc}", file=sys.stderr)
+        return 2
+    wanted = ns.role if ns.command == "healthcheck" else ns.command
+    if cfg.role != wanted:
+        print(f"herdr-artifact-host {ns.command}: the config is the {cfg.role} slice, not {wanted}", file=sys.stderr)
         return 2
     if ns.command == "healthcheck":
         return 0 if healthy(ns.role, cfg) else 1
