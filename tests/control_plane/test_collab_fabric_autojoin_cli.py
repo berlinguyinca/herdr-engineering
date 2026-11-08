@@ -17,7 +17,7 @@ from tests.control_plane.test_collab_tasks import USERS, code, svc  # noqa: F401
 REPO = str(Path(__file__).resolve().parents[2])
 
 
-def run(lw, tmp_path, *argv, env_extra=None, port=None, home=None):
+def run(lw, tmp_path, *argv, env_extra=None, port=None, home=None, control_plane=True):
     home = home or tmp_path / "home"
     home.mkdir(exist_ok=True)
     bindir = tmp_path / "nobin"
@@ -25,7 +25,8 @@ def run(lw, tmp_path, *argv, env_extra=None, port=None, home=None):
     env = {"PATH": str(bindir), "HOME": str(home), "PYTHONPATH": REPO, **(env_extra or {})}
     code_ = "import sys; from herdr_engineering import cli; sys.exit(cli.main(sys.argv[1:]))"
     p = subprocess.run(
-        [sys.executable, "-c", code_, "rooms", *argv, "--control-plane", f"http://{lw.lan}:{port or lw.fabric_port}"],
+        [sys.executable, "-c", code_, "rooms", *argv,
+         *(["--control-plane", f"http://{lw.lan}:{port or lw.fabric_port}"] if control_plane else [])],
         cwd=REPO, env=env, capture_output=True, text=True, timeout=60,
     )
     return p.returncode, p.stdout, p.stderr
@@ -106,3 +107,32 @@ def test_json_flag_prints_only_the_server_answer(lw, tmp_path):
     rc, out, err = run(lw, tmp_path, "join-fabric", "bender-claude", "--json")
     assert rc == 0, err
     assert set(json.loads(out)) >= {"agent_id", "name", "machine"}
+
+
+def test_without_a_fabric_listener_url_it_fails_early_and_says_how_to_fix_it(lw, tmp_path):
+    rc, out, err = run(lw, tmp_path, "join-fabric", "bender-claude", control_plane=False)
+    assert rc == 1 and not out
+    assert "fabric listener" in err and "--control-plane" in err and "Traceback" not in err
+    assert not identity(tmp_path).exists()
+
+
+def test_the_fabric_url_is_discovered_from_the_host_configuration(fake_host_config):
+    from herdr_engineering import rooms_client
+
+    fake_host_config({"control_plane": {"collab": {"fabric_trust": {"listen_host": "100.64.1.2", "listen_port": 8765}}}})
+    assert rooms_client._discover_fabric_url() == "http://100.64.1.2:8765"
+    assert rooms_client._fabric_url(None) == "http://100.64.1.2:8765"
+    assert rooms_client._fabric_url("http://x:1/") == "http://x:1"          # an explicit URL always wins
+
+
+def test_discovery_refuses_what_the_listener_could_not_bind(fake_host_config):
+    import pytest
+
+    from herdr_engineering import rooms_client
+
+    for trust in ({"listen_host": "127.0.0.1", "listen_port": 8765}, {"listen_host": "100.64.1.2", "listen_port": 0},
+                  {"listen_host": "100.64.1.2", "listen_port": "8765"}, {"listen_host": "100.64.1.2"}, {}, None):
+        fake_host_config({"control_plane": {"collab": {"fabric_trust": trust}}})
+        assert rooms_client._discover_fabric_url() is None
+        with pytest.raises(ValueError, match="fabric listener"):
+            rooms_client._fabric_url(None)

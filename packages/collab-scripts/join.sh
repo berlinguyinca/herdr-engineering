@@ -17,7 +17,7 @@
 #                   switched fabric_trust.auto_join on. Needs --name; writes ~/herdr-agents/NAME.json (agent_id, name, machine;
 #                   no credential) and starts nothing. The agent has no room access until a room owner grants it
 #   --name NAME     --fabric only: the agent's name (lowercase letters, digits, dot, hyphen, underscore; up to 64)
-#   --fabric-url U  --fabric only: the control plane's fabric listener (default: the address this script came from)
+#   --fabric-url U  --fabric only, REQUIRED: the fabric listener, http://<listen_host>:<listen_port> (fabric_trust); NOT the public site
 #   --status        show the agents in ~/herdr-agents and whether their workers run
 #   --stop          stop the background workers started by this script
 #   --help          this text
@@ -73,16 +73,17 @@ main() {
 
   if [ "$FABRIC" = 1 ]; then
     # No token and no credential: the tailnet machine is vouched for by the control plane's own whois on the connection.
-    case "$FNAME" in
-      '') echo "join.sh: --fabric needs --name NAME" >&2; return 2 ;;
-      *[!a-z0-9._-]*|[!a-z0-9]*) echo "join.sh: --name must be lowercase letters, digits, dot, hyphen or underscore, starting with a letter or digit" >&2; return 2 ;;
-    esac
-    [ "${#FNAME}" -le 64 ] || { echo "join.sh: --name is at most 64 characters" >&2; return 2; }
+    [ -n "$FNAME" ] || { echo "join.sh: --fabric needs --name NAME" >&2; return 2; }
+    # one rule with the server (JOIN_NAME in collab_fabric_trust.py): 1-64 of [a-z0-9._-], first [a-z0-9]; C locale so ranges are bytes
+    if ! ( LC_ALL=C; case "$FNAME" in *[!a-z0-9._-]*|[!a-z0-9]*) exit 1 ;; esac; [ "${#FNAME}" -le 64 ] ); then
+      echo "join.sh: --name must be 1-64 characters: lowercase letters, digits, dot, underscore, hyphen, starting with a letter or digit" >&2; return 2
+    fi
+    [ -n "$FURL" ] || { echo "join.sh: --fabric needs --fabric-url http://<listen_host>:<listen_port> (the control plane's fabric listener, control_plane.collab.fabric_trust); the public site does not serve it. 'herdr-eng rooms join-fabric NAME' can find it from host config." >&2; return 2; }
     mkdir -p "$DIR"; chmod 700 "$DIR"
     body=$(python3 -c 'import sys,json;d={"name":sys.argv[1]}
 if sys.argv[2]: d["machine"]=sys.argv[2]
 print(json.dumps(d))' "$FNAME" "$MACHINE")
-    resp=$(mktemp); code=$(curl -sS -o "$resp" -w '%{http_code}' -X POST "${FURL:-$BASE}/api/v1/collab/agents/fabric-join" -H 'content-type: application/json' -d "$body" </dev/null) || code=000
+    resp=$(mktemp); code=$(curl -sS -o "$resp" -w '%{http_code}' -X POST "${FURL%/}/api/v1/collab/agents/fabric-join" -H 'content-type: application/json' -d "$body" </dev/null) || code=000
     if [ "$code" != 200 ] && [ "$code" != 201 ]; then
       echo "join.sh: the control plane refused the fabric join (HTTP $code): auto_join is off, this machine is not allow-listed, or you reached the wrong listener (--fabric-url)." >&2; rm -f "$resp"; return 1
     fi

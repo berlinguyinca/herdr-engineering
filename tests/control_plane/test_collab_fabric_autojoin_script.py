@@ -85,3 +85,48 @@ def test_the_token_path_is_unchanged_without_fabric(lw, tmp_path):
     p = subprocess.run(["bash", str(script)], env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}, capture_output=True, text=True, timeout=30)
     assert p.returncode == 1 and "HERDR_JOIN_TOKEN" in p.stderr
     subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
+
+
+def test_fabric_needs_the_listener_url_and_says_so_before_any_request(lw, tmp_path):
+    rc, out, err = run(lw, tmp_path, "--name", "bender-claude", url=False)
+    assert rc == 2 and not out
+    assert "--fabric-url" in err and "fabric listener" in err
+    assert not (tmp_path / "home" / "herdr-agents").exists() or not list((tmp_path / "home" / "herdr-agents").glob("*.json"))
+
+
+# ONE accept/reject table for the three places a name is judged: the server, `rooms join-fabric` and join.sh
+ACCEPT = ["a", "a.b", "a_b-c", "0x", "bender-claude", "a" * 64]
+REJECT = ["", "A", "a b", "-a", ".a", "_a", "a/b", "../x", "a\n", "\na", "a" * 65, "é", "a;b", "a$b", "a\tb", "a\x00b"]
+
+
+def test_the_client_uses_the_servers_name_rule():
+    from herdr_engineering import rooms_client
+    from herdr_engineering.control_plane.collab_fabric_trust import JOIN_NAME
+
+    assert rooms_client._JOIN_NAME is JOIN_NAME                              # one rule, not a copy
+    assert all(JOIN_NAME.fullmatch(n) for n in ACCEPT)
+    assert not any(JOIN_NAME.fullmatch(n) for n in REJECT)
+
+
+def test_the_server_judges_names_by_the_table(aw):
+    from tests.control_plane.test_collab_fabric_autojoin import join
+
+    aw.s.fabric_join_per_hour = aw.s.fabric_join_max_agents = 1000
+    for n in ACCEPT:
+        assert join(aw, name=n)[0] == 201, repr(n)
+    for n in REJECT:
+        assert join(aw, name=n)[0] == 400, repr(n)
+
+
+def test_join_sh_judges_names_by_the_table(tmp_path):
+    script = tmp_path / "join.sh"
+    script.write_text(SCRIPT.read_text().replace("__HERDR_BASE__", "http://127.0.0.1:9"))
+    env = {"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(tmp_path)}
+    for locale in ("C", "en_US.UTF-8"):
+        for n in ACCEPT + REJECT:
+            if n == "" or "\x00" in n:        # argv cannot carry NUL; an empty name is "--name needs a name" territory
+                continue
+            p = subprocess.run(["bash", str(script), "--fabric", "--name", n, "--fabric-url", "http://127.0.0.1:9"],
+                               env=env | {"LC_ALL": locale}, capture_output=True, text=True, timeout=30)
+            # accepted: it reaches curl, which cannot connect (rc 1). Rejected: refused up front (rc 2).
+            assert p.returncode == (1 if n in ACCEPT else 2), (locale, n, p.stderr)

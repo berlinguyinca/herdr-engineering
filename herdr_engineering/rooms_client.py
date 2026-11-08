@@ -21,6 +21,10 @@ from pathlib import Path
 from urllib.parse import quote, urlencode
 
 from .artifact_shares_client import ShareClient, ShareError, _safe
+from .control_plane.collab_fabric_trust import (
+    JOIN_NAME as _JOIN_NAME,  # one rule, the server's (also the file name)
+)
+from .control_plane.collab_fabric_trust import JOIN_NAME_RULE as _JOIN_NAME_RULE
 
 BASE = "/api/v1/collab"
 TOKEN_ENV = "HERDR_COLLAB_TOKEN"
@@ -66,7 +70,6 @@ EXTERNAL_ACTIONS = ("issue-target", "external-list", "external-file", "external-
 
 
 AGENT_MODE_ACTIONS = ("my-tasks", "respond")
-_JOIN_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")  # also the file name, so no path separator can pass
 _AGENT_ID = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _MACHINE = re.compile(r"^[A-Za-z0-9._-]{1,253}$")
 
@@ -251,16 +254,48 @@ def _print_request(row):
         print(f"    > {_safe(line, 400)}")
 
 
+def _discover_fabric_url():
+    """``http://<listen_host>:<listen_port>`` of the fabric listener from this host's configuration
+    (``control_plane.collab.fabric_trust``), or None when it is not discoverable here (the listener runs on the control plane's host)."""
+    from .control_plane.collab_fabric_trust import validate_listen_host
+    from .host_config import host_value
+
+    collab = host_value("control_plane.collab")
+    trust = collab.get("fabric_trust") if isinstance(collab, dict) else None
+    if not isinstance(trust, dict):
+        return None
+    port = trust.get("listen_port")
+    try:
+        host = validate_listen_host(trust.get("listen_host"))
+    except ValueError:
+        return None
+    if not isinstance(port, int) or isinstance(port, bool) or not 0 < port < 65536:
+        return None
+    return f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
+
+
+def _fabric_url(explicit):
+    """The route exists ONLY on the dedicated fabric listener, not on the public control-plane URL: an explicit URL wins, then the
+    listener this host's config names, else fail early with the way out."""
+    if explicit:
+        return explicit.rstrip("/")
+    found = _discover_fabric_url()
+    if found:
+        return found
+    raise ValueError(
+        "join-fabric talks to the control plane's fabric listener (a tailnet address), which is not in this host's configuration: "
+        "pass --control-plane http://<listen_host>:<listen_port> (control_plane.collab.fabric_trust)"
+    )
+
+
 def _join_fabric(args):
     """``rooms join-fabric NAME``: join as a fabric agent with no token (the tailnet machine vouches), then write
     ``~/herdr-agents/NAME.json`` ($HERDR_AGENT_DIR as join.sh honours) holding ONLY agent_id, name and machine, mode 0600.
     There is no credential to store, and the file is what ``_agent_identity`` discovers."""
     name = args.name
-    if not _JOIN_NAME.match(name):
-        raise ValueError("invalid NAME: 1-64 lowercase letters, digits, dot, hyphen or underscore, starting with a letter or digit")
-    from .host_config import resolve_control_plane
-
-    client = ShareClient(resolve_control_plane(args.control_plane))
+    if not _JOIN_NAME.fullmatch(name):
+        raise ValueError(f"invalid NAME: {_JOIN_NAME_RULE}")
+    client = ShareClient(_fabric_url(args.control_plane))
     client.headers = {}  # whois on the real TCP peer is the only credential; nothing else is sent
     body = {"name": name}
     if args.machine:
