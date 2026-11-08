@@ -94,7 +94,7 @@ export function buildShareRequest(form, { allowEntry = true, allowAuthorHtml = f
 export const authorHtmlEligible = state => state.form.audience === 'public' && state.authorHtml?.get(state.form.versionId) === true;
 
 const authorHtmlOption = state => (authorHtmlEligible(state)
-  ? `<div data-share-author-html><label style="display:block"><input type="checkbox" data-share-field="includeAuthorHtml" aria-describedby="share-author-html-note"${state.form.includeAuthorHtml ? ' checked' : ''}> Include the author's HTML page (Rich view)</label><p class="hd-note" id="share-author-html-note">Anyone with the link can view this page. It is shown without scripts.</p></div>`
+  ? `<div data-share-author-html><label style="display:flex;align-items:center;gap:.5em;min-height:32px"><input type="checkbox" style="flex:none" data-share-field="includeAuthorHtml" aria-describedby="share-author-html-note"${state.form.includeAuthorHtml ? ' checked' : ''}> Include the author's HTML page (Rich view)</label><p class="hd-note" id="share-author-html-note">Anyone with the link can view this page. It is shown without scripts.</p></div>`
   : '');
 
 export function renderShareForm(state) {
