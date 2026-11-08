@@ -205,6 +205,42 @@ def test_the_relay_is_a_pinned_hardened_one_way_nginx(host: dict) -> None:
     assert any(v.endswith("/etc/nginx/nginx.conf:ro") for v in svc["volumes"])
 
 
+def _relay_locations() -> dict[str, str]:
+    code = _code(RELAY_CONF.read_text(encoding="utf-8"))
+    begin = code.index("server {")
+    depth, i = 0, begin
+    while True:
+        depth += {"{": 1, "}": -1}.get(code[i], 0)
+        i += 1
+        if depth == 0 and i > begin + 8:
+            break
+    return _locations(code[begin:i])
+
+
+def test_the_relay_allows_only_get_and_nothing_outside_v1() -> None:
+    locs = _relay_locations()
+    v1 = _select(locs, "/v1/content/a/1/index.html")
+    assert v1 and "proxy_pass http://artifact_host_internal;" in v1
+    m = re.search(r"limit_except ([^{]+)\{([^}]*)\}", v1)
+    assert m, "the /v1/ location restricts its methods"
+    assert m.group(1).split() == ["GET"], "GET only (nginx adds HEAD): no POST, PUT, DELETE or PATCH"
+    assert re.fullmatch(r"\s*deny all;\s*", m.group(2)), "every other method is denied, none allowed"
+    assert re.search(r"\bPOST\b", _code(RELAY_CONF.read_text(encoding="utf-8"))) is None
+    for path in ("/", "/x", "/v1", "/v2/x", "/internal/healthz", "/healthz", "//v1/x"):
+        body = _select(locs, path)
+        assert body is not None and body.strip() == "return 404;", (path, body)
+    assert set(re.findall(r"proxy_pass (\S+);", _code(RELAY_CONF.read_text(encoding="utf-8")))) == {
+        "http://artifact_host_internal"
+    }
+    assert (_select(locs, "/relay-healthz") or "").strip().startswith("return 200")
+
+
+def test_the_relay_streams_instead_of_spooling_to_its_small_temp_space() -> None:
+    code = _code(RELAY_CONF.read_text(encoding="utf-8"))
+    assert re.search(r"proxy_buffering off;", code)
+    assert not re.search(r"proxy_buffering on;", code)
+
+
 def test_the_internal_role_cannot_write_the_blobs_and_only_the_public_role_sees_the_sync_dir(
     host: dict,
 ) -> None:
@@ -275,6 +311,7 @@ def _central(
     host_section: dict | None,
     share: dict | None = None,
     library_key: str | None = "k" * 40,
+    library_url: str | None = fcc.ARTIFACT_HOST_RELAY_URL,
 ):
     import importlib.util
 
@@ -304,10 +341,9 @@ def _central(
     if host_section is not None:
         cpv["artifact_host"] = host_section
     if library_key is not None:
-        cpv["artifact_library"] = {
-            "host_url": "http://artifact-host-internal:8091",
-            "host_key": library_key,
-        }
+        cpv["artifact_library"] = {"host_key": library_key}
+        if library_url is not None:
+            cpv["artifact_library"]["host_url"] = library_url
     central.unlink()
     fcc.write_private_file(central, yaml.safe_dump(data, sort_keys=False))
     return central
@@ -659,6 +695,16 @@ def test_no_role_holds_another_roles_secrets_or_password(tmp_path: Path) -> None
     assert all(data3[r]["database"]["password"] != data[r]["database"]["password"] for r in data)
 
 
+def _grants_to(sql: str, role: str) -> list[tuple[list[str], str]]:
+    """(privileges, statement) for every GRANT or ALTER DEFAULT PRIVILEGES ... GRANT statement whose grantee list names ``role``."""
+    out: list[tuple[list[str], str]] = []
+    for line in sql.splitlines():
+        m = re.match(r"^(?:ALTER DEFAULT PRIVILEGES .*? )?GRANT (.+?) ON .+? TO (.+?);$", line.strip())
+        if m and role in [g.strip() for g in m.group(2).split(",")]:
+            out.append(([x.strip() for x in m.group(1).split(",")], line))
+    return out
+
+
 def test_roles_sql_makes_three_non_superuser_roles_with_least_privilege(tmp_path: Path) -> None:
     out, data = _render(tmp_path)
     sql = (out / "roles.sql").read_text()
@@ -667,9 +713,12 @@ def test_roles_sql_makes_three_non_superuser_roles_with_least_privilege(tmp_path
         assert f"ALTER ROLE {user} LOGIN NOSUPERUSER" in sql
         assert data[role]["database"]["password"] in sql
     assert "ALTER ROLE artifact_internal SET default_transaction_read_only = on" in sql
-    grants = [ln for ln in sql.splitlines() if ln.startswith(("GRANT", "ALTER DEFAULT"))]
-    internal_grants = [ln for ln in grants if ln.endswith("artifact_internal") or "TO artifact_public, artifact_internal" in ln]
-    assert all("SELECT ON" in ln or "USAGE ON SCHEMA" in ln or "CONNECT ON" in ln for ln in internal_grants), internal_grants
+    internal_grants = _grants_to(sql, "artifact_internal")
+    assert len(internal_grants) >= 3, internal_grants  # not vacuous: connect, schema usage, table reads, default reads
+    for privileges, target in internal_grants:
+        assert set(privileges) <= {"SELECT", "USAGE", "CONNECT"}, (privileges, target)
+    public_grants = _grants_to(sql, "artifact_public")
+    assert any("INSERT" in privileges for privileges, _ in public_grants), "the public role does have DML"
     assert "REVOKE ALL ON DATABASE artifact_host FROM PUBLIC" in sql
     assert "ALTER DATABASE artifact_host OWNER TO artifact_owner" in sql
 
@@ -718,6 +767,30 @@ def test_the_two_secrets_must_differ(tmp_path: Path) -> None:
     central = _central(tmp_path, host_section=_host_section(session_secret=same, claim_key=same))
     with pytest.raises(FleetConfigError, match="must differ"):
         fcc.render_artifact_host(load_fleet_config(central), tmp_path / "x")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://artifact-host-internal:8091",  # the internal role itself: the dashboard must not be able to reach it
+        "https://artifact-host-relay:8091",
+        "http://artifact-host-relay:8090",
+        "http://artifact-host-relay:8091/v1/",
+        "http://artifact-host-relay.evil.test:8091",
+        "http://user@artifact-host-relay:8091",
+        None,
+    ],
+)
+def test_the_dashboard_library_must_point_at_the_relay(tmp_path: Path, url: str | None) -> None:
+    central = _central(tmp_path, host_section=_host_section(), library_url=url)
+    with pytest.raises(FleetConfigError, match="artifact_library.host_url"):
+        fcc.render_artifact_host(load_fleet_config(central), tmp_path / "x")
+
+
+@pytest.mark.parametrize("url", ["http://artifact-host-relay:8091", "http://artifact-host-relay:8091/"])
+def test_the_relay_url_is_accepted(tmp_path: Path, url: str) -> None:
+    central = _central(tmp_path, host_section=_host_section(), library_url=url)
+    fcc.render_artifact_host(load_fleet_config(central), tmp_path / "x")
 
 
 def test_the_dashboard_key_is_required_and_share_public_is_exclusive(tmp_path: Path) -> None:
@@ -987,6 +1060,17 @@ class _Stack:
             check=False,
         )
 
+    def psql_session(self, user: str, *statements: str) -> subprocess.CompletedProcess:
+        """Several statements as `user` in ONE session (each its own transaction, unlike one `-c` with semicolons), stopping at
+        the first error: a SET in an earlier statement is still in force for the later ones."""
+        args: list[str] = []
+        for sql in statements:
+            args += ["-c", sql]
+        return self.host(
+            "exec", "-T", "artifact-host-db", "psql", "-U", user, "-d", "artifact_host", "-X", "-A", "-t",
+            "-v", "ON_ERROR_STOP=1", *args, check=False,
+        )
+
     def down(self) -> None:
         self.cp("down", "-v", "--remove-orphans", check=False)
         self.host("--profile", "migrate", "down", "-v", "--remove-orphans", check=False)
@@ -1152,56 +1236,89 @@ def test_no_host_container_has_any_route_out(stack: _Stack, service: str) -> Non
     assert stack.probe(f"host:{service}", "resolve", "example.com").returncode == 1
 
 
-def test_the_docker_host_is_not_reachable_at_a_gateway_address_of_any_host_network(
-    stack: _Stack, docker_ok: None
-) -> None:
-    """`internal: true` alone leaves the daemon host with an address on the bridge and its own listeners answer there
-    (sshd at .1:22 from the roles).  A listener on this machine is dialled at each network's .1 from the roles on it; the
-    same dial from a plain internal network (control) succeeds, so the probe is shown to see a leak when there is one."""
+def _host_ipv4_addresses() -> list[str]:
+    ip = shutil.which("ip")
+    assert ip, "this test needs `ip` to read the Docker host's own addresses; install iproute2 (it is not skipped)"
+    out = subprocess.run([ip, "-j", "-4", "addr"], capture_output=True, text=True, check=True).stdout
+    return [a["local"] for iface in json.loads(out) for a in iface.get("addr_info", [])]
+
+
+def _subnets_of(network: str) -> list[str]:
+    cfgs = json.loads(_docker("network", "inspect", network).stdout)[0]["IPAM"]["Config"]
+    return [c["Subnet"] for c in cfgs if "." in c["Subnet"]]
+
+
+def _host_addresses_inside(subnets: list[str]) -> list[str]:
     import ipaddress
-    import socket
 
-    # The target is the daemon host's own sshd (port 22): host firewalls commonly drop bridge-to-host traffic on ephemeral ports,
-    # so a listener of ours would prove nothing.  No sshd answering on this machine means there is nothing to dial.
-    try:
-        socket.create_connection(("127.0.0.1", 22), timeout=2).close()
-    except OSError:
-        pytest.skip("no sshd on this machine to dial from the networks")
-    port = 22
-    listener = socket.socket()
-    try:
-        def gateway(net: str) -> str:
-            cfg = json.loads(_docker("network", "inspect", net).stdout)[0]["IPAM"]["Config"][0]
-            return str(next(ipaddress.ip_network(cfg["Subnet"]).hosts()))
+    nets = [ipaddress.ip_network(s) for s in subnets]
+    return [a for a in _host_ipv4_addresses() if any(ipaddress.ip_address(a) in n for n in nets)]
 
-        # control: an internal network WITHOUT gateway_mode isolated
-        ctrl = f"{stack.project}-ctrl"
-        _docker("network", "create", "--internal", "--subnet", "172.31.253.32/28", ctrl)
-        try:
-            image = f"herdr-artifact-host:{stack.env['HERDR_ARTIFACT_HOST_TAG']}"
-            leak = _docker(
-                "run", "--rm", "--network", ctrl, "--entrypoint", "python", image, "-c", _PROBE, "connect",
-                f"{gateway(ctrl)}:{port}", check=False,
-            )
-            if leak.returncode != 0:
-                pytest.skip("this machine's firewall drops bridge-to-host traffic: the control cannot show a leak")
-        finally:
-            _docker("network", "rm", ctrl, check=False)
-        reach = {
-            "artifact-host-public": ("artifact-host", "edge"),
-            "artifact-host-internal": ("artifact-db-internal", "internal"),
-        }
-        for service, nets in reach.items():
-            for net in nets:
-                name = f"{stack.project}-{net}" if net in {"edge", "internal"} else f"{stack.project}_{net}"
-                assert stack.probe(f"host:{service}", "connect", f"{gateway(name)}:{port}").returncode == 1, (service, net)
-        for net in ("relay",):
-            relay = stack.host(
-                "exec", "-T", "artifact-host-relay", "nc", "-z", "-w", "3", gateway(f"{stack.project}-{net}"), str(port), check=False
-            )
-            assert relay.returncode != 0
+
+def test_the_docker_host_has_no_address_on_any_host_network(stack: _Stack, host: dict) -> None:
+    """`internal: true` alone leaves the daemon host with an address on the bridge, and its own listeners (sshd) answer
+    there.  The earlier form of this test dialled the host from the roles, which a host firewall that drops bridge-to-host
+    traffic turns into a pass whether or not the address exists.  This one reads the host's addresses: with
+    `gateway_mode_ipv4: isolated` none of them lies in a host network's subnet, and the control (a plain internal network
+    created here) shows that a leak WOULD be seen."""
+    nets = _docker(
+        "network", "ls", "--filter", f"label=com.docker.compose.project={stack.project}", "--format", "{{.Name}}"
+    ).stdout.split()
+    assert len(nets) == len(host["networks"]), (nets, sorted(host["networks"]))  # all of them, so nothing is skipped
+    for net in nets:
+        subnets = _subnets_of(net)
+        assert subnets, net
+        assert _host_addresses_inside(subnets) == [], f"the Docker host holds an address on {net} {subnets}"
+
+    ctrl = f"{stack.project}-ctrl"
+    _docker("network", "create", "--internal", "--subnet", "172.31.253.32/28", ctrl)
+    try:
+        assert _host_addresses_inside(_subnets_of(ctrl)) == ["172.31.253.33"], (
+            "control: a plain internal network gives the host an address, so this check can see a leak"
+        )
     finally:
-        listener.close()
+        _docker("network", "rm", ctrl, check=False)
+
+
+def test_the_relay_passes_a_blob_larger_than_its_temp_space_to_a_slow_reader(docker_ok: None, host: dict) -> None:
+    """Content is streamed: a blob bigger than the relay's 16 MB cache tmpfs, read slowly, arrives whole.  The relay runs with
+    compose's read-only root, user and tmpfs sizes against a real nginx serving the bytes under the internal role's name."""
+    svc = host["services"]["artifact-host-relay"]
+    size_mb = int(next(t for t in svc["tmpfs"] if t.startswith("/var/cache/nginx")).split("size=")[1].split("m")[0])
+    total = 2 * size_mb * 1024 * 1024
+    image = svc["image"]
+    suffix = uuid.uuid4().hex[:8]
+    net, up, relay = f"ahrelay{suffix}", f"ahrelay-up{suffix}", f"ahrelay-rl{suffix}"
+    _docker("network", "create", net)
+    try:
+        upstream_conf = "server { listen 8091; root /srv; }"
+        _docker(
+            "run", "-d", "--name", up, "--network", net, "--network-alias", "artifact-host-internal", image, "sh", "-c",
+            f"mkdir -p /srv/v1 && head -c {total} /dev/urandom > /srv/v1/big && "
+            f"echo '{upstream_conf}' > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'",
+        )
+        _docker(
+            "run", "-d", "--name", relay, "--network", net, "--read-only", "--user", "10001:10001", "--cap-drop", "ALL",
+            "--tmpfs", "/run:uid=10001,size=1m", "--tmpfs", f"/var/cache/nginx:uid=10001,size={size_mb}m",
+            "-v", f"{RELAY_CONF}:/etc/nginx/nginx.conf:ro", image,
+        )
+        for _ in range(40):  # the upstream writes its payload before it starts
+            probe = _docker("exec", relay, "wget", "-q", "-O", "/dev/null", "-T", "2", "http://127.0.0.1:8091/relay-healthz", check=False)
+            seen = _docker("exec", up, "wget", "-q", "-O", "/dev/null", "-T", "2", "http://127.0.0.1:8091/v1/big", check=False)
+            if probe.returncode == 0 and seen.returncode == 0:
+                break
+            import time
+
+            time.sleep(0.5)
+        else:
+            raise AssertionError("the relay and its upstream did not come up")
+        got = _docker(
+            "exec", relay, "sh", "-c", "wget -q -O - http://127.0.0.1:8091/v1/big | (sleep 6; wc -c)", check=False
+        )
+        assert got.stdout.strip() == str(total), (got.stdout, got.stderr, _docker("logs", relay, check=False).stderr[-800:])
+    finally:
+        _docker("rm", "-f", relay, up, check=False)
+        _docker("network", "rm", net, check=False)
 
 
 def test_the_roots_are_read_only_and_the_blobs_follow_the_roles(stack: _Stack) -> None:
@@ -1299,6 +1416,63 @@ def test_the_internal_role_can_only_read(stack: _Stack) -> None:
         "CREATE TABLE intruder (x int)",
     ):
         assert stack.psql("artifact_internal", sql).returncode != 0, sql
+
+
+_INTERNAL_WRITES = (
+    "DELETE FROM schema_migrations WHERE false",
+    "UPDATE schema_migrations SET name = name WHERE false",
+    "INSERT INTO schema_migrations (name) SELECT name FROM schema_migrations WHERE false",
+    "TRUNCATE schema_migrations",
+)
+
+
+@pytest.mark.parametrize("sql", _INTERNAL_WRITES)
+def test_the_internal_role_is_refused_by_privilege_when_read_only_is_switched_off(stack: _Stack, sql: str) -> None:
+    """default_transaction_read_only is a session setting the role may change: it must not be what keeps the role read-only."""
+    out = stack.psql_session("artifact_internal", "SET default_transaction_read_only = off", sql)
+    assert out.returncode != 0 and "permission denied" in out.stderr, (sql, out.stderr)
+    explicit = stack.psql_session("artifact_internal", "BEGIN READ WRITE", sql, "ROLLBACK")
+    assert explicit.returncode != 0 and "permission denied" in explicit.stderr, (sql, explicit.stderr)
+
+
+def test_the_internal_role_holds_no_privilege_but_select_on_any_table_or_sequence(stack: _Stack) -> None:
+    held = stack.psql(
+        "artifact_admin",
+        "SELECT c.relname || ':' || p FROM pg_class c, unnest(ARRAY['INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER']) p "
+        "WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r','p') "
+        "AND has_table_privilege('artifact_internal', c.oid, p)",
+    )
+    assert held.returncode == 0 and held.stdout.split() == [], held.stdout
+    seqs = stack.psql(
+        "artifact_admin",
+        "SELECT c.relname FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'S' "
+        "AND CASE WHEN c.relkind = 'S' THEN has_sequence_privilege('artifact_internal', c.oid, 'USAGE, UPDATE') ELSE false END",
+    )
+    assert seqs.returncode == 0 and seqs.stdout.split() == [], seqs.stdout
+    reads = stack.psql(
+        "artifact_admin", "SELECT has_table_privilege('artifact_internal', 'schema_migrations', 'SELECT')"
+    )
+    assert reads.stdout.strip() == "t", "the positive control: it can read"
+
+
+def test_a_table_the_owner_creates_later_is_readable_but_not_writable_by_the_internal_role(stack: _Stack) -> None:
+    """Default privileges: the migration creates tables after roles.sql ran, so the grant must follow them."""
+    assert stack.psql("artifact_owner", "CREATE TABLE ah_probe_default (x int)").returncode == 0
+    try:
+        privs = stack.psql(
+            "artifact_admin",
+            "SELECT p, has_table_privilege('artifact_internal', 'ah_probe_default', p) "
+            "FROM unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE']) p",
+        ).stdout.split()
+        assert privs == ["SELECT|t", "INSERT|f", "UPDATE|f", "DELETE|f", "TRUNCATE|f"], privs
+        out = stack.psql_session(
+            "artifact_internal", "SET default_transaction_read_only = off", "INSERT INTO ah_probe_default VALUES (1)"
+        )
+        assert out.returncode != 0 and "permission denied" in out.stderr, out.stderr
+        public = stack.psql("artifact_public", "INSERT INTO ah_probe_default VALUES (1)")
+        assert public.returncode == 0, "the public role's DML does follow new tables"
+    finally:
+        stack.psql("artifact_owner", "DROP TABLE IF EXISTS ah_probe_default")
 
 
 def test_the_owner_role_runs_the_schema_but_is_not_a_superuser(stack: _Stack) -> None:

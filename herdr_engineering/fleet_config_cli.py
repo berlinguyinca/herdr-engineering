@@ -523,6 +523,7 @@ ARTIFACT_HOST_MIN_PASSWORD = 16
 ARTIFACT_HOST_MIN_DISTINCT = 10  # distinct characters a secret must hold ("a" * 32 and "ab" * 16 are refused)
 # Fixed, not configurable: these must match deploy/artifact-host/compose.yaml (a test keeps them in step).
 ARTIFACT_HOST_INTERNAL_BIND = "172.31.252.18"
+ARTIFACT_HOST_RELAY_URL = "http://artifact-host-relay:8091"
 ARTIFACT_HOST_SLICE_FILES = ("public.json", "internal.json", "migrate.json")
 ARTIFACT_HOST_ADMIN_PASSWORD_FILE = "db-admin-password"
 ARTIFACT_HOST_ROLES_SQL = "roles.sql"
@@ -695,6 +696,13 @@ def artifact_host_slices(cfg: FleetConfig) -> dict[str, dict] | None:
         raise FleetConfigError(
             "control_plane.artifact_host needs control_plane.artifact_library.host_key (the "
             "dashboard's bearer key; only its sha256 digest reaches the host)"
+        )
+    url = library.get("host_url") if isinstance(library, dict) else None
+    if not isinstance(url, str) or url.rstrip("/") != ARTIFACT_HOST_RELAY_URL:
+        raise FleetConfigError(
+            "control_plane.artifact_library.host_url must be exactly "
+            f"{ARTIFACT_HOST_RELAY_URL} when the artifact host is enabled: the dashboard reaches the internal role only "
+            "through the one-way relay and is not on the network of the internal role itself"
         )
     passwords = artifact_host_db_passwords(password)
     users = ARTIFACT_HOST_ROLE_DB_USERS
