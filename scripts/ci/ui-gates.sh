@@ -12,14 +12,33 @@ need node; need python3; need git
 node -e 'if (Number(process.versions.node.split(".")[0]) < 22) { console.error("Node 22 or newer is required, found " + process.version); process.exit(1); }'
 test -d /etc/fonts/conf.d || { echo "no /etc/fonts/conf.d: the screenshots depend on its rendering settings" >&2; exit 1; }
 
+# --- shared dependency cache ---------------------------------------------------------
+# Same as unit-gates.sh: the exec agents get a private per-job /tmp, so the venv wheels, the npm tree and Chromium were
+# paid on every run. On the hive agents /quobyte/metabolomicsgrp is visible cluster-wide and the content-addressed caches
+# are safe to share between concurrent pipelines; when it is not writable the script falls back to a private dir.
+cache_root="${HERDR_CI_CACHE:-/quobyte/metabolomicsgrp/it/ci/cache/herdr}"
+cache_root_fallback=""
+if ! mkdir -p "$cache_root" 2>/dev/null || [ ! -w "$cache_root" ]; then
+  cache_root_fallback="$(mktemp -d "${TMPDIR:-/tmp}/herdr-ci-cache.XXXXXX")"
+  cache_root="$cache_root_fallback"
+  echo "ui-gates: shared cache not writable; using private $cache_root (cold)" >&2
+fi
+export PIP_CACHE_DIR="$cache_root/pip"
+export npm_config_cache="$cache_root/npm"
+export PLAYWRIGHT_BROWSERS_PATH="$cache_root/playwright"
+mkdir -p "$PIP_CACHE_DIR" "$npm_config_cache" "$PLAYWRIGHT_BROWSERS_PATH"
+
 # a private venv per run: two jobs on one agent must not share (and race on) one fixed path
 venv="$(mktemp -d "${TMPDIR:-/tmp}/herdr-ui-gates-venv.XXXXXX")"
-trap 'rm -rf "$venv"' EXIT
+cleanup() { rm -rf "$venv" "${cache_root_fallback:-/nonexistent-$$}"; }
+trap cleanup EXIT
 python3 -m venv "$venv"
 "$venv/bin/pip" install -q -e '.[dev]'
 export PATH="$venv/bin:$PATH"     # the fixture server starts with `python3`
 npm ci --no-audit --no-fund
-npx playwright install chromium         # the build the baselines were made with (Playwright 1.64); a no-op when cached
+# The build the baselines were made with (Playwright 1.64); a no-op when cached. flock serializes concurrent first runs
+# on the shared cache so two pipelines never race the same download.
+flock "$cache_root/playwright-install.lock" npx playwright install chromium
 
 # Phase budgets. A healthy run is ~11 min for the suite and ~1 min for the baseline check, so a phase that blows through 2x that is a
 # regression in the harness (the 2026-10-28 networkidle wait made every capture ~10 s slower: 11 min -> 49 min and never failed), not a

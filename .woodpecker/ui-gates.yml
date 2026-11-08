@@ -15,13 +15,19 @@ when:
   - event: manual
   - event: pull_request
     path:
-      include: ['packages/**', 'tests/playwright/**', 'tests/visual/**', 'docs/assets/screenshots/**', 'scripts/ci/ui-gates.sh', 'package.json', 'package-lock.json', 'herdr_engineering/control_plane/**']
+      include: ['packages/**', 'tests/playwright/**', 'tests/visual/**', 'docs/assets/screenshots/**', 'scripts/ci/ui-gates.sh', 'scripts/ci-pipeline-freshness.sh', 'package.json', 'package-lock.json', 'herdr_engineering/control_plane/**']
 
 # Only the hive `large` pool (metabolomicsgrp/high, 16 dedicated CPUs and 64 GB per agent) runs this. The gate renders ~270 pages in
 # Chromium and a shared 4-8 CPU agent host timed out under load (pipelines 113, 115, 121, 125); network/services/woodpecker-slurm
 # hive.env matches `label:cluster=hive` to that pool, the same way rust.yaml does.
 labels:
   cluster: hive
+
+# One pipeline per branch at a time: the gate renders ~270 pages in ~15 min and a superseded commit would otherwise spend
+# that on the large pool while its successor is still queued; the freshness step exits it in seconds (same as unit-gates).
+concurrency:
+  limit: 1
+  group: "{{branch}}"
 
 skip_clone: true
 
@@ -36,6 +42,12 @@ steps:
       - 'git fetch --no-tags --depth=200 origin "$CI_COMMIT_SHA"   # enough history for the stale-base notice in ui-gates.sh to find the fork point'
       - 'git checkout -q FETCH_HEAD'
       - 'git --no-pager log --oneline -1'
+
+  - name: freshness
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'bash scripts/ci-pipeline-freshness.sh'
 
   - name: ui-gates
     image: bash

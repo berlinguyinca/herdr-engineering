@@ -16,6 +16,14 @@ when:
   - event: manual
   - event: pull_request
 
+# One pipeline per branch at a time: the gate takes ~45 min and the agent loop lands a new commit on a PR branch every
+# 30-60 min, so without this a superseded commit spent a second agent-hour in parallel with its successor, and most PR
+# pipelines were killed before finishing (2026-11: 14 of 45 recent pipelines killed). The freshness step below exits a
+# superseded pipeline in seconds instead of letting it run the gate.
+concurrency:
+  limit: 1
+  group: "{{branch}}"
+
 skip_clone: true
 
 steps:
@@ -29,6 +37,13 @@ steps:
       - 'git fetch --no-tags origin "$CI_COMMIT_SHA"'      # full history: tests/test_deploy_scripts.py resolves older commits
       - 'git checkout -q FETCH_HEAD'
       - 'git --no-pager log --oneline -1'
+
+  # A superseded commit stops here (exit 1) before any install work; rules and fail-open cases in the script.
+  - name: freshness
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'bash scripts/ci-pipeline-freshness.sh'
 
   # exit 0 = run the suite, 3 = nothing covered changed, anything else = fail the pipeline. It fails open: a guard that cannot
   # work out the diff runs the suite rather than handing back a green it did not earn.
