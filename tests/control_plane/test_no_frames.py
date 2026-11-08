@@ -144,7 +144,7 @@ def library_frame_shape_problems(text: str) -> list[str]:
     if re.findall(r"setAttribute\(\s*'src'\s*,\s*([^)]*)\)", text) != ["url"] or "if (!isContentUrl(url)) throw" not in text:
         problems.append("src must be the guarded url")
     route = re.search(r"const CONTENT_ROUTE = (/.*/i);", text)
-    if not route or route.group(1) != (r"/^(?:[a-z][a-z0-9+.-]*:\/\/[^/]+)?\/api\/v1\/library\/content\/[^/?#]+"
+    if not route or route.group(1) != (r"/^\/api\/v1\/library\/content\/[^/?#]+"
                                        r"\/[^/?#]+\/[^?#]+$/i"):
         problems.append("the route pattern changed")
     return problems
@@ -165,6 +165,10 @@ def test_the_library_frame_is_the_one_allowed_library_frame_shape():
     ("const frame = doc.createElement('iframe');", "const frame = doc.createElement('iframe'); doc.createElement('iframe');"),
     ("const frame = doc.createElement('iframe');", "const frame = doc.createElement('iframe'); doc.createElement('embed');"),
     ("\\/library\\/content\\/", "\\/artifacts\\/content\\/"),
+    ("const CONTENT_ROUTE = /^\\/api", "const CONTENT_ROUTE = /^(?:[a-z][a-z0-9+.-]*:\\/\\/[^/]+)?\\/api"),   # scheme://host allowed again
+    ("const CONTENT_ROUTE = /^\\/api", "const CONTENT_ROUTE = /^(?:\\/\\/[^/]+)?\\/api"),                      # //host allowed
+    ("const CONTENT_ROUTE = /^\\/api", "const CONTENT_ROUTE = /\\/api"),                                       # unanchored
+    ("[^?#]+$/i;", "[^?#]*$/i;"),                                                                              # empty path allowed
 ])
 def test_any_other_library_frame_shape_is_rejected(old, new):
     text = (ROOT / LIBRARY_FRAME).read_text(encoding="utf-8")
