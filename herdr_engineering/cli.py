@@ -361,6 +361,8 @@ def _build_parser() -> argparse.ArgumentParser:
     pu.add_argument("--no-pull", action="store_true", help="skip controller git pull")
     pu.add_argument("--no-reinstall", action="store_true",
                     help="skip controller local pip reinstall")
+    pu.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
+                    help="central fleet config file holding control_plane.agent_rules (the pinned shared rules)")
     pu.add_argument("--json", action="store_true")
     pu.set_defaults(func=_cmd_fleet_update)
     ps = fsub.add_parser("status", help="read-only fleet version/registration status")
@@ -1549,6 +1551,7 @@ def _cmd_fleet_join(args) -> int:
         attach=not args.no_attach,
         provision=not args.no_provision,
         fleet_config=None if args.no_credentials else Path(args.fleet_config).expanduser(),
+        agent_rules_config=Path(args.fleet_config).expanduser(),
         roles=([r.strip() for r in args.roles.split(",") if r.strip()] if args.roles else None),
         control_plane_url=args.control_plane_url,
     )
@@ -1662,6 +1665,7 @@ def _cmd_fleet_update(args) -> int:
         gateway=DEFAULT_GATEWAY,
         pull_controller=not args.no_pull,
         reinstall_local=not args.no_reinstall,
+        fleet_config=Path(args.fleet_config).expanduser(),
     )
     if args.json:
         _print_json(report)

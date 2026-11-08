@@ -9,7 +9,11 @@ import urllib.request
 import pytest
 import yaml
 
-from herdr_engineering.control_plane.agent_rules_config import agent_rules_vars, parse_agent_rules
+from herdr_engineering.control_plane.agent_rules_config import (
+    AgentRulesConfigError,
+    agent_rules_vars,
+    parse_agent_rules,
+)
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from herdr_engineering.fleet_config import FleetConfigError, FleetConfigStore
@@ -85,6 +89,8 @@ def test_endpoint_serves_section_and_requires_key(tmp_path):
     {"repo_url": "--upload-pack=x", "ref": SHA},
     {"repo_url": "https://user:pw@github.com/a/b.git", "ref": SHA},
     {"repo_url": URL, "ref": SHA, "token": "leak"},
+    {"repo_url": URL, "ref": "x/"},
+    {"repo_url": URL, "ref": "x."},
 ])
 def test_invalid_section_is_rejected(tmp_path, section):
     with pytest.raises(ValueError):
@@ -94,7 +100,15 @@ def test_invalid_section_is_rejected(tmp_path, section):
 
 
 def test_agent_rules_vars_reads_central_file(tmp_path):
-    assert agent_rules_vars(tmp_path / "missing.yaml") == {}
-    assert agent_rules_vars(write_fleet(tmp_path, None)) == {}
+    assert agent_rules_vars(tmp_path / "missing.yaml") == {}          # no file: legitimately no pin
+    assert agent_rules_vars(write_fleet(tmp_path, None)) == {}        # no section: legitimately no pin
     path = write_fleet(tmp_path, {"repo_url": URL, "ref": SHA})
     assert agent_rules_vars(path) == {"agent_rules_repo_url": URL, "agent_rules_ref": SHA}
+
+
+def test_agent_rules_vars_raises_on_an_unusable_file(tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("::: [")
+    bad.chmod(0o600)
+    with pytest.raises(AgentRulesConfigError):
+        agent_rules_vars(bad)
