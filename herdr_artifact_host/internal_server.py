@@ -203,11 +203,9 @@ def _time(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         raise _BadRequest("timestamps need a time zone")
     try:
-        utc = parsed.astimezone(UTC)
+        parsed.astimezone(UTC)
     except (OverflowError, ValueError) as exc:
         raise _BadRequest("timestamp out of range") from exc
-    if not 1970 <= utc.year <= 9998:
-        raise _BadRequest("timestamp out of range")
     return parsed
 
 

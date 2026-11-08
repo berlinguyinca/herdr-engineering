@@ -524,6 +524,7 @@ HOSTILE = [
     "/v1/shares?offset=99999999999999999999",
     "/v1/folders?owner=a%00b",
     "/v1/feed?sources=mine%00",
+    "/v1/feed?a%00b=1",
 ]
 
 
