@@ -1,4 +1,4 @@
-"""Command line entry point: ``herdr-artifact-host {public,internal,migrate,healthcheck,import}``.
+"""Command line entry point: ``herdr-artifact-host {public,internal,migrate,healthcheck,import,verify}``.
 
 Every role reads its own configuration slice (``--config``, default the compose secret ``/run/secrets/artifact-host-config``;
 see ``host_config``) and refuses a slice rendered for another role.  Nothing is read from the environment.  ``public`` and ``internal`` run until SIGTERM/SIGINT.
@@ -35,8 +35,8 @@ SUBCOMMANDS: dict[str, str] = {
     "internal": "serve the internal listener",
     "migrate": "apply database migrations (and create the blob directories)",
     "healthcheck": "probe a running role from inside its container (exit 0 when healthy)",
-    "import": "import artifacts from a control-plane export",
 }
+IMPORT_COMMANDS = ("import", "verify")  # operator tools, see importer.py
 BIND_HOST = "0.0.0.0"  # noqa: S104 - the public listener; the internal listener binds the address in its slice
 PROBE_TIMEOUT = 3.0
 
@@ -46,10 +46,12 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     for name, help_text in SUBCOMMANDS.items():
         p = sub.add_parser(name, help=help_text, description=help_text)
-        if name != "import":
-            p.add_argument("--config", default=DEFAULT_CONFIG_PATH)
+        p.add_argument("--config", default=DEFAULT_CONFIG_PATH)
         if name == "healthcheck":
             p.add_argument("role", choices=("public", "internal"))
+    from .importer import add_arguments
+
+    add_arguments(sub)
     return parser
 
 
@@ -153,9 +155,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         ns = _parser().parse_args(args)
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else 2
-    if ns.command == "import":
-        print("herdr-artifact-host import: not implemented yet", file=sys.stderr)
-        return 3
+    if ns.command in IMPORT_COMMANDS:
+        from .importer import run_command
+
+        return run_command(ns)
     try:
         cfg = load(ns.config)
     except ValueError as exc:  # names keys only, never values

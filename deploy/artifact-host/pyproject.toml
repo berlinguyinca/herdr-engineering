@@ -11,6 +11,9 @@ description = "Standalone Herdr artifact host"
 requires-python = ">=3.12"
 dependencies = ["nh3==0.3.7", "PyJWT[crypto]>=2.8", "cryptography>=42", "asyncpg>=0.29", "aiohttp==3.13.5", "msgpack==1.1.2"]
 
+[project.optional-dependencies]
+import = ["boto3>=1.34"]  # operator-only: reading the source RustFS bucket (import --source-s3-config)
+
 [project.scripts]
 herdr-artifact-host = "herdr_artifact_host.cli:main"
 
