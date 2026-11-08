@@ -121,6 +121,11 @@ class BlobStore:
         self._tmp = self._root / "tmp"
         self._tmp.mkdir(exist_ok=True)
 
+    @property
+    def tmp_dir(self) -> Path:
+        """Scratch space on the same volume as the blobs (in-flight uploads are staged beneath it)."""
+        return self._tmp
+
     def _path(self, sha: str) -> Path:
         s = validate_sha(sha)
         return self._root / "sha256" / s[:2] / s[2:4] / s

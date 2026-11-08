@@ -12,10 +12,10 @@ member-created shares; "sharer" in the feed is whatever those columns hold.
 
 Writes take a ``Viewer`` and refuse ``OPERATOR_READ_ALL`` (403 ``read_only``) and a blank member id (400).
 
-The pending cap is NOT atomic: ``ensure_pending_capacity`` only counts.  Task 6 must run the count and the insert
-of a new pending artifact in ONE transaction holding ``pg_advisory_xact_lock(LOCK_NS_PENDING_CLAIM, hashtext(owner))`` (the
-two-argument form; ``LOCK_NS_PENDING_CLAIM`` lives in ``db.py`` beside the other namespaces), or concurrent
-pushes can exceed ``PENDING_CAP``.
+``ensure_pending_capacity`` only counts and is advisory.  The atomic path is ``insert_artifact``: for a pending
+artifact it runs the count and the insert in ONE transaction holding ``pg_advisory_xact_lock(LOCK_NS_PENDING_CLAIM,
+hashtext(owner))`` (the two-argument form; ``LOCK_NS_PENDING_CLAIM`` lives in ``db.py`` beside the other namespaces),
+so concurrent pushes cannot exceed ``PENDING_CAP``.  Every creator of a pending artifact (web, MCP) must use it.
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ from datetime import datetime
 from enum import StrEnum
 
 import asyncpg
+
+from .db import LOCK_NS_PENDING_CLAIM
 
 
 class FolderSource(StrEnum):
@@ -240,6 +242,19 @@ SELECT a.artifact_id, {_TITLE} AS title, a.owner AS sharer, a.created_at AS shar
 _PENDING_LIVE = "owner=$1 AND intake='pending' AND lifecycle NOT IN ('retracted','tombstoned')"
 
 
+async def settle_quota(conn: asyncpg.Connection, owner: str, size: int) -> None:
+    """A retracted or discarded artifact stops counting against its owner: its bytes move from ``bytes_used`` to
+    ``bytes_retracted`` (clamped at zero).  Runs in the caller's transaction."""
+    if size <= 0:
+        return
+    await conn.execute(
+        "UPDATE member_usage SET bytes_used = greatest(bytes_used - $2, 0), "
+        "bytes_retracted = bytes_retracted + $2, updated_at = now() WHERE member_id = $1",
+        owner,
+        size,
+    )
+
+
 class LibraryStore:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
@@ -261,6 +276,51 @@ class LibraryStore:
         if await self.count_pending(owner) >= PENDING_CAP:
             raise PendingCapExceeded
 
+    async def insert_artifact(
+        self,
+        viewer: Viewer,
+        *,
+        artifact_id: str,
+        display_name: str,
+        filename: str,
+        artifact_type: str = "other",
+        intake: str = "accepted",
+        conn: asyncpg.Connection | None = None,
+    ) -> None:
+        """Insert a new artifact owned by the viewer.  A ``pending`` one is counted against ``PENDING_CAP`` atomically
+        (advisory lock per owner held until the surrounding transaction ends); pass ``conn`` to join the caller's
+        transaction, otherwise one is opened here."""
+        owner = _member(viewer).member_id
+        if intake not in ("accepted", "pending"):
+            raise LibraryError(400, "invalid_intake")
+
+        async def run(c: asyncpg.Connection) -> None:
+            if intake == "pending":
+                await c.execute(
+                    "SELECT pg_advisory_xact_lock($1, hashtext($2))", LOCK_NS_PENDING_CLAIM, owner
+                )
+                held = await c.fetchval(
+                    f"SELECT count(*) FROM artifacts WHERE {_PENDING_LIVE}", owner
+                )
+                if int(held) >= PENDING_CAP:
+                    raise PendingCapExceeded
+            await c.execute(
+                "INSERT INTO artifacts (artifact_id, owner, created_by, display_name, original_filename, "
+                "artifact_type, intake) VALUES ($1,$2,$2,$3,$4,$5,$6::intake_state)",
+                artifact_id,
+                owner,
+                display_name,
+                filename,
+                artifact_type,
+                intake,
+            )
+
+        if conn is not None:
+            await run(conn)
+            return
+        async with self._pool.acquire() as own, own.transaction():
+            await run(own)
+
     async def accept(self, viewer: Viewer, item: ItemRef) -> None:
         owner = _member(viewer).member_id
         done = await self._pool.execute(
@@ -276,14 +336,15 @@ class LibraryStore:
         transaction (the control plane's member-delete effect)."""
         owner = _member(viewer).member_id
         async with self._pool.acquire() as conn, conn.transaction():
-            done = await conn.execute(
+            size = await conn.fetchval(
                 "UPDATE artifacts SET intake='discarded', lifecycle='retracted', updated_at=now() "
-                f"WHERE artifact_id=$2 AND {_PENDING_LIVE}",
+                f"WHERE artifact_id=$2 AND {_PENDING_LIVE} RETURNING size_bytes",
                 owner,
                 item.artifact_id,
             )
-            if done != "UPDATE 1":
+            if size is None:
                 raise LibraryError(*NOT_FOUND)
+            await settle_quota(conn, owner, int(size))
             await conn.execute(
                 "WITH r AS (UPDATE shares SET state='revoked', revoked_at=now() "
                 "WHERE artifact_id=$2 AND state<>'revoked' RETURNING share_id) "

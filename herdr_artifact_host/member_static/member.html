@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="referrer" content="no-referrer">
+<title>My artifacts</title>
+<link rel="stylesheet" href="/my/static/tokens.css">
+<link rel="stylesheet" href="/my/static/member.css">
+</head>
+<body>
+<header class="bar"><h1>My artifacts</h1><div id="who" class="muted"></div><button id="signout" hidden>Sign out</button></header>
+<main>
+<section id="signin" hidden><p>Sign in to see and share your artifacts.</p><button id="signin-btn" class="primary">Sign in</button></section>
+<section id="app" hidden>
+<div class="row"><input id="q" type="search" placeholder="Search" aria-label="Search"><button id="new">New artifact</button></div>
+<p id="usage" class="muted"></p>
+<p id="msg" role="status" class="muted"></p>
+<ul id="items"></ul>
+<section id="detail" hidden><h2 id="d-title"></h2><div id="d-files"></div><div class="row"><input id="up" type="file" multiple aria-label="Files"><button id="publish" class="primary">Publish files</button></div>
+<h3>Share links</h3><div class="row"><select id="aud" aria-label="Audience"><option value="public">Anyone with the link</option><option value="lab">Lab members</option></select><input id="allow" placeholder="emails for a lab link, comma separated" aria-label="Allowed emails"><input id="days" type="number" min="1" max="90" value="30" aria-label="Days"><button id="mk">Create link</button></div>
+<ul id="links"></ul></section>
+</section>
+</main>
+<script type="module" src="/my/static/member.js"></script>
+</body>
+</html>

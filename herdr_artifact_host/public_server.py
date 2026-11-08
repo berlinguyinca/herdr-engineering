@@ -66,6 +66,7 @@ from .blobs import BlobAborted, BlobCorrupt, BlobMissing, BlobStore, InvalidSha
 from .cognito import CognitoAuthenticator, SyncedDirectory
 from .https_origin import https_origin
 from .library import LibraryError, LibraryStore, Viewer
+from .member_api import MemberLimits, MemberService, MemberSurface, build_member_settings
 from .members_config import valid_public_host
 from .share_bundle import content_type_for
 from .share_http import (
@@ -178,6 +179,9 @@ _CLAIM_CSP = "default-src 'none'; frame-ancestors 'none'; sandbox"
 _Headers = list[tuple[str, str]]
 
 
+DEFAULT_MEMBER_STATIC_DIR = Path(__file__).parent / "member_static"
+
+
 @dataclass(frozen=True)
 class PublicConfig:
     """Everything the public surface needs; lab sign-in is configured only when every part is valid (fail closed)."""
@@ -194,6 +198,12 @@ class PublicConfig:
     static_dir: Path | None = None
     annotations: dict[str, bool | int] = field(default_factory=lambda: annotation_settings(None))
     owner_emails: frozenset[str] = frozenset()
+    member_signing_secret: bytes = field(
+        default=b"", repr=False
+    )  # members are off unless >= 32 bytes
+    member_group: str = "local.dev"
+    member_group_sync_required: bool = False
+    member_static_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if self.public_host is not None and not valid_public_host(self.public_host):
@@ -455,6 +465,48 @@ class PublicSurface:
         self.render_cache = RenderCache()
         self._claims_seen: set[tuple[str, str]] = set()
         self.view_template = self._load_view_template()
+        self.member = self._member_surface(now)
+
+    def _member_surface(self, now: Callable[[], float]) -> MemberSurface | None:
+        """The member page and API, or None (those paths are the uniform 404) unless fully configured."""
+        c = self.config
+        public, cognito = https_origin(c.public_url), https_origin(c.cognito_domain)
+        secret = c.member_signing_secret
+        if (
+            public is None
+            or cognito is None
+            or not c.sync_dir
+            or not isinstance(c.pool_id, str)
+            or not isinstance(c.web_client_id, str)
+            or not _CLIENT_ID.fullmatch(c.web_client_id)
+            or not isinstance(secret, bytes)
+            or len(secret) < MIN_SECRET_BYTES
+            or c.session_seconds <= 0
+        ):
+            return None
+        client_ids = [x for x in (*c.client_ids, c.web_client_id) if _CLIENT_ID.fullmatch(x)]
+        try:
+            settings = build_member_settings(
+                secret=secret,
+                session_seconds=c.session_seconds,
+                public_origin=public,
+                cognito_origin=cognito,
+                client_id=c.web_client_id,
+                client_ids=client_ids,
+                pool_id=c.pool_id,
+                group=c.member_group,
+                sync_dir=Path(c.sync_dir),
+                sync_required=c.member_group_sync_required,
+                member_static=Path(c.member_static_dir)
+                if c.member_static_dir
+                else DEFAULT_MEMBER_STATIC_DIR,
+                share_static=Path(c.static_dir) if c.static_dir else DEFAULT_STATIC_DIR,
+                limits=MemberLimits(),
+            )
+        except (ValueError, OSError):
+            return None
+        service = MemberService(self.pool, self.blobs, self.library, settings.limits, public, now)
+        return MemberSurface(settings, service, not_found, now)
 
     def _load_view_template(self) -> str:
         """``view.html`` once at start-up; every placeholder must occur exactly once (else the app does not start)."""
@@ -551,6 +603,8 @@ class PublicSurface:
         if not self.host_ok(request):
             return await self.deny("wrong_host")
         raw = request.raw_path
+        if self.member is not None and self.member.owns(raw):
+            return await self.member.handle(request)
         if len(raw) > MAX_RAW_PATH or not raw.startswith("/s/"):
             return await self.deny("unknown_route")
         raw_path = raw.split("?", 1)[0]

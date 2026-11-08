@@ -36,6 +36,7 @@ ISS = f"https://cognito-idp.us-west-2.amazonaws.com/{POOL_ID}"
 WEB_CLIENT = "web-client"
 CLI_CLIENT = "cli-client"
 SECRET = b"k" * 48
+MEMBER_SECRET = b"m" * 48
 PUBLIC_URL = "https://share.example"
 COGNITO = "https://auth.lab.example"
 KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -368,6 +369,7 @@ def default_config(static_dir: Path | None, sync_dir: Path, **over: Any) -> Publ
     base: dict[str, Any] = {
         "public_url": PUBLIC_URL,
         "signing_secret": SECRET,
+        "member_signing_secret": MEMBER_SECRET,
         "session_seconds": 3600,
         "sync_dir": sync_dir,
         "pool_id": POOL_ID,
