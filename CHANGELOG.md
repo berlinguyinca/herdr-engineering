@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Rich view: cross-engine and phone-width verification
+
+- `tests/playwright/share-rich-view.test.mjs` now runs per engine (`BROWSERS`, default chromium,firefox; webkit opt-in with the software-Mesa workaround) and adds 390x844 light/dark checks (no horizontal scroll, 24x24 target, tap and keyboard) for the public share toggle and frame.
+- `tests/playwright/share-author-html.test.mjs` gains the same phone checks for the dashboard share panel's "Include the author's HTML page" checkbox, and webkit support.
+- Fix: that checkbox's label was 22.5px tall (under WCAG 2.2 AA 24x24 target size); it is now a 32px-tall flex row.
+
 ### CI: a push to `main` is now gated (#691)
 - `.woodpecker/structural-gates.yml` is the first pipeline that triggers on `event: push, branch: main`. `unit-gates.yml` and `ui-gates.yml` trigger on `pull_request` and `manual` only — deliberately, so a push to a PR branch does not build twice — but the same filter also excluded `main`, so a commit that broke `main` was never detected by `main`. It surfaced as a red pipeline on the next unrelated PR that rebased onto it, which cost two misdirected investigations on 2026-11-05/06.
 - It is not a cheaper `unit-gates`. `main` takes ~85 commits a day (251 on the busiest recent day) and `unit-gates` takes ~55 minutes, so gating every push to `main` with it would need ~78 runner-hours a day and starve PR CI. The new gate answers the questions whose failures actually reached `main` — every tracked YAML/JSON/TOML file parses, no tracked file carries an unresolved conflict marker, and `memory_install.PINNED_REVISION` equals the lock — in **1.34 seconds** over 2858 tracked files, so ~85 runs a day cost about two minutes of runner time. The full suite still runs on every pull request.
