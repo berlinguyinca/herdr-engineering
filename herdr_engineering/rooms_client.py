@@ -25,6 +25,7 @@ from .control_plane.collab_fabric_trust import (
     JOIN_NAME as _JOIN_NAME,  # one rule, the server's (also the file name)
 )
 from .control_plane.collab_fabric_trust import JOIN_NAME_RULE as _JOIN_NAME_RULE
+from .control_plane.collab_fabric_trust import WS_ID, clean_label
 
 BASE = "/api/v1/collab"
 TOKEN_ENV = "HERDR_COLLAB_TOKEN"
@@ -290,19 +291,25 @@ def _fabric_url(explicit):
 
 def _workspace_body(args):
     """The herdr workspace this process runs in (HERDR_WORKSPACE_ID, HERDR_TAB_ID, HERDR_PANE_ID, HERDR_WORKSPACE_LABEL), for the
-    server's workspace rooms. ``--no-workspace`` sends nothing. The server validates every value; the machine is never sent here."""
+    server's workspace rooms. ``--no-workspace`` sends nothing. The machine is never sent here. Only the id decides anything: an invalid
+    id means no workspace is sent (with a warning), and the display-only label, tab and pane are repaired or omitted, so they can never
+    fail a join. The patterns are the server's own (collab_fabric_trust.WS_ID / clean_label)."""
     if getattr(args, "no_workspace", False):
         return {}
     env = os.environ
     wid = (env.get("HERDR_WORKSPACE_ID") or "").strip()
     if not wid:
         return {}
+    if not WS_ID.fullmatch(wid):
+        print("warning: HERDR_WORKSPACE_ID is not a valid workspace id; joining without a workspace room", file=sys.stderr)
+        return {}
     workspace = {"id": wid}
-    if (label := (env.get("HERDR_WORKSPACE_LABEL") or "").strip()):
+    if (label := clean_label(env.get("HERDR_WORKSPACE_LABEL"), truncate=True)):
         workspace["label"] = label
     out = {"workspace": workspace}
     for key, var in (("tab_id", "HERDR_TAB_ID"), ("pane_id", "HERDR_PANE_ID")):
-        if (value := (env.get(var) or "").strip()):
+        value = (env.get(var) or "").strip()
+        if WS_ID.fullmatch(value):
             out[key] = value
     return out
 
@@ -320,9 +327,20 @@ def _join_fabric(args):
     if args.machine:
         body["machine"] = args.machine
     body.update(_workspace_body(args))
-    result = client.request(f"{BASE}/agents/fabric-join", body)
+    try:
+        result = client.request(f"{BASE}/agents/fabric-join", body)
+    except ShareError as error:
+        if error.status != 400 or "workspace" not in body or "unknown field" not in str(error):
+            raise
+        # an older server that predates workspace rooms: retry ONCE without them (deploy the server first, then the clients)
+        print("note: this control plane does not support workspace rooms yet; the workspace room was not used", file=sys.stderr)
+        body = {k: v for k, v in body.items() if k not in ("workspace", "tab_id", "pane_id")}
+        result = client.request(f"{BASE}/agents/fabric-join", body)
     ident = {k: result.get(k) for k in ("agent_id", "name", "machine")}
-    if isinstance(result.get("room_id"), str) and _AGENT_ID.match(result["room_id"]):
+    no_access = result.get("room_access") is False
+    if no_access:
+        print("joined, but no access to the workspace room (owner removed it)", file=sys.stderr)
+    elif isinstance(result.get("room_id"), str) and _AGENT_ID.match(result["room_id"]):
         ident["room_id"] = result["room_id"]
     if not isinstance(ident["agent_id"], str) or not _AGENT_ID.match(ident["agent_id"]):
         raise ValueError("the control plane returned no usable agent id")
