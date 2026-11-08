@@ -60,3 +60,16 @@ what it can fetch to one artifact. I would have Opus 5.5 review this before it s
 Bar visuals and drawer layout (follow `library-view.js` conventions, light only), exact endpoint and header names, the
 signing scheme (HMAC with expiry and item/version in the payload is enough), key rotation, and how fullscreen degrades
 where the Fullscreen API is unavailable.
+
+## Settled during the builder check (my calls, change any)
+
+- **Operator identity.** The actor recorded is the dashboard operator as cp-web knows them (the signed-in dashboard user,
+  not a shared label). Sharing works for any item with a ready version; it is refused for purged or retracted versions,
+  removed members' items and items with no ready version.
+- **Content route.** Same dashboard origin. A dedicated path prefix, verified by signature and exempt from session auth,
+  covers the whole bundle by prefix so multi-file artifacts with relative references load. Negative tests: tampered,
+  expired, wrong item, wrong version, path traversal, and the exemption does not reach any other route.
+- **Bar states.** "Open public page" is disabled when the item has no live share. "Share" opens a small dialog (expiry
+  default 30 d, max 90) then creates; the result link is shown and copied.
+- **Download.** The version's primary file through the existing GET content route; no new route.
+- **Old inert preview.** Replaced. The script-free `CONTENT_CSP` path and its proxy rule are removed, not kept alongside.
