@@ -148,7 +148,9 @@ def test_host_manifest_matches_package() -> None:
     assert host["project"]["version"] == herdr_artifact_host.__version__
     assert host["project"]["scripts"] == {"herdr-artifact-host": "herdr_artifact_host.cli:main"}
     assert host["project"]["requires-python"] == root["project"]["requires-python"]
-    assert host["tool"]["setuptools"]["package-data"] == {"herdr_artifact_host": ["share_static/*", "migrations/*.sql"]}
+    assert host["tool"]["setuptools"]["package-data"] == {
+        "herdr_artifact_host": ["share_static/*", "share_static/*/*", "share_static/*/*/*", "migrations/*.sql"]
+    }
     assert host["tool"]["setuptools"]["packages"]["find"]["include"] == ["herdr_artifact_host*"]
     root_deps = set(root["project"]["dependencies"])
     for extra in root["project"]["optional-dependencies"].values():

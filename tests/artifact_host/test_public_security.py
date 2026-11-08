@@ -23,8 +23,8 @@ def raw_exchange(host: Host, payload: bytes) -> bytes:
 
 
 def normalise(wire: bytes) -> bytes:
-    # aiohttp answers an unparseable request line as HTTP/1.0; every header and the body are the same
-    wire = wire.replace(b"HTTP/1.0 404 Not Found", b"HTTP/1.1 404 Not Found")
+    """Drop the Date header only.  The status-line version is NOT normalised: it is pinned exactly by
+    test_public_hardening.test_the_status_line_version_set_is_exactly_documented."""
     return b"\r\n".join(
         line for line in wire.split(b"\r\n") if not line.lower().startswith(b"date:")
     )
@@ -33,6 +33,7 @@ def normalise(wire: bytes) -> bytes:
 def test_protocol_level_errors_match_the_uniform_404(host: Host) -> None:
     ref = normalise(raw_exchange(host, b"GET /nothing HTTP/1.1\r\nHost: x\r\n\r\n"))
     assert ref.startswith(b"HTTP/1.1 404") and ref.endswith(b"Not found\n")
+    body = ref.split(b"\r\n", 1)[1]
     for bad in (
         b"GET /s/x HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
         b"GARBAGE\r\n\r\n",
@@ -40,8 +41,8 @@ def test_protocol_level_errors_match_the_uniform_404(host: Host) -> None:
         b"GET /s/" + b"a" * 70000 + b" HTTP/1.1\r\nHost: x\r\n\r\n",
     ):
         wire = normalise(raw_exchange(host, bad))
-        assert wire.startswith(b"HTTP/1.1 404") and wire.endswith(b"Not found\n"), wire[:120]
-        assert wire == ref
+        assert wire.startswith((b"HTTP/1.1 404", b"HTTP/1.0 404")), wire[:120]
+        assert wire.split(b"\r\n", 1)[1] == body
 
 
 def test_routes_are_public_only() -> None:

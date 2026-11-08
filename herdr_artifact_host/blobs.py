@@ -6,6 +6,8 @@ import hashlib
 import os
 import re
 import tempfile
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import BinaryIO, NewType
 
@@ -33,9 +35,55 @@ def validate_sha(value: str) -> Sha256:
     return Sha256(value)
 
 
+_CACHE_MAX = 4096
+_Key = tuple[str, int, int, int, int, int]
+
+
+def _key(sha: str, st: os.stat_result) -> _Key:
+    """Identity of the verified bytes: the file (device, inode), its size and both change times."""
+    return (sha, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+class VerifiedCache:
+    """A bounded, thread-safe set of file identities whose bytes were hashed and found to match their address.
+
+    A hit only ever means "this exact inode, size, mtime and ctime was verified"; a write to the file changes the
+    ctime, and a replacement changes the inode, so anything the cache cannot prove unchanged is hashed again."""
+
+    def __init__(self, limit: int = _CACHE_MAX) -> None:
+        self._limit = limit
+        self._keys: OrderedDict[_Key, None] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def hit(self, key: _Key) -> bool:
+        with self._lock:
+            if key in self._keys:
+                self._keys.move_to_end(key)
+                return True
+            return False
+
+    def add(self, key: _Key) -> None:
+        with self._lock:
+            self._keys[key] = None
+            self._keys.move_to_end(key)
+            while len(self._keys) > self._limit:
+                self._keys.popitem(last=False)
+
+    def forget(self, sha: str) -> None:
+        with self._lock:
+            for key in [k for k in self._keys if k[0] == sha]:
+                del self._keys[key]
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+
 class BlobStore:
     def __init__(self, root: Path) -> None:
         self._root = Path(root)
+        self._verified = VerifiedCache()
+        self.verifications = 0  # whole-blob hash passes made by open/open_checked/verify_open (tests and metrics)
+        self._count_lock = threading.Lock()
         (self._root / "sha256").mkdir(parents=True, exist_ok=True)
         self._tmp = self._root / "tmp"
         self._tmp.mkdir(exist_ok=True)
@@ -102,19 +150,43 @@ class BlobStore:
 
     def open(self, sha: str) -> BinaryIO:
         """Verified read: the whole blob is hashed before any byte is returned."""
+        handle, _ = self.open_checked(sha, force=True)
+        return handle
+
+    def open_checked(self, sha: str, *, force: bool = False) -> tuple[BinaryIO, bool]:
+        """Open a blob; hash it unless this exact file identity was already verified (and ``force`` is false).
+
+        Returns the handle (positioned at 0) and whether a hash pass was made now.  Raises ``BlobMissing`` or
+        ``BlobCorrupt``."""
         path = self._path(sha)
         try:
             handle = path.open("rb")
         except FileNotFoundError as exc:
             raise BlobMissing(sha) from exc
         try:
-            digest = hashlib.sha256()
-            while chunk := handle.read(_CHUNK):
-                digest.update(chunk)
-            if digest.hexdigest() != sha:
-                raise BlobCorrupt(sha)
-            handle.seek(0)
+            hashed = self.verify_open(handle, sha, force=force)
+            return handle, hashed
         except BaseException:
             handle.close()
             raise
-        return handle
+
+    def verify_open(self, handle: BinaryIO, sha: str, *, force: bool = True) -> bool:
+        """Hash the open ``handle`` (unless cached and not ``force``); True when a hash pass was made.  The handle
+        is left at offset 0.  The identity is taken from the handle (fstat), never from the path."""
+        before = _key(sha, os.fstat(handle.fileno()))
+        if not force and self._verified.hit(before):
+            handle.seek(0)
+            return False
+        handle.seek(0)
+        digest = hashlib.sha256()
+        while chunk := handle.read(_CHUNK):
+            digest.update(chunk)
+        with self._count_lock:
+            self.verifications += 1
+        if digest.hexdigest() != sha:
+            self._verified.forget(sha)
+            raise BlobCorrupt(sha)
+        if _key(sha, os.fstat(handle.fileno())) == before:  # unchanged while hashing: safe to remember
+            self._verified.add(before)
+        handle.seek(0)
+        return True

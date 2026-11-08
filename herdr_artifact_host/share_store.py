@@ -222,6 +222,9 @@ async def create_annotation(
         row = await _lock_live_lab_share(conn, share_id, email, basis)
         if isinstance(row, str):
             return Written(row)
+        # Lock order is fixed (share, then author) so concurrent creates cannot deadlock.  The share lock makes the
+        # per-share cap exact: the shared row lock above does not stop two writers both counting below the cap.
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", "share-cap:" + share_id)
         await conn.execute(
             "SELECT pg_advisory_xact_lock(hashtext($1))", identity
         )  # serialises the cap per author

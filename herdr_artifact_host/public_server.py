@@ -28,11 +28,13 @@ import os
 import secrets
 import time
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import quote
 
+import aiohttp
 import asyncpg
 from aiohttp import web
 from aiohttp.web_protocol import RequestHandler
@@ -248,6 +250,27 @@ def lab_settings(config: PublicConfig) -> LabSettings | None:
     )
 
 
+# ----------------------------------------------------------------------------- blocking work
+
+BLOB_WORKERS = 8
+MIN_AIOHTTP = (3, 13, 5)  # the first 3.13 release carrying the request-parsing and decompression fixes we rely on
+# Hashing, file reads and rendering run here, never on the loop's default executor, so a flood of large blobs cannot
+# starve the sign-in verification (or anything else) that uses the default pool, and is itself bounded.
+_BLOB_POOL = ThreadPoolExecutor(BLOB_WORKERS, thread_name_prefix="share-blob")
+
+
+async def run_blocking[T](fn: Callable[..., T], *args: object) -> T:
+    return await asyncio.get_running_loop().run_in_executor(_BLOB_POOL, fn, *args)
+
+
+def aiohttp_version_ok(version: str) -> bool:
+    """True for a plain ``X.Y.Z`` release at or above ``MIN_AIOHTTP``; anything else fails closed."""
+    parts = version.split(".")
+    if len(parts) < 3 or not all(p.isdigit() for p in parts[:3]):
+        return False
+    return tuple(int(p) for p in parts[:3]) >= MIN_AIOHTTP
+
+
 # ----------------------------------------------------------------------------- logging and responses
 
 _log_limiter = RateLimiter(LOG_PER_MINUTE, time.monotonic)
@@ -287,6 +310,17 @@ def not_found() -> web.Response:
     """The uniform 404: identical bytes for every failure, CORS headers, ``Connection: close``."""
     # Connection is explicit: a request aiohttp rejects as HTTP/1.0 would otherwise omit it (close is its default)
     return respond(404, [*_NOT_FOUND_HEADERS, ("Connection", "close")], NOT_FOUND_BODY, close=True)
+
+
+def _refused_framing(request: web.Request) -> bool:
+    """``Expect`` (aiohttp would answer 100-continue or a 417 echoing the header before any routing) and any request
+    ``Content-Encoding`` (a body we never want, let alone decompressed) are the uniform 404 on every route."""
+    return "Expect" in request.headers or "Content-Encoding" in request.headers
+
+
+async def _no_expect(request: web.Request) -> None:
+    """The route-level expect handler: does nothing (no ``100 Continue``, no 417); ``handle`` refuses the request."""
+    return None
 
 
 def _announces_body(request: web.Request) -> bool:
@@ -424,22 +458,26 @@ class PublicSurface:
         key = (share_id, hashlib.sha256(claim.session.encode("ascii", "replace")).hexdigest())
         if key in self._claims_seen:
             return
-        if len(self._claims_seen) >= CLAIM_SEEN_MAX:
-            self._claims_seen.clear()
-        self._claims_seen.add(key)
         try:
             await self.library.record_claim(
                 Viewer(member_id=claim.identity, email=claim.email), share_id
             )
         except LibraryError:
             _log("claim refused")
+            return
         except Exception:
             _log("claim write failed")
+            return
+        if len(self._claims_seen) >= CLAIM_SEEN_MAX:
+            self._claims_seen.clear()
+        self._claims_seen.add(key)
         await self._event(share_id, "claimed", claim.identity, {"share_id": share_id})
 
     # -- entry points
 
     async def healthz(self, request: web.Request) -> web.Response:
+        if _refused_framing(request):
+            return not_found()
         try:
             await self.pool.fetchval("SELECT 1")
         except Exception:
@@ -455,6 +493,9 @@ class PublicSurface:
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
         try:
+            if _refused_framing(request):
+                request["close"] = True
+                return await self.deny("refused_framing")
             if _announces_body(request):
                 request["close"] = (
                     True  # a request that announces a body never shares its connection with another
@@ -465,9 +506,6 @@ class PublicSurface:
             return response
         except Exception as exc:  # never a traceback (it could hold the path): one fixed line, then the uniform 404
             _log("internal_error", type(exc).__name__)
-            log.debug(
-                "internal error detail", exc_info=True
-            )  # debug only: a traceback can hold the path
             if request.get("started"):
                 if request.transport is not None:
                     request.transport.close()
@@ -603,10 +641,17 @@ class PublicSurface:
 
     # -- blobs
 
-    async def fetch(self, item: dict[str, object]) -> BinaryIO:
-        """The hash-verified blob of a manifest ``item``; raises ``Fault`` with a fixed reason."""
+    async def fetch(
+        self, item: dict[str, object], *, force: bool = False
+    ) -> tuple[BinaryIO, bool]:
+        """The hash-verified blob of a manifest ``item`` and whether a hash pass was made for this request.
+
+        A blob whose exact file identity (inode, size, mtime, ctime) was verified before is not hashed again unless
+        ``force``; the caller upgrades with ``ensure_full`` before it serves the whole body. Raises ``Fault``."""
         try:
-            handle = await asyncio.to_thread(self.blobs.open, str(item["sha256"]))
+            handle, hashed = await run_blocking(
+                lambda: self.blobs.open_checked(str(item["sha256"]), force=force)
+            )
         except BlobMissing:
             raise Fault("missing_blob") from None
         except BlobCorrupt:
@@ -619,11 +664,22 @@ class PublicSurface:
         except BaseException:
             handle.close()
             raise
-        return handle
+        return handle, hashed
+
+    async def ensure_full(self, handle: BinaryIO, item: dict[str, object], hashed: bool) -> None:
+        """Before a whole body is served: hash it now unless this very request already did (cost follows bytes)."""
+        if hashed:
+            return
+        try:
+            await run_blocking(self.blobs.verify_open, handle, str(item["sha256"]))
+        except BlobCorrupt:
+            raise Fault("blob_corrupt") from None
+        except OSError:
+            raise Fault("blob_unreadable") from None
 
     @staticmethod
     async def read_blob(handle: BinaryIO, size: int) -> bytes:
-        data = await asyncio.to_thread(handle.read, size)
+        data = await run_blocking(handle.read, size)
         if len(data) != size:
             raise Fault("size_mismatch")
         return data
@@ -873,7 +929,7 @@ class PublicSurface:
         if item is None:
             return await self.deny("not_in_bundle", share_id, actor)
         try:
-            handle = await self.fetch(item)
+            handle, hashed = await self.fetch(item)
         except Fault as fault:
             return await self.deny(fault.reason, share_id, actor)
         try:
@@ -889,6 +945,7 @@ class PublicSurface:
                 sandbox_pdf,
                 landing,
                 claim,
+                hashed,
             )
         except Fault as fault:
             return await self.deny(fault.reason, share_id, actor)
@@ -908,6 +965,7 @@ class PublicSurface:
         sandbox_pdf: bool,
         landing: bytes | None,
         claim: Claim | None,
+        hashed: bool,
     ) -> web.StreamResponse:
         share_id = state["share_id"]
         size = int(item["size"])  # type: ignore[call-overload]
@@ -920,6 +978,8 @@ class PublicSurface:
                 if bar:  # a labelled page is never served unlabelled
                     return await self.deny("banner_unavailable", share_id, actor)
             else:
+                await self.ensure_full(handle, item, hashed)  # the modified body is a whole-body serve
+                hashed = True
                 data = await self.read_blob(handle, size)
                 link = (mode_switch.encode("ascii") if mode_switch is not None else b"") + (
                     landing or b""
@@ -979,6 +1039,8 @@ class PublicSurface:
                 status = 206
                 headers.append(("Content-Range", f"bytes {start}-{end}/{size}"))
         length = end - start + 1 if size else 0
+        if request.method == "GET" and status == 200:
+            await self.ensure_full(handle, item, hashed)  # a whole-body stream is always hash-verified
         headers.append(("Content-Length", str(length)))
         if request.method == "GET" and status == 200 and name == state["entry"]:
             await self._opened(share_id, actor, {"file": name[:200]})
@@ -1005,10 +1067,10 @@ class PublicSurface:
         await response.prepare(request)
         if request.method != "HEAD":
             try:
-                await asyncio.to_thread(handle.seek, start)
+                await run_blocking(handle.seek, start)
                 remaining = length
                 while remaining > 0:
-                    chunk = await asyncio.to_thread(handle.read, min(1024 * 1024, remaining))
+                    chunk = await run_blocking(handle.read, min(1024 * 1024, remaining))
                     if (
                         not chunk
                     ):  # the file shrank underneath us: the length promised cannot be kept
@@ -1016,7 +1078,7 @@ class PublicSurface:
                         break
                     await response.write(chunk)
                     remaining -= len(chunk)
-            except (OSError, ValueError, ConnectionError, asyncio.CancelledError):
+            except (OSError, ValueError, ConnectionError):
                 response.force_close()
                 if request.transport is not None:
                     request.transport.close()
@@ -1107,7 +1169,7 @@ class PublicSurface:
         if kind == "html" and mode == "live":
             return await self.deny("not_in_mode", share_id, actor)
         try:
-            handle = await self.fetch(item)
+            handle, _ = await self.fetch(item, force=True)  # the whole blob is rendered
         except Fault as fault:
             return await self.deny(fault.reason, share_id, actor)
         try:
@@ -1118,7 +1180,7 @@ class PublicSurface:
                 else:
                     data = await self.read_blob(handle, int(item["size"]))  # type: ignore[call-overload]
                     try:
-                        content = await asyncio.to_thread(
+                        content = await run_blocking(
                             self.static_copy,
                             kind,
                             share_id,
@@ -1466,7 +1528,7 @@ class PublicSurface:
             finally:
                 os.close(fd)
 
-        return await asyncio.to_thread(read)
+        return await run_blocking(read)
 
     async def send_static(
         self,
@@ -1553,8 +1615,8 @@ def build_app(
     surface = PublicSurface(config, db_pool, blobs, library, now)
     app = web.Application(middlewares=[_uniform_errors], client_max_size=MAX_BODY_BYTES + 1)
     app[SURFACE] = surface
-    app.router.add_get("/healthz", surface.healthz)
-    app.router.add_route("*", "/{tail:.*}", surface.handle)
+    app.router.add_get("/healthz", surface.healthz, expect_handler=_no_expect)
+    app.router.add_route("*", "/{tail:.*}", surface.handle, expect_handler=_no_expect)
     return app
 
 
@@ -1585,6 +1647,15 @@ class _UniformRunner(web.AppRunner):
         return server
 
 
+def assert_uniform_hook(server: web.Server) -> None:
+    """Fail closed when the protocol-error hook is not in place (an aiohttp internal changed): without it a request
+    aiohttp cannot parse would get its own 400 text, a second kind of failure on the wire."""
+    if type(server) is not _UniformServer or _UniformHandler.handle_error is RequestHandler.handle_error:
+        raise RuntimeError("uniform protocol-error hook is not installed")
+    if not aiohttp_version_ok(aiohttp.__version__):
+        raise RuntimeError(f"aiohttp {aiohttp.__version__} is older than the pinned minimum")
+
+
 class PublicServer:
     """Runs ``build_app`` on a TCP socket (the deploy entry point and the tests)."""
 
@@ -1595,9 +1666,14 @@ class PublicServer:
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> int:
         runner = _UniformRunner(
-            self.app, access_log=None, handle_signals=False, keepalive_timeout=15
+            self.app,
+            access_log=None,
+            handle_signals=False,
+            keepalive_timeout=15,
+            auto_decompress=False,  # a request body is never inflated (decompression bomb)
         )
         await runner.setup()
+        assert_uniform_hook(runner.server)  # type: ignore[arg-type]
         site = web.TCPSite(runner, host, port, backlog=64)
         await site.start()
         self._runner = runner
