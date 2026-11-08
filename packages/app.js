@@ -87,7 +87,7 @@ const NAV = [
   { group: 'Monitor', path: '/overview', label: 'Overview' },
   { group: 'Monitor', path: '/attention', label: 'Attention', match: ['/activity'] },
   { group: 'Agents', path: '/herd', label: 'Agents', match: ['/missions', '/handoffs', '/topology'] },
-  { group: 'Agents', path: '/collab', label: 'Collaboration' },
+  { group: 'Agents', path: '/collab', label: 'Collaboration', capability: 'collab_v1' },
   { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
   { group: 'Agents', path: '/teams', label: 'Your teams', capability: 'unified_workspace_v1' },
   { group: 'Agents', path: '/team-map', label: 'Team map', capability: 'unified_workspace_v1' },
@@ -110,7 +110,7 @@ const SECTION_TABS = [
   [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync'], ['/build-cache', 'Build cache', 'build_cache_v1']],
   [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
   [['/ci', 'CI'], ['/deployments', 'Deployments']],
-  [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate']],
+  [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate', 'review_gate_v1']],
   [['/github', 'Issues'], ['/github/projects', 'Boards']],
   [['/artifacts', 'Artifacts'], ['/library', 'Library'], ['/publications', 'Publications']],
 ];
