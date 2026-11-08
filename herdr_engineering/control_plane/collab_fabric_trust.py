@@ -25,11 +25,14 @@ AGENT_TTL_DEFAULT, AGENT_TTL_MIN, AGENT_TTL_MAX = 2592000, 300, 7776000      # 3
 FABRIC_PEER_NETS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))   # tailnet addresses only
 _SUFFIX = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+\Z")
 _SHORT_NAME = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\Z")
-FABRIC_JOIN_PER_HOUR, FABRIC_JOIN_MAX_AGENTS = 30, 200       # per machine: joins an hour; live auto-joined agents
-FABRIC_RENEW_AFTER = 600                                      # an auto-joined agent's sliding renewal writes at most this often
+FABRIC_JOIN_PER_HOUR, FABRIC_JOIN_MAX_AGENTS = 30, 200       # per machine: NEW agents an hour; names ever used (revoked ones count)
+FABRIC_JOIN_MAX_TOTAL = 1000                                  # across all machines; separate from the operator's own max_agents_per_user
+FABRIC_JOIN_AUDIT_WINDOW, FABRIC_JOIN_AUDIT_MAX = 300, 500    # one refusal audit per (machine, reason) per window; lifetime cap in the log
+FABRIC_RENEW_AFTER = 86400                                    # an auto-joined agent's sliding renewal is written once a day at most
 FABRIC_JOIN_AGENT_LIFE = 10 * 365 * 86400                     # the agent record itself; the fabric window is what matters
 JOIN_ORIGIN = "fabric_join"
-_JOIN_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+JOIN_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")           # THE name rule: the server, `rooms join-fabric` and join.sh all follow it
+JOIN_NAME_RULE = "1-64 characters: lowercase letters, digits, dot, underscore, hyphen, starting with a letter or digit"
 _NAME = "control_plane.collab.fabric_trust"
 _MAX_CACHE = 1024
 
@@ -215,6 +218,9 @@ class FabricAuthMixin:
         self._fabric_join_index: dict[tuple[str, str], str] = {}   # (machine, name) -> agent_id of every auto-joined agent, any status
         self.fabric_join_per_hour = FABRIC_JOIN_PER_HOUR
         self.fabric_join_max_agents = FABRIC_JOIN_MAX_AGENTS
+        self.fabric_join_max_total = FABRIC_JOIN_MAX_TOTAL
+        self.fabric_join_audit_max = FABRIC_JOIN_AUDIT_MAX
+        self._fabric_join_denied_total = 0       # refusal audit rows in the log (rebuilt on replay): bounded by fabric_join_audit_max
 
     def _fabric_fail(self, reason: str | None = None, agent: dict | None = None, aid: str | None = None,
                      machine: str | None = None) -> None:
@@ -272,13 +278,22 @@ class FabricAuthMixin:
         pr.peer = peer
         return pr
 
+    def _fabric_renew_due(self, agent: dict) -> float | None:
+        """The new expiry when an auto-joined agent's window is worth writing now, else None. The window slides, but a durable event
+        is written at most once a day (a quarter of the window when that is shorter): a polling agent costs about one event a day."""
+        ttl = self.fabric_trust_cfg()["agent_ttl_seconds"]
+        expires = self._now() + ttl
+        if expires - agent["fabric_expires_at"] < min(FABRIC_RENEW_AFTER, ttl / 4):
+            return None
+        return expires
+
     def _fabric_renew(self, aid: str, agent: dict, machine: str) -> None:
-        """Sliding renewal for an agent made by ``fabric-join``: a successful Fabric request moves its window forward, written at
-        most once per ``FABRIC_RENEW_AFTER`` seconds. Best effort (a full log must not fail authentication). Caller holds the lock."""
+        """Sliding renewal for an agent made by ``fabric-join`` (see ``_fabric_renew_due``). Best effort: a full log must not fail
+        authentication. Never rebinds the machine. Caller holds the lock."""
         if agent.get("origin") != JOIN_ORIGIN:
             return
-        expires = self._now() + self.fabric_trust_cfg()["agent_ttl_seconds"]
-        if expires - agent["fabric_expires_at"] < FABRIC_RENEW_AFTER:
+        expires = self._fabric_renew_due(agent)
+        if expires is None:
             return
         from .collab import CollabError
         try:
@@ -293,10 +308,12 @@ class FabricAuthMixin:
         return {"actor_user_id": owner, "actor_agent_id": None, "actor_kind": "user", "via": "fabric", "machine": machine}
 
     def _join_denied(self, owner: str, machine: str, reason: str, name: str, aid: str | None = None) -> None:
-        """Audit a refused join (at most once a minute per machine, name and reason; the rest is only counted)."""
+        """Audit a refused join. Throttled per (machine, reason) - never per name, which a caller controls - and capped in total, so
+        a loop over fresh names cannot fill the capped event log. Refusals past either limit are only counted."""
         now = self._now()
-        gate = ("fabric_join", machine, name, reason)
-        if now - self._denied_at.get(gate, -1e18) < 60:
+        gate = ("fabric_join", machine, reason)
+        if (now - self._denied_at.get(gate, -1e18) < FABRIC_JOIN_AUDIT_WINDOW
+                or self._fabric_join_denied_total >= self.fabric_join_audit_max):
             self.stats["audit_throttled"] += 1
             return
         if len(self._denied_at) > 10_000:
@@ -329,37 +346,44 @@ class FabricAuthMixin:
         if said is not None and said != machine:
             self._fabric_fail()
         name = body.get("name")
-        if not isinstance(name, str) or not _JOIN_NAME.match(name):
-            raise CollabError(400, "name must be 1-64 characters: lowercase letters, digits, dot, underscore, hyphen")
+        if not isinstance(name, str) or not JOIN_NAME.fullmatch(name):
+            raise CollabError(400, "name must be " + JOIN_NAME_RULE)
         with self._lock:
             if not self._ok(owner):
                 raise CollabError(404, "not found")
-            try:
-                self._throttle("fabricjoin:" + machine, self.fabric_join_per_hour, 3600.0, "fabric join")
-            except CollabError:
-                self._join_denied(owner, machine, "fabric_join_rate_limited", name)
-                raise
-            ttl = self.fabric_trust_cfg()["agent_ttl_seconds"]
-            expires = self._now() + ttl
             aid = self._fabric_join_index.get((machine, name))
             if aid is not None:
                 agent = self._agents[aid]
                 if agent["status"] != "active" or not agent.get("fabric") or agent["owner"] != owner:
                     self._join_denied(owner, machine, "fabric_join_revoked", name, aid)   # never silently resurrected
                     raise CollabError(403, "forbidden")
-                self._commit("agent_fabric_set", self._join_actor(owner, machine) | {
-                    "agent_id": aid, "fabric": True, "machine": machine, "fabric_expires_at": expires, "origin": JOIN_ORIGIN,
-                    "action": "agent.fabric.renew", "outcome": "allowed", "project_ids": [], "resource_id": aid})
-                return 200, {"agent_id": aid, "name": name, "machine": machine, "fabric_expires_at": expires}
-            live = sum(1 for a in self._agents.values()
-                       if a.get("origin") == JOIN_ORIGIN and a.get("machine") == machine and a["status"] == "active")
-            if live >= self.fabric_join_max_agents:
+                if agent.get("machine") != machine:                  # the owner rebound it elsewhere: this is not that machine's agent
+                    self._join_denied(owner, machine, "fabric_join_machine_rebound", name, aid)
+                    raise CollabError(403, "forbidden")
+                expires = self._fabric_renew_due(agent)             # not throttled: it creates nothing, and is written once a day at most
+                if expires is not None:
+                    self._commit("agent_fabric_set", self._join_actor(owner, machine) | {
+                        "agent_id": aid, "fabric": True, "machine": machine, "fabric_expires_at": expires, "origin": JOIN_ORIGIN,
+                        "action": "agent.fabric.renew", "outcome": "allowed", "project_ids": [], "resource_id": aid})
+                return 200, {"agent_id": aid, "name": name, "machine": machine, "fabric_expires_at": agent["fabric_expires_at"]}
+            # a new agent. Bounds first (a refusal costs the caller's budget nothing), then the per-machine creation rate.
+            names = [m for (m, _n) in self._fabric_join_index]
+            if names.count(machine) >= self.fabric_join_max_agents:          # revoked names count too: the index stays bounded
                 self._join_denied(owner, machine, "fabric_join_machine_cap", name)
                 raise CollabError(429, "fabric join agent limit reached for this machine")
+            if len(names) >= self.fabric_join_max_total:
+                self._join_denied(owner, machine, "fabric_join_total_cap", name)
+                raise CollabError(429, "fabric join agent limit reached")
+            try:
+                self._throttle("fabricjoin:" + machine, self.fabric_join_per_hour, 3600.0, "fabric join")
+            except CollabError:
+                self._join_denied(owner, machine, "fabric_join_rate_limited", name)
+                raise
+            expires = self._now() + self.fabric_trust_cfg()["agent_ttl_seconds"]
             aid = ids.new_id("agent")
-            self._commit("agent_enrolled", self._join_actor(owner, machine) | {
+            self._commit("agent_enrolled", self._join_actor(owner, machine) | {      # the slot is chosen by _commit, like any agent's
                 "agent_id": aid, "owner_user_id": owner, "code_digest": None, "join_digest": None,
-                "device_id": "fabric-" + machine, "harness_type": "fabric", "name": name, "slot": None,
+                "device_id": "fabric-" + machine, "harness_type": "agent", "name": name,
                 "parent_agent_id": None, "instance_id": None, "machine": machine,
                 "secret_digest": _digest(secrets.token_urlsafe(32)),        # nobody holds this secret: no credential exists
                 "expires_at_epoch": self._now() + FABRIC_JOIN_AGENT_LIFE, "origin": JOIN_ORIGIN,

@@ -960,8 +960,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             if a is not None:
                 a["fabric"] = bool(p["fabric"])
                 a["fabric_expires_at"] = p.get("fabric_expires_at") if a["fabric"] else None   # absent = expired (fail closed)
-                if p.get("machine"):
+                if p.get("machine") and p.get("action") != "agent.fabric.renew":   # a renewal never rebinds the owner's choice
                     a["machine"] = p["machine"]
+        elif t == "audit_denied":
+            if p.get("action") == "agent.fabric_join":
+                self._fabric_join_denied_total += 1
         elif t == "agent_renamed":
             a = self._agents[p["agent_id"]]
             if a["name"] not in a["aliases"]:                  # an old name keeps working as an alias
@@ -1828,8 +1831,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
 
     def _agent_slots(self, owner: str, extra: int = 1) -> None:
         now = self._now()
-        live = sum(1 for aid in self._agents_by_owner.get(owner, ())
-                   if (a := self._agents[aid])["status"] == "active" and a["expires_at"] > now)
+        live = sum(1 for aid in self._agents_by_owner.get(owner, ())      # auto-joined agents have their own caps (fabric_trust)
+                   if (a := self._agents[aid])["status"] == "active" and a["expires_at"] > now and a.get("origin") != "fabric_join")
         waiting = sum(1 for d in self._pending_by_owner.get(owner, ())
                       if not (r := self._pending[d])["used"] and r["expires_at"] > now)
         if live + waiting + extra > self.max_agents_per_user:

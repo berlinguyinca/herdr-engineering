@@ -139,11 +139,11 @@ def test_the_header_machine_is_informational_and_must_match_whois(aw):
 def test_a_repeat_join_returns_the_same_agent_and_renews_the_expiry(aw):
     _, first = join(aw)
     n = len(enrolled_events(aw))
-    aw.s.clock.t += 3600
+    aw.s.clock.t += 90_000
     status, again = join(aw)
     assert status == 200 and again["agent_id"] == first["agent_id"]
     assert len(enrolled_events(aw)) == n                                  # no duplicate
-    assert again["fabric_expires_at"] == first["fabric_expires_at"] + 3600
+    assert again["fabric_expires_at"] == first["fabric_expires_at"] + 90_000
     assert sum(1 for a in aw.s._agents.values() if a.get("origin") == "fabric_join") == 1
 
 
@@ -318,27 +318,42 @@ def test_a_machine_has_a_hard_cap_of_auto_joined_agents(aw):
     reasons = [e["payload"]["reason"] for e in aw.s._log if e["event_type"] == "audit_denied" and e["payload"]["action"] == "agent.fabric_join"]
     assert "fabric_join_machine_cap" in reasons
     aw.s.revoke_agent(aw.alice, next(a for a, v in aw.s._agents.items() if v["name"] == "c-0"))
-    assert join(aw, name="c-3")[0] == 201                                # revoked ones do not count against the cap
+    assert join(aw, name="c-3")[0] == 429                                # revoked names still count: the index is bounded
 
 
 # ------------------------------------------------------------------ sliding renewal
-def test_a_fabric_request_renews_an_auto_joined_agent_at_most_every_ten_minutes(aw):
+def test_a_polling_agent_costs_about_one_renewal_event_a_day(aw):
     _, out = join(aw)
     aid = out["agent_id"]
     ttl = aw.s.fabric_trust_cfg()["agent_ttl_seconds"]
     n = len(fabric_set_events(aw))
-    aw.s.clock.t += 120
-    agent_auth(aw, aid)
-    assert len(fabric_set_events(aw)) == n                                # inside the window: no write
-    aw.s.clock.t += 600
-    agent_auth(aw, aid)
-    assert len(fabric_set_events(aw)) == n + 1
+    for _ in range(3 * 144):                                              # every ten minutes for three days
+        aw.s.clock.t += 600
+        agent_auth(aw, aid)
+    written = len(fabric_set_events(aw)) - n
+    assert 2 <= written <= 4
     ev = fabric_set_events(aw)[-1]["payload"]
     assert ev["origin"] == "fabric_join" and ev["via"] == "fabric" and ev["fabric"] is True
-    assert aw.s._agents[aid]["fabric_expires_at"] == aw.s._now() + ttl
-    agent_auth(aw, aid)
-    agent_auth(aw, aid)
-    assert len(fabric_set_events(aw)) == n + 1
+    assert aw.s._agents[aid]["fabric_expires_at"] > aw.s._now() + ttl - 2 * 86400     # the window is still sliding
+
+
+def test_the_join_route_cannot_be_used_to_spam_renewal_events(aw):
+    _, out = join(aw)
+    n = len(aw.s._log)
+    for _ in range(100):
+        aw.s.clock.t += 5
+        status, again = join(aw)
+        assert status == 200 and again["agent_id"] == out["agent_id"]
+    assert len(aw.s._log) == n                                            # nothing durable inside the renewal interval
+    assert again["fabric_expires_at"] == aw.s._agents[out["agent_id"]]["fabric_expires_at"]
+
+
+def test_a_short_ttl_still_renews_before_it_runs_out(aw):
+    set_trust(aw, auto_join=True, agent_ttl_seconds=300)
+    _, out = join(aw)
+    for _ in range(20):                                                   # 20 minutes, far past one 300 s window
+        aw.s.clock.t += 60
+        assert agent_auth(aw, out["agent_id"]).via == "fabric"
 
 
 def test_an_active_auto_joined_agent_outlives_the_fixed_ttl(aw):
@@ -360,7 +375,7 @@ def test_owner_set_bits_keep_the_fixed_ttl(aw):
     info = fabric_agent(aw)
     fixed = aw.s._agents[info["agent_id"]]["fabric_expires_at"]
     n = len(fabric_set_events(aw))
-    aw.s.clock.t += 5000
+    aw.s.clock.t += 100_000
     agent_auth(aw, info["agent_id"])
     assert len(fabric_set_events(aw)) == n
     assert aw.s._agents[info["agent_id"]]["fabric_expires_at"] == fixed
@@ -368,17 +383,149 @@ def test_owner_set_bits_keep_the_fixed_ttl(aw):
 
 def test_a_full_log_does_not_break_authentication_when_renewal_cannot_be_written(aw):
     _, out = join(aw)
-    aw.s.clock.t += 700
+    aw.s.clock.t += 100_000
     aw.s.max_log_events = len(aw.s._log)                                  # the log is full: renewal is best effort
     n = len(aw.s._log)
     assert agent_auth(aw, out["agent_id"]).via == "fabric"
     assert len(aw.s._log) == n
 
 
+# ------------------------------------------------------------------ review findings
+def denied_rows(w, reason=None):
+    rows = [e["payload"] for e in w.s._log if e["event_type"] == "audit_denied" and e["payload"]["action"] == "agent.fabric_join"]
+    return [r for r in rows if reason is None or r["reason"] == reason]
+
+
+def test_refusal_audits_are_throttled_per_machine_and_reason_not_per_name(aw):
+    aw.s.fabric_join_max_agents = 1
+    assert join(aw, name="first")[0] == 201
+    for i in range(60):                                                   # a varying-name loop
+        assert join(aw, name=f"loop-{i}")[0] == 429
+    assert len(denied_rows(aw, "fabric_join_machine_cap")) == 1
+    assert aw.s.stats["audit_throttled"] >= 59
+    aw.s.clock.t += 3600
+    assert join(aw, name="loop-x")[0] == 429
+    assert len(denied_rows(aw, "fabric_join_machine_cap")) == 2
+
+
+def test_total_refusal_audits_are_capped_so_the_log_cannot_be_filled(aw):
+    aw.s.fabric_join_max_agents = 1
+    aw.s.fabric_join_audit_max = 4
+    join(aw, name="first")
+    for i in range(30):
+        aw.s.clock.t += 3600                                              # every gate is open again
+        assert join(aw, name=f"loop-{i}")[0] == 429                       # still refused, just no longer written
+    assert len(denied_rows(aw)) == 4
+    fresh = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), now=aw.s._now)
+    fresh.hydrate(list(aw.s._log))
+    assert fresh._fabric_join_denied_total == 4                          # the budget survives a restart
+
+
+def test_auto_joined_agents_do_not_use_the_operators_own_agent_quota(aw):
+    aw.s.max_agents_per_user = 2
+    for i in range(5):
+        assert join(aw, name=f"q-{i}")[0] == 201
+    aw.s._agent_slots(OWNER)                                              # the operator can still enrol their own agents
+    aw.s._agent_slots(OWNER, 2)
+
+
+def test_a_separate_total_cap_bounds_auto_joined_agents_across_machines(aw):
+    aw.s.fabric_join_max_total = 2
+    assert join(aw, name="t-1")[0] == 201
+    assert join(aw, name="t-2", peer=BEAST)[0] == 201
+    assert join(aw, name="t-3")[0] == 429
+    assert join(aw, name="t-1")[0] == 200                                # renewals are not creations
+    assert len(denied_rows(aw, "fabric_join_total_cap")) == 1
+
+
+def test_a_rejoin_after_the_owner_rebound_the_machine_is_refused_and_changes_nothing(aw):
+    _, out = join(aw)
+    aid = out["agent_id"]
+    aw.s.set_agent_fabric(aw.alice, aid, {"fabric": True, "machine": "beast"})
+    n = len(aw.s._log)
+    status, _ = join(aw)                                                  # still from bender
+    assert status == 403
+    assert aw.s._agents[aid]["machine"] == "beast"
+    assert len(denied_rows(aw, "fabric_join_machine_rebound")) == 1
+    assert [e for e in aw.s._log[n:] if e["event_type"] != "audit_denied"] == []
+
+
+def test_a_renewal_event_never_rebinds_the_machine_even_on_replay(aw):
+    _, out = join(aw)
+    aid = out["agent_id"]
+    aw.s.clock.t += 100_000
+    join(aw)
+    ev = fabric_set_events(aw)[-1]
+    assert ev["payload"]["action"] == "agent.fabric.renew"
+    aw.s.set_agent_fabric(aw.alice, aid, {"fabric": True, "machine": "beast"})
+    aw.s.clock.t += 100_000
+    agent_auth(aw, aid, peer=BEAST)                                       # sliding renewal from the new machine
+    fresh = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), now=aw.s._now)
+    fresh.hydrate(list(aw.s._log))
+    assert fresh._agents[aid]["machine"] == "beast"
+
+
+def test_renewals_and_revoked_or_capped_refusals_do_not_drain_the_creation_budget(aw):
+    aw.s.fabric_join_per_hour = 4
+    aw.s.fabric_join_max_agents = 4
+    assert join(aw, name="a-1")[0] == 201                                 # budget 1 of 4
+    for _ in range(25):
+        assert join(aw, name="a-1")[0] == 200                             # renewals are free
+    _, gone = join(aw, name="a-gone")                                     # budget 2 of 4
+    aw.s.revoke_agent(aw.alice, gone["agent_id"])
+    for _ in range(25):
+        assert join(aw, name="a-gone")[0] == 403                          # a revoked name costs nothing
+    assert join(aw, name="a-3")[0] == 201                                 # budget 3 of 4
+    assert join(aw, name="a-4")[0] == 201                                 # budget 4 of 4; the cap of 4 is reached (the revoked name counts)
+    for i in range(25):
+        assert join(aw, name=f"over-{i}")[0] == 429
+    assert join(aw, name="a-9")[0] == 429
+    aw.s.fabric_join_max_agents = 50
+    aw.s.clock.t += 3601                                                  # a new hour: the budget is whole again
+    for i in range(4):
+        assert join(aw, name=f"b-{i}")[0] == 201
+
+
+def test_cap_refusals_leave_the_budget_for_legitimate_callers(aw):
+    aw.s.fabric_join_per_hour = 2
+    aw.s.fabric_join_max_agents = 1
+    assert join(aw, name="only")[0] == 201                                # budget 1 of 2
+    for i in range(30):
+        assert join(aw, name=f"x-{i}")[0] == 429
+    aw.s.fabric_join_max_agents = 5
+    assert join(aw, name="legit")[0] == 201                               # budget 2 of 2 is still there
+
+
+def test_auto_joined_agents_are_addressable_like_normal_agents(aw):
+    aw.s._commit("identity_linked", {"actor_user_id": OWNER, "actor_agent_id": None, "user_id": OWNER,
+                                     "email": "alice@example.org"})      # the operator signed in once, so has a handle
+    _, a = join(aw, name="bender-claude")
+    _, b = join(aw, name="bender-codex")
+    assert aw.s._agents[a["agent_id"]]["harness_type"] != "fabric"
+    addr_a, addr_b = aw.s._address(a["agent_id"]), aw.s._address(b["agent_id"])
+    assert addr_a and addr_b and addr_a != addr_b                        # operator.agent and operator.agent-2
+    assert addr_a.split(".", 1)[0] == addr_b.split(".", 1)[0]
+    res = aw.s.grant_agent(aw.alice, aw.room, {"agent_id": a["agent_id"], "actions": ["read", "post"]})
+    if res["status"] == "pending":
+        aw.s.decide_agent_request(aw.alice, aw.room, res["request_id"], {"decision": "approve"})
+    book = aw.s._address_book(aw.room)
+    assert addr_a in book and book[addr_a]["id"] == a["agent_id"]        # an @mention of its address resolves to it
+    assert "bender-claude" in book and book["bender-claude"]["id"] == a["agent_id"]    # and so does its name
+
+
+def test_a_revoked_name_stays_blocked_and_counts_toward_the_machine_cap(aw):
+    aw.s.fabric_join_max_agents = 3
+    ids_ = [join(aw, name=f"n-{i}")[1]["agent_id"] for i in range(3)]
+    aw.s.revoke_agent(aw.alice, ids_[0])
+    assert join(aw, name="n-0")[0] == 403                                # anti-resurrection
+    assert join(aw, name="n-new")[0] == 429                              # the index cannot grow past the cap by churning names
+    assert join(aw, name="n-1")[0] == 200
+
+
 # ------------------------------------------------------------------ restart
 def test_state_and_the_index_survive_a_restart_from_the_log(aw):
     _, out = join(aw)
-    aw.s.clock.t += 700
+    aw.s.clock.t += 100_000
     agent_auth(aw, out["agent_id"])
     fresh = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), now=aw.s._now)
     fresh.hydrate(list(aw.s._log))
