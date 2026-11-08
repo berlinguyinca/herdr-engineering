@@ -13,13 +13,15 @@
     HOME: "{{ fleet_home }}"
   block:
     - name: "Sync ~/.agent-rules to the pinned ref and run install.sh"
-      ansible.builtin.command:
-        argv:
-          - bash
-          - "{{ herdr_engineering_repo_root }}/scripts/agent-rules-sync.sh"
-          - "{{ agent_rules_repo_url | default('git@github.com:berlinguyinca/agent-rules.git') }}"
-          - "{{ agent_rules_ref }}"
-          - "{{ fleet_home }}/.agent-rules"
+      # ansible.builtin.script copies the controller's script to the host before running it; a plain command would
+      # look for <controller checkout>/scripts/... on the host itself, which exists only on the controller.
+      ansible.builtin.script:
+        cmd: >-
+          {{ herdr_engineering_repo_root }}/scripts/agent-rules-sync.sh
+          {{ (agent_rules_repo_url | default('git@github.com:berlinguyinca/agent-rules.git')) | quote }}
+          {{ agent_rules_ref | quote }}
+          {{ (fleet_home ~ '/.agent-rules') | quote }}
+        executable: bash
       register: agent_rules_sync
       changed_when: >-
         'changed=true' in (agent_rules_sync.stdout_lines | last | default(''))
