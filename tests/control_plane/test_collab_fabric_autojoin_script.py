@@ -76,7 +76,7 @@ def test_fabric_join_needs_a_clean_name(lw, tmp_path):
 def test_a_refusal_is_reported_and_writes_nothing(lw, tmp_path):
     set_trust(lw, auto_join=False)
     rc, _, err = run(lw, tmp_path, "--name", "bender-claude")
-    assert rc != 0 and "refused" in err
+    assert rc != 0 and "fabric join" in err
     assert not ident(tmp_path).exists()
 
 
@@ -148,7 +148,7 @@ def test_join_sh_sends_the_workspace_env_and_lands_in_the_room(lw, tmp_path):
     data = json.loads(ident(tmp_path).read_text())
     agent = lw.s._agents[data["agent_id"]]
     assert agent["workspace"]["workspace_id"] == "ws-1" and agent["workspace"]["tab_id"] == "tab-2" and agent["workspace"]["pane_id"] == "pane-3"
-    assert data["room_id"] == agent["workspace"]["room_id"] and lw.s._rooms[data["room_id"]]["name"] == "bender/my work"
+    assert data["room_id"] == agent["workspace"]["room_id"] and lw.s._rooms[data["room_id"]]["name"] == "bender/ws-1"
     assert set(data) == {"agent_id", "name", "machine", "room_id"} and stat.S_IMODE(ident(tmp_path).stat().st_mode) == 0o600
 
 

@@ -11,7 +11,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from herdr_engineering.control_plane.collab_fabric_trust import WS_ID, WS_LABEL_MAX, normalize_fabric_trust
+from herdr_engineering.control_plane.collab_fabric_trust import (
+    WS_ID,
+    WS_LABEL_MAX,
+    normalize_fabric_trust,
+)
 from tests.control_plane import test_collab_fabric_autojoin_cli as cli_t
 from tests.control_plane import test_collab_fabric_autojoin_script as sh_t
 from tests.control_plane.test_collab_fabric_auth import fabric_agent, fw, lan_ip  # noqa: F401

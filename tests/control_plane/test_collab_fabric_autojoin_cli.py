@@ -154,7 +154,7 @@ def test_join_fabric_sends_the_workspace_env_and_lands_in_the_room(lw, tmp_path)
     data = json.loads(identity(tmp_path).read_text())
     agent = lw.s._agents[data["agent_id"]]
     assert (agent["workspace"]["workspace_id"], agent["workspace"]["tab_id"], agent["workspace"]["pane_id"]) == ("ws-1", "tab-2", "pane-3")
-    assert data["room_id"] == agent["workspace"]["room_id"] and lw.s._rooms[data["room_id"]]["name"] == "bender/my work"
+    assert data["room_id"] == agent["workspace"]["room_id"] and lw.s._rooms[data["room_id"]]["name"] == "bender/ws-1"
     assert set(data) == {"agent_id", "name", "machine", "room_id"}
 
 
