@@ -728,9 +728,48 @@ def serve(host: str, port: int, control_url: str, upstream: str, upstream_key: s
                        max_inflight=max_inflight, wait_seconds=wait_seconds)
     state.reports = ReportQueue(state.control)
     state.refresh(force=True)
-    httpd = ThreadingHTTPServer((host, port), make_handler(state))
+    httpd = _TrackingHTTPServer((host, port), make_handler(state))
     httpd.daemon_threads = True
     return httpd
+
+
+class _TrackingHTTPServer(ThreadingHTTPServer):
+    """Threading server that remembers its live handler threads (daemon threads are not tracked by the stdlib)."""
+
+    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self._handler_threads: set[threading.Thread] = set()
+        self._handler_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        thread = threading.Thread(target=self._run_handler, args=(request, client_address), daemon=True)
+        with self._handler_lock:
+            self._handler_threads.add(thread)
+        thread.start()
+
+    def _run_handler(self, request, client_address):
+        try:
+            self.process_request_thread(request, client_address)
+        finally:
+            with self._handler_lock:
+                self._handler_threads.discard(threading.current_thread())
+
+
+def _drain_handler_threads(httpd, timeout: float = 3.0) -> None:
+    """Wait (bounded) for in-flight request handlers so the reports they submit are flushed, not lost."""
+    lock = getattr(httpd, "_handler_lock", None)
+    if lock is None:
+        return
+    deadline = time.monotonic() + timeout
+    with lock:
+        pending = list(httpd._handler_threads)
+    for t in pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        t.join(remaining)
 
 
 def run_until_stopped(httpd, flush_seconds: float = 5.0) -> None:
@@ -748,6 +787,7 @@ def run_until_stopped(httpd, flush_seconds: float = 5.0) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        _drain_handler_threads(httpd)
         reports = getattr(getattr(getattr(httpd, "RequestHandlerClass", None), "state", None), "reports", None)
         if reports is not None:
             reports.flush(flush_seconds)

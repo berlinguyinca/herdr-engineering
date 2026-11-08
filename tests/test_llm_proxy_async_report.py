@@ -165,3 +165,41 @@ def test_failed_send_is_retried_when_control_plane_recovers():
     finally:
         q.close()
         srv.shutdown()
+
+
+def test_run_until_stopped_waits_for_inflight_handlers_before_flush():
+    import os
+    import signal
+    from http.server import BaseHTTPRequestHandler
+
+    from herdr_engineering.llm_proxy import ProxyState, _TrackingHTTPServer, run_until_stopped
+    got: list = []
+    srv = _slow_control(0.0, got)
+    state = ProxyState(ControlPlaneClient(f"http://127.0.0.1:{srv.server_address[1]}"), "http://127.0.0.1:9", "k")
+    state.reports = ReportQueue(state.control)
+
+    class Slow(BaseHTTPRequestHandler):
+        def do_GET(self):
+            time.sleep(0.6)  # still running when SIGTERM lands
+            state.reports.submit({"n": 42})
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    Slow.state = state
+    httpd = _TrackingHTTPServer(("127.0.0.1", 0), Slow)
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        import urllib.request
+        threading.Thread(
+            target=lambda: urllib.request.urlopen(f"http://127.0.0.1:{httpd.server_address[1]}/", timeout=5).read(),
+            daemon=True).start()
+        threading.Timer(0.2, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+        run_until_stopped(httpd, flush_seconds=5)
+        assert got == [{"n": 42}]
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        srv.shutdown()
