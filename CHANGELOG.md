@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Dashboard a11y ratchet lowered
+
+- `ui-gates-dashboard-a11y.test.mjs`: the recorded `focus-visible` findings on the assistant surfaces are removed. They were cleared by the `.hd-btn` fallback focus ring in #723, and the ratchet fails when a finding disappears without the table being lowered.
+
 ### Report Evidence and Downloads tables are readable at phone width
 
 - Below 600px (screen only) each row of the Evidence and Downloads tables becomes a labelled block, so no column is cut off and nothing scrolls sideways inside the table. Desktop keeps the real table; print keeps it too, with its repeating header; `#evidence-...` anchors still work. Applies to the public share viewer and the dashboard preview (same renderer).
