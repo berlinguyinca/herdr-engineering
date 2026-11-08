@@ -14,8 +14,20 @@ Only rows without a v2 envelope (no source, source sequence or actor) are candid
 in small chunks, ``chunk_rows`` per transaction with ``chunk_pause_seconds`` between, so a large backlog never holds the
 WAL or the table for minutes (one 250,000-row statement stalled every ingest write for ~8 minutes). Each chunk is ONE
 statement that deletes the rows and inserts them into ``fabric_events_archive``, so a row is never lost half way, and
-rows already listed stay removable (later rows can only make more of a stream interior). Removing rows changes the journal a recovery checkpoint covered; the checkpoint
-loader then replays the affected streams in full (correct, slower), so after a drain the job rebuilds the checkpoint.
+rows already listed stay removable (later rows can only make more of a stream interior). Removing rows changes the journal a recovery checkpoint covered. The checkpoint
+loader accepts those deletes (they are ``D`` change rows on ``service`` streams; the checkpoint already reflects each
+service's final state) and rebuilds only the affected service streams from their surviving rows, so the result equals a
+complete replay. Any other delete, update or truncate still forces a complete replay. After a drain the job rebuilds the
+recovery checkpoint (``rebuild_checkpoint``).
+
+The deleted-service streams are rebuilt at load and count against the loader's incremental budget, so a checkpoint older
+than a large backlog drain is rejected and a boot replays the whole journal. With ``publish_projection_checkpoint`` the
+job also publishes a fresh PROJECTION checkpoint (``projection_refresh.refresh_checkpoint``, the path the worker's
+refresh thread uses) after a drained pass that moved rows, so the next boot finds one that already covers the deletes.
+Lock order: the compaction advisory lock (``_LOCK``) is released when the move ends, and only then does the publish take
+the materializer lock (on its own connection, waiting up to ``projection_lock_wait_seconds``); the two are never held
+together, so they cannot deadlock. The blocking publish runs in a thread. A busy lock or a failed publish logs a warning,
+leaves the publish pending and never fails the pass; the next drained pass retries.
 Off unless ``enabled`` is true; ``dry_run`` (the default) only counts.
 """
 from __future__ import annotations
@@ -44,6 +56,8 @@ class CompactionSettings:
     archive_retention_days: float | None = 30.0
     rebuild_checkpoint: bool = True
     keep_checkpoints: int = 2
+    publish_projection_checkpoint: bool = False   # publish a projection checkpoint after a drained pass that moved rows
+    projection_lock_wait_seconds: float = 60.0    # how long that publish waits for the materializer lock
 
 
 # The candidate rows. Windows run over the whole stream so "first" and "last" are real, age is applied afterwards.
@@ -104,13 +118,16 @@ def move_chunk_sql(columns: list[str]) -> str:
 class FabricCompactor:
     """Run :meth:`tick` from the worker loop; it does nothing until ``interval_seconds`` have passed."""
 
-    def __init__(self, settings: CompactionSettings, *, clock=time.monotonic, pass_clock=time.monotonic, checkpoint_builder=None):
+    def __init__(self, settings: CompactionSettings, *, clock=time.monotonic, pass_clock=time.monotonic, checkpoint_builder=None,
+                 projection_publisher=None):
         self.settings = settings
         self._clock = clock
         self._pass_clock = pass_clock       # times one pass against max_pass_seconds; the tick clock only paces ticks
         self._last: float | None = None
         self._rebuild_pending = False
         self._checkpoint_builder = checkpoint_builder
+        self._projection_publisher = projection_publisher     # blocking callable(lock_wait_seconds); None = not wired
+        self._projection_pending = False
         self.last_outcome = "not run"
 
     async def tick(self, conn) -> str:
@@ -145,12 +162,28 @@ class FabricCompactor:
                 s.archive_retention_days * 86400.0)).split()[-1])
         if moved:
             self._rebuild_pending = True
+            self._projection_pending = True
         if not drained:
             self._last = self._clock() - s.interval_seconds + 60.0       # more to drain: come back in a minute
         outcome = f"archived {moved} rows, purged {purged} from the archive"
         if self._rebuild_pending and drained and s.rebuild_checkpoint:
             outcome += "; " + await self._rebuild(conn)
+        if self._projection_pending and drained and s.publish_projection_checkpoint:
+            outcome += "; " + await self._publish_projection()      # after _move released _LOCK: never nested
         return outcome
+
+    async def _publish_projection(self) -> str:
+        """Publish a projection checkpoint off the event loop. Never raises; any failure leaves the publish pending."""
+        if self._projection_publisher is None:
+            log.warning("fabric compaction cannot publish a projection checkpoint: no publisher is wired")
+            return "projection checkpoint deferred (no publisher)"
+        try:
+            await asyncio.to_thread(self._projection_publisher, self.settings.projection_lock_wait_seconds)
+        except Exception as exc:    # the archived rows are consistent either way; the next drained pass retries
+            log.warning("fabric compaction projection checkpoint publish failed (%s)", type(exc).__name__)
+            return f"projection checkpoint deferred ({type(exc).__name__})"
+        self._projection_pending = False
+        return "projection checkpoint published"
 
     async def _move(self, conn, age):
         """List the removable rows once, then move them chunk by chunk. Returns (moved, drained); moved is None when

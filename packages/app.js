@@ -23,6 +23,7 @@ import { mountArchitecture } from './architecture-view.js';
 import { mountPersonalAssistant } from './personal-assistant-view.js';
 import { mountProjectIntelligence } from './project-intelligence-view.js';
 import { visibleNav } from './nav-capabilities.js';
+import { mountSettings } from './settings-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { agentStory, renderStory } from './agents-lineage.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
@@ -87,12 +88,13 @@ const NAV = [
   { group: 'Monitor', path: '/overview', label: 'Overview' },
   { group: 'Monitor', path: '/attention', label: 'Attention', match: ['/activity'] },
   { group: 'Agents', path: '/herd', label: 'Agents', match: ['/missions', '/handoffs', '/topology'] },
-  { group: 'Agents', path: '/collab', label: 'Collaboration' },
+  { group: 'Agents', path: '/collab', label: 'Collaboration', capability: 'collab_v1' },
   { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
   { group: 'Agents', path: '/teams', label: 'Your teams', capability: 'unified_workspace_v1' },
   { group: 'Agents', path: '/team-map', label: 'Team map', capability: 'unified_workspace_v1' },
   { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync', '/build-cache'] },
   { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
+  { group: 'Fabric', path: '/settings', label: 'Settings' },
   { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
   { group: 'Delivery', path: '/ci', label: 'CI', match: ['/deployments'] },
   { group: 'Delivery', path: '/reviews', label: 'Reviews', match: ['/review-gate'] },
@@ -110,7 +112,7 @@ const SECTION_TABS = [
   [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync'], ['/build-cache', 'Build cache', 'build_cache_v1']],
   [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
   [['/ci', 'CI'], ['/deployments', 'Deployments']],
-  [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate']],
+  [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate', 'review_gate_v1']],
   [['/github', 'Issues'], ['/github/projects', 'Boards']],
   [['/artifacts', 'Artifacts'], ['/library', 'Library'], ['/publications', 'Publications']],
 ];
@@ -162,7 +164,7 @@ function applyRoutes() {
 }
 function markAvailability(ok, message) {
   const path = routePath();
-  if (!KNOWN_PAGES.has(path) || path === '/overview' || path === '/attention') return;
+  if (!KNOWN_PAGES.has(path) || path === '/overview' || path === '/attention' || path === '/settings') return;
   const missing = !ok && MISSING.test(message || '');
   if (!ok && !missing) return;
   if (missing === unavailable.has(path)) return;
@@ -262,6 +264,7 @@ const ROUTES = {
   '/scheduling': viewScheduling,
   '/handoffs': viewHandoffs,
   '/memory': viewMemory,
+  '/settings': viewSettings,
 };
 
 // Router rule: render() runs only on a route change (any hash change, query
@@ -437,6 +440,11 @@ async function viewScheduling() {
 async function viewDeployments() {
   root.innerHTML = `${liveHead('<h1>Deployments</h1>')}<div id="deployments"></div>`;
   return mountDeployments(root.querySelector('#deployments'), client, { freshness: chipIn(root) });
+}
+
+async function viewSettings() {
+  root.innerHTML = `${liveHead('<h1>Settings</h1>')}<div id="settings"></div>`;
+  return mountSettings(root.querySelector('#settings'), client, { freshness: chipIn(root) });
 }
 
 async function viewBuildCache() {

@@ -26,6 +26,32 @@ returns nonzero when preparation or publication fails. JSON output contains only
 sanitized errors, counts and recovery timings. A successful ordinary legacy
 replay does not count as a published projection checkpoint.
 
+### Prewarm versus the worker's refresh
+
+The running `herdr-cp-worker` refreshes the checkpoint every ~5 minutes and holds
+the materializer advisory lock for most of each cycle (measured ~85%). A prewarm
+that tried the lock once therefore usually failed with
+`another projection checkpoint materializer is active`. The deploy now handles it
+two ways:
+
+- Default: the prewarm waits for the lock. `herdr-eng control-plane checkpoint
+  --lock-wait SECONDS` polls the lock (every 250 ms) until it is free or the time
+  is up, then fails with the same reason. `deploy.sh --checkpoint-lock-wait SECONDS`
+  (default 420, longer than one refresh cycle) passes it through. Nothing is
+  stopped; the worker simply finds the lock taken for one cycle, logs a warning and
+  tries again 5 minutes later. Without `--lock-wait` (worker, web) behaviour is
+  unchanged: fail immediately.
+- Opt-in `deploy.sh --pause-worker`: stops `herdr-cp-worker` (`docker stop -t 60`)
+  before the prewarm and starts it again right after it, on success, failure or
+  interrupt (the exit trap). Its other jobs (artifacts, collab bridge) idle for that
+  time. A worker that is not running is left alone. The following service
+  recreation replaces the worker container anyway.
+
+When a stored candidate is rejected, the server log line
+`projection checkpoint candidate rejected: CheckpointInvalid: <reason>` now carries
+the validation reason (at most 200 printable characters; only our own
+`CheckpointInvalid` messages, never other exception text, DSNs or row data).
+
 The background worker refreshes on its own connection and thread, one build at a
 time. A database advisory lock excludes overlapping materializers. Web startup
 reads checkpoints and never creates the recovery schema or index. A missing,
@@ -50,6 +76,31 @@ coverage tables can saturate database storage and queue synchronous ingestion
 writes; the rollout investigation observed approximately 19 GB across those
 legacy tables. Apply the setting under deployment ownership and restart only
 the worker on its existing image after making a validated private config backup.
+
+Fabric compaction deletes interior `service` observation rows (archiving them
+first). Those deletes do not invalidate a checkpoint: the loader rebuilds each
+affected service stream from its surviving rows, which gives the same projection
+as a complete replay because compaction keeps every row that changes a service's
+latest state. The change log records no event type, so every `service` delete is
+treated this way; deletes of other entity types (outside the retention types),
+updates and truncates still require a complete replay. The rebuilt streams count
+against the incremental stream budget; if many compacted services exceed it, the
+rejection reason names the budget and recovery falls back to a complete replay.
+
+While compaction drains a large backlog, one pass can touch thousands of streams
+and exceed that budget, so an older checkpoint is rejected and web boot replays
+everything. Set `control_plane.fabric_compaction.publish_projection_checkpoint: true`
+(default `false`, YAML only) to have the worker publish a fresh projection
+checkpoint after every drained pass that moved rows, so the next boot finds one
+that already covers the deletes. It uses the same publish path as
+`herdr-eng control-plane checkpoint` and waits up to
+`projection_lock_wait_seconds` (default 60) for the materializer lock the
+refresh thread holds. The compaction advisory lock is released before the
+publish starts, so the two locks are never held together. A busy lock or failed
+publish logs a warning (`projection checkpoint ... deferred`), never fails the
+compaction pass, and is retried by the next drained pass. It needs
+`control_plane.pg_dsn` (the same key the refresh thread uses). The budget and
+validity guards are unchanged.
 
 Ordinary append-only inspector updates advance the private owner capsule only
 when their replay order follows its captured boundary. Service and session

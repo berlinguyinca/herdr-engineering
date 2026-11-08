@@ -22,6 +22,9 @@ from .projection_store import CheckpointInvalid, ProjectionStore, SnapshotChange
 log = logging.getLogger(__name__)
 RETENTION_TYPES = frozenset({'inspector','host_metrics','token_usage','resource_usage',
                              'ci_report','ci_observation','ci_telemetry','ci_pipeline'})
+# Fabric compaction deletes interior service observation rows. The change log carries no event_type, so any
+# service delete is tolerated; the stream is then rebuilt from its surviving rows (see _append_blocker).
+COMPACTED_TYPES = frozenset({'service'})
 MAX_TAIL_ROWS = 100_000
 MAX_DIRTY_ROWS = 250_000
 
@@ -33,7 +36,7 @@ def feed_visible(row):
                          and kind in ENVELOPE_ONLY))
 
 
-async def _rows(conn, sql, *args, maximum=None):
+async def _rows(conn, sql, *args, maximum=None, explain=None):
     import json
     result = []
     async for row in conn.cursor(sql, *args, prefetch=1000):
@@ -43,8 +46,33 @@ async def _rows(conn, sql, *args, maximum=None):
                 item[field] = json.loads(item[field])
         result.append(item)
         if maximum is not None and len(result) > maximum:
-            raise CheckpointInvalid('incremental stream budget exceeded; complete replay required')
+            detail = f' ({explain()})' if explain else ''
+            raise CheckpointInvalid(f'incremental stream budget exceeded; complete replay required{detail}')
     return result
+
+
+def _append_blocker(operations, tail, previous, in_prefix_events):
+    """Why a compactable stream cannot fold its tail incrementally, or None when it can.
+
+    The tail may be folded onto the captured core only when every change is an
+    insert and every new server-ingest clock follows the stream's captured
+    maximum. Anything else needs the stream in its authoritative order.
+    """
+    if not all(row['operation'] == 'I' for row in operations):
+        return 'non_insert'
+    if len(tail) != len(operations):
+        return 'tail_rows_missing'
+    if previous is None:
+        return None if not in_prefix_events else 'no_cursor'
+    return None if min(event_time(row) for row in tail) > previous else 'not_after_cursor'
+
+
+def _budget_summary(pairs, blocked):
+    kinds = {}
+    for kind, _ in pairs:
+        kinds[kind] = kinds.get(kind, 0) + 1
+    reasons = {f'{kind}:{reason}': count for (kind, reason), count in blocked.items()}
+    return f'dirty streams by type {dict(sorted(kinds.items()))}; compact append blocked {dict(sorted(reasons.items()))}'
 
 
 async def _read_prepared(source, code, policy):
@@ -86,7 +114,7 @@ async def _read_prepared_once(source, code, policy):
                 if len(changes) > MAX_TAIL_ROWS:
                     raise CheckpointInvalid('incremental change budget exceeded')
                 if any(row['operation'] in {'T','U'} or
-                       (row['operation']=='D' and row['entity_type'] not in RETENTION_TYPES)
+                       (row['operation']=='D' and row['entity_type'] not in RETENTION_TYPES | COMPACTED_TYPES)
                        for row in changes):
                     raise CheckpointInvalid('structural history mutation requires complete replay')
                 legacy = prefix['legacy_rows'] - sum(row['operation']=='D' and row['had_position'] is None for row in changes)
@@ -115,6 +143,7 @@ async def _read_prepared_once(source, code, policy):
                 if inspector_append:
                     pairs = [pair for pair in pairs if pair[0] != 'inspector']
                 append_pairs = set()
+                blocked = {}
                 cursors = checkpoint.get('core_cursors', {})
                 for kind, identity in pairs:
                     if kind not in COMPACT_TYPES:
@@ -123,10 +152,12 @@ async def _read_prepared_once(source, code, policy):
                     tail = tail_by_pair.get((kind, identity), [])
                     operations = changes_by_pair[(kind, identity)]
                     previous = cursors.get(key)
-                    if (all(row['operation']=='I' for row in operations) and len(tail)==len(operations)
-                            and ((previous is None and key not in checkpoint['repo']['events'])
-                                 or (previous is not None and min(event_time(row) for row in tail)>previous))):
+                    reason = _append_blocker(operations, tail, previous,
+                                             key in checkpoint['repo']['events'])
+                    if reason is None:
                         append_pairs.add((kind,identity))
+                    else:
+                        blocked[(kind, reason)] = blocked.get((kind, reason), 0) + 1
                 pairs = [pair for pair in pairs if pair not in append_pairs]
                 if any(not kind or not identity for kind,identity in pairs):
                     raise CheckpointInvalid('untyped durable changes require complete replay')
@@ -137,7 +168,8 @@ async def _read_prepared_once(source, code, policy):
                         'unnest($1::text[],$2::text[]) AS dirty(kind,identity) '
                         'ON events.entity_type=dirty.kind AND events.entity_id=dirty.identity '
                         'ORDER BY events.ingest_timestamp,events.sequence,events.event_id',
-                        [p[0] for p in pairs],[p[1] for p in pairs],maximum=MAX_DIRTY_ROWS)
+                        [p[0] for p in pairs],[p[1] for p in pairs],maximum=MAX_DIRTY_ROWS,
+                        explain=lambda: _budget_summary(pairs, blocked))
                     for row in raw:
                         streams[(row['entity_type'],row['entity_id'])].append(public_event(row))
                 coverage = {**point,
@@ -148,12 +180,29 @@ async def _read_prepared_once(source, code, policy):
                     tail_rows=[public_event(row) for row in raw_tail], structured=structured,
                     coverage=coverage, schema=schema, scanned=sum(len(s) for s in streams.values())+len(raw_tail))
             except (CheckpointInvalid, KeyError, TypeError, ValueError) as exc:
-                log.warning('projection checkpoint candidate rejected: %s',type(exc).__name__)
+                log.warning('projection checkpoint candidate rejected: %s%s',type(exc).__name__,_rejection_detail(exc))
         raw = await _rows(conn, 'SELECT * FROM fabric_events ORDER BY '
             '(projection_position IS NOT NULL),projection_position NULLS FIRST,ingest_timestamp,sequence,event_id')
         return dict(checkpoint=None,rows=raw,structured=structured,
                     coverage={**point,'raw_rows':len(raw),'public_rows':sum(feed_visible(row) for row in raw)},
                     schema=schema,scanned=len(raw))
+
+
+MAX_REASON_CHARS = 200
+
+
+def _rejection_detail(exc):
+    """`: <reason>` for our own validation errors, bounded and printable.
+
+    Only CheckpointInvalid carries static, module-authored messages; other
+    exception types may embed row data, so they stay class-only.
+    """
+    if not isinstance(exc, CheckpointInvalid):
+        return ''
+    text = ''.join(ch if ch.isprintable() else ' ' for ch in str(exc)).strip()
+    if len(text) > MAX_REASON_CHARS:
+        text = text[:MAX_REASON_CHARS - 3] + '...'
+    return f': {text}' if text else ''
 
 
 def _reset_private(repo):
@@ -176,7 +225,8 @@ def recover_repository(repo, source):
         if source._conn is None or source._conn.is_closed():
             source._conn = await asyncpg.connect(source._dsn)
     source._run(connect())
-    ownership = ProjectionStore(source._conn).publisher()
+    ownership = ProjectionStore(source._conn).publisher(
+        wait=getattr(source, 'checkpoint_lock_wait', 0.0))
     source._run(ownership.__aenter__())
     try:
         return _recover_repository(repo, source)

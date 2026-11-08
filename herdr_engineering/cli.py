@@ -822,6 +822,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = csub.add_parser("checkpoint", help="prewarm durable projection checkpoints")
     p2.add_argument("--fleet-config", required=True)
     p2.add_argument("--migrations", default=None)
+    p2.add_argument("--lock-wait", type=float, default=0.0, metavar="SECONDS",
+                    help="keep retrying for up to SECONDS when another materializer (the worker's "
+                         "periodic refresh) holds the checkpoint lock; default 0 fails at once")
     p2.set_defaults(func=_cmd_cp_checkpoint)
     p2 = csub.add_parser("collab-repair", help="set aside foreign rows of the collaboration log (dry run by default; "
                          "never deletes: rows move to a quarantine file/table)")
@@ -1247,10 +1250,8 @@ def _cmd_cp_llm_proxy(args) -> int:
     httpd = serve(args.host, args.port, args.control_plane, upstream, key,
                   max_inflight=max_inflight, wait_seconds=wait_seconds)
     print(f"llm-proxy listening on {args.host}:{httpd.server_address[1]}", flush=True)
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    from .llm_proxy import run_until_stopped
+    run_until_stopped(httpd)
     return 0
 
 
@@ -4086,7 +4087,8 @@ def _cmd_cp_checkpoint(args) -> int:
         asyncio.run(migrate())
         stage = 'materialization'
         result = refresh_checkpoint(dsn, host_aliases=_host_aliases_from(cp),
-                                    inspector_limits=cp.get("inspector_limits") or {})
+                                    inspector_limits=cp.get("inspector_limits") or {},
+                                    lock_wait=max(0.0, getattr(args, "lock_wait", 0.0) or 0.0))
     except (Exception, SystemExit) as exc:
         error = {"ok": False, "error": type(exc).__name__, "stage": stage}
         if isinstance(exc, CheckpointInvalid):
@@ -5328,7 +5330,9 @@ def _fabric_compaction_settings(cp):
         chunk_pause_seconds=number("chunk_pause_seconds", 0.25, 0), max_pass_seconds=number("max_pass_seconds", 300, 10),
         archive_retention_days=retention,
         rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False,
-        keep_checkpoints=int(number("keep_checkpoints", 2, 1)))
+        keep_checkpoints=int(number("keep_checkpoints", 2, 1)),
+        publish_projection_checkpoint=raw.get("publish_projection_checkpoint") is True,
+        projection_lock_wait_seconds=number("projection_lock_wait_seconds", 60, 0))
 
 
 def _share_worker_settings(cp):
@@ -5405,7 +5409,16 @@ def _worker_fabric_compactor(fleet_config_path):
     except FleetConfigError as exc:
         raise SystemExit(f"--fleet-config: {exc}") from None
     settings = _fabric_compaction_settings(cp)
-    return FabricCompactor(settings) if settings.enabled else None
+    if not settings.enabled:
+        return None
+    publisher = None
+    if settings.publish_projection_checkpoint and cp.get("pg_dsn"):
+        from .control_plane.projection_refresh import refresh_checkpoint
+        dsn, aliases, limits = cp["pg_dsn"], _host_aliases_from(cp), cp.get("inspector_limits") or {}
+
+        def publisher(lock_wait):
+            return refresh_checkpoint(dsn, host_aliases=aliases, inspector_limits=limits, lock_wait=lock_wait)
+    return FabricCompactor(settings, projection_publisher=publisher)
 
 
 def _artifact_reconcile_settings(cp) -> dict | None:

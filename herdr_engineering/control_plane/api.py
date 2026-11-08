@@ -1674,6 +1674,32 @@ class ControlPlaneServer:
             caps.append("architecture_v1")
             if self.architecture.explain_config:
                 caps.append("architecture_explain_v1")
+        caps.extend(self._service_capabilities())
+        return caps
+
+    def _service_capabilities(self):
+        """Flags for the optional services the Settings page lists. Each mirrors the exact guard its routes apply (the 503
+        "not enabled" checks), so a flag is never true while the route refuses. Presence and booleans only, never values."""
+        caps = []
+        store = self.artifact_store is not None
+        stored = self.share_store is not None and self.shares_root is not None and store
+        if stored and self.share_settings is not None:
+            caps.append("share_v1")
+        if stored and self.member_admin is not None:      # the member routes do not need share_settings
+            caps.append("members_v1")
+        if self.collab_artifacts_enabled and self.collab_grant_store is not None and store:
+            caps.append("collab_artifacts_v1")
+        if getattr(self, "gate_service", None) is not None:
+            caps.append("review_gate_v1")
+        if store and (self.artifact_delete_owners or self.artifact_delete_allow_keyless_owner):
+            caps.append("artifact_delete_v1")
+        if self.ci_monitor.actions_enabled:
+            caps.append("ci_actions_v1")
+        try:
+            if self.deployment_actions_enabled() and self.deployment_definitions.status()["configured"]:
+                caps.append("deployment_actions_v1")
+        except Exception:  # noqa: BLE001 - health must answer even if the definitions cannot be read
+            pass
         return caps
 
     def _health_probe(self, with_capabilities=True):
@@ -2295,6 +2321,11 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 allowed.add(name.lower())
             return allowed
 
+        def _is_fabric_join(self):
+            """``POST agents/fabric-join`` is authenticated by the tailnet machine alone (whois on the real peer): it carries no
+            Authorization header, and whatever one it carries is ignored."""
+            return self.command == "POST" and self.path.split("?")[0].rstrip("/") == "/api/v1/collab/agents/fabric-join"
+
         def _fabric_listener(self):
             """The dedicated fabric listener (tailnet address, no proxy, no TLS): the collab API and nothing else, and ONLY
             ``Authorization: Fabric``. Any other scheme (or none) is a 401 before the service sees it, so a Bearer token or an
@@ -2310,7 +2341,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             if not self._is_collab_path() or server.collab is None:
                 return self._deny(404, "not found")
             scheme, _, rest = self.headers.get("Authorization", "").partition(" ")
-            if scheme != "Fabric" or not rest.strip():
+            if (scheme != "Fabric" or not rest.strip()) and not self._is_fabric_join():
                 return self._deny(401, "unauthorized")
             return self._collab()
 
@@ -3167,6 +3198,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                                           self.headers.get("X-Herdr-Device"),
                                           operator=server.operator_user if operator else None,
                                           client=self._proxied_client(), fabric_listener=fabric,
+                                          fabric_owner=server.operator_user if fabric else None,
                                           **self._fabric_args())
             except Exception:
                 return self._json({"error": "internal error"}, 500)  # never echo internals
@@ -3803,6 +3835,11 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         return self._json({'error':'staleCatalogCursor','message':str(exc)},409)
                     except ValueError as exc:
                         return self._json({'error':str(exc)},400)
+                try:
+                    limit, offset = _page_window(self.path, default_limit=SERVICES_PAGE_DEFAULT,
+                                                 max_limit=SERVICES_PAGE_MAX)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
                 services = r.list_services()
                 host_filter = _q(self.path, "host_id")
                 if host_filter:
@@ -3812,11 +3849,13 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 summary["total"] = len(services)
                 if _q(self.path, "include_archived") in {"false", "0"}:
                     services = [s for s in services if not s["lifecycle"]["archived"]]
+                services, pagination = _page_slice(services, limit, offset)
                 if _q(self.path, "fields") == "feed":
                     # The ownership feed needs identity and proof only; the full
                     # catalog projection is most of the bytes of a large inventory.
                     services = [{k: s.get(k) for k in _FEED_SERVICE_FIELDS} for s in services]
-                return self._etag_json({"services": services, "summary": summary})
+                return self._etag_json({"services": services, "summary": summary,
+                                        "pagination": pagination})
             if resource == "fleet" and parts[4:] == ["config", "status"]:
                 if server.fleet_config is None:
                     return self._json({"error": "not found"}, 404)
@@ -4092,8 +4131,18 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         languages if isinstance(languages, dict) else {}))
                 if what == "history":
                     from .project_links import annotate_ci_history, cached_github_languages
-                    return self._json(annotate_ci_history(server.ci_monitor.history(), r,
-                        repository_languages=cached_github_languages(server.github_monitor)))
+                    try:
+                        limit, offset = _page_window(self.path, default_limit=CI_HISTORY_PAGE_DEFAULT,
+                                                     max_limit=CI_HISTORY_PAGE_MAX)
+                    except ValueError as exc:
+                        return self._json({"error": str(exc)}, 400)
+                    # Only the requested window is copied, then annotated.
+                    snapshot = server.ci_monitor.history(window=(offset, limit))
+                    pagination = snapshot.pop("pagination")
+                    view = annotate_ci_history(snapshot, r,
+                        repository_languages=cached_github_languages(server.github_monitor))
+                    view["pagination"] = pagination
+                    return self._json(view)
                 if what == "reports":
                     from .project_links import annotate_ci_history, cached_github_languages
                     filters = _ci_reports_query(self.path)
@@ -6820,6 +6869,35 @@ def _evolution_body(server, r, session_id, session=None):
 def _q(path, key):
     from urllib.parse import parse_qs, urlparse
     return parse_qs(urlparse(path).query).get(key, [None])[0]
+
+
+def _page_window(path, *, default_limit, max_limit):
+    """Parse ``limit``/``offset`` for a flat list endpoint (ValueError -> 400)."""
+    values = {}
+    for key, low in (("limit", 1), ("offset", 0)):
+        raw = _q(path, key)
+        if raw is None:
+            continue
+        if not re.fullmatch(r"[0-9]{1,9}", raw) or int(raw) < low:
+            raise ValueError(f"{key} must be an integer >= {low}")
+        values[key] = int(raw)
+    limit = values.get("limit", default_limit)
+    if limit > max_limit:
+        raise ValueError(f"limit must be an integer between 1 and {max_limit}")
+    return limit, values.get("offset", 0)
+
+
+def _page_slice(rows, limit, offset):
+    """Return (page rows, pagination marker) for an already ordered list."""
+    page = rows[offset:offset + limit]
+    end = offset + len(page)
+    more = end < len(rows)
+    return page, {"total": len(rows), "limit": limit, "offset": offset,
+                  "next_offset": end if more else None, "truncated": more}
+
+
+SERVICES_PAGE_DEFAULT, SERVICES_PAGE_MAX = 500, 1000
+CI_HISTORY_PAGE_DEFAULT, CI_HISTORY_PAGE_MAX = 1000, 2000
 
 
 def _qint(path, key, default):
