@@ -5330,7 +5330,9 @@ def _fabric_compaction_settings(cp):
         chunk_pause_seconds=number("chunk_pause_seconds", 0.25, 0), max_pass_seconds=number("max_pass_seconds", 300, 10),
         archive_retention_days=retention,
         rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False,
-        keep_checkpoints=int(number("keep_checkpoints", 2, 1)))
+        keep_checkpoints=int(number("keep_checkpoints", 2, 1)),
+        publish_projection_checkpoint=raw.get("publish_projection_checkpoint") is True,
+        projection_lock_wait_seconds=number("projection_lock_wait_seconds", 60, 0))
 
 
 def _share_worker_settings(cp):
@@ -5407,7 +5409,16 @@ def _worker_fabric_compactor(fleet_config_path):
     except FleetConfigError as exc:
         raise SystemExit(f"--fleet-config: {exc}") from None
     settings = _fabric_compaction_settings(cp)
-    return FabricCompactor(settings) if settings.enabled else None
+    if not settings.enabled:
+        return None
+    publisher = None
+    if settings.publish_projection_checkpoint and cp.get("pg_dsn"):
+        from .control_plane.projection_refresh import refresh_checkpoint
+        dsn, aliases, limits = cp["pg_dsn"], _host_aliases_from(cp), cp.get("inspector_limits") or {}
+
+        def publisher(lock_wait):
+            return refresh_checkpoint(dsn, host_aliases=aliases, inspector_limits=limits, lock_wait=lock_wait)
+    return FabricCompactor(settings, projection_publisher=publisher)
 
 
 def _artifact_reconcile_settings(cp) -> dict | None:

@@ -307,6 +307,16 @@ def test_fabric_compaction_settings_default_to_off_and_dry_run():
         _fabric_compaction_settings({"fabric_compaction": {"min_age_days": 0}})
 
 
+def test_fabric_compaction_projection_publish_is_off_unless_exactly_true():
+    from herdr_engineering.cli import _fabric_compaction_settings
+    assert _fabric_compaction_settings({}).publish_projection_checkpoint is False
+    assert _fabric_compaction_settings({"fabric_compaction": {"publish_projection_checkpoint": "yes"}}
+                                       ).publish_projection_checkpoint is False
+    on = _fabric_compaction_settings({"fabric_compaction": {"publish_projection_checkpoint": True,
+                                                            "projection_lock_wait_seconds": 5}})
+    assert on.publish_projection_checkpoint is True and on.projection_lock_wait_seconds == 5.0
+
+
 def test_single_operator_makes_the_assistant_allow_the_owners_own_approval_and_nothing_else_changes():
     from herdr_engineering.cli import _assistant_config
     pa = {"enabled": True, "actions": {"approvers": ["a"]}}
