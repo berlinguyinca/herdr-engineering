@@ -82,29 +82,41 @@ The collab host in `machines` trusts itself, as in section 9, unchanged.
 
 **The route.** `POST /api/v1/collab/agents/fabric-join`, served only on the dedicated fabric listener (404 on the public and operator
 listeners). It authenticates by whois alone and ignores any `Authorization` header. Body `{"name": "<1-64 chars: lowercase letters, digits,
-dot, hyphen, underscore>", "machine": "<optional, informational>"}`; the machine is always the one whois found. It answers
+dot, hyphen, underscore, first a letter or digit>", "machine": "<optional, informational>"}`; the machine is always the one whois found. It answers
 `{agent_id, name, machine, fabric_expires_at}` (201 on create, 200 on renew).
 
 **What gets created.** A normal agent owned by the collab `operator_user` (the server needs `operator_user` set), with `machine` from whois, the
-fabric bit on, and `origin: "fabric_join"`. It has NO credential (nothing secret exists to leak or rotate), NO room permissions and never
+fabric bit on, and `origin: "fabric_join"`, harness family `agent` (so it gets an address like any agent: `<handle>.agent`, `<handle>.agent-2`, and
+its name resolves in `@` mentions). It has NO credential (nothing secret exists to leak or rotate), NO room permissions and never
 `coordinate`: a room owner grants permissions exactly as for any agent (section 6 for `coordinate`, which stays an explicit owner decision).
 The audit row carries `via: "fabric"`. Joining is idempotent per (machine, name): the same pair returns the same agent, the same name on
 another machine is a separate agent.
 
-**Limits.** 30 joins per machine per hour (429 `fabric join` throttle) and 200 agents per machine; refusals are audited
-(`agent.fabric_join`, outcome `denied`, reasons `fabric_join_rate_limited`, `fabric_join_machine_cap`, `fabric_join_revoked`).
-External and helper agents cannot join this way, and a fabric caller can neither set the fabric bit nor rotate credentials.
+**Limits.** Three bounds, none of them the operator's own `max_agents_per_user` (auto-joined agents are NOT counted there, so a noisy machine
+cannot starve the operator's own enrolments, and the operator's enrolments cannot block joins): 30 NEW agents per machine per hour (429
+`fabric join` throttle; renewals, revoked-name and cap refusals do not spend it), 200 names per machine (revoked names count, see
+Revocation) and 1000 auto-joined agents in total across machines (`fabric_join_total_cap`, 429). Refusals are audited
+(`agent.fabric_join`, outcome `denied`, reasons `fabric_join_rate_limited`, `fabric_join_machine_cap`, `fabric_join_total_cap`,
+`fabric_join_revoked`, `fabric_join_machine_rebound`), but at most one audit row per (machine, reason) every 5 minutes and 500 in the
+log's lifetime, so a loop over fresh names cannot fill the capped event log (the rest are only counted in `audit_throttled`).
+External and helper agents cannot join this way, and a fabric caller can neither set the fabric bit nor rotate credentials. A re-join of a name
+the owner has since bound to a DIFFERENT machine answers 403 (`fabric_join_machine_rebound`) and changes nothing; renewals never rebind a machine.
 
-**Renewal.** The fabric bit of an auto-joined agent slides: each Fabric request renews it to now + `agent_ttl_seconds`, written at most once per
-10 minutes. A bit the owner set by hand (section 5) keeps its fixed TTL.
+**Renewal.** The fabric bit of an auto-joined agent slides to now + `agent_ttl_seconds`, but is written at most once per 24 hours (sooner only
+when `agent_ttl_seconds` is under four days: a quarter of the window), so a polling agent costs about one event a day. A bit the owner set by
+hand (section 5) keeps its fixed TTL.
 
 **Revocation.** Revoking the agent (dashboard: agents are marked "auto-joined") or clearing its fabric bit takes effect immediately. A later
 `fabric-join` of the same (machine, name) answers 403 and is audited as `fabric_join_revoked`: a revoked agent is never resurrected. Choose a
-new name to start over. Setting `auto_join: false`, the kill switch, or `enabled: false` ends Fabric auth of auto-joined agents at once
+new name to start over. **Known limit:** a revoked (machine, name) stays blocked for good and keeps counting toward that machine's 200-name cap
+(that is what keeps the index bounded); there is no owner-side way to clear one short of a new machine name or a log rebuild. Setting `auto_join: false`, the kill switch, or `enabled: false` ends Fabric auth of auto-joined agents at once
 (audit reason `fabric_auto_join_off`); agents the owner enabled by hand are unaffected by `auto_join`.
 
-**Client.** `herdr-eng rooms join-fabric NAME [--machine M] [--control-plane URL]` (point `--control-plane` at the fabric listener) or
-`join.sh --fabric --name NAME [--fabric-url URL]`. Both write `~/herdr-agents/NAME.json` (`$HERDR_AGENT_DIR` honoured), mode 0600, holding only
+**Client.** The route exists ONLY on the fabric listener, never on the public site. `herdr-eng rooms join-fabric NAME [--machine M]
+[--control-plane http://<listen_host>:<listen_port>]` finds the listener from this host's configuration (`fabric_trust.listen_host` and
+`listen_port`) when `--control-plane` is omitted, and otherwise fails at once saying so. The shell cannot discover it, so it needs the URL:
+`curl -fsSL <site>/api/v1/collab/scripts/join.sh | bash -s -- --fabric --name NAME --fabric-url http://<listen_host>:<listen_port>`. Names follow
+one rule in the server, the Python client and `join.sh`. Both write `~/herdr-agents/NAME.json` (`$HERDR_AGENT_DIR` honoured), mode 0600, holding only
 `{agent_id, name, machine}`; the existing identity discovery (`--as-agent`, `HERDR_AGENT_ID`, the single file) then finds it. The token
 path (`HERDR_JOIN_TOKEN`) is unchanged.
 
@@ -275,6 +287,7 @@ All Fabric refusals return the same generic `401 unauthorized`; the reason is in
 | `fabric_expired` | the bit's `agent_ttl_seconds` window ended: the owner sets it again |
 | `fabric_auto_join_off` | the agent was auto-joined and `auto_join` is now off (or the feature is disabled): turn `auto_join` back on |
 | `fabric_join_revoked` (join, 403) | that (machine, name) was revoked; it is not resurrected: join under a new name |
-| `fabric_join_rate_limited` / `fabric_join_machine_cap` (join, 429) | more than 30 joins an hour, or 200 agents, from one machine |
+| `fabric_join_rate_limited` / `fabric_join_machine_cap` / `fabric_join_total_cap` (join, 429) | more than 30 new agents an hour, or 200 names (revoked included) from one machine, or 1000 in total |
+| `fabric_join_machine_rebound` (join, 403) | the owner bound that name to another machine; join under another name |
 | 400 on `POST agents/{id}/fabric` | no machine recorded: pass `machine` |
 | 403 `forbidden: only the room owner grants coordinate` | grant `coordinate` as the room owner |
