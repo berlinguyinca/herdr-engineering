@@ -8,9 +8,11 @@ from __future__ import annotations
 import importlib.util
 import re
 import secrets
+import shutil
 import stat
 from pathlib import Path
 
+import pytest
 import yaml
 
 from herdr_engineering import fleet_config_cli as fcc
@@ -141,6 +143,10 @@ def test_incomplete_host_is_refused_without_naming_values(env) -> None:
     _no_secrets(r.stdout + r.stderr)
 
 
+def _host_log(env) -> list[str]:
+    return [ln for ln in env["log"].read_text().splitlines() if "/deploy/artifact-host/compose.yaml " in ln]
+
+
 def test_real_deploy_installs_the_files_and_brings_the_host_up_before_the_control_plane(
     env,
 ) -> None:
@@ -151,26 +157,250 @@ def test_real_deploy_installs_the_files_and_brings_the_host_up_before_the_contro
     _no_secrets(r.stdout + r.stderr)
     ah = env["home"] / ".config/herdr-engineering/artifact-host"
     assert stat.S_IMODE(ah.stat().st_mode) == 0o700
-    assert sorted(p.name for p in ah.iterdir()) == [
-        "artifact-host-config.json",
-        "artifact-host-db-password",
+    names = sorted(p.name for p in ah.iterdir() if p.is_file())
+    assert names == [
+        "db-admin-password",
+        "internal.json",
+        "migrate.json",
+        "public.json",
+        "roles.sql",
     ]
     for p in ah.iterdir():
-        assert stat.S_IMODE(p.stat().st_mode) == 0o644
-    assert (ah / "artifact-host-db-password").read_text() == DBPW
+        if p.is_file():
+            want = 0o600 if p.name == "roles.sql" else 0o644
+            assert stat.S_IMODE(p.stat().st_mode) == want, p.name
     edge = (env["home"] / ".config/herdr-engineering/collab-edge/nginx.conf").read_text()
     assert f"server_name {HOST};" in edge and "location = /mcp/artifacts" in edge
     log = env["log"].read_text().splitlines()
     assert any(ln.startswith("docker build") and "herdr-artifact-host:" in ln for ln in log)
-    migrate = next(i for i, ln in enumerate(log) if " run --rm artifact-host-public migrate" in ln)
-    up = next(i for i, ln in enumerate(log) if "artifact-host/compose.yaml" in ln and " up " in ln)
-    assert "--wait" in log[up]
-    cp_up = next(
-        i
-        for i, ln in enumerate(log)
-        if "compose.artifact-host.yaml" in ln and " up " in ln and "collab-edge" in ln
+    idx = {
+        "db": next(i for i, ln in enumerate(log) if "artifact-host/compose.yaml" in ln and " up " in ln),
+        "roles": next(i for i, ln in enumerate(log) if " exec -T artifact-host-db psql " in ln),
+        "dump": next(i for i, ln in enumerate(log) if " exec -T artifact-host-db pg_dump " in ln),
+        "migrate": next(i for i, ln in enumerate(log) if " run --rm artifact-host-migrate" in ln),
+        "roles_up": max(
+            i for i, ln in enumerate(log) if "artifact-host/compose.yaml" in ln and " up " in ln
+        ),
+        "cp": next(
+            i
+            for i, ln in enumerate(log)
+            if "compose.artifact-host.yaml" in ln and " up " in ln and "collab-edge" in ln
+        ),
+    }
+    assert idx["db"] < idx["roles"] < idx["dump"] < idx["migrate"] < idx["roles_up"] < idx["cp"], idx
+    assert "--wait" in log[idx["roles_up"]]
+
+
+def test_a_routine_deploy_never_recreates_the_database_container(env) -> None:
+    _set(env, _section())
+    _cert(env, MCP_HOST, HOST)
+    assert _ds.deploy(env).returncode == 0
+    ups = [ln for ln in _host_log(env) if " up " in ln]
+    assert ups
+    for ln in ups:
+        if "--force-recreate" in ln:
+            assert "artifact-host-db" not in ln and "--no-deps" in ln, ln
+    assert "artifact-host-db" in ups[0] and "--force-recreate" not in ups[0]
+    assert "artifact-host-public" in ups[-1] and "artifact-host-relay" in ups[-1]
+
+
+def test_the_database_is_backed_up_before_the_migration_and_a_failed_backup_stops_it(env) -> None:
+    _set(env, _section())
+    _cert(env, MCP_HOST, HOST)
+    env["env"]["STUB_FAIL_AH"] = "pg_dump"
+    r = _ds.deploy(env)
+    assert r.returncode == 1, r.stdout + r.stderr
+    host = _host_log(env)
+    assert any(" pg_dump " in ln for ln in host)
+    assert not any("artifact-host-migrate" in ln for ln in host), "no migration after a failed backup"
+    assert "backup" in r.stderr
+    ah = env["home"] / ".config/herdr-engineering/artifact-host"
+    assert not list(ah.glob("backups/*.dump")), "the empty dump of a failed backup is removed"
+
+
+def test_a_successful_backup_is_kept_private(env) -> None:
+    _set(env, _section())
+    _cert(env, MCP_HOST, HOST)
+    assert _ds.deploy(env).returncode == 0
+    ah = env["home"] / ".config/herdr-engineering/artifact-host"
+    dumps = list((ah / "backups").glob("pre-*.dump"))
+    assert len(dumps) == 1
+    assert stat.S_IMODE(dumps[0].stat().st_mode) == 0o600
+    assert stat.S_IMODE((ah / "backups").stat().st_mode) == 0o700
+
+
+def test_the_certificate_must_name_the_artifact_host(env) -> None:
+    _set(env, _section())
+    _cert(env, MCP_HOST)  # a certificate that does not name the host
+    r = _ds.deploy(env)
+    assert r.returncode != 0
+    assert HOST in r.stderr and "certificate" in r.stderr
+    _no_secrets(r.stdout + r.stderr)
+    assert not any(" run --rm artifact-host-migrate" in ln for ln in env["log"].read_text().splitlines())
+
+
+def test_the_certificate_check_passes_when_it_names_the_host_and_the_unit_keeps_checking(env) -> None:
+    _set(env, _section())
+    _cert(env, MCP_HOST, HOST)
+    assert _ds.deploy(env).returncode == 0
+    unit = (env["home"] / ".config/systemd/user/herdr-collab-sync.service").read_text()
+    assert f"--share-host {HOST}" in unit
+
+
+def test_a_successful_deploy_probes_the_hosts_own_name(env) -> None:
+    _set(env, _section())
+    _cert(env, MCP_HOST, HOST)
+    r = _ds.deploy(env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"curl https://{HOST}/s/probe/" in env["log"].read_text()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "HERDR_ARTIFACT_HOST_PROJECT",
+        "HERDR_ARTIFACT_NET_PREFIX",
+        "HERDR_ARTIFACT_EDGE_SUBNET",
+        "HERDR_ARTIFACT_INTERNAL_SUBNET",
+        "HERDR_ARTIFACT_INTERNAL_IP",
+        "HERDR_ARTIFACT_HOST_DIR",
+        "HERDR_ARTIFACT_HOST_TAG",
+    ],
+)
+def test_the_hosts_fixed_names_and_addresses_are_not_deploy_settings(env, name: str) -> None:
+    _set(env, _section())
+    env["env"][name] = "172.31.9.0/28" if "SUBNET" in name else "elsewhere"
+    r = _ds.deploy(env, "--dry-run")
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert name in r.stderr and "fixed" in r.stderr
+    assert not (env["log"].exists() and env["log"].read_text().strip()), "nothing ran"
+
+
+# ---------------------------------------------------------------------------------------------------------- rollback
+
+
+def _host_commit() -> str:
+    """A committed release that already ships the artifact host (so it can be a rollback target)."""
+    return _ds._git(
+        "log", "--format=%H", "--", "deploy/artifact-host/compose.yaml"
+    ).splitlines()[-1]
+
+
+def _mark(env, state: str) -> None:
+    marker = env["home"] / ".config/herdr-engineering/artifact-host.state"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(state)
+
+
+def test_failed_enable_rolls_back_without_the_overlay_and_stops_the_host(env) -> None:
+    """Enabled for the first time (the previous release ran no host): a failed control-plane up leaves no host and no overlay."""
+    prev_full, prev_tag = _ds._seed_previous(env, _ds._layout_commit())
+    _set(env, _section())
+    _cert(env, MCP_HOST, HOST)
+    env["env"]["FAIL_COMPOSE_TAGS"] = _ds._head()
+    r = _ds.deploy(env)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert f"rolled back to herdr-engineering:{prev_tag}" in r.stderr
+    files = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("composefiles ")]
+    assert "compose.artifact-host.yaml" in files[0]
+    rb = [ln for ln in files if ln.startswith(f"composefiles tag={prev_tag} ")]
+    assert rb and "compose.artifact-host.yaml" not in rb[0], "the previous release has no overlay"
+    log = env["log"].read_text()
+    assert "label=com.docker.compose.project=herdr-artifact-host" in log
+    ah = env["home"] / ".config/herdr-engineering/artifact-host"
+    assert not (ah / "public.json").exists(), "the files this deploy installed are removed again"
+    assert not (env["home"] / ".config/herdr-engineering/artifact-host.state").exists()
+    _ds._assert_deploy_worktrees_removed(env)
+
+
+def test_failed_disable_restores_the_overlay_and_the_host(env) -> None:
+    """The host ran before; disabling it fails in the control-plane up: the rollback brings the overlay AND the host back."""
+    prev_full, prev_tag = _ds._seed_previous(env, _host_commit())
+    _set(env, _section(enabled=False))
+    _mark(env, "enabled")
+    ah = env["home"] / ".config/herdr-engineering/artifact-host"
+    ah.mkdir(parents=True)
+    (ah / "roles.sql").write_text("-- the previous release's roles\n")
+    env["env"]["FAIL_COMPOSE_TAGS"] = _ds._head()
+    r = _ds.deploy(env)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert f"rolled back to herdr-engineering:{prev_tag}" in r.stderr
+    assert "NOT FULLY" not in r.stderr
+    files = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("composefiles ")]
+    assert "compose.artifact-host.yaml" not in files[0], "the failed forward deploy ran without the host"
+    rb = next(ln for ln in files if ln.startswith(f"composefiles tag={prev_tag} "))
+    assert "rollback-worktree/deploy/control-plane/compose.artifact-host.yaml" in rb
+    prev_host = [
+        ln for ln in _host_log(env) if "rollback-worktree/deploy/artifact-host/compose.yaml" in ln
+    ]
+    assert any(" up " in ln and "artifact-host-db" in ln for ln in prev_host), prev_host
+    assert any(" exec -T artifact-host-db psql " in ln for ln in prev_host), "the roles are re-applied"
+    assert any(" up " in ln and "artifact-host-public" in ln for ln in prev_host)
+    assert not any("migrate" in ln for ln in prev_host)
+    assert (ah / "roles.sql").read_text() == "-- the previous release's roles\n"
+    _ds._assert_deploy_worktrees_removed(env)
+
+
+def test_rollback_after_a_migration_fails_loudly_with_the_manual_steps(env) -> None:
+    """Enabled before and now: the roles and the schema were touched, so the host is NOT silently reverted."""
+    prev_full, prev_tag = _ds._seed_previous(env, _host_commit())
+    _set(env, _section())
+    _mark(env, "enabled")
+    ah = env["home"] / ".config/herdr-engineering/artifact-host"
+    ah.mkdir(parents=True)
+    (ah / "roles.sql").write_text("-- previous\n")
+    _cert(env, MCP_HOST, HOST)
+    env["env"]["FAIL_COMPOSE_TAGS"] = _ds._head()
+    r = _ds.deploy(env)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "ARTIFACT HOST NOT REVERTED" in r.stderr
+    assert "pg_restore" in r.stderr and "stop artifact-host-public" in r.stderr
+    assert "--ref" in r.stderr  # the redeploy command of the previous release
+    # the control plane itself went back, with the overlay, so nothing is left mixed on its side
+    files = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("composefiles ")]
+    rb = next(ln for ln in files if ln.startswith(f"composefiles tag={prev_tag} "))
+    assert "compose.artifact-host.yaml" in rb
+    assert not any(
+        "rollback-worktree/deploy/artifact-host/compose.yaml" in ln for ln in _host_log(env)
+    ), "the previous host code is not started against a changed database"
+    _no_secrets(r.stdout + r.stderr)
+
+
+def test_a_failed_migration_with_no_previous_host_is_rolled_back_and_the_host_stopped(env) -> None:
+    prev_full, prev_tag = _ds._seed_previous(env, _ds._layout_commit())
+    _set(env, _section())
+    _cert(env, MCP_HOST, HOST)
+    env["env"]["STUB_FAIL_AH"] = "artifact-host-migrate"
+    r = _ds.deploy(env)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert f"rolled back to herdr-engineering:{prev_tag}" in r.stderr
+    assert "label=com.docker.compose.project=herdr-artifact-host" in env["log"].read_text()
+
+
+def test_a_successful_deploy_records_the_state_a_later_rollback_restores(env) -> None:
+    _set(env, _section())
+    _cert(env, MCP_HOST, HOST)
+    assert _ds.deploy(env).returncode == 0
+    marker = env["home"] / ".config/herdr-engineering/artifact-host.state"
+    assert marker.read_text().strip() == "enabled"
+    _set(env, _section(enabled=False), collab=False)
+    assert _ds.deploy(env).returncode == 0
+    assert marker.read_text().strip() == "disabled"
+
+
+def test_deploy_uses_the_repo_virtualenv_not_the_bare_system_python(env, tmp_path) -> None:
+    """The fleet commands need the project's dependencies: a `python3` first on PATH that lacks them must not matter."""
+    real = shutil.which("python3")
+    fake = tmp_path / "fakebin"
+    fake.mkdir()
+    (fake / "python3").write_text(
+        "#!/bin/sh\ncase \"$*\" in *herdr_engineering.cli*) echo 'No module named yaml' >&2; exit 1 ;; esac\n"
+        f'exec {real} "$@"\n'
     )
-    assert migrate < up < cp_up
+    (fake / "python3").chmod(0o755)
+    env["env"]["PATH"] = f"{fake}:{env['env']['PATH']}"
+    r = _ds.deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stdout + r.stderr
 
 
 def test_disabling_the_host_stops_its_project_and_installs_nothing(env) -> None:
