@@ -282,6 +282,11 @@ def _check_members(collab: dict, share: dict, cfg: FleetConfig | None = None) ->
     members = collab.get("members")
     if members is None:
         return
+    if cfg is not None and artifact_host_enabled(cfg):
+        # The dedicated host owns the member web (control_plane.artifact_host: its own host, session_secret and
+        # internal key; no share, bridge or api_keys prerequisite).  A leftover legacy section is ignored.  The
+        # legacy share-public path below still needs share, the bridge and api_keys.
+        return
     from .control_plane.members_config import parse_members
     for key in ("public_host", "session_seconds"):
         if isinstance(members, dict) and key in members:
@@ -314,10 +319,12 @@ def _check_members_prerequisites(cfg: FleetConfig, share: dict) -> None:
                                "API treats every caller as the operator, who may read and share member artifacts")
 
 
-def _members_with_host(values: dict, share: dict) -> dict:
+def _members_with_host(values: dict, share: dict, cfg: FleetConfig | None = None) -> dict:
     """``values`` with the share host and session lifetime copied into an ENABLED members section (collab-public only
     loads this slice, never ``control_plane.share``, so it reads both there)."""
     members = values.get("members")
+    if cfg is not None and artifact_host_enabled(cfg):
+        return {k: v for k, v in values.items() if k != "members"}      # the host serves members; collab-public does not
     if isinstance(members, dict) and members.get("enabled") is True:
         slice_ = {**members, "public_host": share.get("public_host")}
         if share.get("session_seconds") is not None:
@@ -351,7 +358,7 @@ def render_collab(cfg: FleetConfig, out: Path) -> None:
     ``collab_artifacts: {enabled: <bool>}`` switch."""
     data = {"version": SCHEMA_VERSION,
             "sections": {CONTROL_PLANE_SECTION: {"roles": ["control-plane"],
-                                                 "values": {"collab": _members_with_host(collab_values(cfg), _share_mapping(cfg)[0]),
+                                                 "values": {"collab": _members_with_host(collab_values(cfg), _share_mapping(cfg)[0], cfg),
                                                         **_collab_artifacts_slice(cfg)}}},
             "hosts": {}}
     _parse(data)

@@ -413,6 +413,21 @@ def test_enabled_members_need_the_share_the_bridge_and_api_keys_with_the_keys_na
     assert fcc.collab_values(load("ok", share=share()))["members"]["enabled"] is True
 
 
+def test_the_artifact_host_path_needs_no_legacy_member_prerequisites(tmp_path):
+    """With control_plane.artifact_host enabled the host owns the member web: no share, bridge or api_keys needed."""
+    host_on = {"artifact_host": {"enabled": True}, "api_keys": {}}
+    cfg = load_fleet_config(_central(tmp_path / "host", collab={**COLLAB, "members": members()}, extra=host_on))
+    assert fcc.collab_values(cfg)["members"]["enabled"] is True      # no share, no bridge, no api_keys: accepted
+    out = tmp_path / "collab.json"
+    fcc.render_collab(cfg, out)
+    assert "members" not in json.loads(out.read_text())["sections"]["control_plane"]["values"]["collab"]
+    # the legacy (share-public) path keeps every prerequisite
+    legacy = load_fleet_config(_central(tmp_path / "legacy", collab={**COLLAB, "members": members()},
+                                        share=share(), extra={**BRIDGE, "api_keys": {}}))
+    with pytest.raises(FleetConfigError, match=r"control_plane\.api_keys"):
+        fcc.collab_values(legacy)
+
+
 def test_startup_refuses_members_without_any_api_key_but_accepts_keys_from_the_command_line():
     from herdr_engineering.cli import _refuse_keyless_members
     cp = {"collab": {"members": members()}, "share": share()}
