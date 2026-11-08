@@ -587,6 +587,103 @@ Coordinators cannot yet be handed work by Suggest requests.
 
 ---
 
+# Slice 5: approval-gated external actions (a GitHub issue, a Gmail draft)
+
+Slice 5 of the same design (`TEAM_COLLABORATION.md` section 14, slice 5; threat model section 3.9). After the operator has approved
+an email brief, the team can ASK for one of two things to leave the system. It leaves only when the account owner approves the exact
+content.
+
+## What it does
+
+- `github_issue_create`: one issue in the repository the room owner set for that team. The title, the labels (only those the
+  operator listed) and the body (the approved brief in a fenced block plus a machine marker) are built from the approved brief.
+- `email_reply_draft`: one Gmail DRAFT reply to the original sender, in the original thread. The recipient and subject come from the
+  assistant's private record of the email, never from the filer; the filer supplies only the plain reply text (up to 800 characters,
+  secrets refused). Nothing is sent; you send the draft yourself from Gmail.
+- Who: the room owner, the team's issue writer and the team's coordinator may PROPOSE. Only the account owner approves, rejects or
+  retries. Anyone else is told 403 (and the refusal is audited under their own identity), a stranger 404.
+- Approving needs the SHA-256 of the content you were shown (`external-list` prints it), so the card you read is the action that
+  runs. A wrong hash is 409 and nothing happens.
+
+## Turn it on
+
+All YAML, off by default, read at start:
+
+```yaml
+control_plane:
+  collab:
+    team_rooms: {enabled: true}
+  personal_assistant:
+    enabled: true
+    persistence: {dsn: ...}               # required: the intent must be durable before anything leaves
+    collab_users: {"key:<id>": "<collab user that owns the room>"}
+    team_briefs: {enabled: true, topics: [invoice]}
+    external_actions:
+      enabled: true
+      actions_per_hour: 10                # filing cap
+      executions_per_hour: 10             # provider calls cap
+      intent_stale_seconds: 120           # how long an "executing" intent is trusted before it is shown as unknown
+      github:
+        labels: [from-email]              # the only labels a filer may pick
+        # api_base: https://api.github.com   (https only; plain http only to a loopback host)
+```
+
+Credentials are NOT in this block. The issue token comes from the GitHub App's `team_issues` write capability (`github.app.write`)
+or, as a documented fallback, the server-held `github.token` (the same one the deployment escalation issues use). Prefer the App.
+The draft uses the operator's own Google connection (Connectors tab); no extra scope is needed.
+
+Then restart the control plane. Flag off: every route below is 404, the capability `assistant_external_actions` is not advertised,
+and collab behaves as before (pinned by a test).
+
+## Operate it
+
+```
+herdr-eng rooms issue-target ROOM TEAM owner/name            # owner only; omit the repo to show it
+herdr-eng assistant external-file ROOM github_issue_create REF [--title T] [--label L]
+herdr-eng assistant external-file ROOM email_reply_draft REF --body "Thanks, noted."
+herdr-eng assistant external-list [--state awaiting_approval]
+herdr-eng assistant external-show ID                          # the exact card and its sha256
+herdr-eng assistant external-decide ID approved --sha256 HASH # runs it once; or "rejected"
+herdr-eng assistant external-retry ID --sha256 HASH           # failed / unknown only
+herdr-eng rooms external-list|external-file|external-decide|external-retry ROOM ...   # the same, with a collab token
+```
+
+States: `awaiting_approval`, `rejected`, `expired`, `approved` (not run yet), `executed` (with the issue URL or draft id),
+`failed` (the provider refused for good: a revoked token, a missing repository), `unknown` (no usable answer: a timeout, a 5xx, a
+cut connection, a restart in the middle). `failed` and `unknown` show a fixed reason and notify you; only you can retry. A retry
+looks for the earlier result at the provider before creating anything.
+
+## Exactly once, and where that stops
+
+The key is a SHA-256 of the action and the brief, so the same email is one action. The intent is stored durably before the provider
+is called. After a crash or a lost answer, the retry (or the post-restart recovery, which only READS the provider) looks for the
+marker first. It cannot promise: (1) that a request GitHub was still processing when the listing was read does not later appear as a
+second issue; (2) that a Gmail draft older than the newest 50 is found, so a retry may add a second DRAFT (never a second send).
+Check `external-list` for `unknown` actions after an outage.
+
+## Roll back
+
+- Normal and safe: `external_actions.enabled: false` (or `kill_switch: true`) and restart. Routes 404; actions already in the ledger
+  stay, and nothing runs. To stop issue writes entirely also remove the App capability and `github.token`.
+- Rolling the IMAGE back is not recommended and was not run: the state lives in fields the older image already has, so nothing is
+  lost on replay, but the older image knows no executor for these kinds. It lists them in the old proposal queue, where an approver
+  could mark one `approved`; that records permission and runs nothing. After rolling forward such an action shows as approved but
+  not run, and only your retry (with the hash) runs it. Reject anything you do not recognise.
+
+## Choices made where the design left room
+
+- The ledger is `AssistantProposal` with `dedupe_key` (contradiction 10); there is no migration.
+- Routes follow `/api/v1/assistant-*` and `rooms/<id>/external-actions`; the issue repository is data on the team (decision 1),
+  set per room and team by the room owner.
+- `actions.approvers` is not honoured for these kinds: approval for something that leaves the system is the account owner's alone.
+
+## Not built in this slice
+
+Web UI, the attention inbox (P08), a conversation view, calendar actions, any send. GitHub and Gmail were never called: tests use
+contract-level fake servers that speak the REST shapes.
+
+---
+
 # The screens (web UI for slices 1-3)
 
 The collaboration page (`collab.html`, and the same code embedded in the dashboard) has the screens for everything above. They

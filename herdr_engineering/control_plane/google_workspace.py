@@ -51,6 +51,8 @@ DRAFT_ID = re.compile(r"[A-Za-z0-9_\-]{1,64}")
 MAX_ADDRESSES, MAX_TO, MAX_SUBJECT, MAX_DRAFT_BODY = 10, 300, 200, 800
 MAX_SUMMARY, MAX_LOCATION, MAX_REMINDER = 200, 200, 40320
 THREAD_ID = DRAFT_ID
+ACTION_KEY = re.compile(r"[0-9a-f]{64}")
+ACTION_KEY_HEADER = "X-Herdr-Action-Key"
 MESSAGE_ID_HEADER = re.compile(r"<[^<>\s\x00-\x1f\x7f]{1,200}>\Z")
 _ADDRESS = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~\-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9.\-]{0,253}[A-Za-z0-9])?\Z")
 _RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})\Z")
@@ -608,23 +610,56 @@ class GoogleWorkspace:
                 raise GoogleError("reconnect_needed") from None
             raise
 
-    def create_draft(self, tenant: str, user: str, to: Any, subject: Any, body: Any) -> dict:
-        """Save a Gmail DRAFT in the person's own account. It is never delivered; the person reviews it in Gmail."""
+    def create_draft(self, tenant: str, user: str, to: Any, subject: Any, body: Any, *, thread_id: Any = None,
+                     in_reply_to: Any = None, action_key: Any = None) -> dict:
+        """Save a Gmail DRAFT in the person's own account. It is never delivered; the person reviews it in Gmail.
+
+        The keyword arguments are for an approved reply (team collaboration slice 5): ``thread_id`` and ``in_reply_to`` keep it in
+        the thread it answers, and ``action_key`` is written as a header ``X-Herdr-Action-Key`` (never into the body, which the
+        recipient would read) so a draft whose answer was lost can be found again by ``find_draft_by_key``."""
         self._require_gmail(tenant, user)
         from email.message import EmailMessage
         addrs, subj, text = self.validate_draft(to, subject, body)
+        if thread_id is not None and not (isinstance(thread_id, str) and THREAD_ID.fullmatch(thread_id)):
+            raise GoogleError("bad_request")
+        if in_reply_to is not None and not (isinstance(in_reply_to, str) and MESSAGE_ID_HEADER.match(in_reply_to)):
+            raise GoogleError("bad_request")
+        if action_key is not None and not (isinstance(action_key, str) and ACTION_KEY.fullmatch(action_key)):
+            raise GoogleError("bad_request")
         try:
             msg = EmailMessage()
             msg["To"], msg["Subject"] = ", ".join(addrs), subj
+            if in_reply_to:
+                msg["In-Reply-To"], msg["References"] = in_reply_to, in_reply_to
+            if action_key:
+                msg[ACTION_KEY_HEADER] = action_key
             msg.set_content(text)
             raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
         except (ValueError, TypeError, UnicodeError):
             raise GoogleError("bad_request") from None
-        data = self._write(tenant, user, "POST", f"{GMAIL}/drafts", {"message": {"raw": raw}})
+        data = self._write(tenant, user, "POST", f"{GMAIL}/drafts",
+                           {"message": {"raw": raw, **({"threadId": thread_id} if thread_id else {})}})
         did = data.get("id")
         if not isinstance(did, str) or not DRAFT_ID.fullmatch(did):
             raise GoogleError("unavailable")
         return {"id": did}
+
+    def find_draft_by_key(self, tenant: str, user: str, action_key: Any, scan: int = 50) -> dict | None:
+        """The draft whose ``X-Herdr-Action-Key`` header is ``action_key``, looked for among the ``scan`` newest drafts. Read only.
+        Best effort by design: Gmail has no search on a custom header, so an older draft is not seen (the caller documents this)."""
+        self._require_gmail(tenant, user)
+        if not (isinstance(action_key, str) and ACTION_KEY.fullmatch(action_key)):
+            raise GoogleError("bad_request")
+        listing = self._get(tenant, user, f"{GMAIL}/drafts", {"maxResults": max(1, min(int(scan), 100))})
+        for ref in (listing.get("drafts") or [])[:scan]:
+            did = ref.get("id") if isinstance(ref, dict) else None
+            if not isinstance(did, str) or not DRAFT_ID.fullmatch(did):
+                continue
+            draft = self._get(tenant, user, f"{GMAIL}/drafts/{did}", {"format": "metadata", "metadataHeaders": [ACTION_KEY_HEADER]})
+            msg = draft.get("message") if isinstance(draft.get("message"), dict) else {}
+            if self._headers(msg).get(ACTION_KEY_HEADER.lower()) == action_key:
+                return {"id": did}
+        return None
 
     def list_drafts(self, tenant: str, user: str, max_results: int = 20) -> list[dict]:
         self._require_gmail(tenant, user)

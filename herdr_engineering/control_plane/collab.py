@@ -44,6 +44,7 @@ from .collab_fabric_trust import FabricAuthMixin, FabricTrustMixin
 from .collab_federation import FederationMixin
 from .collab_team_briefs import BRIEF_NOTE as _TR_BRIEF_NOTE
 from .collab_team_briefs import TeamBriefsMixin
+from .collab_team_external import ExternalActionsMixin
 from .collab_team_roles import ROLE_FIELDS, TeamRolesMixin
 from .collab_team_rooms import TeamRoomsMixin
 from .collab_workbench import WorkbenchMixin
@@ -84,6 +85,7 @@ BULK_EVENTS = frozenset({"message", "comment_added", "comment_revised", "audit_d
                          # plan 3: the artifact bridge's audit trail (collab_artifacts); _apply ignores them
                          "artifact_tool_used", "artifact_commit_submitted", "artifact_upload_staged",
                          "suggestion_submitted",         # a guest can file one at will, so it stops early like chat
+                         "external_action_filed",        # slice 5: a filer can propose at will (audit record only)
                          "task_reminded"})               # the sweep's reminders stop early like chat
 # audit records only: committed, never wake a room's long-poll
 SILENT_EVENTS = frozenset({"workspace_terminal_authorized", "artifact_tool_used", "artifact_commit_submitted",
@@ -421,7 +423,8 @@ class _GroupClaim(NamedTuple):
 
 
 class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixin, TeamRoomsMixin, TeamRolesMixin,
-                    CoordinatorsMixin, TeamBriefsMixin, DirectMixin, FabricTrustMixin, FabricAuthMixin):
+                    CoordinatorsMixin, TeamBriefsMixin, DirectMixin, FabricTrustMixin, FabricAuthMixin,
+                    ExternalActionsMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -593,6 +596,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         self._init_fabric_trust()
         self._init_fabric_auth()
         self._init_team_briefs()
+        self._init_external_actions()
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -851,7 +855,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
         if (self._apply_workbench(ev) or self._apply_context(ev) or self._apply_attention(ev)
                 or self._apply_federation(ev) or self._apply_team_rooms(ev) or self._apply_team_roles(ev)
-                or self._apply_coordinators(ev) or self._apply_direct(ev)):
+                or self._apply_coordinators(ev) or self._apply_direct(ev) or self._apply_external_actions(ev)):
             return
         if t == "external_usage_reserved":
             k = (p["scope"], p["key"])
@@ -6970,6 +6974,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.team_role_view(pr, rid, parts[3])
                     if n == 5 and parts[2] == "teams" and parts[4] == "coordinator":
                         return 200, self.view_team_coordinator(pr, rid, parts[3])
+                    if n == 5 and parts[2] == "teams" and parts[4] == "issue-target":
+                        return 200, self.view_issue_target(pr, rid, parts[3])
+                    if parts[2:] == ["external-actions"]:
+                        return 200, self.list_external_actions(pr, rid)
                     if parts[2:] == ["coordination"]:
                         return 200, self.coordination_view(pr, rid)
                     if parts[2:] == ["my-tasks"]:
@@ -7194,6 +7202,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.attach_team(pr, rid, parts[3], body)
                     if n == 5 and parts[2] == "teams" and parts[4] == "detach":
                         return 200, self.detach_team(pr, rid, parts[3])
+                    if n == 5 and parts[2] == "teams" and parts[4] == "issue-target":
+                        return 200, self.set_issue_target(pr, rid, parts[3], body)
+                    if parts[2:] == ["external-actions"]:
+                        return self.file_external_action(pr, rid, body)
+                    if n == 5 and parts[2] == "external-actions" and parts[4] in ("decide", "retry"):
+                        return 200, self.decide_external_action(pr, rid, parts[3], body, "decision" if parts[4] == "decide" else "retry")
                     if n == 5 and parts[2] == "direct-tasks" and parts[4] == "cancel":
                         return 200, self.cancel_direct_task(pr, rid, parts[3])
                     if parts[2:] == ["direct-guests"]:

@@ -70,7 +70,8 @@ export function mountFeedbackPanel(container, client, artifactId, { signal } = {
       const page = await client.listArtifactAnnotations(artifactId, { status: state.status, limit: PAGE, before: append ? state.next : undefined, signal: aborter.signal });
       if (disposed || mine !== ticket) return;
       const rows = Array.isArray(page?.annotations) ? page.annotations : [];
-      state.rows = append ? state.rows.concat(rows) : rows;
+      const known = new Set(append ? state.rows.map(row => row.annotation_id) : []);
+      state.rows = (append ? state.rows : []).concat(rows.filter(row => !known.has(row.annotation_id) && known.add(row.annotation_id)));
       state.next = page?.next ?? null;
     } catch (error) {
       if (disposed || mine !== ticket) return;
