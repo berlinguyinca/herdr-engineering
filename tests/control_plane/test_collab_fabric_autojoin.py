@@ -25,8 +25,8 @@ from tests.control_plane.test_collab import BASE
 from tests.control_plane.test_collab_fabric_auth import (  # noqa: F401
     BEAST,
     BENDER,
-    SUFFIX,
     STRANGER,
+    SUFFIX,
     TAILNET,
     fabric_agent,
     fw,
