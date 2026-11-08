@@ -66,6 +66,7 @@ from .blobs import BlobAborted, BlobCorrupt, BlobMissing, BlobStore, InvalidSha
 from .cognito import CognitoAuthenticator, SyncedDirectory
 from .https_origin import https_origin
 from .library import LibraryError, LibraryStore, Viewer
+from .mcp import McpSurface
 from .member_api import MemberLimits, MemberService, MemberSurface, build_member_settings
 from .members_config import valid_public_host
 from .share_bundle import content_type_for
@@ -469,6 +470,9 @@ class PublicSurface:
         self._claims_seen: set[tuple[str, str]] = set()
         self.view_template = self._load_view_template()
         self.member = self._member_surface(now)
+        self.mcp = (
+            McpSurface(self.member.s, self.member.svc, not_found, now) if self.member else None
+        )
 
     def _member_surface(self, now: Callable[[], float]) -> MemberSurface | None:
         """The member page and API, or None (those paths are the uniform 404) unless fully configured."""
@@ -606,6 +610,8 @@ class PublicSurface:
         if not self.host_ok(request):
             return await self.deny("wrong_host")
         raw = request.raw_path
+        if self.mcp is not None and self.mcp.owns(raw):
+            return await self.mcp.handle(request)
         if self.member is not None and self.member.owns(raw):
             return await self.member.handle(request)
         if len(raw) > MAX_RAW_PATH or not raw.startswith("/s/"):

@@ -55,6 +55,7 @@ from urllib.parse import parse_qs
 import asyncpg
 from aiohttp import web
 
+from .agent_tokens import TOKEN_ID_RE, AgentTokenStore, TokenError
 from .blobs import BlobCorrupt, BlobMissing, BlobStore
 from .cognito import CognitoAuthenticator, SyncedDirectory
 from .db import LOCK_NS_BLOB
@@ -137,6 +138,7 @@ _BODY_KEYS: Final[dict[str, tuple[frozenset[str], frozenset[str]]]] = {
     ),
     "approve": (frozenset({"confirm", "idempotency_key"}), frozenset({"confirm"})),
     "folder": (frozenset({"name"}), frozenset({"name"})),
+    "agent_token": (frozenset({"label"}), frozenset()),
     "folder_item": (frozenset({"artifact_id"}), frozenset({"artifact_id"})),
 }
 
@@ -269,6 +271,7 @@ class MemberService:
         self._publishing = 0  # publishes in progress (each holds one pooled connection)
         self.content_streams = asyncio.Semaphore(limits.content_streams)
         self._staging = blobs.tmp_dir / "up"
+        self.tokens = AgentTokenStore(pool)
 
     # -- identity
 
@@ -536,6 +539,8 @@ class MemberService:
         """A new, empty, accepted artifact the member owns (a pending one is an agent push: ``LibraryStore.insert_artifact``
         with ``intake='pending'`` is its atomic path)."""
         member = self._member(actor)
+        # an agent's push waits for the owner's accept; the cap is counted atomically inside insert_artifact
+        intake = "pending" if actor.kind is ActorKind.AGENT else "accepted"
         title, filename = title.strip(), filename.strip()
         if (
             not 1 <= len(title) <= 200
@@ -579,7 +584,7 @@ class MemberService:
                 display_name=title,
                 filename=filename,
                 artifact_type=profile,
-                intake="accepted",
+                intake=intake,
                 conn=conn,
             )
             if idempotency_key is not None:
@@ -648,6 +653,38 @@ class MemberService:
         await self._drop_staging(member, artifact_id)
         await self._audit(member, "delete", "ok")
         return {"artifact_id": artifact_id, "deleted": True}
+
+    # -- agent tokens (minted and revoked by the signed-in member only)
+
+    def _user(self, actor: Actor) -> str:
+        if actor.kind is not ActorKind.USER:
+            raise MemberError(403, "forbidden", "forbidden")
+        return self._member(actor)
+
+    async def token_mint(self, actor: Actor, label: object) -> dict[str, Any]:
+        member = self._user(actor)
+        if label is not None and not isinstance(label, str):
+            raise _bad("label is invalid")
+        self._throttle_write(member)
+        try:
+            out = await self.tokens.mint(member, label or "")
+        except TokenError as exc:
+            raise MemberError(exc.status, exc.code, exc.message) from None
+        await self._audit(member, "token_mint", "ok")
+        return out
+
+    async def token_list(self, actor: Actor) -> dict[str, Any]:
+        return await self.tokens.list(self._user(actor))
+
+    async def token_revoke(self, actor: Actor, token_id: str) -> dict[str, Any]:
+        member = self._user(actor)
+        self._throttle_write(member)
+        try:
+            out = await self.tokens.revoke(member, token_id)
+        except TokenError as exc:
+            raise MemberError(exc.status, exc.code, exc.message) from None
+        await self._audit(member, "token_revoke", "ok")
+        return out
 
     # -- library
 
@@ -1814,6 +1851,9 @@ class MemberSurface:
             if rest == ["links"]:
                 self._query(query, set())
                 return ok(200, await svc.share_list(actor))
+            if rest == ["agent-tokens"]:
+                self._query(query, set())
+                return ok(200, await svc.token_list(actor))
             if n == 2 and rest[0] == "artifacts":
                 self._query(query, set())
                 return ok(200, await svc.head(actor, self._artifact(rest[1])))
@@ -1885,6 +1925,14 @@ class MemberSurface:
                     key,
                 ),
             )
+        if rest == ["agent-tokens"]:
+            b = await self._body(request, "agent_token")
+            return ok(200, await svc.token_mint(actor, b.get("label")))
+        if n == 3 and rest[0] == "agent-tokens" and rest[2] == "revoke":
+            if not TOKEN_ID_RE.fullmatch(rest[1]):
+                raise _not_found()
+            await self._body(request, None)
+            return ok(200, await svc.token_revoke(actor, rest[1]))
         if rest == ["signout"]:
             await self._body(request, None)
             return ok(200, await svc.signout(actor))

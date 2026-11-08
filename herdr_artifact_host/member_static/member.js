@@ -54,6 +54,17 @@ async function load() {
     }
     ul.append(li);
   }
+  await loadTokens();
+}
+async function loadTokens() {
+  const ul = $("tokens");
+  ul.replaceChildren();
+  for (const t of (await api("GET", "/agent-tokens")).tokens) {
+    const li = el("li");
+    li.append(el("span", (t.label || t.token_id) + (t.revoked ? " (revoked)" : "") + (t.last_used_at ? ", last used " + t.last_used_at : ", never used"), "grow"));
+    if (!t.revoked) { const b = el("button", "Revoke"); b.onclick = async () => { await api("POST", "/agent-tokens/" + t.token_id + "/revoke"); loadTokens(); }; li.append(b); }
+    ul.append(li);
+  }
 }
 async function open(id) {
   current = id;
@@ -134,6 +145,14 @@ $("new").onclick = async () => {
   if (!title) return;
   const r = await api("POST", "/artifacts", { title, filename: "index.html" });
   await load(); open(r.artifact_id);
+};
+$("tok-mint").onclick = async () => {
+  try {
+    const r = await api("POST", "/agent-tokens", { label: $("tok-label").value });
+    say("Agent token (shown once, copy it now): " + r.token);
+    $("tok-label").value = "";
+    await loadTokens();
+  } catch (e) { say(e.message); }
 };
 $("publish").onclick = () => publish().catch((e) => say(e.message));
 $("mk").onclick = async () => {

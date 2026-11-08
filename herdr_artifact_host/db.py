@@ -19,6 +19,7 @@ LOCK_NS_AUTHOR = (
 LOCK_NS_BLOB = (
     0x424C4F42  # "BLOB": a blob sha being written or reaped (member_api.publish and its cleanup)
 )
+LOCK_NS_AGENT_TOKEN = 0x41544B4E  # "ATKN": per-member agent token mint cap (agent_tokens.py)
 LOCK_NS_PENDING_CLAIM = 0x504E4443  # "PNDC": per-owner pending-intake claims (library.py, Task 6)
 
 
