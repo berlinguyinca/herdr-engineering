@@ -2295,6 +2295,11 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 allowed.add(name.lower())
             return allowed
 
+        def _is_fabric_join(self):
+            """``POST agents/fabric-join`` is authenticated by the tailnet machine alone (whois on the real peer): it carries no
+            Authorization header, and whatever one it carries is ignored."""
+            return self.command == "POST" and self.path.split("?")[0].rstrip("/") == "/api/v1/collab/agents/fabric-join"
+
         def _fabric_listener(self):
             """The dedicated fabric listener (tailnet address, no proxy, no TLS): the collab API and nothing else, and ONLY
             ``Authorization: Fabric``. Any other scheme (or none) is a 401 before the service sees it, so a Bearer token or an
@@ -2310,7 +2315,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             if not self._is_collab_path() or server.collab is None:
                 return self._deny(404, "not found")
             scheme, _, rest = self.headers.get("Authorization", "").partition(" ")
-            if scheme != "Fabric" or not rest.strip():
+            if (scheme != "Fabric" or not rest.strip()) and not self._is_fabric_join():
                 return self._deny(401, "unauthorized")
             return self._collab()
 
@@ -3167,6 +3172,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                                           self.headers.get("X-Herdr-Device"),
                                           operator=server.operator_user if operator else None,
                                           client=self._proxied_client(), fabric_listener=fabric,
+                                          fabric_owner=server.operator_user if fabric else None,
                                           **self._fabric_args())
             except Exception:
                 return self._json({"error": "internal error"}, 500)  # never echo internals
