@@ -42,7 +42,18 @@ _ROUTES: MappingProxyType[Role, frozenset[str]] = MappingProxyType(
                 "DELETE /api/member/{path}",
             }
         ),
-        Role.INTERNAL: frozenset({"GET /internal/healthz"}),
+        Role.INTERNAL: frozenset(
+            {
+                "GET /internal/healthz",
+                "GET /v1/feed",
+                "GET /v1/folders",
+                "GET /v1/items/{id}",
+                "GET /v1/items/{id}/versions",
+                "GET /v1/shares",
+                "GET /v1/search",
+                "GET /v1/content/{item}/{version}/{path}",
+            }
+        ),
         Role.HEALTH: frozenset({"GET /healthz"}),
     }
 )
