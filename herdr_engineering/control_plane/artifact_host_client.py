@@ -17,6 +17,7 @@ from __future__ import annotations
 import http.client
 import re
 import ssl
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ SHARE_PARAMS: Final = ("artifact_id", "state", "audience", "limit", "offset")
 _ID: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _SEGMENT_BAD: Final = re.compile(r"[\x00-\x1f\x7f\\]")
 MAX_PATH: Final = 1024
+CONTENT_DEADLINE: Final = 30.0       # total seconds one proxied content body may take (each read also has the timeout)
 # What a proxied content response may carry back to the browser (everything else, cookies and hop-by-hop included, is dropped).
 FORWARDED: Final = ("Content-Type", "Content-Security-Policy", "X-Content-Type-Options", "Content-Length")
 
@@ -80,12 +82,15 @@ def clean_path(value: object) -> list[str]:
 
 
 def csp_sandboxes(policy: str | None) -> bool:
-    """True when ``policy`` has a ``sandbox`` directive and grants no ``allow-same-origin``."""
+    """True only for a policy that fully sandboxes: a ``sandbox`` directive with NO ``allow-*`` token (so no scripts,
+    same-origin, forms or popups) and ``default-src 'none'``.  Anything else is not what the host promises."""
     if not policy:
         return False
-    directives = [d.strip().lower() for d in policy.split(";")]
-    sandboxed = any(d == "sandbox" or d.startswith("sandbox ") for d in directives)
-    return sandboxed and "allow-same-origin" not in policy.lower()
+    directives = [d.split() for d in (part.strip().lower() for part in policy.split(";")) if d]
+    sandboxes = [d for d in directives if d[0] == "sandbox"]
+    defaults = [d for d in directives if d[0] == "default-src"]
+    return (bool(sandboxes) and not any(t.startswith("allow-") for d in sandboxes for t in d[1:])
+            and len(defaults) == 1 and defaults[0][1:] == ["'none'"])
 
 
 @dataclass(frozen=True)
@@ -96,7 +101,8 @@ class ContentHead:
 
 
 class ArtifactHostClient:
-    def __init__(self, host_url: str, key: str, *, timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(self, host_url: str, key: str, *, timeout: float = DEFAULT_TIMEOUT,
+                 content_deadline: float = CONTENT_DEADLINE) -> None:
         parts = urlsplit(host_url)
         if parts.scheme not in {"http", "https"} or not parts.hostname or parts.query or parts.fragment or parts.username:
             raise ValueError("host_url must be an http(s) URL without credentials, query or fragment")
@@ -108,6 +114,7 @@ class ArtifactHostClient:
         self._prefix = parts.path.rstrip("/")
         self._key = key
         self.timeout = float(timeout)
+        self.content_deadline = float(content_deadline)
 
     def __repr__(self) -> str:
         return f"ArtifactHostClient({self._scheme}://{self._host}:{self._port}{self._prefix})"
@@ -160,7 +167,7 @@ class ArtifactHostClient:
             raise HostUnavailable(f"unexpected answer from the host ({status})")
         try:
             data = msgpack.unpackb(body, raw=False, strict_map_key=False)
-        except (msgpack.UnpackException, ValueError):
+        except (msgpack.UnpackException, ValueError, TypeError):
             raise HostUnavailable("host answer is not MessagePack") from None
         if status == 200 and isinstance(data, dict):
             return data
@@ -214,15 +221,21 @@ class ArtifactHostClient:
                 raise UnsafeContent("host content lacks the sandbox policy")
             if (response.getheader("X-Content-Type-Options") or "").strip().lower() != "nosniff" or not kind:
                 raise UnsafeContent("host content lacks nosniff or a content type")
+            if any(c in str(response.getheader(name) or "") for name in FORWARDED for c in "\r\n"):
+                raise UnsafeContent("host header carries a line break")
             length = response.getheader("Content-Length")
             size = int(length) if length and length.isdigit() else None
             head = ContentHead(tuple((name, response.getheader(name) or "") for name in FORWARDED
                                      if response.getheader(name) is not None), size)
 
+            started = time.monotonic()
+
             def chunks() -> Iterator[bytes]:
                 while True:
+                    if time.monotonic() - started > self.content_deadline:
+                        raise HostUnavailable("host content too slow")
                     try:
-                        block = response.read(CHUNK)
+                        block = response.read1(CHUNK)
                     except (OSError, http.client.HTTPException) as exc:
                         raise HostUnavailable(f"host unreachable ({type(exc).__name__})") from None
                     if not block:
@@ -232,7 +245,7 @@ class ArtifactHostClient:
             yield head, chunks()
 
 
-LIBRARY_KEYS: Final = frozenset({"host_url", "host_key", "viewers", "timeout_seconds"})
+LIBRARY_KEYS: Final = frozenset({"host_url", "host_key", "timeout_seconds"})
 MIN_KEY_CHARS: Final = 32
 MAX_TIMEOUT: Final = 30.0
 

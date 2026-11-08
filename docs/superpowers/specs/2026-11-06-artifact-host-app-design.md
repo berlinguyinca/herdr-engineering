@@ -107,10 +107,15 @@ public feed for the same fixture.
   boundary is real. The internal listener binds only to `artifact-internal`, never to a host port.
 - **The host runs its own background loop** for what the worker did for this feature: intent-free direct writes,
   expiry/revoke greying sweeps, pending intake caps, group-membership refresh and removed-member grace revocation.
-- **Untrusted HTML never renders in the dashboard origin.** The dashboard embeds `/v1/content/...` only in an
-  `<iframe sandbox>` (no `allow-same-origin`, no scripts unless the item type requires them in a separate origin) from
-  the host's internal listener, which sends `Content-Security-Policy: sandbox` and a different origin (own port) than
-  the dashboard.
+- **Untrusted HTML is proxied onto the dashboard origin, inert.** An iframe cannot send the bearer key and the
+  internal listener is reachable only on the Docker network, so cp-web proxies `/v1/content/<item>/<version>/<path>`
+  as `/api/v1/library/content/...` (operator role). The page is protected three ways: the host's
+  `Content-Security-Policy: sandbox; default-src 'none'...` is passed through unchanged (with `nosniff` and the exact
+  `Content-Type`); the dashboard embeds it only in `<iframe sandbox>` with no tokens (no `allow-same-origin`, no
+  scripts); and the proxy refuses (502) any response whose CSP lacks `sandbox` or has any `allow-*` token or lacks
+  `default-src 'none'`, that lacks `nosniff` or a type, or whose forwarded headers contain a line break. It forwards
+  only the content path (never an open proxy), strips auth and hop-by-hop headers, sets no cookie, never sends the
+  host key to the browser and cuts a body that exceeds a total deadline.
 - **MCP surface.** One path, `/mcp/artifacts`, served by the host (the seven artifact tools plus member push). The
   rooms server on `collab-public` is untouched and registers none of them.
 - **Read API redaction.** Share tokens and agent-token digests never leave the host: shares are returned with

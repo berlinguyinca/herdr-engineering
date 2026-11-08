@@ -74,6 +74,17 @@ test('the item page lists versions, files and shares, escapes them and has only 
   assert.match(renderLibraryItem({}), /not available/);
 });
 
+test('member-controlled file paths and share audiences are escaped on the item page', () => {
+  const evil = '"><img src=x onerror=alert(1)>.html';
+  const item = { artifact_id: 'a1', title: 't', owner: 'member:<i>x</i>', artifact_type: 'web<b>', current_version_id: 'v1', files: [{ path: evil, media_type: 'text/<u>', size: 1 }] };
+  const versions = [{ version_id: 'v1', version_number: 1, state: 'ready', current: true, created_at: null, files: item.files }];
+  const shares = [{ audience: '<script>alert(2)</script>', state: 's"><svg onload=1>', active: false, expires_at: null }];
+  const html = renderLibraryItem({ item, versions, shares });
+  for (const raw of ['<img', '<script', '<svg', '<i>x', '<b>', '<u>', 'onerror=alert(1)>']) assert.ok(!html.includes(raw), raw);
+  assert.match(html, /data-path="&quot;&gt;&lt;img src=x onerror=alert\(1\)&gt;\.html"/);
+  assert.match(html, /&lt;script&gt;alert\(2\)&lt;\/script&gt;/);
+});
+
 test('the search debounce is 150 ms and a refusal shows the server message', () => {
   assert.equal(SEARCH_DEBOUNCE_MS, 150);
   assert.equal(describe({ message: 'pending_cap', body: { message: 'You have 25 pending artifacts' } }), 'You have 25 pending artifacts');

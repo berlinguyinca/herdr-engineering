@@ -120,6 +120,11 @@ export function renderLibraryItem({ item = null, versions = [], shares = [], ver
 <section><h3>Preview</h3><div data-frame-slot><p class="muted">Open a file to preview it. It runs in a sandbox with no scripts.</p></div></section></div>`;
 }
 
+/** The frame guard takes origin-relative paths only: a same-origin absolute URL (a client with a base) is cut to its path. */
+const originPath = (url) => {
+  try { const u = new URL(url, globalThis.location?.origin); return u.origin === globalThis.location?.origin ? u.pathname + u.search : url; } catch { return url; }
+};
+
 export function mountLibraryItem(container, client, itemId, { freshness = () => null, versionId = null } = {}) {
   let disposed = false;
   const controller = new AbortController();
@@ -146,7 +151,7 @@ export function mountLibraryItem(container, client, itemId, { freshness = () => 
     if (el.dataset.action !== 'open-file' || !state.item) return;
     const slot = container.querySelector('[data-frame-slot]');
     const version = versionId || state.item.current_version_id || state.versions.find((v) => v.current)?.version_id || state.versions[0]?.version_id;
-    try { mountLibraryFrame(slot, { url: client.libraryContentUrl(state.item.artifact_id, version, el.dataset.path), title: el.dataset.path }); }
+    try { mountLibraryFrame(slot, { url: originPath(client.libraryContentUrl(state.item.artifact_id, version, el.dataset.path)), title: el.dataset.path }); }
     catch (error) { slot.textContent = describe(error); }
   };
   container.addEventListener('click', onClick);

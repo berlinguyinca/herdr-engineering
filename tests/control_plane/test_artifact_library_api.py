@@ -13,6 +13,7 @@ import http.client
 import http.server
 import json
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,7 +42,8 @@ from tests.artifact_host.conftest import (  # noqa: F401
 from tests.artifact_host.seed import FILES, Host
 
 HOST_KEY = "dash-read-key-" + "x" * 32
-KEYS = {"viewer-key": "viewer", "operator-key": "operator"}
+KEYS = {"viewer-key": "viewer", "operator-key": "operator", "ingest-key": "ingest", "agent-key": "agent",
+        "reviewer-key": "reviewer"}
 CSP = "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'"
 ROOT = Path(__file__).resolve().parents[2]
 TABLES = ("artifacts", "artifact_versions", "shares", "share_events", "library_items", "library_folders", "member_usage")
@@ -63,7 +65,7 @@ def _stop_host(host: Host, server: InternalServer) -> None:
     asyncio.run_coroutine_threadsafe(server.stop(), host.loop).result(30)
 
 
-def _get(port: int, path: str, key: str | None = "viewer-key", method: str = "GET", body: bytes | None = None,
+def _get(port: int, path: str, key: str | None = "operator-key", method: str = "GET", body: bytes | None = None,
          headers: dict[str, str] | None = None) -> tuple[int, dict[str, str], bytes]:
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
     sent = dict(headers or {})
@@ -176,6 +178,21 @@ def test_the_library_needs_a_dashboard_key(dash: Dash) -> None:
     assert dash.req("/api/v1/library", key="operator-key")[0] == 200
 
 
+@pytest.mark.parametrize("key,allowed", [("operator-key", True), ("viewer-key", False), ("ingest-key", False),
+                                         ("agent-key", False), ("reviewer-key", False)])
+def test_only_the_operator_role_reads_the_library(dash: Dash, key: str, allowed: bool) -> None:
+    s = _seed(dash.host, 1)[0]
+    for path in ("/api/v1/library", "/api/v1/library/folders", "/api/v1/library/shares",
+                 f"/api/v1/library/items/{s.artifact_id}", f"/api/v1/library/items/{s.artifact_id}/versions",
+                 f"/api/v1/library/content/{s.artifact_id}/{s.version_id}/index.html"):
+        status, headers, body = dash.req(path, key=key)
+        if allowed:
+            assert status == 200, (path, status)
+        else:
+            assert status == 403, (key, path, status)
+            assert "content-security-policy" not in headers and b"Report" not in body
+
+
 def test_the_host_key_never_reaches_the_browser(dash: Dash) -> None:
     s = _seed(dash.host, 1)[0]
     paths = ["/api/v1/library", "/api/v1/library/folders", f"/api/v1/library/items/{s.artifact_id}",
@@ -202,13 +219,19 @@ def test_no_library_write_route_exists_and_nothing_changes(dash: Dash, method: s
         for key in ("viewer-key", "operator-key"):
             status, headers, _ = dash.req(path, method=method, key=key, body=b'{"name":"x"}',
                                           headers={"Content-Type": "application/json"})
-            # 405 from the library itself; a viewer is refused (403) before routing; the server has no PUT handler at all (501)
+            # POST: 405 from the library itself (a viewer is refused 403 first); the other verbs are never routed to the
+            # library at all, so they get the server's flat 501 like any other resource that does not take them
             assert status in {403, 405, 501}, (method, path, key, status)
             if status == 405:
                 assert headers.get("allow") == "GET"
-            if key == "operator-key" and method in {"POST", "PATCH", "DELETE"}:
-                assert status == 405, (method, path, status)
+            if key == "operator-key":
+                assert status == (405 if method == "POST" else 501), (method, path, status)
     assert dash.counts() == before
+
+
+def test_the_dashboard_routes_no_library_verb_but_get_and_post_to_the_library_module() -> None:
+    text = (ROOT / "herdr_engineering/control_plane/api.py").read_text()
+    assert '"/api/v1/library/"' not in text and '| {"library"}' not in text and '{"assistant-apps", "library"}' not in text
 
 
 def test_the_library_modules_have_no_write_handler_and_the_client_only_gets() -> None:
@@ -315,7 +338,8 @@ def test_content_of_another_version_or_a_purged_one_is_404(dash: Dash) -> None:
 class Rogue:
     """A real HTTP server that answers every request with a configurable (unsafe) answer and logs what it received."""
 
-    def __init__(self, headers: list[tuple[str, str]], body: bytes = b"<script>alert(1)</script>") -> None:
+    def __init__(self, headers: list[tuple[str, str]], body: bytes = b"<script>alert(1)</script>",
+                 trickle: float | None = None) -> None:
         self.seen: list[tuple[str, dict[str, str]]] = []
         rogue = self
 
@@ -329,7 +353,16 @@ class Rogue:
                     self.send_header(name, value)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                if trickle is None:
+                    self.wfile.write(body)
+                    return
+                try:
+                    for i in range(len(body)):          # one byte at a time: each read is "in time", the whole is not
+                        self.wfile.write(body[i:i + 1])
+                        self.wfile.flush()
+                        time.sleep(trickle)
+                except OSError:
+                    pass
 
             def log_message(self, *args: object) -> None:
                 pass
@@ -350,9 +383,10 @@ class Rogue:
 def rogue_factory() -> Iterator[Any]:
     made: list[tuple[Rogue, ControlPlaneServer]] = []
 
-    def make(headers: list[tuple[str, str]]) -> tuple[Rogue, int]:
-        rogue = Rogue(headers)
-        server = _dashboard(ArtifactHostClient(rogue.url, HOST_KEY, timeout=3))
+    def make(headers: list[tuple[str, str]], body: bytes = b"<script>alert(1)</script>", trickle: float | None = None,
+             **client: Any) -> tuple[Rogue, int]:
+        rogue = Rogue(headers, body, trickle)
+        server = _dashboard(ArtifactHostClient(rogue.url, HOST_KEY, timeout=3, **client))
         made.append((rogue, server))
         return rogue, server.port
 
@@ -373,6 +407,14 @@ PATH = "/api/v1/library/content/art_1/ver_1/index.html"
      ("Content-Security-Policy", "default-src 'none'")],                                                      # no sandbox
     [("Content-Type", "text/html"), ("X-Content-Type-Options", "nosniff"),
      ("Content-Security-Policy", "sandbox allow-same-origin allow-scripts; default-src 'none'")],            # same-origin
+    [("Content-Type", "text/html"), ("X-Content-Type-Options", "nosniff"),
+     ("Content-Security-Policy", "sandbox allow-scripts; default-src 'none'")],                              # scripts
+    [("Content-Type", "text/html"), ("X-Content-Type-Options", "nosniff"),
+     ("Content-Security-Policy", "sandbox allow-popups-to-escape-sandbox; default-src 'none'")],             # any allow-*
+    [("Content-Type", "text/html"), ("X-Content-Type-Options", "nosniff"),
+     ("Content-Security-Policy", "sandbox; default-src *")],                                                  # open default-src
+    [("Content-Type", "text/html"), ("X-Content-Type-Options", "nosniff"),
+     ("Content-Security-Policy", "sandbox; img-src data:")],                                                  # no default-src
     [("Content-Type", "text/html"), ("Content-Security-Policy", CSP)],                                       # no nosniff
     [("X-Content-Type-Options", "nosniff"), ("Content-Security-Policy", CSP)],                               # no type
 ])
@@ -400,6 +442,42 @@ def test_hop_by_hop_cookie_and_auth_headers_from_the_host_are_stripped(rogue_fac
     sent = rogue.seen[0][1]
     assert sent["authorization"] == f"Bearer {HOST_KEY}"
     assert "cookie" not in sent and "x-api-key" not in sent
+
+
+@pytest.mark.parametrize("bad", ["Content-Type", "Content-Security-Policy"])
+def test_a_forwarded_header_value_with_a_line_break_is_refused_502(rogue_factory, bad: str) -> None:
+    folded = {"Content-Type": "text/html;\r\n charset=x", "Content-Security-Policy": CSP + ";\r\n x-evil: 1"}[bad]
+    headers = [(n, folded if n == bad else v) for n, v in GOOD]
+    rogue, port = rogue_factory(headers)
+    status, out, body = _get(port, PATH)
+    assert status == 502 and b"alert(1)" not in body and "content-security-policy" not in out
+
+
+@pytest.mark.parametrize("answer", [msgpack.packb({"items": [b"\xff\x00"]}), msgpack.packb({"x": msgpack.ExtType(5, b"ab")}),
+                                    msgpack.packb({b"k": 1}), b"\xc1"])
+def test_a_host_answer_json_cannot_carry_is_a_503(rogue_factory, answer: bytes) -> None:
+    rogue, port = rogue_factory([("Content-Type", "application/msgpack")], answer)
+    for path in ("/api/v1/library", "/api/v1/library/folders", "/api/v1/library/items/art_1"):
+        status, _, body = _get(port, path)
+        assert status == 503 and json.loads(body)["error"] == "library_unavailable", (path, status)
+
+
+def test_a_host_that_trickles_the_content_is_cut_off_at_the_total_deadline(rogue_factory) -> None:
+    rogue, port = rogue_factory(GOOD, b"x" * 400, trickle=0.1, content_deadline=0.6)
+    started = time.monotonic()
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+    got = b""
+    try:
+        conn.request("GET", PATH, headers={"X-API-Key": "operator-key"})
+        response = conn.getresponse()
+        assert response.status == 200
+        try:
+            got = response.read()
+        except http.client.IncompleteRead as exc:
+            got = exc.partial
+    finally:
+        conn.close()
+    assert len(got) < 400 and time.monotonic() - started < 6
 
 
 def test_the_proxy_is_not_an_open_proxy(rogue_factory) -> None:
@@ -432,3 +510,26 @@ def test_the_dashboards_own_artifacts_page_does_not_list_members_items(dash: Das
     _seed(dash.host)
     status, _, body = dash.req("/api/v1/artifacts")
     assert status == 200 and b"Report 0" not in body
+
+
+# ------------------------------------------------------------------------------------------ the host key stays out of logs
+
+def test_the_host_key_never_appears_in_logs_or_the_clients_repr(rogue_factory, dash: Dash, host: Host, caplog) -> None:
+    import logging
+    caplog.set_level(logging.DEBUG)
+    client = ArtifactHostClient("http://127.0.0.1:1", HOST_KEY, timeout=1)
+    assert HOST_KEY not in repr(client) and HOST_KEY not in str(client) and "dash-read" not in repr(client)
+    _stop_host(dash.host, dash.internal)                  # host down: the warning path
+    dash.stopped = True
+    dash.req("/api/v1/library")
+    dash.req("/api/v1/library/content/a/v/index.html")
+    _, port = rogue_factory([("Content-Type", "text/html")])             # unsafe content: the refusal path
+    _get(port, PATH)
+    _, port = rogue_factory([("Content-Type", "application/msgpack")], msgpack.packb({"x": b"\xff"}))
+    _get(port, "/api/v1/library")
+    for call in (client.feed, client.folders, client.shares):
+        with pytest.raises(Exception) as caught:
+            call()
+        assert HOST_KEY not in str(caught.value) and HOST_KEY not in repr(caught.value)
+    assert caplog.records and HOST_KEY not in caplog.text
+    assert all(HOST_KEY not in str(r.args) and HOST_KEY not in r.getMessage() for r in caplog.records)

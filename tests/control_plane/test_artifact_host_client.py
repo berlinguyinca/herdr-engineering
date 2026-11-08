@@ -63,11 +63,15 @@ def test_a_dead_port_is_unavailable_and_unknown_parameters_are_rejected_before_s
 
 
 @pytest.mark.parametrize("policy, ok", [
-    ("sandbox; default-src 'none'", True), ("default-src 'none'; sandbox", True), ("SANDBOX", True),
+    ("sandbox; default-src 'none'", True), ("default-src 'none'; sandbox", True), ("SANDBOX", False),
     (None, False), ("", False), ("default-src 'none'", False), ("sandbox allow-same-origin", False),
-    ("sandbox; x-sandbox-note", True), ("sandboxed", False),
+    ("sandbox; x-sandbox-note", False), ("sandboxed", False),
+    ("sandbox allow-scripts; default-src 'none'", False), ("sandbox allow-forms; default-src 'none'", False),
+    ("sandbox allow-popups-to-escape-sandbox; default-src 'none'", False), ("sandbox; default-src *", False),
+    ("sandbox; default-src 'none' https://x", False), ("sandbox; img-src data:", False),
+    ("sandbox; default-src 'none'; img-src data:", True),
 ])
-def test_only_a_sandboxing_policy_without_same_origin_counts(policy, ok) -> None:
+def test_only_a_fully_sandboxing_policy_counts(policy, ok) -> None:
     assert csp_sandboxes(policy) is ok
 
 
@@ -87,7 +91,9 @@ def test_settings_parse_and_refuse() -> None:
 
 def test_cp_web_wiring_builds_the_client_and_stops_on_bad_settings() -> None:
     assert cli._library_wiring({}) is None
-    assert cli._library_wiring({"artifact_library": {"viewers": {}}}) is None
+    assert cli._library_wiring({"artifact_library": {}}) is None
+    with pytest.raises(SystemExit, match="viewers"):                 # the old per-viewer ACL key is gone
+        cli._library_wiring({"artifact_library": {"viewers": {}, "host_url": "http://h:9", "host_key": KEY}})
     client = cli._library_wiring({"artifact_library": {"host_url": "http://h:9", "host_key": KEY}})
     assert isinstance(client, ArtifactHostClient)
     with pytest.raises(SystemExit, match="host_key"):

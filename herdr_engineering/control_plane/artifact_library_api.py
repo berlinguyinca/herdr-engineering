@@ -16,6 +16,7 @@ never sent to the browser.
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Final
 from urllib.parse import parse_qs, urlsplit
@@ -32,27 +33,6 @@ log = logging.getLogger("herdr.control_plane.artifact_library_api")
 
 PROXY_EXTRA_HEADERS: Final = (("Cache-Control", "no-store"), ("Referrer-Policy", "no-referrer"),
                               ("X-Frame-Options", "SAMEORIGIN"))
-
-
-def parse_library_viewers(raw: Any) -> dict[str, str]:
-    """``{"key:<digest>": "<member id>"}`` validated; ``ValueError`` names the bad entry."""
-    import re
-
-    from .artifact_members import member_principal
-    if raw is None:
-        return {}
-    if not isinstance(raw, dict):
-        raise ValueError("artifact_library.viewers must be a mapping of key:<digest> to a member id")
-    out: dict[str, str] = {}
-    for key, member in raw.items():
-        if not isinstance(key, str) or not re.fullmatch(r"key:[0-9a-f]{12}", key):
-            raise ValueError(f"artifact_library.viewers key {key!r} must look like key:<12 hex digits>")
-        try:
-            member_principal(member)
-        except ValueError:
-            raise ValueError(f"artifact_library.viewers[{key}] is not a valid member id") from None
-        out[key] = member
-    return out
 
 
 def _query(handler) -> dict[str, str]:
@@ -90,7 +70,7 @@ def route_library(handler, server, parts, resource) -> bool:
     """Handle ``/api/v1/library...``; false for any other path."""
     if resource != "library":
         return False
-    if handler._require("viewer"):
+    if handler._require("operator"):     # the library lists members' artifacts: the operator role, like the spec's dashboard-read
         return True
     if handler.command != "GET":
         handler.close_connection = True         # a body, if any, stays unread
@@ -108,7 +88,12 @@ def route_library(handler, server, parts, resource) -> bool:
         if action == "content":
             _proxy_content(handler, client, parts)
         else:
-            handler._json(_read(handler, client, action, parts))
+            answer = _read(handler, client, action, parts)
+            try:
+                json.dumps(answer)                  # MessagePack can carry what JSON cannot (bytes, extension types)
+            except (TypeError, ValueError):
+                raise HostUnavailable("host answer cannot be represented as JSON") from None
+            handler._json(answer)
     except BadReference:
         handler._deny(404, "not found")
     except HostRejected as exc:
@@ -158,4 +143,4 @@ def _proxy_content(handler, client, parts: list[str]) -> None:
         handler._json({"error": "unsafe_content", "message": "the host did not send a sandboxed response"}, 502)
 
 
-__all__ = ["parse_library_viewers", "route_library"]
+__all__ = ["route_library"]

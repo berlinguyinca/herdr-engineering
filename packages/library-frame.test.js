@@ -11,10 +11,11 @@ const doc = { createElement: (t) => new El(t) };
 
 test('only a library content route can be framed', () => {
   assert.ok(isContentUrl('/api/v1/library/content/a1/v1/index.html'));
-  assert.ok(isContentUrl('http://h/api/v1/library/content/a1/v1/data/x%20y.html'));
+  assert.ok(isContentUrl('/api/v1/library/content/a1/v1/data/x%20y.html'));
   for (const bad of ['', null, 'https://evil.example/', '/api/v1/library/items/a1', '/api/v1/artifacts/a1/versions/v1/rich',
     '/api/v1/library/content/a1/v1/', '/api/v1/library/content/a1/v1/../x', '/api/v1/library/content/a1/v1/%2e%2e/x',
-    '/api/v1/library/content/a1/v1/x?y#z', 'javascript:alert(1)', 'data:text/html,<p>']) {
+    '/api/v1/library/content/a1/v1/x?y#z', 'javascript:alert(1)', 'http://h/api/v1/library/content/a1/v1/index.html', 'https://evil.example/api/v1/library/content/a1/v1/x.html',
+    '//evil.example/api/v1/library/content/a1/v1/x.html', 'file:///api/v1/library/content/a1/v1/x', '\\evil/api/v1/library/content/a1/v1/x', 'data:text/html,<p>']) {
     assert.equal(isContentUrl(bad), false, String(bad));
   }
 });

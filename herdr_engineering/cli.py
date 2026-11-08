@@ -4261,17 +4261,6 @@ def _library_wiring(cp: dict):
     return settings.client() if settings is not None else None
 
 
-def _library_viewers(cp) -> dict[str, str]:
-    """``control_plane.artifact_library.viewers`` (YAML only): ``{"key:<digest>": "<member id>"}``, the dashboard keys that
-    read a member's library.  A malformed entry stops the start (it would silently show the wrong library)."""
-    from .control_plane.artifact_library_api import parse_library_viewers
-    section = cp.get("artifact_library") if isinstance(cp, dict) else None
-    try:
-        return parse_library_viewers(section.get("viewers") if isinstance(section, dict) else None)
-    except ValueError as exc:
-        raise SystemExit(f"fleet config {exc}") from None
-
-
 def _collab_grant_wiring(cp: dict, dsn: str | None):
     """(grant store adapter, enabled) when control_plane.collab_artifacts.enabled is exactly true and a DSN exists, else
     (None, False). The owner routes for collaborators, activity and diffs use the adapter's call path."""
@@ -4614,7 +4603,6 @@ def _cmd_cp_web(args) -> int:
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
                              annotation_store=annotation_store, member_admin=member_admin, library=library,
-                             library_viewers=_library_viewers(cp),
                              artifact_delete_owners=artifact_delete.digests,
                              artifact_delete_allow_keyless_owner=artifact_delete.allow_keyless,
                              collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled,
