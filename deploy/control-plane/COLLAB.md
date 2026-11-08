@@ -274,7 +274,8 @@ validates the slice and the compose files without printing any secret.
     listener). `control-plane-web` is NOT on a host network that reaches the internal role: it joins only
     `<prefix>-relay`, where the relay (GET-only `/v1/`, everything else 405/404) forwards to the internal role on
     `<prefix>-internal` (172.31.252.16/28, internal role at the fixed address .18). Set
-    `control_plane.artifact_library.host_url: http://artifact-host-relay:8091`.
+    `control_plane.artifact_library.host_url: http://artifact-host-relay:8091` (fleet validation refuses any other value
+    while the host is enabled). The relay streams (`proxy_buffering off`), so a blob larger than its tmpfs still arrives whole.
   - The database sits on its own network with the public, internal and migrate roles; db and internal cannot
     reach each other except through their own roles, and public and internal share no network.
 - Fixed names and addresses: the compose project (`herdr-artifact-host`), network prefix, both subnets and the
@@ -293,8 +294,9 @@ validates the slice and the compose files without printing any secret.
 - Rollback: the deploy records the previous state (`artifact-host.state`: `enabled` or `disabled`). A failed deploy
   rolls the control plane back with the overlay only if the previous release ran the host. If the host was off before,
   it is stopped again and the files this deploy installed are removed. If it was on and this deploy had not yet
-  touched the database, the previous host release is brought back from the rollback worktree. If roles or migrations
-  already ran, the host is not silently reverted (the previous code may not run against the changed schema): the
+  changed the schema (the applied-migration count did not move and the migration did not fail), the previous host
+  release is brought back from the rollback worktree and the previous roles.sql is re-applied. If a migration ran or
+  failed, the host is not silently reverted (the previous code may not run against the changed schema): the
   deploy exits 3 and prints the exact manual steps (stop the roles, `pg_restore` of the backup, redeploy the previous
   ref).
 - Python: `deploy.sh` runs the fleet commands with the repo's `.venv/bin/python` (override with
