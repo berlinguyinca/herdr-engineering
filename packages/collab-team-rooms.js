@@ -24,7 +24,7 @@ export const TEAM_ROLES = [['issue_writer', 'Issue writer'], ['implementer', 'Im
 export const GUEST_LEVELS = [
   ['read_only', 'Read only', 'Guests can read the room and nothing else.'],
   ['suggest', 'Suggest', 'A guest can file a request. It waits for you; nothing runs until you approve it.'],
-  ['direct', 'Direct (acts as Suggest for now)', 'Stored and checked, but not built yet: until it is, a guest still cannot assign work to anything.'],
+  ['direct', 'Direct', 'The guest can hand work to the team\'s agents directly, within the limits below. If Direct is switched off on this service it acts as Suggest.'],
 ];
 export const POLICIES = [
   ['escalate', 'Escalate', 'Nobody is chosen for them: the task is marked blocked and you are told.'],
@@ -170,7 +170,7 @@ function levelSection(model) {
     <div class="cx-row"><label class="cx-field">Per hour<input name="per_hour" type="number" min="1" max="100" value="${esc(limits.per_hour ?? '')}"></label>
       <label class="cx-field">Open at once<input name="max_open" type="number" min="1" max="50" value="${esc(limits.max_open ?? '')}"></label></div></fieldset>`;
   return `<section class="cx-stack" aria-labelledby="trr-h-level"><h3 class="hd-card__title" id="trr-h-level">Guests</h3>
-    <p class="cx-msg" data-trr-level="${esc(cur)}">Current level: <b>${esc(GUEST_LEVELS.find(([v]) => v === cur)?.[1] || cur)}</b>${cur !== str(st.data.behaves_as) ? `. It acts as ${esc(GUEST_LEVELS.find(([v]) => v === st.data.behaves_as)?.[1] || str(st.data.behaves_as))} for now` : ''}${st.data.explicit ? '' : ' (the default)'}.</p>
+    <p class="cx-msg" data-trr-level="${esc(cur)}">Current level: <b>${esc(GUEST_LEVELS.find(([v]) => v === cur)?.[1] || cur)}</b>${cur !== str(st.data.behaves_as) ? `. It acts as ${esc(GUEST_LEVELS.find(([v]) => v === st.data.behaves_as)?.[1] || str(st.data.behaves_as))} because Direct is switched off on this service` : ''}${st.data.explicit ? '' : ' (the default)'}.</p>
     <form class="cx-stack" data-trr-form="level" aria-label="Guest level"><fieldset class="cx-stack"><legend class="cx-msg">What guests may do in this room</legend>${radios}</fieldset>${direct}
       <div><button type="submit" class="hd-btn hd-btn--sm">Save guest level</button></div></form></section>`;
 }
@@ -463,7 +463,7 @@ export function createTeamRoom({ api, roomId, now = Date.now, confirm = () => tr
           return { invalid: true };
         }
         return run('owner', () => api.setGuestLevel(roomId, a.level, a.level === 'direct' ? a.limits : undefined),
-          a.level === 'direct' ? 'Saved. Direct is stored, but it acts as Suggest for now.' : 'Guest level saved.');
+          a.level === 'direct' ? 'Saved. Direct is stored, but it acts as Suggest while Direct is switched off on this service.' : 'Guest level saved.');
       }
       case 'approve': {
         const r = row(a.id);
