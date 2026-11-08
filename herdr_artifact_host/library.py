@@ -4,6 +4,17 @@
 ``artifact_acl.principal_id`` and ``share_claims.member_id``.  Anything the caller may not see (someone else's
 folder, an unreadable or missing artifact) is the same ``LibraryError(404, "not_found")``.  Every query is
 parameterized; the only SQL text built at runtime is placeholder numbering (``$n``), never user input.
+
+Identity convention (Tasks 5/6 and the importer must follow it): a member is always the BARE member id, never a
+``member:<id>`` principal.  That id is what goes in ``artifacts.owner``, ``library_folders.owner``,
+``artifact_acl.principal_id``, ``artifact_acl.granted_by``, ``share_claims.member_id`` and ``shares.created_by`` for
+member-created shares; "sharer" in the feed is whatever those columns hold.
+
+Writes take a ``Viewer`` and refuse ``OPERATOR_READ_ALL`` (403 ``read_only``) and a blank member id (400).
+
+The pending cap is NOT atomic: ``ensure_pending_capacity`` only counts.  Task 6 must run the count and the insert
+of a new pending artifact in ONE transaction holding ``pg_advisory_xact_lock(hashtext(owner))``, or concurrent
+pushes can exceed ``PENDING_CAP``.
 """
 
 from __future__ import annotations
@@ -53,13 +64,15 @@ PENDING_CAP_MESSAGE = f"You have {PENDING_CAP} pending artifacts; accept or disc
 
 NOT_FOUND = (404, "not_found")
 
-# Owned, or an unexpired ACL read/admin grant; tombstoned excluded.  $1 = member id, $2 = artifact id.
+# Same visibility as the feed: the owner sees their accepted or pending artifact; a grantee (unexpired ACL
+# read/admin) only an accepted one.  Retracted, tombstoned and discarded never.  $1 = member id, $2 = artifact id.
 READABLE_SQL = (
-    "SELECT 1 FROM artifacts a WHERE a.artifact_id=$2 AND a.lifecycle<>'tombstoned' AND "
-    "(a.owner=$1 OR EXISTS (SELECT 1 FROM artifact_acl acl "
+    "SELECT 1 FROM artifacts a WHERE a.artifact_id=$2 AND a.lifecycle NOT IN ('retracted','tombstoned') AND "
+    "((a.owner=$1 AND a.intake IN ('accepted','pending')) OR (a.intake='accepted' AND EXISTS ("
+    "SELECT 1 FROM artifact_acl acl "
     "WHERE acl.artifact_id=a.artifact_id AND acl.principal_id=$1 "
     "AND (acl.expires_at IS NULL OR acl.expires_at > now()) "
-    "AND acl.permissions && ARRAY['read','admin']))"
+    "AND acl.permissions && ARRAY['read','admin'])))"
 )
 
 _FOLDER_SELECT = (
@@ -97,16 +110,17 @@ OPERATOR_READ_ALL = Viewer(member_id="", read_all=True)
 
 def _member(viewer: Viewer) -> Viewer:
     """Writes and per-member state need a real member; the operator is read-only."""
-    if viewer.read_all or not viewer.member_id:
+    if viewer.read_all:
         raise LibraryError(403, "read_only", "this viewer is read-only")
+    if not viewer.member_id.strip():
+        raise LibraryError(400, "invalid_member", "a member id is required")
     return viewer
 
 
 @dataclass(frozen=True)
 class ItemRef:
-    """A pending item addressed by its owner and artifact id."""
+    """A pending item addressed by artifact id (the owner is the acting viewer)."""
 
-    owner: str
     artifact_id: str
 
 
@@ -196,7 +210,7 @@ SELECT a.artifact_id, coalesce(nullif(s.title,''), {_TITLE}), coalesce(s.created
        a.artifact_type, a.size_bytes
   FROM shares s JOIN artifacts a ON a.artifact_id=s.artifact_id
  WHERE s.state='live' AND s.audience='lab' AND (s.expires_at IS NULL OR s.expires_at > now())
-   AND (EXISTS (SELECT 1 FROM unnest(s.allow_emails) e WHERE lower(e)=$2) OR s.allow_groups && $3::text[])
+   AND (($2::text<>'' AND EXISTS (SELECT 1 FROM unnest(s.allow_emails) e WHERE lower(e)=$2)) OR s.allow_groups && $3::text[])
    AND a.intake='accepted' AND {_LIVE}
 UNION ALL
 SELECT a.artifact_id, coalesce(nullif(c.title,''), nullif(s.title,''), {_TITLE}), coalesce(c.sharer, s.created_by, ''),
@@ -246,28 +260,44 @@ class LibraryStore:
         if await self.count_pending(owner) >= PENDING_CAP:
             raise PendingCapExceeded
 
-    async def accept(self, item: ItemRef) -> None:
-        await self._settle(item, "accepted")
-
-    async def discard(self, item: ItemRef) -> None:
-        await self._settle(item, "discarded")
-
-    async def _settle(self, item: ItemRef, intake: str) -> None:
+    async def accept(self, viewer: Viewer, item: ItemRef) -> None:
+        owner = _member(viewer).member_id
         done = await self._pool.execute(
-            f"UPDATE artifacts SET intake=$3::intake_state, updated_at=now() WHERE artifact_id=$2 AND {_PENDING_LIVE}",
-            item.owner,
+            f"UPDATE artifacts SET intake='accepted', updated_at=now() WHERE artifact_id=$2 AND {_PENDING_LIVE}",
+            owner,
             item.artifact_id,
-            intake,
         )
         if done != "UPDATE 1":
             raise LibraryError(*NOT_FOUND)
+
+    async def discard(self, viewer: Viewer, item: ItemRef) -> None:
+        """Discard the viewer's own pending artifact: mark it discarded, retract it and revoke every share, in one
+        transaction (the control plane's member-delete effect)."""
+        owner = _member(viewer).member_id
+        async with self._pool.acquire() as conn, conn.transaction():
+            done = await conn.execute(
+                "UPDATE artifacts SET intake='discarded', lifecycle='retracted', updated_at=now() "
+                f"WHERE artifact_id=$2 AND {_PENDING_LIVE}",
+                owner,
+                item.artifact_id,
+            )
+            if done != "UPDATE 1":
+                raise LibraryError(*NOT_FOUND)
+            await conn.execute(
+                "WITH r AS (UPDATE shares SET state='revoked', revoked_at=now() "
+                "WHERE artifact_id=$2 AND state<>'revoked' RETURNING share_id) "
+                "INSERT INTO share_events (share_id, kind, actor) SELECT share_id, 'revoked', $1 FROM r",
+                owner,
+                item.artifact_id,
+            )
 
     async def can_read(self, member_id: str, artifact_id: str) -> bool:
         return await self._pool.fetchval(READABLE_SQL, member_id, artifact_id) is not None
 
     # --- folders --------------------------------------------------------------------------------------------
 
-    async def create_folder(self, owner: str, name: str) -> Folder:
+    async def create_folder(self, viewer: Viewer, name: str) -> Folder:
+        owner = _member(viewer).member_id
         cleaned = _clean_name(name)
         folder_id = "fld_" + secrets.token_hex(12)
         if (
@@ -294,7 +324,8 @@ class LibraryStore:
             raise LibraryError(409, "duplicate_name") from None
         return Folder(folder_id, owner, cleaned, 0)
 
-    async def rename_folder(self, owner: str, folder_id: str, name: str) -> Folder:
+    async def rename_folder(self, viewer: Viewer, folder_id: str, name: str) -> Folder:
+        owner = _member(viewer).member_id
         cleaned = _clean_name(name)
         try:
             updated = await self._pool.fetchval(
@@ -309,7 +340,8 @@ class LibraryStore:
             raise LibraryError(*NOT_FOUND)
         return await self._folder(owner, folder_id)
 
-    async def delete_folder(self, owner: str, folder_id: str) -> None:
+    async def delete_folder(self, viewer: Viewer, folder_id: str) -> None:
+        owner = _member(viewer).member_id
         deleted = await self._pool.fetchval(
             "DELETE FROM library_folders WHERE folder_id=$1 AND owner=$2 RETURNING folder_id",
             folder_id,
@@ -389,7 +421,8 @@ class LibraryStore:
                 source.value,
             )
 
-    async def unfile_artifact(self, owner: str, folder_id: str, artifact_id: str) -> None:
+    async def unfile_artifact(self, viewer: Viewer, folder_id: str, artifact_id: str) -> None:
+        owner = _member(viewer).member_id
         await self._folder(owner, folder_id)
         await self._pool.execute(
             "DELETE FROM library_items WHERE folder_id=$1 AND artifact_id=$2",
@@ -399,9 +432,10 @@ class LibraryStore:
 
     # --- claims ---------------------------------------------------------------------------------------------
 
-    async def record_claim(self, member_id: str, share_id: str) -> None:
+    async def record_claim(self, viewer: Viewer, share_id: str) -> None:
         """Keep a received share in the member's library.  Only a currently live public share can be claimed (a lab
         share is decided by its allow-list, never kept); title and sharer are snapshotted by the first claim."""
+        member_id = _member(viewer).member_id
         live = await self._pool.fetchval(
             "SELECT 1 FROM shares s JOIN artifacts a ON a.artifact_id=s.artifact_id "
             "WHERE s.share_id=$1 AND s.state='live' AND s.audience='public' "
@@ -426,6 +460,8 @@ class LibraryStore:
     async def feed(self, viewer: Viewer, query: FeedQuery) -> FeedPage:
         """Everything the viewer can see, one row per artifact (badge priority mine > assigned > opened), newest
         first.  Visibility, search and filters apply before LIMIT; ``total`` counts the filtered set.  Read-only."""
+        if not viewer.read_all:
+            _member(viewer)
         limit = max(1, min(int(query.limit), MAX_PAGE))
         offset = max(0, int(query.offset))
         if query.q and len(query.q) > MAX_QUERY:

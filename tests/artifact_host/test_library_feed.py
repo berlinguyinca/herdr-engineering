@@ -39,7 +39,7 @@ def test_owned_direct_lab_and_claimed_all_appear(migrated_dsn: str, who: Who) ->
         await share(pool, grp, who.you, groups=(who.g1,), title="Grp one")
         opened = await artifact(pool, who.you)
         sid = await share(pool, opened, who.you, audience="public", title="Link")
-        await store.record_claim(who.me, sid)
+        await store.record_claim(who.viewer, sid)
         page = await feed(store, who.viewer_in(who.g1))
         got = {i.artifact_id: i for i in page.items}
         assert page.total == 5 and page.next_offset is None
@@ -85,7 +85,7 @@ def test_dedupe_one_row_badge_priority_mine_over_assigned_over_opened(
 ) -> None:
     async def body(store: LibraryStore, pool: asyncpg.Pool) -> None:
         a = await artifact(pool, who.me)
-        await store.record_claim(who.me, await share(pool, a, who.me, audience="public"))
+        await store.record_claim(who.viewer, await share(pool, a, who.me, audience="public"))
         b = await artifact(pool, who.you)
         await share(pool, b, who.you, emails=(who.email,))
         page = await feed(store, who.viewer)
@@ -101,7 +101,7 @@ def test_revoked_share_stays_as_revoked_row_with_snapshot_title(
     async def body(store: LibraryStore, pool: asyncpg.Pool) -> None:
         a = await artifact(pool, who.you, name="Display")
         sid = await share(pool, a, who.you, audience="public", title="Snap")
-        await store.record_claim(who.me, sid)
+        await store.record_claim(who.viewer, sid)
         await pool.execute(
             "UPDATE shares SET state='revoked', title='Changed' WHERE share_id=$1", sid
         )
@@ -120,7 +120,7 @@ def test_expired_share_status_expired_read_live(migrated_dsn: str, who: Who) -> 
     async def body(store: LibraryStore, pool: asyncpg.Pool) -> None:
         a = await artifact(pool, who.you)
         sid = await share(pool, a, who.you, audience="public", expires=NOW + timedelta(hours=1))
-        await store.record_claim(who.me, sid)
+        await store.record_claim(who.viewer, sid)
         assert (await feed(store, who.viewer)).items[0].status == ItemStatus.ACTIVE
         await pool.execute(
             "UPDATE shares SET expires_at=now() - interval '1 minute' WHERE share_id=$1", sid
@@ -158,7 +158,7 @@ def test_retracted_artifact_vanishes_for_grantee_lab_recipient_and_claimant(
         await share(pool, a, who.you, groups=(who.g1,))
         c = await artifact(pool, who.you, name="Gone link")
         sid = await share(pool, c, who.you, audience="public")
-        await store.record_claim(who.me, sid)
+        await store.record_claim(who.viewer, sid)
         assert (await feed(store, who.viewer_in(who.g1), sources=EVERYTHING)).total == 2
         await pool.execute(
             "UPDATE artifacts SET lifecycle='retracted' WHERE artifact_id IN ($1,$2)", a, c
@@ -167,7 +167,7 @@ def test_retracted_artifact_vanishes_for_grantee_lab_recipient_and_claimant(
             page = await feed(store, viewer, sources=EVERYTHING)
             assert page.items == [], viewer.member_id
         with pytest.raises(LibraryError):
-            await store.record_claim(who.you, sid)
+            await store.record_claim(who.other, sid)
 
     run(migrated_dsn, body)
 
@@ -215,7 +215,7 @@ def test_revoked_opened_row_has_blank_type_and_size(migrated_dsn: str, who: Who)
             "UPDATE artifacts SET artifact_type='report', size_bytes=99 WHERE artifact_id=$1", a
         )
         sid = await share(pool, a, who.you, audience="public")
-        await store.record_claim(who.me, sid)
+        await store.record_claim(who.viewer, sid)
         (live,) = (await feed(store, who.viewer)).items
         assert (live.artifact_type, live.size_bytes) == ("report", 99)
         await pool.execute("UPDATE shares SET state='revoked' WHERE share_id=$1", sid)

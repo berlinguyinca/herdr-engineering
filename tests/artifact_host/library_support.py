@@ -29,6 +29,10 @@ class Who:
     def viewer(self) -> Viewer:
         return Viewer(self.me, self.email, frozenset())
 
+    @property
+    def other(self) -> Viewer:
+        return Viewer(self.you)
+
     def viewer_in(self, *groups: str) -> Viewer:
         return Viewer(self.me, self.email, frozenset(groups))
 

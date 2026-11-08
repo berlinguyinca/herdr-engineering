@@ -31,7 +31,7 @@ def test_q_matches_title_filename_sharer_folder_name_and_share_title(
         by_file = await mine(pool, who, None, original_filename="roadmap-final.pdf")
         by_type = await mine(pool, who, "Plain", artifact_type="spreadsheet")
         by_folder = await mine(pool, who, "Plain two")
-        folder = await store.create_folder(who.me, "Onboarding")
+        folder = await store.create_folder(who.viewer, "Onboarding")
         await store.file_artifact(who.viewer, folder.folder_id, by_folder)
         sharer = await artifact(pool, who.you, name="Zed")
         await share(pool, sharer, who.you, emails=(who.email,), title="Zed")
@@ -99,7 +99,7 @@ def test_revoked_row_does_not_leak_filename(migrated_dsn: str, who: Who) -> None
             "UPDATE artifacts SET original_filename='secret-name.pdf' WHERE artifact_id=$1", a
         )
         sid = await share(pool, a, who.you, audience="public", title="Pub")
-        await store.record_claim(who.me, sid)
+        await store.record_claim(who.viewer, sid)
         assert await ids(store, who.viewer, "secret-name") == {a}
         await pool.execute("UPDATE shares SET state='revoked' WHERE share_id=$1", sid)
         assert await ids(store, who.viewer, "secret-name") == set()
@@ -109,7 +109,7 @@ def test_revoked_row_does_not_leak_filename(migrated_dsn: str, who: Who) -> None
 
 def test_combined_filters_are_anded(migrated_dsn: str, who: Who) -> None:
     async def body(store: LibraryStore, pool: asyncpg.Pool) -> None:
-        folder = await store.create_folder(who.me, "F")
+        folder = await store.create_folder(who.viewer, "F")
         old = NOW - timedelta(days=30)
         hit = await mine(pool, who, "Hit", artifact_type="report")
         await store.file_artifact(who.viewer, folder.folder_id, hit)
@@ -163,7 +163,7 @@ def test_search_never_returns_artifacts_member_cannot_see(migrated_dsn: str, who
     async def body(store: LibraryStore, pool: asyncpg.Pool) -> None:
         secret = await artifact(pool, who.you, name="secret plans")
         await share(pool, secret, who.you, emails=("nobody@x.org",), title="secret plans")
-        theirs = await store.create_folder(who.you, "secret folder")
+        theirs = await store.create_folder(who.other, "secret folder")
         await store.file_artifact(Viewer(who.you), theirs.folder_id, secret)
         visible = await mine(pool, who, "visible")
         assert (await feed(store, who.viewer, q="secret")).total == 0
@@ -171,7 +171,7 @@ def test_search_never_returns_artifacts_member_cannot_see(migrated_dsn: str, who
             await feed(store, who.viewer, folder_id=theirs.folder_id)
         ).total == 0  # empty page, not 404
         # another member's folder name never matches my artifacts
-        other = await store.create_folder(who.you, "visible-folder-xyz")
+        other = await store.create_folder(who.other, "visible-folder-xyz")
         await pool.execute(
             "INSERT INTO library_items (folder_id, artifact_id, source) VALUES ($1,$2,'manual')",
             other.folder_id,
