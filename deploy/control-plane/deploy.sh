@@ -609,6 +609,9 @@ COMPOSE_FILES=(-f "$WORK/deploy/control-plane/compose.yaml" "${COLLAB_FILES[@]}"
 if [ "$WEB_EGRESS_COMPOSE_ENABLED" = 1 ]; then
   COMPOSE_FILES+=(-f "$WEB_EGRESS_OVERLAY")
 fi
+if [ "$ARTIFACT_HOST" = 1 ] && [ -f "$WORK/deploy/control-plane/compose.artifact-host.yaml" ]; then
+  COMPOSE_FILES+=(-f "$WORK/deploy/control-plane/compose.artifact-host.yaml")
+fi
 export HERDR_CP_WEB_EGRESS_CIDR="$MEMORY_PRIVATE_EGRESS_CIDR"
 export HERDR_CP_WEB_EGRESS_GENERATION="$WEB_EGRESS_GENERATION"
 # Every service of ours that runs the herdr-engineering image and reads the fleet
@@ -626,6 +629,14 @@ if [ "$DRY" = 1 ]; then
     else
       echo "[dry-run] docker compose config FAILED (details withheld; they could contain values)" >&2
       exit 1
+    fi
+    if [ "$ARTIFACT_HOST" = 1 ]; then
+      if HERDR_ARTIFACT_HOST_TAG="$TAG" docker compose -p "$AH_PROJECT" -f "$WORK/deploy/artifact-host/compose.yaml" config -q >/dev/null 2>&1; then
+        echo "[dry-run] artifact host docker compose config: valid"
+      else
+        echo "[dry-run] artifact host docker compose config FAILED (details withheld; they could contain values)" >&2
+        exit 1
+      fi
     fi
   else
     echo "[dry-run] docker compose not available: skipped offline compose validation"
