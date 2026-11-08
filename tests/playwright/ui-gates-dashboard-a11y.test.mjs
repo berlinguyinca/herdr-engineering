@@ -26,26 +26,26 @@ const KNOWN = {   // light-theme colour-contrast and focus-indicator-contrast fi
     'phone (375px) light': {},
   },
   'dashboard-assistant-proposals': {
-    'desktop light': {'heading-order': 1, 'focus-visible': 16},
-    'desktop dark': {'heading-order': 1, 'color-contrast': 1, 'focus-visible': 16},
-    'phone (375px) light': {'heading-order': 1, 'focus-visible': 15},
+    'desktop light': {'heading-order': 1},
+    'desktop dark': {'heading-order': 1, 'color-contrast': 1},
+    'phone (375px) light': {'heading-order': 1},
   },
   'dashboard-assistant-notifications': {
-    'desktop light': {'focus-visible': 9},
-    'desktop dark': {'color-contrast': 1, 'focus-visible': 9},
-    'phone (375px) light': {'focus-visible': 8},
+    'desktop light': {},
+    'desktop dark': {'color-contrast': 1},
+    'phone (375px) light': {},
   },
   'dashboard-assistant-approvals': {
-    'desktop light': {'focus-visible': 9},
-    'desktop dark': {'color-contrast': 1, 'focus-visible': 9},
-    'phone (375px) light': {'focus-visible': 8},
+    'desktop light': {},
+    'desktop dark': {'color-contrast': 1},
+    'phone (375px) light': {},
   },
   // Apps, blocked calendars, Drafts, Reminders and the generic connector list (measured 2026-10-30). Same page-level findings as the other
   // assistant tabs (the unlabelled chat input, h1 then h3, the shared button focus ring and muted-text contrast); nothing of its own.
   'dashboard-assistant-connectors': {
-    'desktop light': {'heading-order': 1, 'focus-visible': 19},
-    'desktop dark': {'heading-order': 1, 'color-contrast': 1, 'focus-visible': 19},
-    'phone (375px) light': {'heading-order': 1, 'focus-visible': 18},
+    'desktop light': {'heading-order': 1},
+    'desktop dark': {'heading-order': 1, 'color-contrast': 1},
+    'phone (375px) light': {'heading-order': 1},
   },
 };
 const RUNS = [['desktop light', 'desktop', 'light'], ['desktop dark', 'desktop', 'dark'], ['phone (375px) light', 'mobile', 'light']];
