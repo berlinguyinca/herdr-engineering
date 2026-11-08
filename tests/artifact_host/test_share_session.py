@@ -427,7 +427,7 @@ def test_modules_import_and_fail_clearly_without_cryptography():
         "            raise ImportError('blocked')\n"
         "sys.meta_path.insert(0, Block())\n"
         "import herdr_artifact_host.share_session\n"
-        "from herdr_engineering.control_plane import share_session as ss\n"
+        "from herdr_artifact_host import share_session as ss\n"
         "assert ss.MIN_SECRET_BYTES == 32\n"
         "try:\n"
         "    ss.mint_session(b'x' * 32, 'shr-1', 'alice', 2_000_000_000, email='a@b.co', basis='e')\n"
@@ -452,3 +452,70 @@ def test_claim_domain_and_key_labels_are_unchanged():
     assert ss.CLAIM_DOMAIN == b"herdr-claim-v1"
     assert ss._CLAIM_KEY_LABEL == b"herdr-claim-aead-key-v1"
     assert ss._KEY_LABELS[ss.CLAIM_DOMAIN] == ss._CLAIM_KEY_LABEL
+
+
+WRITE_SESSION = "e.1900000100.blob"
+
+
+def test_write_cookie_round_trip_and_name_shape():
+    name = ss.write_cookie_name("shr-1", WRITE_SESSION)
+    assert re.fullmatch(r"hw_[0-9a-f]{16}", name)
+    assert name == ss.write_cookie_name("shr-1", WRITE_SESSION)
+    assert (
+        name
+        != ss.write_cookie_name("shr-2", WRITE_SESSION)
+        != ss.write_cookie_name("shr-1", WRITE_SESSION + "x")
+    )
+    value = ss.write_cookie_value(SECRET, "shr-1", WRITE_SESSION)
+    assert re.fullmatch(r"[A-Za-z0-9_-]{43}", value)
+    assert ss.check_write_cookie(SECRET, "shr-1", WRITE_SESSION, [f"a=b; {name}={value}; c=d"])
+    assert ss.check_write_cookie(SECRET, "shr-1", WRITE_SESSION, ["x=y", f"{name}={value}"])
+
+
+def test_write_cookie_value_is_domain_separated():
+    value = ss.write_cookie_value(SECRET, "shr-1", WRITE_SESSION)
+    assert value != csrf_token(SECRET, "shr-1", WRITE_SESSION)
+    assert value not in WRITE_SESSION
+
+
+def test_write_cookie_rejections():
+    name = ss.write_cookie_name("shr-1", WRITE_SESSION)
+    value = ss.write_cookie_value(SECRET, "shr-1", WRITE_SESSION)
+    tampered = value[:-1] + ("A" if value[-1] != "A" else "B")
+    assert not ss.check_write_cookie(SECRET, "shr-1", WRITE_SESSION, [f"{name}={tampered}"])
+    assert not ss.check_write_cookie(b"B" * 48, "shr-1", WRITE_SESSION, [f"{name}={value}"])
+    assert not ss.check_write_cookie(SECRET, "shr-2", WRITE_SESSION, [f"{name}={value}"])
+    assert not ss.check_write_cookie(SECRET, "shr-1", "other.session", [f"{name}={value}"])
+    assert not ss.check_write_cookie(
+        SECRET, "shr-1", WRITE_SESSION, [f"hw_0000000000000000={value}"]
+    )
+    assert not ss.check_write_cookie(
+        SECRET, "shr-1", WRITE_SESSION, [f"{name}={value}x", f"{name}="]
+    )
+    for junk in (None, [], [""], [None], 5):
+        assert not ss.check_write_cookie(SECRET, "shr-1", WRITE_SESSION, junk)
+    assert not ss.check_write_cookie(b"short", "shr-1", WRITE_SESSION, [f"{name}={value}"])
+
+
+@pytest.mark.parametrize(
+    "secret, share_id, session",
+    [
+        (b"short", "s", "x"),
+        ("str", "s", "x"),
+        (SECRET, "", "x"),
+        (SECRET, "s", ""),
+        (SECRET, None, "x"),
+    ],
+)
+def test_write_cookie_value_refuses_bad_input(secret, share_id, session):
+    with pytest.raises(ValueError):
+        ss.write_cookie_value(secret, share_id, session)
+
+
+def test_write_cookie_header_attributes_and_expiry():
+    header = ss.write_cookie_header(SECRET, "shr-1", "TOK", WRITE_SESSION, 600)
+    name = ss.write_cookie_name("shr-1", WRITE_SESSION)
+    value = ss.write_cookie_value(SECRET, "shr-1", WRITE_SESSION)
+    assert header == f"{name}={value}; Max-Age=600; Path=/s/TOK/; HttpOnly; Secure; SameSite=Strict"
+    assert "Max-Age=0;" in ss.write_cookie_header(SECRET, "shr-1", "TOK", WRITE_SESSION, -5)
+    assert ss.check_write_cookie(SECRET, "shr-1", WRITE_SESSION, [header.split(";")[0]])

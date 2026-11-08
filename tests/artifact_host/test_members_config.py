@@ -1,4 +1,4 @@
-"""control_plane.collab.members: one parser, one limits type (Task 11)."""
+"""The member-channel config: one parser, one limits type (its config section is ``control_plane.collab.members``)."""
 
 from __future__ import annotations
 

@@ -163,3 +163,18 @@ def test_control_plane_wheel_excludes_host() -> None:
     assert find["include"] == ["herdr_engineering*"]
     assert "herdr-artifact-host" not in root["project"]["scripts"]
     assert "herdr_artifact_host" not in root["tool"]["setuptools"]["package-data"]
+
+
+# Tests that deliberately name the control plane: this file (it defines the rule) and the token cross-check, which
+# compares the host's generated tokens.css with the control plane's file by path. Delete the second with the originals.
+TEST_EXCEPTIONS = {"test_boundary.py", "test_share_tokens.py"}
+
+
+def test_host_tests_do_not_reference_the_control_plane():
+    tests_dir = Path(__file__).parent
+    offenders = [
+        p.name
+        for p in sorted(tests_dir.glob("*.py"))
+        if p.name not in TEST_EXCEPTIONS and FORBIDDEN in p.read_text()
+    ]
+    assert offenders == []

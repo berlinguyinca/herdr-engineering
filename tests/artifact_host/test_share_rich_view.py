@@ -81,3 +81,13 @@ def test_with_toggle_refuses_a_page_without_the_expected_policy_and_header(page)
 def test_select_author_asset_uses_the_dashboard_rule():
     a = asset("a")
     assert share_rich.select_author_asset({"assets": [a]}) is a
+
+
+def test_pick_html_asset_refuses_ambiguous_choices():
+    two_previews = {"assets": [asset("a"), asset("b")]}
+    two_data = {"assets": [asset("a", role="data"), asset("b", role="data")]}
+    assert rich.pick_html_asset(two_previews) is None
+    assert rich.pick_html_asset(two_data) is None
+    assert (
+        rich.pick_html_asset({"assets": [asset("a"), asset("b"), asset("c", role="data")]}) is None
+    )
