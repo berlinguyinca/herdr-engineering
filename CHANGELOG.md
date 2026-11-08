@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Share panel polish
+
+- The Version and Audience labels now stack their select with a 4px gap, the sharing tab buttons are separated by a 6px gap (and wrap), and the author-HTML checkbox glyph is 18px instead of the browser's 13px.
+
 ### Rich view: cross-engine and phone-width verification
 
 - `tests/playwright/share-rich-view.test.mjs` now runs per engine (`BROWSERS`, default chromium,firefox; webkit opt-in with the software-Mesa workaround) and adds 390x844 light/dark checks (no horizontal scroll, 24x24 target, tap and keyboard) for the public share toggle and frame.
