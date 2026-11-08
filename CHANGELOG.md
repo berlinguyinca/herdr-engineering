@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Report Evidence and Downloads tables are readable at phone width
+
+- Below 600px (screen only) each row of the Evidence and Downloads tables becomes a labelled block, so no column is cut off and nothing scrolls sideways inside the table. Desktop keeps the real table; print keeps it too, with its repeating header; `#evidence-...` anchors still work. Applies to the public share viewer and the dashboard preview (same renderer).
+- Labels come from the column position in CSS, because the sanitiser keeps no `data-*` attributes and its allowlist is unchanged. The table carries explicit ARIA roles (and keeps its header row, visually hidden) because browsers drop table semantics once `display` changes. The roles and classes are only emitted with the full stylesheet, so the 4 KiB minimum-cap envelope is unchanged.
+- `report-how-to-read`, `report-anchors` and `report-print` Playwright tests now honour `BROWSERS` (default `chromium,firefox`; a missing engine is skipped). `page.pdf()` checks stay Chromium-only. New `report-narrow-tables` test.
+
 ### Report previews open with a "How to read this report" legend
 
 - A collapsed-by-default `<details>` under the report title explains only what that report shows: findings, the question/evidence/figure tags, limits, next checks, a figure's reading guide, downloads and the `#` permalinks. Every row is derived from what the renderer emits. The descriptor has no severity or confidence field, so the legend says "Severity, confidence: Not used" instead of inventing a scale. The text is static (never copied from the report) and the summary is a native, keyboard-operable control with a visible focus ring.

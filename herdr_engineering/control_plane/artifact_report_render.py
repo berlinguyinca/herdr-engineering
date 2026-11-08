@@ -92,6 +92,33 @@ _CORE_CSS = (
     ".rp{max-width:860px;margin:0 auto;padding:32px 16px 64px;background:var(--bg);color:var(--text);"
     "font:15px/1.6 var(--sans);overflow-wrap:break-word}a{color:var(--link)}.fig-img{max-width:100%;height:auto}"
 ) + _PRINT_BASE
+_TABLE_HEADS = {
+    "evidence": ("Evidence", "Description", "Files"),
+    "downloads": ("Name", "Role", "Type", "Size", "SHA-256"),
+}
+_NARROW_TABLE_PX = 600
+
+
+def _stacked_table_css() -> str:
+    """Below ~600px each row becomes a labelled block, so no column is cut off or needs a sideways scroll.
+
+    The sanitiser keeps no ``data-*`` attributes, so the labels come from the column position (``td:nth-child``), one
+    short rule per cell. The tables carry ``role`` attributes because browsers drop table semantics once ``display`` changes.
+    Screen only: print keeps the real table with its repeating header."""
+    labels = "".join(f'table.t-{name} td:nth-child({i + 1})::before{{content:"{head}"}}'
+                     for name, heads in _TABLE_HEADS.items() for i, head in enumerate(heads))
+    return (
+        f"@media screen and (max-width:{_NARROW_TABLE_PX}px){{"
+        ".tablewrap{overflow:visible;border:0;background:none}table{min-width:0;display:block}tbody{display:block}"
+        "thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}"
+        "tr{display:block;margin:0 0 12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface)}"
+        ".tablewrap tr td{display:block;border-bottom:1px solid var(--border);padding:8px 12px;min-width:0}"
+        ".tablewrap tr td:last-child{border-bottom:0}td.num{white-space:normal}td .chip{white-space:normal}"
+        "td::before{display:block;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:2px}"
+        + labels + "}"
+    )
+
+
 _FULL_CSS = _CORE_CSS + (
     ".rp *{box-sizing:border-box}.rp section{margin:40px 0 0;min-width:0}"
     ".hero{padding-bottom:20px;border-bottom:1px solid var(--border)}"
@@ -146,6 +173,7 @@ _FULL_CSS = _CORE_CSS + (
     ".howto dt{font-family:inherit;font-weight:600;color:var(--text)}.howto dd{color:var(--muted)}"
     "@media (max-width:640px){.howto dl{grid-template-columns:1fr;gap:2px 0}.howto dd{margin-bottom:8px}}"
     "@media (max-width:640px){h1{font-size:25px}.rp{padding-top:20px}}"
+    + _stacked_table_css()
     + _PRINT_FULL
 )
 # Heading permalinks cost ~130 bytes each; a cap below this keeps the page plain rather than starving its content.
@@ -308,16 +336,16 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
     def evidence_row(row: dict) -> str:
         files = " ".join(f'<a class="chip" href="{links[asset_id]}">{text(asset_id, 128)}</a>'
                          for asset_id in row.get("asset_ids", [])) or "&mdash;"
-        return (f'<tr id="evidence-{esc_id(row["id"])}"><td><strong>{text(row["title"], 256)}</strong>'
+        return (f'<tr id="evidence-{esc_id(row["id"])}" role="row"><td role="cell"><strong>{text(row["title"], 256)}</strong>'
                 f'<br><span class="mono">{text(row["id"], 128)}</span></td>'
-                f'<td>{text(row["description"])}</td><td>{files}</td></tr>')
+                f'<td role="cell">{text(row["description"])}</td><td role="cell">{files}</td></tr>')
 
     def asset_row(row: dict) -> str:
-        return (f'<tr><td><a href="{links[row["id"]]}">{text(row["name"], 256)}</a></td>'
-                f'<td>{text(row["role"])}</td><td>{text(row["media_type"])}</td>'
-                f'<td class="num" title="{int(row["size_bytes"])} bytes">{_size(int(row["size_bytes"]))}'
+        return (f'<tr role="row"><td role="cell"><a href="{links[row["id"]]}">{text(row["name"], 256)}</a></td>'
+                f'<td role="cell">{text(row["role"])}</td><td role="cell">{text(row["media_type"])}</td>'
+                f'<td class="num" role="cell" title="{int(row["size_bytes"])} bytes">{_size(int(row["size_bytes"]))}'
                 f' ({int(row["size_bytes"])} bytes)</td>'
-                f'<td><code>{text(row["sha256"][:12], 12)}</code></td></tr>')
+                f'<td role="cell"><code>{text(row["sha256"][:12], 12)}</code></td></tr>')
 
     pairs = []
     analysis = report.get("analysis") or {}
@@ -345,15 +373,17 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
         ("findings", "Findings", "findings", [tracked(finding, row) for row in report["findings"]], 4, "div", None),
         ("figures", "Figures", "figures", [tracked(figure, row) for row in report["figures"]], 2, "div", None),
         ("evidence", "Evidence", "evidence entries", [tracked(evidence_row, row) for row in report["evidence"]], 2,
-         "table:Evidence|Description|Files", None),
+         "table:evidence", None),
         ("downloads", "Separate downloads", "downloads", [tracked(asset_row, row) for row in report["assets"]], 2,
-         "table:Name|Role|Type|Size|SHA-256", None),
+         "table:downloads", None),
         ("analysis", "Analysis", "analysis entries", pair_items, 1, "dl", _ANALYSIS_PAIR_LIMIT),
         ("limitations", "Limitations", "limitations",
          [tracked(list_item, value) for value in report.get("limitations", [])], 1, "ul", None),
         ("next-checks", "Next checks", "next checks",
          [tracked(list_item, value) for value in report.get("next_steps", [])], 1, "ul", None),
     ]
+
+    stacked = [False]  # set once the stylesheet is chosen: only the full one carries the stacked-table rules
 
     def wrap(anchor: str, title: str, kind: str, body: str) -> str:
         if kind == "qlist":
@@ -363,9 +393,14 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
         elif kind == "dl":
             inner = f"<details><summary>Method and configuration</summary><dl>{body}</dl></details>"
         elif kind.startswith("table:"):
-            heads = "".join(f"<th>{name}</th>" for name in kind[6:].split("|"))
-            inner = (f'<div class="tablewrap"><table><thead><tr>{heads}</tr></thead>'
-                     f"<tbody>{body}</tbody></table></div>")
+            name = kind[6:]
+            if stacked[0]:  # the stacked layout needs its labels' class and the roles that keep table semantics
+                heads = "".join(f'<th role="columnheader">{head}</th>' for head in _TABLE_HEADS[name])
+                inner = (f'<div class="tablewrap"><table class="t-{name}" role="table"><thead>'
+                         f'<tr role="row">{heads}</tr></thead><tbody>{body}</tbody></table></div>')
+            else:
+                heads = "".join(f"<th>{head}</th>" for head in _TABLE_HEADS[name])
+                inner = f'<div class="tablewrap"><table><thead><tr>{heads}</tr></thead><tbody>{body}</tbody></table></div>'
         else:
             inner = body
         return (f'<section id="sec-{anchor}"><h2{hid("sec-" + anchor)}>{title}{permalink("sec-" + anchor, "section")}</h2>'
@@ -403,12 +438,13 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
     # total). The title appears twice, so it is cut until the envelope fits even the smallest cap.
     worst_note = note([(label, 0, len(items)) for _, _, label, items in present_sections])
     nav_html = toc([(a, t) for a, t, *_ in present_sections])
-    wrappers = sum(len(wrap(a, t, k, "").encode()) for a, t, _, _, _, k, _ in sections)
     for title_limit in (256, 128, 64, 32, 16, 8, 0):
         title_shortened = len(title_source) > title_limit
         title = html.escape(title_source[:title_limit] + ("\u2026" if title_shortened else ""), quote=True)
         css = _FULL_CSS if len(document(_FULL_CSS, "", "", "", "").encode()) + _FULL_CSS_MARGIN <= max_bytes \
             else _CORE_CSS
+        stacked[0] = css is _FULL_CSS
+        wrappers = sum(len(wrap(a, t, k, "").encode()) for a, t, _, _, _, k, _ in sections)
         fixed = len(document(css, "", nav_html, "", worst_note).encode())
         remaining = max_bytes - fixed - wrappers
         if remaining >= 0:
