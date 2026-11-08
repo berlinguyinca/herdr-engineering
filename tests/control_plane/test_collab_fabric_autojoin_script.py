@@ -11,7 +11,8 @@ from pathlib import Path
 import pytest
 
 from tests.control_plane.test_collab_fabric_auth import fabric_agent, fw, lan_ip  # noqa: F401
-from tests.control_plane.test_collab_fabric_autojoin import aw, lw, set_trust, trust  # noqa: F401
+from tests.control_plane.test_collab_fabric_autojoin import aw, lw, set_trust  # noqa: F401
+from tests.control_plane.test_collab_fabric_autojoin import trust as base_trust
 from tests.control_plane.test_collab_fabric_trust import localapi  # noqa: F401
 from tests.control_plane.test_collab_tasks import code, svc  # noqa: F401
 
@@ -137,7 +138,7 @@ WS_ENV = {"HERDR_WORKSPACE_ID": "ws-1", "HERDR_TAB_ID": "tab-2", "HERDR_PANE_ID"
 
 def ws_on(lw):
     from herdr_engineering.control_plane.collab_fabric_trust import normalize_fabric_trust
-    lw.s.fabric_trust = normalize_fabric_trust(trust(auto_join=True, workspace_rooms=True))
+    lw.s.fabric_trust = normalize_fabric_trust(base_trust(auto_join=True, workspace_rooms=True))
 
 
 def test_join_sh_sends_the_workspace_env_and_lands_in_the_room(lw, tmp_path):
