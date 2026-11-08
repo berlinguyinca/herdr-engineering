@@ -4,12 +4,17 @@
 # Installs nothing system-wide (CI hosts have no apt and no sudo); needs Python 3.12+ with venv, Node 22 and git already on the host.
 # ruff is not a gate yet: main has 122 existing findings (scripts/validate.sh runs it).
 # It runs the whole suites, not a scoped subset: a scoped gate hides the breakage a change causes elsewhere.
+#
+# It raises the file-descriptor soft limit before running: the suite leaks roughly 3,000 descriptors over a full run, and a host
+# with the common 1,024 soft limit dies about a third of the way through with no summary at all. See scripts/ci/ensure-fd-limit.sh.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 . scripts/ci/journal.sh; ci_journal unit-gates
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing on this host: $1" >&2; exit 1; }; }
 need python3; need node; need git
+
+. scripts/ci/ensure-fd-limit.sh; herdr_ensure_fd_limit || exit 1
 
 # --- shared dependency cache ---------------------------------------------------------
 # The exec agents get a private per-job /tmp, so the venv wheels, the npm tree and Chromium used to be paid on every
