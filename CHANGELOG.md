@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Share panel and share viewer: accessibility sweep
+
+- Fix: the dashboard share panel's Links/Collaborators/Activity/Feedback tabs now follow the ARIA tabs pattern: roving `tabindex` (one tab stop), Arrow/Home/End move and select, per-mount ids with `aria-controls` on tabs and `aria-labelledby` on panels. They use the design system's `.hd-tabs`, so the selected tab is visibly distinct (all four were identical filled buttons).
+- Fix: `.hd-btn` lost its focus ring outside `.cx-page`/`.cx-embed` (`collab.css` set `outline:none` plus an undefined `--cx-ring`), so Review, Events, Revoke etc. had no focus indicator on the artifact page; the ring variable now has a fallback.
+- Fix: the share viewer's Rich view toggle had no visible focus indicator in Firefox and WebKit (white outline on the page background); it has an explicit `:focus-visible` outline, and `aria-controls` names the region it shows.
+- `tests/playwright/share-a11y.test.mjs` (chromium/firefox/webkit): tabs keyboard behaviour, focus indicators, static contrast/name checks in light and dark, no horizontal scroll at 390px, optional screenshots via `SHOT_DIR`.
+
 ### Share panel polish
 
 - The Version and Audience labels now stack their select with a 4px gap, the sharing tab buttons are separated by a 6px gap (and wrap), and the author-HTML checkbox glyph is 18px instead of the browser's 13px.
