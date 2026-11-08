@@ -87,6 +87,21 @@ updates and truncates still require a complete replay. The rebuilt streams count
 against the incremental stream budget; if many compacted services exceed it, the
 rejection reason names the budget and recovery falls back to a complete replay.
 
+While compaction drains a large backlog, one pass can touch thousands of streams
+and exceed that budget, so an older checkpoint is rejected and web boot replays
+everything. Set `control_plane.fabric_compaction.publish_projection_checkpoint: true`
+(default `false`, YAML only) to have the worker publish a fresh projection
+checkpoint after every drained pass that moved rows, so the next boot finds one
+that already covers the deletes. It uses the same publish path as
+`herdr-eng control-plane checkpoint` and waits up to
+`projection_lock_wait_seconds` (default 60) for the materializer lock the
+refresh thread holds. The compaction advisory lock is released before the
+publish starts, so the two locks are never held together. A busy lock or failed
+publish logs a warning (`projection checkpoint ... deferred`), never fails the
+compaction pass, and is retried by the next drained pass. It needs
+`control_plane.pg_dsn` (the same key the refresh thread uses). The budget and
+validity guards are unchanged.
+
 Ordinary append-only inspector updates advance the private owner capsule only
 when their replay order follows its captured boundary. Service and session
 updates fold into the saved event projection only when every new server-ingest

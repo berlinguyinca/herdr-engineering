@@ -92,3 +92,20 @@ def test_deployment_actions_need_the_flag_and_definitions(tmp_path):
             assert ("deployment_actions_v1" in caps_of(world.svr)) is actions
         finally:
             world.svr.shutdown()
+
+
+def test_deployment_actions_not_advertised_when_definitions_are_configured_but_not_loaded(tmp_path):
+    """The action routes answer 503 "no deployment definitions loaded" unless the definitions are configured AND loaded."""
+    world = World(tmp_path, actions=True, defs=False)
+    try:
+        bad = tmp_path / "broken"
+        bad.mkdir()
+        (bad / "p.yaml").write_text(":\n  - [unbalanced\n")
+        world.defs = str(bad)
+        world.write_config(True)
+        assert world.svr._loaded_deployment_definitions() is None
+        assert world.svr.deployment_definitions.status()["configured"]
+        assert world.force({"component": "hive-gateway"})[0] == 503
+        assert "deployment_actions_v1" not in caps_of(world.svr)
+    finally:
+        world.svr.shutdown()

@@ -1696,7 +1696,8 @@ class ControlPlaneServer:
         if self.ci_monitor.actions_enabled:
             caps.append("ci_actions_v1")
         try:
-            if self.deployment_actions_enabled() and self.deployment_definitions.status()["configured"]:
+            # the same predicate the force/ack routes apply: flag on AND definitions configured AND loaded
+            if self.deployment_actions_enabled() and self._loaded_deployment_definitions() is not None:
                 caps.append("deployment_actions_v1")
         except Exception:  # noqa: BLE001 - health must answer even if the definitions cannot be read
             pass

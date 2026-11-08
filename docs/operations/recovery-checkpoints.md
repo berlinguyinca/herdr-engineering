@@ -82,3 +82,6 @@ later. Chunking keeps ingest writes from queuing behind one huge delete (a singl
 control plane for ~8 minutes per batch in October 2026). Deleting rows changes the journal a checkpoint covered, so affected streams replay in full until
 the checkpoint is rebuilt; the job rebuilds it once a drain finishes (`rebuild_checkpoint: false` leaves that to the
 operator, using the builder above).
+`publish_projection_checkpoint: true` (default false) additionally publishes a projection checkpoint after such a
+drain, with `projection_lock_wait_seconds` (default 60) as the wait for the materializer lock; see
+projection-checkpoints.md.
