@@ -37,6 +37,7 @@ trap cleanup EXIT
 t0=$(date +%s); t1=$t0
 python3 -m venv "$venv"
 "$venv/bin/pip" install -q -e '.[dev,collab,review-gate,federation]'
+export PATH="$venv/bin:$PATH"
 t2=$(date +%s)
 
 echo "== pytest =="
