@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Compaction publishes a projection checkpoint
+
+- `control_plane.fabric_compaction.publish_projection_checkpoint` (default off) makes a drained compaction pass that moved rows publish a fresh projection checkpoint, so web boot does not replay the journal after a backlog drain exceeds the incremental budget. `projection_lock_wait_seconds` (default 60) bounds the wait for the materializer lock; a busy lock or failed publish logs a warning and retries on the next drained pass. The compaction lock is released before the publish.
+
 ### Rich view: cross-engine and phone-width verification
 
 - `tests/playwright/share-rich-view.test.mjs` now runs per engine (`BROWSERS`, default chromium,firefox; webkit opt-in with the software-Mesa workaround) and adds 390x844 light/dark checks (no horizontal scroll, 24x24 target, tap and keyboard) for the public share toggle and frame.
