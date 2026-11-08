@@ -862,6 +862,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             self._usage_reserved[k] = max(self._usage_reserved[k], int(p["reserved"]))
         elif t == "project_created":
             self._projects[p["project_id"]] = {"name": p["name"], "members": {p["actor_user_id"]: "manager"}}
+            if p.get("fabric_workspaces") and self._fabric_ws_project is None:
+                self._fabric_ws_project = p["project_id"]       # the fabric-workspaces project: first one wins, rebuilt on replay
         elif t == "project_member_added":
             self._projects[p["project_id"]]["members"][p["subject_user_id"]] = p["role"]
         elif t == "room_created":
@@ -870,6 +872,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "members": {p["actor_user_id"]: {"role": "owner", "expires_at": None, "joined_seq": seq,
                                                  "joined_at": p.get("created_at")}},
                 "grants": {}}
+            fw = p.get("fabric_workspace")
+            if isinstance(fw, dict):                              # the workspace-room index: (whois machine, workspace id) -> room
+                self._rooms[p["room_id"]]["fabric_workspace"] = dict(fw)
+                self._fabric_ws_rooms.setdefault((fw["machine"], fw["workspace_id"]), p["room_id"])
         elif t == "room_profile_set":
             self._rooms[p["room_id"]]["profile"] = p["profile"]
         elif t == "user_registered":
@@ -1196,6 +1202,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                    "coordinate_roles": list(p.get("coordinate_roles") or [])} if p.get("coordinate_team") else {})}
             self._agent_projects[p["agent_id"]].add(p["project_id"])
             self._rooms_by_agent[p["agent_id"]].add(p["room_id"])
+            fw = p.get("fabric_workspace")
+            if isinstance(fw, dict) and p["agent_id"] in self._agents:   # binds the auto-joined agent to its one workspace
+                self._agents[p["agent_id"]]["workspace"] = {**fw, "room_id": p["room_id"]}
         elif t == "workspace_linked":
             self._links[p["link_id"]] = {
                 "link_id": p["link_id"], "room_id": p["room_id"], "workspace_id": p["workspace_id"],
@@ -3114,6 +3123,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                             "instance_id": a.get("instance_id"), "external": bool(a.get("external")),
                             "machine": a.get("machine"), "fabric": bool(a.get("fabric")),
                             "fabric_expires_at": a.get("fabric_expires_at"), "origin": a.get("origin"),
+                            "workspace": ({"id": a["workspace"]["workspace_id"], "label": a["workspace"].get("label"),
+                                           "room_id": a["workspace"]["room_id"], "tab_id": a["workspace"].get("tab_id"),
+                                           "pane_id": a["workspace"].get("pane_id")} if a.get("workspace") else None),
                             "online": any(self._online(r["room_id"], "agent", aid) for r in rooms),
                             "status": a["status"], "expires_at": a["expires_at"], "rooms": rooms,
                             "pending": pending})

@@ -60,6 +60,15 @@ carries an unexpired owner-set `fabric` bit. Trust is therefore in: the tailnet'
    agents but to mint new ones: any local process there can join under any free name and fill the per-machine cap of 200 and the total of 1000 (names are
    enumerable; revoke to clean up, but revoked names keep counting: a known limit). Room access still needs an owner's grant.
 5a. **Operator error in `machines`** (section 10 of the guide).
+5b. **The workspace id is self-asserted (`workspace_rooms`): a NEW capability, not just more inert agents.** whois vouches for the machine,
+   not for a herdr workspace, and herdr ids such as `w1` are guessable. So any process on an allow-listed machine can now join ANY workspace
+   room on its own machine and, with the auto-granted `instruct` and `execute`, act on the real agents there. That goes beyond minting inert
+   agents with no permissions (5): it is a new capability, and the allow-list's meaning widens again. It is bounded by: the machine allow-list
+   (the room key includes the whois machine, never a client value, so it never crosses machines); the caps on rooms and members (429); the
+   audit trail (`via: "fabric"` on every write); revocation (removes the access at once, the name stays blocked); and the off-by-default
+   switch (`workspace_rooms`, requires `auto_join`). `coordinate` and `spawn_helpers` are never auto-granted, and an agent cannot move itself
+   to another workspace (409). The workspace label is advisory and chosen by the first joiner; it is never part of the room's identity or name.
+   An owner can still grant any agent into a room, and no tokenless path crosses workspaces or machines.
 6. Within the 30-day window a revoked machine binding is enforced, but a stolen host stays trusted until the operator reacts.
 7. Not verified here: per-agent request rate limits specific to Fabric (the spec mentions rate limits; only the generic message and task
    throttles were checked).
