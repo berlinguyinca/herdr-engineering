@@ -108,7 +108,7 @@ async function start() {
     if (rec && code && url.searchParams.get("state") === rec.state) {
       try {
         const t = await exchangeCode(cfg, code, rec.verifier);
-        const r = await fetch("/api/member/session", { method: "POST", cache: "no-store", credentials: "omit", headers: { Authorization: "Bearer " + t.access, "X-Id-Token": t.id } });
+        const r = await fetch("/api/member/session", { method: "POST", cache: "no-store", credentials: "omit", headers: { Authorization: "Bearer " + t.access, "X-Id-Token": t.id, "X-Nonce": rec.nonce } });
         const s = await r.json();
         if (r.ok) { session = s.session; if (store) store.setItem("member", session); }
       } catch (e) { say("Sign-in failed."); }
@@ -120,10 +120,14 @@ async function start() {
 }
 $("signin-btn").onclick = async () => {
   const p = await beginPkce(cfg);
-  if (store) store.setItem("pkce", JSON.stringify({ state: p.state, verifier: p.verifier }));
+  if (store) store.setItem("pkce", JSON.stringify({ state: p.state, verifier: p.verifier, nonce: p.nonce }));
   location.assign(p.url);
 };
-$("signout").onclick = () => { session = null; if (store) store.removeItem("member"); show(); };
+$("signout").onclick = async () => {
+  // end the session on the server too (a bearer session cannot otherwise be recalled), then forget it here
+  try { await api("POST", "/signout"); } catch (e) { /* already invalid: nothing more to end */ }
+  session = null; if (store) store.removeItem("member"); show();
+};
 $("q").oninput = () => load().catch((e) => say(e.message));
 $("new").onclick = async () => {
   const title = prompt("Title");

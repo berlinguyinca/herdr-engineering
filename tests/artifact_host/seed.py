@@ -95,8 +95,10 @@ def ident(
     exp: float | None = None,
     key: rsa.RSAPrivateKey = KEY,
     kid: str = "k1",
+    nonce: str | None = None,
 ) -> str:
     claims = {
+        "nonce": nonce,
         "iss": ISS,
         "sub": f"sub-{user}",
         "cognito:username": user,
@@ -370,6 +372,7 @@ def default_config(static_dir: Path | None, sync_dir: Path, **over: Any) -> Publ
         "public_url": PUBLIC_URL,
         "signing_secret": SECRET,
         "member_signing_secret": MEMBER_SECRET,
+        "member_group_sync_required": False,  # most tests have no members.json: the claim fallback, explicitly
         "session_seconds": 3600,
         "sync_dir": sync_dir,
         "pool_id": POOL_ID,

@@ -16,6 +16,9 @@ LOCK_NS_SHARE_CAP = 0x53484341  # "SHCA": per-share annotation cap (share_store.
 LOCK_NS_AUTHOR = (
     0x41555448  # "AUTH": per-author daily annotation cap (share_store.create_annotation)
 )
+LOCK_NS_BLOB = (
+    0x424C4F42  # "BLOB": a blob sha being written or reaped (member_api.publish and its cleanup)
+)
 LOCK_NS_PENDING_CLAIM = 0x504E4443  # "PNDC": per-owner pending-intake claims (library.py, Task 6)
 
 

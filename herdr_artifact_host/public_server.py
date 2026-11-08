@@ -202,7 +202,10 @@ class PublicConfig:
         default=b"", repr=False
     )  # members are off unless >= 32 bytes
     member_group: str = "local.dev"
-    member_group_sync_required: bool = False
+    # True: a member needs the host-side group sync (members.json); without it every sign-in fails closed.
+    # False is the explicit opt-in to the token's cognito:groups claim alone (sessions then last at most 15 minutes).
+    member_group_sync_required: bool = True
+    member_limits: MemberLimits = field(default_factory=MemberLimits)
     member_static_dir: Path | None = None
 
     def __post_init__(self) -> None:
@@ -501,7 +504,7 @@ class PublicSurface:
                 if c.member_static_dir
                 else DEFAULT_MEMBER_STATIC_DIR,
                 share_static=Path(c.static_dir) if c.static_dir else DEFAULT_STATIC_DIR,
-                limits=MemberLimits(),
+                limits=c.member_limits,
             )
         except (ValueError, OSError):
             return None

@@ -130,6 +130,16 @@ class BlobStore:
         s = validate_sha(sha)
         return self._root / "sha256" / s[:2] / s[2:4] / s
 
+    def remove(self, sha: str) -> bool:
+        """Delete one blob file and forget its verification; True when a file was removed.  The CALLER must know that
+        nothing references the sha and that no writer is mid-publish for it (member_api holds a per-sha advisory lock)."""
+        self._verified.forget(sha)
+        try:
+            self._path(sha).unlink()
+        except FileNotFoundError:
+            return False
+        return True
+
     def exists(self, sha: str) -> bool:
         return self._path(sha).is_file()
 

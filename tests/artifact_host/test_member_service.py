@@ -165,3 +165,42 @@ def test_read_all_viewer_cannot_insert(migrated_dsn: str) -> None:
 def test_blob_store_tmp_dir(tmp_path: Path) -> None:
     store = BlobStore(tmp_path / "b")
     assert store.tmp_dir.is_dir() and store.put(io.BytesIO(b"x"))
+
+
+def test_discard_takes_the_usage_lock_before_the_artifact_row(
+    migrated_dsn: str, tmp_path: Path
+) -> None:
+    """Publish and delete lock member_usage and then the artifact row; discard must use that order or it deadlocks
+    against them.  With the usage row held by someone else, a waiting discard must not yet hold the artifact row."""
+
+    async def go() -> None:
+        pool = await asyncpg.create_pool(migrated_dsn, min_size=2, max_size=8)
+        try:
+            svc = MemberService(
+                pool,
+                BlobStore(tmp_path / "b"),
+                LibraryStore(pool),
+                MemberLimits(),
+                "https://share.example",
+            )
+            aid = "art_" + uuid.uuid4().hex[:20]
+            await pool.execute(
+                "INSERT INTO artifacts (artifact_id, owner, intake) VALUES ($1,'dana','pending')",
+                aid,
+            )
+            await pool.execute("INSERT INTO member_usage (member_id) VALUES ('dana')")
+            async with pool.acquire() as holder, holder.transaction():
+                await holder.execute("SELECT 1 FROM member_usage WHERE member_id='dana' FOR UPDATE")
+                waiting = asyncio.create_task(svc.discard(Actor(ActorKind.USER, "dana"), aid))
+                await asyncio.sleep(0.5)
+                assert not waiting.done()  # blocked on the usage lock
+                async with pool.acquire() as probe, probe.transaction():
+                    got = await probe.fetchval(
+                        "SELECT 1 FROM artifacts WHERE artifact_id=$1 FOR UPDATE NOWAIT", aid
+                    )
+                    assert got == 1
+            await asyncio.wait_for(waiting, 10)
+        finally:
+            await pool.close()
+
+    asyncio.run(go())

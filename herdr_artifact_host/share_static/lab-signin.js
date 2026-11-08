@@ -32,10 +32,12 @@ export function validConfig(c) {
     && typeof c.redirect_uri === "string" && c.redirect_uri.indexOf("https://") === 0;
 }
 
-/** Fresh PKCE material: the caller stores {state, verifier} and sends the user to `url`. */
+/** Fresh PKCE material: the caller stores {state, verifier, nonce} and sends the user to `url`.  The nonce comes back
+ *  inside the ID token; a page that sends it with the session exchange (X-Nonce) proves the token is the one it asked for. */
 export async function beginPkce(cfg) {
   const verifier = randomString(32);
   const state = randomString(24);
+  const nonce = randomString(24);
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
   const query = new URLSearchParams({
     response_type: "code",
@@ -43,10 +45,11 @@ export async function beginPkce(cfg) {
     redirect_uri: cfg.redirect_uri,
     scope: "openid email",
     state: state,
+    nonce: nonce,
     code_challenge: b64url(new Uint8Array(digest)),
     code_challenge_method: "S256"
   });
-  return { state, verifier, url: cfg.cognito_domain + "/oauth2/authorize?" + query.toString() };
+  return { state, verifier, nonce, url: cfg.cognito_domain + "/oauth2/authorize?" + query.toString() };
 }
 
 export async function exchangeCode(cfg, code, verifier) {

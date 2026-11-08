@@ -17,17 +17,30 @@ def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def exchange(
+    host: Host,
+    user: str = "alice",
+    *,
+    groups: tuple[str, ...] = ("local.dev",),
+    nonce: str | None = None,
+    sent_nonce: str | None = None,
+    forwarded: str | None = None,
+) -> Resp:
+    """One real session exchange.  ``nonce`` is in the ID token, ``sent_nonce`` is what the page sends in X-Nonce."""
+    n = nonce if nonce is not None else f"n-{user}"
+    headers = {
+        **ORIGIN,
+        "Authorization": f"Bearer {access(user, groups=groups)}",
+        "X-Id-Token": ident(user, email=f"{user}@lab.example", nonce=n),
+        "X-Nonce": sent_nonce if sent_nonce is not None else n,
+    }
+    if forwarded:
+        headers["X-Forwarded-For"] = forwarded
+    return host.request("POST", "/api/member/session", headers, b"")
+
+
 def sign_in(host: Host, user: str = "alice", *, groups: tuple[str, ...] = ("local.dev",)) -> str:
-    r = host.request(
-        "POST",
-        "/api/member/session",
-        {
-            **ORIGIN,
-            "Authorization": f"Bearer {access(user, groups=groups)}",
-            "X-Id-Token": ident(user, email=f"{user}@lab.example"),
-        },
-        b"",
-    )
+    r = exchange(host, user, groups=groups)
     assert r.status == 200, r.body
     return r.json()["session"]
 

@@ -66,7 +66,8 @@ def test_sign_in_requires_the_group_and_origin(host: Host) -> None:
     ok = {
         **ORIGIN,
         "Authorization": f"Bearer {access('al', groups=('local.dev',))}",
-        "X-Id-Token": ident("al"),
+        "X-Id-Token": ident("al", nonce="n1"),
+        "X-Nonce": "n1",
     }
     assert host.request("POST", "/api/member/session", ok, b"").status == 200
     no_group = {**ok, "Authorization": f"Bearer {access('al', groups=('other',))}"}
@@ -85,7 +86,10 @@ def test_sign_in_requires_the_group_and_origin(host: Host) -> None:
     )
     assert (
         host.request(
-            "POST", "/api/member/session", {**ok, "X-Id-Token": ident("someone-else")}, b""
+            "POST",
+            "/api/member/session",
+            {**ok, "X-Id-Token": ident("someone-else", nonce="n1")},
+            b"",
         ).status
         == 401
     )
@@ -145,7 +149,8 @@ def test_member_outside_the_group_directory_is_refused_everywhere(host: Host) ->
         {
             **ORIGIN,
             "Authorization": f"Bearer {access('alice', groups=('local.dev',))}",
-            "X-Id-Token": ident("alice"),
+            "X-Id-Token": ident("alice", nonce="n1"),
+            "X-Nonce": "n1",
         },
         b"",
     )

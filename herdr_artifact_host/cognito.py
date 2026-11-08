@@ -12,6 +12,7 @@ MFA is a pool setting; this module cannot enforce it.
 
 from __future__ import annotations
 
+import hmac
 import json
 import re
 import threading
@@ -153,7 +154,7 @@ class CognitoAuthenticator:
             else None,
         }
 
-    def verify_id_token(self, token: str, *, user: str) -> str | None:
+    def verify_id_token(self, token: str, *, user: str, nonce: str | None = None) -> str | None:
         """Verified, lower-cased, ASCII-only email from an ID token that belongs to ``user``.
 
         Used only to link a person's email to their (already authenticated) user id so
@@ -188,6 +189,11 @@ class CognitoAuthenticator:
             or (claims.get("cognito:username") or claims.get("sub")) != user
         ):
             return None
+        if nonce is not None and (
+            not isinstance(claims.get("nonce"), str)
+            or not hmac.compare_digest(claims["nonce"].encode(), nonce.encode())
+        ):
+            return None  # an ID token minted for another sign-in attempt (replay) is refused
         if (
             not email.isascii()
         ):  # str.lower folds e.g. U+212A KELVIN SIGN to "k": it could match another address

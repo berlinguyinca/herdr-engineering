@@ -336,6 +336,12 @@ class LibraryStore:
         transaction (the control plane's member-delete effect)."""
         owner = _member(viewer).member_id
         async with self._pool.acquire() as conn, conn.transaction():
+            # lock order everywhere is member_usage first, then the artifact row (publish, delete): the other order
+            # deadlocks against a concurrent publish of the same pending artifact
+            await conn.execute(
+                "INSERT INTO member_usage (member_id) VALUES ($1) ON CONFLICT DO NOTHING", owner
+            )
+            await conn.execute("SELECT 1 FROM member_usage WHERE member_id=$1 FOR UPDATE", owner)
             size = await conn.fetchval(
                 "UPDATE artifacts SET intake='discarded', lifecycle='retracted', updated_at=now() "
                 f"WHERE artifact_id=$2 AND {_PENDING_LIVE} RETURNING size_bytes",

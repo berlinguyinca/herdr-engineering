@@ -33,7 +33,7 @@ MAX_SESSION = 400
 _IDENTITY_RE = re.compile(rf"[\x21-\x7e]{{1,{MAX_IDENTITY}}}")
 _ID_B64_MAX = 4 * MAX_IDENTITY // 3 + 4
 _SESSION_RE = re.compile(
-    rf"([A-Za-z0-9_-]{{2,{_ID_B64_MAX}}})\.([1-9][0-9]{{0,11}})\.([A-Za-z0-9_-]{{43}})"
+    rf"([A-Za-z0-9_-]{{2,{_ID_B64_MAX}}})\.([1-9][0-9]{{0,11}})(?:_([1-9][0-9]{{0,14}}))?\.([A-Za-z0-9_-]{{43}})"
 )
 
 
@@ -50,13 +50,17 @@ def _field(value: str) -> bytes:
     return len(raw).to_bytes(4, "big") + raw
 
 
-def _mac(secret: bytes, identity: str, exp: int) -> bytes:
+def _mac(secret: bytes, identity: str, exp: int, iat: int | None = None) -> bytes:
     msg = _DOMAIN + b"\x00" + _field(_SCOPE) + _field(identity) + _field(str(exp))
+    if iat is not None:
+        msg += _field(str(iat))
     return hmac.new(secret, msg, hashlib.sha256).digest()
 
 
-def mint_session(secret: bytes, identity: str, exp: float) -> str:
-    """The session for ``identity`` valid until ``exp`` (epoch seconds, floored).  Raises ValueError."""
+def mint_session(secret: bytes, identity: str, exp: float, iat_ms: int | None = None) -> str:
+    """The session for ``identity`` valid until ``exp`` (epoch seconds, floored).  ``iat_ms`` (issue time, epoch
+    milliseconds) is MAC'd and carried when given, so a per-member ``sessions_valid_after`` can end older sessions.
+    Raises ValueError."""
     if not isinstance(secret, bytes) or len(secret) < MIN_SECRET_BYTES:
         raise ValueError("signing secret is missing or too short")
     if not isinstance(identity, str) or not _IDENTITY_RE.fullmatch(identity):
@@ -71,7 +75,12 @@ def mint_session(secret: bytes, identity: str, exp: float) -> str:
     exp_int = int(math.floor(exp))
     if exp_int < 1 or exp_int >= 10**12:
         raise ValueError("bad expiry")
-    return f"{_b64(identity.encode('ascii'))}.{exp_int}.{_b64(_mac(secret, identity, exp_int))}"
+    if iat_ms is not None and (
+        isinstance(iat_ms, bool) or not isinstance(iat_ms, int) or not 1 <= iat_ms < 10**15
+    ):
+        raise ValueError("bad issue time")
+    stamp = "" if iat_ms is None else f"_{iat_ms}"
+    return f"{_b64(identity.encode('ascii'))}.{exp_int}{stamp}.{_b64(_mac(secret, identity, exp_int, iat_ms))}"
 
 
 def check_session(secret: bytes, session: object, now: float) -> dict | None:
@@ -87,7 +96,7 @@ def check_session(secret: bytes, session: object, now: float) -> dict | None:
         match = _SESSION_RE.fullmatch(session)
         if match is None:
             return None
-        id_part, exp_part, mac_part = match.groups()
+        id_part, exp_part, iat_part, mac_part = match.groups()
         identity = _unb64(id_part).decode("ascii")
         given = _unb64(mac_part)
         if (
@@ -97,11 +106,15 @@ def check_session(secret: bytes, session: object, now: float) -> dict | None:
         ):
             return None  # one canonical encoding only
         exp = int(exp_part)
-        if not hmac.compare_digest(given, _mac(secret, identity, exp)):
+        iat = int(iat_part) if iat_part else None
+        if not hmac.compare_digest(given, _mac(secret, identity, exp, iat)):
             return None
         if not isinstance(now, (int, float)) or not now < exp:
             return None
-        return {"identity": identity, "exp": float(exp)}
+        out: dict = {"identity": identity, "exp": float(exp)}
+        if iat is not None:
+            out["iat_ms"] = iat
+        return out
     except (binascii.Error, ValueError, UnicodeError):
         return None
 

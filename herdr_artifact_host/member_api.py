@@ -10,15 +10,23 @@ Contract carried over:
 * The session is ``Authorization: Member <session>`` (``member_session``: its own domain tag, never a cookie, so there is
   no ambient credential for a foreign site to ride on).  A claim cookie, a lab session, a write cookie, a Bearer agent
   token or anything else is the same 401 ``{"error": "unauthorized"}``.  The access is re-checked against the group
-  directory on every request.
+  directory on every request, and against the member's ``sessions_valid_after`` (set by ``POST /api/member/signout``,
+  which ends every session issued before it).  The session exchange needs the page's ``X-Nonce`` to equal the ``nonce``
+  claim of the ID token.  Without a ``members.json`` the exchange fails closed unless ``member_group_sync_required`` is
+  explicitly False (the token's ``cognito:groups`` claim then decides, and the session lasts at most 15 minutes).
 * Every non-GET needs exactly one ``Origin: <public origin>`` (403 otherwise, decided before authentication and before
   any body is read).  Error bodies are fixed strings; nothing about a token, a path or an exception reaches a response.
 * Identity is the BARE member id (the Cognito user) in ``artifacts.owner``, ACL principals, ``granted_by``, claims and
   ``shares.created_by``.  Anything on an artifact the caller does not own is the same 404 as a missing artifact: no
   existence oracle.
-* Uploads: chunk runs are staged on disk (``BlobStore.tmp_dir``), at most ``MAX_UPLOAD_BYTES`` (17 MiB) per file and per
-  run, refused from their headers before a body byte is read.  Publish assembles and hash-verifies the file, writes the
-  BlobStore, then writes every row in ONE transaction: a failure leaves no ``artifact_blobs`` / version rows.
+* Uploads: chunk runs are staged on disk (``BlobStore.tmp_dir/up/<member>/<artifact>/<upload>``), at most
+  ``MAX_UPLOAD_BYTES`` (17 MiB) per file and per run, refused from their headers (size, per-member and per-artifact
+  staging caps, upload slots) before a body byte is read.  A body is streamed to disk under a deadline, never held in
+  memory.  ``abort`` takes the same spec as ``status`` and re-derives the upload id.  Staged bytes go away with the
+  artifact (delete, discard, publish) or ``MemberService.sweep_staging``.  Publish assembles and hash-verifies the file, writes the
+  BlobStore, then writes every row in ONE transaction: a failure leaves no ``artifact_blobs`` / version rows and removes
+  the blob files it wrote (a size and quota pre-check runs before any blob is written; per-sha advisory locks make the
+  cleanup safe against a concurrent publish of the same content).
 * Shares are created ``pending`` and made live only by the owner as a signed-in user (an agent, token or operator actor is
   refused).  Expiry defaults to 30 days and is at most 90.  The share token exists only in the creation response.
 """
@@ -28,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -48,6 +57,7 @@ from aiohttp import web
 
 from .blobs import BlobCorrupt, BlobMissing, BlobStore
 from .cognito import CognitoAuthenticator, SyncedDirectory
+from .db import LOCK_NS_BLOB
 from .library import (
     PENDING_CAP,
     FeedQuery,
@@ -74,7 +84,7 @@ MAX_SHARE_DAYS: Final = 90
 MAX_JSON_BODY: Final = 256 * 1024
 MAX_FILES: Final = 200
 READ_BLOCK: Final = 64 * 1024
-RUN_SLOTS: Final = 8  # concurrent run bodies held in memory
+RUN_SLOTS: Final = 8  # concurrent run bodies being streamed to disk, all members together
 MAX_ALLOW_ENTRIES: Final = 50
 UPLOAD_ID_RE: Final = re.compile(r"upl_[0-9a-f]{24}")
 SHA_RE: Final = re.compile(r"[0-9a-f]{64}")
@@ -103,7 +113,7 @@ _BODY_KEYS: Final[dict[str, tuple[frozenset[str], frozenset[str]]]] = {
         frozenset({"title", "filename"}),
     ),
     "delete": (frozenset({"confirm"}), frozenset({"confirm"})),
-    "status": (
+    "status": (  # also the body of an abort: the upload id is re-derived from it
         frozenset({"name", "size_bytes", "file_sha256"}),
         frozenset({"name", "size_bytes", "file_sha256"}),
     ),
@@ -125,7 +135,7 @@ _BODY_KEYS: Final[dict[str, tuple[frozenset[str], frozenset[str]]]] = {
         ),
         frozenset({"version_id", "audience"}),
     ),
-    "approve": (frozenset({"confirm"}), frozenset({"confirm"})),
+    "approve": (frozenset({"confirm", "idempotency_key"}), frozenset({"confirm"})),
     "folder": (frozenset({"name"}), frozenset({"name"})),
     "folder_item": (frozenset({"artifact_id"}), frozenset({"artifact_id"})),
 }
@@ -177,7 +187,16 @@ class MemberLimits:
     writes_per_minute: int = 30
     chunks_per_minute: int = 1200
     share_creates_per_hour: int = 20
-    session_exchanges_per_minute: int = 20
+    session_exchanges_per_minute: int = 20  # failed exchanges per client address
+    session_exchanges_global_per_minute: int = (
+        600  # failed exchanges, all clients: a backstop, not the main limit
+    )
+    staging_bytes_per_member: int = 512 * 1024 * 1024
+    staging_bytes_per_artifact: int = 128 * 1024 * 1024
+    uploads_per_member: int = 2  # run bodies being received at once
+    body_deadline_seconds: float = 120.0  # a run body that takes longer is dropped (408)
+    content_streams: int = 8  # content responses being sent at once, all members together
+    claim_fallback_session_seconds: int = 15 * 60
 
 
 def now_dt(now: Callable[[], float]) -> datetime:
@@ -203,6 +222,10 @@ class MemberSettings:
     assets: dict[str, tuple[bytes, str]]
     page_csp: str
     limits: MemberLimits
+    claim_fallback: bool = (
+        False  # members.json optional: the token's group claim decides when it is absent
+    )
+    directory_present: Callable[[], bool] = lambda: True
 
 
 def synced_lookup(directory: SyncedDirectory, required: bool) -> Callable[[str], list[str] | None]:
@@ -239,6 +262,8 @@ class MemberService:
         self.chunk_rate = RateLimiter(limits.chunks_per_minute, now)
         self.share_rate_window = timedelta(hours=1)
         self._run_slots = asyncio.Semaphore(RUN_SLOTS)
+        self._uploading: dict[str, int] = {}  # run bodies being received, per member
+        self.content_streams = asyncio.Semaphore(limits.content_streams)
         self._staging = blobs.tmp_dir / "up"
 
     # -- identity
@@ -250,25 +275,60 @@ class MemberService:
             raise MemberError(403, "forbidden", "forbidden")
         return member
 
-    async def record_sign_in(self, member_id: str, email: str, groups: list[str]) -> None:
+    async def record_sign_in(
+        self, member_id: str, email: str, groups: list[str], vouched_until: float
+    ) -> None:
+        """Remember what sign-in verified.  The email and groups are used only until ``vouched_until`` (the end of the
+        session that vouched for them), so a removed member's stale lab visibility ends with their session."""
         await self.pool.execute(
-            "INSERT INTO member_usage (member_id, email, groups, last_used_at) VALUES ($1,$2,$3,now()) "
-            "ON CONFLICT (member_id) DO UPDATE SET email=EXCLUDED.email, groups=EXCLUDED.groups, "
+            "INSERT INTO member_usage (member_id, email, groups, last_used_at, identity_expires_at) "
+            "VALUES ($1,$2,$3,now(),$4) ON CONFLICT (member_id) DO UPDATE SET email=EXCLUDED.email, "
+            "groups=EXCLUDED.groups, identity_expires_at=EXCLUDED.identity_expires_at, "
             "last_used_at=now(), updated_at=now()",
             member_id,
             email,
             groups,
+            now_dt(lambda: vouched_until),
         )
+
+    def _vouched(self, row: asyncpg.Record | None) -> bool:
+        return (
+            row is not None
+            and row["identity_expires_at"] is not None
+            and row["identity_expires_at"] > now_dt(self.now)
+        )
+
+    async def sessions_valid_after(self, member: str) -> int | None:
+        """Epoch milliseconds before which this member's sessions are void (sign-out), or None."""
+        got = await self.pool.fetchval(
+            "SELECT sessions_valid_after FROM member_usage WHERE member_id=$1", member
+        )
+        return None if got is None else round(got.timestamp() * 1000)
+
+    async def signout(self, actor: Actor) -> dict[str, Any]:
+        """End every session issued to this member so far (a bearer session cannot be recalled any other way)."""
+        member = self._member(actor)
+        stamp = int(self.now() * 1000)
+        async with self.pool.acquire() as conn, conn.transaction():
+            await self._lock_usage(conn, member)
+            await conn.execute(
+                "UPDATE member_usage SET sessions_valid_after=$2, updated_at=now() WHERE member_id=$1",
+                member,
+                now_dt(lambda: stamp / 1000),
+            )
+        await self._audit(member, "signout", "ok")
+        return {"signed_out": True}
 
     async def viewer(self, actor: Actor) -> Viewer:
         """The caller's own feed identity, from what sign-in verified (never from request input).  The operator's
         read-all viewer is never built here."""
         member = self._member(actor)
         row = await self.pool.fetchrow(
-            "SELECT email, groups FROM member_usage WHERE member_id=$1", member
+            "SELECT email, groups, identity_expires_at FROM member_usage WHERE member_id=$1", member
         )
-        email = (row["email"] or "") if row else ""
-        groups = frozenset(row["groups"]) if row else frozenset()
+        vouched = self._vouched(row)
+        email = (row["email"] or "") if row and vouched else ""
+        groups = frozenset(row["groups"]) if row and vouched else frozenset()
         return Viewer(member_id=member, email=email, groups=groups)
 
     async def _audit(
@@ -306,13 +366,13 @@ class MemberService:
         member = self._member(actor)
         row = await self.pool.fetchrow(
             "SELECT bytes_used, bytes_retracted, max_member_bytes, max_artifact_bytes, max_artifacts, "
-            "sharing_disabled, email FROM member_usage WHERE member_id=$1",
+            "sharing_disabled, email, identity_expires_at FROM member_usage WHERE member_id=$1",
             member,
         )
         used = int(row["bytes_used"]) if row else 0
         return {
             "member_id": member,
-            "email": (row["email"] if row else None) or "",
+            "email": (row["email"] if self._vouched(row) else None) or "",
             "usage": {
                 "bytes_used": used,
                 "max_member_bytes": int(
@@ -434,8 +494,9 @@ class MemberService:
             ]
         }
 
-    async def content(self, actor: Actor, artifact_id: str, name: str) -> tuple[bytes, str, str]:
-        """``(data, content_type, disposition)`` of one file of the current version of a readable artifact."""
+    async def content(self, actor: Actor, artifact_id: str, name: str) -> tuple[str, str, str]:
+        """``(sha256, content_type, disposition)`` of one file of the current version of a readable artifact; the
+        surface streams the blob (``stream_blob``)."""
         member = self._member(actor)
         await self._readable(member, artifact_id)
         try:
@@ -451,19 +512,17 @@ class MemberService:
         item = next((f for f in json.loads(manifest or "[]") if f.get("name") == wanted), None)
         if item is None:
             raise _not_found()
+        ctype = safe_media_type(item.get("media_type") or content_type_for(wanted))
+        return item["sha256"], ctype, "inline" if ctype in _INLINE_TYPES else "attachment"
 
-        def read() -> bytes:
-            with self.blobs.open(item["sha256"]) as handle:
-                return handle.read()
-
+    def open_blob(self, sha: str) -> tuple[Any, int]:
+        """The verified blob handle and its size (blocking: call in a thread)."""
         try:
-            data = await asyncio.to_thread(read)
+            handle, _ = self.blobs.open_checked(sha)
         except (BlobMissing, BlobCorrupt):
             log.warning("member content: blob unavailable")
             raise _not_found() from None
-        ctype = safe_media_type(item.get("media_type") or content_type_for(wanted))
-        disposition = "inline" if ctype in _INLINE_TYPES else "attachment"
-        return data, ctype, disposition
+        return handle, os.fstat(handle.fileno()).st_size
 
     # -- artifacts
 
@@ -582,6 +641,7 @@ class MemberService:
                 member,
             )
             await settle_quota(conn, member, int(row["size_bytes"]))
+        await self._drop_staging(member, artifact_id)
         await self._audit(member, "delete", "ok")
         return {"artifact_id": artifact_id, "deleted": True}
 
@@ -615,7 +675,9 @@ class MemberService:
         return {"accepted": True}
 
     async def discard(self, actor: Actor, artifact_id: str) -> dict[str, Any]:
-        await self.library.discard(Viewer(member_id=self._member(actor)), ItemRef(artifact_id))
+        member = self._member(actor)
+        await self.library.discard(Viewer(member_id=member), ItemRef(artifact_id))
+        await self._drop_staging(member, artifact_id)
         return {"discarded": True}
 
     # -- uploads
@@ -647,11 +709,78 @@ class MemberService:
     def _chunks(size: int) -> int:
         return max(1, -(-size // CHUNK_BYTES)) if size else 0
 
-    def _dir(self, upload_id: str) -> Path:
-        return self._staging / upload_id
+    @staticmethod
+    def _member_key(member: str) -> str:
+        return hashlib.sha256(b"herdr-host-staging-v1\x00" + member.encode()).hexdigest()[:24]
+
+    def _artifact_dir(self, member: str, artifact_id: str) -> Path:
+        return self._staging / self._member_key(member) / artifact_id
+
+    def _dir(self, member: str, artifact_id: str, upload_id: str) -> Path:
+        return self._artifact_dir(member, artifact_id) / upload_id
+
+    async def _drop_staging(self, member: str, artifact_id: str) -> None:
+        await asyncio.to_thread(shutil.rmtree, self._artifact_dir(member, artifact_id), True)
+
+    @staticmethod
+    def _du(root: Path) -> int:
+        total = 0
+        for p in root.rglob("*") if root.is_dir() else ():
+            try:
+                if p.is_file():
+                    total += p.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    def _staging_after(
+        self, member: str, artifact_id: str, upload_id: str, first: int, length: int
+    ) -> tuple[int, int]:
+        """``(member_bytes, artifact_bytes)`` staged if this run were stored: what is there now, minus the chunks this
+        run would replace, plus the run."""
+        replaced = 0
+        folder = self._dir(member, artifact_id, upload_id)
+        if folder.is_dir():
+            wanted = {f"{i:07d}" for i in range(first, first + max(1, -(-length // CHUNK_BYTES)))}
+            for p in folder.iterdir():
+                if p.name in wanted and p.is_file():
+                    replaced += p.stat().st_size
+        mine = self._du(self._staging / self._member_key(member)) - replaced + length
+        here = self._du(self._artifact_dir(member, artifact_id)) - replaced + length
+        return mine, here
+
+    def sweep_staging(self, max_age_seconds: float) -> int:
+        """Remove every staged upload nothing has written to for ``max_age_seconds``; returns how many.  Blocking:
+        housekeeping calls it in a thread."""
+        cutoff = self.now() - max_age_seconds
+        removed = 0
+        if not self._staging.is_dir():
+            return 0
+        for member_dir in list(self._staging.iterdir()):
+            for artifact_dir in list(member_dir.iterdir()) if member_dir.is_dir() else ():
+                for upload in list(artifact_dir.iterdir()) if artifact_dir.is_dir() else ():
+                    try:
+                        newest = max(
+                            [upload.stat().st_mtime]
+                            + [p.stat().st_mtime for p in upload.rglob("*")]
+                        )
+                    except OSError:
+                        continue
+                    if newest < cutoff:
+                        shutil.rmtree(upload, ignore_errors=True)
+                        removed += 1
+                try:
+                    artifact_dir.rmdir()  # only if now empty
+                except OSError:
+                    pass
+            try:
+                member_dir.rmdir()
+            except OSError:
+                pass
+        return removed
 
     def precheck_run(self, content_length: int, size: int, first: int) -> None:
-        """Everything that can be decided from the headers, before one body byte is read."""
+        """Everything that can be decided from the headers alone, before one body byte is read."""
         total = self._chunks(size)
         if content_length < 1 or content_length > MAX_UPLOAD_BYTES:
             raise MemberError(413, "too_large", "run is too large")
@@ -670,8 +799,11 @@ class MemberService:
         file_sha: str,
         first: int,
         run_sha: str,
-        read_body: Callable[[], Awaitable[bytes]],
+        length: int,
+        spool: Callable[[Path], Awaitable[str]],
     ) -> dict[str, Any]:
+        """Stage one run.  ``spool(path)`` streams the request body into ``path`` and returns its sha256; it runs under
+        ``body_deadline_seconds`` and a per-member slot, after the staging caps were checked from the headers."""
         member = self._member(actor)
         await self._owned(self.pool, member, artifact_id)
         name, size, file_sha = self._file_args(name, size, file_sha)
@@ -679,44 +811,61 @@ class MemberService:
             raise _bad("upload_id does not match the headers")
         if not SHA_RE.fullmatch(run_sha):
             raise _bad()
-        async with self._run_slots:
-            data = await read_body()
-            n_chunks = -(-len(data) // CHUNK_BYTES)
-            if (
-                not self.chunk_rate.allow(member + "\x00chunks")
-                if n_chunks <= 1
-                else not all(self.chunk_rate.allow(member + "\x00chunks") for _ in range(n_chunks))
-            ):
-                raise MemberError(
-                    429, "rate_limited", "too many chunks, retry shortly", {"Retry-After": "10"}
-                )
-            if hashlib.sha256(data).hexdigest() != run_sha:
-                raise _bad("run sha256 does not match")
-            await asyncio.to_thread(self._store_run, upload_id, size, first, data)
-        return await self._status(upload_id, size)
-
-    def _store_run(self, upload_id: str, size: int, first: int, data: bytes) -> None:
-        folder = self._dir(upload_id)
-        folder.mkdir(parents=True, exist_ok=True)
+        n_chunks = max(1, -(-length // CHUNK_BYTES))
+        if not all(self.chunk_rate.allow(member + "\x00chunks") for _ in range(n_chunks)):
+            raise MemberError(
+                429, "rate_limited", "too many chunks, retry shortly", {"Retry-After": "10"}
+            )
+        if self._uploading.get(member, 0) >= self.limits.uploads_per_member:
+            raise MemberError(429, "busy", "too many uploads in progress", {"Retry-After": "5"})
+        self._uploading[member] = self._uploading.get(member, 0) + 1
+        folder = self._dir(member, artifact_id, upload_id)
         scratch = folder / f".in-{secrets.token_hex(6)}"
-        scratch.mkdir()
         try:
-            total = self._chunks(size)
-            pieces = [data[i : i + CHUNK_BYTES] for i in range(0, len(data), CHUNK_BYTES)]
-            for offset, piece in enumerate(pieces):
-                index = first + offset
+            mine, here = await asyncio.to_thread(
+                self._staging_after, member, artifact_id, upload_id, first, length
+            )
+            if (
+                mine > self.limits.staging_bytes_per_member
+                or here > self.limits.staging_bytes_per_artifact
+            ):
+                raise MemberError(413, "staging_full", "too many bytes are waiting to be published")
+            async with self._run_slots:
+                await asyncio.to_thread(scratch.mkdir, parents=True)
+                body = scratch / "body"
+                try:
+                    got = await asyncio.wait_for(spool(body), self.limits.body_deadline_seconds)
+                except TimeoutError:
+                    raise MemberError(408, "timeout", "the upload took too long") from None
+                if got != run_sha:
+                    raise _bad("run sha256 does not match")
+                await asyncio.to_thread(self._store_run, folder, scratch, size, first)
+        finally:
+            await asyncio.to_thread(shutil.rmtree, scratch, True)
+            left = self._uploading.get(member, 1) - 1
+            if left > 0:
+                self._uploading[member] = left
+            else:
+                self._uploading.pop(member, None)
+        return await self._status(folder, size, upload_id)
+
+    def _store_run(self, folder: Path, scratch: Path, size: int, first: int) -> None:
+        """Split the received body into chunk files (one chunk in memory at a time) and move them into place."""
+        total = self._chunks(size)
+        with (scratch / "body").open("rb") as src:
+            index = first
+            while piece := src.read(CHUNK_BYTES):
                 expected = CHUNK_BYTES if index < total - 1 else size - CHUNK_BYTES * (total - 1)
                 if len(piece) != expected:
                     raise _bad("chunk has the wrong length")
                 (scratch / f"{index:07d}").write_bytes(piece)
-            for p in scratch.iterdir():
+                index += 1
+        for p in scratch.iterdir():
+            if p.name.isdigit():
                 os.replace(p, folder / p.name)
-        finally:
-            shutil.rmtree(scratch, ignore_errors=True)
 
-    async def _status(self, upload_id: str, size: int) -> dict[str, Any]:
+    async def _status(self, folder: Path, size: int, upload_id: str) -> dict[str, Any]:
         def scan() -> list[int]:
-            folder = self._dir(upload_id)
             return (
                 sorted(int(p.name) for p in folder.iterdir() if p.name.isdigit())
                 if folder.is_dir()
@@ -746,26 +895,47 @@ class MemberService:
         member = self._member(actor)
         await self._owned(self.pool, member, artifact_id)
         name_n, size_n, sha_n = self._file_args(name, size, file_sha)
-        return await self._status(
-            self.upload_id_for(member, artifact_id, name_n, sha_n, size_n), size_n
-        )
+        upload_id = self.upload_id_for(member, artifact_id, name_n, sha_n, size_n)
+        return await self._status(self._dir(member, artifact_id, upload_id), size_n, upload_id)
 
-    async def upload_abort(self, actor: Actor, artifact_id: str, upload_id: str) -> dict[str, Any]:
+    async def upload_abort(
+        self,
+        actor: Actor,
+        artifact_id: str,
+        upload_id: str,
+        name: object,
+        size: object,
+        file_sha: object,
+    ) -> dict[str, Any]:
+        """Drop one staged upload.  The caller names the file; the id is re-derived from it and must match."""
         member = self._member(actor)
         await self._owned(self.pool, member, artifact_id)
         if not UPLOAD_ID_RE.fullmatch(upload_id):
             raise _bad()
-        # the id is a hash of (member, artifact, file): abort can only reach a directory this caller could have made
-        # only when the caller names a file it owns, so any other id simply does not exist
-        await asyncio.to_thread(shutil.rmtree, self._dir(upload_id), True)
+        name_n, size_n, sha_n = self._file_args(name, size, file_sha)
+        if self.upload_id_for(member, artifact_id, name_n, sha_n, size_n) != upload_id:
+            raise _bad("upload_id does not match the file")
+        await asyncio.to_thread(shutil.rmtree, self._dir(member, artifact_id, upload_id), True)
         return {"aborted": True}
 
     # -- publish
 
-    def _assemble(self, upload_id: str, name: str, size: int, file_sha: str) -> str:
+    def _check_quota(self, usage: asyncpg.Record | None, current_size: int, total: int) -> int:
+        """The member's projected bytes if this artifact became ``total`` bytes; raises 413 ``quota`` when over."""
+
+        def limit(column: str, default: int) -> int:
+            return int((usage and usage[column]) or default)
+
+        if total > limit("max_artifact_bytes", self.limits.max_artifact_bytes):
+            raise MemberError(413, "quota", "artifact is over its size limit")
+        projected = int(usage["bytes_used"] if usage else 0) - current_size + total
+        if projected > limit("max_member_bytes", self.limits.max_member_bytes):
+            raise MemberError(413, "quota", "storage quota exceeded")
+        return projected
+
+    def _assemble(self, folder: Path, name: str, size: int, file_sha: str) -> str:
         """Verify and install one staged file in the blob store; returns its sha.  Nothing is stored unless the bytes
         hash to ``file_sha`` and fill ``size`` exactly."""
-        folder = self._dir(upload_id)
         total = self._chunks(size)
         paths = [folder / f"{i:07d}" for i in range(total)]
         if not all(p.is_file() for p in paths):
@@ -823,72 +993,102 @@ class MemberService:
         except ShareBundleError:
             chosen = None  # an entry is only needed when a share is made
         total = sum(s for s, _ in specs.values())
-        manifest: list[dict[str, Any]] = []
-        for name, (size, sha) in specs.items():
-            upload_id = self.upload_id_for(member, artifact_id, name, sha, size)
-            stored = await asyncio.to_thread(self._assemble, upload_id, name, size, sha)
-            manifest.append(
-                {
-                    "name": name,
-                    "sha256": stored,
-                    "size_bytes": size,
-                    "media_type": safe_media_type(content_type_for(name)),
-                }
-            )
+        # lock-free pre-check: an over-quota publish must not write (and then have to remove) a single blob
+        early = await self.pool.fetchrow(
+            "SELECT bytes_used, max_member_bytes, max_artifact_bytes FROM member_usage WHERE member_id=$1",
+            member,
+        )
+        current_row = await self._owned(self.pool, member, artifact_id)
+        self._check_quota(early, int(current_row["size_bytes"]), total)
         version_id = "ver_" + secrets.token_hex(12)
-        async with self.pool.acquire() as conn, conn.transaction():
-            usage = await self._lock_usage(conn, member)
-            row = await self._owned(conn, member, artifact_id, lock=True)
-            current = row["current_version_id"]
-            if (base_version_id or None) != current:
-                raise MemberError(409, "stale_base", "the artifact has a newer version")
-            if total > int(usage["max_artifact_bytes"] or self.limits.max_artifact_bytes):
-                raise MemberError(413, "quota", "artifact is over its size limit")
-            projected = int(usage["bytes_used"]) - int(row["size_bytes"]) + total
-            if projected > int(usage["max_member_bytes"] or self.limits.max_member_bytes):
-                raise MemberError(413, "quota", "storage quota exceeded")
-            for item in manifest:
-                await conn.execute(
-                    "INSERT INTO artifact_blobs (sha256, size_bytes, media_type) VALUES ($1,$2,$3) "
-                    "ON CONFLICT (sha256) DO NOTHING",
-                    item["sha256"],
-                    item["size_bytes"],
-                    item["media_type"],
-                )
-            number = int(
-                await conn.fetchval(
-                    "SELECT coalesce(max(version_number), 0) + 1 FROM artifact_versions WHERE artifact_id=$1",
-                    artifact_id,
-                )
-            )
-            await conn.execute(
-                "INSERT INTO artifact_versions (version_id, artifact_id, version_number, parent_version_ids, "
-                "state, output_manifest, provenance, created_by) VALUES ($1,$2,$3,$4,'ready',$5::jsonb,$6::jsonb,$7)",
-                version_id,
-                artifact_id,
-                number,
-                [current] if current else [],
-                json.dumps(manifest),
-                json.dumps({"message": message or "", "entry": chosen}),
-                member,
-            )
-            await conn.execute(
-                "UPDATE artifacts SET current_version_id=$2, size_bytes=$3, updated_at=now() WHERE artifact_id=$1",
-                artifact_id,
-                version_id,
-                total,
-            )
-            await conn.execute(
-                "UPDATE member_usage SET bytes_used=$2, updated_at=now() WHERE member_id=$1",
-                member,
-                projected,
-            )
-        for name, (size, sha) in specs.items():
-            await asyncio.to_thread(
-                shutil.rmtree,
-                self._dir(self.upload_id_for(member, artifact_id, name, sha, size)),
-                True,
-            )
+        shas = sorted({sha for _, sha in specs.values()})
+        written: list[str] = []
+        committed = False
+        manifest: list[dict[str, Any]] = []
+        # One connection for the whole publish: it holds a session-level advisory lock per content hash from before
+        # the first blob write until the rows are committed (or the blobs removed), so the cleanup of a failed publish
+        # can never delete a blob a concurrent publish of the same content has just written.
+        async with self.pool.acquire() as conn:
+            try:
+                for (
+                    sha
+                ) in shas:  # sorted: two publishes never wait on one another in opposite orders
+                    await conn.execute(
+                        "SELECT pg_advisory_lock($1, hashtext($2))", LOCK_NS_BLOB, sha
+                    )
+                for name, (size, sha) in specs.items():
+                    folder = self._dir(
+                        member,
+                        artifact_id,
+                        self.upload_id_for(member, artifact_id, name, sha, size),
+                    )
+                    stored = await asyncio.to_thread(self._assemble, folder, name, size, sha)
+                    written.append(stored)
+                    manifest.append(
+                        {
+                            "name": name,
+                            "sha256": stored,
+                            "size_bytes": size,
+                            "media_type": safe_media_type(content_type_for(name)),
+                        }
+                    )
+                async with conn.transaction():
+                    usage = await self._lock_usage(conn, member)
+                    row = await self._owned(conn, member, artifact_id, lock=True)
+                    current = row["current_version_id"]
+                    if (base_version_id or None) != current:
+                        raise MemberError(409, "stale_base", "the artifact has a newer version")
+                    projected = self._check_quota(usage, int(row["size_bytes"]), total)
+                    for item in manifest:
+                        await conn.execute(
+                            "INSERT INTO artifact_blobs (sha256, size_bytes, media_type) VALUES ($1,$2,$3) "
+                            "ON CONFLICT (sha256) DO NOTHING",
+                            item["sha256"],
+                            item["size_bytes"],
+                            item["media_type"],
+                        )
+                    number = int(
+                        await conn.fetchval(
+                            "SELECT coalesce(max(version_number), 0) + 1 FROM artifact_versions "
+                            "WHERE artifact_id=$1",
+                            artifact_id,
+                        )
+                    )
+                    await conn.execute(
+                        "INSERT INTO artifact_versions (version_id, artifact_id, version_number, "
+                        "parent_version_ids, state, output_manifest, provenance, created_by) "
+                        "VALUES ($1,$2,$3,$4,'ready',$5::jsonb,$6::jsonb,$7)",
+                        version_id,
+                        artifact_id,
+                        number,
+                        [current] if current else [],
+                        json.dumps(manifest),
+                        json.dumps({"message": message or "", "entry": chosen}),
+                        member,
+                    )
+                    await conn.execute(
+                        "UPDATE artifacts SET current_version_id=$2, size_bytes=$3, updated_at=now() "
+                        "WHERE artifact_id=$1",
+                        artifact_id,
+                        version_id,
+                        total,
+                    )
+                    await conn.execute(
+                        "UPDATE member_usage SET bytes_used=$2, updated_at=now() WHERE member_id=$1",
+                        member,
+                        projected,
+                    )
+                committed = True
+            finally:
+                try:
+                    if not committed:
+                        await self._reap(conn, written)
+                finally:
+                    try:
+                        await conn.execute("SELECT pg_advisory_unlock_all()")
+                    except Exception:
+                        log.warning("member publish: could not release blob locks")
+        await self._drop_staging(member, artifact_id)
         await self._audit(member, "publish", "ok")
         return {
             "artifact_id": artifact_id,
@@ -896,6 +1096,16 @@ class MemberService:
             "version_number": number,
             "size_bytes": total,
         }
+
+    async def _reap(self, conn: asyncpg.Connection, written: list[str]) -> None:
+        """Remove the blob files a failed publish wrote, except any that has an ``artifact_blobs`` row.  The caller
+        holds the sha's advisory lock, so no concurrent publish is between its write and its insert."""
+        for sha in dict.fromkeys(written):
+            try:
+                if await conn.fetchval("SELECT 1 FROM artifact_blobs WHERE sha256=$1", sha) is None:
+                    await asyncio.to_thread(self.blobs.remove, sha)
+            except Exception:
+                log.warning("member publish: blob cleanup failed")
 
     # -- shares
 
@@ -1030,7 +1240,12 @@ class MemberService:
         return row
 
     async def share_approve(
-        self, actor: Actor, artifact_id: str, share_id: str, confirm: object
+        self,
+        actor: Actor,
+        artifact_id: str,
+        share_id: str,
+        confirm: object,
+        idempotency_key: object = None,
     ) -> dict[str, Any]:
         """Make a pending share live.  Only the owner, as a signed-in user: an agent, a token or the operator is refused."""
         member = self._member(actor)
@@ -1039,10 +1254,28 @@ class MemberService:
             raise MemberError(403, "forbidden", "only the signed-in owner can approve a share link")
         if confirm is not True:
             raise _bad("confirm must be true to make a share link live")
+        if idempotency_key is not None and (
+            not isinstance(idempotency_key, str) or not _IDEMPOTENCY.fullmatch(idempotency_key)
+        ):
+            raise _bad("idempotency_key is invalid")
         self._throttle_write(member)
         async with self.pool.acquire() as conn, conn.transaction():
+            usage = await self._lock_usage(conn, member)
+            if usage["sharing_disabled"]:  # revoke and the event log stay open
+                raise MemberError(403, "sharing_disabled", "sharing is disabled for this account")
             row = await self._owned_share(conn, member, artifact_id, share_id)
             if row["state"] != "pending":
+                if (
+                    idempotency_key is not None
+                    and row["state"] == "live"
+                    and await conn.fetchval(
+                        "SELECT 1 FROM share_events WHERE share_id=$1 AND kind='approved' "
+                        "AND detail->>'idempotency_key'=$2",
+                        share_id,
+                        idempotency_key,
+                    )
+                ):
+                    return {"share_id": share_id, "state": "live"}  # the same request again
                 raise MemberError(409, "not_pending", "the share link is not pending")
             if row["expires_at"] is not None and row["expires_at"] <= now_dt(self.now):
                 raise MemberError(409, "expired", "the share link has expired")
@@ -1052,9 +1285,10 @@ class MemberService:
                 member,
             )
             await conn.execute(
-                "INSERT INTO share_events (share_id, kind, actor) VALUES ($1,'approved',$2)",
+                "INSERT INTO share_events (share_id, kind, actor, detail) VALUES ($1,'approved',$2,$3::jsonb)",
                 share_id,
                 member,
+                json.dumps({"idempotency_key": idempotency_key} if idempotency_key else {}),
             )
         await self._audit(member, "share_approve", "ok", None, share_id, row["audience"])
         return {"share_id": share_id, "state": "live"}
@@ -1080,7 +1314,6 @@ class MemberService:
     async def share_events(self, actor: Actor, artifact_id: str, share_id: str) -> dict[str, Any]:
         member = self._member(actor)
         async with self.pool.acquire() as conn:
-            await self._owned_share(conn, member, artifact_id, share_id) if False else None
             ok = await conn.fetchval(
                 "SELECT 1 FROM shares s JOIN artifacts a ON a.artifact_id=s.artifact_id WHERE s.share_id=$1 "
                 "AND s.artifact_id=$2 AND a.owner=$3",
@@ -1191,7 +1424,11 @@ class MemberSurface:
         now: Callable[[], float] = time.time,
     ) -> None:
         self.s, self.svc, self.not_found, self.now = settings, service, uniform_not_found, now
-        self.exchanges = RateLimiter(settings.limits.session_exchanges_per_minute, now, max_keys=1)
+        # only FAILED exchanges are counted: per client address (the real limit) and, much higher, for everyone
+        self.exchange_failures = RateLimiter(settings.limits.session_exchanges_per_minute, now)
+        self.exchange_failures_all = RateLimiter(
+            settings.limits.session_exchanges_global_per_minute, now, max_keys=1
+        )
 
     @staticmethod
     def owns(raw_path: str) -> bool:
@@ -1300,45 +1537,81 @@ class MemberSurface:
             raise _unauthorized()
         return values[0]
 
+    @staticmethod
+    def _client(request: web.Request) -> str:
+        """The limiter key for a client: the socket peer, or (only when that peer is a loopback or private address,
+        i.e. our own proxy) the last X-Forwarded-For entry the proxy appended."""
+        peername = request.transport.get_extra_info("peername") if request.transport else None
+        peer = str(peername[0]) if peername else "unknown"
+        forwarded = request.headers.get("X-Forwarded-For", "").split(",")[-1].strip()
+        try:
+            address = ipaddress.ip_address(peer)
+            trusted = address.is_loopback or address.is_private
+        except ValueError:
+            trusted = False
+        return forwarded[:64] if forwarded and trusted else peer
+
     async def _session(self, request: web.Request) -> web.Response:
-        if not self.exchanges.allow("*"):
+        client = self._client(request)
+        if self.exchange_failures.blocked(client) or self.exchange_failures_all.blocked("*"):
             raise MemberError(429, "rate_limited", "too many sign-ins", {"Retry-After": "60"})
+        try:
+            return await self._exchange(request)
+        except MemberError as err:
+            if err.status in (400, 401):
+                self.exchange_failures.allow(client)
+                self.exchange_failures_all.allow("*")
+            raise
+
+    async def _exchange(self, request: web.Request) -> web.Response:
         if request.headers.getall("Content-Length", ["0"]) not in (
             ["0"],
             [""],
         ) or request.headers.getall("Transfer-Encoding", []):
             raise _bad()
         auth, id_token = self._single(request, "Authorization"), self._single(request, "X-Id-Token")
+        nonce = self._single(request, "X-Nonce", 256)
         scheme, _, access = auth.partition(" ")
         if scheme != "Bearer" or not access or access != access.strip():
             raise _unauthorized()
 
-        def verify() -> tuple[str, float, str, list[str]] | None:
+        def verify() -> tuple[str, float, str, list[str], bool] | None:
             try:
                 claims = self.s.authenticator.verify_claims(access)
                 if not claims:
                     return None
                 user = claims["user"]
-                email = self.s.authenticator.verify_id_token(id_token, user=user)
+                email = self.s.authenticator.verify_id_token(id_token, user=user, nonce=nonce)
                 if not email:
                     return None
-                return user, float(claims["exp"]), email, list(claims.get("groups") or [])
+                return (
+                    user,
+                    float(claims["exp"]),
+                    email,
+                    list(claims.get("groups") or []),
+                    bool(claims.get("groups_capped")),
+                )
             except Exception:
                 return None
 
         got = await asyncio.to_thread(verify)
         if got is None:
             raise _unauthorized()
-        user, token_exp, email, groups = got
+        user, token_exp, email, groups, capped = got
         now = self.now()
         exp = min(now + self.s.session_seconds, token_exp)
+        if self.s.claim_fallback and not await asyncio.to_thread(self.s.directory_present):
+            # no group directory vouches for this member: the token's claim alone decides, so the session is short
+            exp = min(exp, now + self.s.limits.claim_fallback_session_seconds)
         if not exp > now + 1:
             raise _unauthorized()
         try:
-            session = mint_session(self.s.secret, user, exp)
+            session = mint_session(self.s.secret, user, exp, int(now * 1000))
         except ValueError:
             raise _unauthorized() from None
-        await self.svc.record_sign_in(user, email, [g for g in groups if _GROUP.fullmatch(g)][:64])
+        # a capped list is a truncated one: record no groups rather than a partial picture of them
+        recorded = [] if capped else [g for g in groups if _GROUP.fullmatch(g)][:64]
+        await self.svc.record_sign_in(user, email, recorded, exp)
         return self._json(200, {"session": session, "expires_at": int(exp), "member_id": user})
 
     async def _authenticate(self, request: web.Request) -> Actor:
@@ -1352,6 +1625,10 @@ class MemberSurface:
         identity = got["identity"]
         # the group directory decides on EVERY request, so removing a member ends their access within a minute
         if not await asyncio.to_thread(self.s.authenticator.exists, identity):
+            raise _unauthorized()
+        # a sign-out voids every session issued before it (a session without an issue time cannot be proven newer)
+        valid_after = await self.svc.sessions_valid_after(identity)
+        if valid_after is not None and got.get("iat_ms", 0) <= valid_after:
             raise _unauthorized()
         return Actor(ActorKind.USER, identity)
 
@@ -1388,15 +1665,37 @@ class MemberSurface:
         return int(lengths[0]) if lengths else 0
 
     async def _read(self, request: web.Request, length: int) -> bytes:
-        chunks: list[bytes] = []
-        left = length
-        while left:
-            block = await request.content.read(min(READ_BLOCK, left))
-            if not block:
-                raise _bad()
-            chunks.append(block)
-            left -= len(block)
-        return b"".join(chunks)
+        """A small (JSON) body, under the body deadline."""
+
+        async def read() -> bytes:
+            chunks: list[bytes] = []
+            left = length
+            while left:
+                block = await request.content.read(min(READ_BLOCK, left))
+                if not block:
+                    raise _bad()
+                chunks.append(block)
+                left -= len(block)
+            return b"".join(chunks)
+
+        try:
+            return await asyncio.wait_for(read(), self.s.limits.body_deadline_seconds)
+        except TimeoutError:
+            raise MemberError(408, "timeout", "the request took too long") from None
+
+    @staticmethod
+    async def _spool(request: web.Request, length: int, path: Path) -> str:
+        """Stream a run body to ``path`` (never held in memory); returns its sha256."""
+        digest, left = hashlib.sha256(), length
+        with path.open("wb") as out:
+            while left:
+                block = await request.content.read(min(READ_BLOCK, left))
+                if not block:
+                    raise _bad()
+                digest.update(block)
+                out.write(block)
+                left -= len(block)
+        return digest.hexdigest()
 
     async def _body(self, request: web.Request, kind: str | None) -> dict[str, Any]:
         length = self._length(request)
@@ -1489,7 +1788,9 @@ class MemberSurface:
                 )
             if n >= 4 and rest[0] == "artifacts" and rest[2] == "content":
                 self._query(query, set())
-                return await self._content(actor, self._artifact(rest[1]), "/".join(rest[3:]))
+                return await self._content(
+                    request, actor, self._artifact(rest[1]), "/".join(rest[3:])
+                )
             raise _not_found()
         if method == "DELETE":
             if n == 2 and rest[0] == "folders":
@@ -1536,6 +1837,9 @@ class MemberSurface:
                     key,
                 ),
             )
+        if rest == ["signout"]:
+            await self._body(request, None)
+            return ok(200, await svc.signout(actor))
         if rest == ["folders"]:
             return ok(
                 200,
@@ -1588,42 +1892,79 @@ class MemberSurface:
             )
         if n == 5 and rest[0] == "artifacts" and rest[2] == "uploads" and rest[4] == "abort":
             aid = self._artifact(rest[1])
-            await self._body(request, None)
-            return ok(200, await svc.upload_abort(actor, aid, rest[3]))
+            b = await self._body(request, "status")
+            return ok(
+                200,
+                await svc.upload_abort(
+                    actor, aid, rest[3], b["name"], b["size_bytes"], b["file_sha256"]
+                ),
+            )
         if n == 5 and rest[0] == "artifacts" and rest[2] == "shares":
             aid, sid = self._artifact(rest[1]), self._ident(rest[3])
             if rest[4] == "approve":
                 b = await self._body(request, "approve")
-                return ok(200, await svc.share_approve(actor, aid, sid, b["confirm"]))
+                return ok(
+                    200,
+                    await svc.share_approve(
+                        actor, aid, sid, b["confirm"], b.get("idempotency_key")
+                    ),
+                )
             if rest[4] == "revoke":
                 await self._body(request, None)
                 return ok(200, await svc.share_revoke(actor, aid, sid))
         raise _not_found()
 
-    async def _content(self, actor: Actor, artifact_id: str, name: str) -> web.Response:
+    async def _content(
+        self, request: web.Request, actor: Actor, artifact_id: str, name: str
+    ) -> web.StreamResponse:
+        """Stream one file, with at most ``content_streams`` responses in flight (503 beyond that)."""
         from urllib.parse import unquote
 
-        data, ctype, disposition = await self.svc.content(
+        sha, ctype, disposition = await self.svc.content(
             actor, artifact_id, unquote(name, errors="strict")
         )
         base = name.rsplit("/", 1)[-1]
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", unquote(base))[:100] or "file"
-        return web.Response(
-            status=200,
-            body=data,
-            headers={
-                "Content-Type": ctype,
-                "Cache-Control": "no-store",
-                "X-Content-Type-Options": "nosniff",
-                "Referrer-Policy": "no-referrer",
-                "X-Frame-Options": "DENY",
-                "Server": "herdr-share",
-                "Content-Security-Policy": "default-src 'none'; sandbox",
-                "Content-Disposition": "inline"
-                if disposition == "inline"
-                else f'attachment; filename="{safe}"',
-            },
-        )
+        streams = self.svc.content_streams
+        if streams.locked():
+            raise MemberError(
+                503, "busy", "too many downloads, retry shortly", {"Retry-After": "2"}
+            )
+        async with streams:
+            handle, size = await asyncio.to_thread(self.svc.open_blob, sha)
+            try:
+                resp = web.StreamResponse(
+                    status=200,
+                    headers={
+                        "Content-Type": ctype,
+                        "Content-Length": str(size),
+                        "Cache-Control": "no-store",
+                        "X-Content-Type-Options": "nosniff",
+                        "Referrer-Policy": "no-referrer",
+                        "X-Frame-Options": "DENY",
+                        "Server": "herdr-share",
+                        "Content-Security-Policy": "default-src 'none'; sandbox",
+                        "Content-Disposition": "inline"
+                        if disposition == "inline"
+                        else f'attachment; filename="{safe}"',
+                    },
+                )
+                await resp.prepare(request)
+                try:
+                    if request.method != "HEAD":
+                        deadline = self.s.limits.body_deadline_seconds
+                        while block := await asyncio.to_thread(handle.read, READ_BLOCK):
+                            await asyncio.wait_for(resp.write(block), deadline)
+                    await resp.write_eof()
+                except (
+                    TimeoutError
+                ):  # a reader that stopped reading: the headers are out, so only close
+                    if request.transport is not None:
+                        request.transport.close()
+                    raise ConnectionResetError from None
+                return resp
+            finally:
+                handle.close()
 
     async def _run(self, request: web.Request, actor: Actor, rest: list[str]) -> web.Response:
         """``PUT /artifacts/{id}/uploads/{upload_id}/runs/{first}``: every refusal below that can be decided from the
@@ -1678,7 +2019,8 @@ class MemberSurface:
             file_sha,
             first,
             run_sha,
-            lambda: self._read(request, length),
+            length,
+            lambda path: self._spool(request, length, path),
         )
         return self._json(200, result)
 
@@ -1745,4 +2087,6 @@ def build_member_settings(
         assets=assets,
         page_csp=csp,
         limits=limits,
+        claim_fallback=not sync_required,
+        directory_present=lambda: (Path(sync_dir) / "members.json").is_file(),
     )

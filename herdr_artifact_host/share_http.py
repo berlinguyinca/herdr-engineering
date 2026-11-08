@@ -210,6 +210,13 @@ class RateLimiter:
         self._lock = threading.Lock()
         self._windows: dict[str, tuple[float, int]] = {}
 
+    def blocked(self, key: str) -> bool:
+        """True when ``key`` has used its whole window (nothing is counted)."""
+        now = self.now()
+        with self._lock:
+            start, count = self._windows.get(key, (now, 0))
+            return not (now - start >= self.window or now < start) and count >= self.limit
+
     def allow(self, key: str) -> bool:
         now = self.now()
         with self._lock:
