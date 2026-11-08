@@ -385,6 +385,15 @@ def test_rollback_after_a_migration_fails_loudly_with_the_manual_steps(env) -> N
     _no_secrets(r.stdout + r.stderr)
 
 
+def test_an_unreadable_schema_count_after_a_migration_counts_as_moved(env) -> None:
+    """The count query failing after a successful migrate must not read as 'nothing migrated'."""
+    _enabled_before_and_failing_now(env)
+    env["env"]["STUB_AH_COUNT_FAIL"] = "1"  # before and after both read empty, so they compare equal
+    r = _ds.deploy(env)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "ARTIFACT HOST NOT REVERTED" in r.stderr and "pg_restore" in r.stderr
+
+
 def test_a_failed_migration_with_a_previous_host_also_needs_the_manual_steps(env) -> None:
     """The migration may have applied some steps before it failed: the schema is not known to be the old one."""
     _enabled_before_and_failing_now(env)

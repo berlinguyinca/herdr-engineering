@@ -1115,6 +1115,8 @@ artifact_host_up() {
   # its steps) or when the applied-migrations count changed, and not on a deploy that migrated nothing.
   ah_compose run --rm artifact-host-migrate >/dev/null || { AH_MIGRATED=1; return 1; }
   after="$(ah_schema_count)"
+  # an unreadable count after a successful migrate is "moved", never "unchanged": empty == empty must not read as safe
+  case "$after" in ''|*[!0-9]*) AH_MIGRATED=1 ;; esac
   [ "$before" = "$after" ] || AH_MIGRATED=1
   ah_compose up -d --no-build --no-deps --force-recreate --wait --wait-timeout 180 \
     artifact-host-public artifact-host-internal artifact-host-relay >/dev/null || return 1
