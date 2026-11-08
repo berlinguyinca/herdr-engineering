@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Report sections and findings have stable, linkable anchors
+
+- Every section heading, finding and figure in a report preview now has a stable id (`sec-<section>`, `finding-<id>`, `figure-<id>`, derived from the descriptor id, never the title) and a visible `#` permalink in its heading: a 24px target, always visible, keyboard-focusable with a visible focus ring, accessible name "Link to this finding" described by the heading. No free text reaches an attribute (the share sanitiser aborts a render whose attribute looks like a script), so a finding titled `onerror=` still renders. Previews under the 16 KiB budget stay plain (no permalinks).
+- Opening a URL with `#finding-f1` scrolls to and highlights the target on the public share page (CSS `:target`, no script). In the dashboard preview (a shadow root, where `:target` cannot work, and where the server drops relative hrefs and the report stylesheet) `artifact-static-preview.js` rebuilds each permalink as a real link, scrolls and highlights on click and moves focus to the target; `#/artifacts/<id>?version=<v>&at=<anchor>` opens the preview and reveals that section.
+- The sanitiser allowlist is unchanged. Tests: `tests/control_plane/test_artifact_report_render.py`, `packages/artifact-static-preview.test.js`, `tests/playwright/report-anchors.test.mjs` (light/dark, desktop/390px, keyboard, hostile title).
+
 ### Reports print and save as PDF cleanly
 
 - The report stylesheet (`artifact_report_render.py`, used by the dashboard preview and the public share page) has a full `@media print` section: paper is always light and black-on-white whatever the screen theme or forced `data-theme`; the contents pills, download buttons and the opt-in Rich view panel are hidden; findings, figures, callouts, notices and table rows are never split and headings stay with what follows; a figure taller than a page shrinks to fit (180mm); tables lose their scroll box and repeat their header row on each page; the closed "Method and configuration" details prints open; an `http(s)` link spells out its URL. The tight-budget core stylesheet keeps the light override too.
