@@ -8,6 +8,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Share panel polish
 
 - The Version and Audience labels now stack their select with a 4px gap, the sharing tab buttons are separated by a 6px gap (and wrap), and the author-HTML checkbox glyph is 18px instead of the browser's 13px.
+
 ### Compaction publishes a projection checkpoint
 
 - `control_plane.fabric_compaction.publish_projection_checkpoint` (default off) makes a drained compaction pass that moved rows publish a fresh projection checkpoint, so web boot does not replay the journal after a backlog drain exceeds the incremental budget. `projection_lock_wait_seconds` (default 60) bounds the wait for the materializer lock; a busy lock or failed publish logs a warning and retries on the next drained pass. The compaction lock is released before the publish.
