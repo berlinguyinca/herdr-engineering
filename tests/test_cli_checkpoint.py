@@ -36,7 +36,7 @@ def test_explicit_checkpoint_order_cleanup_and_sanitization(monkeypatch, capsys,
 
     def load(dsn, **policy):
         calls.append('load')
-        assert policy == {'host_aliases': {'a': 'b'}, 'inspector_limits': cp['inspector_limits']}
+        assert policy == {'host_aliases': {'a': 'b'}, 'inspector_limits': cp['inspector_limits'], 'lock_wait': 0.0}
         if failure == 'load':
             raise RuntimeError('postgres://secret')
         return {'counts': {'events': 2}, 'recovery_info': {'mode': 'checkpoint'}}
