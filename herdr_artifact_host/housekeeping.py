@@ -28,7 +28,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final
 
@@ -36,7 +36,7 @@ import asyncpg
 
 from .blobs import BlobStore
 from .cognito import DirectorySnapshot
-from .db import LOCK_NS_BLOB
+from .db import LOCK_NS_BLOB, LOCK_NS_HOUSEKEEPING
 from .member_api import MemberService
 
 if TYPE_CHECKING:
@@ -49,6 +49,8 @@ GROUPS_TTL: Final = 24 * 3600.0
 REMOVED_GRACE: Final = 3600.0
 STAGING_MAX_AGE: Final = 24 * 3600.0
 BLOB_GRACE: Final = 3600.0
+BLOB_GC_EVERY: Final = 900.0
+EXPIRY_FLOOR: Final = timedelta(days=7)
 _BLOB_BATCH: Final = 500
 _LIVE_QUOTA: Final = "lifecycle NOT IN ('retracted','tombstoned')"
 
@@ -64,6 +66,35 @@ class SweepReport:
     blobs_removed: int = 0
     usage_corrected: int = 0
     failed: tuple[str, ...] = ()
+    skipped: bool = False  # another replica holds the leader lock: nothing was swept
+
+
+@dataclass(frozen=True)
+class HousekeepingConfig:
+    groups_ttl: float = GROUPS_TTL
+    removed_grace: float = REMOVED_GRACE
+    staging_max_age: float = STAGING_MAX_AGE
+    blob_grace: float = BLOB_GRACE
+    blob_gc_every: float = (
+        BLOB_GC_EVERY  # the blob walk is the costly duty: it runs on this slower cadence
+    )
+
+
+async def run_to_completion[T](fn: Callable[..., T], *args: object) -> T:
+    """``to_thread`` that a cancellation cannot abandon half way: the thread is awaited to its end before the
+    ``CancelledError`` surfaces (the caller still holds its locks until then)."""
+    work = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        while not work.done():
+            try:
+                await asyncio.wait({work})
+            except asyncio.CancelledError:
+                continue
+        if not work.cancelled():
+            work.exception()  # retrieved: nobody else will look
+        raise
 
 
 def _utc(now: datetime) -> datetime:
@@ -79,15 +110,19 @@ class Housekeeper:
         snapshot: Callable[[], DirectorySnapshot | None],
         *,
         group: str,
-        groups_ttl: float = GROUPS_TTL,
-        removed_grace: float = REMOVED_GRACE,
-        staging_max_age: float = STAGING_MAX_AGE,
-        blob_grace: float = BLOB_GRACE,
+        config: HousekeepingConfig = HousekeepingConfig(),
     ) -> None:
         self.pool, self.blobs, self.service, self._snapshot = pool, blobs, service, snapshot
-        self.group = group
-        self.groups_ttl, self.removed_grace = groups_ttl, removed_grace
-        self.staging_max_age, self.blob_grace = staging_max_age, blob_grace
+        self.group, self.config = group, config
+        self._last_blob_gc: datetime | None = None
+
+    @property
+    def groups_ttl(self) -> float:
+        return self.config.groups_ttl
+
+    @property
+    def removed_grace(self) -> float:
+        return self.config.removed_grace
 
     @classmethod
     def for_member_surface(
@@ -97,8 +132,38 @@ class Housekeeper:
 
     # -- the pass
 
-    async def run_once(self, now: datetime) -> SweepReport:
+    async def run_once(self, now: datetime, *, force_blob_gc: bool = False) -> SweepReport:
+        """One pass, if this replica is the leader (a session advisory lock held for the pass; otherwise skipped)."""
         now = _utc(now)
+        async with self.pool.acquire() as leader:
+            if not await leader.fetchval(
+                "SELECT pg_try_advisory_lock($1, hashtext('sweep'))", LOCK_NS_HOUSEKEEPING
+            ):
+                return SweepReport(skipped=True)
+            try:
+                report = await self._sweep(now, force_blob_gc)
+            finally:
+                await leader.execute(
+                    "SELECT pg_advisory_unlock($1, hashtext('sweep'))", LOCK_NS_HOUSEKEEPING
+                )
+        self._log(report)
+        return report
+
+    @staticmethod
+    def _log(report: SweepReport) -> None:
+        changed = [
+            f"{f.name}={getattr(report, f.name)}"
+            for f in fields(report)
+            if f.name not in ("failed", "skipped") and getattr(report, f.name)
+        ]
+        if changed:  # counts only: no ids, names or secrets
+            log.info("housekeeping: %s", " ".join(changed))
+
+    def _blob_gc_due(self, now: datetime, force: bool) -> bool:
+        last = self._last_blob_gc
+        return force or last is None or (now - last).total_seconds() >= self.config.blob_gc_every
+
+    async def _sweep(self, now: datetime, force_blob_gc: bool) -> SweepReport:
         counts: dict[str, int] = {}
         failed: list[str] = []
 
@@ -124,7 +189,9 @@ class Housekeeper:
         await duty("agent_tokens", "tokens_pruned", self.service.tokens.prune())
         await duty("groups", "groups_cleared", self._lapse_groups(now, out))
         await duty("staging", "staging_removed", self._staging())
-        await duty("blobs", "blobs_removed", self._orphan_blobs(now))
+        if self._blob_gc_due(now, force_blob_gc):
+            self._last_blob_gc = now
+            await duty("blobs", "blobs_removed", self._orphan_blobs(now))
         await duty("usage", "usage_corrected", self._reconcile_usage())
         return SweepReport(**counts, failed=tuple(dict.fromkeys(failed)))
 
@@ -144,9 +211,10 @@ class Housekeeper:
             "INSERT INTO share_events (share_id, kind, actor, at) "
             "SELECT s.share_id, 'expired', 'housekeeping', s.expires_at FROM shares s "
             "WHERE s.state='live' AND s.expires_at IS NOT NULL AND s.expires_at <= $1 "
-            "AND NOT EXISTS (SELECT 1 FROM share_events e WHERE e.share_id=s.share_id AND e.kind='expired') "
-            "RETURNING share_id",
+            "AND s.expires_at > $2 "
+            "ON CONFLICT (share_id, at) WHERE kind='expired' DO NOTHING RETURNING share_id",
             now,
+            now - EXPIRY_FLOOR,
         )
         return len(rows)
 
@@ -161,12 +229,12 @@ class Housekeeper:
         if snap is None:
             return set()
         listed, disabled = snap.members, snap.disabled
+        # Only members the host has seen (a member_usage row) under a bare id can be "removed".  Control-plane
+        # principals (member:<id>, agent:<id>), API-key / CI creators and legacy imports are not directory members.
         known = {
             r["member_id"]
             for r in await self.pool.fetch(
-                "SELECT member_id FROM member_usage "
-                "UNION SELECT created_by FROM shares WHERE state IN ('pending','live') AND created_by IS NOT NULL "
-                "UNION SELECT member_id FROM agent_tokens WHERE revoked_at IS NULL"
+                "SELECT member_id FROM member_usage WHERE position(':' in member_id) = 0"
             )
         }
         absent = sorted(known - listed)
@@ -176,10 +244,6 @@ class Housekeeper:
                 sorted(listed - disabled),
             )
             await conn.execute(
-                "INSERT INTO member_usage (member_id) SELECT unnest($1::text[]) ON CONFLICT DO NOTHING",
-                absent,
-            )
-            await conn.execute(
                 "UPDATE member_usage SET removed_since=$2 WHERE removed_since IS NULL AND member_id = ANY($1)",
                 absent,
                 now,
@@ -187,7 +251,7 @@ class Housekeeper:
             lapsed = await conn.fetch(
                 "SELECT member_id FROM member_usage WHERE member_id = ANY($1) AND removed_since <= $2",
                 absent,
-                now - timedelta(seconds=self.removed_grace),
+                now - timedelta(seconds=self.config.removed_grace),
             )
         return {r["member_id"] for r in lapsed} | (disabled & known)
 
@@ -222,17 +286,17 @@ class Housekeeper:
             "UPDATE member_usage SET groups='{}', updated_at=now() WHERE cardinality(groups) > 0 "
             "AND (member_id = ANY($1) OR coalesce(last_used_at, updated_at) < $2)",
             sorted(out),
-            now - timedelta(seconds=self.groups_ttl),
+            now - timedelta(seconds=self.config.groups_ttl),
         )
         return int(done.rsplit(" ", 1)[-1])
 
     # -- files
 
     async def _staging(self) -> int:
-        return await asyncio.to_thread(self.service.sweep_staging, self.staging_max_age)
+        return await asyncio.to_thread(self.service.sweep_staging, self.config.staging_max_age)
 
     async def _orphan_blobs(self, now: datetime) -> int:
-        cutoff = now.timestamp() - self.blob_grace
+        cutoff = now.timestamp() - self.config.blob_grace
         old = await asyncio.to_thread(
             lambda: [sha for sha, mtime in self.blobs.iter_blobs() if mtime < cutoff]
         )
@@ -267,7 +331,10 @@ class Housekeeper:
                     return False
                 if not await asyncio.to_thread(self._still_old, sha, cutoff):
                     return False
-                return await asyncio.to_thread(self.blobs.remove, sha)
+                if not await run_to_completion(self.blobs.remove, sha):
+                    return False
+                await run_to_completion(self.blobs.prune_empty_dirs, sha)
+                return True
             finally:
                 await conn.execute("SELECT pg_advisory_unlock($1, hashtext($2))", LOCK_NS_BLOB, sha)
 

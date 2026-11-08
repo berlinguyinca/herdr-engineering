@@ -141,19 +141,47 @@ class BlobStore:
         return True
 
     def iter_blobs(self) -> Iterator[tuple[str, float]]:
-        """Every stored blob as ``(sha, mtime)``; entries that are not a well-formed sha file are skipped.  Blocking."""
-        base = self._root / "sha256"
-        for first in sorted(base.iterdir()) if base.is_dir() else ():
-            for second in sorted(first.iterdir()) if first.is_dir() else ():
-                for leaf in sorted(second.iterdir()) if second.is_dir() else ():
-                    if not _SHA.fullmatch(leaf.name):
+        """Every stored blob as ``(sha, mtime)``; entries that are not a well-formed sha file are skipped.  Blocking.
+        One ``scandir`` per directory; the mtime comes from the DirEntry (a single stat per file)."""
+        for first in self._subdirs(self._root / "sha256"):
+            for second in self._subdirs(Path(first.path)):
+                for leaf in self._entries(Path(second.path)):
+                    if not _SHA.fullmatch(leaf.name) or leaf.name[2:4] != second.name:
                         continue
                     try:
-                        st = leaf.stat()
+                        if leaf.is_file(follow_symlinks=False):
+                            yield leaf.name, leaf.stat(follow_symlinks=False).st_mtime
                     except OSError:
                         continue
-                    if leaf.is_file() and leaf.parent.name == leaf.name[2:4]:
-                        yield leaf.name, st.st_mtime
+
+    @staticmethod
+    def _entries(path: Path) -> list[os.DirEntry[str]]:
+        try:
+            with os.scandir(path) as it:
+                return sorted(it, key=lambda e: e.name)
+        except OSError:
+            return []
+
+    @classmethod
+    def _subdirs(cls, path: Path) -> list[os.DirEntry[str]]:
+        out = []
+        for entry in cls._entries(path):
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    out.append(entry)
+            except OSError:
+                continue
+        return out
+
+    def prune_empty_dirs(self, sha: str) -> None:
+        """Remove the (now possibly empty) shard directories of ``sha``; rmdir only, so a directory that still holds
+        anything, or that a concurrent writer just refilled, is left alone."""
+        leaf = self._path(sha).parent
+        for directory in (leaf, leaf.parent):
+            try:
+                directory.rmdir()
+            except OSError:  # ENOTEMPTY, already gone, or busy: nothing to do
+                return
 
     def exists(self, sha: str) -> bool:
         return self._path(sha).is_file()
@@ -174,15 +202,26 @@ class BlobStore:
                 return sha  # dedupe hit on verified bytes
             # absent, or present but corrupt: install the verified bytes atomically (concurrent identical puts
             # write identical bytes, so the last rename winning is harmless)
-            self._mkdirs(final.parent)
-            os.replace(tmp_name, final)
-            self._fsync_dir(final.parent)
+            self._install(tmp_name, final)
             return sha
         finally:
             try:
                 os.unlink(tmp_name)
             except FileNotFoundError:
                 pass
+
+    def _install(self, tmp_name: str, final: Path) -> None:
+        """Move the verified temp file into place.  Housekeeping removes empty shard directories, so a directory
+        made a moment ago can vanish before the rename; retry the whole step a few times."""
+        for attempt in range(5):
+            try:
+                self._mkdirs(final.parent)
+                os.replace(tmp_name, final)
+                self._fsync_dir(final.parent)
+                return
+            except FileNotFoundError:
+                if attempt == 4 or not os.path.exists(tmp_name):
+                    raise
 
     @staticmethod
     def _intact(path: Path, sha: str) -> bool:

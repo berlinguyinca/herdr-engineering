@@ -21,6 +21,7 @@ LOCK_NS_BLOB = (
 )
 LOCK_NS_AGENT_TOKEN = 0x41544B4E  # "ATKN": per-member agent token mint cap (agent_tokens.py)
 LOCK_NS_PENDING_CLAIM = 0x504E4443  # "PNDC": per-owner pending-intake claims (library.py, Task 6)
+LOCK_NS_HOUSEKEEPING = 0x484B5050  # "HKPP": the housekeeping leader (one replica sweeps at a time)
 
 
 async def create_pool(dsn: str) -> asyncpg.Pool:

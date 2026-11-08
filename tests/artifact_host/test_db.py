@@ -53,6 +53,7 @@ def test_migrate_twice_is_idempotent(host_dsn: str) -> None:
         "0004_agent_tokens.sql",
         "0005_agent_scope.sql",
         "0006_removed_since.sql",
+        "0007_expired_event_unique.sql",
     ]
     assert second == []
 
@@ -66,7 +67,7 @@ def test_concurrent_migrators_apply_once(host_dsn: str) -> None:
             await pool.close()
 
     results = asyncio.run(go())
-    assert sorted(len(r) for r in results) == [0, 0, 0, 6]
+    assert sorted(len(r) for r in results) == [0, 0, 0, 7]
 
 
 def test_failed_migration_rolls_back_and_is_not_recorded(host_dsn: str, tmp_path: Path) -> None:
@@ -371,6 +372,7 @@ def test_migration_0005_shortens_existing_long_labels(host_dsn: str, tmp_path: P
             assert await Migrator(pool).migrate() == [
                 "0005_agent_scope.sql",
                 "0006_removed_since.sql",
+                "0007_expired_event_unique.sql",
             ]
             rows = await pool.fetch(
                 "SELECT char_length(label) AS n FROM agent_tokens ORDER BY token_id"
@@ -380,3 +382,58 @@ def test_migration_0005_shortens_existing_long_labels(host_dsn: str, tmp_path: P
             await pool.close()
 
     assert asyncio.run(go()) == [64, 64, 10]
+
+
+def test_migration_0007_dedupes_expired_events_then_enforces_uniqueness(
+    host_dsn: str, tmp_path: Path
+) -> None:
+    from herdr_artifact_host.db import packaged_migrations
+
+    for p in packaged_migrations().iterdir():
+        if p.name.endswith(".sql") and p.name < "0007":
+            (tmp_path / p.name).write_text(p.read_text(encoding="utf-8"))
+
+    async def go() -> tuple[list[int], bool]:
+        pool = await create_pool(host_dsn)
+        try:
+            await Migrator(pool, tmp_path).migrate()
+            await pool.execute(
+                "INSERT INTO artifacts (artifact_id, owner, created_by) VALUES ('a1','alice','alice')"
+            )
+            await pool.execute(
+                "INSERT INTO artifact_versions (version_id, artifact_id, version_number) VALUES ('v1','a1',1)"
+            )
+            await pool.execute(
+                "INSERT INTO shares (share_id, artifact_id, version_id, audience, token_hash, state, entry, "
+                "created_by) VALUES ('s1','a1','v1','public','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','live','index.html','alice')"
+            )
+            for _ in range(3):  # the old sweep could write the same expiry repeatedly
+                await pool.execute(
+                    "INSERT INTO share_events (share_id, kind, actor, at) "
+                    "VALUES ('s1','expired','housekeeping','2026-01-01T00:00:00Z')"
+                )
+            await pool.execute(
+                "INSERT INTO share_events (share_id, kind, actor, at) "
+                "VALUES ('s1','expired','housekeeping','2026-02-01T00:00:00Z')"
+            )
+            assert await Migrator(pool).migrate() == ["0007_expired_event_unique.sql"]
+            ids = [
+                r["event_id"]
+                for r in await pool.fetch(
+                    "SELECT event_id FROM share_events WHERE kind='expired' ORDER BY at"
+                )
+            ]
+            try:
+                await pool.execute(
+                    "INSERT INTO share_events (share_id, kind, actor, at) "
+                    "VALUES ('s1','expired','housekeeping','2026-02-01T00:00:00Z')"
+                )
+                rejected = False
+            except asyncpg.UniqueViolationError:
+                rejected = True
+            return ids, rejected
+        finally:
+            await pool.close()
+
+    ids, rejected = asyncio.run(go())
+    assert len(ids) == 2 and ids[0] < ids[1] and rejected

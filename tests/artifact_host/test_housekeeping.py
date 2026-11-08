@@ -15,8 +15,12 @@ import asyncpg
 
 from herdr_artifact_host.blobs import BlobStore
 from herdr_artifact_host.cognito import SyncedDirectory
-from herdr_artifact_host.db import LOCK_NS_BLOB, create_pool
-from herdr_artifact_host.housekeeping import Housekeeper, SweepReport
+from herdr_artifact_host.db import LOCK_NS_BLOB, LOCK_NS_HOUSEKEEPING, create_pool
+from herdr_artifact_host.housekeeping import (
+    Housekeeper,
+    SweepReport,
+    run_to_completion,
+)
 from herdr_artifact_host.library import LibraryStore
 from herdr_artifact_host.member_api import MemberLimits, MemberService
 from herdr_artifact_host.public_server import PublicServer
@@ -51,8 +55,17 @@ class Env:
         )
 
     async def share(
-        self, owner: str, *, state: str = "live", expires: datetime | None = None
+        self,
+        owner: str,
+        *,
+        state: str = "live",
+        expires: datetime | None = None,
+        seen: bool = True,
     ) -> str:
+        if seen:
+            await self.pool.execute(
+                "INSERT INTO member_usage (member_id) VALUES ($1) ON CONFLICT DO NOTHING", owner
+            )
         n = os.urandom(6).hex()
         aid, vid, sid = f"artifact_{n}", f"version_{n}", f"share_{n}"
         await self.pool.execute(
@@ -296,10 +309,10 @@ def test_orphan_blobs_past_grace_go_and_referenced_or_busy_ones_stay(
         assert not env.blobs.exists(orphan)
         assert env.blobs.exists(young) and env.blobs.exists(kept) and env.blobs.exists(busy)
         again = await env.keeper.run_once(
-            utc()
+            utc(), force_blob_gc=True
         )  # lock released: the (still unreferenced) blob goes now
         assert again.blobs_removed == 1 and not env.blobs.exists(busy)
-        assert (await env.keeper.run_once(utc())).blobs_removed == 0
+        assert (await env.keeper.run_once(utc(), force_blob_gc=True)).blobs_removed == 0
 
     run(migrated_dsn, tmp_path, body)
 
@@ -438,3 +451,241 @@ def test_run_forever_survives_a_failing_pass_and_cancels_cleanly(migrated_dsn, t
 def test_the_default_server_wiring_builds_a_housekeeper(migrated_dsn, tmp_path) -> None:
     with running_host(migrated_dsn, tmp_path) as host:
         assert host.server is not None and host.server.housekeeping_running
+
+
+# ---------------------------------------------------------------- fix round 1
+
+
+def test_only_bare_member_ids_the_host_has_seen_can_be_removed(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        now = utc()
+        keep = [
+            await env.share("member:bob", seen=False),  # control-plane principal shape
+            await env.share("agent:ag_1", seen=True),  # even with a usage row: not a bare member id
+            await env.share("ci-key:7", seen=True),
+            await env.share(
+                "legacy_import", seen=False
+            ),  # bare, but the host never saw this member
+        ]
+        gone = await env.share("alice")  # seen and missing from the listing
+        _write_directory(env.sync, ["zed"])
+        await env.keeper.run_once(now)
+        report = await env.keeper.run_once(now + 2 * HOUR)
+        assert report.shares_revoked == 1 and await env.state(gone) == "revoked"
+        assert [await env.state(s) for s in keep] == ["live"] * 4
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_the_real_sync_script_output_drives_disabled_revocation(migrated_dsn, tmp_path) -> None:
+    import re
+    import subprocess
+    import sys
+
+    script = (Path(__file__).parents[2] / "deploy/control-plane/collab-sync.sh").read_text()
+    match = re.search(r"python3 - ([^\n]*members\.json[^\n]*) <<'PY'\n(.*?)\nPY\n", script, re.S)
+    assert match is not None and "disabled" in match.group(2)
+    work = tmp_path / "script"
+    work.mkdir()
+    (work / "users.json").write_text(json.dumps(["alice", "bob", "carol"]))
+    (work / "disabled.json").write_text(json.dumps(["alice"]))
+    (work / "rakazo.json").write_text("[]")
+    argv = {
+        "$tmp/users.json": str(work / "users.json"),
+        "$tmp/members.json": str(work / "members.json"),
+        "$GROUP": GROUP,
+        "$tmp/rakazo.json": str(work / "rakazo.json"),
+        "$RAKAZO_GROUP": "",
+        "$tmp/disabled.json": str(work / "disabled.json"),
+    }
+    words = [argv[w.strip('"')] for w in match.group(1).split()]
+    subprocess.run([sys.executable, "-", *words], input=match.group(2), text=True, check=True)
+    doc = json.loads((work / "members.json").read_text())
+    assert doc["groups"] == {GROUP: ["alice", "bob", "carol"]} and doc["disabled"] == ["alice"]
+    snap = SyncedDirectory(str(work), GROUP).snapshot()
+    assert snap.members == {"alice", "bob", "carol"} and snap.disabled == {"alice"}
+    assert SyncedDirectory(str(work), GROUP).groups("bob") == [
+        GROUP
+    ]  # existing consumers unaffected
+
+    async def body(env: Env) -> None:
+        sid, other = await env.share("alice"), await env.share("bob")
+        env.sync.mkdir(parents=True, exist_ok=True)
+        (env.sync / "members.json").write_text((work / "members.json").read_text())
+        report = await env.keeper.run_once(utc())
+        assert report.shares_revoked == 1
+        assert await env.state(sid) == "revoked" and await env.state(other) == "live"
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_blob_gc_runs_on_its_own_slower_cadence(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        now = utc()
+        assert env.keeper.config.blob_gc_every == 900
+        first = env.blob(b"first", age=2 * HOUR)
+        assert (await env.keeper.run_once(now)).blobs_removed == 1 and not env.blobs.exists(first)
+        second = env.blob(b"second", age=2 * HOUR)
+        assert (await env.keeper.run_once(now + timedelta(minutes=1))).blobs_removed == 0
+        assert env.blobs.exists(second)
+        assert (await env.keeper.run_once(now + timedelta(minutes=14))).blobs_removed == 0
+        assert (await env.keeper.run_once(now + timedelta(minutes=16))).blobs_removed == 1
+        third = env.blob(b"third", age=2 * HOUR)
+        assert (
+            await env.keeper.run_once(now + timedelta(minutes=17), force_blob_gc=True)
+        ).blobs_removed == 1
+        assert not env.blobs.exists(third)
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_collect_rechecks_the_ledger_under_the_lock(migrated_dsn, tmp_path) -> None:
+    """A publish that commits its row after the listing but before the lock: _collect itself must keep the blob."""
+
+    async def body(env: Env) -> None:
+        cutoff = time.time() - 3600
+        control = env.blob(b"nobody published this", age=2 * HOUR)
+        assert (
+            await env.keeper._collect(control, cutoff) is True
+        )  # the same call does delete an orphan
+        sha = env.blob(b"published meanwhile", age=2 * HOUR)
+        await env.pool.execute(
+            "INSERT INTO artifact_blobs (sha256, size_bytes) VALUES ($1, 1)", sha
+        )
+        assert await env.keeper._collect(sha, cutoff) is False and env.blobs.exists(sha)
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_collect_rechecks_manifests_under_the_lock(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        sha = env.blob(b"manifest meanwhile", age=2 * HOUR)
+        await env.pool.execute("INSERT INTO artifacts (artifact_id, owner) VALUES ('a1','alice')")
+        await env.pool.execute(
+            "INSERT INTO artifact_versions (version_id, artifact_id, version_number, output_manifest) "
+            "VALUES ('v1','a1',1,$1::jsonb)",
+            json.dumps([{"name": "i.html", "sha256": sha, "size_bytes": 1}]),
+        )
+        assert await env.keeper._collect(sha, time.time() - 3600) is False
+        assert env.blobs.exists(sha)
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_collect_keeps_a_blob_rewritten_after_it_was_listed(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        sha = env.blob(b"listed old", age=2 * HOUR)
+        cutoff = time.time() - 3600
+        old = [s for s, m in env.blobs.iter_blobs() if m < cutoff]
+        assert old == [sha]
+        os.utime(env.blobs._path(sha))  # a publish re-wrote the same content after the listing
+        assert await env.keeper._collect(sha, cutoff) is False and env.blobs.exists(sha)
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_a_share_expiry_is_recorded_once_per_expiry_even_when_extended(
+    migrated_dsn, tmp_path
+) -> None:
+    async def body(env: Env) -> None:
+        now = utc()
+        sid = await env.share("alice", expires=now + HOUR)
+        assert (await env.keeper.run_once(now + 2 * HOUR)).shares_expired == 1
+        await env.pool.execute(
+            "UPDATE shares SET expires_at=$2 WHERE share_id=$1", sid, now + 5 * HOUR
+        )
+        assert (await env.keeper.run_once(now + 3 * HOUR)).shares_expired == 0
+        assert (
+            await env.keeper.run_once(now + 6 * HOUR)
+        ).shares_expired == 1  # a new expiry, a new event
+        assert (await env.keeper.run_once(now + 7 * HOUR)).shares_expired == 0
+        count = await env.pool.fetchval("SELECT count(*) FROM share_events WHERE kind='expired'")
+        assert count == 2
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_expiry_does_not_rescan_the_distant_past(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        now = utc()
+        await env.share("alice", expires=now - timedelta(days=8))
+        recent = await env.share("alice", expires=now - timedelta(days=6))
+        assert (await env.keeper.run_once(now)).shares_expired == 1
+        row = await env.pool.fetchval("SELECT share_id FROM share_events WHERE kind='expired'")
+        assert row == recent
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_only_one_replica_sweeps_at_a_time(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        now = utc()
+        await env.share("alice", expires=now - HOUR)
+        async with env.pool.acquire() as holder:
+            await holder.execute(
+                "SELECT pg_advisory_lock($1, hashtext('sweep'))", LOCK_NS_HOUSEKEEPING
+            )
+            try:
+                report = await env.keeper.run_once(now)
+            finally:
+                await holder.execute("SELECT pg_advisory_unlock_all()")
+        assert report.skipped and report.shares_expired == 0
+        report = await env.keeper.run_once(
+            now
+        )  # the lock was released (and run_once releases its own)
+        assert not report.skipped and report.shares_expired == 1
+        assert not (await env.keeper.run_once(now)).skipped
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_a_pass_that_changed_something_logs_counts_only(migrated_dsn, tmp_path, caplog) -> None:
+    async def body(env: Env) -> None:
+        now = utc()
+        await env.share("alice-secret-name", expires=now - HOUR)
+        with caplog.at_level("INFO", logger="herdr_artifact_host.housekeeping"):
+            await env.keeper.run_once(now)
+            quiet = len(caplog.records)
+            await env.keeper.run_once(now)  # nothing changed: no line
+            assert len(caplog.records) == quiet
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert "shares_expired=1" in text and "alice" not in text and "share_" not in text
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_run_to_completion_finishes_the_thread_before_cancellation_surfaces() -> None:
+    done: list[str] = []
+
+    def slow() -> str:
+        time.sleep(0.3)
+        done.append("finished")
+        return "ok"
+
+    async def go() -> None:
+        task = asyncio.create_task(run_to_completion(slow))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            assert done == ["finished"]  # the unlink-like work was not abandoned half way
+        else:
+            raise AssertionError("cancellation was swallowed")
+
+    asyncio.run(go())
+
+
+def test_gc_removes_empty_shard_directories_but_not_busy_ones(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        orphan = env.blob(b"alone in its shard", age=2 * HOUR)
+        shard = env.blobs._path(orphan).parent
+        assert (await env.keeper.run_once(utc())).blobs_removed == 1
+        assert not shard.exists() and not shard.parent.exists()
+        sibling = env.blob(b"sibling", age=2 * HOUR)
+        keeper_shard = env.blobs._path(sibling).parent
+        (keeper_shard / ("f" * 64)).write_bytes(b"x")  # something else lives in the shard
+        (await env.keeper.run_once(utc(), force_blob_gc=True))
+        assert keeper_shard.is_dir()
+
+    run(migrated_dsn, tmp_path, body)
