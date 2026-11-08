@@ -208,36 +208,40 @@ def room_label(room: dict) -> str | None:
     return (room.get("fabric_workspace") or {}).get("label")
 
 
+def _ws_token(value: Any) -> str | None:
+    """A herdr id (workspace, tab or pane) when it is well formed, else None."""
+    return value if isinstance(value, str) and WS_ID.fullmatch(value) else None
+
+
+def clean_label(value: Any, *, truncate: bool = False) -> str | None:
+    """The display label: stripped, no control, format (bidi) or line-separator characters, at most ``WS_LABEL_MAX``. A bad label is
+    dropped (None), never an error, unless ``truncate`` (the clients) which repairs it instead."""
+    if not isinstance(value, str):
+        return None
+    if truncate:
+        value = "".join(c for c in value if unicodedata.category(c)[0] != "C" and unicodedata.category(c) not in ("Zl", "Zp"))
+    value = value.strip()
+    if truncate:
+        value = value[:WS_LABEL_MAX].strip()
+    bad = len(value) > WS_LABEL_MAX or any(unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp") for c in value)
+    return None if bad or not value else value
+
+
 def _parse_workspace(body: dict) -> dict | None:
-    """``workspace={"id","label"}`` plus informational ``tab_id``/``pane_id``. Strict: anything else is a 400. Returns None when no
-    workspace was sent. The label is display only; the id is self-asserted (see fabric-trust-threat-model.md)."""
+    """``workspace={"id","label"}`` plus informational ``tab_id``/``pane_id``. Only a malformed workspace OBJECT or id is a 400; the
+    display-only label, tab and pane are dropped when invalid so they can never fail a join. None when no workspace was sent. The id is
+    self-asserted (see fabric-trust-threat-model.md)."""
     from .collab import CollabError
-    tab, pane = (_ws_token(body.get(k), k) for k in ("tab_id", "pane_id")) if ("tab_id" in body or "pane_id" in body) else (None, None)
-    raw = body.get("workspace")
     if "workspace" not in body:
         return None
+    raw = body["workspace"]
     if not isinstance(raw, dict) or set(raw) - {"id", "label"}:
         raise CollabError(400, "workspace must be {id, label}")
-    wid = _ws_token(raw.get("id"), "workspace.id")
+    wid = _ws_token(raw.get("id"))
     if wid is None:
-        raise CollabError(400, "workspace.id is required")
-    label = raw.get("label")
-    if label is not None:
-        if not isinstance(label, str):
-            raise CollabError(400, "workspace.label must be a string")
-        label = label.strip()
-        if len(label) > WS_LABEL_MAX or any(unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp") for c in label):
-            raise CollabError(400, f"workspace.label must be at most {WS_LABEL_MAX} printable characters")
-    return {"id": wid, "label": label or None, "tab_id": tab, "pane_id": pane}
-
-
-def _ws_token(value: Any, what: str) -> str | None:
-    from .collab import CollabError
-    if value is None:
-        return None
-    if not isinstance(value, str) or not WS_ID.fullmatch(value):
-        raise CollabError(400, f"{what} must be 1-64 characters: letters, digits, dot, underscore, colon, hyphen")
-    return value
+        raise CollabError(400, "workspace.id must be 1-64 characters: letters, digits, dot, underscore, colon, hyphen")
+    return {"id": wid, "label": clean_label(raw.get("label")), "tab_id": _ws_token(body.get("tab_id")),
+            "pane_id": _ws_token(body.get("pane_id"))}
 
 
 def _real_peer(peer_ip: str | None) -> str | None:
@@ -421,17 +425,19 @@ class FabricAuthMixin:
                     # into more rooms. Nothing changes, not even the renewal.
                     self._join_denied(owner, machine, "fabric_join_workspace_changed", name, aid)
                     raise CollabError(409, "this agent already joined a different workspace; use another name for it")
+                bind = ws is not None and not agent.get("workspace")
+                if bind:                                             # every check BEFORE anything is written: a refusal writes nothing
+                    self._ws_precheck(owner, machine, ws, name, aid)
                 expires = self._fabric_renew_due(agent)             # not throttled: it creates nothing, and is written once a day at most
                 if expires is not None:
                     self._commit("agent_fabric_set", self._join_actor(owner, machine) | {
                         "agent_id": aid, "fabric": True, "machine": machine, "fabric_expires_at": expires, "origin": JOIN_ORIGIN,
                         "action": "agent.fabric.renew", "outcome": "allowed", "project_ids": [], "resource_id": aid})
                 out = {"agent_id": aid, "name": name, "machine": machine, "fabric_expires_at": agent["fabric_expires_at"]}
+                if bind:
+                    self._ws_bind(owner, machine, aid, name, ws)
                 if ws is not None:
-                    if not agent.get("workspace"):
-                        self._ws_precheck(owner, machine, ws, name, aid)
-                        self._ws_bind(owner, machine, aid, name, ws)
-                    out |= self._ws_view(agent)
+                    out |= self._ws_view(aid)
                 return 200, out
             # a new agent. Bounds first (a refusal costs the caller's budget nothing), then the per-machine creation rate.
             if ws is not None:
@@ -461,48 +467,57 @@ class FabricAuthMixin:
             out = {"agent_id": aid, "name": name, "machine": machine, "fabric_expires_at": expires}
             if ws is not None:
                 self._ws_bind(owner, machine, aid, name, ws)
-                out |= self._ws_view(self._agents[aid])
+                out |= self._ws_view(aid)
         return 201, out
 
     # ---- workspace rooms: one ordinary room per (whois machine, workspace id); the machine is never client supplied
-    def _ws_members(self, room_id: str) -> int:
+    def _ws_live_rooms(self, machine: str | None = None) -> set[str]:
+        """Workspace rooms that have at least one active agent bound to them. Only live rooms spend a cap slot: a room whose agents are
+        all revoked is still found by its key and reused, but costs nothing, so revoking agents frees the caps."""
+        return {a["workspace"]["room_id"] for a in self._agents.values()
+                if a.get("workspace") and a["status"] == "active" and (machine is None or a["workspace"]["machine"] == machine)}
+
+    def _ws_members(self, room_id: str, skip: str | None = None) -> int:
         room = self._rooms[room_id]
-        return sum(1 for a in room["grants"] if self._agents.get(a, {}).get("status") == "active")
+        return sum(1 for a in room["grants"] if a != skip and self._agents.get(a, {}).get("status") == "active")
 
     def _ws_precheck(self, owner: str, machine: str, ws: dict, name: str, aid: str | None) -> None:
-        """Bounds and name clashes, BEFORE anything is written. Fail closed with a 429 and a throttled audit row. Caller holds the lock."""
+        """Bounds and name clashes, BEFORE anything is written. Fail closed with a 429 and a throttled audit row. The joining agent never
+        counts against the member cap. Caller holds the lock."""
         from .collab import CollabError
         cfg = self.fabric_trust_cfg()
         room_id = self._fabric_ws_rooms.get((machine, ws["id"]))
-        if room_id is None:
-            if sum(1 for (m, _w) in self._fabric_ws_rooms if m == machine) >= cfg["workspace_rooms_per_machine"]:
+        if room_id is None or room_id not in self._ws_live_rooms():     # a new room, or an empty one coming back to life
+            if len(self._ws_live_rooms(machine)) >= cfg["workspace_rooms_per_machine"]:
                 self._join_denied(owner, machine, "fabric_ws_machine_cap", name, aid)
                 raise CollabError(429, "workspace room limit reached for this machine")
-            if len(self._fabric_ws_rooms) >= cfg["workspace_rooms_total"]:
+            if len(self._ws_live_rooms()) >= cfg["workspace_rooms_total"]:
                 self._join_denied(owner, machine, "fabric_ws_total_cap", name, aid)
                 raise CollabError(429, "workspace room limit reached")
+        if room_id is None:
             return
-        if self._ws_members(room_id) >= cfg["workspace_room_members"]:
+        if self._ws_members(room_id, skip=aid) >= cfg["workspace_room_members"]:
             self._join_denied(owner, machine, "fabric_ws_members_cap", name, aid)
             raise CollabError(429, "this workspace room is full")
         self._name_free(self._rooms[room_id], aid or "", name)           # a 409 now, not after the agent exists
 
     def _ws_bind(self, owner: str, machine: str, aid: str, name: str, ws: dict) -> None:
         """Find (or lazily create) the workspace room and give ``aid`` its grant in ONE event, so the binding and the grant cannot
-        diverge. Creates through ``_commit`` only; audit rows carry ``via: fabric``. Caller holds the lock."""
+        diverge. Room and project are found by key first, so a half-done bind (room written, grant not) self-heals: the next join reuses
+        the room instead of creating a second. Creates through ``_commit`` only; audit rows carry ``via: "fabric"``. Caller holds the lock."""
         from .collab import ids
         actor = self._join_actor(owner, machine)
         room_id = self._fabric_ws_rooms.get((machine, ws["id"]))
         if room_id is None:
-            project_id = self._fabric_ws_project
-            if project_id is None or project_id not in self._projects:
+            project_id = self._fabric_ws_project            # pinned: the first flagged project_created, on replay and at runtime alike
+            if project_id is None:
                 project_id = ids.new_id("project")
                 self._commit("project_created", actor | {
                     "project_id": project_id, "name": WS_PROJECT_NAME, "fabric_workspaces": True, "action": "project.create",
                     "outcome": "allowed", "project_ids": [project_id], "resource_id": project_id})
             room_id = ids.new_id("room")
             self._commit("room_created", actor | {
-                "project_id": project_id, "room_id": room_id, "name": f"{machine}/{ws['label'] or ws['id']}"[:120],
+                "project_id": project_id, "room_id": room_id, "name": f"{machine}/{ws['id']}",
                 "fabric_workspace": {"machine": machine, "workspace_id": ws["id"], "label": ws["label"]},
                 "action": "room.create", "outcome": "allowed", "project_ids": [project_id], "resource_id": room_id})
         room = self._rooms[room_id]
@@ -512,11 +527,17 @@ class FabricAuthMixin:
                                  "pane_id": ws["pane_id"]},
             "action": "agent.grant", "outcome": "allowed", "project_ids": [room["project_id"]], "resource_id": aid})
 
-    def _ws_view(self, agent: dict) -> dict:
-        w = agent.get("workspace")
+    def _ws_view(self, aid: str) -> dict:
+        """The workspace answer. ``room_id`` is reported only while the agent still holds the full auto-grant: if the owner removed or
+        narrowed it, the binding is returned without room access and nothing is re-granted (the owner's decision wins)."""
+        w = self._agents[aid].get("workspace")
         if not w:
             return {}
-        return {"room_id": w["room_id"], "workspace": {"id": w["workspace_id"], "label": w.get("label")}}
+        grant = (self._rooms.get(w["room_id"]) or {}).get("grants", {}).get(aid)
+        view: dict[str, Any] = {"workspace": {"id": w["workspace_id"], "label": w.get("label")}}
+        if grant is not None and set(WS_ACTIONS) <= set(grant["actions"]):
+            return view | {"room_id": w["room_id"], "room_access": True}
+        return view | {"room_access": False}
 
     def _fabric_still_valid(self, pr) -> bool:
         """Everything ``_fabric_authenticate`` checked, again, for a stream that is still open. tailscaled is asked outside the

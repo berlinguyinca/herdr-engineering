@@ -118,7 +118,7 @@ def test_first_join_creates_the_room_and_grants_the_agent(ww):
     assert out["workspace"] == {"id": "w1", "label": "my ws"} and out["room_id"] in ww.s._rooms
     room = ww.s._rooms[out["room_id"]]
     assert room["created_by"] == OWNER and room["members"][OWNER]["role"] == "owner"
-    assert room["name"] == "bender/my ws"
+    assert room["name"] == "bender/w1"
     proj = ww.s._projects[room["project_id"]]
     assert proj["name"] == "fabric-workspaces" and proj["members"] == {OWNER: "manager"}
     assert sorted(room["grants"][out["agent_id"]]["actions"]) == PEER_ACTIONS
@@ -177,7 +177,7 @@ def test_a_repeat_join_is_idempotent_and_writes_nothing_new(ww):
     status, again = jw(ww, "a-1", label="renamed")
     assert status == 200 and again["room_id"] == a["room_id"] and again["agent_id"] == a["agent_id"]
     assert len(ww.s._log) == n
-    assert ww.s._rooms[a["room_id"]]["name"] == "bender/L"
+    assert ww.s._rooms[a["room_id"]]["name"] == "bender/w1"
 
 
 def test_the_workspace_label_is_display_only(ww):
@@ -185,7 +185,8 @@ def test_the_workspace_label_is_display_only(ww):
     _, b = jw(ww, "a-2", label="different")
     assert a["room_id"] == b["room_id"]                                              # the id is the key
     _, c = jw(ww, "a-3", ws="w9")
-    assert ww.s._rooms[c["room_id"]]["name"] == "bender/w9"                          # no label: the id names it
+    assert ww.s._rooms[c["room_id"]]["name"] == "bender/w9"
+    assert ww.s._rooms[a["room_id"]]["name"] == "bender/w1"                          # the label never names the room
 
 
 def test_no_workspace_is_exactly_the_old_behaviour(ww):
@@ -221,10 +222,7 @@ def test_workspace_ids_are_validated(ww, bad):
 
 
 @pytest.mark.parametrize("body", [{"workspace": "w1"}, {"workspace": []}, {"workspace": {}}, {"workspace": {"id": "w1", "x": 1}},
-                                  {"workspace": {"id": "w1", "label": 5}}, {"workspace": {"id": "w1", "label": "x" * 65}},
-                                  {"workspace": {"id": "w1", "label": "a\x00b"}}, {"workspace": {"id": "w1", "label": "a b"}},
-                                  {"workspace": {"id": "w1"}, "tab_id": "bad id"}, {"workspace": {"id": "w1"}, "pane_id": 3},
-                                  {"workspace": {"id": "w1"}, "tab_id": "t" * 65}, {"workspace": {"id": "w1"}, "extra": 1}])
+                                  {"workspace": {"id": "bad id"}}, {"workspace": {"id": "w1"}, "extra": 1}])
 def test_workspace_shapes_are_validated(ww, body):
     assert join(ww, name="a-1", body=body)[0] == 400
     assert not ws_rooms(ww)
@@ -468,3 +466,115 @@ def test_owner_changes_survive_later_auto_joins_and_a_restart(ww):
         assert sorted(room["grants"][a["agent_id"]]["actions"]) == ["post", "read"]
         assert sorted(room["grants"][b["agent_id"]]["actions"]) == PEER_ACTIONS
     assert fresh._fabric_ws_rooms[("bender", "w1")] == a["room_id"]
+
+
+# ------------------------------------------------------------------ review fixes
+@pytest.mark.parametrize("extra", [{"label": 5}, {"label": "x" * 65}, {"label": "a\x00b"}, {"label": "a\u2028b"}, {"label": "a\u202eb"},
+                                   {"label": "a\u200bb"}])
+def test_an_invalid_label_is_dropped_and_never_fails_the_join(ww, extra):
+    status, out = join(ww, name="a-1", body={"workspace": {"id": "w1", **extra}})
+    assert status == 201 and out["workspace"] == {"id": "w1", "label": None} and out["room_id"]
+
+
+@pytest.mark.parametrize("body", [{"tab_id": "bad id"}, {"pane_id": 3}, {"tab_id": "t" * 65}, {"pane_id": ["x"]}])
+def test_an_invalid_tab_or_pane_is_dropped_and_never_fails_the_join(ww, body):
+    status, out = join(ww, name="a-1", body={"workspace": {"id": "w1"}, **body})
+    assert status == 201 and out["room_id"]
+    w = ww.s._agents[out["agent_id"]]["workspace"]
+    assert w["tab_id"] is None or "tab_id" not in body
+    assert w["pane_id"] is None or "pane_id" not in body
+
+
+def test_the_label_is_a_separate_advisory_field_first_joiner_chosen(ww):
+    _, a = jw(ww, "a-1", label="first")
+    _, b = jw(ww, "a-2", label="second")
+    assert a["workspace"]["label"] == "first" and b["workspace"]["label"] == "first"
+    assert ww.s._rooms[a["room_id"]]["name"] == "bender/w1"
+
+
+def test_rejoin_after_the_owner_removed_the_grant_reports_no_room_access_and_does_not_regrant(ww):
+    _, a = jw(ww, "a-1")
+    ww.s.remove_agent_from_room(ww.alice, a["room_id"], a["agent_id"])
+    n = len(ww.s._log)
+    status, out = jw(ww, "a-1")
+    assert status == 200 and "room_id" not in out and out["room_access"] is False and out["workspace"]["id"] == "w1"
+    assert a["agent_id"] not in ww.s._rooms[a["room_id"]]["grants"] and len(ww.s._log) == n
+
+
+def test_rejoin_after_the_owner_narrowed_the_grant_reports_no_room_access(ww):
+    _, a = jw(ww, "a-1")
+    ww.s.grant_agent(ww.alice, a["room_id"], {"agent_id": a["agent_id"], "actions": ["read"]})
+    status, out = jw(ww, "a-1")
+    assert status == 200 and "room_id" not in out and out["room_access"] is False
+    assert ww.s._rooms[a["room_id"]]["grants"][a["agent_id"]]["actions"] == ["read"]
+    _, ok = jw(ww, "a-2")
+    assert ok["room_access"] is True and ok["room_id"] == a["room_id"]
+
+
+def test_a_refused_rejoin_writes_nothing_not_even_the_renewal(ww):
+    set_ws(ww, workspace_room_members=1)
+    _, plain = join(ww, name="late")                                                  # joined without a workspace
+    assert jw(ww, "first")[0] == 201                                                  # fills the one seat of w1
+    ww.s.clock.t += 5 * 86400                                                         # the renewal is now due
+    before = [e for e in ww.s._log if e["event_type"] != "audit_denied"]
+    assert jw(ww, "late")[0] == 429
+    assert [e for e in ww.s._log if e["event_type"] != "audit_denied"] == before
+    assert ww.s._agents[plain["agent_id"]]["fabric_expires_at"] == plain["fabric_expires_at"]
+
+
+def test_the_member_cap_does_not_count_the_joining_agent_itself(ww):
+    set_ws(ww, workspace_room_members=2)
+    _, a = jw(ww, "a-1")
+    _, other = jw(ww, "a-2")                                                          # room is now full (2 of 2)
+    _, plain = join(ww, name="late")
+    out = ww.s.grant_agent(ww.alice, a["room_id"], {"agent_id": plain["agent_id"], "actions": ["read"]})
+    if out["status"] == "pending":
+        ww.s.decide_agent_request(ww.alice, a["room_id"], out["request_id"], {"decision": "approve"})
+    ww.s.remove_agent_from_room(ww.alice, a["room_id"], other["agent_id"])           # room: a-1 + late = 2 of 2
+    status, again = jw(ww, "late")
+    assert status == 200 and again["room_id"] == a["room_id"]
+
+
+def test_caps_count_only_live_rooms_and_an_empty_room_is_reused_not_duplicated(ww):
+    set_ws(ww, workspace_rooms_per_machine=2, workspace_rooms_total=2)
+    _, a = jw(ww, "a-1", ws="w1")
+    _, b = jw(ww, "a-2", ws="w2")
+    assert jw(ww, "a-3", ws="w3")[0] == 429
+    ww.s.revoke_agent(ww.alice, a["agent_id"])
+    ww.s.revoke_agent(ww.alice, b["agent_id"])                                        # both rooms are empty now
+    assert jw(ww, "n-3", ws="w3")[0] == 201 and jw(ww, "n-4", ws="w4")[0] == 201      # new workspaces fit again
+    assert jw(ww, "n-5", ws="w5")[0] == 429                                           # but the cap still holds for live rooms
+    rooms_before = len(ww.s._rooms)
+    ww.s.revoke_agent(ww.alice, next(x for x, v in ww.s._agents.items() if v["name"] == "n-3"))
+    status, again = jw(ww, "n-6", ws="w1")                                            # the old room comes back, not a duplicate
+    assert status == 201 and again["room_id"] == a["room_id"] and len(ww.s._rooms) == rooms_before
+
+
+def test_a_half_done_bind_self_heals_without_a_duplicate_room(ww):
+    from herdr_engineering.control_plane import collab_fabric_trust as ft
+    actor = ww.s._join_actor(OWNER, "bender")
+    ww.s._commit("project_created", actor | {"project_id": "project_orphan", "name": ft.WS_PROJECT_NAME, "fabric_workspaces": True,
+                                            "action": "project.create", "outcome": "allowed", "project_ids": ["project_orphan"],
+                                            "resource_id": "project_orphan"})
+    ww.s._commit("room_created", actor | {"project_id": "project_orphan", "room_id": "room_orphan", "name": "bender/w1",
+                                          "fabric_workspace": {"machine": "bender", "workspace_id": "w1", "label": None},
+                                          "action": "room.create", "outcome": "allowed", "project_ids": ["project_orphan"],
+                                          "resource_id": "room_orphan"})                  # the crash happened before the grant
+    status, out = jw(ww, "a-1")
+    assert status == 201 and out["room_id"] == "room_orphan" and len(ws_rooms(ww)) == 1
+
+
+def test_the_workspaces_project_is_pinned_across_replay_and_never_duplicated(ww):
+    _, a = jw(ww, "a-1", ws="w1")
+    proj = ww.s._rooms[a["room_id"]]["project_id"]
+    fresh = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in USERS.items()}), now=ww.s._now)
+    fresh.hydrate(list(ww.s._log))
+    fresh.fabric_trust = normalize_fabric_trust(trust(auto_join=True, workspace_rooms=True))
+    fresh.fabric_resolver = FabricPeerResolver(fresh.fabric_trust_cfg, whois=ww.s.fabric_resolver.whois)
+    status, b = fresh.dispatch("POST", ["agents", "fabric-join"], {}, {"name": "b-1", "workspace": {"id": "w2"}}, "", None,
+                               peer_ip=BENDER, fabric_listener=True, fabric_owner=OWNER)
+    assert status == 201 and fresh._rooms[b["room_id"]]["project_id"] == proj
+    flagged = [e for e in fresh._log if e["event_type"] == "project_created" and e["payload"].get("fabric_workspaces")] \
+        if hasattr(fresh, "_log") else []
+    assert len(flagged) <= 1 and fresh._fabric_ws_project == proj
+    assert [p for p in fresh._projects.values() if p["name"] == "fabric-workspaces"] == [fresh._projects[proj]]
