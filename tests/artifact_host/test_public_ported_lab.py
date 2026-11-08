@@ -532,9 +532,11 @@ def test_a_full_render_queue_is_a_busy_503_and_clears_once_the_child_is_replaced
     try:
         for t in waiting:
             t.start()
-        time.sleep(
-            1.0
-        )  # all of them are inside the render queue now, stuck behind the stopped child
+        deadline = time.monotonic() + 15
+        # all of them are inside the render queue (every pending slot taken), stuck behind the stopped child
+        while share_render._WORKER._pending._value > 0:
+            assert time.monotonic() < deadline, "the renders never filled the queue"
+            time.sleep(0.02)
         busy = view(host, s, sess, f"p{cap + 1}.html")
         assert busy.status == 503 and busy.body == UNAVAILABLE_BODY
         assert busy.header("Retry-After") == "5"

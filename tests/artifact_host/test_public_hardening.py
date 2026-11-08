@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import http.client
 import json
 import os
 import socket
@@ -391,11 +392,29 @@ def test_internal_errors_log_no_traceback(host: Host, caplog: pytest.LogCaptureF
 # ----------------------------------------------------------------------------- M5: cancellation propagates
 
 
+class GatedFile:
+    """A real file-like object whose first read parks (in the worker thread) until released, so the handler is known
+    to be suspended inside ``stream`` when the client goes away."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def seek(self, offset: int) -> int:
+        return offset
+
+    def read(self, n: int) -> bytes:
+        self.entered.set()
+        self.release.wait(20)
+        return b"x" * n
+
+    def close(self) -> None:
+        self.release.set()
+
+
 def test_a_cancelled_stream_is_not_swallowed(migrated_dsn: str, tmp_path: Path) -> None:
-    big = tmp_path / "big"
-    with big.open("wb") as fh:
-        fh.truncate(512 << 20)
     outcome: dict[str, str] = {}
+    gate = GatedFile()
 
     async def go() -> None:
         pool = await asyncpg.create_pool(migrated_dsn, min_size=1, max_size=2)
@@ -408,15 +427,14 @@ def test_a_cancelled_stream_is_not_swallowed(migrated_dsn: str, tmp_path: Path) 
             done = asyncio.Event()
 
             async def route(request: web.Request) -> web.StreamResponse:
-                handle = big.open("rb")
                 try:
                     resp = await surface.stream(
                         request,
                         200,
                         [("Content-Type", "application/octet-stream")],
-                        handle,
+                        gate,
                         0,
-                        512 << 20,
+                        1 << 20,
                     )
                     outcome["result"] = "completed"
                     return resp
@@ -424,7 +442,7 @@ def test_a_cancelled_stream_is_not_swallowed(migrated_dsn: str, tmp_path: Path) 
                     outcome["result"] = "cancelled"
                     raise
                 finally:
-                    handle.close()
+                    gate.release.set()
                     done.set()
 
             inner = web.Application()
@@ -439,15 +457,15 @@ def test_a_cancelled_stream_is_not_swallowed(migrated_dsn: str, tmp_path: Path) 
             reader, writer = await asyncio.open_connection("127.0.0.1", port)
             writer.write(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
             await writer.drain()
-            await reader.read(1024)
-            sock = writer.get_extra_info("socket")
-            sock.setsockopt(
-                socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00"
-            )
-            writer.close()
+            await reader.read(1024)  # headers: the handler is now in stream()
+            assert await asyncio.to_thread(
+                gate.entered.wait, 10
+            )  # and parked inside its first read
+            writer.close()  # only now does the client go away
             await asyncio.wait_for(done.wait(), 20)
             await runner.cleanup()
         finally:
+            gate.release.set()
             await pool.close()
 
     asyncio.run(go())
@@ -816,3 +834,106 @@ def test_concurrent_full_blob_verifications_are_capped_and_saturation_is_a_503(h
             sock.close()
     # slots are released: the next full read is served
     assert host.get(f"/s/{s.token}/f/index.html").status == 200
+
+
+# ----------------------------------------------------------------------------- round 3: stop() and /healthz robustness
+
+
+def test_stop_cleans_every_runner_even_when_one_cleanup_raises(
+    migrated_dsn: str, tmp_path: Path
+) -> None:
+    class FailingRunner(public_server._UniformRunner):
+        async def cleanup(self) -> None:
+            await super().cleanup()
+            raise RuntimeError("cleanup failed")
+
+    async def go() -> tuple[int, int]:
+        pool = await asyncpg.create_pool(migrated_dsn, min_size=1, max_size=2)
+        try:
+            sync = make_sync_dir(tmp_path / "sync")
+            app = build_app(
+                default_config(None, sync), pool, BlobStore(tmp_path / "blobs"), LibraryStore(pool)
+            )
+            server = public_server.PublicServer(app)
+            await server.start()
+            public, health = server.port, server.health_port
+            failing = FailingRunner(web.Application())
+            await failing.setup()
+            server._runners.append(failing)  # cleaned FIRST (stop() goes in reverse order)
+            with pytest.raises(RuntimeError, match="cleanup failed"):
+                await server.stop()
+            assert server._runners == []
+            return public, health
+        finally:
+            await pool.close()
+
+    public, health = asyncio.run(go())
+    for port in (public, health):  # both real listeners were closed despite the failure
+        with socket.socket() as probe:
+            assert probe.connect_ex(("127.0.0.1", port)) != 0
+
+
+def test_a_runner_whose_setup_fails_is_still_tracked_and_cleaned(
+    migrated_dsn: str, tmp_path: Path
+) -> None:
+    async def go() -> None:
+        pool = await asyncpg.create_pool(migrated_dsn, min_size=1, max_size=2)
+        try:
+            sync = make_sync_dir(tmp_path / "sync")
+            app = build_app(
+                default_config(None, sync), pool, BlobStore(tmp_path / "blobs"), LibraryStore(pool)
+            )
+            seen: list[str] = []
+
+            async def boom(_: web.Application) -> None:
+                seen.append("startup")
+                raise RuntimeError("startup hook failed")
+
+            app.on_startup.append(boom)  # a real setup() failure
+            server = public_server.PublicServer(app)
+            with pytest.raises(RuntimeError, match="startup hook failed"):
+                await server.start()
+            assert seen == ["startup"] and server._runners == []  # tracked, cleaned, list cleared
+            assert server.port == 0
+        finally:
+            await pool.close()
+
+    asyncio.run(go())
+
+
+def test_healthz_is_a_prompt_503_when_the_pool_is_exhausted(
+    migrated_dsn: str, tmp_path: Path
+) -> None:
+    async def go() -> tuple[int, float]:
+        pool = await asyncpg.create_pool(migrated_dsn, min_size=1, max_size=1)
+        server = None
+        try:
+            sync = make_sync_dir(tmp_path / "sync")
+            app = build_app(
+                default_config(None, sync), pool, BlobStore(tmp_path / "blobs"), LibraryStore(pool)
+            )
+            server = public_server.PublicServer(app)
+            await server.start()
+            async with pool.acquire():  # the only connection is taken
+                start = time.monotonic()
+                status = await asyncio.to_thread(
+                    lambda: http.client.HTTPConnection("127.0.0.1", server.health_port, timeout=15)
+                )
+                status.request("GET", "/healthz", headers={"Host": "x"})
+                got = await asyncio.to_thread(status.getresponse)
+                return got.status, time.monotonic() - start
+        finally:
+            if server is not None:
+                await server.stop()
+            await pool.close()
+
+    status, elapsed = asyncio.run(go())
+    assert status == 503 and public_server.HEALTH_DB_TIMEOUT_SECONDS - 0.5 < elapsed < 6
+
+
+def test_the_probe_dials_the_address_the_listener_is_bound_to() -> None:
+    assert public_server.probe_host("0.0.0.0") == "127.0.0.1"
+    assert public_server.probe_host("") == "127.0.0.1"
+    assert public_server.probe_host("::") == "::1"
+    assert public_server.probe_host("127.0.0.1") == "127.0.0.1"
+    assert public_server.probe_host("192.0.2.7") == "192.0.2.7"

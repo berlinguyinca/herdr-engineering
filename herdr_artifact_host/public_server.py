@@ -11,8 +11,8 @@ Ported from the control plane's ``share_public.py``, whose security contract car
   streamed untouched, as before; a member-labelled one ("Shared by ...") is the uniform 404, event reason
   ``html_too_large`` (``share_public.py``: ``if size > MODE_SWITCH_MAX_BYTES: if bar: deny``).
 * ``/healthz`` is NOT on the public listener (there it is the uniform 404).  It is served by a second listener of
-  the same process bound to 127.0.0.1 only (``PublicServer.health_port``, ``--health-port`` in the deploy entry
-  point), so the compose healthcheck target is ``http://127.0.0.1:<health-port>/healthz`` run inside the container.
+  the same process bound to 127.0.0.1 only (``PublicServer.health_port``; the port option is provided by the Task 10
+  deploy entry point, which does not exist yet), so the compose healthcheck target is ``http://127.0.0.1:<health-port>/healthz`` run inside the container.
   Reachability is decided by the socket's bind address, not by inspecting the peer.
 * Whole-blob hashing of large blobs is capped (``HASH_CONCURRENCY`` passes, own thread pool, no queue): a request that
   finds every slot busy gets the uniform 503 with ``Retry-After: 5`` (as a busy render does; it needs a resolved token
@@ -266,6 +266,7 @@ def lab_settings(config: PublicConfig) -> LabSettings | None:
 # ----------------------------------------------------------------------------- blocking work
 
 BLOB_WORKERS = 8
+HEALTH_DB_TIMEOUT_SECONDS = 2.0
 HEALTH_HOST = "127.0.0.1"  # the health listener is never bound anywhere else
 PINNED_AIOHTTP = (
     3,
@@ -1685,8 +1686,8 @@ def build_health_app(db_pool: asyncpg.Pool) -> web.Application:
     async def healthz(request: web.Request) -> web.StreamResponse:
         if _refused_framing(request):
             return not_found()
-        try:
-            await db_pool.fetchval("SELECT 1")
+        try:  # an exhausted pool must answer 503 promptly, not hang the healthcheck
+            await asyncio.wait_for(db_pool.fetchval("SELECT 1"), HEALTH_DB_TIMEOUT_SECONDS)
         except Exception:
             return respond(
                 503, [("Content-Type", "text/plain; charset=utf-8")], b"unavailable\n", cors=False
@@ -1775,8 +1776,8 @@ def assert_uniform_hook(server: web.Server) -> None:
     require_handler_internals(server())
 
 
-async def _raw_exchange(port: int, payload: bytes) -> bytes:
-    reader, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", port), 5)
+async def _raw_exchange(host: str, port: int, payload: bytes) -> bytes:
+    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 5)
     try:
         writer.write(payload)
         await writer.drain()
@@ -1785,28 +1786,37 @@ async def _raw_exchange(port: int, payload: bytes) -> bytes:
         writer.close()
 
 
+def probe_host(bound: str) -> str:
+    """The address to dial to reach a listener bound to ``bound`` (a wildcard bind is dialled over loopback)."""
+    return {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1"}.get(bound, bound)
+
+
 def _without_date(raw: bytes) -> bytes:
     return b"\r\n".join(
         line for line in raw.split(b"\r\n") if not line.lower().startswith(b"date:")
     )
 
 
-async def verify_uniform_listener(port: int) -> None:
+async def verify_uniform_listener(port: int, host: str = "127.0.0.1") -> None:
     """Behavioural startup check on the bound listener: a request aiohttp cannot parse must be answered with exactly
     the bytes of the uniform 404 (what an ordinary unknown path gets).  Anything else, including no answer, raises."""
     try:
-        malformed = _without_date(await _raw_exchange(port, _MALFORMED_PROBE))
-        reference = _without_date(await _raw_exchange(port, _WELL_FORMED_PROBE))
+        malformed = _without_date(await _raw_exchange(host, port, _MALFORMED_PROBE))
+        reference = _without_date(await _raw_exchange(host, port, _WELL_FORMED_PROBE))
     except (OSError, TimeoutError) as exc:
-        raise RuntimeError(f"uniform 404 check could not talk to the listener: {exc!r}") from exc
+        raise RuntimeError(
+            f"uniform 404 check could not talk to the listener at {host}:{port}: {exc!r}"
+        ) from exc
     if not reference.startswith(b"HTTP/1.1 404 Not Found\r\n") or not reference.endswith(
         NOT_FOUND_BODY
     ):
-        raise RuntimeError("uniform 404 check: the reference answer is not the uniform 404")
+        raise RuntimeError(
+            f"uniform 404 check: {host}:{port} does not answer an ordinary request with the uniform 404"
+        )
     # aiohttp answers a request it could not parse as HTTP/1.0 (it never learned the version); every other byte matches
     if malformed.replace(b"HTTP/1.0 ", b"HTTP/1.1 ", 1) != reference:
         raise RuntimeError(
-            "uniform 404 check: a malformed request is not answered with the uniform 404"
+            f"uniform 404 check: {host}:{port} does not answer a malformed request with the uniform 404"
         )
 
 
@@ -1836,8 +1846,10 @@ class PublicServer:
             keepalive_timeout=15,
             auto_decompress=False,  # a request body is never inflated (decompression bomb)
         )
+        self._runners.append(
+            runner
+        )  # tracked at once, so a failed setup() is still cleaned up by stop()
         await runner.setup()
-        self._runners.append(runner)
         assert_uniform_hook(runner.server)  # type: ignore[arg-type]
         site = web.TCPSite(runner, host, port, backlog=64)
         await site.start()
@@ -1845,17 +1857,31 @@ class PublicServer:
         return int(sockets[0].getsockname()[1]) if sockets else port
 
     async def start(self, host: str = "127.0.0.1", port: int = 0, health_port: int = 0) -> int:
+        """Bind both listeners, then probe each at the address it is bound to.  The probe cannot run before the
+        socket accepts (aiohttp listens and accepts in one step), so the window between bind and probe is not
+        closed; it is safe because ``assert_uniform_hook`` has already verified the server class and the handler
+        internals before the bind, and the probe fails closed (the server is torn down) when behaviour differs."""
         try:
             self.port = await self._serve(self.app, host, port)
             self.health_port = await self._serve(self.health_app, HEALTH_HOST, health_port)
-            await verify_uniform_listener(self.port)
-            await verify_uniform_listener(self.health_port)
+            await verify_uniform_listener(self.port, probe_host(host))
+            await verify_uniform_listener(self.health_port, probe_host(HEALTH_HOST))
         except BaseException:
-            await self.stop()
+            try:
+                await self.stop()
+            except Exception:
+                pass  # the start failure is the error worth reporting
             raise
         return self.port
 
     async def stop(self) -> None:
-        for runner in reversed(self._runners):
-            await runner.cleanup()
-        self._runners.clear()
+        """Clean up every runner even when one cleanup raises; the first error is re-raised afterwards."""
+        runners, self._runners = list(reversed(self._runners)), []
+        first: BaseException | None = None
+        for runner in runners:
+            try:
+                await runner.cleanup()
+            except Exception as exc:
+                first = first or exc
+        if first is not None:
+            raise first
