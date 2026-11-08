@@ -20,6 +20,7 @@ federation = ["cryptography>=42"]   # Ed25519 request/export signing (ADR-0008 P
 [project.scripts]
 herdr-eng = "herdr_engineering.cli:main"
 herdr-plannotator = "herdr_engineering.plannotator:main"
+herdr-artifact-host = "herdr_artifact_host.cli:main"
 
 [tool.ruff]
 line-length = 100
@@ -33,7 +34,7 @@ select = ["E", "F", "W", "I", "UP"]
 extend-ignore = ["E501", "E702"]
 
 [tool.setuptools.packages.find]
-include = ["herdr_engineering*"]
+include = ["herdr_engineering*", "herdr_artifact_host*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -50,6 +51,7 @@ markers = [
 
 
 [tool.setuptools.package-data]
+herdr_artifact_host = ["share_static/*"]
 herdr_engineering = ["control_plane/rakazo_defaults.json", "*.mjs", "skill_data/summary/*.md", "skill_data/summary/adapters/*.md",
                      "skill_data/handoff/*.md", "skill_data/handoff/adapters/*.md",
                      "control_plane/share_static/*.html", "control_plane/share_static/*.js",
