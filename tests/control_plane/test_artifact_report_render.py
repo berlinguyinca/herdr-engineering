@@ -593,7 +593,7 @@ def test_print_stylesheet_forces_light_hides_chrome_and_controls_page_breaks():
         assert selector in printed
     assert "--bg:#fff" in printed and "--text:#000" in printed and "color-scheme:light" in printed
     # no chrome: contents pills, download buttons, the opt-in Rich view panel
-    assert ".toc,.btn,.anchor{display:none}" in printed and ".rp>section:not([id]){display:none!important}" in printed
+    assert ".toc,.btn,.anchor,.howto{display:none}" in printed and ".rp>section:not([id]){display:none!important}" in printed
     # page-break control around findings and figures; a table row and its header
     assert "break-inside:avoid" in printed and ".finding" in printed and ".figure" in printed
     assert "break-after:avoid" in printed and "thead{display:table-header-group}" in printed
@@ -635,7 +635,7 @@ def test_every_section_finding_and_figure_heading_has_a_permalink_to_an_existing
     assert re.search(r'<h3 id="h-finding-f1">Mixed evidence<a class="anchor" href="#finding-f1"', page)
     assert re.search(r'<h2 id="h-sec-findings">Findings<a class="anchor" href="#sec-findings"', page)
     assert ".anchor:focus-visible{outline" in page and ".card:target" in page and "min-width:24px" in page
-    assert ".toc,.btn,.anchor{display:none}" in page, "the permalink is screen-only"
+    assert ".toc,.btn,.anchor,.howto{display:none}" in page, "permalinks and legend are screen-only"
 
 
 def test_anchor_ids_are_stable_across_renders_and_follow_the_descriptor_id_not_the_title():
@@ -702,3 +702,69 @@ def test_a_script_looking_title_never_fails_the_dashboard_or_share_render(title)
     page = _render(dict(base, findings=[dict(base["findings"][0], title=title)] + base["findings"][1:]), asset_url=lambda asset: "#").encode()
     html = api._envelope("html", page, api.dashboard_resolver(), None)["html"]
     assert 'class="anchor"' in html and 'id="finding-f1"' in html
+
+
+def _legend(page: str) -> str:
+    match = re.search(r'<details class="howto">.*?</details>', page, re.S)
+    assert match, "the report has a How to read legend"
+    return match.group()
+
+
+def test_how_to_read_legend_is_collapsed_first_and_explains_only_labels_the_report_shows():
+    page = _render()
+    legend = _legend(page)
+    assert "<details class=\"howto\">" in page and " open" not in legend.split(">", 1)[0], "collapsed by default"
+    assert "<summary>How to read this report</summary>" in legend
+    assert page.index('class="howto"') < page.index('<section id="sec-findings"'), "it sits at the top, before the findings"
+    terms = re.findall(r"<dt>(.*?)</dt>", legend)
+    body = page.replace(legend, "")
+    # every explained label is one this renderer printed (derived, not invented)
+    for label in ("Question", "Evidence", "Figure", "Limits", "Next checks", "How to read", "Method and configuration"):
+        assert any(label in term for term in terms), f"{label} is explained"
+        assert label in body, f"{label} really appears in the report"
+    assert "#" in terms and "Finding" in terms
+
+
+def test_how_to_read_legend_leaves_out_terms_the_report_does_not_use():
+    base = descriptor()
+    bare = dict(base, figures=[], analysis={}, findings=[dict(base["findings"][0], figure_ids=[], limitations=[], next_steps=[])])
+    legend = _legend(_render(bare))
+    for absent in ("Figure", "Limits", "Next checks", "How to read", "Method and configuration"):
+        assert f"<dt>{absent}" not in legend and f" · {absent}" not in legend, f"{absent} is not explained"
+    assert "<dt>Finding</dt>" in legend
+    nothing_to_explain = _render(dict(base, findings=[], figures=[], evidence=[], assets=[], analysis={}))
+    assert 'class="howto"' not in nothing_to_explain
+
+
+def test_the_legend_says_there_is_no_severity_or_confidence_because_the_descriptor_has_none():
+    from herdr_engineering.control_plane.artifact_report_descriptor import (
+        ReportDescriptorError,
+        validate_report_descriptor,
+    )
+
+    base = descriptor()
+    for field in ("severity", "confidence"):
+        rated = dict(base, findings=[dict(base["findings"][0], **{field: "high"})])
+        with pytest.raises(ReportDescriptorError):
+            validate_report_descriptor(rated)
+    assert "<dt>Severity, confidence</dt><dd>Not used" in _legend(_render())
+
+
+def test_the_legend_is_static_and_never_copies_report_text():
+    first = _legend(_render())
+    retitled = descriptor()
+    retitled["findings"][0]["title"] = '<script>alert(1)</script> "x" & y'
+    retitled["title"] = "Another report"
+    assert _legend(_render(retitled)) == first
+
+
+def test_the_legend_is_screen_only_stays_off_tight_budgets_and_survives_the_sanitiser():
+    from herdr_engineering.control_plane import artifact_render_api as api
+
+    page = _render()
+    assert ".toc,.btn,.anchor,.howto{display:none}" in page, "hidden in print"
+    assert ".howto summary:focus-visible{outline" in page
+    assert "howto" not in _render(max_bytes=12000).split("</style>")[1], "a tight budget stays plain"
+    html = api._envelope("html", _render(asset_url=lambda asset: "#").encode(), api.dashboard_resolver(), None)["html"]
+    legend = _legend(html)
+    assert "<summary>How to read this report</summary>" in legend and "<dl>" in legend and " open" not in legend.split(">", 1)[0]
