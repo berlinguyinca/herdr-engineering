@@ -48,6 +48,38 @@ _DARK = ("color-scheme:dark;--bg:#17181c;--surface:#1f2026;--surface-2:#2a2b33;-
          "--warn-bg:#2b2310;--btn:#2fc59c;--on-accent:#07211a;--shadow:0 1px 3px rgba(0,0,0,.5);")
 # Light is the base; dark applies when the OS asks for it unless the host forces light, or whenever the host forces
 # dark. The host sets data-theme on :root (standalone page) or on the shadow host (dashboard), never in the markup.
+# Print / save-as-PDF. Paper is always light, whatever the screen theme or the host's forced data-theme: the variables are
+# re-declared with the same specificity as every theme rule above and later in the sheet, so they win in any theme.
+_PRINT_VARS = ("color-scheme:light;--bg:#fff;--surface:#fff;--surface-2:#fff;--border:#8a8a94;--text:#000;--muted:#333;"
+               "--accent:#000;--accent-weak:#fff;--link:#000;--warn:#000;--warn-bg:#fff;--btn:#fff;--on-accent:#000;"
+               "--shadow:none;")
+_PRINT_SELECTORS = (":root,:root[data-theme],:root:not([data-theme=\"light\"]),:host,:host([data-theme]),"
+                    ":host(:not([data-theme=\"light\"]))")
+_PRINT_BASE = ("@media print{" + _PRINT_SELECTORS + "{" + _PRINT_VARS + "}"
+               "body,.rp{background:#fff;color:#000}.rp{max-width:none;padding:0;font-size:11pt;line-height:1.45}"
+               # the opt-in Rich view panel (the only id-less section a host adds after the header) is screen-only
+               ".rp>section:not([id]){display:none!important}}")
+_PRINT_FULL = (
+    "@media print{"
+    # no chrome: the contents pills, download buttons and the Rich view toggle mean nothing on paper
+    + ".toc,.btn{display:none}.hero{padding-bottom:10pt}h1{font-size:22pt}h2{font-size:15pt}h3{font-size:12pt}"
+    ".rp section{margin-top:18pt}p,li{orphans:3;widows:3}"
+    # page-break control: a heading stays with what follows, and a finding, figure, row or callout is never split
+    "h1,h2,h3,.sub,summary{break-after:avoid}.card,.finding,.figure,.callout,.notice,.qlist li,tr,figure,img"
+    "{break-inside:avoid}.card{box-shadow:none;border-color:#8a8a94}.finding{border-left:3pt solid #000}"
+    # a figure that is taller than a page shrinks to fit one (object-fit keeps its proportions)
+    ".fig-img{max-width:100%;max-height:180mm;width:auto;height:auto;object-fit:contain;margin-left:auto;margin-right:auto}"
+    # tables paginate with a repeating header instead of scrolling inside a clipped box
+    ".tablewrap{overflow:visible;border-color:#8a8a94}table{min-width:0;font-size:10pt}thead{display:table-header-group}"
+    "th{background:#fff;color:#000;border-bottom:1pt solid #000}th,td{padding:4pt 6pt}td:first-child{min-width:0}"
+    ".chip{border-color:#555;background:#fff;color:#000}.callout{border:1px solid #8a8a94;background:#fff}"
+    "details{border-color:#8a8a94}"
+    # closed <details> (the analysis block) is printed open: older engines show the content, newer ones need ::details-content
+    "details>:not(summary){display:block}details::details-content{content-visibility:visible;display:block}"
+    # a link to the outside shows where it goes; in-page chips and local file links are not underlined or expanded
+    "a{color:#000}a[href^=\"http\"]::after{content:\" (\" attr(href) \")\";font-size:.85em}"
+    ".chip,.toc a{text-decoration:none}}"
+)
 _CORE_CSS = (
     ":root,:host{color-scheme:light dark;" + _LIGHT + "--radius:8px;--sans:\"Inter\",-apple-system,BlinkMacSystemFont,\"Segoe UI\","
     "Roboto,Helvetica,Arial,sans-serif;--mono:\"JetBrains Mono\",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}"
@@ -58,7 +90,7 @@ _CORE_CSS = (
     "body{margin:0;background:var(--bg)}"
     ".rp{max-width:860px;margin:0 auto;padding:32px 16px 64px;background:var(--bg);color:var(--text);"
     "font:15px/1.6 var(--sans);overflow-wrap:break-word}a{color:var(--link)}.fig-img{max-width:100%;height:auto}"
-)
+) + _PRINT_BASE
 _FULL_CSS = _CORE_CSS + (
     ".rp *{box-sizing:border-box}.rp section{margin:40px 0 0;min-width:0}"
     ".hero{padding-bottom:20px;border-bottom:1px solid var(--border)}"
@@ -98,10 +130,9 @@ _FULL_CSS = _CORE_CSS + (
     ".notice{margin-top:40px;padding:10px 14px;border:1px dashed var(--warn);border-radius:var(--radius);"
     "background:var(--warn-bg);font-size:13px;color:var(--text)}"
     "@media (max-width:640px){h1{font-size:25px}.rp{padding-top:20px}}"
-    "@media print{body,.rp{background:#fff;color:#000}.rp{max-width:none;padding:0}.toc{display:none}"
-    ".card,.tablewrap{break-inside:avoid;box-shadow:none}a{color:#000}.btn{border:1px solid #000;background:none;color:#000}}"
+    + _PRINT_FULL
 )
-_FULL_CSS_MARGIN = 1200  # a cap below css + this much falls back to the core styles
+_FULL_CSS_MARGIN = 2000  # a cap below css + this much falls back to the core styles
 _CSP = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'")
 _ANALYSIS_PAIR_LIMIT = 40
 
