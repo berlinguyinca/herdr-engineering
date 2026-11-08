@@ -59,6 +59,12 @@ carries an unexpired owner-set `fabric` bit. Trust is therefore in: the tailnet'
 5. **Auto-join widens the allow-list's meaning.** With `auto_join` on, an allow-listed machine is trusted not only to run vouched
    agents but to mint new ones: any local process there can join under any free name and fill the per-machine cap of 200 and the total of 1000 (names are
    enumerable; revoke to clean up, but revoked names keep counting: a known limit). Room access still needs an owner's grant.
+5b. **The workspace id is self-asserted (`workspace_rooms`).** whois vouches for the machine, not for a herdr workspace: any process on an
+   allow-listed machine can claim any workspace id on THAT machine, and thereby join that workspace's room and, with the auto-grant (`read`,
+   `post`, `instruct`, `execute`), read it and direct its agents. This is the same trust as the allow-list itself (every process on the machine is
+   already trusted to mint agents); it adds no new boundary. Across machines it is impossible: the room key includes the whois machine, never a
+   client value. `coordinate` and `spawn_helpers` are never auto-granted, caps bound the rooms and members (429), and an agent cannot move itself
+   to another workspace (409). An owner can still grant any agent into a room, and no tokenless path crosses workspaces or machines.
 5a. **Operator error in `machines`** (section 10 of the guide).
 6. Within the 30-day window a revoked machine binding is enforced, but a stolen host stays trusted until the operator reacts.
 7. Not verified here: per-agent request rate limits specific to Fabric (the spec mentions rate limits; only the generic message and task

@@ -15,7 +15,14 @@ from herdr_engineering.control_plane.collab_fabric_trust import (
     normalize_fabric_trust,
 )
 from tests.control_plane.test_collab import BASE
-from tests.control_plane.test_collab_fabric_auth import BEAST, BENDER, SUFFIX, fabric_agent, fw, lan_ip  # noqa: F401
+from tests.control_plane.test_collab_fabric_auth import (  # noqa: F401
+    BEAST,
+    BENDER,
+    SUFFIX,
+    fabric_agent,
+    fw,
+    lan_ip,
+)
 from tests.control_plane.test_collab_fabric_autojoin import (  # noqa: F401
     OWNER,
     agent_auth,

@@ -288,6 +288,25 @@ def _fabric_url(explicit):
     )
 
 
+def _workspace_body(args):
+    """The herdr workspace this process runs in (HERDR_WORKSPACE_ID, HERDR_TAB_ID, HERDR_PANE_ID, HERDR_WORKSPACE_LABEL), for the
+    server's workspace rooms. ``--no-workspace`` sends nothing. The server validates every value; the machine is never sent here."""
+    if getattr(args, "no_workspace", False):
+        return {}
+    env = os.environ
+    wid = (env.get("HERDR_WORKSPACE_ID") or "").strip()
+    if not wid:
+        return {}
+    workspace = {"id": wid}
+    if (label := (env.get("HERDR_WORKSPACE_LABEL") or "").strip()):
+        workspace["label"] = label
+    out = {"workspace": workspace}
+    for key, var in (("tab_id", "HERDR_TAB_ID"), ("pane_id", "HERDR_PANE_ID")):
+        if (value := (env.get(var) or "").strip()):
+            out[key] = value
+    return out
+
+
 def _join_fabric(args):
     """``rooms join-fabric NAME``: join as a fabric agent with no token (the tailnet machine vouches), then write
     ``~/herdr-agents/NAME.json`` ($HERDR_AGENT_DIR as join.sh honours) holding ONLY agent_id, name and machine, mode 0600.
@@ -300,8 +319,11 @@ def _join_fabric(args):
     body = {"name": name}
     if args.machine:
         body["machine"] = args.machine
+    body.update(_workspace_body(args))
     result = client.request(f"{BASE}/agents/fabric-join", body)
     ident = {k: result.get(k) for k in ("agent_id", "name", "machine")}
+    if isinstance(result.get("room_id"), str) and _AGENT_ID.match(result["room_id"]):
+        ident["room_id"] = result["room_id"]
     if not isinstance(ident["agent_id"], str) or not _AGENT_ID.match(ident["agent_id"]):
         raise ValueError("the control plane returned no usable agent id")
     folder = Path(os.environ.get("HERDR_AGENT_DIR") or Path.home() / "herdr-agents")
@@ -872,6 +894,7 @@ def configure_parser(parser):
         if action == "join-fabric":
             c.add_argument("name", help="the agent's name on this machine (lowercase, 1-64 characters)")
             c.add_argument("--machine", help="informational only: the server uses its own whois answer")
+            c.add_argument("--no-workspace", action="store_true", help="do not send HERDR_WORKSPACE_ID (join without a workspace room)")
             c.set_defaults(func=run_command)
             continue
         c.add_argument("room")

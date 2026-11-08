@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from tests.control_plane.test_collab_fabric_auth import fabric_agent, fw, lan_ip  # noqa: F401
-from tests.control_plane.test_collab_fabric_autojoin import aw, lw, set_trust  # noqa: F401
+from tests.control_plane.test_collab_fabric_autojoin import aw, lw, set_trust, trust  # noqa: F401
 from tests.control_plane.test_collab_fabric_trust import localapi  # noqa: F401
 from tests.control_plane.test_collab_tasks import code, svc  # noqa: F401
 
@@ -21,13 +21,13 @@ pytestmark = pytest.mark.skipif(not (shutil.which("curl") and shutil.which("bash
                                 reason="needs curl, bash and python3")
 
 
-def run(lw, tmp_path, *opts, token=None, url=True):
+def run(lw, tmp_path, *opts, token=None, url=True, env_extra=None):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     script = tmp_path / "join.sh"
     script.write_text(SCRIPT.read_text().replace("__HERDR_BASE__", f"http://{lw.lan}:{lw.public_port}"))
     script.chmod(stat.S_IRWXU)
-    env = {"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(home)}
+    env = {"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(home), **(env_extra or {})}
     if token:
         env["HERDR_JOIN_TOKEN"] = token
     extra = ["--fabric-url", f"http://{lw.lan}:{lw.fabric_port}"] if url else []
@@ -130,3 +130,37 @@ def test_join_sh_judges_names_by_the_table(tmp_path):
                                env=env | {"LC_ALL": locale}, capture_output=True, text=True, timeout=30)
             # accepted: it reaches curl, which cannot connect (rc 1). Rejected: refused up front (rc 2).
             assert p.returncode == (1 if n in ACCEPT else 2), (locale, n, p.stderr)
+
+
+WS_ENV = {"HERDR_WORKSPACE_ID": "ws-1", "HERDR_TAB_ID": "tab-2", "HERDR_PANE_ID": "pane-3", "HERDR_WORKSPACE_LABEL": "my work"}
+
+
+def ws_on(lw):
+    from herdr_engineering.control_plane.collab_fabric_trust import normalize_fabric_trust
+    lw.s.fabric_trust = normalize_fabric_trust(trust(auto_join=True, workspace_rooms=True))
+
+
+def test_join_sh_sends_the_workspace_env_and_lands_in_the_room(lw, tmp_path):
+    ws_on(lw)
+    rc, out, err = run(lw, tmp_path, "--name", "bender-claude", env_extra=WS_ENV)
+    assert rc == 0, (out, err)
+    data = json.loads(ident(tmp_path).read_text())
+    agent = lw.s._agents[data["agent_id"]]
+    assert agent["workspace"]["workspace_id"] == "ws-1" and agent["workspace"]["tab_id"] == "tab-2" and agent["workspace"]["pane_id"] == "pane-3"
+    assert data["room_id"] == agent["workspace"]["room_id"] and lw.s._rooms[data["room_id"]]["name"] == "bender/my work"
+    assert set(data) == {"agent_id", "name", "machine", "room_id"} and stat.S_IMODE(ident(tmp_path).stat().st_mode) == 0o600
+
+
+def test_join_sh_no_workspace_opts_out(lw, tmp_path):
+    ws_on(lw)
+    rc, out, err = run(lw, tmp_path, "--name", "bender-claude", "--no-workspace", env_extra=WS_ENV)
+    assert rc == 0, (out, err)
+    data = json.loads(ident(tmp_path).read_text())
+    assert set(data) == {"agent_id", "name", "machine"} and not lw.s._agents[data["agent_id"]].get("workspace")
+
+
+def test_join_sh_without_the_env_is_the_old_behaviour(lw, tmp_path):
+    ws_on(lw)
+    rc, _, err = run(lw, tmp_path, "--name", "bender-claude")
+    assert rc == 0, err
+    assert set(json.loads(ident(tmp_path).read_text())) == {"agent_id", "name", "machine"}
