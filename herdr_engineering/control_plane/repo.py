@@ -206,6 +206,7 @@ class ControlPlaneRepo:
         self._host_aliases = {str(k): str(v) for k, v in (host_aliases or {}).items() if k and v and k != v}
         self._command_lock = threading.RLock()
         self._event_lock = threading.RLock()
+        self._usage_row_lock = threading.RLock()  # request_id dedupe + write must be atomic
         self._agent_projection_lock = threading.RLock()
         self._agent_records = {}
         self._agent_identity_history = []
@@ -3155,6 +3156,14 @@ class ControlPlaneRepo:
                   "mission_id": _usage_id(row.get("mission_id")),
                   "key_id": _usage_str(row.get("key_id"), 128),
                   "duration_ms": _usage_int(row.get("duration_ms"))}
+        # Idempotent on request_id: the proxy retries a POST whose reply it never saw, and the first
+        # attempt may have been recorded. ``_token_usage`` is rebuilt from events, so this survives restarts.
+        with self._usage_row_lock:
+            if common["request_id"] and common["request_id"] in self._token_usage:
+                return self._token_usage[common["request_id"]]
+            return self._record_token_usage_row_locked(row, project, model, common)
+
+    def _record_token_usage_row_locked(self, row, project, model, common):
         tokens = [_usage_int(row.get(k)) for k in _TOKEN_FIELDS]
         source = (row.get("source") if row.get("source") in ("llm-proxy", "transcript", "llm-gateway")
                   else "llm-proxy")
