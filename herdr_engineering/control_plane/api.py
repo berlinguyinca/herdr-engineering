@@ -1682,11 +1682,10 @@ class ControlPlaneServer:
         "not enabled" checks), so a flag is never true while the route refuses. Presence and booleans only, never values."""
         caps = []
         store = self.artifact_store is not None
-        shares = (self.share_store is not None and self.shares_root is not None
-                  and self.share_settings is not None and store)
-        if shares:
+        stored = self.share_store is not None and self.shares_root is not None and store
+        if stored and self.share_settings is not None:
             caps.append("share_v1")
-        if shares and self.member_admin is not None:
+        if stored and self.member_admin is not None:      # the member routes do not need share_settings
             caps.append("members_v1")
         if self.collab_artifacts_enabled and self.collab_grant_store is not None and store:
             caps.append("collab_artifacts_v1")

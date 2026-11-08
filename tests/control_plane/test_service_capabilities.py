@@ -59,6 +59,11 @@ def test_members_need_the_admin_on_top_of_sharing(tmp_path):
                        member_admin=adapter()) == {"share_v1", "members_v1"}
 
 
+def test_members_do_not_need_share_settings_because_their_routes_do_not(tmp_path):
+    assert served_caps(artifact_store=adapter(), share_store=adapter(), shares_root=tmp_path,
+                       member_admin=adapter()) == {"members_v1"}
+
+
 def test_collab_artifacts_needs_flag_and_grant_store():
     assert served_caps(artifact_store=adapter(), collab_grant_store=adapter()) == set()
     assert served_caps(artifact_store=adapter(), collab_grant_store=adapter(),
