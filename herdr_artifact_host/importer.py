@@ -13,6 +13,14 @@ principals, grantors, claim members and the like):
 * every blob referenced by a non-purged imported version, by hash.  Each blob is hashed while it is staged; a byte that
   differs from its address aborts the run before anything is written (fail closed).
 
+A share of a retracted version (or artifact) is imported revoked: the host has no version-level retraction, so the
+version maps to ``ready`` and the share must not serve it.  Skipped parents are counted in the manifest and the summary.
+
+``import`` and ``--exact`` verify are PRE-CUTOVER tools.  Once the host takes writes, a re-import would compare rows the
+host may have changed since (a share revoked on the host, say) and abort, and verify digests whole rows including mutable
+columns, so a legitimate post-cutover edit shows as a difference.  Not worth excluding columns: run them before the
+edge switch; afterwards a difference means "changed since import", not necessarily corruption.
+
 Non-member artifacts, and the shares and claims that point at them, are not imported.
 
 Idempotent: rows are inserted ``ON CONFLICT DO NOTHING`` and, in the same transaction, every source row is compared with
@@ -33,7 +41,7 @@ import json
 import os
 import re
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,6 +57,7 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 _CHUNK = 1 << 20
+_SHA_RE = re.compile(r"[0-9a-f]{64}")
 _SHOWN = 20  # differences printed by verify
 
 
@@ -85,28 +94,49 @@ class S3Source:
     """The source RustFS/S3 bucket through boto3 (imported lazily; the host image does not need it)."""
 
     def __init__(self, endpoint: str, bucket: str, region: str, access_key: str, secret_key: str) -> None:
-        import boto3
-
+        try:
+            import boto3
+            from botocore.config import Config
+        except ImportError as exc:
+            raise ImportFailed("boto3 is required for --source-s3-config (pip install 'herdr-artifact-host[import]')") from exc
         self._bucket = bucket
-        self._s3 = boto3.client(
-            "s3",
-            endpoint_url=endpoint,
-            region_name=region,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-        )
+        try:
+            self._s3 = boto3.client(
+                "s3",
+                endpoint_url=endpoint,
+                region_name=region,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                config=Config(connect_timeout=10, read_timeout=60, retries={"max_attempts": 3}),
+            )
+        except Exception as exc:  # botocore raises ValueError and its own errors for a bad endpoint
+            raise ImportFailed(f"source S3 client could not be created: {exc}") from exc
 
     @classmethod
     def from_file(cls, path: Path) -> S3Source:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("not a JSON object")
+        except (OSError, ValueError) as exc:
+            raise ImportFailed(f"source S3 config {path} is unreadable: {exc}") from exc
+        missing = [k for k in ("endpoint", "bucket", "access_key", "secret_key") if not raw.get(k)]
+        if missing:
+            raise ImportFailed(f"source S3 config {path} lacks: {', '.join(missing)}")
         return cls(raw["endpoint"], raw["bucket"], raw.get("region", "us-east-1"), raw["access_key"], raw["secret_key"])
 
     def open(self, sha: str) -> BinaryIO:
+        from botocore.exceptions import BotoCoreError, ClientError
+
         validate_sha(sha)
         try:
             body = self._s3.get_object(Bucket=self._bucket, Key=f"sha256/{sha[:2]}/{sha[2:4]}/{sha}")["Body"]
-        except self._s3.exceptions.NoSuchKey as exc:
-            raise SourceBlobMissing(f"source blob {sha} is missing") from exc
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+                raise SourceBlobMissing(f"source blob {sha} is missing") from exc
+            raise ImportFailed(f"source S3 refused blob {sha}: {exc}") from exc
+        except BotoCoreError as exc:  # EndpointConnectionError, timeouts, credential errors
+            raise ImportFailed(f"source S3 is not usable for blob {sha}: {exc}") from exc
         return body  # type: ignore[no-any-return]  # StreamingBody: read(n) and close()
 
 
@@ -124,6 +154,25 @@ BLOB_SHAS = (
     "SELECT e->>'sha256' FROM artifact_versions v, jsonb_array_elements(v.output_manifest) e "
     f"WHERE v.artifact_id IN {MEMBER_ARTIFACTS} AND {_LIVE_VERSION}"
 )
+
+
+# A version-level retraction has no host representation (the host's version states are draft/ready/purged), so a share of
+# a retracted version, or of a retracted artifact, is imported REVOKED rather than live.
+_SHARE_JOIN = (
+    "FROM artifact_shares s JOIN artifacts a ON a.artifact_id = s.artifact_id "
+    "JOIN artifact_versions v ON v.version_id = s.version_id"
+)
+_WITHDRAWN = "(s.state <> 'revoked' AND (v.state = 'retracted' OR a.lifecycle = 'retracted'))"
+REVOKED_COUNT = f"SELECT count(*) {_SHARE_JOIN} WHERE s.artifact_id IN {MEMBER_ARTIFACTS} AND {_WITHDRAWN}"
+# Rows left behind because their parent is not a member artifact/share, counted so the operator sees them.
+SKIPPED: dict[str, str] = {
+    "artifacts": "SELECT count(*) FROM artifacts WHERE created_by IS NULL OR created_by NOT LIKE 'member:%'",
+    "shares": f"SELECT count(*) FROM artifact_shares WHERE artifact_id NOT IN {MEMBER_ARTIFACTS}",
+    "library_items": f"SELECT count(*) FROM artifact_library_items WHERE artifact_id NOT IN {MEMBER_ARTIFACTS}",
+    "share_claims": f"SELECT count(*) FROM artifact_share_claims WHERE share_id NOT IN {IMPORTED_SHARES}",
+    "share_events": f"SELECT count(*) FROM artifact_share_events WHERE share_id NOT IN {IMPORTED_SHARES}",
+    "annotations": f"SELECT count(*) FROM artifact_annotations WHERE artifact_id NOT IN {MEMBER_ARTIFACTS}",
+}
 
 
 @dataclass(frozen=True)
@@ -200,9 +249,11 @@ SPECS: tuple[TableSpec, ...] = (
             "approved_at", "revoked_at",
         ),
         ("share_id",),
-        "SELECT share_id, artifact_id, version_id, audience, token_hash, allow_emails, allow_groups, state, entry, "
-        f"file_count, total_bytes, title, expires_at, {_bare('created_by')}, created_at, {_bare('approved_by')}, "
-        f"approved_at, revoked_at FROM artifact_shares WHERE artifact_id IN {MEMBER_ARTIFACTS}",
+        "SELECT s.share_id, s.artifact_id, s.version_id, s.audience, s.token_hash, s.allow_emails, s.allow_groups, "
+        f"CASE WHEN {_WITHDRAWN} THEN 'revoked' ELSE s.state END, s.entry, s.file_count, s.total_bytes, s.title, "
+        f"s.expires_at, {_bare('s.created_by')}, s.created_at, {_bare('s.approved_by')}, s.approved_at, "
+        f"CASE WHEN {_WITHDRAWN} THEN coalesce(s.revoked_at, s.created_at) ELSE s.revoked_at END "
+        f"{_SHARE_JOIN} WHERE s.artifact_id IN {MEMBER_ARTIFACTS}",
     ),
     TableSpec(
         "share_events",
@@ -339,23 +390,39 @@ class ImportResult:
     inserted: dict[str, int]
 
 
-async def _read_source(dsn: str) -> dict[str, list[Row]]:
+@contextlib.asynccontextmanager
+async def open_source(dsn: str) -> AsyncIterator[asyncpg.Connection]:
+    """The importer's only way to the control plane: a read-only session inside a read-only, repeatable-read
+    transaction (one consistent snapshot).  The source role should also be SELECT-only; this is the second lock."""
     conn = await asyncpg.connect(dsn, server_settings={"default_transaction_read_only": "on"})
     try:
         await _jsonb_codec(conn)
-        out: dict[str, list[Row]] = {}
         async with conn.transaction(readonly=True, isolation="repeatable_read"):
-            for spec in SPECS:
-                out[spec.host] = [tuple(r) for r in await conn.fetch(spec.select)]
-            referenced = {r[0] for r in await conn.fetch(BLOB_SHAS)}
-        missing = sorted(referenced - {r[0] for r in out["artifact_blobs"]})
-        if missing:
-            raise ImportFailed(f"{len(missing)} referenced blob(s) have no row in the source blob index: {missing[0]}...")
-        for sha in referenced:
-            validate_sha(sha)
-        return out
+            yield conn
     finally:
         await conn.close()
+
+
+@dataclass(frozen=True)
+class SourceData:
+    rows: dict[str, list[Row]]
+    skipped: dict[str, int]
+    revoked_shares: int
+
+
+async def _read_source(dsn: str) -> SourceData:
+    async with open_source(dsn) as conn:
+        out = {spec.host: [tuple(r) for r in await conn.fetch(spec.select)] for spec in SPECS}
+        referenced = [r[0] for r in await conn.fetch(BLOB_SHAS)]
+        skipped = {name: int(await conn.fetchval(q)) for name, q in SKIPPED.items()}
+        revoked = int(await conn.fetchval(REVOKED_COUNT))
+    for sha in referenced:
+        if not isinstance(sha, str) or _SHA_RE.fullmatch(sha) is None:
+            raise ImportFailed(f"a version manifest entry has no valid sha256 (got {sha!r})")
+    missing = sorted(set(referenced) - {r[0] for r in out["artifact_blobs"]})
+    if missing:
+        raise ImportFailed(f"{len(missing)} referenced blob(s) have no row in the source blob index: {missing[0]}...")
+    return SourceData(out, skipped, revoked)
 
 
 async def run_import(
@@ -367,7 +434,8 @@ async def run_import(
     *,
     log: Callable[[str], None] = lambda _m: None,
 ) -> ImportResult:
-    data = await _read_source(source_dsn)
+    source = await _read_source(source_dsn)
+    data = source.rows
     blob_rows = data["artifact_blobs"]
     sizes = {r[0]: int(r[1]) for r in blob_rows}
     scratch = Path(tempfile.mkdtemp(dir=store.tmp_dir, prefix="import-"))
@@ -409,8 +477,9 @@ async def run_import(
                 path.unlink()
         with contextlib.suppress(OSError):
             scratch.rmdir()
-    manifest = build_manifest(data, sizes)
+    manifest = build_manifest(data, sizes, source.skipped, source.revoked_shares)
     write_manifest(manifest_path, manifest)
+    log(f"revoked {source.revoked_shares} share(s) of retracted content")
     log(f"imported {sum(inserted.values())} new row(s) and {len(newly_installed)} new blob(s)")
     return ImportResult(manifest, inserted)
 
@@ -444,13 +513,17 @@ async def _compare(conn: asyncpg.Connection, spec: TableSpec, rows: Sequence[Row
 # --- manifest ------------------------------------------------------------------------------------------------------
 
 
-def build_manifest(data: dict[str, list[Row]], sizes: dict[str, int]) -> dict[str, Any]:
+def build_manifest(
+    data: dict[str, list[Row]], sizes: dict[str, int], skipped: dict[str, int], revoked_shares: int
+) -> dict[str, Any]:
     return {
         "version": MANIFEST_VERSION,
         "created_at": datetime.now(UTC).isoformat(),
         "tables": {
             spec.host: {"count": len(data[spec.host]), "rows": keyed_digests(spec, data[spec.host])} for spec in SPECS
         },
+        "skipped": skipped,
+        "revoked_shares": revoked_shares,
         "blobs": {"count": len(sizes), "total_bytes": sum(sizes.values()), "items": dict(sorted(sizes.items()))},
     }
 
@@ -550,13 +623,13 @@ def add_arguments(sub: Any) -> None:
         p.add_argument("--host-dsn", help="host database DSN (overrides --config)")
         p.add_argument("--blob-dir", default=BLOB_DIR, type=Path, help="host blob directory")
 
-    imp = sub.add_parser("import", help="import member artifacts from the control plane", description=__doc__)
+    imp = sub.add_parser("import", help="import member artifacts from the control plane (a pre-cutover tool, see below)", description=__doc__)
     common(imp)
     imp.add_argument("--source-dsn", required=True, help="control-plane DSN of a read-only role")
     group = imp.add_mutually_exclusive_group(required=True)
     group.add_argument("--source-blob-dir", type=Path, help="directory laid out as the source bucket")
     group.add_argument("--source-s3-config", type=Path, help="JSON file: endpoint, bucket, region, access_key, secret_key")
-    ver = sub.add_parser("verify", help="verify the host against a manifest", description=verify.__doc__)
+    ver = sub.add_parser("verify", help="verify the host against an import manifest (pre-cutover; once the host takes writes use the default, not --exact)", description=verify.__doc__)
     common(ver)
     ver.add_argument("--exact", action="store_true", help="also require no rows beyond the manifest's")
 
@@ -601,6 +674,10 @@ def run_command(ns: argparse.Namespace) -> int:
             for d in problems[:_SHOWN]:
                 print(f"herdr-artifact-host import: post-import verify: {d}", file=sys.stderr)
             return EXIT_FAILED
+        m = result.manifest
+        print("import: skipped (parent is not a member artifact/share): "
+              + ", ".join(f"{k}={v}" for k, v in m["skipped"].items()))
+        print(f"import: {m['revoked_shares']} share(s) of retracted content imported as revoked")
         counts = ", ".join(f"{t}={v['count']}" for t, v in result.manifest["tables"].items())
         print(f"import: ok; blobs={result.manifest['blobs']['count']}; {counts}")
         return EXIT_OK

@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,8 +16,9 @@ from typing import Any
 import asyncpg
 import pytest
 
-from herdr_artifact_host import importer
+from herdr_artifact_host import importer, share_store
 from herdr_artifact_host.cli import main
+from herdr_artifact_host.db import create_pool
 
 MIGRATIONS = Path(__file__).resolve().parents[2] / "deploy" / "control-plane" / "migrations"
 ALIASES = {  # renamed copies of 0003-0007 (see control_plane.db.MIGRATION_ALIASES): replaying them would fail
@@ -81,6 +83,10 @@ class Env:
     def src_path(self, data: bytes) -> Path:
         h = sha(data)
         return self.src_blobs / "sha256" / h[:2] / h[2:4] / h
+
+    def host_blob(self, data: bytes) -> Path:
+        h = sha(data)
+        return self.host_blobs / "sha256" / h[:2] / h[2:4] / h
 
     def host_count(self, table: str) -> int:
         return int(rows(self.host, f"SELECT count(*) AS n FROM {table}")[0]["n"])
@@ -211,12 +217,18 @@ def test_member_prefix_stripped_everywhere(env: Env) -> None:
 def test_non_member_artifacts_and_shares_not_imported(env: Env) -> None:
     seed_member(env)
     seed_non_member(env)
+    sql(env.source, "INSERT INTO artifact_library_items (folder_id, artifact_id, source) VALUES ($1,'art_ci','auto')", FLD)
     assert env.run() == 0
+    m = json.loads(env.manifest.read_text())
     assert [r["artifact_id"] for r in rows(env.host, "SELECT artifact_id FROM artifacts")] == ["art_m1"]
     assert [r["share_id"] for r in rows(env.host, "SELECT share_id FROM shares")] == ["shr_1"]
     assert [r["member_id"] for r in rows(env.host, "SELECT member_id FROM share_claims")] == ["bob"]
-    assert sha(env.blobs["b3"]) not in json.loads(env.manifest.read_text())["blobs"]["items"]
-    assert not (env.host_blobs / "sha256" / sha(env.blobs["b3"])[:2]).exists() or env.host_count("artifact_blobs") == 2
+    assert sha(env.blobs["b3"]) not in m["blobs"]["items"]
+    assert env.host_count("artifact_blobs") == 2
+    assert not env.host_blob(env.blobs["b3"]).exists()
+    skipped = m["skipped"]
+    assert skipped["artifacts"] == 1 and skipped["shares"] == 1 and skipped["share_claims"] == 1
+    assert skipped["library_items"] == 1 and skipped["annotations"] == 0
 
 
 def test_zero_member_source_imports_cleanly(env: Env) -> None:
@@ -284,7 +296,7 @@ def test_row_failure_rolls_back_rows_and_new_blobs(env: Env) -> None:
     assert env.run() != 0
     assert env.host_count("artifacts") == 1 and env.host_count("artifact_versions") == 1
     assert env.host_count("artifact_blobs") == 0
-    assert list((env.host_blobs / "sha256").rglob("*")) == [] or all(p.is_dir() for p in (env.host_blobs / "sha256").rglob("*"))
+    assert [p for p in (env.host_blobs / "sha256").rglob("*") if p.is_file()] == []  # the installed blobs were removed
     assert not env.manifest.exists()
 
 
@@ -367,3 +379,135 @@ def test_source_connection_is_read_only(env: Env) -> None:
     seed_member(env)
     assert env.run() == 0
     assert rows(env.source, "SELECT count(*) AS n FROM artifacts")[0]["n"] == 1
+
+
+def test_share_on_retracted_version_is_imported_revoked_and_not_served(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
+    seed_member(env)
+    token = "retracted-token"
+    sql(env.source, "UPDATE artifact_versions SET state='retracted' WHERE version_id='ver_2'")
+    sql(env.source, "INSERT INTO artifact_shares (share_id, artifact_id, version_id, audience, token_hash, state, "
+                    "expires_at, created_by) VALUES ('shr_r','art_m1','ver_2','public',$1,'live', now() + interval '1 day', "
+                    "'member:alice')", share_store.token_digest(token))
+    assert env.run() == 0
+    assert "revoked" in capsys.readouterr().out
+    assert rows(env.host, "SELECT state FROM artifact_versions WHERE version_id='ver_2'")[0]["state"] == "ready"
+    got = rows(env.host, "SELECT state, revoked_at FROM shares WHERE share_id='shr_r'")[0]
+    assert got["state"] == "revoked" and got["revoked_at"] is not None
+    assert rows(env.host, "SELECT state FROM shares WHERE share_id='shr_1'")[0]["state"] == "revoked"
+    assert json.loads(env.manifest.read_text())["revoked_shares"] == 2
+
+    async def lookup() -> share_store.Loaded:
+        pool = await create_pool(env.host)
+        try:
+            return await share_store.load_share(pool, token, time.time())
+        finally:
+            await pool.close()
+
+    loaded = run(lookup())
+    assert loaded.state is None and loaded.reason == "not_live"
+    assert env.run("verify") == 0
+    assert env.run() == 0  # re-run keeps the same revoked rows
+    assert rows(env.host, "SELECT state FROM shares WHERE share_id='shr_r'")[0]["state"] == "revoked"
+
+
+def test_share_on_ready_version_stays_live_and_served(env: Env) -> None:
+    seed_member(env)
+    sql(env.source, "UPDATE artifact_shares SET expires_at = now() + interval '1 day'")
+    assert env.run() == 0
+    assert json.loads(env.manifest.read_text())["revoked_shares"] == 0
+
+    async def lookup() -> share_store.Loaded:
+        pool = await create_pool(env.host)
+        try:
+            return await share_store.load_share(pool, "share-token-1", time.time())
+        finally:
+            await pool.close()
+
+    assert run(lookup()).state is not None
+
+
+def test_purged_version_blobs_are_not_imported(env: Env) -> None:
+    seed_member(env)
+    sql(env.source, "INSERT INTO artifact_versions (version_id, artifact_id, version_number, state, purged_at, "
+                    "output_manifest) VALUES ('ver_3','art_m1',3,'purged', now(), $1::jsonb)",
+        manifest_json(("gone.html", env.blobs["b3"])))
+    env.src_path(env.blobs["b3"]).unlink()  # purged bytes are gone from the source
+    assert env.run() == 0
+    m = json.loads(env.manifest.read_text())
+    assert sha(env.blobs["b3"]) not in m["blobs"]["items"] and m["blobs"]["count"] == 2
+    assert rows(env.host, "SELECT state FROM artifact_versions WHERE version_id='ver_3'")[0]["state"] == "purged"
+
+
+@pytest.mark.parametrize("entry", ['{"name":"x"}', '{"name":"x","sha256":"nope"}', '{"name":"x","sha256":null}'])
+def test_manifest_entry_without_valid_sha256_fails_closed_exit_1(
+    env: Env, entry: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed_member(env)
+    sql(env.source, "INSERT INTO artifact_versions (version_id, artifact_id, version_number, state, output_manifest) "
+                    "VALUES ('ver_bad','art_m1',9,'ready',$1::jsonb)", f"[{entry}]")
+    assert env.run() == 1
+    assert "sha256" in capsys.readouterr().err
+    assert env.host_count("artifacts") == 0 and not env.manifest.exists()
+
+
+def test_importer_source_connection_is_read_only(env: Env) -> None:
+    seed_member(env)
+
+    async def probe() -> tuple[str, str, str]:
+        async with importer.open_source(env.source) as conn:
+            tx = await conn.fetchval("SHOW transaction_read_only")
+            default = await conn.fetchval("SHOW default_transaction_read_only")
+            try:
+                await conn.execute("DELETE FROM artifacts")
+                outcome = "wrote"
+            except asyncpg.ReadOnlySQLTransactionError:
+                outcome = "refused"
+            return tx, default, outcome
+
+    assert run(probe()) == ("on", "on", "refused")
+    assert rows(env.source, "SELECT count(*) AS n FROM artifacts")[0]["n"] == 1
+
+
+def test_import_works_with_a_select_only_source_role(env: Env) -> None:
+    seed_member(env)
+    sql(env.source, "CREATE ROLE imp_ro LOGIN")
+    sql(env.source, "GRANT SELECT ON ALL TABLES IN SCHEMA public TO imp_ro")
+    ro_dsn = env.source.replace("postgresql:///", "postgresql://imp_ro@/", 1)
+    env.source = ro_dsn
+    assert env.run() == 0
+    assert env.host_count("artifacts") == 1
+
+
+def _s3_config(tmp_path: Path, **over: Any) -> Path:
+    cfg = {"endpoint": "http://127.0.0.1:1", "bucket": "b", "region": "us-east-1", "access_key": "a", "secret_key": "s"}
+    cfg.update(over)
+    path = tmp_path / "s3.json"
+    path.write_text(json.dumps({k: v for k, v in cfg.items() if v is not None}))
+    return path
+
+
+def _s3_args(env: Env, cfg: Path) -> list[str]:
+    return ["import", "--manifest", str(env.manifest), "--host-dsn", env.host, "--blob-dir", str(env.host_blobs),
+            "--source-dsn", env.source, "--source-s3-config", str(cfg)]
+
+
+def test_s3_config_missing_key_fails_cleanly(env: Env, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    seed_member(env)
+    assert main(_s3_args(env, _s3_config(tmp_path, secret_key=None))) == 1
+    err = capsys.readouterr().err
+    assert "secret_key" in err and "Traceback" not in err
+    assert env.host_count("artifacts") == 0
+
+
+def test_s3_unreachable_endpoint_fails_cleanly(env: Env, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    seed_member(env)
+    assert main(_s3_args(env, _s3_config(tmp_path))) == 1
+    err = capsys.readouterr().err
+    assert "Traceback" not in err and "ImportFailed" in err
+    assert env.host_count("artifacts") == 0 and not env.manifest.exists()
+
+
+def test_s3_bad_config_json_fails_cleanly(env: Env, tmp_path: Path) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text("{nope")
+    assert main(_s3_args(env, bad)) == 1
