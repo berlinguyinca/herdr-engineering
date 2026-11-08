@@ -246,6 +246,42 @@ edge (nginx, server_name <public_host>): /s/ -> share-public:8083
   -v <conf>:/etc/nginx/nginx.conf:ro -v <certdir>:/etc/acme:ro nginx:1.29-alpine nginx -t` (a test does this when
   Docker is available).
 
+## Artifact host (`control_plane.artifact_host`)
+
+The dedicated artifact host (`herdr_artifact_host`, image `herdr-artifact-host`) replaces share-public for member
+artifacts. It is enabled with `control_plane.artifact_host.enabled: true` (needs the collab marker; refused together
+with `control_plane.share.enabled`, since both want the edge's `/s/`). `deploy.sh` renders the slice with
+`herdr-eng fleet config render-artifact-host`, builds the image, runs `migrate`, brings the host up with `--wait`
+BEFORE the control plane and the edge, and stops it again when the section is disabled. `--dry-run` renders and
+validates the slice and the compose files without printing any secret.
+
+- Services (`deploy/artifact-host/compose.yaml`): `artifact-host-db`, `artifact-host-public` (8090),
+  `artifact-host-internal` (8091). No host ports are published. Each role has its own compose healthcheck
+  (`herdr-artifact-host healthcheck <role>`, loopback port 8092 on public).
+- Networks (`deploy/control-plane/compose.artifact-host.yaml` joins the control plane to them): every host network is
+  `internal: true`, so no host container has a route out and external names do not resolve.
+  - The public role needs no egress. Cognito keys and group membership arrive through the synced `jwks.json` and
+    `members.json` (mounted read-only from `HERDR_COLLAB_SYNC_DIR`), and the browser exchanges the sign-in code with
+    Cognito itself.
+  - Public and internal share no network. The edge reaches public over `<prefix>-edge` (fixed subnet, also denied on
+    the `:8082` operator listener); `control-plane-web` reaches internal over `<prefix>-internal`.
+  - What Docker enforces: no egress from internal networks, and no name resolution of `herdr-cp-*` from the host.
+    What it does not: containers on the same network can reach each other, and `control-plane-web` and `collab-edge`
+    are attached to the host networks, so those two containers can see the host.
+- Config secret: Compose file secrets are bind mounts and ignore `uid`/`gid`/`mode`. `deploy.sh` therefore installs
+  `artifact-host-config.json` (and the db password) as 0644 files inside a 0700 directory
+  (`~/.config/herdr-engineering/artifact-host/`); the directory mode is the access control.
+- Membership: the host reads `members.json` and `jwks.json` from the synced directory (`SyncedDirectory`).
+  `collab-sync.sh` writes the optional `disabled` list into `members.json`; the host treats a stale or empty listing as
+  no evidence (sign-in fails closed) and denies accounts on the `disabled` list.
+- Edge (`artifact-host-http.conf`, `artifact-host-mcp.conf`, rendered in place of the share snippets): the artifact
+  host name routes `/s/`, `/api/member/`, `/` and `/my/` to `artifact-host-public:8090` (run-time DNS via the
+  `resolver`); `mcp.` routes `POST /mcp/artifacts` there too. Nothing routes to the internal role. `X-Forwarded-For`
+  is overwritten with `$remote_addr`; `/healthz` and `/internal/` answer 404 at the edge. Body caps: `/s/` 1k,
+  annotations 32k, `/api/member/` 1m, run uploads 17m, `/mcp/artifacts` 768k. Existing room routes are unchanged.
+- Check: `tests/test_artifact_host_compose.py` parses the files and, when Docker is available (required under CI or
+  `HERDR_REQUIRE_DOCKER=1`), starts the stack and runs `nginx -t` on the rendered edge.
+
 ## Artifact collaborator bridge (`control_plane.collab_artifacts`)
 
 External agents can read and commit to an artifact whose owner granted them access. Off unless

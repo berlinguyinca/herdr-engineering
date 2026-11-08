@@ -18,4 +18,4 @@ herdr-artifact-host = "herdr_artifact_host.cli:main"
 include = ["herdr_artifact_host*"]
 
 [tool.setuptools.package-data]
-herdr_artifact_host = ["share_static/*", "share_static/*/*", "share_static/*/*/*", "migrations/*.sql"]
+herdr_artifact_host = ["member_static/*", "share_static/*", "share_static/*/*", "share_static/*/*/*", "migrations/*.sql"]

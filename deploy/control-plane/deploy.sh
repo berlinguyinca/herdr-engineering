@@ -43,6 +43,14 @@
 #      before the edge;
 #      disabled, a running share-public is stopped and the edge conf is the repo file unchanged. A rollback
 #      recreates share-public from the previous commit when the restored edge conf routes /s/, else stops it
+#      Artifact host (member-owned artifacts): control_plane.artifact_host is always validated
+#      (render-artifact-host; an enabled but incomplete block is refused before anything runs, no value
+#      printed). Only when it is enabled (which needs the collaboration marker, and share-public off) is its
+#      configuration installed 0644 in a 0700 directory (Compose ignores secret modes; see compose.yaml),
+#      its image built from the same commit, the edge conf rendered with its server block and /mcp/artifacts,
+#      and the host project (deploy/artifact-host/compose.yaml: db, public, internal) migrated and brought up
+#      healthy BEFORE the control plane's compose up, which attaches control-plane-web and the edge to the
+#      host's two networks (compose.artifact-host.yaml). `--dry-run` renders and validates all of it.
 #   5. waits for /api/v1/health to report the new commit AND for every recreated
 #      container (web, worker, llm-proxy, collab-public/edge) to be running, not
 #      restarting and not unhealthy. Nothing on the host changes before the image is
@@ -477,6 +485,34 @@ SHARE_CONFIG="$SHARE_DIR/share-config.json"
 SHARE_SERVICE=()
 [ "$SHARE" = 0 ] || SHARE_SERVICE=(share-public)
 
+# Artifact host: ONE JSON file (everything its three roles read) rendered from control_plane.artifact_host, the Cognito
+# identifiers of control_plane.collab and the digest of control_plane.artifact_library.host_key. Always rendered (to
+# validate), installed only when enabled. An older candidate without the command has no host wiring at all.
+ARTIFACT_HOST=0; NEW_AH=""
+AH_PROJECT="${HERDR_ARTIFACT_HOST_PROJECT:-herdr-artifact-host}"
+if grep -q '"render-artifact-host"' "$WORK/herdr_engineering/cli.py" 2>/dev/null \
+    && [ -f "$WORK/deploy/artifact-host/compose.yaml" ] && [ -f "$WORK/deploy/control-plane/compose.artifact-host.yaml" ]; then
+  NEW_AH="$ENV_DIR/new/artifact-host/artifact-host-config.json"
+  if ! AH_OUT="$(herdr_eng fleet config render-artifact-host --path "$CENTRAL" --out "$NEW_AH")"; then
+    echo "control_plane.artifact_host is incomplete or invalid in $CENTRAL; nothing was changed" >&2
+    exit 1
+  fi
+  case "$AH_OUT" in *artifact_host=enabled) ARTIFACT_HOST=1 ;; esac
+fi
+if [ "$ARTIFACT_HOST" = 1 ] && [ "$COLLAB" = 0 ]; then
+  echo "control_plane.artifact_host.enabled is true but the collaboration network is off: the host is served behind" \
+       "the collab edge (create $COLLAB_MARKER), or set control_plane.artifact_host.enabled: false" >&2
+  exit 1
+fi
+if [ "$DRY" = 1 ]; then AH_DIR="$ENV_DIR/new/artifact-host"; else AH_DIR="$HOME/.config/herdr-engineering/artifact-host"; fi
+AH_CONFIG="$AH_DIR/artifact-host-config.json"
+AH_DBPW="$AH_DIR/artifact-host-db-password"
+export HERDR_ARTIFACT_HOST_CONFIG="$AH_CONFIG" HERDR_ARTIFACT_HOST_DB_PASSWORD_FILE="$AH_DBPW"
+if [ "$DRY" = 1 ] && [ "$ARTIFACT_HOST" = 1 ]; then   # so the offline compose validation finds the secret file
+  ( umask 077; python3 -c 'import json,sys; sys.stdout.write(json.load(open(sys.argv[1]))["database"]["password"])' "$NEW_AH" > "$AH_DBPW" ) \
+    || exit 1
+fi
+
 # The edge bind-mounts this single nginx.conf, so it is written IN PLACE (same inode): a
 # rename-replace would leave the running container reading the old file.
 EDGE_CONF_CHANGED=0
@@ -514,7 +550,7 @@ if [ "$COLLAB" = 1 ]; then
   # The edge conf for this config: the repo file, plus the share host server only when share is enabled.
   NEW_EDGE="$ENV_DIR/new/collab-edge/nginx.conf"
   EDGE_TEMPLATE="$WORK/deploy/control-plane/collab-edge/nginx.conf"
-  if [ -n "$NEW_SHARE" ]; then
+  if [ -n "$NEW_SHARE" ] || [ -n "$NEW_AH" ]; then
     herdr_eng fleet config render-edge --path "$CENTRAL" --template "$EDGE_TEMPLATE" --out "$NEW_EDGE" >/dev/null || exit 1
   else
     mkdir -p "$(dirname "$NEW_EDGE")" && cp "$EDGE_TEMPLATE" "$NEW_EDGE"
@@ -620,6 +656,9 @@ if [ "$DRY" = 1 ]; then
   fi
   if [ "$SHARE" = 1 ]; then
     echo "[dry-run] share links enabled: rendered the share slice to a temp dir (would install it at ~/.config/herdr-engineering/share/), the edge conf gains the share host's server block, the edge certificate must name that host, share-public would be force-recreated before the edge"
+  fi
+  if [ "$ARTIFACT_HOST" = 1 ]; then
+    echo "[dry-run] artifact host enabled: rendered its configuration to a temp dir (would install it 0644 in a 0700 $AH_DIR), the edge conf gains its server block and /mcp/artifacts, would build herdr-artifact-host:$TAG, run migrate, and bring up project $AH_PROJECT (db, public, internal) healthy BEFORE the control plane's compose up"
   fi
   echo "[dry-run] would prewarm the target image checkpoint on an existing deployment when its CLI supports it, before host or service changes"
   echo "[dry-run] would build herdr-engineering:$TAG and recreate ${APP_SERVICES[*]} ${EDGE_SERVICE[*]}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}}"
@@ -729,6 +768,11 @@ deploy_lock_phase build
 memory_client_build || exit 1
 docker build -q -f "$WORK/deploy/fabric-stack/Dockerfile" --build-arg "GIT_COMMIT=$SHA" \
   "${MEMORY_CLIENT_BUILD_ARGS[@]}" -t "herdr-engineering:$TAG" "$WORK" >/dev/null
+# The host's image comes from the same commit (only the standalone herdr_artifact_host package goes into it).
+if [ "$ARTIFACT_HOST" = 1 ]; then
+  docker build -q -f "$WORK/deploy/artifact-host/Dockerfile" --build-arg "GIT_COMMIT=$SHA" \
+    -t "herdr-artifact-host:$TAG" "$WORK" >/dev/null
+fi
 
 # Use this checkout's helper, not the target commit's possibly older deploy tooling.
 # The selected canonical source stays the forward mount. Snapshots live outside
@@ -826,6 +870,7 @@ if [ "$COLLAB" = 1 ]; then
   for u in "${SYNC_UNITS[@]}"; do backup_file "$UNIT_DIR/$u"; done
 fi
 if [ "$SHARE" = 1 ]; then backup_file "$SHARE_CONFIG"; fi
+if [ "$ARTIFACT_HOST" = 1 ]; then backup_file "$AH_CONFIG"; backup_file "$AH_DBPW"; fi
 
 # restore_host_state: every backed-up file back to its pre-deploy content. nginx.conf in
 # place (same inode, then the edge reloads); the collab-sync units reload in systemd.
@@ -863,6 +908,9 @@ compose_run() {
   if [ "$COLLAB" = 1 ]; then files+=(-f "$tree/deploy/control-plane/compose.collab.yaml"); fi
   if [ "$FABRIC" = 1 ] && [ -f "$tree/deploy/control-plane/compose.collab-fabric.yaml" ]; then
     files+=(-f "$tree/deploy/control-plane/compose.collab-fabric.yaml")
+  fi
+  if [ "$ARTIFACT_HOST" = 1 ] && [ -f "$tree/deploy/control-plane/compose.artifact-host.yaml" ]; then
+    files+=(-f "$tree/deploy/control-plane/compose.artifact-host.yaml")
   fi
   if [ "$WEB_EGRESS_COMPOSE_ENABLED" = 1 ]; then files+=(-f "$WEB_EGRESS_OVERLAY"); fi
   if [ -n "$ROLLBACK_IMAGES" ]; then files+=(-f "$ROLLBACK_IMAGES"); fi
@@ -972,6 +1020,38 @@ stop_share_public() {   # never fatal; plain docker, so it works whichever compo
   fi
 }
 
+# ah_compose <compose args...>: the artifact host's own project (its compose file, none of the control plane's).
+ah_compose() {
+  HERDR_ARTIFACT_HOST_TAG="$TAG" docker compose -p "$AH_PROJECT" -f "$WORK/deploy/artifact-host/compose.yaml" "$@"
+}
+
+# install_artifact_host_files: 0644 files in a 0700 directory. Compose ignores secret uid/gid/mode, so the container user
+# reads the host file with its own mode; the directory is what keeps other host users out.
+install_artifact_host_files() {
+  mkdir -p "$AH_DIR" && chmod 700 "$AH_DIR" || return 1
+  local pw="$AH_DIR/.dbpw.tmp"
+  ( umask 077; python3 -c 'import json,sys; sys.stdout.write(json.load(open(sys.argv[1]))["database"]["password"])' "$NEW_AH" > "$pw" ) \
+    || return 1
+  install -m 0644 "$NEW_AH" "$AH_CONFIG.install.tmp" && mv -f "$AH_CONFIG.install.tmp" "$AH_CONFIG" || return 1
+  install -m 0644 "$pw" "$AH_DBPW.install.tmp" && mv -f "$AH_DBPW.install.tmp" "$AH_DBPW" || return 1
+  rm -f "$pw"
+}
+
+# artifact_host_up: schema first (a prewarm: the roles refuse to serve an unmigrated database), then the three services
+# recreated (the roles read their configuration at startup) and waited on until healthy. Runs BEFORE the control plane's
+# compose up, which attaches control-plane-web and the edge to the networks created here.
+artifact_host_up() {
+  ah_compose run --rm artifact-host-public migrate --config /run/secrets/artifact-host-config >/dev/null || return 1
+  ah_compose up -d --no-build --force-recreate --wait --wait-timeout 180 >/dev/null || return 1
+}
+
+stop_artifact_host() {   # never fatal: the host is disabled, so a project a previous deploy started has no job (data stays)
+  local ids
+  ids="$(docker ps -q --filter "label=com.docker.compose.project=$AH_PROJECT" 2>/dev/null || true)"
+  [ -z "$ids" ] || docker stop $ids >/dev/null 2>&1 \
+    || echo "WARNING: could not stop the artifact host project $AH_PROJECT (control_plane.artifact_host.enabled is false)" >&2
+}
+
 stop_fabric_whois() {   # never fatal: the listener is not configured, so the sidecar a previous deploy started has no job
   if docker inspect herdr-collab-fabric-whois >/dev/null 2>&1; then
     docker stop herdr-collab-fabric-whois >/dev/null 2>&1 \
@@ -993,6 +1073,7 @@ forward() {
     && chmod 755 "$HERDR_COLLAB_MIRROR_DIR" "$HERDR_COLLAB_OUTBOX_DIR" && chmod 700 "$HERDR_COLLAB_SPOOL_DIR" \
     || return 1
   if [ "$SHARE" = 1 ]; then install_private "$NEW_SHARE" "$SHARE_CONFIG" || return 1; fi
+  if [ "$ARTIFACT_HOST" = 1 ]; then install_artifact_host_files || return 1; fi
   # the deploy/pipelines refresh timer; its first run is the timer's (a fetch never fails a deploy)
   if [ -f "$PIPELINES_SYNC" ]; then
     "$PIPELINES_SYNC" install --dir "$PIPELINES_DIR" || return 1
@@ -1030,6 +1111,7 @@ forward() {
     mkdir -p "$(dirname "$HERDR_COLLAB_EDGE_CONF")" || return 1
     write_edge_conf "$NEW_EDGE" || return 1
   fi
+  if [ "$ARTIFACT_HOST" = 1 ]; then artifact_host_up || return 1; fi
   if [ "$SHARE" = 1 ]; then
     # Stateless and it reads its slice only at startup: recreated once, alone, BEFORE the edge (whose conf
     # now names it as an upstream nginx resolves at start and reload).
@@ -1053,6 +1135,7 @@ forward() {
   # Shares disabled: the edge no longer serves the share host; stop a share-public a previous deploy started (its
   # bundles stay on disk). Never fatal.
   if [ "$SHARE" = 0 ] && [ -n "$NEW_SHARE" ]; then stop_share_public; fi
+  if [ "$ARTIFACT_HOST" = 0 ] && [ -n "$NEW_AH" ]; then stop_artifact_host; fi
   if [ "$COLLAB" = 1 ] && [ "$FABRIC" = 0 ]; then stop_fabric_whois; fi
   deploy_lock_phase verify || return 1
   python3 "$STATE_HELPER" verify-forward "$ATTEMPT" || return 1

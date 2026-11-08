@@ -1,0 +1,24 @@
+# Overlay for the control-plane project, added by deploy.sh only when control_plane.artifact_host.enabled is true.
+# It attaches exactly two control-plane containers to the artifact host's networks (declared by
+# deploy/artifact-host/compose.yaml, which deploy.sh brings up FIRST, so the networks exist):
+#
+#   control-plane-web (herdr-cp-web)  -> artifact-internal : the dashboard's read-only client of artifact-host-internal
+#   collab-edge                       -> artifact-edge     : the TLS edge reaches artifact-host-public (:8090) and nothing else
+#
+# No other control-plane service (postgres, worker, llm-*, collab-public, share-public, ...) joins a host network.
+# `default` is repeated because naming `networks:` replaces the implicit default network.
+name: herdr-control-plane
+
+services:
+  control-plane-web:
+    networks: [default, artifact-internal]
+  collab-edge:
+    networks: [collab, share, edge, artifact-edge]
+
+networks:
+  artifact-internal:
+    external: true
+    name: ${HERDR_ARTIFACT_NET_PREFIX:-herdr-artifact}-internal
+  artifact-edge:
+    external: true
+    name: ${HERDR_ARTIFACT_NET_PREFIX:-herdr-artifact}-edge

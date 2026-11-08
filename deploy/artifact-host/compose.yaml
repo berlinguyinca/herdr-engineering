@@ -1,0 +1,142 @@
+# HerdR artifact host (member-owned artifacts): its own project, database, blob volume and image. Deployed by
+# deploy/control-plane/deploy.sh (do not run `docker compose up` by hand: the variables below come from it).
+#
+#   artifact-host-db        its own PostgreSQL (nothing else uses it)
+#   artifact-host-public    the public listener (:8090) behind the collab edge, plus a 127.0.0.1-only health listener
+#   artifact-host-internal  the dashboard's read-only listener (:8091), key-authenticated, GET only
+#
+# NETWORKS (every one is `internal: true`: Docker gives them no gateway, so nothing on them has a route out or in
+# except through a container attached to them; no host container publishes a port):
+#
+#   artifact-host        public <-> db                     (the public role's database path)
+#   artifact-db-internal internal <-> db                   (the internal role's database path; the db is on both)
+#   artifact-edge        public <-> collab-edge            (fixed subnet: the edge's operator listener refuses it)
+#   artifact-internal    internal <-> herdr-cp-web         (declared again, external, by deploy/control-plane/compose.artifact-host.yaml)
+#
+# The public and internal roles share NO network, so a compromised public listener has no path to the dashboard
+# listener; herdr-cp-* sits on none of artifact-host / artifact-db-internal / artifact-edge, and the host containers
+# sit on none of the control plane's networks. See COLLAB.md "Artifact host" for what Docker alone does and does not
+# enforce (notably: no egress is configured at all, because the public role needs none: Cognito keys and group
+# membership arrive through the synced files, and the browser exchanges the sign-in code with Cognito itself).
+#
+# CONFIG: one JSON slice (secret `artifact-host-config`, rendered by `herdr-eng fleet config render-artifact-host`)
+# and the database password (secret `artifact-host-db-password`). Nothing is read from the environment.
+# ISOLATION CAVEAT (checked, not assumed): Compose ignores secret uid/gid/mode, so the secret files' host mode decides who
+# can read them inside the container; see the comment on `secrets:` below.
+name: ${HERDR_ARTIFACT_HOST_PROJECT:-herdr-artifact-host}
+
+x-role: &role
+  image: herdr-artifact-host:${HERDR_ARTIFACT_HOST_TAG:?run deploy.sh}
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 256
+  mem_limit: 768m
+  cpus: 1.0
+  user: "10001:10001"
+  # File secrets are plain bind mounts under Compose: `uid`/`gid`/`mode` are IGNORED (Compose warns and says so), so the
+  # container user (10001) reads the file with the host file's own owner and mode. deploy.sh therefore installs both
+  # secret files 0644 inside a 0700 directory it owns: other host users cannot traverse to them, and only these
+  # containers mount them.
+  secrets:
+    - artifact-host-config
+  depends_on:
+    artifact-host-db:
+      condition: service_healthy
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+
+services:
+  artifact-host-db:
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: artifact_host
+      POSTGRES_DB: artifact_host
+      POSTGRES_PASSWORD_FILE: /run/secrets/artifact-host-db-password
+    secrets:
+      - artifact-host-db-password
+    volumes:
+      - artifact-host-db:/var/lib/postgresql/data
+    networks: [artifact-host, artifact-db-internal]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /run/postgresql:mode=1777
+    # The entrypoint chowns the data directory and drops to the postgres user, so it keeps these and nothing else.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U artifact_host -d artifact_host"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  artifact-host-public:
+    <<: *role
+    command: ["public", "--config", "/run/secrets/artifact-host-config"]
+    volumes:
+      - artifact-host-blobs:/var/lib/artifact-host/blobs
+      # collab-sync.sh's output directory (jwks.json + members.json, replaced atomically per file): a DIRECTORY mount,
+      # read-only, so a rename-replace is seen. Only the public role reads it (sign-in and the housekeeping sweep).
+      - ${HERDR_COLLAB_SYNC_DIR:?run deploy.sh}:/sync:ro
+    networks: [artifact-host, artifact-edge]
+    healthcheck:
+      test: ["CMD", "herdr-artifact-host", "healthcheck", "public", "--config", "/run/secrets/artifact-host-config"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  artifact-host-internal:
+    <<: *role
+    command: ["internal", "--config", "/run/secrets/artifact-host-config"]
+    volumes:
+      - artifact-host-blobs:/var/lib/artifact-host/blobs:ro
+    networks: [artifact-db-internal, artifact-internal]
+    healthcheck:
+      test: ["CMD", "herdr-artifact-host", "healthcheck", "internal", "--config", "/run/secrets/artifact-host-config"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+secrets:
+  artifact-host-config:
+    file: ${HERDR_ARTIFACT_HOST_CONFIG:?run deploy.sh}
+  artifact-host-db-password:
+    file: ${HERDR_ARTIFACT_HOST_DB_PASSWORD_FILE:?run deploy.sh}
+
+volumes:
+  artifact-host-blobs:
+  artifact-host-db:
+
+networks:
+  artifact-host:
+    internal: true
+  artifact-db-internal:
+    internal: true
+  artifact-edge:
+    name: ${HERDR_ARTIFACT_NET_PREFIX:-herdr-artifact}-edge
+    internal: true
+    # Fixed so the collab edge can refuse it on its operator listener (8082, no sign-in): the public role shares this
+    # network with the edge and must never reach collab_operator by setting Host itself. Next to the host's fixed
+    # 172.31.250.0/29 and the share network's 172.31.251.0/28; a change here must match the `deny` in
+    # collab-edge/nginx.conf (a test keeps them in step).
+    ipam:
+      config:
+        - subnet: ${HERDR_ARTIFACT_EDGE_SUBNET:-172.31.252.0/28}
+  artifact-internal:
+    name: ${HERDR_ARTIFACT_NET_PREFIX:-herdr-artifact}-internal
+    internal: true

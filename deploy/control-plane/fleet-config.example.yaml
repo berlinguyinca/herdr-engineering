@@ -196,6 +196,17 @@ sections:
       #     max_per_share: 20000
       #   # container paths; keep the defaults with deploy.sh (its mounts are fixed):
       #   # shares_dir: /shares   events_dir: /share-events   marker_dir: /var/lib/herdr/share-markers
+      # OPTIONAL: the dedicated artifact host (COLLAB.md, "Artifact host"). OFF unless `enabled: true`; needs the collab
+      # marker and cannot be enabled together with share. Cognito identifiers come from collab; the dashboard library's
+      # host_key (control_plane.artifact_library) is required and only its sha256 reaches the host.
+      # artifact_host:
+      #   enabled: false
+      #   public_host: "artifacts.example.test"      # lowercase DNS name; must have a certificate on the edge
+      #   mcp_public_hosts: ["mcp.example.test"]     # hosts allowed on /mcp/artifacts
+      #   session_secret: "REDACTED"                 # >= 32 bytes, never equal to claim_key (openssl rand -hex 32)
+      #   claim_key: "REDACTED"                      # >= 32 bytes
+      #   db_password: "REDACTED"                    # >= 16 chars
+      #   # session_seconds, health_port (8092), db_user are optional
       # OPTIONAL: the collaborator bridge (external agents read and commit artifacts through collab-public's MCP tools).
       # OFF unless `enabled: true` (exactly true). Needs the collab marker for collab-public to serve it; the worker runs
       # the bridge loop whenever this is true. YAML only: no environment variable is read. Every limit is a positive
