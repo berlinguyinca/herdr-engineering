@@ -129,17 +129,22 @@ the same machine land in ONE shared room with no owner click. The body gains an 
 dot, underscore, colon, hyphen>", "label": "<display only, at most 64 printable characters>"}` and optional informational `tab_id` and `pane_id`
 (same character rule, stored on the agent for display only). The room key is `(whois machine, workspace id)`: the machine is never client
 supplied, so the same workspace id on another machine is a different room. Without `workspace` (or with the switch off) behaviour is exactly as
-above. Malformed fields are a 400 and create nothing.
+above. Only a malformed `workspace` object or id is a 400 (and creates nothing); an invalid `label`, `tab_id` or `pane_id` is display-only and is IGNORED
+(dropped), so it can never fail a join.
 
-- *Room.* The first join for a key creates the room (`<machine>/<label or id>`, owner = `operator_user`) in a lazily created project
+- *Room.* The first join for a key creates the room (always named `<machine>/<workspace id>`, owner = `operator_user`; the label is a separate, sanitised display field that is advisory and chosen by
+  whoever joins first, never part of the identity or the name) in a lazily created project
   `fabric-workspaces` that the operator owns, then grants the agent. Later joins find the room through an index rebuilt from the event log, so
   it survives a restart or rebuild. All writes are `_commit` events whose audit rows carry `via: "fabric"`; the response adds `room_id` and `workspace`.
 - *Grant.* `read`, `post`, `instruct` and `execute`. Never `spawn_helpers`, never `coordinate` (see below). The grant has no expiry of its own: it
   lasts as long as the agent's fabric window and ends on revocation. The binding and the grant are one event, so an owner who narrows or removes
-  an agent's grant is not overridden by a later re-join.
+  an agent's grant is not overridden by a later re-join: the re-join answer then omits `room_id`, says `"room_access": false` and keeps the `workspace` binding.
 - *Bounds (429, fail closed, throttled audit rows like the other refusals).* `workspace_rooms_per_machine` (100), `workspace_rooms_total` (500)
   and `workspace_room_members` (50; active agents holding a grant). Reasons `fabric_ws_machine_cap`, `fabric_ws_total_cap`, `fabric_ws_members_cap`.
-  The caps are checked before the agent is created, so a refused join leaves nothing behind. These writes do not go through the user paths, so
+  The caps count only LIVE rooms (at least one active agent bound): revoking the agents of a room frees its slot, while the empty room is still
+  found by its key and reused, never duplicated. The member cap does not count the joining agent. Every check runs before anything is written, so
+  a refused join (new or re-join) leaves nothing behind. The room and its first grant are separate events, but a half-done bind self-heals: the
+  next join finds the room by its key. The `fabric-workspaces` project is pinned as the first one created, at runtime and on replay alike. These writes do not go through the user paths, so
   `max_rooms_per_project` and `max_projects_per_user` do not apply to them.
 - *One workspace per agent, auto-join only.* An auto-joined agent belongs to at most one workspace room. Re-joining the same (machine, name) from
   a DIFFERENT workspace id answers 409, audits `fabric_join_workspace_changed` and changes nothing (not even the renewal); use another agent name.
@@ -154,7 +159,11 @@ above. Malformed fields are a 400 and create nothing.
   Originating needs `coordinate` or an owner-designated team coordinator, which also needs an attached team. That stays an explicit owner grant.
 - *Client.* `herdr-eng rooms join-fabric NAME` and `join.sh --fabric` read `HERDR_WORKSPACE_ID` (plus `HERDR_TAB_ID`, `HERDR_PANE_ID` and, when set,
   `HERDR_WORKSPACE_LABEL`) from the environment and send them; `--no-workspace` opts out. The identity file stays `{agent_id, name, machine}`
-  and gains `room_id` when the join landed in a room. The dashboard's agents list shows the workspace and room of an auto-joined agent; there is no new UI.
+  and gains `room_id` when the join landed in a room (with `room_access: false` the clients say "joined, but no access to the workspace room (owner removed
+  it)" and write no `room_id`). The clients sanitise the label (control, format and bidi characters stripped, at most 64) and omit an invalid
+  tab or pane; an invalid workspace id means they join without a workspace. `join.sh` explains each HTTP status with the server's error text.
+  **Deploy order: server first, then clients.** A new client against an older server gets 400 "unknown field": both clients retry ONCE without
+  the workspace fields and say the room was not used. The id and limit rules in `join.sh` are a copy of the server's constants (a test compares them). The dashboard's agents list shows the workspace and room of an auto-joined agent; there is no new UI.
 - ***A YAML edit alone does nothing.*** collab-public reads the RENDERED `collab-config.json`, not the fleet YAML. `auto_join` and the four
   workspace keys reach it only through `herdr-eng fleet config render-collab` (which validates and carries them) or a deploy that runs it.
   Check the rendered file before concluding the feature is on.
