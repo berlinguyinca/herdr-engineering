@@ -59,11 +59,14 @@ ACTIONS = (
     "external-file",
     "external-decide",
     "external-retry",
+    # fabric auto-join (404 on the server until control_plane.collab.fabric_trust.auto_join is true)
+    "join-fabric",
 )
 EXTERNAL_ACTIONS = ("issue-target", "external-list", "external-file", "external-decide", "external-retry")
 
 
 AGENT_MODE_ACTIONS = ("my-tasks", "respond")
+_JOIN_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")  # also the file name, so no path separator can pass
 _AGENT_ID = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _MACHINE = re.compile(r"^[A-Za-z0-9._-]{1,253}$")
 
@@ -248,8 +251,55 @@ def _print_request(row):
         print(f"    > {_safe(line, 400)}")
 
 
+def _join_fabric(args):
+    """``rooms join-fabric NAME``: join as a fabric agent with no token (the tailnet machine vouches), then write
+    ``~/herdr-agents/NAME.json`` ($HERDR_AGENT_DIR as join.sh honours) holding ONLY agent_id, name and machine, mode 0600.
+    There is no credential to store, and the file is what ``_agent_identity`` discovers."""
+    name = args.name
+    if not _JOIN_NAME.match(name):
+        raise ValueError("invalid NAME: 1-64 lowercase letters, digits, dot, hyphen or underscore, starting with a letter or digit")
+    from .host_config import resolve_control_plane
+
+    client = ShareClient(resolve_control_plane(args.control_plane))
+    client.headers = {}  # whois on the real TCP peer is the only credential; nothing else is sent
+    body = {"name": name}
+    if args.machine:
+        body["machine"] = args.machine
+    result = client.request(f"{BASE}/agents/fabric-join", body)
+    ident = {k: result.get(k) for k in ("agent_id", "name", "machine")}
+    if not isinstance(ident["agent_id"], str) or not _AGENT_ID.match(ident["agent_id"]):
+        raise ValueError("the control plane returned no usable agent id")
+    folder = Path(os.environ.get("HERDR_AGENT_DIR") or Path.home() / "herdr-agents")
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f"{name}.json"
+    tmp = folder / f".{name}.json.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(ident) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, target)
+    _show(
+        args,
+        result,
+        lambda r: print(
+            f"Joined as {_safe(r.get('agent_id'))} ({_safe(r.get('name'))} on {_safe(r.get('machine'))}); "
+            f"identity written to {target}"
+        ),
+    )
+
+
 def run_command(args):
     action = args.rooms_action
+    if action == "join-fabric":
+        try:
+            _join_fabric(args)
+            return 0
+        except ShareError as error:
+            _err(_message(error))
+            return 1
+        except (OSError, ValueError, RuntimeError) as error:
+            _err(str(error))
+            return 1
     token = os.environ.get(args.token_env)
     as_agent = getattr(args, "as_agent", None)
     agent = None
@@ -784,6 +834,11 @@ def configure_parser(parser):
             help="Environment variable NAME holding your collaboration bearer token, never the token",
         )
         c.add_argument("--json", action="store_true", help="print the server's JSON only")
+        if action == "join-fabric":
+            c.add_argument("name", help="the agent's name on this machine (lowercase, 1-64 characters)")
+            c.add_argument("--machine", help="informational only: the server uses its own whois answer")
+            c.set_defaults(func=run_command)
+            continue
         c.add_argument("room")
         if action in ("attach", "detach", "roles", "assign-role", "clear-role", "role-policy"):
             c.add_argument("team", help="the team id (herdr-eng teams list)")
