@@ -84,14 +84,28 @@ class CIHistory:
     def _measurement_snapshot(self):
         return self._measurements.snapshot()
 
-    def snapshot(self, *, start=True):
+    def snapshot(self, *, start=True, window=None):
+        """Detached view. ``window=(offset, limit)`` copies only that slice of
+        ``pipelines`` (the rest of the view is small) and adds a ``pagination``
+        marker, so a page request costs the page, not the whole retained history."""
         if start:
             self.start()
         with self._lock:
-            result = copy.deepcopy(self._view)
+            pipelines = self._view['pipelines']
+            total = len(pipelines)
+            if window is not None:
+                offset, limit = window
+                pipelines = pipelines[offset:offset + limit]
+            result = {key: copy.deepcopy(value) for key, value in self._view.items() if key != 'pipelines'}
+            result['pipelines'] = copy.deepcopy(pipelines)
+        if window is not None:
+            end = offset + len(result['pipelines'])
+            more = end < total
+            result['pagination'] = {'total': total, 'limit': limit, 'offset': offset,
+                                    'next_offset': end if more else None, 'truncated': more}
         if self._last_check is not None and self._now() - self._last_check > self._interval * 3:
             result['stale'] = True
-        self._measurements.observe(result, len(result['pipelines']), result['stale'])
+        self._measurements.observe(result, total, result['stale'])
         return result
 
     def summary_snapshot(self, *, start=True):
@@ -188,6 +202,10 @@ class CIHistory:
                 value.update(complete_since=None, exhausted=False,
                              error=value['error'] or 'CI history is awaiting head revalidation.')
         rows = [row for repo in repos for row in self._states[str(repo['id'])]['rows'].values()]
+        # A deterministic total order keeps offset paging stable between requests:
+        # newest first, ties broken by repository then run number.
+        rows.sort(key=lambda row: (str(row.get('provider_repo_id')), -int(_key(row) or 0)))
+        rows.sort(key=lambda row: str(row.get('created_at') or ''), reverse=True)
         partial = bool(inventory_error) or any(c['error'] or c['truncated'] for c in coverage.values())
         pending = any(not state['done'] for state in self._states.values())
         old_outcomes = any(not state['done'] and set(state['rows']) - state['seen']

@@ -822,6 +822,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = csub.add_parser("checkpoint", help="prewarm durable projection checkpoints")
     p2.add_argument("--fleet-config", required=True)
     p2.add_argument("--migrations", default=None)
+    p2.add_argument("--lock-wait", type=float, default=0.0, metavar="SECONDS",
+                    help="keep retrying for up to SECONDS when another materializer (the worker's "
+                         "periodic refresh) holds the checkpoint lock; default 0 fails at once")
     p2.set_defaults(func=_cmd_cp_checkpoint)
     p2 = csub.add_parser("collab-repair", help="set aside foreign rows of the collaboration log (dry run by default; "
                          "never deletes: rows move to a quarantine file/table)")
@@ -4084,7 +4087,8 @@ def _cmd_cp_checkpoint(args) -> int:
         asyncio.run(migrate())
         stage = 'materialization'
         result = refresh_checkpoint(dsn, host_aliases=_host_aliases_from(cp),
-                                    inspector_limits=cp.get("inspector_limits") or {})
+                                    inspector_limits=cp.get("inspector_limits") or {},
+                                    lock_wait=max(0.0, getattr(args, "lock_wait", 0.0) or 0.0))
     except (Exception, SystemExit) as exc:
         error = {"ok": False, "error": type(exc).__name__, "stage": stage}
         if isinstance(exc, CheckpointInvalid):

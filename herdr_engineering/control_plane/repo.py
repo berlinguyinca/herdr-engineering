@@ -1009,7 +1009,8 @@ class ControlPlaneRepo:
     def list_services(self, *, include_archived=True):
         services = [self._service_projection(s) for s in self._services.values()]
         return _sort_by([s for s in services if include_archived
-                         or not s["lifecycle"]["archived"]], "created_at", reverse=True)
+                         or not s["lifecycle"]["archived"]], "created_at", reverse=True,
+                        id_key="service_id")
 
     def service_catalog_page(self, *, scope='herdr', status='current', include_archived=False,
                              search='', host_id='', group_by='project', limit=100, cursor=None):

@@ -3829,6 +3829,11 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         return self._json({'error':'staleCatalogCursor','message':str(exc)},409)
                     except ValueError as exc:
                         return self._json({'error':str(exc)},400)
+                try:
+                    limit, offset = _page_window(self.path, default_limit=SERVICES_PAGE_DEFAULT,
+                                                 max_limit=SERVICES_PAGE_MAX)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
                 services = r.list_services()
                 host_filter = _q(self.path, "host_id")
                 if host_filter:
@@ -3838,11 +3843,13 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 summary["total"] = len(services)
                 if _q(self.path, "include_archived") in {"false", "0"}:
                     services = [s for s in services if not s["lifecycle"]["archived"]]
+                services, pagination = _page_slice(services, limit, offset)
                 if _q(self.path, "fields") == "feed":
                     # The ownership feed needs identity and proof only; the full
                     # catalog projection is most of the bytes of a large inventory.
                     services = [{k: s.get(k) for k in _FEED_SERVICE_FIELDS} for s in services]
-                return self._etag_json({"services": services, "summary": summary})
+                return self._etag_json({"services": services, "summary": summary,
+                                        "pagination": pagination})
             if resource == "fleet" and parts[4:] == ["config", "status"]:
                 if server.fleet_config is None:
                     return self._json({"error": "not found"}, 404)
@@ -4118,8 +4125,18 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         languages if isinstance(languages, dict) else {}))
                 if what == "history":
                     from .project_links import annotate_ci_history, cached_github_languages
-                    return self._json(annotate_ci_history(server.ci_monitor.history(), r,
-                        repository_languages=cached_github_languages(server.github_monitor)))
+                    try:
+                        limit, offset = _page_window(self.path, default_limit=CI_HISTORY_PAGE_DEFAULT,
+                                                     max_limit=CI_HISTORY_PAGE_MAX)
+                    except ValueError as exc:
+                        return self._json({"error": str(exc)}, 400)
+                    # Only the requested window is copied, then annotated.
+                    snapshot = server.ci_monitor.history(window=(offset, limit))
+                    pagination = snapshot.pop("pagination")
+                    view = annotate_ci_history(snapshot, r,
+                        repository_languages=cached_github_languages(server.github_monitor))
+                    view["pagination"] = pagination
+                    return self._json(view)
                 if what == "reports":
                     from .project_links import annotate_ci_history, cached_github_languages
                     filters = _ci_reports_query(self.path)
@@ -6846,6 +6863,35 @@ def _evolution_body(server, r, session_id, session=None):
 def _q(path, key):
     from urllib.parse import parse_qs, urlparse
     return parse_qs(urlparse(path).query).get(key, [None])[0]
+
+
+def _page_window(path, *, default_limit, max_limit):
+    """Parse ``limit``/``offset`` for a flat list endpoint (ValueError -> 400)."""
+    values = {}
+    for key, low in (("limit", 1), ("offset", 0)):
+        raw = _q(path, key)
+        if raw is None:
+            continue
+        if not re.fullmatch(r"[0-9]{1,9}", raw) or int(raw) < low:
+            raise ValueError(f"{key} must be an integer >= {low}")
+        values[key] = int(raw)
+    limit = values.get("limit", default_limit)
+    if limit > max_limit:
+        raise ValueError(f"limit must be an integer between 1 and {max_limit}")
+    return limit, values.get("offset", 0)
+
+
+def _page_slice(rows, limit, offset):
+    """Return (page rows, pagination marker) for an already ordered list."""
+    page = rows[offset:offset + limit]
+    end = offset + len(page)
+    more = end < len(rows)
+    return page, {"total": len(rows), "limit": limit, "offset": offset,
+                  "next_offset": end if more else None, "truncated": more}
+
+
+SERVICES_PAGE_DEFAULT, SERVICES_PAGE_MAX = 500, 1000
+CI_HISTORY_PAGE_DEFAULT, CI_HISTORY_PAGE_MAX = 1000, 2000
 
 
 def _qint(path, key, default):

@@ -144,7 +144,8 @@ export function mountCiHealth(host,client,{onSelectRun=()=>{},onSelectStep=()=>{
     if(disposed || doc.hidden || pending)return;
     if(typeof client.getCiHistory!=='function'){history={available:false,status:'unavailable',missingClient:true,repos:[],pipelines:[],coverage:{}};draw();return;}
     const request=new AbortController(),version=++generation;pending=request;
-    const timeout=setTimeout(()=>request.abort(),15000);
+    // The client pages CI history (2000 rows per request), so a refresh may take several round trips.
+    const timeout=setTimeout(()=>request.abort(),60000);
     try {
       // Race the abort as old clients may not honor the supplied signal.
       const aborted=new Promise((_,reject)=>request.signal.addEventListener('abort',()=>reject(new Error('CI history refresh timed out.')),{once:true}));

@@ -290,7 +290,7 @@ test('dashboard reads preserve filters and forward cancellation signals', async 
   await client.listHosts({signal:controller.signal});
   await client.health({signal:controller.signal});
   await client.activity(8,{signal:controller.signal});
-  assert.deepEqual(calls.map(x=>x.url), ['/api/v1/sessions?status=active','/api/v1/services','/api/v1/hosts','/api/v1/health','/api/v1/activity?limit=8']);
+  assert.deepEqual(calls.map(x=>x.url), ['/api/v1/sessions?status=active','/api/v1/services?limit=1000','/api/v1/hosts','/api/v1/health','/api/v1/activity?limit=8']);
   assert.ok(calls.every(x=>x.opts.signal===controller.signal));
 });
 
@@ -387,6 +387,82 @@ test('CI report history reads use viewer GET and forward cancellation',async()=>
  } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
 });
 
+test('listServices and getCiHistory lazily follow next_offset and merge pages',async()=>{
+ const calls=[];
+ const server=createServer((req,res)=>{
+  calls.push(req.url);
+  const offset=Number(new URL(req.url,'http://x').searchParams.get('offset')||0);
+  const key=req.url.startsWith('/api/v1/services')?'services':'pipelines';
+  const next=offset<2?offset+1:null;
+  res.setHeader('Content-Type','application/json');
+  res.end(JSON.stringify({[key]:[{id:offset}],summary:{total:3},repos:[],coverage:{},pagination:{total:3,limit:1,offset,next_offset:next,truncated:next!==null}}));
+ });
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ try {
+  const client=new HerdrClient(`http://127.0.0.1:${server.address().port}`);
+  const services=await client.listServices();
+  assert.deepEqual(services.services,[{id:0},{id:1},{id:2}]);
+  assert.equal(services.pagination.next_offset,null);
+  assert.deepEqual(calls,['/api/v1/services?limit=1000','/api/v1/services?limit=1000&offset=1','/api/v1/services?limit=1000&offset=2']);
+  calls.length=0;
+  const history=await client.getCiHistory();
+  assert.deepEqual(history.pipelines,[{id:0},{id:1},{id:2}]);
+  assert.deepEqual(calls,['/api/v1/ci/history?limit=2000','/api/v1/ci/history?limit=2000&offset=1','/api/v1/ci/history?limit=2000&offset=2']);
+  calls.length=0;
+  assert.equal((await client.listServices({all:false})).services.length,1);
+  assert.deepEqual(calls,['/api/v1/services?limit=1000']);
+ } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+});
+
+async function withPagedServer(handler,fn){
+ const calls=[];
+ const server=createServer((req,res)=>{
+  calls.push(req.url);
+  const offset=Number(new URL(req.url,'http://x').searchParams.get('offset')||0);
+  res.setHeader('Content-Type','application/json');res.end(JSON.stringify(handler(offset,req.url)));
+ });
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ try {await fn(new HerdrClient(`http://127.0.0.1:${server.address().port}`),calls);}
+ finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+}
+
+test('paging de-duplicates rows that shift between page requests',async()=>{
+ const services=[{service_id:'a'},{service_id:'b'},{service_id:'c'}];
+ await withPagedServer(offset=>offset===0
+  ?{services:services.slice(0,2),pagination:{next_offset:2,truncated:true}}
+  :{services:services.slice(1),pagination:{next_offset:null,truncated:false}},async client=>{
+  const result=await client.listServices();
+  assert.deepEqual(result.services.map(s=>s.service_id),['a','b','c']);
+  assert.equal(result.pagination.truncated,false);
+ });
+ const run=(repo,n)=>({provider_repo_id:repo,run_number:n});
+ await withPagedServer(offset=>offset===0
+  ?{pipelines:[run(1,5),run(2,5)],pagination:{next_offset:2}}
+  :{pipelines:[run(2,5),run(1,4)],pagination:{next_offset:null}},async client=>{
+  const result=await client.getCiHistory();
+  // same run number in a different repository is a different run
+  assert.equal(result.pipelines.length,3);
+ });
+});
+
+test('a non-advancing next_offset stops paging and reports truncation instead of duplicating rows',async()=>{
+ for(const cursor of [0,2,'x',1.5]){
+  await withPagedServer(offset=>({services:[{service_id:`s${offset}`}],pagination:{next_offset:offset===0?2:cursor}}),async(client,calls)=>{
+   const result=await client.listServices();
+   assert.equal(result.pagination.truncated,true);
+   assert.match(result.pagination.error,/did not advance/);
+   assert.ok(calls.length<=3,`${cursor}: ${calls.length} requests`);
+   assert.equal(new Set(result.services.map(s=>s.service_id)).size,result.services.length);
+  });
+ }
+ await withPagedServer(offset=>({pipelines:[{provider_repo_id:1,run_number:offset+1}],pagination:{next_offset:offset+1}}),async(client,calls)=>{
+  const result=await client.getCiHistory();
+  assert.equal(result.pagination.truncated,true);
+  assert.match(result.pagination.error,/page cap/);
+  assert.equal(calls.length,200);
+ });
+});
+
 test('CI heatmap history uses the viewer endpoint and supports cancellation',async()=>{
  const calls=[];
  const server=createServer((req,res)=>{calls.push({url:req.url,method:req.method});res.setHeader('Content-Type','application/json');res.end(JSON.stringify({repos:[],pipelines:[],coverage:{}}));});
@@ -394,7 +470,7 @@ test('CI heatmap history uses the viewer endpoint and supports cancellation',asy
  try {
   const client=new HerdrClient(`http://127.0.0.1:${server.address().port}`);
   assert.deepEqual(await client.getCiHistory(),{repos:[],pipelines:[],coverage:{}});
-  assert.deepEqual(calls[0],{url:'/api/v1/ci/history',method:'GET'});
+  assert.deepEqual(calls[0],{url:'/api/v1/ci/history?limit=2000',method:'GET'});
   const controller=new AbortController();
   const request=client.getCiHistory({signal:controller.signal});controller.abort();
   await assert.rejects(request,{name:'AbortError'});
@@ -589,7 +665,7 @@ test('catalog paging is opt in, encoded and abortable; detail reads only one ser
   await client.listServices();
   await client.listServiceCatalog({scope:'unassigned',status:'all',includeArchived:true,search:'a & b',hostId:'h/x',groupBy:'type',limit:2,cursor:'opaque',signal:controller.signal});
   await client.getService('a/b?#',{signal:controller.signal});
-  assert.equal(calls[0].url,'/api/v1/services');
+  assert.equal(calls[0].url,'/api/v1/services?limit=1000');
   const params=new URL(calls[1].url,'http://x').searchParams;
   assert.deepEqual(Object.fromEntries(params),{view:'catalog',scope:'unassigned',status:'all',include_archived:'true',search:'a & b',host_id:'h/x',group_by:'type',limit:'2',cursor:'opaque'});
   assert.equal(calls[1].signal,controller.signal);

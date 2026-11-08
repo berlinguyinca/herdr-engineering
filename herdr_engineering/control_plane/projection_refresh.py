@@ -16,10 +16,11 @@ class CheckpointNotPublished(RuntimeError):
     """Recovery completed without publishing a durable projection checkpoint."""
 
 
-def refresh_checkpoint(dsn, *, host_aliases=None, inspector_limits=None):
+def refresh_checkpoint(dsn, *, host_aliases=None, inspector_limits=None, lock_wait=0.0):
     """Build the same projection policy as the web host; always release the source."""
     repo = ControlPlaneRepo(host_aliases=host_aliases, inspector_limits=inspector_limits)
-    source = bridge.PostgresSource(dsn=dsn, checkpoint_publish=True)
+    options = {'checkpoint_lock_wait': lock_wait} if lock_wait else {}
+    source = bridge.PostgresSource(dsn=dsn, checkpoint_publish=True, **options)
     try:
         counts = bridge.load_into(repo, source)
         # Only known modes and numeric counters cross the CLI/log boundary.
