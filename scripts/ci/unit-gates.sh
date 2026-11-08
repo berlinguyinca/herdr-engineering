@@ -13,11 +13,12 @@ need python3; need node; need git
 
 # --- shared dependency cache ---------------------------------------------------------
 # The exec agents get a private per-job /tmp, so the venv wheels, the npm tree and Chromium used to be paid on every
-# single run (~5-10 min of the ~45 min gate). On the hive agents /quobyte/metabolomicsgrp is visible cluster-wide, and
-# the caches here are content-addressed (pip http cache, npm cacache, playwright browser dir) and safe to share between
-# concurrent pipelines. When that path is not writable (docker agents, a dev host) the script falls back to a private
-# per-job dir and keeps working, just cold. Override with HERDR_CI_CACHE.
-cache_root="${HERDR_CI_CACHE:-/quobyte/metabolomicsgrp/it/ci/cache/herdr}"
+# single run (~5-10 min of the ~45 min gate). The one shared path the agent mounts rw into every job is the CI store
+# mount /home/wohlgemuth/woodpecker/ci (host: /quobyte/metabolomicsgrp/it/ci/woodpecker); /quobyte inside the image
+# is NOT mounted and must not be used. The caches here are content-addressed (pip http cache, npm cacache, playwright
+# browser dir) and safe to share between concurrent pipelines. When the path is not writable (docker agents, a dev
+# host) the script falls back to a private per-job dir and keeps working, just cold. Override with HERDR_CI_CACHE.
+cache_root="${HERDR_CI_CACHE:-/home/wohlgemuth/woodpecker/ci/cache/herdr}"
 cache_root_fallback=""
 if ! mkdir -p "$cache_root" 2>/dev/null || [ ! -w "$cache_root" ]; then
   cache_root_fallback="$(mktemp -d "${TMPDIR:-/tmp}/herdr-ci-cache.XXXXXX")"
