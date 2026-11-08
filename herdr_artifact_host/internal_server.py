@@ -27,10 +27,9 @@ import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
-from urllib.parse import parse_qs
 
 import asyncpg
 import msgpack
@@ -47,7 +46,6 @@ from .library import (
     Source,
     Viewer,
 )
-from .member_api import MemberSurface
 from .share_bundle import content_type_for
 from .share_http import CHUNK_BYTES, RateLimiter, decode_rel_path
 
@@ -66,7 +64,16 @@ _SHARE_STATES = frozenset({"pending", "live", "revoked"})
 _AUDIENCES = frozenset({"lab", "public"})
 # Same visibility as the feed: never a retracted, tombstoned or discarded artifact.
 _VISIBLE = "a.lifecycle NOT IN ('retracted','tombstoned') AND a.intake IN ('accepted','pending')"
+# Every response (API, errors and content) is sandboxed: a document served from here can run no script, reach no
+# network and has an opaque origin (no allow-same-origin).
+CONTENT_CSP = "sandbox; default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'"
+MAX_INT = 10**9  # offsets and limits are clamped long before an int64 parameter could overflow
+MAX_BODY = 1024
+HEALTHZ_PER_MINUTE = 120
+KEY_FAILURES_GLOBAL_PER_MINUTE = 200
+_EMPTY_DIGEST = hashlib.sha256(b"").hexdigest()
 _SECURITY_HEADERS = (
+    ("Content-Security-Policy", CONTENT_CSP),
     ("Cache-Control", "no-store"),
     ("X-Content-Type-Options", "nosniff"),
     ("Referrer-Policy", "no-referrer"),
@@ -82,10 +89,14 @@ class InternalConfig:
     key_digest: str
     role: str = ROLE
     key_failures_per_minute: int = KEY_FAILURES_PER_MINUTE
+    key_failures_global_per_minute: int = KEY_FAILURES_GLOBAL_PER_MINUTE
+    healthz_per_minute: int = HEALTHZ_PER_MINUTE
 
     def __post_init__(self) -> None:
         if not _DIGEST.fullmatch(self.key_digest):
             raise ValueError("internal_key_digest must be a lowercase hex sha256")
+        if self.key_digest == _EMPTY_DIGEST:
+            raise ValueError("internal_key_digest is the digest of the empty string")
         if self.role != ROLE:
             raise ValueError(f"the internal listener serves only the {ROLE} role")
 
@@ -175,6 +186,8 @@ def _one(query: dict[str, list[str]], name: str) -> str | None:
     values = query.get(name)
     if values is None:
         return None
+    if any("\x00" in v for v in values):
+        raise _BadRequest(f"{name} holds a NUL")
     if len(values) != 1:
         raise _BadRequest(f"{name} may be given once")
     return values[0] or None
@@ -189,6 +202,12 @@ def _time(value: str | None) -> datetime | None:
         raise _BadRequest("invalid timestamp") from exc
     if parsed.tzinfo is None:
         raise _BadRequest("timestamps need a time zone")
+    try:
+        utc = parsed.astimezone(UTC)
+    except (OverflowError, ValueError) as exc:
+        raise _BadRequest("timestamp out of range") from exc
+    if not 1970 <= utc.year <= 9998:
+        raise _BadRequest("timestamp out of range")
     return parsed
 
 
@@ -196,9 +215,10 @@ def _int(value: str | None, default: int) -> int:
     if value is None:
         return default
     try:
-        return int(value)
+        number = int(value)
     except ValueError as exc:
         raise _BadRequest("invalid number") from exc
+    return max(-MAX_INT, min(number, MAX_INT))
 
 
 def parse_feed_query(query: dict[str, list[str]], *, all_sources: bool = False) -> FeedQuery:
@@ -262,22 +282,40 @@ class InternalSurface:
         self.library = LibraryStore(self.reader)  # type: ignore[arg-type]
         self.blobs = blobs
         self.failures = RateLimiter(config.key_failures_per_minute, now)
+        self.failures_all = RateLimiter(config.key_failures_global_per_minute, now)
+        self.health = RateLimiter(config.healthz_per_minute, now)
 
     # -- entry --------------------------------------------------------------------------------------------
+
+    @staticmethod
+    def _client(request: web.Request) -> str:
+        """The limiter key: the socket peer only.  This listener sits behind no proxy, so a forwarded header is
+        attacker-controlled and never consulted."""
+        peername = request.transport.get_extra_info("peername") if request.transport else None
+        return str(peername[0]) if peername else "unknown"
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
         if request.method != "GET":
             return _fail(request, 405, "method_not_allowed", {"Allow": "GET"})
+        if request.body_exists or request.headers.getall("Transfer-Encoding", []):
+            response = _fail(request, 400, "invalid_request")
+            response.force_close()
+            return response
         path = request.raw_path.split("?", 1)[0]
+        client = self._client(request)
         if path == "/internal/healthz":
+            if not self.health.allow(client):
+                return _fail(request, 429, "rate_limited", {"Retry-After": "60"})
             return await self.healthz(request)
-        client = MemberSurface._client(request)
         if self.failures.blocked(client):
             return _fail(request, 429, "rate_limited", {"Retry-After": "60"})
         if not self.authorised(request):
+            # The global backstop stops a distributed guesser; it never blocks a good key.
+            if not self.failures_all.allow("*"):
+                return _fail(request, 429, "rate_limited", {"Retry-After": "60"})
             self.failures.allow(client)  # counts the failure
             return _fail(request, 401, "unauthorized", {"WWW-Authenticate": "Bearer"})
-        if len(request.query_string) > MAX_QUERY_BYTES:
+        if len(request.rel_url.raw_query_string) > MAX_QUERY_BYTES:
             return _fail(request, 414, "uri_too_long")
         try:
             return await self.route(request, path)
@@ -285,6 +323,9 @@ class InternalSurface:
             return _fail(request, 400, "invalid_request", message=str(exc))
         except LibraryError as exc:
             return _fail(request, exc.status, exc.code)
+        except Exception as exc:  # noqa: BLE001 - one uniform answer; the type only, never a parameter value
+            log.error("internal: unexpected %s", type(exc).__name__)
+            return _fail(request, 500, "internal_error")
 
     def authorised(self, request: web.Request) -> bool:
         values = request.headers.getall("Authorization", [])
@@ -297,15 +338,21 @@ class InternalSurface:
         return ok and bool(presented)
 
     async def healthz(self, request: web.Request) -> web.Response:
+        """A pool liveness check (a connection is available); no table is read."""
         try:
-            await self.reader.fetchval("SELECT 1")
-        except (OSError, asyncpg.PostgresError):
+            async with self.pool.acquire(timeout=2):
+                pass
+        except (OSError, TimeoutError, asyncpg.PostgresError):
             return _fail(request, 503, "unavailable")
         return encode(request, 200, {"status": "ok"})
 
     async def route(self, request: web.Request, path: str) -> web.StreamResponse:
         parts = path.split("/")  # ['', 'v1', ...]
-        query = parse_qs(request.query_string, keep_blank_values=True)
+        query = {
+            k: request.query.getall(k) for k in request.query
+        }  # decoded exactly once, by aiohttp
+        if any("\x00" in k for k in query):
+            raise _BadRequest("NUL in a parameter name")
         if len(parts) < 3 or parts[0] != "" or parts[1] != "v1":
             return _fail(request, 404, "not_found")
         route, rest = parts[2], parts[3:]
@@ -332,11 +379,6 @@ class InternalSurface:
         return _fail(request, 404, "not_found")
 
     # -- reads --------------------------------------------------------------------------------------------
-
-    async def _folder_owner(self, folder_id: str) -> str | None:
-        return await self.reader.fetchval(
-            "SELECT owner FROM library_folders WHERE folder_id=$1", folder_id
-        )
 
     async def _folders(self, owner: str | None) -> list[dict[str, Any]]:
         if owner:
@@ -374,14 +416,6 @@ class InternalSurface:
         if search and not feed_query.q:
             raise _BadRequest("q is required")
         owner = _one(query, "owner")
-        if feed_query.folder_id and not owner:
-            owner = await self._folder_owner(feed_query.folder_id)
-            if owner is None:  # an unknown folder holds nothing
-                return encode(
-                    request,
-                    200,
-                    {"items": [], "total": 0, "next_offset": None, "folders": [], "pending": 0},
-                )
         viewer = Viewer(member_id=owner or "", read_all=True) if owner else OPERATOR_READ_ALL
         page = await self.library.feed(viewer, feed_query)
         body: dict[str, Any] = {
@@ -491,7 +525,11 @@ class InternalSurface:
         item["share_count"] = int(row["share_count"])
         item["version_number"] = row["version_number"]
         item["version_state"] = row["version_state"]
-        item["files"] = _files(_manifest(row["manifest"])) if row["manifest"] else []
+        item["files"] = (
+            _files(_manifest(row["manifest"]))
+            if row["manifest"] and row["version_state"] == "ready"
+            else []
+        )
         return encode(request, 200, {"item": item})
 
     async def versions(self, request: web.Request, artifact_id: str) -> web.Response:
@@ -583,6 +621,9 @@ async def _uniform(request: web.Request, handler: Callable[..., Any]) -> web.Str
         return await handler(request)
     except web.HTTPException:
         return _fail(request, 404, "not_found")
+    except Exception as exc:  # noqa: BLE001 - encoded, with the security headers; the type only is logged
+        log.error("internal: unexpected %s", type(exc).__name__)
+        return _fail(request, 500, "internal_error")
 
 
 def build_app(
@@ -598,7 +639,7 @@ def build_app(
     async def middleware(request: web.Request, handler: Callable[..., Any]) -> web.StreamResponse:
         return await _uniform(request, handler)
 
-    app = web.Application(middlewares=[middleware], client_max_size=0)
+    app = web.Application(middlewares=[middleware], client_max_size=MAX_BODY)
     app[SURFACE] = surface
     app.router.add_route("*", "/{tail:.*}", surface.handle)
     return app

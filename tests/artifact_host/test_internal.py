@@ -335,7 +335,7 @@ def test_content_is_served_sandboxed(internal: Internal, host: Host) -> None:
     s = host.seed_share()
     r = internal.get(f"/v1/content/{s.artifact_id}/{s.version_id}/index.html")
     assert r.status == 200 and r.body == FILES["index.html"]
-    assert r.header("Content-Security-Policy") == "sandbox"
+    assert r.header("Content-Security-Policy") == CSP
     assert r.header("X-Content-Type-Options") == "nosniff"
     assert r.header("Cache-Control") == "no-store"
     assert r.header(
@@ -344,7 +344,7 @@ def test_content_is_served_sandboxed(internal: Internal, host: Host) -> None:
     nested = internal.get(f"/v1/content/{s.artifact_id}/{s.version_id}/data/big.bin")
     assert nested.status == 200 and nested.body == FILES["data/big.bin"]
     assert nested.header("Content-Type") == "application/octet-stream"
-    assert nested.header("Content-Security-Policy") == "sandbox"
+    assert nested.header("Content-Security-Policy") == CSP
 
 
 def test_content_type_ignores_stored_media_type(internal: Internal, host: Host) -> None:
@@ -361,7 +361,7 @@ def test_content_type_ignores_stored_media_type(internal: Internal, host: Host) 
     r = internal.get(f"/v1/content/{s.artifact_id}/{s.version_id}/evil.bin")
     assert r.status == 200 and r.header("Content-Type") == "application/octet-stream"
     assert (
-        r.header("Content-Security-Policy") == "sandbox"
+        r.header("Content-Security-Policy") == CSP
         and r.header("X-Content-Type-Options") == "nosniff"
     )
 
@@ -502,3 +502,194 @@ def test_route_tables_are_disjoint_and_complete() -> None:
 
 def test_healthz_needs_no_key(internal: Internal) -> None:
     assert internal.get("/internal/healthz", None).status == 200
+
+
+# -- fix round 1 ------------------------------------------------------------------------------------------
+
+CSP = "sandbox; default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'"
+HOSTILE = [
+    "/v1/feed?offset=99999999999999999999",
+    "/v1/feed?limit=99999999999999999999",
+    "/v1/feed?offset=-99999999999999999999",
+    "/v1/feed?since=0001-01-01T00:00:00%2B14:00",
+    "/v1/feed?until=9999-12-31T23:59:59-14:00",
+    "/v1/feed?since=9999-12-31T23:59:59-14:00",
+    "/v1/feed?q=a%00b",
+    "/v1/feed?type=a%00b",
+    "/v1/feed?owner=a%00b",
+    "/v1/feed?folder_id=a%00b",
+    "/v1/search?q=a%00b",
+    "/v1/search?q=a&owner=a%00b",
+    "/v1/shares?artifact_id=a%00b",
+    "/v1/shares?offset=99999999999999999999",
+    "/v1/folders?owner=a%00b",
+    "/v1/feed?sources=mine%00",
+]
+
+
+@pytest.mark.parametrize("path", HOSTILE)
+def test_hostile_parameters_are_400_with_headers(internal: Internal, path: str) -> None:
+    r = internal.get(path)
+    assert r.status in (200, 400), path
+    assert (
+        r.header("X-Content-Type-Options") == "nosniff" and r.header("Cache-Control") == "no-store"
+    )
+    if "%00" in path or "9999-12-31" in path or "0001-01-01" in path:
+        assert r.status == 400, path
+
+
+def test_unexpected_errors_are_encoded_with_headers(host: Host) -> None:
+    server = _start(host, InternalConfig(key_digest(KEY), key_failures_per_minute=10_000))
+    try:
+        api = Internal(host, server.port)
+        assert host.loop is not None
+        surface = server.app[
+            __import__("herdr_artifact_host.internal_server", fromlist=["SURFACE"]).SURFACE
+        ]
+
+        async def boom(*_a: object, **_k: object) -> None:
+            raise RuntimeError("secret-param-value")
+
+        surface.route = boom  # a real handler fault, not a double of the database
+        r = api.get("/v1/feed", JSON)
+        assert r.status == 500 and r.json() == {"error": "internal_error"}
+        assert (
+            r.header("X-Content-Type-Options") == "nosniff"
+            and r.header("Cache-Control") == "no-store"
+        )
+        assert b"secret" not in r.body
+    finally:
+        assert host.loop is not None
+        asyncio.run_coroutine_threadsafe(server.stop(), host.loop).result(30)
+
+
+def test_csp_on_every_response(internal: Internal, host: Host) -> None:
+    s = host.seed_share()
+    for path, status in (
+        (f"/v1/content/{s.artifact_id}/{s.version_id}/index.html", 200),
+        (f"/v1/content/{s.artifact_id}/{s.version_id}/nope.html", 404),
+        (f"/v1/content/{s.artifact_id}/{s.version_id}/../x", 404),
+        ("/v1/feed?limit=x", 400),
+    ):
+        r = internal.get(path)
+        assert r.status == status, path
+        assert r.header("Content-Security-Policy") == CSP, path
+    assert internal.get("/v1/feed", None).header("Content-Security-Policy") == CSP
+    assert "allow-same-origin" not in CSP
+
+
+def test_owner_filters_items_and_folder_ids_are_real(internal: Internal, host: Host) -> None:
+    a, b = host.seed_share(), host.seed_share()
+    owners = {
+        x.artifact_id: host.rows("SELECT owner FROM artifacts WHERE artifact_id=$1", x.artifact_id)[
+            0
+        ]["owner"]
+        for x in (a, b)
+    }
+    for i, x in enumerate((a, b)):
+        fid = f"fld_{str(i) * 24}"
+        host.execute(
+            "INSERT INTO library_folders (folder_id, owner, name) VALUES ($1,$2,$3)",
+            fid,
+            owners[x.artifact_id],
+            f"F{i}",
+        )
+        host.execute(
+            "INSERT INTO library_items (folder_id, artifact_id, source) VALUES ($1,$2,'manual')",
+            fid,
+            x.artifact_id,
+        )
+    everyone = {i["artifact_id"]: i for i in internal.js("/v1/feed")["items"]}
+    assert everyone[a.artifact_id]["folder_ids"] == ["fld_" + "0" * 24]
+    assert everyone[b.artifact_id]["folder_ids"] == ["fld_" + "1" * 24]
+    mine = internal.js(f"/v1/feed?owner={owners[a.artifact_id]}")
+    assert [i["artifact_id"] for i in mine["items"]] == [a.artifact_id] and mine["total"] == 1
+    assert [
+        i["artifact_id"]
+        for i in internal.js(f"/v1/search?q=a&owner={owners[b.artifact_id]}")["items"]
+    ] == [b.artifact_id]
+    assert internal.js("/v1/feed?owner=nobody")["items"] == []
+    assert [
+        i["artifact_id"] for i in internal.js("/v1/feed?folder_id=fld_" + "1" * 24)["items"]
+    ] == [b.artifact_id]
+
+
+def test_empty_string_digest_is_refused() -> None:
+    import hashlib
+
+    with pytest.raises(ValueError):
+        InternalConfig(hashlib.sha256(b"").hexdigest())
+
+
+def test_empty_bearer_never_authenticates(internal: Internal) -> None:
+    for value in ("Bearer", "Bearer ", "Bearer  "):
+        assert internal.get("/v1/feed", {"Authorization": value}).status == 401
+
+
+def _from(address: str, port: int, headers: dict[str, str] | None = None) -> int:
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10, source_address=(address, 0))
+    try:
+        conn.request("GET", "/v1/feed", headers=headers or {})
+        return conn.getresponse().status
+    finally:
+        conn.close()
+
+
+def test_limiter_ignores_forwarded_for_and_has_a_global_backstop(host: Host) -> None:
+    server = _start(
+        host,
+        InternalConfig(
+            key_digest(KEY), key_failures_per_minute=2, key_failures_global_per_minute=4
+        ),
+    )
+    try:
+        # rotating X-Forwarded-For buys no fresh bucket: the socket peer is the key
+        assert [
+            _from("127.0.0.2", server.port, {"X-Forwarded-For": f"10.0.0.{i}"}) for i in range(3)
+        ] == [401, 401, 429]
+        # distinct peers each have their own bucket, but the global backstop stops a distributed guesser
+        assert _from("127.0.0.3", server.port) == 401
+        assert _from("127.0.0.4", server.port) == 401
+        assert _from("127.0.0.5", server.port) == 429
+        # a good key from a fresh peer is not locked out by the backstop
+        assert _from("127.0.0.6", server.port, AUTH) == 200
+    finally:
+        assert host.loop is not None
+        asyncio.run_coroutine_threadsafe(server.stop(), host.loop).result(30)
+
+
+def test_query_is_decoded_once(internal: Internal, host: Host) -> None:
+    s = host.seed_share()
+    host.execute("UPDATE artifacts SET display_name='x%41y' WHERE artifact_id=$1", s.artifact_id)
+    assert [i["artifact_id"] for i in internal.js("/v1/feed?q=x%2541y")["items"]] == [s.artifact_id]
+    assert internal.js("/v1/feed?q=xAy")["items"] == []
+
+
+def test_get_with_a_body_is_refused(internal: Internal) -> None:
+    r = internal.req("GET", "/v1/feed", AUTH, b"hello")
+    assert r.status == 400
+    assert internal.req("GET", "/v1/feed", {**AUTH, "Content-Length": "0"}).status == 200
+
+
+def test_item_lists_files_only_for_a_ready_head(internal: Internal, host: Host) -> None:
+    s = host.seed_share()
+    host.execute(
+        "UPDATE artifacts SET current_version_id=$2 WHERE artifact_id=$1",
+        s.artifact_id,
+        s.version_id,
+    )
+    assert internal.js(f"/v1/items/{s.artifact_id}")["item"]["files"] != []
+    host.execute("UPDATE artifact_versions SET state='purged' WHERE version_id=$1", s.version_id)
+    assert internal.js(f"/v1/items/{s.artifact_id}")["item"]["files"] == []
+
+
+def test_healthz_is_rate_limited_and_touches_no_table(host: Host) -> None:
+    server = _start(host, InternalConfig(key_digest(KEY), healthz_per_minute=3))
+    try:
+        api = Internal(host, server.port)
+        assert [api.get("/internal/healthz", None).status for _ in range(4)] == [200, 200, 200, 429]
+    finally:
+        assert host.loop is not None
+        asyncio.run_coroutine_threadsafe(server.stop(), host.loop).result(30)

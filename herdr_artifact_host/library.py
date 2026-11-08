@@ -235,7 +235,7 @@ SELECT a.artifact_id, {_TITLE} AS title, a.owner AS sharer, a.created_at AS shar
        CASE WHEN a.intake='pending' THEN 0 ELSE 1 END AS prio,
        CASE WHEN a.intake='pending' THEN 'pending' ELSE 'active' END AS status,
        NULL::timestamptz AS expires_at, NULL::text AS share_id, a.artifact_type, a.size_bytes
-  FROM artifacts a WHERE a.intake IN ('pending','accepted') AND {_LIVE}
+  FROM artifacts a WHERE a.intake IN ('pending','accepted') AND {_LIVE} AND ($1='' OR a.owner=$1)
 """
 
 # A pending artifact counts until it is accepted, discarded, retracted or tombstoned.
@@ -561,7 +561,7 @@ class LibraryStore:
                 f" OR (d.status IN ('active','pending') AND EXISTS (SELECT 1 FROM artifacts qa"
                 f" WHERE qa.artifact_id=d.artifact_id AND qa.search_text {esc}))"
                 " OR EXISTS (SELECT 1 FROM library_items qi JOIN library_folders qf"
-                " ON qf.folder_id=qi.folder_id WHERE qi.artifact_id=d.artifact_id AND qf.owner=$1"
+                " ON qf.folder_id=qi.folder_id WHERE qi.artifact_id=d.artifact_id AND ($1='' OR qf.owner=$1)"
                 f" AND qf.name {esc}))"
             )
         if query.artifact_type:
@@ -573,7 +573,7 @@ class LibraryStore:
         if query.folder_id:
             outer.append(
                 "EXISTS (SELECT 1 FROM library_items i JOIN library_folders f ON f.folder_id=i.folder_id "
-                f"WHERE i.artifact_id=d.artifact_id AND f.owner=$1 AND f.folder_id={arg(query.folder_id)})"
+                f"WHERE i.artifact_id=d.artifact_id AND ($1='' OR f.owner=$1) AND f.folder_id={arg(query.folder_id)})"
             )
         filtered = (
             f"WITH c AS ({candidates}), "
@@ -588,7 +588,7 @@ class LibraryStore:
             + f", p AS (SELECT * FROM f ORDER BY shared_at DESC, artifact_id LIMIT {lim} OFFSET {off}) "
             "SELECT p.*, coalesce((SELECT array_agg(i.folder_id ORDER BY i.folder_id) "
             "FROM library_items i JOIN library_folders fo ON fo.folder_id=i.folder_id "
-            "WHERE i.artifact_id=p.artifact_id AND fo.owner=$1), '{}') AS folder_ids "
+            "WHERE i.artifact_id=p.artifact_id AND ($1='' OR fo.owner=$1)), '{}') AS folder_ids "
             "FROM p ORDER BY p.shared_at DESC, p.artifact_id",
             *args,
         )
