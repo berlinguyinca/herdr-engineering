@@ -187,3 +187,22 @@ columns, no drops or renames in the same release), or plan a manual restore.
   rename-replace. An invalid edit is rejected, and the last good revision keeps
   serving (`/api/v1/fleet/config/status` shows `last_error`). The tools that
   rewrite the file drop YAML comments.
+
+## Turning on optional services
+
+On a fresh install most optional services (the ones the dashboard Settings page lists as Off) are disabled, and the
+only switch is a key in the central `fleet-config.yaml`. Configuration is YAML only; no environment variable is read.
+
+```bash
+herdr-eng settings status                      # on / off / needs-values per service, names only
+herdr-eng settings enable share_v1             # dry run: prints the exact lines it would change
+herdr-eng settings enable share_v1 --write     # backs up to fleet-config.yaml.bak.<timestamp> (0600), writes atomically
+herdr-eng settings enable --all-safe --write   # every service that is a plain boolean flag
+```
+
+Pass `--fleet-config PATH` to use another file (default `~/.config/herdr-engineering/fleet/fleet-config.yaml`).
+Comments and key order are preserved, the command is idempotent, and it never touches keys outside the ones requested.
+Services whose key needs more than a flag (`control_plane.ci_actions`, `deployment_definitions`, `deployment_actions`,
+`artifact_delete.owner_key_digests`, `skill_registry`, `architecture.explain`) show as `needs-values`; `enable` refuses
+them and names the key to set by hand. Restart the control plane after writing. The service list lives in
+`herdr_engineering/settings_catalog.py`, and a test keeps it equal to `packages/service-catalog.js`.

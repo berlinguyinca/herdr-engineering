@@ -17,7 +17,7 @@ export function renderSettings(capabilities) {
     + `<span class="hd-note"> ${esc(row.description)}</span>`
     + (row.howToEnable ? `<span class="hd-note"> To enable, set <code>${esc(row.howToEnable)}</code> in the fleet config.</span>` : '')
     + '</li>';
-  return '<p class="hd-note">Services that are off are hidden from the rest of the dashboard and listed here only.</p>'
+  return '<p class="hd-note">Services that are off are hidden from the rest of the dashboard and listed here only. Run <code>herdr-eng settings status</code> on the control-plane host to see them, or <code>herdr-eng settings enable --all-safe</code> to preview turning them on.</p>'
     + [...groups].map(([group, rows]) => `<section class="hd-card"><h2>${esc(group)}</h2><ul class="hd-list">${rows.map(item).join('')}</ul></section>`).join('');
 }
 
