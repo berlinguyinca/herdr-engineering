@@ -1,18 +1,19 @@
-// The dashboard's artifact library: the same feed, folders and pending inbox as the member site, read through
-// /api/v1/library. Rows, chips and the folder sidebar are the member site's own pure renderers, so both surfaces
-// draw the same markup for the same data; only the open link (the dashboard's artifact page) differs.
+// The dashboard's artifact library: the artifact host's feed and folders, read through /api/v1/library. READ-ONLY:
+// no approve, revoke, file or delete control exists here (those stay on the member site). Rows, chips and the folder
+// sidebar are the member site's own pure renderers (in their read-only form); a row opens #/library/<id>, whose page
+// shows the item's versions, files and shares and frames one file inside a fully sandboxed iframe (library-frame.js).
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { skeleton } from './motion.js';
-import { filterFeed, renderChips, renderFeedList, renderFolderSidebar } from './member-artifacts-view.js';
+import { filterFeed, renderChips, renderFeedList, renderFolderSidebar, formatDate, humanBytes } from './member-artifacts-view.js';
+import { mountLibraryFrame } from './library-frame.js';
 
 export const SEARCH_DEBOUNCE_MS = 150;
 const PAGE = 200;
 const ALL_SOURCES = ['mine', 'assigned', 'opened', 'pending'];
 const CHIP_SOURCES = { all: ['mine', 'assigned', 'opened'], assigned: ['assigned'], opened: ['opened'], mine: ['mine'], pending: ['pending'] };
 
-/** Expired and revoked rows have no link, nor has a row the server says this key cannot read (`readable: false`, sent
- * for a key mapped to a member); everything else opens the dashboard's artifact page. */
-export const rowHref = (row) => (row.status === 'expired' || row.status === 'revoked' || row.readable === false ? null : `#/artifacts/${encodeURIComponent(row.artifact_id)}`);
+/** Expired and revoked rows have no link; everything else opens the library item page. */
+export const rowHref = (row) => (row.status === 'expired' || row.status === 'revoked' ? null : `#/library/${encodeURIComponent(row.artifact_id)}`);
 export const folderHref = (id) => `#/library?folder=${encodeURIComponent(id)}`;
 
 /** The server's refusal text when it sent one (e.g. the pending cap), else the error message. */
@@ -29,17 +30,17 @@ export function renderLibrary({ items = [], folders = [], chip = 'all', q = '', 
   const folder = folderId ? folders.find((f) => f.folder_id === folderId) : null;
   if (folderId && !folder) return '<p class="empty" data-empty>This folder is not available.</p>';
   const shown = filterFeed(items, { sources: CHIP_SOURCES[chip] || CHIP_SOURCES.all });
-  return `<div class="library" data-library>${renderFolderSidebar(folders, folder ? folder.folder_id : null, { allHref: '#/library', folderHref })}
+  return `<div class="library" data-library>${renderFolderSidebar(folders, folder ? folder.folder_id : null, { allHref: '#/library', folderHref, readOnly: true })}
 <section class="library-main"><h2>${folder ? esc(folder.name) : 'Library'}</h2>
 <label class="search">Search <input type="search" class="hd-input" data-search maxlength="200" autocomplete="off" placeholder="Title, sharer, folder" value="${esc(q)}"></label>
 <div data-chips-region>${renderChips(chipCounts(items), chip)}</div>
 <p data-library-state role="status"></p>
-<div data-feed-region>${renderFeedList(shown, { folders, activeFolder: folder ? folder.folder_id : null, href: rowHref })}</div>
+<div data-feed-region>${renderFeedList(shown, { folders, activeFolder: folder ? folder.folder_id : null, href: rowHref, readOnly: true })}</div>
 ${more ? `<button type="button" class="btn" data-action="more">Load more${total === null ? '' : ` (${esc(total)} in all)`}</button>` : ''}
 </section></div>`;
 }
 
-export function mountLibrary(container, client, { freshness = () => null, folderId = null, confirm = (m) => window.confirm(m), prompt = (m, v) => window.prompt(m, v) } = {}) {
+export function mountLibrary(container, client, { freshness = () => null, folderId = null } = {}) {
   let disposed = false, controller, generation = 0, searchTimer = null;
   const state = { items: [], folders: [], chip: 'all', q: '', folderId, total: null, next: null, loaded: false };
   const say = (text) => { const el = container.querySelector('[data-library-state]'); if (el) el.textContent = text; };
@@ -59,12 +60,12 @@ export function mountLibrary(container, client, { freshness = () => null, folder
       state.folders = page.folders; state.total = page.total; state.next = page.next_offset;
       state.loaded = true;
       paint();
-      freshness(true);
+      freshness()?.touch(true);
     } catch (error) {
       if (disposed || mine !== generation || request.signal.aborted) return;
       if (!state.loaded) container.innerHTML = `<herdr-error message="${esc(describe(error))}"></herdr-error><button type="button" class="btn" data-action="retry">Retry</button>`;
       else say(describe(error));
-      freshness(false, describe(error));
+      freshness()?.touch(false, describe(error));
     }
   };
 
@@ -75,41 +76,12 @@ export function mountLibrary(container, client, { freshness = () => null, folder
     if (focused) { const fresh = container.querySelector('[data-search]'); fresh.focus(); fresh.setSelectionRange(fresh.value.length, fresh.value.length); }
   };
 
-  /** Run one write, reload, and say what happened (a refusal shows the server's message). */
-  const act = async (run, done) => {
-    say('Working…');
-    try { await run(); } catch (error) { say(describe(error)); return false; }
-    await load();
-    say(done);
-    return true;
-  };
-
-  const folderOf = (id) => state.folders.find((f) => f.folder_id === id);
   const onClick = (event) => {
     const el = event.target.closest('[data-action],[data-chip]');
     if (!el || !container.contains(el)) return;
     if (el.dataset.chip) { state.chip = el.dataset.chip; paint(); return; }
-    const id = el.dataset.artifact;
-    switch (el.dataset.action) {
-      case 'accept': void act(() => client.acceptPending(id), 'Added to your library.'); break;
-      case 'discard': if (confirm('Discard this pushed artifact? It is deleted.')) void act(() => client.discardPending(id), 'Discarded.'); break;
-      case 'unfile': void act(() => client.unfileItem(el.dataset.folder, id), 'Removed from the folder.'); break;
-      case 'more': void load({ append: true }); break;
-      case 'retry': void load(); break;
-      case 'rename-folder': {
-        const folder = folderOf(el.dataset.folder);
-        const name = String(prompt('Folder name', folder?.name || '') || '').trim();
-        if (name && folder && name !== folder.name) void act(() => client.renameFolder(folder.folder_id, name), 'Folder renamed.');
-        break;
-      }
-      case 'delete-folder': {
-        const folder = folderOf(el.dataset.folder);
-        if (!folder || !confirm(`Delete the folder "${folder.name}"? Its items stay in your library.`)) break;
-        void act(() => client.deleteFolder(folder.folder_id), 'Folder deleted.').then((ok) => { if (ok && state.folderId === folder.folder_id) window.location.hash = '#/library'; });
-        break;
-      }
-      default:
-    }
+    if (el.dataset.action === 'more') void load({ append: true });
+    else if (el.dataset.action === 'retry') void load();
   };
   const onInput = (event) => {
     const t = event.target;
@@ -117,28 +89,67 @@ export function mountLibrary(container, client, { freshness = () => null, folder
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => { state.q = t.value; void load(); }, SEARCH_DEBOUNCE_MS);
   };
-  const onChange = (event) => {
-    const t = event.target;
-    if (!t.matches?.('select[data-action="file"]') || !t.value) return;
-    void act(() => client.fileItem(t.value, t.dataset.artifact), 'Filed.');
-  };
-  const onSubmit = (event) => {
-    const form = event.target;
-    if (!form.matches?.('[data-folder-form]')) return;
-    event.preventDefault();
-    const name = String(new FormData(form).get('name') || '').trim();
-    if (name) void act(() => client.createFolder(name), 'Folder created.');
-  };
   container.addEventListener('click', onClick);
   container.addEventListener('input', onInput);
-  container.addEventListener('change', onChange);
-  container.addEventListener('submit', onSubmit);
   void load();
   return {
     refresh() { if (state.loaded) void load(); },
     dispose() {
       disposed = true; controller?.abort(); clearTimeout(searchTimer);
-      for (const [type, fn] of [['click', onClick], ['input', onInput], ['change', onChange], ['submit', onSubmit]]) container.removeEventListener(type, fn);
+      for (const [type, fn] of [['click', onClick], ['input', onInput]]) container.removeEventListener(type, fn);
     },
   };
+}
+
+const when = (iso) => (iso ? esc(formatDate(iso)) : 'never');
+const filesList = (files = []) => (files.length
+  ? `<ul class="library-files">${files.map((f) => `<li><button type="button" class="btn" data-action="open-file" data-path="${esc(f.path)}">${esc(f.path)}</button> <span class="muted">${esc(f.media_type || '')} ${f.size == null ? '' : esc(humanBytes(f.size))}</span></li>`).join('')}</ul>`
+  : '<p class="empty">No files.</p>');
+
+/** The item page body: pure. Every control here only reads (open a version, open a file in the sandboxed frame). */
+export function renderLibraryItem({ item = null, versions = [], shares = [], versionId = null } = {}) {
+  if (!item) return '<p class="empty" data-empty>This item is not available.</p>';
+  const current = versionId || item.current_version_id || versions.find((v) => v.current)?.version_id || versions[0]?.version_id;
+  const shown = versions.find((v) => v.version_id === current);
+  const files = shown ? shown.files : item.files;
+  return `<div class="library-item" data-library-item="${esc(item.artifact_id)}"><h2>${esc(item.title || item.artifact_id)}</h2>
+<p class="muted">Owner ${esc(item.owner || 'unknown')} · ${esc(item.artifact_type || 'file')} · updated ${when(item.updated_at)}</p>
+<section><h3>Versions</h3><ul class="library-versions">${versions.map((v) => `<li${v.version_id === current ? ' aria-current="true"' : ''}><a href="#/library/${encodeURIComponent(item.artifact_id)}?version=${encodeURIComponent(v.version_id)}">Version ${esc(v.version_number)}</a> <span class="muted">${esc(v.state)}${v.current ? ' (current)' : ''} · ${when(v.created_at)}</span></li>`).join('') || '<li class="empty">No versions.</li>'}</ul></section>
+<section><h3>Files</h3>${filesList(files)}</section>
+<section><h3>Shares</h3><ul class="library-shares">${shares.map((s) => `<li>${esc(s.audience)} · ${esc(s.state)}${s.active ? ' (active)' : ''} · expires ${when(s.expires_at)}</li>`).join('') || '<li class="empty">No shares.</li>'}</ul></section>
+<section><h3>Preview</h3><div data-frame-slot><p class="muted">Open a file to preview it. It runs in a sandbox with no scripts.</p></div></section></div>`;
+}
+
+export function mountLibraryItem(container, client, itemId, { freshness = () => null, versionId = null } = {}) {
+  let disposed = false;
+  const controller = new AbortController();
+  const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]);
+  const state = { item: null, versions: [], shares: [] };
+  const paint = () => { container.innerHTML = renderLibraryItem({ ...state, versionId }); };
+  const load = async () => {
+    container.innerHTML = skeleton('library item', { rows: 2, height: 40 });
+    try {
+      const [item, versions, shares] = await Promise.all([client.libraryItem(itemId, { signal }), client.libraryVersions(itemId, { signal }), client.libraryShares(itemId, { signal })]);
+      if (disposed) return;
+      state.item = item?.item || null; state.versions = versions?.versions || []; state.shares = shares?.shares || [];
+      paint(); freshness()?.touch(true);
+    } catch (error) {
+      if (disposed || controller.signal.aborted) return;
+      container.innerHTML = `<herdr-error message="${esc(describe(error))}"></herdr-error><button type="button" class="btn" data-action="retry">Retry</button>`;
+      freshness()?.touch(false, describe(error));
+    }
+  };
+  const onClick = (event) => {
+    const el = event.target.closest('[data-action]');
+    if (!el || !container.contains(el)) return;
+    if (el.dataset.action === 'retry') { void load(); return; }
+    if (el.dataset.action !== 'open-file' || !state.item) return;
+    const slot = container.querySelector('[data-frame-slot]');
+    const version = versionId || state.item.current_version_id || state.versions.find((v) => v.current)?.version_id || state.versions[0]?.version_id;
+    try { mountLibraryFrame(slot, { url: client.libraryContentUrl(state.item.artifact_id, version, el.dataset.path), title: el.dataset.path }); }
+    catch (error) { slot.textContent = describe(error); }
+  };
+  container.addEventListener('click', onClick);
+  void load();
+  return { refresh() { void load(); }, dispose() { disposed = true; controller.abort(); container.removeEventListener('click', onClick); } };
 }

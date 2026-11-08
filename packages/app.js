@@ -48,7 +48,7 @@ import { mountRelated } from './related-panel.js';
 import { mountMissionStory } from './mission-story-view.js';
 import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-view.js';
 import { mountArtifacts, renderArtifactDetail } from './artifacts-view.js';
-import { mountLibrary } from './library-view.js';
+import { mountLibrary, mountLibraryItem } from './library-view.js';
 import { mountPublications } from './publications-view.js';
 import { mountHandoffs } from './handoffs-view.js';
 import { mountMemory } from './memory-view.js';
@@ -258,6 +258,7 @@ const ROUTES = {
   '/artifacts': viewArtifacts,
   '/artifacts/:id': viewArtifact,
   '/library': viewLibrary,
+  '/library/:id': viewLibraryItem,
   '/publications': viewPublications,
   '/scheduling': viewScheduling,
   '/handoffs': viewHandoffs,
@@ -422,6 +423,13 @@ async function viewArtifact(parts, revision) {
 async function viewLibrary() {
   root.innerHTML = `${liveHead('<h1>Library</h1>')}<div id="artifact-library"></div>`;
   return mountLibrary(root.querySelector('#artifact-library'), client, { freshness: chipIn(root), folderId: route().query.get('folder') || null });
+}
+
+async function viewLibraryItem(parts) {
+  const id = safeDecode(parts[1]);
+  if (!id) { statusPage('<herdr-error message="Item not found"></herdr-error>', true); return; }
+  root.innerHTML = `<a href="#/library">← Library</a>${liveHead('<h1>Library item</h1>')}<div id="library-item"></div>`;
+  return mountLibraryItem(root.querySelector('#library-item'), client, id, { freshness: chipIn(root), versionId: route().query.get('version') || null });
 }
 
 async function viewPublications() {

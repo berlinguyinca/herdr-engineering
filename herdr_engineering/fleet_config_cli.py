@@ -1046,7 +1046,20 @@ def validate_config(path: Path) -> dict:
         validate_section((cfg.section("control_plane") or {}).get("graph_merge_gate"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
+    check_artifact_library(cfg)
     return {"revision": cfg.revision, "hosts": len(cfg.status()["hosts"])}
+
+
+def check_artifact_library(cfg: FleetConfig) -> None:
+    """Validate ``control_plane.artifact_library`` (host_url, host_key, timeout_seconds, viewers).  The key is never echoed."""
+    from .control_plane.artifact_host_client import parse_library_host
+    from .control_plane.artifact_library_api import parse_library_viewers
+    section = (cfg.section(CONTROL_PLANE_SECTION) if CONTROL_PLANE_SECTION in cfg.section_names() else {}).get("artifact_library")
+    try:
+        parse_library_host(section)
+        parse_library_viewers(section.get("viewers") if isinstance(section, dict) else None)
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
 
 
 # --------------------------------------------------------------------------

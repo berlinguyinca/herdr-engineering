@@ -32,31 +32,27 @@ test('listLibrary builds the query string and escapes q', async () => {
   assert.equal(calls[2].url, 'http://h/api/v1/library');
 });
 
-test('library writes hit the fixed routes with exact methods and bodies', async () => {
+test('the library client has no write call and reads the fixed routes', async () => {
   const { client, calls } = recorder();
-  await client.createFolder('Reading');
-  await client.renameFolder('fld/1', 'To read');
-  await client.deleteFolder('fld/1');
-  await client.fileItem('fld_1', 'art 1');
-  await client.unfileItem('fld/1', 'art 1');
-  await client.acceptPending('a/1');
-  await client.discardPending('a/1');
+  for (const name of ['createFolder', 'renameFolder', 'deleteFolder', 'fileItem', 'unfileItem', 'acceptPending', 'discardPending']) {
+    assert.equal(client[name], undefined, name);
+  }
+  await client.libraryItem('a/1');
+  await client.libraryVersions('a/1');
+  await client.libraryShares('a/1');
   assert.deepEqual(calls.map((c) => [c.method, c.url]), [
-    ['POST', 'http://h/api/v1/library/folders'],
-    ['PUT', 'http://h/api/v1/library/folders/fld%2F1'],
-    ['DELETE', 'http://h/api/v1/library/folders/fld%2F1'],
-    ['POST', 'http://h/api/v1/library/items'],
-    ['DELETE', 'http://h/api/v1/library/folders/fld%2F1/items/art%201'],
-    ['POST', 'http://h/api/v1/library/pending/a%2F1/accept'],
-    ['POST', 'http://h/api/v1/library/pending/a%2F1/discard'],
+    ['GET', 'http://h/api/v1/library/items/a%2F1'],
+    ['GET', 'http://h/api/v1/library/items/a%2F1/versions'],
+    ['GET', 'http://h/api/v1/library/shares?artifact_id=a%2F1'],
   ]);
-  assert.deepEqual(calls[0].body, { name: 'Reading' });
-  assert.deepEqual(calls[1].body, { name: 'To read' });
-  assert.deepEqual(calls[3].body, { folder_id: 'fld_1', artifact_id: 'art 1' });
-  assert.equal(calls[2].body, undefined);
+});
+
+test('libraryContentUrl encodes every piece and stays on the dashboard origin', () => {
+  const { client } = recorder();
+  assert.equal(client.libraryContentUrl('a1', 'v 1', 'data/in dex.html'), 'http://h/api/v1/library/content/a1/v%201/data/in%20dex.html');
 });
 
 test('a library refusal keeps its message and status', async () => {
-  const { client } = recorder(() => ({ ok: false, status: 429, headers: new Headers(), text: async () => JSON.stringify({ error: 'pending_cap', message: 'You have 25 pending artifacts' }) }));
-  await assert.rejects(client.acceptPending('a'), (e) => e instanceof ApiError && e.status === 429 && e.body?.message === 'You have 25 pending artifacts');
+  const { client } = recorder(() => ({ ok: false, status: 503, headers: new Headers(), text: async () => JSON.stringify({ error: 'library_unavailable', message: 'the artifact host is unavailable' }) }));
+  await assert.rejects(client.listLibrary(), (e) => e instanceof ApiError && e.status === 503 && e.body?.message === 'the artifact host is unavailable');
 });

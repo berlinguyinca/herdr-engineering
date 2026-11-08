@@ -4249,21 +4249,16 @@ def _member_admin_wiring(cp: dict, dsn: str | None):
     return artifact_adapter.SyncArtifactAdapter(create)
 
 
-def _library_wiring(dsn: str | None):
-    """The dashboard artifact library (adapter over ``LibraryStore`` on its own small pool) when a DSN exists, else None."""
-    if not dsn:
-        return None
-    from .control_plane.artifact_library_api import make_library_adapter
-
-    async def pool():
-        import asyncpg
-        return await asyncpg.create_pool(dsn, min_size=1, max_size=3)
-
+def _library_wiring(cp: dict):
+    """The dashboard artifact library: an ``ArtifactHostClient`` (read-only HTTP client of the artifact host's internal
+    listener) built from ``control_plane.artifact_library.host_url`` / ``host_key``, else None (the routes answer 503).
+    No database is opened.  Invalid settings stop the start (the key value is never printed)."""
+    from .control_plane.artifact_host_client import parse_library_host
     try:
-        return make_library_adapter(pool)
-    except RuntimeError as exc:  # database unreachable at start: the library routes answer 503, the dashboard still starts
-        print(f"warning: artifact library unavailable ({exc.__cause__ or exc})", file=sys.stderr)
-        return None
+        settings = parse_library_host(cp.get("artifact_library") if isinstance(cp, dict) else None)
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+    return settings.client() if settings is not None else None
 
 
 def _library_viewers(cp) -> dict[str, str]:
@@ -4472,7 +4467,7 @@ def _cmd_cp_web(args) -> int:
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
     annotation_store = _annotation_wiring(cp, dsn)
     member_admin = _member_admin_wiring(cp, dsn)
-    library = _library_wiring(dsn)
+    library = _library_wiring(cp)
     try:
         from .control_plane.artifact_delete_api import owner_digests_config
         artifact_delete = owner_digests_config(cp.get("artifact_delete"))
@@ -4671,9 +4666,6 @@ def _cmd_cp_web(args) -> int:
             artifact_adapter.close()
         if member_admin is not None:
             member_admin.close()
-        if library is not None:
-            library("close")        # the pool first, then the adapter's loop
-            library.close()
         if share_store is not None:
             share_store.close()
         if annotation_store is not None:

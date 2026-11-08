@@ -301,7 +301,7 @@ export function rejectionText(out) {
 }
 
 /** `href(row)` (optional) makes the title a plain link instead of an open button: the dashboard opens its own detail page. */
-export function renderFeedRow(row, { folders = [], activeFolder = null, href = null } = {}) {
+export function renderFeedRow(row, { folders = [], activeFolder = null, href = null, readOnly = false } = {}) {
   const [badgeKey, badgeText] = SOURCE_BADGE[row.source] || ['opened', row.source || 'Unknown'];
   const gone = GONE[row.status];
   const when = formatDate(row.shared_at);
@@ -323,15 +323,15 @@ export function renderFeedRow(row, { folders = [], activeFolder = null, href = n
     : `<span class="row-title">${title}</span>`;
   const expiry = row.source === 'opened' && row.expires_at ? ` <span data-expiry>Expires ${esc(formatDate(row.expires_at))}</span>` : '';
   const id = esc(row.artifact_id);
-  const pending = row.source === 'pending' || row.status === 'pending'
+  const pending = !readOnly && (row.source === 'pending' || row.status === 'pending')
     ? `<span class="row-actions"><button type="button" class="btn btn-primary" data-action="accept" data-artifact="${id}">Accept</button>
 <button type="button" class="btn" data-action="discard" data-artifact="${id}">Discard</button></span>`
     : '';
-  const choices = list(folders).filter((f) => !(row.folder_ids || []).includes(f.folder_id));
+  const choices = readOnly ? [] : list(folders).filter((f) => !(row.folder_ids || []).includes(f.folder_id));
   const file = choices.length && !pending
     ? `<select data-action="file" data-artifact="${id}" aria-label="File ${title} in a folder"><option value="">File in folder</option>${choices.map((f) => `<option value="${esc(f.folder_id)}">${esc(f.name)}</option>`).join('')}</select>`
     : '';
-  const unfile = activeFolder && (row.folder_ids || []).includes(activeFolder)
+  const unfile = !readOnly && activeFolder && (row.folder_ids || []).includes(activeFolder)
     ? `<button type="button" class="btn" data-action="unfile" data-artifact="${id}" data-folder="${esc(activeFolder)}">Remove from folder</button>`
     : '';
   return `<li class="row" data-feed-row="${id}" data-source="${esc(row.source)}">
@@ -356,15 +356,16 @@ export function renderChips(counts = {}, active = 'all') {
   }).join('')}</div>`;
 }
 
-/** `allHref` / `folderHref(id)` (optional) point the folder links at another router (the dashboard's `#/library`). */
-export function renderFolderSidebar(folders, activeId = null, { allHref = '#/', folderHref = (id) => `#/f/${encodeURIComponent(id)}` } = {}) {
+/** `allHref` / `folderHref(id)` (optional) point the folder links at another router (the dashboard's `#/library`);
+ * `readOnly` drops the create, rename and delete controls (the dashboard only reads). */
+export function renderFolderSidebar(folders, activeId = null, { allHref = '#/', folderHref = (id) => `#/f/${encodeURIComponent(id)}`, readOnly = false } = {}) {
   const rows = list(folders);
   const active = rows.find((f) => f.folder_id === activeId);
   return `<aside class="folders" aria-label="Folders">
 <h3>Folders</h3>
 <ul class="folder-list"><li><a class="tab" href="${esc(allHref)}"${activeId ? '' : ' aria-current="page"'}>All items</a></li>${rows.map((f) => `<li><a class="tab" href="${esc(folderHref(f.folder_id))}"${f.folder_id === activeId ? ' aria-current="page"' : ''}>${esc(f.name)}${f.item_count === undefined ? '' : ` <span class="row-meta">${esc(f.item_count)}</span>`}</a></li>`).join('')}</ul>
-<form data-folder-form><label>New folder <input name="name" required maxlength="80" autocomplete="off"></label><button type="submit" class="btn">Create folder</button></form>
-${active ? `<div class="folder-manage"><button type="button" class="btn" data-action="rename-folder" data-folder="${esc(active.folder_id)}">Rename</button>
+${readOnly ? '' : `<form data-folder-form><label>New folder <input name="name" required maxlength="80" autocomplete="off"></label><button type="submit" class="btn">Create folder</button></form>`}
+${active && !readOnly ? `<div class="folder-manage"><button type="button" class="btn" data-action="rename-folder" data-folder="${esc(active.folder_id)}">Rename</button>
 <button type="button" class="btn btn-danger" data-action="delete-folder" data-folder="${esc(active.folder_id)}">Delete folder</button></div>` : ''}
 </aside>`;
 }
