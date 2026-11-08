@@ -195,6 +195,9 @@ class MemberLimits:
     staging_bytes_per_artifact: int = 128 * 1024 * 1024
     uploads_per_member: int = 2  # run bodies being received at once
     body_deadline_seconds: float = 120.0  # a run body that takes longer is dropped (408)
+    concurrent_publishes: int = (
+        4  # publishes in progress at once, all members together: each holds one pooled connection
+    )
     content_streams: int = 8  # content responses being sent at once, all members together
     claim_fallback_session_seconds: int = 15 * 60
 
@@ -263,6 +266,7 @@ class MemberService:
         self.share_rate_window = timedelta(hours=1)
         self._run_slots = asyncio.Semaphore(RUN_SLOTS)
         self._uploading: dict[str, int] = {}  # run bodies being received, per member
+        self._publishing = 0  # publishes in progress (each holds one pooled connection)
         self.content_streams = asyncio.Semaphore(limits.content_streams)
         self._staging = blobs.tmp_dir / "up"
 
@@ -719,6 +723,14 @@ class MemberService:
     def _dir(self, member: str, artifact_id: str, upload_id: str) -> Path:
         return self._artifact_dir(member, artifact_id) / upload_id
 
+    async def _artifact_cap(self, member: str) -> int:
+        """Most bytes one artifact may have staged: the default, or the member's own ``max_artifact_bytes`` when that is
+        larger, so a member allowed a bigger artifact can also stage one."""
+        own = await self.pool.fetchval(
+            "SELECT max_artifact_bytes FROM member_usage WHERE member_id=$1", member
+        )
+        return max(self.limits.staging_bytes_per_artifact, int(own or 0))
+
     async def _drop_staging(self, member: str, artifact_id: str) -> None:
         await asyncio.to_thread(shutil.rmtree, self._artifact_dir(member, artifact_id), True)
 
@@ -825,21 +837,33 @@ class MemberService:
             mine, here = await asyncio.to_thread(
                 self._staging_after, member, artifact_id, upload_id, first, length
             )
-            if (
-                mine > self.limits.staging_bytes_per_member
-                or here > self.limits.staging_bytes_per_artifact
+            if mine > self.limits.staging_bytes_per_member or here > await self._artifact_cap(
+                member
             ):
                 raise MemberError(413, "staging_full", "too many bytes are waiting to be published")
             async with self._run_slots:
                 await asyncio.to_thread(scratch.mkdir, parents=True)
+                # delete/discard drop the staging after retracting the artifact, so look again now that the directory
+                # exists: a retracted artifact must not get one back
+                await self._owned(self.pool, member, artifact_id)
                 body = scratch / "body"
                 try:
                     got = await asyncio.wait_for(spool(body), self.limits.body_deadline_seconds)
                 except TimeoutError:
                     raise MemberError(408, "timeout", "the upload took too long") from None
+                except FileNotFoundError:
+                    raise _not_found() from None  # the staging was dropped under the running upload
                 if got != run_sha:
                     raise _bad("run sha256 does not match")
-                await asyncio.to_thread(self._store_run, folder, scratch, size, first)
+                try:
+                    await asyncio.to_thread(self._store_run, folder, scratch, size, first)
+                except FileNotFoundError:
+                    raise _not_found() from None
+                await self._owned(self.pool, member, artifact_id)
+        except MemberError as exc:
+            if exc.code == "not_found":
+                await self._drop_staging(member, artifact_id)
+            raise
         finally:
             await asyncio.to_thread(shutil.rmtree, scratch, True)
             left = self._uploading.get(member, 1) - 1
@@ -1000,6 +1024,30 @@ class MemberService:
         )
         current_row = await self._owned(self.pool, member, artifact_id)
         self._check_quota(early, int(current_row["size_bytes"]), total)
+        # Each publish holds one pooled connection from its first blob lock until the commit (the session-level locks
+        # must outlive the blob write), so a global cap keeps publishes from draining the pool.
+        if self._publishing >= self.limits.concurrent_publishes:
+            raise MemberError(
+                503, "busy", "too many publishes, retry shortly", {"Retry-After": "2"}
+            )
+        self._publishing += 1
+        try:
+            return await self._publish_locked(
+                member, artifact_id, specs, total, base_version_id, message, chosen
+            )
+        finally:
+            self._publishing -= 1
+
+    async def _publish_locked(
+        self,
+        member: str,
+        artifact_id: str,
+        specs: dict[str, tuple[int, str]],
+        total: int,
+        base_version_id: object,
+        message: object,
+        chosen: str | None,
+    ) -> dict[str, Any]:
         version_id = "ver_" + secrets.token_hex(12)
         shas = sorted({sha for _, sha in specs.values()})
         written: list[str] = []

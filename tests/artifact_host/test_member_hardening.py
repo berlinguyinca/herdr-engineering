@@ -430,3 +430,129 @@ def test_the_id_token_nonce_must_match(host: Host) -> None:
         host.request("POST", "/api/member/session", {**plain, "X-Nonce": "abc"}, b"").status == 401
     )
     assert host.request("POST", "/api/member/session", plain, b"").status == 401  # no header
+
+
+# ---------------------------------------------------------------- round 2
+
+
+def slow_run(host: Host, s: str, aid: str, name: str, whole: bytes) -> socket.socket:
+    """A run whose headers arrived and whose body has not: the upload is in flight on the server."""
+    return trickle(host, s, aid, name, whole)
+
+
+def test_delete_during_an_inflight_upload_leaves_no_staging(host: Host) -> None:
+    s = sign_in(host)
+    aid = create(host, s)
+    conn = slow_run(host, s, aid, "a.bin", b"x" * 100)
+    try:
+        time.sleep(0.4)  # the server is receiving the body now
+        assert call(host, s, "POST", f"/artifacts/{aid}/delete", {"confirm": True}).status == 200
+        conn.sendall(b"x" * 95)  # the rest of the body
+        reply = conn.recv(4096)
+        assert reply.startswith(b"HTTP/1.1 404")
+    finally:
+        conn.close()
+    assert staged_files(host) == []
+    root = host.blob_root / "tmp" / "up"
+    assert not list(root.rglob(aid)) if root.exists() else True
+
+
+def test_per_artifact_staging_follows_the_members_artifact_limit(migrated_dsn, tmp_path) -> None:
+    mib = 1024 * 1024
+    with limited(migrated_dsn, tmp_path, staging_bytes_per_artifact=2 * mib) as host:
+        s = sign_in(host)
+        aid = create(host, s)
+        big = b"\x01" * (3 * mib)
+        assert stage_run(host, s, aid, "big.bin", big, big).status == 413
+        host.execute(
+            "UPDATE member_usage SET max_artifact_bytes=$1 WHERE member_id='alice'", 8 * mib
+        )
+        assert stage_run(host, s, aid, "big.bin", big, big).status == 200
+        # a smaller override never lowers the default cap
+        host.execute("UPDATE member_usage SET max_artifact_bytes=$1 WHERE member_id='alice'", 1)
+        small = b"\x02" * mib
+        assert stage_run(host, s, create(host, s), "small.bin", small, small).status == 200
+
+
+def test_publishes_are_capped_and_the_overflow_is_503(migrated_dsn, tmp_path) -> None:
+    import asyncio
+    import threading
+
+    import asyncpg
+
+    from herdr_artifact_host.db import LOCK_NS_BLOB
+
+    with limited(migrated_dsn, tmp_path, concurrent_publishes=1) as host:
+        s = sign_in(host)
+        a, b = create(host, s), create(host, s)
+        first = upload(host, s, a, "one.html", b"<p>one</p>")
+        second = upload(host, s, b, "two.html", b"<p>two</p>")
+
+        async def hold_then_probe() -> tuple[int, str | None, int]:
+            blocker = await asyncpg.connect(migrated_dsn)
+            try:
+                await blocker.execute(
+                    "SELECT pg_advisory_lock($1, hashtext($2))", LOCK_NS_BLOB, first["file_sha256"]
+                )
+                done: dict[str, int] = {}
+
+                def go() -> None:
+                    done["status"] = call(
+                        host,
+                        s,
+                        "POST",
+                        f"/artifacts/{a}/publish",
+                        {"base_version_id": None, "files": [first]},
+                    ).status
+
+                t = threading.Thread(target=go)
+                t.start()
+                await asyncio.sleep(0.6)  # the first publish is parked on the blob lock
+                r = await asyncio.to_thread(
+                    call,
+                    host,
+                    s,
+                    "POST",
+                    f"/artifacts/{b}/publish",
+                    {"base_version_id": None, "files": [second]},
+                )
+                retry = r.header("Retry-After")
+                await blocker.execute(
+                    "SELECT pg_advisory_unlock($1, hashtext($2))",
+                    LOCK_NS_BLOB,
+                    first["file_sha256"],
+                )
+                await asyncio.to_thread(t.join, 10)
+                return r.status, retry, done["status"]
+            finally:
+                await blocker.close()
+
+        status, retry, first_status = asyncio.run(hold_then_probe())
+        assert status == 503 and retry is not None
+        assert first_status == 200
+        # and the slot is free again
+        assert (
+            call(
+                host,
+                s,
+                "POST",
+                f"/artifacts/{b}/publish",
+                {"base_version_id": None, "files": [second]},
+            ).status
+            == 200
+        )
+
+
+def test_sign_in_and_use_under_the_product_defaults(migrated_dsn, tmp_path) -> None:
+    with running_host(migrated_dsn, tmp_path, {"member_group_sync_required": True}) as host:
+        (host.sync_dir / "members.json").write_text(
+            json.dumps({"updated": time.time(), "groups": {"local.dev": ["bob"]}})
+        )
+        r = exchange(host, "bob")
+        assert r.status == 200
+        s = r.json()["session"]
+        assert r.json()["expires_at"] <= time.time() + 3600 + 5
+        aid, _vid = published(host, s)
+        assert call(host, s, "GET", f"/artifacts/{aid}").status == 200
+        # not listed in members.json: refused
+        assert exchange(host, "dave").status == 401

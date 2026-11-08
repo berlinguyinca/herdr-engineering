@@ -7,7 +7,7 @@ whatever the secret: a member session is refused by ``share_session.check_sessio
 ``Authorization: Member <session>``; the server keeps no session state, so the per-request re-check of the user's
 approval (done by the web layer) is what ends access.  ``share_session`` is a separate format.
 
-``member_sign_in`` turns verified Cognito tokens into such a session. The public link's claim cookie
+The member API's token exchange (``member_api``) turns verified Cognito tokens into such a session. The public link's claim cookie
 (``share_session.CLAIM_DOMAIN``) is a different cookie, format and key use: it is never accepted here, and a member
 session is never accepted as a claim cookie.
 """
@@ -20,10 +20,6 @@ import hashlib
 import hmac
 import math
 import re
-import time
-from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Protocol
 
 _DOMAIN = b"herdr-member-session-v1"
 _SCOPE = "member"
@@ -130,49 +126,3 @@ def session_from_header(value: str | None) -> str | None:
     if scheme != AUTH_SCHEME or not sep or rest != rest.strip():
         return None
     return rest
-
-
-class Verifier(Protocol):
-    def verify_claims(self, token: str) -> dict | None: ...
-
-    def verify_id_token(self, token: str, *, user: str) -> str | None: ...
-
-
-@dataclass(frozen=True)
-class MemberGrant:
-    identity: str
-    email: str
-    session: str
-    exp: int
-
-
-def member_sign_in(
-    verifier: Verifier,
-    secret: bytes,
-    access_token: str,
-    id_token: str,
-    *,
-    session_seconds: int,
-    now: Callable[[], float] = time.time,
-) -> MemberGrant | None:
-    """Exchange a Cognito access token plus ID token for a member session; None on any failure.
-
-    The session ends at the earlier of ``session_seconds`` from now and the access token's own expiry. The email
-    comes only from the ID token that names the same user as the access token."""
-    try:
-        if not (access_token.isascii() and id_token.isascii()):
-            return None
-        claims = verifier.verify_claims(access_token)
-        user = claims.get("user") if claims else None
-        exp = claims.get("exp") if claims else None
-        if not isinstance(user, str) or not isinstance(exp, (int, float)) or isinstance(exp, bool):
-            return None
-        email = verifier.verify_id_token(id_token, user=user)
-        if not isinstance(email, str) or not email:
-            return None
-        until = int(min(now() + session_seconds, float(exp)) // 1)
-        if until <= now():
-            return None
-        return MemberGrant(user, email, mint_session(secret, user, until), until)
-    except Exception:
-        return None
