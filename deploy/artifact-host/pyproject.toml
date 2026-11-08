@@ -9,7 +9,7 @@ name = "herdr-artifact-host"
 version = "0.1.0"
 description = "Standalone Herdr artifact host"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["nh3==0.3.7", "PyJWT[crypto]>=2.8", "cryptography>=42"]
 
 [project.scripts]
 herdr-artifact-host = "herdr_artifact_host.cli:main"
