@@ -18,6 +18,7 @@ from typing import Any
 import asyncpg
 
 from .annotation_anchor import ANNOTATION_ID_RE
+from .db import LOCK_NS_AUTHOR, LOCK_NS_SHARE_CAP
 from .share_bundle import ShareBundleError, choose_entry, normalise_name
 from .share_lab import still_admitted
 
@@ -224,9 +225,11 @@ async def create_annotation(
             return Written(row)
         # Lock order is fixed (share, then author) so concurrent creates cannot deadlock.  The share lock makes the
         # per-share cap exact: the shared row lock above does not stop two writers both counting below the cap.
-        await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", "share-cap:" + share_id)
         await conn.execute(
-            "SELECT pg_advisory_xact_lock(hashtext($1))", identity
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))", LOCK_NS_SHARE_CAP, share_id
+        )
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))", LOCK_NS_AUTHOR, identity
         )  # serialises the cap per author
         day = await conn.fetchval(
             "SELECT count(*) FROM annotations WHERE author_identity = $1 AND ingested_at > now() - interval '1 day'",

@@ -13,7 +13,7 @@ def url(token: str, rest: str = "") -> str:
 
 
 def test_healthz(host: Host) -> None:
-    r = host.get("/healthz")
+    r = host.health_get("/healthz")
     assert r.status == 200 and r.body == b"ok\n"
 
 

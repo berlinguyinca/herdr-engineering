@@ -1,4 +1,14 @@
-"""Content-addressed blob store: ``<root>/sha256/xx/yy/<sha>``, temp file + atomic rename, hash verified on read."""
+"""Content-addressed blob store: ``<root>/sha256/xx/yy/<sha>``, temp file + atomic rename, hash verified on read.
+
+Verification cache and its residual.  Hashing a large blob on every request is too expensive, so a file identity
+(device, inode, size, mtime, ctime, all read from the open handle) that was hashed and matched its address is
+remembered for ``VERIFIED_TTL_SECONDS``.  Only range, HEAD and conditional reads may trust an entry; a full 200 body
+is always hashed.  The residual: a writer that changes bytes in place without moving size, inode, mtime or ctime
+(a shared mmap before the kernel stamps the file, or a same-tick write on a coarse-grained clock) or silent disk
+corruption can be served by a range read for at most the TTL.  Exploiting it needs local write access to the blob
+directory or failing hardware, both outside this process's trust boundary; the TTL bounds the exposure and the next
+full read or expiry re-verifies.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +17,9 @@ import os
 import re
 import tempfile
 import threading
+import time
 from collections import OrderedDict
+from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO, NewType
 
@@ -15,6 +27,7 @@ Sha256 = NewType("Sha256", str)
 
 _SHA = re.compile(r"[0-9a-f]{64}")
 _CHUNK = 1 << 20
+VERIFIED_TTL_SECONDS = 30.0
 
 
 class InvalidSha(ValueError):
@@ -23,6 +36,10 @@ class InvalidSha(ValueError):
 
 class BlobCorrupt(Exception):
     """Stored bytes no longer hash to their address."""
+
+
+class BlobAborted(Exception):
+    """The caller stopped a hash pass (its client went away); the blob was neither confirmed nor found corrupt."""
 
 
 class BlobMissing(FileNotFoundError):
@@ -50,21 +67,34 @@ class VerifiedCache:
     A hit only ever means "this exact inode, size, mtime and ctime was verified"; a write to the file changes the
     ctime, and a replacement changes the inode, so anything the cache cannot prove unchanged is hashed again."""
 
-    def __init__(self, limit: int = _CACHE_MAX) -> None:
+    def __init__(
+        self,
+        limit: int = _CACHE_MAX,
+        ttl: float = VERIFIED_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._limit = limit
-        self._keys: OrderedDict[_Key, None] = OrderedDict()
+        self._ttl = ttl
+        self._clock = clock
+        self._keys: OrderedDict[_Key, float] = (
+            OrderedDict()
+        )  # key -> monotonic time it was verified
         self._lock = threading.Lock()
 
     def hit(self, key: _Key) -> bool:
         with self._lock:
-            if key in self._keys:
-                self._keys.move_to_end(key)
-                return True
-            return False
+            stamp = self._keys.get(key)
+            if stamp is None:
+                return False
+            if self._clock() - stamp > self._ttl:
+                del self._keys[key]
+                return False
+            self._keys.move_to_end(key)
+            return True
 
     def add(self, key: _Key) -> None:
         with self._lock:
-            self._keys[key] = None
+            self._keys[key] = self._clock()
             self._keys.move_to_end(key)
             while len(self._keys) > self._limit:
                 self._keys.popitem(last=False)
@@ -79,10 +109,13 @@ class VerifiedCache:
 
 
 class BlobStore:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, verified_ttl: float = VERIFIED_TTL_SECONDS) -> None:
         self._root = Path(root)
-        self._verified = VerifiedCache()
-        self.verifications = 0  # whole-blob hash passes made by open/open_checked/verify_open (tests and metrics)
+        self._verified = VerifiedCache(ttl=verified_ttl)
+        self.aborted = 0  # hash passes stopped by ``should_stop`` (tests and metrics)
+        self.verifications = (
+            0  # whole-blob hash passes made by open/open_checked/verify_open (tests and metrics)
+        )
         self._count_lock = threading.Lock()
         (self._root / "sha256").mkdir(parents=True, exist_ok=True)
         self._tmp = self._root / "tmp"
@@ -170,23 +203,53 @@ class BlobStore:
             handle.close()
             raise
 
-    def verify_open(self, handle: BinaryIO, sha: str, *, force: bool = True) -> bool:
+    def open_handle(self, sha: str) -> BinaryIO:
+        """Open a blob WITHOUT hashing it (cheap).  Raises ``BlobMissing``."""
+        try:
+            return self._path(sha).open("rb")
+        except FileNotFoundError as exc:
+            raise BlobMissing(sha) from exc
+
+    def is_verified(self, handle: BinaryIO, sha: str) -> bool:
+        """True when the exact file identity of ``handle`` is in the verified cache (no hashing, no I/O but fstat)."""
+        return self._verified.hit(_key(sha, os.fstat(handle.fileno())))
+
+    def verify_open(
+        self,
+        handle: BinaryIO,
+        sha: str,
+        *,
+        force: bool = True,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> bool:
         """Hash the open ``handle`` (unless cached and not ``force``); True when a hash pass was made.  The handle
-        is left at offset 0.  The identity is taken from the handle (fstat), never from the path."""
+        is left at offset 0.  The identity is taken from the handle (fstat), never from the path.
+
+        ``should_stop`` is asked before the first chunk and between chunks; when it returns true the pass ends with
+        ``BlobAborted`` (a vanished client must not keep a worker hashing a huge blob)."""
         before = _key(sha, os.fstat(handle.fileno()))
         if not force and self._verified.hit(before):
             handle.seek(0)
             return False
         handle.seek(0)
         digest = hashlib.sha256()
-        while chunk := handle.read(_CHUNK):
+        while True:
+            if should_stop is not None and should_stop():
+                with self._count_lock:
+                    self.aborted += 1
+                raise BlobAborted(sha)
+            chunk = handle.read(_CHUNK)
+            if not chunk:
+                break
             digest.update(chunk)
         with self._count_lock:
             self.verifications += 1
         if digest.hexdigest() != sha:
             self._verified.forget(sha)
             raise BlobCorrupt(sha)
-        if _key(sha, os.fstat(handle.fileno())) == before:  # unchanged while hashing: safe to remember
+        if (
+            _key(sha, os.fstat(handle.fileno())) == before
+        ):  # unchanged while hashing: safe to remember
             self._verified.add(before)
         handle.seek(0)
         return True

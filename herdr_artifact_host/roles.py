@@ -9,6 +9,7 @@ from types import MappingProxyType
 class Role(StrEnum):
     PUBLIC = "public"
     INTERNAL = "internal"
+    HEALTH = "health"  # loopback-only listener next to the public one
 
 
 # Route tables are disjoint by construction; later tasks extend them. Internal
@@ -17,7 +18,6 @@ _ROUTES: MappingProxyType[Role, frozenset[str]] = MappingProxyType(
     {
         Role.PUBLIC: frozenset(
             {
-                "GET /healthz",
                 "GET /s/{token}",
                 "GET /s/{token}/",
                 "GET /s/{token}/f/{path}",
@@ -35,6 +35,7 @@ _ROUTES: MappingProxyType[Role, frozenset[str]] = MappingProxyType(
             }
         ),
         Role.INTERNAL: frozenset({"GET /internal/healthz"}),
+        Role.HEALTH: frozenset({"GET /healthz"}),
     }
 )
 

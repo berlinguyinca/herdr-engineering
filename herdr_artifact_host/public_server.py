@@ -1,4 +1,4 @@
-"""The public share surface of the artifact host: ``/s/*`` (public links and lab shares) and ``/healthz``.
+"""The public share surface of the artifact host: ``/s/*`` (public links and lab shares).
 
 Ported from the control plane's ``share_public.py``, whose security contract carries over unchanged:
 
@@ -10,8 +10,14 @@ Ported from the control plane's ``share_public.py``, whose security contract car
 * HTML over ``MODE_SWITCH_MAX_BYTES`` (2 MiB) cannot be labelled or get the mode-switch link.  An unlabelled one is
   streamed untouched, as before; a member-labelled one ("Shared by ...") is the uniform 404, event reason
   ``html_too_large`` (``share_public.py``: ``if size > MODE_SWITCH_MAX_BYTES: if bar: deny``).
-* ``/healthz`` answers loopback peers only (the compose healthcheck runs inside the container); everyone else gets
-  the uniform 404.
+* ``/healthz`` is NOT on the public listener (there it is the uniform 404).  It is served by a second listener of
+  the same process bound to 127.0.0.1 only (``PublicServer.health_port``, ``--health-port`` in the deploy entry
+  point), so the compose healthcheck target is ``http://127.0.0.1:<health-port>/healthz`` run inside the container.
+  Reachability is decided by the socket's bind address, not by inspecting the peer.
+* Whole-blob hashing of large blobs is capped (``HASH_CONCURRENCY`` passes, own thread pool, no queue): a request that
+  finds every slot busy gets the uniform 503 with ``Retry-After: 5`` (as a busy render does; it needs a resolved token
+  and bundle member, so it reveals nothing to a stranger), and a pass is abandoned between chunks once the client's
+  transport is closing.  Cheap reads and renders use a separate pool that hashing cannot fill.
 * A client that half-closes (SHUT_WR) after its request still gets the full response: the handler is not cancelled
   and the connection closes after that one response.
 * No request body is read except for the lab annotation POSTs; any other request that announces a body is closed.
@@ -29,7 +35,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
-import ipaddress
 import json
 import logging
 import os
@@ -57,7 +62,7 @@ from .annotation_anchor import (
     parse_delete_request,
     parse_edit_request,
 )
-from .blobs import BlobCorrupt, BlobMissing, BlobStore, InvalidSha
+from .blobs import BlobAborted, BlobCorrupt, BlobMissing, BlobStore, InvalidSha
 from .cognito import CognitoAuthenticator, SyncedDirectory
 from .https_origin import https_origin
 from .library import LibraryError, LibraryStore, Viewer
@@ -261,10 +266,22 @@ def lab_settings(config: PublicConfig) -> LabSettings | None:
 # ----------------------------------------------------------------------------- blocking work
 
 BLOB_WORKERS = 8
-MIN_AIOHTTP = (3, 13, 5)  # the first 3.13 release carrying the request-parsing and decompression fixes we rely on
+HEALTH_HOST = "127.0.0.1"  # the health listener is never bound anywhere else
+PINNED_AIOHTTP = (
+    3,
+    13,
+    5,
+)  # the exact release the manifests pin; the private attributes used below are its own
 # Hashing, file reads and rendering run here, never on the loop's default executor, so a flood of large blobs cannot
 # starve the sign-in verification (or anything else) that uses the default pool, and is itself bounded.
 _BLOB_POOL = ThreadPoolExecutor(BLOB_WORKERS, thread_name_prefix="share-blob")
+# Whole-blob hashing of a large blob is the one slow, unbounded-by-request operation, so it gets its own small pool
+# AND a semaphore of the same size: at most HASH_CONCURRENCY such passes run, a request that finds them all busy is
+# answered at once with the 503 (never queued), and the cheap pool above (opens, small reads, renders, chunk reads)
+# can never be filled by hashing.  Blobs up to HASH_INLINE_MAX_BYTES are cheap and hash on the cheap pool, ungated.
+HASH_CONCURRENCY = 4
+HASH_INLINE_MAX_BYTES = 4 * 1024 * 1024
+_HASH_POOL = ThreadPoolExecutor(HASH_CONCURRENCY, thread_name_prefix="share-hash")
 
 
 async def run_blocking[T](fn: Callable[..., T], *args: object) -> T:
@@ -272,11 +289,11 @@ async def run_blocking[T](fn: Callable[..., T], *args: object) -> T:
 
 
 def aiohttp_version_ok(version: str) -> bool:
-    """True for a plain ``X.Y.Z`` release at or above ``MIN_AIOHTTP``; anything else fails closed."""
+    """True only for exactly the pinned ``X.Y.Z`` release; a newer one may have changed the internals we override."""
     parts = version.split(".")
-    if len(parts) < 3 or not all(p.isdigit() for p in parts[:3]):
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
         return False
-    return tuple(int(p) for p in parts[:3]) >= MIN_AIOHTTP
+    return tuple(int(p) for p in parts) == PINNED_AIOHTTP
 
 
 # ----------------------------------------------------------------------------- logging and responses
@@ -324,20 +341,6 @@ def _refused_framing(request: web.Request) -> bool:
     """``Expect`` (aiohttp would answer 100-continue or a 417 echoing the header before any routing) and any request
     ``Content-Encoding`` (a body we never want, let alone decompressed) are the uniform 404 on every route."""
     return "Expect" in request.headers or "Content-Encoding" in request.headers
-
-
-def is_loopback_peer(peername: object) -> bool:
-    """True when ``peername`` (``transport.get_extra_info("peername")``) is a loopback address, IPv4, IPv6 or an
-    IPv4-mapped IPv6 one.  Anything else, including an unparseable value, is not loopback."""
-    if not isinstance(peername, tuple) or not peername or not isinstance(peername[0], str):
-        return False
-    try:
-        address = ipaddress.ip_address(peername[0])
-    except ValueError:
-        return False
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-        address = address.ipv4_mapped
-    return address.is_loopback
 
 
 async def _no_expect(request: web.Request) -> None:
@@ -392,6 +395,19 @@ class Fault(Exception):
         self.reason = reason
 
 
+class Saturated(Fault):
+    """Every whole-blob hash slot is taken: the request is answered with the uniform 503 and may retry.  Only raised
+    after the token resolved to a known share and the file to a bundle member, so it tells a stranger nothing."""
+
+    def __init__(self) -> None:
+        super().__init__("hash_busy")
+
+
+def _client_gone(request: web.Request) -> bool:
+    transport = request.transport
+    return transport is None or transport.is_closing()
+
+
 @dataclass(frozen=True)
 class Claim:
     """A visitor this server verified from the claim cookie of a public link."""
@@ -416,6 +432,7 @@ class PublicSurface:
         self.pool = pool
         self.blobs = blobs
         self.library = library
+        self._hash_gate = asyncio.Semaphore(HASH_CONCURRENCY)
         self.now = now
         self.lab = lab_settings(config)
         self.public_origin = https_origin(
@@ -496,26 +513,6 @@ class PublicSurface:
         await self._event(share_id, "claimed", claim.identity, {"share_id": share_id})
 
     # -- entry points
-
-    async def healthz(self, request: web.Request) -> web.Response:
-        """Answered only to loopback peers (the container-local compose healthcheck, ``curl http://127.0.0.1:<port>/
-        healthz`` from inside the container); any other peer gets the uniform 404, so the endpoint is not a public
-        probe of the database."""
-        peer = request.transport.get_extra_info("peername") if request.transport is not None else None
-        if _refused_framing(request) or not is_loopback_peer(peer):
-            return not_found()
-        try:
-            await self.pool.fetchval("SELECT 1")
-        except Exception:
-            return respond(
-                503, [("Content-Type", "text/plain; charset=utf-8")], b"unavailable\n", cors=False
-            )
-        return respond(
-            200,
-            [("Content-Type", "text/plain; charset=utf-8"), ("Cache-Control", "no-store")],
-            b"ok\n",
-            cors=False,
-        )
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
         try:
@@ -668,23 +665,24 @@ class PublicSurface:
     # -- blobs
 
     async def fetch(
-        self, item: dict[str, object], *, force: bool = False
+        self, request: web.Request, item: dict[str, object], *, force: bool = False
     ) -> tuple[BinaryIO, bool]:
         """The hash-verified blob of a manifest ``item`` and whether a hash pass was made for this request.
 
         A blob whose exact file identity (inode, size, mtime, ctime) was verified before is not hashed again unless
-        ``force``; the caller upgrades with ``ensure_full`` before it serves the whole body. Raises ``Fault``."""
+        ``force``; the caller upgrades with ``ensure_full`` before it serves the whole body. Raises ``Fault``
+        (``Saturated`` when no hash slot is free)."""
+        sha = str(item["sha256"])
         try:
-            handle, hashed = await run_blocking(
-                lambda: self.blobs.open_checked(str(item["sha256"]), force=force)
-            )
+            handle = await run_blocking(self.blobs.open_handle, sha)
         except BlobMissing:
             raise Fault("missing_blob") from None
-        except BlobCorrupt:
-            raise Fault("blob_corrupt") from None
         except (InvalidSha, OSError):
             raise Fault("blob_unreadable") from None
         try:
+            hashed = force or not await run_blocking(self.blobs.is_verified, handle, sha)
+            if hashed:  # first: a damaged file is "blob_corrupt", whatever its size has become
+                await self._hash(request, handle, item)
             if os.fstat(handle.fileno()).st_size != item["size"]:
                 raise Fault("size_mismatch")
         except BaseException:
@@ -692,16 +690,47 @@ class PublicSurface:
             raise
         return handle, hashed
 
-    async def ensure_full(self, handle: BinaryIO, item: dict[str, object], hashed: bool) -> None:
-        """Before a whole body is served: hash it now unless this very request already did (cost follows bytes)."""
-        if hashed:
-            return
+    async def _hash(self, request: web.Request, handle: BinaryIO, item: dict[str, object]) -> None:
+        """One whole-blob hash pass, gated (large blobs), abandoned when the client has gone."""
+        sha = str(item["sha256"])
+
+        def run() -> bool:
+            return self.blobs.verify_open(handle, sha, should_stop=lambda: _client_gone(request))
+
+        large = (
+            os.fstat(handle.fileno()).st_size > HASH_INLINE_MAX_BYTES
+        )  # the real size, not the manifest's
         try:
-            await run_blocking(self.blobs.verify_open, handle, str(item["sha256"]))
+            if not large:
+                await run_blocking(run)
+                return
+            if self._hash_gate.locked():
+                raise Saturated
+            async with self._hash_gate:
+                if _client_gone(request):
+                    raise Fault("client_gone")
+                await asyncio.get_running_loop().run_in_executor(_HASH_POOL, run)
+        except BlobAborted:
+            raise Fault("client_gone") from None
         except BlobCorrupt:
             raise Fault("blob_corrupt") from None
         except OSError:
             raise Fault("blob_unreadable") from None
+
+    async def ensure_full(
+        self, request: web.Request, handle: BinaryIO, item: dict[str, object], hashed: bool
+    ) -> None:
+        """Before a whole body is served: hash it now unless this very request already did (cost follows bytes)."""
+        if hashed:
+            return
+        await self._hash(request, handle, item)
+
+    async def fault_response(self, fault: Fault, share_id: str, actor: str) -> web.Response:
+        """The answer for a ``Fault``: the uniform 503 when only capacity is short, otherwise the uniform 404."""
+        if isinstance(fault, Saturated):
+            _log("busy", fault.reason)
+            return self.unavailable()
+        return await self.deny(fault.reason, share_id, actor)
 
     @staticmethod
     async def read_blob(handle: BinaryIO, size: int) -> bytes:
@@ -955,9 +984,9 @@ class PublicSurface:
         if item is None:
             return await self.deny("not_in_bundle", share_id, actor)
         try:
-            handle, hashed = await self.fetch(item)
+            handle, hashed = await self.fetch(request, item)
         except Fault as fault:
-            return await self.deny(fault.reason, share_id, actor)
+            return await self.fault_response(fault, share_id, actor)
         try:
             return await self._serve_handle(
                 request,
@@ -974,7 +1003,7 @@ class PublicSurface:
                 hashed,
             )
         except Fault as fault:
-            return await self.deny(fault.reason, share_id, actor)
+            return await self.fault_response(fault, share_id, actor)
         finally:
             handle.close()
 
@@ -1004,7 +1033,9 @@ class PublicSurface:
                 if bar:  # a labelled page is never served unlabelled; over the limit it cannot be labelled
                     return await self.deny("html_too_large", share_id, actor)
             else:
-                await self.ensure_full(handle, item, hashed)  # the modified body is a whole-body serve
+                await self.ensure_full(
+                    request, handle, item, hashed
+                )  # the modified body is a whole-body serve
                 hashed = True
                 data = await self.read_blob(handle, size)
                 link = (mode_switch.encode("ascii") if mode_switch is not None else b"") + (
@@ -1066,7 +1097,9 @@ class PublicSurface:
                 headers.append(("Content-Range", f"bytes {start}-{end}/{size}"))
         length = end - start + 1 if size else 0
         if request.method == "GET" and status == 200:
-            await self.ensure_full(handle, item, hashed)  # a whole-body stream is always hash-verified
+            await self.ensure_full(
+                request, handle, item, hashed
+            )  # a whole-body stream is always hash-verified
         headers.append(("Content-Length", str(length)))
         if request.method == "GET" and status == 200 and name == state["entry"]:
             await self._opened(share_id, actor, {"file": name[:200]})
@@ -1195,9 +1228,9 @@ class PublicSurface:
         if kind == "html" and mode == "live":
             return await self.deny("not_in_mode", share_id, actor)
         try:
-            handle, _ = await self.fetch(item, force=True)  # the whole blob is rendered
+            handle, _ = await self.fetch(request, item, force=True)  # the whole blob is rendered
         except Fault as fault:
-            return await self.deny(fault.reason, share_id, actor)
+            return await self.fault_response(fault, share_id, actor)
         try:
             content, shown = "", kind
             if kind in ("text", "html"):
@@ -1222,7 +1255,7 @@ class PublicSurface:
                     except RenderFailed:
                         return await self.deny("render_failed", share_id, actor)
         except Fault as fault:
-            return await self.deny(fault.reason, share_id, actor)
+            return await self.fault_response(fault, share_id, actor)
         finally:
             handle.close()
         nonce, body = self.render_view(state, parts, got, name, shown, content, mode, lab)
@@ -1634,15 +1667,43 @@ def build_app(
     *,
     now: Callable[[], float] = time.time,
 ) -> web.Application:
-    """The public app: ``GET /healthz`` and the ``/s/*`` surface.
+    """The public app: the ``/s/*`` surface (``/healthz`` lives on ``build_health_app``).
 
     The catch-all route is registered LAST, so the member API of a later task adds its routes before it (and onto the
     separate member roles) without changing the uniform-404 behaviour of everything else."""
     surface = PublicSurface(config, db_pool, blobs, library, now)
     app = web.Application(middlewares=[_uniform_errors], client_max_size=MAX_BODY_BYTES + 1)
     app[SURFACE] = surface
-    app.router.add_get("/healthz", surface.healthz, expect_handler=_no_expect)
     app.router.add_route("*", "/{tail:.*}", surface.handle, expect_handler=_no_expect)
+    return app
+
+
+def build_health_app(db_pool: asyncpg.Pool) -> web.Application:
+    """The health app: ``GET /healthz`` and the uniform 404 for everything else.  It is only ever served on the
+    loopback-only listener of ``PublicServer``."""
+
+    async def healthz(request: web.Request) -> web.StreamResponse:
+        if _refused_framing(request):
+            return not_found()
+        try:
+            await db_pool.fetchval("SELECT 1")
+        except Exception:
+            return respond(
+                503, [("Content-Type", "text/plain; charset=utf-8")], b"unavailable\n", cors=False
+            )
+        return respond(
+            200,
+            [("Content-Type", "text/plain; charset=utf-8"), ("Cache-Control", "no-store")],
+            b"ok\n",
+            cors=False,
+        )
+
+    async def anything_else(request: web.Request) -> web.StreamResponse:
+        return not_found()
+
+    app = web.Application(middlewares=[_uniform_errors])
+    app.router.add_get("/healthz", healthz, expect_handler=_no_expect)
+    app.router.add_route("*", "/{tail:.*}", anything_else, expect_handler=_no_expect)
     return app
 
 
@@ -1668,7 +1729,9 @@ class _UniformHandler(RequestHandler):
             return None  # nothing in flight: asyncio closes the transport
         request = self._current_request
         if request is not None and not request.content.is_eof():
-            return None  # a request body that will never complete: drop the connection, write nothing
+            return (
+                None  # a request body that will never complete: drop the connection, write nothing
+            )
         self.close()  # stop after the in-flight response (the handler task itself is not cancelled)
         return True
 
@@ -1685,41 +1748,114 @@ class _UniformRunner(web.AppRunner):
         return server
 
 
+_MALFORMED_PROBE = b"GET /uniform-probe HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+_WELL_FORMED_PROBE = b"GET /uniform-probe HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+_HANDLER_INTERNALS = ("_current_request", "_messages")  # read by _UniformHandler.eof_received
+
+
+def require_handler_internals(handler: object) -> None:
+    """``eof_received`` leans on two private attributes of aiohttp's request handler; fail closed when they are gone."""
+    missing = [name for name in _HANDLER_INTERNALS if not hasattr(handler, name)]
+    if missing:
+        raise RuntimeError(
+            f"aiohttp request handler lacks {', '.join(missing)}; eof_received cannot be trusted"
+        )
+
+
 def assert_uniform_hook(server: web.Server) -> None:
     """Fail closed when the protocol-error hook is not in place (an aiohttp internal changed): without it a request
     aiohttp cannot parse would get its own 400 text, a second kind of failure on the wire."""
-    if type(server) is not _UniformServer or _UniformHandler.handle_error is RequestHandler.handle_error:
+    if (
+        type(server) is not _UniformServer
+        or _UniformHandler.handle_error is RequestHandler.handle_error
+    ):
         raise RuntimeError("uniform protocol-error hook is not installed")
     if not aiohttp_version_ok(aiohttp.__version__):
-        raise RuntimeError(f"aiohttp {aiohttp.__version__} is older than the pinned minimum")
+        raise RuntimeError(f"aiohttp {aiohttp.__version__} is not the pinned release")
+    require_handler_internals(server())
+
+
+async def _raw_exchange(port: int, payload: bytes) -> bytes:
+    reader, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", port), 5)
+    try:
+        writer.write(payload)
+        await writer.drain()
+        return await asyncio.wait_for(reader.read(), 5)
+    finally:
+        writer.close()
+
+
+def _without_date(raw: bytes) -> bytes:
+    return b"\r\n".join(
+        line for line in raw.split(b"\r\n") if not line.lower().startswith(b"date:")
+    )
+
+
+async def verify_uniform_listener(port: int) -> None:
+    """Behavioural startup check on the bound listener: a request aiohttp cannot parse must be answered with exactly
+    the bytes of the uniform 404 (what an ordinary unknown path gets).  Anything else, including no answer, raises."""
+    try:
+        malformed = _without_date(await _raw_exchange(port, _MALFORMED_PROBE))
+        reference = _without_date(await _raw_exchange(port, _WELL_FORMED_PROBE))
+    except (OSError, TimeoutError) as exc:
+        raise RuntimeError(f"uniform 404 check could not talk to the listener: {exc!r}") from exc
+    if not reference.startswith(b"HTTP/1.1 404 Not Found\r\n") or not reference.endswith(
+        NOT_FOUND_BODY
+    ):
+        raise RuntimeError("uniform 404 check: the reference answer is not the uniform 404")
+    # aiohttp answers a request it could not parse as HTTP/1.0 (it never learned the version); every other byte matches
+    if malformed.replace(b"HTTP/1.0 ", b"HTTP/1.1 ", 1) != reference:
+        raise RuntimeError(
+            "uniform 404 check: a malformed request is not answered with the uniform 404"
+        )
 
 
 class PublicServer:
-    """Runs ``build_app`` on a TCP socket (the deploy entry point and the tests)."""
+    """Runs ``build_app`` on a TCP socket and ``build_health_app`` on a second, loopback-only one (the deploy entry
+    point and the tests)."""
 
-    def __init__(self, app: web.Application) -> None:
+    def __init__(self, app: web.Application, health_app: web.Application | None = None) -> None:
         self.app = app
-        self._runner: _UniformRunner | None = None
+        self.health_app = (
+            health_app if health_app is not None else build_health_app(app[SURFACE].pool)
+        )
+        self._runners: list[_UniformRunner] = []
         self.port = 0
+        self.health_port = 0
 
-    async def start(self, host: str = "127.0.0.1", port: int = 0) -> int:
+    @property
+    def _runner(self) -> _UniformRunner | None:
+        """The public listener's runner."""
+        return self._runners[0] if self._runners else None
+
+    async def _serve(self, app: web.Application, host: str, port: int) -> int:
         runner = _UniformRunner(
-            self.app,
+            app,
             access_log=None,
             handle_signals=False,
             keepalive_timeout=15,
             auto_decompress=False,  # a request body is never inflated (decompression bomb)
         )
         await runner.setup()
+        self._runners.append(runner)
         assert_uniform_hook(runner.server)  # type: ignore[arg-type]
         site = web.TCPSite(runner, host, port, backlog=64)
         await site.start()
-        self._runner = runner
         sockets = site._server.sockets if site._server is not None else []  # type: ignore[union-attr]
-        self.port = sockets[0].getsockname()[1] if sockets else port
+        return int(sockets[0].getsockname()[1]) if sockets else port
+
+    async def start(self, host: str = "127.0.0.1", port: int = 0, health_port: int = 0) -> int:
+        try:
+            self.port = await self._serve(self.app, host, port)
+            self.health_port = await self._serve(self.health_app, HEALTH_HOST, health_port)
+            await verify_uniform_listener(self.port)
+            await verify_uniform_listener(self.health_port)
+        except BaseException:
+            await self.stop()
+            raise
         return self.port
 
     async def stop(self) -> None:
-        if self._runner is not None:
-            await self._runner.cleanup()
-            self._runner = None
+        for runner in reversed(self._runners):
+            await runner.cleanup()
+        self._runners.clear()

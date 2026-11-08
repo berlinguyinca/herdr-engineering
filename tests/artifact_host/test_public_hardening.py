@@ -5,11 +5,11 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import http.client
 import json
 import os
 import socket
 import threading
+import time
 import zlib
 from pathlib import Path
 
@@ -23,6 +23,7 @@ from herdr_artifact_host.annotation_anchor import annotation_settings
 from herdr_artifact_host.blobs import BlobStore
 from herdr_artifact_host.library import LibraryStore
 from herdr_artifact_host.public_server import Claim, build_app
+from herdr_artifact_host.roles import Role, routes_for
 from tests.artifact_host.seed import Host, default_config, make_sync_dir, running_host
 from tests.artifact_host.test_public_annotations import Session, rows
 from tests.artifact_host.test_public_lab import lab
@@ -288,9 +289,21 @@ def test_a_plain_aiohttp_server_fails_the_hook_check() -> None:
 
 def test_the_aiohttp_version_is_checked() -> None:
     assert public_server.aiohttp_version_ok(aiohttp.__version__)
-    assert public_server.aiohttp_version_ok("3.13.5") and public_server.aiohttp_version_ok("3.14.0")
-    for old in ("3.13.4", "3.12.15", "3.13", "garbage", "2.9.0"):
-        assert not public_server.aiohttp_version_ok(old)
+    assert public_server.aiohttp_version_ok("3.13.5")
+    for other in (
+        "3.13.4",
+        "3.13.6",
+        "3.14.0",
+        "4.0.0",
+        "3.12.15",
+        "3.13",
+        "3.13.5rc1",
+        "garbage",
+        "2.9.0",
+    ):
+        assert not public_server.aiohttp_version_ok(other), (
+            other
+        )  # exactly the pinned release, nothing else
     assert aiohttp.__version__ == "3.13.5"  # the exact pin the manifests carry
 
 
@@ -441,7 +454,7 @@ def test_a_cancelled_stream_is_not_swallowed(migrated_dsn: str, tmp_path: Path) 
     assert outcome["result"] == "cancelled"
 
 
-# ----------------------------------------------------------------------------- M6: /healthz is loopback only
+# ----------------------------------------------------------------------------- N3: /healthz has its own loopback listener
 
 
 def lan_address() -> str | None:
@@ -455,32 +468,30 @@ def lan_address() -> str | None:
     return None if addr.startswith("127.") else addr
 
 
-@pytest.mark.parametrize(
-    ("peer", "expected"),
-    [
-        (("127.0.0.1", 5000), True),
-        (("127.9.9.9", 5000), True),
-        (("::1", 5000, 0, 0), True),
-        (("::ffff:127.0.0.1", 5000, 0, 0), True),
-        (("10.0.0.5", 5000), False),
-        (("192.168.1.2", 5000), False),
-        (("::ffff:10.0.0.5", 5000, 0, 0), False),
-        (("2001:db8::1", 5000, 0, 0), False),
-        (("not an address", 5000), False),
-        (None, False),
-        ("/run/some.sock", False),
-    ],
-)
-def test_healthz_peer_check(peer: object, expected: bool) -> None:
-    assert public_server.is_loopback_peer(peer) is expected
-
-
-def test_healthz_answers_loopback_peers(host: Host) -> None:
-    r = host.get("/healthz")
+def test_healthz_is_answered_on_the_health_listener(host: Host) -> None:
+    assert host.health_port and host.health_port != host.port
+    r = host.health_get("/healthz")
     assert r.status == 200 and r.body == b"ok\n"
 
 
-def test_healthz_is_the_uniform_404_to_a_non_loopback_peer(
+def test_the_public_listener_has_no_healthz(host: Host) -> None:
+    ref = host.get("/nothing").shape()
+    assert host.get("/healthz").shape() == ref
+    assert host.health_get("/nothing", port=host.port).shape() == ref
+    assert "GET /healthz" not in routes_for(Role.PUBLIC)
+    assert routes_for(Role.HEALTH) == {"GET /healthz"}
+
+
+def test_the_health_listener_answers_nothing_else_and_refuses_framing(host: Host) -> None:
+    ref = host.get("/nothing").shape()
+    for path in ("/", "/nothing", "/s/anything/f/x", "/healthz/", "/internal/healthz"):
+        assert host.health_get(path).shape() == ref, path
+    assert host.health_get("/healthz", {"Expect": "100-continue"}).shape() == ref
+    assert host.health_get("/healthz", {"Content-Encoding": "gzip"}).shape() == ref
+    assert host.health_get("/healthz").status == 200
+
+
+def test_the_health_listener_is_bound_to_loopback_even_when_the_public_one_is_wide(
     migrated_dsn: str, tmp_path: Path
 ) -> None:
     addr = lan_address()
@@ -492,19 +503,67 @@ def test_healthz_is_the_uniform_404_to_a_non_loopback_peer(
     wide = Host(migrated_dsn, tmp_path / "blobs", DEFAULT_STATIC_DIR, sync, bind="0.0.0.0")
     wide.start(default_config(DEFAULT_STATIC_DIR, sync))
     try:
-        local = wide.get("/healthz")
-        assert local.status == 200  # reached over 127.0.0.1: a loopback peer
-        ref = wide.get("/nothing").shape()
-        conn = http.client.HTTPConnection(addr, wide.port, timeout=10, source_address=(addr, 0))
-        try:
-            conn.request("GET", "/healthz", headers={"Host": "x"})
-            r = conn.getresponse()
-            body = r.read()
-            assert r.status == 404 and body == ref[2]
-        finally:
-            conn.close()
+        assert wide.health_get("/healthz").status == 200  # over 127.0.0.1
+        with socket.socket() as probe:
+            probe.settimeout(5)
+            assert probe.connect_ex((addr, wide.health_port)) != 0  # nothing listens there
+        with socket.socket() as probe:
+            probe.settimeout(5)
+            assert probe.connect_ex((addr, wide.port)) == 0  # the public listener is wide
     finally:
         wide.stop()
+
+
+def test_loopback_peer_check_is_gone() -> None:
+    assert not hasattr(public_server, "is_loopback_peer")
+
+
+# ----------------------------------------------------------------------------- N4: the startup check is behavioural
+
+
+def test_the_startup_check_accepts_the_real_server(host: Host) -> None:
+    asyncio.run(public_server.verify_uniform_listener(host.port))
+
+
+def test_the_startup_check_fails_closed_on_a_plain_aiohttp_server() -> None:
+    async def go() -> None:
+        runner = web.AppRunner(web.Application())  # aiohttp's own 400 text for unparseable requests
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
+        try:
+            with pytest.raises(RuntimeError, match="uniform"):
+                await public_server.verify_uniform_listener(port)
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(go())
+
+
+def test_the_startup_check_fails_closed_when_nothing_answers() -> None:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    with pytest.raises(RuntimeError, match="uniform"):
+        asyncio.run(public_server.verify_uniform_listener(port))
+
+
+def test_the_private_attributes_eof_received_relies_on_are_required() -> None:
+    with pytest.raises(RuntimeError, match="_current_request"):
+        public_server.require_handler_internals(object())
+
+
+def test_a_real_handler_has_the_private_attributes() -> None:
+    async def go() -> None:
+        runner = public_server._UniformRunner(web.Application())
+        await runner.setup()
+        try:
+            public_server.require_handler_internals(runner.server())  # type: ignore[misc]
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(go())
 
 
 # ----------------------------------------------------------------------------- M7: half-close must not lose the response
@@ -550,7 +609,11 @@ def test_half_closed_clients_still_get_full_answers_for_known_shares(host: Host)
             b"404 Not Found",
             b"Not found\n",
         ),
-        "healthz": ("GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n", b"200 OK", b"ok\n"),
+        "healthz (not on the public port)": (
+            "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n",
+            b"404 Not Found",
+            b"Not found\n",
+        ),
         "protocol error": (
             f"GET /s/{s.token}/f/notes.txt HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
             b"404 Not Found",
@@ -600,3 +663,156 @@ def test_html_over_the_limit_is_the_uniform_404_with_an_explicit_reason(host: Ho
     assert reasons == ["html_too_large"]
     ok = host.get(f"/s/{s.token}/f/data.bin")
     assert ok.status == 200 and ok.body == big
+
+
+# ----------------------------------------------------------------------------- N5: advisory lock namespaces
+
+
+def hold_lock(host: Host, namespace: int, key: str, seconds: float) -> threading.Thread:
+    """Hold ``pg_advisory_xact_lock(namespace, hashtext(key))`` in a real transaction for ``seconds``."""
+    held = threading.Event()
+
+    def run() -> None:
+        async def body(pool: asyncpg.Pool) -> None:
+            async with pool.acquire() as conn, conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock($1, hashtext($2))", namespace, key)
+                held.set()
+                await asyncio.sleep(seconds)
+
+        host.db(body)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    assert held.wait(10)
+    return t
+
+
+def timed_create(a: Session) -> tuple[float, int]:
+    start = time.monotonic()
+    status = a.create().status
+    return time.monotonic() - start, status
+
+
+def test_share_cap_and_author_locks_use_distinct_two_argument_namespaces(host: Host) -> None:
+    from herdr_artifact_host.db import LOCK_NS_AUTHOR, LOCK_NS_SHARE_CAP
+
+    assert LOCK_NS_AUTHOR != LOCK_NS_SHARE_CAP
+    s = lab(host)
+    a = Session(host, s)
+    assert a.create().status == 201
+    identity = rows(host, s)[0]["author_identity"]
+    # the share-cap lock of THIS share blocks a create for it ...
+    t = hold_lock(host, LOCK_NS_SHARE_CAP, s.share_id, 1.5)
+    waited, status = timed_create(a)
+    t.join()
+    assert status == 201 and waited >= 1.0
+    # ... and the very same key text in the author namespace (or a different share's key) does not
+    t = hold_lock(host, LOCK_NS_AUTHOR, s.share_id, 1.5)
+    waited, status = timed_create(a)
+    assert status == 201 and waited < 1.0
+    t.join()
+    t = hold_lock(host, LOCK_NS_SHARE_CAP, "some-other-share", 1.5)
+    waited, status = timed_create(a)
+    assert status == 201 and waited < 1.0
+    t.join()
+    # the author lock (identity key) blocks that author in its own namespace
+    t = hold_lock(host, LOCK_NS_AUTHOR, identity, 1.5)
+    waited, status = timed_create(a)
+    t.join()
+    assert status == 201 and waited >= 1.0
+
+
+# ----------------------------------------------------------------------------- N1: hashing cannot starve the surface
+
+HUGE = 160 * 1024 * 1024
+
+
+def huge_share(host: Host):
+    data = b"\xa5" * HUGE
+    return host.seed_share({"index.html": b"<html><body>x</body></html>", "big.bin": data})
+
+
+def fire_and_close(host: Host, path: str) -> None:
+    """The reviewer's probe: connect, send a full GET, close at once."""
+    try:
+        with socket.create_connection(("127.0.0.1", host.port), timeout=5) as sock:
+            sock.sendall(f"GET {path} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    except OSError:
+        pass
+
+
+def test_a_connect_get_close_flood_of_a_huge_blob_does_not_starve_small_requests(
+    host: Host,
+) -> None:
+    s = huge_share(host)
+    big, small = f"/s/{s.token}/f/big.bin", f"/s/{s.token}/f/index.html"
+    assert host.get(small).status == 200
+    stop = threading.Event()
+
+    def hammer() -> None:
+        while not stop.is_set():
+            fire_and_close(host, big)
+
+    threads = [threading.Thread(target=hammer, daemon=True) for _ in range(8)]
+    for t in threads:
+        t.start()
+    try:
+        time.sleep(0.5)  # the flood is in full swing
+        slowest = 0.0
+        for _ in range(15):
+            start = time.monotonic()
+            r = host.get(small)
+            slowest = max(slowest, time.monotonic() - start)
+            assert r.status == 200
+        assert slowest < 1.0, f"a tiny GET took {slowest:.2f}s while a huge blob was being hammered"
+        health_start = time.monotonic()
+        assert host.health_get("/healthz").status == 200
+        assert time.monotonic() - health_start < 1.0
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(10)
+
+
+def read_status_and_head(sock: socket.socket) -> bytes:
+    sock.settimeout(30)
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    if head.startswith(b"HTTP/1.1 503"):  # small body: read it fully
+        length = int(head.lower().split(b"content-length: ")[1].split(b"\r\n")[0])
+        while len(body) < length:
+            body += sock.recv(4096)
+        return head + b"\r\n\r\n" + body
+    return data
+
+
+def test_concurrent_full_blob_verifications_are_capped_and_saturation_is_a_503(host: Host) -> None:
+    from herdr_artifact_host.share_http import UNAVAILABLE_BODY
+
+    s = huge_share(host)
+    big = f"/s/{s.token}/f/big.bin"
+    cap = public_server.HASH_CONCURRENCY
+    socks = [socket.create_connection(("127.0.0.1", host.port), timeout=30) for _ in range(cap + 4)]
+    try:
+        for sock in socks:
+            sock.sendall(f"GET {big} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+        heads = [read_status_and_head(sock) for sock in socks]
+        busy = [h for h in heads if h.startswith(b"HTTP/1.1 503")]
+        served = [h for h in heads if h.startswith(b"HTTP/1.1 200")]
+        assert len(busy) >= 1 and len(busy) + len(served) == len(socks)
+        assert len(served) <= cap + 1  # the cap, plus one that arrived after a slot freed
+        for h in busy:
+            assert b"Retry-After: 5" in h
+            assert h.split(b"\r\n\r\n", 1)[1] == UNAVAILABLE_BODY
+        # the 503 is only reachable for a token that resolved; an unknown token is still the uniform 404
+        assert host.get("/s/unknowntoken/f/big.bin").shape() == host.get("/nothing").shape()
+    finally:
+        for sock in socks:
+            sock.close()
+    # slots are released: the next full read is served
+    assert host.get(f"/s/{s.token}/f/index.html").status == 200

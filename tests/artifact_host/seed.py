@@ -148,6 +148,7 @@ class Host:
     static_dir: Path
     sync_dir: Path
     port: int = 0
+    health_port: int = 0
     bind: str = "127.0.0.1"
     loop: asyncio.AbstractEventLoop | None = None
     server: PublicServer | None = None
@@ -175,6 +176,7 @@ class Host:
                 self.surface = app[SURFACE]
                 self.server = PublicServer(app)
                 self.port = await self.server.start(self.bind)
+                self.health_port = self.server.health_port
 
             try:
                 loop.run_until_complete(boot())
@@ -325,13 +327,16 @@ class Host:
         path: str,
         headers: dict[str, str] | list[tuple[str, str]] | None = None,
         body: bytes | None = None,
+        *,
+        port: int | None = None,
     ) -> Resp:
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        port = self.port if port is None else port
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
         try:
             conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
             items = list(headers.items()) if isinstance(headers, dict) else list(headers or [])
             if not any(k.lower() == "host" for k, _ in items):
-                items.insert(0, ("Host", f"127.0.0.1:{self.port}"))
+                items.insert(0, ("Host", f"127.0.0.1:{port}"))
             for k, v in items:
                 conn.putheader(k, v)
             if body is not None and not any(k.lower() == "content-length" for k, _ in items):
@@ -345,6 +350,12 @@ class Host:
 
     def get(self, path: str, headers: dict[str, str] | None = None) -> Resp:
         return self.request("GET", path, headers)
+
+    def health_get(
+        self, path: str, headers: dict[str, str] | None = None, *, port: int | None = None
+    ) -> Resp:
+        """GET on the loopback-only health listener (or on ``port`` when given)."""
+        return self.request("GET", path, headers, port=self.health_port if port is None else port)
 
 
 def make_sync_dir(root: Path) -> Path:

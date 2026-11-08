@@ -9,6 +9,15 @@ import asyncpg
 
 _LOCK_KEY = 0x48415F4D4947  # advisory lock id for migrations ("HA_MIG")
 
+# Two-argument advisory locks are ``pg_advisory_xact_lock(namespace, hashtext(key))``.  Each lock family owns one
+# namespace (int32), so a key collision across families (for example an identity equal to a share id) cannot make
+# unrelated transactions wait on one another.  The migration lock above uses the one-argument bigint space.
+LOCK_NS_SHARE_CAP = 0x53484341  # "SHCA": per-share annotation cap (share_store.create_annotation)
+LOCK_NS_AUTHOR = (
+    0x41555448  # "AUTH": per-author daily annotation cap (share_store.create_annotation)
+)
+LOCK_NS_PENDING_CLAIM = 0x504E4443  # "PNDC": per-owner pending-intake claims (library.py, Task 6)
+
 
 async def create_pool(dsn: str) -> asyncpg.Pool:
     return await asyncpg.create_pool(dsn, min_size=1, max_size=10)
@@ -26,7 +35,11 @@ class Migrator:
         self._dir = directory if directory is not None else packaged_migrations()
 
     def _files(self) -> list[tuple[str, str]]:
-        found = [(p.name, p.read_text(encoding="utf-8")) for p in self._dir.iterdir() if p.name.endswith(".sql")]
+        found = [
+            (p.name, p.read_text(encoding="utf-8"))
+            for p in self._dir.iterdir()
+            if p.name.endswith(".sql")
+        ]
         return sorted(found)
 
     async def migrate(self) -> list[str]:

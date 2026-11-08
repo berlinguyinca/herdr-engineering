@@ -4,9 +4,12 @@ cases and the annotation view's markup, CSP and hostile content.  Real server, r
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import shutil
+import signal
+import threading
 import time
 import urllib.parse
 from collections.abc import Iterator
@@ -438,7 +441,7 @@ def test_hostile_file_name_is_escaped_everywhere(host: Host, viewed: tuple[Seede
 
 def test_render_failures_map_to_uniform_responses(host: Host) -> None:
     """RenderFailed (the output tripwire) is the uniform 404; RenderTooLarge gets the note; real isolated child.
-    Not ported: RenderTimeout (needed a monkeypatched deadline) and RenderBusy (timing-dependent pool saturation)."""
+    RenderTimeout and RenderBusy are the SIGSTOP tests below."""
     files = {
         "index.html": b"<p>i</p>",
         "tripwire.html": b'<p title="' + CLOSE_TEMPLATE.encode() + b'<img src=x onerror=1>">x</p>',
@@ -451,3 +454,101 @@ def test_render_failures_map_to_uniform_responses(host: Host) -> None:
     assert r.shape()[0] == 404 and r.body == ref[2]
     big = view(host, s, sess, "huge.html")
     assert big.status == 200 and b"too large to show" in big.body
+
+
+# ----------------------------------------------------------------------------- RenderTimeout and RenderBusy, real child
+
+
+def stop_the_sanitizer_child() -> int:
+    """SIGSTOP the real isolated sanitizer child: it neither answers nor dies, so a job runs into its deadline."""
+    from herdr_artifact_host import share_render
+
+    proc = share_render._WORKER._proc
+    assert proc is not None and proc.poll() is None
+    os.kill(proc.pid, signal.SIGSTOP)
+    return proc.pid
+
+
+def render_files(count: int) -> dict[str, bytes]:
+    files = {"index.html": b"<p>index</p>"}
+    for i in range(count):
+        files[f"p{i}.html"] = f"<p>page {i} {secrets.token_hex(4)}</p>".encode()
+    return files
+
+
+def test_a_stopped_sanitizer_child_is_a_render_timeout_that_answers_the_uniform_404(
+    host: Host,
+) -> None:
+    from herdr_artifact_host import share_render
+
+    share_render.clear_sanitize_caches()
+    s = lab(host, files=render_files(3))
+    sess = landing_session(sign_in(host, s))
+    assert view(host, s, sess, "p0.html").status == 200  # the child is up
+    pid = stop_the_sanitizer_child()
+    try:
+        ref = host.get("/nothing-here").shape()
+        start = time.monotonic()
+        r = view(host, s, sess, "p1.html")
+        elapsed = time.monotonic() - start
+        assert r.shape()[0] == 404 and r.body == ref[2]
+        assert (
+            share_render.SANITIZE_DEADLINE_SECONDS - 0.5
+            < elapsed
+            < share_render.SANITIZE_DEADLINE_SECONDS + 3
+        )
+        assert {"reason": "render_failed"} in [
+            json.loads(e["detail"]) for e in host.events(s.share_id, "denied")
+        ]
+    finally:
+        try:
+            os.kill(
+                pid, signal.SIGKILL
+            )  # the parent already killed it on the deadline; this is just cleanup
+        except ProcessLookupError:
+            pass
+    again = view(host, s, sess, "p2.html")  # a fresh child serves the next request
+    assert again.status == 200 and b"page 2" in again.body
+
+
+def test_a_full_render_queue_is_a_busy_503_and_clears_once_the_child_is_replaced(
+    host: Host,
+) -> None:
+    from herdr_artifact_host import share_render
+    from herdr_artifact_host.share_http import UNAVAILABLE_BODY
+
+    share_render.clear_sanitize_caches()
+    cap = share_render.MAX_PENDING_RENDERS
+    s = lab(host, files=render_files(cap + 3))
+    sess = landing_session(sign_in(host, s))
+    assert view(host, s, sess, "p0.html").status == 200
+    pid = stop_the_sanitizer_child()
+    answers: dict[int, int] = {}
+
+    def render(i: int) -> None:
+        answers[i] = view(host, s, sess, f"p{i}.html").status
+
+    waiting = [threading.Thread(target=render, args=(i,), daemon=True) for i in range(1, cap + 1)]
+    try:
+        for t in waiting:
+            t.start()
+        time.sleep(
+            1.0
+        )  # all of them are inside the render queue now, stuck behind the stopped child
+        busy = view(host, s, sess, f"p{cap + 1}.html")
+        assert busy.status == 503 and busy.body == UNAVAILABLE_BODY
+        assert busy.header("Retry-After") == "5"
+        ref = host.get("/nothing-here").shape()
+        assert (
+            host.get(f"/s/{s.token}/k/{sess}/a/missing.html").shape() == ref
+        )  # still uniform for what is not there
+    finally:
+        for t in waiting:
+            t.join(30)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    assert len(answers) == cap
+    after = view(host, s, sess, f"p{cap + 2}.html")  # the queue drained and a fresh child works
+    assert after.status == 200

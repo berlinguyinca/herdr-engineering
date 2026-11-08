@@ -13,7 +13,8 @@ member-created shares; "sharer" in the feed is whatever those columns hold.
 Writes take a ``Viewer`` and refuse ``OPERATOR_READ_ALL`` (403 ``read_only``) and a blank member id (400).
 
 The pending cap is NOT atomic: ``ensure_pending_capacity`` only counts.  Task 6 must run the count and the insert
-of a new pending artifact in ONE transaction holding ``pg_advisory_xact_lock(hashtext(owner))``, or concurrent
+of a new pending artifact in ONE transaction holding ``pg_advisory_xact_lock(LOCK_NS_PENDING_CLAIM, hashtext(owner))`` (the
+two-argument form; ``LOCK_NS_PENDING_CLAIM`` lives in ``db.py`` beside the other namespaces), or concurrent
 pushes can exceed ``PENDING_CAP``.
 """
 
