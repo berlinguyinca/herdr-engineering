@@ -10,6 +10,7 @@ import tempfile
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import asyncpg
 import pytest
@@ -91,3 +92,12 @@ def migrated_dsn(host_dsn: str) -> str:
 
     asyncio.run(go())
     return host_dsn
+
+
+@pytest.fixture
+def host(migrated_dsn: str, tmp_path: Path) -> Iterator[Any]:
+    """A running public share server (lab sign-in configured) over a migrated database."""
+    from tests.artifact_host.seed import running_host
+
+    with running_host(migrated_dsn, tmp_path) as running:
+        yield running
