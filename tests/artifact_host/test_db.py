@@ -51,6 +51,7 @@ def test_migrate_twice_is_idempotent(host_dsn: str) -> None:
         "0002_member_identity.sql",
         "0003_member_sessions.sql",
         "0004_agent_tokens.sql",
+        "0005_agent_scope.sql",
     ]
     assert second == []
 
@@ -64,7 +65,7 @@ def test_concurrent_migrators_apply_once(host_dsn: str) -> None:
             await pool.close()
 
     results = asyncio.run(go())
-    assert sorted(len(r) for r in results) == [0, 0, 0, 4]
+    assert sorted(len(r) for r in results) == [0, 0, 0, 5]
 
 
 def test_failed_migration_rolls_back_and_is_not_recorded(host_dsn: str, tmp_path: Path) -> None:

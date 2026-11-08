@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import threading
@@ -9,7 +10,13 @@ import time
 from typing import Any
 
 from herdr_artifact_host.mcp import PROTOCOL
-from herdr_artifact_host.member_api import CHUNK_BYTES, MemberLimits
+from herdr_artifact_host.member_api import (
+    CHUNK_BYTES,
+    Actor,
+    ActorKind,
+    MemberError,
+    MemberLimits,
+)
 from tests.artifact_host.member_support import (
     ORIGIN,
     call,
@@ -17,7 +24,7 @@ from tests.artifact_host.member_support import (
     sha,
     sign_in,
 )
-from tests.artifact_host.seed import Host, Resp, running_host
+from tests.artifact_host.seed import Host, Resp, access, ident, running_host
 
 LOTS = MemberLimits(writes_per_minute=10_000, chunks_per_minute=100_000)
 
@@ -31,11 +38,19 @@ def mint(host: Host, session: str, label: str = "laptop") -> dict[str, Any]:
 class Agent:
     """A minimal MCP client (Streamable HTTP, JSON responses): handshake, tools/list, tools/call."""
 
-    def __init__(self, host: Host, token: str | None, *, scheme: str = "Bearer") -> None:
+    def __init__(
+        self,
+        host: Host,
+        token: str | None,
+        *,
+        scheme: str = "Bearer",
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.host, self.token, self.scheme, self._id = host, token, scheme, 0
+        self.extra = dict(headers or {})
 
     def post(self, message: Any) -> Resp:
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", **self.extra}
         if self.token is not None:
             headers["Authorization"] = f"{self.scheme} {self.token}"
         return self.host.request("POST", "/mcp/artifacts", headers, json.dumps(message).encode())
@@ -77,7 +92,9 @@ class Agent:
         return body
 
     def push(self, title: str, files: dict[str, bytes]) -> tuple[str, dict[str, Any]]:
-        aid = self.ok("artifact_create", title=title, filename="index.html")["artifact_id"]
+        aid = self.ok("artifact_create", title=title, filename="index.html", profile="web")[
+            "artifact_id"
+        ]
         specs = []
         for name, data in files.items():
             spec = {"name": name, "size_bytes": len(data), "file_sha256": sha(data)}
@@ -232,7 +249,9 @@ def test_body_rules(host: Host) -> None:
         == 403
     )
     assert host.request("POST", "/mcp/artifacts", auth, b"{not json").status == 400
-    err, body = agent.tool("artifact_create", title="t", filename="a.html", surprise=1)
+    err, body = agent.tool(
+        "artifact_create", title="t", filename="a.html", profile="web", surprise=1
+    )
     assert err and body["error"] == "bad_request"
 
 
@@ -258,7 +277,7 @@ def test_create_and_push_lands_pending(host: Host) -> None:
 def test_a_multi_chunk_file_resumes_and_publishes(host: Host) -> None:
     agent, _, _ = agent_for(host)
     data = bytes(range(256)) * 5000  # three chunks
-    aid = agent.ok("artifact_create", title="Big", filename="big.bin")["artifact_id"]
+    aid = agent.ok("artifact_create", title="Big", filename="big.bin", profile="web")["artifact_id"]
     spec = {"name": "big.bin", "size_bytes": len(data), "file_sha256": sha(data)}
     part = data[CHUNK_BYTES : 2 * CHUNK_BYTES]
     agent.ok(
@@ -313,7 +332,7 @@ def test_a_multi_chunk_file_resumes_and_publishes(host: Host) -> None:
 
 def test_publish_failure_reaps_orphan_blobs(host: Host) -> None:
     agent, _, _ = agent_for(host)
-    aid = agent.ok("artifact_create", title="t", filename="a.html")["artifact_id"]
+    aid = agent.ok("artifact_create", title="t", filename="a.html", profile="web")["artifact_id"]
     data = b"orphan candidate"
     spec = {"name": "a.html", "size_bytes": len(data), "file_sha256": sha(data)}
     agent.ok(
@@ -383,30 +402,38 @@ def test_an_agent_cannot_touch_another_members_artifact(host: Host) -> None:
 # ---------------------------------------------------------------- shares
 
 
+def accepted_push(agent: Agent, host: Host, session: str, title: str = "Pushed") -> tuple[str, str]:
+    """An artifact the agent created and the owner accepted: (artifact_id, version_id)."""
+    aid, pub = agent.push(title, {"index.html": b"<html><body>agent made</body></html>"})
+    assert call(host, session, "POST", f"/pending/{aid}/accept").status == 200
+    return aid, pub["version_id"]
+
+
+def on_loop(host: Host, coro: Any) -> Any:
+    assert host.loop is not None
+    return asyncio.run_coroutine_threadsafe(coro, host.loop).result(15)
+
+
 def test_an_agent_share_is_pending_and_cannot_be_approved_by_it(host: Host) -> None:
     agent, session, _ = agent_for(host)
-    aid, vid = published(host, session)  # an accepted artifact made through the web page
+    aid, vid = accepted_push(agent, host, session)
     made = agent.ok("artifact_share_create", artifact_id=aid, version_id=vid, audience="public")
     assert made["state"] == "pending"
-    row = host.rows("SELECT state, created_by FROM shares WHERE share_id=$1", made["share_id"])[0]
-    assert row == {"state": "pending", "created_by": "alice"}
+    row = host.rows(
+        "SELECT state, created_by, created_via FROM shares WHERE share_id=$1", made["share_id"]
+    )[0]
+    assert row == {"state": "pending", "created_by": "alice", "created_via": "agent"}
     assert not [t for t in agent.tools() if "approve" in t]
     listed = agent.ok("artifact_share_list", artifact_id=aid)["links"]
     assert [x["state"] for x in listed] == ["pending"]
     # the same agent actor is refused by the service itself, not only by the missing tool
-    from herdr_artifact_host.member_api import Actor, ActorKind, MemberError
-
-    async def approve(pool: Any) -> None:
-        raise AssertionError
-
-    svc = host.surface.member.svc
-    import asyncio
-
-    fut = asyncio.run_coroutine_threadsafe(
-        svc.share_approve(Actor(ActorKind.AGENT, "alice"), aid, made["share_id"], True), host.loop
-    )
     try:
-        fut.result(10)
+        on_loop(
+            host,
+            host.surface.member.svc.share_approve(
+                Actor(ActorKind.AGENT, "alice"), aid, made["share_id"], True
+            ),
+        )
     except MemberError as exc:
         assert exc.status == 403
     else:
@@ -415,16 +442,14 @@ def test_an_agent_share_is_pending_and_cannot_be_approved_by_it(host: Host) -> N
         host.rows("SELECT state FROM shares WHERE share_id=$1", made["share_id"])[0]["state"]
         == "pending"
     )
-    assert (
-        call(
-            host,
-            session,
-            "POST",
-            f"/artifacts/{aid}/shares/{made['share_id']}/approve",
-            {"confirm": True},
-        ).status
-        == 200
+    approved = call(
+        host,
+        session,
+        "POST",
+        f"/artifacts/{aid}/shares/{made['share_id']}/approve",
+        {"confirm": True},
     )
+    assert approved.status == 200
     assert (
         agent.ok("artifact_share_revoke", artifact_id=aid, share_id=made["share_id"])["state"]
         == "revoked"
@@ -439,8 +464,8 @@ def test_the_26th_pending_is_refused(migrated_dsn, tmp_path) -> None:
     with running_host(migrated_dsn, tmp_path, {"member_limits": LOTS}) as host:
         agent, _, _ = agent_for(host)
         for i in range(25):
-            agent.ok("artifact_create", title=f"p{i}", filename="a.html")
-        err, body = agent.tool("artifact_create", title="p25", filename="a.html")
+            agent.ok("artifact_create", title=f"p{i}", filename="a.html", profile="web")
+        err, body = agent.tool("artifact_create", title="p25", filename="a.html", profile="web")
         assert err and body["error"] == "pending_cap" and body["status"] == 429
         assert len(host.rows("SELECT 1 FROM artifacts WHERE intake='pending'")) == 25
 
@@ -454,7 +479,7 @@ def test_26_concurrent_creates_admit_exactly_25(migrated_dsn, tmp_path) -> None:
 
         def go(i: int) -> None:
             start.wait()
-            got = agent.tool("artifact_create", title=f"c{i}", filename="a.html")
+            got = agent.tool("artifact_create", title=f"c{i}", filename="a.html", profile="web")
             with lock:
                 results.append(got)
 
@@ -503,3 +528,389 @@ def test_per_token_rate_limit(migrated_dsn, tmp_path) -> None:
         agent, _, _ = agent_for(host)  # initialize + notification used 2
         statuses = [agent.rpc("ping").status for _ in range(6)]
         assert statuses.count(429) >= 1 and statuses[0] == 200
+
+
+# ---------------------------------------------------------------- fix round 1
+
+
+def test_a_blocked_client_gets_429_and_other_clients_are_unaffected(host: Host) -> None:
+    _, _, token = agent_for(host)
+    bad = Agent(host, "hat_" + "B" * 43, headers={"X-Forwarded-For": "10.9.0.1"})
+    codes = [bad.rpc("ping").status for _ in range(60)]
+    assert codes == [401] * 60
+    blocked = bad.rpc("ping")
+    assert blocked.status == 429 and blocked.header("Retry-After")
+    # a valid token from the blocked address is held back too; from another address it works
+    assert Agent(host, token, headers={"X-Forwarded-For": "10.9.0.1"}).rpc("ping").status == 429
+    assert Agent(host, token, headers={"X-Forwarded-For": "10.9.0.2"}).rpc("ping").status == 200
+
+
+def test_an_agent_share_response_carries_no_token_or_url(host: Host) -> None:
+    agent, session, token = agent_for(host)
+    aid, vid = accepted_push(agent, host, session)
+    made = agent.ok(
+        "artifact_share_create", artifact_id=aid, version_id=vid, audience="public", title="Hello"
+    )
+    assert set(made) == {"share_id", "state", "audience", "expires_at", "title"}
+    assert made["state"] == "pending" and made["title"] == "Hello"
+    assert host.rows("SELECT token_hash FROM shares WHERE share_id=$1", made["share_id"]) == [
+        {"token_hash": None}
+    ]
+    listed = agent.rpc("tools/call", {"name": "artifact_share_list", "arguments": {}}).body
+    assert b"token" not in listed and b"/s/" not in listed
+
+
+def test_the_member_gets_the_link_once_at_approve_and_it_serves_content(host: Host) -> None:
+    agent, session, _ = agent_for(host)
+    aid, vid = accepted_push(agent, host, session)
+    made = agent.ok("artifact_share_create", artifact_id=aid, version_id=vid, audience="public")
+    path = f"/artifacts/{aid}/shares/{made['share_id']}/approve"
+    key = "approve-key-1"
+    r = call(host, session, "POST", path, {"confirm": True, "idempotency_key": key})
+    assert r.status == 200
+    body = r.json()
+    assert (
+        body["state"] == "live" and body["token"] and body["url"].endswith(f"/s/{body['token']}/")
+    )
+    assert host.get(f"/s/{body['token']}/").status == 302
+    served = host.get(f"/s/{body['token']}/f/index.html")
+    assert served.status == 200 and b"agent made" in served.body
+    # only a digest is stored, and the agent never sees the token in any tool
+    seen = b"".join(
+        agent.rpc("tools/call", {"name": n, "arguments": a}).body
+        for n, a in (
+            ("artifact_share_list", {}),
+            ("artifact_share_events", {"artifact_id": aid, "share_id": made["share_id"]}),
+            ("artifact_head", {"artifact_id": aid}),
+        )
+    )
+    assert body["token"].encode() not in seen
+    # the same approve again is not a second link
+    again = call(host, session, "POST", path, {"confirm": True, "idempotency_key": key})
+    assert again.status == 200 and "token" not in again.json()
+
+
+def test_a_web_made_share_still_shows_its_link_at_creation_only(host: Host) -> None:
+    s = sign_in(host)
+    aid, vid = published(host, s)
+    made = call(
+        host, s, "POST", f"/artifacts/{aid}/shares", {"version_id": vid, "audience": "public"}
+    )
+    assert made.status == 200 and made.json()["token"] and made.json()["url"]
+    approved = call(
+        host,
+        s,
+        "POST",
+        f"/artifacts/{aid}/shares/{made.json()['share_id']}/approve",
+        {"confirm": True},
+    )
+    assert approved.status == 200 and "token" not in approved.json()
+
+
+def test_an_agent_mutates_only_what_agents_created(host: Host) -> None:
+    agent, session, _ = agent_for(host)
+    web_aid, web_vid = published(host, session)  # made through the web page
+    web_share = call(
+        host,
+        session,
+        "POST",
+        f"/artifacts/{web_aid}/shares",
+        {"version_id": web_vid, "audience": "public"},
+    ).json()["share_id"]
+    spec = {"name": "index.html", "size_bytes": 3, "file_sha256": sha(b"abc")}
+    attempts: list[tuple[str, dict[str, Any]]] = [
+        ("artifact_delete", {"artifact_id": web_aid, "confirm": True}),
+        ("artifact_publish", {"artifact_id": web_aid, "files": [spec]}),
+        ("artifact_upload_status", {"artifact_id": web_aid, **spec}),
+        (
+            "artifact_upload_chunk",
+            {
+                "artifact_id": web_aid,
+                **spec,
+                "index": 0,
+                "total": 1,
+                "sha256": sha(b"abc"),
+                "data_b64": base64.b64encode(b"abc").decode(),
+            },
+        ),
+        ("artifact_upload_abort", {"artifact_id": web_aid, "upload_id": "upl_" + "0" * 24, **spec}),
+        (
+            "artifact_share_create",
+            {"artifact_id": web_aid, "version_id": web_vid, "audience": "public"},
+        ),
+        ("artifact_share_revoke", {"artifact_id": web_aid, "share_id": web_share}),
+    ]
+    for name, args in attempts:
+        err, body = agent.tool(name, **args)
+        err2, body2 = agent.tool(name, **{**args, "artifact_id": "art_doesnotexist"})
+        assert err and err2 and body == body2 and body["error"] == "not_found", (name, body)
+    assert host.rows("SELECT lifecycle FROM artifacts WHERE artifact_id=$1", web_aid)[0] == {
+        "lifecycle": "active"
+    }
+    assert host.rows("SELECT state FROM shares WHERE share_id=$1", web_share)[0] == {
+        "state": "pending"
+    }
+    # an agent-made artifact stays the agent's after the owner accepts it; a web share on it is not
+    own, own_vid = accepted_push(agent, host, session)
+    web_on_own = call(
+        host,
+        session,
+        "POST",
+        f"/artifacts/{own}/shares",
+        {"version_id": own_vid, "audience": "public"},
+    ).json()["share_id"]
+    err, body = agent.tool("artifact_share_revoke", artifact_id=own, share_id=web_on_own)
+    assert err and body["error"] == "not_found"
+    agent_share = agent.ok(
+        "artifact_share_create", artifact_id=own, version_id=own_vid, audience="public"
+    )["share_id"]
+    assert (
+        agent.ok("artifact_share_revoke", artifact_id=own, share_id=agent_share)["state"]
+        == "revoked"
+    )
+    assert agent.ok("artifact_delete", artifact_id=own, confirm=True)["deleted"] is True
+    # migration backfill: pending rows are agent made, everything else web made
+    assert host.rows("SELECT created_via FROM artifacts WHERE artifact_id=$1", web_aid) == [
+        {"created_via": "web"}
+    ]
+
+
+def test_tool_descriptions_state_the_scope(host: Host) -> None:
+    agent, _, _ = agent_for(host)
+    tools = {t["name"]: t for t in agent.rpc("tools/list").json()["result"]["tools"]}
+    for name in (
+        "artifact_delete",
+        "artifact_publish",
+        "artifact_share_create",
+        "artifact_share_revoke",
+    ):
+        assert "created through an agent" in tools[name]["description"], name
+    assert tools["artifact_create"]["inputSchema"]["required"] == ["title", "filename", "profile"]
+    assert tools["artifact_create"]["inputSchema"]["properties"]["profile"]["enum"] == [
+        "web",
+        "document",
+    ]
+
+
+def test_profile_is_required_and_limited(host: Host) -> None:
+    agent, _, _ = agent_for(host)
+    for args in (
+        {"title": "t", "filename": "a.html"},
+        {"title": "t", "filename": "a.html", "profile": "other"},
+    ):
+        err, body = agent.tool("artifact_create", **args)
+        assert err and body["error"] == "bad_request"
+    assert agent.ok("artifact_create", title="t", filename="a.html", profile="document")
+
+
+def test_search_filters_before_the_limit_and_counts_truthfully(host: Host) -> None:
+    agent, session, _ = agent_for(host)
+    accepted = [accepted_push(agent, host, session, f"Accepted {i}")[0] for i in range(3)]
+    for i in range(4):  # newer pending ones must not crowd out the accepted
+        agent.push(f"Pending {i}", {"index.html": b"p"})
+    page = agent.ok("artifact_search", limit=2)
+    assert len(page["items"]) == 2 and page["total"] == 3
+    assert {i["artifact_id"] for i in page["items"]} <= set(accepted)
+    # a folder can be named by its id or by its name
+    folder = call(host, session, "POST", "/folders", {"name": "Reports"}).json()["folder_id"]
+    call(host, session, "POST", f"/folders/{folder}/items", {"artifact_id": accepted[0]})
+    for ref in (folder, "Reports"):
+        found = agent.ok("artifact_search", folder=ref)
+        assert [i["artifact_id"] for i in found["items"]] == [accepted[0]] and found["total"] == 1
+    assert agent.ok("artifact_search", folder="Nope") == {"items": [], "total": 0}
+
+
+def test_publish_and_share_create_are_idempotent(host: Host) -> None:
+    agent, session, _ = agent_for(host)
+    aid = agent.ok("artifact_create", title="t", filename="index.html", profile="web")[
+        "artifact_id"
+    ]
+    data = b"<html>once</html>"
+    spec = {"name": "index.html", "size_bytes": len(data), "file_sha256": sha(data)}
+    agent.ok(
+        "artifact_upload_chunk",
+        artifact_id=aid,
+        **spec,
+        index=0,
+        total=1,
+        sha256=sha(data),
+        data_b64=base64.b64encode(data).decode(),
+    )
+    first = agent.ok("artifact_publish", artifact_id=aid, files=[spec], idempotency_key="publish-1")
+    again = agent.ok("artifact_publish", artifact_id=aid, files=[spec], idempotency_key="publish-1")
+    assert again["version_id"] == first["version_id"]
+    assert host.rows("SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid) != []
+    assert len(host.rows("SELECT 1 FROM artifact_versions WHERE artifact_id=$1", aid)) == 1
+    err, body = agent.tool(
+        "artifact_publish",
+        artifact_id=aid,
+        files=[{**spec, "size_bytes": 1}],
+        idempotency_key="publish-1",
+    )
+    assert err and body["error"] == "conflict"
+    assert call(host, session, "POST", f"/pending/{aid}/accept").status == 200
+    vid = first["version_id"]
+    one = agent.ok(
+        "artifact_share_create",
+        artifact_id=aid,
+        version_id=vid,
+        audience="public",
+        idempotency_key="share-key-1",
+    )
+    two = agent.ok(
+        "artifact_share_create",
+        artifact_id=aid,
+        version_id=vid,
+        audience="public",
+        idempotency_key="share-key-1",
+    )
+    assert one == two
+    assert len(host.rows("SELECT 1 FROM shares WHERE artifact_id=$1", aid)) == 1
+    err, body = agent.tool(
+        "artifact_share_create",
+        artifact_id=aid,
+        version_id=vid,
+        audience="lab",
+        allow_emails=["a@b.example"],
+        idempotency_key="share-key-1",
+    )
+    assert err and body["error"] == "conflict"
+
+
+def test_a_zero_byte_file_publishes_without_a_chunk(host: Host) -> None:
+    agent, _, _ = agent_for(host)
+    aid = agent.ok("artifact_create", title="t", filename="empty.txt", profile="document")[
+        "artifact_id"
+    ]
+    spec = {"name": "empty.txt", "size_bytes": 0, "file_sha256": sha(b"")}
+    assert agent.ok("artifact_upload_status", artifact_id=aid, **spec)["complete"] is True
+    pub = agent.ok("artifact_publish", artifact_id=aid, files=[spec])
+    assert pub["size_bytes"] == 0
+    err, body = agent.tool(
+        "artifact_upload_chunk",
+        artifact_id=aid,
+        **spec,
+        index=0,
+        total=1,
+        sha256=sha(b""),
+        data_b64="",
+    )
+    assert err and body["error"] == "bad_request"
+
+
+def test_the_ticket_book_is_lru_and_bounded(host: Host) -> None:
+    mcp = host.surface.mcp
+    mcp.max_ticket_members = 3
+    first = mcp._issue("m1", {"x": 1})["ticket"]
+    mcp._issue("m2", {"x": 2})
+    mcp._issue("m3", {"x": 3})
+    assert mcp._ticket("m1", first) is not None  # a read keeps m1 fresh
+    mcp._issue("m4", {"x": 4})  # evicts the least recently used member (m2)
+    assert set(mcp._tickets) == {"m1", "m3", "m4"}
+    mcp.tickets_per_member = 2
+    t = [mcp._issue("m1", {"n": i})["ticket"] for i in range(3)]
+    assert mcp._ticket("m1", t[0]) is None and mcp._ticket("m1", t[2]) is not None
+
+
+def test_agent_token_housekeeping(migrated_dsn, tmp_path) -> None:
+    with running_host(migrated_dsn, tmp_path) as host:
+        s = sign_in(host, "alice")
+        old = mint(host, s, "old")
+        mint(host, s, "kept")
+        bob = sign_in(host, "bob")
+        mint(host, bob, "bobs")
+        host.execute(
+            "UPDATE agent_tokens SET revoked_at = now() - interval '91 days' WHERE token_id=$1",
+            old["token_id"],
+        )
+        assert on_loop(host, host.surface.mcp.sweep_agent_tokens()) == 1
+        assert len(host.rows("SELECT 1 FROM agent_tokens")) == 2
+        (host.sync_dir / "members.json").write_text(
+            json.dumps({"updated": time.time(), "groups": {"local.dev": ["bob"]}})
+        )
+        host.surface.member.s.authenticator._checked.clear()
+        assert on_loop(host, host.surface.mcp.sweep_removed_members_agent_tokens()) == 1
+        rows = {
+            r["member_id"]: r["revoked_at"] is not None
+            for r in host.rows("SELECT member_id, revoked_at FROM agent_tokens")
+        }
+        assert rows == {"alice": True, "bob": False}
+
+
+def test_listing_puts_active_tokens_first_and_labels_are_capped(host: Host) -> None:
+    s = sign_in(host)
+    first = mint(host, s, "first")
+    second = mint(host, s, "second")
+    assert call(host, s, "POST", f"/agent-tokens/{second['token_id']}/revoke").status == 200
+    ids = [t["token_id"] for t in call(host, s, "GET", "/agent-tokens").json()["tokens"]]
+    assert ids == [first["token_id"], second["token_id"]]
+    assert call(host, s, "POST", "/agent-tokens", {"label": "x" * 65}).status == 400
+    assert call(host, s, "POST", "/agent-tokens", {"label": "x" * 64}).status == 200
+    try:
+        host.execute(
+            "INSERT INTO agent_tokens (token_id, member_id, label, digest) VALUES ('atk_1', 'a', $1, repeat('0', 64))",
+            "y" * 65,
+        )
+    except Exception as exc:
+        assert "agent_tokens_label_len" in str(exc)
+    else:
+        raise AssertionError("the database accepted a 65 character label")
+
+
+def test_last_used_is_gated_in_memory(host: Host) -> None:
+    s = sign_in(host)
+    minted = mint(host, s)
+    agent = Agent(host, minted["token"])
+    assert agent.rpc("ping").status == 200
+    assert host.rows("SELECT last_used_at FROM agent_tokens")[0]["last_used_at"] is not None
+    host.execute("UPDATE agent_tokens SET last_used_at = NULL")
+    assert agent.rpc("ping").status == 200  # within the minute: no write at all
+    assert host.rows("SELECT last_used_at FROM agent_tokens")[0]["last_used_at"] is None
+
+
+def test_the_aggregate_rate_limit_is_per_member_across_tokens(host: Host) -> None:
+    s = sign_in(host)
+    one, two = Agent(host, mint(host, s)["token"]), Agent(host, mint(host, s)["token"])
+    host.surface.mcp.per_member.limit = 6
+    statuses = [(one if i % 2 else two).rpc("ping").status for i in range(10)]
+    assert statuses[0] == 200 and statuses.count(429) >= 3
+    other = Agent(host, mint(host, sign_in(host, "bob"))["token"])
+    assert other.rpc("ping").status == 200
+
+
+def test_mcp_public_hosts_are_accepted_for_the_endpoint_only(migrated_dsn, tmp_path) -> None:
+    over = {"public_host": "share.example", "mcp_public_hosts": ("mcp.example",)}
+    with running_host(migrated_dsn, tmp_path, over) as host:
+        s = sign_in_on(host, "share.example")
+        token = call(
+            host, s, "POST", "/agent-tokens", {"label": "x"}, headers=on("share.example")
+        ).json()["token"]
+        for good in ("share.example", "mcp.example"):
+            r = Agent(host, token, headers=on(good)).rpc("ping")
+            assert r.status == 200, good
+        for bad in ("evil.example", "mcp.example.evil.example"):
+            assert Agent(host, token, headers=on(bad)).rpc("ping").status == 404, bad
+        # the extra host serves nothing else
+        assert host.request("GET", "/api/member/me", {**on("mcp.example")}).status == 404
+        assert host.request("GET", "/s/abc/", on("mcp.example")).status == 404
+
+
+def on(hostname: str) -> dict[str, str]:
+    return {"Host": hostname}
+
+
+def sign_in_on(host: Host, hostname: str, user: str = "alice") -> str:
+    r = host.request(
+        "POST",
+        "/api/member/session",
+        {
+            **ORIGIN,
+            "Host": hostname,
+            "Authorization": f"Bearer {access(user, groups=('local.dev',))}",
+            "X-Id-Token": ident(user, email=f"{user}@lab.example", nonce=f"n-{user}"),
+            "X-Nonce": f"n-{user}",
+        },
+        b"",
+    )
+    assert r.status == 200, r.body
+    return r.json()["session"]

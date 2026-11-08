@@ -78,7 +78,7 @@ async function open(id) {
   for (const l of links.links) {
     const li = el("li");
     li.append(el("span", l.audience + " " + l.status, "grow"));
-    if (l.state === "pending") { const b = el("button", "Approve"); b.onclick = async () => { await api("POST", "/artifacts/" + id + "/shares/" + l.share_id + "/approve", { confirm: true }); open(id); }; li.append(b); }
+    if (l.state === "pending") { const b = el("button", "Approve"); b.onclick = async () => { const r = await api("POST", "/artifacts/" + id + "/shares/" + l.share_id + "/approve", { confirm: true }); if (r.url) say("Link (shown once): " + r.url); open(id); }; li.append(b); }
     if (l.state !== "revoked") { const b = el("button", "Revoke"); b.onclick = async () => { await api("POST", "/artifacts/" + id + "/shares/" + l.share_id + "/revoke"); open(id); }; li.append(b); }
     ul.append(li);
   }

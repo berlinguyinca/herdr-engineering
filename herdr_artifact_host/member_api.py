@@ -272,8 +272,13 @@ class MemberService:
         self.content_streams = asyncio.Semaphore(limits.content_streams)
         self._staging = blobs.tmp_dir / "up"
         self.tokens = AgentTokenStore(pool)
+        self._idem_locks: dict[str, asyncio.Lock] = {}
 
     # -- identity
+
+    @staticmethod
+    def _agent(actor: Actor) -> bool:
+        return actor.kind is ActorKind.AGENT
 
     @staticmethod
     def _member(actor: Actor) -> str:
@@ -585,6 +590,7 @@ class MemberService:
                 filename=filename,
                 artifact_type=profile,
                 intake=intake,
+                created_via="agent" if actor.kind is ActorKind.AGENT else "web",
                 conn=conn,
             )
             if idempotency_key is not None:
@@ -618,11 +624,16 @@ class MemberService:
         artifact_id: str,
         *,
         lock: bool = False,
+        agent: bool = False,
     ):
+        """The member's own live artifact, else the uniform not_found.  ``agent=True`` (an agent token acting) narrows it
+        to artifacts that were created through an agent token: an agent never mutates what the member made on the web."""
         row = await conn.fetchrow(
             "SELECT artifact_id, size_bytes, current_version_id, intake, lifecycle FROM artifacts "
             "WHERE artifact_id=$1 AND owner=$2 AND lifecycle NOT IN ('retracted','tombstoned') "
-            "AND intake IN ('accepted','pending')" + (" FOR UPDATE" if lock else ""),
+            "AND intake IN ('accepted','pending')"
+            + (" AND created_via='agent'" if agent else "")
+            + (" FOR UPDATE" if lock else ""),
             artifact_id,
             member,
         )
@@ -637,7 +648,7 @@ class MemberService:
         self._throttle_write(member)
         async with self.pool.acquire() as conn, conn.transaction():
             await self._lock_usage(conn, member)
-            row = await self._owned(conn, member, artifact_id, lock=True)
+            row = await self._owned(conn, member, artifact_id, lock=True, agent=self._agent(actor))
             await conn.execute(
                 "UPDATE artifacts SET lifecycle='retracted', updated_at=now() WHERE artifact_id=$1",
                 artifact_id,
@@ -854,7 +865,8 @@ class MemberService:
         """Stage one run.  ``spool(path)`` streams the request body into ``path`` and returns its sha256; it runs under
         ``body_deadline_seconds`` and a per-member slot, after the staging caps were checked from the headers."""
         member = self._member(actor)
-        await self._owned(self.pool, member, artifact_id)
+        agent = self._agent(actor)
+        await self._owned(self.pool, member, artifact_id, agent=agent)
         name, size, file_sha = self._file_args(name, size, file_sha)
         if self.upload_id_for(member, artifact_id, name, file_sha, size) != upload_id:
             raise _bad("upload_id does not match the headers")
@@ -882,7 +894,7 @@ class MemberService:
                 await asyncio.to_thread(scratch.mkdir, parents=True)
                 # delete/discard drop the staging after retracting the artifact, so look again now that the directory
                 # exists: a retracted artifact must not get one back
-                await self._owned(self.pool, member, artifact_id)
+                await self._owned(self.pool, member, artifact_id, agent=agent)
                 body = scratch / "body"
                 try:
                     got = await asyncio.wait_for(spool(body), self.limits.body_deadline_seconds)
@@ -896,7 +908,7 @@ class MemberService:
                     await asyncio.to_thread(self._store_run, folder, scratch, size, first)
                 except FileNotFoundError:
                     raise _not_found() from None
-                await self._owned(self.pool, member, artifact_id)
+                await self._owned(self.pool, member, artifact_id, agent=agent)
         except MemberError as exc:
             if exc.code == "not_found":
                 await self._drop_staging(member, artifact_id)
@@ -954,7 +966,7 @@ class MemberService:
         self, actor: Actor, artifact_id: str, name: object, size: object, file_sha: object
     ) -> dict[str, Any]:
         member = self._member(actor)
-        await self._owned(self.pool, member, artifact_id)
+        await self._owned(self.pool, member, artifact_id, agent=self._agent(actor))
         name_n, size_n, sha_n = self._file_args(name, size, file_sha)
         upload_id = self.upload_id_for(member, artifact_id, name_n, sha_n, size_n)
         return await self._status(self._dir(member, artifact_id, upload_id), size_n, upload_id)
@@ -970,7 +982,7 @@ class MemberService:
     ) -> dict[str, Any]:
         """Drop one staged upload.  The caller names the file; the id is re-derived from it and must match."""
         member = self._member(actor)
-        await self._owned(self.pool, member, artifact_id)
+        await self._owned(self.pool, member, artifact_id, agent=self._agent(actor))
         if not UPLOAD_ID_RE.fullmatch(upload_id):
             raise _bad()
         name_n, size_n, sha_n = self._file_args(name, size, file_sha)
@@ -1019,6 +1031,56 @@ class MemberService:
             )
         return stored
 
+    async def _idempotent(
+        self,
+        member: str,
+        scope: str,
+        key: object,
+        request: object,
+        artifact_id: str,
+        run: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Run ``run`` once per (member, scope, artifact, key): a retry with the same request gets the first answer, the
+        same key with another request is a 409.  Calls of one member that carry a key are serialised."""
+        if key is None:
+            return await run()
+        if not isinstance(key, str) or not _IDEMPOTENCY.fullmatch(key):
+            raise _bad("idempotency_key is invalid")
+        # the spaces cannot occur in a validated create key, so these never collide with artifact_create's keys
+        full = f"{scope} {artifact_id} {key}"
+        digest = hashlib.sha256(
+            json.dumps(request, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        lock = self._idem_locks.setdefault(member, asyncio.Lock())
+        async with lock:
+            prior = await self.pool.fetchrow(
+                "SELECT request_hash, result::text AS result FROM artifact_member_creates "
+                "WHERE member_id=$1 AND idempotency_key=$2",
+                member,
+                full,
+            )
+            if prior is not None:
+                if prior["request_hash"] != digest:
+                    raise MemberError(
+                        409, "conflict", "idempotency_key was used with other arguments"
+                    )
+                if prior["result"] is not None:
+                    return json.loads(prior["result"])
+            out = await run()
+            await self.pool.execute(
+                "INSERT INTO artifact_member_creates (member_id, idempotency_key, request_hash, artifact_id, result) "
+                "VALUES ($1,$2,$3,$4,$5::jsonb) ON CONFLICT DO NOTHING",
+                member,
+                full,
+                digest,
+                artifact_id,
+                json.dumps({k: v for k, v in out.items() if k not in ("token", "url")}),
+            )
+        if len(self._idem_locks) > 1024:
+            for k in [k for k, v in self._idem_locks.items() if not v.locked()]:
+                del self._idem_locks[k]
+        return out
+
     async def publish(
         self,
         actor: Actor,
@@ -1028,8 +1090,36 @@ class MemberService:
         files: object,
         message: object,
         entry: object,
+        idempotency_key: object = None,
     ) -> dict[str, Any]:
         """Publish the complete file set of the next version.  Blob store first, then every row in one transaction."""
+        member = self._member(actor)
+        return await self._idempotent(
+            member,
+            "publish",
+            idempotency_key,
+            [base_version_id, files, message, entry],
+            artifact_id,
+            lambda: self._publish_once(
+                actor,
+                artifact_id,
+                base_version_id=base_version_id,
+                files=files,
+                message=message,
+                entry=entry,
+            ),
+        )
+
+    async def _publish_once(
+        self,
+        actor: Actor,
+        artifact_id: str,
+        *,
+        base_version_id: object,
+        files: object,
+        message: object,
+        entry: object,
+    ) -> dict[str, Any]:
         member = self._member(actor)
         if not isinstance(files, list) or not 1 <= len(files) <= MAX_FILES:
             raise _bad(f"files must list 1 to {MAX_FILES} files")
@@ -1040,7 +1130,7 @@ class MemberService:
         if entry is not None and not isinstance(entry, str):
             raise _bad()
         self._throttle_write(member)
-        await self._owned(self.pool, member, artifact_id)
+        await self._owned(self.pool, member, artifact_id, agent=self._agent(actor))
         specs: dict[str, tuple[int, str]] = {}
         for f in files:
             if not isinstance(f, dict) or set(f) != {"name", "size_bytes", "file_sha256"}:
@@ -1059,7 +1149,7 @@ class MemberService:
             "SELECT bytes_used, max_member_bytes, max_artifact_bytes FROM member_usage WHERE member_id=$1",
             member,
         )
-        current_row = await self._owned(self.pool, member, artifact_id)
+        current_row = await self._owned(self.pool, member, artifact_id, agent=self._agent(actor))
         self._check_quota(early, int(current_row["size_bytes"]), total)
         # Each publish holds one pooled connection from its first blob lock until the commit (the session-level locks
         # must outlive the blob write), so a global cap keeps publishes from draining the pool.
@@ -1070,7 +1160,14 @@ class MemberService:
         self._publishing += 1
         try:
             return await self._publish_locked(
-                member, artifact_id, specs, total, base_version_id, message, chosen
+                member,
+                artifact_id,
+                specs,
+                total,
+                base_version_id,
+                message,
+                chosen,
+                agent=self._agent(actor),
             )
         finally:
             self._publishing -= 1
@@ -1084,6 +1181,8 @@ class MemberService:
         base_version_id: object,
         message: object,
         chosen: str | None,
+        *,
+        agent: bool = False,
     ) -> dict[str, Any]:
         version_id = "ver_" + secrets.token_hex(12)
         shas = sorted({sha for _, sha in specs.values()})
@@ -1119,7 +1218,7 @@ class MemberService:
                     )
                 async with conn.transaction():
                     usage = await self._lock_usage(conn, member)
-                    row = await self._owned(conn, member, artifact_id, lock=True)
+                    row = await self._owned(conn, member, artifact_id, lock=True, agent=agent)
                     current = row["current_version_id"]
                     if (base_version_id or None) != current:
                         raise MemberError(409, "stale_base", "the artifact has a newer version")
@@ -1198,6 +1297,21 @@ class MemberService:
         self, actor: Actor, artifact_id: str, body: dict[str, Any]
     ) -> dict[str, Any]:
         member = self._member(actor)
+        request = {k: v for k, v in body.items() if k != "idempotency_key"}
+        return await self._idempotent(
+            member,
+            "share",
+            body.get("idempotency_key"),
+            request,
+            artifact_id,
+            lambda: self._share_create_once(actor, artifact_id, request),
+        )
+
+    async def _share_create_once(
+        self, actor: Actor, artifact_id: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        member = self._member(actor)
+        agent = self._agent(actor)
         version_id, audience = body["version_id"], body["audience"]
         if not isinstance(version_id, str) or not _ARTIFACT.fullmatch(version_id):
             raise _bad("version_id is invalid")
@@ -1226,7 +1340,7 @@ class MemberService:
             usage = await self._lock_usage(conn, member)
             if usage["sharing_disabled"]:
                 raise MemberError(403, "sharing_disabled", "sharing is disabled for this account")
-            await self._owned(conn, member, artifact_id, lock=True)
+            await self._owned(conn, member, artifact_id, lock=True, agent=agent)
             art = await conn.fetchrow(
                 "SELECT intake, lifecycle FROM artifacts WHERE artifact_id=$1", artifact_id
             )
@@ -1256,13 +1370,15 @@ class MemberService:
                 )
             await conn.execute(
                 "INSERT INTO shares (share_id, artifact_id, version_id, audience, token_hash, allow_emails, "
-                "allow_groups, state, entry, file_count, total_bytes, title, expires_at, created_by) "
-                "VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,$12,$13)",
+                "allow_groups, state, entry, file_count, total_bytes, title, expires_at, created_by, created_via) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,$12,$13,$14)",
                 share_id,
                 artifact_id,
                 version_id,
                 audience,
-                token_digest(token),
+                None
+                if agent
+                else token_digest(token),  # an agent's link gets its token when the owner approves
                 emails,
                 groups,
                 entry,
@@ -1271,6 +1387,7 @@ class MemberService:
                 (title or None),
                 expires,
                 member,
+                "agent" if agent else "web",
             )
             await conn.execute(
                 "INSERT INTO share_events (share_id, kind, actor, detail) VALUES ($1,'created',$2,$3::jsonb)",
@@ -1279,6 +1396,14 @@ class MemberService:
                 json.dumps({"audience": audience}),
             )
         await self._audit(member, "share_create", "ok", None, share_id, audience)
+        if agent:  # the agent never holds the link: the owner gets it, once, when approving
+            return {
+                "share_id": share_id,
+                "state": "pending",
+                "audience": audience,
+                "expires_at": iso(expires),
+                "title": title or None,
+            }
         # the one and only place the token is shown; only its digest is stored
         base = self.public_origin or ""
         return {
@@ -1310,12 +1435,20 @@ class MemberService:
         return out
 
     async def _owned_share(
-        self, conn: asyncpg.Connection, member: str, artifact_id: str, share_id: str
+        self,
+        conn: asyncpg.Connection,
+        member: str,
+        artifact_id: str,
+        share_id: str,
+        *,
+        agent: bool = False,
     ):
         row = await conn.fetchrow(
-            "SELECT s.share_id, s.state, s.audience, s.expires_at FROM shares s JOIN artifacts a "
+            "SELECT s.share_id, s.state, s.audience, s.expires_at, s.created_via FROM shares s JOIN artifacts a "
             "ON a.artifact_id=s.artifact_id WHERE s.share_id=$1 AND s.artifact_id=$2 AND a.owner=$3 "
-            "AND a.lifecycle NOT IN ('retracted','tombstoned') FOR UPDATE OF s",
+            "AND a.lifecycle NOT IN ('retracted','tombstoned')"
+            + (" AND s.created_via='agent' AND a.created_via='agent'" if agent else "")
+            + " FOR UPDATE OF s",
             share_id,
             artifact_id,
             member,
@@ -1364,10 +1497,14 @@ class MemberService:
                 raise MemberError(409, "not_pending", "the share link is not pending")
             if row["expires_at"] is not None and row["expires_at"] <= now_dt(self.now):
                 raise MemberError(409, "expired", "the share link has expired")
+            # an agent's link has no token yet: it is made here and shown to the owner once (only its digest is kept)
+            token = secrets.token_urlsafe(32) if row["created_via"] == "agent" else None
             await conn.execute(
-                "UPDATE shares SET state='live', approved_by=$2, approved_at=now() WHERE share_id=$1",
+                "UPDATE shares SET state='live', approved_by=$2, approved_at=now(), "
+                "token_hash=coalesce($3, token_hash) WHERE share_id=$1",
                 share_id,
                 member,
+                token_digest(token) if token else None,
             )
             await conn.execute(
                 "INSERT INTO share_events (share_id, kind, actor, detail) VALUES ($1,'approved',$2,$3::jsonb)",
@@ -1376,13 +1513,22 @@ class MemberService:
                 json.dumps({"idempotency_key": idempotency_key} if idempotency_key else {}),
             )
         await self._audit(member, "share_approve", "ok", None, share_id, row["audience"])
+        if token:
+            return {
+                "share_id": share_id,
+                "state": "live",
+                "token": token,
+                "url": f"{self.public_origin or ''}/s/{token}/",
+            }
         return {"share_id": share_id, "state": "live"}
 
     async def share_revoke(self, actor: Actor, artifact_id: str, share_id: str) -> dict[str, Any]:
         member = self._member(actor)
         self._throttle_write(member)
         async with self.pool.acquire() as conn, conn.transaction():
-            row = await self._owned_share(conn, member, artifact_id, share_id)
+            row = await self._owned_share(
+                conn, member, artifact_id, share_id, agent=self._agent(actor)
+            )
             if row["state"] != "revoked":
                 await conn.execute(
                     "UPDATE shares SET state='revoked', revoked_at=now() WHERE share_id=$1",

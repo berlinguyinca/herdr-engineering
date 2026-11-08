@@ -66,7 +66,7 @@ from .blobs import BlobAborted, BlobCorrupt, BlobMissing, BlobStore, InvalidSha
 from .cognito import CognitoAuthenticator, SyncedDirectory
 from .https_origin import https_origin
 from .library import LibraryError, LibraryStore, Viewer
-from .mcp import McpSurface
+from .mcp import MCP_PATH, McpSurface
 from .member_api import MemberLimits, MemberService, MemberSurface, build_member_settings
 from .members_config import valid_public_host
 from .share_bundle import content_type_for
@@ -189,6 +189,8 @@ class PublicConfig:
 
     public_url: str | None = None
     public_host: str | None = None  # /s/ is served on this Host only
+    # Further Hosts that may reach ``/mcp/artifacts`` (and nothing else), e.g. a dedicated agent endpoint name.
+    mcp_public_hosts: tuple[str, ...] = ()
     signing_secret: bytes = field(default=b"", repr=False)
     session_seconds: int = 14400
     sync_dir: Path | None = None
@@ -212,6 +214,10 @@ class PublicConfig:
     def __post_init__(self) -> None:
         if self.public_host is not None and not valid_public_host(self.public_host):
             raise ValueError("public_host must be a lowercase DNS name (no scheme, port or path)")
+        if not isinstance(self.mcp_public_hosts, tuple) or not all(
+            isinstance(h, str) and valid_public_host(h) for h in self.mcp_public_hosts
+        ):
+            raise ValueError("mcp_public_hosts must be a tuple of lowercase DNS names")
 
 
 @dataclass(frozen=True)
@@ -604,7 +610,12 @@ class PublicSurface:
         if len(hosts) != 1:
             return False
         host = hosts[0].strip().lower()
-        return host == wanted or host == wanted + ":443"
+        if host == wanted or host == wanted + ":443":
+            return True
+        # the agent endpoint may also answer on its own names, and only that path
+        if request.raw_path.split("?", 1)[0] == MCP_PATH:
+            return any(host == h or host == h + ":443" for h in self.config.mcp_public_hosts)
+        return False
 
     async def route(self, request: web.Request) -> web.StreamResponse:
         if not self.host_ok(request):

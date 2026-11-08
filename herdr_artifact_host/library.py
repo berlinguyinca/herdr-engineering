@@ -285,12 +285,15 @@ class LibraryStore:
         filename: str,
         artifact_type: str = "other",
         intake: str = "accepted",
+        created_via: str = "web",
         conn: asyncpg.Connection | None = None,
     ) -> None:
         """Insert a new artifact owned by the viewer.  A ``pending`` one is counted against ``PENDING_CAP`` atomically
         (advisory lock per owner held until the surrounding transaction ends); pass ``conn`` to join the caller's
         transaction, otherwise one is opened here."""
         owner = _member(viewer).member_id
+        if created_via not in ("web", "agent"):
+            raise LibraryError(400, "invalid_created_via")
         if intake not in ("accepted", "pending"):
             raise LibraryError(400, "invalid_intake")
 
@@ -306,13 +309,14 @@ class LibraryStore:
                     raise PendingCapExceeded
             await c.execute(
                 "INSERT INTO artifacts (artifact_id, owner, created_by, display_name, original_filename, "
-                "artifact_type, intake) VALUES ($1,$2,$2,$3,$4,$5,$6::intake_state)",
+                "artifact_type, intake, created_via) VALUES ($1,$2,$2,$3,$4,$5,$6::intake_state,$7)",
                 artifact_id,
                 owner,
                 display_name,
                 filename,
                 artifact_type,
                 intake,
+                created_via,
             )
 
         if conn is not None:

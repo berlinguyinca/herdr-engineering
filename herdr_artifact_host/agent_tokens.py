@@ -8,10 +8,13 @@ Listing never returns a secret or a digest.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import re
 import secrets
+import time
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Final
 
@@ -23,7 +26,9 @@ TOKEN_PREFIX: Final = "hat_"
 TOKEN_RE: Final = re.compile(r"hat_[A-Za-z0-9_-]{43}")
 TOKEN_ID_RE: Final = re.compile(r"atk_[0-9a-f]{16}")
 MAX_ACTIVE_TOKENS: Final = 10
-MAX_LABEL: Final = 80
+MAX_LABEL: Final = 64
+PRUNE_AFTER_DAYS: Final = 90
+LAST_USED_EVERY: Final = 60.0  # seconds between last_used_at writes for one token
 
 
 class TokenError(Exception):
@@ -43,6 +48,9 @@ def _iso(value: datetime | None) -> str | None:
 class AgentTokenStore:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
+        self._touched: dict[
+            str, float
+        ] = {}  # token_id -> monotonic time of the last last_used_at write
 
     async def mint(self, member: str, label: str) -> dict[str, Any]:
         label = label.strip()
@@ -79,7 +87,7 @@ class AgentTokenStore:
     async def list(self, member: str) -> dict[str, Any]:
         rows = await self._pool.fetch(
             "SELECT token_id, label, created_at, last_used_at, revoked_at FROM agent_tokens "
-            "WHERE member_id=$1 ORDER BY created_at DESC, token_id LIMIT 100",
+            "WHERE member_id=$1 ORDER BY (revoked_at IS NOT NULL), created_at DESC, token_id LIMIT 100",
             member,
         )
         return {
@@ -117,9 +125,46 @@ class AgentTokenStore:
         )
         if row is None or not hmac.compare_digest(row["digest"], want):
             return None
-        await self._pool.execute(
-            "UPDATE agent_tokens SET last_used_at=now() WHERE token_id=$1 "
-            "AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')",
-            row["token_id"],
-        )
+        await self._touch(row["token_id"])
         return row["token_id"], row["member_id"]
+
+    async def _touch(self, token_id: str) -> None:
+        """last_used_at is advisory: at most one write a minute per token, gated in memory (no query on the hot path)."""
+        now = time.monotonic()
+        last = self._touched.get(token_id)
+        if last is not None and now - last < LAST_USED_EVERY:
+            return
+        if len(self._touched) >= 4096:
+            self._touched.clear()
+        self._touched[token_id] = now
+        await self._pool.execute(
+            "UPDATE agent_tokens SET last_used_at=now() WHERE token_id=$1", token_id
+        )
+
+    async def prune(self, older_than_days: int = PRUNE_AFTER_DAYS) -> int:
+        """Delete tokens revoked more than ``older_than_days`` ago (an active token is never deleted)."""
+        done = await self._pool.execute(
+            "DELETE FROM agent_tokens WHERE revoked_at IS NOT NULL "
+            "AND revoked_at < now() - make_interval(days => $1)",
+            older_than_days,
+        )
+        return int(done.rsplit(" ", 1)[-1])
+
+    async def revoke_for_absent_members(self, exists: Callable[[str], bool]) -> int:
+        """Revoke every active token of a member for whom ``exists`` is false (left the group); returns the count."""
+        members = [
+            r["member_id"]
+            for r in await self._pool.fetch(
+                "SELECT DISTINCT member_id FROM agent_tokens WHERE revoked_at IS NULL"
+            )
+        ]
+        total = 0
+        for member in members:
+            if await asyncio.to_thread(exists, member):
+                continue
+            done = await self._pool.execute(
+                "UPDATE agent_tokens SET revoked_at=now() WHERE member_id=$1 AND revoked_at IS NULL",
+                member,
+            )
+            total += int(done.rsplit(" ", 1)[-1])
+        return total
