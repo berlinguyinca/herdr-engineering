@@ -13,6 +13,11 @@
 #   --cmd 'COMMAND' run COMMAND for each task instead of the family's own (task text arrives on stdin)
 #   --no-sandbox    do not run tasks inside bubblewrap (default: boxed whenever bwrap works)
 #   --machine NAME  record NAME (MagicDNS short name) as this machine; only matters for Fabric trust, which the owner still enables
+#   --fabric        join with NO token: this machine must be on the control plane's fabric allow-list and the owner must have
+#                   switched fabric_trust.auto_join on. Needs --name; writes ~/herdr-agents/NAME.json (agent_id, name, machine;
+#                   no credential) and starts nothing. The agent has no room access until a room owner grants it
+#   --name NAME     --fabric only: the agent's name (lowercase letters, digits, dot, hyphen, underscore; up to 64)
+#   --fabric-url U  --fabric only: the control plane's fabric listener (default: the address this script came from)
 #   --status        show the agents in ~/herdr-agents and whether their workers run
 #   --stop          stop the background workers started by this script
 #   --help          this text
@@ -22,7 +27,7 @@ main() {
   set -euo pipefail
   BASE='__HERDR_BASE__'
   DIR="${HERDR_AGENT_DIR:-$HOME/herdr-agents}"
-  COUNT=1; START=0; USE_HERDR=0; TOOLS=0; CMD_OVERRIDE=""; SANDBOX_ON=1; MODE=join; MACHINE=""
+  COUNT=1; START=0; USE_HERDR=0; TOOLS=0; CMD_OVERRIDE=""; SANDBOX_ON=1; MODE=join; MACHINE=""; FABRIC=0; FNAME=""; FURL=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --count) COUNT="${2:?--count needs a number}"; shift 2 ;;
@@ -32,9 +37,12 @@ main() {
       --cmd) CMD_OVERRIDE="${2:?--cmd needs a command}"; shift 2 ;;
       --machine) MACHINE="${2:?--machine needs a name}"; shift 2 ;;
       --no-sandbox) SANDBOX_ON=0; shift ;;
+      --fabric) FABRIC=1; shift ;;
+      --name) FNAME="${2:?--name needs a name}"; shift 2 ;;
+      --fabric-url) FURL="${2:?--fabric-url needs a URL}"; shift 2 ;;
       --status) MODE=status; shift ;;
       --stop) MODE=stop; shift ;;
-      --help|-h) sed -n '2,23p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null || true; echo "usage: curl -fsSL $BASE/api/v1/collab/scripts/join.sh | HERDR_JOIN_TOKEN=... bash -s -- --count N [--start] [--herdr] [--tools]"; return 0 ;;
+      --help|-h) sed -n '2,28p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null || true; echo "usage: curl -fsSL $BASE/api/v1/collab/scripts/join.sh | HERDR_JOIN_TOKEN=... bash -s -- --count N [--start] [--herdr] [--tools]"; return 0 ;;
       *) echo "join.sh: unknown option $1 (try --help)" >&2; return 2 ;;
     esac
   done
@@ -60,6 +68,31 @@ main() {
       rm -f "$p"
     done
     echo "Workers started in herdr panes keep running: close their workspaces in herdr."
+    return 0
+  fi
+
+  if [ "$FABRIC" = 1 ]; then
+    # No token and no credential: the tailnet machine is vouched for by the control plane's own whois on the connection.
+    case "$FNAME" in
+      '') echo "join.sh: --fabric needs --name NAME" >&2; return 2 ;;
+      *[!a-z0-9._-]*|[!a-z0-9]*) echo "join.sh: --name must be lowercase letters, digits, dot, hyphen or underscore, starting with a letter or digit" >&2; return 2 ;;
+    esac
+    [ "${#FNAME}" -le 64 ] || { echo "join.sh: --name is at most 64 characters" >&2; return 2; }
+    mkdir -p "$DIR"; chmod 700 "$DIR"
+    body=$(python3 -c 'import sys,json;d={"name":sys.argv[1]}
+if sys.argv[2]: d["machine"]=sys.argv[2]
+print(json.dumps(d))' "$FNAME" "$MACHINE")
+    resp=$(mktemp); code=$(curl -sS -o "$resp" -w '%{http_code}' -X POST "${FURL:-$BASE}/api/v1/collab/agents/fabric-join" -H 'content-type: application/json' -d "$body" </dev/null) || code=000
+    if [ "$code" != 200 ] && [ "$code" != 201 ]; then
+      echo "join.sh: the control plane refused the fabric join (HTTP $code): auto_join is off, this machine is not allow-listed, or you reached the wrong listener (--fabric-url)." >&2; rm -f "$resp"; return 1
+    fi
+    python3 -c 'import sys,json,re
+d=json.load(open(sys.argv[1]))
+out={k:d.get(k) for k in ("agent_id","name","machine")}
+if not isinstance(out["agent_id"],str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}",out["agent_id"]): sys.exit("join.sh: unexpected agent id from the server")
+print(json.dumps(out))' "$resp" > "$DIR/.$FNAME.json.new" || { rm -f "$resp" "$DIR/.$FNAME.json.new"; return 1; }
+    rm -f "$resp"; chmod 600 "$DIR/.$FNAME.json.new"; mv -f "$DIR/.$FNAME.json.new" "$DIR/$FNAME.json"
+    echo "joined $FNAME (identity in $DIR/$FNAME.json); it has no room access until a room owner grants it"
     return 0
   fi
 
