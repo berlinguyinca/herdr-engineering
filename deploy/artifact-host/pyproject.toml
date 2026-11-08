@@ -1,0 +1,21 @@
+# The artifact host's own manifest (the host ships only in deploy/artifact-host/Dockerfile,
+# never in the control-plane wheel). Keep version in step with herdr_artifact_host.__version__.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "herdr-artifact-host"
+version = "0.1.0"
+description = "Standalone Herdr artifact host"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+herdr-artifact-host = "herdr_artifact_host.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["herdr_artifact_host*"]
+
+[tool.setuptools.package-data]
+herdr_artifact_host = ["share_static/*"]

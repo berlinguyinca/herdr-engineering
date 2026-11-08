@@ -20,7 +20,6 @@ federation = ["cryptography>=42"]   # Ed25519 request/export signing (ADR-0008 P
 [project.scripts]
 herdr-eng = "herdr_engineering.cli:main"
 herdr-plannotator = "herdr_engineering.plannotator:main"
-herdr-artifact-host = "herdr_artifact_host.cli:main"
 
 [tool.ruff]
 line-length = 100
@@ -34,10 +33,14 @@ select = ["E", "F", "W", "I", "UP"]
 extend-ignore = ["E501", "E702"]
 
 [tool.setuptools.packages.find]
-include = ["herdr_engineering*", "herdr_artifact_host*"]
+include = ["herdr_engineering*"]
+# herdr_artifact_host is deliberately NOT part of this wheel: it ships only in its own
+# image (deploy/artifact-host), with its own manifest.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# herdr_artifact_host is not in the installed wheel; resolve it from the checkout.
+pythonpath = ["."]
 # Import test modules by file path (not basename) so nested packages like
 # tests/control_plane/ can share a basename with top-level tests (e.g.
 # test_artifacts.py) without an ``import file mismatch`` collection error.
@@ -51,7 +54,6 @@ markers = [
 
 
 [tool.setuptools.package-data]
-herdr_artifact_host = ["share_static/*"]
 herdr_engineering = ["control_plane/rakazo_defaults.json", "*.mjs", "skill_data/summary/*.md", "skill_data/summary/adapters/*.md",
                      "skill_data/handoff/*.md", "skill_data/handoff/adapters/*.md",
                      "control_plane/share_static/*.html", "control_plane/share_static/*.js",

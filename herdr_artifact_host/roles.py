@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from types import MappingProxyType
 
 
 class Role(StrEnum):
@@ -12,10 +13,12 @@ class Role(StrEnum):
 
 # Route tables are disjoint by construction; later tasks extend them. Internal
 # routes must never be reachable on the public listener.
-_ROUTES: dict[Role, frozenset[str]] = {
-    Role.PUBLIC: frozenset({"GET /healthz"}),
-    Role.INTERNAL: frozenset({"GET /internal/healthz"}),
-}
+_ROUTES: MappingProxyType[Role, frozenset[str]] = MappingProxyType(
+    {
+        Role.PUBLIC: frozenset({"GET /healthz"}),
+        Role.INTERNAL: frozenset({"GET /internal/healthz"}),
+    }
+)
 
 
 def routes_for(role: Role) -> frozenset[str]:
