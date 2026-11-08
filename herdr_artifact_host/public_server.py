@@ -7,6 +7,13 @@ Ported from the control plane's ``share_public.py``, whose security contract car
   sessions and CSRF values are never logged or put in an event.
 * The request target is checked exactly as before (length, printable ASCII, strict percent-escapes, one decode per
   segment, no dot segments). The token is looked up by its sha256 digest.
+* HTML over ``MODE_SWITCH_MAX_BYTES`` (2 MiB) cannot be labelled or get the mode-switch link.  An unlabelled one is
+  streamed untouched, as before; a member-labelled one ("Shared by ...") is the uniform 404, event reason
+  ``html_too_large`` (``share_public.py``: ``if size > MODE_SWITCH_MAX_BYTES: if bar: deny``).
+* ``/healthz`` answers loopback peers only (the compose healthcheck runs inside the container); everyone else gets
+  the uniform 404.
+* A client that half-closes (SHUT_WR) after its request still gets the full response: the handler is not cancelled
+  and the connection closes after that one response.
 * No request body is read except for the lab annotation POSTs; any other request that announces a body is closed.
 * A lab share is decided by its allow-list and is never claimed; a public link is claimed only with its claim cookie, a
   different cookie, key use and format from a lab session and from a member session.
@@ -22,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -318,6 +326,20 @@ def _refused_framing(request: web.Request) -> bool:
     return "Expect" in request.headers or "Content-Encoding" in request.headers
 
 
+def is_loopback_peer(peername: object) -> bool:
+    """True when ``peername`` (``transport.get_extra_info("peername")``) is a loopback address, IPv4, IPv6 or an
+    IPv4-mapped IPv6 one.  Anything else, including an unparseable value, is not loopback."""
+    if not isinstance(peername, tuple) or not peername or not isinstance(peername[0], str):
+        return False
+    try:
+        address = ipaddress.ip_address(peername[0])
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback
+
+
 async def _no_expect(request: web.Request) -> None:
     """The route-level expect handler: does nothing (no ``100 Continue``, no 417); ``handle`` refuses the request."""
     return None
@@ -476,7 +498,11 @@ class PublicSurface:
     # -- entry points
 
     async def healthz(self, request: web.Request) -> web.Response:
-        if _refused_framing(request):
+        """Answered only to loopback peers (the container-local compose healthcheck, ``curl http://127.0.0.1:<port>/
+        healthz`` from inside the container); any other peer gets the uniform 404, so the endpoint is not a public
+        probe of the database."""
+        peer = request.transport.get_extra_info("peername") if request.transport is not None else None
+        if _refused_framing(request) or not is_loopback_peer(peer):
             return not_found()
         try:
             await self.pool.fetchval("SELECT 1")
@@ -975,8 +1001,8 @@ class PublicSurface:
         bar = shared_by_bar(state["shared_by"]) if is_html else b""
         if is_html and (bar or mode_switch is not None or landing):
             if size > MODE_SWITCH_MAX_BYTES:
-                if bar:  # a labelled page is never served unlabelled
-                    return await self.deny("banner_unavailable", share_id, actor)
+                if bar:  # a labelled page is never served unlabelled; over the limit it cannot be labelled
+                    return await self.deny("html_too_large", share_id, actor)
             else:
                 await self.ensure_full(handle, item, hashed)  # the modified body is a whole-body serve
                 hashed = True
@@ -1633,6 +1659,18 @@ class _UniformHandler(RequestHandler):
     ) -> web.StreamResponse:
         _log("denied", "protocol_error")
         return not_found()
+
+    def eof_received(self) -> bool | None:
+        """The client half-closed its side.  aiohttp's default lets asyncio close the whole transport, which loses the
+        response of any request still being answered (every known-share request awaits the database).  Keep the write
+        side open for the one in-flight response and close after it; an idle connection just closes."""
+        if self._current_request is None and not self._messages:
+            return None  # nothing in flight: asyncio closes the transport
+        request = self._current_request
+        if request is not None and not request.content.is_eof():
+            return None  # a request body that will never complete: drop the connection, write nothing
+        self.close()  # stop after the in-flight response (the handler task itself is not cancelled)
+        return True
 
 
 class _UniformServer(web.Server):

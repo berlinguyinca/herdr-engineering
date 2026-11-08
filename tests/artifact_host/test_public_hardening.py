@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import http.client
+import json
 import os
 import socket
 import threading
@@ -106,7 +108,9 @@ def test_any_request_content_encoding_is_the_uniform_404(host: Host, encoding: s
         wire = strip_date(
             raw_exchange(
                 host,
-                b"GET " + path.encode() + b" HTTP/1.1\r\nHost: x\r\nContent-Encoding: "
+                b"GET "
+                + path.encode()
+                + b" HTTP/1.1\r\nHost: x\r\nContent-Encoding: "
                 + encoding.encode()
                 + b"\r\n\r\n",
             )
@@ -120,7 +124,9 @@ def test_the_server_never_inflates_request_bodies(host: Host) -> None:
     if not _reset_peak():
         pytest.skip("cannot reset the peak RSS counter")
     comp = zlib.compressobj(9)
-    bomb = b"".join(comp.compress(bytes(1 << 20)) for _ in range(400)) + comp.flush()  # 400 MiB inflated
+    bomb = (
+        b"".join(comp.compress(bytes(1 << 20)) for _ in range(400)) + comp.flush()
+    )  # 400 MiB inflated
     assert len(bomb) < 2 << 20
     _reset_peak()
     before = _peak_rss_kib()
@@ -207,7 +213,9 @@ def test_a_blob_corrupted_after_caching_is_still_detected(host: Host) -> None:
     assert host.get(url, {"Range": "bytes=0-0"}).status == 206  # cached
     path = blob_path(host, data)
     st = path.stat()
-    with path.open("r+b") as fh:  # same size, then restore the mtime: only the inode change time betrays it
+    with path.open(
+        "r+b"
+    ) as fh:  # same size, then restore the mtime: only the inode change time betrays it
         fh.seek(7)
         fh.write(b"\xff\xfe")
     os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
@@ -334,11 +342,15 @@ def test_a_refused_claim_is_not_remembered_and_logs_no_event(host: Host) -> None
     def run(claim: Claim) -> None:
         asyncio.run_coroutine_threadsafe(surface._claimed(s.share_id, claim), loop).result(10)
 
-    run(Claim(identity="", email="a@b.example", session="sess-1"))  # the library refuses an empty member
+    run(
+        Claim(identity="", email="a@b.example", session="sess-1")
+    )  # the library refuses an empty member
     assert surface._claims_seen == set()
     assert host.events(s.share_id, "claimed") == []
     assert host.rows("SELECT 1 FROM share_claims WHERE share_id=$1", s.share_id) == []
-    run(Claim(identity="alice", email="a@b.example", session="sess-1"))  # the same session, now valid
+    run(
+        Claim(identity="alice", email="a@b.example", session="sess-1")
+    )  # the same session, now valid
     assert len(host.events(s.share_id, "claimed")) == 1
     assert len(host.rows("SELECT 1 FROM share_claims WHERE share_id=$1", s.share_id)) == 1
 
@@ -386,7 +398,12 @@ def test_a_cancelled_stream_is_not_swallowed(migrated_dsn: str, tmp_path: Path) 
                 handle = big.open("rb")
                 try:
                     resp = await surface.stream(
-                        request, 200, [("Content-Type", "application/octet-stream")], handle, 0, 512 << 20
+                        request,
+                        200,
+                        [("Content-Type", "application/octet-stream")],
+                        handle,
+                        0,
+                        512 << 20,
                     )
                     outcome["result"] = "completed"
                     return resp
@@ -399,7 +416,9 @@ def test_a_cancelled_stream_is_not_swallowed(migrated_dsn: str, tmp_path: Path) 
 
             inner = web.Application()
             inner.router.add_get("/big", route)
-            runner = web.AppRunner(inner, handler_cancellation=True, access_log=None, handle_signals=False)
+            runner = web.AppRunner(
+                inner, handler_cancellation=True, access_log=None, handle_signals=False
+            )
             await runner.setup()
             site = web.TCPSite(runner, "127.0.0.1", 0)
             await site.start()
@@ -409,7 +428,9 @@ def test_a_cancelled_stream_is_not_swallowed(migrated_dsn: str, tmp_path: Path) 
             await writer.drain()
             await reader.read(1024)
             sock = writer.get_extra_info("socket")
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+            sock.setsockopt(
+                socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00"
+            )
             writer.close()
             await asyncio.wait_for(done.wait(), 20)
             await runner.cleanup()
@@ -418,3 +439,164 @@ def test_a_cancelled_stream_is_not_swallowed(migrated_dsn: str, tmp_path: Path) 
 
     asyncio.run(go())
     assert outcome["result"] == "cancelled"
+
+
+# ----------------------------------------------------------------------------- M6: /healthz is loopback only
+
+
+def lan_address() -> str | None:
+    """A local non-loopback IPv4 address, or None on a machine that only has loopback."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        try:
+            probe.connect(("192.0.2.1", 9))  # no packet is sent
+            addr = probe.getsockname()[0]
+        except OSError:
+            return None
+    return None if addr.startswith("127.") else addr
+
+
+@pytest.mark.parametrize(
+    ("peer", "expected"),
+    [
+        (("127.0.0.1", 5000), True),
+        (("127.9.9.9", 5000), True),
+        (("::1", 5000, 0, 0), True),
+        (("::ffff:127.0.0.1", 5000, 0, 0), True),
+        (("10.0.0.5", 5000), False),
+        (("192.168.1.2", 5000), False),
+        (("::ffff:10.0.0.5", 5000, 0, 0), False),
+        (("2001:db8::1", 5000, 0, 0), False),
+        (("not an address", 5000), False),
+        (None, False),
+        ("/run/some.sock", False),
+    ],
+)
+def test_healthz_peer_check(peer: object, expected: bool) -> None:
+    assert public_server.is_loopback_peer(peer) is expected
+
+
+def test_healthz_answers_loopback_peers(host: Host) -> None:
+    r = host.get("/healthz")
+    assert r.status == 200 and r.body == b"ok\n"
+
+
+def test_healthz_is_the_uniform_404_to_a_non_loopback_peer(
+    migrated_dsn: str, tmp_path: Path
+) -> None:
+    addr = lan_address()
+    if addr is None:
+        pytest.skip("no non-loopback address on this machine")
+    from herdr_artifact_host.share_http import DEFAULT_STATIC_DIR
+
+    sync = make_sync_dir(tmp_path / "sync")
+    wide = Host(migrated_dsn, tmp_path / "blobs", DEFAULT_STATIC_DIR, sync, bind="0.0.0.0")
+    wide.start(default_config(DEFAULT_STATIC_DIR, sync))
+    try:
+        local = wide.get("/healthz")
+        assert local.status == 200  # reached over 127.0.0.1: a loopback peer
+        ref = wide.get("/nothing").shape()
+        conn = http.client.HTTPConnection(addr, wide.port, timeout=10, source_address=(addr, 0))
+        try:
+            conn.request("GET", "/healthz", headers={"Host": "x"})
+            r = conn.getresponse()
+            body = r.read()
+            assert r.status == 404 and body == ref[2]
+        finally:
+            conn.close()
+    finally:
+        wide.stop()
+
+
+# ----------------------------------------------------------------------------- M7: half-close must not lose the response
+
+
+def half_closed(host: Host, payload: bytes) -> bytes:
+    with socket.create_connection(("127.0.0.1", host.port), timeout=10) as sock:
+        sock.sendall(payload)
+        sock.shutdown(socket.SHUT_WR)
+        chunks = []
+        while data := sock.recv(65536):
+            chunks.append(data)
+    return b"".join(chunks)
+
+
+def test_half_closed_clients_still_get_full_answers_for_known_shares(host: Host) -> None:
+    s = host.seed_share()
+    gone = host.seed_share(state="revoked")
+    cases = {
+        "file": (
+            f"GET /s/{s.token}/f/notes.txt HTTP/1.1\r\nHost: x\r\n\r\n",
+            b"200 OK",
+            b"plain notes",
+        ),
+        "injected html": (
+            f"GET /s/{s.token}/f/index.html HTTP/1.1\r\nHost: x\r\n\r\n",
+            b"200 OK",
+            b"hello",
+        ),
+        "range": (
+            f"GET /s/{s.token}/f/notes.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=0-4\r\n\r\n",
+            b"206 Partial Content",
+            b"plain",
+        ),
+        "head": (f"HEAD /s/{s.token}/f/notes.txt HTTP/1.1\r\nHost: x\r\n\r\n", b"200 OK", b""),
+        "revoked share": (
+            f"GET /s/{gone.token}/f/notes.txt HTTP/1.1\r\nHost: x\r\n\r\n",
+            b"404 Not Found",
+            b"Not found\n",
+        ),
+        "missing file": (
+            f"GET /s/{s.token}/f/ghost HTTP/1.1\r\nHost: x\r\n\r\n",
+            b"404 Not Found",
+            b"Not found\n",
+        ),
+        "healthz": ("GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n", b"200 OK", b"ok\n"),
+        "protocol error": (
+            f"GET /s/{s.token}/f/notes.txt HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            b"404 Not Found",
+            b"Not found\n",
+        ),
+    }
+    for name, (request, status, tail) in cases.items():
+        out = half_closed(host, request.encode())
+        assert out.split(b"\r\n", 1)[0].endswith(status), (name, out[:120])
+        assert tail in out.split(b"\r\n\r\n", 1)[1] if tail else True, name
+        assert out.count(b"HTTP/1.") == 1, name
+
+
+def test_half_closed_lab_post_is_answered_and_written(host: Host) -> None:
+    s = lab(host)
+    a = Session(host, s)
+    body = json.dumps(
+        {"anchor": {"kind": "document", "file": "index.html"}, "comment": "half"}
+    ).encode()
+    head = f"POST {a.base} HTTP/1.1\r\nHost: x\r\n" + "".join(
+        f"{k}: {v}\r\n" for k, v in a.headers().items()
+    )
+    out = half_closed(host, head.encode() + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+    assert out.startswith(b"HTTP/1.1 201 ")
+    assert [r["body"] for r in rows(host, s)] == ["half"]
+
+
+def test_an_idle_half_close_just_closes(host: Host) -> None:
+    with socket.create_connection(("127.0.0.1", host.port), timeout=10) as sock:
+        sock.shutdown(socket.SHUT_WR)
+        assert sock.recv(10) == b""  # closed promptly, not held open until the keep-alive timeout
+
+
+# ----------------------------------------------------------------------------- M8: HTML over the injection limit
+
+
+def test_html_over_the_limit_is_the_uniform_404_with_an_explicit_reason(host: Host) -> None:
+    """Every host share is a member link and so carries the "Shared by" label, exactly as member links did in the
+    control plane (``share_public.py``: ``if size > MODE_SWITCH_MAX_BYTES: if bar: deny``): a labelled page is never
+    served unlabelled, and HTML over 2 MiB cannot be labelled.  The event says why; other types still stream."""
+    big = b"<html><body>" + b"<p>x</p>" * 300_000 + b"</body></html>"
+    assert len(big) > public_server.MODE_SWITCH_MAX_BYTES
+    s = host.seed_share({"index.html": big, "data.bin": big})
+    r = host.get(f"/s/{s.token}/f/index.html")
+    assert r.status == 404 and r.body == b"Not found\n"
+    reasons = [json.loads(e["detail"])["reason"] for e in host.events(s.share_id, "denied")]
+    assert reasons == ["html_too_large"]
+    ok = host.get(f"/s/{s.token}/f/data.bin")
+    assert ok.status == 200 and ok.body == big

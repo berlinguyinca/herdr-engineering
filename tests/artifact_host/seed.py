@@ -148,6 +148,7 @@ class Host:
     static_dir: Path
     sync_dir: Path
     port: int = 0
+    bind: str = "127.0.0.1"
     loop: asyncio.AbstractEventLoop | None = None
     server: PublicServer | None = None
     surface: Any = None
@@ -173,7 +174,7 @@ class Host:
                 )
                 self.surface = app[SURFACE]
                 self.server = PublicServer(app)
-                self.port = await self.server.start()
+                self.port = await self.server.start(self.bind)
 
             try:
                 loop.run_until_complete(boot())
