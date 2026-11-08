@@ -24,6 +24,7 @@ export function fabricAgentLine(a, nowSec = Date.now() / 1000) {
   const state = fabricState(a, nowSec);
   if (!machine && state === 'off') return '';
   const parts = [];
+  if (a.origin === 'fabric_join') parts.push('<b data-fabric-autojoined>auto-joined</b> (no token; revoke to remove)');
   if (machine) parts.push(`machine ${esc(machine)}`);
   if (state === 'active') parts.push(`fabric until ${esc(new Date(a.fabric_expires_at * 1000).toLocaleDateString())}`);
   else if (state === 'expired') parts.push('<b data-fabric-expired>fabric expired</b> (the owner can renew it)');

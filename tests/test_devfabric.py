@@ -34,6 +34,26 @@ def _free_port() -> int:
     return port
 
 
+def _free_port_pair() -> int:
+    """A base port where BOTH base and base+1 are bindable right now (a shared CI host can hold the neighbour)."""
+    import socket
+    for _ in range(200):
+        base = _free_port()
+        held = []
+        try:
+            for port in (base, base + 1):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                held.append(s)
+                s.bind(("127.0.0.1", port))
+        except OSError:
+            continue
+        finally:
+            for s in held:
+                s.close()
+        return base
+    raise RuntimeError("no pair of consecutive free loopback ports")
+
+
 def test_collision_free_port_allocation(tmp_path):
     r = DevServiceRegistry(store_path=tmp_path / "leases.json")
     l1 = r.register(target_machine_id="fry", target_host="127.0.0.1", target_port=8080,
@@ -129,7 +149,7 @@ def test_close(tmp_path):
 def test_port_exhaustion_raises_conflict(tmp_path):
     # Pick a pair of ports the OS has free so the test is hermetic (the
     # allocator skips ports with live OS bindings, e.g. a running gateway).
-    base = _free_port()
+    base = _free_port_pair()
     r = DevServiceRegistry(store_path=tmp_path / "leases.json",
                            port_range=(base, base + 1))
     r.register(target_machine_id="a", target_host="h", target_port=1, owner_process_id="p1")

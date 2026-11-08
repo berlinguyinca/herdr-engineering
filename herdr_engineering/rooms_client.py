@@ -21,6 +21,10 @@ from pathlib import Path
 from urllib.parse import quote, urlencode
 
 from .artifact_shares_client import ShareClient, ShareError, _safe
+from .control_plane.collab_fabric_trust import (
+    JOIN_NAME as _JOIN_NAME,  # one rule, the server's (also the file name)
+)
+from .control_plane.collab_fabric_trust import JOIN_NAME_RULE as _JOIN_NAME_RULE
 
 BASE = "/api/v1/collab"
 TOKEN_ENV = "HERDR_COLLAB_TOKEN"
@@ -59,6 +63,8 @@ ACTIONS = (
     "external-file",
     "external-decide",
     "external-retry",
+    # fabric auto-join (404 on the server until control_plane.collab.fabric_trust.auto_join is true)
+    "join-fabric",
 )
 EXTERNAL_ACTIONS = ("issue-target", "external-list", "external-file", "external-decide", "external-retry")
 
@@ -248,8 +254,87 @@ def _print_request(row):
         print(f"    > {_safe(line, 400)}")
 
 
+def _discover_fabric_url():
+    """``http://<listen_host>:<listen_port>`` of the fabric listener from this host's configuration
+    (``control_plane.collab.fabric_trust``), or None when it is not discoverable here (the listener runs on the control plane's host)."""
+    from .control_plane.collab_fabric_trust import validate_listen_host
+    from .host_config import host_value
+
+    collab = host_value("control_plane.collab")
+    trust = collab.get("fabric_trust") if isinstance(collab, dict) else None
+    if not isinstance(trust, dict):
+        return None
+    port = trust.get("listen_port")
+    try:
+        host = validate_listen_host(trust.get("listen_host"))
+    except ValueError:
+        return None
+    if not isinstance(port, int) or isinstance(port, bool) or not 0 < port < 65536:
+        return None
+    return f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
+
+
+def _fabric_url(explicit):
+    """The route exists ONLY on the dedicated fabric listener, not on the public control-plane URL: an explicit URL wins, then the
+    listener this host's config names, else fail early with the way out."""
+    if explicit:
+        return explicit.rstrip("/")
+    found = _discover_fabric_url()
+    if found:
+        return found
+    raise ValueError(
+        "join-fabric talks to the control plane's fabric listener (a tailnet address), which is not in this host's configuration: "
+        "pass --control-plane http://<listen_host>:<listen_port> (control_plane.collab.fabric_trust)"
+    )
+
+
+def _join_fabric(args):
+    """``rooms join-fabric NAME``: join as a fabric agent with no token (the tailnet machine vouches), then write
+    ``~/herdr-agents/NAME.json`` ($HERDR_AGENT_DIR as join.sh honours) holding ONLY agent_id, name and machine, mode 0600.
+    There is no credential to store, and the file is what ``_agent_identity`` discovers."""
+    name = args.name
+    if not _JOIN_NAME.fullmatch(name):
+        raise ValueError(f"invalid NAME: {_JOIN_NAME_RULE}")
+    client = ShareClient(_fabric_url(args.control_plane))
+    client.headers = {}  # whois on the real TCP peer is the only credential; nothing else is sent
+    body = {"name": name}
+    if args.machine:
+        body["machine"] = args.machine
+    result = client.request(f"{BASE}/agents/fabric-join", body)
+    ident = {k: result.get(k) for k in ("agent_id", "name", "machine")}
+    if not isinstance(ident["agent_id"], str) or not _AGENT_ID.match(ident["agent_id"]):
+        raise ValueError("the control plane returned no usable agent id")
+    folder = Path(os.environ.get("HERDR_AGENT_DIR") or Path.home() / "herdr-agents")
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f"{name}.json"
+    tmp = folder / f".{name}.json.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(ident) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, target)
+    _show(
+        args,
+        result,
+        lambda r: print(
+            f"Joined as {_safe(r.get('agent_id'))} ({_safe(r.get('name'))} on {_safe(r.get('machine'))}); "
+            f"identity written to {target}"
+        ),
+    )
+
+
 def run_command(args):
     action = args.rooms_action
+    if action == "join-fabric":
+        try:
+            _join_fabric(args)
+            return 0
+        except ShareError as error:
+            _err(_message(error))
+            return 1
+        except (OSError, ValueError, RuntimeError) as error:
+            _err(str(error))
+            return 1
     token = os.environ.get(args.token_env)
     as_agent = getattr(args, "as_agent", None)
     agent = None
@@ -784,6 +869,11 @@ def configure_parser(parser):
             help="Environment variable NAME holding your collaboration bearer token, never the token",
         )
         c.add_argument("--json", action="store_true", help="print the server's JSON only")
+        if action == "join-fabric":
+            c.add_argument("name", help="the agent's name on this machine (lowercase, 1-64 characters)")
+            c.add_argument("--machine", help="informational only: the server uses its own whois answer")
+            c.set_defaults(func=run_command)
+            continue
         c.add_argument("room")
         if action in ("attach", "detach", "roles", "assign-role", "clear-role", "role-policy"):
             c.add_argument("team", help="the team id (herdr-eng teams list)")
