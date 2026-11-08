@@ -94,7 +94,7 @@ export function buildShareRequest(form, { allowEntry = true, allowAuthorHtml = f
 export const authorHtmlEligible = state => state.form.audience === 'public' && state.authorHtml?.get(state.form.versionId) === true;
 
 const authorHtmlOption = state => (authorHtmlEligible(state)
-  ? `<div data-share-author-html><label style="display:flex;align-items:center;gap:.5em;min-height:32px"><input type="checkbox" style="flex:none" data-share-field="includeAuthorHtml" aria-describedby="share-author-html-note"${state.form.includeAuthorHtml ? ' checked' : ''}> Include the author's HTML page (Rich view)</label><p class="hd-note" id="share-author-html-note">Anyone with the link can view this page. It is shown without scripts.</p></div>`
+  ? `<div data-share-author-html><label style="display:flex;align-items:center;gap:.5em;min-height:32px"><input type="checkbox" style="flex:none;width:18px;height:18px" data-share-field="includeAuthorHtml" aria-describedby="share-author-html-note"${state.form.includeAuthorHtml ? ' checked' : ''}> Include the author's HTML page (Rich view)</label><p class="hd-note" id="share-author-html-note">Anyone with the link can view this page. It is shown without scripts.</p></div>`
   : '');
 
 export function renderShareForm(state) {
@@ -112,7 +112,7 @@ export function renderShareForm(state) {
     fields = `<label style="display:block">Emails (comma or new line separated)<textarea class="hd-input" rows="2" data-share-field="emails" style="width:100%">${esc(form.emails)}</textarea></label><label style="display:block">Groups (comma or new line separated)<textarea class="hd-input" rows="2" data-share-field="groups" style="width:100%">${esc(form.groups)}</textarea></label><label style="display:block">Expires after (days, optional, 1–${MAX_LAB_DAYS})<input class="hd-input" type="number" inputmode="numeric" data-share-field="labDays" min="1" max="${MAX_LAB_DAYS}" step="1" placeholder="No expiry" value="${esc(form.labDays)}"></label>`;
   }
   const extra = form.audience === 'private' ? '' : `<label style="display:block">Title (optional)<input class="hd-input" data-share-field="title" maxlength="240" value="${esc(form.title)}" style="width:100%"></label>${state.allowEntry ? `<label style="display:block">Entry file (optional)<input class="hd-input" data-share-field="entry" value="${esc(form.entry)}" style="width:100%"></label>` : ''}`;
-  return `<form data-share-form novalidate><div class="hd-inline" style="flex-wrap:wrap"><label>Version<select class="hd-input" data-share-field="versionId">${versionOptions || '<option value="">No ready version</option>'}</select></label><label>Audience<select class="hd-input" data-share-field="audience">${audience}</select></label></div>${fields}${extra}<div class="hd-inline" style="flex-wrap:wrap"><button type="button" class="hd-btn" data-share-action="review"${disabled.review ? ' disabled' : ''}>Review</button><button type="button" class="hd-btn" data-share-action="generate"${disabled.generate ? ' disabled' : ''}>Generate link</button></div></form>`;
+  return `<form data-share-form novalidate><div class="hd-inline" style="flex-wrap:wrap"><label style="display:inline-flex;flex-direction:column;gap:4px">Version<select class="hd-input" data-share-field="versionId">${versionOptions || '<option value="">No ready version</option>'}</select></label><label style="display:inline-flex;flex-direction:column;gap:4px">Audience<select class="hd-input" data-share-field="audience">${audience}</select></label></div>${fields}${extra}<div class="hd-inline" style="flex-wrap:wrap"><button type="button" class="hd-btn" data-share-action="review"${disabled.review ? ' disabled' : ''}>Review</button><button type="button" class="hd-btn" data-share-action="generate"${disabled.generate ? ' disabled' : ''}>Generate link</button></div></form>`;
 }
 
 export function renderSummary(summary) {
@@ -398,7 +398,7 @@ export function createShareController(client, artifactId, { versions = [], headV
 // ------------------------------------------------------------------------------------------------ mount
 
 const TABS = [['links', 'Links'], ['collaborators', 'Collaborators'], ['activity', 'Activity'], ['feedback', 'Feedback']];
-const TAB_BAR = `<div role="tablist" aria-label="Sharing" data-panel-tabs>${TABS.map(([key, label], i) => `<button type="button" role="tab" class="hd-btn" data-panel-tab="${key}" aria-selected="${i === 0}">${label}</button>`).join('')}</div>`;
+const TAB_BAR = `<div role="tablist" aria-label="Sharing" data-panel-tabs style="display:flex;flex-wrap:wrap;gap:6px">${TABS.map(([key, label], i) => `<button type="button" role="tab" class="hd-btn" data-panel-tab="${key}" aria-selected="${i === 0}">${label}</button>`).join('')}</div>`;
 
 // `collabApi` defaults to the same-origin, token-less mode: the dashboard proxy authenticates the call.
 export function mountSharePanel(container, client, artifactId, { versions = [], headVersionId, signal, allowEntry = true, collabApi = new CollabApi(null) } = {}) {
