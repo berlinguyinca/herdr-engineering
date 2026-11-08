@@ -328,3 +328,11 @@ def test_no_preview_ever_gets_allow_same_origin(world):
     for h in (on, off):
         assert h["content-security-policy"].startswith("sandbox allow-scripts allow-downloads;")
         assert "allow-same-origin" not in h["content-security-policy"]
+
+
+def test_toggle_names_the_region_it_controls_and_has_a_visible_focus_style() -> None:
+    from herdr_engineering.control_plane.share_rich_view import _PANEL
+
+    assert 'aria-controls="rich-view-slot"' in _PANEL
+    assert 'id="rich-view-slot" data-rich-slot' in _PANEL
+    assert "[data-rich-view] button:focus-visible{outline:2px solid" in _PANEL

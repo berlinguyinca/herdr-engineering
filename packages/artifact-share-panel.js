@@ -398,11 +398,16 @@ export function createShareController(client, artifactId, { versions = [], headV
 // ------------------------------------------------------------------------------------------------ mount
 
 const TABS = [['links', 'Links'], ['collaborators', 'Collaborators'], ['activity', 'Activity'], ['feedback', 'Feedback']];
-const TAB_BAR = `<div role="tablist" aria-label="Sharing" data-panel-tabs>${TABS.map(([key, label], i) => `<button type="button" role="tab" class="hd-btn" data-panel-tab="${key}" aria-selected="${i === 0}">${label}</button>`).join('')}</div>`;
+// ARIA tabs pattern: one tab stop (roving tabindex), Arrow/Home/End move and select, each panel is labelled by its tab.
+// Ids are per mount (several artifacts' panels can exist at once); the design system's .hd-tabs marks the selected tab.
+let mounts = 0;
+const tabBar = uid => `<div role="tablist" aria-label="Sharing" class="hd-tabs" data-panel-tabs>${TABS.map(([key, label], i) => `<button type="button" role="tab" id="${uid}-tab-${key}" data-panel-tab="${key}" aria-controls="${uid}-pane-${key}" aria-selected="${i === 0}" tabindex="${i === 0 ? 0 : -1}">${label}</button>`).join('')}</div>`;
+const paneAttrs = (uid, key) => `id="${uid}-pane-${key}" role="tabpanel" aria-labelledby="${uid}-tab-${key}" data-panel-pane="${key}"`;
 
 // `collabApi` defaults to the same-origin, token-less mode: the dashboard proxy authenticates the call.
 export function mountSharePanel(container, client, artifactId, { versions = [], headVersionId, signal, allowEntry = true, collabApi = new CollabApi(null) } = {}) {
-  container.innerHTML = TAB_BAR + '<div role="tabpanel" data-panel-pane="links"><section data-share-panel><p class="hd-note">Viewer links give people outside this dashboard read-only access to one pinned version.</p><div data-share-form-region></div><div role="status" data-share-status></div><div data-share-review-region></div><div data-share-link-region></div><h3>Links</h3><div data-share-list-region></div></section></div><div role="tabpanel" data-panel-pane="collaborators" hidden></div><div role="tabpanel" data-panel-pane="activity" hidden></div><div role="tabpanel" data-panel-pane="feedback" hidden></div>';
+  const uid = `share-panel-${++mounts}`;
+  container.innerHTML = tabBar(uid) + `<div ${paneAttrs(uid, 'links')}><section data-share-panel><p class="hd-note">Viewer links give people outside this dashboard read-only access to one pinned version.</p><div data-share-form-region></div><div role="status" data-share-status></div><div data-share-review-region></div><div data-share-link-region></div><h3>Links</h3><div data-share-list-region></div></section></div><div ${paneAttrs(uid, 'collaborators')} hidden></div><div ${paneAttrs(uid, 'activity')} hidden></div><div ${paneAttrs(uid, 'feedback')} hidden></div>`;
   const region = name => container.querySelector(`[data-share-${name}-region]`);
   const status = container.querySelector('[data-share-status]');
   let formKey = null, shownLink = null;
@@ -460,7 +465,9 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
       const shown = name === key;
       const element = pane(name);
       if (element) element.hidden = !shown;
-      container.querySelector(`[data-panel-tab="${name}"]`)?.setAttribute('aria-selected', String(shown));
+      const tabEl = container.querySelector(`[data-panel-tab="${name}"]`);
+      tabEl?.setAttribute('aria-selected', String(shown));
+      tabEl?.setAttribute('tabindex', shown ? '0' : '-1');
     }
   };
 
@@ -491,6 +498,16 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
       default: break;
     }
   };
+  const onTabKey = event => {
+    const tab = event.target.closest?.('[data-panel-tab]');
+    if (!tab || !container.contains(tab)) return;
+    const keys = TABS.map(([key]) => key), at = keys.indexOf(tab.dataset.panelTab);
+    const to = { ArrowRight: (at + 1) % keys.length, ArrowLeft: (at - 1 + keys.length) % keys.length, Home: 0, End: keys.length - 1 }[event.key];
+    if (to === undefined || event.altKey || event.ctrlKey || event.metaKey) return;
+    event.preventDefault();
+    showTab(keys[to]);
+    container.querySelector(`[data-panel-tab="${keys[to]}"]`)?.focus?.();
+  };
   const onField = event => {
     const field = event.target.closest?.('[data-share-field]');
     if (!field || !container.contains(field)) return;
@@ -498,6 +515,7 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
   };
   const onSubmit = event => { if (event.target.closest?.('[data-share-form]')) event.preventDefault(); };
   container.addEventListener('click', onClick);
+  container.addEventListener('keydown', onTabKey);
   container.addEventListener('input', onField);
   container.addEventListener('change', onField);
   container.addEventListener('submit', onSubmit);
@@ -506,6 +524,7 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
     ctrl.dispose();
     for (const handle of Object.values(mounted)) handle.dispose();
     container.removeEventListener('click', onClick);
+    container.removeEventListener('keydown', onTabKey);
     container.removeEventListener('input', onField);
     container.removeEventListener('change', onField);
     container.removeEventListener('submit', onSubmit);
