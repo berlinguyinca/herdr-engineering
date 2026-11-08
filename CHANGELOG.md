@@ -12,6 +12,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Fix: the share viewer's Rich view toggle had no visible focus indicator in Firefox and WebKit (white outline on the page background); it has an explicit `:focus-visible` outline, and `aria-controls` names the region it shows.
 - `tests/playwright/share-a11y.test.mjs` (chromium/firefox/webkit): tabs keyboard behaviour, focus indicators, static contrast/name checks in light and dark, no horizontal scroll at 390px, optional screenshots via `SHOT_DIR`.
 
+### Share panel polish
+
+- The Version and Audience labels now stack their select with a 4px gap, the sharing tab buttons are separated by a 6px gap (and wrap), and the author-HTML checkbox glyph is 18px instead of the browser's 13px.
+
 ### Reports print and save as PDF cleanly
 
 - The report stylesheet (`artifact_report_render.py`, used by the dashboard preview and the public share page) has a full `@media print` section: paper is always light and black-on-white whatever the screen theme or forced `data-theme`; the contents pills, download buttons and the opt-in Rich view panel are hidden; findings, figures, callouts, notices and table rows are never split and headings stay with what follows; a figure taller than a page shrinks to fit (180mm); tables lose their scroll box and repeat their header row on each page; the closed "Method and configuration" details prints open; an `http(s)` link spells out its URL. The tight-budget core stylesheet keeps the light override too.

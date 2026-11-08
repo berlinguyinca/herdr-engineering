@@ -949,3 +949,9 @@ test('a resumed pending author-page share shows its files, warning and badge, ne
   assert.match(html, /anyone holding the link/);
   assert.match(html, /Includes author page/);
 });
+
+test('Version and Audience labels stack their select with a gap instead of butting against it', () => {
+  const html = renderShareForm(formState());
+  assert.match(html, /<label style="display:inline-flex;flex-direction:column;gap:4px">Version<select/);
+  assert.match(html, /<label style="display:inline-flex;flex-direction:column;gap:4px">Audience<select/);
+});
