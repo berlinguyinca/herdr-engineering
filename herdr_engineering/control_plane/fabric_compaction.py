@@ -14,8 +14,11 @@ Only rows without a v2 envelope (no source, source sequence or actor) are candid
 in small chunks, ``chunk_rows`` per transaction with ``chunk_pause_seconds`` between, so a large backlog never holds the
 WAL or the table for minutes (one 250,000-row statement stalled every ingest write for ~8 minutes). Each chunk is ONE
 statement that deletes the rows and inserts them into ``fabric_events_archive``, so a row is never lost half way, and
-rows already listed stay removable (later rows can only make more of a stream interior). Removing rows changes the journal a recovery checkpoint covered; the checkpoint
-loader then replays the affected streams in full (correct, slower), so after a drain the job rebuilds the checkpoint.
+rows already listed stay removable (later rows can only make more of a stream interior). Removing rows changes the journal a recovery checkpoint covered. The checkpoint
+loader accepts those deletes (they are ``D`` change rows on ``service`` streams; the checkpoint already reflects each
+service's final state) and rebuilds only the affected service streams from their surviving rows, so the result equals a
+complete replay. Any other delete, update or truncate still forces a complete replay. After a drain the job rebuilds the
+checkpoint.
 Off unless ``enabled`` is true; ``dry_run`` (the default) only counts.
 """
 from __future__ import annotations

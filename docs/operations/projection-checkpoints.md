@@ -77,6 +77,16 @@ writes; the rollout investigation observed approximately 19 GB across those
 legacy tables. Apply the setting under deployment ownership and restart only
 the worker on its existing image after making a validated private config backup.
 
+Fabric compaction deletes interior `service` observation rows (archiving them
+first). Those deletes do not invalidate a checkpoint: the loader rebuilds each
+affected service stream from its surviving rows, which gives the same projection
+as a complete replay because compaction keeps every row that changes a service's
+latest state. The change log records no event type, so every `service` delete is
+treated this way; deletes of other entity types (outside the retention types),
+updates and truncates still require a complete replay. The rebuilt streams count
+against the incremental stream budget; if many compacted services exceed it, the
+rejection reason names the budget and recovery falls back to a complete replay.
+
 Ordinary append-only inspector updates advance the private owner capsule only
 when their replay order follows its captured boundary. Service and session
 updates fold into the saved event projection only when every new server-ingest

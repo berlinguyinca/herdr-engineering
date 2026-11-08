@@ -22,6 +22,9 @@ from .projection_store import CheckpointInvalid, ProjectionStore, SnapshotChange
 log = logging.getLogger(__name__)
 RETENTION_TYPES = frozenset({'inspector','host_metrics','token_usage','resource_usage',
                              'ci_report','ci_observation','ci_telemetry','ci_pipeline'})
+# Fabric compaction deletes interior service observation rows. The change log carries no event_type, so any
+# service delete is tolerated; the stream is then rebuilt from its surviving rows (see _append_blocker).
+COMPACTED_TYPES = frozenset({'service'})
 MAX_TAIL_ROWS = 100_000
 MAX_DIRTY_ROWS = 250_000
 
@@ -111,7 +114,7 @@ async def _read_prepared_once(source, code, policy):
                 if len(changes) > MAX_TAIL_ROWS:
                     raise CheckpointInvalid('incremental change budget exceeded')
                 if any(row['operation'] in {'T','U'} or
-                       (row['operation']=='D' and row['entity_type'] not in RETENTION_TYPES)
+                       (row['operation']=='D' and row['entity_type'] not in RETENTION_TYPES | COMPACTED_TYPES)
                        for row in changes):
                     raise CheckpointInvalid('structural history mutation requires complete replay')
                 legacy = prefix['legacy_rows'] - sum(row['operation']=='D' and row['had_position'] is None for row in changes)
