@@ -9,7 +9,7 @@ name = "herdr-artifact-host"
 version = "0.1.0"
 description = "Standalone Herdr artifact host"
 requires-python = ">=3.12"
-dependencies = ["nh3==0.3.7", "PyJWT[crypto]>=2.8", "cryptography>=42"]
+dependencies = ["nh3==0.3.7", "PyJWT[crypto]>=2.8", "cryptography>=42", "asyncpg>=0.29"]
 
 [project.scripts]
 herdr-artifact-host = "herdr_artifact_host.cli:main"
@@ -18,4 +18,4 @@ herdr-artifact-host = "herdr_artifact_host.cli:main"
 include = ["herdr_artifact_host*"]
 
 [tool.setuptools.package-data]
-herdr_artifact_host = ["share_static/*"]
+herdr_artifact_host = ["share_static/*", "migrations/*.sql"]
