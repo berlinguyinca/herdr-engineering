@@ -4,7 +4,8 @@ The dashboard never opens the host's database: ``/api/v1/library`` is a thin vie
 
 * Every request is a ``GET`` to ``<host_url>/v1/...``; the target is always built here from validated pieces (an id
   matching ``[A-Za-z0-9][A-Za-z0-9_-]{0,127}`` and, for content, a manifest path of clean segments), so the client is
-  never an open proxy.
+  never an open proxy.  ``host_url`` is the GET-only relay (``http://artifact-host-relay:8091``), not the internal
+  role itself: the dashboard shares a network with the relay only.
 * The key travels only in the ``Authorization`` header of that request.  It is never returned, logged or put in a URL.
 * Every call has a connect/read timeout.  A host that is down, slow, unauthorised, or answers anything unexpected is a
   ``HostUnavailable`` (the dashboard answers 503 for the library only); a ``4xx`` that the host meant for the caller

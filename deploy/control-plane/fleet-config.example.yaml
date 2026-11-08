@@ -205,8 +205,8 @@ sections:
       #   mcp_public_hosts: ["mcp.example.test"]     # hosts allowed on /mcp/artifacts
       #   session_secret: "REDACTED"                 # >= 32 bytes, never equal to claim_key (openssl rand -hex 32)
       #   claim_key: "REDACTED"                      # >= 32 bytes
-      #   db_password: "REDACTED"                    # >= 16 chars
-      #   # session_seconds, health_port (8092), db_user are optional
+      #   db_password: "REDACTED"                    # >= 16 chars; changing it re-keys all three db roles on the next deploy
+      #   # session_seconds and health_port (8092) are optional. artifact_library.host_url is http://artifact-host-relay:8091
       # OPTIONAL: the collaborator bridge (external agents read and commit artifacts through collab-public's MCP tools).
       # OFF unless `enabled: true` (exactly true). Needs the collab marker for collab-public to serve it; the worker runs
       # the bridge loop whenever this is true. YAML only: no environment variable is read. Every limit is a positive
