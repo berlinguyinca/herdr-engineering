@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 import zlib
 from contextlib import asynccontextmanager
 
@@ -66,14 +67,24 @@ class ProjectionStore:
             'ON fabric_events(projection_position) WHERE projection_position IS NOT NULL')
 
     @asynccontextmanager
-    async def publisher(self):
-        """One materializer per database schema; readers never take this lock."""
+    async def publisher(self, wait=0.0, poll=0.25):
+        """One materializer per database schema; readers never take this lock.
+
+        ``wait`` bounds how long (seconds) to keep retrying a held lock before
+        giving up; the default of zero fails at once, as the worker's refresh does.
+        """
         conn = self.conn
         key = await conn.fetchval("SELECT hashtext(current_schema() || '.projection_checkpoints')")
-        acquired = await conn.fetchval('SELECT pg_try_advisory_lock($1::int,$2::int)',
-                                       FENCE_NAMESPACE, key)
-        if not acquired:
-            raise CheckpointInvalid('another projection checkpoint materializer is active')
+        deadline = time.monotonic() + max(0.0, wait)
+        while True:
+            acquired = await conn.fetchval('SELECT pg_try_advisory_lock($1::int,$2::int)',
+                                           FENCE_NAMESPACE, key)
+            if acquired:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CheckpointInvalid('another projection checkpoint materializer is active')
+            await asyncio.sleep(min(poll, remaining))
         try:
             yield
         finally:

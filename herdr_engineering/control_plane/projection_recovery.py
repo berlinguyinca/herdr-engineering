@@ -148,12 +148,29 @@ async def _read_prepared_once(source, code, policy):
                     tail_rows=[public_event(row) for row in raw_tail], structured=structured,
                     coverage=coverage, schema=schema, scanned=sum(len(s) for s in streams.values())+len(raw_tail))
             except (CheckpointInvalid, KeyError, TypeError, ValueError) as exc:
-                log.warning('projection checkpoint candidate rejected: %s',type(exc).__name__)
+                log.warning('projection checkpoint candidate rejected: %s%s',type(exc).__name__,_rejection_detail(exc))
         raw = await _rows(conn, 'SELECT * FROM fabric_events ORDER BY '
             '(projection_position IS NOT NULL),projection_position NULLS FIRST,ingest_timestamp,sequence,event_id')
         return dict(checkpoint=None,rows=raw,structured=structured,
                     coverage={**point,'raw_rows':len(raw),'public_rows':sum(feed_visible(row) for row in raw)},
                     schema=schema,scanned=len(raw))
+
+
+MAX_REASON_CHARS = 200
+
+
+def _rejection_detail(exc):
+    """`: <reason>` for our own validation errors, bounded and printable.
+
+    Only CheckpointInvalid carries static, module-authored messages; other
+    exception types may embed row data, so they stay class-only.
+    """
+    if not isinstance(exc, CheckpointInvalid):
+        return ''
+    text = ''.join(ch if ch.isprintable() else ' ' for ch in str(exc)).strip()
+    if len(text) > MAX_REASON_CHARS:
+        text = text[:MAX_REASON_CHARS - 3] + '...'
+    return f': {text}' if text else ''
 
 
 def _reset_private(repo):
@@ -176,7 +193,8 @@ def recover_repository(repo, source):
         if source._conn is None or source._conn.is_closed():
             source._conn = await asyncpg.connect(source._dsn)
     source._run(connect())
-    ownership = ProjectionStore(source._conn).publisher()
+    ownership = ProjectionStore(source._conn).publisher(
+        wait=getattr(source, 'checkpoint_lock_wait', 0.0))
     source._run(ownership.__aenter__())
     try:
         return _recover_repository(repo, source)
