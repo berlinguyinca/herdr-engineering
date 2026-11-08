@@ -465,9 +465,7 @@ class ControlPlaneServer:
         self.member_admin = member_admin
         # Dashboard artifact library (a SyncArtifactAdapter over LibraryStore): absent -> the routes answer 503.
         self.library = library
-        # ``control_plane.artifact_library.viewers``: {"key:<digest>": "<member id>"}.  A mapped key reads and writes that
-        # member's library (feed, folders, pending); everything else keeps its own key library.  ``member_directory``
-        # returns the member directory body (``{"group", "users": {...}}``) or None; default: the collab service's.
+        # ``member_directory`` returns the member directory body (``{"group", "users": {...}}``) or None; default: the collab service's.
         self.member_directory = member_directory
         # Owner annotation API (list/dismiss): a SyncArtifactAdapter over AnnotationStore, or the routes answer 503.
         self.annotation_store = annotation_store
@@ -2755,6 +2753,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             if public and server.member_web is not None and self.path.startswith("/api/member/"):
                 return self._timed_request(self._public)      # the member run upload (only on the member host)
             if operator or public or fabric or not self.path.startswith(("/api/v1/assistant-apps/",)):
+                self.close_connection = True  # the unread body would otherwise be parsed as the next request
                 return self._timed_request(lambda: self._send_json(501, {"error": "not implemented"}))
             return self._timed_request(self._mutate_verb)
 
@@ -2793,6 +2792,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             if resource not in self._ASSISTANT_MUTABLE_RESOURCES or (
                     self.command == "PUT" and resource != "assistant-apps"):
                 # preserve the pre-existing 501 for PATCH/DELETE elsewhere
+                self.close_connection = True  # the unread body would otherwise be parsed as the next request
                 return self._send_json(501, {"error": "not implemented"})
             err = self._require("operator")
             if err:
