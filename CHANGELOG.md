@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Report previews open with a "How to read this report" legend
+
+- A collapsed-by-default `<details>` under the report title explains only what that report shows: findings, the question/evidence/figure tags, limits, next checks, a figure's reading guide, downloads and the `#` permalinks. Every row is derived from what the renderer emits. The descriptor has no severity or confidence field, so the legend says "Severity, confidence: Not used" instead of inventing a scale. The text is static (never copied from the report) and the summary is a native, keyboard-operable control with a visible focus ring.
+- Hidden in print (it is a screen reading aid) and left out of previews under the 16 KiB budget.
+
 ### Report sections and findings have stable, linkable anchors
 
 - Every section heading, finding and figure in a report preview now has a stable id (`sec-<section>`, `finding-<id>`, `figure-<id>`, derived from the descriptor id, never the title) and a visible `#` permalink in its heading: a 24px target, always visible, keyboard-focusable with a visible focus ring, accessible name "Link to this finding" described by the heading. No free text reaches an attribute (the share sanitiser aborts a render whose attribute looks like a script), so a finding titled `onerror=` still renders. Previews under the 16 KiB budget stay plain (no permalinks).

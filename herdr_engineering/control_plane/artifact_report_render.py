@@ -62,7 +62,7 @@ _PRINT_BASE = ("@media print{" + _PRINT_SELECTORS + "{" + _PRINT_VARS + "}"
 _PRINT_FULL = (
     "@media print{"
     # no chrome: the contents pills, download buttons and the Rich view toggle mean nothing on paper
-    + ".toc,.btn,.anchor{display:none}.hero{padding-bottom:10pt}h1{font-size:22pt}h2{font-size:15pt}h3{font-size:12pt}"
+    + ".toc,.btn,.anchor,.howto{display:none}.hero{padding-bottom:10pt}h1{font-size:22pt}h2{font-size:15pt}h3{font-size:12pt}"
     ".rp section{margin-top:18pt}p,li{orphans:3;widows:3}"
     # page-break control: a heading stays with what follows, and a finding, figure, row or callout is never split
     "h1,h2,h3,.sub,summary{break-after:avoid}.card,.finding,.figure,.callout,.notice,.qlist li,tr,figure,img"
@@ -139,6 +139,12 @@ _FULL_CSS = _CORE_CSS + (
     ".card:target,.card.is-target{outline:2px solid var(--accent);outline-offset:2px;background:var(--accent-weak)}"
     "section:target>h2,section.is-target>h2,li:target,li.is-target,tr:target td,tr.is-target td"
     "{background:var(--accent-weak);border-radius:4px}"
+    # "How to read this report": a collapsed legend; screen-only (paper keeps every label self-explanatory)
+    ".howto{margin:16px 0 0;font-size:14px;max-width:68ch}.howto summary{min-height:24px;line-height:24px}"
+    ".howto summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}"
+    ".howto dl{grid-template-columns:minmax(0,12rem) 1fr;font-size:13.5px}"
+    ".howto dt{font-family:inherit;font-weight:600;color:var(--text)}.howto dd{color:var(--muted)}"
+    "@media (max-width:640px){.howto dl{grid-template-columns:1fr;gap:2px 0}.howto dd{margin-bottom:8px}}"
     "@media (max-width:640px){h1{font-size:25px}.rp{padding-top:20px}}"
     + _PRINT_FULL
 )
@@ -166,6 +172,43 @@ def _flatten(value, prefix: str = ""):
     else:
         text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
         yield prefix, text
+
+
+def _how_to_read(report: dict, anchors: bool) -> str:
+    """The collapsed "How to read this report" legend. Static text only (no descriptor text is copied in), and a term
+    is explained only when this report actually shows it: the labels are the ones ``render_report_preview`` prints.
+    The descriptor has no severity or confidence field, and the legend says so rather than inventing a scale."""
+    findings = report["findings"]
+    if not (findings or report["figures"] or report["assets"] or report.get("analysis")):
+        return ""  # nothing to explain beyond questions and lists
+    rows: list[tuple[str, str]] = []
+    if findings:
+        rows.append(("Finding", "A claim the author makes. It names the questions it answers and cites at least one "
+                                "evidence entry."))
+        tags = ["Question", "Evidence"] + (["Figure"] if any(row.get("figure_ids") for row in findings) else [])
+        rows.append((" \u00b7 ".join(tags), "The small tags under a finding. Each names an entry in this report; "
+                                           "select one to jump to it."))
+        if any(row.get("limitations") for row in findings):
+            rows.append(("Limits", "What that finding does not establish."))
+        if any(row.get("next_steps") for row in findings):
+            rows.append(("Next checks", "What the author suggests checking next."))
+        rows.append(("Severity, confidence", "Not used: findings are not ranked or scored. Judge how much weight one "
+                                             "deserves from its evidence and its limits."))
+    if any(row.get("reading_guide") for row in report["figures"]):
+        rows.append(("How to read", "The author's note under a figure, explaining how to read that chart."))
+    if report["assets"]:
+        rows.append(("Evidence and downloads", "Evidence rows link the files they came from. The downloads table gives "
+                                               "each file's type, size and the first 12 characters of its SHA-256 to "
+                                               "check a download."))
+    if report.get("analysis"):
+        rows.append(("Method and configuration", "Folded away: how the result was produced."))
+    if anchors:
+        rows.append(("#", "Beside each section, finding and figure heading. It links to exactly that part; copy it to "
+                          "share."))
+    rows.append(("Shortened or omitted", "A notice at the end means this is a size-limited preview; the full "
+                                         "descriptor has everything."))
+    return ('<details class="howto"><summary>How to read this report</summary><dl>'
+            + "".join(f"<dt>{term}</dt><dd>{meaning}</dd>" for term, meaning in rows) + "</dl></details>")
 
 
 def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] | None = None,
@@ -346,12 +389,14 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
     summary_html = f'<p class="lede">{text(report["summary"])}</p>' if report.get("summary") else ""
     summary_shortened, shortened = shortened, False
 
+    legend = _how_to_read(report, anchors) if anchors else ""   # same size gate as the permalinks
+
     def document(css: str, hero_summary: str, nav: str, body: str, footer: str) -> str:
         return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
                 '<meta name="viewport" content="width=device-width,initial-scale=1">'
                 f'<meta http-equiv="Content-Security-Policy" content="{_CSP}">'
                 f'<title>{title}</title><style>{css}</style></head><body><main class="rp">'
-                f'<header class="hero"><h1>{title}</h1>{hero_summary}{nav}</header>{body}{footer}'
+                f'<header class="hero"><h1>{title}</h1>{hero_summary}{nav}{legend if css is _FULL_CSS else ""}</header>{body}{footer}'
                 "</main></body></html>")
 
     # Reserve the largest possible contents list and omission note (every count is no wider than its
