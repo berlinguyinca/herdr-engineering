@@ -263,7 +263,8 @@ class ControlPlaneRepo:
         self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection,
             verify_noop=bool(getattr(self._sink, "verify_agent_identity_noop", False)))
         # Agent inspector (spec 0200): bounded per-session detail projection.
-        self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
+        self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector,
+                                                    journal_suppression=self._journal_policy)
         self.mission_activity = MissionActivityStore(now=self._now)
         self.mission_outcomes = None   # set by the server (control_plane.missions); None writes no outcomes
         # Lineage graph (T02): derived from ``lineage`` envelope events, rebuilt
