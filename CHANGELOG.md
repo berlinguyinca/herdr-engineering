@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Report viewer guide
+
+- New `docs/artifacts/report-viewer-guide.md`: the Rich view opt-in, finding anchors, printing and saving as PDF, the "How to read this report" legend, phone-width Evidence and Downloads tables, and keyboard use of the share panel tabs. Linked from `docs/artifacts/share-links.md` and the README. Docs only.
+
 ### `/herdr::join` works with no flags after `herdr-eng summary install`
 - `rooms join-fabric` found the listener only in the fetched host config, which agent hosts do not carry, so a bare call failed. It now also reads `fabric_join` (`control_plane_url`, or `listen_host` + `listen_port`) from the machine config `~/.config/herdr-engineering/config.yaml` and falls back to the readable fleet config's `control_plane.collab.fabric_trust`. YAML only, no new environment variable; `--control-plane` still overrides.
 - `herdr-eng summary install` (and `scripts/install.sh`) records the fleet config's listener under `fabric_join` idempotently and never overwrites a differing value (reported as `preserved`). New read-only `herdr-eng summary install --check` verifies per harness the skill symlink, the OpenCode command, listener resolution and reachability, and the hook state, exiting 1 on a failure; no secrets are printed.
