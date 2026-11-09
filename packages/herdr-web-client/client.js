@@ -822,6 +822,15 @@ export class HerdrClient {
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/inspector?${p}`);
   }
 
+  // Events older than the in-memory ring, one page from Postgres; pass the previous `next_cursor` as `before`.
+  getInspectorHistory(sessionId, { view = 'all', limit, before } = {}) {
+    const p = new URLSearchParams({ view });
+    if (limit) p.set('limit', String(limit));
+    if (before) p.set('before', before);
+    return this.request(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/inspector/history?${p}`);
+  }
+
   getInspectorEvent(sessionId, seq) {
     return this.request(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/inspector/events/${seq}`);

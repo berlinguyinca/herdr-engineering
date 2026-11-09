@@ -1075,6 +1075,29 @@ class InspectorStore:
                 "prefs": self.get_prefs(session_id),
             }
 
+    def oldest_recv(self, session_id: str) -> float | None:
+        """Receive time of the oldest event still in the ring; durable rows older than it are only in Postgres."""
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            return sess.events[0]["recv"] if sess is not None and sess.events else None
+
+    @staticmethod
+    def view_kinds(view: str) -> frozenset[str] | None:
+        if view not in VIEWS:
+            raise ValueError(f"view must be one of {list(VIEWS)}")
+        kinds = _VIEW_KINDS.get(view)
+        return frozenset(kinds) if kinds else None
+
+    def render_history(self, entries: list[dict], role: str = "viewer") -> list[dict]:
+        """Render durable-history entries for ``role`` with the ring's own redaction. Nothing enters the ring."""
+        out = []
+        for e in entries:
+            e = {**e, "size": self._size(e["data"])}
+            rendered = self._render(e, role, full=False)
+            rendered["history_id"] = e.get("history_id")
+            out.append(rendered)
+        return out
+
     def events_after(self, session_id: str, after_rev: int, role: str = "viewer",
                      limit: int = 200) -> list[dict]:
         """Events whose revision is newer than ``after_rev``, ascending by revision, rendered for ``role``.

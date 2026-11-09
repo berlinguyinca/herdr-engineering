@@ -189,6 +189,17 @@ class PostgresHistory:
                 'latest_sequence': latest['sequence'] if latest else None,
                 'last_event_id': latest['event_id'] if latest else None}
 
+    def inspector_page(self, session_id, *, limit, before=None, cutoff=None, kinds=None):
+        """One bounded page of durable inspector rows older than the ring (see inspector_history)."""
+        return self._call(self._inspector_page(session_id, limit, before, cutoff, kinds))
+
+    async def _inspector_page(self, session_id, limit, before, cutoff, kinds):
+        from .inspector_history import fetch_page
+        pool = await self._get_pool()
+        async with pool.acquire(timeout=5) as conn:
+            return await fetch_page(conn, self.table, session_id, limit=limit, before=before,
+                                    cutoff=cutoff, kinds=kinds)
+
     def entity_ids(self, kind):
         return self._call(self._ids(kind))
 

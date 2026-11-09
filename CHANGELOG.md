@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Inspector: older events on demand from Postgres
+- New `GET /api/v1/sessions/{id}/inspector/history?before=&limit=&view=` returns inspector events older than the in-memory ring, one bounded page at a time (opaque keyset cursor on `ingest_timestamp, sequence, event_id`), rendered with the ring's role redaction. Nothing is read at boot and nothing is loaded into the ring, so memory does not grow with paging. Existing `/inspector` and `before_seq` are unchanged. Configured by `control_plane.inspector_history` (`enabled`, `page_size`, `max_page_size`), validated in `fleet_config.py`, unknown keys rejected. Client: `getInspectorHistory`.
+- Caveats: durable rows carry no ring `seq` (`seq` is null; `history_id` is the event id); a tool call's newest row per page wins, so a call split across a page boundary can show once per page; rows already archived to `fabric_events_archive` are not read.
+
 ### `/herdr::join`: one skill to join the workspace room from any harness
 - New skill `herdr-join` (`herdr_engineering/skill_data/herdr-join`, linked at `skills/herdr-join`). It reads `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID` and `HERDR_PANE_ID`, runs the existing `herdr-eng rooms join-fabric NAME --json` (tokenless tailnet fabric trust; `--no-workspace` opts out), reports agent id, room and the fixed `read`/`post`/`instruct`/`execute` grant, and says plainly that `coordinate` and `grant_agent` are owner-only.
 - `herdr-eng summary install|verify|uninstall` now manages it with `summary` and `handoff` (`--skill herdr-join`): a symlink into Claude Code, Codex, Pi and OpenCode skill directories plus an OpenCode `/herdr-join` command. Nothing pre-existing is overwritten; a collision is reported as `preserved`. No top-level `/join` alias and no Pi/Codex prompt are written.
