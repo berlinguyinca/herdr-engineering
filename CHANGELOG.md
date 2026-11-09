@@ -5,6 +5,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### `/herdr::join` works with no flags after `herdr-eng summary install`
+- `rooms join-fabric` found the listener only in the fetched host config, which agent hosts do not carry, so a bare call failed. It now also reads `fabric_join` (`control_plane_url`, or `listen_host` + `listen_port`) from the machine config `~/.config/herdr-engineering/config.yaml` and falls back to the readable fleet config's `control_plane.collab.fabric_trust`. YAML only, no new environment variable; `--control-plane` still overrides.
+- `herdr-eng summary install` (and `scripts/install.sh`) records the fleet config's listener under `fabric_join` idempotently and never overwrites a differing value (reported as `preserved`). New read-only `herdr-eng summary install --check` verifies per harness the skill symlink, the OpenCode command, listener resolution and reachability, and the hook state, exiting 1 on a failure; no secrets are printed.
+- Opt-in auto-join, off by default: `fabric_join.auto_join_on_session_start: true` installs one Claude Code `SessionStart` hook (appended, manifest tracked, removed by uninstall; HerdR panes only; never fails the session). Codex, OpenCode and Pi get no hook (no verified safe contract) and are reported `unsupported`. Installing with the key false installs nothing.
+- Tests: `tests/control_plane/test_fabric_join_setup.py` (real CLI, real fabric listener).
+- Codex: its sandbox blocked the tailnet listener ("control plane is unreachable"). `summary install` now appends one execpolicy rule, `prefix_rule(pattern=["herdr-eng", "rooms", "join-fabric"], decision="allow")`, to `~/.codex/rules/default.rules` (only when `~/.codex` exists; idempotent, manifest tracked, removed by `summary uninstall`, shown by `--check`). No `network_access`, `sandbox_mode` or `approval_policy` change. Verified with `codex execpolicy check` and a real `codex exec` join, and a no-rule control that fails.
+- OpenCode and Pi: not a code defect. Their configured default model (`qwen3.8-27b-...-q8_k_xl`, also OpenCode's `small_model` title model) has no worker on the gateway (503 `capacity_unavailable`), so runs hung or printed the "retry after the declared delay" error. Documented the workaround in `docs/operations/fabric-trust.md` section 9a; both joined for real with a served model.
+
 ### Dashboard a11y ratchet lowered
 
 - `ui-gates-dashboard-a11y.test.mjs`: the recorded `focus-visible` findings on the assistant surfaces are removed. They were cleared by the `.hd-btn` fallback focus ring in #723, and the ratchet fails when a finding disappears without the table being lowered.
