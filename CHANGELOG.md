@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Auto-join hook no longer dies silently on a loaded host
+- `summary join-hook` ran the join under a 12 s kill-timeout through `python -m herdr_engineering.cli`; on a loaded host that start alone took 3-40 s, so the join was killed and the session printed nothing. It now starts the CLI directly, waits up to 8 s, and past that leaves the (idempotent) join running detached and says "still running in the background". Test: a real listener that never answers.
+
 ### `/herdr::join` works with no flags after `herdr-eng summary install`
 - `rooms join-fabric` found the listener only in the fetched host config, which agent hosts do not carry, so a bare call failed. It now also reads `fabric_join` (`control_plane_url`, or `listen_host` + `listen_port`) from the machine config `~/.config/herdr-engineering/config.yaml` and falls back to the readable fleet config's `control_plane.collab.fabric_trust`. YAML only, no new environment variable; `--control-plane` still overrides.
 - `herdr-eng summary install` (and `scripts/install.sh`) records the fleet config's listener under `fabric_join` idempotently and never overwrites a differing value (reported as `preserved`). New read-only `herdr-eng summary install --check` verifies per harness the skill symlink, the OpenCode command, listener resolution and reachability, and the hook state, exiting 1 on a failure; no secrets are printed.
