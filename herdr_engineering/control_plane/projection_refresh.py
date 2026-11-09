@@ -1,15 +1,24 @@
 """Explicit checkpoint prewarming and isolated, serial background refreshes."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
+import re
 import threading
+import time
 
 from . import bridge
 from .repo import ControlPlaneRepo
 
 log = logging.getLogger(__name__)
 REFRESH_INTERVAL = 300.0
+_URL = re.compile(r'\S*://\S*')
+
+
+def _safe_message(exc, limit=500):
+    """Exception text for the log, with anything URL-shaped (a DSN) redacted."""
+    return _URL.sub('<url>', str(exc))[:limit]
 
 
 class CheckpointNotPublished(RuntimeError):
@@ -43,6 +52,39 @@ def refresh_checkpoint(dsn, *, host_aliases=None, inspector_limits=None, lock_wa
         source.close()
 
 
+def checkpoint_is_current(dsn, *, host_aliases=None, inspector_limits=None):
+    """True only when a published checkpoint for this code and policy already
+    sits at the current projection position. Any doubt (no checkpoint, schema
+    missing, query failure) returns False so the caller does the full pass; a
+    skip is purely an optimisation and a concurrent append just means the next
+    pass runs."""
+    async def check():
+        import asyncpg
+
+        from .projection_checkpoint import code_fingerprint, policy_fingerprint
+        from .projection_store import ProjectionStore
+        repo = ControlPlaneRepo(host_aliases=host_aliases, inspector_limits=inspector_limits)
+        conn = await asyncpg.connect(dsn)
+        try:
+            store = ProjectionStore(conn)
+            if not await store.available():
+                return False
+            candidates = await store.candidates(code_fingerprint(), policy_fingerprint(repo))
+            if not candidates:
+                return False
+            current = await conn.fetchval(
+                'SELECT GREATEST(replay_floor,COALESCE((SELECT max(position) FROM projection_event_changes),0)) '
+                'FROM projection_checkpoint_control WHERE singleton')
+            return current is not None and any(row['frontier'] == current for row in candidates)
+        finally:
+            await conn.close()
+    try:
+        return asyncio.run(check())
+    except Exception as exc:
+        log.info('projection refresh: currency check failed (%s); doing the pass', type(exc).__name__)
+        return False
+
+
 class ProjectionRefresh:
     """One refresh at a time, with an interruptible delay after each pass.
 
@@ -67,11 +109,22 @@ class ProjectionRefresh:
         self._stop.set()
         self._thread.join()
 
+    def _pass(self):
+        started = time.monotonic()
+        outcome = 'failed'
+        try:
+            if checkpoint_is_current(self._dsn, **self._policy):
+                outcome = 'skipped'
+            else:
+                refresh_checkpoint(self._dsn, **self._policy)
+                outcome = 'published'
+        except Exception as exc:
+            log.warning('projection checkpoint refresh failed (%s): %s',
+                        type(exc).__name__, _safe_message(exc))
+        log.info('projection refresh: %s in %.1fs', outcome, time.monotonic() - started)
+
     def _run(self):
         while not self._stop.is_set():
-            try:
-                refresh_checkpoint(self._dsn, **self._policy)
-            except Exception as exc:
-                log.warning('projection checkpoint refresh failed (%s)', type(exc).__name__)
+            self._pass()
             if self._stop.wait(self._interval):
                 break
