@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Inspector archive job (disabled by default)
+- New `control_plane.inspector_archive` config (YAML only, validated in `fleet_config.py`) and `InspectorArchiver`: moves inspector tool/message rows older than 14 days from `fabric_events` into `fabric_events_archive`, chunked, one transaction per chunk, idempotent, with a count-only dry run. Never moves rows above the snapshot watermark or projection checkpoint frontier, v2-envelope rows, or state-bearing kinds. Migration 0052 adds a partial archive index. Snapshot boot counts archived rows; the compaction archive purge now skips inspector rows. See `docs/operations/inspector-archive.md`.
+
 ### Report viewer guide
 
 - New `docs/artifacts/report-viewer-guide.md`: the Rich view opt-in, finding anchors, printing and saving as PDF, the "How to read this report" legend, phone-width Evidence and Downloads tables, and keyboard use of the share panel tabs. Linked from `docs/artifacts/share-links.md` and the README. Docs only.
