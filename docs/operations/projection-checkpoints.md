@@ -87,7 +87,7 @@ updates and truncates still require a complete replay. The rebuilt streams count
 against the incremental stream budget; if many compacted services exceed it, the
 rejection reason names the budget and recovery falls back to a complete replay.
 
-Both budgets count rows and are set in the central fleet YAML (never environment
+The budgets count rows and are set in the central fleet YAML (never environment
 variables):
 
 ```yaml
@@ -95,12 +95,31 @@ control_plane:
   projection_checkpoint:
     max_tail_rows: 100000    # change-log rows since the checkpoint
     max_dirty_rows: 600000   # rows re-read from streams that cannot fold incrementally
+    hard_dirty_rows: 2000000 # above this a complete replay is cheaper; default max(2000000, max_dirty_rows)
 ```
 
-Values must be positive integers; anything else stops startup with an error naming
-the key. A rejection logs `dirty rows <actual> > limit <configured>` with the top
-five entity types by row count (non-compactable streams such as `token_usage`
-stay dirty and are re-read in full).
+Values must be positive integers (`hard_dirty_rows` >= `max_dirty_rows`); anything
+else stops startup with an error naming the key. Between `max_dirty_rows` and
+`hard_dirty_rows` recovery logs a warning (`over the dirty budget; refolding ...`)
+and still recovers from the checkpoint, re-reading only the dirty streams. Above
+`hard_dirty_rows` the checkpoint is rejected with `dirty rows <actual> > hard cap
+<configured>` and the top five entity types by row count, and recovery falls back
+to a complete replay.
+
+What folds without re-reading the stream (it does not count against the dirty
+budgets): `token_usage` and `resource_usage` streams, whose checkpointed rows are
+kept verbatim and rebuilt into the usage projections on every restore. Inserts
+are appended and retention deletes removed by `(event_id, actor)`, so the result
+equals a complete replay. `service` and `session` keep their append path above.
+Everything else is refolded from its full stream: `host`, `mission`, `artifact`
+(ordered reducers over partial fields), `inspector` mutations that are not appends,
+`host_metrics`, CI kinds (`ci_report`, `ci_observation`, `ci_telemetry`,
+`ci_logtests`; `_trim_ci_history` evicts across streams, so appending is not
+provably equal), and every other type. A foldable stream whose change log and
+table disagree is refolded too. Each recovery logs `path=` (`checkpoint_plus_tail`
+or `complete_replay`), `rows_scanned`, `refolded_rows`, `folded_streams` and
+`elapsed_ms`; the checkpoint refresh thread runs the same path and publishes its
+result, so the published checkpoint advances without a complete replay.
 
 While compaction drains a large backlog, one pass can touch thousands of streams
 and exceed that budget, so an older checkpoint is rejected and web boot replays

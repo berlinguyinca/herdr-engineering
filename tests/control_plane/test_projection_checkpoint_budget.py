@@ -15,9 +15,9 @@ NON_COMPACTABLE = {"probe_big": 12, "probe_mid": 5, "probe_small": 3}
 
 
 def test_budget_defaults_raise_the_dirty_limit():
-    assert checkpoint_budgets(None) == CheckpointBudgets(100_000, 600_000)
-    assert checkpoint_budgets({}) == CheckpointBudgets(100_000, 600_000)
-    assert checkpoint_budgets({"max_dirty_rows": 7}) == CheckpointBudgets(100_000, 7)
+    assert checkpoint_budgets(None) == CheckpointBudgets(100_000, 600_000, 2_000_000)
+    assert checkpoint_budgets({}) == CheckpointBudgets(100_000, 600_000, 2_000_000)
+    assert checkpoint_budgets({"max_dirty_rows": 7}) == CheckpointBudgets(100_000, 7, 2_000_000)
 
 
 @pytest.mark.parametrize(
