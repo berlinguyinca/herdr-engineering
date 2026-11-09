@@ -844,7 +844,7 @@ def _docker(
 @pytest.fixture(scope="module")
 def docker_ok() -> None:
     reason = None
-    if os.environ.get("HERDR_SKIP_DOCKER") == "1":  # parse-level iteration only; CI never sets it
+    if os.environ.get("HERDR_SKIP_DOCKER") == "1":  # parse-level iteration, and scripts/ci/unit-gates.sh (its agents have no docker)
         pytest.skip("HERDR_SKIP_DOCKER=1")
     if shutil.which("docker") is None:
         reason = "docker is not installed"

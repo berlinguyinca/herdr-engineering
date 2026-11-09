@@ -18,7 +18,9 @@ python3 -m venv "$venv"
 export PATH="$venv/bin:$PATH"
 
 echo "== pytest =="
-python -m pytest -q
+# CI agents are Slurm exec hosts with no docker daemon: the real `docker compose up` tests of the artifact host skip here
+# (they fail, not skip, under CI otherwise) and run wherever docker exists; no pipeline has docker today.
+HERDR_SKIP_DOCKER=1 python -m pytest -q
 echo "== client tests =="
 npm ci --no-audit --no-fund       # the component tests import playwright
 npx playwright install chromium     # one component test drives a real browser; a no-op when cached
