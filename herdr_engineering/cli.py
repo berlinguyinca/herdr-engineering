@@ -468,8 +468,8 @@ def _build_parser() -> argparse.ArgumentParser:
         p2.add_argument("--project-dir", default=None, help="project root for --scope project (default: cwd)")
         if name != "verify":
             p2.add_argument("--dry-run", action="store_true")
-        p2.add_argument("--skill", choices=("summary", "handoff", "all"), default="all",
-                        help="which skill to manage (default: both /summary and /handoff)")
+        p2.add_argument("--skill", choices=("summary", "handoff", "herdr-join", "all"), default="all",
+                        help="which skill to manage (default: /summary, /handoff and /herdr::join)")
         p2.add_argument("--json", action="store_true")
         p2.set_defaults(func=_cmd_summary_manage)
     p2 = smsub.add_parser("history", help="read-only normalized history of the current agent session")

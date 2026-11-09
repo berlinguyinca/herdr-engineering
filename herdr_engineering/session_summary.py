@@ -24,13 +24,16 @@ VERSION = 1
 # skills/summary in the repo root is a symlink to it for discoverability next to the other skills.
 SOURCE = Path(__file__).resolve().parent / "skill_data" / "summary"
 MANIFEST_NAME = ".summary-manifest.json"
-SKILLS = ("summary", "handoff")  # handoff has no Pi prompt template: Pi's built-in /handoff owns that name
+SKILLS = ("summary", "handoff", "herdr-join")  # only summary has a Pi prompt template (Pi's built-in /handoff owns that name; herdr-join is reached as /herdr::join or the skill)
 HANDOFF_SOURCE = Path(__file__).resolve().parent / "skill_data" / "handoff"
+JOIN_SOURCE = Path(__file__).resolve().parent / "skill_data" / "herdr-join"
 
 
 def _source(skill: str) -> Path:
     if skill not in SKILLS:
         raise ValueError(f"unknown skill: {skill}")
+    if skill == "herdr-join":
+        return JOIN_SOURCE
     return SOURCE if skill == "summary" else HANDOFF_SOURCE  # SOURCE is read late so tests can repoint it
 
 
