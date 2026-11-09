@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Dashboard report viewer and share panel: phone-width and dark-theme polish
+- The dashboard's "Evidence and source downloads" table stacks into labelled blocks below 600px (table roles kept) instead of scrolling sideways with no cue.
+- Share panel at 390px: the four tabs stay on one row; labels stack caption over control with a gap (Expires, Version, Audience, Compare, Report version, Finding or figure); the Links heading and Title field have top margin.
+- Dark theme: the report detail's textareas, inputs and the "Evidence supporting this check" fieldset use the theme tokens (`--surface`, `--border`) instead of the browser's flat grey and white border. `.hd-note` is now styled.
+- Public and preview report pages: roomier table rows (12px/14px padding, 1.55 line height); permalink focus ring uses `--link` (it was 2.99:1, below 3:1).
+- Tests: `tests/playwright/viewer-phone-polish.test.mjs` (chromium, firefox); the share fixture now returns the descriptor's assets.
+
 ### `/herdr::join` works with no flags after `herdr-eng summary install`
 - `rooms join-fabric` found the listener only in the fetched host config, which agent hosts do not carry, so a bare call failed. It now also reads `fabric_join` (`control_plane_url`, or `listen_host` + `listen_port`) from the machine config `~/.config/herdr-engineering/config.yaml` and falls back to the readable fleet config's `control_plane.collab.fabric_trust`. YAML only, no new environment variable; `--control-plane` still overrides.
 - `herdr-eng summary install` (and `scripts/install.sh`) records the fleet config's listener under `fabric_join` idempotently and never overwrites a differing value (reported as `preserved`). New read-only `herdr-eng summary install --check` verifies per harness the skill symlink, the OpenCode command, listener resolution and reachability, and the hook state, exiting 1 on a failure; no secrets are printed.
