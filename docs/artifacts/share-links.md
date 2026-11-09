@@ -3,6 +3,8 @@
 `herdr-eng artifacts share` turns one pinned version of a private artifact into a link that someone outside the
 registry can open. Nothing is exposed until the owner approves it, and approval shows exactly what will be exposed.
 
+For how a shared report reads and prints, and the Rich view option, see [report-viewer-guide.md](report-viewer-guide.md).
+
 ## Audiences
 
 - **private** (default): no share exists; only the registry's normal access rules apply.

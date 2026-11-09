@@ -21,7 +21,7 @@ def test_skill_source_is_valid_symlinked_and_packaged():
                    "--no-workspace", "--control-plane", "room_access", "agent id", "/herdr::join"):
         assert needle in body, needle
     assert "`coordinate` and `grant_agent` are owner-only" in body
-    assert "No session-start hook auto-joins" in body
+    assert "auto_join_on_session_start" in body and "off by default" in body
 
 
 def test_documented_command_exists_in_the_cli():
@@ -81,7 +81,8 @@ def test_cli_install_all_includes_herdr_join(tmp_path):
 
 
 def test_no_session_start_hook_was_added():
-    for path in (ROOT / "herdr_engineering/skill_data/herdr-join").rglob("*"):
+    # the skill text may DOCUMENT the opt-in key; the command adapters (which run it) must never wire a hook
+    for path in (ROOT / "herdr_engineering/skill_data/herdr-join/adapters").rglob("*"):
         if path.is_file():
             text = path.read_text().lower()
             assert "sessionstart" not in text and "session_start" not in text
