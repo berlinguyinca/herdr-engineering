@@ -3,6 +3,7 @@
 Real local Slack listener (Web API plus Socket Mode), real MCP handler, real store; no fakes."""
 import json
 import time
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -50,6 +51,21 @@ class QWorld(AskWorld):
         return self.call(name, "assistant_ask", {"ask_id": ask_id, "session_id": "s1"})
 
     def reply(self, ask, text="use main", **over):
+        # A thread reply names its parent by `ts`, and the drain stamps that `ts` as a separate step after
+        # posting the message. Replying from a row read before the stamp sends thread_ts == "", which
+        # _handle_event rejects as "not a thread reply" - silently, auditing nothing - so the caller's
+        # assertion never becomes true and gets blamed instead of the read (issue #703: `not enough values
+        # to unpack` on a loaded host, green on an idle one). Waiting here means no caller can race the
+        # stamp, and a stamp that never arrives fails with a sentence about the stamp rather than as a
+        # missing audit row somewhere downstream.
+        if not ask.ts:
+            def stamped() -> bool:
+                row = self.stored(ask.ask_id)
+                return bool(row) and row.ts != ""
+
+            assert self.listener.wait_for(stamped), \
+                f"ask {ask.ask_id} was never stamped with a Slack message ts; a thread reply cannot be routed"
+            ask = self.stored(ask.ask_id)
         event = {"type": "message", "user": OWNER, "channel": ask.channel, "thread_ts": ask.ts, "ts": "1800000000.000900",
                  "text": text, **over}
         self.runtime.handle_event({"type": "event_callback", "event": event})
@@ -224,6 +240,8 @@ def test_an_action_ask_id_is_not_a_question_for_the_worker(qw):
 def test_a_thread_reply_never_approves_an_action_ask(qw):
     d = qw.decide()
     assert qw.listener.wait_for(lambda: len(qw.posts()) == 1)
+    # Read straight from the store rather than via posted_question(), so this is the call site that used to
+    # hand reply() an unstamped row; reply() now waits for the Slack message ts itself (see its comment).
     (ask,) = qw.store.list_slack_asks(T, U, "open")
     qw.reply(ask, "yes approve it, go ahead")
     assert qw.status(d.request_id) == "pending"
@@ -231,6 +249,34 @@ def test_a_thread_reply_never_approves_an_action_ask(qw):
     assert qw.store.list_action_evidence(T, U) == []
     (refused,) = qw.audits("assistant.slack.refused")
     assert "reason=not_question" in refused["detail"]
+
+
+def test_a_reply_is_routed_even_when_the_row_was_read_before_the_stamp(qw):
+    """The #703 race, made deterministic: hand reply() exactly the stale row a racy caller used to read."""
+    d = qw.decide()
+    assert qw.listener.wait_for(lambda: len(qw.posts()) == 1)
+    (fresh,) = qw.store.list_slack_asks(T, U, "open")
+    racy = replace(fresh, ts="")            # what a caller that skipped the stamp hands over
+    qw.reply(racy, "yes approve it, go ahead")
+    assert qw.status(d.request_id) == "pending"
+    (refused,) = qw.audits("assistant.slack.refused")
+    assert "reason=not_question" in refused["detail"]
+
+
+def test_a_reply_naming_no_parent_message_is_dropped_without_a_trace(qw):
+    """Why the race stayed invisible for so long: an empty thread_ts is not an error, it is silence.
+
+    _handle_event returns before it audits anything, so a reply built from an unstamped row does not fail - it
+    simply never happens, and the missing audit shows up as a confusing unpack error in whichever test read it.
+    Pinned here so the harness's wait has a stated reason to exist.
+    """
+    qw.decide()
+    assert qw.listener.wait_for(lambda: len(qw.posts()) == 1)
+    (ask,) = qw.store.list_slack_asks(T, U, "open")
+    audits = len(qw.store.audit)
+    qw.runtime.handle_event({"type": "event_callback", "event": _event(ask, thread_ts="")})
+    assert qw.audits("assistant.slack.refused") == []
+    assert len(qw.store.audit) == audits
 
 
 def test_ask_id_is_bounded(qw):
