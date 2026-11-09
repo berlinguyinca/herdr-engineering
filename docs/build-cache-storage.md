@@ -129,7 +129,7 @@ The shared level is used only when: cache enabled, `mode: shared_cache`, `shared
 
 ## What the operator must provide (not available here)
 
-1. An approved S3-compatible endpoint reachable from Bender over TLS with a certificate the host trusts, and a registry entry for it. No endpoint is deployed: the loopback MinIO in `deploy/control-plane/compose.yaml` is for artifacts and is not used.
+1. An approved S3-compatible endpoint reachable from Bender over TLS with a certificate the host trusts, and a registry entry for it. No endpoint is deployed: the loopback RustFS in `deploy/control-plane/compose.yaml` is for artifacts and is not used.
 2. A dedicated bucket (or prefix) and scoped credentials: read-only credentials for the first canary phase; read/write limited to the bucket for the second. Put them in the 0600 credentials file.
 3. Approval to install sccache >= 0.19.0 (`cargo install sccache --locked --version 0.19.0`, or a distro package).
 

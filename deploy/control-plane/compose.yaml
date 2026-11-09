@@ -83,6 +83,10 @@ services:
     # what is pulled, the tag is for humans. The image runs as UID/GID 10001 and ships /data owned by that user, so a
     # fresh named volume is writable without a chown. It cannot read a MinIO volume: see deploy/control-plane/README.md
     # ("Object store: MinIO to RustFS") before pointing an existing control plane at it.
+    # WARNING: a manual `docker compose up` recreates this container from this image on the EXISTING volume
+    # herdr-cp-rustfs. Never do that on a volume that holds MinIO data (a top-level `.minio.sys`): compose has no
+    # guard. The guard is the herdr-fleet control-plane role and `herdr-fleet adopt`, which block with
+    # object-store-is-minio / object-store-unverified and never mount, delete or recreate the volume.
     image: rustfs/rustfs:1.0.4@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2
     container_name: herdr-cp-rustfs
     restart: unless-stopped

@@ -9,7 +9,7 @@ otherwise. No step prints a secret.
 ## Safe order
 
 1. **Create the central file from the old env file.** This keeps the Postgres
-   and MinIO credentials. Postgres applies `POSTGRES_*` only to an empty volume,
+   and object store (RustFS) credentials. Postgres applies `POSTGRES_*` only to an empty volume,
    so new credentials would lock the server out of its own database, and it would
    quietly fall back to in-memory storage.
 
@@ -51,8 +51,8 @@ otherwise. No step prints a secret.
    herdr-eng fleet config validate
    ```
 
-   It prints `ok revision=... hosts=N`. It also checks that `pg_dsn`, `minio_*` and
-   `compose.HERDR_CP_{PG,MINIO}_*` name the same credentials.
+   It prints `ok revision=... hosts=N`. It also checks that `pg_dsn`, `rustfs_*` (or the
+   older `minio_*`) and `compose.HERDR_CP_{PG,RUSTFS}_*` (or `_MINIO_*`) name the same credentials.
 
 3. **Dry-run the deploy.** With collab enabled, first check that
    `~/.config/herdr-engineering/collab/` holds nothing but `collab-config.json`. That
@@ -171,7 +171,7 @@ columns, no drops or renames in the same release), or plan a manual restore.
   emit hook do not send `X-API-Key` yet. Filling `control_plane.api_keys` (or using
   `init --with-api-keys`) makes them all fail with 401. Leave it `{}`.
 - **A fresh `init` without `--from-env` on an existing control plane.** It
-  generates new Postgres and MinIO users that the live volumes do not have.
+  generates new Postgres and object store (RustFS) users that the live volumes do not have.
 - **Putting other files next to the central file.** `deploy.sh` mounts that
   directory into the containers and refuses to run if it holds anything else.
   Backups go to `~/.config/herdr-engineering/fleet-backups/`.

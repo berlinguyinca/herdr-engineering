@@ -68,9 +68,9 @@ memory containers exist.
 ### Key generation, rotation and hand-out
 
 * Keys are 43 URL-safe characters from `secrets.token_urlsafe(32)`, generated **on the host**, stored in the 0600
-  fleet file next to the Postgres/MinIO credentials, rendered into the transient 0600 compose env file (removed on
+  fleet file next to the Postgres/RustFS credentials, rendered into the transient 0600 compose env file (removed on
   exit) and never printed, logged or put in argv. Validation refuses duplicates (a shared key would merge tenants),
-  a key equal to any Postgres/MinIO secret, and wrong shapes, naming the key but never its value.
+  a key equal to any Postgres/RustFS secret, and wrong shapes, naming the key but never its value.
 * `herdr-eng fleet config memory init --rotate personal` regenerates one tenant's key (repeatable). Then
   `deploy.sh --with-memory` recreates the API (it reads keys at start) and the old key stops working. The database
   password is **not** rotatable this way: Postgres applies it to an empty volume only (same as the control plane's).
