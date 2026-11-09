@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### fabric_events partitioning (disabled by default, lazy-loading PR 9)
+
+- Migration 0053 prepares an empty LIST-partitioned copy of `fabric_events` (inspector partition plus default); nothing moves automatically. New `control_plane.fabric_partitioning` config (YAML only, validated in `fleet_config.py`) and `control-plane fabric-partition status|backfill|cutover|rollback|drop-old`: resumable keyset backfill, one-transaction cutover with a bounded lock and exact catch-up, and a rollback that carries post-cutover writes back. `control-plane checkpoint` skips the CONCURRENTLY index on a partitioned journal. See `docs/operations/fabric-events-partitioning.md`.
+
 ### Report viewer guide
 
 - New `docs/artifacts/report-viewer-guide.md`: the Rich view opt-in, finding anchors, printing and saving as PDF, the "How to read this report" legend, phone-width Evidence and Downloads tables, and keyboard use of the share panel tabs. Linked from `docs/artifacts/share-links.md` and the README. Docs only.
