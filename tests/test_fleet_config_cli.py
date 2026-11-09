@@ -337,7 +337,8 @@ def test_example_file_matches_what_the_code_requires():
     ex = yaml.safe_load((Path(__file__).resolve().parents[1] / "deploy/control-plane/fleet-config.example.yaml").read_text())
     vals = ex["sections"]["control_plane"]["values"]
     assert set(vals["compose"]) >= set(fcc.COMPOSE_REQUIRED)
-    assert "minio_user" in vals and "minio_password" in vals and "ci_actions" in vals
+    assert "rustfs_user" in vals and "rustfs_password" in vals and "ci_actions" in vals
+    assert "minio_user" not in vals and "HERDR_CP_MINIO_USER" not in vals["compose"]
     assert "rustfs_access_key" not in vals and "rustfs_secret_key" not in vals
 
 
@@ -676,3 +677,61 @@ def test_cli_from_env_missing_github_token_without_terminal_stays_empty(tmp_path
                  str(_env_file(tmp_path, "HERDR_CP_PG_USER=u\n")), "--answers", str(_cli_answers(tmp_path))]) == 0
     assert load_fleet_config(target).section("github")["token"] == ""
     assert "github.token: missing" in capsys.readouterr().err
+
+
+def test_new_install_uses_rustfs_names_and_no_minio_names(tmp_path):
+    p = make(tmp_path)
+    cp = load_fleet_config(p).section("control_plane")
+    assert cp["rustfs_user"] == cp["compose"]["HERDR_CP_RUSTFS_USER"]
+    assert cp["rustfs_password"] == cp["compose"]["HERDR_CP_RUSTFS_PASSWORD"]
+    assert cp["rustfs_user"] != "rustfsadmin" and len(cp["rustfs_password"]) == 32
+    assert not [k for k in cp if k.startswith("minio_")]
+    assert not [k for k in cp["compose"] if "MINIO" in k]
+    fcc.validate_config(p)
+
+
+def test_legacy_minio_answers_keep_their_names_and_values(tmp_path):
+    a = dict(ANSWERS, minio_user="minio_live", minio_password="placeholder-legacy-ten")
+    p = fcc.init_config(tmp_path / "fleet" / "fleet-config.yaml", a, prompt=no_prompt, secret_prompt=no_prompt)
+    cp = load_fleet_config(p).section("control_plane")
+    assert (cp["minio_user"], cp["minio_password"]) == ("minio_live", "placeholder-legacy-ten")
+    assert cp["compose"]["HERDR_CP_MINIO_USER"] == "minio_live"
+    assert "HERDR_CP_RUSTFS_USER" not in cp["compose"] and "rustfs_user" not in cp
+    fcc.validate_config(p)           # an old-style file is still valid
+    env = tmp_path / "env" / "compose.env"
+    fcc.render_compose(load_fleet_config(p), env)
+    assert parse_env_file(env.read_text())["HERDR_CP_MINIO_PASSWORD"] == "placeholder-legacy-ten"
+
+
+def test_import_maps_the_rustfs_env_names(tmp_path):
+    env = _env_file(tmp_path, "HERDR_CP_RUSTFS_USER=rfs_live\nHERDR_CP_RUSTFS_PASSWORD=placeholder-rfs-eleven\n")
+    answers, report = fcc.import_env_file(env)
+    assert answers["rustfs_user"] == "rfs_live" and answers["rustfs_password"] == "placeholder-rfs-eleven"
+    assert "placeholder-rfs-eleven" not in json.dumps(report)
+    a = dict(ANSWERS, **answers)
+    cp = load_fleet_config(fcc.init_config(tmp_path / "f2" / "fleet-config.yaml", a, prompt=no_prompt,
+                                           secret_prompt=no_prompt)).section("control_plane")
+    assert cp["compose"]["HERDR_CP_RUSTFS_PASSWORD"] == "placeholder-rfs-eleven"
+
+
+def test_compose_without_any_object_store_credentials_is_refused(tmp_path):
+    p = make(tmp_path)
+    _rewrite(p, lambda v: [v["compose"].pop(k) for k in ("HERDR_CP_RUSTFS_USER", "HERDR_CP_RUSTFS_PASSWORD")])
+    with pytest.raises(FleetConfigError) as e:
+        fcc.validate_config(p)
+    assert "HERDR_CP_RUSTFS_USER" in str(e.value)
+
+
+def test_rustfs_credentials_that_disagree_with_compose_are_caught_without_values(tmp_path):
+    p = make(tmp_path)
+    _rewrite(p, lambda v: v["compose"].update(HERDR_CP_RUSTFS_PASSWORD="placeholder-changed-twelve"))
+    with pytest.raises(FleetConfigError) as e:
+        fcc.validate_config(p)
+    assert "rustfs_password" in str(e.value) and "placeholder-changed-twelve" not in str(e.value)
+
+
+def test_object_store_credentials_helper_prefers_rustfs_and_falls_back():
+    from herdr_engineering.fleet_config import object_store_credentials as osc
+    assert osc({"rustfs_user": "a", "rustfs_password": "b", "minio_user": "c", "minio_password": "d"}) == ("a", "b")
+    assert osc({"minio_user": "c", "minio_password": "d"}) == ("c", "d")
+    assert osc({"rustfs_user": "a"}) == (None, None) and osc({}) == (None, None)

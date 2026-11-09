@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### The control plane's S3 store is the real RustFS image (MinIO stand-in removed)
+- `deploy/control-plane/compose.yaml`: the `rustfs` service runs `rustfs/rustfs:1.0.4` pinned by tag and multi-arch index digest (`sha256:ed9210d6...`), replacing the unpullable `minio/minio` tag. It starts with the image's own entrypoint (no `server /data` command), sets `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` from the rendered env file (no default credential: the upstream `rustfsadmin` is public), health-checks `http://127.0.0.1:9000/health`, mounts the same `herdr-cp-rustfs:/data` volume and keeps both ports loopback-only (no FTP/SFTP/WebDAV).
+- **RustFS cannot read a MinIO volume.** An existing control plane must not be pointed at its old MinIO volume: copy the objects at the S3 level while MinIO still runs, or restore from backup, then switch (`deploy/control-plane/README.md`, "Object store: MinIO to RustFS"). `deploy.sh` does not recreate `rustfs`, so a normal deploy is unaffected.
+- Credential names: new installs get `control_plane.rustfs_user`/`rustfs_password` and `compose.HERDR_CP_RUSTFS_USER`/`HERDR_CP_RUSTFS_PASSWORD`. The old `minio_*` / `HERDR_CP_MINIO_*` names stay accepted everywhere (compose falls back to them, `fleet config init --from-env` keeps them, validation checks them), so re-running `deploy.sh` on an existing install neither regenerates nor breaks its credentials. Reader helper: `fleet_config.object_store_credentials`.
+- Client: `RustFSClient` now builds its boto3 client with path-style addressing and, where botocore supports it (>= 1.36), `request_checksum_calculation`/`response_checksum_validation` = `when_required`, so default CRC headers do not break puts against a non-AWS store. Tests: `tests/control_plane/test_rustfs_client_config.py`, `tests/test_compose_render.py`, `tests/test_fleet_config_cli.py`.
+- Known gap: `herdr-eng build-cache-rustfs-provision` drives the MinIO client `mc` inside the container, which the RustFS image does not ship.
+
 ### Fabric compaction retries a deferred projection checkpoint on every tick
 - With `fabric_compaction.publish_projection_checkpoint`, a publish deferred by the materializer lock (`projection checkpoint deferred (CheckpointInvalid)`) was only retried on the next drained compaction pass, possibly a day later. The compactor now retries it on every worker tick, bypassing `interval_seconds`, with no compaction work and the unchanged `projection_lock_wait_seconds`; the pending flag clears only on a successful publish. Tests in `tests/control_plane/test_compaction_publishes_projection_checkpoint.py` (real PostgreSQL).
 

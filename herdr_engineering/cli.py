@@ -304,7 +304,7 @@ def _build_parser() -> argparse.ArgumentParser:
         if name == "init":
             sp.add_argument("--from-env", default=None, metavar="PATH",
                             help="import an existing docker-compose env file (e.g. the old "
-                                 "control-plane.env): keeps the Postgres/MinIO credentials the "
+                                 "control-plane.env): keeps the Postgres/RustFS credentials the "
                                  "live volumes were created with; prints names only")
             sp.add_argument("--answers", default=None, metavar="PATH",
                             help="YAML/JSON answers file (mode 0600); overrides --from-env")
@@ -918,7 +918,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file: the only source of configuration. "
                          "It is served to hosts, and its control_plane section supplies the "
-                         "Postgres DSN, host aliases, API keys, RustFS/MinIO, CI-actions "
+                         "Postgres DSN, host aliases, API keys, RustFS, CI-actions "
                          "and inspector settings")
     p2.add_argument("--pg-dsn", default=None,
                     help="optional Postgres DSN to hydrate the repo from "
@@ -3526,7 +3526,8 @@ def _cp_config(fleet_config_path=None) -> dict:
                 out["postgres_dsn"] = str(dsn)
             # The worker writes render output to RustFS: take its endpoint and credentials from the
             # fleet file too, or it falls back to the image's defaults and is refused (InvalidAccessKeyId).
-            for key in ("rustfs_endpoint", "rustfs_bucket", "rustfs_region", "minio_user", "minio_password"):
+            for key in ("rustfs_endpoint", "rustfs_bucket", "rustfs_region", "rustfs_user", "rustfs_password",
+                        "minio_user", "minio_password"):
                 if section.get(key):
                     out[key] = str(section[key])
     return out
@@ -5145,7 +5146,8 @@ def _maybe_rustfs_client(cp=None):
 
     Configured by the fleet file's control_plane section: rustfs_endpoint,
     rustfs_bucket (default herdr-artifacts), rustfs_region (default us-east-1),
-    minio_user and minio_password (default the fixed dev creds). Returns None
+    rustfs_user and rustfs_password, or the older minio_user and minio_password
+    (default the fixed dev creds). Returns None
     when there is no endpoint so the web server still starts with the
     in-memory stand-in.
     """
@@ -5154,8 +5156,9 @@ def _maybe_rustfs_client(cp=None):
     endpoint = cp.get("rustfs_endpoint")
     bucket = cp.get("rustfs_bucket", "herdr-artifacts")
     region = cp.get("rustfs_region", "us-east-1")
-    access_key = cp.get("minio_user", "herdr")
-    secret_key = cp.get("minio_password", "herdr")
+    from .fleet_config import object_store_credentials
+    access_key, secret_key = object_store_credentials(cp)
+    access_key, secret_key = access_key or "herdr", secret_key or "herdr"
     if not endpoint:
         return None
     client = RustFSClient(endpoint=endpoint, bucket=bucket, region=region,
@@ -5163,7 +5166,7 @@ def _maybe_rustfs_client(cp=None):
     try:
         client.ensure_bucket()
     except Exception:
-        # Bucket creation is best-effort; MinIO may already have it. Don't
+        # Bucket creation is best-effort; the bucket may already exist. Don't
         # crash web startup over object storage.
         pass
     return client

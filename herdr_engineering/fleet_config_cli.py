@@ -119,9 +119,13 @@ def _compose_scalar(key: str, value: Any) -> str:
 
 # Every variable compose.yaml substitutes with no default (or that deploy.sh reads).
 # Extra names are allowed (e.g. HERDR_LLM_PROXY_PORT); these must be present.
-COMPOSE_REQUIRED = ("HERDR_CP_PG_USER", "HERDR_CP_PG_PASSWORD", "HERDR_CP_MINIO_USER",
-                    "HERDR_CP_MINIO_PASSWORD", "HERDR_CP_WEB_BIND", "HERDR_CP_WEB_PUBLIC_PORT",
+COMPOSE_REQUIRED = ("HERDR_CP_PG_USER", "HERDR_CP_PG_PASSWORD", "HERDR_CP_RUSTFS_USER",
+                    "HERDR_CP_RUSTFS_PASSWORD", "HERDR_CP_WEB_BIND", "HERDR_CP_WEB_PUBLIC_PORT",
                     "HERDR_CP_PG_PORT", "GATEWAY_TAILNET_IP")
+# An env/fleet file written while the store was MinIO names its credentials like this; still accepted in
+# place of the RUSTFS pair above so a re-run of deploy.sh keeps an existing install's credentials.
+LEGACY_OBJECT_STORE_COMPOSE = {"HERDR_CP_RUSTFS_USER": "HERDR_CP_MINIO_USER",
+                               "HERDR_CP_RUSTFS_PASSWORD": "HERDR_CP_MINIO_PASSWORD"}
 LOOPBACK = "127.0.0.1"
 
 
@@ -142,7 +146,8 @@ def compose_env(cfg: FleetConfig) -> dict[str, str]:
         if not isinstance(key, str) or not _ENV_NAME.match(key):
             raise FleetConfigError(f"control_plane.compose: {key!r} is not a valid environment variable name")
         out[key] = _compose_scalar(key, value)
-    missing = [k for k in COMPOSE_REQUIRED if not out.get(k)]
+    missing = [k for k in COMPOSE_REQUIRED
+               if not out.get(k) and not out.get(LEGACY_OBJECT_STORE_COMPOSE.get(k, ""))]
     if missing:
         raise FleetConfigError("control_plane.compose is missing required keys: " + ", ".join(missing))
     ip = out["GATEWAY_TAILNET_IP"]
@@ -681,7 +686,7 @@ OPTIONAL_SECRET_LABELS = {"github_token": "GitHub token"}
 def init_config(path: Path, answers: dict | None = None, prompt: Callable = input,
                 secret_prompt: Callable | None = None, *, with_api_keys: bool = False,
                 optional_secrets: tuple[str, ...] = ()) -> Path:
-    """Create a new fleet config. Generates DB/MinIO credentials.
+    """Create a new fleet config. Generates DB/RustFS credentials.
 
     The control plane stays open on the tailnet (``control_plane.api_keys: {}``) and
     ``ingest.api_key`` / ``agent.api_key`` are empty, so clients send no X-API-Key.
@@ -718,11 +723,17 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
     hosts = _collect_hosts(a, prompt)
 
     # Existing credentials (imported with --from-env/--answers) are kept: Postgres and
-    # MinIO apply their users only to an EMPTY volume, so new ones would not work.
+    # the object store apply their users only to an EMPTY volume, so new ones would not work.
     pg_user = str(a.get("pg_user") or "") or f"herdr_{secrets.token_hex(4)}"
     pg_pass = str(a.get("pg_password") or "") or secrets.token_hex(16)
-    minio_user = str(a.get("minio_user") or "") or f"herdr_{secrets.token_hex(4)}"
-    minio_pass = str(a.get("minio_password") or "") or secrets.token_hex(16)
+    # New installs name the S3 store's credentials rustfs_*; answers that still carry the MinIO-era names
+    # (an imported existing env file) keep those names and values, so nothing is regenerated or renamed.
+    legacy_store = not (a.get("rustfs_user") or a.get("rustfs_password")) and bool(
+        a.get("minio_user") or a.get("minio_password"))
+    store = "minio" if legacy_store else "rustfs"
+    store_env = "MINIO" if legacy_store else "RUSTFS"
+    store_user = str(a.get(f"{store}_user") or "") or f"herdr_{secrets.token_hex(4)}"
+    store_pass = str(a.get(f"{store}_password") or "") or secrets.token_hex(16)
     api_keys: dict[str, str] = {}
     ingest_key = agent_key = ""  # empty: hosts send no X-API-Key (open control plane)
     if with_api_keys:
@@ -748,13 +759,13 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
                 "rustfs_endpoint": "http://rustfs:9000",
                 "rustfs_bucket": bucket,
                 "ci_actions": ci_actions,  # true lets operators retry/cancel CI pipelines from the UI
-                "minio_user": minio_user,
-                "minio_password": minio_pass,
+                f"{store}_user": store_user,
+                f"{store}_password": store_pass,
                 "compose": {
                     "HERDR_CP_PG_USER": pg_user,
                     "HERDR_CP_PG_PASSWORD": pg_pass,
-                    "HERDR_CP_MINIO_USER": minio_user,
-                    "HERDR_CP_MINIO_PASSWORD": minio_pass,
+                    f"HERDR_CP_{store_env}_USER": store_user,
+                    f"HERDR_CP_{store_env}_PASSWORD": store_pass,
                     "HERDR_CP_WEB_BIND": web_bind,
                     "HERDR_CP_WEB_PUBLIC_PORT": web_port,
                     "HERDR_CP_PG_PORT": pg_port,
@@ -808,7 +819,7 @@ def _dsn_credentials(dsn: str) -> tuple[str, str, str] | None:
 
 
 def check_credentials_consistent(cfg: FleetConfig) -> None:
-    """pg_dsn, minio_* and compose.HERDR_CP_{PG,MINIO}_* must name the same users and
+    """pg_dsn, rustfs_*/minio_* and compose.HERDR_CP_{PG,RUSTFS,MINIO}_* must name the same users and
     passwords (when the DSN points at the compose `postgres` service). Names only."""
     try:
         cp = cfg.section(CONTROL_PLANE_SECTION)
@@ -822,7 +833,8 @@ def check_credentials_consistent(cfg: FleetConfig) -> None:
             bad.append("pg_dsn user vs compose.HERDR_CP_PG_USER")
         if "HERDR_CP_PG_PASSWORD" in compose and str(compose["HERDR_CP_PG_PASSWORD"]) != creds[1]:
             bad.append("pg_dsn password vs compose.HERDR_CP_PG_PASSWORD")
-    for key, ckey in (("minio_user", "HERDR_CP_MINIO_USER"), ("minio_password", "HERDR_CP_MINIO_PASSWORD")):
+    for key, ckey in (("rustfs_user", "HERDR_CP_RUSTFS_USER"), ("rustfs_password", "HERDR_CP_RUSTFS_PASSWORD"),
+                      ("minio_user", "HERDR_CP_MINIO_USER"), ("minio_password", "HERDR_CP_MINIO_PASSWORD")):
         if key in cp and ckey in compose and str(cp[key]) != str(compose[ckey]):
             bad.append(f"{key} vs compose.{ckey}")
     if bad:
@@ -836,7 +848,8 @@ def check_credentials_consistent(cfg: FleetConfig) -> None:
 # env name -> init answer key. Values are never printed; reports carry names only.
 ENV_IMPORT_MAP = {
     "HERDR_CP_PG_USER": "pg_user", "HERDR_CP_PG_PASSWORD": "pg_password",
-    "HERDR_CP_MINIO_USER": "minio_user", "HERDR_CP_MINIO_PASSWORD": "minio_password",
+    "HERDR_CP_RUSTFS_USER": "rustfs_user", "HERDR_CP_RUSTFS_PASSWORD": "rustfs_password",
+    "HERDR_CP_MINIO_USER": "minio_user", "HERDR_CP_MINIO_PASSWORD": "minio_password",  # pre-RustFS env files
     "HERDR_CP_WEB_BIND": "web_bind", "HERDR_CP_WEB_PUBLIC_PORT": "web_port",
     "HERDR_CP_PG_PORT": "pg_port", "GATEWAY_TAILNET_IP": "gateway_tailnet_ip",
     "FABRIC_LLM_UPSTREAM_KEY": "llm_upstream_key", "FABRIC_LLM_UPSTREAM_URL": "llm_upstream_url",

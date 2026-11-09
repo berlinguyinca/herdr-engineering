@@ -201,7 +201,7 @@ HOSTILE = ["pa$$word", "it's \"quoted\"", "line1\nline2", "trailing\\", "${HOME}
 @pytest.mark.parametrize("value", HOSTILE)
 def test_hostile_secret_round_trips_through_rendered_file_and_compose(tmp_path, value):
     central, envfile = _render(tmp_path, lambda c: c.update(HERDR_CP_PG_PASSWORD=value,
-                                                           HERDR_CP_MINIO_PASSWORD=value))
+                                                           HERDR_CP_RUSTFS_PASSWORD=value))
     r = _config(central, envfile, "compose.yaml", fmt="json")
     assert r.returncode == 0, r.stderr
     svc = json.loads(r.stdout)["services"]
@@ -209,7 +209,7 @@ def test_hostile_secret_round_trips_through_rendered_file_and_compose(tmp_path, 
     def real(v):  # `config` re-escapes a literal $ as $$ so its output can be re-read
         return v.replace("$$", "$")
     assert real(svc["postgres"]["environment"]["POSTGRES_PASSWORD"]) == value
-    assert real(svc["rustfs"]["environment"]["MINIO_ROOT_PASSWORD"]) == value
+    assert real(svc["rustfs"]["environment"]["RUSTFS_SECRET_KEY"]) == value
 
 
 # The compose.yaml of the release before the apps mount, reduced to the part that matters: it still REQUIRES
@@ -240,3 +240,47 @@ def test_a_rollback_to_the_previous_compose_still_renders_with_compose_runs_envi
     r = subprocess.run(["docker", "compose", "-p", "t", "-f", str(old), "config", "-q"],
                        env=env, capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
+
+
+RUSTFS_DIGEST = "sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2"
+
+
+def _rustfs_service(tmp_path, mutate=None):
+    central, envfile = _render(tmp_path, mutate)
+    r = _config(central, envfile, "compose.yaml", fmt="json")
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)["services"]["rustfs"]
+
+
+def test_rustfs_service_is_the_pinned_rustfs_image_not_minio(tmp_path):
+    svc = _rustfs_service(tmp_path)
+    assert svc["image"] == f"rustfs/rustfs:1.0.4@{RUSTFS_DIGEST}"
+    assert not svc.get("command")                      # the image's own entrypoint + CMD ["rustfs"]
+    env = svc["environment"]
+    assert not [k for k in env if k.startswith("MINIO")]
+    assert env["RUSTFS_ACCESS_KEY"].startswith("herdr_") and len(env["RUSTFS_SECRET_KEY"]) == 32
+    assert env["RUSTFS_ACCESS_KEY"] != "rustfsadmin" and env["RUSTFS_SECRET_KEY"] != "rustfsadmin"
+    assert env["RUSTFS_ADDRESS"] == "0.0.0.0:9000" and env["RUSTFS_CONSOLE_ADDRESS"] == "0.0.0.0:9001"
+    assert [v["target"] for v in svc["volumes"]] == ["/data"] and svc["volumes"][0]["source"] == "herdr-cp-rustfs"
+    assert svc["healthcheck"]["test"] == ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
+
+
+def test_rustfs_ports_stay_loopback_only_and_no_file_protocols(tmp_path):
+    svc = _rustfs_service(tmp_path)
+    assert {(p["host_ip"], p["target"]) for p in svc["ports"]} == {("127.0.0.1", 9000), ("127.0.0.1", 9001)}
+    assert not [k for k in svc["environment"] if any(w in k for w in ("FTP", "SFTP", "WEBDAV"))]
+
+
+def test_legacy_minio_variable_names_in_an_existing_env_still_feed_rustfs(tmp_path):
+    def legacy(c):
+        c["HERDR_CP_MINIO_USER"], c["HERDR_CP_MINIO_PASSWORD"] = "minio_live", "placeholder-legacy-pw"
+        del c["HERDR_CP_RUSTFS_USER"], c["HERDR_CP_RUSTFS_PASSWORD"]
+    env = _rustfs_service(tmp_path, legacy)["environment"]
+    assert (env["RUSTFS_ACCESS_KEY"], env["RUSTFS_SECRET_KEY"]) == ("minio_live", "placeholder-legacy-pw")
+
+
+def test_new_names_win_over_legacy_when_both_are_present(tmp_path):
+    def both(c):
+        c["HERDR_CP_MINIO_USER"], c["HERDR_CP_MINIO_PASSWORD"] = "old_user", "old-password-value"
+    env = _rustfs_service(tmp_path, both)["environment"]
+    assert env["RUSTFS_ACCESS_KEY"].startswith("herdr_") and env["RUSTFS_SECRET_KEY"] != "old-password-value"

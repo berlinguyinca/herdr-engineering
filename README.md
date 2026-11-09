@@ -289,7 +289,7 @@ per-user keys:
   `tailscale ip -4`), so it is reachable from any dev.lan machine but not from a
   plain LAN / `0.0.0.0`. The container runs `--allow-open` to acknowledge this
   boundary explicitly.
-- Postgres / MinIO credentials are **randomly generated strong passwords** written
+- Postgres / RustFS credentials are **randomly generated strong passwords** written
   into the central fleet config by `herdr-eng fleet config init` (mode 0600, never
   in git); `deploy.sh` hands compose only a transient rendering of them, and
   DB/object-store ports stay loopback-only.
@@ -324,7 +324,7 @@ herdr-eng control-plane web --port 8080 --api-keys 'view1=viewer,op1=operator'
 # hydrate from durable Postgres state on startup (asyncpg; graceful if absent)
 herdr-eng control-plane web --port 8080 --pg-dsn 'postgresql://herdr:herdr@127.0.0.1:5432/herdr'
 
-# full compose stack (postgres + rustfs(minio) + worker + web)
+# full compose stack (postgres + rustfs + worker + web)
 #   the UI is served at http://dev.lan (port 80) on the Tailnet interface
 herdr-eng fleet config init            # once: writes the central file (0600) with generated secrets
 deploy/control-plane/deploy.sh         # renders compose variables from it, builds and rolls web
@@ -332,7 +332,7 @@ deploy/control-plane/deploy.sh         # renders compose variables from it, buil
 ```
 
 Deployed on **bender**, the control-plane stack serves the HerdR UI at
-`http://dev.lan` (Tailnet IP `:80`) with durable Postgres + MinIO:
+`http://dev.lan` (Tailnet IP `:80`) with durable Postgres + RustFS:
 
 - The web bind address (the Tailnet interface, e.g. `100.104.39.6`) and public port
   (`80`) are `control_plane.compose.HERDR_CP_WEB_BIND` / `HERDR_CP_WEB_PUBLIC_PORT`
@@ -343,9 +343,10 @@ Deployed on **bender**, the control-plane stack serves the HerdR UI at
 - Postgres host port defaults to `127.0.0.1:5432`; set
   `control_plane.compose.HERDR_CP_PG_PORT` to a free loopback port (e.g. `15433`)
   when 5432 is already taken on the host.
-- MinIO is pinned to `minio/minio:RELEASE.2025-09-07T16-13-09Z` (`minio:latest`
-  is not always pullable); swap the image for a real RustFS image later —
-  config-only.
+- The object store is `rustfs/rustfs:1.0.4`, pinned by tag and digest in
+  `deploy/control-plane/compose.yaml`. It cannot read a MinIO volume: see
+  "Object store: MinIO to RustFS" in `deploy/control-plane/README.md` before an existing
+  control plane switches.
 - The image is stamped with the build commit (visible in `/api/v1/health`):
   build with `docker compose build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD)`.
 - **TLS:** traffic inside the Tailnet is already WireGuard-encrypted, so plain
@@ -416,7 +417,7 @@ git) is the only place configuration and secrets live; nobody authors an env fil
 
 ```bash
 # once per control plane: prompts for the public URL, LLM and CI addresses/keys and
-# the host list; generates the DB/MinIO credentials (no API keys: the control plane
+# the host list; generates the DB/RustFS credentials (no API keys: the control plane
 # stays open on the tailnet, control_plane.api_keys: {}); writes the file 0600.
 # Migrating an existing control plane: --from-env ~/.config/herdr-engineering/control-plane.env
 # (see docs/operations/central-config-cutover.md). join/token/revoke rewrite the

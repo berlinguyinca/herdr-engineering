@@ -271,7 +271,7 @@ def test_render_collab_slice_holds_only_the_collab_mapping(tmp_path):
     assert data["sections"]["control_plane"]["values"] == {"collab": COLLAB, "collab_artifacts": {"enabled": False}}
     assert data["hosts"] == {}
     cp = yaml.safe_load(central.read_text())["sections"]["control_plane"]["values"]
-    for secret in (cp["pg_dsn"], cp["minio_password"], *cp["api_keys"]):
+    for secret in (cp["pg_dsn"], cp["rustfs_password"], *cp["api_keys"]):
         assert secret not in text
 
 

@@ -124,7 +124,7 @@ already done in Stage 0. Rollback: Stage 1 section below.
 
 ## Stage 2: shared canary on rustfs (read-only first)
 
-The only shared backend is the herdr rustfs server (`herdr-cp-rustfs`, a MinIO drop-in).
+The only shared backend is the herdr rustfs server (`herdr-cp-rustfs`, the RustFS image).
 No AWS or other S3 service. The operator provisions it once, then enables one host:
 
 1. `herdr-eng build-cache-rustfs-provision` (dry-run), review, then `--apply`. This creates

@@ -6,6 +6,8 @@ import io
 import tempfile
 from typing import Any
 
+from botocore.config import Config
+
 
 class IntegrityError(Exception):
     """SHA-256 verification failed for an object retrieved from RustFS."""
@@ -14,6 +16,21 @@ class IntegrityError(Exception):
 def content_key(data: bytes) -> str:
     hex_ = hashlib.sha256(data).hexdigest()
     return f"sha256/{hex_[:2]}/{hex_[2:4]}/{hex_}"
+
+
+def build_s3_config() -> Config:
+    """botocore config for a self-hosted S3 store (RustFS): path-style URLs, checksums only when required.
+
+    boto3 >= 1.36 sends CRC checksum headers on every put by default, which non-AWS stores may reject, so they
+    are limited to operations that need them. Older botocore does not know those options (and does not send the
+    headers), so it gets the path-style config alone.
+    """
+    base = {"s3": {"addressing_style": "path"}}
+    try:
+        return Config(**base, request_checksum_calculation="when_required",
+                      response_checksum_validation="when_required")
+    except TypeError:
+        return Config(**base)
 
 
 class RustFSClient:
@@ -33,6 +50,7 @@ class RustFSClient:
                 "s3", endpoint_url=endpoint,
                 region_name=region,
                 aws_access_key_id=access_key, aws_secret_access_key=secret_key,
+                config=build_s3_config(),
             )
 
     def ensure_bucket(self) -> None:

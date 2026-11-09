@@ -31,6 +31,21 @@ _log = logging.getLogger(__name__)
 FAIL_CLOSED, LAST_GOOD = "fail_closed", "last_good"
 
 
+def object_store_credentials(values: Any) -> tuple[str | None, str | None]:
+    """(user, password) of the control plane's S3 store from ``control_plane`` values.
+
+    New installs write ``rustfs_user``/``rustfs_password``; a file written while the store was a MinIO stand-in
+    has ``minio_user``/``minio_password``, which stay accepted so an existing install keeps its credentials.
+    A pair is used only when both halves are non-empty strings; the new names win.
+    """
+    if isinstance(values, dict):
+        for user_key, pass_key in (("rustfs_user", "rustfs_password"), ("minio_user", "minio_password")):
+            user, password = values.get(user_key), values.get(pass_key)
+            if isinstance(user, str) and user and isinstance(password, str) and password:
+                return user, password
+    return None, None
+
+
 class FleetConfigError(ValueError):
     """The fleet config file is unreadable, unsafe, or invalid."""
 

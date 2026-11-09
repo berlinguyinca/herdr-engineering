@@ -8,12 +8,12 @@
 #                         NOT SQLite; no large binaries stored here (those live
 #                         in rustfs).
 #
-#   rustfs                object store for artifact payloads. Phase 1 uses
-#                         MinIO as an S3 drop-in because RustFS does not ship a
-#                         maintained container image yet (known open item). The
-#                         client (herdr_engineering.control_plane.rustfs) is
-#                         boto3/S3-agnostic, so swapping in a real RustFS image
-#                         later is a config-only change.
+#   rustfs                object store for artifact payloads: the RustFS image
+#                         (rustfs/rustfs, pinned by digest below). The client
+#                         (herdr_engineering.control_plane.rustfs) is boto3 with
+#                         path-style addressing. A volume written by the former
+#                         MinIO stand-in is NOT readable by RustFS and must be
+#                         migrated, never re-mounted (deploy/control-plane/README.md).
 #
 #   control-plane-worker  the bounded background worker: runs migrations on
 #                         startup, then loops over stale-lease detection, host
@@ -79,28 +79,34 @@ services:
       - "127.0.0.1:${HERDR_CP_PG_PORT:-5432}:5432"
 
   rustfs:
-    # Pinned: minio/minio:latest is not always pullable; this RELEASE tag is
-    # known-good and cached on the deploy host. Swap image here for a real
-    # RustFS image later (config-only).
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # RustFS (github.com/rustfs/rustfs), pinned by tag AND multi-arch index digest (amd64+arm64): the digest is
+    # what is pulled, the tag is for humans. The image runs as UID/GID 10001 and ships /data owned by that user, so a
+    # fresh named volume is writable without a chown. It cannot read a MinIO volume: see deploy/control-plane/README.md
+    # ("Object store: MinIO to RustFS") before pointing an existing control plane at it.
+    image: rustfs/rustfs:1.0.4@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2
     container_name: herdr-cp-rustfs
     restart: unless-stopped
-    command: ["server", "/data", "--console-address", ":9001"]
-    # SECURITY: credentials are substituted from the rendered env file (see postgres).
+    # No `command`: the image's entrypoint starts `rustfs` (a MinIO-style `server /data ...` would be wrong).
+    # SECURITY: credentials are substituted from the rendered env file (see postgres). The upstream default
+    # (rustfsadmin) is public, so there is NO fallback to it. New installs render HERDR_CP_RUSTFS_USER/PASSWORD;
+    # an env file written before the swap only has HERDR_CP_MINIO_USER/PASSWORD, which keep working.
     environment:
-      MINIO_ROOT_USER: "${HERDR_CP_MINIO_USER:?run deploy.sh}"
-      MINIO_ROOT_PASSWORD: "${HERDR_CP_MINIO_PASSWORD:?run deploy.sh}"
+      RUSTFS_ACCESS_KEY: "${HERDR_CP_RUSTFS_USER:-${HERDR_CP_MINIO_USER:?run deploy.sh}}"
+      RUSTFS_SECRET_KEY: "${HERDR_CP_RUSTFS_PASSWORD:-${HERDR_CP_MINIO_PASSWORD:?run deploy.sh}}"
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
     volumes:
       - herdr-cp-rustfs:/data
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
       interval: 5s
       timeout: 3s
       retries: 10
       start_period: 5s
     ports:
       - "127.0.0.1:9000:9000"   # S3 API (loopback-only)
-      - "127.0.0.1:9001:9001"   # MinIO console (loopback-only)
+      - "127.0.0.1:9001:9001"   # RustFS console (loopback-only)
 
   control-plane-web:
     build:

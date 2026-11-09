@@ -67,7 +67,7 @@ def _config(central, envfile, *, profile, fmt="json", env_file=True):
            "HERDR_CP_PIPELINES_DIR": str(d), "HERDR_SHARES_DIR": str(d), "HERDR_SHARE_EVENTS_DIR": str(d),
            "HERDR_COLLAB_MIRROR_DIR": str(d), "HERDR_COLLAB_OUTBOX_DIR": str(d), "HERDR_COLLAB_SPOOL_DIR": str(d)}
     for k in list(env):
-        if k.startswith(("HERDR_MEMORY_", "HERDR_CP_PG", "HERDR_CP_MINIO", "GATEWAY_")):
+        if k.startswith(("HERDR_MEMORY_", "HERDR_CP_PG", "HERDR_CP_MINIO", "HERDR_CP_RUSTFS", "GATEWAY_")):
             del env[k]
     return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
 

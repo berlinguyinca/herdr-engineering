@@ -199,11 +199,12 @@ def memory_compose_env(cp_values: dict, compose: dict[str, str] | None = None) -
                                       "HERDR_LLM_GATEWAY_PORT", "HERDR_LLM_RELAY_PORT")}
     if str(m["port"]) in taken:
         raise _err("port collides with another published port of the control-plane project")
-    secrets_all = [str(cp_values.get(k) or "") for k in ("minio_password",)] + \
-                  [compose.get("HERDR_CP_PG_PASSWORD", ""), compose.get("HERDR_CP_MINIO_PASSWORD", "")]
+    secrets_all = [str(cp_values.get(k) or "") for k in ("rustfs_password", "minio_password")] + \
+                  [compose.get(k, "") for k in ("HERDR_CP_PG_PASSWORD", "HERDR_CP_RUSTFS_PASSWORD",
+                                                "HERDR_CP_MINIO_PASSWORD")]
     for v in [m["db_password"], *m["tenants"].values()]:
         if v and v in secrets_all:
-            raise _err("a memory secret equals a Postgres/MinIO secret; generate separate ones")
+            raise _err("a memory secret equals a Postgres/RustFS secret; generate separate ones")
     return {
         "HERDR_MEMORY_DB_PASSWORD": m["db_password"],
         "HERDR_MEMORY_TENANT_USERS": ",".join(f"{t}:{m['tenants'][t]}" for t in TENANTS),

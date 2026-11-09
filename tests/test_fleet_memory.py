@@ -122,13 +122,13 @@ def test_render_compose_emits_the_five_variables_with_0600(central, tmp_path):
     assert env["HERDR_CP_PG_PASSWORD"]
 
 
-def test_every_memory_secret_differs_from_postgres_and_minio(central):
+def test_every_memory_secret_differs_from_postgres_and_rustfs(central):
     enable(central)
     pg = yaml.safe_load(central.read_text())["sections"]["control_plane"]["values"]["compose"]["HERDR_CP_PG_PASSWORD"]
     edit(central, lambda cp: cp["memory"].__setitem__("db_password", pg + pg))   # distinct
     assert fcc.compose_env(load_fleet_config(central))
     edit(central, lambda cp: cp["compose"].__setitem__("HERDR_CP_PG_PASSWORD", cp["memory"]["db_password"]))
-    with pytest.raises(FleetConfigError, match="equals a Postgres/MinIO secret"):
+    with pytest.raises(FleetConfigError, match="equals a Postgres/RustFS secret"):
         fcc.compose_env(load_fleet_config(central))
 
 

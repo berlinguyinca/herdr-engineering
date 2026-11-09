@@ -9,7 +9,7 @@ Compose project (spec 0190). It is the structured-state backbone the unified
 | Service              | Image                 | Role                                                    |
 |----------------------|-----------------------|---------------------------------------------------------|
 | `postgres`           | `postgres:16-alpine`  | Structured state (missions, sessions, services, events, token_usage, state_snapshots, ...). Not SQLite. |
-| `rustfs`             | `minio/minio`         | Object store for artifact payloads. **MinIO drop-in** (see below). |
+| `rustfs`             | `rustfs/rustfs`       | S3 object store for artifact payloads, pinned by tag and digest in `compose.yaml`. |
 | `control-plane-worker` | `herdr-engineering`  | Bounded background worker: migrations on startup, then stale-lease / health / snapshot / artifact-GC passes. |
 
 ## Design notes
@@ -22,10 +22,25 @@ Compose project (spec 0190). It is the structured-state backbone the unified
   record + bindings.
 - **The worker is separate from the web frontend** (spec §95): GC / retention /
   stale-lease detection / snapshot generation run here, never in the UI.
-- **RustFS image (open item).** RustFS does not yet ship a maintained container
-  image, so Phase 1 uses MinIO as an S3-compatible drop-in. The client
-  (`herdr_engineering.control_plane.rustfs`) is boto3/S3-agnostic, so swapping
-  in a real RustFS image later is a config-only change.
+- **Object store: MinIO to RustFS.** The `rustfs` service runs the real RustFS image,
+  `rustfs/rustfs:1.0.4` pinned by multi-arch index digest. The client
+  (`herdr_engineering.control_plane.rustfs`) is boto3 with path-style addressing and
+  checksums only when required. The credentials are the variables
+  `HERDR_CP_RUSTFS_USER`/`HERDR_CP_RUSTFS_PASSWORD` (fleet config `rustfs_user`/`rustfs_password`).
+  An existing install keeps working under the old names (`HERDR_CP_MINIO_*`,
+  `minio_user`/`minio_password`): `compose.yaml` falls back to them, `fleet config init --from-env`
+  keeps them and does not rename or regenerate them. There is no default credential: the upstream
+  `rustfsadmin` is public and is always overridden.
+  **A volume written by the former MinIO container cannot be read by RustFS.** If
+  `herdr-cp-rustfs` contains `.minio.sys`, do NOT recreate the service on it, and do not delete the
+  volume. Copy the objects at the S3 level while the old MinIO is still running (for example
+  `mc mirror old/herdr-artifacts new/herdr-artifacts` against a second, empty RustFS on another
+  volume), or restore from a backup into a fresh RustFS, then switch the service over.
+  `deploy.sh` only recreates `control-plane-web`, `control-plane-worker` and `llm-proxy`
+  (`--no-deps`), so a normal deploy never touches the object store; only a manual `docker compose up`
+  of `rustfs` does. A fresh volume is writable as-is (the image ships `/data` owned by UID 10001).
+  The `build-cache-rustfs-provision` helper still drives the MinIO client `mc` inside the container,
+  which the RustFS image does not contain; see its docs before using it against this image.
 - **Bridge networking (not host).** Unlike `deploy/fabric-stack` (which needs
   host networking for the gateway + CoreDNS), this project only needs the
   services to reach each other, so they resolve by service name.
@@ -50,10 +65,10 @@ maintain.
 
 ```bash
 # 1) once: create the central file (prompts for the public URL, LLM and CI
-#    address/keys and the host list; generates Postgres/MinIO credentials. API keys
+#    address/keys and the host list; generates Postgres/RustFS credentials. API keys
 #    stay off: control_plane.api_keys is {} and the control plane is open on the tailnet)
 herdr-eng fleet config init
-#    an EXISTING control plane must keep its Postgres/MinIO credentials (the live
+#    an EXISTING control plane must keep its Postgres/object-store credentials (the live
 #    volumes were created with them): import the old env file instead - names, never
 #    values, are reported; anything still missing is prompted for.
 #    See docs/operations/central-config-cutover.md for the full order.
@@ -96,7 +111,7 @@ substitution variables only exist while `deploy.sh` runs. Compose refuses to sta
 without them, and DB/object-store ports stay loopback-only.
 
 Settings of the reserved `control_plane` section the servers read: `pg_dsn`,
-`host_aliases`, `api_keys`, `rustfs_*`/`minio_*`, `self_host`, `web_port`,
+`host_aliases`, `api_keys`, `rustfs_*` (older files: `minio_*`), `self_host`, `web_port`,
 `ci_actions` (true enables CI retry/cancel), `ci_log_tests` (test counts read from finished runs' CI logs; on by default, see `docs/ci-test-reports.md`), `deployment_definitions` (absolute path, as the
 web container sees it, to a checkout of InferWeave's `deploy/pipelines`; read live and validated with
 the same rules as its `validate.py`. Absent: no definitions, any host may report any component and the

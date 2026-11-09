@@ -1,7 +1,7 @@
 # Build cache central storage (spec 04)
 
 > **Shared tier = the herdr rustfs server (2026-11-04 operator decision).** The only
-> shared backend is the rustfs (MinIO drop-in) container `herdr-cp-rustfs`, bucket
+> shared backend is the rustfs (RustFS) container `herdr-cp-rustfs`, bucket
 > `herdr-build-cache`. No AWS or other S3 service is used. The configuration keys keep
 > their historical S3-flavoured names (`endpoint_ref`, `registry_file`,
 > `credentials_file`, `SCCACHE_S3_RW_MODE`, `[cache.s3]` in the sccache TOML) because

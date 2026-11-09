@@ -106,7 +106,7 @@ class AdminCredential:
 def load_admin_credential(central: Path | None = None) -> AdminCredential:
     """Read the rustfs root credential from the central fleet config (0600 file).
 
-    The same file ``deploy.sh`` renders HERDR_CP_MINIO_USER / _PASSWORD from.
+    The same file ``deploy.sh`` renders HERDR_CP_RUSTFS_USER / _PASSWORD (older files: HERDR_CP_MINIO_*) from.
     """
     from .fleet_config import CONTROL_PLANE_SECTION, FleetConfigError, load_fleet_config
     path = Path(central) if central else CENTRAL_FLEET_CONFIG
@@ -114,9 +114,11 @@ def load_admin_credential(central: Path | None = None) -> AdminCredential:
         values = load_fleet_config(path).section(CONTROL_PLANE_SECTION)
     except FleetConfigError as exc:
         raise ProvisionError(f"admin credential unavailable: {exc}") from None
-    user, password = values.get("minio_user"), values.get("minio_password")
-    if not isinstance(user, str) or not user or not isinstance(password, str) or not password:
-        raise ProvisionError("central fleet config has no control_plane.minio_user/minio_password")
+    from .fleet_config import object_store_credentials
+    user, password = object_store_credentials(values)
+    if user is None or password is None:
+        raise ProvisionError("central fleet config has no control_plane.rustfs_user/rustfs_password "
+                             "(or the older minio_user/minio_password)")
     return AdminCredential(user, password)
 
 

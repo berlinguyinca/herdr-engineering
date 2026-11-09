@@ -79,7 +79,7 @@ def test_slice_holds_only_the_share_and_cognito_keys(tmp_path):
     text = out.read_text()
     full = yaml.safe_load(central.read_text())
     cpv = full["sections"]["control_plane"]["values"]
-    for value in (cpv["pg_dsn"], cpv["minio_password"], "placeholder-api-key-value", "owner-test", "team.test",
+    for value in (cpv["pg_dsn"], cpv["rustfs_password"], "placeholder-api-key-value", "owner-test", "team.test",
                   full["sections"]["llm"]["values"]["upstream_key"]):
         assert value not in text
     fcc.check_share_slice(load_fleet_config(out))      # the container accepts exactly this
