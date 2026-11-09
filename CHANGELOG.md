@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Single-operator phone account acts as the room owner with no `collab_user`
+- In `single_operator` mode a YAML bridge account with role `operator` now acts as `operator_user` for rooms, groups and agent bots, so the phone app lists fabric agents and workspace rooms without a hand-written `collab_user` link. An explicit `collab_user` still wins. Cognito-derived accounts, other roles, replaced accounts and servers that are not single-operator stay unlinked. Tests in `tests/control_plane/test_rakazo_rooms.py`.
+
 ### Fabric compaction retries a deferred projection checkpoint on every tick
 - With `fabric_compaction.publish_projection_checkpoint`, a publish deferred by the materializer lock (`projection checkpoint deferred (CheckpointInvalid)`) was only retried on the next drained compaction pass, possibly a day later. The compactor now retries it on every worker tick, bypassing `interval_seconds`, with no compaction work and the unchanged `projection_lock_wait_seconds`; the pending flag clears only on a successful publish. Tests in `tests/control_plane/test_compaction_publishes_projection_checkpoint.py` (real PostgreSQL).
 
