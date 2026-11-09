@@ -4434,7 +4434,7 @@ def _cmd_cp_web(args) -> int:
         from .control_plane.collab import FileEventLog
         sink = FileEventLog(args.collab_log_file)
     repo = ControlPlaneRepo(sink=sink, host_aliases=_host_aliases_from(cp),
-                            inspector_limits=inspector_limits)
+                            inspector_limits=inspector_limits, journal_suppression=_journal_suppression(cp))
     if args.seed_demo:
         _seed_demo(repo)
     rustfs = _maybe_rustfs_client(cp)
@@ -5355,6 +5355,15 @@ def _fabric_compaction_settings(cp):
         publish_projection_checkpoint=raw.get("publish_projection_checkpoint") is True,
         projection_lock_wait_seconds=number("projection_lock_wait_seconds", 60, 0),
         normalize_service_timestamps=raw.get("normalize_service_timestamps") is not False)
+
+
+def _journal_suppression(cp):
+    """``control_plane.journal_suppression`` as JournalSuppression (everything on by default, unknown keys rejected)."""
+    from .control_plane.journal_suppression import JournalSuppression
+    try:
+        return JournalSuppression.from_config((cp or {}).get("journal_suppression"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
 
 
 def _share_worker_settings(cp):

@@ -334,3 +334,14 @@ def test_fabric_compaction_normalises_service_timestamps_unless_exactly_false():
                                        ).normalize_service_timestamps is True
     assert _fabric_compaction_settings({"fabric_compaction": {"normalize_service_timestamps": False}}
                                        ).normalize_service_timestamps is False
+
+
+def test_journal_suppression_config_defaults_on_and_rejects_bad_keys():
+    from herdr_engineering.cli import _journal_suppression
+    assert _journal_suppression({}).session_noop is True
+    assert _journal_suppression(None).inspector_tool_updates is True
+    assert _journal_suppression({"journal_suppression": {"inspector_zero_usage": False}}).inspector_zero_usage is False
+    with pytest.raises(SystemExit, match="unknown key: sessions_noop"):
+        _journal_suppression({"journal_suppression": {"sessions_noop": True}})
+    with pytest.raises(SystemExit, match="session_heartbeat_seconds"):
+        _journal_suppression({"journal_suppression": {"session_heartbeat_seconds": 9999}})
