@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fabric compaction retries a deferred projection checkpoint on every tick
+- With `fabric_compaction.publish_projection_checkpoint`, a publish deferred by the materializer lock (`projection checkpoint deferred (CheckpointInvalid)`) was only retried on the next drained compaction pass, possibly a day later. The compactor now retries it on every worker tick, bypassing `interval_seconds`, with no compaction work and the unchanged `projection_lock_wait_seconds`; the pending flag clears only on a successful publish. Tests in `tests/control_plane/test_compaction_publishes_projection_checkpoint.py` (real PostgreSQL).
+
 ### Guest level: Direct is no longer labelled "for now"
 - The team-room guest-level card calls the level plain "Direct" and says it acts as Suggest only when Direct is switched off on the service (`team_rooms.direct_enabled`). Tests in `packages/collab-team-rooms.test.js` updated.
 
