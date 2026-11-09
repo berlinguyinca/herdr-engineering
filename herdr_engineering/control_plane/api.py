@@ -561,6 +561,7 @@ class ControlPlaneServer:
         self._build_assistant_apps(assistant_apps_dsn)
         if self.rakazo is not None:
             self.rakazo.single_operator_fn = lambda: self.single_operator
+            self.rakazo.operator_user_fn = lambda: self.operator_user
         self._build_reminders(assistant_apps_dsn)
         self.assistant.canonical_person = self._canonical_person
         from .ingest import IngestService
@@ -3869,6 +3870,15 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 raw = server._control_plane_value(server.fleet_config, "ai_sync")
                 try:
                     return self._json(parse_ai_sync(raw)) if raw is not None else self._json(
+                        {"error": "not configured"}, 404)
+                except ValueError:
+                    return self._json({"error": "not configured"}, 404)
+            if resource == "agent-rules" and parts[4:] == ["config"]:
+                # Read-only, from the central fleet YAML; an unusable or invalid section reads as not configured.
+                from .agent_rules_config import parse_agent_rules
+                raw = server._control_plane_value(server.fleet_config, "agent_rules")
+                try:
+                    return self._json(parse_agent_rules(raw)) if raw is not None else self._json(
                         {"error": "not configured"}, 404)
                 except ValueError:
                     return self._json({"error": "not configured"}, 404)

@@ -176,7 +176,8 @@ class PostgresSource(DurableSource):
                  events_table: str = "fabric_events", dsn: str | None = None,
                  use_checkpoints: bool = True, checkpoint_publish: bool = False,
                  inspector_snapshots: bool = False,
-                 checkpoint_lock_wait: float = 0.0):
+                 checkpoint_lock_wait: float = 0.0,
+                 checkpoint_budgets: Any = None):
         self._owned_runner = None
         if run is None:
             self._owned_runner = _LoopRunner()
@@ -192,6 +193,7 @@ class PostgresSource(DurableSource):
         self.checkpoint_enabled = bool(use_checkpoints and dsn and events_table == 'fabric_events')
         self.checkpoint_publish = checkpoint_publish
         self.checkpoint_lock_wait = checkpoint_lock_wait
+        self.checkpoint_budgets = checkpoint_budgets  # None = projection_recovery defaults
         self.recovery_info = None
         self._history_provider = None
 

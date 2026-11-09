@@ -15,6 +15,21 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Labels come from the column position in CSS, because the sanitiser keeps no `data-*` attributes and its allowlist is unchanged. The table carries explicit ARIA roles (and keeps its header row, visually hidden) because browsers drop table semantics once `display` changes. The roles and classes are only emitted with the full stylesheet, so the 4 KiB minimum-cap envelope is unchanged.
 - `report-how-to-read`, `report-anchors` and `report-print` Playwright tests now honour `BROWSERS` (default `chromium,firefox`; a missing engine is skipped). `page.pdf()` checks stay Chromium-only. New `report-narrow-tables` test.
 
+### `/herdr::join`: one skill to join the workspace room from any harness
+- New skill `herdr-join` (`herdr_engineering/skill_data/herdr-join`, linked at `skills/herdr-join`). It reads `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID` and `HERDR_PANE_ID`, runs the existing `herdr-eng rooms join-fabric NAME --json` (tokenless tailnet fabric trust; `--no-workspace` opts out), reports agent id, room and the fixed `read`/`post`/`instruct`/`execute` grant, and says plainly that `coordinate` and `grant_agent` are owner-only.
+- `herdr-eng summary install|verify|uninstall` now manages it with `summary` and `handoff` (`--skill herdr-join`): a symlink into Claude Code, Codex, Pi and OpenCode skill directories plus an OpenCode `/herdr-join` command. Nothing pre-existing is overwritten; a collision is reported as `preserved`. No top-level `/join` alias and no Pi/Codex prompt are written.
+- No session-start auto-join hook: that stays an owner decision. The router entry (`join` in the `herdr` skill's `commands.json`) lives in the separate herdr-handoff repo.
+- Tests: `tests/test_herdr_join_skill.py`, `tests/control_plane/test_collab_fabric_join_skill_e2e.py` (real CLI against the real fabric listener).
+
+### Single-operator phone account acts as the room owner with no `collab_user`
+- In `single_operator` mode a YAML bridge account with role `operator` now acts as `operator_user` for rooms, groups and agent bots, so the phone app lists fabric agents and workspace rooms without a hand-written `collab_user` link. An explicit `collab_user` still wins. Cognito-derived accounts, other roles, replaced accounts and servers that are not single-operator stay unlinked. Tests in `tests/control_plane/test_rakazo_rooms.py`.
+
+### Fabric compaction retries a deferred projection checkpoint on every tick
+- With `fabric_compaction.publish_projection_checkpoint`, a publish deferred by the materializer lock (`projection checkpoint deferred (CheckpointInvalid)`) was only retried on the next drained compaction pass, possibly a day later. The compactor now retries it on every worker tick, bypassing `interval_seconds`, with no compaction work and the unchanged `projection_lock_wait_seconds`; the pending flag clears only on a successful publish. Tests in `tests/control_plane/test_compaction_publishes_projection_checkpoint.py` (real PostgreSQL).
+
+### Guest level: Direct is no longer labelled "for now"
+- The team-room guest-level card calls the level plain "Direct" and says it acts as Suggest only when Direct is switched off on the service (`team_rooms.direct_enabled`). Tests in `packages/collab-team-rooms.test.js` updated.
+
 ### Report previews open with a "How to read this report" legend
 
 - A collapsed-by-default `<details>` under the report title explains only what that report shows: findings, the question/evidence/figure tags, limits, next checks, a figure's reading guide, downloads and the `#` permalinks. Every row is derived from what the renderer emits. The descriptor has no severity or confidence field, so the legend says "Severity, confidence: Not used" instead of inventing a scale. The text is static (never copied from the report) and the summary is a native, keyboard-operable control with a visible focus ring.

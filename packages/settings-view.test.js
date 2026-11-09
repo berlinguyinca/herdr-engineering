@@ -22,3 +22,7 @@ test('with no capabilities every optional service is off and nothing links elsew
 test('a probe failure is stated instead of listing everything as off', () => {
   assert.match(renderSettings(null), /Could not read which services are enabled/);
 });
+
+test('the page points operators at the settings CLI', () => {
+  assert.match(renderSettings([]), /herdr-eng settings enable/);
+});

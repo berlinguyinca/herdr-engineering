@@ -255,6 +255,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _register_google(sub)
     from .fleet_watch.cli import register as _register_fleet_watch
     _register_fleet_watch(sub)
+    from .settings_cli import register as _register_settings
+    _register_settings(sub)
 
     # fleet ----------------------------------------------------------------
     p = sub.add_parser("fleet", help="one-command fleet onboarding + version sync")
@@ -361,6 +363,8 @@ def _build_parser() -> argparse.ArgumentParser:
     pu.add_argument("--no-pull", action="store_true", help="skip controller git pull")
     pu.add_argument("--no-reinstall", action="store_true",
                     help="skip controller local pip reinstall")
+    pu.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
+                    help="central fleet config file holding control_plane.agent_rules (the pinned shared rules)")
     pu.add_argument("--json", action="store_true")
     pu.set_defaults(func=_cmd_fleet_update)
     ps = fsub.add_parser("status", help="read-only fleet version/registration status")
@@ -464,8 +468,8 @@ def _build_parser() -> argparse.ArgumentParser:
         p2.add_argument("--project-dir", default=None, help="project root for --scope project (default: cwd)")
         if name != "verify":
             p2.add_argument("--dry-run", action="store_true")
-        p2.add_argument("--skill", choices=("summary", "handoff", "all"), default="all",
-                        help="which skill to manage (default: both /summary and /handoff)")
+        p2.add_argument("--skill", choices=("summary", "handoff", "herdr-join", "all"), default="all",
+                        help="which skill to manage (default: /summary, /handoff and /herdr::join)")
         p2.add_argument("--json", action="store_true")
         p2.set_defaults(func=_cmd_summary_manage)
     p2 = smsub.add_parser("history", help="read-only normalized history of the current agent session")
@@ -1549,6 +1553,7 @@ def _cmd_fleet_join(args) -> int:
         attach=not args.no_attach,
         provision=not args.no_provision,
         fleet_config=None if args.no_credentials else Path(args.fleet_config).expanduser(),
+        agent_rules_config=Path(args.fleet_config).expanduser(),
         roles=([r.strip() for r in args.roles.split(",") if r.strip()] if args.roles else None),
         control_plane_url=args.control_plane_url,
     )
@@ -1662,6 +1667,7 @@ def _cmd_fleet_update(args) -> int:
         gateway=DEFAULT_GATEWAY,
         pull_controller=not args.no_pull,
         reinstall_local=not args.no_reinstall,
+        fleet_config=Path(args.fleet_config).expanduser(),
     )
     if args.json:
         _print_json(report)
@@ -1676,7 +1682,8 @@ def _cmd_fleet_update(args) -> int:
         for h in report.get("status", {}).get("hosts", []):
             print(f"  {h['host']:12} herdr-eng={h['herdr_eng']} build-gate={h['build_gate']} "
                   f"agent={h['agent']} revision={h.get('revision', 'unknown')} "
-                  f"cleanup={h.get('cleanup', 'unknown')} summary={h.get('summary', 'unknown')}")
+                  f"cleanup={h.get('cleanup', 'unknown')} summary={h.get('summary', 'unknown')} "
+                  f"rules={h.get('rules', 'unknown')}")
         fs = report.get("steps", {}).get("fleet_sync", {})
         if fs.get("rc") != 0 and fs.get("stderr"):
             print(f"  !! {fs['stderr']}")
@@ -4088,6 +4095,7 @@ def _cmd_cp_checkpoint(args) -> int:
         stage = 'materialization'
         result = refresh_checkpoint(dsn, host_aliases=_host_aliases_from(cp),
                                     inspector_limits=cp.get("inspector_limits") or {},
+                                    checkpoint_budgets=_checkpoint_budgets_from(cp),
                                     lock_wait=max(0.0, getattr(args, "lock_wait", 0.0) or 0.0))
     except (Exception, SystemExit) as exc:
         error = {"ok": False, "error": type(exc).__name__, "stage": stage}
@@ -4416,7 +4424,8 @@ def _cmd_cp_web(args) -> int:
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
     _require_durable_review_gate(cp, dsn)
-    source = _maybe_pg_source(dsn, inspector_snapshots=_inspector_snapshot_settings(cp)[0])
+    source = _maybe_pg_source(dsn, inspector_snapshots=_inspector_snapshot_settings(cp)[0],
+                              checkpoint_budgets=_checkpoint_budgets_from(cp))
     # When durable storage is wired, attach a write-through sink so every
     # ingested event persists to Postgres instead of dying with the in-memory
     # repo on restart (Phase 1a). Best-effort; never blocks or breaks serving.
@@ -4626,6 +4635,9 @@ def _cmd_cp_web(args) -> int:
                              artifact_delete_allow_keyless_owner=artifact_delete.allow_keyless,
                              collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled,
                              member_web=member_web)
+    # The constructor ran the boot replay (load_into): return its freed heap to the OS before serving.
+    from .control_plane.heap_release import release_heap_if_enabled
+    release_heap_if_enabled(_heap_release_enabled(cp))
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read
         svr.artifact_graph_gate.load_retractions(artifact_adapter("load_retractions"))
@@ -5162,6 +5174,15 @@ def _maybe_rustfs_client(cp=None):
     return client
 
 
+def _heap_release_enabled(cp) -> bool:
+    """``control_plane.heap_release.enabled`` (default true); a malformed section refuses the start."""
+    from .control_plane.heap_release import heap_release_enabled
+    try:
+        return heap_release_enabled(cp)
+    except ValueError as exc:
+        raise SystemExit(f"fleet config control_plane.{exc}") from None
+
+
 def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
     """``control_plane.inspector_snapshots: {enabled, interval_seconds}`` (off unless ``enabled`` is exactly true)."""
     raw = (cp or {}).get("inspector_snapshots") or {}
@@ -5415,9 +5436,11 @@ def _worker_fabric_compactor(fleet_config_path):
     if settings.publish_projection_checkpoint and cp.get("pg_dsn"):
         from .control_plane.projection_refresh import refresh_checkpoint
         dsn, aliases, limits = cp["pg_dsn"], _host_aliases_from(cp), cp.get("inspector_limits") or {}
+        budgets = _checkpoint_budgets_from(cp)
 
         def publisher(lock_wait):
-            return refresh_checkpoint(dsn, host_aliases=aliases, inspector_limits=limits, lock_wait=lock_wait)
+            return refresh_checkpoint(dsn, host_aliases=aliases, inspector_limits=limits, lock_wait=lock_wait,
+                                      checkpoint_budgets=budgets)
     return FabricCompactor(settings, projection_publisher=publisher)
 
 
@@ -5456,7 +5479,16 @@ def _worker_artifact_reconciler(fleet_config_path, rustfs):
     return ArtifactReconciler(lambda conn: ArtifactStore(conn, rustfs), **settings)
 
 
-def _maybe_pg_source(dsn, *, inspector_snapshots=False):
+def _checkpoint_budgets_from(cp):
+    """Validated control_plane.projection_checkpoint row budgets (defaults when absent)."""
+    from .control_plane.projection_recovery import checkpoint_budgets
+    try:
+        return checkpoint_budgets(cp.get("projection_checkpoint"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+
+
+def _maybe_pg_source(dsn, *, inspector_snapshots=False, checkpoint_budgets=None):
     """Build a PostgresSource from a DSN, or None if not provided."""
     if not dsn:
         return None
@@ -5464,7 +5496,8 @@ def _maybe_pg_source(dsn, *, inspector_snapshots=False):
 
     # Lazy: PostgresSource connects on its own persistent event loop when the
     # server first hydrates from Postgres, so connect+fetch share one loop.
-    return PostgresSource(dsn=dsn, inspector_snapshots=inspector_snapshots)
+    return PostgresSource(dsn=dsn, inspector_snapshots=inspector_snapshots,
+                          checkpoint_budgets=checkpoint_budgets)
 
 
 def _worker_snapshot_writer(fleet_config_path):
@@ -5733,7 +5766,9 @@ def _cmd_cp_worker(args) -> int:
                 if fleet_cp.get("pg_dsn"):
                     refresh = ProjectionRefresh(
                         fleet_cp["pg_dsn"], host_aliases=_host_aliases_from(fleet_cp),
-                        inspector_limits=fleet_cp.get("inspector_limits") or {})
+                        inspector_limits=fleet_cp.get("inspector_limits") or {},
+                        checkpoint_budgets=_checkpoint_budgets_from(fleet_cp),
+                        heap_release=_heap_release_enabled(fleet_cp))
                     refresh.start()
                 await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
                                  artifact_job_runner=runner, inspector_snapshotter=snapshotter,

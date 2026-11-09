@@ -11,6 +11,7 @@ from pathlib import Path
 
 from tests.control_plane.test_collab_fabric_auth import fabric_agent, fw, lan_ip  # noqa: F401
 from tests.control_plane.test_collab_fabric_autojoin import aw, lw, set_trust  # noqa: F401
+from tests.control_plane.test_collab_fabric_autojoin import trust as base_trust
 from tests.control_plane.test_collab_fabric_trust import localapi  # noqa: F401
 from tests.control_plane.test_collab_tasks import USERS, code, svc  # noqa: F401
 
@@ -136,3 +137,37 @@ def test_discovery_refuses_what_the_listener_could_not_bind(fake_host_config):
         assert rooms_client._discover_fabric_url() is None
         with pytest.raises(ValueError, match="fabric listener"):
             rooms_client._fabric_url(None)
+
+
+WS_ENV = {"HERDR_WORKSPACE_ID": "ws-1", "HERDR_TAB_ID": "tab-2", "HERDR_PANE_ID": "pane-3", "HERDR_WORKSPACE_LABEL": "my work"}
+
+
+def ws_on(lw):
+    from herdr_engineering.control_plane.collab_fabric_trust import normalize_fabric_trust
+    lw.s.fabric_trust = normalize_fabric_trust(base_trust(auto_join=True, workspace_rooms=True))
+
+
+def test_join_fabric_sends_the_workspace_env_and_lands_in_the_room(lw, tmp_path):
+    ws_on(lw)
+    rc, out, err = run(lw, tmp_path, "join-fabric", "bender-claude", env_extra=WS_ENV)
+    assert rc == 0, (out, err)
+    data = json.loads(identity(tmp_path).read_text())
+    agent = lw.s._agents[data["agent_id"]]
+    assert (agent["workspace"]["workspace_id"], agent["workspace"]["tab_id"], agent["workspace"]["pane_id"]) == ("ws-1", "tab-2", "pane-3")
+    assert data["room_id"] == agent["workspace"]["room_id"] and lw.s._rooms[data["room_id"]]["name"] == "bender/ws-1"
+    assert set(data) == {"agent_id", "name", "machine", "room_id"}
+
+
+def test_join_fabric_no_workspace_opts_out(lw, tmp_path):
+    ws_on(lw)
+    rc, _, err = run(lw, tmp_path, "join-fabric", "bender-claude", "--no-workspace", env_extra=WS_ENV)
+    assert rc == 0, err
+    data = json.loads(identity(tmp_path).read_text())
+    assert set(data) == {"agent_id", "name", "machine"} and not lw.s._agents[data["agent_id"]].get("workspace")
+
+
+def test_join_fabric_without_the_env_is_the_old_behaviour(lw, tmp_path):
+    ws_on(lw)
+    rc, _, err = run(lw, tmp_path, "join-fabric", "bender-claude")
+    assert rc == 0, err
+    assert set(json.loads(identity(tmp_path).read_text())) == {"agent_id", "name", "machine"}
