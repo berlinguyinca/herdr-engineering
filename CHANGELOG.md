@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### `/herdr::join` works with no flags after `herdr-eng summary install`
+- `rooms join-fabric` found the listener only in the fetched host config, which agent hosts do not carry, so a bare call failed. It now also reads `fabric_join` (`control_plane_url`, or `listen_host` + `listen_port`) from the machine config `~/.config/herdr-engineering/config.yaml` and falls back to the readable fleet config's `control_plane.collab.fabric_trust`. YAML only, no new environment variable; `--control-plane` still overrides.
+- `herdr-eng summary install` (and `scripts/install.sh`) records the fleet config's listener under `fabric_join` idempotently and never overwrites a differing value (reported as `preserved`). New read-only `herdr-eng summary install --check` verifies per harness the skill symlink, the OpenCode command, listener resolution and reachability, and the hook state, exiting 1 on a failure; no secrets are printed.
+- Opt-in auto-join, off by default: `fabric_join.auto_join_on_session_start: true` installs one Claude Code `SessionStart` hook (appended, manifest tracked, removed by uninstall; HerdR panes only; never fails the session). Codex, OpenCode and Pi get no hook (no verified safe contract) and are reported `unsupported`. Installing with the key false installs nothing.
+- Tests: `tests/control_plane/test_fabric_join_setup.py` (real CLI, real fabric listener).
+
 ### `/herdr::join`: one skill to join the workspace room from any harness
 - New skill `herdr-join` (`herdr_engineering/skill_data/herdr-join`, linked at `skills/herdr-join`). It reads `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID` and `HERDR_PANE_ID`, runs the existing `herdr-eng rooms join-fabric NAME --json` (tokenless tailnet fabric trust; `--no-workspace` opts out), reports agent id, room and the fixed `read`/`post`/`instruct`/`execute` grant, and says plainly that `coordinate` and `grant_agent` are owner-only.
 - `herdr-eng summary install|verify|uninstall` now manages it with `summary` and `handoff` (`--skill herdr-join`): a symlink into Claude Code, Codex, Pi and OpenCode skill directories plus an OpenCode `/herdr-join` command. Nothing pre-existing is overwritten; a collision is reported as `preserved`. No top-level `/join` alias and no Pi/Codex prompt are written.

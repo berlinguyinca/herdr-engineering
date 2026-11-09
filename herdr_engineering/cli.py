@@ -468,10 +468,16 @@ def _build_parser() -> argparse.ArgumentParser:
         p2.add_argument("--project-dir", default=None, help="project root for --scope project (default: cwd)")
         if name != "verify":
             p2.add_argument("--dry-run", action="store_true")
+        if name == "install":
+            p2.add_argument("--check", action="store_true",
+                            help="read-only: verify skills, OpenCode command, fabric listener and hook state; exit 1 on a failure")
         p2.add_argument("--skill", choices=("summary", "handoff", "herdr-join", "all"), default="all",
                         help="which skill to manage (default: /summary, /handoff and /herdr::join)")
         p2.add_argument("--json", action="store_true")
         p2.set_defaults(func=_cmd_summary_manage)
+    p2 = smsub.add_parser("join-hook", help="session-start hook body (opt-in): join the HerdR workspace room; never fails")
+    p2.add_argument("harness", choices=("claude", "codex", "opencode", "pi"))
+    p2.set_defaults(func=lambda a: __import__("herdr_engineering.fabric_join_setup", fromlist=["x"]).run_join_hook(a.harness))
     p2 = smsub.add_parser("history", help="read-only normalized history of the current agent session")
     p2.add_argument("--agent", choices=("claude", "pi", "codex", "opencode"), default=None)
     p2.add_argument("--session", default=None, help="session id or transcript path")
@@ -1347,19 +1353,34 @@ def _cmd_handoff_harness(args) -> int:
 
 
 def _cmd_summary_manage(args) -> int:
+    from . import fabric_join_setup as fj
     from . import session_summary as ss
-    kw = dict(scope=args.scope, home=Path(args.home) if args.home else None,
-              project=Path(args.project_dir) if args.project_dir else None)
+    home = Path(args.home) if args.home else None
+    kw = dict(scope=args.scope, home=home, project=Path(args.project_dir) if args.project_dir else None)
+    skills = ss.SKILLS if args.skill == "all" else (args.skill,)
+    check = getattr(args, "check", False)
     ok = True
     results = []
-    for skill in (ss.SKILLS if args.skill == "all" else (args.skill,)):
-        if args.summary_command == "verify":
+    for skill in skills:
+        if args.summary_command == "verify" or check:
             good, part = ss.verify(skill=skill, **kw)
             ok = ok and good
         else:
             fn = ss.install if args.summary_command == "install" else ss.uninstall
             part = fn(dry_run=args.dry_run, skill=skill, **kw)
         results += part
+    if "herdr-join" in skills and args.scope == "global":
+        dry = getattr(args, "dry_run", False)
+        if check:
+            extra = fj.check_setup(home)
+            ok = ok and not any(i.action in fj.FAIL_ACTIONS for i in extra)
+        elif args.summary_command == "install":
+            extra = [fj.install_listener(home, dry_run=dry), *fj.reconcile_hooks(home, dry_run=dry)]
+        elif args.summary_command == "uninstall":
+            extra = fj.uninstall_hooks(home, dry_run=dry)
+        else:
+            extra = []
+        results += [ss.Result(i.target, i.action, i.detail) for i in extra]
     if args.json:
         _print_json({"ok": ok, "results": [r.to_dict() for r in results]})
     else:

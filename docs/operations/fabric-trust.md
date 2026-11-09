@@ -316,6 +316,40 @@ machine, and a fabric-bit agent bound to it can be named by any local process. T
 An image older than slice 6a rejects the new keys. Remove `listen_host`, `listen_port` and `whois_socket` from the config BEFORE rolling the
 image back (the overlay then drops out and the sidecar is stopped).
 
+## 9a. `/herdr::join` setup on an agent host
+
+`herdr-eng rooms join-fabric NAME --json` needs the fabric listener's address. It looks in this order and stops at the first hit
+(`--control-plane URL` on the command always wins):
+
+1. this host's fetched fleet configuration (`control_plane.collab.fabric_trust`; only hosts that carry it);
+2. `fabric_join` in the machine config `~/.config/herdr-engineering/config.yaml`;
+3. the fleet config file on this machine (`~/.config/herdr-engineering/fleet/fleet-config.yaml`, mode 0600, read only).
+
+```yaml
+# ~/.config/herdr-engineering/config.yaml (YAML only; there is no environment variable)
+fabric_join:
+  listen_host: 100.104.39.6          # tailnet address of the fabric listener
+  listen_port: 9483
+  # control_plane_url: http://100.104.39.6:9483   # optional explicit URL, wins over listen_host/listen_port
+  auto_join_on_session_start: false  # true: Claude Code SessionStart hook joins automatically (default false)
+```
+
+`herdr-eng summary install` (also run by `scripts/install.sh`) installs the `herdr-join` skill for Claude Code, Codex, Pi and
+OpenCode, and writes the `fabric_join` listener from the fleet config when it is readable. It is idempotent and never overwrites
+a differing value: it reports `preserved` and names the fleet value instead. The fleet config itself is never modified.
+
+`herdr-eng summary install --check [--skill herdr-join] [--json]` is read-only and exits 1 on a failure. It verifies, per harness, the skill
+symlink points at the canonical copy and the OpenCode `/herdr-join` command exists, that the listener resolves, that it answers (refused is a
+failure; unreachable, for example off the tailnet, is reported but not a failure) and that the hook matches the key. No secret is printed.
+
+**Auto-join (opt-in, off by default).** With `auto_join_on_session_start: true`, install adds one Claude Code `SessionStart` command hook
+to `~/.claude/settings.json`, appended to any hooks already there and recorded in
+`~/.local/share/herdr-engineering/skills/.herdr-join-hooks-manifest.json`; `summary uninstall` and turning the key back to false remove only that
+entry. The hook (`herdr-eng summary join-hook claude`) does nothing outside a HerdR pane (`HERDR_WORKSPACE_ID` unset), names the agent
+`<harness>-<pane>` lower-cased, and always exits 0. No hook is written for the other harnesses: Codex hooks (`~/.codex/hooks.json`) are
+gated by Codex's own hook trust state, which this installer never writes; OpenCode and Pi have no verified session-start hook contract.
+Use `/herdr::join` there. Install reports each as `unsupported` when the key is true.
+
 ## 10. What NOT to put in `machines`
 
 Never an L4/SNI proxy, a subnet router or an exit node: such a node presents its own tailnet address for traffic that originates elsewhere, so

@@ -256,23 +256,13 @@ def _print_request(row):
 
 
 def _discover_fabric_url():
-    """``http://<listen_host>:<listen_port>`` of the fabric listener from this host's configuration
-    (``control_plane.collab.fabric_trust``), or None when it is not discoverable here (the listener runs on the control plane's host)."""
-    from .control_plane.collab_fabric_trust import validate_listen_host
-    from .host_config import host_value
+    """``http://<listen_host>:<listen_port>`` of the fabric listener, or None when it is not discoverable on this host. Looked up in
+    this host's configuration (``control_plane.collab.fabric_trust``), the machine config's ``fabric_join`` block, then the fleet
+    config file when it is readable here (see ``fabric_join_setup.resolve_listener``)."""
+    from .fabric_join_setup import resolve_listener
 
-    collab = host_value("control_plane.collab")
-    trust = collab.get("fabric_trust") if isinstance(collab, dict) else None
-    if not isinstance(trust, dict):
-        return None
-    port = trust.get("listen_port")
-    try:
-        host = validate_listen_host(trust.get("listen_host"))
-    except ValueError:
-        return None
-    if not isinstance(port, int) or isinstance(port, bool) or not 0 < port < 65536:
-        return None
-    return f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
+    found = resolve_listener()
+    return found[0] if found else None
 
 
 def _fabric_url(explicit):
@@ -285,7 +275,8 @@ def _fabric_url(explicit):
         return found
     raise ValueError(
         "join-fabric talks to the control plane's fabric listener (a tailnet address), which is not in this host's configuration: "
-        "pass --control-plane http://<listen_host>:<listen_port> (control_plane.collab.fabric_trust)"
+        "pass --control-plane http://<listen_host>:<listen_port> (control_plane.collab.fabric_trust), or run `herdr-eng summary install` "
+        "to record it under fabric_join in ~/.config/herdr-engineering/config.yaml"
     )
 
 
