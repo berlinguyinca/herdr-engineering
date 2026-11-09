@@ -689,3 +689,18 @@ def test_gc_removes_empty_shard_directories_but_not_busy_ones(migrated_dsn, tmp_
         assert keeper_shard.is_dir()
 
     run(migrated_dsn, tmp_path, body)
+
+
+def test_a_failed_blob_pass_is_retried_on_the_next_sweep(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        now = utc()
+        orphan = env.blob(b"orphan", age=2 * HOUR)
+        await env.pool.execute("ALTER TABLE artifact_blobs RENAME TO artifact_blobs_off")
+        assert (
+            "blobs" in (await env.keeper.run_once(now)).failed
+        )  # a real failure of the blobs duty
+        await env.pool.execute("ALTER TABLE artifact_blobs_off RENAME TO artifact_blobs")
+        retry = await env.keeper.run_once(now + timedelta(minutes=1))  # well inside blob_gc_every
+        assert retry.blobs_removed == 1 and not env.blobs.exists(orphan)
+
+    run(migrated_dsn, tmp_path, body)

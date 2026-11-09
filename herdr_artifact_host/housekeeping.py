@@ -190,8 +190,11 @@ class Housekeeper:
         await duty("groups", "groups_cleared", self._lapse_groups(now, out))
         await duty("staging", "staging_removed", self._staging())
         if self._blob_gc_due(now, force_blob_gc):
-            self._last_blob_gc = now
             await duty("blobs", "blobs_removed", self._orphan_blobs(now))
+            if (
+                "blobs" not in failed
+            ):  # a failed pass is retried on the next sweep, not after blob_gc_every
+                self._last_blob_gc = now
         await duty("usage", "usage_corrected", self._reconcile_usage())
         return SweepReport(**counts, failed=tuple(dict.fromkeys(failed)))
 

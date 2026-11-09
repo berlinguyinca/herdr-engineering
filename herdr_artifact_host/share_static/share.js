@@ -58,17 +58,17 @@ import { renderLandingBar, renderSigninCard, rememberReturn, takeReturn } from "
 
   async function signIn(cfg, sharePath) {
     var p = await beginPkce(cfg);
-    store().setItem(PENDING_KEY, JSON.stringify({ state: p.state, verifier: p.verifier, share: sharePath }));
+    store().setItem(PENDING_KEY, JSON.stringify({ state: p.state, verifier: p.verifier, nonce: p.nonce, share: sharePath }));
     location.assign(p.url);
   }
 
-  async function openShare(sharePath, tokens) {
+  async function openShare(sharePath, tokens, nonce) {
     // same-origin: the response sets the HttpOnly write cookie that the annotation routes require
     var r = await fetch(sharePath + "session", {
       method: "POST",
       cache: "no-store",
       credentials: "same-origin",
-      headers: { "Authorization": "Bearer " + tokens.access, "X-Id-Token": tokens.id }
+      headers: { "Authorization": "Bearer " + tokens.access, "X-Id-Token": tokens.id, "X-Nonce": nonce }
     });
     forget(); // the session path replaces the tokens; nothing is kept either way
     if (!r.ok) throw new Error("session");
@@ -91,14 +91,14 @@ import { renderLandingBar, renderSigninCard, rememberReturn, takeReturn } from "
     var pending = raw ? JSON.parse(raw) : null;
     var code = params.get("code");
     if (params.get("error") || !pending || typeof pending.state !== "string" || params.get("state") !== pending.state
-        || typeof pending.verifier !== "string" || typeof pending.share !== "string"
+        || typeof pending.verifier !== "string" || typeof pending.nonce !== "string" || typeof pending.share !== "string"
         || !SHARE_PATH.test(pending.share) || !code) {
       throw new Error("callback");
     }
     var cfg = await loadConfig();
     var tokens = await exchangeCode(cfg, code, pending.verifier);
     s.setItem(TOKENS_KEY, JSON.stringify(tokens));
-    await openShare(pending.share, tokens);
+    await openShare(pending.share, tokens, pending.nonce);
   }
 
   // The sign-in step of a public link: the card, one button. The way back is remembered in sessionStorage only.

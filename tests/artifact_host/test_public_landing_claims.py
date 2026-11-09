@@ -13,7 +13,13 @@ DOC = {"Sec-Fetch-Dest": "document"}
 
 
 def claim_cookie(host: Host, token: str, user: str = "alice", email: str = "alice@lab.example"):
-    r = sign_in(host, type("S", (), {"token": token})(), access(user), ident(user, email=email))
+    r = sign_in(
+        host,
+        type("S", (), {"token": token})(),
+        access(user),
+        ident(user, email=email, nonce="n-1"),
+        {"X-Nonce": "n-1"},
+    )
     return r
 
 
@@ -146,3 +152,18 @@ def test_claim_cookie_dies_with_the_share(host: Host) -> None:
     value = (claim_cookie(host, s.token).header("Set-Cookie") or "").split(";")[0]
     host.execute("UPDATE shares SET state='revoked' WHERE share_id=$1", s.share_id)
     assert host.get(f"/s/{s.token}/f/index.html", {**DOC, "Cookie": value}).status == 404
+
+
+def test_claim_session_needs_the_matching_nonce(host: Host) -> None:
+    s = host.seed_share()
+    tok = type("S", (), {"token": s.token})()
+    bare = sign_in(host, tok, access(), ident(email="alice@lab.example"))  # no nonce at all
+    assert bare.status == 404
+    wrong = sign_in(
+        host, tok, access(), ident(email="alice@lab.example", nonce="a"), {"X-Nonce": "b"}
+    )
+    assert wrong.status == 404
+    unsent = sign_in(host, tok, access(), ident(email="alice@lab.example", nonce="a"))
+    assert unsent.status == 404
+    ok = sign_in(host, tok, access(), ident(email="alice@lab.example", nonce="a"), {"X-Nonce": "a"})
+    assert ok.status == 200

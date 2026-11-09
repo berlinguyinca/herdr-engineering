@@ -1502,6 +1502,11 @@ class MemberService:
             if usage["sharing_disabled"]:  # revoke and the event log stay open
                 raise MemberError(403, "sharing_disabled", "sharing is disabled for this account")
             row = await self._owned_share(conn, member, artifact_id, share_id)
+            art = await conn.fetchrow(
+                "SELECT intake, lifecycle FROM artifacts WHERE artifact_id=$1", artifact_id
+            )
+            if art is None or art["intake"] != "accepted" or art["lifecycle"] != "active":
+                raise _not_found()  # same bar as creating a share: never make a link live for a gone artifact
             if row["state"] != "pending":
                 if (
                     idempotency_key is not None
@@ -2188,9 +2193,11 @@ class MemberSurface:
         """Stream one file, with at most ``content_streams`` responses in flight (503 beyond that)."""
         from urllib.parse import unquote
 
-        sha, ctype, disposition = await self.svc.content(
-            actor, artifact_id, unquote(name, errors="strict")
-        )
+        try:
+            wanted = unquote(name, errors="strict")
+        except UnicodeDecodeError:
+            raise _not_found() from None
+        sha, ctype, disposition = await self.svc.content(actor, artifact_id, wanted)
         base = name.rsplit("/", 1)[-1]
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", unquote(base))[:100] or "file"
         streams = self.svc.content_streams

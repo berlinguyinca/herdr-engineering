@@ -924,6 +924,11 @@ class PublicSurface:
         if tokens is None:
             return await self.deny("bad_headers", share_id)
         access_token, id_token = tokens
+        nonce = _single(request, "X-Nonce")
+        if not nonce or len(nonce) > 256 or not nonce.isascii():
+            return await self.deny(
+                "bad_nonce", share_id
+            )  # the page's own sign-in attempt, as for member sessions
 
         def verify() -> tuple[str | None, float | None, str | None]:
             try:
@@ -935,7 +940,7 @@ class PublicSurface:
                 user = claims.get("user") if claims else None
                 exp = claims.get("exp") if claims else None
                 email = (
-                    lab.authenticator.verify_id_token(id_token, user=user)
+                    lab.authenticator.verify_id_token(id_token, user=user, nonce=nonce)
                     if isinstance(user, str) and id_token.isascii()
                     else None
                 )

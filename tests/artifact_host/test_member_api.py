@@ -608,3 +608,21 @@ def test_pending_accept_and_discard_settle_quota(host: Host) -> None:
     host.execute("UPDATE artifacts SET intake='pending' WHERE artifact_id=$1", aid2)
     assert call(host, s, "POST", f"/pending/{aid2}/accept").status == 200
     assert call(host, s, "POST", f"/pending/{aid2}/accept").status == 404
+
+
+def test_approve_refuses_an_archived_artifact(host: Host) -> None:
+    s = sign_in(host)
+    aid, vid = published(host, s)
+    sid = make_share(host, s, aid, vid).json()["share_id"]
+    host.execute("UPDATE artifacts SET lifecycle='archived' WHERE artifact_id=$1", aid)
+    r = call(host, s, "POST", f"/artifacts/{aid}/shares/{sid}/approve", {"confirm": True})
+    assert r.status == 404
+    assert host.rows("SELECT state FROM shares WHERE share_id=$1", sid)[0]["state"] == "pending"
+
+
+def test_content_with_invalid_utf8_name_is_a_uniform_404(host: Host) -> None:
+    s = sign_in(host)
+    aid, _ = published(host, s)
+    bad = call(host, s, "GET", f"/artifacts/{aid}/content/%ff%fe")
+    missing = call(host, s, "GET", f"/artifacts/{aid}/content/nope.txt")
+    assert bad.status == 404 and bad.shape() == missing.shape()
