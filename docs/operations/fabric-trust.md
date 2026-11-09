@@ -168,6 +168,8 @@ above. Only a malformed `workspace` object or id is a 400 (and creates nothing);
   workspace keys reach it only through `herdr-eng fleet config render-collab` (which validates and carries them) or a deploy that runs it.
   Check the rendered file before concluding the feature is on.
 
+**The `/herdr::join` skill.** Agents in any harness (Claude Code, Codex, OpenCode, Pi) do not need to remember the command: the `herdr-join` skill (`herdr-eng summary install`, or `--skill herdr-join`) runs `herdr-eng rooms join-fabric NAME --json` with the pane's `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID` and `HERDR_PANE_ID`, then reports the agent id, the room (`<machine>/<workspace id>`) and the `read`/`post`/`instruct`/`execute` grant, and states that `coordinate` and `grant_agent` stay owner-only. `--no-workspace` opts out of the room. It is opt-in per session: **there is deliberately no session-start auto-join hook**; adding one is an owner decision that has not been made. The installer never overwrites an existing skill or command named `herdr-join` and reports it as `preserved`. The `/herdr::join` route in the `herdr` router skill (`join`, action `fabric-join`) is in the herdr-handoff repo.
+
 **Rollback.** An image without this feature rejects the `auto_join` and `workspace_rooms*` keys: remove them from the config BEFORE rolling back. Agents already
 created are then ordinary fabric-bit agents bound to their machine and keep working until their bit expires; revoke them to remove them.
 
