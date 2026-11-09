@@ -5465,6 +5465,35 @@ def _worker_fabric_compactor(fleet_config_path):
     return FabricCompactor(settings, projection_publisher=publisher)
 
 
+def _worker_inspector_archiver(fleet_config_path):
+    """The inspector archiver when the fleet file enables it, else None."""
+    from pathlib import Path
+
+    from .control_plane.inspector_archive import InspectorArchiver, parse_inspector_archive
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return None
+    try:
+        cp = load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane")
+        settings = parse_inspector_archive(cp.get("inspector_archive"))
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    except ValueError as exc:
+        raise SystemExit(f"fleet config control_plane.{exc}") from None
+    if not settings.enabled:
+        return None
+    publisher = None
+    if settings.publish_projection_checkpoint and cp.get("pg_dsn"):
+        from .control_plane.projection_refresh import refresh_checkpoint
+        dsn, aliases, limits = cp["pg_dsn"], _host_aliases_from(cp), cp.get("inspector_limits") or {}
+        budgets = _checkpoint_budgets_from(cp)
+
+        def publisher(lock_wait):
+            return refresh_checkpoint(dsn, host_aliases=aliases, inspector_limits=limits, lock_wait=lock_wait,
+                                      checkpoint_budgets=budgets)
+    return InspectorArchiver(settings, projection_publisher=publisher)
+
+
 def _artifact_reconcile_settings(cp) -> dict | None:
     """``control_plane.artifact_reconcile: {enabled, interval_seconds, grace_seconds, orphan_ttl_hours, limit}``
     (off unless ``enabled`` is exactly true). Out-of-range numbers fall back to the defaults."""
@@ -5747,12 +5776,13 @@ def _cmd_cp_worker(args) -> int:
             worker_id = args.host_id or socket.gethostname()
             snapshotter = _worker_snapshot_writer(getattr(args, "fleet_config", None))
             compactor = _worker_fabric_compactor(getattr(args, "fleet_config", None))
+            archiver = _worker_inspector_archiver(getattr(args, "fleet_config", None))
             share_hk = _worker_share_housekeeper(getattr(args, "fleet_config", None), member_runtime)
             reconciler = _worker_artifact_reconciler(getattr(args, "fleet_config", None), rustfs)
             if args.once:
                 return await run_one_pass(conn, worker_id=worker_id,
                                           artifact_job_runner=runner, inspector_snapshotter=snapshotter,
-                                          fabric_compactor=compactor, share_housekeeper=share_hk,
+                                          fabric_compactor=compactor, inspector_archiver=archiver, share_housekeeper=share_hk,
                                           annotation_housekeeper=_worker_annotation_housekeeper(
                                               getattr(args, "fleet_config", None)),
                                           artifact_reconciler=reconciler)
@@ -5793,7 +5823,7 @@ def _cmd_cp_worker(args) -> int:
                     refresh.start()
                 await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
                                  artifact_job_runner=runner, inspector_snapshotter=snapshotter,
-                                 fabric_compactor=compactor, share_housekeeper=share_hk,
+                                 fabric_compactor=compactor, inspector_archiver=archiver, share_housekeeper=share_hk,
                                  annotation_housekeeper=annotation_hk,
                                  artifact_reconciler=reconciler)
             finally:
