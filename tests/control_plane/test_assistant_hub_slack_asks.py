@@ -74,6 +74,12 @@ def test_new_pending_action_posts_one_message_with_three_buttons(aw):
     d = aw.decide("frobnicate --all --token=hunter2-CANARY")
     assert d.outcome == "pending"
     assert aw.listener.wait_for(lambda: len(aw.posts()) == 1)
+    # The drain posts the Slack message and stamps the ask row's `ts` as two separate steps, so a message
+    # sitting in the outbox does not yet mean a routable ask. Every other read in this file filters
+    # `if a.ts`; this one asserted the stamp instead of waiting for it, so `ask.ts` below was a coin flip
+    # on host load - the intermittent `... and ''` of issue #703.
+    assert aw.listener.wait_for(lambda: any(a.request_id == d.request_id and a.ts
+                                            for a in aw.store.list_slack_asks(T, U, "open")))
     (post,) = aw.posts()
     assert [b["text"]["text"] for b in buttons(post)] == ["Approve", "Deny", "Approve and remember"]
     assert [b["action_id"] for b in buttons(post)] == ["ask_approve", "ask_deny", "ask_remember"]
@@ -116,6 +122,9 @@ def test_unreachable_slack_leaves_decide_pending_fast_and_the_ask_is_retried(aw)
     aw.cfg = {**aw.cfg, "base_url": good}                           # Slack is reachable again
     assert aw.listener.wait_for(lambda: len(aw.posts()) == 1)
     assert aw.listener.wait_for(lambda: aw.runtime.queued() == 0)
+    # Same two-step stamp as above: the post is out, the row is not yet routable.
+    assert aw.listener.wait_for(lambda: any(a.request_id == d.request_id and a.ts
+                                            for a in aw.store.list_slack_asks(T, U, "open")))
     (ask,) = aw.store.list_slack_asks(T, U, "open")
     assert ask.request_id == d.request_id and ask.ts
 
