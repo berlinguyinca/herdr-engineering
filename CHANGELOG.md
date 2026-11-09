@@ -12,6 +12,19 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Public and preview report pages: roomier table rows (12px/14px padding, 1.55 line height); permalink focus ring uses `--link` (it was 2.99:1, below 3:1).
 - Tests: `tests/playwright/viewer-phone-polish.test.mjs` (chromium, firefox); the share fixture now returns the descriptor's assets.
 
+### Inspector archive job (disabled by default)
+- New `control_plane.inspector_archive` config (YAML only, validated in `fleet_config.py`) and `InspectorArchiver`: moves inspector tool/message rows older than 14 days from `fabric_events` into `fabric_events_archive`, chunked, one transaction per chunk, idempotent, with a count-only dry run. Never moves rows above the snapshot watermark or projection checkpoint frontier, v2-envelope rows, or state-bearing kinds. Migration 0052 adds a partial archive index. Snapshot boot counts archived rows; the compaction archive purge now skips inspector rows. See `docs/operations/inspector-archive.md`.
+
+### CI-reported deployments (`control_plane.ci_deployments`)
+
+- New fleet config key `control_plane.ci_deployments: {component: host id}` lets a CI pipeline (for example Woodpecker as host `woodpecker-ci`) report deployments of components that have no `deploy/pipelines` definition, without a fake definition. An event is accepted when the definitions rule allows it or the exact (component, host) pair is listed; another host reporting a listed component gets 403. Bounded (32 entries), validated, hot-reloaded; a component that also has a definition refuses the whole list. With no definitions configured nothing changes; with definitions configured but invalid, every event is still refused (503), listed components included.
+- The coordinator, plans, permits, escalations and force/ack ignore these components. The Deployments snapshot adds `definitions.ci_components`, `definitions.ci_errors`, and `kind: "ci"` plus a `ci` summary on their rows; the page shows them under "CI-reported deployments" with a badge, last deploy, outcome, commits and the evidence link. Documented in `deploy/control-plane/README.md`. Tests: `tests/control_plane/test_ci_deployments.py`, `tests/playwright/deployments.test.mjs`.
+
+### Report viewer guide
+
+- New `docs/artifacts/report-viewer-guide.md`: the Rich view opt-in, finding anchors, printing and saving as PDF, the "How to read this report" legend, phone-width Evidence and Downloads tables, and keyboard use of the share panel tabs. Linked from `docs/artifacts/share-links.md` and the README. Docs only.
+- Fact-check fix: the guide now states the exact Rich view eligibility rule (one `text/html` asset, or exactly one with role `preview` among several) and when the legend is omitted.
+
 ### `/herdr::join` works with no flags after `herdr-eng summary install`
 - `rooms join-fabric` found the listener only in the fetched host config, which agent hosts do not carry, so a bare call failed. It now also reads `fabric_join` (`control_plane_url`, or `listen_host` + `listen_port`) from the machine config `~/.config/herdr-engineering/config.yaml` and falls back to the readable fleet config's `control_plane.collab.fabric_trust`. YAML only, no new environment variable; `--control-plane` still overrides.
 - `herdr-eng summary install` (and `scripts/install.sh`) records the fleet config's listener under `fabric_join` idempotently and never overwrites a differing value (reported as `preserved`). New read-only `herdr-eng summary install --check` verifies per harness the skill symlink, the OpenCode command, listener resolution and reachability, and the hook state, exiting 1 on a failure; no secrets are printed.
