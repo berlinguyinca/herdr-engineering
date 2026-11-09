@@ -22,9 +22,33 @@ from .inspector import InspectorStore, SnapshotStale
 log = logging.getLogger(__name__)
 
 _PAGE = 20000
+_KEYS = {"enabled", "interval_seconds"}
+MIN_INTERVAL_SECONDS = 60
+DEFAULT_INTERVAL_SECONDS = 600.0
 _COLUMNS = ("event_id, schema_version, source_timestamp, ingest_timestamp, entity_type, entity_id, mission_id, "
             "session_id, sequence, event_type, payload")
 _VALID = "entity_type = 'inspector' AND entity_id IS NOT NULL AND entity_id <> ''"
+
+
+def parse_inspector_snapshots(raw) -> dict:
+    """Validate ``control_plane.inspector_snapshots`` (YAML only) and return ``{"enabled", "interval_seconds"}``.
+
+    Absent or empty means off with the default interval. Anything malformed raises ``ValueError`` rather than being
+    guessed at, so a typo cannot silently leave the optimisation in an unintended state."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("inspector_snapshots must be a mapping")
+    unknown = sorted(set(raw) - _KEYS, key=str)
+    if unknown:
+        raise ValueError(f"inspector_snapshots: unknown key(s) {unknown}; allowed: {sorted(_KEYS)}")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("inspector_snapshots.enabled must be a boolean")
+    interval = raw.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < MIN_INTERVAL_SECONDS:
+        raise ValueError(f"inspector_snapshots.interval_seconds must be a number >= {MIN_INTERVAL_SECONDS}")
+    return {"enabled": enabled, "interval_seconds": float(interval)}
 
 
 def encode(state: dict) -> bytes:

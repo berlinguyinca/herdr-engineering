@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Inspector snapshot boot: used on the complete-replay fallback, strictly validated
+
+- With projection checkpoints on (the default), a missing or rejected checkpoint fell back to a complete replay that ignored `inspector_snapshots` and re-ran every stored inspector row through redaction. That fallback now hands the stored snapshot to the repo, which verifies it by count and ordering and replays everything on any doubt.
+- `control_plane.inspector_snapshots` is validated in `fleet_config.py`: `enabled` must be a boolean, `interval_seconds` a number >= 60, unknown keys are rejected (previously a bad interval was silently replaced by 600). Default stays off.
+
 ### Report viewer guide
 
 - New `docs/artifacts/report-viewer-guide.md`: the Rich view opt-in, finding anchors, printing and saving as PDF, the "How to read this report" legend, phone-width Evidence and Downloads tables, and keyboard use of the share panel tabs. Linked from `docs/artifacts/share-links.md` and the README. Docs only.

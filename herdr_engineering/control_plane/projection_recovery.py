@@ -400,7 +400,8 @@ def _recover_repository(repo, source):
         rows.sort(key=lambda row: (row['ingest_timestamp'].isoformat(), row['sequence'],
                                   row['event_id'], str((row.get('actor') or {}).get('id') or '')))
         counts = _load_full_into(repo,PreparedSource(prepared['structured'],rows,
-            source_ledger=ledger.export_checkpoint()),capture_event_core=True)
+            source_ledger=ledger.export_checkpoint(),
+            inspector_snapshot=source._run(_read_inspector_snapshot(source))),capture_event_core=True)
         mode='full_replay'
     coverage=prepared['coverage']
     counts.update(events=coverage['raw_rows'])
@@ -429,6 +430,22 @@ def _recover_repository(repo, source):
              source.recovery_info['tail_events'], source.recovery_info['refolded_rows'],
              source.recovery_info['folded_streams'], source.recovery_info['elapsed_ms'])
     return counts
+
+
+async def _read_inspector_snapshot(source):
+    """The stored inspector snapshot for a complete replay, or None when disabled, absent or unreadable.
+
+    The repo verifies it against the rows it loaded and replays every inspector event on any doubt, so a complete
+    replay (checkpoint missing or rejected) no longer re-runs ~all stored inspector rows through redaction."""
+    if not getattr(source,'_inspector_snapshots',False):
+        return None
+    try:
+        row=await source._conn.fetchrow('SELECT schema_version, fingerprint, watermark, event_count, body '
+                                        'FROM inspector_snapshots WHERE id = 1')
+    except Exception as exc:  # noqa: BLE001 - an optimisation; never block a boot
+        log.warning('inspector snapshot unavailable (%s); replaying every inspector event',type(exc).__name__)
+        return None
+    return dict(row) if row is not None else None
 
 
 async def _read_full_prepared(source):

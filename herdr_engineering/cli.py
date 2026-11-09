@@ -5206,13 +5206,12 @@ def _heap_release_enabled(cp) -> bool:
 
 def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
     """``control_plane.inspector_snapshots: {enabled, interval_seconds}`` (off unless ``enabled`` is exactly true)."""
-    raw = (cp or {}).get("inspector_snapshots") or {}
-    if not isinstance(raw, dict):
-        raise SystemExit("fleet config control_plane.inspector_snapshots must be a mapping")
-    interval = raw.get("interval_seconds", 600)
-    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 60:
-        interval = 600
-    return raw.get("enabled") is True, float(interval)
+    from .control_plane.inspector_snapshot import parse_inspector_snapshots
+    try:
+        parsed = parse_inspector_snapshots((cp or {}).get("inspector_snapshots"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config control_plane.{exc}") from None
+    return parsed["enabled"], parsed["interval_seconds"]
 
 
 def _cmd_relay_join(args):

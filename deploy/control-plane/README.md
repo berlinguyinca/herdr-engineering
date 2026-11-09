@@ -580,6 +580,12 @@ snapshot's watermark are exactly the ones the snapshot consumed (same count), it
 Postgres (they are about a third of the data); if the repo then refuses the snapshot it fetches them on demand, and a
 boot never proceeds with an incomplete inspector.
 
+The snapshot is also used when the projection checkpoint is missing or rejected and the boot falls back to a complete
+replay: every row is loaded then, but the repo verifies the snapshot by count and skips re-running the covered
+inspector rows through redaction and eviction. The config is validated at fleet-config load: `enabled` must be a
+boolean, `interval_seconds` a number of at least 60, and any other key is rejected (YAML only; there is no
+environment variable).
+
 It is an optimisation, never a source of truth. The web replays everything, and logs why
 (`boot inspector replay: full:<reason>`), when the snapshot is missing or unreadable, was built under other
 inspector limits/roles or other redaction rules, or does not match the stored events (a different event count below
