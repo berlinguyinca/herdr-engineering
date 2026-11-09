@@ -7,6 +7,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Inspector archive job (disabled by default)
 - New `control_plane.inspector_archive` config (YAML only, validated in `fleet_config.py`) and `InspectorArchiver`: moves inspector tool/message rows older than 14 days from `fabric_events` into `fabric_events_archive`, chunked, one transaction per chunk, idempotent, with a count-only dry run. Never moves rows above the snapshot watermark or projection checkpoint frontier, v2-envelope rows, or state-bearing kinds. Migration 0052 adds a partial archive index. Snapshot boot counts archived rows; the compaction archive purge now skips inspector rows. See `docs/operations/inspector-archive.md`.
+### CI-reported deployments (`control_plane.ci_deployments`)
+
+- New fleet config key `control_plane.ci_deployments: {component: host id}` lets a CI pipeline (for example Woodpecker as host `woodpecker-ci`) report deployments of components that have no `deploy/pipelines` definition, without a fake definition. An event is accepted when the definitions rule allows it or the exact (component, host) pair is listed; another host reporting a listed component gets 403. Bounded (32 entries), validated, hot-reloaded; a component that also has a definition refuses the whole list. With no definitions configured nothing changes; with definitions configured but invalid, every event is still refused (503), listed components included.
+- The coordinator, plans, permits, escalations and force/ack ignore these components. The Deployments snapshot adds `definitions.ci_components`, `definitions.ci_errors`, and `kind: "ci"` plus a `ci` summary on their rows; the page shows them under "CI-reported deployments" with a badge, last deploy, outcome, commits and the evidence link. Documented in `deploy/control-plane/README.md`. Tests: `tests/control_plane/test_ci_deployments.py`, `tests/playwright/deployments.test.mjs`.
 
 ### Report viewer guide
 

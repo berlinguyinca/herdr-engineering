@@ -377,6 +377,7 @@ class ControlPlaneServer:
         from .deployment_definitions import DeploymentDefinitions
         self.deployment_definitions = DeploymentDefinitions(
             lambda: self._control_plane_value(fleet_config, "deployment_definitions"),
+            ci_components=lambda: self._control_plane_value(fleet_config, "ci_deployments"),
             ci_snapshot=lambda: self.ci_monitor.snapshot(start=True))
         # The stage coordinator (Task 3), ticked by _deployments_loop; GET /api/v1/deployments
         # serves the last tick and never ticks itself. `deployment_evidence` is the release-evidence

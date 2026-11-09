@@ -3,7 +3,9 @@
 ``python deployments-server.py defined`` loads three pipeline definitions over two stages,
 a green CI release, confirmed release evidence, and host events: hive-gateway healthy
 (holding), hive-nodes failed with a hostile ``<img onerror>`` evidence string (stage 1
-halts). ``python deployments-server.py empty`` has no definitions configured.
+halts). ``python deployments-server.py ci`` is ``defined`` plus ``control_plane.ci_deployments`` and two
+events a CI host reported for ``lc-binbase-frontend``. ``python deployments-server.py empty`` has no
+definitions configured.
 Prints "PORT=<n>" once ready, then runs until killed.
 """
 import hashlib
@@ -25,6 +27,7 @@ from herdr_engineering.fleet_config import FleetConfigStore  # noqa: E402
 
 REPO = "InferWeave/inferweave"
 OLD, NEW = "0" * 40, "c0ffee" + "1" * 34
+CI_RUN = "https://ci.metabolomics.us/repos/7/pipeline/412"
 HOSTILE = '<img src=x onerror="window.__pwned=1">boom'
 
 
@@ -47,7 +50,7 @@ def _event(n, component, outcome, host="login2.hive", evidence=""):
 def main(mode):
     tmp = Path(tempfile.mkdtemp(prefix="herdr-deployments-ui-"))
     values = {}
-    if mode == "defined":
+    if mode in ("defined", "ci"):
         pipelines = tmp / "pipelines"
         pipelines.mkdir(mode=0o755)
         for doc in (_definition("hive-gateway", 1, 0, "hive"), _definition("hive-nodes", 1, 1, "hive"),
@@ -56,12 +59,14 @@ def main(mode):
             path.write_text(yaml.safe_dump(doc))
             os.chmod(path, 0o644)
         values = {"deployment_definitions": str(pipelines)}
+        if mode == "ci":
+            values["ci_deployments"] = {"lc-binbase-frontend": "woodpecker-ci"}
     fleet = tmp / "fleet.yaml"
     fleet.write_text(yaml.safe_dump({
         "version": 1,
         "sections": {"control_plane": {"roles": ["control"], "values": values}} if values else {},
         "hosts": {h: {"roles": ["node"], "token_sha256": hashlib.sha256(h.encode()).hexdigest()}
-                  for h in ("hive", "whiteale")}}))
+                  for h in ("hive", "whiteale", "woodpecker-ci")}}))
     os.chmod(fleet, 0o600)
     repo = ControlPlaneRepo()
     server = ControlPlaneServer(repo, web_root=ROOT / "packages", fleet_config=FleetConfigStore(fleet))
@@ -70,12 +75,17 @@ def main(mode):
         {"repository": REPO, "run_number": 7, "revision": NEW, "branch": "main", "event": "push",
          "state": "success"}]}}
     server.ci_monitor.snapshot = lambda start=True: ci
-    if mode == "defined":
+    if mode in ("defined", "ci"):
         server.deployment_evidence = lambda track, target, plan: ReleaseEvidence(target, True)
         for n, (component, outcome, evidence) in enumerate([
                 ("hive-gateway", "started", ""), ("hive-gateway", "ok", "probe ok: 3 models answered"),
                 ("hive-nodes", "started", ""), ("hive-nodes", "failed", HOSTILE)], start=1):
             repo.deployments.ingest(_event(n, component, outcome, evidence=evidence), reported_by="hive")
+    if mode == "ci":
+        for n, outcome in ((101, "started"), (102, "ok")):
+            ev = _event(n, "lc-binbase-frontend", outcome, host="ci-agent-1",
+                        evidence="" if outcome == "started" else f"pipeline {CI_RUN}")
+            repo.deployments.ingest(ev, reported_by="woodpecker-ci")
     threading.Thread(target=server.serve, daemon=True).start()
     server.wait_until_ready()
     server.deployments_tick()
