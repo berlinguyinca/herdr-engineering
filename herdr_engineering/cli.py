@@ -1375,9 +1375,9 @@ def _cmd_summary_manage(args) -> int:
             extra = fj.check_setup(home)
             ok = ok and not any(i.action in fj.FAIL_ACTIONS for i in extra)
         elif args.summary_command == "install":
-            extra = [fj.install_listener(home, dry_run=dry), *fj.reconcile_hooks(home, dry_run=dry)]
+            extra = [fj.install_listener(home, dry_run=dry), *fj.reconcile_hooks(home, dry_run=dry), *fj.reconcile_codex_rule(home, dry_run=dry)]
         elif args.summary_command == "uninstall":
-            extra = fj.uninstall_hooks(home, dry_run=dry)
+            extra = [*fj.uninstall_hooks(home, dry_run=dry), *fj.uninstall_codex_rule(home, dry_run=dry)]
         else:
             extra = []
         results += [ss.Result(i.target, i.action, i.detail) for i in extra]

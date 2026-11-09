@@ -244,3 +244,86 @@ def test_check_requires_the_hook_when_auto_join_is_on(tmp_path):
     assert any(i.action == "missing" for i in fj.check_setup(tmp_path, probe=False))
     fj.reconcile_hooks(tmp_path)
     assert not any(i.action in fj.FAIL_ACTIONS for i in fj.check_setup(tmp_path, probe=False) if i.target.startswith("claude"))
+
+
+# ---- Codex execpolicy rule: the only way a sandboxed Codex may reach the tailnet listener ---------------------------------------
+RULES_REL = ".codex/rules/default.rules"
+RULE = 'prefix_rule(pattern=["herdr-eng", "rooms", "join-fabric"], decision="allow")'
+
+
+def codex_home(home, rules=None):
+    (home / ".codex").mkdir(parents=True, exist_ok=True)
+    if rules is not None:
+        (home / RULES_REL).parent.mkdir(parents=True, exist_ok=True)
+        (home / RULES_REL).write_text(rules)
+
+
+def test_codex_rule_is_appended_once_to_existing_rules_and_nothing_else_changes(tmp_path):
+    before = 'prefix_rule(pattern=["go", "test"], decision="allow")\n'
+    codex_home(tmp_path, before)
+    assert fj.reconcile_codex_rule(tmp_path)[0].action == "installed"
+    text = (tmp_path / RULES_REL).read_text()
+    assert text.startswith(before) and text.count(RULE) == 1
+    assert fj.reconcile_codex_rule(tmp_path)[0].action == "unchanged"
+    assert (tmp_path / RULES_REL).read_text() == text
+
+
+def test_codex_rule_is_not_written_without_codex_and_creates_the_file_when_missing(tmp_path):
+    assert fj.reconcile_codex_rule(tmp_path)[0].action == "skipped"
+    assert not (tmp_path / ".codex").exists()
+    codex_home(tmp_path)
+    assert fj.reconcile_codex_rule(tmp_path)[0].action == "installed"
+    assert (tmp_path / RULES_REL).read_text().count(RULE) == 1
+
+
+def test_codex_rule_dry_run_writes_nothing_and_uninstall_removes_only_our_line(tmp_path):
+    codex_home(tmp_path, 'prefix_rule(pattern=["go", "test"], decision="allow")\n')
+    fj.reconcile_codex_rule(tmp_path, dry_run=True)
+    assert RULE not in (tmp_path / RULES_REL).read_text()
+    fj.reconcile_codex_rule(tmp_path)
+    assert fj.uninstall_codex_rule(tmp_path)[0].action == "removed"
+    assert (tmp_path / RULES_REL).read_text() == 'prefix_rule(pattern=["go", "test"], decision="allow")\n'
+    assert fj.uninstall_codex_rule(tmp_path) == []
+
+
+def test_codex_rule_a_hand_added_identical_rule_is_left_alone_on_uninstall(tmp_path):
+    codex_home(tmp_path, RULE + "\n")
+    assert fj.reconcile_codex_rule(tmp_path)[0].action == "unchanged"
+    assert fj.uninstall_codex_rule(tmp_path) == []
+    assert RULE in (tmp_path / RULES_REL).read_text()
+
+
+def test_codex_rule_allows_only_the_join_prefix_per_the_real_codex_engine(tmp_path):
+    import shutil
+    codex = shutil.which("codex")
+    if not codex:
+        import pytest
+        pytest.skip("codex not installed")
+    codex_home(tmp_path)
+    fj.reconcile_codex_rule(tmp_path)
+    rules = str(tmp_path / RULES_REL)
+
+    def decision(*argv):
+        p = subprocess.run([codex, "execpolicy", "check", "--rules", rules, *argv], capture_output=True, text=True, timeout=30)
+        return json.loads(p.stdout).get("decision")
+    assert decision("herdr-eng", "rooms", "join-fabric", "codex-x", "--json") == "allow"
+    assert decision("herdr-eng", "rooms", "list") is None
+    assert decision("herdr-eng", "rooms") is None
+    assert decision("herdr-eng") is None
+    assert decision("curl", "http://100.104.39.6:9483") is None
+
+
+def test_check_reports_the_codex_rule(tmp_path):
+    codex_home(tmp_path)
+    assert [i.action for i in fj.check_setup(tmp_path, probe=False) if i.target == "codex execpolicy rule"] == ["missing"]
+    fj.reconcile_codex_rule(tmp_path)
+    assert [i.action for i in fj.check_setup(tmp_path, probe=False) if i.target == "codex execpolicy rule"] == ["ok"]
+
+
+def test_cli_install_check_and_uninstall_manage_the_codex_rule(tmp_path):
+    write_fleet(tmp_path)
+    codex_home(tmp_path)
+    rc, out, _ = cli(tmp_path, "summary", "install", "--skill", "herdr-join", "--json")
+    assert rc == 0 and RULE in (tmp_path / RULES_REL).read_text()
+    rc, out, _ = cli(tmp_path, "summary", "uninstall", "--skill", "herdr-join", "--json")
+    assert RULE not in (tmp_path / RULES_REL).read_text()

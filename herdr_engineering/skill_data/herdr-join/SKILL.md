@@ -51,7 +51,7 @@ Report the server's error text; never retry with other names to get around it. A
 
 ## Opt-in only
 
-This skill never runs by itself. An owner can turn on a Claude Code session-start auto-join with `fabric_join.auto_join_on_session_start: true` in `~/.config/herdr-engineering/config.yaml` and `herdr-eng summary install`; it is off by default and no other harness gets a hook. Do not add a hook yourself. `herdr-eng summary install --check` reports whether this setup is complete.
+This skill never runs by itself. An owner can turn on a Claude Code session-start auto-join with `fabric_join.auto_join_on_session_start: true` in `~/.config/herdr-engineering/config.yaml` and `herdr-eng summary install`; it is off by default and no other harness gets a hook. Codex needs no hook but one execpolicy rule that lets only `herdr-eng rooms join-fabric` leave its sandbox; `summary install` adds it. If Codex says "control plane is unreachable", run `herdr-eng summary install --check`. Do not add a hook yourself. `herdr-eng summary install --check` reports whether this setup is complete.
 
 ## Collisions
 

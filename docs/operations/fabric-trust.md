@@ -350,6 +350,29 @@ entry. The hook (`herdr-eng summary join-hook claude`) does nothing outside a He
 gated by Codex's own hook trust state, which this installer never writes; OpenCode and Pi have no verified session-start hook contract.
 Use `/herdr::join` there. Install reports each as `unsupported` when the key is true.
 
+**Codex needs one execpolicy rule.** Codex runs shell commands in a sandbox with no network, so a join from `codex exec` or the TUI fails with
+"control plane is unreachable" even though the listener is up (verified: the same command succeeds with `--control-plane` once allowed, and
+fails without the rule). When `~/.codex` exists, `herdr-eng summary install` appends exactly one line to `~/.codex/rules/default.rules`:
+
+```
+prefix_rule(pattern=["herdr-eng", "rooms", "join-fabric"], decision="allow")
+```
+
+Codex runs a command matching that prefix outside the sandbox without asking; nothing else changes (`herdr-eng rooms list`, `herdr-eng rooms`,
+`curl ...` do not match, checked with `codex execpolicy check`). It does not set `network_access`, `sandbox_mode` or `approval_policy`, and no other
+rule or config line is touched. It is idempotent, recorded in `~/.local/share/herdr-engineering/skills/.herdr-join-codex-rule-manifest.json`,
+removed by `summary uninstall` (a rule you wrote by hand is adopted and never removed), and shown by `summary install --check` as
+`codex execpolicy rule`. Note the prefix covers any arguments, including `--control-plane URL`: the allowed command is the join CLI itself, which
+only asks tailscaled-attested listeners to register this agent.
+
+**Pi and OpenCode: a dead default model looks like a hang.** Both ship configured with a default model the gateway may not currently serve
+(for example `qwen3.8-27b-modality-vision-quant-q8_k_xl`: the gateway answers 503 `capacity_unavailable`, "Retry after the declared delay").
+OpenCode also uses that model as `small_model` for the session title, and Pi uses it as `defaultModel`; both then wait or print nothing,
+and the join skill never runs. This is not a join bug. Check the live catalog with
+`curl -s https://llm.metabolomics.us/v1/models -H "Authorization: Bearer $KEY"` and pick a served model: Pi `pi -p --model metabolomics/qwen3.8-text ...`
+(or set `defaultModel` in `~/.pi/agent/settings.json`), OpenCode `opencode run -m qwen-turing/deepseek_v4-flash ...` and set `small_model`
+in `~/.config/opencode/opencode.json` to a served model. A reasoning model can take over a minute per turn, so allow several minutes.
+
 ## 10. What NOT to put in `machines`
 
 Never an L4/SNI proxy, a subnet router or an exit node: such a node presents its own tailnet address for traffic that originates elsewhere, so

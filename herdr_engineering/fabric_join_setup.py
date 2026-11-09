@@ -327,6 +327,68 @@ def uninstall_hooks(home: Path | None = None, *, dry_run: bool = False) -> list[
     return [gone] if gone else []
 
 
+# --------------------------------------------------------------------------
+# Codex execpolicy rule (the narrow way out of the Codex sandbox), manifest tracked
+# --------------------------------------------------------------------------
+# Codex runs shell commands in a sandbox with no network, so the join cannot reach the tailnet listener ("control plane is
+# unreachable"). An execpolicy ``prefix_rule`` lets exactly this command prefix run outside the sandbox (verified with
+# ``codex execpolicy check`` and a real ``codex exec``). Nothing else is widened: no network_access, sandbox_mode or approval_policy.
+CODEX_RULES_REL = Path(".codex/rules/default.rules")
+CODEX_RULE = 'prefix_rule(pattern=["herdr-eng", "rooms", "join-fabric"], decision="allow")'
+CODEX_RULE_NOTE = "  # herdr-join: runs this one command outside the Codex sandbox so it can reach the tailnet listener"
+CODEX_RULE_MANIFEST = ".herdr-join-codex-rule-manifest.json"
+
+
+def _codex_manifest(home: Path) -> Path:
+    return home / ".local/share/herdr-engineering/skills" / CODEX_RULE_MANIFEST
+
+
+def _codex_rule_present(text: str) -> bool:
+    return any(line.strip().startswith(CODEX_RULE) for line in text.splitlines())
+
+
+def reconcile_codex_rule(home: Path | None = None, *, dry_run: bool = False) -> list[Item]:
+    """Append the join prefix rule to ``~/.codex/rules/default.rules`` (only when ``~/.codex`` exists). Idempotent; other rules are
+    never touched; a hand-written identical rule is adopted as the user's, not ours."""
+    h = _home(home)
+    path = h / CODEX_RULES_REL
+    if not (h / ".codex").is_dir():
+        return [Item(str(path), "skipped", "Codex is not installed on this host (no ~/.codex)")]
+    text = path.read_text() if path.is_file() else ""
+    if _codex_rule_present(text):
+        return [Item(str(path), "unchanged", "execpolicy rule for `herdr-eng rooms join-fabric` present")]
+    if not dry_run:
+        sep = "" if not text or text.endswith("\n") else "\n"
+        _write_text(path, f"{text}{sep}{CODEX_RULE}{CODEX_RULE_NOTE}\n")
+        _write_text(_codex_manifest(h), json.dumps({str(path): CODEX_RULE}, indent=2) + "\n")
+    return [Item(str(path), "installed", "execpolicy rule: only `herdr-eng rooms join-fabric` runs outside the Codex sandbox")]
+
+
+def uninstall_codex_rule(home: Path | None = None, *, dry_run: bool = False) -> list[Item]:
+    """Remove the rule line WE added (per the manifest); a rule the user wrote is never removed."""
+    h = _home(home)
+    manifest = _codex_manifest(h)
+    try:
+        record = json.loads(manifest.read_text())
+    except (OSError, ValueError):
+        return []
+    out: list[Item] = []
+    for path_s, rule in (record.items() if isinstance(record, dict) else []):
+        path = Path(path_s)
+        try:
+            lines = path.read_text().splitlines(keepends=True)
+        except OSError:
+            continue
+        kept = [ln for ln in lines if not ln.strip().startswith(rule)]
+        if len(kept) != len(lines):
+            if not dry_run:
+                _write_text(path, "".join(kept))
+            out.append(Item(path_s, "removed", "execpolicy rule for `herdr-eng rooms join-fabric`"))
+    if not dry_run:
+        manifest.unlink(missing_ok=True)
+    return out
+
+
 def agent_name(harness: str, env) -> str | None:
     """``<harness>-<pane>`` lower-cased and made to fit the server's name rule; None outside a HerdR pane."""
     if not (env.get("HERDR_WORKSPACE_ID") or "").strip():
@@ -381,6 +443,12 @@ def check_setup(home: Path | None = None, *, probe: bool = True) -> list[Item]:
         out = [Item("fabric listener", "ok", f"resolved {found[0]} from {found[1]}")]
         if probe:
             out.append(_probe(found[0]))
+    if (h / ".codex").is_dir():
+        rules = h / CODEX_RULES_REL
+        have = rules.is_file() and _codex_rule_present(rules.read_text())
+        out.append(Item("codex execpolicy rule", "ok" if have else "missing",
+                        "`herdr-eng rooms join-fabric` may run outside the Codex sandbox" if have else
+                        "Codex's sandbox blocks the tailnet listener; run: herdr-eng summary install"))
     settings = h / ".claude/settings.json"
     command = _load_manifest(h).get(str(settings))
     present = False
