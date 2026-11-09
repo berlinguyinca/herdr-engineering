@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
@@ -60,7 +61,8 @@ class StallWatch(threading.Thread):
             self._stop_event.wait(self.tick)
             late = time.monotonic() - before - self.tick
             if late >= self.stall and not self._stop_event.is_set():
-                log.warning("process paused %.1fs (tick %.2fs); threads on resume:\n%s", late + self.tick, self.tick, self.threads())
+                log.warning("process paused %.1fs (tick %.2fs); %s; threads on resume:\n%s",
+                            late + self.tick, self.tick, gc_state(), self.threads())
 
     @staticmethod
     def threads() -> str:
@@ -79,6 +81,53 @@ def freeze_boot_heap() -> int:
     gc.collect()
     gc.freeze()
     return gc.get_freeze_count()
+
+
+@dataclass(frozen=True)
+class GcTuning:
+    """``control_plane.gc`` in the fleet config: collector thresholds plus whether to freeze the boot heap."""
+    gen0: int = 700
+    gen1: int = 10
+    gen2: int = 1000
+    freeze: bool = True
+
+
+_GC_KEYS = ("gen0", "gen1", "gen2", "freeze")
+
+
+def parse_gc_config(section) -> GcTuning:
+    """Parse ``control_plane.gc`` (None = defaults); a malformed block raises ValueError so startup stops."""
+    if section is None:
+        return GcTuning()
+    if not isinstance(section, dict):
+        raise ValueError("control_plane.gc must be a mapping")
+    unknown = sorted(set(section) - set(_GC_KEYS))
+    if unknown:
+        raise ValueError(f"control_plane.gc: unknown keys {unknown}")
+    values = {}
+    for key in ("gen0", "gen1", "gen2"):
+        if key in section:
+            v = section[key]
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"control_plane.gc.{key} must be a positive integer")
+            values[key] = v
+    if "freeze" in section:
+        if not isinstance(section["freeze"], bool):
+            raise ValueError("control_plane.gc.freeze must be true or false")
+        values["freeze"] = section["freeze"]
+    return GcTuning(**values)
+
+
+def gc_state() -> str:
+    return f"gc frozen={gc.get_freeze_count()} thresholds={gc.get_threshold()}"
+
+
+def tune_gc(tuning: GcTuning) -> int:
+    """Freeze the boot heap (when enabled) and raise the thresholds so full collections are rare. Returns frozen count."""
+    frozen = freeze_boot_heap() if tuning.freeze else 0
+    gc.set_threshold(tuning.gen0, tuning.gen1, tuning.gen2)
+    log.info("gc tuned: gen0=%d gen1=%d gen2=%d freeze=%s frozen=%d", tuning.gen0, tuning.gen1, tuning.gen2, tuning.freeze, frozen)
+    return frozen
 
 
 def install() -> StallWatch:

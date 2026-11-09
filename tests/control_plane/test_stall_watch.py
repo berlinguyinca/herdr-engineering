@@ -3,6 +3,8 @@ import logging
 import re
 import time
 
+import pytest
+
 from herdr_engineering.control_plane import stall_watch
 
 
@@ -62,3 +64,40 @@ def test_freeze_boot_heap_moves_live_objects_out_of_the_collector():
     finally:
         gc.unfreeze()
         del keep
+
+
+def test_parse_gc_config_defaults_and_overrides():
+    assert stall_watch.parse_gc_config(None) == stall_watch.GcTuning(700, 10, 1000, True)
+    got = stall_watch.parse_gc_config({"gen0": 500, "gen1": 5, "gen2": 4000, "freeze": False})
+    assert got == stall_watch.GcTuning(500, 5, 4000, False)
+
+
+@pytest.mark.parametrize("bad", [[], {"gen2": 0}, {"gen0": "x"}, {"gen1": True}, {"freeze": "yes"}, {"bogus": 1}])
+def test_parse_gc_config_rejects_bad_sections(bad):
+    with pytest.raises(ValueError):
+        stall_watch.parse_gc_config(bad)
+
+
+def test_tune_gc_freezes_boot_heap_and_applies_thresholds(caplog):
+    caplog.set_level(logging.INFO, logger=stall_watch.__name__)
+    saved = gc.get_threshold()
+    keep = [{"k": i} for i in range(1000)]
+    try:
+        frozen = stall_watch.tune_gc(stall_watch.GcTuning(650, 9, 1234, True))
+        assert frozen >= 1000 and gc.get_freeze_count() >= 1000
+        assert gc.get_threshold() == (650, 9, 1234)
+        assert any("gen2=1234" in r.message and "frozen=" in r.message for r in caplog.records)
+        assert "frozen=" in stall_watch.gc_state()
+    finally:
+        gc.unfreeze()
+        gc.set_threshold(*saved)
+        del keep
+
+
+def test_tune_gc_without_freeze_keeps_heap_collectable():
+    saved = gc.get_threshold()
+    try:
+        assert stall_watch.tune_gc(stall_watch.GcTuning(700, 10, 1000, False)) == 0
+        assert gc.get_freeze_count() == 0 and gc.get_threshold() == (700, 10, 1000)
+    finally:
+        gc.set_threshold(*saved)
