@@ -95,7 +95,7 @@ class Rooms:
         return {"ok": True}
 
     def linked(self, ctx) -> bool:
-        return bool(ctx.account.collab_user and self.collab is not None)
+        return bool(self.b.collab_user_for(ctx.account) and self.collab is not None)
 
     def principal(self, ctx, *, required: bool = True) -> Principal | None:
         if not self.linked(ctx):
@@ -103,7 +103,8 @@ class Rooms:
                 raise self.Error(400, "BAD_REQUEST", "Collaboration is not linked to this account. "
                                  "The operator sets collab_user for it in the bridge configuration.")
             return None
-        pr = Principal("user", ctx.account.collab_user, ctx.account.collab_user)
+        user = self.b.collab_user_for(ctx.account)
+        pr = Principal("user", user, user)
         if not self.collab.still_valid(pr):
             raise self.Error(403, "FORBIDDEN", "This account's collaboration user is not available.")
         return pr

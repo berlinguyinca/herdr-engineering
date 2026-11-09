@@ -698,6 +698,7 @@ class RakazoBridge:
         self._cognito_users: dict[str, str] = {}      # account id -> Cognito username, for pool members who signed in
         self._accounts_lock = threading.Lock()
         self.single_operator_fn: Callable[[], bool] = lambda: False     # set by api.py: control_plane.single_operator
+        self.operator_user_fn: Callable[[], str | None] = lambda: None  # set by api.py: the collab user that owns the rooms
         self.cognito = cognito_signin or (cognito.CognitoSignIn(config["cognito"]) if config.get("cognito") else None)
         self.tokens = TokenStore(config["token_ttl_days"] * 86400, config["max_tokens"], persistence, clock,
                                  cutoffs={a.account_id: a.tokens_valid_after for a in self.accounts})
@@ -1629,6 +1630,24 @@ class RakazoBridge:
         except Exception:  # noqa: BLE001 - never widen access on an error
             log.warning("rakazo: canonical_person lookup failed; person left unchanged")
         return tenant, user
+
+    def collab_user_for(self, account) -> str | None:
+        """The collaboration user an account acts as. An explicit ``collab_user`` always wins. Otherwise, in single-operator mode
+        a YAML account with role ``operator`` IS the dashboard operator (see ``canonical_person``), so it acts as the collab user
+        that owns the rooms and no link needs writing. Fails closed (None) for Cognito-derived accounts, a removed or replaced
+        account, any other role, a server that is not in single-operator mode, and on error."""
+        if account.collab_user:
+            return account.collab_user
+        try:
+            if account.role != "operator" or not self.single_operator_fn():
+                return None
+            with self._accounts_lock:
+                if self._by_id.get(account.account_id) is not account or account.account_id in self._cognito_users:
+                    return None
+            return self.operator_user_fn() or None
+        except Exception:  # noqa: BLE001 - never widen access on an error
+            log.warning("rakazo: collab_user_for lookup failed; account left unlinked")
+            return None
 
     def is_owner(self, account) -> bool:
         """The terminal gate. A shell on every fleet host is more than any operator role grants, so only the owner passes:
