@@ -126,8 +126,9 @@ def test_the_fabric_url_is_discovered_from_the_host_configuration(fake_host_conf
     assert rooms_client._fabric_url("http://x:1/") == "http://x:1"          # an explicit URL always wins
 
 
-def test_discovery_refuses_what_the_listener_could_not_bind(fake_host_config):
+def test_discovery_refuses_what_the_listener_could_not_bind(fake_host_config, tmp_path, monkeypatch):
     import pytest
+    monkeypatch.setenv("HOME", str(tmp_path))  # no machine config or fleet config of the real user may answer instead
 
     from herdr_engineering import rooms_client
 

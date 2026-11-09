@@ -535,7 +535,7 @@ def _check_no_empty_or_dangling_sections(page: str):
         assert has_heading == (f'href="#sec-{anchor}"' in toc)  # a chip exactly when the section is there
         if has_heading:
             body = re.search(rf'<section id="sec-{anchor}">(.*?)</section>', page, re.S).group(1)
-            assert re.search(r'<(tr><td|tr id|li|article|dt)', body), f"{anchor} has a heading but no entry"
+            assert re.search(r'<(tr[^>]*><td|tr id|li|article|dt)', body), f"{anchor} has a heading but no entry"
     # (a heading's own permalink points at its own section; the contents chips are the only other section links)
     assert 'href="#sec-' not in re.sub(r'<a class="anchor"[^>]*>#</a>', "", page.replace(toc, "")) and not [
         link for link in document.links if link.startswith("#") and link[1:] not in document.ids]
@@ -768,3 +768,28 @@ def test_the_legend_is_screen_only_stays_off_tight_budgets_and_survives_the_sani
     html = api._envelope("html", _render(asset_url=lambda asset: "#").encode(), api.dashboard_resolver(), None)["html"]
     legend = _legend(html)
     assert "<summary>How to read this report</summary>" in legend and "<dl>" in legend and " open" not in legend.split(">", 1)[0]
+
+
+def test_narrow_tables_stack_into_labelled_rows_but_keep_table_semantics():
+    page = _render()
+    media = re.search(r"@media screen and \(max-width:600px\)\{(.*?)\}\}?(?=@media|$|</style>)", page, re.S)
+    assert media, "a screen-only narrow-width rule exists (print keeps the real table)"
+    css = media.group(1)
+    # no data-* (the sanitiser drops them): labels come from the column position, one per header
+    for head in ("Evidence", "Description", "Files", "Name", "Role", "Type", "Size", "SHA-256"):
+        assert f'content:"{head}"' in page, head
+    assert "table.t-evidence td:nth-child(3)::before" in page and "table.t-downloads td:nth-child(5)::before" in page
+    assert "min-width:0" in css and "display:block" in css
+    assert "data-label" not in page
+    # real table markup with explicit roles survives the display change; the header stays for screen readers
+    assert page.count('<table class="t-') == 2 and page.count('role="columnheader"') == 8
+    assert page.count('role="row"') == 2 + 1 + 1 + 1  # 2 header rows + evidence + 2 assets
+    assert "clip:rect(0 0 0 0)" in css  # visually hidden, not display:none
+    # the desktop minimum width is untouched and print is not stacked
+    assert "min-width:560px" in page
+    assert page.index("max-width:600px") < page.index("@media print{.toc")
+
+
+def test_stacked_rows_keep_their_evidence_anchors():
+    page = _render()
+    assert 'id="evidence-e1"' in page and '<tr id="evidence-e1" role="row">' in page

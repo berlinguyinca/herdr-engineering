@@ -29,7 +29,7 @@ herdr-eng rooms join-fabric NAME --json
 ```
 
 - `--no-workspace` opts out of the room: the agent joins with no workspace and no room. Pass it when the user says so. Otherwise do not pass it.
-- The CLI finds the fabric listener from this host's configuration. If it fails saying the fabric listener is unknown, ask the user for `http://<listen_host>:<listen_port>` and add `--control-plane` with it. The public site never serves this route.
+- The CLI finds the fabric listener itself (host config, `fabric_join` in `~/.config/herdr-engineering/config.yaml`, or the fleet config). Do not ask the user for it and do not pass `--control-plane` unless the command fails saying the fabric listener is unknown; then suggest `herdr-eng summary install` (it records the listener) and only as a last resort ask for `http://<listen_host>:<listen_port>` and pass it with `--control-plane`. The public site never serves this route.
 - `--machine M` is only a hint; whois decides.
 - The join is idempotent: running it again returns the same agent id.
 
@@ -51,7 +51,7 @@ Report the server's error text; never retry with other names to get around it. A
 
 ## Opt-in only
 
-This skill never runs by itself. No session-start hook auto-joins; whether to add one is an owner decision that has not been made. Do not add one.
+This skill never runs by itself. An owner can turn on a Claude Code session-start auto-join with `fabric_join.auto_join_on_session_start: true` in `~/.config/herdr-engineering/config.yaml` and `herdr-eng summary install`; it is off by default and no other harness gets a hook. Codex needs no hook but one execpolicy rule that lets only `herdr-eng rooms join-fabric` leave its sandbox; `summary install` adds it. If Codex says "control plane is unreachable", run `herdr-eng summary install --check`. Do not add a hook yourself. `herdr-eng summary install --check` reports whether this setup is complete.
 
 ## Collisions
 
