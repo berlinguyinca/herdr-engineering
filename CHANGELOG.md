@@ -5,8 +5,16 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Dashboard report viewer and share panel: phone-width and dark-theme polish
+- The dashboard's "Evidence and source downloads" table stacks into labelled blocks below 600px (table roles kept) instead of scrolling sideways with no cue.
+- Share panel at 390px: the four tabs stay on one row; labels stack caption over control with a gap (Expires, Version, Audience, Compare, Report version, Finding or figure); the Links heading and Title field have top margin.
+- Dark theme: the report detail's textareas, inputs and the "Evidence supporting this check" fieldset use the theme tokens (`--surface`, `--border`) instead of the browser's flat grey and white border. `.hd-note` is now styled.
+- Public and preview report pages: roomier table rows (12px/14px padding, 1.55 line height); permalink focus ring uses `--link` (it was 2.99:1, below 3:1).
+- Tests: `tests/playwright/viewer-phone-polish.test.mjs` (chromium, firefox); the share fixture now returns the descriptor's assets.
+
 ### Inspector archive job (disabled by default)
 - New `control_plane.inspector_archive` config (YAML only, validated in `fleet_config.py`) and `InspectorArchiver`: moves inspector tool/message rows older than 14 days from `fabric_events` into `fabric_events_archive`, chunked, one transaction per chunk, idempotent, with a count-only dry run. Never moves rows above the snapshot watermark or projection checkpoint frontier, v2-envelope rows, or state-bearing kinds. Migration 0052 adds a partial archive index. Snapshot boot counts archived rows; the compaction archive purge now skips inspector rows. See `docs/operations/inspector-archive.md`.
+
 ### CI-reported deployments (`control_plane.ci_deployments`)
 
 - New fleet config key `control_plane.ci_deployments: {component: host id}` lets a CI pipeline (for example Woodpecker as host `woodpecker-ci`) report deployments of components that have no `deploy/pipelines` definition, without a fake definition. An event is accepted when the definitions rule allows it or the exact (component, host) pair is listed; another host reporting a listed component gets 403. Bounded (32 entries), validated, hot-reloaded; a component that also has a definition refuses the whole list. With no definitions configured nothing changes; with definitions configured but invalid, every event is still refused (503), listed components included.
