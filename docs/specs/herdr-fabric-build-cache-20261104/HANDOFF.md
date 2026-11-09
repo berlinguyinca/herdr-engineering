@@ -1,4 +1,9 @@
 # HANDOFF (rolling; newest section first)
+## Update 2026-11-09: scheduled build-cache report sender (branch feat/build-cache-report-sender, not pushed, not deployed)
+
+`herdr-eng build-cache-report [--once|--loop] [--json]` wraps `report_builds`. YAML only: `fabric_build_cache.report {enabled: false, url, key_file, interval_s: 60, host_id}`; key from `key_file` (0600) only; exit 2 when disabled, non-https (loopback http allowed), or the key file is missing/empty/loose; exit 1 on a transport or server refusal; `--loop` survives both. Units, all opt-in and enabled by nothing: `scripts/herdr-eng-build-cache-report.service`, `scripts/com.herdr-engineering.build-cache-report.plist`. Install steps: `docs/build-cache-deployment.md`. Tests: `tests/test_build_cache_report_cli.py` (real ControlPlaneServer, no mocks).
+Still open: no host has this enabled, the control plane's `build_cache.ingest` is still off, no ingest-role key or key file exists on any host, the units were not run under a real systemd or launchd, and a real second host has not reported.
+
 ## Update 2026-11-05: backend follow-ups (branch feat/build-cache-backend-followups, not pushed, not deployed)
 
 Four commits: 96a5b8aa reconcile wiring, 52595948 contract events, 1ef7b6c0 SSE resume, 7058dac6 ingest.
@@ -8,7 +13,7 @@ Four commits: 96a5b8aa reconcile wiring, 52595948 contract events, 1ef7b6c0 SSE 
 - Ingest: YAML `control_plane.build_cache.ingest {enabled: false, max_hosts: 64, per_host_builds: 200}`. `POST /api/v1/host/build-cache/report` (ingest-role key, `host_id` checked by `_host_key_allowed`, allowlisted non-secret fields, host forced to the authenticated id, 429 when max_hosts is hit). Merged into the existing GET builds/hosts/status with the host filter. Sender: `herdr_engineering/build_cache_report.py` (`report_builds`).
 - Migration decision: NO migration 0046. Reports are a re-sendable recent window, so in-memory storage loses nothing durable; add a table only if history must survive restarts.
 - Tests: tests/test_build_*.py, tests/control_plane/test_build_cache_api.py, tests/test_fabric_agent.py (see final report for counts).
-- Not done: scheduled sender, real second host, deploy.
+- Not done: real second host, deploy. (The scheduled sender was added afterwards, see the 2026-11-09 update.)
 
 ## Update 2026-11-05: UI and typecheck follow-ups (branch feat/build-cache-ui-followups, not pushed)
 
