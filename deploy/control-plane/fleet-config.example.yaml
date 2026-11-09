@@ -58,6 +58,13 @@ sections:
       # deploy.sh mounts ~/.local/share/herdr-engineering/pipelines (kept equal to InferWeave's
       # deploy/pipelines on main by the herdr-pipelines-sync timer) at /etc/herdr/pipelines.
       # deployment_definitions: "/etc/herdr/pipelines"
+      # OPTIONAL: components a CI pipeline (not a host updater) reports, as {component: host id}. The
+      # host id is a `hosts:` entry (with token_sha256) whose token the pipeline POSTs events with.
+      # Accepted and shown with a "CI-reported" badge, but never planned, gated, permitted, escalated or
+      # forced. At most 32 entries; a component must not also have a definition (the whole list is then
+      # refused and the page says why). Read live. Only effective with deployment_definitions loaded;
+      # while those are invalid, every event is refused (503), these included.
+      # ci_deployments: {lc-binbase-frontend: woodpecker-ci, lc-binbase-backend: woodpecker-ci}
       # OPTIONAL: true enables the audited Deployments actions (POST /api/deployments/force and
       # /ack, operator role). Read live; anything but true is off. Force only records a request the
       # host updaters pick up; the host permit gate (GET /api/deployments/permit) works either way.

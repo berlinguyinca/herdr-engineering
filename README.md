@@ -766,3 +766,5 @@ them under `unleased`; such services are not URL-rewritten.
 and cookie `Domain` headers of HTTP leases to the fabric address. It forces `Connection: close`
 on those leases so every response passes the filter; bodies (which may hold signed or
 script-built URLs) and websocket upgrades are never touched.
+
+Reading, printing and sharing artifact reports (Rich view, anchors, legend): [docs/artifacts/report-viewer-guide.md](docs/artifacts/report-viewer-guide.md).

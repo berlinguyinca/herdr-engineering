@@ -116,6 +116,22 @@ def move_chunk_sql(columns: list[str]) -> str:
                               moved_columns=", ".join("moved." + _quote(c) for c in columns))
 
 
+async def sync_archive_columns(conn) -> list[str]:
+    """Give the archive every column the journal has. A column added to ``fabric_events`` after the archive was created
+    (``trace_id``) made ``INSERT ... SELECT moved.*`` fail with "more expressions than target columns", so no pass
+    moved anything and the journal grew until a boot took ten minutes. Returns the journal's column names."""
+    journal = await conn.fetch(_JOURNAL_COLUMNS)
+    have = {r["name"] for r in await conn.fetch(_ARCHIVE_COLUMNS)}
+    for col in journal:
+        if col["name"] not in have:
+            async with conn.transaction():        # never wait long on a lock while the caller's lock is held
+                await conn.execute("SET LOCAL lock_timeout = '5s'")
+                await conn.execute(
+                    f"ALTER TABLE fabric_events_archive ADD COLUMN IF NOT EXISTS {_quote(col['name'])} {col['type']}")
+            log.warning("fabric archive added missing column %s", col["name"])
+    return [r["name"] for r in journal]
+
+
 class FabricCompactor:
     """Run :meth:`tick` from the worker loop; it does nothing until ``interval_seconds`` have passed."""
 
@@ -160,7 +176,8 @@ class FabricCompactor:
         purged = 0
         if s.archive_retention_days is not None:
             purged = int((await conn.execute(
-                "DELETE FROM fabric_events_archive WHERE archived_at < now() - make_interval(secs => $1)",
+                "DELETE FROM fabric_events_archive WHERE archived_at < now() - make_interval(secs => $1) "
+                "AND entity_type IS DISTINCT FROM 'inspector'",      # inspector rows are accounted for by the snapshot
                 s.archive_retention_days * 86400.0)).split()[-1])
         if moved:
             self._rebuild_pending = True
@@ -242,19 +259,7 @@ class FabricCompactor:
                 log.warning("fabric compaction cleanup failed", exc_info=True)
 
     async def _sync_archive_columns(self, conn) -> list[str]:
-        """Give the archive every column the journal has. A column added to ``fabric_events`` after the archive was created
-        (``trace_id``) made ``INSERT ... SELECT moved.*`` fail with "more expressions than target columns", so no pass
-        moved anything and the journal grew until a boot took ten minutes. Returns the journal's column names."""
-        journal = await conn.fetch(_JOURNAL_COLUMNS)
-        have = {r["name"] for r in await conn.fetch(_ARCHIVE_COLUMNS)}
-        for col in journal:
-            if col["name"] not in have:
-                async with conn.transaction():        # never wait long on a lock while the compaction lock is held
-                    await conn.execute("SET LOCAL lock_timeout = '5s'")
-                    await conn.execute(
-                        f"ALTER TABLE fabric_events_archive ADD COLUMN IF NOT EXISTS {_quote(col['name'])} {col['type']}")
-                log.warning("fabric compaction added missing archive column %s", col["name"])
-        return [r["name"] for r in journal]
+        return await sync_archive_columns(conn)
 
     async def _rebuild(self, conn) -> str:
         from . import recovery_checkpoint as rc
