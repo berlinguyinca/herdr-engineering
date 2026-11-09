@@ -442,6 +442,7 @@ async def run_import(
     staged: dict[str, Path] = {}
     newly_installed: list[str] = []
     inserted: dict[str, int] = {}
+    manifest: dict[str, Any] = {}
     try:
         # 1. Stage and verify every blob the host lacks.  Nothing is written to the host until all are good.
         for sha in sorted(sizes):
@@ -465,6 +466,10 @@ async def run_import(
                     for spec in SPECS:
                         inserted[spec.host] = await _insert(conn, spec, data[spec.host])
                         await _compare(conn, spec, data[spec.host])
+                    # The manifest is derived from the source alone.  Written last inside the transaction, so a write
+                    # failure rolls the rows back (and the except below removes the new blobs): no commit without it.
+                    manifest = build_manifest(data, sizes, source.skipped, source.revoked_shares)
+                    write_manifest(manifest_path, manifest)
             except BaseException:
                 for sha in newly_installed:  # the rolled-back rows never referenced them
                     store.remove(sha)
@@ -477,8 +482,6 @@ async def run_import(
                 path.unlink()
         with contextlib.suppress(OSError):
             scratch.rmdir()
-    manifest = build_manifest(data, sizes, source.skipped, source.revoked_shares)
-    write_manifest(manifest_path, manifest)
     log(f"revoked {source.revoked_shares} share(s) of retracted content")
     log(f"imported {sum(inserted.values())} new row(s) and {len(newly_installed)} new blob(s)")
     return ImportResult(manifest, inserted)

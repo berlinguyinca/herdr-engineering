@@ -300,6 +300,14 @@ def test_row_failure_rolls_back_rows_and_new_blobs(env: Env) -> None:
     assert not env.manifest.exists()
 
 
+def test_manifest_write_failure_aborts_before_any_row_or_blob_is_committed(env: Env) -> None:
+    seed_member(env)
+    env.manifest.mkdir(parents=True)  # a directory where the file goes: the atomic rename cannot succeed
+    assert env.run() != 0
+    assert env.host_count("artifacts") == 0 and env.host_count("artifact_blobs") == 0
+    assert [p for p in (env.host_blobs / "sha256").rglob("*") if p.is_file()] == []
+
+
 def test_verify_fails_on_deleted_row(env: Env, capsys: pytest.CaptureFixture[str]) -> None:
     seed_member(env)
     assert env.run() == 0

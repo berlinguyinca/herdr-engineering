@@ -1521,3 +1521,28 @@ def test_roles_sql_is_idempotent_and_a_rotated_password_takes_effect(stack: _Sta
         "exec", "-T", "artifact-host-db", "psql", "-U", "artifact_admin", "-d", "artifact_host",
         "-X", "-q", "-v", "ON_ERROR_STOP=1", "-f", "-", input=(stack.dir / "roles.sql").read_text(),
     )
+
+
+def test_member_api_allows_delete_only_on_the_routes_the_app_defines(rendered_edge: str) -> None:
+    """The app defines DELETE /api/member/folders/<id> and /folders/<id>/items/<artifact>; the edge lets exactly those
+    through (the body cap and limits stay on the location)."""
+    code = _code(rendered_edge)
+    m = re.search(r"map \"\$request_method:\$uri\" \$member_method_ok \{(.*?)\n  \}", code, re.S)
+    assert m, "member_method_ok map missing"
+    rules = re.findall(r'"~([^"]+)" 1;', m.group(1))
+    assert "default 0;" in m.group(1)
+
+    def allowed(method: str, uri: str) -> bool:
+        return any(re.search(r.replace(r"\z", r"\Z"), f"{method}:{uri}") for r in rules)
+
+    assert allowed("DELETE", "/api/member/folders/fld_a-B")
+    assert allowed("DELETE", "/api/member/folders/fld_a/items/art_1")
+    for bad in ("/api/member/folders", "/api/member/folders/", "/api/member/artifacts/art_1",
+                "/api/member/folders/f/items", "/api/member/folders/f/items/a/b", "/api/member/folders/f\n",
+                "/api/member/folders/f/extra"):
+        assert not allowed("DELETE", bad), bad
+    assert allowed("GET", "/api/member/artifacts") and allowed("PUT", "/api/member/folders/f")
+    assert not allowed("PATCH", "/api/member/artifacts") and not allowed("OPTIONS", "/api/member/artifacts")
+    block = _locations(_server_block(rendered_edge, HOST))["/api/member/"]
+    assert "if ($member_method_ok = 0) { return 404; }" in _code(block)
+    assert "client_max_body_size 1m;" in _code(block) and "limit_req zone=member_req" in block

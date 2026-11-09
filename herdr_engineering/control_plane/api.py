@@ -2079,7 +2079,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         return "agent"
                     return None
                 # With no api keys EVERY caller on this listener is the operator, including for member-owned
-                # artifacts (D4); members therefore require api keys (fleet-config check refuses otherwise).
+                # artifacts (D4); the legacy share-public member path therefore requires api keys (fleet-config check refuses
+                # otherwise). The artifact host path has no member data in this process, so it needs none.
                 # open — only reachable via loopback or an explicit --allow-open
                 # (Tailnet trust boundary); the fail-closed guard enforces this
                 return "operator"

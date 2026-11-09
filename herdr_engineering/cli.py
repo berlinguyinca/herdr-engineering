@@ -4850,7 +4850,8 @@ def _apply_collab_config(args, cp) -> None:
             continue
         value = collab[key]
         if key == "members":
-            _members_settings({"collab": {"members": value}, "share": cp.get("share")})   # validated here, read again where used
+            _members_settings({"collab": {"members": value}, "share": cp.get("share"),
+                               "artifact_host": cp.get("artifact_host")})   # validated here, read again where used
             setattr(args, dest, dict(value))
             continue
         if kind is dict and key == "summary_fix":
@@ -4983,6 +4984,9 @@ def _members_settings(cp) -> dict | None:
     a ``group``, a ``session_secret`` and ``control_plane.share.public_host``; see ``members_config``. A bad section
     stops the start."""
     from .control_plane.members_config import parse_members
+    host = cp.get("artifact_host") if isinstance(cp, dict) else None
+    if isinstance(host, dict) and host.get("enabled") is True:
+        return None     # the dedicated artifact host owns the member web: a leftover collab.members is never read
     collab = cp.get("collab") if isinstance(cp, dict) else None
     raw = collab.get("members") if isinstance(collab, dict) else None
     share = cp.get("share") if isinstance(cp, dict) else None

@@ -438,3 +438,20 @@ def test_startup_refuses_members_without_any_api_key_but_accepts_keys_from_the_c
     _refuse_keyless_members(cp, {"k" * 20: "operator"})              # e.g. --api-keys only: the merged set is what counts
     _refuse_keyless_members({"collab": {"members": {"enabled": False}}}, None)    # members off: nothing to refuse
     _refuse_keyless_members({}, None)
+
+
+def test_on_the_host_path_cli_never_reads_collab_members():
+    """Host enabled + a leftover collab.members.enabled true, no share.public_host, no api_keys: no member admin routes,
+    no worker member runtime, no collab member group, no startup refusal."""
+    from herdr_engineering import cli
+    cp = {"artifact_host": {"enabled": True}, "collab": {"members": members()}}   # members() has no public_host: legacy parse would fail
+    assert cli._members_settings(cp) is None
+    assert cli._member_admin_wiring(cp, "postgresql://unused/db") is None
+    assert cli._collab_member_kwargs(cp) == {}
+    assert cli._members_runtime(cp, None) is None
+    cli._refuse_keyless_members(cp, None)
+    args = type("A", (), {})()
+    cli._apply_collab_config(args, cp)                                          # the YAML key must not be parsed either
+    # and with the host off the same section is still the legacy member config (here: refused for the missing host)
+    with pytest.raises(SystemExit):
+        cli._members_settings({"collab": {"members": members()}})

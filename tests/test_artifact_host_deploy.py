@@ -375,6 +375,14 @@ def test_rollback_after_a_migration_fails_loudly_with_the_manual_steps(env) -> N
     assert "ARTIFACT HOST NOT REVERTED" in r.stderr
     assert "pg_restore" in r.stderr and "stop artifact-host-public" in r.stderr
     assert "--ref" in r.stderr  # the redeploy command of the previous release
+    # the printed commands must survive the deploy's own cleanup: the checkout's compose file, never the deleted $WORK,
+    # and all three variables the compose file requires, on BOTH the stop and the pg_restore step
+    steps = [ln for ln in r.stderr.splitlines() if "stop artifact-host-public" in ln or "pg_restore" in ln]
+    assert len(steps) == 2, r.stderr
+    for ln in steps:
+        assert "HERDR_ARTIFACT_HOST_TAG=" in ln and "HERDR_COLLAB_SYNC_DIR=" in ln and "HERDR_ARTIFACT_HOST_DIR=" in ln, ln
+        compose_path = ln.split(" -f ")[1].split()[0]
+        assert Path(compose_path).is_file(), f"printed compose path does not exist after the deploy: {ln}"
     # the control plane itself went back, with the overlay, so nothing is left mixed on its side
     files = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("composefiles ")]
     rb = next(ln for ln in files if ln.startswith(f"composefiles tag={prev_tag} "))

@@ -56,11 +56,17 @@ Host database (only once the host exists; deploy B also writes `pre-<tag>-<time>
 `~/.config/herdr-engineering/artifact-host/backups/` before migrating, and stops the deploy if that backup fails):
 
     umask 077
-    docker compose -p herdr-artifact-host -f deploy/artifact-host/compose.yaml exec -T artifact-host-db \
+    REPO=<the repo checkout on bender, at the release being deployed>
+    TAG=$(docker inspect --format '{{.Config.Image}}' herdr-artifact-host-artifact-host-public-1 | cut -d: -f2)   # the running host image tag
+    HERDR_ARTIFACT_HOST_TAG=$TAG \
+    HERDR_COLLAB_SYNC_DIR=<the collab sync dir deploy.sh uses: ~/.local/share/herdr-engineering/collab-sync> \
+    HERDR_ARTIFACT_HOST_DIR=$HOME/.config/herdr-engineering/artifact-host \
+    docker compose -p herdr-artifact-host -f $REPO/deploy/artifact-host/compose.yaml exec -T artifact-host-db \
       pg_dump -U artifact_admin -d artifact_host -Fc > ~/herdr-backups/artifact-host-cutover/host-$(date -u +%Y%m%dT%H%M%SZ).dump
 
-(When running compose by hand, export the variables deploy.sh sets, or use the helper it prints; `HERDR_ARTIFACT_HOST_TAG`
-and `HERDR_COLLAB_SYNC_DIR` are required by the file.) Blob storage of the control plane (RustFS bucket) is not modified by
+The compose file requires all three variables (`HERDR_ARTIFACT_HOST_TAG`, `HERDR_COLLAB_SYNC_DIR`,
+`HERDR_ARTIFACT_HOST_DIR`) for any command; `deploy.sh` sets them itself, and nothing prints a ready-made helper for
+by-hand use except the exit-3 recovery steps. Use the checkout path, never a temporary directory. Blob storage of the control plane (RustFS bucket) is not modified by
 anything here; the importer only reads it.
 
 ## 2. Deploy A: new release, host dark
@@ -100,8 +106,10 @@ Edit the fleet YAML (never print values):
         host_url: http://artifact-host-relay:8091                                   # exactly this
       collab: { ... cognito_pool, cognito_clients, cognito_web_client, cognito_domain, cognito_group ... }
 
-`control_plane.api_keys` is NOT required for the host path (the legacy `collab.members` section is ignored and stripped
-from the collab slice while the host is enabled; the share-public path still requires share, the bridge and `api_keys`).
+`control_plane.api_keys` is NOT required for the host path. Remove the legacy `control_plane.collab.members` section (or
+set `enabled: false`) in the same edit: while the host is enabled it is ignored everywhere (fleet validation, the
+collab slice, the dashboard and worker startup read nothing from it), but leaving it in is confusing and invites
+someone to re-enable the old path. The share-public path (host disabled) still requires share, the bridge and `api_keys`.
 
     herdr-eng fleet config validate         # expect revision and host count, no error
     deploy/control-plane/deploy.sh --ref origin/main --dry-run   # renders slices and compose, prints no secret
@@ -121,24 +129,38 @@ The importer needs the control-plane DSN and the host's migrate slice, and the h
 one-off container on the host image, attached to the host DB network and to the control-plane DB network, using a
 read-only control-plane role created for this (a role with `SELECT` only on the library/artifact tables; drop it after):
 
-    umask 077
+The container runs as uid 10001 with a read-only root, so every mount must suit that uid. Prepare them first:
+
+    OUT=~/herdr-backups/artifact-host-cutover/out
+    mkdir -p $OUT && sudo chown 10001:10001 $OUT && sudo chmod 0700 $OUT      # /out: the manifest is written here by uid 10001
+    # (the migrate slice is a 0644 file inside a 0700 directory: the daemon mounts the file, and uid 10001 can read the file itself)
+    # /src: the control plane's blob directory must be readable by 10001. Check: `sudo find <dir> ! -perm -o+r | head`
+    # prints nothing. If it prints files, copy instead of widening the original:
+    #   sudo cp -a <dir> /srv/ah-import-src && sudo chown -R 10001:10001 /srv/ah-import-src   (remove it afterwards)
+    # pgpass (only if the read-only role has a password): a 0400 file owned by 10001, MOUNTED below; PGPASSFILE means nothing otherwise
+    printf '%s\n' 'herdr-cp-postgres:5432:herdr:<ro-role>:<password>' | sudo tee /srv/ah-pgpass >/dev/null
+    sudo chown 10001:10001 /srv/ah-pgpass && sudo chmod 0400 /srv/ah-pgpass     # remove it afterwards
+
     docker run -d --name ah-import --read-only --cap-drop ALL --user 10001:10001 \
       --network herdr-artifact-host_artifact-host --entrypoint sleep \
       -v ~/.config/herdr-engineering/artifact-host/migrate.json:/run/secrets/m:ro \
       -v herdr-artifact-host_artifact-host-blobs:/var/lib/artifact-host/blobs \
-      -v <cp-blob-dir-or-s3-config>:/src:ro -v ~/herdr-backups/artifact-host-cutover:/out \
+      -v <blob-dir-or-/srv/ah-import-src-or-s3-config-file>:/src:ro -v $OUT:/out \
+      -v /srv/ah-pgpass:/run/secrets/pgpass:ro \
       herdr-artifact-host:<tag> 3600
     docker network connect <cp-db-network> ah-import       # the control plane's postgres network (`docker inspect herdr-cp-postgres`)
-    docker exec ah-import herdr-artifact-host import --config /run/secrets/m --manifest /out/manifest.json \
-      --source-dsn 'postgresql://<ro-role>@herdr-cp-postgres/herdr' --source-blob-dir /src      # or --source-s3-config /src
+    docker exec -e PGPASSFILE=/run/secrets/pgpass ah-import herdr-artifact-host import --config /run/secrets/m \
+      --manifest /out/manifest.json --source-dsn 'postgresql://<ro-role>@herdr-cp-postgres/herdr' \
+      --source-blob-dir /src      # or --source-s3-config /src
+    ls -l $OUT/manifest.json      # exists; the importer writes it inside the commit, so no manifest means nothing was imported
 
 Expected: `import:` lines ending in a summary with `0` (or near-empty) rows and blobs; exit 0 (the command also runs
 verify). Then:
 
-    docker exec ah-import herdr-artifact-host verify --config /run/secrets/m --manifest /out/manifest.json --exact
+    docker exec ah-import herdr-artifact-host verify --config /run/secrets/m --manifest /out/manifest.json --exact   # prints from /out
 
 Expected: `verify: identical to the manifest`, exit 0. A nonzero exit is a failed verify: do not continue; Rollback.
-Re-running import is safe (idempotent). Keep `manifest.json` with the backups. Then `docker rm -f ah-import` and drop the temporary read-only role. (Network, volume and mount names must be checked against `docker network ls` / `docker volume ls` before running; the source DSN needs the role's password via `PGPASSFILE` or the DSN of your secret store, not typed on the line. With a near-empty source this is a formality, but the manifest is the audit record.)
+Re-running import is safe (idempotent). Keep `manifest.json` with the backups. Then `docker rm -f ah-import`, remove `/srv/ah-pgpass` and any `/srv/ah-import-src` copy, and drop the temporary read-only role. (Check network, volume and mount names against `docker network ls` / `docker volume ls` before running. With a near-empty source this is a formality, but the manifest is the audit record.)
 
 ## 7. Live checks (all must pass)
 
@@ -149,10 +171,10 @@ Substitute `H=<public_host>`, `M=<mcp host>`, `DASH=<dashboard base URL>`.
 | 1 | `curl -sS -i https://$H/api/member/config` | `200`, JSON with the Cognito client/domain, no secret |
 | 2 | `curl -sS -i https://$H/s/unknown/` and `curl -sS -i https://$H/s/other-unknown/` | both `404`, byte-identical bodies (`diff <(curl -s https://$H/s/unknown/) <(curl -s https://$H/s/other-unknown/)` prints nothing) |
 | 3 | Open a real share link in a browser (or `curl -sSi` it) | landing bar present; response has `Content-Security-Policy` (claim CSP); content is served inert |
-| 4 | From the dashboard: open `$DASH/library` signed in as the operator | lists items (empty is fine), page loads; this proves the internal key and the relay |
-| 5 | From the dashboard container, send a POST to the relay: `docker exec herdr-cp-web python -c "import urllib.request as u; r=u.Request('http://artifact-host-relay:8091/v1/feed', data=b'', method='POST'); u.urlopen(r)"` | fails with `HTTPError: HTTP Error 405` (GET-only; the key is not needed to see the refusal) |
-| 6 | `docker exec herdr-artifact-host-artifact-host-public-1 sh -c 'getent hosts herdr-cp-web; wget -T3 -qO- http://herdr-cp-web:8080 \|\| echo unreachable'` (container name per `docker ps`) | name does not resolve / `unreachable`: the host cannot reach the control plane |
-| 7 | Browser: `https://$H/` sign in with Cognito, land on the member page, reload, sign out | round trip works; session cookie is set, `/api/member/me` answers 200 when signed in and 401 signed out |
+| 4 | From the dashboard: open `$DASH/library` signed in as the operator | lists items (empty is fine), page loads; this proves the internal key and the relay. A POST to the dashboard's library route answers `501` |
+| 5 | From the dashboard container, send a POST to the relay: `docker exec herdr-cp-web python -c "import urllib.request as u; u.urlopen(u.Request('http://artifact-host-relay:8091/v1/feed', data=b'', method='POST'))"` | fails with `HTTPError: HTTP Error 403` (the relay allows GET only; no key needed to see the refusal). A `200` or `405` here is a failure of the relay config |
+| 6 | `docker exec herdr-artifact-host-artifact-host-public-1 python -c "import socket,sys; socket.create_connection(('herdr-cp-web', 8080), 3); sys.exit('REACHABLE')"` (container name per `docker ps`) | exits non-zero with `socket.gaierror` (name does not resolve) or a timeout/`OSError`: the host cannot reach the control plane. It FAILS the check if it prints `REACHABLE` or exits 0 |
+| 7 | Browser: `https://$H/` sign in with Cognito, land on the member page, reload, sign out | round trip works. The member session is a bearer token the page keeps and sends in the `Authorization` header (never a cookie): in the browser's network tab `/api/member/*` calls carry `Authorization: Bearer ...`, and no `Set-Cookie` appears. After sign-out the same call with the old token answers `401` |
 | 8 | Agent: `POST https://$M/mcp/artifacts` (`tools/call` create_artifact with a member's agent token) | lands `pending` (visible in the member page awaiting accept; not shared); after the member accepts, it appears |
 | 9 | `$DASH/library` after step 8 and after accepting | the item shows read-only (no edit/share controls; a POST to the internal API still 405) |
 | 10 | `docker ps --filter name=artifact-host --format '{{.Names}} {{.Status}}'` | db, public, internal, relay all `healthy`; no published ports |
@@ -172,12 +194,17 @@ The host's data is additive and the control plane's copy is unchanged, so rollba
 1. If the host has taken real member data (anything created after deploy B), dump the host DB FIRST (command in section
    1). Rolling back loses what was written to the host since cutover unless you re-import it by hand; say so to the owner.
 2. Point the edge back: set `control_plane.artifact_host.enabled: false` and `control_plane.share.enabled: true` (the previous
-   share settings), then `deploy/control-plane/deploy.sh --ref <previous commit> --no-fetch --allow-divergent`. The deploy
-   stops the host containers (volumes are kept) and renders the share edge again. Re-run check 2 and the legacy probe.
+   share settings), then redeploy THE SAME `origin/main` commit: `deploy/control-plane/deploy.sh --ref <the commit you shipped>
+   --no-fetch --allow-divergent`. Never roll back to a commit from before this branch: those releases have no host files,
+   so the deploy cannot stop the host cleanly or restore its roles (it would record a manual-rollback case), and their fleet
+   validation does not know the `artifact_host` section. The shipped commit contains both paths; the flag decides. The
+   deploy stops the host containers (volumes are kept) and renders the share edge again. Re-run check 2 and the legacy probe.
 3. `deploy.sh` exit 3 ("FAILED TO ROLL BACK" / manual steps printed): it refuses to silently revert a host whose schema it
    changed. Follow the printed steps exactly: stop the host roles, `pg_restore` the pre-migration dump
-   (`... exec -T artifact-host-db pg_restore -U artifact_admin -d artifact_host --clean --if-exists < <dump>`), then redeploy the
-   previous ref with the printed command. Take a host DB dump before restoring.
+   (`... exec -T artifact-host-db pg_restore -U artifact_admin -d artifact_host --clean --if-exists < <dump>`), then run
+   the printed redeploy command (in this cutover the previous release is the Deploy A commit, the same `origin/main` commit).
+   The printed `docker compose` lines use the repo checkout's compose file and carry all three required variables; run them
+   from that checkout at the shipped commit. Take a host DB dump before restoring.
 4. The control-plane DB backup from section 1 is only needed if the control plane itself was damaged; restore it with
    `pg_restore --clean --if-exists` after stopping the control plane, never otherwise.
 

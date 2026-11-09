@@ -1276,10 +1276,14 @@ rollback_artifact_host() {
     {
       echo "ARTIFACT HOST NOT REVERTED: this deploy changed its database (roles and/or migrations), and the previous release's host code"
       echo "may not run against it, so the host project $AH_PROJECT stays on the new release $SHA. To finish the rollback by hand:"
-      echo "  1. stop the roles:   HERDR_ARTIFACT_HOST_TAG=$TAG HERDR_ARTIFACT_HOST_DIR=$AH_DIR docker compose -p $AH_PROJECT -f $WORK/deploy/artifact-host/compose.yaml stop artifact-host-public artifact-host-internal artifact-host-relay"
+      # $WORK is deleted when this script exits: print the checkout's own compose file, and every variable it requires.
+      local AH_ENV="HERDR_ARTIFACT_HOST_TAG=$TAG HERDR_COLLAB_SYNC_DIR=$HERDR_COLLAB_SYNC_DIR HERDR_ARTIFACT_HOST_DIR=$AH_DIR"
+      local AH_COMPOSE="docker compose -p $AH_PROJECT -f $REPO/deploy/artifact-host/compose.yaml"
+      echo "  (run these from a checkout of $SHA: $REPO/deploy/artifact-host/compose.yaml must be that release's file)"
+      echo "  1. stop the roles:   $AH_ENV $AH_COMPOSE stop artifact-host-public artifact-host-internal artifact-host-relay"
       if [ -e "${AH_BACKUP_FILE:-}" ]; then
         echo "  2. restore the pre-migration dump ($AH_BACKUP_FILE):"
-        echo "       docker compose -p $AH_PROJECT -f $WORK/deploy/artifact-host/compose.yaml exec -T artifact-host-db pg_restore -U artifact_admin -d artifact_host --clean --if-exists < $AH_BACKUP_FILE"
+        echo "       $AH_ENV $AH_COMPOSE exec -T artifact-host-db pg_restore -U artifact_admin -d artifact_host --clean --if-exists < $AH_BACKUP_FILE"
       else
         echo "  2. no dump was taken by this deploy (it failed before the backup): the database is as the roles step left it"
       fi

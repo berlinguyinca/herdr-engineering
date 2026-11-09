@@ -287,8 +287,8 @@ class InternalSurface:
 
     @staticmethod
     def _client(request: web.Request) -> str:
-        """The limiter key: the socket peer only.  This listener sits behind no proxy, so a forwarded header is
-        attacker-controlled and never consulted."""
+        """The limiter key: the socket peer only.  The only hop in front of this listener is the one-way relay, which
+        does not set a trusted client address, so a forwarded header is attacker-controlled and never consulted."""
         peername = request.transport.get_extra_info("peername") if request.transport else None
         return str(peername[0]) if peername else "unknown"
 
