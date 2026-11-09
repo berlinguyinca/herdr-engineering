@@ -61,6 +61,8 @@ DEFAULTS: dict[str, Any] = {
                      "max_entries_per_run": 5000},
         "adaptive_slots": {"enabled": False, "min_slots": 1, "max_slots": 4},
         "observability": {"enabled": False, "export_existing_metrics_pipeline": False},
+        # Opt-in sender of this host's builds to a control plane (`herdr-eng build-cache-report`).
+        "report": {"enabled": False, "url": None, "key_file": None, "interval_s": 60, "host_id": None},
     },
     "herdr": {"capability_cache_ttl_seconds": 30},
     "web": {"private_only": True, "host": "127.0.0.1", "port": 8787},
