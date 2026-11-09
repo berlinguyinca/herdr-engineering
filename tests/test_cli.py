@@ -325,3 +325,12 @@ def test_single_operator_makes_the_assistant_allow_the_owners_own_approval_and_n
     on = _assistant_config({"personal_assistant": pa, "single_operator": True})["personal_assistant"]
     assert on["actions"] == {"approvers": ["a"], "allow_self_approval": True} and "allow_self_approval" not in pa["actions"]
     assert _assistant_config({"single_operator": True}) is None
+
+
+def test_fabric_compaction_normalises_service_timestamps_unless_exactly_false():
+    from herdr_engineering.cli import _fabric_compaction_settings
+    assert _fabric_compaction_settings({}).normalize_service_timestamps is True
+    assert _fabric_compaction_settings({"fabric_compaction": {"normalize_service_timestamps": "no"}}
+                                       ).normalize_service_timestamps is True
+    assert _fabric_compaction_settings({"fabric_compaction": {"normalize_service_timestamps": False}}
+                                       ).normalize_service_timestamps is False

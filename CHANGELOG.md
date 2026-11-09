@@ -11,6 +11,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - No session-start auto-join hook: that stays an owner decision. The router entry (`join` in the `herdr` skill's `commands.json`) lives in the separate herdr-handoff repo.
 - Tests: `tests/test_herdr_join_skill.py`, `tests/control_plane/test_collab_fabric_join_skill_e2e.py` (real CLI against the real fabric listener).
 
+### Fabric compaction treats ServiceUpdated rows that differ only by heartbeat timestamps as repeats
+- `ServiceUpdated` compaction compared payloads exactly, but every heartbeat restamps `metadata_updated_at`, `verified_origin.verified_at` and `metadata_observation.observed_at`, so it removed 32 of 235,252 recent rows while 99.6% differed only by those. Equality now ignores the three timestamps (`control_plane.fabric_compaction.normalize_service_timestamps`, default true; false restores exact equality). The service's first and last `ServiceUpdated` row are still kept, so a replay (including `updated_at`) is identical; rows already journaled replay as before. Tests in `tests/control_plane/test_compaction_ignores_heartbeat_timestamps.py` (real PostgreSQL).
+
 ### Single-operator phone account acts as the room owner with no `collab_user`
 - In `single_operator` mode a YAML bridge account with role `operator` now acts as `operator_user` for rooms, groups and agent bots, so the phone app lists fabric agents and workspace rooms without a hand-written `collab_user` link. An explicit `collab_user` still wins. Cognito-derived accounts, other roles, replaced accounts and servers that are not single-operator stay unlinked. Tests in `tests/control_plane/test_rakazo_rooms.py`.
 

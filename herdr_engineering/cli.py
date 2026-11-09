@@ -5353,7 +5353,8 @@ def _fabric_compaction_settings(cp):
         rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False,
         keep_checkpoints=int(number("keep_checkpoints", 2, 1)),
         publish_projection_checkpoint=raw.get("publish_projection_checkpoint") is True,
-        projection_lock_wait_seconds=number("projection_lock_wait_seconds", 60, 0))
+        projection_lock_wait_seconds=number("projection_lock_wait_seconds", 60, 0),
+        normalize_service_timestamps=raw.get("normalize_service_timestamps") is not False)
 
 
 def _share_worker_settings(cp):
