@@ -22,7 +22,24 @@ from .projection_store import CheckpointInvalid
 COMPACT_TYPES = frozenset({'service', 'session'})
 PRIVATE_REPLAY_TYPES = frozenset({'deployment', 'deployment_plan', 'deployment_request',
                                   'deployment_escalation'})
+
+# Streams whose checkpointed rows are kept verbatim in the capsule and consumed only by a reducer that
+# rebuilds from the full row set on every restore (``_rebuild_delivery_from_events``: token and resource
+# usage). New rows can therefore be appended, and retention deletes removed, without re-reading the
+# stream: the restored row set equals the full replay's. Everything else is refolded from the database.
+#   * ci_report/ci_observation/ci_telemetry/ci_logtests: ``_trim_ci_history`` evicts across streams.
+#   * inspector/host_metrics/collab/deployment*/agent_*: private owners, not kept in the capsule streams.
+#   * host/mission/artifact: ordered reducers over partial fields (``dirty_core`` refolds them).
+#   * service/session (COMPACT_TYPES): own append path with the ingest-clock cursor.
+FOLDABLE_TYPES = frozenset({'token_usage', 'resource_usage'})
 CORE_FIELDS = ('missions', 'sessions', 'hosts', 'services', 'artifacts')
+
+
+def actor_id(row):
+    actor = row.get('actor') or {}
+    if isinstance(actor, str):
+        actor = json.loads(actor)
+    return actor.get('id') or ''
 
 
 def event_time(row):
@@ -161,7 +178,7 @@ def _host_metrics_after_tail(repo, state, host_projection, full_streams):
     return merged, views
 
 
-def restore_projection(repo, checkpoint, *, full_streams, tail_rows, structured, coverage):
+def restore_projection(repo, checkpoint, *, full_streams, tail_rows, structured, coverage, fold_removed=None):
     """Prepare a fresh repository. It is not published until every owner restores."""
     from .bridge import _load_full_into, _reconstruct_from_events
 
@@ -211,6 +228,18 @@ def restore_projection(repo, checkpoint, *, full_streams, tail_rows, structured,
 
     streams = state['events']
     streams.update(copy.deepcopy(checkpoint.get('private_streams', {})))
+    # Foldable streams keep their checkpointed rows: drop what retention deleted, append what arrived.
+    folded = fold_removed or {}
+    for (kind, identity), removed in folded.items():
+        key = f'{kind}|{identity}'
+        streams[key] = [row for row in streams.get(key, []) if (row.get('event_id'), actor_id(row)) not in removed]
+    for row in tail_rows:
+        pair = (row.get('entity_type'), row.get('entity_id'))
+        if pair in folded:
+            streams.setdefault(f'{pair[0]}|{pair[1]}', []).append(copy.deepcopy(row))
+    for kind, identity in folded:
+        if not streams.get(f'{kind}|{identity}'):
+            streams.pop(f'{kind}|{identity}', None)
     for key, rows in appended.items():
         streams[key] = sorted(streams.get(key, []) + rows, key=lambda row: row['sequence'])[-1:]
     for (kind, identity), rows in full_streams.items():
