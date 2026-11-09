@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import NamedTuple
 
 from .envelope import SourceLedger
 from .inspector import InspectorStore
@@ -26,7 +27,35 @@ RETENTION_TYPES = frozenset({'inspector','host_metrics','token_usage','resource_
 # service delete is tolerated; the stream is then rebuilt from its surviving rows (see _append_blocker).
 COMPACTED_TYPES = frozenset({'service'})
 MAX_TAIL_ROWS = 100_000
-MAX_DIRTY_ROWS = 250_000
+MAX_DIRTY_ROWS = 600_000
+TOP_CONTRIBUTORS = 5
+
+
+class CheckpointBudgets(NamedTuple):
+    """Row budgets for one incremental recovery: change-log tail and re-read dirty streams."""
+    max_tail_rows: int
+    max_dirty_rows: int
+
+
+def checkpoint_budgets(raw=None):
+    """Validate ``control_plane.projection_checkpoint`` (fleet YAML); missing keys take the defaults.
+
+    Raises ValueError naming the key for anything but a positive integer.
+    """
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError('control_plane.projection_checkpoint must be a mapping')
+    unknown = sorted(set(raw) - {'max_tail_rows', 'max_dirty_rows'})
+    if unknown:
+        raise ValueError(f'control_plane.projection_checkpoint: unknown key(s) {unknown}')
+    values = {}
+    for key, default in (('max_tail_rows', MAX_TAIL_ROWS), ('max_dirty_rows', MAX_DIRTY_ROWS)):
+        value = raw.get(key, default)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f'control_plane.projection_checkpoint.{key} must be a positive integer, got {value!r}')
+        values[key] = value
+    return CheckpointBudgets(**values)
 
 
 def feed_visible(row):
@@ -46,7 +75,10 @@ async def _rows(conn, sql, *args, maximum=None, explain=None):
                 item[field] = json.loads(item[field])
         result.append(item)
         if maximum is not None and len(result) > maximum:
-            detail = f' ({explain()})' if explain else ''
+            described = explain() if explain else None
+            if hasattr(described, '__await__'):
+                described = await described
+            detail = f' ({described})' if described else ''
             raise CheckpointInvalid(f'incremental stream budget exceeded; complete replay required{detail}')
     return result
 
@@ -67,12 +99,32 @@ def _append_blocker(operations, tail, previous, in_prefix_events):
     return None if min(event_time(row) for row in tail) > previous else 'not_after_cursor'
 
 
-def _budget_summary(pairs, blocked):
+def _budget_summary(pairs, blocked, rows_by_type=None, limit=None):
     kinds = {}
     for kind, _ in pairs:
         kinds[kind] = kinds.get(kind, 0) + 1
     reasons = {f'{kind}:{reason}': count for (kind, reason), count in blocked.items()}
-    return f'dirty streams by type {dict(sorted(kinds.items()))}; compact append blocked {dict(sorted(reasons.items()))}'
+    text = f'dirty streams by type {dict(sorted(kinds.items()))}; compact append blocked {dict(sorted(reasons.items()))}'
+    if rows_by_type is None:
+        return text
+    ranked = sorted(rows_by_type.items(), key=lambda item: (-item[1], item[0]))
+    top = ', '.join(f'{kind}={count}' for kind, count in ranked[:TOP_CONTRIBUTORS])
+    if len(ranked) > TOP_CONTRIBUTORS:
+        top += f', +{len(ranked) - TOP_CONTRIBUTORS} more types'
+    return f'dirty rows {sum(rows_by_type.values())} > limit {limit}: {top}; {text}'
+
+
+async def _dirty_rows_by_type(conn, pairs):
+    found = await conn.fetch(
+        'SELECT dirty.kind AS kind, count(*) AS rows FROM fabric_events AS events JOIN '
+        'unnest($1::text[],$2::text[]) AS dirty(kind,identity) '
+        'ON events.entity_type=dirty.kind AND events.entity_id=dirty.identity GROUP BY dirty.kind',
+        [p[0] for p in pairs], [p[1] for p in pairs])
+    return {row['kind']: row['rows'] for row in found}
+
+
+async def _explain_overflow(conn, pairs, blocked, limit):
+    return _budget_summary(pairs, blocked, await _dirty_rows_by_type(conn, pairs), limit)
 
 
 async def _read_prepared(source, code, policy):
@@ -111,8 +163,10 @@ async def _read_prepared_once(source, code, policy):
                         or not point['replay_floor'] <= frontier <= point['position']):
                     raise CheckpointInvalid('checkpoint frontier is outside retained change coverage')
                 changes = await store.changes_after(frontier, point['position'])
-                if len(changes) > MAX_TAIL_ROWS:
-                    raise CheckpointInvalid('incremental change budget exceeded')
+                budgets = getattr(source, 'checkpoint_budgets', None) or CheckpointBudgets(MAX_TAIL_ROWS, MAX_DIRTY_ROWS)
+                if len(changes) > budgets.max_tail_rows:
+                    raise CheckpointInvalid(f'incremental change budget exceeded: {len(changes)} tail rows > limit '
+                                            f'{budgets.max_tail_rows}; complete replay required')
                 if any(row['operation'] in {'T','U'} or
                        (row['operation']=='D' and row['entity_type'] not in RETENTION_TYPES | COMPACTED_TYPES)
                        for row in changes):
@@ -168,8 +222,8 @@ async def _read_prepared_once(source, code, policy):
                         'unnest($1::text[],$2::text[]) AS dirty(kind,identity) '
                         'ON events.entity_type=dirty.kind AND events.entity_id=dirty.identity '
                         'ORDER BY events.ingest_timestamp,events.sequence,events.event_id',
-                        [p[0] for p in pairs],[p[1] for p in pairs],maximum=MAX_DIRTY_ROWS,
-                        explain=lambda: _budget_summary(pairs, blocked))
+                        [p[0] for p in pairs],[p[1] for p in pairs],maximum=budgets.max_dirty_rows,
+                        explain=lambda: _explain_overflow(conn, pairs, blocked, budgets.max_dirty_rows))
                     for row in raw:
                         streams[(row['entity_type'],row['entity_id'])].append(public_event(row))
                 coverage = {**point,

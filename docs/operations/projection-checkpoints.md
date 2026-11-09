@@ -87,6 +87,21 @@ updates and truncates still require a complete replay. The rebuilt streams count
 against the incremental stream budget; if many compacted services exceed it, the
 rejection reason names the budget and recovery falls back to a complete replay.
 
+Both budgets count rows and are set in the central fleet YAML (never environment
+variables):
+
+```yaml
+control_plane:
+  projection_checkpoint:
+    max_tail_rows: 100000    # change-log rows since the checkpoint
+    max_dirty_rows: 600000   # rows re-read from streams that cannot fold incrementally
+```
+
+Values must be positive integers; anything else stops startup with an error naming
+the key. A rejection logs `dirty rows <actual> > limit <configured>` with the top
+five entity types by row count (non-compactable streams such as `token_usage`
+stay dirty and are re-read in full).
+
 While compaction drains a large backlog, one pass can touch thousands of streams
 and exceed that budget, so an older checkpoint is rejected and web boot replays
 everything. Set `control_plane.fabric_compaction.publish_projection_checkpoint: true`
