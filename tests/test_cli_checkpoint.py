@@ -105,7 +105,8 @@ def test_worker_refresh_lifecycle_preserves_upstream_flows(
         def __init__(self, dsn, **kwargs):
             assert dsn == cp['pg_dsn']
             assert kwargs == {'host_aliases': {'a': 'b'}, 'inspector_limits': {},
-                              'checkpoint_budgets': CheckpointBudgets(100_000, 600_000, 2_000_000)}
+                              'checkpoint_budgets': CheckpointBudgets(100_000, 600_000, 2_000_000),
+                              'heap_release': True}
             events.append('refresh-init')
 
         def start(self):

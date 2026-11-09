@@ -6,6 +6,7 @@ import math
 import threading
 
 from . import bridge
+from .heap_release import release_heap_if_enabled
 from .repo import ControlPlaneRepo
 
 log = logging.getLogger(__name__)
@@ -54,13 +55,14 @@ class ProjectionRefresh:
     """
 
     def __init__(self, dsn, *, host_aliases=None, inspector_limits=None,
-                 interval=REFRESH_INTERVAL, checkpoint_budgets=None):
+                 interval=REFRESH_INTERVAL, checkpoint_budgets=None, heap_release=True):
         if not math.isfinite(interval) or interval <= 0:
             raise ValueError('checkpoint interval must be positive and finite')
         self._dsn = dsn
         self._policy = dict(host_aliases=host_aliases, inspector_limits=inspector_limits,
                             checkpoint_budgets=checkpoint_budgets)
         self._interval = interval
+        self._heap_release = heap_release
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name='projection-refresh', daemon=True)
 
@@ -77,5 +79,7 @@ class ProjectionRefresh:
                 refresh_checkpoint(self._dsn, **self._policy)
             except Exception as exc:
                 log.warning('projection checkpoint refresh failed (%s)', type(exc).__name__)
+            # The pass's repo and replay rows are unreachable now; hand the fragmented heap back to the OS.
+            release_heap_if_enabled(self._heap_release)
             if self._stop.wait(self._interval):
                 break

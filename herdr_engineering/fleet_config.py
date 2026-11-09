@@ -156,6 +156,13 @@ def _parse(data: Any) -> FleetConfig:
                 parse_agent_rules(sec["values"]["agent_rules"])
             except ValueError as exc:
                 raise FleetConfigError(f"section {name}: {exc}") from None
+        if name == CONTROL_PLANE_SECTION and "heap_release" in sec["values"]:
+            from herdr_engineering.control_plane.heap_release import parse_heap_release
+
+            try:
+                parse_heap_release(sec["values"]["heap_release"])
+            except ValueError as exc:
+                raise FleetConfigError(f"section {name}: {exc}") from None
         if name == "github" and sec["values"].get("app") not in (None, {}):
             from herdr_engineering.github_auth import GitHubAuthError, parse_app_config
 

@@ -4635,6 +4635,9 @@ def _cmd_cp_web(args) -> int:
                              artifact_delete_allow_keyless_owner=artifact_delete.allow_keyless,
                              collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled,
                              member_web=member_web)
+    # The constructor ran the boot replay (load_into): return its freed heap to the OS before serving.
+    from .control_plane.heap_release import release_heap_if_enabled
+    release_heap_if_enabled(_heap_release_enabled(cp))
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read
         svr.artifact_graph_gate.load_retractions(artifact_adapter("load_retractions"))
@@ -5169,6 +5172,15 @@ def _maybe_rustfs_client(cp=None):
         # crash web startup over object storage.
         pass
     return client
+
+
+def _heap_release_enabled(cp) -> bool:
+    """``control_plane.heap_release.enabled`` (default true); a malformed section refuses the start."""
+    from .control_plane.heap_release import heap_release_enabled
+    try:
+        return heap_release_enabled(cp)
+    except ValueError as exc:
+        raise SystemExit(f"fleet config control_plane.{exc}") from None
 
 
 def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
@@ -5755,7 +5767,8 @@ def _cmd_cp_worker(args) -> int:
                     refresh = ProjectionRefresh(
                         fleet_cp["pg_dsn"], host_aliases=_host_aliases_from(fleet_cp),
                         inspector_limits=fleet_cp.get("inspector_limits") or {},
-                        checkpoint_budgets=_checkpoint_budgets_from(fleet_cp))
+                        checkpoint_budgets=_checkpoint_budgets_from(fleet_cp),
+                        heap_release=_heap_release_enabled(fleet_cp))
                     refresh.start()
                 await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
                                  artifact_job_runner=runner, inspector_snapshotter=snapshotter,
