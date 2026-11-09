@@ -98,7 +98,10 @@ that already covers the deletes. It uses the same publish path as
 refresh thread holds. The compaction advisory lock is released before the
 publish starts, so the two locks are never held together. A busy lock or failed
 publish logs a warning (`projection checkpoint ... deferred`), never fails the
-compaction pass, and is retried by the next drained pass. It needs
+compaction pass, and is retried on every later worker tick (not only the next
+drained pass, which can be a day away): a retry tick does no compaction work,
+keeps the same short lock wait, and clears the pending flag only once a
+checkpoint is actually published. It needs
 `control_plane.pg_dsn` (the same key the refresh thread uses). The budget and
 validity guards are unchanged.
 

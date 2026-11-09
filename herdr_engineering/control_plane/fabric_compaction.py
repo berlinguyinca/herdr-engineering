@@ -27,7 +27,8 @@ refresh thread uses) after a drained pass that moved rows, so the next boot find
 Lock order: the compaction advisory lock (``_LOCK``) is released when the move ends, and only then does the publish take
 the materializer lock (on its own connection, waiting up to ``projection_lock_wait_seconds``); the two are never held
 together, so they cannot deadlock. The blocking publish runs in a thread. A busy lock or a failed publish logs a warning,
-leaves the publish pending and never fails the pass; the next drained pass retries.
+leaves the publish pending and never fails the pass; every later tick (even inside ``interval_seconds``) retries it, with
+no compaction work, until it succeeds.
 Off unless ``enabled`` is true; ``dry_run`` (the default) only counts.
 """
 from __future__ import annotations
@@ -128,12 +129,13 @@ class FabricCompactor:
         self._checkpoint_builder = checkpoint_builder
         self._projection_publisher = projection_publisher     # blocking callable(lock_wait_seconds); None = not wired
         self._projection_pending = False
+        self._projection_retry_due = False    # a publish was attempted and deferred: retry it on every tick
         self.last_outcome = "not run"
 
     async def tick(self, conn) -> str:
         now = self._clock()
         if self._last is not None and now - self._last < self.settings.interval_seconds:
-            return "waiting"
+            return await self._retry_projection() or "waiting"
         self._last = now
         try:
             self.last_outcome = await self._run(conn)
@@ -172,17 +174,31 @@ class FabricCompactor:
             outcome += "; " + await self._publish_projection()      # after _move released _LOCK: never nested
         return outcome
 
+    async def _retry_projection(self) -> str | None:
+        """On a tick inside the interval: retry a deferred publish only. No compaction work, no connection used; the
+        wait is the short ``projection_lock_wait_seconds``. Returns None when there is nothing to retry."""
+        s = self.settings
+        if not (self._projection_retry_due and self._projection_pending and s.publish_projection_checkpoint
+                and not s.dry_run):
+            return None
+        outcome = await self._publish_projection()
+        self.last_outcome = outcome
+        return outcome
+
     async def _publish_projection(self) -> str:
         """Publish a projection checkpoint off the event loop. Never raises; any failure leaves the publish pending."""
         if self._projection_publisher is None:
             log.warning("fabric compaction cannot publish a projection checkpoint: no publisher is wired")
+            self._projection_retry_due = True
             return "projection checkpoint deferred (no publisher)"
         try:
             await asyncio.to_thread(self._projection_publisher, self.settings.projection_lock_wait_seconds)
         except Exception as exc:    # the archived rows are consistent either way; the next drained pass retries
             log.warning("fabric compaction projection checkpoint publish failed (%s)", type(exc).__name__)
+            self._projection_retry_due = True
             return f"projection checkpoint deferred ({type(exc).__name__})"
         self._projection_pending = False
+        self._projection_retry_due = False
         return "projection checkpoint published"
 
     async def _move(self, conn, age):

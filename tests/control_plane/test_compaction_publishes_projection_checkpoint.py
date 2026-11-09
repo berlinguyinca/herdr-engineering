@@ -109,3 +109,52 @@ def test_a_held_lock_keeps_the_pass_successful_and_the_publish_pending(durable, 
     assert "projection checkpoint published" in outcome, outcome
     assert job._projection_pending is False
     assert len(checkpoints(conn, run)) == len(before) + 1
+
+
+def test_a_deferred_publish_is_retried_on_a_tick_inside_the_interval(durable):  # noqa: F811
+    """The retry bypasses the 86400s gate, does no compaction work, and clears the flag only on success."""
+    import asyncpg
+    conn, run, recover = durable
+    run(seed(conn))
+    recover(publish=True)
+    before = checkpoints(conn, run)
+    schema = run(conn.fetchval("SELECT current_schema()"))
+
+    async def hold():
+        other = await asyncpg.connect(DSN, server_settings={"search_path": schema})
+        holder = ProjectionStore(other).publisher()
+        await holder.__aenter__()
+        return other, holder
+
+    other, holder = run(hold())
+    job = compactor(conn, run, publish_projection_checkpoint=True, projection_lock_wait_seconds=0.3,
+                    interval_seconds=10**9)
+    try:
+        assert "projection checkpoint deferred" in run(job.tick(conn))
+        assert job._projection_pending is True
+        # still locked, still inside the interval: the retry defers again and the flag stays set
+        outcome = run(job.tick(conn))
+        assert "projection checkpoint deferred" in outcome and "archived" not in outcome, outcome
+        assert job._projection_pending is True
+        assert checkpoints(conn, run) == before
+    finally:
+        run(holder.__aexit__(None, None, None))
+        run(other.close())
+    archived = run(conn.fetchval("SELECT count(*) FROM fabric_events_archive"))
+    outcome = run(job.tick(conn))                        # no _last reset: only the interval-free retry can publish
+    assert outcome == "projection checkpoint published", outcome
+    assert job._projection_pending is False
+    assert len(checkpoints(conn, run)) == len(before) + 1
+    assert run(conn.fetchval("SELECT count(*) FROM fabric_events_archive")) == archived   # no compaction work
+    assert run(job.tick(conn)) == "waiting"              # nothing pending any more: a plain no-op
+
+
+def test_a_tick_with_nothing_pending_inside_the_interval_does_nothing(durable):  # noqa: F811
+    conn, run, recover = durable
+    run(seed(conn))
+    recover(publish=True)
+    job = compactor(conn, run, publish_projection_checkpoint=True, interval_seconds=10**9)
+    run(job.tick(conn))
+    marker = checkpoints(conn, run)
+    assert run(job.tick(conn)) == "waiting"
+    assert checkpoints(conn, run) == marker
