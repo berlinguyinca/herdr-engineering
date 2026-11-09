@@ -57,7 +57,7 @@ def test_real_coordinator_restores_matching_policy_and_profile_before_grant(
     script = f'''
 set -euo pipefail
 WORK="{current.parent}"; PREV_WORK="{previous.parent}"; ENV_DIR="{tmp_path}/env"
-ATTEMPT="{tmp_path}/attempt"; STATE_DIR="{tmp_path}"; STATE_HELPER="{state}"
+ATTEMPT="{tmp_path}/attempt"; STATE_DIR="{tmp_path}"; STATE_HELPER="{state}"; PY=python3; ARTIFACT_HOST=0; PREV_AH=0; AH_MIGRATED=0; AH_MANUAL=0; NEW_AH=""
 REPO="$WORK"; HERE="{ROOT}/deploy/control-plane"; DEPLOY_LOCK_FD=7
 SHA=new; TAG=new; REF=candidate; MEMORY={int(health_result == "outage-unchanged")}; PREV_COMMIT=old; PREV_SHA=old; PREV_TAG=old; PREVIOUS_IMAGE=old
 COLLAB=0; SHARE=0; NEW_SHARE=""; COLLAB_HASH=""; PREV_COLLAB_HASH=""
@@ -96,6 +96,7 @@ compose_up() {{
 memory_phase() {{ echo backend-repair >> "{log}"; }}
 rollback_share() {{ return 0; }}
 rollback_services() {{ return 0; }}
+rollback_artifact_host() {{ return 0; }}
 verify() {{ echo "verify:$1" >> "{log}"; }}
 git() {{ return 0; }}
 {function("forward")}
