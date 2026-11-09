@@ -8,7 +8,7 @@ dashboard preview). For the share flow itself see [share-links.md](share-links.m
 
 A report share normally holds only the generated preview page. In the share panel's **Links** tab the form shows an
 **Include the author's HTML page (Rich view)** checkbox, only when the audience is **public** and the chosen version has
-exactly one HTML asset. It is off by default. The approval summary then lists the author's page and marks it.
+one unambiguous HTML asset (a single `text/html` asset, or, when there are several, exactly one with role `preview`). It is off by default. The approval summary then lists the author's page and marks it.
 
 When it is on:
 
@@ -49,7 +49,8 @@ Use the browser's Print, then "Save as PDF". The print stylesheet:
 
 ## "How to read this report" legend
 
-A collapsed section under the title (screen only, hidden in print). It explains only what the report actually shows:
+A collapsed section under the title (screen only, hidden in print). It is left out when the report has no findings,
+figures, downloads or analysis, and with the permalinks under the 16 KiB cap. It explains only what the report actually shows:
 Finding, the Question/Evidence/Figure tags, Limits, Next checks, a figure's "How to read" note, Evidence and
 downloads (including the first 12 characters of each file's SHA-256), Method and configuration, `#` links, and the
 "Shortened or omitted" notice of a size-limited preview. It states that severity and confidence are not used: findings
