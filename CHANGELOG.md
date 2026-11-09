@@ -15,6 +15,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Report viewer guide
 
 - New `docs/artifacts/report-viewer-guide.md`: the Rich view opt-in, finding anchors, printing and saving as PDF, the "How to read this report" legend, phone-width Evidence and Downloads tables, and keyboard use of the share panel tabs. Linked from `docs/artifacts/share-links.md` and the README. Docs only.
+- Fact-check fix: the guide now states the exact Rich view eligibility rule (one `text/html` asset, or exactly one with role `preview` among several) and when the legend is omitted.
 
 ### `/herdr::join` works with no flags after `herdr-eng summary install`
 - `rooms join-fabric` found the listener only in the fetched host config, which agent hosts do not carry, so a bare call failed. It now also reads `fabric_join` (`control_plane_url`, or `listen_host` + `listen_port`) from the machine config `~/.config/herdr-engineering/config.yaml` and falls back to the readable fleet config's `control_plane.collab.fabric_trust`. YAML only, no new environment variable; `--control-plane` still overrides.
