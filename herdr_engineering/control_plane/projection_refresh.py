@@ -56,12 +56,13 @@ def refresh_checkpoint(dsn, *, host_aliases=None, inspector_limits=None, lock_wa
         source.close()
 
 
-def checkpoint_is_current(dsn, *, host_aliases=None, inspector_limits=None):
+def checkpoint_is_current(dsn, *, host_aliases=None, inspector_limits=None, checkpoint_budgets=None):
     """True only when a published checkpoint for this code and policy already
     sits at the current projection position. Any doubt (no checkpoint, schema
     missing, query failure) returns False so the caller does the full pass; a
     skip is purely an optimisation and a concurrent append just means the next
-    pass runs."""
+    pass runs. checkpoint_budgets is accepted so the refresher can pass one policy
+    to both calls; budgets bound a pass's work and are not part of the fingerprint."""
     async def check():
         import asyncpg
 
