@@ -5,8 +5,15 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Report preview: link-preview metadata, honest share notice, fairer section quotas
+
+- The report preview head now carries `description`, `og:title`, `og:description`, `og:type=article`, `og:site_name` and `twitter:card=summary` (summary cut near 160 characters, falling back to finding/evidence counts; every value attribute-escaped). The CSP and the sanitiser allowlist are unchanged. The tags are dropped only when even the 4 KiB minimum cap cannot hold them.
+- In a share, the truncation notice no longer says "see the full descriptor" (that link was rewritten to plain text because the descriptor is not shared); it now says the full report is available to its owner.
+- Section quotas: unused quota of a section that fits is now handed to sections that overflow, so a 1 MiB preview of 500 evidence rows no longer drops about 16 of them under the fixed 4/2/2/1 weight split. Output still never exceeds the cap.
+
 ### Inspector archive job (disabled by default)
 - New `control_plane.inspector_archive` config (YAML only, validated in `fleet_config.py`) and `InspectorArchiver`: moves inspector tool/message rows older than 14 days from `fabric_events` into `fabric_events_archive`, chunked, one transaction per chunk, idempotent, with a count-only dry run. Never moves rows above the snapshot watermark or projection checkpoint frontier, v2-envelope rows, or state-bearing kinds. Migration 0052 adds a partial archive index. Snapshot boot counts archived rows; the compaction archive purge now skips inspector rows. See `docs/operations/inspector-archive.md`.
+
 ### CI-reported deployments (`control_plane.ci_deployments`)
 
 - New fleet config key `control_plane.ci_deployments: {component: host id}` lets a CI pipeline (for example Woodpecker as host `woodpecker-ci`) report deployments of components that have no `deploy/pipelines` definition, without a fake definition. An event is accepted when the definitions rule allows it or the exact (component, host) pair is listed; another host reporting a listed component gets 403. Bounded (32 entries), validated, hot-reloaded; a component that also has a definition refuses the whole list. With no definitions configured nothing changes; with definitions configured but invalid, every event is still refused (503), listed components included.
