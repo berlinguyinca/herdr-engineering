@@ -57,6 +57,36 @@ services:
     image: postgres:16-alpine
     container_name: herdr-cp-postgres
     restart: unless-stopped
+    # Tuned for the 503 GiB NVMe master host (stock defaults were 128MB
+    # shared_buffers, 4MB work_mem, 1GB max_wal_size, random_page_cost 4).
+    # cp-web holds a ~32 GiB heap and the host runs many other services, so
+    # shared_buffers stays modest and the OS page cache does the rest
+    # (effective_cache_size only informs the planner; it allocates nothing).
+    command:
+      - postgres
+      - -c
+      - shared_buffers=8GB
+      - -c
+      - effective_cache_size=96GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=1GB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - min_wal_size=1GB
+      - -c
+      - wal_compression=on
+    # Docker's 64MB /dev/shm default breaks parallel query DSM segments at
+    # these sizes.
+    shm_size: 1gb
     # SECURITY: credentials are substituted from the env file deploy.sh renders
     # from the central file. Compose refuses to start until they are present.
     environment:
