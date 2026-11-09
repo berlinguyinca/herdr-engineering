@@ -21,7 +21,8 @@ def refresh_checkpoint(dsn, *, host_aliases=None, inspector_limits=None, lock_wa
     """Build the same projection policy as the web host; always release the source."""
     repo = ControlPlaneRepo(host_aliases=host_aliases, inspector_limits=inspector_limits)
     options = {'checkpoint_lock_wait': lock_wait} if lock_wait else {}
-    options['checkpoint_budgets'] = checkpoint_budgets
+    if checkpoint_budgets is not None:
+        options['checkpoint_budgets'] = checkpoint_budgets
     source = bridge.PostgresSource(dsn=dsn, checkpoint_publish=True, **options)
     try:
         counts = bridge.load_into(repo, source)
