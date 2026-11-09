@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Report preview: link-preview metadata, honest share notice, fairer section quotas
+
+- The report preview head now carries `description`, `og:title`, `og:description`, `og:type=article`, `og:site_name` and `twitter:card=summary` (summary cut near 160 characters, falling back to finding/evidence counts; every value attribute-escaped). The CSP and the sanitiser allowlist are unchanged. The tags are dropped only when even the 4 KiB minimum cap cannot hold them.
+- In a share, the truncation notice no longer says "see the full descriptor" (that link was rewritten to plain text because the descriptor is not shared); it now says the full report is available to its owner.
+- Section quotas: unused quota of a section that fits is now handed to sections that overflow, so a 1 MiB preview of 500 evidence rows no longer drops about 16 of them under the fixed 4/2/2/1 weight split. Output still never exceeds the cap.
+
 ### `/herdr::join` works with no flags after `herdr-eng summary install`
 - `rooms join-fabric` found the listener only in the fetched host config, which agent hosts do not carry, so a bare call failed. It now also reads `fabric_join` (`control_plane_url`, or `listen_host` + `listen_port`) from the machine config `~/.config/herdr-engineering/config.yaml` and falls back to the readable fleet config's `control_plane.collab.fabric_trust`. YAML only, no new environment variable; `--control-plane` still overrides.
 - `herdr-eng summary install` (and `scripts/install.sh`) records the fleet config's listener under `fabric_join` idempotently and never overwrites a differing value (reported as `preserved`). New read-only `herdr-eng summary install --check` verifies per harness the skill symlink, the OpenCode command, listener resolution and reachability, and the hook state, exiting 1 on a failure; no secrets are printed.
