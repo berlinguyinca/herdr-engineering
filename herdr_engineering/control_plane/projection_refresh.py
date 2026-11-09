@@ -16,10 +16,12 @@ class CheckpointNotPublished(RuntimeError):
     """Recovery completed without publishing a durable projection checkpoint."""
 
 
-def refresh_checkpoint(dsn, *, host_aliases=None, inspector_limits=None, lock_wait=0.0):
+def refresh_checkpoint(dsn, *, host_aliases=None, inspector_limits=None, lock_wait=0.0,
+                       checkpoint_budgets=None):
     """Build the same projection policy as the web host; always release the source."""
     repo = ControlPlaneRepo(host_aliases=host_aliases, inspector_limits=inspector_limits)
     options = {'checkpoint_lock_wait': lock_wait} if lock_wait else {}
+    options['checkpoint_budgets'] = checkpoint_budgets
     source = bridge.PostgresSource(dsn=dsn, checkpoint_publish=True, **options)
     try:
         counts = bridge.load_into(repo, source)
@@ -51,11 +53,12 @@ class ProjectionRefresh:
     """
 
     def __init__(self, dsn, *, host_aliases=None, inspector_limits=None,
-                 interval=REFRESH_INTERVAL):
+                 interval=REFRESH_INTERVAL, checkpoint_budgets=None):
         if not math.isfinite(interval) or interval <= 0:
             raise ValueError('checkpoint interval must be positive and finite')
         self._dsn = dsn
-        self._policy = dict(host_aliases=host_aliases, inspector_limits=inspector_limits)
+        self._policy = dict(host_aliases=host_aliases, inspector_limits=inspector_limits,
+                            checkpoint_budgets=checkpoint_budgets)
         self._interval = interval
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name='projection-refresh', daemon=True)

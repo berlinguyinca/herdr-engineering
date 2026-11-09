@@ -4095,6 +4095,7 @@ def _cmd_cp_checkpoint(args) -> int:
         stage = 'materialization'
         result = refresh_checkpoint(dsn, host_aliases=_host_aliases_from(cp),
                                     inspector_limits=cp.get("inspector_limits") or {},
+                                    checkpoint_budgets=_checkpoint_budgets_from(cp),
                                     lock_wait=max(0.0, getattr(args, "lock_wait", 0.0) or 0.0))
     except (Exception, SystemExit) as exc:
         error = {"ok": False, "error": type(exc).__name__, "stage": stage}
@@ -4423,7 +4424,8 @@ def _cmd_cp_web(args) -> int:
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
     _require_durable_review_gate(cp, dsn)
-    source = _maybe_pg_source(dsn, inspector_snapshots=_inspector_snapshot_settings(cp)[0])
+    source = _maybe_pg_source(dsn, inspector_snapshots=_inspector_snapshot_settings(cp)[0],
+                              checkpoint_budgets=_checkpoint_budgets_from(cp))
     # When durable storage is wired, attach a write-through sink so every
     # ingested event persists to Postgres instead of dying with the in-memory
     # repo on restart (Phase 1a). Best-effort; never blocks or breaks serving.
@@ -5422,9 +5424,11 @@ def _worker_fabric_compactor(fleet_config_path):
     if settings.publish_projection_checkpoint and cp.get("pg_dsn"):
         from .control_plane.projection_refresh import refresh_checkpoint
         dsn, aliases, limits = cp["pg_dsn"], _host_aliases_from(cp), cp.get("inspector_limits") or {}
+        budgets = _checkpoint_budgets_from(cp)
 
         def publisher(lock_wait):
-            return refresh_checkpoint(dsn, host_aliases=aliases, inspector_limits=limits, lock_wait=lock_wait)
+            return refresh_checkpoint(dsn, host_aliases=aliases, inspector_limits=limits, lock_wait=lock_wait,
+                                      checkpoint_budgets=budgets)
     return FabricCompactor(settings, projection_publisher=publisher)
 
 
@@ -5463,7 +5467,16 @@ def _worker_artifact_reconciler(fleet_config_path, rustfs):
     return ArtifactReconciler(lambda conn: ArtifactStore(conn, rustfs), **settings)
 
 
-def _maybe_pg_source(dsn, *, inspector_snapshots=False):
+def _checkpoint_budgets_from(cp):
+    """Validated control_plane.projection_checkpoint row budgets (defaults when absent)."""
+    from .control_plane.projection_recovery import checkpoint_budgets
+    try:
+        return checkpoint_budgets(cp.get("projection_checkpoint"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+
+
+def _maybe_pg_source(dsn, *, inspector_snapshots=False, checkpoint_budgets=None):
     """Build a PostgresSource from a DSN, or None if not provided."""
     if not dsn:
         return None
@@ -5471,7 +5484,8 @@ def _maybe_pg_source(dsn, *, inspector_snapshots=False):
 
     # Lazy: PostgresSource connects on its own persistent event loop when the
     # server first hydrates from Postgres, so connect+fetch share one loop.
-    return PostgresSource(dsn=dsn, inspector_snapshots=inspector_snapshots)
+    return PostgresSource(dsn=dsn, inspector_snapshots=inspector_snapshots,
+                          checkpoint_budgets=checkpoint_budgets)
 
 
 def _worker_snapshot_writer(fleet_config_path):
@@ -5740,7 +5754,8 @@ def _cmd_cp_worker(args) -> int:
                 if fleet_cp.get("pg_dsn"):
                     refresh = ProjectionRefresh(
                         fleet_cp["pg_dsn"], host_aliases=_host_aliases_from(fleet_cp),
-                        inspector_limits=fleet_cp.get("inspector_limits") or {})
+                        inspector_limits=fleet_cp.get("inspector_limits") or {},
+                        checkpoint_budgets=_checkpoint_budgets_from(fleet_cp))
                     refresh.start()
                 await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
                                  artifact_job_runner=runner, inspector_snapshotter=snapshotter,
