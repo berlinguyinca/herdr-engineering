@@ -1,12 +1,11 @@
 // Real-browser check that a report prints / saves as PDF cleanly: print media is light in every theme, chrome and
 // controls are gone, findings and figures are never split across pages, nothing is clipped, outbound URLs are spelled out.
-import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { chromium } from 'playwright';
+import { engineTest, launch } from './helpers/engines.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
 const PYTHON = process.env.PYTHON || (fs.existsSync(path.join(ROOT, '.venv/bin/python')) ? path.join(ROOT, '.venv/bin/python') : 'python3');
@@ -35,7 +34,6 @@ sys.stdout.write(r(report, figure_images={"fig": ("image/svg+xml", svg)}))
 `;
 const html = execFileSync(PYTHON, ['-c', PROGRAM, String(FINDINGS)], { cwd: ROOT, env: { ...process.env, PYTHONPATH: ROOT } }).toString();
 
-const launch = () => chromium.launch({ headless: true, args: ['--no-sandbox'], ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}) });
 const pdfPages = (file) => {
   const info = execFileSync('pdfinfo', [file]).toString();
   const total = Number(/Pages:\s+(\d+)/.exec(info)[1]);
@@ -44,8 +42,8 @@ const pdfPages = (file) => {
 const shot = async (page, name, options = {}) => { if (SHOTS) await page.screenshot({ path: path.join(SHOTS, name), ...options }); };
 
 for (const [scheme, forced] of [['light', null], ['dark', null], ['dark', 'dark'], ['light', 'dark']]) {
-  test(`prints light, chrome-free and unsplit (os=${scheme}, forced=${forced})`, async () => {
-    const browser = await launch();
+  engineTest(`prints light, chrome-free and unsplit (os=${scheme}, forced=${forced})`, async (engine) => {
+    const browser = await launch(engine);
     try {
       const page = await browser.newPage({ colorScheme: scheme, viewport: { width: 1000, height: 900 } });
       await page.setContent(html);
@@ -80,6 +78,7 @@ for (const [scheme, forced] of [['light', null], ['dark', null], ['dark', 'dark'
       assert.ok(state.overflowX <= 0, `no horizontal overflow: ${state.overflowX}`);
       assert.equal(state.wrapOverflow, 'visible'); assert.notEqual(state.figMax, 'none');
 
+      if (engine !== 'chromium') return; // page.pdf() is Chromium-only; the print-media assertions above ran on this engine
       const file = path.join(os.tmpdir(), `report-print-${scheme}-${forced}-${process.pid}.pdf`);
       await page.pdf({ path: file, format: 'A4', printBackground: false, margin: { top: '14mm', bottom: '14mm', left: '12mm', right: '12mm' } });
       try {
@@ -106,9 +105,9 @@ for (const [scheme, forced] of [['light', null], ['dark', null], ['dark', 'dark'
   });
 }
 
-test('a report inside the dashboard preview wrapper prints in full, not clipped to the 640px scroll box', async () => {
+engineTest('a report inside the dashboard preview wrapper prints in full, not clipped to the 640px scroll box', async (engine) => {
   const { PRINT_CSS } = await import('../../packages/artifact-static-preview.js');
-  const browser = await launch();
+  const browser = await launch(engine);
   try {
     const page = await browser.newPage({ colorScheme: 'dark', viewport: { width: 1000, height: 900 } });
     await page.setContent('<div data-static-preview style="contain:paint;overflow:auto;max-height:640px"><div id="h" data-theme="dark"></div></div>');
@@ -123,6 +122,7 @@ test('a report inside the dashboard preview wrapper prints in full, not clipped 
       return { clipped: wrapper.getBoundingClientRect().height < rp.getBoundingClientRect().height - 1, bg: getComputedStyle(rp).backgroundColor, color: getComputedStyle(rp).color };
     });
     assert.equal(probe.clipped, false); assert.equal(probe.bg, 'rgb(255, 255, 255)'); assert.equal(probe.color, 'rgb(0, 0, 0)');
+    if (engine !== 'chromium') return; // page.pdf() is Chromium-only
     const file = path.join(os.tmpdir(), `report-print-shadow-${process.pid}.pdf`);
     await page.pdf({ path: file, format: 'A4' });
     try { assert.ok(pdfPages(file).join('\n').includes(`END-MARK-${FINDINGS - 1}`), 'the last finding is in the PDF'); } finally { fs.rmSync(file, { force: true }); }
