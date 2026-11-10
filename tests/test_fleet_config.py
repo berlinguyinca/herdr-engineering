@@ -309,6 +309,8 @@ def test_a_valid_ci_deployments_map_loads(tmp_path):
 
 def test_the_yaml_on_key_typo_is_rejected_at_load(tmp_path):
     # YAML 1.1 reads an unquoted `on` as boolean True: the map key is not a component name.
-    text = yaml.safe_dump(base()).replace("pg_dsn:", "ci_deployments:\n      on: woodpecker-ci\n    pg_dsn:", 1)
+    data = _with(lambda d: d["sections"]["control_plane"]["values"].update(ci_deployments="ON-MARKER"))
+    text = yaml.safe_dump(data).replace("ci_deployments: ON-MARKER", "ci_deployments:\n        on: woodpecker-ci")
+    assert "on: woodpecker-ci" in text
     with pytest.raises(FleetConfigError, match="ci_deployments"):
         load_fleet_config(write(tmp_path, None, text=text))
