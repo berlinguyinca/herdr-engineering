@@ -16,6 +16,8 @@ _COMPONENT = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _HOST = re.compile(r"\S{1,253}")
 #: The first https URL in an event's evidence: the run page a pipeline reports.
 _URL = re.compile(r"https://[^\s<>\"'`]{1,512}")
+#: Prose punctuation that ends a sentence or closes a bracket, not part of the URL.
+_URL_TRAILING = ".,;:)]"
 
 
 def _entry_error(component: object, host: object) -> str | None:
@@ -44,4 +46,4 @@ def parse_ci_deployments(value: object) -> tuple[dict[str, str], list[str]]:
 def evidence_url(evidence: object) -> str | None:
     """The first https URL in ``evidence`` (already redacted text), or None."""
     match = _URL.search(evidence) if isinstance(evidence, str) else None
-    return match.group(0) if match else None
+    return match.group(0).rstrip(_URL_TRAILING) if match else None

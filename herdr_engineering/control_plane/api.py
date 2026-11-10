@@ -379,7 +379,8 @@ class ControlPlaneServer:
         from .deployment_definitions import DeploymentDefinitions
         self.deployment_definitions = DeploymentDefinitions(
             lambda: self._control_plane_value(fleet_config, "deployment_definitions"),
-            ci_components=lambda: self._control_plane_value(fleet_config, "ci_deployments"),
+            # fail CLOSED: an unreadable fleet file means an empty allowlist, not the last good one
+            ci_components=lambda: self._deployment_secure_value("ci_deployments"),
             ci_snapshot=lambda: self.ci_monitor.snapshot(start=True))
         # The stage coordinator (Task 3), ticked by _deployments_loop; GET /api/v1/deployments
         # serves the last tick and never ticks itself. `deployment_evidence` is the release-evidence
