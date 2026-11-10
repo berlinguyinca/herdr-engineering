@@ -343,6 +343,23 @@ def helper_run(d: Path) -> int:
         write_private(d / "result.json", json.dumps(res))
 
 
+def read_key_file(path: Path) -> str:
+    """The X-API-Key in ``path``; refuses a symlink, a non-regular file or a mode wider than 0600. The error
+    names the path, never the key."""
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise ValueError(f"api key file {path}: {exc.strerror or 'unreadable'}") from None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"api key file {path}: not a regular file")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        raise ValueError(f"api key file {path}: unsafe mode {stat.S_IMODE(st.st_mode):04o} (want 0600)")
+    key = path.read_text(encoding="utf-8").strip()
+    if not key:
+        raise ValueError(f"api key file {path}: empty")
+    return key
+
+
 class Failure(Exception):
     pass
 
@@ -396,7 +413,9 @@ def trim(text: str, n: int = 200) -> str:
 
 class Runner:
     def __init__(self, url: str, state_dir: Path, herdr: str, ssh: str, worker: Path, host_id: str, say=print,
-                 allow_tools: bool = False, sandbox: Path | None = None, gateway: str | None = None):
+                 allow_tools: bool = False, sandbox: Path | None = None, gateway: str | None = None,
+                 api_key: str | None = None):
+        self.api_key = api_key or None        # optional X-API-Key; none = no header (an open control plane)
         self.url, self.state, self.herdr, self.ssh, self.say = url.rstrip("/"), state_dir, herdr, ssh, say
         self.worker_text = worker.read_text(encoding="utf-8")
         self.host_id = host_id
@@ -414,11 +433,18 @@ class Runner:
         self.gateway = gateway or None              # the LLM gateway whose model list feeds the helper model picker
         self.families: dict[str, list[str]] = {}          # host label -> harness families it can start
 
+    def headers(self, extra: dict | None = None) -> dict:
+        """Request headers; X-API-Key only when a key file was given."""
+        out = dict(extra or {})
+        if self.api_key:
+            out["X-API-Key"] = self.api_key
+        return out
+
     # ------------------------------------------------------------ the collab service (operator listener)
     def api(self, method: str, path: str, body: dict | None = None):
         data = json.dumps(body, ensure_ascii=False).encode("utf-8", "replace") if body is not None else None
         req = urllib.request.Request(f"{self.url}/api/v1/collab/{path}", data=data, method=method,
-                                     headers={"Content-Type": "application/json"} if method == "POST" else {})
+                                     headers=self.headers({"Content-Type": "application/json"} if method == "POST" else {}))
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:             # noqa: S310 (operator-configured URL)
                 return resp.status, json.loads(resp.read(4_000_000) or b"{}")
@@ -613,7 +639,7 @@ class Runner:
                            "mission_id": pane.split(":", 1)[0], "summary": f"collab agent {name}", "status": "active"}}
         try:
             req = urllib.request.Request(f"{self.url}/api/v1/ingest", data=json.dumps(env).encode(), method="POST",
-                                         headers={"Content-Type": "application/json"})
+                                         headers=self.headers({"Content-Type": "application/json"}))
             urllib.request.urlopen(req, timeout=10).close()          # noqa: S310 (operator-configured URL)
         except (OSError, ValueError):
             pass
@@ -736,7 +762,7 @@ class Runner:
         req = urllib.request.Request(
             f"{self.url}/api/v1/scheduler/reservations",
             data=json.dumps(body).encode(), method="POST",
-            headers={"Content-Type": "application/json"},
+            headers=self.headers({"Content-Type": "application/json"}),
         )
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 (operator-configured URL)
@@ -749,7 +775,9 @@ class Runner:
         if host_uid not in eligible:
             # During identity migration, resolve the stable UID to its display alias.
             try:
-                with urllib.request.urlopen(f"{self.url}/api/v1/scheduler", timeout=15) as resp:  # noqa: S310
+                with urllib.request.urlopen(
+                        urllib.request.Request(f"{self.url}/api/v1/scheduler", headers=self.headers()),
+                        timeout=15) as resp:  # noqa: S310
                     cards = json.loads(resp.read(1_000_000) or b"{}").get("hosts", [])
                 card = next((row for row in cards if row.get("host_uid") == host_uid), None)
                 host = next((alias for alias in (card or {}).get("aliases", []) if alias in eligible), None)
@@ -762,7 +790,7 @@ class Runner:
         commit = urllib.request.Request(
             f"{self.url}/api/v1/scheduler/reservations/commit",
             data=json.dumps({"reservation_id": reservation["reservation_id"]}).encode(), method="POST",
-            headers={"Content-Type": "application/json"},
+            headers=self.headers({"Content-Type": "application/json"}),
         )
         try:
             with urllib.request.urlopen(commit, timeout=30):  # noqa: S310
@@ -775,7 +803,7 @@ class Runner:
         req = urllib.request.Request(
             f"{self.url}/api/v1/scheduler/reservations/release",
             data=json.dumps({"reservation_id": reservation_id}).encode(), method="POST",
-            headers={"Content-Type": "application/json"},
+            headers=self.headers({"Content-Type": "application/json"}),
         )
         try:
             with urllib.request.urlopen(req, timeout=15):  # noqa: S310
@@ -1716,14 +1744,25 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--no-sandbox", action="store_true", help="run tasks directly on the host (not recommended)")
     ap.add_argument("--gateway", default=gw, help="LLM gateway whose /v1/models feeds the helper model picker "
                                                     "(default: llm_gateway from host.json; none: no catalogue)")
+    ap.add_argument("--api-key-file", default=None,
+                    help="file (mode 0600) holding the X-API-Key sent to the control plane; needed once "
+                         "control_plane.api_keys is enabled (ingest role for session reports, operator role for "
+                         "the scheduler). Default: no header")
     ap.add_argument("--allow-tools", action="store_true",
                     help="let agents use their harness's tools (shell, files, MCP) on task text from room members")
     args = ap.parse_args(argv)
     if not args.url or not HOST.fullmatch(args.host_id):
         ap.error("no dashboard URL (pass --url) or an invalid --host-id")
+    api_key = None
+    if args.api_key_file:
+        try:
+            api_key = read_key_file(Path(args.api_key_file))
+        except ValueError as exc:
+            ap.error(str(exc))
     r = Runner(args.url, Path(args.state_dir), args.herdr, args.ssh, Path(args.worker), args.host_id,
                say=lambda m: print(f"collab-spawn: {m}", file=sys.stderr), allow_tools=args.allow_tools,
-               sandbox=None if args.no_sandbox else Path(args.sandbox), gateway=args.gateway)
+               sandbox=None if args.no_sandbox else Path(args.sandbox), gateway=args.gateway,
+               api_key=api_key)
     try:
         r.once()
     except Failure as exc:
