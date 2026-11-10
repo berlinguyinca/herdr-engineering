@@ -9,6 +9,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - With `control_plane.api_keys` on, the browser dashboard got 401 on everything (no browser code sends a key; `EventSource` cannot). New same-origin reverse proxy `herdr_engineering/control_plane/dashboard_proxy.py`: GET/HEAD/static/SSE use a `viewer` key (SSE streamed unbuffered), writes use the `operator` key only when `METHOD /path` is in `control_plane.dashboard_proxy.operator_post_allowlist` (default = the dashboard's write actions; others 403 at the proxy; encoded slashes and dot segments refused). A client-supplied `X-API-Key` and `X-Forwarded-*` are never forwarded; hop-by-hop headers are stripped.
 - YAML only: `control_plane.dashboard_proxy {viewer_key_file, operator_key_file, upstream, operator_post_allowlist}`, validated by `fleet config`. Key files must be mode 0600; the proxy exits 2 on a group/other-accessible, missing or empty file. Optional compose profile `dashboard-proxy` (port `HERDR_DASHBOARD_PROXY_PORT`, default 8081). With no block configured nothing changes. `API_KEYS_WARNING`, the README and `fleet-config.example.yaml` now say the dashboard works behind the proxy. Tests: `tests/control_plane/test_dashboard_proxy.py` (real keyed `ControlPlaneServer`).
 
+### Optional `X-API-Key` for control-plane callers that sent none
+`collab-spawn.py --api-key-file` (ingest report: ingest role; scheduler: operator role), `herdr-eng fleet drift`
+(viewer; `--api-key-file` or this host's agent/ingest key), `herdr-eng artifacts upload --api-key-file` (a bare
+`POST /artifacts` needs the operator role) and the `herdr-artifact` wrapper (`history` viewer, `share-request`
+operator) now send a key once `control_plane.api_keys` is enabled. No key = no header = unchanged open behaviour.
+Key files must be mode 0600 and are refused otherwise; the key is never printed. The duplicate
+`_cmd_art_upload` in the CLI was removed (the two copies were identical).
+
 ### Build-cache report sender (`herdr-eng build-cache-report`, disabled by default)
 - New `herdr-eng build-cache-report [--once|--loop] [--json]` schedules the existing `report_builds` sender. Config is YAML only, `fabric_build_cache.report {enabled: false, url, key_file, interval_s: 60 (10..3600), host_id}`; the ingest-role key is read from `key_file` only (never argv, env or logs). It refuses to run (exit 2) when disabled, when the url is not https (http only for 127.0.0.1/localhost), or when the key file is missing, empty or group/world readable. `--loop` logs one line per attempt and survives an unreachable or refusing control plane.
 - Opt-in service files, enabled by nothing: `scripts/herdr-eng-build-cache-report.service` (systemd user) and `scripts/com.herdr-engineering.build-cache-report.plist` (launchd template). Runbook: `docs/build-cache-deployment.md`. Tests: `tests/test_build_cache_report_cli.py`.

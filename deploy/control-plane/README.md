@@ -170,6 +170,13 @@ the emit hook do not send keys yet, so turning keys on breaks them until they do
 browser dashboard works through the **dashboard proxy** (next section). viewer = read-only, operator = read + mutate, ingest =
 POST /api/v1/ingest, agent = ingest + LLM-key mint/revoke + review posting.
 
+Callers that can send a key (all optional; no key = no header): `collab-spawn.py --api-key-file FILE` (the
+session report needs an ingest-role key, the scheduler calls an operator-role key, so use an operator key on
+the runner host), `herdr-eng fleet drift` (viewer; `--api-key-file` or the host's own agent/ingest key),
+`herdr-eng artifacts upload --api-key-file FILE` (operator: a bare `POST /artifacts` is not an agent route) and
+`herdr-artifact history|share-request --api-key-file FILE` (viewer / operator; the host's cached key is used
+for the host's own control plane). Key files must be mode 0600 or they are refused.
+
 ### Dashboard proxy (keyed mode, optional)
 
 Browsers cannot put `X-API-Key` on an `EventSource`, and the dashboard sends no key,

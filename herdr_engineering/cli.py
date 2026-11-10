@@ -377,6 +377,8 @@ def _build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--control-plane", default=None,
                     help="control plane URL (default: host.json control_plane_url)")
     pd.add_argument("--host", help="only this host")
+    pd.add_argument("--api-key-file", default=None,
+                    help="file (mode 0600) holding a viewer-role X-API-Key (default: this host's agent/ingest key)")
     pd.add_argument("--json", action="store_true")
     pd.set_defaults(func=_cmd_fleet_drift)
 
@@ -423,6 +425,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--mime", default="application/octet-stream")
     p2.add_argument("--session", default=None)
     p2.add_argument("--mission", default=None)
+    p2.add_argument("--api-key-file", default=None,
+                    help="file (mode 0600) holding the X-API-Key; a bare POST /artifacts needs the operator role")
     p2.set_defaults(func=_cmd_art_upload)
     asub.add_parser("list", help="list stored artifacts").set_defaults(func=_cmd_art_list)
     p2 = asub.add_parser("retention", help="enforce retention policy")
@@ -1814,13 +1818,25 @@ def _cmd_fleet_drift(args) -> int:
     import urllib.request
 
     from .fleet import plan_version_sync
-    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+    from .host_config import (
+        HostConfigUnavailable,
+        exit_unavailable,
+        resolve_api_key,
+        resolve_control_plane,
+    )
     try:
         base = resolve_control_plane(args.control_plane)
     except HostConfigUnavailable as exc:
         return exit_unavailable(exc)
     try:
-        with urllib.request.urlopen(f"{base}/api/v1/fleet/inventory", timeout=10) as response:
+        key = resolve_api_key(base, args.api_key_file, explicit_url=bool(args.control_plane))
+    except ValueError as exc:
+        print(f"could not read fleet inventory: {exc}", file=sys.stderr)
+        return 2
+    inventory = urllib.request.Request(f"{base}/api/v1/fleet/inventory",
+                                       headers={"X-API-Key": key} if key else {})
+    try:
+        with urllib.request.urlopen(inventory, timeout=10) as response:
             matrix = json.loads(response.read(4 * 1024 * 1024))
     except (OSError, ValueError) as exc:
         print(f"could not read fleet inventory from {base}: {exc}", file=sys.stderr)
@@ -1901,35 +1917,6 @@ def _cmd_art_publish(args) -> int:
     return 0 if res.ok else 1
 
 
-def _cmd_art_upload(args) -> int:
-    import urllib.request
-    from pathlib import Path
-    from urllib.parse import urlencode
-
-    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
-    try:
-        base = resolve_control_plane(args.control_plane)
-    except HostConfigUnavailable as exc:
-        return exit_unavailable(exc)
-    path = Path(args.data)
-    query = {"filename": args.filename or path.name, "mime": args.mime}
-    if args.session:
-        query["session_id"] = args.session
-    if args.mission:
-        query["mission_id"] = args.mission
-    req = urllib.request.Request(f"{base}/api/v1/artifacts?{urlencode(query)}",
-                                 data=path.read_bytes(), method="POST",
-                                 headers={"Content-Type": args.mime})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            payload = json.loads(response.read(8 * 1024 * 1024))
-    except (OSError, ValueError) as exc:
-        print(f"artifact upload failed: {exc}", file=sys.stderr)
-        return 1
-    _print_json(payload)
-    return 0
-
-
 def _cmd_graph_artifact_render(args) -> int:
     """Render a graph snapshot JSON file (GraphProjection.snapshot() shape) to
     a deterministic sanitized HTML artifact (system-graph P5).
@@ -1954,12 +1941,22 @@ def _cmd_art_upload(args) -> int:
     from pathlib import Path
     from urllib.parse import urlencode
 
-    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+    from .host_config import (
+        HostConfigUnavailable,
+        exit_unavailable,
+        resolve_api_key,
+        resolve_control_plane,
+    )
 
     try:
         base = resolve_control_plane(args.control_plane)
     except HostConfigUnavailable as exc:
         return exit_unavailable(exc)
+    try:
+        key = resolve_api_key(base, args.api_key_file, explicit_url=bool(args.control_plane))
+    except ValueError as exc:
+        print(f"artifact upload failed: {exc}", file=sys.stderr)
+        return 2
     path = Path(args.data)
     query = {"filename": args.filename or path.name, "mime": args.mime}
     if args.session:
@@ -1968,7 +1965,7 @@ def _cmd_art_upload(args) -> int:
         query["mission_id"] = args.mission
     req = urllib.request.Request(
         f"{base}/api/v1/artifacts?{urlencode(query)}", data=path.read_bytes(),
-        method="POST", headers={"Content-Type": args.mime})
+        method="POST", headers={"Content-Type": args.mime, **({"X-API-Key": key} if key else {})})
     try:
         with urllib.request.urlopen(req, timeout=60) as response:
             payload = json.loads(response.read(8 * 1024 * 1024))
