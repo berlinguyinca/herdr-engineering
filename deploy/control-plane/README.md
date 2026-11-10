@@ -171,6 +171,11 @@ breaks them until they do. The llm-proxy, `llm-gateway-sync` and `llm-gateway-us
 one: see "Client key for the llm services" below. viewer = read-only, operator = read + mutate, ingest =
 POST /api/v1/ingest, agent = ingest + LLM-key mint/revoke + review posting + `POST /api/v1/token-usage`.
 
+dashboard and the llm-proxy do not send keys yet, so turning keys on breaks them until
+they do. The emit hook and the fabric agent (service leases and host telemetry) send
+`ingest.api_key` as `X-API-Key` when one is configured (role `ingest` suffices). viewer = read-only, operator = read + mutate, ingest =
+POST /api/v1/ingest, agent = ingest + LLM-key mint/revoke + review posting.
+
 Callers that can send a key (all optional; no key = no header): `collab-spawn.py --api-key-file FILE` (the
 session report needs an ingest-role key, the scheduler calls an operator-role key, so use an operator key on
 the runner host), `herdr-eng fleet drift` (viewer; `--api-key-file` or the host's own agent/ingest key),

@@ -3138,6 +3138,7 @@ def _cmd_dev_agent(args) -> int:
             web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
             ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
             control_plane_url=control_plane_for(live),
+            api_key=live.api_key or "",
             fabric_domains=tuple(dict.fromkeys([d for d in (fabric_cfg.get("acme_domain"), fabric_cfg.get("url_base"),
                                                             *(fabric_cfg.get("url_aliases") or [])) if d])),
             host_report_interval=float(fabric_cfg.get("host_report_interval", 30.0)),
@@ -3150,18 +3151,20 @@ def _cmd_dev_agent(args) -> int:
         _print_json({"ok": True, **summary})
         return 0
     refresher = ConfigRefresher(live)
-    seen = {"fabric": (live.get("fabric.url"), live.get("fabric.token")), "cp": control_plane_for(live)}
+    seen = {"fabric": (live.get("fabric.url"), live.get("fabric.token")), "cp": control_plane_for(live),
+            "key": live.api_key or ""}
 
     def follow_config() -> None:
         """Rebuild the gateway client / control-plane URL when a fresh fetch changed them."""
         fresh = refresher.current()  # raises HostConfigUnavailable(revoked=True)
         fab = (fresh.get("fabric.url"), fresh.get("fabric.token"))
         cp = control_plane_for(fresh)
-        if fab == seen["fabric"] and cp == seen["cp"]:
+        key = fresh.api_key or ""
+        if fab == seen["fabric"] and cp == seen["cp"] and key == seen["key"]:
             return
         new_base = gateway_url_from_config(cfg, fabric_url=fab[0] or "") or base
-        agent.retarget(FabricClient(new_base, fab[1] or None), cp)
-        seen["fabric"], seen["cp"] = fab, cp
+        agent.retarget(FabricClient(new_base, fab[1] or None), cp, key)
+        seen["fabric"], seen["cp"], seen["key"] = fab, cp, key
 
     try:
         agent.run(after_cycle=follow_config)

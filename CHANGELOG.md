@@ -9,6 +9,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `ControlPlaneClient` (llm-proxy, `llm-gateway-sync`, `llm-gateway-usage`) sends `X-API-Key` read from an optional key file on every call; no file = no header = unchanged. The file must be mode 0600 (group/other-readable, missing or empty is refused without printing it). Setting: `--control-plane-key-file` on the three commands, plus `control_plane.llm_proxy.control_plane_key_file` for the llm-proxy slice; compose mounts `HERDR_CP_CLIENT_KEY_FILE` read-only when set.
 - The `agent` role may now `POST /api/v1/token-usage` (viewer still may not; an open control plane is unchanged), so usage reporters need no operator key. Tests: `tests/test_control_plane_client_key.py`, `tests/control_plane/test_agent_token_usage.py`. See `deploy/control-plane/README.md`.
 
+### Ingest callers send the host config's `ingest.api_key`
+- The feed-plugin `emit.js` and the fabric agent (service lease and host telemetry POSTs) now send `X-API-Key` when `ingest.api_key` is configured, and nothing when it is not, so they keep working once `control_plane.api_keys` is enabled. The agent follows key changes through `retarget`. Tests: `deploy/herdr-cp-feed-plugin/emit-send.test.js`, `tests/test_fabric_agent_ingest_key.py`.
+
 ### Optional `X-API-Key` for control-plane callers that sent none
 `collab-spawn.py --api-key-file` (ingest report: ingest role; scheduler: operator role), `herdr-eng fleet drift`
 (viewer; `--api-key-file` or this host's agent/ingest key), `herdr-eng artifacts upload --api-key-file` (a bare
