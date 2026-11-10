@@ -142,7 +142,8 @@ export function apiAnswer(pathname, method = 'GET') {
  * what only this app needs: the stubbed API, a silent event stream, and no calm/theme state from storage.
  * Returns { ctx, page } like openReal.
  */
-export async function openDashboard(browser, hash, ctxOpts = {}, log = API_LOG) {
+/** `log` given (the capture matrix): strict, an unanswered route is a logged 404 MISS. Omitted (the pinned baselines and the a11y gate): the original behaviour, unknown routes answer {}. */
+export async function openDashboard(browser, hash, ctxOpts = {}, log) {
   const origin = await dashboardOrigin();
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, ...ctxOpts });
   const page = await ctx.newPage();
@@ -151,6 +152,7 @@ export async function openDashboard(browser, hash, ctxOpts = {}, log = API_LOG) 
   await page.route('**/api/v1/**', (route) => {
     const u = new URL(route.request().url());
     const answer = fixtureAnswer(u.pathname, route.request().method(), u.searchParams);
+    if (!log) return route.fulfill({ json: apiAnswer(u.pathname, route.request().method()) ?? {} });
     log.add(`${route.request().method()} ${u.pathname} -> ${answer === undefined ? 'MISS' : 'fixture'}`);
     return answer === undefined ? route.fulfill({ status: 404, json: { error: 'no fixture for ' + u.pathname } }) : route.fulfill({ json: answer });
   });
