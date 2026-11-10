@@ -296,7 +296,7 @@
         "status": "fixture",
         "reason": ""
       },
-      "proof": "#view table tbody tr",
+      "proof": "#view [data-rv-item]",
       "surfaces": [
         {
           "slug": "dashboard-reviews",

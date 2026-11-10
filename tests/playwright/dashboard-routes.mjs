@@ -57,7 +57,7 @@ export const ROUTE_NOTES = {
   '/analytics/usage': { title: 'Analytics: usage', fixture: { status: 'fixture', reason: '' }, proof: 'table.hd-table', surfaces: [{ slug: 'dashboard-analytics-usage', hash: '/analytics/usage' }] },
   '/ci': { title: 'CI', proof: '[data-ci-workspace]', fixture: { status: 'fixture', reason: '' }, query: { tab: 'current|unconfirmed|failed|finished', search: 'text', workspace: 'filter', repository: 'filter', provider: 'filter', mission: 'filter', session: 'filter' }, surfaces: [{ slug: 'dashboard-ci', hash: '/ci' }] },
   '/deployments': { title: 'Deployments', proof: '#deployments tbody tr', fixture: { status: 'fixture', reason: '' }, surfaces: [{ slug: 'dashboard-deployments', hash: '/deployments' }] },
-  '/reviews': { title: 'Plan reviews', proof: '#view table tbody tr', fixture: { status: 'fixture', reason: '' }, surfaces: [{ slug: 'dashboard-reviews', hash: '/reviews' }] },
+  '/reviews': { title: 'Plan reviews', proof: '#view [data-rv-item]', fixture: { status: 'fixture', reason: '' }, surfaces: [{ slug: 'dashboard-reviews', hash: '/reviews' }] },
   '/review-gate': { title: 'Review gate', proof: '.rg-panel', fixture: { status: 'fixture', reason: '' }, surfaces: [{ slug: 'dashboard-review-gate', hash: '/review-gate' }] },
   '/github': { title: 'Issues', proof: '[data-gh-issue]', fixture: { status: 'fixture', reason: '' }, surfaces: [{ slug: 'dashboard-github', hash: '/github' }] },
   '/github/projects': { title: 'Boards', proof: '.ghp-column', fixture: { status: 'fixture', reason: '' }, subviews: [{ id: 'board', label: 'Board layout', via: { hash: '/github/projects' } }, { id: 'list', label: 'Flat list layout', via: { hash: '/github/projects?layout=list' } }],

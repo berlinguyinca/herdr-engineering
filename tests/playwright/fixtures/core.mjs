@@ -370,6 +370,7 @@ function collab(path, ctx) {
       { id: 'eg-3', room_id: 'room-1', host_port: 'files.pythonhosted.org:443', agent_id: 'agent-impl', state: 'approved', expires_at: now + 86400 },
     ] };
   }
+  if (rest === '/fleet/agent-links') return { agents: [] };
   if (rest === '/fleet/helpers') {
     return { paused: false, now, helpers: [
       { helper_id: 'hlp-1', role: 'reviewer', task: 'Review the retry budget change for 429 double counting', status: 'running', requester_agent_id: 'agent-impl', room_id: 'room-1', created_epoch: now - 1200, expires_epoch: now + 2400 },
