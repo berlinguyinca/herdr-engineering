@@ -47,6 +47,24 @@ export function localDisplay(override = '') {
   return { viewport: `local-${w}x${h}${dpr !== 1 ? `-${dpr}x` : ''}`, width: w, height: h, device_class: 'local', orientation: w >= h ? 'landscape' : 'portrait', dpr, idSuffix: '' };
 }
 
+/**
+ * Capture only: a full-page screenshot of a sticky / 100vh layout (the sidebar, the memory drawer) ends where the viewport ends. Grow the
+ * viewport to the document height (never below the mode's own height, never above `cap`) so the picture looks like a real tall window.
+ * Width is untouched, so every width-keyed media query and the Screenwright metadata stay identical. Returns the final height.
+ */
+export async function fitViewportToPage(page, width, baseHeight, cap = 8000) {
+  let h = baseHeight;
+  for (let i = 0; i < 4; i++) {
+    const doc = await page.evaluate(() => document.documentElement.scrollHeight);
+    const want = Math.min(cap, Math.max(baseHeight, doc));
+    if (want === h && i > 0) break;
+    h = want;
+    await page.setViewportSize({ width, height: h });
+    await page.waitForTimeout(50);
+  }
+  return h;
+}
+
 /** Pure and deterministic: the Screenwright metadata of one capture. */
 export const screenMeta = (slug, mode) => ({ screen_id: slug + mode.idSuffix, orientation: mode.orientation, device_class: mode.device_class });
 export const fileName = (slug, mode, appearance) => `${slug}__${mode.viewport}__${appearance}`;
@@ -103,7 +121,7 @@ async function main() {
       try {
         const apiLog = new Set();   // per capture: jobs run in parallel
         let probe = null;
-        const wrapped = { ...s, apiLog, steps: async (page) => { await s.steps(page); probe = await page.evaluate(() => ({ error: !!document.querySelector('#view herdr-error, #view [data-error]'), text: (document.querySelector('#view')?.innerText || '').slice(0, 4000) })); } };
+        const wrapped = { ...s, apiLog, steps: async (page) => { await s.steps(page); await fitViewportToPage(page, mode.width, mode.height); probe = await page.evaluate(() => ({ error: !!document.querySelector('#view herdr-error, #view [data-error]'), text: (document.querySelector('#view')?.innerText || '').slice(0, 4000) })); } };
         const r = await capture(browser, null, wrapped, mode.viewport, appearance, { regions: false, size: { width: mode.width, height: mode.height }, dpr: mode.dpr, strictFonts: false });
         fs.writeFileSync(path.join(a.out, name + '.png'), r.page);
         const misses = [...apiLog].filter((l) => l.endsWith('MISS')).map((l) => l.replace(' -> MISS', ''));
