@@ -170,6 +170,11 @@ the emit hook do not send keys yet, so turning keys on breaks them until they do
 browser dashboard works through the **dashboard proxy** (next section). viewer = read-only, operator = read + mutate, ingest =
 
 status, version and commit without a key) and the host endpoints. The browser
+dashboard and the emit hook do not send keys yet, so turning keys on
+breaks them until they do. The llm-proxy, `llm-gateway-sync` and `llm-gateway-usage` can send
+one: see "Client key for the llm services" below. viewer = read-only, operator = read + mutate, ingest =
+POST /api/v1/ingest, agent = ingest + LLM-key mint/revoke + review posting + `POST /api/v1/token-usage`.
+
 dashboard and the llm-proxy do not send keys yet, so turning keys on breaks them until
 they do. The emit hook and the fabric agent (service leases and host telemetry) send
 `ingest.api_key` as `X-API-Key` when one is configured (role `ingest` suffices). viewer = read-only, operator = read + mutate, ingest =
@@ -918,3 +923,22 @@ whether or not a stream is open. The executor claims the proposal itself, so a d
 a late reject still cannot run it twice or after a reject. The board is in memory: a control-plane restart mid-execution
 drops the proposal with the rest of the board (nothing is left "executing"), and the action may or may not have reached
 the CI provider; check the dashboard or CI.
+
+## Client key for the llm services (optional)
+
+On a keyed control plane the llm-proxy (`llm/config` read, token reporting), `llm-gateway-sync`
+(`llm/config` read) and `llm-gateway-usage` (`POST /api/v1/token-usage`) need an API key. Give
+them an **`agent`-role** key (`token-usage` is in the agent POST allow-list; a `viewer` key cannot
+report usage, and `operator` is more than they need). Default: no key file, no `X-API-Key`
+header, the open control plane's behaviour.
+
+- Put the key alone in a file, mode `0600` (a group- or other-readable file is refused, as in
+  `ci-fix-runner.py`), owned by the uid the container runs as (1000 for the gateway services).
+  It is re-read on every request, so rotating it needs no restart. It is never put in argv,
+  env or logs.
+- Compose: set `HERDR_CP_CLIENT_KEY_FILE=/path/to/key` for `deploy.sh`; it is mounted read-only
+  at `/run/secrets/cp-client-key` in the llm-proxy, `llm-gateway-sync` and `llm-gateway-usage`
+  services and passed as `--control-plane-key-file`. Unset: nothing is mounted or sent.
+- Without compose: `--control-plane-key-file PATH` on `control-plane llm-proxy`,
+  `llm-gateway-sync` and `llm-gateway-usage`; for the llm-proxy also
+  `control_plane.llm_proxy.control_plane_key_file` in the llm slice YAML (the flag wins).
