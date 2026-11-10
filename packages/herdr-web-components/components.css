@@ -189,6 +189,16 @@ button.hd-linkbtn { box-shadow: none; font: inherit; font-size: .75rem; color: v
   #view table { display: block; max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
   #view table th, #view table td { overflow-wrap: normal; word-break: normal; }
   #view table th { white-space: nowrap; }
+  #view table th, #view table td { padding-left: 6px; padding-right: 6px; }
+  /* scroll affordance: an edge shadow shows on whichever side still has hidden columns (scroll-linked via background-attachment: local) */
+  #view table { background:
+    linear-gradient(to right, var(--surface, #fff) 30%, transparent) left center / 24px 100% no-repeat local,
+    linear-gradient(to left, var(--surface, #fff) 30%, transparent) right center / 24px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%, rgba(0, 0, 0, .28), transparent) left center / 10px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%, rgba(0, 0, 0, .28), transparent) right center / 10px 100% no-repeat scroll; }
+  #view table:focus-visible { outline: 2px solid var(--accent, #1f7ae0); outline-offset: 2px; }
+  /* names and goals in list rows wrap instead of being cut with an ellipsis */
+  .hd-row .hd-row__who, .hd-row .hd-row__goal { white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
   /* the live dot stays beside the page title instead of wrapping onto a line of its own */
   .hd-live-head { flex-wrap: nowrap; align-items: center; gap: 4px 8px; }
   .hd-live-head > h1 { flex: 0 1 auto; }
