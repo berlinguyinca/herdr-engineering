@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Build-cache report sender (`herdr-eng build-cache-report`, disabled by default)
+- New `herdr-eng build-cache-report [--once|--loop] [--json]` schedules the existing `report_builds` sender. Config is YAML only, `fabric_build_cache.report {enabled: false, url, key_file, interval_s: 60 (10..3600), host_id}`; the ingest-role key is read from `key_file` only (never argv, env or logs). It refuses to run (exit 2) when disabled, when the url is not https (http only for 127.0.0.1/localhost), or when the key file is missing, empty or group/world readable. `--loop` logs one line per attempt and survives an unreachable or refusing control plane.
+- Opt-in service files, enabled by nothing: `scripts/herdr-eng-build-cache-report.service` (systemd user) and `scripts/com.herdr-engineering.build-cache-report.plist` (launchd template). Runbook: `docs/build-cache-deployment.md`. Tests: `tests/test_build_cache_report_cli.py`.
+
 ### Dashboard report viewer and share panel: phone-width and dark-theme polish
 - The dashboard's "Evidence and source downloads" table stacks into labelled blocks below 600px (table roles kept) instead of scrolling sideways with no cue.
 - Share panel at 390px: the four tabs stay on one row; labels stack caption over control with a gap (Expires, Version, Audience, Compare, Report version, Finding or figure); the Links heading and Title field have top margin.

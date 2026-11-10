@@ -227,9 +227,41 @@ control_plane:
 
 Effects: routes answer 404 when off; capability `build_cache_v1` appears only when
 on; an enabled-but-invalid `fabric_build_cache` section stops control-plane start.
-Data is this host's own `builds.jsonl` only (no ingest from other hosts). HTTP
+Data is this host's own `builds.jsonl` plus anything other hosts push when `control_plane.build_cache.ingest.enabled` (see "Report this host's builds" below). HTTP
 cleanup execute answers 501 by design; eviction apply is CLI-only. Roll out after
 Stage 1 has recorded builds to show. Rollback: set it false.
+
+## Report this host's builds to the control plane (opt-in)
+
+Off by default. A host pushes the non-secret summary of its recent builds (never argv, env, cwd or paths) to
+`POST /api/v1/host/build-cache/report`. The control plane must have `control_plane.build_cache.ingest.enabled: true`
+and an ingest-role key bound to this host's id.
+
+1. Put the key in a file only you can read: `install -m 600 /dev/null ~/.config/herdr-engineering/build-cache-ingest.key`,
+   then write the key into it (not onto a command line). A file readable by group or others is refused (`chmod 600`).
+2. In `~/.config/herdr-engineering/config.yaml` (YAML only; there is no environment variable and no key option on argv):
+
+```yaml
+fabric_build_cache:
+  report:
+    enabled: true
+    url: https://<control-plane host>            # https required; http only for 127.0.0.1/localhost
+    key_file: /home/<you>/.config/herdr-engineering/build-cache-ingest.key
+    interval_s: 60                                # 10..3600
+    host_id: <optional; defaults to the hostname and must match the key's host binding>
+```
+
+3. Try once: `herdr-eng build-cache-report --once --json` (exit 0 sent, 1 transport or server refusal, 2 refused to run:
+   disabled, non-https url, missing/empty/loose key file, unknown key).
+4. Schedule it, not enabled by default:
+   - Linux: install `scripts/herdr-eng-build-cache-report.service` as a systemd user unit (steps are in the file header),
+     then `systemctl --user enable --now herdr-eng-build-cache-report.service`.
+   - macOS: render `scripts/com.herdr-engineering.build-cache-report.plist` into `~/Library/LaunchAgents/` and
+     `launchctl bootstrap gui/$(id -u) ...` (steps are in the file header).
+
+`--loop` logs one `build-cache-report:` line per attempt on stderr and survives an unreachable or refusing control
+plane; the key file is re-read each attempt, so rotating the key needs no restart. Rollback: disable the unit
+(`systemctl --user disable --now ...` / `launchctl bootout ...`) or set `report.enabled: false`.
 
 ## Pi extension deploy ORDER
 
