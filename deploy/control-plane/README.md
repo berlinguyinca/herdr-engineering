@@ -366,8 +366,10 @@ sections:
 ```
 
 - **Rules.** A mapping of at most 32 components (`[a-z0-9][a-z0-9_-]{0,63}`) to a non-empty host id. A bad
-  entry, a non-mapping value, or a component that also has a definition (ambiguous) refuses the whole list;
-  `definitions.ci_errors` in `GET /api/v1/deployments` says why. Read live, like the other keys.
+  entry or non-mapping value is rejected when the fleet file loads; a component that also has a definition
+  (ambiguous) is dropped alone and named in `definitions.ci_errors` in `GET /api/v1/deployments`. Read live,
+  failing closed: while the fleet file is unreadable, deleted or invalid the allowlist is empty (CI hosts get
+  403) unless `control_plane.config_failure_mode: last_good`. Unknown keys anywhere in the file are rejected.
 - **Authorization.** An event is accepted when the definitions rule allows it OR the exact (component,
   authenticated host id) pair is listed. A listed component reported by any other host is refused (403).
   With no `deployment_definitions` configured ingest stays accept-all, as before. With definitions

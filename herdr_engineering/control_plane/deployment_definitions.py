@@ -601,8 +601,8 @@ class DeploymentDefinitions:
 
     # ---------------------------------------------------- CI-reported set
     def _ci_read(self, defs) -> tuple[dict, list]:
-        """The validated ``control_plane.ci_deployments`` (read live) and its errors. Any error,
-        refuses the whole list; a component that also has a definition drops only that entry."""
+        """The validated ``control_plane.ci_deployments`` (read live) and its errors. A bad
+        list is refused whole; a component that also has a definition drops only that entry."""
         if self._ci_components_fn is None:
             return {}, []
         # Imported here: pipelines-sync.sh loads this file standalone as the validator, so it must
