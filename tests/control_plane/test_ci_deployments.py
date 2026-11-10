@@ -102,16 +102,16 @@ def test_invalid_definitions_keep_refusing_even_an_allowlisted_component(tmp_pat
         store.authorize("hive-gateway", "hive")
 
 
-def test_a_component_with_a_definition_and_an_allowlist_entry_is_ambiguous_and_refused(tmp_path):
+def test_a_clashing_entry_is_dropped_and_reported_and_the_rest_still_works(tmp_path):
     store = _store(tmp_path, {"hive-gateway": CI_HOST, "lc-binbase-frontend": CI_HOST})
-    errors = store.annotate({"components": {}})["definitions"]["ci_errors"]
-    assert errors == ["control_plane.ci_deployments: component 'hive-gateway' also has a deployment "
-                      "definition; remove one of them"]
+    view = store.annotate({"components": {}})["definitions"]
+    assert view["ci_errors"] == ["control_plane.ci_deployments: component 'hive-gateway' also has a "
+                                 "deployment definition; remove one of them"]
+    assert view["ci_components"] == ["lc-binbase-frontend"]
     store.authorize("hive-gateway", "hive")                       # the definition still rules
     with pytest.raises(DeploymentAuthorizationError):
         store.authorize("hive-gateway", CI_HOST)
-    with pytest.raises(DeploymentAuthorizationError):             # the whole list is refused
-        store.authorize("lc-binbase-frontend", CI_HOST)
+    store.authorize("lc-binbase-frontend", CI_HOST)               # only the clash is dropped
 
 
 def test_an_unreadable_or_invalid_ci_value_refuses_only_ci_components(tmp_path):
@@ -124,6 +124,17 @@ def test_an_unreadable_or_invalid_ci_value_refuses_only_ci_components(tmp_path):
         store.authorize("lc-binbase-frontend", CI_HOST)
     view = store.annotate({"components": {}})["definitions"]
     assert view["ci_components"] == [] and "secret" not in json.dumps(view)
+
+
+def test_without_loaded_definitions_no_ci_badge_or_component_list(tmp_path):
+    store = DeploymentDefinitions(lambda: None, ci_components=lambda: MAP)        # not configured
+    snap = {"components": {"lc-binbase-frontend": {"running": C1, "timeline": []}}}
+    view = store.annotate(snap)
+    assert "kind" not in view["components"]["lc-binbase-frontend"]
+    assert view["definitions"]["ci_components"] == []
+    broken = _write(tmp_path / "p", [dict(STAGE1[0], stage=7)])                   # configured, never valid
+    view = DeploymentDefinitions(lambda: str(broken), ci_components=lambda: MAP).annotate(snap)
+    assert "kind" not in view["components"]["lc-binbase-frontend"]
 
 
 def test_the_snapshot_names_the_ci_components_and_marks_only_their_rows(tmp_path):
@@ -147,6 +158,8 @@ def test_the_ci_summary_carries_outcome_commits_time_and_a_bounded_evidence_link
     ci = store.annotate(snap)["components"]["lc-binbase-frontend"]["ci"]
     assert ci == {"outcome": "ok", "at": "2026-11-09T10:00:00Z", "from": "a" * 40, "to": C1,
                   "evidence_url": RUN_URL}
+    snap["components"]["lc-binbase-frontend"]["timeline"] = [dict(ev, evidence=f"(see {RUN_URL}).")]
+    assert store.annotate(snap)["components"]["lc-binbase-frontend"]["ci"]["evidence_url"] == RUN_URL
     snap["components"]["lc-binbase-frontend"]["timeline"] = [dict(ev, evidence="no link http://x")]
     assert store.annotate(snap)["components"]["lc-binbase-frontend"]["ci"]["evidence_url"] is None
 
@@ -265,3 +278,75 @@ def test_the_allowlist_is_hot_reloaded(world, tmp_path):
     os.chmod(cfg, 0o600)
     assert _post(world, CI_TOKEN, component="lc-binbase-frontend")[0] == 403
     assert _post(world, CI_TOKEN, component="lc-binbase-backend")[0] == 200
+
+
+# ------------------------------------------ fail closed when the fleet file breaks
+
+def _fleet_world(tmp_path, extra_values=None):
+    defs = _write(tmp_path / "pipelines", [d for d in STAGE1 if d["host"] == "hive"])
+    path = tmp_path / "fleet.yaml"
+    values = {"deployment_definitions": str(defs), "ci_deployments": MAP, **(extra_values or {})}
+    path.write_text(yaml.safe_dump({
+        "version": 1,
+        "sections": {"control_plane": {"roles": ["control"], "values": values}},
+        "hosts": {"hive": {"roles": ["node"], "token_sha256": _sha(HIVE_TOKEN)},
+                  CI_HOST: {"roles": ["ci"], "token_sha256": _sha(CI_TOKEN)}}}))
+    os.chmod(path, 0o600)
+    svr = ControlPlaneServer(ControlPlaneRepo(), api_keys={"opkey": "operator"},
+                             fleet_config=FleetConfigStore(path))
+    svr._deployments_stop.set()
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    return svr, path
+
+
+def _break(path):
+    path.write_text("version: [unclosed\n")
+    os.chmod(path, 0o600)
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+
+
+def test_a_broken_fleet_file_fails_the_ci_allowlist_closed(tmp_path):
+    svr, path = _fleet_world(tmp_path)
+    try:
+        assert _post(svr, CI_TOKEN)[0] == 200
+        _break(path)
+        status, body = _post(svr, CI_TOKEN)
+        assert status == 403 and "lc-binbase-frontend" in body["error"]
+        assert _post(svr, HIVE_TOKEN, component="hive-gateway")[0] == 200   # definitions keep last good
+    finally:
+        svr.shutdown()
+
+
+def test_a_deleted_fleet_file_fails_the_ci_allowlist_closed(tmp_path):
+    svr, path = _fleet_world(tmp_path)
+    try:
+        assert _post(svr, CI_TOKEN)[0] == 200
+        path.unlink()
+        assert _post(svr, CI_TOKEN)[0] == 403
+    finally:
+        svr.shutdown()
+
+
+def test_last_good_mode_keeps_the_ci_allowlist_through_a_broken_file(tmp_path):
+    svr, path = _fleet_world(tmp_path, {"config_failure_mode": "last_good"})
+    try:
+        assert _post(svr, CI_TOKEN)[0] == 200
+        _break(path)
+        assert _post(svr, CI_TOKEN)[0] == 200
+    finally:
+        svr.shutdown()
+
+
+def test_the_allowlist_comes_back_when_the_file_is_repaired(tmp_path):
+    svr, path = _fleet_world(tmp_path)
+    try:
+        good = path.read_text()
+        _break(path)
+        assert _post(svr, CI_TOKEN)[0] == 403
+        path.write_text(good + "# repaired\n")
+        os.chmod(path, 0o600)
+        assert _post(svr, CI_TOKEN)[0] == 200
+    finally:
+        svr.shutdown()

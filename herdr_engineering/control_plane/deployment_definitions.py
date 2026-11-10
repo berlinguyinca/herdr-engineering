@@ -601,8 +601,8 @@ class DeploymentDefinitions:
 
     # ---------------------------------------------------- CI-reported set
     def _ci_read(self, defs) -> tuple[dict, list]:
-        """The validated ``control_plane.ci_deployments`` (read live) and its errors. Any error,
-        including a component that also has a definition, refuses the whole list."""
+        """The validated ``control_plane.ci_deployments`` (read live) and its errors. A bad
+        list is refused whole; a component that also has a definition drops only that entry."""
         if self._ci_components_fn is None:
             return {}, []
         # Imported here: pipelines-sync.sh loads this file standalone as the validator, so it must
@@ -613,10 +613,10 @@ class DeploymentDefinitions:
         except Exception:  # noqa: BLE001 - a broken config reader must not crash ingest
             return {}, [f"{CI_KEY} could not be read"]
         clash = sorted(c for c in mapping if c in defs)
-        if clash:
-            return {}, [f"{CI_KEY}: component {c[:64]!r} also has a deployment definition; "
-                        "remove one of them" for c in clash[:5]]
-        return mapping, errors
+        kept = {c: h for c, h in mapping.items() if c not in defs}
+        errors += [f"{CI_KEY}: component {c[:64]!r} also has a deployment definition; "
+                   "remove one of them" for c in clash[:5]]
+        return kept, errors
 
     def ci_components(self) -> dict:
         """{component: host id} reported by CI (no definition exists for any of them)."""
@@ -644,7 +644,9 @@ class DeploymentDefinitions:
     def annotate(self, snapshot: dict) -> dict:
         """The monitor snapshot plus ``definitions`` (status, groups) for the page."""
         view = copy.deepcopy(snapshot)
-        ci, ci_errors = self._ci_read(self.definitions())
+        # CI rows are only part of the picture when definitions are loaded: without them ingest is
+        # unrestricted and nothing marks a component as CI-reported.
+        ci, ci_errors = self._ci_read(self.definitions()) if self.status()["loaded"] else ({}, [])
         view["definitions"] = {**self.status(), "groups": self.groups(),
                                "ci_components": sorted(ci), "ci_errors": ci_errors}
         components = view.get("components")
