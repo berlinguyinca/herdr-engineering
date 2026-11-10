@@ -120,7 +120,7 @@ export function bundledFontCss() {
 }
 
 /** Ask Chromium which font file really painted EVERY element (and ::before / ::after) with text: each must be a bundled font. */
-export async function assertBundledFonts(page, ctx) {
+export async function assertBundledFonts(page, ctx, { strict = true } = {}) {
   const cdp = await ctx.newCDPSession(page);
   try {
     await cdp.send('DOM.enable'); await cdp.send('CSS.enable');
@@ -141,9 +141,10 @@ export async function assertBundledFonts(page, ctx) {
         else host.set(f.familyName, (host.get(f.familyName) || 0) + f.glyphCount);
       }
     }
-    if (host.size) throw new Error(`screenshots must use the bundled fonts only, but these host fonts painted glyphs: ${[...host].map(([f, n]) => `${f} (${n} glyphs)`).join(', ')}`);
+    const hostFonts = Object.fromEntries(host);
+    if (host.size && strict) throw new Error(`screenshots must use the bundled fonts only, but these host fonts painted glyphs: ${[...host].map(([f, n]) => `${f} (${n} glyphs)`).join(', ')}`);
     if (!used.size) throw new Error('could not read which fonts painted the page');
-    return { checked, used: Object.fromEntries(used) };
+    return { checked, used: Object.fromEntries(used), hostFonts };
   } finally { await cdp.detach().catch(() => {}); }
 }
 
@@ -167,7 +168,7 @@ async function settled(page, quietMs = 500, maxMs = 5000) {
  * Capture one surface at one viewport / colour scheme. Returns { page: Buffer, regions: {name: Buffer} }.
  * `extraCss` is only for the gate's own "teeth" tests: it lets a test inject a defect and prove the compare notices it.
  */
-export async function capture(browser, info, surface, viewport, scheme, { extraCss = '', regions = viewport === 'desktop', size = null, dpr = 1 } = {}) {
+export async function capture(browser, info, surface, viewport, scheme, { extraCss = '', regions = viewport === 'desktop', size = null, dpr = 1, strictFonts = true } = {}) {
   // `size` ({width,height}) and `dpr` let capture-matrix.mjs take sizes outside ui-gates.yaml (the Screenwright matrix, the host's own screen)
   const vp = size || CFG.viewports[viewport];
   const ctxOpts = { viewport: vp, colorScheme: scheme, reducedMotion: 'reduce', deviceScaleFactor: dpr, bypassCSP: true };
@@ -191,11 +192,11 @@ export async function capture(browser, info, surface, viewport, scheme, { extraC
     // selecting a node scrolls the page by a run-dependent pixel; those surfaces are captured from the top (the chat, which scrolls to
     // its newest message on purpose, is not touched)
     if (surface.resetScroll) { await page.evaluate(() => { window.scrollTo(0, 0); document.scrollingElement.scrollTop = 0; }); await page.waitForTimeout(100); }
-    await assertBundledFonts(page, ctx);
+    const fontReport = await assertBundledFonts(page, ctx, { strict: strictFonts });
     const full = await page.evaluate(() => Math.max(document.documentElement.scrollHeight, innerHeight));
     if (full > MAX_HEIGHT) throw new Error(`${surface.slug} at ${viewport} is ${full}px tall, above the ${MAX_HEIGHT}px capture cap: the rest would never be compared`);
     const height = full;
-    const out = { page: await page.screenshot({ clip: { x: 0, y: 0, width: vp.width, height }, fullPage: surface.fullPage === true, animations: 'disabled', caret: 'hide' }), regions: {} };
+    const out = { hostFonts: fontReport.hostFonts, page: await page.screenshot({ clip: { x: 0, y: 0, width: vp.width, height }, fullPage: surface.fullPage === true, animations: 'disabled', caret: 'hide' }), regions: {} };
     if (regions) {
       for (const r of surface.regions || []) {
         // by bounding box, not locator.screenshot(): that waits for the element to be visible, which would make a test that hides

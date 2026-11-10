@@ -104,11 +104,11 @@ async function main() {
         const apiLog = new Set();   // per capture: jobs run in parallel
         let probe = null;
         const wrapped = { ...s, apiLog, steps: async (page) => { await s.steps(page); probe = await page.evaluate(() => ({ error: !!document.querySelector('#view herdr-error, #view [data-error]'), text: (document.querySelector('#view')?.innerText || '').slice(0, 4000) })); } };
-        const r = await capture(browser, null, wrapped, mode.viewport, appearance, { regions: false, size: { width: mode.width, height: mode.height }, dpr: mode.dpr });
+        const r = await capture(browser, null, wrapped, mode.viewport, appearance, { regions: false, size: { width: mode.width, height: mode.height }, dpr: mode.dpr, strictFonts: false });
         fs.writeFileSync(path.join(a.out, name + '.png'), r.page);
         const misses = [...apiLog].filter((l) => l.endsWith('MISS')).map((l) => l.replace(' -> MISS', ''));
         const errorState = probe?.error || /no fixture for/.test(probe?.text || '');
-        rows.push({ ...row, status: misses.length || errorState ? 'degraded' : 'ok', ...(misses.length ? { misses: [...new Set(misses)].sort() } : {}), ...(errorState ? { errorState: true } : {}) });
+        rows.push({ ...row, status: misses.length || errorState ? 'degraded' : 'ok', ...(misses.length ? { misses: [...new Set(misses)].sort() } : {}), ...(errorState ? { errorState: true } : {}), ...(Object.keys(r.hostFonts || {}).length ? { hostFonts: r.hostFonts } : {}) });
         console.log(misses.length || errorState ? 'degraded' : 'ok', name);
       } catch (e) { rows.push({ ...row, status: 'failed', reason: String(e.message).split('\n')[0].slice(0, 300) }); console.log('FAIL', name, String(e.message).split('\n')[0].slice(0, 200)); }
     }
@@ -120,6 +120,7 @@ async function main() {
   fs.writeFileSync(path.join(a.out, 'map.json'), JSON.stringify(shots.map((r) => ({ screen_id: r.screen_id, before: r.name, after: r.name, orientation: r.orientation, device_class: r.device_class, appearance: r.appearance })), null, 1));
   fs.writeFileSync(path.join(a.out, 'coverage.json'), JSON.stringify(rows, null, 1));
   const count = (st) => rows.filter((r) => r.status === st).length;
+  console.log(`host-font glyphs (screens not byte-reproducible on other hosts): ${rows.filter((r) => r.hostFonts).length}`);
   console.log(`done: ok ${count('ok')}, degraded ${count('degraded')}, failed ${count('failed')}, skipped ${count('skipped')} of ${rows.length}`);
   process.exitCode = count('failed') ? 1 : 0;
 }
