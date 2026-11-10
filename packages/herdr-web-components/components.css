@@ -164,3 +164,21 @@
 .hd-subnav a:hover { color: var(--text); }
 .hd-subnav a[aria-current=page] { color: var(--accent); border-bottom-color: var(--accent); font-weight: 500; }
 button.hd-linkbtn { box-shadow: none; font: inherit; font-size: .75rem; color: var(--accent); background: none; border: 0; padding: 2px 0; cursor: pointer; text-decoration: underline; }
+
+/* ---- look and feel: surfaces, metrics, tab strip (presentation only) ---- */
+.hd-card { padding: 20px; border-color: var(--border-subtle); }
+.hd-card__title { font-size: 1rem; letter-spacing: -0.008em; margin-bottom: 6px; }
+.hd-card + .hd-card { margin-top: 16px; }
+.hd-metric { padding: 16px 18px; border-radius: var(--radius); }
+.hd-metric__value { font-size: 1.5rem; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.hd-status { padding: 2px 10px 2px 8px; }
+.hd-empty, .hd-error { padding: 32px 24px; border-radius: var(--radius); }
+.hd-subnav { gap: 4px; margin: 0 0 20px; position: relative; }
+.hd-subnav a { padding: 10px 16px; font-weight: 500; border-radius: var(--radius-sm) var(--radius-sm) 0 0; transition: color var(--motion-fast), background-color var(--motion-fast); }
+.hd-subnav a:hover { background: var(--surface-hover); text-decoration: none; }
+.hd-subnav a[aria-current=page] { font-weight: 600; border-bottom-width: 3px; }
+@media (max-width: 900px) {
+  .hd-subnav { overflow-x: auto; scrollbar-width: none; flex-wrap: nowrap; }
+  .hd-subnav a { white-space: nowrap; flex: none; }
+  .hd-card { padding: 16px; }
+}

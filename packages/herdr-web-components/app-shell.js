@@ -175,13 +175,18 @@ const SHARED = `
 .hd-shell__badge { margin-left: auto; min-width: 20px; padding: 0 6px; border-radius: 10px; font-size: .75rem; line-height: 20px; text-align: center; background: var(--accent-weak); color: var(--accent); font-weight: 600; }
 .hd-shell__badge[data-tone=critical] { background: var(--status-failed); color: #fff; }
 .hd-shell__link:hover { background: var(--surface-hover); text-decoration: none; }
-.hd-shell__link.active { background: var(--accent-weak); color: var(--accent); font-weight: 500; }
+.hd-shell__link.active { background: var(--accent-weak); color: var(--accent); font-weight: 600; box-shadow: inset 3px 0 0 var(--accent); }
+.hd-shell__link { transition: background-color var(--motion-fast), color var(--motion-fast); }
+.hd-shell__link:hover { color: var(--text); }
+.hd-shell__brand { font-size: 1rem; letter-spacing: -0.01em; padding: 18px 16px; }
+.hd-shell__group + .hd-shell__group { margin-top: 6px; }
+.hd-shell__group-label { padding: 6px 10px 4px; }
 .hd-shell__display { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 10px 14px 14px; border-top: 1px solid var(--border-subtle); position: sticky; bottom: 0; background: var(--surface); }
 .hd-shell__icon { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; color: var(--text-secondary); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; }
 .hd-shell__icon:hover { background: var(--surface-hover); color: var(--text); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .hd-shell__main { flex: 1; min-width: 0; }
-.hd-shell__content { width: auto; max-width: none; margin: 0; padding: clamp(20px,1.25vw,48px); }
+.hd-shell__content { width: auto; max-width: none; margin: 0; padding: clamp(24px,2vw,48px) clamp(24px,2.4vw,56px); }
 @media (max-width: 900px) {
   .hd-shell { flex-direction: column; }
   .hd-shell__sidebar { width: 100%; border-right: none; position: static; height: auto; overflow: visible;
@@ -194,7 +199,9 @@ const SHARED = `
   .hd-shell__link { min-height: 44px; align-items: center; }
   .hd-shell__nav { display: none; grid-template-columns: repeat(2,minmax(0,1fr)); max-height: 55vh; overflow-y: auto; }
   .hd-shell__nav[data-open=true] { display: grid; }
-  .hd-shell__content { max-width: none; padding: 16px; }
+  .hd-shell__content { max-width: none; padding: 16px 16px 28px; }
+  .hd-shell__brand { position: sticky; top: 0; background: var(--surface); z-index: 2; }
+  .hd-shell__menu { border-radius: 8px; font-weight: 500; }
 }`;
 
 function escapeHtml(s) {

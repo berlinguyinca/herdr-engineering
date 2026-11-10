@@ -106,3 +106,20 @@ code, pre, kbd, samp {
 }
 .hd-tabs strong, .hd-tabs small { font-weight: 500; font-size: 12px; color: var(--text-secondary); margin-left: 4px; }
 @media (max-width: 900px) { .hd-btn, .hd-tabs > button, .hd-tabs > label { min-height: 44px; } .hd-tabs > button, .hd-tabs > label { line-height: 42px; } .hd-btn--sm { min-height: 44px; } .hd-btn--icon { width: 44px; } }
+
+/* ---- look and feel: type scale, rhythm, calmer controls (presentation only) ---- */
+:root { --ease-ui: cubic-bezier(.2, .6, .2, 1); }
+body { font-size: 15px; line-height: 1.55; letter-spacing: -0.003em; font-feature-settings: "cv11", "ss01"; }
+h1 { font-size: 1.75rem; letter-spacing: -0.02em; line-height: 1.2; margin-bottom: 0.625rem; }
+h2 { font-size: 1.25rem; letter-spacing: -0.012em; }
+h3 { font-size: 1.0625rem; letter-spacing: -0.008em; }
+.hd-btn, .hd-tabs > button, .hd-tabs > label { transition: background-color var(--motion-fast) var(--ease-ui), border-color var(--motion-fast) var(--ease-ui), color var(--motion-fast) var(--ease-ui), box-shadow var(--motion-fast) var(--ease-ui); }
+.hd-btn { border-radius: 8px; font-weight: 600; letter-spacing: 0; }
+.hd-btn:not(.hd-btn--secondary):not(.hd-btn--ghost):not(.hd-btn--quiet):not(.hd-btn--danger) { box-shadow: 0 1px 1px rgba(16, 24, 40, 0.12); }
+.hd-btn--secondary, .hd-btn--ghost, .hd-btn--danger { border-color: var(--border); }
+.hd-tabs { gap: 8px; }
+.hd-tabs > button, .hd-tabs > label { border-radius: 8px; }
+.hd-tabs > [aria-selected="true"], .hd-tabs > [aria-pressed="true"], .hd-tabs > .hd-tab--on { background: var(--accent-weak); box-shadow: none; font-weight: 600; }
+input, select, textarea { transition: border-color var(--motion-fast) var(--ease-ui), box-shadow var(--motion-fast) var(--ease-ui); }
+input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+::selection { background: var(--accent-weak); }
