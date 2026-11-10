@@ -168,6 +168,11 @@ leaves `ingest.api_key` / `agent.api_key` empty, so hosts send no `X-API-Key` at
 status, version and commit without a key) and the host endpoints. The llm-proxy and
 the emit hook do not send keys yet, so turning keys on breaks them until they do. The
 browser dashboard works through the **dashboard proxy** (next section). viewer = read-only, operator = read + mutate, ingest =
+
+status, version and commit without a key) and the host endpoints. The browser
+dashboard and the llm-proxy do not send keys yet, so turning keys on breaks them until
+they do. The emit hook and the fabric agent (service leases and host telemetry) send
+`ingest.api_key` as `X-API-Key` when one is configured (role `ingest` suffices). viewer = read-only, operator = read + mutate, ingest =
 POST /api/v1/ingest, agent = ingest + LLM-key mint/revoke + review posting.
 
 Callers that can send a key (all optional; no key = no header): `collab-spawn.py --api-key-file FILE` (the
