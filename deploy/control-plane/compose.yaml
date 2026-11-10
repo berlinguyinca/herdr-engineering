@@ -192,6 +192,32 @@ services:
       - "--fleet-config"
       - "/etc/herdr/fleet/fleet-config.yaml"
 
+  # ---- OPTIONAL: same-origin key-injecting proxy for the browser dashboard (keyed mode) ---
+  # Opt-in: `docker compose --profile dashboard-proxy up -d dashboard-proxy`. Needs
+  # control_plane.dashboard_proxy in the central file (key files under the mounted dir, mode 0600).
+  # Browsers point at this port instead of the web port; the proxy adds the viewer/operator key.
+  dashboard-proxy:
+    profiles: ["dashboard-proxy"]
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-unset}
+    container_name: herdr-cp-dashboard-proxy
+    restart: unless-stopped
+    depends_on:
+      - control-plane-web
+    volumes:
+      - ${HERDR_CP_FLEET_DIR:-/etc/herdr/fleet}:/etc/herdr/fleet:ro
+      - ${HERDR_DASHBOARD_PROXY_KEY_DIR:-/var/lib/herdr-dashboard-proxy}:/etc/herdr/dashboard-proxy:ro
+    ports:
+      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_DASHBOARD_PROXY_PORT:-8081}:8081"
+    command:
+      - "control-plane"
+      - "dashboard-proxy"
+      - "--fleet-config"
+      - "/etc/herdr/fleet/fleet-config.yaml"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8081"
+
   control-plane-worker:
     build:
       context: ../..
