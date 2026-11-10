@@ -9,7 +9,7 @@ const settle = (page) => page.evaluate(() => document.activeElement?.blur());
 /** Named UI steps referenced by `step` in the route notes. */
 export const STEPS = {
   missions: KNOWN.get('dashboard-missions').steps,
-  'memory-open': async (page) => { await page.locator('[data-memory="mem-1"]').click(); await page.locator('[data-mem-drawer]:not([hidden]) .mem-drawer__head').waitFor(); await settle(page); },
+  'memory-open': async (page) => { await page.locator('[data-memory="mem-1"]').click(); await page.locator('[data-mem-drawer]:not([hidden]) .mem-drawer__head').waitFor(); await page.locator('[data-mem-drawer]:not([hidden]) .mem-text').waitFor(); await page.locator('[data-mem-drawer] [aria-busy="true"]').waitFor({ state: 'detached' }); await settle(page); },
   'assistant-tab': (name) => KNOWN.get(`dashboard-assistant-${name.toLowerCase()}`)?.steps || assistantTab(name, null),
 };
 function stepFor(ref) {
