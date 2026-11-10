@@ -1109,6 +1109,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--interval", type=float, default=30.0)
     p2.add_argument("--once", action="store_true", help="report once and exit")
     p2.set_defaults(func=_cmd_cp_llm_gateway_usage)
+    p2 = csub.add_parser("dashboard-proxy",
+                         help="same-origin proxy that injects viewer/operator API keys for the browser dashboard")
+    p2.add_argument("--fleet-config", required=True,
+                    help="central fleet file; reads control_plane.dashboard_proxy (key files, upstream, allowlist)")
+    p2.add_argument("--host", default="0.0.0.0")
+    p2.add_argument("--port", type=int, default=8081)
+    p2.set_defaults(func=_cmd_cp_dashboard_proxy)
 
     return parser
 
@@ -1304,6 +1311,30 @@ def _cmd_cp_llm_gateway_usage(args) -> int:
         return 1 if sync_once(control, fetch, state) is None else 0
     try:
         run(control, fetch, state, interval=args.interval)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def _cmd_cp_dashboard_proxy(args) -> int:
+    """Serve the browser-facing key-injecting proxy; exit 2 when unconfigured or a key file is unsafe."""
+    from .control_plane.dashboard_proxy import (
+        ProxyConfigError,
+        build_from_settings,
+        parse_dashboard_proxy,
+    )
+    _store, cp = _load_cp_fleet_config(args.fleet_config)
+    try:
+        settings = parse_dashboard_proxy(cp.get("dashboard_proxy"))
+        if settings is None:
+            print("dashboard-proxy: control_plane.dashboard_proxy.viewer_key_file is not configured", file=sys.stderr)
+            return 2
+        proxy = build_from_settings(settings, args.host, args.port)
+    except (ValueError, ProxyConfigError) as exc:
+        print(f"dashboard-proxy: {exc}", file=sys.stderr)
+        return 2
+    try:
+        proxy.serve()
     except KeyboardInterrupt:
         pass
     return 0
