@@ -171,6 +171,13 @@ they do. The emit hook and the fabric agent (service leases and host telemetry) 
 `ingest.api_key` as `X-API-Key` when one is configured (role `ingest` suffices). viewer = read-only, operator = read + mutate, ingest =
 POST /api/v1/ingest, agent = ingest + LLM-key mint/revoke + review posting.
 
+Callers that can send a key (all optional; no key = no header): `collab-spawn.py --api-key-file FILE` (the
+session report needs an ingest-role key, the scheduler calls an operator-role key, so use an operator key on
+the runner host), `herdr-eng fleet drift` (viewer; `--api-key-file` or the host's own agent/ingest key),
+`herdr-eng artifacts upload --api-key-file FILE` (operator: a bare `POST /artifacts` is not an agent route) and
+`herdr-artifact history|share-request --api-key-file FILE` (viewer / operator; the host's cached key is used
+for the host's own control plane). Key files must be mode 0600 or they are refused.
+
 Run the same server standalone from the host:
 
 ```bash

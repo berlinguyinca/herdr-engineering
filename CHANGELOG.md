@@ -8,6 +8,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Ingest callers send the host config's `ingest.api_key`
 - The feed-plugin `emit.js` and the fabric agent (service lease and host telemetry POSTs) now send `X-API-Key` when `ingest.api_key` is configured, and nothing when it is not, so they keep working once `control_plane.api_keys` is enabled. The agent follows key changes through `retarget`. Tests: `deploy/herdr-cp-feed-plugin/emit-send.test.js`, `tests/test_fabric_agent_ingest_key.py`.
 
+### Optional `X-API-Key` for control-plane callers that sent none
+`collab-spawn.py --api-key-file` (ingest report: ingest role; scheduler: operator role), `herdr-eng fleet drift`
+(viewer; `--api-key-file` or this host's agent/ingest key), `herdr-eng artifacts upload --api-key-file` (a bare
+`POST /artifacts` needs the operator role) and the `herdr-artifact` wrapper (`history` viewer, `share-request`
+operator) now send a key once `control_plane.api_keys` is enabled. No key = no header = unchanged open behaviour.
+Key files must be mode 0600 and are refused otherwise; the key is never printed. The duplicate
+`_cmd_art_upload` in the CLI was removed (the two copies were identical).
+
 ### Build-cache report sender (`herdr-eng build-cache-report`, disabled by default)
 - New `herdr-eng build-cache-report [--once|--loop] [--json]` schedules the existing `report_builds` sender. Config is YAML only, `fabric_build_cache.report {enabled: false, url, key_file, interval_s: 60 (10..3600), host_id}`; the ingest-role key is read from `key_file` only (never argv, env or logs). It refuses to run (exit 2) when disabled, when the url is not https (http only for 127.0.0.1/localhost), or when the key file is missing, empty or group/world readable. `--loop` logs one line per attempt and survives an unreachable or refusing control plane.
 - Opt-in service files, enabled by nothing: `scripts/herdr-eng-build-cache-report.service` (systemd user) and `scripts/com.herdr-engineering.build-cache-report.plist` (launchd template). Runbook: `docs/build-cache-deployment.md`. Tests: `tests/test_build_cache_report_cli.py`.
