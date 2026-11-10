@@ -15,14 +15,17 @@ import hmac
 import http.client
 import json
 import logging
+import os
 import queue
 import re
+import stat
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlsplit
 
 log = logging.getLogger("herdr.llm_proxy")
@@ -52,15 +55,41 @@ HOP_HEADERS = {"connection", "keep-alive", "transfer-encoding", "te", "trailer",
                "authorization"}
 
 
+class ControlPlaneKeyError(OSError):
+    """The control-plane key file is missing, empty or readable by group/others. Never carries the key."""
+
+
 class ControlPlaneClient:
-    def __init__(self, base_url: str, timeout: float = 5.0):
+    """Optionally authenticates with ``X-API-Key`` read from ``key_file`` on every call (so a rotated key is picked
+    up). No key file = no header = the open control plane's behaviour."""
+
+    def __init__(self, base_url: str, timeout: float = 5.0, key_file: str | os.PathLike | None = None):
         self.base = base_url.rstrip("/")
         self.timeout = timeout
+        self.key_file = Path(key_file).expanduser() if key_file else None
+
+    def _key(self) -> str | None:
+        if self.key_file is None:
+            return None
+        try:
+            if self.key_file.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                raise ControlPlaneKeyError(f"{self.key_file} must not be readable by group or others")
+            key = self.key_file.read_text(encoding="utf-8").strip()
+        except ControlPlaneKeyError:
+            raise
+        except OSError as exc:
+            raise ControlPlaneKeyError(f"cannot read the control-plane key file: {exc.strerror}") from None
+        if not key:
+            raise ControlPlaneKeyError(f"{self.key_file} is empty")
+        return key
 
     def _call(self, path: str, body: dict | None = None):
+        headers = {"Content-Type": "application/json"}
+        key = self._key()
+        if key:
+            headers["X-API-Key"] = key
         req = urllib.request.Request(
-            self.base + path, data=None if body is None else json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"})
+            self.base + path, data=None if body is None else json.dumps(body).encode(), headers=headers)
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
             return json.loads(resp.read() or b"{}")
 
@@ -723,8 +752,9 @@ def make_handler(state: ProxyState):
 
 
 def serve(host: str, port: int, control_url: str, upstream: str, upstream_key: str, *,
-          max_inflight: int = DEFAULT_MAX_INFLIGHT, wait_seconds: float = DEFAULT_QUEUE_WAIT_SECONDS):
-    state = ProxyState(ControlPlaneClient(control_url), upstream, upstream_key,
+          max_inflight: int = DEFAULT_MAX_INFLIGHT, wait_seconds: float = DEFAULT_QUEUE_WAIT_SECONDS,
+          control_key_file: str | None = None):
+    state = ProxyState(ControlPlaneClient(control_url, key_file=control_key_file), upstream, upstream_key,
                        max_inflight=max_inflight, wait_seconds=wait_seconds)
     state.reports = ReportQueue(state.control)
     state.refresh(force=True)

@@ -62,6 +62,8 @@ _HOST_TERMINAL_OUT = re.compile(r"^/api/v1/host/terminal/[^/]+/output$")
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure)"
+                        # Usage reporters (llm-proxy, llm-gateway-usage): an agent key may report tokens, nothing wider.
+                        r"|token-usage"
                         r"|architecture/(?:snapshots|analyses|analyses/claim)"
                         # CI fix runner: claim, report state, report result. Never create or cancel.
                         r"|ci/fix/claim|ci/fix/[^/]+/(?:state|result))$")
