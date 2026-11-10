@@ -193,7 +193,7 @@ function memory(path, params, ctx) {
   if (!m) return undefined;
   const x = all.find(y => y.memory_id === m[1]);
   if (!x) return undefined;
-  return { ...x, revisions: [{ revision: 1, status: 'candidate', at: x.created_at, text: 'First draft: ' + x.text.slice(0, 60) }, { revision: x.revision, status: x.status, at: x.updated_at, text: x.text }],
+  return { memory: { ...x, revisions: [{ revision: 1, status: 'candidate', at: x.created_at, text: 'First draft: ' + x.text.slice(0, 60) }, { revision: x.revision, status: x.status, at: x.updated_at, text: x.text }] },
     retrieval_history: x.memory_id === 'mem-1' ? { events: [{ at: ctx.ago(1200), harness: 'pi', host: 'bender', query: 'gateway retry', rank: 1 }, { at: ctx.ago(5000), harness: 'claude', host: 'beast', query: 'budget', rank: 2 }] }
       : { state: 'unknown', reason: 'retrieval log not enabled for this bank' } };
 }
