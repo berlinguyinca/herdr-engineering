@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Ingest callers send the host config's `ingest.api_key`
+- The feed-plugin `emit.js` and the fabric agent (service lease and host telemetry POSTs) now send `X-API-Key` when `ingest.api_key` is configured, and nothing when it is not, so they keep working once `control_plane.api_keys` is enabled. The agent follows key changes through `retarget`. Tests: `deploy/herdr-cp-feed-plugin/emit-send.test.js`, `tests/test_fabric_agent_ingest_key.py`.
+
 ### Optional `X-API-Key` for control-plane callers that sent none
 `collab-spawn.py --api-key-file` (ingest report: ingest role; scheduler: operator role), `herdr-eng fleet drift`
 (viewer; `--api-key-file` or this host's agent/ingest key), `herdr-eng artifacts upload --api-key-file` (a bare
