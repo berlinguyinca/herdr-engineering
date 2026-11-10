@@ -170,6 +170,13 @@ def _parse(data: Any) -> FleetConfig:
                 parse_inspector_archive(sec["values"]["inspector_archive"])
             except ValueError as exc:
                 raise FleetConfigError(f"section {name}: {exc}") from None
+        if name == CONTROL_PLANE_SECTION and "dashboard_proxy" in sec["values"]:
+            from herdr_engineering.control_plane.dashboard_proxy import parse_dashboard_proxy
+
+            try:
+                parse_dashboard_proxy(sec["values"]["dashboard_proxy"])
+            except ValueError as exc:
+                raise FleetConfigError(f"section {name}: {exc}") from None
         if name == "github" and sec["values"].get("app") not in (None, {}):
             from herdr_engineering.github_auth import GitHubAuthError, parse_app_config
 

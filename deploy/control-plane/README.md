@@ -165,6 +165,10 @@ leaves `ingest.api_key` / `agent.api_key` empty, so hosts send no `X-API-Key` at
 **Optional RBAC (Spec §104) - not supported for the compose stack yet.** Keyed mode
 (entries in `control_plane.api_keys`, by hand or with `fleet config init
 --with-api-keys`) gates every route except `/api/v1/health` (which then answers only
+status, version and commit without a key) and the host endpoints. The llm-proxy and
+the emit hook do not send keys yet, so turning keys on breaks them until they do. The
+browser dashboard works through the **dashboard proxy** (next section). viewer = read-only, operator = read + mutate, ingest =
+
 status, version and commit without a key) and the host endpoints. The browser
 dashboard and the emit hook do not send keys yet, so turning keys on
 breaks them until they do. The llm-proxy, `llm-gateway-sync` and `llm-gateway-usage` can send
@@ -182,6 +186,37 @@ the runner host), `herdr-eng fleet drift` (viewer; `--api-key-file` or the host'
 `herdr-eng artifacts upload --api-key-file FILE` (operator: a bare `POST /artifacts` is not an agent route) and
 `herdr-artifact history|share-request --api-key-file FILE` (viewer / operator; the host's cached key is used
 for the host's own control plane). Key files must be mode 0600 or they are refused.
+
+### Dashboard proxy (keyed mode, optional)
+
+Browsers cannot put `X-API-Key` on an `EventSource`, and the dashboard sends no key,
+so with `control_plane.api_keys` on the UI and every GET return 401. The optional
+`dashboard-proxy` compose profile runs `herdr-eng control-plane dashboard-proxy`, a
+same-origin reverse proxy for browser traffic that adds the key server-side:
+
+- GET/HEAD (static UI, JSON, SSE streamed unbuffered) use the `viewer` key.
+- A write uses the `operator` key only if `METHOD /path` is in
+  `control_plane.dashboard_proxy.operator_post_allowlist` (default: the dashboard's own
+  write actions; `*` = one path segment, trailing `**` = the rest). Anything else is 403
+  at the proxy. No `operator_key_file` = read-only dashboard.
+- A client-supplied `X-API-Key` / `X-Forwarded-*` is dropped; the browser never sees a key.
+
+```yaml
+control_plane:
+  dashboard_proxy:
+    viewer_key_file: /etc/herdr/dashboard-proxy/viewer.key     # one key per file, mode 0600
+    operator_key_file: /etc/herdr/dashboard-proxy/operator.key
+    upstream: "http://control-plane-web:8080"
+```
+
+Put the two key files in a directory on the host (`HERDR_DASHBOARD_PROXY_KEY_DIR`,
+default `/var/lib/herdr-dashboard-proxy`), owned by the container user, files `0600`;
+the proxy exits 2 if a key file is group/other accessible, missing or empty. The two
+keys must exist in `control_plane.api_keys` with roles `viewer` and `operator`. Start
+it with `docker compose --profile dashboard-proxy up -d dashboard-proxy` and point
+browsers at its port (`HERDR_DASHBOARD_PROXY_PORT`, default 8081) instead of the web
+port. It adds no authentication of its own: keep it on the tailnet bind like the web
+port. With no `dashboard_proxy` block and the profile off, nothing changes.
 
 Run the same server standalone from the host:
 
