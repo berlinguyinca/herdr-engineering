@@ -142,7 +142,7 @@ export function apiAnswer(pathname, method = 'GET') {
  * what only this app needs: the stubbed API, a silent event stream, and no calm/theme state from storage.
  * Returns { ctx, page } like openReal.
  */
-export async function openDashboard(browser, hash, ctxOpts = {}) {
+export async function openDashboard(browser, hash, ctxOpts = {}, log = API_LOG) {
   const origin = await dashboardOrigin();
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, ...ctxOpts });
   const page = await ctx.newPage();
@@ -151,7 +151,7 @@ export async function openDashboard(browser, hash, ctxOpts = {}) {
   await page.route('**/api/v1/**', (route) => {
     const u = new URL(route.request().url());
     const answer = fixtureAnswer(u.pathname, route.request().method(), u.searchParams);
-    API_LOG.add(`${route.request().method()} ${u.pathname} -> ${answer === undefined ? 'MISS' : 'fixture'}`);
+    log.add(`${route.request().method()} ${u.pathname} -> ${answer === undefined ? 'MISS' : 'fixture'}`);
     return answer === undefined ? route.fulfill({ status: 404, json: { error: 'no fixture for ' + u.pathname } }) : route.fulfill({ json: answer });
   });
   await page.addInitScript(() => {
@@ -183,17 +183,18 @@ export const DASHBOARD_SURFACES = [
      hash: '/personal-assistant', proof: '[data-config]', steps: connectorsTab },
 ];
 
-async function connectorsTab(page) {
+export async function connectorsTab(page) {
   await assistantTab('Connectors', 'Apps your assistant can use')(page);
   for (const sel of ['[data-app="gmail"]', '[data-blocked-form]', '[data-draft="r-1"]', '[data-reminder="rem_1"]', '[data-cstatus]']) await page.locator(sel).first().waitFor({ state: 'attached' });
   await page.waitForTimeout(100);
 }
 
-function assistantTab(name, text) {
+export function assistantTab(name, text) {
   return async (page) => {
     await page.locator('[data-config]').click();
     await page.getByRole('tab', { name, exact: true }).click();
-    await page.locator('#pa-panel').getByText(text).first().waitFor();
+    if (text) await page.locator('#pa-panel').getByText(text).first().waitFor();
+    else await page.waitForFunction(() => (document.querySelector('#pa-panel')?.textContent || '').trim().length > 20);   // tabs without a known heading: wait for any content
     // The voice buttons are colour emoji (U+1F3A4, U+1F50A). No bundled font has them, so each host would paint them with its own
     // emoji font (or a box): the one thing in these pages that is not reproducible. They are swapped for ASCII stand-ins here, and
     // kept swapped across redraws; docs/specs/.../test-matrix.md lists this as a known limit of the baselines.

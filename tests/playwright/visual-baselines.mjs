@@ -167,10 +167,12 @@ async function settled(page, quietMs = 500, maxMs = 5000) {
  * Capture one surface at one viewport / colour scheme. Returns { page: Buffer, regions: {name: Buffer} }.
  * `extraCss` is only for the gate's own "teeth" tests: it lets a test inject a defect and prove the compare notices it.
  */
-export async function capture(browser, info, surface, viewport, scheme, { extraCss = '', regions = viewport === 'desktop' } = {}) {
-  const ctxOpts = { viewport: CFG.viewports[viewport], colorScheme: scheme, reducedMotion: 'reduce', deviceScaleFactor: 1, bypassCSP: true };
+export async function capture(browser, info, surface, viewport, scheme, { extraCss = '', regions = viewport === 'desktop', size = null, dpr = 1 } = {}) {
+  // `size` ({width,height}) and `dpr` let capture-matrix.mjs take sizes outside ui-gates.yaml (the Screenwright matrix, the host's own screen)
+  const vp = size || CFG.viewports[viewport];
+  const ctxOpts = { viewport: vp, colorScheme: scheme, reducedMotion: 'reduce', deviceScaleFactor: dpr, bypassCSP: true };
   const dashboard = surface.app === 'dashboard';
-  const { ctx, page } = dashboard ? await openDashboard(browser, surface.hash, ctxOpts) : await openReal(browser, info, 'alice', ctxOpts);
+  const { ctx, page } = dashboard ? await openDashboard(browser, surface.hash, ctxOpts, surface.apiLog) : await openReal(browser, info, 'alice', ctxOpts);
   try {
     if (!dashboard) await page.clock.setFixedTime(new Date(CFG.screenshots.fixed_clock));
     await page.addStyleTag({ content: bundledFontCss() });
@@ -193,7 +195,7 @@ export async function capture(browser, info, surface, viewport, scheme, { extraC
     const full = await page.evaluate(() => Math.max(document.documentElement.scrollHeight, innerHeight));
     if (full > MAX_HEIGHT) throw new Error(`${surface.slug} at ${viewport} is ${full}px tall, above the ${MAX_HEIGHT}px capture cap: the rest would never be compared`);
     const height = full;
-    const out = { page: await page.screenshot({ clip: { x: 0, y: 0, width: CFG.viewports[viewport].width, height }, fullPage: surface.fullPage === true, animations: 'disabled', caret: 'hide' }), regions: {} };
+    const out = { page: await page.screenshot({ clip: { x: 0, y: 0, width: vp.width, height }, fullPage: surface.fullPage === true, animations: 'disabled', caret: 'hide' }), regions: {} };
     if (regions) {
       for (const r of surface.regions || []) {
         // by bounding box, not locator.screenshot(): that waits for the element to be visible, which would make a test that hides
