@@ -162,23 +162,19 @@ beyond the tailnet.
 `fleet config init` keeps this posture: it writes `control_plane.api_keys: {}` and
 leaves `ingest.api_key` / `agent.api_key` empty, so hosts send no `X-API-Key` at all.
 
-**Optional RBAC (Spec §104) - not supported for the compose stack yet.** Keyed mode
-(entries in `control_plane.api_keys`, by hand or with `fleet config init
---with-api-keys`) gates every route except `/api/v1/health` (which then answers only
-status, version and commit without a key) and the host endpoints. The llm-proxy and
-the emit hook do not send keys yet, so turning keys on breaks them until they do. The
-browser dashboard works through the **dashboard proxy** (next section). viewer = read-only, operator = read + mutate, ingest =
-
-status, version and commit without a key) and the host endpoints. The browser
-dashboard and the emit hook do not send keys yet, so turning keys on
-breaks them until they do. The llm-proxy, `llm-gateway-sync` and `llm-gateway-usage` can send
-one: see "Client key for the llm services" below. viewer = read-only, operator = read + mutate, ingest =
-POST /api/v1/ingest, agent = ingest + LLM-key mint/revoke + review posting + `POST /api/v1/token-usage`.
-
-dashboard and the llm-proxy do not send keys yet, so turning keys on breaks them until
-they do. The emit hook and the fabric agent (service leases and host telemetry) send
-`ingest.api_key` as `X-API-Key` when one is configured (role `ingest` suffices). viewer = read-only, operator = read + mutate, ingest =
-POST /api/v1/ingest, agent = ingest + LLM-key mint/revoke + review posting.
+**Optional RBAC (Spec §104).** Keyed mode (entries in `control_plane.api_keys`, by hand or with
+`fleet config init --with-api-keys`) gates every route except `/api/v1/health` (which then answers only
+status, version and commit without a key) and the host-token endpoints (`fleet/config*`). Roles: viewer =
+read-only, operator = read + mutate, ingest = `POST /api/v1/ingest`, `host/summary-reports/*` and
+`host/build-cache/report`, agent = ingest + LLM-key mint/revoke + review posting + `POST /api/v1/token-usage`.
+The emit hook, the snapshot loop, the fabric agent and the mission/ai-sync/service feeds send `ingest.api_key`
+(or `agent.api_key`) as `X-API-Key`; the llm-proxy, `llm-gateway-sync` and `llm-gateway-usage` send a key too (see
+"Client key for the llm services" below). The browser dashboard works through the **dashboard proxy** (next
+section). `build-cache-report` reads its own `fabric_build_cache.report.key_file` from `config.yaml`: put an
+ingest-role key there (mode 0600). `control_plane.single_operator` needs an open listener, so the control plane
+refuses to start with both `single_operator: true` and `api_keys` set. `api_keys` is restart-required, and
+long-running feeds read the key once at start, so restart them after a key change. Pi reads it once per session:
+sessions started earlier keep posting unkeyed (401) until restarted.
 
 Callers that can send a key (all optional; no key = no header): `collab-spawn.py --api-key-file FILE` (the
 session report needs an ingest-role key, the scheduler calls an operator-role key, so use an operator key on
