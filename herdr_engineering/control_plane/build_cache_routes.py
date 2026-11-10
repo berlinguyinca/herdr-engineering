@@ -5,7 +5,7 @@ Config (YAML only, never environment variables)::
     control_plane:
       build_cache:
         enabled: false              # default; when off the routes answer 404 and nothing is constructed
-        ingest: {enabled: false, max_hosts: 64, per_host_builds: 200}   # other hosts' reports (default off)
+        ingest: {enabled: false, max_hosts: 64, per_host_builds: 200, max_reports_per_minute: 30}   # other hosts' reports (default off)
         state_dir: /path            # optional; default is the build-gate state dir of THIS host
         fabric_build_cache: {...}   # optional; the host's ``fabric_build_cache`` section (default: the host config)
 
@@ -72,6 +72,10 @@ class IngestFull(Exception):
     """The reporting-host bound is reached."""
 
 
+class IngestRateLimited(Exception):
+    """A host exceeded ``ingest.max_reports_per_minute``."""
+
+
 def build_cache_config(cfg) -> dict:
     cfg = {} if cfg is None else cfg
     if not isinstance(cfg, dict):
@@ -95,13 +99,14 @@ def _ingest_config(cfg) -> dict:
     cfg = {} if cfg is None else cfg
     if not isinstance(cfg, dict):
         raise ValueError("control_plane.build_cache.ingest must be a mapping")
-    unknown = set(cfg) - {"enabled", "max_hosts", "per_host_builds"}
+    unknown = set(cfg) - {"enabled", "max_hosts", "per_host_builds", "max_reports_per_minute"}
     if unknown:
         raise ValueError(f"control_plane.build_cache.ingest: unknown keys {sorted(unknown)}")
     if cfg.get("enabled", False) not in (True, False):
         raise ValueError("control_plane.build_cache.ingest.enabled must be true or false")
     out = {"enabled": cfg.get("enabled", False) is True}
-    for name, default, hi in (("max_hosts", 64, 1024), ("per_host_builds", 200, 5000)):
+    for name, default, hi in (("max_hosts", 64, 1024), ("per_host_builds", 200, 5000),
+                              ("max_reports_per_minute", 30, 6000)):
         value = cfg.get(name, default)
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= hi:
             raise ValueError(f"control_plane.build_cache.ingest.{name} must be an integer in 1..{hi}")
@@ -160,6 +165,7 @@ class BuildCacheService:
         # host_id -> build_id -> {event: slim record}; in memory only (see ingest()).
         self._remote: dict[str, dict[str, dict[str, dict]]] = {}
         self._remote_ts: dict[str, str] = {}
+        self._report_times: dict[str, deque] = {}            # host_id -> monotonic times of reports in the last 60 s
         self.state_dir = Path(state_dir)
         self.record_event = record_event
         self._now = now
@@ -374,6 +380,19 @@ class BuildCacheService:
             self._subs.discard(q)
 
     # ---------------------------------------------------------------- remote hosts
+    def _rate_check(self, host_id: str) -> None:
+        """Sliding 60 s window per host; every report counts, valid or not."""
+        now = self._now()
+        with self._lock:
+            if host_id not in self._report_times and len(self._report_times) >= max(self.ingest_cfg["max_hosts"] * 4, 256):
+                self._report_times = {h: t for h, t in self._report_times.items() if t and now - t[-1] < 60}
+            times = self._report_times.setdefault(host_id, deque())
+            while times and now - times[0] >= 60:
+                times.popleft()
+            if len(times) >= self.ingest_cfg["max_reports_per_minute"]:
+                raise IngestRateLimited("report rate limit reached")
+            times.append(now)
+
     def ingest(self, host_id: str, body) -> dict:
         """Store another host's ``build-coordinate --record`` summary (spec 09 follow-up; in memory, no migration).
 
@@ -381,6 +400,7 @@ class BuildCacheService:
         forced to the authenticated ``host_id``. Retention: ``per_host_builds`` builds per host, ``max_hosts`` hosts.
         State is lost on restart; hosts re-send their recent window (replays are idempotent).
         """
+        self._rate_check(host_id)
         if not isinstance(body, dict) or set(body) - {"host_id", "builds"}:
             raise ValueError("JSON object with host_id and builds required")
         builds = body.get("builds")
@@ -553,6 +573,8 @@ def _route_report(handler, server) -> bool:
             handler._json({"error": "this API key may not act for that host"}, 403)
             return True
         handler._json(service.ingest(host_id, body))
+    except IngestRateLimited as exc:
+        handler._json({"error": f"{exc}: raise control_plane.build_cache.ingest.max_reports_per_minute"}, 429)
     except IngestFull as exc:
         handler._json({"error": f"{exc}: raise control_plane.build_cache.ingest.max_hosts"}, 429)
     except ValueError as exc:
