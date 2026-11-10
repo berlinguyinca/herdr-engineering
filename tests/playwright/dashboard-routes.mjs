@@ -1,0 +1,73 @@
+// Hand-kept facts about every dashboard route that packages/app.js cannot say itself: the title the page prints, how to instantiate
+// a parameterised route, its sub-views (tabs, filters), the selector that proves it rendered, and whether it renders from fixtures.
+// scripts/gen-dashboard-sitemap.mjs merges this with what it READS from app.js (ROUTES, NAV, SECTION_TABS, the query parameters each
+// view function reads) into docs/dashboard-sitemap.{json,md}; packages/dashboard-sitemap.test.js fails when app.js, this file and
+// the committed sitemap drift apart. Data only (no browser imports): the generator and the unit test both load it.
+//
+// fixture.status: 'fixture' = the harness (visual-dashboard.mjs + dashboard-fixtures.mjs) renders it from deterministic /api/v1 fixtures
+//                 'skipped' = cannot be rendered without the real server; `reason` says why. A skipped route is never counted as a pass.
+// subviews[].via: how the capture reaches the sub-view: a hash (`hash`) or a step name (`step`, run by dashboard-surfaces.mjs).
+// surfaces: the screens the capture matrix takes, one per slug. `hash` is relative to index.html#; `step` names a UI step.
+
+export const ROUTE_NOTES = {
+  '/overview': { title: 'Overview', proof: '#overview-dashboard', surfaces: [{ slug: 'dashboard-overview', hash: '/overview' }] },
+  '/attention': { title: 'Attention', proof: '#attention-root', surfaces: [{ slug: 'dashboard-attention', hash: '/attention' }] },
+  '/activity': { title: 'Activity', proof: '#view', surfaces: [{ slug: 'dashboard-activity', hash: '/activity' }] },
+  '/herd': { title: 'Agents', proof: '#view', subviews: [{ id: 'current', label: 'Current', via: { hash: '/herd' } }, { id: 'unconfirmed', label: 'Unconfirmed', via: { hash: '/herd?tab=unconfirmed' } }, { id: 'failed', label: 'Failed', via: { hash: '/herd?tab=failed' } }, { id: 'finished', label: 'Finished', via: { hash: '/herd?tab=finished' } }],
+    surfaces: [{ slug: 'dashboard-agents', hash: '/herd' }] },
+  '/herd/session/:id': { title: 'Agent session', proof: '.sd-title', params: { id: { example: 's-101', how: 'a session_id from GET /api/v1/sessions' } },
+    subviews: [{ id: 'overview', label: 'Overview', via: { hash: '/herd/session/s-101' } }, { id: 'evolution', label: 'Evolution', via: { hash: '/herd/session/s-101?tab=evolution' } }],
+    surfaces: [{ slug: 'dashboard-agent-session', hash: '/herd/session/s-101' }, { slug: 'dashboard-agent-session-evolution', hash: '/herd/session/s-101?tab=evolution' }] },
+  '/missions': { title: 'Missions', proof: '[data-mission-key]', subviews: [{ id: 'current', label: 'Current', via: { hash: '/missions' } }, { id: 'unconfirmed', label: 'Unconfirmed', via: { hash: '/missions?tab=unconfirmed' } }, { id: 'failed', label: 'Failed', via: { hash: '/missions?tab=failed' } }, { id: 'finished', label: 'Finished', via: { hash: '/missions?tab=finished' } }],
+    surfaces: [{ slug: 'dashboard-missions', hash: '/missions', step: 'missions' }, { slug: 'dashboard-missions-finished', hash: '/missions?tab=finished' }] },
+  '/missions/:id': { title: 'Mission (recorded history)', proof: '#mission-history', params: { id: { example: 'M-301', how: 'a mission_id from GET /api/v1/missions; a pi:<id> key opens the live Pi mission instead (see the next row)' } },
+    surfaces: [{ slug: 'dashboard-mission-detail', hash: '/missions/M-301' }, { slug: 'dashboard-mission-detail-pi', hash: '/missions/pi:M-201' }] },
+  '/missions/:id/tests': { title: 'Mission tests and builds', proof: '#mission-tests', params: { id: { example: 'M-301', how: 'a mission_id from GET /api/v1/missions' } }, surfaces: [{ slug: 'dashboard-mission-tests', hash: '/missions/M-301/tests' }] },
+  '/missions/:id/reviews': { title: 'Mission reviews and PRs', proof: '#mission-reviews', params: { id: { example: 'M-301', how: 'a mission_id from GET /api/v1/missions' } }, surfaces: [{ slug: 'dashboard-mission-reviews', hash: '/missions/M-301/reviews' }] },
+  '/handoffs': { title: 'Handoffs', proof: '#handoffs', surfaces: [{ slug: 'dashboard-handoffs', hash: '/handoffs' }] },
+  '/topology': { title: 'Topology', proof: '#view', subviews: [{ id: 'current', label: 'Current', via: { hash: '/topology' } }, { id: 'history', label: 'History', via: { hash: '/topology?status=history' } }],
+    note: 'No nav or tab entry (the lineage graph replaced it); the route still answers for old links.', surfaces: [{ slug: 'dashboard-topology', hash: '/topology' }] },
+  '/collab': { title: 'Collaboration', proof: '#collab-root', surfaces: [{ slug: 'dashboard-collab', hash: '/collab' }] },
+  '/personal-assistant': { title: 'Personal Assistant', proof: '[data-config]',
+    subviews: ['General', 'Permissions', 'Memory', 'Routines', 'Connectors', 'Delegations', 'Approvals', 'Proposals', 'Notifications', 'Diagnostics'].map((t) => ({ id: t.toLowerCase(), label: t, via: { step: `assistant-tab:${t}` } })),
+    surfaces: [{ slug: 'dashboard-assistant', hash: '/personal-assistant' }, ...['Permissions', 'Memory', 'Routines', 'Delegations', 'Diagnostics'].map((t) => ({ slug: `dashboard-assistant-${t.toLowerCase()}`, hash: '/personal-assistant', step: `assistant-tab:${t}` })),
+      ...['Proposals', 'Notifications', 'Approvals', 'Connectors'].map((t) => ({ slug: `dashboard-assistant-${t.toLowerCase()}`, hash: '/personal-assistant', step: `assistant-tab:${t}` }))] },
+  '/teams': { title: 'Your teams', proof: '#teams', surfaces: [{ slug: 'dashboard-teams', hash: '/teams' }] },
+  '/team-map': { title: 'Team map', proof: '#team-map', query: { root: 'a work-graph root node id' }, surfaces: [{ slug: 'dashboard-team-map', hash: '/team-map' }] },
+  '/hosts': { title: 'Hosts', proof: '#view', subviews: [{ id: 'all', label: 'All hosts', via: { hash: '/hosts' } }, { id: 'drift', label: 'Drifted only', via: { hash: '/hosts?drift=1' } }],
+    surfaces: [{ slug: 'dashboard-hosts', hash: '/hosts' }, { slug: 'dashboard-hosts-drift', hash: '/hosts?drift=1' }] },
+  '/hosts/:id': { title: 'Host', proof: '#view', params: { id: { example: 'beast', how: 'a host_id from GET /api/v1/hosts' } }, subviews: [{ id: '1h', label: '1 hour', via: { hash: '/hosts/beast' } }, { id: '24h', label: '24 hours', via: { hash: '/hosts/beast?range=24h' } }],
+    surfaces: [{ slug: 'dashboard-host-detail', hash: '/hosts/beast' }] },
+  '/scheduling': { title: 'Scheduling', proof: '#scheduler', surfaces: [{ slug: 'dashboard-scheduling', hash: '/scheduling' }] },
+  '/ai-sync': { title: 'AI sync', proof: '#view', surfaces: [{ slug: 'dashboard-ai-sync', hash: '/ai-sync' }] },
+  '/services': { title: 'Services (catalog)', proof: '#view', subviews: [{ id: 'current', label: 'Current', via: { hash: '/services' } }, { id: 'all', label: 'All records', via: { hash: '/services?all=1' } }], surfaces: [{ slug: 'dashboard-services', hash: '/services' }] },
+  '/services/:id': { title: 'Service', proof: '#view', params: { id: { example: 'svc-1', how: 'a service_id from GET /api/v1/services' } }, surfaces: [{ slug: 'dashboard-service-detail', hash: '/services/svc-1' }] },
+  '/fabric-services': { title: 'Services (fabric)', proof: '#view', surfaces: [{ slug: 'dashboard-fabric-services', hash: '/fabric-services' }] },
+  '/local-services': { title: 'Services (local)', proof: '#view', surfaces: [{ slug: 'dashboard-local-services', hash: '/local-services' }] },
+  '/system-services': { title: 'Services (system)', proof: '#view', surfaces: [{ slug: 'dashboard-system-services', hash: '/system-services' }] },
+  '/diagnostics': { title: 'Diagnostics', proof: '#view', surfaces: [{ slug: 'dashboard-diagnostics', hash: '/diagnostics' }] },
+  '/llm': { title: 'Usage (LLM)', proof: '#view', query: { window: '1h|6h|24h|7d|30d', project: 'filter', model: 'filter', mission: 'filter' }, surfaces: [{ slug: 'dashboard-llm', hash: '/llm' }] },
+  '/llm/session/:id': { title: 'Usage: one session', proof: '#view', params: { id: { example: 's-101', how: 'a session_id from GET /api/v1/sessions' } }, surfaces: [{ slug: 'dashboard-llm-session', hash: '/llm/session/s-101' }] },
+  '/analytics': { title: 'Analytics', proof: '#view', surfaces: [{ slug: 'dashboard-analytics', hash: '/analytics' }] },
+  '/analytics/missions': { title: 'Analytics: missions', proof: '#view', surfaces: [{ slug: 'dashboard-analytics-missions', hash: '/analytics/missions' }] },
+  '/analytics/models': { title: 'Analytics: models', proof: '#view', surfaces: [{ slug: 'dashboard-analytics-models', hash: '/analytics/models' }] },
+  '/analytics/hosts': { title: 'Analytics: hosts', proof: '#view', surfaces: [{ slug: 'dashboard-analytics-hosts', hash: '/analytics/hosts' }] },
+  '/analytics/tokens': { title: 'Analytics: tokens', proof: '#view', surfaces: [{ slug: 'dashboard-analytics-tokens', hash: '/analytics/tokens' }] },
+  '/analytics/stages': { title: 'Analytics: stages', proof: '#view', surfaces: [{ slug: 'dashboard-analytics-stages', hash: '/analytics/stages' }] },
+  '/analytics/usage': { title: 'Analytics: usage', proof: '#view', surfaces: [{ slug: 'dashboard-analytics-usage', hash: '/analytics/usage' }] },
+  '/ci': { title: 'CI', proof: '#view', query: { tab: 'current|unconfirmed|failed|finished', search: 'text', workspace: 'filter', repository: 'filter', provider: 'filter', mission: 'filter', session: 'filter' }, surfaces: [{ slug: 'dashboard-ci', hash: '/ci' }] },
+  '/deployments': { title: 'Deployments', proof: '#deployments', surfaces: [{ slug: 'dashboard-deployments', hash: '/deployments' }] },
+  '/reviews': { title: 'Plan reviews', proof: '#view', surfaces: [{ slug: 'dashboard-reviews', hash: '/reviews' }] },
+  '/review-gate': { title: 'Review gate', proof: '#view', surfaces: [{ slug: 'dashboard-review-gate', hash: '/review-gate' }] },
+  '/github': { title: 'Issues', proof: '#view', surfaces: [{ slug: 'dashboard-github', hash: '/github' }] },
+  '/github/projects': { title: 'Boards', proof: '#view', subviews: [{ id: 'board', label: 'Board layout', via: { hash: '/github/projects' } }, { id: 'table', label: 'Table layout', via: { hash: '/github/projects?layout=table' } }],
+    surfaces: [{ slug: 'dashboard-github-projects', hash: '/github/projects' }] },
+  '/pr/:owner/:repo/:number': { title: 'How this pull request got here', proof: '#pr-trail', params: { owner: { example: 'org', how: 'repository owner' }, repo: { example: 'repo', how: 'repository name' }, number: { example: '7', how: 'pull request number' } },
+    surfaces: [{ slug: 'dashboard-pr-trail', hash: '/pr/org/repo/7' }] },
+  '/architecture': { title: 'Architecture', proof: '#architecture-root', query: { snapshot: 'snapshot id', parent: 'node id', q: 'search' }, surfaces: [{ slug: 'dashboard-architecture', hash: '/architecture' }] },
+  '/artifacts': { title: 'Artifacts', proof: '#artifact-registry', surfaces: [{ slug: 'dashboard-artifacts', hash: '/artifacts' }] },
+  '/artifacts/:id': { title: 'Artifact', proof: '#artifact-detail', params: { id: { example: 'art-1', how: 'an artifact_id from GET /api/v1/artifacts' } }, query: { version: 'a version id' }, surfaces: [{ slug: 'dashboard-artifact-detail', hash: '/artifacts/art-1' }] },
+  '/publications': { title: 'Publications', proof: '#publication-registry', surfaces: [{ slug: 'dashboard-publications', hash: '/publications' }] },
+  '/memory': { title: 'Memory', proof: '#memory', surfaces: [{ slug: 'dashboard-memory', hash: '/memory' }] },
+  '/intelligence': { title: 'Project intelligence', proof: '#project-intelligence', surfaces: [{ slug: 'dashboard-intelligence', hash: '/intelligence' }] },
+};

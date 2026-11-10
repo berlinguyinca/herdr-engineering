@@ -1,0 +1,1861 @@
+{
+  "generatedFrom": "packages/app.js + tests/playwright/dashboard-routes.mjs",
+  "routeCount": 47,
+  "surfaceCount": 60,
+  "navGroups": [
+    "Monitor",
+    "Agents",
+    "Fabric",
+    "Delivery",
+    "Code"
+  ],
+  "routes": [
+    {
+      "route": "/overview",
+      "hash": "#/overview",
+      "title": "Overview",
+      "view": "viewOverview",
+      "nav": {
+        "group": "Monitor",
+        "label": "Overview",
+        "entry": "/overview",
+        "listedInSidebar": true,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#overview-dashboard",
+      "surfaces": [
+        {
+          "slug": "dashboard-overview",
+          "hash": "/overview"
+        }
+      ]
+    },
+    {
+      "route": "/attention",
+      "hash": "#/attention",
+      "title": "Attention",
+      "view": "viewAttention",
+      "nav": {
+        "group": "Monitor",
+        "label": "Attention",
+        "entry": "/attention",
+        "listedInSidebar": true,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Attention",
+        "siblings": [
+          "/attention",
+          "/activity"
+        ]
+      },
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#attention-root",
+      "surfaces": [
+        {
+          "slug": "dashboard-attention",
+          "hash": "/attention"
+        }
+      ]
+    },
+    {
+      "route": "/github/projects",
+      "hash": "#/github/projects",
+      "title": "Boards",
+      "view": "viewGithubProjects",
+      "nav": {
+        "group": "Delivery",
+        "label": "Projects",
+        "entry": "/github",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Boards",
+        "siblings": [
+          "/github",
+          "/github/projects"
+        ]
+      },
+      "params": {},
+      "query": {
+        "layout": "sub-view selector (see subviews)",
+        "project": "sub-view selector (see subviews)"
+      },
+      "subviews": [
+        {
+          "id": "board",
+          "label": "Board layout",
+          "via": {
+            "hash": "/github/projects"
+          }
+        },
+        {
+          "id": "table",
+          "label": "Table layout",
+          "via": {
+            "hash": "/github/projects?layout=table"
+          }
+        }
+      ],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-github-projects",
+          "hash": "/github/projects"
+        }
+      ]
+    },
+    {
+      "route": "/github",
+      "hash": "#/github",
+      "title": "Issues",
+      "view": "viewGithub",
+      "nav": {
+        "group": "Delivery",
+        "label": "Projects",
+        "entry": "/github",
+        "listedInSidebar": true,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Issues",
+        "siblings": [
+          "/github",
+          "/github/projects"
+        ]
+      },
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-github",
+          "hash": "/github"
+        }
+      ]
+    },
+    {
+      "route": "/collab",
+      "hash": "#/collab",
+      "title": "Collaboration",
+      "view": "viewCollab",
+      "nav": {
+        "group": "Agents",
+        "label": "Collaboration",
+        "entry": "/collab",
+        "listedInSidebar": true,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#collab-root",
+      "surfaces": [
+        {
+          "slug": "dashboard-collab",
+          "hash": "/collab"
+        }
+      ]
+    },
+    {
+      "route": "/ci",
+      "hash": "#/ci",
+      "title": "CI",
+      "view": "viewIntegrations",
+      "nav": {
+        "group": "Delivery",
+        "label": "CI",
+        "entry": "/ci",
+        "listedInSidebar": true,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "CI",
+        "siblings": [
+          "/ci",
+          "/deployments"
+        ]
+      },
+      "params": {},
+      "query": {
+        "mission": "filter",
+        "provider": "filter",
+        "repository": "filter",
+        "search": "text",
+        "session": "filter",
+        "tab": "current|unconfirmed|failed|finished",
+        "workspace": "filter"
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-ci",
+          "hash": "/ci"
+        }
+      ]
+    },
+    {
+      "route": "/deployments",
+      "hash": "#/deployments",
+      "title": "Deployments",
+      "view": "viewDeployments",
+      "nav": {
+        "group": "Delivery",
+        "label": "CI",
+        "entry": "/ci",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Deployments",
+        "siblings": [
+          "/ci",
+          "/deployments"
+        ]
+      },
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#deployments",
+      "surfaces": [
+        {
+          "slug": "dashboard-deployments",
+          "hash": "/deployments"
+        }
+      ]
+    },
+    {
+      "route": "/reviews",
+      "hash": "#/reviews",
+      "title": "Plan reviews",
+      "view": "viewIntegrations",
+      "nav": {
+        "group": "Delivery",
+        "label": "Reviews",
+        "entry": "/reviews",
+        "listedInSidebar": true,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Plan reviews",
+        "siblings": [
+          "/reviews",
+          "/review-gate"
+        ]
+      },
+      "params": {},
+      "query": {
+        "mission": "",
+        "provider": "",
+        "repository": "",
+        "search": "",
+        "session": "",
+        "tab": "",
+        "workspace": ""
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-reviews",
+          "hash": "/reviews"
+        }
+      ]
+    },
+    {
+      "route": "/review-gate",
+      "hash": "#/review-gate",
+      "title": "Review gate",
+      "view": "viewReviewGate",
+      "nav": {
+        "group": "Delivery",
+        "label": "Reviews",
+        "entry": "/reviews",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Review gate",
+        "siblings": [
+          "/reviews",
+          "/review-gate"
+        ]
+      },
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-review-gate",
+          "hash": "/review-gate"
+        }
+      ]
+    },
+    {
+      "route": "/topology",
+      "hash": "#/topology",
+      "title": "Topology",
+      "view": "viewTopology",
+      "nav": {
+        "group": "Agents",
+        "label": "Agents",
+        "entry": "/herd",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {
+        "status": "sub-view selector (see subviews)"
+      },
+      "subviews": [
+        {
+          "id": "current",
+          "label": "Current",
+          "via": {
+            "hash": "/topology"
+          }
+        },
+        {
+          "id": "history",
+          "label": "History",
+          "via": {
+            "hash": "/topology?status=history"
+          }
+        }
+      ],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-topology",
+          "hash": "/topology"
+        }
+      ],
+      "note": "No nav or tab entry (the lineage graph replaced it); the route still answers for old links."
+    },
+    {
+      "route": "/architecture",
+      "hash": "#/architecture",
+      "title": "Architecture",
+      "view": "viewArchitecture",
+      "nav": {
+        "group": "Code",
+        "label": "Architecture",
+        "entry": "/architecture",
+        "listedInSidebar": true,
+        "capability": "architecture_v1"
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {
+        "parent": "node id",
+        "q": "search",
+        "snapshot": "snapshot id"
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#architecture-root",
+      "surfaces": [
+        {
+          "slug": "dashboard-architecture",
+          "hash": "/architecture"
+        }
+      ]
+    },
+    {
+      "route": "/missions",
+      "hash": "#/missions",
+      "title": "Missions",
+      "view": "viewMissions",
+      "nav": {
+        "group": "Agents",
+        "label": "Agents",
+        "entry": "/herd",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Missions",
+        "siblings": [
+          "/herd",
+          "/missions",
+          "/handoffs"
+        ]
+      },
+      "params": {},
+      "query": {
+        "status": "sub-view selector (see subviews)",
+        "tab": "sub-view selector (see subviews)"
+      },
+      "subviews": [
+        {
+          "id": "current",
+          "label": "Current",
+          "via": {
+            "hash": "/missions"
+          }
+        },
+        {
+          "id": "unconfirmed",
+          "label": "Unconfirmed",
+          "via": {
+            "hash": "/missions?tab=unconfirmed"
+          }
+        },
+        {
+          "id": "failed",
+          "label": "Failed",
+          "via": {
+            "hash": "/missions?tab=failed"
+          }
+        },
+        {
+          "id": "finished",
+          "label": "Finished",
+          "via": {
+            "hash": "/missions?tab=finished"
+          }
+        }
+      ],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "[data-mission-key]",
+      "surfaces": [
+        {
+          "slug": "dashboard-missions",
+          "hash": "/missions",
+          "step": "missions"
+        },
+        {
+          "slug": "dashboard-missions-finished",
+          "hash": "/missions?tab=finished"
+        }
+      ]
+    },
+    {
+      "route": "/missions/:id",
+      "hash": "#/missions/M-301",
+      "title": "Mission (recorded history)",
+      "view": "viewMission",
+      "nav": {
+        "group": "Agents",
+        "label": "Agents",
+        "entry": "/herd",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {
+        "id": {
+          "example": "M-301",
+          "how": "a mission_id from GET /api/v1/missions; a pi:<id> key opens the live Pi mission instead (see the next row)"
+        }
+      },
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#mission-history",
+      "surfaces": [
+        {
+          "slug": "dashboard-mission-detail",
+          "hash": "/missions/M-301"
+        },
+        {
+          "slug": "dashboard-mission-detail-pi",
+          "hash": "/missions/pi:M-201"
+        }
+      ]
+    },
+    {
+      "route": "/missions/:id/tests",
+      "hash": "#/missions/M-301/tests",
+      "title": "Mission tests and builds",
+      "view": "viewMissionTests",
+      "nav": {
+        "group": "Agents",
+        "label": "Agents",
+        "entry": "/herd",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {
+        "id": {
+          "example": "M-301",
+          "how": "a mission_id from GET /api/v1/missions"
+        }
+      },
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#mission-tests",
+      "surfaces": [
+        {
+          "slug": "dashboard-mission-tests",
+          "hash": "/missions/M-301/tests"
+        }
+      ]
+    },
+    {
+      "route": "/missions/:id/reviews",
+      "hash": "#/missions/M-301/reviews",
+      "title": "Mission reviews and PRs",
+      "view": "viewMissionReviews",
+      "nav": {
+        "group": "Agents",
+        "label": "Agents",
+        "entry": "/herd",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {
+        "id": {
+          "example": "M-301",
+          "how": "a mission_id from GET /api/v1/missions"
+        }
+      },
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#mission-reviews",
+      "surfaces": [
+        {
+          "slug": "dashboard-mission-reviews",
+          "hash": "/missions/M-301/reviews"
+        }
+      ]
+    },
+    {
+      "route": "/herd",
+      "hash": "#/herd",
+      "title": "Agents",
+      "view": "viewSessions",
+      "nav": {
+        "group": "Agents",
+        "label": "Agents",
+        "entry": "/herd",
+        "listedInSidebar": true,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Agents",
+        "siblings": [
+          "/herd",
+          "/missions",
+          "/handoffs"
+        ]
+      },
+      "params": {},
+      "query": {
+        "tab": "sub-view selector (see subviews)"
+      },
+      "subviews": [
+        {
+          "id": "current",
+          "label": "Current",
+          "via": {
+            "hash": "/herd"
+          }
+        },
+        {
+          "id": "unconfirmed",
+          "label": "Unconfirmed",
+          "via": {
+            "hash": "/herd?tab=unconfirmed"
+          }
+        },
+        {
+          "id": "failed",
+          "label": "Failed",
+          "via": {
+            "hash": "/herd?tab=failed"
+          }
+        },
+        {
+          "id": "finished",
+          "label": "Finished",
+          "via": {
+            "hash": "/herd?tab=finished"
+          }
+        }
+      ],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-agents",
+          "hash": "/herd"
+        }
+      ]
+    },
+    {
+      "route": "/herd/session/:id",
+      "hash": "#/herd/session/s-101",
+      "title": "Agent session",
+      "view": "viewSession",
+      "nav": {
+        "group": "Agents",
+        "label": "Agents",
+        "entry": "/herd",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {
+        "id": {
+          "example": "s-101",
+          "how": "a session_id from GET /api/v1/sessions"
+        }
+      },
+      "query": {
+        "tab": "sub-view selector (see subviews)"
+      },
+      "subviews": [
+        {
+          "id": "overview",
+          "label": "Overview",
+          "via": {
+            "hash": "/herd/session/s-101"
+          }
+        },
+        {
+          "id": "evolution",
+          "label": "Evolution",
+          "via": {
+            "hash": "/herd/session/s-101?tab=evolution"
+          }
+        }
+      ],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": ".sd-title",
+      "surfaces": [
+        {
+          "slug": "dashboard-agent-session",
+          "hash": "/herd/session/s-101"
+        },
+        {
+          "slug": "dashboard-agent-session-evolution",
+          "hash": "/herd/session/s-101?tab=evolution"
+        }
+      ]
+    },
+    {
+      "route": "/services",
+      "hash": "#/services",
+      "title": "Services (catalog)",
+      "view": "viewServices",
+      "nav": {
+        "group": "Fabric",
+        "label": "Services",
+        "entry": "/services",
+        "listedInSidebar": true,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Catalog",
+        "siblings": [
+          "/services",
+          "/fabric-services",
+          "/local-services",
+          "/system-services"
+        ]
+      },
+      "params": {},
+      "query": {
+        "all": "sub-view selector (see subviews)",
+        "status": "sub-view selector (see subviews)"
+      },
+      "subviews": [
+        {
+          "id": "current",
+          "label": "Current",
+          "via": {
+            "hash": "/services"
+          }
+        },
+        {
+          "id": "all",
+          "label": "All records",
+          "via": {
+            "hash": "/services?all=1"
+          }
+        }
+      ],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-services",
+          "hash": "/services"
+        }
+      ]
+    },
+    {
+      "route": "/system-services",
+      "hash": "#/system-services",
+      "title": "Services (system)",
+      "view": "viewServices",
+      "nav": {
+        "group": "Fabric",
+        "label": "Services",
+        "entry": "/services",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "System",
+        "siblings": [
+          "/services",
+          "/fabric-services",
+          "/local-services",
+          "/system-services"
+        ]
+      },
+      "params": {},
+      "query": {
+        "all": "",
+        "status": ""
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-system-services",
+          "hash": "/system-services"
+        }
+      ]
+    },
+    {
+      "route": "/local-services",
+      "hash": "#/local-services",
+      "title": "Services (local)",
+      "view": "viewServices",
+      "nav": {
+        "group": "Fabric",
+        "label": "Services",
+        "entry": "/services",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Local",
+        "siblings": [
+          "/services",
+          "/fabric-services",
+          "/local-services",
+          "/system-services"
+        ]
+      },
+      "params": {},
+      "query": {
+        "all": "",
+        "status": ""
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-local-services",
+          "hash": "/local-services"
+        }
+      ]
+    },
+    {
+      "route": "/fabric-services",
+      "hash": "#/fabric-services",
+      "title": "Services (fabric)",
+      "view": "viewFabricServices",
+      "nav": {
+        "group": "Fabric",
+        "label": "Services",
+        "entry": "/services",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Fabric",
+        "siblings": [
+          "/services",
+          "/fabric-services",
+          "/local-services",
+          "/system-services"
+        ]
+      },
+      "params": {},
+      "query": {
+        "search": ""
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-fabric-services",
+          "hash": "/fabric-services"
+        }
+      ]
+    },
+    {
+      "route": "/ai-sync",
+      "hash": "#/ai-sync",
+      "title": "AI sync",
+      "view": "viewAiSync",
+      "nav": {
+        "group": "Fabric",
+        "label": "Hosts",
+        "entry": "/hosts",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "AI sync",
+        "siblings": [
+          "/hosts",
+          "/scheduling",
+          "/ai-sync"
+        ]
+      },
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-ai-sync",
+          "hash": "/ai-sync"
+        }
+      ]
+    },
+    {
+      "route": "/pr/:owner/:repo/:number",
+      "hash": "#/pr/org/repo/7",
+      "title": "How this pull request got here",
+      "view": "viewPrTrail",
+      "nav": {
+        "group": "Delivery",
+        "label": "Projects",
+        "entry": "/github",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {
+        "owner": {
+          "example": "org",
+          "how": "repository owner"
+        },
+        "repo": {
+          "example": "repo",
+          "how": "repository name"
+        },
+        "number": {
+          "example": "7",
+          "how": "pull request number"
+        }
+      },
+      "query": {
+        "host": ""
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#pr-trail",
+      "surfaces": [
+        {
+          "slug": "dashboard-pr-trail",
+          "hash": "/pr/org/repo/7"
+        }
+      ]
+    },
+    {
+      "route": "/teams",
+      "hash": "#/teams",
+      "title": "Your teams",
+      "view": "viewTeams",
+      "nav": {
+        "group": "Agents",
+        "label": "Your teams",
+        "entry": "/teams",
+        "listedInSidebar": true,
+        "capability": "unified_workspace_v1"
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#teams",
+      "surfaces": [
+        {
+          "slug": "dashboard-teams",
+          "hash": "/teams"
+        }
+      ]
+    },
+    {
+      "route": "/team-map",
+      "hash": "#/team-map",
+      "title": "Team map",
+      "view": "viewTeamMap",
+      "nav": {
+        "group": "Agents",
+        "label": "Team map",
+        "entry": "/team-map",
+        "listedInSidebar": true,
+        "capability": "unified_workspace_v1"
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {
+        "root": "a work-graph root node id"
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#team-map",
+      "surfaces": [
+        {
+          "slug": "dashboard-team-map",
+          "hash": "/team-map"
+        }
+      ]
+    },
+    {
+      "route": "/services/:id",
+      "hash": "#/services/svc-1",
+      "title": "Service",
+      "view": "viewService",
+      "nav": {
+        "group": "Fabric",
+        "label": "Services",
+        "entry": "/services",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {
+        "id": {
+          "example": "svc-1",
+          "how": "a service_id from GET /api/v1/services"
+        }
+      },
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-service-detail",
+          "hash": "/services/svc-1"
+        }
+      ]
+    },
+    {
+      "route": "/hosts",
+      "hash": "#/hosts",
+      "title": "Hosts",
+      "view": "viewHosts",
+      "nav": {
+        "group": "Fabric",
+        "label": "Hosts",
+        "entry": "/hosts",
+        "listedInSidebar": true,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Hosts",
+        "siblings": [
+          "/hosts",
+          "/scheduling",
+          "/ai-sync"
+        ]
+      },
+      "params": {},
+      "query": {
+        "drift": "sub-view selector (see subviews)"
+      },
+      "subviews": [
+        {
+          "id": "all",
+          "label": "All hosts",
+          "via": {
+            "hash": "/hosts"
+          }
+        },
+        {
+          "id": "drift",
+          "label": "Drifted only",
+          "via": {
+            "hash": "/hosts?drift=1"
+          }
+        }
+      ],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-hosts",
+          "hash": "/hosts"
+        },
+        {
+          "slug": "dashboard-hosts-drift",
+          "hash": "/hosts?drift=1"
+        }
+      ]
+    },
+    {
+      "route": "/diagnostics",
+      "hash": "#/diagnostics",
+      "title": "Diagnostics",
+      "view": "viewDiagnostics",
+      "nav": {
+        "group": "Fabric",
+        "label": "Diagnostics",
+        "entry": "/diagnostics",
+        "listedInSidebar": true,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-diagnostics",
+          "hash": "/diagnostics"
+        }
+      ]
+    },
+    {
+      "route": "/personal-assistant",
+      "hash": "#/personal-assistant",
+      "title": "Personal Assistant",
+      "view": "viewPersonalAssistant",
+      "nav": {
+        "group": "Agents",
+        "label": "Assistant",
+        "entry": "/personal-assistant",
+        "listedInSidebar": true,
+        "capability": "assistant_v1"
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [
+        {
+          "id": "general",
+          "label": "General",
+          "via": {
+            "step": "assistant-tab:General"
+          }
+        },
+        {
+          "id": "permissions",
+          "label": "Permissions",
+          "via": {
+            "step": "assistant-tab:Permissions"
+          }
+        },
+        {
+          "id": "memory",
+          "label": "Memory",
+          "via": {
+            "step": "assistant-tab:Memory"
+          }
+        },
+        {
+          "id": "routines",
+          "label": "Routines",
+          "via": {
+            "step": "assistant-tab:Routines"
+          }
+        },
+        {
+          "id": "connectors",
+          "label": "Connectors",
+          "via": {
+            "step": "assistant-tab:Connectors"
+          }
+        },
+        {
+          "id": "delegations",
+          "label": "Delegations",
+          "via": {
+            "step": "assistant-tab:Delegations"
+          }
+        },
+        {
+          "id": "approvals",
+          "label": "Approvals",
+          "via": {
+            "step": "assistant-tab:Approvals"
+          }
+        },
+        {
+          "id": "proposals",
+          "label": "Proposals",
+          "via": {
+            "step": "assistant-tab:Proposals"
+          }
+        },
+        {
+          "id": "notifications",
+          "label": "Notifications",
+          "via": {
+            "step": "assistant-tab:Notifications"
+          }
+        },
+        {
+          "id": "diagnostics",
+          "label": "Diagnostics",
+          "via": {
+            "step": "assistant-tab:Diagnostics"
+          }
+        }
+      ],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "[data-config]",
+      "surfaces": [
+        {
+          "slug": "dashboard-assistant",
+          "hash": "/personal-assistant"
+        },
+        {
+          "slug": "dashboard-assistant-permissions",
+          "hash": "/personal-assistant",
+          "step": "assistant-tab:Permissions"
+        },
+        {
+          "slug": "dashboard-assistant-memory",
+          "hash": "/personal-assistant",
+          "step": "assistant-tab:Memory"
+        },
+        {
+          "slug": "dashboard-assistant-routines",
+          "hash": "/personal-assistant",
+          "step": "assistant-tab:Routines"
+        },
+        {
+          "slug": "dashboard-assistant-delegations",
+          "hash": "/personal-assistant",
+          "step": "assistant-tab:Delegations"
+        },
+        {
+          "slug": "dashboard-assistant-diagnostics",
+          "hash": "/personal-assistant",
+          "step": "assistant-tab:Diagnostics"
+        },
+        {
+          "slug": "dashboard-assistant-proposals",
+          "hash": "/personal-assistant",
+          "step": "assistant-tab:Proposals"
+        },
+        {
+          "slug": "dashboard-assistant-notifications",
+          "hash": "/personal-assistant",
+          "step": "assistant-tab:Notifications"
+        },
+        {
+          "slug": "dashboard-assistant-approvals",
+          "hash": "/personal-assistant",
+          "step": "assistant-tab:Approvals"
+        },
+        {
+          "slug": "dashboard-assistant-connectors",
+          "hash": "/personal-assistant",
+          "step": "assistant-tab:Connectors"
+        }
+      ]
+    },
+    {
+      "route": "/intelligence",
+      "hash": "#/intelligence",
+      "title": "Project intelligence",
+      "view": "viewIntelligence",
+      "nav": {
+        "group": "Code",
+        "label": "Project intelligence",
+        "entry": "/intelligence",
+        "listedInSidebar": true,
+        "capability": "project_intelligence_v1"
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#project-intelligence",
+      "surfaces": [
+        {
+          "slug": "dashboard-intelligence",
+          "hash": "/intelligence"
+        }
+      ]
+    },
+    {
+      "route": "/hosts/:id",
+      "hash": "#/hosts/beast",
+      "title": "Host",
+      "view": "viewHost",
+      "nav": {
+        "group": "Fabric",
+        "label": "Hosts",
+        "entry": "/hosts",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {
+        "id": {
+          "example": "beast",
+          "how": "a host_id from GET /api/v1/hosts"
+        }
+      },
+      "query": {
+        "range": "sub-view selector (see subviews)"
+      },
+      "subviews": [
+        {
+          "id": "1h",
+          "label": "1 hour",
+          "via": {
+            "hash": "/hosts/beast"
+          }
+        },
+        {
+          "id": "24h",
+          "label": "24 hours",
+          "via": {
+            "hash": "/hosts/beast?range=24h"
+          }
+        }
+      ],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-host-detail",
+          "hash": "/hosts/beast"
+        }
+      ]
+    },
+    {
+      "route": "/activity",
+      "hash": "#/activity",
+      "title": "Activity",
+      "view": "viewActivity",
+      "nav": {
+        "group": "Monitor",
+        "label": "Attention",
+        "entry": "/attention",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Activity",
+        "siblings": [
+          "/attention",
+          "/activity"
+        ]
+      },
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-activity",
+          "hash": "/activity"
+        }
+      ]
+    },
+    {
+      "route": "/analytics",
+      "hash": "#/analytics",
+      "title": "Analytics",
+      "view": "viewAnalytics",
+      "nav": {
+        "group": "Fabric",
+        "label": "Usage",
+        "entry": "/llm",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-analytics",
+          "hash": "/analytics"
+        }
+      ]
+    },
+    {
+      "route": "/analytics/missions",
+      "hash": "#/analytics/missions",
+      "title": "Analytics: missions",
+      "view": "viewAnalytics",
+      "nav": {
+        "group": "Fabric",
+        "label": "Usage",
+        "entry": "/llm",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-analytics-missions",
+          "hash": "/analytics/missions"
+        }
+      ]
+    },
+    {
+      "route": "/analytics/models",
+      "hash": "#/analytics/models",
+      "title": "Analytics: models",
+      "view": "viewAnalytics",
+      "nav": {
+        "group": "Fabric",
+        "label": "Usage",
+        "entry": "/llm",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-analytics-models",
+          "hash": "/analytics/models"
+        }
+      ]
+    },
+    {
+      "route": "/analytics/hosts",
+      "hash": "#/analytics/hosts",
+      "title": "Analytics: hosts",
+      "view": "viewAnalytics",
+      "nav": {
+        "group": "Fabric",
+        "label": "Usage",
+        "entry": "/llm",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-analytics-hosts",
+          "hash": "/analytics/hosts"
+        }
+      ]
+    },
+    {
+      "route": "/analytics/tokens",
+      "hash": "#/analytics/tokens",
+      "title": "Analytics: tokens",
+      "view": "viewAnalytics",
+      "nav": {
+        "group": "Fabric",
+        "label": "Usage",
+        "entry": "/llm",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-analytics-tokens",
+          "hash": "/analytics/tokens"
+        }
+      ]
+    },
+    {
+      "route": "/analytics/stages",
+      "hash": "#/analytics/stages",
+      "title": "Analytics: stages",
+      "view": "viewAnalytics",
+      "nav": {
+        "group": "Fabric",
+        "label": "Usage",
+        "entry": "/llm",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-analytics-stages",
+          "hash": "/analytics/stages"
+        }
+      ]
+    },
+    {
+      "route": "/analytics/usage",
+      "hash": "#/analytics/usage",
+      "title": "Analytics: usage",
+      "view": "viewAnalytics",
+      "nav": {
+        "group": "Fabric",
+        "label": "Usage",
+        "entry": "/llm",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-analytics-usage",
+          "hash": "/analytics/usage"
+        }
+      ]
+    },
+    {
+      "route": "/llm",
+      "hash": "#/llm",
+      "title": "Usage (LLM)",
+      "view": "viewLlm",
+      "nav": {
+        "group": "Fabric",
+        "label": "Usage",
+        "entry": "/llm",
+        "listedInSidebar": true,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {
+        "mission": "filter",
+        "model": "filter",
+        "project": "filter",
+        "window": "1h|6h|24h|7d|30d"
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-llm",
+          "hash": "/llm"
+        }
+      ]
+    },
+    {
+      "route": "/llm/session/:id",
+      "hash": "#/llm/session/s-101",
+      "title": "Usage: one session",
+      "view": "viewLlmSession",
+      "nav": {
+        "group": "Fabric",
+        "label": "Usage",
+        "entry": "/llm",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {
+        "id": {
+          "example": "s-101",
+          "how": "a session_id from GET /api/v1/sessions"
+        }
+      },
+      "query": {
+        "window": ""
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#view",
+      "surfaces": [
+        {
+          "slug": "dashboard-llm-session",
+          "hash": "/llm/session/s-101"
+        }
+      ]
+    },
+    {
+      "route": "/artifacts",
+      "hash": "#/artifacts",
+      "title": "Artifacts",
+      "view": "viewArtifacts",
+      "nav": {
+        "group": "Code",
+        "label": "Artifacts",
+        "entry": "/artifacts",
+        "listedInSidebar": true,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Artifacts",
+        "siblings": [
+          "/artifacts",
+          "/publications"
+        ]
+      },
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#artifact-registry",
+      "surfaces": [
+        {
+          "slug": "dashboard-artifacts",
+          "hash": "/artifacts"
+        }
+      ]
+    },
+    {
+      "route": "/artifacts/:id",
+      "hash": "#/artifacts/art-1",
+      "title": "Artifact",
+      "view": "viewArtifact",
+      "nav": {
+        "group": "Code",
+        "label": "Artifacts",
+        "entry": "/artifacts",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {
+        "id": {
+          "example": "art-1",
+          "how": "an artifact_id from GET /api/v1/artifacts"
+        }
+      },
+      "query": {
+        "version": "a version id"
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#artifact-detail",
+      "surfaces": [
+        {
+          "slug": "dashboard-artifact-detail",
+          "hash": "/artifacts/art-1"
+        }
+      ]
+    },
+    {
+      "route": "/publications",
+      "hash": "#/publications",
+      "title": "Publications",
+      "view": "viewPublications",
+      "nav": {
+        "group": "Code",
+        "label": "Artifacts",
+        "entry": "/artifacts",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Publications",
+        "siblings": [
+          "/artifacts",
+          "/publications"
+        ]
+      },
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#publication-registry",
+      "surfaces": [
+        {
+          "slug": "dashboard-publications",
+          "hash": "/publications"
+        }
+      ]
+    },
+    {
+      "route": "/scheduling",
+      "hash": "#/scheduling",
+      "title": "Scheduling",
+      "view": "viewScheduling",
+      "nav": {
+        "group": "Fabric",
+        "label": "Hosts",
+        "entry": "/hosts",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Scheduling",
+        "siblings": [
+          "/hosts",
+          "/scheduling",
+          "/ai-sync"
+        ]
+      },
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#scheduler",
+      "surfaces": [
+        {
+          "slug": "dashboard-scheduling",
+          "hash": "/scheduling"
+        }
+      ]
+    },
+    {
+      "route": "/handoffs",
+      "hash": "#/handoffs",
+      "title": "Handoffs",
+      "view": "viewHandoffs",
+      "nav": {
+        "group": "Agents",
+        "label": "Agents",
+        "entry": "/herd",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Handoffs",
+        "siblings": [
+          "/herd",
+          "/missions",
+          "/handoffs"
+        ]
+      },
+      "params": {},
+      "query": {
+        "open": ""
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#handoffs",
+      "surfaces": [
+        {
+          "slug": "dashboard-handoffs",
+          "hash": "/handoffs"
+        }
+      ]
+    },
+    {
+      "route": "/memory",
+      "hash": "#/memory",
+      "title": "Memory",
+      "view": "viewMemory",
+      "nav": {
+        "group": "Code",
+        "label": "Memory",
+        "entry": "/memory",
+        "listedInSidebar": true,
+        "capability": "memory_v1"
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#memory",
+      "surfaces": [
+        {
+          "slug": "dashboard-memory",
+          "hash": "/memory"
+        }
+      ]
+    }
+  ]
+}

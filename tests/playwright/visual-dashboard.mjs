@@ -12,6 +12,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CFG, REPO } from './ui-gates-lib.mjs';
+import { routeFixture } from './dashboard-fixtures.mjs';
 
 const PACKAGES = path.join(REPO, 'packages');
 const TYPES = { '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.html': 'text/html', '.json': 'application/json', '.svg': 'image/svg+xml', '.md': 'text/markdown', '.woff2': 'font/woff2' };
@@ -100,6 +101,12 @@ const APPS = { ready: true, redirect_uri: 'https://cp.example/api/v1/assistant-a
   { id: 'calendar', name: 'Google Calendar', kind: 'oauth', provider: 'google', connected: true, account: 'ann@example.com', status: 'connected', scopes: [], client_configured: true },
   { id: 'github', name: 'GitHub', kind: 'status', provider: 'github', connected: true, account: 'berlinguyinca', status: 'connected', scopes: [], client_configured: false }] };
 
+/** The Missions and assistant answers above first, then the fixtures of every other dashboard route (dashboard-fixtures.mjs). */
+export const fixtureAnswer = (pathname, method, params = new URLSearchParams()) => apiAnswer(pathname, method) ?? routeFixture(pathname, method, params, { now: NOW, ago });
+
+/** Every API request the pages made, "METHOD path -> fixture|MISS": the capture entry point reports misses, never hides them. */
+export const API_LOG = new Set();
+
 /** The /api/v1 answers. Reads only: a surface never mutates anything. Unknown routes answer {} like the live-view tests do. */
 export function apiAnswer(pathname, method = 'GET') {
   const db = assistantDb();
@@ -125,7 +132,8 @@ export function apiAnswer(pathname, method = 'GET') {
     default:
       // the view opens a thread when the assistant has none: answer that one write with a fixed thread
       if (method === 'POST' && /\/threads$/.test(pathname)) return { thread_id: 'thr_1', title: 'New thread', created_at: created };
-      return /\/threads$/.test(pathname) ? { threads: [] } : {};
+      if (/\/threads$/.test(pathname)) return { threads: [] };
+      return undefined;   // not an assistant/missions answer: dashboard-fixtures.mjs has the rest, and an unknown route is a MISS, never {}
   }
 }
 
@@ -140,7 +148,12 @@ export async function openDashboard(browser, hash, ctxOpts = {}) {
   const page = await ctx.newPage();
   // no network beyond the loopback static server: any other request is refused
   await ctx.route('**/*', (route) => (route.request().url().startsWith(origin) || route.request().url().startsWith('data:') ? route.fallback() : route.abort()));
-  await page.route('**/api/v1/**', (route) => route.fulfill({ json: apiAnswer(new URL(route.request().url()).pathname, route.request().method()) }));
+  await page.route('**/api/v1/**', (route) => {
+    const u = new URL(route.request().url());
+    const answer = fixtureAnswer(u.pathname, route.request().method(), u.searchParams);
+    API_LOG.add(`${route.request().method()} ${u.pathname} -> ${answer === undefined ? 'MISS' : 'fixture'}`);
+    return answer === undefined ? route.fulfill({ status: 404, json: { error: 'no fixture for ' + u.pathname } }) : route.fulfill({ json: answer });
+  });
   await page.addInitScript(() => {
     window.EventSource = class { constructor(url) { this.url = String(url); } close() {} };
   });
