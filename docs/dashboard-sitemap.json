@@ -1,7 +1,7 @@
 {
   "generatedFrom": "packages/app.js + tests/playwright/dashboard-routes.mjs",
   "routeCount": 47,
-  "surfaceCount": 60,
+  "surfaceCount": 61,
   "navGroups": [
     "Monitor",
     "Agents",
@@ -27,7 +27,7 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
       "proof": "#overview-dashboard",
@@ -61,10 +61,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#attention-root",
+      "proof": "[data-attention-row]",
       "surfaces": [
         {
           "slug": "dashboard-attention",
@@ -105,18 +105,18 @@
           }
         },
         {
-          "id": "table",
-          "label": "Table layout",
+          "id": "list",
+          "label": "Flat list layout",
           "via": {
-            "hash": "/github/projects?layout=table"
+            "hash": "/github/projects?layout=list"
           }
         }
       ],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": ".ghp-column",
       "surfaces": [
         {
           "slug": "dashboard-github-projects",
@@ -147,10 +147,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": "[data-gh-issue]",
       "surfaces": [
         {
           "slug": "dashboard-github",
@@ -175,10 +175,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#collab-root",
+      "proof": ".cx-room",
       "surfaces": [
         {
           "slug": "dashboard-collab",
@@ -217,10 +217,10 @@
       },
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": "[data-ci-workspace]",
       "surfaces": [
         {
           "slug": "dashboard-ci",
@@ -251,10 +251,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#deployments",
+      "proof": "#deployments tbody tr",
       "surfaces": [
         {
           "slug": "dashboard-deployments",
@@ -293,10 +293,10 @@
       },
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": "#view table tbody tr",
       "surfaces": [
         {
           "slug": "dashboard-reviews",
@@ -327,10 +327,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": ".rg-panel",
       "surfaces": [
         {
           "slug": "dashboard-review-gate",
@@ -372,10 +372,10 @@
         }
       ],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": ".tx-group",
       "surfaces": [
         {
           "slug": "dashboard-topology",
@@ -405,14 +405,14 @@
       },
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#architecture-root",
+      "proof": ".arch-table",
       "surfaces": [
         {
           "slug": "dashboard-architecture",
-          "hash": "/architecture"
+          "hash": "/architecture?parent=n-app"
         }
       ]
     },
@@ -472,7 +472,7 @@
         }
       ],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
       "proof": "[data-mission-key]",
@@ -510,10 +510,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#mission-history",
+      "proof": "#mission-history details[data-history-panel]",
       "surfaces": [
         {
           "slug": "dashboard-mission-detail",
@@ -547,10 +547,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#mission-tests",
+      "proof": "#mission-tests .hd-card",
       "surfaces": [
         {
           "slug": "dashboard-mission-tests",
@@ -580,10 +580,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#mission-reviews",
+      "proof": "#mission-reviews .hd-card",
       "surfaces": [
         {
           "slug": "dashboard-mission-reviews",
@@ -646,10 +646,10 @@
         }
       ],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": ".ss-row",
       "surfaces": [
         {
           "slug": "dashboard-agents",
@@ -696,7 +696,7 @@
         }
       ],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
       "proof": ".sd-title",
@@ -754,10 +754,10 @@
         }
       ],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": ".sc-row",
       "surfaces": [
         {
           "slug": "dashboard-services",
@@ -793,10 +793,10 @@
       },
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": ".sc-row",
       "surfaces": [
         {
           "slug": "dashboard-system-services",
@@ -832,10 +832,10 @@
       },
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": ".sc-row",
       "surfaces": [
         {
           "slug": "dashboard-local-services",
@@ -870,10 +870,10 @@
       },
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": "table.fabric-services",
       "surfaces": [
         {
           "slug": "dashboard-fabric-services",
@@ -905,10 +905,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": ".ais-table",
       "surfaces": [
         {
           "slug": "dashboard-ai-sync",
@@ -948,10 +948,10 @@
       },
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#pr-trail",
+      "proof": "#pr-trail li",
       "surfaces": [
         {
           "slug": "dashboard-pr-trail",
@@ -976,10 +976,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#teams",
+      "proof": "#teams li",
       "surfaces": [
         {
           "slug": "dashboard-teams",
@@ -1006,14 +1006,14 @@
       },
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#team-map",
+      "proof": "[data-tm-canvas]",
       "surfaces": [
         {
           "slug": "dashboard-team-map",
-          "hash": "/team-map"
+          "hash": "/team-map?root=project:atlas"
         }
       ]
     },
@@ -1039,10 +1039,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": "[data-service-state]",
       "surfaces": [
         {
           "slug": "dashboard-service-detail",
@@ -1091,10 +1091,10 @@
         }
       ],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": "[data-host-card]",
       "surfaces": [
         {
           "slug": "dashboard-hosts",
@@ -1123,10 +1123,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": "[data-tl-session]",
       "surfaces": [
         {
           "slug": "dashboard-diagnostics",
@@ -1222,7 +1222,7 @@
         }
       ],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
       "proof": "[data-config]",
@@ -1295,14 +1295,14 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#project-intelligence",
+      "proof": ".pi-item",
       "surfaces": [
         {
           "slug": "dashboard-intelligence",
-          "hash": "/intelligence"
+          "hash": "/intelligence?event=evt-1"
         }
       ]
     },
@@ -1345,10 +1345,10 @@
         }
       ],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": "[data-section=\"gauges\"]",
       "surfaces": [
         {
           "slug": "dashboard-host-detail",
@@ -1379,10 +1379,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": ".ac-row",
       "surfaces": [
         {
           "slug": "dashboard-activity",
@@ -1407,10 +1407,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": "[data-analytics-panel]",
       "surfaces": [
         {
           "slug": "dashboard-analytics",
@@ -1435,10 +1435,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": "[data-analytics-panel]",
       "surfaces": [
         {
           "slug": "dashboard-analytics-missions",
@@ -1463,10 +1463,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": ".hd-card",
       "surfaces": [
         {
           "slug": "dashboard-analytics-models",
@@ -1491,10 +1491,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": "herdr-metric",
       "surfaces": [
         {
           "slug": "dashboard-analytics-hosts",
@@ -1519,10 +1519,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": "table.hd-table",
       "surfaces": [
         {
           "slug": "dashboard-analytics-tokens",
@@ -1547,10 +1547,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": "table.hd-table",
       "surfaces": [
         {
           "slug": "dashboard-analytics-stages",
@@ -1575,10 +1575,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": "table.hd-table",
       "surfaces": [
         {
           "slug": "dashboard-analytics-usage",
@@ -1608,10 +1608,10 @@
       },
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": ".llm-tiles",
       "surfaces": [
         {
           "slug": "dashboard-llm",
@@ -1643,10 +1643,10 @@
       },
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#view",
+      "proof": ".llm-tiles",
       "surfaces": [
         {
           "slug": "dashboard-llm-session",
@@ -1677,10 +1677,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#artifact-registry",
+      "proof": "#artifact-registry tbody tr",
       "surfaces": [
         {
           "slug": "dashboard-artifacts",
@@ -1712,7 +1712,7 @@
       },
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
       "proof": "#artifact-detail",
@@ -1746,10 +1746,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#publication-registry",
+      "proof": "#publication-registry tbody tr",
       "surfaces": [
         {
           "slug": "dashboard-publications",
@@ -1781,10 +1781,10 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#scheduler",
+      "proof": "[data-scheduler-host]",
       "surfaces": [
         {
           "slug": "dashboard-scheduling",
@@ -1818,10 +1818,10 @@
       },
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#handoffs",
+      "proof": "[data-handoff]",
       "surfaces": [
         {
           "slug": "dashboard-handoffs",
@@ -1846,14 +1846,19 @@
       "query": {},
       "subviews": [],
       "fixture": {
-        "status": "pending",
+        "status": "fixture",
         "reason": ""
       },
-      "proof": "#memory",
+      "proof": ".mem-row",
       "surfaces": [
         {
           "slug": "dashboard-memory",
-          "hash": "/memory"
+          "hash": "/memory?q=gateway"
+        },
+        {
+          "slug": "dashboard-memory-detail",
+          "hash": "/memory?q=gateway",
+          "step": "memory-open"
         }
       ]
     }
