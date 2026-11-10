@@ -101,6 +101,7 @@ def test_disabled_explicit_exits_2(tmp_path, ingest, capsys):
 
 
 @pytest.mark.parametrize("url", ["http://builds.example.com", "ftp://127.0.0.1", "http://127.0.0.1.evil.com",
+                                 "http://100.128.0.1:8080", "http://100.63.255.255", "http://100.104.39.6.evil.com",
                                  "https://user:pw@example.com", "example.com"])
 def test_non_https_remote_url_refused(tmp_path, url, capsys):
     cfg = _config(tmp_path, url, _key_file(tmp_path))
@@ -258,3 +259,9 @@ def test_service_files_have_no_secrets_and_are_not_enabled_by_default():
     assert "build-cache-report" in plist and "--loop" in plist and "<key>EnvironmentVariables</key>" not in plist
     import plistlib
     assert plistlib.loads(plist.encode())["Label"] == "com.herdr-engineering.build-cache-report"
+
+
+@pytest.mark.parametrize("url", ["http://100.104.39.6:8080", "http://100.64.0.1", "http://100.127.255.254:9"])
+def test_tailnet_http_url_is_accepted_by_validation(url):
+    from herdr_engineering.build_cache_report_cli import _check_url
+    assert _check_url(url) == url

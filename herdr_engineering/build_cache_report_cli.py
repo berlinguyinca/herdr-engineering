@@ -6,6 +6,7 @@ keeps going), 2 refused to run (disabled or unsafe configuration).
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import sys
 import time
@@ -18,6 +19,16 @@ from .errors import InvalidError
 
 EXIT_OK, EXIT_FAILED, EXIT_REFUSED = 0, 1, 2
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
+# Tailscale CGNAT range: the tailnet (WireGuard) is the fabric's trust boundary.
+_TAILNET = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _is_tailnet(host: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return addr.version == 4 and addr in _TAILNET
 _PREFIX = "build-cache-report:"
 
 
@@ -55,9 +66,9 @@ def _check_url(url: str | None) -> str:
         raise InvalidError("fabric_build_cache.report.url is not a valid URL") from None
     if u.username or u.password or u.query or u.fragment or not host:
         raise InvalidError("fabric_build_cache.report.url must be a plain base URL (no credentials, query or fragment)")
-    if u.scheme == "https" or (u.scheme == "http" and host in _LOOPBACK):
+    if u.scheme == "https" or (u.scheme == "http" and (host in _LOOPBACK or _is_tailnet(host))):
         return url
-    raise InvalidError("fabric_build_cache.report.url must be https (plain http only for 127.0.0.1/localhost)")
+    raise InvalidError("fabric_build_cache.report.url must be https (plain http only for 127.0.0.1/localhost or a tailnet 100.64.0.0/10 address)")
 
 
 def _read_key(key_file: str | None) -> str:
