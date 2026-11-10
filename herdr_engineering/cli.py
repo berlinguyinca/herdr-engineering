@@ -1081,6 +1081,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="control-plane base URL")
     p2.add_argument("--upstream", default=None,
                     help="upstream base URL (default: llm.upstream_url from the fleet config)")
+    p2.add_argument("--control-plane-key-file", default=None, metavar="PATH",
+                    help="optional 0600 file holding an API key sent as X-API-Key (default: "
+                         "control_plane.llm_proxy.control_plane_key_file; absent = no header)")
     p2.add_argument("--fleet-config", default="~/.config/herdr-engineering/llm-proxy/llm-config.json",
                     help="the llm slice of the central fleet file (`fleet config render-llm`): llm.upstream_key/upstream_url and "
                          "control_plane.llm_proxy tuning (the only source of configuration)")
@@ -1088,6 +1091,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = csub.add_parser("llm-gateway-sync",
                          help="keep project keys rendered as sha256-only gateway principals")
     p2.add_argument("--control-plane", default="http://control-plane-web:8080")
+    p2.add_argument("--control-plane-key-file", default=None, metavar="PATH",
+                    help="optional file (mode 0600) holding an API key sent as X-API-Key; absent = no header")
     p2.add_argument("--principals-file", required=True,
                     help="file the gateway reads as auth.client_principals_file (written 0600)")
     p2.add_argument("--interval", type=float, default=5.0)
@@ -1096,6 +1101,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = csub.add_parser("llm-gateway-usage",
                          help="report the gateway's per-key token usage to the control plane")
     p2.add_argument("--control-plane", default="http://control-plane-web:8080")
+    p2.add_argument("--control-plane-key-file", default=None, metavar="PATH",
+                    help="optional file (mode 0600) holding an API key sent as X-API-Key; absent = no header")
     p2.add_argument("--gateway", required=True, help="gateway or relay base URL")
     p2.add_argument("--usage-path", default="/v1/admin/usage",
                     help="usage route: /v1/admin/usage on a gateway, /api/usage on a relay")
@@ -1252,6 +1259,9 @@ def _cmd_cp_llm_proxy(args) -> int:
             raise FleetConfigError("control_plane.llm_proxy must be a mapping")
         max_inflight = int(tuning.get("max_inflight", DEFAULT_MAX_INFLIGHT))
         wait_seconds = float(tuning.get("queue_wait_seconds", DEFAULT_QUEUE_WAIT_SECONDS))
+        key_file = args.control_plane_key_file or tuning.get("control_plane_key_file") or None
+        if key_file is not None and not isinstance(key_file, str):
+            raise FleetConfigError("control_plane.llm_proxy.control_plane_key_file must be a path string")
     except (FleetConfigError, OSError, ValueError, TypeError) as exc:
         print(f"--fleet-config {path}: {exc}", file=sys.stderr)
         return 2
@@ -1261,7 +1271,7 @@ def _cmd_cp_llm_proxy(args) -> int:
         print("fleet config llm.upstream_key and llm.upstream_url are required", file=sys.stderr)
         return 2
     httpd = serve(args.host, args.port, args.control_plane, upstream, key,
-                  max_inflight=max_inflight, wait_seconds=wait_seconds)
+                  max_inflight=max_inflight, wait_seconds=wait_seconds, control_key_file=key_file)
     print(f"llm-proxy listening on {args.host}:{httpd.server_address[1]}", flush=True)
     from .llm_proxy import run_until_stopped
     run_until_stopped(httpd)
@@ -1273,7 +1283,7 @@ def _cmd_cp_llm_gateway_sync(args) -> int:
 
     from .llm_gateway_bridge import run, sync_once
     from .llm_proxy import ControlPlaneClient
-    control = ControlPlaneClient(args.control_plane)
+    control = ControlPlaneClient(args.control_plane, key_file=args.control_plane_key_file)
     path = Path(args.principals_file).expanduser()
     if args.once:
         return 1 if sync_once(control, path) is None else 0
@@ -1289,7 +1299,7 @@ def _cmd_cp_llm_gateway_usage(args) -> int:
 
     from .llm_gateway_usage import fetch_usage, run, sync_once
     from .llm_proxy import ControlPlaneClient
-    control = ControlPlaneClient(args.control_plane)
+    control = ControlPlaneClient(args.control_plane, key_file=args.control_plane_key_file)
     secret_path = Path(args.admin_secret_file).expanduser()
 
     def fetch():  # re-read each pass so a rotated secret is picked up
