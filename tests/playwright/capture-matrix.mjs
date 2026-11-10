@@ -70,7 +70,7 @@ export const screenMeta = (slug, mode) => ({ screen_id: slug + mode.idSuffix, or
 export const fileName = (slug, mode, appearance) => `${slug}__${mode.viewport}__${appearance}`;
 
 function parseArgs(argv) {
-  const a = { out: '', modes: ALL_MODES, appearance: ['light', 'dark'], routes: ['all'], jobs: 4, localSize: '', list: false, includeSkipped: false };
+  const a = { out: '', modes: ALL_MODES, appearance: ['light', 'dark'], routes: ['all'], jobs: 4, localSize: '', list: false, includeSkipped: false, ux: '' };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i]; const v = () => { const x = argv[++i]; if (x === undefined) throw new Error(`${k} needs a value`); return x; };
     if (k === '--out') a.out = path.resolve(v());
@@ -81,6 +81,7 @@ function parseArgs(argv) {
     else if (k === '--local-size') a.localSize = v();
     else if (k === '--list') a.list = true;
     else if (k === '--include-skipped') a.includeSkipped = true;
+    else if (k === '--ux') a.ux = path.resolve(v());   // Screenwright's scripts/ux-measure-page.js: also write <name>.ux.json (complexity measurement at the mode's own viewport)
     else throw new Error(`unknown flag ${k}`);
   }
   const badMode = a.modes.filter((m) => !ALL_MODES.includes(m)); if (badMode.length) throw new Error(`unknown mode(s) ${badMode}; choose from ${ALL_MODES}`);
@@ -110,6 +111,7 @@ async function main() {
   for (const m of modes) console.log(`  mode ${m.viewport}: ${m.width}x${m.height} @${m.dpr}x device_class=${m.device_class} orientation=${m.orientation}`);
   if (a.list) { for (const s of surfaces) console.log(`  ${s.slug}  ${s.route}  #${s.hash}  fixture=${s.fixtureStatus}`); return; }
   fs.mkdirSync(a.out, { recursive: true });
+  const measurePage = a.ux ? (await import(a.ux)).measurePage : null;
   const browser = await launch();
   const rows = []; let next = 0;
   const worker = async () => {
@@ -120,10 +122,11 @@ async function main() {
       if (s.fixtureStatus === 'skipped' && !a.includeSkipped) { rows.push({ ...row, status: 'skipped', reason: s.skipReason }); console.log('skipped', name, '-', s.skipReason); continue; }
       try {
         const apiLog = new Set();   // per capture: jobs run in parallel
-        let probe = null;
-        const wrapped = { ...s, apiLog, steps: async (page) => { await s.steps(page); await fitViewportToPage(page, mode.width, mode.height); probe = await page.evaluate(() => ({ error: !!document.querySelector('#view herdr-error, #view [data-error]'), text: (document.querySelector('#view')?.innerText || '').slice(0, 4000) })); } };
+        let probe = null; let uxJson = null;
+        const wrapped = { ...s, apiLog, steps: async (page) => { await s.steps(page); if (measurePage) { await page.evaluate(() => { window.scrollTo(0, 0); }); uxJson = await measurePage(page); } await fitViewportToPage(page, mode.width, mode.height); probe = await page.evaluate(() => ({ error: !!document.querySelector('#view herdr-error, #view [data-error]'), text: (document.querySelector('#view')?.innerText || '').slice(0, 4000) })); } };
         const r = await capture(browser, null, wrapped, mode.viewport, appearance, { regions: false, size: { width: mode.width, height: mode.height }, dpr: mode.dpr, strictFonts: false });
         fs.writeFileSync(path.join(a.out, name + '.png'), r.page);
+        if (uxJson) fs.writeFileSync(path.join(a.out, name + '.ux.json'), JSON.stringify(uxJson, null, 1));
         const misses = [...apiLog].filter((l) => l.endsWith('MISS')).map((l) => l.replace(' -> MISS', ''));
         const errorState = probe?.error || /no fixture for/.test(probe?.text || '');
         rows.push({ ...row, status: misses.length || errorState ? 'degraded' : 'ok', ...(misses.length ? { misses: [...new Set(misses)].sort() } : {}), ...(errorState ? { errorState: true } : {}), ...(Object.keys(r.hostFonts || {}).length ? { hostFonts: r.hostFonts } : {}) });
