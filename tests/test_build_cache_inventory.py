@@ -112,7 +112,8 @@ def test_disabled_collects_nothing(tmp_path, monkeypatch):
 def test_collect_with_real_rustc(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "st"))
     c = inv.collect(_cfg(), path_env=os.environ["PATH"])
-    assert c.os == "linux" and c.toolchain_digest and c.rustc_version
+    expected_os = {"darwin": "darwin", "linux": "linux", "win32": "windows"}[sys.platform]
+    assert c.os == expected_os and c.toolchain_digest and c.rustc_version
     assert inv.compatibility(c, inv.collect(_cfg(), path_env=os.environ["PATH"])).compatible
     assert not (tmp_path / "st").exists()
 

@@ -15,6 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from .build_cache_location import StorageTier, parse_storage_tiers
 from .errors import InvalidError
 
 _ENDPOINT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
@@ -53,6 +54,7 @@ class Local:
     ram_scratch_gib: float
     min_free_disk_percent: float
     incremental_disabled_for_cacheable_builds: bool
+    storage_tiers: tuple[StorageTier, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -357,6 +359,7 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     ram = _num(lo, "ram_scratch_gib", lp, lo=0, lo_incl=True)
     free = _num(lo, "min_free_disk_percent", lp, lo=0, lo_incl=True, hi=100)
     incr = _bool(lo, "incremental_disabled_for_cacheable_builds", lp)
+    tiers = parse_storage_tiers(lo["storage_tiers"])
 
     xp = f"{p}.execution"
     ex = _filled(top["execution"], base["execution"], xp)
@@ -422,7 +425,7 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     return BuildCacheConfig(
         enabled=enabled, mode=mode, allowed_hosts=allowed_hosts,
         shared_cache=SharedCache(s_enabled, ep, s["namespace"], writes, max_total, tls, cred, reg),
-        local=Local(capacity, ram, free, incr),
+        local=Local(capacity, ram, free, incr, tiers),
         execution=Execution(slurm, clusters, parts, gpu, fb, slots),
         cleanup=Cleanup(dry, idle, evict),
         observability=Observability(obs, exp),
