@@ -139,9 +139,17 @@ def _override(ctx: Context, name: str) -> list[str] | None:
 
 # --------------------------------------------------------------------------- D6 gate
 
+#: The owner is pinned: every deployment checkout in the fleet is a clone of github.com/berlinguyinca/<repo>, in the https,
+#: `git@github.com:` or `ssh://git@github.com/` form (observed on beast: ssh://git@github.com/berlinguyinca/<repo>[.git]).
+OWNER = "berlinguyinca"
+_ORIGIN = re.compile(r"(?:https://(?:[^@/\s]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)"
+                     rf"{OWNER}/(?P<name>[A-Za-z0-9._-]+?)(?:\.git)?/?")
+
+
 def origin_matches(url: str, repo: str) -> bool:
-    """The deployment checkout must be a clone of the repo being rolled out (https, ssh or a path ending in its name)."""
-    return re.search(rf"(^|[/:]){re.escape(repo)}(\.git)?/?$", url.strip()) is not None
+    """True only for github.com/berlinguyinca/<repo>; other owners, hosts and bare local paths are refused."""
+    match = _ORIGIN.fullmatch(url.strip())
+    return match is not None and match["name"] == repo
 
 
 def checkout_gate(ctx: Context, root: Path) -> dict[str, int]:
@@ -152,7 +160,7 @@ def checkout_gate(ctx: Context, root: Path) -> dict[str, int]:
     if not (root / ".git").exists():
         ctx.note(f"no git checkout at {root}")
         raise PhaseStop("failed", "apply_failed")
-    rc0, origin = _git(ctx, root, "remote", "get-url", "origin")
+    rc0, origin = _git(ctx, root, "config", "--get", "remote.origin.url")   # raw: no insteadOf rewrite
     if rc0 or not origin_matches(origin, ctx.repo):
         ctx.note(f"origin of {root} is not the {ctx.repo} repository")
         raise PhaseStop("failed", "apply_failed")
@@ -198,6 +206,9 @@ def _ff_to(ctx: Context, root: Path, sha: str) -> None:
         raise PhaseStop("blocked", "not_published")
     rc, _ = _git(ctx, root, "merge", "--ff-only", "--quiet", sha)
     if rc:
+        raise PhaseStop("failed", "apply_failed")
+    if _head(ctx, root) != sha:         # `sha` was an ancestor of HEAD (main moved on): never install/receipt another rev
+        ctx.note("checkout is ahead of the target revision; refusing to install a different revision")
         raise PhaseStop("failed", "apply_failed")
 
 
@@ -382,7 +393,9 @@ class Autospec:
 
     def rollback(self, ctx: Context) -> str | None:
         """A failed refresh leaves the previous generation active; that is a rollback only if it still is."""
-        return "rolled_back" if ctx.before_sha and self.installed(ctx) == ctx.before_sha else None
+        if not ctx.before_sha or ctx.before_sha == ctx.sha:     # converged before this rollout: nothing to undo
+            return None
+        return "rolled_back" if self.installed(ctx) == ctx.before_sha else None
 
 
 # --------------------------------------------------------------------------- pi-engineering (D7)

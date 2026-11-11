@@ -132,8 +132,12 @@ fast-forward, the install and the agent restart all succeeded; `no_change` needs
 target, so an install that failed after the fast-forward is retried (no receipt means "apply again", which is idempotent).
 The deployment checkout is `$HERDR_ENGINEERING_REPO`, else the one-line file `~/.config/herdr-engineering/
 deployment-checkout` (an absolute path; non-interactive ssh has no profile environment), else `failed(apply_failed)`
-with the cause in the host log. The checkout's `origin` URL must end in the repo's name (`.../<repo>(.git)`), else
-`failed(apply_failed)`. D6 gate: `blocked(dirty_checkout|not_on_main|
+with the cause in the host log. The checkout's configured `origin` URL must be `github.com/berlinguyinca/<repo>` (https,
+`git@github.com:` or `ssh://git@github.com/` form, optional `.git`; the forms observed on beast), else
+`failed(apply_failed)`; other owners, hosts and bare local paths are refused. If the checkout is already ahead of the
+target (main moved on), nothing is installed and no receipt is written: `failed(apply_failed)`. A crash mid-row keeps the
+host's own previous revision (saved at precheck time) so a later rollback still targets it, and an optional host that was
+unreachable for one repo is skipped for the remaining repos of that rollout. D6 gate: `blocked(dirty_checkout|not_on_main|
 unpublished_commits)` with counts, never a clean, stash or reset. It holds `fleet-auto-update.lock` (`blocked(busy)`
 after 5 retries, 60 s apart).
 

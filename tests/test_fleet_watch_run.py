@@ -35,6 +35,9 @@ from herdr_engineering.service_metadata_feed import MetadataClient
 from tests.test_fleet_watch import FakeGitHub, Forge, git
 
 CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
+if not Path(run.__file__).resolve().is_relative_to(CHECKOUT_ROOT):          # e.g. bare `pytest` + another editable tree
+    raise RuntimeError(f"these tests import herdr_engineering from {run.__file__}, not from {CHECKOUT_ROOT}; "
+                       "run `python -m pytest` from the repo root or install this checkout")
 #: Run THIS checkout's code (not whatever happens to be installed in the venv), isolated like the real entry point.
 BOOT = (f"import sys; sys.path.insert(0, {str(CHECKOUT_ROOT)!r}); "
         "from herdr_engineering.cli import main; sys.exit(main())")
@@ -53,6 +56,8 @@ case "$mode" in
   down) exit 255 ;;
   hang) sleep 60; exit 0 ;;
   hang_apply) case "$*" in *"--phase apply"*) sleep 60; exit 0 ;; esac ;;
+  die_health) case "$*" in *"--phase health"*) kill -9 $PPID; sleep 1; exit 1 ;; esac ;;
+  down_he) case "$*" in *"--repo herdr-engineering"*) exit 255 ;; esac ;;
   die) kill -9 $PPID; sleep 1; exit 1 ;;
 esac
 export HOME="$FAKE_SSH_DIR/home-$host"
@@ -87,6 +92,10 @@ class Fleet:
         (home / ".local/bin").mkdir(parents=True)
         checkout = home / "checkout"
         subprocess.run(["git", "clone", "-q", str(self.forge.root / f"{HE}.git"), str(checkout)], check=True)
+        url = f"https://github.com/{HE}.git"          # the real origin form; the host's git config maps it locally
+        git(checkout, "remote", "set-url", "origin", url)
+        gitconfig = home / "gitconfig"
+        gitconfig.write_text(f'[url "{self.forge.root / f"{HE}.git"}"]\n\tinsteadOf = {url}\n')
         marker = home / "installed.marker"
         install = script(home / "install.sh", f'echo "$HERDR_FLEET_TARGET_SHA" > "{marker}"')
         ok = script(home / "ok.sh", "exit 0")
@@ -102,7 +111,7 @@ export HERDR_ENGINEERING_REPO="{checkout}"
 export HERDR_FLEET_HERDR_INSTALL_CMD="{install}" HERDR_FLEET_HERDR_AGENT_CMD=""
 export HERDR_FLEET_HERDR_SERVICE_CMD="{ok}" HERDR_FLEET_PARITY_CMD="{ok}"
 export HERDR_FLEET_PI_STAGE_CMD="{stage}" HERDR_FLEET_PI_SMOKE_CMD="{smoke}"
-export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+export GIT_CONFIG_GLOBAL="{gitconfig}" GIT_CONFIG_SYSTEM=/dev/null
 exec "{sys.executable}" -I -c "{BOOT}" "$@"''')
         self.shims[host] = shim
 
@@ -470,6 +479,34 @@ def test_rollback_returns_the_host_to_its_own_release_not_the_plan_baseline(flee
     assert fleet.cli(repo=PI).returncode == 1
     assert current(fleet, "bender") == own
     assert fleet.finished()["bender"][1]["after_sha"] == own
+
+
+# --------------------------------------------------------------------------- optional host hold, own revision across a crash
+
+def test_an_optional_host_that_missed_the_first_repo_is_not_updated_for_the_second(fleet):
+    before, after = pi_world(fleet)
+    fleet.mode("macbook-pro", "down_he")               # unreachable for herdr-engineering only; pi would answer
+    out = fleet.cli("--repo", PI)
+    assert out.returncode == 0, out.stderr
+    mac = fleet.finished()["macbook-pro"]
+    assert [(p["repo"], p["status"], p.get("reason")) for p in mac] == [
+        ("herdr-engineering", "skipped", "optional_unreachable"), ("pi-engineering", "skipped", "optional_unreachable")]
+    assert len(fleet.calls("macbook-pro")) == 1        # only the failed precheck; pi was never contacted there
+    assert current(fleet, "macbook-pro") == before and fleet.types()[-1] == "rollout.succeeded"
+
+
+def test_a_crash_during_health_keeps_the_hosts_own_previous_release_for_the_rollback(fleet):
+    before, after = pi_world(fleet)
+    fleet.mode("bender", "die_health")                 # the switch happens, then the runner is killed in health
+    assert fleet.cli(repo=PI).returncode == -9
+    assert current(fleet, "bender") == after
+    [rollout] = fleet.saved()["rollouts"].values()
+    assert rollout["rows"]["bender/pi-engineering"]["host_before"] == before     # persisted at precheck time
+    fleet.mode("bender", "ok")
+    (fleet.home("bender") / "smoke_fail").write_text("")
+    assert fleet.cli(repo=PI).returncode == 1          # crash-resume: health now fails
+    assert current(fleet, "bender") == before          # rolled back to the host's own previous release
+    assert [p["status"] for p in fleet.finished()["bender"]][-1] == "rolled_back"
 
 
 # --------------------------------------------------------------------------- who is "local"

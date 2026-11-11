@@ -30,6 +30,11 @@ from herdr_engineering.control_plane.fleet_rollout import (
 )
 from herdr_engineering.fleet_watch import host_apply, logs
 
+CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
+if not Path(host_apply.__file__).resolve().is_relative_to(CHECKOUT_ROOT):    # e.g. bare `pytest` + another editable tree
+    raise RuntimeError(f"these tests import herdr_engineering from {host_apply.__file__}, not from {CHECKOUT_ROOT}; "
+                       "run `python -m pytest` from the repo root or install this checkout")
+
 RID = "0123456789abcdef"
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -88,6 +93,12 @@ class World:
         self.publish("one")
         self.checkout = root / "checkout"
         subprocess.run(["git", "clone", "-q", str(self.origin), str(self.checkout)], check=True)
+        # The checkout's configured origin is the real GitHub URL form; the host's git config maps it to the local
+        # bare repo (insteadOf), so the owner/name pinning is exercised without any network.
+        self.url = f"https://github.com/berlinguyinca/{name}.git"
+        git(self.checkout, "remote", "set-url", "origin", self.url)
+        self.gitconfig = root / "gitconfig"
+        self.gitconfig.write_text(f'[url "{self.origin}"]\n\tinsteadOf = {self.url}\n')
         self.home = root / "home"
         self.home.mkdir()
         self.marker = root / "installed.marker"
@@ -98,7 +109,7 @@ class World:
             "HERDR_ENGINEERING_REPO": str(self.checkout),
             "HERDR_FLEET_HERDR_INSTALL_CMD": str(install), "HERDR_FLEET_HERDR_AGENT_CMD": "",
             "HERDR_FLEET_HERDR_SERVICE_CMD": str(ok), "HERDR_FLEET_PARITY_CMD": str(ok),
-            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_CONFIG_GLOBAL": str(self.gitconfig), "GIT_CONFIG_SYSTEM": "/dev/null",
         }
 
     def publish(self, name: str) -> str:
@@ -114,8 +125,14 @@ class World:
     def sibling(self, name: str) -> World:
         """Another repo (own origin named after it) that shares this world's HOME and state."""
         other = World(self.root / name, name)
-        other.home, other.env, other.marker = self.home, {**self.env}, self.marker
+        other.home, other.marker = self.home, self.marker
+        other.env = {**self.env, "GIT_CONFIG_GLOBAL": str(other.gitconfig)}
         return other
+
+    def host_git(self, *args: str) -> None:
+        """git as the host sees it (origin URL mapped to the local bare repo)."""
+        subprocess.run(["git", "-C", str(self.checkout), *args], check=True, capture_output=True,
+                       env={**os.environ, **self.env})
 
     def run(self, phase, repo="herdr-engineering", sha=None, **kw) -> dict:
         return host_apply.run_phase(phase, rollout_id=RID, repo=repo, sha=sha or self.head(), host="bender",
@@ -349,13 +366,50 @@ def test_repo_location_falls_back_to_the_config_file_then_fails_closed(world):
 
 def test_a_checkout_whose_origin_is_another_repo_is_refused(world):
     target = world.publish("two")
-    git(world.checkout, "remote", "set-url", "origin", "https://example.invalid/someone/else.git")
-    out = world.run("apply", sha=target)
+    for url in ("https://example.invalid/someone/else.git", "https://github.com/mallory/herdr-engineering.git",
+                str(world.origin)):
+        git(world.checkout, "remote", "set-url", "origin", url)
+        out = world.run("apply", sha=target)
+        assert (out["status"], out["reason"]) == ("failed", "apply_failed"), url
+    assert not world.marker.exists() and world.head() != target
+
+
+@pytest.mark.parametrize("url", [
+    "git@github.com:berlinguyinca/herdr-engineering.git", "ssh://git@github.com/berlinguyinca/herdr-engineering",
+    "https://github.com/berlinguyinca/herdr-engineering/", "https://github.com/berlinguyinca/herdr-engineering.git",
+    "https://tok@github.com/berlinguyinca/herdr-engineering.git",
+])
+def test_origin_matches_accepts_the_owner_pinned_forms(url):
+    assert host_apply.origin_matches(url, "herdr-engineering")
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/x/herdr-engineering-evil.git", "https://github.com/mallory/herdr-engineering.git",
+    "git@github.com:mallory/herdr-engineering.git", "/srv/git/berlinguyinca/herdr-engineering.git",
+    "https://evil.example/berlinguyinca/herdr-engineering.git", "https://github.com/berlinguyinca/autospec.git",
+    "https://github.com.evil.example/berlinguyinca/herdr-engineering.git", "",
+])
+def test_origin_matches_rejects_other_owners_hosts_names_and_paths(url):
+    assert not host_apply.origin_matches(url, "herdr-engineering")
+
+
+def test_a_checkout_ahead_of_the_target_is_not_installed_and_gets_no_receipt(world):
+    older = world.publish("two")
+    world.publish("three")                                    # main moved on (nightly updater) ...
+    world.host_git("pull", "-q", "--ff-only", "origin", "main")   # ... and so did the checkout
+    out = world.run("apply", sha=older)
     assert (out["status"], out["reason"]) == ("failed", "apply_failed")
-    assert not world.marker.exists()
-    assert host_apply.origin_matches("git@github.com:berlinguyinca/herdr-engineering.git", "herdr-engineering")
-    assert host_apply.origin_matches("https://github.com/berlinguyinca/herdr-engineering/", "herdr-engineering")
-    assert not host_apply.origin_matches("https://github.com/x/herdr-engineering-evil.git", "herdr-engineering")
+    assert not world.marker.exists()                          # nothing was installed
+    assert not (world.home / "state/herdr-engineering/fleet-watch/installed-herdr-engineering.json").exists()
+    assert world.run("precheck", sha=older)["no_change"] is False
+
+
+def test_autospec_rollback_is_not_claimed_when_the_host_was_already_on_the_target(world):
+    world, env = autospec_world(world)
+    target = world.publish("two")
+    assert world.run("all", repo="autospec", sha=target, env=env)["status"] == "ok"
+    back = world.run("rollback", repo="autospec", sha=target, before_sha=target, env=env)
+    assert back["status"] == "skipped" and back["not_applicable"] is True
 
 
 def test_a_garbage_autospec_receipt_does_not_crash(world):

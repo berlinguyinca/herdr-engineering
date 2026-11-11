@@ -252,7 +252,9 @@ class Runner:
                     self._skip(saved, rid, rollout, name, repo, reason)
                     continue
                 status, reason = self._row(saved, rid, rollout, name, repo, bool(host["optional"]))
-                if not self._settled(row):
+                if status == "skipped" and reason == "optional_unreachable":
+                    hold = reason                  # an unreachable optional host is skipped for every later repo too
+                elif not self._settled(row):
                     halted = (name, reason)
         if halted:
             rollout["status"] = "halted"
@@ -299,14 +301,22 @@ class Runner:
         sha = rollout["targets"][repo]
         before = rollout["before"].get(repo)         # the plan-wide baseline; the host's own is learned by precheck
         started = now()
+        # A crash mid-row leaves state "running": the host's own previous revision was saved at precheck time and must
+        # survive (after a switch, a fresh precheck would report the target as "before" and rollback would do nothing).
+        carried = row.get("host_before") if row.get("state") == "running" else None
         row.clear()
         row["state"] = "running"
+        if carried:
+            row["host_before"] = carried
         state.save(saved, self.directory)
         self._emit(rid, "host.started", host=host, repo=short(repo))
         self._step(rid, host, repo, "precheck")
         result = self._call(rid, host, repo, sha, "precheck", before)
         phase = "precheck"
-        own_before = result.get("before_sha") if result["status"] == "ok" else None
+        own_before = carried or (result.get("before_sha") if result["status"] == "ok" else None)
+        if own_before and row.get("host_before") != own_before:
+            row["host_before"] = own_before
+            state.save(saved, self.directory)
         applied = False
         if result["status"] == "ok":
             self._step(rid, host, repo, "applying", result)
