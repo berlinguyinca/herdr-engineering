@@ -24,7 +24,7 @@ from .projection_store import CheckpointInvalid, ProjectionStore, SnapshotChange
 
 log = logging.getLogger(__name__)
 RETENTION_TYPES = frozenset({'inspector','host_metrics','token_usage','resource_usage',
-                             'ci_report','ci_observation','ci_telemetry','ci_pipeline'})
+                             'ci_report','ci_observation','ci_telemetry','ci_pipeline','mission_activity_store'})
 # Fabric compaction deletes interior service observation rows. The change log carries no event_type, so any
 # service delete is tolerated; the stream is then rebuilt from its surviving rows (see _append_blocker).
 COMPACTED_TYPES = frozenset({'service'})

@@ -51,6 +51,15 @@ def parse_inspector_snapshots(raw) -> dict:
     return {"enabled": enabled, "interval_seconds": float(interval)}
 
 
+async def archived_inspector_count(conn, watermark: int) -> int:
+    """Inspector rows the archive job moved out of ``fabric_events`` at or below ``watermark``. The snapshot consumed them,
+    so they count toward its ``event_count``; 0 when the archive table does not exist."""
+    if not await conn.fetchval("SELECT to_regclass('fabric_events_archive') IS NOT NULL"):
+        return 0
+    return int(await conn.fetchval(f"SELECT count(*) FROM fabric_events_archive WHERE {_VALID} AND sequence <= $1",
+                                   int(watermark)))
+
+
 def encode(state: dict) -> bytes:
     return gzip.compress(json.dumps(state, separators=(",", ":")).encode(), compresslevel=3)
 
@@ -74,7 +83,7 @@ def apply_to_store(store: InspectorStore, row: dict | None, events: list[dict], 
         covered = row.get("covered_count")
         if covered is None:
             covered = sum(1 for e in events if isinstance(e.get("sequence"), int) and e["sequence"] <= watermark)
-        if int(covered) != int(row["event_count"]):
+        if int(covered) + int(row.get("archived_count") or 0) != int(row["event_count"]):
             raise SnapshotStale("the event log below the watermark is not the one the snapshot consumed")
         state = decode(row["body"])
         if state.get("watermark") != watermark or state.get("count") != int(row["event_count"]):
@@ -138,6 +147,7 @@ class SnapshotWriter:
         covered = await conn.fetchval(f"SELECT count(*) FROM fabric_events WHERE {_VALID} AND sequence <= $1 "
                                       "AND ingest_timestamp < now() - make_interval(secs => $2)",
                                       shadow.replay_watermark, self.settle)
+        covered = int(covered) + await archived_inspector_count(conn, shadow.replay_watermark)
         if int(covered) != shadow.replay_count:
             log.warning("inspector snapshot missed or lost events (%s stored, %s consumed); rebuilding", covered, shadow.replay_count)
             return await self._rebuild(conn)
@@ -161,6 +171,7 @@ class SnapshotWriter:
         covered = await conn.fetchval(f"SELECT count(*) FROM fabric_events WHERE {_VALID} AND sequence <= $1 "
                                       "AND ingest_timestamp < now() - make_interval(secs => $2)",
                                       shadow.replay_watermark, self.settle)
+        covered = int(covered) + await archived_inspector_count(conn, shadow.replay_watermark)
         if int(covered) != shadow.replay_count:
             self._shadow = None
             return "rebuild did not match the stored log; nothing written"

@@ -508,6 +508,24 @@ def test_ingest_retention_is_bounded_per_host_and_in_hosts(tmp_path):
         svr.shutdown()
 
 
+def test_ingest_rate_limit_is_per_host(tmp_path):
+    svr, base, _ = _serve_ingest(tmp_path, {"enabled": True, "max_reports_per_minute": 2})
+    try:
+        for i in (1, 2):
+            assert call(base, "POST", REPORT, "k-host", {"host_id": "h2", "builds": [_rec("h2", i)]})[0] == 200
+        code, out = call(base, "POST", REPORT, "k-host", {"host_id": "h2", "builds": [_rec("h2", 3)]})
+        assert code == 429 and "max_reports_per_minute" in out["error"]
+        assert call(base, "POST", REPORT, "k-host", {"host_id": "h3", "builds": [_rec("h3", 1)]})[0] == 200
+    finally:
+        svr.shutdown()
+
+
+def test_ingest_rate_limit_config_validates_and_has_a_default():
+    assert build_cache_config({"enabled": True})["ingest"]["max_reports_per_minute"] == 30
+    with pytest.raises(ValueError):
+        build_cache_config({"enabled": True, "ingest": {"max_reports_per_minute": 0}})
+
+
 @pytest.mark.parametrize("body", [
     {"builds": [_rec("h2", 1)]},                                   # no host_id
     {"host_id": "h2"},                                             # no builds

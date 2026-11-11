@@ -62,6 +62,8 @@ _HOST_TERMINAL_OUT = re.compile(r"^/api/v1/host/terminal/[^/]+/output$")
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure)"
+                        # Usage reporters (llm-proxy, llm-gateway-usage): an agent key may report tokens, nothing wider.
+                        r"|token-usage"
                         r"|architecture/(?:snapshots|analyses|analyses/claim)"
                         # CI fix runner: claim, report state, report result. Never create or cancel.
                         r"|ci/fix/claim|ci/fix/[^/]+/(?:state|result))$")
@@ -318,7 +320,7 @@ class ControlPlaneServer:
                  assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None, build_cache=None,
-                 memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
+                 memory_adapter=None, memory_config=None, unified_workspace_config=None, work_center_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None, library=None,
                  library_viewers=None, member_directory=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
@@ -377,6 +379,8 @@ class ControlPlaneServer:
         from .deployment_definitions import DeploymentDefinitions
         self.deployment_definitions = DeploymentDefinitions(
             lambda: self._control_plane_value(fleet_config, "deployment_definitions"),
+            # fail CLOSED: an unreadable fleet file means an empty allowlist, not the last good one
+            ci_components=lambda: self._deployment_secure_value("ci_deployments"),
             ci_snapshot=lambda: self.ci_monitor.snapshot(start=True))
         # The stage coordinator (Task 3), ticked by _deployments_loop; GET /api/v1/deployments
         # serves the last tick and never ticks itself. `deployment_evidence` is the release-evidence
@@ -438,6 +442,9 @@ class ControlPlaneServer:
         self.summary_report = None
         # unified_workspace_v1 (P01): capability advertisement only; no route consumes it yet. YAML-only, default off.
         self.unified_workspace_enabled = isinstance(unified_workspace_config, dict) and unified_workspace_config.get("enabled") is True
+        # work_center_v1 (WC-006): gates every Work Command Center UI surface in the dashboard (This week card, session Work Context
+        # header, board "Open in Herdr" links). Advertisement only; no route consumes it. YAML-only, strict True, default off.
+        self.work_center_enabled = isinstance(work_center_config, dict) and work_center_config.get("enabled") is True
         self._summary_stop = threading.Event()
         self._summary_scanner = None
         if not collab_only:
@@ -1662,6 +1669,8 @@ class ControlPlaneServer:
             caps.append("memory_v1")
         if getattr(self, "unified_workspace_enabled", False):
             caps.append("unified_workspace_v1")
+        if getattr(self, "work_center_enabled", False):
+            caps.append("work_center_v1")
         if getattr(self, "skills", None) is not None:
             caps.append("skill_registry_v1")
         if getattr(self, "build_cache", None) is not None:
@@ -3708,12 +3717,13 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
             if resource == "mission-outcomes" and len(parts) == 4:
-                from .mission_outcome import outcome_summaries
+                from .mission_outcome import issue_refs_by_mission, outcome_summaries, pr_refs_by_mission
                 try:
                     server.mission_outcomes.sweep()
                 except Exception:  # noqa: BLE001
                     pass
-                return self._json({"outcomes": outcome_summaries(r)})
+                return self._json({"outcomes": outcome_summaries(r), "pr_refs": pr_refs_by_mission(r),
+                                   "issue_refs": issue_refs_by_mission(r)})
             if resource == "missions":
                 try:
                     server.mission_outcomes.sweep()   # throttled; closes missions that went silent
@@ -3926,6 +3936,18 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     return self._json(r.usage_analytics(
                         mission_id=_q(self.path, "mission")))
                 return self._json({"error": "unknown analytics kind"}, 404)
+            if resource == "work":
+                # G1: read-only cross-entity lifecycle window; same viewer-level read auth as /events, gated by work_center_v1.
+                if not getattr(server, "work_center_enabled", False) or parts[4:] != ["weekly-events"]:
+                    return self._json({"error": "not found"}, 404)
+                from .work_weekly import weekly_events
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                for key in ("since", "until", "limit", "after"):
+                    if len(query.get(key, [])) > 1:
+                        raise ValueError(f"{key} must be supplied once")
+                return self._json(weekly_events(
+                    r, since=query.get("since", [None])[0], until=query.get("until", [None])[0],
+                    limit=query.get("limit", [None])[0], after=query.get("after", [None])[0]))
             if resource == "events":
                 if len(parts) > 4 and parts[4] == "stream":
                     return self._sse()

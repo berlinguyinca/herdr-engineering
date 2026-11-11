@@ -313,7 +313,12 @@ class PostgresSource(DurableSource):
                 f"SELECT count(*) FROM {self._events_table} WHERE entity_type = 'inspector' AND entity_id IS NOT NULL "
                 "AND entity_id <> '' AND sequence <= $1", int(row["watermark"]))
             row["covered_count"] = int(covered)
-            if int(covered) != int(row["event_count"]):
+            archived = 0
+            if self._events_table == "fabric_events":
+                from .inspector_snapshot import archived_inspector_count
+                archived = await archived_inspector_count(conn, int(row["watermark"]))
+            row["archived_count"] = archived      # rows the archive job moved out; the snapshot consumed them
+            if int(covered) + archived != int(row["event_count"]):
                 return row, None
             row["skipped_upto"] = int(row["watermark"])
             return row, int(row["watermark"])

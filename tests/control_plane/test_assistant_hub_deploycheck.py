@@ -504,6 +504,17 @@ def _healthy_and_posted(sw, hl):
     wait_seen(sw, check)
     sw.clock.now = HUB_NOW + timedelta(minutes=11)
     assert sw.listener.wait_for(lambda: len(outcome_posts(sw)) == 1)
+
+    # The Slack post and the row are written by the same drain step, and the post lands first.
+    # Waiting on the post alone therefore leaves `status`/`notified` racing - the post is in the
+    # outbox while the row still reads as un-notified, which is the intermittent
+    # `assert ('healthy' == 'healthy' and False is True)` of issue #703. Wait for the state actually
+    # being asserted, the way test_exit_one_..._notified already does further down this file.
+    def settled() -> bool:
+        got = sw.store.get_deploy_check(check.check_id, tenant_id="t1", user_id="u1")
+        return bool(got) and got.status == "healthy" and got.notified is True
+
+    assert sw.listener.wait_for(settled)
     got = sw.store.get_deploy_check(check.check_id, tenant_id="t1", user_id="u1")
     assert got.status == "healthy" and got.notified is True
     return check
