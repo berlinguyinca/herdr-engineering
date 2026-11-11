@@ -174,6 +174,26 @@ def _seed_related(repo, session_id, mission_id):
                               "branch": "fix/parser", "state": "success"})
 
 
+def _seed_pi_activity(repo):
+    """G9: a Pi activity snapshot (contract v4 shape) for the existing Pi mission pi:MSN-PI1, through the real ingest path,
+    plus an agent that names that mission. Pi reports a next action and links issue org/app#321 and PR org/app#42."""
+    from datetime import UTC, datetime
+
+    from herdr_engineering.control_plane.ingest import IngestService
+    now = datetime.now(UTC).isoformat()
+    IngestService(repo).ingest({
+        "entity_type": "mission_activity", "entity_id": "pi:MSN-PI1", "source": "pi", "event_type": "mission_activity.snapshot",
+        "payload": {"contract_version": 1, "host_id": "beast", "instance_id": "i", "session_id": "native-1", "observed_at": now,
+                    "snapshot_at": now, "mission_revision": 1, "connection": "connected",
+                    "mission": {"id": "MSN-PI1", "title": "Pi mission", "status": "EXECUTING", "created_at": "2026-10-14T12:00:00Z",
+                                "links": [{"kind": "issue", "repository": "org/app", "number": 321},
+                                          {"kind": "pull_request", "repository": "org/app", "number": 42}]},
+                    "activity": {"health": "active", "nextAction": "Run the integration suite", "nextActionAt": now}}})
+    sid = repo.create_session(agent_role="pi", model="gpt-4o")
+    repo.upsert_session(sid, host_id="beast", mission_id="pi:MSN-PI1", status="running")
+    return sid
+
+
 def _seed_missions(repo, m1, s1):
     """Missions in each state for the story page: Alpha succeeded with an outcome, Gamma failed, Delta ended
     before outcomes were kept, Beta (the base seed) still running."""
@@ -202,6 +222,8 @@ def main():
         _seed_related(repo, _s1, _m1)
     if os.environ.get("MISSION_STORY_SEED") == "1":
         _seed_missions(repo, _m1, _s1)
+    if os.environ.get("PI_ACTIVITY_SEED") == "1":
+        _seed_pi_activity(repo)
 
     # A fixture price table for the Usage page's spend estimate (production reads control_plane.usage.prices from YAML).
     usage_prices = ([{"model": "qwen*", "input": 100.0, "output": 200.0, "cached": None, "cached_in_input": False}]
@@ -209,7 +231,9 @@ def main():
     # No quiet hours: the production default (22:00-07:00 on the browser's clock) would hold notifications back, so
     # a browser test would pass in the evening and fail at night.
     svr = ControlPlaneServer(repo, host="127.0.0.1", port=0, usage_prices=usage_prices,
-                             attention={"notify": {"quiet_hours": None}}, web_root=_REPO / "packages")
+                             attention={"notify": {"quiet_hours": None}}, web_root=_REPO / "packages",
+                             # WC-006: the Work Command Center UI is gated by the work_center_v1 capability (default off).
+                             work_center_config={"enabled": True} if os.environ.get("WORK_CENTER") == "1" else None)
     # Stricter than the production default (600/min): a throttled live-
     # refreshing dashboard must respect a finite per-IP budget. This makes the
     # rate-limit regression test fast and unambiguous (an un-throttled client

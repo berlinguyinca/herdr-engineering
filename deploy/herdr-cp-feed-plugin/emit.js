@@ -29,7 +29,7 @@
 import os from "node:os";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { readHostJson } from "./host-config.js";
+import { readHostJson, loadHostConfig } from "./host-config.js";
 import { pathToFileURL } from "node:url";
 import { enrichSession, rawWorkspace, resolveSessionEnv } from "./enrich.js";
 import { recordSessionBinding } from "./session-helpers.js";
@@ -268,13 +268,15 @@ export function resolveUrl(env = process.env) {
   catch { return null; }
 }
 
-async function send(url, envelope) {
+export async function send(url, envelope, apiKey = null) {
+  const headers = { "content-type": "application/json" };
+  if (apiKey) headers["X-API-Key"] = apiKey;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 2000);
   try {
     const res = await fetch(`${url}/api/v1/ingest`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify(envelope),
       signal: controller.signal,
     });
@@ -323,7 +325,10 @@ async function main() {
     process.stderr.write("[herdr-cp-feed] host config unavailable: no host.json; run `herdr-eng fleet join`\n");
     return;
   }
-  await Promise.allSettled(enriched.map((e) => send(url, e)));
+  // Keyed control plane: the host config's ingest key. Absent or unreachable
+  // config keeps the open (keyless) behaviour.
+  const apiKey = await loadHostConfig().then((c) => c?.apiKey ?? null).catch(() => null);
+  await Promise.allSettled(enriched.map((e) => send(url, e, apiKey)));
 }
 
 // Only run when executed directly (not when imported by tests).
