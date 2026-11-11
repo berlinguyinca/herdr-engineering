@@ -103,7 +103,7 @@ Rollback: `fleet-watch run --apply` (below) is the only caller of the emitter; r
 
 ```
 herdr-eng fleet host-apply --rollout ID --repo R --sha S [--host H] [--phase precheck|apply|health|rollback|all]
-herdr-eng fleet-watch run [--apply] [--resume] [--local-host beast|none] [--rollback-scope failed_host|all_updated]
+herdr-eng fleet-watch run [--apply] [--resume] [--local-host auto|beast|bender|macbook-pro|none] [--rollback-scope failed_host|all_updated]
 ```
 
 `fleet-watch run` without `--apply` is the dry-run plan (no ssh, no events). With `--apply` it walks beast, bender,
@@ -113,17 +113,33 @@ The first row that is not ok halts the rollout and later rows are `skipped(halte
 `skipped(optional_unreachable)` and does not halt, an unreachable beast or bender halts. A timeout is `failed(timeout)`.
 State is saved after every transition (`state.json`, `rollouts[id]`): a crash resumes at the first unfinished row on the
 next `run --apply` (event `rollout.resumed`, no reason); a halted rollout is re-run only with `--resume` (reason
-`operator`). The lock file is not written yet (step 5).
+`operator`). The halt is saved in the same write as the failing row, and a crash that still lost it is repaired on
+resume: a finished row that is not ok (and not a deliberate `optional_unreachable`/`not_applicable` skip) always halts,
+later hosts are never applied and `converged` does not move. A halt that was never emitted is emitted
+(`rollout.halted`) before `rollout.resumed`. The lock file is not written yet (step 5).
+
+Which host is "local" (applied without ssh) is verified, not assumed: `--local-host auto` (default) is this machine
+when the `host_id` of `~/.config/herdr-engineering/host.json` (else the short hostname) is a fleet host, otherwise
+every host goes over ssh. An explicit `--local-host X` that is not this machine is refused (exit 2, no ssh, no events).
+A remote answer is accepted only if it echoes the request (rollout id, repo, sha, phase), an ok apply/health ends on
+the target sha, and a `skipped` carries a reason or `not_applicable`; anything else is `failed(apply_failed)`.
 
 `host-apply` prints ONE JSON object made of closed enums, hex, ints and UTC timestamps (section 14); log text, including
 example dirty paths (at most 8), stays in the host's log store and is read with `fleet-watch log show`. Idempotent: an
-installed sha equal to the target is `ok` with `no_change`. D6 gate: `blocked(dirty_checkout|not_on_main|
+installed build equal to the target is `ok` with `no_change`. For herdr-engineering the installed build is a receipt
+(`$XDG_STATE_HOME/herdr-engineering/fleet-watch/installed-herdr-engineering.json`) written only after the checkout
+fast-forward, the install and the agent restart all succeeded; `no_change` needs receipt == target AND checkout HEAD ==
+target, so an install that failed after the fast-forward is retried (no receipt means "apply again", which is idempotent).
+The deployment checkout is `$HERDR_ENGINEERING_REPO`, else the one-line file `~/.config/herdr-engineering/
+deployment-checkout` (an absolute path; non-interactive ssh has no profile environment), else `failed(apply_failed)`
+with the cause in the host log. The checkout's `origin` URL must end in the repo's name (`.../<repo>(.git)`), else
+`failed(apply_failed)`. D6 gate: `blocked(dirty_checkout|not_on_main|
 unpublished_commits)` with counts, never a clean, stash or reset. It holds `fleet-auto-update.lock` (`blocked(busy)`
 after 5 retries, 60 s apart).
 
 Per repo: herdr-engineering = ff-only + pip install + agent restart (no automatic rollback: ff-only cannot go backwards);
 pi-engineering = stage release, atomic `current` symlink switch (temp link + `rename`), keep 3 releases (never the current
-or previous), no signal to live sessions, rollback = flip the link back; autospec = refresh the runtime checkout and
+or previous), no signal to live sessions, rollback = flip the link back to the host's OWN previous release (its precheck `before_sha`), and only if `current` is still the release this rollout activated; autospec = refresh the runtime checkout and
 installer, rollback only while the newest generation receipt still equals the before sha. ai-sync and claude-config are
 `skipped(not_applicable)`. `--rollback-scope failed_host` (default) undoes the failed row and updated rows of that host;
 `all_updated` undoes every updated row, newest first; each rollback emits a further `host.finished(rolled_back)`.

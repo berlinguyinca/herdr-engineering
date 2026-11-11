@@ -77,9 +77,10 @@ def assert_closed(result: dict) -> None:
 class World:
     """A bare origin, a developer clone that publishes commits, and the host's deployment checkout."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, name: str = "herdr-engineering"):
+        root.mkdir(parents=True, exist_ok=True)
         self.root = root
-        self.origin = root / "origin.git"
+        self.origin = root / f"{name}.git"
         subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(self.origin)], check=True)
         self.dev = root / "dev"
         subprocess.run(["git", "init", "-q", "-b", "main", str(self.dev)], check=True)
@@ -109,6 +110,12 @@ class World:
 
     def head(self) -> str:
         return git(self.checkout, "rev-parse", "HEAD")
+
+    def sibling(self, name: str) -> World:
+        """Another repo (own origin named after it) that shares this world's HOME and state."""
+        other = World(self.root / name, name)
+        other.home, other.env, other.marker = self.home, {**self.env}, self.marker
+        return other
 
     def run(self, phase, repo="herdr-engineering", sha=None, **kw) -> dict:
         return host_apply.run_phase(phase, rollout_id=RID, repo=repo, sha=sha or self.head(), host="bender",
@@ -291,6 +298,96 @@ def test_busy_lock_is_retried_and_then_succeeds(world):
     assert out["status"] == "ok" and world.head() == target
 
 
+# --------------------------------------------------------------------------- installed build, not checkout HEAD
+
+def test_failed_install_after_the_fast_forward_is_retried_not_no_change(world):
+    target = world.publish("two")
+    good_install = world.env["HERDR_FLEET_HERDR_INSTALL_CMD"]
+    world.env["HERDR_FLEET_HERDR_INSTALL_CMD"] = str(script(world.root / "bad.sh", "exit 3"))
+    assert world.run("apply", sha=target)["status"] == "failed"
+    assert world.head() == target                                     # the checkout moved, the install did not
+    world.env["HERDR_FLEET_HERDR_INSTALL_CMD"] = good_install
+    pre = world.run("precheck", sha=target)
+    assert pre["no_change"] is False
+    assert world.run("health", sha=target)["reason"] == "health_failed"   # nothing installed yet: not healthy
+    out = world.run("apply", sha=target)
+    assert (out["status"], out["no_change"]) == ("ok", False)
+    assert world.marker.read_text().strip() == target                  # the installer really ran this time
+    assert world.run("health", sha=target)["status"] == "ok"
+
+
+def test_failed_agent_restart_after_install_is_retried(world):
+    target = world.publish("two")
+    good = world.env["HERDR_FLEET_HERDR_AGENT_CMD"]
+    world.env["HERDR_FLEET_HERDR_AGENT_CMD"] = str(script(world.root / "badagent.sh", "exit 1"))
+    assert world.run("apply", sha=target)["status"] == "failed"
+    world.env["HERDR_FLEET_HERDR_AGENT_CMD"] = good
+    assert world.run("precheck", sha=target)["no_change"] is False
+
+
+def test_receipt_for_the_target_but_a_checkout_moved_back_is_not_no_change(world):
+    target = world.publish("two")
+    assert world.run("all", sha=target)["status"] == "ok"
+    git(world.checkout, "reset", "-q", "--hard", "HEAD~1")             # the test may; the production code never does
+    assert world.run("precheck", sha=target)["no_change"] is False
+    assert world.run("health", sha=target)["reason"] == "health_failed"
+
+
+def test_repo_location_falls_back_to_the_config_file_then_fails_closed(world):
+    target = world.publish("two")
+    env = {k: v for k, v in world.env.items() if k != "HERDR_ENGINEERING_REPO"}
+    out = world.run("precheck", sha=target, env=env)
+    assert (out["status"], out["reason"]) == ("failed", "apply_failed")
+    assert_closed(out)
+    config = world.home / ".config/herdr-engineering/deployment-checkout"
+    config.parent.mkdir(parents=True)
+    config.write_text(str(world.checkout) + "\n")
+    assert world.run("all", sha=target, env=env)["status"] == "ok"
+    config.write_text("relative/path\n")                               # only an absolute directory is accepted
+    assert world.run("precheck", sha=target, env=env)["reason"] == "apply_failed"
+
+
+def test_a_checkout_whose_origin_is_another_repo_is_refused(world):
+    target = world.publish("two")
+    git(world.checkout, "remote", "set-url", "origin", "https://example.invalid/someone/else.git")
+    out = world.run("apply", sha=target)
+    assert (out["status"], out["reason"]) == ("failed", "apply_failed")
+    assert not world.marker.exists()
+    assert host_apply.origin_matches("git@github.com:berlinguyinca/herdr-engineering.git", "herdr-engineering")
+    assert host_apply.origin_matches("https://github.com/berlinguyinca/herdr-engineering/", "herdr-engineering")
+    assert not host_apply.origin_matches("https://github.com/x/herdr-engineering-evil.git", "herdr-engineering")
+
+
+def test_a_garbage_autospec_receipt_does_not_crash(world):
+    world, env = autospec_world(world)
+    gen = world.home / ".autospec/runtime-generations/gen-bad"
+    gen.mkdir()
+    (gen / "receipt").write_bytes(b"\xff\xfe\x00head=")
+    target = world.publish("two")
+    out = world.run("precheck", repo="autospec", sha=target, env=env)
+    assert out["status"] == "ok" and out["before_sha"] is None
+
+
+def test_pi_rollback_does_nothing_when_the_stage_failed_before_the_switch(world):
+    make_release(world, PI_SHAS[0])
+    root = world.home / ".local/share/herdr-engineering/pi"
+    os.symlink(f"releases/{PI_SHAS[0]}", root / "current")
+    env = {**pi_env(world), "HERDR_FLEET_PI_STAGE_CMD": "false"}
+    assert world.run("apply", repo="pi-engineering", sha=PI_SHAS[1], env=env)["status"] == "failed"
+    back = world.run("rollback", repo="pi-engineering", sha=PI_SHAS[1], before_sha=PI_SHAS[0], env=env)
+    assert back["status"] == "skipped" and back["not_applicable"] is True
+    assert os.readlink(root / "current") == f"releases/{PI_SHAS[0]}"
+
+
+def test_pi_rollback_never_downgrades_a_host_that_is_at_some_other_release(world):
+    make_release(world, PI_SHAS[0])
+    make_release(world, PI_SHAS[2])
+    root = world.home / ".local/share/herdr-engineering/pi"
+    os.symlink(f"releases/{PI_SHAS[2]}", root / "current")             # legitimately newer than before_sha
+    back = world.run("rollback", repo="pi-engineering", sha=PI_SHAS[1], before_sha=PI_SHAS[0], env=pi_env(world))
+    assert back["status"] == "skipped" and os.readlink(root / "current") == f"releases/{PI_SHAS[2]}"
+
+
 # --------------------------------------------------------------------------- pi-engineering (D7)
 
 PI_SHAS = [f"{i:x}" * 40 for i in range(1, 7)]
@@ -419,20 +516,21 @@ def test_pi_refuses_to_replace_a_real_current_directory(world):
 
 # --------------------------------------------------------------------------- autospec
 
-def autospec_world(world) -> dict:
+def autospec_world(world):
+    world = world.sibling("autospec")
     gens = world.home / ".autospec/runtime-generations"
     gens.mkdir(parents=True)
     install = script(world.root / "as-install.sh", f'''set -e
 g="{gens}/gen-$HERDR_FLEET_TARGET_SHA"
 mkdir -p "$g"
 printf 'schema=4\\nhead=%s\\n' "$HERDR_FLEET_TARGET_SHA" > "$g/receipt"''')
-    return {**world.env, "HERDR_FLEET_AUTOSPEC_CHECKOUT": str(world.checkout),
+    return world, {**world.env, "HERDR_FLEET_AUTOSPEC_CHECKOUT": str(world.checkout),
             "HERDR_FLEET_AUTOSPEC_GENERATIONS": str(gens), "HERDR_FLEET_AUTOSPEC_INSTALL_CMD": str(install),
             "HERDR_FLEET_AUTOSPEC_SMOKE_CMD": str(world.root / "ok.sh")}
 
 
 def test_autospec_applies_and_checks_the_generation_receipt(world):
-    env = autospec_world(world)
+    world, env = autospec_world(world)
     target = world.publish("two")
     out = world.run("all", repo="autospec", sha=target, env=env)
     assert out["status"] == "ok" and out["after_sha"] == target
@@ -441,7 +539,7 @@ def test_autospec_applies_and_checks_the_generation_receipt(world):
 
 
 def test_autospec_dirty_checkout_blocks_and_failed_refresh_leaves_previous_generation(world):
-    env = autospec_world(world)
+    world, env = autospec_world(world)
     first = world.publish("two")
     assert world.run("all", repo="autospec", sha=first, env=env)["status"] == "ok"
     second = world.publish("three")
@@ -457,23 +555,29 @@ def test_autospec_dirty_checkout_blocks_and_failed_refresh_leaves_previous_gener
 
 # --------------------------------------------------------------------------- the real CLI
 
+CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def cli_argv(*args: str) -> list[str]:
+    """Run THIS checkout's code (not whatever is installed in the venv), isolated like the production entry point."""
+    boot = f"import sys; sys.path.insert(0, {str(CHECKOUT_ROOT)!r}); from herdr_engineering.cli import main; sys.exit(main())"
+    return [sys.executable, "-I", "-c", boot, *args]
+
+
 def test_cli_prints_one_closed_json_object_and_sets_the_exit_code(world):
     target = world.publish("two")
-    env = {**world.env, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
-    base = [sys.executable, "-I", "-c", "import sys; from herdr_engineering.cli import main; sys.exit(main())",
-            "fleet", "host-apply", "--rollout", RID, "--repo", "herdr-engineering", "--sha", target,
-            "--host", "bender", "--busy-wait", "0.05"]
-    env_i = {k: v for k, v in env.items() if k != "PYTHONPATH"}
-    out = subprocess.run(base, capture_output=True, text=True, env=env_i, cwd="/", timeout=120)
-    # -I ignores PYTHONPATH, but the venv has the package installed (editable): the installed-build path.
+    base = ["fleet", "host-apply", "--rollout", RID, "--repo", "herdr-engineering", "--busy-wait", "0.05",
+            "--host", "bender"]
+    out = subprocess.run(cli_argv(*base, "--sha", target), capture_output=True, text=True, env=world.env,
+                         cwd="/", timeout=120)
     assert out.returncode == 0, out.stderr
     result = json.loads(out.stdout)
     assert result["status"] == "ok" and out.stdout.count("\n") == 1
     assert_closed(result)
     (world.checkout / "x").write_text("x")
     third = world.publish("three")
-    blocked = subprocess.run([*base[:-6], "--sha", third, "--host", "bender", "--phase", "precheck"],
-                             capture_output=True, text=True, env=env_i, cwd="/", timeout=120)
+    blocked = subprocess.run(cli_argv(*base, "--sha", third, "--phase", "precheck"), capture_output=True,
+                             text=True, env=world.env, cwd="/", timeout=120)
     assert blocked.returncode == 1 and json.loads(blocked.stdout)["reason"] == "dirty_checkout"
-    bad = subprocess.run([*base[:7], "nothex", *base[8:]], capture_output=True, text=True, env=env_i, cwd="/")
+    bad = subprocess.run(cli_argv(*base, "--sha", "nothex"), capture_output=True, text=True, env=world.env, cwd="/")
     assert bad.returncode == 2 and bad.stdout == ""

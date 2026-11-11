@@ -34,6 +34,10 @@ from herdr_engineering.fleet_watch import core, events, run, state
 from herdr_engineering.service_metadata_feed import MetadataClient
 from tests.test_fleet_watch import FakeGitHub, Forge, git
 
+CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
+#: Run THIS checkout's code (not whatever happens to be installed in the venv), isolated like the real entry point.
+BOOT = (f"import sys; sys.path.insert(0, {str(CHECKOUT_ROOT)!r}); "
+        "from herdr_engineering.cli import main; sys.exit(main())")
 HE = "berlinguyinca/herdr-engineering"
 PI = "berlinguyinca/pi-engineering"
 HEX = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}|[0-9a-f]{16}")
@@ -99,7 +103,7 @@ export HERDR_FLEET_HERDR_INSTALL_CMD="{install}" HERDR_FLEET_HERDR_AGENT_CMD=""
 export HERDR_FLEET_HERDR_SERVICE_CMD="{ok}" HERDR_FLEET_PARITY_CMD="{ok}"
 export HERDR_FLEET_PI_STAGE_CMD="{stage}" HERDR_FLEET_PI_SMOKE_CMD="{smoke}"
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
-exec "{sys.executable}" -c "import sys; from herdr_engineering.cli import main; sys.exit(main())" "$@"''')
+exec "{sys.executable}" -I -c "{BOOT}" "$@"''')
         self.shims[host] = shim
 
     def mode(self, host: str, mode: str) -> None:
@@ -131,9 +135,20 @@ exec "{sys.executable}" -c "import sys; from herdr_engineering.cli import main; 
         argv = ["fleet-watch", "run", "--repo", repo, "--lock", str(self.lock), "--local-host", "none", *args]
         if apply:
             argv.append("--apply")
-        return subprocess.run([sys.executable, "-c", "import sys; from herdr_engineering.cli import main; "
-                               "sys.exit(main())", *argv], capture_output=True, text=True, env=self.env(),
-                              timeout=timeout)
+        return subprocess.run([sys.executable, "-I", "-c", BOOT, *argv], capture_output=True, text=True,
+                              env=self.env(), timeout=timeout)
+
+    def identify(self, host_id: str) -> None:
+        """This machine's host.json (the runner's identity); the control plane URL is a closed port."""
+        path = self.runner_home / ".config/herdr-engineering/host.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"control_plane_url": "http://127.0.0.1:1", "host_id": host_id,
+                                    "token": "t" * 16}))
+
+    def tamper(self, edit) -> None:
+        saved = self.saved()
+        edit(saved)
+        state.save(saved, self.state_dir)
 
     def queued(self) -> list[dict]:
         return events.Emitter(self.state_dir, client=None).pending()
@@ -377,9 +392,116 @@ def test_herdr_engineering_has_no_automatic_rollback_so_the_row_stays_failed(fle
     assert [(p["status"], p.get("reason")) for p in fleet.finished()["bender"]] == [("failed", "apply_failed")]
 
 
+# --------------------------------------------------------------------------- crash-resume keeps halting
+
+def test_crash_after_a_failed_row_was_saved_but_before_the_halt_does_not_continue(fleet):
+    (fleet.checkout("beast") / "dirty").write_text("x")
+    assert fleet.cli().returncode == 1                       # beast blocked(dirty_checkout); bender/mac skipped(halted)
+    calls = fleet.calls()
+
+    def crash_state(saved):                                  # the state a crash between the two saves would leave
+        [rollout] = saved["rollouts"].values()
+        rollout["status"] = "running"
+        rollout.pop("halt", None)
+        rollout.pop("halt_emitted", None)
+        for key, row in rollout["rows"].items():
+            if not key.startswith("beast/"):
+                row.clear()
+                row["state"] = "pending"
+    fleet.tamper(crash_state)
+    (fleet.checkout("beast") / "dirty").unlink()             # even a fixed beast must not be "retried" by a crash resume
+    out = fleet.cli()                                        # no flag: a crash resumes by itself
+    assert out.returncode == 1 and "halted" in out.stdout
+    assert fleet.calls() == calls                            # no later host was contacted, nothing re-applied
+    saved = fleet.saved()
+    [rollout] = saved["rollouts"].values()
+    assert rollout["status"] == "halted" and saved["converged"] == {}
+    assert [r["reason"] for k, r in rollout["rows"].items() if not k.startswith("beast/")] == ["halted"] * 2
+    assert fleet.installed("bender") is None and fleet.installed("macbook-pro") is None
+
+
+def test_the_halt_is_persisted_together_with_the_failing_row(fleet):
+    (fleet.checkout("bender") / "dirty").write_text("x")
+    fleet.cli()
+    [rollout] = fleet.saved()["rollouts"].values()
+    assert rollout["status"] == "halted" and rollout["halt"] == {"host": "bender", "reason": "dirty_checkout"}
+    assert rollout["halt_emitted"] is True
+
+
+def test_a_halt_that_was_never_emitted_is_emitted_before_the_operator_resume(fleet):
+    (fleet.checkout("bender") / "dirty").write_text("x")
+    fleet.cli()
+    seen = len(fleet.queued())
+    fleet.tamper(lambda saved: next(iter(saved["rollouts"].values())).update(halt_emitted=False))
+    (fleet.checkout("bender") / "dirty").unlink()
+    assert fleet.cli("--resume").returncode == 0
+    new = fleet.types()[seen:]
+    assert new[:2] == ["rollout.halted", "rollout.resumed"] and new[-1] == "rollout.succeeded"
+    halted = [e for e in fleet.queued()[seen:] if e["event_type"] == "rollout.halted"][0]["payload"]
+    assert halted["halted_at_host"] == "bender" and halted["reason"] == "dirty_checkout"
+
+
+# --------------------------------------------------------------------------- rollback targets the host itself
+
+def test_a_no_op_row_is_not_rolled_back_by_a_later_failure(fleet):
+    before, after = pi_world(fleet)
+    root = fleet.home("beast") / ".local/share/herdr-engineering/pi"
+    stage = (fleet.home("beast") / "stage.sh")
+    subprocess.run(["sh", "-c", f'HERDR_FLEET_TARGET_SHA={after} sh {stage} && ln -sfn releases/{after} '
+                    f'{root}/current'], check=True)                 # beast is ALREADY on the target
+    (fleet.home("bender") / "smoke_fail").write_text("")
+    out = fleet.cli("--rollback-scope", "all_updated", repo=PI)
+    assert out.returncode == 1
+    assert current(fleet, "beast") == after                          # untouched: it never changed in this rollout
+    assert [p["status"] for p in fleet.finished()["beast"]] == ["ok"]
+    assert current(fleet, "bender") == before
+
+
+def test_rollback_returns_the_host_to_its_own_release_not_the_plan_baseline(fleet):
+    before, after = pi_world(fleet)
+    own = "c" * 40                                                   # bender legitimately runs a third release
+    root = fleet.home("bender") / ".local/share/herdr-engineering/pi"
+    (root / "releases" / own / "node_modules").mkdir(parents=True)
+    (root / "releases" / own / "package.json").write_text("{}")
+    (root / "receipts" / f"{own}.json").write_text("{}")
+    os.replace(root / "current", root / "old-current")
+    os.symlink(f"releases/{own}", root / "current")
+    (fleet.home("bender") / "smoke_fail").write_text("")
+    assert fleet.cli(repo=PI).returncode == 1
+    assert current(fleet, "bender") == own
+    assert fleet.finished()["bender"][1]["after_sha"] == own
+
+
+# --------------------------------------------------------------------------- who is "local"
+
+def test_an_explicit_local_host_that_is_not_this_machine_is_refused_before_anything_runs(fleet):
+    fleet.identify("bender")
+    out = fleet.cli("--local-host", "beast", "--remote-bin", str(fleet.shims["beast"]))
+    assert out.returncode == 2 and "not this machine" in out.stderr
+    assert fleet.calls() == [] and fleet.queued() == [] and fleet.installed("beast") is None
+    assert fleet.saved()["rollouts"] == {}
+
+
+def test_auto_local_host_follows_host_json_and_the_default_is_auto(fleet):
+    fleet.identify("beast")
+    out = fleet.cli("--local-host", "auto", "--remote-bin", str(fleet.shims["beast"]))
+    assert out.returncode == 0, out.stderr
+    assert fleet.calls("beast") == [] and fleet.installed("beast") == fleet.forge.head(HE)
+    from herdr_engineering.fleet_watch import cli as watch_cli
+    assert watch_cli.local_identity(fleet.runner_home) == "beast"
+
+
+def test_auto_local_host_that_is_no_fleet_host_uses_ssh_for_everyone(fleet):
+    fleet.identify("laptop")
+    out = fleet.cli("--local-host", "auto")
+    assert out.returncode == 0, out.stderr
+    assert len(fleet.calls("beast")) == 3
+
+
 # --------------------------------------------------------------------------- local host, delivery
 
 def test_the_local_host_is_applied_without_ssh(fleet):
+    fleet.identify("beast")
     out = fleet.cli("--local-host", "beast", "--remote-bin", str(fleet.shims["beast"]))
     assert out.returncode == 0, out.stderr
     assert fleet.calls("beast") == []                                                # no ssh for beast
@@ -417,20 +539,50 @@ def test_events_reach_a_real_control_plane_in_order_through_the_outbox(fleet, li
         assert_closed({k: v for k, v in e["payload"].items() if not k.startswith("_")})
 
 
+RID = "0123456789abcdef"
+SHA = "a" * 40
+
+
+def host_json(**over) -> str:
+    return json.dumps({"schema_version": 1, "phase": "apply", "rollout_id": RID, "repo": "herdr-engineering",
+                       "sha": SHA, "status": "ok", "after_sha": SHA, "no_change": False, **over})
+
+
 def test_unit_parse_result_rejects_anything_outside_the_closed_vocabulary():
-    rid = "0123456789abcdef"
-    ok = run.Outcome(0, json.dumps({"status": "ok", "after_sha": "a" * 40, "no_change": True}))
-    assert run.parse_result(rid, "beast", HE, ok)["no_change"] is True
+    ok = run.Outcome(0, host_json(no_change=True))
+    assert run.parse_result(RID, "beast", HE, ok, sha=SHA, phase="apply")["no_change"] is True
     for stdout in ("not json", "[]", json.dumps({"status": "exploded"}),
-                   json.dumps({"status": "failed", "reason": "my password is hunter2"}),
-                   json.dumps({"status": "ok", "checks": [{"name": "free text", "status": "ok"}]})):
-        got = run.parse_result(rid, "beast", HE, run.Outcome(1, stdout))
+                   host_json(status="failed", reason="my password is hunter2"),
+                   host_json(checks=[{"name": "free text", "status": "ok"}])):
+        got = run.parse_result(RID, "beast", HE, run.Outcome(1, stdout), sha=SHA, phase="apply")
         assert (got["status"], got["reason"]) == ("failed", "apply_failed")
-    assert run.parse_result(rid, "beast", HE, run.Outcome(0, '{"status": "failed", "reason": "timeout"}'))[
-        "reason"] == "timeout"
-    assert run.parse_result(rid, "beast", HE, run.Outcome(None, "", timed_out=True))["reason"] == "timeout"
-    assert run.parse_result(rid, "beast", HE, run.Outcome(255, ""))["status"] == "unreachable"
-    assert run.parse_result(rid, "beast", HE, run.Outcome(2, json.dumps({"status": "ok"})))["status"] == "failed"
+    assert run.parse_result(RID, "beast", HE, run.Outcome(0, host_json(status="failed", reason="timeout")),
+                            sha=SHA, phase="apply")["reason"] == "timeout"
+    assert run.parse_result(RID, "beast", HE, run.Outcome(None, "", timed_out=True))["reason"] == "timeout"
+    assert run.parse_result(RID, "beast", HE, run.Outcome(255, ""))["status"] == "unreachable"
+    assert run.parse_result(RID, "beast", HE, run.Outcome(2, host_json()), sha=SHA, phase="apply")["status"] == "failed"
+
+
+@pytest.mark.parametrize("override", [
+    {"rollout_id": "f" * 16}, {"repo": "pi-engineering"}, {"sha": "b" * 40}, {"phase": "health"},
+    {"after_sha": "b" * 40}, {"after_sha": None}, {"rollout_id": None},
+])
+def test_unit_parse_result_cross_checks_the_result_against_the_request(override):
+    data = json.loads(host_json())
+    data.update(override)
+    got = run.parse_result(RID, "beast", HE, run.Outcome(0, json.dumps(data)), sha=SHA, phase="apply")
+    assert (got["status"], got["reason"]) == ("failed", "apply_failed")
+
+
+def test_unit_parse_result_a_skipped_without_a_reason_is_not_a_settled_row():
+    bare = host_json(status="skipped", after_sha=None)
+    got = run.parse_result(RID, "bender", HE, run.Outcome(0, bare), sha=SHA, phase="apply")
+    assert (got["status"], got["reason"]) == ("failed", "apply_failed")
+    explained = host_json(status="skipped", after_sha=None, not_applicable=True)
+    assert run.parse_result(RID, "bender", HE, run.Outcome(0, explained), sha=SHA, phase="apply")["status"] == "skipped"
+    assert run.parse_result(RID, "bender", HE, run.Outcome(
+        0, host_json(status="skipped", reason="optional_unreachable", after_sha=None)), sha=SHA, phase="apply"
+    )["status"] == "skipped"
 
 
 def test_unit_transport_refuses_unsafe_arguments():

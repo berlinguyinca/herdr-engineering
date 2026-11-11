@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import json
 import os
 import re
 import shlex
@@ -138,6 +139,11 @@ def _override(ctx: Context, name: str) -> list[str] | None:
 
 # --------------------------------------------------------------------------- D6 gate
 
+def origin_matches(url: str, repo: str) -> bool:
+    """The deployment checkout must be a clone of the repo being rolled out (https, ssh or a path ending in its name)."""
+    return re.search(rf"(^|[/:]){re.escape(repo)}(\.git)?/?$", url.strip()) is not None
+
+
 def checkout_gate(ctx: Context, root: Path) -> dict[str, int]:
     """D6: branch main, porcelain (incl. untracked) empty, origin/main..HEAD == 0. Never cleans, stashes or resets.
 
@@ -145,6 +151,10 @@ def checkout_gate(ctx: Context, root: Path) -> dict[str, int]:
     """
     if not (root / ".git").exists():
         ctx.note(f"no git checkout at {root}")
+        raise PhaseStop("failed", "apply_failed")
+    rc0, origin = _git(ctx, root, "remote", "get-url", "origin")
+    if rc0 or not origin_matches(origin, ctx.repo):
+        ctx.note(f"origin of {root} is not the {ctx.repo} repository")
         raise PhaseStop("failed", "apply_failed")
     rc, branch = _git(ctx, root, "branch", "--show-current")
     rc2, porcelain = _git(ctx, root, "status", "--porcelain", "--untracked-files=all")
@@ -228,17 +238,51 @@ def update_lock(ctx: Context) -> Iterator[None]:
 
 # --------------------------------------------------------------------------- herdr-engineering
 
+def state_dir(env: dict[str, str]) -> Path:
+    root = env.get("XDG_STATE_HOME") or str(Path(env.get("HOME") or Path.home()) / ".local" / "state")
+    return Path(root) / "herdr-engineering" / "fleet-watch"
+
+
 class HerdrEngineering:
+    """The installed build is NOT the checkout HEAD (a fast-forward can succeed while pip or the agent restart
+    fails), so a successful apply writes a receipt naming the revision it installed; `installed` is that receipt."""
+
     def root(self, ctx: Context) -> Path:
+        """Deployment checkout: $HERDR_ENGINEERING_REPO, else the one-line file ~/.config/herdr-engineering/
+        deployment-checkout (non-interactive ssh has no profile environment), else a closed failure."""
         configured = ctx.env.get("HERDR_ENGINEERING_REPO")
         if not configured:
-            ctx.note("HERDR_ENGINEERING_REPO is not set")
+            file = ctx.home / ".config" / "herdr-engineering" / "deployment-checkout"
+            try:
+                configured = file.read_text().strip()
+            except (OSError, ValueError):
+                configured = ""
+        if not configured or not Path(configured).is_absolute():
+            ctx.note("no deployment checkout: set HERDR_ENGINEERING_REPO or write an absolute path to "
+                     "~/.config/herdr-engineering/deployment-checkout")
             raise PhaseStop("failed", "apply_failed")
         return Path(configured)
 
+    def receipt(self, ctx: Context) -> Path:
+        return state_dir(ctx.env) / "installed-herdr-engineering.json"
+
     def installed(self, ctx: Context) -> str | None:
+        try:
+            sha = json.loads(self.receipt(ctx).read_text()).get("sha")
+        except (OSError, ValueError, AttributeError):
+            return None
+        return sha if isinstance(sha, str) and _SHA.fullmatch(sha) else None
+
+    def converged(self, ctx: Context) -> bool:
         root = self.root(ctx)
-        return _head(ctx, root) if (root / ".git").exists() else None
+        return self.installed(ctx) == ctx.sha and (root / ".git").exists() and _head(ctx, root) == ctx.sha
+
+    def _write_receipt(self, ctx: Context) -> None:
+        path = self.receipt(ctx)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}")
+        tmp.write_text(json.dumps({"sha": ctx.sha}))
+        os.replace(tmp, path)
 
     def gate(self, ctx: Context) -> dict[str, int]:
         return checkout_gate(ctx, self.root(ctx))
@@ -259,9 +303,10 @@ class HerdrEngineering:
             label = f"gui/{os.getuid()}/com.herdr-engineering.fabric-agent"
             if _run(ctx, ["launchctl", "print", label])[0] == 0:
                 _checked(ctx, ["launchctl", "kickstart", "-k", label])
+        self._write_receipt(ctx)
 
     def checks(self, ctx: Context) -> list[dict]:
-        out = [_check("version_matches", self.installed(ctx) == ctx.sha)]
+        out = [_check("version_matches", self.converged(ctx))]
         service = _override(ctx, "HERDR_SERVICE")
         if service is None and sys.platform.startswith("linux") and shutil.which("systemctl"):
             service = ["systemctl", "--user", "is-active", "--quiet", "herdr-eng-fabric-agent.service"]
@@ -304,17 +349,21 @@ class Autospec:
 
     def active_head(self, ctx: Context) -> str | None:
         """`head=` of the newest generation receipt: the runtime the host is on."""
-        receipts = sorted(self.generations(ctx).glob("*/receipt"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for receipt in receipts[:1]:
-            match = re.search(r"^head=([0-9a-f]{40})$", receipt.read_text(), re.M)
-            return match.group(1) if match else None
+        try:
+            receipts = sorted(self.generations(ctx).glob("*/receipt"), key=lambda p: p.stat().st_mtime,
+                              reverse=True)
+            for receipt in receipts[:1]:
+                match = re.search(r"^head=([0-9a-f]{40})$", receipt.read_text(), re.M)
+                return match.group(1) if match else None
+        except (OSError, ValueError):       # unreadable or not text (UnicodeDecodeError): no usable receipt
+            ctx.note("generation receipt unreadable")
         return None
 
     def installed(self, ctx: Context) -> str | None:
-        try:
-            return self.active_head(ctx)
-        except OSError:
-            return None
+        return self.active_head(ctx)
+
+    def converged(self, ctx: Context) -> bool:
+        return self.installed(ctx) == ctx.sha
 
     def gate(self, ctx: Context) -> dict[str, int]:
         return checkout_gate(ctx, self.root(ctx))
@@ -356,6 +405,9 @@ class Pi:
         return ((release / "package.json").is_file() and (release / "node_modules").is_dir()
                 and (root / "receipts" / f"{sha}.json").is_file())
 
+    def converged(self, ctx: Context) -> bool:
+        return self.installed(ctx) == ctx.sha and self.complete(ctx, ctx.sha)
+
     def gate(self, ctx: Context) -> dict[str, int]:
         return {}               # releases are immutable; the stage helper itself refuses a dirty one
 
@@ -370,7 +422,12 @@ class Pi:
             raise PhaseStop("failed", "apply_failed")
         tmp = root / f".current-{os.getpid()}-{time.monotonic_ns()}"
         os.symlink(Path("releases") / sha, tmp)
-        os.replace(tmp, current)
+        try:
+            os.replace(tmp, current)
+        except OSError:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
 
     def prune(self, ctx: Context, keep_extra: set[str]) -> None:
         """Keep the active release, the one it replaced and the newest others, KEEP_RELEASES in total."""
@@ -404,7 +461,10 @@ class Pi:
                 _timed("version_smoke", lambda: _run(ctx, smoke, timeout=60)[0] == 0)]
 
     def rollback(self, ctx: Context) -> str | None:
-        if not ctx.before_sha or not (self.root(ctx) / "releases" / ctx.before_sha).is_dir():
+        """Only undoes OUR switch: current must still be the release this rollout activated and differ from the
+        host's own previous release. A host that never switched, or is legitimately elsewhere, is left alone."""
+        if (not ctx.before_sha or ctx.before_sha == ctx.sha or self.installed(ctx) != ctx.sha
+                or not (self.root(ctx) / "releases" / ctx.before_sha).is_dir()):
             return None
         self.switch(ctx, ctx.before_sha)
         return "rolled_back" if self.installed(ctx) == ctx.before_sha else None
@@ -463,14 +523,13 @@ def _store_log(ctx: Context, phase: str) -> dict | None:
 
 
 def _log_dir(ctx: Context) -> Path:
-    root = ctx.env.get("XDG_STATE_HOME") or str(ctx.home / ".local" / "state")
-    return Path(root) / "herdr-engineering" / "fleet-watch" / "logs"
+    return state_dir({**ctx.env, "HOME": str(ctx.home)}) / "logs"
 
 
 def _precheck(ctx: Context, adapter, began: datetime) -> dict:
     installed = adapter.installed(ctx)
     ctx.before_sha = installed
-    if installed == ctx.sha and (not isinstance(adapter, Pi) or adapter.complete(ctx, ctx.sha)):
+    if adapter.converged(ctx):
         return _result(ctx, "precheck", "ok", None, began, no_change=True, before_sha=installed, after_sha=installed)
     counts = adapter.gate(ctx)
     return _result(ctx, "precheck", "ok", None, began, before_sha=installed, **({"counts": counts} if counts else {}))

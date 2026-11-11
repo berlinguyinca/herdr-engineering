@@ -34,8 +34,8 @@ CONNECT_TIMEOUT_S = 15
 SSH_FAILED_RC = 255
 MAX_STDOUT = 65536
 ROLLBACK_SCOPES = ("failed_host", "all_updated")
-#: Row outcomes that never halt the rollout and are never redone on resume.
-SETTLED = frozenset({"ok", "skipped", "rolled_back"})
+#: Row reasons of a `skipped` row that are a deliberate non-event (everything else halts the rollout).
+SETTLED_SKIPS = frozenset({"optional_unreachable"})
 _ID = re.compile(r"[0-9a-f]{16}")
 _SHA = re.compile(r"[0-9a-f]{40}")
 _ARG = re.compile(r"[a-z0-9-]{1,40}")
@@ -105,8 +105,12 @@ class SshTransport:
 
 # --------------------------------------------------------------------------- strict result parsing
 
-def parse_result(rid: str, host: str, repo: str, outcome: Outcome) -> dict:
-    """Closed-vocabulary view of one phase result; anything unexpected becomes failed(apply_failed)."""
+def parse_result(rid: str, host: str, repo: str, outcome: Outcome, *, sha: str | None = None,
+                 phase: str | None = None) -> dict:
+    """Closed-vocabulary view of one phase result; anything unexpected becomes failed(apply_failed).
+
+    The result must also be about THIS request: rollout id, repo, sha and phase echo the request, and an ok
+    apply/health answer must end on the target sha. A `skipped` needs a reason or `not_applicable`."""
     if outcome.timed_out:
         return {"status": "failed", "reason": "timeout"}
     if outcome.rc == SSH_FAILED_RC:
@@ -118,6 +122,10 @@ def parse_result(rid: str, host: str, repo: str, outcome: Outcome) -> dict:
         return bad
     if not isinstance(data, dict):
         return bad
+    if data.get("rollout_id") != rid or data.get("repo") != short(repo):
+        return bad
+    if (sha is not None and data.get("sha") != sha) or (phase is not None and data.get("phase") != phase):
+        return bad
     keep = {k: data[k] for k in ("status", "reason", "before_sha", "after_sha", "checks", "log", "counts")
             if data.get(k) is not None}
     probe = {"rollout_id": rid, "ts": now().isoformat(), "seq": 0, "host": host, "repo": short(repo), **keep}
@@ -127,7 +135,12 @@ def parse_result(rid: str, host: str, repo: str, outcome: Outcome) -> dict:
         return bad
     if keep["status"] == "ok" and outcome.rc != 0:
         return bad
+    if keep["status"] == "ok" and phase in ("apply", "health") and sha is not None and keep.get("after_sha") != sha:
+        return bad
     keep["no_change"] = data.get("no_change") is True
+    keep["not_applicable"] = data.get("not_applicable") is True
+    if keep["status"] == "skipped" and not keep.get("reason") and not keep["not_applicable"]:
+        return bad
     return keep
 
 
@@ -167,12 +180,15 @@ class Runner:
         """Continue a rollout: after a crash (status running) or on operator request (halted)."""
         rollout = saved["rollouts"][rid]
         if operator:
+            if rollout.get("halt") and not rollout.get("halt_emitted"):      # the halt the crash swallowed
+                self._emit_halted(saved, rid, rollout)
             for row in rollout["rows"].values():
-                if not (row.get("status") == "ok" or (row.get("status") == "skipped"
-                                                      and row.get("reason") != "halted")):
+                if not self._settled(row):
                     row.clear()
                     row["state"] = "pending"
         rollout["status"] = "running"
+        rollout.pop("halt", None)
+        rollout.pop("halt_emitted", None)
         state.save(saved, self.directory)
         if rollout.get("announced"):
             self._emit(rid, "rollout.resumed", **({"reason": "operator"} if operator else {}))
@@ -202,6 +218,19 @@ class Runner:
         self._emit(rid, "rollout.started", targets=targets)
         rollout["announced"] = True
 
+    @staticmethod
+    def _settled(row: dict) -> bool:
+        """A finished row that does not stop the rollout: ok, or a skip that is a deliberate non-event."""
+        return row.get("state") == "done" and (row.get("status") == "ok" or (
+            row.get("status") == "skipped" and (row.get("reason") in SETTLED_SKIPS or row.get("not_applicable") is True)))
+
+    def _emit_halted(self, saved: dict, rid: str, rollout: dict) -> None:
+        halt = rollout["halt"]
+        self._emit(rid, "rollout.halted", halted_at_host=halt["host"], **({"reason": halt["reason"]}
+                                                                         if halt.get("reason") else {}))
+        rollout["halt_emitted"] = True
+        state.save(saved, self.directory)
+
     def run(self, saved: dict, rid: str) -> str:
         rollout = saved["rollouts"][rid]
         self._announce(rid, rollout)
@@ -213,6 +242,9 @@ class Runner:
                 key = f"{name}/{short(repo)}"
                 row = rollout["rows"][key]
                 if row.get("state") == "done":
+                    # a finished row that is not settled halts the rollout, also after a crash that lost the halt
+                    if not self._settled(row) and not halted and row.get("reason") != "halted":
+                        halted = (name, row.get("reason"))
                     hold = hold or self._carry(row, name)
                     continue
                 if halted or hold == "optional_unreachable":
@@ -220,15 +252,14 @@ class Runner:
                     self._skip(saved, rid, rollout, name, repo, reason)
                     continue
                 status, reason = self._row(saved, rid, rollout, name, repo, bool(host["optional"]))
-                if status == "skipped" and reason == "optional_unreachable":
-                    hold = reason
-                elif status not in SETTLED:
+                if not self._settled(row):
                     halted = (name, reason)
         if halted:
             rollout["status"] = "halted"
+            rollout.setdefault("halt", {"host": halted[0], "reason": halted[1]})
             state.save(saved, self.directory)
-            self._emit(rid, "rollout.halted", halted_at_host=halted[0],
-                       **({"reason": halted[1]} if halted[1] else {}))
+            if not rollout.get("halt_emitted"):
+                self._emit_halted(saved, rid, rollout)
             return "halted"
         rollout["status"] = "succeeded"
         saved["converged"].update(rollout["targets"])
@@ -251,7 +282,8 @@ class Runner:
         args = ["--rollout", rid, "--repo", short(repo), "--sha", sha, "--host", host, "--phase", phase]
         if before:
             args += ["--before-sha", before]
-        return parse_result(rid, host, repo, self.transport.run(host, args, self.timeouts[phase]))
+        return parse_result(rid, host, repo, self.transport.run(host, args, self.timeouts[phase]),
+                            sha=sha, phase=phase)
 
     def _step(self, rid: str, host: str, repo: str, status: str, result: dict | None = None) -> None:
         extra = {}
@@ -265,7 +297,7 @@ class Runner:
         key = f"{host}/{short(repo)}"
         row = rollout["rows"][key]
         sha = rollout["targets"][repo]
-        before = rollout["before"].get(repo)
+        before = rollout["before"].get(repo)         # the plan-wide baseline; the host's own is learned by precheck
         started = now()
         row.clear()
         row["state"] = "running"
@@ -274,15 +306,17 @@ class Runner:
         self._step(rid, host, repo, "precheck")
         result = self._call(rid, host, repo, sha, "precheck", before)
         phase = "precheck"
+        own_before = result.get("before_sha") if result["status"] == "ok" else None
+        applied = False
         if result["status"] == "ok":
             self._step(rid, host, repo, "applying", result)
             phase = "apply"
-            result = self._call(rid, host, repo, sha, "apply", before)
+            result = self._call(rid, host, repo, sha, "apply", own_before)
+            applied = result["status"] == "ok" and not result.get("no_change")   # the host really changed
         if result["status"] == "ok":
             self._step(rid, host, repo, "checking", result)
             phase = "health"
-            result = self._call(rid, host, repo, sha, "health", before)
-        updated = phase != "precheck" and not result.get("no_change")
+            result = self._call(rid, host, repo, sha, "health", own_before)
         status, reason = result["status"], result.get("reason")
         if status == "unreachable" and phase == "precheck" and optional:
             status, reason, result = "skipped", "optional_unreachable", {}
@@ -293,12 +327,18 @@ class Runner:
         extra = _fields(result, "before_sha", "after_sha", "checks", "counts")
         if result.get("log", {}).get("host") == host:
             extra["log"] = result["log"]
-        row.update(state="done", status=status, updated=updated and status == "ok",
-                   **({"reason": reason} if reason else {}))
+        row.update(state="done", status=status, updated=applied and status == "ok",
+                   **({"reason": reason} if reason else {}),
+                   **({"not_applicable": True} if result.get("not_applicable") else {}),
+                   **({"host_before": own_before} if own_before else {}))
+        if not self._settled(row):                    # the halt is saved with the row that causes it
+            rollout["status"] = "halted"
+            rollout["halt"] = {"host": host, "reason": reason}
+            rollout["halt_emitted"] = False
         state.save(saved, self.directory)
         self._emit(rid, "host.finished", host=host, repo=short(repo), status=status,
                    **({"reason": reason} if reason else {}), **{**extra, **finish})
-        if status not in SETTLED and phase != "precheck":
+        if not self._settled(row) and phase != "precheck":
             self._rollback(saved, rid, rollout, host, repo)
         return status, reason
 
@@ -317,7 +357,8 @@ class Runner:
             h, name = key.split("/", 1)
             full = by_short[name]
             row = rollout["rows"][key]
-            result = self._call(rid, h, full, rollout["targets"][full], "rollback", rollout["before"].get(full))
+            own = row.get("host_before")          # the host's own previous revision, never the plan baseline
+            result = self._call(rid, h, full, rollout["targets"][full], "rollback", own)
             row["rollback"] = result["status"]
             if result["status"] == "rolled_back":
                 if key != failing:

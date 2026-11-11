@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import socket
 import sys
+from pathlib import Path
 
 from . import core, events, logs, poll, state
 
@@ -54,11 +56,40 @@ def _event_client():
         return None
 
 
+def local_identity(home: Path | None = None) -> str:
+    """Which fleet host this machine is: the host_id of its host.json, else its short hostname."""
+    from .. import host_config as hc
+
+    try:
+        return hc._read_host_json(Path(home) if home is not None else Path.home())["host_id"]
+    except (hc.HostConfigUnavailable, OSError, ValueError):
+        return socket.gethostname().split(".")[0].lower()
+
+
+def _resolve_local(requested: str) -> tuple[str | None, str | None]:
+    """(local host or None for all-ssh, refusal text). Local means "run without ssh", so it must be true."""
+    from ..control_plane.fleet_rollout import HOST_ORDER
+
+    if requested in ("", "none"):
+        return None, None
+    identity = local_identity()
+    if requested == "auto":
+        return (identity if identity in HOST_ORDER else None), None
+    if requested not in HOST_ORDER or requested != identity:
+        return None, (f"--local-host {requested}: this is not this machine (identity: "
+                      f"{identity if identity in HOST_ORDER else 'not a fleet host'}); refusing to run it locally")
+    return requested, None
+
+
 def cmd_run(args) -> int:
     """`fleet-watch run`: plan like `once`, and with --apply execute the rollout serially (or resume one)."""
     from . import run as runner
 
     repos = args.repo or list(core.DEFAULT_REPOS)
+    local, refusal = _resolve_local(args.local_host) if args.apply else (None, None)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
     try:
         report = core.run_once(repos, lock_path=args.lock, auth=poll.token())
     except state.WatcherBusy as exc:
@@ -68,7 +99,6 @@ def cmd_run(args) -> int:
         print(json.dumps(report, indent=1, sort_keys=True) if args.json else render(report))
         print("dry-run: nothing executed; pass --apply to roll out", file=sys.stderr)
         return 0
-    local = None if args.local_host in ("", "none") else args.local_host
     timeouts = {**runner.DEFAULT_TIMEOUTS, "precheck": args.precheck_timeout, "apply": args.apply_timeout,
                 "health": args.health_timeout}
     directory = state.state_dir()
@@ -196,7 +226,9 @@ def register(sub) -> None:
     ru.add_argument("--lock", default=core.DEFAULT_LOCK, help="fleet.lock.yaml read as the baseline")
     ru.add_argument("--json", action="store_true")
     ru.add_argument("--resume", action="store_true", help="re-run a halted rollout (operator decision)")
-    ru.add_argument("--local-host", default="beast", help="host this runs on, applied without ssh ('none' = ssh all)")
+    ru.add_argument("--local-host", default="auto",
+                    help="host applied without ssh: 'auto' (default) = this machine if its host.json/hostname is a "
+                         "fleet host; an explicit name must be this machine or the run is refused; 'none' = ssh all")
     ru.add_argument("--remote-bin", default="$HOME/.local/bin/herdr-eng",
                     help="installed herdr-eng on each host (expanded by the remote shell)")
     ru.add_argument("--rollback-scope", choices=("failed_host", "all_updated"), default="failed_host")
