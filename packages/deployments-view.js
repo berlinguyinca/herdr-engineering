@@ -66,7 +66,7 @@ function ciRow(view, name, open) {
   return `<tr data-deploy-row="${esc(name)}" data-deploy-kind="ci" data-health="${esc(text(ci.outcome, 'unknown'))}">
     <th scope="row"><button type="button" class="hd-linkbtn" data-deploy-toggle="${esc(name)}" aria-expanded="${open}" aria-controls="${esc(id)}">${esc(name)}</button> <span class="hd-badge" data-deploy-ci-badge>CI-reported</span></th>
     <td data-deploy-ci-at>${esc(text(ci.at))}</td>
-    <td data-deploy-ci-outcome>${esc(text(ci.outcome))}</td>
+    <td data-deploy-ci-outcome>${esc(text(ci.outcome))}${ci.outcome === 'failed' && ci.detail ? `<div class="hd-card__sub" data-deploy-ci-detail>${esc(ci.detail)}</div>` : ''}</td>
     <td data-deploy-ci-commits>${commitCell(ci.from)} → ${commitCell(ci.to)}</td>
     <td>${evidenceLink(ci.evidence_url)}</td>
   </tr>
@@ -81,6 +81,24 @@ function ciSection(view, open) {
       <p class="hd-card__sub">Reported by a CI pipeline, not a host updater: no plan, permit, escalation or force applies.</p>
       <div class="hd-table-wrap"><table class="hd-table"><thead><tr><th>Component</th><th>Last deploy</th><th>Outcome</th><th>From → to</th><th>Evidence</th></tr></thead>
       <tbody>${names.map((name) => ciRow(view, name, open.has(name))).join('')}</tbody></table></div>
+    </section>`;
+}
+
+// Recent failures/problems across every component, newest first (server: deployment_definitions.recent_problems).
+function problemsSection(view) {
+  if (!view.problems.length) return '';
+  return `<section data-deploy-problems aria-label="Recent deploy problems">
+      <h2>Recent problems</h2>
+      <p class="hd-card__sub">Failed, refused and rolled-back deploy events, newest first.</p>
+      <div class="hd-table-wrap"><table class="hd-table"><thead><tr><th>When</th><th>Component</th><th>Step</th><th>Outcome</th><th>Detail</th><th>Run</th></tr></thead>
+      <tbody>${view.problems.map((p) => `<tr data-deploy-problem data-outcome="${esc(text(p.outcome))}">
+        <td>${esc(text(p.at))}</td>
+        <td>${esc(text(p.component))}</td>
+        <td>${esc(text(p.step))}</td>
+        <td>${esc(text(p.outcome))}${p.recovered ? ' <span class="hd-badge" data-deploy-recovered>recovered later</span>' : ''}</td>
+        <td data-deploy-problem-detail>${esc(text(p.detail))}</td>
+        <td>${evidenceLink(p.evidence_url)}</td>
+      </tr>`).join('')}</tbody></table></div>
     </section>`;
 }
 
@@ -181,6 +199,7 @@ export function renderDeployments(raw) {
     plans: list(raw?.plans).filter(isObject),
     coordinator: isObject(raw?.coordinator) ? raw.coordinator : {},
     escalations: list(raw?.escalations).filter(isObject),
+    problems: list(raw?.problems).filter(isObject),
   };
   return (open) => {
     const defs = view.definitions;
@@ -191,6 +210,7 @@ export function renderDeployments(raw) {
     if (view.coordinator.error) notes.push(`<p role="note" data-deploy-tick-error>Coordinator: ${esc(view.coordinator.error)}${view.coordinator.stale ? ' (showing the last good plan)' : ''}</p>`);
     const stages = stageRows(view);
     const ci = ciSection(view, open);
+    const problems = problemsSection(view);
     if (!defs.configured && !stages.size && !ci) {
       return `${notes.join('')}<herdr-empty data-deploy-empty message="No deployment pipelines are configured"></herdr-empty>
         <p class="hd-muted">Set <code>control_plane.deployment_definitions</code> in the fleet config to a checkout of InferWeave <code>deploy/pipelines</code>.</p>`;
@@ -201,7 +221,7 @@ export function renderDeployments(raw) {
       <div class="hd-table-wrap"><table class="hd-table"><thead><tr><th>Component</th><th>Running</th><th>Target</th><th>Step</th><th>Health</th><th>Last result</th><th>Hold left</th><th>Repairs</th></tr></thead>
       <tbody>${items.map((item) => componentRow(view, item, open.has(item.name))).join('')}</tbody></table></div>
     </section>`).join('');
-    return `${notes.join('')}<div class="hd-grid">${plans}</div>${sections || (ci ? '' : '<herdr-empty message="No components defined"></herdr-empty>')}${ci}`;
+    return `${notes.join('')}${problems}<div class="hd-grid">${plans}</div>${sections || (ci ? '' : '<herdr-empty message="No components defined"></herdr-empty>')}${ci}`;
   };
 }
 
