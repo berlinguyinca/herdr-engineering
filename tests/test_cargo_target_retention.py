@@ -39,6 +39,12 @@ def fixture_output(tmp_path: Path, name: str = "project", *, days: int = 8) -> t
     return workspace, cache, target
 
 
+requires_lsof = pytest.mark.skipif(
+    shutil.which("lsof") is None,
+    reason="open-file inspection needs lsof; eviction fails closed without it",
+)
+
+
 def test_retention_config_has_separate_validated_opt_in_budgets():
     config = validate(None)
     assert not config.local.target_retention_enabled
@@ -52,6 +58,7 @@ def test_retention_config_has_separate_validated_opt_in_budgets():
             validate({"local": {setting: value}})
 
 
+@requires_lsof
 def test_dry_run_then_eviction_preserves_sources_markers_and_lock_inodes(tmp_path: Path):
     from herdr_engineering.cargo_target_retention import sweep
     workspace, cache, target = fixture_output(tmp_path)

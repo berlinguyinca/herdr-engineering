@@ -377,6 +377,19 @@ def _build_parser() -> argparse.ArgumentParser:
     ps = fsub.add_parser("status", help="read-only fleet version/registration status")
     ps.add_argument("--json", action="store_true")
     ps.set_defaults(func=_cmd_fleet_status)
+    pha = fsub.add_parser("host-apply", help="rollout step for THIS host (installed build; JSON result of closed "
+                                             "enums on stdout, log text stays on the host)")
+    pha.add_argument("--rollout", required=True, help="16-hex rollout id")
+    pha.add_argument("--repo", required=True, help="autospec | pi-engineering | herdr-engineering "
+                                                    "(ai-sync, claude-config answer skipped)")
+    pha.add_argument("--sha", required=True, help="40-hex target commit (must be published on origin/main)")
+    pha.add_argument("--host", default=None, help="this host's fleet name (beast, bender, macbook-pro); "
+                                                   "enables the host-side log reference")
+    pha.add_argument("--phase", choices=("precheck", "apply", "health", "rollback", "all"), default="all")
+    pha.add_argument("--before-sha", default=None, help="rollback target (phase rollback)")
+    pha.add_argument("--busy-retries", type=int, default=5, help="fleet-auto-update.lock retries (default 5)")
+    pha.add_argument("--busy-wait", type=float, default=60.0, help="seconds between lock retries (default 60)")
+    pha.set_defaults(func=_cmd_fleet_host_apply)
     pd = fsub.add_parser("drift", help="show tool/plugin versions that differ across hosts, with suggested fixes")
     pd.add_argument("--control-plane", default=None,
                     help="control plane URL (default: host.json control_plane_url)")
@@ -1730,6 +1743,19 @@ def _cmd_fleet_config(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0
+
+
+def _cmd_fleet_host_apply(args) -> int:
+    from .fleet_watch import host_apply
+    try:
+        result = host_apply.run_phase(args.phase, rollout_id=args.rollout, repo=args.repo, sha=args.sha,
+                                      host=args.host, before_sha=args.before_sha, busy_retries=args.busy_retries,
+                                      busy_wait_s=args.busy_wait)
+    except ValueError as exc:
+        print(f"fleet host-apply: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["status"] in ("ok", "skipped", "rolled_back") else 1
 
 
 def _cmd_fleet_update(args) -> int:
@@ -4508,7 +4534,9 @@ def _cmd_cp_web(args) -> int:
         from .control_plane.collab import FileEventLog
         sink = FileEventLog(args.collab_log_file)
     repo = ControlPlaneRepo(sink=sink, host_aliases=_host_aliases_from(cp),
-                            inspector_limits=inspector_limits)
+                            inspector_limits=inspector_limits, journal_suppression=_journal_suppression(cp),
+                            mission_activity_mirror=isinstance(cp.get("work_center"), dict)
+                            and cp["work_center"].get("enabled") is True)
     if args.seed_demo:
         _seed_demo(repo)
     rustfs = _maybe_rustfs_client(cp)
@@ -4686,6 +4714,7 @@ def _cmd_cp_web(args) -> int:
                              summary_config=cp.get("agent_summaries") or {},
                              summary_report_config=cp.get("summary_report") or {},
                              unified_workspace_config=cp.get("unified_workspace") if isinstance(cp.get("unified_workspace"), dict) else None,
+                             work_center_config=cp.get("work_center") if isinstance(cp.get("work_center"), dict) else None,
                              assistant_config=_assistant_config(cp),
                              review_quorum=_review_quorum_config(cp),
                              single_operator=cp.get("single_operator") is True,
@@ -5427,7 +5456,17 @@ def _fabric_compaction_settings(cp):
         rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False,
         keep_checkpoints=int(number("keep_checkpoints", 2, 1)),
         publish_projection_checkpoint=raw.get("publish_projection_checkpoint") is True,
-        projection_lock_wait_seconds=number("projection_lock_wait_seconds", 60, 0))
+        projection_lock_wait_seconds=number("projection_lock_wait_seconds", 60, 0),
+        normalize_service_timestamps=raw.get("normalize_service_timestamps") is not False)
+
+
+def _journal_suppression(cp):
+    """``control_plane.journal_suppression`` as JournalSuppression (everything on by default, unknown keys rejected)."""
+    from .control_plane.journal_suppression import JournalSuppression
+    try:
+        return JournalSuppression.from_config((cp or {}).get("journal_suppression"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
 
 
 def _share_worker_settings(cp):
