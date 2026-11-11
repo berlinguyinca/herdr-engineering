@@ -162,23 +162,19 @@ beyond the tailnet.
 `fleet config init` keeps this posture: it writes `control_plane.api_keys: {}` and
 leaves `ingest.api_key` / `agent.api_key` empty, so hosts send no `X-API-Key` at all.
 
-**Optional RBAC (Spec §104) - not supported for the compose stack yet.** Keyed mode
-(entries in `control_plane.api_keys`, by hand or with `fleet config init
---with-api-keys`) gates every route except `/api/v1/health` (which then answers only
-status, version and commit without a key) and the host endpoints. The llm-proxy and
-the emit hook do not send keys yet, so turning keys on breaks them until they do. The
-browser dashboard works through the **dashboard proxy** (next section). viewer = read-only, operator = read + mutate, ingest =
-
-status, version and commit without a key) and the host endpoints. The browser
-dashboard and the emit hook do not send keys yet, so turning keys on
-breaks them until they do. The llm-proxy, `llm-gateway-sync` and `llm-gateway-usage` can send
-one: see "Client key for the llm services" below. viewer = read-only, operator = read + mutate, ingest =
-POST /api/v1/ingest, agent = ingest + LLM-key mint/revoke + review posting + `POST /api/v1/token-usage`.
-
-dashboard and the llm-proxy do not send keys yet, so turning keys on breaks them until
-they do. The emit hook and the fabric agent (service leases and host telemetry) send
-`ingest.api_key` as `X-API-Key` when one is configured (role `ingest` suffices). viewer = read-only, operator = read + mutate, ingest =
-POST /api/v1/ingest, agent = ingest + LLM-key mint/revoke + review posting.
+**Optional RBAC (Spec §104).** Keyed mode (entries in `control_plane.api_keys`, by hand or with
+`fleet config init --with-api-keys`) gates every route except `/api/v1/health` (which then answers only
+status, version and commit without a key) and the host-token endpoints (`fleet/config*`). Roles: viewer =
+read-only, operator = read + mutate, ingest = `POST /api/v1/ingest`, `host/summary-reports/*` and
+`host/build-cache/report`, agent = ingest + LLM-key mint/revoke + review posting + `POST /api/v1/token-usage`.
+The emit hook, the snapshot loop, the fabric agent and the mission/ai-sync/service feeds send `ingest.api_key`
+(or `agent.api_key`) as `X-API-Key`; the llm-proxy, `llm-gateway-sync` and `llm-gateway-usage` send a key too (see
+"Client key for the llm services" below). The browser dashboard works through the **dashboard proxy** (next
+section). `build-cache-report` reads its own `fabric_build_cache.report.key_file` from `config.yaml`: put an
+ingest-role key there (mode 0600). `control_plane.single_operator` needs an open listener, so the control plane
+refuses to start with both `single_operator: true` and `api_keys` set. `api_keys` is restart-required, and
+long-running feeds read the key once at start, so restart them after a key change. Pi reads it once per session:
+sessions started earlier keep posting unkeyed (401) until restarted.
 
 Callers that can send a key (all optional; no key = no header): `collab-spawn.py --api-key-file FILE` (the
 session report needs an ingest-role key, the scheduler calls an operator-role key, so use an operator key on
@@ -366,8 +362,10 @@ sections:
 ```
 
 - **Rules.** A mapping of at most 32 components (`[a-z0-9][a-z0-9_-]{0,63}`) to a non-empty host id. A bad
-  entry, a non-mapping value, or a component that also has a definition (ambiguous) refuses the whole list;
-  `definitions.ci_errors` in `GET /api/v1/deployments` says why. Read live, like the other keys.
+  entry or non-mapping value is rejected when the fleet file loads; a component that also has a definition
+  (ambiguous) is dropped alone and named in `definitions.ci_errors` in `GET /api/v1/deployments`. Read live,
+  failing closed: while the fleet file is unreadable, deleted or invalid the allowlist is empty (CI hosts get
+  403) unless `control_plane.config_failure_mode: last_good`. Unknown keys anywhere in the file are rejected.
 - **Authorization.** An event is accepted when the definitions rule allows it OR the exact (component,
   authenticated host id) pair is listed. A listed component reported by any other host is refused (403).
   With no `deployment_definitions` configured ingest stays accept-all, as before. With definitions

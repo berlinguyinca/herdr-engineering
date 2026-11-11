@@ -338,7 +338,7 @@ def test_runtime_reconnects_after_a_dropped_connection(world):
     assert world.listener.wait_for(lambda: world.listener.ws_connections >= 2 and world.listener.ws_alive == 1)
     env = world.listener.push_interactive(_socket_payload(ask))
     assert world.listener.wait_for(lambda: world.status(ask.request_id) == "approved")
-    assert world.listener.wait_for(lambda: env in world.listener.acks, timeout=10)   # the ack trails the tap
+    assert world.listener.wait_for(lambda: env in world.listener.acks)   # the ack follows the approval; under load it can lag
 
 
 def _supervisors() -> set[threading.Thread]:

@@ -47,6 +47,7 @@ DEFAULTS: dict[str, Any] = {
         "local": {
             "capacity_gib": 20, "ram_scratch_gib": 0, "min_free_disk_percent": 20,
             "incremental_disabled_for_cacheable_builds": True,
+            "storage_tiers": [],
         },
         "execution": {
             "slurm_enabled": False, "allowed_clusters": [], "allowed_partitions": [],
