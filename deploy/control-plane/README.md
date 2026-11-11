@@ -697,6 +697,11 @@ control_plane:
         # tokens_valid_after: "2026-11-02T09:30:00Z"   # optional revocation cut-off, see "Revoking a lost phone"
 ```
 
+`open_owner_origins` (optional) lists the app `Origin` values the passwordless `open_owner` session accepts. Default `["rakazo://"]`
+(unchanged); add another native app with e.g. `["rakazo://", "shepherd://"]`. Each entry is `scheme://` or `scheme://host`, exactly
+matched; `http`/`https`, wildcards, spaces, duplicates and more than 8 entries are refused at startup. The network allowlist,
+trusted-proxy checks and per-address rate limit apply to every origin alike.
+
 `enabled: true` with no account, a malformed hash, an unknown key or any role but `operator` (`family` is reserved, not
 implemented) stops the control plane at startup with a message naming the field. Disabled (the default) leaves every
 `/rpc/*` and `/api/auth/*` path a 404, as before.

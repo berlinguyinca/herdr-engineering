@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Rakazo bridge: `open_owner_origins` (default unchanged)
+- New optional `control_plane.rakazo_bridge.open_owner_origins` (list of 1-8 `scheme://[host]` strings, default `["rakazo://"]`): the exact `Origin` values `open_owner` accepts, so a second native app can use it. http/https, wildcards, whitespace and duplicates are refused at startup; every other guard (network allowlist, proxy checks, 30s interval, operator account) is unchanged. Tests: `tests/control_plane/test_rakazo_bridge.py`.
+
 ### Fleet rollout watcher step 4: host-apply and the serial runner (manual, `--apply` required)
 - `herdr-eng fleet host-apply` (precheck/apply/health/rollback per repo, D6 checkout gate, idempotent `no_change`, `fleet-auto-update.lock`, atomic Pi `current` switch keeping 3 releases) and `herdr-eng fleet-watch run [--apply]` (serial beast -> bender -> macbook-pro, halt on first failure, durable crash-resume, ssh timeouts, D8 rollback for pointer flips and ff-only, events through the existing emitter/outbox). Output and events carry no free text. No systemd unit (step 5). Tests: `tests/test_fleet_host_apply.py`, `tests/test_fleet_watch_run.py`. See `docs/operations/fleet-rollout-events.md`.
 

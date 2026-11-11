@@ -185,6 +185,23 @@ def _cutoff(value: Any, where: str, now: float) -> float:
     return stamp.timestamp()
 
 
+_APP_ORIGIN = re.compile(r"[a-z][a-z0-9+.\-]*://[A-Za-z0-9._\-]*")
+
+
+def _open_owner_origins(value) -> tuple[str, ...]:
+    """The Origin values ``open_owner`` accepts: 1-8 distinct app origins shaped ``scheme://`` or ``scheme://host``."""
+    where = "control_plane.rakazo_bridge.open_owner_origins"
+    if not isinstance(value, list) or not 1 <= len(value) <= 8:
+        raise ValueError(f"{where} must be a list of 1 to 8 app origins such as rakazo://")
+    for entry in value:
+        if not isinstance(entry, str) or not _APP_ORIGIN.fullmatch(entry) or entry.lower().startswith(("http://", "https://")):
+            raise ValueError(f"{where} entries must look like scheme:// or scheme://host (not http or https, no wildcards "
+                             f"or spaces), got {entry!r}")
+    if len(set(value)) != len(value):
+        raise ValueError(f"{where} must not repeat an origin")
+    return tuple(value)
+
+
 def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
     """Validate ``control_plane.rakazo_bridge``. Disabled (and unchecked beyond its type) unless ``enabled`` is true;
     when enabled, anything missing or malformed raises ValueError so the control plane refuses to start."""
@@ -196,7 +213,8 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         return {"enabled": False}
     now = time.time() if now is None else now
     unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies",
-                                 "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms", "cognito", "push", "default_tools", "open_owner"})
+                                 "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms", "cognito", "push", "default_tools", "open_owner",
+                                 "open_owner_origins"})
     if unknown:
         raise ValueError(f"control_plane.rakazo_bridge has unknown keys: {', '.join(map(str, unknown))} "
                          "(accounts are listed under accounts: [{email, password_scrypt, role}])")
@@ -268,7 +286,8 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         raise ValueError("control_plane.rakazo_bridge.open_owner must be true or false")
     if open_owner and not any(a.role == "operator" for a in accounts):
         raise ValueError("control_plane.rakazo_bridge.open_owner needs an account with role operator to act as")
-    return {"enabled": True, "open_owner": open_owner, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
+    open_owner_origins = _open_owner_origins(raw.get("open_owner_origins", ["rakazo://"]))
+    return {"enabled": True, "open_owner": open_owner, "open_owner_origins": open_owner_origins, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
             "trusted_proxies": tuple(nets), "routine_runner_seconds": runner, "hindsight": hindsight,
             "vault_key_file": vault_key_file, "auto_join_rooms": tuple(auto_join), "default_tools": tuple(dict.fromkeys(tools)),
             "cognito": cognito_cfg, "push": _push_config(raw.get("push"))}
@@ -691,6 +710,7 @@ class RakazoBridge:
         self.version = version
         self.accounts: list[Account] = list(config["accounts"])
         self.open_owner = bool(config.get("open_owner"))
+        self.open_owner_origins: tuple[str, ...] = tuple(config.get("open_owner_origins") or ("rakazo://",))
         self._open_lock = threading.Lock()
         self._open_last: dict[str, float] = {}
         self._by_principal = {a.principal_id: a for a in self.accounts}
@@ -950,10 +970,10 @@ class RakazoBridge:
     def _open_owner(self, headers, ip: str, peer: str) -> BridgeResponse:
         """A session for the first operator account with no password, for one-person setups where the network is the
         credential. Allowed only from this machine or the tailnet (not LAN or container networks), and only from the app itself
-        (its ``rakazo://`` origin, which a web page cannot send). Never enable it behind a reverse proxy or NAT that does
+        (an app origin from ``open_owner_origins``, default ``rakazo://``, which a web page cannot send). Never enable it behind a reverse proxy or NAT that does
         not set X-Forwarded-For: the proxy's own address would then count as the caller."""
         refuse = BridgeError(403, "FORBIDDEN", "This server only opens a session from your own network.")
-        if headers.get("origin", "") != "rakazo://":
+        if headers.get("origin", "") not in self.open_owner_origins:
             raise refuse
         try:
             addr = ipaddress.ip_address(ip)
