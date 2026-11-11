@@ -97,4 +97,33 @@ herdr-eng fleet-watch outbox flush [--control-plane URL] [--api-key-file F] [--j
 herdr-eng fleet-watch log show <rollout_id> --host H [--path-id K]
 ```
 
-Rollback: nothing calls the emitter in this release; removing the ingest type is the only server-side change to undo.
+Rollback: `fleet-watch run --apply` (below) is the only caller of the emitter; removing the ingest type is the only server-side change to undo.
+
+## Applying a rollout (`fleet host-apply`, `fleet-watch run`) - step 4, manual only
+
+```
+herdr-eng fleet host-apply --rollout ID --repo R --sha S [--host H] [--phase precheck|apply|health|rollback|all]
+herdr-eng fleet-watch run [--apply] [--resume] [--local-host beast|none] [--rollback-scope failed_host|all_updated]
+```
+
+`fleet-watch run` without `--apply` is the dry-run plan (no ssh, no events). With `--apply` it walks beast, bender,
+macbook-pro serially, per host per repo: `precheck` (60 s), `apply` (30 min), `health` (120 s) over `ssh -o BatchMode=yes
+-o ConnectTimeout=15` (the local host runs the same command without ssh), in `/` with the host's installed `herdr-eng`.
+The first row that is not ok halts the rollout and later rows are `skipped(halted)`; an unreachable macbook-pro is
+`skipped(optional_unreachable)` and does not halt, an unreachable beast or bender halts. A timeout is `failed(timeout)`.
+State is saved after every transition (`state.json`, `rollouts[id]`): a crash resumes at the first unfinished row on the
+next `run --apply` (event `rollout.resumed`, no reason); a halted rollout is re-run only with `--resume` (reason
+`operator`). The lock file is not written yet (step 5).
+
+`host-apply` prints ONE JSON object made of closed enums, hex, ints and UTC timestamps (section 14); log text, including
+example dirty paths (at most 8), stays in the host's log store and is read with `fleet-watch log show`. Idempotent: an
+installed sha equal to the target is `ok` with `no_change`. D6 gate: `blocked(dirty_checkout|not_on_main|
+unpublished_commits)` with counts, never a clean, stash or reset. It holds `fleet-auto-update.lock` (`blocked(busy)`
+after 5 retries, 60 s apart).
+
+Per repo: herdr-engineering = ff-only + pip install + agent restart (no automatic rollback: ff-only cannot go backwards);
+pi-engineering = stage release, atomic `current` symlink switch (temp link + `rename`), keep 3 releases (never the current
+or previous), no signal to live sessions, rollback = flip the link back; autospec = refresh the runtime checkout and
+installer, rollback only while the newest generation receipt still equals the before sha. ai-sync and claude-config are
+`skipped(not_applicable)`. `--rollback-scope failed_host` (default) undoes the failed row and updated rows of that host;
+`all_updated` undoes every updated row, newest first; each rollback emits a further `host.finished(rolled_back)`.

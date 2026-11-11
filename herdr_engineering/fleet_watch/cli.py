@@ -42,6 +42,73 @@ def cmd_fleet_watch(args) -> int:
     return 0
 
 
+def _event_client():
+    """Control-plane client for live delivery from `run`: this host's host.json, else outbox-only (None)."""
+    import argparse
+
+    from .. import host_config as hc
+
+    try:
+        return _outbox_client(argparse.Namespace(api_key_file=None, control_plane=None))
+    except (hc.HostConfigUnavailable, OSError, ValueError):
+        return None
+
+
+def cmd_run(args) -> int:
+    """`fleet-watch run`: plan like `once`, and with --apply execute the rollout serially (or resume one)."""
+    from . import run as runner
+
+    repos = args.repo or list(core.DEFAULT_REPOS)
+    try:
+        report = core.run_once(repos, lock_path=args.lock, auth=poll.token())
+    except state.WatcherBusy as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
+    if not args.apply:
+        print(json.dumps(report, indent=1, sort_keys=True) if args.json else render(report))
+        print("dry-run: nothing executed; pass --apply to roll out", file=sys.stderr)
+        return 0
+    local = None if args.local_host in ("", "none") else args.local_host
+    timeouts = {**runner.DEFAULT_TIMEOUTS, "precheck": args.precheck_timeout, "apply": args.apply_timeout,
+                "health": args.health_timeout}
+    directory = state.state_dir()
+    try:
+        with state.single_instance(directory):
+            saved = state.load(directory)
+            engine = runner.Runner(
+                directory, events.Emitter(directory, client=_event_client()),
+                runner.SshTransport(local_host=local, remote_bin=args.remote_bin,
+                                    connect_timeout=args.connect_timeout),
+                rollback_scope=args.rollback_scope, timeouts=timeouts)
+            outcome = _drive(engine, saved, report["rollout"], args.resume)
+    except state.WatcherBusy as exc:
+        print(str(exc), file=sys.stderr)
+        return 3
+    print(json.dumps({"outcome": outcome}) if args.json else f"fleet-watch run: {outcome}")
+    return {"succeeded": 0, "idle": 0, "halted": 1, "needs_resume": 4}[outcome]
+
+
+def _drive(engine, saved: dict, plan: dict | None, resume: bool) -> str:
+    rollouts = saved["rollouts"]
+    running = [rid for rid, r in rollouts.items() if r.get("status") == "running"]
+    if running:                                           # a crashed run: continue where it stopped
+        return engine.resume(saved, running[0])
+    halted = [rid for rid, r in rollouts.items() if r.get("status") == "halted"]
+    if plan and plan["rollout_id"] in halted:
+        if not resume:
+            print(f"rollout {plan['rollout_id']} halted earlier; fix the cause and pass --resume", file=sys.stderr)
+            return "needs_resume"
+        return engine.resume(saved, plan["rollout_id"], operator=True)
+    if plan:
+        for rid in halted:
+            engine.supersede(saved, rid)
+        return engine.start(saved, plan)
+    if resume and halted:
+        return engine.resume(saved, halted[-1], operator=True)
+    print("plan: nothing to roll out", file=sys.stderr)
+    return "idle"
+
+
 def _outbox_client(args):
     """The control-plane client for `outbox flush`: explicit flags, else this host's host.json."""
     from pathlib import Path
@@ -123,6 +190,21 @@ def register(sub) -> None:
     po.add_argument("--lock", default=core.DEFAULT_LOCK, help="fleet.lock.yaml read as the baseline")
     po.add_argument("--json", action="store_true")
     po.set_defaults(func=cmd_fleet_watch)
+    ru = wsub.add_parser("run", help="plan, then (with --apply) roll out serially beast -> bender -> macbook-pro")
+    ru.add_argument("--apply", action="store_true", help="execute the rollout; without it this is a dry-run plan")
+    ru.add_argument("--repo", action="append", metavar="OWNER/NAME", help="watched repo (repeatable)")
+    ru.add_argument("--lock", default=core.DEFAULT_LOCK, help="fleet.lock.yaml read as the baseline")
+    ru.add_argument("--json", action="store_true")
+    ru.add_argument("--resume", action="store_true", help="re-run a halted rollout (operator decision)")
+    ru.add_argument("--local-host", default="beast", help="host this runs on, applied without ssh ('none' = ssh all)")
+    ru.add_argument("--remote-bin", default="$HOME/.local/bin/herdr-eng",
+                    help="installed herdr-eng on each host (expanded by the remote shell)")
+    ru.add_argument("--rollback-scope", choices=("failed_host", "all_updated"), default="failed_host")
+    ru.add_argument("--precheck-timeout", type=float, default=60.0)
+    ru.add_argument("--apply-timeout", type=float, default=1800.0)
+    ru.add_argument("--health-timeout", type=float, default=120.0)
+    ru.add_argument("--connect-timeout", type=int, default=15)
+    ru.set_defaults(func=cmd_run)
     ob = wsub.add_parser("outbox", help="inspect or deliver the queued rollout events (control-plane outage buffer)")
     osub = ob.add_subparsers(dest="outbox_command", required=True)
     st = osub.add_parser("status", help="count queued and parked events")

@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fleet rollout watcher step 4: host-apply and the serial runner (manual, `--apply` required)
+- `herdr-eng fleet host-apply` (precheck/apply/health/rollback per repo, D6 checkout gate, idempotent `no_change`, `fleet-auto-update.lock`, atomic Pi `current` switch keeping 3 releases) and `herdr-eng fleet-watch run [--apply]` (serial beast -> bender -> macbook-pro, halt on first failure, durable crash-resume, ssh timeouts, D8 rollback for pointer flips and ff-only, events through the existing emitter/outbox). Output and events carry no free text. No systemd unit (step 5). Tests: `tests/test_fleet_host_apply.py`, `tests/test_fleet_watch_run.py`. See `docs/operations/fleet-rollout-events.md`.
+
 ### Control-plane client key for the llm services (optional)
 - `ControlPlaneClient` (llm-proxy, `llm-gateway-sync`, `llm-gateway-usage`) sends `X-API-Key` read from an optional key file on every call; no file = no header = unchanged. The file must be mode 0600 (group/other-readable, missing or empty is refused without printing it). Setting: `--control-plane-key-file` on the three commands, plus `control_plane.llm_proxy.control_plane_key_file` for the llm-proxy slice; compose mounts `HERDR_CP_CLIENT_KEY_FILE` read-only when set.
 - The `agent` role may now `POST /api/v1/token-usage` (viewer still may not; an open control plane is unchanged), so usage reporters need no operator key. Tests: `tests/test_control_plane_client_key.py`, `tests/control_plane/test_agent_token_usage.py`. See `deploy/control-plane/README.md`.
