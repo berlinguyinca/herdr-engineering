@@ -6,6 +6,7 @@ import {safeServiceUrl} from './services-view.js';
 import {skeleton} from './motion.js';
 import {morph,patchList,patchText,patchAttr} from './patch.js';
 import {freshnessSources} from './freshness.js';
+import {resolveBoardLink} from './board-links.js';
 
 const text=value=>typeof value==='string'?value:'';
 const short=(value,max=160)=>text(value).replace(/\s+/g,' ').trim().slice(0,max);
@@ -50,13 +51,16 @@ export function applyProjectDelta(kind,held,body) {
 const link=(url,label)=>{const safe=safeServiceUrl(url);return safe?`<a href="${esc(safe)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`:esc(label);};
 const itemTitle=entry=>short(entry.title,200)||(entry.type==='REDACTED'?'Item not visible to this token':'Untitled item');
 const itemMeta=entry=>[entry.repository?`${short(entry.repository,100)}${Number.isInteger(entry.number)?` #${entry.number}`:''}`:'',entry.type&&entry.type!=='ISSUE'?human(entry.type):'',entry.state&&entry.state!=='OPEN'?human(entry.state):''].filter(Boolean).join(' · ');
-export function renderProjectCard(entry={}) {
+// WC-005: an internal "Open in Herdr" link only for a verified target (href built by entityHref in board-links);
+// a partial lookup gets a quiet note; none/ambiguous render nothing, so there is never a dead link.
+const herdrLink=resolved=>resolved?.state==='verified'&&typeof resolved.target?.href==='string'?`<p class="ghp-herdr"><a data-herdr-link href="${esc(resolved.target.href)}">Open in Herdr</a></p>`:resolved?.state==='partial'?'<p class="ghp-meta" data-herdr-partial>Herdr data partial</p>':'';
+export function renderProjectCard(entry={},resolved) {
  const meta=itemMeta(entry);
- return `<article class="ghp-card" data-key="${esc(entry.item_id||'')}" data-ghp-item="${esc(entry.item_id||'')}"><p class="ghp-title">${link(entry.url,itemTitle(entry))}</p>${meta?`<p class="ghp-meta">${esc(meta)}</p>`:''}</article>`;
+ return `<article class="ghp-card" data-key="${esc(entry.item_id||'')}" data-ghp-item="${esc(entry.item_id||'')}"><p class="ghp-title">${link(entry.url,itemTitle(entry))}</p>${meta?`<p class="ghp-meta">${esc(meta)}</p>`:''}${herdrLink(resolved)}</article>`;
 }
-export function renderProjectRow(entry={}) {
+export function renderProjectRow(entry={},resolved) {
  const meta=itemMeta(entry);
- return `<article class="ghp-row" data-key="${esc(entry.item_id||'')}" data-ghp-item="${esc(entry.item_id||'')}"><span class="ghp-status">${esc(short(entry.status,60)||NO_STATUS.name)}</span><p class="ghp-title">${link(entry.url,itemTitle(entry))}</p>${meta?`<p class="ghp-meta">${esc(meta)}</p>`:''}</article>`;
+ return `<article class="ghp-row" data-key="${esc(entry.item_id||'')}" data-ghp-item="${esc(entry.item_id||'')}"><span class="ghp-status">${esc(short(entry.status,60)||NO_STATUS.name)}</span><p class="ghp-title">${link(entry.url,itemTitle(entry))}</p>${meta?`<p class="ghp-meta">${esc(meta)}</p>`:''}${herdrLink(resolved)}</article>`;
 }
 export function projectsSyncNote(body) {
  const sync=body?.projects_sync||{};
@@ -71,13 +75,15 @@ const styles=`<style>
 .ghp-board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(240px,1fr);gap:12px;overflow-x:auto;padding-bottom:8px;align-items:start}.ghp-board[hidden],.ghp-list[hidden]{display:none}
 .ghp-column{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);min-width:0}.ghp-column h2{display:flex;justify-content:space-between;gap:8px;font-size:13px;margin:0;padding:12px;border-bottom:1px solid var(--border-subtle)}.ghp-column h2 small{color:var(--text-secondary);font-weight:400}
 .ghp-cards{display:flex;flex-direction:column;gap:8px;padding:10px;min-height:40px}.ghp-card,.ghp-row{background:var(--bg);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:10px;overflow-wrap:anywhere}
-.ghp-title{margin:0;font-size:13px;line-height:1.5;font-weight:600}.ghp-meta{margin:4px 0 0;font-size:12px;color:var(--text-secondary)}.ghp-empty{color:var(--text-secondary);font-size:12px;margin:0}
+.ghp-title{margin:0;font-size:13px;line-height:1.5;font-weight:600}.ghp-herdr{margin:4px 0 0;font-size:12px}.ghp-row .ghp-herdr{grid-column:2}.ghp-meta{margin:4px 0 0;font-size:12px;color:var(--text-secondary)}.ghp-empty{color:var(--text-secondary);font-size:12px;margin:0}
 .ghp-list{display:flex;flex-direction:column;gap:8px}.ghp-row{display:grid;grid-template-columns:minmax(90px,160px) minmax(0,1fr);gap:4px 12px;align-items:baseline}.ghp-row .ghp-meta{grid-column:2}.ghp-status{font-size:12px;color:var(--text-secondary)}
-@media(max-width:700px){.ghp-board{grid-auto-flow:row;grid-auto-columns:auto;overflow-x:visible}.ghp-row{grid-template-columns:minmax(0,1fr)}.ghp-row .ghp-meta{grid-column:1}}
+@media(max-width:700px){.ghp-row .ghp-herdr{grid-column:1}.ghp-board{grid-auto-flow:row;grid-auto-columns:auto;overflow-x:visible}.ghp-row{grid-template-columns:minmax(0,1fr)}.ghp-row .ghp-meta{grid-column:1}}
 </style>`;
 
-export function mountGithubProjects(container,client,{project='',layout='board'}={}) {
- let disposed=false,projects=null,items=null,projectsError='',itemsError='',selected=text(project),flat=layout==='list',timer=null;
+// G3: Herdr refs are re-read on the board's existing refresh cycle (poll / live event / tab return), at most once per REFS_MS.
+const REFS_MS=30000;
+export function mountGithubProjects(container,client,{project='',layout='board',herdrRefs=null,herdrRefsFailed=false,loadHerdrRefs=null,herdrRefsMs=REFS_MS}={}) {
+ let refsAt=Date.now(),disposed=false,projects=null,items=null,projectsError='',itemsError='',selected=text(project),flat=layout==='list',timer=null;
  const held={projects:{query:null,polls:0,full:false},items:{query:null,polls:0,full:false}};
  const syncSignature=body=>JSON.stringify(body?.projects_sync||null);
  const requests=new Map(),listeners=new AbortController();
@@ -86,6 +92,8 @@ export function mountGithubProjects(container,client,{project='',layout='board'}
   <div class="ghp-controls"><label>Project<select data-ghp-project aria-label="Project"></select></label><button type="button" class="hd-btn" data-ghp-layout aria-pressed="${flat}">Flat list</button></div><p class="ghp-note" data-ghp-summary role="status"></p>
   <div class="ghp-board" data-ghp-board role="region" aria-label="Project board"></div><div class="ghp-list" data-ghp-list role="region" aria-label="Project items" hidden></div>`;
  const el=selector=>container.querySelector(selector);
+ // Read-only: refs are Herdr-recorded mission/session references handed in by the caller; none are wired today.
+ const resolve=row=>resolveBoardLink(row,{refs:herdrRefs,refsFailed:herdrRefsFailed});
  const current=()=>records(projects?.projects).find(p=>p.project_id===selected)||null;
  function placeholder(target,html){
   // patchList ignores unkeyed children, so an empty note or skeleton is swapped by hand.
@@ -111,7 +119,7 @@ export function mountGithubProjects(container,client,{project='',layout='board'}
    patchText(node.querySelector('[data-ghp-column-name]'),column.name);
    patchText(node.querySelector('[data-ghp-column-count]'),String(column.items.length));
    const cards=node.querySelector('.ghp-cards');
-   if(!patchCards(cards,column.items,renderProjectCard))placeholder(cards,'<p class="ghp-empty">No items</p>');
+   if(!patchCards(cards,column.items,row=>renderProjectCard(row,resolve(row))))placeholder(cards,'<p class="ghp-empty">No items</p>');
   }
  }
  // A focused card that moves column leaves its old node (patchList); focus follows the item to
@@ -149,7 +157,7 @@ export function mountGithubProjects(container,client,{project='',layout='board'}
   if(!projects){morph(el('[data-ghp-board]'),projectsError?'':skeleton('project board',{rows:2,height:64}));return;}
   if(!project){placeholder(el('[data-ghp-board]'),'');placeholder(el('[data-ghp-list]'),'');return;}
   if(rows===null){if(!itemsError)placeholder(showList?el('[data-ghp-list]'):el('[data-ghp-board]'),skeleton('project items',{rows:2,height:48}));return;}
-  if(showList){if(!patchCards(el('[data-ghp-list]'),rows.slice().sort(itemOrder),renderProjectRow))placeholder(el('[data-ghp-list]'),'<p class="ghp-empty">This project has no items.</p>');}
+  if(showList){if(!patchCards(el('[data-ghp-list]'),rows.slice().sort(itemOrder),row=>renderProjectRow(row,resolve(row))))placeholder(el('[data-ghp-list]'),'<p class="ghp-empty">This project has no items.</p>');}
   else drawBoard(project,rows);
  }
  // One read with the held revision as `since` when the held body answers the same query; every
@@ -197,7 +205,15 @@ export function mountGithubProjects(container,client,{project='',layout='board'}
   // The URL names the shown project and layout without re-rendering the route.
   try{const q=new URLSearchParams();if(selected)q.set('project',selected);if(flat)q.set('layout','list');history.replaceState(null,'',`#/github/projects${q.size?`?${q}`:''}`);}catch{}
  }
- function refresh(){readProjects();readItems();}
+ function readRefs(){
+  if(typeof loadHerdrRefs!=='function'||Date.now()-refsAt<herdrRefsMs)return;
+  refsAt=Date.now();
+  request('refs',signal=>loadHerdrRefs(signal),mapped=>{
+   if(!mapped||!Array.isArray(mapped.refs))throw new Error('Invalid Herdr refs');
+   herdrRefs=mapped.refs;herdrRefsFailed=!!mapped.failed;
+  },()=>{herdrRefsFailed=true;});
+ }
+ function refresh(){readProjects();readItems();readRefs();}
  el('[data-ghp-project]').addEventListener('change',event=>{
   selected=event.target.value;requests.get('items')?.abort();requests.delete('items');items=null;itemsError='';held.items.query=null;remember();draw();readItems();
  },{signal:listeners.signal});

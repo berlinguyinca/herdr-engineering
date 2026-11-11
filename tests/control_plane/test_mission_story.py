@@ -228,7 +228,8 @@ def test_outcome_summaries_feed_the_catalog_rows():
     repo.mission_outcomes.sweep(force=True)
     out = outcome_summaries(repo)
     assert out["m1"] == {"result": "succeeded", "final_stage": "complete", "inferred": False, "ended_at": out["m1"]["ended_at"],
-                         "duration_s": HOUR, "agent_count": 2, "repository": "org/app", "last_event": "PR #214 merged"}
+                         "duration_s": HOUR, "agent_count": 2, "repository": "org/app", "last_event": "PR #214 merged",
+                      "prs": [{"repository": "org/app", "number": 214}]}
     assert out["bad"]["result"] == "failed" and out["bad"]["last_event"] == "Ended: failed"
     assert out["quiet"]["result"] == "unknown" and out["quiet"]["inferred"] is True
     repo.set_mission_stage("m1", "implementation")                 # reopened: its old outcome no longer describes it

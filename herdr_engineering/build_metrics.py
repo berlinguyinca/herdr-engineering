@@ -154,9 +154,10 @@ def classify_cmd(cmd: list[str]) -> str:
         if toks[0] == "rustc":
             return "rustc"
         if toks[0] == "cargo":
-            rest = [t for t in toks[1:] if not t.startswith("+")]
-            if rest:
-                kind = f"cargo {rest[0]}"
+            from .cargo_host import cargo_subcommand
+            subcommand = cargo_subcommand(toks[1:])
+            if subcommand:
+                kind = f"cargo {subcommand}"
                 if kind in _CMD_KINDS:
                     return kind
     except (IndexError, TypeError):

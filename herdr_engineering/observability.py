@@ -73,6 +73,9 @@ def _is_public_ip(ip: str) -> bool:
     Loopback, RFC1918, link-local, CGNAT, the Tailscale IPv4 CGNAT range and
     the Tailscale IPv6 ULA (fd7a:115c:a1e0::/48) are private.
     """
+    low_ip = ip.lower()
+    if low_ip.startswith("::ffff:") and "." in low_ip:
+        ip = ip[len("::ffff:"):]              # IPv4-mapped IPv6: classify the embedded IPv4 address
     if ip in ("127.0.0.1", "::1", "0.0.0.0", "::"):
         return False
     if ":" in ip:

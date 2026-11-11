@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 PRIVATE_TYPES = frozenset({'lineage', 'review_request', 'inspector', 'host_metrics',
                            'agent_identity', 'agent_summary', 'deployment', 'deployment_plan',
-                           'deployment_request', 'deployment_escalation'})
+                           'deployment_request', 'deployment_escalation', 'mission_activity_store'})
 ENVELOPE_ONLY = ('host', 'session', 'mission', 'service', 'inspector', 'mission_activity', 'lineage')
 
 
@@ -212,7 +212,7 @@ class PostgresHistory:
             rows = [dict(row) async for row in conn.cursor(
                 f'SELECT * FROM {self.table} WHERE entity_type<>ALL($1::text[]) '
                 'ORDER BY ingest_timestamp,sequence,event_id',
-                ['agent_identity','agent_summary','inspector','host_metrics','collab'], prefetch=1000)]
+                ['agent_identity','agent_summary','inspector','host_metrics','mission_activity_store','collab'], prefetch=1000)]
         streams, order = _rebuild_events(rows, reuse=True)
         order = [row for row in order if not hidden_history(row[0])]
         return streams, order
