@@ -45,6 +45,7 @@ testpaths = ["tests"]
 # plain ``pytest`` / scripts/validate.sh deselects it. Opt in with ``-m e2e`` (scripts/run_acceptance.py does).
 addopts = "--import-mode=importlib -m 'not e2e and not integration'"
 markers = [
+    "e2e: real command-line end-to-end workflows; opt in explicitly",
     "integration: needs an external dependency (a live Postgres via PA_PG_DSN, or a real CLI such as claude); deselected by default, opt in with -m integration",
 ]
 #
