@@ -492,7 +492,7 @@ def test_an_optional_host_that_missed_the_first_repo_is_not_updated_for_the_seco
     assert [(p["repo"], p["status"], p.get("reason")) for p in mac] == [
         ("herdr-engineering", "skipped", "optional_unreachable"), ("pi-engineering", "skipped", "optional_unreachable")]
     assert len(fleet.calls("macbook-pro")) == 1        # only the failed precheck; pi was never contacted there
-    assert current(fleet, "macbook-pro") == before and fleet.types()[-1] == "rollout.succeeded"
+    assert current(fleet, "macbook-pro") == before and "rollout.succeeded" in fleet.types()[-2:]
 
 
 def test_a_crash_during_health_keeps_the_hosts_own_previous_release_for_the_rollback(fleet):

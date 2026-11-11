@@ -1,0 +1,20 @@
+[Unit]
+Description=HerdR fleet rollout watcher (polls merged heads of the watched repos and plans; rolls out only when told to)
+After=network-online.target
+
+[Service]
+Type=simple
+# The INSTALLED build from a neutral cwd, never `python -m` in a checkout (shadowed(), #585).
+WorkingDirectory=/
+ExecStart=%h/.local/bin/herdr-eng fleet-watch loop
+# No RuntimeMaxSec/TimeoutStartSec: a healthy rollout may take long. The loop warns at its soft limit and exits 70 only
+# after a hard-limit stretch with NO progress; systemd then restarts it and the durable state resumes the rollout.
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=120
+Nice=10
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
