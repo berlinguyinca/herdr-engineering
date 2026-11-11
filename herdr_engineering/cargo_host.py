@@ -109,6 +109,19 @@ def install(home: Path, real_cargo: Path, python: Path) -> dict[str, str]:
         raise ValueError(f"Existing Cargo launcher is not ours: {launcher}")
     if launcher.is_symlink() or real_cargo.resolve() == launcher.resolve():
         raise ValueError("Cargo launcher would replace a symlink or recurse")
+    # A caller installing an isolated/new home may discover this user's already
+    # managed Cargo on PATH. Capture its real executable, not another launcher.
+    try:
+        with real_cargo.open("rb") as executable:
+            managed = MARKER.encode() in executable.read(256)
+    except OSError:
+        managed = False
+    if managed:
+        existing_home = real_cargo.resolve().parents[2]
+        original = json.loads((host_root(existing_home) / "install.json").read_text())
+        real_cargo = Path(original["real_cargo"])
+        if not real_cargo.is_absolute() or real_cargo.resolve() == launcher.resolve():
+            raise ValueError("Managed Cargo chain would recurse")
     if not real_cargo.is_file() or not os.access(real_cargo, os.X_OK):
         raise ValueError("Real Cargo executable is unavailable")
     config = home / ".cargo/config.toml"
@@ -223,18 +236,88 @@ def enroll_storage(volume: Path, name: str, directory: str, config_path: Path,
     return {"name": name, "volume_uuid": str(identity), "cache_directory": str(cache)}
 
 
+def enable_targets(config_path: Path) -> dict[str, object]:
+    import yaml
+
+    from .build_cache_config import validate
+    original = config_path.read_text()
+    data = yaml.safe_load(original)
+    section = data.get("fabric_build_cache", {})
+    if not section.get("enabled"):
+        raise ValueError("Enable fabric_build_cache before managed targets")
+    section.setdefault("local", {})["manage_targets"] = True
+    validate(section)
+    backup = config_path.with_name(config_path.name + ".before-herdr-target-storage")
+    if not backup.exists():
+        _atomic_write(backup, original)
+    if config_path.read_text() != original:
+        raise ValueError("Configuration changed concurrently; no target setting saved")
+    _atomic_write(config_path, yaml.safe_dump(data, sort_keys=False))
+    from .build_cache_location import select_storage
+    from .build_coord import _default_state_dir
+    from .cargo_target_storage import seed_existing_aliases
+    config = validate(section)
+    selected = select_storage(config.local.storage_tiers, _default_state_dir() / "sccache",
+                              config.local.min_free_disk_percent)
+    seeded = seed_existing_aliases(selected.directory, _default_state_dir()) if selected.directory else 0
+    return {"manage_targets": True, "config": str(config_path), "registered_existing_aliases": seeded}
+
+
 def run_cargo(argv: list[str]) -> int:
     real = _real_cargo(Path.home())
     command = [str(real), *argv]
     subcommand = cargo_subcommand(argv)
     from .cli import _build_cache_config
     config = _build_cache_config()
-    if (os.environ.get(COORDINATED) == "1" or config is None
-            or subcommand not in {"build", "check", "test", "clippy", "nextest", "run"}):
+    already_coordinated = os.environ.get(COORDINATED) == "1"
+    if (config is None or subcommand not in {"build", "check", "test", "clippy", "nextest", "run",
+                                            "bench", "doc", "rustc", "rustdoc", "clean", "fix", "package"}):
         os.execvpe(str(real), command, dict(os.environ))
         return 127  # pragma: no cover
     from .build_cache_policy import effective_slots
     from .build_coord import _default_slots, _default_state_dir, run_gated
+    if config.local.manage_targets:
+        from .build_cache_location import select_storage
+        from .cargo_target_storage import (
+            alias_owned,
+            compatibility_alias,
+            maintenance_lock,
+            prepare_target,
+            target_override,
+            workspace_root,
+        )
+        if not target_override(argv, os.environ, Path.cwd()):
+            with maintenance_lock(_default_state_dir()):
+                selected = select_storage(config.local.storage_tiers, _default_state_dir() / "sccache",
+                                          0 if subcommand == "clean" else config.local.min_free_disk_percent)
+                if selected.directory is None:
+                    raise ValueError("No writable storage tier meets the reserve; managed build was not started")
+                if not selected.directory.exists():
+                    removable = any(tier.name == selected.name and tier.volume_uuid
+                                    for tier in config.local.storage_tiers)
+                    if removable:
+                        raise ValueError("Selected external storage disappeared")
+                    selected.directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+                workspace = workspace_root(real, argv, Path.cwd())
+                old_target = workspace / "target"
+                if (old_target.exists() or old_target.is_symlink()) and not alias_owned(_default_state_dir(), workspace):
+                    if already_coordinated:
+                        os.execvpe(str(real), command, dict(os.environ))
+                        return 127  # pragma: no cover
+                    return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
+                                     record=True, cache_config=config, max_load=1.5)
+                target = prepare_target(selected.directory, workspace)
+                if not compatibility_alias(_default_state_dir(), workspace, target):
+                    raise ValueError("Default target changed concurrently; no automatic redirection applied")
+                os.environ["CARGO_TARGET_DIR"] = str(target)
+                if already_coordinated:
+                    os.execvpe(str(real), command, dict(os.environ))
+                    return 127  # pragma: no cover
+                return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
+                                 record=True, cache_config=config, max_load=1.5)
+    if already_coordinated:
+        os.execvpe(str(real), command, dict(os.environ))
+        return 127  # pragma: no cover
     return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
                      record=True, cache_config=config, max_load=1.5)
 
@@ -291,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
         if arguments and arguments[0] == "rustc":
             return run_rustc(arguments[1:])
         parser = argparse.ArgumentParser(prog="herdr-eng cargo-host")
-        parser.add_argument("action", choices=["install", "status", "storage-add"])
+        parser.add_argument("action", choices=["install", "status", "storage-add", "targets-enable", "targets-migrate"])
         parser.add_argument("--real-cargo", type=Path)
         parser.add_argument("--volume", type=Path)
         parser.add_argument("--name", default="primary")
@@ -299,6 +382,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.add_argument("--priority", type=int, default=0)
         parser.add_argument("--config", type=Path,
                             default=Path.home() / ".config/herdr-engineering/config.yaml")
+        parser.add_argument("--root", type=Path, action="append", default=[])
+        parser.add_argument("--apply", action="store_true")
+        parser.add_argument("--quiescent", action="store_true",
+                            help="confirm uncoordinated Cargo/IDE clients are paused for migration")
         args = parser.parse_args(arguments)
         if args.action == "install":
             real = args.real_cargo
@@ -311,6 +398,11 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("storage-add requires --volume")
             print(json.dumps(enroll_storage(args.volume, args.name, args.directory,
                                             args.config, args.priority), indent=2))
+        elif args.action == "targets-enable":
+            print(json.dumps(enable_targets(args.config), indent=2))
+        elif args.action == "targets-migrate":
+            from .cargo_target_migration import migration_run
+            print(json.dumps(migration_run(args.root, apply=args.apply, quiescent=args.quiescent), indent=2))
         else:
             from .build_cache_location import select_storage
             from .build_coord import _default_state_dir
@@ -319,6 +411,7 @@ def main(argv: list[str] | None = None) -> int:
             selected = select_storage(config.local.storage_tiers, _default_state_dir() / "sccache",
                                       config.local.min_free_disk_percent) if config else None
             print(json.dumps({"installed": (host_root(Path.home()) / "install.json").exists(),
+                              "manage_targets": config.local.manage_targets if config else False,
                               "storage_tier": selected.name if selected else None,
                               "cache_directory": str(selected.directory) if selected and selected.directory else None,
                               "skipped": selected.skipped if selected else []}, indent=2))

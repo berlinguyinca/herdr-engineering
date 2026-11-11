@@ -55,6 +55,7 @@ class Local:
     min_free_disk_percent: float
     incremental_disabled_for_cacheable_builds: bool
     storage_tiers: tuple[StorageTier, ...] = ()
+    manage_targets: bool = False
 
 
 @dataclass(frozen=True)
@@ -360,6 +361,7 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     free = _num(lo, "min_free_disk_percent", lp, lo=0, lo_incl=True, hi=100)
     incr = _bool(lo, "incremental_disabled_for_cacheable_builds", lp)
     tiers = parse_storage_tiers(lo["storage_tiers"])
+    manage_targets = _bool(lo, "manage_targets", lp)
 
     xp = f"{p}.execution"
     ex = _filled(top["execution"], base["execution"], xp)
@@ -425,7 +427,7 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     return BuildCacheConfig(
         enabled=enabled, mode=mode, allowed_hosts=allowed_hosts,
         shared_cache=SharedCache(s_enabled, ep, s["namespace"], writes, max_total, tls, cred, reg),
-        local=Local(capacity, ram, free, incr, tiers),
+        local=Local(capacity, ram, free, incr, tiers, manage_targets),
         execution=Execution(slurm, clusters, parts, gpu, fb, slots),
         cleanup=Cleanup(dry, idle, evict),
         observability=Observability(obs, exp),

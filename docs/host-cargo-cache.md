@@ -19,7 +19,7 @@ Managed PATH blocks are added to shell startup files. Existing content is preser
 
 Disabling `fabric_build_cache` later stops cache use but does not automatically remove the installed `incremental = false` default. Restore that setting deliberately from the retained backup if reverting the integration.
 
-Cache probe failures fall back to the original compiler. Cache integration does not change target directories or source checkouts, does not install remote-cache credentials in compiler environments, and does not migrate Docker or scratch directories.
+Cache probe failures fall back to the original compiler. Compiler caching alone leaves target directories unchanged. Managed target placement is a separate opt-in described below. Neither feature moves source checkouts, installs remote-cache credentials in compiler environments, or migrates Docker or scratch directories.
 
 ## Automatic primary, secondary, and internal storage
 
@@ -65,4 +65,25 @@ herdr-eng build-cache-inventory --json
 herdr-eng build-coordinate --status
 ```
 
-This reduces repeated compilation. It does not eliminate Cargo's target output footprint, and it is not a quota for existing worktrees.
+Compiler caching reduces repeated compilation. Its size cap is separate from Cargo's target output footprint and is not a quota for existing worktrees.
+
+## Managed target directories
+
+After enrollment, opt in to placing new Cargo output on the selected tier:
+
+```sh
+herdr-eng cargo-host targets-enable
+herdr-eng cargo-host status
+```
+
+This sets `fabric_build_cache.local.manage_targets: true`, retaining a configuration backup. Normal `cargo build`, `test`, `check`, `run`, `clean` and related built-ins use a workspace-specific directory under the selected cache directory's sibling `targets/` tree. Each worktree has its own directory. A managed `./target` symlink keeps scripts that read local build artifacts working. Existing physical target directories, unrecognized links, and explicit CLI/environment/Cargo configuration overrides remain authoritative.
+
+The first eligible enrolled drive wins on each invocation. If a drive is absent, the next enrolled drive or eligible internal tier is selected. Owned links are updated automatically, including broken links left by an unplugged drive. Outputs are independent per tier; switching drives may require rebuilding. New managed builds fail clearly if no tier meets the free-space reserve. The compiler-cache size cap does **not** bound managed target directories. Unmount drives only after builds using them finish; this does not provide mid-build failover. Direct absolute Cargo invocations receive compiler caching but need the managed launcher for automatic target selection.
+
+Existing default targets can be inspected without moving anything:
+
+```sh
+herdr-eng cargo-host targets-migrate --root ~/projects
+```
+
+For publication, pause Cargo agents and IDE/build watchers, then use `--apply --quiescent`. The explicit quiescent assertion is necessary because older clients do not participate in the maintenance lock. Migration also refuses open output or active compilers, tracked files, source markers, escaping links, special files, and uncertain ownership. It copies output with hardlinks preserved, verifies SHA256 content and link metadata, publishes the compatibility link, and removes only the verified original. A changed or in-use backup is retained and reported. Source directories never move. Automatic builds do not migrate existing physical targets implicitly.
