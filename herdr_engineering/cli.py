@@ -56,6 +56,10 @@ def _build_parser() -> argparse.ArgumentParser:
     from .build_cache_report_cli import register as register_build_cache_report
     register_build_cache_report(sub)
 
+    p = sub.add_parser("cargo-host", help="install or inspect harness-neutral Cargo caching")
+    p.add_argument("arguments", nargs=argparse.REMAINDER)
+    p.set_defaults(func=_cmd_cargo_host)
+
     from .open_client import register_parser
     register_parser(sub)
 
@@ -2948,6 +2952,11 @@ def _cmd_dev_gateway(args) -> int:
         gateway.stop()
         _print_json({"stopped": True})
     return 0
+
+
+def _cmd_cargo_host(args) -> int:
+    from .cargo_host import main
+    return main(args.arguments)
 
 
 def _cmd_build_coordinate(args) -> int:
