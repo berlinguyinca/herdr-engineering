@@ -170,7 +170,9 @@ export async function openDashboard(browser, hash, ctxOpts = {}, log) {
 // Size cap (6144 KB for all baselines): the pages are tall (Missions 961px, assistant tabs 1600-2400px) and 100 baselines already take 4.5 MB,
 // so the matrix is desktop light, desktop dark and mobile light. Left out: tablet (768px uses the same collapsed layout as mobile, 375px, so
 // the mobile baseline covers the layout) and mobile dark (the colours are pinned by desktop dark). Listed in the test matrix as a known limit.
-const SKIP = ['tablet-light', 'tablet-dark', 'mobile-dark'];
+// Desktop only (2026-11-11): the dashboard is used on desktops, so phone and tablet pixel baselines are not kept; phone reflow stays gated by
+// ui-gates-dashboard-a11y and assistant-connectors.test.mjs.
+const SKIP = ['tablet-light', 'tablet-dark', 'mobile-light', 'mobile-dark'];
 export const DASHBOARD_SURFACES = [
   { slug: 'dashboard-missions', app: 'dashboard', fullPage: true, skip: SKIP, hash: '/missions', proof: '[data-mission-key]',
     steps: async (page) => { await page.locator('[data-mission-key="pi:M-203"]').waitFor(); await page.locator('#mc-result').filter({ hasText: 'matching current missions' }).waitFor(); await page.evaluate(() => document.activeElement?.blur()); },
@@ -181,7 +183,7 @@ export const DASHBOARD_SURFACES = [
     regions: [{ name: 'panel', selector: '#pa-notifications' }] },
   { slug: 'dashboard-assistant-approvals', app: 'dashboard', fullPage: true, skip: SKIP, hash: '/personal-assistant', proof: '[data-config]', steps: assistantTab('Approvals', 'Approving allows'),
     regions: [{ name: 'panel', selector: '#pa-approvals' }] },
-  { slug: 'dashboard-assistant-connectors', app: 'dashboard', fullPage: true, skip: [...SKIP, 'mobile-light'],   // no mobile baseline: the 6144 KB cap; phone reflow is gated by ui-gates-dashboard-a11y and assistant-connectors.test.mjs
+  { slug: 'dashboard-assistant-connectors', app: 'dashboard', fullPage: true, skip: SKIP,   // no mobile baseline: the 6144 KB cap; phone reflow is gated by ui-gates-dashboard-a11y and assistant-connectors.test.mjs
      hash: '/personal-assistant', proof: '[data-config]', steps: connectorsTab },
 ];
 
