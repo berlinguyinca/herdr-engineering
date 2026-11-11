@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### CI: unit-gates runs pytest in parallel (pytest-xdist)
+- `scripts/ci/unit-gates.sh` now runs `python -m pytest -q -n auto --maxprocesses=8 --dist=loadfile` (arguments come from `scripts/ci/pytest-parallel.sh`), so the ~90 minute serial run is spread over workers; a file's tests stay on one worker. Overrides: `HERDR_PYTEST_WORKERS=<n>|auto|0` (0 = serial as before), `HERDR_PYTEST_MAXPROCESSES=<cap>`. The file-descriptor floor still applies first (the limit is per process, so each worker leaks only its share). Nothing is deselected or skipped. `pytest-xdist==3.8.0` is pinned in the `dev` extra. Tests: `tests/test_ci_pytest_parallel.py`.
+- `join.sh --stop` now uses `ps -ww`: xdist workers export `COLUMNS=80`, which made `ps -o args=` truncate the worker's command line before `worker.sh`, so `--stop` silently stopped nothing (`tests/control_plane/test_collab_join_script.py` failed only under xdist).
+
 ### Fleet rollout watcher step 4: host-apply and the serial runner (manual, `--apply` required)
 - `herdr-eng fleet host-apply` (precheck/apply/health/rollback per repo, D6 checkout gate, idempotent `no_change`, `fleet-auto-update.lock`, atomic Pi `current` switch keeping 3 releases) and `herdr-eng fleet-watch run [--apply]` (serial beast -> bender -> macbook-pro, halt on first failure, durable crash-resume, ssh timeouts, D8 rollback for pointer flips and ff-only, events through the existing emitter/outbox). Output and events carry no free text. No systemd unit (step 5). Tests: `tests/test_fleet_host_apply.py`, `tests/test_fleet_watch_run.py`. See `docs/operations/fleet-rollout-events.md`.
 
