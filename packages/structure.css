@@ -17,9 +17,3 @@
 #view .pa-status, #view .pa-badge, #view .pa-graph-chip, #view .rel-state, #view .ov-metric, #view .ov-tag, #view details > summary, #view kbd, #view code { border-radius: 4px; }
 #view .hd-card, #view details.hd-card, #view .ov-panel, #view .pa-msg, #view .pa-app, #view .pa-setup, #view .pa-strip, #view .sw-message,
 #view .sw-summary-card, #view .sw-panes, #view .conversation-input { border-radius: 10px; }
-
-
-/* 4. Disclosure that is really closed: the content of a closed <details> is not laid out at all. It was already invisible and
-   unreachable by keyboard; this makes that true for layout-based measurement too. Trade-off: browser find-in-page no longer
-   opens a closed section on a match. */
-#view details:not([open]) > :not(summary) { display: none; }
