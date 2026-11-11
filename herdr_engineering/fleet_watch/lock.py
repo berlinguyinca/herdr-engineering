@@ -103,6 +103,7 @@ def _backup_path(path: Path, now: datetime) -> Path:
 
 
 def _write_atomic(path: Path, text: str, mode: int, previous: bytes | None, now: datetime) -> None:
+    path = path.resolve()                      # a symlinked lock keeps its link; the target file is replaced
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     try:
@@ -112,10 +113,12 @@ def _write_atomic(path: Path, text: str, mode: int, previous: bytes | None, now:
             handle.flush()
             os.fsync(handle.fileno())
         if previous is not None:
+            if path.read_bytes() != previous:      # changed since pin_repos read it: never overwrite someone else's edit
+                raise LockRefused("lock_invalid")
             backup = _backup_path(path, now)
             shutil.copy2(path, backup)
         os.replace(tmp, path)
-    except OSError:
+    except (OSError, LockRefused):
         tmp.unlink(missing_ok=True)
         raise
     dir_fd = os.open(path.parent, os.O_RDONLY)

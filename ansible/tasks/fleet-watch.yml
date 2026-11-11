@@ -28,6 +28,7 @@
         content: "{{ lookup('file', herdr_engineering_repo_root ~ '/scripts/herdr-eng-fleet-watch.service') }}"
         dest: "{{ fleet_home }}/.config/systemd/user/herdr-eng-fleet-watch.service"
         mode: "0644"
+      register: watch_unit_copy
 
     - name: "Opt the watcher into applying rollouts (drop-in appends --enable-rollouts), only when asked"
       ansible.builtin.copy:
@@ -37,18 +38,30 @@
           ExecStart=%h/.local/bin/herdr-eng fleet-watch loop --enable-rollouts
         dest: "{{ fleet_home }}/.config/systemd/user/herdr-eng-fleet-watch.service.d/apply.conf"
         mode: "0644"
+      register: watch_dropin_copy
       when: watch_apply | bool
 
     - name: "Remove the apply drop-in when rollouts are not wanted"
       ansible.builtin.file:
         path: "{{ fleet_home }}/.config/systemd/user/herdr-eng-fleet-watch.service.d/apply.conf"
         state: absent
+      register: watch_dropin_removed
       when: not (watch_apply | bool)
 
-    - name: "Enable the watcher only where it is wanted"
+    - name: "Enable the watcher only where it is wanted (started, never restarted when nothing changed)"
       ansible.builtin.systemd_service:
         name: herdr-eng-fleet-watch.service
         scope: user
         daemon_reload: true
         enabled: "{{ watch_wanted | bool }}"
-        state: "{{ 'restarted' if (watch_wanted | bool) else 'stopped' }}"
+        state: "{{ 'started' if (watch_wanted | bool) else 'stopped' }}"
+
+    - name: "Restart the running watcher only when its unit or drop-in changed"
+      ansible.builtin.systemd_service:
+        name: herdr-eng-fleet-watch.service
+        scope: user
+        daemon_reload: true
+        state: restarted
+      when: >-
+        (watch_wanted | bool) and
+        (watch_unit_copy is changed or watch_dropin_copy is changed or watch_dropin_removed is changed)

@@ -124,7 +124,7 @@ def test_the_old_resume_flag_still_works_with_a_deprecation_note(fleet):
     out = fleet.cli("--resume")
     assert out.returncode == 0, out.stderr
     assert "deprecated" in out.stderr and "fleet-watch resume" in out.stderr
-    assert fleet.types()[-1] == "rollout.succeeded"
+    assert "rollout.succeeded" in fleet.types()[-2:]
 
 
 # --------------------------------------------------------------------------- abandon
@@ -380,7 +380,7 @@ def test_tasks_install_the_unit_but_enable_only_when_fleet_watch_enabled_on_beas
     assert b["environment"]["XDG_RUNTIME_DIR"] == "/run/user/{{ ansible_user_uid }}"
     wanted = b["vars"]["watch_wanted"]
     assert "fleet_watch_enabled | default(false) | bool" in wanted and "inventory_hostname == 'beast'" in wanted
-    (service,) = [t["ansible.builtin.systemd_service"] for t in b["block"] if "ansible.builtin.systemd_service" in t]
+    service = [t["ansible.builtin.systemd_service"] for t in b["block"] if "ansible.builtin.systemd_service" in t][0]
     assert service["name"] == "herdr-eng-fleet-watch.service" and service["scope"] == "user"
     assert "watch_wanted" in service["enabled"] and "stopped" in service["state"]
     copies = [t["ansible.builtin.copy"] for t in b["block"] if "ansible.builtin.copy" in t]
@@ -407,3 +407,19 @@ def test_no_default_turns_the_watcher_on():
         text = path.read_text()
         assert not re.search(r"^\s*fleet_watch_(enabled|apply):\s*true", text, re.M), path
 
+
+
+def test_the_final_task_starts_and_restarts_only_when_a_file_changed():
+    b = block()["block"]
+    copies = [t for t in b if "ansible.builtin.copy" in t]
+    assert copies and all(t.get("register") for t in copies)
+    svc = [t for t in b if "ansible.builtin.systemd_service" in t][0]
+    assert "restarted" not in svc["ansible.builtin.systemd_service"]["state"]
+    restart = [t for t in b if "restarted" in str(t.get("ansible.builtin.systemd_service", {}).get("state", ""))]
+    assert restart and all("changed" in str(t["when"]) for t in restart)
+
+
+def test_unit_does_not_restart_on_refusal_or_busy_and_wants_the_network():
+    unit = parse_unit(UNIT)
+    assert dict(unit["Service"])["RestartPreventExitStatus"] == "2 3"
+    assert dict(unit["Unit"])["Wants"] == "network-online.target"

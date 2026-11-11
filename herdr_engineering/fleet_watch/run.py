@@ -296,13 +296,14 @@ class Runner:
     def _pin_lock(self, saved: dict, rid: str, rollout: dict) -> None:
         """Move the lock to the converged targets: only after success, only through `lock.pin_repos` (D3 history
         check, no downgrade). A refusal is recorded and emitted; it never undoes the converged rollout."""
-        if self.lock_path is None or not self.lock_path.exists():
-            rollout["lock"] = "absent"             # the operator's lock is never invented by a rollout
-            state.save(saved, self.directory)
-            return
         targets = [{"repo": short(repo), "sha": sha, **({"before": rollout["before"][repo]}
                                                          if rollout["before"].get(repo) else {})}
                    for repo, sha in rollout["targets"].items()]
+        if self.lock_path is None or not self.lock_path.exists():
+            rollout["lock"] = "absent"             # the operator's lock is never invented by a rollout
+            state.save(saved, self.directory)
+            self._emit(rid, "lock.refused", targets=targets, reason="lock_invalid")
+            return
         try:
             lock.pin_repos(rollout["targets"], self.lock_path, directory=self.directory, base=core.git_base())
         except lock.LockRefused as exc:

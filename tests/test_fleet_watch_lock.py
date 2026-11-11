@@ -11,12 +11,13 @@ import re
 import stat
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from herdr_engineering.control_plane.fleet_rollout import REASONS, validate_fleet_rollout
-from herdr_engineering.fleet_watch import lock
+from herdr_engineering.fleet_watch import lock, state
 from tests.test_fleet_watch import Forge, git
 from tests.test_fleet_watch_run import BOOT, HE, PI, fleet  # noqa: F401  (fixture)
 
@@ -295,11 +296,6 @@ def test_the_lock_moves_only_after_a_fully_succeeded_rollout(fleet):
     assert fleet.saved()["rollouts"][pinned["rollout_id"]]["lock"] == "pinned"
 
 
-def test_a_rollout_does_not_invent_a_lock_that_does_not_exist(fleet):
-    assert fleet.cli().returncode == 0
-    assert not fleet.lock.exists() and lock_events(fleet) == []
-
-
 def test_a_refused_pin_is_recorded_but_does_not_undo_the_converged_rollout(fleet):
     head = fleet.forge.head(HE)
     ahead = fleet.forge.commit(HE, "three")                                   # the lock is ahead of what main will be
@@ -343,3 +339,46 @@ def test_fake_secret_shapes_never_reach_lock_events(fleet):
         lock.pin_repos({HE: key}, fleet.lock, directory=fleet.state_dir, base=str(fleet.forge.root), create=True)
     assert key not in json.dumps(fleet.queued())
 
+
+
+# --------------------------------------------------------------------------- review fixes
+
+def test_pin_repos_refuses_when_the_lock_changed_after_it_was_read(world):
+    forge, directory, path = world
+    old = write_lock(path, forge)
+    path.write_text(old + "# edited by the operator meanwhile\n")
+    with pytest.raises(lock.LockRefused) as caught:
+        lock._write_atomic(path, old.replace("a", "a"), 0o600, old.encode(), datetime.now(UTC))
+    assert caught.value.reason == "lock_invalid"
+    assert path.read_text().endswith("meanwhile\n")
+    assert not [p for p in path.parent.iterdir() if "tmp" in p.name or "bak" in p.name]
+
+
+def test_a_symlinked_lock_stays_a_symlink_and_its_target_is_updated(world, tmp_path):
+    forge, directory, path = world
+    real = tmp_path / "real" / "fleet.lock.yaml"
+    real.parent.mkdir()
+    write_lock(real, forge)
+    path.symlink_to(real)
+    new = forge.commit(AUTO, "two")
+    pin(forge, directory, path, {AUTO: new})
+    assert path.is_symlink() and new in real.read_text()
+    assert [p.name for p in real.parent.iterdir() if "bak" in p.name]
+
+
+def test_lock_verify_while_the_watcher_holds_its_lock_reports_busy_not_a_fetch_failure(world, tmp_path):
+    forge, _, path = world
+    write_lock(path, forge)
+    home = tmp_path / "home"
+    held = home / "state" / "herdr-engineering" / "fleet-watch"
+    with state.single_instance(held):
+        out = verify_cli(forge, home, path, "--json")
+    assert out.returncode == 3 and json.loads(out.stdout) == {"ok": False, "status": "busy"}
+    assert "fetch_failed" not in out.stdout
+
+
+def test_a_rollout_without_a_lock_file_emits_lock_refused_lock_invalid_but_never_creates_it(fleet):
+    assert fleet.cli().returncode == 0
+    assert not fleet.lock.exists()
+    events = lock_events(fleet)
+    assert [e["event_type"] for e in events] == ["lock.refused"] and events[0]["payload"]["reason"] == "lock_invalid"

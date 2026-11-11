@@ -1,5 +1,6 @@
 [Unit]
 Description=HerdR fleet rollout watcher (polls merged heads of the watched repos and plans; rolls out only when told to)
+Wants=network-online.target
 After=network-online.target
 
 [Service]
@@ -10,6 +11,8 @@ ExecStart=%h/.local/bin/herdr-eng fleet-watch loop
 # No RuntimeMaxSec/TimeoutStartSec: a healthy rollout may take long. The loop warns at its soft limit and exits 70 only
 # after a hard-limit stretch with NO progress; systemd then restarts it and the durable state resumes the rollout.
 Restart=on-failure
+# Exit 2 (refused) and 3 (busy) will not fix themselves by restarting.
+RestartPreventExitStatus=2 3
 RestartSec=30
 TimeoutStopSec=120
 Nice=10

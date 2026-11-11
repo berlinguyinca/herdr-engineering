@@ -1755,7 +1755,11 @@ def _cmd_fleet_config(args) -> int:
 def _cmd_fleet_lock_verify(args) -> int:
     from .fleet_watch import lock, state
     try:
-        rows = lock.verify_lock(args.lock, converged=state.load().get("converged", {}))
+        with state.single_instance(state.state_dir()):      # the watcher fetches into the same cache clones
+            rows = lock.verify_lock(args.lock, converged=state.load().get("converged", {}))
+    except state.WatcherBusy:
+        print(json.dumps({"ok": False, "status": "busy"}) if args.json else "lock verify: busy (watcher pass running)")
+        return 3
     except lock.LockRefused:
         print(f"fleet lock verify: cannot read the repos section of {args.lock}", file=sys.stderr)
         return 2
