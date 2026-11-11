@@ -475,7 +475,36 @@ def _ci_summary(row: dict) -> dict:
     from .ci_deployments import evidence_url     # lazy: see _ci_read
     return {"outcome": last.get("outcome"), "at": last.get("received_at"),
             "from": last.get("from"), "to": last.get("to"),
-            "evidence_url": evidence_url(last.get("evidence"))}
+            "evidence_url": evidence_url(last.get("evidence")),
+            "detail": (last.get("evidence") or "").strip()[:PROBLEM_DETAIL] if isinstance(last.get("evidence"), str) else ""}
+
+
+#: Outcomes that are problems an operator should see (not started/ok/skipped).
+PROBLEM_OUTCOMES = ("failed", "refused", "rolled-back")
+MAX_PROBLEMS = 20
+PROBLEM_DETAIL = 300
+
+
+def recent_problems(components: dict) -> list[dict]:
+    """Newest-first problem events across every component's timeline: component, step, outcome,
+    time, host, the evidence text (bounded; already redacted) and its run link. ``recovered`` is
+    True when a later ``ok`` for the same component arrived."""
+    from .ci_deployments import evidence_url     # lazy: see _ci_read
+    found = []
+    for name, row in (components or {}).items():
+        timeline = [e for e in (row.get("timeline") or ()) if isinstance(e, dict)] if isinstance(row, dict) else []
+        for i, e in enumerate(timeline):
+            if e.get("outcome") not in PROBLEM_OUTCOMES:
+                continue
+            evidence = e.get("evidence") if isinstance(e.get("evidence"), str) else ""
+            found.append({
+                "component": name, "step": e.get("step"), "outcome": e.get("outcome"),
+                "at": e.get("received_at"), "host": e.get("host"), "reported_by": e.get("reported_by"),
+                "detail": evidence.strip()[:PROBLEM_DETAIL], "evidence_url": evidence_url(evidence),
+                "recovered": any(later.get("outcome") == "ok" for later in timeline[i + 1:]),
+                "_epoch": e.get("received_epoch") or 0})
+    found.sort(key=lambda p: p["_epoch"], reverse=True)
+    return [{k: v for k, v in p.items() if k != "_epoch"} for p in found[:MAX_PROBLEMS]]
 
 
 class DeploymentAuthorizationError(PermissionError):
@@ -654,6 +683,7 @@ class DeploymentDefinitions:
             if isinstance(components, dict) and isinstance(components.get(name), dict):
                 components[name]["kind"] = "ci"
                 components[name]["ci"] = _ci_summary(components[name])
+        view["problems"] = recent_problems(components if isinstance(components, dict) else {})
         return view
 
     # ------------------------------------------------------- target + plan

@@ -157,7 +157,7 @@ def test_the_ci_summary_carries_outcome_commits_time_and_a_bounded_evidence_link
     snap = {"components": {"lc-binbase-frontend": {"timeline": [ev, started], "running": C1}}}
     ci = store.annotate(snap)["components"]["lc-binbase-frontend"]["ci"]
     assert ci == {"outcome": "ok", "at": "2026-11-09T10:00:00Z", "from": "a" * 40, "to": C1,
-                  "evidence_url": RUN_URL}
+                  "evidence_url": RUN_URL, "detail": f"deployed, see {RUN_URL} for the run"}
     snap["components"]["lc-binbase-frontend"]["timeline"] = [dict(ev, evidence=f"(see {RUN_URL}).")]
     assert store.annotate(snap)["components"]["lc-binbase-frontend"]["ci"]["evidence_url"] == RUN_URL
     snap["components"]["lc-binbase-frontend"]["timeline"] = [dict(ev, evidence="no link http://x")]
@@ -350,3 +350,30 @@ def test_the_allowlist_comes_back_when_the_file_is_repaired(tmp_path):
         assert _post(svr, CI_TOKEN)[0] == 200
     finally:
         svr.shutdown()
+
+
+def test_recent_problems_list_failed_events_newest_first_with_detail_link_and_recovery(tmp_path):
+    store = _store(tmp_path, MAP)
+    base = {"step": "deployment.lc-binbase-backend.deploy", "host": "ci-agent-1", "reported_by": CI_HOST}
+    detail = f"deploy step failed: FAILED MODULES: go-assistant-mcp (pipeline #154) [{RUN_URL}]"
+    backend = [dict(base, outcome="failed", received_at="2026-11-09T09:00:00Z", received_epoch=1, evidence="old"),
+               dict(base, outcome="ok", received_at="2026-11-09T09:30:00Z", received_epoch=2, evidence=""),
+               dict(base, outcome="failed", received_at="2026-11-10T09:00:00Z", received_epoch=3, evidence=detail)]
+    frontend = [dict(base, step="deployment.lc-binbase-frontend.deploy", outcome="started",
+                     received_at="2026-11-10T09:05:00Z", received_epoch=4, evidence="")]
+    snap = {"components": {"lc-binbase-backend": {"timeline": backend}, "lc-binbase-frontend": {"timeline": frontend}}}
+    problems = store.annotate(snap)["problems"]
+    assert [p["at"] for p in problems] == ["2026-11-10T09:00:00Z", "2026-11-09T09:00:00Z"]
+    assert problems[0] == {"component": "lc-binbase-backend", "step": "deployment.lc-binbase-backend.deploy",
+                           "outcome": "failed", "at": "2026-11-10T09:00:00Z", "host": "ci-agent-1",
+                           "reported_by": CI_HOST, "detail": detail, "evidence_url": RUN_URL, "recovered": False}
+    assert problems[1]["recovered"] is True
+    assert store.annotate({"components": {}})["problems"] == []
+
+
+def test_recent_problems_are_bounded_and_the_detail_is_capped(tmp_path):
+    store = _store(tmp_path, MAP)
+    timeline = [{"step": "deployment.lc-binbase-backend.deploy", "outcome": "failed", "received_epoch": n,
+                 "received_at": "t", "evidence": "x" * 5000} for n in range(50)]
+    problems = store.annotate({"components": {"lc-binbase-backend": {"timeline": timeline}}})["problems"]
+    assert len(problems) == 20 and len(problems[0]["detail"]) == 300
