@@ -136,7 +136,10 @@ def parse_result(rid: str, host: str, repo: str, outcome: Outcome, *, sha: str |
     if keep["status"] == "ok" and outcome.rc != 0:
         return bad
     if keep["status"] == "ok" and phase in ("apply", "health") and sha is not None and keep.get("after_sha") != sha:
-        return bad
+        # the host may be AT OR PAST the target (it verified that itself) and says so with past_target
+        if not (data.get("past_target") is True and isinstance(keep.get("after_sha"), str)
+                and re.fullmatch(r"[0-9a-f]{40}", keep["after_sha"])):
+            return bad
     keep["no_change"] = data.get("no_change") is True
     keep["not_applicable"] = data.get("not_applicable") is True
     if keep["status"] == "skipped" and not keep.get("reason") and not keep["not_applicable"]:
@@ -322,7 +325,7 @@ class Runner:
             self._step(rid, host, repo, "applying", result)
             phase = "apply"
             result = self._call(rid, host, repo, sha, "apply", own_before)
-            applied = result["status"] == "ok" and not result.get("no_change")   # the host really changed
+            applied = result["status"] == "ok" and not result.get("no_change")   # the host really changed now
         if result["status"] == "ok":
             self._step(rid, host, repo, "checking", result)
             phase = "health"
@@ -337,7 +340,10 @@ class Runner:
         extra = _fields(result, "before_sha", "after_sha", "checks", "counts")
         if result.get("log", {}).get("host") == host:
             extra["log"] = result["log"]
-        row.update(state="done", status=status, updated=applied and status == "ok",
+        # A carried host_before that differs from the target means an earlier, crashed attempt already switched this
+        # host: the resumed precheck/apply report no_change, but the host did change in this rollout.
+        switched = applied or bool(carried and carried != sha)
+        row.update(state="done", status=status, updated=switched and status == "ok",
                    **({"reason": reason} if reason else {}),
                    **({"not_applicable": True} if result.get("not_applicable") else {}),
                    **({"host_before": own_before} if own_before else {}))

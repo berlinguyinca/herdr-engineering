@@ -92,10 +92,10 @@ class Fleet:
         (home / ".local/bin").mkdir(parents=True)
         checkout = home / "checkout"
         subprocess.run(["git", "clone", "-q", str(self.forge.root / f"{HE}.git"), str(checkout)], check=True)
-        url = f"https://github.com/{HE}.git"          # the real origin form; the host's git config maps it locally
+        url = f"ssh://git@github.com/{HE}.git"        # the real origin form; the host's ssh seam serves it locally
         git(checkout, "remote", "set-url", "origin", url)
-        gitconfig = home / "gitconfig"
-        gitconfig.write_text(f'[url "{self.forge.root / f"{HE}.git"}"]\n\tinsteadOf = {url}\n')
+        gitssh = script(home / "git-ssh", f'''for a; do cmd="$a"; done
+exec sh -c "$(printf '%s' "$cmd" | sed "s#'/{HE}\\(\\.git\\)\\{{0,1\\}}'#'{self.forge.root / f"{HE}.git"}'#")"''')
         marker = home / "installed.marker"
         install = script(home / "install.sh", f'echo "$HERDR_FLEET_TARGET_SHA" > "{marker}"')
         ok = script(home / "ok.sh", "exit 0")
@@ -111,7 +111,7 @@ export HERDR_ENGINEERING_REPO="{checkout}"
 export HERDR_FLEET_HERDR_INSTALL_CMD="{install}" HERDR_FLEET_HERDR_AGENT_CMD=""
 export HERDR_FLEET_HERDR_SERVICE_CMD="{ok}" HERDR_FLEET_PARITY_CMD="{ok}"
 export HERDR_FLEET_PI_STAGE_CMD="{stage}" HERDR_FLEET_PI_SMOKE_CMD="{smoke}"
-export GIT_CONFIG_GLOBAL="{gitconfig}" GIT_CONFIG_SYSTEM=/dev/null
+export GIT_SSH_COMMAND="{gitssh}" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 exec "{sys.executable}" -I -c "{BOOT}" "$@"''')
         self.shims[host] = shim
 
@@ -509,6 +509,23 @@ def test_a_crash_during_health_keeps_the_hosts_own_previous_release_for_the_roll
     assert [p["status"] for p in fleet.finished()["bender"]][-1] == "rolled_back"
 
 
+def test_a_crash_after_the_switch_still_rolls_the_earlier_repo_back_when_a_later_repo_fails(fleet):
+    before, after = pi_world(fleet)
+    receipt = fleet.home("bender") / "state/herdr-engineering/fleet-watch/installed-herdr-engineering.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(json.dumps({"sha": git(fleet.checkout("bender"), "rev-parse", "HEAD")}))   # bender's own build
+    fleet.forge.commit(HE, "he-two")                   # herdr-engineering has something to install too
+    fleet.mode("bender", "die_health")                 # herdr-engineering switches on bender, then the runner dies
+    assert fleet.cli("--repo", PI).returncode == -9
+    fleet.mode("bender", "ok")
+    (fleet.home("bender") / "smoke_fail").write_text("")      # pi-engineering fails its health check on resume
+    assert fleet.cli("--repo", PI).returncode == 1
+    [rollout] = fleet.saved()["rollouts"].values()
+    assert rollout["rows"]["bender/herdr-engineering"]["updated"] is True     # precheck saw no_change; it did change
+    rollbacks = [c for c in fleet.calls("bender") if "--phase rollback" in c]
+    assert any("herdr-engineering" in c for c in rollbacks)                  # so the earlier repo is offered a rollback
+
+
 # --------------------------------------------------------------------------- who is "local"
 
 def test_an_explicit_local_host_that_is_not_this_machine_is_refused_before_anything_runs(fleet):
@@ -627,3 +644,14 @@ def test_unit_transport_refuses_unsafe_arguments():
     with pytest.raises(ValueError):
         t.command(["--repo", "x; rm -rf /"])
     assert t.command(["--phase", "apply"]).startswith("cd / && exec $HOME/.local/bin/herdr-eng fleet host-apply")
+
+
+def test_unit_parse_result_accepts_a_different_after_sha_only_when_the_host_says_it_is_past_the_target():
+    later = "b" * 40
+    wrong = run.Outcome(0, host_json(after_sha=later))
+    assert run.parse_result(RID, "beast", HE, wrong, sha=SHA, phase="apply")["status"] == "failed"
+    past = run.Outcome(0, host_json(after_sha=later, no_change=True, past_target=True))
+    got = run.parse_result(RID, "beast", HE, past, sha=SHA, phase="apply")
+    assert (got["status"], got["after_sha"], got["no_change"]) == ("ok", later, True)
+    junk = run.Outcome(0, host_json(after_sha="not-a-sha", past_target=True))
+    assert run.parse_result(RID, "beast", HE, junk, sha=SHA, phase="apply")["status"] == "failed"

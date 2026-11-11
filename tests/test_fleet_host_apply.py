@@ -54,6 +54,12 @@ def script(path: Path, body: str) -> Path:
     return path
 
 
+def ssh_seam(path: Path, name: str, origin: Path) -> Path:
+    """A real local-command ssh: serves github.com/berlinguyinca/<name> from the local bare repo."""
+    return script(path, f'''for a; do cmd="$a"; done
+exec sh -c "$(printf '%s' "$cmd" | sed "s#'/berlinguyinca/{name}\\(\\.git\\)\\{{0,1\\}}'#'{origin}'#")"''')
+
+
 def assert_closed(result: dict) -> None:
     """Spec section 14: every string in a result is an enum, hex, a timestamp or a fixed key - never free text."""
     enums = {"precheck", "apply", "health", "rollback", "all", *STATUSES, *REASONS, *HOST_ORDER, *LOG_KINDS,
@@ -93,12 +99,11 @@ class World:
         self.publish("one")
         self.checkout = root / "checkout"
         subprocess.run(["git", "clone", "-q", str(self.origin), str(self.checkout)], check=True)
-        # The checkout's configured origin is the real GitHub URL form; the host's git config maps it to the local
-        # bare repo (insteadOf), so the owner/name pinning is exercised without any network.
-        self.url = f"https://github.com/berlinguyinca/{name}.git"
+        # The checkout's configured origin is the real GitHub ssh URL form, unrewritten; the host's ssh command is a
+        # local-command seam that serves it from the bare repo, so owner/name pinning is exercised without a network.
+        self.url = f"ssh://git@github.com/berlinguyinca/{name}.git"
         git(self.checkout, "remote", "set-url", "origin", self.url)
-        self.gitconfig = root / "gitconfig"
-        self.gitconfig.write_text(f'[url "{self.origin}"]\n\tinsteadOf = {self.url}\n')
+        self.ssh = ssh_seam(root / "git-ssh", name, self.origin)
         self.home = root / "home"
         self.home.mkdir()
         self.marker = root / "installed.marker"
@@ -109,7 +114,7 @@ class World:
             "HERDR_ENGINEERING_REPO": str(self.checkout),
             "HERDR_FLEET_HERDR_INSTALL_CMD": str(install), "HERDR_FLEET_HERDR_AGENT_CMD": "",
             "HERDR_FLEET_HERDR_SERVICE_CMD": str(ok), "HERDR_FLEET_PARITY_CMD": str(ok),
-            "GIT_CONFIG_GLOBAL": str(self.gitconfig), "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_SSH_COMMAND": str(self.ssh), "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
         }
 
     def publish(self, name: str) -> str:
@@ -126,11 +131,11 @@ class World:
         """Another repo (own origin named after it) that shares this world's HOME and state."""
         other = World(self.root / name, name)
         other.home, other.marker = self.home, self.marker
-        other.env = {**self.env, "GIT_CONFIG_GLOBAL": str(other.gitconfig)}
+        other.env = {**self.env, "GIT_SSH_COMMAND": str(other.ssh)}
         return other
 
     def host_git(self, *args: str) -> None:
-        """git as the host sees it (origin URL mapped to the local bare repo)."""
+        """git as the host sees it (origin URL served from the local bare repo)."""
         subprocess.run(["git", "-C", str(self.checkout), *args], check=True, capture_output=True,
                        env={**os.environ, **self.env})
 
@@ -374,6 +379,23 @@ def test_a_checkout_whose_origin_is_another_repo_is_refused(world):
     assert not world.marker.exists() and world.head() != target
 
 
+def test_a_checkout_with_a_second_origin_url_or_a_rewritten_effective_url_is_refused(world, tmp_path):
+    target = world.publish("two")
+    git(world.checkout, "config", "--unset-all", "remote.origin.url")
+    git(world.checkout, "config", "remote.origin.url", "https://github.com/mallory/herdr-engineering.git")
+    git(world.checkout, "config", "--add", "remote.origin.url", world.url)     # the genuine one is the LAST value
+    out = world.run("apply", sha=target)                      # two configured values: git would use both
+    assert (out["status"], out["reason"]) == ("failed", "apply_failed")
+    git(world.checkout, "config", "--unset-all", "remote.origin.url")
+    git(world.checkout, "config", "remote.origin.url", world.url)
+    rewrite = tmp_path / "rewrite-config"                     # the host's git config redirects the raw URL elsewhere
+    rewrite.write_text('[url "https://github.com/mallory/"]\n\tinsteadOf = ssh://git@github.com/berlinguyinca/\n')
+    out = world.run("apply", sha=target, env={**world.env, "GIT_CONFIG_GLOBAL": str(rewrite)})
+    assert (out["status"], out["reason"]) == ("failed", "apply_failed")
+    assert not world.marker.exists() and world.head() != target
+    assert world.run("apply", sha=target)["status"] == "ok"   # the one genuine value still works
+
+
 @pytest.mark.parametrize("url", [
     "git@github.com:berlinguyinca/herdr-engineering.git", "ssh://git@github.com/berlinguyinca/herdr-engineering",
     "https://github.com/berlinguyinca/herdr-engineering/", "https://github.com/berlinguyinca/herdr-engineering.git",
@@ -388,20 +410,81 @@ def test_origin_matches_accepts_the_owner_pinned_forms(url):
     "git@github.com:mallory/herdr-engineering.git", "/srv/git/berlinguyinca/herdr-engineering.git",
     "https://evil.example/berlinguyinca/herdr-engineering.git", "https://github.com/berlinguyinca/autospec.git",
     "https://github.com.evil.example/berlinguyinca/herdr-engineering.git", "",
+    "https://evil.com\\@github.com/berlinguyinca/herdr-engineering", "https://a\tb@github.com/berlinguyinca/herdr-engineering",
+    "https://a b@github.com/berlinguyinca/herdr-engineering", "https://a\x00b@github.com/berlinguyinca/herdr-engineering",
 ])
 def test_origin_matches_rejects_other_owners_hosts_names_and_paths(url):
     assert not host_apply.origin_matches(url, "herdr-engineering")
 
 
-def test_a_checkout_ahead_of_the_target_is_not_installed_and_gets_no_receipt(world):
+def _receipt(world) -> Path:
+    return world.home / "state/herdr-engineering/fleet-watch/installed-herdr-engineering.json"
+
+
+def test_a_checkout_ahead_of_the_target_with_an_older_receipt_fails_closed_and_installs_nothing(world):
     older = world.publish("two")
+    assert world.run("all", sha=older)["status"] == "ok"      # installed at `older`, receipt at `older`
     world.publish("three")                                    # main moved on (nightly updater) ...
-    world.host_git("pull", "-q", "--ff-only", "origin", "main")   # ... and so did the checkout
-    out = world.run("apply", sha=older)
-    assert (out["status"], out["reason"]) == ("failed", "apply_failed")
-    assert not world.marker.exists()                          # nothing was installed
-    assert not (world.home / "state/herdr-engineering/fleet-watch/installed-herdr-engineering.json").exists()
-    assert world.run("precheck", sha=older)["no_change"] is False
+    world.host_git("pull", "-q", "--ff-only", "origin", "main")   # ... and so did the checkout, with no receipt
+    receipt = _receipt(world).read_text()
+    world.marker.unlink()
+    for phase in ("precheck", "apply", "all"):
+        out = world.run(phase, sha=older)
+        assert (out["status"], out["reason"]) == ("blocked", "ahead_of_target"), phase
+        assert_closed(out)
+    assert not world.marker.exists()                          # an unverified newer HEAD is never installed
+    assert _receipt(world).read_text() == receipt
+
+
+def test_a_checkout_ahead_of_the_target_is_converged_when_the_receipt_is_at_or_past_the_target(world):
+    older = world.publish("two")
+    newer = world.publish("three")
+    assert world.run("all", sha=newer)["status"] == "ok"      # the host is on `newer`, receipt at `newer`
+    world.marker.unlink()
+    for phase in ("precheck", "apply"):
+        out = world.run(phase, sha=older)
+        assert (out["status"], out["no_change"], out["before_sha"], out["after_sha"]) == ("ok", True, newer, newer), phase
+        assert out["past_target"] is True
+        assert_closed(out)
+    assert world.run("all", sha=older)["status"] == "ok"
+    health = world.run("health", sha=older, before_sha=newer)
+    assert health["status"] == "ok" and health["after_sha"] == newer
+    assert {c["name"]: c["status"] for c in health["checks"]}["version_matches"] == "ok"
+    assert not world.marker.exists() and world.head() == newer
+
+
+def test_a_checkout_ahead_with_unpublished_commits_still_blocks(world):
+    older = world.publish("two")
+    newer = world.publish("three")
+    assert world.run("all", sha=newer)["status"] == "ok"
+    (world.checkout / "local").write_text("x")
+    git(world.checkout, "add", "local")
+    git(world.checkout, "commit", "-q", "-m", "local")
+    out = world.run("precheck", sha=older)
+    assert (out["status"], out["reason"]) == ("blocked", "unpublished_commits")
+
+
+def test_autospec_ahead_of_the_target_is_converged_only_when_the_generation_receipt_is_past_it(world):
+    world, env = autospec_world(world)
+    first = world.head()
+    assert world.run("all", repo="autospec", sha=first, env=env)["status"] == "ok"      # generation at `first`
+    target = world.publish("two")
+    newer = world.publish("three")
+    world.host_git("pull", "-q", "--ff-only", "origin", "main")           # checkout moved on, generation did not
+    gens = lambda: sorted(p.name for p in (world.home / ".autospec/runtime-generations").iterdir())  # noqa: E731
+    before = gens()
+    for phase in ("precheck", "apply"):
+        out = world.run(phase, repo="autospec", sha=target, env=env)
+        assert (out["status"], out["reason"]) == ("blocked", "ahead_of_target"), phase
+        assert_closed(out)
+    assert gens() == before                                               # an unverified newer HEAD is never installed
+    assert world.run("all", repo="autospec", sha=newer, env=env)["status"] == "ok"     # generation at `newer`
+    for phase in ("precheck", "apply"):
+        out = world.run(phase, repo="autospec", sha=target, env=env)
+        assert (out["status"], out["no_change"], out["after_sha"], out["past_target"]) == ("ok", True, newer, True)
+        assert_closed(out)
+    health = world.run("health", repo="autospec", sha=target, before_sha=newer, env=env)
+    assert health["status"] == "ok" and health["after_sha"] == newer
 
 
 def test_autospec_rollback_is_not_claimed_when_the_host_was_already_on_the_target(world):

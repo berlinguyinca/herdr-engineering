@@ -142,7 +142,7 @@ def _override(ctx: Context, name: str) -> list[str] | None:
 #: The owner is pinned: every deployment checkout in the fleet is a clone of github.com/berlinguyinca/<repo>, in the https,
 #: `git@github.com:` or `ssh://git@github.com/` form (observed on beast: ssh://git@github.com/berlinguyinca/<repo>[.git]).
 OWNER = "berlinguyinca"
-_ORIGIN = re.compile(r"(?:https://(?:[^@/\s]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)"
+_ORIGIN = re.compile(r"(?:https://(?:[^@/\\\s\x00-\x1f\x7f]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)"
                      rf"{OWNER}/(?P<name>[A-Za-z0-9._-]+?)(?:\.git)?/?")
 
 
@@ -160,9 +160,13 @@ def checkout_gate(ctx: Context, root: Path) -> dict[str, int]:
     if not (root / ".git").exists():
         ctx.note(f"no git checkout at {root}")
         raise PhaseStop("failed", "apply_failed")
-    rc0, origin = _git(ctx, root, "config", "--get", "remote.origin.url")   # raw: no insteadOf rewrite
-    if rc0 or not origin_matches(origin, ctx.repo):
-        ctx.note(f"origin of {root} is not the {ctx.repo} repository")
+    # Exactly one configured URL (git would use several), and BOTH the raw value and the effective one (after the
+    # host's insteadOf rewrites, which is what fetch really talks to) must be the owner-pinned repository.
+    rc0, raw = _git(ctx, root, "config", "--get-all", "remote.origin.url")
+    rc1, effective = _git(ctx, root, "remote", "get-url", "origin")
+    if rc0 or rc1 or len(raw.splitlines()) != 1 or not (origin_matches(raw, ctx.repo)
+                                                          and origin_matches(effective, ctx.repo)):
+        ctx.note(f"origin of {root} is not exactly the {ctx.repo} repository")
         raise PhaseStop("failed", "apply_failed")
     rc, branch = _git(ctx, root, "branch", "--show-current")
     rc2, porcelain = _git(ctx, root, "status", "--porcelain", "--untracked-files=all")
@@ -192,6 +196,22 @@ def checkout_gate(ctx: Context, root: Path) -> dict[str, int]:
 def _head(ctx: Context, root: Path) -> str | None:
     rc, out = _git(ctx, root, "rev-parse", "HEAD")
     return out if rc == 0 and _SHA.fullmatch(out) else None
+
+
+def _descends(ctx: Context, root: Path, ancestor: str, descendant: str) -> bool:
+    """`ancestor` is an ancestor of (or equal to) `descendant`; false when either commit is unknown here."""
+    return _git(ctx, root, "merge-base", "--is-ancestor", ancestor, descendant)[0] == 0
+
+
+def _past_target(ctx: Context, root: Path) -> bool:
+    """The checkout is strictly AHEAD of the target (the target is a proper ancestor of HEAD)."""
+    head = _head(ctx, root)
+    return bool(head and head != ctx.sha and _descends(ctx, root, ctx.sha, head))
+
+
+def _installed_past_target(ctx: Context, root: Path, installed: str | None) -> bool:
+    """The recorded installed build is a proper descendant of the target (it contains the verified revision)."""
+    return bool(installed and installed != ctx.sha and _descends(ctx, root, ctx.sha, installed))
 
 
 def _ff_to(ctx: Context, root: Path, sha: str) -> None:
@@ -288,6 +308,12 @@ class HerdrEngineering:
         root = self.root(ctx)
         return self.installed(ctx) == ctx.sha and (root / ".git").exists() and _head(ctx, root) == ctx.sha
 
+    def past_target(self, ctx: Context) -> bool:
+        return (self.root(ctx) / ".git").exists() and _past_target(ctx, self.root(ctx))
+
+    def installed_past_target(self, ctx: Context) -> bool:
+        return _installed_past_target(ctx, self.root(ctx), self.installed(ctx))
+
     def _write_receipt(self, ctx: Context) -> None:
         path = self.receipt(ctx)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -317,7 +343,7 @@ class HerdrEngineering:
         self._write_receipt(ctx)
 
     def checks(self, ctx: Context) -> list[dict]:
-        out = [_check("version_matches", self.converged(ctx))]
+        out = [_check("version_matches", self.converged(ctx) or (self.past_target(ctx) and self.installed_past_target(ctx)))]
         service = _override(ctx, "HERDR_SERVICE")
         if service is None and sys.platform.startswith("linux") and shutil.which("systemctl"):
             service = ["systemctl", "--user", "is-active", "--quiet", "herdr-eng-fabric-agent.service"]
@@ -341,7 +367,7 @@ class HerdrEngineering:
             from .. import fleet  # lazy: rewrites sys.path at import time
             status = fleet.fleet_status(inventory=root / "ansible" / "inventory" / "hosts.yml", host=ctx.host)
             return status.get("rc") == 0 and any(
-                h.get("host") == ctx.host and h.get("revision") == ctx.sha and h.get("agent") == "active"
+                h.get("host") == ctx.host and h.get("revision") in (ctx.sha, self.installed(ctx)) and h.get("agent") == "active"
                 for h in status.get("hosts", []))
         return _timed("parity_ok", parity)
 
@@ -376,6 +402,12 @@ class Autospec:
     def converged(self, ctx: Context) -> bool:
         return self.installed(ctx) == ctx.sha
 
+    def past_target(self, ctx: Context) -> bool:
+        return (self.root(ctx) / ".git").exists() and _past_target(ctx, self.root(ctx))
+
+    def installed_past_target(self, ctx: Context) -> bool:
+        return _installed_past_target(ctx, self.root(ctx), self.installed(ctx))
+
     def gate(self, ctx: Context) -> dict[str, int]:
         return checkout_gate(ctx, self.root(ctx))
 
@@ -388,7 +420,8 @@ class Autospec:
 
     def checks(self, ctx: Context) -> list[dict]:
         smoke = _override(ctx, "AUTOSPEC_SMOKE") or ["autospec", "--version"]
-        return [_check("generation_receipt", self.installed(ctx) == ctx.sha),
+        return [_check("generation_receipt", self.installed(ctx) == ctx.sha
+                       or (self.past_target(ctx) and self.installed_past_target(ctx))),
                 _timed("version_smoke", lambda: _run(ctx, smoke, timeout=60)[0] == 0)]
 
     def rollback(self, ctx: Context) -> str | None:
@@ -420,6 +453,9 @@ class Pi:
 
     def converged(self, ctx: Context) -> bool:
         return self.installed(ctx) == ctx.sha and self.complete(ctx, ctx.sha)
+
+    def past_target(self, ctx: Context) -> bool:
+        return False            # releases are immutable and addressed by revision: there is no checkout to be ahead
 
     def gate(self, ctx: Context) -> dict[str, int]:
         return {}               # releases are immutable; the stage helper itself refuses a dirty one
@@ -544,6 +580,16 @@ def _precheck(ctx: Context, adapter, began: datetime) -> dict:
     ctx.before_sha = installed
     if adapter.converged(ctx):
         return _result(ctx, "precheck", "ok", None, began, no_change=True, before_sha=installed, after_sha=installed)
+    if adapter.past_target(ctx):
+        # The checkout is AHEAD of the verified target (the nightly updater or an operator moved it on). At or past the
+        # target counts as converged, but only when the recorded installed build is itself a proper descendant of the
+        # target; otherwise the newer HEAD is unverified and is never installed on this target's behalf.
+        adapter.gate(ctx)                       # published, on main, clean (raises blocked otherwise)
+        if adapter.installed_past_target(ctx):
+            return _result(ctx, "precheck", "ok", None, began, no_change=True, past_target=True,
+                           before_sha=installed, after_sha=installed)
+        ctx.note("checkout is ahead of the target and the installed build is not past it")
+        raise PhaseStop("blocked", "ahead_of_target")
     counts = adapter.gate(ctx)
     return _result(ctx, "precheck", "ok", None, began, before_sha=installed, **({"counts": counts} if counts else {}))
 
@@ -555,7 +601,7 @@ def _phase(ctx: Context, phase: str, adapter, began: datetime) -> dict:
         pre = _precheck(ctx, adapter, began)
         if pre["no_change"]:
             return _result(ctx, "apply", "ok", None, began, no_change=True, before_sha=pre["before_sha"],
-                           after_sha=pre["after_sha"])
+                           after_sha=pre["after_sha"], **({"past_target": True} if pre.get("past_target") else {}))
         with update_lock(ctx):
             adapter.apply(ctx)
         return _result(ctx, "apply", "ok", None, began, before_sha=pre["before_sha"], after_sha=adapter.installed(ctx),
@@ -565,7 +611,8 @@ def _phase(ctx: Context, phase: str, adapter, began: datetime) -> dict:
         failed = any(c["status"] == "failed" for c in checks)
         installed = adapter.installed(ctx)
         return _result(ctx, "health", "failed" if failed else "ok", "health_failed" if failed else None, began,
-                       checks=checks, before_sha=ctx.before_sha, after_sha=installed)
+                       checks=checks, before_sha=ctx.before_sha, after_sha=installed,
+                       **({"past_target": True} if installed and installed != ctx.sha else {}))
     if phase == "rollback":
         with update_lock(ctx):
             outcome = adapter.rollback(ctx)
