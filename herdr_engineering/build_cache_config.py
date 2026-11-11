@@ -56,6 +56,10 @@ class Local:
     incremental_disabled_for_cacheable_builds: bool
     storage_tiers: tuple[StorageTier, ...] = ()
     manage_targets: bool = False
+    target_retention_enabled: bool = False
+    target_internal_gib: float = 32
+    target_external_gib: float = 256
+    target_min_idle_hours: float = 168
 
 
 @dataclass(frozen=True)
@@ -168,6 +172,11 @@ class BuildCacheConfig:
             "local": {
                 "capacity_gib": lo.capacity_gib, "ram_scratch_gib": lo.ram_scratch_gib,
                 "min_free_disk_percent": lo.min_free_disk_percent,
+                "manage_targets": lo.manage_targets,
+                "target_retention_enabled": lo.target_retention_enabled,
+                "target_internal_gib": lo.target_internal_gib,
+                "target_external_gib": lo.target_external_gib,
+                "target_min_idle_hours": lo.target_min_idle_hours,
                 "incremental_disabled_for_cacheable_builds":
                     lo.incremental_disabled_for_cacheable_builds,
             },
@@ -362,6 +371,13 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     incr = _bool(lo, "incremental_disabled_for_cacheable_builds", lp)
     tiers = parse_storage_tiers(lo["storage_tiers"])
     manage_targets = _bool(lo, "manage_targets", lp)
+    target_retention = _bool(lo, "target_retention_enabled", lp)
+    internal = _num(lo, "target_internal_gib", lp, lo=0, lo_incl=False)
+    external = _num(lo, "target_external_gib", lp, lo=0, lo_incl=False)
+    target_idle = _num(lo, "target_min_idle_hours", lp, lo=24, lo_incl=True)
+    import math
+    if not all(math.isfinite(value) for value in (internal, external, target_idle)):
+        raise _bad(lp, "target retention limits must be finite")
 
     xp = f"{p}.execution"
     ex = _filled(top["execution"], base["execution"], xp)
@@ -427,7 +443,7 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     return BuildCacheConfig(
         enabled=enabled, mode=mode, allowed_hosts=allowed_hosts,
         shared_cache=SharedCache(s_enabled, ep, s["namespace"], writes, max_total, tls, cred, reg),
-        local=Local(capacity, ram, free, incr, tiers, manage_targets),
+        local=Local(capacity, ram, free, incr, tiers, manage_targets, target_retention, internal, external, target_idle),
         execution=Execution(slurm, clusters, parts, gpu, fb, slots),
         cleanup=Cleanup(dry, idle, evict),
         observability=Observability(obs, exp),

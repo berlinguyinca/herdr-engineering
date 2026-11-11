@@ -218,6 +218,7 @@ def prepare_target(cache: Path, workspace: Path) -> Path:
             if any(target.iterdir()):
                 raise ValueError("Existing target directory has no ownership marker")
             _write_marker(marker, expected)
+        os.utime(marker, None, follow_symlinks=False)
         return target
     finally:
         os.close(fd)

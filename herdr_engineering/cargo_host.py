@@ -263,6 +263,31 @@ def enable_targets(config_path: Path) -> dict[str, object]:
     return {"manage_targets": True, "config": str(config_path), "registered_existing_aliases": seeded}
 
 
+def enable_retention(config_path: Path, *, schedule: bool = True) -> dict[str, object]:
+    import yaml
+
+    from .build_cache_config import validate
+    from .cargo_target_retention import install_job
+    original = config_path.read_text()
+    data = yaml.safe_load(original)
+    section = data.get("fabric_build_cache", {})
+    config = validate(section)
+    if not config.enabled or not config.local.manage_targets:
+        raise ValueError("Enable managed Cargo targets before retention")
+    section.setdefault("local", {})["target_retention_enabled"] = True
+    validate(section)
+    backup = config_path.with_name(config_path.name + ".before-herdr-target-retention")
+    if not backup.exists():
+        _atomic_write(backup, original)
+    if config_path.read_text() != original:
+        raise ValueError("Configuration changed concurrently; retention was not enabled")
+    _atomic_write(config_path, yaml.safe_dump(data, sort_keys=False))
+    job = install_job(Path.home(), Path.home() / ".local/bin/herdr-eng", config_path=config_path) if schedule else None
+    return {"target_retention_enabled": True, "job": str(job) if job else None,
+            "internal_gib": config.local.target_internal_gib, "external_gib": config.local.target_external_gib,
+            "min_idle_hours": config.local.target_min_idle_hours}
+
+
 def run_cargo(argv: list[str]) -> int:
     real = _real_cargo(Path.home())
     command = [str(real), *argv]
@@ -374,7 +399,8 @@ def main(argv: list[str] | None = None) -> int:
         if arguments and arguments[0] == "rustc":
             return run_rustc(arguments[1:])
         parser = argparse.ArgumentParser(prog="herdr-eng cargo-host")
-        parser.add_argument("action", choices=["install", "status", "storage-add", "targets-enable", "targets-migrate"])
+        parser.add_argument("action", choices=["install", "status", "storage-add", "targets-enable", "targets-migrate",
+                                               "targets-retention-enable", "targets-maintain", "targets-report"])
         parser.add_argument("--real-cargo", type=Path)
         parser.add_argument("--volume", type=Path)
         parser.add_argument("--name", default="primary")
@@ -384,6 +410,8 @@ def main(argv: list[str] | None = None) -> int:
                             default=Path.home() / ".config/herdr-engineering/config.yaml")
         parser.add_argument("--root", type=Path, action="append", default=[])
         parser.add_argument("--apply", action="store_true")
+        parser.add_argument("--json", action="store_true")
+        parser.add_argument("--no-schedule", action="store_true")
         parser.add_argument("--quiescent", action="store_true",
                             help="confirm uncoordinated Cargo/IDE clients are paused for migration")
         args = parser.parse_args(arguments)
@@ -400,6 +428,19 @@ def main(argv: list[str] | None = None) -> int:
                                             args.config, args.priority), indent=2))
         elif args.action == "targets-enable":
             print(json.dumps(enable_targets(args.config), indent=2))
+        elif args.action == "targets-retention-enable":
+            print(json.dumps(enable_retention(args.config, schedule=not args.no_schedule), indent=2))
+        elif args.action == "targets-maintain":
+            from .cargo_target_retention import maintain_targets
+            print(json.dumps(maintain_targets(apply=args.apply), indent=2))
+        elif args.action == "targets-report":
+            from .cargo_target_retention import retention_report
+            if args.json:
+                from .build_coord import _default_state_dir
+                from .cargo_target_retention import read_report
+                print(json.dumps(read_report(_default_state_dir()) or {}, indent=2))
+            else:
+                print(retention_report())
         elif args.action == "targets-migrate":
             from .cargo_target_migration import migration_run
             print(json.dumps(migration_run(args.root, apply=args.apply, quiescent=args.quiescent), indent=2))

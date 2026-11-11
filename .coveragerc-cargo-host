@@ -9,4 +9,5 @@ include =
     */herdr_engineering/build_cache_location.py
     */herdr_engineering/cargo_target_storage.py
     */herdr_engineering/cargo_target_migration.py
+    */herdr_engineering/cargo_target_retention.py
 show_missing = True

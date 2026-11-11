@@ -87,3 +87,34 @@ herdr-eng cargo-host targets-migrate --root ~/projects
 ```
 
 For publication, pause Cargo agents and IDE/build watchers, then use `--apply --quiescent`. The explicit quiescent assertion is necessary because older clients do not participate in the maintenance lock. Migration also refuses open output or active compilers, tracked files, source markers, escaping links, special files, and uncertain ownership. It copies output with hardlinks preserved, verifies SHA256 content and link metadata, publishes the compatibility link, and removes only the verified original. A changed or in-use backup is retained and reported. Source directories never move. Automatic builds do not migrate existing physical targets implicitly.
+
+## Retention budgets and growth reporting
+
+Managed target retention is a separate opt-in. Defaults are 32GiB internally, 256GiB per external tier, and 168 hours idle:
+
+```yaml
+fabric_build_cache:
+  local:
+    manage_targets: true
+    target_retention_enabled: true
+    target_internal_gib: 32
+    target_external_gib: 256
+    target_min_idle_hours: 168
+```
+
+Enable the policy and install the hourly macOS user job:
+
+```sh
+herdr-eng cargo-host targets-retention-enable
+herdr-eng cargo-host targets-maintain        # dry-run inventory
+herdr-eng cargo-host targets-report
+herdr-eng cargo-host targets-report --json
+```
+
+`targets-retention-enable --no-schedule` enables manual-only maintenance. `targets-maintain --apply` applies the enabled policy. The user LaunchAgent retains its selected configuration and maintenance-state paths. It discards stdout/stderr instead of accumulating log files; its bounded atomic report lives at `build-gates/target-retention.json`. Re-running installation preserves unrelated jobs and refuses to overwrite a different job definition. Disable automatic cleanup by setting `target_retention_enabled: false`; the scheduled invocation then refuses to delete.
+
+A sweep skips busy builds immediately, scans only enrolled owned target roots, and preserves foreign ownership, mount boundaries, source markers, escaping links and special files. Initial incomplete inventories never delete. A build invocation refreshes workspace use time even when Cargo is already up to date. Output mtimes additionally protect direct Cargo users. Use tracking is conservatively workspace-wide: a recently used workspace retains all its profiles.
+
+Reclamation takes Cargo's native profile lock exclusively and preserves profile directories and all `.cargo*-lock` inodes, protecting both older Cargo and waiting processes. Only contents of recognized idle profile directories are reclaimed; output such as root-level documentation/package archives and unrelated physical workspace targets is reported but remains intact. Entry/deadline limits cover enumeration and deletion; a sweep can stop after partially clearing regenerable output, leaving sources and lock files untouched. The next Cargo build regenerates missing output.
+
+These are **soft retention budgets**, not active-build quotas. If everything is recent, busy or uncertain, the report shows pressure and exclusions instead of deleting it. Estimated reclaimed allocation can differ from physical free-space gain because of hardlinks and APFS sharing. Growth compares successful inventory samples; an unavailable/busy tier has no current usage measurement. The existing free-disk admission reserve remains in effect.
