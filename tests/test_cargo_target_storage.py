@@ -22,6 +22,12 @@ from herdr_engineering.cargo_target_storage import (
 )
 
 
+requires_lsof = pytest.mark.skipif(
+    shutil.which("lsof") is None,
+    reason="open-file inspection needs lsof; migration fails closed without it",
+)
+
+
 def test_managed_target_storage_is_an_explicit_valid_option():
     assert validate({"enabled": True, "local": {"manage_targets": True}}).local.manage_targets
     assert not validate(None).local.manage_targets
@@ -109,6 +115,7 @@ def build_real_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     return workspace, cache, tmp_path / "state"
 
 
+@requires_lsof
 def test_real_output_migration_preserves_bytes_links_and_original_paths(tmp_path: Path):
     workspace, cache, state = build_real_fixture(tmp_path)
     target = workspace / "target"
@@ -127,6 +134,7 @@ def test_real_output_migration_preserves_bytes_links_and_original_paths(tmp_path
     assert alias_owned(state, workspace), "Migrated aliases must survive an unavailable destination"
 
 
+@requires_lsof
 def test_open_output_is_never_migrated(tmp_path: Path):
     workspace, cache, state = build_real_fixture(tmp_path)
     target = workspace / "target"
@@ -136,6 +144,7 @@ def test_open_output_is_never_migrated(tmp_path: Path):
     assert target.is_dir() and not target.is_symlink()
 
 
+@requires_lsof
 def test_escaping_link_preserves_original_output(tmp_path: Path):
     workspace, cache, state = build_real_fixture(tmp_path)
     (workspace / "target/source-link").symlink_to(workspace / "src/lib.rs")
@@ -156,6 +165,7 @@ def test_tracked_output_and_special_files_are_preserved(tmp_path: Path):
         tree_manifest(target)
 
 
+@requires_lsof
 def test_newer_managed_output_is_not_overwritten(tmp_path: Path):
     workspace, cache, state = build_real_fixture(tmp_path)
     current = prepare_target(cache, workspace)
@@ -240,6 +250,7 @@ def test_source_markers_and_unrecognized_output_are_preserved(tmp_path: Path):
         tree_manifest(target)
 
 
+@requires_lsof
 def test_failed_real_copy_preserves_original_output(tmp_path: Path):
     workspace, cache, state = build_real_fixture(tmp_path)
     target = workspace / "target"
@@ -273,6 +284,7 @@ def test_application_arguments_do_not_change_workspace_or_target(tmp_path: Path)
     assert not target_override(arguments, {"CARGO_HOME": str(tmp_path / "cargo-home")}, first)
 
 
+@requires_lsof
 def test_target_management_cli_enable_and_migration_safety(tmp_path: Path):
     from herdr_engineering.cargo_host import install
     workspace, cache, state = build_real_fixture(tmp_path)
