@@ -52,6 +52,7 @@ from .host_metrics_store import HostMetricsStore, clean_metrics, clean_state
 from .host_problems import compute_problems
 from .ids import new_id, validate_mission_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
+from .journal_suppression import JournalSuppression
 from .mission_activity import MissionActivityStore
 from .redact import redact_payload
 from .service_catalog import (
@@ -196,8 +197,11 @@ class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
     def __init__(self, *, now=None, sink=None, service_archive_days=7, host_aliases=None,
-                 inspector_limits=None):
-        """``sink`` is an optional durable writer (e.g. DurableEventSink) called
+                 inspector_limits=None, journal_suppression=None):
+        """``journal_suppression`` (:class:`.journal_suppression.JournalSuppression`, default all on) keeps no-op writes
+        out of a durable sink; it never changes the in-memory state or what listeners see.
+
+        ``sink`` is an optional durable writer (e.g. DurableEventSink) called
         with each recorded event so ingestion survives a restart.
 
         ``host_aliases`` maps an alternate host name to the canonical one (one
@@ -217,6 +221,8 @@ class ControlPlaneRepo:
         self._missions = {}
         self._sessions = {}
         self._services = {}
+        self._journal_policy = journal_suppression if journal_suppression is not None else JournalSuppression()
+        self._session_journaled = {}  # session_id -> (material facts, clock time) of the last journaled SessionUpdated
         self._listener_journaled = {}  # service_id -> (material facts, monotonic time) of the last journaled observation
         self._service_archive_days = validate_archive_days(service_archive_days)
         self._hosts = {}
@@ -257,7 +263,8 @@ class ControlPlaneRepo:
         self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection,
             verify_noop=bool(getattr(self._sink, "verify_agent_identity_noop", False)))
         # Agent inspector (spec 0200): bounded per-session detail projection.
-        self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector)
+        self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector,
+                                                    journal_suppression=self._journal_policy)
         self.mission_activity = MissionActivityStore(now=self._now)
         self.mission_outcomes = None   # set by the server (control_plane.missions); None writes no outcomes
         # Lineage graph (T02): derived from ``lineage`` envelope events, rebuilt
@@ -1429,6 +1436,7 @@ class ControlPlaneRepo:
                 key = binding["mission_key"]
                 if key in self._missions:
                     self._missions[key]["sessions"].append(session_id)
+            self._session_journaled.pop(session_id, None)
             self.record_event("session", session_id, "SessionStarted",
                               {"host_id": host_id, "mission_id": mission_id,
                                "agent_role": agent_role, "model": model,
@@ -1460,17 +1468,39 @@ class ControlPlaneRepo:
                 existing[k] = v
         # Carry the full identity state in the delta so event-sourced
         # hydration (bridge._reconstruct_from_events) can rebuild the record.
-        self.record_event("session", session_id, "SessionUpdated",
-                          {"commit_sha": existing.get("commit_sha"), **{k: existing[k] for k in (
-                              "host_id", "mission_id", "mission_key", "mission_source", "agent_role", "model",
-                              "status", "cwd", "branch", "pid", "cmdline",
-                              "summary", "attach", "pane_id", "terminal_id", "herdr_session",
-                              "machine", "agent_session", "revision", "interactive_ready",
-                              "launch_pending", "state_change_seq", "repository_id", "commit_sha", "worktree_id",
-                              "transcript", "parent_session_id", "name", "runtime") if existing.get(k) is not None}},
-                          mission_id=existing["mission_id"],
-                          session_id=session_id)
+        payload = {"commit_sha": existing.get("commit_sha"), **{k: existing[k] for k in (
+            "host_id", "mission_id", "mission_key", "mission_source", "agent_role", "model",
+            "status", "cwd", "branch", "pid", "cmdline",
+            "summary", "attach", "pane_id", "terminal_id", "herdr_session",
+            "machine", "agent_session", "revision", "interactive_ready",
+            "launch_pending", "state_change_seq", "repository_id", "commit_sha", "worktree_id",
+            "transcript", "parent_session_id", "name", "runtime") if existing.get(k) is not None}}
+        self.record_event("session", session_id, "SessionUpdated", payload,
+                          mission_id=existing["mission_id"], session_id=session_id,
+                          journal=not self._session_repeat(session_id, payload))
         return _copy(existing)
+
+    # ``runtime`` (cpu_s and rss_mib counters move on every report) and ``transcript`` (the reporter's status flips between
+    # ``identity_unavailable`` and ``recording`` from one report to the next; the cause is outside this repository and
+    # was not verified) are ignored when deciding whether a SessionUpdated repeats the last journaled one. 98.6% of
+    # production rows were such repeats. A replay of the suppressed log therefore shows the runtime and transcript of the
+    # last journaled row, at most ``session_heartbeat_seconds`` old, and an ``updated_at`` that old at most.
+    _SESSION_VOLATILE_KEYS = frozenset({"runtime", "transcript"})
+
+    def _session_repeat(self, session_id, payload):
+        """True when this SessionUpdated repeats the last journaled one (ignoring the volatile keys) and one was journaled
+        less than ``session_heartbeat_seconds`` ago. Only ever true with a durable sink and the switch on."""
+        policy = self._journal_policy
+        if self._sink is None or not policy.session_noop:
+            return False
+        facts = json.dumps({k: v for k, v in payload.items() if k not in self._SESSION_VOLATILE_KEYS},
+                           sort_keys=True, default=str)
+        now = self._now()
+        last = self._session_journaled.get(session_id)
+        if last is not None and last[0] == facts and 0 <= now - last[1] < policy.session_heartbeat_seconds:
+            return True
+        self._session_journaled[session_id] = (facts, now)
+        return False
 
     def upsert_mission(self, mission_id, *, title, purpose="", stage="active",
                        cwd=None, source="herdr", repository_id=None, commit_sha=None):
@@ -2825,8 +2855,9 @@ class ControlPlaneRepo:
     # --------------------------------------------------------------- events
     def record_event(self, entity_type, entity_id, event_type, payload=None,
                      mission_id=None, session_id=None, require_durable=False, publish=True,
-                     envelope=None, feed=True):
-        """Record one event. ``envelope`` (a normalised v2 envelope) makes it the
+                     envelope=None, feed=True, journal=True):
+        """Record one event. ``journal=False`` keeps it out of the durable sink (and the durable feed counts) but leaves
+        the in-memory stream and the listeners as they are: a no-op write that is not worth a journal row. ``envelope`` (a normalised v2 envelope) makes it the
         canonical envelope row: emitter event_id, server-set actor/received_at,
         durable before return. ``feed=False`` keeps it out of the global feed."""
         if self._suppress_record_events and not require_durable and envelope is None:
@@ -2893,7 +2924,7 @@ class ControlPlaneRepo:
                 self._ci_sequence = seq + 1
             stream.append(ev)
             if feed:
-                if self._durable_history is not None:
+                if self._durable_history is not None and journal:
                     self._durable_public_count += 1
                     self._durable_row_count += 1
                 if self._durable_history is None or entity_type not in {'service','session'}:
@@ -2905,7 +2936,7 @@ class ControlPlaneRepo:
                 del stream[:-BUILD_CACHE_STREAM_MAX]
                 self._event_order = [t for t in self._event_order
                                      if not (t[0] == entity_type and t[1] == entity_id and t[2] < cutoff)]
-            if self._sink is not None and not require_durable:
+            if self._sink is not None and not require_durable and journal:
                 try:
                     self._sink.record(ev)
                 except Exception:
