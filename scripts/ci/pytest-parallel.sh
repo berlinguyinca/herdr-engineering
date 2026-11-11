@@ -19,3 +19,16 @@ herdr_pytest_parallel_args() {
   case "$cap" in ''|*[!0-9]*|0) echo "HERDR_PYTEST_MAXPROCESSES must be a positive number, got '$cap'" >&2; return 1 ;; esac
   printf '%s\n' -n "$workers" "--maxprocesses=$cap" --dist=loadfile
 }
+
+# Fills the global array PYTEST_PARALLEL with those arguments (empty for a serial run) and fails if an override is invalid. Read it
+# as ${PYTEST_PARALLEL[@]+"${PYTEST_PARALLEL[@]}"} so an empty array is safe under `set -u` on older bash. Words are read one per
+# line on purpose: `echo $words` would swallow the leading `-n` as echo's own option.
+herdr_pytest_parallel_load() {
+  local words word
+  PYTEST_PARALLEL=()
+  words="$(herdr_pytest_parallel_args)" || return 1
+  while IFS= read -r word; do
+    [ -z "$word" ] || PYTEST_PARALLEL+=("$word")
+  done <<<"$words"
+  return 0
+}

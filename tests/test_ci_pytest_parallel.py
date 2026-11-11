@@ -56,9 +56,39 @@ def test_a_non_numeric_worker_count_is_refused_not_guessed() -> None:
     assert done.returncode != 0 and "HERDR_PYTEST_WORKERS" in done.stderr
 
 
+def load_array(**env: str) -> list[str]:
+    """What unit-gates.sh actually passes to pytest, one element per line, under the gate's own `set -euo pipefail`."""
+    exports = "".join(f"export {k}={v}; " for k, v in env.items())
+    done = subprocess.run(
+        ["bash", "-c", f'set -euo pipefail; unset HERDR_PYTEST_WORKERS HERDR_PYTEST_MAXPROCESSES; {exports}. "{HELPER}"; '
+                       'herdr_pytest_parallel_load; for w in ${PYTEST_PARALLEL[@]+"${PYTEST_PARALLEL[@]}"}; do printf "[%s]\\n" "$w"; done'],
+        capture_output=True, text=True, cwd=ROOT,
+    )
+    assert done.returncode == 0, done.stderr
+    return [line[1:-1] for line in done.stdout.splitlines()]
+
+
+def test_the_loaded_array_keeps_the_dash_n_flag_that_echo_would_eat() -> None:
+    # Regression: assembling the words with `echo $words` made `-n` an echo option, so CI ran `pytest auto ...` (exit 4).
+    assert load_array(HERDR_PYTEST_WORKERS="3", HERDR_PYTEST_MAXPROCESSES="5") == ["-n", "3", "--maxprocesses=5", "--dist=loadfile"]
+    assert load_array()[:2] == ["-n", "auto"]
+
+
+def test_the_loaded_array_is_empty_for_a_serial_run_and_the_gate_survives_set_u() -> None:
+    assert load_array(HERDR_PYTEST_WORKERS="0") == []
+
+
+def test_the_loader_fails_on_a_bad_override() -> None:
+    done = subprocess.run(
+        ["bash", "-c", f'set -euo pipefail; export HERDR_PYTEST_WORKERS=lots; . "{HELPER}"; herdr_pytest_parallel_load; echo reached'],
+        capture_output=True, text=True, cwd=ROOT,
+    )
+    assert done.returncode != 0 and "reached" not in done.stdout
+
+
 def test_the_gate_uses_the_helper_and_still_raises_the_fd_limit_first() -> None:
-    assert "pytest-parallel.sh" in GATE and "herdr_pytest_parallel_args" in GATE
-    assert GATE.index("herdr_ensure_fd_limit") < GATE.index("herdr_pytest_parallel_args")
+    assert "pytest-parallel.sh" in GATE and "herdr_pytest_parallel_load" in GATE
+    assert GATE.index("herdr_ensure_fd_limit") < GATE.index("herdr_pytest_parallel_load")
     assert "python -m pytest" in GATE  # bare `pytest` imports another editable checkout
 
 
