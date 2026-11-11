@@ -17,6 +17,8 @@ The compiler adapter in `~/.cargo/config.toml` covers Cargo invoked by absolute 
 
 Managed PATH blocks are added to shell startup files. Existing content is preserved, symlinks/unsupported destinations are rejected before publication, and original files receive `.before-herdr-cargo-host` backups. Publication failures attempt to restore the original files. Restart existing harnesses to inherit the new PATH; the compiler configuration is read by newly invoked Cargo processes.
 
+Disabling `fabric_build_cache` later stops cache use but does not automatically remove the installed `incremental = false` default. Restore that setting deliberately from the retained backup if reverting the integration.
+
 Cache probe failures fall back to the original compiler. Cache integration does not change target directories or source checkouts, does not install remote-cache credentials in compiler environments, and does not migrate Docker or scratch directories.
 
 ## Automatic primary, secondary, and internal storage
