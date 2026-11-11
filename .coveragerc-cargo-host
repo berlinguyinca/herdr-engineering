@@ -7,4 +7,6 @@ patch = subprocess,execv
 include =
     */herdr_engineering/cargo_host.py
     */herdr_engineering/build_cache_location.py
+    */herdr_engineering/cargo_target_storage.py
+    */herdr_engineering/cargo_target_migration.py
 show_missing = True
