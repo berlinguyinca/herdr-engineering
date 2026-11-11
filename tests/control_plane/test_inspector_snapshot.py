@@ -181,6 +181,8 @@ class FakeConn:
     async def fetchval(self, sql, *args):
         if "inspector_snapshots" in sql:
             return 1 if self.saved else None
+        if "to_regclass" in sql:
+            return False  # no archive table in this fake
         return sum(1 for r in self.rows if r["sequence"] <= args[0])
 
     async def fetchrow(self, sql):

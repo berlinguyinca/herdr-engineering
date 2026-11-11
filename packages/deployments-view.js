@@ -44,9 +44,62 @@ function stageRows(view) {
     stages.get(key).push(...list(group.components).map((name) => ({ name: String(name), order: group.order })));
   }
   const known = new Set([...stages.values()].flat().map((r) => r.name));
-  const extra = Object.keys(view.components).filter((name) => !known.has(name)).sort();
+  const extra = Object.keys(view.components).filter((name) => !known.has(name) && !isCi(view, name)).sort();
   if (extra.length) stages.set(stages.size ? 'Not in any stage' : 'Reported components', extra.map((name) => ({ name, order: null })));
   return stages;
+}
+
+// A CI-reported row (control_plane.ci_deployments): shown, never planned. Own keys only, like componentRow.
+const rowOf = (view, name) => (Object.hasOwn(view.components, name) && isObject(view.components[name]) ? view.components[name] : NO_ROW);
+const isCi = (view, name) => rowOf(view, name).kind === 'ci';
+
+// Only an https URL is ever a link (the server extracts it from redacted evidence text); anything else is not rendered as one.
+function evidenceLink(url) {
+  if (typeof url !== 'string' || !/^https:\/\/[^\s<>"']+$/.test(url)) return '—';
+  return `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer" data-deploy-ci-evidence>run</a>`;
+}
+
+function ciRow(view, name, open) {
+  const row = rowOf(view, name);
+  const ci = isObject(row.ci) ? row.ci : NO_ROW;
+  const id = `dp-tl-${encodeURIComponent(name).replace(/%/g, '_')}`;
+  return `<tr data-deploy-row="${esc(name)}" data-deploy-kind="ci" data-health="${esc(text(ci.outcome, 'unknown'))}">
+    <th scope="row"><button type="button" class="hd-linkbtn" data-deploy-toggle="${esc(name)}" aria-expanded="${open}" aria-controls="${esc(id)}">${esc(name)}</button> <span class="hd-badge" data-deploy-ci-badge>CI-reported</span></th>
+    <td data-deploy-ci-at>${esc(text(ci.at))}</td>
+    <td data-deploy-ci-outcome>${esc(text(ci.outcome))}${ci.outcome === 'failed' && ci.detail ? `<div class="hd-card__sub" data-deploy-ci-detail>${esc(ci.detail)}</div>` : ''}</td>
+    <td data-deploy-ci-commits>${commitCell(ci.from)} → ${commitCell(ci.to)}</td>
+    <td>${evidenceLink(ci.evidence_url)}</td>
+  </tr>
+  <tr id="${esc(id)}" data-deploy-timeline="${esc(name)}"${open ? '' : ' hidden'}><td colspan="5">${timeline(row)}</td></tr>`;
+}
+
+function ciSection(view, open) {
+  const names = Object.keys(view.components).filter((name) => isCi(view, name)).sort();
+  if (!names.length) return '';
+  return `<section data-deploy-stage="CI-reported" aria-label="CI-reported deployments">
+      <h2>CI-reported deployments</h2>
+      <p class="hd-card__sub">Reported by a CI pipeline, not a host updater: no plan, permit, escalation or force applies.</p>
+      <div class="hd-table-wrap"><table class="hd-table"><thead><tr><th>Component</th><th>Last deploy</th><th>Outcome</th><th>From → to</th><th>Evidence</th></tr></thead>
+      <tbody>${names.map((name) => ciRow(view, name, open.has(name))).join('')}</tbody></table></div>
+    </section>`;
+}
+
+// Recent failures/problems across every component, newest first (server: deployment_definitions.recent_problems).
+function problemsSection(view) {
+  if (!view.problems.length) return '';
+  return `<section data-deploy-problems aria-label="Recent deploy problems">
+      <h2>Recent problems</h2>
+      <p class="hd-card__sub">Failed, refused and rolled-back deploy events, newest first.</p>
+      <div class="hd-table-wrap"><table class="hd-table"><thead><tr><th>When</th><th>Component</th><th>Step</th><th>Outcome</th><th>Detail</th><th>Run</th></tr></thead>
+      <tbody>${view.problems.map((p) => `<tr data-deploy-problem data-outcome="${esc(text(p.outcome))}">
+        <td>${esc(text(p.at))}</td>
+        <td>${esc(text(p.component))}</td>
+        <td>${esc(text(p.step))}</td>
+        <td>${esc(text(p.outcome))}${p.recovered ? ' <span class="hd-badge" data-deploy-recovered>recovered later</span>' : ''}</td>
+        <td data-deploy-problem-detail>${esc(text(p.detail))}</td>
+        <td>${evidenceLink(p.evidence_url)}</td>
+      </tr>`).join('')}</tbody></table></div>
+    </section>`;
 }
 
 function planFor(view, name) {
@@ -146,15 +199,19 @@ export function renderDeployments(raw) {
     plans: list(raw?.plans).filter(isObject),
     coordinator: isObject(raw?.coordinator) ? raw.coordinator : {},
     escalations: list(raw?.escalations).filter(isObject),
+    problems: list(raw?.problems).filter(isObject),
   };
   return (open) => {
     const defs = view.definitions;
     const notes = [];
     if (defs.warning) notes.push(`<p role="note" data-deploy-warning>${esc(defs.warning)}</p>`);
+    for (const err of list(defs.ci_errors).slice(0, 5)) notes.push(`<p role="note" class="hd-card__sub" data-deploy-ci-error>${esc(err)}</p>`);
     for (const err of list(defs.errors).slice(0, 20)) notes.push(`<p role="note" class="hd-card__sub" data-deploy-error>${esc(err)}</p>`);
     if (view.coordinator.error) notes.push(`<p role="note" data-deploy-tick-error>Coordinator: ${esc(view.coordinator.error)}${view.coordinator.stale ? ' (showing the last good plan)' : ''}</p>`);
     const stages = stageRows(view);
-    if (!defs.configured && !stages.size) {
+    const ci = ciSection(view, open);
+    const problems = problemsSection(view);
+    if (!defs.configured && !stages.size && !ci) {
       return `${notes.join('')}<herdr-empty data-deploy-empty message="No deployment pipelines are configured"></herdr-empty>
         <p class="hd-muted">Set <code>control_plane.deployment_definitions</code> in the fleet config to a checkout of InferWeave <code>deploy/pipelines</code>.</p>`;
     }
@@ -164,7 +221,7 @@ export function renderDeployments(raw) {
       <div class="hd-table-wrap"><table class="hd-table"><thead><tr><th>Component</th><th>Running</th><th>Target</th><th>Step</th><th>Health</th><th>Last result</th><th>Hold left</th><th>Repairs</th></tr></thead>
       <tbody>${items.map((item) => componentRow(view, item, open.has(item.name))).join('')}</tbody></table></div>
     </section>`).join('');
-    return `${notes.join('')}<div class="hd-grid">${plans}</div>${sections || '<herdr-empty message="No components defined"></herdr-empty>'}`;
+    return `${notes.join('')}${problems}<div class="hd-grid">${plans}</div>${sections || (ci ? '' : '<herdr-empty message="No components defined"></herdr-empty>')}${ci}`;
   };
 }
 

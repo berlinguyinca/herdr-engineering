@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  HerdR Engineering build-cache report sender, macOS LaunchAgent template (OPT-IN; nothing installs it).
+  No secrets here. Configure fabric_build_cache.report (enabled, url, key_file, interval_s, host_id) in
+  ~/.config/herdr-engineering/config.yaml; the ingest-role key lives in report.key_file (chmod 600).
+
+  Install (replace __HERDR_ENG__ with the herdr-eng path and __HOME__ with your home directory):
+    sed -e "s|__HERDR_ENG__|$HOME/.venvs/herdr-engineering/bin/herdr-eng|" -e "s|__HOME__|$HOME|g" \
+      scripts/com.herdr-engineering.build-cache-report.plist \
+      > ~/Library/LaunchAgents/com.herdr-engineering.build-cache-report.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.herdr-engineering.build-cache-report.plist
+  Uninstall:
+    launchctl bootout gui/$(id -u)/com.herdr-engineering.build-cache-report
+    rm -f ~/Library/LaunchAgents/com.herdr-engineering.build-cache-report.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.herdr-engineering.build-cache-report</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HERDR_ENG__</string>
+    <string>build-cache-report</string>
+    <string>--loop</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- Restart after any exit. Exit 2 (disabled or unsafe config) is retried slowly via ThrottleInterval, so a
+       config fix is picked up without a reload. -->
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/herdr-build-cache-report.log</string>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/herdr-build-cache-report.log</string>
+</dict>
+</plist>

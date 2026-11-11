@@ -1,0 +1,33 @@
+# HerdR Engineering build-cache report sender (OPT-IN; not installed or enabled by any script).
+#
+# Pushes this host's recent builds (allowlisted, non-secret fields only) to the control plane every
+# fabric_build_cache.report.interval_s. Everything is configured in YAML, never here:
+#   ~/.config/herdr-engineering/config.yaml -> fabric_build_cache.report {enabled, url, key_file, interval_s, host_id}
+# The ingest-role key is read from report.key_file (mode 0600), not from this unit. Disabled in YAML = exit 2.
+#
+# Install (replace the placeholder with the herdr-eng path, e.g. $(command -v herdr-eng)):
+#   mkdir -p ~/.config/systemd/user
+#   sed "s|__HERDR_ENG__|$(command -v herdr-eng)|" scripts/herdr-eng-build-cache-report.service \
+#     > ~/.config/systemd/user/herdr-eng-build-cache-report.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now herdr-eng-build-cache-report.service
+# Uninstall:
+#   systemctl --user disable --now herdr-eng-build-cache-report.service
+#   rm -f ~/.config/systemd/user/herdr-eng-build-cache-report.service && systemctl --user daemon-reload
+[Unit]
+Description=HerdR Engineering build-cache report sender
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=__HERDR_ENG__ build-cache-report --loop
+# Exit 2 means refused (disabled or unsafe config): do not restart-loop on it.
+RestartPreventExitStatus=2
+Restart=on-failure
+RestartSec=30
+Nice=19
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
