@@ -53,6 +53,8 @@ from .host_problems import compute_problems
 from .ids import new_id, validate_mission_id
 from .inspector import REQUIRED_DURABLE_KINDS, InspectorStore
 from .journal_suppression import JournalSuppression
+from .mission_activity import ENTITY_TYPE as MISSION_ACTIVITY_ENTITY
+from .mission_activity import RETENTION_SECONDS as MISSION_ACTIVITY_RETENTION_S
 from .mission_activity import MissionActivityStore
 from .redact import redact_payload
 from .service_catalog import (
@@ -197,9 +199,12 @@ class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
     def __init__(self, *, now=None, sink=None, service_archive_days=7, host_aliases=None,
-                 inspector_limits=None, journal_suppression=None):
+                 inspector_limits=None, journal_suppression=None, mission_activity_mirror=False):
         """``journal_suppression`` (:class:`.journal_suppression.JournalSuppression`, default all on) keeps no-op writes
         out of a durable sink; it never changes the in-memory state or what listeners see.
+
+        ``mission_activity_mirror`` turns the G8-C durable Pi activity mirror on (write, hydrate and prune); the server
+        wiring passes ``work_center_v1``, so with the flag off nothing new is persisted.
 
         ``sink`` is an optional durable writer (e.g. DurableEventSink) called
         with each recorded event so ingestion survives a restart.
@@ -265,7 +270,9 @@ class ControlPlaneRepo:
         # Agent inspector (spec 0200): bounded per-session detail projection.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector,
                                                     journal_suppression=self._journal_policy)
-        self.mission_activity = MissionActivityStore(now=self._now)
+        self.mission_activity_mirror = mission_activity_mirror is True
+        self.mission_activity = self._new_mission_activity()
+        self._mission_activity_pruned_at = 0.0
         self.mission_outcomes = None   # set by the server (control_plane.missions); None writes no outcomes
         # Lineage graph (T02): derived from ``lineage`` envelope events, rebuilt
         # from them on import_state; owns no storage of its own.
@@ -341,6 +348,25 @@ class ControlPlaneRepo:
         self._sink.record({"event_id": new_id("event"), "schema_version": 1,
                            "source_timestamp": stamp, "ingest_timestamp": stamp,
                            "mission_id": None, "session_id": None, **ev})
+
+    def _new_mission_activity(self):
+        return MissionActivityStore(now=self._now,
+                                    persist=self._persist_mission_activity if self.mission_activity_mirror else None)
+
+    def _persist_mission_activity(self, ev):
+        """G8-C: mirror the Pi activity projection through the same private sink path as host metrics, and drop rows past
+        the 24 h retention at most once an hour (best-effort, like every other prune here)."""
+        self._persist_host_metrics(ev)
+        now = self._now()
+        if self._sink is None or now - self._mission_activity_pruned_at < 3600:
+            return
+        self._mission_activity_pruned_at = now
+        prune = getattr(self._sink, "prune_events_before", None)
+        if callable(prune):
+            try:
+                prune(MISSION_ACTIVITY_ENTITY, _dt.datetime.fromtimestamp(now - MISSION_ACTIVITY_RETENTION_S, _dt.UTC))
+            except Exception as exc:  # noqa: BLE001 - retried on the next hour; never breaks ingest
+                logging.getLogger(__name__).warning("durable mission_activity prune failed: %s", type(exc).__name__)
 
     def _persist_source_state(self, state):
         """Mirror per-source state to the durable sink when it supports it."""
@@ -3856,6 +3882,16 @@ class ControlPlaneRepo:
             host = self._hosts.get(hid)
             if host is not None:
                 host.update({k: v for k, v in rec.items() if v is not None})
+
+        # Pi activity projection (G8-C): a private mirror stream, rebuilt into the bounded in-memory store.
+        activity_rows = []
+        for key in [k for k in self._events if k[0] == MISSION_ACTIVITY_ENTITY]:
+            activity_rows.extend(self._events.pop(key))
+        self._event_order = [t for t in self._event_order if t[0] != MISSION_ACTIVITY_ENTITY]
+        self.mission_activity = self._new_mission_activity()
+        counts = self.mission_activity.hydrate(activity_rows) if self.mission_activity_mirror else {"skipped": 0}
+        if counts["skipped"]:
+            logging.getLogger(__name__).warning("skipped %d unusable mission_activity row(s) on restore", counts["skipped"])
 
         # Policies are authoritative independently of stream iteration order.
         for (etype, entity_id), stream in self._events.items():

@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Work Command Center: rollout gate `work_center_v1` (off by default)
+- New capability `work_center_v1` in `/api/v1/health`, only when `control_plane.work_center.enabled: true` (YAML, strict `true`, default off). It gates the Overview "This week" card, the session "Work context" header and the GitHub board "Open in Herdr" links; with it off the dashboard is unchanged (the board no longer reads `/api/v1/mission-outcomes`). Rollback is turning the flag off. Nothing is deployed or enabled by merging. See `docs/specs/herdr-work-command-center-wc001/OPERATOR.md`.
+
 ### Control-plane client key for the llm services (optional)
 - `ControlPlaneClient` (llm-proxy, `llm-gateway-sync`, `llm-gateway-usage`) sends `X-API-Key` read from an optional key file on every call; no file = no header = unchanged. The file must be mode 0600 (group/other-readable, missing or empty is refused without printing it). Setting: `--control-plane-key-file` on the three commands, plus `control_plane.llm_proxy.control_plane_key_file` for the llm-proxy slice; compose mounts `HERDR_CP_CLIENT_KEY_FILE` read-only when set.
 - The `agent` role may now `POST /api/v1/token-usage` (viewer still may not; an open control plane is unchanged), so usage reporters need no operator key. Tests: `tests/test_control_plane_client_key.py`, `tests/control_plane/test_agent_token_usage.py`. See `deploy/control-plane/README.md`.
