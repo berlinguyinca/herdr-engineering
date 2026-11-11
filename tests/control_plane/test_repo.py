@@ -132,6 +132,18 @@ def test_service_description_derived_for_imported_records():
     assert "mac.lan" in svc["description"]
 
 
+def test_container_ids_are_not_hosts():
+    """A docker container id with no tailnet address is not a machine: it is left out of the host list (and so out of
+    attention), while a real host, even one named like a hex id but reachable on the tailnet, stays."""
+    r = repo.ControlPlaneRepo()
+    r.upsert_host("bender", "bender", "100.64.0.1")
+    r.upsert_host("0982873b6ca5", "0982873b6ca5", None, status="unknown")
+    r.upsert_host("a" * 64, "a" * 64, None, status="unknown")
+    r.upsert_host("deadbeef0001", "deadbeef0001", "100.64.0.9")
+    assert [h["host_name"] for h in r.list_hosts()] == ["bender", "deadbeef0001"]
+    assert r.get_host("0982873b6ca5") is not None      # the raw record is kept, only the listing ignores it
+
+
 def test_host_heartbeat_and_unavailable():
     r = repo.ControlPlaneRepo()
     hid = r.register_host("bender", "100.104.39.6")
@@ -570,3 +582,33 @@ def test_pull_request_end_count_counts_ends_not_corrected_times():
     assert _pr(r, "merged", merged_at="2026-10-01T10:00:00Z")["end_count"] == 1, "a corrected time is not a new end"
     assert _pr(r, "open")["end_count"] == 1
     assert _pr(r, "closed")["end_count"] == 2, "ending again after a reopen is a new end"
+
+
+def test_record_token_usage_row_concurrent_identical_request_id_writes_one_event():
+    import threading
+
+    r = repo.ControlPlaneRepo()
+    row = {"project": "p", "model": "m", "request_id": "req-race", "input_tokens": 3}
+    barrier = threading.Barrier(16)
+    errors = []
+
+    def post():
+        try:
+            barrier.wait()
+            r.record_token_usage_row(dict(row))
+        except Exception as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    for _ in range(20):
+        r2 = repo.ControlPlaneRepo()
+        r = r2
+        barrier = threading.Barrier(16)
+        threads = [threading.Thread(target=post) for _ in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        events = r.events_of_type("token_usage")
+        assert len(events) == 1
+        assert len(r._token_usage) == 1
+    assert not errors

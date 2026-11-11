@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 import zlib
 from contextlib import asynccontextmanager
 
@@ -66,19 +67,46 @@ class ProjectionStore:
             'ON fabric_events(projection_position) WHERE projection_position IS NOT NULL')
 
     @asynccontextmanager
-    async def publisher(self):
-        """One materializer per database schema; readers never take this lock."""
+    async def publisher(self, wait=0.0, poll=0.25):
+        """One materializer per database schema; readers never take this lock.
+
+        ``wait`` bounds how long (seconds) to keep retrying a held lock before
+        giving up; the default of zero fails at once, as the worker's refresh does.
+        """
         conn = self.conn
         key = await conn.fetchval("SELECT hashtext(current_schema() || '.projection_checkpoints')")
-        acquired = await conn.fetchval('SELECT pg_try_advisory_lock($1::int,$2::int)',
-                                       FENCE_NAMESPACE, key)
-        if not acquired:
-            raise CheckpointInvalid('another projection checkpoint materializer is active')
+        deadline = time.monotonic() + max(0.0, wait)
+        while True:
+            acquired = await conn.fetchval('SELECT pg_try_advisory_lock($1::int,$2::int)',
+                                           FENCE_NAMESPACE, key)
+            if acquired:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CheckpointInvalid('another projection checkpoint materializer is active'
+                                        + await self._lock_holder(key))
+            await asyncio.sleep(min(poll, remaining))
         try:
             yield
         finally:
             if not conn.is_closed():
                 await conn.execute('SELECT pg_advisory_unlock($1::int,$2::int)', FENCE_NAMESPACE, key)
+
+    async def _lock_holder(self, key):
+        """Name the session holding the materializer lock, so an abort says who to look at."""
+        try:
+            rows = await self.conn.fetch(
+                "SELECT a.pid, a.client_addr::text AS addr, a.application_name AS app, a.state, "
+                "extract(epoch FROM now() - a.state_change)::int AS idle_seconds, left(a.query, 80) AS query "
+                "FROM pg_locks l JOIN pg_stat_activity a USING (pid) "
+                "WHERE l.locktype = 'advisory' AND l.classid = $1::int::oid AND l.objid = $2::int::oid "
+                "AND l.granted AND a.pid <> pg_backend_pid()",
+                FENCE_NAMESPACE, key)
+        except Exception:  # diagnostics must never mask the real refusal
+            return ""
+        return "".join(
+            f" (held by pid {r['pid']} addr {r['addr'] or 'local'} app {r['app'] or '-'} "
+            f"state {r['state']} for {r['idle_seconds']}s: {r['query']!r})" for r in rows)
 
     async def available(self):
         return bool(await self.conn.fetchval(

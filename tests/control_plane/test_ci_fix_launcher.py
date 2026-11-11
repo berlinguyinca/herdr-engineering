@@ -385,7 +385,6 @@ def box(tmp_path):
     (run / "allow.txt").write_text("gateway.example:443\n")
     (run / "services.json").write_text("[]")
     (run / "secrets.json").write_text("{}")
-    # A CI runner can export XDG_RUNTIME_DIR for a user whose /run/user/<uid> was never created.
     runtime = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
     sock_dir = (runtime if runtime.is_dir() else Path("/tmp")) / f"cifix-{uuid.uuid4().hex[:8]}"
     sock_dir.mkdir(mode=0o700)

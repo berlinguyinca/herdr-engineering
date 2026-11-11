@@ -15,12 +15,24 @@ sections:
       host_aliases: {}              # e.g. {bender: "bender.example.test"}
       # {} = open on the tailnet (the default `fleet config init` writes; the web port is
       # bound to the tailnet interface and runs --allow-open).
-      # !!! KEYED MODE IS NOT SUPPORTED YET !!! Adding entries here (key: role, roles
-      # viewer | operator | ingest | agent) gates every route but /api/v1/health and the
-      # host endpoints. The browser dashboard, the llm-proxy and the emit hook do not
-      # send keys yet, so they all get 401 until they do. If you still enable it, put the
-      # ingest key in ingest.api_key and the agent key in agent.api_key below.
+      # Keyed mode: adding entries here (key: role, roles viewer | operator | ingest | agent)
+      # gates every route but /api/v1/health and the host endpoints. The llm-proxy and the
+      # emit hook do not send keys yet (401 until they do). The browser dashboard works only
+      # behind the dashboard proxy (dashboard_proxy below). Put the ingest key in
+      # ingest.api_key and the agent key in agent.api_key.
       api_keys: {}
+      # OPTIONAL, off by default (no block = nothing changes). Same-origin proxy for BROWSER
+      # traffic when api_keys is on: GET/SSE/static get the viewer key, only the allowlisted
+      # writes get the operator key, everything else is 403. The browser never sees a key.
+      # Key files hold one key each, mode 0600 (the proxy refuses to start otherwise).
+      # Run: herdr-eng control-plane dashboard-proxy --fleet-config <this file>
+      # (compose profile dashboard-proxy). Point the browser at the proxy port, not the web port.
+      # dashboard_proxy:
+      #   viewer_key_file: /etc/herdr/dashboard-proxy/viewer.key
+      #   operator_key_file: /etc/herdr/dashboard-proxy/operator.key   # omit = dashboard is read-only
+      #   upstream: "http://control-plane-web:8080"
+      #   # operator_post_allowlist: ["POST /api/v1/attention/ack"]   # "METHOD /path"; * = one segment, trailing ** = rest
+      #   #   default = the dashboard's own write actions (see control_plane/dashboard_proxy.py)
       rustfs_endpoint: "http://rustfs:9000"
       minio_user: "REDACTED"        # the object store's access key (what the web reads)
       minio_password: "REDACTED"
@@ -58,6 +70,13 @@ sections:
       # deploy.sh mounts ~/.local/share/herdr-engineering/pipelines (kept equal to InferWeave's
       # deploy/pipelines on main by the herdr-pipelines-sync timer) at /etc/herdr/pipelines.
       # deployment_definitions: "/etc/herdr/pipelines"
+      # OPTIONAL: components a CI pipeline (not a host updater) reports, as {component: host id}. The
+      # host id is a `hosts:` entry (with token_sha256) whose token the pipeline POSTs events with.
+      # Accepted and shown with a "CI-reported" badge, but never planned, gated, permitted, escalated or
+      # forced. At most 32 entries; a component must not also have a definition (the whole list is then
+      # refused and the page says why). Read live. Only effective with deployment_definitions loaded;
+      # while those are invalid, every event is refused (503), these included.
+      # ci_deployments: {lc-binbase-frontend: woodpecker-ci, lc-binbase-backend: woodpecker-ci}
       # OPTIONAL: true enables the audited Deployments actions (POST /api/deployments/force and
       # /ack, operator role). Read live; anything but true is off. Force only records a request the
       # host updaters pick up; the host permit gate (GET /api/deployments/permit) works either way.
@@ -292,6 +311,7 @@ sections:
       #     grant_ttl_days: 30           # lifetime of a proposed grant, and of an active one from activation
       #     extra_vetoes: []             # extra hard denies: [{code: no_prod, reason: "...", argv_contains: "prod"}]
       #     policy_version: 1            # bump to invalidate every existing grant
+      #     approval_ttl_minutes: 15     # how long an owner's one-shot approval of an exact action can be spent
       #   # OPTIONAL: the action judge (Phase 3). It can only ADD friction: an active grant is honoured only when the
       #   # judge answers AND does not escalate; unreachable/disabled => the owner decides. Register the key with
       #   # `herdr-eng control-plane assistant-judge register --endpoint URL --key-file PATH --key-stdin` (stdin only).
@@ -312,6 +332,41 @@ sections:
       #     calibration:                 # the activation gate, evaluated per risk class
       #       min_labeled_decisions: 200 # minimum 20
       #       max_false_negative_bound: 0.05   # exclusive upper bound; accepted range 0 < x <= 0.5
+      #   # OPTIONAL: Slack front door (Phase 4). Register tokens with
+      #   # `herdr-eng control-plane assistant-slack register --base-url URL --bot-token-file PATH --app-token-file PATH`
+      #   # (bot token, then app token, one per line on stdin). Inline tokens are rejected.
+      #   slack:
+      #     enabled: false
+      #     base_url: https://slack.com/api  # https; http only for loopback (tests)
+      #     bot_token_file: ""           # absolute PATH to the xoxb- token file (0600)
+      #     app_token_file: ""           # absolute PATH to the xapp- token file (0600), Socket Mode
+      #     owner_user_id: ""            # Slack user id of the owner, like U01ABC23DEF; required when enabled
+      #     channel: ""                  # channel id; empty = the owner's DM
+      #     ask_ttl_minutes: 15          # integer 1..120
+      #     max_asks_per_task_per_hour: 6
+      #     max_asks_per_worker_per_hour: 20   # integer 1..1000; across all of a worker's task ids
+      #     max_asks_per_hour: 60              # integer 1..10000; across all workers; overflow is batched
+      #     summary_idle_minutes: 30     # integer 1..1440
+      #   # The Slack runtime serves ONE owner (owner_user_id from THIS YAML, not from worker registration)
+      #   # and every principal visible to it.
+      #   # OPTIONAL: per-project, per-scope deploy permission (Phase 4). A worker's command maps to a project and scope
+      #   # ONLY when it is exactly `<command> --ref <40 lowercase hex chars>` and its repo agrees. `mode: auto` is only a
+      #   # candidate: it takes effect after YOU confirm it with a Slack tap (POST /api/v1/assistant-deploys/<project>/<scope>/auto)
+      #   # and is revocable (DELETE the same path). Every `require` entry is checked by the hub, never claimed by the worker.
+      #   deploy:
+      #     projects:
+      #       herdr-engineering:           # project id: [a-z0-9][a-z0-9_-]{0,63}
+      #         repo: berlinguyinca/herdr-engineering
+      #         scopes:
+      #           control-plane:           # scope id, same pattern
+      #             mode: ask              # ask (default) | auto (candidate only)
+      #             command: deploy/control-plane/deploy.sh   # relative path: no leading / or ./, no .., no spaces
+      #             require: [on_main, ci_green, descends_from_deployed]   # a non-empty subset; default all three
+      #             health_url: http://127.0.0.1:8080/api/v1/health   # REQUIRED with an explicit descends_from_deployed: the hub
+      #                                         # reads the deployed commit from `<health_url>?probe=1` (loopback http or https)
+      #     precondition_timeout_seconds: 10   # overall deadline for the hub's checks per request, 1..60
+      #     deploy_check_minutes: 20     # integer 1..240; how long the hub polls health before "unconfirmed"
+      #     deploy_window_minutes: 10    # integer 1..240, <= deploy_check_minutes; the target must keep serving through it for "healthy"
       #   # Off-box anchor for the audit chain head (see runbook "Anchoring the audit head"):
       #   audit:
       #     hmac_key_file: "/etc/herdr/assistant-audit.key"   # PATH only (>= 16 bytes)

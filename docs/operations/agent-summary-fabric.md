@@ -35,6 +35,22 @@ or invalid evidence. `X-Herdr-LLM-Route` identifies `fabric` or `cpu` on inferen
 responses. A ready catalog entry is routing evidence; it does not prove an idle
 physical GPU or authorize creating a runtime.
 
+## Gateway fallback instead of a private CPU service
+
+Instead of running `agent-summary-model`, register the policy without `base_url` and list gateway models to use when the
+advertised one is not ready:
+
+```json
+{"name": "herdr-agent-summaries", "project": "herdr-agent-summaries",
+ "upstream_model": "qwen2.5-1.5b-instruct-q4_k_m", "fabric_model": "qwen2.5-1.5b-instruct-q4_k_m",
+ "fallback_models": ["qwen3.8-*"], "context_window": 8192}
+```
+
+When the advertised model is cold, absent, too small or answers 429/503, the proxy retries once on the ready gateway model
+that matches the first pattern with a ready entry (most free slots wins). The response carries
+`X-Herdr-LLM-Route: fallback`. With neither a ready match nor a `base_url`, the caller gets the gateway's own answer (or 503
+`model_unavailable`). A `base_url`, if also given, is used only after the patterns find nothing.
+
 ## Configure the summary client
 
 Mint/reuse a project-mode key with the existing `session_env.acquire` helper for

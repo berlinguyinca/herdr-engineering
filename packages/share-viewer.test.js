@@ -9,7 +9,8 @@ import { webcrypto } from 'node:crypto';
 const STATIC = new URL('../herdr_engineering/control_plane/share_static/', import.meta.url);
 const SOURCE = [
   fs.readFileSync(new URL('lab-signin.js', STATIC), 'utf8').replace(/^export /gm, ''),
-  fs.readFileSync(new URL('share.js', STATIC), 'utf8').replace(/^import .*lab-signin\.js";\s*$/m, ''),
+  fs.readFileSync(new URL('landing.js', STATIC), 'utf8').replace(/^export /gm, ''),
+  fs.readFileSync(new URL('share.js', STATIC), 'utf8').replace(/^import .*\.js";\s*$/gm, ''),
 ].join('\n');
 const TOKEN = 'A'.repeat(43);
 const OTHER = 'B'.repeat(43);

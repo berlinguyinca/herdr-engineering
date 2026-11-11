@@ -178,7 +178,8 @@ def _tasks(service: CollabService, pr, rid: Any, method: str, params: Any):
         return _fail(rid, exc)
 
 
-def handle(service: CollabService, message: Any, authorization: str, device: str | None):
+def handle(service: CollabService, message: Any, authorization: str, device: str | None, *,
+           peer_ip: str | None = None, machine: str | None = None):
     """One JSON-RPC request in, (HTTP status, JSON) out."""
     if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
         return 400, _error(None, -32600, "invalid request")
@@ -186,7 +187,7 @@ def handle(service: CollabService, message: Any, authorization: str, device: str
     if rid is None or isinstance(rid, (dict, list, bool)):
         return 400, _error(None, -32600, "invalid request")   # A2A has no notifications
     try:
-        pr = service.authenticate(authorization, device)
+        pr = service.authenticate(authorization, device, peer_ip=peer_ip, machine=machine)
     except CollabError:
         return 401, _error(rid, -32001, "unauthorized")
     if not pr.is_agent:

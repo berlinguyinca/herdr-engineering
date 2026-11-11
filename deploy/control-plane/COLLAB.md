@@ -125,7 +125,7 @@ edge (nginx, the share host's own server: /s/ only) -> herdr-share-public:8083 (
 - Certificate: the edge presents ONE certificate for both hosts (`/etc/acme`); `collab-sync.sh` is unchanged and
   still manages one lineage. Before enabling shares, add the share host to the existing lineage once, on the
   certbot host, with the same DNS-01 plugin and flags the lineage was created with:
-  `certbot certonly --cert-name localdev.mcp.metabolomics.us --expand -d localdev.mcp.metabolomics.us -d <share host>`
+  `certbot certonly --cert-name localdev.mcp.metabolomics.us --expand -d localdev.mcp.metabolomics.us -d mcp.local.metabolomics.us -d artifacts.local.metabolomics.us -d <share host>`
   (every name the lineage already has must be repeated). Renewals then cover both names. The router and SNI front
   must also send the share host's name to the edge's port.
 - Edge limits (trade-off): `/s/` allows 100 requests/s per client address with a burst of 300 (parquet range
@@ -206,6 +206,8 @@ edge (nginx, server_name <public_host>): /s/ -> share-public:8083
   therefore sets that directory to group `control_plane.collab.members.secrets_gid` (default: the worker's
   `HERDR_COLLAB_CERT_UID`, which compose passes with collab-public's default), mode 0770, files 0640; others get
   nothing. With no gid the worker refuses to start members rather than issue links nobody can receive.
+- Approving a share link is a human action: `member.share_approve` accepts user actors only and the agent tool
+  `artifact_share_approve` no longer exists; an agent can only create a pending share that the owner approves in the web page.
 - A `share` grant is not read-protected: a grantee holding only `share` can create and approve a link, receives the
   read-once URL, and so can open it and read the bytes. The member API (head, history, view tools) stays gated on
   `read`; do not hand out `share` expecting it to hide content.
@@ -398,12 +400,33 @@ Agent ids starting with `room:` are refused by every collaborator route (grant, 
 before that rule cannot be revoked by id any more: use `collab restrict <artifact_id>` (it revokes every collaborator
 grant of the artifact).
 
+## Fabric listener (optional)
+
+Set `control_plane.collab.fabric_trust.listen_host` (a tailnet address) and `listen_port` (and `whois_socket: /run/fabric-whois/whois.sock`)
+and `deploy.sh` layers `compose.collab-fabric.yaml`: a `fabric-whois` sidecar (no network, tailscaled's socket directory read-only, its own
+socket directory) and a port published from `collab-public` on that tailnet address only. Without those keys nothing changes. Before relying
+on it, check that Docker preserves the caller's source address, and read the rollback caveat: `docs/operations/fabric-trust.md` section 9.
+
+Three host steps `deploy.sh` cannot do for you (it warns while they are missing):
+
+- **Firewall (required).** The `fabric` network is not internal (Docker cannot publish a port from an internal network) and masquerade-off does not remove
+  its default route, so `collab-public` could reach the host's own addresses, other containers' ports and the LAN. As root:
+  `deploy/control-plane/collab-fabric-firewall.sh --install` (`--check`, `--remove`); it drops NEW connections from `172.30.213.0/24` in `DOCKER-USER`
+  and `INPUT`. Re-apply at boot.
+- **Boot order.** Install `deploy/control-plane/docker-after-tailscale.conf` as `/etc/systemd/system/docker.service.d/after-tailscale.conf`
+  (`systemctl daemon-reload`): docker then starts after tailscaled and waits for the tailnet address, otherwise the port bind can fail at boot and the
+  PUBLIC site stays down.
+- **The collab host trusts itself.** A local process, `ssh -L`/`socat` relay or host-network container reaches the listener as the host's own tailnet IP and is
+  accepted as that machine if the host is in `machines`. Run no relays or L4 fronts on the collab host and omit it from `machines` unless its own agents need it.
+
 ## Verify
 
+The MCP URL is `https://mcp.local.metabolomics.us`. `localdev.mcp.metabolomics.us` is a deprecated alias the edge serves on the same server block during the overlap (the certbot lineage keeps that name).
+
 ```
-curl -s https://localdev.mcp.metabolomics.us/api/v1/collab/config        # 200
-curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/collab/rooms   # 401
-curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/hosts          # 404
+curl -s https://mcp.local.metabolomics.us/api/v1/collab/config        # 200
+curl -s -o /dev/null -w '%{http_code}' https://mcp.local.metabolomics.us/api/v1/collab/rooms   # 401
+curl -s -o /dev/null -w '%{http_code}' https://mcp.local.metabolomics.us/api/v1/hosts          # 404
 curl -s http://<tailnet-ip>:9482/api/v1/collab/config                    # operator block present
-curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/s/unknown/           # 404 (the MCP host serves no /s/)
+curl -s -o /dev/null -w '%{http_code}' https://mcp.local.metabolomics.us/s/unknown/           # 404 (the MCP host serves no /s/)
 ```

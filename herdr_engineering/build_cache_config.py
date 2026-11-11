@@ -15,6 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from .build_cache_location import StorageTier, parse_storage_tiers
 from .errors import InvalidError
 
 _ENDPOINT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
@@ -53,6 +54,7 @@ class Local:
     ram_scratch_gib: float
     min_free_disk_percent: float
     incremental_disabled_for_cacheable_builds: bool
+    storage_tiers: tuple[StorageTier, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,16 @@ class Observability:
 
 
 @dataclass(frozen=True)
+class ReportSection:
+    """Opt-in push of this host's recent builds to a control plane. The key lives in ``key_file`` only."""
+    enabled: bool = False
+    url: str | None = None
+    key_file: str | None = None
+    interval_s: int = 60
+    host_id: str | None = None
+
+
+@dataclass(frozen=True)
 class BuildCacheConfig:
     enabled: bool
     mode: Mode
@@ -118,6 +130,7 @@ class BuildCacheConfig:
     eviction: Eviction = Eviction(False, 40, 5000)
     adaptive_slots: AdaptiveSlots = AdaptiveSlots(False, 1, 4)
     slurm: SlurmSection = SlurmSection()
+    report: ReportSection = ReportSection()
 
     @property
     def effective_mode(self) -> Mode:
@@ -278,6 +291,23 @@ def _slurm_section(raw: Any, defaults: dict, path: str) -> SlurmSection:
     return SlurmSection(on, acct, parts, cpus, mem, tl, qw)
 
 
+_HOST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
+
+
+def _report_section(raw: Any, defaults: dict, path: str) -> ReportSection:
+    d = _filled(raw, defaults, path)
+    on = _bool(d, "enabled", path)
+    url, kf, hid = d["url"], d["key_file"], d["host_id"]
+    if url is not None and (not isinstance(url, str) or not url.strip()):
+        raise _bad(f"{path}.url", "must be a URL string")
+    if kf is not None and (not isinstance(kf, str) or not kf.strip()):
+        raise _bad(f"{path}.key_file", "must be a path string (path only; never the key itself)")
+    if hid is not None and (not isinstance(hid, str) or not _HOST_ID_RE.match(hid)):
+        raise _bad(f"{path}.host_id", "must match ^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+    iv = int(_num(d, "interval_s", path, lo=10, lo_incl=True, hi=3600, hi_incl=True, integer=True))
+    return ReportSection(on, url, kf, iv, hid)
+
+
 def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     """Validate a ``fabric_build_cache`` mapping; raise ``InvalidError`` on any fault."""
     base = _defaults()
@@ -329,6 +359,7 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     ram = _num(lo, "ram_scratch_gib", lp, lo=0, lo_incl=True)
     free = _num(lo, "min_free_disk_percent", lp, lo=0, lo_incl=True, hi=100)
     incr = _bool(lo, "incremental_disabled_for_cacheable_builds", lp)
+    tiers = parse_storage_tiers(lo["storage_tiers"])
 
     xp = f"{p}.execution"
     ex = _filled(top["execution"], base["execution"], xp)
@@ -346,6 +377,7 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
         warnings.append(f"{xp}.gpu_for_cpu_builds is true: CPU builds may occupy GPU nodes")
 
     sl = _slurm_section(top["slurm"], base["slurm"], f"{p}.slurm")
+    rep = _report_section(top["report"], base["report"], f"{p}.report")
 
     cp = f"{p}.cleanup"
     cl = _filled(top["cleanup"], base["cleanup"], cp)
@@ -393,7 +425,7 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     return BuildCacheConfig(
         enabled=enabled, mode=mode, allowed_hosts=allowed_hosts,
         shared_cache=SharedCache(s_enabled, ep, s["namespace"], writes, max_total, tls, cred, reg),
-        local=Local(capacity, ram, free, incr),
+        local=Local(capacity, ram, free, incr, tiers),
         execution=Execution(slurm, clusters, parts, gpu, fb, slots),
         cleanup=Cleanup(dry, idle, evict),
         observability=Observability(obs, exp),
@@ -401,6 +433,7 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
         eviction=Eviction(destructive, hard_cap, max_entries),
         adaptive_slots=AdaptiveSlots(ad_on, min_s, max_s),
         slurm=sl,
+        report=rep,
     )
 
 

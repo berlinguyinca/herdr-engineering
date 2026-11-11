@@ -270,7 +270,7 @@ textarea.cx-input { resize: vertical; font: inherit; }
 .cx-cols > .hd-card > .hd-card__title { font-size: .75rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px; }
 .hd-btn { transition: background var(--motion-fast, .15s), box-shadow var(--motion-fast, .15s); }
 .hd-btn:focus-visible, .cx-input:focus-visible, .cx-page input:focus-visible, .cx-embed input:focus-visible, .cx-page select:focus-visible, .cx-embed select:focus-visible,
-.cx-rtab:focus-visible, .cx-stab:focus-visible, .cx-edit:focus-visible { outline: none; box-shadow: var(--cx-ring); }
+.cx-rtab:focus-visible, .cx-stab:focus-visible, .cx-edit:focus-visible { outline: none; box-shadow: var(--cx-ring, 0 0 0 3px var(--accent)); }
 .hd-status { background: color-mix(in srgb, var(--sc, var(--text-muted)) 10%, var(--surface)); border-color: color-mix(in srgb, var(--sc, var(--text-muted)) 28%, var(--border-subtle)); }
 .cx-av--sm { width: 26px; height: 26px; flex-basis: 26px; font-size: .6875rem; }
 .cx-ntitle { display: inline-flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%; flex-wrap: wrap; }

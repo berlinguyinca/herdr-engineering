@@ -7,13 +7,14 @@ name = "herdr-engineering"
 version = "0.1.0"
 description = "Super HerdR / HerdR Engineering — thin curated integration layer over Herdr"
 requires-python = ">=3.12"
-dependencies = ["PyYAML>=6.0", "asyncpg>=0.29", "boto3>=1.34", "psycopg2-binary>=2.9", "nh3==0.3.7"]
+dependencies = ["PyYAML>=6.0", "asyncpg>=0.29", "boto3>=1.34", "psycopg2-binary>=2.9", "nh3==0.3.7", "slack_sdk==3.45.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.5", "jsonschema>=4.10"]
-collab = ["PyJWT[crypto]>=2.8"]
-review-gate = ["PyJWT[crypto]>=2.8"]
+dev = ["pytest>=8", "pytest-timeout>=2.3", "ruff>=0.5", "jsonschema>=4.10", "cryptography>=42"]
+collab = ["PyJWT[crypto]>=2.8", "cryptography>=42"]
+review-gate = ["PyJWT[crypto]>=2.8", "cryptography>=42"]
 acme = ["certbot>=3", "certbot-dns-route53>=3", "boto3>=1.34"]   # publicly trusted fabric certificates (devfabric cert/dns)
+share = ["cryptography>=42"]   # lab-share session AEAD (share_session.py)
 federation = ["cryptography>=42"]   # Ed25519 request/export signing (ADR-0008 P2); imported lazily
 
 [project.scripts]
@@ -46,10 +47,22 @@ addopts = "--import-mode=importlib -m 'not e2e and not integration'"
 markers = [
     "integration: needs an external dependency (a live Postgres via PA_PG_DSN, or a real CLI such as claude); deselected by default, opt in with -m integration",
 ]
+#
+# A per-test ceiling, so a stall names itself instead of eating the pipeline. The suite has been observed to stall for 6-12
+# minutes on a loaded host and, before the file-descriptor floor in scripts/ci/ensure-fd-limit.sh, to die outright at ~38% with no
+# summary (issue #651). Both failure modes end a run with no verdict, which is what makes them expensive: a 79-minute kill that
+# names nothing costs more than a failure that names a test. 900s is deliberately far above any test that has ever passed here -
+# it is a hang detector, not a performance budget - and `signal` (the POSIX default) is set explicitly so one hung test reports
+# and the run continues to a summary rather than the process being killed. Override per run with --timeout=<seconds>.
+timeout = 900
+timeout_method = "signal"
 
 
 [tool.setuptools.package-data]
 herdr_engineering = ["control_plane/rakazo_defaults.json", "*.mjs", "skill_data/summary/*.md", "skill_data/summary/adapters/*.md",
+                     "skill_data/handoff/*.md", "skill_data/handoff/adapters/*.md",
+                     "skill_data/herdr-join/*.md", "skill_data/herdr-join/adapters/*.md",
                      "control_plane/share_static/*.html", "control_plane/share_static/*.js",
-                     "control_plane/share_static/*.css", "control_plane/share_static/vendor/pdfjs/*",
+                     "control_plane/share_static/*.css", "control_plane/share_static/fonts/*.woff2",
+                     "control_plane/share_static/fonts/OFL.txt", "control_plane/share_static/vendor/pdfjs/*",
                      "control_plane/projection_compatibility.json"]

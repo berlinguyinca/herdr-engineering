@@ -26,6 +26,7 @@ import { mountArchitecture } from './architecture-view.js';
 import { mountPersonalAssistant } from './personal-assistant-view.js';
 import { mountProjectIntelligence } from './project-intelligence-view.js';
 import { visibleNav } from './nav-capabilities.js';
+import { mountSettings } from './settings-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { agentStory, renderStory } from './agents-lineage.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
@@ -51,6 +52,7 @@ import { mountRelated } from './related-panel.js';
 import { mountMissionStory } from './mission-story-view.js';
 import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-view.js';
 import { mountArtifacts, renderArtifactDetail } from './artifacts-view.js';
+import { mountLibrary } from './library-view.js';
 import { mountPublications } from './publications-view.js';
 import { mountHandoffs } from './handoffs-view.js';
 import { mountMemory } from './memory-view.js';
@@ -89,18 +91,19 @@ const NAV = [
   { group: 'Monitor', path: '/overview', label: 'Overview' },
   { group: 'Monitor', path: '/attention', label: 'Attention', match: ['/activity'] },
   { group: 'Agents', path: '/herd', label: 'Agents', match: ['/missions', '/handoffs', '/topology'] },
-  { group: 'Agents', path: '/collab', label: 'Collaboration' },
+  { group: 'Agents', path: '/collab', label: 'Collaboration', capability: 'collab_v1' },
   { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
   { group: 'Agents', path: '/teams', label: 'Your teams', capability: 'unified_workspace_v1' },
   { group: 'Agents', path: '/team-map', label: 'Team map', capability: 'unified_workspace_v1' },
   { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync', '/build-cache'] },
   { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
+  { group: 'Fabric', path: '/settings', label: 'Settings' },
   { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
   { group: 'Delivery', path: '/ci', label: 'CI', match: ['/deployments'] },
   { group: 'Delivery', path: '/reviews', label: 'Reviews', match: ['/review-gate'] },
   { group: 'Delivery', path: '/github', label: 'Projects', match: ['/github/projects', '/pr'] },
   { group: 'Code', path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
-  { group: 'Code', path: '/artifacts', label: 'Artifacts', match: ['/publications'] },
+  { group: 'Code', path: '/artifacts', label: 'Artifacts', match: ['/library', '/publications'] },
   { group: 'Code', path: '/memory', label: 'Memory', capability: 'memory_v1' },
   { group: 'Code', path: '/intelligence', label: 'Project intelligence', capability: 'project_intelligence_v1' },
 ];
@@ -112,9 +115,9 @@ const SECTION_TABS = [
   [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync'], ['/build-cache', 'Build cache', 'build_cache_v1']],
   [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
   [['/ci', 'CI'], ['/deployments', 'Deployments']],
-  [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate']],
+  [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate', 'review_gate_v1']],
   [['/github', 'Issues'], ['/github/projects', 'Boards']],
-  [['/artifacts', 'Artifacts'], ['/publications', 'Publications']],
+  [['/artifacts', 'Artifacts'], ['/library', 'Library'], ['/publications', 'Publications']],
 ];
 
 const SHELL = document.getElementById('shell');
@@ -164,7 +167,7 @@ function applyRoutes() {
 }
 function markAvailability(ok, message) {
   const path = routePath();
-  if (!KNOWN_PAGES.has(path) || path === '/overview' || path === '/attention') return;
+  if (!KNOWN_PAGES.has(path) || path === '/overview' || path === '/attention' || path === '/settings') return;
   const missing = !ok && MISSING.test(message || '');
   if (!ok && !missing) return;
   if (missing === unavailable.has(path)) return;
@@ -265,10 +268,12 @@ const ROUTES = {
   '/llm/session/:id': viewLlmSession,
   '/artifacts': viewArtifacts,
   '/artifacts/:id': viewArtifact,
+  '/library': viewLibrary,
   '/publications': viewPublications,
   '/scheduling': viewScheduling,
   '/handoffs': viewHandoffs,
   '/memory': viewMemory,
+  '/settings': viewSettings,
 };
 
 // Router rule: render() runs only on a route change (any hash change, query
@@ -420,10 +425,15 @@ async function viewArtifact(parts, revision) {
   const controller = new AbortController();
   const chip = root.querySelector('herdr-freshness');
   // Mount immediately so navigation can cancel the pending detail read.
-  void renderArtifactDetail(container, client, id, { signal: controller.signal, versionId: route().query.get('version') || undefined })
+  void renderArtifactDetail(container, client, id, { signal: controller.signal, versionId: route().query.get('version') || undefined, anchor: route().query.get('at') || undefined })
     .then(result => { if (!controller.signal.aborted && revision === renderRevision) chip.touch(!result?.errors?.length, result?.errors?.join('; ')); })
     .catch(error => { if (!controller.signal.aborted && revision === renderRevision) { container.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error><button type="button" data-route-retry>Retry</button>`; chip.touch(false, error.message); } });
   return { refresh() {}, dispose: () => controller.abort() };
+}
+
+async function viewLibrary() {
+  root.innerHTML = `${liveHead('<h1>Library</h1>')}<div id="artifact-library"></div>`;
+  return mountLibrary(root.querySelector('#artifact-library'), client, { freshness: chipIn(root), folderId: route().query.get('folder') || null });
 }
 
 async function viewPublications() {
@@ -439,6 +449,11 @@ async function viewScheduling() {
 async function viewDeployments() {
   root.innerHTML = `${liveHead('<h1>Deployments</h1>')}<div id="deployments"></div>`;
   return mountDeployments(root.querySelector('#deployments'), client, { freshness: chipIn(root) });
+}
+
+async function viewSettings() {
+  root.innerHTML = `${liveHead('<h1>Settings</h1>')}<div id="settings"></div>`;
+  return mountSettings(root.querySelector('#settings'), client, { freshness: chipIn(root) });
 }
 
 async function viewBuildCache() {

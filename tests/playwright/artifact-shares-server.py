@@ -44,7 +44,7 @@ from herdr_engineering.control_plane.artifact_annotations import AnnotationError
 from herdr_engineering.control_plane.artifact_bundle import ArtifactBundle  # noqa: E402
 from herdr_engineering.control_plane.artifact_collab_store import InviteGrantConflict  # noqa: E402
 from herdr_engineering.control_plane.artifact_shares import ShareError  # noqa: E402
-from herdr_engineering.control_plane.artifacts import ArtifactConflict  # noqa: E402
+from herdr_engineering.control_plane.artifacts import ArtifactConflict, ArtifactError  # noqa: E402
 from herdr_engineering.control_plane.collab_mirror import REPORT_READ_ONLY  # noqa: E402
 from herdr_engineering.control_plane.repo import ControlPlaneRepo  # noqa: E402
 
@@ -53,6 +53,7 @@ HOSTILE_TAG = '<img src=x onerror=window.__x=1>'
 INVITE_CODE = "hcn_invite_ONE-TIME-CODE-7f3a9c2e51b84d60"
 _EMAIL = re.compile(r"[!-?A-~]+@[!-?A-~]+\Z", re.ASCII)   # artifact_shares._EMAIL
 _LOCK = threading.RLock()
+AUTHOR_PAGE = b"<!doctype html><title>Author</title><h1>Author page</h1><script>window.ran=1</script>"
 
 
 def _now():
@@ -66,6 +67,10 @@ def _blob(data: bytes) -> dict:
 
 class ArtifactFixture:
     """The registry calls the artifact detail page, the report reader, restore and share bundling make."""
+
+    async def tombstoned_ids(self):
+        """The detail route reads the tombstone set before it serves an artifact; this fixture deletes none."""
+        return []
 
     def __init__(self):
         self.blobs = {}
@@ -106,7 +111,25 @@ class ArtifactFixture:
             "created_by": "api-key:fixture:local", "state": "ready", "created_at": "2026-10-30T10:00:00+00:00",
             "committed_at": "2026-10-30T10:00:00+00:00", "report_descriptor": descriptor, "output_manifest": [],
             "source_manifest_blob": None, "validation": {"status": "passed"}})
+        # report_v2 carries the author's own HTML page: the only version the share panel offers "Include the author's
+        # HTML page" for (report_v1, the head, has no HTML asset).
+        ref = _blob(AUTHOR_PAGE)
+        self.blobs[ref["storage_key"]] = AUTHOR_PAGE
+        rich = copy.deepcopy(descriptor)
+        rich["assets"].append({"id": "author_page", "name": "report.html", "role": "preview",
+                               "media_type": "text/html", "sha256": ref["sha256"], "size_bytes": ref["size_bytes"]})
+        self.versions["report_1"].append({**self.versions["report_1"][0], "version_id": "report_v2", "version_number": 2,
+                                          "parent_version_id": "report_v1", "report_descriptor": rich})
         self.commits = 0
+
+    async def get_report_asset(self, artifact_id, version_id, asset_id):
+        """The pinned asset with its storage key (ArtifactStore.get_report_asset); only the author page has bytes here."""
+        version = await self.get_version(version_id, artifact_id)
+        assets = ((version or {}).get("report_descriptor") or {}).get("assets") or []
+        asset = next((a for a in assets if a["id"] == asset_id and a["id"] == "author_page"), None)
+        if asset is None:
+            raise ArtifactError("asset not found")
+        return {**asset, "storage_key": _blob(AUTHOR_PAGE)["storage_key"]}
 
     def _version(self, artifact_id, number, parents, files, *, message=None, author="api-key:author:local"):
         outputs = []
@@ -261,7 +284,7 @@ class ArtifactFixture:
                   "evidence_checked": {"status": "not_checked"}, "reviewed": {"status": "not_checked"}}
         return {"artifact_id": artifact_id, "version_id": version_id, "report_descriptor": version["report_descriptor"],
                 "checks": checks, "state": "rendered", "feedback": [], "feedback_count": 0,
-                "feedback_has_more": False, "assets": [],
+                "feedback_has_more": False, "assets": version["report_descriptor"].get("assets", []),
                 "preview_url": f"/api/v1/artifacts/{artifact_id}/versions/{version_id}/preview"}
 
     async def list_report_feedback(self, artifact_id, version_id, *, limit=10, offset=0):
@@ -300,6 +323,12 @@ class ShareFixture:
 
     def sync_call(self, method, *args, **kwargs):
         return asyncio.run(getattr(self, method)(*args, **kwargs))
+
+    async def acquire_spend(self):
+        """ShareStore holds a cross-process spend lock around approve; one in-memory process needs none."""
+
+    async def release_spend(self):
+        """Counterpart of acquire_spend."""
 
     def _public(self, share_id, keep_hash=False):
         row = {k: copy.deepcopy(self.rows[share_id][k]) for k in self.COLUMNS}

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   renderShareForm, renderShareRow, renderSummary, renderEvents, renderLinkDialog,
   buildShareRequest, eventCounts, defaultForm, createShareController,
-  renderPendingReview, renderShareList, mountSharePanel,
+  renderPendingReview, renderShareList, mountSharePanel, PENDING_MARK,
 } from './artifact-share-panel.js';
 
 const IMG = '<img src=x onerror=alert(1)>';
@@ -248,6 +248,7 @@ function fakeClient(overrides = {}) {
     approveArtifactShare: record('approve', overrides.approve ?? { share: { share_id: 'share_new', state: 'live' }, url: SECRET_URL, summary: { warnings: [] } }),
     revokeArtifactShare: record('revoke', overrides.revoke ?? { share: { share_id: 'share_1', state: 'revoked' } }),
     artifactShareEvents: record('events', overrides.events ?? { share_id: 'share_1', events: [] }),
+    artifactReport: record('report', overrides.report ?? ((id, versionId) => Promise.resolve({ version_id: versionId, report_descriptor: { assets: [] }, assets: [] }))),
   };
 }
 
@@ -730,6 +731,34 @@ test('the panel offers Links, Collaborators, Activity and Feedback tabs with the
   panel.dispose();
 });
 
+test('the tabs follow the ARIA tabs pattern: roving tabindex, ids, aria-controls, labelled panels, arrow keys', async () => {
+  const container = withPanes(fakeContainer());
+  const panel = mountSharePanel(container, fakeClient(), 'art1', { versions, headVersionId: 'v2' });
+  await tick();
+  const html = container.innerHTML;
+  assert.match(html, /class="hd-tabs" data-panel-tabs/);
+  assert.equal((html.match(/role="tab"[^>]*tabindex="0"/g) || []).length, 1);
+  assert.equal((html.match(/role="tab"[^>]*tabindex="-1"/g) || []).length, 3);
+  for (const key of ['links', 'collaborators', 'activity', 'feedback']) {
+    const tabId = html.match(new RegExp(`id="([^"]+)" data-panel-tab="${key}" aria-controls="([^"]+)"`));
+    assert.ok(tabId, key);
+    assert.match(html, new RegExp(`id="${tabId[2]}" role="tabpanel" aria-labelledby="${tabId[1]}" data-panel-pane="${key}"`));
+  }
+  const press = (from, key) => { let prevented = false; for (const fn of container.listeners.keydown || []) fn({ key, preventDefault() { prevented = true; }, target: { closest: s => (s === '[data-panel-tab]' ? { dataset: { panelTab: from } } : null) } }); return prevented; };
+  container.contains = () => true;
+  assert.equal(press('links', 'ArrowRight'), true);
+  assert.equal(container.panes.collaborators.hidden, false);
+  assert.equal(press('collaborators', 'End'), true);
+  assert.equal(container.panes.feedback.hidden, false);
+  assert.equal(press('feedback', 'ArrowRight'), true);
+  assert.equal(container.panes.links.hidden, false, 'wraps to the first tab');
+  assert.equal(press('links', 'ArrowLeft'), true);
+  assert.equal(container.panes.feedback.hidden, false, 'wraps to the last tab');
+  assert.equal(press('feedback', 'Home'), true);
+  assert.equal(press('links', 'a'), false, 'other keys are left alone');
+  panel.dispose();
+});
+
 test('the Feedback tab mounts its panel once, lazily', async () => {
   const container = withPanes(fakeContainer());
   let lists = 0;
@@ -790,4 +819,147 @@ test('leaving the Collaborators tab drops the one-time invite code and disarms R
   assert.doesNotMatch(pane.html, /restrict-confirm/);
   assert.equal(restricted.length, 0);
   panel.dispose();
+});
+
+// ------------------------------------------------------------------ author HTML ("Rich view") opt-in
+
+const HTML_ASSET = { id: 'page', name: 'report.html', role: 'preview', media_type: 'text/html' };
+const CSV_ASSET = { id: 'data', name: 'timing.csv', role: 'data', media_type: 'text/csv' };
+const reportVersions = [
+  { version_id: 'r2', version_number: 2, state: 'ready', is_report: true },
+  { version_id: 'r1', version_number: 1, state: 'ready', is_report: true },
+];
+const reportOf = assetsByVersion => (id, versionId) => Promise.resolve({ version_id: versionId, report_descriptor: { assets: assetsByVersion[versionId] || [] }, assets: [] });
+const reportController = (assetsByVersion, options = {}) => {
+  const client = fakeClient({ report: reportOf(assetsByVersion) });
+  const ctrl = createShareController(client, 'art1', { versions: reportVersions, headVersionId: 'r2', ...options });
+  return { client, ctrl };
+};
+const createBody = client => client.calls.find(call => call[0] === 'create')[2];
+
+test('the checkbox is hidden unless the public form is on a version with exactly one HTML asset', async () => {
+  const { ctrl } = reportController({ r2: [CSV_ASSET], r1: [HTML_ASSET] });
+  ctrl.setField('audience', 'public');
+  await tick();
+  assert.doesNotMatch(renderShareForm(ctrl.state), /data-share-field="includeAuthorHtml"/);
+  ctrl.setField('versionId', 'r1');
+  await tick();
+  const html = renderShareForm(ctrl.state);
+  assert.match(html, /<input[^>]*type="checkbox"[^>]*data-share-field="includeAuthorHtml"/);
+  ctrl.setField('audience', 'lab');
+  assert.doesNotMatch(renderShareForm(ctrl.state), /includeAuthorHtml/);
+});
+
+test('two HTML assets: only a single preview-role one counts, otherwise no checkbox', async () => {
+  const other = { ...HTML_ASSET, id: 'other', role: 'data' };
+  const ambiguous = reportController({ r2: [{ ...HTML_ASSET, role: 'data' }, other] });
+  ambiguous.ctrl.setField('audience', 'public'); await tick();
+  assert.doesNotMatch(renderShareForm(ambiguous.ctrl.state), /includeAuthorHtml/);
+  const picked = reportController({ r2: [HTML_ASSET, other] });
+  picked.ctrl.setField('audience', 'public'); await tick();
+  assert.match(renderShareForm(picked.ctrl.state), /includeAuthorHtml/);
+});
+
+test('a non-report version, a failed probe or a text/html;charset asset never crash or show the box wrongly', async () => {
+  const web = fakeClient();
+  const plain = createShareController(web, 'art1', { versions, headVersionId: 'v2' });
+  plain.setField('audience', 'public'); await tick();
+  assert.equal(web.count('report'), 0, 'no report read for a non-report artifact');
+  assert.doesNotMatch(renderShareForm(plain.state), /includeAuthorHtml/);
+  const broken = fakeClient({ report: () => Promise.reject(new Error('boom')) });
+  const failing = createShareController(broken, 'art1', { versions: reportVersions, headVersionId: 'r2' });
+  failing.setField('audience', 'public'); await tick();
+  assert.doesNotMatch(renderShareForm(failing.state), /includeAuthorHtml/);
+  const typed = reportController({ r2: [{ ...HTML_ASSET, media_type: 'Text/HTML; charset=utf-8' }] });
+  typed.ctrl.setField('audience', 'public'); await tick();
+  assert.match(renderShareForm(typed.ctrl.state), /includeAuthorHtml/);
+});
+
+test('the checkbox is unchecked by default, labelled, cautioned, and the field is absent from the request', async () => {
+  const { client, ctrl } = reportController({ r2: [HTML_ASSET] });
+  ctrl.setField('audience', 'public');
+  await tick();
+  const html = renderShareForm(ctrl.state);
+  const box = html.match(/<input[^>]*data-share-field="includeAuthorHtml"[^>]*>/)[0];
+  assert.doesNotMatch(box, /checked/);
+  assert.match(html, /<label[^>]*>[^<]*<input[^>]*includeAuthorHtml[^>]*>\s*Include the author's HTML page \(Rich view\)/);
+  assert.match(html, /Anyone with the link can view this page\. It is shown without scripts\./);
+  await ctrl.review();
+  assert.deepEqual(createBody(client), { version_id: 'r2', audience: 'public', expires_in_days: 30 });
+  assert.equal('include_author_html' in createBody(client), false);
+});
+
+test('checking the box sends include_author_html: true, and unchecking again drops it', async () => {
+  const { client, ctrl } = reportController({ r2: [HTML_ASSET] });
+  ctrl.setField('audience', 'public');
+  await tick();
+  ctrl.setField('includeAuthorHtml', true);
+  assert.match(renderShareForm(ctrl.state), /<input[^>]*includeAuthorHtml[^>]*checked/);
+  await ctrl.review();
+  assert.deepEqual(createBody(client), { version_id: 'r2', audience: 'public', expires_in_days: 30, include_author_html: true });
+  ctrl.setField('includeAuthorHtml', false);
+  await ctrl.review();
+  assert.equal('include_author_html' in client.calls.filter(call => call[0] === 'create')[1][2], false);
+});
+
+test('a checked box is cleared when the version changes to one without a single HTML asset, or the audience leaves public', async () => {
+  const { client, ctrl } = reportController({ r2: [HTML_ASSET], r1: [CSV_ASSET] });
+  ctrl.setField('audience', 'public'); await tick();
+  ctrl.setField('includeAuthorHtml', true);
+  ctrl.setField('versionId', 'r1'); await tick();
+  assert.equal(ctrl.state.form.includeAuthorHtml, false);
+  await ctrl.review();
+  assert.equal('include_author_html' in createBody(client), false);
+  ctrl.setField('versionId', 'r2'); await tick();
+  ctrl.setField('includeAuthorHtml', true);
+  assert.equal(buildShareRequest({ ...ctrl.state.form, audience: 'lab', emails: 'a@b.c' }, { allowAuthorHtml: true }).include_author_html, undefined);
+});
+
+test('buildShareRequest ignores the flag unless the caller says the version qualifies', () => {
+  const form = { ...defaultForm('v2'), audience: 'public', includeAuthorHtml: true };
+  assert.equal('include_author_html' in buildShareRequest(form), false);
+  assert.equal(buildShareRequest(form, { allowAuthorHtml: true }).include_author_html, true);
+});
+
+test('the internal pending entry is never rendered; the real entry and an "includes author page" badge are', () => {
+  assert.equal(PENDING_MARK, 'preview.html+author-html');
+  const summary = { entry: PENDING_MARK, author_html: true, file_count: 2, total_bytes: 10, files: [{ name: 'preview.html', size_bytes: 4 }, { name: 'author-page.html', size_bytes: 6 }], warnings: ['the author\'s own HTML page IS included: anyone holding the link can view it'] };
+  const html = renderSummary(summary);
+  assert.doesNotMatch(html, /author-html/);
+  assert.match(html, /opens <code>preview\.html<\/code>/);
+  assert.match(html, /data-share-author-badge[^>]*>Includes author page</);
+  assert.match(html, /<code>author-page\.html<\/code>/);
+  assert.match(html, /Warning: the author&#39;s own HTML page IS included/);
+  const row = renderShareRow({ share_id: 's1', state: 'pending', audience: 'public', entry: PENDING_MARK }, undefined);
+  assert.doesNotMatch(row, /author-html/);
+  assert.match(row, /data-share-author-badge/);
+  assert.match(row, /<code>preview\.html<\/code>/);
+  assert.doesNotMatch(renderShareRow({ share_id: 's2', state: 'pending', audience: 'public', entry: 'preview.html' }, undefined), /author-badge/);
+  assert.doesNotMatch(renderSummary({ entry: 'preview.html', author_html: false, files: [], file_count: 1 }), /author-badge/);
+});
+
+test('a resumed pending author-page share shows its files, warning and badge, never the sentinel', async () => {
+  const getArtifactShare = () => Promise.resolve({ share: { share_id: 's1', state: 'pending', audience: 'public', entry: PENDING_MARK }, summary: { entry: PENDING_MARK, author_html: true, file_count: 2, total_bytes: 3, files: [{ name: 'preview.html', size_bytes: 1 }, { name: 'author-page.html', size_bytes: 2 }], warnings: ['anyone holding the link can view it'] } });
+  const client = { ...fakeClient(), getArtifactShare };
+  const ctrl = createShareController(client, 'art1', { versions, headVersionId: 'v2' });
+  await ctrl.resume('s1');
+  const html = renderPendingReview(ctrl.state.pending);
+  assert.doesNotMatch(html, /author-html/);
+  assert.match(html, /author-page\.html/);
+  assert.match(html, /anyone holding the link/);
+  assert.match(html, /Includes author page/);
+});
+
+test('Version and Audience labels stack their select with a gap instead of butting against it', () => {
+  const html = renderShareForm(formState());
+  assert.match(html, /<label style="display:inline-flex;flex-direction:column;gap:4px">Version<select/);
+  assert.match(html, /<label style="display:inline-flex;flex-direction:column;gap:4px">Audience<select/);
+});
+
+test('form labels carry no inline display, so the design system stacks caption over control with a gap', () => {
+  for (const audience of ['private', 'lab', 'public']) {
+    const html = renderShareForm(formState({ audience }));
+    assert.doesNotMatch(html, /<label style="display:block"/, audience);
+  }
+  assert.match(renderShareForm(formState({ audience: 'public' })), /<label>Expires after/);
 });

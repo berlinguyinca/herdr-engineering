@@ -175,7 +175,9 @@ class PostgresSource(DurableSource):
     def __init__(self, conn: Any = None, *, run: Callable | None = None,
                  events_table: str = "fabric_events", dsn: str | None = None,
                  use_checkpoints: bool = True, checkpoint_publish: bool = False,
-                 inspector_snapshots: bool = False):
+                 inspector_snapshots: bool = False,
+                 checkpoint_lock_wait: float = 0.0,
+                 checkpoint_budgets: Any = None):
         self._owned_runner = None
         if run is None:
             self._owned_runner = _LoopRunner()
@@ -190,6 +192,8 @@ class PostgresSource(DurableSource):
         self._query_lock = threading.RLock()
         self.checkpoint_enabled = bool(use_checkpoints and dsn and events_table == 'fabric_events')
         self.checkpoint_publish = checkpoint_publish
+        self.checkpoint_lock_wait = checkpoint_lock_wait
+        self.checkpoint_budgets = checkpoint_budgets  # None = projection_recovery defaults
         self.recovery_info = None
         self._history_provider = None
 
@@ -309,7 +313,12 @@ class PostgresSource(DurableSource):
                 f"SELECT count(*) FROM {self._events_table} WHERE entity_type = 'inspector' AND entity_id IS NOT NULL "
                 "AND entity_id <> '' AND sequence <= $1", int(row["watermark"]))
             row["covered_count"] = int(covered)
-            if int(covered) != int(row["event_count"]):
+            archived = 0
+            if self._events_table == "fabric_events":
+                from .inspector_snapshot import archived_inspector_count
+                archived = await archived_inspector_count(conn, int(row["watermark"]))
+            row["archived_count"] = archived      # rows the archive job moved out; the snapshot consumed them
+            if int(covered) + archived != int(row["event_count"]):
                 return row, None
             row["skipped_upto"] = int(row["watermark"])
             return row, int(row["watermark"])

@@ -53,6 +53,13 @@ def _build_parser() -> argparse.ArgumentParser:
         cp.add_argument("--dry-run", action="store_true")
         cp.set_defaults(func=_cmd_build_cleanup)
 
+    from .build_cache_report_cli import register as register_build_cache_report
+    register_build_cache_report(sub)
+
+    p = sub.add_parser("cargo-host", help="install or inspect harness-neutral Cargo caching")
+    p.add_argument("arguments", nargs=argparse.REMAINDER)
+    p.set_defaults(func=_cmd_cargo_host)
+
     from .open_client import register_parser
     register_parser(sub)
 
@@ -230,6 +237,15 @@ def _build_parser() -> argparse.ArgumentParser:
     rp = rsub.add_parser("status", help="show the room, agent, rights and expiry from the state file")
     rp.add_argument("--config", required=True)
     rp.set_defaults(func=_cmd_relay_status)
+    # fabric ---------------------------------------------------------------
+    p = sub.add_parser("fabric", help="fabric trust helpers (control_plane.collab.fabric_trust)")
+    fasub = p.add_subparsers(dest="fabric_command", required=True)
+    fp = fasub.add_parser("whois-proxy", help="serve ONLY `GET /whois?addr=<tailnet ip>` on a unix socket (0660) by asking tailscaled; "
+                          "mounted read-only into the isolated collab-public container instead of the tailscaled socket")
+    fp.add_argument("--listen-socket", required=True, help="unix socket to create (its directory is what the container mounts)")
+    fp.add_argument("--tailscaled-socket", action="append", default=[],
+                    help="tailscaled LocalAPI socket (default: /var/run/tailscale/tailscaled.sock, /run/tailscale/tailscaled.sock)")
+    fp.set_defaults(func=_cmd_fabric_whois_proxy)
     # bridge ---------------------------------------------------------------
     p = sub.add_parser("bridge", help="Rakazo mobile bridge helpers (control_plane.rakazo_bridge)")
     bsub = p.add_subparsers(dest="bridge_command", required=True)
@@ -246,6 +262,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _register_google(sub)
     from .fleet_watch.cli import register as _register_fleet_watch
     _register_fleet_watch(sub)
+    from .settings_cli import register as _register_settings
+    _register_settings(sub)
 
     # fleet ----------------------------------------------------------------
     p = sub.add_parser("fleet", help="one-command fleet onboarding + version sync")
@@ -284,6 +302,7 @@ def _build_parser() -> argparse.ArgumentParser:
                       ("revoke", "remove a host (its token stops working); backup first"),
                       ("render-compose", "write the compose env file (0600)"),
                       ("render-collab", "write the collab container's config slice (0600)"),
+                      ("fabric-listener", "print `HOST PORT` of control_plane.collab.fabric_trust's dedicated listener (nothing when not configured)"),
                       ("render-llm", "write the llm-proxy container's config slice (0600)"),
                       ("render-share", "write the share-public container's config slice (0600)"),
                       ("render-edge", "write the collab edge's nginx.conf (with /s/ when shares are enabled)")):
@@ -351,6 +370,8 @@ def _build_parser() -> argparse.ArgumentParser:
     pu.add_argument("--no-pull", action="store_true", help="skip controller git pull")
     pu.add_argument("--no-reinstall", action="store_true",
                     help="skip controller local pip reinstall")
+    pu.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
+                    help="central fleet config file holding control_plane.agent_rules (the pinned shared rules)")
     pu.add_argument("--json", action="store_true")
     pu.set_defaults(func=_cmd_fleet_update)
     ps = fsub.add_parser("status", help="read-only fleet version/registration status")
@@ -360,6 +381,8 @@ def _build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--control-plane", default=None,
                     help="control plane URL (default: host.json control_plane_url)")
     pd.add_argument("--host", help="only this host")
+    pd.add_argument("--api-key-file", default=None,
+                    help="file (mode 0600) holding a viewer-role X-API-Key (default: this host's agent/ingest key)")
     pd.add_argument("--json", action="store_true")
     pd.set_defaults(func=_cmd_fleet_drift)
 
@@ -406,6 +429,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--mime", default="application/octet-stream")
     p2.add_argument("--session", default=None)
     p2.add_argument("--mission", default=None)
+    p2.add_argument("--api-key-file", default=None,
+                    help="file (mode 0600) holding the X-API-Key; a bare POST /artifacts needs the operator role")
     p2.set_defaults(func=_cmd_art_upload)
     asub.add_parser("list", help="list stored artifacts").set_defaults(func=_cmd_art_list)
     p2 = asub.add_parser("retention", help="enforce retention policy")
@@ -434,6 +459,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--out", default=None, help="output .html path (default: <graph_json>.html)")
     p2.set_defaults(func=_cmd_graph_artifact_render)
 
+    # handoff --------------------------------------------------------------
+    p = sub.add_parser("handoff", help="/handoff skill helpers (the envelope and launch live in herdr-handoff)")
+    hsub = p.add_subparsers(dest="handoff_command", required=True)
+    p2 = hsub.add_parser("harness", help="print the harness running this session (exit 2 when undetectable)")
+    p2.add_argument("--harness", default=None, help="skip detection and validate this name")
+    p2.add_argument("--proc-root", default="/proc", help=argparse.SUPPRESS)
+    p2.set_defaults(func=_cmd_handoff_harness)
+
     # summary --------------------------------------------------------------
     p = sub.add_parser("summary", help="/summary skill: install, verify, remove, read session history")
     smsub = p.add_subparsers(dest="summary_command", required=True)
@@ -446,8 +479,16 @@ def _build_parser() -> argparse.ArgumentParser:
         p2.add_argument("--project-dir", default=None, help="project root for --scope project (default: cwd)")
         if name != "verify":
             p2.add_argument("--dry-run", action="store_true")
+        if name == "install":
+            p2.add_argument("--check", action="store_true",
+                            help="read-only: verify skills, OpenCode command, fabric listener and hook state; exit 1 on a failure")
+        p2.add_argument("--skill", choices=("summary", "handoff", "herdr-join", "all"), default="all",
+                        help="which skill to manage (default: /summary, /handoff and /herdr::join)")
         p2.add_argument("--json", action="store_true")
         p2.set_defaults(func=_cmd_summary_manage)
+    p2 = smsub.add_parser("join-hook", help="session-start hook body (opt-in): join the HerdR workspace room; never fails")
+    p2.add_argument("harness", choices=("claude", "codex", "opencode", "pi"))
+    p2.set_defaults(func=lambda a: __import__("herdr_engineering.fabric_join_setup", fromlist=["x"]).run_join_hook(a.harness))
     p2 = smsub.add_parser("history", help="read-only normalized history of the current agent session")
     p2.add_argument("--agent", choices=("claude", "pi", "codex", "opencode"), default=None)
     p2.add_argument("--session", default=None, help="session id or transcript path")
@@ -802,6 +843,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = csub.add_parser("checkpoint", help="prewarm durable projection checkpoints")
     p2.add_argument("--fleet-config", required=True)
     p2.add_argument("--migrations", default=None)
+    p2.add_argument("--lock-wait", type=float, default=0.0, metavar="SECONDS",
+                    help="keep retrying for up to SECONDS when another materializer (the worker's "
+                         "periodic refresh) holds the checkpoint lock; default 0 fails at once")
     p2.set_defaults(func=_cmd_cp_checkpoint)
     p2 = csub.add_parser("collab-repair", help="set aside foreign rows of the collaboration log (dry run by default; "
                          "never deletes: rows move to a quarantine file/table)")
@@ -870,6 +914,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--control-plane", default=None, help="status|check: control-plane base URL (default: host.json)")
     p2.add_argument("--api-key-file", default=None, help="status|check: PATH to a file holding an operator API key")
     p2.set_defaults(func=_cmd_cp_assistant_judge)
+    p2 = csub.add_parser("assistant-slack", help="register the Slack bot/app tokens, or show local token-file status")
+    p2.add_argument("action", choices=["register", "status"])
+    p2.add_argument("--base-url", default="https://slack.com/api", help="register: the Slack Web API base URL (https; http only for loopback)")
+    p2.add_argument("--bot-token-file", default=None, help="absolute PATH of the 0600 bot token file (xoxb-)")
+    p2.add_argument("--app-token-file", default=None, help="absolute PATH of the 0600 app-level token file (xapp-)")
+    p2.add_argument("--key-stdin", action="store_true",
+                    help="register: read the bot token then the app token from stdin, one per line (the only way; never argv)")
+    p2.set_defaults(func=_cmd_cp_assistant_slack)
     p2 = csub.add_parser("web", help="serve the control-plane UI + /api/v1 + SSE")
     p2.add_argument("--host", default="127.0.0.1",
                     help="bind host (default 127.0.0.1; private-by-default)")
@@ -947,6 +999,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--collab-artifacts-outbox", default=None,
                     help="with --collab-only: the outbox directory collab-public writes intents and staging into "
                          "(see --collab-artifacts-mirror)")
+    p2.add_argument("--collab-fabric-bind-host", default=None,
+                    help="with control_plane.collab.fabric_trust.listen_host: the address this process binds for the fabric listener "
+                         "when it cannot own the tailnet address itself (inside a container whose published port lands here, e.g. "
+                         "0.0.0.0). Omit it to bind listen_host directly (host network)")
     p2.add_argument("--collab-operator-port", type=int, default=None,
                     help="with --collab-only: also serve the collaboration API WITHOUT sign-in on this "
                          "port, as --collab-operator-user, for the local owner's dashboard (publish it "
@@ -1033,6 +1089,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="control-plane base URL")
     p2.add_argument("--upstream", default=None,
                     help="upstream base URL (default: llm.upstream_url from the fleet config)")
+    p2.add_argument("--control-plane-key-file", default=None, metavar="PATH",
+                    help="optional 0600 file holding an API key sent as X-API-Key (default: "
+                         "control_plane.llm_proxy.control_plane_key_file; absent = no header)")
     p2.add_argument("--fleet-config", default="~/.config/herdr-engineering/llm-proxy/llm-config.json",
                     help="the llm slice of the central fleet file (`fleet config render-llm`): llm.upstream_key/upstream_url and "
                          "control_plane.llm_proxy tuning (the only source of configuration)")
@@ -1040,6 +1099,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = csub.add_parser("llm-gateway-sync",
                          help="keep project keys rendered as sha256-only gateway principals")
     p2.add_argument("--control-plane", default="http://control-plane-web:8080")
+    p2.add_argument("--control-plane-key-file", default=None, metavar="PATH",
+                    help="optional file (mode 0600) holding an API key sent as X-API-Key; absent = no header")
     p2.add_argument("--principals-file", required=True,
                     help="file the gateway reads as auth.client_principals_file (written 0600)")
     p2.add_argument("--interval", type=float, default=5.0)
@@ -1048,6 +1109,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = csub.add_parser("llm-gateway-usage",
                          help="report the gateway's per-key token usage to the control plane")
     p2.add_argument("--control-plane", default="http://control-plane-web:8080")
+    p2.add_argument("--control-plane-key-file", default=None, metavar="PATH",
+                    help="optional file (mode 0600) holding an API key sent as X-API-Key; absent = no header")
     p2.add_argument("--gateway", required=True, help="gateway or relay base URL")
     p2.add_argument("--usage-path", default="/v1/admin/usage",
                     help="usage route: /v1/admin/usage on a gateway, /api/usage on a relay")
@@ -1057,6 +1120,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--interval", type=float, default=30.0)
     p2.add_argument("--once", action="store_true", help="report once and exit")
     p2.set_defaults(func=_cmd_cp_llm_gateway_usage)
+    p2 = csub.add_parser("dashboard-proxy",
+                         help="same-origin proxy that injects viewer/operator API keys for the browser dashboard")
+    p2.add_argument("--fleet-config", required=True,
+                    help="central fleet file; reads control_plane.dashboard_proxy (key files, upstream, allowlist)")
+    p2.add_argument("--host", default="0.0.0.0")
+    p2.add_argument("--port", type=int, default=8081)
+    p2.set_defaults(func=_cmd_cp_dashboard_proxy)
 
     return parser
 
@@ -1204,6 +1274,9 @@ def _cmd_cp_llm_proxy(args) -> int:
             raise FleetConfigError("control_plane.llm_proxy must be a mapping")
         max_inflight = int(tuning.get("max_inflight", DEFAULT_MAX_INFLIGHT))
         wait_seconds = float(tuning.get("queue_wait_seconds", DEFAULT_QUEUE_WAIT_SECONDS))
+        key_file = args.control_plane_key_file or tuning.get("control_plane_key_file") or None
+        if key_file is not None and not isinstance(key_file, str):
+            raise FleetConfigError("control_plane.llm_proxy.control_plane_key_file must be a path string")
     except (FleetConfigError, OSError, ValueError, TypeError) as exc:
         print(f"--fleet-config {path}: {exc}", file=sys.stderr)
         return 2
@@ -1213,12 +1286,10 @@ def _cmd_cp_llm_proxy(args) -> int:
         print("fleet config llm.upstream_key and llm.upstream_url are required", file=sys.stderr)
         return 2
     httpd = serve(args.host, args.port, args.control_plane, upstream, key,
-                  max_inflight=max_inflight, wait_seconds=wait_seconds)
+                  max_inflight=max_inflight, wait_seconds=wait_seconds, control_key_file=key_file)
     print(f"llm-proxy listening on {args.host}:{httpd.server_address[1]}", flush=True)
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    from .llm_proxy import run_until_stopped
+    run_until_stopped(httpd)
     return 0
 
 
@@ -1227,7 +1298,7 @@ def _cmd_cp_llm_gateway_sync(args) -> int:
 
     from .llm_gateway_bridge import run, sync_once
     from .llm_proxy import ControlPlaneClient
-    control = ControlPlaneClient(args.control_plane)
+    control = ControlPlaneClient(args.control_plane, key_file=args.control_plane_key_file)
     path = Path(args.principals_file).expanduser()
     if args.once:
         return 1 if sync_once(control, path) is None else 0
@@ -1243,7 +1314,7 @@ def _cmd_cp_llm_gateway_usage(args) -> int:
 
     from .llm_gateway_usage import fetch_usage, run, sync_once
     from .llm_proxy import ControlPlaneClient
-    control = ControlPlaneClient(args.control_plane)
+    control = ControlPlaneClient(args.control_plane, key_file=args.control_plane_key_file)
     secret_path = Path(args.admin_secret_file).expanduser()
 
     def fetch():  # re-read each pass so a rotated secret is picked up
@@ -1254,6 +1325,30 @@ def _cmd_cp_llm_gateway_usage(args) -> int:
         return 1 if sync_once(control, fetch, state) is None else 0
     try:
         run(control, fetch, state, interval=args.interval)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def _cmd_cp_dashboard_proxy(args) -> int:
+    """Serve the browser-facing key-injecting proxy; exit 2 when unconfigured or a key file is unsafe."""
+    from .control_plane.dashboard_proxy import (
+        ProxyConfigError,
+        build_from_settings,
+        parse_dashboard_proxy,
+    )
+    _store, cp = _load_cp_fleet_config(args.fleet_config)
+    try:
+        settings = parse_dashboard_proxy(cp.get("dashboard_proxy"))
+        if settings is None:
+            print("dashboard-proxy: control_plane.dashboard_proxy.viewer_key_file is not configured", file=sys.stderr)
+            return 2
+        proxy = build_from_settings(settings, args.host, args.port)
+    except (ValueError, ProxyConfigError) as exc:
+        print(f"dashboard-proxy: {exc}", file=sys.stderr)
+        return 2
+    try:
+        proxy.serve()
     except KeyboardInterrupt:
         pass
     return 0
@@ -1298,16 +1393,46 @@ def _cmd_doctor(args) -> int:
     return doctor_main(args)
 
 
+def _cmd_handoff_harness(args) -> int:
+    from . import handoff_harness as hh
+    try:
+        found = hh.detect(explicit=args.harness, proc=Path(args.proc_root))
+    except hh.Undetectable as exc:
+        _print_json({"ok": False, "error": str(exc), "options": list(hh.HARNESSES)})
+        return 2
+    _print_json(found.to_dict())
+    return 0
+
+
 def _cmd_summary_manage(args) -> int:
+    from . import fabric_join_setup as fj
     from . import session_summary as ss
-    kw = dict(scope=args.scope, home=Path(args.home) if args.home else None,
-              project=Path(args.project_dir) if args.project_dir else None)
+    home = Path(args.home) if args.home else None
+    kw = dict(scope=args.scope, home=home, project=Path(args.project_dir) if args.project_dir else None)
+    skills = ss.SKILLS if args.skill == "all" else (args.skill,)
+    check = getattr(args, "check", False)
     ok = True
-    if args.summary_command == "verify":
-        ok, results = ss.verify(**kw)
-    else:
-        fn = ss.install if args.summary_command == "install" else ss.uninstall
-        results = fn(dry_run=args.dry_run, **kw)
+    results = []
+    for skill in skills:
+        if args.summary_command == "verify" or check:
+            good, part = ss.verify(skill=skill, **kw)
+            ok = ok and good
+        else:
+            fn = ss.install if args.summary_command == "install" else ss.uninstall
+            part = fn(dry_run=args.dry_run, skill=skill, **kw)
+        results += part
+    if "herdr-join" in skills and args.scope == "global":
+        dry = getattr(args, "dry_run", False)
+        if check:
+            extra = fj.check_setup(home)
+            ok = ok and not any(i.action in fj.FAIL_ACTIONS for i in extra)
+        elif args.summary_command == "install":
+            extra = [fj.install_listener(home, dry_run=dry), *fj.reconcile_hooks(home, dry_run=dry), *fj.reconcile_codex_rule(home, dry_run=dry)]
+        elif args.summary_command == "uninstall":
+            extra = [*fj.uninstall_hooks(home, dry_run=dry), *fj.uninstall_codex_rule(home, dry_run=dry)]
+        else:
+            extra = []
+        results += [ss.Result(i.target, i.action, i.detail) for i in extra]
     if args.json:
         _print_json({"ok": ok, "results": [r.to_dict() for r in results]})
     else:
@@ -1501,6 +1626,7 @@ def _cmd_fleet_join(args) -> int:
         attach=not args.no_attach,
         provision=not args.no_provision,
         fleet_config=None if args.no_credentials else Path(args.fleet_config).expanduser(),
+        agent_rules_config=Path(args.fleet_config).expanduser(),
         roles=([r.strip() for r in args.roles.split(",") if r.strip()] if args.roles else None),
         control_plane_url=args.control_plane_url,
     )
@@ -1567,6 +1693,10 @@ def _cmd_fleet_config(args) -> int:
         elif cmd == "render-collab":
             fcc.render_collab(load_fleet_config(path), Path(args.out).expanduser())
             print(f"wrote {args.out} (0600)")
+        elif cmd == "fabric-listener":
+            listener = fcc.fabric_listener(load_fleet_config(path))
+            if listener:
+                print(f"{listener[0]} {listener[1]}")
         elif cmd == "render-llm":
             fcc.render_llm(load_fleet_config(path), Path(args.out).expanduser())
             print(f"wrote {args.out} (0600)")
@@ -1610,6 +1740,7 @@ def _cmd_fleet_update(args) -> int:
         gateway=DEFAULT_GATEWAY,
         pull_controller=not args.no_pull,
         reinstall_local=not args.no_reinstall,
+        fleet_config=Path(args.fleet_config).expanduser(),
     )
     if args.json:
         _print_json(report)
@@ -1624,7 +1755,8 @@ def _cmd_fleet_update(args) -> int:
         for h in report.get("status", {}).get("hosts", []):
             print(f"  {h['host']:12} herdr-eng={h['herdr_eng']} build-gate={h['build_gate']} "
                   f"agent={h['agent']} revision={h.get('revision', 'unknown')} "
-                  f"cleanup={h.get('cleanup', 'unknown')} summary={h.get('summary', 'unknown')}")
+                  f"cleanup={h.get('cleanup', 'unknown')} summary={h.get('summary', 'unknown')} "
+                  f"rules={h.get('rules', 'unknown')}")
         fs = report.get("steps", {}).get("fleet_sync", {})
         if fs.get("rc") != 0 and fs.get("stderr"):
             print(f"  !! {fs['stderr']}")
@@ -1700,13 +1832,25 @@ def _cmd_fleet_drift(args) -> int:
     import urllib.request
 
     from .fleet import plan_version_sync
-    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+    from .host_config import (
+        HostConfigUnavailable,
+        exit_unavailable,
+        resolve_api_key,
+        resolve_control_plane,
+    )
     try:
         base = resolve_control_plane(args.control_plane)
     except HostConfigUnavailable as exc:
         return exit_unavailable(exc)
     try:
-        with urllib.request.urlopen(f"{base}/api/v1/fleet/inventory", timeout=10) as response:
+        key = resolve_api_key(base, args.api_key_file, explicit_url=bool(args.control_plane))
+    except ValueError as exc:
+        print(f"could not read fleet inventory: {exc}", file=sys.stderr)
+        return 2
+    inventory = urllib.request.Request(f"{base}/api/v1/fleet/inventory",
+                                       headers={"X-API-Key": key} if key else {})
+    try:
+        with urllib.request.urlopen(inventory, timeout=10) as response:
             matrix = json.loads(response.read(4 * 1024 * 1024))
     except (OSError, ValueError) as exc:
         print(f"could not read fleet inventory from {base}: {exc}", file=sys.stderr)
@@ -1787,35 +1931,6 @@ def _cmd_art_publish(args) -> int:
     return 0 if res.ok else 1
 
 
-def _cmd_art_upload(args) -> int:
-    import urllib.request
-    from pathlib import Path
-    from urllib.parse import urlencode
-
-    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
-    try:
-        base = resolve_control_plane(args.control_plane)
-    except HostConfigUnavailable as exc:
-        return exit_unavailable(exc)
-    path = Path(args.data)
-    query = {"filename": args.filename or path.name, "mime": args.mime}
-    if args.session:
-        query["session_id"] = args.session
-    if args.mission:
-        query["mission_id"] = args.mission
-    req = urllib.request.Request(f"{base}/api/v1/artifacts?{urlencode(query)}",
-                                 data=path.read_bytes(), method="POST",
-                                 headers={"Content-Type": args.mime})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            payload = json.loads(response.read(8 * 1024 * 1024))
-    except (OSError, ValueError) as exc:
-        print(f"artifact upload failed: {exc}", file=sys.stderr)
-        return 1
-    _print_json(payload)
-    return 0
-
-
 def _cmd_graph_artifact_render(args) -> int:
     """Render a graph snapshot JSON file (GraphProjection.snapshot() shape) to
     a deterministic sanitized HTML artifact (system-graph P5).
@@ -1840,12 +1955,22 @@ def _cmd_art_upload(args) -> int:
     from pathlib import Path
     from urllib.parse import urlencode
 
-    from .host_config import HostConfigUnavailable, exit_unavailable, resolve_control_plane
+    from .host_config import (
+        HostConfigUnavailable,
+        exit_unavailable,
+        resolve_api_key,
+        resolve_control_plane,
+    )
 
     try:
         base = resolve_control_plane(args.control_plane)
     except HostConfigUnavailable as exc:
         return exit_unavailable(exc)
+    try:
+        key = resolve_api_key(base, args.api_key_file, explicit_url=bool(args.control_plane))
+    except ValueError as exc:
+        print(f"artifact upload failed: {exc}", file=sys.stderr)
+        return 2
     path = Path(args.data)
     query = {"filename": args.filename or path.name, "mime": args.mime}
     if args.session:
@@ -1854,7 +1979,7 @@ def _cmd_art_upload(args) -> int:
         query["mission_id"] = args.mission
     req = urllib.request.Request(
         f"{base}/api/v1/artifacts?{urlencode(query)}", data=path.read_bytes(),
-        method="POST", headers={"Content-Type": args.mime})
+        method="POST", headers={"Content-Type": args.mime, **({"X-API-Key": key} if key else {})})
     try:
         with urllib.request.urlopen(req, timeout=60) as response:
             payload = json.loads(response.read(8 * 1024 * 1024))
@@ -2829,6 +2954,11 @@ def _cmd_dev_gateway(args) -> int:
     return 0
 
 
+def _cmd_cargo_host(args) -> int:
+    from .cargo_host import main
+    return main(args.arguments)
+
+
 def _cmd_build_coordinate(args) -> int:
     """Run a build command under the per-host single-flight build gate.
 
@@ -3048,6 +3178,7 @@ def _cmd_dev_agent(args) -> int:
             web_port_min=int(fabric_cfg.get("agent_web_port_min", 1024)),
             ephemeral_min=int(fabric_cfg.get("agent_ephemeral_min", 32768)),
             control_plane_url=control_plane_for(live),
+            api_key=live.api_key or "",
             fabric_domains=tuple(dict.fromkeys([d for d in (fabric_cfg.get("acme_domain"), fabric_cfg.get("url_base"),
                                                             *(fabric_cfg.get("url_aliases") or [])) if d])),
             host_report_interval=float(fabric_cfg.get("host_report_interval", 30.0)),
@@ -3060,18 +3191,20 @@ def _cmd_dev_agent(args) -> int:
         _print_json({"ok": True, **summary})
         return 0
     refresher = ConfigRefresher(live)
-    seen = {"fabric": (live.get("fabric.url"), live.get("fabric.token")), "cp": control_plane_for(live)}
+    seen = {"fabric": (live.get("fabric.url"), live.get("fabric.token")), "cp": control_plane_for(live),
+            "key": live.api_key or ""}
 
     def follow_config() -> None:
         """Rebuild the gateway client / control-plane URL when a fresh fetch changed them."""
         fresh = refresher.current()  # raises HostConfigUnavailable(revoked=True)
         fab = (fresh.get("fabric.url"), fresh.get("fabric.token"))
         cp = control_plane_for(fresh)
-        if fab == seen["fabric"] and cp == seen["cp"]:
+        key = fresh.api_key or ""
+        if fab == seen["fabric"] and cp == seen["cp"] and key == seen["key"]:
             return
         new_base = gateway_url_from_config(cfg, fabric_url=fab[0] or "") or base
-        agent.retarget(FabricClient(new_base, fab[1] or None), cp)
-        seen["fabric"], seen["cp"] = fab, cp
+        agent.retarget(FabricClient(new_base, fab[1] or None), cp, key)
+        seen["fabric"], seen["cp"], seen["key"] = fab, cp, key
 
     try:
         agent.run(after_cycle=follow_config)
@@ -3725,6 +3858,81 @@ def _cmd_cp_assistant_judge(args) -> int:
     return 1
 
 
+def _assistant_slack_register(args) -> int:
+    """``assistant-slack register``: both tokens come from stdin only (bot first) and are never printed. 0/1/2."""
+    from .control_plane.assistant_hub.slack_register import (
+        MAX_KEY_CHARS,
+        SlackRegisterError,
+        register_tokens,
+    )
+
+    if not (args.bot_token_file and args.app_token_file and args.key_stdin):
+        print("assistant-slack register needs --bot-token-file, --app-token-file and --key-stdin (tokens are never "
+              "taken from argv)", file=sys.stderr)
+        return 2
+    if sys.stdin.isatty():
+        import getpass
+        lines = [getpass.getpass("Slack bot token (xoxb-): "), getpass.getpass("Slack app token (xapp-): ")]
+    else:
+        lines = sys.stdin.read(2 * MAX_KEY_CHARS + 4).splitlines()
+    tokens = [line.strip() for line in lines if line.strip()]
+    if len(tokens) != 2 or any(any(c.isspace() for c in t) for t in tokens):
+        print("assistant-slack register failed: need exactly two tokens on stdin (bot token, then app token), one per line",
+              file=sys.stderr)
+        return 2
+    try:
+        done = register_tokens(args.base_url, args.bot_token_file, args.app_token_file, tokens[0], tokens[1])
+    except SlackRegisterError as exc:
+        print(f"assistant-slack register failed: {exc.code}", file=sys.stderr)
+        return 1
+    print(f"registered: bot_fingerprint={done.bot_fingerprint} app_fingerprint={done.app_fingerprint} "
+          f"team={_tty_safe(done.team) or '-'} bot_user_id={_tty_safe(done.bot_user_id) or '-'}")
+    print("next: add bot_token_file, app_token_file and owner_user_id to control_plane.personal_assistant.slack in your "
+          "fleet YAML (this command does not edit it) and set enabled: true.")
+    return 0
+
+
+def _slack_file_state(label: str, path: str) -> tuple[bool, str]:
+    """One status line for a token file; reads it only to fingerprint it, never prints its text."""
+    import stat as _stat
+    from pathlib import Path
+
+    from .control_plane.assistant_hub.slack_register import fingerprint
+
+    p = Path(path)
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return False, f"{label}: missing path={_tty_safe(path)}"
+    except OSError as exc:
+        return False, f"{label}: unreadable ({_tty_safe(exc.strerror)}) path={_tty_safe(path)}"
+    if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISREG(st.st_mode):
+        return False, f"{label}: not a regular file path={_tty_safe(path)}"
+    if _stat.S_IMODE(st.st_mode) & 0o077:
+        return False, f"{label}: unsafe mode {_stat.S_IMODE(st.st_mode):04o} (want 0600) path={_tty_safe(path)}"
+    try:
+        token = p.read_text(encoding="ascii").strip()
+    except (OSError, ValueError):
+        return False, f"{label}: unreadable path={_tty_safe(path)}"
+    if not token:
+        return False, f"{label}: empty path={_tty_safe(path)}"
+    return True, f"{label}: ok fingerprint={fingerprint(token)} path={_tty_safe(path)}"
+
+
+def _cmd_cp_assistant_slack(args) -> int:
+    """``control-plane assistant-slack register|status``: 0 ok, 1 failure, 2 usage. ``status`` is local only."""
+    if args.action == "register":
+        return _assistant_slack_register(args)
+    if not (args.bot_token_file and args.app_token_file):
+        print("assistant-slack status needs --bot-token-file and --app-token-file", file=sys.stderr)
+        return 2
+    ok_bot, line_bot = _slack_file_state("bot_token", args.bot_token_file)
+    ok_app, line_app = _slack_file_state("app_token", args.app_token_file)
+    print(line_bot)
+    print(line_app)
+    return 0 if ok_bot and ok_app else 1
+
+
 def _cmd_cp_assistant_hub_owner(args) -> int:
     """``control-plane assistant-action list|approve|deny`` and ``assistant-grant list|revoke|activate``.
 
@@ -3960,7 +4168,9 @@ def _cmd_cp_checkpoint(args) -> int:
         asyncio.run(migrate())
         stage = 'materialization'
         result = refresh_checkpoint(dsn, host_aliases=_host_aliases_from(cp),
-                                    inspector_limits=cp.get("inspector_limits") or {})
+                                    inspector_limits=cp.get("inspector_limits") or {},
+                                    checkpoint_budgets=_checkpoint_budgets_from(cp),
+                                    lock_wait=max(0.0, getattr(args, "lock_wait", 0.0) or 0.0))
     except (Exception, SystemExit) as exc:
         error = {"ok": False, "error": type(exc).__name__, "stage": stage}
         if isinstance(exc, CheckpointInvalid):
@@ -4123,6 +4333,34 @@ def _member_admin_wiring(cp: dict, dsn: str | None):
     return artifact_adapter.SyncArtifactAdapter(create)
 
 
+def _library_wiring(dsn: str | None):
+    """The dashboard artifact library (adapter over ``LibraryStore`` on its own small pool) when a DSN exists, else None."""
+    if not dsn:
+        return None
+    from .control_plane.artifact_library_api import make_library_adapter
+
+    async def pool():
+        import asyncpg
+        return await asyncpg.create_pool(dsn, min_size=1, max_size=3)
+
+    try:
+        return make_library_adapter(pool)
+    except RuntimeError as exc:  # database unreachable at start: the library routes answer 503, the dashboard still starts
+        print(f"warning: artifact library unavailable ({exc.__cause__ or exc})", file=sys.stderr)
+        return None
+
+
+def _library_viewers(cp) -> dict[str, str]:
+    """``control_plane.artifact_library.viewers`` (YAML only): ``{"key:<digest>": "<member id>"}``, the dashboard keys that
+    read a member's library.  A malformed entry stops the start (it would silently show the wrong library)."""
+    from .control_plane.artifact_library_api import parse_library_viewers
+    section = cp.get("artifact_library") if isinstance(cp, dict) else None
+    try:
+        return parse_library_viewers(section.get("viewers") if isinstance(section, dict) else None)
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+
+
 def _collab_grant_wiring(cp: dict, dsn: str | None):
     """(grant store adapter, enabled) when control_plane.collab_artifacts.enabled is exactly true and a DSN exists, else
     (None, False). The owner routes for collaborators, activity and diffs use the adapter's call path."""
@@ -4260,7 +4498,8 @@ def _cmd_cp_web(args) -> int:
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
     _require_durable_review_gate(cp, dsn)
-    source = _maybe_pg_source(dsn, inspector_snapshots=_inspector_snapshot_settings(cp)[0])
+    source = _maybe_pg_source(dsn, inspector_snapshots=_inspector_snapshot_settings(cp)[0],
+                              checkpoint_budgets=_checkpoint_budgets_from(cp))
     # When durable storage is wired, attach a write-through sink so every
     # ingested event persists to Postgres instead of dying with the in-memory
     # repo on restart (Phase 1a). Best-effort; never blocks or breaks serving.
@@ -4320,6 +4559,7 @@ def _cmd_cp_web(args) -> int:
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
     annotation_store = _annotation_wiring(cp, dsn)
     member_admin = _member_admin_wiring(cp, dsn)
+    library = _library_wiring(dsn)
     try:
         from .control_plane.artifact_delete_api import owner_digests_config
         artifact_delete = owner_digests_config(cp.get("artifact_delete"))
@@ -4412,7 +4652,12 @@ def _cmd_cp_web(args) -> int:
         collab.team_roles = normalize_team_roles(getattr(args, "collab_team_roles", None))
         from .control_plane.collab_coordinators import normalize_coordinators
         collab.coordinators = normalize_coordinators(getattr(args, "collab_coordinators", None))
+        from .control_plane.collab_fabric_trust import normalize_fabric_trust
+        collab.fabric_trust = normalize_fabric_trust(getattr(args, "collab_fabric_trust", None))
         _wire_collab_switches(collab, switch_store, pinned=frozenset({"replay_history"}) if replay_flag else frozenset())
+    fabric_listen = None
+    if collab is not None and collab.fabric_trust.get("listen_host"):      # slice 6a: startup-only, a restart applies a change
+        fabric_listen = (collab.fabric_trust["listen_host"], collab.fabric_trust["listen_port"])
     from .control_plane.rakazo_bridge import rakazo_bridge_config
     try:
         rakazo_bridge_config(cp.get("rakazo_bridge"))      # an enabled but malformed bridge stops startup here, clearly
@@ -4451,6 +4696,8 @@ def _cmd_cp_web(args) -> int:
                              ci_fix=ci_fix, missions=missions, github_pg_dsn=dsn, ci_log_tests=ci_log_tests,
                              public_port=args.collab_public_port,
                              public_host=args.collab_public_host,
+                             fabric_listen=fabric_listen,
+                             fabric_bind_host=getattr(args, "collab_fabric_bind_host", None),
                              collab_only=args.collab_only,
                              operator_port=args.collab_operator_port,
                              operator_user=args.collab_operator_user,
@@ -4459,11 +4706,15 @@ def _cmd_cp_web(args) -> int:
                              collab_operator_url=args.collab_operator_url,
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
-                             annotation_store=annotation_store, member_admin=member_admin,
+                             annotation_store=annotation_store, member_admin=member_admin, library=library,
+                             library_viewers=_library_viewers(cp),
                              artifact_delete_owners=artifact_delete.digests,
                              artifact_delete_allow_keyless_owner=artifact_delete.allow_keyless,
                              collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled,
                              member_web=member_web)
+    # The constructor ran the boot replay (load_into): return its freed heap to the OS before serving.
+    from .control_plane.heap_release import release_heap_if_enabled
+    release_heap_if_enabled(_heap_release_enabled(cp))
     if artifact_adapter is not None and svr.artifact_graph_gate is not None:
         # the lineage retraction set is server state kept in the registry: reload it before serving a single read
         svr.artifact_graph_gate.load_retractions(artifact_adapter("load_retractions"))
@@ -4485,17 +4736,25 @@ def _cmd_cp_web(args) -> int:
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
                  "host": args.host, "port": args.port,
                  "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})
+    from .control_plane import stall_watch
+    watch = stall_watch.install()
+    logging.info("froze %d boot objects out of garbage collection", stall_watch.freeze_boot_heap())
     try:
         svr.serve()
     except KeyboardInterrupt:
         pass
     finally:
+        watch.stop()
         if hub_server is not None:
             try:
-                hub_server.shutdown()
+                try:
+                    hub_server.shutdown()
+                finally:
+                    if hub_server.hub.judge is not None:
+                        hub_server.hub.judge.recorder.stop()
             finally:
-                if hub_server.hub.judge is not None:
-                    hub_server.hub.judge.recorder.stop()
+                if hub_server.hub.slack is not None:
+                    hub_server.hub.slack.stop()
         svr.shutdown()
         if artifact_bridge is not None:
             artifact_bridge.stop()
@@ -4503,6 +4762,9 @@ def _cmd_cp_web(args) -> int:
             artifact_adapter.close()
         if member_admin is not None:
             member_admin.close()
+        if library is not None:
+            library("close")        # the pool first, then the adapter's loop
+            library.close()
         if share_store is not None:
             share_store.close()
         if annotation_store is not None:
@@ -4664,6 +4926,8 @@ COLLAB_CONFIG_KEYS = {
     "team_roles": ("collab_team_roles", dict),
     # team collaboration slice 3: the coordinator role with limits; external people only behind a second flag; YAML only, off
     "coordinators": ("collab_coordinators", dict),
+    # fabric trust slice 1: which tailnet machines may be recognised as fabric peers; YAML only, off by default
+    "fabric_trust": ("collab_fabric_trust", dict),
     "skills": ("collab_skills", dict),                    # public collaboration skill catalog/config
     "members": ("collab_members", dict),                  # plan 5 member-owned artifacts; YAML only, off by default
     # {room_id, requester_agent_id}: the operator's standing summary-fix room (YAML only, no flag)
@@ -4705,12 +4969,13 @@ def _apply_collab_config(args, cp) -> None:
             from .control_plane.collab_attention import normalize_insights
             from .control_plane.collab_context import normalize_contextual
             from .control_plane.collab_coordinators import normalize_coordinators
+            from .control_plane.collab_fabric_trust import normalize_fabric_trust
             from .control_plane.collab_team_roles import normalize_team_roles
             from .control_plane.collab_team_rooms import normalize_team_rooms
             from .control_plane.collab_workbench import normalize_steering
             try:
                 {"contextual": normalize_contextual, "insights": normalize_insights, "coordinators": normalize_coordinators,
-                 "team_rooms": normalize_team_rooms, "team_roles": normalize_team_roles}.get(key, normalize_steering)(value)
+                 "fabric_trust": normalize_fabric_trust, "team_rooms": normalize_team_rooms, "team_roles": normalize_team_roles}.get(key, normalize_steering)(value)
             except ValueError as exc:
                 raise SystemExit(f"fleet config {exc}") from None
             setattr(args, dest, dict(value))
@@ -4738,6 +5003,7 @@ HOT_COLLAB_SWITCHES = {
     "team_rooms": ("team_rooms_source", "dict"),
     "team_roles": ("team_roles_source", "dict"),
     "coordinators": ("coordinators_source", "dict"),
+    "fabric_trust": ("fabric_trust_source", "dict"),
     "delegation_enabled": ("delegation_source", "bool"),
     "replay_history": ("replay_history_source", "str"),
 }
@@ -4764,12 +5030,13 @@ def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
     from .control_plane.collab_attention import normalize_insights
     from .control_plane.collab_context import normalize_contextual
     from .control_plane.collab_coordinators import normalize_coordinators
+    from .control_plane.collab_fabric_trust import normalize_fabric_trust
     from .control_plane.collab_team_roles import normalize_team_roles
     from .control_plane.collab_team_rooms import normalize_team_rooms
     from .control_plane.collab_workbench import normalize_steering
     normalizers = {"steering": normalize_steering, "contextual": normalize_contextual, "insights": normalize_insights,
                    "team_rooms": normalize_team_rooms, "team_roles": normalize_team_roles,
-                   "coordinators": normalize_coordinators}
+                   "coordinators": normalize_coordinators, "fabric_trust": normalize_fabric_trust}
 
     def check(key, value):
         return normalizers[key](value) if key in normalizers else value
@@ -4984,6 +5251,15 @@ def _maybe_rustfs_client(cp=None):
     return client
 
 
+def _heap_release_enabled(cp) -> bool:
+    """``control_plane.heap_release.enabled`` (default true); a malformed section refuses the start."""
+    from .control_plane.heap_release import heap_release_enabled
+    try:
+        return heap_release_enabled(cp)
+    except ValueError as exc:
+        raise SystemExit(f"fleet config control_plane.{exc}") from None
+
+
 def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
     """``control_plane.inspector_snapshots: {enabled, interval_seconds}`` (off unless ``enabled`` is exactly true)."""
     raw = (cp or {}).get("inspector_snapshots") or {}
@@ -5016,6 +5292,13 @@ def _cmd_relay_status(args):
     left = int(client.state["expires_at"] - time.time())
     print(f"room {client.room_id}, agent {client.agent_id}, can post: {client.can_post}, "
           f"invite expires in {left // 3600} h" if left > 0 else "the invite has expired; ask the room owner for a new one")
+    return 0
+
+
+def _cmd_fabric_whois_proxy(args):
+    from .fabric_access import DEFAULT_SOCKETS
+    from .fabric_whois_proxy import serve
+    serve(args.listen_socket, tuple(args.tailscaled_socket) or DEFAULT_SOCKETS)
     return 0
 
 
@@ -5075,8 +5358,15 @@ def _start_assistant_hub(service):
     from .control_plane.assistant_hub.workers import WorkerRegistry
     registry = WorkerRegistry(service.store, enrollment_ttl=timedelta(seconds=hub_cfg["enrollment_ttl_seconds"]),
                               worker_ttl=timedelta(days=hub_cfg["worker_ttl_days"]))
+    from .control_plane.assistant_hub.slack import SlackRuntime
+    judge = _build_judge_runtime(service)
+    from .control_plane.assistant_hub.preconditions import default_clients
+    clients = default_clients()
+    slack = SlackRuntime(service.store, service, lambda: service.config.get("slack") or {}, service.now, judge=judge,
+                         health=clients.health, preconditions=clients)
     try:
-        server = HubServer(Hub(registry=registry, service=service, store=service.store, judge=_build_judge_runtime(service)),
+        server = HubServer(Hub(registry=registry, service=service, store=service.store,
+                               judge=judge, slack=slack, preconditions=clients),
                            host=hub_cfg["host"],
                            port=hub_cfg["port"], allowed_networks=hub_cfg["allowed_networks"],
                            allowed_hosts=hub_cfg["allowed_hosts"])
@@ -5084,6 +5374,10 @@ def _start_assistant_hub(service):
         raise SystemExit(f"assistant hub cannot start: {type(exc).__name__}: {exc}") from None
     server.start()
     server.hub.judge.recorder.start()          # a thread exists only when the judge is enabled
+    if (service.config.get("slack") or {}).get("enabled") is True:
+        slack.start()                          # Socket Mode link and the ask poster; stopped by the caller
+    else:
+        slack.start_checks()                   # deploy outcome checks do not need Slack; open ones resume here
     return server, registry
 
 
@@ -5095,6 +5389,7 @@ def _wire_assistant_hub(svr):
     hub_server, registry = _start_assistant_hub(service)
     svr.assistant_workers = registry
     svr.assistant_judge = hub_server.hub.judge if hub_server is not None else None   # same runtime as the hub
+    svr.assistant_slack = hub_server.hub.slack if hub_server is not None else None
     return hub_server
 
 
@@ -5133,7 +5428,9 @@ def _fabric_compaction_settings(cp):
         chunk_pause_seconds=number("chunk_pause_seconds", 0.25, 0), max_pass_seconds=number("max_pass_seconds", 300, 10),
         archive_retention_days=retention,
         rebuild_checkpoint=raw.get("rebuild_checkpoint") is not False,
-        keep_checkpoints=int(number("keep_checkpoints", 2, 1)))
+        keep_checkpoints=int(number("keep_checkpoints", 2, 1)),
+        publish_projection_checkpoint=raw.get("publish_projection_checkpoint") is True,
+        projection_lock_wait_seconds=number("projection_lock_wait_seconds", 60, 0))
 
 
 def _share_worker_settings(cp):
@@ -5152,7 +5449,7 @@ def _share_worker_settings(cp):
     return out
 
 
-def _worker_share_housekeeper(fleet_config_path):
+def _worker_share_housekeeper(fleet_config_path, member_runtime=None):
     """The share housekeeper when the fleet file enables shares, else None."""
     from pathlib import Path
 
@@ -5167,7 +5464,8 @@ def _worker_share_housekeeper(fleet_config_path):
     settings = _share_worker_settings(cp)
     if not settings["enabled"]:
         return None
-    return ShareHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"])
+    return ShareHousekeeper(settings["shares_dir"], settings["events_dir"], settings["marker_dir"],
+                            member_runtime=member_runtime)
 
 
 def _worker_annotation_housekeeper(fleet_config_path, mirror=None):
@@ -5209,7 +5507,47 @@ def _worker_fabric_compactor(fleet_config_path):
     except FleetConfigError as exc:
         raise SystemExit(f"--fleet-config: {exc}") from None
     settings = _fabric_compaction_settings(cp)
-    return FabricCompactor(settings) if settings.enabled else None
+    if not settings.enabled:
+        return None
+    publisher = None
+    if settings.publish_projection_checkpoint and cp.get("pg_dsn"):
+        from .control_plane.projection_refresh import refresh_checkpoint
+        dsn, aliases, limits = cp["pg_dsn"], _host_aliases_from(cp), cp.get("inspector_limits") or {}
+        budgets = _checkpoint_budgets_from(cp)
+
+        def publisher(lock_wait):
+            return refresh_checkpoint(dsn, host_aliases=aliases, inspector_limits=limits, lock_wait=lock_wait,
+                                      checkpoint_budgets=budgets)
+    return FabricCompactor(settings, projection_publisher=publisher)
+
+
+def _worker_inspector_archiver(fleet_config_path):
+    """The inspector archiver when the fleet file enables it, else None."""
+    from pathlib import Path
+
+    from .control_plane.inspector_archive import InspectorArchiver, parse_inspector_archive
+    from .fleet_config import FleetConfigError, load_fleet_config
+    if not fleet_config_path or not Path(fleet_config_path).expanduser().exists():
+        return None
+    try:
+        cp = load_fleet_config(Path(fleet_config_path).expanduser()).section("control_plane")
+        settings = parse_inspector_archive(cp.get("inspector_archive"))
+    except FleetConfigError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
+    except ValueError as exc:
+        raise SystemExit(f"fleet config control_plane.{exc}") from None
+    if not settings.enabled:
+        return None
+    publisher = None
+    if settings.publish_projection_checkpoint and cp.get("pg_dsn"):
+        from .control_plane.projection_refresh import refresh_checkpoint
+        dsn, aliases, limits = cp["pg_dsn"], _host_aliases_from(cp), cp.get("inspector_limits") or {}
+        budgets = _checkpoint_budgets_from(cp)
+
+        def publisher(lock_wait):
+            return refresh_checkpoint(dsn, host_aliases=aliases, inspector_limits=limits, lock_wait=lock_wait,
+                                      checkpoint_budgets=budgets)
+    return InspectorArchiver(settings, projection_publisher=publisher)
 
 
 def _artifact_reconcile_settings(cp) -> dict | None:
@@ -5247,7 +5585,16 @@ def _worker_artifact_reconciler(fleet_config_path, rustfs):
     return ArtifactReconciler(lambda conn: ArtifactStore(conn, rustfs), **settings)
 
 
-def _maybe_pg_source(dsn, *, inspector_snapshots=False):
+def _checkpoint_budgets_from(cp):
+    """Validated control_plane.projection_checkpoint row budgets (defaults when absent)."""
+    from .control_plane.projection_recovery import checkpoint_budgets
+    try:
+        return checkpoint_budgets(cp.get("projection_checkpoint"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config {exc}") from None
+
+
+def _maybe_pg_source(dsn, *, inspector_snapshots=False, checkpoint_budgets=None):
     """Build a PostgresSource from a DSN, or None if not provided."""
     if not dsn:
         return None
@@ -5255,7 +5602,8 @@ def _maybe_pg_source(dsn, *, inspector_snapshots=False):
 
     # Lazy: PostgresSource connects on its own persistent event loop when the
     # server first hydrates from Postgres, so connect+fetch share one loop.
-    return PostgresSource(dsn=dsn, inspector_snapshots=inspector_snapshots)
+    return PostgresSource(dsn=dsn, inspector_snapshots=inspector_snapshots,
+                          checkpoint_budgets=checkpoint_budgets)
 
 
 def _worker_snapshot_writer(fleet_config_path):
@@ -5404,7 +5752,11 @@ def _build_collab_bridge_loop(settings: CollabArtifactsSettings, *, mirror, rust
     applier.register_commit()
     register_annotation_resolve(applier)
     register_member_intents(applier)
-    publisher = None if members is None else (lambda conn: publish_member_views(conn, members))
+    publisher = None
+    if members is not None:
+        import dataclasses
+        pooled = dataclasses.replace(members, rustfs=rustfs)     # the view tick fills the library content pool
+        publisher = lambda conn: publish_member_views(conn, pooled)  # noqa: E731
     return cp_worker.CollabBridgeLoop(connect, mirror, applier, members_publisher=publisher)
 
 
@@ -5480,12 +5832,13 @@ def _cmd_cp_worker(args) -> int:
             worker_id = args.host_id or socket.gethostname()
             snapshotter = _worker_snapshot_writer(getattr(args, "fleet_config", None))
             compactor = _worker_fabric_compactor(getattr(args, "fleet_config", None))
-            share_hk = _worker_share_housekeeper(getattr(args, "fleet_config", None))
+            archiver = _worker_inspector_archiver(getattr(args, "fleet_config", None))
+            share_hk = _worker_share_housekeeper(getattr(args, "fleet_config", None), member_runtime)
             reconciler = _worker_artifact_reconciler(getattr(args, "fleet_config", None), rustfs)
             if args.once:
                 return await run_one_pass(conn, worker_id=worker_id,
                                           artifact_job_runner=runner, inspector_snapshotter=snapshotter,
-                                          fabric_compactor=compactor, share_housekeeper=share_hk,
+                                          fabric_compactor=compactor, inspector_archiver=archiver, share_housekeeper=share_hk,
                                           annotation_housekeeper=_worker_annotation_housekeeper(
                                               getattr(args, "fleet_config", None)),
                                           artifact_reconciler=reconciler)
@@ -5520,11 +5873,13 @@ def _cmd_cp_worker(args) -> int:
                 if fleet_cp.get("pg_dsn"):
                     refresh = ProjectionRefresh(
                         fleet_cp["pg_dsn"], host_aliases=_host_aliases_from(fleet_cp),
-                        inspector_limits=fleet_cp.get("inspector_limits") or {})
+                        inspector_limits=fleet_cp.get("inspector_limits") or {},
+                        checkpoint_budgets=_checkpoint_budgets_from(fleet_cp),
+                        heap_release=_heap_release_enabled(fleet_cp))
                     refresh.start()
                 await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
                                  artifact_job_runner=runner, inspector_snapshotter=snapshotter,
-                                 fabric_compactor=compactor, share_housekeeper=share_hk,
+                                 fabric_compactor=compactor, inspector_archiver=archiver, share_housekeeper=share_hk,
                                  annotation_housekeeper=annotation_hk,
                                  artifact_reconciler=reconciler)
             finally:

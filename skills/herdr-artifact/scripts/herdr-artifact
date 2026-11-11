@@ -6,6 +6,41 @@ set -eu
 command=${1:-}
 [ "$#" -gt 0 ] && shift
 
+# Optional X-API-Key. Prints one "X-API-Key: ..." header line (or nothing) for `curl -H @-`, so the key
+# never appears in a process argument list or in output. Source: --api-key-file (must be mode 0600), else
+# this host's agent/ingest key from the cached fleet config when the target is the host's own control plane.
+key_header() {
+  python3 - "$1" "$2" <<'PY'
+import json, os, stat, sys
+base, key_file = sys.argv[1].rstrip("/"), sys.argv[2]
+home = os.path.expanduser("~")
+key = ""
+if key_file:
+    p = os.path.expanduser(key_file)
+    try:
+        st = os.lstat(p)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) & 0o077:
+            raise ValueError("not a regular file with mode 0600")
+        key = open(p, encoding="utf-8").read().strip()
+    except (OSError, ValueError) as exc:
+        sys.stderr.write("api key file refused: %s\n" % exc)
+        sys.exit(3)
+else:
+    try:
+        host = json.load(open(os.path.join(home, ".config/herdr-engineering/host.json")))
+        if str(host["control_plane_url"]).rstrip("/") == base:
+            cache = os.path.join(home, ".cache/herdr-engineering/fleet-config.json")
+            st = os.lstat(cache)
+            if stat.S_ISREG(st.st_mode) and not stat.S_IMODE(st.st_mode) & 0o077:
+                values = json.load(open(cache)).get("values", {})
+                key = values.get("agent", {}).get("api_key") or values.get("ingest", {}).get("api_key") or ""
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        key = ""
+if key:
+    sys.stdout.write("X-API-Key: %s\n" % key)
+PY
+}
+
 case "$command" in
   create|upload)
     exec herdr-eng artifacts upload "$@"
@@ -14,14 +49,17 @@ case "$command" in
     artifact_id=${1:?usage: herdr-artifact history ARTIFACT_ID [--control-plane URL]}
     shift
     base=${HERDR_CONTROL_PLANE_URL:-}
+    key_file=
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --control-plane) base=$2; shift 2 ;;
+        --api-key-file) key_file=$2; shift 2 ;;
         *) break ;;
       esac
     done
     [ -n "$base" ] || { echo "control-plane URL required" >&2; exit 2; }
-    exec curl --fail --silent --show-error \
+    header=$(key_header "$base" "$key_file") || exit 2
+    printf '%s\n' "$header" | curl --fail --silent --show-error -H @- \
       "$base/api/v1/artifacts/$artifact_id/versions"
     ;;
   share-request)
@@ -31,11 +69,13 @@ case "$command" in
     base=${HERDR_CONTROL_PLANE_URL:-}
     audience=unlisted_link
     expires_at=
+    key_file=
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --control-plane) base=$2; shift 2 ;;
         --audience) audience=$2; shift 2 ;;
         --expires-at) expires_at=$2; shift 2 ;;
+        --api-key-file) key_file=$2; shift 2 ;;
         *) echo "unknown share-request option: $1" >&2; exit 2 ;;
       esac
     done
@@ -48,7 +88,8 @@ print(json.dumps({"resource_id": sys.argv[1], "version_id": sys.argv[2],
                   "audience": sys.argv[3], "expires_at": float(sys.argv[4])}))
 PY
 )
-    exec curl --fail --silent --show-error -H 'Content-Type: application/json' \
+    header=$(key_header "$base" "$key_file") || exit 2
+    printf '%s\n' "$header" | curl --fail --silent --show-error -H @- -H 'Content-Type: application/json' \
       -X POST --data "$body" "$base/api/v1/publications/requests"
     ;;
   *)

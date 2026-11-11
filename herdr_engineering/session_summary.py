@@ -24,6 +24,17 @@ VERSION = 1
 # skills/summary in the repo root is a symlink to it for discoverability next to the other skills.
 SOURCE = Path(__file__).resolve().parent / "skill_data" / "summary"
 MANIFEST_NAME = ".summary-manifest.json"
+SKILLS = ("summary", "handoff", "herdr-join")  # only summary has a Pi prompt template (Pi's built-in /handoff owns that name; herdr-join is reached as /herdr::join or the skill)
+HANDOFF_SOURCE = Path(__file__).resolve().parent / "skill_data" / "handoff"
+JOIN_SOURCE = Path(__file__).resolve().parent / "skill_data" / "herdr-join"
+
+
+def _source(skill: str) -> Path:
+    if skill not in SKILLS:
+        raise ValueError(f"unknown skill: {skill}")
+    if skill == "herdr-join":
+        return JOIN_SOURCE
+    return SOURCE if skill == "summary" else HANDOFF_SOURCE  # SOURCE is read late so tests can repoint it
 
 
 @dataclass
@@ -42,30 +53,40 @@ class Layout:
     canonical: Path
     manifest: Path
     skill_links: dict[str, Path]  # agent -> link path
-    pi_prompt: Path
+    pi_prompt: Path | None
     opencode_command: Path
+    name: str = "summary"
     results: list[Result] = field(default_factory=list)
 
 
-def layout(*, scope: str = "global", home: Path | None = None, project: Path | None = None) -> Layout:
+def layout(*, scope: str = "global", home: Path | None = None, project: Path | None = None,
+           skill: str = "summary") -> Layout:
+    _source(skill)
+    manifest_name = MANIFEST_NAME if skill == "summary" else f".{skill}-manifest.json"
+    pi = skill == "summary"
     if scope == "global":
         h = Path(home or Path.home())
-        canonical = h / ".local/share/herdr-engineering/skills/summary"
+        canonical = h / f".local/share/herdr-engineering/skills/{skill}"
         oc_dir = "command" if (h / ".config/opencode/command").is_dir() else "commands"
         return Layout(
-            scope, canonical, canonical.parent / MANIFEST_NAME,
-            {"claude": h / ".claude/skills/summary", "codex": h / ".codex/skills/summary",
-             "pi": h / ".pi/agent/skills/summary", "opencode": h / ".config/opencode/skills/summary"},
-            h / ".pi/agent/prompts/summary.md", h / ".config/opencode" / oc_dir / "summary.md")
+            scope, canonical, canonical.parent / manifest_name,
+            {"claude": h / f".claude/skills/{skill}", "codex": h / f".codex/skills/{skill}",
+             "pi": h / f".pi/agent/skills/{skill}", "opencode": h / f".config/opencode/skills/{skill}"},
+            h / f".pi/agent/prompts/{skill}.md" if pi else None,
+            h / ".config/opencode" / oc_dir / f"{skill}.md", skill)
     if scope == "project":
         p = Path(project or Path.cwd())
-        canonical = p / ".agents/skills/summary"
+        canonical = p / f".agents/skills/{skill}"
         oc_dir = "command" if (p / ".opencode/command").is_dir() else "commands"
         return Layout(
-            scope, canonical, canonical.parent / MANIFEST_NAME,
-            {"claude": p / ".claude/skills/summary"},  # Codex, Pi, OpenCode read .agents/skills directly
-            p / ".pi/prompts/summary.md", p / ".opencode" / oc_dir / "summary.md")
+            scope, canonical, canonical.parent / manifest_name,
+            {"claude": p / f".claude/skills/{skill}"},  # Codex, Pi, OpenCode read .agents/skills directly
+            p / f".pi/prompts/{skill}.md" if pi else None, p / ".opencode" / oc_dir / f"{skill}.md", skill)
     raise ValueError(f"unknown scope: {scope}")
+
+
+def _flag(lay: Layout) -> str:
+    return "" if lay.name == "summary" else f" --skill {lay.name}"
 
 
 def _sha(path: Path) -> str | None:
@@ -94,10 +115,13 @@ def _atomic_write(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
-def _sources() -> dict[str, bytes]:
-    return {"skill": (SOURCE / "SKILL.md").read_bytes(),
-            "pi": (SOURCE / "adapters/pi-summary.md").read_bytes(),
-            "opencode": (SOURCE / "adapters/opencode-summary.md").read_bytes()}
+def _sources(skill: str = "summary") -> dict[str, bytes]:
+    src = _source(skill)
+    out = {"skill": (src / "SKILL.md").read_bytes(),
+           "opencode": (src / f"adapters/opencode-{skill}.md").read_bytes()}
+    if skill == "summary":
+        out["pi"] = (src / "adapters/pi-summary.md").read_bytes()
+    return out
 
 
 def _place(lay: Layout, files: dict, path: Path, data: bytes, dry: bool) -> Result:
@@ -130,7 +154,7 @@ def _link(lay: Layout, links: dict, link: Path, dry: bool) -> Result:
             return Result(key, "unchanged")
         return Result(key, "preserved", "a different link exists here; left untouched")
     if link.exists():
-        return Result(key, "preserved", "a user skill named summary exists here; left untouched")
+        return Result(key, "preserved", f"a user skill named {lay.name} exists here; left untouched")
     if not dry:
         link.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(os.path.relpath(lay.canonical, link.parent) if lay.scope == "project" else lay.canonical, link)
@@ -139,26 +163,27 @@ def _link(lay: Layout, links: dict, link: Path, dry: bool) -> Result:
 
 
 def install(*, scope: str = "global", home: Path | None = None, project: Path | None = None,
-            dry_run: bool = False) -> list[Result]:
-    lay = layout(scope=scope, home=home, project=project)
-    src = _sources()
+            dry_run: bool = False, skill: str = "summary") -> list[Result]:
+    lay = layout(scope=scope, home=home, project=project, skill=skill)
+    src = _sources(skill)
     manifest = _load(lay)
     files: dict[str, str] = dict(manifest.get("files", {}))
     links: dict[str, str] = dict(manifest.get("links", {}))
     out = [_place(lay, files, lay.canonical / "SKILL.md", src["skill"], dry_run)]
     out += [_link(lay, links, p, dry_run) for p in lay.skill_links.values()]
-    out.append(_place(lay, files, lay.pi_prompt, src["pi"], dry_run))
+    if lay.pi_prompt:
+        out.append(_place(lay, files, lay.pi_prompt, src["pi"], dry_run))
     out.append(_place(lay, files, lay.opencode_command, src["opencode"], dry_run))
     if not dry_run:
         _atomic_write(lay.manifest, json.dumps(
-            {"name": "summary", "version": VERSION, "skill_sha256": _sha_bytes(src["skill"]),
+            {"name": lay.name, "version": VERSION, "skill_sha256": _sha_bytes(src["skill"]),
              "files": files, "links": links}, indent=2, sort_keys=True).encode())
     return out
 
 
 def uninstall(*, scope: str = "global", home: Path | None = None, project: Path | None = None,
-              dry_run: bool = False) -> list[Result]:
-    lay = layout(scope=scope, home=home, project=project)
+              dry_run: bool = False, skill: str = "summary") -> list[Result]:
+    lay = layout(scope=scope, home=home, project=project, skill=skill)
     manifest = _load(lay)
     files: dict[str, str] = manifest.get("files", {})
     out: list[Result] = []
@@ -188,24 +213,25 @@ def uninstall(*, scope: str = "global", home: Path | None = None, project: Path 
     return out
 
 
-def verify(*, scope: str = "global", home: Path | None = None, project: Path | None = None) -> tuple[bool, list[Result]]:
+def verify(*, scope: str = "global", home: Path | None = None, project: Path | None = None,
+           skill: str = "summary") -> tuple[bool, list[Result]]:
     """Read-only check. ``ok`` is False when the skill is missing or invalid; stale/customized files are reported."""
-    lay = layout(scope=scope, home=home, project=project)
-    src = _sources()
+    lay = layout(scope=scope, home=home, project=project, skill=skill)
+    src = _sources(skill)
     manifest = _load(lay)
     out: list[Result] = []
     skill = lay.canonical / "SKILL.md"
     body = skill.read_text(errors="replace") if skill.is_file() else ""
-    valid = body.startswith("---") and "\nname: summary\n" in body.split("\n---", 1)[0] + "\n"
+    valid = body.startswith("---") and f"\nname: {lay.name}\n" in body.split("\n---", 1)[0] + "\n"
     ok = skill.is_file() and valid
     if not skill.is_file():
-        out.append(Result(str(skill), "missing", "run: herdr-eng summary install"))
+        out.append(Result(str(skill), "missing", f"run: herdr-eng summary install{_flag(lay)}"))
     elif not valid:
-        out.append(Result(str(skill), "stale", "SKILL.md frontmatter does not declare name: summary"))
+        out.append(Result(str(skill), "stale", f"SKILL.md frontmatter does not declare name: {lay.name}"))
     elif _sha(skill) == _sha_bytes(src["skill"]):
         out.append(Result(str(skill), "ok", f"matches canonical source (version {manifest.get('version', '?')})"))
     elif manifest.get("files", {}).get(str(skill)) == _sha(skill):
-        out.append(Result(str(skill), "stale", "older managed copy; run: herdr-eng summary install"))
+        out.append(Result(str(skill), "stale", f"older managed copy; run: herdr-eng summary install{_flag(lay)}"))
     else:
         out.append(Result(str(skill), "preserved", "customized copy; not managed"))
     for agent, link in lay.skill_links.items():
@@ -213,11 +239,12 @@ def verify(*, scope: str = "global", home: Path | None = None, project: Path | N
         if good:
             out.append(Result(str(link), "ok", agent))
         elif link.exists():
-            out.append(Result(str(link), "preserved", f"{agent}: user-owned summary skill"))
+            out.append(Result(str(link), "preserved", f"{agent}: user-owned {lay.name} skill"))
         else:
             out.append(Result(str(link), "missing", agent))
             ok = False
-    for path, want in ((lay.pi_prompt, src["pi"]), (lay.opencode_command, src["opencode"])):
+    wanted = ([(lay.pi_prompt, src["pi"])] if lay.pi_prompt else []) + [(lay.opencode_command, src["opencode"])]
+    for path, want in wanted:
         cur = _sha(path)
         if cur is None:
             out.append(Result(str(path), "missing"))
@@ -225,7 +252,7 @@ def verify(*, scope: str = "global", home: Path | None = None, project: Path | N
         elif cur == _sha_bytes(want):
             out.append(Result(str(path), "ok"))
         elif manifest.get("files", {}).get(str(path)) == cur:
-            out.append(Result(str(path), "stale", "older managed copy; run: herdr-eng summary install"))
+            out.append(Result(str(path), "stale", f"older managed copy; run: herdr-eng summary install{_flag(lay)}"))
         else:
             out.append(Result(str(path), "preserved", "customized command; not managed"))
     return ok, out

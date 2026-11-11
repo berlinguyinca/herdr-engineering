@@ -405,7 +405,7 @@ def test_the_mirror_drops_resolved_and_deleted_annotations_after_a_tick(registry
             resolve_raw(env, a, aid, mine, [resolved])
             await settle(env)
             await AnnotationStore(conn).ingest(conn, {"op": "delete", "share_id": sid, "annotation_id": deleted,
-                                                      "author_identity": "u1", "at": datetime.now(UTC).isoformat()},
+                                                      "author_identity": "u1", "author_email": "A@x.org", "basis": "e", "at": datetime.now(UTC).isoformat()},
                                                "del" + deleted, **KW)
             await hk.tick(conn)
             assert [r["annotation_id"] for r in mirrored(mirror, aid)["annotations"]] == [keep], (
@@ -452,8 +452,10 @@ def test_importing_collab_artifacts_registers_the_kind():
             "print(sorted(c._INTENT_KINDS))")
     proc = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip() == ("['annotation_resolve', 'commit', 'member.artifact_create', 'member.artifact_delete', "
-                                   "'member.publish', 'member.share_approve', 'member.share_create', 'member.share_events', "
+    assert proc.stdout.strip() == ("['annotation_resolve', 'commit', 'library_accept', 'library_discard', "
+                                   "'library_file', 'library_folder_create', 'library_folder_delete', "
+                                   "'library_folder_rename', 'library_unfile', 'member.artifact_create', "
+                                   "'member.artifact_delete', 'member.publish', 'member.share_approve', 'member.share_create', 'member.share_events', "
                                    "'member.share_revoke']")
 
 

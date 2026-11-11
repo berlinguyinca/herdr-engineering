@@ -138,14 +138,14 @@ def test_create_edit_delete_dismiss_reach_only_the_authors_projection(registry_p
         assert [r["body"] for r in mine["annotations"]] == ["note"]
         assert [r["body"] for r in projection(tmp_path / "shares", sid, "u2")["annotations"]] == ["mine"]
         assert projection(tmp_path / "shares", sid, "stranger") is None
-        append(events, {"op": "edit", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1",
+        append(events, {"op": "edit", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1", "author_email": "A@x.org", "basis": "e",
                         "body": "edited", "at": create(sid, 1)["at"]})
         await hk.tick(conn)
         assert projection(tmp_path / "shares", sid, "u1")["annotations"][0]["body"] == "edited"
         await store.dismiss(aid, ann_id(2), actor="owner")
         await hk.tick(conn)
         assert projection(tmp_path / "shares", sid, "u2")["annotations"][0]["status"] == "dismissed"
-        append(events, {"op": "delete", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1",
+        append(events, {"op": "delete", "share_id": sid, "annotation_id": ann_id(1), "author_identity": "u1", "author_email": "A@x.org", "basis": "e",
                         "at": create(sid, 1)["at"]})
         await hk.tick(conn)
         assert projection(tmp_path / "shares", sid, "u1")["annotations"] == []     # withdrawn rows leave the file

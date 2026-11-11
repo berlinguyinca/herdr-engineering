@@ -132,8 +132,27 @@ export class HerdrClient {
     return this.request(`/api/v1/memory/search?${params}`, { signal });
   }
 
-  getMemoryRecord(id, { signal } = {}) {
-    return this.request(`/api/v1/memory/${encodeURIComponent(id)}`, { signal });
+  getMemoryRecord(id, { signal, kind, scope, project } = {}) {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries({ kind, scope, project })) {
+      if (value != null && value !== '') params.set(key, value);
+    }
+    const query = params.toString();
+    // A caller's close/replace signal must not remove request()'s 15 s bound.
+    let bounded = signal;
+    if (signal) {
+      const deadline = AbortSignal.timeout(15000);
+      if (AbortSignal.any) bounded = AbortSignal.any([signal, deadline]);
+      else {
+        const controller = new AbortController();
+        for (const source of [signal, deadline]) {
+          if (source.aborted) controller.abort(source.reason);
+          else source.addEventListener('abort', () => controller.abort(source.reason), { once: true });
+        }
+        bounded = controller.signal;
+      }
+    }
+    return this.request(`/api/v1/memory/${encodeURIComponent(id)}${query ? `?${query}` : ''}`, { signal: bounded });
   }
 
   getMemoryServiceStatus({ signal } = {}) {
@@ -176,6 +195,45 @@ export class HerdrClient {
       if (value != null && value !== '') query.set(key, String(value));
     }
     return this.request(`/api/v1/artifacts${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  // The dashboard artifact library (same feed and folders as the member site). Writes need an operator key; the viewer is
+  // always the authenticated key, never a field of the request.
+  listLibrary({ q, sources, folderId, type, since, until, offset, limit, signal } = {}) {
+    const query = new URLSearchParams();
+    const wanted = { q, sources: Array.isArray(sources) ? sources.join(',') : sources, folder_id: folderId, type, since, until, offset, limit };
+    for (const [key, value] of Object.entries(wanted)) {
+      if (value != null && value !== '') query.set(key, String(value));
+    }
+    return this.request(`/api/v1/library${query.size ? `?${query}` : ''}`, { signal });
+  }
+
+  createFolder(name, { signal } = {}) {
+    return this.request('/api/v1/library/folders', { method: 'POST', body: { name }, signal });
+  }
+
+  renameFolder(folderId, name, { signal } = {}) {
+    return this.request(`/api/v1/library/folders/${encodeURIComponent(folderId)}`, { method: 'PUT', body: { name }, signal });
+  }
+
+  deleteFolder(folderId, { signal } = {}) {
+    return this.request(`/api/v1/library/folders/${encodeURIComponent(folderId)}`, { method: 'DELETE', signal });
+  }
+
+  fileItem(folderId, artifactId, { signal } = {}) {
+    return this.request('/api/v1/library/items', { method: 'POST', body: { folder_id: folderId, artifact_id: artifactId }, signal });
+  }
+
+  unfileItem(folderId, artifactId, { signal } = {}) {
+    return this.request(`/api/v1/library/folders/${encodeURIComponent(folderId)}/items/${encodeURIComponent(artifactId)}`, { method: 'DELETE', signal });
+  }
+
+  acceptPending(artifactId, { signal } = {}) {
+    return this.request(`/api/v1/library/pending/${encodeURIComponent(artifactId)}/accept`, { method: 'POST', body: {}, signal });
+  }
+
+  discardPending(artifactId, { signal } = {}) {
+    return this.request(`/api/v1/library/pending/${encodeURIComponent(artifactId)}/discard`, { method: 'POST', body: {}, signal });
   }
 
   // Owner-only delete (tombstone / purge now) and restore. The server answers a non-owner with a plain 404.
@@ -266,6 +324,11 @@ export class HerdrClient {
   // Static copy of a report version's lightweight preview.
   artifactReportPreviewRender(id, versionId, { signal } = {}) {
     return this.request(`${this.artifactReportPath(id, versionId)}/preview/render`, { signal });
+  }
+
+  // A report version's HTML asset, served under a no-script sandbox CSP: the only URL the dashboard frames.
+  artifactRichUrl(id, versionId) {
+    return `${this.base}${this.artifactReportPath(id, versionId)}/rich`;
   }
 
   // The sandboxed raw view, opened in a new tab (never framed).
@@ -515,6 +578,10 @@ export class HerdrClient {
     return this.request('/api/v1/scheduler/plan', { method: 'POST', body: request, signal });
   }
 
+  schedulerSetHostPolicy(request, { signal } = {}) {
+    return this.request('/api/v1/scheduler/host-policy', { method: 'POST', body: request, signal });
+  }
+
   // -- missions -----------------------------------------------------------
   listMissions(status, { signal } = {}) {
     const q = status ? `?status=${encodeURIComponent(status)}` : '';
@@ -602,8 +669,51 @@ export class HerdrClient {
   }
 
   // -- services / hosts ---------------------------------------------------
-  listServices({ signal } = {}) {
-    return this.request('/api/v1/services', { signal });
+  /**
+   * Services arrive in capped pages (`pagination.next_offset`). By default the
+   * remaining pages are fetched one request at a time and merged, so callers
+   * still receive the whole inventory; pass `all:false` for the first page only.
+   */
+  listServices({ signal, all = true } = {}) {
+    return this._collectPages('/api/v1/services', 'services', { signal, all, limit: 1000,
+      identity: (row) => row?.service_id });
+  }
+
+  /**
+   * Follow `pagination.next_offset` and merge pages, requesting the largest page
+   * the server allows. The server keeps no snapshot between requests, so rows can
+   * shift and repeat across pages: they are de-duplicated by `identity`. A cursor
+   * that does not advance (or too many pages) stops the loop and is reported as
+   * `pagination.truncated` with `pagination.error` instead of duplicating rows.
+   */
+  async _collectPages(path, field, { signal, all, limit, identity }) {
+    const page = (offset) => this.request(
+      `${path}?limit=${limit}${offset ? `&offset=${encodeURIComponent(offset)}` : ''}`, { signal });
+    const first = await page(0);
+    let next = first?.pagination?.next_offset;
+    if (!all || next == null) return first;
+    const rows = [], seen = new Set();
+    const add = (list) => {
+      for (const row of list || []) {
+        const id = identity(row);
+        if (id != null) { if (seen.has(id)) continue; seen.add(id); }
+        rows.push(row);
+      }
+    };
+    add(first[field]);
+    let offset = 0, error = null;
+    for (let pages = 1; next != null; pages++) {
+      if (!Number.isInteger(next) || next <= offset) { error = 'pagination cursor did not advance'; break; }
+      if (pages >= 200) { error = 'pagination page cap reached'; break; }
+      offset = next;
+      const body = await page(offset);
+      add(body?.[field]);
+      next = body?.pagination?.next_offset;
+    }
+    const truncated = next != null || error != null;
+    return { ...first, [field]: rows,
+      pagination: { ...first.pagination, limit: rows.length, next_offset: error ? next ?? null : null,
+        truncated, ...(error ? { error } : {}) } };
   }
 
   listServiceCatalog({scope='herdr', status='current', includeArchived=false,
@@ -861,8 +971,10 @@ export class HerdrClient {
     return this.request(`/api/v1/ci/performance?${query}`, { signal });
   }
 
-  getCiHistory({ signal } = {}) {
-    return this.request('/api/v1/ci/history', { signal });
+  /** Pipelines are paged server-side; see listServices for the merge behaviour. */
+  getCiHistory({ signal, all = true } = {}) {
+    return this._collectPages('/api/v1/ci/history', 'pipelines', { signal, all, limit: 2000,
+      identity: (row) => (row?.run_number == null ? null : `${row.provider_repo_id ?? row.repo_id ?? row.repository}#${row.run_number}`) });
   }
 
   getCiPipeline(repository, number, { signal, providerUrl } = {}) {

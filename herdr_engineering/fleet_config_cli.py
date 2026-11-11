@@ -195,6 +195,7 @@ COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "co
                          "cognito_domain", "public_url", "operator_user", "operator_email",
                          "open_signup", "approver_groups", "dashboard_hosts", "replay_history", "steering",
                          "contextual", "insights", "team_rooms", "team_roles", "coordinators",
+                         "fabric_trust",   # machine short names only, no secret
                          "skills",
                          "summary_fix",   # summary_fix: ids of the operator's summary-fix room and agent, no secret
                          "delegation_enabled",
@@ -254,6 +255,11 @@ def collab_values(cfg: FleetConfig) -> dict:
     from .control_plane.collab_coordinators import normalize_coordinators
     try:
         normalize_coordinators(collab.get("coordinators"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
+    from .control_plane.collab_fabric_trust import normalize_fabric_trust
+    try:
+        normalize_fabric_trust(collab.get("fabric_trust"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
     from .control_plane.collab import summary_fix_config
@@ -330,6 +336,14 @@ def _collab_artifacts_slice(cfg: FleetConfig) -> dict:
         section = None
     enabled = isinstance(section, dict) and section.get("enabled") is True
     return {"collab_artifacts": {"enabled": enabled}}
+
+
+def fabric_listener(cfg: FleetConfig) -> tuple[str, int] | None:
+    """(host, port) of control_plane.collab.fabric_trust's dedicated listener, or None when it is not configured. The
+    values were validated (tailnet address only) by ``collab_values``; deploy.sh publishes exactly this address and port."""
+    from .control_plane.collab_fabric_trust import normalize_fabric_trust
+    trust = normalize_fabric_trust(collab_values(cfg).get("fabric_trust"))
+    return (trust["listen_host"], trust["listen_port"]) if trust["listen_host"] else None
 
 
 def render_collab(cfg: FleetConfig, out: Path) -> None:
@@ -655,10 +669,12 @@ def _collect_hosts(answers: dict, prompt: Callable) -> dict[str, list[str]]:
 
 
 API_KEYS_WARNING = (
-    "warning: --with-api-keys turns on X-API-Key auth for the control plane. The browser "
-    "dashboard, the llm-proxy and the emit hook do not send keys yet, so they will get "
-    "401 until they do. Leave control_plane.api_keys empty ({}) to keep the tailnet-open "
-    "posture.")
+    "warning: --with-api-keys turns on X-API-Key auth for the control plane. The llm-proxy "
+    "and the emit hook do not send keys yet, so they will get 401 until they do. The browser "
+    "dashboard works only behind the dashboard proxy: set control_plane.dashboard_proxy "
+    "(viewer_key_file, operator_key_file) and run `herdr-eng control-plane dashboard-proxy` "
+    "(compose profile dashboard-proxy); without it the dashboard gets 401. Leave "
+    "control_plane.api_keys empty ({}) to keep the tailnet-open posture.")
 
 
 OPTIONAL_SECRET_LABELS = {"github_token": "GitHub token"}
@@ -672,7 +688,7 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
     The control plane stays open on the tailnet (``control_plane.api_keys: {}``) and
     ``ingest.api_key`` / ``agent.api_key`` are empty, so clients send no X-API-Key.
     ``with_api_keys`` generates operator/ingest/agent keys instead (keyed mode; the
-    dashboard, llm-proxy and emit hook do not support keys yet - see API_KEYS_WARNING).
+    llm-proxy and emit hook do not support keys yet, the dashboard needs the dashboard proxy - see API_KEYS_WARNING).
 
     Hosts get a placeholder hash of a discarded token: they cannot authenticate
     until ``fleet join`` / ``fleet config token`` installs a real one.

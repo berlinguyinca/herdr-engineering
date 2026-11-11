@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import NamedTuple
 
 from .envelope import SourceLedger
 from .inspector import InspectorStore
 from .projection_checkpoint import (
     COMPACT_TYPES,
+    FOLDABLE_TYPES,
     PreparedSource,
+    actor_id,
     capture_projection,
     code_fingerprint,
     event_time,
@@ -22,8 +25,55 @@ from .projection_store import CheckpointInvalid, ProjectionStore, SnapshotChange
 log = logging.getLogger(__name__)
 RETENTION_TYPES = frozenset({'inspector','host_metrics','token_usage','resource_usage',
                              'ci_report','ci_observation','ci_telemetry','ci_pipeline','mission_activity_store'})
+# Fabric compaction deletes interior service observation rows. The change log carries no event_type, so any
+# service delete is tolerated; the stream is then rebuilt from its surviving rows (see _append_blocker).
+COMPACTED_TYPES = frozenset({'service'})
 MAX_TAIL_ROWS = 100_000
-MAX_DIRTY_ROWS = 250_000
+MAX_DIRTY_ROWS = 600_000
+HARD_DIRTY_ROWS = 2_000_000
+TOP_CONTRIBUTORS = 5
+
+
+class CheckpointBudgets(NamedTuple):
+    """Row budgets for one incremental recovery.
+
+    ``max_tail_rows``: change-log tail. ``max_dirty_rows``: refolded rows the recovery is expected to
+    re-read; above it recovery logs and carries on. ``hard_dirty_rows``: the cap above which the dirty
+    streams are no cheaper than a complete replay (None = same as ``max_dirty_rows``).
+    """
+    max_tail_rows: int
+    max_dirty_rows: int
+    hard_dirty_rows: int | None = None
+
+    @property
+    def dirty_cap(self):
+        return self.max_dirty_rows if self.hard_dirty_rows is None else self.hard_dirty_rows
+
+
+def checkpoint_budgets(raw=None):
+    """Validate ``control_plane.projection_checkpoint`` (fleet YAML); missing keys take the defaults.
+
+    Raises ValueError naming the key for anything but a positive integer.
+    """
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError('control_plane.projection_checkpoint must be a mapping')
+    unknown = sorted(set(raw) - {'max_tail_rows', 'max_dirty_rows', 'hard_dirty_rows'})
+    if unknown:
+        raise ValueError(f'control_plane.projection_checkpoint: unknown key(s) {unknown}')
+    values = {}
+    for key, default in (('max_tail_rows', MAX_TAIL_ROWS), ('max_dirty_rows', MAX_DIRTY_ROWS)):
+        value = raw.get(key, default)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f'control_plane.projection_checkpoint.{key} must be a positive integer, got {value!r}')
+        values[key] = value
+    hard = raw.get('hard_dirty_rows', max(HARD_DIRTY_ROWS, values['max_dirty_rows']))
+    if type(hard) is not int or hard <= 0:
+        raise ValueError(f'control_plane.projection_checkpoint.hard_dirty_rows must be a positive integer, got {hard!r}')
+    if hard < values['max_dirty_rows']:
+        raise ValueError('control_plane.projection_checkpoint.hard_dirty_rows must be >= max_dirty_rows')
+    return CheckpointBudgets(**values, hard_dirty_rows=hard)
 
 
 def feed_visible(row):
@@ -33,7 +83,7 @@ def feed_visible(row):
                          and kind in ENVELOPE_ONLY))
 
 
-async def _rows(conn, sql, *args, maximum=None):
+async def _rows(conn, sql, *args, maximum=None, explain=None):
     import json
     result = []
     async for row in conn.cursor(sql, *args, prefetch=1000):
@@ -43,8 +93,81 @@ async def _rows(conn, sql, *args, maximum=None):
                 item[field] = json.loads(item[field])
         result.append(item)
         if maximum is not None and len(result) > maximum:
-            raise CheckpointInvalid('incremental stream budget exceeded; complete replay required')
+            described = explain() if explain else None
+            if hasattr(described, '__await__'):
+                described = await described
+            detail = f' ({described})' if described else ''
+            raise CheckpointInvalid(f'incremental stream budget exceeded; complete replay required{detail}')
     return result
+
+
+def _append_blocker(operations, tail, previous, in_prefix_events):
+    """Why a compactable stream cannot fold its tail incrementally, or None when it can.
+
+    The tail may be folded onto the captured core only when every change is an
+    insert and every new server-ingest clock follows the stream's captured
+    maximum. Anything else needs the stream in its authoritative order.
+    """
+    if not all(row['operation'] == 'I' for row in operations):
+        return 'non_insert'
+    if len(tail) != len(operations):
+        return 'tail_rows_missing'
+    if previous is None:
+        return None if not in_prefix_events else 'no_cursor'
+    return None if min(event_time(row) for row in tail) > previous else 'not_after_cursor'
+
+
+def _fold_plan(operations, tail):
+    """``(removed_keys, None)`` when a foldable stream folds from its change log, else ``(None, reason)``.
+
+    Replays the pair's changes in log order: an insert is alive until a later delete; a delete of
+    anything not inserted since the checkpoint removes a checkpointed row. The tail rows read from the
+    table must be exactly the rows still alive, otherwise the log and the table disagree.
+    """
+    alive, removed = set(), set()
+    for row in operations:
+        key = (row['event_id'], row['actor_id'] or '')
+        if row['operation'] == 'I':
+            alive.add(key)
+        elif row['operation'] == 'D':
+            if key in alive:
+                alive.discard(key)
+            else:
+                removed.add(key)
+        else:
+            return None, 'non_insert_delete'
+    if {(row['event_id'], actor_id(row)) for row in tail} != alive:
+        return None, 'tail_rows_missing'
+    return removed, None
+
+
+def _budget_summary(pairs, blocked, rows_by_type=None, limit=None):
+    kinds = {}
+    for kind, _ in pairs:
+        kinds[kind] = kinds.get(kind, 0) + 1
+    reasons = {f'{kind}:{reason}': count for (kind, reason), count in blocked.items()}
+    text = f'dirty streams by type {dict(sorted(kinds.items()))}; compact append blocked {dict(sorted(reasons.items()))}'
+    if rows_by_type is None:
+        return text
+    ranked = sorted(rows_by_type.items(), key=lambda item: (-item[1], item[0]))
+    top = ', '.join(f'{kind}={count}' for kind, count in ranked[:TOP_CONTRIBUTORS])
+    if len(ranked) > TOP_CONTRIBUTORS:
+        top += f', +{len(ranked) - TOP_CONTRIBUTORS} more types'
+    return f'dirty rows {sum(rows_by_type.values())} > limit {limit}: {top}; {text}'
+
+
+async def _dirty_rows_by_type(conn, pairs):
+    found = await conn.fetch(
+        'SELECT dirty.kind AS kind, count(*) AS rows FROM fabric_events AS events JOIN '
+        'unnest($1::text[],$2::text[]) AS dirty(kind,identity) '
+        'ON events.entity_type=dirty.kind AND events.entity_id=dirty.identity GROUP BY dirty.kind',
+        [p[0] for p in pairs], [p[1] for p in pairs])
+    return {row['kind']: row['rows'] for row in found}
+
+
+async def _explain_overflow(conn, pairs, blocked, limit, hard=False):
+    text = _budget_summary(pairs, blocked, await _dirty_rows_by_type(conn, pairs), limit)
+    return text.replace(' > limit ', ' > hard cap ', 1) if hard else text
 
 
 async def _read_prepared(source, code, policy):
@@ -83,10 +206,12 @@ async def _read_prepared_once(source, code, policy):
                         or not point['replay_floor'] <= frontier <= point['position']):
                     raise CheckpointInvalid('checkpoint frontier is outside retained change coverage')
                 changes = await store.changes_after(frontier, point['position'])
-                if len(changes) > MAX_TAIL_ROWS:
-                    raise CheckpointInvalid('incremental change budget exceeded')
+                budgets = getattr(source, 'checkpoint_budgets', None) or CheckpointBudgets(MAX_TAIL_ROWS, MAX_DIRTY_ROWS)
+                if len(changes) > budgets.max_tail_rows:
+                    raise CheckpointInvalid(f'incremental change budget exceeded: {len(changes)} tail rows > limit '
+                                            f'{budgets.max_tail_rows}; complete replay required')
                 if any(row['operation'] in {'T','U'} or
-                       (row['operation']=='D' and row['entity_type'] not in RETENTION_TYPES)
+                       (row['operation']=='D' and row['entity_type'] not in RETENTION_TYPES | COMPACTED_TYPES)
                        for row in changes):
                     raise CheckpointInvalid('structural history mutation requires complete replay')
                 legacy = prefix['legacy_rows'] - sum(row['operation']=='D' and row['had_position'] is None for row in changes)
@@ -115,6 +240,7 @@ async def _read_prepared_once(source, code, policy):
                 if inspector_append:
                     pairs = [pair for pair in pairs if pair[0] != 'inspector']
                 append_pairs = set()
+                blocked = {}
                 cursors = checkpoint.get('core_cursors', {})
                 for kind, identity in pairs:
                     if kind not in COMPACT_TYPES:
@@ -123,37 +249,78 @@ async def _read_prepared_once(source, code, policy):
                     tail = tail_by_pair.get((kind, identity), [])
                     operations = changes_by_pair[(kind, identity)]
                     previous = cursors.get(key)
-                    if (all(row['operation']=='I' for row in operations) and len(tail)==len(operations)
-                            and ((previous is None and key not in checkpoint['repo']['events'])
-                                 or (previous is not None and min(event_time(row) for row in tail)>previous))):
+                    reason = _append_blocker(operations, tail, previous,
+                                             key in checkpoint['repo']['events'])
+                    if reason is None:
                         append_pairs.add((kind,identity))
-                pairs = [pair for pair in pairs if pair not in append_pairs]
+                    else:
+                        blocked[(kind, reason)] = blocked.get((kind, reason), 0) + 1
+                fold_removed = {}
+                for kind, identity in pairs:
+                    if kind not in FOLDABLE_TYPES:
+                        continue
+                    removed, reason = _fold_plan(changes_by_pair[(kind, identity)],
+                                                 tail_by_pair.get((kind, identity), []))
+                    if reason is None:
+                        fold_removed[(kind, identity)] = removed
+                    else:
+                        blocked[(kind, reason)] = blocked.get((kind, reason), 0) + 1
+                pairs = [pair for pair in pairs if pair not in append_pairs and pair not in fold_removed]
                 if any(not kind or not identity for kind,identity in pairs):
                     raise CheckpointInvalid('untyped durable changes require complete replay')
                 streams = {pair:[] for pair in pairs}
+                refolded = 0
                 if pairs:
                     raw = await _rows(conn,
                         'SELECT events.* FROM fabric_events AS events JOIN '
                         'unnest($1::text[],$2::text[]) AS dirty(kind,identity) '
                         'ON events.entity_type=dirty.kind AND events.entity_id=dirty.identity '
                         'ORDER BY events.ingest_timestamp,events.sequence,events.event_id',
-                        [p[0] for p in pairs],[p[1] for p in pairs],maximum=MAX_DIRTY_ROWS)
+                        [p[0] for p in pairs],[p[1] for p in pairs],maximum=budgets.dirty_cap,
+                        explain=lambda: _explain_overflow(conn, pairs, blocked, budgets.dirty_cap,
+                                                          hard=budgets.hard_dirty_rows is not None))
                     for row in raw:
                         streams[(row['entity_type'],row['entity_id'])].append(public_event(row))
+                    refolded = len(raw)
+                    if refolded > budgets.max_dirty_rows:
+                        by_type = {}
+                        for row in raw:
+                            by_type[row['entity_type']] = by_type.get(row['entity_type'], 0) + 1
+                        log.warning('projection recovery over the dirty budget; refolding %d dirty streams from the '
+                                    'checkpoint instead of a complete replay (%s)', len(pairs),
+                                    _budget_summary(pairs, blocked, by_type, budgets.max_dirty_rows))
                 coverage = {**point,
                     'raw_rows': prefix['raw_rows'] + sum(1 if row['operation']=='I' else -1 for row in changes),
                     'public_rows': prefix['public_rows'] + sum((1 if row['operation']=='I' else -1)
                                                                for row in changes if feed_visible(row))}
-                return dict(checkpoint=checkpoint, full_streams=streams,
+                return dict(checkpoint=checkpoint, full_streams=streams, fold_removed=fold_removed,
                     tail_rows=[public_event(row) for row in raw_tail], structured=structured,
-                    coverage=coverage, schema=schema, scanned=sum(len(s) for s in streams.values())+len(raw_tail))
+                    coverage=coverage, schema=schema, refolded_rows=refolded, folded_streams=len(fold_removed),
+                    scanned=refolded+len(raw_tail))
             except (CheckpointInvalid, KeyError, TypeError, ValueError) as exc:
-                log.warning('projection checkpoint candidate rejected: %s',type(exc).__name__)
+                log.warning('projection checkpoint candidate rejected: %s%s',type(exc).__name__,_rejection_detail(exc))
         raw = await _rows(conn, 'SELECT * FROM fabric_events ORDER BY '
             '(projection_position IS NOT NULL),projection_position NULLS FIRST,ingest_timestamp,sequence,event_id')
         return dict(checkpoint=None,rows=raw,structured=structured,
                     coverage={**point,'raw_rows':len(raw),'public_rows':sum(feed_visible(row) for row in raw)},
                     schema=schema,scanned=len(raw))
+
+
+MAX_REASON_CHARS = 200
+
+
+def _rejection_detail(exc):
+    """`: <reason>` for our own validation errors, bounded and printable.
+
+    Only CheckpointInvalid carries static, module-authored messages; other
+    exception types may embed row data, so they stay class-only.
+    """
+    if not isinstance(exc, CheckpointInvalid):
+        return ''
+    text = ''.join(ch if ch.isprintable() else ' ' for ch in str(exc)).strip()
+    if len(text) > MAX_REASON_CHARS:
+        text = text[:MAX_REASON_CHARS - 3] + '...'
+    return f': {text}' if text else ''
 
 
 def _reset_private(repo):
@@ -176,7 +343,8 @@ def recover_repository(repo, source):
         if source._conn is None or source._conn.is_closed():
             source._conn = await asyncpg.connect(source._dsn)
     source._run(connect())
-    ownership = ProjectionStore(source._conn).publisher()
+    ownership = ProjectionStore(source._conn).publisher(
+        wait=getattr(source, 'checkpoint_lock_wait', 0.0))
     source._run(ownership.__aenter__())
     try:
         return _recover_repository(repo, source)
@@ -214,6 +382,7 @@ def _recover_repository(repo, source):
         try:
             counts = restore_projection(repo,checkpoint,
                 full_streams=prepared['full_streams'],tail_rows=prepared['tail_rows'],
+                fold_removed=prepared['fold_removed'],
                 structured=prepared['structured'],coverage=prepared['coverage'])
             mode='checkpoint'
         except (ValueError,KeyError,TypeError) as exc:
@@ -251,10 +420,14 @@ def _recover_repository(repo, source):
     repo._checkpoint_coverage=coverage
     source.recovery_info={'mode':mode,'frontier':coverage['position'],
         'tail_events':len(prepared.get('tail_rows',[])),'event_rows_scanned':prepared['scanned'],
+        'refolded_rows':prepared.get('refolded_rows',0),'folded_streams':prepared.get('folded_streams',0),
         'elapsed_ms':round((time.monotonic()-start)*1000,2)}
     source._cache=dict(prepared['structured'])
-    log.info('projection recovery mode=%s rows_scanned=%s elapsed_ms=%s',
-             mode,prepared['scanned'],source.recovery_info['elapsed_ms'])
+    log.info('projection recovery mode=%s path=%s rows_scanned=%s tail_events=%s refolded_rows=%s '
+             'folded_streams=%s elapsed_ms=%s', mode,
+             'checkpoint_plus_tail' if mode == 'checkpoint' else 'complete_replay', prepared['scanned'],
+             source.recovery_info['tail_events'], source.recovery_info['refolded_rows'],
+             source.recovery_info['folded_streams'], source.recovery_info['elapsed_ms'])
     return counts
 
 

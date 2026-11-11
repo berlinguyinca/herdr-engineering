@@ -1,6 +1,5 @@
-:root { color-scheme: light dark; --accent: #1f4fd1; --line: #8884; --muted: #595959; --danger: #b3261e; }
-@media (prefers-color-scheme: dark) { :root { --muted: #b4b4b4; --danger: #ff8a80; } }
-body { margin: 0; font: 16px/1.5 system-ui, sans-serif; }
+:root { color-scheme: light; --accent: #1f4fd1; --line: #8884; --muted: #595959; --danger: #b3261e; }
+body { margin: 0; font: 16px/1.5 var(--font-sans, Inter, system-ui, sans-serif); }
 aside.herdr-shared-by { position: relative; z-index: 30; padding: 8px 12px; background: #fff3cd; color: #4a3b00; border-bottom: 1px solid #8884; font-size: 14px; }
 body[data-mode="annotate"] > aside.herdr-shared-by { grid-column: 1 / -1; }
 nav[data-mode-switch] { position: relative; z-index: 20; background: Canvas; display: flex; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #8884; }
@@ -76,4 +75,5 @@ aside[data-annotate-panel] { grid-area: panel; position: sticky; top: 0; z-index
 .herdr-pdf-page .textLayer ::selection { background: rgba(0, 80, 255, .3); }
 .herdr-pdf-page .herdr-region-layer { z-index: 2; }
 .herdr-file-link { margin: 8px 0; }
-.herdr-image-hint { margin: 6px 0 0; font-size: 13px; color: var(--muted); line-height: 1.4; }
+.herdr-pdf-page:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.herdr-pdf-hint, .herdr-image-hint { margin: 6px 0 0; font-size: 13px; color: var(--muted); line-height: 1.4; }

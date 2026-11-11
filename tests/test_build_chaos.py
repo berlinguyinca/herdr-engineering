@@ -10,6 +10,7 @@ explicit skips at the bottom of this file (reason in the skip message).
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 import shutil
@@ -112,6 +113,52 @@ def _rows(db: Path, sql: str, args: tuple = ()) -> list[tuple]:
         return conn.execute(sql, args).fetchall()
     finally:
         conn.close()
+
+
+def _registry_report(gates: Path) -> str:
+    """Why the row count is what it is, because `19 != 20` cannot tell the candidate causes apart and
+    they live in different files.
+
+    A missing `attempts` row is consistent with three very different stories:
+
+    1. the registration never created a build - `register()` takes a caller-supplied `build_id` and
+       joins an existing build instead of inserting, and the storm runs 20 tickets over only 3 cwds,
+       so two tickets can share a request key;
+    2. the build row exists and only the attempt row is gone;
+    3. a row was deleted after the fact - both FKs are `ON DELETE CASCADE` and `PRAGMA foreign_keys=ON`,
+       so one `builds` delete silently takes its attempts and their transitions with it.
+
+    Counting builds alongside attempts separates 1 from 2 and 3; duplicate request keys name 1;
+    orphaned transitions name 3. Dumped on failure only, so a green run stays quiet.
+    """
+    db = gates / "build-registry.db"
+    builds = _rows(db, "SELECT build_id, request_key, state FROM builds")
+    attempts = _rows(db, "SELECT attempt_id, build_id, state, joined FROM attempts")
+    build_ids = {b[0] for b in builds}
+    keys = collections.Counter(b[1] for b in builds)
+    dups = {k: n for k, n in keys.items() if n > 1}
+    orphan_attempts = sorted(a[1] for a in attempts if a[1] not in build_ids)
+    try:
+        trans, trans_attempts = _rows(db, "SELECT COUNT(*), COUNT(DISTINCT attempt_id) FROM transitions")[0]
+        orphan_trans = _rows(db, "SELECT COUNT(*) FROM transitions WHERE attempt_id NOT IN "
+                                 "(SELECT attempt_id FROM attempts)")[0][0]
+    except sqlite3.Error as exc:                                  # a cascade can take tables with it
+        trans, trans_attempts, orphan_trans = f"unavailable ({exc})", "?", "?"
+    finished = [e for e in _events(gates) if e.get("event") == "build_finished"]
+    return "\n".join([
+        f"builds={len(builds)} attempts={len(attempts)} transitions={trans} "
+        f"(distinct attempt_id={trans_attempts})",
+        f"build_finished events={len(finished)}",
+        f"duplicate request_key={dups or 'none'}",
+        f"attempts whose build_id has no builds row={orphan_attempts or 'none'}",
+        f"transitions whose attempt_id has no attempts row={orphan_trans}",
+        f"joined attempts={sum(1 for a in attempts if a[3])}",
+        f"attempt states={collections.Counter(a[2] for a in attempts)}",
+        f"build states={collections.Counter(b[2] for b in builds)}",
+        "expected: builds=20 attempts=20, no duplicate request_key, no orphans, joined=0 - "
+        "builds=19 means a ticket joined instead of registering; builds=20 with attempts=19 means "
+        "the attempt row alone is gone; orphan transitions mean a cascade deleted a row",
+    ])
 
 
 def _closed_port() -> int:
@@ -339,19 +386,8 @@ def test_twenty_build_storm_respects_slots_and_completes(tmp_path):
     assert len(fin) == 20
     assert sorted(e["exit_code"] for e in fin) == sorted(codes)
     db = gates / "build-registry.db"
-    # The registry is best-effort by design ("registry failure must never fail a
-    # build"): under a loaded disk a registration can hit the 5 s busy timeout and the
-    # build runs unrecorded. Such a build's finish event carries no attempt_id, so the
-    # invariant is "exactly the builds that registered have a terminal row", not a
-    # fixed 20 -- which would depend on the host's speed.
-    registered = [e for e in fin if e.get("attempt_id")]
-    assert len(registered) >= 1
-    want: dict[str, int] = {}
-    for e in registered:
-        st = "completed" if e["exit_code"] == 0 else "failed"
-        want[st] = want.get(st, 0) + 1
     states = dict(_rows(db, "SELECT state, COUNT(*) FROM attempts GROUP BY state"))
-    assert states == want                                              # rows consistent
+    assert states == {"completed": 16, "failed": 4}, _registry_report(gates)                    # rows consistent
     assert _rows(db, "SELECT COUNT(*) FROM leases WHERE released_ts IS NULL") == [(0,)]
     assert _rows(db, "SELECT COUNT(*) FROM builds WHERE state NOT IN "
                      "('completed','failed','cancelled','timed_out','rejected')") == [(0,)]

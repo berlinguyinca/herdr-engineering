@@ -154,9 +154,10 @@ def classify_cmd(cmd: list[str]) -> str:
         if toks[0] == "rustc":
             return "rustc"
         if toks[0] == "cargo":
-            rest = [t for t in toks[1:] if not t.startswith("+")]
-            if rest:
-                kind = f"cargo {rest[0]}"
+            from .cargo_host import cargo_subcommand
+            subcommand = cargo_subcommand(toks[1:])
+            if subcommand:
+                kind = f"cargo {subcommand}"
                 if kind in _CMD_KINDS:
                     return kind
     except (IndexError, TypeError):
@@ -290,12 +291,12 @@ def diff_stats(before: dict[str, Any], after: dict[str, Any]) -> dict[str, float
 # --- event log --------------------------------------------------------------
 
 def append_event(state_dir: Path | str, event: dict[str, Any],
-                 max_bytes: int = MAX_LOG_BYTES) -> bool:
+                 max_bytes: int = MAX_LOG_BYTES, filename: str = "builds.jsonl") -> bool:
     """Append one JSON line (O_APPEND, 0600); rotate to .1 above ``max_bytes``."""
     try:
         d = Path(state_dir)
         d.mkdir(parents=True, exist_ok=True)
-        path = d / "builds.jsonl"
+        path = d / filename
         line = json.dumps(event, sort_keys=True, separators=(",", ":"))
         if len(line) > MAX_EVENT_BYTES:
             slim = dict(event, sccache_stats=None)
@@ -303,7 +304,7 @@ def append_event(state_dir: Path | str, event: dict[str, Any],
             line = json.dumps(slim, sort_keys=True, separators=(",", ":"))
         try:
             if path.stat().st_size > max_bytes:
-                os.replace(path, d / "builds.jsonl.1")
+                os.replace(path, d / f"{filename}.1")
         except FileNotFoundError:
             pass
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT
@@ -375,6 +376,27 @@ def _exit_code(status: int) -> int:
     return 128 - code if code < 0 else code
 
 
+CONTRACT_LOG = "contract-events.jsonl"  # separate from builds.jsonl so build-record readers see only build lines
+CONTRACT_EVENTS = ("cache_stats_updated", "storage_degraded", "lease_changed", "cleanup_completed")
+
+
+def emit_event(state_dir: Path | str, event: str, **fields: Any) -> bool:
+    """Append one contract event (``CONTRACT_EVENTS``) to ``contract-events.jsonl``; never raises.
+
+    Fields must be small, non-secret scalars/mappings chosen by the caller (ids, counters, reason codes, never
+    paths, argv or environment).
+    """
+    if event not in CONTRACT_EVENTS:
+        raise ValueError(f"unknown contract event {event!r}")
+    try:
+        return append_event(state_dir, {"event": event, "ts": _now_iso(),
+                                        "host": _safe(socket.gethostname, "unknown"), **fields},
+                            filename=CONTRACT_LOG)
+    except Exception as exc:  # noqa: BLE001 - metrics must never break the caller
+        _warn(f"could not emit {event}: {type(exc).__name__}")
+        return False
+
+
 def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
                  slot: int | None = None, cwd: str | None = None,
                  emit: bool = True, env: dict[str, str] | None = None,
@@ -417,6 +439,10 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
         append_event(state_dir, {**BuildStarted(
             event="build_started", ts=_now_iso(), build_id=build_id, host=host,
             slot=slot, cmd_kind=kind, cache=cache), **extra})
+        shared = (cache or {}).get("shared")
+        if isinstance(shared, dict) and str(shared.get("reason", "")).startswith("shared_unavailable"):
+            emit_event(state_dir, "storage_degraded", build_id=build_id, tier="shared",
+                       reason=str(shared["reason"])[:96])
 
     t0 = time.monotonic()
     try:
@@ -520,6 +546,9 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
     out = {**fin, **extra}
     if emit and state_dir is not None:
         append_event(state_dir, out)
+        if sccache_delta is not None:
+            emit_event(state_dir, "cache_stats_updated", build_id=build_id, sccache_stats=sccache_delta,
+                       cache_applied=bool((cache or {}).get("applied")))
     return Measured(code, out)
 
 

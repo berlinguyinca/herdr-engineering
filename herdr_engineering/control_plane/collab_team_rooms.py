@@ -11,8 +11,9 @@ the level, the attachment and the queue survive a restart exactly as ``task_crea
   fixed actions of their role, and takes them out again. The grants are ordinary room grants marked with the team id, so
   ``_effective`` stays the only authority and a detach removes exactly what the attach made. Team membership is its own data
   (this module's ``_tr_attach``); the people of the room are never team members (design contradiction 1).
-* ``room_guest_level_set``: ``read_only`` | ``suggest`` | ``direct``; the owner user only. ``direct`` is stored and validated and
-  behaves as ``suggest`` until slices 2 and 3 define what it may do (it fails closed).
+* ``room_guest_level_set``: ``read_only`` | ``suggest`` | ``direct``; the owner user only. ``direct`` is always stored and
+  validated, but it ACTS as ``direct`` only while ``team_rooms.direct_enabled`` is true (``collab_direct.py``); otherwise it
+  behaves as ``suggest`` and fails closed.
 * ``suggestion_submitted`` / ``suggestion_decided`` / ``suggestion_withdrawn`` / ``suggestion_materialized``: a guest's request
   for work. It is data in a queue until the owner approves it; approving creates ONE new task whose command is the owner's and
   whose request rides as quoted, tainted data (contradiction 7), never as an instruction.
@@ -44,7 +45,10 @@ MAX_SCAN_ROWS = 200
 LIST_LIMIT = 100
 TAINT = "external-source:guest"
 TEAM_ROOMS_KEYS = frozenset({"enabled", "kill_switch", "default_guest_level", "suggestion_ttl_seconds",
-                             "max_pending_per_guest", "max_pending_per_room", "submits_per_10min", "decisions_per_minute"})
+                             "max_pending_per_guest", "max_pending_per_room", "submits_per_10min", "decisions_per_minute",
+                             # the Direct guest level (collab_direct.py): its own flag, off by default, and the low numbers a
+                             # room's direct_limits fall back to when the owner names none
+                             "direct_enabled", "direct_default_per_hour", "direct_default_max_open"})
 SUGGESTION_STATES = frozenset({"pending", "approved", "materialized", "rejected", "withdrawn", "expired"})
 TR_EVENTS = frozenset({"team_attached", "team_detached", "room_guest_level_set", "suggestion_submitted",
                        "suggestion_decided", "suggestion_withdrawn", "suggestion_materialized"})
@@ -64,11 +68,13 @@ def normalize_team_rooms(raw: Any) -> dict:
     if unknown:
         raise ValueError("control_plane.collab.team_rooms: unknown keys: " + ", ".join(unknown))
     cfg = {"enabled": False, "kill_switch": False, "default_guest_level": "suggest", "suggestion_ttl_seconds": 7 * 86400,
-           "max_pending_per_guest": 5, "max_pending_per_room": 50, "submits_per_10min": 10, "decisions_per_minute": 30}
+           "max_pending_per_guest": 5, "max_pending_per_room": 50, "submits_per_10min": 10, "decisions_per_minute": 30,
+           "direct_enabled": False, "direct_default_per_hour": 3, "direct_default_max_open": 2}
     ranges = {"suggestion_ttl_seconds": (60, 30 * 86400), "max_pending_per_guest": (1, 50), "max_pending_per_room": (1, 500),
-              "submits_per_10min": (1, 100), "decisions_per_minute": (1, 120)}
+              "submits_per_10min": (1, 100), "decisions_per_minute": (1, 120),
+              "direct_default_per_hour": (1, 100), "direct_default_max_open": (1, 50)}
     for key, value in raw.items():
-        if key in ("enabled", "kill_switch"):
+        if key in ("enabled", "kill_switch", "direct_enabled"):
             if not isinstance(value, bool):
                 raise ValueError(f"control_plane.collab.team_rooms.{key} must be true or false")
         elif key == "default_guest_level":
@@ -103,6 +109,7 @@ class TeamRoomsMixin:
         self._sg_by_room: dict[str, list] = {}
         self._sg_keys: dict[tuple, tuple] = {}                  # (submitter, room, client key) -> (fingerprint, suggestion id)
         self._sg_task: dict[str, str] = {}                      # suggestion id -> the task its approval created
+        self._init_direct()
 
     # ----------------------------------------------------------------- config (hot, fail closed)
     def team_rooms_cfg(self) -> dict:
@@ -192,7 +199,8 @@ class TeamRoomsMixin:
 
     def _tr_recount(self) -> dict:
         """Attachments that can still emit a ``team_detached`` (pre-paid, see ``REVOCABLE_CREATE``)."""
-        return {"teamattach": sum(1 for a in self._tr_attach.values() if a["state"] == "attached")}
+        return {"teamattach": sum(1 for a in self._tr_attach.values() if a["state"] == "attached"),
+                "dglevel": sum(1 for lv in self._tr_level.values() if lv["level"] == "direct")}   # each can emit a lowering
 
     # ----------------------------------------------------------------- guards
     def _tr_owner(self, pr, room_id: str, audit_action: str) -> dict:
@@ -239,14 +247,18 @@ class TeamRoomsMixin:
             return st["level"], st["direct_limits"], True
         return self.team_rooms_cfg()["default_guest_level"], None, False
 
-    @staticmethod
-    def _tr_behaves_as(level: str) -> str:
-        return "suggest" if level == "direct" else level      # direct fails closed until slices 2 and 3
+    def _tr_behaves_as(self, level: str) -> str:
+        """What a level DOES now. ``direct`` is stored either way but acts as ``suggest`` (it fails closed) unless the Direct
+        flag is on, so switching the flag off is the whole rollback."""
+        return "suggest" if level == "direct" and not self.direct_active() else level
 
     def _tr_level_view(self, room_id: str) -> dict:
         level, limits, explicit = self._tr_level_of(room_id)
-        return {"room_id": room_id, "level": level, "explicit": explicit, "direct_limits": limits,
-                "behaves_as": self._tr_behaves_as(level)}
+        out = {"room_id": room_id, "level": level, "explicit": explicit, "direct_limits": limits,
+               "behaves_as": self._tr_behaves_as(level)}
+        if level == "direct":
+            out["effective_limits"] = self._dg_effective_limits(limits)
+        return out
 
     def get_guest_level(self, pr, room_id: str) -> dict:
         self._tr_need_on()
@@ -304,10 +316,15 @@ class TeamRoomsMixin:
             if have is not None and have["level"] == level and have["direct_limits"] == limits:
                 return {**self._tr_level_view(room_id), "replayed": True}
             self._throttle("guest-level:" + pr.key, 30, 600.0, "guest level")
+            # only leaving Direct is a revocation the log pre-paid (setting Direct costs one slot); a toggle among the other
+            # levels is an ordinary write, so it cannot be used to fill the log past the room that revocations need
+            revokes_direct = have is not None and have["level"] == "direct" and level != "direct"
             self._commit("room_guest_level_set", self._actor(
                 pr, project_id=room["project_id"], room_id=room_id, level=level, direct_limits=limits,
+                revokes_direct=revokes_direct,
                 visibility_scope="room", action="room.guest_level.set", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=room_id))
+            self._dg_reconcile_room(room_id)             # Direct: a lowered or narrowed level ends what it no longer allows
             return {**self._tr_level_view(room_id), "replayed": False}
 
     # ----------------------------------------------------------------- attach / detach

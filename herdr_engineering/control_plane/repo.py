@@ -192,6 +192,8 @@ class _BootPhases:
         self._last = now
 
 
+_CONTAINER_ID = re.compile(r"[0-9a-f]{12}|[0-9a-f]{64}")
+
 class ControlPlaneRepo:
     """In-memory structured control-plane state with event sequencing."""
 
@@ -209,6 +211,7 @@ class ControlPlaneRepo:
         self._host_aliases = {str(k): str(v) for k, v in (host_aliases or {}).items() if k and v and k != v}
         self._command_lock = threading.RLock()
         self._event_lock = threading.RLock()
+        self._usage_row_lock = threading.RLock()  # request_id dedupe + write must be atomic
         self._agent_projection_lock = threading.RLock()
         self._agent_records = {}
         self._agent_identity_history = []
@@ -1032,7 +1035,8 @@ class ControlPlaneRepo:
     def list_services(self, *, include_archived=True):
         services = [self._service_projection(s) for s in self._services.values()]
         return _sort_by([s for s in services if include_archived
-                         or not s["lifecycle"]["archived"]], "created_at", reverse=True)
+                         or not s["lifecycle"]["archived"]], "created_at", reverse=True,
+                        id_key="service_id")
 
     def service_catalog_page(self, *, scope='herdr', status='current', include_archived=False,
                              search='', host_id='', group_by='project', limit=100, cursor=None):
@@ -1161,8 +1165,14 @@ class ControlPlaneRepo:
                 base["inventory"] = _copy(rec["inventory"])
         return merged
 
+    @staticmethod
+    def _is_container_id(host):
+        """A docker container id (12 or 64 hex digits) that never reported a tailnet address: a container, not a machine."""
+        return bool(_CONTAINER_ID.fullmatch(str(host.get("host_name") or host.get("host_id") or ""))) and not host.get("tailnet_ip")
+
     def list_hosts(self):
-        hosts = [self._with_problems(h) for h in self._merged_hosts().values()]
+        """Machines only: container ids with no tailnet address are kept in the store but never listed."""
+        hosts = [self._with_problems(h) for h in self._merged_hosts().values() if not self._is_container_id(h)]
         return _sort_by(hosts, "host_name")
 
     def host_snapshot(self, host_id):
@@ -1201,7 +1211,7 @@ class ControlPlaneRepo:
             ),
         )
 
-    def set_host_policy(self, host_id, *, mode, expected_revision, allow_tags=(), deny_tags=(), reason=None):
+    def set_host_policy(self, host_id, *, mode, expected_revision, allow_tags=None, deny_tags=None, reason=None):
         """Update scheduler policy with optimistic concurrency and an audit event."""
         with self.scheduler_admission():
             return self._set_host_policy(host_id, mode=mode, expected_revision=expected_revision,
@@ -1218,8 +1228,10 @@ class ControlPlaneRepo:
         next_policy = {
             "mode": mode.value,
             "revision": int(current.get("revision", 0)) + 1,
-            "allow_tags": sorted({str(v).strip().lower() for v in allow_tags if str(v).strip()}),
-            "deny_tags": sorted({str(v).strip().lower() for v in deny_tags if str(v).strip()}),
+            "allow_tags": sorted({str(v).strip().lower() for v in (
+                current.get("allow_tags", ()) if allow_tags is None else allow_tags) if str(v).strip()}),
+            "deny_tags": sorted({str(v).strip().lower() for v in (
+                current.get("deny_tags", ()) if deny_tags is None else deny_tags) if str(v).strip()}),
             "reason": str(reason)[:300] if reason else None,
         }
         self.record_event("host", host_id, "HostPolicyChanged", next_policy, require_durable=True)
@@ -3170,6 +3182,14 @@ class ControlPlaneRepo:
                   "mission_id": _usage_id(row.get("mission_id")),
                   "key_id": _usage_str(row.get("key_id"), 128),
                   "duration_ms": _usage_int(row.get("duration_ms"))}
+        # Idempotent on request_id: the proxy retries a POST whose reply it never saw, and the first
+        # attempt may have been recorded. ``_token_usage`` is rebuilt from events, so this survives restarts.
+        with self._usage_row_lock:
+            if common["request_id"] and common["request_id"] in self._token_usage:
+                return self._token_usage[common["request_id"]]
+            return self._record_token_usage_row_locked(row, project, model, common)
+
+    def _record_token_usage_row_locked(self, row, project, model, common):
         tokens = [_usage_int(row.get(k)) for k in _TOKEN_FIELDS]
         source = (row.get("source") if row.get("source") in ("llm-proxy", "transcript", "llm-gateway")
                   else "llm-proxy")
@@ -3481,23 +3501,34 @@ class ControlPlaneRepo:
         return [{k: v for k, v in key.items() if k != "key_hash"}
                 for key in self._llm_keys()]
 
-    def upsert_custom_model(self, name, base_url, upstream_model=None, project=None, *,
-                            fabric_model=None, context_window=8192):
-        if not name or not base_url:
-            raise ValueError("name and base_url are required")
-        if not str(base_url).startswith(("http://", "https://")):
+    def upsert_custom_model(self, name, base_url=None, upstream_model=None, project=None, *,
+                            fabric_model=None, context_window=8192, fallback_models=None):
+        """``base_url`` is the optional private service; ``fallback_models`` are fnmatch patterns of gateway models used
+        instead when the advertised ``fabric_model`` is not ready. One of the two must exist."""
+        if fallback_models is not None:
+            if (not isinstance(fallback_models, list) or not 1 <= len(fallback_models) <= 8
+                    or any(not isinstance(p, str) or not p or len(p) > 128 or not p.isprintable()
+                           or any(c.isspace() for c in p) for p in fallback_models)):
+                raise ValueError("fallback_models must be one to eight gateway model patterns without whitespace")
+        if not name or not (base_url or fallback_models):
+            raise ValueError("name and a base_url or fallback_models are required")
+        if base_url and not str(base_url).startswith(("http://", "https://")):
             raise ValueError("base_url must be http(s)")
-        payload = {"name": name, "base_url": base_url.rstrip("/"),
-                   "upstream_model": upstream_model or name, "project": project,
-                   "deleted": False}
+        payload = {"name": name, "upstream_model": upstream_model or name, "project": project, "deleted": False}
+        if base_url:
+            payload["base_url"] = base_url.rstrip("/")
         if fabric_model is not None:
             if (not isinstance(fabric_model, str) or not fabric_model
                     or len(fabric_model) > 256 or not fabric_model.isprintable()
                     or any(c.isspace() for c in fabric_model)):
                 raise ValueError("fabric_model must be a bounded model identity without whitespace")
+            payload["fabric_model"] = fabric_model
+        if fabric_model is not None or fallback_models:
             if type(context_window) is not int or not 1 <= context_window <= 1048576:
                 raise ValueError("context_window must be an integer between 1 and 1048576")
-            payload.update(fabric_model=fabric_model, context_window=context_window)
+            payload["context_window"] = context_window
+        if fallback_models:
+            payload["fallback_models"] = list(fallback_models)
         return self.record_event("custom_model", name, "custom_model.upserted", payload)
 
     def delete_custom_model(self, name):

@@ -598,6 +598,7 @@ class TeamRolesMixin:
             if (not pt or pt["room_id"] != room_id or pt["target"] != pr.id or self._task_status(pt) != "accepted"
                     or (coord is not None and (pt["seq"] < first or not self._creator_valid(pt, room)))):
                 raise _err(400, "agents delegate: parent_task_id must be a task you accepted in this room")
+            self._dg_refuse_child(pr, room, pt)            # T-TC5: a guest's task is not handed on
             depth, root = pt["depth"] + 1, pt["root"]
             if depth > MAX_TASK_DEPTH:
                 raise _err(400, "task chain is too deep")
@@ -609,7 +610,7 @@ class TeamRolesMixin:
         root_id = None
         if coord is not None:
             root_id = pt["coord"]["root"] if pt.get("coord") else parent
-            self._tc_check_caps(coord, limits, root_id, depth)
+            self._tc_check_caps(coord, limits, root_id, depth, pr)
         self._prune()
         work = self._tr2_work(room_id, reviews) if reviews is not None else None
         why = self._tr2_disqualified(work) if work is not None else {}

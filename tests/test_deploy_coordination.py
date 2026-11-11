@@ -567,3 +567,43 @@ def test_initially_absent_web_skips_prewarm_network_and_is_recreated(env):
     metadata = json.loads(next(state(env).glob("attempt-*/metadata.json")).read_text())
     assert metadata["outcome"] == "succeeded"
     assert not (state(env) / "rollout-owner.json").exists()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("pause", [False, True])
+def test_prewarm_waits_for_lock_and_optionally_pauses_worker(env, fail, pause):
+    _seed_previous(env, _layout_commit())
+    docker = env["tmp"] / "bin/docker"
+    original = docker.with_suffix(".pause-original")
+    docker.rename(original)
+    docker.write_text(f'''#!/usr/bin/env bash
+case "$*" in
+  "inspect -f {{{{.State.Running}}}} herdr-cp-worker") echo true; exit 0 ;;
+  "stop -t 60 herdr-cp-worker"|"start herdr-cp-worker") echo "worker-$1" >> '{env["log"]}'; exit 0 ;;
+esac
+if [ "$1" = run ]; then
+  echo "prewarm-run $*" >> '{env["log"]}'
+  [ "${{STUB_PREWARM_FAIL:-}}" != 1 ] || exit 1
+  echo '{{"ok": true}}'
+  exit 0
+fi
+exec '{original}' "$@"
+''')
+    docker.chmod(0o755)
+    if fail:
+        env["env"]["STUB_PREWARM_FAIL"] = "1"
+    argv = command(env) + (["--pause-worker"] if pause else [])
+    result = subprocess.run(argv, cwd=ROOT, env=env["env"], capture_output=True,
+                            text=True, timeout=DEPLOY_TIMEOUT)
+    lines = env["log"].read_text().splitlines()
+    run = next(line for line in lines if line.startswith("prewarm-run "))
+    assert "--lock-wait 420" in run
+    assert result.returncode == (1 if fail else 0), result.stdout + result.stderr
+    events = [line.split()[0] for line in lines if line.startswith(("worker-", "prewarm-run"))]
+    if pause:
+        # Stopped before the prewarm and started again right after it, failure included.
+        assert events == ["worker-stop", "prewarm-run", "worker-start"]
+        resumed = lines.index("worker-start")
+        assert not any(" up " in line for line in lines[:resumed])
+    else:
+        assert events == ["prewarm-run"]

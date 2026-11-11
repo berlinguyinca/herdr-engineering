@@ -152,9 +152,11 @@ def test_publisher_excludes_other_materializers_and_releases_on_failure():
             try:
                 with pytest.raises(RuntimeError, match='failed build'):
                     async with ProjectionStore(conn).publisher():
-                        with pytest.raises(CheckpointInvalid, match='materializer'):
+                        with pytest.raises(CheckpointInvalid, match='materializer') as refused:
                             async with ProjectionStore(other).publisher():
                                 pytest.fail('overlapping checkpoint builds')
+                        holder_pid = await conn.fetchval('SELECT pg_backend_pid()')
+                        assert f'held by pid {holder_pid}' in str(refused.value)
                         # Readers still obtain a fenced snapshot.
                         async with ProjectionStore(other).snapshot():
                             pass

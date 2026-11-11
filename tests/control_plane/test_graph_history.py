@@ -49,27 +49,19 @@ class TestHistorySlice:
 
 
 class TestSloScale:
-    def test_ingest_scales_linearly_not_quadratically(self):
-        """Projecting a 1000-node + 999-edge fixture must scale ~linearly.
-
-        An absolute seconds budget depends on the runner's CPU and disk (CI runs on
-        mixed hardware), so compare 1000 nodes against 100 nodes measured on the same
-        machine in the same process: linear is ~10x, quadratic ~100x. Best-of-3 on each
-        side discards scheduler noise.
-        """
-        def best(n):
-            runs = []
-            for _ in range(3):
-                t0 = time.perf_counter()
-                g = build(n)
-                runs.append(time.perf_counter() - t0)
-            return min(runs), g
-
-        small, _ = best(100)
-        large, g = best(1000)
-        assert len(g.snapshot()["nodes"]) == 1000
-        ratio = large / max(small, 1e-6)
-        assert ratio < 40, f"1000 nodes took {ratio:.1f}x the 100-node time (linear ~10x, quadratic ~100x)"
+    def test_p95_ingest_under_target(self):
+        """Project a 1000-node + 999-edge fixture well under a 1s budget
+        (acceptance target p95 < 2s)."""
+        # Best of five: a loaded CI host inflates any single wall-clock sample (1.47s once, under load, for ~0.2s of
+        # work), but a real slowdown raises every sample, so the minimum still fails on a genuine regression.
+        elapsed = float("inf")
+        for _ in range(5):
+            t0 = time.perf_counter()
+            g = build(1000)
+            elapsed = min(elapsed, time.perf_counter() - t0)
+        snap = g.snapshot()
+        assert len(snap["nodes"]) == 1000
+        assert elapsed < 1.0, f"projection took {elapsed:.3f}s (budget 1.0s)"
 
     def test_duplicate_stream_failure_recovery(self):
         g = GraphProjection()

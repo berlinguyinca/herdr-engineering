@@ -21,13 +21,14 @@
 
   /* text */
   --text: #353740;
-  --text-secondary: #6e6e80;
-  --text-muted: #8e8ea0;
+  --text-secondary: #5a5a6e;
+  --text-muted: #666678;
   --text-on-accent: #ffffff;
 
   /* brand / accent (ChatGPT green) */
-  --accent: #10a37f;
-  --accent-hover: #0d8f6f;
+  --accent: #0a7258;
+  --accent-hover: #085f48;
+  --accent-ink: #0a6e56; /* accent text on --accent-weak: 5.1:1; light --accent and --text-muted clear 4.5:1 on every surface */
   --accent-weak: #d2f0e8;
   --accent-strong: var(--accent-hover);
 
@@ -36,12 +37,12 @@
   --violet-weak: #e8e2fb;
 
   /* semantic status colors (Spec §9) */
-  --status-ok: #0d9d6c;        /* healthy / complete */
+  --status-ok: #08794f;        /* healthy / complete */
   --status-active: #2563eb;    /* active / running */
   --status-waiting: #9ca3af;   /* waiting */
-  --status-attention: #d97706; /* needs attention */
+  --status-attention: #b45309; /* needs attention */
   --status-blocked: #ea580c;   /* blocked */
-  --status-failed: #dc2626;    /* failed / critical */
+  --status-failed: #b91c1c;    /* failed / critical */
   --status-planning: #7152e3;  /* planning / specification (violet) */
   --status-ready: #6b7280;     /* ready (gray) */
   --status-testing: #0e7490;   /* testing (cyan/blue) */
@@ -137,6 +138,7 @@
     --text-on-accent: #07211a;
     --accent: #2fc59c;
     --accent-hover: #4ad6b0;
+    --accent-ink: #2fc59c;
     --accent-weak: #153d33;
     --violet: #a08cf5;
     --violet-weak: #2a2447;
@@ -200,6 +202,7 @@
   --text-on-accent: #07211a;
   --accent: #2fc59c;
   --accent-hover: #4ad6b0;
+  --accent-ink: #2fc59c;
   --accent-weak: #153d33;
   --violet: #a08cf5;
   --violet-weak: #2a2447;
@@ -300,3 +303,29 @@
   :root[data-density] .ci-health-grid :is(td, thead th:not(.ci-health-project)) { width: 48px; min-width: 48px; }
   :root[data-density] .ci-health-cell { min-width: 44px; }
 }
+
+/* Report detail view (the dashboard's artifact reader and its share panel). The detail shell is not inside the registry card, so the
+   registry's field rules are repeated here with the same theme tokens; otherwise textareas fall back to the browser's flat grey. */
+[data-artifact-detail] .hd-input { box-sizing: border-box; min-width: 0; max-width: 100%; padding: 8px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); font: inherit; }
+[data-artifact-detail] fieldset { min-width: 0; margin: 12px 0; padding: 8px 12px; color: var(--text); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+[data-artifact-detail] legend { padding: 0 4px; }
+/* a label that wraps its control stacks the caption over it with a gap (a label that merely contains a checkbox is left alone) */
+[data-artifact-detail] label:has(> select, > textarea, > input:not([type="checkbox"])) { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin: 0 0 12px; }
+[data-artifact-detail] label:has(> textarea, > input:not([type="checkbox"])) { align-items: stretch; }
+[data-artifact-detail] [data-panel-tabs] { flex-wrap: nowrap; gap: 4px; margin-bottom: 12px; }
+[data-artifact-detail] [data-panel-tabs] > button { flex: 1 1 auto; min-width: 0; padding: 0 6px; }
+[data-artifact-detail] [data-share-panel] > h3 { margin: 20px 0 8px; }
+[data-artifact-detail] .hd-card .hd-inline { gap: 12px; }
+
+/* Below phone width each row of the downloads table is a labelled block; the roles on the markup keep the table semantics. */
+@media (max-width: 600px) {
+  .hd-table--stack, .hd-table--stack tbody { display: block; }
+  .hd-table--stack thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .hd-table--stack tr { display: block; margin: 0 0 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); }
+  .hd-table--stack td { display: block; min-width: 0; padding: 8px 12px; overflow-wrap: anywhere; border-bottom: 1px solid var(--border-subtle); }
+  .hd-table--stack td:last-child { border-bottom: 0; }
+  .hd-table--stack td::before { content: attr(data-label); display: block; margin-bottom: 2px; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-secondary); }
+}
+
+/* Secondary note text (the static-preview banner, version captions): muted and small, never the browser default. */
+.hd-note { color: var(--text-secondary); font-size: 0.8125rem; line-height: 1.5; }

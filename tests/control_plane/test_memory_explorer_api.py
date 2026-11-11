@@ -28,13 +28,13 @@ class FakeAdapter:
     def __init__(self, records=None, fail=False):
         self.records, self.fail, self.calls = records or [], fail, []
 
-    def recall(self, query, *, scope=None, project=None, max_results=200):
+    def recall(self, query, *, scope=None, project=None, max_results=200, kind="fact"):
         self.calls.append(("recall", scope, project))
         if self.fail:
             raise MemoryUnavailable("down")
         return {"results": list(self.records), "degraded": False, "offline": False, "timing_ms": 3}
 
-    def get(self, memory_id, *, scope="project", project=None):
+    def get(self, memory_id, *, scope="project", project=None, kind="fact"):
         self.calls.append(("get", memory_id))
         if self.fail:
             raise MemoryUnavailable("down")
@@ -145,7 +145,7 @@ def test_filters_and_paging(server):
     _, body = get(server, "/api/v1/memory/search?q=x&host=bender&harness=claude&limit=1&offset=1")
     assert len(body["results"]) == 1 and body["has_more"] is True and body["offset"] == 1
     assert get(server, "/api/v1/memory/search?q=x&host=other")[1]["results"] == []
-    assert get(server, "/api/v1/memory/search?q=x&kind=decision")[1]["results"] == []
+    assert get(server, "/api/v1/memory/search?q=x&kind=decision")[0] == 400
     assert get(server, "/api/v1/memory/search?q=x&status=superseded")[1]["note"]
     assert get(server, "/api/v1/memory/search")[0] == 400
     assert get(server, "/api/v1/memory/search?q=x&limit=abc")[0] == 400
@@ -211,4 +211,4 @@ def test_cli_argv_matches_real_herdr_memory_parser():
     MemoryAdapter(runner=run).recall("q", scope="global", project="p1")
     MemoryAdapter(runner=run).get("m1", scope="infra")
     assert seen[0][:3] == ["herdr-memory", "--project", "p1"] and seen[0][3] == "recall"
-    assert seen[1] == ["herdr-memory", "get", "m1", "--scope", "infra"]
+    assert seen[1] == ["herdr-memory", "get", "m1", "--scope", "infra", "--kind", "fact"]

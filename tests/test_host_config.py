@@ -577,10 +577,11 @@ def _agent_setup(monkeypatch, tmp_path, live, loader_cfgs):
             self.client, self.cfg = client, config
             log["clients"].append((client.gateway_url, client.token))
 
-        def retarget(self, client, cp):
+        def retarget(self, client, cp, key=None):
             self.client = client
             log["clients"].append((client.gateway_url, client.token))
             log["cps"].append(cp)
+            log.setdefault("keys", []).append(key)
 
         def scan_once(self):
             return {}

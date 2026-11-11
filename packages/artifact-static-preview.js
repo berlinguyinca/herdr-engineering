@@ -1,15 +1,44 @@
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 
-// Dashboard previews without frames. Rendered foreign markup is the server's nh3 copy (scripts, frames, forms and
+// Dashboard previews without frames (the one exception, a sandboxed report page, lives in artifact-rich-view.js). Rendered foreign markup is the server's nh3 copy (scripts, frames, forms and
 // event handlers are gone) and is placed inside an open shadow root under a paint-contained wrapper. PDFs are drawn on
 // canvases by the vendored pdf.js. The raw file is only reachable through the sandboxed live route in a new tab.
 
-export const STATIC_NOTE = 'Scripts, frames and embedded media are not shown in this static copy';
+export const STATIC_NOTE = 'Scripts, frames, audio and video are not shown in this static copy';
 export const PDF_FAILED = 'This PDF could not be drawn';
 const PDFJS_MODULE = '/vendor/pdfjs/pdf.min.mjs';
 const PDFJS_WORKER = '/vendor/pdfjs/pdf.worker.min.mjs';
 const MAX_PDF_PAGES = 200;
 const KEPT_HREF = /^(?:https?:\/\/[^\s\\]|mailto:)/i;
+
+// On paper the scroll box must not clip the copy to its 640px screen height, and the screen-only note is dropped.
+export const PRINT_CSS = '@media print{[data-static-preview]{max-height:none!important;overflow:visible!important;contain:none!important}[data-static-note]{display:none!important}}';
+
+function ensurePrintStyle(doc) {
+  const head = doc.head;
+  if (!head || doc.querySelector?.('style[data-static-print]')) return;
+  const style = doc.createElement('style');
+  style.setAttribute('data-static-print', '');
+  style.textContent = PRINT_CSS;
+  head.append(style);
+}
+
+// The server drops the report's own stylesheet from this copy, so the highlight for a linked finding is added here.
+export const TARGET_CSS = '.is-target{outline:2px solid Highlight;outline-offset:2px;background:color-mix(in srgb,Highlight 14%,transparent)}';
+
+const fragmentId = href => {
+  if (typeof href !== 'string' || !href.startsWith('#') || href.length < 2) return null;
+  try { return decodeURIComponent(href.slice(1)); } catch { return null; }
+};
+
+/** Scroll `target` into view inside the preview, mark it (one at a time) and move keyboard focus to it. */
+export function revealTarget(shadow, target) {
+  for (const old of shadow.querySelectorAll?.('.is-target') ?? []) old.classList.remove('is-target');
+  target.classList.add('is-target');
+  if (!target.hasAttribute('tabindex')) target.setAttribute('tabindex', '-1');
+  target.scrollIntoView?.({ block: 'start' });
+  target.focus?.({ preventScroll: true });
+}
 
 /** True for an absolute http(s) or mailto link: the only links a static copy keeps. */
 export const isKeptHref = href => typeof href === 'string' && KEPT_HREF.test(href.trim());
@@ -17,9 +46,14 @@ export const isKeptHref = href => typeof href === 'string' && KEPT_HREF.test(hre
 /**
  * Show the server-sanitised html in `container`. The wrapper carries `contain: paint` so nothing the copy styles
  * (position: fixed on the shadow host included) can paint outside it; the shadow root is on an inner element.
- * Links that are not absolute are unwrapped so a fragment link can never drive the SPA's hash router.
+ * Links that are not absolute are unwrapped so a fragment link can never drive the SPA's hash router. The one exception
+ * is a fragment link whose target id exists inside the copy (a finding's "#" permalink, a table-of-contents entry): it
+ * is kept, never reaches the router (the click is cancelled), scrolls to and highlights its target, and, when the caller
+ * gives `permalink(id)`, carries a real deep-link href and reports the choice through `onNavigate(id, url)`.
+ * `focus` names an id to reveal on mount.
  */
-export function mountStaticHtml(container, html, { label = 'Static preview', document: doc = globalThis.document } = {}) {
+export function mountStaticHtml(container, html, { label = 'Static preview', document: doc = globalThis.document, theme, focus, permalink, onNavigate } = {}) {
+  ensurePrintStyle(doc);
   const note = doc.createElement('p');
   note.className = 'hd-note';
   note.setAttribute('data-static-note', '');
@@ -30,17 +64,41 @@ export function mountStaticHtml(container, html, { label = 'Static preview', doc
   wrapper.setAttribute('aria-label', label);
   wrapper.setAttribute('style', 'contain:paint;overflow:auto;max-height:640px');
   const host = doc.createElement('div');
+  // The dashboard's own theme (data-theme on the document root) drives the copy's light/dark; the copy's stylesheet
+  // reads data-theme on its shadow host and falls back to the OS scheme when it is absent.
+  const forced = theme ?? doc.documentElement?.getAttribute('data-theme');
+  if (forced === 'light' || forced === 'dark') host.setAttribute('data-theme', forced);
   wrapper.append(host);
   container.replaceChildren(note, wrapper);
   // The declarative template element does not attach through innerHTML, so the root is attached imperatively.
   const shadow = host.attachShadow({ mode: 'open' });
   shadow.innerHTML = String(html ?? '');
+  let wired = false;
   for (const link of [...shadow.querySelectorAll('a')]) {
-    if (isKeptHref(link.getAttribute('href'))) {
+    // The server drops relative hrefs, so a permalink ("a.anchor") has none: it names the card or section that holds its heading.
+    const id = fragmentId(link.getAttribute('href')) ?? (link.classList?.contains('anchor') ? link.closest?.('article[id],section[id]')?.getAttribute('id') : null);
+    const target = id && typeof shadow.getElementById === 'function' ? shadow.getElementById(id) : null;
+    if (target) {
+      wired = true;
+      const url = typeof permalink === 'function' ? permalink(id) : null;
+      link.setAttribute('href', url || `#${encodeURIComponent(id)}`);   // an <a> without href is not keyboard-focusable
+      link.addEventListener('click', event => {
+        event.preventDefault();
+        revealTarget(shadow, target);
+        if (url) onNavigate?.(id, url);
+      });
+    } else if (isKeptHref(link.getAttribute('href'))) {
       link.setAttribute('target', '_blank');
       link.setAttribute('rel', 'noopener noreferrer');
     } else link.replaceWith(...link.childNodes);
   }
+  if (wired || focus) {
+    const style = doc.createElement('style');
+    style.textContent = TARGET_CSS;
+    shadow.append?.(style);
+  }
+  const first = focus && typeof shadow.getElementById === 'function' ? shadow.getElementById(focus) : null;
+  if (first) revealTarget(shadow, first);
   return wrapper;
 }
 

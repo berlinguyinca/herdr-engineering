@@ -16,6 +16,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { chromium } from 'playwright';
+import { scaled, BASE_WAIT_MS } from './ui-gates-lib.mjs';   // waits stretch with host load (loadScale)
 
 const REPO = path.resolve(import.meta.dirname, '..', '..');
 const PY = process.env.PYTHON
@@ -48,7 +49,7 @@ async function startServer(env = {}) {
   });
   const port = await new Promise((resolve, reject) => {
     let buf = '';
-    const timer = setTimeout(() => reject(new Error('server start timeout')), 20000);
+    const timer = setTimeout(() => reject(new Error('server start timeout')), scaled(20000));
     proc.stdout.on('data', (d) => {
       buf += d.toString();
       let m;
@@ -88,6 +89,7 @@ async function withApp(fn, env = {}) {
   try {
     browser = await launchBrowser();
     const page = await browser.newPage();
+    page.setDefaultTimeout(scaled(BASE_WAIT_MS));
     const base = `http://127.0.0.1:${srv.port}`;
     return await fn({ page, base });
   } finally {
@@ -114,7 +116,7 @@ test('every page renders without rate-limit / fetch errors', async () => {
       // (non-burst) render.
       await page.waitForFunction(
         (n) => (document.body ? document.body.innerText : '').includes(n),
-        needle, { timeout: 15000 });
+        needle, { timeout: scaled(15000) });
       const text = await bodyText(page);
       assert.ok(!text.includes('too many requests'),
         `rate-limit error on ${route}:\n${text.slice(0, 400)}`);
@@ -130,7 +132,7 @@ test('overview survives a heavy event burst without rate limiting', async () => 
     await page.goto(`${base}/#/overview`);
     await page.waitForFunction(
       () => (document.body ? document.body.innerText : '').includes('Overview'),
-      null, { timeout: 15000 });
+      null, { timeout: scaled(15000) });
     // The throttled live refresh re-renders (and briefly shows the spinner),
     // so we only assert that NO error card ever appears during the burst and
     // that the overview recovers afterwards — never that the word "Overview"
@@ -147,7 +149,7 @@ test('overview survives a heavy event burst without rate limiting', async () => 
     // The view must recover (not be stuck on an error card).
     await page.waitForFunction(
       () => (document.body ? document.body.innerText : '').includes('Overview'),
-      null, { timeout: 10000 });
+      null, { timeout: scaled(10000) });
   });
 });
 
@@ -324,24 +326,24 @@ test('pi-sourced mission detail renders by mission_key', async () => {
     await page.locator('[data-filter=recorded]').click();
     // Recorded missions remain available through their history group.
     // The href encodes the complete namespace; the hash router decodes it once.
-    await page.waitForSelector('a[href="#/missions/pi%3AMSN-PI1"]', { timeout: 15000 });
+    await page.waitForSelector('a[href="#/missions/pi%3AMSN-PI1"]', { timeout: scaled(15000) });
     await page.click('a:has-text("Pi mission")');
     // Detail route uses the mission_key, not the bare mission_id (UI-005).
     await page.waitForFunction(
       () => (location.hash === `#/missions/${encodeURIComponent('pi:MSN-PI1')}`
         || location.hash === '#/missions/pi:MSN-PI1'),
-      null, { timeout: 15000 });
+      null, { timeout: scaled(15000) });
     // The mission resolves by key: title renders, not a "Mission not found" card.
     await page.waitForFunction(
       () => document.querySelector('#view h1')?.textContent === 'Pi mission',
-      null, { timeout: 15000 });
+      null, { timeout: scaled(15000) });
     assert.ok(!(await bodyText(page)).includes('Mission not found'));
     // The event stream is queried by mission_key, so the seeded stage event
     // (recorded under 'pi:MSN-PI1') must render — not the empty state.
     await page.waitForFunction(() => {
       const el = document.getElementById('mission-stream');
       return el && !el.innerHTML.includes('No events for this entity yet');
-    }, null, { timeout: 15000 });
+    }, null, { timeout: scaled(15000) });
     await page.locator('[data-history-panel=events] > summary').click();
     const streamText = await page.locator('#mission-stream').innerText();
     assert.ok(streamText.includes('MissionStageChanged'),
@@ -355,7 +357,7 @@ test('mission detail renders the timeline', async () => {
     await page.goto(`${base}/#/missions/pi:MSN-PI1`);
     await page.locator('[data-history-panel=timeline] > summary').click();
     // Merged timeline (UI-009): stage events + test run + merged PR.
-    await page.waitForSelector('herdr-timeline .hd-timeline__item', { timeout: 15000 });
+    await page.waitForSelector('herdr-timeline .hd-timeline__item', { timeout: scaled(15000) });
     const kinds = await page.evaluate(() =>
       Array.from(document.querySelectorAll('herdr-timeline .hd-timeline__item'))
         .map((el) => el.getAttribute('data-kind')));
@@ -376,7 +378,7 @@ test('mission detail surfaces telemetry state and stall age (issue #31)', async 
   await withApp(async ({ page, base }) => {
     // pi:MSN-PI1 has no live collector, so its telemetry_state is UNKNOWN.
     await page.goto(`${base}/#/missions/pi:MSN-PI1`);
-    await page.waitForSelector('[data-telemetry-state]', { timeout: 15000 });
+    await page.waitForSelector('[data-telemetry-state]', { timeout: scaled(15000) });
     const badge = await page.locator('[data-telemetry-state]').innerText();
     assert.match(badge, /Telemetry unknown/, `telemetry badge should say unknown (got "${badge}")`);
     // A Stall age metric is rendered and, for a no-collector mission, is unknown.
@@ -411,7 +413,7 @@ test('inspector: tabs, redaction/ACL, reasoning gating, search, layout, live too
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto(`${base}/${hash}`);
     await page.locator('#advanced-inspector > summary').click();
-    await page.waitForSelector('.hd-ins__tab', { timeout: 15000 });
+    await page.waitForSelector('.hd-ins__tab', { timeout: scaled(15000) });
     const inspector = () => page.locator('#ins-root');
 
     // default view = conversation
@@ -433,7 +435,7 @@ test('inspector: tabs, redaction/ACL, reasoning gating, search, layout, live too
     assert.ok(text.includes('builder') && text.includes('running') && text.includes('error'));
     await postInspector(base, sid, [{ kind: 'tool', call_id: 'c2', phase: 'end', output: 'built', exit_code: 0, agent_id: 'builder' }]);
     await page.waitForFunction(() => [...document.querySelectorAll('.hd-ins__row')]
-      .some((r) => r.innerText.includes('make build') && /\bok\b/.test(r.innerText) && !/running/.test(r.innerText)), null, { timeout: 8000 });
+      .some((r) => r.innerText.includes('make build') && /\bok\b/.test(r.innerText) && !/running/.test(r.innerText)), null, { timeout: scaled(8000) });
 
     // files + diff inspection
     await page.click('[data-view=files]');
@@ -489,7 +491,7 @@ test('inspector: live events do not clobber typing, open prefs form, scroll posi
     await page.waitForSelector('.hd-ins__tab');
     const msgs = (n, tag) => Array.from({ length: n }, (_, i) => ({ kind: 'message', role: 'assistant', text: `${tag}-${i} `.padEnd(300, 'x') }));
     await postInspector(base, sid, msgs(60, 'bulk'));
-    await page.waitForFunction(() => document.querySelectorAll('.hd-ins__row').length >= 60, null, { timeout: 8000 });
+    await page.waitForFunction(() => document.querySelectorAll('.hd-ins__row').length >= 60, null, { timeout: scaled(8000) });
 
     // open prefs, edit, then let live events arrive: edits must survive
     await page.click('#ins-prefs');
@@ -507,7 +509,7 @@ test('inspector: live events do not clobber typing, open prefs form, scroll posi
     const before = await page.evaluate(() => document.querySelector('.hd-ins__list').scrollTop);
     assert.ok(before > 100, `list must be scrollable (scrollTop=${before})`);
     await postInspector(base, sid, msgs(3, 'late'));
-    await page.waitForFunction(() => document.querySelector('.hd-ins__list').innerText.includes('late-2'), null, { timeout: 8000 });
+    await page.waitForFunction(() => document.querySelector('.hd-ins__list').innerText.includes('late-2'), null, { timeout: scaled(8000) });
     const after = await page.evaluate(() => document.querySelector('.hd-ins__list').scrollTop);
     assert.ok(after >= before - 5, `scroll jumped: ${before} -> ${after}`);
   }, { BURST: '0', INSPECTOR_SEED: '0' });
@@ -724,14 +726,20 @@ test('service catalog filters, archive inspection and groups survive live refres
     assert.equal(await page.locator('.sc-row').filter({hasText:'Archived parser'}).count(),0);
     assert.equal(await page.locator('.sc-row').filter({hasText:'Inactive parser'}).count(),0);
     await page.locator('[data-filter=unknown]').click();
+    // paged catalogs refetch on filter/search, so the rows settle asynchronously
+    await page.waitForFunction(t=>{const r=document.querySelectorAll('.sc-row');return r.length===1&&r[0].innerText.includes(t);},'Stale healthy parser');
     assert.equal(await page.locator('.sc-row').count(),1);
     assert.match(await page.locator('.sc-row').innerText(), /Stale healthy parser/);
     assert.match(await page.locator('.sc-health').innerText(), /Unconfirmed/);
     await page.locator('[data-filter=archived]').click();
+    // paged catalogs refetch on filter/search, so the rows settle asynchronously
+    await page.waitForFunction(t=>{const r=document.querySelectorAll('.sc-row');return r.length===1&&r[0].innerText.includes(t);},'Archived parser');
     assert.equal(await page.locator('.sc-row').count(),1);
     assert.match(await page.locator('.sc-row').innerText(), /Archived parser/);
     await page.locator('[data-filter=current]').click();
     await page.locator('#sc-search').fill('spectra 8080');
+    // paged catalogs refetch on filter/search, so the rows settle asynchronously
+    await page.waitForFunction(t=>{const r=document.querySelectorAll('.sc-row');return r.length===1&&r[0].innerText.includes(t);},'Parse experimental spectra');
     assert.equal(await page.locator('.sc-row').count(),1);
     assert.match(await page.locator('.sc-row').innerText(), /Parse experimental spectra/);
     await page.locator('#sc-expand').click();
@@ -744,6 +752,7 @@ test('service catalog filters, archive inspection and groups survive live refres
     await page.locator('#sc-host').selectOption('beast');
     await page.locator('#sc-expand').click();
     const archived=page.locator('.sc-row').filter({hasText:'Archived parser'});
+    await archived.first().waitFor();
     assert.equal(await archived.count(),1);
     assert.equal(await page.locator('a[href^="javascript:"]').count(),0);
     assert.equal(await page.evaluate(()=>window.catalogXss),undefined);
@@ -1560,7 +1569,7 @@ async function alphaMissionKey(page, base) {
   // link may be hidden; read its href directly (works whether or not visible).
   await page.waitForFunction(
     () => [...document.querySelectorAll('a.mc-title')].some((a) => a.textContent.includes('Alpha')),
-    null, { timeout: 20000 });
+    null, { timeout: scaled(20000) });
   return await page.evaluate(() => {
     const link = [...document.querySelectorAll('a.mc-title')].find((a) => a.textContent.includes('Alpha'));
     const hash = link.getAttribute('href'); // href is #/missions/<encoded key>
@@ -1575,7 +1584,7 @@ test('mission tests page lists builds and test runs read-only', async () => {
     // Seeded failing test run and its '1 failed' count.
     await page.waitForFunction(
       () => (document.body ? document.body.innerText : '').includes('failed 1'),
-      null, { timeout: 15000 });
+      null, { timeout: scaled(15000) });
     const text = await bodyText(page);
     assert.ok(text.includes('failed 1'), 'failed run count missing');
     assert.ok(text.includes('passed 2'), 'passed run count missing');
@@ -1604,7 +1613,7 @@ test('mission delivery pages escape hostile text and keep UNKNOWN verdict unknow
     await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/reviews`);
     await page.waitForFunction(
       () => (document.body ? document.body.innerText : '').includes('Changes requested'),
-      null, { timeout: 15000 });
+      null, { timeout: scaled(15000) });
     const text = await bodyText(page);
     assert.ok(text.includes('<img src=x onerror=alert(1)> & hostile'), 'hostile title should remain text');
     assert.equal(await page.locator('img[src="x"]').count(), 0, 'hostile title must not create an image');
@@ -1629,7 +1638,7 @@ test('mission delivery navigation ignores stale delayed responses', async () => 
     await page.goto(`${base}/#/overview`);
     await page.waitForFunction(
       () => (document.body ? document.body.innerText : '').includes('Overview'),
-      null, { timeout: 15000 });
+      null, { timeout: scaled(15000) });
     await page.waitForTimeout(700);
     assert.ok((await bodyText(page)).includes('Overview'), 'stale delivery response replaced the current route');
   }, { BURST: '0' });
@@ -1642,7 +1651,7 @@ test('mission reviews page lists verdict, findings and PR merge status', async (
     // Seeded review verdict and blocking finding.
     await page.waitForFunction(
       () => (document.body ? document.body.innerText : '').includes('Changes requested'),
-      null, { timeout: 15000 });
+      null, { timeout: scaled(15000) });
     const text = await bodyText(page);
     assert.ok(text.includes('blocker'), 'blocking finding missing');
     assert.ok(text.includes('Parser crashes on empty input'), 'finding summary missing');
@@ -1673,7 +1682,7 @@ test('mission delivery pages escape hostile text and ignore stale delayed respon
       await route.fulfill({ response, json: mission });
     });
     await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/reviews`);
-    await page.waitForFunction(() => document.body?.innerText.includes('Changes requested'), null, { timeout: 15000 });
+    await page.waitForFunction(() => document.body?.innerText.includes('Changes requested'), null, { timeout: scaled(15000) });
     assert.ok((await bodyText(page)).includes('<img src=x onerror=alert(1)> & hostile'));
     assert.equal(await page.locator('img[src="x"]').count(), 0);
 
@@ -1682,7 +1691,7 @@ test('mission delivery pages escape hostile text and ignore stale delayed respon
     await page.goto(`${base}/#/missions/${encodeURIComponent(key)}/tests`);
     await page.locator('[data-skeleton][aria-busy="true"]').first().waitFor({ state: 'attached' });
     await page.goto(`${base}/#/overview`);
-    await page.waitForFunction(() => document.body?.innerText.includes('Overview'), null, { timeout: 15000 });
+    await page.waitForFunction(() => document.body?.innerText.includes('Overview'), null, { timeout: scaled(15000) });
     await page.waitForTimeout(700);
     assert.ok((await bodyText(page)).includes('Overview'));
   }, { BURST: '0' });
@@ -1693,11 +1702,13 @@ test('mission detail links to the delivery section pages', async () => {
     const key = await alphaMissionKey(page, base);
     // The mission detail page now carries the section nav (issue #34/#35).
     await page.goto(`${base}/#/missions/${encodeURIComponent(key)}`);
-    await page.locator('a:has-text("Tests & builds")').first().waitFor({ timeout: 15000 });
+    await page.locator('a:has-text("Tests & builds")').first().waitFor({ timeout: scaled(15000) });
     await page.locator('a:has-text("Reviews & PRs")').first().click();
+    // The detail page's own story grid also says "Pull requests", so wait for
+    // the reviews route and for its PR card, not for that shared heading.
     await page.waitForFunction(
-      () => (document.body ? document.body.innerText : '').includes('Pull requests'),
-      null, { timeout: 15000 });
+      () => (document.getElementById('mission-reviews')?.innerText || '').includes('PR #7'),
+      null, { timeout: scaled(15000) });
     assert.ok((await bodyText(page)).includes('PR #7'), 'review section must render via detail nav');
   }, { BURST: '0' });
 });

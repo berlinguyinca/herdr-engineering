@@ -376,6 +376,22 @@ def verify_runtime(container: str, *, runner=None) -> None:
         raise ProfileError("Cannot verify the private memory client runtime") from None
 
 
+def verify_connectivity(container: str, *, runner=None) -> None:
+    """Forward acceptance only: canonical SDK status, never response/error echo."""
+    try:
+        _check_container(container)
+        result = (runner or subprocess.run)(
+            ["docker", "exec", container, "herdr-memory", "--harness", "codex", "status"],
+            capture_output=True, text=True, check=False, timeout=20)
+        if result.returncode or len(result.stdout) > 65536:
+            raise ProfileError("unhealthy status")
+        status = json.loads(result.stdout)
+        if not isinstance(status, dict) or status.get("healthy") is not True:
+            raise ProfileError("unhealthy status")
+    except (ProfileError, OSError, subprocess.SubprocessError, ValueError, TypeError):
+        raise ProfileError("Private memory client connectivity check failed") from None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action", required=True)
@@ -390,6 +406,8 @@ def main(argv=None):
     install.add_argument("--container", required=True)
     verify = actions.add_parser("verify")
     verify.add_argument("--container", required=True)
+    connectivity = actions.add_parser("connectivity")
+    connectivity.add_argument("--container", required=True)
     info = actions.add_parser("policy-info")
     info.add_argument("--fleet-config", required=True, type=Path)
     info.add_argument("--profile-override", action="store_true")
@@ -405,6 +423,8 @@ def main(argv=None):
             install_profile(args.archive, args.container)
         elif args.action == "verify":
             verify_runtime(args.container)
+        elif args.action == "connectivity":
+            verify_connectivity(args.container)
         elif args.action == "check":
             print(json.dumps(check_archive(args.archive)))
         else:
