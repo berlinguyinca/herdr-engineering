@@ -21,7 +21,6 @@ from herdr_engineering.cargo_target_storage import (
     workspace_root,
 )
 
-
 requires_lsof = pytest.mark.skipif(
     shutil.which("lsof") is None,
     reason="open-file inspection needs lsof; migration fails closed without it",
