@@ -8,6 +8,11 @@ production journal (1,762,189 service rows -> 349,664, all 6,544 reconstructed s
   and last row; every row between them is removable.
 * ``ServiceUpdated``: removable only when its payload equals the service's previous ``ServiceUpdated`` payload and it
   is not the last one. Other ``ServiceUpdated`` rows carry state transitions (``unavailable_since``) and stay.
+  "Equal" ignores three pure timestamps (``metadata_updated_at``, ``verified_origin.verified_at``,
+  ``metadata_observation.observed_at``) when ``normalize_service_timestamps`` is true (the default): every heartbeat
+  restamps them, so exact equality removed 32 of 235,252 rows while 99.6% differed only by those timestamps. This is
+  replay-safe because a replay overwrites those keys from the next row and the service's last ``ServiceUpdated`` is never
+  removed; ``updated_at`` comes from that last row's timestamp.
 
 Only rows without a v2 envelope (no source, source sequence or actor) are candidates, and only rows older than
 ``min_age_days``. A pass scans the journal once (read only) into a session temp table of event ids, then moves them
@@ -59,15 +64,22 @@ class CompactionSettings:
     keep_checkpoints: int = 2
     publish_projection_checkpoint: bool = False   # publish a projection checkpoint after a drained pass that moved rows
     projection_lock_wait_seconds: float = 60.0    # how long that publish waits for the materializer lock
+    normalize_service_timestamps: bool = True     # ServiceUpdated rows that differ only by heartbeat timestamps are repeats
 
 
-# The candidate rows. Windows run over the whole stream so "first" and "last" are real, age is applied afterwards.
-_REMOVABLE = """
+# A ServiceUpdated payload without the timestamps every heartbeat restamps (see the module docstring).
+_NORMALISED_PAYLOAD = "((payload - 'metadata_updated_at') #- '{verified_origin,verified_at}' #- '{metadata_observation,observed_at}')"
+
+
+def removable_sql(normalize_service_timestamps: bool = True) -> str:
+    """The candidate rows. Windows run over the whole stream so "first" and "last" are real, age is applied afterwards."""
+    compared = _NORMALISED_PAYLOAD if normalize_service_timestamps else "payload"
+    return f"""
     SELECT event_id, event_type FROM (
         SELECT event_id, event_type, ingest_timestamp, payload,
                schema_version, source, source_sequence, actor,
                row_number() OVER w AS rn, count(*) OVER (PARTITION BY entity_id, event_type) AS cnt,
-               lag(payload) OVER w AS prev_payload
+               lag({compared}) OVER w AS prev_payload
         FROM fabric_events
         WHERE entity_type = 'service' AND entity_id IS NOT NULL
           AND event_type IN ('ServiceListenerObserved', 'ServiceMetadataObserved', 'ServiceUpdated')
@@ -77,14 +89,17 @@ _REMOVABLE = """
       AND schema_version = 1 AND source IS NULL AND source_sequence IS NULL AND actor IS NULL
       AND rn < cnt
       AND ((event_type <> 'ServiceUpdated' AND rn > 1)
-           OR (event_type = 'ServiceUpdated' AND payload IS NOT DISTINCT FROM prev_payload))
+           OR (event_type = 'ServiceUpdated' AND {compared} IS NOT DISTINCT FROM prev_payload))
 """
 
-_COUNT = f"SELECT event_type, count(*) AS n FROM ({_REMOVABLE}) r GROUP BY event_type"
 
-_LIST = f"""
-    CREATE TEMP TABLE compaction_pending AS SELECT event_id FROM ({_REMOVABLE}) r LIMIT $2
-"""
+def _count_sql(normalize: bool) -> str:
+    return f"SELECT event_type, count(*) AS n FROM ({removable_sql(normalize)}) r GROUP BY event_type"
+
+
+def _list_sql(normalize: bool) -> str:
+    return f"CREATE TEMP TABLE compaction_pending AS SELECT event_id FROM ({removable_sql(normalize)}) r LIMIT $2"
+
 
 _MOVE_CHUNK = """
     WITH batch AS (
@@ -114,6 +129,22 @@ def move_chunk_sql(columns: list[str]) -> str:
     """The move statement with every column named, so the archive's column order never has to match the journal's."""
     return _MOVE_CHUNK.format(columns=", ".join(_quote(c) for c in columns),
                               moved_columns=", ".join("moved." + _quote(c) for c in columns))
+
+
+async def sync_archive_columns(conn) -> list[str]:
+    """Give the archive every column the journal has. A column added to ``fabric_events`` after the archive was created
+    (``trace_id``) made ``INSERT ... SELECT moved.*`` fail with "more expressions than target columns", so no pass
+    moved anything and the journal grew until a boot took ten minutes. Returns the journal's column names."""
+    journal = await conn.fetch(_JOURNAL_COLUMNS)
+    have = {r["name"] for r in await conn.fetch(_ARCHIVE_COLUMNS)}
+    for col in journal:
+        if col["name"] not in have:
+            async with conn.transaction():        # never wait long on a lock while the caller's lock is held
+                await conn.execute("SET LOCAL lock_timeout = '5s'")
+                await conn.execute(
+                    f"ALTER TABLE fabric_events_archive ADD COLUMN IF NOT EXISTS {_quote(col['name'])} {col['type']}")
+            log.warning("fabric archive added missing column %s", col["name"])
+    return [r["name"] for r in journal]
 
 
 class FabricCompactor:
@@ -152,7 +183,7 @@ class FabricCompactor:
             return "skipped: apply migration 0035 (fabric_events_archive) first"
         age = s.min_age_days * 86400.0
         if s.dry_run:
-            counts = {r["event_type"]: int(r["n"]) for r in await conn.fetch(_COUNT, age)}
+            counts = {r["event_type"]: int(r["n"]) for r in await conn.fetch(_count_sql(s.normalize_service_timestamps), age)}
             return f"dry run: would archive {sum(counts.values())} rows {dict(sorted(counts.items()))}"
         moved, drained = await self._move(conn, age)
         if moved is None:
@@ -160,7 +191,8 @@ class FabricCompactor:
         purged = 0
         if s.archive_retention_days is not None:
             purged = int((await conn.execute(
-                "DELETE FROM fabric_events_archive WHERE archived_at < now() - make_interval(secs => $1)",
+                "DELETE FROM fabric_events_archive WHERE archived_at < now() - make_interval(secs => $1) "
+                "AND entity_type IS DISTINCT FROM 'inspector'",      # inspector rows are accounted for by the snapshot
                 s.archive_retention_days * 86400.0)).split()[-1])
         if moved:
             self._rebuild_pending = True
@@ -214,7 +246,7 @@ class FabricCompactor:
             await conn.execute("DROP TABLE IF EXISTS compaction_pending")
             columns = await self._sync_archive_columns(conn)
             move_sql = move_chunk_sql(columns)
-            await conn.execute(_LIST, age, s.batch_rows)
+            await conn.execute(_list_sql(s.normalize_service_timestamps), age, s.batch_rows)
             listed = int(await conn.fetchval("SELECT count(*) FROM compaction_pending"))
             while moved < listed:
                 async with conn.transaction():
@@ -242,19 +274,7 @@ class FabricCompactor:
                 log.warning("fabric compaction cleanup failed", exc_info=True)
 
     async def _sync_archive_columns(self, conn) -> list[str]:
-        """Give the archive every column the journal has. A column added to ``fabric_events`` after the archive was created
-        (``trace_id``) made ``INSERT ... SELECT moved.*`` fail with "more expressions than target columns", so no pass
-        moved anything and the journal grew until a boot took ten minutes. Returns the journal's column names."""
-        journal = await conn.fetch(_JOURNAL_COLUMNS)
-        have = {r["name"] for r in await conn.fetch(_ARCHIVE_COLUMNS)}
-        for col in journal:
-            if col["name"] not in have:
-                async with conn.transaction():        # never wait long on a lock while the compaction lock is held
-                    await conn.execute("SET LOCAL lock_timeout = '5s'")
-                    await conn.execute(
-                        f"ALTER TABLE fabric_events_archive ADD COLUMN IF NOT EXISTS {_quote(col['name'])} {col['type']}")
-                log.warning("fabric compaction added missing archive column %s", col["name"])
-        return [r["name"] for r in journal]
+        return await sync_archive_columns(conn)
 
     async def _rebuild(self, conn) -> str:
         from . import recovery_checkpoint as rc

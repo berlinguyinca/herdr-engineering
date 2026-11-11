@@ -10,6 +10,8 @@ import { defineComponents } from './herdr-web-components/index.js';
 import { missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
 import { mountInspector } from './inspector-view.js';
 import { mountSessionWorkspace } from './session-workspace.js';
+import { mountSessionContext } from './session-context.js';
+import { workCenterEnabled } from './work-center-flag.js';
 import { mountTerminalAttach } from './terminal-attach.js';
 import { mountMissionActivity } from './mission-live-view.js';
 import { mountMissionCatalog } from './mission-catalog-view.js';
@@ -17,6 +19,7 @@ import { mountOverview } from './overview-view.js';
 import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
 import { mountGithubProjects } from './github-projects-view.js';
+import { refsFromMissionOutcomes } from './board-links.js';
 import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountArchitecture } from './architecture-view.js';
@@ -182,7 +185,13 @@ root.addEventListener('hd-freshness', (event) => markAvailability(event.detail.o
 window.addEventListener('hashchange', applyRoutes);   // the entry you are on stays listed; leaving it lets it go
 applyRoutes();
 // Optional tabs appear once /api/v1/health advertises their capability; a failed probe keeps them hidden.
-client.health({ probe: true }).then((h) => { capabilities = h?.capabilities || []; applyRoutes(); }).catch(() => { /* optional tabs stay hidden */ });
+const capabilitiesReady = client.health({ probe: true }).then((h) => { capabilities = h?.capabilities || []; applyRoutes(); }).catch(() => { /* optional tabs stay hidden */ });
+// WC-006 rollout gate: the Work Command Center UI exists only while the control plane advertises `work_center_v1`. A failed or
+// slow capability probe means "off" (the pages then behave exactly as before the Work Command Center); the wait is bounded.
+async function workCenterOn() {
+  await Promise.race([capabilitiesReady, new Promise((resolve) => setTimeout(resolve, 3000))]);
+  return workCenterEnabled(capabilities);
+}
 SHELL.setAttribute('brand', 'HerdR Dev Fabric');
 
 // The nav badge follows the server inbox on every page, so a new critical item is visible from anywhere.
@@ -504,8 +513,12 @@ async function viewArchitecture() {
 }
 
 async function viewOverview() {
-  root.innerHTML = `${liveHead('<h1>Overview</h1>')}<div id="overview-dashboard"></div>`;
-  return ownPolling(mountOverview(document.getElementById('overview-dashboard'), client, { freshness: chipIn(root) }));
+  // Show the page frame and a skeleton straight away; the capability wait (bounded) must not leave the generic page skeleton up.
+  root.innerHTML = `${liveHead('<h1>Overview</h1>')}<div id="overview-dashboard">${skeleton('overview', { rows: 8, height: 64 })}</div>`;
+  const host = document.getElementById('overview-dashboard');
+  const workCenter = await workCenterOn();
+  if (!host.isConnected) return { refresh() {}, dispose() {} };   // navigated away while the capability probe was pending
+  return ownPolling(mountOverview(host, client, { freshness: chipIn(root), workCenter }));
 }
 
 async function viewAttention() {
@@ -531,7 +544,25 @@ async function viewGithub() {
 async function viewGithubProjects() {
   // Read-only Projects v2 boards; keeps its own 5 s poll, live events refresh it too.
   const query = route().query;
-  return mountGithubProjects(root, client, { project: query.get('project') || '', layout: query.get('layout') || 'board' });
+  // WC-005b: one read on mount of the mission PR refs (no polling); a failed read marks the Herdr data partial.
+  // Flag off: no read at all and no refs, exactly the board before the Work Command Center.
+  // Same frame as the board's own first paint (heading + board skeleton), so the capability wait does not leave the generic page skeleton up.
+  root.innerHTML = `<div class="hd-live-head"><h1>Project boards</h1></div>${skeleton('project board', { rows: 2, height: 64 })}`;
+  const frame = root.firstElementChild;
+  const workCenter = await workCenterOn();
+  if (!frame.isConnected) return { refresh() {}, dispose() {} };   // navigated away while the capability probe was pending
+  let herdrRefs = workCenter ? [] : null;
+  let herdrRefsFailed = false;
+  if (workCenter) try {
+    const mapped = refsFromMissionOutcomes(await client.missionOutcomes());
+    herdrRefs = mapped.refs;
+    herdrRefsFailed = mapped.failed;
+  } catch {
+    herdrRefsFailed = true;
+  }
+  // G3: the board re-reads the refs on its own refresh cycle (throttled in the view); flag off: no loader at all.
+  const loadHerdrRefs = workCenter ? signal => client.missionOutcomes({ signal }).then(refsFromMissionOutcomes) : null;
+  return mountGithubProjects(root, client, { project: query.get('project') || '', layout: query.get('layout') || 'board', herdrRefs, herdrRefsFailed, loadHerdrRefs });
 }
 
 async function viewReviewGate() {
@@ -913,6 +944,8 @@ async function viewSession(parts, revision) {
     const s = await client.getSession(id, {signal: controller.signal});
     if (revision !== renderRevision || controller.signal.aborted) return;
     if (!s) { statusPage('<herdr-error message="Agent not found"></herdr-error>', true); return; }
+    const workCenter = await workCenterOn();
+    if (revision !== renderRevision || controller.signal.aborted) return;
     const outcome = recordOutcome(s);
     const activeTab = route().query.get('tab') === 'evolution' ? 'evolution' : 'overview';
     const terminal = outcome === 'failed' || outcome === 'finished';
@@ -926,6 +959,7 @@ async function viewSession(parts, revision) {
        ${terminal ? `<p class="sd-meta">${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.</p>` : ''}
        ${TABS_STYLE}${tabsHtml(activeTab)}
       <div id="agent-panel-overview" role="tabpanel" tabindex="0" aria-labelledby="agent-tab-overview"${activeTab === 'overview' ? '' : ' hidden'}>
+       ${workCenter ? '<div id="session-context"></div>' : ''}
        <div id="session-story"></div>
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
       <div id="related-panel"></div>
@@ -970,7 +1004,9 @@ async function viewSession(parts, revision) {
       },
     });
     if (activeTab === 'evolution') startEvolution();
-    const disposeSession = combineDisposers(relatedDispose, disposeWorkspace, disposeTerminal, () => disposeAdvanced?.(), () => evolution?.dispose());
+    // Work Context: read-only parent mission, measured progress and sibling agents; distinct from the terminal attach panel below.
+    const disposeContext = workCenter ? mountSessionContext(document.getElementById('session-context'), client, s, {signal: controller.signal, onLinked: () => document.getElementById('session-mission')?.setAttribute('hidden', '')}) : () => {};
+    const disposeSession = combineDisposers(disposeContext, relatedDispose, disposeWorkspace, disposeTerminal, () => disposeAdvanced?.(), () => evolution?.dispose());
     const missionElement = document.getElementById('session-mission');
     if (missionElement) {
       const contextController = new AbortController();

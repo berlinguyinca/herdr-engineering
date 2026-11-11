@@ -25,7 +25,7 @@ event types `rollout.observed|planned|started|resumed|succeeded|halted|supersede
 | `repo`, `trigger.repo`, `targets[].repo` | `autospec pi-engineering herdr-engineering ai-sync claude-config` |
 | `host`, `halted_at_host`, `log.host` | `beast bender macbook-pro` (a new fleet member needs a code change) |
 | `status` | `pending precheck applying checking ok blocked failed unreachable skipped rolled_back` |
-| `reason` | `dirty_checkout not_on_main unpublished_commits busy timeout health_failed apply_failed ssh_failed halted optional_unreachable not_published rate_limited operator` |
+| `reason` | `dirty_checkout not_on_main unpublished_commits busy timeout health_failed apply_failed ssh_failed halted optional_unreachable not_published rate_limited ahead_of_target operator` |
 | `trigger` | `repo`, `sha` (40 hex), optional `pr` (int), `merged_at` (UTC) - no title |
 | `targets[]` | `repo`, `sha`, optional `before` (40 hex or null), at most 5 |
 | `checks[]` (at most 10) | `name` in `version_matches service_active gateway_registered parity_ok release_complete current_symlink version_smoke generation_receipt verify_ok feed_in_sync`, `status` in `ok failed skipped`, optional `duration_ms` |
@@ -97,4 +97,62 @@ herdr-eng fleet-watch outbox flush [--control-plane URL] [--api-key-file F] [--j
 herdr-eng fleet-watch log show <rollout_id> --host H [--path-id K]
 ```
 
-Rollback: nothing calls the emitter in this release; removing the ingest type is the only server-side change to undo.
+Rollback: `fleet-watch run --apply` (below) is the only caller of the emitter; removing the ingest type is the only server-side change to undo.
+
+## Applying a rollout (`fleet host-apply`, `fleet-watch run`) - step 4, manual only
+
+```
+herdr-eng fleet host-apply --rollout ID --repo R --sha S [--host H] [--phase precheck|apply|health|rollback|all]
+herdr-eng fleet-watch run [--apply] [--resume] [--local-host auto|beast|bender|macbook-pro|none] [--rollback-scope failed_host|all_updated]
+```
+
+`fleet-watch run` without `--apply` is the dry-run plan (no ssh, no events). With `--apply` it walks beast, bender,
+macbook-pro serially, per host per repo: `precheck` (60 s), `apply` (30 min), `health` (120 s) over `ssh -o BatchMode=yes
+-o ConnectTimeout=15` (the local host runs the same command without ssh), in `/` with the host's installed `herdr-eng`.
+The first row that is not ok halts the rollout and later rows are `skipped(halted)`; an unreachable macbook-pro is
+`skipped(optional_unreachable)` and does not halt, an unreachable beast or bender halts. A timeout is `failed(timeout)`.
+State is saved after every transition (`state.json`, `rollouts[id]`): a crash resumes at the first unfinished row on the
+next `run --apply` (event `rollout.resumed`, no reason); a halted rollout is re-run only with `--resume` (reason
+`operator`). The halt is saved in the same write as the failing row, and a crash that still lost it is repaired on
+resume: a finished row that is not ok (and not a deliberate `optional_unreachable`/`not_applicable` skip) always halts,
+later hosts are never applied and `converged` does not move. A halt that was never emitted is emitted
+(`rollout.halted`) before `rollout.resumed`. The lock file is not written yet (step 5).
+
+Which host is "local" (applied without ssh) is verified, not assumed: `--local-host auto` (default) is this machine
+when the `host_id` of `~/.config/herdr-engineering/host.json` (else the short hostname) is a fleet host, otherwise
+every host goes over ssh. An explicit `--local-host X` that is not this machine is refused (exit 2, no ssh, no events).
+A remote answer is accepted only if it echoes the request (rollout id, repo, sha, phase), an ok apply/health ends on
+the target sha (or, when the host says `past_target`, a 40-hex revision it verified is past the target), and a `skipped` carries a reason or `not_applicable`; anything else is `failed(apply_failed)`.
+
+`host-apply` prints ONE JSON object made of closed enums, hex, ints and UTC timestamps (section 14); log text, including
+example dirty paths (at most 8), stays in the host's log store and is read with `fleet-watch log show`. Idempotent: an
+installed build equal to the target is `ok` with `no_change`. For herdr-engineering the installed build is a receipt
+(`$XDG_STATE_HOME/herdr-engineering/fleet-watch/installed-herdr-engineering.json`) written only after the checkout
+fast-forward, the install and the agent restart all succeeded; `no_change` needs receipt == target AND checkout HEAD ==
+target, so an install that failed after the fast-forward is retried (no receipt means "apply again", which is idempotent).
+The deployment checkout is `$HERDR_ENGINEERING_REPO`, else the one-line file `~/.config/herdr-engineering/
+deployment-checkout` (an absolute path; non-interactive ssh has no profile environment), else `failed(apply_failed)`
+with the cause in the host log. The checkout's configured `origin` URL must be `github.com/berlinguyinca/<repo>` (https,
+`git@github.com:` or `ssh://git@github.com/` form, optional `.git`; the forms observed on beast), else
+`failed(apply_failed)`; other owners, hosts and bare local paths are refused. There must be exactly ONE configured
+`remote.origin.url` (`git config --get-all`), and both that raw value and the effective one (`git remote get-url`, after
+the host's insteadOf rewrites) must pass; a backslash or control character in the https userinfo is refused.
+At or past the target counts as converged: when the checkout is AHEAD of the target (main moved on: the nightly updater
+or an operator) and passes the D6 gate (so HEAD is published), the host answers `ok` with `no_change`, `past_target`
+and `before_sha == after_sha == installed` only if the install receipt (herdr-engineering) or the newest generation
+receipt (autospec) is a proper descendant of the target; if it is not (behind the target, equal to it while HEAD has moved
+on, or missing) the answer is `blocked(ahead_of_target)`: nothing is installed and no receipt is written, because an
+unverified newer HEAD is never installed on the target's behalf. (autospec still treats a generation receipt equal to the
+target as converged, as before: the generation, not the checkout, is the runtime.) A crash mid-row keeps the
+host's own previous revision (saved at precheck time) so a later rollback still targets it, and a row resumed with a
+carried revision that differs from the target counts as `updated` even though its re-run apply reports `no_change`, and an optional host that was
+unreachable for one repo is skipped for the remaining repos of that rollout. D6 gate: `blocked(dirty_checkout|not_on_main|
+unpublished_commits)` with counts, never a clean, stash or reset. It holds `fleet-auto-update.lock` (`blocked(busy)`
+after 5 retries, 60 s apart).
+
+Per repo: herdr-engineering = ff-only + pip install + agent restart (no automatic rollback: ff-only cannot go backwards);
+pi-engineering = stage release, atomic `current` symlink switch (temp link + `rename`), keep 3 releases (never the current
+or previous), no signal to live sessions, rollback = flip the link back to the host's OWN previous release (its precheck `before_sha`), and only if `current` is still the release this rollout activated; autospec = refresh the runtime checkout and
+installer, rollback only while the newest generation receipt still equals the before sha. ai-sync and claude-config are
+`skipped(not_applicable)`. `--rollback-scope failed_host` (default) undoes the failed row and updated rows of that host;
+`all_updated` undoes every updated row, newest first; each rollback emits a further `host.finished(rolled_back)`.

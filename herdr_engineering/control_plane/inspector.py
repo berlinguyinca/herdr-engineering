@@ -48,6 +48,7 @@ KINDS = frozenset({
 })
 #: Capture must be committed before acknowledging emitter checkpoints.
 REQUIRED_DURABLE_KINDS = frozenset({"message", "tool", "file", "usage"})
+_TOOL_ENDING_PHASES = ("restarted", "interrupted", "ended")   # lifecycle phases that close every running tool call
 DURABLE_KINDS = REQUIRED_DURABLE_KINDS | frozenset({"capabilities", "association", "model", "lifecycle", "test"})
 VIEWS = ("all", "conversation", "reasoning", "tools", "files", "tests", "usage")
 _VIEW_KINDS = {
@@ -210,7 +211,7 @@ class _Session:
                  "dropped_ring", "client_dropped", "seen", "capabilities",
                  "assoc", "models", "usage_totals", "usage_latest", "last_event",
                  "last_ingest", "ended", "prefs", "tools", "tests", "subs",
-                 "evicted_to")
+                 "evicted_to", "tool_pending", "tool_carry")
 
     def __init__(self, session_id: str):
         self.session_id = session_id
@@ -236,6 +237,10 @@ class _Session:
         self.tests: dict[str, dict] = {}   # run_id  -> live ring entry
         self.subs: set = set()
         self.evicted_to = -1
+        # Journal suppression (journal_suppression.py): per live call_id, the latest tool update not yet journaled, and what
+        # the journaled rows of the call already established. Process-local; never part of a snapshot.
+        self.tool_pending: dict[str, dict] = {}
+        self.tool_carry: dict[str, dict] = {}
 
 
 class Subscriber:
@@ -279,7 +284,9 @@ class InspectorStore:
     def __init__(self, *, limits: dict | None = None, persist=None,
                  reasoning_roles: str = "operator",
                  sensitive_roles: str = "operator", store_reasoning: bool = True,
-                 clock=time.time):
+                 clock=time.time, journal_suppression=None):
+        from .journal_suppression import JournalSuppression
+        self._journal = journal_suppression if journal_suppression is not None else JournalSuppression()
         self.limits = dict(DEFAULT_LIMITS)
         for k, v in (limits or {}).items():
             if k in DEFAULT_LIMITS and isinstance(v, (int, float)) and v > 0:
@@ -589,6 +596,8 @@ class InspectorStore:
             flagged = flagged or self._cmd_sensitive(data) or bool(live and live["sensitive"])
             if data["phase"] == "end" and "duration_ms" not in data and live and live.get("t0") is not None:
                 data["duration_ms"] = int((self._clock() - live["t0"]) * 1000)
+        if persist and kind == "lifecycle" and data.get("phase") in _TOOL_ENDING_PHASES:
+            self._flush_tool_updates(sess)          # the interrupted call keeps its last update, ahead of the lifecycle row
         if persist and kind in REQUIRED_DURABLE_KINDS and (
                 kind != "message" or data["role"] in ("user", "assistant")):
             # Commit before any projection mutation, publication or retry-id update.
@@ -622,7 +631,7 @@ class InspectorStore:
             sess.models.append({**data, "ts": base["ts"]})
         elif kind == "lifecycle":
             phase = data.get("phase")
-            if phase in ("restarted", "interrupted", "ended"):
+            if phase in _TOOL_ENDING_PHASES:
                 # Never claim success for work whose telemetry was cut off.
                 for t in sess.tools.values():
                     if t["data"].get("status") == "running":
@@ -630,6 +639,8 @@ class InspectorStore:
                         t["data"]["incomplete"] = True
                         self._touch(sess, t)
                 sess.tools = {k: t for k, t in sess.tools.items() if t["data"]["status"] == "running"}
+                sess.tool_pending.clear()       # already journaled by _flush_tool_updates before the lifecycle row
+                sess.tool_carry.clear()
             if phase == "ended":
                 sess.ended = True
             dropped = data.get("dropped")
@@ -837,6 +848,12 @@ class InspectorStore:
                         "event_id": base["event_id"], "kind": kind, "sensitive": flagged,
                         **flags, "_received_at": self._clock(), "_sequence": sess.rev},
         }
+        if kind == "tool" and self._journal.inspector_tool_updates:
+            if not self._defer_tool_update(sess, durable):
+                self._write_durable(sess, durable)
+            return
+        if kind == "usage" and self._journal.inspector_zero_usage and self._repeats_zero_usage(sess, data):
+            return
         if kind in REQUIRED_DURABLE_KINDS:
             try:
                 self._persist(durable)
@@ -844,6 +861,88 @@ class InspectorStore:
                 raise RuntimeError("inspector persistence unavailable") from exc
         else:
             self._safe_persist(durable)
+
+    # --- journal suppression -----------------------------------------------
+    # A tool call journals start, update... and end rows, and each update repeats the whole output so far. Replay only
+    # needs the end row when it carries the output, so updates are held back (latest only) until the call ends: dropped
+    # when the end row covers everything they carried, journaled just before it when it does not, and journaled when the
+    # session is interrupted/ended/restarted or the call leaves the ring. The remaining gap: if the process dies with a
+    # call still running and no such row ever follows, that call's last update is lost and a replay shows its start only.
+    _VALID_TOOL = staticmethod(lambda v: bool(v) and v != "unknown")
+
+    def _write_durable(self, sess: _Session, durable: dict, *, safe: bool = False) -> None:
+        """Journal one tool row and fold what it establishes into the call's carry."""
+        p = durable["payload"]
+        carry = sess.tool_carry.setdefault(p.get("call_id"), {"tool": None, "args_preview": None, "sensitive": False,
+                                                              "redacted": False, "truncated": False})
+        if not self._VALID_TOOL(carry["tool"]) and self._VALID_TOOL(p.get("tool")):
+            carry["tool"] = p["tool"]
+        if not carry["args_preview"] and p.get("args_preview"):
+            carry["args_preview"] = p["args_preview"]
+        for key in ("sensitive", "redacted", "truncated"):
+            carry[key] = carry[key] or bool(p.get(key))
+        if p.get("phase") == "end":
+            sess.tool_carry.pop(p.get("call_id"), None)
+        if safe:
+            self._safe_persist(durable)
+            return
+        try:
+            self._persist(durable)
+        except Exception as exc:
+            raise RuntimeError("inspector persistence unavailable") from exc
+
+    def _defer_tool_update(self, sess: _Session, durable: dict) -> bool:
+        """Hold back an update row (True), or settle what is held for the call and let the row through (False)."""
+        p = durable["payload"]
+        cid, phase = p.get("call_id"), p.get("phase")
+        held = sess.tool_pending.get(cid)
+        if phase == "update":
+            if held is not None:        # fold the earlier update into this one: output is the latest, the rest accumulates
+                q = held["payload"]
+                for key in ("tool", "args_preview"):
+                    if (self._VALID_TOOL if key == "tool" else bool)(q.get(key)) and not (
+                            self._VALID_TOOL if key == "tool" else bool)(p.get(key)):
+                        p[key] = q[key]
+                for key in ("sensitive", "redacted", "truncated"):
+                    p[key] = bool(p.get(key)) or bool(q.get(key))
+            sess.tool_pending[cid] = durable
+            return True
+        if held is None:
+            return False
+        if phase == "end" and "output" in p and self._covers(sess.tool_carry.get(cid), held["payload"], p):
+            del sess.tool_pending[cid]                      # the end row replays to the same entry
+            return False
+        del sess.tool_pending[cid]
+        self._write_durable(sess, held)                     # before the row that follows it
+        return False
+
+    def _covers(self, carry: dict | None, update: dict, end: dict) -> bool:
+        """True when replaying ``update`` between the journaled rows of the call and ``end`` changes nothing ``end`` and
+        those rows do not already settle: the first valid tool and args_preview, and the sensitive/redacted/truncated flags."""
+        carry = carry or {"tool": None, "args_preview": None, "sensitive": False, "redacted": False, "truncated": False}
+
+        def first(valid, key, *rows):
+            return next((r[key] for r in rows if valid(r.get(key))), None)
+        if first(self._VALID_TOOL, "tool", carry, end) != first(self._VALID_TOOL, "tool", carry, update, end):
+            return False
+        if first(bool, "args_preview", carry, end) != first(bool, "args_preview", carry, update, end):
+            return False
+        return all(not update.get(k) or carry[k] or end.get(k) for k in ("sensitive", "redacted", "truncated"))
+
+    def _flush_tool_updates(self, sess: _Session, *, safe: bool = False) -> None:
+        pending, sess.tool_pending = sess.tool_pending, {}
+        for held in pending.values():
+            self._write_durable(sess, held, safe=safe)
+
+    def _repeats_zero_usage(self, sess: _Session, data: dict) -> bool:
+        """An all-zero usage report (no token or context number above zero, no model) that equals the session's latest one
+        changes neither the totals nor the latest report, so its row is not journaled. (An all-zero report that would
+        replace a different latest one is journaled: dropping it would change ``usage.latest`` after a replay.)"""
+        body = {k: v for k, v in data.items() if k != "_flags"}
+        if body.get("model") or any(isinstance(v, int) and v > 0 for v in body.values()):
+            return False
+        latest = sess.usage_latest
+        return latest is not None and {k: v for k, v in latest.items() if k != "_flags"} == body
 
     def _touch(self, sess: _Session, entry: dict, *, account: bool = True) -> None:
         if account:
@@ -952,7 +1051,12 @@ class InspectorStore:
         self.stats["evicted_events"] += 1
         # Only unlink the live map if it still points at the evicted entry (ids can be reused).
         if old["kind"] == "tool" and sess.tools.get(old["data"].get("call_id")) is old:
-            del sess.tools[old["data"]["call_id"]]
+            cid = old["data"]["call_id"]
+            held = sess.tool_pending.pop(cid, None)
+            if held is not None:
+                self._write_durable(sess, held, safe=True)      # a call leaving the ring keeps its last update
+            sess.tool_carry.pop(cid, None)
+            del sess.tools[cid]
         elif old["kind"] == "test" and sess.tests.get(old["data"].get("run_id")) is old:
             del sess.tests[old["data"]["run_id"]]
 

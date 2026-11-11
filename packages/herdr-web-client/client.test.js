@@ -682,6 +682,16 @@ test('the log slice request names the step, the line range and the test it expec
  assert.deepEqual(Object.fromEntries(query.searchParams),{repository:'17',number:'12',step:'4',start:'10',end:'14',context:'40',expect:'TestBeta',provider_url:'https://ci.example'});
 });
 
+test('weeklyEvents (G1) asks for one half-open window with an optional limit and cursor', async () => {
+  const calls = [];
+  const client = new HerdrClient('', { fetchImpl: async url => { calls.push(url); return { ok: true, status: 200, text: async () => '{"events":[]}' }; } });
+  await client.weeklyEvents({ since: '2026-11-02T08:00:00.000Z', until: '2026-11-09T08:00:00.000Z', limit: 500, after: 'a_b' });
+  await client.weeklyEvents({ since: '2026-11-02T08:00:00.000Z', until: '2026-11-09T08:00:00.000Z' });
+  assert.deepEqual(calls, [
+    '/api/v1/work/weekly-events?since=2026-11-02T08%3A00%3A00.000Z&until=2026-11-09T08%3A00%3A00.000Z&limit=500&after=a_b',
+    '/api/v1/work/weekly-events?since=2026-11-02T08%3A00%3A00.000Z&until=2026-11-09T08%3A00%3A00.000Z']);
+});
+
 test('memory detail encodes optional selectors and preserves id-only callers and signal', async () => {
   const calls = [];
   const client = new HerdrClient('', { fetchImpl: async (url, opts) => {
