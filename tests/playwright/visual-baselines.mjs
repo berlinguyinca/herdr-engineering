@@ -37,7 +37,9 @@ const MAX_HEIGHT = 10000;
 const selectNode = async (page) => { await page.locator('g[data-node="attempt:a1"]').focus(); await page.keyboard.press('Enter'); await page.locator('.wb-comment').first().waitFor(); await page.locator('.wb-steer').first().waitFor(); await page.evaluate(() => document.activeElement?.blur()); };
 
 /** The surfaces under test: slug, how to reach it, a selector that proves it rendered, optional steps, and components compared on their own. */
-export const SURFACES = [
+// Desktop only (2026-11-11): these tools are used on desktops, so phone and tablet pixel baselines are not kept.
+const DESKTOP_ONLY = ['tablet-light', 'tablet-dark', 'mobile-light', 'mobile-dark'];
+const COLLAB_SURFACES = [
   { slug: 'collab-rooms', hash: '/rooms', proof: '#hcn-rooms' },
   { slug: 'collab-chat', sub: 'chat', proof: '#hcn-log', regions: [{ name: 'logo', selector: '.cx-logo' }, { name: 'subtabs', selector: '.cx-stabs' }, { name: 'log', selector: '#hcn-log' }] },
   { slug: 'collab-tabs', sub: 'tabs', proof: '#hcn-tabs [role=tab]' },
@@ -60,6 +62,9 @@ export const SURFACES = [
   { slug: 'collab-links', sub: 'links', proof: '#hcn-links li' },
   { slug: 'collab-proposals', sub: 'proposals', proof: '[data-proposal]', steps: async (page) => { await page.locator('[data-proposal]').first().click(); await page.locator('#hcn-review [data-decide]').first().waitFor(); },
     regions: [{ name: 'review', selector: '#hcn-review' }] },
+];
+export const SURFACES = [
+  ...COLLAB_SURFACES.map((s) => ({ skip: DESKTOP_ONLY, ...s })),
   // The dashboard app (Missions, Personal Assistant tabs): served from packages/ over a stubbed API, no server process (visual-dashboard.mjs)
   ...DASHBOARD_SURFACES,
 ];
