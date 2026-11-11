@@ -285,6 +285,7 @@ def test_target_management_cli_enable_and_migration_safety(tmp_path: Path):
         "min_free_disk_percent": 0, "storage_tiers": [{"name": "internal", "directory": str(cache)}]}}}
     config.write_text(yaml.safe_dump(settings))
     env = {**os.environ, "HOME": str(home), "CARGO_HOME": str(home / ".cargo"),
+           "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
            "HERDR_ENGINEERING_CONFIG": str(config), "HERDR_ENGINEERING_STATE": str(state),
            "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
 
@@ -341,9 +342,10 @@ def test_migration_cli_uses_real_external_volume(tmp_path: Path):
         config = tmp_path / "config.yaml"
         config.write_text("fabric_build_cache:\n  enabled: true\n  local:\n    min_free_disk_percent: 0\n")
         enroll_storage(volume, "test", str(Path(external).relative_to(volume) / "compiler-cache"), config)
-        previous = {key: os.environ.get(key) for key in ("HOME", "HERDR_ENGINEERING_CONFIG", "HERDR_ENGINEERING_STATE")}
+        rustup = os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup"))
+        previous = {key: os.environ.get(key) for key in ("HOME", "RUSTUP_HOME", "HERDR_ENGINEERING_CONFIG", "HERDR_ENGINEERING_STATE")}
         try:
-            os.environ.update(HOME=str(home), HERDR_ENGINEERING_CONFIG=str(config), HERDR_ENGINEERING_STATE=str(state))
+            os.environ.update(HOME=str(home), RUSTUP_HOME=rustup, HERDR_ENGINEERING_CONFIG=str(config), HERDR_ENGINEERING_STATE=str(state))
             plan = migration_run([workspace])
             assert plan["targets"][0]["status"] == "eligible"
             result = migration_run([workspace], apply=True, quiescent=True)
