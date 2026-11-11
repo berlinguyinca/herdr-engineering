@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fleet rollout watcher step 4: host-apply and the serial runner (manual, `--apply` required)
+- `herdr-eng fleet host-apply` (precheck/apply/health/rollback per repo, D6 checkout gate, idempotent `no_change`, `fleet-auto-update.lock`, atomic Pi `current` switch keeping 3 releases) and `herdr-eng fleet-watch run [--apply]` (serial beast -> bender -> macbook-pro, halt on first failure, durable crash-resume, ssh timeouts, D8 rollback for pointer flips and ff-only, events through the existing emitter/outbox). Output and events carry no free text. No systemd unit (step 5). Tests: `tests/test_fleet_host_apply.py`, `tests/test_fleet_watch_run.py`. See `docs/operations/fleet-rollout-events.md`.
+
 ### Work Command Center: rollout gate `work_center_v1` (off by default)
 - New capability `work_center_v1` in `/api/v1/health`, only when `control_plane.work_center.enabled: true` (YAML, strict `true`, default off). It gates the Overview "This week" card, the session "Work context" header and the GitHub board "Open in Herdr" links; with it off the dashboard is unchanged (the board no longer reads `/api/v1/mission-outcomes`). Rollback is turning the flag off. Nothing is deployed or enabled by merging. See `docs/specs/herdr-work-command-center-wc001/OPERATOR.md`.
 
