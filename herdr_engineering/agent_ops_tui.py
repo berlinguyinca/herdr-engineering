@@ -252,19 +252,27 @@ def hosts_row(snapshot: dict, width: int, opts: RenderOpts) -> str | None:
     if not isinstance(hosts, list) and not isinstance(fleet, dict):
         return None
     hosts = hosts if isinstance(hosts, list) else []
-    segs: list[tuple[str, str | None]] = []
-    if isinstance(fleet, dict):
-        avg = fleet.get("average_fraction")
-        measured = f" ({fleet.get('measured_count', '?')}/{fleet.get('total', '?')})" if avg is not None else ""
-        segs.append((f"fleet {pct_text(avg if isinstance(avg, (int, float)) else None)}{measured}  ",
-                     ctx_level_style(avg if isinstance(avg, (int, float)) else None) or "dim"))
-    segs.append((f"hosts {(snapshot.get('counts') or {}).get('hosts', len(hosts))}:", "bold"))
     glyph = {"connected": ("●", "green"), "disconnected": ("×", "red")}
-    for host in hosts:
-        mark, style = glyph.get(str(host.get("state")), ("?", "gray"))     # unknown stays unknown: never "up" or "down"
-        avg = (host.get("context_health") or {}).get("average_fraction")
-        avg = avg if isinstance(avg, (int, float)) else None
-        segs += [(f" {clean(host.get('host_id'), 14)} ", None), (mark, style), (f" {pct_text(avg)} ", ctx_level_style(avg))]
+
+    def build(short: bool) -> list[tuple[str, str | None]]:
+        segs: list[tuple[str, str | None]] = []
+        if isinstance(fleet, dict):
+            avg = fleet.get("average_fraction")
+            avg = avg if isinstance(avg, (int, float)) else None
+            measured = f" ({fleet.get('measured_count', '?')}/{fleet.get('total', '?')})" if avg is not None and not short else ""
+            segs.append((f"fleet {pct_text(avg)}{measured}  ", ctx_level_style(avg) or "dim"))
+        segs.append((f"hosts {(snapshot.get('counts') or {}).get('hosts', len(hosts))}:", "bold"))
+        for host in hosts:
+            mark, style = glyph.get(str(host.get("state")), ("?", "gray"))     # unknown stays unknown: never "up" or "down"
+            avg = (host.get("context_health") or {}).get("average_fraction")
+            avg = avg if isinstance(avg, (int, float)) else None
+            badge = pct_text(avg) if not short else "?" if avg is None else f"{round(100 * avg)}%"
+            segs += [(f" {clean(host.get('host_id'), 14)} ", None), (mark, style), (f" {badge} ", ctx_level_style(avg))]
+        return segs
+
+    segs = build(False)
+    if sum(cell_width(t) for t, _ in segs) > width:
+        segs = build(True)         # narrow pane: drop the "ctx" word and the measured count so every host still fits
     out, used = [], 0
     for text, style in segs:
         text = fit(text, width - used)

@@ -34,6 +34,17 @@ SEED = [  # (agent, event_type, extra fields)
     ("qwen", "review.requested", {"session_id": "qwen", "task_id": "api-impl", "payload": {"target_agent_id": "opus"}}),
     ("codex", "message.sent", {"session_id": "codex", "task_id": "ui", "payload": {"target_agent_id": "claude"}}),
     ("codex", "artifact.created", {"session_id": "codex", "task_id": "ui"}),
+    # health + drift + interrupted handoffs (slices 08/09): all heuristics are derived from these real events
+    ("opus", "tool.failed", {"session_id": "opus", "task_id": "api-impl"}),
+    ("opus", "tool.failed", {"session_id": "opus", "task_id": "api-impl"}),
+    ("qwen", "drift.warning", {"session_id": "qwen", "task_id": "api-impl"}),
+    ("gem", "session.started", {"session_id": "gem", "host_id": "dev-03"}),
+    ("codex", "handoff.state", {"session_id": "codex", "handoff_id": "ho-ui", "status": "accepted", "task_id": "ui-polish",
+                                "payload": {"target_agent_id": "opus", "target_session_id": "opus"}}),
+    ("gem", "handoff.state", {"session_id": "gem", "handoff_id": "ho-docs", "status": "accepted", "task_id": "docs",
+                              "payload": {"target_agent_id": "claude", "target_session_id": "claude"}}),
+    ("opus", "agent.disconnected", {"session_id": "opus", "host_id": "mac-02"}),
+    ("gem", "session.ended", {"session_id": "gem"}),
 ]
 
 

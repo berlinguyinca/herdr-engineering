@@ -597,3 +597,9 @@ def test_real_server_snapshot_with_hosts_renders_end_to_end():
         assert re.search(r"\] 91%!!", plain(render(snapshot, 120, 40, opts=UNI)))
     finally:
         server.stop()
+
+
+def test_hosts_row_shortens_instead_of_dropping_hosts_in_a_narrow_pane():
+    row = plain([tui.hosts_row(health_snap(), 80, UNI)])
+    assert tui.cell_width(row) <= 80 and all(h in row for h in ("mac-01", "dev-02", "lab-03"))
+    assert "lab-03 ? ?" in row           # unknown host state and unknown context both stay "?"
