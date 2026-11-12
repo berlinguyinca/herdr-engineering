@@ -43,6 +43,7 @@ import { mountFabricServices } from './fabric-services-view.js';
 import { mountAiSync } from './ai-sync-view.js';
 import { mountPrTrail } from './pr-trail-view.js';
 import { mountTeamMap } from './team-map-view.js';
+import { mountAgentOps } from './agent-ops-view.js';
 import { mountTeams } from './teams-view.js';
 import { mountAgentEvolution, tabsHtml, TABS_STYLE, wireTabs } from './agent-evolution-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
@@ -95,6 +96,7 @@ const NAV = [
   { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
   { group: 'Agents', path: '/teams', label: 'Your teams', capability: 'unified_workspace_v1' },
   { group: 'Agents', path: '/team-map', label: 'Team map', capability: 'unified_workspace_v1' },
+  { group: 'Agents', path: '/agent-ops', label: 'Agent Operations', capability: 'agent_ops_v1' },
   { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync', '/build-cache'] },
   { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
   { group: 'Fabric', path: '/settings', label: 'Settings' },
@@ -251,6 +253,7 @@ const ROUTES = {
   '/pr/:owner/:repo/:number': viewPrTrail,
   '/teams': viewTeams,
   '/team-map': viewTeamMap,
+  '/agent-ops': viewAgentOps,
   '/services/:id': viewService,
   '/hosts': viewHosts,
   '/personal-assistant': viewPersonalAssistant,
@@ -484,6 +487,12 @@ async function viewTeamMap() {
   const view = mountTeamMap(root.querySelector('#team-map'), client, { root: route().query.get('root') || '', freshness: chipIn(root),
     onRoot: (r) => history.replaceState(null, '', `#/team-map${r ? `?root=${encodeURIComponent(r)}` : ''}`) });
   return ownPolling(view);   // positions the person moved must survive a live event, so only the Open button reloads
+}
+
+async function viewAgentOps() {
+  root.innerHTML = `${liveHead('<h1>Agent Operations</h1>')}<div id="agent-ops"></div>`;
+  const view = mountAgentOps(root.querySelector('#agent-ops'), client, { freshness: chipIn(root) });
+  return { refresh: () => view.refresh(), dispose: () => view.dispose() };   // the view owns its own SSE stream (cursor resume) and replay state
 }
 
 async function viewHandoffs() {
