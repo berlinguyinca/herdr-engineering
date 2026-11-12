@@ -11,6 +11,8 @@ so an event the caller cannot read contributes to no node, edge or count.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import threading
 import time
 from datetime import UTC, datetime
@@ -120,19 +122,35 @@ def _uint(value: Any) -> int | None:
 
 def cursor_of(event: dict) -> str:
     """Total, append-stable order of the aggregated feed: receipt time, then the event's identity (source, agent, id), so
-    two emitters that reuse an event id never share a cursor."""
-    return "~".join((event["ingested_at"], event["source"], event["agent_id"] or "", event["event_id"]))
+    two emitters (or two authenticated keys) that reuse an event id never share a cursor. Clients treat it as opaque and
+    take it from the ``cursor`` field of a row; ``~`` inside a part is escaped so the parts stay unambiguous."""
+    parts = (event["ingested_at"], event["source"], event["agent_id"] or "", event.get("actor_ref") or "")
+    return "~".join([p.replace("~", "%7E") for p in parts] + [event["event_id"]])
 
 
 def _identity(event: dict) -> tuple:
-    return (event["source"], event["agent_id"] or "", event["room_id"] or "", event["event_id"])
+    return (event["source"], event["agent_id"] or "", event.get("actor_ref") or "", event["room_id"] or "",
+            event["event_id"])
+
+
+def _actor_ref(ev: dict) -> str:
+    """A short stable digest of the authenticated actor (never the id itself): part of an event's identity."""
+    actor = ev.get("actor")
+    if isinstance(actor, str):
+        try:
+            actor = json.loads(actor)
+        except ValueError:
+            actor = None
+    actor_id = actor.get("id") if isinstance(actor, dict) else None
+    return hashlib.sha256(actor_id.encode()).hexdigest()[:12] if isinstance(actor_id, str) and actor_id else ""
 
 
 def _event(**fields: Any) -> dict:
     base = {"event_id": None, "source": "unknown", "sequence": 0, "event_type": None, "occurred_at": "",
             "ingested_at": "", "room_id": None, "visibility_scope": "private", "provenance": "unknown",
             "agent_id": None, "session_id": None, "host_id": None, "model_id": None, "parent_session_id": None,
-            "handoff_id": None, "task_id": None, "status": None, "sanitized_label": None, "payload": {}}
+            "handoff_id": None, "task_id": None, "status": None, "sanitized_label": None, "payload": {},
+            "actor_ref": ""}
     base.update(fields)
     return base
 
@@ -154,6 +172,8 @@ def _payload(raw: Any) -> dict:
 
 
 def _norm_envelope(ev: dict) -> dict | None:
+    if ev.get("schema_version") != 2:
+        return None                          # only a v2 ingest has its _envelope set by the server
     payload = ev.get("payload") or {}
     meta = payload.get("_envelope") if isinstance(payload, dict) else None
     ops = meta.get("agent_ops") if isinstance(meta, dict) else None
@@ -167,7 +187,7 @@ def _norm_envelope(ev: dict) -> dict | None:
         event_type=ev["event_type"], occurred_at=_ts(ev.get("source_timestamp")),
         ingested_at=_ts(ev.get("ingest_timestamp")) or _ts(ev.get("source_timestamp")),
         room_id=_str(ev.get("room_id")) if scope == "room" else None,   # a room id counts only on a room-scoped event
-        visibility_scope=scope,
+        visibility_scope=scope, actor_ref=_actor_ref(ev),
         provenance=ops.get("provenance") if ops.get("provenance") in PROVENANCE else "unknown",
         agent_id=_str(ev.get("agent_id")), session_id=_str(ops.get("session_id")),
         host_id=_str(ops.get("host_id")), model_id=_str(ops.get("model_id")),
@@ -317,14 +337,13 @@ def _ordered(events: list[dict]) -> list[dict]:
     keyed = []
     for source in sorted(by_source):
         floor = ""
-        for ev in sorted(by_source[source], key=lambda e: (e["sequence"], e["agent_id"] or "", e["event_id"])):
+        for ev in sorted(by_source[source], key=lambda e: (e["sequence"], e["agent_id"] or "", e["actor_ref"], e["event_id"])):
             floor = max(floor, ev["occurred_at"] or ev["ingested_at"])
-            keyed.append(((floor, source, ev["sequence"], ev["agent_id"] or "", ev["event_id"]), ev))
+            keyed.append(((floor, source, ev["sequence"], ev["agent_id"] or "", ev["actor_ref"], ev["event_id"]), ev))
     return [ev for _, ev in sorted(keyed, key=lambda item: item[0])]
 
 
 def _canon(ev: dict) -> str:
-    import json
     return json.dumps(ev, sort_keys=True, default=str)
 
 
@@ -663,8 +682,8 @@ class AgentOpsService:
                cached: bool = False) -> dict:
         limit = max(1, min(limit, PAGE_MAX))
         ordered = [e for e in self._gather(viewer, principal, cached) if cursor is None or cursor_of(e) > cursor]
-        page = ordered[:limit]
-        return {"events": page, "next_cursor": cursor_of(page[-1]) if page else cursor,
+        page = [{**e, "cursor": cursor_of(e)} for e in ordered[:limit]]
+        return {"events": page, "next_cursor": page[-1]["cursor"] if page else cursor,
                 "has_more": len(ordered) > limit}
 
     def replay(self, viewer: Viewer, principal: Any = None, until: str | None = None) -> dict:

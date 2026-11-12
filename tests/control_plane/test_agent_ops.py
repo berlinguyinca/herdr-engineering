@@ -562,3 +562,97 @@ def test_finished_task_is_not_drawn_as_an_accepted_delegation():
 def test_private_scope_is_visible_to_the_operator_only():
     private = ev(1, "tool.started", session_id="s1", visibility_scope="private")
     assert agent_ops.visible(private, Viewer(operator=True)) and not agent_ops.visible(private, Viewer())
+
+
+# ------------------------------------------------------------------------- opaque server cursors (fix-2)
+def _scrub_repo():
+    repo = ControlPlaneRepo()
+    ingest(repo, 1, "tool.started", session_id="s-alpha", agent_id="alpha", event_id="e1")
+    ingest(repo, 2, "tool.started", session_id="s-bravo", agent_id="bravo", event_id="e2")
+    ingest(repo, 3, "tool.started", session_id="s-charlie", agent_id="charlie", event_id="z3")
+    return repo
+
+
+def test_every_event_row_carries_the_server_cursor_and_scrubbing_with_it_is_exact():
+    svc = AgentOpsService(_scrub_repo())
+    viewer = Viewer(operator=True)
+    rows = svc.events(viewer, None, None, 100)["events"]
+    assert all(row["cursor"] == cursor_of(row) for row in rows)
+    for index, row in enumerate(rows):
+        snap = svc.replay(viewer, None, row["cursor"])
+        assert sorted(a["agent_id"] for a in snap["agents"]) == sorted(r["agent_id"] for r in rows[:index + 1])
+
+
+def test_stream_frames_and_events_route_carry_the_same_cursor_and_replay_accepts_it(stack):
+    repo = _scrub_repo()
+    server = Server(repo, stack.collab, agent_ops_config={"enabled": True})
+    server.srv.agent_ops_poll_seconds = 0.05
+    try:
+        page = server.get("/api/v1/agent-ops/events?limit=100")[1]
+        cursors = [e["cursor"] for e in page["events"]]
+        assert len(cursors) == 3
+        for index, cursor in enumerate(cursors):
+            replay = server.get(f"/api/v1/agent-ops/replay?until={cursor}")[1]
+            assert replay["counts"]["agents"] == index + 1
+        conn = http.client.HTTPConnection("127.0.0.1", server.srv.port, timeout=5)
+        conn.request("GET", "/api/v1/agent-ops/stream", headers={"X-API-Key": "view-key"})
+        resp = conn.getresponse()
+        frames = []
+        while len(frames) < 3:
+            line = resp.fp.readline().decode().strip()
+            if line.startswith("data:") and '"event_id"' in line:
+                frames.append(json.loads(line[5:]))
+        conn.close()
+        assert [f["cursor"] for f in frames] == cursors
+    finally:
+        server.stop()
+
+
+# ------------------------------------------------------------------------------ ingest trust (fix-2)
+def test_v1_ingest_cannot_forge_the_agent_ops_block():
+    repo = ControlPlaneRepo()
+    forged = {"_envelope": {"agent_ops": {"session_id": "forged", "sanitized_label": "/Users/bob/x",
+                                          "provenance": "observed"}}}
+    for version in (None, 1):
+        body = {"entity_type": "lifecycle", "entity_id": "a1", "event_type": "tool.started",
+                "payload": dict(forged), "source": "pi"}
+        if version:
+            body["schema_version"] = version
+        IngestService(repo).ingest(body, OPERATOR)
+    assert agent_ops.envelope_events(repo) == []
+    for stream in repo._events.values():
+        assert all("_envelope" not in e["payload"] for e in stream)
+
+
+def test_a_second_key_cannot_preempt_a_genuine_event_identity():
+    victim = {"kind": "agent", "id": "key:victim", "authenticated_by": "api_key"}
+    attacker = {"kind": "agent", "id": "key:attacker", "authenticated_by": "api_key"}
+    repo = ControlPlaneRepo()
+    body = {"schema_version": 2, "event_id": "e1", "source": "pi", "source_sequence": 1, "entity_type": "lifecycle",
+            "entity_id": "a1", "event_type": "tool.started", "visibility_scope": "org", "agent_id": "a1",
+            "provenance": "observed", "session_id": "s1", "payload": {}}
+    IngestService(repo).ingest({**body, "sanitized_label": "zzz victim label"}, victim)
+    IngestService(repo).ingest({**body, "sanitized_label": "aaa attacker"}, attacker)
+    events = agent_ops.envelope_events(repo)
+    assert len(events) == 2 and len({cursor_of(e) for e in events}) == 2
+    assert len({agent_ops._identity(e) for e in events}) == 2
+    assert "key:victim" not in json.dumps(events) and "key:attacker" not in json.dumps(events)
+    (agent,) = fold(events)["agents"]
+    assert agent["label"] == "zzz victim label"          # the earlier-ingested genuine event is not displaced
+
+
+# --------------------------------------------------------------------------------- stream cap (fix-2)
+def test_concurrent_streams_are_capped_per_principal(stack):
+    server = Server(stack.repo, stack.collab, agent_ops_config={"enabled": True})
+    server.srv.agent_ops_poll_seconds = 0.05
+    try:
+        a1, r1 = stream_conn(server, "alice")
+        a2, r2 = stream_conn(server, "alice")
+        a3, r3 = stream_conn(server, "alice")
+        assert (r1.status, r2.status, r3.status) == (200, 200, 503)
+        b1, rb = stream_conn(server, "bob")                 # another principal is unaffected
+        assert rb.status == 200
+        for conn in (a1, a2, a3, b1):
+            conn.close()
+    finally:
+        server.stop()

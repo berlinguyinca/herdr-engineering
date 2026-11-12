@@ -451,6 +451,10 @@ class ControlPlaneServer:
         self.agent_ops_poll_seconds = 1.0
         self.agent_ops_reauth_seconds = 30.0          # a live stream re-checks its credential this often
         self.agent_ops_streams = threading.BoundedSemaphore(16)   # concurrent SSE readers; each tick is a full gather
+        self.agent_ops_streams_per_principal = 2       # ...of which one caller (person, agent or key) may hold this many
+        self._agent_ops_stream_counts: dict[str, int] = {}
+        self._agent_ops_stream_lock = threading.Lock()
+        self.agent_ops_skipped_frames = 0              # stored events whose cursor could not be framed safely
         self._summary_stop = threading.Event()
         self._summary_scanner = None
         if not collab_only:
@@ -6024,9 +6028,15 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             room stops flowing at once) and the credential itself every ``agent_ops_reauth_seconds`` (a revoked key, token
             or disabled person ends the stream); the queue is the bounded page read each tick (no unbounded subscriber
             queue), and the number of concurrent streams is capped."""
-            from .agent_ops import STREAM_PAGE, cursor_of
-            if not server.agent_ops_streams.acquire(blocking=False):
-                return self._json({"error": "too many agent-ops streams"}, 503)
+            from .agent_ops import STREAM_PAGE
+            caller = f"p:{principal.id}" if principal is not None else \
+                "k:" + hashlib.sha256(self.headers.get("X-API-Key", "").encode()).hexdigest()
+            with server._agent_ops_stream_lock:
+                if server._agent_ops_stream_counts.get(caller, 0) >= server.agent_ops_streams_per_principal:
+                    return self._json({"error": "too many agent-ops streams for this caller"}, 503)
+                if not server.agent_ops_streams.acquire(blocking=False):
+                    return self._json({"error": "too many agent-ops streams"}, 503)
+                server._agent_ops_stream_counts[caller] = server._agent_ops_stream_counts.get(caller, 0) + 1
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -6056,8 +6066,9 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         page = service.events(service.viewer(principal, operator), principal, cursor, STREAM_PAGE,
                                               cached=True)
                         for ev in page["events"]:
-                            frame_id = cursor_of(ev)
+                            frame_id = ev["cursor"]
                             if any(c in frame_id for c in "\r\n\0"):
+                                server.agent_ops_skipped_frames += 1
                                 continue          # never let a stored id forge or split an SSE frame
                             self.wfile.write(f"id: {frame_id}\ndata: {json.dumps(ev)}\n\n".encode())
                         if page["events"]:
@@ -6075,6 +6086,12 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     pass
             finally:
                 server.agent_ops_streams.release()
+                with server._agent_ops_stream_lock:
+                    left = server._agent_ops_stream_counts.get(caller, 1) - 1
+                    if left > 0:
+                        server._agent_ops_stream_counts[caller] = left
+                    else:
+                        server._agent_ops_stream_counts.pop(caller, None)
             return None
 
         def _work_graph(self, sub, body=None):
