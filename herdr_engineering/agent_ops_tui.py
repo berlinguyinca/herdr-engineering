@@ -17,6 +17,7 @@ import termios
 import threading
 import time
 import tty
+import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field, replace
 
@@ -24,11 +25,10 @@ MODES = ("activity", "communication", "handoffs", "ownership", "replay")
 PANES = ("map", "tasks", "activity", "timeline")
 KINDS = ("communication", "delegation", "handoff", "review", "ownership")
 PLANNED = {"planned", "proposed", "pending", "queued", "requested"}
-_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 RESET = "\x1b[0m"
 _ASCII = str.maketrans({"·": "-", "…": "~", "→": ">", "←": "<", "↑": "^", "↓": "v", "⏎": "E", "▸": ">", "●": "*", "○": "o",
-                        "◆": "!", "×": "x", "◉": "*", "█": "#", "░": "."})
+                        "◆": "!", "×": "x", "✗": "x", "◉": "*", "█": "#", "░": "."})
 
 # kind -> (colour, solid h, solid v, dashed h, dashed v, arrow glyph, ascii h, ascii v, ascii arrow)
 _EDGE = {
@@ -46,14 +46,47 @@ _COLORS = {"red": (31, 203), "green": (32, 78), "yellow": (33, 215), "blue": (34
            "rev": (7, None)}
 
 
+_DROPPED = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp", "Mn", "Me"})   # controls, bidi/zero-width format chars, combining marks
+
+
+def _drop(ch: str) -> bool:
+    return unicodedata.category(ch) in _DROPPED
+
+
+def char_width(ch: str) -> int:
+    """Terminal cells one (already sanitised) character occupies: 2 for East Asian wide/fullwidth and emoji."""
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def cell_width(text: str) -> int:
+    return sum(char_width(ch) for ch in text)
+
+
+def fit(text: str, cells: int) -> str:
+    """The longest prefix of ``text`` that fits ``cells`` columns; a wide glyph is dropped whole, never split."""
+    out, used = [], 0
+    for ch in text:
+        used += char_width(ch)
+        if used > cells:
+            break
+        out.append(ch)
+    return "".join(out)
+
+
+def pad(text: str, cells: int) -> str:
+    text = fit(text, cells)
+    return text + " " * (cells - cell_width(text))
+
+
 def clean(value: object, limit: int = 40) -> str:
-    """Printable text with control characters removed and length bounded; None becomes an empty string."""
-    text = _CTRL.sub("", "" if value is None else str(value))
-    return text if len(text) <= limit else text[:max(limit - 1, 1)] + "…"
+    """Printable text: control, bidi, zero-width and combining characters removed FIRST, then bounded to ``limit``
+    terminal cells (wide glyphs count 2) so the cut can never split an escape sequence or a glyph; None becomes ''."""
+    text = "".join(ch for ch in ("" if value is None else str(value)) if not _drop(ch))
+    return text if cell_width(text) <= limit else fit(text, max(limit - 1, 1)) + "…"
 
 
 def visible_width(line: str) -> int:
-    return len(_ANSI.sub("", line))
+    return cell_width(_ANSI.sub("", line))
 
 
 @dataclass(frozen=True)
@@ -91,17 +124,41 @@ class Canvas:
         self.cells: list[list[tuple[str, str | None]]] = [[(" ", None)] * self.w for _ in range(self.h)]
 
     def put(self, x: int, y: int, ch: str, style: str | None = None) -> None:
-        if 0 <= x < self.w and 0 <= y < self.h:
-            self.cells[y][x] = (ch, style)
+        if not (0 <= x < self.w and 0 <= y < self.h):
+            return
+        row, width = self.cells[y], char_width(ch)
+        if width == 2 and x + 1 >= self.w:
+            ch, width = " ", 1          # a wide glyph that would straddle the right edge is not drawn
+        self._blank_partner(row, x)
+        if width == 2:
+            self._blank_partner(row, x + 1)
+        row[x] = (ch, style)
+        if width == 2:
+            row[x + 1] = ("", style)    # continuation cell: contributes no column of its own
+
+    @staticmethod
+    def _blank_partner(row: list[tuple[str, str | None]], x: int) -> None:
+        """Overwriting one half of a wide glyph blanks the other half so no orphan half is left."""
+        if row[x][0] == "" and x > 0:
+            row[x - 1] = (" ", row[x - 1][1])
+        elif char_width(row[x][0]) == 2 and x + 1 < len(row):
+            row[x + 1] = (" ", row[x + 1][1])
 
     def text(self, x: int, y: int, s: str, style: str | None = None, limit: int | None = None) -> None:
-        for i, ch in enumerate(s):
-            if limit is not None and i >= limit:
+        col = 0
+        for ch in s:
+            if _drop(ch):
+                continue
+            width = char_width(ch)
+            if limit is not None and col + width > limit:
                 break
-            self.put(x + i, y, ch, style)
+            self.put(x + col, y, ch, style)
+            col += width
 
     def at(self, x: int, y: int) -> str:
-        return self.cells[y][x][0] if 0 <= x < self.w and 0 <= y < self.h else " "
+        if not (0 <= x < self.w and 0 <= y < self.h):
+            return " "
+        return self.cells[y][x][0] or "\x00"
 
     def lines(self, color: bool) -> list[str]:
         out = []
@@ -144,6 +201,84 @@ def context_bar(context: object, width: int, opts: RenderOpts) -> str:
 
 def is_planned(edge: dict) -> bool:
     return str(edge.get("state", "")).lower() in PLANNED
+
+
+BROKEN = {"stalled", "failed"}      # a handoff interrupted by a disconnect (stalled) or ended session (failed)
+
+
+def is_broken(edge: dict) -> bool:
+    return str(edge.get("state", "")).lower() in BROKEN
+
+
+def context_fraction(agent: dict) -> float | None:
+    """Measured context fraction from the server's ``context_health`` (or, for an older snapshot, from ``context``);
+    None means unknown and is never turned into 0."""
+    health_ = agent.get("context_health")
+    if isinstance(health_, dict):
+        f = health_.get("fraction") if health_.get("measured") else None
+        return float(f) if isinstance(f, (int, float)) else None
+    ctx = agent.get("context")
+    if isinstance(ctx, dict) and isinstance(ctx.get("used"), (int, float)) and isinstance(ctx.get("limit"), (int, float)) \
+            and ctx["limit"] > 0:
+        return ctx["used"] / ctx["limit"]
+    return None
+
+
+def ctx_level_style(fraction: float | None) -> str | None:
+    return None if fraction is None else "red" if fraction >= 0.9 else "yellow" if fraction >= 0.7 else "green"
+
+
+def ctx_badge(agent: dict, width: int, opts: RenderOpts) -> tuple[str, str | None]:
+    """The map node's context row: a bar with ``!`` (amber, >=70%) or ``!!`` (red, >=90%) so colour is never the only cue,
+    or ``ctx unknown`` when nothing measurable was reported."""
+    fraction = context_fraction(agent)
+    mark = "" if fraction is None or fraction < 0.7 else "!!" if fraction >= 0.9 else "!"
+    bar = context_bar(agent.get("context"), width - len(mark), opts)
+    return ("ctx unknown" if bar == "ctx ?" else bar + mark), ctx_level_style(fraction)
+
+
+def pct_text(fraction: float | None) -> str:
+    return "ctx unknown" if fraction is None else f"ctx {round(100 * fraction)}%"
+
+
+def drift_kinds(item: dict) -> list[str]:
+    return [clean(d.get("kind"), 24) for d in item.get("drift") or [] if isinstance(d, dict)]
+
+
+def hosts_row(snapshot: dict, width: int, opts: RenderOpts) -> str | None:
+    """``fleet ctx 69% (3/4)  hosts 3: mac-01 ● ctx 56%  dev-02 × ctx 95%  lab-03 ? ctx unknown``; None for an older snapshot."""
+    hosts = snapshot.get("hosts")
+    fleet = (snapshot.get("health") or {}).get("context")
+    if not isinstance(hosts, list) and not isinstance(fleet, dict):
+        return None
+    hosts = hosts if isinstance(hosts, list) else []
+    glyph = {"connected": ("●", "green"), "disconnected": ("×", "red")}
+
+    def build(short: bool) -> list[tuple[str, str | None]]:
+        segs: list[tuple[str, str | None]] = []
+        if isinstance(fleet, dict):
+            avg = fleet.get("average_fraction")
+            avg = avg if isinstance(avg, (int, float)) else None
+            measured = f" ({fleet.get('measured_count', '?')}/{fleet.get('total', '?')})" if avg is not None and not short else ""
+            segs.append((f"fleet {pct_text(avg)}{measured}  ", ctx_level_style(avg) or "dim"))
+        segs.append((f"hosts {(snapshot.get('counts') or {}).get('hosts', len(hosts))}:", "bold"))
+        for host in hosts:
+            mark, style = glyph.get(str(host.get("state")), ("?", "gray"))     # unknown stays unknown: never "up" or "down"
+            avg = (host.get("context_health") or {}).get("average_fraction")
+            avg = avg if isinstance(avg, (int, float)) else None
+            badge = pct_text(avg) if not short else "?" if avg is None else f"{round(100 * avg)}%"
+            segs += [(f" {clean(host.get('host_id'), 14)} ", None), (mark, style), (f" {badge} ", ctx_level_style(avg))]
+        return segs
+
+    segs = build(False)
+    if sum(cell_width(t) for t, _ in segs) > width:
+        segs = build(True)         # narrow pane: drop the "ctx" word and the measured count so every host still fits
+    out, used = [], 0
+    for text, style in segs:
+        text = fit(text, width - used)
+        used += cell_width(text)
+        out.append(f"{sgr(style)}{text}{RESET}" if opts.color and style and text else text)
+    return "".join(out)
 
 
 def visible_edges(snapshot: dict, mode: str, kind_filter: str | None) -> list[dict]:
@@ -275,10 +410,14 @@ def route(a: Box, b: Box, blocked: set[tuple[int, int]], occupied: dict[tuple[in
     return []
 
 
-def hub_text(snapshot: dict, w: int) -> tuple[str, str]:
+def hub_room(snapshot: dict) -> dict | None:
     rooms = sorted(snapshot.get("rooms") or [], key=lambda r: (-len(r.get("agent_ids") or []), str(r.get("room_id"))))
-    if rooms:
-        r = rooms[0]
+    return rooms[0] if rooms else None
+
+
+def hub_text(snapshot: dict, w: int) -> tuple[str, str]:
+    r = hub_room(snapshot)
+    if r:
         return f"room …{clean(r.get('room_id'), 80)[-6:]}", f"{len(r.get('agent_ids') or [])} members"
     return "ops hub", f"{len(snapshot.get('agents') or [])} agents"
 
@@ -286,11 +425,12 @@ def hub_text(snapshot: dict, w: int) -> tuple[str, str]:
 def edge_label(edge: dict, room: int) -> str:
     """'delegate · api-impl': the kind is always spelled out; only the task id is abbreviated to fit ``room`` cells."""
     verb = ("~" if is_planned(edge) else "") + _VERB.get(edge["kind"], edge["kind"])
+    verb += f" {str(edge['state']).upper()}" if is_broken(edge) else ""
     task = clean(edge.get("task_id") or "", 40)
     if not task:
         return verb
-    left = room - len(verb) - 3
-    return f"{verb} · {task if len(task) <= left else task[:max(left - 1, 3)] + '…'}" if left >= 4 else verb
+    left = room - cell_width(verb) - 3
+    return f"{verb} · {task if cell_width(task) <= left else fit(task, max(left - 1, 3)) + '…'}" if left >= 4 else verb
 
 
 def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, opts: RenderOpts,
@@ -301,7 +441,7 @@ def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, o
     nw = min(nw, max(w - 2, 8))
     if not agents:
         msg = "no agents reported yet" if snapshot.get("counts", {}).get("agents", 0) == 0 else "no agents visible"
-        cv.text(max((w - len(msg)) // 2, 0), h // 2, msg, "dim")
+        cv.text(max((w - cell_width(msg)) // 2, 0), h // 2, msg, "dim")
         return cv.lines(opts.color)
     ring = ring_fits(len(agents), w, h, 22, nh)
     if ring:
@@ -333,7 +473,12 @@ def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, o
         path = route(a, b, blocked, occupied, w, h)
         occupied.update({(x, y): d for x, y, d in path})
         color, sh, sv, dh, dv, arrow, ah_, av_, aa = _EDGE[edge["kind"]]
-        planned = is_planned(edge)
+        broken = is_broken(edge)
+        if broken:
+            color = "red"       # stalled = dashed red, failed = solid red ending in a cross; neither looks accepted
+            if str(edge.get("state")).lower() == "failed":
+                arrow, aa = "✗", "x"
+        planned = is_planned(edge) or str(edge.get("state")).lower() == "stalled"
         for i, (x, y, d) in enumerate(path):
             if opts.unicode:
                 ch = (dh if d == "h" else dv) if planned else (sh if d == "h" else sv)
@@ -352,8 +497,15 @@ def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, o
             cv.put(hx + hw - 1, hy + row, r, "dim")
             for c in range(1, hw - 1):
                 cv.put(hx + c, hy + row, m, "dim")
-        cv.text(hx + 2, hy, f" {title} "[:hw - 4], "cyan")
-        cv.text(hx + max((hw - len(sub)) // 2, 1), hy + 1, sub[:hw - 2], "cyan")
+        cv.text(hx + 2, hy, fit(f" {title} ", hw - 4), "cyan")
+        room_health = (hub_room(snapshot) or {}).get("context_health")
+        if isinstance(room_health, dict):
+            avg = room_health.get("average_fraction")
+            avg = avg if isinstance(avg, (int, float)) else None
+            partial = f" {room_health.get('measured_count')}/{room_health.get('total')}" if avg is not None and \
+                room_health.get("measured_count") != room_health.get("total") else ""
+            cv.text(hx + 2, hy + 2, fit(f" {pct_text(avg)}{partial} ", hw - 4), ctx_level_style(avg) or "dim")
+        cv.text(hx + max((hw - cell_width(sub)) // 2, 1), hy + 1, fit(sub, hw - 2), "cyan")
     for i, a in enumerate(agents):
         draw_node(cv, a, boxes[a["node_id"]], i == focus % len(agents), opts, compact, snapshot, mode)
     for edge, path, color in drawn:     # labels go on the longest straight run, on a free row/column beside the line
@@ -371,12 +523,12 @@ def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, o
             for run in sorted(runs, key=len, reverse=True):
                 x0, y0, d = run[0]
                 if d == "h":
-                    xs = min(x0, run[-1][0]) + (len(run) - len(text)) // 2
+                    xs = min(x0, run[-1][0]) + (len(run) - cell_width(text)) // 2
                     spots = [(xs, y0 - 1), (xs, y0 + 1)]
                 else:
                     rows = sorted((c[1] for c in run), key=lambda r: abs(r - run[len(run) // 2][1]))
-                    spots = [(sx, r) for r in rows for sx in (x0 + 2, x0 - 1 - len(text))]
-                spot = next(((x, y) for x, y in spots if all(free(x + i, y) for i in range(len(text)))), None)
+                    spots = [(sx, r) for r in rows for sx in (x0 + 2, x0 - 1 - cell_width(text))]
+                spot = next(((x, y) for x, y in spots if all(free(x + i, y) for i in range(cell_width(text)))), None)
                 if spot:
                     cv.text(spot[0], spot[1], text, color)
                     placed = True
@@ -384,7 +536,7 @@ def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, o
             if placed:
                 break
     for edge, path, color in drawn:     # activity pulses: a glyph travelling the edge; fixed mid-edge under reduced motion
-        live = not is_planned(edge) and any(
+        live = not is_planned(edge) and not is_broken(edge) and any(
             next((x for x in agents if x["node_id"] == n), {}).get("state") == "working" for n in (edge.get("from"), edge.get("to")))
         if live and path and mode != "replay":
             px, py, _ = path[len(path) // 2 if opts.reduced_motion else tick % len(path)]
@@ -415,22 +567,21 @@ def draw_node(cv: Canvas, agent: dict, box: tuple[int, int, int, int], focused: 
     inner = w - 4
     dot = _STATE_DOT.get(state, "?") if opts.unicode else {"working": "*", "idle": "o", "blocked": "!"}.get(state, "?")
     shown_state = _ABBR.get(state, state) if compact else state
-    rows = [f"{dot} {'▸' if focused and opts.unicode else '>' if focused else ''}{node_name(agent)}", f"{clean(agent.get('model') or 'model ?', max(inner - len(shown_state) - 1, 4))} {clean(shown_state, 9)}"]
+    rows = [f"{dot} {'▸' if focused and opts.unicode else '>' if focused else ''}{node_name(agent)}", f"{clean(agent.get('model') or 'model ?', max(inner - cell_width(shown_state) - 1, 4))} {clean(shown_state, 9)}"]
+    badge, ctx_style = ctx_badge(agent, inner, opts)
     if not compact or h >= 4:
-        rows.append(context_bar(agent.get("context"), inner, opts))
+        rows.append(badge)
     if mode == "ownership":
         owned = [t["task_id"] for t in snapshot.get("tasks") or [] if t.get("accountable_owner") in
                  (agent.get("agent_id"), agent.get("node_id"))]
         rows[1] = ("owns " + ",".join(clean(t, 6) for t in owned)) if owned else rows[1]
-    ctx = agent.get("context")
-    pct = 100 * ctx["used"] / ctx["limit"] if isinstance(ctx, dict) and isinstance(ctx.get("used"), (int, float)) \
-        and isinstance(ctx.get("limit"), (int, float)) and ctx["limit"] > 0 else None
-    ctx_style = None if pct is None else "red" if pct >= 90 else "yellow" if pct >= 70 else "green"   # unknown stays unstyled
     for i, text in enumerate(rows[:h - 2]):
         if i == 0 and focused:      # visible focus: the whole name row in reverse video (marker + bold frame without colour)
-            cv.text(x + 1, y + 1, (" " + text).ljust(w - 2)[:w - 2], color + "+rev")
+            cv.text(x + 1, y + 1, pad(" " + text, w - 2), color + "+rev")
             continue
         cv.text(x + 2, y + 1 + i, text, color if i == 0 else ctx_style if i == 2 else None, limit=inner)
+    if drift_kinds(agent):      # heuristic signal, so the tag says so: "?" and never a verdict
+        cv.text(x + 2, y + h - 1, f" ~drift?{len(drift_kinds(agent)) if len(drift_kinds(agent)) > 1 else ''} ", "yellow")
 
 
 # --------------------------------------------------------------------------------------------- side panels
@@ -439,15 +590,15 @@ def boxed(title: str, body: list[str], w: int, h: int, opts: RenderOpts, active:
     tl, tr, bl, br, hz, vt = ("╭", "╮", "╰", "╯", "─", "│") if opts.unicode else ("+", "+", "+", "+", "-", "|")
     if active:
         tl, tr, bl, br, hz, vt = ("┏", "┓", "┗", "┛", "━", "┃") if opts.unicode else ("#", "#", "#", "#", "=", "#")
-    cap = f" {title} "[:max(w - 4, 0)]
-    out = [tl + cap + hz * max(w - 2 - len(cap), 0) + tr]
+    cap = fit(f" {title} ", max(w - 4, 0))
+    out = [tl + cap + hz * max(w - 2 - cell_width(cap), 0) + tr]
     window = body[scroll:scroll + max(h - 2, 0)]
     for line in window:
-        out.append(vt + line[:w - 2].ljust(w - 2) + vt)
+        out.append(vt + pad(line, w - 2) + vt)
     while len(out) < h - 1:
         out.append(vt + " " * (w - 2) + vt)
     out.append(bl + hz * (w - 2) + br)
-    return [l[:w] for l in out[:h]]
+    return [fit(l, w) for l in out[:h]]
 
 
 def task_lines(snapshot: dict, w: int) -> list[str]:
@@ -456,12 +607,14 @@ def task_lines(snapshot: dict, w: int) -> list[str]:
         lines.append(clean(f"{t.get('task_id')} owner:{t.get('accountable_owner') or '?'}", w - 2))
         contrib = ",".join(clean(c, 8) for c in t.get("contributors") or []) or "-"
         lines.append(clean(f"  by:{contrib} rev:{t.get('reviewer') or '-'}", w - 2))
+        if drift_kinds(t):
+            lines.append(clean(f"  ~drift? {','.join(drift_kinds(t))}", w - 2))
     return lines or ["no tasks"]
 
 
 def agent_lines(snapshot: dict, w: int, opts: RenderOpts) -> list[str]:
     """name / model / state / context columns sized so ``attention`` and a 9-character model fit untruncated."""
-    rows = [clean(f"{node_name(a):<8.8} {clean(a.get('model') or 'model ?', 10):<10} {clean(a.get('state'), 9):<9} "
+    rows = [clean(f"{pad(node_name(a), 8)} {pad(clean(a.get('model') or 'model ?', 10), 10)} {pad(clean(a.get('state'), 9), 9)} "
                   f"{context_pct(a['context']) if isinstance(a.get('context'), dict) and context_pct(a['context']) else 'ctx ?'}", w - 2)
             for a in snapshot.get("agents") or []]
     return rows or ["no agents"]
@@ -496,7 +649,7 @@ def timeline_bar(snapshot: dict, w: int, opts: RenderOpts) -> list[str]:
         cells[min(int(i / max(n - 1, 1) * (w - 1)), w - 1)] = "▼" if opts.unicode else "V"
     caption = (f"replay {opts.replay_pos[0] + 1}/{opts.replay_pos[1]}" + (" paused" if opts.replay_paused else " playing")
                if opts.replay_pos else (f"live · {hhmmss(stamps[-1])}" if stamps else "live · no events"))
-    return ["".join(cells), caption[:w]]
+    return ["".join(cells), fit(caption, w)]
 
 
 def legend(opts: RenderOpts) -> str:
@@ -504,7 +657,7 @@ def legend(opts: RenderOpts) -> str:
     for kind in KINDS:
         _, sh, _, dh, _, arrow, ah_, _, aa = _EDGE[kind]
         parts.append(f"{sh * 2 if opts.unicode else ah_ * 2}{arrow if opts.unicode else aa}{kind[:4]}")
-    return " ".join(parts) + ("  ╌╌ planned" if opts.unicode else "  -  - planned")
+    return " ".join(parts) + ("  ╌╌ planned  ╌╌ stalled  ✗ failed" if opts.unicode else "  -  - planned  -  - stalled  x failed")
 
 
 def status_text(snapshot: dict, opts: RenderOpts) -> str:
@@ -562,7 +715,12 @@ def overlay_lines(snapshot: dict, w: int, h: int, focus: int, opts: RenderOpts) 
                 f"state     {clean(a.get('state'))}  ({clean(a.get('provenance'))})",
                 f"context   {context_bar(ctx, 14, opts)}  src:{clean((ctx or {}).get('source') if isinstance(ctx, dict) else None) or '?'}",
                 f"compact   {a.get('compactions', 0)}  drift {a.get('drift_warnings', 0)}",
+                f"ctx health {pct_text(context_fraction(a))[4:]}",
                 f"rooms     {', '.join(clean(r, 12) for r in a.get('room_ids') or []) or '-'}", "edges:"]
+        if drift_kinds(a):
+            text.append("drift (heuristic, not a proven violation):")
+            text += [clean(f"  {d.get('kind')} [{d.get('provenance')}] task:{d.get('task_id') or '-'}", w - 2)
+                     for d in a.get("drift") or [] if isinstance(d, dict)]
         for e in snapshot.get("edges") or []:
             if a.get("node_id") in (e.get("from"), e.get("to")):
                 text.append(clean(f"  {e['kind']} {e['from']} → {e['to']} {e.get('state')}", w - 2))
@@ -590,15 +748,17 @@ def render(snapshot: dict, width: int, height: int, mode: str = "activity", focu
 
 def _trim(line: str, width: int) -> str:
     out, n, i = [], 0, 0
-    while i < len(line) and n < width:
+    while i < len(line):
         m = _ANSI.match(line, i)
         if m:
             out.append(m.group())
             i = m.end()
-        else:
-            out.append(line[i])
-            n += 1
-            i += 1
+            continue
+        n += char_width(line[i])
+        if n > width:
+            break
+        out.append(line[i])
+        i += 1
     return "".join(out) + (RESET if "\x1b" in line else "")
 
 
@@ -609,7 +769,7 @@ def _render(snapshot: dict, width: int, height: int, mode: str, focus: int, tick
     if mode == "replay" and opts.status == "live":
         status = "REPLAY"
     hint = (HINTS if opts.unicode else HINTS_ASCII) if width >= 100 else (HINTS_SHORT if opts.unicode else HINTS_SHORT_ASCII)
-    footer = hint[:width]
+    footer = fit(hint, width)
     footer = style_line(footer, "dim", opts)
     header_style = STATUS_COLOR.get(opts.status, "white")
     summary = (f"{counts.get('agents', len(agents))} agents  {counts.get('rooms', 0)} rooms  "
@@ -621,15 +781,18 @@ def _render(snapshot: dict, width: int, height: int, mode: str, focus: int, tick
         return _render_narrow(snapshot, width, height, mode, focus, opts, status, footer)
     title = "HERDR / AGENT OPERATIONS" if width >= 80 else "AGENT OPS"
     head = f"{title}  [{status}]  {mode_title(mode)}" + ("  filter:" + opts.filter_kind if opts.filter_kind else "")
-    header = [style_line(head[:width], header_style + "+bold", opts), style_line(summary[:width], "dim", opts)]
+    header = [style_line(fit(head, width), header_style + "+bold", opts), style_line(fit(summary, width), "dim", opts)]
     if opts.overlay:
         return header + overlay_lines(snapshot, width, height - 3, focus, opts) + [footer]
+    hrow = hosts_row(snapshot, width, opts)
+    header += [hrow] if hrow is not None else []
+    extra = len(header) - 2
     full = width >= 100 and height >= 30
     if full:
         rw = 40
         mw = width - rw - 1
         bottom = 4
-        mh = height - 2 - bottom - 1
+        mh = height - 2 - extra - bottom - 1
         map_lines = draw_map(snapshot, mw - 2, mh - 3, mode, focus, tick, opts, compact=False)
         map_block = _boxed_ansi("Map · " + mode_title(mode), map_lines, mw, mh, opts, opts.pane == "map", legend(opts))
         t_h = max(mh // 4, 5)
@@ -645,15 +808,15 @@ def _render(snapshot: dict, width: int, height: int, mode: str, focus: int, tick
         return header + body + bottom_block + [footer]
     # compact (80x24 and similar): map hero, a two-panel strip below
     strip = 6 if height >= 20 else 3
-    mh = height - 2 - strip - 3
+    mh = height - 2 - extra - strip - 3
     map_lines = draw_map(snapshot, width, mh, mode, focus, tick, opts, compact=True)
-    lg = style_line(legend(opts)[:width], "dim", opts)
+    lg = style_line(fit(legend(opts), width), "dim", opts)
     half = width // 2
     left = boxed("Tasks", task_lines(snapshot, half), half, strip, opts, opts.pane == "tasks", opts.scroll if opts.pane == "tasks" else 0)
     right = boxed("Activity", activity_lines(snapshot, width - half), width - half, strip, opts, opts.pane == "activity",
                   opts.scroll if opts.pane == "activity" else 0)
     tl = timeline_bar(snapshot, width, opts)
-    return header + map_lines + [lg] + join_columns(left, right, half) + [style_line(tl[0][:width], "dim", opts), footer]
+    return header + map_lines + [lg] + join_columns(left, right, half) + [style_line(fit(tl[0], width), "dim", opts), footer]
 
 
 def _boxed_ansi(title: str, inner: list[str], w: int, h: int, opts: RenderOpts, active: bool, foot: str) -> list[str]:
@@ -661,12 +824,12 @@ def _boxed_ansi(title: str, inner: list[str], w: int, h: int, opts: RenderOpts, 
     tl, tr, bl, br, hz, vt = ("╭", "╮", "╰", "╯", "─", "│") if opts.unicode else ("+", "+", "+", "+", "-", "|")
     if active:
         tl, tr, bl, br, hz, vt = ("┏", "┓", "┗", "┛", "━", "┃") if opts.unicode else ("#", "#", "#", "#", "=", "#")
-    cap = f" {title} "[:max(w - 4, 0)]
-    out = [tl + cap + hz * max(w - 2 - len(cap), 0) + tr]
+    cap = fit(f" {title} ", max(w - 4, 0))
+    out = [tl + cap + hz * max(w - 2 - cell_width(cap), 0) + tr]
     for i in range(h - 3):
         line = inner[i] if i < len(inner) else ""
         out.append(vt + line + " " * max(w - 2 - visible_width(line), 0) + vt)
-    out.append(vt + style_line(foot[:w - 2].ljust(w - 2), "dim", opts) + vt)
+    out.append(vt + style_line(pad(foot, w - 2), "dim", opts) + vt)
     out.append(bl + hz * (w - 2) + br)
     return out
 
@@ -674,14 +837,16 @@ def _boxed_ansi(title: str, inner: list[str], w: int, h: int, opts: RenderOpts, 
 def _render_narrow(snapshot: dict, width: int, height: int, mode: str, focus: int, opts: RenderOpts, status: str,
                    footer: str) -> list[str]:
     agents = snapshot.get("agents") or []
-    lines = [style_line(f"AGENT OPS [{status}] {mode_title(mode)}"[:width], STATUS_COLOR.get(opts.status, "white") + "+bold", opts)]
+    lines = [style_line(fit(f"AGENT OPS [{status}] {mode_title(mode)}", width), STATUS_COLOR.get(opts.status, "white") + "+bold", opts)]
     if opts.overlay:
         return lines + overlay_lines(snapshot, width, height - 2, focus, opts) + [style_line("q quit Esc close"[:width], "dim", opts)]
+    hrow = hosts_row(snapshot, width, opts)
+    lines += [hrow] if hrow is not None else []
     for i, a in enumerate(agents):
         state = str(a.get("state") or "unknown")
         mark = ">" if i == focus % max(len(agents), 1) else " "
-        row = f"{mark}{_STATE_DOT.get(state, '?') if opts.unicode else state[:1]} {node_name(a)} {clean(a.get('model') or 'model ?', 10)} {context_bar(a.get('context'), 8, opts)}"
-        lines.append(style_line(row[:width], _STATE_COLOR.get(state, "gray"), opts))
+        row = f"{mark}{_STATE_DOT.get(state, '?') if opts.unicode else state[:1]} {node_name(a)} {clean(a.get('model') or 'model ?', 10)} {ctx_badge(a, 8, opts)[0]}"
+        lines.append(style_line(fit(row, width), _STATE_COLOR.get(state, "gray"), opts))
     for e in visible_edges(snapshot, mode, opts.filter_kind):
         lines.append(clean(f" {e['kind'][:5]} {e['from']}→{e['to']} {'~' if is_planned(e) else ''}{e.get('state')}", width))
     lines += [clean(" " + l, width) for l in task_lines(snapshot, width)]
@@ -864,10 +1029,26 @@ class Client:
 
 
 # --------------------------------------------------------------------------------------------- the pane loop
+def resolve_token(args, env) -> tuple[str, bool]:
+    """(collab token, whether it came from argv). Order: --token-file, --token, $HERDR_AGENT_OPS_TOKEN, $HERDR_COLLAB_TOKEN."""
+    if getattr(args, "token_file", None):
+        try:
+            with open(args.token_file, encoding="utf-8") as fh:
+                return fh.read().strip(), False
+        except OSError as exc:
+            raise SystemExit(f"agent-ops: cannot read --token-file: {exc.strerror or exc}") from exc
+    if args.token:
+        return args.token, True
+    return env.get("HERDR_AGENT_OPS_TOKEN") or env.get("HERDR_COLLAB_TOKEN", ""), False
+
+
 def run(args) -> int:
     base = args.url or os.environ.get("HERDR_CP_URL", "http://127.0.0.1:8080")
-    client = Client(base, args.api_key or os.environ.get("HERDR_CP_API_KEY", ""),
-                    args.token or os.environ.get("HERDR_COLLAB_TOKEN", ""))
+    token, from_argv = resolve_token(args, os.environ)
+    if from_argv:
+        print("warning: --token is visible in the process list (ps); prefer --token-file or $HERDR_AGENT_OPS_TOKEN",
+              file=sys.stderr)
+    client = Client(base, args.api_key or os.environ.get("HERDR_CP_API_KEY", ""), token)
     out = sys.stdout
     opts = detect_opts(isatty=out.isatty(), no_animation=args.no_animation, ascii_only=args.ascii)
     if args.once:
@@ -957,7 +1138,9 @@ def register(sub) -> None:
     p = sub.add_parser("agent-ops", help="terminal Agent Operations map (live, replay, inspect) for a Herdr pane")
     p.add_argument("--url", help="control-plane base URL (default $HERDR_CP_URL or http://127.0.0.1:8080)")
     p.add_argument("--api-key", help="viewer API key (default $HERDR_CP_API_KEY)")
-    p.add_argument("--token", help="collab bearer token for room visibility (default $HERDR_COLLAB_TOKEN)")
+    p.add_argument("--token", help="collab bearer token for room visibility. WARNING: visible to every local user in the "
+                                   "process list (ps); prefer --token-file or $HERDR_AGENT_OPS_TOKEN (falls back to $HERDR_COLLAB_TOKEN)")
+    p.add_argument("--token-file", help="read the collab bearer token from this file (not exposed in ps)")
     p.add_argument("--no-animation", action="store_true", help="static pulses (also HERDR_REDUCED_MOTION=1)")
     p.add_argument("--ascii", action="store_true", help="ASCII glyphs only")
     p.add_argument("--once", action="store_true", help="print one frame and exit (for captures and doctor checks)")
