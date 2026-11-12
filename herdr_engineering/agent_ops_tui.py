@@ -38,9 +38,9 @@ _EDGE = {
     "review": ("magenta", "─", "│", "┄", "┆", "◇", "~", ";", "o"),
     "ownership": ("cyan", "┈", "┊", "╌", "╎", "●", ".", ":", "*"),
 }
-_STATE_COLOR = {"working": "green", "idle": "cyan", "blocked": "red", "disconnected": "gray", "ended": "gray",
+_STATE_COLOR = {"attention": "yellow", "working": "green", "idle": "cyan", "blocked": "red", "disconnected": "gray", "ended": "gray",
                 "unknown": "gray"}
-_STATE_DOT = {"working": "●", "idle": "○", "blocked": "◆", "disconnected": "×", "ended": "×", "unknown": "?"}
+_STATE_DOT = {"attention": "▲", "working": "●", "idle": "○", "blocked": "◆", "disconnected": "×", "ended": "×", "unknown": "?"}
 _COLORS = {"red": (31, 203), "green": (32, 78), "yellow": (33, 215), "blue": (34, 75), "magenta": (35, 141),
            "cyan": (36, 80), "gray": (90, 244), "white": (37, 252), "bold": (1, None), "dim": (2, None),
            "rev": (7, None)}
@@ -203,11 +203,11 @@ def layout_nodes(count: int, w: int, h: int, nw: int, nh: int) -> list[tuple[int
     return out
 
 
-def route(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> list[tuple[int, int, str]]:
+def route(a: tuple[int, int, int, int], b: tuple[int, int, int, int], lane: int = 0) -> list[tuple[int, int, str]]:
     """Orthogonal path (x, y, 'h'|'v') from box a to box b, leaving/entering through the facing sides."""
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
-    acx, acy, bcx, bcy = ax + aw // 2, ay + ah // 2, bx + bw // 2, by + bh // 2
+    acx, acy, bcx, bcy = ax + aw // 2 + lane * 2, ay + ah // 2 + lane, bx + bw // 2 + lane * 2, by + bh // 2 + lane
     path: list[tuple[int, int, str]] = []
     if ax + aw < bx or bx + bw < ax:
         sx = ax + aw if bcx > acx else ax - 1
@@ -262,13 +262,17 @@ def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, o
     for room, (rx, ry) in seen_rooms.items():
         cv.text(rx, max(ry - 1, 0), f"╭ room {clean(room, 14)} ╮" if opts.unicode else f"[room {clean(room, 14)}]", "dim")
     late: list[tuple[int, int, str, str]] = []
+    lanes: dict[str, int] = {}
     for edge in visible_edges(snapshot, mode, opts.filter_kind):
         a, b = boxes.get(edge.get("from")), boxes.get(edge.get("to"))
-        if not a or not b:
-            continue
+        if not a or not b or edge.get("from") == edge.get("to"):
+            continue        # an edge needs two distinct endpoints (a self ownership is shown on the node instead)
+        used = max(lanes.get(edge["from"], 0), lanes.get(edge["to"], 0))
+        lane = (0, 1, -1)[used % 3]                     # edges sharing a node get their own row/column
+        lanes[edge["from"]] = lanes[edge["to"]] = used + 1
         color, sh, sv, dh, dv, arrow, ah_, av_, aa = _EDGE[edge["kind"]]
         planned = is_planned(edge)
-        path = route(a, b)
+        path = route(a, b, lane)
         for i, (x, y, d) in enumerate(path):
             if opts.unicode:
                 ch = (dh if d == "h" else dv) if planned else (sh if d == "h" else sv)
@@ -320,7 +324,7 @@ def draw_node(cv: Canvas, agent: dict, box: tuple[int, int, int, int], focused: 
         cv.put(x + w - 1, y + r, vt, style)
     inner = w - 4
     dot = _STATE_DOT.get(state, "?") if opts.unicode else {"working": "*", "idle": "o", "blocked": "!"}.get(state, "?")
-    rows = [f"{dot} {'▸' if focused and opts.unicode else '>' if focused else ''}{node_name(agent)}", f"{clean(agent.get('model') or 'model ?', 14)} {clean(state, 9)}"]
+    rows = [f"{dot} {'▸' if focused and opts.unicode else '>' if focused else ''}{node_name(agent)}", f"{clean(agent.get('model') or 'model ?', max(inner - len(state) - 1, 4))} {clean(state, 9)}"]
     if not compact or h >= 4:
         rows.append(context_bar(agent.get("context"), inner, opts))
     if mode == "ownership":
@@ -610,9 +614,9 @@ def handle_key(state: UIState, key: str, agent_count: int, event_total: int = 0)
     if key in ("q", "ctrl-c"):
         return replace(s, effects=("quit",))
     if key == "esc":
-        return replace(s, overlay=None)
+        return replace(s, overlay=None, scroll=0)
     if key == "?":
-        return replace(s, overlay=None if s.overlay == "help" else "help")
+        return replace(s, overlay=None if s.overlay == "help" else "help", scroll=0)
     if key == "tab":
         return replace(s, pane=PANES[(PANES.index(s.pane) + 1) % len(PANES)], scroll=0)
     if key in ("left", "up", "right", "down"):
@@ -622,7 +626,7 @@ def handle_key(state: UIState, key: str, agent_count: int, event_total: int = 0)
         step = -1 if key in ("left", "up") else 1
         return replace(s, focus=(s.focus + step) % n)
     if key == "enter":
-        return replace(s, overlay=None if s.overlay == "inspect" else "inspect")
+        return replace(s, overlay=None if s.overlay == "inspect" else "inspect", scroll=0)
     if key == "h":
         return replace(s, overlay=None if s.overlay == "handoffs" else "handoffs", scroll=0)
     if key == "t":

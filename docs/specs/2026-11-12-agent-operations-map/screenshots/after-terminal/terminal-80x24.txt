@@ -1,0 +1,24 @@
+HERDR / AGENT OPERATIONS  [LIVE]  Activity
+4 agents  0 rooms  5 edges  2 tasks
+╭──────────────────╮                                        ╭──────────────────╮
+│ ● ▸claude        │━━━◉━━━━━━━━━━━━━━━━                    │ ● codex          │
+│ opus-4.1 working │›──────────────────┃commu:ui────────◉───│ gpt-4o working   │
+│ [████████░░] 82% │╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍┃╍~deleg:ui╍╍╍╍╍╍╍╍╍▶│ ctx ?            │
+╰──────────────────╯                   ┃                    ╰──────────────────╯
+                                       ┃deleg:api-i…                            
+╭──────────────────╮                   ┃                    ╭──────────────────╮
+│ ▲ opus           │                   ┃━━━━━━━━━━━━━━━━━━━▶│ ● qwen           │
+│ model… attention │◇┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄~revie:api-i…┄┄┄┄┄┄┄│ qwen3-7… working │
+│ ctx ?            │                                        │ [███████░░░] 68% │
+╰──────────────────╯                                        ╰──────────────────╯
+                                                                                
+                                                                                
+──›comm ━━▶dele ══⇒hand ──◇revi ┈┈●owne  ╌╌ planned
+╭ Tasks ───────────────────────────────╮╭ Activity ────────────────────────────╮
+│api-impl owner:claude                 ││12:43:18 communication codex → claude…│
+│  by:qwen rev:opus                    ││12:43:17 review qwen → opus planned   │
+│ui owner:?                            ││12:43:16 delegation claude → codex pl…│
+│  by:codex rev:-                      ││12:43:15 delegation claude → qwen acc…│
+╰──────────────────────────────────────╯╰──────────────────────────────────────╯
+●──────────────────●───────────────────●───────────────────●────●────●────●────●
+Tab pane ←↑↓→ ⏎ inspect h handoff t time r replay f filter m mode ? help q quit

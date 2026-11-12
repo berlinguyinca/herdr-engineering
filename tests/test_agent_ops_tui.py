@@ -307,3 +307,49 @@ def test_client_reports_offline_and_stream_resumes_with_backoff():
         assert states2 and set(states2) == {"degraded"}
     finally:
         server.stop()
+
+
+def test_opening_an_overlay_resets_scroll():
+    s = handle_key(handle_key(UIState(), "tab", 2), "down", 2)
+    assert s.scroll == 1
+    assert handle_key(s, "enter", 2).scroll == 0 and handle_key(s, "?", 2).scroll == 0
+
+
+def test_interactive_pane_in_a_real_pty_against_the_real_server():
+    import fcntl
+    import os
+    import pty
+    import select
+    import struct
+    import subprocess
+    import sys
+    import termios
+    import time
+    server = LiveServer()
+    try:
+        ingest(server.repo, 1, "session.started", agent_id="a1", session_id="s1")
+        ingest(server.repo, 2, "delegation.accepted", agent_id="a1", session_id="s1", task_id="t1",
+               payload={"target_agent_id": "a2"})
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+        env = dict(os.environ, TERM="xterm-256color", LANG="en_US.UTF-8", HERDR_CP_URL=server.url, HERDR_CP_API_KEY="view-key")
+        proc = subprocess.Popen([sys.executable, "-m", "herdr_engineering.cli", "agent-ops"], stdin=slave, stdout=slave,
+                                stderr=slave, env=env)
+        seen = b""
+
+        def pump(seconds):
+            nonlocal seen
+            end = time.time() + seconds
+            while time.time() < end:
+                if select.select([master], [], [], 0.1)[0]:
+                    seen += os.read(master, 65536)
+        pump(2.0)
+        for key in (b"h", b"\x1b", b"?", b"\x1b", b"r", b"[", b"l", b"q"):
+            os.write(master, key)
+            pump(0.5)
+        assert proc.wait(timeout=5) == 0
+        text = seen.decode("utf-8", "replace")
+        for needle in ("[LIVE]", "HANDOFFS AND DELEGATIONS", "KEYS", "REPLAY", "model ?"):
+            assert needle in text, needle
+    finally:
+        server.stop()
