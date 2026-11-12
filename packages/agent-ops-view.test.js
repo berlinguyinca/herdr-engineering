@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { HerdrClient } from './herdr-web-client/client.js';
 import { layoutScene, buildTimeline } from './agent-ops-model.js';
-import { API, loadSnapshot, loadReplay, loadTimeline, streamUrl, renderTabs, renderFilters, renderScene, renderNode, renderEdge, renderInspector, renderTimeline, renderBanner, renderAltTable, renderEmpty, renderLegend } from './agent-ops-view.js';
+import { API, loadSnapshot, loadReplay, loadTimeline, streamUrl, renderTabs, renderFilters, renderScene, renderNode, renderEdge, renderInspector, renderTimeline, renderBanner, renderAltTable, renderEmpty, renderLegend, renderHostStrip, renderDrift } from './agent-ops-view.js';
 
 const agent = (id, over = {}) => ({ node_id: id, agent_id: id, session_id: null, host_id: 'h1', provider: null, model: 'opus', model_changes: [], state: 'working', context: { used: 50, limit: 100, source: 'pi' },
   room_ids: [], parent_session_id: null, compactions: 0, drift_warnings: 0, label: null, provenance: 'observed', last_event_at: '2026-11-12T10:00:00.000000Z', ...over });
@@ -122,4 +122,77 @@ test('text alternative lists every node and edge; empty states distinguish filte
   assert.match(alt, /3 agents, 2 relationships/); assert.match(alt, /ctx unknown/);
   assert.match(renderEmpty(SNAP, true), /Nothing matches/); assert.match(renderEmpty(SNAP, false), /No agent activity yet/);
   assert.match(renderLegend(), /planned \(dashed\)/);
+});
+
+// ---- S8/S9/N7 and health/drift display ----------------------------------------------------------------------------------------------
+function serveHistory(total, pageSize) {
+  const all = Array.from({ length: total }, (_, i) => ({ event_id: `e${String(i + 1).padStart(4, '0')}`, ingested_at: `2026-11-12T10:00:00.${String(i + 1).padStart(6, '0')}Z`, event_type: 'tool.started', agent_id: 'a1' }));
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://x'), after = url.searchParams.get('cursor');
+    const rest = after ? all.filter((e) => `${e.ingested_at}~${e.event_id}` > after) : all, page = rest.slice(0, pageSize);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ events: page, next_cursor: page.length ? `${page.at(-1).ingested_at}~${page.at(-1).event_id}` : after, has_more: rest.length > pageSize }));
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ client: new HerdrClient(`http://127.0.0.1:${server.address().port}`), close: () => server.close() })));
+}
+
+test('timeline loads the tail of a long history, bounded by the cap', async () => {
+  const s = await serveHistory(50, 10);
+  try {
+    const tl = await loadTimeline(s.client, { cap: 15 });
+    assert.equal(tl.body.events.length, 15);
+    assert.equal(tl.body.events.at(-1).event_id, 'e0050'); assert.equal(tl.body.events[0].event_id, 'e0036');
+  } finally { s.close(); }
+});
+
+test('roving tabindex: exactly one node is a tab stop, the chosen one', () => {
+  const two = layoutScene(SNAP);
+  const html = renderScene(two, { tabId: 'a3' });
+  const stops = [...html.matchAll(/data-ao-node="([^"]+)"[^>]*tabindex="(-?\d)"/g)].map((m) => [m[1], m[2]]);
+  assert.deepEqual(stops.filter(([, t]) => t === '0').map(([id]) => id), ['a3']);
+  assert.equal(stops.filter(([, t]) => t === '-1').length, 2);
+  assert.equal([...renderScene(two).matchAll(/data-ao-node="[^"]+"[^>]*tabindex="0"/g)].length, 1, 'defaults to the first node');
+});
+
+test('inspector live region and the per-event caption are not chatty', () => {
+  assert.doesNotMatch(renderTimeline({ timeline: buildTimeline(EVENTS), index: null, playing: false, speed: 1 }), /role="status"/);
+});
+
+const HEALTHY = { ...SNAP,
+  agents: [agent('a1', { host_id: 'h1', drift: [{ kind: 'handoff_stalled', provenance: 'derived', evidence_event_ids: ['e5', 'e3'], task_id: 't1', heuristic: true, note: 'x' }] }), agent('a2', { host_id: 'h2', context: null })],
+  edges: [{ kind: 'handoff', from: 'a1', to: 'a2', state: 'stalled', room_id: null, event_id: 'e9', provenance: 'observed', task_id: 't1', handoff_id: 'ho1', interrupted_by: 'e8', updated_at: 't' },
+    { kind: 'handoff', from: 'a2', to: 'a1', state: 'failed', room_id: null, event_id: 'e10', provenance: 'observed', task_id: null, handoff_id: 'ho2', updated_at: 't' }],
+  tasks: [{ ...SNAP.tasks[0], drift: [{ kind: 'handoff_stalled', provenance: 'derived', evidence_event_ids: ['e5'], task_id: 't1', heuristic: true, note: 'x' }] }],
+  hosts: [{ host_id: 'h1', agents: ['a1'], state: 'connected', connected: true, reconnects: 0, context_health: { measured_count: 1, total: 1, average_fraction: 0.5, level: 'ok' } },
+    { host_id: 'h2', agents: ['a2'], state: 'disconnected', connected: false, reconnects: 1, context_health: { measured_count: 0, total: 1, average_fraction: null, level: 'unknown' } },
+    { host_id: 'h3', agents: [], connected: null }],
+  health: { context: { measured_count: 1, total: 2, average_fraction: 0.5, level: 'ok' } }, counts: { hosts: 3 } };
+
+test('host strip: host id, agent count, state words; unknown says unknown; ctx unknown never 0', () => {
+  const html = renderHostStrip(HEALTHY);
+  assert.match(html, /h1/); assert.match(html, /1 agent\b/); assert.match(html, /connected/); assert.match(html, /disconnected/);
+  assert.match(html, /h3[\s\S]*0 agents[\s\S]*unknown/); assert.match(html, /ctx unknown/); assert.doesNotMatch(html, /\b0% ctx/);
+  assert.match(html, /50% ctx/);
+  assert.equal(renderHostStrip({ agents: [] }), '');
+});
+
+test('drift is labelled heuristic with provenance and evidence, in node and task inspectors', () => {
+  const sc = layoutScene(HEALTHY);
+  const node = renderInspector({ type: 'node', id: 'a1' }, sc, HEALTHY);
+  assert.match(node, /Handoff stalled/); assert.match(node, /heuristic/i); assert.match(node, /derived/); assert.match(node, /e5/); assert.match(node, /not proof/i);
+  const task = renderInspector({ type: 'task', id: 't1' }, sc, HEALTHY);
+  assert.match(task, /Handoff stalled/); assert.match(task, /heuristic/i);
+  assert.equal(renderDrift([]), '');
+  assert.doesNotMatch(renderInspector({ type: 'node', id: 'a2' }, sc, HEALTHY), /Drift signals/);
+});
+
+test('stalled and failed handoff edges: distinct line, state in text, explained in the inspector', () => {
+  const sc = layoutScene(HEALTHY);
+  const stalled = sc.edges.find((e) => e.state === 'stalled'), failed = sc.edges.find((e) => e.state === 'failed');
+  const sh = renderEdge(stalled, sc);
+  assert.match(sh, /Handoff · stalled/); assert.match(sh, /ao-edge--stalled/); assert.doesNotMatch(sh, /ao-particle/);
+  assert.match(renderEdge(failed, sc), /Handoff · failed/);
+  assert.match(renderInspector({ type: 'edge', id: stalled.id }, sc, HEALTHY), /stalled[\s\S]*Interrupted by[\s\S]*e8/);
+  assert.match(renderInspector({ type: 'edge', id: failed.id }, sc, HEALTHY), /failed/);
+  assert.match(renderLegend(), /stalled/);
 });

@@ -10,7 +10,7 @@ import { entityHref } from './entity-links.js';
 import {
   MODES, FILTER_KEYS, SPEEDS, EDGE_KINDS, KIND_ORDER, NODE_R, RING_R, RING_W, HALO_R, emptyFilters, filterOptions, layoutScene, diffSnapshots,
   describeNode, describeEdge, altTable, neighbour, buildTimeline, replayFrame, indexAtFraction, nextIndex, stepDelay, formatClock, shortId, roomLabel,
-  contextInfo, stateInfo, edgeId,
+  contextInfo, stateInfo, edgeId, hostStrip, driftItems, TIMELINE_CAP,
 } from './agent-ops-model.js';
 
 const text = (v) => (typeof v === 'string' ? v : v == null ? '' : String(v));
@@ -30,13 +30,14 @@ const answer = async (call) => {
 };
 export const loadSnapshot = (client, { signal } = {}) => answer(() => client.getJson(`${API}/snapshot`, { signal }));
 export const loadReplay = (client, cursor, { signal } = {}) => answer(() => client.getJson(`${API}/replay?until=${encodeURIComponent(cursor)}`, { signal }));
-/** Event history for the scrubber, page by page (bounded: the timeline is a window, not an archive). */
-export async function loadTimeline(client, { signal, pages = 6 } = {}) {
+/** Event history for the scrubber. The feed pages forward only, so walk it to its end but keep just the newest `cap` rows: the tail. */
+export async function loadTimeline(client, { signal, pages = 40, cap = TIMELINE_CAP } = {}) {
   let cursor = '', out = [];
   for (let i = 0; i < pages; i += 1) {
     const r = await answer(() => client.getJson(`${API}/events?limit=500${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`, { signal }));
     if (r.status !== 'ok') return i === 0 ? r : { status: 'ok', body: { events: out } };
     out = out.concat(list(r.body?.events));
+    if (out.length > cap) out = out.slice(out.length - cap);
     if (!r.body?.has_more || !r.body?.next_cursor) break;
     cursor = r.body.next_cursor;
   }
@@ -68,13 +69,14 @@ export function renderLegend() {
   return `<ul class="ao-legend" aria-label="Legend">${kinds}
     <li class="ao-key ao-key--line"><svg width="30" height="8" aria-hidden="true"><line x1="1" y1="4" x2="29" y2="4"/></svg>accepted (solid)</li>
     <li class="ao-key ao-key--line ao-key--planned"><svg width="30" height="8" aria-hidden="true"><line x1="1" y1="4" x2="29" y2="4" stroke-dasharray="6 4"/></svg>planned (dashed)</li>
+    <li class="ao-key ao-key--line ao-key--stalled"><svg width="30" height="8" aria-hidden="true"><line x1="1" y1="4" x2="29" y2="4" stroke-dasharray="10 3 2 3"/></svg>stalled handoff (dash-dot)</li>
     <li class="ao-key ao-key--ring">outer ring = context used (amber 70%+, red 90%+, always labelled)</li></ul>`;
 }
 
 // ---- the map --------------------------------------------------------------------------------------------------------------------
 const f1 = (n) => Math.round(num(n) * 10) / 10;
 
-export function renderNode(n, { selected = false, pulse = false } = {}) {
+export function renderNode(n, { selected = false, pulse = false, tab = true } = {}) {
   const ring = n.ring, ctx = n.ctx;
   const level = n.person ? 'person' : ctx.level;
   const arc = n.person ? '' : ring.unknown
@@ -87,7 +89,7 @@ export function renderNode(n, { selected = false, pulse = false } = {}) {
     : `<text class="ao-name" y="-7" text-anchor="middle">${esc(clip(n.name, 12))}</text>
        <text class="ao-model${n.modelKnown ? '' : ' ao-model--unknown'}" y="9" text-anchor="middle">${esc(clip(n.model, 13))}</text>
        <text class="ao-ctx ao-ctx--${level}" y="25" text-anchor="middle">${esc(ctx.known && ctx.percent != null ? `${ctx.percent}% ctx` : ctx.label)}${warn}</text>`;
-  return `<g class="ao-node ao-node--${n.state.tone}${n.person ? ' ao-node--person' : ''}${selected ? ' is-selected' : ''}" data-ao-node="${esc(n.id)}" transform="translate(${n.x} ${n.y})" tabindex="0" role="button" aria-pressed="${selected}" aria-label="${esc(describeNode(n))}">
+  return `<g class="ao-node ao-node--${n.state.tone}${n.person ? ' ao-node--person' : ''}${selected ? ' is-selected' : ''}" data-ao-node="${esc(n.id)}" transform="translate(${n.x} ${n.y})" tabindex="${tab ? 0 : -1}" role="button" aria-pressed="${selected}" aria-label="${esc(describeNode(n))}">
     <circle class="ao-halo ao-halo--${n.state.tone}" r="${HALO_R}"/>${track}${arc}<circle class="ao-body" r="${NODE_R}"/>${inner}
     <text class="ao-state" y="${RING_R + 22}" text-anchor="middle">${esc(n.state.label)}${!n.person && (ctx.level === 'warn' || ctx.level === 'critical') ? ` · ctx ${ctx.level === 'warn' ? 'high' : 'critical'}` : ''}</text></g>`;
 }
@@ -108,11 +110,13 @@ export function renderMarkers() {
   return `<defs>${KIND_ORDER.map((k) => `<marker id="ao-arrow-${EDGE_KINDS[k].tone}" class="ao-arrow ao-arrow--${EDGE_KINDS[k].tone}" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z"/></marker>`).join('')}</defs>`;
 }
 
-export function renderScene(scene, { selected = null, pulses = new Set(), flowing = true, label = 'Agent activity map' } = {}) {
+export function renderScene(scene, { selected = null, pulses = new Set(), flowing = true, label = 'Agent activity map', tabId = null } = {}) {
   const vb = scene.viewBox;
-  const rooms = scene.rooms.map((r) => `<g class="ao-room" aria-hidden="true"><circle cx="${r.cx}" cy="${r.cy}" r="${r.r}"/><text x="${r.cx}" y="${f1(r.cy - r.r + 22)}" text-anchor="middle">${esc(r.label)}</text></g>`).join('');
+  const rooms = scene.rooms.map((r) => `<g class="ao-room" aria-hidden="true"><circle cx="${r.cx}" cy="${r.cy}" r="${r.r}"/><text x="${r.cx}" y="${f1(r.cy - r.r + 22)}" text-anchor="middle">${esc(r.label)}${r.ctx?.known && r.ctx.percent != null ? ` · avg ${r.ctx.percent}% ctx` : ''}</text></g>`).join('');
   const edges = scene.edges.map((e) => renderEdge(e, scene, { selected: selected?.type === 'edge' && selected.id === e.id, flowing })).join('');
-  const nodes = scene.nodes.map((n) => renderNode(n, { selected: selected?.type === 'node' && selected.id === n.id, pulse: pulses.has(n.id) })).join('');
+  // Roving tabindex: one node is the tab stop (the chosen one, else the first); arrows move between the rest.
+  const stop = scene.nodes.some((n) => n.id === tabId) ? tabId : scene.nodes[0]?.id;
+  const nodes = scene.nodes.map((n) => renderNode(n, { selected: selected?.type === 'node' && selected.id === n.id, pulse: pulses.has(n.id), tab: n.id === stop })).join('');
   return `<svg class="ao-svg" viewBox="${vb.x} ${vb.y} ${vb.w} ${vb.h}" role="group" aria-label="${esc(label)}" aria-describedby="ao-alt-desc" preserveAspectRatio="xMidYMid meet" data-ao-svg>${renderMarkers()}<g class="ao-rooms">${rooms}</g><g class="ao-edges">${edges}</g><g class="ao-nodes">${nodes}</g></svg>`;
 }
 
@@ -131,6 +135,31 @@ export function renderAltTable(scene) {
     <table><caption>Relationships</caption><thead><tr><th>Kind</th><th>From</th><th>To</th><th>State</th><th>Line</th><th>Task</th></tr></thead><tbody>${edges}</tbody></table></div>`;
 }
 
+// ---- fleet hosts ------------------------------------------------------------------------------------------------------------------
+export function renderHostStrip(snapshot) {
+  const rows = hostStrip(snapshot);
+  if (!rows.length) return '';
+  const fleet = contextInfo(null, snapshot?.health?.context && Number.isFinite(snapshot.health.context.average_fraction) ? { measured: true, fraction: snapshot.health.context.average_fraction } : null);
+  const chips = rows.map((h) => `<li class="ao-host ao-host--${h.state}" data-ao-host="${esc(h.id)}"><span class="ao-host-id">${esc(h.id)}</span>
+    <span class="ao-host-count">${h.agents} ${h.agents === 1 ? 'agent' : 'agents'}</span><span class="ao-host-state">${esc(h.state)}</span>
+    <span class="ao-badge ao-badge--${h.ctx.level}">${esc(h.ctx.known ? `avg ${h.ctx.label}` : h.ctx.label)}</span></li>`).join('');
+  return `<ul class="ao-hosts" aria-label="Fleet hosts">${chips}<li class="ao-host ao-host--fleet"><span class="ao-host-id">Fleet</span><span class="ao-badge ao-badge--${fleet.level}">${esc(fleet.known ? `avg ${fleet.label}` : fleet.label)}</span></li></ul>`;
+}
+
+/** Drift signals: always labelled as heuristics, each with where it came from and the events that triggered it. */
+export function renderDrift(items) {
+  if (!items.length) return '';
+  const rows = items.map((d) => `<li class="ao-drift-item"><strong>${esc(d.title)}</strong> <span class="ao-chip ao-chip--static">${esc(d.provenance)}</span>
+    ${d.task ? `<span class="ao-note">task ${esc(d.task)}</span>` : ''}${d.evidence.length ? `<span class="ao-note">evidence: ${esc(d.evidence.map(shortId).join(', '))}</span>` : ''}</li>`).join('');
+  return `<section class="ao-drift" aria-label="Drift signals"><h4>Drift signals (heuristic)</h4><ul class="ao-drift-list">${rows}</ul>
+    <p class="ao-note">Heuristic signals from event metadata (derived or inferred, as labelled). They are not proof of a policy violation.</p></section>`;
+}
+
+const EDGE_STATE_NOTE = {
+  stalled: 'This handoff stalled: an endpoint disconnected before it finished. It stays stalled until a new handoff event arrives.',
+  failed: 'This handoff failed: an endpoint session ended before it finished.',
+};
+
 // ---- inspector --------------------------------------------------------------------------------------------------------------------
 const dl = (rows) => `<dl class="ao-dl">${rows.filter((r) => r[1] !== '' && r[1] != null).map(([k, v, raw]) => `<dt>${esc(k)}</dt><dd>${raw ? v : esc(v)}</dd>`).join('')}</dl>`;
 const nameOf = (scene, id) => scene.nodes.find((n) => n.id === id)?.name || shortId(id);
@@ -141,7 +170,7 @@ export function renderTask(task, scene) {
   const contributors = list(task.contributors).map(who).join(', ');
   return `<h3>Task ${esc(task.task_id)}</h3><p class="ao-note">Delegating never moves accountability: the owner below stays accountable.</p>
     ${dl([['Accountable owner', who(task.accountable_owner) || 'not assigned', Boolean(task.accountable_owner)], ['Contributors', contributors || 'none reported', Boolean(contributors)],
-      ['Reviewer', who(task.reviewer) || 'none reported', Boolean(task.reviewer)], ['Room', task.room_id ? roomLabel(task.room_id) : ''], ['Updated', task.updated_at]])}`;
+      ['Reviewer', who(task.reviewer) || 'none reported', Boolean(task.reviewer)], ['Room', task.room_id ? roomLabel(task.room_id) : ''], ['Updated', task.updated_at]])}${renderDrift(driftItems(task))}`;
 }
 
 export function renderInspector(sel, scene, snapshot) {
@@ -156,8 +185,9 @@ export function renderInspector(sel, scene, snapshot) {
       ['Kind', n.person ? 'Person' : 'Agent'], ['Model', n.person ? '' : n.modelKnown ? n.model : 'model unknown'], ['Provider', n.provider || (n.person ? '' : 'unknown')],
       ['Context', n.person ? '' : n.ctx.words], ['State', n.state.label], ['Host', n.host || (n.person ? '' : 'unknown')], ['Room', roomLabel(n.room)],
       ['Roles', n.roles.map((r) => `${r.role} of ${r.task}`).join(', ')], ['Model changes', changes], ['Compactions', n.compactions ? String(n.compactions) : ''],
-      ['Drift warnings', n.drift ? String(n.drift) : ''], ['Provenance', n.provenance], ['Last event', n.lastEventAt || ''], ['Session', a.session_id ? shortId(a.session_id) : ''],
+      ['Drift warnings reported', n.drift ? String(n.drift) : ''], ['Provenance', n.provenance], ['Last event', n.lastEventAt || ''], ['Session', a.session_id ? shortId(a.session_id) : ''],
     ])}${tasks.length ? `<p class="ao-sub">Tasks ${taskButtons(tasks)}</p>` : ''}
+      ${renderDrift(n.driftItems || [])}
       <div class="ao-actions">${n.person ? '' : `<button type="button" class="ao-btn" data-ao-open-pane="${esc(n.id)}">Open pane</button>`}${link ? `<a class="ao-btn" href="${esc(link)}">Open session</a>` : ''}</div>
       ${n.person ? '' : '<p class="ao-note">Double-click a node (or press O) to open its pane.</p>'}`;
   }
@@ -166,8 +196,8 @@ export function renderInspector(sel, scene, snapshot) {
     if (!e) return `${head}<p class="ao-note">That relationship is not in the current view.</p>`;
     return `${head}<h3>${esc(e.style.kindLabel)}</h3><p class="ao-note">${esc(EDGE_KINDS[e.kind].meaning)}. Metadata only: no message content is stored or shown.</p>${dl([
       ['From', nameOf(scene, e.from)], ['To', nameOf(scene, e.to)], ['State', e.style.state], ['Line', e.style.line], ['Task', e.task || ''], ['Handoff', e.handoff || ''],
-      ['Room', e.room ? roomLabel(e.room) : ''], ['Provenance', e.provenance], ['Updated', e.updatedAt || ''], ['Event', e.eventId || ''],
-    ])}${e.task ? `<p class="ao-sub">Task ${taskButtons([e.task])}</p>` : ''}`;
+      ['Room', e.room ? roomLabel(e.room) : ''], ['Provenance', e.provenance], ['Updated', e.updatedAt || ''], ['Event', e.eventId || ''], ['Interrupted by', e.raw?.interrupted_by || ''],
+    ])}${EDGE_STATE_NOTE[e.state] ? `<p class="ao-note ao-note--alert">${esc(EDGE_STATE_NOTE[e.state])}</p>` : ''}${e.task ? `<p class="ao-sub">Task ${taskButtons([e.task])}</p>` : ''}`;
   }
   if (sel?.type === 'task') {
     const t = scene.tasks.find((x) => x.task_id === sel.id) || list(snapshot?.tasks).find((x) => x.task_id === sel.id);
@@ -190,7 +220,7 @@ export function renderTimeline(state) {
     <label class="ao-filter ao-speed">Speed<select data-ao-speed>${speeds}</select></label>
     <input class="ao-scrub" type="range" min="0" max="${max}" value="${value}" step="1" data-ao-scrub aria-label="Execution timeline"${state.timeline.length ? '' : ' disabled'} aria-valuetext="${esc(frame.entry ? `${frame.entry.label}, ${where}` : 'no events yet')}">
     <button type="button" class="ao-btn ao-live${frame.live ? ' is-live' : ''}" data-ao-live aria-pressed="${frame.live}"><span class="ao-live-dot" aria-hidden="true"></span>Live</button></div>
-    <p class="ao-timeline-now" data-ao-now role="status">${esc(frame.entry ? `${formatClock(frame.at)} UTC · ${frame.entry.label} · ${where}` : 'No events yet.')}</p>`;
+    <p class="ao-timeline-now" data-ao-now>${esc(frame.entry ? `${formatClock(frame.at)} UTC · ${frame.entry.label} · ${where}` : 'No events yet.')}</p>`;
 }
 
 export function renderBanner(conn) {
@@ -209,17 +239,21 @@ const calmNow = () => {
 export function mountAgentOps(container, client, opts = {}) {
   const { freshness = () => null, connect = connectEvents, createEventSource, open = (detail) => container.dispatchEvent(new CustomEvent(OPEN_PANE_EVENT, { bubbles: true, detail })) } = opts;
   const state = { phase: 'loading', message: '', live: null, replay: null, mode: opts.mode || 'activity', filters: { ...emptyFilters(), ...(opts.filters || {}) }, selected: null,
-    timeline: [], index: null, playing: false, speed: 1, conn: 'idle', pulses: new Set(), scene: null, sig: '' };
+    timeline: [], index: null, playing: false, speed: 1, conn: 'idle', pulses: new Set(), scene: null, sig: '', tabNode: null, inspHtml: '', hostHtml: '', streamCursor: '' };
   let disposed = false, controller = null, replayCtl = null, playTimer = null, refreshTimer = null, stop = null;
 
   container.innerHTML = `<section class="ao" data-agent-ops data-ao-phase="loading">
     <div class="ao-bar"><div data-ao-tabs></div><div data-ao-filters></div></div>
     <div class="ao-banner" data-ao-banner role="status" hidden></div>
+    <div data-ao-hosts></div>
     <div class="ao-main"><div class="ao-stage" data-ao-stage></div><aside class="ao-inspector" data-ao-inspector aria-label="Inspector" aria-live="polite"></aside></div>
     <div class="ao-timeline" data-ao-timeline></div><div data-ao-alt-host></div></section>`;
   const $ = (s) => container.querySelector(s);
   const root = $('[data-agent-ops]'), stageEl = $('[data-ao-stage]'), inspEl = $('[data-ao-inspector]'), tlEl = $('[data-ao-timeline]');
 
+  // The inspector is an aria-live region: write it only when its content really changed, so a stream of unrelated events stays silent.
+  const setInspector = (html) => { if (html !== state.inspHtml) { state.inspHtml = html; inspEl.innerHTML = html; } };
+  const setHosts = (html) => { if (html !== state.hostHtml) { state.hostHtml = html; $('[data-ao-hosts]').innerHTML = html; } };
   const viewSnap = () => (state.index == null ? state.live : state.replay || state.live);
   const flowing = () => !calmNow();
 
@@ -238,7 +272,7 @@ export function mountAgentOps(container, client, opts = {}) {
       stageEl.innerHTML = state.phase === 'loading' ? '<div class="ao-state" role="status">Loading agent activity…</div>'
         : state.phase === 'off' ? '<div class="ao-state" role="status"><h2>Agent Operations is not turned on</h2><p>An administrator can enable control_plane.agent_ops in the server configuration.</p></div>'
           : `<div class="ao-state" role="alert"><h2>The map could not be loaded</h2><p>${esc(state.message)}</p><button type="button" class="ao-btn" data-ao-retry>Try again</button></div>`;
-      inspEl.innerHTML = '';
+      setInspector(''); setHosts('');
       return;
     }
     const snap = viewSnap();
@@ -252,13 +286,14 @@ export function mountAgentOps(container, client, opts = {}) {
       state.sig = sig;
       const filtered = FILTER_KEYS.some((k) => state.filters[k]);
       stageEl.innerHTML = scene.nodes.length
-        ? `<div class="ao-canvas">${renderScene(scene, { selected: state.selected, pulses: state.pulses, flowing: flowing() })}</div>${renderLegend()}${scene.truncated ? '<p class="ao-note">The server capped this view; some agents are not drawn.</p>' : ''}`
+        ? `<div class="ao-canvas">${renderScene(scene, { selected: state.selected, pulses: state.pulses, flowing: flowing(), tabId: state.tabNode })}</div>${renderLegend()}${scene.truncated ? '<p class="ao-note">The server capped this view; some agents are not drawn.</p>' : ''}`
         : renderEmpty(snap, filtered);
       $('[data-ao-alt-host]').innerHTML = renderAltTable(scene);
       if (focusKey) stageEl.querySelector(`[data-${focusKey[0] === 'aoNode' ? 'ao-node' : 'ao-edge'}="${CSS.escape(focusKey[1])}"]`)?.focus({ preventScroll: true });
       state.pulses = new Set();
     }
-    inspEl.innerHTML = renderInspector(state.selected, scene, snap);
+    setInspector(renderInspector(state.selected, scene, snap));
+    setHosts(renderHostStrip(snap));
   }
   function paintTimeline() {
     const hadFocus = tlEl.contains(container.querySelector(':focus')) ? container.querySelector(':focus')?.getAttribute('data-ao-scrub') != null : false;
@@ -285,6 +320,8 @@ export function mountAgentOps(container, client, opts = {}) {
       const tl = await loadTimeline(client, { signal });
       if (disposed || ctl.signal.aborted) return;
       if (tl.status === 'ok') state.timeline = buildTimeline(tl.body.events, state.timeline);
+      // The stream resumes from the snapshot's own cursor: the snapshot already contains everything up to it.
+      if (snap.body?.cursor && snap.body.cursor > state.streamCursor) state.streamCursor = snap.body.cursor;
       paintTimeline(); startStream();
     } else {
       state.phase = snap.status; state.message = snap.message || '';
@@ -301,7 +338,7 @@ export function mountAgentOps(container, client, opts = {}) {
       setLive(r.body); if (state.index == null) { paintBar(); paintStage(); }
     }, 350);
   }
-  const lastCursor = () => state.timeline.at(-1)?.cursor || state.live?.cursor || '';
+  const lastCursor = () => state.streamCursor || state.timeline.at(-1)?.cursor || state.live?.cursor || '';
   function startStream() {
     if (stop || disposed) return;
     const mk = createEventSource || ((u) => new EventSource(u));
@@ -313,6 +350,7 @@ export function mountAgentOps(container, client, opts = {}) {
       onError: () => { state.conn = 'offline'; paintBanner(); freshness()?.touch(false, 'agent-ops stream disconnected'); },
       onEvent: (ev) => {
         state.timeline = buildTimeline([ev], state.timeline);
+        if (ev?.event_id && ev.ingested_at) { const c = `${ev.ingested_at}~${ev.event_id}`; if (c > state.streamCursor) state.streamCursor = c; }
         if (state.index == null) paintTimeline(); else updateScrubMax();
         scheduleRefresh();
       },
@@ -361,7 +399,7 @@ export function mountAgentOps(container, client, opts = {}) {
       const on = Boolean(sel) && (sel.type === 'node' ? el.dataset.aoNode === sel.id : sel.type === 'edge' && el.dataset.aoEdge === sel.id);
       el.classList.toggle('is-selected', on); el.setAttribute('aria-pressed', String(on));
     }
-    if (state.scene) inspEl.innerHTML = renderInspector(sel, state.scene, viewSnap());
+    if (state.scene) setInspector(renderInspector(sel, state.scene, viewSnap()));
     state.sig = '';   // the next data change redraws with the selection baked in
   };
   const openPane = (id) => {
@@ -383,6 +421,12 @@ export function mountAgentOps(container, client, opts = {}) {
     else if ('aoLive' in d) { stopPlaying(false); if (state.mode === 'replay') { state.mode = 'activity'; paintBar(); } void seek(null); }
     else if ('aoClear' in d) { state.filters = emptyFilters(); paintBar(); paintStage({ force: true }); }
     else if ('aoRetry' in d) { state.phase = 'loading'; paintStage(); void load(); }
+  });
+  container.addEventListener('focusin', (event) => {
+    const n = event.target.closest?.('[data-ao-node]');
+    if (!n || state.tabNode === n.dataset.aoNode) return;
+    state.tabNode = n.dataset.aoNode;
+    for (const el of stageEl.querySelectorAll('[data-ao-node]')) el.setAttribute('tabindex', el === n ? '0' : '-1');
   });
   container.addEventListener('dblclick', (event) => { const n = event.target.closest?.('[data-ao-node]'); if (n) openPane(n.dataset.aoNode); });
   container.addEventListener('change', (event) => {

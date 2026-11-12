@@ -25,7 +25,14 @@ export const CTX_WARN = 0.7;
 export const CTX_CRITICAL = 0.9;
 
 /** Context utilisation of a snapshot agent. `fraction` is null unless both a measured numerator and a positive limit exist. */
-export function contextInfo(context) {
+export function contextInfo(context, health = null) {
+  if ((!context || !Number.isFinite(context.used)) && health && health.measured && Number.isFinite(health.fraction)) {
+    // The backend measured a fraction (used/limit) even though the raw numbers are not in this row: show it, still never as 0.
+    const raw = health.fraction, percent = Math.round(raw * 100), fraction = Math.max(0, Math.min(1, raw));
+    const level = raw >= CTX_CRITICAL ? 'critical' : raw >= CTX_WARN ? 'warn' : 'ok';
+    const tag = level === 'critical' ? ' critical' : level === 'warn' ? ' high' : '';
+    return { known: true, fraction, percent, level, label: `${percent}% ctx${tag}`, words: `${percent}% of context used${tag ? `, ${tag.trim()}` : ''}`, used: null, limit: null };
+  }
   const used = context && Number.isFinite(context.used) ? context.used : null;
   const limit = context && Number.isFinite(context.limit) && context.limit > 0 ? context.limit : null;
   if (used == null) return { known: false, fraction: null, percent: null, level: 'unknown', label: 'ctx unknown', words: 'context not reported', used: null, limit: null };
@@ -73,22 +80,24 @@ export const EDGE_KINDS = {
 export const KIND_ORDER = Object.keys(EDGE_KINDS);
 const PLANNED = new Set(['planned', 'proposed', 'queued', 'claimed', 'pending', 'requested']);
 const REJECTED = new Set(['rejected', 'declined', 'denied', 'cancelled', 'failed', 'expired']);
+const STALLED = new Set(['stalled']);   // a handoff whose endpoint went away: neither accepted nor refused, so it gets its own line
 
 export const DASH_PLANNED = '9 7';
 export const DASH_REJECTED = '2 7';
+export const DASH_STALLED = '14 4 2 4';
 
 /** Solid = accepted (or done), dashed = planned, dotted = rejected. The state word is always part of the label. */
 export function edgeStyle(edge) {
   const kind = Object.hasOwn(EDGE_KINDS, edge?.kind) ? edge.kind : 'communication';
   const meta = EDGE_KINDS[kind];
   const state = text(edge?.state).toLowerCase() || 'unknown';
-  const planned = PLANNED.has(state), rejected = REJECTED.has(state);
-  const dash = planned ? DASH_PLANNED : rejected ? DASH_REJECTED : null;
+  const planned = PLANNED.has(state), rejected = REJECTED.has(state), stalled = STALLED.has(state);
+  const dash = planned ? DASH_PLANNED : rejected ? DASH_REJECTED : stalled ? DASH_STALLED : null;
   return {
-    kind, tone: meta.tone, kindLabel: meta.label, state, planned, rejected, dashed: dash != null, dash,
-    line: planned ? 'dashed' : rejected ? 'dotted' : 'solid',
+    kind, tone: meta.tone, kindLabel: meta.label, state, planned, rejected, stalled, dashed: dash != null, dash,
+    line: planned ? 'dashed' : rejected ? 'dotted' : stalled ? 'stalled' : 'solid',
     // Flowing particles only on edges that are live: accepted or in-flight, never a refused one.
-    flowing: !rejected, label: `${meta.label} · ${state}`,
+    flowing: !rejected && !stalled, label: `${meta.label} · ${state}`,
   };
 }
 
@@ -151,6 +160,24 @@ export function nodeName(agent) {
 /** The model label shown inside a node; absent means the model is not known, which is said out loud. */
 export const modelLabel = (agent) => text(agent?.model) || 'model unknown';
 export const roomLabel = (id) => (id === NO_ROOM ? 'No room' : `Room ${shortId(id)}`);
+
+// ---- fleet hosts and drift ------------------------------------------------------------------------------------------------------
+const HOST_STATES = ['connected', 'disconnected'];
+/** One chip per host: id, how many agents, connection state (anything not reported as connected/disconnected is "unknown"). */
+export function hostStrip(snapshot) {
+  return list(snapshot?.hosts).filter((h) => h && h.host_id).map((h) => {
+    const agg = h.context_health;
+    return { id: text(h.host_id), agents: list(h.agents).length, state: HOST_STATES.includes(h.state) ? h.state : 'unknown', lastSeen: h.last_seen || null, reconnects: h.reconnects || 0,
+      ctx: contextInfo(null, agg && Number.isFinite(agg.average_fraction) ? { measured: true, fraction: agg.average_fraction } : null) };
+  });
+}
+
+const driftTitle = (kind) => { const t = text(kind).replace(/_/g, ' '); return t ? t[0].toUpperCase() + t.slice(1) : 'Drift'; };
+/** Drift signals of an agent or task. They are heuristics from event metadata, never proof of a policy violation; the UI says so. */
+export function driftItems(owner) {
+  return list(owner?.drift).filter(Boolean).map((d) => ({ kind: text(d.kind), title: driftTitle(d.kind), provenance: text(d.provenance) || 'unknown',
+    evidence: list(d.evidence_event_ids).map(text), task: d.task_id || null, note: text(d.note) }));
+}
 
 // ---- layout ---------------------------------------------------------------------------------------------------------------------
 const r1 = (n) => Math.round(n * 10) / 10;
@@ -241,16 +268,17 @@ export function layoutScene(snapshot, { mode = 'activity', filters = {} } = {}) 
     const n = g.members.length, ringR = n <= 1 ? 0 : memberRing(n);
     g.members.forEach((m, i) => {
       const a = n <= 1 ? 0 : -Math.PI / 2 + (2 * Math.PI * i) / n;
-      const ctx = contextInfo(m.context), st = stateInfo(m.state);
+      const ctx = contextInfo(m.context, m.context_health), st = stateInfo(m.state);
       nodes.push({
         id: m.node_id, x: r1(cx + ringR * Math.cos(a)), y: r1(cy + ringR * Math.sin(a)), r: NODE_R, room: g.id, person: m.kind === 'person' || isPerson(m.node_id),
         name: nodeName(m), model: modelLabel(m), modelKnown: Boolean(m.model), provider: m.provider || null, host: m.host_id || null,
         ctx, ring: ringGeometry(ctx.fraction), state: st, provenance: m.provenance || 'unknown', parent: m.parent_session_id || null,
-        modelChanges: list(m.model_changes).length, compactions: m.compactions || 0, drift: m.drift_warnings || 0, lastEventAt: m.last_event_at || null,
+        modelChanges: list(m.model_changes).length, compactions: m.compactions || 0, drift: m.drift_warnings || 0, driftItems: driftItems(m), lastEventAt: m.last_event_at || null,
         roles: roles.get(m.node_id) || [], agent: m,
       });
     });
-    rooms.push({ id: g.id, label: roomLabel(g.id), cx: r1(cx), cy: r1(cy), r: r1(radii[gi]), members: g.members.map((m) => m.node_id) });
+    const rh = list(view.rooms).find((r) => r.room_id === g.id)?.context_health;
+    rooms.push({ id: g.id, ctx: contextInfo(null, rh && Number.isFinite(rh.average_fraction) ? { measured: true, fraction: rh.average_fraction } : null), label: roomLabel(g.id), cx: r1(cx), cy: r1(cy), r: r1(radii[gi]), members: g.members.map((m) => m.node_id) });
   });
 
   const at = new Map(nodes.map((n) => [n.id, n]));
@@ -362,8 +390,9 @@ export function eventLabel(ev) {
   return `${what}${who ? ` · ${shortId(who)}` : ''}`;
 }
 
-/** Normalized /events rows -> ordered, de-duplicated timeline entries. Cursor order = server order. */
-export function buildTimeline(events, previous = []) {
+/** Normalized /events rows -> ordered, de-duplicated timeline entries, newest `cap` kept. Cursor order = server order. */
+export const TIMELINE_CAP = 2000;
+export function buildTimeline(events, previous = [], cap = TIMELINE_CAP) {
   const byCursor = new Map(previous.map((t) => [t.cursor, t]));
   for (const ev of list(events)) {
     if (!ev || !ev.event_id || !ev.ingested_at) continue;
@@ -371,7 +400,8 @@ export function buildTimeline(events, previous = []) {
     byCursor.set(cursor, { cursor, id: ev.event_id, type: text(ev.event_type), at: cursorTime(cursor), agent: ev.agent_id || null, session: ev.session_id || null,
       room: ev.room_id || null, task: ev.task_id || null, provenance: ev.provenance || 'unknown', label: eventLabel(ev) });
   }
-  return [...byCursor.values()].sort((a, b) => (a.cursor < b.cursor ? -1 : a.cursor > b.cursor ? 1 : 0));
+  const sorted = [...byCursor.values()].sort((a, b) => (a.cursor < b.cursor ? -1 : a.cursor > b.cursor ? 1 : 0));
+  return sorted.length > cap ? sorted.slice(sorted.length - cap) : sorted;   // ring buffer: the oldest entries fall off
 }
 
 /** Where the scrubber stands. `index` null = Live. */

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   agentOpsEnabled, altTable, buildTimeline, contextInfo, cursorTime, describeEdge, describeNode, diffSnapshots, edgeId, edgeStyle, filterOptions, filterSnapshot,
-  indexAtFraction, layoutScene, modeKinds, neighbour, nextIndex, replayFrame, ringGeometry, stateInfo, stepDelay, NODE_R, RING_R,
+  indexAtFraction, layoutScene, hostStrip, driftItems, TIMELINE_CAP, modeKinds, neighbour, nextIndex, replayFrame, ringGeometry, stateInfo, stepDelay, NODE_R, RING_R,
 } from './agent-ops-model.js';
 
 const agent = (id, over = {}) => ({ node_id: id, agent_id: id, session_id: id, host_id: 'h1', provider: null, model: 'opus', model_changes: [], state: 'idle',
@@ -261,4 +261,47 @@ test('edge labels: parallel edges between close nodes get separate label positio
   const spots = scene.edges.map((e) => `${e.labelAt.x},${e.labelAt.y}`);
   assert.equal(new Set(spots).size, 3);
   assert.ok(scene.edges.every((e) => e.at === undefined && Number.isFinite(e.labelAt.x)));
+});
+
+// ---- S8 ring buffer, health, hosts, drift, stalled handoffs ------------------------------------------------------------------
+test('timeline is a ring buffer: oldest entries drop at the cap, newest always survive', () => {
+  assert.equal(TIMELINE_CAP, 2000);
+  const evs = Array.from({ length: 12 }, (_, i) => ev(i + 1));
+  const t = buildTimeline(evs, [], 5);
+  assert.deepEqual(t.map((e) => e.id), ['e8', 'e9', 'e10', 'e11', 'e12']);
+  const more = buildTimeline([ev(13)], t, 5);
+  assert.deepEqual(more.map((e) => e.id), ['e9', 'e10', 'e11', 'e12', 'e13']);
+  assert.equal(buildTimeline(Array.from({ length: 2100 }, (_, i) => ({ ...ev(1), event_id: `x${String(i).padStart(4, '0')}` }))).length, 2000);
+});
+
+test('context health: backend measured fraction feeds the badge, unknown stays unknown and never 0', () => {
+  const measured = layoutScene({ agents: [agent('h', { context: null, context_health: { fraction: 0.92, level: 'high', measured: true } })], edges: [], rooms: [], tasks: [] }).nodes[0];
+  assert.equal(measured.ctx.percent, 92); assert.equal(measured.ctx.level, 'critical');
+  const unknown = layoutScene({ agents: [agent('u', { context: null, context_health: { fraction: null, level: 'unknown', measured: false } })], edges: [], rooms: [], tasks: [] }).nodes[0];
+  assert.equal(unknown.ctx.label, 'ctx unknown'); assert.equal(unknown.ctx.percent, null);
+  assert.equal(contextInfo({ used: 70, limit: 100 }).level, 'warn'); assert.equal(contextInfo({ used: 90, limit: 100 }).level, 'critical');
+});
+
+test('host strip: id, agent count, connection state; missing state says unknown', () => {
+  const rows = hostStrip({ hosts: [
+    { host_id: 'h1', agents: ['a', 'b'], state: 'connected', connected: true, last_seen: 't', reconnects: 1, context_health: { measured_count: 2, total: 2, average_fraction: 0.75, level: 'elevated' } },
+    { host_id: 'h2', agents: ['c'], connected: null }, { host_id: 'h3', agents: [], state: 'disconnected' }] });
+  assert.deepEqual(rows.map((r) => [r.id, r.agents, r.state]), [['h1', 2, 'connected'], ['h2', 1, 'unknown'], ['h3', 0, 'disconnected']]);
+  assert.equal(rows[0].ctx.percent, 75); assert.equal(rows[0].ctx.level, 'warn'); assert.equal(rows[1].ctx.label, 'ctx unknown');
+  assert.deepEqual(hostStrip({}), []);
+});
+
+test('drift items are labelled heuristic with provenance and evidence; absent drift is empty', () => {
+  const items = driftItems({ drift: [{ kind: 'handoff_stalled', provenance: 'derived', evidence_event_ids: ['e5', 'e3'], task_id: 't1', heuristic: true, note: 'n' }, { kind: 'weird_kind', provenance: 'inferred' }] });
+  assert.equal(items[0].title, 'Handoff stalled'); assert.equal(items[0].provenance, 'derived'); assert.deepEqual(items[0].evidence, ['e5', 'e3']);
+  assert.equal(items[1].title, 'Weird kind'); assert.equal(items[1].provenance, 'inferred');
+  assert.deepEqual(driftItems({}), []); assert.deepEqual(driftItems(null), []);
+  const n = layoutScene({ agents: [agent('d', { drift: [{ kind: 'repeated_tool_failures', provenance: 'derived' }] })], edges: [], rooms: [], tasks: [] }).nodes[0];
+  assert.equal(n.driftItems.length, 1);
+});
+
+test('handoff edge states stalled and failed have distinct styles and text', () => {
+  const stalled = edgeStyle({ kind: 'handoff', state: 'stalled' }), failed = edgeStyle({ kind: 'handoff', state: 'failed' });
+  assert.equal(stalled.line, 'stalled'); assert.ok(stalled.dash); assert.equal(stalled.flowing, false); assert.match(stalled.label, /stalled/);
+  assert.equal(failed.line, 'dotted'); assert.equal(failed.flowing, false);
 });

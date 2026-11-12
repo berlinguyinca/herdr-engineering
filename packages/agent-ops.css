@@ -138,3 +138,32 @@ html[data-calm="on"] .ao-particle { display: none; }
 /* A label with no free spot on a dense map appears on hover, focus or selection; its text always stays in the aria-label and the table. */
 .ao-edge-label--quiet { opacity: 0; }
 .ao-edge:hover .ao-edge-label--quiet, .ao-edge:focus-visible .ao-edge-label--quiet, .ao-edge.is-selected .ao-edge-label--quiet { opacity: 1; }
+
+/* fleet hosts strip: host id, agent count, connection state (words first, colour second) */
+.ao-hosts { list-style: none; display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; padding: 0; }
+.ao-hosts:empty { display: none; }
+.ao-host { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 6px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); font-size: 0.8125rem; min-width: 0; --host: var(--text-muted); }
+.ao-host--connected { --host: var(--status-ok); } .ao-host--disconnected { --host: var(--status-failed); } .ao-host--unknown { --host: var(--text-muted); }
+.ao-host { border-inline-start: 4px solid var(--host); }
+.ao-host-id { font: 600 0.8125rem var(--font-mono); overflow-wrap: anywhere; }
+.ao-host-count, .ao-host-state { color: var(--text-secondary); }
+.ao-host--disconnected .ao-host-state { color: var(--status-failed); font-weight: 600; }
+.ao-host--unknown .ao-host-state { font-style: italic; }
+
+/* context-health badge: amber from 70%, red from 90%; unknown is plain text, never 0 */
+.ao-badge { font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-secondary); }
+.ao-badge--warn { border-color: var(--status-attention); color: var(--status-attention); font-weight: 600; }
+.ao-badge--critical { border-color: var(--status-failed); color: var(--status-failed); font-weight: 700; }
+.ao-badge--unknown { font-style: italic; }
+
+/* drift warnings: heuristic, labelled */
+.ao-drift { margin: 12px 0; padding: 10px 12px; border: 1px dashed var(--status-attention); border-radius: var(--radius-sm); }
+.ao-drift h4 { margin: 0 0 6px; font-size: 0.8125rem; }
+.ao-drift-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: 0.8125rem; }
+.ao-drift-item { display: flex; flex-wrap: wrap; gap: 2px 8px; align-items: baseline; overflow-wrap: anywhere; }
+.ao-chip--static { cursor: default; padding: 1px 8px; min-height: 0; }
+.ao-note--alert { border-inline-start: 3px solid var(--status-attention); padding-inline-start: 8px; color: var(--text); }
+
+/* stalled handoff: dash-dot, amber, no particles (the label says "stalled" too) */
+.ao-edge--stalled .ao-edge-line { stroke: var(--status-attention); }
+.ao-key--stalled line { stroke: var(--status-attention); }
