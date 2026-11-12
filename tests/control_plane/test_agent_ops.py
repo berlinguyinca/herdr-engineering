@@ -643,7 +643,7 @@ def test_a_second_key_cannot_preempt_a_genuine_event_identity():
 
 # --------------------------------------------------------------------------------- stream cap (fix-2)
 def test_concurrent_streams_are_capped_per_principal(stack):
-    server = Server(stack.repo, stack.collab, agent_ops_config={"enabled": True})
+    server = Server(stack.repo, stack.collab, agent_ops_config={"enabled": True, "streams_per_principal": 2})
     server.srv.agent_ops_poll_seconds = 0.05
     try:
         a1, r1 = stream_conn(server, "alice")
@@ -705,3 +705,42 @@ def test_events_and_replay_answer_400_for_an_invalid_cursor_and_stream_resets(st
         assert frames[0]["event_id"] == "e9" and frames[0]["cursor"] > snapshot_cursor
     finally:
         server.stop()
+
+
+# ------------------------------------------------------------------------------ stream cap config, open mode (fix-4)
+def test_per_principal_stream_cap_defaults_to_four_and_is_configurable(stack):
+    server = Server(stack.repo, stack.collab, agent_ops_config={"enabled": True})
+    assert server.srv.agent_ops_streams_per_principal == 4
+    server.stop()
+    server = Server(stack.repo, stack.collab, agent_ops_config={"enabled": True, "streams_per_principal": 1})
+    try:
+        assert server.srv.agent_ops_streams_per_principal == 1
+        a1, r1 = stream_conn(server, "alice")
+        a2, r2 = stream_conn(server, "alice")
+        assert (r1.status, r2.status) == (200, 503)
+        a1.close()
+        a2.close()
+    finally:
+        server.stop()
+
+
+def test_open_mode_streams_share_one_bucket_whatever_the_api_key_header_says():
+    srv = ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, agent_ops_config={"enabled": True})
+    thread = threading.Thread(target=srv.serve, daemon=True)
+    thread.start()
+    srv.wait_until_ready()
+    srv.agent_ops_poll_seconds = 0.05
+    conns = []
+    try:
+        statuses = []
+        for n in range(6):                       # a fresh X-API-Key each time must not mint a fresh bucket
+            conn = http.client.HTTPConnection("127.0.0.1", srv.port, timeout=5)
+            conn.request("GET", "/api/v1/agent-ops/stream", headers={"X-API-Key": f"anything-{n}"})
+            statuses.append(conn.getresponse().status)
+            conns.append(conn)
+        assert statuses == [200, 200, 200, 200, 503, 503]
+    finally:
+        for conn in conns:
+            conn.close()
+        srv.shutdown()
+        thread.join(timeout=5)

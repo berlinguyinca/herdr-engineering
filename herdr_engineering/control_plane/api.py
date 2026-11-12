@@ -451,7 +451,9 @@ class ControlPlaneServer:
         self.agent_ops_poll_seconds = 1.0
         self.agent_ops_reauth_seconds = 30.0          # a live stream re-checks its credential this often
         self.agent_ops_streams = threading.BoundedSemaphore(16)   # concurrent SSE readers; each tick is a full gather
-        self.agent_ops_streams_per_principal = 2       # ...of which one caller (person, agent or key) may hold this many
+        per_caller = agent_ops_config.get("streams_per_principal") if isinstance(agent_ops_config, dict) else None
+        # ...of which one caller (person, agent or key) may hold this many (config streams_per_principal, default 4)
+        self.agent_ops_streams_per_principal = per_caller if isinstance(per_caller, int) and not isinstance(per_caller, bool) and per_caller >= 1 else 4
         self._agent_ops_stream_counts: dict[str, int] = {}
         self._agent_ops_stream_lock = threading.Lock()
         self.agent_ops_skipped_frames = 0              # stored events whose cursor could not be framed safely
@@ -6034,7 +6036,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             queue), and the number of concurrent streams is capped."""
             from .agent_ops import STREAM_PAGE, valid_cursor
             reset = cursor is not None and not valid_cursor(cursor)
-            caller = f"p:{principal.id}" if principal is not None else \
+            # open mode (no API keys) has no identity: one shared bucket, never one per (attacker-chosen) header value
+            caller = f"p:{principal.id}" if principal is not None else "open" if not server._keys else \
                 "k:" + hashlib.sha256(self.headers.get("X-API-Key", "").encode()).hexdigest()
             with server._agent_ops_stream_lock:
                 if server._agent_ops_stream_counts.get(caller, 0) >= server.agent_ops_streams_per_principal:
