@@ -18,7 +18,7 @@ const SNAP = {
 const EVENTS = [1, 2, 3].map((n) => ({ event_id: `e${n}`, ingested_at: `2026-11-12T10:00:0${n}.000000Z`, cursor: `2026-11-12T10:00:0${n}.000000Z~pi~a1~~e${n}`, event_type: 'tool.started', agent_id: 'a1', session_id: null }));
 
 // A real HTTP server speaking the agent-ops routes' contract (404 while off), and the real client.
-function serve({ enabled = true, fail = false } = {}) {
+function serve({ enabled = true, fail = false, badCursor = false } = {}) {
   const seen = [];
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://x');
@@ -26,6 +26,7 @@ function serve({ enabled = true, fail = false } = {}) {
     const send = (code, body) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
     if (!enabled || !url.pathname.startsWith(API)) return send(404, { error: 'not found' });
     if (fail) return send(500, { error: 'boom' });
+    if (badCursor && !url.pathname.endsWith('/snapshot')) return send(400, { error: 'invalid cursor' });
     if (url.pathname.endsWith('/snapshot')) return send(200, SNAP);
     if (url.pathname.endsWith('/replay')) return send(200, { ...SNAP, edges: [], cursor: url.searchParams.get('until') });
     if (url.pathname.endsWith('/events')) {
@@ -58,6 +59,17 @@ test('capability off is "off" (a 404 is an answer), a server error is "error"', 
     const e = await loadSnapshot(bad.client);
     assert.equal(e.status, 'error'); assert.ok(e.message);
   } finally { off.close(); bad.close(); }
+});
+
+test('a 400 on a cursor is a reset (re-fetch the snapshot), a 500 is not', async () => {
+  const s = await serve({ badCursor: true });
+  const bad = await serve({ fail: true });
+  try {
+    const r = await loadReplay(s.client, 'old~format');
+    assert.equal(r.status, 'error'); assert.equal(r.reset, true);
+    assert.equal((await loadSnapshot(s.client)).status, 'ok');
+    assert.equal((await loadReplay(bad.client, 'x')).reset, undefined);
+  } finally { s.close(); bad.close(); }
 });
 
 test('stream url resumes from the cursor', () => {

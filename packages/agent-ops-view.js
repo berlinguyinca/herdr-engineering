@@ -25,7 +25,8 @@ export const OPEN_PANE_EVENT = 'agent-ops:open-pane';
 const answer = async (call) => {
   try { return { status: 'ok', body: await call() }; } catch (error) {
     if (error?.status === 404) return { status: 'off' };
-    return { status: 'error', message: error?.message || 'request failed' };
+    // 400 = the server refused our cursor: the owner drops it and re-fetches the snapshot
+    return { status: 'error', message: error?.message || 'request failed', ...(error?.status === 400 ? { reset: true } : {}) };
   }
 };
 export const loadSnapshot = (client, { signal } = {}) => answer(() => client.getJson(`${API}/snapshot`, { signal }));
@@ -371,7 +372,8 @@ export function mountAgentOps(container, client, opts = {}) {
     if (r.status === 'ok') {
       state.pulses = new Set(diffSnapshots(viewSnap(), r.body).modelChanged); state.replay = r.body;
       state.conn = state.conn === 'offline' ? 'offline' : state.conn;
-    } else { state.message = r.message || ''; }
+    } else if (r.reset) { state.streamCursor = ''; state.index = null; state.replay = null; load(); return; }
+    else { state.message = r.message || ''; }
     paintStage(); paintTimeline(); schedulePlay();
   }
   function stopPlaying(repaint = true) { state.playing = false; clearTimeout(playTimer); playTimer = null; if (repaint) paintTimeline(); }
