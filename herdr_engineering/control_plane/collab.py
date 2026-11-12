@@ -1699,6 +1699,17 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 raise CollabError(404, "not found")
         return self.artifact_room_handle(pr.id, room_id, query)
 
+    def readable_room_ids(self, pr: Principal) -> list[str]:
+        """Ids of the rooms ``pr`` may read right now. Same rule as ``_authorize(.., "read", ..)`` but silent (no audit row,
+        no denial counter): for projections that must filter, not probe."""
+        with self._lock:
+            out = []
+            for rid, room in self._rooms.items():
+                eff = self._effective(pr, room)
+                if eff is not None and "read" in eff[0]:
+                    out.append(rid)
+            return out
+
     def room_exists(self, room_id: str) -> bool:
         """Whether a room by this id exists. For callers (API keys) that have no room membership of their own."""
         with self._lock:

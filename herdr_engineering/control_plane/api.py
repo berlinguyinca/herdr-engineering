@@ -320,7 +320,7 @@ class ControlPlaneServer:
                  assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None, build_cache=None,
-                 memory_adapter=None, memory_config=None, unified_workspace_config=None, work_center_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
+                 memory_adapter=None, memory_config=None, unified_workspace_config=None, work_center_config=None, agent_ops_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None, library=None,
                  library_viewers=None, member_directory=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
@@ -445,6 +445,10 @@ class ControlPlaneServer:
         # work_center_v1 (WC-006): gates every Work Command Center UI surface in the dashboard (This week card, session Work Context
         # header, board "Open in Herdr" links). Advertisement only; no route consumes it. YAML-only, strict True, default off.
         self.work_center_enabled = isinstance(work_center_config, dict) and work_center_config.get("enabled") is True
+        # agent_ops_v1 (docs/specs/2026-11-12-agent-operations-map): the read-only Agent Operations projection routes.
+        # YAML-only, strict True, default off; off means 404 and no capability.
+        self.agent_ops_enabled = isinstance(agent_ops_config, dict) and agent_ops_config.get("enabled") is True
+        self.agent_ops_poll_seconds = 1.0
         self._summary_stop = threading.Event()
         self._summary_scanner = None
         if not collab_only:
@@ -636,6 +640,8 @@ class ControlPlaneServer:
         from .single_flight_cache import SingleFlightCache
         self.ci_reports_cache = SingleFlightCache(ttl=15.0)     # /api/v1/ci/reports, see single_flight_cache.py
         self.collab = collab
+        from .agent_ops import AgentOpsService
+        self.agent_ops = AgentOpsService(repo, collab, self.handoffs)
         if self.assistant.host_candidates is None:       # looked up per call: `collab` may be swapped after startup
             self.assistant.host_candidates = lambda: (
                 self.collab.assistant_runtime_host_candidates() if self.collab is not None else [])
@@ -1671,6 +1677,8 @@ class ControlPlaneServer:
             caps.append("unified_workspace_v1")
         if getattr(self, "work_center_enabled", False):
             caps.append("work_center_v1")
+        if getattr(self, "agent_ops_enabled", False):
+            caps.append("agent_ops_v1")
         if getattr(self, "skills", None) is not None:
             caps.append("skill_registry_v1")
         if getattr(self, "build_cache", None) is not None:
@@ -4106,6 +4114,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 if what in ("stats", "timeseries", "errors", "spend") and len(parts) == 5:
                     return self._llm_stats(what)
                 return self._json({"error": "not found"}, 404)
+            if resource == "agent-ops":
+                return self._agent_ops(parts[4:])
             if resource == "graph":
                 return self._graph_get(parts)
             if resource == "steering":
@@ -5958,6 +5968,91 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 if view is not None:
                     out = {**out, **view}
             return self._json(out)
+
+        def _agent_ops_caller(self):
+            """(principal, operator): the collab person/agent behind the request, if any. Room scope comes ONLY from a
+            collab principal (or the single operator's own identity); an API key alone reads no room."""
+            from .collab import CollabError
+            service = server.collab
+            operator = self._role() == "operator"
+            if service is None:
+                return None, operator
+            authorization = self.headers.get("Authorization", "")
+            if authorization:
+                try:
+                    return service.authenticate(authorization, self.headers.get("X-Herdr-Device")), operator
+                except CollabError:
+                    raise PermissionError("unauthorized") from None
+            if operator and server.operator_user and service.auth.exists(server.operator_user):
+                from .collab import Principal
+                pr = Principal("user", server.operator_user, server.operator_user)
+                pr.admin = pr.approver = True
+                return pr, operator
+            return None, operator
+
+        def _agent_ops(self, sub):
+            """``/api/v1/agent-ops/{snapshot,events,replay,stream}``: metadata-only, room-authorized, read-only. Off (default)
+            it is a 404 like any unknown route."""
+            if not getattr(server, "agent_ops_enabled", False) or len(sub) != 1 or sub[0] not in (
+                    "snapshot", "events", "replay", "stream"):
+                return self._json({"error": "not found"}, 404)
+            try:
+                principal, operator = self._agent_ops_caller()
+            except PermissionError:
+                return self._json({"error": "unauthorized"}, 401)
+            from .agent_ops import PAGE_MAX
+            service = server.agent_ops
+            query = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+            cursor = query.get("cursor") or self.headers.get("Last-Event-ID") or None
+            if sub[0] == "stream":
+                return self._agent_ops_stream(service, principal, operator, cursor)
+            viewer = service.viewer(principal, operator)
+            if sub[0] == "snapshot":
+                return self._json(service.snapshot(viewer, principal))
+            if sub[0] == "replay":
+                return self._json(service.replay(viewer, principal, query.get("until") or cursor))
+            try:
+                limit = int(query.get("limit", 100))
+            except ValueError:
+                return self._json({"error": "limit must be an integer"}, 400)
+            return self._json(service.events(viewer, principal, cursor, min(max(limit, 1), PAGE_MAX)))
+
+        def _agent_ops_stream(self, service, principal, operator, cursor):
+            """SSE with cursor resume (``?cursor=`` or ``Last-Event-ID``). Access is re-evaluated on every tick, so a revoked
+            room stops flowing at once; the queue is the bounded page read each tick (no unbounded subscriber queue)."""
+            from .agent_ops import STREAM_PAGE, cursor_of
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                self.connection.settimeout(30)
+            except OSError:
+                pass
+            started = last_write = time.monotonic()
+            try:
+                self.wfile.write(f"event: connected\ndata: {json.dumps({'cursor': cursor})}\n\n".encode())
+                self.wfile.flush()
+                while time.monotonic() - started < _MAX_SSE_SECONDS:
+                    page = service.events(service.viewer(principal, operator), principal, cursor, STREAM_PAGE)
+                    for ev in page["events"]:
+                        self.wfile.write(f"id: {cursor_of(ev)}\ndata: {json.dumps(ev)}\n\n".encode())
+                    if page["events"]:
+                        cursor = page["next_cursor"]
+                        self.wfile.flush()
+                        last_write = time.monotonic()
+                        if page["has_more"]:
+                            continue
+                    elif time.monotonic() - last_write >= _SSE_IDLE_SECONDS:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        last_write = time.monotonic()
+                    time.sleep(server.agent_ops_poll_seconds)
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                pass
+            return None
 
         def _work_graph(self, sub, body=None):
             """``/api/v1/graph/work/*`` (unified workspace P02): the persistent Work Graph. Off (default) it is a 404 like any

@@ -163,6 +163,13 @@
         "provider": {
           "type": "string",
           "maxLength": 64
+        },
+        "target_agent_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Fan-out targets for message/delegation events (read as endpoints; max 16)."
         }
       }
     }
