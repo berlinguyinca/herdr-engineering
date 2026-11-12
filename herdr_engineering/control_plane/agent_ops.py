@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import threading
 import time
 from datetime import UTC, datetime
@@ -126,6 +127,32 @@ def cursor_of(event: dict) -> str:
     take it from the ``cursor`` field of a row; ``~`` inside a part is escaped so the parts stay unambiguous."""
     parts = (event["ingested_at"], event["source"], event["agent_id"] or "", event.get("actor_ref") or "")
     return "~".join([p.replace("~", "%7E") for p in parts] + [event["event_id"]])
+
+
+CURSOR_MAX = 512
+_CURSOR_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
+_CURSOR_ACTOR_RE = re.compile(r"[0-9a-f]{12}")
+
+
+def valid_cursor(cursor: Any) -> bool:
+    """Whether ``cursor`` has the shape :func:`cursor_of` issues: ``ts~source~agent~actor_ref~event_id`` (ts a real UTC
+    timestamp or empty when the event had none, actor_ref empty or 12 hex, no control characters, bounded length)."""
+    if not isinstance(cursor, str) or not cursor or len(cursor) > CURSOR_MAX:
+        return False
+    if any(ord(c) < 32 or ord(c) == 127 for c in cursor):
+        return False
+    parts = cursor.split("~", 4)
+    if len(parts) != 5:
+        return False
+    stamp, source, _agent, actor, event_id = parts
+    if stamp:
+        if not _CURSOR_TS_RE.fullmatch(stamp):
+            return False
+        try:
+            datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S.%fZ")
+        except ValueError:
+            return False
+    return bool(source and event_id and (not actor or _CURSOR_ACTOR_RE.fullmatch(actor)))
 
 
 def _identity(event: dict) -> tuple:

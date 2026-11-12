@@ -6006,12 +6006,16 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 principal, operator = self._agent_ops_caller()
             except PermissionError:
                 return self._json({"error": "unauthorized"}, 401)
-            from .agent_ops import PAGE_MAX
+            from .agent_ops import PAGE_MAX, valid_cursor
             service = server.agent_ops
             query = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
             cursor = query.get("cursor") or self.headers.get("Last-Event-ID") or None
             if sub[0] == "stream":
                 return self._agent_ops_stream(service, principal, operator, cursor)
+            for given in (query.get("until"), cursor):
+                if given and sub[0] in ("events", "replay") and not valid_cursor(given):
+                    return self._json({"error": "invalid cursor: take one from the cursor field of a snapshot or event "
+                                                "row (re-fetch the snapshot)"}, 400)
             viewer = service.viewer(principal, operator)
             if sub[0] == "snapshot":
                 return self._json(service.snapshot(viewer, principal))
@@ -6028,7 +6032,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             room stops flowing at once) and the credential itself every ``agent_ops_reauth_seconds`` (a revoked key, token
             or disabled person ends the stream); the queue is the bounded page read each tick (no unbounded subscriber
             queue), and the number of concurrent streams is capped."""
-            from .agent_ops import STREAM_PAGE
+            from .agent_ops import STREAM_PAGE, valid_cursor
+            reset = cursor is not None and not valid_cursor(cursor)
             caller = f"p:{principal.id}" if principal is not None else \
                 "k:" + hashlib.sha256(self.headers.get("X-API-Key", "").encode()).hexdigest()
             with server._agent_ops_stream_lock:
@@ -6050,7 +6055,10 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     pass
                 started = last_write = last_auth = time.monotonic()
                 try:
-                    self.wfile.write(f"event: connected\ndata: {json.dumps({'cursor': cursor})}\n\n".encode())
+                    if reset:        # an unusable Last-Event-ID is ignored: say so, then continue from the current snapshot
+                        cursor = service.snapshot(service.viewer(principal, operator), principal)["cursor"]
+                    self.wfile.write(
+                        f"event: connected\ndata: {json.dumps({'cursor': None, 'reset': True} if reset else {'cursor': cursor})}\n\n".encode())
                     self.wfile.flush()
                     while time.monotonic() - started < _MAX_SSE_SECONDS:
                         if time.monotonic() - last_auth >= server.agent_ops_reauth_seconds:

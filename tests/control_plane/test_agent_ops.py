@@ -656,3 +656,52 @@ def test_concurrent_streams_are_capped_per_principal(stack):
             conn.close()
     finally:
         server.stop()
+
+
+# ------------------------------------------------------------------------------ cursor validation (fix-4)
+def _bad_cursors(repo):
+    row = AgentOpsService(repo).events(Viewer(operator=True), None, None, 1)["events"][0]
+    return {"old-format": f"{row['ingested_at']}~{row['event_id']}", "garbage": "garbage!!", "empty-parts": "~",
+            "huge": "x" * 20000, "nul": "a\x00b", "bad-time": "2026-13-45T99:00:00.000000Z~pi~a1~~e1",
+            "bad-actor": f"{row['ingested_at']}~pi~a1~nothex~e1"}
+
+
+def test_cursor_validator_accepts_every_server_cursor_and_nothing_else():
+    repo = _scrub_repo()
+    for row in AgentOpsService(repo).events(Viewer(operator=True), None, None, 100)["events"]:
+        assert agent_ops.valid_cursor(row["cursor"])
+    assert not any(agent_ops.valid_cursor(c) for c in _bad_cursors(repo).values())
+
+
+def test_events_and_replay_answer_400_for_an_invalid_cursor_and_stream_resets(stack):
+    repo = _scrub_repo()
+    server = Server(repo, stack.collab, agent_ops_config={"enabled": True})
+    server.srv.agent_ops_poll_seconds = 0.05
+    try:
+        from urllib.parse import quote
+        for name, cur in _bad_cursors(repo).items():
+            assert server.get(f"/api/v1/agent-ops/events?cursor={quote(cur)}")[0] == 400, name
+            status, body = server.get(f"/api/v1/agent-ops/replay?until={quote(cur)}")
+            assert status == 400 and "cursor" in body["error"], name
+        good = server.get("/api/v1/agent-ops/events?limit=100")[1]["events"][0]["cursor"]
+        assert server.get(f"/api/v1/agent-ops/events?cursor={quote(good)}")[0] == 200
+        snapshot_cursor = server.get("/api/v1/agent-ops/snapshot")[1]["cursor"]
+        conn = http.client.HTTPConnection("127.0.0.1", server.srv.port, timeout=5)
+        conn.request("GET", "/api/v1/agent-ops/stream",
+                     headers={"X-API-Key": "view-key", "Last-Event-ID": _bad_cursors(repo)["old-format"]})
+        resp = conn.getresponse()
+        assert resp.status == 200
+        lines = [resp.fp.readline().decode().strip() for _ in range(2)]
+        assert lines[0] == "event: connected"
+        assert json.loads(lines[1][5:]) == {"cursor": None, "reset": True}
+        # starts from the current snapshot cursor: nothing already folded in is replayed
+        ingest(repo, 9, "tool.started", session_id="s-delta", agent_id="delta", event_id="e9")
+        frames = []
+        while not frames:
+            line = resp.fp.readline().decode().strip()
+            if line.startswith("data:") and '"event_id"' in line:
+                frames.append(json.loads(line[5:]))
+        conn.close()
+        assert frames[0]["event_id"] == "e9" and frames[0]["cursor"] > snapshot_cursor
+    finally:
+        server.stop()
