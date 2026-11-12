@@ -169,3 +169,16 @@ test('Work Command Center embed: lineage card on the Overview only with BOTH cap
   assert.equal(await page.locator('[data-overview="agent-lineage"]').count(),0);
  });
 });
+
+test('fleet strip from real ingest (hosts, unknown state) and roving tabindex on the nodes',async()=>{
+ await withServer({},async(page,base)=>{
+  await open(page,base);
+  const strip=await page.locator('.ao-hosts').innerText();
+  assert.match(strip,/mac-studio/); assert.match(strip,/farm-gpu-01/); assert.match(strip,/3 agents/); assert.match(strip,/unknown/);
+  assert.equal(await page.locator('.ao-node[tabindex="0"]').count(),1,'exactly one node is a tab stop');
+  assert.equal(await page.locator('.ao-node[tabindex="-1"]').count(),4);
+  await page.locator('.ao-node').nth(2).focus();
+  assert.equal(await page.locator('.ao-node[tabindex="0"]').count(),1);
+  assert.equal(await page.locator('.ao-node').nth(2).getAttribute('tabindex'),'0');
+ });
+});
