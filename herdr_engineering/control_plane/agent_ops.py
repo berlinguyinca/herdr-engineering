@@ -46,6 +46,37 @@ _REVIEW = {"review.requested": "planned", "review.completed": "completed"}
 _HANDOFF = {"queued": "planned", "claimed": "planned", "accepted": "accepted", "in_progress": "accepted"}
 _REJECTED_TASK = frozenset({"rejected", "declined", "denied", "cancelled"})
 _CONTRIBUTION = frozenset({"artifact.created", "artifact.verified", "tests.started", "tests.completed"})
+_IN_FLIGHT = frozenset({"planned", "accepted"})   # handoff edge states that an agent crash can interrupt
+CONTEXT_ELEVATED = 0.70                           # amber
+CONTEXT_HIGH = 0.90                               # red
+CONTEXT_CRITICAL = 1.0
+FAILURE_STREAK = 3                                # consecutive tool.failed (no tool.ended between) = drift signal
+MAX_EVIDENCE = 10
+HEURISTIC_NOTE = "Heuristic signal derived from event metadata; not a proven policy violation."
+
+
+def _level(fraction: float | None) -> str:
+    if fraction is None:
+        return "unknown"
+    return ("critical" if fraction >= CONTEXT_CRITICAL else "high" if fraction >= CONTEXT_HIGH
+            else "elevated" if fraction >= CONTEXT_ELEVATED else "ok")
+
+
+def context_health(context: dict | None) -> dict:
+    """Derived health of one measured context. Unknown (no used, or no positive limit) stays unknown, never 0."""
+    used = context.get("used") if context else None
+    limit = context.get("limit") if context else None
+    fraction = round(used / limit, 4) if used is not None and limit else None
+    return {"fraction": fraction, "level": _level(fraction), "source": (context or {}).get("source"),
+            "measured": fraction is not None}
+
+
+def context_aggregate(agents: list[dict]) -> dict:
+    """Average over MEASURED agents only; ``measured_count/total`` says how much of the group that covers."""
+    fractions = [a["context_health"]["fraction"] for a in agents if a["context_health"]["measured"]]
+    average = round(sum(fractions) / len(fractions), 4) if fractions else None
+    return {"measured_count": len(fractions), "total": len(agents), "average_fraction": average,
+            "level": _level(average)}
 
 
 class Viewer(NamedTuple):
@@ -265,6 +296,7 @@ class _Fold:
         self.rooms: dict[str, dict] = {}
         self.edges: dict[tuple, dict] = {}
         self.tasks: dict[str, dict] = {}
+        self.hosts: dict[str, dict] = {}
 
     # -- nodes
     def node(self, agent_id: str | None, session_id: str | None) -> str | None:
@@ -287,7 +319,8 @@ class _Fold:
                 "node_id": key, "agent_id": agent_id or key, "session_id": session_id, "host_id": None,
                 "provider": None, "model": None, "model_changes": [], "state": "unknown", "context": None,
                 "room_ids": [], "parent_session_id": None, "compactions": 0, "drift_warnings": 0,
-                "label": None, "provenance": "unknown", "last_event_at": None}
+                "label": None, "provenance": "unknown", "last_event_at": None,
+                "_prior": None, "_by_host": None, "_fails": [], "_reported": []}
         elif agent_id and self.nodes[key]["agent_id"] == key and agent_id != key:
             self.nodes[key]["agent_id"] = agent_id
         return key
@@ -330,6 +363,11 @@ class _Fold:
         kind, payload = ev["event_type"], ev["payload"]
         when = ev["occurred_at"] or ev["ingested_at"]
         me = self.node(ev["agent_id"], ev["session_id"])
+        if ev["host_id"]:
+            host = self.hosts.setdefault(ev["host_id"], {"connected": None, "reconnects": 0, "last_seen": ""})
+            host["last_seen"] = max(host["last_seen"], when)
+            if me is None and kind in ("agent.disconnected", "agent.reconnected"):
+                self._host_link(ev["host_id"], host, kind, ev)
         if ev["room_id"]:
             room = self.rooms.setdefault(ev["room_id"], {"room_id": ev["room_id"], "agent_ids": []})
             if me and not me.startswith(_USER) and kind != "room.left":
@@ -367,6 +405,29 @@ class _Fold:
         elif kind in _CONTRIBUTION and task is not None and me and not me.startswith(_USER):
             self._add(task["contributors"], me)
 
+    def _host_link(self, host_id: str, host: dict, kind: str, ev: dict) -> None:
+        """A host-level (agent-less) disconnect/reconnect moves every agent known on that host."""
+        members = [n for n in self.nodes.values() if n["host_id"] == host_id]
+        if kind == "agent.disconnected" and host["connected"] is not False:
+            host["connected"] = False
+            for node in members:
+                if node["state"] not in ("disconnected", "ended"):
+                    node["_prior"], node["_by_host"], node["state"] = node["state"], host_id, "disconnected"
+                    self._interrupt(node["node_id"], "stalled", ev)
+        elif kind == "agent.reconnected":
+            if host["connected"] is False:
+                host["reconnects"] += 1
+            host["connected"] = True
+            for node in members:
+                if node["_by_host"] == host_id:
+                    node["state"], node["_by_host"], node["_prior"] = node["_prior"] or "idle", None, None
+
+    def _interrupt(self, node_id: str, state: str, ev: dict) -> None:
+        """A handoff in flight to/from an agent that disconnected or ended is stalled/failed, never accepted."""
+        for edge in self.edges.values():
+            if edge["kind"] == "handoff" and edge["state"] in _IN_FLIGHT and node_id in (edge["from"], edge["to"]):
+                edge["state"], edge["interrupted_by"] = state, ev["event_id"]
+
     def _agent_event(self, node: dict, ev: dict, kind: str, payload: dict, when: str) -> None:
         for field in ("host_id", "parent_session_id"):
             node[field] = ev[field] or node[field]
@@ -376,7 +437,19 @@ class _Fold:
         if ev["provenance"] != "unknown" or node["provenance"] == "unknown":
             node["provenance"] = ev["provenance"]
         if kind in _STATES:
-            node["state"] = _STATES[kind]
+            if node["_by_host"] and kind != "agent.reconnected":
+                node["_prior"] = _STATES[kind]   # host is down: remember what to restore, stay disconnected
+            else:
+                node["state"], node["_by_host"] = _STATES[kind], None
+            if kind == "agent.disconnected":
+                self._interrupt(node["node_id"], "stalled", ev)
+            elif kind == "session.ended":
+                self._interrupt(node["node_id"], "failed", ev)
+        if kind == "tool.failed":
+            node["_fails"].append((ev["event_id"], ev["task_id"]))
+            del node["_fails"][:-MAX_EVIDENCE]
+        elif kind == "tool.ended":
+            node["_fails"] = []
         if kind in ("model.selected", "model.switched") and ev["model_id"] and ev["model_id"] != node["model"]:
             node["model_changes"].append({"from": node["model"], "to": ev["model_id"], "at": when,
                                           "event_id": ev["event_id"]})
@@ -392,12 +465,26 @@ class _Fold:
             node["compactions"] += 1
         elif kind == "drift.warning":
             node["drift_warnings"] += 1          # derived/inferred; never a proven policy violation
+            node["_reported"].append((ev["event_id"], ev["provenance"], ev["task_id"]))
+            del node["_reported"][:-MAX_EVIDENCE]
         elif kind == "room.joined" and ev["room_id"]:
             self._add(node["room_ids"], ev["room_id"])
         elif kind == "room.left" and ev["room_id"] and ev["room_id"] in node["room_ids"]:
             node["room_ids"].remove(ev["room_id"])
         if ev["room_id"] and kind not in ("room.left",):
             self._add(node["room_ids"], ev["room_id"])
+
+    def _hosts(self, agents: list[dict]) -> list[dict]:
+        ids = sorted(set(self.hosts) | {a["host_id"] for a in agents if a["host_id"]})[:MAX_ROOMS]
+        out = []
+        for host_id in ids:
+            meta = self.hosts.get(host_id) or {"connected": None, "reconnects": 0, "last_seen": ""}
+            members = [a for a in agents if a["host_id"] == host_id]
+            state = "unknown" if meta["connected"] is None else "connected" if meta["connected"] else "disconnected"
+            out.append({"host_id": host_id, "agents": [a["node_id"] for a in members], "state": state,
+                        "last_seen": meta["last_seen"] or None, "connected": meta["connected"],
+                        "reconnects": meta["reconnects"], "context_health": context_aggregate(members)})
+        return out
 
     def result(self, cursor: str | None, event_count: int) -> dict:
         def fix(ref: str | None) -> str | None:
@@ -407,9 +494,14 @@ class _Fold:
             return ref
 
         agents = sorted(self.nodes.values(), key=lambda n: n["node_id"])[:MAX_AGENTS]
+        by_id = {n["node_id"]: n for n in agents}
+        for node in agents:
+            node["context_health"] = context_health(node["context"])
         rooms = []
         for room in sorted(self.rooms.values(), key=lambda r: r["room_id"])[:MAX_ROOMS]:
-            rooms.append({"room_id": room["room_id"], "agent_ids": sorted({fix(a) for a in room["agent_ids"]})})
+            ids = sorted({fix(a) for a in room["agent_ids"]})
+            rooms.append({"room_id": room["room_id"], "agent_ids": ids,
+                          "context_health": context_aggregate([by_id[i] for i in ids if i in by_id])})
         edges = []
         for edge in sorted(self.edges.values(), key=lambda e: (e["kind"], e["from"], e["to"], e["event_id"])):
             edges.append({**edge, "from": fix(edge["from"]), "to": fix(edge["to"])})
@@ -420,12 +512,42 @@ class _Fold:
                           "contributors": sorted({fix(c) for c in task["contributors"]})})
         for node in agents:
             node["room_ids"] = sorted(node["room_ids"])
-        return {"agents": copy.deepcopy(agents), "rooms": rooms, "edges": edges[:MAX_EDGES], "tasks": tasks,
-                "cursor": cursor,
+        _drift(agents, by_id, edges, tasks)
+        hosts = self._hosts(agents)
+        out_agents = [{k: v for k, v in copy.deepcopy(n).items() if not k.startswith("_")} for n in agents]
+        return {"agents": out_agents, "rooms": rooms, "edges": edges[:MAX_EDGES], "tasks": tasks,
+                "cursor": cursor, "hosts": hosts, "health": {"context": context_aggregate(agents)},
                 "counts": {"agents": len(agents), "rooms": len(rooms), "edges": len(edges[:MAX_EDGES]),
-                           "tasks": len(tasks), "events": event_count},
+                           "tasks": len(tasks), "events": event_count, "hosts": len(hosts)},
                 "truncated": len(self.nodes) > MAX_AGENTS or len(self.edges) > MAX_EDGES
                 or len(self.rooms) > MAX_ROOMS}
+
+
+def _drift(agents: list[dict], by_id: dict, edges: list[dict], tasks: list[dict]) -> None:
+    """Attach ``drift`` warnings (heuristics from real event fields only) to agents and tasks. Never raw content."""
+    def entry(kind: str, provenance: str, evidence: list[str], task_id: str | None) -> dict:
+        return {"kind": kind, "provenance": provenance, "evidence_event_ids": evidence[-MAX_EVIDENCE:],
+                "task_id": task_id, "heuristic": True, "note": HEURISTIC_NOTE}
+
+    for node in agents:
+        node["drift"] = []
+        if node["_reported"]:
+            marks = {p for _, p, _ in node["_reported"]}
+            node["drift"].append(entry("reported_drift_warning", "inferred" if "inferred" in marks else "derived",
+                                       [e for e, _, _ in node["_reported"]], node["_reported"][-1][2]))
+        if len(node["_fails"]) >= FAILURE_STREAK:
+            node["drift"].append(entry("repeated_tool_failures", "derived", [e for e, _ in node["_fails"]],
+                                       node["_fails"][-1][1]))
+    for edge in edges:
+        if edge["kind"] == "handoff" and edge["state"] in ("stalled", "failed"):
+            for end in {edge["from"], edge["to"]}:
+                if end in by_id:
+                    by_id[end]["drift"].append(entry(f"handoff_{edge['state']}", "derived",
+                                                     [edge["interrupted_by"], edge["event_id"]], edge["task_id"]))
+    for node in agents:
+        node["drift"].sort(key=lambda d: (d["kind"], d["evidence_event_ids"]))
+    for task in tasks:
+        task["drift"] = [d for n in agents for d in n["drift"] if d["task_id"] == task["task_id"]]
 
 
 def fold(events: list[dict], up_to: str | None = None) -> dict:
