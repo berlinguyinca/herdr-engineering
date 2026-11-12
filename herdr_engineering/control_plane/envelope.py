@@ -42,8 +42,14 @@ _OPS_MODEL_RE = re.compile(r"[A-Za-z0-9._:@/+-]{1,160}")       # provider/model 
 LABEL_MAX = 80
 _LABEL_REDACTIONS = (
     (re.compile(r"(?i)\b(?:authorization:\s*)?bearer\s+\S+"), "[redacted]"),
-    (re.compile(r"(?i)\b[\w-]*(?:password|passwd|pwd|pass|secret|token|api[ _-]?key)[\w-]*\s*(?:[=:]|\bis\b)\s*\S+"),
+    (re.compile(r"(?i)\bauthorization:\s*basic\s+\S+"), "[redacted]"),
+    # long nouns keep [\w-]* around them (db_password, x-api-key); `was` only for the nouns that are never ordinary prose
+    (re.compile(r"(?i)\b[\w-]*(?:password|passwd|secret|api[ _-]?key)[\w-]*\s*(?:[=:]|->|\bis\b|\bwas\b)\s*\S+"),
      "[redacted]"),
+    (re.compile(r"(?i)\b[\w-]*token[\w-]*\s*(?:[=:]|->|\bis\b)\s*\S+"), "[redacted]"),
+    # short forms are anchored: `tests passed: 42`, `bypass is enabled`, `compass: north` are ordinary text
+    (re.compile(r"(?i)(?<![A-Za-z0-9])pass(?![A-Za-z0-9])\s*(?:[=:]|->|\bis\b)\s*\S+"), "[redacted]"),
+    (re.compile(r"(?i)(?<![A-Za-z0-9])pwd(?![A-Za-z0-9])\s*(?:[=:]|->|\bis\b|\s)\s*\S+"), "[redacted]"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]*)?)?"), "[redacted]"),
     (re.compile(r"\bglpat-[A-Za-z0-9_-]{8,}"), "[redacted]"),
     (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[email]"),
@@ -54,7 +60,7 @@ _LABEL_REDACTIONS = (
     (re.compile(r"(?<![\w:])(?:~|\.{1,2})?(?:/[^\s/]+)+/?"), "[path]"),
     # relative: src/app/main.py, a/b/c, docs/readme.md. One separator and no extension (CI/CD, read/write, 3/4,
     # claude-opus-4/5, auth/session) is ordinary text, not a path.
-    (re.compile(r"(?<![\w:/.-])(?:[\w.-]+(?:/[\w.-]+){2,}|[\w-]+(?:\.[\w-]+)*/[\w.-]*\.[A-Za-z0-9]{1,8}\b|[\w.-]+\.[A-Za-z0-9]{1,8}\b(?=/)[/\w.-]*)/?"), "[path]"),
+    (re.compile(r"(?<![\w:/.-])(?!\d+(?:/\d+){2,}\b)(?:[\w.-]+(?:/[\w.-]+){2,}|[\w-]+(?:\.[\w-]+)*/[\w.-]*\.[A-Za-z0-9]{1,8}\b|[\w.-]+\.[A-Za-z0-9]{1,8}\b(?=/)[/\w.-]*)/?"), "[path]"),
 )
 
 # Entity types whose state is derived by dedicated handlers. Their v2 envelope
@@ -115,6 +121,7 @@ def sanitize_label(value: str) -> str:
     """A short human label with file paths and secret-looking tokens removed (metadata only, never content)."""
     if not isinstance(value, str):
         raise ValueError("sanitized_label must be a string")
+    value = value[:_MAX_STR]                             # bound the regex input when called outside the validated path
     # controls first (zero-width / bidi / format characters would otherwise split a secret past the patterns)
     value = unicodedata.normalize("NFKC", value)         # fullwidth / compatibility forms fold to their ASCII shape
     value = "".join(" " if ch.isspace() else "" if unicodedata.category(ch) in ("Cc", "Cf") else ch for ch in value)
@@ -138,6 +145,8 @@ def _agent_ops(body: dict) -> dict | None:
         raise ValueError("status must be a short lowercase token")
     ops["status"] = status
     label = body.get("sanitized_label")
+    if isinstance(label, str) and len(label) > _MAX_STR:  # reject (never truncate) before any normalising or pattern runs
+        raise ValueError(f"sanitized_label must be at most {_MAX_STR} characters")
     ops["sanitized_label"] = None if label is None else sanitize_label(label)
     if provenance is None and all(v is None for v in ops.values()):
         return None

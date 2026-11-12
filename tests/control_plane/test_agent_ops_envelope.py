@@ -143,3 +143,35 @@ def test_label_keeps_ordinary_text(raw):
 ])
 def test_label_hardened_redactions(raw, leak):
     assert leak not in sanitize_label(raw)
+
+
+@pytest.mark.parametrize("raw", ["tests passed: 42", "bypass is enabled", "compass: north", "passport: check",
+                                 "deadline 11/12/2026", "pass rate is 90%", "token: count 5"[:0] + "ratio 1/2/3"])
+def test_label_short_forms_and_dates_are_not_redacted(raw):
+    assert sanitize_label(raw) == raw
+
+
+@pytest.mark.parametrize("raw,leak", [
+    ("my secret was hunter2", "hunter2"), ("Authorization: Basic dXNlcjpwYXNzd29yZA", "dXNlcjpwYXNzd29yZA"),
+    ("password -> hunter2", "hunter2"), ("pwd hunter2", "hunter2"), ("PASS = hunter2", "hunter2"),
+    ("db_password: hunter2", "hunter2"), ("user_pwd=hunter2", "hunter2"),
+])
+def test_label_secret_forms_still_redacted(raw, leak):
+    assert leak not in sanitize_label(raw)
+
+
+@pytest.mark.parametrize("raw", ["pass" * 25000, "a." * 50000, "x" * 513])
+def test_oversized_label_is_rejected_quickly_before_any_regex(raw):
+    import time
+    t = time.perf_counter()
+    with pytest.raises(ValueError):
+        normalize_envelope(body(provenance="observed", sanitized_label=raw), PRINCIPAL, NOW)
+    assert time.perf_counter() - t < 0.5
+
+
+def test_label_at_the_cap_is_accepted_and_direct_call_is_bounded():
+    import time
+    assert normalize_envelope(body(provenance="observed", sanitized_label="y" * 512), PRINCIPAL, NOW)
+    t = time.perf_counter()
+    assert len(sanitize_label("a." * 50000)) <= 80
+    assert time.perf_counter() - t < 1.0
