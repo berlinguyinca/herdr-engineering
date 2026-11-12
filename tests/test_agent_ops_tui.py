@@ -273,7 +273,7 @@ def test_end_to_end_renders_the_real_server_snapshot_and_replay():
         assert snapshot["counts"]["agents"] == 2
         for w, h in ((120, 40), (80, 24), (50, 20)):
             text = plain(render(snapshot, w, h, opts=UNI))
-            assert "opus" in text and "model ?" in text and "ctx ?" in text, (w, h)
+            assert "opus" in text and "model ?" in text and "ctx unknown" in text, (w, h)
         cursors = client.all_cursors()
         assert len(cursors) >= 4 and cursors == sorted(cursors)
         early = client.get("replay", until=cursors[1])
@@ -495,5 +495,105 @@ def test_cli_warns_about_argv_token_but_not_env_or_file(tmp_path):
         assert argv.returncode == viaenv.returncode == viafile.returncode == 0
         assert "visible in the process list" in argv.stderr and "tok-alice" not in argv.stderr
         assert viaenv.stderr == "" and viafile.stderr == ""
+    finally:
+        server.stop()
+
+
+# ---------------------------------------------------------------- health, drift, hosts, stalled/failed handoffs
+def health(fraction):
+    return {"fraction": fraction, "level": "unknown" if fraction is None else "ok", "source": None, "measured": fraction is not None}
+
+
+def aggregate(avg, measured, total):
+    return {"measured_count": measured, "total": total, "average_fraction": avg, "level": "unknown" if avg is None else "ok"}
+
+
+def drift(kind="repeated_tool_failures", task="t1"):
+    return {"kind": kind, "provenance": "derived", "evidence_event_ids": ["e1"], "task_id": task, "heuristic": True,
+            "note": "Heuristic signal derived from event metadata; not a proven policy violation."}
+
+
+def health_snap():
+    agents = [agent("calm", ctx={"used": 40, "limit": 100, "source": None}), agent("warm", ctx={"used": 72, "limit": 100, "source": None}),
+              agent("hot", ctx={"used": 95, "limit": 100, "source": None}), agent("blank", ctx=None)]
+    for a, f in zip(agents, (0.4, 0.72, 0.95, None)):
+        a["context_health"] = health(f)
+        a["drift"] = []
+    agents[2]["drift"] = [drift()]
+    data = snap(agents, [edge("handoff", "calm", "warm", "stalled", "t1"), edge("handoff", "hot", "blank", "failed", "t2"),
+                         edge("handoff", "calm", "hot", "accepted", "t3")])
+    data["tasks"][0]["drift"] = [drift()]
+    data["hosts"] = [{"host_id": "mac-01", "agents": ["calm", "warm"], "state": "connected", "connected": True, "last_seen": None,
+                      "reconnects": 0, "context_health": aggregate(0.56, 2, 2)},
+                     {"host_id": "dev-02", "agents": ["hot"], "state": "disconnected", "connected": False, "last_seen": None,
+                      "reconnects": 1, "context_health": aggregate(0.95, 1, 1)},
+                     {"host_id": "lab-03", "agents": ["blank"], "state": "unknown", "connected": None, "last_seen": None,
+                      "reconnects": 0, "context_health": aggregate(None, 0, 1)}]
+    data["health"] = {"context": aggregate(0.69, 3, 4)}
+    data["counts"]["hosts"] = 3
+    return data
+
+
+@pytest.mark.parametrize("w,h", [(120, 40), (80, 24)])
+def test_health_features_render_in_both_layouts(w, h):
+    for opts in (UNI, ASCII, RenderOpts(color=True)):
+        lines = render(health_snap(), w, h, opts=opts)
+        assert len(lines) == h and all(visible_width(l) <= w for l in lines)
+    text = plain(render(health_snap(), w, h, opts=UNI))
+    assert re.search(r"hosts 3:.*mac-01", text) and "dev-02" in text
+    assert "ctx 69%" in text and "ctx unknown" in text            # fleet average and an unmeasured agent/host
+    assert "0%" not in text.replace("40%", "").replace("70%", "")  # unknown is never drawn as zero
+    assert "~drift?" in text                                       # heuristic, never asserted as fact
+    assert "STALLED" in text and "FAILED" in text
+
+
+def test_hosts_row_keeps_unknown_unknown():
+    text = plain(render(health_snap(), 120, 40, opts=UNI))
+    row = next(l for l in text.splitlines() if l.startswith("hosts") or " hosts " in l)
+    assert "lab-03 ? ctx unknown" in row and "dev-02 × ctx 95%" in row and "mac-01 ● ctx 56%" in row
+
+
+def test_context_badge_thresholds_and_colours():
+    coloured = "\n".join(render(health_snap(), 120, 40, opts=RenderOpts(color=True)))
+    assert re.search(r"\x1b\[38;5;78m\[[█░]+\] 40%\x1b", coloured)                 # green
+    assert re.search(r"\x1b\[38;5;215m\[[█░]+\] 72%!\x1b", coloured)               # amber from 70
+    assert re.search(r"\x1b\[38;5;203m\[[█░]+\] 95%!!\x1b", coloured)              # red from 90
+    assert "ctx unknown" in plain(render(health_snap(), 120, 40, opts=UNI))
+    assert "\x1b" not in "\n".join(render(health_snap(), 120, 40, opts=UNI))      # NO_COLOR path stays escape-free
+
+
+def test_stalled_and_failed_handoffs_are_distinct_from_accepted_and_planned():
+    data = health_snap()
+    text = plain(render(data, 120, 40, mode="handoffs", opts=UNI))
+    assert "handoff STALLED" in text and "handoff FAILED" in text and "✗" in text
+    ascii_text = plain(render(data, 120, 40, mode="handoffs", opts=ASCII))
+    assert "STALLED" in ascii_text and "FAILED" in ascii_text and "x" in ascii_text
+    red = "\n".join(render(data, 120, 40, mode="handoffs", opts=RenderOpts(color=True)))
+    assert re.search(r"\x1b\[38;5;203mhandoff STALLED", red) and re.search(r"\x1b\[38;5;203mhandoff FAILED", red)
+
+
+def test_drift_is_marked_heuristic_in_tasks_and_inspect():
+    data = health_snap()
+    assert "~drift? repeated_tool_failures" in plain(render(data, 120, 40, opts=UNI))
+    inspect = plain(render(data, 120, 40, focus=2, opts=RenderOpts(overlay="inspect")))
+    assert "heuristic" in inspect and "repeated_tool_failures" in inspect and "ctx health" in inspect
+
+
+def test_legacy_snapshot_without_new_fields_still_renders():
+    text = plain(render(snap(), 120, 40, opts=UNI))
+    assert "hosts" not in text and "~drift?" not in text and "STALLED" not in text
+
+
+def test_real_server_snapshot_with_hosts_renders_end_to_end():
+    server = LiveServer()
+    try:
+        ingest(server.repo, 1, "session.started", agent_id="a1", session_id="s1", host_id="mac-01")
+        ingest(server.repo, 2, "context.metric", agent_id="a1", session_id="s1", payload={"context_used": 91, "context_limit": 100})
+        ingest(server.repo, 3, "session.started", agent_id="a2", session_id="s2", host_id="dev-02")
+        snapshot = tui.Client(server.url, "view-key").get("snapshot")
+        for w, h in ((120, 40), (80, 24)):
+            text = plain(render(snapshot, w, h, opts=UNI))
+            assert "hosts 2:" in text and "mac-01" in text and "ctx unknown" in text
+        assert re.search(r"\] 91%!!", plain(render(snapshot, 120, 40, opts=UNI)))
     finally:
         server.stop()

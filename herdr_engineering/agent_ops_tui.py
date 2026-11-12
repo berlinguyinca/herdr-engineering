@@ -203,6 +203,76 @@ def is_planned(edge: dict) -> bool:
     return str(edge.get("state", "")).lower() in PLANNED
 
 
+BROKEN = {"stalled", "failed"}      # a handoff interrupted by a disconnect (stalled) or ended session (failed)
+
+
+def is_broken(edge: dict) -> bool:
+    return str(edge.get("state", "")).lower() in BROKEN
+
+
+def context_fraction(agent: dict) -> float | None:
+    """Measured context fraction from the server's ``context_health`` (or, for an older snapshot, from ``context``);
+    None means unknown and is never turned into 0."""
+    health_ = agent.get("context_health")
+    if isinstance(health_, dict):
+        f = health_.get("fraction") if health_.get("measured") else None
+        return float(f) if isinstance(f, (int, float)) else None
+    ctx = agent.get("context")
+    if isinstance(ctx, dict) and isinstance(ctx.get("used"), (int, float)) and isinstance(ctx.get("limit"), (int, float)) \
+            and ctx["limit"] > 0:
+        return ctx["used"] / ctx["limit"]
+    return None
+
+
+def ctx_level_style(fraction: float | None) -> str | None:
+    return None if fraction is None else "red" if fraction >= 0.9 else "yellow" if fraction >= 0.7 else "green"
+
+
+def ctx_badge(agent: dict, width: int, opts: RenderOpts) -> tuple[str, str | None]:
+    """The map node's context row: a bar with ``!`` (amber, >=70%) or ``!!`` (red, >=90%) so colour is never the only cue,
+    or ``ctx unknown`` when nothing measurable was reported."""
+    fraction = context_fraction(agent)
+    mark = "" if fraction is None or fraction < 0.7 else "!!" if fraction >= 0.9 else "!"
+    bar = context_bar(agent.get("context"), width - len(mark), opts)
+    return ("ctx unknown" if bar == "ctx ?" else bar + mark), ctx_level_style(fraction)
+
+
+def pct_text(fraction: float | None) -> str:
+    return "ctx unknown" if fraction is None else f"ctx {round(100 * fraction)}%"
+
+
+def drift_kinds(item: dict) -> list[str]:
+    return [clean(d.get("kind"), 24) for d in item.get("drift") or [] if isinstance(d, dict)]
+
+
+def hosts_row(snapshot: dict, width: int, opts: RenderOpts) -> str | None:
+    """``fleet ctx 69% (3/4)  hosts 3: mac-01 ● ctx 56%  dev-02 × ctx 95%  lab-03 ? ctx unknown``; None for an older snapshot."""
+    hosts = snapshot.get("hosts")
+    fleet = (snapshot.get("health") or {}).get("context")
+    if not isinstance(hosts, list) and not isinstance(fleet, dict):
+        return None
+    hosts = hosts if isinstance(hosts, list) else []
+    segs: list[tuple[str, str | None]] = []
+    if isinstance(fleet, dict):
+        avg = fleet.get("average_fraction")
+        measured = f" ({fleet.get('measured_count', '?')}/{fleet.get('total', '?')})" if avg is not None else ""
+        segs.append((f"fleet {pct_text(avg if isinstance(avg, (int, float)) else None)}{measured}  ",
+                     ctx_level_style(avg if isinstance(avg, (int, float)) else None) or "dim"))
+    segs.append((f"hosts {(snapshot.get('counts') or {}).get('hosts', len(hosts))}:", "bold"))
+    glyph = {"connected": ("●", "green"), "disconnected": ("×", "red")}
+    for host in hosts:
+        mark, style = glyph.get(str(host.get("state")), ("?", "gray"))     # unknown stays unknown: never "up" or "down"
+        avg = (host.get("context_health") or {}).get("average_fraction")
+        avg = avg if isinstance(avg, (int, float)) else None
+        segs += [(f" {clean(host.get('host_id'), 14)} ", None), (mark, style), (f" {pct_text(avg)} ", ctx_level_style(avg))]
+    out, used = [], 0
+    for text, style in segs:
+        text = fit(text, width - used)
+        used += cell_width(text)
+        out.append(f"{sgr(style)}{text}{RESET}" if opts.color and style and text else text)
+    return "".join(out)
+
+
 def visible_edges(snapshot: dict, mode: str, kind_filter: str | None) -> list[dict]:
     edges = [e for e in snapshot.get("edges") or [] if e.get("kind") in _EDGE]
     allowed = {"communication": {"communication"}, "handoffs": {"handoff", "delegation"},
@@ -332,10 +402,14 @@ def route(a: Box, b: Box, blocked: set[tuple[int, int]], occupied: dict[tuple[in
     return []
 
 
-def hub_text(snapshot: dict, w: int) -> tuple[str, str]:
+def hub_room(snapshot: dict) -> dict | None:
     rooms = sorted(snapshot.get("rooms") or [], key=lambda r: (-len(r.get("agent_ids") or []), str(r.get("room_id"))))
-    if rooms:
-        r = rooms[0]
+    return rooms[0] if rooms else None
+
+
+def hub_text(snapshot: dict, w: int) -> tuple[str, str]:
+    r = hub_room(snapshot)
+    if r:
         return f"room …{clean(r.get('room_id'), 80)[-6:]}", f"{len(r.get('agent_ids') or [])} members"
     return "ops hub", f"{len(snapshot.get('agents') or [])} agents"
 
@@ -343,6 +417,7 @@ def hub_text(snapshot: dict, w: int) -> tuple[str, str]:
 def edge_label(edge: dict, room: int) -> str:
     """'delegate · api-impl': the kind is always spelled out; only the task id is abbreviated to fit ``room`` cells."""
     verb = ("~" if is_planned(edge) else "") + _VERB.get(edge["kind"], edge["kind"])
+    verb += f" {str(edge['state']).upper()}" if is_broken(edge) else ""
     task = clean(edge.get("task_id") or "", 40)
     if not task:
         return verb
@@ -390,7 +465,12 @@ def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, o
         path = route(a, b, blocked, occupied, w, h)
         occupied.update({(x, y): d for x, y, d in path})
         color, sh, sv, dh, dv, arrow, ah_, av_, aa = _EDGE[edge["kind"]]
-        planned = is_planned(edge)
+        broken = is_broken(edge)
+        if broken:
+            color = "red"       # stalled = dashed red, failed = solid red ending in a cross; neither looks accepted
+            if str(edge.get("state")).lower() == "failed":
+                arrow, aa = "✗", "x"
+        planned = is_planned(edge) or str(edge.get("state")).lower() == "stalled"
         for i, (x, y, d) in enumerate(path):
             if opts.unicode:
                 ch = (dh if d == "h" else dv) if planned else (sh if d == "h" else sv)
@@ -410,6 +490,13 @@ def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, o
             for c in range(1, hw - 1):
                 cv.put(hx + c, hy + row, m, "dim")
         cv.text(hx + 2, hy, fit(f" {title} ", hw - 4), "cyan")
+        room_health = (hub_room(snapshot) or {}).get("context_health")
+        if isinstance(room_health, dict):
+            avg = room_health.get("average_fraction")
+            avg = avg if isinstance(avg, (int, float)) else None
+            partial = f" {room_health.get('measured_count')}/{room_health.get('total')}" if avg is not None and \
+                room_health.get("measured_count") != room_health.get("total") else ""
+            cv.text(hx + 2, hy + 2, fit(f" {pct_text(avg)}{partial} ", hw - 4), ctx_level_style(avg) or "dim")
         cv.text(hx + max((hw - cell_width(sub)) // 2, 1), hy + 1, fit(sub, hw - 2), "cyan")
     for i, a in enumerate(agents):
         draw_node(cv, a, boxes[a["node_id"]], i == focus % len(agents), opts, compact, snapshot, mode)
@@ -441,7 +528,7 @@ def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, o
             if placed:
                 break
     for edge, path, color in drawn:     # activity pulses: a glyph travelling the edge; fixed mid-edge under reduced motion
-        live = not is_planned(edge) and any(
+        live = not is_planned(edge) and not is_broken(edge) and any(
             next((x for x in agents if x["node_id"] == n), {}).get("state") == "working" for n in (edge.get("from"), edge.get("to")))
         if live and path and mode != "replay":
             px, py, _ = path[len(path) // 2 if opts.reduced_motion else tick % len(path)]
@@ -473,21 +560,20 @@ def draw_node(cv: Canvas, agent: dict, box: tuple[int, int, int, int], focused: 
     dot = _STATE_DOT.get(state, "?") if opts.unicode else {"working": "*", "idle": "o", "blocked": "!"}.get(state, "?")
     shown_state = _ABBR.get(state, state) if compact else state
     rows = [f"{dot} {'▸' if focused and opts.unicode else '>' if focused else ''}{node_name(agent)}", f"{clean(agent.get('model') or 'model ?', max(inner - cell_width(shown_state) - 1, 4))} {clean(shown_state, 9)}"]
+    badge, ctx_style = ctx_badge(agent, inner, opts)
     if not compact or h >= 4:
-        rows.append(context_bar(agent.get("context"), inner, opts))
+        rows.append(badge)
     if mode == "ownership":
         owned = [t["task_id"] for t in snapshot.get("tasks") or [] if t.get("accountable_owner") in
                  (agent.get("agent_id"), agent.get("node_id"))]
         rows[1] = ("owns " + ",".join(clean(t, 6) for t in owned)) if owned else rows[1]
-    ctx = agent.get("context")
-    pct = 100 * ctx["used"] / ctx["limit"] if isinstance(ctx, dict) and isinstance(ctx.get("used"), (int, float)) \
-        and isinstance(ctx.get("limit"), (int, float)) and ctx["limit"] > 0 else None
-    ctx_style = None if pct is None else "red" if pct >= 90 else "yellow" if pct >= 70 else "green"   # unknown stays unstyled
     for i, text in enumerate(rows[:h - 2]):
         if i == 0 and focused:      # visible focus: the whole name row in reverse video (marker + bold frame without colour)
             cv.text(x + 1, y + 1, pad(" " + text, w - 2), color + "+rev")
             continue
         cv.text(x + 2, y + 1 + i, text, color if i == 0 else ctx_style if i == 2 else None, limit=inner)
+    if drift_kinds(agent):      # heuristic signal, so the tag says so: "?" and never a verdict
+        cv.text(x + 2, y + h - 1, f" ~drift?{len(drift_kinds(agent)) if len(drift_kinds(agent)) > 1 else ''} ", "yellow")
 
 
 # --------------------------------------------------------------------------------------------- side panels
@@ -513,6 +599,8 @@ def task_lines(snapshot: dict, w: int) -> list[str]:
         lines.append(clean(f"{t.get('task_id')} owner:{t.get('accountable_owner') or '?'}", w - 2))
         contrib = ",".join(clean(c, 8) for c in t.get("contributors") or []) or "-"
         lines.append(clean(f"  by:{contrib} rev:{t.get('reviewer') or '-'}", w - 2))
+        if drift_kinds(t):
+            lines.append(clean(f"  ~drift? {','.join(drift_kinds(t))}", w - 2))
     return lines or ["no tasks"]
 
 
@@ -561,7 +649,7 @@ def legend(opts: RenderOpts) -> str:
     for kind in KINDS:
         _, sh, _, dh, _, arrow, ah_, _, aa = _EDGE[kind]
         parts.append(f"{sh * 2 if opts.unicode else ah_ * 2}{arrow if opts.unicode else aa}{kind[:4]}")
-    return " ".join(parts) + ("  ╌╌ planned" if opts.unicode else "  -  - planned")
+    return " ".join(parts) + ("  ╌╌ planned  ╌╌ stalled  ✗ failed" if opts.unicode else "  -  - planned  -  - stalled  x failed")
 
 
 def status_text(snapshot: dict, opts: RenderOpts) -> str:
@@ -619,7 +707,12 @@ def overlay_lines(snapshot: dict, w: int, h: int, focus: int, opts: RenderOpts) 
                 f"state     {clean(a.get('state'))}  ({clean(a.get('provenance'))})",
                 f"context   {context_bar(ctx, 14, opts)}  src:{clean((ctx or {}).get('source') if isinstance(ctx, dict) else None) or '?'}",
                 f"compact   {a.get('compactions', 0)}  drift {a.get('drift_warnings', 0)}",
+                f"ctx health {pct_text(context_fraction(a))[4:]}",
                 f"rooms     {', '.join(clean(r, 12) for r in a.get('room_ids') or []) or '-'}", "edges:"]
+        if drift_kinds(a):
+            text.append("drift (heuristic, not a proven violation):")
+            text += [clean(f"  {d.get('kind')} [{d.get('provenance')}] task:{d.get('task_id') or '-'}", w - 2)
+                     for d in a.get("drift") or [] if isinstance(d, dict)]
         for e in snapshot.get("edges") or []:
             if a.get("node_id") in (e.get("from"), e.get("to")):
                 text.append(clean(f"  {e['kind']} {e['from']} → {e['to']} {e.get('state')}", w - 2))
@@ -683,12 +776,15 @@ def _render(snapshot: dict, width: int, height: int, mode: str, focus: int, tick
     header = [style_line(fit(head, width), header_style + "+bold", opts), style_line(fit(summary, width), "dim", opts)]
     if opts.overlay:
         return header + overlay_lines(snapshot, width, height - 3, focus, opts) + [footer]
+    hrow = hosts_row(snapshot, width, opts)
+    header += [hrow] if hrow is not None else []
+    extra = len(header) - 2
     full = width >= 100 and height >= 30
     if full:
         rw = 40
         mw = width - rw - 1
         bottom = 4
-        mh = height - 2 - bottom - 1
+        mh = height - 2 - extra - bottom - 1
         map_lines = draw_map(snapshot, mw - 2, mh - 3, mode, focus, tick, opts, compact=False)
         map_block = _boxed_ansi("Map · " + mode_title(mode), map_lines, mw, mh, opts, opts.pane == "map", legend(opts))
         t_h = max(mh // 4, 5)
@@ -704,7 +800,7 @@ def _render(snapshot: dict, width: int, height: int, mode: str, focus: int, tick
         return header + body + bottom_block + [footer]
     # compact (80x24 and similar): map hero, a two-panel strip below
     strip = 6 if height >= 20 else 3
-    mh = height - 2 - strip - 3
+    mh = height - 2 - extra - strip - 3
     map_lines = draw_map(snapshot, width, mh, mode, focus, tick, opts, compact=True)
     lg = style_line(fit(legend(opts), width), "dim", opts)
     half = width // 2
@@ -736,10 +832,12 @@ def _render_narrow(snapshot: dict, width: int, height: int, mode: str, focus: in
     lines = [style_line(fit(f"AGENT OPS [{status}] {mode_title(mode)}", width), STATUS_COLOR.get(opts.status, "white") + "+bold", opts)]
     if opts.overlay:
         return lines + overlay_lines(snapshot, width, height - 2, focus, opts) + [style_line("q quit Esc close"[:width], "dim", opts)]
+    hrow = hosts_row(snapshot, width, opts)
+    lines += [hrow] if hrow is not None else []
     for i, a in enumerate(agents):
         state = str(a.get("state") or "unknown")
         mark = ">" if i == focus % max(len(agents), 1) else " "
-        row = f"{mark}{_STATE_DOT.get(state, '?') if opts.unicode else state[:1]} {node_name(a)} {clean(a.get('model') or 'model ?', 10)} {context_bar(a.get('context'), 8, opts)}"
+        row = f"{mark}{_STATE_DOT.get(state, '?') if opts.unicode else state[:1]} {node_name(a)} {clean(a.get('model') or 'model ?', 10)} {ctx_badge(a, 8, opts)[0]}"
         lines.append(style_line(fit(row, width), _STATE_COLOR.get(state, "gray"), opts))
     for e in visible_edges(snapshot, mode, opts.filter_kind):
         lines.append(clean(f" {e['kind'][:5]} {e['from']}→{e['to']} {'~' if is_planned(e) else ''}{e.get('state')}", width))
