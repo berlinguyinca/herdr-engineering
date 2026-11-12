@@ -62,6 +62,8 @@ export function configFromEnv(env = process.env) {
   };
 }
 
+let lastSequence = 0;   // per process: source_sequence strictly increases in build (= emit) order, even within one ms
+
 // Build one envelope. Absent/invalid optional fields are omitted (unknown), never guessed.
 // `key` makes event_id deterministic so a redelivery of the same observation dedupes.
 export function buildEnvelope({ source, type, key, entityId, occurredAt, scope = "private", provenance = "observed",
@@ -72,8 +74,10 @@ export function buildEnvelope({ source, type, key, entityId, occurredAt, scope =
     ? new Date(occurredAt).toISOString() : new Date().toISOString();
   const env = {
     schema_version: 2, event_id: `ao-${digest.slice(0, 32)}`, source,
-    // Deterministic per event: ms timestamp plus a digest-derived slot, so concurrent hook processes rarely collide.
-    source_sequence: Date.parse(when) * 1000 + (parseInt(digest.slice(0, 4), 16) % 1000),
+    // ms timestamp plus a digest-derived slot (keeps concurrent hook processes apart), forced above the previous one
+    // from this process so events built in the same ms keep their emit order (tool.started before tool.ended).
+    source_sequence: (lastSequence = Math.max(lastSequence + 1,
+      Date.parse(when) * 1000 + (parseInt(digest.slice(0, 4), 16) % 1000))),
     entity_type: "lifecycle", entity_id: sanitizeId(entityId) || sanitizeId(sessionId) || "unknown",
     event_type: type, occurred_at: when, visibility_scope: scope, provenance,
   };
