@@ -1,4 +1,6 @@
 """Agent Ops envelope extension: optional provenance/session/model fields on envelope v2."""
+import unicodedata
+
 import pytest
 
 from herdr_engineering.control_plane.envelope import (
@@ -90,3 +92,38 @@ def test_ingest_persists_sanitized_label_and_fields_in_envelope_metadata():
     ops = event["payload"]["_envelope"]["agent_ops"]
     assert ops["model_id"] == "m1" and ops["provenance"] == "observed"
     assert "/home" not in ops["sanitized_label"]
+
+
+ADVERSARIAL = [
+    "to​ken=abcd1234 leaked",                                   # zero-width inside a keyword
+    "Bearer‮ abcdefghijklmnop",                                 # bidi override
+    "key eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sig-nature_ok",
+    "glpat-abcdefghij0123456789 here",
+    "the password is hunter2 ok",
+    "see src/app/secret_module.py please",
+    "mail bob.smith@example.com now",
+    "line\nbreak /etc/shadow",
+    "\x1b[31mred\x1b[0m ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+]
+
+
+@pytest.mark.parametrize("raw", ADVERSARIAL)
+def test_label_adversarial_corpus(raw):
+    out = sanitize_label(raw)
+    for leak in ("abcd1234", "abcdefghijklmnop", "eyJ", "glpat", "hunter2", "secret_module", "src/app", "bob.smith",
+                 "example.com", "/etc", "ghp_", "\x1b", "\n", "​", "‮"):
+        assert leak not in out
+    assert all(unicodedata.category(c) not in ("Cc", "Cf") for c in out)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("event_id", "a\r\nb"), ("event_id", "a b"), ("agent_id", "a/b"), ("agent_id", "x" * 161), ("task_id", "t\n1"),
+    ("room_id", "r 1"), ("session_id", "s\x00"), ("host_id", "h/1"), ("handoff_id", "ho\n"), ("model_id", "m 1"),
+])
+def test_agent_ops_ids_are_constrained(field, value):
+    with pytest.raises(ValueError):
+        normalize_envelope(body(provenance="observed", **{field: value}), PRINCIPAL, NOW)
+
+
+def test_constraints_do_not_apply_to_events_without_agent_ops_fields():
+    assert "agent_ops" not in normalize_envelope(body(event_id="a b/c", agent_id="x/y"), PRINCIPAL, NOW)

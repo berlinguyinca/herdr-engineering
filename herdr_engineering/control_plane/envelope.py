@@ -16,6 +16,7 @@ import math
 import re
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from datetime import UTC, datetime
 from typing import Any
@@ -35,15 +36,23 @@ _MAX_STR = 512
 AGENT_OPS_PROVENANCE = frozenset({"observed", "derived", "inferred", "unknown"})
 AGENT_OPS_ID_FIELDS = ("host_id", "session_id", "model_id", "parent_session_id", "handoff_id")
 _STATUS_RE = re.compile(r"[a-z][a-z0-9_.-]{0,63}")
+_OPS_EVENT_ID_RE = re.compile(r"[A-Za-z0-9._:~-]{1,128}")    # a cursor / SSE `id:` is built from it: no CR/LF/NUL
+_OPS_ID_RE = re.compile(r"[A-Za-z0-9._:@-]{1,160}")
+_OPS_MODEL_RE = re.compile(r"[A-Za-z0-9._:@/+-]{1,160}")       # provider/model ids carry a slash
 LABEL_MAX = 80
 _LABEL_REDACTIONS = (
     (re.compile(r"(?i)\b(?:authorization:\s*)?bearer\s+\S+"), "[redacted]"),
-    (re.compile(r"(?i)\b[\w-]*(?:password|passwd|secret|token|api[_-]?key)[\w-]*\s*[=:]\s*\S+"), "[redacted]"),
+    (re.compile(r"(?i)\b[\w-]*(?:password|passwd|pwd|secret|token|api[_-]?key)[\w-]*\s*(?:[=:]|\bis\b|\bwas\b)\s*\S+"),
+     "[redacted]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]*)?"), "[redacted]"),
+    (re.compile(r"\bglpat-[A-Za-z0-9_-]{8,}"), "[redacted]"),
+    (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[email]"),
     (re.compile(r"\b(?:sk|pk|ghp|gho|ghs|xox[abp])[-_][A-Za-z0-9_-]{8,}"), "[redacted]"),
     (re.compile(r"\bAKIA[0-9A-Z]{12,}\b"), "[redacted]"),
     (re.compile(r"\b[A-Za-z0-9+/_-]{32,}={0,2}"), "[redacted]"),
     (re.compile(r"[A-Za-z]:\\\S+"), "[path]"),
     (re.compile(r"(?<![\w:])(?:~|\.{1,2})?(?:/[^\s/]+)+/?"), "[path]"),
+    (re.compile(r"(?<![\w:/.-])[\w.-]+(?:/[\w.-]+)+/?"), "[path]"),      # relative: src/app/main.py
 )
 
 # Entity types whose state is derived by dedicated handlers. Their v2 envelope
@@ -104,6 +113,8 @@ def sanitize_label(value: str) -> str:
     """A short human label with file paths and secret-looking tokens removed (metadata only, never content)."""
     if not isinstance(value, str):
         raise ValueError("sanitized_label must be a string")
+    # controls first (zero-width / bidi / format characters would otherwise split a secret past the patterns)
+    value = "".join(" " if ch.isspace() else "" if unicodedata.category(ch) in ("Cc", "Cf") else ch for ch in value)
     for pattern, replacement in _LABEL_REDACTIONS:
         value = pattern.sub(replacement, value)
     value = " ".join(value.split())
@@ -116,6 +127,9 @@ def _agent_ops(body: dict) -> dict | None:
     if provenance is not None and (not isinstance(provenance, str) or provenance not in AGENT_OPS_PROVENANCE):
         raise ValueError("provenance must be one of " + ", ".join(sorted(AGENT_OPS_PROVENANCE)))
     ops: dict[str, Any] = {name: _opt_str(body, name) for name in AGENT_OPS_ID_FIELDS}
+    if any(v is not None and not (_OPS_MODEL_RE if name == "model_id" else _OPS_ID_RE).fullmatch(v)
+           for name, v in ops.items()):
+        raise ValueError("agent operations ids must match [A-Za-z0-9._:@-]{1,160} (model_id also allows / and +)")
     status = body.get("status")
     if status is not None and (not isinstance(status, str) or not _STATUS_RE.fullmatch(status)):
         raise ValueError("status must be a short lowercase token")
@@ -201,6 +215,11 @@ def normalize_envelope(body: dict, principal: dict | None, received_at: str, *, 
         apply_clamp(env, body, clamp)       # BEFORE the hash: a replay of the same event hashes the same
     ops = _agent_ops(body)
     if ops is not None:
+        if not _OPS_EVENT_ID_RE.fullmatch(event_id):
+            raise ValueError("event_id of an agent operations event must match [A-Za-z0-9._:~-]{1,128}")
+        if any(env[n] is not None and not _OPS_ID_RE.fullmatch(env[n]) for n in ("agent_id", "task_id", "room_id")):
+            raise ValueError("agent_id, task_id and room_id of an agent operations event must match "
+                             "[A-Za-z0-9._:@-]{1,160}")
         env["agent_ops"] = ops
     env["content_hash"] = _content_hash(body, env)
     return env

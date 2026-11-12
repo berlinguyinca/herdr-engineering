@@ -19,8 +19,8 @@
     },
     "event_id": {
       "type": "string",
-      "minLength": 1,
-      "maxLength": 512
+      "pattern": "^[A-Za-z0-9._:~-]{1,128}$",
+      "description": "Constrained because it becomes part of an SSE cursor/id line: no whitespace or control characters."
     },
     "source": {
       "type": "string",
@@ -83,16 +83,22 @@
     },
     "room_id": {
       "type": "string",
-      "description": "Events with a room_id are visible only to callers who can read that room."
+      "description": "Events with a room_id are visible only to callers who can read that room, and a room_id counts only on an event whose visibility_scope is room.",
+      "pattern": "^[A-Za-z0-9._:@-]{1,160}$",
+      "maxLength": 160
     },
     "workspace_id": {
       "type": "string"
     },
     "task_id": {
-      "type": "string"
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:@-]{1,160}$",
+      "maxLength": 160
     },
     "agent_id": {
-      "type": "string"
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:@-]{1,160}$",
+      "maxLength": 160
     },
     "correlation_id": {
       "type": "string"
@@ -108,24 +114,29 @@
     },
     "host_id": {
       "type": "string",
-      "maxLength": 512
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9._:@-]{1,160}$"
     },
     "session_id": {
       "type": "string",
-      "maxLength": 512,
-      "description": "A new session_id is a new agent node; a model switch within one session updates the same node."
+      "maxLength": 160,
+      "description": "A new session_id is a new agent node; a model switch within one session updates the same node.",
+      "pattern": "^[A-Za-z0-9._:@-]{1,160}$"
     },
     "model_id": {
       "type": "string",
-      "maxLength": 512
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9._:@/+-]{1,160}$"
     },
     "parent_session_id": {
       "type": "string",
-      "maxLength": 512
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9._:@-]{1,160}$"
     },
     "handoff_id": {
       "type": "string",
-      "maxLength": 512
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9._:@-]{1,160}$"
     },
     "status": {
       "type": "string",
