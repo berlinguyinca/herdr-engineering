@@ -185,6 +185,15 @@ def _parse(data: Any) -> FleetConfig:
                 parse_heap_release(sec["values"]["heap_release"])
             except ValueError as exc:
                 raise FleetConfigError(f"section {name}: {exc}") from None
+        if name == CONTROL_PLANE_SECTION and "fabric_partitioning" in sec["values"]:
+            from herdr_engineering.control_plane.fabric_partitioning import (
+                parse_fabric_partitioning,
+            )
+
+            try:
+                parse_fabric_partitioning(sec["values"]["fabric_partitioning"])
+            except ValueError as exc:
+                raise FleetConfigError(f"section {name}: {exc}") from None
         if name == CONTROL_PLANE_SECTION and "inspector_snapshots" in sec["values"]:
             from herdr_engineering.control_plane.inspector_snapshot import parse_inspector_snapshots
 
