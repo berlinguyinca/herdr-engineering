@@ -379,10 +379,8 @@ export function neighbour(scene, id, dir) {
 // ---- replay -----------------------------------------------------------------------------------------------------------------------
 export const SPEEDS = [0.5, 1, 2, 4, 8];
 
-/** `2026-11-12T10:00:02.000000Z~e2` -> epoch ms of the ingest time (NaN when malformed). Cursors stay opaque otherwise. */
+/** a server cursor (`<ingest time>~...`) -> epoch ms of the ingest time (NaN when malformed). Cursors stay opaque otherwise. */
 export const cursorTime = (cursor) => Date.parse(text(cursor).split('~')[0]);
-
-const cursorOf = (e) => `${e.ingested_at}~${e.event_id}`;
 
 export function eventLabel(ev) {
   const what = text(ev?.event_type).replace(/\./g, ' ');
@@ -395,8 +393,8 @@ export const TIMELINE_CAP = 2000;
 export function buildTimeline(events, previous = [], cap = TIMELINE_CAP) {
   const byCursor = new Map(previous.map((t) => [t.cursor, t]));
   for (const ev of list(events)) {
-    if (!ev || !ev.event_id || !ev.ingested_at) continue;
-    const cursor = cursorOf(ev);
+    if (!ev || !ev.event_id || !ev.ingested_at || typeof ev.cursor !== 'string' || !ev.cursor) continue;
+    const cursor = ev.cursor;   // the server's opaque cursor, never built here
     byCursor.set(cursor, { cursor, id: ev.event_id, type: text(ev.event_type), at: cursorTime(cursor), agent: ev.agent_id || null, session: ev.session_id || null,
       room: ev.room_id || null, task: ev.task_id || null, provenance: ev.provenance || 'unknown', label: eventLabel(ev) });
   }

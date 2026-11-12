@@ -15,7 +15,7 @@ const SNAP = {
   tasks: [{ task_id: 't1', room_id: null, accountable_owner: 'a1', contributors: ['a2'], reviewer: 'a3', updated_at: '2026-11-12T10:00:02.000000Z' }],
   cursor: '2026-11-12T10:00:03.000000Z~e3', counts: {}, truncated: false,
 };
-const EVENTS = [1, 2, 3].map((n) => ({ event_id: `e${n}`, ingested_at: `2026-11-12T10:00:0${n}.000000Z`, event_type: 'tool.started', agent_id: 'a1', session_id: null }));
+const EVENTS = [1, 2, 3].map((n) => ({ event_id: `e${n}`, ingested_at: `2026-11-12T10:00:0${n}.000000Z`, cursor: `2026-11-12T10:00:0${n}.000000Z~pi~a1~~e${n}`, event_type: 'tool.started', agent_id: 'a1', session_id: null }));
 
 // A real HTTP server speaking the agent-ops routes' contract (404 while off), and the real client.
 function serve({ enabled = true, fail = false } = {}) {
@@ -126,12 +126,12 @@ test('text alternative lists every node and edge; empty states distinguish filte
 
 // ---- S8/S9/N7 and health/drift display ----------------------------------------------------------------------------------------------
 function serveHistory(total, pageSize) {
-  const all = Array.from({ length: total }, (_, i) => ({ event_id: `e${String(i + 1).padStart(4, '0')}`, ingested_at: `2026-11-12T10:00:00.${String(i + 1).padStart(6, '0')}Z`, event_type: 'tool.started', agent_id: 'a1' }));
+  const all = Array.from({ length: total }, (_, i) => ({ event_id: `e${String(i + 1).padStart(4, '0')}`, ingested_at: `2026-11-12T10:00:00.${String(i + 1).padStart(6, '0')}Z`, cursor: `2026-11-12T10:00:00.${String(i + 1).padStart(6, '0')}Z~pi~a1~~e${String(i + 1).padStart(4, '0')}`, event_type: 'tool.started', agent_id: 'a1' }));
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://x'), after = url.searchParams.get('cursor');
-    const rest = after ? all.filter((e) => `${e.ingested_at}~${e.event_id}` > after) : all, page = rest.slice(0, pageSize);
+    const rest = after ? all.filter((e) => e.cursor > after) : all, page = rest.slice(0, pageSize);
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ events: page, next_cursor: page.length ? `${page.at(-1).ingested_at}~${page.at(-1).event_id}` : after, has_more: rest.length > pageSize }));
+    res.end(JSON.stringify({ events: page, next_cursor: page.length ? page.at(-1).cursor : after, has_more: rest.length > pageSize }));
   });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ client: new HerdrClient(`http://127.0.0.1:${server.address().port}`), close: () => server.close() })));
 }

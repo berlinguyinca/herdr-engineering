@@ -983,7 +983,7 @@ class Client:
         cursors, cursor = [], ""
         for _ in range(20):
             page = self.get("events", **({"cursor": cursor} if cursor else {}), limit="500")
-            cursors += [f"{e['ingested_at']}~{e['event_id']}" for e in page.get("events", []) if e.get("ingested_at")]
+            cursors += [e["cursor"] for e in page.get("events", []) if isinstance(e.get("cursor"), str)]   # the server's own
             cursor = page.get("next_cursor") or ""
             if not page.get("has_more") or not cursor:
                 break

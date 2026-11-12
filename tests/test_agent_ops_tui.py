@@ -283,6 +283,21 @@ def test_end_to_end_renders_the_real_server_snapshot_and_replay():
         server.stop()
 
 
+def test_scrubbing_with_client_obtained_cursors_is_exact_even_when_event_ids_do_not_sort_by_arrival():
+    server = LiveServer()
+    try:
+        ingest(server.repo, 1, "tool.started", agent_id="alpha", session_id="s-alpha", event_id="e1")
+        ingest(server.repo, 2, "tool.started", agent_id="bravo", session_id="s-bravo", event_id="e2")
+        ingest(server.repo, 3, "tool.started", agent_id="charlie", session_id="s-charlie", event_id="z3")
+        client = tui.Client(server.url, "view-key")
+        cursors = client.all_cursors()
+        assert len(cursors) == 3
+        for index, cursor in enumerate(cursors):
+            assert client.get("replay", until=cursor)["counts"]["agents"] == index + 1
+    finally:
+        server.stop()
+
+
 def test_client_reports_offline_and_stream_resumes_with_backoff():
     with pytest.raises(OSError):
         tui.Client("http://127.0.0.1:1", "k", timeout=0.5).get("snapshot")

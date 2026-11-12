@@ -350,7 +350,7 @@ export function mountAgentOps(container, client, opts = {}) {
       onError: () => { state.conn = 'offline'; paintBanner(); freshness()?.touch(false, 'agent-ops stream disconnected'); },
       onEvent: (ev) => {
         state.timeline = buildTimeline([ev], state.timeline);
-        if (ev?.event_id && ev.ingested_at) { const c = `${ev.ingested_at}~${ev.event_id}`; if (c > state.streamCursor) state.streamCursor = c; }
+        if (typeof ev?.cursor === 'string' && ev.cursor > state.streamCursor) state.streamCursor = ev.cursor;
         if (state.index == null) paintTimeline(); else updateScrubMax();
         scheduleRefresh();
       },

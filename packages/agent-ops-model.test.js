@@ -212,15 +212,24 @@ test('keyboard neighbour picks the nearest node in the arrow direction', () => {
 });
 
 // ---- replay -------------------------------------------------------------------------------------------------------------------
-const ev = (n, type = 'tool.started', extra = {}) => ({ event_id: `e${n}`, event_type: type, ingested_at: `2026-11-12T10:00:${String(n).padStart(2, '0')}.000000Z`, agent_id: 'a1', ...extra });
+const stampOf = (n) => `2026-11-12T10:00:${String(n).padStart(2, '0')}.000000Z`;
+// `cursor` is the server's opaque value (ts~source~agent~actor~event_id); clients must use it as-is.
+const ev = (n, type = 'tool.started', extra = {}) => ({ event_id: `e${n}`, event_type: type, ingested_at: stampOf(n), cursor: `${stampOf(n)}~pi~a1~~e${n}`, agent_id: 'a1', ...extra });
 
 test('timeline is ordered by cursor, de-duplicated, and extendable', () => {
-  const t = buildTimeline([ev(3), ev(1), ev(2), ev(2), { event_id: 'x' }]);
+  const t = buildTimeline([ev(3), ev(1), ev(2), ev(2), { event_id: 'x' }, { event_id: 'y', ingested_at: stampOf(9) }]);   // no server cursor: never invented
   assert.deepEqual(t.map((e) => e.id), ['e1', 'e2', 'e3']);
-  assert.equal(t[0].cursor, '2026-11-12T10:00:01.000000Z~e1');
+  assert.equal(t[0].cursor, '2026-11-12T10:00:01.000000Z~pi~a1~~e1');   // the server's value, verbatim
   const more = buildTimeline([ev(4), ev(3)], t);
   assert.deepEqual(more.map((e) => e.id), ['e1', 'e2', 'e3', 'e4']);
   assert.equal(cursorTime(t[1].cursor) - cursorTime(t[0].cursor), 1000);
+});
+
+test('scrubbing addresses the server cursor even when event ids do not sort like arrival order', () => {
+  const rows = [['e1', 1], ['e2', 2], ['z3', 3]].map(([id, n]) => ev(n, 'tool.started', { event_id: id, cursor: `${stampOf(n)}~pi~a${n}~~${id}` }));
+  const t = buildTimeline(rows);
+  assert.deepEqual(t.map((e) => e.cursor), rows.map((r) => r.cursor));
+  assert.deepEqual([0, 1, 2].map((i) => replayFrame(t, i).cursor), rows.map((r) => r.cursor));
 });
 
 test('replay frame: null index is Live, an index addresses a cursor, out of range clamps', () => {
@@ -244,13 +253,13 @@ test('scrubber maps fractions to indices and playing advances to Live', () => {
 });
 
 test('step delay scales with speed and is bounded', () => {
-  const t = buildTimeline([ev(1), ev(3), { ...ev(4), ingested_at: '2026-11-12T11:00:00.000000Z' }]);
+  const t = buildTimeline([ev(1), ev(3), { ...ev(4), ingested_at: '2026-11-12T11:00:00.000000Z', cursor: '2026-11-12T11:00:00.000000Z~pi~a1~~e4' }]);
   assert.equal(stepDelay(t, 0, 1), 1500);
   assert.equal(stepDelay(t, 0, 2), 750);
   assert.equal(stepDelay(t, 1, 1), 1500, 'an hour gap is capped');
   assert.equal(stepDelay(t, 2, 1), 600, 'no next event: default');
   assert.equal(stepDelay([ev(1)].map((e) => ({ at: 0, cursor: 'a', ...e })), 0, 99), 600, 'unknown speed falls back to 1x');
-  const quick = buildTimeline([ev(1), { ...ev(1), event_id: 'e1b' }]);
+  const quick = buildTimeline([ev(1), { ...ev(1), event_id: 'e1b', cursor: `${stampOf(1)}~pi~a1~~e1b` }]);
   assert.equal(stepDelay(quick, 0, 8), 15);
 });
 
@@ -271,7 +280,7 @@ test('timeline is a ring buffer: oldest entries drop at the cap, newest always s
   assert.deepEqual(t.map((e) => e.id), ['e8', 'e9', 'e10', 'e11', 'e12']);
   const more = buildTimeline([ev(13)], t, 5);
   assert.deepEqual(more.map((e) => e.id), ['e9', 'e10', 'e11', 'e12', 'e13']);
-  assert.equal(buildTimeline(Array.from({ length: 2100 }, (_, i) => ({ ...ev(1), event_id: `x${String(i).padStart(4, '0')}` }))).length, 2000);
+  assert.equal(buildTimeline(Array.from({ length: 2100 }, (_, i) => ({ ...ev(1), event_id: `x${String(i).padStart(4, '0')}`, cursor: `${stampOf(1)}~pi~a1~~x${String(i).padStart(4, '0')}` }))).length, 2000);
 });
 
 test('context health: backend measured fraction feeds the badge, unknown stays unknown and never 0', () => {
