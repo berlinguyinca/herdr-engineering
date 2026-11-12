@@ -348,3 +348,217 @@ def test_stream_resumes_by_cursor_and_is_room_scoped(stack):
         assert resumed["events"] == []
     finally:
         server.stop()
+
+
+# ------------------------------------------------------------------------------ review fixes (backend)
+def make_registry(stack):
+    from herdr_engineering.control_plane.handoffs import HandoffRegistry
+    stack.svc.handoffs = HandoffRegistry(stack.repo)
+    return stack.svc.handoffs
+
+
+def new_handoff(registry, stack, hid):
+    registry.create({"handoff_id": hid, "source_harness": "pi", "target_harness": "claude", "goal": "g",
+                     "source_agent_id": "a1", "source_session_id": "s1", "target_agent_id": "a2",
+                     "target_session_id": "s2", "room_id": stack.rooms["alice"]}, {"id": "alice"})
+
+
+@pytest.mark.parametrize("path,expected", [
+    (("claimed", "accepted", "in_progress", "failed"), "failed"),
+    (("expired",), "expired"),
+    (("cancelled",), "cancelled"),
+    (("claimed", "rejected"), "rejected"),
+    (("claimed", "accepted", "in_progress", "completed"), "completed"),
+])
+def test_registry_terminal_handoff_states_fold_without_error(stack, path, expected):
+    registry = make_registry(stack)
+    new_handoff(registry, stack, "ho1")
+    for state in path:
+        registry.transition("ho1", state, {"id": "x"})
+    alice = stack.users["alice"]
+    snap = stack.svc.snapshot(stack.svc.viewer(alice), alice)
+    (edge,) = [e for e in snap["edges"] if e["kind"] == "handoff"]
+    assert edge["state"] == expected
+    replay = stack.svc.replay(stack.svc.viewer(alice), alice)
+    assert replay == snap
+    for node in snap["agents"]:
+        for drift in node["drift"]:
+            assert None not in drift["evidence_event_ids"]
+
+
+def test_failed_handoff_drift_omits_missing_interrupter(stack):
+    registry = make_registry(stack)
+    new_handoff(registry, stack, "ho1")
+    for state in ("claimed", "accepted", "in_progress", "failed"):
+        registry.transition("ho1", state, {"id": "x"})
+    alice = stack.users["alice"]
+    snap = stack.svc.snapshot(stack.svc.viewer(alice), alice)
+    kinds = {d["kind"] for n in snap["agents"] for d in n["drift"]}
+    assert kinds == {"handoff_failed"}
+    assert "interrupted_by" not in [e for e in snap["edges"] if e["kind"] == "handoff"][0]
+
+
+def test_two_emitters_sharing_an_event_id_do_not_erase_each_other():
+    one = ev(1, "model.selected", agent="a1", session_id="s1", model_id="m1", source="pi")
+    two = ev(1, "model.selected", agent="a2", session_id="s2", model_id="m2", source="pi")
+    assert one["event_id"] == two["event_id"] and cursor_of(one) != cursor_of(two)
+    snap = fold([one, two])
+    assert {a["node_id"]: a["model"] for a in snap["agents"]} == {"s1": "m1", "s2": "m2"}
+    assert snap["counts"]["events"] == 2
+    assert fold([two, one, copy.deepcopy(one)]) == snap
+
+
+def test_sse_unsafe_event_id_is_refused_at_ingest():
+    repo = ControlPlaneRepo()
+    for bad in ("x\r\nevent: forged", "x\nid: 1", "a\x00b", "has space", "y" * 129):
+        with pytest.raises(ValueError):
+            ingest(repo, 1, "tool.started", session_id="s1", event_id=bad)
+    ingest(repo, 2, "tool.started", session_id="s1", event_id="ok.id:1~a-b_c")
+
+
+def test_stream_never_writes_a_forged_frame_from_a_stored_unsafe_id(stack):
+    ingest(stack.repo, 1, "tool.started", session_id="sa", agent_id="a1", visibility_scope="org")
+    for stream in stack.repo._events.values():       # a row stored before the ingest constraint existed
+        stream[-1]["event_id"] = "evil\r\nevent: forged\r\ndata: {}"
+    ingest(stack.repo, 2, "tool.started", session_id="sb", agent_id="a2", visibility_scope="org")
+    server = Server(stack.repo, stack.collab, agent_ops_config={"enabled": True})
+    server.srv.agent_ops_poll_seconds = 0.05
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.srv.port, timeout=5)
+        conn.request("GET", "/api/v1/agent-ops/stream", headers={"X-API-Key": "view-key",
+                                                                  "Authorization": f"Bearer {TOKENS['alice']}"})
+        resp = conn.getresponse()
+        lines, seen = [], False
+        while not seen:
+            line = resp.fp.readline().decode().rstrip("\r\n")
+            lines.append(line)
+            seen = '"session_id": "sb"' in line
+        conn.close()
+        assert not any(line.startswith("event: forged") or line == "data: {}" for line in lines)
+        assert all(line == "" or line.startswith(("id:", "data:", "event:", ":")) for line in lines)
+    finally:
+        server.stop()
+
+
+def stream_conn(server, user):
+    conn = http.client.HTTPConnection("127.0.0.1", server.srv.port, timeout=5)
+    conn.request("GET", "/api/v1/agent-ops/stream", headers={"X-API-Key": "view-key",
+                                                              "Authorization": f"Bearer {TOKENS[user]}"})
+    return conn, conn.getresponse()
+
+
+def test_stream_ends_when_the_credential_is_revoked_mid_stream(stack):
+    ingest(stack.repo, 1, "tool.started", session_id="sa", agent_id="a1", visibility_scope="org")
+    server = Server(stack.repo, stack.collab, agent_ops_config={"enabled": True})
+    server.srv.agent_ops_poll_seconds = 0.05
+    server.srv.agent_ops_reauth_seconds = 0.1
+    try:
+        conn, resp = stream_conn(server, "alice")
+        assert resp.status == 200
+        while '"session_id": "sa"' not in resp.fp.readline().decode():
+            pass
+        stack.collab.auth.disable("alice")
+        rest = resp.read().decode()                  # the server closes the stream, so read() returns
+        assert "event: revoked" in rest
+        conn.close()
+    finally:
+        server.stop()
+
+
+def test_concurrent_streams_are_capped(stack):
+    server = Server(stack.repo, stack.collab, agent_ops_config={"enabled": True})
+    server.srv.agent_ops_poll_seconds = 0.05
+    server.srv.agent_ops_streams = threading.BoundedSemaphore(1)
+    try:
+        first, resp = stream_conn(server, "alice")
+        assert resp.status == 200
+        second, resp2 = stream_conn(server, "bob")
+        assert resp2.status == 503
+        first.close(), second.close()
+    finally:
+        server.stop()
+
+
+def test_streaming_reads_are_cached_briefly_per_viewer(stack):
+    ingest(stack.repo, 1, "tool.started", session_id="s1", agent_id="a1", visibility_scope="org")
+    svc, viewer = stack.svc, Viewer(operator=True)
+    assert len(svc.events(viewer, None, None, 10, cached=True)["events"]) == 1
+    ingest(stack.repo, 2, "tool.started", session_id="s2", agent_id="a2", visibility_scope="org")
+    assert len(svc.events(viewer, None, None, 10, cached=True)["events"]) == 1      # within the TTL
+    assert len(svc.events(viewer, None, None, 10)["events"]) == 2                   # uncached reads are always fresh
+    svc.CACHE_TTL = 0.0
+    assert len(svc.events(viewer, None, None, 10, cached=True)["events"]) == 2
+
+
+def test_envelope_tail_keeps_last_known_model_context_and_state(monkeypatch):
+    monkeypatch.setattr(agent_ops, "_ENVELOPE_TAIL", 5)
+    repo = ControlPlaneRepo()
+    ingest(repo, 1, "model.selected", session_id="s1", model_id="opus-x")
+    ingest(repo, 2, "context.metric", session_id="s1", payload={"context_used": 40, "context_limit": 100})
+    for n in range(3, 20):
+        ingest(repo, n, "tool.started" if n % 2 else "tool.ended", session_id="s1")
+    (agent,) = AgentOpsService(repo).snapshot(Viewer(operator=True))["agents"]
+    assert agent["model"] == "opus-x" and agent["context"]["used"] == 40
+
+
+def test_max_events_window_keeps_last_known_model(monkeypatch):
+    monkeypatch.setattr(agent_ops, "MAX_EVENTS", 5)
+    events = [ev(1, "model.selected", session_id="s1", model_id="opus-x")] + [
+        ev(n, "tool.started" if n % 2 else "tool.ended", session_id="s1") for n in range(2, 20)]
+    (agent,) = fold(agent_ops.authorized_events(events, Viewer(operator=True)))["agents"]
+    assert agent["model"] == "opus-x"
+
+
+def test_room_events_read_from_the_tail(stack, monkeypatch):
+    monkeypatch.setattr(agent_ops, "ROOM_EVENTS_PER_ROOM", 4)
+    alice = stack.users["alice"]
+    for n in range(12):
+        stack.collab.post_message(alice, stack.rooms["alice"], {"text": f"m{n}", "idempotency_key": f"t-{n}"})
+    events = agent_ops.room_events(stack.collab, alice, stack.rooms["alice"])
+    assert len(events) == 4
+    newest = stack.collab.read_tail(alice, stack.rooms["alice"], 1)["events"][0]["event_id"]
+    assert events[-1]["event_id"] == newest
+
+
+def test_guest_sees_room_chat_sources_only_not_envelope_or_handoff_events(stack):
+    bob, alice = stack.users["bob"], stack.users["alice"]
+    stack.collab.add_member(bob, stack.rooms["bob"], {"user_id": "alice", "role": "guest"})
+    stack.collab.post_message(bob, stack.rooms["bob"], {"text": "after the guest joined", "idempotency_key": "g1"})
+    ingest(stack.repo, 1, "tool.started", session_id="sb", agent_id="agent-b", room_id=stack.rooms["bob"],
+           visibility_scope="room")
+    registry = make_registry(stack)
+    registry.create({"handoff_id": "hob", "source_harness": "pi", "target_harness": "claude", "goal": "g",
+                     "source_agent_id": "ha1", "source_session_id": "hs1", "target_agent_id": "ha2",
+                     "target_session_id": "hs2", "room_id": stack.rooms["bob"]}, {"id": "bob"})
+    guest = stack.svc.snapshot(stack.svc.viewer(alice), alice)
+    dump = json.dumps(guest)
+    assert "agent-b" not in dump and "hs1" not in dump and guest["edges"] == []
+    assert stack.rooms["bob"] in dump                      # her own view of the room's chat is still there
+    member = stack.svc.snapshot(stack.svc.viewer(bob), bob)
+    assert "agent-b" in json.dumps(member) and [e for e in member["edges"] if e["kind"] == "handoff"]
+
+
+def test_room_id_is_ignored_unless_the_scope_is_room(stack):
+    ingest(stack.repo, 1, "tool.started", session_id="sa", agent_id="agent-a", room_id=stack.rooms["alice"],
+           visibility_scope="org")
+    bob = stack.users["bob"]
+    snap = stack.svc.snapshot(stack.svc.viewer(bob), bob)
+    assert stack.rooms["alice"] not in json.dumps(snap)
+    page = stack.svc.events(stack.svc.viewer(bob), bob)["events"]
+    assert [e["room_id"] for e in page if not e["source"].startswith("room:")] == [None]
+
+
+def test_finished_task_is_not_drawn_as_an_accepted_delegation():
+    base = dict(session_id="s1", task_id="t1", payload={"target_agent_id": "a2"})
+    done = fold([ev(1, "delegation.accepted", status="completed", **base)])
+    failed = fold([ev(1, "delegation.accepted", status="failed", **base)])
+    live = fold([ev(1, "delegation.accepted", status="in_progress", **base)])
+    assert [e["state"] for e in done["edges"]] == ["completed"]
+    assert [e["state"] for e in failed["edges"]] == ["failed"]
+    assert [e["state"] for e in live["edges"]] == ["accepted"]
+    assert done["tasks"][0]["contributors"] == [] and live["tasks"][0]["contributors"] != []
+
+
+def test_private_scope_is_visible_to_the_operator_only():
+    private = ev(1, "tool.started", session_id="s1", visibility_scope="private")
+    assert agent_ops.visible(private, Viewer(operator=True)) and not agent_ops.visible(private, Viewer())

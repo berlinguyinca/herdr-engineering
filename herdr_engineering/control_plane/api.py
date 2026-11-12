@@ -449,6 +449,8 @@ class ControlPlaneServer:
         # YAML-only, strict True, default off; off means 404 and no capability.
         self.agent_ops_enabled = isinstance(agent_ops_config, dict) and agent_ops_config.get("enabled") is True
         self.agent_ops_poll_seconds = 1.0
+        self.agent_ops_reauth_seconds = 30.0          # a live stream re-checks its credential this often
+        self.agent_ops_streams = threading.BoundedSemaphore(16)   # concurrent SSE readers; each tick is a full gather
         self._summary_stop = threading.Event()
         self._summary_scanner = None
         if not collab_only:
@@ -6018,40 +6020,61 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             return self._json(service.events(viewer, principal, cursor, min(max(limit, 1), PAGE_MAX)))
 
         def _agent_ops_stream(self, service, principal, operator, cursor):
-            """SSE with cursor resume (``?cursor=`` or ``Last-Event-ID``). Access is re-evaluated on every tick, so a revoked
-            room stops flowing at once; the queue is the bounded page read each tick (no unbounded subscriber queue)."""
+            """SSE with cursor resume (``?cursor=`` or ``Last-Event-ID``). Access is re-evaluated on every tick (a revoked
+            room stops flowing at once) and the credential itself every ``agent_ops_reauth_seconds`` (a revoked key, token
+            or disabled person ends the stream); the queue is the bounded page read each tick (no unbounded subscriber
+            queue), and the number of concurrent streams is capped."""
             from .agent_ops import STREAM_PAGE, cursor_of
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-            self.close_connection = True
+            if not server.agent_ops_streams.acquire(blocking=False):
+                return self._json({"error": "too many agent-ops streams"}, 503)
             try:
-                self.connection.settimeout(30)
-            except OSError:
-                pass
-            started = last_write = time.monotonic()
-            try:
-                self.wfile.write(f"event: connected\ndata: {json.dumps({'cursor': cursor})}\n\n".encode())
-                self.wfile.flush()
-                while time.monotonic() - started < _MAX_SSE_SECONDS:
-                    page = service.events(service.viewer(principal, operator), principal, cursor, STREAM_PAGE)
-                    for ev in page["events"]:
-                        self.wfile.write(f"id: {cursor_of(ev)}\ndata: {json.dumps(ev)}\n\n".encode())
-                    if page["events"]:
-                        cursor = page["next_cursor"]
-                        self.wfile.flush()
-                        last_write = time.monotonic()
-                        if page["has_more"]:
-                            continue
-                    elif time.monotonic() - last_write >= _SSE_IDLE_SECONDS:
-                        self.wfile.write(b": keep-alive\n\n")
-                        self.wfile.flush()
-                        last_write = time.monotonic()
-                    time.sleep(server.agent_ops_poll_seconds)
-            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
-                pass
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                self.close_connection = True
+                try:
+                    self.connection.settimeout(30)
+                except OSError:
+                    pass
+                started = last_write = last_auth = time.monotonic()
+                try:
+                    self.wfile.write(f"event: connected\ndata: {json.dumps({'cursor': cursor})}\n\n".encode())
+                    self.wfile.flush()
+                    while time.monotonic() - started < _MAX_SSE_SECONDS:
+                        if time.monotonic() - last_auth >= server.agent_ops_reauth_seconds:
+                            last_auth = time.monotonic()
+                            try:
+                                if self._role() is None:
+                                    raise PermissionError("unauthorized")
+                                principal, operator = self._agent_ops_caller()
+                            except PermissionError:
+                                self.wfile.write(b"event: revoked\ndata: {}\n\n")
+                                self.wfile.flush()
+                                break
+                        page = service.events(service.viewer(principal, operator), principal, cursor, STREAM_PAGE,
+                                              cached=True)
+                        for ev in page["events"]:
+                            frame_id = cursor_of(ev)
+                            if any(c in frame_id for c in "\r\n\0"):
+                                continue          # never let a stored id forge or split an SSE frame
+                            self.wfile.write(f"id: {frame_id}\ndata: {json.dumps(ev)}\n\n".encode())
+                        if page["events"]:
+                            cursor = page["next_cursor"]
+                            self.wfile.flush()
+                            last_write = time.monotonic()
+                            if page["has_more"]:
+                                continue
+                        elif time.monotonic() - last_write >= _SSE_IDLE_SECONDS:
+                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.flush()
+                            last_write = time.monotonic()
+                        time.sleep(server.agent_ops_poll_seconds)
+                except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                    pass
+            finally:
+                server.agent_ops_streams.release()
             return None
 
         def _work_graph(self, sub, body=None):

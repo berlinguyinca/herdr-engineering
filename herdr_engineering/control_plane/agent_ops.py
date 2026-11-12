@@ -11,8 +11,8 @@ so an event the caller cannot read contributes to no node, edge or count.
 from __future__ import annotations
 
 import copy
+import threading
 import time
-from collections import deque
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
@@ -43,7 +43,11 @@ _DELEGATION = {"delegation.proposed": "planned", "delegation.accepted": "accepte
                "delegation.rejected": "rejected"}
 _MESSAGE = {"message.sent": "sent", "message.delivered": "delivered", "message.acknowledged": "acknowledged"}
 _REVIEW = {"review.requested": "planned", "review.completed": "completed"}
-_HANDOFF = {"queued": "planned", "claimed": "planned", "accepted": "accepted", "in_progress": "accepted"}
+_HANDOFF = {"queued": "planned", "claimed": "planned", "accepted": "accepted", "in_progress": "accepted",
+            "failed": "failed", "expired": "expired", "cancelled": "cancelled", "rejected": "rejected",
+            "completed": "completed"}
+_TASK_END = {"completed": "completed", "done": "completed", "succeeded": "completed", "failed": "failed",
+             "error": "failed", "errored": "failed", "timed_out": "failed", "expired": "expired"}
 _REJECTED_TASK = frozenset({"rejected", "declined", "denied", "cancelled"})
 _CONTRIBUTION = frozenset({"artifact.created", "artifact.verified", "tests.started", "tests.completed"})
 _IN_FLIGHT = frozenset({"planned", "accepted"})   # handoff edge states that an agent crash can interrupt
@@ -84,6 +88,7 @@ class Viewer(NamedTuple):
     rooms: frozenset = frozenset()
     operator: bool = False
     external: bool = False
+    guest_rooms: frozenset = frozenset()     # rooms where the caller is a guest: room events only (no helper/agent data)
 
 
 # --------------------------------------------------------------------------------------------- normalisation
@@ -114,8 +119,13 @@ def _uint(value: Any) -> int | None:
 
 
 def cursor_of(event: dict) -> str:
-    """Total, append-stable order of the aggregated feed: server receipt time, then event id."""
-    return f"{event['ingested_at']}~{event['event_id']}"
+    """Total, append-stable order of the aggregated feed: receipt time, then the event's identity (source, agent, id), so
+    two emitters that reuse an event id never share a cursor."""
+    return "~".join((event["ingested_at"], event["source"], event["agent_id"] or "", event["event_id"]))
+
+
+def _identity(event: dict) -> tuple:
+    return (event["source"], event["agent_id"] or "", event["room_id"] or "", event["event_id"])
 
 
 def _event(**fields: Any) -> dict:
@@ -143,46 +153,71 @@ def _payload(raw: Any) -> dict:
     return out
 
 
+def _norm_envelope(ev: dict) -> dict | None:
+    payload = ev.get("payload") or {}
+    meta = payload.get("_envelope") if isinstance(payload, dict) else None
+    ops = meta.get("agent_ops") if isinstance(meta, dict) else None
+    if not isinstance(ops, dict) or ev.get("event_type") not in EVENT_TYPES:
+        return None
+    sequence = ev.get("source_sequence")
+    scope = ev.get("visibility_scope") or "private"
+    return _event(
+        event_id=ev["event_id"], source=_str(ev.get("source"), 32) or "unknown",
+        sequence=sequence if sequence is not None else ev.get("sequence", 0),
+        event_type=ev["event_type"], occurred_at=_ts(ev.get("source_timestamp")),
+        ingested_at=_ts(ev.get("ingest_timestamp")) or _ts(ev.get("source_timestamp")),
+        room_id=_str(ev.get("room_id")) if scope == "room" else None,   # a room id counts only on a room-scoped event
+        visibility_scope=scope,
+        provenance=ops.get("provenance") if ops.get("provenance") in PROVENANCE else "unknown",
+        agent_id=_str(ev.get("agent_id")), session_id=_str(ops.get("session_id")),
+        host_id=_str(ops.get("host_id")), model_id=_str(ops.get("model_id")),
+        parent_session_id=_str(ops.get("parent_session_id")), handoff_id=_str(ops.get("handoff_id")),
+        task_id=_str(ev.get("task_id")), status=_str(ops.get("status"), 64),
+        sanitized_label=_str(ops.get("sanitized_label"), 80), payload=_payload(payload))
+
+
+_CARRY_SCAN = 5000
+_CARRY_MAX = MAX_AGENTS * 6
+
+
+def _category(ev: dict) -> str | None:
+    """The kinds whose LAST value is still the current truth after older history slides out of a window."""
+    kind = ev["event_type"]
+    return ("model" if kind in ("model.selected", "model.switched") else "context" if kind == "context.metric"
+            else "state" if kind in _STATES else "room" if kind in ("room.joined", "room.left") else None)
+
+
+def carry_forward(dropped: list[dict]) -> list[dict]:
+    """From events a sliding window dropped (ascending), the newest of each (kind, entity): last-known model, context,
+    state and room membership survive truncation. They are real, original events, never synthesized."""
+    latest: dict[tuple, dict] = {}
+    for ev in dropped:
+        category = _category(ev)
+        if category:
+            latest[(category, ev["source"], ev["agent_id"], ev["session_id"], ev["host_id"], ev["room_id"])] = ev
+    return sorted(latest.values(), key=cursor_of)[-_CARRY_MAX:]
+
+
 def envelope_events(repo: Any) -> list[dict]:
-    """Stored envelope events that carry the Agent Operations block, as normalized events."""
+    """Stored envelope events that carry the Agent Operations block, as normalized events. Each stream keeps its newest
+    ``_ENVELOPE_TAIL`` plus the last-known model/context/state of what slid out."""
     out: list[dict] = []
     with repo._event_lock:
-        streams = [list(stream[-_ENVELOPE_TAIL:]) for stream in repo._events.values()]
-    for stream in streams:
-        for ev in stream:
-            payload = ev.get("payload") or {}
-            meta = payload.get("_envelope") if isinstance(payload, dict) else None
-            ops = meta.get("agent_ops") if isinstance(meta, dict) else None
-            if not isinstance(ops, dict) or ev.get("event_type") not in EVENT_TYPES:
-                continue
-            sequence = ev.get("source_sequence")
-            out.append(_event(
-                event_id=ev["event_id"], source=_str(ev.get("source"), 32) or "unknown",
-                sequence=sequence if sequence is not None else ev.get("sequence", 0),
-                event_type=ev["event_type"], occurred_at=_ts(ev.get("source_timestamp")),
-                ingested_at=_ts(ev.get("ingest_timestamp")) or _ts(ev.get("source_timestamp")),
-                room_id=_str(ev.get("room_id")), visibility_scope=ev.get("visibility_scope") or "private",
-                provenance=ops.get("provenance") if ops.get("provenance") in PROVENANCE else "unknown",
-                agent_id=_str(ev.get("agent_id")), session_id=_str(ops.get("session_id")),
-                host_id=_str(ops.get("host_id")), model_id=_str(ops.get("model_id")),
-                parent_session_id=_str(ops.get("parent_session_id")), handoff_id=_str(ops.get("handoff_id")),
-                task_id=_str(ev.get("task_id")), status=_str(ops.get("status"), 64),
-                sanitized_label=_str(ops.get("sanitized_label"), 80), payload=_payload(payload)))
+        streams = [(list(stream[-_ENVELOPE_TAIL:]), list(stream[:-_ENVELOPE_TAIL][-_CARRY_SCAN:]))
+                   for stream in repo._events.values()]
+    for tail, dropped in streams:
+        norm_dropped = [n for n in (_norm_envelope(ev) for ev in dropped) if n is not None]
+        out += carry_forward(norm_dropped)
+        out += [n for n in (_norm_envelope(ev) for ev in tail) if n is not None]
     return out
 
 
 def room_events(collab: Any, principal: Any, room_id: str) -> list[dict]:
-    """Room events as ``principal`` may read them (the room service authorizes and filters), as normalized events."""
+    """The newest ``ROOM_EVENTS_PER_ROOM`` room events as ``principal`` may read them (the room service authorizes and
+    filters, from the tail), as normalized events."""
     from .collab import CollabError
-    raw: deque = deque(maxlen=ROOM_EVENTS_PER_ROOM)
-    cursor = 0
     try:
-        for _ in range(100):
-            page = collab.read_events(principal, room_id, cursor, 100)
-            raw.extend(page["events"])
-            if not page["has_more"] or page["next_cursor"] == cursor:
-                break
-            cursor = page["next_cursor"]
+        raw = collab.read_tail(principal, room_id, ROOM_EVENTS_PER_ROOM)["events"]
     except CollabError:
         return []
     out = []
@@ -251,8 +286,8 @@ def visible(event: dict, viewer: Viewer) -> bool:
     if scope == "private":
         return viewer.operator
     if event["room_id"]:
-        if viewer.external and not event["source"].startswith("room:"):
-            return False
+        if (viewer.external or event["room_id"] in viewer.guest_rooms) and not event["source"].startswith("room:"):
+            return False                     # chat-only callers never see envelope/handoff data of a room
         return event["room_id"] in viewer.rooms
     return scope == "org" or viewer.operator
 
@@ -260,27 +295,31 @@ def visible(event: dict, viewer: Viewer) -> bool:
 def authorized_events(events: list[dict], viewer: Viewer) -> list[dict]:
     """Visible events, newest ``MAX_EVENTS`` by cursor, ascending. Filtering happens before any aggregation."""
     kept = sorted((e for e in events if visible(e, viewer)), key=cursor_of)
-    return kept[-MAX_EVENTS:]
+    if len(kept) <= MAX_EVENTS:
+        return kept
+    window = kept[-MAX_EVENTS:] if MAX_EVENTS else []
+    return sorted(carry_forward(kept[:len(kept) - len(window)]) + window, key=cursor_of)
 
 
 # --------------------------------------------------------------------------------------------------- fold
 def _ordered(events: list[dict]) -> list[dict]:
-    """Dedupe by event_id, then order by (effective time, source, sequence): a source's own sequence is authoritative
-    (its effective time never runs backwards), sources interleave by time. Deterministic for any input order."""
-    unique: dict[str, dict] = {}
+    """Dedupe by identity (source, agent, room, event id), then order by (effective time, source, sequence): a source's
+    own sequence is authoritative (its effective time never runs backwards), sources interleave by time. Two emitters
+    that reuse an event id stay distinct. Deterministic for any input order."""
+    unique: dict[tuple, dict] = {}
     for ev in events:
-        known = unique.get(ev["event_id"])
+        known = unique.get(_identity(ev))
         if known is None or _canon(ev) < _canon(known):
-            unique[ev["event_id"]] = ev
+            unique[_identity(ev)] = ev
     by_source: dict[str, list[dict]] = {}
     for ev in unique.values():
         by_source.setdefault(ev["source"], []).append(ev)
     keyed = []
     for source in sorted(by_source):
         floor = ""
-        for ev in sorted(by_source[source], key=lambda e: (e["sequence"], e["event_id"])):
+        for ev in sorted(by_source[source], key=lambda e: (e["sequence"], e["agent_id"] or "", e["event_id"])):
             floor = max(floor, ev["occurred_at"] or ev["ingested_at"])
-            keyed.append(((floor, source, ev["sequence"], ev["event_id"]), ev))
+            keyed.append(((floor, source, ev["sequence"], ev["agent_id"] or "", ev["event_id"]), ev))
     return [ev for _, ev in sorted(keyed, key=lambda item: item[0])]
 
 
@@ -383,9 +422,11 @@ class _Fold:
             for dst in self.target(payload):
                 self.edge("communication", me, dst, _MESSAGE[kind], ev, ev["task_id"] or "")
         elif kind in _DELEGATION:
+            state = (_TASK_END.get(ev["status"] or "") or _DELEGATION[kind]) if kind == "delegation.accepted" \
+                else _DELEGATION[kind]               # a finished task is never drawn as an accepted delegation
             for dst in self.target(payload):
-                self.edge("delegation", me, dst, _DELEGATION[kind], ev, ev["task_id"] or "")
-                if kind == "delegation.accepted" and task is not None:
+                self.edge("delegation", me, dst, state, ev, ev["task_id"] or "")
+                if state == "accepted" and task is not None:
                     self._add(task["contributors"], dst)   # a contributor, never the accountable owner
         elif kind in _REVIEW:
             for dst in self.target(payload):
@@ -540,10 +581,10 @@ def _drift(agents: list[dict], by_id: dict, edges: list[dict], tasks: list[dict]
                                        node["_fails"][-1][1]))
     for edge in edges:
         if edge["kind"] == "handoff" and edge["state"] in ("stalled", "failed"):
+            evidence = [e for e in (edge.get("interrupted_by"), edge["event_id"]) if e]
             for end in {edge["from"], edge["to"]}:
                 if end in by_id:
-                    by_id[end]["drift"].append(entry(f"handoff_{edge['state']}", "derived",
-                                                     [edge["interrupted_by"], edge["event_id"]], edge["task_id"]))
+                    by_id[end]["drift"].append(entry(f"handoff_{edge['state']}", "derived", evidence, edge["task_id"]))
     for node in agents:
         node["drift"].sort(key=lambda d: (d["kind"], d["evidence_event_ids"]))
     for task in tasks:
@@ -565,29 +606,63 @@ def fold(events: list[dict], up_to: str | None = None) -> dict:
 class AgentOpsService:
     """Gathers the sources for one authorized caller and answers snapshot / events / replay."""
 
+    CACHE_TTL = 1.0                  # seconds a streaming reader may reuse one viewer's gathered events
+    CACHE_MAX = 64
+
     def __init__(self, repo: Any, collab: Any = None, handoffs: Any = None, now: Any = None):
         self.repo, self.collab, self.handoffs = repo, collab, handoffs
         self._now = now or time.time
+        self._cache: dict[tuple, tuple[float, list[dict]]] = {}
+        self._cache_lock = threading.Lock()
 
     def viewer(self, principal: Any = None, operator: bool = False) -> Viewer:
         rooms = frozenset(self.collab.readable_room_ids(principal)) if self.collab and principal is not None else frozenset()
-        return Viewer(rooms=rooms, operator=operator, external=bool(getattr(principal, "external", False)))
+        return Viewer(rooms=rooms, operator=operator, external=bool(getattr(principal, "external", False)),
+                      guest_rooms=self._guest_rooms(principal, rooms))
 
-    def _gather(self, viewer: Viewer, principal: Any) -> list[dict]:
+    def _guest_rooms(self, principal: Any, rooms: frozenset) -> frozenset:
+        """Rooms where the caller (or the person an agent acts for) is a guest."""
+        collab = self.collab
+        if collab is None or principal is None or not rooms:
+            return frozenset()
+        with collab._lock:
+            uid = principal.id if principal.kind == "user" else (collab._agents.get(principal.id) or {}).get("owner")
+            found = set()
+            for rid in rooms:
+                room = collab._rooms.get(rid)
+                member = collab._member(room, uid) if room and uid else None
+                if member and member.get("role") == "guest":
+                    found.add(rid)
+            return frozenset(found)
+
+    def _gather(self, viewer: Viewer, principal: Any, cached: bool = False) -> list[dict]:
+        key = (viewer, getattr(principal, "id", None))
+        if cached:
+            with self._cache_lock:
+                hit = self._cache.get(key)
+            if hit is not None and time.monotonic() - hit[0] < self.CACHE_TTL:
+                return hit[1]
         events = envelope_events(self.repo)
         if self.handoffs is not None:
             events += handoff_events(self.handoffs)
         if self.collab is not None and principal is not None:
             for room_id in sorted(viewer.rooms)[:MAX_ROOMS]:
                 events += room_events(self.collab, principal, room_id)
-        return authorized_events(events, viewer)
+        out = authorized_events(events, viewer)
+        if cached:
+            with self._cache_lock:
+                if len(self._cache) >= self.CACHE_MAX:
+                    self._cache.clear()
+                self._cache[key] = (time.monotonic(), out)
+        return out
 
     def snapshot(self, viewer: Viewer, principal: Any = None) -> dict:
         return fold(self._gather(viewer, principal))
 
-    def events(self, viewer: Viewer, principal: Any = None, cursor: str | None = None, limit: int = 100) -> dict:
+    def events(self, viewer: Viewer, principal: Any = None, cursor: str | None = None, limit: int = 100,
+               cached: bool = False) -> dict:
         limit = max(1, min(limit, PAGE_MAX))
-        ordered = [e for e in self._gather(viewer, principal) if cursor is None or cursor_of(e) > cursor]
+        ordered = [e for e in self._gather(viewer, principal, cached) if cursor is None or cursor_of(e) > cursor]
         page = ordered[:limit]
         return {"events": page, "next_cursor": cursor_of(page[-1]) if page else cursor,
                 "has_more": len(ordered) > limit}
