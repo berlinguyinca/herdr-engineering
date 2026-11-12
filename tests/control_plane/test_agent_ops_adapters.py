@@ -148,6 +148,21 @@ def run_pi(plane, tail=""):
     return json.loads(r.stdout.strip().splitlines()[-1])
 
 
+def test_source_sequence_follows_emit_order_within_one_millisecond():
+    """Regression: two events built in the same millisecond must still carry increasing source_sequence, or the fold can
+    replay tool.ended before tool.started and leave the agent 'working'."""
+    r = node_script("""
+        import { buildEnvelope } from "%s/core.js";
+        const at = "2026-11-12T10:00:00.000Z";
+        const seqs = [];
+        for (let i = 0; i < 64; i++) seqs.push(buildEnvelope({ source: "pi-ops", type: "tool.started", key: "k" + i, occurredAt: at, sessionId: "s" }).source_sequence);
+        console.log(JSON.stringify(seqs));
+    """ % ADAPTERS, {"PATH": os.environ["PATH"]})
+    assert r.returncode == 0, r.stderr
+    seqs = json.loads(r.stdout)
+    assert all(a < b for a, b in zip(seqs, seqs[1:]))
+
+
 def test_pi_hooks_emit_session_model_tool_and_measured_context(plane):
     stats = run_pi(plane)
     assert stats["failed"] == 0
