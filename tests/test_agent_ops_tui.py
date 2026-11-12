@@ -456,3 +456,44 @@ def test_canvas_wide_glyph_occupies_two_cells_and_is_never_split():
     cv.text(0, 0, "日日")
     cv.put(1, 0, "x")                                           # overwriting half a glyph blanks the other half
     assert cv.lines(False)[0] == " x日"
+
+
+# ---------------------------------------------------------------- N6: the token must not have to live in `ps`
+def _args(**kw):
+    import argparse
+    return argparse.Namespace(**{"token": None, "token_file": None, **kw})
+
+
+def test_token_sources_and_precedence(tmp_path):
+    f = tmp_path / "tok"
+    f.write_text("  from-file\n")
+    assert tui.resolve_token(_args(token_file=str(f), token="argv"), {"HERDR_AGENT_OPS_TOKEN": "env"}) == ("from-file", False)
+    assert tui.resolve_token(_args(token="argv"), {"HERDR_AGENT_OPS_TOKEN": "env"}) == ("argv", True)
+    assert tui.resolve_token(_args(), {"HERDR_AGENT_OPS_TOKEN": "env", "HERDR_COLLAB_TOKEN": "c"}) == ("env", False)
+    assert tui.resolve_token(_args(), {"HERDR_COLLAB_TOKEN": "c"}) == ("c", False)
+    assert tui.resolve_token(_args(), {}) == ("", False)
+
+
+def test_token_file_unreadable_is_a_clear_error(tmp_path):
+    with pytest.raises(SystemExit) as exc:
+        tui.resolve_token(_args(token_file=str(tmp_path / "missing")), {})
+    assert "token-file" in str(exc.value)
+
+
+def test_cli_warns_about_argv_token_but_not_env_or_file(tmp_path):
+    import subprocess
+    import sys
+    server = LiveServer()
+    try:
+        tokfile = tmp_path / "tok"
+        tokfile.write_text("tok-alice-0123456789\n")
+        base = [sys.executable, "-m", "herdr_engineering.cli", "agent-ops", "--once", "--url", server.url, "--api-key", "view-key"]
+        env = {k: v for k, v in __import__("os").environ.items() if not k.startswith("HERDR_")}
+        argv = subprocess.run(base + ["--token", "tok-alice-0123456789"], env=env, capture_output=True, text=True, timeout=30)
+        viaenv = subprocess.run(base, env={**env, "HERDR_AGENT_OPS_TOKEN": "tok-alice-0123456789"}, capture_output=True, text=True, timeout=30)
+        viafile = subprocess.run(base + ["--token-file", str(tokfile)], env=env, capture_output=True, text=True, timeout=30)
+        assert argv.returncode == viaenv.returncode == viafile.returncode == 0
+        assert "visible in the process list" in argv.stderr and "tok-alice" not in argv.stderr
+        assert viaenv.stderr == "" and viafile.stderr == ""
+    finally:
+        server.stop()

@@ -923,10 +923,26 @@ class Client:
 
 
 # --------------------------------------------------------------------------------------------- the pane loop
+def resolve_token(args, env) -> tuple[str, bool]:
+    """(collab token, whether it came from argv). Order: --token-file, --token, $HERDR_AGENT_OPS_TOKEN, $HERDR_COLLAB_TOKEN."""
+    if getattr(args, "token_file", None):
+        try:
+            with open(args.token_file, encoding="utf-8") as fh:
+                return fh.read().strip(), False
+        except OSError as exc:
+            raise SystemExit(f"agent-ops: cannot read --token-file: {exc.strerror or exc}") from exc
+    if args.token:
+        return args.token, True
+    return env.get("HERDR_AGENT_OPS_TOKEN") or env.get("HERDR_COLLAB_TOKEN", ""), False
+
+
 def run(args) -> int:
     base = args.url or os.environ.get("HERDR_CP_URL", "http://127.0.0.1:8080")
-    client = Client(base, args.api_key or os.environ.get("HERDR_CP_API_KEY", ""),
-                    args.token or os.environ.get("HERDR_COLLAB_TOKEN", ""))
+    token, from_argv = resolve_token(args, os.environ)
+    if from_argv:
+        print("warning: --token is visible in the process list (ps); prefer --token-file or $HERDR_AGENT_OPS_TOKEN",
+              file=sys.stderr)
+    client = Client(base, args.api_key or os.environ.get("HERDR_CP_API_KEY", ""), token)
     out = sys.stdout
     opts = detect_opts(isatty=out.isatty(), no_animation=args.no_animation, ascii_only=args.ascii)
     if args.once:
@@ -1016,7 +1032,9 @@ def register(sub) -> None:
     p = sub.add_parser("agent-ops", help="terminal Agent Operations map (live, replay, inspect) for a Herdr pane")
     p.add_argument("--url", help="control-plane base URL (default $HERDR_CP_URL or http://127.0.0.1:8080)")
     p.add_argument("--api-key", help="viewer API key (default $HERDR_CP_API_KEY)")
-    p.add_argument("--token", help="collab bearer token for room visibility (default $HERDR_COLLAB_TOKEN)")
+    p.add_argument("--token", help="collab bearer token for room visibility. WARNING: visible to every local user in the "
+                                   "process list (ps); prefer --token-file or $HERDR_AGENT_OPS_TOKEN (falls back to $HERDR_COLLAB_TOKEN)")
+    p.add_argument("--token-file", help="read the collab bearer token from this file (not exposed in ps)")
     p.add_argument("--no-animation", action="store_true", help="static pulses (also HERDR_REDUCED_MOTION=1)")
     p.add_argument("--ascii", action="store_true", help="ASCII glyphs only")
     p.add_argument("--once", action="store_true", help="print one frame and exit (for captures and doctor checks)")

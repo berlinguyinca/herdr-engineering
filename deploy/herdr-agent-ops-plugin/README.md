@@ -10,7 +10,7 @@ metadata-only.
 1. `herdr-eng` must be on `PATH` (`herdr-eng --version`) and the control plane must run with
    `control_plane.agent_ops.enabled: true`.
 2. Point it at the control plane: `HERDR_CP_URL` (default `http://127.0.0.1:8080`), `HERDR_CP_API_KEY` (viewer key),
-   optionally `HERDR_COLLAB_TOKEN` (a collab bearer token; without it you only see org-scoped, room-less events).
+   optionally `HERDR_AGENT_OPS_TOKEN` (or `HERDR_COLLAB_TOKEN`; a collab bearer token, without it you only see org-scoped, room-less events). Prefer the environment variable or `--token-file <path>` over `--token <value>`: an argv token is visible to every local user in the process list (`ps`), and the pane prints a warning when you use it.
 3. Link for local use: `herdr plugin link /path/to/herdr-engineering/deploy/herdr-agent-ops-plugin`, then
    `herdr plugin list`.
 4. Open it: `herdr plugin action invoke herdr.agent-ops open` or `herdr plugin pane open herdr.agent-ops map`.
