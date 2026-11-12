@@ -277,7 +277,8 @@ export function layoutScene(snapshot, { mode = 'activity', filters = {} } = {}) 
         roles: roles.get(m.node_id) || [], agent: m,
       });
     });
-    rooms.push({ id: g.id, label: roomLabel(g.id), cx: r1(cx), cy: r1(cy), r: r1(radii[gi]), members: g.members.map((m) => m.node_id) });
+    const rh = list(view.rooms).find((r) => r.room_id === g.id)?.context_health;
+    rooms.push({ id: g.id, ctx: contextInfo(null, rh && Number.isFinite(rh.average_fraction) ? { measured: true, fraction: rh.average_fraction } : null), label: roomLabel(g.id), cx: r1(cx), cy: r1(cy), r: r1(radii[gi]), members: g.members.map((m) => m.node_id) });
   });
 
   const at = new Map(nodes.map((n) => [n.id, n]));
