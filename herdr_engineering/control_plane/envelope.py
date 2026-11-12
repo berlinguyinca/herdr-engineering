@@ -36,23 +36,25 @@ _MAX_STR = 512
 AGENT_OPS_PROVENANCE = frozenset({"observed", "derived", "inferred", "unknown"})
 AGENT_OPS_ID_FIELDS = ("host_id", "session_id", "model_id", "parent_session_id", "handoff_id")
 _STATUS_RE = re.compile(r"[a-z][a-z0-9_.-]{0,63}")
-_OPS_EVENT_ID_RE = re.compile(r"[A-Za-z0-9._:~-]{1,128}")    # a cursor / SSE `id:` is built from it: no CR/LF/NUL
+_OPS_EVENT_ID_RE = re.compile(r"[A-Za-z0-9._:~-]{1,128}")    # a cursor / SSE `id:` is built from it: no CR/LF/NUL; `~` is safe (the event id is the cursor's last part)
 _OPS_ID_RE = re.compile(r"[A-Za-z0-9._:@-]{1,160}")
 _OPS_MODEL_RE = re.compile(r"[A-Za-z0-9._:@/+-]{1,160}")       # provider/model ids carry a slash
 LABEL_MAX = 80
 _LABEL_REDACTIONS = (
     (re.compile(r"(?i)\b(?:authorization:\s*)?bearer\s+\S+"), "[redacted]"),
-    (re.compile(r"(?i)\b[\w-]*(?:password|passwd|pwd|secret|token|api[_-]?key)[\w-]*\s*(?:[=:]|\bis\b|\bwas\b)\s*\S+"),
+    (re.compile(r"(?i)\b[\w-]*(?:password|passwd|pwd|pass|secret|token|api[ _-]?key)[\w-]*\s*(?:[=:]|\bis\b)\s*\S+"),
      "[redacted]"),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]*)?"), "[redacted]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]*)?)?"), "[redacted]"),
     (re.compile(r"\bglpat-[A-Za-z0-9_-]{8,}"), "[redacted]"),
     (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[email]"),
-    (re.compile(r"\b(?:sk|pk|ghp|gho|ghs|xox[abp])[-_][A-Za-z0-9_-]{8,}"), "[redacted]"),
+    (re.compile(r"\b(?:sk|pk|ghp|gho|ghs|xox[abp])[-_\u2010-\u2015\u2212][A-Za-z0-9_-]{8,}"), "[redacted]"),
     (re.compile(r"\bAKIA[0-9A-Z]{12,}\b"), "[redacted]"),
     (re.compile(r"\b[A-Za-z0-9+/_-]{32,}={0,2}"), "[redacted]"),
     (re.compile(r"[A-Za-z]:\\\S+"), "[path]"),
     (re.compile(r"(?<![\w:])(?:~|\.{1,2})?(?:/[^\s/]+)+/?"), "[path]"),
-    (re.compile(r"(?<![\w:/.-])[\w.-]+(?:/[\w.-]+)+/?"), "[path]"),      # relative: src/app/main.py
+    # relative: src/app/main.py, a/b/c, docs/readme.md. One separator and no extension (CI/CD, read/write, 3/4,
+    # claude-opus-4/5, auth/session) is ordinary text, not a path.
+    (re.compile(r"(?<![\w:/.-])(?:[\w.-]+(?:/[\w.-]+){2,}|[\w-]+(?:\.[\w-]+)*/[\w.-]*\.[A-Za-z0-9]{1,8}\b|[\w.-]+\.[A-Za-z0-9]{1,8}\b(?=/)[/\w.-]*)/?"), "[path]"),
 )
 
 # Entity types whose state is derived by dedicated handlers. Their v2 envelope
@@ -114,6 +116,7 @@ def sanitize_label(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("sanitized_label must be a string")
     # controls first (zero-width / bidi / format characters would otherwise split a secret past the patterns)
+    value = unicodedata.normalize("NFKC", value)         # fullwidth / compatibility forms fold to their ASCII shape
     value = "".join(" " if ch.isspace() else "" if unicodedata.category(ch) in ("Cc", "Cf") else ch for ch in value)
     for pattern, replacement in _LABEL_REDACTIONS:
         value = pattern.sub(replacement, value)

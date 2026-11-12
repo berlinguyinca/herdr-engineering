@@ -127,3 +127,19 @@ def test_agent_ops_ids_are_constrained(field, value):
 
 def test_constraints_do_not_apply_to_events_without_agent_ops_fields():
     assert "agent_ops" not in normalize_envelope(body(event_id="a b/c", agent_id="x/y"), PRINCIPAL, NOW)
+
+
+@pytest.mark.parametrize("raw", ["use claude-opus-4/5 model", "fix CI/CD now", "read/write lock", "run 3/4 shards",
+                                 "review auth/session flow", "the token was rotated"])
+def test_label_keeps_ordinary_text(raw):
+    assert sanitize_label(raw) == raw
+
+
+@pytest.mark.parametrize("raw,leak", [
+    ("api key: hunter2", "hunter2"), ("pass=hunter2", "hunter2"), ("PASSWORD=hunter2", "hunter2"),
+    ("eyJhbGciOiJIUzI1NiJ9", "eyJ"), ("ghp‐ABCDEFGHIJKLMNOPQRST1234", "ABCDEFGHIJ"),
+    ("sk＿ABCDEFGHIJKL", "ABCDEFGHIJ"), ("token = abc123", "abc123"),
+    ("edit src/app/main.py", "src/app"), ("see docs/readme.md", "readme"), ("a/b/c here", "a/b/c"),
+])
+def test_label_hardened_redactions(raw, leak):
+    assert leak not in sanitize_label(raw)
