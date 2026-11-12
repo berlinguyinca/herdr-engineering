@@ -1,0 +1,200 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/agent-ops-event.schema.json",
+  "title": "Herdr Agent Operations event (envelope v2 extension)",
+  "description": "Metadata-only agent operations event posted to POST /api/v1/ingest with schema_version 2. All Agent Operations fields are optional and additive; absent means unknown. Never carry prompts, responses, file contents, paths, shell arguments or credentials. Only the listed payload keys are read by the projection.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "event_id",
+    "source",
+    "source_sequence",
+    "entity_type",
+    "entity_id",
+    "event_type"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+    },
+    "source_sequence": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "entity_type": {
+      "type": "string",
+      "description": "An allowed generic ingest entity type, e.g. lifecycle."
+    },
+    "entity_id": {
+      "type": "string"
+    },
+    "event_type": {
+      "enum": [
+        "session.started",
+        "session.ended",
+        "model.selected",
+        "model.switched",
+        "tool.started",
+        "tool.ended",
+        "tool.failed",
+        "context.metric",
+        "context.compaction",
+        "message.sent",
+        "message.delivered",
+        "message.acknowledged",
+        "delegation.proposed",
+        "delegation.accepted",
+        "delegation.rejected",
+        "owner.transferred",
+        "review.requested",
+        "review.completed",
+        "artifact.created",
+        "artifact.verified",
+        "tests.started",
+        "tests.completed",
+        "room.joined",
+        "room.left",
+        "agent.disconnected",
+        "agent.reconnected",
+        "drift.warning"
+      ]
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "visibility_scope": {
+      "enum": [
+        "private",
+        "mission",
+        "room",
+        "org"
+      ],
+      "description": "Fail closed: private when absent."
+    },
+    "room_id": {
+      "type": "string",
+      "description": "Events with a room_id are visible only to callers who can read that room."
+    },
+    "workspace_id": {
+      "type": "string"
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "agent_id": {
+      "type": "string"
+    },
+    "correlation_id": {
+      "type": "string"
+    },
+    "provenance": {
+      "enum": [
+        "observed",
+        "derived",
+        "inferred",
+        "unknown"
+      ],
+      "default": "unknown"
+    },
+    "host_id": {
+      "type": "string",
+      "maxLength": 512
+    },
+    "session_id": {
+      "type": "string",
+      "maxLength": 512,
+      "description": "A new session_id is a new agent node; a model switch within one session updates the same node."
+    },
+    "model_id": {
+      "type": "string",
+      "maxLength": 512
+    },
+    "parent_session_id": {
+      "type": "string",
+      "maxLength": 512
+    },
+    "handoff_id": {
+      "type": "string",
+      "maxLength": 512
+    },
+    "status": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+    },
+    "sanitized_label": {
+      "type": "string",
+      "description": "Server strips paths and secret-looking tokens and truncates to 80 characters."
+    },
+    "payload": {
+      "type": "object",
+      "description": "Only these keys are read; everything else is ignored.",
+      "properties": {
+        "context_used": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "context_limit": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "context_source": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "target_agent_id": {
+          "type": "string"
+        },
+        "target_session_id": {
+          "type": "string"
+        },
+        "new_owner_agent_id": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string",
+          "maxLength": 64
+        }
+      }
+    }
+  },
+  "additionalProperties": true,
+  "x-event-types": {
+    "session.started": "agent session lifecycle begins",
+    "session.ended": "session lifecycle ends",
+    "model.selected": "initial model chosen (model_id)",
+    "model.switched": "model changed within a session (model_id)",
+    "tool.started": "tool call began (state working)",
+    "tool.ended": "tool call finished",
+    "tool.failed": "tool call failed (state attention)",
+    "context.metric": "measured context (payload.context_used / context_limit / context_source)",
+    "context.compaction": "context compacted",
+    "message.sent": "communication edge to payload.target_*",
+    "message.delivered": "communication edge state delivered",
+    "message.acknowledged": "communication edge state acknowledged",
+    "delegation.proposed": "delegation edge planned",
+    "delegation.accepted": "delegation edge accepted (target becomes task contributor)",
+    "delegation.rejected": "delegation edge rejected",
+    "owner.transferred": "task accountable owner changes to payload.new_owner_agent_id (ownership edge); never implied by delegation",
+    "review.requested": "review edge planned, target becomes task reviewer",
+    "review.completed": "review edge completed",
+    "artifact.created": "emitter becomes task contributor",
+    "artifact.verified": "artifact verified",
+    "tests.started": "tests started",
+    "tests.completed": "tests completed (status passed|failed)",
+    "room.joined": "agent joined room_id",
+    "room.left": "agent left room_id",
+    "agent.disconnected": "state disconnected",
+    "agent.reconnected": "state returns to idle",
+    "drift.warning": "derived/inferred drift signal; never a proven policy violation"
+  }
+}
