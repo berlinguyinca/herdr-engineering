@@ -101,7 +101,7 @@ export function renderEdge(e, scene, { selected = false, flowing = true } = {}) 
   const label = e.label;
   return `<g class="ao-edge ao-edge--${s.tone} ao-edge--${s.line}${e.dimmed ? ' is-dim' : ''}${selected ? ' is-selected' : ''}" data-ao-edge="${esc(e.id)}" tabindex="0" role="button" aria-pressed="${selected}" aria-label="${esc(describeEdge(e, scene))}">
     <path class="ao-edge-hit" d="${e.d}" fill="none"/><path class="ao-edge-line" d="${e.d}" fill="none"${dash} marker-end="url(#ao-arrow-${s.tone})"/>${particles}
-    <text class="ao-edge-label" x="${e.mid.x}" y="${e.mid.y - 6}" text-anchor="middle">${esc(label)}</text></g>`;
+    <text class="ao-edge-label${e.labelQuiet ? ' ao-edge-label--quiet' : ''}" x="${(e.labelAt || e.mid).x}" y="${(e.labelAt || e.mid).y - 6}" text-anchor="middle">${esc(label)}</text></g>`;
 }
 
 export function renderMarkers() {

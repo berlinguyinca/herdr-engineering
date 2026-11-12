@@ -192,7 +192,29 @@ function curve(a, b, bend) {
   const x1 = a.x + ((cx - a.x) / sa) * cut, y1 = a.y + ((cy - a.y) / sa) * cut;
   const x2 = b.x + ((cx - b.x) / sb) * (cut + 4), y2 = b.y + ((cy - b.y) / sb) * (cut + 4);
   const mid = { x: r1(0.25 * x1 + 0.5 * cx + 0.25 * x2), y: r1(0.25 * y1 + 0.5 * cy + 0.25 * y2) };
-  return { d: `M${r1(x1)} ${r1(y1)} Q${r1(cx)} ${r1(cy)} ${r1(x2)} ${r1(y2)}`, mid, length: Math.round(len), ux, uy };
+  const at = (t) => ({ x: (1 - t) ** 2 * x1 + 2 * (1 - t) * t * cx + t * t * x2, y: (1 - t) ** 2 * y1 + 2 * (1 - t) * t * cy + t * t * y2 });
+  return { d: `M${r1(x1)} ${r1(y1)} Q${r1(cx)} ${r1(cy)} ${r1(x2)} ${r1(y2)}`, mid, at, length: Math.round(len), ux, uy };
+}
+
+// Edge labels: try the middle of the curve first, then slide along it, keeping clear of earlier labels and of node halos.
+// When no spot is free the label turns quiet (shown on hover, focus or selection) instead of printing over other text.
+const LABEL_H = 14, LABEL_CHAR = 6.4, LABEL_TS = [0.5, 0.42, 0.58, 0.34, 0.66, 0.27, 0.73, 0.2, 0.8, 0.14, 0.86];
+function placeLabels(items, nodes) {
+  const placed = [];
+  const hit = (a, b) => Math.abs(a.x - b.x) < (a.w + b.w) / 2 && Math.abs(a.y - b.y) < (a.h + b.h) / 2;
+  for (const it of items) {
+    const w = String(it.label || '').length * LABEL_CHAR + 6;
+    let best = null;
+    for (const t of LABEL_TS) {
+      const p = it.at(t), box = { x: p.x, y: p.y - 6, w, h: LABEL_H };
+      const crowd = placed.filter((b) => hit(box, b)).length + nodes.filter((n) => hit(box, { x: n.x, y: n.y, w: 2 * RING_R, h: 2 * RING_R }) || hit(box, { x: n.x, y: n.y + RING_R + 18, w: 130, h: 16 })).length;
+      if (!best || crowd < best.crowd) best = { crowd, box };
+      if (!crowd) break;
+    }
+    placed.push(best.box);
+    it.labelAt = { x: r1(best.box.x), y: r1(best.box.y + 6) };
+    it.labelQuiet = best.crowd > 0;   // no free spot: the label shows on hover, focus or selection (the text stays in the aria-label and the table)
+  }
 }
 
 /**
@@ -246,11 +268,14 @@ export function layoutScene(snapshot, { mode = 'activity', filters = {} } = {}) 
     const g = curve(at.get(e.from), at.get(e.to), bend);
     const style = edgeStyle(e);
     return {
-      id: edgeId(e), from: e.from, to: e.to, kind: style.kind, state: style.state, style, d: g.d, mid: g.mid, length: g.length,
+      id: edgeId(e), from: e.from, to: e.to, kind: style.kind, state: style.state, style, d: g.d, mid: g.mid, at: g.at, length: g.length,
       label: style.label, task: e.task_id || null, handoff: e.handoff_id || null, room: e.room_id || null, eventId: e.event_id || null,
       provenance: e.provenance || 'unknown', updatedAt: e.updated_at || null, dimmed: kinds != null && !kinds.includes(style.kind), raw: e,
     };
   });
+
+  placeLabels(edges, nodes);
+  for (const e of edges) delete e.at;
 
   const pad = CLUSTER_PAD;
   const xs = rooms.flatMap((r) => [r.cx - r.r, r.cx + r.r]), ys = rooms.flatMap((r) => [r.cy - r.r, r.cy + r.r]);

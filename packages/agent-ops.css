@@ -134,3 +134,7 @@ html[data-calm="on"] .ao-particle { display: none; }
 .ao-lineage-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); }
 .ao-lineage-row { border: 1px solid var(--border-subtle); border-radius: var(--radius); padding: 12px; background: var(--surface); }
 .ao-lineage-task { font-weight: 600; color: var(--accent-ink); }
+
+/* A label with no free spot on a dense map appears on hover, focus or selection; its text always stays in the aria-label and the table. */
+.ao-edge-label--quiet { opacity: 0; }
+.ao-edge:hover .ao-edge-label--quiet, .ao-edge:focus-visible .ao-edge-label--quiet, .ao-edge.is-selected .ao-edge-label--quiet { opacity: 1; }

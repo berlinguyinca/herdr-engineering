@@ -253,3 +253,12 @@ test('step delay scales with speed and is bounded', () => {
   const quick = buildTimeline([ev(1), { ...ev(1), event_id: 'e1b' }]);
   assert.equal(stepDelay(quick, 0, 8), 15);
 });
+
+test('edge labels: parallel edges between close nodes get separate label positions', () => {
+  const agents = ['a', 'b'].map((id) => ({ node_id: id, agent_id: id, model: 'm', state: 'working', room_ids: [], context: null }));
+  const edge = (kind, n) => ({ kind, from: 'a', to: 'b', state: 'sent', room_id: null, task_id: `t${n}`, event_id: `e${n}`, provenance: 'observed', updated_at: '2026-11-12T10:00:00Z' });
+  const scene = layoutScene({ agents, rooms: [], tasks: [], edges: [edge('communication', 1), edge('delegation', 2), edge('handoff', 3)] }, {});
+  const spots = scene.edges.map((e) => `${e.labelAt.x},${e.labelAt.y}`);
+  assert.equal(new Set(spots).size, 3);
+  assert.ok(scene.edges.every((e) => e.at === undefined && Number.isFinite(e.labelAt.x)));
+});
