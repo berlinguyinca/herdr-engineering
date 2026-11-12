@@ -86,10 +86,10 @@ export function renderNode(n, { selected = false, pulse = false } = {}) {
     ? `<text class="ao-name" y="4" text-anchor="middle">${esc(clip(n.name, 12))}</text>`
     : `<text class="ao-name" y="-7" text-anchor="middle">${esc(clip(n.name, 12))}</text>
        <text class="ao-model${n.modelKnown ? '' : ' ao-model--unknown'}" y="9" text-anchor="middle">${esc(clip(n.model, 13))}</text>
-       <text class="ao-ctx ao-ctx--${level}" y="25" text-anchor="middle">${esc(ctx.label)}${warn}</text>`;
+       <text class="ao-ctx ao-ctx--${level}" y="25" text-anchor="middle">${esc(ctx.known && ctx.percent != null ? `${ctx.percent}% ctx` : ctx.label)}${warn}</text>`;
   return `<g class="ao-node ao-node--${n.state.tone}${n.person ? ' ao-node--person' : ''}${selected ? ' is-selected' : ''}" data-ao-node="${esc(n.id)}" transform="translate(${n.x} ${n.y})" tabindex="0" role="button" aria-pressed="${selected}" aria-label="${esc(describeNode(n))}">
     <circle class="ao-halo ao-halo--${n.state.tone}" r="${HALO_R}"/>${track}${arc}<circle class="ao-body" r="${NODE_R}"/>${inner}
-    <text class="ao-state" y="${RING_R + 22}" text-anchor="middle">${esc(n.state.label)}</text></g>`;
+    <text class="ao-state" y="${RING_R + 22}" text-anchor="middle">${esc(n.state.label)}${!n.person && (ctx.level === 'warn' || ctx.level === 'critical') ? ` · ctx ${ctx.level === 'warn' ? 'high' : 'critical'}` : ''}</text></g>`;
 }
 
 const PARTICLES = 3;

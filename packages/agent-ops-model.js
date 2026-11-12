@@ -17,7 +17,7 @@ export const RING_GAP = 8;
 export const RING_W = 7;
 export const RING_R = NODE_R + RING_GAP;
 export const HALO_R = RING_R + 12;
-export const CLUSTER_PAD = 54;
+export const CLUSTER_PAD = 30;
 export const NO_ROOM = '';
 
 // ---- context fraction (ADR: amber >= 70, red >= 90) -------------------------------------------------------------------------
@@ -171,9 +171,12 @@ function groupByRoom(nodes, rooms) {
   return keys.map((id) => ({ id, members: groups.get(id).sort((a, b) => (a.node_id < b.node_id ? -1 : a.node_id > b.node_id ? 1 : 0)) }));
 }
 
+// Members sit on a ring wide enough that neighbours keep a gap of about one node width: room for the edge between them and its label.
+const memberRing = (n) => Math.max(HALO_R * 2.1, (n * (2 * HALO_R + 96)) / (2 * Math.PI));
+
 function clusterRadius(n) {
   if (n <= 1) return HALO_R + CLUSTER_PAD;
-  const ring = Math.max(HALO_R * 1.25, (n * (2 * HALO_R + 18)) / (2 * Math.PI));
+  const ring = memberRing(n);
   return ring + HALO_R + CLUSTER_PAD;
 }
 
@@ -213,7 +216,7 @@ export function layoutScene(snapshot, { mode = 'activity', filters = {} } = {}) 
   groups.forEach((g, gi) => {
     const angle = k <= 1 ? 0 : -Math.PI / 2 + (2 * Math.PI * gi) / k;
     const cx = k <= 1 ? 0 : orbit * Math.cos(angle) * 1.25, cy = k <= 1 ? 0 : orbit * Math.sin(angle);
-    const n = g.members.length, ringR = n <= 1 ? 0 : Math.max(HALO_R * 1.25, (n * (2 * HALO_R + 18)) / (2 * Math.PI));
+    const n = g.members.length, ringR = n <= 1 ? 0 : memberRing(n);
     g.members.forEach((m, i) => {
       const a = n <= 1 ? 0 : -Math.PI / 2 + (2 * Math.PI * i) / n;
       const ctx = contextInfo(m.context), st = stateInfo(m.state);
