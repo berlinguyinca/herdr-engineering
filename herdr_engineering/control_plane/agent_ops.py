@@ -702,8 +702,18 @@ class AgentOpsService:
                 self._cache[key] = (time.monotonic(), out)
         return out
 
+    def _named(self, snap: dict, viewer: Viewer) -> dict:
+        """Additive: ``rooms[].name`` from the collab room, only for rooms this viewer can read; otherwise null."""
+        for room in snap["rooms"]:
+            name = None
+            if self.collab is not None and room["room_id"] in viewer.rooms:
+                with self.collab._lock:
+                    name = (self.collab._rooms.get(room["room_id"]) or {}).get("name")
+            room["name"] = name if isinstance(name, str) and name else None
+        return snap
+
     def snapshot(self, viewer: Viewer, principal: Any = None) -> dict:
-        return fold(self._gather(viewer, principal))
+        return self._named(fold(self._gather(viewer, principal)), viewer)
 
     def events(self, viewer: Viewer, principal: Any = None, cursor: str | None = None, limit: int = 100,
                cached: bool = False) -> dict:
@@ -714,4 +724,4 @@ class AgentOpsService:
                 "has_more": len(ordered) > limit}
 
     def replay(self, viewer: Viewer, principal: Any = None, until: str | None = None) -> dict:
-        return fold(self._gather(viewer, principal), until)
+        return self._named(fold(self._gather(viewer, principal), until), viewer)

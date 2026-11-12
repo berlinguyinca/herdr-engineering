@@ -744,3 +744,16 @@ def test_open_mode_streams_share_one_bucket_whatever_the_api_key_header_says():
             conn.close()
         srv.shutdown()
         thread.join(timeout=5)
+
+
+def test_snapshot_rooms_carry_the_collab_room_name_only_when_readable(stack):
+    alice = stack.users["alice"]
+    ingest(stack.repo, 1, "tool.started", session_id="sa", agent_id="agent-a", room_id=stack.rooms["alice"],
+           visibility_scope="room")
+    snap = stack.svc.snapshot(stack.svc.viewer(alice), alice)
+    assert [(r["room_id"], r["name"]) for r in snap["rooms"]] == [(stack.rooms["alice"], "r-alice")]
+    assert stack.svc.replay(stack.svc.viewer(alice), alice)["rooms"][0]["name"] == "r-alice"
+    # no collab identity: the room id is not readable, so no name is attached (null, never the real name)
+    ingest(stack.repo, 2, "tool.started", session_id="sb", agent_id="agent-b", room_id="room-unknown", visibility_scope="room")
+    op = AgentOpsService(stack.repo).snapshot(Viewer(operator=True, rooms=frozenset({"room-unknown"})))
+    assert all(r["name"] is None for r in op["rooms"])
