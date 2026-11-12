@@ -331,8 +331,12 @@ def draw_node(cv: Canvas, agent: dict, box: tuple[int, int, int, int], focused: 
         owned = [t["task_id"] for t in snapshot.get("tasks") or [] if t.get("accountable_owner") in
                  (agent.get("agent_id"), agent.get("node_id"))]
         rows[1] = ("owns " + ",".join(clean(t, 6) for t in owned)) if owned else rows[1]
+    ctx = agent.get("context")
+    pct = 100 * ctx["used"] / ctx["limit"] if isinstance(ctx, dict) and isinstance(ctx.get("used"), (int, float)) \
+        and isinstance(ctx.get("limit"), (int, float)) and ctx["limit"] > 0 else None
+    ctx_style = None if pct is None else "red" if pct >= 90 else "yellow" if pct >= 70 else "green"   # unknown stays unstyled
     for i, text in enumerate(rows[:h - 2]):
-        cv.text(x + 2, y + 1 + i, text, color if i == 0 else None, limit=inner)
+        cv.text(x + 2, y + 1 + i, text, color if i == 0 else ctx_style if i == 2 else None, limit=inner)
 
 
 # --------------------------------------------------------------------------------------------- side panels
