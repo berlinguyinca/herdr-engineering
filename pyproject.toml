@@ -45,6 +45,7 @@ testpaths = ["tests"]
 # plain ``pytest`` / scripts/validate.sh deselects it. Opt in with ``-m e2e`` (scripts/run_acceptance.py does).
 addopts = "--import-mode=importlib -m 'not e2e and not integration'"
 markers = [
+    "e2e: real command-line end-to-end workflows; opt in explicitly",
     "integration: needs an external dependency (a live Postgres via PA_PG_DSN, or a real CLI such as claude); deselected by default, opt in with -m integration",
 ]
 #
@@ -61,6 +62,7 @@ timeout_method = "signal"
 [tool.setuptools.package-data]
 herdr_engineering = ["control_plane/rakazo_defaults.json", "*.mjs", "skill_data/summary/*.md", "skill_data/summary/adapters/*.md",
                      "skill_data/handoff/*.md", "skill_data/handoff/adapters/*.md",
+                     "skill_data/herdr-join/*.md", "skill_data/herdr-join/adapters/*.md",
                      "control_plane/share_static/*.html", "control_plane/share_static/*.js",
                      "control_plane/share_static/*.css", "control_plane/share_static/fonts/*.woff2",
                      "control_plane/share_static/fonts/OFL.txt", "control_plane/share_static/vendor/pdfjs/*",

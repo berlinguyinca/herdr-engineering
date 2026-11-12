@@ -176,7 +176,8 @@ class PostgresSource(DurableSource):
                  events_table: str = "fabric_events", dsn: str | None = None,
                  use_checkpoints: bool = True, checkpoint_publish: bool = False,
                  inspector_snapshots: bool = False,
-                 checkpoint_lock_wait: float = 0.0):
+                 checkpoint_lock_wait: float = 0.0,
+                 checkpoint_budgets: Any = None):
         self._owned_runner = None
         if run is None:
             self._owned_runner = _LoopRunner()
@@ -192,6 +193,7 @@ class PostgresSource(DurableSource):
         self.checkpoint_enabled = bool(use_checkpoints and dsn and events_table == 'fabric_events')
         self.checkpoint_publish = checkpoint_publish
         self.checkpoint_lock_wait = checkpoint_lock_wait
+        self.checkpoint_budgets = checkpoint_budgets  # None = projection_recovery defaults
         self.recovery_info = None
         self._history_provider = None
 
@@ -311,7 +313,12 @@ class PostgresSource(DurableSource):
                 f"SELECT count(*) FROM {self._events_table} WHERE entity_type = 'inspector' AND entity_id IS NOT NULL "
                 "AND entity_id <> '' AND sequence <= $1", int(row["watermark"]))
             row["covered_count"] = int(covered)
-            if int(covered) != int(row["event_count"]):
+            archived = 0
+            if self._events_table == "fabric_events":
+                from .inspector_snapshot import archived_inspector_count
+                archived = await archived_inspector_count(conn, int(row["watermark"]))
+            row["archived_count"] = archived      # rows the archive job moved out; the snapshot consumed them
+            if int(covered) + archived != int(row["event_count"]):
                 return row, None
             row["skipped_upto"] = int(row["watermark"])
             return row, int(row["watermark"])
@@ -379,6 +386,22 @@ class PostgresSource(DurableSource):
         with self._query_lock:
             return self._run(DurableHistoryReader(self._conn, events_table=self._events_table).page(
                 entity_type, entity_id, limit=limit, before=before))
+
+    def inspector_page(self, session_id, *, limit, before=None, cutoff=None, kinds=None):
+        """One bounded page of durable inspector rows older than the ring (see inspector_history)."""
+        from .inspector_history import fetch_page
+        table = '"' + str(self._events_table).replace('"', '""') + '"'
+
+        async def read():
+            if self._conn is None or self._conn.is_closed():
+                if self._dsn is None:
+                    raise ValueError("PostgresSource needs a conn or dsn")
+                import asyncpg
+                self._conn = await asyncpg.connect(self._dsn)
+            return await fetch_page(self._conn, table, session_id, limit=limit, before=before,
+                                    cutoff=cutoff, kinds=kinds)
+        with self._query_lock:
+            return self._run(read())
 
     def history_stream(self, entity_type, entity_id):
         from .durable_history import DurableHistoryReader
@@ -846,8 +869,9 @@ def _load_full_into(repo, source: DurableSource, *, core_override=None,
         "hosts": hosts, "artifacts": artifacts, "blobs": {}, "leases": {},
         "telemetry": (projection_state or {}).get('telemetry', {}),
         "events": events, "event_order": event_order,
-        "inspector_snapshot": source.inspector_snapshot() if isinstance(source, PostgresSource) else None,
-        "inspector_backfill": source.inspector_backfill if isinstance(source, PostgresSource) else None,
+        "inspector_snapshot": (source.inspector_snapshot()
+                               if callable(getattr(source, "inspector_snapshot", None)) else None),
+        "inspector_backfill": getattr(source, "inspector_backfill", None),
     }
     for key in ('leases', 'scheduler_reservations', 'scheduler_leases'):
         if key in (projection_state or {}):

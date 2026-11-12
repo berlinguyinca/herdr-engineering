@@ -15,12 +15,24 @@ sections:
       host_aliases: {}              # e.g. {bender: "bender.example.test"}
       # {} = open on the tailnet (the default `fleet config init` writes; the web port is
       # bound to the tailnet interface and runs --allow-open).
-      # !!! KEYED MODE IS NOT SUPPORTED YET !!! Adding entries here (key: role, roles
-      # viewer | operator | ingest | agent) gates every route but /api/v1/health and the
-      # host endpoints. The browser dashboard, the llm-proxy and the emit hook do not
-      # send keys yet, so they all get 401 until they do. If you still enable it, put the
-      # ingest key in ingest.api_key and the agent key in agent.api_key below.
+      # Keyed mode: adding entries here (key: role, roles viewer | operator | ingest | agent)
+      # gates every route but /api/v1/health and the host endpoints. The llm-proxy and the
+      # emit hook do not send keys yet (401 until they do). The browser dashboard works only
+      # behind the dashboard proxy (dashboard_proxy below). Put the ingest key in
+      # ingest.api_key and the agent key in agent.api_key.
       api_keys: {}
+      # OPTIONAL, off by default (no block = nothing changes). Same-origin proxy for BROWSER
+      # traffic when api_keys is on: GET/SSE/static get the viewer key, only the allowlisted
+      # writes get the operator key, everything else is 403. The browser never sees a key.
+      # Key files hold one key each, mode 0600 (the proxy refuses to start otherwise).
+      # Run: herdr-eng control-plane dashboard-proxy --fleet-config <this file>
+      # (compose profile dashboard-proxy). Point the browser at the proxy port, not the web port.
+      # dashboard_proxy:
+      #   viewer_key_file: /etc/herdr/dashboard-proxy/viewer.key
+      #   operator_key_file: /etc/herdr/dashboard-proxy/operator.key   # omit = dashboard is read-only
+      #   upstream: "http://control-plane-web:8080"
+      #   # operator_post_allowlist: ["POST /api/v1/attention/ack"]   # "METHOD /path"; * = one segment, trailing ** = rest
+      #   #   default = the dashboard's own write actions (see control_plane/dashboard_proxy.py)
       rustfs_endpoint: "http://rustfs:9000"
       minio_user: "REDACTED"        # the object store's access key (what the web reads)
       minio_password: "REDACTED"
@@ -58,6 +70,13 @@ sections:
       # deploy.sh mounts ~/.local/share/herdr-engineering/pipelines (kept equal to InferWeave's
       # deploy/pipelines on main by the herdr-pipelines-sync timer) at /etc/herdr/pipelines.
       # deployment_definitions: "/etc/herdr/pipelines"
+      # OPTIONAL: components a CI pipeline (not a host updater) reports, as {component: host id}. The
+      # host id is a `hosts:` entry (with token_sha256) whose token the pipeline POSTs events with.
+      # Accepted and shown with a "CI-reported" badge, but never planned, gated, permitted, escalated or
+      # forced. At most 32 entries; a component must not also have a definition (the whole list is then
+      # refused and the page says why). Read live. Only effective with deployment_definitions loaded;
+      # while those are invalid, every event is refused (503), these included.
+      # ci_deployments: {lc-binbase-frontend: woodpecker-ci, lc-binbase-backend: woodpecker-ci}
       # OPTIONAL: true enables the audited Deployments actions (POST /api/deployments/force and
       # /ack, operator role). Read live; anything but true is off. Force only records a request the
       # host updaters pick up; the host permit gate (GET /api/deployments/permit) works either way.
@@ -253,6 +272,8 @@ sections:
       #   max_tokens: 5                  # live sessions per account; the oldest is dropped (1-50)
       #   trusted_proxies: []            # proxies whose X-Forwarded-For is believed (loopback always); the fabric gateway's
       #                                  # address as the control plane sees it goes here so lockout keys on the real client
+      #   open_owner_origins: ["rakazo://", "shepherd://"]   # app Origins the passwordless open_owner session accepts
+      #                                  # (default ["rakazo://"]; scheme:// or scheme://host, never http/https, max 8)
       #   accounts:                      # shape reserved for a later multi-user mode; today only role: operator
       #     - email: "you@example.com"
       #       password_scrypt: "scrypt$32768$8$1$<salt_b64>$<hash_b64>"

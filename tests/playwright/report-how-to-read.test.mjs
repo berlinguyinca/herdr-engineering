@@ -1,13 +1,13 @@
 // Real-browser check of the "How to read this report" legend: collapsed by default, operable by keyboard, readable at
 // 390px without horizontal scroll, light and dark, left out of print, and intact in the dashboard's shadow-root copy.
-import { test, after } from 'node:test';
+import { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { chromium } from 'playwright';
+import { engineTest, launch } from './helpers/engines.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
 const PYTHON = process.env.PYTHON || (fs.existsSync(path.join(ROOT, '.venv/bin/python')) ? path.join(ROOT, '.venv/bin/python') : 'python3');
@@ -42,12 +42,11 @@ await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const base = `http://127.0.0.1:${server.address().port}`;
 after(() => server.close());
 
-const launch = () => chromium.launch({ headless: true, args: ['--no-sandbox'], ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}) });
 const shot = async (page, name) => { if (SHOTS) await page.screenshot({ path: path.join(SHOTS, name) }); };
 
 for (const [scheme, width, tag] of [['light', 1100, 'desktop'], ['dark', 1100, 'desktop'], ['light', 390, 'phone'], ['dark', 390, 'phone']]) {
-  test(`share page: legend is collapsed, keyboard-operable and fits (${scheme}, ${tag})`, async () => {
-    const browser = await launch();
+  engineTest(`share page: legend is collapsed, keyboard-operable and fits (${scheme}, ${tag})`, async (engine) => {
+    const browser = await launch(engine);
     try {
       const page = await browser.newPage({ colorScheme: scheme, viewport: { width, height: 800 } });
       await page.goto(`${base}/report.html`);
@@ -73,13 +72,14 @@ for (const [scheme, width, tag] of [['light', 1100, 'desktop'], ['dark', 1100, '
   });
 }
 
-test('print: the legend is left out, the report is not', async () => {
-  const browser = await launch();
+engineTest('print: the legend is left out, the report is not', async (engine) => {
+  const browser = await launch(engine);
   try {
     const page = await browser.newPage({ viewport: { width: 1000, height: 900 } });
     await page.goto(`${base}/report.html`);
     await page.emulateMedia({ media: 'print' });
     assert.equal(await page.locator('details.howto').isVisible(), false, 'hidden on paper');
+    if (engine !== 'chromium') return; // page.pdf() is Chromium-only; the print-media check above ran on this engine
     const pdf = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'howto-')), 'r.pdf');
     await page.pdf({ path: pdf });
     const text = execFileSync('pdftotext', ['-layout', pdf, '-']).toString();
@@ -88,8 +88,8 @@ test('print: the legend is left out, the report is not', async () => {
   } finally { await browser.close(); }
 });
 
-test('dashboard preview: the legend survives the sanitiser, collapsed, and toggles inside the shadow root', async () => {
-  const browser = await launch();
+engineTest('dashboard preview: the legend survives the sanitiser, collapsed, and toggles inside the shadow root', async (engine) => {
+  const browser = await launch(engine);
   try {
     const page = await browser.newPage({ viewport: { width: 390, height: 800 } });
     await page.goto(`${base}/dash.html`);

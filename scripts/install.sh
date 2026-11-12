@@ -146,6 +146,8 @@ printf '  herdr-artifacts %s installed from %s\n' "$ARTIFACT_REF" "$ARTIFACT_REP
 
 # Idempotent; never overwrites a customized summary skill or command.
 "$PY" -m herdr_engineering.cli summary install || warn "summary skill install reported a problem (see above)"
+# Read-only: skills in all four harnesses, OpenCode command, fabric listener, opt-in hook state (non-fatal).
+"$PY" -m herdr_engineering.cli summary install --check --skill herdr-join || warn "/herdr::join setup check reported a problem (see above)"
 
 # --- 4. state + artifact directories --------------------------------------
 step "4/8 machine-local state + artifact directories"

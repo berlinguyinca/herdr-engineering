@@ -1,13 +1,13 @@
 // Real-browser check of finding anchors: every finding/section heading has a keyboard-reachable "#" permalink, a URL
 // with #fragment scrolls to and highlights its target on the share page (CSS :target only: the page has no script),
 // and in the dashboard preview (a shadow root, where :target cannot work) the client wires the same behaviour.
-import { test, after } from 'node:test';
+import { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { chromium } from 'playwright';
+import { engineTest, launch } from './helpers/engines.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
 const PYTHON = process.env.PYTHON || (fs.existsSync(path.join(ROOT, '.venv/bin/python')) ? path.join(ROOT, '.venv/bin/python') : 'python3');
@@ -43,13 +43,12 @@ await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const base = `http://127.0.0.1:${server.address().port}`;
 after(() => server.close());
 
-const launch = () => chromium.launch({ headless: true, args: ['--no-sandbox'], ...(process.env.PLAYWRIGHT_CHROMIUM ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM } : {}) });
 const shot = async (page, name) => { if (SHOTS) await page.screenshot({ path: path.join(SHOTS, name) }); };
 const inView = (page, selector) => page.evaluate(sel => { const r = document.querySelector(sel).getBoundingClientRect(); return r.top >= 0 && r.top < innerHeight; }, selector);
 
 for (const [scheme, width, height, tag] of [['light', 1100, 800, 'desktop'], ['dark', 1100, 800, 'desktop'], ['light', 390, 800, 'phone'], ['dark', 390, 800, 'phone']]) {
-  test(`share page: #fragment scrolls to and highlights the finding (${scheme}, ${tag})`, async () => {
-    const browser = await launch();
+  engineTest(`share page: #fragment scrolls to and highlights the finding (${scheme}, ${tag})`, async (engine) => {
+    const browser = await launch(engine);
     try {
       const page = await browser.newPage({ colorScheme: scheme, viewport: { width, height } });
       await page.goto(`${base}/report.html#finding-f9`);
@@ -64,8 +63,8 @@ for (const [scheme, width, height, tag] of [['light', 1100, 800, 'desktop'], ['d
   });
 }
 
-test('share page: every permalink is a real link to an existing id, reachable and operable by keyboard', async () => {
-  const browser = await launch();
+engineTest('share page: every permalink is a real link to an existing id, reachable and operable by keyboard', async (engine) => {
+  const browser = await launch(engine);
   try {
     const page = await browser.newPage({ viewport: { width: 1100, height: 800 } });
     await page.goto(`${base}/report.html`);
@@ -90,8 +89,8 @@ test('share page: every permalink is a real link to an existing id, reachable an
 });
 
 for (const [scheme, width, tag] of [['light', 1100, 'desktop'], ['dark', 1100, 'desktop'], ['light', 390, 'phone'], ['dark', 390, 'phone']]) {
-  test(`dashboard preview: permalink click and ?at= deep link reveal the section inside the shadow root (${scheme}, ${tag})`, async () => {
-    const browser = await launch();
+  engineTest(`dashboard preview: permalink click and ?at= deep link reveal the section inside the shadow root (${scheme}, ${tag})`, async (engine) => {
+    const browser = await launch(engine);
     try {
       const page = await browser.newPage({ colorScheme: scheme, viewport: { width, height: 800 } });
       await page.goto(`${base}/dash.html`);

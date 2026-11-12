@@ -5,6 +5,114 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Inspector snapshot boot: used on the complete-replay fallback, strictly validated
+
+- With projection checkpoints on (the default), a missing or rejected checkpoint fell back to a complete replay that ignored `inspector_snapshots` and re-ran every stored inspector row through redaction. That fallback now hands the stored snapshot to the repo, which verifies it by count and ordering and replays everything on any doubt.
+- `control_plane.inspector_snapshots` is validated in `fleet_config.py`: `enabled` must be a boolean, `interval_seconds` a number >= 60, unknown keys are rejected (previously a bad interval was silently replaced by 600). Default stays off.
+
+### Auto-join hook no longer dies silently on a loaded host
+- `summary join-hook` ran the join under a 12 s kill-timeout through `python -m herdr_engineering.cli`; on a loaded host that start alone took 3-40 s, so the join was killed and the session printed nothing. It now starts the CLI directly, waits up to 8 s, and past that leaves the (idempotent) join running detached and says "still running in the background". Test: a real listener that never answers.
+
+### Inspector: older events on demand from Postgres
+- New `GET /api/v1/sessions/{id}/inspector/history?before=&limit=&view=` returns inspector events older than the in-memory ring, one bounded page at a time (opaque keyset cursor on `ingest_timestamp, sequence, event_id`), rendered with the ring's role redaction. Nothing is read at boot and nothing is loaded into the ring, so memory does not grow with paging. Existing `/inspector` and `before_seq` are unchanged. Configured by `control_plane.inspector_history` (`enabled`, `page_size`, `max_page_size`), validated in `fleet_config.py`, unknown keys rejected. Client: `getInspectorHistory`.
+- Caveats: durable rows carry no ring `seq` (`seq` is null; `history_id` is the event id); a tool call's newest row per page wins, so a call split across a page boundary can show once per page; rows already archived to `fabric_events_archive` are not read.
+
+### fabric_events partitioning (disabled by default, lazy-loading PR 9)
+
+- Migration 0053 prepares an empty LIST-partitioned copy of `fabric_events` (inspector partition plus default); nothing moves automatically. New `control_plane.fabric_partitioning` config (YAML only, validated in `fleet_config.py`) and `control-plane fabric-partition status|backfill|cutover|rollback|drop-old`: resumable keyset backfill, one-transaction cutover with a bounded lock and exact catch-up, and a rollback that carries post-cutover writes back. `control-plane checkpoint` skips the CONCURRENTLY index on a partitioned journal. See `docs/operations/fabric-events-partitioning.md`.
+
+### Rakazo bridge: `open_owner_origins` (default unchanged)
+- New optional `control_plane.rakazo_bridge.open_owner_origins` (list of 1-8 `scheme://[host]` strings, default `["rakazo://"]`): the exact `Origin` values `open_owner` accepts, so a second native app can use it. http/https, wildcards, whitespace and duplicates are refused at startup; every other guard (network allowlist, proxy checks, 30s interval, operator account) is unchanged. Tests: `tests/control_plane/test_rakazo_bridge.py`.
+
+### Fleet rollout watcher step 4: host-apply and the serial runner (manual, `--apply` required)
+- `herdr-eng fleet host-apply` (precheck/apply/health/rollback per repo, D6 checkout gate, idempotent `no_change`, `fleet-auto-update.lock`, atomic Pi `current` switch keeping 3 releases) and `herdr-eng fleet-watch run [--apply]` (serial beast -> bender -> macbook-pro, halt on first failure, durable crash-resume, ssh timeouts, D8 rollback for pointer flips and ff-only, events through the existing emitter/outbox). Output and events carry no free text. No systemd unit (step 5). Tests: `tests/test_fleet_host_apply.py`, `tests/test_fleet_watch_run.py`. See `docs/operations/fleet-rollout-events.md`.
+
+### Work Command Center: rollout gate `work_center_v1` (off by default)
+- New capability `work_center_v1` in `/api/v1/health`, only when `control_plane.work_center.enabled: true` (YAML, strict `true`, default off). It gates the Overview "This week" card, the session "Work context" header and the GitHub board "Open in Herdr" links; with it off the dashboard is unchanged (the board no longer reads `/api/v1/mission-outcomes`). Rollback is turning the flag off. Nothing is deployed or enabled by merging. See `docs/specs/herdr-work-command-center-wc001/OPERATOR.md`.
+
+### Control-plane client key for the llm services (optional)
+- `ControlPlaneClient` (llm-proxy, `llm-gateway-sync`, `llm-gateway-usage`) sends `X-API-Key` read from an optional key file on every call; no file = no header = unchanged. The file must be mode 0600 (group/other-readable, missing or empty is refused without printing it). Setting: `--control-plane-key-file` on the three commands, plus `control_plane.llm_proxy.control_plane_key_file` for the llm-proxy slice; compose mounts `HERDR_CP_CLIENT_KEY_FILE` read-only when set.
+- The `agent` role may now `POST /api/v1/token-usage` (viewer still may not; an open control plane is unchanged), so usage reporters need no operator key. Tests: `tests/test_control_plane_client_key.py`, `tests/control_plane/test_agent_token_usage.py`. See `deploy/control-plane/README.md`.
+
+### Dashboard proxy for keyed control planes (`herdr-eng control-plane dashboard-proxy`, off by default)
+- With `control_plane.api_keys` on, the browser dashboard got 401 on everything (no browser code sends a key; `EventSource` cannot). New same-origin reverse proxy `herdr_engineering/control_plane/dashboard_proxy.py`: GET/HEAD/static/SSE use a `viewer` key (SSE streamed unbuffered), writes use the `operator` key only when `METHOD /path` is in `control_plane.dashboard_proxy.operator_post_allowlist` (default = the dashboard's write actions; others 403 at the proxy; encoded slashes and dot segments refused). A client-supplied `X-API-Key` and `X-Forwarded-*` are never forwarded; hop-by-hop headers are stripped.
+- YAML only: `control_plane.dashboard_proxy {viewer_key_file, operator_key_file, upstream, operator_post_allowlist}`, validated by `fleet config`. Key files must be mode 0600; the proxy exits 2 on a group/other-accessible, missing or empty file. Optional compose profile `dashboard-proxy` (port `HERDR_DASHBOARD_PROXY_PORT`, default 8081). With no block configured nothing changes. `API_KEYS_WARNING`, the README and `fleet-config.example.yaml` now say the dashboard works behind the proxy. Tests: `tests/control_plane/test_dashboard_proxy.py` (real keyed `ControlPlaneServer`).
+
+### Ingest callers send the host config's `ingest.api_key`
+- The feed-plugin `emit.js` and the fabric agent (service lease and host telemetry POSTs) now send `X-API-Key` when `ingest.api_key` is configured, and nothing when it is not, so they keep working once `control_plane.api_keys` is enabled. The agent follows key changes through `retarget`. Tests: `deploy/herdr-cp-feed-plugin/emit-send.test.js`, `tests/test_fabric_agent_ingest_key.py`.
+
+### Optional `X-API-Key` for control-plane callers that sent none
+`collab-spawn.py --api-key-file` (ingest report: ingest role; scheduler: operator role), `herdr-eng fleet drift`
+(viewer; `--api-key-file` or this host's agent/ingest key), `herdr-eng artifacts upload --api-key-file` (a bare
+`POST /artifacts` needs the operator role) and the `herdr-artifact` wrapper (`history` viewer, `share-request`
+operator) now send a key once `control_plane.api_keys` is enabled. No key = no header = unchanged open behaviour.
+Key files must be mode 0600 and are refused otherwise; the key is never printed. The duplicate
+`_cmd_art_upload` in the CLI was removed (the two copies were identical).
+
+### Build-cache report sender (`herdr-eng build-cache-report`, disabled by default)
+- New `herdr-eng build-cache-report [--once|--loop] [--json]` schedules the existing `report_builds` sender. Config is YAML only, `fabric_build_cache.report {enabled: false, url, key_file, interval_s: 60 (10..3600), host_id}`; the ingest-role key is read from `key_file` only (never argv, env or logs). It refuses to run (exit 2) when disabled, when the url is not https (http only for 127.0.0.1/localhost), or when the key file is missing, empty or group/world readable. `--loop` logs one line per attempt and survives an unreachable or refusing control plane.
+- Opt-in service files, enabled by nothing: `scripts/herdr-eng-build-cache-report.service` (systemd user) and `scripts/com.herdr-engineering.build-cache-report.plist` (launchd template). Runbook: `docs/build-cache-deployment.md`. Tests: `tests/test_build_cache_report_cli.py`.
+
+### Dashboard report viewer and share panel: phone-width and dark-theme polish
+- The dashboard's "Evidence and source downloads" table stacks into labelled blocks below 600px (table roles kept) instead of scrolling sideways with no cue.
+- Share panel at 390px: the four tabs stay on one row; labels stack caption over control with a gap (Expires, Version, Audience, Compare, Report version, Finding or figure); the Links heading and Title field have top margin.
+- Dark theme: the report detail's textareas, inputs and the "Evidence supporting this check" fieldset use the theme tokens (`--surface`, `--border`) instead of the browser's flat grey and white border. `.hd-note` is now styled.
+- Public and preview report pages: roomier table rows (12px/14px padding, 1.55 line height); permalink focus ring uses `--link` (it was 2.99:1, below 3:1).
+- Tests: `tests/playwright/viewer-phone-polish.test.mjs` (chromium, firefox); the share fixture now returns the descriptor's assets.
+
+### Inspector archive job (disabled by default)
+- New `control_plane.inspector_archive` config (YAML only, validated in `fleet_config.py`) and `InspectorArchiver`: moves inspector tool/message rows older than 14 days from `fabric_events` into `fabric_events_archive`, chunked, one transaction per chunk, idempotent, with a count-only dry run. Never moves rows above the snapshot watermark or projection checkpoint frontier, v2-envelope rows, or state-bearing kinds. Migration 0052 adds a partial archive index. Snapshot boot counts archived rows; the compaction archive purge now skips inspector rows. See `docs/operations/inspector-archive.md`.
+
+### Fleet config: unknown keys rejected, `ci_deployments` fails closed
+- `fleet config` loading now rejects unknown top-level, per-section and per-host keys (it dropped them silently; a live `control_plane:` written at the top level instead of `sections.control_plane.values` went unnoticed). The error names the key, never a value, and hints `sections.control_plane.values` for a top-level `control_plane`. Allowed: top level `version, sections, hosts`; section `roles, values`; host `roles, token_sha256, overrides` (everything the repo's own writers produce). While the control plane is running, a rejected edit leaves the last good config serving; a restart (or any CLI that loads the file) with such a key fails instead, so run `herdr-eng fleet config validate` before deploying.
+- `control_plane.ci_deployments` is validated at load (`section control_plane: control_plane.ci_deployments: ...`) and is read through `FleetConfigStore.secure_section`: while the fleet file is unreadable, deleted or invalid the CI allowlist is empty (CI hosts get 403) unless `control_plane.config_failure_mode: last_good`. Deployment definitions still keep the last good config.
+- The `kind: "ci"` badge and `definitions.ci_components` appear only when definitions are loaded. The evidence link no longer ends in `.,;:)]`. Tests: `tests/test_fleet_config.py`, `tests/control_plane/test_ci_deployments.py`.
+
+### CI-reported deployments (`control_plane.ci_deployments`)
+
+- New fleet config key `control_plane.ci_deployments: {component: host id}` lets a CI pipeline (for example Woodpecker as host `woodpecker-ci`) report deployments of components that have no `deploy/pipelines` definition, without a fake definition. An event is accepted when the definitions rule allows it or the exact (component, host) pair is listed; with deployment definitions loaded, another host reporting a listed component gets 403 (with none configured ingest is unrestricted, as before). Bounded (32 entries), validated, hot-reloaded; a component that also has a definition is dropped from the list (only that entry) and reported in `definitions.ci_errors`. With no definitions configured nothing changes; with definitions configured but invalid, every event is still refused (503), listed components included.
+- The coordinator, plans, permits, escalations and force/ack ignore these components. The Deployments snapshot adds `definitions.ci_components`, `definitions.ci_errors`, and `kind: "ci"` plus a `ci` summary on their rows; the page shows them under "CI-reported deployments" with a badge, last deploy, outcome, commits and the evidence link. Documented in `deploy/control-plane/README.md`. Tests: `tests/control_plane/test_ci_deployments.py`, `tests/playwright/deployments.test.mjs`.
+
+### Report viewer guide
+
+- New `docs/artifacts/report-viewer-guide.md`: the Rich view opt-in, finding anchors, printing and saving as PDF, the "How to read this report" legend, phone-width Evidence and Downloads tables, and keyboard use of the share panel tabs. Linked from `docs/artifacts/share-links.md` and the README. Docs only.
+- Fact-check fix: the guide now states the exact Rich view eligibility rule (one `text/html` asset, or exactly one with role `preview` among several) and when the legend is omitted.
+
+### `/herdr::join` works with no flags after `herdr-eng summary install`
+- `rooms join-fabric` found the listener only in the fetched host config, which agent hosts do not carry, so a bare call failed. It now also reads `fabric_join` (`control_plane_url`, or `listen_host` + `listen_port`) from the machine config `~/.config/herdr-engineering/config.yaml` and falls back to the readable fleet config's `control_plane.collab.fabric_trust`. YAML only, no new environment variable; `--control-plane` still overrides.
+- `herdr-eng summary install` (and `scripts/install.sh`) records the fleet config's listener under `fabric_join` idempotently and never overwrites a differing value (reported as `preserved`). New read-only `herdr-eng summary install --check` verifies per harness the skill symlink, the OpenCode command, listener resolution and reachability, and the hook state, exiting 1 on a failure; no secrets are printed.
+- Opt-in auto-join, off by default: `fabric_join.auto_join_on_session_start: true` installs one Claude Code `SessionStart` hook (appended, manifest tracked, removed by uninstall; HerdR panes only; never fails the session). Codex, OpenCode and Pi get no hook (no verified safe contract) and are reported `unsupported`. Installing with the key false installs nothing.
+- Tests: `tests/control_plane/test_fabric_join_setup.py` (real CLI, real fabric listener).
+- Codex: its sandbox blocked the tailnet listener ("control plane is unreachable"). `summary install` now appends one execpolicy rule, `prefix_rule(pattern=["herdr-eng", "rooms", "join-fabric"], decision="allow")`, to `~/.codex/rules/default.rules` (only when `~/.codex` exists; idempotent, manifest tracked, removed by `summary uninstall`, shown by `--check`). No `network_access`, `sandbox_mode` or `approval_policy` change. Verified with `codex execpolicy check` and a real `codex exec` join, and a no-rule control that fails.
+- OpenCode and Pi: not a code defect. Their configured default model (`qwen3.8-27b-...-q8_k_xl`, also OpenCode's `small_model` title model) has no worker on the gateway (503 `capacity_unavailable`), so runs hung or printed the "retry after the declared delay" error. Documented the workaround in `docs/operations/fabric-trust.md` section 9a; both joined for real with a served model.
+
+### Dashboard a11y ratchet lowered
+
+- `ui-gates-dashboard-a11y.test.mjs`: the recorded `focus-visible` findings on the assistant surfaces are removed. They were cleared by the `.hd-btn` fallback focus ring in #723, and the ratchet fails when a finding disappears without the table being lowered.
+
+### Report Evidence and Downloads tables are readable at phone width
+
+- Below 600px (screen only) each row of the Evidence and Downloads tables becomes a labelled block, so no column is cut off and nothing scrolls sideways inside the table. Desktop keeps the real table; print keeps it too, with its repeating header; `#evidence-...` anchors still work. Applies to the public share viewer and the dashboard preview (same renderer).
+- Labels come from the column position in CSS, because the sanitiser keeps no `data-*` attributes and its allowlist is unchanged. The table carries explicit ARIA roles (and keeps its header row, visually hidden) because browsers drop table semantics once `display` changes. The roles and classes are only emitted with the full stylesheet, so the 4 KiB minimum-cap envelope is unchanged.
+- `report-how-to-read`, `report-anchors` and `report-print` Playwright tests now honour `BROWSERS` (default `chromium,firefox`; a missing engine is skipped). `page.pdf()` checks stay Chromium-only. New `report-narrow-tables` test.
+
+### `/herdr::join`: one skill to join the workspace room from any harness
+- New skill `herdr-join` (`herdr_engineering/skill_data/herdr-join`, linked at `skills/herdr-join`). It reads `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID` and `HERDR_PANE_ID`, runs the existing `herdr-eng rooms join-fabric NAME --json` (tokenless tailnet fabric trust; `--no-workspace` opts out), reports agent id, room and the fixed `read`/`post`/`instruct`/`execute` grant, and says plainly that `coordinate` and `grant_agent` are owner-only.
+- `herdr-eng summary install|verify|uninstall` now manages it with `summary` and `handoff` (`--skill herdr-join`): a symlink into Claude Code, Codex, Pi and OpenCode skill directories plus an OpenCode `/herdr-join` command. Nothing pre-existing is overwritten; a collision is reported as `preserved`. No top-level `/join` alias and no Pi/Codex prompt are written.
+- No session-start auto-join hook: that stays an owner decision. The router entry (`join` in the `herdr` skill's `commands.json`) lives in the separate herdr-handoff repo.
+- Tests: `tests/test_herdr_join_skill.py`, `tests/control_plane/test_collab_fabric_join_skill_e2e.py` (real CLI against the real fabric listener).
+
+### Inspector journal skips tool update rows that have an end row, and repeated all-zero usage rows
+- A tool call journaled a row per update (each repeating the output so far) plus start and end; 99.8% of `inspector.tool` update rows belonged to calls with an end row. Updates are now held back (latest only) and dropped when the end row carries the output and everything the update added (first valid tool and args_preview, sensitive/redacted/truncated); otherwise the held update is journaled just before the end row, and also when the session is interrupted, ended or restarted, or the call leaves the ring. An all-zero `inspector.usage` report that equals the session's latest report is not journaled (20% of rows); a zero report that would replace a different latest is. `control_plane.journal_suppression.inspector_tool_updates` and `inspector_zero_usage` (default true) turn each off.
+- Known replay difference: if the process dies with a call still running and nothing closes it, that call's last update is lost (its start replays). A replayed ring has fewer events, so `rev`, `seen` and sequence numbers differ; tool status/output and `usage` totals/latest are equal. Rows already journaled replay as before. Tests in `tests/control_plane/test_journal_suppression.py` (real PostgreSQL, suppressed vs unsuppressed log).
+
+### SessionUpdated rows that only change `runtime` or `transcript` are no longer journaled
+- 98.6% of `SessionUpdated` rows differed from the previous one only by `runtime` (cpu/rss counters) or `transcript` (the reporter's status flips between `identity_unavailable` and `recording`; the cause lies outside this repository). With a durable sink such a write is skipped unless `control_plane.journal_suppression.session_heartbeat_seconds` (default 300, max 600) have passed since the last journaled row, so a replayed `updated_at`, runtime and transcript are at most that old. `session_noop: false` restores journaling every write. The in-memory state, the live SSE stream and every API answer are unchanged; all keys are validated and unknown keys are rejected.
+- Product-visible changes: the Activity feed and the durable session history no longer show a `SessionUpdated` entry for each runtime/transcript-only report (they still show every material change and one entry per heartbeat); the per-session event count shrinks accordingly. Tool-update and zero-usage rows (above) disappear from the journal, not from the inspector view.
+
+### Fabric compaction treats ServiceUpdated rows that differ only by heartbeat timestamps as repeats
+- `ServiceUpdated` compaction compared payloads exactly, but every heartbeat restamps `metadata_updated_at`, `verified_origin.verified_at` and `metadata_observation.observed_at`, so it removed 32 of 235,252 recent rows while 99.6% differed only by those. Equality now ignores the three timestamps (`control_plane.fabric_compaction.normalize_service_timestamps`, default true; false restores exact equality). The service's first and last `ServiceUpdated` row are still kept, so a replay (including `updated_at`) is identical; rows already journaled replay as before. Tests in `tests/control_plane/test_compaction_ignores_heartbeat_timestamps.py` (real PostgreSQL).
+
 ### Single-operator phone account acts as the room owner with no `collab_user`
 - In `single_operator` mode a YAML bridge account with role `operator` now acts as `operator_user` for rooms, groups and agent bots, so the phone app lists fabric agents and workspace rooms without a hand-written `collab_user` link. An explicit `collab_user` still wins. Cognito-derived accounts, other roles, replaced accounts and servers that are not single-operator stay unlinked. Tests in `tests/control_plane/test_rakazo_rooms.py`.
 

@@ -767,6 +767,14 @@ export class HerdrClient {
     return this.request('/api/v1/mission-outcomes', { signal });
   }
 
+  /** G1: deduped started/finished/paused_quota lifecycle events in the half-open window [since, until) (needs work_center_v1). */
+  weeklyEvents({ since, until, limit, after, signal } = {}) {
+    const query = new URLSearchParams({ since, until });
+    if (limit !== undefined) query.set('limit', String(limit));
+    if (after !== undefined) query.set('after', after);
+    return this.request(`/api/v1/work/weekly-events?${query}`, { signal });
+  }
+
   /** One mission's story (header, needs, events, agents, outcome, usage). Rejects with status 404 when unknown. */
   missionStory(key, { signal } = {}) {
     return this.request(`/api/v1/missions/${encodeURIComponent(key)}/story`, { signal });
@@ -820,6 +828,15 @@ export class HerdrClient {
     if (before_seq != null) p.set('before_seq', String(before_seq));
     return this.request(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/inspector?${p}`);
+  }
+
+  // Events older than the in-memory ring, one page from Postgres; pass the previous `next_cursor` as `before`.
+  getInspectorHistory(sessionId, { view = 'all', limit, before } = {}) {
+    const p = new URLSearchParams({ view });
+    if (limit) p.set('limit', String(limit));
+    if (before) p.set('before', before);
+    return this.request(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/inspector/history?${p}`);
   }
 
   getInspectorEvent(sessionId, seq) {

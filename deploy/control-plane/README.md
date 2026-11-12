@@ -97,7 +97,7 @@ without them, and DB/object-store ports stay loopback-only.
 
 Settings of the reserved `control_plane` section the servers read: `pg_dsn`,
 `host_aliases`, `api_keys`, `rustfs_*`/`minio_*`, `self_host`, `web_port`,
-`ci_actions` (true enables CI retry/cancel), `ci_log_tests` (test counts read from finished runs' CI logs; on by default, see `docs/ci-test-reports.md`), `deployment_definitions` (absolute path, as the
+`ci_actions` (true enables CI retry/cancel), `ci_log_tests` (test counts read from finished runs' CI logs; on by default, see `docs/ci-test-reports.md`), `ci_deployments` (component to host id for CI-reported deploys; see "CI-reported deployments"), `deployment_definitions` (absolute path, as the
 web container sees it, to a checkout of InferWeave's `deploy/pipelines`; read live and validated with
 the same rules as its `validate.py`. Absent: no definitions, any host may report any component and the
 Deployments snapshot warns. Set: a host may report only components whose `host` is its fleet id, and
@@ -106,7 +106,7 @@ an invalid set keeps the last good one, or refuses events with 503 if none was e
 `deployment_actions` (exactly `true` enables the audited Deployments actions; read live, and off while the
 file is unusable unless `config_failure_mode: last_good` — see "Deployment actions" below), `inspector_limits` (`max_events`,
 `max_bytes`, `max_sessions`, `max_total_bytes`, `retention_hours`, `reasoning_role`,
-`sensitive_role`, `store_reasoning`), `inspector_snapshots` (`enabled`, default off;
+`sensitive_role`, `store_reasoning`), `inspector_history` (`enabled`, default true; `page_size` default 100, `max_page_size` default 500, both 1-1000: `GET /api/v1/sessions/{id}/inspector/history?before=<next_cursor>&limit=&view=` reads inspector events older than the 24h in-memory ring from Postgres, one page at a time, newest first, role-gated like the ring; nothing is loaded at boot or put into the ring; 503 when no durable history is attached; unknown keys are rejected), `inspector_snapshots` (`enabled`, default off;
 `interval_seconds`, default 600, at least 60: the worker keeps a replay snapshot of the inspector so a boot
 replays only newer events instead of every stored one; see "Inspector snapshots" below), `artifact_reconcile` (`enabled`, default off; the **worker** runs the artifact registry's idempotent repair pass every `interval_seconds`, default 300, at least 60: orphan blobs are marked after `orphan_ttl_hours` (default 24) and never deleted, expired uploads are closed, tombstones past their hold window are purged; `grace_seconds` default 60, `limit` default 100; it does not re-emit lineage, the worker has no graph emitter) and `llm_proxy` (`max_inflight`,
 `queue_wait_seconds`, `raw_retention_days` (default 14: the web server drops older
@@ -162,13 +162,57 @@ beyond the tailnet.
 `fleet config init` keeps this posture: it writes `control_plane.api_keys: {}` and
 leaves `ingest.api_key` / `agent.api_key` empty, so hosts send no `X-API-Key` at all.
 
-**Optional RBAC (Spec §104) - not supported for the compose stack yet.** Keyed mode
-(entries in `control_plane.api_keys`, by hand or with `fleet config init
---with-api-keys`) gates every route except `/api/v1/health` (which then answers only
-status, version and commit without a key) and the host endpoints. The browser
-dashboard, the llm-proxy and the emit hook do not send keys yet, so turning keys on
-breaks them until they do. viewer = read-only, operator = read + mutate, ingest =
-POST /api/v1/ingest, agent = ingest + LLM-key mint/revoke + review posting.
+**Optional RBAC (Spec §104).** Keyed mode (entries in `control_plane.api_keys`, by hand or with
+`fleet config init --with-api-keys`) gates every route except `/api/v1/health` (which then answers only
+status, version and commit without a key) and the host-token endpoints (`fleet/config*`). Roles: viewer =
+read-only, operator = read + mutate, ingest = `POST /api/v1/ingest`, `host/summary-reports/*` and
+`host/build-cache/report`, agent = ingest + LLM-key mint/revoke + review posting + `POST /api/v1/token-usage`.
+The emit hook, the snapshot loop, the fabric agent and the mission/ai-sync/service feeds send `ingest.api_key`
+(or `agent.api_key`) as `X-API-Key`; the llm-proxy, `llm-gateway-sync` and `llm-gateway-usage` send a key too (see
+"Client key for the llm services" below). The browser dashboard works through the **dashboard proxy** (next
+section). `build-cache-report` reads its own `fabric_build_cache.report.key_file` from `config.yaml`: put an
+ingest-role key there (mode 0600). `control_plane.single_operator` needs an open listener, so the control plane
+refuses to start with both `single_operator: true` and `api_keys` set. `api_keys` is restart-required, and
+long-running feeds read the key once at start, so restart them after a key change. Pi reads it once per session:
+sessions started earlier keep posting unkeyed (401) until restarted.
+
+Callers that can send a key (all optional; no key = no header): `collab-spawn.py --api-key-file FILE` (the
+session report needs an ingest-role key, the scheduler calls an operator-role key, so use an operator key on
+the runner host), `herdr-eng fleet drift` (viewer; `--api-key-file` or the host's own agent/ingest key),
+`herdr-eng artifacts upload --api-key-file FILE` (operator: a bare `POST /artifacts` is not an agent route) and
+`herdr-artifact history|share-request --api-key-file FILE` (viewer / operator; the host's cached key is used
+for the host's own control plane). Key files must be mode 0600 or they are refused.
+
+### Dashboard proxy (keyed mode, optional)
+
+Browsers cannot put `X-API-Key` on an `EventSource`, and the dashboard sends no key,
+so with `control_plane.api_keys` on the UI and every GET return 401. The optional
+`dashboard-proxy` compose profile runs `herdr-eng control-plane dashboard-proxy`, a
+same-origin reverse proxy for browser traffic that adds the key server-side:
+
+- GET/HEAD (static UI, JSON, SSE streamed unbuffered) use the `viewer` key.
+- A write uses the `operator` key only if `METHOD /path` is in
+  `control_plane.dashboard_proxy.operator_post_allowlist` (default: the dashboard's own
+  write actions; `*` = one path segment, trailing `**` = the rest). Anything else is 403
+  at the proxy. No `operator_key_file` = read-only dashboard.
+- A client-supplied `X-API-Key` / `X-Forwarded-*` is dropped; the browser never sees a key.
+
+```yaml
+control_plane:
+  dashboard_proxy:
+    viewer_key_file: /etc/herdr/dashboard-proxy/viewer.key     # one key per file, mode 0600
+    operator_key_file: /etc/herdr/dashboard-proxy/operator.key
+    upstream: "http://control-plane-web:8080"
+```
+
+Put the two key files in a directory on the host (`HERDR_DASHBOARD_PROXY_KEY_DIR`,
+default `/var/lib/herdr-dashboard-proxy`), owned by the container user, files `0600`;
+the proxy exits 2 if a key file is group/other accessible, missing or empty. The two
+keys must exist in `control_plane.api_keys` with roles `viewer` and `operator`. Start
+it with `docker compose --profile dashboard-proxy up -d dashboard-proxy` and point
+browsers at its port (`HERDR_DASHBOARD_PROXY_PORT`, default 8081) instead of the web
+port. It adds no authentication of its own: keep it on the tailnet bind like the web
+port. With no `dashboard_proxy` block and the profile off, nothing changes.
 
 Run the same server standalone from the host:
 
@@ -300,6 +344,46 @@ errors. The component groups (stages) come from the definitions. The same status
 Run once by hand (same flags as the unit's `ExecStart`): `~/.local/share/herdr-engineering/pipelines-sync.sh once`.
 To roll back, drop `deployment_definitions` from the fleet file (the key is read live), then
 `systemctl --user disable --now herdr-pipelines-sync.timer`.
+
+## CI-reported deployments (`control_plane.ci_deployments`)
+
+Some production deploys are done by a CI pipeline (Woodpecker), not by a host updater. They have no
+`deploy/pipelines` definition, and must not get a fake one: definitions drive the coordinator's plans,
+gating, permits, escalation and force actions, none of which can act on a CI-pushed deploy. Instead the
+operator allowlists them, as `{component: host id}` under `sections.control_plane.values`:
+
+```yaml
+hosts:
+  woodpecker-ci: {roles: [ci], token_sha256: "<sha256 of the pipeline's token>"}
+sections:
+  control_plane:
+    values:
+      ci_deployments: {lc-binbase-frontend: woodpecker-ci, lc-binbase-backend: woodpecker-ci}
+```
+
+- **Rules.** A mapping of at most 32 components (`[a-z0-9][a-z0-9_-]{0,63}`) to a non-empty host id. A bad
+  entry or non-mapping value is rejected when the fleet file loads; a component that also has a definition
+  (ambiguous) is dropped alone and named in `definitions.ci_errors` in `GET /api/v1/deployments`. Read live,
+  failing closed: while the fleet file is unreadable, deleted or invalid the allowlist is empty (CI hosts get
+  403) unless `control_plane.config_failure_mode: last_good`. Unknown keys anywhere in the file are rejected.
+- **Authorization.** An event is accepted when the definitions rule allows it OR the exact (component,
+  authenticated host id) pair is listed. A listed component reported by any other host is refused (403).
+  With no `deployment_definitions` configured ingest stays accept-all, as before. With definitions
+  configured but never valid, every event is refused (503), allowlisted CI components included: an
+  allowlist entry is not a way around a broken definitions set.
+- **What it is not.** The coordinator, plans, permit gate, escalations and force/ack ignore these
+  components (force/ack answer 404 `unknown component`, the permit 403).
+- **Reporting from a pipeline.** After a deploy step, `POST /api/deployments/events` with
+  `Authorization: Bearer <the host token>` and `Content-Type: application/json`, one event per step:
+  `{"id": "<hex>", "ts": "2026-11-09T10:00:00Z", "host": "<agent name>", "component": "lc-binbase-frontend",
+  "step": "deployment.lc-binbase-frontend.deploy", "outcome": "ok|failed|rolled-back|skipped|started",
+  "from": "<old commit>", "to": "<new commit>", "evidence": "<text, e.g. the pipeline URL>"}`. The first
+  `https://` URL in the evidence of the latest finished event is shown as the evidence link. Evidence is
+  redacted on arrival; never put a secret in it.
+- **View.** The Deployments page lists them under "CI-reported deployments" with a badge, last deploy time,
+  outcome, from and to commit and the evidence link, and no hold or repair columns. In the snapshot each such
+  row has `kind: "ci"` and a `ci` summary; `definitions.ci_components` names the allowed components.
+- **Roll back** by removing the key (read live): those events are then refused again.
 
 ## Deployment actions (force redeploy, permit gate, ack)
 
@@ -580,6 +664,12 @@ snapshot's watermark are exactly the ones the snapshot consumed (same count), it
 Postgres (they are about a third of the data); if the repo then refuses the snapshot it fetches them on demand, and a
 boot never proceeds with an incomplete inspector.
 
+The snapshot is also used when the projection checkpoint is missing or rejected and the boot falls back to a complete
+replay: every row is loaded then, but the repo verifies the snapshot by count and skips re-running the covered
+inspector rows through redaction and eviction. The config is validated at fleet-config load: `enabled` must be a
+boolean, `interval_seconds` a number of at least 60, and any other key is rejected (YAML only; there is no
+environment variable).
+
 It is an optimisation, never a source of truth. The web replays everything, and logs why
 (`boot inspector replay: full:<reason>`), when the snapshot is missing or unreadable, was built under other
 inspector limits/roles or other redaction rules, or does not match the stored events (a different event count below
@@ -612,6 +702,11 @@ control_plane:
         role: operator
         # tokens_valid_after: "2026-11-02T09:30:00Z"   # optional revocation cut-off, see "Revoking a lost phone"
 ```
+
+`open_owner_origins` (optional) lists the app `Origin` values the passwordless `open_owner` session accepts. Default `["rakazo://"]`
+(unchanged); add another native app with e.g. `["rakazo://", "shepherd://"]`. Each entry is `scheme://` or `scheme://host`, exactly
+matched; `http`/`https`, wildcards, spaces, duplicates and more than 8 entries are refused at startup. The network allowlist,
+trusted-proxy checks and per-address rate limit apply to every origin alike.
 
 `enabled: true` with no account, a malformed hash, an unknown key or any role but `operator` (`family` is reserved, not
 implemented) stops the control plane at startup with a message naming the field. Disabled (the default) leaves every
@@ -837,3 +932,22 @@ whether or not a stream is open. The executor claims the proposal itself, so a d
 a late reject still cannot run it twice or after a reject. The board is in memory: a control-plane restart mid-execution
 drops the proposal with the rest of the board (nothing is left "executing"), and the action may or may not have reached
 the CI provider; check the dashboard or CI.
+
+## Client key for the llm services (optional)
+
+On a keyed control plane the llm-proxy (`llm/config` read, token reporting), `llm-gateway-sync`
+(`llm/config` read) and `llm-gateway-usage` (`POST /api/v1/token-usage`) need an API key. Give
+them an **`agent`-role** key (`token-usage` is in the agent POST allow-list; a `viewer` key cannot
+report usage, and `operator` is more than they need). Default: no key file, no `X-API-Key`
+header, the open control plane's behaviour.
+
+- Put the key alone in a file, mode `0600` (a group- or other-readable file is refused, as in
+  `ci-fix-runner.py`), owned by the uid the container runs as (1000 for the gateway services).
+  It is re-read on every request, so rotating it needs no restart. It is never put in argv,
+  env or logs.
+- Compose: set `HERDR_CP_CLIENT_KEY_FILE=/path/to/key` for `deploy.sh`; it is mounted read-only
+  at `/run/secrets/cp-client-key` in the llm-proxy, `llm-gateway-sync` and `llm-gateway-usage`
+  services and passed as `--control-plane-key-file`. Unset: nothing is mounted or sent.
+- Without compose: `--control-plane-key-file PATH` on `control-plane llm-proxy`,
+  `llm-gateway-sync` and `llm-gateway-usage`; for the llm-proxy also
+  `control_plane.llm_proxy.control_plane_key_file` in the llm slice YAML (the flag wins).
