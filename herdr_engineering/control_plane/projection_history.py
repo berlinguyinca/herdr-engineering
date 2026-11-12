@@ -198,7 +198,7 @@ class PostgresHistory:
         pool = await self._get_pool()
         async with pool.acquire(timeout=5) as conn:
             return await fetch_page(conn, self.table, session_id, limit=limit, before=before,
-                                    cutoff=cutoff, kinds=kinds)
+                                    cutoff=cutoff, kinds=kinds, archive_table=self.table + "_archive")
 
     def entity_ids(self, kind):
         return self._call(self._ids(kind))

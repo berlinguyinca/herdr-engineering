@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Inspector history reads the archive too
+
+- `GET /api/v1/sessions/{id}/inspector/history` now continues into `fabric_events_archive` once the requested range goes past what the archive job moved out of `fabric_events`. The two tables are merged under the one keyset order and the same opaque cursor, so a page can straddle the boundary with no gap and no duplicate (a row present in both is returned once). No new setting: with no archive table, behaviour is unchanged. Replaces the earlier caveat that archived rows were not read; the archive job itself stays off by default.
+
 ### Inspector snapshot boot: used on the complete-replay fallback, strictly validated
 
 - With projection checkpoints on (the default), a missing or rejected checkpoint fell back to a complete replay that ignored `inspector_snapshots` and re-ran every stored inspector row through redaction. That fallback now hands the stored snapshot to the repo, which verifies it by count and ordering and replays everything on any doubt.

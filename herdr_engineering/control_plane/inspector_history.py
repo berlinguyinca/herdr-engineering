@@ -70,12 +70,9 @@ def decode_cursor(cursor: str) -> tuple[datetime, int, str]:
         raise HistoryCursorInvalid("invalid history cursor") from None
 
 
-async def fetch_page(conn: Any, table: str, session_id: str, *, limit: int, before: str | None = None,
-                     cutoff: float | None = None, kinds: frozenset[str] | None = None) -> dict:
-    """One page of durable inspector rows for a session, newest first.
-
-    ``table`` is a trusted, already-quoted identifier. ``cutoff`` (epoch seconds) bounds a first page to rows older
-    than the ring's oldest event; ``before`` continues from a previous page's ``next_cursor``."""
+async def _query(conn: Any, table: str, session_id: str, limit: int, before: str | None,
+                 cutoff: float | None, kinds: frozenset[str] | None) -> list[Any]:
+    """Up to ``limit`` + 1 newest rows of one table, in the keyset order shared by the journal and its archive."""
     args: list[Any] = [session_id]
     where = ["entity_type = 'inspector'", "entity_id = $1", "event_type LIKE 'inspector.%'",
              "event_type <> 'inspector.preferences'"]
@@ -91,12 +88,36 @@ async def fetch_page(conn: Any, table: str, session_id: str, *, limit: int, befo
         n = len(args)
         where.append(f"(ingest_timestamp, sequence, event_id COLLATE \"C\") < (${n-2}, ${n-1}, ${n}::text COLLATE \"C\")")
     args.append(limit + 1)
-    rows = await conn.fetch(
+    return await conn.fetch(
         f"SELECT event_id, sequence, event_type, source_timestamp, ingest_timestamp, payload FROM {table} "
         f"WHERE {' AND '.join(where)} "
         f"ORDER BY ingest_timestamp DESC, sequence DESC, event_id COLLATE \"C\" DESC LIMIT ${len(args)}", *args)
+
+
+def _order_key(row: dict) -> tuple:
+    return (row["ingest_timestamp"], row["sequence"], row["event_id"].encode())
+
+
+async def fetch_page(conn: Any, table: str, session_id: str, *, limit: int, before: str | None = None,
+                     cutoff: float | None = None, kinds: frozenset[str] | None = None,
+                     archive_table: str | None = None) -> dict:
+    """One page of durable inspector rows for a session, newest first.
+
+    ``table`` is a trusted, already-quoted identifier. ``cutoff`` (epoch seconds) bounds a first page to rows older
+    than the ring's oldest event; ``before`` continues from a previous page's ``next_cursor``.
+
+    ``archive_table`` (trusted, quoted) is the inspector archive (``fabric_events_archive``). When it exists, the page is
+    the newest ``limit`` rows of the two tables merged under the one keyset order, so the same cursor walks from the
+    journal into the archive with no gap and no duplicate (a row present in both tables is returned once). A missing
+    archive table is simply not read."""
+    rows = [dict(r) for r in await _query(conn, table, session_id, limit, before, cutoff, kinds)]
+    if archive_table is not None and await conn.fetchval("SELECT to_regclass($1) IS NOT NULL", archive_table):
+        seen = {r["event_id"] for r in rows}
+        rows += [d for d in (dict(r) for r in await _query(conn, archive_table, session_id, limit, before, cutoff, kinds))
+                 if d["event_id"] not in seen]
+        rows.sort(key=_order_key, reverse=True)
     more = len(rows) > limit
-    shown = [dict(r) for r in rows[:limit]]
+    shown = rows[:limit]
     for r in shown:
         if isinstance(r["payload"], str):
             r["payload"] = json.loads(r["payload"])
