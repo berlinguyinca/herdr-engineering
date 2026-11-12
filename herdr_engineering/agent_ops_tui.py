@@ -17,6 +17,7 @@ import termios
 import threading
 import time
 import tty
+import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field, replace
 
@@ -24,11 +25,10 @@ MODES = ("activity", "communication", "handoffs", "ownership", "replay")
 PANES = ("map", "tasks", "activity", "timeline")
 KINDS = ("communication", "delegation", "handoff", "review", "ownership")
 PLANNED = {"planned", "proposed", "pending", "queued", "requested"}
-_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 RESET = "\x1b[0m"
 _ASCII = str.maketrans({"·": "-", "…": "~", "→": ">", "←": "<", "↑": "^", "↓": "v", "⏎": "E", "▸": ">", "●": "*", "○": "o",
-                        "◆": "!", "×": "x", "◉": "*", "█": "#", "░": "."})
+                        "◆": "!", "×": "x", "✗": "x", "◉": "*", "█": "#", "░": "."})
 
 # kind -> (colour, solid h, solid v, dashed h, dashed v, arrow glyph, ascii h, ascii v, ascii arrow)
 _EDGE = {
@@ -46,14 +46,47 @@ _COLORS = {"red": (31, 203), "green": (32, 78), "yellow": (33, 215), "blue": (34
            "rev": (7, None)}
 
 
+_DROPPED = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp", "Mn", "Me"})   # controls, bidi/zero-width format chars, combining marks
+
+
+def _drop(ch: str) -> bool:
+    return unicodedata.category(ch) in _DROPPED
+
+
+def char_width(ch: str) -> int:
+    """Terminal cells one (already sanitised) character occupies: 2 for East Asian wide/fullwidth and emoji."""
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def cell_width(text: str) -> int:
+    return sum(char_width(ch) for ch in text)
+
+
+def fit(text: str, cells: int) -> str:
+    """The longest prefix of ``text`` that fits ``cells`` columns; a wide glyph is dropped whole, never split."""
+    out, used = [], 0
+    for ch in text:
+        used += char_width(ch)
+        if used > cells:
+            break
+        out.append(ch)
+    return "".join(out)
+
+
+def pad(text: str, cells: int) -> str:
+    text = fit(text, cells)
+    return text + " " * (cells - cell_width(text))
+
+
 def clean(value: object, limit: int = 40) -> str:
-    """Printable text with control characters removed and length bounded; None becomes an empty string."""
-    text = _CTRL.sub("", "" if value is None else str(value))
-    return text if len(text) <= limit else text[:max(limit - 1, 1)] + "…"
+    """Printable text: control, bidi, zero-width and combining characters removed FIRST, then bounded to ``limit``
+    terminal cells (wide glyphs count 2) so the cut can never split an escape sequence or a glyph; None becomes ''."""
+    text = "".join(ch for ch in ("" if value is None else str(value)) if not _drop(ch))
+    return text if cell_width(text) <= limit else fit(text, max(limit - 1, 1)) + "…"
 
 
 def visible_width(line: str) -> int:
-    return len(_ANSI.sub("", line))
+    return cell_width(_ANSI.sub("", line))
 
 
 @dataclass(frozen=True)
@@ -91,17 +124,41 @@ class Canvas:
         self.cells: list[list[tuple[str, str | None]]] = [[(" ", None)] * self.w for _ in range(self.h)]
 
     def put(self, x: int, y: int, ch: str, style: str | None = None) -> None:
-        if 0 <= x < self.w and 0 <= y < self.h:
-            self.cells[y][x] = (ch, style)
+        if not (0 <= x < self.w and 0 <= y < self.h):
+            return
+        row, width = self.cells[y], char_width(ch)
+        if width == 2 and x + 1 >= self.w:
+            ch, width = " ", 1          # a wide glyph that would straddle the right edge is not drawn
+        self._blank_partner(row, x)
+        if width == 2:
+            self._blank_partner(row, x + 1)
+        row[x] = (ch, style)
+        if width == 2:
+            row[x + 1] = ("", style)    # continuation cell: contributes no column of its own
+
+    @staticmethod
+    def _blank_partner(row: list[tuple[str, str | None]], x: int) -> None:
+        """Overwriting one half of a wide glyph blanks the other half so no orphan half is left."""
+        if row[x][0] == "" and x > 0:
+            row[x - 1] = (" ", row[x - 1][1])
+        elif char_width(row[x][0]) == 2 and x + 1 < len(row):
+            row[x + 1] = (" ", row[x + 1][1])
 
     def text(self, x: int, y: int, s: str, style: str | None = None, limit: int | None = None) -> None:
-        for i, ch in enumerate(s):
-            if limit is not None and i >= limit:
+        col = 0
+        for ch in s:
+            if _drop(ch):
+                continue
+            width = char_width(ch)
+            if limit is not None and col + width > limit:
                 break
-            self.put(x + i, y, ch, style)
+            self.put(x + col, y, ch, style)
+            col += width
 
     def at(self, x: int, y: int) -> str:
-        return self.cells[y][x][0] if 0 <= x < self.w and 0 <= y < self.h else " "
+        if not (0 <= x < self.w and 0 <= y < self.h):
+            return " "
+        return self.cells[y][x][0] or "\x00"
 
     def lines(self, color: bool) -> list[str]:
         out = []
@@ -289,8 +346,8 @@ def edge_label(edge: dict, room: int) -> str:
     task = clean(edge.get("task_id") or "", 40)
     if not task:
         return verb
-    left = room - len(verb) - 3
-    return f"{verb} · {task if len(task) <= left else task[:max(left - 1, 3)] + '…'}" if left >= 4 else verb
+    left = room - cell_width(verb) - 3
+    return f"{verb} · {task if cell_width(task) <= left else fit(task, max(left - 1, 3)) + '…'}" if left >= 4 else verb
 
 
 def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, opts: RenderOpts,
@@ -301,7 +358,7 @@ def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, o
     nw = min(nw, max(w - 2, 8))
     if not agents:
         msg = "no agents reported yet" if snapshot.get("counts", {}).get("agents", 0) == 0 else "no agents visible"
-        cv.text(max((w - len(msg)) // 2, 0), h // 2, msg, "dim")
+        cv.text(max((w - cell_width(msg)) // 2, 0), h // 2, msg, "dim")
         return cv.lines(opts.color)
     ring = ring_fits(len(agents), w, h, 22, nh)
     if ring:
@@ -352,8 +409,8 @@ def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, o
             cv.put(hx + hw - 1, hy + row, r, "dim")
             for c in range(1, hw - 1):
                 cv.put(hx + c, hy + row, m, "dim")
-        cv.text(hx + 2, hy, f" {title} "[:hw - 4], "cyan")
-        cv.text(hx + max((hw - len(sub)) // 2, 1), hy + 1, sub[:hw - 2], "cyan")
+        cv.text(hx + 2, hy, fit(f" {title} ", hw - 4), "cyan")
+        cv.text(hx + max((hw - cell_width(sub)) // 2, 1), hy + 1, fit(sub, hw - 2), "cyan")
     for i, a in enumerate(agents):
         draw_node(cv, a, boxes[a["node_id"]], i == focus % len(agents), opts, compact, snapshot, mode)
     for edge, path, color in drawn:     # labels go on the longest straight run, on a free row/column beside the line
@@ -371,12 +428,12 @@ def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, o
             for run in sorted(runs, key=len, reverse=True):
                 x0, y0, d = run[0]
                 if d == "h":
-                    xs = min(x0, run[-1][0]) + (len(run) - len(text)) // 2
+                    xs = min(x0, run[-1][0]) + (len(run) - cell_width(text)) // 2
                     spots = [(xs, y0 - 1), (xs, y0 + 1)]
                 else:
                     rows = sorted((c[1] for c in run), key=lambda r: abs(r - run[len(run) // 2][1]))
-                    spots = [(sx, r) for r in rows for sx in (x0 + 2, x0 - 1 - len(text))]
-                spot = next(((x, y) for x, y in spots if all(free(x + i, y) for i in range(len(text)))), None)
+                    spots = [(sx, r) for r in rows for sx in (x0 + 2, x0 - 1 - cell_width(text))]
+                spot = next(((x, y) for x, y in spots if all(free(x + i, y) for i in range(cell_width(text)))), None)
                 if spot:
                     cv.text(spot[0], spot[1], text, color)
                     placed = True
@@ -415,7 +472,7 @@ def draw_node(cv: Canvas, agent: dict, box: tuple[int, int, int, int], focused: 
     inner = w - 4
     dot = _STATE_DOT.get(state, "?") if opts.unicode else {"working": "*", "idle": "o", "blocked": "!"}.get(state, "?")
     shown_state = _ABBR.get(state, state) if compact else state
-    rows = [f"{dot} {'▸' if focused and opts.unicode else '>' if focused else ''}{node_name(agent)}", f"{clean(agent.get('model') or 'model ?', max(inner - len(shown_state) - 1, 4))} {clean(shown_state, 9)}"]
+    rows = [f"{dot} {'▸' if focused and opts.unicode else '>' if focused else ''}{node_name(agent)}", f"{clean(agent.get('model') or 'model ?', max(inner - cell_width(shown_state) - 1, 4))} {clean(shown_state, 9)}"]
     if not compact or h >= 4:
         rows.append(context_bar(agent.get("context"), inner, opts))
     if mode == "ownership":
@@ -428,7 +485,7 @@ def draw_node(cv: Canvas, agent: dict, box: tuple[int, int, int, int], focused: 
     ctx_style = None if pct is None else "red" if pct >= 90 else "yellow" if pct >= 70 else "green"   # unknown stays unstyled
     for i, text in enumerate(rows[:h - 2]):
         if i == 0 and focused:      # visible focus: the whole name row in reverse video (marker + bold frame without colour)
-            cv.text(x + 1, y + 1, (" " + text).ljust(w - 2)[:w - 2], color + "+rev")
+            cv.text(x + 1, y + 1, pad(" " + text, w - 2), color + "+rev")
             continue
         cv.text(x + 2, y + 1 + i, text, color if i == 0 else ctx_style if i == 2 else None, limit=inner)
 
@@ -439,15 +496,15 @@ def boxed(title: str, body: list[str], w: int, h: int, opts: RenderOpts, active:
     tl, tr, bl, br, hz, vt = ("╭", "╮", "╰", "╯", "─", "│") if opts.unicode else ("+", "+", "+", "+", "-", "|")
     if active:
         tl, tr, bl, br, hz, vt = ("┏", "┓", "┗", "┛", "━", "┃") if opts.unicode else ("#", "#", "#", "#", "=", "#")
-    cap = f" {title} "[:max(w - 4, 0)]
-    out = [tl + cap + hz * max(w - 2 - len(cap), 0) + tr]
+    cap = fit(f" {title} ", max(w - 4, 0))
+    out = [tl + cap + hz * max(w - 2 - cell_width(cap), 0) + tr]
     window = body[scroll:scroll + max(h - 2, 0)]
     for line in window:
-        out.append(vt + line[:w - 2].ljust(w - 2) + vt)
+        out.append(vt + pad(line, w - 2) + vt)
     while len(out) < h - 1:
         out.append(vt + " " * (w - 2) + vt)
     out.append(bl + hz * (w - 2) + br)
-    return [l[:w] for l in out[:h]]
+    return [fit(l, w) for l in out[:h]]
 
 
 def task_lines(snapshot: dict, w: int) -> list[str]:
@@ -461,7 +518,7 @@ def task_lines(snapshot: dict, w: int) -> list[str]:
 
 def agent_lines(snapshot: dict, w: int, opts: RenderOpts) -> list[str]:
     """name / model / state / context columns sized so ``attention`` and a 9-character model fit untruncated."""
-    rows = [clean(f"{node_name(a):<8.8} {clean(a.get('model') or 'model ?', 10):<10} {clean(a.get('state'), 9):<9} "
+    rows = [clean(f"{pad(node_name(a), 8)} {pad(clean(a.get('model') or 'model ?', 10), 10)} {pad(clean(a.get('state'), 9), 9)} "
                   f"{context_pct(a['context']) if isinstance(a.get('context'), dict) and context_pct(a['context']) else 'ctx ?'}", w - 2)
             for a in snapshot.get("agents") or []]
     return rows or ["no agents"]
@@ -496,7 +553,7 @@ def timeline_bar(snapshot: dict, w: int, opts: RenderOpts) -> list[str]:
         cells[min(int(i / max(n - 1, 1) * (w - 1)), w - 1)] = "▼" if opts.unicode else "V"
     caption = (f"replay {opts.replay_pos[0] + 1}/{opts.replay_pos[1]}" + (" paused" if opts.replay_paused else " playing")
                if opts.replay_pos else (f"live · {hhmmss(stamps[-1])}" if stamps else "live · no events"))
-    return ["".join(cells), caption[:w]]
+    return ["".join(cells), fit(caption, w)]
 
 
 def legend(opts: RenderOpts) -> str:
@@ -590,15 +647,17 @@ def render(snapshot: dict, width: int, height: int, mode: str = "activity", focu
 
 def _trim(line: str, width: int) -> str:
     out, n, i = [], 0, 0
-    while i < len(line) and n < width:
+    while i < len(line):
         m = _ANSI.match(line, i)
         if m:
             out.append(m.group())
             i = m.end()
-        else:
-            out.append(line[i])
-            n += 1
-            i += 1
+            continue
+        n += char_width(line[i])
+        if n > width:
+            break
+        out.append(line[i])
+        i += 1
     return "".join(out) + (RESET if "\x1b" in line else "")
 
 
@@ -609,7 +668,7 @@ def _render(snapshot: dict, width: int, height: int, mode: str, focus: int, tick
     if mode == "replay" and opts.status == "live":
         status = "REPLAY"
     hint = (HINTS if opts.unicode else HINTS_ASCII) if width >= 100 else (HINTS_SHORT if opts.unicode else HINTS_SHORT_ASCII)
-    footer = hint[:width]
+    footer = fit(hint, width)
     footer = style_line(footer, "dim", opts)
     header_style = STATUS_COLOR.get(opts.status, "white")
     summary = (f"{counts.get('agents', len(agents))} agents  {counts.get('rooms', 0)} rooms  "
@@ -621,7 +680,7 @@ def _render(snapshot: dict, width: int, height: int, mode: str, focus: int, tick
         return _render_narrow(snapshot, width, height, mode, focus, opts, status, footer)
     title = "HERDR / AGENT OPERATIONS" if width >= 80 else "AGENT OPS"
     head = f"{title}  [{status}]  {mode_title(mode)}" + ("  filter:" + opts.filter_kind if opts.filter_kind else "")
-    header = [style_line(head[:width], header_style + "+bold", opts), style_line(summary[:width], "dim", opts)]
+    header = [style_line(fit(head, width), header_style + "+bold", opts), style_line(fit(summary, width), "dim", opts)]
     if opts.overlay:
         return header + overlay_lines(snapshot, width, height - 3, focus, opts) + [footer]
     full = width >= 100 and height >= 30
@@ -647,13 +706,13 @@ def _render(snapshot: dict, width: int, height: int, mode: str, focus: int, tick
     strip = 6 if height >= 20 else 3
     mh = height - 2 - strip - 3
     map_lines = draw_map(snapshot, width, mh, mode, focus, tick, opts, compact=True)
-    lg = style_line(legend(opts)[:width], "dim", opts)
+    lg = style_line(fit(legend(opts), width), "dim", opts)
     half = width // 2
     left = boxed("Tasks", task_lines(snapshot, half), half, strip, opts, opts.pane == "tasks", opts.scroll if opts.pane == "tasks" else 0)
     right = boxed("Activity", activity_lines(snapshot, width - half), width - half, strip, opts, opts.pane == "activity",
                   opts.scroll if opts.pane == "activity" else 0)
     tl = timeline_bar(snapshot, width, opts)
-    return header + map_lines + [lg] + join_columns(left, right, half) + [style_line(tl[0][:width], "dim", opts), footer]
+    return header + map_lines + [lg] + join_columns(left, right, half) + [style_line(fit(tl[0], width), "dim", opts), footer]
 
 
 def _boxed_ansi(title: str, inner: list[str], w: int, h: int, opts: RenderOpts, active: bool, foot: str) -> list[str]:
@@ -661,12 +720,12 @@ def _boxed_ansi(title: str, inner: list[str], w: int, h: int, opts: RenderOpts, 
     tl, tr, bl, br, hz, vt = ("╭", "╮", "╰", "╯", "─", "│") if opts.unicode else ("+", "+", "+", "+", "-", "|")
     if active:
         tl, tr, bl, br, hz, vt = ("┏", "┓", "┗", "┛", "━", "┃") if opts.unicode else ("#", "#", "#", "#", "=", "#")
-    cap = f" {title} "[:max(w - 4, 0)]
-    out = [tl + cap + hz * max(w - 2 - len(cap), 0) + tr]
+    cap = fit(f" {title} ", max(w - 4, 0))
+    out = [tl + cap + hz * max(w - 2 - cell_width(cap), 0) + tr]
     for i in range(h - 3):
         line = inner[i] if i < len(inner) else ""
         out.append(vt + line + " " * max(w - 2 - visible_width(line), 0) + vt)
-    out.append(vt + style_line(foot[:w - 2].ljust(w - 2), "dim", opts) + vt)
+    out.append(vt + style_line(pad(foot, w - 2), "dim", opts) + vt)
     out.append(bl + hz * (w - 2) + br)
     return out
 
@@ -674,14 +733,14 @@ def _boxed_ansi(title: str, inner: list[str], w: int, h: int, opts: RenderOpts, 
 def _render_narrow(snapshot: dict, width: int, height: int, mode: str, focus: int, opts: RenderOpts, status: str,
                    footer: str) -> list[str]:
     agents = snapshot.get("agents") or []
-    lines = [style_line(f"AGENT OPS [{status}] {mode_title(mode)}"[:width], STATUS_COLOR.get(opts.status, "white") + "+bold", opts)]
+    lines = [style_line(fit(f"AGENT OPS [{status}] {mode_title(mode)}", width), STATUS_COLOR.get(opts.status, "white") + "+bold", opts)]
     if opts.overlay:
         return lines + overlay_lines(snapshot, width, height - 2, focus, opts) + [style_line("q quit Esc close"[:width], "dim", opts)]
     for i, a in enumerate(agents):
         state = str(a.get("state") or "unknown")
         mark = ">" if i == focus % max(len(agents), 1) else " "
         row = f"{mark}{_STATE_DOT.get(state, '?') if opts.unicode else state[:1]} {node_name(a)} {clean(a.get('model') or 'model ?', 10)} {context_bar(a.get('context'), 8, opts)}"
-        lines.append(style_line(row[:width], _STATE_COLOR.get(state, "gray"), opts))
+        lines.append(style_line(fit(row, width), _STATE_COLOR.get(state, "gray"), opts))
     for e in visible_edges(snapshot, mode, opts.filter_kind):
         lines.append(clean(f" {e['kind'][:5]} {e['from']}→{e['to']} {'~' if is_planned(e) else ''}{e.get('state')}", width))
     lines += [clean(" " + l, width) for l in task_lines(snapshot, width)]

@@ -406,3 +406,53 @@ def test_real_room_becomes_the_hub_header():
         assert not tui.Client(server.url, "view-key").get("snapshot")["rooms"]
     finally:
         server.stop()
+
+
+# ---------------------------------------------------------------- N4/N5: adversarial text never breaks layout
+BIDI = "‪‫‬‭‮⁦⁧⁨⁩‎‏؜"
+ZERO = "​‌‍⁠﻿­"
+EVIL = ["‮evil‬" + ZERO + "name", "日本語エージェント名前長い", "🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂", "a" + ZERO * 5 + BIDI + "b", "é́́x"]
+
+
+def test_clean_strips_bidi_and_zero_width_and_counts_cells():
+    assert tui.clean("a" + BIDI + ZERO + "b") == "ab"
+    assert tui.clean("日本語", 40) == "日本語" and tui.cell_width("日本語") == 6
+    assert tui.cell_width(tui.clean("日本語エージェント" * 3, 10)) <= 10
+    assert tui.clean("日本語エージェント" * 3, 10).endswith("…")
+    assert tui.clean("🙂" * 30, 9) == "🙂" * 4 + "…"          # never half an emoji: 4 x 2 cells + ellipsis = 9
+    assert tui.clean("x" * 50, 10) == "x" * 9 + "…"
+
+
+def test_truncation_happens_after_sanitising_so_no_sequence_is_split():
+    text = "ab\x1b[31mcd\x1b[0mefghij"
+    out = tui.clean(text, 8)
+    assert "\x1b" not in out and tui.cell_width(out) <= 8
+    assert tui.clean("a‮" + "b" * 20, 5) == "abbb…"        # the control chars do not eat the budget
+
+
+@pytest.mark.parametrize("w,h", [(120, 40), (80, 24), (50, 20)])
+def test_adversarial_labels_never_break_the_layout(w, h):
+    agents = [agent(f"n{i}", label=label, model=label, ctx={"used": 50, "limit": 100, "source": None}) for i, label in enumerate(EVIL)]
+    data = snap(agents, [edge("delegation", "n0", "n1"), edge("handoff", "n2", "n3", task=EVIL[1])])
+    data["tasks"][0]["task_id"] = EVIL[0]
+    for opts in (UNI, ASCII, RenderOpts(color=True)):
+        lines = render(data, w, h, opts=opts)
+        assert len(lines) == h
+        text = plain(lines)
+        assert not any(c in text for c in BIDI + ZERO)
+        assert all(visible_width(l) <= w for l in lines)
+        if w >= 100:   # framed rows keep their right border in one column
+            assert {visible_width(l) for l in lines[2:-1]} == {w}
+
+
+def test_canvas_wide_glyph_occupies_two_cells_and_is_never_split():
+    cv = tui.Canvas(6, 1)
+    cv.text(0, 0, "日本語", limit=5)
+    assert cv.lines(False)[0] == "日本"                       # a third wide glyph would need cells 4-5 > limit 5
+    cv = tui.Canvas(3, 1)
+    cv.text(2, 0, "日")
+    assert visible_width(cv.lines(False)[0]) <= 3 and "日" not in cv.lines(False)[0]
+    cv = tui.Canvas(4, 1)
+    cv.text(0, 0, "日日")
+    cv.put(1, 0, "x")                                           # overwriting half a glyph blanks the other half
+    assert cv.lines(False)[0] == " x日"
