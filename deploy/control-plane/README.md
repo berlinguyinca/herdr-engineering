@@ -106,7 +106,7 @@ an invalid set keeps the last good one, or refuses events with 503 if none was e
 `deployment_actions` (exactly `true` enables the audited Deployments actions; read live, and off while the
 file is unusable unless `config_failure_mode: last_good` — see "Deployment actions" below), `inspector_limits` (`max_events`,
 `max_bytes`, `max_sessions`, `max_total_bytes`, `retention_hours`, `reasoning_role`,
-`sensitive_role`, `store_reasoning`), `inspector_snapshots` (`enabled`, default off;
+`sensitive_role`, `store_reasoning`), `inspector_history` (`enabled`, default true; `page_size` default 100, `max_page_size` default 500, both 1-1000: `GET /api/v1/sessions/{id}/inspector/history?before=<next_cursor>&limit=&view=` reads inspector events older than the 24h in-memory ring from Postgres, one page at a time, newest first, role-gated like the ring; nothing is loaded at boot or put into the ring; 503 when no durable history is attached; unknown keys are rejected), `inspector_snapshots` (`enabled`, default off;
 `interval_seconds`, default 600, at least 60: the worker keeps a replay snapshot of the inspector so a boot
 replays only newer events instead of every stored one; see "Inspector snapshots" below), `artifact_reconcile` (`enabled`, default off; the **worker** runs the artifact registry's idempotent repair pass every `interval_seconds`, default 300, at least 60: orphan blobs are marked after `orphan_ttl_hours` (default 24) and never deleted, expired uploads are closed, tombstones past their hold window are purged; `grace_seconds` default 60, `limit` default 100; it does not re-emit lineage, the worker has no graph emitter) and `llm_proxy` (`max_inflight`,
 `queue_wait_seconds`, `raw_retention_days` (default 14: the web server drops older
