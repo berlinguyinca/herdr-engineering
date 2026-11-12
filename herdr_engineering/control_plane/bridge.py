@@ -869,8 +869,9 @@ def _load_full_into(repo, source: DurableSource, *, core_override=None,
         "hosts": hosts, "artifacts": artifacts, "blobs": {}, "leases": {},
         "telemetry": (projection_state or {}).get('telemetry', {}),
         "events": events, "event_order": event_order,
-        "inspector_snapshot": source.inspector_snapshot() if isinstance(source, PostgresSource) else None,
-        "inspector_backfill": source.inspector_backfill if isinstance(source, PostgresSource) else None,
+        "inspector_snapshot": (source.inspector_snapshot()
+                               if callable(getattr(source, "inspector_snapshot", None)) else None),
+        "inspector_backfill": getattr(source, "inspector_backfill", None),
     }
     for key in ('leases', 'scheduler_reservations', 'scheduler_leases'):
         if key in (projection_state or {}):

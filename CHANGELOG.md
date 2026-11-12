@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Inspector snapshot boot: used on the complete-replay fallback, strictly validated
+
+- With projection checkpoints on (the default), a missing or rejected checkpoint fell back to a complete replay that ignored `inspector_snapshots` and re-ran every stored inspector row through redaction. That fallback now hands the stored snapshot to the repo, which verifies it by count and ordering and replays everything on any doubt.
+- `control_plane.inspector_snapshots` is validated in `fleet_config.py`: `enabled` must be a boolean, `interval_seconds` a number >= 60, unknown keys are rejected (previously a bad interval was silently replaced by 600). Default stays off.
+
 ### Auto-join hook no longer dies silently on a loaded host
 - `summary join-hook` ran the join under a 12 s kill-timeout through `python -m herdr_engineering.cli`; on a loaded host that start alone took 3-40 s, so the join was killed and the session printed nothing. It now starts the CLI directly, waits up to 8 s, and past that leaves the (idempotent) join running detached and says "still running in the background". Test: a real listener that never answers.
 
