@@ -387,6 +387,22 @@ class PostgresSource(DurableSource):
             return self._run(DurableHistoryReader(self._conn, events_table=self._events_table).page(
                 entity_type, entity_id, limit=limit, before=before))
 
+    def inspector_page(self, session_id, *, limit, before=None, cutoff=None, kinds=None):
+        """One bounded page of durable inspector rows older than the ring (see inspector_history)."""
+        from .inspector_history import fetch_page
+        table = '"' + str(self._events_table).replace('"', '""') + '"'
+
+        async def read():
+            if self._conn is None or self._conn.is_closed():
+                if self._dsn is None:
+                    raise ValueError("PostgresSource needs a conn or dsn")
+                import asyncpg
+                self._conn = await asyncpg.connect(self._dsn)
+            return await fetch_page(self._conn, table, session_id, limit=limit, before=before,
+                                    cutoff=cutoff, kinds=kinds)
+        with self._query_lock:
+            return self._run(read())
+
     def history_stream(self, entity_type, entity_id):
         from .durable_history import DurableHistoryReader
         with self._query_lock:
