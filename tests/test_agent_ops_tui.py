@@ -2,6 +2,7 @@
 import hashlib
 import http.client
 import json
+import re
 import threading
 
 import pytest
@@ -242,7 +243,8 @@ class LiveServer:
         from herdr_engineering.control_plane.repo import ControlPlaneRepo
         self.repo = ControlPlaneRepo()
         auth = StaticTokenAuthenticator({"alice": hashlib.sha256(b"tok-alice-0123456789").hexdigest()})
-        self.srv = ControlPlaneServer(self.repo, host="127.0.0.1", port=0, collab=CollabService(auth),
+        self.collab = CollabService(auth)
+        self.srv = ControlPlaneServer(self.repo, host="127.0.0.1", port=0, collab=self.collab,
                                       api_keys={"op-key": "operator", "view-key": "viewer"},
                                       agent_ops_config={"enabled": True})
         self.srv.agent_ops_poll_seconds = 0.1
@@ -351,5 +353,56 @@ def test_interactive_pane_in_a_real_pty_against_the_real_server():
         text = seen.decode("utf-8", "replace")
         for needle in ("[LIVE]", "HANDOFFS AND DELEGATIONS", "KEYS", "REPLAY", "model ?"):
             assert needle in text, needle
+    finally:
+        server.stop()
+
+
+def test_agents_panel_spells_out_attention_and_long_models():
+    data = snap([agent("opus", state="attention", model="claude-opus")], [])
+    text = plain(render(data, 120, 40, opts=UNI))
+    assert "attention" in text and "claude-opu" in text and "attn" not in text.split("Agents")[1]
+
+
+def test_ring_layout_surrounds_a_hub_and_labels_keep_the_kind():
+    names = ["top", "left", "right", "bottom"]
+    data = snap([agent(n) for n in names], [edge("delegation", "top", "right", "accepted", task="api-impl-long")])
+    lines = plain(render(data, 120, 40, opts=RenderOpts(pane="none"))).splitlines()
+    text = "\n".join(lines)
+    assert "ops hub" in text and "4 agents" in text
+    pos = [next((r, l.index(n)) for r, l in enumerate(lines) if re.search(rf"[●◆○◇] ▸?{n}\b", l)) for n in names]
+    assert len({p[0] for p in pos}) >= 3 and len({p[1] for p in pos}) >= 3   # top / sides / bottom, not corner-pinned
+    assert "delegate" in text and "deleg:" not in text
+
+
+def test_focus_is_visible_without_colour_and_in_reverse_video_with_it():
+    data = snap([agent("a"), agent("b"), agent("c")], [])
+    assert "▸a" in plain(render(data, 120, 40, focus=0, opts=UNI)) and "▸b" not in plain(render(data, 120, 40, focus=0, opts=UNI))
+    assert "\x1b[" in "\n".join(render(data, 120, 40, focus=1, opts=RenderOpts(color=True)))
+    assert "7" in "".join(re.findall(r"\x1b\[([0-9;]*)m", "\n".join(render(data, 120, 40, focus=1, opts=RenderOpts(color=True)))))
+
+
+def test_pulse_moves_with_the_tick_and_holds_still_under_reduced_motion():
+    data = snap([agent("a"), agent("b"), agent("c")], [edge("delegation", "a", "b", "accepted")])
+    frames = {plain(render(data, 120, 40, tick=t, opts=RenderOpts(pane="none", reduced_motion=False))) for t in range(4)}
+    still = {plain(render(data, 120, 40, tick=t, opts=RenderOpts(pane="none", reduced_motion=True))) for t in range(4)}
+    assert len(frames) > 1 and len(still) == 1
+
+
+def test_real_room_becomes_the_hub_header():
+    from herdr_engineering.control_plane.collab import Principal
+    server = LiveServer()
+    try:
+        alice = Principal("user", "alice", "alice")
+        project = server.collab.create_project(alice, {"name": "proj"})
+        room = server.collab.create_room(alice, project["project_id"], {"name": "war-room"})["room_id"]
+        for n, who in enumerate(("a1", "a2", "a3"), 1):
+            ingest(server.repo, n, "session.started", agent_id=who, session_id=who, room_id=room, visibility_scope="room")
+        ingest(server.repo, 9, "message.sent", agent_id="a1", session_id="a1", room_id=room, visibility_scope="room",
+               payload={"target_agent_id": "a2"})
+        snapshot = tui.Client(server.url, "view-key", "tok-alice-0123456789").get("snapshot")
+        assert [r["room_id"] for r in snapshot["rooms"]] == [room]
+        text = plain(render(snapshot, 120, 40, opts=UNI))
+        assert "3 members" in text and f"room …{room[-6:]}" in text
+        assert not tui.Client(server.url, "view-key").get("snapshot")["rooms"]
     finally:
         server.stop()

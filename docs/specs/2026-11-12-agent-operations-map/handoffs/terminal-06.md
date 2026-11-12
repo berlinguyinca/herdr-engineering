@@ -34,14 +34,21 @@ Reference: glowing ring of circular nodes around a room hub, ctx rings, labelled
 Agent-status panels, timeline strip, key footer. Ours keeps the information architecture (map hero, Tasks, Agents,
 Activity, Timeline, key footer, status) in character cells. Differences by necessity: boxes instead of circles, no glow,
 no provider icons, ctx as a bar (amber >=70%, red >=90%) not a ring.
-Iteration 1 (ring layout -> grid): the ellipse ring made edges hug nodes and overlap; an even grid with Z-routed edges,
-per-node lanes, deferred labels and no self-edges made edges legible. Iteration 2: model text clipped to fit, ctx colouring,
-focus marker `▸` instead of a heavy border (which collided with the handoff glyph).
+Polish pass (after review of the first captures): 3-8 agents now sit on an ellipse (top/right/bottom/left) around a central
+hub drawn as a dotted box (`room …<id tail>` + member count from `rooms[]`, else `ops hub`); 1-2 agents or panes too small
+for the ring use the even grid. Edges are routed by a small Dijkstra over free cells (few turns, never through nodes or the
+hub, heavy cost for running along another edge, cheap crossings), so no long shared trunks. Labels spell the kind
+(`delegate · api-impl`, `~review · …` when planned) and only the task id shrinks; they sit beside the longest clear run.
+Focus is a reverse-video name row plus `▸`; the Agents panel columns fit `attention` and 10-char models; compact nodes
+abbreviate `attention` to `attn`. The pulse `◉` travels the active edge each tick (static mid-edge under reduced motion).
+Capture now seeds a real collab room (alice token) so the hub header is in the goldens and in a real-server test.
+
+Honest gap vs reference 03: boxes not circles, no glow/ctx rings/icons; opposite nodes (top-bottom) still need a long
+edge past the hub, and edges can run close to node borders at 80x24. Edge geometry is good but not as polished as the mock.
 
 ## Limitations
-- No room cluster in the capture (seed has no collab rooms): room headers (`room <id>`) render from `room_ids` but are
-  covered only by code path, not by a golden. Click/double-click-to-open-pane and Herdr pane sync are not implemented (no socket).
-- Edge routing is orthogonal and heuristic: edges that share a corridor can still overlap with 5+ agents; the 7+ agent grid scrolls rows by focus.
+- Click/double-click-to-open-pane and Herdr pane sync are not implemented (no socket).
+- Routing is a per-edge greedy search (order-dependent); 9+ agents fall back to the scrolling grid, where edges can crowd.
 - Filters are edge-kind only (room/host/model/time filters from the spec are not in the TUI); the timeline bar is derived
   from edge/model-change timestamps in the snapshot, not from raw events.
 - Replay play-through steps one event per tick (0.25s) while unpaused; speed control is not implemented.

@@ -1,18 +1,18 @@
 HERDR / AGENT OPERATIONS  [LIVE]  Activity
-4 agents  0 rooms  5 edges  2 tasks
-╭──────────────────╮                                        ╭──────────────────╮
-│ ● ▸claude        │━━━◉━━━━━━━━━━━━━━━━                    │ ● codex          │
-│ opus-4.1 working │›──────────────────┃commu:ui────────◉───│ gpt-4o working   │
-│ [████████░░] 82% │╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍╍┃╍~deleg:ui╍╍╍╍╍╍╍╍╍▶│ ctx ?            │
-╰──────────────────╯                   ┃                    ╰──────────────────╯
-                                       ┃deleg:api-i…                            
-╭──────────────────╮                   ┃                    ╭──────────────────╮
-│ ▲ opus           │                   ┃━━━━━━━━━━━━━━━━━━━▶│ ● qwen           │
-│ model… attention │◇┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄~revie:api-i…┄┄┄┄┄┄┄│ qwen3-7… working │
-│ ctx ?            │                                        │ [███████░░░] 68% │
-╰──────────────────╯                                        ╰──────────────────╯
-                                                                                
-                                                                                
+4 agents  1 rooms  5 edges  2 tasks
+                             ╭────────────────────╮                             
+                    delegate │ ● ▸claude          │                             
+                   ━━━━━━◉━━━│ opus-4.1 working   │╍╍╍╍╍╍╍╍╍╍                   
+                   ▶         │ [██████████░░] 82% │›│       ▶ ~delegate · ui    
+╭────────────────────╮       ╰────────────────────╯ │     ╭────────────────────╮
+│ ● qwen             │         ╭┈ room …zrsvch ┈╮   ──◉───│ ● codex            │
+│ qwen3-72b working  │         ┊   4 members    ┊  message│ gpt-4o working     │
+│ [████████░░░░] 68% │┄┄┄┄┄┄   ╰┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈╯         │ ctx ?              │
+╰────────────────────╯     ┆ ╭────────────────────╮       ╰────────────────────╯
+        ~review · api-impl ┆◇│ ▲ opus             │                             
+                             │ model ? attn       │                             
+                             │ ctx ?              │                             
+                             ╰────────────────────╯                             
 ──›comm ━━▶dele ══⇒hand ──◇revi ┈┈●owne  ╌╌ planned
 ╭ Tasks ───────────────────────────────╮╭ Activity ────────────────────────────╮
 │api-impl owner:claude                 ││12:43:18 communication codex → claude…│

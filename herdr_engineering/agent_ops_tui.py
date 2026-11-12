@@ -186,10 +186,13 @@ def mode_title(mode: str) -> str:
 
 
 # ------------------------------------------------------------------------------------------------- map layout
-def layout_nodes(count: int, w: int, h: int, nw: int, nh: int) -> list[tuple[int, int]]:
+_VERB = {"communication": "message", "delegation": "delegate", "handoff": "handoff", "review": "review", "ownership": "owns"}
+_ABBR = {"attention": "attn", "disconnected": "disc"}
+Box = tuple[int, int, int, int]
+
+
+def layout_grid(count: int, w: int, h: int, nw: int, nh: int) -> list[tuple[int, int]]:
     """Top-left corners on an even grid spread across (w, h); stacked tightly (and scrolled) when it cannot fit."""
-    if count == 0:
-        return []
     cols = 1 if count == 1 else 2 if count <= 4 else 3 if count <= 9 else max(1, w // (nw + 2))
     cols = max(1, min(cols, w // (nw + 1)))
     rows = -(-count // cols)
@@ -203,102 +206,189 @@ def layout_nodes(count: int, w: int, h: int, nw: int, nh: int) -> list[tuple[int
     return out
 
 
-def route(a: tuple[int, int, int, int], b: tuple[int, int, int, int], lane: int = 0) -> list[tuple[int, int, str]]:
-    """Orthogonal path (x, y, 'h'|'v') from box a to box b, leaving/entering through the facing sides."""
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    acx, acy, bcx, bcy = ax + aw // 2 + lane * 2, ay + ah // 2 + lane, bx + bw // 2 + lane * 2, by + bh // 2 + lane
-    path: list[tuple[int, int, str]] = []
-    if ax + aw < bx or bx + bw < ax:
-        sx = ax + aw if bcx > acx else ax - 1
-        ex = bx - 1 if bcx > acx else bx + bw
-        y0, y1 = acy, bcy
-        step = 1 if ex >= sx else -1
-        mid = (sx + ex) // 2
-        for x in range(sx, mid + step, step):
-            path.append((x, y0, "h"))
-        for y in range(y0, y1 + (1 if y1 >= y0 else -1), 1 if y1 >= y0 else -1):
-            if y != y0:
-                path.append((mid, y, "v"))
-        for x in range(mid + step, ex + step, step):
-            path.append((x, y1, "h"))
-    else:
-        sy = ay + ah if bcy > acy else ay - 1
-        ey = by - 1 if bcy > acy else by + bh
-        step = 1 if ey >= sy else -1
-        mid = (sy + ey) // 2
-        for y in range(sy, mid + step, step):
-            path.append((acx, y, "v"))
-        for x in range(acx, bcx + (1 if bcx >= acx else -1), 1 if bcx >= acx else -1):
-            if x != acx:
-                path.append((x, mid, "h"))
-        for y in range(mid + step, ey + step, step):
-            path.append((bcx, y, "v"))
-    return path
+def ring_fits(count: int, w: int, h: int, nw: int, nh: int) -> bool:
+    return 3 <= count <= 8 and w >= nw * 2 + 8 and h >= nh * 2 + 1 and (count <= 4 or (w >= nw * 3 + 6 and h >= nh * 3))
+
+
+def layout_ring(count: int, w: int, h: int, nw: int, nh: int) -> list[tuple[int, int]]:
+    """Agents on an ellipse around the central hub: top, right, bottom, left for four (two sit left and right)."""
+    import math
+    if count == 1:
+        return [((w - nw) // 2, 0)]
+    cx, cy, rx, ry = (w - nw) / 2, (h - nh) / 2, (w - nw) / 2, (h - nh) / 2
+    start = math.pi if count == 2 else -math.pi / 2
+    return [(round(cx + rx * math.cos(start + 2 * math.pi * i / count)),
+             round(cy + ry * math.sin(start + 2 * math.pi * i / count))) for i in range(count)]
+
+
+def route(a: Box, b: Box, blocked: set[tuple[int, int]], occupied: dict[tuple[int, int], str],
+          w: int, h: int) -> list[tuple[int, int, str]]:
+    """Cheapest orthogonal (x, y, 'h'|'v') path from box a to box b over free cells (Dijkstra): few turns, no walking
+    through nodes or the hub, and a heavy cost for running along a cell another edge already uses (crossing is cheap).
+    Returns [] when no path exists (e.g. the nodes are boxed in)."""
+    import heapq
+
+    def ring(box: Box) -> dict[tuple[int, int], int]:
+        x, y, bw, bh = box
+        cells = {(x + bw, y + r): abs(r - bh // 2) for r in range(1, bh - 1)}
+        cells |= {(x - 1, y + r): abs(r - bh // 2) for r in range(1, bh - 1)}
+        cells |= {(x + c, y - 1): abs(c - bw // 2) // 3 for c in range(2, bw - 2)}
+        cells |= {(x + c, y + bh): abs(c - bw // 2) // 3 for c in range(2, bw - 2)}
+        return {c: v for c, v in cells.items() if 0 <= c[0] < w and 0 <= c[1] < h and c not in blocked}
+
+    starts, goals = ring(a), ring(b)
+    margin = {(x + dx, y + dy) for x, y in blocked for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))} - blocked
+    heap: list[tuple[int, int, int, int, int]] = [(cost, x, y, -1, 0) for (x, y), cost in starts.items()]
+    heapq.heapify(heap)
+    best: dict[tuple[int, int, int], int] = {}
+    parent: dict[tuple[int, int, int], tuple[int, int, int] | None] = {(x, y, -1): None for (x, y) in starts}
+    while heap:
+        cost, x, y, d, _ = heapq.heappop(heap)
+        if best.get((x, y, d), 1 << 30) < cost:
+            continue
+        if (x, y) in goals and d != -1:
+            cost += goals[(x, y)]
+            cells = []
+            node: tuple[int, int, int] | None = (x, y, d)
+            while node:
+                cells.append(node)
+                node = parent[node]
+            cells.reverse()
+            out = [(cx, cy, "h" if cd in (0, 1) else "v") for cx, cy, cd in cells]
+            if out:
+                out[0] = (out[0][0], out[0][1], out[1][2] if len(out) > 1 else out[0][2])
+            return out
+        for nd, (dx, dy) in enumerate(((1, 0), (-1, 0), (0, 1), (0, -1))):
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < w and 0 <= ny < h) or (nx, ny) in blocked:
+                continue
+            step = 1 + (3 if d not in (-1, nd) else 0) + (5 if (nx, ny) in margin else 0)
+            seen = occupied.get((nx, ny))
+            if seen:
+                step += 30 if seen == ("h" if nd < 2 else "v") else 4
+            nc = cost + step
+            key = (nx, ny, nd)
+            if nc < best.get(key, 1 << 30):
+                best[key] = nc
+                parent[key] = (x, y, d)
+                heapq.heappush(heap, (nc, nx, ny, nd, 0))
+    return []
+
+
+def hub_text(snapshot: dict, w: int) -> tuple[str, str]:
+    rooms = sorted(snapshot.get("rooms") or [], key=lambda r: (-len(r.get("agent_ids") or []), str(r.get("room_id"))))
+    if rooms:
+        r = rooms[0]
+        return f"room …{clean(r.get('room_id'), 80)[-6:]}", f"{len(r.get('agent_ids') or [])} members"
+    return "ops hub", f"{len(snapshot.get('agents') or [])} agents"
+
+
+def edge_label(edge: dict, room: int) -> str:
+    """'delegate · api-impl': the kind is always spelled out; only the task id is abbreviated to fit ``room`` cells."""
+    verb = ("~" if is_planned(edge) else "") + _VERB.get(edge["kind"], edge["kind"])
+    task = clean(edge.get("task_id") or "", 40)
+    if not task:
+        return verb
+    left = room - len(verb) - 3
+    return f"{verb} · {task if len(task) <= left else task[:max(left - 1, 3)] + '…'}" if left >= 4 else verb
 
 
 def draw_map(snapshot: dict, w: int, h: int, mode: str, focus: int, tick: int, opts: RenderOpts,
              *, compact: bool) -> list[str]:
     cv = Canvas(w, h)
     agents = snapshot.get("agents") or []
-    nw, nh = (20, 5) if compact else (26, 5)
-    nw = min(nw, max((w - 2) // 3, 12) if len(agents) > 2 else max(w - 2, 8))
+    nw, nh = (22, 5) if compact else (26, 5)
+    nw = min(nw, max(w - 2, 8))
     if not agents:
         msg = "no agents reported yet" if snapshot.get("counts", {}).get("agents", 0) == 0 else "no agents visible"
         cv.text(max((w - len(msg)) // 2, 0), h // 2, msg, "dim")
         return cv.lines(opts.color)
-    pos = layout_nodes(len(agents), w, h, nw, nh)
-    # a grid layout may overflow; scroll rows so the focused node stays in view
-    shift = 0
-    if pos and max(y for _, y in pos) + nh > h:
+    ring = ring_fits(len(agents), w, h, 22, nh)
+    if ring:
+        nw = 22
+    pos = layout_ring(len(agents), w, h, nw, nh) if ring else layout_grid(len(agents), w, h, nw, nh)
+    shift = 0   # a grid may overflow; scroll rows so the focused node stays in view
+    if not ring and pos and max(y for _, y in pos) + nh > h:
         shift = max(0, min(pos[focus % len(pos)][1] + nh - h, max(y for _, y in pos) + nh - h))
     boxes = {a["node_id"]: (x, y - shift, nw, nh) for a, (x, y) in zip(agents, pos)}
-    # room cluster headers (membership only), drawn first
-    seen_rooms: dict[str, tuple[int, int]] = {}
-    for a, (x, y) in zip(agents, pos):
-        for room in (a.get("room_ids") or [])[:1]:
-            lo = seen_rooms.get(room, (x, y - shift))
-            seen_rooms[room] = (min(lo[0], x), min(lo[1], y - shift))
-    for room, (rx, ry) in seen_rooms.items():
-        cv.text(rx, max(ry - 1, 0), f"╭ room {clean(room, 14)} ╮" if opts.unicode else f"[room {clean(room, 14)}]", "dim")
-    late: list[tuple[int, int, str, str]] = []
-    lanes: dict[str, int] = {}
+    solid: list[Box] = list(boxes.values())
+    hub: Box | None = None
+    if ring:
+        hw = 18
+        hub = ((w - hw) // 2, (h - 3) // 2, hw, 3)
+        solid.append(hub)
+
+    def free(x: int, y: int, own: str = "") -> bool:
+        if not (0 <= x < w and 0 <= y < h) or any(bx <= x < bx + bw and by <= y < by + bh for bx, by, bw, bh in solid):
+            return False
+        return cv.at(x, y) == " " or cv.at(x, y) in own
+
+    blocked = {(x + i, y + j) for x, y, bw, bh in solid for i in range(bw) for j in range(bh)}
+    occupied: dict[tuple[int, int], str] = {}
+    drawn: list[tuple[dict, list[tuple[int, int, str]], str]] = []
     for edge in visible_edges(snapshot, mode, opts.filter_kind):
         a, b = boxes.get(edge.get("from")), boxes.get(edge.get("to"))
         if not a or not b or edge.get("from") == edge.get("to"):
             continue        # an edge needs two distinct endpoints (a self ownership is shown on the node instead)
-        used = max(lanes.get(edge["from"], 0), lanes.get(edge["to"], 0))
-        lane = (0, 1, -1)[used % 3]                     # edges sharing a node get their own row/column
-        lanes[edge["from"]] = lanes[edge["to"]] = used + 1
+        path = route(a, b, blocked, occupied, w, h)
+        occupied.update({(x, y): d for x, y, d in path})
         color, sh, sv, dh, dv, arrow, ah_, av_, aa = _EDGE[edge["kind"]]
         planned = is_planned(edge)
-        path = route(a, b, lane)
         for i, (x, y, d) in enumerate(path):
             if opts.unicode:
                 ch = (dh if d == "h" else dv) if planned else (sh if d == "h" else sv)
             else:
-                ch = ah_ if d == "h" else av_
-            if planned and not opts.unicode and i % 2:
-                ch = " "
+                ch = " " if planned and i % 2 else (ah_ if d == "h" else av_)
             cv.put(x, y, ch, color)
         if path:
-            ex, ey, ed = path[-1]
-            cv.put(ex, ey, arrow if opts.unicode else aa, color + "+bold")
-            mx, my, _ = path[len(path) // 2]
-            label = clean(edge["kind"][:5] + (":" + edge["task_id"] if edge.get("task_id") else ""), 12)
-            late.append((mx + 1, my, ("~" if planned else "") + label, color))
-            active = not planned and any(
-                (next((x for x in agents if x["node_id"] == n), {}) or {}).get("state") == "working"
-                for n in (edge.get("from"), edge.get("to")))
-            if active and mode != "replay":
-                px, py, _ = path[(len(path) // 2) if opts.reduced_motion else (tick % len(path))]
-                late.append((px, py, "◉" if opts.unicode else "*", color + "+bold"))
+            cv.put(path[-1][0], path[-1][1], arrow if opts.unicode else aa, color + "+bold")
+        drawn.append((edge, path, color))
+    if hub:
+        title, sub = hub_text(snapshot, hub[2])
+        hx, hy, hw, _ = hub
+        tl, tr, bl, br, hz, vt = ("╭", "╮", "╰", "╯", "┈", "┊") if opts.unicode else ("+", "+", "+", "+", ".", ":")
+        for row, (l, m, r) in enumerate(((tl, hz, tr), (vt, " ", vt), (bl, hz, br))):
+            cv.put(hx, hy + row, l, "dim")
+            cv.put(hx + hw - 1, hy + row, r, "dim")
+            for c in range(1, hw - 1):
+                cv.put(hx + c, hy + row, m, "dim")
+        cv.text(hx + 2, hy, f" {title} "[:hw - 4], "cyan")
+        cv.text(hx + max((hw - len(sub)) // 2, 1), hy + 1, sub[:hw - 2], "cyan")
     for i, a in enumerate(agents):
         draw_node(cv, a, boxes[a["node_id"]], i == focus % len(agents), opts, compact, snapshot, mode)
-    for x, y, text, style in late:      # labels and pulses never overwrite a node, only free cells or edge lines
-        for i, ch in enumerate(text):
-            if cv.at(x + i, y) in " ─│━┃═║┄┆╍╏╌╎┈┊-|=!#H~;.:":
-                cv.put(x + i, y, ch, style)
+    for edge, path, color in drawn:     # labels go on the longest straight run, on a free row/column beside the line
+        runs: list[list[tuple[int, int, str]]] = []
+        for cell in path:
+            if runs and runs[-1][-1][2] == cell[2]:
+                runs[-1].append(cell)
+            else:
+                runs.append([cell])
+        if not runs:
+            continue
+        placed = False
+        for room in (40, 20, 0):      # fullest label first; the task id shrinks before the kind does
+            text = edge_label(edge, room)
+            for run in sorted(runs, key=len, reverse=True):
+                x0, y0, d = run[0]
+                if d == "h":
+                    xs = min(x0, run[-1][0]) + (len(run) - len(text)) // 2
+                    spots = [(xs, y0 - 1), (xs, y0 + 1)]
+                else:
+                    rows = sorted((c[1] for c in run), key=lambda r: abs(r - run[len(run) // 2][1]))
+                    spots = [(sx, r) for r in rows for sx in (x0 + 2, x0 - 1 - len(text))]
+                spot = next(((x, y) for x, y in spots if all(free(x + i, y) for i in range(len(text)))), None)
+                if spot:
+                    cv.text(spot[0], spot[1], text, color)
+                    placed = True
+                    break
+            if placed:
+                break
+    for edge, path, color in drawn:     # activity pulses: a glyph travelling the edge; fixed mid-edge under reduced motion
+        live = not is_planned(edge) and any(
+            next((x for x in agents if x["node_id"] == n), {}).get("state") == "working" for n in (edge.get("from"), edge.get("to")))
+        if live and path and mode != "replay":
+            px, py, _ = path[len(path) // 2 if opts.reduced_motion else tick % len(path)]
+            cv.put(px, py, "◉" if opts.unicode else "*", color + "+bold")
     return cv.lines(opts.color)
 
 
@@ -324,7 +414,8 @@ def draw_node(cv: Canvas, agent: dict, box: tuple[int, int, int, int], focused: 
         cv.put(x + w - 1, y + r, vt, style)
     inner = w - 4
     dot = _STATE_DOT.get(state, "?") if opts.unicode else {"working": "*", "idle": "o", "blocked": "!"}.get(state, "?")
-    rows = [f"{dot} {'▸' if focused and opts.unicode else '>' if focused else ''}{node_name(agent)}", f"{clean(agent.get('model') or 'model ?', max(inner - len(state) - 1, 4))} {clean(state, 9)}"]
+    shown_state = _ABBR.get(state, state) if compact else state
+    rows = [f"{dot} {'▸' if focused and opts.unicode else '>' if focused else ''}{node_name(agent)}", f"{clean(agent.get('model') or 'model ?', max(inner - len(shown_state) - 1, 4))} {clean(shown_state, 9)}"]
     if not compact or h >= 4:
         rows.append(context_bar(agent.get("context"), inner, opts))
     if mode == "ownership":
@@ -336,6 +427,9 @@ def draw_node(cv: Canvas, agent: dict, box: tuple[int, int, int, int], focused: 
         and isinstance(ctx.get("limit"), (int, float)) and ctx["limit"] > 0 else None
     ctx_style = None if pct is None else "red" if pct >= 90 else "yellow" if pct >= 70 else "green"   # unknown stays unstyled
     for i, text in enumerate(rows[:h - 2]):
+        if i == 0 and focused:      # visible focus: the whole name row in reverse video (marker + bold frame without colour)
+            cv.text(x + 1, y + 1, (" " + text).ljust(w - 2)[:w - 2], color + "+rev")
+            continue
         cv.text(x + 2, y + 1 + i, text, color if i == 0 else ctx_style if i == 2 else None, limit=inner)
 
 
@@ -366,8 +460,9 @@ def task_lines(snapshot: dict, w: int) -> list[str]:
 
 
 def agent_lines(snapshot: dict, w: int, opts: RenderOpts) -> list[str]:
-    rows = [clean(f"{node_name(a):<10.10} {clean(a.get('model') or 'model ?', 9):<9} {clean(a.get('state'), 8):<8} "
-                  f"{context_bar(a.get('context'), 0, opts) if not isinstance(a.get('context'), dict) else context_pct(a['context'])}", w - 2)
+    """name / model / state / context columns sized so ``attention`` and a 9-character model fit untruncated."""
+    rows = [clean(f"{node_name(a):<8.8} {clean(a.get('model') or 'model ?', 10):<10} {clean(a.get('state'), 9):<9} "
+                  f"{context_pct(a['context']) if isinstance(a.get('context'), dict) and context_pct(a['context']) else 'ctx ?'}", w - 2)
             for a in snapshot.get("agents") or []]
     return rows or ["no agents"]
 

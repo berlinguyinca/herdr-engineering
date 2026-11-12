@@ -1,36 +1,36 @@
 HERDR / AGENT OPERATIONS  [LIVE]  Activity
-4 agents  0 rooms  5 edges  2 tasks
+4 agents  1 rooms  5 edges  2 tasks
 ┏ Map · Activity ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓ ╭ Tasks ───────────────────────────────╮
-┃╭───────────────────────╮                           ╭───────────────────────╮┃ │api-impl owner:claude                 │
-┃│ ● ▸claude             │━━━◉━━━━━━━━━━             │ ● codex               │┃ │  by:qwen rev:opus                    │
-┃│ opus-4.1 working      │›────────────┃commu:ui─◉───│ gpt-4o working        │┃ │ui owner:?                            │
-┃│ [████████████░░░] 82% │╍╍╍╍╍╍╍╍╍╍╍╍╍┃~deleg:ui╍╍╍▶│ ctx ?                 │┃ │  by:codex rev:-                      │
-┃╰───────────────────────╯             ┃             ╰───────────────────────╯┃ │                                      │
-┃                                      ┃                                      ┃ │                                      │
-┃                                      ┃                                      ┃ ╰──────────────────────────────────────╯
-┃                                      ┃                                      ┃ ╭ Agents ──────────────────────────────╮
-┃                                      ┃                                      ┃ │claude     opus-4.1  working  82%     │
-┃                                      ┃                                      ┃ │codex      gpt-4o    working  ctx ?   │
-┃                                      ┃                                      ┃ │opus       model ?   attenti… ctx ?   │
-┃                                      ┃                                      ┃ │qwen       qwen3-72b working  68%     │
-┃                                      ┃                                      ┃ │                                      │
-┃                                      ┃                                      ┃ │                                      │
-┃                                      ┃deleg:api-i…                          ┃ │                                      │
-┃                                      ┃                                      ┃ │                                      │
-┃                                      ┃                                      ┃ │                                      │
-┃                                      ┃                                      ┃ ╰──────────────────────────────────────╯
-┃                                      ┃                                      ┃ ╭ Recent activity ─────────────────────╮
-┃                                      ┃                                      ┃ │12:43:18 communication codex → claude…│
-┃                                      ┃                                      ┃ │12:43:17 review qwen → opus planned   │
-┃                                      ┃                                      ┃ │12:43:16 delegation claude → codex pl…│
-┃                                      ┃                                      ┃ │12:43:15 delegation claude → qwen acc…│
-┃                                      ┃                                      ┃ │12:43:14 ownership claude → claude tr…│
-┃                                      ┃                                      ┃ │12:43:10 codex model ? → gpt-4o       │
-┃╭───────────────────────╮             ┃             ╭───────────────────────╮┃ │12:43:06 qwen model ? → qwen3-72b     │
-┃│ ▲ opus                │             ┃━━━━━━━━━━━━▶│ ● qwen                │┃ │12:43:02 claude model ? → opus-4.1    │
-┃│ model ? attention     │◇┄┄┄┄┄┄┄┄┄┄┄┄┄~revie:api-i…│ qwen3-72b working     │┃ │                                      │
-┃│ ctx ?                 │                           │ [██████████░░░░░] 68% │┃ │                                      │
-┃╰───────────────────────╯                           ╰───────────────────────╯┃ │                                      │
+┃                            ╭────────────────────╮                           ┃ │api-impl owner:claude                 │
+┃                            │ ● ▸claude          │                           ┃ │  by:qwen rev:opus                    │
+┃                            │ opus-4.1 working   │╍╍╍╍╍╍╍╍                   ┃ │ui owner:?                            │
+┃                   ━━━━━◉━━━│ [██████████░░] 82% │›│     ╏                   ┃ │  by:codex rev:-                      │
+┃                   ┃        ╰────────────────────╯ │     ╏                   ┃ │                                      │
+┃                   ┃                               │     ╏                   ┃ │                                      │
+┃                   ┃                               │     ╏                   ┃ ╰──────────────────────────────────────╯
+┃                   ┃                  message · ui │     ╏ ~delegate · ui    ┃ ╭ Agents ──────────────────────────────╮
+┃                   ┃ delegate · api-impl           │     ╏                   ┃ │claude   opus-4.1   working   82%     │
+┃                   ┃                               │     ╏                   ┃ │codex    gpt-4o     working   ctx ?   │
+┃                   ┃                               │     ╏                   ┃ │opus     model ?    attention ctx ?   │
+┃                   ┃                               │     ▶                   ┃ │qwen     qwen3-72b  working   68%     │
+┃                   ▶                               │   ╭────────────────────╮┃ │                                      │
+┃╭────────────────────╮       ╭┈ room …zrsvch ┈╮    ◉───│ ● codex            │┃ │                                      │
+┃│ ● qwen             │       ┊   4 members    ┊        │ gpt-4o working     │┃ │                                      │
+┃│ qwen3-72b working  │       ╰┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈╯        │ ctx ?              │┃ │                                      │
+┃│ [████████░░░░] 68% │                                 ╰────────────────────╯┃ │                                      │
+┃╰────────────────────╯                                                       ┃ ╰──────────────────────────────────────╯
+┃                   ┆                                                         ┃ ╭ Recent activity ─────────────────────╮
+┃                   ┆                                                         ┃ │12:43:18 communication codex → claude…│
+┃                   ┆                                                         ┃ │12:43:17 review qwen → opus planned   │
+┃                   ┆                                                         ┃ │12:43:16 delegation claude → codex pl…│
+┃                   ┆ ~review · api-impl                                      ┃ │12:43:15 delegation claude → qwen acc…│
+┃                   ┆                                                         ┃ │12:43:14 ownership claude → claude tr…│
+┃                   ┆                                                         ┃ │12:43:10 codex model ? → gpt-4o       │
+┃                   ┆        ╭────────────────────╮                           ┃ │12:43:06 qwen model ? → qwen3-72b     │
+┃                   ┆┄┄┄┄┄┄┄◇│ ▲ opus             │                           ┃ │12:43:02 claude model ? → opus-4.1    │
+┃                            │ model ? attention  │                           ┃ │                                      │
+┃                            │ ctx ?              │                           ┃ │                                      │
+┃                            ╰────────────────────╯                           ┃ │                                      │
 ┃──›comm ━━▶dele ══⇒hand ──◇revi ┈┈●owne  ╌╌ planned                          ┃ │                                      │
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ ╰──────────────────────────────────────╯
 ╭ Timeline ────────────────────────────────────────────────────────────────────────────────────────────────────────────╮

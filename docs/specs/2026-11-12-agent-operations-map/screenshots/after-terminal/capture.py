@@ -9,7 +9,7 @@ import threading
 
 from herdr_engineering import agent_ops_tui as tui
 from herdr_engineering.control_plane.api import ControlPlaneServer
-from herdr_engineering.control_plane.collab import CollabService, StaticTokenAuthenticator
+from herdr_engineering.control_plane.collab import CollabService, Principal, StaticTokenAuthenticator
 from herdr_engineering.control_plane.ingest import IngestService
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
@@ -40,14 +40,19 @@ SEED = [  # (agent, event_type, extra fields)
 def boot():
     repo = ControlPlaneRepo()
     auth = StaticTokenAuthenticator({"alice": hashlib.sha256(b"tok-alice-0123456789").hexdigest()})
-    srv = ControlPlaneServer(repo, host="127.0.0.1", port=0, collab=CollabService(auth),
+    collab = CollabService(auth)
+    srv = ControlPlaneServer(repo, host="127.0.0.1", port=0, collab=collab,
                              api_keys={"view-key": "viewer"}, agent_ops_config={"enabled": True})
     threading.Thread(target=srv.serve, daemon=True).start()
     srv.wait_until_ready()
+    alice = Principal("user", "alice", "alice")   # a real room: its members make the hub header
+    room = collab.create_room(alice, collab.create_project(alice, {"name": "ops"})["project_id"], {"name": "war-room"})["room_id"]
     for n, (agent, etype, extra) in enumerate(SEED, 1):
         IngestService(repo).ingest({"schema_version": 2, "event_id": f"cap-{n}", "source": "pi", "source_sequence": n,
                                     "entity_type": "lifecycle", "entity_id": agent, "event_type": etype,
-                                    "occurred_at": f"2026-11-12T12:43:{n:02d}Z", "visibility_scope": "org",
+                                    "occurred_at": f"2026-11-12T12:43:{n:02d}Z",
+                                    "visibility_scope": "room" if etype == "session.started" else "org",
+                                    "room_id": room if etype == "session.started" else None,
                                     "agent_id": agent, "provenance": "observed", "payload": {}, **extra}, OP)
     return srv
 
@@ -79,7 +84,7 @@ def to_html(text):
 def main(outdir):
     out = pathlib.Path(outdir)
     srv = boot()
-    client = tui.Client(f"http://127.0.0.1:{srv.port}", "view-key")
+    client = tui.Client(f"http://127.0.0.1:{srv.port}", "view-key", "tok-alice-0123456789")
     snap = client.get("snapshot")
     opts = tui.RenderOpts(color=True, unicode=True, reduced_motion=False)
     for w, h in ((120, 40), (80, 24)):
