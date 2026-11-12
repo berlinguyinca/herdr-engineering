@@ -3,6 +3,7 @@
 .ao { color: var(--text); min-width: 0; --ao-comm: var(--status-active); --ao-delegation: var(--violet); --ao-handoff: var(--accent); --ao-review: var(--status-review); --ao-ownership: var(--status-testing); }
 .ao :focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 .ao-bar { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: end; justify-content: space-between; margin: 0 0 12px; }
+.ao-bar > * { min-width: 0; max-width: 100%; }
 .ao-tabs { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); max-width: 100%; overflow-x: auto; }
 .ao-tab { background: transparent; color: var(--text-secondary); border: 0; border-radius: var(--radius-sm); padding: 8px 14px; min-height: 44px; font: inherit; font-weight: 500; cursor: pointer; white-space: nowrap; }
 .ao-tab:hover { color: var(--text); }
@@ -100,7 +101,7 @@ text.ao-state { paint-order: stroke; stroke: var(--surface); stroke-width: 4px; 
 
 @media (prefers-reduced-motion: no-preference) {
   html:not([data-calm="on"]) .ao-particle { animation: ao-flow 3.2s linear infinite; }
-  html:not([data-calm="on"]) .ao-halo { animation: ao-breathe 3.6s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+  html:not([data-calm="on"]) .ao-halo { animation: ao-breathe 3.6s ease-in-out infinite; }
   html:not([data-calm="on"]) .ao-node--muted .ao-halo, html:not([data-calm="on"]) .ao-node--unknown .ao-halo { animation: none; }
   html:not([data-calm="on"]) .ao-node--active .ao-halo { animation-duration: 2.2s; }
   html:not([data-calm="on"]) .ao-edge--dashed .ao-edge-line { animation: ao-march 1.2s linear infinite; }
@@ -109,7 +110,7 @@ text.ao-state { paint-order: stroke; stroke: var(--surface); stroke-width: 4px; 
   html:not([data-calm="on"]) .ao-live.is-live .ao-live-dot { animation: ao-blink 1.6s ease-in-out infinite; }
 }
 @keyframes ao-flow { from { offset-distance: 0%; } to { offset-distance: 100%; } }
-@keyframes ao-breathe { 0%, 100% { opacity: 0.7; transform: scale(0.96); } 50% { opacity: 1; transform: scale(1.04); } }
+@keyframes ao-breathe { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
 @keyframes ao-march { to { stroke-dashoffset: -32; } }
 @keyframes ao-ring-pulse { 0% { stroke-width: 7; filter: drop-shadow(0 0 0 transparent); } 40% { stroke-width: 13; filter: drop-shadow(0 0 10px var(--accent)); } 100% { stroke-width: 7; } }
 @keyframes ao-appear { from { opacity: 0; } to { opacity: 1; } }

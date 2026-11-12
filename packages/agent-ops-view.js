@@ -354,7 +354,16 @@ export function mountAgentOps(container, client, opts = {}) {
   }
 
   // ---- interactions -----------------------------------------------------------------------------------------------------------------
-  const select = (sel) => { state.selected = sel; paintStage({ force: true }); };
+  // Selecting must not rebuild the map: a double-click needs the same element under both clicks, and focus must stay put.
+  const select = (sel) => {
+    state.selected = sel;
+    for (const el of stageEl.querySelectorAll('[data-ao-node],[data-ao-edge]')) {
+      const on = Boolean(sel) && (sel.type === 'node' ? el.dataset.aoNode === sel.id : sel.type === 'edge' && el.dataset.aoEdge === sel.id);
+      el.classList.toggle('is-selected', on); el.setAttribute('aria-pressed', String(on));
+    }
+    if (state.scene) inspEl.innerHTML = renderInspector(sel, state.scene, viewSnap());
+    state.sig = '';   // the next data change redraws with the selection baked in
+  };
   const openPane = (id) => {
     const n = state.scene?.nodes.find((x) => x.id === id);
     if (n && !n.person) open({ node_id: n.id, agent_id: n.agent.agent_id || null, session_id: n.agent.session_id || null, host_id: n.host });
@@ -396,7 +405,7 @@ export function mountAgentOps(container, client, opts = {}) {
     }
     const node = event.target.closest?.('[data-ao-node]'), edge = event.target.closest?.('[data-ao-edge]');
     if (!node && !edge) return;
-    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); (node || edge).click(); return; }
+    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); (node || edge).dispatchEvent(new MouseEvent('click', { bubbles: true })); return; }   // SVG groups have no .click()
     if (node && (event.key === 'o' || event.key === 'O')) { event.preventDefault(); openPane(node.dataset.aoNode); return; }
     if (event.key === 'Escape') { select(null); return; }
     if (node && state.scene && event.key.startsWith('Arrow')) {
