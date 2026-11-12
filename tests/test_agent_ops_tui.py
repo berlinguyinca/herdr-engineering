@@ -618,3 +618,21 @@ def test_hosts_row_shortens_instead_of_dropping_hosts_in_a_narrow_pane():
     row = plain([tui.hosts_row(health_snap(), 80, UNI)])
     assert tui.cell_width(row) <= 80 and all(h in row for h in ("mac-01", "dev-02", "lab-03"))
     assert "lab-03 ? ?" in row           # unknown host state and unknown context both stay "?"
+
+
+def test_stream_resets_to_a_fresh_snapshot_when_the_server_rejects_the_resume_cursor():
+    server = LiveServer()
+    try:
+        ingest(server.repo, 1, "session.started", agent_id="a1", session_id="s1")
+        stop, seen, got = threading.Event(), [], threading.Event()
+        client = tui.Client(server.url, "view-key")
+        t = threading.Thread(target=client.stream, args=("2026-11-12T10:00:01.000000Z~in-1", stop,
+                                                         lambda c: (seen.append(c), got.set()), lambda *a: None),
+                             daemon=True)
+        t.start()
+        assert got.wait(5)
+        stop.set()
+        t.join(timeout=5)
+        assert seen[0] == ""            # reset: the old-format cursor is dropped and the owner re-fetches the snapshot
+    finally:
+        server.stop()

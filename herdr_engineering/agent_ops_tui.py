@@ -1002,6 +1002,9 @@ class Client:
                 conn.request("GET", f"{prefix}/api/v1/agent-ops/stream", headers=headers)
                 resp = conn.getresponse()
                 if resp.status != 200:
+                    if resp.status == 400 and cursor:     # the server refuses our cursor: drop it and re-fetch the snapshot
+                        cursor = ""
+                        on_event(cursor)
                     raise OSError(f"HTTP {resp.status}")
                 on_state("live")
                 delay = 1.0
@@ -1018,6 +1021,14 @@ class Client:
                             cursor = json.loads(text[5:]).get("cursor") or cursor
                         except ValueError:
                             pass
+                    elif text.startswith("data:") and '"reset"' in text:
+                        try:
+                            reset = json.loads(text[5:]).get("reset") is True
+                        except ValueError:
+                            reset = False
+                        if reset and cursor:      # `connected` says our resume cursor was ignored: re-fetch the snapshot
+                            cursor = ""
+                            on_event(cursor)
             except (OSError, http.client.HTTPException, ValueError) as exc:
                 on_state("degraded", clean(exc, 24))
             finally:
