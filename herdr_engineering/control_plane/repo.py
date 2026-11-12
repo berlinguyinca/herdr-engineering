@@ -3026,6 +3026,23 @@ class ControlPlaneRepo:
         return sorted(items, key=lambda i: (i['ts'] or '', i['kind'],
                                             i['entity_id'] or ''))
 
+    def inspector_history_page(self, session_id, role="viewer", *, view="all", limit=100, before=None):
+        """Inspector events older than the in-memory ring, read from Postgres one page at a time.
+
+        Raises LookupError when no durable history is attached. Never loads anything into the ring."""
+        from .inspector_history import decode_cursor, entries_from_rows
+        if before is not None:
+            decode_cursor(before)   # reject a forged cursor before any database work
+        reader = getattr(self._durable_history, "inspector_page", None)
+        if not callable(reader):
+            raise LookupError("durable inspector history is not available")
+        kinds = self.inspector.view_kinds(view)
+        cutoff = None if before is not None else self.inspector.oldest_recv(session_id)
+        page = reader(session_id, limit=limit, before=before, cutoff=cutoff, kinds=kinds)
+        return {"session_id": session_id, "view": view, "source": "postgres",
+                "events": self.inspector.render_history(entries_from_rows(page["rows"]), role),
+                "has_more": page["has_more"], "next_cursor": page["next_cursor"]}
+
     def stream(self, entity_type, entity_id):
         if callable(getattr(self._durable_history, 'stream', None)):
             return self._durable_history.stream(entity_type, entity_id)
