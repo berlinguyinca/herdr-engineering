@@ -44,6 +44,9 @@ def _build_parser() -> argparse.ArgumentParser:
     from .assistant_cli import register as register_assistant_cli
     register_assistant_cli(sub)
 
+    from .agent_ops_tui import register as register_agent_ops_tui
+    register_agent_ops_tui(sub)
+
     p = sub.add_parser("build-cleanup", help="reclaim stale Rust build caches")
     cleanup_sub = p.add_subparsers(dest="cleanup_command", required=True)
     for action in ("run", "watch", "status"):
