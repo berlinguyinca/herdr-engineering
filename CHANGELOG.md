@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Auto-join hook no longer dies silently on a loaded host
+- `summary join-hook` ran the join under a 12 s kill-timeout through `python -m herdr_engineering.cli`; on a loaded host that start alone took 3-40 s, so the join was killed and the session printed nothing. It now starts the CLI directly, waits up to 8 s, and past that leaves the (idempotent) join running detached and says "still running in the background". Test: a real listener that never answers.
+
 ### Inspector: older events on demand from Postgres
 - New `GET /api/v1/sessions/{id}/inspector/history?before=&limit=&view=` returns inspector events older than the in-memory ring, one bounded page at a time (opaque keyset cursor on `ingest_timestamp, sequence, event_id`), rendered with the ring's role redaction. Nothing is read at boot and nothing is loaded into the ring, so memory does not grow with paging. Existing `/inspector` and `before_seq` are unchanged. Configured by `control_plane.inspector_history` (`enabled`, `page_size`, `max_page_size`), validated in `fleet_config.py`, unknown keys rejected. Client: `getInspectorHistory`.
 - Caveats: durable rows carry no ring `seq` (`seq` is null; `history_id` is the event id); a tool call's newest row per page wins, so a call split across a page boundary can show once per page; rows already archived to `fabric_events_archive` are not read.
