@@ -44,6 +44,7 @@ import { mountAiSync } from './ai-sync-view.js';
 import { mountPrTrail } from './pr-trail-view.js';
 import { mountTeamMap } from './team-map-view.js';
 import { mountAgentOps } from './agent-ops-view.js';
+import { lineageEnabled, mountAgentOpsLineage } from './agent-ops-lineage.js';
 import { mountTeams } from './teams-view.js';
 import { mountAgentEvolution, tabsHtml, TABS_STYLE, wireTabs } from './agent-evolution-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
@@ -491,7 +492,7 @@ async function viewTeamMap() {
 
 async function viewAgentOps() {
   root.innerHTML = `${liveHead('<h1>Agent Operations</h1>')}<div id="agent-ops"></div>`;
-  const view = mountAgentOps(root.querySelector('#agent-ops'), client, { freshness: chipIn(root) });
+  const view = mountAgentOps(root.querySelector('#agent-ops'), client, { freshness: chipIn(root), filters: { task: route().query.get('task') || '' } });
   return { refresh: () => view.refresh(), dispose: () => view.dispose() };   // the view owns its own SSE stream (cursor resume) and replay state
 }
 
@@ -527,7 +528,11 @@ async function viewOverview() {
   const host = document.getElementById('overview-dashboard');
   const workCenter = await workCenterOn();
   if (!host.isConnected) return { refresh() {}, dispose() {} };   // navigated away while the capability probe was pending
-  return ownPolling(mountOverview(host, client, { freshness: chipIn(root), workCenter }));
+  const overview = mountOverview(host, client, { freshness: chipIn(root), workCenter });
+  // Slice 07: task lineage from Agent Operations, only while BOTH work_center_v1 and agent_ops_v1 are advertised.
+  let lineage = null;
+  if (lineageEnabled(capabilities)) { const slot = document.createElement('div'); slot.id = 'agent-lineage'; host.after(slot); lineage = mountAgentOpsLineage(slot, client); }
+  return ownPolling({ dispose() { overview.dispose(); lineage?.dispose(); document.getElementById('agent-lineage')?.remove(); } });
 }
 
 async function viewAttention() {

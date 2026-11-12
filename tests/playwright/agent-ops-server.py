@@ -2,6 +2,7 @@
 
     python tests/playwright/agent-ops-server.py            # prints PORT=<n> once ready, then serves until killed
     EMPTY=1 ...                                            # enabled but nothing ingested (empty state)
+    WORK_CENTER=1 ...                                      # also advertise work_center_v1 (the Overview shows the task-lineage card)
     OFF=1 ...                                              # capability off (the route and the nav entry must stay hidden)
 
 No mocks: events travel through the HTTP ingest endpoint, the projection folds them, and the page reads /api/v1/agent-ops/*.
@@ -62,7 +63,8 @@ def seed(base):
 def main():
     repo = ControlPlaneRepo()
     cfg = None if os.environ.get("OFF") == "1" else {"enabled": True}
-    srv = ControlPlaneServer(repo, host="127.0.0.1", port=0, web_root=_REPO / "packages", agent_ops_config=cfg)
+    srv = ControlPlaneServer(repo, host="127.0.0.1", port=0, web_root=_REPO / "packages", agent_ops_config=cfg,
+                              work_center_config={"enabled": True} if os.environ.get("WORK_CENTER") == "1" else None)
     import threading
     threading.Thread(target=srv.serve, daemon=True).start()
     srv.wait_until_ready()

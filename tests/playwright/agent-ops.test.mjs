@@ -150,3 +150,22 @@ test('empty server: explains that nothing was reported',async()=>{
   await page.getByText('No agent activity yet').waitFor({timeout:10000});
  });
 });
+
+test('Work Command Center embed: lineage card on the Overview only with BOTH capabilities',async()=>{
+ await withServer({WORK_CENTER:'1'},async(page,base)=>{
+  await page.goto(`${base}/index.html#/overview`);
+  const card=page.locator('[data-overview="agent-lineage"]');
+  await card.waitFor({timeout:15000});
+  const text=await card.textContent();
+  assert.match(text,/task-42/); assert.match(text,/Accountable owner/); assert.match(text,/Planner/);
+  await card.locator('a.ao-lineage-task',{hasText:'task-42'}).click();
+  await page.locator('.ao-node').first().waitFor({timeout:15000});
+  assert.match(page.url(),/#\/agent-ops\?task=task-42/);
+  assert.ok(await page.locator('.ao-node').count()<5,'the task filter narrows the map');
+ });
+ await withServer({},async(page,base)=>{   // agent_ops_v1 alone: Overview unchanged
+  await page.goto(`${base}/index.html#/overview`);
+  await page.waitForTimeout(1500);
+  assert.equal(await page.locator('[data-overview="agent-lineage"]').count(),0);
+ });
+});

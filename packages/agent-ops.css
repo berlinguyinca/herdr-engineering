@@ -128,3 +128,9 @@ html[data-calm="on"] .ao-particle { display: none; }
   .ao-bar { align-items: stretch; } .ao-filters { width: 100%; } .ao-filter { flex: 1 1 42%; } .ao-filter select { max-width: none; width: 100%; }
   .ao-svg { min-width: 560px; height: 480px; } .ao-timeline-row { gap: 8px; } .ao-btn { padding-inline: 12px; }
 }
+
+/* Work Command Center embed: task lineage under the Overview */
+.ao-lineage { margin-top: 16px; }
+.ao-lineage-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); }
+.ao-lineage-row { border: 1px solid var(--border-subtle); border-radius: var(--radius); padding: 12px; background: var(--surface); }
+.ao-lineage-task { font-weight: 600; color: var(--accent-ink); }
