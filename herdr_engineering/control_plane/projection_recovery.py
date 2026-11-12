@@ -31,6 +31,7 @@ COMPACTED_TYPES = frozenset({'service'})
 MAX_TAIL_ROWS = 100_000
 MAX_DIRTY_ROWS = 600_000
 HARD_DIRTY_ROWS = 2_000_000
+HARD_TAIL_ROWS = 500_000
 TOP_CONTRIBUTORS = 5
 
 
@@ -40,10 +41,17 @@ class CheckpointBudgets(NamedTuple):
     ``max_tail_rows``: change-log tail. ``max_dirty_rows``: refolded rows the recovery is expected to
     re-read; above it recovery logs and carries on. ``hard_dirty_rows``: the cap above which the dirty
     streams are no cheaper than a complete replay (None = same as ``max_dirty_rows``).
+    ``hard_tail_rows``: tolerance for a slightly stale checkpoint. A tail between ``max_tail_rows`` and
+    this cap is logged and still folded incrementally (None = same as ``max_tail_rows``: no tolerance).
     """
     max_tail_rows: int
     max_dirty_rows: int
     hard_dirty_rows: int | None = None
+    hard_tail_rows: int | None = None
+
+    @property
+    def tail_cap(self):
+        return self.max_tail_rows if self.hard_tail_rows is None else self.hard_tail_rows
 
     @property
     def dirty_cap(self):
@@ -59,7 +67,7 @@ def checkpoint_budgets(raw=None):
         raw = {}
     if not isinstance(raw, dict):
         raise ValueError('control_plane.projection_checkpoint must be a mapping')
-    unknown = sorted(set(raw) - {'max_tail_rows', 'max_dirty_rows', 'hard_dirty_rows'})
+    unknown = sorted(set(raw) - {'max_tail_rows', 'max_dirty_rows', 'hard_dirty_rows', 'hard_tail_rows'})
     if unknown:
         raise ValueError(f'control_plane.projection_checkpoint: unknown key(s) {unknown}')
     values = {}
@@ -73,7 +81,13 @@ def checkpoint_budgets(raw=None):
         raise ValueError(f'control_plane.projection_checkpoint.hard_dirty_rows must be a positive integer, got {hard!r}')
     if hard < values['max_dirty_rows']:
         raise ValueError('control_plane.projection_checkpoint.hard_dirty_rows must be >= max_dirty_rows')
-    return CheckpointBudgets(**values, hard_dirty_rows=hard)
+    hard_tail = raw.get('hard_tail_rows', max(HARD_TAIL_ROWS, values['max_tail_rows']))
+    if type(hard_tail) is not int or hard_tail <= 0:
+        raise ValueError(
+            f'control_plane.projection_checkpoint.hard_tail_rows must be a positive integer, got {hard_tail!r}')
+    if hard_tail < values['max_tail_rows']:
+        raise ValueError('control_plane.projection_checkpoint.hard_tail_rows must be >= max_tail_rows')
+    return CheckpointBudgets(**values, hard_dirty_rows=hard, hard_tail_rows=hard_tail)
 
 
 def feed_visible(row):
@@ -139,6 +153,20 @@ def _fold_plan(operations, tail):
     if {(row['event_id'], actor_id(row)) for row in tail} != alive:
         return None, 'tail_rows_missing'
     return removed, None
+
+
+def _tail_summary(changes, limit=TOP_CONTRIBUTORS):
+    """``type=rows (op=n, ...)`` for the busiest entity types of a change-log tail."""
+    kinds = {}
+    for row in changes:
+        ops = kinds.setdefault(row['entity_type'] or '', {})
+        ops[row['operation']] = ops.get(row['operation'], 0) + 1
+    ranked = sorted(kinds.items(), key=lambda item: (-sum(item[1].values()), item[0]))
+    parts = [f"{kind or '(untyped)'}={sum(ops.values())} ({', '.join(f'{op}={n}' for op, n in sorted(ops.items()))})"
+             for kind, ops in ranked[:limit]]
+    if len(ranked) > limit:
+        parts.append(f'+{len(ranked) - limit} more types')
+    return ', '.join(parts)
 
 
 def _budget_summary(pairs, blocked, rows_by_type=None, limit=None):
@@ -207,16 +235,26 @@ async def _read_prepared_once(source, code, policy):
                     raise CheckpointInvalid('checkpoint frontier is outside retained change coverage')
                 changes = await store.changes_after(frontier, point['position'])
                 budgets = getattr(source, 'checkpoint_budgets', None) or CheckpointBudgets(MAX_TAIL_ROWS, MAX_DIRTY_ROWS)
+                if len(changes) > budgets.tail_cap:
+                    raise CheckpointInvalid(f'incremental change budget exceeded: {len(changes)} tail rows > '
+                                            f'{"hard cap" if budgets.hard_tail_rows is not None else "limit"} '
+                                            f'{budgets.tail_cap} (frontier {frontier}, position {point["position"]}); '
+                                            f'tail by type {_tail_summary(changes)}; complete replay required')
                 if len(changes) > budgets.max_tail_rows:
-                    raise CheckpointInvalid(f'incremental change budget exceeded: {len(changes)} tail rows > limit '
-                                            f'{budgets.max_tail_rows}; complete replay required')
-                if any(row['operation'] in {'T','U'} or
-                       (row['operation']=='D' and row['entity_type'] not in RETENTION_TYPES | COMPACTED_TYPES)
-                       for row in changes):
-                    raise CheckpointInvalid('structural history mutation requires complete replay')
+                    log.warning('projection recovery over the tail budget; folding the tail incrementally instead of '
+                                'a complete replay: %d tail rows > limit %d (hard cap %d; frontier %s, position %s); '
+                                'tail by type %s', len(changes), budgets.max_tail_rows, budgets.tail_cap,
+                                frontier, point['position'], _tail_summary(changes))
+                structural = [row for row in changes if row['operation'] in {'T','U'} or
+                              (row['operation']=='D' and row['entity_type'] not in RETENTION_TYPES | COMPACTED_TYPES)]
+                if structural:
+                    raise CheckpointInvalid(f'structural history mutation requires complete replay: '
+                                            f'{len(structural)} of {len(changes)} tail rows; '
+                                            f'by type {_tail_summary(structural)}')
                 legacy = prefix['legacy_rows'] - sum(row['operation']=='D' and row['had_position'] is None for row in changes)
                 if legacy != point['legacy_rows']:
-                    raise CheckpointInvalid('legacy prefix coverage changed unexpectedly')
+                    raise CheckpointInvalid(f'legacy prefix coverage changed unexpectedly: expected '
+                                            f'{legacy}, found {point["legacy_rows"]}')
                 inserted = [row['position'] for row in changes if row['operation']=='I']
                 raw_tail = await _rows(conn, 'SELECT * FROM fabric_events WHERE projection_position=ANY($1::bigint[]) '
                                        'ORDER BY projection_position', inserted) if inserted else []
@@ -231,11 +269,15 @@ async def _read_prepared_once(source, code, policy):
                     order = InspectorStore(clock=getattr(source, '_checkpoint_inspector_clock', time.time))._replay_order
                     tail = [row for row in raw_tail if row['entity_type'] == 'inspector']
                     key = checkpoint['inspector']['replay']['key']
-                    inspector_append = (all(row['operation']=='I' for row in private_changes)
-                        and len(tail)==len(private_changes)
-                        and (key is None or min(order(row) for row in tail) > tuple(key)))
+                    non_insert = sum(row['operation']!='I' for row in private_changes)
+                    after_cursor = bool(tail) and (key is None or min(order(row) for row in tail) > tuple(key))
+                    inspector_append = non_insert==0 and len(tail)==len(private_changes) and after_cursor
                     if not inspector_append:
-                        raise CheckpointInvalid('inspector mutation requires complete authoritative replay')
+                        why = ('non_insert' if non_insert else 'tail_rows_missing' if len(tail)!=len(private_changes)
+                               else 'not_after_cursor')
+                        raise CheckpointInvalid(f'inspector mutation requires complete authoritative replay: {why}; '
+                                                f'{len(private_changes)} inspector changes ({non_insert} non-insert), '
+                                                f'{len(tail)} tail rows')
                 pairs = sorted({(row['entity_type'],row['entity_id']) for row in changes})
                 if inspector_append:
                     pairs = [pair for pair in pairs if pair[0] != 'inspector']
@@ -306,7 +348,7 @@ async def _read_prepared_once(source, code, policy):
                     schema=schema,scanned=len(raw))
 
 
-MAX_REASON_CHARS = 200
+MAX_REASON_CHARS = 2000
 
 
 def _rejection_detail(exc):

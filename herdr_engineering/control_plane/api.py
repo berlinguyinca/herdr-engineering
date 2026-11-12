@@ -6071,6 +6071,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         limit=_qint(self.path, "limit", 200),
                         before_seq=(_qint(self.path, "before_seq", -1)
                                     if _q(self.path, "before_seq") else None)), sid))
+                if tail[0] == "history" and len(tail) == 1:
+                    return self._inspector_history(sid, role)
                 if tail[0] == "events" and len(tail) == 2:
                     if not tail[1].isdigit():
                         return self._json({"error": "invalid sequence"}, 400)
@@ -6089,6 +6091,29 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             except KeyError:
                 return self._json({"error": "not found"}, 404)
             return self._json({"error": "not found"}, 404)
+
+        def _inspector_history(self, sid, role):
+            """Older inspector events from Postgres, paged by an opaque cursor (``before``); additive to the ring."""
+            from .inspector_history import HistoryCursorInvalid, parse_inspector_history
+            cfg = parse_inspector_history(server._control_plane_value(server.fleet_config, "inspector_history"))
+            if not cfg["enabled"]:
+                return self._json({"error": "inspector history is disabled"}, 404)
+            if not server.repo.inspector.has_session(sid) and server.repo.get_session(sid) is None:
+                return self._json({"error": "session not found"}, 404)
+            raw = _q(self.path, "limit")
+            if raw is not None and not raw.isdigit():
+                return self._json({"error": "invalid limit"}, 400)
+            limit = max(1, min(int(raw) if raw else cfg["page_size"], cfg["max_page_size"]))
+            try:
+                body = server.repo.inspector_history_page(
+                    sid, role, view=_q(self.path, "view") or "all", limit=limit, before=_q(self.path, "before"))
+            except (HistoryCursorInvalid, ValueError) as exc:
+                return self._json({"error": str(exc)}, 400)
+            except LookupError:
+                return self._json({"error": "durable inspector history is not available"}, 503)
+            except Exception:   # a failed durable read must not take the dashboard down; static message only
+                return self._json({"error": "durable inspector history is unavailable"}, 503)
+            return self._json(body)
 
         def _inspector_set_prefs(self, sid):
             body = self._read_json() or {}
