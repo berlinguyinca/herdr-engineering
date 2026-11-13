@@ -827,3 +827,83 @@ def test_every_issued_cursor_at_max_field_lengths_is_valid_and_round_trips_over_
                 assert status == 200, (path, row["event_id"][:40], status)
     finally:
         server.stop()
+
+
+# ------------------------------------------------------------------ lapsed guests fail closed (no org fallback)
+def _read_stream(server, user, seconds=1.2):
+    """Raw text of an agent-ops stream as ``user`` until ``seconds`` pass (the server keeps it open)."""
+    import time
+    conn = http.client.HTTPConnection("127.0.0.1", server.srv.port, timeout=0.3)
+    conn.request("GET", "/api/v1/agent-ops/stream", headers={"X-API-Key": "view-key",
+                                                              "Authorization": f"Bearer {TOKENS[user]}"})
+    resp = conn.getresponse()
+    assert resp.status == 200
+    chunks, end = [], time.monotonic() + seconds
+    while time.monotonic() < end:
+        try:
+            line = resp.fp.readline()
+        except OSError:
+            continue
+        if line:
+            chunks.append(line.decode())
+    conn.close()
+    return "".join(chunks)
+
+
+@pytest.mark.parametrize("how", ["revoked", "expired"])
+def test_lapsed_guest_sees_nothing_on_every_route(stack, how):
+    """A guest whose room access ends still holds a valid user token. They must not fall back to org-scoped
+    visibility: no org agent, no room data, on snapshot, events, replay or stream."""
+    import time
+    bob = stack.users["bob"]
+    expiry = time.time() + 1.0 if how == "expired" else None
+    body = {"user_id": "carol", "role": "guest", **({"expires_at": expiry} if expiry else {})}
+    stack.collab.add_member(bob, stack.rooms["bob"], body)
+    stack.collab.post_message(bob, stack.rooms["bob"], {"text": "while a guest", "idempotency_key": "g0"})
+    ingest(stack.repo, 1, "tool.started", session_id="so", agent_id="org-agent", visibility_scope="org")
+    ingest(stack.repo, 2, "tool.started", session_id="sb", agent_id="agent-b", room_id=stack.rooms["bob"],
+           visibility_scope="room")
+    server = Server(stack.repo, stack.collab, agent_ops_config={"enabled": True})
+    server.srv.agent_ops_poll_seconds = 0.05
+    try:
+        _, before = server.get("/api/v1/agent-ops/snapshot", user="carol")
+        assert {r["room_id"] for r in before["rooms"]} == {stack.rooms["bob"]}      # live guest: room only
+        assert "org-agent" not in json.dumps(before)
+        if how == "revoked":
+            stack.collab.remove_member(bob, stack.rooms["bob"], "carol")
+        else:
+            time.sleep(max(0.0, expiry - time.time()) + 0.2)
+        assert stack.collab.readable_room_ids(stack.users["carol"]) == []            # access really is gone
+        stack.collab.post_message(bob, stack.rooms["bob"], {"text": "AFTER LAPSE SECRETTEXT", "idempotency_key": "z"})
+        for key in ("view-key", "op-key"):
+            status, snap = server.get("/api/v1/agent-ops/snapshot", user="carol", key=key)
+            assert status == 200
+            _, page = server.get("/api/v1/agent-ops/events?limit=200", user="carol", key=key)
+            _, replay = server.get(f"/api/v1/agent-ops/replay?until={snap['cursor']}", user="carol", key=key)
+            for body in (snap, page, replay):
+                dump = json.dumps(body)
+                assert "org-agent" not in dump and "agent-b" not in dump and "SECRETTEXT" not in dump
+                assert stack.rooms["bob"] not in dump and stack.rooms["alice"] not in dump
+            assert snap["agents"] == [] and snap["rooms"] == [] and page["events"] == []
+        text = _read_stream(server, "carol")
+        assert "org-agent" not in text and "agent-b" not in text and "SECRETTEXT" not in text
+        assert '"event_id"' not in text
+    finally:
+        server.stop()
+
+
+def test_user_who_never_was_a_guest_keeps_org_visibility(stack):
+    ingest(stack.repo, 1, "tool.started", session_id="so", agent_id="org-agent", visibility_scope="org")
+    carol = stack.users["carol"]
+    snap = stack.svc.snapshot(stack.svc.viewer(carol), carol)
+    assert [a["agent_id"] for a in snap["agents"]] == ["org-agent"]
+
+
+def test_same_api_key_different_sessions_stay_separate_nodes(stack):
+    """Shared-key trust model: a key authenticates, the session id identifies. Same key, three sessions, three nodes."""
+    ingest(stack.repo, 1, "tool.started", session_id="sess-1", agent_id="agent-one")
+    ingest(stack.repo, 2, "tool.started", session_id="sess-2", agent_id="agent-two")
+    ingest(stack.repo, 3, "tool.started", session_id="sess-3", agent_id="agent-one")   # same agent id, new session
+    snap = stack.svc.snapshot(Viewer(operator=True))
+    assert sorted(a["node_id"] for a in snap["agents"]) == ["sess-1", "sess-2", "sess-3"]
+    assert {a["node_id"]: a["session_id"] for a in snap["agents"]} == {s: s for s in ("sess-1", "sess-2", "sess-3")}
