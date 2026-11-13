@@ -1,6 +1,6 @@
 #!/bin/sh
-L=/private/tmp/claude-501/lp
-A=~/IdeaProjects/herdr-engineering/.claude/worktrees/agent-ae7b3d9d01511ff31/deploy/agent-ops-adapters/codex.js
+L=${SCRATCH:-/tmp/ao-live}
+A=${REPO:-$HOME/IdeaProjects/herdr-engineering}/deploy/agent-ops-adapters/codex.js
 mkdir -p $L/codex-cwd
 export HERDR_AGENT_OPS=1 HERDR_AGENT_OPS_URL=http://127.0.0.1:65157 HERDR_AGENT_OPS_API_KEY=ing-<THROWAWAY-TOKEN> HERDR_AGENT_OPS_SCOPE=org
 cd $L/codex-cwd

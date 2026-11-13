@@ -22,7 +22,7 @@ Branch `feat/agent-ops-tui`. Commits (prefix `agent-ops-tui:`):
 - Plugin: `deploy/herdr-agent-ops-plugin/` (manifest with `[[panes]]` split x2 + `[[actions]]` open/doctor, README).
   Not linked into the running Herdr.
 
-## Tests (`/private/tmp/claude-501/aoenv/bin/python -m pytest tests/test_agent_ops_tui.py -q -p no:cacheprovider`)
+## Tests (`$VENV/bin/python -m pytest tests/test_agent_ops_tui.py -q -p no:cacheprovider`)
 27 passed: render at 120x40/80x24/50x20/30x8 (fit, content, ASCII/unicode/color), `ctx ?`, planned vs accepted glyphs, ASCII
 fallback, control-char stripping, NO_COLOR/TERM/reduced-motion detection, pulses animate vs static, modes/filters, overlays,
 status line, garbage snapshots, 14-agent grid, key state machine and replay flow, key parsing, and real-server tests: render
