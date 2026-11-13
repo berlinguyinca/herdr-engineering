@@ -869,12 +869,18 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
     head filter. Upgrade requests (websockets) are passed through untouched."""
     from .urlrewrite import force_close, inject_request_headers, is_upgrade, rewrite_response_head
     req_head, rest = _read_head(client)
-    if tls and req_head.endswith(b"\r\n\r\n"):
-        # TLS ends here: tell the origin the browser spoke https and which name it used.
-        host = next((ln.split(b":", 1)[1].strip().decode("latin-1") for ln in req_head.split(b"\r\n")[1:]
-                     if ln.lower().startswith(b"host:")), external)
-        pairs = {"X-Forwarded-Proto": "https", "X-Forwarded-Host": host}
+    complete = req_head.endswith(b"\r\n\r\n")
+    if forwarded_for and not complete:
+        return      # fail closed: a head we cannot rewrite is never relayed with a client-chosen X-Forwarded-For
+    if complete and (tls or forwarded_for):
+        pairs: dict[str, str] = {}
+        if tls:
+            # TLS ends here: tell the origin the browser spoke https and which name it used.
+            host = next((ln.split(b":", 1)[1].strip().decode("latin-1") for ln in req_head.split(b"\r\n")[1:]
+                         if ln.lower().startswith(b"host:")), external)
+            pairs.update({"X-Forwarded-Proto": "https", "X-Forwarded-Host": host})
         if forwarded_for:
+            # on every path (plaintext too) the client's own copy is replaced by the real peer
             pairs["X-Forwarded-For"] = forwarded_for
         req_head = inject_request_headers(req_head[:-4], pairs) + b"\r\n\r\n"
     upgrade = is_upgrade(req_head)

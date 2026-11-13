@@ -355,7 +355,7 @@ def test_open_owner_allowed_sources_checks_the_client_behind_a_trusted_proxy(mak
     assert open_from(svr.rakazo, "198.51.100.7", "100.64.1.1") == 403
 
 
-@pytest.mark.parametrize("bad", ["not-an-ip", "100.64.0.0/33", "", 5, None, ["100.64.0.1"], "100.64.0.1/16/2"])
+@pytest.mark.parametrize("bad", ["not-an-ip", "100.64.0.0/33", "100.104.39.6/24", "100.64.1.1/10", "::ffff:100.64.1.1", "::ffff:100.64.0.0/104", "", 5, None, ["100.64.0.1"], "100.64.0.1/16/2"])
 def test_open_owner_allowed_sources_rejects_invalid_entries(bad):
     with pytest.raises(ValueError, match="open_owner_allowed_sources"):
         rb.rakazo_bridge_config({"enabled": True, "open_owner_allowed_sources": ["100.64.0.1", bad], "accounts": ACCOUNTS})
@@ -367,6 +367,22 @@ def test_open_owner_allowed_sources_must_be_a_bounded_list():
             rb.rakazo_bridge_config({"enabled": True, "open_owner_allowed_sources": bad, "accounts": ACCOUNTS})
     ok = rb.rakazo_bridge_config({"enabled": True, "open_owner_allowed_sources": ["100.64.0.1", "100.64.0.0/24"], "accounts": ACCOUNTS})
     assert len(ok["open_owner_allowed_sources"]) == 2
+
+
+def test_open_owner_allowed_sources_multi_value_and_garbage_forwarded_for(make_server):
+    cfg = bridge_section(open_owner=True, trusted_proxies=["10.0.0.0/8"], open_owner_allowed_sources=["100.64.1.1"])
+    svr, _ = make_server(cfg)
+    assert open_from(svr.rakazo, "10.0.0.2", "100.64.9.9, 100.64.1.1") == 200      # the last entry (the proxy's own append) decides
+    assert open_from(svr.rakazo, "10.0.0.2", "100.64.1.1, 100.64.9.9") == 403
+    assert open_from(svr.rakazo, "10.0.0.2", "garbage") == 403                     # falls back to the proxy itself: not listed
+    assert open_from(svr.rakazo, "10.0.0.2", "100.64.1.1, garbage") == 403
+
+
+def test_open_owner_without_allowed_sources_warns_at_startup(make_server, caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger=rb.log.name):
+        make_server(bridge_section(open_owner=True))
+    assert "no open_owner_allowed_sources" in caplog.text
 
 
 def test_open_owner_needs_an_operator_account_to_act_as():

@@ -253,6 +253,16 @@ class GatewayRouter:
         client, tls = self._terminate_tls(client)
         if client is None:
             return
+        try:
+            real_peer = client.getpeername()[0]
+        except OSError:
+            real_peer = None
+        if (tls or rewrite or external) and not routes and real_peer is None:
+            try:
+                client.close()      # fail closed: no peer address, no X-Forwarded-For to set
+            except OSError:
+                pass
+            return
         if tls and not routes:
             external = external or (self.external_for(port) if port is not None else None)
             target = None
@@ -280,7 +290,7 @@ class GatewayRouter:
             try:
                 target = socket.create_connection((target_host, target_port), timeout=5)
                 from .devfabric import rewriting_pipe
-                rewriting_pipe(client, target, target_port, external or rewrite)
+                rewriting_pipe(client, target, target_port, external or rewrite, forwarded_for=real_peer)
             except OSError:
                 pass
             finally:
