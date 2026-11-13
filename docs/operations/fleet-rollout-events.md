@@ -25,7 +25,7 @@ event types `rollout.observed|planned|started|resumed|succeeded|halted|supersede
 | `repo`, `trigger.repo`, `targets[].repo` | `autospec pi-engineering herdr-engineering ai-sync claude-config` |
 | `host`, `halted_at_host`, `log.host` | `beast bender macbook-pro` (a new fleet member needs a code change) |
 | `status` | `pending precheck applying checking ok blocked failed unreachable skipped rolled_back` |
-| `reason` | `dirty_checkout not_on_main unpublished_commits busy timeout health_failed apply_failed ssh_failed halted optional_unreachable not_published rate_limited ahead_of_target operator` |
+| `reason` | `dirty_checkout not_on_main unpublished_commits busy timeout health_failed apply_failed ssh_failed halted optional_unreachable not_published rate_limited ahead_of_target operator downgrade lock_invalid` |
 | `trigger` | `repo`, `sha` (40 hex), optional `pr` (int), `merged_at` (UTC) - no title |
 | `targets[]` | `repo`, `sha`, optional `before` (40 hex or null), at most 5 |
 | `checks[]` (at most 10) | `name` in `version_matches service_active gateway_registered parity_ok release_complete current_symlink version_smoke generation_receipt verify_ok feed_in_sync`, `status` in `ok failed skipped`, optional `duration_ms` |
@@ -116,7 +116,7 @@ next `run --apply` (event `rollout.resumed`, no reason); a halted rollout is re-
 `operator`). The halt is saved in the same write as the failing row, and a crash that still lost it is repaired on
 resume: a finished row that is not ok (and not a deliberate `optional_unreachable`/`not_applicable` skip) always halts,
 later hosts are never applied and `converged` does not move. A halt that was never emitted is emitted
-(`rollout.halted`) before `rollout.resumed`. The lock file is not written yet (step 5).
+(`rollout.halted`) before `rollout.resumed`. The lock is pinned only after a rollout succeeded (`lock.pinned`), see `fleet-rollout-watcher.md`.
 
 Which host is "local" (applied without ssh) is verified, not assumed: `--local-host auto` (default) is this machine
 when the `host_id` of `~/.config/herdr-engineering/host.json` (else the short hostname) is a fleet host, otherwise
