@@ -238,13 +238,16 @@ function curve(a, b, bend) {
 // When no spot is free the label turns quiet (shown on hover, focus or selection) instead of printing over other text.
 const LABEL_H = 18, LABEL_CHAR = 7, LABEL_TS = [0.5, 0.42, 0.58, 0.34, 0.66, 0.27, 0.73, 0.2, 0.8, 0.14, 0.86], LABEL_DYS = [0, -20, 20, -38, 38];
 const CROWD_CAP = 4;   // past this many collisions a spot is just "crowded": a quiet label does not need an exact count
-const SAMPLE_GAP = 12, MAX_SAMPLES = 240, GRID_CELL = 40;
+const SAMPLE_GAP = 12, MAX_SAMPLES = 240, GRID_CELL = 40, MAX_GRID_CELLS = 250000;
 /** Uniform grid over [minX,maxX]x[minY,maxY]: an item goes into every cell its extent touches (clamped at the border), so a box query only looks at nearby cells. */
 function makeGrid(minX, minY, maxX, maxY) {
-  const cols = Math.max(1, Math.ceil((maxX - minX) / GRID_CELL) + 1), rows = Math.max(1, Math.ceil((maxY - minY) / GRID_CELL) + 1);
+  const w = maxX - minX, h = maxY - minY;
+  // A huge or non-finite extent widens the cell so the grid never exceeds MAX_GRID_CELLS (one cell when the bounds are not finite).
+  const cell = Number.isFinite(w) && Number.isFinite(h) ? Math.max(GRID_CELL, Math.sqrt((Math.max(w, 0) * Math.max(h, 0)) / MAX_GRID_CELLS), Math.max(w, h) / 500) : Infinity;
+  const cols = Number.isFinite(cell) ? Math.max(1, Math.ceil(w / cell) + 1) : 1, rows = Number.isFinite(cell) ? Math.max(1, Math.ceil(h / cell) + 1) : 1;
   const cells = Array.from({ length: cols * rows }, () => null);
-  const cx = (x) => Math.min(cols - 1, Math.max(0, Math.floor((x - minX) / GRID_CELL)));
-  const cy = (y) => Math.min(rows - 1, Math.max(0, Math.floor((y - minY) / GRID_CELL)));
+  const cx = (x) => Math.min(cols - 1, Math.max(0, Math.floor((x - minX) / cell)));
+  const cy = (y) => Math.min(rows - 1, Math.max(0, Math.floor((y - minY) / cell)));
   return {
     add(item, x0, x1, y0, y1) {
       for (let gx = cx(x0), ex = cx(x1); gx <= ex; gx += 1) for (let gy = cy(y0), ey = cy(y1); gy <= ey; gy += 1) { const k = gx * rows + gy; if (cells[k]) cells[k].push(item); else cells[k] = [item]; }
