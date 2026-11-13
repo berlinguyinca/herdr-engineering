@@ -56,7 +56,7 @@ def bot_view(assistant, thread_id: str, preview: str, status: str, space_id: str
     return {
         "id": assistant.assistant_id, "spaceId": space_id, "name": assistant.name, "title": "",
         "description": "", "instructions": assistant.instructions, "color": _AVATAR, "avatarSet": "organic",
-        "notifyOnFinish": False, "pinned": False, "sectionId": None, "archivedAt": None, "unread": False,
+        "notifyOnFinish": False, "pinned": False, "isDefault": False, "sectionId": None, "archivedAt": None, "unread": False,
         "parentBotId": None, "memoryScope": None, "threadId": thread_id, "preview": preview, "status": status,
         "runErrorId": None, "computerMode": "team", "updatedAt": stamp, "createdAt": iso(assistant.created_at),
         "voiceId": None, "autoSpeak": False, "modelProvider": None,
@@ -67,7 +67,7 @@ def bot_view(assistant, thread_id: str, preview: str, status: str, space_id: str
     }
 
 
-_SPACE_BOT_KEYS = ("id", "spaceId", "name", "title", "color", "avatarSet", "notifyOnFinish", "pinned", "sectionId",
+_SPACE_BOT_KEYS = ("id", "spaceId", "name", "title", "color", "avatarSet", "notifyOnFinish", "pinned", "isDefault", "sectionId",
                    "unread", "parentBotId", "preview", "status", "runErrorId", "updatedAt")
 
 
