@@ -96,8 +96,8 @@ export function renderNode(n, { selected = false, pulse = false, tab = true, com
   // Drift: a small warning triangle on the ring at the upper right. It is a heuristic and says so (title, aria-label, legend).
   const drift = n.hasDrift ? `<g class="ao-drift-badge" transform="translate(${f1((RING_R + 2) * 0.707)} ${f1(-(RING_R + 2) * 0.707)})"><title>Drift signal (heuristic)</title><path d="M0 -13L13 10H-13z"/><text y="6" text-anchor="middle" aria-hidden="true">!</text></g>` : '';
   // Model switched: a pill under the node, apart from any handoff edge (a switch happens inside one agent, a handoff goes between two).
-  const from = n.switchedFrom ? clip(n.switchedFrom, 14) : '';
-  const pillW = f1(`switched from ${from}`.length * 6.6 + 20);
+  const from = n.switchedFrom ? clip(n.switchedFrom, compact ? 9 : 14) : '';
+  const pillW = f1(`switched from ${from}`.length * (compact ? 8.2 : 6.6) + 20);
   const pill = n.switchedFrom ? `<g class="ao-switched" transform="translate(0 ${RING_R + 48})"><title>Model switched from ${esc(n.switchedFrom)} to ${esc(n.model)}</title><rect x="${f1(-pillW / 2)}" y="-11" width="${pillW}" height="22" rx="11"/><text y="4" text-anchor="middle">switched from ${esc(from)}</text></g>` : '';
   return `<g class="ao-node ao-node--${n.state.tone}${n.person ? ' ao-node--person' : ''}${selected ? ' is-selected' : ''}" data-ao-node="${esc(n.id)}" transform="translate(${n.x} ${n.y})" tabindex="${tab ? 0 : -1}" role="button" aria-pressed="${selected}" aria-label="${esc(describeNode(n))}">
     <circle class="ao-halo ao-halo--${n.state.tone}" r="${HALO_R}"/>${track}${arc}<circle class="ao-body" r="${NODE_R}"/>${inner}${drift}
@@ -122,7 +122,7 @@ export function renderMarkers() {
 
 export function renderScene(scene, { selected = null, pulses = new Set(), flowing = true, label = 'Agent activity map', tabId = null } = {}) {
   const vb = scene.viewBox;
-  const rooms = scene.rooms.map((r) => `<g class="ao-room" aria-hidden="true"><ellipse cx="${r.cx}" cy="${r.cy}" rx="${r.rx ?? r.r}" ry="${r.ry ?? r.r}"/><text x="${r.cx}" y="${f1(r.cy - (r.ry ?? r.r) + 26)}" text-anchor="middle">${esc(r.label)}${r.ctx?.known && r.ctx.percent != null ? ` · avg ${r.ctx.percent}% ctx` : ''}</text></g>`).join('');
+  const rooms = scene.rooms.map((r) => `<g class="ao-room" aria-hidden="true">${r.shape === 'rect' ? `<rect x="${f1(r.cx - r.rx)}" y="${f1(r.cy - r.ry)}" width="${f1(2 * r.rx)}" height="${f1(2 * r.ry)}" rx="48"/>` : `<ellipse cx="${r.cx}" cy="${r.cy}" rx="${r.rx ?? r.r}" ry="${r.ry ?? r.r}"/>`}<text x="${r.cx}" y="${f1(r.cy - (r.ry ?? r.r) + 26)}" text-anchor="middle">${esc(r.label)}${r.ctx?.known && r.ctx.percent != null ? ` · avg ${r.ctx.percent}% ctx` : ''}</text></g>`).join('');
   const edges = scene.edges.map((e) => renderEdge(e, scene, { selected: selected?.type === 'edge' && selected.id === e.id, flowing })).join('');
   // Roving tabindex: one node is the tab stop (the chosen one, else the first); arrows move between the rest.
   const stop = scene.nodes.some((n) => n.id === tabId) ? tabId : scene.nodes[0]?.id;

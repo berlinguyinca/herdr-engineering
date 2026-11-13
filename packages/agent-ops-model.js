@@ -18,7 +18,8 @@ export const RING_W = 8;
 export const RING_R = NODE_R + RING_GAP;
 export const HALO_R = RING_R + 12;
 export const CLUSTER_PAD = 40;
-export const LABEL_BELOW = 124;   // distance below a node centre that its state label and switched-model pill need
+export const LABEL_BELOW = 124;
+const GRID_COL = 214, GRID_ROW = 205;   // phone layout: two columns, one row per pair   // distance below a node centre that its state label and switched-model pill need
 export const NO_ROOM = '';
 
 // ---- context fraction (ADR: amber >= 70, red >= 90) -------------------------------------------------------------------------
@@ -236,12 +237,12 @@ function curve(a, b, bend) {
 // Edge labels: try the middle of the curve first, then slide along it, keeping clear of earlier labels and of node halos.
 // When no spot is free the label turns quiet (shown on hover, focus or selection) instead of printing over other text.
 const LABEL_H = 18, LABEL_CHAR = 7, LABEL_TS = [0.5, 0.42, 0.58, 0.34, 0.66, 0.27, 0.73, 0.2, 0.8, 0.14, 0.86], LABEL_DYS = [0, -20, 20];
-function placeLabels(items, nodes) {
+function placeLabels(items, nodes, charW = LABEL_CHAR) {
   const placed = [];
   const hit = (a, b) => Math.abs(a.x - b.x) < (a.w + b.w) / 2 && Math.abs(a.y - b.y) < (a.h + b.h) / 2;
   const blocks = nodes.flatMap((n) => [{ x: n.x, y: n.y, w: 2 * RING_R, h: 2 * RING_R }, { x: n.x, y: n.y + RING_R + 22, w: 170, h: 18 }, { x: n.x, y: n.y + RING_R + 46, w: 170, h: 20 }]);
   for (const it of items) {
-    const w = String(it.label || '').length * LABEL_CHAR + 10;
+    const w = String(it.label || '').length * charW + 10;
     let best = null;
     search: for (const t of LABEL_TS) for (const dy of LABEL_DYS) {
       const p = it.at(t), box = { x: p.x, y: p.y - 6 + dy, w, h: LABEL_H };
@@ -289,12 +290,17 @@ export function layoutScene(snapshot, { mode = 'activity', filters = {}, aspect 
     const angle = k <= 1 ? 0 : -Math.PI / 2 + (2 * Math.PI * gi) / k;
     const cx = k <= 1 ? 0 : orbit * Math.cos(angle) * 1.25, cy = k <= 1 ? 0 : orbit * Math.sin(angle);
     const n = g.members.length, ringR = n <= 1 ? 0 : memberRing(n);
-    const rx = n <= 1 ? radii[gi] : ringR * sx + LABEL_BELOW + 12, ry = n <= 1 ? radii[gi] : ringR * sy + LABEL_BELOW + 12;
+    let rx = n <= 1 ? radii[gi] : ringR * sx + LABEL_BELOW + 12, ry = n <= 1 ? radii[gi] : ringR * sy + LABEL_BELOW + 12;
+    // Phone: one room is two columns of nodes in a rounded box, so the scene is narrow and scales up instead of shrinking the text away.
+    const grid = k <= 1 && compact && n > 1;
+    const rows = Math.ceil(n / 2), top0 = -((rows - 1) * GRID_ROW) / 2;
+    if (grid) { rx = GRID_COL / 2 + HALO_R + 10; ry = ((rows - 1) * GRID_ROW) / 2 + (HALO_R + 40 + LABEL_BELOW) / 2; }
     g.members.forEach((m, i) => {
       const a = n <= 1 ? 0 : -Math.PI / 2 + (2 * Math.PI * i) / n;
+      const gx = grid ? ((i % 2) - 0.5) * GRID_COL * (n % 2 && i === n - 1 ? 0 : 1) : 0, gy = grid ? top0 + Math.floor(i / 2) * GRID_ROW : 0;
       const ctx = contextInfo(m.context, m.context_health), st = stateInfo(m.state);
       nodes.push({
-        id: m.node_id, x: r1(cx + ringR * sx * Math.cos(a)), y: r1(cy + ringR * sy * Math.sin(a)), r: NODE_R, room: g.id, person: m.kind === 'person' || isPerson(m.node_id),
+        id: m.node_id, x: r1(cx + (grid ? gx : ringR * sx * Math.cos(a))), y: r1(cy + (grid ? gy : ringR * sy * Math.sin(a))), r: NODE_R, room: g.id, person: m.kind === 'person' || isPerson(m.node_id),
         name: nodeName(m), model: modelLabel(m), modelKnown: Boolean(m.model), provider: m.provider || null, host: m.host_id || null,
         ctx, ring: ringGeometry(ctx.fraction), state: st, provenance: m.provenance || 'unknown', parent: m.parent_session_id || null,
         modelChanges: list(m.model_changes).length, switchedFrom: switchedFrom(m), hasDrift: !m.kind && (list(m.drift).length > 0 || (m.drift_warnings || 0) > 0), compactions: m.compactions || 0, drift: m.drift_warnings || 0, driftItems: driftItems(m), lastEventAt: m.last_event_at || null,
@@ -303,7 +309,7 @@ export function layoutScene(snapshot, { mode = 'activity', filters = {}, aspect 
     });
     const rh = list(view.rooms).find((r) => r.room_id === g.id)?.context_health;
     rooms.push({ id: g.id, ctx: contextInfo(null, rh && Number.isFinite(rh.average_fraction) ? { measured: true, fraction: rh.average_fraction } : null), name: list(view.rooms).find((r) => r.room_id === g.id)?.name || null, label: roomLabel(g.id, list(view.rooms).find((r) => r.room_id === g.id)?.name),
-      cx: r1(cx), cy: r1(cy), r: r1(Math.max(rx, ry)), rx: r1(rx), ry: r1(ry), members: g.members.map((m) => m.node_id) });
+      cx: r1(cx), cy: r1(cy + (grid ? (LABEL_BELOW - HALO_R - 40) / 2 : 0)), r: r1(Math.max(rx, ry)), rx: r1(rx), ry: r1(ry), shape: grid ? 'rect' : 'ellipse', members: g.members.map((m) => m.node_id) });
   });
 
   for (const n of nodes) n.roomLabel = rooms.find((r) => r.id === n.room)?.label || roomLabel(n.room);
@@ -328,7 +334,7 @@ export function layoutScene(snapshot, { mode = 'activity', filters = {}, aspect 
     };
   });
 
-  placeLabels(edges, nodes);
+  placeLabels(edges, nodes, compact ? LABEL_CHAR * 1.3 : LABEL_CHAR);
   for (const e of edges) delete e.at;
 
   // Fit: the box around every room ellipse and node (with its labels), padded, never smaller than a sane minimum so one node is not blown up.
@@ -337,7 +343,7 @@ export function layoutScene(snapshot, { mode = 'activity', filters = {}, aspect 
   let minX = xs.length ? Math.min(...xs) - 12 : -260, maxX = xs.length ? Math.max(...xs) + 12 : 260;
   let minY = ys.length ? Math.min(...ys) - 12 : -170, maxY = ys.length ? Math.max(...ys) + 12 : 170;
   const grow = (lo, hi, min) => (hi - lo >= min ? [lo, hi] : [(lo + hi) / 2 - min / 2, (lo + hi) / 2 + min / 2]);
-  [minX, maxX] = grow(minX, maxX, 520); [minY, maxY] = grow(minY, maxY, 340);
+  [minX, maxX] = grow(minX, maxX, compact ? 380 : 520); [minY, maxY] = grow(minY, maxY, 340);
   return { mode, nodes, edges, rooms, tasks: view.tasks, viewBox: { x: r1(minX), y: r1(minY), w: r1(maxX - minX), h: r1(maxY - minY) }, compact,
     counts: { nodes: nodes.length, edges: edges.length, rooms: rooms.length, tasks: view.tasks.length }, cursor: snapshot?.cursor ?? null, truncated: Boolean(snapshot?.truncated) };
 }

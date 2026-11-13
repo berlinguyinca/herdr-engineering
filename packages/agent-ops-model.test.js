@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   agentOpsEnabled, altTable, buildTimeline, contextInfo, cursorTime, describeEdge, describeNode, diffSnapshots, edgeId, edgeStyle, filterOptions, filterSnapshot,
-  indexAtFraction, layoutScene, hostStrip, driftItems, TIMELINE_CAP, modeKinds, neighbour, nextIndex, replayFrame, ringGeometry, stateInfo, stepDelay, NODE_R, RING_R,
+  indexAtFraction, layoutScene, hostStrip, driftItems, TIMELINE_CAP, modeKinds, neighbour, nextIndex, replayFrame, ringGeometry, stateInfo, stepDelay, NODE_R, RING_R, HALO_R,
 } from './agent-ops-model.js';
 
 const agent = (id, over = {}) => ({ node_id: id, agent_id: id, session_id: id, host_id: 'h1', provider: null, model: 'opus', model_changes: [], state: 'idle',
@@ -345,7 +345,9 @@ test('the Room filter drops a person whose edges belong to another room', () => 
 test('the scene is fitted: the viewBox hugs the content and follows the requested aspect', () => {
   const wide = layoutScene(ROOM(), { aspect: 1.5 }), tall = layoutScene(ROOM(), { aspect: 0.6 });
   assert.ok(wide.viewBox.w / wide.viewBox.h > tall.viewBox.w / tall.viewBox.h);
-  assert.ok(tall.viewBox.w < wide.viewBox.w, 'a phone scene is narrower, so it scales up less to fit');
+  assert.ok(tall.viewBox.w < wide.viewBox.w * 0.6, 'a phone scene is much narrower, so it scales up to fit the card');
+  assert.equal(tall.rooms[0].shape, 'rect'); assert.equal(wide.rooms[0].shape, 'ellipse');
+  assert.ok(tall.nodes.every((n) => Math.abs(n.x - tall.rooms[0].cx) <= tall.rooms[0].rx - HALO_R + 1), 'phone nodes sit inside the box');
   assert.ok(tall.compact && !wide.compact);
   for (const s of [wide, tall]) for (const n of s.nodes) {
     const vb = s.viewBox;

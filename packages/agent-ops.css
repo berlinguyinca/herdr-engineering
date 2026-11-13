@@ -45,7 +45,7 @@
 .ao-key--review line { stroke: var(--ao-review); } .ao-key--ownership line { stroke: var(--ao-ownership); }
 
 /* rooms */
-.ao-room ellipse { fill: color-mix(in srgb, var(--surface-2) 55%, transparent); stroke: var(--border); stroke-width: 1.5; stroke-dasharray: 3 7; }
+.ao-room ellipse, .ao-room rect { fill: color-mix(in srgb, var(--surface-2) 55%, transparent); stroke: var(--border); stroke-width: 1.5; stroke-dasharray: 3 7; }
 .ao-room text { fill: var(--text-muted); font: 700 15px var(--font-sans); letter-spacing: 0.06em; text-transform: uppercase; }
 
 /* nodes */
