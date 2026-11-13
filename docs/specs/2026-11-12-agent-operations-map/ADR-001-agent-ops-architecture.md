@@ -32,3 +32,23 @@ herdr-handoff has no LICENSE file: interoperate via its schema, copy nothing.
 
 ## Rollback
 Everything is additive behind `agent_ops_v1`; disable = capability off; revert = drop branch.
+
+## Always-on changes outside the `agent_ops_v1` flag
+Two edits ship regardless of the flag, so "revert = capability off" does not undo them:
+- `envelope.py` `normalize_envelope` validates the optional agent-ops fields of a v2 envelope. A v2 sender with an
+  invalid optional ops field, or an `event_id` not matching `[A-Za-z0-9._:~-]{1,128}`, now gets a 400.
+- `ingest.py` strips a client-sent `_envelope` key from the payload (server-owned metadata, never client-set).
+
+## Trust model
+API keys are shared and authenticate only; they do not identify a person. A node's identity is its session id.
+Guest and external narrowing applies only to callers who send `Authorization`: anyone holding an `X-API-Key` who
+omits it reads org scope. The narrowing is defence in depth, not a security boundary.
+
+## Guest and external visibility
+Fail closed: a guest, a lapsed guest, or an external agent reads `room:` chat sources of its allowed rooms and nothing
+else (no org or private events, with the viewer key or the operator key). The trade-off: a lapsed guest sees an empty
+map rather than the org map, even though their sign-in is still valid.
+- "Lapsed guest" means the person's latest room membership was a guest one. A later non-guest add clears it
+  (`_ever_guests` is rebuilt identically on log replay). Re-added as contributor then removed, they read org scope again.
+- An agent inherits its owner's lapsed-guest status only when the owner reads no room other than guest rooms.
+- An external agent is treated as a guest bound to its invited room; once the binding expires it sees nothing.
