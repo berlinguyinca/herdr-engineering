@@ -22,14 +22,14 @@ Conclusion: open-weight models are useful as a cheap first pass but are not trus
 
 ### Reuse `ai-review.py poll`
 
-Keep the structure of `deploy/ci-review/ai-review.py poll`: list open non-draft PRs, review once per head SHA, idempotent (a terminal status for the head means done), retry a stale pending status after `pending_stale_minutes`, the **poster decides the state** (never the model), and drop findings that cite files not in the PR. Today `ai-review.py` defaults `poll.skip_drafts` to `false` (`ai-review.py:98`, used at `:1149`), so drafts are skipped only when `poll.skip_drafts: true` is set. The proposal sets it `true` in the config of the review unit. New code goes in a sibling module or a `--tier` option so the existing `Independent AI review` path keeps working.
+Keep the structure of `deploy/ci-review/ai-review.py poll`: list open PRs, review once per head SHA, idempotent (a terminal status for the head means done), retry a stale pending status after `pending_stale_minutes`, the **poster decides the state** (never the model), and drop findings that cite files not in the PR. Today `ai-review.py` defaults `poll.skip_drafts` to `false` (`ai-review.py:98`, used at `:1149`), so drafts are skipped only when `poll.skip_drafts: true` is set. The proposal sets it `true` in the config of the review unit. New code goes in a sibling module or a `--tier` option so the existing `Independent AI review` path keeps working.
 
 ### Two tiers
 
 | | Tier 1 | Tier 2 |
 | --- | --- | --- |
 | Reviewer | open-weight model via the pi gateway | local headless Claude Opus: `claude -p --model opus` |
-| Runs on | every push (every new head SHA) | only a head that is otherwise mergeable: all other checks green (`artifact-handoff`, `structural-gates`, `ui-gates`, `unit-gates`, `verify`, `GitGuardian`) |
+| Runs on | every push (every new head SHA) | only a head that is otherwise mergeable: every check that ran on the head is green (contexts `ci/woodpecker/pr/{artifact-handoff,structural-gates,unit-gates,ui-gates}`, `verify`, `GitGuardian Security Checks`; `ui-gates` only runs for certain paths, so a missing one is not a wait) |
 | Effect | **advisory only**; never posts `Opus agent review`. Posts under a different context, e.g. `Open-weight pre-review`, and optionally one marked PR comment | posts `Opus agent review` success or failure |
 | Tools | none (diff as data, as today) | read-only: Read, Grep, Glob and an allowlisted `git diff`, enforced with `--allowedTools` / `--disallowedTools`. No WebFetch, WebSearch or write tools. `claude -p` still needs API reach and its login on the host |
 
