@@ -94,6 +94,7 @@ class Viewer(NamedTuple):
     operator: bool = False
     external: bool = False
     guest_rooms: frozenset = frozenset()     # rooms where the caller is a guest: room events only (no helper/agent data)
+    guest_only: bool = False                 # every readable room is a guest room: only ``room:`` sources, whatever the key
 
 
 # --------------------------------------------------------------------------------------------- normalisation
@@ -248,7 +249,8 @@ def carry_forward(dropped: list[dict]) -> list[dict]:
     for ev in dropped:
         category = _category(ev)
         if category:
-            latest[(category, ev["source"], ev["agent_id"], ev["session_id"], ev["host_id"], ev["room_id"])] = ev
+            latest[(category, ev["source"], ev["actor_ref"], ev["agent_id"], ev["session_id"], ev["host_id"],
+                    ev["room_id"])] = ev
     return sorted(latest.values(), key=cursor_of)[-_CARRY_MAX:]
 
 
@@ -337,6 +339,8 @@ def handoff_events(registry: Any) -> list[dict]:
 def visible(event: dict, viewer: Viewer) -> bool:
     """Fail closed: a room event needs room access; a room-less event needs org scope or the operator."""
     scope = event["visibility_scope"]
+    if viewer.guest_only:
+        return bool(event["room_id"] in viewer.guest_rooms and event["source"].startswith("room:"))
     if scope == "private":
         return viewer.operator
     if event["room_id"]:
@@ -670,8 +674,9 @@ class AgentOpsService:
 
     def viewer(self, principal: Any = None, operator: bool = False) -> Viewer:
         rooms = frozenset(self.collab.readable_room_ids(principal)) if self.collab and principal is not None else frozenset()
+        guests = self._guest_rooms(principal, rooms)
         return Viewer(rooms=rooms, operator=operator, external=bool(getattr(principal, "external", False)),
-                      guest_rooms=self._guest_rooms(principal, rooms))
+                      guest_rooms=guests, guest_only=bool(guests) and guests == rooms)
 
     def _guest_rooms(self, principal: Any, rooms: frozenset) -> frozenset:
         """Rooms where the caller (or the person an agent acts for) is a guest."""
