@@ -208,3 +208,33 @@ test('stalled and failed handoff edges: distinct line, state in text, explained 
   assert.match(renderInspector({ type: 'edge', id: failed.id }, sc, HEALTHY), /failed/);
   assert.match(renderLegend(), /stalled/);
 });
+
+// ---- visual pass: node markers, fitted svg, room names -------------------------------------------------------------------------
+test('node carries a drift badge (heuristic) and a model-switched marker, each with a text form', () => {
+  const snap = { ...SNAP, agents: [agent('a1', { model: 'opus', model_changes: [{ from: 'sonnet-4', to: 'opus' }], drift: [{ kind: 'reported_drift_warning', provenance: 'derived', evidence_event_ids: [] }] }), agent('a2')], edges: [], tasks: [] };
+  const [a1, a2] = layoutScene(snap).nodes;
+  const html = renderNode(a1), plain = renderNode(a2);
+  assert.match(html, /class="ao-drift-badge"/);
+  assert.match(html, /<title>Drift signal \(heuristic\)<\/title>/);
+  assert.match(html, /class="ao-switched"/);
+  assert.match(html, /switched from sonnet-4/);
+  assert.match(html, /aria-label="[^"]*drift signal \(heuristic\)[^"]*model switched from sonnet-4/);
+  assert.ok(!/ao-drift-badge|ao-switched/.test(plain));
+});
+
+test('scene svg is fitted to its content (aspect-ratio from the viewBox), room is titled by name, compact on phones', () => {
+  const snap = { ...SNAP, agents: SNAP.agents.map((a) => ({ ...a, room_ids: ['rX'] })), rooms: [{ room_id: 'rX', name: 'product-dev', agent_ids: ['a1', 'a2', 'a3'] }] };
+  const wide = layoutScene(snap, { aspect: 1.4 }), phone = layoutScene(snap, { aspect: 0.55 });
+  const w = renderScene(wide), p = renderScene(phone);
+  assert.match(w, new RegExp(`aspect-ratio:${wide.viewBox.w} / ${wide.viewBox.h}`));
+  assert.match(w, /<ellipse /);
+  assert.match(w, />product-dev/);
+  assert.ok(!/ao-svg--compact/.test(w)); assert.match(p, /ao-svg--compact/);
+  assert.ok(!/ROOM_|Room rX/.test(w));
+});
+
+test('room filter option shows the room name', () => {
+  const html = renderFilters({ room: ['rX'], roomName: { rX: 'product-dev' } }, { room: '' });
+  assert.match(html, /<option value="rX">product-dev<\/option>/);
+  assert.match(renderFilters({ room: ['room_0123456789ABCDEF'] }, {}), /room_0….*CDEF/);
+});

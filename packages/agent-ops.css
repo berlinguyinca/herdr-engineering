@@ -23,7 +23,7 @@
 .ao-main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; align-items: start; }
 .ao-stage { min-width: 0; border: 1px solid var(--border); border-radius: calc(var(--radius) + 4px); background: radial-gradient(ellipse at 50% 38%, color-mix(in srgb, var(--accent) 7%, var(--surface)) 0%, var(--surface) 62%); box-shadow: var(--shadow-lg); overflow: hidden; }
 .ao-canvas { overflow: auto; }
-.ao-svg { display: block; width: 100%; height: clamp(440px, 72vh, 820px); }
+.ao-svg { display: block; width: 100%; height: auto; max-height: 88vh; }
 .ao-inspector { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: 16px; position: sticky; top: 12px; max-height: 80vh; overflow: auto; min-width: 0; }
 .ao-inspector h2, .ao-inspector h3 { margin: 0 0 8px; overflow-wrap: anywhere; }
 .ao-inspector-title { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-secondary); }
@@ -45,8 +45,8 @@
 .ao-key--review line { stroke: var(--ao-review); } .ao-key--ownership line { stroke: var(--ao-ownership); }
 
 /* rooms */
-.ao-room circle { fill: color-mix(in srgb, var(--surface-2) 55%, transparent); stroke: var(--border); stroke-width: 1.5; stroke-dasharray: 3 7; }
-.ao-room text { fill: var(--text-muted); font: 600 13px var(--font-sans); letter-spacing: 0.06em; text-transform: uppercase; }
+.ao-room ellipse { fill: color-mix(in srgb, var(--surface-2) 55%, transparent); stroke: var(--border); stroke-width: 1.5; stroke-dasharray: 3 7; }
+.ao-room text { fill: var(--text-muted); font: 700 15px var(--font-sans); letter-spacing: 0.06em; text-transform: uppercase; }
 
 /* nodes */
 .ao-node { cursor: pointer; outline: none; --tone: var(--status-waiting); }
@@ -63,25 +63,25 @@
 .ao-ring { stroke: var(--status-ok); transition: stroke-dasharray 0.6s ease; }
 .ao-ring--ok { stroke: var(--status-ok); } .ao-ring--warn { stroke: var(--status-attention); } .ao-ring--critical { stroke: var(--status-failed); }
 .ao-ring-unknown { stroke: var(--text-muted); stroke-width: 3; stroke-dasharray: 2 7; stroke-linecap: round; fill: none; }
-.ao-name { fill: var(--text); font: 700 12.5px var(--font-sans); pointer-events: none; }
-.ao-model { fill: var(--accent-ink); font: 600 10.5px var(--font-mono); pointer-events: none; }
+.ao-name { fill: var(--text); font: 700 15px var(--font-sans); pointer-events: none; }
+.ao-model { fill: var(--accent-ink); font: 600 11.5px var(--font-mono); pointer-events: none; }
 .ao-model--unknown { fill: var(--text-muted); font-style: italic; font-weight: 400; }
-.ao-ctx { fill: var(--text-secondary); font: 600 9.5px var(--font-sans); pointer-events: none; }
+.ao-ctx { fill: var(--text-secondary); font: 600 11.5px var(--font-sans); pointer-events: none; }
 .ao-ctx--warn { fill: var(--status-attention); } .ao-ctx--critical { fill: var(--status-failed); } .ao-ctx--unknown { fill: var(--text-muted); font-weight: 400; }
-.ao-state-label, .ao-state { fill: var(--text-secondary); font: 600 11px var(--font-sans); letter-spacing: 0.02em; pointer-events: none; }
+.ao-state-label, .ao-state { fill: var(--text-secondary); font: 600 13px var(--font-sans); letter-spacing: 0.02em; pointer-events: none; }
 text.ao-state { paint-order: stroke; stroke: var(--surface); stroke-width: 4px; stroke-linejoin: round; }
 
 /* edges */
 .ao-edge { cursor: pointer; outline: none; --edge: var(--text-muted); }
 .ao-edge--comm { --edge: var(--ao-comm); } .ao-edge--delegation { --edge: var(--ao-delegation); } .ao-edge--handoff { --edge: var(--ao-handoff); }
 .ao-edge--review { --edge: var(--ao-review); } .ao-edge--ownership { --edge: var(--ao-ownership); }
-.ao-edge-hit { stroke: transparent; stroke-width: 22px; }
+.ao-edge-hit { stroke: transparent; stroke-width: 26px; }
 .ao-edge-line { stroke: var(--edge); stroke-width: 3; stroke-linecap: round; opacity: 0.9; filter: drop-shadow(0 0 4px color-mix(in srgb, var(--edge) 55%, transparent)); transition: stroke-width var(--motion-fast); }
 .ao-edge:hover .ao-edge-line, .ao-edge.is-selected .ao-edge-line { stroke-width: 5; }
 .ao-edge:focus-visible .ao-edge-line { stroke: var(--focus-ring); stroke-width: 5; }
 .ao-edge--dotted .ao-edge-line { opacity: 0.55; }
 .ao-edge.is-dim { opacity: 0.18; }
-.ao-edge-label { fill: var(--text); font: 600 11px var(--font-sans); paint-order: stroke; stroke: var(--surface); stroke-width: 5px; stroke-linejoin: round; pointer-events: none; }
+.ao-edge-label { fill: var(--text); font: 600 12px var(--font-sans); paint-order: stroke; stroke: var(--surface); stroke-width: 5px; stroke-linejoin: round; pointer-events: none; }
 .ao-arrow path { fill: context-stroke; }
 .ao-arrow--comm path { fill: var(--ao-comm); } .ao-arrow--delegation path { fill: var(--ao-delegation); } .ao-arrow--handoff path { fill: var(--ao-handoff); }
 .ao-arrow--review path { fill: var(--ao-review); } .ao-arrow--ownership path { fill: var(--ao-ownership); }
@@ -123,10 +123,10 @@ html[data-calm="on"] .ao-particle { display: none; }
 }
 
 /* tablet and phone: inspector stacks under the map, the map keeps a readable minimum width and scrolls instead of shrinking labels away */
-@media (max-width: 1100px) { .ao-main { grid-template-columns: minmax(0, 1fr); } .ao-inspector { position: static; max-height: none; } .ao-svg { height: clamp(380px, 60vh, 640px); } }
+@media (max-width: 1100px) { .ao-main { grid-template-columns: minmax(0, 1fr); } .ao-inspector { position: static; max-height: none; } }
 @media (max-width: 520px) {
   .ao-bar { align-items: stretch; } .ao-filters { width: 100%; } .ao-filter { flex: 1 1 42%; } .ao-filter select { max-width: none; width: 100%; }
-  .ao-svg { min-width: 560px; height: 480px; } .ao-timeline-row { gap: 8px; } .ao-btn { padding-inline: 12px; }
+  .ao-timeline-row { gap: 8px; } .ao-btn { padding-inline: 12px; }
 }
 
 /* Work Command Center embed: task lineage under the Overview */
@@ -167,3 +167,18 @@ html[data-calm="on"] .ao-particle { display: none; }
 /* stalled handoff: dash-dot, amber, no particles (the label says "stalled" too) */
 .ao-edge--stalled .ao-edge-line { stroke: var(--status-attention); }
 .ao-key--stalled line { stroke: var(--status-attention); }
+
+/* phone: the scene is laid out tall and scaled to the card width, so text is bumped in scene units to stay readable after the scale-down */
+.ao-svg--compact .ao-name { font-size: 18px; } .ao-svg--compact .ao-model { font-size: 14px; } .ao-svg--compact .ao-ctx { font-size: 14px; }
+.ao-svg--compact .ao-state { font-size: 16px; } .ao-svg--compact .ao-edge-label { font-size: 15px; } .ao-svg--compact .ao-room text { font-size: 18px; }
+.ao-svg--compact .ao-switched text { font-size: 14px; }
+
+/* drift badge (heuristic) and model-switched pill, both on the node itself */
+.ao-drift-badge path { fill: var(--status-attention); stroke: var(--surface); stroke-width: 2.5; stroke-linejoin: round; }
+.ao-drift-badge text { fill: var(--surface); font: 800 15px var(--font-sans); pointer-events: none; }
+.ao-switched rect { fill: var(--surface); stroke: var(--accent); stroke-width: 1.8; }
+.ao-switched text { fill: var(--accent-ink); font: 600 12px var(--font-sans); pointer-events: none; }
+.ao-key--drift path { fill: var(--status-attention); }
+.ao-key--switched rect { fill: var(--surface); stroke: var(--accent); stroke-width: 1.6; }
+.ao-key svg { flex: none; }
+.ao-key--drift, .ao-key--switched { fill: none; }

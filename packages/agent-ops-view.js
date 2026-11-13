@@ -57,7 +57,7 @@ export function renderFilters(options, filters) {
   const selects = FILTER_KEYS.map((k) => {
     const values = list(options?.[k]);
     const cur = text(filters?.[k]);
-    const opts = [`<option value="">All</option>`, ...values.map((v) => `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(k === 'kind' ? EDGE_KINDS[v]?.label || v : k === 'room' ? shortId(v) : v)}</option>`)];
+    const opts = [`<option value="">All</option>`, ...values.map((v) => `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(k === 'kind' ? EDGE_KINDS[v]?.label || v : k === 'room' ? options?.roomName?.[v] || shortId(v) : v)}</option>`)];
     if (cur && !values.includes(cur)) opts.push(`<option value="${esc(cur)}" selected>${esc(cur)}</option>`);
     return `<label class="ao-filter">${FILTER_LABEL[k]}<select data-ao-filter="${k}">${opts.join('')}</select></label>`;
   });
@@ -71,13 +71,15 @@ export function renderLegend() {
     <li class="ao-key ao-key--line"><svg width="30" height="8" aria-hidden="true"><line x1="1" y1="4" x2="29" y2="4"/></svg>accepted (solid)</li>
     <li class="ao-key ao-key--line ao-key--planned"><svg width="30" height="8" aria-hidden="true"><line x1="1" y1="4" x2="29" y2="4" stroke-dasharray="6 4"/></svg>planned (dashed)</li>
     <li class="ao-key ao-key--line ao-key--stalled"><svg width="30" height="8" aria-hidden="true"><line x1="1" y1="4" x2="29" y2="4" stroke-dasharray="10 3 2 3"/></svg>stalled handoff (dash-dot)</li>
+    <li class="ao-key ao-key--drift"><svg width="16" height="16" viewBox="-14 -14 28 28" aria-hidden="true"><path d="M0 -13L13 10H-13z"/></svg>drift signal (heuristic)</li>
+    <li class="ao-key ao-key--switched"><svg width="26" height="12" viewBox="0 0 26 12" aria-hidden="true"><rect x="1" y="1" width="24" height="10" rx="5"/></svg>model switched from (inside one agent, not a handoff)</li>
     <li class="ao-key ao-key--ring">outer ring = context used (amber 70%+, red 90%+, always labelled)</li></ul>`;
 }
 
 // ---- the map --------------------------------------------------------------------------------------------------------------------
 const f1 = (n) => Math.round(num(n) * 10) / 10;
 
-export function renderNode(n, { selected = false, pulse = false, tab = true } = {}) {
+export function renderNode(n, { selected = false, pulse = false, tab = true, compact = false } = {}) {
   const ring = n.ring, ctx = n.ctx;
   const level = n.person ? 'person' : ctx.level;
   const arc = n.person ? '' : ring.unknown
@@ -85,14 +87,21 @@ export function renderNode(n, { selected = false, pulse = false, tab = true } = 
     : `<circle class="ao-ring ao-ring--${level}${pulse ? ' ao-pulse' : ''}" r="${RING_R}" fill="none" stroke-width="${RING_W}" stroke-linecap="round" stroke-dasharray="${ring.dash} ${ring.gap}" transform="rotate(-90)"/>`;
   const track = n.person ? '' : `<circle class="ao-track" r="${RING_R}" fill="none" stroke-width="${RING_W}"/>`;
   const warn = !n.person && (ctx.level === 'critical' ? ' !' : '');
+  const nameMax = compact ? 9 : 11, modelMax = compact ? 11 : 13;
   const inner = n.person
-    ? `<text class="ao-name" y="4" text-anchor="middle">${esc(clip(n.name, 12))}</text>`
-    : `<text class="ao-name" y="-7" text-anchor="middle">${esc(clip(n.name, 12))}</text>
-       <text class="ao-model${n.modelKnown ? '' : ' ao-model--unknown'}" y="9" text-anchor="middle">${esc(clip(n.model, 13))}</text>
-       <text class="ao-ctx ao-ctx--${level}" y="25" text-anchor="middle">${esc(ctx.known && ctx.percent != null ? `${ctx.percent}% ctx` : ctx.label)}${warn}</text>`;
+    ? `<text class="ao-name" y="5" text-anchor="middle">${esc(clip(n.name, nameMax + 1))}</text>`
+    : `<text class="ao-name" y="-9" text-anchor="middle">${esc(clip(n.name, nameMax))}</text>
+       <text class="ao-model${n.modelKnown ? '' : ' ao-model--unknown'}" y="9" text-anchor="middle">${esc(clip(n.model, modelMax))}</text>
+       <text class="ao-ctx ao-ctx--${level}" y="28" text-anchor="middle">${esc(ctx.known && ctx.percent != null ? `${ctx.percent}% ctx` : ctx.label)}${warn}</text>`;
+  // Drift: a small warning triangle on the ring at the upper right. It is a heuristic and says so (title, aria-label, legend).
+  const drift = n.hasDrift ? `<g class="ao-drift-badge" transform="translate(${f1((RING_R + 2) * 0.707)} ${f1(-(RING_R + 2) * 0.707)})"><title>Drift signal (heuristic)</title><path d="M0 -13L13 10H-13z"/><text y="6" text-anchor="middle" aria-hidden="true">!</text></g>` : '';
+  // Model switched: a pill under the node, apart from any handoff edge (a switch happens inside one agent, a handoff goes between two).
+  const from = n.switchedFrom ? clip(n.switchedFrom, 14) : '';
+  const pillW = f1(`switched from ${from}`.length * 6.6 + 20);
+  const pill = n.switchedFrom ? `<g class="ao-switched" transform="translate(0 ${RING_R + 48})"><title>Model switched from ${esc(n.switchedFrom)} to ${esc(n.model)}</title><rect x="${f1(-pillW / 2)}" y="-11" width="${pillW}" height="22" rx="11"/><text y="4" text-anchor="middle">switched from ${esc(from)}</text></g>` : '';
   return `<g class="ao-node ao-node--${n.state.tone}${n.person ? ' ao-node--person' : ''}${selected ? ' is-selected' : ''}" data-ao-node="${esc(n.id)}" transform="translate(${n.x} ${n.y})" tabindex="${tab ? 0 : -1}" role="button" aria-pressed="${selected}" aria-label="${esc(describeNode(n))}">
-    <circle class="ao-halo ao-halo--${n.state.tone}" r="${HALO_R}"/>${track}${arc}<circle class="ao-body" r="${NODE_R}"/>${inner}
-    <text class="ao-state" y="${RING_R + 22}" text-anchor="middle">${esc(n.state.label)}${!n.person && (ctx.level === 'warn' || ctx.level === 'critical') ? ` · ctx ${ctx.level === 'warn' ? 'high' : 'critical'}` : ''}</text></g>`;
+    <circle class="ao-halo ao-halo--${n.state.tone}" r="${HALO_R}"/>${track}${arc}<circle class="ao-body" r="${NODE_R}"/>${inner}${drift}
+    <text class="ao-state" y="${RING_R + 22}" text-anchor="middle">${esc(n.state.label)}${!n.person && (ctx.level === 'warn' || ctx.level === 'critical') ? ` · ctx ${ctx.level === 'warn' ? 'high' : 'critical'}` : ''}</text>${pill}</g>`;
 }
 
 const PARTICLES = 3;
@@ -113,12 +122,12 @@ export function renderMarkers() {
 
 export function renderScene(scene, { selected = null, pulses = new Set(), flowing = true, label = 'Agent activity map', tabId = null } = {}) {
   const vb = scene.viewBox;
-  const rooms = scene.rooms.map((r) => `<g class="ao-room" aria-hidden="true"><circle cx="${r.cx}" cy="${r.cy}" r="${r.r}"/><text x="${r.cx}" y="${f1(r.cy - r.r + 22)}" text-anchor="middle">${esc(r.label)}${r.ctx?.known && r.ctx.percent != null ? ` · avg ${r.ctx.percent}% ctx` : ''}</text></g>`).join('');
+  const rooms = scene.rooms.map((r) => `<g class="ao-room" aria-hidden="true"><ellipse cx="${r.cx}" cy="${r.cy}" rx="${r.rx ?? r.r}" ry="${r.ry ?? r.r}"/><text x="${r.cx}" y="${f1(r.cy - (r.ry ?? r.r) + 26)}" text-anchor="middle">${esc(r.label)}${r.ctx?.known && r.ctx.percent != null ? ` · avg ${r.ctx.percent}% ctx` : ''}</text></g>`).join('');
   const edges = scene.edges.map((e) => renderEdge(e, scene, { selected: selected?.type === 'edge' && selected.id === e.id, flowing })).join('');
   // Roving tabindex: one node is the tab stop (the chosen one, else the first); arrows move between the rest.
   const stop = scene.nodes.some((n) => n.id === tabId) ? tabId : scene.nodes[0]?.id;
-  const nodes = scene.nodes.map((n) => renderNode(n, { selected: selected?.type === 'node' && selected.id === n.id, pulse: pulses.has(n.id), tab: n.id === stop })).join('');
-  return `<svg class="ao-svg" viewBox="${vb.x} ${vb.y} ${vb.w} ${vb.h}" role="group" aria-label="${esc(label)}" aria-describedby="ao-alt-desc" preserveAspectRatio="xMidYMid meet" data-ao-svg>${renderMarkers()}<g class="ao-rooms">${rooms}</g><g class="ao-edges">${edges}</g><g class="ao-nodes">${nodes}</g></svg>`;
+  const nodes = scene.nodes.map((n) => renderNode(n, { selected: selected?.type === 'node' && selected.id === n.id, pulse: pulses.has(n.id), tab: n.id === stop, compact: scene.compact })).join('');
+  return `<svg class="ao-svg${scene.compact ? ' ao-svg--compact' : ''}" style="aspect-ratio:${vb.w} / ${vb.h}" viewBox="${vb.x} ${vb.y} ${vb.w} ${vb.h}" role="group" aria-label="${esc(label)}" aria-describedby="ao-alt-desc" preserveAspectRatio="xMidYMid meet" data-ao-svg>${renderMarkers()}<g class="ao-rooms">${rooms}</g><g class="ao-edges">${edges}</g><g class="ao-nodes">${nodes}</g></svg>`;
 }
 
 export function renderEmpty(snapshot, filtered) {
@@ -163,6 +172,7 @@ const EDGE_STATE_NOTE = {
 
 // ---- inspector --------------------------------------------------------------------------------------------------------------------
 const dl = (rows) => `<dl class="ao-dl">${rows.filter((r) => r[1] !== '' && r[1] != null).map(([k, v, raw]) => `<dt>${esc(k)}</dt><dd>${raw ? v : esc(v)}</dd>`).join('')}</dl>`;
+const roomOf = (scene, id) => roomLabel(id, scene.rooms?.find((r) => r.id === id)?.name);
 const nameOf = (scene, id) => scene.nodes.find((n) => n.id === id)?.name || shortId(id);
 const taskButtons = (ids) => ids.map((t) => `<button type="button" class="ao-chip" data-ao-task="${esc(t)}">${esc(t)}</button>`).join(' ');
 
@@ -171,7 +181,7 @@ export function renderTask(task, scene) {
   const contributors = list(task.contributors).map(who).join(', ');
   return `<h3>Task ${esc(task.task_id)}</h3><p class="ao-note">Delegating never moves accountability: the owner below stays accountable.</p>
     ${dl([['Accountable owner', who(task.accountable_owner) || 'not assigned', Boolean(task.accountable_owner)], ['Contributors', contributors || 'none reported', Boolean(contributors)],
-      ['Reviewer', who(task.reviewer) || 'none reported', Boolean(task.reviewer)], ['Room', task.room_id ? roomLabel(task.room_id) : ''], ['Updated', task.updated_at]])}${renderDrift(driftItems(task))}`;
+      ['Reviewer', who(task.reviewer) || 'none reported', Boolean(task.reviewer)], ['Room', task.room_id ? roomOf(scene, task.room_id) : ''], ['Updated', task.updated_at]])}${renderDrift(driftItems(task))}`;
 }
 
 export function renderInspector(sel, scene, snapshot) {
@@ -184,7 +194,7 @@ export function renderInspector(sel, scene, snapshot) {
     const tasks = [...new Set(n.roles.map((r) => r.task))];
     return `${head}<h3>${esc(n.name)}</h3>${dl([
       ['Kind', n.person ? 'Person' : 'Agent'], ['Model', n.person ? '' : n.modelKnown ? n.model : 'model unknown'], ['Provider', n.provider || (n.person ? '' : 'unknown')],
-      ['Context', n.person ? '' : n.ctx.words], ['State', n.state.label], ['Host', n.host || (n.person ? '' : 'unknown')], ['Room', roomLabel(n.room)],
+      ['Context', n.person ? '' : n.ctx.words], ['State', n.state.label], ['Host', n.host || (n.person ? '' : 'unknown')], ['Room', n.roomLabel || roomLabel(n.room)],
       ['Roles', n.roles.map((r) => `${r.role} of ${r.task}`).join(', ')], ['Model changes', changes], ['Compactions', n.compactions ? String(n.compactions) : ''],
       ['Drift warnings reported', n.drift ? String(n.drift) : ''], ['Provenance', n.provenance], ['Last event', n.lastEventAt || ''], ['Session', a.session_id ? shortId(a.session_id) : ''],
     ])}${tasks.length ? `<p class="ao-sub">Tasks ${taskButtons(tasks)}</p>` : ''}
@@ -197,7 +207,7 @@ export function renderInspector(sel, scene, snapshot) {
     if (!e) return `${head}<p class="ao-note">That relationship is not in the current view.</p>`;
     return `${head}<h3>${esc(e.style.kindLabel)}</h3><p class="ao-note">${esc(EDGE_KINDS[e.kind].meaning)}. Metadata only: no message content is stored or shown.</p>${dl([
       ['From', nameOf(scene, e.from)], ['To', nameOf(scene, e.to)], ['State', e.style.state], ['Line', e.style.line], ['Task', e.task || ''], ['Handoff', e.handoff || ''],
-      ['Room', e.room ? roomLabel(e.room) : ''], ['Provenance', e.provenance], ['Updated', e.updatedAt || ''], ['Event', e.eventId || ''], ['Interrupted by', e.raw?.interrupted_by || ''],
+      ['Room', e.room ? roomOf(scene, e.room) : ''], ['Provenance', e.provenance], ['Updated', e.updatedAt || ''], ['Event', e.eventId || ''], ['Interrupted by', e.raw?.interrupted_by || ''],
     ])}${EDGE_STATE_NOTE[e.state] ? `<p class="ao-note ao-note--alert">${esc(EDGE_STATE_NOTE[e.state])}</p>` : ''}${e.task ? `<p class="ao-sub">Task ${taskButtons([e.task])}</p>` : ''}`;
   }
   if (sel?.type === 'task') {
@@ -257,6 +267,11 @@ export function mountAgentOps(container, client, opts = {}) {
   const setHosts = (html) => { if (html !== state.hostHtml) { state.hostHtml = html; $('[data-ao-hosts]').innerHTML = html; } };
   const viewSnap = () => (state.index == null ? state.live : state.replay || state.live);
   const flowing = () => !calmNow();
+  // The scene is laid out for the width it will be shown at: a wide ellipse on desktop and tablet, a tall one on a phone, so it scales up to fill the card.
+  const aspectNow = () => ((stageEl.clientWidth || container.clientWidth || 1000) < 560 ? 0.6 : 1.35);
+  let lastAspect = null;
+  const onResize = () => { const a = aspectNow(); if (state.phase === 'ok' && a !== lastAspect) { lastAspect = a; paintStage({ force: true }); } };
+  globalThis.addEventListener?.('resize', onResize);
 
   function paintBar() {
     $('[data-ao-tabs]').innerHTML = renderTabs(state.mode);
@@ -277,8 +292,8 @@ export function mountAgentOps(container, client, opts = {}) {
       return;
     }
     const snap = viewSnap();
-    const scene = layoutScene(snap, { mode: state.mode, filters: state.filters });
-    state.scene = scene;
+    const scene = layoutScene(snap, { mode: state.mode, filters: state.filters, aspect: aspectNow() });
+    state.scene = scene; lastAspect = aspectNow();
     const sig = JSON.stringify([scene.nodes.map((n) => [n.id, n.x, n.y, n.ctx.label, n.state.key, n.model, n.name, n.roles.length]), scene.edges.map((e) => [e.id, e.d, e.state, e.dimmed]),
       scene.rooms.map((r) => [r.id, r.cx, r.cy, r.r]), state.selected, flowing(), [...state.pulses]]);
     if (force || sig !== state.sig) {
@@ -466,6 +481,6 @@ export function mountAgentOps(container, client, opts = {}) {
   return {
     refresh: refreshNow,
     state: () => state,
-    dispose() { disposed = true; controller?.abort(); replayCtl?.abort(); clearTimeout(playTimer); clearTimeout(refreshTimer); stop?.(); container.innerHTML = ''; },
+    dispose() { disposed = true; globalThis.removeEventListener?.('resize', onResize); controller?.abort(); replayCtl?.abort(); clearTimeout(playTimer); clearTimeout(refreshTimer); stop?.(); container.innerHTML = ''; },
   };
 }
