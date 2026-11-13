@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
@@ -60,7 +61,8 @@ class StallWatch(threading.Thread):
             self._stop_event.wait(self.tick)
             late = time.monotonic() - before - self.tick
             if late >= self.stall and not self._stop_event.is_set():
-                log.warning("process paused %.1fs (tick %.2fs); threads on resume:\n%s", late + self.tick, self.tick, self.threads())
+                log.warning("process paused %.1fs (tick %.2fs); %s; threads on resume:\n%s",
+                            late + self.tick, self.tick, gc_state(), self.threads())
 
     @staticmethod
     def threads() -> str:
@@ -79,6 +81,59 @@ def freeze_boot_heap() -> int:
     gc.collect()
     gc.freeze()
     return gc.get_freeze_count()
+
+
+@dataclass(frozen=True)
+class GcTuning:
+    """``control_plane.gc`` in the fleet config: collector thresholds plus whether to freeze the boot heap."""
+    gen0: int
+    gen1: int
+    gen2: int
+    freeze: bool = True
+
+
+_GC_KEYS = ("gen0", "gen1", "gen2", "freeze")
+DEFAULT_GEN2 = 1000          # the one deliberate default change: the interpreter's 10 makes full collections frequent
+_GC_MAX = 2**31 - 1          # gc.set_threshold takes C ints; anything larger raises OverflowError
+
+
+def parse_gc_config(section) -> GcTuning:
+    """Parse ``control_plane.gc`` (None = defaults); a malformed block raises ValueError so startup stops.
+
+    Keys left unset: ``gen0``/``gen1`` keep the running interpreter's values (700 on 3.12, 2000 on 3.13+), so
+    nothing is lowered; ``gen2`` defaults to ``DEFAULT_GEN2`` (1000, interpreter default 10) even with no block.
+    """
+    if section is not None and not isinstance(section, dict):
+        raise ValueError("control_plane.gc must be a mapping")
+    section = section or {}
+    unknown = sorted(set(section) - set(_GC_KEYS))
+    if unknown:
+        raise ValueError(f"control_plane.gc: unknown keys {unknown}")
+    gen0, gen1, _ = gc.get_threshold()
+    values = {"gen0": gen0, "gen1": gen1, "gen2": DEFAULT_GEN2}
+    for key in ("gen0", "gen1", "gen2"):
+        if key in section:
+            v = section[key]
+            if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= _GC_MAX:
+                raise ValueError(f"control_plane.gc.{key} must be an integer between 1 and {_GC_MAX}")
+            values[key] = v
+    if "freeze" in section:
+        if not isinstance(section["freeze"], bool):
+            raise ValueError("control_plane.gc.freeze must be true or false")
+        values["freeze"] = section["freeze"]
+    return GcTuning(**values)
+
+
+def gc_state() -> str:
+    return f"gc frozen={gc.get_freeze_count()} thresholds={gc.get_threshold()}"
+
+
+def tune_gc(tuning: GcTuning) -> int:
+    """Freeze the boot heap (when enabled) and raise the thresholds so full collections are rare. Returns frozen count."""
+    frozen = freeze_boot_heap() if tuning.freeze else 0
+    gc.set_threshold(tuning.gen0, tuning.gen1, tuning.gen2)
+    log.info("gc tuned: gen0=%d gen1=%d gen2=%d freeze=%s frozen=%d", tuning.gen0, tuning.gen1, tuning.gen2, tuning.freeze, frozen)
+    return frozen
 
 
 def install() -> StallWatch:
