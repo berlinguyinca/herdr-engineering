@@ -16,7 +16,7 @@ from herdr_engineering.control_plane.ingest import IngestService
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 OPERATOR = {"kind": "operator", "id": "key:op", "authenticated_by": "api_key"}
-TOKENS = {"alice": "tok-alice-0123456789", "bob": "tok-bob-0123456789abc"}
+TOKENS = {"alice": "tok-alice-0123456789", "bob": "tok-bob-0123456789abc", "carol": "tok-carol-0123456789ab"}
 
 
 def ev(n, event_type, *, agent="a1", source="pi", seq=None, at=None, **fields):
@@ -194,7 +194,7 @@ def stack(acknowledged_sink):
     collab = CollabService(auth, sink=acknowledged_sink)
     users = {name: Principal("user", name, name) for name in TOKENS}
     rooms = {}
-    for name in TOKENS:
+    for name in ("alice", "bob"):               # carol owns no room: she is only ever a guest
         project = collab.create_project(users[name], {"name": f"p-{name}"})
         rooms[name] = collab.create_room(users[name], project["project_id"], {"name": f"r-{name}"})["room_id"]
         assert collab.post_message(users[name], rooms[name], {"text": f"hi from {name} SECRETTEXT",
@@ -536,6 +536,46 @@ def test_guest_sees_room_chat_sources_only_not_envelope_or_handoff_events(stack)
     assert stack.rooms["bob"] in dump                      # her own view of the room's chat is still there
     member = stack.svc.snapshot(stack.svc.viewer(bob), bob)
     assert "agent-b" in json.dumps(member) and [e for e in member["edges"] if e["kind"] == "handoff"]
+
+
+def test_guest_only_principal_sees_only_room_sources_of_guest_rooms_on_every_route(stack):
+    bob = stack.users["bob"]
+    stack.collab.add_member(bob, stack.rooms["bob"], {"user_id": "carol", "role": "guest"})
+    stack.collab.post_message(bob, stack.rooms["bob"], {"text": "after the guest joined", "idempotency_key": "g1"})
+    ingest(stack.repo, 1, "tool.started", session_id="so", agent_id="org-agent", visibility_scope="org")
+    ingest(stack.repo, 2, "tool.started", session_id="sb", agent_id="agent-b", room_id=stack.rooms["bob"],
+           visibility_scope="room")
+    ingest(stack.repo, 3, "tool.started", session_id="sa", agent_id="agent-a", room_id=stack.rooms["alice"],
+           visibility_scope="room")
+    server = Server(stack.repo, stack.collab, agent_ops_config={"enabled": True})
+    server.srv.agent_ops_poll_seconds = 0.05
+    try:
+        for key in ("view-key", "op-key"):
+            status, snap = server.get("/api/v1/agent-ops/snapshot", user="carol", key=key)
+            assert status == 200
+            _, page = server.get("/api/v1/agent-ops/events?limit=200", user="carol", key=key)
+            _, replay = server.get(f"/api/v1/agent-ops/replay?until={snap['cursor']}", user="carol", key=key)
+            for body in (snap, page, replay):
+                dump = json.dumps(body)
+                assert "org-agent" not in dump and "agent-b" not in dump and "agent-a" not in dump
+                assert stack.rooms["alice"] not in dump and "r-alice" not in dump
+            assert snap["rooms"] and {r["room_id"] for r in snap["rooms"]} == {stack.rooms["bob"]}
+            assert page["events"] and all(e["source"] == f"room:{stack.rooms['bob']}" for e in page["events"])
+            assert not any(a["agent_id"] in ("org-agent", "agent-b") for a in snap["agents"])
+        conn = http.client.HTTPConnection("127.0.0.1", server.srv.port, timeout=5)
+        conn.request("GET", "/api/v1/agent-ops/stream", headers={"X-API-Key": "view-key",
+                                                                  "Authorization": f"Bearer {TOKENS['carol']}"})
+        resp = conn.getresponse()
+        assert resp.status == 200
+        seen = []
+        while not any(f.get("event_type") == "message.sent" for f in seen):
+            line = resp.fp.readline().decode().strip()
+            if line.startswith("data:") and '"event_id"' in line:
+                seen.append(json.loads(line[5:]))
+        conn.close()
+        assert all(f["source"] == f"room:{stack.rooms['bob']}" for f in seen)
+    finally:
+        server.stop()
 
 
 def test_room_id_is_ignored_unless_the_scope_is_room(stack):
