@@ -13,6 +13,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Pin advanced to `a693217` (herdr-handoff#6, client 0.3.0): same-tab takeover where the close of the replaced pane is gated on herdr observing the successor live, plus `herdr-handoff confirm` for that successor.
 - Known gap: a skill left as a plain copied directory by an install from before the linker is still reported as a collision, and its text never updates. `scripts/install-handoff.sh --migrate-copies` moves each such directory aside as `<skill>.pre-<rev>.bak` and links the pinned tree in its place; it is opt-in because a copy may carry local edits.
 
+### Test fix: cargo target-storage CLI test no longer depends on ambient CARGO_TARGET_DIR
+
+- `test_target_management_cli_enable_and_migration_safety` inherited the host environment; a CI agent exporting `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR` made the migrator report "Explicit target setting remains authoritative" instead of "same filesystem". The test now drops those two variables from the child environment and separately asserts the explicit-override verdict. No production code changed.
+
 
 ### Inspector snapshot boot: used on the complete-replay fallback, strictly validated
 
@@ -32,6 +36,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Rakazo bridge: `open_owner_origins` (default unchanged)
 - New optional `control_plane.rakazo_bridge.open_owner_origins` (list of 1-8 `scheme://[host]` strings, default `["rakazo://"]`): the exact `Origin` values `open_owner` accepts, so a second native app can use it. http/https, wildcards, whitespace and duplicates are refused at startup; every other guard (network allowlist, proxy checks, 30s interval, operator account) is unchanged. Tests: `tests/control_plane/test_rakazo_bridge.py`.
+
+### CI: unit-gates runs pytest in parallel (pytest-xdist)
+- `scripts/ci/unit-gates.sh` now runs `python -m pytest -q -n auto --maxprocesses=8 --dist=loadfile` (arguments come from `scripts/ci/pytest-parallel.sh`), so the ~90 minute serial run is spread over workers; a file's tests stay on one worker. Overrides: `HERDR_PYTEST_WORKERS=<n>|auto|0` (0 = serial as before), `HERDR_PYTEST_MAXPROCESSES=<cap>`. The file-descriptor floor still applies first (the limit is per process, so each worker leaks only its share). Nothing is deselected or skipped. `pytest-xdist==3.8.0` is pinned in the `dev` extra. Tests: `tests/test_ci_pytest_parallel.py`.
+- `join.sh --stop` now uses `ps -ww`: xdist workers export `COLUMNS=80`, which made `ps -o args=` truncate the worker's command line before `worker.sh`, so `--stop` silently stopped nothing (`tests/control_plane/test_collab_join_script.py` failed only under xdist).
 
 ### Fleet rollout watcher step 4: host-apply and the serial runner (manual, `--apply` required)
 - `herdr-eng fleet host-apply` (precheck/apply/health/rollback per repo, D6 checkout gate, idempotent `no_change`, `fleet-auto-update.lock`, atomic Pi `current` switch keeping 3 releases) and `herdr-eng fleet-watch run [--apply]` (serial beast -> bender -> macbook-pro, halt on first failure, durable crash-resume, ssh timeouts, D8 rollback for pointer flips and ff-only, events through the existing emitter/outbox). Output and events carry no free text. No systemd unit (step 5). Tests: `tests/test_fleet_host_apply.py`, `tests/test_fleet_watch_run.py`. See `docs/operations/fleet-rollout-events.md`.
