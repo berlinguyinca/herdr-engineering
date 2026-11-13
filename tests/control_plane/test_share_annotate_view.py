@@ -72,6 +72,16 @@ def split_shadow(page):
     return before, inside, after
 
 
+def clobber_ids(text):
+    """The hostile `id=pwn`/`id=pwn2` markers in `text`, quoted or not.
+
+    The bare substring "pwn" is not a usable signal: the CSP nonce is random and can contain it, which
+    failed this suite in CI (pipeline 1218) on a page whose only "pwn" was `nonce="VhxkoHLpwnvg-P36DpklIZ9t"`.
+    An id clobbering attempt is an id, so that is what is matched.
+    """
+    return [m.group(0) for m in re.finditer(r'id\s*=\s*"?pwn2?"?', text)]
+
+
 def data_of(page):
     return json.loads(re.search(r'id="herdr-view-data"[^>]*>(.*?)</script>', page, re.S).group(1))
 
@@ -148,14 +158,26 @@ def test_hostile_html_is_sanitised_and_contained_in_the_shadow_root(lab):
     assert page.count('id="herdr-view-data"') == 2 and before.count('id="herdr-view-data"') == 1
     assert after.count('id="herdr-view-data"') == 0 and "data-annotate-panel" in after
     assert 'id="annotate-panel"' in inside and 'id="annotate-panel"' not in before + after
-    assert "pwn" not in before + after
+    assert clobber_ids(before + after) == []
     # a style whose text holds a closer for the wrapper or the style element is dropped, never kept
-    assert "color:red" not in inside and "pwn" not in inside.replace('id="pwn2"', "")
+    assert "color:red" not in inside and clobber_ids(inside.replace('id="pwn2"', "")) == []
     assert "color:blue" in inside and inside.count("<style>") == inside.count(CLOSE_STYLE) == 2     # blue is a whole style
     # a host rule is allowed through (by design) but the page contains it: wrapper outside the host
     assert ":host{position:fixed!important" in inside
     outer = before.rindex('id="herdr-viewport"')
     assert outer < before.index('id="herdr-content"') and after.lstrip().startswith("</div>")
+
+
+def test_a_nonce_happening_to_spell_pwn_is_not_read_as_an_id_clobber():
+    """The exact shape that failed CI: the only "pwn" outside the shadow root is inside the CSP nonce."""
+    page = ('<head><meta http-equiv="Content-Security-Policy" content="script-src \'nonce-abc\'">'
+            '</head>\n<body data-mode="annotate">\n'
+            '<script type="application/json" id="herdr-view-data" '
+            'nonce="VhxkoHLpwnvg-P36DpklIZ9t">{"entry": "index.html"}</script>\n')
+    assert "pwn" in page                                  # the substring the old assertion keyed on
+    assert clobber_ids(page) == []                         # and the assertion that has to survive it
+    assert clobber_ids('<b id=pwn>x</b>') == ["id=pwn"]    # a real attempt is still caught
+    assert clobber_ids('<b id="pwn2">y</b>') == ['id="pwn2"']
 
 
 def test_stylesheet_contains_the_content_box(lab):
