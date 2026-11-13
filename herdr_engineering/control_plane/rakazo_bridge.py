@@ -212,9 +212,12 @@ def _open_owner_allowed_sources(value) -> tuple:
         try:
             if not isinstance(item, str) or not item.strip():
                 raise ValueError
-            nets.append(ipaddress.ip_network(item.strip(), strict=False))
+            net = ipaddress.ip_network(item.strip(), strict=True)       # host bits set ("100.104.39.6/24") is a typo, not a wider range
         except ValueError:
-            raise ValueError(f"{where}[{i}] is not an address or CIDR range") from None
+            raise ValueError(f"{where}[{i}] is not an address or CIDR range with no host bits set") from None
+        if net.version == 6 and net.subnet_of(ipaddress.ip_network("::ffff:0:0/96")):
+            raise ValueError(f"{where}[{i}] is an IPv4-mapped IPv6 range: write it as plain IPv4")
+        nets.append(net)
     return tuple(nets)
 
 
@@ -730,6 +733,9 @@ class RakazoBridge:
         self.open_owner = bool(config.get("open_owner"))
         self.open_owner_origins: tuple[str, ...] = tuple(config.get("open_owner_origins") or ("rakazo://",))
         self.open_owner_allowed_sources = tuple(config.get("open_owner_allowed_sources") or ())
+        if self.open_owner and not self.open_owner_allowed_sources:
+            log.warning("rakazo bridge: open_owner is on with no open_owner_allowed_sources: any tailnet node, including a "
+                        "shared-in guest, can open an owner session. List your own devices' tailnet IPs.")
         self._open_lock = threading.Lock()
         self._open_last: dict[str, float] = {}
         self._by_principal = {a.principal_id: a for a in self.accounts}
