@@ -867,6 +867,15 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="keep retrying for up to SECONDS when another materializer (the worker's "
                          "periodic refresh) holds the checkpoint lock; default 0 fails at once")
     p2.set_defaults(func=_cmd_cp_checkpoint)
+    p2 = csub.add_parser("fabric-partition", help="explicit steps to move fabric_events onto a partitioned table "
+                         "(off unless control_plane.fabric_partitioning.enabled; nothing runs automatically)")
+    p2.add_argument("step", choices=["status", "backfill", "cutover", "rollback", "drop-old"])
+    p2.add_argument("--fleet-config", required=True)
+    p2.add_argument("--max-batches", type=int, default=None, help="backfill: stop after this many batches (resume later)")
+    p2.add_argument("--allow-inspector-envelopes", action="store_true",
+                    help="cutover: accept inspector rows with v2 envelopes (weaker sequence-collision check)")
+    p2.add_argument("--confirm", action="store_true", help="required for cutover, rollback and drop-old")
+    p2.set_defaults(func=_cmd_cp_fabric_partition)
     p2 = csub.add_parser("collab-repair", help="set aside foreign rows of the collaboration log (dry run by default; "
                          "never deletes: rows move to a quarantine file/table)")
     p2.add_argument("--log-file", default=None, help="a collab-only JSON-lines log; without it the Postgres "
@@ -3683,6 +3692,48 @@ def _cmd_cp_migrate(args) -> int:
     return 0
 
 
+def _cmd_cp_fabric_partition(args) -> int:
+    """``control-plane fabric-partition status|backfill|cutover|rollback|drop-old``; see
+    docs/operations/fabric-events-partitioning.md. Every step but ``status`` needs ``enabled: true`` in the fleet YAML."""
+    import asyncio
+
+    from .control_plane import fabric_partitioning as fp
+    try:
+        _, cp = _load_cp_fleet_config(args.fleet_config)
+        settings = fp.parse_fabric_partitioning(cp.get("fabric_partitioning"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config control_plane.{exc}") from None
+    dsn = cp.get("pg_dsn")
+    if not dsn:
+        _print_json({"ok": False, "error": "fabric-partition requires control_plane.pg_dsn"})
+        return 1
+    if args.step in ("cutover", "rollback", "drop-old") and not args.confirm:
+        _print_json({"ok": False, "error": f"{args.step} changes the live journal; re-run with --confirm"})
+        return 2
+
+    async def _run():
+        conn = await _cp_connect(dsn)
+        try:
+            if args.step == "status":
+                return await fp.status(conn)
+            if args.step == "backfill":
+                return await fp.backfill(conn, settings, max_batches=args.max_batches)
+            if args.step == "cutover":
+                return await fp.cutover(conn, settings, allow_inspector_envelopes=args.allow_inspector_envelopes)
+            if args.step == "rollback":
+                return await fp.rollback(conn, settings)
+            return await fp.drop_old(conn, settings)
+        finally:
+            await conn.close()
+
+    try:
+        _print_json({"ok": True, "step": args.step, **asyncio.run(_run())})
+    except fp.PartitioningError as exc:
+        _print_json({"ok": False, "step": args.step, "error": str(exc)})
+        return 1
+    return 0
+
+
 def _cmd_cp_assistant_audit(args) -> int:
     """``control-plane assistant-audit anchor|verify``: exit 0 only when the anchor was appended / the chain matches."""
     import urllib.error
@@ -5316,13 +5367,12 @@ def _heap_release_enabled(cp) -> bool:
 
 def _inspector_snapshot_settings(cp) -> tuple[bool, float]:
     """``control_plane.inspector_snapshots: {enabled, interval_seconds}`` (off unless ``enabled`` is exactly true)."""
-    raw = (cp or {}).get("inspector_snapshots") or {}
-    if not isinstance(raw, dict):
-        raise SystemExit("fleet config control_plane.inspector_snapshots must be a mapping")
-    interval = raw.get("interval_seconds", 600)
-    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 60:
-        interval = 600
-    return raw.get("enabled") is True, float(interval)
+    from .control_plane.inspector_snapshot import parse_inspector_snapshots
+    try:
+        parsed = parse_inspector_snapshots((cp or {}).get("inspector_snapshots"))
+    except ValueError as exc:
+        raise SystemExit(f"fleet config control_plane.{exc}") from None
+    return parsed["enabled"], parsed["interval_seconds"]
 
 
 def _cmd_relay_join(args):

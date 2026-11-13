@@ -8,6 +8,33 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Fleet rollout watcher step 5: service, lock pinning, resume/abandon (off by default)
 - `herdr-eng fleet-watch loop` (poll + plan; rolls out only with `--enable-rollouts`; flock single instance; soft limit warns, hard limit exits only after no progress), user unit `herdr-eng-fleet-watch.service` and `ansible/tasks/fleet-watch.yml` (disabled unless `fleet_watch_enabled: true` on beast). `lock.pin_repos` moves `fleet.lock.yaml` only after a full success with the D3 published-history check, atomically with a backup; `herdr-eng fleet lock verify`. `fleet-watch resume|abandon` (the `run --resume` flag is a deprecated alias). New reasons `downgrade`, `lock_invalid`. Nothing is enabled by this change. See `docs/operations/fleet-rollout-watcher.md`.
 
+### Test fix: cargo target-storage CLI test no longer depends on ambient CARGO_TARGET_DIR
+
+- `test_target_management_cli_enable_and_migration_safety` inherited the host environment; a CI agent exporting `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR` made the migrator report "Explicit target setting remains authoritative" instead of "same filesystem". The test now drops those two variables from the child environment and separately asserts the explicit-override verdict. No production code changed.
+
+### Inspector snapshot boot: used on the complete-replay fallback, strictly validated
+
+- With projection checkpoints on (the default), a missing or rejected checkpoint fell back to a complete replay that ignored `inspector_snapshots` and re-ran every stored inspector row through redaction. That fallback now hands the stored snapshot to the repo, which verifies it by count and ordering and replays everything on any doubt.
+- `control_plane.inspector_snapshots` is validated in `fleet_config.py`: `enabled` must be a boolean, `interval_seconds` a number >= 60, unknown keys are rejected (previously a bad interval was silently replaced by 600). Default stays off.
+
+### Auto-join hook no longer dies silently on a loaded host
+- `summary join-hook` ran the join under a 12 s kill-timeout through `python -m herdr_engineering.cli`; on a loaded host that start alone took 3-40 s, so the join was killed and the session printed nothing. It now starts the CLI directly, waits up to 8 s, and past that leaves the (idempotent) join running detached and says "still running in the background". Test: a real listener that never answers.
+
+### Inspector: older events on demand from Postgres
+- New `GET /api/v1/sessions/{id}/inspector/history?before=&limit=&view=` returns inspector events older than the in-memory ring, one bounded page at a time (opaque keyset cursor on `ingest_timestamp, sequence, event_id`), rendered with the ring's role redaction. Nothing is read at boot and nothing is loaded into the ring, so memory does not grow with paging. Existing `/inspector` and `before_seq` are unchanged. Configured by `control_plane.inspector_history` (`enabled`, `page_size`, `max_page_size`), validated in `fleet_config.py`, unknown keys rejected. Client: `getInspectorHistory`.
+- Caveats: durable rows carry no ring `seq` (`seq` is null; `history_id` is the event id); a tool call's newest row per page wins, so a call split across a page boundary can show once per page; rows already archived to `fabric_events_archive` are not read.
+
+### fabric_events partitioning (disabled by default, lazy-loading PR 9)
+
+- Migration 0053 prepares an empty LIST-partitioned copy of `fabric_events` (inspector partition plus default); nothing moves automatically. New `control_plane.fabric_partitioning` config (YAML only, validated in `fleet_config.py`) and `control-plane fabric-partition status|backfill|cutover|rollback|drop-old`: resumable keyset backfill, one-transaction cutover with a bounded lock and exact catch-up, and a rollback that carries post-cutover writes back. `control-plane checkpoint` skips the CONCURRENTLY index on a partitioned journal. See `docs/operations/fabric-events-partitioning.md`.
+
+### Rakazo bridge: `open_owner_origins` (default unchanged)
+- New optional `control_plane.rakazo_bridge.open_owner_origins` (list of 1-8 `scheme://[host]` strings, default `["rakazo://"]`): the exact `Origin` values `open_owner` accepts, so a second native app can use it. http/https, wildcards, whitespace and duplicates are refused at startup; every other guard (network allowlist, proxy checks, 30s interval, operator account) is unchanged. Tests: `tests/control_plane/test_rakazo_bridge.py`.
+
+### CI: unit-gates runs pytest in parallel (pytest-xdist)
+- `scripts/ci/unit-gates.sh` now runs `python -m pytest -q -n auto --maxprocesses=8 --dist=loadfile` (arguments come from `scripts/ci/pytest-parallel.sh`), so the ~90 minute serial run is spread over workers; a file's tests stay on one worker. Overrides: `HERDR_PYTEST_WORKERS=<n>|auto|0` (0 = serial as before), `HERDR_PYTEST_MAXPROCESSES=<cap>`. The file-descriptor floor still applies first (the limit is per process, so each worker leaks only its share). Nothing is deselected or skipped. `pytest-xdist==3.8.0` is pinned in the `dev` extra. Tests: `tests/test_ci_pytest_parallel.py`.
+- `join.sh --stop` now uses `ps -ww`: xdist workers export `COLUMNS=80`, which made `ps -o args=` truncate the worker's command line before `worker.sh`, so `--stop` silently stopped nothing (`tests/control_plane/test_collab_join_script.py` failed only under xdist).
+
 ### Fleet rollout watcher step 4: host-apply and the serial runner (manual, `--apply` required)
 - `herdr-eng fleet host-apply` (precheck/apply/health/rollback per repo, D6 checkout gate, idempotent `no_change`, `fleet-auto-update.lock`, atomic Pi `current` switch keeping 3 releases) and `herdr-eng fleet-watch run [--apply]` (serial beast -> bender -> macbook-pro, halt on first failure, durable crash-resume, ssh timeouts, D8 rollback for pointer flips and ff-only, events through the existing emitter/outbox). Output and events carry no free text. No systemd unit (step 5). Tests: `tests/test_fleet_host_apply.py`, `tests/test_fleet_watch_run.py`. See `docs/operations/fleet-rollout-events.md`.
 

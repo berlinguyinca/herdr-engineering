@@ -310,10 +310,15 @@ def restore_projection(repo, checkpoint, *, full_streams, tail_rows, structured,
 
 class PreparedSource:
     """Transferred snapshot rows; no subsequent database query is implicit."""
-    def __init__(self, structured, rows, *, source_ledger=None):
+    def __init__(self, structured, rows, *, source_ledger=None, inspector_snapshot=None):
         self.structured = structured
         self.rows = rows
         self.source_ledger = source_ledger
+        self._inspector_snapshot = inspector_snapshot
+
+    def inspector_snapshot(self):
+        """The stored inspector replay snapshot, or None. Every row is loaded, so the repo verifies it by count."""
+        return self._inspector_snapshot
 
     def missions(self):
         return self.structured['missions']
