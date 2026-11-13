@@ -123,7 +123,7 @@ export function renderMarkers() {
 // Everything a repaint must notice: any field the scene draws. A signal appearing alone (drift, a model switch) must change it.
 export function sceneSignature(scene, { selected = null, flowing = false, pulses = [] } = {}) {
   return JSON.stringify([scene.nodes.map((n) => [n.id, n.x, n.y, n.ctx.label, n.state.key, n.model, n.name, n.roles.length, n.hasDrift, n.drift, n.switchedFrom]),
-    scene.edges.map((e) => [e.id, e.d, e.state, e.dimmed]), scene.rooms.map((r) => [r.id, r.cx, r.cy, r.r, r.label, r.rx, r.ry, r.shape]), selected, flowing, pulses]);
+    scene.edges.map((e) => [e.id, e.d, e.state, e.dimmed]), scene.rooms.map((r) => [r.id, r.cx, r.cy, r.r, r.label, r.rx, r.ry, r.shape, r.ctx?.percent, r.ctx?.known]), scene.truncated === true, selected, flowing, pulses]);
 }
 
 export function renderScene(scene, { selected = null, pulses = new Set(), flowing = true, label = 'Agent activity map', tabId = null } = {}) {

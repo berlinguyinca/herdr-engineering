@@ -13,7 +13,11 @@ Rollback: set `control_plane.agent_ops.enabled: false` (capability `agent_ops_v1
 | 06 terminal map + plugin manifest | feat/agent-ops-tui | done; review fixes in feat/agent-ops-fix-tui (manifest not validated with `herdr plugin link`) |
 | 02 provider adapters | feat/agent-ops-adapters | done (handlers tested directly; no live Pi/Claude/Codex run) |
 | 08/09 context health, drift, fleet hosts | feat/agent-ops-health | done |
-| 10 review | Opus read-only | review 1 REJECT (3 blocking); fixes merged at 00daf836; re-review pending |
+| 10 review | Opus read-only | R1 REJECT (3 blocking) -> R2 REJECT (cursor) -> R3 APPROVE (03e516c8) -> R4 REJECT (compound pass/pwd redaction regression) -> R5 APPROVE (fixes b46fd4ee; no blockers) |
+| fix rounds | feat/agent-ops-fix-2/-3/-4, -shots, -visual, fix/agent-ops-round4 | all merged; visual pass 50485f3b; round-4 fixes merged 2f650b7f |
 
 Test evidence at 00daf836 (focused): 166 Python tests pass (agent_ops, envelope, health, adapters, tui); 48 web unit tests pass.
 Known flaky: test_pi_null_context_after_compaction_emits_compaction_not_a_metric failed once in a combined run and passed on 5 reruns; test_interactive_pane_in_a_real_pty_against_the_real_server is timing based.
+
+Test evidence at final tip: 239 Python tests (agent_ops, envelope, health, adapters, tui), 61 node tests (model 36, view 21, lineage 4), tests/playwright/agent-ops.test.mjs 11/11.
+Known flaky: test_interactive_pane_in_a_real_pty_against_the_real_server (timing); a Claude-hook adapter test once under load. nav-groups.test.mjs and calm.test.mjs fail/hang on the pre-mission base 22ecf0f1 too.

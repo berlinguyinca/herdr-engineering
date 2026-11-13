@@ -249,6 +249,9 @@ test('scene signature: drift or a model switch appearing alone changes it (repai
   const phone = layoutScene({ ...SNAP, rooms: [{ room_id: 'rX', name: 'a', agent_ids: ['a1'] }], agents: SNAP.agents.map((a) => ({ ...a, room_ids: ['rX'] })) }, { aspect: 1.4 });
   const renamed = { ...phone, rooms: phone.rooms.map((r) => ({ ...r, label: 'other', shape: 'rect' })) };
   assert.notEqual(sceneSignature(renamed, {}), sceneSignature(phone, {}));
+  const ctxChanged = { ...phone, rooms: phone.rooms.map((r) => ({ ...r, ctx: { ...r.ctx, percent: 55, known: true } })) };
+  assert.notEqual(sceneSignature(ctxChanged, {}), sceneSignature(phone, {}));
+  assert.notEqual(sceneSignature({ ...phone, truncated: true }, {}), sceneSignature({ ...phone, truncated: false }, {}));
 });
 
 test('layoutScene survives a non-finite aspect', () => {
