@@ -7,6 +7,10 @@
 #
 # It raises the file-descriptor soft limit before running: the suite leaks roughly 3,000 descriptors over a full run, and a host
 # with the common 1,024 soft limit dies about a third of the way through with no summary at all. See scripts/ci/ensure-fd-limit.sh.
+#
+# pytest runs in parallel under pytest-xdist (serial it took ~90 minutes), `--dist=loadfile` so a file's tests share a worker.
+# Overrides: HERDR_PYTEST_WORKERS=<n>|auto|0 (0 = serial), HERDR_PYTEST_MAXPROCESSES=<cap on auto, default 8>. See
+# scripts/ci/pytest-parallel.sh. The descriptor limit is per process, so each worker leaks only its share of the ~3,000.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 . scripts/ci/journal.sh; ci_journal unit-gates
@@ -15,6 +19,8 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "missing on this host: $1" >&
 need python3; need node; need git
 
 . scripts/ci/ensure-fd-limit.sh; herdr_ensure_fd_limit || exit 1
+. scripts/ci/pytest-parallel.sh
+herdr_pytest_parallel_load || exit 1     # a bad override fails loudly instead of silently running serial
 
 venv="$(mktemp -d "${TMPDIR:-/tmp}/herdr-unit-gates-venv.XXXXXX")"
 trap 'rm -rf "$venv"' EXIT
@@ -23,7 +29,8 @@ python3 -m venv "$venv"
 export PATH="$venv/bin:$PATH"
 
 echo "== pytest =="
-python -m pytest -q
+echo "pytest arguments: ${PYTEST_PARALLEL[*]:-(serial)}"
+python -m pytest -q ${PYTEST_PARALLEL[@]+"${PYTEST_PARALLEL[@]}"}
 echo "== client tests =="
 npm ci --no-audit --no-fund       # the component tests import playwright
 npx playwright install chromium     # one component test drives a real browser; a no-op when cached
