@@ -100,10 +100,11 @@ def save(state: dict, directory: Path | None = None) -> Path:
 
 
 @contextlib.contextmanager
-def single_instance(directory: Path | None = None) -> Iterator[None]:
+def single_instance(directory: Path | None = None, name: str = "lock") -> Iterator[None]:
+    """Exclusive non-blocking flock on `<directory>/<name>`: `lock` guards one pass, `loop.lock` one service loop."""
     directory = directory or state_dir()
     private_dir(directory)
-    fd = os.open(directory / "lock", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    fd = os.open(directory / name, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, "a") as handle:
         try:

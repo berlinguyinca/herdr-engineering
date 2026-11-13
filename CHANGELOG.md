@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Inspector history reads the archive too
+
+- `GET /api/v1/sessions/{id}/inspector/history` now continues into `fabric_events_archive` once the requested range goes past what the archive job moved out of `fabric_events`. The two tables are merged under the one keyset order and the same opaque cursor, so a page can straddle the boundary with no gap and no duplicate (a row present in both is returned once). No new setting: with no archive table, behaviour is unchanged. Replaces the earlier caveat that archived rows were not read; the archive job itself stays off by default.
+
+### Fleet rollout watcher step 5: service, lock pinning, resume/abandon (off by default)
+- `herdr-eng fleet-watch loop` (poll + plan; rolls out only with `--enable-rollouts`; flock single instance; soft limit warns, hard limit exits only after no progress), user unit `herdr-eng-fleet-watch.service` and `ansible/tasks/fleet-watch.yml` (disabled unless `fleet_watch_enabled: true` on beast). `lock.pin_repos` moves `fleet.lock.yaml` only after a full success with the D3 published-history check, atomically with a backup; `herdr-eng fleet lock verify`. `fleet-watch resume|abandon` (the `run --resume` flag is a deprecated alias). New reasons `downgrade`, `lock_invalid`. Nothing is enabled by this change. See `docs/operations/fleet-rollout-watcher.md`.
+
 ### Web: configurable GC thresholds, boot-heap freeze (`control_plane.gc`)
 
 - `control_plane.gc: {gen0, gen1, gen2, freeze}` tunes the collector at web start (restart required). Keys left unset: `gen0`/`gen1` keep the running interpreter's values; `gen2` defaults to 1000.
