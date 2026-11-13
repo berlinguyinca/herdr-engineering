@@ -652,12 +652,27 @@ def timeline_bar(snapshot: dict, w: int, opts: RenderOpts) -> list[str]:
     return ["".join(cells), fit(caption, w)]
 
 
-def legend(opts: RenderOpts) -> str:
-    parts = []
-    for kind in KINDS:
-        _, sh, _, dh, _, arrow, ah_, _, aa = _EDGE[kind]
-        parts.append(f"{sh * 2 if opts.unicode else ah_ * 2}{arrow if opts.unicode else aa}{kind[:4]}")
-    return " ".join(parts) + ("  ╌╌ planned  ╌╌ stalled  ✗ failed" if opts.unicode else "  -  - planned  -  - stalled  x failed")
+# Legend words, longest first: the first tier whose whole line fits the width wins, so a word is never cut mid-way.
+LEGEND_WORDS = (
+    {"communication": "message", "delegation": "delegate", "handoff": "handoff", "review": "review", "ownership": "owner"},
+    {"communication": "msg", "delegation": "deleg", "handoff": "handoff", "review": "review", "ownership": "owner"},
+)
+
+
+def legend(opts: RenderOpts, width: int = 80) -> str:
+    tails = (("  ╌╌ planned  ╌╌ stalled  ✗ failed", "  ╌ planned ╌ stalled ✗ failed") if opts.unicode
+             else ("  -  - planned  -  - stalled  x failed", "  - planned - stalled x failed"))
+    line = ""
+    for words in LEGEND_WORDS:
+        parts = []
+        for kind in KINDS:
+            _, sh, _, dh, _, arrow, ah_, _, aa = _EDGE[kind]
+            parts.append(f"{sh * 2 if opts.unicode else ah_ * 2}{arrow if opts.unicode else aa}{words[kind]}")
+        for tail in tails:
+            line = " ".join(parts) + tail
+            if cell_width(line) <= width:
+                return line
+    return line   # nothing fits (very narrow terminal): the caller clips the end, the kinds come first
 
 
 def status_text(snapshot: dict, opts: RenderOpts) -> str:
@@ -794,7 +809,7 @@ def _render(snapshot: dict, width: int, height: int, mode: str, focus: int, tick
         bottom = 4
         mh = height - 2 - extra - bottom - 1
         map_lines = draw_map(snapshot, mw - 2, mh - 3, mode, focus, tick, opts, compact=False)
-        map_block = _boxed_ansi("Map · " + mode_title(mode), map_lines, mw, mh, opts, opts.pane == "map", legend(opts))
+        map_block = _boxed_ansi("Map · " + mode_title(mode), map_lines, mw, mh, opts, opts.pane == "map", legend(opts, mw - 2))
         t_h = max(mh // 4, 5)
         g_h = max(mh // 3, 6)
         a_h = max(mh - t_h - g_h, 5)
@@ -810,7 +825,7 @@ def _render(snapshot: dict, width: int, height: int, mode: str, focus: int, tick
     strip = 6 if height >= 20 else 3
     mh = height - 2 - extra - strip - 3
     map_lines = draw_map(snapshot, width, mh, mode, focus, tick, opts, compact=True)
-    lg = style_line(fit(legend(opts), width), "dim", opts)
+    lg = style_line(fit(legend(opts, width), width), "dim", opts)
     half = width // 2
     left = boxed("Tasks", task_lines(snapshot, half), half, strip, opts, opts.pane == "tasks", opts.scroll if opts.pane == "tasks" else 0)
     right = boxed("Activity", activity_lines(snapshot, width - half), width - half, strip, opts, opts.pane == "activity",

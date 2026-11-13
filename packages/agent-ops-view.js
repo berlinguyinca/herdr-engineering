@@ -10,7 +10,7 @@ import { entityHref } from './entity-links.js';
 import {
   MODES, FILTER_KEYS, SPEEDS, EDGE_KINDS, KIND_ORDER, NODE_R, RING_R, RING_W, HALO_R, emptyFilters, filterOptions, layoutScene, diffSnapshots,
   describeNode, describeEdge, altTable, neighbour, buildTimeline, replayFrame, indexAtFraction, nextIndex, stepDelay, formatClock, shortId, roomLabel,
-  contextInfo, stateInfo, edgeId, hostStrip, driftItems, TIMELINE_CAP,
+  contextInfo, stateInfo, edgeId, hostStrip, driftItems, TIMELINE_CAP, fitText, chordWidth, squeezeAttrs,
 } from './agent-ops-model.js';
 
 const text = (v) => (typeof v === 'string' ? v : v == null ? '' : String(v));
@@ -87,12 +87,14 @@ export function renderNode(n, { selected = false, pulse = false, tab = true, com
     : `<circle class="ao-ring ao-ring--${level}${pulse ? ' ao-pulse' : ''}" r="${RING_R}" fill="none" stroke-width="${RING_W}" stroke-linecap="round" stroke-dasharray="${ring.dash} ${ring.gap}" transform="rotate(-90)"/>`;
   const track = n.person ? '' : `<circle class="ao-track" r="${RING_R}" fill="none" stroke-width="${RING_W}"/>`;
   const warn = !n.person && (ctx.level === 'critical' ? ' !' : '');
-  const nameMax = compact ? 9 : 11, modelMax = compact ? 11 : 13;
+  // Text is ellipsised to the chord of the circle at its own height, with padding, so it never touches the circle edge.
+  const namePx = compact ? 18 : 15, modelPx = compact ? 14 : 11.5, ctxPx = modelPx;
+  const ctxText = ctx.known && ctx.percent != null ? `${ctx.percent}% ctx` : ctx.label;
   const inner = n.person
-    ? `<text class="ao-name" y="5" text-anchor="middle">${esc(clip(n.name, nameMax + 1))}</text>`
-    : `<text class="ao-name" y="-9" text-anchor="middle">${esc(clip(n.name, nameMax))}</text>
-       <text class="ao-model${n.modelKnown ? '' : ' ao-model--unknown'}" y="9" text-anchor="middle">${esc(clip(n.model, modelMax))}</text>
-       <text class="ao-ctx ao-ctx--${level}" y="28" text-anchor="middle">${esc(ctx.known && ctx.percent != null ? `${ctx.percent}% ctx` : ctx.label)}${warn}</text>`;
+    ? `<text class="ao-name" y="5" text-anchor="middle">${esc(fitText(n.name, chordWidth(5, namePx), namePx))}</text>`
+    : `<text class="ao-name" y="-9" text-anchor="middle">${esc(fitText(n.name, chordWidth(-9, namePx), namePx))}</text>
+       <text class="ao-model${n.modelKnown ? '' : ' ao-model--unknown'}" y="9" text-anchor="middle"${n.modelKnown ? '' : squeezeAttrs(n.model, chordWidth(9, modelPx, 4), modelPx, true)}>${esc(n.modelKnown ? fitText(n.model, chordWidth(9, modelPx, 4), modelPx, true) : n.model)}</text>
+       <text class="ao-ctx ao-ctx--${level}" y="28" text-anchor="middle"${squeezeAttrs(ctxText + warn, chordWidth(28, ctxPx, 4), ctxPx)}>${esc(ctxText)}${warn}</text>`;
   // Drift: a small warning triangle on the ring at the upper right. It is a heuristic and says so (title, aria-label, legend).
   const drift = n.hasDrift ? `<g class="ao-drift-badge" transform="translate(${f1((RING_R + 2) * 0.707)} ${f1(-(RING_R + 2) * 0.707)})"><title>Drift signal (heuristic)</title><path d="M0 -13L13 10H-13z"/><text y="6" text-anchor="middle" aria-hidden="true">!</text></g>` : '';
   // Model switched: a pill under the node, apart from any handoff edge (a switch happens inside one agent, a handoff goes between two).

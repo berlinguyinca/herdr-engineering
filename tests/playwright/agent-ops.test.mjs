@@ -182,3 +182,26 @@ test('fleet strip from real ingest (hosts, unknown state) and roving tabindex on
   assert.equal(await page.locator('.ao-node').nth(2).getAttribute('tabindex'),'0');
  });
 });
+
+test('node text stays inside its circle with padding (measured with getBBox), at desktop and phone width',async()=>{
+ await withServer({},async(page,base)=>{
+  for(const [w,h] of [[1440,900],[390,844]]){
+   await page.setViewportSize({width:w,height:h});await open(page,base);
+   const worst=await page.evaluate(()=>{
+    const out=[];
+    for(const g of document.querySelectorAll('.ao-node')){
+     const R=Number(g.querySelector('.ao-body').getAttribute('r'));
+     for(const t of g.querySelectorAll('.ao-name,.ao-model,.ao-ctx')){
+      const b=t.getBBox();
+      // text coordinates are in the node's own space (the group is translated), so the circle is centred on 0,0
+      const far=Math.max(...[[b.x,b.y],[b.x+b.width,b.y],[b.x,b.y+b.height],[b.x+b.width,b.y+b.height]].map(([x,y])=>Math.hypot(x,y)));
+      out.push({text:t.textContent,far,R});
+     }
+    }
+    return out;
+   });
+   assert.ok(worst.length>=10,'text measured');
+   for(const t of worst)assert.ok(t.far<=t.R-2,`"${t.text}" reaches ${t.far.toFixed(1)} of radius ${t.R} at ${w}px`);
+  }
+ });
+});
