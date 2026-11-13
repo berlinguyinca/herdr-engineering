@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { HerdrClient } from './herdr-web-client/client.js';
 import { layoutScene, buildTimeline } from './agent-ops-model.js';
-import { API, loadSnapshot, loadReplay, loadTimeline, streamUrl, renderTabs, renderFilters, renderScene, renderNode, renderEdge, renderInspector, renderTimeline, renderBanner, renderAltTable, renderEmpty, renderLegend, renderHostStrip, renderDrift } from './agent-ops-view.js';
+import { API, loadSnapshot, loadReplay, loadTimeline, streamUrl, renderTabs, renderFilters, renderScene, renderNode, renderEdge, renderInspector, renderTimeline, renderBanner, renderAltTable, renderEmpty, renderLegend, renderHostStrip, renderDrift, sceneSignature } from './agent-ops-view.js';
 
 const agent = (id, over = {}) => ({ node_id: id, agent_id: id, session_id: null, host_id: 'h1', provider: null, model: 'opus', model_changes: [], state: 'working', context: { used: 50, limit: 100, source: 'pi' },
   room_ids: [], parent_session_id: null, compactions: 0, drift_warnings: 0, label: null, provenance: 'observed', last_event_at: '2026-11-12T10:00:00.000000Z', ...over });
@@ -237,4 +237,24 @@ test('room filter option shows the room name', () => {
   const html = renderFilters({ room: ['rX'], roomName: { rX: 'product-dev' } }, { room: '' });
   assert.match(html, /<option value="rX">product-dev<\/option>/);
   assert.match(renderFilters({ room: ['room_0123456789ABCDEF'] }, {}), /room_0….*CDEF/);
+});
+
+test('scene signature: drift or a model switch appearing alone changes it (repaint), room shape too', () => {
+  const base = layoutScene(SNAP, { aspect: 1.4 });
+  const drifted = layoutScene({ ...SNAP, agents: SNAP.agents.map((a) => (a.node_id === 'a1' ? { ...a, drift_warnings: 2 } : a)) }, { aspect: 1.4 });
+  const switched = layoutScene({ ...SNAP, agents: SNAP.agents.map((a) => (a.node_id === 'a1' ? { ...a, model_changes: [{ from: 'sonnet', to: 'opus' }] } : a)) }, { aspect: 1.4 });
+  assert.notEqual(sceneSignature(drifted, {}), sceneSignature(base, {}));
+  assert.notEqual(sceneSignature(switched, {}), sceneSignature(base, {}));
+  assert.equal(sceneSignature(base, {}), sceneSignature(layoutScene(SNAP, { aspect: 1.4 }), {}));
+  const phone = layoutScene({ ...SNAP, rooms: [{ room_id: 'rX', name: 'a', agent_ids: ['a1'] }], agents: SNAP.agents.map((a) => ({ ...a, room_ids: ['rX'] })) }, { aspect: 1.4 });
+  const renamed = { ...phone, rooms: phone.rooms.map((r) => ({ ...r, label: 'other', shape: 'rect' })) };
+  assert.notEqual(sceneSignature(renamed, {}), sceneSignature(phone, {}));
+});
+
+test('layoutScene survives a non-finite aspect', () => {
+  for (const aspect of [NaN, Infinity, undefined]) {
+    const s = layoutScene(SNAP, { aspect });
+    assert.deepEqual(s.nodes.map((n) => [n.x, n.y]), layoutScene(SNAP, { aspect: 1.35 }).nodes.map((n) => [n.x, n.y]));
+    assert.ok(s.nodes.every((n) => Number.isFinite(n.x) && Number.isFinite(n.y)));
+  }
 });

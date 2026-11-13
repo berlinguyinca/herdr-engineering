@@ -120,6 +120,12 @@ export function renderMarkers() {
   return `<defs>${KIND_ORDER.map((k) => `<marker id="ao-arrow-${EDGE_KINDS[k].tone}" class="ao-arrow ao-arrow--${EDGE_KINDS[k].tone}" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z"/></marker>`).join('')}</defs>`;
 }
 
+// Everything a repaint must notice: any field the scene draws. A signal appearing alone (drift, a model switch) must change it.
+export function sceneSignature(scene, { selected = null, flowing = false, pulses = [] } = {}) {
+  return JSON.stringify([scene.nodes.map((n) => [n.id, n.x, n.y, n.ctx.label, n.state.key, n.model, n.name, n.roles.length, n.hasDrift, n.drift, n.switchedFrom]),
+    scene.edges.map((e) => [e.id, e.d, e.state, e.dimmed]), scene.rooms.map((r) => [r.id, r.cx, r.cy, r.r, r.label, r.rx, r.ry, r.shape]), selected, flowing, pulses]);
+}
+
 export function renderScene(scene, { selected = null, pulses = new Set(), flowing = true, label = 'Agent activity map', tabId = null } = {}) {
   const vb = scene.viewBox;
   const rooms = scene.rooms.map((r) => `<g class="ao-room" aria-hidden="true">${r.shape === 'rect' ? `<rect x="${f1(r.cx - r.rx)}" y="${f1(r.cy - r.ry)}" width="${f1(2 * r.rx)}" height="${f1(2 * r.ry)}" rx="48"/>` : `<ellipse cx="${r.cx}" cy="${r.cy}" rx="${r.rx ?? r.r}" ry="${r.ry ?? r.r}"/>`}<text x="${r.cx}" y="${f1(r.cy - (r.ry ?? r.r) + 26)}" text-anchor="middle">${esc(r.label)}${r.ctx?.known && r.ctx.percent != null ? ` · avg ${r.ctx.percent}% ctx` : ''}</text></g>`).join('');
@@ -294,8 +300,7 @@ export function mountAgentOps(container, client, opts = {}) {
     const snap = viewSnap();
     const scene = layoutScene(snap, { mode: state.mode, filters: state.filters, aspect: aspectNow() });
     state.scene = scene; lastAspect = aspectNow();
-    const sig = JSON.stringify([scene.nodes.map((n) => [n.id, n.x, n.y, n.ctx.label, n.state.key, n.model, n.name, n.roles.length]), scene.edges.map((e) => [e.id, e.d, e.state, e.dimmed]),
-      scene.rooms.map((r) => [r.id, r.cx, r.cy, r.r]), state.selected, flowing(), [...state.pulses]]);
+    const sig = sceneSignature(scene, { selected: state.selected, flowing: flowing(), pulses: [...state.pulses] });
     if (force || sig !== state.sig) {
       const active = container.querySelector(':focus');
       const focusKey = active?.dataset?.aoNode ? ['aoNode', active.dataset.aoNode] : active?.dataset?.aoEdge ? ['aoEdge', active.dataset.aoEdge] : null;
@@ -387,7 +392,7 @@ export function mountAgentOps(container, client, opts = {}) {
     if (r.status === 'ok') {
       state.pulses = new Set(diffSnapshots(viewSnap(), r.body).modelChanged); state.replay = r.body;
       state.conn = state.conn === 'offline' ? 'offline' : state.conn;
-    } else if (r.reset) { state.streamCursor = ''; state.index = null; state.replay = null; load(); return; }
+    } else if (r.reset) { stopPlaying(false); state.streamCursor = ''; state.index = null; state.replay = null; load(); return; }
     else { state.message = r.message || ''; }
     paintStage(); paintTimeline(); schedulePlay();
   }

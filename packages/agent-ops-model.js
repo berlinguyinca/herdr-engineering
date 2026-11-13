@@ -18,8 +18,8 @@ export const RING_W = 8;
 export const RING_R = NODE_R + RING_GAP;
 export const HALO_R = RING_R + 12;
 export const CLUSTER_PAD = 40;
-export const LABEL_BELOW = 124;
-const GRID_COL = 214, GRID_ROW = 205;   // phone layout: two columns, one row per pair   // distance below a node centre that its state label and switched-model pill need
+export const LABEL_BELOW = 124;   // distance below a node centre that its state label and switched-model pill need
+const GRID_COL = 214, GRID_ROW = 205;   // phone layout: two columns, one row per pair
 export const NO_ROOM = '';
 
 // ---- context fraction (ADR: amber >= 70, red >= 90) -------------------------------------------------------------------------
@@ -261,7 +261,8 @@ function placeLabels(items, nodes, charW = LABEL_CHAR) {
  * snapshot -> scene. Deterministic: clusters sorted by room id, members by node id, parallel edges fanned by index.
  * `mode` only decides which edges are dimmed; `filters` (see filterSnapshot) decide what is drawn at all.
  */
-export function layoutScene(snapshot, { mode = 'activity', filters = {}, aspect = 1.35 } = {}) {
+export function layoutScene(snapshot, { mode = 'activity', filters = {}, aspect: aspectIn = 1.35 } = {}) {
+  const aspect = Number.isFinite(aspectIn) ? aspectIn : 1.35;
   const view = filterSnapshot(snapshot || {}, filters);
   const agents = view.agents.map((a) => ({ ...a }));
   const byId = new Map(agents.map((a) => [a.node_id, a]));
