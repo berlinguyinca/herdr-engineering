@@ -9,6 +9,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - `GET /api/v1/sessions/{id}/inspector/history` now continues into `fabric_events_archive` once the requested range goes past what the archive job moved out of `fabric_events`. The two tables are merged under the one keyset order and the same opaque cursor, so a page can straddle the boundary with no gap and no duplicate (a row present in both is returned once). No new setting: with no archive table, behaviour is unchanged. Replaces the earlier caveat that archived rows were not read; the archive job itself stays off by default.
 
+### Web: configurable GC thresholds, boot-heap freeze (`control_plane.gc`)
+
+- `control_plane.gc: {gen0, gen1, gen2, freeze}` tunes the collector at web start (restart required). Keys left unset: `gen0`/`gen1` keep the running interpreter's values; `gen2` defaults to 1000.
+- Behaviour change with no `gc` block at all: the default `gen2` goes from 10 to 1000, and the boot heap is frozen. Rollback: `gc: {gen2: 10, freeze: false}` in the fleet YAML.
+- Values must be integers from 1 to 2147483647; a bad block stops startup with `--fleet-config: control_plane.gc...`.
+
 ### Design: always-on review pane
 
 - Added `docs/superpowers/specs/2026-11-13-always-on-review-pane-design.md`, a proposal for a dedicated two-tier review process (advisory open-weight first pass, Opus on mergeable heads posting `Opus agent review`) with measured open-weight evidence, a replay-set plan, failure modes and rollback. Docs only.
