@@ -4,11 +4,11 @@
 # minutes; running it across workers is what makes the gate affordable. Everything here is overridable because the CPU count of the
 # CI exec host is not known in advance:
 #   HERDR_PYTEST_WORKERS       worker count; `auto` (default) = one per CPU, `0` = plain serial run, as before xdist.
-#   HERDR_PYTEST_MAXPROCESSES  ceiling on `auto` (default 8): a 100+ core host must not start 100 workers that each import the
+#   HERDR_PYTEST_MAXPROCESSES  ceiling on the worker count (default 8; xdist applies it to `auto` and to an explicit `-n N` alike): a 100+ core host must not start 100 workers that each import the
 #                              package, bind loopback servers and hold ~3,000 leaked descriptors apiece (see ensure-fd-limit.sh).
-# --dist=loadfile keeps every test of a file on one worker, because the suite's fixtures and module state are written per file. A
-# test that cannot share a machine with others (fixed port, shared path) is marked `xdist_group`, never deselected: loadfile already
-# honours it by keeping the whole file together.
+# --dist=loadfile keeps every test of a file on one worker, because the suite's fixtures and module state are written per file. It
+# does NOT honour `xdist_group` marks (only --dist=loadgroup does), so files still run concurrently with each other: a test that
+# cannot share a machine with other files (fixed port, shared path) must use an OS-assigned port or a per-test tmp path instead.
 herdr_pytest_parallel_args() {
   local workers="${HERDR_PYTEST_WORKERS:-auto}" cap="${HERDR_PYTEST_MAXPROCESSES:-8}"
   case "$workers" in

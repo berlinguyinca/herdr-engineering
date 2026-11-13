@@ -79,3 +79,20 @@ def test_node_detail_unknown(monkeypatch):
     d = tree.node_detail("nope:nothing")
     assert d["kind"] == "unknown"
     assert "error" in d
+
+
+def test_live_processes_sees_args_past_80_columns_under_xdist_columns(monkeypatch):
+    """pytest-xdist workers export COLUMNS=80, which makes `ps` truncate args unless it is run with -ww."""
+    import subprocess
+    import sys
+
+    marker = "augur-tail-marker"
+    padding = "x" * 120
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", padding, marker])
+    try:
+        monkeypatch.setenv("COLUMNS", "80")
+        found = [p for p in tree._live_processes() if p["pid"] == str(child.pid)]
+        assert found and marker in found[0]["args"]
+    finally:
+        child.kill()
+        child.wait()
