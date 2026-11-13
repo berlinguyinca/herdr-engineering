@@ -272,6 +272,8 @@ sections:
       #   max_tokens: 5                  # live sessions per account; the oldest is dropped (1-50)
       #   trusted_proxies: []            # proxies whose X-Forwarded-For is believed (loopback always); the fabric gateway's
       #                                  # address as the control plane sees it goes here so lockout keys on the real client
+      #   open_owner_origins: ["rakazo://", "shepherd://"]   # app Origins the passwordless open_owner session accepts
+      #                                  # (default ["rakazo://"]; scheme:// or scheme://host, never http/https, max 8)
       #   accounts:                      # shape reserved for a later multi-user mode; today only role: operator
       #     - email: "you@example.com"
       #       password_scrypt: "scrypt$32768$8$1$<salt_b64>$<hash_b64>"
