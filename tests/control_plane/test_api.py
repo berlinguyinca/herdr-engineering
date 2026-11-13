@@ -483,7 +483,7 @@ def test_default_native_dispatch_checks_conversation_before_prompt(monkeypatch):
               "terminal_id": "term-1", "agent_session": dict(conversation)}
     receipt = ControlPlaneServer._dispatch_native_message(None, record, "literal hello", [])
     assert receipt["status"] == "delivered"
-    assert calls[-1] == ["--machine", "machine-beast", "--session", "eng", "agent", "prompt", "--", "term-1", "literal hello"]
+    assert calls[-1] == ["--machine", "machine-beast", "--session", "eng", "agent", "prompt", "term-1", "literal hello"]
     record["agent_session"] = {**conversation, "value": "/tmp/different-session.jsonl"}
     from herdr_engineering.errors import InvalidError
     with pytest.raises(InvalidError, match="identity changed"):

@@ -112,8 +112,10 @@ class NativeHerdrAdapter:
         self._capabilities: HerdrCapabilities | None = None
 
     # -- low-level ---------------------------------------------------------
-    def _run(self, args: list[str], timeout: int = 30) -> str:
+    def _run(self, args: list[str], timeout: int = 30, environment: dict[str, str] | None = None) -> str:
         try:
+            if environment and isinstance(self._runner, _SubprocessRunner):
+                return self._runner.run(args, timeout=timeout, environment=environment)
             return self._runner.run(args, timeout=timeout)
         except subprocess.TimeoutExpired:
             raise TimeoutError_Engineering("herdr command timed out",
@@ -304,7 +306,7 @@ class NativeHerdrAdapter:
 
     # -- input ---------------------------------------------------------------
     def send_input(self, target: str, text: str, machine: str | None = None,
-                   session: str | None = None) -> dict[str, Any]:
+                   session: str | None = None, operation_id: str | None = None) -> dict[str, Any]:
         """Submit a native prompt; delivery does not establish mission progress.
 
         ``session`` selects the named HerdR server, ``target`` selects an agent
@@ -314,9 +316,11 @@ class NativeHerdrAdapter:
             raise InvalidError("an explicit native agent target is required")
         if not isinstance(text, str) or not text.strip():
             raise InvalidError("prompt text is required")
-        result = self._run_json(self._routing(machine, session)
-                                + ["agent", "prompt", "--", target, text])
-        if not isinstance(result, dict) or result.get("ok") is not True:
+        environment = {"HERDR_COMMUNICATION_OPERATION_ID": operation_id} if operation_id else None
+        result = json.loads(self._run(self._routing(machine, session)
+                            + ["agent", "prompt", target, text], environment=environment))
+        from .communications import delivery_status
+        if delivery_status(0, json.dumps(result).encode()) != "delivered":
             raise InvalidError("native prompt did not acknowledge delivery")
         return {"status": "delivered", "target": target, "machine": machine,
                 "session": session, "mission_progress_verified": False,
@@ -327,9 +331,11 @@ class _SubprocessRunner:
     def __init__(self, herdr_bin: str) -> None:
         self.herdr_bin = herdr_bin
 
-    def run(self, args: list[str], timeout: int = 30) -> str:
+    def run(self, args: list[str], timeout: int = 30, environment: dict[str, str] | None = None) -> str:
+        import os
         proc = subprocess.run(
-            [self.herdr_bin] + args, capture_output=True, text=True, timeout=timeout)
+            [self.herdr_bin] + args, capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, **environment} if environment else None)
         if proc.returncode != 0:
             raise InvalidError(f"herdr {args[0]} failed: {proc.stderr.strip()[:300]}")
         return proc.stdout
