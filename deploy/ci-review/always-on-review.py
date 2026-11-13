@@ -66,7 +66,7 @@ DEFAULTS: dict = {
     "state_dir": "~/.local/state/herdr-review",
     "post": False,                      # with the --post flag, the second of the two keys that allow any posting
     "clone": "",                        # a clone the claude/pi backends create read-only worktrees from
-    "gates": {"required": []},          # commit status contexts or check-run names that must be green for tier 2
+    "gates": {"required": [], "when_present": []},   # tier 2: required must be success; when_present only if it exists
     "poll": {"max_per_run": 5, "pending_stale_minutes": 120, "cooldown_failures": 3, "cooldown_minutes": 60},
     "tiers": {
         "tier1": {"enabled": True, "context": "Open-weight pre-review", "backend": "pi",
@@ -76,7 +76,7 @@ DEFAULTS: dict = {
     },
     "backends": {
         "gateway": {**ai.DEFAULTS["reviewer"], "chunk_bytes": 24000},
-        "claude": {"command": "claude", "wrapper": [], "max_turns": 40},
+        "claude": {"command": "claude", "wrapper": [], "max_turns": 40, "diff_bytes": 200000},
         "pi": {"command": "pi", "wrapper": [], "thinking": "off", "diff_bytes": 60000},
     },
 }
@@ -115,6 +115,13 @@ def load_config(path: str | None) -> dict:
             raise Refused(f"config: backends.{name}.wrapper must be a list of strings")
         if not b["command"].strip():
             raise Refused(f"config: backends.{name}.command is empty")
+    for g in ("required", "when_present"):
+        if not isinstance(cfg["gates"][g], list) or not all(isinstance(x, str) and x for x in cfg["gates"][g]):
+            raise Refused(f"config: gates.{g} must be a list of names")
+    for name, t in cfg["tiers"].items():
+        if t["backend"] == "pi" and t["comment"] is True and not cfg["backends"]["pi"]["wrapper"]:
+            raise Refused(f"config: tiers.{name} uses pi with comment: true, but pi has no file sandbox and its "
+                          "output would reach a public comment; set backends.pi.wrapper (e.g. bwrap) or comment: false")
     return cfg
 
 
@@ -267,6 +274,7 @@ class ReviewRequest:
     diff: str
     files: list[str]
     worktree: Path | None = None
+    log: str = ""
     cfg: dict = field(default_factory=dict)
 
 
@@ -307,6 +315,8 @@ def untrusted(req: ReviewRequest, fence: str, with_diff: int | None) -> str:
     files = ", ".join(json.dumps(ai.CTRL.sub("", f)) for f in req.files)
     parts = [fence, f"BASE COMMIT (trusted): {req.base_sha}", f"FILES CHANGED: {files}",
              f"TITLE: {req.title[:500]}", f"DESCRIPTION:\n{req.body[:8000]}"]
+    if req.log:
+        parts.append(f"COMMITS (base..head):\n{req.log[:8000]}")
     if with_diff is not None:
         raw = req.diff.encode()
         text = raw[:with_diff].decode("utf-8", "ignore") + (
@@ -317,13 +327,13 @@ def untrusted(req: ReviewRequest, fence: str, with_diff: int | None) -> str:
 
 
 def claude_argv(bcfg: dict, model: str, system: str) -> list[str]:
-    """Headless Claude Code, read-only. Tools are an allowlist (Read/Grep/Glob and Bash restricted to git diff, log,
-    show); dontAsk denies everything else; --setting-sources "" ignores the user's and the PR's settings (measured:
+    """Headless Claude Code, read-only. Tools are an allowlist of Read, Grep and Glob only: no Bash at all (a git
+    allow rule is not read-only: `git diff --output=PATH` writes a file). The diff and commit log are in the prompt.
+    dontAsk denies everything else; --setting-sources "" ignores the user's and the PR's settings (measured:
     with `user`, a permissive user rule let Read leave the worktree)."""
     return [*bcfg["wrapper"], bcfg["command"], "-p", "--model", model, "--output-format", "json",
             "--json-schema", json.dumps(VERDICT_SCHEMA, separators=(",", ":")),
-            "--tools", "Read,Grep,Glob,Bash",
-            "--allowedTools", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)",
+            "--tools", "Read,Grep,Glob",
             "--disallowedTools", "WebFetch", "WebSearch", "Edit", "Write", "NotebookEdit", "Task",
             "--permission-mode", "dontAsk", "--setting-sources", "", "--strict-mcp-config",
             "--disable-slash-commands", "--no-session-persistence", "--max-turns", str(bcfg["max_turns"]),
@@ -374,10 +384,10 @@ class ClaudeBackend:
 
     def argv(self, req: ReviewRequest) -> tuple[list[str], str]:
         fence = "=====UNTRUSTED-" + secrets.token_hex(8) + "====="
-        tools = ("Your tools are read-only: Read, Grep, Glob and the shell commands `git diff`, `git log`, `git show`, "
-                 "run plainly from the current directory (the PR head, checked out). See the change with "
-                 f"`git diff {req.base_sha} HEAD`.\n")
-        return claude_argv(self.bcfg, self.model, instructions(req, fence, tools)), untrusted(req, fence, None)
+        tools = ("Your tools are read-only: Read, Grep and Glob, on the checked-out PR head in the current directory "
+                 "(for the code around the change). You have no shell. The diff and commit log are in the message.\n")
+        return (claude_argv(self.bcfg, self.model, instructions(req, fence, tools)),
+                untrusted(req, fence, self.bcfg["diff_bytes"]))
 
     def review(self, req: ReviewRequest, time_cap_s: float) -> RawReview:
         argv, stdin = self.argv(req)
@@ -402,6 +412,7 @@ class PiBackend:
     def __init__(self, bcfg: dict, model: str):
         self.bcfg, self.model = bcfg, model
         register_pi_secret(model)
+        register_gh_secret()
 
     def argv(self, req: ReviewRequest) -> list[str]:
         fence = "=====UNTRUSTED-" + secrets.token_hex(8) + "====="
@@ -424,6 +435,17 @@ def register_pi_secret(model: str) -> None:
         if isinstance(key, str) and key and not key.startswith(("!", "$")):
             ai.REDACT.add(key)
     except (OSError, ValueError, AttributeError):
+        pass
+
+
+def register_gh_secret() -> None:
+    """Best effort: the operator's `gh auth token` joins the redaction set (pi can read ~/.config/gh). Never raises."""
+    try:
+        p = subprocess.run(["gh", "auth", "token"], capture_output=True, timeout=30, env=child_env())
+        tok = p.stdout.decode("utf-8", "replace").strip()
+        if p.returncode == 0 and len(tok) >= 8:
+            ai.REDACT.add(tok)
+    except (OSError, subprocess.SubprocessError):
         pass
 
 
@@ -453,8 +475,11 @@ class GatewayBackend:
             raise ReviewFailed("nothing reviewable in the diff (every file is binary or skipped)")
         deadline, parts, used, took = time.monotonic() + time_cap_s, [], self.model, 0.0
         for i, ch in enumerate(chunks, 1):
-            if time.monotonic() > deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise ReviewFailed(f"the review took longer than the time cap ({time_cap_s:.0f}s)")
+            self.gw.r["timeout_s"] = min(float(self.bcfg["timeout_s"]), remaining)     # one request is bounded too
+            self.gw.r["deadline_s"] = min(float(self.bcfg["deadline_s"]), remaining)
             fence = "=====UNTRUSTED-" + secrets.token_hex(8) + "====="
             system = GATEWAY_SYSTEM.format(repo=req.repo, n=req.pr, sha=req.sha, i=i, total=len(chunks), fence=fence,
                                            claimable=", ".join(ai.CLAIMABLE))
@@ -500,7 +525,18 @@ class Worktree:
         self.path = ai.expand(cfg["state_dir"]) / "worktrees" / f"pr{pr}-{sha[:12]}-{secrets.token_hex(3)}"
         self.base_sha = ""
 
+    def _drop_refs(self) -> None:
+        for r in (f"refs/herdr-review/pr-{self.pr}", f"refs/herdr-review/base-{self.pr}"):
+            subprocess.run(["git", "update-ref", "-d", r], cwd=self.clone, capture_output=True, timeout=60)
+
     def __enter__(self) -> Worktree:
+        try:
+            return self._enter()
+        except BaseException:
+            self._drop_refs()
+            raise
+
+    def _enter(self) -> Worktree:
         ref = f"refs/herdr-review/pr-{self.pr}"
         git(["fetch", "--no-tags", "--quiet", "origin", f"+refs/pull/{self.pr}/head:{ref}",
              f"+refs/heads/{self.base_ref}:refs/herdr-review/base-{self.pr}"], self.clone)
@@ -514,33 +550,53 @@ class Worktree:
     def __exit__(self, *exc) -> None:
         subprocess.run(["git", "worktree", "remove", "--force", str(self.path)], cwd=self.clone,
                        capture_output=True, timeout=300)
+        self._drop_refs()
 
 
 # ---------------- gates, state, log ----------------
 
-def gates_green(gh, repo: str, sha: str, required: list[str]) -> tuple[bool, list[str]]:
-    """Every required name is a success on this exact SHA, as a commit status (newest wins) or a check run."""
-    if not required:
-        raise Refused("config: gates.required is empty; tier 2 would review heads that are not mergeable")
+def gate_states(gh, repo: str, sha: str) -> dict[str, str]:
+    """name -> success | pending | failure | neutral, for this exact SHA. A commit status (newest wins) takes
+    precedence over a check run of the same name; check runs arrive newest first. A check run that is not completed
+    is pending; its conclusion neutral or skipped is neutral; any other conclusion but success is a failure."""
     seen: dict[str, str] = {}
     for s in gh.statuses(repo, sha):
-        seen.setdefault(str(s.get("context")), str(s.get("state")))
+        st = str(s.get("state"))
+        seen.setdefault(str(s.get("context")), st if st in ("success", "pending") else "failure")
     for c in gh.check_runs(repo, sha):
-        seen.setdefault(str(c.get("name")), "success" if c.get("conclusion") == "success" else "pending")
+        done, concl = c.get("status", "completed") == "completed", c.get("conclusion")
+        seen.setdefault(str(c.get("name")), "pending" if not done else "success" if concl == "success"
+                        else "neutral" if concl in ("neutral", "skipped") else "failure")
+    return seen
+
+
+def gates_green(gh, repo: str, sha: str, required: list[str], when_present: list[str] | None = None
+                ) -> tuple[bool, list[str]]:
+    """`required` names must be present and success (neutral and skipped are NOT green). `when_present` names may
+    be absent or neutral/skipped, but if one exists it must be success: pending or failed blocks."""
+    if not required:
+        raise Refused("config: gates.required is empty; tier 2 would review heads that are not mergeable")
+    seen = gate_states(gh, repo, sha)
     missing = [g for g in required if seen.get(g) != "success"]
+    missing += [g for g in (when_present or []) if seen.get(g, "success") not in ("success", "neutral")]
     return not missing, missing
 
 
-def needs_review(statuses: list[dict], context: str, stale_minutes: int) -> bool:
+def needs_review(statuses: list[dict], context: str, stale_minutes: int, failed_here: bool = False) -> bool:
+    """No status: review. A terminal one: done. A pending one is another run's claim until it is stale, unless this
+    host's own run for this head already failed (we hold the PR lock, so nobody else is working on it). A pending
+    status with a missing or unparseable updated_at counts as recent: when in doubt, do not review."""
     mine = [s for s in statuses if s.get("context") == context]
     if not mine:
         return True
     if mine[0].get("state") in ("success", "failure", "error"):
         return False
+    if failed_here:
+        return True
     try:
         when = dt.datetime.strptime(str(mine[0].get("updated_at")), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.UTC)
     except ValueError:
-        return True
+        return False
     return (dt.datetime.now(dt.UTC) - when).total_seconds() / 60 >= stale_minutes
 
 
@@ -565,10 +621,14 @@ class State:
         tmp.write_text(json.dumps(self.data))
         tmp.replace(self.path)
 
-    def cooling(self, key: str, cfg: dict) -> bool:
+    def failed_here(self, key: str, sha: str) -> bool:
+        e = self.get(key)
+        return e.get("failures", 0) > 0 and e.get("failure_sha") == sha
+
+    def cooling(self, key: str, sha: str, cfg: dict) -> bool:
         e = self.get(key)
         p = cfg["poll"]
-        return (e.get("failures", 0) >= p["cooldown_failures"]
+        return (e.get("failure_sha") == sha and e.get("failures", 0) >= p["cooldown_failures"]
                 and time.time() - e.get("last_failure", 0) < p["cooldown_minutes"] * 60)
 
 
@@ -630,7 +690,7 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
         return SKIPPED
     post_on = post_allowed(cfg, post_flag)
     gh = ai.Gh(dry_run=not post_on)
-    state, key, started = State(cfg), f"{repo}#{n}#{tier_name}", time.monotonic()
+    state, key, started, sha = State(cfg), f"{repo}#{n}#{tier_name}", time.monotonic(), ""
     try:
         pr = gh.pr(repo, n)
         sha = str(pr.get("headRefOid", ""))
@@ -638,15 +698,16 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
             raise ReviewFailed("no head SHA")
         if pr.get("isDraft") or str(pr.get("state", "OPEN")).upper() != "OPEN":
             return SKIPPED
-        if not force and not needs_review(gh.statuses(repo, sha), tier["context"], cfg["poll"]["pending_stale_minutes"]):
+        if not force and not needs_review(gh.statuses(repo, sha), tier["context"],
+                                          cfg["poll"]["pending_stale_minutes"], state.failed_here(key, sha)):
             return SKIPPED
         if not post_on and not force and state.get(key).get("dry_sha") == sha:
             return SKIPPED
-        if state.cooling(key, cfg) and not force:
+        if state.cooling(key, sha, cfg) and not force:
             ai.say(f"{key}: cooling down after repeated failures; skipped")
             return SKIPPED
         if tier_name == "tier2":
-            green, missing = gates_green(gh, repo, sha, cfg["gates"]["required"])
+            green, missing = gates_green(gh, repo, sha, cfg["gates"]["required"], cfg["gates"]["when_present"])
             if not green:
                 ai.say(f"{key} @ {sha[:12]}: waiting for gates: {', '.join(missing)}")
                 return SKIPPED
@@ -655,13 +716,16 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
             return _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started)
         except (ReviewFailed, Refused) as e:
             if isinstance(e, ReviewFailed):
-                e0 = state.get(key).get("failures", 0) + 1
-                state.put(key, failures=e0, last_failure=time.time())
+                old = state.get(key)
+                count = old.get("failures", 0) + 1 if old.get("failure_sha") == sha else 1
+                state.put(key, failures=count, last_failure=time.time(), failure_sha=sha)
             log_line(cfg, repo=repo, pr=n, sha=sha, tier=tier_name, state="not-run", model=tier["model"],
                      duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=str(e)[:200])
             raise
     except HeadMoved as e:
         ai.say(f"{repo}#{n}: {e}; nothing posted (a new run handles the new head)")
+        log_line(cfg, repo=repo, pr=n, sha=sha, tier=tier_name, state="head-moved", model=tier["model"],
+                 duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=str(e)[:200])
         return MOVED
     finally:
         held.close()
@@ -685,6 +749,7 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
     if backend.needs_worktree:
         with Worktree(cfg, n, sha, str(pr.get("baseRefName", "main"))) as wt:
             req.worktree, req.base_sha = wt.path, wt.base_sha
+            req.log = git(["log", "--format=%h %s", f"{wt.base_sha}..{sha}"], wt.path)
             raw = backend.review(req, tier["time_cap_s"])
     else:
         raw = backend.review(req, tier["time_cap_s"])
@@ -747,6 +812,9 @@ def _poll_one(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool) -> 
         return REFUSED
     except ReviewFailed as e:
         ai.say(f"{repo}#{n} {tier_name}: review failed, status stays pending: {e}")
+        return FAILED
+    except Exception as e:                       # one PR's unexpected error must not stop the others
+        ai.say(f"{repo}#{n} {tier_name}: internal error, nothing posted: {type(e).__name__}")
         return FAILED
 
 

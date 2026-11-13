@@ -138,21 +138,25 @@ decides the state" rule. `ai-review.py` itself keeps working unchanged (the gate
 | Tier | Default context | Backend (config) | When it runs | Required? |
 |---|---|---|---|---|
 | tier1 | `Open-weight pre-review` | `pi` with an open-weight alias | every non-draft head | no, advisory |
-| tier2 | `Opus agent review` | `claude` with `opus` | only when every name in `gates.required` is green on that exact SHA | yes, once the ruleset is changed by the operator |
+| tier2 | `Opus agent review` | `claude` with `opus` | only when every `gates.required` name is success on that exact SHA and every existing `gates.when_present` check is success | yes, once the ruleset is changed by the operator |
 
 Backends (`tiers.<t>.backend`, settings under `backends.<name>`):
 
 - `gateway`: the OpenAI-compatible call, chunked as in ai-review.
-- `claude`: `claude -p --model <model>` in a fresh detached worktree of the PR head. Read-only tools only (`Read`,
-  `Grep`, `Glob`, `git diff|log|show`), `--permission-mode dontAsk`, `--setting-sources ""` (measured: with
+- `claude`: `claude -p --model <model>` in a fresh detached worktree of the PR head. Tools are exactly `Read`,
+  `Grep` and `Glob`: no Bash and no git allow rules (a `git diff:*` rule is not read-only, since
+  `--output=<path>` writes a file). The diff (cut at `diff_bytes`) and the commit log are in the prompt; the worktree
+  is there for reading the code around the change. `--permission-mode dontAsk`, `--setting-sources ""` (measured: with
   `--setting-sources user` a permissive user rule let `Read` leave the worktree; with `""` it is denied and a logged-in
   CLI still works), no MCP, no slash commands, no session persistence, strict `--json-schema` verdict, hard time cap.
-  The diff is not in the prompt; the model runs plain `git diff <base> HEAD` from the worktree (a `git -C` or `cd`
-  form is rejected by the prefix allow rule).
+  The prompt text and the worktree are untrusted input; for host-level isolation set `backends.claude.wrapper` to a
+  sandbox prefix such as `bwrap` (optional, not installed or required by this script).
 - `pi`: `pi -p --model <provider/alias>` with `--tools read,grep,find,ls`, no extensions, skills, MCP, context files
   or session, `--offline`. pi has no JSON-schema flag, so the diff is in the prompt and the answer is parsed strictly
-  from stdout. pi has no file sandbox: use `wrapper:` (for example bwrap) for isolation, and note that the pi
-  provider key is added to the redaction set so it cannot reach a comment, status or log.
+  from stdout. pi has no file sandbox and can read any file the user can, so its answer is not trusted to be free of
+  secrets: the pi provider key and the `gh auth token` value are added to the redaction set (best effort, exact
+  strings only: other secrets are NOT covered), and a tier that uses pi with `comment: true` is refused unless
+  `backends.pi.wrapper` is set (for example a `bwrap` prefix). Statuses and `reviews.jsonl` are redacted the same way.
 
 ### Choosing a pi model or alias
 
@@ -172,6 +176,13 @@ always-on-review.py review --tier tier1 --repo O/R --pr N --config CFG          
 always-on-review.py poll --config CFG                                            # dry run of the whole loop
 always-on-review.py poll --config CFG --post                                     # posts only if CFG has post: true
 ```
+
+Gates: `gates.required` names must be present and `success`; `neutral` and `skipped` do not count as green. A
+`gates.when_present` name (a pipeline that only runs on some PRs, such as `ui-gates`) may be absent or neutral/skipped,
+but when it exists it must be `success`: pending or failed blocks tier 2.
+
+Use a dedicated bare clone for `clone:` (not your working checkout): the script fetches `refs/pull/N/head` into
+`refs/herdr-review/*` there and removes those refs and the worktree after each review.
 
 Guarantees: one review per exact head SHA (idempotent, redone on every push), drafts skipped, one review at a time,
 per-review time cap (process group killed), cooldown after repeated failures, status stays `pending` whenever a

@@ -268,10 +268,25 @@ class Gh:
         return str(self.json(["api", "user"]).get("login", ""))
 
     def statuses(self, repo: str, sha: str) -> list[dict]:
-        return self.json(["api", f"repos/{repo}/commits/{sha}/status"]).get("statuses", []) or []
+        out: list[dict] = []
+        for page in range(1, 51):
+            batch = self.json(["api", f"repos/{repo}/commits/{sha}/status?per_page=100&page={page}"]).get(
+                "statuses", []) or []
+            out.extend(batch)
+            if len(batch) < 100:
+                break
+        return out
 
     def check_runs(self, repo: str, sha: str) -> list[dict]:
-        return self.json(["api", f"repos/{repo}/commits/{sha}/check-runs?per_page=100"]).get("check_runs", []) or []
+        """Every check run of this commit (all pages), newest first, so the first of a duplicated name wins."""
+        out: list[dict] = []
+        for page in range(1, 51):
+            batch = self.json(["api", f"repos/{repo}/commits/{sha}/check-runs?per_page=100&page={page}"]).get(
+                "check_runs", []) or []
+            out.extend(batch)
+            if len(batch) < 100:
+                break
+        return sorted(out, key=lambda c: (str(c.get("started_at") or ""), int(c.get("id") or 0)), reverse=True)
 
     def comments(self, repo: str, n: int) -> list[dict]:
         out: list[dict] = []

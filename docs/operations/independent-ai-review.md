@@ -74,7 +74,7 @@ next poll.
 
 The always-on process (`deploy/ci-review/always-on-review.py`) adds an advisory `Open-weight pre-review` (pi, open
 weights) and the `Opus agent review` (claude, run only on heads whose Woodpecker gates, verify and GitGuardian are all
-green). Both are configured in YAML only; see `deploy/ci-review/README.md` for backends, pi alias selection and the
+green; a `gates.when_present` check such as `ui-gates` must be green only if it exists). Both are configured in YAML only; see `deploy/ci-review/README.md` for backends, pi alias selection and the
 security posture.
 
 Operating rules:
