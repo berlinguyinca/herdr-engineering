@@ -44,7 +44,7 @@ try/catch-wrapped and delivery is never awaited by a hook.
 See `git log feat/agent-ops-adapters` (prefix `agent-ops-adapters:`).
 
 ## Tests and results
-`/private/tmp/claude-501/aoenv/bin/python -m pytest tests/control_plane/test_agent_ops_adapters.py -q -p no:cacheprovider`
+`$VENV/bin/python -m pytest tests/control_plane/test_agent_ops_adapters.py -q -p no:cacheprovider`
 -> 16 passed. Also `tests/control_plane/test_agent_ops.py` (22 passed) and `node --test emit.test.js emit-send.test.js`
 in `deploy/herdr-cp-feed-plugin` (34 passed). Real in-process control plane server, real `node` subprocesses (Claude hook
 CLI, Codex CLI, `emit.js`); Pi is exercised by calling the registered handlers with real `getContextUsage` functions

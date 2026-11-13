@@ -1,12 +1,12 @@
 # Discovery B: sibling repos, Herdr runtime, visual references
 
 Date 2026-11-12. Read-only. Local checkouts inspected in place; remote repos shallow-cloned to
-`/private/tmp/claude-501/-Users-wohlgemuth/3be4963c-3f15-489c-97c3-3e63c8119287/scratchpad/<name>`.
+`<scratch>/<name>`.
 Dashboard/control-plane code lives in `~/IdeaProjects/herdr-engineering` (covered by discovery A; only touched here for contracts).
 
 ## 1. Herdr runtime (the real tool)
 
-- Installed: `/Users/wohlgemuth/.local/bin/herdr`, v0.9.1, protocol 22, server running (`herdr status`). Upstream: `herdrdev/herdr` (Apache-2.0; also `herdrdev/herdr-app`, `herdr-core`). Docs index: https://herdr.dev/llms.txt (stable is 0.9.5, local is behind; re-check APIs on upgrade).
+- Installed: `$HOME/.local/bin/herdr`, v0.9.1, protocol 22, server running (`herdr status`). Upstream: `herdrdev/herdr` (Apache-2.0; also `herdrdev/herdr-app`, `herdr-core`). Docs index: https://herdr.dev/llms.txt (stable is 0.9.5, local is behind; re-check APIs on upgrade).
 - Not `ogulcancelik/herdr` as spec guessed; plugin cookbook is `ogulcancelik/herdr-plugin-examples`. Community plugins seen via `gh search repos herdr`: persiyanov/herdr-reviewr, hhdebb/herdr-radar (agent activity sidebar, MIT; closest prior art), dcolinmorgan/herdr-remote, eliasstravik/shepherdr, 0cv/herdr-mobile-relay, nikok6/herdr-mirror. Not inspected beyond metadata.
 - Plugin API (docs: `.../v0.9.5/docs/next/website/src/content/docs/plugins.mdx`, `socket-api.mdx`, `add-herdr-support.mdx`):
   - Manifest `herdr-plugin.toml`: `id, name, version, min_herdr_version`, `[[build]]`, `[[startup]]` (one-shot, not supervised daemons), `[[actions]]` (contexts workspace/global), `[[events]] on=<event>`, `[[panes]]` (placement overlay|popup|split|tab|zoomed, runs any argv = a TUI process), `[[link_handlers]]`. Lifecycle: `herdr plugin install owner/repo[/subdir]` (git clone, build, register), `link <dir>` for dev, `update`, `enable/disable`, `uninstall`, `config-dir`, `log list`. No native non-terminal plugin UI in v1: a plugin cannot draw web UI inside Herdr; only terminal panes. No sandbox; runs as user.

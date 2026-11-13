@@ -68,7 +68,7 @@ Rules the UI can rely on:
 - Bounds: 5000 events, 500 agents, 2000 edges, 200 rooms; `truncated: true` when any bound applied.
 
 ## Tests
-`/private/tmp/claude-501/aoenv/bin/python -m pytest tests/control_plane/test_envelope_v2.py tests/control_plane/test_ingest.py tests/control_plane/test_handoff.py tests/control_plane/test_collab.py tests/control_plane/test_collab_a2a.py tests/control_plane/test_agent_ops_envelope.py tests/control_plane/test_agent_ops.py -q -p no:cacheprovider`
+`$VENV/bin/python -m pytest tests/control_plane/test_envelope_v2.py tests/control_plane/test_ingest.py tests/control_plane/test_handoff.py tests/control_plane/test_collab.py tests/control_plane/test_collab_a2a.py tests/control_plane/test_agent_ops_envelope.py tests/control_plane/test_agent_ops.py -q -p no:cacheprovider`
 -> 235 passed. Also `test_api.py test_health_probe.py` -> 63 passed.
 New: 22 envelope tests, 22 projection tests (dedupe, out-of-order shuffles, deterministic replay, room
 authorization with no cross-room leak including counts, unknown stays null, model switch vs new session,

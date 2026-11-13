@@ -4,7 +4,7 @@
       "node_id": "01a1d2c5-dd79-728c-acb5-8f95855d28a8",
       "agent_id": "01a1d2c5-dd79-728c-acb5-8f95855d28a8",
       "session_id": "01a1d2c5-dd79-728c-acb5-8f95855d28a8",
-      "host_id": "Mac.lan",
+      "host_id": "<host>",
       "provider": "pi",
       "model": null,
       "model_changes": [],
@@ -29,7 +29,7 @@
       "node_id": "01a1d2c6-6647-7e20-8c29-5aaf21962171",
       "agent_id": "01a1d2c6-6647-7e20-8c29-5aaf21962171",
       "session_id": "01a1d2c6-6647-7e20-8c29-5aaf21962171",
-      "host_id": "Mac.lan",
+      "host_id": "<host>",
       "provider": "codex",
       "model": "gpt-6-astra",
       "model_changes": [
@@ -65,7 +65,7 @@
       "node_id": "032e75b5-97b2-489f-aaa8-683b15ecb7b6",
       "agent_id": "032e75b5-97b2-489f-aaa8-683b15ecb7b6",
       "session_id": "032e75b5-97b2-489f-aaa8-683b15ecb7b6",
-      "host_id": "Mac.lan",
+      "host_id": "<host>",
       "provider": "claude",
       "model": null,
       "model_changes": [],
@@ -90,7 +90,7 @@
       "node_id": "1e8b2ff5-3a76-4eaf-aa98-61396bcc1d3d",
       "agent_id": "1e8b2ff5-3a76-4eaf-aa98-61396bcc1d3d",
       "session_id": "1e8b2ff5-3a76-4eaf-aa98-61396bcc1d3d",
-      "host_id": "Mac.lan",
+      "host_id": "<host>",
       "provider": "claude",
       "model": null,
       "model_changes": [],
@@ -115,7 +115,7 @@
       "node_id": "560f5eb9-a437-4243-b289-c5442e7a4836",
       "agent_id": "560f5eb9-a437-4243-b289-c5442e7a4836",
       "session_id": "560f5eb9-a437-4243-b289-c5442e7a4836",
-      "host_id": "Mac.lan",
+      "host_id": "<host>",
       "provider": "claude",
       "model": null,
       "model_changes": [],
@@ -143,7 +143,7 @@
   "cursor": "2026-11-13T02:40:17.362248Z~claude-ops~~b64677b0317e~ao-018ad80b4e0b0ae50f0a935f29b1dfd9",
   "hosts": [
     {
-      "host_id": "Mac.lan",
+      "host_id": "<host>",
       "agents": [
         "01a1d2c5-dd79-728c-acb5-8f95855d28a8",
         "01a1d2c6-6647-7e20-8c29-5aaf21962171",

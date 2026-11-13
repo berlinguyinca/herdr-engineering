@@ -1,6 +1,6 @@
 #!/bin/sh
-L=/private/tmp/claude-501/lp
-A=~/IdeaProjects/herdr-engineering/.claude/worktrees/agent-ae7b3d9d01511ff31/deploy/agent-ops-adapters/claude.js
+L=${SCRATCH:-/tmp/ao-live}
+A=${REPO:-$HOME/IdeaProjects/herdr-engineering}/deploy/agent-ops-adapters/claude.js
 mkdir -p $L/claude-cwd
 CMD="sh -c 'tee -a $L/hook-in.jsonl | node $A'"
 cat > $L/claude-settings.json <<EOF
