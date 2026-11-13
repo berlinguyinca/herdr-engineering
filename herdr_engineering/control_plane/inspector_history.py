@@ -74,7 +74,8 @@ async def _query(conn: Any, table: str, session_id: str, limit: int, before: str
                  cutoff: float | None, kinds: frozenset[str] | None) -> list[Any]:
     """Up to ``limit`` + 1 newest rows of one table, in the keyset order shared by the journal and its archive."""
     args: list[Any] = [session_id]
-    where = ["entity_type = 'inspector'", "entity_id = $1", "event_type LIKE 'inspector.%'",
+    where = ["entity_type = 'inspector'", "entity_id IS NOT NULL", "entity_id <> ''",
+             "entity_id = $1", "event_type LIKE 'inspector.%'",
              "event_type <> 'inspector.preferences'"]
     if kinds is not None:
         args.append(sorted(kinds))
@@ -112,9 +113,9 @@ async def fetch_page(conn: Any, table: str, session_id: str, *, limit: int, befo
     archive table is simply not read."""
     rows = [dict(r) for r in await _query(conn, table, session_id, limit, before, cutoff, kinds)]
     if archive_table is not None and await conn.fetchval("SELECT to_regclass($1) IS NOT NULL", archive_table):
-        seen = {r["event_id"] for r in rows}
+        seen = {_order_key(r) for r in rows}   # event_id alone is only unique per actor: dedup on the full key
         rows += [d for d in (dict(r) for r in await _query(conn, archive_table, session_id, limit, before, cutoff, kinds))
-                 if d["event_id"] not in seen]
+                 if _order_key(d) not in seen]
         rows.sort(key=_order_key, reverse=True)
     more = len(rows) > limit
     shown = rows[:limit]
