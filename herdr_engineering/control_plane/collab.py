@@ -886,8 +886,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             u = self._users.setdefault(p["user_id"], {"since": p["at"]})
             u.update(status=p["status"], decided_by=p["decided_by"], decided_at=p["at"], reason=p.get("reason"))
         elif t == "member_added":
+            # "lapsed guest" = the person's LATEST membership was a guest one: a later non-guest add clears it.
             if p["role"] == "guest":
                 self._ever_guests.add(p["subject_user_id"])
+            else:
+                self._ever_guests.discard(p["subject_user_id"])
             self._rooms[p["room_id"]]["members"][p["subject_user_id"]] = {
                 "role": p["role"], "expires_at": p.get("expires_at"), "joined_seq": seq,
                 "joined_at": p.get("created_at")}
