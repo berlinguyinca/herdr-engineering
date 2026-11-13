@@ -201,5 +201,4 @@ def test_label_regex_cost_is_bounded(raw):
     import time
     t = time.perf_counter()
     sanitize_label(raw)
-    print("cost", time.perf_counter() - t)
     assert time.perf_counter() - t < 0.25

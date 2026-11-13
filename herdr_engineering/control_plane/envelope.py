@@ -44,18 +44,18 @@ _LABEL_REDACTIONS = (
     (re.compile(r"(?i)\b(?:authorization:\s*)?bearer\s+\S+"), "[redacted]"),
     (re.compile(r"(?i)\bauthorization:\s*basic\s+\S+"), "[redacted]"),
     # long nouns keep [\w-]* around them (db_password, x-api-key); `was` only for the nouns that are never ordinary prose
-    (re.compile(r"(?i)\b[\w-]*(?:password|passwd|secret|api[ _-]?key)[\w-]*\s*(?:[=:]|->|\bis\b|\bwas\b)\s*\S+"),
+    (re.compile(r"(?i)(?<![\w-])[\w-]*(?:password|passwd|secret|api[ _-]?key)[\w-]*+\s*(?:[=:]|->|\bis\b|\bwas\b)\s*\S+"),
      "[redacted]"),
-    (re.compile(r"(?i)\b[\w-]*token[\w-]*\s*(?:[=:]|->|\bis\b)\s*\S+"), "[redacted]"),
+    (re.compile(r"(?i)(?<![\w-])[\w-]*token[\w-]*+\s*(?:[=:]|->|\bis\b)\s*\S+"), "[redacted]"),
     # compound keys (dbpass, passphrase, passcode, userpass, pass_phrase, mypwd): the delimiter is still required
-    (re.compile(r"(?i)\b[\w-]*(?:pass(?:[_-]?phrase|code|wd|word)|pwd)[\w-]*\s*(?:[=:]|->)\s*\S+"), "[redacted]"),
-    (re.compile(r"(?i)\b[\w-]+(?:(?<!by)(?<!com)pass|pwd)\b\s*(?:[=:]|->)\s*\S+"), "[redacted]"),
+    (re.compile(r"(?i)(?<![\w-])[\w-]*(?:pass(?:[_-]?phrase|code|wd|word)|pwd)[\w-]*+\s*(?:[=:]|->)\s*\S+"), "[redacted]"),
+    (re.compile(r"(?i)(?<![\w-])[\w-]+(?:(?<!by)(?<!com)pass|pwd)\b\s*(?:[=:]|->)\s*\S+"), "[redacted]"),
     # short forms are anchored: `tests passed: 42`, `bypass is enabled`, `compass: north` are ordinary text
     (re.compile(r"(?i)(?<![A-Za-z0-9])pass(?![A-Za-z0-9])\s*(?:[=:]|->|\bis\b)\s*\S+"), "[redacted]"),
     (re.compile(r"(?i)(?<![A-Za-z0-9])pwd(?![A-Za-z0-9])\s*(?:[=:]|->|\bis\b|\s)\s*\S+"), "[redacted]"),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]*)?)?"), "[redacted]"),
     (re.compile(r"\bglpat-[A-Za-z0-9_-]{8,}"), "[redacted]"),
-    (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[email]"),
+    (re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[email]"),
     (re.compile(r"\b(?:sk|pk|ghp|gho|ghs|xox[abp])[-_\u2010-\u2015\u2212][A-Za-z0-9_-]{8,}"), "[redacted]"),
     (re.compile(r"\bAKIA[0-9A-Z]{12,}\b"), "[redacted]"),
     (re.compile(r"\b[A-Za-z0-9+/_-]{32,}={0,2}"), "[redacted]"),
