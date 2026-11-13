@@ -47,6 +47,9 @@ _LABEL_REDACTIONS = (
     (re.compile(r"(?i)\b[\w-]*(?:password|passwd|secret|api[ _-]?key)[\w-]*\s*(?:[=:]|->|\bis\b|\bwas\b)\s*\S+"),
      "[redacted]"),
     (re.compile(r"(?i)\b[\w-]*token[\w-]*\s*(?:[=:]|->|\bis\b)\s*\S+"), "[redacted]"),
+    # compound keys (dbpass, passphrase, passcode, userpass, pass_phrase, mypwd): the delimiter is still required
+    (re.compile(r"(?i)\b[\w-]*(?:pass(?:[_-]?phrase|code|wd|word)|pwd)[\w-]*\s*(?:[=:]|->)\s*\S+"), "[redacted]"),
+    (re.compile(r"(?i)\b[\w-]+(?:(?<!by)(?<!com)pass|pwd)\b\s*(?:[=:]|->)\s*\S+"), "[redacted]"),
     # short forms are anchored: `tests passed: 42`, `bypass is enabled`, `compass: north` are ordinary text
     (re.compile(r"(?i)(?<![A-Za-z0-9])pass(?![A-Za-z0-9])\s*(?:[=:]|->|\bis\b)\s*\S+"), "[redacted]"),
     (re.compile(r"(?i)(?<![A-Za-z0-9])pwd(?![A-Za-z0-9])\s*(?:[=:]|->|\bis\b|\s)\s*\S+"), "[redacted]"),
@@ -60,7 +63,7 @@ _LABEL_REDACTIONS = (
     (re.compile(r"(?<![\w:])(?:~|\.{1,2})?(?:/[^\s/]+)+/?"), "[path]"),
     # relative: src/app/main.py, a/b/c, docs/readme.md. One separator and no extension (CI/CD, read/write, 3/4,
     # claude-opus-4/5, auth/session) is ordinary text, not a path.
-    (re.compile(r"(?<![\w:/.-])(?!\d+(?:/\d+){2,}\b)(?:[\w.-]+(?:/[\w.-]+){2,}|[\w-]+(?:\.[\w-]+)*/[\w.-]*\.[A-Za-z0-9]{1,8}\b|[\w.-]+\.[A-Za-z0-9]{1,8}\b(?=/)[/\w.-]*)/?"), "[path]"),
+    (re.compile(r"(?<![\w:/.-])(?!\d{1,4}/\d{1,2}/\d{1,4}(?![\w./-]))(?:[\w.-]+(?:/[\w.-]+){2,}|[\w-]+(?:\.[\w-]+)*/[\w.-]*\.[A-Za-z0-9]{1,8}\b|[\w.-]+\.[A-Za-z0-9]{1,8}\b(?=/)[/\w.-]*)/?"), "[path]"),
 )
 
 # Entity types whose state is derived by dedicated handlers. Their v2 envelope
