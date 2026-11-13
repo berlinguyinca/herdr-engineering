@@ -10,6 +10,8 @@ gh api repos/berlinguyinca/herdr-engineering/statuses/<full head sha> \
     -f state=success -f context="Opus agent review" -f description="<what was reviewed>"
 ```
 
+- The ruleset is still named "Independent AI review" in the GitHub UI, although the context it requires is now `Opus agent review`.
+- Anyone with push access can post the `Opus agent review` status, so it is a convention, not an enforced identity.
 - If a push changes the head, re-review the fix commit with an Opus subagent. Any push makes the status stale, and
   it must be re-posted on the new head.
 - The `Independent AI review` check below (`deploy/ci-review/ai-review.py`, a deepseek or qwen model) is **no
