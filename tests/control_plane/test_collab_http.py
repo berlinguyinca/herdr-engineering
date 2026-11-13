@@ -269,6 +269,14 @@ def test_a_lost_post_is_reported_unknown_and_is_never_sent_twice(raw):
     assert [h for h in srv.hits if "/messages" in h] == ["POST /api/v1/collab/rooms/room_x/messages"]
 
 
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_a_post_the_service_answers_with_a_5xx_keeps_the_unknown_outcome_note(raw, status):
+    srv = raw(lambda line: _http(status, b'{"error": "boom"}'))
+    with pytest.raises(CollabError) as e:
+        HttpCollab(srv.url).post_message(ALICE, "room_x", {"text": "hi", "idempotency_key": "k1"})
+    assert e.value.status in (502, 503) and "may or may not" in e.value.message
+
+
 def test_the_environment_proxy_is_never_used(raw, monkeypatch):
     srv = raw(lambda line: _http(200, b'{"rooms": []}'))
     monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{_free_port()}")
@@ -276,10 +284,10 @@ def test_the_environment_proxy_is_never_used(raw, monkeypatch):
     assert HttpCollab(srv.url).list_rooms(ALICE) == {"rooms": []}
 
 
-def test_a_send_without_a_nonce_is_idempotent_on_retry(world):
+def test_a_send_without_a_nonce_is_never_dropped_as_a_repeat(world):
     sent = ok(world.api, "threads/send", {"groupId": world.room, "text": "no nonce"}, world.alice_t)
     again = ok(world.api, "threads/send", {"groupId": world.room, "text": "no nonce"}, world.alice_t)
-    assert again["seq"] == sent["seq"]
+    assert again["seq"] != sent["seq"]
 
 
 # ------------------------------------------------------------------------------------------------ implicit linking

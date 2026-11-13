@@ -48,6 +48,7 @@ class HttpCollab:
     def _request(self, method: str, path: str, query: dict[str, Any] | None = None,
                  body: dict[str, Any] | None = None, *, unknown_outcome: str | None = None) -> tuple[int, Any]:
         self.requests += 1
+        note = f"; {unknown_outcome}" if unknown_outcome else ""
         url = self.url + BASE + path + ("?" + urllib.parse.urlencode(query) if query else "")
         data = json.dumps(body if body is not None else {}).encode() if method == "POST" else None
         req = urllib.request.Request(url, data=data, method=method,
@@ -59,13 +60,15 @@ class HttpCollab:
             except urllib.error.HTTPError as exc:
                 status, raw = exc.code, exc.read(MAX_BODY)
         except Exception:                                                        # noqa: BLE001 - refused, timed out, DNS
-            raise CollabError(503, "collaboration service unavailable" + (f"; {unknown_outcome}" if unknown_outcome else "")) from None
+            raise CollabError(503, "collaboration service unavailable" + note) from None
         if status >= 500 and status not in (502, 503) or 300 <= status < 400:
-            raise CollabError(502, "collaboration service answered unexpectedly")
+            raise CollabError(502, "collaboration service answered unexpectedly" + note)
         try:
             out = json.loads(raw) if raw else {}
         except ValueError:
-            raise CollabError(502, "collaboration service sent an unreadable answer") from None
+            raise CollabError(502, "collaboration service sent an unreadable answer" + note) from None
+        if status in (502, 503):
+            raise CollabError(status, str((out if isinstance(out, dict) else {}).get("error") or "collaboration service unavailable") + note)
         if status >= 400:
             err = out if isinstance(out, dict) else {}
             raise CollabError(status, str(err.get("error") or "request refused"), err.get("reason"), err.get("code"))
