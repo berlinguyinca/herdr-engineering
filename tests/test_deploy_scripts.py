@@ -431,7 +431,9 @@ def test_compose_web_has_no_env_file_and_mounts_central_file_read_only():
     assert "FABRIC_LLM_UPSTREAM_KEY" not in (proxy.get("environment") or {})
     assert proxy["command"][proxy["command"].index("--fleet-config") + 1] == "/etc/herdr/llm/llm-config.json"
     # only the llm slice directory: never the central file's directory
-    assert proxy["volumes"] == ["${HERDR_LLM_SLICE_DIR:?run deploy.sh}:/etc/herdr/llm:ro"]
+    assert proxy["volumes"] == ["${HERDR_LLM_SLICE_DIR:?run deploy.sh}:/etc/herdr/llm:ro",
+                                   # optional client key for a keyed control plane (unset = /dev/null, no flag value)
+                                   "${HERDR_CP_CLIENT_KEY_FILE:-/dev/null}:/run/secrets/cp-client-key:ro"]
 
 
 def test_collab_overlay_reads_only_the_collab_slice():

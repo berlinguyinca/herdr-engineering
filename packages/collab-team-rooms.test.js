@@ -273,19 +273,19 @@ test('detach asks first; a "no" sends nothing and a "yes" sends one detach', asy
   assert.match(yes.tr.render('owner'), /No team is attached to this room/);
 }));
 
-test('guest level: direct is labelled "acts as Suggest for now", needs agents or roles, and saves the limits', async () => withServer({}, async (srv) => {
+test('guest level: direct is labelled "Direct" and says when it acts as Suggest, needs agents or roles, and saves the limits', async () => withServer({}, async (srv) => {
   const { tr } = room(srv, 'tok-owner');
   await tr.load('owner');
   const html = tr.render('owner');
-  assert.match(html, /value="direct"[^>]*> <span><b>Direct \(acts as Suggest for now\)<\/b>/);
+  assert.match(html, /value="direct"[^>]*> <span><b>Direct<\/b>/);
   assert.match(html, /value="suggest" checked/);
   assert.deepEqual(await tr.dispatch(formAction('level', new URLSearchParams({ level: 'direct' }))), { invalid: true });
   await tr.dispatch(formAction('level', new URLSearchParams([['level', 'direct'], ['agents', 'ag1'], ['roles', 'tester'], ['per_hour', '6']])));
   const set = srv.S.calls.find((c) => c.method === 'POST' && c.path.endsWith('/guest-level'));
   assert.deepEqual(set.body, { level: 'direct', direct_limits: { agents: ['ag1'], roles: ['tester'], per_hour: 6 } });
   const after = tr.render('owner');
-  assert.match(after, /Current level: <b>Direct \(acts as Suggest for now\)<\/b>\. It acts as Suggest for now/);
-  assert.match(after, /Saved\. Direct is stored, but it acts as Suggest for now\./);
+  assert.match(after, /Current level: <b>Direct<\/b>\. It acts as Suggest because Direct is switched off on this service/);
+  assert.match(after, /Saved\. Direct is stored, but it acts as Suggest while Direct is switched off on this service\./);
   await tr.dispatch(formAction('level', new URLSearchParams({ level: 'read_only' })));
   assert.deepEqual(srv.S.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/guest-level')).at(-1).body, { level: 'read_only' }, 'no limits ride along');
 }));

@@ -189,6 +189,7 @@ def test_coordinator_rollback_restores_previous_profile_before_verification(harn
     """Exercise the coordinator's real rollback/EXIT functions with isolated host callbacks."""
     source = (ROOT / 'deploy/control-plane/deploy.sh').read_text()
     rollback = source[source.index('rollback() {'):].split('\n}\n', 1)[0] + '\n}\n'
+    resume = source[source.index('resume_worker() {'):].split('\n}\n', 1)[0] + '\n}\n'
     finish = source[source.index('finish() {'):].split('\n}\n', 1)[0] + '\n}\n'
     previous = harness['root'] / 'env/rollback-worktree/herdr_engineering'
     previous.mkdir(parents=True)
@@ -207,7 +208,7 @@ memory_client_snapshot
 PREV_COMMIT=old; PREV_SHA=old; PREV_TAG=old; PREVIOUS_IMAGE=old
 SHA=new; REPO="$WORK"; STATE_HELPER="{state}"; PY=python3; ARTIFACT_HOST=0; PREV_AH=0; AH_MIGRATED=0; AH_MANUAL=0; NEW_AH=""; COLLAB=0
 APP_SERVICES=(control-plane-web); EDGE_SERVICE=(); SHARE_SERVICE=()
-HOST_MUTATED=1; DEPLOY_FINISHED=0
+HOST_MUTATED=1; DEPLOY_FINISHED=0; WORKER_PAUSED=0
 DEPLOY_LOCK_PHASES=()
 deploy_lock_phase() {{ DEPLOY_LOCK_PHASES+=("$1"); }}
 restore_host_state() {{ return 0; }}
@@ -219,6 +220,7 @@ rollback_artifact_host() {{ return 0; }}
 verify() {{ printf '%s\\n' '{{"action":"verify-rollback","args":[]}}' >> "{harness['log']}"; }}
 cleanup() {{ return 0; }}
 {rollback}
+{resume}
 {finish}
 '''
     if interrupted:

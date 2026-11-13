@@ -353,7 +353,8 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
                        artifact_job_runner=None, max_artifact_jobs=1,
                        inspector_snapshotter=None, fabric_compactor=None,
                        share_housekeeper=None, artifact_reconciler=None,
-                       annotation_housekeeper=None) -> dict:
+                       annotation_housekeeper=None,
+                       inspector_archiver=None) -> dict:
     summary: dict[str, Any] = {}
 
     # Stale services -> unavailable (never delete).
@@ -407,6 +408,8 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
         summary["inspector_snapshot"] = await inspector_snapshotter.tick(conn)
     if conn is not None and fabric_compactor is not None:
         summary["fabric_compaction"] = await fabric_compactor.tick(conn)
+    if conn is not None and inspector_archiver is not None:
+        summary["inspector_archive"] = await inspector_archiver.tick(conn)
     if conn is not None and share_housekeeper is not None:
         summary["share_housekeeping"] = await share_housekeeper.tick(conn)
     if conn is not None and annotation_housekeeper is not None:

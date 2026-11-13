@@ -1,0 +1,67 @@
+{
+ "contractVersion": 4,
+ "generatedAt": "2026-10-14T12:00:00.000Z",
+ "missions": [
+  {
+   "id": "MSN-golden-nulls",
+   "revision": 3,
+   "title": "Nullable fields are null",
+   "goal": "Pin the null form of every nullable field",
+   "created_at": "2026-10-14T12:00:00.000Z",
+   "status": "NEW",
+   "canonicalState": "CREATED",
+   "observability": {
+    "progress": {
+     "approximatePercent": 40,
+     "verifiedComplete": false,
+     "basis": "weighted_dag"
+    },
+    "health": "active",
+    "currentActivity": null,
+    "lastMeaningfulProgressAt": null,
+    "action": "run_task",
+    "nextAction": "verify",
+    "nextActionAt": null
+   }
+  },
+  {
+   "id": "MSN-golden-full",
+   "revision": 3,
+   "title": "Nullable fields are filled",
+   "goal": "Pin the populated form of every nullable field",
+   "created_at": "2026-10-14T12:00:00.000Z",
+   "completed_at": "2026-10-14T11:30:00.000Z",
+   "links": [
+    {
+     "kind": "issue",
+     "repository": "org/repo",
+     "number": 5
+    },
+    {
+     "kind": "pull_request",
+     "repository": "org/repo",
+     "number": 9
+    }
+   ],
+   "status": "NEW",
+   "canonicalState": "CREATED",
+   "observability": {
+    "progress": {
+     "approximatePercent": 40,
+     "verifiedComplete": false,
+     "basis": "weighted_dag"
+    },
+    "health": "active",
+    "currentActivity": {
+     "type": "running_test",
+     "summary": "running the suite",
+     "workerId": "W-golden"
+    },
+    "lastMeaningfulProgressAt": "2026-10-14T11:59:00.000Z",
+    "action": "run_task",
+    "nextAction": "verify",
+    "nextActionAt": "2026-10-14T12:05:00.000Z"
+   }
+  }
+ ]
+}

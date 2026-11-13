@@ -13,6 +13,15 @@
 #   --cmd 'COMMAND' run COMMAND for each task instead of the family's own (task text arrives on stdin)
 #   --no-sandbox    do not run tasks inside bubblewrap (default: boxed whenever bwrap works)
 #   --machine NAME  record NAME (MagicDNS short name) as this machine; only matters for Fabric trust, which the owner still enables
+#   --fabric        join with NO token: this machine must be on the control plane's fabric allow-list and the owner must have
+#                   switched fabric_trust.auto_join on. Needs --name; writes ~/herdr-agents/NAME.json (agent_id, name, machine;
+#                   no credential) and starts nothing. Inside a herdr workspace (HERDR_WORKSPACE_ID, plus HERDR_TAB_ID, HERDR_PANE_ID
+#                   and HERDR_WORKSPACE_LABEL when set) it is sent too, and with fabric_trust.workspace_rooms on the agent lands in
+#                   the ONE room of that workspace on this machine (read, post, instruct, execute; room_id is added to the identity
+#                   file). Otherwise it has no room access until a room owner grants it
+#   --no-workspace  --fabric only: do not send the herdr workspace, join without a room
+#   --name NAME     --fabric only: the agent's name (lowercase letters, digits, dot, hyphen, underscore; up to 64)
+#   --fabric-url U  --fabric only, REQUIRED: the fabric listener, http://<listen_host>:<listen_port> (fabric_trust); NOT the public site
 #   --status        show the agents in ~/herdr-agents and whether their workers run
 #   --stop          stop the background workers started by this script
 #   --help          this text
@@ -22,7 +31,7 @@ main() {
   set -euo pipefail
   BASE='__HERDR_BASE__'
   DIR="${HERDR_AGENT_DIR:-$HOME/herdr-agents}"
-  COUNT=1; START=0; USE_HERDR=0; TOOLS=0; CMD_OVERRIDE=""; SANDBOX_ON=1; MODE=join; MACHINE=""
+  COUNT=1; START=0; USE_HERDR=0; TOOLS=0; CMD_OVERRIDE=""; SANDBOX_ON=1; MODE=join; MACHINE=""; FABRIC=0; FNAME=""; FURL=""; NOWS=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --count) COUNT="${2:?--count needs a number}"; shift 2 ;;
@@ -32,9 +41,13 @@ main() {
       --cmd) CMD_OVERRIDE="${2:?--cmd needs a command}"; shift 2 ;;
       --machine) MACHINE="${2:?--machine needs a name}"; shift 2 ;;
       --no-sandbox) SANDBOX_ON=0; shift ;;
+      --fabric) FABRIC=1; shift ;;
+      --no-workspace) NOWS=1; shift ;;
+      --name) FNAME="${2:?--name needs a name}"; shift 2 ;;
+      --fabric-url) FURL="${2:?--fabric-url needs a URL}"; shift 2 ;;
       --status) MODE=status; shift ;;
       --stop) MODE=stop; shift ;;
-      --help|-h) sed -n '2,23p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null || true; echo "usage: curl -fsSL $BASE/api/v1/collab/scripts/join.sh | HERDR_JOIN_TOKEN=... bash -s -- --count N [--start] [--herdr] [--tools]"; return 0 ;;
+      --help|-h) sed -n '2,32p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null || true; echo "usage: curl -fsSL $BASE/api/v1/collab/scripts/join.sh | HERDR_JOIN_TOKEN=... bash -s -- --count N [--start] [--herdr] [--tools]"; return 0 ;;
       *) echo "join.sh: unknown option $1 (try --help)" >&2; return 2 ;;
     esac
   done
@@ -60,6 +73,74 @@ main() {
       rm -f "$p"
     done
     echo "Workers started in herdr panes keep running: close their workspaces in herdr."
+    return 0
+  fi
+
+  if [ "$FABRIC" = 1 ]; then
+    # No token and no credential: the tailnet machine is vouched for by the control plane's own whois on the connection.
+    [ -n "$FNAME" ] || { echo "join.sh: --fabric needs --name NAME" >&2; return 2; }
+    # one rule with the server (JOIN_NAME in collab_fabric_trust.py): 1-64 of [a-z0-9._-], first [a-z0-9]; C locale so ranges are bytes
+    if ! ( LC_ALL=C; case "$FNAME" in *[!a-z0-9._-]*|[!a-z0-9]*) exit 1 ;; esac; [ "${#FNAME}" -le 64 ] ); then
+      echo "join.sh: --name must be 1-64 characters: lowercase letters, digits, dot, underscore, hyphen, starting with a letter or digit" >&2; return 2
+    fi
+    [ -n "$FURL" ] || { echo "join.sh: --fabric needs --fabric-url http://<listen_host>:<listen_port> (the control plane's fabric listener, control_plane.collab.fabric_trust); the public site does not serve it. 'herdr-eng rooms join-fabric NAME' can find it from host config." >&2; return 2; }
+    mkdir -p "$DIR"; chmod 700 "$DIR"
+    WSID=""; WSLABEL=""; WSTAB=""; WSPANE=""
+    if [ "$NOWS" = 0 ]; then WSID="${HERDR_WORKSPACE_ID:-}"; WSLABEL="${HERDR_WORKSPACE_LABEL:-}"; WSTAB="${HERDR_TAB_ID:-}"; WSPANE="${HERDR_PANE_ID:-}"; fi
+    # The id pattern and the 64 character limit below MUST match collab_fabric_trust.WS_ID / WS_LABEL_MAX (a test compares them).
+    # Only the id decides anything; the label is repaired and the tab and pane are omitted when invalid, so they never fail a join.
+    mkbody() { python3 -c 'import sys,json,re,unicodedata
+d={"name":sys.argv[1]}
+if sys.argv[2]: d["machine"]=sys.argv[2]
+tok=re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
+if sys.argv[3]:
+    if tok.fullmatch(sys.argv[3]):
+        d["workspace"]={"id":sys.argv[3]}
+        lab="".join(c for c in sys.argv[4] if unicodedata.category(c)[0]!="C" and unicodedata.category(c) not in ("Zl","Zp")).strip()[:64].strip()
+        if lab: d["workspace"]["label"]=lab
+        if tok.fullmatch(sys.argv[5]): d["tab_id"]=sys.argv[5]
+        if tok.fullmatch(sys.argv[6]): d["pane_id"]=sys.argv[6]
+    else: sys.stderr.write("join.sh: HERDR_WORKSPACE_ID is not a valid workspace id; joining without a workspace room\n")
+print(json.dumps(d))' "$FNAME" "$MACHINE" "$1" "$2" "$3" "$4"; }
+    body=$(mkbody "$WSID" "$WSLABEL" "$WSTAB" "$WSPANE") || return 1
+    resp=$(mktemp)
+    post() { curl -sS -o "$resp" -w '%{http_code}' -X POST "${FURL%/}/api/v1/collab/agents/fabric-join" -H 'content-type: application/json' -d "$1" </dev/null || echo 000; }
+    errtext() { python3 -c 'import sys,json
+try: e=json.load(open(sys.argv[1])).get("error","")
+except Exception: e=""
+print("".join(c for c in str(e) if c.isprintable())[:300])' "$resp" 2>/dev/null; }
+    code=$(post "$body")
+    if [ "$code" = 400 ] && printf '%s' "$body" | grep -q '"workspace"' && errtext | grep -q 'unknown field'; then
+      # an older server that predates workspace rooms: retry ONCE without them (deploy the server first, then the clients)
+      echo "join.sh: this control plane does not support workspace rooms yet; the workspace room was not used" >&2
+      body=$(mkbody "" "" "" "") || return 1
+      code=$(post "$body")
+    fi
+    if [ "$code" != 200 ] && [ "$code" != 201 ]; then
+      why=$(errtext); [ -z "$why" ] || why=": $why"
+      case "$code" in
+        400) echo "join.sh: the control plane rejected the join request$why" >&2 ;;
+        403) echo "join.sh: this agent name was revoked or is bound to another machine$why" >&2 ;;
+        404) echo "join.sh: the control plane has no fabric join here (auto_join is off, or you reached the wrong listener: --fabric-url)$why" >&2 ;;
+        409) echo "join.sh: this name already belongs to a different workspace (or the name is taken)$why" >&2 ;;
+        429) echo "join.sh: a limit was reached (workspace rooms or members, or join throttling); try again later$why" >&2 ;;
+        000) echo "join.sh: the control plane could not be reached at $FURL" >&2 ;;
+        *) echo "join.sh: the control plane refused the fabric join (HTTP $code)$why" >&2 ;;
+      esac
+      rm -f "$resp"; return 1
+    fi
+    python3 -c 'import sys,json,re
+d=json.load(open(sys.argv[1]))
+out={k:d.get(k) for k in ("agent_id","name","machine")}
+rid=d.get("room_id")
+if d.get("room_access") is not False and isinstance(rid,str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}",rid): out["room_id"]=rid
+if not isinstance(out["agent_id"],str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}",out["agent_id"]): sys.exit("join.sh: unexpected agent id from the server")
+print(json.dumps(out))' "$resp" > "$DIR/.$FNAME.json.new" || { rm -f "$resp" "$DIR/.$FNAME.json.new"; return 1; }
+    noaccess=0; grep -q '"room_access": *false' "$resp" && noaccess=1
+    rm -f "$resp"; chmod 600 "$DIR/.$FNAME.json.new"; mv -f "$DIR/.$FNAME.json.new" "$DIR/$FNAME.json"
+    if [ "$noaccess" = 1 ]; then echo "joined $FNAME (identity in $DIR/$FNAME.json), but no access to the workspace room (owner removed it)"
+    elif grep -q '"room_id"' "$DIR/$FNAME.json"; then echo "joined $FNAME (identity in $DIR/$FNAME.json); it is in its herdr workspace's room"
+    else echo "joined $FNAME (identity in $DIR/$FNAME.json); it has no room access until a room owner grants it"; fi
     return 0
   fi
 

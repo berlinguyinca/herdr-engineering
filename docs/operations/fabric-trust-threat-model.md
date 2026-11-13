@@ -36,6 +36,7 @@ carries an unexpired owner-set `fabric` bit. Trust is therefore in: the tailnet'
 | Stale grants: a bit that was set once and forgotten, a revoked or demoted agent, a disabled owner | Bit expires (`agent_ttl_seconds`, default 30 d; a missing expiry counts as expired); every request re-checks status, owner, machine, bit and expiry; open streams re-check (`still_valid`) |
 | A fabric caller minting persistence | `rotate_credential` and `set_agent_fabric` refuse a fabric principal (`collab.py`) |
 | Coordinator abuse (task floods, cross-team assignment, privilege chains) | `coordinate` is granted only by the room owner, per attached team, with an explicit non-empty role allow-list (missing list on replay = empty); creation only by role, within `coordinators.tasks_per_hour`, `max_open`, depth limits and a person-given accepted root task; needs `team_rooms`, `team_roles`, `coordinators.enabled` and no kill switch (`collab_coordinators.py`, `_grant_coordinate`) |
+| **Auto-join** (`auto_join: true`): any process on an allow-listed machine creates an agent and acts as it, with no token and no owner click | Accepted by operator decision (2026-11-07): the machine is the trust unit. Limited by: one default-off hot-reloaded switch; fabric listener only (404 elsewhere); whois-only auth that ignores `Authorization`; the created agent is a normal agent of `operator_user` with NO room permissions, never `coordinate` (room owners grant both), no credential to steal or rotate; 30 new agents/hour and 200 names (revoked included) per machine plus 1000 in total, kept apart from the operator's own agent quota; refusal audits throttled per (machine, reason) and capped at 500, renewals written once a day, so none of it can fill the capped event log; external and helper agents excluded; a fabric caller cannot set the bit or rotate credentials; revocation is immediate and a revoked (machine, name) is never resurrected (`fabric_join_revoked`); switch off, kill switch or `enabled: false` ends their Fabric auth (`fabric_auto_join_off`) |
 | Audit flooding by repeated bad requests | Refusals of a recognised agent are audited at most once per (agent, reason) per 60 s (`_audit_denied`); `auth_failures` counts all |
 | Information leak from refusals | Every refusal is the same generic 401 (`_fabric_fail`); reasons only in the audit |
 
@@ -55,7 +56,19 @@ carries an unexpired owner-set `fabric` bit. Trust is therefore in: the tailnet'
    if it does not, Fabric fails closed.
 4. **tailscaled is trusted.** A wrong whois answer, an ACL mistake letting an unintended node reach the port, or a node key theft is
    a fabric identity. Tailnet ACLs should limit who may connect to the collab port.
-5. **Operator error in `machines`** (section 10 of the guide).
+5. **Auto-join widens the allow-list's meaning.** With `auto_join` on, an allow-listed machine is trusted not only to run vouched
+   agents but to mint new ones: any local process there can join under any free name and fill the per-machine cap of 200 and the total of 1000 (names are
+   enumerable; revoke to clean up, but revoked names keep counting: a known limit). Room access still needs an owner's grant.
+5a. **Operator error in `machines`** (section 10 of the guide).
+5b. **The workspace id is self-asserted (`workspace_rooms`): a NEW capability, not just more inert agents.** whois vouches for the machine,
+   not for a herdr workspace, and herdr ids such as `w1` are guessable. So any process on an allow-listed machine can now join ANY workspace
+   room on its own machine and, with the auto-granted `instruct` and `execute`, act on the real agents there. That goes beyond minting inert
+   agents with no permissions (5): it is a new capability, and the allow-list's meaning widens again. It is bounded by: the machine allow-list
+   (the room key includes the whois machine, never a client value, so it never crosses machines); the caps on rooms and members (429); the
+   audit trail (`via: "fabric"` on every write); revocation (removes the access at once, the name stays blocked); and the off-by-default
+   switch (`workspace_rooms`, requires `auto_join`). `coordinate` and `spawn_helpers` are never auto-granted, and an agent cannot move itself
+   to another workspace (409). The workspace label is advisory and chosen by the first joiner; it is never part of the room's identity or name.
+   An owner can still grant any agent into a room, and no tokenless path crosses workspaces or machines.
 6. Within the 30-day window a revoked machine binding is enforced, but a stolen host stays trusted until the operator reacts.
 7. Not verified here: per-agent request rate limits specific to Fabric (the spec mentions rate limits; only the generic message and task
    throttles were checked).
@@ -64,7 +77,10 @@ carries an unexpired owner-set `fabric` bit. Trust is therefore in: the tailnet'
 - Project audit route `GET /api/v1/collab/audit?project_id=...` and room events carry `via: "fabric"` and `machine` on every fabric actor
   event; the dashboard shows a "via fabric · <machine>" badge.
 - `audit_denied` rows, action `auth.agent`, with reasons `fabric_header_mismatch`, `fabric_machine_unbound`, `fabric_not_enabled`,
-  `fabric_expired`, `fabric_agent_inactive`, `fabric_agent_kind`, `fabric_owner_disabled` (throttled to one per agent and reason per minute).
+  `fabric_expired`, `fabric_agent_inactive`, `fabric_agent_kind`, `fabric_owner_disabled`, `fabric_auto_join_off` (throttled to one per agent and reason per minute).
+- Join events: `agent_enrolled` with `origin: "fabric_join"` and `via: "fabric"`; refusals are `audit_denied`, action `agent.fabric_join`
+  (`fabric_join_revoked`, `fabric_join_rate_limited`, `fabric_join_machine_cap`, `fabric_join_total_cap`, `fabric_join_machine_rebound`),
+  at most one per (machine, reason) per 5 minutes and 500 in the log's lifetime. The dashboard marks auto-joined agents.
 - Counters: `auth_failures` (every attempt), `audit_throttled`.
 - Alert on: `via: fabric` events from an agent at an unexpected hour, a `fabric_machine_unbound` burst (someone naming an agent from the
   wrong host), and any fabric event after a host was taken out of service.

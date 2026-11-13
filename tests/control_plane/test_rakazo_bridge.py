@@ -256,6 +256,38 @@ def test_open_owner_only_answers_the_app_not_a_web_page(make_server):
         assert api.raw("POST", "/api/auth/open", {}, {"origin": origin})[0] == 403, origin
 
 
+def test_open_owner_origins_default_accepts_only_the_rakazo_app(make_server):
+    _, api = make_server(bridge_section(open_owner=True))
+    assert api.raw("POST", "/api/auth/open", {}, {"origin": "rakazo://", "X-Forwarded-For": "100.64.1.1"})[0] == 200
+    assert api.raw("POST", "/api/auth/open", {}, {"origin": "shepherd://", "X-Forwarded-For": "100.64.1.2"})[0] == 403
+
+
+def test_open_owner_origins_adds_a_second_app_with_the_same_network_guards(make_server):
+    _, api = make_server(bridge_section(open_owner=True, open_owner_origins=["rakazo://", "shepherd://"]))
+    assert api.raw("POST", "/api/auth/open", {}, {"origin": "shepherd://", "X-Forwarded-For": "100.64.1.3"})[0] == 200
+    assert api.raw("POST", "/api/auth/open", {}, {"origin": "shepherd://", "X-Forwarded-For": "192.168.1.20"})[0] == 403
+    assert api.raw("POST", "/api/auth/open", {}, {"origin": "https://shepherd.example", "X-Forwarded-For": "100.64.1.4"})[0] == 403
+    assert api.raw("POST", "/api/auth/open", {}, {"origin": "other://", "X-Forwarded-For": "100.64.1.5"})[0] == 403
+
+
+@pytest.mark.parametrize("bad", [
+    "rakazo://", "x", "", "http://", "https://host", "HTTPS://", "shep*://", "*", "a b://", "shepherd:// ", "shepherd://ho st",
+    5, None, "://", "shepherd://a/b"])
+def test_open_owner_origins_rejects_invalid_entries(bad):
+    entries = ["rakazo://", bad]   # "rakazo://" itself is the duplicate case
+    with pytest.raises(ValueError, match="open_owner_origins"):
+        rb.rakazo_bridge_config({"enabled": True, "open_owner_origins": entries, "accounts": ACCOUNTS})
+
+
+def test_open_owner_origins_must_be_a_short_nonempty_list():
+    for bad in ("rakazo://", [], {"a": 1}, [f"app{i}://" for i in range(9)]):
+        with pytest.raises(ValueError, match="open_owner_origins"):
+            rb.rakazo_bridge_config({"enabled": True, "open_owner_origins": bad, "accounts": ACCOUNTS})
+    ok = rb.rakazo_bridge_config({"enabled": True, "open_owner_origins": [f"app{i}://" for i in range(8)], "accounts": ACCOUNTS})
+    assert len(ok["open_owner_origins"]) == 8
+    assert rb.rakazo_bridge_config({"enabled": True, "accounts": ACCOUNTS})["open_owner_origins"] == ("rakazo://",)
+
+
 def test_open_owner_is_rate_limited_per_address_so_it_cannot_evict_the_owners_sessions(make_server):
     _, api = make_server(bridge_section(open_owner=True))
     first = api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "100.64.1.1"})
@@ -588,6 +620,16 @@ def test_bots_map_to_assistants_with_one_thread_each(srv, alice):
     assert space["isDefault"] is True and space["hasContent"] is True and space["bots"][0]["id"] == bot["id"]
     assert api.rpc("bots/get", {"botId": "missing"}, alice)[0] == 404
     assert api.rpc("bots/create", {"name": ""}, alice)[0] == 400
+
+
+@pytest.mark.parametrize("proc", ["threads/send", "threads/head", "threads/get", "threads/messages"])
+def test_an_unknown_bot_id_is_a_plain_404_not_a_logged_bug(srv, alice, caplog, proc):
+    # the Shepherd TUI sends a herdr agent id as botId; that is a normal not-found (its terminal-input fallback trigger)
+    _, api = srv
+    with caplog.at_level(logging.WARNING):
+        status = api.rpc(proc, {"botId": "not-an-assistant", "text": "hi", "clientNonce": "n1"}, alice)[0]
+    assert status == 404
+    assert "KeyError" not in caplog.text
 
 
 def test_an_assistant_made_elsewhere_for_the_same_principal_shows_up_with_its_existing_thread(srv, alice):

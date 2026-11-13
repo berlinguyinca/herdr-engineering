@@ -177,3 +177,11 @@ test('model use text is escaped', () => {
   const html = missionCard({ ...projection, activity: { ...projection.activity, modelUse: { pin: '<img src=x onerror=alert(1)>', agents: [] } } }, now);
   assert.doesNotMatch(html, /<img src=x/);
 });
+test('G9 the card shows Pi next action text but never its "nothing scheduled" literal or empty text', () => {
+  const withNext = nextAction => missionCard({ ...projection, activity: { ...projection.activity, nextAction } }, now);
+  assert.match(withNext('  Run the integration suite '), /Next action<\/span><span>Run the integration suite</);
+  assert.match(withNext('<b>x</b>'), /&lt;b&gt;x&lt;\/b&gt;/);
+  for (const value of ['No further action is scheduled', ' no further ACTION is scheduled ', '', '   ', null, 7, undefined]) {
+    assert.doesNotMatch(withNext(value), /Next action/, JSON.stringify(value));
+  }
+});

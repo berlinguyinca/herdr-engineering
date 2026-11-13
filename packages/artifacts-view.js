@@ -2,6 +2,7 @@ import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { skeleton } from './motion.js';
 import { morph } from './patch.js';
 import { pollWhileVisible } from './refresh-bus.js';
+import { retireWhenOff, serviceOff } from './service-gates.js';
 import { mountSharePanel } from './artifact-share-panel.js';
 import { mountMembersPanel } from './artifact-members-panel.js';
 import { mountHistory } from './artifact-history.js';
@@ -128,12 +129,13 @@ export function mountArtifacts(container, client, { freshness = () => null } = {
     act(() => client.deleteArtifacts([...selected], { mode: 'purge_now', confirm: typed, reason: 'Permanently deleted from the dashboard', requestKey: key() }), 'permanently deleted');
   });
   // Only an owner sees the controls; a failed probe leaves them hidden. The server enforces this on every call.
-  client.artifactDeleteAccess?.().then(access => { if (!disposed && access?.owner === true) { owner = true; syncOwner(); render({ replace: true }); } }, () => {});
+  client.artifactDeleteAccess?.().then(async access => { if (!disposed && access?.owner === true && !(await serviceOff(client, 'artifact_delete_v1'))) { owner = true; syncOwner(); render({ replace: true }); } }, () => {});
   const stop = pollWhileVisible(render, 30000);
   void render();
   // The operator Members section shows itself only when the members list loads; a 403 leaves it hidden.
   const membersAbort = new AbortController();
   const members = mountMembersPanel(container.querySelector('[data-artifact-members]'), client, { signal: membersAbort.signal });
+  retireWhenOff(client, 'members_v1', container.querySelector('[data-artifact-members]'));
   return { refresh: render, dispose() { disposed = true; clearTimeout(timer); stop(); controller?.abort(); membersAbort.abort(); members.dispose(); } };
 }
 
@@ -181,11 +183,11 @@ function feedbackHtml(report) {
   const targets = `<option value="${esc(JSON.stringify(['report', null]))}">Whole report</option>` + ['finding', 'figure'].map(kind => `<optgroup label="${kind === 'finding' ? 'Findings' : 'Figures'}">${(descriptor[kind === 'finding' ? 'findings' : 'figures'] || []).map(item => `<option value="${esc(JSON.stringify([kind, item.id]))}">${esc(item.title)} (${esc(item.id)})</option>`).join('')}</optgroup>`).join('');
   const comments = feedbackRows(report.feedback || []);
   const references = ['evidence', 'finding', 'figure'].flatMap(kind => (descriptor[{ evidence: 'evidence', finding: 'findings', figure: 'figures' }[kind]] || []).map(item => `<label style="display:block"><input type="checkbox" data-report-check-reference value="${esc(`${kind}:${item.id}`)}"> ${esc(kind)}: ${esc(item.title || item.id)}</label>`)).join('');
-  return `<section class="hd-card"><h2>Feedback for this version</h2><p>Feedback is pinned to <strong>${esc(report.version_id)}</strong>; changing versions does not move comments.</p><div data-report-feedback-list>${comments || '<p>No feedback recorded for this version.</p>'}</div>${report.feedback_has_more ? '<p>More comments remain attached to this version.</p><button type="button" class="hd-btn" data-report-feedback-more>Load more feedback</button><p role="status" data-report-feedback-more-status></p>' : ''}<form data-report-feedback-form><label>Finding or figure<select class="hd-input" data-report-feedback-target>${targets}</select></label><label style="display:block">Feedback<textarea class="hd-input" rows="4" maxlength="10000" required data-report-feedback-body style="width:100%"></textarea></label><button class="hd-btn" type="submit">Add feedback to this version</button><p role="status" data-report-feedback-status></p></form></section><section class="hd-card"><h2>Record a check</h2><p>Record a check you performed, with its evidence. Passing review requires the rendering and evidence checks to pass first.</p><form data-report-check-form><div class="hd-inline"><label>Stage<select class="hd-input" data-report-check-stage>${Object.entries(STAGES).map(([id, label]) => `<option value="${id}">${label}</option>`).join('')}</select></label><label>Outcome<select class="hd-input" data-report-check-status><option value="passed">Passed</option><option value="failed">Failed</option></select></label></div><label style="display:block">What was checked<textarea class="hd-input" rows="3" maxlength="10000" required data-report-check-notes style="width:100%"></textarea></label><fieldset><legend>Evidence supporting this check</legend>${references || '<p>No referenceable report items are available.</p>'}</fieldset><button class="hd-btn" type="submit">Record check for this version</button><p role="status" data-report-check-result></p></form></section>`;
+  return `<section class="hd-card"><h2>Feedback for this version</h2><p>Feedback is pinned to <strong>${esc(report.version_id)}</strong>; changing versions does not move comments.</p><div data-report-feedback-list>${comments || '<p>No feedback recorded for this version.</p>'}</div>${report.feedback_has_more ? '<p>More comments remain attached to this version.</p><button type="button" class="hd-btn" data-report-feedback-more>Load more feedback</button><p role="status" data-report-feedback-more-status></p>' : ''}<form data-report-feedback-form><label>Finding or figure<select class="hd-input" data-report-feedback-target>${targets}</select></label><label>Feedback<textarea class="hd-input" rows="4" maxlength="10000" required data-report-feedback-body style="width:100%"></textarea></label><button class="hd-btn" type="submit">Add feedback to this version</button><p role="status" data-report-feedback-status></p></form></section><section class="hd-card"><h2>Record a check</h2><p>Record a check you performed, with its evidence. Passing review requires the rendering and evidence checks to pass first.</p><form data-report-check-form><div class="hd-inline"><label>Stage<select class="hd-input" data-report-check-stage>${Object.entries(STAGES).map(([id, label]) => `<option value="${id}">${label}</option>`).join('')}</select></label><label>Outcome<select class="hd-input" data-report-check-status><option value="passed">Passed</option><option value="failed">Failed</option></select></label></div><label>What was checked<textarea class="hd-input" rows="3" maxlength="10000" required data-report-check-notes style="width:100%"></textarea></label><fieldset><legend>Evidence supporting this check</legend>${references || '<p>No referenceable report items are available.</p>'}</fieldset><button class="hd-btn" type="submit">Record check for this version</button><p role="status" data-report-check-result></p></form></section>`;
 }
 
 function assetHtml(assets) {
-  return `<section class="hd-card"><h2>Evidence and source downloads</h2><p>Assets remain separate from this metadata view. They load only when you request a download.</p>${assets.length ? `<div class="hd-table-wrap" style="overflow-x:auto;max-width:100%"><table class="hd-table"><thead><tr><th>Asset</th><th>Role</th><th>Format</th><th>Size</th><th>Integrity</th><th>Download</th></tr></thead><tbody>${assets.map(asset => `<tr data-report-item data-kind="asset" data-item-id="${esc(asset.id)}" tabindex="-1"><td>${esc(asset.name)}</td><td>${esc(asset.role)}</td><td>${esc(asset.media_type)}</td><td>${humanSize(asset.size_bytes)}</td><td><details><summary>SHA-256</summary><code style="overflow-wrap:anywhere">${esc(asset.sha256)}</code></details></td><td><button type="button" class="hd-btn" data-report-download="${esc(asset.id)}" aria-label="Download ${esc(asset.name)}">Download</button><span role="status" data-download-status></span></td></tr>`).join('')}</tbody></table></div>` : '<p>No assets attached.</p>'}</section>`;
+  return `<section class="hd-card"><h2>Evidence and source downloads</h2><p>Assets remain separate from this metadata view. They load only when you request a download.</p>${assets.length ? `<div class="hd-table-wrap" style="overflow-x:auto;max-width:100%"><table class="hd-table hd-table--stack" role="table"><thead><tr role="row"><th role="columnheader">Asset</th><th role="columnheader">Role</th><th role="columnheader">Format</th><th role="columnheader">Size</th><th role="columnheader">Integrity</th><th role="columnheader">Download</th></tr></thead><tbody>${assets.map(asset => `<tr data-report-item data-kind="asset" data-item-id="${esc(asset.id)}" tabindex="-1" role="row"><td role="cell" data-label="Asset">${esc(asset.name)}</td><td role="cell" data-label="Role">${esc(asset.role)}</td><td role="cell" data-label="Format">${esc(asset.media_type)}</td><td role="cell" data-label="Size">${humanSize(asset.size_bytes)}</td><td role="cell" data-label="Integrity"><details><summary>SHA-256</summary><code style="overflow-wrap:anywhere">${esc(asset.sha256)}</code></details></td><td role="cell" data-label="Download"><button type="button" class="hd-btn" data-report-download="${esc(asset.id)}" aria-label="Download ${esc(asset.name)}">Download</button><span role="status" data-download-status></span></td></tr>`).join('')}</tbody></table></div>` : '<p>No assets attached.</p>'}</section>`;
 }
 
 export function renderReportDiff(diff, base, selected) {
@@ -205,7 +207,7 @@ export function renderReportDiff(diff, base, selected) {
   }).join('')}`;
 }
 
-async function renderReportReader(container, client, id, artifact, versions, { versionId, signal: outer } = {}) {
+async function renderReportReader(container, client, id, artifact, versions, { versionId, anchor, signal: outer } = {}) {
   const shell = document.createElement('div');
   shell.dataset.artifactDetail = id;
   // The app shell owns the "← Artifacts" back link.
@@ -217,6 +219,7 @@ async function renderReportReader(container, client, id, artifact, versions, { v
   let disposed = false;
   let generation = 0;
   let selectedVersion = versionId;
+  let pendingAnchor = anchor || undefined;
   let controller = new AbortController();
   // Route cancellation (outer signal) disposes this reader and aborts its reads.
   const stop = () => { disposed = true; generation += 1; controller.abort(); revokeBlobs(); };
@@ -231,7 +234,20 @@ async function renderReportReader(container, client, id, artifact, versions, { v
       output.innerHTML = `<p role="alert">${render?.too_large ? 'This output exceeds the preview limit. Download it instead.' : 'This output type has no static preview. Download it instead.'}</p>`;
       return;
     }
-    mountStaticHtml(output, render.html, { label: 'Report preview' });
+    // A "#" permalink inside the copy becomes a real deep link (#/artifacts/<id>?version=<v>&at=<anchor>); `anchor`
+    // is the deep link this page was opened with, revealed once.
+    const focus = pendingAnchor;
+    pendingAnchor = undefined;
+    mountStaticHtml(output, render.html, {
+      label: 'Report preview',
+      focus,
+      permalink: at => `${location.origin}${location.pathname}${location.search}#/artifacts/${encodeURIComponent(id)}?version=${encodeURIComponent(selectedVersion ?? '')}&at=${encodeURIComponent(at)}`,
+      onNavigate: (at, url) => {
+        try { history.replaceState(history.state, '', url); } catch { /* the address bar is a convenience */ }
+        const status = output.querySelector('[data-permalink-status]') || output.insertAdjacentElement?.('afterbegin', Object.assign(document.createElement('p'), { className: 'hd-note' }));
+        if (status) { status.setAttribute('data-permalink-status', ''); status.setAttribute('role', 'status'); status.textContent = 'The address bar now links to this section.'; }
+      },
+    });
   }
 
   function showLegacyVersion(version, selected, ticket, signal) {
@@ -397,6 +413,8 @@ async function renderReportReader(container, client, id, artifact, versions, { v
           if (alive(ticket)) { output.innerHTML = `<p role="alert">Preview unavailable: ${failure(error)}</p>`; body.querySelector('[data-report-preview]').disabled = false; }
         }
       });
+      // Opened from a deep link (&at=<id>): load the preview now so the linked section can be revealed.
+      if (pendingAnchor) body.querySelector('[data-report-preview]').click();
       body.querySelectorAll('[data-report-download]').forEach(button => button.addEventListener('click', async () => {
         const asset = assets.find(item => item.id === button.dataset.reportDownload);
         if (!asset) return;
@@ -427,6 +445,7 @@ async function renderReportReader(container, client, id, artifact, versions, { v
   // The Share card lives outside the per-version body (replaced on every version switch); the route signal disposes it.
   // Its errors stay inside the card and never reach the route's freshness errors.
   if (!disposed) mountSharePanel(shell.querySelector('[data-artifact-share]'), client, id, { versions, headVersionId: artifact.current_version_id, signal: outer, allowEntry: false });
+  retireWhenOff(client, 'share_v1', shell.querySelector('[data-artifact-share-card]'));
   try {
     header.innerHTML = `<h2>${esc(artifact.display_name || artifact.original_filename || id)}</h2><p class="hd-note">Report artifact ${esc(id)}</p>`;
     if (!versions.length) { body.innerHTML = '<p>No immutable report version has been committed yet.</p>'; return { errors }; }
@@ -442,7 +461,7 @@ async function renderReportReader(container, client, id, artifact, versions, { v
   return { errors };
 }
 
-export async function renderArtifactDetail(container, client, id, { signal, versionId } = {}) {
+export async function renderArtifactDetail(container, client, id, { signal, versionId, anchor } = {}) {
   // Each read has its own deadline; the caller's signal only represents route cancellation.
   const bounded = () => signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000);
   const artifact = await client.getArtifact(id, { signal: bounded() });
@@ -454,7 +473,7 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
     // A report is always read through its version history; a failure is the caller's visible error.
     const { versions } = await versionsRead;
     if (signal?.aborted || !container.isConnected) return;
-    return renderReportReader(container, client, id, artifact, Array.isArray(versions) ? versions : [], { signal, versionId });
+    return renderReportReader(container, client, id, artifact, Array.isArray(versions) ? versions : [], { signal, versionId, anchor });
   }
   versionsRead.catch(() => {});
   const mime = artifact.mime_type || 'application/octet-stream';
@@ -477,13 +496,14 @@ export async function renderArtifactDetail(container, client, id, { signal, vers
   if (signal?.aborted || !container.isConnected) return;
   // A logical artifact whose history declares reports opens the report reader without fetching its download.
   if (results[0].status === 'fulfilled' && Array.isArray(results[0].value?.versions) && declaresReport(results[0].value.versions)) {
-    return renderReportReader(container, client, id, artifact, results[0].value.versions, { signal, versionId });
+    return renderReportReader(container, client, id, artifact, results[0].value.versions, { signal, versionId, anchor });
   }
   // Share card: its own list read and errors (kept out of the route's errors); the route signal disposes it.
   const share = mountSharePanel(container.querySelector('[data-artifact-share]'), client, id, {
     versions: results[0].status === 'fulfilled' && Array.isArray(results[0].value?.versions) ? results[0].value.versions : [],
     headVersionId: artifact.current_version_id, signal,
   });
+  retireWhenOff(client, 'share_v1', container.querySelector('[data-artifact-share-card]'));
   // Only a non-report artifact may fetch the download for its preview.
   const previewSlot = container.querySelector('[data-artifact-preview]');
   const imageHtml = `<img src="${esc(url)}" alt="${esc(artifact.original_filename || id)}" style="max-width:100%;max-height:640px;object-fit:contain">`;

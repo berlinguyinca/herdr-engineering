@@ -41,6 +41,20 @@ def _roles(raw: Any, where: str) -> list[str]:
     return list(raw)
 
 
+_TOP_KEYS = frozenset({"version", "sections", "hosts"})
+_SECTION_KEYS = frozenset({"roles", "values"})
+_HOST_KEYS = frozenset({"roles", "token_sha256", "overrides"})
+
+
+def _reject_unknown(raw: dict, allowed: frozenset[str], where: str, hints: dict[str, str] | None = None) -> None:
+    """A key the loader would silently drop is a typo or a misplaced setting: name it (never its value)."""
+    unknown = sorted(str(k)[:64] for k in raw if k not in allowed)
+    if not unknown:
+        return
+    hint = next((f" (did you mean {hints[k]}?)" for k in unknown if hints and k in hints), "")
+    raise FleetConfigError(f"{where}: unknown key {unknown[0]!r}{hint}; allowed: {', '.join(sorted(allowed))}")
+
+
 def _deep_merge(base: dict, over: dict) -> dict:
     for key, val in over.items():
         if isinstance(val, dict) and isinstance(base.get(key), dict):
@@ -111,6 +125,7 @@ class FleetConfig:
 def _parse(data: Any) -> FleetConfig:
     if not isinstance(data, dict):
         raise FleetConfigError("top level must be a mapping")
+    _reject_unknown(data, _TOP_KEYS, "top level", {CONTROL_PLANE_SECTION: "sections.control_plane.values"})
     if data.get("version") != SCHEMA_VERSION:
         raise FleetConfigError(f"version must be {SCHEMA_VERSION}")
     raw_sections = data.get("sections")
@@ -122,6 +137,7 @@ def _parse(data: Any) -> FleetConfig:
     for name, sec in raw_sections.items():
         if not isinstance(name, str) or not isinstance(sec, dict):
             raise FleetConfigError(f"section {name!r}: must be a mapping")
+        _reject_unknown(sec, _SECTION_KEYS, f"section {name}")
         roles = _roles(sec.get("roles"), f"section {name}")
         if not isinstance(sec.get("values"), dict):
             raise FleetConfigError(f"section {name}: values must be a mapping")
@@ -149,6 +165,63 @@ def _parse(data: Any) -> FleetConfig:
                 parse_ai_sync(sec["values"]["ai_sync"])
             except ValueError as exc:
                 raise FleetConfigError(f"section {name}: {exc}") from None
+        if name == CONTROL_PLANE_SECTION and "agent_rules" in sec["values"]:
+            from herdr_engineering.control_plane.agent_rules_config import parse_agent_rules
+
+            try:
+                parse_agent_rules(sec["values"]["agent_rules"])
+            except ValueError as exc:
+                raise FleetConfigError(f"section {name}: {exc}") from None
+        if name == CONTROL_PLANE_SECTION and "ci_deployments" in sec["values"]:
+            from herdr_engineering.control_plane.ci_deployments import parse_ci_deployments
+
+            _, ci_errors = parse_ci_deployments(sec["values"]["ci_deployments"])
+            if ci_errors:   # names the offending component/key shape, never a host id value
+                raise FleetConfigError(f"section {name}: {ci_errors[0]}")
+        if name == CONTROL_PLANE_SECTION and "heap_release" in sec["values"]:
+            from herdr_engineering.control_plane.heap_release import parse_heap_release
+
+            try:
+                parse_heap_release(sec["values"]["heap_release"])
+            except ValueError as exc:
+                raise FleetConfigError(f"section {name}: {exc}") from None
+        if name == CONTROL_PLANE_SECTION and "fabric_partitioning" in sec["values"]:
+            from herdr_engineering.control_plane.fabric_partitioning import (
+                parse_fabric_partitioning,
+            )
+
+            try:
+                parse_fabric_partitioning(sec["values"]["fabric_partitioning"])
+            except ValueError as exc:
+                raise FleetConfigError(f"section {name}: {exc}") from None
+        if name == CONTROL_PLANE_SECTION and "inspector_snapshots" in sec["values"]:
+            from herdr_engineering.control_plane.inspector_snapshot import parse_inspector_snapshots
+
+            try:
+                parse_inspector_snapshots(sec["values"]["inspector_snapshots"])
+            except ValueError as exc:
+                raise FleetConfigError(f"section {name}: {exc}") from None
+        if name == CONTROL_PLANE_SECTION and "inspector_history" in sec["values"]:
+            from herdr_engineering.control_plane.inspector_history import parse_inspector_history
+
+            try:
+                parse_inspector_history(sec["values"]["inspector_history"])
+            except ValueError as exc:
+                raise FleetConfigError(f"section {name}: {exc}") from None
+        if name == CONTROL_PLANE_SECTION and "inspector_archive" in sec["values"]:
+            from herdr_engineering.control_plane.inspector_archive import parse_inspector_archive
+
+            try:
+                parse_inspector_archive(sec["values"]["inspector_archive"])
+            except ValueError as exc:
+                raise FleetConfigError(f"section {name}: {exc}") from None
+        if name == CONTROL_PLANE_SECTION and "dashboard_proxy" in sec["values"]:
+            from herdr_engineering.control_plane.dashboard_proxy import parse_dashboard_proxy
+
+            try:
+                parse_dashboard_proxy(sec["values"]["dashboard_proxy"])
+            except ValueError as exc:
+                raise FleetConfigError(f"section {name}: {exc}") from None
         if name == "github" and sec["values"].get("app") not in (None, {}):
             from herdr_engineering.github_auth import GitHubAuthError, parse_app_config
 
@@ -163,6 +236,7 @@ def _parse(data: Any) -> FleetConfig:
     for host_id, host in raw_hosts.items():
         if not isinstance(host_id, str) or not isinstance(host, dict):
             raise FleetConfigError(f"host {host_id!r}: must be a mapping")
+        _reject_unknown(host, _HOST_KEYS, f"host {host_id}")
         roles = _roles(host.get("roles", []), f"host {host_id}")
         digest = host.get("token_sha256")
         if not isinstance(digest, str) or not _SHA256_HEX.match(digest):

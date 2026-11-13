@@ -351,3 +351,52 @@ def test_a_chat_only_account_neither_sees_nor_answers_proposal_and_steering_card
     assert not [m for m in snap["messages"] if m["id"].startswith(("steer:", "proposal:"))]
     assert world.api.rpc("threads/answer", {"groupId": world.room, "messageId": "steer:st1", "answer": "allow"},
                          world.alice_t)[0] == 404
+
+
+# ------------------------------------------------------------------------- single-operator default link
+def _serve(svc, accounts, **server_kw):
+    server = ControlPlaneServer(ControlPlaneRepo(), collab=svc, rakazo_bridge=bridge_section(accounts=accounts),
+                                assistant_service=AssistantService(config=assistant_config(
+                                    {"personal_assistant": {"enabled": True}})), **server_kw)
+    threading.Thread(target=server.serve, daemon=True).start()
+    server.wait_until_ready()
+    return server
+
+
+def _group_names(server, who="alice@example.com", pw=PW_A):
+    api = Api(server.port)
+    return {g["name"] for g in ok(api, "groups/list", {}, api.login(who, pw))}
+
+
+def test_single_operator_links_the_operator_account_to_the_room_owner_with_no_collab_user(world, svc):
+    """No collab_user in the YAML: in single-operator mode the operator account acts as operator_user."""
+    server = _serve(svc, [ACCOUNTS[0]], single_operator=True, operator_user="alice")
+    try:
+        assert _group_names(server) == {"r", "r2"}
+    finally:
+        server.shutdown()
+
+
+def test_without_single_operator_mode_the_account_stays_unlinked(world, svc):
+    server = _serve(svc, [ACCOUNTS[0]], operator_user="alice")
+    try:
+        assert _group_names(server) == set()
+    finally:
+        server.shutdown()
+
+
+def test_a_non_operator_role_is_never_linked_by_default(world, svc):
+    viewer = {**ACCOUNTS[0], "role": "family"}
+    server = _serve(svc, [viewer], single_operator=True, operator_user="alice")
+    try:
+        assert _group_names(server) == set()
+    finally:
+        server.shutdown()
+
+
+def test_an_explicit_collab_user_wins_over_the_single_operator_default(world, svc):
+    server = _serve(svc, [{**ACCOUNTS[1], "collab_user": "bob"}], single_operator=True, operator_user="alice")
+    try:
+        assert _group_names(server, "bob@example.com", PW_B) == {"r"}
+    finally:
+        server.shutdown()

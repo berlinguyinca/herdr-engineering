@@ -862,6 +862,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             self._usage_reserved[k] = max(self._usage_reserved[k], int(p["reserved"]))
         elif t == "project_created":
             self._projects[p["project_id"]] = {"name": p["name"], "members": {p["actor_user_id"]: "manager"}}
+            if p.get("fabric_workspaces") and self._fabric_ws_project is None:
+                self._fabric_ws_project = p["project_id"]       # the fabric-workspaces project: first one wins, rebuilt on replay
         elif t == "project_member_added":
             self._projects[p["project_id"]]["members"][p["subject_user_id"]] = p["role"]
         elif t == "room_created":
@@ -870,6 +872,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "members": {p["actor_user_id"]: {"role": "owner", "expires_at": None, "joined_seq": seq,
                                                  "joined_at": p.get("created_at")}},
                 "grants": {}}
+            fw = p.get("fabric_workspace")
+            if isinstance(fw, dict):                              # the workspace-room index: (whois machine, workspace id) -> room
+                self._rooms[p["room_id"]]["fabric_workspace"] = dict(fw)
+                self._fabric_ws_rooms.setdefault((fw["machine"], fw["workspace_id"]), p["room_id"])
         elif t == "room_profile_set":
             self._rooms[p["room_id"]]["profile"] = p["profile"]
         elif t == "user_registered":
@@ -922,7 +928,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "slot": slot, "_legacy_slot": taken, "aliases": [], "skills": list(p.get("skills") or []),
                 "owner": p["owner_user_id"], "device_id": p["device_id"], "harness_type": p["harness_type"],
                 "instance_id": p.get("instance_id"), "status": "active",
-                "machine": p.get("machine"), "fabric": False,    # additive (older logs have neither); the bit starts OFF
+                "machine": p.get("machine"), "origin": p.get("origin"),
+                # additive (older logs have neither); the bit starts OFF, except for an agent made by fabric-join (whois vouched)
+                "fabric": p.get("origin") == "fabric_join" and p.get("fabric") is True,
+                "fabric_expires_at": p.get("fabric_expires_at") if p.get("origin") == "fabric_join" else None,
                 "name": p.get("name") or _default_handle(p["harness_type"], p["agent_id"]),
                 "parent": p.get("parent_agent_id"), "join": p.get("join_digest"),
                 "cred_digest": p["secret_digest"], "expires_at": p["expires_at_epoch"],
@@ -930,6 +939,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                              if isinstance(p.get("external"), dict) else None)}
             self._by_cred[p["secret_digest"]] = p["agent_id"]
             self._agents_by_owner[p["owner_user_id"]].add(p["agent_id"])
+            if p.get("origin") == "fabric_join" and not isinstance(p.get("external"), dict):
+                self._fabric_join_index[(p["machine"], p["name"])] = p["agent_id"]
             if isinstance(p.get("external"), dict):
                 self._externals_by_room[p["external"]["room_id"]].append(p["agent_id"])
             if p.get("action") == "helper.agent.create":
@@ -955,8 +966,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             if a is not None:
                 a["fabric"] = bool(p["fabric"])
                 a["fabric_expires_at"] = p.get("fabric_expires_at") if a["fabric"] else None   # absent = expired (fail closed)
-                if p.get("machine"):
+                if p.get("machine") and p.get("action") != "agent.fabric.renew":   # a renewal never rebinds the owner's choice
                     a["machine"] = p["machine"]
+        elif t == "audit_denied":
+            if p.get("action") == "agent.fabric_join":
+                self._fabric_join_denied_total += 1
         elif t == "agent_renamed":
             a = self._agents[p["agent_id"]]
             if a["name"] not in a["aliases"]:                  # an old name keeps working as an alias
@@ -1188,6 +1202,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                    "coordinate_roles": list(p.get("coordinate_roles") or [])} if p.get("coordinate_team") else {})}
             self._agent_projects[p["agent_id"]].add(p["project_id"])
             self._rooms_by_agent[p["agent_id"]].add(p["room_id"])
+            fw = p.get("fabric_workspace")
+            if isinstance(fw, dict) and p["agent_id"] in self._agents:   # binds the auto-joined agent to its one workspace
+                self._agents[p["agent_id"]]["workspace"] = {**fw, "room_id": p["room_id"]}
         elif t == "workspace_linked":
             self._links[p["link_id"]] = {
                 "link_id": p["link_id"], "room_id": p["room_id"], "workspace_id": p["workspace_id"],
@@ -1823,8 +1840,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
 
     def _agent_slots(self, owner: str, extra: int = 1) -> None:
         now = self._now()
-        live = sum(1 for aid in self._agents_by_owner.get(owner, ())
-                   if (a := self._agents[aid])["status"] == "active" and a["expires_at"] > now)
+        live = sum(1 for aid in self._agents_by_owner.get(owner, ())      # auto-joined agents have their own caps (fabric_trust)
+                   if (a := self._agents[aid])["status"] == "active" and a["expires_at"] > now and a.get("origin") != "fabric_join")
         waiting = sum(1 for d in self._pending_by_owner.get(owner, ())
                       if not (r := self._pending[d])["used"] and r["expires_at"] > now)
         if live + waiting + extra > self.max_agents_per_user:
@@ -3105,7 +3122,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
                             "instance_id": a.get("instance_id"), "external": bool(a.get("external")),
                             "machine": a.get("machine"), "fabric": bool(a.get("fabric")),
-                            "fabric_expires_at": a.get("fabric_expires_at"),
+                            "fabric_expires_at": a.get("fabric_expires_at"), "origin": a.get("origin"),
+                            "workspace": ({"id": a["workspace"]["workspace_id"], "label": a["workspace"].get("label"),
+                                           "room_id": a["workspace"]["room_id"], "tab_id": a["workspace"].get("tab_id"),
+                                           "pane_id": a["workspace"].get("pane_id")} if a.get("workspace") else None),
                             "online": any(self._online(r["room_id"], "agent", aid) for r in rooms),
                             "status": a["status"], "expires_at": a["expires_at"], "rooms": rooms,
                             "pending": pending})
@@ -6842,11 +6862,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
     def dispatch(self, method: str, parts: list[str], query: dict, body: dict,
                  authorization: str, device: str | None, operator: str | None = None,
                  client: str | None = None, peer_ip: str | None = None, machine: str | None = None,
-                 fabric_listener: bool = False):
+                 fabric_listener: bool = False, fabric_owner: str | None = None):
         """parts: path segments after /api/v1/collab. Returns (status, json) or a Stream.
 
         ``fabric_listener``: the request came in on the dedicated fabric listener, where the routes that run BEFORE
-        authentication (enrollment, join, join-link, the public config) do not exist: a 404, whatever the headers."""
+        authentication (enrollment, join, join-link, the public config) do not exist: a 404, whatever the headers.
+        ``fabric_owner``: the collab operator, who owns the agents ``agents/fabric-join`` creates (that route exists only there)."""
         try:
             if fabric_listener and (parts[:1] == ["agents"] and parts[1:] in (["enrollment", "complete"], ["join"], ["join-link"])
                                     or parts == ["config"]):
@@ -6857,6 +6878,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 return 201, self.redeem_join_token(body, client)  # the token IS the authentication
             if parts == ["agents", "join-link"] and method == "POST":
                 return 200, self.link_joined(body)
+            if parts == ["agents", "fabric-join"] and method == "POST":
+                if not fabric_listener:                  # the whois proof exists only on the dedicated listener
+                    raise CollabError(404, "not found")
+                return self.fabric_join(body, peer_ip, machine, fabric_owner)   # whois is the authentication: the header is ignored
             if parts == ["config"] and method == "GET":
                 return 200, self.public_config  # public identifiers only; no auth needed
             if operator is not None and self.degraded:

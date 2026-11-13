@@ -30,6 +30,13 @@ test('the agent line names machine, bit and expiry, and escapes', () => {
   assert.ok(!fabricAgentLine({ machine: EVIL, fabric: true }, NOW).includes('<img'));
 });
 
+test('an auto-joined agent is marked so the operator can see and revoke it', () => {
+  const line = fabricAgentLine({ machine: 'bender', fabric: true, fabric_expires_at: NOW + 99, origin: 'fabric_join' }, NOW);
+  assert.match(line, /data-fabric-autojoined>auto-joined/);
+  assert.ok(!fabricAgentLine({ machine: 'bender', fabric: true, fabric_expires_at: NOW + 99 }, NOW).includes('auto-joined'));
+  assert.ok(!fabricAgentLine({ machine: 'bender', fabric: true, origin: '<img>' }, NOW).includes('auto-joined'));
+});
+
 test('the coordinator line shows team and roles and escapes', () => {
   assert.equal(coordinatorLine(undefined), '');
   assert.match(coordinatorLine({ team_id: 'team-abc', roles: ['implementer', 'reviewer'] }), /coordinator: team-abc · roles implementer, reviewer/);

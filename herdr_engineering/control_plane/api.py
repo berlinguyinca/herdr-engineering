@@ -62,6 +62,8 @@ _HOST_TERMINAL_OUT = re.compile(r"^/api/v1/host/terminal/[^/]+/output$")
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure)"
+                        # Usage reporters (llm-proxy, llm-gateway-usage): an agent key may report tokens, nothing wider.
+                        r"|token-usage"
                         r"|architecture/(?:snapshots|analyses|analyses/claim)"
                         # CI fix runner: claim, report state, report result. Never create or cancel.
                         r"|ci/fix/claim|ci/fix/[^/]+/(?:state|result))$")
@@ -318,7 +320,7 @@ class ControlPlaneServer:
                  assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None, build_cache=None,
-                 memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
+                 memory_adapter=None, memory_config=None, unified_workspace_config=None, work_center_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None, library=None,
                  member_directory=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
@@ -377,6 +379,8 @@ class ControlPlaneServer:
         from .deployment_definitions import DeploymentDefinitions
         self.deployment_definitions = DeploymentDefinitions(
             lambda: self._control_plane_value(fleet_config, "deployment_definitions"),
+            # fail CLOSED: an unreadable fleet file means an empty allowlist, not the last good one
+            ci_components=lambda: self._deployment_secure_value("ci_deployments"),
             ci_snapshot=lambda: self.ci_monitor.snapshot(start=True))
         # The stage coordinator (Task 3), ticked by _deployments_loop; GET /api/v1/deployments
         # serves the last tick and never ticks itself. `deployment_evidence` is the release-evidence
@@ -438,6 +442,9 @@ class ControlPlaneServer:
         self.summary_report = None
         # unified_workspace_v1 (P01): capability advertisement only; no route consumes it yet. YAML-only, default off.
         self.unified_workspace_enabled = isinstance(unified_workspace_config, dict) and unified_workspace_config.get("enabled") is True
+        # work_center_v1 (WC-006): gates every Work Command Center UI surface in the dashboard (This week card, session Work Context
+        # header, board "Open in Herdr" links). Advertisement only; no route consumes it. YAML-only, strict True, default off.
+        self.work_center_enabled = isinstance(work_center_config, dict) and work_center_config.get("enabled") is True
         self._summary_stop = threading.Event()
         self._summary_scanner = None
         if not collab_only:
@@ -558,6 +565,7 @@ class ControlPlaneServer:
         self._build_assistant_apps(assistant_apps_dsn)
         if self.rakazo is not None:
             self.rakazo.single_operator_fn = lambda: self.single_operator
+            self.rakazo.operator_user_fn = lambda: self.operator_user
         self._build_reminders(assistant_apps_dsn)
         self.assistant.canonical_person = self._canonical_person
         from .ingest import IngestService
@@ -1658,6 +1666,8 @@ class ControlPlaneServer:
             caps.append("memory_v1")
         if getattr(self, "unified_workspace_enabled", False):
             caps.append("unified_workspace_v1")
+        if getattr(self, "work_center_enabled", False):
+            caps.append("work_center_v1")
         if getattr(self, "skills", None) is not None:
             caps.append("skill_registry_v1")
         if getattr(self, "build_cache", None) is not None:
@@ -1671,6 +1681,33 @@ class ControlPlaneServer:
             caps.append("architecture_v1")
             if self.architecture.explain_config:
                 caps.append("architecture_explain_v1")
+        caps.extend(self._service_capabilities())
+        return caps
+
+    def _service_capabilities(self):
+        """Flags for the optional services the Settings page lists. Each mirrors the exact guard its routes apply (the 503
+        "not enabled" checks), so a flag is never true while the route refuses. Presence and booleans only, never values."""
+        caps = []
+        store = self.artifact_store is not None
+        stored = self.share_store is not None and self.shares_root is not None and store
+        if stored and self.share_settings is not None:
+            caps.append("share_v1")
+        if stored and self.member_admin is not None:      # the member routes do not need share_settings
+            caps.append("members_v1")
+        if self.collab_artifacts_enabled and self.collab_grant_store is not None and store:
+            caps.append("collab_artifacts_v1")
+        if getattr(self, "gate_service", None) is not None:
+            caps.append("review_gate_v1")
+        if store and (self.artifact_delete_owners or self.artifact_delete_allow_keyless_owner):
+            caps.append("artifact_delete_v1")
+        if self.ci_monitor.actions_enabled:
+            caps.append("ci_actions_v1")
+        try:
+            # the same predicate the force/ack routes apply: flag on AND definitions configured AND loaded
+            if self.deployment_actions_enabled() and self._loaded_deployment_definitions() is not None:
+                caps.append("deployment_actions_v1")
+        except Exception:  # noqa: BLE001 - health must answer even if the definitions cannot be read
+            pass
         return caps
 
     def _health_probe(self, with_capabilities=True):
@@ -2293,6 +2330,11 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 allowed.add(name.lower())
             return allowed
 
+        def _is_fabric_join(self):
+            """``POST agents/fabric-join`` is authenticated by the tailnet machine alone (whois on the real peer): it carries no
+            Authorization header, and whatever one it carries is ignored."""
+            return self.command == "POST" and self.path.split("?")[0].rstrip("/") == "/api/v1/collab/agents/fabric-join"
+
         def _fabric_listener(self):
             """The dedicated fabric listener (tailnet address, no proxy, no TLS): the collab API and nothing else, and ONLY
             ``Authorization: Fabric``. Any other scheme (or none) is a 401 before the service sees it, so a Bearer token or an
@@ -2308,7 +2350,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             if not self._is_collab_path() or server.collab is None:
                 return self._deny(404, "not found")
             scheme, _, rest = self.headers.get("Authorization", "").partition(" ")
-            if scheme != "Fabric" or not rest.strip():
+            if (scheme != "Fabric" or not rest.strip()) and not self._is_fabric_join():
                 return self._deny(401, "unauthorized")
             return self._collab()
 
@@ -3167,6 +3209,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                                           self.headers.get("X-Herdr-Device"),
                                           operator=server.operator_user if operator else None,
                                           client=self._proxied_client(), fabric_listener=fabric,
+                                          fabric_owner=server.operator_user if fabric else None,
                                           **self._fabric_args())
             except Exception:
                 return self._json({"error": "internal error"}, 500)  # never echo internals
@@ -3674,12 +3717,13 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
             if resource == "mission-outcomes" and len(parts) == 4:
-                from .mission_outcome import outcome_summaries
+                from .mission_outcome import issue_refs_by_mission, outcome_summaries, pr_refs_by_mission
                 try:
                     server.mission_outcomes.sweep()
                 except Exception:  # noqa: BLE001
                     pass
-                return self._json({"outcomes": outcome_summaries(r)})
+                return self._json({"outcomes": outcome_summaries(r), "pr_refs": pr_refs_by_mission(r),
+                                   "issue_refs": issue_refs_by_mission(r)})
             if resource == "missions":
                 try:
                     server.mission_outcomes.sweep()   # throttled; closes missions that went silent
@@ -3803,6 +3847,11 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         return self._json({'error':'staleCatalogCursor','message':str(exc)},409)
                     except ValueError as exc:
                         return self._json({'error':str(exc)},400)
+                try:
+                    limit, offset = _page_window(self.path, default_limit=SERVICES_PAGE_DEFAULT,
+                                                 max_limit=SERVICES_PAGE_MAX)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
                 services = r.list_services()
                 host_filter = _q(self.path, "host_id")
                 if host_filter:
@@ -3812,11 +3861,13 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 summary["total"] = len(services)
                 if _q(self.path, "include_archived") in {"false", "0"}:
                     services = [s for s in services if not s["lifecycle"]["archived"]]
+                services, pagination = _page_slice(services, limit, offset)
                 if _q(self.path, "fields") == "feed":
                     # The ownership feed needs identity and proof only; the full
                     # catalog projection is most of the bytes of a large inventory.
                     services = [{k: s.get(k) for k in _FEED_SERVICE_FIELDS} for s in services]
-                return self._etag_json({"services": services, "summary": summary})
+                return self._etag_json({"services": services, "summary": summary,
+                                        "pagination": pagination})
             if resource == "fleet" and parts[4:] == ["config", "status"]:
                 if server.fleet_config is None:
                     return self._json({"error": "not found"}, 404)
@@ -3829,6 +3880,15 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 raw = server._control_plane_value(server.fleet_config, "ai_sync")
                 try:
                     return self._json(parse_ai_sync(raw)) if raw is not None else self._json(
+                        {"error": "not configured"}, 404)
+                except ValueError:
+                    return self._json({"error": "not configured"}, 404)
+            if resource == "agent-rules" and parts[4:] == ["config"]:
+                # Read-only, from the central fleet YAML; an unusable or invalid section reads as not configured.
+                from .agent_rules_config import parse_agent_rules
+                raw = server._control_plane_value(server.fleet_config, "agent_rules")
+                try:
+                    return self._json(parse_agent_rules(raw)) if raw is not None else self._json(
                         {"error": "not configured"}, 404)
                 except ValueError:
                     return self._json({"error": "not configured"}, 404)
@@ -3876,6 +3936,18 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     return self._json(r.usage_analytics(
                         mission_id=_q(self.path, "mission")))
                 return self._json({"error": "unknown analytics kind"}, 404)
+            if resource == "work":
+                # G1: read-only cross-entity lifecycle window; same viewer-level read auth as /events, gated by work_center_v1.
+                if not getattr(server, "work_center_enabled", False) or parts[4:] != ["weekly-events"]:
+                    return self._json({"error": "not found"}, 404)
+                from .work_weekly import weekly_events
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                for key in ("since", "until", "limit", "after"):
+                    if len(query.get(key, [])) > 1:
+                        raise ValueError(f"{key} must be supplied once")
+                return self._json(weekly_events(
+                    r, since=query.get("since", [None])[0], until=query.get("until", [None])[0],
+                    limit=query.get("limit", [None])[0], after=query.get("after", [None])[0]))
             if resource == "events":
                 if len(parts) > 4 and parts[4] == "stream":
                     return self._sse()
@@ -4092,8 +4164,18 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         languages if isinstance(languages, dict) else {}))
                 if what == "history":
                     from .project_links import annotate_ci_history, cached_github_languages
-                    return self._json(annotate_ci_history(server.ci_monitor.history(), r,
-                        repository_languages=cached_github_languages(server.github_monitor)))
+                    try:
+                        limit, offset = _page_window(self.path, default_limit=CI_HISTORY_PAGE_DEFAULT,
+                                                     max_limit=CI_HISTORY_PAGE_MAX)
+                    except ValueError as exc:
+                        return self._json({"error": str(exc)}, 400)
+                    # Only the requested window is copied, then annotated.
+                    snapshot = server.ci_monitor.history(window=(offset, limit))
+                    pagination = snapshot.pop("pagination")
+                    view = annotate_ci_history(snapshot, r,
+                        repository_languages=cached_github_languages(server.github_monitor))
+                    view["pagination"] = pagination
+                    return self._json(view)
                 if what == "reports":
                     from .project_links import annotate_ci_history, cached_github_languages
                     filters = _ci_reports_query(self.path)
@@ -5989,6 +6071,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         limit=_qint(self.path, "limit", 200),
                         before_seq=(_qint(self.path, "before_seq", -1)
                                     if _q(self.path, "before_seq") else None)), sid))
+                if tail[0] == "history" and len(tail) == 1:
+                    return self._inspector_history(sid, role)
                 if tail[0] == "events" and len(tail) == 2:
                     if not tail[1].isdigit():
                         return self._json({"error": "invalid sequence"}, 400)
@@ -6007,6 +6091,29 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             except KeyError:
                 return self._json({"error": "not found"}, 404)
             return self._json({"error": "not found"}, 404)
+
+        def _inspector_history(self, sid, role):
+            """Older inspector events from Postgres, paged by an opaque cursor (``before``); additive to the ring."""
+            from .inspector_history import HistoryCursorInvalid, parse_inspector_history
+            cfg = parse_inspector_history(server._control_plane_value(server.fleet_config, "inspector_history"))
+            if not cfg["enabled"]:
+                return self._json({"error": "inspector history is disabled"}, 404)
+            if not server.repo.inspector.has_session(sid) and server.repo.get_session(sid) is None:
+                return self._json({"error": "session not found"}, 404)
+            raw = _q(self.path, "limit")
+            if raw is not None and not raw.isdigit():
+                return self._json({"error": "invalid limit"}, 400)
+            limit = max(1, min(int(raw) if raw else cfg["page_size"], cfg["max_page_size"]))
+            try:
+                body = server.repo.inspector_history_page(
+                    sid, role, view=_q(self.path, "view") or "all", limit=limit, before=_q(self.path, "before"))
+            except (HistoryCursorInvalid, ValueError) as exc:
+                return self._json({"error": str(exc)}, 400)
+            except LookupError:
+                return self._json({"error": "durable inspector history is not available"}, 503)
+            except Exception:   # a failed durable read must not take the dashboard down; static message only
+                return self._json({"error": "durable inspector history is unavailable"}, 503)
+            return self._json(body)
 
         def _inspector_set_prefs(self, sid):
             body = self._read_json() or {}
@@ -6820,6 +6927,35 @@ def _evolution_body(server, r, session_id, session=None):
 def _q(path, key):
     from urllib.parse import parse_qs, urlparse
     return parse_qs(urlparse(path).query).get(key, [None])[0]
+
+
+def _page_window(path, *, default_limit, max_limit):
+    """Parse ``limit``/``offset`` for a flat list endpoint (ValueError -> 400)."""
+    values = {}
+    for key, low in (("limit", 1), ("offset", 0)):
+        raw = _q(path, key)
+        if raw is None:
+            continue
+        if not re.fullmatch(r"[0-9]{1,9}", raw) or int(raw) < low:
+            raise ValueError(f"{key} must be an integer >= {low}")
+        values[key] = int(raw)
+    limit = values.get("limit", default_limit)
+    if limit > max_limit:
+        raise ValueError(f"limit must be an integer between 1 and {max_limit}")
+    return limit, values.get("offset", 0)
+
+
+def _page_slice(rows, limit, offset):
+    """Return (page rows, pagination marker) for an already ordered list."""
+    page = rows[offset:offset + limit]
+    end = offset + len(page)
+    more = end < len(rows)
+    return page, {"total": len(rows), "limit": limit, "offset": offset,
+                  "next_offset": end if more else None, "truncated": more}
+
+
+SERVICES_PAGE_DEFAULT, SERVICES_PAGE_MAX = 500, 1000
+CI_HISTORY_PAGE_DEFAULT, CI_HISTORY_PAGE_MAX = 1000, 2000
 
 
 def _qint(path, key, default):

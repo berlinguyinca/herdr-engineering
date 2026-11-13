@@ -4,6 +4,7 @@
 #   deploy/control-plane/deploy.sh [--ref origin/main] [--dry-run] [--no-fetch]
 #                                  [--fleet-config PATH] [--collab-lock-wait SECONDS]
 #                                  [--deploy-lock-wait SECONDS]
+#                                  [--checkpoint-lock-wait SECONDS] [--pause-worker]
 #                                  [--with-memory [--memory-checkout PATH]]
 #                                  [--memory-client-config PATH]
 #                                  [--memory-private-egress --memory-private-egress-gateway IPV4/32]
@@ -69,6 +70,14 @@
 #      recreate removed it) is recorded as absent, not an error: the deploy recreates it,
 #      and a rollback recreates it from the previous web's pinned image.
 #
+# The checkpoint prewarm needs the per-schema projection materializer lock, which the
+# running worker's periodic refresh holds for most of each cycle. By default the prewarm
+# waits for it (--checkpoint-lock-wait, default 420s: longer than one 300s refresh cycle
+# plus a pass), failing with the lock's reason only after that. --pause-worker (opt-in)
+# instead stops herdr-cp-worker for the prewarm and starts it again straight after, on
+# success, failure or interrupt; the worker's jobs (artifacts, collab bridge) idle for
+# that time. See docs/operations/projection-checkpoints.md.
+#
 # One deploy at a time: every real deploy holds STATE_DIR/deploy.lock from before it
 # changes anything until it exits (rollback included), waiting --deploy-lock-wait
 # seconds (default 600) for another deploy to finish, else failing untouched.
@@ -120,6 +129,7 @@
 set -euo pipefail
 
 REF="origin/main"; DRY=0; FETCH=1; ALLOW_DIVERGENT=0; COLLAB_LOCK_WAIT=300; DEPLOY_LOCK_WAIT=600
+CHECKPOINT_LOCK_WAIT=420; PAUSE_WORKER=0; WORKER_PAUSED=0
 MEMORY_PRIVATE_EGRESS=auto; MEMORY_PRIVATE_EGRESS_RECOVER=""
 MEMORY_PRIVATE_EGRESS_CIDR="172.31.252.0/29"
 MEMORY_PRIVATE_EGRESS_GATEWAY="${HERDR_CP_MEMORY_PRIVATE_EGRESS_GATEWAY:-}"
@@ -135,6 +145,8 @@ while [ $# -gt 0 ]; do
     --fleet-config) CENTRAL="${2:?--fleet-config needs a value}"; shift 2 ;;
     --collab-lock-wait) COLLAB_LOCK_WAIT="${2:?--collab-lock-wait needs a value}"; shift 2 ;;
     --deploy-lock-wait) DEPLOY_LOCK_WAIT="${2:?--deploy-lock-wait needs a value}"; shift 2 ;;
+    --checkpoint-lock-wait) CHECKPOINT_LOCK_WAIT="${2:?--checkpoint-lock-wait needs a value}"; shift 2 ;;
+    --pause-worker) PAUSE_WORKER=1; shift ;;
     --memory-private-egress-recover) MEMORY_PRIVATE_EGRESS_RECOVER="${2:?needs the saved deploy attempt}"; shift 2 ;;
     --memory-private-egress) MEMORY_PRIVATE_EGRESS=1; shift ;;
     --no-memory-private-egress) MEMORY_PRIVATE_EGRESS=0; shift ;;
@@ -148,6 +160,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 [[ "$COLLAB_LOCK_WAIT" =~ ^[0-9]+$ ]] || { echo "--collab-lock-wait needs a whole number of seconds" >&2; exit 2; }
+[[ "$CHECKPOINT_LOCK_WAIT" =~ ^[0-9]+$ ]] || { echo "--checkpoint-lock-wait needs a whole number of seconds" >&2; exit 2; }
 [[ "$DEPLOY_LOCK_WAIT" =~ ^[0-9]+$ ]] || { echo "--deploy-lock-wait needs a whole number of seconds" >&2; exit 2; }
 if [ -n "$MEMORY_CLIENT_CONFIG" ]; then
   MEMORY_CLIENT_CONFIG="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().absolute())' "$MEMORY_CLIENT_CONFIG")"
@@ -334,6 +347,18 @@ check_pipelines_dir || exit 1
 WORK=""; ENV_DIR=""; PREV_WORK=""
 HOST_MUTATED=0
 DEPLOY_FINISHED=0
+# Start the worker again if --pause-worker stopped it. Idempotent; never fatal.
+# shellcheck disable=SC2317
+resume_worker() {
+  [ "$WORKER_PAUSED" = 1 ] || return 0
+  if docker start herdr-cp-worker >/dev/null 2>&1; then
+    echo "resumed herdr-cp-worker"
+  else
+    echo "WARNING: could not start herdr-cp-worker; start it with: docker start herdr-cp-worker" >&2
+    return 0
+  fi
+  WORKER_PAUSED=0
+}
 # Called by the EXIT trap via finish().
 # shellcheck disable=SC2317
 cleanup() {
@@ -351,6 +376,7 @@ finish() {
   # Repeated interrupts must not cut short recovery or release ownership early.
   trap '' INT TERM HUP
   trap - EXIT
+  resume_worker
   if [ "$HOST_MUTATED" = 1 ] && [ "$DEPLOY_FINISHED" = 0 ]; then
     rollback || rollback_status=$?
     [ "$rollback_status" != 3 ] || status=3
@@ -702,7 +728,7 @@ if [ "$DRY" = 1 ]; then
   if [ "$ARTIFACT_HOST" = 1 ]; then
     echo "[dry-run] artifact host enabled: rendered its configuration to a temp dir (would install it in a 0700 $AH_DIR), the edge conf gains its server block and /mcp/artifacts, would build herdr-artifact-host:$TAG, create the database roles, back the database up, run migrate, and bring up project $AH_PROJECT (db, public, internal, relay) healthy BEFORE the control plane's compose up"
   fi
-  echo "[dry-run] would prewarm the target image checkpoint on an existing deployment when its CLI supports it, before host or service changes"
+  echo "[dry-run] would prewarm the target image checkpoint on an existing deployment when its CLI supports it, before host or service changes (waiting up to ${CHECKPOINT_LOCK_WAIT}s for the worker's materializer lock$([ "$PAUSE_WORKER" = 1 ] && echo '; --pause-worker: herdr-cp-worker is stopped for the prewarm and started again after'))"
   echo "[dry-run] would build herdr-engineering:$TAG and recreate ${APP_SERVICES[*]} ${EDGE_SERVICE[*]}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}}"
   exit 0
 fi
@@ -845,15 +871,31 @@ if [ -n "$PREVIOUS_IMAGE" ] && grep -q '^def _cmd_cp_checkpoint(' "$WORK/herdr_e
   chmod 600 "$PREWARM_LOG"
   deploy_lock_phase checkpoint-prewarm
   echo "prewarming target projection checkpoint before host or service changes"
+  if [ "$PAUSE_WORKER" = 1 ]; then
+    if [ "$(docker inspect -f '{{.State.Running}}' herdr-cp-worker 2>/dev/null || true)" = true ]; then
+      echo "pausing herdr-cp-worker for the prewarm (restarted right after, even on failure)"
+      WORKER_PAUSED=1
+      if ! docker stop -t 60 herdr-cp-worker >/dev/null 2>&1; then
+        echo "could not stop herdr-cp-worker; no host files or services changed" >&2
+        resume_worker
+        exit 1
+      fi
+    else
+      echo "herdr-cp-worker is not running; nothing to pause"
+    fi
+  fi
   if ! docker run --rm --network container:herdr-cp-web \
       --mount "type=bind,src=$ATTEMPT/candidate,dst=/etc/herdr/fleet,readonly" \
       --entrypoint herdr-eng "$CANDIDATE_IMAGE_ID" \
       control-plane checkpoint --fleet-config "$MOUNT_TARGET" \
-      --migrations /app/control-plane/migrations >"$PREWARM_LOG" 2>&1; then
+      --migrations /app/control-plane/migrations \
+      --lock-wait "$CHECKPOINT_LOCK_WAIT" >"$PREWARM_LOG" 2>&1; then
+    resume_worker
     "$PY" "$STATE_HELPER" outcome "$ATTEMPT" prewarm_failed
     echo "target projection checkpoint prewarm failed; no host files or services changed. Reason and output saved in private log: $PREWARM_LOG" >&2
     exit 1
   fi
+  resume_worker
   echo "projection checkpoint prewarm succeeded; metrics saved in private log: $PREWARM_LOG"
 else
   echo "projection checkpoint prewarm skipped (first deploy or target predates checkpoint CLI)"

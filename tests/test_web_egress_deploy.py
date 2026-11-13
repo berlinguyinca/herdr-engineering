@@ -46,7 +46,8 @@ def test_real_coordinator_restores_matching_policy_and_profile_before_grant(
     new.write_text("new fixture")
     if interrupted:
         invocation = (
-            "HOST_MUTATED=1; DEPLOY_FINISHED=0\ncleanup() { return 0; }\n"
+            "HOST_MUTATED=1; DEPLOY_FINISHED=0; WORKER_PAUSED=0\ncleanup() { return 0; }\n"
+            + function("resume_worker")
             + function("finish")
             + "\ntrap finish EXIT\ntrap 'exit 143' TERM\nkill -TERM $$\n"
         )

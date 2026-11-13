@@ -48,6 +48,11 @@ control_plane:
       listen_host: 100.104.39.6         # the dedicated listener (section 9); tailnet range only; with listen_port, or neither
       listen_port: 9483
       whois_socket: /run/fabric-whois/whois.sock   # ask the whois sidecar instead of tailscaled (section 9); absolute path
+      auto_join: false         # true = agents on an allow-listed machine join with no token and no owner click (section 5a)
+      workspace_rooms: false   # true = auto-joined agents of one herdr workspace share ONE room (section 5a); requires auto_join
+      workspace_rooms_per_machine: 100   # 1..10000; new workspace rooms per machine (429 past it)
+      workspace_rooms_total: 500         # 1..10000; across all machines
+      workspace_room_members: 50         # 1..10000; active agents with a grant in one workspace room
 ```
 
 `listen_host`, `listen_port` and `whois_socket` are read at startup only (an edit needs a restart or a deploy); everything else stays hot.
@@ -69,6 +74,104 @@ that fails to read or validate means OFF with the kill switch on. The machine is
    Fabric request is refused with `fabric_expired`. Setting the bit again renews it. Logs written before this field existed count as
    expired (fail closed). The agent list (`list_my_agents`) shows `machine`, `fabric` and `fabric_expires_at`, and the dashboard marks an
    expired bit "fabric expired".
+
+## 5a. Auto-join: no token, no owner click
+
+Operator decision (2026-11-07): an agent that runs on a machine in `machines` may join and act on that machine's word alone. One YAML switch
+turns it on: `control_plane.collab.fabric_trust.auto_join: true` (default `false`, hot-reloaded like its siblings, requires `enabled: true`).
+
+**What you are trusting.** The operator trusts EVERY process on an allow-listed machine: whois vouches for the machine, not for a program or a
+user, so any local process there can join and then name the agent it created. Do not allow-list a machine you would not trust with that.
+The collab host in `machines` trusts itself, as in section 9, unchanged.
+
+**The route.** `POST /api/v1/collab/agents/fabric-join`, served only on the dedicated fabric listener (404 on the public and operator
+listeners). It authenticates by whois alone and ignores any `Authorization` header. Body `{"name": "<1-64 chars: lowercase letters, digits,
+dot, hyphen, underscore, first a letter or digit>", "machine": "<optional, informational>"}`; the machine is always the one whois found. It answers
+`{agent_id, name, machine, fabric_expires_at}` (201 on create, 200 on renew).
+
+**What gets created.** A normal agent owned by the collab `operator_user` (the server needs `operator_user` set), with `machine` from whois, the
+fabric bit on, and `origin: "fabric_join"`, harness family `agent` (so it gets an address like any agent: `<handle>.agent`, `<handle>.agent-2`, and
+its name resolves in `@` mentions). It has NO credential (nothing secret exists to leak or rotate), NO room permissions and never
+`coordinate`: a room owner grants permissions exactly as for any agent (section 6 for `coordinate`, which stays an explicit owner decision).
+The audit row carries `via: "fabric"`. Joining is idempotent per (machine, name): the same pair returns the same agent, the same name on
+another machine is a separate agent.
+
+**Limits.** Three bounds, none of them the operator's own `max_agents_per_user` (auto-joined agents are NOT counted there, so a noisy machine
+cannot starve the operator's own enrolments, and the operator's enrolments cannot block joins): 30 NEW agents per machine per hour (429
+`fabric join` throttle; renewals, revoked-name and cap refusals do not spend it), 200 names per machine (revoked names count, see
+Revocation) and 1000 auto-joined agents in total across machines (`fabric_join_total_cap`, 429). Refusals are audited
+(`agent.fabric_join`, outcome `denied`, reasons `fabric_join_rate_limited`, `fabric_join_machine_cap`, `fabric_join_total_cap`,
+`fabric_join_revoked`, `fabric_join_machine_rebound`), but at most one audit row per (machine, reason) every 5 minutes and 500 in the
+log's lifetime, so a loop over fresh names cannot fill the capped event log (the rest are only counted in `audit_throttled`).
+External and helper agents cannot join this way, and a fabric caller can neither set the fabric bit nor rotate credentials. A re-join of a name
+the owner has since bound to a DIFFERENT machine answers 403 (`fabric_join_machine_rebound`) and changes nothing; renewals never rebind a machine.
+
+**Renewal.** The fabric bit of an auto-joined agent slides to now + `agent_ttl_seconds`, but is written at most once per 24 hours (sooner only
+when `agent_ttl_seconds` is under four days: a quarter of the window), so a polling agent costs about one event a day. A bit the owner set by
+hand (section 5) keeps its fixed TTL.
+
+**Revocation.** Revoking the agent (dashboard: agents are marked "auto-joined") or clearing its fabric bit takes effect immediately. A later
+`fabric-join` of the same (machine, name) answers 403 and is audited as `fabric_join_revoked`: a revoked agent is never resurrected. Choose a
+new name to start over. **Known limit:** a revoked (machine, name) stays blocked for good and keeps counting toward that machine's 200-name cap
+(that is what keeps the index bounded); there is no owner-side way to clear one short of a new machine name or a log rebuild. Setting `auto_join: false`, the kill switch, or `enabled: false` ends Fabric auth of auto-joined agents at once
+(audit reason `fabric_auto_join_off`); agents the owner enabled by hand are unaffected by `auto_join`.
+
+**Client.** The route exists ONLY on the fabric listener, never on the public site. `herdr-eng rooms join-fabric NAME [--machine M]
+[--control-plane http://<listen_host>:<listen_port>]` finds the listener from this host's configuration (`fabric_trust.listen_host` and
+`listen_port`) when `--control-plane` is omitted, and otherwise fails at once saying so. The shell cannot discover it, so it needs the URL:
+`curl -fsSL <site>/api/v1/collab/scripts/join.sh | bash -s -- --fabric --name NAME --fabric-url http://<listen_host>:<listen_port>`. Names follow
+one rule in the server, the Python client and `join.sh`. Both write `~/herdr-agents/NAME.json` (`$HERDR_AGENT_DIR` honoured), mode 0600, holding only
+`{agent_id, name, machine}`; the existing identity discovery (`--as-agent`, `HERDR_AGENT_ID`, the single file) then finds it. The token
+path (`HERDR_JOIN_TOKEN`) is unchanged.
+
+**Workspace rooms (`workspace_rooms: true`, default off, requires `auto_join: true`).** Agents that auto-join from the same herdr WORKSPACE on
+the same machine land in ONE shared room with no owner click. The body gains an optional `workspace` object `{"id": "<1-64 chars: letters, digits,
+dot, underscore, colon, hyphen>", "label": "<display only, at most 64 printable characters>"}` and optional informational `tab_id` and `pane_id`
+(same character rule, stored on the agent for display only). The room key is `(whois machine, workspace id)`: the machine is never client
+supplied, so the same workspace id on another machine is a different room. Without `workspace` (or with the switch off) behaviour is exactly as
+above. Only a malformed `workspace` object or id is a 400 (and creates nothing); an invalid `label`, `tab_id` or `pane_id` is display-only and is IGNORED
+(dropped), so it can never fail a join.
+
+- *Room.* The first join for a key creates the room (always named `<machine>/<workspace id>`, owner = `operator_user`; the label is a separate, sanitised display field that is advisory and chosen by
+  whoever joins first, never part of the identity or the name) in a lazily created project
+  `fabric-workspaces` that the operator owns, then grants the agent. Later joins find the room through an index rebuilt from the event log, so
+  it survives a restart or rebuild. All writes are `_commit` events whose audit rows carry `via: "fabric"`; the response adds `room_id` and `workspace`.
+- *Grant.* `read`, `post`, `instruct` and `execute`. Never `spawn_helpers`, never `coordinate` (see below). The grant has no expiry of its own: it
+  lasts as long as the agent's fabric window and ends on revocation. The binding and the grant are one event, so an owner who narrows or removes
+  an agent's grant is not overridden by a later re-join: the re-join answer then omits `room_id`, says `"room_access": false` and keeps the `workspace` binding.
+- *Bounds (429, fail closed, throttled audit rows like the other refusals).* `workspace_rooms_per_machine` (100), `workspace_rooms_total` (500)
+  and `workspace_room_members` (50; active agents holding a grant). Reasons `fabric_ws_machine_cap`, `fabric_ws_total_cap`, `fabric_ws_members_cap`.
+  The caps count only LIVE rooms (at least one active agent bound): revoking the agents of a room frees its slot, while the empty room is still
+  found by its key and reused, never duplicated. The member cap does not count the joining agent. Every check runs before anything is written, so
+  a refused join (new or re-join) leaves nothing behind. The room and its first grant are separate events, but a half-done bind self-heals: the
+  next join finds the room by its key. The `fabric-workspaces` project is pinned as the first one created, at runtime and on replay alike. These writes do not go through the user paths, so
+  `max_rooms_per_project` and `max_projects_per_user` do not apply to them.
+- *One workspace per agent, auto-join only.* An auto-joined agent belongs to at most one workspace room. Re-joining the same (machine, name) from
+  a DIFFERENT workspace id answers 409, audits `fabric_join_workspace_changed` and changes nothing (not even the renewal); use another agent name.
+  Re-joining with no workspace changes nothing. An agent that joined before sending a workspace is bound by its first join that carries one.
+  This rule limits only the tokenless path. A workspace room is an ordinary room: the owner can grant ANY other active agent into it (a
+  token-enrolled agent on another machine, a coordinator into several workspace rooms) with the normal grant, add members and guests, invite
+  externals, and change or remove the auto-granted access; those changes survive later auto-joins and a restart. There is deliberately no tokenless
+  way for an agent to enter a room of a different workspace or machine; that would bypass the owner and is a separate decision.
+- *Revocation.* Revoking the agent removes its room access at once and its (machine, name) stays blocked, as above.
+- *Peer assignment and `coordinate`.* `instruct` plus `execute` let a peer hand on a task a PERSON gave it (an agent must pass `parent_task_id` of
+  a task it accepted, rooted in a person's task); they do not let a peer start a task for another peer, and `my-tasks`/`respond` are the person flow.
+  Originating needs `coordinate` or an owner-designated team coordinator, which also needs an attached team. That stays an explicit owner grant.
+- *Client.* `herdr-eng rooms join-fabric NAME` and `join.sh --fabric` read `HERDR_WORKSPACE_ID` (plus `HERDR_TAB_ID`, `HERDR_PANE_ID` and, when set,
+  `HERDR_WORKSPACE_LABEL`) from the environment and send them; `--no-workspace` opts out. The identity file stays `{agent_id, name, machine}`
+  and gains `room_id` when the join landed in a room (with `room_access: false` the clients say "joined, but no access to the workspace room (owner removed
+  it)" and write no `room_id`). The clients sanitise the label (control, format and bidi characters stripped, at most 64) and omit an invalid
+  tab or pane; an invalid workspace id means they join without a workspace. `join.sh` explains each HTTP status with the server's error text.
+  **Deploy order: server first, then clients.** A new client against an older server gets 400 "unknown field": both clients retry ONCE without
+  the workspace fields and say the room was not used. The id and limit rules in `join.sh` are a copy of the server's constants (a test compares them). The dashboard's agents list shows the workspace and room of an auto-joined agent; there is no new UI.
+- ***A YAML edit alone does nothing.*** collab-public reads the RENDERED `collab-config.json`, not the fleet YAML. `auto_join` and the four
+  workspace keys reach it only through `herdr-eng fleet config render-collab` (which validates and carries them) or a deploy that runs it.
+  Check the rendered file before concluding the feature is on.
+
+**The `/herdr::join` skill.** Agents in any harness (Claude Code, Codex, OpenCode, Pi) do not need to remember the command: the `herdr-join` skill (`herdr-eng summary install`, or `--skill herdr-join`) runs `herdr-eng rooms join-fabric NAME --json` with the pane's `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID` and `HERDR_PANE_ID`, then reports the agent id, the room (`<machine>/<workspace id>`) and the `read`/`post`/`instruct`/`execute` grant, and states that `coordinate` and `grant_agent` stay owner-only. `--no-workspace` opts out of the room. It is opt-in per session: **there is deliberately no session-start auto-join hook**; adding one is an owner decision that has not been made. The installer never overwrites an existing skill or command named `herdr-join` and reports it as `preserved`. The `/herdr::join` route in the `herdr` router skill (`join`, action `fabric-join`) is in the herdr-handoff repo.
+
+**Rollback.** An image without this feature rejects the `auto_join` and `workspace_rooms*` keys: remove them from the config BEFORE rolling back. Agents already
+created are then ordinary fabric-bit agents bound to their machine and keep working until their bit expires; revoke them to remove them.
 
 ## 6. Granting `coordinate`
 
@@ -213,6 +316,63 @@ machine, and a fabric-bit agent bound to it can be named by any local process. T
 An image older than slice 6a rejects the new keys. Remove `listen_host`, `listen_port` and `whois_socket` from the config BEFORE rolling the
 image back (the overlay then drops out and the sidecar is stopped).
 
+## 9a. `/herdr::join` setup on an agent host
+
+`herdr-eng rooms join-fabric NAME --json` needs the fabric listener's address. It looks in this order and stops at the first hit
+(`--control-plane URL` on the command always wins):
+
+1. this host's fetched fleet configuration (`control_plane.collab.fabric_trust`; only hosts that carry it);
+2. `fabric_join` in the machine config `~/.config/herdr-engineering/config.yaml`;
+3. the fleet config file on this machine (`~/.config/herdr-engineering/fleet/fleet-config.yaml`, mode 0600, read only).
+
+```yaml
+# ~/.config/herdr-engineering/config.yaml (YAML only; there is no environment variable)
+fabric_join:
+  listen_host: 100.104.39.6          # tailnet address of the fabric listener
+  listen_port: 9483
+  # control_plane_url: http://100.104.39.6:9483   # optional explicit URL, wins over listen_host/listen_port
+  auto_join_on_session_start: false  # true: Claude Code SessionStart hook joins automatically (default false)
+```
+
+`herdr-eng summary install` (also run by `scripts/install.sh`) installs the `herdr-join` skill for Claude Code, Codex, Pi and
+OpenCode, and writes the `fabric_join` listener from the fleet config when it is readable. It is idempotent and never overwrites
+a differing value: it reports `preserved` and names the fleet value instead. The fleet config itself is never modified.
+
+`herdr-eng summary install --check [--skill herdr-join] [--json]` is read-only and exits 1 on a failure. It verifies, per harness, the skill
+symlink points at the canonical copy and the OpenCode `/herdr-join` command exists, that the listener resolves, that it answers (refused is a
+failure; unreachable, for example off the tailnet, is reported but not a failure) and that the hook matches the key. No secret is printed.
+
+**Auto-join (opt-in, off by default).** With `auto_join_on_session_start: true`, install adds one Claude Code `SessionStart` command hook
+to `~/.claude/settings.json`, appended to any hooks already there and recorded in
+`~/.local/share/herdr-engineering/skills/.herdr-join-hooks-manifest.json`; `summary uninstall` and turning the key back to false remove only that
+entry. The hook (`herdr-eng summary join-hook claude`) does nothing outside a HerdR pane (`HERDR_WORKSPACE_ID` unset), names the agent
+`<harness>-<pane>` lower-cased, and always exits 0. No hook is written for the other harnesses: Codex hooks (`~/.codex/hooks.json`) are
+gated by Codex's own hook trust state, which this installer never writes; OpenCode and Pi have no verified session-start hook contract.
+Use `/herdr::join` there. Install reports each as `unsupported` when the key is true.
+
+**Codex needs one execpolicy rule.** Codex runs shell commands in a sandbox with no network, so a join from `codex exec` or the TUI fails with
+"control plane is unreachable" even though the listener is up (verified: the same command succeeds with `--control-plane` once allowed, and
+fails without the rule). When `~/.codex` exists, `herdr-eng summary install` appends exactly one line to `~/.codex/rules/default.rules`:
+
+```
+prefix_rule(pattern=["herdr-eng", "rooms", "join-fabric"], decision="allow")
+```
+
+Codex runs a command matching that prefix outside the sandbox without asking; nothing else changes (`herdr-eng rooms list`, `herdr-eng rooms`,
+`curl ...` do not match, checked with `codex execpolicy check`). It does not set `network_access`, `sandbox_mode` or `approval_policy`, and no other
+rule or config line is touched. It is idempotent, recorded in `~/.local/share/herdr-engineering/skills/.herdr-join-codex-rule-manifest.json`,
+removed by `summary uninstall` (a rule you wrote by hand is adopted and never removed), and shown by `summary install --check` as
+`codex execpolicy rule`. Note the prefix covers any arguments, including `--control-plane URL`: the allowed command is the join CLI itself, which
+only asks tailscaled-attested listeners to register this agent.
+
+**Pi and OpenCode: a dead default model looks like a hang.** Both ship configured with a default model the gateway may not currently serve
+(for example `qwen3.8-27b-modality-vision-quant-q8_k_xl`: the gateway answers 503 `capacity_unavailable`, "Retry after the declared delay").
+OpenCode also uses that model as `small_model` for the session title, and Pi uses it as `defaultModel`; both then wait or print nothing,
+and the join skill never runs. This is not a join bug. Check the live catalog with
+`curl -s https://llm.metabolomics.us/v1/models -H "Authorization: Bearer $KEY"` and pick a served model: Pi `pi -p --model metabolomics/qwen3.8-text ...`
+(or set `defaultModel` in `~/.pi/agent/settings.json`), OpenCode `opencode run -m qwen-turing/deepseek_v4-flash ...` and set `small_model`
+in `~/.config/opencode/opencode.json` to a served model. A reasoning model can take over a minute per turn, so allow several minutes.
+
 ## 10. What NOT to put in `machines`
 
 Never an L4/SNI proxy, a subnet router or an exit node: such a node presents its own tailnet address for traffic that originates elsewhere, so
@@ -232,5 +392,9 @@ All Fabric refusals return the same generic `401 unauthorized`; the reason is in
 | `fabric_machine_unbound` | the agent has no recorded machine or it is bound to another one: re-bind with `POST agents/{id}/fabric` and `machine` |
 | `fabric_not_enabled` | the owner has not set the bit (or cleared it) |
 | `fabric_expired` | the bit's `agent_ttl_seconds` window ended: the owner sets it again |
+| `fabric_auto_join_off` | the agent was auto-joined and `auto_join` is now off (or the feature is disabled): turn `auto_join` back on |
+| `fabric_join_revoked` (join, 403) | that (machine, name) was revoked; it is not resurrected: join under a new name |
+| `fabric_join_rate_limited` / `fabric_join_machine_cap` / `fabric_join_total_cap` (join, 429) | more than 30 new agents an hour, or 200 names (revoked included) from one machine, or 1000 in total |
+| `fabric_join_machine_rebound` (join, 403) | the owner bound that name to another machine; join under another name |
 | 400 on `POST agents/{id}/fabric` | no machine recorded: pass `machine` |
 | 403 `forbidden: only the room owner grants coordinate` | grant `coordinate` as the room owner |

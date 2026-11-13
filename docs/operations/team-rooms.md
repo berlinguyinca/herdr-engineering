@@ -494,8 +494,7 @@ herdr-eng rooms direct-cancel ROOM TASK_ID
 
 ## Not built here
 
-Web UI (the label in `packages/collab-team-rooms.js`, from PR #598 which is not merged, says Direct "acts as Suggest for now" and must change
-when both land), the attention inbox, external actions (slice 5), grants of anything wider than a task, taint inheritance into child
+The attention inbox, a web UI for external actions, grants of anything wider than a task, taint inheritance into child
 tasks (children are refused instead), and any approval step between a guest and an allowed agent (that is what Suggest is for).
 
 external credential reaches is rejected with 401, tested), approval-gated external actions (slice 5), and `direct` guest behaviour.
