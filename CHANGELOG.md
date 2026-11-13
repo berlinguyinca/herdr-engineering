@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Always-on review: two tiers, claude and pi backends (dry-run by default)
+
+- New `deploy/ci-review/always-on-review.py` builds on `ai-review.py`: tier 1 `Open-weight pre-review` (advisory, pi) and tier 2 `Opus agent review` (claude, only for heads with all gates green), pluggable `gateway` / `claude` / `pi` backends chosen in YAML only, strict verdict parsing, one review per head SHA, cooldown, time cap, detached read-only worktree, scrubbed environment. Posting needs `post: true` in config and `--post`. Nothing is installed or enabled; added example config, systemd --user service/timer and a herdr pane tail script. `ai-review.py` gained an optional schema argument on `Gateway.chat` and `Gh.check_runs`.
+
 ### Test fix: cargo target-storage CLI test no longer depends on ambient CARGO_TARGET_DIR
 
 - `test_target_management_cli_enable_and_migration_safety` inherited the host environment; a CI agent exporting `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR` made the migrator report "Explicit target setting remains authoritative" instead of "same filesystem". The test now drops those two variables from the child environment and separately asserts the explicit-override verdict. No production code changed.

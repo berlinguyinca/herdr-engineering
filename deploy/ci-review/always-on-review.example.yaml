@@ -1,0 +1,67 @@
+# always-on-review.py configuration. Copy to ~/.config/herdr-engineering/always-on-review.yaml, pass with --config.
+# YAML only: no environment variables. Unknown keys are refused. No secrets belong here: gh uses its own login, the
+# claude backend uses the operator's Claude Code login, the pi backend uses ~/.pi/agent/models.json.
+#
+# DRY-RUN IS THE DEFAULT. Nothing is posted (no status, no comment) unless `post: true` below AND the command line
+# passes --post. A dry run still runs the reviewers and writes state_dir/reviews.jsonl.
+
+repos:                                   # example: what `poll` watches when no --repo is given
+  - berlinguyinca/herdr-engineering
+state_dir: ~/.local/state/herdr-review   # locks, state.json (cooldowns), reviews.jsonl (one line per review), worktrees/
+post: false                              # key 1 of 2 for posting; key 2 is the --post flag
+clone: ~/IdeaProjects/herdr-engineering  # a clone with `origin` = GitHub; claude/pi get a detached worktree of the PR head
+
+# Tier 2 runs only on a head where EVERY name below is green on that exact SHA (commit status context or check-run
+# name). Empty is refused for tier 2: it must not review heads that are not mergeable. Example names (set yours):
+gates:
+  required:
+    - ci/woodpecker/pr/lint
+    - ci/woodpecker/pr/typecheck
+    - ci/woodpecker/pr/test
+    - ci/woodpecker/pr/build
+    - verify
+    - GitGuardian Security Checks
+
+poll:
+  max_per_run: 5                         # reviews started per poll; one runs at a time (lock), so concurrency is 1
+  pending_stale_minutes: 120             # a pending status older than this (a crashed run) is reviewed again
+  cooldown_failures: 3                   # a PR+tier whose review fails this many times in a row ...
+  cooldown_minutes: 60                   # ... is not retried for this long (the status stays pending meanwhile)
+
+# Backend and model per tier. The backend names a block under `backends:`; `model` is passed to that backend.
+tiers:
+  tier1:                                 # advisory: never posts the required context
+    enabled: true
+    context: Open-weight pre-review
+    backend: pi                          # gateway | claude | pi
+    model: metabolomics/qwen3.8-27b      # pi: provider/alias or id from `pi --list-models` (see README)
+    time_cap_s: 900
+    comment: false                       # true: one marked PR comment when it blocks
+  tier2:                                 # the required check, only for mergeable heads
+    enabled: true
+    context: Opus agent review
+    backend: claude
+    model: opus                          # claude: any --model value (alias or full id)
+    time_cap_s: 1800
+    comment: true                        # one marked PR comment (updated in place) when it blocks
+
+backends:
+  gateway:                               # the OpenAI-compatible call of ai-review.py; same keys as its `reviewer:`
+    pi_provider: metabolomics
+    models_file: ~/.pi/agent/models.json
+    chunk_bytes: 24000
+    thinking: false
+    response_format: json_schema
+    timeout_s: 900
+    deadline_s: 1800
+    retries: 4
+    allow_plain_http_hosts: []
+  claude:
+    command: claude
+    wrapper: []                          # optional prefix, e.g. ["bwrap", "--ro-bind", "/", "/", ...] for a sandbox
+    max_turns: 40
+  pi:
+    command: pi
+    wrapper: []
+    thinking: "off"                      # pi --thinking level
+    diff_bytes: 60000                    # the diff is in the prompt (pi has no shell); cut here

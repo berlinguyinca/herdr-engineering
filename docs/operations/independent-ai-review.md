@@ -70,6 +70,25 @@ next poll.
   because the diff already holds them. A bug that spans files in different chunks can be missed.
 - **Not a human review.** It is no substitute for one, and it does not approve the PR in GitHub's review sense.
 
+## Always-on review (tier 1 and tier 2)
+
+The always-on process (`deploy/ci-review/always-on-review.py`) adds an advisory `Open-weight pre-review` (pi, open
+weights) and the `Opus agent review` (claude, run only on heads whose Woodpecker gates, verify and GitGuardian are all
+green). Both are configured in YAML only; see `deploy/ci-review/README.md` for backends, pi alias selection and the
+security posture.
+
+Operating rules:
+
+- Dry-run is the default. Posting needs `post: true` in the config and `--post` on the command line.
+- Tier 1 never posts the required context. Making `Opus agent review` required is a ruleset change the operator makes
+  separately, after watching dry-run output in `reviews.jsonl`.
+- A review that cannot run (timeout, bad JSON, head moved, gates not green) leaves the status `pending`; it is never
+  turned green or red by guesswork.
+- Install on any host with `gh`, `git`, the `claude` login and pi configured: copy the example config and the
+  `herdr-always-on-review.{service,timer}` units, then `systemctl --user enable --now` the timer. The interim host is
+  beast; a dedicated node later needs only the same files. Watch it with `herdr-review-pane.example.sh` in a herdr pane.
+- Cost: only tier 2 spends Opus tokens, once per green head; `reviews.jsonl` records cost and duration.
+
 ## Limits: advisory strength
 
 - **Prompt injection.** The diff, the PR title and body, and the file contents are untrusted. The model has no

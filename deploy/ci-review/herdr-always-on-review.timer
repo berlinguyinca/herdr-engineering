@@ -1,0 +1,11 @@
+[Unit]
+Description=Look for pull request heads that need an always-on review every five minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Unit=herdr-always-on-review.service
+
+[Install]
+WantedBy=timers.target
