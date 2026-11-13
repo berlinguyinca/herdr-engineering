@@ -1,0 +1,24 @@
+--- link ~/IdeaProjects/herdr-engineering/.claude/worktrees/agent-ae7b3d9d01511ff31/deploy/herdr-agent-ops-plugin
+{"id":"cli:plugin","result":{"plugin":{"actions":[{"command":["herdr-eng","agent-ops","--once","--width","100","--height","30"],"contexts":["global"],"description":"Check control-plane reachability and the agent_ops_v1 capability by printing one frame","id":"doctor","title":"Agent Operations doctor"},{"command":["herdr","plugin","pane","open","herdr.agent-ops","map"],"contexts":["workspace","global"],"description":"Open the Agent Operations map in a split pane","id":"open","title":"Open Agent Operations map"}],"description":"Terminal Agent Operations map: live agent graph, tasks, handoffs, timeline and replay from the control plane","enabled":true,"manifest_path":"~/IdeaProjects/herdr-engineering/.claude/worktrees/agent-ae7b3d9d01511ff31/deploy/herdr-agent-ops-plugin/herdr-plugin.toml","min_herdr_version":"0.9.1","name":"HerdR Agent Operations Map","panes":[{"command":["herdr-eng","agent-ops"],"description":"Live agent activity map (q closes the pane)","id":"map","placement":"split","title":"Agent Operations"},{"command":["herdr-eng","agent-ops","--ascii","--no-animation"],"description":"ASCII, no-animation variant","id":"map-ascii","placement":"split","title":"Agent Operations (ASCII)"}],"platforms":["linux","macos"],"plugin_id":"herdr.agent-ops","plugin_root":"~/IdeaProjects/herdr-engineering/.claude/worktrees/agent-ae7b3d9d01511ff31/deploy/herdr-agent-ops-plugin","source":{"kind":"local"},"version":"0.1.0"},"type":"plugin_linked"}}
+exit=0
+--- list
+1 plugin installed:
+- herdr.agent-ops (HerdR Agent Operations Map) enabled [local:~/IdeaProjects/herdr-engineering/.claude/worktrees/agent-ae7b3d9d01511ff31/deploy/herdr-agent-ops-plugin]
+  config: /private/tmp/claude-501/lp/herdr-home/cfg/herdr/plugins/config/herdr.agent-ops
+exit=0
+--- action list
+{"id":"cli:plugin","error":{"code":"server_not_running","message":"no herdr server is running at /private/tmp/claude-501/lp/herdr-home/h/herdr.sock; run `herdr` to start or attach it"}}
+--- tree
+/private/tmp/claude-501/lp/herdr-home
+/private/tmp/claude-501/lp/herdr-home/state
+/private/tmp/claude-501/lp/herdr-home/state/herdr
+/private/tmp/claude-501/lp/herdr-home/state/herdr/plugins
+/private/tmp/claude-501/lp/herdr-home/state/herdr/plugins/herdr.agent-ops
+/private/tmp/claude-501/lp/herdr-home/h
+/private/tmp/claude-501/lp/herdr-home/cfg
+/private/tmp/claude-501/lp/herdr-home/cfg/herdr
+/private/tmp/claude-501/lp/herdr-home/cfg/herdr/plugins
+/private/tmp/claude-501/lp/herdr-home/cfg/herdr/plugins/config
+/private/tmp/claude-501/lp/herdr-home/cfg/herdr/plugins/config/herdr.agent-ops
+/private/tmp/claude-501/lp/herdr-home/cfg/herdr/.plugins.lock
+/private/tmp/claude-501/lp/herdr-home/cfg/herdr/plugins.json
