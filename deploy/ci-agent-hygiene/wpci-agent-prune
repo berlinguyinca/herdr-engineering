@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Delete dead Woodpecker agent registrations.
+
+Dead means a system agent (owner_id=-1) that either never contacted the server
+and is older than --never-contacted-secs (default 1h), or has had no contact
+and no work for --stale-secs (default 24h). An agent that any pending or
+running workflow in the queue references is never touched, and the server
+itself refuses to delete an agent with a running task. Dry run unless --apply.
+The API token is read from a file and is never printed.
+"""
+import argparse
+import json
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+PAGE = 50
+
+
+def call(server, token, method, path):
+    req = urllib.request.Request(server.rstrip("/") + path, method=method,
+                                 headers={"Authorization": "Bearer " + token})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read()
+    return json.loads(body) if body.strip() else None
+
+
+def list_agents(server, token):
+    agents, page = [], 1
+    while True:
+        rows = call(server, token, "GET", f"/api/agents?perPage={PAGE}&page={page}")
+        agents += rows
+        if len(rows) < PAGE:
+            return agents
+        page += 1
+
+
+def busy_ids(server, token):
+    queue = call(server, token, "GET", "/api/queue/info")
+    tasks = (queue.get("pending") or []) + (queue.get("running") or []) + (queue.get("waiting_on_deps") or [])
+    return {t["agent_id"] for t in tasks if t.get("agent_id", 0) > 0}
+
+
+def verdict(agent, now, busy, never_secs, stale_secs):
+    """Return a delete reason, or None to keep the agent."""
+    if agent["id"] in busy:
+        return None
+    if agent.get("owner_id", -1) != -1 or agent.get("org_id", -1) != -1:
+        return None
+    if agent["last_contact"] == 0:
+        return "never-contacted" if now - agent["created"] > never_secs else None
+    newest = max(agent["last_contact"], agent.get("last_work", 0))
+    return "stale" if now - newest > stale_secs else None
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--server", default="https://ci.metabolomics.us")
+    ap.add_argument("--token-file", default=str(Path.home() / ".config/woodpecker/token"))
+    ap.add_argument("--never-contacted-secs", type=int, default=3600)
+    ap.add_argument("--stale-secs", type=int, default=86400)
+    ap.add_argument("--apply", action="store_true")
+    args = ap.parse_args(argv)
+    token = Path(args.token_file).read_text().strip()
+    now = time.time()
+    agents = list_agents(args.server, token)
+    busy = busy_ids(args.server, token)
+    removed = kept = 0
+    for agent in sorted(agents, key=lambda a: a["id"]):
+        reason = verdict(agent, now, busy, args.never_contacted_secs, args.stale_secs)
+        if reason is None:
+            kept += 1
+            continue
+        label = f"agent_id={agent['id']} name={agent.get('name') or '-'} reason={reason}"
+        if args.apply:
+            # Fresh queue check right before each delete.
+            if agent["id"] in busy_ids(args.server, token):
+                kept += 1
+                continue
+            call(args.server, token, "DELETE", f"/api/agents/{agent['id']}")
+            print("removed " + label)
+        else:
+            print("would-remove " + label)
+        removed += 1
+    print(f"summary scanned={len(agents)} removed={removed} kept={kept} mode={'apply' if args.apply else 'dry-run'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
