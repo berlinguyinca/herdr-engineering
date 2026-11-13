@@ -86,30 +86,36 @@ def freeze_boot_heap() -> int:
 @dataclass(frozen=True)
 class GcTuning:
     """``control_plane.gc`` in the fleet config: collector thresholds plus whether to freeze the boot heap."""
-    gen0: int = 700
-    gen1: int = 10
-    gen2: int = 1000
+    gen0: int
+    gen1: int
+    gen2: int
     freeze: bool = True
 
 
 _GC_KEYS = ("gen0", "gen1", "gen2", "freeze")
+DEFAULT_GEN2 = 1000          # the one deliberate default change: the interpreter's 10 makes full collections frequent
+_GC_MAX = 2**31 - 1          # gc.set_threshold takes C ints; anything larger raises OverflowError
 
 
 def parse_gc_config(section) -> GcTuning:
-    """Parse ``control_plane.gc`` (None = defaults); a malformed block raises ValueError so startup stops."""
-    if section is None:
-        return GcTuning()
-    if not isinstance(section, dict):
+    """Parse ``control_plane.gc`` (None = defaults); a malformed block raises ValueError so startup stops.
+
+    Keys left unset: ``gen0``/``gen1`` keep the running interpreter's values (700 on 3.12, 2000 on 3.13+), so
+    nothing is lowered; ``gen2`` defaults to ``DEFAULT_GEN2`` (1000, interpreter default 10) even with no block.
+    """
+    if section is not None and not isinstance(section, dict):
         raise ValueError("control_plane.gc must be a mapping")
+    section = section or {}
     unknown = sorted(set(section) - set(_GC_KEYS))
     if unknown:
         raise ValueError(f"control_plane.gc: unknown keys {unknown}")
-    values = {}
+    gen0, gen1, _ = gc.get_threshold()
+    values = {"gen0": gen0, "gen1": gen1, "gen2": DEFAULT_GEN2}
     for key in ("gen0", "gen1", "gen2"):
         if key in section:
             v = section[key]
-            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
-                raise ValueError(f"control_plane.gc.{key} must be a positive integer")
+            if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= _GC_MAX:
+                raise ValueError(f"control_plane.gc.{key} must be an integer between 1 and {_GC_MAX}")
             values[key] = v
     if "freeze" in section:
         if not isinstance(section["freeze"], bool):

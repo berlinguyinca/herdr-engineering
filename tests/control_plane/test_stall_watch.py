@@ -66,8 +66,25 @@ def test_freeze_boot_heap_moves_live_objects_out_of_the_collector():
         del keep
 
 
-def test_parse_gc_config_defaults_and_overrides():
-    assert stall_watch.parse_gc_config(None) == stall_watch.GcTuning(700, 10, 1000, True)
+def test_parse_gc_config_defaults_keep_the_interpreters_gen0_gen1_and_raise_gen2():
+    gen0, gen1, _ = gc.get_threshold()
+    assert stall_watch.parse_gc_config(None) == stall_watch.GcTuning(gen0, gen1, 1000, True)
+    assert stall_watch.parse_gc_config({"gen2": 50}) == stall_watch.GcTuning(gen0, gen1, 50, True)
+
+
+def test_parse_gc_config_defaults_follow_the_running_interpreter():
+    saved = gc.get_threshold()
+    try:
+        gc.set_threshold(2000, 7, 3)
+        assert stall_watch.parse_gc_config(None) == stall_watch.GcTuning(2000, 7, 1000, True)
+    finally:
+        gc.set_threshold(*saved)
+
+
+def test_parse_gc_config_rejects_values_gc_set_threshold_cannot_hold():
+    with pytest.raises(ValueError, match=r"control_plane\.gc\.gen2"):
+        stall_watch.parse_gc_config({"gen2": 2**31})
+    assert stall_watch.parse_gc_config({"gen2": 2**31 - 1}).gen2 == 2**31 - 1
     got = stall_watch.parse_gc_config({"gen0": 500, "gen1": 5, "gen2": 4000, "freeze": False})
     assert got == stall_watch.GcTuning(500, 5, 4000, False)
 
@@ -95,6 +112,7 @@ def test_tune_gc_freezes_boot_heap_and_applies_thresholds(caplog):
 
 
 def test_tune_gc_without_freeze_keeps_heap_collectable():
+    gc.unfreeze()                      # order-independent: an earlier in-process web start may have frozen the heap
     saved = gc.get_threshold()
     try:
         assert stall_watch.tune_gc(stall_watch.GcTuning(700, 10, 1000, False)) == 0

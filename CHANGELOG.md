@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Web: configurable GC thresholds, boot-heap freeze (`control_plane.gc`)
+
+- `control_plane.gc: {gen0, gen1, gen2, freeze}` tunes the collector at web start (restart required). Keys left unset: `gen0`/`gen1` keep the running interpreter's values; `gen2` defaults to 1000.
+- Behaviour change with no `gc` block at all: the default `gen2` goes from 10 to 1000, and the boot heap is frozen. Rollback: `gc: {gen2: 10, freeze: false}` in the fleet YAML.
+- Values must be integers from 1 to 2147483647; a bad block stops startup with `--fleet-config: control_plane.gc...`.
+
 ### Inspector snapshot boot: used on the complete-replay fallback, strictly validated
 
 - With projection checkpoints on (the default), a missing or rejected checkpoint fell back to a complete replay that ignored `inspector_snapshots` and re-ran every stored inspector row through redaction. That fallback now hands the stored snapshot to the repo, which verifies it by count and ordering and replays everything on any doubt.
