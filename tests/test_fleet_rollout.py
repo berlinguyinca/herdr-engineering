@@ -682,6 +682,38 @@ def test_busy_maintenance_retries_once_next_pass_with_new_operation(tmp_path, ac
     )
 
 
+def test_reload_blocked_by_runtime_update_lock_retries_next_pass(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    original = wire.maintenance
+    attempts = []
+
+    def lock_busy_once(target, root, instance, request):
+        if request["action"] == "reload":
+            attempts.append(request["operationId"])
+            if len(attempts) == 1:
+                return {
+                    "maintenance": {
+                        "operationId": request["operationId"],
+                        "action": "reload",
+                        "status": "failed",
+                        "error": "Pi Engineering runtime update already in progress.",
+                    }
+                }
+        return original(target, root, instance, request)
+
+    wire.maintenance = lock_busy_once
+    first = apply(store, plan, wire)
+    state = first["hosts"]["bender"]["sessions"]["bender-conversation"]
+    assert state["status"] == "pending"
+    second = apply(store, plan, wire)
+    assert len(attempts) == 2 and attempts[0] != attempts[1]
+    assert (
+        second["hosts"]["bender"]["sessions"]["bender-conversation"]["status"]
+        == "awaiting_progress"
+    )
+
+
 def test_stale_fence_code_retries_with_fresh_revision_and_generation(tmp_path):
     store, plan = setup_rollout(tmp_path)
     wire = Wire()

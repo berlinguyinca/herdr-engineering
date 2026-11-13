@@ -493,6 +493,13 @@ def _retryable_skip(receipt):
     )
 
 
+def _update_lock_busy(receipt):
+    """A failed reload that never started because another runtime update held the lock."""
+    result = receipt.get("result") or {}
+    text = str(receipt.get("error") or result.get("error") or "")
+    return receipt["status"] == "failed" and "runtime update already in progress" in text
+
+
 def _archive_operation(state, key):
     state.setdefault("retryReceipts", []).append(state["operations"].pop(key))
 
@@ -545,7 +552,8 @@ def _session(plan, state, transport, target, root, save):
             save,
         )
         if receipt["status"] != "succeeded":
-            if _retryable_skip(receipt):
+            if _retryable_skip(receipt) or _update_lock_busy(receipt):
+                # The install-root update lock is transient; retry with a new operation.
                 _archive_operation(state, "reload")
                 state["status"] = "pending"
             else:
