@@ -21,6 +21,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - Migration 0053 prepares an empty LIST-partitioned copy of `fabric_events` (inspector partition plus default); nothing moves automatically. New `control_plane.fabric_partitioning` config (YAML only, validated in `fleet_config.py`) and `control-plane fabric-partition status|backfill|cutover|rollback|drop-old`: resumable keyset backfill, one-transaction cutover with a bounded lock and exact catch-up, and a rollback that carries post-cutover writes back. `control-plane checkpoint` skips the CONCURRENTLY index on a partitioned journal. See `docs/operations/fabric-events-partitioning.md`.
 
+### Rakazo bridge: `open_owner_allowed_sources` (default unchanged)
+- New optional `control_plane.rakazo_bridge.open_owner_allowed_sources` (up to 64 IPs or CIDRs, default empty): when non-empty, `open_owner` also requires the resolved client address to be in the list, else the usual 403. `X-Forwarded-For` is believed only from loopback or `trusted_proxies`, as before. Invalid entries refuse startup. Lets a one-person setup keep a shared-in guest tailnet node from getting an owner session. Tests: `tests/control_plane/test_rakazo_bridge.py`.
+
 ### Rakazo bridge: `open_owner_origins` (default unchanged)
 - New optional `control_plane.rakazo_bridge.open_owner_origins` (list of 1-8 `scheme://[host]` strings, default `["rakazo://"]`): the exact `Origin` values `open_owner` accepts, so a second native app can use it. http/https, wildcards, whitespace and duplicates are refused at startup; every other guard (network allowlist, proxy checks, 30s interval, operator account) is unchanged. Tests: `tests/control_plane/test_rakazo_bridge.py`.
 
