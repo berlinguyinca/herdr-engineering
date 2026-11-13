@@ -27,8 +27,18 @@ class HandoffDependencyResult:
 
 
 def _advertises(help_text: str, command: str) -> bool:
-    """Whether `--help` really lists the command, not merely mentions the word somewhere."""
-    return re.search(rf"(?:^|\s){re.escape(command)}(?:\s|$)", help_text, re.MULTILINE) is not None
+    """Whether the CLI's own help really offers this command.
+
+    argparse lists subcommands as one brace group on the usage line
+    (`{create,inspect,...,takeover,confirm}`), so matching "word at start of line" reads the newest CLI
+    as missing the commands it just gained.  The choices are read out of that group when it exists, and
+    a word-boundary search (which ignores `herdr-handoff` and `--flags`) covers help that spells the
+    commands out some other way.
+    """
+    for group in re.findall(r"\{([A-Za-z0-9][A-Za-z0-9,_\- ]*)\}", help_text):
+        if command in [choice.strip() for choice in group.split(",")]:
+            return True
+    return re.search(rf"(?<![\w-]){re.escape(command)}(?![\w-])", help_text) is not None
 
 
 def _probe_cli(path: str) -> tuple[str, dict[str, bool]]:
@@ -65,12 +75,15 @@ def check_handoff_dependency(*, skill_root: Path | None = None,
                for skill in ("herdr", "herdr-handoff", "herdr-artifact")
                if not (path.parent / skill / "SKILL.md").is_file()]
     resolved = shutil.which("herdr-handoff") if executable == "auto" else executable
+    version, capabilities = _probe_cli(resolved) if resolved else ("", {})
     if missing or not resolved:
+        # Report the version even here: an operator fixing missing skills needs to know which CLI the
+        # skills are supposed to match.
         missing_text = f"missing skills: {', '.join(missing)}" if missing else "all Herdr skills present"
-        cli_text = "herdr-handoff CLI missing" if not resolved else f"CLI: {resolved}"
-        return HandoffDependencyResult("fail", f"{missing_text}; {cli_text}", missing, resolved)
-
-    version, capabilities = _probe_cli(resolved)
+        cli_text = ("herdr-handoff CLI missing" if not resolved
+                    else f"CLI: {resolved}" + (f" ({version})" if version else ""))
+        return HandoffDependencyResult("fail", f"{missing_text}; {cli_text}", missing, resolved,
+                                       version, capabilities)
     problems: list[str] = []
     if not capabilities:
         problems.append(f"CLI at {resolved} could not be run to check its commands")

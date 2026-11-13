@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from herdr_engineering.handoff_dependency import CLI_COMMANDS, HARNESS_DIRS, \
     check_handoff_dependency
 
@@ -18,6 +20,7 @@ def test_handoff_dependency_names_the_harness_missing_a_skill(tmp_path: Path):
     result = check_handoff_dependency(skill_root=tree,
                                      executable=_fake_cli(tmp_path, version="0.3.0", commands=CLI_COMMANDS))
     assert result.status == "fail" and "pi:herdr-handoff" in result.detail
+    assert result.version == "0.3.0"   # the skills are meant to match this CLI, so say which one it is
 
 
 def test_strict_dependency_fails_when_cli_or_skill_is_missing(tmp_path: Path):
@@ -35,16 +38,30 @@ def _skills_tree(root: Path) -> Path:
     return root
 
 
-def _fake_cli(tmp_path: Path, *, version: str, commands: tuple[str, ...]) -> str:
-    """A real executable that answers --version/--help the way a herdr-handoff release does."""
-    path = tmp_path / f"herdr-handoff-{version}"
-    body = "#!/bin/sh\ncase \"$1\" in\n"
-    body += f"  --version) printf '{version}\\n' ;;\n"
-    body += '  --help) printf "usage: herdr-handoff <command>\\n\\ncommands:\\n"\n'
-    for command in commands:
-        body += f'    printf "  {command} [--id X]   description\\n"\n'
-    body += "    ;;\nesac\n"
-    path.write_text(body)
+def _fake_cli(tmp_path: Path, *, version: str, commands: tuple[str, ...],
+              style: str = "argparse") -> str:
+    """A real executable that answers --version/--help the way a herdr-handoff release does.
+
+    `argparse` is the shape the shipped CLI actually prints (one brace group on the usage line);
+    `listed` is a hand-written help that spells the commands out one per line, so both spellings get
+    exercised.
+    """
+    path = tmp_path / f"herdr-handoff-{version}-{style}"
+    choices = ",".join(commands)
+    if style == "argparse":
+        help_text = (f"usage: herdr-handoff [-h] [--version] [--root ROOT]\n"
+                     f"                     {{{choices}}} ...\n"
+                     "\npositional arguments:\n"
+                     f"  {{{choices}}}\n"
+                     "\noptions:\n"
+                     "  -h, --help            show this help message and exit\n")
+    else:
+        help_text = "usage: herdr-handoff <command>\n\ncommands:\n" + "".join(
+            f"  {command} [--id X]   description\n" for command in commands)
+    path.write_text("#!/usr/bin/env python3\nimport sys\n"
+                    f"HELP = {help_text!r}\n"
+                    f"if \"--version\" in sys.argv: print({version!r})\n"
+                    "elif \"--help\" in sys.argv: print(HELP, end=\"\"), sys.exit(0)\n")
     path.chmod(0o755)
     return str(path)
 

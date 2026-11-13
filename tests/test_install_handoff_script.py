@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+import pytest
+
 REPO = Path(__file__).parents[1]
 SCRIPT = REPO / "scripts" / "install-handoff.sh"
 LOCK = REPO / "lock" / "upstreams.yaml"
@@ -25,11 +27,32 @@ def pinned_revision() -> str:
     return re.search(r'revision:\s*"?([0-9a-f]{7,40})"?', block).group(1)
 
 
+_TMP_HOME: list[str] = []
+
+
+def tmp_path_home() -> str | None:
+    """The home the script may write to - always a temp dir, never the operator's real one."""
+    return _TMP_HOME[-1] if _TMP_HOME else None
+
+
 def run_script(*args, env=None, expect=0):
+    base = {"HOME": str(tmp_path_home()) if tmp_path_home() else os.environ["HOME"]}
     result = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True,
-                            env={**os.environ, **(env or {})}, check=False)
+                            env={**os.environ, **base, **(env or {})}, check=False)
     assert result.returncode == expect, f"exit {result.returncode}\nSTDOUT\n{result.stdout}\nSTDERR\n{result.stderr}"
     return result
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    # install-handoff.sh writes under $HOME by default; a test must never reach the operator's real
+    # ~/.local/bin or skill directories.
+    home = tmp_path / "home"
+    home.mkdir()
+    _TMP_HOME.append(str(home))
+    monkeypatch.setenv("HOME", str(home))
+    yield
+    _TMP_HOME.pop()
 
 
 def _upstream(tmp_path: Path, revision_marker: str) -> tuple[Path, str]:
@@ -130,3 +153,63 @@ def test_an_unreachable_revision_fails_loudly(tmp_path):
                                                         "HERDR_HANDOFF_CACHE": str(tmp_path / "cache"),
                                                         "HERDR_HANDOFF_SKILL_ROOT": str(tmp_path / "harness-homes")})
     assert "ffffffff" in result.stderr
+
+
+def test_a_python_that_refuses_pip_falls_back_to_uv(tmp_path):
+    # The macOS hosts this runs on carry a Homebrew python that is externally managed, and keep tools
+    # under ~/.local/share/uv/tools; failing the whole install there would be a dead end when uv is the
+    # working path.
+    bare, sha = _upstream(tmp_path, "revision A")
+    python = tmp_path / "python3"
+    python.write_text('#!/bin/sh\nif [ "$2" = "pip" ]; then echo "error: externally-managed-environment" >&2; exit 1; fi\n'
+                      'exit 0\n')
+    python.chmod(0o755)
+    uv = tmp_path / "uv"
+    uv.write_text('#!/bin/sh\nprintf "uv %s\\n" "$*" >> "' + str(tmp_path / 'uv.log') + '"\n'
+                  'printf "%s\\n" "$@"\n')
+    uv.chmod(0o755)
+    result = run_script(env={"HERDR_HANDOFF_URL": str(bare), "HERDR_HANDOFF_REF": sha,
+                             "HERDR_HANDOFF_CACHE": str(tmp_path / "cache"),
+                             "HERDR_HANDOFF_SKILL_ROOT": str(tmp_path / "harness-homes"),
+                             "HERDR_HANDOFF_PYTHON": str(python),
+                             "PATH": f"{tmp_path}:/usr/bin:/bin",
+                             "HERDR_HANDOFF_NO_PATH_LINK": "1"})
+    log = (tmp_path / "uv.log").read_text()
+    assert "tool install" in log and str(tmp_path / "cache") in log, (log, result.stdout, result.stderr)
+    assert "externally-managed-environment" in result.stderr + result.stdout
+    assert "herdr-handoff" in result.stdout
+
+
+def test_no_pip_and_no_uv_stops_instead_of_losing_the_install(tmp_path):
+    bare, sha = _upstream(tmp_path, "revision A")
+    python = tmp_path / "python-no-pip"
+    python.write_text('#!/bin/sh\nif [ "$2" = "pip" ]; then echo "no pip" >&2; exit 1; fi\nexit 0\n')
+    python.chmod(0o755)
+    result = run_script(env={"HERDR_HANDOFF_URL": str(bare), "HERDR_HANDOFF_REF": sha,
+                             "HERDR_HANDOFF_CACHE": str(tmp_path / "cache"),
+                             "HERDR_HANDOFF_SKILL_ROOT": str(tmp_path / "harness-homes"),
+                             "HERDR_HANDOFF_PYTHON": str(python),
+                             "PATH": "/usr/bin:/bin",
+                             "HERDR_HANDOFF_NO_PATH_LINK": "1"}, expect=1)
+    assert "--skills-only" in result.stderr
+
+
+def test_the_path_link_never_points_the_entrypoint_at_itself(tmp_path):
+    # This ran once against the real ~/.local/bin: the uv tool's shim is already the PATH entry, and
+    # `ln -sf` onto itself produced `herdr-handoff -> herdr-handoff`, leaving a working CLI answering
+    # "Too many levels of symbolic links".
+    home = tmp_path / "home"
+    uv_bin = home / ".local" / "share" / "uv" / "tools" / "herdr-handoff" / "bin"
+    uv_bin.mkdir(parents=True)
+    shim = uv_bin / "herdr-handoff"
+    shim.write_text("#!/bin/sh\necho the uv tool shim\n")
+    shim.chmod(0o755)
+    bare, sha = _upstream(tmp_path, "revision A")
+    # The PATH directory *is* the directory the CLI already lives in.
+    result = run_script("--skills-only", env={"HERDR_HANDOFF_URL": str(bare), "HERDR_HANDOFF_REF": sha,
+                                              "HERDR_HANDOFF_CACHE": str(tmp_path / "cache"),
+                                              "HERDR_HANDOFF_SKILL_ROOT": str(tmp_path / "harness-homes"),
+                                              "HERDR_LOCAL_BIN": str(uv_bin), "PATH": "/usr/bin:/bin"})
+    assert shim.is_file() and not shim.is_symlink(), result.stdout + result.stderr
+    assert shim.read_text().startswith("#!/bin/sh\necho the uv tool shim")
+    assert "leaving PATH alone" in result.stderr, result.stdout + result.stderr

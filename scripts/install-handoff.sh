@@ -12,7 +12,8 @@
 # Usage:
 #   scripts/install-handoff.sh                  install/refresh the pinned revision (CLI + skills + PATH)
 #   scripts/install-handoff.sh --plan           print what WOULD be used; touch nothing
-#   scripts/install-handoff.sh --skills-only    skip the CLI install (e.g. hosts that install it with uv)
+#   scripts/install-handoff.sh --skills-only    skip the CLI install (a CLI installed with uv is still
+#                                               linked into PATH by step 4)
 #   scripts/install-handoff.sh --no-path-link   do not touch ~/.local/bin
 #   scripts/install-handoff.sh --migrate-copies replace skill directories that are plain copies of an
 #                                               earlier herdr-handoff install, backing each one up first
@@ -52,6 +53,7 @@ UPSTREAM="${HERDR_HANDOFF_URL:-https://github.com/berlinguyinca/herdr-handoff.gi
 CACHE="${HERDR_HANDOFF_CACHE:-$HOME/.local/share/herdr-handoff/$HERDR_HANDOFF_REF}"
 PYTHON="${HERDR_HANDOFF_PYTHON:-python3}"
 LINK_DIR="${HERDR_LOCAL_BIN:-$HOME/.local/bin}"
+if [ "${HERDR_HANDOFF_NO_PATH_LINK:-0}" = 1 ]; then PATH_LINK=0; fi
 
 if [ "$PLAN" = 1 ]; then
   printf 'pin: %s\nupstream: %s\ncache: %s\npython: %s\nskills: %s\npath_link: %s\n' \
@@ -90,15 +92,30 @@ printf 'pin: %s\nresolved: %s\ncache: %s\n' "$HERDR_HANDOFF_REF" "$have" "$CACHE
 
 # --- 2. the CLI, into the interpreter the caller names -------------------------------------------------
 if [ "$SKILLS_ONLY" = 0 ]; then
+  # The macOS hosts this runs on carry a Homebrew python that is externally managed and keep tools under
+  # ~/.local/share/uv/tools, so a refused pip is a detour there, not a reason to lose the install.
+  installed=0
   if "$PYTHON" -m pip --version >/dev/null 2>&1; then
-    "$PYTHON" -m pip install --quiet --upgrade "$CACHE"
-    printf 'cli: pip install --upgrade %s (%s)\n' "$CACHE" "$PYTHON"
-  elif command -v uv >/dev/null 2>&1; then
-    # hosts that keep tools under ~/.local/share/uv/tools have no pip in the picture at all
+    if pip_report="$("$PYTHON" -m pip install --quiet --upgrade "$CACHE" 2>&1)"; then
+      printf 'cli: pip install --upgrade %s (%s)\n' "$CACHE" "$PYTHON"
+      installed=1
+    fi
+  else
+    # keep the reason pip is unusable; "no pip" and "externally-managed-environment" send the operator
+    # to different fixes.
+    pip_report="$("$PYTHON" -m pip --version 2>&1 || true)"
+    [ -n "$pip_report" ] || pip_report="$PYTHON has no pip module"
+  fi
+  if [ "$installed" = 0 ] && command -v uv >/dev/null 2>&1; then
+    printf 'pip did not install it (%s); using uv\n' "$(printf '%s' "$pip_report" | tail -n 1)" >&2
     uv tool install --force --reinstall "$CACHE" >/dev/null
     printf 'cli: uv tool install --force %s\n' "$CACHE"
-  else
-    printf 'no pip in %s and no uv on PATH; install the CLI with --skills-only and your own tooling\n' "$PYTHON" >&2
+    installed=1
+  fi
+  if [ "$installed" = 0 ]; then
+    printf '%s\n' "$pip_report" >&2
+    printf 'no usable installer: pip failed and no uv on PATH. Install the CLI with your own tooling\n' >&2
+    printf 'and re-run this with --skills-only.\n' >&2
     exit 1
   fi
 fi
@@ -131,15 +148,28 @@ case "$skill_report" in
 esac
 
 # --- 4. PATH ------------------------------------------------------------------------------------------------
-if [ "$PATH_LINK" = 1 ] && [ "$SKILLS_ONLY" = 0 ]; then
-  if command -v herdr-handoff >/dev/null 2>&1; then
+if [ "$PATH_LINK" = 1 ]; then
+  # Linking the entrypoint that already IS the PATH entry turns it into a self-referencing symlink
+  # (`Too many levels of symbolic links`), which is how this ran once and broke a working uv tool shim.
+  # So a candidate is only linked when it is not the destination, and success is stated only when a link
+  # was actually made.
+  destination="$LINK_DIR/herdr-handoff"
+  if command -v herdr-handoff >/dev/null 2>&1 && [ "$(command -v herdr-handoff)" != "$destination" ]; then
     printf 'cli on PATH: %s (%s)\n' "$(command -v herdr-handoff)" "$(herdr-handoff --version 2>/dev/null || echo unknown)"
-  elif [ -w "$LINK_DIR" ] || mkdir -p "$LINK_DIR" 2>/dev/null; then
-    for candidate in "$(dirname "$PYTHON")/herdr-handoff" "$HOME/.local/bin/herdr-handoff"; do
-      [ -x "$candidate" ] && ln -sf "$candidate" "$LINK_DIR/herdr-handoff" && break
-    done
-    printf 'path: %s\n' "$LINK_DIR/herdr-handoff"
   else
-    printf 'not writable, leaving PATH alone: %s\n' "$LINK_DIR" >&2
+    linked=""
+    for candidate in "$(dirname "$PYTHON")/herdr-handoff" \
+                     "$HOME/.local/share/uv/tools/herdr-handoff/bin/herdr-handoff"; do
+      [ -x "$candidate" ] || continue
+      [ "$(cd "$(dirname "$candidate")" && printf '%s/%s\n' "$(pwd)" "$(basename "$candidate")")" = "$destination" ] && continue
+      if [ -d "$LINK_DIR" ] || mkdir -p "$LINK_DIR" 2>/dev/null; then
+        ln -sf "$candidate" "$destination" && linked="$candidate" && break
+      fi
+    done
+    if [ -n "$linked" ]; then
+      printf 'path: %s -> %s\n' "$destination" "$linked"
+    else
+      printf 'no separate entrypoint to link into %s; leaving PATH alone\n' "$LINK_DIR" >&2
+    fi
   fi
 fi
