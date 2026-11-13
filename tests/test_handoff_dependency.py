@@ -66,7 +66,9 @@ def _fake_cli(tmp_path: Path, *, version: str, commands: tuple[str, ...],
     return str(path)
 
 
-REQUIRED = ("handoff", "receive", "takeover", "confirm")
+# What `herdr-eng` invokes; the real 0.3.0 CLI offers
+# {create,inspect,list,transition,resume,sync,launch,takeover,confirm}.
+REQUIRED = ("create", "launch", "takeover", "confirm")
 
 
 def test_the_cli_is_checked_for_the_commands_we_actually_call(tmp_path):
@@ -86,7 +88,7 @@ def test_a_cli_without_takeover_is_reported_as_the_gap_it_is(tmp_path):
     tree = _skills_tree(tmp_path)
     result = check_handoff_dependency(skill_root=tree, required_commands=REQUIRED,
                                      executable=_fake_cli(tmp_path, version="0.2.0",
-                                                          commands=("handoff", "receive")))
+                                                          commands=("create", "launch")))
     assert result.status == "fail"
     assert "takeover" in result.detail and "confirm" in result.detail
     assert "0.2.0" in result.detail
@@ -96,7 +98,7 @@ def test_a_cli_without_takeover_is_reported_as_the_gap_it_is(tmp_path):
 def test_the_capability_probe_does_not_invent_commands(tmp_path):
     tree = _skills_tree(tmp_path)
     result = check_handoff_dependency(skill_root=tree, required_commands=(),
-                                     executable=_fake_cli(tmp_path, version="0.3.0", commands=("handoff",)))
+                                     executable=_fake_cli(tmp_path, version="0.3.0", commands=("create",)))
     assert result.status == "ok"       # nothing was required of it
     assert result.capabilities["takeover"] is False
 

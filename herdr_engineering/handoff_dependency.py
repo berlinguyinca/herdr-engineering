@@ -10,10 +10,12 @@ from typing import Sequence
 
 HARNESS_DIRS = ("codex", "claude", "pi", "opencode")
 
-# The flows `herdr-eng` drives through the CLI.  They are checked by name rather than inferred from the
-# binary existing: takeover and the successor's confirm arrived in herdr-handoff v0.3.0, and a host pinned
-# to v0.2.0 has a CLI that satisfies an existence check and cannot honour a takeover close.
-CLI_COMMANDS = ("handoff", "receive", "takeover", "confirm")
+# The flows `herdr-eng` drives through the CLI, taken from what it actually invokes
+# (`herdr-engineering/skill_data/handoff/SKILL.md`: create, then launch; plus takeover and the
+# successor's confirm).  They are checked by name rather than inferred from the binary existing:
+# takeover and confirm arrived in herdr-handoff v0.3.0, and a host pinned to v0.2.0 has a CLI that
+# satisfies an existence check and cannot honour a takeover close.
+CLI_COMMANDS = ("create", "launch", "takeover", "confirm")
 
 
 @dataclass(frozen=True)
