@@ -1,5 +1,7 @@
 # ci-review: the `Independent AI review` status
 
+> As of 2026-11-13 the required status is `Opus agent review`, posted by a Claude session; this script's status is advisory. See `docs/operations/independent-ai-review.md`.
+
 The repository ruleset requires a commit status named exactly `Independent AI review`. `ai-review.py` posts it.
 Before this script, the operator posted it by hand. Operator guide: `docs/operations/independent-ai-review.md`.
 
