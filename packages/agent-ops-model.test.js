@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   agentOpsEnabled, altTable, buildTimeline, contextInfo, cursorTime, describeEdge, describeNode, diffSnapshots, edgeId, edgeStyle, filterOptions, filterSnapshot,
-  indexAtFraction, layoutScene, hostStrip, driftItems, TIMELINE_CAP, modeKinds, neighbour, nextIndex, replayFrame, ringGeometry, stateInfo, stepDelay, NODE_R, RING_R, HALO_R,
+  indexAtFraction, layoutScene, hostStrip, driftItems, TIMELINE_CAP, modeKinds, neighbour, nextIndex, replayFrame, ringGeometry, stateInfo, stepDelay, NODE_R, RING_R, HALO_R, estimateTextWidth,
 } from './agent-ops-model.js';
 
 const agent = (id, over = {}) => ({ node_id: id, agent_id: id, session_id: id, host_id: 'h1', provider: null, model: 'opus', model_changes: [], state: 'idle',
@@ -380,4 +380,29 @@ test('drift and model switches are node signals of their own, distinct from hand
   const [c, o] = layoutScene(snap).nodes;
   assert.equal(c.hasDrift, true); assert.equal(c.switchedFrom, 'sonnet'); assert.equal(o.hasDrift, false); assert.equal(o.switchedFrom, null);
   assert.match(describeNode(c), /drift signal \(heuristic\)/); assert.match(describeNode(c), /model switched from sonnet/);
+});
+
+const denseGraph = (agents, edges) => ({
+  ...SNAP, rooms: [], tasks: [],
+  agents: Array.from({ length: agents }, (_, i) => agent(`d${String(i).padStart(2, '0')}`, { room_ids: [`r${i % 4}`] })),
+  edges: Array.from({ length: edges }, (_, i) => {
+    const from = (i * 7) % agents, to = (from + 1 + ((i * 13) % (agents - 1))) % agents;
+    return edge(i % 2 ? 'communication' : 'delegation', `d${String(from).padStart(2, '0')}`, `d${String(to).padStart(2, '0')}`, 'accepted', { event_id: `ev${i}`, label: `msg ${i}` });
+  }),
+});
+
+test('layoutScene stays fast on a maxed-out graph (60 agents, 2000 edges)', () => {
+  const snap = denseGraph(60, 2000);
+  for (let run = 0; run < 3; run += 1) {
+    const t0 = performance.now();
+    layoutScene(snap);
+    const ms = performance.now() - t0;
+    assert.ok(ms < 250, `layoutScene took ${ms.toFixed(0)}ms (run ${run})`);
+  }
+});
+
+test('estimateTextWidth counts CJK and emoji as full-width glyphs', () => {
+  assert.equal(estimateTextWidth('漢', 10), 10);
+  assert.equal(estimateTextWidth('🚀', 10), 10);
+  assert.equal(estimateTextWidth('a', 10), 5.8);
 });
