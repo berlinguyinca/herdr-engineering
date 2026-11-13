@@ -1,0 +1,77 @@
+name: Agent communications
+
+on:
+  pull_request:
+    paths:
+      - 'herdr_engineering/**'
+      - 'packages/**'
+      - 'tests/**'
+      - 'scripts/build-communications.sh'
+      - 'tsconfig.communications.json'
+      - 'playwright.communications.config.ts'
+      - '.coveragerc-communications'
+      - '.github/workflows/agent-communications.yml'
+      - 'package*.json'
+  workflow_dispatch:
+
+concurrency:
+  group: agent-communications-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17.6
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: herdr_comm_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      HERDR_COMMUNICATION_TEST_DSN: postgresql://postgres:ci-only-password@127.0.0.1:5432/herdr_comm_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install dependencies and pinned native HerdR
+        run: |
+          python -m pip install -e '.[dev,collab,review-gate,federation]' ruff==0.14.5 pytest-cov==7.0.0 coverage==7.13.1 mypy==1.18.2 types-PyYAML==6.0.12.20261103 build==1.3.0
+          npm ci --ignore-scripts
+          npx playwright install --with-deps chromium
+          mkdir -p "$RUNNER_TEMP/herdr-native"
+          curl -fL --retry 3 https://github.com/herdrdev/herdr/releases/download/v0.9.1/herdr-linux-x86_64 -o "$RUNNER_TEMP/herdr-native/herdr"
+          echo "2a02fed16beb651ef006e1d43f048f652ca4dc58ad053cd2d44450563d5c54b7  $RUNNER_TEMP/herdr-native/herdr" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/herdr-native/herdr"
+          echo "$RUNNER_TEMP/herdr-native" >> "$GITHUB_PATH"
+      - name: Lint, format and type-check
+        run: |
+          ruff check herdr_engineering/communications.py herdr_engineering/control_plane/communications.py herdr_engineering/herdr_adapter.py herdr_engineering/control_plane/api.py herdr_engineering/control_plane/repo.py herdr_engineering/control_plane/ingest.py herdr_engineering/control_plane/projection_history.py tests/test_communications.py tests/control_plane/test_communications.py tests/control_plane/test_communications_postgres.py tests/playwright/communications-server.py
+          ruff format --check herdr_engineering/communications.py herdr_engineering/control_plane/communications.py tests/test_communications.py tests/control_plane/test_communications.py tests/control_plane/test_communications_postgres.py tests/playwright/communications-server.py
+          mypy --follow-imports=silent --ignore-missing-imports --check-untyped-defs --disallow-untyped-defs herdr_engineering/communications.py herdr_engineering/control_plane/communications.py
+          bash scripts/build-communications.sh
+          npx tsc --noEmit --strict --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --types node playwright.communications.config.ts tests/playwright/communications.spec.ts
+          git diff --exit-code -- packages/communications-view.js
+      - name: Unit, integration and native smoke with coverage
+        run: |
+          mkdir -p .superpowers
+          python -m pytest -q -m 'not e2e' tests/test_communications.py tests/control_plane/test_communications.py tests/control_plane/test_communications_postgres.py --cov --cov-config=.coveragerc-communications --cov-report=term-missing --cov-report=json:.superpowers/communications-coverage.json
+          python scripts/ci/check-cargo-coverage.py .superpowers/communications-coverage.json
+          python -m pytest -q tests/test_herdr_adapter.py tests/control_plane/test_api.py tests/control_plane/test_summary_fix.py tests/control_plane/test_ci_debug.py tests/test_pi_recovery.py
+      - name: Real browser E2E and component coverage
+        run: |
+          npx playwright test -c playwright.communications.config.ts
+          NODE_V8_COVERAGE=.superpowers/communications-v8 node --test packages/communications-view.test.js
+          npx c8 report --temp-directory=.superpowers/communications-v8 --include=packages/communications-view.js --reports-dir=.superpowers/communications-js-coverage --reporter=text --check-coverage --lines=80 --branches=80 --functions=80 --statements=80
+      - name: Build distributable
+        run: python -m build --wheel
