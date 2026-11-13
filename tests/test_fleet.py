@@ -559,3 +559,28 @@ def test_fleet_status_reports_summary_skill_state_without_gating(tmp_path, monke
         host = fleet.fleet_status()['hosts'][0]
         assert host['summary'] == expected
         assert host['build_gate'] == 'b' * 32 and host['pi_path'] == '/p'
+
+
+def test_update_refreshes_the_pinned_handoff_dependency(tmp_path, monkeypatch):
+    # herdr-handoff is a required dependency pinned in lock/upstreams.yaml; a controller update that
+    # only reinstalls herdr-eng leaves the handoff CLI and its harness skills on whatever revision was
+    # cloned at install time, so the pin and the machine silently disagree.
+    repo = _fake_repo(tmp_path)
+    (repo / 'scripts').mkdir()
+    (repo / 'scripts/install-handoff.sh').write_text('#!/bin/sh\n')
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    calls = []
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        if any('install-handoff.sh' in part for part in cmd):
+            return 1, '', 'cannot fetch the pinned revision'
+        return _success(cmd, **kwargs)
+    monkeypatch.setattr(fleet, '_run', run)
+    monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: STATUS)
+    result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
+    assert any('install-handoff.sh' in ' '.join(cmd) for cmd in calls)
+    assert result['steps']['handoff_refresh']['ok'] is False
+    assert any('herdr-handoff' in warning for warning in result.get('warnings', []))
+    # A host with a stale handoff still syncs: blocking the fleet on it would trade a reportable gap
+    # for an outage.
+    assert result['ok']

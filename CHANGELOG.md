@@ -5,6 +5,15 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### herdr-handoff: one place resolves the pin, and doctor checks what the CLI can actually do
+
+- `scripts/install-handoff.sh` is now the only thing that installs or refreshes the required herdr-handoff dependency: it reads the revision from `lock/upstreams.yaml` (`HERDR_HANDOFF_REF` overrides for a controlled rollout), fetches it into `~/.local/share/herdr-handoff/<rev>`, installs the CLI into `HERDR_HANDOFF_PYTHON` (or via `uv tool` where there is no pip), links the four harness skills, and prints the revision it resolved. `scripts/install.sh` step 3 calls it instead of carrying its own default revision, which had drifted from the pin (install.sh cloned `3051d8c` while `lock/upstreams.yaml` declared `c425453`), so a machine could be "fully installed" a revision behind a dependency it declares required and nothing said so. `--plan` prints the resolution and touches nothing.
+- `fleet update` refreshes the dependency as a non-fatal `handoff_refresh` step: a host whose handoff install is broken still syncs, and the failure is reported in `warnings` rather than blocking the fleet.
+- `check_handoff_dependency` no longer reads "the binary exists" as health. It asks the CLI `--version` and `--help` and fails when a flow `herdr-eng` actually calls (`handoff`, `receive`, `takeover`, `confirm`) is missing, naming the version found and `scripts/install-handoff.sh`; a CLI it cannot run reports no capabilities at all. Doctor keeps mapping the required dependency to a warning unless run strict, so an old pin now reads as a gap instead of a green check.
+- Pin advanced to `a693217` (herdr-handoff#6, client 0.3.0): same-tab takeover where the close of the replaced pane is gated on herdr observing the successor live, plus `herdr-handoff confirm` for that successor.
+- Known gap: a skill left as a plain copied directory by an install from before the linker is still reported as a collision, and its text never updates. `scripts/install-handoff.sh --migrate-copies` moves each such directory aside as `<skill>.pre-<rev>.bak` and links the pinned tree in its place; it is opt-in because a copy may carry local edits.
+
+
 ### Inspector snapshot boot: used on the complete-replay fallback, strictly validated
 
 - With projection checkpoints on (the default), a missing or rejected checkpoint fell back to a complete replay that ignored `inspector_snapshots` and re-ran every stored inspector row through redaction. That fallback now hands the stored snapshot to the repo, which verifies it by count and ordering and replays everything on any doubt.

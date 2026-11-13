@@ -53,9 +53,8 @@ cd "$REPO_ROOT"
 VENV="$REPO_ROOT/.venv"
 PY="$VENV/bin/python"
 HERDR_BIN="${HERDR_BIN:-herdr}"
-HANDOFF_REF="${HERDR_HANDOFF_REF:-c425453}"
-HANDOFF_REPO="${HERDR_HANDOFF_REPO:-$REPO_ROOT/../herdr-handoff}"
-HANDOFF_CACHE="${HERDR_HANDOFF_CACHE:-$HOME/.local/share/herdr-handoff/$HANDOFF_REF}"
+# The herdr-handoff pin lives in lock/upstreams.yaml and is resolved by
+# scripts/install-handoff.sh; HERDR_HANDOFF_REF overrides it for a controlled rollout.
 ARTIFACT_REF="${HERDR_ARTIFACT_REF:-c6156ea}"
 ARTIFACT_REPO="${HERDR_ARTIFACT_REPO:-$REPO_ROOT/../herdr-artifacts}"
 ARTIFACT_CACHE="${HERDR_ARTIFACT_CACHE:-$HOME/.local/share/herdr-artifacts/$ARTIFACT_REF}"
@@ -117,19 +116,10 @@ fi
 
 # --- 3. required cross-harness handoff ------------------------------------
 step "3/8 installing required herdr-handoff integration"
-if [ ! -f "$HANDOFF_REPO/pyproject.toml" ]; then
-  command -v git >/dev/null 2>&1 || die "git is required to install herdr-handoff"
-  mkdir -p "$(dirname "$HANDOFF_CACHE")"
-  if [ ! -d "$HANDOFF_CACHE/.git" ]; then
-    git clone --quiet https://github.com/berlinguyinca/herdr-handoff.git "$HANDOFF_CACHE"
-  fi
-  git -C "$HANDOFF_CACHE" fetch --quiet --depth 1 origin "$HANDOFF_REF" || true
-  git -C "$HANDOFF_CACHE" checkout --quiet --detach "$HANDOFF_REF"
-  HANDOFF_REPO="$HANDOFF_CACHE"
-fi
-"$PY" -m pip install --quiet -e "$HANDOFF_REPO"
-"$HANDOFF_REPO/install/install.sh"
-printf '  herdr-handoff %s installed from %s\n' "$HANDOFF_REF" "$HANDOFF_REPO"
+# One script resolves the pin, fetches it, installs the CLI and links the skills, so an install and an
+# update cannot disagree about what "installed" means (they used to: install.sh carried its own default
+# revision, which had silently drifted from the pin in lock/upstreams.yaml).
+HERDR_HANDOFF_PYTHON="$PY" bash "$REPO_ROOT/scripts/install-handoff.sh"
 
 if [ ! -f "$ARTIFACT_REPO/install/install.sh" ]; then
   command -v git >/dev/null 2>&1 || die "git is required to install herdr-artifacts"

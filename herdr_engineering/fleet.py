@@ -381,6 +381,19 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
         if not ok:
             return report
 
+    # herdr-handoff is a required operational dependency pinned in lock/upstreams.yaml: `herdr-eng`
+    # hands sessions to its CLI and every `/herdr::*` command comes from its skill tree.  Refreshing it
+    # with the controller means the pin and the machine cannot drift apart the way install.sh's own
+    # hardcoded default and the lock file did.  A failure here is reported, not fatal: a host whose
+    # handoff install is broken still syncs, and `herdr-eng doctor` names the gap.
+    handoff_installer = root / "scripts" / "install-handoff.sh"
+    if handoff_installer.exists():
+        handoff_ok, _ = step("handoff_refresh", ["bash", str(handoff_installer)], 600)
+        if not handoff_ok:
+            report.setdefault("warnings", []).append(
+                "herdr-handoff refresh failed; the pinned dependency may be stale - run "
+                "scripts/install-handoff.sh and check `herdr-eng doctor`")
+
     from .config import load_config
     cleanup = load_config().get("build_cleanup", {})
     roots = cleanup.get("roots", []) if isinstance(cleanup, dict) else []
