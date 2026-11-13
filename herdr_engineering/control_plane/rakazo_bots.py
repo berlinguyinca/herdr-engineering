@@ -7,6 +7,7 @@ Nothing here deletes a bot: "remove" archives it, exactly like the archive butto
 from __future__ import annotations
 
 import secrets
+import threading
 from datetime import UTC, datetime
 from typing import Any
 
@@ -47,6 +48,7 @@ class Bots:
         self.b = bridge
         self.Error = error_type
         self.prefs = bridge.prefs
+        self._default_lock = threading.Lock()      # clear-others + set must not interleave
 
     def procs(self) -> dict[str, Any]:
         return {"bots/update": self.update, "bots/archive": self.archive, "bots/remove": self.archive,
@@ -111,10 +113,11 @@ class Bots:
                 patch["instructions"] = text
         if "sectionId" in meta and meta["sectionId"] is not None and meta["sectionId"] not in self._sections(ctx):
             raise self.Error(404, "NOT_FOUND", "Not found.")
-        if meta.get("isDefault") is True:
-            self._clear_default(ctx, except_id=assistant.assistant_id)
         if meta:
-            self._put_meta(ctx, assistant.assistant_id, meta)
+            with self._default_lock:
+                if meta.get("isDefault") is True:
+                    self._clear_default(ctx, except_id=assistant.assistant_id)
+                self._put_meta(ctx, assistant.assistant_id, meta)
         if patch:
             self.b.svc.update_assistant(assistant.assistant_id, tenant_id=ctx.tenant, user_id=ctx.user, patch=patch)
             assistant = self._assistant(ctx, inp)
@@ -124,7 +127,7 @@ class Bots:
         """At most one default bot per space: drop the flag from every other bot."""
         for bot_id, meta in self.prefs.items(ctx.account.account_id, ctx.space, META_KIND).items():
             if bot_id != except_id and meta.get("isDefault"):
-                self.b.prefs_put(ctx.account.account_id, ctx.space, META_KIND, bot_id, {**meta, "isDefault": False})
+                self._put_meta(ctx, bot_id, {"isDefault": False})
 
     def _remember_instructions(self, ctx, assistant) -> None:
         key = assistant.assistant_id

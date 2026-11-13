@@ -133,3 +133,22 @@ def test_archive_default_leaves_no_default_listed(srv, alice):
     api.ok("bots/update", {"botId": bot["id"], "isDefault": True}, alice)
     api.ok("bots/archive", {"botId": bot["id"]}, alice)
     assert bot["id"] not in _listed(api, alice)
+
+
+def test_concurrent_default_updates_leave_exactly_one(srv, alice):
+    import threading
+    _, api = srv
+    bots = [new_bot(api, alice, f"B{i}") for i in range(4)]
+    errors: list[BaseException] = []
+
+    def mark(bot_id):
+        try:
+            api.ok("bots/update", {"botId": bot_id, "isDefault": True}, alice)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=mark, args=(b["id"],)) for b in bots]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert not errors
+    assert sum(1 for v in _listed(api, alice).values() if v["isDefault"]) == 1
