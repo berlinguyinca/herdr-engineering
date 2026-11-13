@@ -323,6 +323,52 @@ def test_open_owner_believes_forwarded_for_from_a_trusted_proxy_only(make_server
     assert open_from(svr.rakazo, "198.51.100.7", "100.64.2.2") == 403
 
 
+def test_open_owner_allowed_sources_admits_only_listed_addresses(make_server):
+    _, api = make_server(bridge_section(open_owner=True, open_owner_allowed_sources=["100.64.1.1", "100.100.0.0/16", "fd7a:115c:a1e0::5"]))
+    for ip in ("100.64.1.1", "100.100.7.8", "fd7a:115c:a1e0::5", "::ffff:100.64.1.1"):
+        assert api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": ip})[0] == 200, ip
+    for ip in ("100.64.1.2", "100.101.0.1", "127.0.0.1", "fd7a:115c:a1e0::6"):      # tailnet or loopback, but not listed
+        status, body, hdrs = api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": ip})
+        assert status == 403 and "set-auth-token" not in {k.lower() for k in hdrs}, ip
+        assert json.loads(body)["code"] == "FORBIDDEN"
+
+
+def test_open_owner_allowed_sources_unset_or_empty_changes_nothing(make_server):
+    for over in ({}, {"open_owner_allowed_sources": []}):
+        _, api = make_server(bridge_section(open_owner=True, **over))
+        assert api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "100.64.7.7"})[0] == 200
+    assert rb.rakazo_bridge_config({"enabled": True, "accounts": ACCOUNTS})["open_owner_allowed_sources"] == ()
+
+
+def test_open_owner_allowed_sources_ignores_forwarded_for_from_an_untrusted_peer(make_server):
+    svr, _ = make_server(bridge_section(open_owner=True, open_owner_allowed_sources=["100.64.1.1"]))
+    assert open_from(svr.rakazo, "100.64.9.9", "100.64.1.1") == 403           # a listed address named by an unlisted peer
+    assert open_from(svr.rakazo, "198.51.100.7", "100.64.1.1") == 403
+    assert open_from(svr.rakazo, "100.64.1.1") == 200                         # the listed peer itself
+    assert open_from(svr.rakazo, "100.64.9.9") == 403
+
+
+def test_open_owner_allowed_sources_checks_the_client_behind_a_trusted_proxy(make_server):
+    svr, _ = make_server(bridge_section(open_owner=True, trusted_proxies=["10.0.0.0/8"], open_owner_allowed_sources=["100.64.1.1"]))
+    assert open_from(svr.rakazo, "10.0.0.2", "100.64.1.1") == 200
+    assert open_from(svr.rakazo, "10.0.0.2", "100.64.1.2") == 403
+    assert open_from(svr.rakazo, "198.51.100.7", "100.64.1.1") == 403
+
+
+@pytest.mark.parametrize("bad", ["not-an-ip", "100.64.0.0/33", "", 5, None, ["100.64.0.1"], "100.64.0.1/16/2"])
+def test_open_owner_allowed_sources_rejects_invalid_entries(bad):
+    with pytest.raises(ValueError, match="open_owner_allowed_sources"):
+        rb.rakazo_bridge_config({"enabled": True, "open_owner_allowed_sources": ["100.64.0.1", bad], "accounts": ACCOUNTS})
+
+
+def test_open_owner_allowed_sources_must_be_a_bounded_list():
+    for bad in ("100.64.0.1", {"a": 1}, [f"100.64.0.{i % 250}" for i in range(65)]):
+        with pytest.raises(ValueError, match="open_owner_allowed_sources"):
+            rb.rakazo_bridge_config({"enabled": True, "open_owner_allowed_sources": bad, "accounts": ACCOUNTS})
+    ok = rb.rakazo_bridge_config({"enabled": True, "open_owner_allowed_sources": ["100.64.0.1", "100.64.0.0/24"], "accounts": ACCOUNTS})
+    assert len(ok["open_owner_allowed_sources"]) == 2
+
+
 def test_open_owner_needs_an_operator_account_to_act_as():
     with pytest.raises(ValueError, match="open_owner"):
         rb.rakazo_bridge_config({"enabled": True, "open_owner": True,
