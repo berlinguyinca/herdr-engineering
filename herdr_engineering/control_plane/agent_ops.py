@@ -19,6 +19,8 @@ import time
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
+from .envelope import _OPS_ID_RE
+
 EVENT_TYPES = frozenset({
     "session.started", "session.ended", "model.selected", "model.switched", "tool.started", "tool.ended",
     "tool.failed", "context.metric", "context.compaction", "message.sent", "message.delivered",
@@ -117,6 +119,11 @@ def _str(value: Any, limit: int = 160) -> str | None:
     return value[:limit] if isinstance(value, str) and value else None
 
 
+def _ops_id(value: Any) -> str | None:
+    """An id as the envelope would accept it; the registry validates the handoff id but not its source ids."""
+    return value if isinstance(value, str) and _OPS_ID_RE.fullmatch(value) else None
+
+
 def _uint(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
@@ -129,17 +136,17 @@ def cursor_of(event: dict) -> str:
     return "~".join([p.replace("~", "%7E") for p in parts] + [event["event_id"]])
 
 
-CURSOR_MAX = 512
+CURSOR_MAX = 2048                       # ts 27 + source <=168 + agent <=160 + actor 12 + event id <=175 + separators, with headroom
 _CURSOR_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
 _CURSOR_ACTOR_RE = re.compile(r"[0-9a-f]{12}")
 
 
 def valid_cursor(cursor: Any) -> bool:
     """Whether ``cursor`` has the shape :func:`cursor_of` issues: ``ts~source~agent~actor_ref~event_id`` (ts a real UTC
-    timestamp or empty when the event had none, actor_ref empty or 12 hex, no control characters, bounded length)."""
+    timestamp or empty when the event had none, actor_ref empty or 12 hex, no CR/LF/NUL, bounded length)."""
     if not isinstance(cursor, str) or not cursor or len(cursor) > CURSOR_MAX:
         return False
-    if any(ord(c) < 32 or ord(c) == 127 for c in cursor):
+    if any(c in cursor for c in "\r\n\0"):          # the only characters that can break an SSE frame or a header
         return False
     parts = cursor.split("~", 4)
     if len(parts) != 5:
@@ -321,7 +328,7 @@ def handoff_events(registry: Any) -> list[dict]:
                 event_id=f"handoff:{hid}:{index}", source=f"handoff:{hid}", sequence=index,
                 event_type="handoff.state", occurred_at=stamp, ingested_at=stamp, room_id=_str(row.get("room_id")),
                 visibility_scope="room" if row.get("room_id") else "private", provenance="observed",
-                agent_id=_str(src.get("agent_id")), session_id=_str(src.get("session_id")), handoff_id=hid,
+                agent_id=_ops_id(src.get("agent_id")), session_id=_ops_id(src.get("session_id")), handoff_id=hid,
                 status=step.get("state") if isinstance(step.get("state"), str) else None,
                 payload={**payload, "provider": _str(src.get("harness"), 64) or ""} if src.get("harness") else payload))
     return out
