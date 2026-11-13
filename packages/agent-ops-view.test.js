@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { HerdrClient } from './herdr-web-client/client.js';
-import { layoutScene, buildTimeline } from './agent-ops-model.js';
+import { layoutScene, buildTimeline, fitText, estimateTextWidth, chordWidth } from './agent-ops-model.js';
 import { API, loadSnapshot, loadReplay, loadTimeline, streamUrl, renderTabs, renderFilters, renderScene, renderNode, renderEdge, renderInspector, renderTimeline, renderBanner, renderAltTable, renderEmpty, renderLegend, renderHostStrip, renderDrift, sceneSignature } from './agent-ops-view.js';
 
 const agent = (id, over = {}) => ({ node_id: id, agent_id: id, session_id: null, host_id: 'h1', provider: null, model: 'opus', model_changes: [], state: 'working', context: { used: 50, limit: 100, source: 'pi' },
@@ -260,4 +260,47 @@ test('layoutScene survives a non-finite aspect', () => {
     assert.deepEqual(s.nodes.map((n) => [n.x, n.y]), layoutScene(SNAP, { aspect: 1.35 }).nodes.map((n) => [n.x, n.y]));
     assert.ok(s.nodes.every((n) => Number.isFinite(n.x) && Number.isFinite(n.y)));
   }
+});
+
+// ---- layout defects: node text inside the circle, edge labels off other edges' lines --------------------------------------------
+const bez = (d) => { const [x1, y1, cx, cy, x2, y2] = d.match(/-?\d+(?:\.\d+)?/g).map(Number); return (t) => ({ x: (1 - t) ** 2 * x1 + 2 * (1 - t) * t * cx + t * t * x2, y: (1 - t) ** 2 * y1 + 2 * (1 - t) * t * cy + t * t * y2 }); };
+const DENSE = {
+  agents: ['claude', 'qwen', 'codex', 'opus', 'gem', 'lint'].map((id) => agent(id, { model: id === 'gem' ? null : `${id}-model-xl` })),
+  rooms: [], tasks: [], cursor: 'c', counts: {}, truncated: false,
+  edges: [['ownership', 'claude', 'qwen', 'transferred'], ['delegation', 'claude', 'qwen', 'accepted'], ['delegation', 'claude', 'codex', 'planned'],
+    ['handoff', 'codex', 'opus', 'completed'], ['handoff', 'gem', 'claude', 'stalled'], ['handoff', 'lint', 'claude', 'failed'],
+    ['review', 'qwen', 'opus', 'requested'], ['communication', 'codex', 'claude', 'sent'], ['communication', 'opus', 'gem', 'sent']]
+    .map(([kind, from, to, state], i) => ({ kind, from, to, state, room_id: null, event_id: `e${i}`, provenance: 'observed', task_id: `t${i}`, handoff_id: null, updated_at: '2026-11-12T10:00:03.000000Z' })),
+};
+
+test('edge labels that are printed never sit on another edge\'s line (desktop and phone layout)', () => {
+  for (const aspect of [1.6, 1.35, 0.5]) {
+    const s = layoutScene(DENSE, { aspect });
+    const curves = s.edges.map((e) => ({ id: e.id, pt: bez(e.d) }));
+    for (const e of s.edges.filter((x) => !x.labelQuiet)) {
+      const b = e.labelBox;
+      for (const c of curves.filter((x) => x.id !== e.id)) {
+        for (let i = 0; i <= 60; i++) {
+          const p = c.pt(i / 60);
+          assert.ok(!(Math.abs(p.x - b.x) < b.w / 2 && Math.abs(p.y - b.y) < b.h / 2), `aspect ${aspect}: label "${e.label}" sits on ${c.id}`);
+        }
+      }
+    }
+    if (aspect >= 1.35) assert.ok(s.edges.filter((x) => !x.labelQuiet).length >= Math.floor(s.edges.length / 2), `aspect ${aspect}: most labels stay printed`);   // phone: dense, quiet labels are by design
+  }
+});
+
+test('node text is ellipsised to the chord of the circle with padding, never cut at the edge', () => {
+  const long = agent('long', { label: 'Extraordinarily-long-agent-name', model: 'claude-opus-5-20261112-preview' });
+  for (const aspect of [1.35, 0.5]) {
+    const s = layoutScene({ ...SNAP, agents: [long], edges: [], tasks: [] }, { aspect });
+    const html = renderNode(s.nodes[0], { compact: s.compact });
+    for (const [cls, px, y] of [['ao-name', s.compact ? 18 : 15, -9], ['ao-model', s.compact ? 14 : 11.5, 9]]) {
+      const m = html.match(new RegExp(`<text class="${cls}[^"]*" y="${y}"[^>]*>([^<]*)</text>`));
+      const shown = m[1].replace(/&[a-z]+;/g, 'x');
+      assert.ok(shown.endsWith('…'), `${cls} is ellipsised`);
+      assert.ok(estimateTextWidth(shown, px, cls === 'ao-model') <= chordWidth(y, px, cls === 'ao-model' ? 4 : 6) + 0.01, `${cls} fits the chord (${shown})`);
+    }
+  }
+  assert.equal(fitText('Plan', 80, 15), 'Plan');
 });

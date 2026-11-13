@@ -236,17 +236,21 @@ function curve(a, b, bend) {
 
 // Edge labels: try the middle of the curve first, then slide along it, keeping clear of earlier labels and of node halos.
 // When no spot is free the label turns quiet (shown on hover, focus or selection) instead of printing over other text.
-const LABEL_H = 18, LABEL_CHAR = 7, LABEL_TS = [0.5, 0.42, 0.58, 0.34, 0.66, 0.27, 0.73, 0.2, 0.8, 0.14, 0.86], LABEL_DYS = [0, -20, 20];
+const LABEL_H = 18, LABEL_CHAR = 7, LABEL_TS = [0.5, 0.42, 0.58, 0.34, 0.66, 0.27, 0.73, 0.2, 0.8, 0.14, 0.86], LABEL_DYS = [0, -20, 20, -38, 38];
+const SAMPLES = 48;
 function placeLabels(items, nodes, charW = LABEL_CHAR) {
   const placed = [];
+  // Every edge is sampled along its curve: a label box that contains a point of ANOTHER edge sits on that edge's line and counts as crowded.
+  const lines = items.map((it) => Array.from({ length: SAMPLES + 1 }, (_, i) => it.at(i / SAMPLES)));
+  const onOtherLine = (box, self) => lines.reduce((n, pts, i) => (i !== self && pts.some((p) => Math.abs(p.x - box.x) < box.w / 2 + 2 && Math.abs(p.y - box.y) < box.h / 2 + 2) ? n + 1 : n), 0);
   const hit = (a, b) => Math.abs(a.x - b.x) < (a.w + b.w) / 2 && Math.abs(a.y - b.y) < (a.h + b.h) / 2;
   const blocks = nodes.flatMap((n) => [{ x: n.x, y: n.y, w: 2 * RING_R, h: 2 * RING_R }, { x: n.x, y: n.y + RING_R + 22, w: 170, h: 18 }, { x: n.x, y: n.y + RING_R + 46, w: 170, h: 20 }]);
-  for (const it of items) {
+  for (const [self, it] of items.entries()) {
     const w = String(it.label || '').length * charW + 10;
     let best = null;
     search: for (const t of LABEL_TS) for (const dy of LABEL_DYS) {
       const p = it.at(t), box = { x: p.x, y: p.y - 6 + dy, w, h: LABEL_H };
-      const crowd = placed.filter((b) => hit(box, b)).length + blocks.filter((b) => hit(box, b)).length;
+      const crowd = placed.filter((b) => hit(box, b)).length + blocks.filter((b) => hit(box, b)).length + onOtherLine(box, self);
       if (!best || crowd < best.crowd) best = { crowd, box };
       if (!crowd) break search;
     }
@@ -347,6 +351,32 @@ export function layoutScene(snapshot, { mode = 'activity', filters = {}, aspect:
   [minX, maxX] = grow(minX, maxX, compact ? 380 : 520); [minY, maxY] = grow(minY, maxY, 340);
   return { mode, nodes, edges, rooms, tasks: view.tasks, viewBox: { x: r1(minX), y: r1(minY), w: r1(maxX - minX), h: r1(maxY - minY) }, compact,
     counts: { nodes: nodes.length, edges: edges.length, rooms: rooms.length, tasks: view.tasks.length }, cursor: snapshot?.cursor ?? null, truncated: Boolean(snapshot?.truncated) };
+}
+
+// ---- text that has to stay inside a node circle ------------------------------------------------------------------------------------
+// No DOM here (the model runs under node), so widths are estimated per character class: deliberately a little wide, so an estimate that
+// says "fits" is true in a real font too. The map tests re-measure the rendered text with getBBox in a real browser.
+const NARROW = new Set([...".iljtfrI,:;'|! "]), WIDE = new Set([...'mwMW']);
+export function estimateTextWidth(str, px, mono = false) {
+  if (mono) return [...String(str)].length * px * 0.605;
+  return [...String(str)].reduce((w, ch) => w + px * (NARROW.has(ch) ? 0.38 : WIDE.has(ch) ? 0.92 : ch >= 'A' && ch <= 'Z' ? 0.70 : 0.58), 0);
+}
+/** Width of the horizontal chord of the node body that a text line (baseline y, font size px) may use, minus `pad` on each side. */
+export function chordWidth(baselineY, px, pad = 6, radius = NODE_R) {
+  const far = Math.max(Math.abs(baselineY - 0.75 * px), Math.abs(baselineY + 0.25 * px));
+  return Math.max(0, 2 * Math.sqrt(Math.max(radius * radius - far * far, 0)) - 2 * pad);
+}
+/** SVG attributes that squeeze a line that is too wide to maxW (glyph spacing), for text that must stay whole: 'ctx unknown', 'model unknown'. */
+export function squeezeAttrs(str, maxW, px, mono = false) {
+  return estimateTextWidth(str, px, mono) <= maxW ? '' : ` textLength="${Math.round(maxW * 10) / 10}" lengthAdjust="spacingAndGlyphs"`;
+}
+/** The text, ellipsised so that its estimated width is at most maxW. */
+export function fitText(str, maxW, px, mono = false) {
+  const chars = [...String(str)];
+  if (estimateTextWidth(chars.join(''), px, mono) <= maxW) return chars.join('');
+  let n = chars.length;
+  while (n > 1 && estimateTextWidth(`${chars.slice(0, n - 1).join('').trimEnd()}…`, px, mono) > maxW) n -= 1;
+  return `${chars.slice(0, Math.max(n - 1, 1)).join('').trimEnd()}…`;
 }
 
 // ---- change detection: what animates ----------------------------------------------------------------------------------------------

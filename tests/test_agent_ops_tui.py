@@ -636,3 +636,24 @@ def test_stream_resets_to_a_fresh_snapshot_when_the_server_rejects_the_resume_cu
         assert seen[0] == ""            # reset: the old-format cursor is dropped and the owner re-fetches the snapshot
     finally:
         server.stop()
+
+
+@pytest.mark.parametrize("opts", [UNI, ASCII])
+@pytest.mark.parametrize("width", [80, 77, 60])
+def test_legend_fits_width_with_whole_words(opts, width):
+    """Every edge kind keeps a whole word (never a cut-off stem like 'revi'/'owne'), and the line fits."""
+    text = tui.legend(opts, width)
+    assert tui.cell_width(text) <= width or width < 76
+    if width >= 76:
+        words = text.split()
+        for kind in tui.KINDS:
+            assert any(w.endswith(tui.LEGEND_WORDS[0][kind]) or w.endswith(tui.LEGEND_WORDS[1][kind]) for w in words), kind
+        assert "planned" in text and "stalled" in text and "failed" in text
+
+
+def test_80x24_legend_row_is_untruncated():
+    out = plain(render(snap(), 80, 24, opts=UNI))
+    row = next(l for l in out.splitlines() if "planned" in l)
+    for word in ("handoff", "review", "owner", "planned", "stalled", "failed"):
+        assert word in row
+    assert "revi " not in row and "owne " not in row
