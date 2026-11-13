@@ -295,7 +295,11 @@ def test_target_management_cli_enable_and_migration_safety(tmp_path: Path):
     settings = {"fabric_build_cache": {"enabled": True, "local": {
         "min_free_disk_percent": 0, "storage_tiers": [{"name": "internal", "directory": str(cache)}]}}}
     config.write_text(yaml.safe_dump(settings))
-    env = {**os.environ, "HOME": str(home), "CARGO_HOME": str(home / ".cargo"),
+    # Hermetic: an ambient target-dir override (common on CI agents) is "authoritative"
+    # to the migrator and would hide the same-filesystem verdict this test asserts.
+    ambient = {key: value for key, value in os.environ.items()
+               if key not in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR")}
+    env = {**ambient, "HOME": str(home), "CARGO_HOME": str(home / ".cargo"),
            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
            "HERDR_ENGINEERING_CONFIG": str(config), "HERDR_ENGINEERING_STATE": str(state),
            "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
@@ -323,6 +327,11 @@ def test_target_management_cli_enable_and_migration_safety(tmp_path: Path):
     assert plan.returncode == 0, plan.stderr
     assert json.loads(plan.stdout)["targets"][0]["status"] == "preserved"
     assert "same filesystem" in json.loads(plan.stdout)["targets"][0]["reason"]
+    explicit = subprocess.run([sys.executable, "-m", "herdr_engineering.cargo_host", "targets-migrate",
+                               "--root", str(workspace)], env={**env, "CARGO_TARGET_DIR": str(tmp_path / "elsewhere")},
+                              text=True, capture_output=True, timeout=30)
+    assert explicit.returncode == 0, explicit.stderr
+    assert "Explicit target setting" in json.loads(explicit.stdout)["targets"][0]["reason"]
     settings["fabric_build_cache"]["local"]["min_free_disk_percent"] = 101
     config.write_text(yaml.safe_dump(settings))
     assert invoke("targets-migrate", "--root", str(workspace)).returncode != 0
