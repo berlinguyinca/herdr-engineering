@@ -14,7 +14,7 @@ Decisions already taken by the operator:
 
 ## Motivation: measured evidence
 
-On the pre-fix diffs of #733 (7 issues found by Opus) and #782 (6 issues found by Opus), three open-weight candidates (deepseek-v4-flash, qwen3.8-27b-q8_k_xl, qwen3.8-flash_next-q4_k_xl) found **0 of 13 clearly**, 2 weak partial hits, and 3-4 real hits on #782 (dedup collision, untested bridge path). They also raised **4 false blocking findings**, for example calling `table[:-1] + '_archive"'` at bridge.py:402 an invalid identifier. Latencies were 15-240 s. deepseek has one slot and returns 429 when called in parallel.
+On the pre-fix diffs of #733 (7 issues found by Opus) and #782 (6 issues found by Opus), three open-weight candidates (deepseek-v4-flash, qwen3.8-27b-q8_k_xl, qwen3.8-flash_next-q4_k_xl) found **0 of the 13 clearly**, with 2 weak partial hits. They also reported 3-4 other real-looking issues on #782 (a dedup collision on `event_id`, an untested bridge path). Whether those were outside Opus's list of 13 has **not been confirmed** and the scoring needs to be redone against Opus's list before this evidence is relied on. They also raised **4 false blocking findings**, for example calling `table[:-1] + '_archive"'` at `herdr_engineering/control_plane/bridge.py:402` an invalid identifier (on the pre-fix #782 diff). Latencies were 15-240 s. deepseek has one slot and returns 429 when called in parallel.
 
 Conclusion: open-weight models are useful as a cheap first pass but are not trustworthy as the gate.
 
@@ -22,16 +22,16 @@ Conclusion: open-weight models are useful as a cheap first pass but are not trus
 
 ### Reuse `ai-review.py poll`
 
-Keep the structure of `deploy/ci-review/ai-review.py poll`: list open non-draft PRs, review once per head SHA, idempotent (a terminal status for the head means done), retry a stale pending status after `pending_stale_minutes`, the **poster decides the state** (never the model), and drop findings that cite files not in the PR. Drafts are skipped. New code goes in a sibling module or a `--tier` option so the existing `Independent AI review` path keeps working.
+Keep the structure of `deploy/ci-review/ai-review.py poll`: list open non-draft PRs, review once per head SHA, idempotent (a terminal status for the head means done), retry a stale pending status after `pending_stale_minutes`, the **poster decides the state** (never the model), and drop findings that cite files not in the PR. Today `ai-review.py` defaults `poll.skip_drafts` to `false` (`ai-review.py:98`, used at `:1149`), so drafts are skipped only when `poll.skip_drafts: true` is set. The proposal sets it `true` in the config of the review unit. New code goes in a sibling module or a `--tier` option so the existing `Independent AI review` path keeps working.
 
 ### Two tiers
 
 | | Tier 1 | Tier 2 |
 | --- | --- | --- |
 | Reviewer | open-weight model via the pi gateway | local headless Claude Opus: `claude -p --model opus` |
-| Runs on | every push (every new head SHA) | only a head that is otherwise mergeable: all Woodpecker gates and verify green |
+| Runs on | every push (every new head SHA) | only a head that is otherwise mergeable: all other checks green (`artifact-handoff`, `structural-gates`, `ui-gates`, `unit-gates`, `verify`, `GitGuardian`) |
 | Effect | **advisory only**; never posts `Opus agent review`. Posts under a different context, e.g. `Open-weight pre-review`, and optionally one marked PR comment | posts `Opus agent review` success or failure |
-| Tools | none (diff as data, as today) | read-only: Read, Grep, Glob, `git diff`. No network, no secrets, no write tools |
+| Tools | none (diff as data, as today) | read-only: Read, Grep, Glob and an allowlisted `git diff`, enforced with `--allowedTools` / `--disallowedTools`. No WebFetch, WebSearch or write tools. `claude -p` still needs API reach and its login on the host |
 
 Tier 2 runs in a fresh detached worktree of the exact head SHA, created per review and removed after. Running it only on green heads spends Opus tokens once per mergeable head rather than once per push.
 
@@ -41,7 +41,7 @@ Strict JSON, anything else is a failed review (status stays pending): `{"head_sh
 
 ### Prompt-injection posture
 
-PR title, body, diff, commit messages and file contents are untrusted data, fenced with random delimiters and never placed in instructions. The Tier 2 process has no network, no secrets and no write tools, so an injection can only skew the verdict text. The script, not the model, decides the posted state, and re-reads the PR head before posting; a head that moved posts nothing.
+PR title, body, diff, commit messages and file contents are untrusted data, fenced with random delimiters and never placed in instructions. The Tier 2 process is restricted to Read, Grep, Glob and allowlisted `git diff` (no WebFetch, WebSearch or write tools). It still needs API reach and the host's Claude login, so it is not network- or secret-free, but an injection can only skew the verdict text. The script, not the model, decides the posted state, and re-reads the PR head before posting; a head that moved posts nothing.
 
 ### Limits and failure behaviour
 
@@ -61,7 +61,7 @@ Opus reviewing Claude-authored PRs drops the different-family rule that `Indepen
 
 ### The pane
 
-A herdr pane tails the reviewer log (`journalctl --user -fu herdr-review` or the state dir log), showing per-PR lines: head, tier, state, duration, tokens. The unit also writes one JSON line per review to its state dir for later cost accounting. Configuration is YAML only (no environment variables), like `ai-review.yaml`.
+A herdr pane tails the reviewer log (`journalctl --user -fu herdr-review` (`herdr-review` is a proposed unit name) or the state dir log), showing per-PR lines: head, tier, state, duration, tokens. The unit also writes one JSON line per review to its state dir for later cost accounting. Configuration is YAML only (no environment variables), like `ai-review.yaml`.
 
 ## Failure modes
 
@@ -72,7 +72,7 @@ A herdr pane tails the reviewer log (`journalctl --user -fu herdr-review` or the
 
 ## Rollback
 
-Before changing the ruleset, save its prior state: `gh api repos/berlinguyinca/herdr-engineering/rulesets/25691548 > ruleset-25691548.prior.json` (stored outside the repo). Rollback removes the `Opus agent review` context from the required checks using that saved JSON, then stops the unit. `Independent AI review` stays available throughout. This spec changes no ruleset.
+Rollback is to stop and uninstall the review unit and fall back to the manual post (PR #788). This spec changes no ruleset. Any ruleset change is a separate operator step with its own description and rollback. Note that the raw `gh api repos/berlinguyinca/herdr-engineering/rulesets/25691548` GET output cannot be PUT back unchanged, because it has read-only fields (`id`, `_links`, `created_at`, `updated_at`, `source`, and similar); strip them before any restore. `Independent AI review` stays available throughout.
 
 ## Open questions
 
