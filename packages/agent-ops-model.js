@@ -12,12 +12,13 @@ export const CAPABILITY = 'agent_ops_v1';
 export const agentOpsEnabled = (capabilities) => Array.isArray(capabilities) && capabilities.includes(CAPABILITY);
 
 // ---- geometry constants (scene units; the SVG scales the viewBox) ----------------------------------------------------------
-export const NODE_R = 44;
+export const NODE_R = 52;
 export const RING_GAP = 8;
-export const RING_W = 7;
+export const RING_W = 8;
 export const RING_R = NODE_R + RING_GAP;
 export const HALO_R = RING_R + 12;
-export const CLUSTER_PAD = 30;
+export const CLUSTER_PAD = 40;
+export const LABEL_BELOW = 124;   // distance below a node centre that its state label and switched-model pill need
 export const NO_ROOM = '';
 
 // ---- context fraction (ADR: amber >= 70, red >= 90) -------------------------------------------------------------------------
@@ -121,6 +122,7 @@ export function filterOptions(snapshot) {
   const agents = list(snapshot?.agents);
   return {
     room: uniqSorted(list(snapshot?.rooms).map((r) => r.room_id)),
+    roomName: Object.fromEntries(list(snapshot?.rooms).filter((r) => r && r.room_id && text(r.name)).map((r) => [r.room_id, text(r.name)])),
     task: uniqSorted(list(snapshot?.tasks).map((t) => t.task_id)),
     host: uniqSorted(agents.map((a) => a.host_id)),
     provider: uniqSorted(agents.map((a) => a.provider)),
@@ -141,7 +143,9 @@ export function filterSnapshot(snapshot, filters = {}) {
   const agents = agents0.filter((a) => (!f.room || list(a.room_ids).includes(f.room)) && (!f.host || a.host_id === f.host)
     && (!f.provider || a.provider === f.provider) && (!f.model || a.model === f.model) && (!taskNodes || taskNodes.has(a.node_id)));
   const keep = new Set(agents.map((a) => a.node_id));
-  const edges = edges0.filter((e) => (!f.kind || e.kind === f.kind) && (!f.task || e.task_id === f.task)
+  // A person has no room of their own: under a Room filter they stay only through an edge that belongs to that room.
+  const personOk = (e) => !f.room || !(isPerson(e.from) || isPerson(e.to)) || !e.room_id || e.room_id === f.room;
+  const edges = edges0.filter((e) => (!f.kind || e.kind === f.kind) && (!f.task || e.task_id === f.task) && personOk(e)
     && (keep.has(e.from) || isPerson(e.from)) && (keep.has(e.to) || isPerson(e.to)) && (keep.has(e.from) || keep.has(e.to)));
   const rooms = list(snapshot?.rooms).filter((r) => !f.room || r.room_id === f.room)
     .map((r) => ({ ...r, agent_ids: list(r.agent_ids).filter((id) => keep.has(id)) }));
@@ -159,7 +163,7 @@ export function nodeName(agent) {
 }
 /** The model label shown inside a node; absent means the model is not known, which is said out loud. */
 export const modelLabel = (agent) => text(agent?.model) || 'model unknown';
-export const roomLabel = (id) => (id === NO_ROOM ? 'No room' : `Room ${shortId(id)}`);
+export const roomLabel = (id, name = null) => (id === NO_ROOM ? 'No room' : text(name) || `Room ${shortId(id)}`);
 
 // ---- fleet hosts and drift ------------------------------------------------------------------------------------------------------
 const HOST_STATES = ['connected', 'disconnected'];
@@ -182,6 +186,13 @@ export function driftItems(owner) {
 // ---- layout ---------------------------------------------------------------------------------------------------------------------
 const r1 = (n) => Math.round(n * 10) / 10;
 
+/** What the agent's model was before its latest switch (the model_changes entry), or null when it never switched. */
+function switchedFrom(agent) {
+  const changes = list(agent?.model_changes);
+  if (!changes.length) return null;
+  return text(changes[changes.length - 1]?.from) || 'unknown model';
+}
+
 function personStub(id) { return { node_id: id, agent_id: id, session_id: null, host_id: null, provider: null, model: null, model_changes: [], state: 'unknown', context: null, room_ids: [], label: null, provenance: 'unknown', kind: 'person' }; }
 
 /** Rooms are clusters (membership, not ownership); an agent sits in the first of its rooms (sorted), else in the "No room" cluster. */
@@ -199,12 +210,11 @@ function groupByRoom(nodes, rooms) {
 }
 
 // Members sit on a ring wide enough that neighbours keep a gap of about one node width: room for the edge between them and its label.
-const memberRing = (n) => Math.max(HALO_R * 2.1, (n * (2 * HALO_R + 96)) / (2 * Math.PI));
+const memberRing = (n) => Math.max(HALO_R * 2.1, (n * (2 * HALO_R + 110)) / (2 * Math.PI));
 
 function clusterRadius(n) {
-  if (n <= 1) return HALO_R + CLUSTER_PAD;
-  const ring = memberRing(n);
-  return ring + HALO_R + CLUSTER_PAD;
+  if (n <= 1) return LABEL_BELOW + 12;
+  return memberRing(n) + LABEL_BELOW + 12;
 }
 
 export const edgeId = (e) => [e.kind, e.from, e.to, e.room_id || '', e.task_id || e.handoff_id || ''].join('|');
@@ -225,22 +235,24 @@ function curve(a, b, bend) {
 
 // Edge labels: try the middle of the curve first, then slide along it, keeping clear of earlier labels and of node halos.
 // When no spot is free the label turns quiet (shown on hover, focus or selection) instead of printing over other text.
-const LABEL_H = 14, LABEL_CHAR = 6.4, LABEL_TS = [0.5, 0.42, 0.58, 0.34, 0.66, 0.27, 0.73, 0.2, 0.8, 0.14, 0.86];
+const LABEL_H = 18, LABEL_CHAR = 7, LABEL_TS = [0.5, 0.42, 0.58, 0.34, 0.66, 0.27, 0.73, 0.2, 0.8, 0.14, 0.86], LABEL_DYS = [0, -20, 20];
 function placeLabels(items, nodes) {
   const placed = [];
   const hit = (a, b) => Math.abs(a.x - b.x) < (a.w + b.w) / 2 && Math.abs(a.y - b.y) < (a.h + b.h) / 2;
+  const blocks = nodes.flatMap((n) => [{ x: n.x, y: n.y, w: 2 * RING_R, h: 2 * RING_R }, { x: n.x, y: n.y + RING_R + 22, w: 170, h: 18 }, { x: n.x, y: n.y + RING_R + 46, w: 170, h: 20 }]);
   for (const it of items) {
-    const w = String(it.label || '').length * LABEL_CHAR + 6;
+    const w = String(it.label || '').length * LABEL_CHAR + 10;
     let best = null;
-    for (const t of LABEL_TS) {
-      const p = it.at(t), box = { x: p.x, y: p.y - 6, w, h: LABEL_H };
-      const crowd = placed.filter((b) => hit(box, b)).length + nodes.filter((n) => hit(box, { x: n.x, y: n.y, w: 2 * RING_R, h: 2 * RING_R }) || hit(box, { x: n.x, y: n.y + RING_R + 18, w: 130, h: 16 })).length;
+    search: for (const t of LABEL_TS) for (const dy of LABEL_DYS) {
+      const p = it.at(t), box = { x: p.x, y: p.y - 6 + dy, w, h: LABEL_H };
+      const crowd = placed.filter((b) => hit(box, b)).length + blocks.filter((b) => hit(box, b)).length;
       if (!best || crowd < best.crowd) best = { crowd, box };
-      if (!crowd) break;
+      if (!crowd) break search;
     }
-    placed.push(best.box);
-    it.labelAt = { x: r1(best.box.x), y: r1(best.box.y + 6) };
-    it.labelQuiet = best.crowd > 0;   // no free spot: the label shows on hover, focus or selection (the text stays in the aria-label and the table)
+    it.labelBox = { x: r1(best.box.x), y: r1(best.box.y), w: best.box.w, h: best.box.h };
+    it.labelAt = { x: it.labelBox.x, y: r1(best.box.y + 6) };
+    it.labelQuiet = best.crowd > 0;   // no free spot: the label shows on hover, focus or selection (text stays in the aria-label, legend and table)
+    if (!it.labelQuiet) placed.push(best.box);
   }
 }
 
@@ -248,11 +260,21 @@ function placeLabels(items, nodes) {
  * snapshot -> scene. Deterministic: clusters sorted by room id, members by node id, parallel edges fanned by index.
  * `mode` only decides which edges are dimmed; `filters` (see filterSnapshot) decide what is drawn at all.
  */
-export function layoutScene(snapshot, { mode = 'activity', filters = {} } = {}) {
+export function layoutScene(snapshot, { mode = 'activity', filters = {}, aspect = 1.35 } = {}) {
   const view = filterSnapshot(snapshot || {}, filters);
   const agents = view.agents.map((a) => ({ ...a }));
   const byId = new Map(agents.map((a) => [a.node_id, a]));
   for (const e of view.edges) for (const id of [e.from, e.to]) if (id && !byId.has(id)) { const stub = personStub(id); byId.set(id, stub); agents.push(stub); }
+  // A person has no room id of their own; they belong to the room(s) their edges are in (else the room of the agent on the other end).
+  for (const p of agents.filter((a) => a.kind === 'person')) {
+    const rs = new Set();
+    for (const e of view.edges) {
+      if (e.from !== p.node_id && e.to !== p.node_id) continue;
+      if (e.room_id) rs.add(e.room_id); else for (const r of list(byId.get(e.from === p.node_id ? e.to : e.from)?.room_ids)) rs.add(r);
+    }
+    p.room_ids = [...rs].sort();
+  }
+  const compact = aspect < 0.8, asp = Math.max(0.5, Math.min(1.8, aspect));
   const roles = new Map();
   const role = (id, r, task) => { if (!id) return; if (!roles.has(id)) roles.set(id, []); roles.get(id).push({ role: r, task }); };
   for (const t of view.tasks) { role(t.accountable_owner, 'owner', t.task_id); role(t.reviewer, 'reviewer', t.task_id); for (const c of list(t.contributors)) role(c, 'contributor', t.task_id); }
@@ -260,27 +282,31 @@ export function layoutScene(snapshot, { mode = 'activity', filters = {} } = {}) 
   const groups = groupByRoom(agents, view.rooms);
   const radii = groups.map((g) => clusterRadius(g.members.length));
   const k = groups.length, maxR = Math.max(0, ...radii);
+  const sx = k <= 1 ? Math.max(0.85, Math.sqrt(asp)) : 1, sy = k <= 1 ? Math.max(0.85, 1 / Math.sqrt(asp)) : 1;   // one room: its members sit on an ellipse shaped like the canvas
   const orbit = k <= 1 ? 0 : k === 2 ? maxR + 24 : maxR / Math.sin(Math.PI / k) + 24;
   const rooms = [], nodes = [];
   groups.forEach((g, gi) => {
     const angle = k <= 1 ? 0 : -Math.PI / 2 + (2 * Math.PI * gi) / k;
     const cx = k <= 1 ? 0 : orbit * Math.cos(angle) * 1.25, cy = k <= 1 ? 0 : orbit * Math.sin(angle);
     const n = g.members.length, ringR = n <= 1 ? 0 : memberRing(n);
+    const rx = n <= 1 ? radii[gi] : ringR * sx + LABEL_BELOW + 12, ry = n <= 1 ? radii[gi] : ringR * sy + LABEL_BELOW + 12;
     g.members.forEach((m, i) => {
       const a = n <= 1 ? 0 : -Math.PI / 2 + (2 * Math.PI * i) / n;
       const ctx = contextInfo(m.context, m.context_health), st = stateInfo(m.state);
       nodes.push({
-        id: m.node_id, x: r1(cx + ringR * Math.cos(a)), y: r1(cy + ringR * Math.sin(a)), r: NODE_R, room: g.id, person: m.kind === 'person' || isPerson(m.node_id),
+        id: m.node_id, x: r1(cx + ringR * sx * Math.cos(a)), y: r1(cy + ringR * sy * Math.sin(a)), r: NODE_R, room: g.id, person: m.kind === 'person' || isPerson(m.node_id),
         name: nodeName(m), model: modelLabel(m), modelKnown: Boolean(m.model), provider: m.provider || null, host: m.host_id || null,
         ctx, ring: ringGeometry(ctx.fraction), state: st, provenance: m.provenance || 'unknown', parent: m.parent_session_id || null,
-        modelChanges: list(m.model_changes).length, compactions: m.compactions || 0, drift: m.drift_warnings || 0, driftItems: driftItems(m), lastEventAt: m.last_event_at || null,
+        modelChanges: list(m.model_changes).length, switchedFrom: switchedFrom(m), hasDrift: !m.kind && (list(m.drift).length > 0 || (m.drift_warnings || 0) > 0), compactions: m.compactions || 0, drift: m.drift_warnings || 0, driftItems: driftItems(m), lastEventAt: m.last_event_at || null,
         roles: roles.get(m.node_id) || [], agent: m,
       });
     });
     const rh = list(view.rooms).find((r) => r.room_id === g.id)?.context_health;
-    rooms.push({ id: g.id, ctx: contextInfo(null, rh && Number.isFinite(rh.average_fraction) ? { measured: true, fraction: rh.average_fraction } : null), label: roomLabel(g.id), cx: r1(cx), cy: r1(cy), r: r1(radii[gi]), members: g.members.map((m) => m.node_id) });
+    rooms.push({ id: g.id, ctx: contextInfo(null, rh && Number.isFinite(rh.average_fraction) ? { measured: true, fraction: rh.average_fraction } : null), name: list(view.rooms).find((r) => r.room_id === g.id)?.name || null, label: roomLabel(g.id, list(view.rooms).find((r) => r.room_id === g.id)?.name),
+      cx: r1(cx), cy: r1(cy), r: r1(Math.max(rx, ry)), rx: r1(rx), ry: r1(ry), members: g.members.map((m) => m.node_id) });
   });
 
+  for (const n of nodes) n.roomLabel = rooms.find((r) => r.id === n.room)?.label || roomLabel(n.room);
   const at = new Map(nodes.map((n) => [n.id, n]));
   const pairs = new Map();
   const live = view.edges.filter((e) => at.has(e.from) && at.has(e.to) && e.from !== e.to);
@@ -305,11 +331,14 @@ export function layoutScene(snapshot, { mode = 'activity', filters = {} } = {}) 
   placeLabels(edges, nodes);
   for (const e of edges) delete e.at;
 
-  const pad = CLUSTER_PAD;
-  const xs = rooms.flatMap((r) => [r.cx - r.r, r.cx + r.r]), ys = rooms.flatMap((r) => [r.cy - r.r, r.cy + r.r]);
-  const minX = xs.length ? Math.min(...xs) - pad / 2 : -200, maxX = xs.length ? Math.max(...xs) + pad / 2 : 200;
-  const minY = ys.length ? Math.min(...ys) - pad / 2 : -140, maxY = ys.length ? Math.max(...ys) + pad / 2 : 140;
-  return { mode, nodes, edges, rooms, tasks: view.tasks, viewBox: { x: r1(minX), y: r1(minY), w: r1(maxX - minX), h: r1(maxY - minY) },
+  // Fit: the box around every room ellipse and node (with its labels), padded, never smaller than a sane minimum so one node is not blown up.
+  const xs = [...rooms.flatMap((r) => [r.cx - r.rx, r.cx + r.rx]), ...nodes.flatMap((n) => [n.x - HALO_R, n.x + HALO_R])];
+  const ys = [...rooms.flatMap((r) => [r.cy - r.ry, r.cy + r.ry]), ...nodes.flatMap((n) => [n.y - HALO_R, n.y + LABEL_BELOW])];
+  let minX = xs.length ? Math.min(...xs) - 12 : -260, maxX = xs.length ? Math.max(...xs) + 12 : 260;
+  let minY = ys.length ? Math.min(...ys) - 12 : -170, maxY = ys.length ? Math.max(...ys) + 12 : 170;
+  const grow = (lo, hi, min) => (hi - lo >= min ? [lo, hi] : [(lo + hi) / 2 - min / 2, (lo + hi) / 2 + min / 2]);
+  [minX, maxX] = grow(minX, maxX, 520); [minY, maxY] = grow(minY, maxY, 340);
+  return { mode, nodes, edges, rooms, tasks: view.tasks, viewBox: { x: r1(minX), y: r1(minY), w: r1(maxX - minX), h: r1(maxY - minY) }, compact,
     counts: { nodes: nodes.length, edges: edges.length, rooms: rooms.length, tasks: view.tasks.length }, cursor: snapshot?.cursor ?? null, truncated: Boolean(snapshot?.truncated) };
 }
 
@@ -341,7 +370,7 @@ export function diffSnapshots(prev, next) {
 export function describeNode(n) {
   const who = n.person ? `Person ${n.name}` : `Agent ${n.name}`;
   const parts = [who, n.person ? '' : `model ${n.modelKnown ? n.model : 'unknown'}`, n.person ? '' : n.ctx.known ? n.ctx.words : 'context unknown',
-    `state ${n.state.label.toLowerCase()}`, n.host ? `host ${n.host}` : '', `${roomLabel(n.room).toLowerCase()}`,
+    `state ${n.state.label.toLowerCase()}`, n.hasDrift ? 'drift signal (heuristic)' : '', n.switchedFrom ? `model switched from ${n.switchedFrom}` : '', n.host ? `host ${n.host}` : '', n.roomLabel || roomLabel(n.room),
     ...n.roles.map((r) => `${r.role} of task ${r.task}`)];
   return parts.filter(Boolean).join(', ');
 }
@@ -352,7 +381,7 @@ export function describeEdge(e, scene) {
 /** Rows for the visually hidden table that carries everything the picture says. */
 export function altTable(scene) {
   return {
-    nodes: scene.nodes.map((n) => ({ id: n.id, name: n.name, model: n.person ? '' : n.model, context: n.person ? '' : n.ctx.label, state: n.state.label, room: roomLabel(n.room), host: n.host || '' })),
+    nodes: scene.nodes.map((n) => ({ id: n.id, name: n.name, model: n.person ? '' : n.model, context: n.person ? '' : n.ctx.label, state: n.state.label, room: n.roomLabel || roomLabel(n.room), host: n.host || '' })),
     edges: scene.edges.map((e) => ({ id: e.id, kind: e.style.kindLabel, from: scene.nodes.find((n) => n.id === e.from)?.name || e.from, to: scene.nodes.find((n) => n.id === e.to)?.name || e.to, state: e.style.state, line: e.style.line, task: e.task || '' })),
   };
 }

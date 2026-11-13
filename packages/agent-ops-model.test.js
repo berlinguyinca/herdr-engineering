@@ -314,3 +314,68 @@ test('handoff edge states stalled and failed have distinct styles and text', () 
   assert.equal(stalled.line, 'stalled'); assert.ok(stalled.dash); assert.equal(stalled.flowing, false); assert.match(stalled.label, /stalled/);
   assert.equal(failed.line, 'dotted'); assert.equal(failed.flowing, false);
 });
+
+// ---- visual pass: fit, person in room, labels, names, markers -----------------------------------------------------------------
+const ROOM = (over = {}) => ({
+  agents: ['c', 'o', 'q', 'g'].map((id) => agent(id, { room_ids: ['rX'], label: id })),
+  rooms: [{ room_id: 'rX', name: 'product-dev', agent_ids: ['c', 'o', 'q', 'g'] }],
+  edges: [edge('message' === 'x' ? 'x' : 'communication', 'user:alice', 'c', 'sent', { room_id: 'rX' }), edge('handoff', 'o', 'q', 'completed', { room_id: 'rX', handoff_id: 'h1' }),
+    edge('handoff', 'q', 'g', 'stalled', { room_id: 'rX', handoff_id: 'h2' }), edge('delegation', 'c', 'q', 'planned', { room_id: 'rX', task_id: 't9' }), edge('ownership', 'c', 'q', 'transferred', { room_id: 'rX', task_id: 't9' })],
+  tasks: [], cursor: null, ...over,
+});
+
+test('a person who takes part in a room sits inside that room, not in a No-room cluster', () => {
+  const s = layoutScene(ROOM());
+  const alice = s.nodes.find((n) => n.id === 'user:alice');
+  assert.equal(alice.room, 'rX');
+  assert.deepEqual(s.rooms.map((r) => r.id), ['rX']);
+  const r = s.rooms[0];
+  assert.ok(Math.hypot((alice.x - r.cx) / r.rx, (alice.y - r.cy) / r.ry) <= 1, 'inside the room ellipse');
+});
+
+test('the Room filter drops a person whose edges belong to another room', () => {
+  const snap = ROOM({ agents: [...ROOM().agents, agent('z', { room_ids: ['rY'] })], rooms: [...ROOM().rooms, { room_id: 'rY', agent_ids: ['z'] }],
+    edges: [...ROOM().edges, edge('communication', 'user:bob', 'z', 'sent', { room_id: 'rY' })] });
+  const f = layoutScene(snap, { filters: { room: 'rX' } });
+  assert.deepEqual(f.nodes.map((n) => n.id).sort(), ['c', 'g', 'o', 'q', 'user:alice']);
+  assert.ok(f.nodes.every((n) => n.room === 'rX'));
+  assert.ok(!layoutScene(snap, { filters: { room: 'rY' } }).nodes.some((n) => n.id === 'user:alice'));
+});
+
+test('the scene is fitted: the viewBox hugs the content and follows the requested aspect', () => {
+  const wide = layoutScene(ROOM(), { aspect: 1.5 }), tall = layoutScene(ROOM(), { aspect: 0.6 });
+  assert.ok(wide.viewBox.w / wide.viewBox.h > tall.viewBox.w / tall.viewBox.h);
+  assert.ok(tall.viewBox.w < wide.viewBox.w, 'a phone scene is narrower, so it scales up less to fit');
+  assert.ok(tall.compact && !wide.compact);
+  for (const s of [wide, tall]) for (const n of s.nodes) {
+    const vb = s.viewBox;
+    assert.ok(n.x - RING_R >= vb.x && n.x + RING_R <= vb.x + vb.w && n.y - RING_R >= vb.y && n.y + RING_R + 40 <= vb.y + vb.h, `${n.id} fits`);
+  }
+  const one = layoutScene({ agents: [agent('solo')], rooms: [], edges: [], tasks: [] });
+  assert.ok(one.viewBox.w >= 520, 'a single node is not blown up to fill the canvas');
+});
+
+test('edge labels never overlap each other: a label with no free spot goes quiet instead', () => {
+  const s = layoutScene(ROOM());
+  const shown = s.edges.filter((e) => !e.labelQuiet);
+  assert.ok(shown.length >= 1);
+  for (const a of shown) for (const b of shown) if (a.id < b.id) {
+    const x = Math.abs(a.labelBox.x - b.labelBox.x) < (a.labelBox.w + b.labelBox.w) / 2, y = Math.abs(a.labelBox.y - b.labelBox.y) < (a.labelBox.h + b.labelBox.h) / 2;
+    assert.ok(!(x && y), `${a.id} / ${b.id} overlap`);
+  }
+});
+
+test('room title is the room name; unknown name falls back to a shortened id', () => {
+  assert.equal(layoutScene(ROOM()).rooms[0].label, 'product-dev');
+  const noName = layoutScene(ROOM({ rooms: [{ room_id: 'room_0123456789ABCDEFRZGBJ', name: null, agent_ids: [] }], agents: ROOM().agents.map((a) => ({ ...a, room_ids: ['room_0123456789ABCDEFRZGBJ'] })) }));
+  assert.match(noName.rooms[0].label, /^Room room_0….*ZGBJ$/);
+  assert.deepEqual(filterOptions(ROOM()).roomName, { rX: 'product-dev' });
+});
+
+test('drift and model switches are node signals of their own, distinct from handoff edges', () => {
+  const snap = ROOM({ agents: [agent('c', { room_ids: ['rX'], drift: [{ kind: 'reported_drift_warning', provenance: 'derived', evidence_event_ids: [] }], model: 'opus', model_changes: [{ from: 'sonnet', to: 'opus', at: 't' }] }),
+    agent('o', { room_ids: ['rX'] })], rooms: [{ room_id: 'rX', agent_ids: ['c', 'o'] }], edges: [] });
+  const [c, o] = layoutScene(snap).nodes;
+  assert.equal(c.hasDrift, true); assert.equal(c.switchedFrom, 'sonnet'); assert.equal(o.hasDrift, false); assert.equal(o.switchedFrom, null);
+  assert.match(describeNode(c), /drift signal \(heuristic\)/); assert.match(describeNode(c), /model switched from sonnet/);
+});
