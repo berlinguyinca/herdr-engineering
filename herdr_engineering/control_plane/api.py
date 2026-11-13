@@ -558,12 +558,15 @@ class ControlPlaneServer:
         _bridge_cfg = rakazo_bridge_config(rakazo_bridge)
         if _bridge_cfg["enabled"]:       # the assistant user ids the bridge accounts act as (hashes, no email), for ci_watch.users
             log.info("rakazo bridge assistant users: %s", ", ".join(a.principal_id for a in _bridge_cfg["accounts"]))
+        from .collab_http import HttpCollab
         self.rakazo = (RakazoBridge(_bridge_cfg, self.assistant, version=__version__,
                                     persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     space_persistence=PostgresSpacePersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     prefs_persistence=PostgresPrefsPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     push_persistence=PostgresPushPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
-                                    collab=collab, artifacts_fn=lambda: RegistryBackend(self))
+                                    collab=collab if collab is not None else (HttpCollab(collab_operator_url.rstrip("/"))
+                                                      if collab_operator_url else None),
+                                    artifacts_fn=lambda: RegistryBackend(self))
                        if _bridge_cfg["enabled"] else None)
         self._build_assistant_apps(assistant_apps_dsn)
         if self.rakazo is not None:
