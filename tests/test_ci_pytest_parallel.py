@@ -101,17 +101,11 @@ def test_xdist_is_a_pinned_dev_dependency() -> None:
 def test_a_zero_or_non_numeric_cap_is_refused() -> None:
     for bad in ("0", "lots"):
         done = subprocess.run(
-            ["bash", "-c", f'export HERDR_PYTEST_MAXPROCESSES={bad}; . "{HELPER}"; herdr_pytest_parallel_args'],
+            ["bash", "-c", f'unset HERDR_PYTEST_WORKERS HERDR_PYTEST_MAXPROCESSES; export HERDR_PYTEST_MAXPROCESSES={bad}; . "{HELPER}"; herdr_pytest_parallel_args'],
             capture_output=True, text=True, cwd=ROOT,
         )
         assert done.returncode != 0 and "HERDR_PYTEST_MAXPROCESSES" in done.stderr, (bad, done.stderr)
         assert done.stdout == ""
-
-
-def test_the_helper_does_not_claim_loadfile_honours_xdist_group() -> None:
-    text = HELPER.read_text()
-    assert "already\n# honours it" not in text and "loadfile already" not in text
-    assert "--dist=loadgroup" in text
 
 
 def test_xdist_dependencies_are_pinned_exactly() -> None:

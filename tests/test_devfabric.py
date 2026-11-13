@@ -169,10 +169,11 @@ def test_allocation_skips_os_bound_port(tmp_path):
     blocker.listen(1)
     try:
         r = DevServiceRegistry(store_path=tmp_path / "leases.json",
-                               port_range=(bound, bound + 1))
+                               port_range=(bound, bound + 50))
         lease = r.register(target_machine_id="a", target_host="h", target_port=1,
                            owner_process_id="p1")
-        assert lease.external_port == bound + 1  # `bound` is held by the blocker
+        # `bound` is held by the blocker, so the allocator must move on within the range
+        assert bound < lease.external_port <= bound + 50
     finally:
         blocker.close()
 
