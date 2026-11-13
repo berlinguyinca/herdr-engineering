@@ -8,6 +8,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Fleet rollout watcher step 5: service, lock pinning, resume/abandon (off by default)
 - `herdr-eng fleet-watch loop` (poll + plan; rolls out only with `--enable-rollouts`; flock single instance; soft limit warns, hard limit exits only after no progress), user unit `herdr-eng-fleet-watch.service` and `ansible/tasks/fleet-watch.yml` (disabled unless `fleet_watch_enabled: true` on beast). `lock.pin_repos` moves `fleet.lock.yaml` only after a full success with the D3 published-history check, atomically with a backup; `herdr-eng fleet lock verify`. `fleet-watch resume|abandon` (the `run --resume` flag is a deprecated alias). New reasons `downgrade`, `lock_invalid`. Nothing is enabled by this change. See `docs/operations/fleet-rollout-watcher.md`.
 
+### Design: always-on review pane
+
+- Added `docs/superpowers/specs/2026-11-13-always-on-review-pane-design.md`, a proposal for a dedicated two-tier review process (advisory open-weight first pass, Opus on mergeable heads posting `Opus agent review`) with measured open-weight evidence, a replay-set plan, failure modes and rollback. Docs only.
+
 ### Test fix: cargo target-storage CLI test no longer depends on ambient CARGO_TARGET_DIR
 
 - `test_target_management_cli_enable_and_migration_safety` inherited the host environment; a CI agent exporting `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR` made the migrator report "Explicit target setting remains authoritative" instead of "same filesystem". The test now drops those two variables from the child environment and separately asserts the explicit-override verdict. No production code changed.
