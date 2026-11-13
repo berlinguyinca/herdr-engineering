@@ -622,6 +622,16 @@ def test_bots_map_to_assistants_with_one_thread_each(srv, alice):
     assert api.rpc("bots/create", {"name": ""}, alice)[0] == 400
 
 
+@pytest.mark.parametrize("proc", ["threads/send", "threads/head", "threads/get", "threads/messages"])
+def test_an_unknown_bot_id_is_a_plain_404_not_a_logged_bug(srv, alice, caplog, proc):
+    # the Shepherd TUI sends a herdr agent id as botId; that is a normal not-found (its terminal-input fallback trigger)
+    _, api = srv
+    with caplog.at_level(logging.WARNING):
+        status = api.rpc(proc, {"botId": "not-an-assistant", "text": "hi", "clientNonce": "n1"}, alice)[0]
+    assert status == 404
+    assert "KeyError" not in caplog.text
+
+
 def test_an_assistant_made_elsewhere_for_the_same_principal_shows_up_with_its_existing_thread(srv, alice):
     svr, api = srv
     acct = svr.rakazo.accounts[0]
