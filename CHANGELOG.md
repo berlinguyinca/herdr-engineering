@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Design: always-on review pane
+
+- Added `docs/superpowers/specs/2026-11-13-always-on-review-pane-design.md`, a proposal for a dedicated two-tier review process (advisory open-weight first pass, Opus on mergeable heads posting `Opus agent review`) with measured open-weight evidence, a replay-set plan, failure modes and rollback. Docs only.
+
 ### herdr-handoff: one place resolves the pin, and doctor checks what the CLI can actually do
 
 - `scripts/install-handoff.sh` is now the only thing that installs or refreshes the required herdr-handoff dependency: it reads the revision from `lock/upstreams.yaml` (`HERDR_HANDOFF_REF` overrides for a controlled rollout), fetches it into `~/.local/share/herdr-handoff/<rev>`, installs the CLI into `HERDR_HANDOFF_PYTHON` (or via `uv tool` where there is no pip), links the four harness skills, and prints the revision it resolved. `scripts/install.sh` step 3 calls it instead of carrying its own default revision, which had drifted from the pin (install.sh cloned `3051d8c` while `lock/upstreams.yaml` declared `c425453`), so a machine could be "fully installed" a revision behind a dependency it declares required and nothing said so. `--plan` prints the resolution and touches nothing.
