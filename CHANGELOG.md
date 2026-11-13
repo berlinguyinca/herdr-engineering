@@ -9,6 +9,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - `GET /api/v1/sessions/{id}/inspector/history` now continues into `fabric_events_archive` once the requested range goes past what the archive job moved out of `fabric_events`. The two tables are merged under the one keyset order and the same opaque cursor, so a page can straddle the boundary with no gap and no duplicate (a row present in both is returned once). No new setting: with no archive table, behaviour is unchanged. Replaces the earlier caveat that archived rows were not read; the archive job itself stays off by default.
 
+### Design: always-on review pane
+
+- Added `docs/superpowers/specs/2026-11-13-always-on-review-pane-design.md`, a proposal for a dedicated two-tier review process (advisory open-weight first pass, Opus on mergeable heads posting `Opus agent review`) with measured open-weight evidence, a replay-set plan, failure modes and rollback. Docs only.
+
+### Test fix: cargo target-storage CLI test no longer depends on ambient CARGO_TARGET_DIR
+
+- `test_target_management_cli_enable_and_migration_safety` inherited the host environment; a CI agent exporting `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR` made the migrator report "Explicit target setting remains authoritative" instead of "same filesystem". The test now drops those two variables from the child environment and separately asserts the explicit-override verdict. No production code changed.
+
 ### Inspector snapshot boot: used on the complete-replay fallback, strictly validated
 
 - With projection checkpoints on (the default), a missing or rejected checkpoint fell back to a complete replay that ignored `inspector_snapshots` and re-ran every stored inspector row through redaction. That fallback now hands the stored snapshot to the repo, which verifies it by count and ordering and replays everything on any doubt.
@@ -27,6 +35,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Rakazo bridge: `open_owner_origins` (default unchanged)
 - New optional `control_plane.rakazo_bridge.open_owner_origins` (list of 1-8 `scheme://[host]` strings, default `["rakazo://"]`): the exact `Origin` values `open_owner` accepts, so a second native app can use it. http/https, wildcards, whitespace and duplicates are refused at startup; every other guard (network allowlist, proxy checks, 30s interval, operator account) is unchanged. Tests: `tests/control_plane/test_rakazo_bridge.py`.
+
+### CI: unit-gates runs pytest in parallel (pytest-xdist)
+- `scripts/ci/unit-gates.sh` now runs `python -m pytest -q -n auto --maxprocesses=8 --dist=loadfile` (arguments come from `scripts/ci/pytest-parallel.sh`), so the ~90 minute serial run is spread over workers; a file's tests stay on one worker. Overrides: `HERDR_PYTEST_WORKERS=<n>|auto|0` (0 = serial as before), `HERDR_PYTEST_MAXPROCESSES=<cap>`. The file-descriptor floor still applies first (the limit is per process, so each worker leaks only its share). Nothing is deselected or skipped. `pytest-xdist==3.8.0` is pinned in the `dev` extra. Tests: `tests/test_ci_pytest_parallel.py`.
+- `join.sh --stop` now uses `ps -ww`: xdist workers export `COLUMNS=80`, which made `ps -o args=` truncate the worker's command line before `worker.sh`, so `--stop` silently stopped nothing (`tests/control_plane/test_collab_join_script.py` failed only under xdist).
 
 ### Fleet rollout watcher step 4: host-apply and the serial runner (manual, `--apply` required)
 - `herdr-eng fleet host-apply` (precheck/apply/health/rollback per repo, D6 checkout gate, idempotent `no_change`, `fleet-auto-update.lock`, atomic Pi `current` switch keeping 3 releases) and `herdr-eng fleet-watch run [--apply]` (serial beast -> bender -> macbook-pro, halt on first failure, durable crash-resume, ssh timeouts, D8 rollback for pointer flips and ff-only, events through the existing emitter/outbox). Output and events carry no free text. No systemd unit (step 5). Tests: `tests/test_fleet_host_apply.py`, `tests/test_fleet_watch_run.py`. See `docs/operations/fleet-rollout-events.md`.
