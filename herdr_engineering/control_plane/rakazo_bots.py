@@ -22,6 +22,7 @@ _META: dict[str, Any] = {
     "avatarSet": lambda v: v in ("organic", "rakazo"),
     "notifyOnFinish": lambda v: isinstance(v, bool),
     "pinned": lambda v: isinstance(v, bool),
+    "isDefault": lambda v: isinstance(v, bool),
     "memoryScope": lambda v: v in (None, "isolated", "shared"),
     "sectionId": lambda v: v is None or (isinstance(v, str) and bool(v)),
     "voiceId": lambda v: v is None or (isinstance(v, str) and len(v) <= 120),
@@ -110,12 +111,20 @@ class Bots:
                 patch["instructions"] = text
         if "sectionId" in meta and meta["sectionId"] is not None and meta["sectionId"] not in self._sections(ctx):
             raise self.Error(404, "NOT_FOUND", "Not found.")
+        if meta.get("isDefault") is True:
+            self._clear_default(ctx, except_id=assistant.assistant_id)
         if meta:
             self._put_meta(ctx, assistant.assistant_id, meta)
         if patch:
             self.b.svc.update_assistant(assistant.assistant_id, tenant_id=ctx.tenant, user_id=ctx.user, patch=patch)
             assistant = self._assistant(ctx, inp)
         return self.b._bot(ctx, assistant)
+
+    def _clear_default(self, ctx, except_id: str) -> None:
+        """At most one default bot per space: drop the flag from every other bot."""
+        for bot_id, meta in self.prefs.items(ctx.account.account_id, ctx.space, META_KIND).items():
+            if bot_id != except_id and meta.get("isDefault"):
+                self.b.prefs_put(ctx.account.account_id, ctx.space, META_KIND, bot_id, {**meta, "isDefault": False})
 
     def _remember_instructions(self, ctx, assistant) -> None:
         key = assistant.assistant_id
@@ -178,7 +187,7 @@ class Bots:
             copy = self.b.svc.create_assistant(tenant_id=ctx.tenant, user_id=ctx.user,
                                                name=(source.name + " copy")[:80], instructions=source.instructions,
                                                enabled=True)
-        keep = {k: v for k, v in self.meta(ctx, source.assistant_id).items() if k not in ("archivedAt", "pinned")}
+        keep = {k: v for k, v in self.meta(ctx, source.assistant_id).items() if k not in ("archivedAt", "pinned", "isDefault")}
         if keep:
             self._put_meta(ctx, copy.assistant_id, keep)
         return self.b._bot(ctx, copy)

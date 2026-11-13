@@ -89,3 +89,47 @@ def test_duplicate_computer_unread_and_misc(srv, alice):
     assert api.ok("bots/get", {"botId": bot["id"]}, alice)["unread"] is False
     validate("bots/reorder", api.ok("bots/reorder", {"botIds": [bot["id"]]}, alice))
     validate("threads/endCall", api.ok("threads/endCall", {"botId": bot["id"], "callId": "c1"}, alice))
+
+
+def _listed(api, token):
+    return {b["id"]: b for b in api.ok("bots/list", {}, token)}
+
+
+def test_list_includes_isdefault_false_by_default(srv, alice):
+    _, api = srv
+    bot = new_bot(api, alice)
+    assert _listed(api, alice)[bot["id"]]["isDefault"] is False
+    assert api.ok("bots/get", {"botId": bot["id"]}, alice)["isDefault"] is False
+
+
+def test_update_sets_default_and_clears_previous(srv, alice):
+    _, api = srv
+    a, b = new_bot(api, alice, "A"), new_bot(api, alice, "B")
+    assert api.ok("bots/update", {"botId": a["id"], "isDefault": True}, alice)["isDefault"] is True
+    api.ok("bots/update", {"botId": b["id"], "isDefault": True}, alice)
+    listed = _listed(api, alice)
+    assert [i for i, v in listed.items() if v["isDefault"]] == [b["id"]]
+
+
+def test_update_rejects_non_bool_isdefault(srv, alice):
+    _, api = srv
+    bot = new_bot(api, alice)
+    status, body = rpc(api, "bots/update", {"botId": bot["id"], "isDefault": "yes"}, alice)
+    assert status == 400 and "BAD_REQUEST" in str(body)
+
+
+def test_duplicate_does_not_copy_isdefault(srv, alice):
+    _, api = srv
+    bot = new_bot(api, alice)
+    api.ok("bots/update", {"botId": bot["id"], "isDefault": True}, alice)
+    copy = api.ok("bots/duplicate", {"botId": bot["id"]}, alice)
+    assert copy["isDefault"] is False
+    assert api.ok("bots/get", {"botId": bot["id"]}, alice)["isDefault"] is True
+
+
+def test_archive_default_leaves_no_default_listed(srv, alice):
+    _, api = srv
+    bot = new_bot(api, alice)
+    api.ok("bots/update", {"botId": bot["id"], "isDefault": True}, alice)
+    api.ok("bots/archive", {"botId": bot["id"]}, alice)
+    assert bot["id"] not in _listed(api, alice)
