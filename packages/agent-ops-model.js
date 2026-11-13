@@ -237,27 +237,76 @@ function curve(a, b, bend) {
 // Edge labels: try the middle of the curve first, then slide along it, keeping clear of earlier labels and of node halos.
 // When no spot is free the label turns quiet (shown on hover, focus or selection) instead of printing over other text.
 const LABEL_H = 18, LABEL_CHAR = 7, LABEL_TS = [0.5, 0.42, 0.58, 0.34, 0.66, 0.27, 0.73, 0.2, 0.8, 0.14, 0.86], LABEL_DYS = [0, -20, 20, -38, 38];
-const SAMPLES = 48;
+const CROWD_CAP = 4;   // past this many collisions a spot is just "crowded": a quiet label does not need an exact count
+const SAMPLE_GAP = 12, MAX_SAMPLES = 240, GRID_CELL = 40;
+/** Uniform grid over [minX,maxX]x[minY,maxY]: an item goes into every cell its extent touches (clamped at the border), so a box query only looks at nearby cells. */
+function makeGrid(minX, minY, maxX, maxY) {
+  const cols = Math.max(1, Math.ceil((maxX - minX) / GRID_CELL) + 1), rows = Math.max(1, Math.ceil((maxY - minY) / GRID_CELL) + 1);
+  const cells = Array.from({ length: cols * rows }, () => null);
+  const cx = (x) => Math.min(cols - 1, Math.max(0, Math.floor((x - minX) / GRID_CELL)));
+  const cy = (y) => Math.min(rows - 1, Math.max(0, Math.floor((y - minY) / GRID_CELL)));
+  return {
+    add(item, x0, x1, y0, y1) {
+      for (let gx = cx(x0), ex = cx(x1); gx <= ex; gx += 1) for (let gy = cy(y0), ey = cy(y1); gy <= ey; gy += 1) { const k = gx * rows + gy; if (cells[k]) cells[k].push(item); else cells[k] = [item]; }
+    },
+    /** Calls visit(item) for every item in the cells touched by the box; visit returns true to stop. */
+    query(x0, x1, y0, y1, visit) {
+      for (let gx = cx(x0), ex = cx(x1); gx <= ex; gx += 1) for (let gy = cy(y0), ey = cy(y1); gy <= ey; gy += 1) { const c = cells[gx * rows + gy]; if (c) for (let i = 0; i < c.length; i += 1) if (visit(c[i])) return; }
+    },
+  };
+}
 function placeLabels(items, nodes, charW = LABEL_CHAR) {
-  const placed = [];
-  // Every edge is sampled along its curve: a label box that contains a point of ANOTHER edge sits on that edge's line and counts as crowded.
-  const lines = items.map((it) => Array.from({ length: SAMPLES + 1 }, (_, i) => it.at(i / SAMPLES)));
-  const onOtherLine = (box, self) => lines.reduce((n, pts, i) => (i !== self && pts.some((p) => Math.abs(p.x - box.x) < box.w / 2 + 2 && Math.abs(p.y - box.y) < box.h / 2 + 2) ? n + 1 : n), 0);
+  if (!items.length) return;
+  // Every edge is sampled along its curve (a point at most SAMPLE_GAP px apart, so a label box cannot slip between samples):
+  // a label box that contains a point of ANOTHER edge sits on that edge's line and counts as crowded.
+  const pts = [];
+  items.forEach((it, i) => {
+    const n = Math.min(MAX_SAMPLES, Math.max(8, Math.ceil((it.length * 1.25) / SAMPLE_GAP)));
+    for (let k = 0; k <= n; k += 1) { const p = it.at(k / n); pts.push(i, p.x, p.y); }
+  });
+  const count = pts.length / 3, PI = new Int32Array(count), PX = new Float64Array(count), PY = new Float64Array(count);
+  for (let k = 0; k < count; k += 1) { PI[k] = pts[3 * k]; PX[k] = pts[3 * k + 1]; PY[k] = pts[3 * k + 2]; }
+  const xs = [...PX, ...nodes.map((n) => n.x)], ys = [...PY, ...nodes.map((n) => n.y)];
+  const [minX, maxX, minY, maxY] = [xs.reduce((m, v) => Math.min(m, v), Infinity), xs.reduce((m, v) => Math.max(m, v), -Infinity), ys.reduce((m, v) => Math.min(m, v), Infinity), ys.reduce((m, v) => Math.max(m, v), -Infinity)];
+  const lineGrid = makeGrid(minX, minY, maxX, maxY);
+  for (let k = 0; k < count; k += 1) lineGrid.add(k, PX[k], PX[k], PY[k], PY[k]);
+  const rectGrid = makeGrid(minX, minY, maxX, maxY);
+  const addRect = (b) => rectGrid.add(b, b.x - b.w / 2, b.x + b.w / 2, b.y - b.h / 2, b.y + b.h / 2);
+  nodes.flatMap((n) => [{ x: n.x, y: n.y, w: 2 * RING_R, h: 2 * RING_R }, { x: n.x, y: n.y + RING_R + 22, w: 170, h: 18 }, { x: n.x, y: n.y + RING_R + 46, w: 170, h: 20 }]).forEach(addRect);
   const hit = (a, b) => Math.abs(a.x - b.x) < (a.w + b.w) / 2 && Math.abs(a.y - b.y) < (a.h + b.h) / 2;
-  const blocks = nodes.flatMap((n) => [{ x: n.x, y: n.y, w: 2 * RING_R, h: 2 * RING_R }, { x: n.x, y: n.y + RING_R + 22, w: 170, h: 18 }, { x: n.x, y: n.y + RING_R + 46, w: 170, h: 20 }]);
+  const rectSeen = new Set(), lineStamp = new Int32Array(items.length).fill(-1);
+  let stampNo = 0;
+  // Crowd of a box = overlapping labels/halos + other edges running through it; counting stops once it can no longer beat `limit`.
+  const crowdOf = (box, self, limit) => {
+    let n = 0;
+    rectSeen.clear(); stampNo += 1;
+    rectGrid.query(box.x - box.w / 2, box.x + box.w / 2, box.y - box.h / 2, box.y + box.h / 2, (b) => {
+      if (rectSeen.has(b)) return false;
+      rectSeen.add(b);
+      if (hit(box, b)) n += 1;
+      return n >= limit;
+    });
+    if (n >= limit) return n;
+    const hw = box.w / 2 + 2, hh = box.h / 2 + 2;
+    lineGrid.query(box.x - hw, box.x + hw, box.y - hh, box.y + hh, (k) => {
+      if (Math.abs(PX[k] - box.x) < hw && Math.abs(PY[k] - box.y) < hh && PI[k] !== self && lineStamp[PI[k]] !== stampNo) { lineStamp[PI[k]] = stampNo; n += 1; return n >= limit; }
+      return false;
+    });
+    return n;
+  };
   for (const [self, it] of items.entries()) {
     const w = String(it.label || '').length * charW + 10;
     let best = null;
     search: for (const t of LABEL_TS) for (const dy of LABEL_DYS) {
       const p = it.at(t), box = { x: p.x, y: p.y - 6 + dy, w, h: LABEL_H };
-      const crowd = placed.filter((b) => hit(box, b)).length + blocks.filter((b) => hit(box, b)).length + onOtherLine(box, self);
+      const crowd = crowdOf(box, self, best ? best.crowd : CROWD_CAP);
       if (!best || crowd < best.crowd) best = { crowd, box };
       if (!crowd) break search;
     }
     it.labelBox = { x: r1(best.box.x), y: r1(best.box.y), w: best.box.w, h: best.box.h };
     it.labelAt = { x: it.labelBox.x, y: r1(best.box.y + 6) };
     it.labelQuiet = best.crowd > 0;   // no free spot: the label shows on hover, focus or selection (text stays in the aria-label, legend and table)
-    if (!it.labelQuiet) placed.push(best.box);
+    if (!it.labelQuiet) addRect(best.box);
   }
 }
 
@@ -359,7 +408,7 @@ export function layoutScene(snapshot, { mode = 'activity', filters = {}, aspect:
 const NARROW = new Set([...".iljtfrI,:;'|! "]), WIDE = new Set([...'mwMW']);
 export function estimateTextWidth(str, px, mono = false) {
   if (mono) return [...String(str)].length * px * 0.605;
-  return [...String(str)].reduce((w, ch) => w + px * (NARROW.has(ch) ? 0.38 : WIDE.has(ch) ? 0.92 : ch >= 'A' && ch <= 'Z' ? 0.70 : 0.58), 0);
+  return [...String(str)].reduce((w, ch) => w + px * (NARROW.has(ch) ? 0.38 : WIDE.has(ch) ? 0.92 : ch >= 'A' && ch <= 'Z' ? 0.70 : ch.codePointAt(0) >= 0x1100 ? 1 : 0.58), 0);
 }
 /** Width of the horizontal chord of the node body that a text line (baseline y, font size px) may use, minus `pad` on each side. */
 export function chordWidth(baselineY, px, pad = 6, radius = NODE_R) {
