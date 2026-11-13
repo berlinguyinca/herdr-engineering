@@ -9,6 +9,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - New `deploy/ci-review/always-on-review.py` builds on `ai-review.py`: tier 1 `Open-weight pre-review` (advisory, pi) and tier 2 `Opus agent review` (claude, only for heads with all gates green), pluggable `gateway` / `claude` / `pi` backends chosen in YAML only, strict verdict parsing, one review per head SHA, cooldown, time cap, detached read-only worktree, scrubbed environment. Posting needs `post: true` in config and `--post`. Nothing is installed or enabled; added example config, systemd --user service/timer and a herdr pane tail script. `ai-review.py` gained an optional schema argument on `Gateway.chat` and `Gh.check_runs`.
 
+### Docs: ruleset now requires `Opus agent review`
+
+- Ruleset 25691548 requires the commit status `Opus agent review`, posted by a Claude session after an Opus subagent reviews the exact head (re-post after any push). `Independent AI review` (`ai-review.py`) is advisory; the different-model-family rule no longer holds. Docs only.
+
 ### Inspector history reads the archive too
 
 - `GET /api/v1/sessions/{id}/inspector/history` now continues into `fabric_events_archive` once the requested range goes past what the archive job moved out of `fabric_events`. The two tables are merged under the one keyset order and the same opaque cursor, so a page can straddle the boundary with no gap and no duplicate (a row present in both is returned once). No new setting: with no archive table, behaviour is unchanged. Replaces the earlier caveat that archived rows were not read; the archive job itself stays off by default.
