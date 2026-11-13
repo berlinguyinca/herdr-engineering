@@ -390,6 +390,13 @@ def _build_parser() -> argparse.ArgumentParser:
     pha.add_argument("--busy-retries", type=int, default=5, help="fleet-auto-update.lock retries (default 5)")
     pha.add_argument("--busy-wait", type=float, default=60.0, help="seconds between lock retries (default 60)")
     pha.set_defaults(func=_cmd_fleet_host_apply)
+    pl = fsub.add_parser("lock", help="fleet.lock.yaml checks (the lock means 'converged', never 'wanted')")
+    lsub = pl.add_subparsers(dest="fleet_lock_command", required=True)
+    plv = lsub.add_parser("verify", help="read-only: every repos pin must be published main history "
+                                         "(exit 1 names the bad pins, 2 if the lock is unreadable)")
+    plv.add_argument("--lock", default="~/.config/herdr-fleet/fleet.lock.yaml", help="lock file to check")
+    plv.add_argument("--json", action="store_true")
+    plv.set_defaults(func=_cmd_fleet_lock_verify)
     pd = fsub.add_parser("drift", help="show tool/plugin versions that differ across hosts, with suggested fixes")
     pd.add_argument("--control-plane", default=None,
                     help="control plane URL (default: host.json control_plane_url)")
@@ -1752,6 +1759,27 @@ def _cmd_fleet_config(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0
+
+
+def _cmd_fleet_lock_verify(args) -> int:
+    from .fleet_watch import lock, state
+    try:
+        with state.single_instance(state.state_dir()):      # the watcher fetches into the same cache clones
+            rows = lock.verify_lock(args.lock, converged=state.load().get("converged", {}))
+    except state.WatcherBusy:
+        print(json.dumps({"ok": False, "status": "busy"}) if args.json else "lock verify: busy (watcher pass running)")
+        return 3
+    except lock.LockRefused:
+        print(f"fleet lock verify: cannot read the repos section of {args.lock}", file=sys.stderr)
+        return 2
+    bad = [r for r in rows if r["status"] not in ("ok", "unwatched")]
+    if args.json:
+        print(json.dumps({"ok": not bad, "pins": rows}, sort_keys=True))
+    else:
+        for r in rows:
+            print(f"{r['repo']}: {r['status']} {r['sha'][:12] or '-'}")
+        print("lock verify: ok" if not bad else f"lock verify: {len(bad)} pin(s) not publishable")
+    return 1 if bad else 0
 
 
 def _cmd_fleet_host_apply(args) -> int:
@@ -4468,6 +4496,11 @@ def _cmd_cp_web(args) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")   # boot phase timings
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
     _validate_graph_merge_gate(cp)
+    from .control_plane import stall_watch
+    try:
+        gc_tuning = stall_watch.parse_gc_config(cp.get("gc"))     # a bad control_plane.gc stops startup before anything binds
+    except ValueError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
     switch_store = fleet_store
     replay_flag = getattr(args, "collab_replay_history", None)      # an explicit --collab-replay-history wins over the YAML
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
@@ -4813,9 +4846,8 @@ def _cmd_cp_web(args) -> int:
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
                  "host": args.host, "port": args.port,
                  "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})
-    from .control_plane import stall_watch
     watch = stall_watch.install()
-    logging.info("froze %d boot objects out of garbage collection", stall_watch.freeze_boot_heap())
+    stall_watch.tune_gc(gc_tuning)
     try:
         svr.serve()
     except KeyboardInterrupt:
@@ -5089,7 +5121,7 @@ STARTUP_ONLY_COLLAB_KEYS = frozenset(COLLAB_CONFIG_KEYS) - frozenset(HOT_COLLAB_
 
 
 # control_plane keys read ONCE at startup: editing them needs a restart (unlike HOT_COLLAB_SWITCHES)
-RESTART_REQUIRED_KEYS = ("review_quorum", "lineage_key_scopes", "api_keys", "ci_actions", "pg_dsn", "architecture")
+RESTART_REQUIRED_KEYS = ("review_quorum", "lineage_key_scopes", "api_keys", "ci_actions", "pg_dsn", "architecture", "gc")
 
 
 def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
