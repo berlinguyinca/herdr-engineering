@@ -571,7 +571,9 @@ class ControlPlaneServer:
         self._build_assistant_apps(assistant_apps_dsn)
         if self.rakazo is not None:
             self.rakazo.single_operator_fn = lambda: self.single_operator
-            self.rakazo.operator_user_fn = lambda: self.operator_user
+            # the split deployment has no operator_user here; the collab service names its own operator (HTTP mode only)
+            self.rakazo.operator_user_fn = lambda: self.operator_user or (
+                self.rakazo.collab.operator_user() if isinstance(self.rakazo.collab, HttpCollab) else None)
         self._build_reminders(assistant_apps_dsn)
         self.assistant.canonical_person = self._canonical_person
         from .ingest import IngestService

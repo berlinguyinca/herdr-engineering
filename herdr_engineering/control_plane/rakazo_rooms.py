@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -487,8 +488,10 @@ class Rooms:
             if prefix:
                 text = f"{prefix} {text}"
         key = inp.get("clientNonce") if isinstance(inp.get("clientNonce"), str) and inp["clientNonce"] else None
-        status, out = self.call(self.collab.post_message, pr, rid,
-                                {"text": text.strip(), "idempotency_key": key or "rk-" + secrets.token_hex(12)})
+        if key is None:       # no client nonce: a retry of the same text within the minute is the same message
+            seed = f"{ctx.account.account_id}|{rid}|{text.strip()}|{int(time.time() // 60)}"
+            key = "rk-" + hashlib.sha256(seed.encode()).hexdigest()[:32]
+        status, out = self.call(self.collab.post_message, pr, rid, {"text": text.strip(), "idempotency_key": key})
         event = out["event"]
         return {"taskId": event["event_id"], "runId": event["event_id"], "seq": event["sequence"]}
 

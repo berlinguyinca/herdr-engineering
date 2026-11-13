@@ -7,8 +7,8 @@ single-tenant: it serves only the principal whose id is the operator's and refus
 
 Rules: no retries (a lost reply to ``post_message`` is reported, never repeated); a service that cannot be reached is a
 503 ``CollabError``; the service's own refusals keep their status (404 stays 404); a route the service does not have is
-the service's 404, never guessed around. Not served over HTTP: ``read_tail`` (built from the paged event feed) and
-``room_people`` (read from the room-state route, which also lists people).
+the service's 404, never guessed around. ``read_tail`` and ``room_people`` use the service's side-effect-free
+``events/tail`` and ``people`` routes, so the collab service must be deployed together with this client.
 """
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import deque
 from typing import Any
 
 from .collab import CollabError, Principal
@@ -27,8 +26,14 @@ BASE = "/api/v1/collab"
 TIMEOUT = 15.0
 MAX_BODY = 4_000_000
 OPERATOR_TTL = 60.0
-PAGE = 200
-_END = 2**62       # a cursor past every event: the room-state route then answers people, agents and tasks without events
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None                      # the answer is the 3xx itself, which _request refuses
+
+
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)   # never via an environment proxy
 
 
 class HttpCollab:
@@ -36,22 +41,27 @@ class HttpCollab:
         self.url = operator_url.rstrip("/")
         self.timeout = timeout
         self._operator: tuple[str, float] | None = None
+        self.requests = 0                    # calls made, for tests and diagnostics
         self._lock = threading.Lock()
 
     # transport -----------------------------------------------------------------------------------------------------
     def _request(self, method: str, path: str, query: dict[str, Any] | None = None,
-                 body: dict[str, Any] | None = None) -> tuple[int, Any]:
+                 body: dict[str, Any] | None = None, *, unknown_outcome: str | None = None) -> tuple[int, Any]:
+        self.requests += 1
         url = self.url + BASE + path + ("?" + urllib.parse.urlencode(query) if query else "")
         data = json.dumps(body if body is not None else {}).encode() if method == "POST" else None
         req = urllib.request.Request(url, data=data, method=method,
                                      headers={"Content-Type": "application/json"} if data is not None else {})
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:      # noqa: S310 (operator-configured URL)
-                status, raw = resp.status, resp.read(MAX_BODY)
-        except urllib.error.HTTPError as exc:
-            status, raw = exc.code, exc.read(MAX_BODY)
+            try:
+                with _OPENER.open(req, timeout=self.timeout) as resp:
+                    status, raw = resp.status, resp.read(MAX_BODY)
+            except urllib.error.HTTPError as exc:
+                status, raw = exc.code, exc.read(MAX_BODY)
         except Exception:                                                        # noqa: BLE001 - refused, timed out, DNS
-            raise CollabError(503, "collaboration service unavailable") from None
+            raise CollabError(503, "collaboration service unavailable" + (f"; {unknown_outcome}" if unknown_outcome else "")) from None
+        if status >= 500 and status not in (502, 503) or 300 <= status < 400:
+            raise CollabError(502, "collaboration service answered unexpectedly")
         try:
             out = json.loads(raw) if raw else {}
         except ValueError:
@@ -119,27 +129,10 @@ class HttpCollab:
         return self._get(pr, self._seg("rooms", room_id) + "/events", {"cursor": cursor, "limit": limit})
 
     def read_tail(self, pr, room_id, limit):
-        """The newest ``limit`` events, oldest first: the service has no tail route, so the feed is paged and trimmed."""
-        keep: deque = deque(maxlen=max(limit, 0))
-        cursor = 0
-        while True:
-            page = self.read_events(pr, room_id, cursor, PAGE)
-            keep.extend(page["events"])
-            if not page["has_more"] or page["next_cursor"] <= cursor:
-                break
-            cursor = page["next_cursor"]
-        events = list(keep)
-        return {"events": events, "next_cursor": events[-1]["sequence"] if events else 0}
+        return self._get(pr, self._seg("rooms", room_id) + "/events/tail", {"limit": limit})
 
     def room_people(self, pr, room_id):
-        """Handles of the people in the room. The state route lists only people the service has a handle for; the owner's
-        member list (the same user ids) fills in the rest with the in-process fallback handle, so both agree."""
-        state = self._get(pr, self._seg("rooms", room_id) + "/state", {"since": -1, "cursor": _END})
-        people = {p["user_id"]: p for p in state["people"]}
-        for m in self._get(pr, self._seg("rooms", room_id)).get("members", []):
-            uid = m["user_id"]
-            people.setdefault(uid, {"user_id": uid, "handle": uid.split("@")[0], "online": False})
-        return list(people.values())
+        return self._get(pr, self._seg("rooms", room_id) + "/people")["people"]
 
     def list_steering(self, pr, room_id, query):
         return self._get(pr, self._seg("rooms", room_id) + "/steering", query or None)
@@ -168,7 +161,8 @@ class HttpCollab:
 
     def post_message(self, pr, room_id, body):
         self._only(pr)
-        return self._request("POST", self._seg("rooms", room_id) + "/messages", None, body)
+        return self._request("POST", self._seg("rooms", room_id) + "/messages", None, body,
+                             unknown_outcome="the message may or may not have been posted; check the room before sending again")
 
     def confirm_steering(self, pr, room_id, steer_id, body):
         return self._post(pr, self._seg("rooms", room_id, "steering", steer_id) + "/confirm", body)

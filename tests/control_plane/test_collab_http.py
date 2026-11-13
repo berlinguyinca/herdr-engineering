@@ -3,8 +3,13 @@
 
 A real CollabService is served by a collab-only ControlPlaneServer with an operator listener on an ephemeral port; the
 dashboard-side server has no in-process collab and only ``collab_operator_url``, as in production."""
+import copy
+import json
 import socket
+import socketserver
 import threading
+import time
+import urllib.request
 
 import pytest
 
@@ -116,12 +121,13 @@ def test_the_client_refuses_a_principal_that_is_not_the_operator(remote):
         remote.http.post_message(Principal("user", "bob", "bob"), remote.room, {"text": "x", "idempotency_key": "k"})
 
 
-def test_service_down_is_503_and_a_wrong_url_is_never_retried(remote):
+def test_service_down_is_503_and_the_operator_stays_unknown(remote):
     dead = HttpCollab(f"http://127.0.0.1:{_free_port()}", timeout=2)
     with pytest.raises(CollabError) as e:
         dead.list_rooms(remote.alice)
     assert e.value.status == 503
-    assert dead.acts_for("anyone") is True            # operator unknown: not linked away, every call still refuses
+    assert dead.requests == 1                          # one attempt to learn the operator, no retry
+    assert dead.acts_for("anyone") is True             # operator unknown: not linked away, every call still refuses
 
 
 def test_unknown_room_keeps_the_services_404(remote):
@@ -130,13 +136,165 @@ def test_unknown_room_keeps_the_services_404(remote):
     assert e.value.status == 404
 
 
-def test_read_tail_pages_and_trims(remote, monkeypatch):
-    monkeypatch.setattr("herdr_engineering.control_plane.collab_http.PAGE", 7)       # force several pages
-    for i in range(25):
+def _fill(remote, n):
+    """n messages in the room; the service rate-limits posting per minute, so move its clock between batches."""
+    for i in range(n):
+        if i and i % 40 == 0:
+            remote.s.clock.t += 120
         remote.s.post_message(remote.alice, remote.room, {"text": f"m{i}", "idempotency_key": f"k{i}"})
-    tail = remote.http.read_tail(remote.alice, remote.room, 5)
-    assert tail == remote.s.read_tail(remote.alice, remote.room, 5)
-    assert [e["text"] for e in tail["events"]][-1] == "m24"
+
+
+def test_tail_is_one_request_however_large_the_room(remote):
+    _fill(remote, 130)
+    remote.http.operator_user()                        # learn the operator first: count only the tail reads
+    before = remote.http.requests
+    for limit in (100, 1):                             # a group view, then a head / mark-read
+        tail = remote.http.read_tail(remote.alice, remote.room, limit)
+        assert tail == remote.s.read_tail(remote.alice, remote.room, limit)
+        assert len(tail["events"]) == limit
+    assert remote.http.requests - before == 2
+    assert tail["events"][-1]["text"] == "m129"
+
+
+def test_people_changes_no_presence_and_needs_no_state_waiter_slot(remote):
+    svc, room = remote.s, remote.room
+    base = f"{remote.http.url}/api/v1/collab/rooms/{room}/state"
+    seq = json.load(urllib.request.urlopen(f"{base}?since=-1", timeout=5))["seq"]
+    seen_before = copy.deepcopy(svc._seen)
+
+    def long_poll():
+        try:
+            urllib.request.urlopen(f"{base}?since={seq}&wait=6", timeout=15).read()
+        except Exception:                                                  # noqa: BLE001 - only holding a slot
+            pass
+    waiters = [threading.Thread(target=long_poll, daemon=True) for _ in range(svc.MAX_STATE_WAITERS)]
+    for t in waiters:
+        t.start()
+    deadline = time.monotonic() + 5
+    while sum(svc._state_waiters.values()) < svc.MAX_STATE_WAITERS and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert sum(svc._state_waiters.values()) == svc.MAX_STATE_WAITERS         # the dashboard holds every slot
+    seen_mid = copy.deepcopy(svc._seen)
+    people = remote.http.room_people(remote.alice, room)
+    assert {p["user_id"] for p in people} == {"alice", "bob", "carol", "dave"}
+    assert people == _norm(svc.room_people(remote.alice, room))
+    assert svc._seen == seen_mid                                             # reading people marked nobody present
+    assert seen_before.keys() <= svc._seen.keys()
+    svc.post_message(remote.alice, room, {"text": "wake", "idempotency_key": "w1"})
+    for t in waiters:
+        t.join(10)
+
+
+# ------------------------------------------------------------------------------------------------ transport rules
+class _Raw(socketserver.ThreadingTCPServer):
+    """A real TCP server whose answers the test scripts byte for byte (the collab service never sends these)."""
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, script):
+        self.hits = []
+
+        class H(socketserver.StreamRequestHandler):
+            def handle(h):
+                line = h.rfile.readline().decode()
+                while h.rfile.readline() not in (b"\r\n", b""):
+                    pass
+                self.hits.append(line.split()[0] + " " + line.split()[1])
+                reply = script(line)
+                if reply is not None:
+                    h.wfile.write(reply)
+        super().__init__(("127.0.0.1", 0), H)
+        threading.Thread(target=self.serve_forever, daemon=True).start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.server_address[1]}"
+
+
+def _http(status, body=b"{}", extra=""):
+    return f"HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n{extra}Connection: close\r\n\r\n".encode() + body
+
+
+def _script(rest):
+    """/me answers the operator; every other request gets ``rest(line)``."""
+    return lambda line: _http(200, b'{"user_id": "alice"}') if " /api/v1/collab/me" in line else rest(line)
+
+
+@pytest.fixture()
+def raw():
+    servers = []
+
+    def make(rest):
+        srv = _Raw(_script(rest))
+        servers.append(srv)
+        return srv
+    yield make
+    for srv in servers:
+        srv.shutdown()
+        srv.server_close()
+
+
+ALICE = Principal("user", "alice", "alice")
+
+
+@pytest.mark.parametrize("status", [500, 501, 504, 413, 301, 302, 307])
+def test_unexpected_service_statuses_are_a_bad_gateway(raw, status):
+    srv = raw(lambda line: _http(status, b'{"error": "x"}', "Location: http://127.0.0.1:1/x\r\n"))
+    with pytest.raises(CollabError) as e:
+        HttpCollab(srv.url).list_rooms(ALICE)
+    assert e.value.status == (413 if status == 413 else 502)       # 4xx keeps its meaning; 5xx and 3xx never reach the app as is
+    assert len([h for h in srv.hits if "/me" not in h]) == 1       # a redirect is never followed
+
+
+def test_a_500_reaches_the_app_as_502_bad_gateway(raw):
+    from herdr_engineering.control_plane import rakazo_rooms as rr
+    srv = raw(lambda line: _http(500, b'{"error": "internal error"}'))
+    with pytest.raises(CollabError) as e:
+        HttpCollab(srv.url).list_rooms(ALICE)
+    assert e.value.status == 502 and rr._CODES[502] == "BAD_GATEWAY"
+
+
+def test_a_body_that_dies_midway_is_a_bad_gateway_not_a_crash(raw):
+    srv = raw(lambda line: b"HTTP/1.1 404 X\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{")
+    with pytest.raises(CollabError) as e:
+        HttpCollab(srv.url).list_rooms(ALICE)
+    assert e.value.status == 502
+
+
+def test_a_lost_post_is_reported_unknown_and_is_never_sent_twice(raw):
+    srv = raw(lambda line: None)                                    # reads the request, then hangs up
+    with pytest.raises(CollabError) as e:
+        HttpCollab(srv.url).post_message(ALICE, "room_x", {"text": "hi", "idempotency_key": "k1"})
+    assert e.value.status == 503 and "unavailable" in e.value.message and "may or may not" in e.value.message
+    assert [h for h in srv.hits if "/messages" in h] == ["POST /api/v1/collab/rooms/room_x/messages"]
+
+
+def test_the_environment_proxy_is_never_used(raw, monkeypatch):
+    srv = raw(lambda line: _http(200, b'{"rooms": []}'))
+    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{_free_port()}")
+    monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{_free_port()}")
+    assert HttpCollab(srv.url).list_rooms(ALICE) == {"rooms": []}
+
+
+def test_a_send_without_a_nonce_is_idempotent_on_retry(world):
+    sent = ok(world.api, "threads/send", {"groupId": world.room, "text": "no nonce"}, world.alice_t)
+    again = ok(world.api, "threads/send", {"groupId": world.room, "text": "no nonce"}, world.alice_t)
+    assert again["seq"] == sent["seq"]
+
+
+# ------------------------------------------------------------------------------------------------ implicit linking
+def test_the_operator_account_links_with_no_collab_user_when_the_service_names_its_operator(svc, operator):
+    w = W(svc)
+    server = _start(collab_operator_url=f"http://127.0.0.1:{operator.operator_port}", single_operator=True,
+                    rakazo_bridge=bridge_section(accounts=[dict(ACCOUNTS[0]), dict(ACCOUNTS[1])]),
+                    assistant_service=AssistantService(config=assistant_config({"personal_assistant": {"enabled": True}})))
+    try:
+        api = Api(server.port)
+        alice_t = api.login("alice@example.com", PW_A)
+        assert {g["name"] for g in ok(api, "groups/list", {}, alice_t)} == {"r", "r2"}      # alice is the operator
+        assert w.room in {g["id"] for g in ok(api, "groups/list", {}, alice_t)}
+    finally:
+        server.shutdown()
 
 
 # ------------------------------------------------------------------------------------------------ contract
