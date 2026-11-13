@@ -675,8 +675,19 @@ class AgentOpsService:
     def viewer(self, principal: Any = None, operator: bool = False) -> Viewer:
         rooms = frozenset(self.collab.readable_room_ids(principal)) if self.collab and principal is not None else frozenset()
         guests = self._guest_rooms(principal, rooms)
+        # Fail closed: someone who is (or ever was) a guest and reads no other room has nothing to see. A lapsed or
+        # revoked guest keeps a valid sign-in, so without this they would fall back to org-scoped visibility.
+        guest_only = (bool(guests) and guests == rooms) or (not rooms and self._was_guest(principal))
         return Viewer(rooms=rooms, operator=operator, external=bool(getattr(principal, "external", False)),
-                      guest_rooms=guests, guest_only=bool(guests) and guests == rooms)
+                      guest_rooms=guests, guest_only=guest_only)
+
+    def _was_guest(self, principal: Any) -> bool:
+        collab = self.collab
+        if collab is None or principal is None:
+            return False
+        with collab._lock:
+            uid = principal.id if principal.kind == "user" else (collab._agents.get(principal.id) or {}).get("owner")
+            return bool(uid) and uid in collab._ever_guests
 
     def _guest_rooms(self, principal: Any, rooms: frozenset) -> frozenset:
         """Rooms where the caller (or the person an agent acts for) is a guest."""
