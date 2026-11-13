@@ -757,3 +757,33 @@ def test_snapshot_rooms_carry_the_collab_room_name_only_when_readable(stack):
     ingest(stack.repo, 2, "tool.started", session_id="sb", agent_id="agent-b", room_id="room-unknown", visibility_scope="room")
     op = AgentOpsService(stack.repo).snapshot(Viewer(operator=True, rooms=frozenset({"room-unknown"})))
     assert all(r["name"] is None for r in op["rooms"])
+
+
+# ------------------------------------------------------------------------------ cursors the server issues are accepted (round 4)
+def test_every_issued_cursor_at_max_field_lengths_is_valid_and_round_trips_over_http(stack):
+    from urllib.parse import quote
+    server = Server(stack.repo, stack.collab, agent_ops_config={"enabled": True})
+    try:
+        long_id = "h" * 160
+        for hid, agent in (("ho-tab", "tab\tagent"), ("ho-tilde", "~" * 160), (long_id, "s" * 160),
+                           ("ho-ok", "alice-agent")):
+            server.srv.handoffs.create({"handoff_id": hid, "source_harness": "pi", "target_harness": "claude",
+                                        "goal": "g", "source_agent_id": agent, "source_session_id": "x" * 160,
+                                        "target_agent_id": "t" * 160, "target_session_id": "s2",
+                                        "room_id": stack.rooms["alice"]}, {"id": "alice"})
+        ingest(stack.repo, 1, "tool.started", event_id="e" * 128, source="s" * 32, agent_id="g" * 160,
+               session_id="z" * 160)
+        events = agent_ops.handoff_events(server.srv.handoffs) + agent_ops.envelope_events(stack.repo)
+        assert len(events) >= 5
+        for e in events:
+            cursor = cursor_of(e)
+            assert agent_ops.valid_cursor(cursor), cursor[:80]
+        status, page = server.get("/api/v1/agent-ops/events?limit=100", key="op-key")
+        assert status == 200 and page["events"]
+        for row in page["events"]:
+            assert row["cursor"] == cursor_of(row) and agent_ops.valid_cursor(row["cursor"])
+            for path in ("events?cursor=", "replay?until="):
+                status, _ = server.get(f"/api/v1/agent-ops/{path}{quote(row['cursor'], safe='')}", key="op-key")
+                assert status == 200, (path, row["event_id"][:40], status)
+    finally:
+        server.stop()

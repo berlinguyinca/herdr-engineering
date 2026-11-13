@@ -175,3 +175,30 @@ def test_label_at_the_cap_is_accepted_and_direct_call_is_bounded():
     t = time.perf_counter()
     assert len(sanitize_label("a." * 50000)) <= 80
     assert time.perf_counter() - t < 1.0
+
+
+@pytest.mark.parametrize("raw", ["dbpass=hunter2", "passphrase=hunter2", "passcode: 123456", "userpass: hunter2",
+                                 "pass_phrase: hunter2", "mypwd=hunter2", "dbpwd: hunter2", "my secret was hunter2",
+                                 "db-pass -> hunter2"])
+def test_label_compound_pass_and_pwd_keys_redact(raw):
+    out = sanitize_label(raw)
+    assert "hunter2" not in out and "123456" not in out and "[redacted]" in out
+
+
+@pytest.mark.parametrize("raw", ["tests passed: 42", "bypass", "compass", "passport", "CI/CD", "deadline 11/12/2026",
+                                 "11/12/2026", "bypass: yes", "compass: north", "passport: check"])
+def test_label_compound_pass_negatives_are_untouched(raw):
+    assert sanitize_label(raw) == raw
+
+
+@pytest.mark.parametrize("raw", ["1/2/3/etc/passwd", "12/34/56.py", "11/12/2026/x", "123/456/789"])
+def test_label_digit_prefixed_paths_are_redacted(raw):
+    assert sanitize_label(raw) == "[path]"
+
+
+@pytest.mark.parametrize("raw", ["token-" * 85, "㍿" * 512])
+def test_label_regex_cost_is_bounded(raw):
+    import time
+    t = time.perf_counter()
+    sanitize_label(raw)
+    assert time.perf_counter() - t < 0.25
