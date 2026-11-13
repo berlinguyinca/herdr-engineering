@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Design: always-on review pane
+
+- Added `docs/superpowers/specs/2026-11-13-always-on-review-pane-design.md`, a proposal for a dedicated two-tier review process (advisory open-weight first pass, Opus on mergeable heads posting `Opus agent review`) with measured open-weight evidence, a replay-set plan, failure modes and rollback. Docs only.
+
 ### Test fix: cargo target-storage CLI test no longer depends on ambient CARGO_TARGET_DIR
 
 - `test_target_management_cli_enable_and_migration_safety` inherited the host environment; a CI agent exporting `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR` made the migrator report "Explicit target setting remains authoritative" instead of "same filesystem". The test now drops those two variables from the child environment and separately asserts the explicit-override verdict. No production code changed.
