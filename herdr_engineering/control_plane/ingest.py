@@ -146,7 +146,7 @@ DISPATCHED_ENTITY_TYPES = frozenset({"lineage", "host", "session", "mission", "s
 # authoritative reads them back, and like mission/session they are only reflected into lineage when the operator
 # turned the adapter on.
 GENERIC_ENTITY_TYPES = frozenset({"task", "note", "workspace", "ledger", "platform", "lifecycle",
-                                  "repository", "request", "span"})
+                                  "repository", "request", "span", "communication"})
 INGEST_ENTITY_TYPES = DISPATCHED_ENTITY_TYPES | GENERIC_ENTITY_TYPES
 # Event types the server itself writes for an allowed entity type: receipts other code trusts as idempotency
 # markers (repo.send_message, ci_debug, bridge). A client may not name them.
@@ -464,6 +464,9 @@ class IngestService:
         report never consumes its event id/sequence: the corrected retry with
         the same idempotency identity can still be applied.
         """
+        if entity_type == "communication":
+            from .communications import validate_observation
+            validate_observation(entity_id, event_type, payload)
         if entity_type == "mission":
             validate_mission_id(entity_id, source)
         if entity_type == "lineage":
@@ -575,6 +578,10 @@ class IngestService:
                                           validate_fleet_rollout(entity_id, event_type, payload))
             return {"entity_type": "fleet_rollout", "entity_id": entity_id, "event_type": event_type,
                     "duplicate": not stored}
+        if entity_type == "communication":
+            from .communications import record_observation
+            stored = record_observation(self.repo, payload)
+            return {"entity_type": entity_type, "entity_id": entity_id, "duplicate": not stored}
         if entity_type == "host":
             return self._ingest_host(entity_id, event_type, payload, source)
         if entity_type == "session":

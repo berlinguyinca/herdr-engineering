@@ -743,13 +743,15 @@ class ControlPlaneRepo:
             try:
                 self.record_event("session", session_id, "SessionCommandQueued",
                                   dict(result), session_id=session_id, require_durable=True)
+                from .communications import record_command
+                record_command(self, session, result)
             except Exception:
                 result.update(status="failed", error="receipt_persistence_failed")
                 return result
             if dispatcher is None:
                 return result
             try:
-                delivery = dispatcher(_deep_copy(session), message, list(artifact_ids))
+                delivery = dispatcher({**_deep_copy(session), "communication_operation_id": operation_id}, message, list(artifact_ids))
                 if not isinstance(delivery, dict) or delivery.get("status") != "delivered":
                     raise ValueError("transport did not acknowledge delivery")
                 result["status"] = "delivered"
@@ -760,6 +762,7 @@ class ControlPlaneRepo:
             try:
                 self.record_event("session", session_id, "SessionCommandSettled",
                                   _deep_copy(result), session_id=session_id, require_durable=True)
+                record_command(self, session, result)
             except Exception:
                 # The durable queued receipt prevents resending after restart.
                 result.update(status="queued", error="receipt_settlement_unknown")

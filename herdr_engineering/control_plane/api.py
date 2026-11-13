@@ -1583,7 +1583,12 @@ class ControlPlaneServer:
             raise InvalidError("native session identity changed; refresh before delivery")
         if matches[0].interactive_ready is False or matches[0].launch_pending:
             raise InvalidError("native agent is not ready for prompt delivery")
-        return adapter.send_input(target, message, machine=machine, session=server)
+        prompt_target = matches[0].pane_id or target
+        operation_id = record.get("communication_operation_id")
+        if operation_id:
+            return adapter.send_input(prompt_target, message, machine=machine, session=server,
+                                      operation_id=operation_id)
+        return adapter.send_input(prompt_target, message, machine=machine, session=server)
 
     def _canonical_person(self, tenant, user):
         """Single-operator rule (RakazoBridge.canonical_person); identity when there is no bridge."""
@@ -3717,7 +3722,11 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
             if resource == "mission-outcomes" and len(parts) == 4:
-                from .mission_outcome import issue_refs_by_mission, outcome_summaries, pr_refs_by_mission
+                from .mission_outcome import (
+                    issue_refs_by_mission,
+                    outcome_summaries,
+                    pr_refs_by_mission,
+                )
                 try:
                     server.mission_outcomes.sweep()
                 except Exception:  # noqa: BLE001
@@ -3915,6 +3924,9 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     return self._etag_json(h) if h else self._json(
                         {"error": "not found"}, 404)
                 return self._etag_json({"hosts": r.list_hosts()})
+            if resource == "communications" and len(parts) == 4:
+                from .communications import communication_page
+                return self._json(communication_page(r, limit=_qint(self.path, "limit", 50), before=_q(self.path, "before")))
             if resource == "activity":
                 evs = [_redact_event(e) for e in r.recent_events(limit=_qint(self.path, "limit", 50))
                        if self._sse_readable(e)]        # artifact events only for callers who may read that artifact
