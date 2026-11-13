@@ -19,7 +19,7 @@ Rollback: set `control_plane.agent_ops.enabled: false` (capability `agent_ops_v1
 Test evidence at 00daf836 (focused): 166 Python tests pass (agent_ops, envelope, health, adapters, tui); 48 web unit tests pass.
 Known flaky: test_pi_null_context_after_compaction_emits_compaction_not_a_metric failed once in a combined run and passed on 5 reruns; test_interactive_pane_in_a_real_pty_against_the_real_server is timing based.
 
-Test evidence at final tip (5add21bf): 251 Python (same five files), 63 node, tests/playwright/agent-ops.test.mjs 12/12. Earlier at 5cc60e00: 240 Python tests (agent_ops, envelope, health, adapters, tui; two clean runs), 61 node tests (model 36, view 21, lineage 4), tests/playwright/agent-ops.test.mjs 11/11.
+Test evidence at final tip: 258 Python (same five files), 65 node, tests/playwright/agent-ops.test.mjs 12/12. Earlier at 5cc60e00: 240 Python tests (agent_ops, envelope, health, adapters, tui; two clean runs), 61 node tests (model 36, view 21, lineage 4), tests/playwright/agent-ops.test.mjs 11/11.
 Known flaky: test_interactive_pane_in_a_real_pty_against_the_real_server (timing); a Claude-hook adapter test once under load. nav-groups.test.mjs and calm.test.mjs fail/hang on the pre-mission base 22ecf0f1 too.
 
 ## Authz follow-up (after round 5)

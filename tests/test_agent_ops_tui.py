@@ -336,7 +336,7 @@ def test_interactive_pane_in_a_real_pty_against_the_real_server():
     import fcntl
     import os
     import pty
-    import select
+    import selectors
     import struct
     import subprocess
     import sys
@@ -353,12 +353,14 @@ def test_interactive_pane_in_a_real_pty_against_the_real_server():
         proc = subprocess.Popen([sys.executable, "-m", "herdr_engineering.cli", "agent-ops"], stdin=slave, stdout=slave,
                                 stderr=slave, env=env)
         seen = b""
+        sel = selectors.DefaultSelector()   # poll/kqueue: select() fails once the full suite leaks fds past 1024
+        sel.register(master, selectors.EVENT_READ)
 
         def pump(seconds):
             nonlocal seen
             end = time.time() + seconds
             while time.time() < end:
-                if select.select([master], [], [], 0.1)[0]:
+                if sel.select(0.1):
                     seen += os.read(master, 65536)
         pump(2.0)
         for key in (b"h", b"\x1b", b"?", b"\x1b", b"r", b"[", b"l", b"q"):
