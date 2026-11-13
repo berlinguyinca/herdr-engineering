@@ -666,11 +666,21 @@ class AgentOpsService:
     CACHE_TTL = 1.0                  # seconds a streaming reader may reuse one viewer's gathered events
     CACHE_MAX = 64
 
-    def __init__(self, repo: Any, collab: Any = None, handoffs: Any = None, now: Any = None):
-        self.repo, self.collab, self.handoffs = repo, collab, handoffs
+    def __init__(self, repo: Any, collab: Any = None, handoffs: Any = None, now: Any = None,
+                 collab_source: Any = None):
+        self.repo, self.handoffs = repo, handoffs
+        self._collab, self._collab_source = collab, collab_source     # source: callable giving the live collab
         self._now = now or time.time
         self._cache: dict[tuple, tuple[float, list[dict]]] = {}
         self._cache_lock = threading.Lock()
+
+    @property
+    def collab(self) -> Any:
+        return self._collab_source() if self._collab_source is not None else self._collab
+
+    @collab.setter
+    def collab(self, value: Any) -> None:
+        self._collab, self._collab_source = value, None
 
     def viewer(self, principal: Any = None, operator: bool = False) -> Viewer:
         rooms = frozenset(self.collab.readable_room_ids(principal)) if self.collab and principal is not None else frozenset()

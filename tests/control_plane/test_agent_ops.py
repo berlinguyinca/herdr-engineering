@@ -1029,3 +1029,14 @@ def test_external_agent_whose_room_binding_lapsed_sees_nothing(stack):
     assert viewer.rooms == frozenset() and viewer.guest_only
     assert stack.svc.snapshot(viewer, agent)["agents"] == []
     assert stack.svc.events(viewer, agent)["events"] == []
+
+
+def test_service_follows_the_live_server_collab(stack):
+    """`collab` may be swapped after startup: the service must read the same object `_agent_ops_caller` does."""
+    server = Server(stack.repo, None, agent_ops_config={"enabled": True})
+    try:
+        assert server.srv.agent_ops.collab is None
+        server.srv.collab = stack.collab
+        assert server.srv.agent_ops.collab is stack.collab
+    finally:
+        server.stop()

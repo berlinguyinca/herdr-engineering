@@ -649,7 +649,7 @@ class ControlPlaneServer:
         self.ci_reports_cache = SingleFlightCache(ttl=15.0)     # /api/v1/ci/reports, see single_flight_cache.py
         self.collab = collab
         from .agent_ops import AgentOpsService
-        self.agent_ops = AgentOpsService(repo, collab, self.handoffs)
+        self.agent_ops = AgentOpsService(repo, collab, self.handoffs, collab_source=lambda: self.collab)
         if self.assistant.host_candidates is None:       # looked up per call: `collab` may be swapped after startup
             self.assistant.host_candidates = lambda: (
                 self.collab.assistant_runtime_host_candidates() if self.collab is not None else [])
