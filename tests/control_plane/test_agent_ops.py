@@ -907,3 +907,125 @@ def test_same_api_key_different_sessions_stay_separate_nodes(stack):
     snap = stack.svc.snapshot(Viewer(operator=True))
     assert sorted(a["node_id"] for a in snap["agents"]) == ["sess-1", "sess-2", "sess-3"]
     assert {a["node_id"]: a["session_id"] for a in snap["agents"]} == {s: s for s in ("sess-1", "sess-2", "sess-3")}
+
+
+# ------------------------------------------------- "lapsed guest" means the LATEST membership was a guest one (S3)
+def test_guest_readded_as_contributor_is_no_longer_a_lapsed_guest(stack):
+    """Rule: lapsed guest = the person's most recent room membership was a guest one. Carol was a guest, is re-added
+    as a contributor (latest membership is non-guest) and then removed: she is NOT a lapsed guest, so she sees org
+    scope again. A later guest add makes her one again."""
+    bob, carol = stack.users["bob"], stack.users["carol"]
+    ingest(stack.repo, 1, "tool.started", session_id="so", agent_id="org-agent", visibility_scope="org")
+
+    def sees_org():
+        return [a["agent_id"] for a in stack.svc.snapshot(stack.svc.viewer(carol), carol)["agents"]] == ["org-agent"]
+    stack.collab.add_member(bob, stack.rooms["bob"], {"user_id": "carol", "role": "guest"})
+    stack.collab.remove_member(bob, stack.rooms["bob"], "carol")
+    assert not sees_org()                                                    # lapsed guest: nothing
+    stack.collab.add_member(bob, stack.rooms["bob"], {"user_id": "carol", "role": "contributor"})
+    stack.collab.remove_member(bob, stack.rooms["bob"], "carol")
+    assert sees_org()                                                        # latest membership was non-guest
+    stack.collab.add_member(bob, stack.rooms["bob"], {"user_id": "carol", "role": "guest"})
+    stack.collab.remove_member(bob, stack.rooms["bob"], "carol")
+    assert not sees_org()
+
+
+def test_ever_guests_is_rebuilt_identically_from_the_log(stack):
+    bob = stack.users["bob"]
+    stack.collab.add_member(bob, stack.rooms["bob"], {"user_id": "carol", "role": "guest"})
+    assert stack.collab._ever_guests == {"carol"}
+    stack.collab.remove_member(bob, stack.rooms["bob"], "carol")
+    stack.collab.add_member(bob, stack.rooms["bob"], {"user_id": "carol", "role": "contributor"})
+    assert stack.collab._ever_guests == set()
+    stack.collab.remove_member(bob, stack.rooms["bob"], "carol")
+    stack.collab.add_member(bob, stack.rooms["bob"], {"user_id": "carol", "role": "guest"})
+    fresh = CollabService(stack.collab.auth, sink=None)
+    fresh.hydrate(stack.collab._log)
+    assert fresh._ever_guests == stack.collab._ever_guests == {"carol"}
+
+
+def test_agent_of_an_owner_with_a_room_of_her_own_is_not_denied_for_having_once_been_a_guest(stack):
+    """alice owns a room and was once a guest in bob's: her enrolled agent (no grants) sees what a normal agent sees."""
+    alice, bob = stack.users["alice"], stack.users["bob"]
+    stack.collab.add_member(bob, stack.rooms["bob"], {"user_id": "alice", "role": "guest"})
+    stack.collab.remove_member(bob, stack.rooms["bob"], "alice")
+    info = stack.collab.connect_agent(alice, {"harness_type": "claude-code"})
+    agent = stack.collab.authenticate(f"Agent {info['credential']}", info["device_id"])
+    ingest(stack.repo, 1, "tool.started", session_id="so", agent_id="org-agent", visibility_scope="org")
+    viewer = stack.svc.viewer(agent)
+    assert not viewer.guest_only
+    assert [a["agent_id"] for a in stack.svc.snapshot(viewer, agent)["agents"]] == ["org-agent"]
+
+
+def test_agent_of_a_lapsed_guest_with_no_room_of_her_own_still_sees_nothing(stack):
+    bob, carol = stack.users["bob"], stack.users["carol"]
+    stack.collab.add_member(bob, stack.rooms["bob"], {"user_id": "carol", "role": "guest"})
+    stack.collab.remove_member(bob, stack.rooms["bob"], "carol")
+    info = stack.collab.connect_agent(carol, {"harness_type": "claude-code"})
+    agent = stack.collab.authenticate(f"Agent {info['credential']}", info["device_id"])
+    assert stack.svc.viewer(agent).guest_only
+
+
+# ------------------------------------------------- an external agent is treated like a guest (S2)
+def _get_raw(server, path, authorization, device, key):
+    conn = http.client.HTTPConnection("127.0.0.1", server.srv.port, timeout=5)
+    conn.request("GET", path, headers={"X-API-Key": key, "Authorization": authorization, "X-Herdr-Device": device})
+    resp = conn.getresponse()
+    raw = resp.read()
+    conn.close()
+    return resp.status, json.loads(raw) if raw else None
+
+
+def _enroll_external(stack, room):
+    inv = stack.collab.create_external_invite(stack.users["alice"], room, {"label": "Dana"})
+    out = stack.collab.redeem_join_token({"token": inv["code"]})
+    return out, stack.collab.authenticate(f"Agent {out['credential']}", out["device_id"])
+
+
+def test_external_agent_sees_only_its_room_chat_with_either_key(stack):
+    import time
+    out, _ = _enroll_external(stack, stack.rooms["alice"])
+    ingest(stack.repo, 1, "tool.started", session_id="so", agent_id="org-agent", visibility_scope="org")
+    ingest(stack.repo, 2, "tool.started", session_id="sp", agent_id="priv-agent", visibility_scope="private")
+    ingest(stack.repo, 3, "tool.started", session_id="sa", agent_id="agent-a", room_id=stack.rooms["alice"],
+           visibility_scope="room")
+    server = Server(stack.repo, stack.collab, agent_ops_config={"enabled": True})
+    try:
+        auth, dev = f"Agent {out['credential']}", out["device_id"]
+        for key in ("view-key", "op-key"):
+            status, snap = _get_raw(server, "/api/v1/agent-ops/snapshot", auth, dev, key)
+            assert status == 200, key
+            _, page = _get_raw(server, "/api/v1/agent-ops/events?limit=200", auth, dev, key)
+            _, replay = _get_raw(server, f"/api/v1/agent-ops/replay?until={snap['cursor']}", auth, dev, key)
+            for body in (snap, page, replay):
+                dump = json.dumps(body)
+                assert "org-agent" not in dump and "priv-agent" not in dump and "agent-a" not in dump, key
+            assert snap["agents"] == []
+            assert all(e["source"].startswith("room:") for e in page["events"]), key
+        conn = http.client.HTTPConnection("127.0.0.1", server.srv.port, timeout=0.3)
+        conn.request("GET", "/api/v1/agent-ops/stream",
+                     headers={"X-API-Key": "op-key", "Authorization": auth, "X-Herdr-Device": dev})
+        resp = conn.getresponse()
+        assert resp.status == 200
+        text, end = "", time.monotonic() + 1.0
+        while time.monotonic() < end:
+            try:
+                line = resp.fp.readline()
+            except OSError:
+                continue
+            text += line.decode() if line else ""
+        conn.close()
+        assert "org-agent" not in text and "priv-agent" not in text and "agent-a" not in text
+    finally:
+        server.stop()
+
+
+def test_external_agent_whose_room_binding_lapsed_sees_nothing(stack):
+    out, agent = _enroll_external(stack, stack.rooms["alice"])
+    ingest(stack.repo, 1, "tool.started", session_id="so", agent_id="org-agent", visibility_scope="org")
+    assert stack.svc.viewer(agent).guest_only
+    stack.collab._now = lambda: out["expires_at"] + 10          # the binding's hard expiry has passed
+    viewer = stack.svc.viewer(agent)
+    assert viewer.rooms == frozenset() and viewer.guest_only
+    assert stack.svc.snapshot(viewer, agent)["agents"] == []
+    assert stack.svc.events(viewer, agent)["events"] == []
