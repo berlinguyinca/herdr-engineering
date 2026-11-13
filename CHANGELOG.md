@@ -8,6 +8,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Fleet rollout watcher step 5: service, lock pinning, resume/abandon (off by default)
 - `herdr-eng fleet-watch loop` (poll + plan; rolls out only with `--enable-rollouts`; flock single instance; soft limit warns, hard limit exits only after no progress), user unit `herdr-eng-fleet-watch.service` and `ansible/tasks/fleet-watch.yml` (disabled unless `fleet_watch_enabled: true` on beast). `lock.pin_repos` moves `fleet.lock.yaml` only after a full success with the D3 published-history check, atomically with a backup; `herdr-eng fleet lock verify`. `fleet-watch resume|abandon` (the `run --resume` flag is a deprecated alias). New reasons `downgrade`, `lock_invalid`. Nothing is enabled by this change. See `docs/operations/fleet-rollout-watcher.md`.
 
+### Web: configurable GC thresholds, boot-heap freeze (`control_plane.gc`)
+
+- `control_plane.gc: {gen0, gen1, gen2, freeze}` tunes the collector at web start (restart required). Keys left unset: `gen0`/`gen1` keep the running interpreter's values; `gen2` defaults to 1000.
+- Behaviour change with no `gc` block at all: the default `gen2` goes from 10 to 1000, and the boot heap is frozen. Rollback: `gc: {gen2: 10, freeze: false}` in the fleet YAML.
+- Values must be integers from 1 to 2147483647; a bad block stops startup with `--fleet-config: control_plane.gc...`.
+
 ### Design: always-on review pane
 
 - Added `docs/superpowers/specs/2026-11-13-always-on-review-pane-design.md`, a proposal for a dedicated two-tier review process (advisory open-weight first pass, Opus on mergeable heads posting `Opus agent review`) with measured open-weight evidence, a replay-set plan, failure modes and rollback. Docs only.

@@ -4496,6 +4496,11 @@ def _cmd_cp_web(args) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")   # boot phase timings
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
     _validate_graph_merge_gate(cp)
+    from .control_plane import stall_watch
+    try:
+        gc_tuning = stall_watch.parse_gc_config(cp.get("gc"))     # a bad control_plane.gc stops startup before anything binds
+    except ValueError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
     switch_store = fleet_store
     replay_flag = getattr(args, "collab_replay_history", None)      # an explicit --collab-replay-history wins over the YAML
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
@@ -4841,9 +4846,8 @@ def _cmd_cp_web(args) -> int:
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
                  "host": args.host, "port": args.port,
                  "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})
-    from .control_plane import stall_watch
     watch = stall_watch.install()
-    logging.info("froze %d boot objects out of garbage collection", stall_watch.freeze_boot_heap())
+    stall_watch.tune_gc(gc_tuning)
     try:
         svr.serve()
     except KeyboardInterrupt:
@@ -5117,7 +5121,7 @@ STARTUP_ONLY_COLLAB_KEYS = frozenset(COLLAB_CONFIG_KEYS) - frozenset(HOT_COLLAB_
 
 
 # control_plane keys read ONCE at startup: editing them needs a restart (unlike HOT_COLLAB_SWITCHES)
-RESTART_REQUIRED_KEYS = ("review_quorum", "lineage_key_scopes", "api_keys", "ci_actions", "pg_dsn", "architecture")
+RESTART_REQUIRED_KEYS = ("review_quorum", "lineage_key_scopes", "api_keys", "ci_actions", "pg_dsn", "architecture", "gc")
 
 
 def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
