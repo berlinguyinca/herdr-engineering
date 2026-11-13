@@ -2910,14 +2910,14 @@ class AssistantStore:
     def _assistant(self, assistant_id: str) -> Assistant:
         a = self.assistants.get(assistant_id)
         if a is None:
-            raise KeyError("assistant not found")
+            raise AssistantMissing("assistant not found")
         return a
 
     def get_assistant(self, assistant_id: str, *, tenant_id: str,
                       user_id: str) -> Assistant:
         a = self._assistant(assistant_id)
         if a.tenant_id != tenant_id or a.user_id != user_id:
-            raise KeyError("assistant not found")
+            raise AssistantMissing("assistant not found")
         return a
 
     def list_assistants(self, *, tenant_id: str, user_id: str) -> list[Assistant]:
@@ -3279,6 +3279,11 @@ class DelegationPersistenceError(AssistantUnavailable):
 
 class AssistantNotFound(AssistantError):
     pass
+
+
+class AssistantMissing(AssistantNotFound, KeyError):
+    """No such assistant for this caller. Still a KeyError for callers that probe with it, but typed so the bridge
+    answers a plain 404 without treating it as a bug."""
 
 
 class ApprovalRequired(AssistantError):
