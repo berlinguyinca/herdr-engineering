@@ -1,6 +1,29 @@
 # Independent AI review
 
-The ruleset on `berlinguyinca/herdr-engineering` requires a commit status named exactly `Independent AI review`.
+## Current requirement (2026-11-13): `Opus agent review`
+
+Ruleset 25691548 on the default branch now requires a commit status named exactly `Opus agent review` (no strict
+flag). A Claude session posts it only after an Opus subagent has reviewed that exact head:
+
+```bash
+gh api repos/berlinguyinca/herdr-engineering/statuses/<full head sha> \
+    -f state=success -f context="Opus agent review" -f description="<what was reviewed>"
+```
+
+- The ruleset is still named "Independent AI review" in the GitHub UI, although the context it requires is now `Opus agent review`.
+- Anyone with push access can post the `Opus agent review` status, so it is a convention, not an enforced identity.
+- If a push changes the head, re-review the fix commit with an Opus subagent. Any push makes the status stale, and
+  it must be re-posted on the new head.
+- The `Independent AI review` check below (`deploy/ci-review/ai-review.py`, a deepseek or qwen model) is **no
+  longer required**. The script and timer remain, but their status is advisory.
+- Trade-off: the old rule that the reviewer be a different model family from the author no longer holds, because
+  Opus reviews Claude-authored PRs. The rest of this page describes the advisory script.
+
+---
+
+# Independent AI review (advisory since 2026-11-13)
+
+The ruleset on `berlinguyinca/herdr-engineering` used to require a commit status named exactly `Independent AI review`.
 `deploy/ci-review/ai-review.py` posts it. The script sends the PR's diff to a model from a different family than
 the author, chosen from the models `llm.metabolomics.us` advertises. Today that means a deepseek or qwen model
 reviews Claude's PRs. The script, not the model, then decides the state. Details are in

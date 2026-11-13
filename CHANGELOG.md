@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Docs: ruleset now requires `Opus agent review`
+
+- Ruleset 25691548 requires the commit status `Opus agent review`, posted by a Claude session after an Opus subagent reviews the exact head (re-post after any push). `Independent AI review` (`ai-review.py`) is advisory; the different-model-family rule no longer holds. Docs only.
+
 ### Inspector history reads the archive too
 
 - `GET /api/v1/sessions/{id}/inspector/history` now continues into `fabric_events_archive` once the requested range goes past what the archive job moved out of `fabric_events`. The two tables are merged under the one keyset order and the same opaque cursor, so a page can straddle the boundary with no gap and no duplicate (a row present in both is returned once). No new setting: with no archive table, behaviour is unchanged. Replaces the earlier caveat that archived rows were not read; the archive job itself stays off by default.
