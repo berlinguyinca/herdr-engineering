@@ -9,7 +9,7 @@ A dedicated, always-on cross-system review process in herdr-engineering, visible
 Decisions already taken by the operator:
 
 - Ruleset 25691548 requires the commit status `Opus agent review`, posted per exact head SHA (PR #788 documents the current manual flow: a Claude session runs an Opus subagent and posts it). `Independent AI review` is advisory.
-- The host is a dedicated node chosen later. The design stays host-agnostic: a `systemd --user` unit or a herdr pane.
+- Interim host (operator, 2026-11-13): **beast**, until a dedicated node is up. The design stays host-agnostic so the move is a re-install, not a rewrite: a `systemd --user` unit or a herdr pane. beast is a production LLM host, so the reviewer must stay light (concurrency 1, no GPU use, no change to its serving units), and the operator installs it (nothing here deploys itself). It needs a Claude Code login and `gh` auth on beast, and a clone it can create read-only worktrees from.
 - The operator wants to save money by using open-weight models where possible.
 
 ## Motivation: measured evidence
@@ -76,7 +76,7 @@ Before changing the ruleset, save its prior state: `gh api repos/berlinguyinca/h
 
 ## Open questions
 
-1. Host choice for the dedicated node.
+1. Which dedicated node replaces beast, and when.
 2. Opus token budget per review and per day, and the wall-clock cap.
 3. Does Tier 1 post a PR comment, or only log? (Comments are visible but noisy.)
 4. Which paths count as risky for the Codex second reviewer.
