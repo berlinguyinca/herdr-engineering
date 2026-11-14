@@ -7087,6 +7087,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                     if parts[2:] == ["events"]:
                         return 200, self.read_events(pr, rid, _int(query, "cursor", 0),
                                                      _int(query, "limit", 100, 1, 200))
+                    if parts[2:] == ["events", "tail"]:         # the newest events, side-effect free (the app's head and tail reads)
+                        return 200, self.read_tail(pr, rid, _int(query, "limit", 100, 1, 500))
+                    if parts[2:] == ["people"]:                 # handles only; unlike /state it records no presence and takes no waiter slot
+                        return 200, {"people": self.room_people(pr, rid)}
                     if parts[2:] == ["events", "stream"]:
                         return self.open_stream(pr, rid, _int(query, "cursor", 0))
             elif method in ("PUT", "POST") and n == 3 and parts[0] == "rooms" and parts[2] == "profile":

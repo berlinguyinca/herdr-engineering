@@ -29,10 +29,10 @@ Interactions (all covered by tests/control_plane/test_inspector_archive.py):
 * Inspector snapshot. Its covered-row check compares the stored ``event_count`` with the rows at or below the watermark;
   that count now includes the archived inspector rows (``fabric_events_archive``), in the snapshot writer and at boot.
   The compaction job's archive purge never deletes inspector rows, and this job does not purge them.
-* PR 7 on-demand history (``inspector_history``) reads ``fabric_events`` only, so a page reaching further back than
-  ``min_age_days`` ends at the archive boundary until a follow-up reads ``fabric_events_archive`` too. The archive keeps
-  the same columns and migration 0052 indexes it by (entity_id, ingest_timestamp, sequence), the order PR 7 pages in.
-  ``min_age_days`` (14) is far beyond the ring, so nothing PR 7 serves today is moved.
+* PR 7 on-demand history (``inspector_history``) also reads ``fabric_events_archive``: a page that reaches past
+  ``min_age_days`` continues into the archive under the same keyset order and cursor, with no gap or duplicate
+  (migration 0052 indexes the archive by (entity_id, ingest_timestamp, sequence)). Without the archive table only
+  ``fabric_events`` is read.
 
 Configured by ``control_plane.inspector_archive`` in the central fleet YAML (no environment variable). Off unless
 ``enabled`` is true; ``dry_run`` (the default) only counts.
