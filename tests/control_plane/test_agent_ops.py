@@ -987,6 +987,7 @@ def _enroll_external(stack, room):
 def test_external_agent_sees_only_its_room_chat_with_either_key(stack):
     import time
     out, _ = _enroll_external(stack, stack.rooms["alice"])
+    stack.collab.post_message(stack.users["alice"], stack.rooms["alice"], {"text": "bound room chat", "idempotency_key": "x1"})
     ingest(stack.repo, 1, "tool.started", session_id="so", agent_id="org-agent", visibility_scope="org")
     ingest(stack.repo, 2, "tool.started", session_id="sp", agent_id="priv-agent", visibility_scope="private")
     ingest(stack.repo, 3, "tool.started", session_id="sa", agent_id="agent-a", room_id=stack.rooms["alice"],
@@ -1004,6 +1005,7 @@ def test_external_agent_sees_only_its_room_chat_with_either_key(stack):
                 assert "org-agent" not in dump and "priv-agent" not in dump and "agent-a" not in dump, key
             assert snap["agents"] == []
             assert all(e["source"].startswith("room:") for e in page["events"]), key
+            assert any(e["room_id"] == stack.rooms["alice"] for e in page["events"]), key     # its BOUND room is visible
         conn = http.client.HTTPConnection("127.0.0.1", server.srv.port, timeout=0.3)
         conn.request("GET", "/api/v1/agent-ops/stream",
                      headers={"X-API-Key": "op-key", "Authorization": auth, "X-Herdr-Device": dev})
