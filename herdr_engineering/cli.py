@@ -40,6 +40,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version",
                         version=f"herdr-eng {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("communications", help="install, sync or inspect native agent communication audit")
 
     from .assistant_cli import register as register_assistant_cli
     register_assistant_cli(sub)
@@ -6023,6 +6024,10 @@ def _cmd_cp_worker(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    communication_args = list(sys.argv[1:] if argv is None else argv)
+    if communication_args[:1] == ["communications"]:
+        from .communications import main as communications_main
+        return communications_main(communication_args[1:])
     parser = _build_parser()
     effective_argv = list(sys.argv[1:] if argv is None else argv)
     if effective_argv and effective_argv[0] == "assistant":

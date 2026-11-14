@@ -1,0 +1,11 @@
+[run]
+branch = True
+parallel = True
+patch = subprocess
+source =
+    herdr_engineering.communications
+    herdr_engineering.control_plane.communications
+
+[report]
+show_missing = True
+fail_under = 80
