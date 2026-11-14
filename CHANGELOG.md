@@ -49,7 +49,6 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - A CRLF `fleet.lock.yaml` can be pinned (it was always refused as changed-since-read) and keeps its line endings; same-second lock backups no longer overwrite each other; an interrupted write no longer strands `<lock>.tmp`.
 - `herdr-eng fleet lock verify` no longer creates the watcher state directory or lock file when it does not exist. A failed backup copy removes its empty `.bak` file.
 - Tests: exact event tails instead of `in types[-2:]`, SIGTERM must exit 0. Operator doc: self-update restart, restart-mid-rollout safety, symlinked-lock backup location.
->>>>>>> b7698d72 (fix(fleet-watch): review follow-ups for the step 5 watcher)
 
 ### xdist follow-ups: collision-free ports, accurate comments, stronger parallel tests
 
