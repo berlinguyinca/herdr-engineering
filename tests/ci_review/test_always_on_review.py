@@ -67,6 +67,8 @@ if argv[:2] == ["pr", "view"]:
     out({"number": int(n), "headRefOid": head(n), "state": "OPEN", "isDraft": p.get("draft", False),
          "title": p.get("title", "t"), "body": p.get("body", ""), "baseRefName": "main", "commits": []})
 elif argv[:2] == ["pr", "diff"]:
+    if pr(argv[2]).get("diff_error"):
+        sys.stderr.write(pr(argv[2])["diff_error"]); sys.exit(1)
     sys.stdout.write(pr(argv[2])["diff"])
 elif argv[:2] == ["pr", "list"]:
     out([{"number": int(n), "headRefOid": head(n), "isDraft": pr(n).get("draft", False)} for n in st["prs"]])
@@ -188,12 +190,13 @@ class Env:
         self.config()
         self.mod = load()
 
-    def config(self, extra: str = "", post: bool = False) -> None:
+    def config(self, extra: str = "", post: bool = False, wait: bool | None = True) -> None:
+        wait_key = "" if wait is None else f", wait_for_green: {str(wait).lower()}"
         self.cfg_path.write_text(textwrap.dedent(f"""\
             state_dir: {self.tmp}/state
             clone: {self.clone}
             post: {str(post).lower()}
-            gates: {{required: {json.dumps(GATES)}, when_present: [{WHEN_PRESENT}]}}
+            gates: {{required: {json.dumps(GATES)}, when_present: [{WHEN_PRESENT}]{wait_key}}}
             poll: {{max_per_run: 5}}
             """) + textwrap.dedent(extra))
 
@@ -615,3 +618,101 @@ def test_gateway_backend_reviews_through_the_openai_compatible_endpoint(env, tmp
         assert env.reviewer_calls() == [] and T.KEY not in (env.bin / "gh.log").read_text()
     finally:
         gw.stop()
+
+
+# ---------------- the clone the worktrees come from ----------------
+
+def test_a_bare_clone_is_accepted_for_the_detached_worktree(env, tmp_path):
+    bare = tmp_path / "bare.git"
+    sh("git", "clone", "-q", "--bare", str(env.origin), str(bare), cwd=tmp_path)
+    sh("git", "remote", "set-url", "origin", str(env.origin), cwd=bare)
+    env.cfg_path.write_text(env.cfg_path.read_text().replace(f"clone: {env.clone}", f"clone: {bare}"))
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+    assert env.reviewer_calls()[0]["head"] == env.head
+    assert sh("git", "for-each-ref", "refs/herdr-review", cwd=bare) == ""
+
+
+@pytest.mark.parametrize("kind", ["missing", "empty-dir", "inside-other-repo", "dot-git-file-to-nowhere"])
+def test_a_clone_that_is_not_a_git_repository_root_is_refused(env, tmp_path, kind):
+    path = tmp_path / "notaclone"
+    if kind != "missing":
+        path.mkdir()
+    if kind == "inside-other-repo":
+        path = env.clone / "src"                    # inside a work tree, but not a repository root
+    if kind == "dot-git-file-to-nowhere":
+        (path / ".git").write_text("gitdir: /nonexistent\n")
+    env.cfg_path.write_text(env.cfg_path.read_text().replace(f"clone: {env.clone}", f"clone: {path}"))
+    assert env.review("tier2") == 2 and env.reviewer_calls() == []
+
+
+# ---------------- the green-only gate is optional ----------------
+
+def _red_head(env):
+    st = env.gh_state()
+    st["statuses"][env.head][1]["state"] = "pending"
+    st["check_runs"][env.head][0]["conclusion"] = "failure"
+    env.write_gh(st)
+
+
+def test_by_default_tier2_reviews_a_head_whose_checks_are_not_green(env):
+    env.config(wait=None)                                    # the key is absent: the default applies
+    _red_head(env)
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+    assert env.reviewer_calls()[0]["head"] == env.head
+
+
+def test_by_default_tier2_needs_no_configured_gates(env):
+    env.cfg_path.write_text(env.cfg_path.read_text().replace(json.dumps(GATES), "[]").replace(
+        ", wait_for_green: true", ""))
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+
+
+def test_wait_for_green_true_restores_the_gate(env):
+    env.config(wait=True)
+    _red_head(env)
+    assert env.review("tier2") == 4 and env.reviewer_calls() == []
+
+
+def test_wait_for_green_false_skips_the_gate_and_must_be_a_boolean(env):
+    env.config(wait=False)
+    _red_head(env)
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+    env.cfg_path.write_text(env.cfg_path.read_text().replace("wait_for_green: false", "wait_for_green: yes please"))
+    assert env.review("tier2", "--force") == 2
+
+
+# ---------------- issue #790: diffs over GitHub's 20,000-line limit ----------------
+
+TOO_LARGE = ("could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines "
+             "(20000) (https://api.github.com/repos/acme/widget/pulls/7)")
+
+
+def _too_large(env, error=TOO_LARGE):
+    st = env.gh_state()
+    st["prs"]["7"]["diff_error"] = error
+    env.write_gh(st)
+
+
+def test_a_diff_over_githubs_line_limit_is_taken_from_the_local_worktree(env):
+    _too_large(env)
+    env.config(post=True)
+    assert env.review("tier2", post=True) == 0
+    [call] = env.reviewer_calls()
+    assert call["head"] == env.head and "return eval(x)" in call["stdin"] + " ".join(call["argv"])
+    assert [s["state"] for s in env.statuses_posted()] == ["pending", "success"]
+
+
+def test_the_local_diff_still_drives_the_in_pr_rules(env):
+    _too_large(env)
+    env.reviewer("claude", answer=block(file="src/a.py", line=2))
+    env.config(post=True)
+    assert env.review("tier2", post=True) == 0
+    assert env.statuses_posted()[-1]["state"] == "failure"                  # the finding is on a file in the diff
+    env.reviewer("claude", answer=block(file="src/not_in_pr.py", line=2))
+    assert env.review("tier2", "--force", post=True) == 0
+    assert env.statuses_posted()[-1]["state"] != "failure"                  # dropped: not in the local diff
+
+
+def test_any_other_diff_failure_still_fails_the_review(env):
+    _too_large(env, "gh: HTTP 502: bad gateway")
+    assert env.review("tier2") == 1 and env.reviewer_calls() == []
