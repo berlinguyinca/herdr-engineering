@@ -1,9 +1,9 @@
-"""Pure logic of deploy/control-plane/rooms-bootstrap.py (no mocks)."""
+"""deploy/control-plane/rooms-bootstrap.py: pure rules plus real-service integration (no mocks)."""
 import http.server
 import importlib.util
-import json
 import socket
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -33,14 +33,15 @@ def test_names_are_valid_collab_handles():
 def test_plan_empty_then_idempotent():
     p = rb.plan([], [], None)
     assert p == {"agents": list(rb.AGENT_NAMES), "room": True, "members": list(rb.AGENT_NAMES)}
-    agents = [{"name": n, "status": "active"} for n in rb.AGENT_NAMES]
-    done = rb.plan(agents, [{"name": rb.ROOM_NAME}], [{"name": n} for n in rb.AGENT_NAMES])
+    agents = [{"name": n, "status": "active", "agent_id": "id-" + n} for n in rb.AGENT_NAMES]
+    done = rb.plan(agents, [{"name": rb.ROOM_NAME}], [{"name": n, "agent_id": "id-" + n} for n in rb.AGENT_NAMES])
     assert rb.is_noop(done)
 
 
 def test_plan_ignores_revoked_agents_and_partial_members():
-    agents = [{"name": "tui-smoke-a", "status": "revoked"}, {"name": "tui-smoke-b", "status": "active"}]
-    p = rb.plan(agents, [{"name": rb.ROOM_NAME}], [{"name": "tui-smoke-b"}])
+    agents = [{"name": "tui-smoke-a", "status": "revoked", "agent_id": "a1"},
+              {"name": "tui-smoke-b", "status": "active", "agent_id": "b1"}]
+    p = rb.plan(agents, [{"name": rb.ROOM_NAME}], [{"name": "tui-smoke-b", "agent_id": "b1"}])
     assert p == {"agents": ["tui-smoke-a"], "room": False, "members": ["tui-smoke-a"]}
 
 
@@ -59,10 +60,10 @@ def _free_port():
         return s.getsockname()[1]
 
 
-@pytest.fixture
-def stack(tmp_path):
+def _stack(tmp_path, **service_options):
     svc = CollabService(StaticTokenAuthenticator({u: _digest(t) for u, t in TOKENS.items()}),
-                        sink=FileEventLog(str(tmp_path / "log")), public_config={"public_url": "https://x/"})
+                        sink=FileEventLog(str(tmp_path / "log")), public_config={"public_url": "https://x/"},
+                        **service_options)
     port = _free_port()
     srv = ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, collab=svc, allow_open=True,
                              public_port=0, public_host="127.0.0.1", collab_only=True, collab_require_https=True,
@@ -80,6 +81,16 @@ def stack(tmp_path):
     srv.shutdown()
     t.join(timeout=5)
     t2.join(timeout=5)
+
+
+@pytest.fixture
+def stack(tmp_path):
+    yield from _stack(tmp_path)
+
+
+@pytest.fixture
+def short_ttl_stack(tmp_path):
+    yield from _stack(tmp_path, remote_credential_ttl=2.0)
 
 
 def run_main(stack, capsys, *flags):
@@ -153,20 +164,74 @@ def test_expired_agents_count_as_missing():
     assert rb.is_active({"status": "active", "expires_at": now + 5}, now)
     assert not rb.is_active({"status": "active", "expires_at": now - 5}, now)
     assert rb.is_active({"status": "active", "expires_at": None}, now)
-    agents = [{"name": "tui-smoke-a", "status": "active", "expires_at": 1.0},
-              {"name": "tui-smoke-b", "status": "active", "expires_at": None}]
+    agents = [{"name": "tui-smoke-a", "status": "active", "expires_at": 1.0, "agent_id": "a1"},
+              {"name": "tui-smoke-b", "status": "active", "expires_at": None, "agent_id": "b1"}]
     assert rb.plan(agents, [{"name": rb.ROOM_NAME}], [])["agents"] == ["tui-smoke-a"]
+
+
+def test_member_grant_to_an_expired_agent_is_not_a_grant():
+    agents = [{"name": "tui-smoke-a", "status": "active", "expires_at": 1.0, "agent_id": "old-a"},
+              {"name": "tui-smoke-a", "status": "active", "expires_at": None, "agent_id": "new-a"},
+              {"name": "tui-smoke-b", "status": "active", "expires_at": None, "agent_id": "b1"}]
+    members = [{"name": "tui-smoke-a", "agent_id": "old-a"}, {"name": "tui-smoke-b", "agent_id": "b1"}]
+    assert rb.plan(agents, [{"name": rb.ROOM_NAME}], members)["members"] == ["tui-smoke-a"]
 
 
 def test_redact_hides_any_dsn_with_credentials_only():
     out = rb.redact("a mongodb+srv://user:pw0rd@host/db b redis://:x@h c")
-    assert "pw0rd" not in out and "user:" not in out
+    assert "pw0rd" not in out and "user:" not in out and "x@h" not in out
     assert rb.redact("see https://example.org/path") == "see https://example.org/path"
+
+
+def test_redact_hides_headers_cookies_sessions_and_quoted_values():
+    out = rb.redact('Authorization: Basic dXNlcjpwYXNz\nAuthorization: Bearer abc.def\nSet-Cookie: sid=cook1e; Path=/\n'
+                    'Cookie: a=cook2e; b=c\n{"session": "sess1on", "token": "two words", "x": 1}')
+    for secret in ("dXNlcjpwYXNz", "abc.def", "cook1e", "cook2e", "sess1on", "two", "words"):
+        assert secret not in out
+    assert '"x": 1' in out
+    assert rb.redact('"token": "two words"').endswith("[redacted]")
 
 
 def test_bridge_group_match_is_exact():
     assert rb.has_group({"json": [{"name": "tui-smoke"}]})
+    assert rb.has_group({"json": {"groups": [{"name": "tui-smoke"}]}})
     assert not rb.has_group({"json": [{"name": "tui-smoke-old"}], "note": "tui-smoke"})
+    assert not rb.has_group({"json": {"groups": [], "other": [{"name": "tui-smoke"}]}})
+
+
+def test_expired_agents_are_replaced_and_granted(short_ttl_stack, capsys):
+    stack = short_ttl_stack
+    host = f"127.0.0.1:{stack.op}"
+    rc, out = run_main(stack, capsys)
+    assert rc == 0 and len(created(out)) == 5, out
+    time.sleep(2.5)                                          # past remote_credential_ttl
+    rc, out = run_main(stack, capsys)
+    assert rc == 0 and "FAIL" not in out, out
+    assert [ln.split()[1] for ln in created(out)] == ["agent", "agent", "membership", "membership"]
+    agents = call(stack.op, "GET", f"{BASE}/agents", host=host)[1]["agents"]
+    live = {a["agent_id"] for a in agents if rb.is_active(a)}
+    room = call(stack.op, "GET", f"{BASE}/rooms", host=host)[1]["rooms"][0]
+    members = call(stack.op, "GET", f"{BASE}/rooms/{room['room_id']}/agents", host=host)[1]["agents"]
+    assert len(live) == 2 and {m["agent_id"] for m in members} == live
+    assert rb.is_noop(rb.current(rb.Http(stack.url))[0])
+
+
+def test_verify_fails_when_a_member_is_not_a_live_agent(short_ttl_stack, capsys):
+    stack = short_ttl_stack
+    run_main(stack, capsys)
+    time.sleep(2.5)
+    rc, out = run_main(stack, capsys, "--check-only", "--no-post")
+    assert rc == 1 and "FAIL rooms list has tui-smoke with both agents" in out
+    assert "SKIP bridge groups/list" in out
+
+
+def test_find_project_on_the_real_service(stack):
+    api = rb.Http(stack.url)
+    assert rb.find_project(api, []) is None                  # GET /projects is a 404 there: create instead
+    assert rb.find_project(api, [{"name": rb.ROOM_NAME, "project_id": "p1"}]) == "p1"
+    assert rb.find_project(api, [{"name": "other", "project_id": "p2"}]) is None
+    with pytest.raises(RuntimeError, match="unreachable"):
+        rb.find_project(rb.Http("http://127.0.0.1:1"), [])
 
 
 class _Serve:
@@ -180,15 +245,17 @@ class _Serve:
         self.httpd.server_close()
 
 
-def test_find_project_uses_get_projects_and_redirects_are_not_followed():
+def test_bridge_bearer_token_never_follows_a_redirect(monkeypatch, capsys):
     seen = []
 
     class Target(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            seen.append(self.path)
+        def _note(self):
+            seen.append((self.command, self.path, self.headers.get("Authorization")))
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"{}")
+
+        do_GET = do_POST = _note
 
         def log_message(self, *a):
             pass
@@ -196,24 +263,21 @@ def test_find_project_uses_get_projects_and_redirects_are_not_followed():
     target = _Serve(Target)
 
     class Front(Target):
-        def do_GET(self):
-            if self.path.endswith("/projects"):
-                body = json.dumps({"projects": [{"name": "x", "project_id": "p0"},
-                                                {"name": rb.PROJECT_NAME, "project_id": "p1"}]}).encode()
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(body)
-            else:
-                self.send_response(302)
-                self.send_header("Location", target.url + "/leak")
-                self.end_headers()
+        def do_POST(self):
+            self.send_response(307)
+            self.send_header("Location", target.url + "/leak")
+            self.end_headers()
 
     front = _Serve(Front)
+    monkeypatch.setenv("HERDR_ROOMS_BRIDGE_TOKEN", "sekrit-token-value")
     try:
-        assert rb.find_project(rb.Http(front.url))["project_id"] == "p1"
-        with pytest.raises(RuntimeError, match="HTTP 302"):
-            rb.Http(front.url).call("GET", "/other")
+        res = rb.Result()
+        rb._verify_bridge(front.url, res)
+        out = capsys.readouterr().out
+        assert res.failed and "FAIL bridge groups/list" in out and "sekrit" not in out
         assert seen == []
+        with pytest.raises(RuntimeError, match="HTTP 307"):
+            rb.Http(front.url).call("POST", "/x", {})
     finally:
         front.close()
         target.close()
