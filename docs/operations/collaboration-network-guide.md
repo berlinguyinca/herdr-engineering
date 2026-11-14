@@ -834,6 +834,16 @@ helper's own agent (their cursor still moves past them).
   snippet with it) and starts a fresh window of the connect lifetime (30 days by default). The old credential stops
   working at once. Only the owner can do it (anyone else gets 404). Revoked agents, helper agents, fabric-machine
   identities and externally invited agents are refused: an external agent never lives past its invite's hard expiry.
+* From a shell: `herdr-eng collab agents list` (id, name, harness, status, expires_at, renewable; never a credential) and
+  `herdr-eng collab agents renew <agent-id|@name> --credential-file ~/.config/herdr/<name>.cred`. It calls the collab
+  operator listener (`--operator-url`, else `HERDR_COLLAB_OPERATOR_URL`, default `http://127.0.0.1:9482`; no sign-in, the
+  listener acts as the operator) and writes the NEW credential only to that file (created 0600; an existing file is refused
+  without `--force`, and before anything is renewed). It prints the agent id, the new `expires_at` and `grants_restored`,
+  never the credential, unless you pass `--print-credential` (stdout only). `--json` gives the same fields. Exit 1 with the
+  server's message on 404 (not yours), 403 (cannot be renewed), 409 (revoked) and 429 (agent cap); 2 when neither
+  `--credential-file` nor `--print-credential` is given, because the old credential dies at once.
+  **After renewing, update the harness with the new credential**: the `claude mcp add` header, `~/.codex/config.toml`, or the
+  credential file a collab-spawn reads. Until then that harness is locked out.
 * Room grants have their own expiry (30 days by default) and the service drops a lapsed grant, so an expired agent has
   usually lost its rooms. A renew therefore also re-grants, with the SAME actions, every room grant of the agent that
   lapsed, and extends every one that would lapse before the new credential does, to the new credential expiry (the reply
