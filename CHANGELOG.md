@@ -5,6 +5,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### xdist follow-ups: collision-free ports, accurate comments, stronger parallel tests
+
+- `test_allocation_skips_os_bound_port` and `test_failed_forwarder_start_is_retried_on_next_sync` bound fixed ports (18500, 24700) that could collide across files running concurrently under `--dist=loadfile`; they now use OS-assigned ports.
+- `scripts/ci/pytest-parallel.sh` comments corrected: `loadfile` does not honour `xdist_group` (only `loadgroup` does), and `--maxprocesses` caps explicit worker counts too.
+- The loadfile test now runs four real files on two workers and asserts more than one worker was used with each file on exactly one; added refusal tests for `HERDR_PYTEST_MAXPROCESSES` of `0` or non-numeric.
+- `tree._live_processes` runs `ps -ww`: xdist workers export `COLUMNS=80`, which truncated process args (regression test added).
+- `execnet==2.1.2` (what `pytest-xdist==3.8.0` resolves to) is pinned in the dev extra.
+
 ### Fix: collab agents CLI and rooms-bootstrap follow-ups, flaky MCP upload tests, renewal runbook
 
 - `herdr-eng collab agents renew`: `--json --print-credential` now prints one JSON object that includes `credential` (no second line); a failed file write with `--print-credential` prints the credential on stdout as requested instead of stderr; the temp file is fsynced before it is renamed into place; a read timeout on an error body, a malformed `--operator-url` (`http://[::1`) and a listed agent without an id are one-line errors (exit 1), not tracebacks.
