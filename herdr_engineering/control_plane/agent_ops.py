@@ -692,6 +692,10 @@ class AgentOpsService:
         # An external agent is chat-only like a guest: its bound room(s) are the only sources it may read, and with no
         # room left (binding expired or revoked) it reads nothing, never the org scope.
         guest_only = external or (bool(guests) and guests == rooms) or (not rooms and self._was_guest(principal, collab))
+        # The operator's own key acts as the synthesized operator principal (``admin`` is set only there, never by
+        # authenticate()): it is the owner, not a guest, even if that user was once added to a room as one.
+        if operator and getattr(principal, "admin", False) and not external:
+            guest_only = False
         return Viewer(rooms=rooms, operator=operator, external=external,
                       guest_rooms=rooms if external else guests, guest_only=guest_only)
 

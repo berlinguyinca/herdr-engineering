@@ -1044,3 +1044,23 @@ def test_service_follows_the_live_server_collab(stack):
         assert server.srv.agent_ops.collab is stack.collab
     finally:
         server.stop()
+
+
+def test_operator_key_whose_synthesized_principal_was_once_a_guest_is_still_the_operator(stack):
+    """The operator API key acts as the operator user. If that user was ever added to a room as a guest (and reads no
+    other room) the guest restriction must not shrink the operator key's org/private view."""
+    bob = stack.users["bob"]
+    stack.collab.add_member(bob, stack.rooms["bob"], {"user_id": "carol", "role": "guest"})
+    ingest(stack.repo, 1, "tool.started", session_id="so", agent_id="org-agent", visibility_scope="org")
+    ingest(stack.repo, 2, "tool.started", session_id="sp", agent_id="priv-agent", visibility_scope="private")
+    server = Server(stack.repo, stack.collab, agent_ops_config={"enabled": True}, operator_user="carol")
+    try:
+        status, snap = server.get("/api/v1/agent-ops/snapshot", key="op-key")
+        assert status == 200
+        dump = json.dumps(snap)
+        assert "org-agent" in dump and "priv-agent" in dump
+        # a viewer-role key with the same synthesized identity is not an operator: unchanged
+        _, view = server.get("/api/v1/agent-ops/snapshot", key="view-key")
+        assert "priv-agent" not in json.dumps(view)
+    finally:
+        server.stop()
