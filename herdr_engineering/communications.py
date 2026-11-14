@@ -482,7 +482,7 @@ def install(
         "  printf '%s\\n' 'HerdR audit warning: runtime unavailable; using native delivery.' >&2\n"
         f'  exec {retained} "$@"\n'
         "fi\n"
-        f'exec {python} -c {shlex.quote(program)} "$@"\n'
+        f'exec {python} -I -c {shlex.quote(program)} "$@"\n'
     )
     launcher.chmod(0o755)
     try:

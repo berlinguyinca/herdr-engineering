@@ -245,21 +245,27 @@ def test_installation_preserves_native_passthrough_and_records_refusal(tmp_path)
 
 
 def test_installation_works_from_a_real_runtime_path_with_spaces(tmp_path):
-    from pathlib import Path
-
     native = _native_binary()
-    if not native:
-        pytest.skip("Real HerdR CLI is not installed on this runner")
+    wheel = os.environ.get("HERDR_COMMUNICATION_TEST_WHEEL")
+    if not native or not wheel:
+        pytest.skip(
+            "Needs the real native CLI and HERDR_COMMUNICATION_TEST_WHEEL built from this head"
+        )
     runtime = tmp_path / "persistent runtime with spaces"
-    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(runtime)], check=True)
+    subprocess.run([sys.executable, "-m", "venv", str(runtime)], check=True)
     python = runtime / "bin/python"
+    subprocess.run(
+        [python, "-I", "-m", "pip", "install", "--no-deps", "--no-index", wheel],
+        check=True,
+        capture_output=True,
+    )
     target = tmp_path / "herdr"
     shutil.copy2(native, target)
     config = tmp_path / "config.json"
-    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
     subprocess.run(
         [
             python,
+            "-I",
             "-m",
             "herdr_engineering.communications",
             "install",
@@ -268,17 +274,47 @@ def test_installation_works_from_a_real_runtime_path_with_spaces(tmp_path):
             "--config",
             str(config),
         ],
-        env=env,
         check=True,
     )
-    assert subprocess.check_output([target, "--version"], env=env) == subprocess.check_output(
-        [native, "--version"]
+    cfg = json.loads(config.read_text())
+    cfg["outbox"] = str(tmp_path / "audit.sqlite")
+    config.write_text(json.dumps(cfg))
+    expected = subprocess.check_output([native, "--version"])
+    assert subprocess.check_output([target, "--version"]) == expected
+    refusal = subprocess.run(
+        [target, "agent", "prompt", "audit-target-does-not-exist", "installed wheel audit"],
+        capture_output=True,
     )
-    # Losing the optional audit runtime must leave the retained native binary usable.
+    assert refusal.returncode != 0
+    assert Outbox(tmp_path / "audit.sqlite").pending()[-1]["text"] == "installed wheel audit"
     runtime.rename(tmp_path / "runtime-retired")
-    assert subprocess.check_output([target, "--version"], env=env) == subprocess.check_output(
-        [native, "--version"]
-    )
+    assert subprocess.check_output([target, "--version"]) == expected
+
+
+def test_launcher_does_not_import_the_callers_worktree_or_pythonpath(tmp_path):
+    from herdr_engineering.communications import install
+
+    native = _native_binary()
+    if not native:
+        pytest.skip("Real HerdR CLI is not installed on this runner")
+    target = tmp_path / "herdr"
+    shutil.copy2(native, target)
+    install(target, tmp_path / "config.json")
+    hostile = tmp_path / "untrusted-project"
+    hostile.mkdir()
+    marker = tmp_path / "code-executed"
+    package = hostile / "herdr_engineering"
+    package.mkdir()
+    source = f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\nraise RuntimeError('untrusted import')\n"
+    (package / "__init__.py").write_text(source)
+    (hostile / "uuid.py").write_text(source)
+    expected = subprocess.check_output([native, "--version"])
+    for extra in ({}, {"PYTHONPATH": str(hostile)}):
+        result = subprocess.run(
+            [target, "--version"], cwd=hostile, env={**os.environ, **extra}, capture_output=True
+        )
+        assert result.returncode == 0 and result.stdout == expected
+        assert not marker.exists(), "the native wrapper imported untrusted project code"
 
 
 def test_adapter_uses_the_real_native_literal_argument_grammar():

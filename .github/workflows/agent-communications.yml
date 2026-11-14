@@ -35,6 +35,7 @@ jobs:
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s --health-timeout 5s --health-retries 12
     env:
+      HERDR_COMMUNICATION_TEST_WHEEL: ${{ github.workspace }}/dist/herdr_engineering-0.1.0-py3-none-any.whl
       HERDR_COMMUNICATION_TEST_DSN: postgresql://postgres:ci-only-password@127.0.0.1:5432/herdr_comm_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -73,6 +74,8 @@ jobs:
           git diff --exit-code -- packages/communications-view.js
           npx eslint --config eslint.communications.config.mjs packages/communications-view.js packages/communications-view.test.js
           npx prettier --check packages/communications-view.ts packages/communications-view.js packages/communications-view.test.js tests/playwright/communications.spec.ts playwright.communications.config.ts tsconfig.communications.json eslint.communications.config.mjs
+      - name: Build distributable
+        run: python -m build --wheel
       - name: Unit, integration and native smoke with coverage
         run: |
           mkdir -p .superpowers
@@ -84,5 +87,3 @@ jobs:
           npx playwright test -c playwright.communications.config.ts
           NODE_V8_COVERAGE=.superpowers/communications-v8 node --test packages/communications-view.test.js
           npx c8 report --temp-directory=.superpowers/communications-v8 --include=packages/communications-view.js --reports-dir=.superpowers/communications-js-coverage --reporter=text --check-coverage --lines=80 --branches=80 --functions=80 --statements=80
-      - name: Build distributable
-        run: python -m build --wheel
