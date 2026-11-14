@@ -8,7 +8,7 @@
 import { buildTimeline, normalizeIncident } from './diagnostics-model.js';
 
 export const SECTIONS = ['events', 'hosts'];   // the only feeds this adapter reads; asking for another section is not a new endpoint
-export const HOST_EVENT_PAGE_SIZE = 50;        // rows asked for per host; the control plane caps a page at 100 and answers 400 above that
+export const HOST_EVENT_PAGE_SIZE = 50;        // rows asked for per host; the control plane takes limit as 1..200 and answers 400 outside that
 export const HOST_READ_CAP = 20;               // hosts read per load; past the cap the read says so rather than looking complete
 const plain = (v) => typeof v === 'object' && v !== null && !Array.isArray(v), finite = (v) => typeof v === 'number' && Number.isFinite(v);
 const text = (v) => (typeof v === 'string' ? v : '');
@@ -32,9 +32,10 @@ function readPage(section, value) {
 /**
  * One `/api/v1/events` envelope to an H02 event. The real envelope (see the file header) carries `event_id`,
  * `event_type`, `source_timestamp`/`ingest_timestamp`, `entity_type`, `entity_id`, `mission_id`, `session_id`
- * and `payload`; `at` is the source instant when it parses and the ingest instant otherwise, because a record
- * with no readable instant cannot be placed on a timeline at all. Returns null when identity or an instant is
- * missing — the caller counts that row instead of dropping it silently.
+ * and `payload`; `at` is the source instant, or the ingest instant when the row reports no source instant at
+ * all — a record with no readable instant cannot be placed on a timeline, so a row whose source instant is
+ * present but does not parse returns null and the caller counts it. Identity, type or an absent instant likewise
+ * return null: the caller counts that row instead of dropping it silently.
  */
 export function toTimelineRecord(row) {
   if (!plain(row)) return null;
@@ -53,22 +54,30 @@ export function toTimelineRecord(row) {
  * One host from `GET /api/v1/hosts` to the H02 incidents it reported. The feed carries `problems[]` of
  * `{code, message, severity}` alongside `host_id` and `last_seen`; each becomes one incident whose instant is
  * the host's own `last_seen` (the reading the problem was computed against — the feed reports no separate
- * time), and whose fingerprint is the local convention `host_id:code` (the feed gives no fingerprint of its
- * own, and H02 requires one to group repeats). A problem with no code, or a severity outside H02's
- * vocabulary, is passed through anyway: H04 shows it as a rejected record rather than quietly discarding it.
- * A host reporting no problems returns nothing, which is the feed's fact, not an unreadable section.
+ * time, so the "last seen" H04 prints for such a card is the instant that host last reported, which the page
+ * says under its heading), and whose fingerprint is the local convention `host_id:code` (the feed gives no
+ * fingerprint of its own, and H02 requires one to group repeats). A host reporting the same code twice is two
+ * incidents: the repeats carry `#2`, `#3` …, because H02 keys a record by its id and two cards sharing an id
+ * would read as one problem. A problem with no code, or a severity outside H02's vocabulary, is passed through
+ * anyway: H04 shows it as a rejected record rather than quietly discarding it. A host reporting no problems
+ * returns nothing, which is the feed's fact, not an unreadable section.
  */
 export function toIssueRecords(host) {
   if (!plain(host) || !text(host.host_id).trim()) return [];
   const at = Date.parse(text(host.last_seen));
-  return (Array.isArray(host.problems) ? host.problems : []).filter(plain).map((problem) => ({
-    id: `${host.host_id}:${text(problem.code).trim() || 'unspecified'}`,
-    kind: text(problem.code),
-    severity: text(problem.severity),
-    message: text(problem.message),
-    hostId: host.host_id,
-    ...(finite(at) ? { at } : {}),
-  }));
+  const seen = new Map();
+  return (Array.isArray(host.problems) ? host.problems : []).filter(plain).map((problem) => {
+    const base = `${host.host_id}:${text(problem.code).trim() || 'unspecified'}`;
+    const repeat = (seen.get(base) || 0) + 1; seen.set(base, repeat);
+    return {
+      id: repeat === 1 ? base : `${base}#${repeat}`,
+      kind: text(problem.code),
+      severity: text(problem.severity),
+      message: text(problem.message),
+      hostId: host.host_id,
+      ...(finite(at) ? { at } : {}),
+    };
+  });
 }
 
 /** Adapt whatever transport the caller supplies — an existing Herdr feed today, an injected fake under node:test. `now` is the caller's instant (a finite number) so freshness can be labelled downstream without this module reading a clock; without one it is null. */
