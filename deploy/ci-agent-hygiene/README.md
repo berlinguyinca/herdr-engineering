@@ -8,11 +8,13 @@ user timer `herdr-ci-agent-prune.timer`; each deletion is logged to the journal
 (`install -m0600 /dev/null ~/.config/woodpecker/token`), the script refuses a
 group/other-accessible token file.
 
-Guards: a run aborts with nothing deleted (exit 3) if candidates exceed 50% of
-scanned system agents, or if no agent has contacted the server in the last 60
-minutes (`--recent-contact-mins`; e.g. server just restarted). At most 50
-deletions per run (`--max-deletions`). Agents missing owner/org fields are never
-deleted. A 409 on one delete is skipped and counted.
+Guards: if no agent has contacted the server in the last 60 minutes
+(`--recent-contact-mins`; server just restarted, or a quiet night) the run
+deletes nothing and exits 0 with a one-line `NOTICE` on stderr, so the unit does
+not show as failed. At most 50 deletions per run (`--max-deletions`); a larger
+backlog drains over successive runs. Agents missing owner/org fields are never
+deleted. A 409 on one delete is skipped and counted. Exit codes: 0 ok or
+guarded skip, 1 API error, 2 token file missing or not 0600, 64 bad arguments.
 
 Deleted: system agents (`owner_id=-1`) that never contacted the server and are
 older than 1 hour, or have had no contact and no work for 24 hours. Never

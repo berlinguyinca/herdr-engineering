@@ -6,10 +6,12 @@ and is older than --never-contacted-secs (default 1h), or has had no contact
 and no work for --stale-secs (default 24h). An agent that any pending or
 running workflow in the queue references is never touched, and the server
 itself refuses to delete an agent with a running task. Dry run unless --apply.
-Guards (abort, nothing deleted, exit 3): candidates over 50% of scanned system
-agents, or no system agent has contacted the server in --recent-contact-mins
-(default 60; the server just came back). At most --max-deletions (default 50)
-are deleted per run. Missing owner/org fields make an agent ineligible.
+Guard: if no system agent has contacted the server in --recent-contact-mins
+(default 60; the server just came back, or it is a quiet night) nothing is
+deleted and the run exits 0 with a NOTICE on stderr. At most --max-deletions
+(default 50) are deleted per run; the rest wait for the next run.
+Exit codes: 0 ok or guarded skip, 1 API error, 2 token file missing or not
+0600, 64 bad arguments. Missing owner/org fields make an agent ineligible.
 The API token is read from a file and is never printed.
 """
 import argparse
@@ -33,12 +35,15 @@ def call(server, token, method, path):
 
 
 def list_agents(server, token):
-    agents, page = [], 1
+    """Page until an empty page, or a page with nothing new (server ignoring page)."""
+    agents, seen, page = [], set(), 1
     while True:
-        rows = call(server, token, "GET", f"/api/agents?perPage={PAGE}&page={page}")
-        agents += rows
-        if len(rows) < PAGE:
+        rows = call(server, token, "GET", f"/api/agents?perPage={PAGE}&page={page}") or []
+        new = [r for r in rows if r.get("id") not in seen]
+        if not new:
             return agents
+        seen.update(r.get("id") for r in new)
+        agents += new
         page += 1
 
 
@@ -67,13 +72,20 @@ def is_system(agent):
     return agent.get("owner_id") == -1 and agent.get("org_id") == -1
 
 
-def abort(msg):
-    print("abort: " + msg + "; nothing deleted", file=sys.stderr)
-    return 3
+def skip(msg):
+    print("NOTICE: " + msg + "; nothing deleted", file=sys.stderr)
+    return 0
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        sys.exit(64)
 
 
 def main(argv):
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = Parser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--server", default="https://ci.metabolomics.us")
     ap.add_argument("--token-file", default=str(Path.home() / ".config/woodpecker/token"))
     ap.add_argument("--never-contacted-secs", type=int, default=3600)
@@ -82,11 +94,20 @@ def main(argv):
     ap.add_argument("--recent-contact-mins", type=int, default=60)
     ap.add_argument("--apply", action="store_true")
     args = ap.parse_args(argv)
+    if args.max_deletions < 0:
+        ap.error("--max-deletions must be >= 0")
+    if args.recent_contact_mins <= 0:
+        ap.error("--recent-contact-mins must be > 0")
     token_path = Path(args.token_file)
-    if token_path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-        print(f"refusing: {token_path} must be mode 0600 (chmod 600 it)", file=sys.stderr)
+    try:
+        mode = token_path.stat().st_mode
+        if mode & (stat.S_IRWXG | stat.S_IRWXO):
+            print(f"refusing: {token_path} must be mode 0600 (chmod 600 it)", file=sys.stderr)
+            return 2
+        token = token_path.read_text().strip()
+    except OSError as exc:
+        print(f"cannot read token file {token_path}: {exc.strerror}", file=sys.stderr)
         return 2
-    token = token_path.read_text().strip()
     try:
         return run(args, token)
     except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -98,6 +119,8 @@ def run(args, token):
     now = time.time()
     agents = list_agents(args.server, token)
     busy = busy_ids(args.server, token)
+    if not agents:
+        return skip("server returned no agents")
     system = [a for a in agents if is_system(a)]
     cands = []
     for a in sorted(agents, key=lambda a: a.get("id", 0)):
@@ -107,9 +130,10 @@ def run(args, token):
     if cands:
         horizon = now - args.recent_contact_mins * 60
         if not any((a.get("last_contact") or 0) > horizon for a in system):
-            return abort(f"no agent has contacted the server in the last {args.recent_contact_mins} minutes")
-        if len(cands) * 2 > len(system):
-            return abort(f"{len(cands)} candidates exceed 50% of {len(system)} system agents")
+            return skip(f"no agent has contacted the server in the last {args.recent_contact_mins} minutes")
+        if len(cands) > len(agents):
+            print("abort: more candidates than agents listed (inconsistent data)", file=sys.stderr)
+            return 1
     removed = skipped = 0
     kept = len(agents) - len(cands)
     for agent, reason in cands[:args.max_deletions]:
