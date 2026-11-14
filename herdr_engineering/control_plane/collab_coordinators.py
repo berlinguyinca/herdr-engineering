@@ -142,6 +142,7 @@ class CoordinatorsMixin:
                                                    "team_id": tid, "coordinator": True}
                 self._agent_projects[aid].add(p["project_id"])
                 self._rooms_by_agent[aid].add(rid)
+                self._lapsed_grants[aid].pop(rid, None)          # the designation replaces a lapsed direct grant for good
         elif t == "team_coordinator_cleared":
             have = self._tc_coord.get((rid, tid))
             if have is not None and have["holder"] == p["holder"]:

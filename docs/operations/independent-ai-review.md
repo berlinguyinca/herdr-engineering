@@ -96,21 +96,28 @@ next poll.
 ## Always-on review (tier 1 and tier 2)
 
 The always-on process (`deploy/ci-review/always-on-review.py`) adds an advisory `Open-weight pre-review` (pi, open
-weights) and the `Opus agent review` (claude, run only on heads whose Woodpecker gates, verify and GitGuardian are all
-green; a `gates.when_present` check such as `ui-gates` must be green only if it exists). Both are configured in YAML only; see `deploy/ci-review/README.md` for backends, pi alias selection and the
+weights) and the `Opus agent review` (claude, run on every non-draft head without waiting for green checks; the operator approved removing the
+green-only gate. Set `gates.wait_for_green: true` in the YAML to restore it: Woodpecker gates, verify and GitGuardian
+must then be green, and a `gates.when_present` check such as `ui-gates` only if it exists). Both are configured in YAML only; see `deploy/ci-review/README.md` for backends, pi alias selection and the
 security posture.
 
 Operating rules:
 
+- A diff over GitHub's 20,000-line limit (`gh pr diff` fails with HTTP 406) is read locally from the review worktree
+  instead (merge base to the pinned head), so such PRs are still reviewed.
 - Dry-run is the default. Posting needs `post: true` in the config and `--post` on the command line.
 - Tier 1 never posts the required context. The ruleset already requires `Opus agent review`; turning on tier 2 posting
   (`post: true` plus `--post`) is a separate operator step, taken after watching dry-run output in `reviews.jsonl`.
-- A review that cannot run (timeout, bad JSON, head moved, gates not green) leaves the status `pending`; it is never
+- A review that cannot run (timeout, bad JSON, head moved, or gates not green when `gates.wait_for_green` is on) leaves the status `pending`; it is never
   turned green or red by guesswork.
 - Install on any host with `gh`, `git`, the `claude` login and pi configured: copy the example config and the
   `herdr-always-on-review.{service,timer}` units, then `systemctl --user enable --now` the timer. The interim host is
   beast; a dedicated node later needs only the same files. Watch it with `herdr-review-pane.example.sh` in a herdr pane.
-- Cost: only tier 2 spends Opus tokens, once per green head; `reviews.jsonl` records cost and duration.
+- Cost: only tier 2 spends Opus tokens, once per head it reviews (every head by default, only green heads with `gates.wait_for_green`); `reviews.jsonl` records cost and duration.
+
+### Prompt v2, passes and replay
+
+Both tiers now get the operator's project rules and a review checklist (`deploy/ci-review/review-checklist.yaml`). A blocking finding must quote evidence that exists in the diff or the pinned file, otherwise the script downgrades it to a note. Tier 2 can run several focused passes (general, tests, security, migrations in the example config), which multiplies cost and time; `passes: []` restores one review. `always-on-review.py replay` scores a tier against a corpus of PRs with known outcomes, posts nothing, is resumable and runs one case at a time; the intended corpus is thousands of PRs across the org's repos, built with `corpus build`. Details: `deploy/ci-review/README.md`.
 
 ## Limits: advisory strength
 
@@ -150,7 +157,7 @@ Operating rules:
   - routes sometimes ended mid-answer (`upstream_transport_error`), and qwen's single slot answered 429;
   - for a while the gateway advertised no models at all.
 
-  Route failures, 429s and 5xx responses are retried with backoff. A stream that closes unfinished (no `[DONE]`,
+  Route failures and 5xx responses are retried with backoff; 429s are waited out for up to `reviewer.busy_wait_s` (1800 s) without using the retries. A stream that closes unfinished (no `[DONE]`,
   no `finish_reason`) is retried the same way. A model that is not advertised fails the run before anything is
   posted.
 - **qwen on the `development` provider.** That provider sets `compat.thinkingFormat: qwen-chat-template`. pi then

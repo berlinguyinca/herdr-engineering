@@ -151,6 +151,7 @@ class TeamRoomsMixin:
                                        "team_id": p["team_id"]}
                 self._agent_projects[aid].add(p["project_id"])
                 self._rooms_by_agent[aid].add(rid)
+                self._lapsed_grants[aid].pop(rid, None)          # the team grant replaces a lapsed direct one for good
         elif t == "team_detached":
             room = self._rooms[rid]
             att = self._tr_attach.get((rid, p["team_id"]))

@@ -40,9 +40,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version",
                         version=f"herdr-eng {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("communications", help="install, sync or inspect native agent communication audit")
 
     from .assistant_cli import register as register_assistant_cli
     register_assistant_cli(sub)
+
+    from .agent_ops_tui import register as register_agent_ops_tui
+    register_agent_ops_tui(sub)
 
     p = sub.add_parser("build-cleanup", help="reclaim stale Rust build caches")
     cleanup_sub = p.add_subparsers(dest="cleanup_command", required=True)
@@ -237,6 +241,9 @@ def _build_parser() -> argparse.ArgumentParser:
     rp = rsub.add_parser("status", help="show the room, agent, rights and expiry from the state file")
     rp.add_argument("--config", required=True)
     rp.set_defaults(func=_cmd_relay_status)
+    # collab ---------------------------------------------------------------
+    from .collab_agents_client import add_collab_subparser as add_collab_agents_subparser
+    add_collab_agents_subparser(sub)
     # fabric ---------------------------------------------------------------
     p = sub.add_parser("fabric", help="fabric trust helpers (control_plane.collab.fabric_trust)")
     fasub = p.add_subparsers(dest="fabric_command", required=True)
@@ -431,6 +438,20 @@ def _build_parser() -> argparse.ArgumentParser:
             rp.add_argument("--max-passes", type=int, default=None, help="stop after this many passes; omit to retry offline hosts until complete")
             rp.add_argument("--max-unchanged-online-passes", type=int, default=8, help="stop for review after this many unchanged online passes per session (1..1000)")
         rp.set_defaults(func=_cmd_fleet_rollout)
+
+    rp = rsub.add_parser(
+        "retire-identityless",
+        help="settle blocked registrations whose instance identity cannot be resolved, so the "
+        "rollout can finish for what it can prove; the evidence stays in the report",
+    )
+    rp.add_argument("--state", default=None, help="private rollout state directory")
+    rp.add_argument("--id", required=True, help="rollout ID printed by plan")
+    rp.add_argument(
+        "--settled-by",
+        default="operator",
+        help="who is settling the registration; recorded per session in the report",
+    )
+    rp.set_defaults(func=_cmd_fleet_rollout)
 
     # artifacts ------------------------------------------------------------
     p = sub.add_parser("artifacts", help="shared artifact workspace (spec 0080)")
@@ -1868,6 +1889,7 @@ def _cmd_fleet_rollout(args) -> int:
         apply_rollout,
         create_rollout,
         inventory_targets,
+        retire_identityless,
         run_rollout,
     )
 
@@ -1880,6 +1902,8 @@ def _cmd_fleet_rollout(args) -> int:
             report = apply_rollout(store, args.id)
         elif args.rollout_command == "run":
             report = run_rollout(store, args.id, interval_seconds=args.interval_seconds, max_passes=args.max_passes, max_unchanged_online_passes=args.max_unchanged_online_passes)
+        elif args.rollout_command == "retire-identityless":
+            report = retire_identityless(store, args.id, settled_by=args.settled_by)
         else:
             report = store.read(args.id)
     except (OSError, ValueError, RuntimeError) as exc:
@@ -1888,6 +1912,10 @@ def _cmd_fleet_rollout(args) -> int:
     _print_json(report)
     if report.get("runner", {}).get("status") == "interrupted" and args.rollout_command == "run":
         return 130
+    if args.rollout_command == "retire-identityless" and (
+        report.get("stillBlocked") or report.get("blockedHosts")
+    ):
+        return 2
     return 0 if args.rollout_command not in ("apply", "run") or report["status"] == "complete" else 2
 
 
@@ -4799,6 +4827,7 @@ def _cmd_cp_web(args) -> int:
                              summary_report_config=cp.get("summary_report") or {},
                              unified_workspace_config=cp.get("unified_workspace") if isinstance(cp.get("unified_workspace"), dict) else None,
                              work_center_config=cp.get("work_center") if isinstance(cp.get("work_center"), dict) else None,
+                             agent_ops_config=cp.get("agent_ops") if isinstance(cp.get("agent_ops"), dict) else None,
                              assistant_config=_assistant_config(cp),
                              review_quorum=_review_quorum_config(cp),
                              single_operator=cp.get("single_operator") is True,
@@ -6023,6 +6052,10 @@ def _cmd_cp_worker(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    communication_args = list(sys.argv[1:] if argv is None else argv)
+    if communication_args[:1] == ["communications"]:
+        from .communications import main as communications_main
+        return communications_main(communication_args[1:])
     parser = _build_parser()
     effective_argv = list(sys.argv[1:] if argv is None else argv)
     if effective_argv and effective_argv[0] == "assistant":

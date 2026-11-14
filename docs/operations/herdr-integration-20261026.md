@@ -70,7 +70,7 @@ Keep the original canonical checkout and all source branches recoverable.
 
 ## Source and integration state
 
-- Integration checkout: `/home/wohlgemuth/IdeaProjects/.worktrees/herdr-complete-20261026`.
+- Integration checkout: `/home/user/IdeaProjects/.worktrees/herdr-complete-20261026`.
 - Integration branch: `integration/herdr-complete-20261026`.
 - Recovery checkpoint: `8bc7c7e` preserves the first integration attempt, including
   artifact, scheduler, handoff, and publication additions.

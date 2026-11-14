@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,8 @@ if argv[:2] == ["pr", "view"]:
     out({"number": int(n), "headRefOid": head(n), "state": "OPEN", "isDraft": p.get("draft", False),
          "title": p.get("title", "t"), "body": p.get("body", ""), "baseRefName": "main", "commits": []})
 elif argv[:2] == ["pr", "diff"]:
+    if pr(argv[2]).get("diff_error"):
+        sys.stderr.write(pr(argv[2])["diff_error"]); sys.exit(1)
     sys.stdout.write(pr(argv[2])["diff"])
 elif argv[:2] == ["pr", "list"]:
     out([{"number": int(n), "headRefOid": head(n), "isDraft": pr(n).get("draft", False)} for n in st["prs"]])
@@ -128,7 +131,15 @@ if name == "claude":
     sys.stdout.write(json.dumps({"is_error": cfg.get("is_error", False), "result": json.dumps(ans),
                                  "structured_output": ans if isinstance(ans, dict) else None,
                                  "total_cost_usd": 0.5, "usage": cfg.get("usage", {"input_tokens": 10, "output_tokens": 5}),
-                                 "modelUsage": {"claude-opus-5-5": {}}}))
+                                 "modelUsage": {"claude-opus-5-5": {}},
+                                 **({"num_turns": cfg["num_turns"]} if "num_turns" in cfg else {})}))
+elif name == "codex":
+    out = sys.argv[sys.argv.index("--output-last-message") + 1]
+    open(out, "w").write(ans if isinstance(ans, str) else json.dumps(ans))
+    sys.stdout.write(json.dumps({"type": "thread.started"}) + "\n")
+    if "usage" in cfg or not cfg.get("no_usage"):
+        sys.stdout.write(json.dumps({"type": "turn.completed", "usage": cfg.get(
+            "usage", {"input_tokens": 1000000, "cached_input_tokens": 0, "output_tokens": 500000})}) + "\n")
 else:
     sys.stdout.write(ans if isinstance(ans, str) else json.dumps(ans))
 '''
@@ -138,7 +149,8 @@ APPROVE = {"head_sha": "@HEAD", "verdict": "approve", "findings": [], "checked":
 
 def block(file="src/a.py", line=2, why="eval of input"):
     return {"head_sha": "@HEAD", "verdict": "block", "checked": ["code"],
-            "findings": [{"file": file, "line": line, "severity": "blocking", "category": "security", "why": why}]}
+            "findings": [{"file": file, "line": line, "severity": "blocking", "category": "security", "why": why,
+                          "evidence": "return eval(x)", "how_it_fails": "x = '__import__(\"os\")' runs code"}]}
 
 
 def sh(*a, cwd):
@@ -151,7 +163,7 @@ class Env:
     def __init__(self, tmp: Path, monkeypatch):
         self.tmp, self.bin = tmp, tmp / "bin"
         self.bin.mkdir()
-        for name, body in (("gh", FAKE_GH), ("claude", FAKE_REVIEWER), ("pi", FAKE_REVIEWER)):
+        for name, body in (("gh", FAKE_GH), ("claude", FAKE_REVIEWER), ("pi", FAKE_REVIEWER), ("codex", FAKE_REVIEWER)):
             (self.bin / name).write_text(body)
             (self.bin / name).chmod(0o755)
         self.origin, self.clone = tmp / "origin.git", tmp / "clone"
@@ -178,6 +190,7 @@ class Env:
             "check_runs": {self.head: [{"name": "GitGuardian Security Checks", "conclusion": "success"}]}})
         self.reviewer("claude", answer=APPROVE)
         self.reviewer("pi", answer=APPROVE)
+        self.reviewer("codex", answer=APPROVE)
         monkeypatch.setenv("HOME", str(self.home))
         monkeypatch.setenv("PATH", f"{self.bin}:{os.environ['PATH']}")
         monkeypatch.setenv("GH_TOKEN", "ghp_NOTFORREVIEWERS")
@@ -186,12 +199,13 @@ class Env:
         self.config()
         self.mod = load()
 
-    def config(self, extra: str = "", post: bool = False) -> None:
+    def config(self, extra: str = "", post: bool = False, wait: bool | None = True) -> None:
+        wait_key = "" if wait is None else f", wait_for_green: {str(wait).lower()}"
         self.cfg_path.write_text(textwrap.dedent(f"""\
             state_dir: {self.tmp}/state
             clone: {self.clone}
             post: {str(post).lower()}
-            gates: {{required: {json.dumps(GATES)}, when_present: [{WHEN_PRESENT}]}}
+            gates: {{required: {json.dumps(GATES)}, when_present: [{WHEN_PRESENT}]{wait_key}}}
             poll: {{max_per_run: 5}}
             """) + textwrap.dedent(extra))
 
@@ -338,7 +352,7 @@ def test_config_rejects_unknown_keys_backends_and_equal_contexts(env):
 def test_posting_needs_both_the_config_key_and_the_flag(env):
     for post_cfg, flag in ((False, False), (True, False), (False, True)):
         env.config(post=post_cfg)
-        assert env.review("tier2", post=flag, *["--force"]) == 0
+        assert env.review("tier2", "--force", post=flag) == 0
     assert env.gh_writes() == []                               # three real reviews, not one write
     assert len(env.reviewer_calls()) == 3
 
@@ -466,24 +480,24 @@ def test_a_blocking_finding_posts_failure_and_one_marked_comment(env):
     assert env.statuses_posted()[-1]["state"] == "failure"
     (c,) = env.gh_state()["comments"]
     assert c["body"].startswith("<!-- always-on-review:opus-agent-review -->") and "src/a.py:2" in c["body"]
-    assert env.review("tier2", post=True, *["--force"]) == 0                        # a re-run updates, not adds
+    assert env.review("tier2", "--force", post=True) == 0                        # a re-run updates, not adds
     assert len(env.gh_state()["comments"]) == 1
 
 
 def test_findings_on_files_outside_the_pr_are_dropped(env):
-    env.config(post=True)
-    env.reviewer("claude", answer=block(file="src/other.py"))
-    assert env.review("tier2", post=True) == 0
-    last = env.statuses_posted()[-1]
-    assert last["state"] == "success" and "1 finding dropped" in last["description"]
-    assert env.gh_state().get("comments", []) == []
+    m = env.mod
+    diff = env.gh_state()["prs"]["7"]["diff"]
+    index = {f.path: f for f in m.ai.parse_diff(diff)}
+    ans = {**block(file="src/other.py"), "head_sha": "a" * 40}
+    d = m.decide(m.parse_verdict(ans, "a" * 40), index, "m")
+    assert d.state == "success" and "1 finding dropped" in d.description and len(d.dropped) == 1
 
 
 def test_a_malformed_answer_leaves_the_status_pending(env):
     env.config(post=True)
     for bad in ("LGTM, approve!", {**APPROVE, "head_sha": "b" * 40}, {**APPROVE, "extra": 1}):
         env.reviewer("claude", answer=bad)
-        assert env.review("tier2", post=True, *["--force"]) == 1
+        assert env.review("tier2", "--force", post=True) == 1
     assert {s["state"] for s in env.statuses_posted()} == {"pending"}
     assert env.gh_state().get("comments", []) == []
 
@@ -613,3 +627,463 @@ def test_gateway_backend_reviews_through_the_openai_compatible_endpoint(env, tmp
         assert env.reviewer_calls() == [] and T.KEY not in (env.bin / "gh.log").read_text()
     finally:
         gw.stop()
+
+
+# ---------------- the clone the worktrees come from ----------------
+
+def test_a_bare_clone_is_accepted_for_the_detached_worktree(env, tmp_path):
+    bare = tmp_path / "bare.git"
+    sh("git", "clone", "-q", "--bare", str(env.origin), str(bare), cwd=tmp_path)
+    sh("git", "remote", "set-url", "origin", str(env.origin), cwd=bare)
+    env.cfg_path.write_text(env.cfg_path.read_text().replace(f"clone: {env.clone}", f"clone: {bare}"))
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+    assert env.reviewer_calls()[0]["head"] == env.head
+    assert sh("git", "for-each-ref", "refs/herdr-review", cwd=bare) == ""
+
+
+@pytest.mark.parametrize("kind", ["missing", "empty-dir", "inside-other-repo", "dot-git-file-to-nowhere"])
+def test_a_clone_that_is_not_a_git_repository_root_is_refused(env, tmp_path, kind):
+    path = tmp_path / "notaclone"
+    if kind != "missing":
+        path.mkdir()
+    if kind == "inside-other-repo":
+        path = env.clone / "src"                    # inside a work tree, but not a repository root
+    if kind == "dot-git-file-to-nowhere":
+        (path / ".git").write_text("gitdir: /nonexistent\n")
+    env.cfg_path.write_text(env.cfg_path.read_text().replace(f"clone: {env.clone}", f"clone: {path}"))
+    assert env.review("tier2") == 2 and env.reviewer_calls() == []
+
+
+# ---------------- the green-only gate is optional ----------------
+
+def _red_head(env):
+    st = env.gh_state()
+    st["statuses"][env.head][1]["state"] = "pending"
+    st["check_runs"][env.head][0]["conclusion"] = "failure"
+    env.write_gh(st)
+
+
+def test_by_default_tier2_reviews_a_head_whose_checks_are_not_green(env):
+    env.config(wait=None)                                    # the key is absent: the default applies
+    _red_head(env)
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+    assert env.reviewer_calls()[0]["head"] == env.head
+
+
+def test_by_default_tier2_needs_no_configured_gates(env):
+    env.cfg_path.write_text(env.cfg_path.read_text().replace(json.dumps(GATES), "[]").replace(
+        ", wait_for_green: true", ""))
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+
+
+def test_wait_for_green_true_restores_the_gate(env):
+    env.config(wait=True)
+    _red_head(env)
+    assert env.review("tier2") == 4 and env.reviewer_calls() == []
+
+
+def test_wait_for_green_false_skips_the_gate_and_must_be_a_boolean(env):
+    env.config(wait=False)
+    _red_head(env)
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+    env.cfg_path.write_text(env.cfg_path.read_text().replace("wait_for_green: false", "wait_for_green: yes please"))
+    assert env.review("tier2", "--force") == 2
+
+
+# ---------------- issue #790: diffs over GitHub's 20,000-line limit ----------------
+
+TOO_LARGE = ("could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines "
+             "(20000) (https://api.github.com/repos/acme/widget/pulls/7)")
+
+
+def _too_large(env, error=TOO_LARGE):
+    st = env.gh_state()
+    st["prs"]["7"]["diff_error"] = error
+    env.write_gh(st)
+
+
+def test_a_diff_over_githubs_line_limit_is_taken_from_the_local_worktree(env):
+    _too_large(env)
+    env.config(post=True)
+    assert env.review("tier2", post=True) == 0
+    [call] = env.reviewer_calls()
+    assert call["head"] == env.head and "return eval(x)" in call["stdin"] + " ".join(call["argv"])
+    assert [s["state"] for s in env.statuses_posted()] == ["pending", "success"]
+
+
+def test_the_local_diff_still_drives_the_in_pr_rules(env):
+    _too_large(env)
+    env.reviewer("claude", answer=block(file="src/a.py", line=2))
+    env.config(post=True)
+    assert env.review("tier2", post=True) == 0
+    assert env.statuses_posted()[-1]["state"] == "failure"                  # the finding is on a file in the diff
+    env.reviewer("claude", answer=block(file="src/not_in_pr.py", line=2))
+    assert env.review("tier2", "--force", post=True) == 0
+    assert env.statuses_posted()[-1]["state"] != "failure"                  # dropped: not in the local diff
+
+
+def test_any_other_diff_failure_still_fails_the_review(env):
+    _too_large(env, "gh: HTTP 502: bad gateway")
+    assert env.review("tier2") == 1 and env.reviewer_calls() == []
+
+
+# ---------------- issue #792 follow-up: tiers.<name>.daily_budget_usd ----------------
+
+BUDGET = "tiers: {tier2: {daily_budget_usd: 1.0}}\n"      # the fake claude reports total_cost_usd 0.5 per review
+
+
+def _log_lines(env):
+    return [json.loads(x) for x in (env.tmp / "state/reviews.jsonl").read_text().splitlines()]
+
+
+def test_below_the_daily_budget_the_review_runs(env):
+    env.config(BUDGET, post=True)
+    assert env.review("tier2", post=True) == 0
+    assert len(env.reviewer_calls()) == 1 and _log_lines(env)[-1]["usage"]["cost_usd"] == 0.5
+
+
+def test_at_the_daily_budget_the_review_is_skipped_and_stays_pending(env, capsys):
+    env.config(BUDGET, post=True)
+    assert env.review("tier2", post=True) == 0                      # 0.5 spent, under 1.0
+    assert env.review("tier2", "--force", post=True) == 0        # 1.0 spent: now at the budget
+    posted = env.statuses_posted()
+    capsys.readouterr()
+    assert env.review("tier2", "--force", post=True) == 4        # SKIPPED, nothing run, nothing posted
+    assert len(env.reviewer_calls()) == 2 and env.statuses_posted() == posted
+    err = capsys.readouterr().err
+    assert err.count("daily budget") == 1 and "tier2" in err and "exhausted" in err
+
+
+def test_spend_from_a_previous_utc_day_is_ignored(env):
+    env.config(BUDGET, post=True)
+    env.review("tier2", post=True)
+    env.review("tier2", "--force", post=True)
+    yesterday = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path = env.tmp / "state/reviews.jsonl"
+    path.write_text("".join(json.dumps({**x, "ts": yesterday}) + "\n" for x in _log_lines(env)))
+    assert env.review("tier2", "--force", post=True) == 0 and len(env.reviewer_calls()) == 3
+
+
+def test_only_the_same_tiers_spend_counts(env):
+    env.config(BUDGET, post=True)
+    assert env.review("tier1", post=True) == 0
+    env.reviewer("pi", answer=APPROVE)
+    path = env.tmp / "state/reviews.jsonl"
+    path.write_text("".join(json.dumps({**x, "usage": {"cost_usd": 99}}) + "\n" for x in _log_lines(env)))
+    assert env.review("tier2", post=True) == 0 and len(env.reviewer_calls()) == 2
+
+
+def test_no_budget_means_no_limit(env):
+    env.config(post=True)
+    for _ in range(4):
+        assert env.review("tier2", "--force", post=True) == 0
+    assert len(env.reviewer_calls()) == 4
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "'5'", "true", ".nan", ".inf", "[1]", str(10**400)])
+def test_an_invalid_daily_budget_is_refused(env, bad):
+    env.config(f"tiers: {{tier2: {{daily_budget_usd: {bad}}}}}\n")
+    assert env.review("tier2") == 2 and env.reviewer_calls() == []
+
+
+def test_spend_of_a_review_whose_head_moved_counts(env):
+    env.config(BUDGET, post=True)
+    st = env.gh_state()
+    st["prs"]["7"]["head_after_review"] = "c" * 40
+    env.write_gh(st)
+    assert env.review("tier2", post=True) == 3
+    assert _log_lines(env)[-1]["state"] == "head-moved" and _log_lines(env)[-1]["usage"]["cost_usd"] == 0.5
+    assert env.mod.spent_today_usd(env.mod.load_config(env.cfg_path), "tier2") == 0.5
+
+
+def test_spend_of_a_review_whose_passes_all_failed_counts(env):
+    env.config(BUDGET, post=True)
+    env.reviewer("claude", answer={"head_sha": "@HEAD", "verdict": "maybe"})      # model ran and billed; not a verdict
+    assert env.review("tier2", post=True) == 1
+    assert _log_lines(env)[-1]["state"] == "not-run" and _log_lines(env)[-1]["usage"]["cost_usd"] == 0.5
+    assert env.mod.spent_today_usd(env.mod.load_config(env.cfg_path), "tier2") == 0.5
+
+
+def test_a_non_finite_logged_cost_counts_as_zero(env):
+    env.config(BUDGET, post=True)
+    assert env.review("tier2", post=True) == 0
+    now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with (env.tmp / "state/reviews.jsonl").open("a") as f:
+        for bad in ("NaN", "Infinity", "-Infinity"):
+            f.write('{"ts": "%s", "tier": "tier2", "usage": {"cost_usd": %s}}\n' % (now, bad))
+    assert env.mod.spent_today_usd(env.mod.load_config(env.cfg_path), "tier2") == 0.5
+
+
+def test_an_undecodable_byte_in_the_log_skips_that_line_only(env):
+    env.config(BUDGET, post=True)
+    assert env.review("tier2", post=True) == 0
+    with (env.tmp / "state/reviews.jsonl").open("ab") as f:
+        f.write(b'\xff\xfe not utf-8\n')
+    assert env.mod.spent_today_usd(env.mod.load_config(env.cfg_path), "tier2") == 0.5
+    assert env.review("tier2", "--force", post=True) == 0
+
+
+def test_a_pass_that_hits_the_time_cap_does_not_recount_the_previous_passes_usage(env):
+    """A real Backend (it sleeps, then answers) used directly: pass 1 uses up the whole cap, so pass 2 stops at the
+    cap check before it calls any backend. Pass 1's usage must be counted exactly once."""
+    env.config(BUDGET)
+    cfg = env.mod.load_config(env.cfg_path)
+
+    class Slow:
+        name, needs_worktree = "slow", False
+
+        def review(self, req, time_cap_s):
+            time.sleep(0.3)
+            answer = {"head_sha": req.sha, "verdict": "approve", "findings": [], "checked": ["code"]}
+            return env.mod.RawReview(answer, "m", 0.3, {"cost_usd": 0.5})
+
+    tier = {**cfg["tiers"]["tier2"], "time_cap_s": 0.2, "passes": [{"name": "a", "focus": ""}, {"name": "b", "focus": ""}]}
+    req = env.mod.ReviewRequest(REPO, 7, env.head, "t", "", "", "", [])
+    result = env.mod.run_passes(cfg, tier, Slow(), req, None)
+    assert result.partial and result.usage["cost_usd"] == 0.5
+
+
+# ---------------- Codex second reviewer on risky paths ----------------
+
+RISKY = """
+    risky:
+      globs: ["src/**"]
+"""
+PRICES = ", input_usd_per_mtok: 2, output_usd_per_mtok: 10"       # the stand-in's usage costs 2 + 5 = 7 dollars
+
+
+def codex_calls(env):
+    return [c for c in env.reviewer_calls() if c["tool"] == "codex"]
+
+
+def only_pending(env):
+    return [s["state"] for s in env.statuses_posted()] == ["pending"]
+
+
+def test_a_non_risky_pr_never_calls_codex(env):
+    env.config('risky: {globs: ["deploy/**"]}\n', post=True)
+    assert env.review("tier2", post=True) == env.mod.OK
+    assert codex_calls(env) == []
+    assert [s["state"] for s in env.statuses_posted()] == ["pending", "success"]
+
+
+def test_with_no_risky_globs_codex_is_off(env):
+    assert env.review("tier2", post=True) == env.mod.OK          # the default config
+    assert codex_calls(env) == []
+
+
+def test_a_risky_pr_needs_both_verdicts_then_posts_success(env):
+    env.config(RISKY, post=True)
+    assert env.review("tier2", post=True) == env.mod.OK
+    assert [c["tool"] for c in env.reviewer_calls()] == ["claude", "codex"]
+    c = codex_calls(env)[0]
+    assert c["head"] == env.head and c["porcelain"] == ""                 # the exact head, a clean worktree
+    assert "/worktrees/" in c["cwd"]
+    a = c["argv"]
+    assert a[0] == "exec" and a[a.index("--sandbox") + 1] == "read-only"
+    for flag in ("--ephemeral", "--ignore-user-config", "--ignore-rules", "--output-schema"):
+        assert flag in a
+    assert "GH_TOKEN" not in c["env"] and "ANTHROPIC_API_KEY" not in c["env"]
+    assert env.head in c["stdin"] and "UNTRUSTED" in c["stdin"]
+    posted = env.statuses_posted()
+    assert [s["state"] for s in posted] == ["pending", "success"]
+    assert "opus" in posted[-1]["description"] and "codex" in posted[-1]["description"]
+    assert env.worktrees() == [env.worktrees()[0]]                        # removed afterwards
+
+
+def test_a_codex_block_posts_failure_with_its_finding(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=block(why="codex found an eval"))
+    assert env.review("tier2", post=True) == env.mod.OK
+    states = [s["state"] for s in env.statuses_posted()]
+    assert states == ["pending", "failure"]
+    assert any("codex found an eval" in w["body"].get("body", "") for w in env.gh_writes())
+
+
+def test_an_opus_block_decides_failure_without_calling_codex(env):
+    env.config(RISKY, post=True)
+    env.reviewer("claude", answer=block())
+    env.review("tier2", post=True)
+    assert codex_calls(env) == []
+    assert [s["state"] for s in env.statuses_posted()] == ["pending", "failure"]
+
+
+@pytest.mark.parametrize("how", ["exit", "garbage", "wrong-head", "missing-binary", "no-answer-file"])
+def test_codex_that_cannot_run_leaves_the_status_pending(env, how):
+    env.config(RISKY if how != "missing-binary" else RISKY + "      codex: {command: no-such-codex}\n", post=True)
+    if how == "exit":
+        env.reviewer("codex", answer=APPROVE, exit=3)
+    elif how == "garbage":
+        env.reviewer("codex", answer="I approve, trust me")
+    elif how == "wrong-head":
+        env.reviewer("codex", answer={**APPROVE, "head_sha": "0" * 40})
+    elif how == "no-answer-file":
+        (env.bin / "codex").write_text("#!/bin/sh\nexit 0\n")
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    assert only_pending(env)                                           # never a terminal state
+
+
+def test_unverifiable_codex_blockers_leave_the_status_pending(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer={**block(), "findings": [{**block()["findings"][0], "evidence": "this is not code"}]})
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    assert only_pending(env)
+
+
+def test_codex_failures_are_logged_and_cool_down(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=APPROVE, exit=3)
+    for _ in range(3):
+        env.review("tier2", post=True)
+    assert len(codex_calls(env)) == 3
+    assert env.review("tier2", post=True) == env.mod.SKIPPED            # cooling down, no fourth call
+    assert len(codex_calls(env)) == 3
+
+
+def test_a_risky_dry_run_runs_codex_but_posts_nothing(env):
+    env.config(RISKY)
+    assert env.review("tier2") == env.mod.OK
+    assert [c["tool"] for c in env.reviewer_calls()] == ["claude", "codex"]
+    assert env.statuses_posted() == []
+
+
+def test_tier1_never_calls_codex_even_on_risky_paths(env):
+    env.config(RISKY, post=True)
+    env.review("tier1", post=True)
+    assert codex_calls(env) == []
+
+
+def test_a_head_that_moves_during_a_risky_review_posts_nothing_terminal(env):
+    env.config(RISKY, post=True)
+    st = env.gh_state()
+    st["prs"]["7"]["head_after_review"] = "f" * 40
+    env.write_gh(st)
+    assert env.review("tier2", post=True) == env.mod.MOVED
+    assert only_pending(env)
+
+
+def read_log(env):
+    return [json.loads(x) for x in (env.tmp / "state/reviews.jsonl").read_text().splitlines()]
+
+
+def test_codex_cost_is_logged_from_tokens_and_prices(env):
+    env.config(RISKY + "      codex: {" + PRICES.lstrip(", ") + "}\n")
+    env.review("tier2")
+    line = next(x for x in read_log(env) if x["tier"] == "codex")
+    assert line["usage"]["cost_usd"] == 7.0 and line["state"] == "reviewed" and line["sha"] == env.head
+    assert env.mod.spent_today_usd(env.mod.load_config(str(env.cfg_path)), "codex") == 7.0
+
+
+def spend_codex(env, usd):
+    (env.tmp / "state").mkdir(exist_ok=True)
+    now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(env.tmp / "state/reviews.jsonl", "a") as fh:
+        fh.write(json.dumps({"ts": now, "tier": "codex", "usage": {"cost_usd": usd}}) + "\n")
+
+
+def test_an_exhausted_codex_budget_skips_the_risky_review_before_opus_runs(env):
+    env.config(RISKY + "      codex: {daily_budget_usd: 5" + PRICES + "}\n", post=True)
+    spend_codex(env, 5.0)
+    assert env.review("tier2", post=True) == env.mod.SKIPPED
+    assert env.reviewer_calls() == [] and env.statuses_posted() == []    # no Opus spend, status unchanged
+
+
+def test_codex_budget_does_not_touch_non_risky_prs_or_other_tiers(env):
+    env.config('risky: {globs: ["deploy/**"], codex: {daily_budget_usd: 1' + PRICES + '}}\n', post=True)
+    spend_codex(env, 99.0)
+    assert env.review("tier2", post=True) == env.mod.OK
+
+
+def test_below_the_codex_budget_it_runs_and_the_spend_adds_up(env):
+    env.config(RISKY + "      codex: {daily_budget_usd: 10" + PRICES + "}\n")
+    spend_codex(env, 2.0)
+    assert env.review("tier2") == env.mod.OK                             # 2 spent, 10 allowed
+    assert env.mod.spent_today_usd(env.mod.load_config(str(env.cfg_path)), "codex") == 9.0
+    spend_codex(env, 1.0)
+    assert env.review("tier2", "--force") == env.mod.SKIPPED             # --force does not bypass the budget
+
+
+def test_codex_without_token_usage_cannot_be_budgeted_so_it_stays_pending(env):
+    env.config(RISKY + "      codex: {daily_budget_usd: 50" + PRICES + "}\n", post=True)
+    env.reviewer("codex", answer=APPROVE, no_usage=True)
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    assert only_pending(env)
+
+
+@pytest.mark.parametrize("bad", [
+    'risky: {globs: "deploy/**"}', 'risky: {globs: [""]}', 'risky: {globs: ["/etc/**"]}',
+    'risky: {globs: ["../x"]}', 'risky: {codex: {daily_budget_usd: 5}}',
+    'risky: {codex: {daily_budget_usd: -1, input_usd_per_mtok: 1, output_usd_per_mtok: 1}}',
+    'risky: {codex: {time_cap_s: 1}}', 'risky: {codex: {wrapper: "bwrap"}}', 'risky: {codex: {command: ""}}',
+    'risky: {codex: {nope: 1}}', 'risky: {extra: 1}'])
+def test_bad_risky_config_is_refused(env, bad):
+    env.config(bad + "\n")
+    with pytest.raises(env.mod.Refused):
+        env.mod.load_config(str(env.cfg_path))
+
+
+@pytest.mark.parametrize("glob,path,hit", [
+    ("deploy/**", "deploy/a.sh", True), ("deploy/**", "deploy/x/y/z.yaml", True), ("deploy/**", "mydeploy/a", False),
+    ("**/migrations/**", "db/migrations/001.sql", True), ("**/migrations/**", "migrations/001.sql", True),
+    ("**/migrations/**", "db/migrationsx/1.sql", False), ("**/*.sql", "a/b/c.sql", True), ("**/*.sql", "c.sql", True),
+    ("**/*.sql", "c.sqlx", False), ("**/*security*/**", "src/app_security/x.py", True),
+    ("**/*security*/**", "security.py", False), ("**/*auth*", "pkg/oauth.go", True), ("**/*auth*", "pkg/authz/x", False),
+    ("**/secrets*", "a/secrets.env", True), ("**/secrets*", "a/not_secrets.env", False),
+    ("src/?.py", "src/a.py", True), ("src/?.py", "src/ab.py", False), ("a.b", "aXb", False)])
+def test_glob_matching(env, glob, path, hit):
+    assert bool(env.mod.glob_regex(glob).fullmatch(path)) is hit
+
+
+def test_a_file_moved_out_of_a_risky_path_still_counts(env):
+    diff = ("diff --git a/deploy/run.sh b/tools/run.sh\nsimilarity index 100%\nrename from deploy/run.sh\n"
+            "rename to tools/run.sh\n")
+    cfg = {"risky": {"globs": ["deploy/**"]}}
+    assert env.mod.risky_paths(cfg, env.mod.ai.parse_diff(diff)) == ["deploy/run.sh"]
+    assert env.mod.risky_paths({"risky": {"globs": ["docs/**"]}}, env.mod.ai.parse_diff(diff)) == []
+
+
+def test_show_command_prints_the_codex_command_line(env, capsys):
+    assert env.run("show-command", "--tier", "codex") == env.mod.OK
+    out = capsys.readouterr().out
+    assert "codex exec --sandbox read-only" in out and "--ignore-user-config" in out
+    assert env.reviewer_calls() == []
+
+
+def test_posting_still_needs_both_keys_on_a_risky_pr(env):
+    env.config(RISKY, post=True)
+    env.review("tier2")                                                  # config key only, no --post
+    env.config(RISKY, post=False)
+    env.review("tier2", "--force", post=True)                            # flag only, no config key
+    assert env.statuses_posted() == []
+
+
+def test_a_codex_block_whose_blockers_all_cite_files_outside_the_pr_stays_pending(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=block(file="elsewhere/other.py"))
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    assert only_pending(env)                                              # not success
+
+
+@pytest.mark.parametrize("bad", [10**400, 10**13, -5])
+def test_absurd_codex_token_counts_are_invalid_usage_and_fail_the_review(env, bad):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=APPROVE, usage={"input_tokens": bad, "output_tokens": 1})
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    assert only_pending(env)
+
+
+def test_codex_cost_survives_huge_numbers_without_overflowing(env):
+    c = {"input_usd_per_mtok": 2, "output_usd_per_mtok": 10}
+    assert env.mod.codex_cost_usd(c, {"input_tokens": 10**400, "output_tokens": 1}) is None
+
+
+def test_codex_does_not_load_a_pr_added_agents_md_as_instructions(env):
+    env.config(RISKY)
+    env.review("tier2")
+    a = codex_calls(env)[0]["argv"]
+    assert "project_doc_max_bytes=0" in a and a[a.index("project_doc_max_bytes=0") - 1] == "-c"
+
+
+def test_the_example_config_counts_auth_directories_as_risky(env):
+    cfg = env.mod.load_config(str(ROOT / "deploy/ci-review/always-on-review.example.yaml"))
+    assert any(env.mod.glob_regex(g).fullmatch("pkg/auth/login.go") for g in cfg["risky"]["globs"])

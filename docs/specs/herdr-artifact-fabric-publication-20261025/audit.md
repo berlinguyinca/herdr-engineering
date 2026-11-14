@@ -6,7 +6,7 @@ Execution host: `bender`
 HEAD: `88c4d5e9efe700f9641bc408e5b3504fc124c0b0` (`main`)
 
 The specification bundle was transferred from the discovered Mac host `mac.lan`
-as SSH user `wohlgemuth`, verified with SHA-256
+as SSH user `user`, verified with SHA-256
 `f9215bcfd2a66c15a9c924d58394cd5db6afb24e12bf5b27cc9aa654bc079743`, and
 extracted at:
 
