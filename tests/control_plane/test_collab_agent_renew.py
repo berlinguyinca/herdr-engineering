@@ -223,13 +223,66 @@ def test_only_rooms_the_owner_owns_are_restored(gw):
     assert w.s.agent_rooms(auth(w.s, out))["rooms"] == []
 
 
-def test_a_grant_the_owner_removed_is_not_restored(gw):
+def test_a_lapsed_grant_cannot_be_removed_so_renew_restores_it(gw):
     w = gw
     _, info = w.agent("alice")
+    w.s.clock.t += 11 * DAY
+    w.s.agent_rooms(w.alice)
+    assert code(w.s.remove_agent_from_room, w.alice, w.room, info["agent_id"]) == 404    # documented: no way to veto
+    assert w.s.renew_agent(w.alice, info["agent_id"])["grants_restored"] == [w.room]
+
+
+def test_a_grant_lapsed_then_regranted_then_removed_is_not_restored(gw):
+    w = gw
+    _, info = w.agent("alice")
+    w.s.clock.t += 11 * DAY
+    w.s.agent_rooms(w.alice)
+    w.s.grant_agent(w.alice, w.room, {"agent_id": info["agent_id"], "actions": ["read"]})   # a fresh decision clears the lapse
     w.s.remove_agent_from_room(w.alice, w.room, info["agent_id"])
     w.s.clock.t += 11 * DAY
     w.s.agent_rooms(w.alice)
     assert w.s.renew_agent(w.alice, info["agent_id"])["grants_restored"] == []
+
+
+def test_a_team_grant_that_replaced_a_lapsed_direct_grant_is_left_alone(gw):
+    from herdr_engineering.control_plane.collab_team_rooms import normalize_team_rooms
+    w = gw
+    w.s.team_rooms = normalize_team_rooms({"enabled": True})
+    _, info = w.agent("alice", actions=("read", "post", "execute", "instruct"))
+    aid = info["agent_id"]
+    w.s.clock.t += 11 * DAY
+    w.s.agent_rooms(w.alice)                                            # the direct grant lapsed
+    team = "team-" + "c" * 20
+    w.s.attach_team(w.alice, w.room, team, {"roles": {"implementer": [aid]}})
+    held = dict(w.s._rooms[w.room]["grants"][aid])
+    assert held["team_id"] == team
+    out = w.s.renew_agent(w.alice, aid)
+    assert w.room not in out["grants_restored"]
+    assert w.s._rooms[w.room]["grants"][aid] == held                    # still the team grant, team_id intact
+    w.s.detach_team(w.alice, w.room, team)
+    assert aid not in w.s._rooms[w.room]["grants"]                      # and detach still removes it
+    assert w.s.renew_agent(w.alice, aid)["grants_restored"] == []      # the old direct grant is not resurrected
+
+
+def test_a_removed_member_does_not_get_their_agents_lapsed_grants_back(gw):
+    w = gw
+    _, info = w.agent("bob")                                            # bob owns it; alice approved the grant
+    w.s.clock.t += 11 * DAY
+    w.s.agent_rooms(w.alice)
+    assert w.s._lapsed_grants[info["agent_id"]]
+    w.s.remove_member(w.alice, w.room, "bob")
+    assert not w.s._lapsed_grants.get(info["agent_id"])                 # their lapsed grants die with the membership
+    assert not replayed(w.s)._lapsed_grants.get(info["agent_id"])        # and so on replay
+
+
+def test_lapsed_records_of_revoked_agents_are_dropped(gw):
+    w = gw
+    _, info = w.agent("alice")
+    w.s.clock.t += 11 * DAY
+    w.s.agent_rooms(w.alice)
+    assert w.s._lapsed_grants.get(info["agent_id"])
+    w.s.revoke_agent(w.alice, info["agent_id"])
+    assert not w.s._lapsed_grants.get(info["agent_id"])
 
 
 # ------------------------------------------------------------------ sliding extension on use

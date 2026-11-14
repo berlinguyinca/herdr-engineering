@@ -900,6 +900,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             for aid in [a for a in room["grants"] if self._agents.get(a, {}).get("owner") == p["subject_user_id"]]:
                 room["grants"].pop(aid, None)
                 self._rooms_by_agent[aid].discard(p["room_id"])
+            for aid, lapsed in self._lapsed_grants.items():        # nor a grant that had already lapsed (renew restores those)
+                if self._agents.get(aid, {}).get("owner") == p["subject_user_id"]:
+                    lapsed.pop(p["room_id"], None)
             gone = p["subject_user_id"]                # re-adding them later must not restore a terminal right
             self._prune_terminal(p["room_id"], lambda k: k == f"user:{gone}" or (
                 k.startswith("agent:") and self._agents.get(k[6:], {}).get("owner") == gone))
@@ -990,6 +993,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             self._by_cred[p["secret_digest"]] = p["agent_id"]
         elif t == "agent_revoked":
             self._agents[p["agent_id"]]["status"] = "revoked"
+            self._lapsed_grants.pop(p["agent_id"], None)
             if self._agents[p["agent_id"]].get("external"):
                 self._agents[p["agent_id"]]["external"]["revoked_at"] = p["created_at"]
                 self._agents[p["agent_id"]]["external"]["revoked_by"] = (
@@ -3252,6 +3256,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         name = self._agents[agent_id]["name"]
         for rid, actions in sorted(wanted.items()):
             room = self._rooms.get(rid)
+            if room and agent_id in room["grants"] and rid in self._lapsed_grants.get(agent_id, {}):
+                continue                                    # something else holds a grant here now (a team attach): never overwrite
             m = self._member(room, pr.id) if room else None
             if not m or m["role"] != "owner":
                 continue
