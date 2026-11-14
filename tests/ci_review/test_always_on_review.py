@@ -188,12 +188,13 @@ class Env:
         self.config()
         self.mod = load()
 
-    def config(self, extra: str = "", post: bool = False) -> None:
+    def config(self, extra: str = "", post: bool = False, wait: bool | None = True) -> None:
+        wait_key = "" if wait is None else f", wait_for_green: {str(wait).lower()}"
         self.cfg_path.write_text(textwrap.dedent(f"""\
             state_dir: {self.tmp}/state
             clone: {self.clone}
             post: {str(post).lower()}
-            gates: {{required: {json.dumps(GATES)}, when_present: [{WHEN_PRESENT}]}}
+            gates: {{required: {json.dumps(GATES)}, when_present: [{WHEN_PRESENT}]{wait_key}}}
             poll: {{max_per_run: 5}}
             """) + textwrap.dedent(extra))
 
@@ -640,3 +641,39 @@ def test_a_clone_that_is_not_a_git_repository_root_is_refused(env, tmp_path, kin
         (path / ".git").write_text("gitdir: /nonexistent\n")
     env.cfg_path.write_text(env.cfg_path.read_text().replace(f"clone: {env.clone}", f"clone: {path}"))
     assert env.review("tier2") == 2 and env.reviewer_calls() == []
+
+
+# ---------------- the green-only gate is optional ----------------
+
+def _red_head(env):
+    st = env.gh_state()
+    st["statuses"][env.head][1]["state"] = "pending"
+    st["check_runs"][env.head][0]["conclusion"] = "failure"
+    env.write_gh(st)
+
+
+def test_by_default_tier2_reviews_a_head_whose_checks_are_not_green(env):
+    env.config(wait=None)                                    # the key is absent: the default applies
+    _red_head(env)
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+    assert env.reviewer_calls()[0]["head"] == env.head
+
+
+def test_by_default_tier2_needs_no_configured_gates(env):
+    env.cfg_path.write_text(env.cfg_path.read_text().replace(json.dumps(GATES), "[]").replace(
+        ", wait_for_green: true", ""))
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+
+
+def test_wait_for_green_true_restores_the_gate(env):
+    env.config(wait=True)
+    _red_head(env)
+    assert env.review("tier2") == 4 and env.reviewer_calls() == []
+
+
+def test_wait_for_green_false_skips_the_gate_and_must_be_a_boolean(env):
+    env.config(wait=False)
+    _red_head(env)
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+    env.cfg_path.write_text(env.cfg_path.read_text().replace("wait_for_green: false", "wait_for_green: yes please"))
+    assert env.review("tier2", "--force") == 2

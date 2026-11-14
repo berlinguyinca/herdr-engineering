@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Always-on review: bare clones work, the green-only gate is optional
+
+- Fix: the `clone:` check required `<clone>/.git`, so the bare clone the README recommends was refused. It now asks git (`is_git_clone`): a bare or non-bare repository root passes; a missing path, a plain directory, a directory inside another repo or a dangling `.git` is refused.
+- Default change (operator approved): tier 2 no longer waits for green checks; it reviews every non-draft head. New YAML key `gates.wait_for_green` (boolean, default `false`) restores the old gate; `gates.required` is only needed, and only validated as non-empty, when it is `true`. Cost note: Opus now runs on heads whose CI is still pending or red, so expect more reviews. Rollback: `gates: {wait_for_green: true, ...}`; restart the polling service after editing, it reads the config at start.
+
 ### Review prompt v2: rules, checklist, evidence, passes, replay harness (always-on-review.py)
 
 - New YAML keys: `prompt.project_rules` (trusted rules in both tiers' prompt), `prompt.checklist_file` (`deploy/ci-review/review-checklist.yaml`, validated, the reviewer lists the ids it considered in `checked_items`), `prompt.require_evidence` (default true), `tiers.tier2.passes` (the example ships general, tests, security, migrations; unset or `[]` keeps one unfocused review) and `replay.clones`. The claude prompt now tells the reviewer to read callers, tests and migrations before the verdict.

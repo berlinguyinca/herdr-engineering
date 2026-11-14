@@ -9,7 +9,7 @@ Built on ai-review.py (same `gh` wrapper, diff parser, chunker, citation check, 
 reviewer backends chosen in YAML only: `gateway` (an OpenAI-compatible chat completion, as ai-review.py), `claude`
 (headless Claude Code, read-only tools, a fresh detached worktree of the PR head) and `pi` (the pi harness, read-only
 tools, same worktree). Tier 1 is advisory and posts its own context; tier 2 posts the required context, and only for
-a head whose required gates are all green.
+the head it was asked about, without waiting for green checks unless `gates.wait_for_green` is set.
 
 DRY-RUN IS THE DEFAULT. Reviews run and are logged, and nothing is posted unless the config sets `post: true` AND the
 command line passes `--post`. The script, never the model, decides the state: the reviewer's answer must parse under
@@ -69,7 +69,8 @@ DEFAULTS: dict = {
     "state_dir": "~/.local/state/herdr-review",
     "post": False,                      # with the --post flag, the second of the two keys that allow any posting
     "clone": "",                        # a clone the claude/pi backends create read-only worktrees from
-    "gates": {"required": [], "when_present": []},   # tier 2: required must be success; when_present only if it exists
+    "gates": {"wait_for_green": False,  # true: tier 2 waits until the gates below are green on the head; false: reviews at once
+              "required": [], "when_present": []},   # with wait_for_green: required must be success; when_present only if it exists
     "poll": {"max_per_run": 5, "pending_stale_minutes": 120, "cooldown_failures": 3, "cooldown_minutes": 60},
     "prompt": {"project_rules": [], "checklist_file": "", "require_evidence": True},
     "replay": {"clones": [],            # [{repo: OWNER/NAME, path: DIR}]: the clone replay uses for that repo
@@ -123,6 +124,8 @@ def load_config(path: str | None) -> dict:
             raise Refused(f"config: backends.{name}.wrapper must be a list of strings")
         if not b["command"].strip():
             raise Refused(f"config: backends.{name}.command is empty")
+    if not isinstance(cfg["gates"]["wait_for_green"], bool):
+        raise Refused("config: gates.wait_for_green must be true or false")
     for g in ("required", "when_present"):
         if not isinstance(cfg["gates"][g], list) or not all(isinstance(x, str) and x for x in cfg["gates"][g]):
             raise Refused(f"config: gates.{g} must be a list of names")
@@ -1072,7 +1075,7 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
         if state.cooling(key, sha, cfg) and not force:
             ai.say(f"{key}: cooling down after repeated failures; skipped")
             return SKIPPED
-        if tier_name == "tier2":
+        if tier_name == "tier2" and cfg["gates"]["wait_for_green"]:
             green, missing = gates_green(gh, repo, sha, cfg["gates"]["required"], cfg["gates"]["when_present"])
             if not green:
                 ai.say(f"{key} @ {sha[:12]}: waiting for gates: {', '.join(missing)}")
