@@ -266,8 +266,8 @@ def test_a_team_grant_that_replaced_a_lapsed_direct_grant_is_left_alone(gw):
 
 def test_a_coordinator_designation_replaces_a_lapsed_direct_grant_for_good(gw):
     from herdr_engineering.control_plane.collab_coordinators import normalize_coordinators
-    from herdr_engineering.control_plane.collab_team_rooms import normalize_team_rooms
     from herdr_engineering.control_plane.collab_team_roles import normalize_team_roles
+    from herdr_engineering.control_plane.collab_team_rooms import normalize_team_rooms
     w = gw
     w.s.team_rooms = normalize_team_rooms({"enabled": True})
     w.s.team_roles = normalize_team_roles({"enabled": True})
