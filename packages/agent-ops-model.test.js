@@ -391,7 +391,8 @@ const denseGraph = (agents, edges) => ({
   }),
 });
 
-test('layoutScene stays fast on a maxed-out graph (60 agents, 2000 edges)', () => {
+// Catastrophic-regression guard, not a benchmark: the limit is deliberately loose (best of 5 under 2000 ms).
+test('layoutScene catastrophic-regression guard: best of 5 under 2000 ms on a maxed-out graph (60 agents, 2000 edges)', () => {
   const snap = denseGraph(60, 2000);
   layoutScene(snap);   // warm-up: the first call pays for JIT
   const runs = [];

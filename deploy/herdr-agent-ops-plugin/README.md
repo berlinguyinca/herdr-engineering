@@ -13,7 +13,7 @@ metadata-only.
    optionally `HERDR_AGENT_OPS_TOKEN` (or `HERDR_COLLAB_TOKEN`; a collab bearer token, without it you only see org-scoped, room-less events). Prefer the environment variable or `--token-file <path>` over `--token <value>`: an argv token is visible to every local user in the process list (`ps`), and the pane prints a warning when you use it.
 3. Link for local use: `herdr plugin link /path/to/herdr-engineering/deploy/herdr-agent-ops-plugin`, then
    `herdr plugin list`.
-4. Open it: `herdr plugin action invoke herdr.agent-ops open` or `herdr plugin pane open herdr.agent-ops map`.
+4. Open it: `herdr plugin action invoke open --plugin herdr.agent-ops` or `herdr plugin pane open --plugin herdr.agent-ops --entrypoint map` (needs an active workspace pane).
 
 The manifest follows the `[[panes]]`/`[[actions]]` shape in Herdr's plugin docs as summarised in
 `docs/specs/2026-11-12-agent-operations-map/DISCOVERY-B-siblings.md`; `herdr plugin link` is the real validator, so
@@ -21,7 +21,7 @@ if your Herdr version rejects a field, fix it there first.
 
 ## Doctor
 
-- `herdr plugin action invoke herdr.agent-ops doctor` (or `herdr-eng agent-ops --once`) prints one frame; a non-zero
+- `herdr plugin action invoke doctor --plugin herdr.agent-ops` (or `herdr-eng agent-ops --once`) prints one frame; a non-zero
   exit with a JSON error means the URL, key or the `agent_ops_v1` capability is wrong (`GET /api/v1/health` lists it
   under `capabilities`; 404 on `/api/v1/agent-ops/snapshot` means it is disabled).
 - `herdr plugin log list` shows plugin command output.

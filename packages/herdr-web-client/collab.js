@@ -194,6 +194,7 @@ export class CollabApi {
   bulkConnect(body) { return this.call('POST', '/agents/bulk', body); }
   approveAll(room, body = {}) { return this.call('POST', `/rooms/${encodeURIComponent(room)}/agent-requests/approve-all`, body); }
   renameAgent(id, name) { return this.call('POST', `/agents/${encodeURIComponent(id)}/rename`, { name }); }
+  renewAgent(id) { return this.call('POST', `/agents/${encodeURIComponent(id)}/renew`, {}, AbortSignal.timeout(15000)); }
   revokeAgent(id) { return this.call('POST', `/agents/${encodeURIComponent(id)}/revoke`, {}, AbortSignal.timeout(15000)); }
   grantAgent(room, agentId, actions, expiresAt) {
     return this.call('POST', `/rooms/${encodeURIComponent(room)}/agents`,
