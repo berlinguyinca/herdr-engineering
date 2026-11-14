@@ -10,7 +10,7 @@ import { chromium } from 'playwright';
 
 const REPO = path.resolve(import.meta.dirname, '..', '..');
 const PY = process.env.PYTHON || (fs.existsSync(path.join(REPO, '.venv', 'bin', 'python')) ? path.join(REPO, '.venv', 'bin', 'python') : 'python3');
-const CHROME = '/home/user/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
+const CHROME = (process.env.HOME+'/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome');
 const T = 60000;
 
 async function startServer() {

@@ -24,7 +24,7 @@ async function withApp(env, fn, ctx = {}) {
     const options = {headless: true, args: ['--no-sandbox']};
     if (process.env.PLAYWRIGHT_CHROMIUM) options.executablePath = process.env.PLAYWRIGHT_CHROMIUM;
     try { browser = await chromium.launch(options); } catch (e) {
-      const fb = '/home/user/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
+      const fb = (process.env.HOME+'/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome');
       if (!fs.existsSync(fb)) throw e; browser = await chromium.launch({...options, executablePath: fb});
     }
     const page = await browser.newPage(ctx);

@@ -17,7 +17,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-state_dir="${HERDR_CI_STATE:-/home/user/woodpecker/ci/state/herdr}"
+state_dir="${HERDR_CI_STATE:-/home/wohlgemuth/woodpecker/ci/state/herdr}"
 memo="${state_dir}/main-unit-gates-green.txt"
 head_sha="$(git rev-parse HEAD)"
 

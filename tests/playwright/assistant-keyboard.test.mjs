@@ -27,7 +27,7 @@ async function withPage(fn, { width = 1100 } = {}) {
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   let browser;
   try {
-    const fallback = '/home/user/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
+    const fallback = (process.env.HOME+'/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome');
     browser = await chromium.launch({ headless: true, args: ['--no-sandbox'], executablePath: existsSync(fallback) ? fallback : undefined });
     const page = await browser.newPage({ viewport: { width, height: 900 } });
     await page.goto(`http://127.0.0.1:${server.address().port}/`);

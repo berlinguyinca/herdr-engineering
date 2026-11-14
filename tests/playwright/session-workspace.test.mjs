@@ -16,7 +16,7 @@ async function withWorkspace(run) {
   await new Promise(r=>server.listen(0,'127.0.0.1',r));
   let browser;
   try{
-    browser=await chromium.launch({headless:true,args:['--no-sandbox'],executablePath:process.env.PLAYWRIGHT_CHROMIUM || '/home/user/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome'});
+    browser=await chromium.launch({headless:true,args:['--no-sandbox'],executablePath:process.env.PLAYWRIGHT_CHROMIUM || (process.env.HOME+'/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome')});
     const page=await browser.newPage({viewport:{width:1400,height:1000}});
     const errors=[];page.on('pageerror',e=>errors.push(e.message));
     await page.goto(`http://127.0.0.1:${server.address().port}`);
