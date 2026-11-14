@@ -43,6 +43,8 @@ import { mountFabricServices } from './fabric-services-view.js';
 import { mountAiSync } from './ai-sync-view.js';
 import { mountPrTrail } from './pr-trail-view.js';
 import { mountTeamMap } from './team-map-view.js';
+import { mountAgentOps } from './agent-ops-view.js';
+import { lineageEnabled, mountAgentOpsLineage } from './agent-ops-lineage.js';
 import { mountTeams } from './teams-view.js';
 import { mountAgentEvolution, tabsHtml, TABS_STYLE, wireTabs } from './agent-evolution-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
@@ -96,6 +98,7 @@ const NAV = [
   { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
   { group: 'Agents', path: '/teams', label: 'Your teams', capability: 'unified_workspace_v1' },
   { group: 'Agents', path: '/team-map', label: 'Team map', capability: 'unified_workspace_v1' },
+  { group: 'Agents', path: '/agent-ops', label: 'Agent Operations', capability: 'agent_ops_v1' },
   { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync', '/build-cache'] },
   { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
   { group: 'Fabric', path: '/settings', label: 'Settings' },
@@ -252,6 +255,7 @@ const ROUTES = {
   '/pr/:owner/:repo/:number': viewPrTrail,
   '/teams': viewTeams,
   '/team-map': viewTeamMap,
+  '/agent-ops': viewAgentOps,
   '/services/:id': viewService,
   '/hosts': viewHosts,
   '/personal-assistant': viewPersonalAssistant,
@@ -488,6 +492,12 @@ async function viewTeamMap() {
   return ownPolling(view);   // positions the person moved must survive a live event, so only the Open button reloads
 }
 
+async function viewAgentOps() {
+  root.innerHTML = `${liveHead('<h1>Agent Operations</h1>')}<div id="agent-ops"></div>`;
+  const view = mountAgentOps(root.querySelector('#agent-ops'), client, { freshness: chipIn(root), filters: { task: route().query.get('task') || '' } });
+  return { refresh: () => view.refresh(), dispose: () => view.dispose() };   // the view owns its own SSE stream (cursor resume) and replay state
+}
+
 async function viewHandoffs() {
   root.innerHTML = `${liveHead('<h1>Handoffs</h1>')}<div id="handoffs"></div>`;
   return mountHandoffs(root.querySelector('#handoffs'), client, { freshness: chipIn(root), open: route().query.get('open') || '' });
@@ -520,7 +530,11 @@ async function viewOverview() {
   const host = document.getElementById('overview-dashboard');
   const workCenter = await workCenterOn();
   if (!host.isConnected) return { refresh() {}, dispose() {} };   // navigated away while the capability probe was pending
-  return ownPolling(mountOverview(host, client, { freshness: chipIn(root), workCenter }));
+  const overview = mountOverview(host, client, { freshness: chipIn(root), workCenter });
+  // Slice 07: task lineage from Agent Operations, only while BOTH work_center_v1 and agent_ops_v1 are advertised.
+  let lineage = null;
+  if (lineageEnabled(capabilities)) { const slot = document.createElement('div'); slot.id = 'agent-lineage'; host.after(slot); lineage = mountAgentOpsLineage(slot, client); }
+  return ownPolling({ dispose() { overview.dispose(); lineage?.dispose(); document.getElementById('agent-lineage')?.remove(); } });
 }
 
 async function viewAttention() {

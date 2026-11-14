@@ -45,6 +45,9 @@ def _build_parser() -> argparse.ArgumentParser:
     from .assistant_cli import register as register_assistant_cli
     register_assistant_cli(sub)
 
+    from .agent_ops_tui import register as register_agent_ops_tui
+    register_agent_ops_tui(sub)
+
     p = sub.add_parser("build-cleanup", help="reclaim stale Rust build caches")
     cleanup_sub = p.add_subparsers(dest="cleanup_command", required=True)
     for action in ("run", "watch", "status"):
@@ -4800,6 +4803,7 @@ def _cmd_cp_web(args) -> int:
                              summary_report_config=cp.get("summary_report") or {},
                              unified_workspace_config=cp.get("unified_workspace") if isinstance(cp.get("unified_workspace"), dict) else None,
                              work_center_config=cp.get("work_center") if isinstance(cp.get("work_center"), dict) else None,
+                             agent_ops_config=cp.get("agent_ops") if isinstance(cp.get("agent_ops"), dict) else None,
                              assistant_config=_assistant_config(cp),
                              review_quorum=_review_quorum_config(cp),
                              single_operator=cp.get("single_operator") is True,
