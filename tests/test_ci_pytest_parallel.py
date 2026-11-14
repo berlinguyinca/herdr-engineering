@@ -193,6 +193,7 @@ def test_a_real_run_deselects_slow_tests_from_the_parallel_pass_and_runs_them_in
             [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-c", str(tmp_path / "pytest.ini"), "-m", expr,
              "-v", *extra, str(tmp_path)],
             capture_output=True, text=True, cwd=tmp_path,
+            env={k: v for k, v in os.environ.items() if not k.startswith("PYTEST_XDIST")},   # we may be a worker ourselves
         )
         assert done.returncode == 0, done.stdout + done.stderr
         return done.stdout
@@ -201,7 +202,7 @@ def test_a_real_run_deselects_slow_tests_from_the_parallel_pass_and_runs_them_in
     assert "test_fast" in parallel and "test_slow" not in parallel and "test_integ" not in parallel
     tail = run(markexpr("HERDR_PYTEST_SLOW_MARKEXPR"))
     assert "test_slow PASSED" in tail and "test_fast" not in tail and "test_integ" not in tail
-    assert "gw0" not in tail and "gw1" not in tail      # serial: no xdist worker
+    assert "[gw" not in tail and "created: " not in tail   # serial: no xdist worker
 
 
 def test_the_gate_runs_the_parallel_pass_then_a_serial_tail_both_under_the_watchdog() -> None:
