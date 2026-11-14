@@ -913,6 +913,7 @@ def test_scheduled_template_uses_isolated_runtime_and_bounded_output() -> None:
     arguments = data["ProgramArguments"]
     assert arguments[:4] == ["__PYTHON__", "-I", "-m", "herdr_engineering.scratch_reaper"]
     assert "--apply" in arguments
+    assert "--gate-state-dir" in arguments
     assert data["StartInterval"] == 900
     assert data["StandardOutPath"] == "/dev/null"
     assert data["StandardErrorPath"] == "/dev/null"
@@ -1287,3 +1288,89 @@ def test_custom_swift_cache_declaration_requires_real_proof(
     assert (output in paths(report.removed)) == (declaration == "sqlite")
     if declaration != "sqlite":
         assert (output / "object.o").exists()
+
+
+@pytest.mark.parametrize("fault", ["fifo", "readonly"])
+def test_one_uninspectable_component_does_not_stop_unrelated_cleanup(
+    tree: Tree, fault: str
+) -> None:
+    build = tree[2] / "Build"
+    if fault == "fifo":
+        os.mkfifo(build / "Products/control.pipe")
+    else:
+        (build / "Products").chmod(0o500)
+    try:
+        report = sweep(tree, policy(), apply=True)
+        assert tree[2] / "ModuleCache.noindex" in paths(report.removed)
+        assert (build / "Products/output.o").exists()
+        assert any("inspection" in p.reason for p in report.protected)
+    finally:
+        if fault == "readonly":
+            (build / "Products").chmod(0o700)
+
+
+def test_conflicting_recovery_is_retained_but_other_output_can_be_reclaimed(tree: Tree) -> None:
+    candidate, claim = _claim_fixture(tree)
+    candidate.path.mkdir()
+    (candidate.path / "new-work.txt").write_text("unique recreated work")
+    report = sweep(tree, policy(), apply=True)
+    assert tree[2] / "ModuleCache.noindex" in paths(report.removed)
+    assert claim.exists() and (candidate.path / "new-work.txt").exists()
+    again = sweep(tree, policy(), apply=True)
+    assert claim.exists() and (candidate.path / "new-work.txt").exists()
+    assert again.protected
+
+
+def test_branch_discovery_limit_does_not_hide_independent_cache(tree: Tree) -> None:
+    import shutil
+
+    from herdr_engineering.scratch_reaper import _discover
+
+    independent = tree[0] / "independent-dd"
+    shutil.copytree(tree[2], independent)
+    report = Report(RunStatus.DRY_RUN, True)
+    candidates = _discover(tree[0], report=report, max_dirs=2)
+    assert independent / "Build" in paths(candidates)
+    assert report.protected and report.errors
+
+
+@pytest.mark.parametrize("fault", ["fifo", "unreadable"])
+def test_bad_quarantine_entry_does_not_stop_healthy_cache_cleanup(tree: Tree, fault: str) -> None:
+    import shutil
+    import time
+
+    day = tree[3] / time.strftime("%Y-%m-%d")
+    day.mkdir()
+    bad = day / "bad-entry"
+    bad.mkdir()
+    if fault == "fifo":
+        os.mkfifo(bad / "control.pipe")
+    else:
+        bad.chmod(0)
+    good = day / "good-derived-data"
+    shutil.copytree(tree[2], good)
+    try:
+        report = sweep(tree, policy(), apply=True)
+        assert tree[2] / "Build" in paths(report.removed)
+        assert good / "Build" in paths(report.removed)
+        assert bad.exists()
+    finally:
+        if fault == "unreadable":
+            bad.chmod(0o700)
+
+
+def test_unreadable_quarantine_day_does_not_stop_healthy_expiry(tree: Tree) -> None:
+    day = tree[3] / "2000-01-01"
+    day.mkdir()
+    healthy = tree[3] / "2000-01-02" / "expired-session"
+    healthy.mkdir(parents=True)
+    (healthy / "old.txt").write_text("abandoned fixture")
+    day.chmod(0)
+    try:
+        report = sweep(tree, replace(policy(), quarantine_ttl_seconds=0), apply=True)
+        assert not healthy.exists()
+        assert not report.quarantined
+        assert report.errors
+        assert report.quarantine_bytes is None
+    finally:
+        day.chmod(0o700)

@@ -63,7 +63,11 @@ and protections again, and uses symlink-safe removal. A protected claim is
 restored without overwriting a recreated source. Interrupted transactions are
 restored on the next apply pass; dry runs report pending recovery without moving
 application data. Conflicts leave both versions and their private receipt intact
-with an error instead of discarding one. Inspect `state-dir/retiring` before any
+with an error instead of discarding one. A conflicting path and its ancestors stay
+protected while unrelated candidates continue. Candidate-local inspection or removal
+faults retain that candidate and report an error; unavailable global process or
+lease inspection blocks the pass. Unknown quarantine usage is reported as `null`
+and blocks new admissions while independently verified expiry can continue. Inspect `state-dir/retiring` before any
 manual recovery; never delete it blindly.
 
 ## Install and rollback

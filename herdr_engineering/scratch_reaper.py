@@ -15,9 +15,12 @@ import os
 import plistlib
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -26,7 +29,9 @@ from typing import NoReturn, cast
 from xml.parsers.expat import ExpatError
 
 from .scratch_safety import (
+    InspectionUnavailable,
     Snapshot,
+    TreeInfo,
     inspect_tree,
     keep_ancestor,
     open_parent,
@@ -119,8 +124,8 @@ class Report:
     errors: list[str] = field(default_factory=list)
     scanned_candidates: int = 0
     generated_bytes: int = 0
-    quarantine_bytes: int = 0
-    quarantine_reserved_bytes: int = 0
+    quarantine_bytes: int | None = 0
+    quarantine_reserved_bytes: int | None = 0
     protected_bytes: int = 0
     protected_count: int = 0
     removed_bytes: int = 0
@@ -128,10 +133,18 @@ class Report:
     free_after: int | None = None
 
     def protect(self, candidate: Candidate, reason: str) -> None:
+        self.protect_path(candidate.path, reason, candidate.allocated_bytes)
+
+    def protect_path(self, path: Path, reason: str, allocated_bytes: int = 0) -> None:
         self.protected_count += 1
-        self.protected_bytes += candidate.allocated_bytes
+        self.protected_bytes += allocated_bytes
         if len(self.protected) < _DETAILS:
-            self.protected.append(Protection(candidate.path, reason, candidate.allocated_bytes))
+            self.protected.append(Protection(path, reason, allocated_bytes))
+
+    def fault(self, path: Path, error: Exception) -> None:
+        self.protect_path(path, "inspection_error")
+        if len(self.errors) < _DETAILS:
+            self.errors.append(f"{path}: {type(error).__name__}: {str(error)[:500]}")
 
     def to_dict(self) -> dict[str, object]:
         value = asdict(self)
@@ -247,60 +260,103 @@ def _recognized(path: Path) -> tuple[Kind, list[Path], Path | None] | None:
     return None
 
 
-def _discover(root: Path, *, quarantine: bool = False) -> list[Candidate]:
+@contextmanager
+def _local_fault(report: Report, path: Path) -> Iterator[None]:
+    try:
+        yield
+    except InspectionUnavailable:
+        raise
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        report.fault(path, error)
+
+
+def _discovery_branches(root: Path, report: Report, quarantine: bool) -> Iterator[Path]:
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if entry.name in _PRUNE or not entry.is_dir(follow_symlinks=False):
+                continue
+            top = Path(entry.path)
+            with _local_fault(report, top):
+                container = top.name.startswith("-") or (
+                    quarantine and re.fullmatch(r"\d{4}-\d{2}-\d{2}", top.name)
+                )
+                if container and _recognized(top) is None:
+                    with os.scandir(top) as children:
+                        for child in children:
+                            if child.name not in _PRUNE and child.is_dir(follow_symlinks=False):
+                                yield Path(child.path)
+                else:
+                    yield top
+
+
+def _discover(
+    root: Path, *, quarantine: bool = False, report: Report | None = None, max_dirs: int = 20_000
+) -> list[Candidate]:
     result: list[Candidate] = []
-    pending = [(root, 0)]
-    seen = 0
+    report = report if report is not None else Report(RunStatus.DRY_RUN, True)
     device = root.stat().st_dev
-    while pending:
-        directory, depth = pending.pop()
-        with os.scandir(directory) as entries:
-            children = [
-                Path(entry.path)
-                for entry in entries
-                if entry.is_dir(follow_symlinks=False) and entry.name not in _PRUNE
-            ]
-        for path in children:
-            seen += 1
-            if seen > 20_000:
-                raise OSError("discovery directory limit reached")
-            metadata = path.lstat()
-            if metadata.st_uid != os.getuid() or metadata.st_dev != device:
-                raise OSError("foreign directory in managed root")
-            recognized = _recognized(path)
-            if recognized is not None:
+    for branch in _discovery_branches(root, report, quarantine):
+        pending = [(branch, 0)]
+        seen = 0
+        with _local_fault(report, branch):
+            while pending:
+                path, depth = pending.pop()
+                seen += 1
+                if seen > max_dirs:
+                    raise OSError("discovery limit for this branch; remainder retained")
+                metadata = path.lstat()
+                if metadata.st_uid != os.getuid() or metadata.st_dev != device:
+                    raise OSError("foreign directory in managed branch")
+                recognized = _recognized(path)
+                if recognized is None:
+                    if depth < 11:
+                        with os.scandir(path) as entries:
+                            for entry in entries:
+                                if entry.name in _PRUNE or not entry.is_dir(follow_symlinks=False):
+                                    continue
+                                if seen + len(pending) >= max_dirs:
+                                    raise OSError(
+                                        "discovery limit for this branch; remainder retained"
+                                    )
+                                pending.append((Path(entry.path), depth + 1))
+                    continue
                 kind, components, source = recognized
                 for component in components:
                     if component.is_symlink():
+                        report.protect_path(component, "symlink_component")
                         continue
-                    info = inspect_tree(component)
-                    newest = info.newest
-                    if kind is Kind.XCODE:
-                        marker = (path / "info.plist").stat()
-                        newest = max(newest, marker.st_mtime, marker.st_ctime)
-                    elif kind is Kind.SWIFT:
-                        for name in ("workspace-state.json", "manifest.pif", "debug.yaml"):
+                    with _local_fault(report, component):
+                        info = inspect_tree(component)
+                        newest = info.newest
+                        markers = (
+                            ["info.plist"]
+                            if kind is Kind.XCODE
+                            else (
+                                ["workspace-state.json", "manifest.pif", "debug.yaml"]
+                                if kind is Kind.SWIFT
+                                else []
+                            )
+                        )
+                        for name in markers:
                             marker_path = path / name
                             if marker_path.is_file() and not marker_path.is_symlink():
                                 marker = marker_path.stat()
                                 newest = max(newest, marker.st_mtime, marker.st_ctime)
-                    result.append(
-                        Candidate(
-                            component,
-                            path,
-                            root,
-                            kind,
-                            newest,
-                            info.allocated_bytes,
-                            info.device,
-                            info.inode,
-                            source,
-                            quarantine,
-                            info.reserved_bytes,
+                        result.append(
+                            Candidate(
+                                component,
+                                path,
+                                root,
+                                kind,
+                                newest,
+                                info.allocated_bytes,
+                                info.device,
+                                info.inode,
+                                source,
+                                quarantine,
+                                info.reserved_bytes,
+                            )
                         )
-                    )
-            elif depth < 11:
-                pending.append((path, depth + 1))
     return result
 
 
@@ -312,7 +368,7 @@ def _lease_reason(gate: Path, candidate: Candidate) -> str | None:
     try:
         scopes = active_scopes(gate)
     except RegistryError as error:
-        raise OSError("build registry is unreadable; cleanup blocked") from error
+        raise InspectionUnavailable("build registry is unreadable; cleanup blocked") from error
     for value in scopes:
         if not value.startswith("/"):
             continue
@@ -484,38 +540,53 @@ def _retire(
             os.close(parent)
 
 
-def _recover(state: Path, roots: list[Path]) -> None:
+def _recover(state: Path, roots: list[Path], report: Report) -> set[Path]:
     retiring = state / "retiring"
     _secure_directory(retiring)
+    blocked: set[Path] = set()
     for claim in sorted(retiring.iterdir()):
         if not os.path.lexists(claim):
             continue
-        if claim.suffix == ".json":
-            if claim.is_symlink() or not re.fullmatch(r"[0-9a-f]{32}\.json", claim.name):
-                raise OSError("unrecognized recovery receipt; retained")
-            if not claim.with_suffix("").exists():
-                _small_json(claim)
-                claim.unlink()  # removal completed before receipt cleanup
-            continue
-        if claim.is_symlink() or not re.fullmatch(r"[0-9a-f]{32}", claim.name):
-            raise OSError("unrecognized recovery entry; retained")
-        receipt = _small_json(claim.with_suffix(".json"))
-        original = Path(str(receipt.get("original", "")))
-        root = Path(str(receipt.get("root", "")))
-        metadata = claim.lstat()
-        if (
-            root not in roots
-            or not original.is_relative_to(root)
-            or original == root
-            or (metadata.st_dev, metadata.st_ino) != (receipt.get("device"), receipt.get("inode"))
-        ):
-            raise OSError("unverifiable recovery entry; retained")
-        parent = open_parent(root, original)
-        try:
-            _restore(claim, parent, original.name)
-            claim.with_suffix(".json").unlink()
-        finally:
-            os.close(parent)
+        with _local_fault(report, claim):
+            if claim.suffix == ".json":
+                if claim.is_symlink() or not re.fullmatch(r"[0-9a-f]{32}\.json", claim.name):
+                    raise OSError("unrecognized recovery receipt; retained")
+                if not claim.with_suffix("").exists():
+                    _small_json(claim)
+                    claim.unlink()
+                continue
+            if claim.is_symlink() or not re.fullmatch(r"[0-9a-f]{32}", claim.name):
+                raise OSError("unrecognized recovery entry; retained")
+            receipt = _small_json(claim.with_suffix(".json"))
+            original = Path(str(receipt.get("original", "")))
+            root = Path(str(receipt.get("root", "")))
+            metadata = claim.lstat()
+            if (
+                root not in roots
+                or not original.is_relative_to(root)
+                or original == root
+                or ".." in original.relative_to(root).parts
+                or (metadata.st_dev, metadata.st_ino)
+                != (receipt.get("device"), receipt.get("inode"))
+            ):
+                raise OSError("unverifiable recovery entry; retained")
+            if os.path.lexists(original):
+                blocked.add(original)
+                report.protect_path(original, "recovery_conflict")
+                raise OSError("recreated original and claimed data both retained")
+            parent = open_parent(root, original)
+            try:
+                _restore(claim, parent, original.name)
+                claim.with_suffix(".json").unlink()
+            finally:
+                os.close(parent)
+    return blocked
+
+
+def _blocked(path: Path, protected: set[Path]) -> bool:
+    return any(
+        path == item or path.is_relative_to(item) or item.is_relative_to(path) for item in protected
+    )
 
 
 def _walk_error(error: OSError) -> NoReturn:
@@ -549,9 +620,15 @@ def _live_ids(roots: list[Path], cutoff: float) -> set[str]:
     return live
 
 
-def _session_dirs(root: Path) -> list[Path]:
+def _children(path: Path, report: Report) -> list[Path]:
+    with _local_fault(report, path):
+        return sorted(path.iterdir())
+    return []
+
+
+def _session_dirs(root: Path, report: Report) -> list[Path]:
     result = []
-    for first in root.iterdir():
+    for first in _children(root, report):
         if first.is_symlink() or not first.is_dir():
             continue
         if _UUID.fullmatch(first.name):
@@ -559,10 +636,25 @@ def _session_dirs(root: Path) -> list[Path]:
         else:
             result.extend(
                 p
-                for p in first.iterdir()
+                for p in _children(first, report)
                 if _UUID.fullmatch(p.name) and p.is_dir() and not p.is_symlink()
             )
     return result
+
+
+def _quarantine_usage(quarantine: Path, report: Report) -> TreeInfo | None:
+    try:
+        return inspect_tree(quarantine, accounting_only=True) if quarantine.exists() else None
+    except OSError as error:
+        report.fault(quarantine, error)
+        return None
+
+
+def _quarantine_sizes(quarantine: Path, report: Report) -> tuple[int | None, int | None]:
+    info = _quarantine_usage(quarantine, report)
+    if info is not None:
+        return info.allocated_bytes, info.reserved_bytes
+    return (None, None) if quarantine.exists() else (0, 0)
 
 
 def _general(
@@ -574,60 +666,68 @@ def _general(
     report: Report,
     apply: bool,
     live_roots: list[Path],
+    blocked: set[Path] | None = None,
 ) -> None:
     now = time.time()
     live = _live_ids(live_roots, now - policy.live_seconds)
+    blocked = blocked if blocked is not None else set()
     if quarantine.exists():
-        report.quarantine_bytes = inspect_tree(quarantine).allocated_bytes
-        for day in sorted(quarantine.iterdir()):
+        report.quarantine_bytes, report.quarantine_reserved_bytes = _quarantine_sizes(
+            quarantine, report
+        )
+        for day in _children(quarantine, report):
             if (
                 day.is_symlink()
                 or not day.is_dir()
                 or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day.name)
             ):
                 continue
-            for path in sorted(day.iterdir()):
-                if path.is_symlink() or not path.is_dir():
+            for path in _children(day, report):
+                if _blocked(path, blocked):
+                    report.protect_path(path, "recovery_conflict")
                     continue
-                info = inspect_tree(path)
-                candidate = Candidate(
-                    path,
-                    path,
-                    quarantine,
-                    Kind.SESSION,
-                    info.newest,
-                    info.allocated_bytes,
-                    info.device,
-                    info.inode,
-                    quarantine=True,
-                    reserved_bytes=info.reserved_bytes,
-                )
-                if (
-                    any(identity in path.name for identity in live)
-                    or info.newest > now - policy.quarantine_ttl_seconds
-                ):
-                    continue
-                reason, _ = _reason(candidate, process_snapshot(), gate, live=live)
-                if reason:
-                    report.protect(candidate, reason)
-                elif apply:
-                    reason = _retire(
-                        candidate,
-                        state,
-                        gate,
-                        now - policy.quarantine_ttl_seconds,
-                        live_roots=live_roots,
-                        live_seconds=policy.live_seconds,
+                with _local_fault(report, path):
+                    if path.is_symlink() or not path.is_dir():
+                        continue
+                    info = inspect_tree(path)
+                    candidate = Candidate(
+                        path,
+                        path,
+                        quarantine,
+                        Kind.SESSION,
+                        info.newest,
+                        info.allocated_bytes,
+                        info.device,
+                        info.inode,
+                        quarantine=True,
+                        reserved_bytes=info.reserved_bytes,
                     )
+                    if (
+                        any(identity in path.name for identity in live)
+                        or info.newest > now - policy.quarantine_ttl_seconds
+                    ):
+                        continue
+                    reason, _ = _reason(candidate, process_snapshot(), gate, live=live)
                     if reason:
                         report.protect(candidate, reason)
+                    elif apply:
+                        reason = _retire(
+                            candidate,
+                            state,
+                            gate,
+                            now - policy.quarantine_ttl_seconds,
+                            live_roots=live_roots,
+                            live_seconds=policy.live_seconds,
+                        )
+                        if reason:
+                            report.protect(candidate, reason)
+                        else:
+                            report.removed.append(candidate)
+                            report.removed_bytes += candidate.allocated_bytes
                     else:
-                        report.removed.append(candidate)
-                        report.removed_bytes += candidate.allocated_bytes
-                else:
-                    report.would_remove.append(candidate)
-    admission_used = inspect_tree(quarantine).reserved_bytes if quarantine.exists() else 0
-    if not apply:
+                        report.would_remove.append(candidate)
+    _, admission_used = _quarantine_sizes(quarantine, report)
+    if not apply and admission_used is not None:
         admission_used = max(
             0,
             admission_used
@@ -637,56 +737,62 @@ def _general(
                 if c.quarantine
             ),
         )
-    for path in _session_dirs(root):
-        if path.name in live:
+    for path in _session_dirs(root, report):
+        if _blocked(path, blocked):
+            report.protect_path(path, "recovery_conflict")
             continue
-        info = inspect_tree(path)
-        if info.newest > now - policy.session_ttl_seconds:
-            continue
-        candidate = Candidate(
-            path,
-            path,
-            root,
-            Kind.SESSION,
-            info.newest,
-            info.allocated_bytes,
-            info.device,
-            info.inode,
-            reserved_bytes=info.reserved_bytes,
-        )
-        reason, _ = _reason(candidate, process_snapshot(), gate, live=live)
-        used = (
-            max(admission_used, inspect_tree(quarantine).reserved_bytes)
-            if apply and quarantine.exists()
-            else admission_used
-        )
-        reservation = info.reserved_bytes + 8192
-        if reason or used + reservation > policy.quarantine_max_bytes:
-            report.protect(candidate, reason or "quarantine_capacity")
-            continue
-        if not apply:
-            report.quarantined.append(candidate)
-            admission_used += reservation
-            continue
-        # Quarantine is recovery, not reclaimed capacity. Never copy across disks.
-        day = quarantine / time.strftime("%Y-%m-%d")
-        _secure_directory(quarantine)
-        _secure_directory(day)
-        destination = day / (path.parent.name + "__" + path.name + "__" + uuid.uuid4().hex[:8])
-        reason = _retire(
-            candidate,
-            state,
-            gate,
-            now - policy.session_ttl_seconds,
-            destination=destination,
-            live_roots=live_roots,
-            live_seconds=policy.live_seconds,
-        )
-        if reason:
-            report.protect(candidate, reason)
-        else:
-            report.quarantined.append(candidate)
-            admission_used = used + reservation
+        with _local_fault(report, path):
+            if path.name in live:
+                continue
+            info = inspect_tree(path)
+            if info.newest > now - policy.session_ttl_seconds:
+                continue
+            candidate = Candidate(
+                path,
+                path,
+                root,
+                Kind.SESSION,
+                info.newest,
+                info.allocated_bytes,
+                info.device,
+                info.inode,
+                reserved_bytes=info.reserved_bytes,
+            )
+            reason, _ = _reason(candidate, process_snapshot(), gate, live=live)
+            _, measured = _quarantine_sizes(quarantine, report) if apply else (None, admission_used)
+            used = (
+                max(admission_used, measured)
+                if admission_used is not None and measured is not None
+                else None
+            )
+            reservation = info.reserved_bytes + 8192
+            if reason or used is None or used + reservation > policy.quarantine_max_bytes:
+                report.protect(candidate, reason or "quarantine_capacity")
+                continue
+            if not apply:
+                report.quarantined.append(candidate)
+                assert admission_used is not None
+                admission_used += reservation
+                continue
+            # Quarantine is recovery, not reclaimed capacity. Never copy across disks.
+            day = quarantine / time.strftime("%Y-%m-%d")
+            _secure_directory(quarantine)
+            _secure_directory(day)
+            destination = day / (path.parent.name + "__" + path.name + "__" + uuid.uuid4().hex[:8])
+            reason = _retire(
+                candidate,
+                state,
+                gate,
+                now - policy.session_ttl_seconds,
+                destination=destination,
+                live_roots=live_roots,
+                live_seconds=policy.live_seconds,
+            )
+            if reason:
+                report.protect(candidate, reason)
+            else:
+                report.quarantined.append(candidate)
+                admission_used = used + reservation
 
 
 def _secure_directory(path: Path) -> None:
@@ -785,49 +891,57 @@ def run_once(
             quarantine.is_symlink() or quarantine.stat().st_dev != root.stat().st_dev
         ):
             raise OSError("quarantine must be a real directory on the scratch filesystem")
+        blocked: set[Path] = set()
         if apply:
-            _recover(state, [root, quarantine])
+            blocked = _recover(state, [root, quarantine], report)
         elif (state / "retiring").exists() and any((state / "retiring").iterdir()):
             raise OSError("pending transaction recovery; apply to restore it before cleanup")
         usage = shutil.disk_usage(root)
         if policy.min_free_bytes > usage.total:
             raise ValueError("free-space floor exceeds filesystem capacity")
         report.free_before = usage.free
-        candidates = _discover(root)
+        candidates = _discover(root, report=report)
         if quarantine.exists():
-            candidates.extend(_discover(quarantine, quarantine=True))
+            candidates.extend(_discover(quarantine, quarantine=True, report=report))
         candidates.sort(key=lambda c: (c.newest, str(c.path)))
         report.scanned_candidates = len(candidates)
         report.generated_bytes = sum(c.allocated_bytes for c in candidates)
         remaining = report.generated_bytes
-        qbytes = inspect_tree(quarantine).allocated_bytes if quarantine.exists() else 0
+        qbytes, report.quarantine_reserved_bytes = _quarantine_sizes(quarantine, report)
         report.quarantine_bytes = qbytes
-        report.quarantine_reserved_bytes = (
-            inspect_tree(quarantine).reserved_bytes if quarantine.exists() else 0
-        )
         snapshot = process_snapshot()
         for candidate in candidates:
-            free = shutil.disk_usage(root).free
-            pressure = remaining > policy.max_bytes or free < policy.min_free_bytes
-            pressure |= candidate.quarantine and qbytes > policy.quarantine_max_bytes
-            age = min(policy.idle_seconds, policy.ttl_seconds) if pressure else policy.ttl_seconds
-            cutoff = time.time() - age
-            reason, newest = _reason(candidate, snapshot, gate)
-            if reason or newest > cutoff:
-                report.protect(candidate, reason or "recent_activity")
+            if _blocked(candidate.path, blocked):
+                report.protect(candidate, "recovery_conflict")
                 continue
-            if apply:
-                reason = _retire(candidate, state, gate, cutoff)
-                if reason:
-                    report.protect(candidate, reason)
+            with _local_fault(report, candidate.path):
+                free = shutil.disk_usage(root).free
+                pressure = remaining > policy.max_bytes or free < policy.min_free_bytes
+                pressure |= (
+                    candidate.quarantine
+                    and qbytes is not None
+                    and qbytes > policy.quarantine_max_bytes
+                )
+                age = (
+                    min(policy.idle_seconds, policy.ttl_seconds) if pressure else policy.ttl_seconds
+                )
+                cutoff = time.time() - age
+                reason, newest = _reason(candidate, snapshot, gate)
+                if reason or newest > cutoff:
+                    report.protect(candidate, reason or "recent_activity")
                     continue
-                report.removed.append(candidate)
-                report.removed_bytes += candidate.allocated_bytes
-            else:
-                report.would_remove.append(candidate)
-            remaining -= candidate.allocated_bytes
-            if candidate.quarantine:
-                qbytes -= candidate.allocated_bytes
+                if apply:
+                    reason = _retire(candidate, state, gate, cutoff)
+                    if reason:
+                        report.protect(candidate, reason)
+                        continue
+                    report.removed.append(candidate)
+                    report.removed_bytes += candidate.allocated_bytes
+                else:
+                    report.would_remove.append(candidate)
+                remaining -= candidate.allocated_bytes
+                if candidate.quarantine and qbytes is not None:
+                    qbytes -= candidate.allocated_bytes
         defaults = [
             Path.home() / ".claude/projects",
             Path.home() / ".codex/sessions",
@@ -842,21 +956,27 @@ def run_once(
             report,
             apply,
             live_roots if live_roots is not None else defaults,
+            blocked,
         )
         report.free_after = shutil.disk_usage(root).free
-        report.quarantine_bytes = (
-            inspect_tree(quarantine).allocated_bytes if quarantine.exists() else 0
-        )
-        report.quarantine_reserved_bytes = (
-            inspect_tree(quarantine).reserved_bytes if quarantine.exists() else 0
+        report.quarantine_bytes, report.quarantine_reserved_bytes = _quarantine_sizes(
+            quarantine, report
         )
         if apply and (
             remaining > policy.max_bytes
             or (report.free_after is not None and report.free_after < policy.min_free_bytes)
-            or report.quarantine_bytes > policy.quarantine_max_bytes
-            or report.quarantine_reserved_bytes > policy.quarantine_max_bytes
+            or (
+                report.quarantine_bytes is not None
+                and report.quarantine_bytes > policy.quarantine_max_bytes
+            )
+            or (
+                report.quarantine_reserved_bytes is not None
+                and report.quarantine_reserved_bytes > policy.quarantine_max_bytes
+            )
         ):
             report.status = RunStatus.PRESSURE_BLOCKED
+        if report.errors:
+            report.status = RunStatus.ERROR
     except Exception as error:
         report.errors.append(f"{type(error).__name__}: {str(error)[:1000]}")
         report.status = RunStatus.ERROR

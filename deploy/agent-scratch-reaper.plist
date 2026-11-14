@@ -8,6 +8,7 @@
     <string>--root</string><string>__ROOT__</string>
     <string>--quarantine</string><string>__QUARANTINE__</string>
     <string>--state-dir</string><string>__STATE__</string>
+    <string>--gate-state-dir</string><string>__GATE_STATE__</string>
   </array>
   <key>StartInterval</key><integer>900</integer>
   <key>RunAtLoad</key><true/>

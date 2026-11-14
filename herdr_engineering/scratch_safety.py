@@ -31,6 +31,10 @@ _COMPILERS = {
 _MAX_ENTRIES = 1_000_000
 
 
+class InspectionUnavailable(OSError):
+    """A global process/lease guard is unavailable; no candidate may be applied."""
+
+
 @dataclass(frozen=True)
 class TreeInfo:
     newest: float
@@ -43,7 +47,9 @@ class TreeInfo:
     reserved_bytes: int
 
 
-def inspect_tree(path: Path, *, ignore_root_ctime: bool = False) -> TreeInfo:
+def inspect_tree(
+    path: Path, *, ignore_root_ctime: bool = False, accounting_only: bool = False
+) -> TreeInfo:
     first = path.lstat()
     if not stat.S_ISDIR(first.st_mode):
         raise OSError("candidate is not a real directory")
@@ -61,7 +67,9 @@ def inspect_tree(path: Path, *, ignore_root_ctime: bool = False) -> TreeInfo:
         count += 1
         if count > _MAX_ENTRIES or (count % 1024 == 0 and time.monotonic() > deadline):
             raise OSError("candidate inspection limit reached")
-        if metadata.st_uid != os.getuid() or metadata.st_dev != first.st_dev:
+        if metadata.st_dev != first.st_dev or (
+            not accounting_only and metadata.st_uid != os.getuid()
+        ):
             raise OSError("foreign owner or filesystem in candidate")
         newest = max(
             newest,
@@ -80,6 +88,10 @@ def inspect_tree(path: Path, *, ignore_root_ctime: bool = False) -> TreeInfo:
         if stat.S_ISLNK(metadata.st_mode):
             continue  # unlinking a link must never inspect/remove its target
         if stat.S_ISDIR(metadata.st_mode):
+            if not accounting_only and metadata.st_mode & (stat.S_IWUSR | stat.S_IXUSR) != (
+                stat.S_IWUSR | stat.S_IXUSR
+            ):
+                raise OSError("read-only directory in candidate")
             with os.scandir(item) as entries:
                 children = [Path(entry.path) for entry in entries]
             names = {child.name for child in children}
@@ -88,7 +100,7 @@ def inspect_tree(path: Path, *, ignore_root_ctime: bool = False) -> TreeInfo:
             elif {"HEAD", "objects"} <= names and ".git" not in item.relative_to(path).parts:
                 repositories.append(item)  # bare/unknown dependency repository
             pending.extend(children)
-        elif not stat.S_ISREG(metadata.st_mode):
+        elif not accounting_only and not stat.S_ISREG(metadata.st_mode):
             raise OSError("special file in candidate")
     return TreeInfo(
         newest,
@@ -252,10 +264,24 @@ class Snapshot:
 def _comparison(value: str) -> str:
     # macOS paths can use equivalent Unicode/case spellings. Overprotection on
     # a case-sensitive APFS volume is safer than missing a live reference.
-    return unicodedata.normalize("NFC", value).casefold() if sys.platform == "darwin" else value
+    if sys.platform != "darwin":
+        return value
+    value = re.sub(
+        r"(^|[\s\"'=(:]|file://)/(tmp|var|etc)(?=/|$|[\s\"'])",
+        lambda match: match.group(1) + "/private/" + match.group(2),
+        value,
+    )
+    return unicodedata.normalize("NFC", value).casefold()
 
 
 def process_snapshot() -> Snapshot:
+    try:
+        return _process_snapshot()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise InspectionUnavailable("process visibility is unavailable; cleanup blocked") from error
+
+
+def _process_snapshot() -> Snapshot:
     listing = subprocess.run(
         ["ps", "-ww", "-axo", "pid=,args="], capture_output=True, text=True, timeout=15
     )
@@ -278,7 +304,7 @@ def process_snapshot() -> Snapshot:
         capture_output=True,
         timeout=30,
     )
-    if result.returncode not in {0, 1} or len(result.stdout) > 64 * 2**20:
+    if result.returncode != 0 or not result.stdout or len(result.stdout) > 64 * 2**20:
         raise OSError("open-file inspection failed")
     paths: list[str] = []
     compiler_cwds: list[str] = []
