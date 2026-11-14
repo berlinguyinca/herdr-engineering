@@ -295,7 +295,10 @@ def test_target_management_cli_enable_and_migration_safety(tmp_path: Path):
     settings = {"fabric_build_cache": {"enabled": True, "local": {
         "min_free_disk_percent": 0, "storage_tiers": [{"name": "internal", "directory": str(cache)}]}}}
     config.write_text(yaml.safe_dump(settings))
-    env = {**os.environ, "HOME": str(home), "CARGO_HOME": str(home / ".cargo"),
+    # A runner that exports a cargo target override would make every target "explicit".
+    inherited = {k: v for k, v in os.environ.items()
+                 if k not in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR")}
+    env = {**inherited, "HOME": str(home), "CARGO_HOME": str(home / ".cargo"),
            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
            "HERDR_ENGINEERING_CONFIG": str(config), "HERDR_ENGINEERING_STATE": str(state),
            "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
