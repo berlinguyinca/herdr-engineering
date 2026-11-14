@@ -23,6 +23,23 @@ from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 OUT = Path(__file__).resolve().parents[1] / "fixtures" / "diagnostics_events_host.json"
 STABLE_KEYS = ("event_id", "source_timestamp", "ingest_timestamp", "sequence")
+# Everything the server mints per run: ULID-ish row ids, opaque page cursors, wall-clock instants. Pinned so
+# re-running this recorder reproduces the fixture byte for byte — a fixture a test run can rewrite is a fixture
+# whose contents nobody chose. Keys the server does NOT mint per run are deliberately absent: they are recorded
+# as answered.
+EPHEMERAL = {"last_event_id": "event_recorded_last", "next_cursor": "recorded_cursor", "before": "recorded_cursor",
+             "created_at": "2026-11-14T02:03:00+00:00", "updated_at": "2026-11-14T02:03:00+00:00",
+             "last_seen": "2026-11-14T02:03:00+00:00", "first_seen_at": "2026-11-14T02:00:00+00:00"}
+
+
+def pin(value):
+    """Replace per-run identifiers and instants anywhere in a response, leaving every other value as answered."""
+    if isinstance(value, dict):
+        return {key: (EPHEMERAL[key] if key in EPHEMERAL and value[key] is not None else pin(value[key]))
+                for key in value}
+    if isinstance(value, list):
+        return [pin(item) for item in value]
+    return value
 
 
 def call(server, path):
@@ -77,15 +94,14 @@ def record():
                 "generated_by": "tests/control_plane/record_diagnostics_events.py",
                 "generated_with": "PYTHONPATH=. python tests/control_plane/record_diagnostics_events.py",
                 "server": "herdr_engineering.control_plane.api.ControlPlaneServer over a loopback socket",
-                "ids_and_timestamps": "replaced with stable values; every other key and value is the server's own",
+                "ids_and_timestamps": "event ids, page cursors and wall-clock instants replaced with stable values; every other key and value is the server's own",
             },
-            "events_bare": {"status": bare_status, "body": bare_body},
-            "events_host_hive": {"status": page_status, "body": {**page_body,
-                                     "events": [stable(e, i) for i, e in enumerate(page_body["events"])]}},
-            "events_host_hive_limit_1": {"status": first_status, "body": {**first_page,
-                                     "events": [stable(e, 0) for e in first_page["events"]],
-                                     "has_more": first_page["has_more"]}},
-            "hosts": {"status": hosts_status, "body": hosts_body},
+            "events_bare": {"status": bare_status, "body": pin(bare_body)},
+            "events_host_hive": {"status": page_status, "body": pin({**page_body,
+                                     "events": [stable(e, i) for i, e in enumerate(page_body["events"])]})},
+            "events_host_hive_limit_1": {"status": first_status, "body": pin({**first_page,
+                                     "events": [stable(e, 0) for e in first_page["events"]]})},
+            "hosts": {"status": hosts_status, "body": pin(hosts_body)},
         }
         OUT.write_text(json.dumps(fixture, indent=1, sort_keys=True) + "\n")
         return fixture
