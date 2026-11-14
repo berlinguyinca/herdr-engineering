@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from . import core, events, logs, poll, service, state
+from . import run as runner
 
 
 def render(report: dict) -> str:
@@ -88,8 +89,6 @@ def _resolve_local(requested: str) -> tuple[str | None, str | None]:
 
 
 def _engine(args, directory: Path, local: str | None):
-    """The runner for this invocation's transport/timeout options (shared by run, resume, abandon, loop)."""
-    from . import run as runner
 
     timeouts = {**runner.DEFAULT_TIMEOUTS, "precheck": args.precheck_timeout, "apply": args.apply_timeout,
                 "health": args.health_timeout}
@@ -194,18 +193,36 @@ def cmd_abandon(args) -> int:
     return 0
 
 
-def _loop_pass(args, local: str | None) -> tuple[dict, str]:
-    """One service pass: poll + plan; with --enable-rollouts also run (or continue) the rollout."""
+def _updated_local_build(saved: dict, before: set[str], local: str | None) -> bool:
+    """True when a rollout that succeeded during this pass installed herdr-engineering on THIS host: the running
+    process still has the old code, so the loop must restart to pick up what it just installed."""
+    if local is None:
+        return False
+    for rid, rollout in saved["rollouts"].items():
+        if rid in before or rollout.get("status") != "succeeded":
+            continue
+        row = rollout.get("rows", {}).get(f"{local}/herdr-engineering")
+        if row and row.get("updated") is True:
+            return True
+    return False
+
+
+def _loop_pass(args, local: str | None) -> tuple[dict, str, bool]:
+    """One service pass: poll + plan; with --enable-rollouts also run (or continue) the rollout.
+
+    The third value says the loop must restart (a rollout just installed a new herdr-engineering on this host)."""
     report = core.run_once(args.repo or list(core.DEFAULT_REPOS), lock_path=args.lock, auth=poll.token())
     rollout = report["rollout"]
     if not args.enable_rollouts:
-        return report, f"plan only ({'rollout ' + rollout['rollout_id'] if rollout else 'nothing to roll out'})"
+        return report, f"plan only ({'rollout ' + rollout['rollout_id'] if rollout else 'nothing to roll out'})", False
     directory = state.state_dir()
     with state.single_instance(directory):
         saved = state.load(directory)
+        done = {rid for rid, r in saved["rollouts"].items() if r.get("status") == "succeeded"}
         engine = _engine(args, directory, local)
         engine.settle_locks(saved)
-        return report, _drive(engine, saved, rollout, False)
+        outcome = _drive(engine, saved, rollout, False)
+        return report, outcome, outcome == "succeeded" and _updated_local_build(saved, done, local)
 
 
 def _watchdog_markers(directory: Path) -> list[Path]:
@@ -235,6 +252,7 @@ def _loop(args, directory: Path, local: str | None) -> int:
     def hard(stalled: float) -> None:
         print(f"fleet-watch loop: no progress for {int(stalled)}s (hard limit {int(args.hard_limit)}s); "
               "exiting 70, the service restarts and resumes the durable rollout", file=sys.stderr, flush=True)
+        runner.kill_children()                            # os._exit runs no cleanup: do not orphan host-apply children
         os._exit(70)
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
@@ -247,14 +265,20 @@ def _loop(args, directory: Path, local: str | None) -> int:
         while True:
             passes += 1
             report: dict = {"repos": {}}
+            restart = False
             try:
                 with dog.guard():
-                    report, outcome = _loop_pass(args, local)
+                    report, outcome, restart = _loop_pass(args, local)
             except state.WatcherBusy:
                 outcome = "busy"
             except Exception as exc:                       # a bad pass must not stop the service; the class is enough
                 outcome = f"error {type(exc).__name__}"
             print(f"pass {passes}: {outcome}", flush=True)
+            if restart:
+                print("fleet-watch loop: a rollout installed a new herdr-engineering on this host; "
+                      f"exiting {service.RESTART_EXIT}, the service restarts into the new build",
+                      file=sys.stderr, flush=True)
+                return service.RESTART_EXIT
             if args.max_passes and passes >= args.max_passes:
                 return 0
             time.sleep(service.next_sleep(report, args.interval, rng))

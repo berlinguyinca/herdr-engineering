@@ -11,6 +11,8 @@ ExecStart=%h/.local/bin/herdr-eng fleet-watch loop
 # No RuntimeMaxSec/TimeoutStartSec: a healthy rollout may take long. The loop warns at its soft limit and exits 70 only
 # after a hard-limit stretch with NO progress; systemd then restarts it and the durable state resumes the rollout.
 Restart=on-failure
+# Exit 75: a rollout installed a new herdr-engineering on this host; restart to run the new build.
+RestartForceExitStatus=75
 # Exit 2 (refused) and 3 (busy) will not fix themselves by restarting.
 RestartPreventExitStatus=2 3
 RestartSec=30

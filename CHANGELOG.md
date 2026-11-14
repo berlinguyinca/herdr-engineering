@@ -42,6 +42,15 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - New YAML block `risky` (default `globs: []` = off, behaviour unchanged). For a PR touching a path that matches `risky.globs` (`**` globs, case-insensitive, a rename counts by old and new path), `Opus agent review` is posted success only when a Codex review of the same head also approves: Opus runs first, and only if it approved cleanly `codex exec` (read-only sandbox, `--ignore-user-config`, strict verdict schema, same evidence rule) reviews the same worktree; the verdicts are merged and the script decides the state. A Codex block posts failure with its findings. If Codex cannot run or its answer cannot be verified (missing binary or login, time cap, bad exit, malformed answer, unverifiable block) the status stays pending, never success. Non-risky PRs and tier 1 never call Codex; a moved head posts nothing; dry-run and the two-key post rule are unchanged. Cost: `risky.codex.daily_budget_usd` with `input_usd_per_mtok` / `output_usd_per_mtok` (codex reports tokens only; the prices are required with a budget) is summed from `reviews.jsonl` (`tier: codex`) since 00:00 UTC and skips a risky review before Opus runs once reached. A Codex block whose blockers all cite files outside the PR also stays pending; `-c project_doc_max_bytes=0` keeps a PR-added AGENTS.md out of Codex's instructions; implausible token counts (negative, non-integer, over 10**12) fail the review. `show-command --tier codex` prints the command. Not installed or deployed by this change; beast needs `codex login`. Rollback: set `risky.globs: []` (or remove the block) and restart the poller.
 
+### Fix: fleet watcher review follow-ups (self-update restart, orphaned children, lock edge cases)
+
+- `fleet-watch loop` now picks up its own update: after a pass in which a rollout succeeded and changed herdr-engineering on the local host it exits 75 and systemd starts the new build (`RestartForceExitStatus=75`; 2 and 3 still never restart). Other hosts or repos do not trigger it.
+- SIGTERM and the hard-limit exit 70 kill the in-flight local `host-apply` process group instead of orphaning it.
+- A CRLF `fleet.lock.yaml` can be pinned (it was always refused as changed-since-read) and keeps its line endings; same-second lock backups no longer overwrite each other; an interrupted write no longer strands `<lock>.tmp`.
+- `herdr-eng fleet lock verify` no longer creates the watcher state directory or lock file when it does not exist.
+- Tests: exact event tails instead of `in types[-2:]`, SIGTERM must exit 0. Operator doc: self-update restart, restart-mid-rollout safety, symlinked-lock backup location.
+>>>>>>> b7698d72 (fix(fleet-watch): review follow-ups for the step 5 watcher)
+
 ### xdist follow-ups: collision-free ports, accurate comments, stronger parallel tests
 
 - `test_allocation_skips_os_bound_port` and `test_failed_forwarder_start_is_retried_on_next_sync` bound fixed ports (18500, 24700) that could collide across files running concurrently under `--dist=loadfile`; they now use OS-assigned ports.

@@ -4,7 +4,9 @@ The lock's `repos:` section means "the fabric is converged on these SHAs", so it
 succeeded (the runner calls `pin_repos`), and every SHA that is written or verified here must be published history
 (decision D3): a commit of the remote's `main`, found in the watcher's own bare cache clone. One bad SHA refuses the
 whole write. The edit is textual and confined to `repos:` values, so every other byte and comment survives; the file is
-replaced atomically (temp + fsync + rename, mode kept) and the previous file is kept as `<lock>.bak-<UTC date>`.
+replaced atomically (temp + fsync + rename, mode kept) and the previous file is kept as `<lock>.bak-<UTC date>` (a
+later one the same day: `-HHMMSSffffff`, with `-N` appended on a further collision), beside the file a symlinked lock
+points to. Line endings (LF or CRLF) are preserved.
 """
 
 from __future__ import annotations
@@ -65,13 +67,14 @@ def read_pins(path: Path) -> dict[str, str]:
 def _edit(text: str, updates: Mapping[str, str]) -> str:
     """Replace or add `repos:` values without touching any other byte."""
     lines = text.splitlines(keepends=True)
-    start = next((i for i, ln in enumerate(lines) if _REPOS_LINE.match(ln.rstrip("\n"))), None)
+    eol = "\r\n" if "\r\n" in text else "\n"                 # added lines follow the file's own convention
+    start = next((i for i, ln in enumerate(lines) if _REPOS_LINE.match(ln.rstrip("\r\n"))), None)
     pending = dict(updates)
     if start is None:
         if re.search(r"^repos:", text, re.M):
             raise LockRefused("lock_invalid")                  # inline/flow form: not edited textually
-        body = "".join(f"  {k}: {v}\n" for k, v in pending.items())
-        return text + ("" if not text or text.endswith("\n") else "\n") + "repos:\n" + body
+        body = "".join(f"  {k}: {v}{eol}" for k, v in pending.items())
+        return text + ("" if not text or text.endswith("\n") else eol) + f"repos:{eol}" + body
     end = len(lines)
     for i in range(start + 1, len(lines)):
         ln = lines[i]
@@ -80,26 +83,35 @@ def _edit(text: str, updates: Mapping[str, str]) -> str:
             break
     last_entry = None
     for i in range(start + 1, end):
-        m = _ENTRY.match(lines[i].rstrip("\n"))
+        m = _ENTRY.match(lines[i].rstrip("\r\n"))
         if not m or lines[i].lstrip().startswith("#"):
             continue
         last_entry = i
         name = short(m["key"])
         if name in pending and (m["key"] == name or m["key"] == owner_repo(name)):
-            nl = "\n" if lines[i].endswith("\n") else ""
+            nl = lines[i][len(lines[i].rstrip("\r\n")):]
             lines[i] = f'{m["indent"]}{m["key"]}{m["mid"]}{pending.pop(name)}{m["rest"]}{nl}'
     if pending:
-        indent = _ENTRY.match(lines[last_entry].rstrip("\n"))["indent"] if last_entry is not None else "  "
+        indent = _ENTRY.match(lines[last_entry].rstrip("\r\n"))["indent"] if last_entry is not None else "  "
         at = (last_entry + 1) if last_entry is not None else start + 1
         if at > 0 and not lines[at - 1].endswith("\n"):
-            lines[at - 1] += "\n"
-        lines[at:at] = [f"{indent}{k}: {v}\n" for k, v in pending.items()]
+            lines[at - 1] += eol
+        lines[at:at] = [f"{indent}{k}: {v}{eol}" for k, v in pending.items()]
     return "".join(lines)
 
 
-def _backup_path(path: Path, now: datetime) -> Path:
-    first = path.with_name(f"{path.name}.bak-{now:%Y%m%d}")
-    return first if not first.exists() else path.with_name(f"{path.name}.bak-{now:%Y%m%d-%H%M%S}")
+def _reserve_backup(path: Path, now: datetime) -> Path:
+    """Create (empty, exclusively) the backup file for this write and return it; never reuses an existing name."""
+    names = [f"{path.name}.bak-{now:%Y%m%d}", f"{path.name}.bak-{now:%Y%m%d-%H%M%S%f}"]
+    names += [f"{names[1]}-{n}" for n in range(1, 1000)]
+    for name in names:
+        candidate = path.with_name(name)
+        try:
+            os.close(os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        except FileExistsError:
+            continue
+        return candidate
+    raise LockRefused("lock_invalid")
 
 
 def _write_atomic(path: Path, text: str, mode: int, previous: bytes | None, now: datetime) -> None:
@@ -108,17 +120,17 @@ def _write_atomic(path: Path, text: str, mode: int, previous: bytes | None, now:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     try:
         os.fchmod(fd, mode)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(text)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(text.encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
         if previous is not None:
             if path.read_bytes() != previous:      # changed since pin_repos read it: never overwrite someone else's edit
                 raise LockRefused("lock_invalid")
-            backup = _backup_path(path, now)
+            backup = _reserve_backup(path, now)
             shutil.copy2(path, backup)
         os.replace(tmp, path)
-    except (OSError, LockRefused):
+    except BaseException:                          # also SystemExit/KeyboardInterrupt: no stray `<lock>.tmp`
         tmp.unlink(missing_ok=True)
         raise
     dir_fd = os.open(path.parent, os.O_RDONLY)
@@ -144,13 +156,16 @@ def pin_repos(updates: Mapping[str, str], path: str | Path, *, directory: Path |
         if short(repo) not in WATCHED_REPOS:
             raise LockRefused("lock_invalid", [short(repo)])
     try:
-        text = path.read_text()
+        raw = path.read_bytes()                  # bytes, so CRLF survives and the changed-since-read check can match
+        text = raw.decode("utf-8")
         mode = path.stat().st_mode & 0o7777
-        previous: bytes | None = text.encode()
+        previous: bytes | None = raw
     except FileNotFoundError:
         if not create:
             raise LockRefused("lock_invalid") from None
         text, mode, previous = "", 0o600, None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise LockRefused("lock_invalid") from exc
     pins = read_pins(path) if previous is not None else {}
     unpublished = []
     caches = {}

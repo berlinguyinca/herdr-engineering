@@ -15,12 +15,14 @@ for `failed_host` (default) or `all_updated` scope.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shlex
 import signal
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -58,6 +60,21 @@ class Outcome:
     timed_out: bool = False
 
 
+_CHILDREN: set[int] = set()                      # process groups of in-flight host-apply children
+_CHILDREN_LOCK = threading.Lock()
+
+
+def kill_children() -> None:
+    """SIGKILL every in-flight host-apply process group (each child runs in its own session, so it would otherwise be
+    orphaned when the watcher exits on SIGTERM or the hard limit). Safe from any thread; a remote phase may still
+    finish, which host-apply's idempotence allows."""
+    with _CHILDREN_LOCK:
+        groups = list(_CHILDREN)
+    for pgid in groups:
+        with contextlib.suppress(OSError):
+            os.killpg(pgid, signal.SIGKILL)
+
+
 class SshTransport:
     """Runs `herdr-eng fleet host-apply` on a host: over ssh (BatchMode, ConnectTimeout), or directly for the local host.
 
@@ -91,6 +108,8 @@ class SshTransport:
                                     stderr=subprocess.DEVNULL, start_new_session=True, cwd="/")
         except OSError:
             return Outcome(SSH_FAILED_RC, "")
+        with _CHILDREN_LOCK:
+            _CHILDREN.add(proc.pid)
         try:
             out, _ = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -100,6 +119,13 @@ class SshTransport:
                 proc.kill()
             proc.communicate()
             return Outcome(None, "", timed_out=True)
+        except BaseException:                      # SIGTERM -> SystemExit, KeyboardInterrupt: never orphan the child
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            raise
+        finally:
+            with _CHILDREN_LOCK:
+                _CHILDREN.discard(proc.pid)
         return Outcome(proc.returncode, out[:MAX_STDOUT].decode("utf-8", "replace"))
 
 

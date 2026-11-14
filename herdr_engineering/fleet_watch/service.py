@@ -21,6 +21,9 @@ SOFT_LIMIT_S = 3600.0
 #: Longer than one apply (30 min) plus a health call, so only a real stall can reach it.
 HARD_LIMIT_S = 5400.0
 MIN_WAIT_S = 5
+#: EX_TEMPFAIL: the loop exits with this after a rollout installed a new herdr-engineering on THIS host, so systemd
+#: (`Restart=on-failure`, plus `RestartForceExitStatus`) starts the new build instead of the loop going on with old code.
+RESTART_EXIT = 75
 ORDINARY = ("new", "changed", "unchanged")
 
 

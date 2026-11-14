@@ -1796,10 +1796,17 @@ def _cmd_fleet_config(args) -> int:
 
 
 def _cmd_fleet_lock_verify(args) -> int:
+    import tempfile
+
     from .fleet_watch import lock, state
+    directory = state.state_dir()
     try:
-        with state.single_instance(state.state_dir()):      # the watcher fetches into the same cache clones
-            rows = lock.verify_lock(args.lock, converged=state.load().get("converged", {}))
+        if directory.is_dir():
+            with state.single_instance(directory):          # the watcher fetches into the same cache clones
+                rows = lock.verify_lock(args.lock, converged=state.load(directory).get("converged", {}))
+        else:                                               # no watcher ever ran: read-only means leaving no state behind
+            with tempfile.TemporaryDirectory(prefix="herdr-lock-verify-") as scratch:
+                rows = lock.verify_lock(args.lock, directory=Path(scratch))
     except state.WatcherBusy:
         print(json.dumps({"ok": False, "status": "busy"}) if args.json else "lock verify: busy (watcher pass running)")
         return 3

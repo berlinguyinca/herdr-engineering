@@ -7,6 +7,7 @@ stand-in, throwaway HOMEs) drives real subprocesses. Nothing here starts or enab
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import signal
@@ -22,7 +23,13 @@ from herdr_engineering.control_plane.fleet_rollout import validate_fleet_rollout
 from herdr_engineering.fleet_watch import plan, state
 from tests.test_deploy_units import parse_unit
 from tests.test_fleet_watch import git
-from tests.test_fleet_watch_run import BOOT, HE, fleet  # noqa: F401  (fixture)
+from tests.test_fleet_watch_run import (
+    BOOT,
+    HE,
+    PI,
+    fleet,  # noqa: F401  (fixture)
+    pi_world,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -337,10 +344,120 @@ def test_loop_stops_cleanly_on_sigterm_between_passes(fleet):
         while time.monotonic() < deadline and "head" not in json.dumps(fleet.saved()["repos"]):
             time.sleep(0.2)
         proc.send_signal(signal.SIGTERM)
-        assert proc.wait(timeout=20) in (0, -signal.SIGTERM)
+        assert proc.wait(timeout=20) == 0                                          # a clean stop, not death by signal
     finally:
         proc.kill()
         proc.communicate()
+
+
+# --------------------------------------------------------------------------- self-update restart, orphaned children
+
+def local_loop_argv(fleet, remote_bin, *extra: str) -> list[str]:
+    """A loop that applies the local host (beast) without ssh through `remote_bin`."""
+    fleet.identify("beast")
+    return [sys.executable, "-I", "-c", BOOT, "fleet-watch", "loop", "--lock", str(fleet.lock), "--repo", HE,
+            "--interval", "1", "--enable-rollouts", "--local-host", "beast", "--remote-bin", str(remote_bin), *extra]
+
+
+def test_a_rollout_that_updates_herdr_engineering_on_the_local_host_restarts_the_loop_with_exit_75(fleet):
+    argv = local_loop_argv(fleet, fleet.shims["beast"], "--max-passes", "5")
+    out = subprocess.run(argv, capture_output=True, text=True, env=fleet.env(), timeout=120)
+    assert out.returncode == 75, (out.returncode, out.stderr)                      # EX_TEMPFAIL: systemd re-execs the new build
+    assert out.stdout.count("pass ") == 1 and "exiting 75" in out.stderr         # it did not go on with the old code
+    assert fleet.saved()["converged"] == {HE: fleet.forge.head(HE)}                # the rollout itself was complete
+    assert fleet.installed("beast") == fleet.forge.head(HE)
+
+
+def test_a_rollout_that_updates_only_another_repo_on_the_local_host_does_not_restart_the_loop(fleet, tmp_path):
+    pi_world(fleet)                                                                # pi-engineering moved, herdr-engineering did not
+    at_beast = tmp_path / "beast-herdr-eng"                                        # the local run needs beast's HOME, as ssh gives it
+    at_beast.write_text(f'#!/bin/sh\nexport HOME={fleet.home("beast")}\nexec {fleet.shims["beast"]} "$@"\n')
+    at_beast.chmod(0o755)
+    argv = local_loop_argv(fleet, at_beast, "--max-passes", "1")
+    argv[argv.index(HE)] = PI
+    out = subprocess.run(argv, capture_output=True, text=True, env=fleet.env(), timeout=120)
+    assert out.returncode == 0, out.stderr
+    assert fleet.saved()["converged"] == {PI: fleet.forge.head(PI)}                # a rollout ran, on the local host too
+    assert fleet.installed("beast") is None                                        # (herdr-engineering was not reinstalled)
+
+
+def test_the_unit_restarts_on_the_update_exit_code_but_never_on_refused_or_busy():
+    from herdr_engineering.fleet_watch import service
+    unit = dict(parse_unit(UNIT)["Service"])
+    assert service.RESTART_EXIT == 75
+    assert unit["Restart"] == "on-failure"                                         # 75 is a failure status: restarted
+    assert "75" in unit["RestartForceExitStatus"].split()
+    assert set(unit["RestartPreventExitStatus"].split()) == {"2", "3"}             # 75 is not among them
+
+
+def hung_remote_bin(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A host-apply stand-in that hangs, leaving a parent shell and a sleeping child, both recorded by pid."""
+    parent, child = tmp_path / "hung.parent.pid", tmp_path / "hung.child.pid"
+    bin_ = tmp_path / "hung-herdr-eng"
+    bin_.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {child}\necho $$ > {parent}\nwait\n")
+    bin_.chmod(0o755)
+    return bin_, parent, child
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    stat = Path(f"/proc/{pid}/stat")
+    return not (stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] == "Z")
+
+
+def wait_for(path: Path, seconds: float = 30) -> int:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if path.exists() and path.read_text().strip():
+            return int(path.read_text())
+        time.sleep(0.1)
+    raise AssertionError(f"{path} never appeared")
+
+
+def assert_dead_soon(*pids: int) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and any(alive(p) for p in pids):
+        time.sleep(0.1)
+    assert not [p for p in pids if alive(p)], "a host-apply child outlived the watcher"
+
+
+def test_sigterm_during_a_local_host_apply_kills_the_child_process_group(fleet, tmp_path):
+    bin_, parent, child = hung_remote_bin(tmp_path)
+    proc = subprocess.Popen(local_loop_argv(fleet, bin_), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            env=fleet.env())
+    pids: list[int] = []
+    try:
+        pids = [wait_for(parent), wait_for(child)]
+        assert all(alive(p) for p in pids)
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=30) == 0
+        assert_dead_soon(*pids)
+    finally:
+        proc.kill()
+        proc.communicate()
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_the_hard_limit_exit_kills_the_child_process_group(fleet, tmp_path):
+    bin_, parent, child = hung_remote_bin(tmp_path)
+    argv = local_loop_argv(fleet, bin_, "--soft-limit", "1", "--hard-limit", "3")
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=fleet.env())
+    pids: list[int] = []
+    try:
+        pids = [wait_for(parent), wait_for(child)]
+        assert proc.wait(timeout=60) == 70
+        assert_dead_soon(*pids)
+    finally:
+        proc.kill()
+        proc.communicate()
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
 
 
 # --------------------------------------------------------------------------- systemd unit and ansible task
