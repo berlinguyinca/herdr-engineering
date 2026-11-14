@@ -31,7 +31,8 @@ import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { agentStory, renderStory } from './agents-lineage.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
 import { RANGES, safeHostId } from './host-view.js';
-import { mountHosts, loadHosts } from './hosts-view.js';
+import { mountHosts, loadHosts, mountDiagnostics } from './hosts-view.js';
+import { createHostDiagnosticsSource } from './diagnostics-source.js';
 import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountActivity, loadActivity } from './activity-view.js';
 import { mountAnalytics, loadAnalytics, usageStrip } from './analytics-view.js';
@@ -99,7 +100,7 @@ const NAV = [
   { group: 'Agents', path: '/teams', label: 'Your teams', capability: 'unified_workspace_v1' },
   { group: 'Agents', path: '/team-map', label: 'Team map', capability: 'unified_workspace_v1' },
   { group: 'Agents', path: '/agent-ops', label: 'Agent Operations', capability: 'agent_ops_v1' },
-  { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync', '/build-cache'] },
+  { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync', '/build-cache', '/diagnostics'] },
   { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
   { group: 'Fabric', path: '/settings', label: 'Settings' },
   { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
@@ -116,7 +117,7 @@ const NAV = [
 const SECTION_TABS = [
   [['/herd', 'Agents'], ['/missions', 'Missions'], ['/handoffs', 'Handoffs'], ['/communications', 'Communications']],
   [['/attention', 'Attention'], ['/activity', 'Activity']],
-  [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync'], ['/build-cache', 'Build cache', 'build_cache_v1']],
+  [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync'], ['/build-cache', 'Build cache', 'build_cache_v1'], ['/diagnostics', 'Diagnostics']],
   [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
   [['/ci', 'CI'], ['/deployments', 'Deployments']],
   [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate', 'review_gate_v1']],
@@ -258,6 +259,7 @@ const ROUTES = {
   '/agent-ops': viewAgentOps,
   '/services/:id': viewService,
   '/hosts': viewHosts,
+  '/diagnostics': viewDiagnostics,
   '/personal-assistant': viewPersonalAssistant,
   '/intelligence': viewIntelligence,
   '/hosts/:id': viewHost,
@@ -1131,6 +1133,21 @@ async function viewHosts(_parts, revision) {
   const data = await loadHosts(client);
   if (revision !== renderRevision) return;
   return mountHosts(root, client, { data, driftedOnly: route().query.get('drift') === '1' });
+}
+
+// Diagnostics is a snapshot the way the LLM pages are (addSnapshotChip): one read per navigation, never refreshed by a live event, because H03 reads
+// each feed once. The two calls below are feeds that already exist — the event stream and the host list — so no endpoint is invented here, and the
+// mount writes into this route's own node, so a read that finishes after the operator navigated away cannot write over the page they moved to.
+async function viewDiagnostics(_parts, revision) {
+  root.innerHTML = '<div data-diagnostics></div>';
+  // Only feeds that exist: the host list, then one event page per host through the adapter's own path builder.
+  // The bare events endpoint answers 400 (it requires both entity parameters), so that query lives in
+  // hostEventsPath beside the adapter that maps the answer, and this page names no URL of its own.
+  const source = createHostDiagnosticsSource({ request: (path) => client.request(path), listHosts: () => client.listHosts(), now: Date.now() });
+  await mountDiagnostics(root.querySelector('[data-diagnostics]'), { source });
+  if (revision !== renderRevision) return NO_REFRESH;
+  addSnapshotChip();
+  return NO_REFRESH;
 }
 
 async function viewHost(parts, revision) {
