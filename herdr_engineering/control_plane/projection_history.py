@@ -198,7 +198,7 @@ class PostgresHistory:
         pool = await self._get_pool()
         async with pool.acquire(timeout=5) as conn:
             return await fetch_page(conn, self.table, session_id, limit=limit, before=before,
-                                    cutoff=cutoff, kinds=kinds)
+                                    cutoff=cutoff, kinds=kinds, archive_table=self.table + "_archive")
 
     def entity_ids(self, kind):
         return self._call(self._ids(kind))
@@ -212,6 +212,31 @@ class PostgresHistory:
 
     def recent_events(self, limit=50):
         return self._call(self._recent(limit))
+
+    def communications(self, limit, before):
+        return self._call(self._communications(limit, before))
+
+    async def _communications(self, limit, before):
+        """One bounded result per operation, with server receipts preferred."""
+        stamp = datetime.fromisoformat(before[0]) if before else None
+        identity = before[1] if before else None
+        pool = await self._get_pool()
+        async with pool.acquire(timeout=5) as conn:
+            rows = await conn.fetch(f'''
+                WITH ranked AS (
+                  SELECT *, min(ingest_timestamp) OVER (PARTITION BY entity_id) AS communication_started,
+                    row_number() OVER (PARTITION BY entity_id ORDER BY
+                      (payload->>'evidence_kind' = 'server_receipt') DESC,
+                      (payload->>'status' <> 'queued') DESC,
+                      ingest_timestamp DESC, sequence DESC, event_id DESC) AS choice
+                  FROM {self.table} WHERE entity_type='communication'
+                )
+                SELECT * FROM ranked WHERE choice=1
+                  AND ($1::timestamptz IS NULL OR (communication_started,entity_id) < ($1,$2::text))
+                ORDER BY communication_started DESC,entity_id DESC LIMIT $3
+            ''', stamp, identity, limit)
+        return [{**public_event(row), 'communication_started': row['communication_started'].isoformat()}
+                for row in rows]
 
     def export_events(self):
         return self._call(self._export_events())

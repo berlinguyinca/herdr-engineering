@@ -1,0 +1,32 @@
+{
+ "findings": [
+  {
+   "file": "herdr_engineering/control_plane/bridge.py",
+   "line": 402,
+   "severity": "blocking",
+   "category": "code",
+   "why": "table[:-1] + '_archive\"' builds an invalid quoted identifier for the archive table"
+  },
+  {
+   "file": "herdr_engineering/control_plane/inspector_history.py",
+   "line": 114,
+   "severity": "blocking",
+   "category": "code",
+   "why": "to_regclass does not accept quoted names, so the archive is never detected"
+  },
+  {
+   "file": "herdr_engineering/control_plane/inspector_history.py",
+   "line": 120,
+   "severity": "blocking",
+   "category": "code",
+   "why": "The limit+1 truncation loses a row at the page boundary"
+  },
+  {
+   "file": "herdr_engineering/control_plane/bridge.py",
+   "line": 50,
+   "severity": "blocking",
+   "category": "code",
+   "why": "Unrelated claim about thread ownership of the connection"
+  }
+ ]
+}

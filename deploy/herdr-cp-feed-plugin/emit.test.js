@@ -22,8 +22,8 @@ function env(overrides = {}) {
 }
 
 const INFO = {
-  wK: { title: "herdr frontend work", cwd: "/home/wohlgemuth/IdeaProjects" },
-  w1H: { title: "wcmc - release", cwd: "/home/wohlgemuth/IdeaProjects/wcmc3" },
+  wK: { title: "herdr frontend work", cwd: "/home/user/IdeaProjects" },
+  w1H: { title: "wcmc - release", cwd: "/home/user/IdeaProjects/wcmc3" },
 };
 
 // ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ test("workspace.created emits mission.started with the resolved human label", ()
   assert.equal(m.entity_id, "herdr-ws:wK");
   assert.equal(m.event_type, "mission.started");
   assert.equal(m.payload.title, "herdr frontend work"); // NOT "wK"
-  assert.equal(m.payload.cwd, "/home/wohlgemuth/IdeaProjects");
+  assert.equal(m.payload.cwd, "/home/user/IdeaProjects");
   assert.equal(m.payload.stage, "active");
 });
 
@@ -238,13 +238,13 @@ test("mapEvent is deterministic given the same env + ctx", () => {
 test("workspaceInfo reads the human label + cwd from session.json", () => {
   const dir = mkdtempSync(join(tmpdir(), "cp-feed-"));
   const ws = { id: "wK", custom_name: "herdr frontend work",
-    identity_cwd: "/home/wohlgemuth/IdeaProjects" };
+    identity_cwd: "/home/user/IdeaProjects" };
   writeFileSync(join(dir, "session.json"),
     JSON.stringify({ workspaces: [ws] }));
   const env2 = { HERDR_SESSION_JSON: join(dir, "session.json") };
   assert.deepEqual(workspaceInfo(env2, "wK"), {
     title: "herdr frontend work",
-    cwd: "/home/wohlgemuth/IdeaProjects",
+    cwd: "/home/user/IdeaProjects",
   });
   // unknown id falls back to the id
   assert.deepEqual(workspaceInfo(env2, "wZ"), { title: "wZ", cwd: undefined });
@@ -305,7 +305,7 @@ for (const event of ["workspace.created", "workspace.focused", "workspace.rename
       if (envelope.entity_type === "mission") {
         assert.equal(envelope.entity_id, "herdr-ws:wK");
         assert.equal(envelope.payload.title, "herdr frontend work");
-        assert.equal(envelope.payload.cwd, "/home/wohlgemuth/IdeaProjects");
+        assert.equal(envelope.payload.cwd, "/home/user/IdeaProjects");
       } else if (envelope.entity_type === "session") {
         assert.equal(envelope.payload.mission_id, "herdr-ws:wK");
         assert.equal(envelope.payload.pane_id, "wK:p1");

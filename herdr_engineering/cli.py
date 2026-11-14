@@ -40,9 +40,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version",
                         version=f"herdr-eng {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("communications", help="install, sync or inspect native agent communication audit")
 
     from .assistant_cli import register as register_assistant_cli
     register_assistant_cli(sub)
+
+    from .agent_ops_tui import register as register_agent_ops_tui
+    register_agent_ops_tui(sub)
 
     p = sub.add_parser("build-cleanup", help="reclaim stale Rust build caches")
     cleanup_sub = p.add_subparsers(dest="cleanup_command", required=True)
@@ -237,6 +241,9 @@ def _build_parser() -> argparse.ArgumentParser:
     rp = rsub.add_parser("status", help="show the room, agent, rights and expiry from the state file")
     rp.add_argument("--config", required=True)
     rp.set_defaults(func=_cmd_relay_status)
+    # collab ---------------------------------------------------------------
+    from .collab_agents_client import add_collab_subparser as add_collab_agents_subparser
+    add_collab_agents_subparser(sub)
     # fabric ---------------------------------------------------------------
     p = sub.add_parser("fabric", help="fabric trust helpers (control_plane.collab.fabric_trust)")
     fasub = p.add_subparsers(dest="fabric_command", required=True)
@@ -390,6 +397,13 @@ def _build_parser() -> argparse.ArgumentParser:
     pha.add_argument("--busy-retries", type=int, default=5, help="fleet-auto-update.lock retries (default 5)")
     pha.add_argument("--busy-wait", type=float, default=60.0, help="seconds between lock retries (default 60)")
     pha.set_defaults(func=_cmd_fleet_host_apply)
+    pl = fsub.add_parser("lock", help="fleet.lock.yaml checks (the lock means 'converged', never 'wanted')")
+    lsub = pl.add_subparsers(dest="fleet_lock_command", required=True)
+    plv = lsub.add_parser("verify", help="read-only: every repos pin must be published main history "
+                                         "(exit 1 names the bad pins, 2 if the lock is unreadable)")
+    plv.add_argument("--lock", default="~/.config/herdr-fleet/fleet.lock.yaml", help="lock file to check")
+    plv.add_argument("--json", action="store_true")
+    plv.set_defaults(func=_cmd_fleet_lock_verify)
     pd = fsub.add_parser("drift", help="show tool/plugin versions that differ across hosts, with suggested fixes")
     pd.add_argument("--control-plane", default=None,
                     help="control plane URL (default: host.json control_plane_url)")
@@ -424,6 +438,20 @@ def _build_parser() -> argparse.ArgumentParser:
             rp.add_argument("--max-passes", type=int, default=None, help="stop after this many passes; omit to retry offline hosts until complete")
             rp.add_argument("--max-unchanged-online-passes", type=int, default=8, help="stop for review after this many unchanged online passes per session (1..1000)")
         rp.set_defaults(func=_cmd_fleet_rollout)
+
+    rp = rsub.add_parser(
+        "retire-identityless",
+        help="settle blocked registrations whose instance identity cannot be resolved, so the "
+        "rollout can finish for what it can prove; the evidence stays in the report",
+    )
+    rp.add_argument("--state", default=None, help="private rollout state directory")
+    rp.add_argument("--id", required=True, help="rollout ID printed by plan")
+    rp.add_argument(
+        "--settled-by",
+        default="operator",
+        help="who is settling the registration; recorded per session in the report",
+    )
+    rp.set_defaults(func=_cmd_fleet_rollout)
 
     # artifacts ------------------------------------------------------------
     p = sub.add_parser("artifacts", help="shared artifact workspace (spec 0080)")
@@ -1754,6 +1782,27 @@ def _cmd_fleet_config(args) -> int:
     return 0
 
 
+def _cmd_fleet_lock_verify(args) -> int:
+    from .fleet_watch import lock, state
+    try:
+        with state.single_instance(state.state_dir()):      # the watcher fetches into the same cache clones
+            rows = lock.verify_lock(args.lock, converged=state.load().get("converged", {}))
+    except state.WatcherBusy:
+        print(json.dumps({"ok": False, "status": "busy"}) if args.json else "lock verify: busy (watcher pass running)")
+        return 3
+    except lock.LockRefused:
+        print(f"fleet lock verify: cannot read the repos section of {args.lock}", file=sys.stderr)
+        return 2
+    bad = [r for r in rows if r["status"] not in ("ok", "unwatched")]
+    if args.json:
+        print(json.dumps({"ok": not bad, "pins": rows}, sort_keys=True))
+    else:
+        for r in rows:
+            print(f"{r['repo']}: {r['status']} {r['sha'][:12] or '-'}")
+        print("lock verify: ok" if not bad else f"lock verify: {len(bad)} pin(s) not publishable")
+    return 1 if bad else 0
+
+
 def _cmd_fleet_host_apply(args) -> int:
     from .fleet_watch import host_apply
     try:
@@ -1840,6 +1889,7 @@ def _cmd_fleet_rollout(args) -> int:
         apply_rollout,
         create_rollout,
         inventory_targets,
+        retire_identityless,
         run_rollout,
     )
 
@@ -1852,6 +1902,8 @@ def _cmd_fleet_rollout(args) -> int:
             report = apply_rollout(store, args.id)
         elif args.rollout_command == "run":
             report = run_rollout(store, args.id, interval_seconds=args.interval_seconds, max_passes=args.max_passes, max_unchanged_online_passes=args.max_unchanged_online_passes)
+        elif args.rollout_command == "retire-identityless":
+            report = retire_identityless(store, args.id, settled_by=args.settled_by)
         else:
             report = store.read(args.id)
     except (OSError, ValueError, RuntimeError) as exc:
@@ -1860,6 +1912,10 @@ def _cmd_fleet_rollout(args) -> int:
     _print_json(report)
     if report.get("runner", {}).get("status") == "interrupted" and args.rollout_command == "run":
         return 130
+    if args.rollout_command == "retire-identityless" and (
+        report.get("stillBlocked") or report.get("blockedHosts")
+    ):
+        return 2
     return 0 if args.rollout_command not in ("apply", "run") or report["status"] == "complete" else 2
 
 
@@ -4468,6 +4524,11 @@ def _cmd_cp_web(args) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")   # boot phase timings
     fleet_store, cp = _load_cp_fleet_config(getattr(args, "fleet_config", None))
     _validate_graph_merge_gate(cp)
+    from .control_plane import stall_watch
+    try:
+        gc_tuning = stall_watch.parse_gc_config(cp.get("gc"))     # a bad control_plane.gc stops startup before anything binds
+    except ValueError as exc:
+        raise SystemExit(f"--fleet-config: {exc}") from None
     switch_store = fleet_store
     replay_flag = getattr(args, "collab_replay_history", None)      # an explicit --collab-replay-history wins over the YAML
     api_keys = _parse_api_keys(args.api_key, args.api_keys)
@@ -4766,6 +4827,7 @@ def _cmd_cp_web(args) -> int:
                              summary_report_config=cp.get("summary_report") or {},
                              unified_workspace_config=cp.get("unified_workspace") if isinstance(cp.get("unified_workspace"), dict) else None,
                              work_center_config=cp.get("work_center") if isinstance(cp.get("work_center"), dict) else None,
+                             agent_ops_config=cp.get("agent_ops") if isinstance(cp.get("agent_ops"), dict) else None,
                              assistant_config=_assistant_config(cp),
                              review_quorum=_review_quorum_config(cp),
                              single_operator=cp.get("single_operator") is True,
@@ -4813,9 +4875,8 @@ def _cmd_cp_web(args) -> int:
     _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
                  "host": args.host, "port": args.port,
                  "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})
-    from .control_plane import stall_watch
     watch = stall_watch.install()
-    logging.info("froze %d boot objects out of garbage collection", stall_watch.freeze_boot_heap())
+    stall_watch.tune_gc(gc_tuning)
     try:
         svr.serve()
     except KeyboardInterrupt:
@@ -5089,7 +5150,7 @@ STARTUP_ONLY_COLLAB_KEYS = frozenset(COLLAB_CONFIG_KEYS) - frozenset(HOT_COLLAB_
 
 
 # control_plane keys read ONCE at startup: editing them needs a restart (unlike HOT_COLLAB_SWITCHES)
-RESTART_REQUIRED_KEYS = ("review_quorum", "lineage_key_scopes", "api_keys", "ci_actions", "pg_dsn", "architecture")
+RESTART_REQUIRED_KEYS = ("review_quorum", "lineage_key_scopes", "api_keys", "ci_actions", "pg_dsn", "architecture", "gc")
 
 
 def _wire_collab_switches(collab, store, pinned=frozenset()) -> None:
@@ -5991,6 +6052,10 @@ def _cmd_cp_worker(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    communication_args = list(sys.argv[1:] if argv is None else argv)
+    if communication_args[:1] == ["communications"]:
+        from .communications import main as communications_main
+        return communications_main(communication_args[1:])
     parser = _build_parser()
     effective_argv = list(sys.argv[1:] if argv is None else argv)
     if effective_argv and effective_argv[0] == "assistant":

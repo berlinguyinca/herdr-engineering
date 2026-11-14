@@ -50,6 +50,8 @@
       ansible.builtin.include_tasks: ../tasks/ai-sync-feed.yml
     - name: "Converge ai-sync enforcement (opt-in per host, never on the publisher)"
       ansible.builtin.include_tasks: ../tasks/ai-sync-enforce.yml
+    - name: "Install the fleet rollout watcher unit (enabled only with fleet_watch_enabled on beast)"
+      ansible.builtin.include_tasks: ../tasks/fleet-watch.yml
 
     - name: "Install the pinned shared agent rules"
       ansible.builtin.include_tasks: ../tasks/agent-rules.yml

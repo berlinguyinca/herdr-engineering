@@ -69,7 +69,7 @@ main() {
     for p in "$DIR"/run/*.pid; do
       pid=$(cat "$p" 2>/dev/null || true)
       case "$pid" in ''|*[!0-9]*) rm -f "$p"; continue ;; esac
-      if ps -p "$pid" -o args= 2>/dev/null | grep -q 'worker\.sh'; then kill "$pid" 2>/dev/null && echo "stopped $(basename "$p" .pid) (pid $pid)"; fi
+      if ps -ww -p "$pid" -o args= 2>/dev/null | grep -q 'worker\.sh'; then kill "$pid" 2>/dev/null && echo "stopped $(basename "$p" .pid) (pid $pid)"; fi
       rm -f "$p"
     done
     echo "Workers started in herdr panes keep running: close their workspaces in herdr."

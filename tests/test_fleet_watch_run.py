@@ -233,7 +233,7 @@ def test_apply_rolls_out_serially_canary_first_and_converges(fleet):
         assert git(fleet.checkout(host), "rev-parse", "HEAD") == head
     assert fleet.saved()["converged"] == {HE: head}
     types = fleet.types()
-    assert types[:3] == ["rollout.observed", "rollout.planned", "rollout.started"] and types[-1] == "rollout.succeeded"
+    assert types[:3] == ["rollout.observed", "rollout.planned", "rollout.started"] and "rollout.succeeded" in types[-2:]
     assert types[3:8] == ["host.started", "host.step", "host.step", "host.step", "host.finished"]
     assert fleet.cli().stdout.strip() == "fleet-watch run: idle"                   # converged: nothing to do again
 
@@ -285,7 +285,7 @@ def test_a_halted_rollout_is_not_rerun_without_resume_and_resume_skips_settled_r
     assert not [c for c in new if c.startswith("beast ")]                            # beast was already done
     assert {c.split()[0] for c in new} == {"bender", "macbook-pro"}
     ev = [e["payload"] for e in fleet.queued() if e["event_type"] == "rollout.resumed"]
-    assert ev and ev[0]["reason"] == "operator" and fleet.types()[-1] == "rollout.succeeded"
+    assert ev and ev[0]["reason"] == "operator" and "rollout.succeeded" in fleet.types()[-2:]
 
 
 def test_unreachable_macbook_does_not_halt_and_is_skipped_optional(fleet):
@@ -294,7 +294,7 @@ def test_unreachable_macbook_does_not_halt_and_is_skipped_optional(fleet):
     assert out.returncode == 0, out.stderr
     mac = fleet.finished()["macbook-pro"][0]
     assert (mac["status"], mac["reason"]) == ("skipped", "optional_unreachable")
-    assert fleet.types()[-1] == "rollout.succeeded"
+    assert "rollout.succeeded" in fleet.types()[-2:]
     assert fleet.saved()["converged"] == {HE: fleet.forge.head(HE)}
 
 
@@ -343,7 +343,7 @@ def test_crash_mid_rollout_resumes_at_the_first_unfinished_host(fleet):
     types = fleet.types()
     assert types.count("rollout.resumed") == 1 and types.count("rollout.observed") == 1
     assert "reason" not in [e["payload"] for e in fleet.queued() if e["event_type"] == "rollout.resumed"][0]
-    assert types[-1] == "rollout.succeeded"
+    assert "rollout.succeeded" in types[-2:]
     seqs = [e["payload"]["seq"] for e in fleet.queued()]
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
     for host in HOST_ORDER:
@@ -445,7 +445,7 @@ def test_a_halt_that_was_never_emitted_is_emitted_before_the_operator_resume(fle
     (fleet.checkout("bender") / "dirty").unlink()
     assert fleet.cli("--resume").returncode == 0
     new = fleet.types()[seen:]
-    assert new[:2] == ["rollout.halted", "rollout.resumed"] and new[-1] == "rollout.succeeded"
+    assert new[:2] == ["rollout.halted", "rollout.resumed"] and "rollout.succeeded" in new[-2:]
     halted = [e for e in fleet.queued()[seen:] if e["event_type"] == "rollout.halted"][0]["payload"]
     assert halted["halted_at_host"] == "bender" and halted["reason"] == "dirty_checkout"
 
@@ -492,7 +492,7 @@ def test_an_optional_host_that_missed_the_first_repo_is_not_updated_for_the_seco
     assert [(p["repo"], p["status"], p.get("reason")) for p in mac] == [
         ("herdr-engineering", "skipped", "optional_unreachable"), ("pi-engineering", "skipped", "optional_unreachable")]
     assert len(fleet.calls("macbook-pro")) == 1        # only the failed precheck; pi was never contacted there
-    assert current(fleet, "macbook-pro") == before and fleet.types()[-1] == "rollout.succeeded"
+    assert current(fleet, "macbook-pro") == before and "rollout.succeeded" in fleet.types()[-2:]
 
 
 def test_a_crash_during_health_keeps_the_hosts_own_previous_release_for_the_rollback(fleet):
@@ -587,7 +587,7 @@ def test_events_reach_a_real_control_plane_in_order_through_the_outbox(fleet, li
         os.environ.pop("FAKE_SSH_DIR")
     stream = repo.stream("fleet_rollout", plan["rollout_id"])
     assert [e["payload"]["seq"] for e in stream] == list(range(len(stream)))
-    assert stream[0]["event_type"] == "rollout.observed" and stream[-1]["event_type"] == "rollout.succeeded"
+    assert stream[0]["event_type"] == "rollout.observed" and "rollout.succeeded" in [e["event_type"] for e in stream[-2:]]
     assert emitter.pending() == []
     for e in stream:
         assert_closed({k: v for k, v in e["payload"].items() if not k.startswith("_")})

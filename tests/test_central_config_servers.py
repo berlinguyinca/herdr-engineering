@@ -199,6 +199,11 @@ def test_web_reads_everything_from_the_fleet_file_and_ignores_env(tmp_path, monk
     assert seen["server_kw"]["github_pg_dsn"] == cp["pg_dsn"]  # the GitHub catalog persists there
 
 
+def test_web_refuses_invalid_gc_block(tmp_path, monkeypatch, old_env, capsys):
+    with pytest.raises(SystemExit, match=r"--fleet-config: control_plane\.gc"):
+        _run_web(monkeypatch, make_file(tmp_path, gc={"gen2": 0}))
+
+
 def test_web_wires_personal_assistant_from_fleet_config(tmp_path, monkeypatch, old_env, capsys):
     # enabled section is passed through to the server as assistant_config
     p1 = make_file(tmp_path / "pa", personal_assistant={"enabled": True, "inference": {"endpoint": "x"}})

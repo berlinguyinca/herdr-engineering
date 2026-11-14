@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Branch `feat/assistant-jev-mcp` in worktree `/home/wohlgemuth/IdeaProjects/herdr-assistant-jev`; never commit to main; no merge without the owner's word; plain `git push` only.
+- Branch `feat/assistant-jev-mcp` in worktree `/home/user/IdeaProjects/herdr-assistant-jev`; never commit to main; no merge without the owner's word; plain `git push` only.
 - TDD; no mocks, stubs or fakes (a `now` clock injection is allowed, as in existing tests); tests use throwaway HOME/tmp dirs and never touch the real `~/.claude`, `~/.codex`, `~/.config/opencode`, `~/.pi`.
 - Commit trailer: `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`.
 - Credential format `hcw_` + `secrets.token_urlsafe(32)`; enrollment code `hce_` + `secrets.token_urlsafe(24)`, single use, TTL default 900 s; only sha256 digests stored; shown once; uniform 401 on every auth failure.
