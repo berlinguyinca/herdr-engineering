@@ -131,6 +131,72 @@ so does `poll`, so overlapping timer runs never review the same PR twice.
 
 Exit codes: 0 the review completed; 1 the review failed; 2 refused; 3 the head moved; 4 another run holds the PR.
 
+## Always-on review (two tiers, pluggable backends)
+
+`always-on-review.py` extends this reviewer with two tiers and a choice of backend per tier. It reuses this file's
+diff parsing, chunking, strict verdict schema, finding validation, stale-pending retry and "the script, not the model,
+decides the state" rule. `ai-review.py` itself keeps working unchanged (the gateway backend is the same call).
+
+| Tier | Default context | Backend (config) | When it runs | Required? |
+|---|---|---|---|---|
+| tier1 | `Open-weight pre-review` | `pi` with an open-weight alias | every non-draft head | no, advisory |
+| tier2 | `Opus agent review` | `claude` with `opus` | only when every `gates.required` name is success on that exact SHA and every existing `gates.when_present` check is success | yes, once the ruleset is changed by the operator |
+
+Backends (`tiers.<t>.backend`, settings under `backends.<name>`):
+
+- `gateway`: the OpenAI-compatible call, chunked as in ai-review.
+- `claude`: `claude -p --model <model>` in a fresh detached worktree of the PR head. Tools are exactly `Read`,
+  `Grep` and `Glob`: no Bash and no git allow rules (a `git diff:*` rule is not read-only, since
+  `--output=<path>` writes a file). The diff (cut at `diff_bytes`) and the commit log are in the prompt; the worktree
+  is there for reading the code around the change. `--permission-mode dontAsk`, `--setting-sources ""` (measured: with
+  `--setting-sources user` a permissive user rule let `Read` leave the worktree; with `""` it is denied and a logged-in
+  CLI still works), no MCP, no slash commands, no session persistence, strict `--json-schema` verdict, hard time cap.
+  The prompt text and the worktree are untrusted input; for host-level isolation set `backends.claude.wrapper` to a
+  sandbox prefix such as `bwrap` (optional, not installed or required by this script).
+- `pi`: `pi -p --model <provider/alias>` with `--tools read,grep,find,ls`, no extensions, skills, MCP, context files
+  or session, `--offline`. pi has no JSON-schema flag, so the diff is in the prompt and the answer is parsed strictly
+  from stdout. pi has no file sandbox and can read any file the user can, so its answer is not trusted to be free of
+  secrets: the pi provider key and the `gh auth token` value are added to the redaction set (best effort, exact
+  strings only: other secrets are NOT covered), and a tier that uses pi with `comment: true` is refused unless
+  `backends.pi.wrapper` is set (for example a `bwrap` prefix). Statuses and `reviews.jsonl` are redacted the same way.
+
+### Choosing a pi model or alias
+
+pi "aliases" are the gateway aliases listed as model entries under a provider in `~/.pi/agent/models.json` (for
+example provider `metabolomics`, ids `qwen3.8-27b`, `qwen3.8-flash`, ...). There is no separate alias file. List them
+with `pi --list-models [search]`, then set `tiers.tier1.model: metabolomics/<alias>` (optionally `:<thinking>`).
+`PI_CODING_AGENT_DIR` is not used; the default `~/.pi/agent` applies.
+
+### Dry-run is the default; two keys to post
+
+Nothing is posted unless the config has `post: true` AND the command has `--post`. Without both, reviewers still run
+and `state_dir/reviews.jsonl` gets one line per review, but no status or comment is written to GitHub.
+
+```
+always-on-review.py show-command --tier tier2 --config CFG     # print the exact reviewer command line
+always-on-review.py review --tier tier1 --repo O/R --pr N --config CFG           # dry run
+always-on-review.py poll --config CFG                                            # dry run of the whole loop
+always-on-review.py poll --config CFG --post                                     # posts only if CFG has post: true
+```
+
+Gates: `gates.required` names must be present and `success`; `neutral` and `skipped` do not count as green. A
+`gates.when_present` name (a pipeline that only runs on some PRs, such as `ui-gates`) may be absent or neutral/skipped,
+but when it exists it must be `success`: pending or failed blocks tier 2.
+
+Use a dedicated bare clone for `clone:` (not your working checkout): the script fetches `refs/pull/N/head` into
+`refs/herdr-review/*` there and removes those refs and the worktree after each review.
+
+Guarantees: one review per exact head SHA (idempotent, redone on every push), drafts skipped, one review at a time,
+per-review time cap (process group killed), cooldown after repeated failures, status stays `pending` whenever a
+review cannot run or its answer fails the schema (`post_status` refuses success without a parsed verdict for that
+SHA), blocking findings must cite a file in the PR (others are dropped), and a failure posts one marked comment
+(`<!-- always-on-review:<slug> -->`, updated in place). The reviewer subprocess gets a scrubbed environment (no
+`GH_TOKEN`, no API keys) and the PR title, body and diff are treated as untrusted. "No network" means no network
+tools; the CLIs still reach their own model API.
+
+Examples (not installed by anything): `always-on-review.example.yaml`, `herdr-always-on-review.service` / `.timer`
+(systemd --user), and `herdr-review-pane.example.sh` (a herdr pane that tails `reviews.jsonl`).
+
 ## Limits
 
 - **Prompt injection can still win.** The model has no tools, filesystem, network or key, so text in a PR can

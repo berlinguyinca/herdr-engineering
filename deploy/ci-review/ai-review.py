@@ -268,7 +268,25 @@ class Gh:
         return str(self.json(["api", "user"]).get("login", ""))
 
     def statuses(self, repo: str, sha: str) -> list[dict]:
-        return self.json(["api", f"repos/{repo}/commits/{sha}/status"]).get("statuses", []) or []
+        out: list[dict] = []
+        for page in range(1, 51):
+            batch = self.json(["api", f"repos/{repo}/commits/{sha}/status?per_page=100&page={page}"]).get(
+                "statuses", []) or []
+            out.extend(batch)
+            if len(batch) < 100:
+                break
+        return out
+
+    def check_runs(self, repo: str, sha: str) -> list[dict]:
+        """Every check run of this commit (all pages), newest first, so the first of a duplicated name wins."""
+        out: list[dict] = []
+        for page in range(1, 51):
+            batch = self.json(["api", f"repos/{repo}/commits/{sha}/check-runs?per_page=100&page={page}"]).get(
+                "check_runs", []) or []
+            out.extend(batch)
+            if len(batch) < 100:
+                break
+        return sorted(out, key=lambda c: (str(c.get("started_at") or ""), int(c.get("id") or 0)), reverse=True)
 
     def comments(self, repo: str, n: int) -> list[dict]:
         out: list[dict] = []
@@ -504,7 +522,7 @@ class Gateway:
         out = self.call("GET", "/models")
         return [str(m.get("id")) for m in out.get("data", []) if isinstance(m, dict)]
 
-    def chat(self, model: str, system: str, user: str) -> Answer:
+    def chat(self, model: str, system: str, user: str, schema: dict | None = None) -> Answer:
         body = {"model": model, "messages": [{"role": "system", "content": system},
                                              {"role": "user", "content": user}],
                 self.max_tokens_field: self.r["max_tokens"], "temperature": self.r["temperature"],
@@ -513,7 +531,8 @@ class Gateway:
             body["chat_template_kwargs"] = {"enable_thinking": False}
         if self.r["response_format"] == "json_schema":
             body["response_format"] = {"type": "json_schema",
-                                       "json_schema": {"name": "verdict", "strict": True, "schema": VERDICT_SCHEMA}}
+                                       "json_schema": {"name": "verdict", "strict": True,
+                                                       "schema": schema or VERDICT_SCHEMA}}
         elif self.r["response_format"] == "json_object":
             body["response_format"] = {"type": "json_object"}
         t = time.monotonic()
