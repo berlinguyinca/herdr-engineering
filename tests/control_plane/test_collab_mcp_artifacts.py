@@ -197,6 +197,7 @@ from herdr_engineering.control_plane.collab_bridge_files import MCP_UPLOAD_MAX_B
 from herdr_engineering.control_plane.repo import ControlPlaneRepo  # noqa: E402
 
 KIB = 1024
+LOAD_TIMEOUT = 30.0     # socket waits only bound a hang; a loaded xdist worker can stall the server for seconds
 CHUNK_DATA = bytes((i * 13 + 5) % 256 for i in range(CHUNK_BYTES))
 
 
@@ -230,7 +231,7 @@ def padded(name, size, rid=1):
     return msg
 
 
-def raw_post(edge, info, declared, body=b"", *, extra=(), send_body=True, recv_timeout=3.0):
+def raw_post(edge, info, declared, body=b"", *, extra=(), send_body=True, recv_timeout=LOAD_TIMEOUT):
     """POST /mcp over a raw socket on the public listener. Returns (status, headers dict, body)."""
     head = ["POST /mcp HTTP/1.1", "Host: x", "X-Forwarded-Proto: https", "Content-Type: application/json"]
     if info:
@@ -468,7 +469,7 @@ def test_expect_100_continue_is_sent_only_after_admission(edge, world):
     head = ("POST /mcp HTTP/1.1\r\nHost: x\r\nX-Forwarded-Proto: https\r\nContent-Type: application/json\r\n"
             f"Authorization: Agent {world.a_info['credential']}\r\nX-Herdr-Device: {world.a_info['device_id']}\r\n"
             f"Expect: 100-continue\r\nContent-Length: {len(body)}\r\n\r\n").encode()
-    s = socket.create_connection(("127.0.0.1", edge.public_port), timeout=5)
+    s = socket.create_connection(("127.0.0.1", edge.public_port), timeout=LOAD_TIMEOUT)
     try:
         s.sendall(head)
         assert s.recv(4096).startswith(b"HTTP/1.1 100 Continue")

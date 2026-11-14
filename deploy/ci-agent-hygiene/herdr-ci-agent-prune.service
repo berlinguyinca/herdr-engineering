@@ -1,0 +1,11 @@
+[Unit]
+Description=Delete dead Woodpecker agent registrations
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=%h/.local/libexec/wpci-agent-prune --apply
+TimeoutStartSec=5min
+NoNewPrivileges=yes

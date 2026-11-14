@@ -14,7 +14,7 @@
 
 - Branch `feat/assistant-hub-phase2` off origin/main; never commit to main; plain `git commit`/`git push` (no rebase, no force-push); no merge without the owner's word. Commit trailer `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`.
 - TDD, no mocks/stubs/fakes (real stores, real servers on port 0, real subprocess for CLI); tests never touch real `~/.claude`, `~/.codex`, `~/.pi`, `~/.config/herdr`, `~/.config/opencode` (throwaway HOME).
-- `/api/v1` tests need `asyncpg`; sandbox runs use `PYTHONPATH=/tmp/claude-1000/-home-wohlgemuth-IdeaProjects/a8939f5b-bb45-4f5f-a41d-65023acf9586/scratchpad/deps`.
+- `/api/v1` tests need `asyncpg`; sandbox runs use `PYTHONPATH=/tmp/claude-1000/-home-user-IdeaProjects/a8939f5b-bb45-4f5f-a41d-65023acf9586/scratchpad/deps`.
 - Strings are never matched: grants match only on exact canonical-key equality (spec 6.1). No wildcards in a learned grant.
 - The judge (Phase 3) does not exist here. Decision order steps 4 and 6 collapse to "no judge available => fail closed => owner approval". Judge can only add friction, never remove a requirement.
 - Learned state lives only in the hub store; harness code stays a stateless relay (spec 16.1). The Phase 1 hook relay is NOT changed in this phase and still returns no decision.

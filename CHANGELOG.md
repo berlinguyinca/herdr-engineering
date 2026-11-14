@@ -5,6 +5,84 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: Woodpecker agent pruner and fabric firewall script polish
+
+- `wpci-agent-prune`: a null or non-object queue response, a null `agent_id` in a queue task, or a non-list agents response now exits 1 with the normal `abort: API error` line instead of a traceback. The unreachable "more candidates than agents" abort is removed (candidates are a subset of the agents listed). README documents that after a >24h Woodpecker outage up to `--max-deletions` live agents per run may be removed (they re-register) and how to lower the cap.
+- `collab-fabric-firewall.sh --check`: a missing iptables binary is exit 3 with a clear message (was folded into 2, "need root"); one chain absent plus the other unreadable reports absent (1). `deploy.sh` treats 3 like absent (the strong WARNING). `--install`/`--remove` unchanged apart from the message. Exit-code list in `docs/operations/fabric-trust.md` updated.
+
+### Fix: deploy.sh no longer warns that the fabric firewall is missing when it merely cannot read it
+
+- `collab-fabric-firewall.sh --check` run as the non-root deploy user exits 2 (cannot read), which `deploy.sh` treated like absent rules and always printed the install WARNING. Exit 1 (absent) keeps the WARNING; exit 2 now prints a one-line NOTE (verify with `sudo <script> --check`, noting if `herdr-collab-fabric-firewall.service` is enabled). Never fails the deploy. Docs in `docs/operations/fabric-trust.md` updated.
+
+### Fix: unit gate no longer starves or hangs on the 1.77M-row recovery test
+
+- `test_production_cardinality_snapshot_recovery_and_database_restart` (~5.5 min alone, >23 min under disk contention) is marked `slow` with an explicit `@pytest.mark.timeout(3600)`; the suite-wide 900 s ceiling failed pipeline 1334 after ~57 min.
+- `scripts/ci/unit-gates.sh` runs everything else under xdist with `-m 'not e2e and not integration and not slow'`, then the `slow` tests serially in a tail pass (its hang limit is 4200 s so pytest-timeout names a hung test first), so coverage is identical and the slow test no longer competes with the workers.
+- Both passes run under `scripts/ci/run-watched.py` (derived from the shared run-watched helper; it tracks the command's session, parent-pid descendants and any process carrying its per-run token in its environment, so a Postgres started by `pg_ctl` and reparented to init is counted and stopped; it reads per-process CPU from /proc, stops the whole tree on a hang or on SIGTERM/SIGINT/SIGHUP (exit 128+signal), gives survivors left after the command exits a bounded grace, and keeps draining if the reader of its output closes): a soft notice after `HERDR_PYTEST_SOFT_SECONDS` (3600), and a kill (exit 124) only after `HERDR_PYTEST_HANG_SECONDS` (1800) with no output and no CPU, so a wedged run (pipeline 1362, ~8 h) fails instead of hanging; a slow live run is never killed.
+- Tests: real-subprocess coverage that slow tests are deselected from the parallel pass and run in the tail, that the two selections partition the default collection, and the watchdog's kill / no-kill behaviour. Rollback: revert the commit.
+
+### Codex second reviewer on risky paths (always-on-review.py)
+
+- New YAML block `risky` (default `globs: []` = off, behaviour unchanged). For a PR touching a path that matches `risky.globs` (`**` globs, case-insensitive, a rename counts by old and new path), `Opus agent review` is posted success only when a Codex review of the same head also approves: Opus runs first, and only if it approved cleanly `codex exec` (read-only sandbox, `--ignore-user-config`, strict verdict schema, same evidence rule) reviews the same worktree; the verdicts are merged and the script decides the state. A Codex block posts failure with its findings. If Codex cannot run or its answer cannot be verified (missing binary or login, time cap, bad exit, malformed answer, unverifiable block) the status stays pending, never success. Non-risky PRs and tier 1 never call Codex; a moved head posts nothing; dry-run and the two-key post rule are unchanged. Cost: `risky.codex.daily_budget_usd` with `input_usd_per_mtok` / `output_usd_per_mtok` (codex reports tokens only; the prices are required with a budget) is summed from `reviews.jsonl` (`tier: codex`) since 00:00 UTC and skips a risky review before Opus runs once reached. A Codex block whose blockers all cite files outside the PR also stays pending; `-c project_doc_max_bytes=0` keeps a PR-added AGENTS.md out of Codex's instructions; implausible token counts (negative, non-integer, over 10**12) fail the review. `show-command --tier codex` prints the command. Not installed or deployed by this change; beast needs `codex login`. Rollback: set `risky.globs: []` (or remove the block) and restart the poller.
+
+### xdist follow-ups: collision-free ports, accurate comments, stronger parallel tests
+
+- `test_allocation_skips_os_bound_port` and `test_failed_forwarder_start_is_retried_on_next_sync` bound fixed ports (18500, 24700) that could collide across files running concurrently under `--dist=loadfile`; they now use OS-assigned ports.
+- `scripts/ci/pytest-parallel.sh` comments corrected: `loadfile` does not honour `xdist_group` (only `loadgroup` does), and `--maxprocesses` caps explicit worker counts too.
+- The loadfile test now runs four real files on two workers and asserts more than one worker was used with each file on exactly one; added refusal tests for `HERDR_PYTEST_MAXPROCESSES` of `0` or non-numeric.
+- `tree._live_processes` runs `ps -ww`: xdist workers export `COLUMNS=80`, which truncated process args (regression test added).
+- `execnet==2.1.2` (what `pytest-xdist==3.8.0` resolves to) is pinned in the dev extra.
+
+### Fix: leftovers from the review of the collab agents follow-ups
+
+- `herdr-eng collab agents renew`: a failed write with `--json --print-credential` now prints the one JSON object (with `credential`) on stdout, not the bare credential; a failed move into place with `--print-credential` also prints the credential (or the JSON object) on stdout, keeping the 0600 temp file and its path on stderr.
+- `deploy/control-plane/rooms-bootstrap.py`: a membership conflict is recognised by the real HTTP status (409), not by the text "HTTP 409" in the message, so a non-409 error quoting it is no longer swallowed. The missing-operator-id test now covers every falsy `user_id` shape against a real stub that would otherwise remove an unowned grant.
+- Runbook 5.2a step 5: fabric-join agents are refused (403) and renewing an expired agent at the agent limit returns 429.
+
+### Fix: collab agents CLI and rooms-bootstrap follow-ups, flaky MCP upload tests, renewal runbook
+
+- `herdr-eng collab agents renew`: `--json --print-credential` now prints one JSON object that includes `credential` (no second line); a failed file write with `--print-credential` prints the credential on stdout as requested instead of stderr; the temp file is fsynced before it is renamed into place; a read timeout on an error body, a malformed `--operator-url` (`http://[::1`) and a listed agent without an id are one-line errors (exit 1), not tracebacks.
+- Tests: the agent-cap test uses a real fixture (servers and threads are torn down) with a wider TTL margin; the disk-full test sets `RLIMIT_FSIZE` inside the child instead of `preexec_fn`; added coverage for the failed rename (temp file kept at 0600, path printed).
+- `deploy/control-plane/rooms-bootstrap.py`: a 409 on one member no longer aborts the others (the run still fails at the end), and a missing operator id from `/me` refuses to remove any membership. The `REMOVED stale membership` count is now asserted.
+- `test_collab_mcp_artifacts.py`: the raw-socket waits in the two load-sensitive tests are 30 s, so they pass under `-n 4`; assertions unchanged.
+- Docs: new "Renewing an expired agent" runbook (section 5.2a) in the collaboration network guide. Rollback: revert the commit.
+
+### Fix: retired identity-less registrations are terminal and keep host-level blockers (#779, #798 review)
+
+- `fleet rollout retire-identityless` now settles only what it can: the identity refusal is recorded as a typed `blockReason` on the session (no string matching), and host-level reasons (unverified native coverage, ambiguous native identity, a missing discovered session) are recorded separately as `hostLevelError`, so a host with an identity-less session plus a coverage error stays blocked with its reason and `coverageErrors`. Hosts with nothing retired are untouched.
+- A retired session is terminal: the runner no longer stops as blocked or stalled on it, its husk leaving the native inventory no longer raises "previously discovered session is missing", and it keeps its refusal in `error` and `retiredSessions`. If its identity resolves, the next pass un-retires it and replaces `pid`/`instanceId` with the real values.
+- The command exits 2 when `stillBlocked` is non-empty. Rollback: revert the commit.
+
+### Fix: daily budget hardening (always-on-review.py, #818 follow-up)
+
+- Spend already incurred is now logged (`usage`) when a review's head moves after the model ran and when every pass fails with an unusable answer, so `spent_today_usd` counts it (the billed usage of an unusable later pass is counted too). A logged NaN or infinite cost is counted as zero instead of making the sum NaN (which never tripped the budget). An integer `daily_budget_usd` too large for a float (e.g. `10**400`) is refused as a config error instead of raising `OverflowError`. `reviews.jsonl` is read with `errors="replace"`, so an undecodable byte skips that line instead of crashing a review. Per-PR locking and the whole-log read are unchanged. Rollback: revert the commit.
+
+### Daily budget per tier (always-on-review.py, #792 follow-up)
+
+- New optional YAML key `tiers.<tier>.daily_budget_usd` (positive number; default unset = no limit, behaviour unchanged). Before starting a review the poller sums the `usage.cost_usd` that tier logged in `state_dir/reviews.jsonl` since 00:00 UTC today (partial and dry-run reviews count; other days and the other tier do not). At or over the budget the review is skipped with one log line (`daily budget exhausted`) and the status is left exactly as it was (never success, no new pending); `--force` does not bypass it. Reviews already finished are unaffected. Zero, negative, non-numeric, boolean, NaN and infinite values are refused at config load. Rollback: remove the key and restart the poller.
+
+### Reviewer fixes: bare clones, optional green-only gate, diffs over 20,000 lines (always-on-review.py)
+
+- Fix: the `clone:` check required `<clone>/.git`, so the bare clone the README recommends was refused. It now asks git (`is_git_clone`): a bare or non-bare repository root passes; a missing path, a plain directory, a directory inside another repo or a dangling `.git` is refused.
+- Fix (#790, diffs over GitHub's 20,000-line limit): when `gh pr diff` fails because GitHub refuses the diff as too large (HTTP 406), the always-on reviewer now builds the diff locally in the detached worktree (merge base to the pinned head, the same three-dot diff), so the in-PR file index, evidence checks and prompt work as usual. Any other `gh pr diff` failure still fails the review. This covers the 20,000-line limit only; the separate `github-fleet-automerge` 120 KB per-file limit named in the issue body lives in a service outside this repository and is not changed here.
+- Default change (operator approved): tier 2 no longer waits for green checks; it reviews every non-draft head. New YAML key `gates.wait_for_green` (boolean, default `false`) restores the old gate; `gates.required` is only needed, and only validated as non-empty, when it is `true`. Cost note: Opus now runs on heads whose CI is still pending or red, so expect more reviews. Rollback: `gates: {wait_for_green: true, ...}`; restart the polling service after editing, it reads the config at start.
+
+### Fix: Independent AI review poller waits for a busy single-slot model
+
+- `ai-review.py`: a 429 from the gateway (deepseek and qwen have one slot, so any parallel caller gets 429) used to share the 4-retry budget (about 75 s) with 5xx errors, shorter than one chunk's generation time, so a busy slot failed the review. 429 is now waited out for up to the new `reviewer.busy_wait_s` (default 1800 s of total waiting, each wait capped at 60 s, `Retry-After` honoured) and no longer spends `retries`. When the budget runs out the run fails and posts no success (and no terminal status). Config: `reviewer.busy_wait_s` (>= 0). Rollback: revert the commit. `reviewer.backoff_s` must now be greater than 0, and backoff waits are capped at 60 s.
+
+### Collab: `herdr-eng collab agents list|renew`
+
+- New CLI over the collab operator listener (`HERDR_COLLAB_OPERATOR_URL`, default `http://127.0.0.1:9482`): `collab agents list` shows id, name, harness, status, expires_at and `renewable`; `collab agents renew <agent-id|@name>` renews via `POST /api/v1/collab/agents/{id}/renew` and writes the NEW credential only to `--credential-file` (0600, no overwrite without `--force`, checked before renewing) or to stdout with `--print-credential`; the credential is never logged or in `--json`. After renewing, update the harness config (`claude mcp add` header, `~/.codex/config.toml`, collab-spawn credential file).
+
+### Collab: owner renew of expired agents, sliding window on use
+
+- New `POST /api/v1/collab/agents/{id}/renew` (`CollabService.renew_agent`, dashboard **Renew access** on an expired agent card, shown only when the agent list says `renewable`): the signed-in owner (404 for anyone else, 403 for an agent caller) gets a new credential for the same agent id, device and name, shown once, with expiry now + `remote_credential_ttl`. The old credential dies at once. Refused: revoked (409), helper, fabric-machine, fabric-join and externally bound agents (403; an external agent's `hard_expiry` is never extended). It reuses the `credential_rotated` event with action `agent.renew`, so replay and audit work unchanged; a renewal of an expired agent counts against the agent cap again (429).
+- Room grants have their own expiry and the service drops lapsed ones, so renew also restores access: every room grant of the agent that lapsed is re-granted with the same actions, and every live one that would lapse before the new credential is extended to it (reply field `grants_restored`). Only rooms the owner owns; team-attached and coordinator grants are never overwritten or brought back (attaching a team or designating the agent coordinator replaces a lapsed direct grant for good), and a removed member's lapsed grants and a revoked agent's are forgotten. A restored grant expires with the new credential. After a grant lapsed, removing it answers 404, so the owner cannot veto the restore short of revoking the agent or removing the member. The lapsed actions are rebuilt from the event log on replay.
+- Agents made by `connect_agent` (new `origin: "connect"` on `agent_enrolled`; older ones get their cap at their first slide) now slide: a successful Agent auth moves `expires_at` to now + `remote_credential_ttl` once less than half the window is left (about two `credential_rotated` events with action `agent.slide` per window), best effort (a full log never fails the request), never past an absolute cap of 180 days from creation or the owner's last renew (`AGENT_MAX_LIFE`), never for helper/fabric/external agents and never for an expired or revoked one. Room grants are not slid. A stolen credential in regular use lives until revoked or the cap.
+- `/rooms/{id}/agents` lists each grant's `expires_at`, and `/agents` a `renewable` flag.
+- `deploy/control-plane/rooms-bootstrap.py` renews an expired operator-owned agent in place (`RENEWED agent <handle>`, the credential is dropped unread) instead of removing its grant and connecting a new agent, and treats a listed grant whose `expires_at` has passed (housekeeping lags up to 30s) as absent, re-granting it; foreign-owner handling is unchanged, and a refused renew falls back to creating one.
+
 ### Review prompt v2: rules, checklist, evidence, passes, replay harness (always-on-review.py)
 
 - New YAML keys: `prompt.project_rules` (trusted rules in both tiers' prompt), `prompt.checklist_file` (`deploy/ci-review/review-checklist.yaml`, validated, the reviewer lists the ids it considered in `checked_items`), `prompt.require_evidence` (default true), `tiers.tier2.passes` (the example ships general, tests, security, migrations; unset or `[]` keeps one unfocused review) and `replay.clones`. The claude prompt now tells the reviewer to read callers, tests and migrations before the verdict.

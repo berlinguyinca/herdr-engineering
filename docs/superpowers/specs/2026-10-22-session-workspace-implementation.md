@@ -28,7 +28,7 @@ Public messages, tool activity/output, file diffs and usage are retained through
 
 ## Local operation
 
-Worktree: `/home/wohlgemuth/IdeaProjects/herdr-session-workspace`, branch `feat/session-workspace`.
+Worktree: `/home/user/IdeaProjects/herdr-session-workspace`, branch `feat/session-workspace`.
 
 Deploy the control plane and host feed from the same merged revision so recording status, durability acknowledgements and runtime imports agree. The fleet runtime bundle includes both transcript modules and installs native Codex/Claude/Pi reporting hooks without restarting those agents. No database schema migration or added project dependency is required.
 

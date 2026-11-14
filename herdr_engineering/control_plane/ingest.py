@@ -332,6 +332,8 @@ class IngestService:
         payload = body.get("payload") or {}
         if not isinstance(payload, dict):
             raise ValueError("payload must be a JSON object")
+        if "_envelope" in payload and entity_type != "lineage":   # lineage streams reject '_' keys with a 400 in _prevalidate
+            payload = {k: v for k, v in payload.items() if k != "_envelope"}   # server-owned metadata, never client-set
         source = body.get("source") or "herdr"
         if not isinstance(source, str):
             raise ValueError("invalid source")

@@ -16,6 +16,7 @@ import math
 import re
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from datetime import UTC, datetime
 from typing import Any
@@ -30,6 +31,40 @@ _ID_FIELDS = ("mission_id", "org_id", "project_id", "room_id", "workspace_id",
               "task_id", "agent_id", "correlation_id", "causation_id", "trace_id")
 _SOURCE_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 _MAX_STR = 512
+
+# Agent Operations (docs/specs/2026-11-12-agent-operations-map): additive, optional envelope fields. Absent = unknown.
+AGENT_OPS_PROVENANCE = frozenset({"observed", "derived", "inferred", "unknown"})
+AGENT_OPS_ID_FIELDS = ("host_id", "session_id", "model_id", "parent_session_id", "handoff_id")
+_STATUS_RE = re.compile(r"[a-z][a-z0-9_.-]{0,63}")
+_OPS_EVENT_ID_RE = re.compile(r"[A-Za-z0-9._:~-]{1,128}")    # a cursor / SSE `id:` is built from it: no CR/LF/NUL; `~` is safe (the event id is the cursor's last part)
+_OPS_ID_RE = re.compile(r"[A-Za-z0-9._:@-]{1,160}")
+_OPS_MODEL_RE = re.compile(r"[A-Za-z0-9._:@/+-]{1,160}")       # provider/model ids carry a slash
+LABEL_MAX = 80
+_LABEL_REDACTIONS = (
+    (re.compile(r"(?i)\b(?:authorization:\s*)?bearer\s+\S+"), "[redacted]"),
+    (re.compile(r"(?i)\bauthorization:\s*basic\s+\S+"), "[redacted]"),
+    # long nouns keep [\w-]* around them (db_password, x-api-key); `was` only for the nouns that are never ordinary prose
+    (re.compile(r"(?i)(?<![\w-])[\w-]*(?:password|passwd|secret|api[ _-]?key)[\w-]*+\s*(?:[=:]|->|\bis\b|\bwas\b)\s*\S+"),
+     "[redacted]"),
+    (re.compile(r"(?i)(?<![\w-])[\w-]*token[\w-]*+\s*(?:[=:]|->|\bis\b)\s*\S+"), "[redacted]"),
+    # compound keys (dbpass, passphrase, passcode, userpass, pass_phrase, mypwd): the delimiter is still required
+    (re.compile(r"(?i)(?<![\w-])[\w-]*(?:pass(?:[_-]?phrase|code|wd|word)|pwd)[\w-]*+\s*(?:[=:]|->)\s*\S+"), "[redacted]"),
+    (re.compile(r"(?i)(?<![\w-])[\w-]+(?:(?<!by)(?<!com)pass|pwd)\b\s*(?:[=:]|->)\s*\S+"), "[redacted]"),
+    # short forms are anchored: `tests passed: 42`, `bypass is enabled`, `compass: north` are ordinary text
+    (re.compile(r"(?i)(?<![A-Za-z0-9])pass(?![A-Za-z0-9])\s*(?:[=:]|->|\bis\b)\s*\S+"), "[redacted]"),
+    (re.compile(r"(?i)(?<![A-Za-z0-9])pwd(?![A-Za-z0-9])\s*(?:[=:]|->|\bis\b|\s)\s*\S+"), "[redacted]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]*)?)?"), "[redacted]"),
+    (re.compile(r"\bglpat-[A-Za-z0-9_-]{8,}"), "[redacted]"),
+    (re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[email]"),
+    (re.compile(r"\b(?:sk|pk|ghp|gho|ghs|xox[abp])[-_\u2010-\u2015\u2212][A-Za-z0-9_-]{8,}"), "[redacted]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{12,}\b"), "[redacted]"),
+    (re.compile(r"\b[A-Za-z0-9+/_-]{32,}={0,2}"), "[redacted]"),
+    (re.compile(r"[A-Za-z]:\\\S+"), "[path]"),
+    (re.compile(r"(?<![\w:])(?:~|\.{1,2})?(?:/[^\s/]+)+/?"), "[path]"),
+    # relative: src/app/main.py, a/b/c, docs/readme.md. One separator and no extension (CI/CD, read/write, 3/4,
+    # claude-opus-4/5, auth/session) is ordinary text, not a path.
+    (re.compile(r"(?<![\w:/.-])(?!\d{1,4}/\d{1,2}/\d{1,4}(?![\w./-]))(?:[\w.-]+(?:/[\w.-]+){2,}|[\w-]+(?:\.[\w-]+)*/[\w.-]*\.[A-Za-z0-9]{1,8}\b|[\w.-]+\.[A-Za-z0-9]{1,8}\b(?=/)[/\w.-]*)/?"), "[path]"),
+)
 
 # Entity types whose state is derived by dedicated handlers. Their v2 envelope
 # is stored as an envelope-only row: persisted for idempotency, sequence and
@@ -83,6 +118,43 @@ def _evidence_refs(value: Any) -> list[dict[str, str]] | None:
                 out[optional] = ref[optional]
         refs.append(out)
     return refs
+
+
+def sanitize_label(value: str) -> str:
+    """A short human label with file paths and secret-looking tokens removed (metadata only, never content)."""
+    if not isinstance(value, str):
+        raise ValueError("sanitized_label must be a string")
+    value = value[:_MAX_STR]                             # bound the regex input when called outside the validated path
+    # controls first (zero-width / bidi / format characters would otherwise split a secret past the patterns)
+    value = unicodedata.normalize("NFKC", value)         # fullwidth / compatibility forms fold to their ASCII shape
+    value = "".join(" " if ch.isspace() else "" if unicodedata.category(ch) in ("Cc", "Cf") else ch for ch in value)
+    for pattern, replacement in _LABEL_REDACTIONS:
+        value = pattern.sub(replacement, value)
+    value = " ".join(value.split())
+    return value if len(value) <= LABEL_MAX else value[:LABEL_MAX - 1] + "\u2026"
+
+
+def _agent_ops(body: dict) -> dict | None:
+    """The optional Agent Operations block, or None when the emitter sent none of its fields."""
+    provenance = body.get("provenance")
+    if provenance is not None and (not isinstance(provenance, str) or provenance not in AGENT_OPS_PROVENANCE):
+        raise ValueError("provenance must be one of " + ", ".join(sorted(AGENT_OPS_PROVENANCE)))
+    ops: dict[str, Any] = {name: _opt_str(body, name) for name in AGENT_OPS_ID_FIELDS}
+    if any(v is not None and not (_OPS_MODEL_RE if name == "model_id" else _OPS_ID_RE).fullmatch(v)
+           for name, v in ops.items()):
+        raise ValueError("agent operations ids must match [A-Za-z0-9._:@-]{1,160} (model_id also allows / and +)")
+    status = body.get("status")
+    if status is not None and (not isinstance(status, str) or not _STATUS_RE.fullmatch(status)):
+        raise ValueError("status must be a short lowercase token")
+    ops["status"] = status
+    label = body.get("sanitized_label")
+    if isinstance(label, str) and len(label) > _MAX_STR:  # reject (never truncate) before any normalising or pattern runs
+        raise ValueError(f"sanitized_label must be at most {_MAX_STR} characters")
+    ops["sanitized_label"] = None if label is None else sanitize_label(label)
+    if provenance is None and all(v is None for v in ops.values()):
+        return None
+    ops["provenance"] = provenance or "unknown"
+    return {k: v for k, v in ops.items() if v is not None}
 
 
 def _utc(value: Any, name: str) -> str:
@@ -156,6 +228,14 @@ def normalize_envelope(body: dict, principal: dict | None, received_at: str, *, 
         env[name] = _opt_str(body, name)
     if clamp is not None:
         apply_clamp(env, body, clamp)       # BEFORE the hash: a replay of the same event hashes the same
+    ops = _agent_ops(body)
+    if ops is not None:
+        if not _OPS_EVENT_ID_RE.fullmatch(event_id):
+            raise ValueError("event_id of an agent operations event must match [A-Za-z0-9._:~-]{1,128}")
+        if any(env[n] is not None and not _OPS_ID_RE.fullmatch(env[n]) for n in ("agent_id", "task_id", "room_id")):
+            raise ValueError("agent_id, task_id and room_id of an agent operations event must match "
+                             "[A-Za-z0-9._:@-]{1,160}")
+        env["agent_ops"] = ops
     env["content_hash"] = _content_hash(body, env)
     return env
 
@@ -169,6 +249,7 @@ def _content_hash(body: dict, env: dict) -> str:
         "occurred_at": env["occurred_at"], "visibility_scope": env["visibility_scope"],
         "evidence_refs": env["evidence_refs"],
         **{name: env[name] for name in _ID_FIELDS},
+        **({"agent_ops": env["agent_ops"]} if "agent_ops" in env else {}),
     }
     blob = json.dumps(content, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(blob.encode()).hexdigest()
