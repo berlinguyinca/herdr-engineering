@@ -700,6 +700,7 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
         for host, host_state in plan["hosts"].items():
             target = host_state["target"]
             host_state.pop("error", None)
+            host_state.pop("hostLevelError", None)
             try:
                 if not host_state.get("sourceRoot"):
                     if inventory_targets(Path(plan["inventory"]), host) != [target]:
@@ -774,19 +775,29 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                         {"error": "previously discovered session is missing from native inventory"}
                     )
                 session_errors = [error["error"] for error in coverage_errors]
+                # Host-level reasons (coverage, ambiguity, a missing session) are recorded apart from
+                # per-session ones, so settling a session can never be mistaken for settling them.
+                host_level_errors = list(session_errors)
                 for agent, session_id, identity_proof in identified:
                     state = host_state["sessions"].setdefault(
                         session_id,
                         {"sessionId": session_id, "native": agent, "status": "discovered"},
                     )
-                    state.pop("error", None)
+                    if state.get("status") != "retired":
+                        # A retired session keeps the refusal that justified retiring it.
+                        state.pop("error", None)
+                        state.pop("blockReason", None)
                     if identity_proof is not None:
                         state["identityProof"] = identity_proof
                     try:
                         descriptor, _ = _live(rows, session_id)
-                        if "pid" not in state:
+                        if "pid" not in state or state.get("status") == "retired":
+                            # `_live` only returns a descriptor with a real identity, so for a
+                            # retired husk these replace the stale values.
                             state.update(pid=descriptor["pid"], instanceId=descriptor["instanceId"])
                         if state.get("status") == "retired":
+                            state.pop("error", None)
+                            state.pop("blockReason", None)
                             # The identity resolved after the operator retired the registration,
                             # so the retirement was wrong: pick the session back up and say so.
                             state["unretiredAt"] = datetime.now(UTC).isoformat()
@@ -811,7 +822,11 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                                 }
                             )
                         else:
-                            state.update(status="blocked", error=str(exc)[:500])
+                            state.update(
+                                status="blocked",
+                                error=str(exc)[:500],
+                                blockReason=_BLOCK_IDENTITY_MISSING,
+                            )
                             session_errors.append(str(exc)[:500])
                     except (ValueError, TypeError, KeyError) as exc:
                         state.update(status="blocked", error=str(exc)[:500])
@@ -842,12 +857,18 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                     )
                     else "pending"
                 )
+                if host_level_errors:
+                    host_state["hostLevelError"] = "; ".join(host_level_errors)[:1000]
+                else:
+                    host_state.pop("hostLevelError", None)
                 if session_errors:
                     host_state["error"] = "; ".join(session_errors)[:1000]
             except (ConnectionError, OSError, subprocess.SubprocessError) as exc:
                 host_state.update(status="pending", error=str(exc)[:500])
             except (ValueError, TypeError, KeyError) as exc:
-                host_state.update(status="blocked", error=str(exc)[:500])
+                host_state.update(
+                    status="blocked", error=str(exc)[:500], hostLevelError=str(exc)[:500]
+                )
             finally:
                 save()
         plan["status"] = (
@@ -862,6 +883,9 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
 # The typed refusal names this marker; it is what makes a blocked session settle-able, so the
 # settlement and the refusal must agree on the text rather than each carrying its own copy.
 _IDENTITY_MISSING_MARKER = "no instanceId to act on"
+# Typed reason recorded on the session when the identity refusal is raised, so settling does not
+# depend on a message surviving truncation or being joined into a longer string.
+_BLOCK_IDENTITY_MISSING = "identity_missing"
 
 
 def retire_identityless(store, rollout_id, *, settled_by="operator"):
@@ -886,7 +910,11 @@ def retire_identityless(store, rollout_id, *, settled_by="operator"):
                 # Only the typed refusal is settle-able. A plain "identity missing or ambiguous"
                 # may be a genuine disagreement between two live registrations, which is never a
                 # stale husk and must stay blocked.
-                identity_missing = _IDENTITY_MISSING_MARKER in error
+                # Plans written before blockReason existed fall back to the refusal text.
+                identity_missing = (
+                    state.get("blockReason") == _BLOCK_IDENTITY_MISSING
+                    or _IDENTITY_MISSING_MARKER in error
+                )
                 if state.get("status") != "blocked" or not identity_missing:
                     if state.get("status") == "blocked":
                         still_blocked.append(f"{host}/{session_id}")
@@ -917,27 +945,28 @@ def retire_identityless(store, rollout_id, *, settled_by="operator"):
                 for s in sessions.values()
                 if s.get("status") == "retired"
             ]
-            # A host error is not necessarily about sessions. Unverified native coverage, an
-            # ambiguous native conversation identity or a missing discovered session are reasons
-            # apply_rollout keeps the gate closed even when every session is complete, so only the
-            # identity refusal this command actually settled may be dropped (#798 review).
-            host_error = str(host_state.get("error") or "")
-            residual = host_error if host_error and _IDENTITY_MISSING_MARKER not in host_error else None
-            if residual is None and any(entry["host"] == host for entry in retired):
-                host_state.pop("error", None)
-            host_state["status"] = (
-                "blocked"
-                if blocking or residual
-                else "complete"
-                if sessions
-                and all(s.get("status") in ("complete", "retired") for s in sessions.values())
-                else "pending"
-            )
+            # Only hosts this command actually settled something on are recomputed. Their
+            # host-level reasons (unverified native coverage, ambiguous native identity, a
+            # missing discovered session) were recorded separately by apply_rollout and are never
+            # this command's to clear (#798 review).
+            if any(entry["host"] == host for entry in retired):
+                host_level = str(host_state.get("hostLevelError") or "")
+                if host_level:
+                    host_state["error"] = host_level
+                else:
+                    host_state.pop("error", None)
+                host_state["status"] = (
+                    "blocked"
+                    if blocking or host_level
+                    else "complete"
+                    if sessions
+                    and all(s.get("status") in ("complete", "retired") for s in sessions.values())
+                    else "pending"
+                )
         plan["status"] = (
             "complete"
-            if plan.get("hosts") and all(
-                h.get("status") == "complete" for h in plan["hosts"].values()
-            )
+            if plan.get("hosts")
+            and all(h.get("status") == "complete" for h in plan["hosts"].values())
             else "pending"
         )
         store.write(plan)

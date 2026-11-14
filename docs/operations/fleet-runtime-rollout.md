@@ -182,6 +182,12 @@ in every later report, and appear in `coverageErrors` while the husk is still pr
 identity ever resolves, the next pass picks the session back up and stamps `unretiredAt` — a
 wrong retirement is corrected rather than carried forever.
 
+Retirement settles only the identity refusal. A host blocked for a host-level reason
+(unverified native coverage, ambiguous native identity, a missing discovered session) stays
+blocked with that reason in `error`/`coverageErrors` and keeps the plan from completing. A retired
+session is terminal for the runner and keeps its refusal in `error`; it vanishing from the native
+inventory is not a blocker. The command exits 2 while `stillBlocked` is non-empty.
+
 ## Validation coverage
 
 `tests/test_fleet_rollout.py` exercises real durable state and the production JSON

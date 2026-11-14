@@ -1414,7 +1414,10 @@ def test_ambiguous_identity_is_never_retired(tmp_path):
 
     settled = retire_identityless(store, plan["id"])
     assert settled["retired"] == []
-    assert sorted(settled["stillBlocked"]) == ["beast/beast-conversation", "bender/bender-conversation"]
+    assert sorted(settled["stillBlocked"]) == [
+        "beast/beast-conversation",
+        "bender/bender-conversation",
+    ]
     after = store.read(plan["id"])
     assert after["hosts"]["beast"]["status"] == "blocked"
     assert after["status"] != "complete"
@@ -1436,7 +1439,9 @@ def test_retired_registration_is_picked_back_up_when_its_identity_resolves(tmp_p
     result = apply(store, plan, wire)
     session = result["hosts"]["beast"]["sessions"]["beast-conversation"]
     assert session["unretiredAt"], "the wrong retirement is recorded, not silently forgotten"
-    assert session["status"] == "awaiting_progress", "it rejoined the rollout instead of staying retired"
+    assert session["status"] == "awaiting_progress", (
+        "it rejoined the rollout instead of staying retired"
+    )
     assert session["instanceId"] == "beast-instance-new", "it was really driven through reload"
     assert result["hosts"]["beast"]["retiredSessions"] == []
     assert result["hosts"]["beast"]["status"] != "blocked"
@@ -1516,12 +1521,133 @@ def test_retiring_does_not_erase_a_host_level_blocker(tmp_path):
     assert after["status"] != "complete"
 
 
-# Finding 3 of the #798 review (a retired husk vanishing from the native inventory must not
-# become a permanent "previously discovered session is missing" blocker) is fixed by excluding
-# retired session ids from that coverage diff. There is no test for it here: the rollout test
-# transport cannot express "one identity-less row disappears while another valid session stays"
-# without fabricating a row whose identity proof then fails for unrelated reasons. Tracked as an
-# untested-but-reviewed change rather than dressed up as a passing regression test.
+class HuskWire(Wire):
+    """beast runs its real session plus a stale identity-less husk that may later vanish."""
+
+    def __init__(self):
+        super().__init__()
+        self.offline.clear()
+        self.husk_present = True
+        self.husk_instance = None
+        self.husk_pid = 43
+        self.unverifiable_pane = False
+
+    def native(self, target):
+        rows = super().native(target)
+        if target["host"] == "beast" and self.husk_present:
+            rows.append(
+                {
+                    "agent": "pi",
+                    "terminal_id": "terminal-husk",
+                    "agent_session": {"value": "husk-conversation"},
+                    "session": "main",
+                }
+            )
+        if target["host"] == "beast" and self.unverifiable_pane:
+            rows.append({"agent": "pi", "terminal_id": "terminal-2", "session": "main"})
+        return rows
+
+    def sessions(self, target, root):
+        rows = super().sessions(target, root)
+        if target["host"] == "beast" and self.husk_present:
+            rows.append(
+                {
+                    "descriptor": {
+                        "instanceId": self.husk_instance,
+                        "sessionId": "husk-conversation",
+                        "pid": self.husk_pid,
+                    },
+                    "reachable": True,
+                    "reply": {"ok": True, "data": {"runtime": {}, "missions": []}},
+                }
+            )
+        return rows
+
+
+def test_a_retired_husk_leaving_the_native_inventory_does_not_block_the_host(tmp_path):
+    """#798 finding 3: retirement is terminal, so the husk disappearing is the settled end state."""
+    from herdr_engineering.fleet_rollout import retire_identityless
+
+    store, plan = setup_rollout(tmp_path)
+    wire = HuskWire()
+    first = apply(store, plan, wire)
+    assert first["hosts"]["beast"]["sessions"]["husk-conversation"]["status"] == "blocked"
+    settled = retire_identityless(store, plan["id"])
+    assert [e["sessionId"] for e in settled["retired"]] == ["husk-conversation"]
+
+    wire.husk_present = False
+    after = apply(store, plan, wire)
+    beast = after["hosts"]["beast"]
+    assert beast["sessions"]["husk-conversation"]["status"] == "retired"
+    assert beast["status"] != "blocked", beast.get("error")
+    assert "error" not in beast
+    assert not any("missing from native inventory" in e["error"] for e in beast["coverageErrors"])
+
+
+def test_retired_session_keeps_its_error_in_the_report(tmp_path):
+    """#798 review: the evidence (the refusal) survives later passes, still present or not."""
+    from herdr_engineering.fleet_rollout import retire_identityless
+
+    store, plan = setup_rollout(tmp_path)
+    wire = HuskWire()
+    apply(store, plan, wire)
+    retire_identityless(store, plan["id"])
+    beast = apply(store, plan, wire)["hosts"]["beast"]
+    assert "no instanceId to act on" in beast["sessions"]["husk-conversation"]["error"]
+    assert "no instanceId to act on" in beast["retiredSessions"][0]["error"]
+
+
+def test_identityless_session_plus_coverage_error_stays_blocked(tmp_path):
+    """#798 review: a joined error string must not let one marker erase a real coverage error."""
+    from herdr_engineering.fleet_rollout import retire_identityless
+
+    store, plan = setup_rollout(tmp_path)
+    wire = HuskWire()
+    wire.unverifiable_pane = True
+    first = apply(store, plan, wire)
+    assert first["hosts"]["beast"]["coverageErrors"]
+
+    settled = retire_identityless(store, plan["id"])
+    assert [e["sessionId"] for e in settled["retired"]] == ["husk-conversation"]
+    after = store.read(plan["id"])
+    beast = after["hosts"]["beast"]
+    assert beast["status"] == "blocked"
+    assert "unverified" in beast["error"]
+    assert beast["coverageErrors"]
+    assert after["status"] != "complete"
+
+
+def test_unretire_refills_pid_and_instance_with_the_real_values(tmp_path):
+    from herdr_engineering.fleet_rollout import retire_identityless
+
+    store, plan = setup_rollout(tmp_path)
+    wire = HuskWire()
+    apply(store, plan, wire)
+    retire_identityless(store, plan["id"])
+
+    wire.husk_instance, wire.husk_pid = "real-instance", 77
+    result = apply(store, plan, wire)
+    state = result["hosts"]["beast"]["sessions"]["husk-conversation"]
+    assert state["unretiredAt"]
+    assert state["pid"] == 77
+    assert state["instanceId"].startswith("real-instance")
+    assert not state.get("error")
+
+
+def test_retire_identityless_exits_non_zero_while_sessions_remain_blocked(tmp_path):
+    from herdr_engineering.cli import _build_parser, _cmd_fleet_rollout
+
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    discover = wire.sessions
+    wire.sessions = lambda target, root: list(discover(target, root)) * 2
+    apply(store, plan, wire)  # ambiguous identity: blocked, never settle-able
+
+    args = _build_parser().parse_args(
+        ["fleet", "rollout", "retire-identityless", "--id", plan["id"], "--state", str(store.root)]
+    )
+    assert _cmd_fleet_rollout(args) == 2
 
 
 def test_retire_identityless_is_a_supported_command():

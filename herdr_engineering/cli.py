@@ -1912,6 +1912,8 @@ def _cmd_fleet_rollout(args) -> int:
     _print_json(report)
     if report.get("runner", {}).get("status") == "interrupted" and args.rollout_command == "run":
         return 130
+    if args.rollout_command == "retire-identityless" and report.get("stillBlocked"):
+        return 2
     return 0 if args.rollout_command not in ("apply", "run") or report["status"] == "complete" else 2
 
 
