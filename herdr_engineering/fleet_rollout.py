@@ -762,7 +762,14 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                     raise ValueError("ambiguous native conversation identity")
                 if not agents:
                     raise ValueError("no native Pi sessions; expected coverage unverified")
-                if set(host_state["sessions"]) - set(identities):
+                # A retired husk is expected to leave the native inventory; its absence is the
+                # settled end state, not a fresh blocker no later pass could ever clear (#798 review).
+                retired_ids = {
+                    session_id
+                    for session_id, state in host_state["sessions"].items()
+                    if state.get("status") == "retired"
+                }
+                if set(host_state["sessions"]) - set(identities) - retired_ids:
                     coverage_errors.append(
                         {"error": "previously discovered session is missing from native inventory"}
                     )
@@ -852,6 +859,11 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
         return plan
 
 
+# The typed refusal names this marker; it is what makes a blocked session settle-able, so the
+# settlement and the refusal must agree on the text rather than each carrying its own copy.
+_IDENTITY_MISSING_MARKER = "no instanceId to act on"
+
+
 def retire_identityless(store, rollout_id, *, settled_by="operator"):
     """Settle registrations a rollout can never act on, keeping the evidence in the report (#779).
 
@@ -874,7 +886,7 @@ def retire_identityless(store, rollout_id, *, settled_by="operator"):
                 # Only the typed refusal is settle-able. A plain "identity missing or ambiguous"
                 # may be a genuine disagreement between two live registrations, which is never a
                 # stale husk and must stay blocked.
-                identity_missing = "no instanceId to act on" in error
+                identity_missing = _IDENTITY_MISSING_MARKER in error
                 if state.get("status") != "blocked" or not identity_missing:
                     if state.get("status") == "blocked":
                         still_blocked.append(f"{host}/{session_id}")
@@ -905,17 +917,22 @@ def retire_identityless(store, rollout_id, *, settled_by="operator"):
                 for s in sessions.values()
                 if s.get("status") == "retired"
             ]
+            # A host error is not necessarily about sessions. Unverified native coverage, an
+            # ambiguous native conversation identity or a missing discovered session are reasons
+            # apply_rollout keeps the gate closed even when every session is complete, so only the
+            # identity refusal this command actually settled may be dropped (#798 review).
+            host_error = str(host_state.get("error") or "")
+            residual = host_error if host_error and _IDENTITY_MISSING_MARKER not in host_error else None
+            if residual is None and any(entry["host"] == host for entry in retired):
+                host_state.pop("error", None)
             host_state["status"] = (
                 "blocked"
-                if blocking
+                if blocking or residual
                 else "complete"
-                if sessions and all(
-                    s.get("status") in ("complete", "retired") for s in sessions.values()
-                )
+                if sessions
+                and all(s.get("status") in ("complete", "retired") for s in sessions.values())
                 else "pending"
             )
-            if not blocking:
-                host_state.pop("error", None)
         plan["status"] = (
             "complete"
             if plan.get("hosts") and all(
@@ -967,6 +984,9 @@ def _automatic_blocker(plan):
         if host_state.get("error") and not _offline_failure(host_state):
             return f"{host}: {host_state['error']}"
         for session_id, session in host_state["sessions"].items():
+            if session["status"] == "retired":
+                # Settled by the operator: terminal for the runner, evidence kept in the report.
+                continue
             if session["status"] not in ("complete", "pending", "awaiting_progress", "discovered"):
                 return f"{host}/{session_id}: {session['status']}: {session.get('error', 'operator attention required')}"
             if session.get("error") and not _offline_failure(session):
@@ -1008,7 +1028,7 @@ def _online_stall_budget(plan, previous, limit):
             continue
         for session_id, session in host_state["sessions"].items():
             key = host + "/" + session_id
-            if session["status"] == "complete":
+            if session["status"] in ("complete", "retired"):
                 budgets.pop(key, None)
                 continue
             if _offline_failure(session):

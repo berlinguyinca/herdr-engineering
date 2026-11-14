@@ -1444,6 +1444,86 @@ def test_retired_registration_is_picked_back_up_when_its_identity_resolves(tmp_p
     # predates this reload, so completion belongs to the completion tests, not to this one.
 
 
+def test_a_retired_session_does_not_stop_later_runner_passes(tmp_path):
+    """#798 review: retirement must be terminal for the runner, not only in the report.
+
+    `run --max-passes 3` is the documented step right after settling a husk. If a retired
+    session still reads as a blocker, the runner stops at the very thing the operator settled.
+    """
+    from herdr_engineering.fleet_rollout import retire_identityless
+
+    store, plan = setup_rollout(tmp_path)
+    wire, clock = Wire(), RunClock()
+    wire.offline.clear()
+    wire.rows["beast"]["descriptor"]["instanceId"] = None
+    apply(store, plan, wire)
+    retire_identityless(store, plan["id"])
+
+    result = run_with_wire(store, plan, wire, clock, max_passes=3)
+    assert result["runner"]["status"] == "max_passes"
+    assert result["runner"]["passes"] == 3
+    assert result["hosts"]["beast"]["sessions"]["beast-conversation"]["status"] == "retired"
+
+
+def test_retired_sessions_do_not_consume_the_online_stall_budget(tmp_path):
+    """Nothing online is left to wait for, so the run must not be called stalled."""
+    from herdr_engineering.fleet_rollout import retire_identityless
+
+    store, plan = setup_rollout(tmp_path)
+    wire, clock = Wire(), RunClock()
+    wire.offline.clear()
+    wire.rows["beast"]["descriptor"]["instanceId"] = None
+    apply(store, plan, wire)
+    retire_identityless(store, plan["id"])
+
+    wire.progress = True  # every live session has reached the target revision
+    result = run_with_wire(store, plan, wire, clock, max_passes=10)
+    assert result["runner"]["status"] != "stalled"
+    assert result["status"] == "complete"
+
+
+def test_retiring_does_not_erase_a_host_level_blocker(tmp_path):
+    """A host blocked for a host-level reason is not this command's to unblock.
+
+    Unverified native coverage, an ambiguous native conversation identity or a missing
+    discovered session are reasons `apply_rollout` keeps the gate closed even when every
+    session is complete. Retirement may not flip such a host to complete, and it must not
+    touch hosts that had no identity-less registration at all.
+    """
+    from herdr_engineering.fleet_rollout import retire_identityless
+
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.rows["beast"]["descriptor"]["instanceId"] = None
+    apply(store, plan, wire)
+
+    state = store.read(plan["id"])
+    host_error = "no native Pi sessions; expected coverage unverified"
+    state["hosts"]["bender"]["error"] = host_error
+    state["hosts"]["bender"]["status"] = "blocked"
+    for session in state["hosts"]["bender"]["sessions"].values():
+        session["status"] = "complete"
+    state["status"] = "pending"
+    store.write(state)
+
+    settled = retire_identityless(store, plan["id"])
+    assert [entry["host"] for entry in settled["retired"]] == ["beast"]
+
+    after = store.read(plan["id"])
+    assert after["hosts"]["bender"]["error"] == host_error
+    assert after["hosts"]["bender"]["status"] == "blocked"
+    assert after["status"] != "complete"
+
+
+# Finding 3 of the #798 review (a retired husk vanishing from the native inventory must not
+# become a permanent "previously discovered session is missing" blocker) is fixed by excluding
+# retired session ids from that coverage diff. There is no test for it here: the rollout test
+# transport cannot express "one identity-less row disappears while another valid session stays"
+# without fabricating a row whose identity proof then fails for unrelated reasons. Tracked as an
+# untested-but-reviewed change rather than dressed up as a passing regression test.
+
+
 def test_retire_identityless_is_a_supported_command():
     """#779 asked for a supported path; a documented flag nobody can type is not one."""
     from herdr_engineering.cli import _build_parser
