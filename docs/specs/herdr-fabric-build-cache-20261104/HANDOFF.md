@@ -1,4 +1,9 @@
 # HANDOFF (rolling; newest section first)
+## Update 2026-11-09: scheduled build-cache report sender (branch feat/build-cache-report-sender, not pushed, not deployed)
+
+`herdr-eng build-cache-report [--once|--loop] [--json]` wraps `report_builds`. YAML only: `fabric_build_cache.report {enabled: false, url, key_file, interval_s: 60, host_id}`; key from `key_file` (0600) only; exit 2 when disabled, non-https (loopback http allowed), or the key file is missing/empty/loose; exit 1 on a transport or server refusal; `--loop` survives both. Units, all opt-in and enabled by nothing: `scripts/herdr-eng-build-cache-report.service`, `scripts/com.herdr-engineering.build-cache-report.plist`. Install steps: `docs/build-cache-deployment.md`. Tests: `tests/test_build_cache_report_cli.py` (real ControlPlaneServer, no mocks).
+Still open: no host has this enabled, the control plane's `build_cache.ingest` is still off, no ingest-role key or key file exists on any host, the units were not run under a real systemd or launchd, and a real second host has not reported.
+
 ## Update 2026-11-05: backend follow-ups (branch feat/build-cache-backend-followups, not pushed, not deployed)
 
 Four commits: 96a5b8aa reconcile wiring, 52595948 contract events, 1ef7b6c0 SSE resume, 7058dac6 ingest.
@@ -8,7 +13,7 @@ Four commits: 96a5b8aa reconcile wiring, 52595948 contract events, 1ef7b6c0 SSE 
 - Ingest: YAML `control_plane.build_cache.ingest {enabled: false, max_hosts: 64, per_host_builds: 200}`. `POST /api/v1/host/build-cache/report` (ingest-role key, `host_id` checked by `_host_key_allowed`, allowlisted non-secret fields, host forced to the authenticated id, 429 when max_hosts is hit). Merged into the existing GET builds/hosts/status with the host filter. Sender: `herdr_engineering/build_cache_report.py` (`report_builds`).
 - Migration decision: NO migration 0046. Reports are a re-sendable recent window, so in-memory storage loses nothing durable; add a table only if history must survive restarts.
 - Tests: tests/test_build_*.py, tests/control_plane/test_build_cache_api.py, tests/test_fabric_agent.py (see final report for counts).
-- Not done: scheduled sender, real second host, deploy.
+- Not done: real second host, deploy. (The scheduled sender was added afterwards, see the 2026-11-09 update.)
 
 ## Update 2026-11-05: UI and typecheck follow-ups (branch feat/build-cache-ui-followups, not pushed)
 
@@ -167,7 +172,7 @@ Next: 03-local.
 ## Spec 01 measure -- DONE (code complete; Bender baseline NOT run)
 Completed: opt-in `build-coordinate --record` (fork + wait4, locks held for child life, SIGINT/SIGTERM forwarded to child only, exit code exact, signal -> 128+sig); `build_metrics.py` (typed `build_started`/`build_finished`, cmd_kind allowlist, argv/env never recorded, sccache delta, `/proc` IO sampling, diskstats delta, `unavailable` list, rotation at 5 MiB, `summarize()`); `--status` now also shows a recorded-build summary; `scripts/build_bench.py` (cold only inside its own `--copy` temp dir); slots doc/help drift fixed (min(4, cores-4), floor 2).
 Not done: the exit criterion "repeatable Bender cold/warm baseline" (no ssh/run against real projects by design; run `scripts/build_bench.py` on Bender next); cleanup-path instrumentation (build_maintenance untouched); `build-gate.ts` fleet fingerprint untouched (still may state old slot text); no type-checker is configured in pyproject/CI for Python, so none was run; `ruff format` not applied (repo files are not ruff-formatted); pre-existing ruff I001 in cli.py:1067 left alone.
-Risks: `sccache --show-stats` can start a sccache server; `proc_io_write_bytes` is logical and a lower bound (short-lived processes missed); disk delta is device/host wide and includes other activity; fake `sccache` used only in the parser-contract test; existing tests hard-code `/home/wohlgemuth/IdeaProjects/herdr-engineering` on sys.path (they pass, but may import the other checkout in 2 subprocess tests).
+Risks: `sccache --show-stats` can start a sccache server; `proc_io_write_bytes` is logical and a lower bound (short-lived processes missed); disk delta is device/host wide and includes other activity; fake `sccache` used only in the parser-contract test; existing tests hard-code `/home/user/IdeaProjects/herdr-engineering` on sys.path (they pass, but may import the other checkout in 2 subprocess tests).
 Files: herdr_engineering/build_metrics.py (new), herdr_engineering/build_coord.py, herdr_engineering/cli.py, scripts/build_bench.py (new), tests/test_build_metrics.py (new), docs/build-gate.md, this file.
 Tests: `python3 -m pytest tests/test_build_coord.py tests/test_build_metrics.py tests/test_build_cleanup.py tests/test_build_maintenance.py tests/test_cleanup_deploy.py -q -p no:cacheprovider` -> 94 passed (63 baseline + 31 new), exit 0. `ruff check` on new files clean.
 Next: 02-config.

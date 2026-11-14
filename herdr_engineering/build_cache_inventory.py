@@ -144,8 +144,12 @@ def collect(config: BuildCacheConfig, *, path_env: str | None = None,
     """Probe this host. ``None`` (and nothing touched) unless the section is enabled."""
     if not config.enabled:
         return None
+    from .build_cache_location import select_storage
     from .build_coord import _default_state_dir
-    cache_dir = (state_dir or _default_state_dir()) / "sccache"
+    default = (state_dir or _default_state_dir()) / "sccache"
+    selected = select_storage(config.local.storage_tiers, default,
+                              config.local.min_free_disk_percent)
+    cache_dir = selected.directory or default
     return build_capability(config, host_id=socket.gethostname(),
                             tools=detect_tools(path_env if path_env is not None
                                                else os.environ.get("PATH", "")),

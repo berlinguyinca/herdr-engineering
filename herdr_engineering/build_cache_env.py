@@ -54,6 +54,7 @@ class Reason(StrEnum):
     WORKSPACE_INVALID = "workspace_invalid"
     USER_WRAPPER_PRESENT = "user_wrapper_present"
     LOW_FREE_DISK = "low_free_disk"
+    NO_STORAGE = "no_storage_tier_available"
 
 
 @dataclass(frozen=True)
@@ -200,15 +201,20 @@ def _config_sets_wrapper(workspace: Path, base_env: Mapping[str, str]) -> bool:
             build = tomllib.loads(f.read_text()).get("build", {})
         except (OSError, ValueError):
             continue
-        if isinstance(build, dict) and (build.get("rustc-wrapper")
-                                        or build.get("rustc-workspace-wrapper")):
-            return True
+        if isinstance(build, dict):
+            if build.get("rustc-workspace-wrapper"):
+                return True
+            wrapper = build.get("rustc-wrapper")
+            if wrapper:
+                from .cargo_host import is_managed_wrapper
+                if not is_managed_wrapper(str(wrapper), Path(home).parent):
+                    return True
     return False
 
 
 def plan(config: BuildCacheConfig, cmd: list[str], base_env: Mapping[str, str],
          tools: Tools, workspace: Path, state_dir: Path,
-         shared_reachable: bool | None = None) -> EnvPlan:
+         shared_reachable: bool | None = None, *, cache_dir: Path | None = None) -> EnvPlan:
     """Decide the cache environment for one command. No writes, no network.
 
     It may READ the registry and credentials files when the shared level is
@@ -235,7 +241,9 @@ def plan(config: BuildCacheConfig, cmd: list[str], base_env: Mapping[str, str],
         return _no(Reason.WORKSPACE_INVALID)
 
     lo = config.local
-    cache_dir = state_dir / "sccache"
+    if config.local.storage_tiers and cache_dir is None:
+        return _no(Reason.NO_STORAGE)
+    cache_dir = cache_dir if cache_dir is not None else state_dir / "sccache"
     free = _free_percent(cache_dir)
     if free is not None and free < lo.min_free_disk_percent:
         return EnvPlan(False, {}, [Reason.LOW_FREE_DISK.value], [], fp)

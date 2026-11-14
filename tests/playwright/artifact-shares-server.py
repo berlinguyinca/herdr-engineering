@@ -284,7 +284,7 @@ class ArtifactFixture:
                   "evidence_checked": {"status": "not_checked"}, "reviewed": {"status": "not_checked"}}
         return {"artifact_id": artifact_id, "version_id": version_id, "report_descriptor": version["report_descriptor"],
                 "checks": checks, "state": "rendered", "feedback": [], "feedback_count": 0,
-                "feedback_has_more": False, "assets": [],
+                "feedback_has_more": False, "assets": version["report_descriptor"].get("assets", []),
                 "preview_url": f"/api/v1/artifacts/{artifact_id}/versions/{version_id}/preview"}
 
     async def list_report_feedback(self, artifact_id, version_id, *, limit=10, offset=0):

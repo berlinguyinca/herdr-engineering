@@ -40,6 +40,12 @@ from typing import Any
 SCHEMA_VERSION = 1
 DB_NAME = "build-registry.db"
 BUSY_TIMEOUT_MS = 5000
+# Registry open used to take a write transaction unconditionally, so a storm of simultaneous builds
+# serialised on it and one could lose the 5 s busy_timeout (#746). Bounded backoff keeps a transient
+# lock transient instead of letting it drop a build from the registry.
+INIT_RETRIES = 6
+INIT_BACKOFF_S = 0.02
+INIT_BACKOFF_MAX_S = 0.4
 RETENTION_S = 30 * 24 * 3600
 MAX_BUILDS = 5000
 JOIN_TTL_S = 600.0
@@ -236,6 +242,12 @@ def db_path(state_dir: str | os.PathLike[str]) -> Path:
     return Path(state_dir) / DB_NAME
 
 
+def _busy(exc: BaseException) -> bool:
+    """True for the SQLite 'somebody else holds the lock' family, which is worth retrying."""
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
 def _connect(path: Path, create: bool) -> sqlite3.Connection:
     if create:
         fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -260,15 +272,46 @@ class Registry:
         try:
             Path(state_dir).mkdir(parents=True, exist_ok=True)
             warn_if_network_fs(state_dir)
-            conn = _connect(self.path, create=True)
-            try:
-                self._init(conn)
-            finally:
-                conn.close()
-        except RegistryError:
-            raise
-        except (OSError, sqlite3.Error) as exc:
+        except OSError as exc:
             raise RegistryError(f"cannot initialise registry: {exc}") from exc
+        delay = INIT_BACKOFF_S
+        for attempt in range(INIT_RETRIES):
+            try:
+                conn = _connect(self.path, create=True)
+                try:
+                    if not self._current(conn):
+                        self._init(conn)
+                finally:
+                    conn.close()
+                break
+            except sqlite3.OperationalError as exc:
+                # The failure #746 measured: under a 20-way storm one open exhausted busy_timeout,
+                # `BuildRun.open` swallowed the error, and the build ran unrecorded. Retrying here
+                # turns that into a slow open instead of a missing row.
+                if not _busy(exc) or attempt == INIT_RETRIES - 1:
+                    raise RegistryError(f"cannot initialise registry: {exc}") from exc
+                time.sleep(delay)
+                delay = min(delay * 2, INIT_BACKOFF_MAX_S)
+            except (OSError, sqlite3.Error) as exc:
+                raise RegistryError(f"cannot initialise registry: {exc}") from exc
+        self._prune_if_needed()
+
+    def _current(self, conn: sqlite3.Connection) -> bool:
+        """True when the schema is present and current, so this open needs no write lock.
+
+        Every open used to run `BEGIN IMMEDIATE`, eleven `CREATE ... IF NOT EXISTS`, and the prune,
+        which made every open in the process a writer and turned concurrent opens into a queue on one
+        write lock. An already-initialised registry - the overwhelmingly common case - is read-only.
+        """
+        try:
+            row = conn.execute("SELECT version FROM schema_version").fetchone()
+        except sqlite3.Error:
+            return False          # nothing there yet; the slow path creates it
+        if row is None:
+            return False
+        if row[0] > SCHEMA_VERSION:
+            raise RegistryError(f"registry schema {row[0]} is newer than {SCHEMA_VERSION}")
+        return row[0] == SCHEMA_VERSION
 
     # -- plumbing
     def _init(self, conn: sqlite3.Connection) -> None:
@@ -283,7 +326,6 @@ class Registry:
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
             elif row[0] > SCHEMA_VERSION:
                 raise RegistryError(f"registry schema {row[0]} is newer than {SCHEMA_VERSION}")
-            self._prune(conn)
             conn.execute("COMMIT")
         except BaseException:
             try:
@@ -291,6 +333,57 @@ class Registry:
             except sqlite3.Error:
                 pass
             raise
+
+    def _prune_if_needed(self) -> None:
+        """Retention and the row cap, applied only when there is something to apply them to.
+
+        Both used to run inside the init write transaction, so every open in the process was a writer
+        and concurrent opens queued behind one another - the contention #746 measured. Whether work
+        exists is a cheap read against a table already capped at MAX_BUILDS rows; only the DELETEs
+        need the lock, and in steady state there is nothing to delete. So the common open stays
+        write-free while both guarantees keep their exact previous strength.
+        """
+        if not self._prune_pending():
+            return
+        try:
+            conn = _connect(self.path, create=False)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._prune(conn)
+                    conn.execute("COMMIT")
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+            finally:
+                conn.close()
+        except (RegistryError, OSError, sqlite3.Error):
+            return          # housekeeping must never fail an open; the next open retries
+
+    def _prune_pending(self) -> bool:
+        """Read-only: would `_prune` delete anything? Unsure means yes - the real prune is idempotent."""
+        cutoff = self._now() - RETENTION_S
+        marks = ",".join("?" for _ in TERMINAL)
+        term = tuple(sorted(TERMINAL))
+        try:
+            conn = _connect(self.path, create=False)
+            try:
+                if conn.execute(f"SELECT 1 FROM builds WHERE state IN ({marks}) AND updated_ts < ?"
+                                " LIMIT 1", (*term, cutoff)).fetchone():
+                    return True
+                (count,) = conn.execute("SELECT COUNT(*) FROM builds").fetchone()
+                if count > MAX_BUILDS:
+                    return True
+                return conn.execute(
+                    "SELECT 1 FROM leases WHERE released_ts IS NOT NULL AND released_ts < ? LIMIT 1",
+                    (cutoff,)).fetchone() is not None
+            finally:
+                conn.close()
+        except (RegistryError, OSError, sqlite3.Error):
+            return True
 
     def _prune(self, conn: sqlite3.Connection) -> None:
         cutoff = self._now() - RETENTION_S
@@ -673,6 +766,7 @@ class BuildRun:
         self.reg: Registration | None = None
         self.lease: Lease | None = None
         self.unavailable = False
+        self.unavailable_reason: str | None = None
         self.joined_unleased = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -707,12 +801,20 @@ class BuildRun:
                 run.lease = run.registry.acquire_lease(cwd, aid, run._ttl)
             except LeaseHeld:
                 run.joined_unleased = True  # another owner is active; run unfenced
-        except Exception:  # noqa: BLE001 - registry failure must never fail a build
-            run._fail()
+        except Exception as exc:  # noqa: BLE001 - registry failure must never fail a build
+            run._fail(exc)
         return run
 
-    def _fail(self) -> None:
+    def _fail(self, exc: BaseException | None = None) -> None:
+        """Mark the run unrecorded, keeping *why*.
+
+        The policy is right - a registry problem must not fail a user's build - but a bare boolean
+        meant `build_finished` could say ``registry_unavailable`` with no cause attached, so "database
+        is locked" and "schema too new" were indistinguishable after the fact (#746).
+        """
         self.unavailable = True
+        if exc is not None and self.unavailable_reason is None:
+            self.unavailable_reason = f"{type(exc).__name__}: {exc}"
 
     def ids(self) -> dict[str, Any]:
         if self.reg is None:
@@ -733,8 +835,8 @@ class BuildRun:
             self.registry.record_pid(self.reg.attempt_id, child_pid, lease=self.lease)
             self.registry.transition(self.reg.attempt_id, "running", "child_started",
                                      lease=self.lease)
-        except Exception:  # noqa: BLE001
-            self._fail()
+        except Exception as exc:  # noqa: BLE001
+            self._fail(exc)
             return
         self._thread = threading.Thread(target=self._beat, args=(child_pid,), daemon=True)
         self._thread.start()
@@ -762,8 +864,8 @@ class BuildRun:
                     os.kill(child_pid, signal.SIGTERM)  # our own child only
             except FencedError:
                 return  # taken over / released: stop heartbeating, keep the build running
-            except Exception:  # noqa: BLE001
-                self._fail()
+            except Exception as exc:  # noqa: BLE001
+                self._fail(exc)
 
     def on_exit(self, exit_code: int | None, *, signaled: bool = False,
                 spawn_failed: bool = False) -> None:
@@ -781,5 +883,5 @@ class BuildRun:
         try:
             self.registry.finish(self.reg.attempt_id, state, reason,
                                  exit_code=exit_code, lease=self.lease)
-        except Exception:  # noqa: BLE001
-            self._fail()
+        except Exception as exc:  # noqa: BLE001
+            self._fail(exc)

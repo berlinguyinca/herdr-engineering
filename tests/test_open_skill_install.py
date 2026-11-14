@@ -194,3 +194,13 @@ def test_activation_block_tells_agents_to_offer_links_too(tmp_path):
     text = (home / ".claude" / "CLAUDE.md").read_text()
     assert "`--url`" in text and "links" in text
     assert "Never automatically offer Markdown" in text
+
+
+def test_activation_block_uses_home_relative_paths_so_it_is_identical_on_every_host(tmp_path):
+    source = make_source(tmp_path)
+    home = tmp_path / "operator home"
+    assert run_install(home, source, "--activate").returncode == 0
+    text = (home / ".claude/CLAUDE.md").read_text()
+    assert '"~/.claude/skills/herdr-open/SKILL.md"' in text
+    assert '"~/.claude/skills/herdr-open/scripts/open-client.py"' in text
+    assert str(home) not in text

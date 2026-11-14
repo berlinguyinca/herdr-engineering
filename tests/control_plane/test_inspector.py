@@ -14,6 +14,7 @@ from herdr_engineering.control_plane.inspector import (
     truncate_text,
     validate_prefs,
 )
+from herdr_engineering.control_plane.journal_suppression import OFF
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 
 SID = "w1:p1"
@@ -1009,7 +1010,9 @@ def test_http_failed_conversation_write_is_not_acknowledged(server):
 def test_durable_activity_replays_tool_phases_files_usage_and_retry_ids():
     rows = []
     now = [time.time()]
-    store = InspectorStore(persist=rows.append, clock=lambda: now[0], limits={"max_body_bytes": 200})
+    # Every phase journaled: the default drops the update row (tests/control_plane/test_journal_suppression.py).
+    store = InspectorStore(persist=rows.append, clock=lambda: now[0], limits={"max_body_bytes": 200},
+                           journal_suppression=OFF)
     secret = "ghp_" + "a" * 36
     events = [
         tool("c", "start", event_id="start", tool="bash", args_preview="cat .env",
@@ -1060,7 +1063,8 @@ def test_activity_persistence_failure_is_retryable_without_partial_mutation(fail
             self.events.append(event)
 
     sink = FlakySink()
-    store = ControlPlaneRepo(sink=sink).inspector
+    # An update row is held until its call ends by default, so a failing sink is only seen with that switched off.
+    store = ControlPlaneRepo(sink=sink, journal_suppression=OFF).inspector
     if failed_kind in ("update", "end"):
         feed(store, tool("c", "start", event_id="start", output="before"))
     event = (tool("c", failed_kind, output="after") if failed_kind in ("start", "update", "end")

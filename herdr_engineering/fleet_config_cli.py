@@ -669,10 +669,12 @@ def _collect_hosts(answers: dict, prompt: Callable) -> dict[str, list[str]]:
 
 
 API_KEYS_WARNING = (
-    "warning: --with-api-keys turns on X-API-Key auth for the control plane. The browser "
-    "dashboard, the llm-proxy and the emit hook do not send keys yet, so they will get "
-    "401 until they do. Leave control_plane.api_keys empty ({}) to keep the tailnet-open "
-    "posture.")
+    "warning: --with-api-keys turns on X-API-Key auth for the control plane. The llm-proxy "
+    "and the emit hook do not send keys yet, so they will get 401 until they do. The browser "
+    "dashboard works only behind the dashboard proxy: set control_plane.dashboard_proxy "
+    "(viewer_key_file, operator_key_file) and run `herdr-eng control-plane dashboard-proxy` "
+    "(compose profile dashboard-proxy); without it the dashboard gets 401. Leave "
+    "control_plane.api_keys empty ({}) to keep the tailnet-open posture.")
 
 
 OPTIONAL_SECRET_LABELS = {"github_token": "GitHub token"}
@@ -686,7 +688,7 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
     The control plane stays open on the tailnet (``control_plane.api_keys: {}``) and
     ``ingest.api_key`` / ``agent.api_key`` are empty, so clients send no X-API-Key.
     ``with_api_keys`` generates operator/ingest/agent keys instead (keyed mode; the
-    dashboard, llm-proxy and emit hook do not support keys yet - see API_KEYS_WARNING).
+    llm-proxy and emit hook do not support keys yet, the dashboard needs the dashboard proxy - see API_KEYS_WARNING).
 
     Hosts get a placeholder hash of a discarded token: they cannot authenticate
     until ``fleet join`` / ``fleet config token`` installs a real one.

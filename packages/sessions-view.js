@@ -18,7 +18,7 @@ const tabs = [['current','Current'],['unconfirmed','Unconfirmed'],['failed','Fai
 const missionKey = mission => text(mission.mission_key) || (text(mission.mission_id)
   ? `${text(mission.source) && mission.source!=='herdr' ? `${mission.source}:` : ''}${mission.mission_id}` : '');
 
-function associatedMission(session, missions) {
+export function associatedMission(session, missions) {
   const id=text(session.mission_id), key=text(session.mission_key);
   if (!id && !key) return null;
   const matches=missions.filter(m=> {

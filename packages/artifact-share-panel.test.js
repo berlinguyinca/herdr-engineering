@@ -955,3 +955,11 @@ test('Version and Audience labels stack their select with a gap instead of butti
   assert.match(html, /<label style="display:inline-flex;flex-direction:column;gap:4px">Version<select/);
   assert.match(html, /<label style="display:inline-flex;flex-direction:column;gap:4px">Audience<select/);
 });
+
+test('form labels carry no inline display, so the design system stacks caption over control with a gap', () => {
+  for (const audience of ['private', 'lab', 'public']) {
+    const html = renderShareForm(formState({ audience }));
+    assert.doesNotMatch(html, /<label style="display:block"/, audience);
+  }
+  assert.match(renderShareForm(formState({ audience: 'public' })), /<label>Expires after/);
+});

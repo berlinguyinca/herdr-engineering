@@ -398,17 +398,31 @@ def agent_name(harness: str, env) -> str | None:
     return name or None
 
 
-def run_join_hook(harness: str, env=None, out=None) -> int:
-    """The SessionStart hook body. Never fails the session: any error is swallowed, the exit code is always 0."""
+HOOK_WAIT_SECONDS = 8.0
+
+
+def run_join_hook(harness: str, env=None, out=None, wait: float = HOOK_WAIT_SECONDS) -> int:
+    """The SessionStart hook body. Never fails the session: any error is swallowed, the exit code is always 0.
+
+    A loaded host can take longer than a hook may block to start Python and join, so after ``wait`` seconds the
+    join is left running detached (it is idempotent) instead of being killed, and the session says so.
+    """
     env = os.environ if env is None else env
     out = out or sys.stdout
     try:
         name = agent_name(harness, env)
         if not name:
             return 0
-        proc = subprocess.run([sys.executable, "-m", "herdr_engineering.cli", "rooms", "join-fabric", name, "--json"],
-                              capture_output=True, text=True, timeout=12, env=dict(env), stdin=subprocess.DEVNULL)
-        if proc.returncode == 0:
+        proc = subprocess.Popen([sys.executable, "-c", "import sys; from herdr_engineering.cli import main; sys.exit(main())",
+                                 "rooms", "join-fabric", name, "--json"],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                env=dict(env), start_new_session=True)
+        try:
+            rc = proc.wait(timeout=wait)
+        except subprocess.TimeoutExpired:
+            print(f"HerdR: joining the workspace room as {name} (still running in the background)", file=out)
+            return 0
+        if rc == 0:
             print(f"HerdR: joined the workspace room as {name}", file=out)
     except Exception:
         pass

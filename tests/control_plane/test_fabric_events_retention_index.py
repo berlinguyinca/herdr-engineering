@@ -25,7 +25,7 @@ _PG_DSN = os.environ.get("HERDR_E2E_PG_DSN")
 
 
 def _index_migrations():
-    return [p for p in sorted(_MIGRATIONS.glob("*.sql")) if _INDEX in p.read_text()]
+    return [p for p in sorted(_MIGRATIONS.glob("*.sql")) if re.search(rf"\b{_INDEX}\b", p.read_text())]
 
 
 def test_a_migration_indexes_fabric_events_by_type_and_source_timestamp():

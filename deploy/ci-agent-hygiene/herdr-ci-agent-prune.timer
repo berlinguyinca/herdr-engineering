@@ -1,0 +1,11 @@
+[Unit]
+Description=Prune dead Woodpecker agent registrations every 30 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+RandomizedDelaySec=60s
+Unit=herdr-ci-agent-prune.service
+
+[Install]
+WantedBy=timers.target

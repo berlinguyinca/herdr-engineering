@@ -1,0 +1,21 @@
+# Example user unit (not installed by anything; the operator installs it). Host-agnostic: the interim host is beast,
+# a dedicated node later. It runs as the operator: `gh`, the Claude Code login and ~/.pi/agent/models.json are theirs.
+# One review at a time (a lock), no GPU use, no change to any serving unit.
+#   cp deploy/ci-review/herdr-always-on-review.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now herdr-always-on-review.timer
+#   loginctl enable-linger "$USER"
+# It is DRY-RUN until the config says `post: true`: this ExecStart passes --post, so editing the config is the switch.
+# Remove --post here to keep it dry no matter what the config says.
+[Unit]
+Description=Always-on review of open pull requests (Open-weight pre-review, Opus agent review)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/IdeaProjects/herdr-engineering/deploy/ci-review/always-on-review.py poll --config %h/.config/herdr-engineering/always-on-review.yaml --post
+TimeoutStartSec=3h
+Nice=10
+UMask=0077
+NoNewPrivileges=yes
+# not ProtectHome: the script reads the gh login, the Claude Code login and ~/.pi/agent/models.json

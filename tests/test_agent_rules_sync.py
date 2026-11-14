@@ -186,6 +186,14 @@ def test_task_file_is_wired_to_the_script_and_skips_without_a_pin():
     assert "agent-rules-sync.sh" in text and "agent_rules_repo_url" in text and "agent_rules_ref" in text
 
 
+def test_script_is_shipped_to_each_host_not_run_from_the_controller_path():
+    block = yaml.safe_load(TASKS.read_text())[0]["block"][0]
+    # ansible.builtin.command would execute <controller checkout>/scripts/... ON the host, which only exists on
+    # the controller itself (beast/mac failed with "No such file"); ansible.builtin.script copies it over first.
+    assert "ansible.builtin.script" in block and "ansible.builtin.command" not in block
+    assert "agent-rules-sync.sh" in block["ansible.builtin.script"]["cmd"]
+
+
 @pytest.mark.parametrize("playbook", ["fleet-sync.yml", "site.yml"])
 def test_playbooks_converge_rules_before_the_fingerprint(playbook):
     tasks = yaml.safe_load((ROOT / "ansible/playbooks" / playbook).read_text())[0]["tasks"]

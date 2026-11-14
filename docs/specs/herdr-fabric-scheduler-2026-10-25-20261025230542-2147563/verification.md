@@ -72,5 +72,5 @@ These are fresh post-Ralph-loop results against the current worktree. The reposi
 
 - `npm run test:ui` → **60 passed, 1 failed** in the full 61-test suite. The single failure was the existing timeout-sensitive mission-history test; rerunning `node --test --test-name-pattern='recorded history requests time out and retry' tests/playwright/ui.test.mjs` passed in **0.77s**, so the failure is suite-contention/flakiness rather than deterministic scheduler UI behavior.
 - `./.venv/bin/python -m pytest -q tests/test_herdr_adapter.py tests/control_plane/test_collab_spawn.py tests/control_plane/test_collab_join_script.py` → **57 passed in 37.69s**.
-- Read-only host probes: `beast` reachable as Linux but has no `herdr` binary on PATH; `macbook-pro` reachable as `mac.lan`, macOS 26.5.2, and has `/Users/wohlgemuth/.local/bin/herdr`.
+- Read-only host probes: `beast` reachable as Linux but has no `herdr` binary on PATH; `macbook-pro` reachable as `mac.lan`, macOS 26.5.2, and has `<home>/.local/bin/herdr`.
 - Canary status: blocked from a real 2–3 host scheduler canary until the Linux destination is provisioned with Herdr and a certified runtime resume contract. No scheduler admission/migration flags were enabled.

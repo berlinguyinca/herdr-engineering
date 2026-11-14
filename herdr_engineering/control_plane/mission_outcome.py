@@ -229,6 +229,7 @@ def outcome_summaries(repo):
     """Per mission key, a small summary of its latest stored outcome (for catalog rows). Newest outcome wins;
     a mission reopened since its outcome has none."""
     out = {}
+    prs = _pr_refs_by_mission(repo)
     for mission in repo.list_missions()[:MAX_SUMMARIES]:
         key = mission_key(mission)
         event = last_outcome(repo, key)
@@ -240,8 +241,65 @@ def outcome_summaries(repo):
         p = event["payload"]
         out[key] = {"result": RESULT.get(p.get("final_stage"), "unknown"), "final_stage": p.get("final_stage"),
                     "inferred": bool(p.get("inferred")), "ended_at": p.get("ended_at"), "duration_s": p.get("duration_s"),
-                    "agent_count": p.get("agent_count"), "repository": p.get("repository"), "last_event": last_event(p)}
+                    "agent_count": p.get("agent_count"), "repository": p.get("repository"), "last_event": last_event(p),
+                    "prs": prs.get(key, [])}
     return out
+
+
+def _pi_refs(repo, kind):
+    """G8: {mission key: {(repository, number)}} from Pi-reported links of one kind in the retained activity snapshots."""
+    out = {}
+    store = getattr(repo, "mission_activity", None)
+    if store is None:
+        return out
+    try:
+        by_mission = store.links_by_mission()
+    except Exception:  # noqa: BLE001 - Pi evidence is a convenience; the list itself must still answer
+        return out
+    for key, links in by_mission.items():
+        for item in links:
+            if item.get("kind") == kind:
+                out.setdefault(key, set()).add((_text(item["repository"], 120), item["number"]))
+    return out
+
+
+def pr_refs_by_mission(repo):
+    """G3/G8: {mission key: [{repository, number}]} for every listed mission (running included), bounded by MAX_SUMMARIES.
+    Herdr's own PR records are merged with Pi-reported pull_request links (deduped by repository+number); Pi-only missions
+    still appear. A failing read is empty."""
+    merged = {k: {(r["repository"], r["number"]) for r in v} for k, v in _pr_refs_by_mission(repo).items()}
+    for key, refs in _pi_refs(repo, "pull_request").items():
+        merged.setdefault(key, set()).update(refs)
+    if not merged:
+        return {}
+    try:
+        keys = {mission_key(m) for m in repo.list_missions()[:MAX_SUMMARIES]}
+    except Exception:  # noqa: BLE001
+        keys = set()
+    pi_keys = set(_pi_refs(repo, "pull_request"))
+    return {k: [{"repository": r, "number": n} for r, n in sorted(v)] for k, v in sorted(merged.items())
+            if k in keys or k in pi_keys}
+
+
+def issue_refs_by_mission(repo):
+    """G8: {mission key: [{repository, number}]} of issues Pi explicitly linked to a mission. Never inferred from text."""
+    return {k: [{"repository": r, "number": n} for r, n in sorted(v)] for k, v in sorted(_pi_refs(repo, "issue").items())}
+
+
+def _pr_refs_by_mission(repo):
+    """One bulk read of the PR records, grouped by the exact mission key (namespaces never mix): {key: [{repository, number}]},
+    sorted by (repository, number) so the order is deterministic. A failing read yields no refs, never a failed list."""
+    grouped = {}
+    try:
+        records = repo.list_pull_requests()
+    except Exception:  # noqa: BLE001 - refs are a convenience on a list; the list itself must still answer
+        return grouped
+    for rec in records:
+        number, repository = rec.get("number"), rec.get("repository")
+        if rec.get("mission_id") is None or not isinstance(number, int) or isinstance(number, bool) or not isinstance(repository, str):
+            continue
+        grouped.setdefault(rec["mission_id"], set()).add((_text(repository, 120), number))
+    return {k: [{"repository": r, "number": n} for r, n in sorted(v)] for k, v in grouped.items()}
 
 
 class MissionOutcomes:

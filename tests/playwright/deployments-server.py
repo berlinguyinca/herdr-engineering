@@ -60,7 +60,7 @@ def main(mode):
             os.chmod(path, 0o644)
         values = {"deployment_definitions": str(pipelines)}
         if mode == "ci":
-            values["ci_deployments"] = {"lc-binbase-frontend": "woodpecker-ci"}
+            values["ci_deployments"] = {"lc-binbase-frontend": "woodpecker-ci", "lc-binbase-backend": "woodpecker-ci"}
     fleet = tmp / "fleet.yaml"
     fleet.write_text(yaml.safe_dump({
         "version": 1,
@@ -85,6 +85,10 @@ def main(mode):
         for n, outcome in ((101, "started"), (102, "ok")):
             ev = _event(n, "lc-binbase-frontend", outcome, host="ci-agent-1",
                         evidence="" if outcome == "started" else f"pipeline {CI_RUN}")
+            repo.deployments.ingest(ev, reported_by="woodpecker-ci")
+        for n, outcome in ((201, "started"), (202, "failed")):
+            ev = _event(n, "lc-binbase-backend", outcome, host="ci-agent-1", evidence="" if outcome == "started" else
+                        f"deploy step failed: FAILED MODULES: go-assistant-mcp (pipeline #154) [{CI_RUN}]")
             repo.deployments.ingest(ev, reported_by="woodpecker-ci")
     threading.Thread(target=server.serve, daemon=True).start()
     server.wait_until_ready()
