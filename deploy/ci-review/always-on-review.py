@@ -356,9 +356,8 @@ def _diff_lines(diff: str) -> dict[str, list[str]]:
         if header:
             inhunk = False
             if ln.startswith("--- "):
-                old, new = (x[4:].split("\t")[0] for x in (ln, lines[i + 1]))
-                path = old.removeprefix("a/") if new == "/dev/null" else new.removeprefix("b/")
-                cur = path
+                old, new = ai.side_path(ln[4:]), ai.side_path(lines[i + 1][4:])   # unquotes git's "caf\\303\\251" paths
+                cur = new or old or ""
                 out.setdefault(cur, [])
                 i += 1
             i += 1
@@ -373,7 +372,7 @@ def _diff_lines(diff: str) -> dict[str, list[str]]:
 
 TRIVIAL_LINES = frozenset({"if __name__ == \"__main__\":", "from __future__ import annotations", "raise notimplementederror",
                            "raise notimplementederror()", "return true", "return false", "except exception:",
-                           "except exception as e:", "} catch (e) {", "} else {"})   # normalised, lower case, >= 12 chars
+                           "except exception as e:", "} catch (e) {", "} else {"})   # normalised, lower case
 
 
 def _marker_stripped(ev: str) -> str:
@@ -391,8 +390,20 @@ def _quote_in(ev: str, lines: list[str]) -> bool:
         return False
     if len(evn) >= EVIDENCE_MIN and evn in " ".join(norm):
         return True
-    return len(evn) >= EVIDENCE_LINE_MIN and any(
-        " ".join(norm[i:j]) == evn for i in range(len(norm)) for j in range(i + 1, min(i + 13, len(norm)) + 1))
+    return len(evn) >= EVIDENCE_LINE_MIN and any(_run_equals(norm, i, evn) for i in range(len(norm))
+                                                 if evn.startswith(norm[i]))
+
+
+def _run_equals(norm: list[str], i: int, evn: str) -> bool:
+    """Whole consecutive lines norm[i:j] (at most 13) joined by spaces equal `evn`; stops as soon as they cannot."""
+    acc = ""
+    for line in norm[i:i + 13]:
+        acc = f"{acc} {line}" if acc else line
+        if acc == evn:
+            return True
+        if not evn.startswith(acc):
+            return False
+    return False
 
 
 def apply_evidence(verdict: Verdict, diff: str, root: Path | None) -> tuple[Verdict, int]:
