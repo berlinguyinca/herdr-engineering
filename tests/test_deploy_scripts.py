@@ -1263,8 +1263,8 @@ def test_fabric_firewall_rules_absent_keeps_the_strong_install_warning(env):
 
 def test_fabric_firewall_unexpected_check_exit_code_still_warns(env):
     _with_collab(env, dict(COLLAB, fabric_trust=FABRIC_TRUST))
-    # the script's shebang resolves bash via PATH: make only the firewall script exit 64
-    _shim(env, "bash", 'case "$1" in *collab-fabric-firewall*) exit 64 ;; esac; exec /bin/bash "$@"')
+    # the iptables shim kills its parent (the firewall script), so deploy.sh sees an exit code (137) the script never returns
+    _shim(env, "iptables", 'kill -9 "$PPID"')
     _shim(env, "systemctl", "exit 0")
     r = deploy(env, "--dry-run")
     assert r.returncode == 0, r.stderr
