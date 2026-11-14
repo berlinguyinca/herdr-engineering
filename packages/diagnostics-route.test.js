@@ -17,7 +17,7 @@ const BEFORE = ['/overview', '/attention', '/herd', '/collab', '/personal-assist
   '/llm', '/ci', '/reviews', '/github', '/architecture', '/artifacts', '/memory', '/intelligence'];
 // Pages main gained between H07 being written and this series landing. They are named rather than tolerated:
 // the assertion stays "nothing was added, dropped, renamed or moved out of NAV" and only grows deliberately.
-const ADDED_ON_MAIN_SINCE_H07 = ['/settings'];
+const ADDED_ON_MAIN_SINCE_H07 = ['/settings', '/agent-ops'];
 const SECTION_AT = APP.indexOf('const SECTION_TABS = [');
 const sectionBlock = APP.slice(SECTION_AT, APP.indexOf('];', SECTION_AT));
 const hostsRow = sectionBlock.split('\n').find((line) => line.includes("'/hosts', 'Hosts'")) || '';
