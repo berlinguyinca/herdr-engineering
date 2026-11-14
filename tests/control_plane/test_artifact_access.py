@@ -145,7 +145,7 @@ def test_native_delivery_includes_artifact_references_after_identity_verificatio
     from herdr_engineering.herdr_adapter import NativeHerdrAdapter
 
     received = []
-    conversation = {'source': 'integration', 'agent': 'claude', 'kind': 'uuid',
+    conversation = {'source': 'integration', 'agent': 'claude', 'kind': 'id',
                     'value': 'conversation1'}
     monkeypatch.setattr(NativeHerdrAdapter, 'list_agents', lambda *_a, **_k: [
         SimpleNamespace(terminal_id='term1', pane_id='w1:p1', agent_session=conversation,
