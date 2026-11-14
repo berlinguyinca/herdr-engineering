@@ -125,6 +125,38 @@ test("a host problem becomes an incident stamped with the host's own last_seen; 
   assert.equal(toIssueRecords({ host_id: 'h3', last_seen: null, problems: [{ code: 'c', severity: 'info', message: 'm' }] })[0].at, undefined, 'no instant is invented');
 });
 
+test('toIssueRecords keeps two problems carrying one code as two incidents', () => {
+  // A host can report the same code twice. H04 keys a card by its id, so repeating `host:code` would show one
+  // card for two problems; the repeat carries a counter, which is our convention and not a field the feed sends.
+  const twice = toIssueRecords({ host_id: 'hive', last_seen: '2026-11-14T02:03:04+00:00',
+    problems: [{ code: 'DISK_FULL', message: 'one', severity: 'critical' },
+      { code: 'DISK_FULL', message: 'two', severity: 'warning' }] });
+  assert.deepEqual(twice.map((issue) => issue.id), ['hive:DISK_FULL', 'hive:DISK_FULL#2']);
+  assert.deepEqual(twice.map((issue) => issue.message), ['one', 'two'], 'each problem keeps its own message');
+});
+
+test('a host-list read that fails is asked once inside a load, and the next load tries again', async () => {
+  // The host list feeds both sections, so its failure has to reach both. Nothing else is asked: an events
+  // request without a host would be an invented call, and a remembered failure would say "unavailable" forever.
+  let hostReads = 0;
+  const src = createHostDiagnosticsSource({
+    now: 0,
+    listHosts: async () => { hostReads += 1; throw new Error('hosts down'); },
+    request: async (path) => { throw new Error(`unexpected request: ${path}`); },
+  });
+  const first = await loadDiagnostics(src);
+  assert.equal(hostReads, 1, 'one load asks the host feed once, whatever sections want it');
+  assert.deepEqual(first.unavailable, [...SECTIONS], 'both sections say unavailable, neither invents a reading');
+  assert.deepEqual({ ...first.issues, invalid: first.issues.invalid }, { items: [], invalid: 0 }, 'no incidents, none counted as invalid — nothing was read');
+  assert.deepEqual(first.events.timeline, [], 'and no events');
+  assert.equal(first.partial, true, 'the load admits it is partial');
+  assert.match(describeUnavailable(first.unavailable), /events, hosts could not be read/, 'the line the view shows names both');
+  // A later load asks again, and two loads started together still share the single read they have in flight.
+  const [a, b] = await Promise.all([loadDiagnostics(src), loadDiagnostics(src)]);
+  assert.equal(hostReads, 2, 'the next load asks again, and asks once between them');
+  assert.deepEqual([a.unavailable, b.unavailable], [[...SECTIONS], [...SECTIONS]]);
+});
+
 test('loadDiagnostics hands the issue list incidents, not timeline records', async () => {
   const result = await loadDiagnostics(source({ events: feed([envelope.events[0]]), hosts: feed(recordedHosts) }));
   assert.equal(result.issues.items.every((item) => 'kind' in item && 'severity' in item), true, 'incidents carry the incident fields H04 validates');
@@ -136,8 +168,9 @@ test('loadDiagnostics hands the issue list incidents, not timeline records', asy
 test('hostEventsPath is the only events URL, and it carries both entity parameters', () => {
   assert.equal(hostEventsPath('hive'), '/api/v1/events?entity_type=host&entity_id=hive&limit=50');
   assert.equal(hostEventsPath('ws:00:1a:2b'), '/api/v1/events?entity_type=host&entity_id=ws%3A00%3A1a%3A2b&limit=50');
-  assert.equal(hostEventsPath('hive', 100), '/api/v1/events?entity_type=host&entity_id=hive&limit=100');   // the server's ceiling
-  assert.equal(hostEventsPath('hive', 0), '/api/v1/events?entity_type=host&entity_id=hive&limit=50');      // outside 1..100: fall back to the page size
+  assert.equal(hostEventsPath('hive', 200), '/api/v1/events?entity_type=host&entity_id=hive&limit=200');   // the ceiling the server takes
+  assert.equal(hostEventsPath('hive', 0), '/api/v1/events?entity_type=host&entity_id=hive&limit=50');      // outside 1..200, measured: fall back to the page size
+  assert.equal(hostEventsPath('hive', 201), '/api/v1/events?entity_type=host&entity_id=hive&limit=50');    // 201 is the first value the server refuses
   assert.equal(hostEventsPath('hive', 500), '/api/v1/events?entity_type=host&entity_id=hive&limit=50');
   assert.throws(() => hostEventsPath(''), TypeError);
 });

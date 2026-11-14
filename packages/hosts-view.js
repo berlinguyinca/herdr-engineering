@@ -110,6 +110,11 @@ function renderHostsRead(hosts, unavailable) {
 const hostField = (label, value) => `<div class="diag-field"><b>${escapeHtml(value || 'unknown')}</b><span>${escapeHtml(label)}</span></div>`;
 const text = (v) => (typeof v === 'string' ? v : '');
 
+// What the issue list on this page is: severity comes from the host feed, unchanged, and a problem carries no
+// instant of its own, so the one shown is the host's last report. Said on the page because the numbers alone
+// would read as "this problem happened at this moment".
+const ISSUE_SCOPE_NOTE = 'Problems the host feed reported, at the severity it gave them. A problem carries no time of its own, so the instant shown is when that host last reported.';
+
 export async function mountDiagnostics(container, { source } = {}) {
   const read = await loadDiagnostics(source).catch(() => null);   // loadDiagnostics already swallows every feed failure; this covers a source that is not a source at all
   const diagnostics = read || { events: { timeline: [] }, issues: { items: [] }, hosts: { items: [] }, unavailable: [...SECTIONS], partial: true };
@@ -119,7 +124,10 @@ export async function mountDiagnostics(container, { source } = {}) {
   container.innerHTML = `<h1>Diagnostics</h1>
     ${diagnostics.note ? `<p class="diag-note" role="status" data-diagnostics-note>${escapeHtml(diagnostics.note)}</p>` : ''}
     <section data-diagnostics-hosts><h2>Hosts read</h2>${renderHostsRead(diagnostics.hosts, diagnostics.unavailable)}</section>
-    <section data-diagnostics-issues><h2>Error issues</h2>${renderIssueList(diagnostics.issues?.items || [], { state: diagnostics })}</section>
+    // "Host issues", not "Error issues": these are the problems the host feed reported, at whatever severity
+    // it gave them (critical, error, warning, info), and the instant H04 prints for one is when that host last
+    // reported, because the feed gives no time of its own for a problem. Both facts are said, not assumed.
+    <section data-diagnostics-issues><h2>Host issues</h2><p class="diag-note" data-diagnostics-issues-scope>${escapeHtml(ISSUE_SCOPE_NOTE)}</p>${renderIssueList(diagnostics.issues?.items || [], { state: diagnostics })}</section>
     <section data-diagnostics-timeline><h2>Session timeline</h2>${renderSessionTimeline(events, { unavailable: diagnostics.unavailable })}</section>
     <section data-diagnostics-drift><h2>Task drift</h2>${renderDriftComparison(null)}</section>`;
 }

@@ -75,6 +75,7 @@ test('one read renders the issue list, then the session timeline, then the drift
   // Issues are host problems as H02 incidents, and the host feed could not be read: nothing is listed, and
   // nothing is invented to fill the list. Events alone were never issue records — severity is not an event field.
   assert.match(html, /data-diagnostics-hosts-unavailable>/);
+  assert.match(html, /data-diagnostics-issues-scope>Problems the host feed reported, at the severity it gave them\./);
   assert.doesNotMatch(html, /data-diag-card|data-diag-rejected|data-diagnostics-host\b/);
 });
 

@@ -63,11 +63,13 @@ def stable(event):
 
     The id is derived from the event's own `sequence`, which the server assigns and which is stable across pages,
     so the same event carries the same recorded id in the limit=50 page and in the limit=1 page. Renumbering by
-    position would make `event_recorded_0` a different event in each page."""
+    position would make `event_recorded_0` a different event in each page. The instants are the sequence as
+    minutes past the hour, which stays valid for the 60 events a stream would have to reach before it breaks —
+    well past the four this recorder posts."""
     out = dict(event)
     out["event_id"] = f"event_recorded_{event['sequence']}"
-    out["source_timestamp"] = f"2026-11-14T02:0{event['sequence']}:00+00:00"
-    out["ingest_timestamp"] = f"2026-11-14T02:0{event['sequence']}:01+00:00"
+    out["source_timestamp"] = f"2026-11-14T02:{event['sequence']:02d}:00+00:00"
+    out["ingest_timestamp"] = f"2026-11-14T02:{event['sequence']:02d}:01+00:00"
     return out
 
 
@@ -112,11 +114,6 @@ def record():
         server.shutdown()
 
 
-if __name__ == "__main__":
-    made = record()
-    print(f"wrote {OUT}")
-    print(f"events_bare {made['events_bare']['status']} events_host_hive {made['events_host_hive']['status']} "
-          f"hosts {made['hosts']['status']} events={len(made['events_host_hive']['body']['events'])}")
 if __name__ == "__main__":
     made = record()
     print(f"wrote {OUT}")

@@ -33,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = ROOT / "tests" / "fixtures" / "diagnostics_events_host.json"
 
 # Keys toTimelineRecord reads: identity, instants, type, host, payload, session.
-EVENT_KEYS = {"event_id", "event_type", "entity_id", "source_timestamp", "ingest_timestamp",
+EVENT_KEYS = {"event_id", "event_type", "entity_type", "entity_id", "source_timestamp", "ingest_timestamp",
               "payload", "mission_id", "session_id"}
 # Top-level keys readPage reads: the rows, and whether more exist.
 PAGE_KEYS = {"events", "has_more", "next_cursor", "latest_sequence", "last_event_id"}
