@@ -20,6 +20,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `tree._live_processes` runs `ps -ww`: xdist workers export `COLUMNS=80`, which truncated process args (regression test added).
 - `execnet==2.1.2` (what `pytest-xdist==3.8.0` resolves to) is pinned in the dev extra.
 
+### Fix: leftovers from the review of the collab agents follow-ups
+
+- `herdr-eng collab agents renew`: a failed write with `--json --print-credential` now prints the one JSON object (with `credential`) on stdout, not the bare credential; a failed move into place with `--print-credential` also prints the credential (or the JSON object) on stdout, keeping the 0600 temp file and its path on stderr.
+- `deploy/control-plane/rooms-bootstrap.py`: a membership conflict is recognised by the real HTTP status (409), not by the text "HTTP 409" in the message, so a non-409 error quoting it is no longer swallowed. The missing-operator-id test now covers every falsy `user_id` shape against a real stub that would otherwise remove an unowned grant.
+- Runbook 5.2a step 5: fabric-join agents are refused (403) and renewing an expired agent at the agent limit returns 429.
+
 ### Fix: collab agents CLI and rooms-bootstrap follow-ups, flaky MCP upload tests, renewal runbook
 
 - `herdr-eng collab agents renew`: `--json --print-credential` now prints one JSON object that includes `credential` (no second line); a failed file write with `--print-credential` prints the credential on stdout as requested instead of stderr; the temp file is fsynced before it is renamed into place; a read timeout on an error body, a malformed `--operator-url` (`http://[::1`) and a listed agent without an id are one-line errors (exit 1), not tracebacks.

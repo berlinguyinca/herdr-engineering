@@ -118,10 +118,11 @@ def _discard(tmp, fd):
         os.unlink(tmp)
 
 
-def _store(credential, tmp, fd, dest, to_stdout=False):
+def _store(credential, tmp, fd, dest, to_stdout=False, shown=None):
     """Write the new credential to the reserved temp file and move it into place. The old credential is already dead, so a
     failure here must not lose the new one: keep the temp file (path to stderr) or, with no file at all, put it on stderr
-    (on stdout instead when the caller asked for it there with --print-credential)."""
+    (on stdout instead when the caller asked for it there with --print-credential; with --json the one JSON object, ``shown`` plus
+    the credential)."""
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(credential + "\n")
@@ -135,7 +136,7 @@ def _store(credential, tmp, fd, dest, to_stdout=False):
         if to_stdout:
             print(f"collab agents: the agent WAS renewed but writing {dest} failed ({exc.strerror}). This is the only copy of "
                   "the new credential; it is printed on stdout as requested: save it now.", file=sys.stderr)
-            print(credential)
+            print(json.dumps({**shown, "credential": credential}) if shown is not None else credential)
         else:
             print(f"collab agents: the agent WAS renewed but writing {dest} failed ({exc.strerror}). This is the only copy of "
                   f"the new credential; save it now: {credential}", file=sys.stderr)
@@ -145,6 +146,8 @@ def _store(credential, tmp, fd, dest, to_stdout=False):
     except OSError as exc:
         print(f"collab agents: the agent WAS renewed and the credential is saved in {tmp} (0600) because moving it to {dest} "
               f"failed ({exc.strerror}). Move it into place yourself; re-running renew would replace it.", file=sys.stderr)
+        if to_stdout:                                             # asked for on stdout: give it there too, the file stays as the backup
+            print(json.dumps({**shown, "credential": credential}) if shown is not None else credential)
         return False
     return True
 
@@ -178,9 +181,10 @@ def _cmd_renew(args):
     if not isinstance(credential, str) or not credential:
         _discard(tmp, fd)
         raise AgentsError("the control plane answered without a credential; outcome unknown, the agent may have been renewed: re-run renew")
-    if args.credential_file and not _store(credential, tmp, fd, args.credential_file, args.print_credential):
-        return 1
     shown = {k: out.get(k) for k in ("agent_id", "expires_at", "grants_restored")}
+    if args.credential_file and not _store(credential, tmp, fd, args.credential_file, args.print_credential,
+                                           shown if args.json else None):
+        return 1
     if args.json:
         print(json.dumps({**shown, "credential": credential} if args.print_credential else shown))
     else:
