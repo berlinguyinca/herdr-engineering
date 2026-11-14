@@ -58,7 +58,9 @@ export function toTimelineRecord(row) {
  * says under its heading), and whose fingerprint is the local convention `host_id:code` (the feed gives no
  * fingerprint of its own, and H02 requires one to group repeats). A host reporting the same code twice is two
  * incidents: the repeats carry `#2`, `#3` …, because H02 keys a record by its id and two cards sharing an id
- * would read as one problem. A problem with no code, or a severity outside H02's vocabulary, is passed through
+ * would read as one problem. That suffix is positional within one feed response (the server emits `problems[]` in
+ * a fixed check order), so it groups what is on screen now; it is not an incident identity that survives the
+ * first problem clearing. A problem with no code, or a severity outside H02's vocabulary, is passed through
  * anyway: H04 shows it as a rejected record rather than quietly discarding it. A host reporting no problems
  * returns nothing, which is the feed's fact, not an unreadable section.
  */

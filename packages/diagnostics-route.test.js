@@ -32,6 +32,20 @@ const mount = async (source) => { const el = { innerHTML: '' }; const returned =
 // content change on Missions overflows a phone (pipeline 1243). Diagnostics describes hosts, so it is a tab
 // of the Hosts section instead: one click from every Hosts page, highlighted in the sidebar with them, and
 // the Hosts section has no committed baselines at all, so no captured surface moves.
+// What a page must never show is its own commentary. A `//` line written inside the markup template is not a
+// comment there - it is text the operator reads, which is how "Host issues, not Error issues" nearly shipped.
+test('the page shows no developer commentary: the rendered text carries no comment lines and no retired wording', async () => {
+  const { html } = await mount(createDiagnosticsSource({
+    fetchEvents: async () => [event('e1', 1700, { sessionId: 's1' })],
+    fetchHosts: async () => [Object.freeze({ host_id: 'h1', last_seen: '2026-11-13T02:00:00Z', problems: [Object.freeze({ code: 'DISK_FULL', message: 'disk full', severity: 'warning' })] })],
+    now: 1700,
+  }));
+  const shown = html.replace(/<[^>]*>/g, ' ');        // what a reader sees, markup stripped
+  assert.ok(!shown.includes('//'), `a comment line is rendered as page text: ${shown.slice(0, 240)}`);
+  assert.ok(!shown.includes('Error issues'), 'the retired heading must not appear anywhere on the page');
+  assert.equal((shown.match(/Problems the host feed reported/g) || []).length, 1);   // the scope note is said once
+});
+
 test('no navigation regression: the sidebar lists exactly what it listed before H07, and Diagnostics is a Hosts tab', () => {
   for (const page of BEFORE) assert.ok(navPaths.includes(page), `NAV no longer lists ${page}`);
   assert.deepEqual([...navPaths].sort(), [...BEFORE, ...ADDED_ON_MAIN_SINCE_H07].sort());   // 17 unchanged + what main added since, nothing else

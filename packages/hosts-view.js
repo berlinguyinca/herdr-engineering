@@ -121,12 +121,13 @@ export async function mountDiagnostics(container, { source } = {}) {
   const events = diagnostics.events?.timeline || [];
   // Task drift keeps its "unknown" reading: no feed on this page carries an expected-versus-actual pair, and
   // H06 says an unreported comparison is unknown, not zero. Passing null says that explicitly.
+  // The issue section is headed "Host issues", not "Error issues": these are the problems the host feed reported,
+  // at whatever severity it gave them (critical, error, warning, info), and the instant H04 prints for one is when
+  // that host last reported, because the feed gives no time of its own for a problem. Both facts are said on the
+  // page, in ISSUE_SCOPE_NOTE, rather than left for the reader to assume.
   container.innerHTML = `<h1>Diagnostics</h1>
     ${diagnostics.note ? `<p class="diag-note" role="status" data-diagnostics-note>${escapeHtml(diagnostics.note)}</p>` : ''}
     <section data-diagnostics-hosts><h2>Hosts read</h2>${renderHostsRead(diagnostics.hosts, diagnostics.unavailable)}</section>
-    // "Host issues", not "Error issues": these are the problems the host feed reported, at whatever severity
-    // it gave them (critical, error, warning, info), and the instant H04 prints for one is when that host last
-    // reported, because the feed gives no time of its own for a problem. Both facts are said, not assumed.
     <section data-diagnostics-issues><h2>Host issues</h2><p class="diag-note" data-diagnostics-issues-scope>${escapeHtml(ISSUE_SCOPE_NOTE)}</p>${renderIssueList(diagnostics.issues?.items || [], { state: diagnostics })}</section>
     <section data-diagnostics-timeline><h2>Session timeline</h2>${renderSessionTimeline(events, { unavailable: diagnostics.unavailable })}</section>
     <section data-diagnostics-drift><h2>Task drift</h2>${renderDriftComparison(null)}</section>`;
