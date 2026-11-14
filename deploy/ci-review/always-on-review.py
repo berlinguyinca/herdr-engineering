@@ -369,8 +369,8 @@ def _diff_lines(diff: str) -> dict[str, list[str]]:
 
 
 TRIVIAL_LINES = frozenset({"if __name__ == \"__main__\":", "from __future__ import annotations", "raise notimplementederror",
-                           "raise notimplementederror()", "return true", "return false", "return none", "except exception:",
-                           "except exception as e:", "} catch (e) {", "} else {", "try {", "finally {"})
+                           "raise notimplementederror()", "return true", "return false", "except exception:",
+                           "except exception as e:", "} catch (e) {", "} else {"})   # normalised, lower case, >= 12 chars
 
 
 def _marker_stripped(ev: str) -> str:
@@ -384,9 +384,11 @@ def _quote_in(ev: str, lines: list[str]) -> bool:
     line such as `else:` or `pass`."""
     norm = [x for x in (_ws(ln) for ln in lines) if x]
     evn = _ws(ev)
+    if evn.lower() in TRIVIAL_LINES:
+        return False
     if len(evn) >= EVIDENCE_MIN and evn in " ".join(norm):
         return True
-    return len(evn) >= EVIDENCE_LINE_MIN and evn.lower() not in TRIVIAL_LINES and any(
+    return len(evn) >= EVIDENCE_LINE_MIN and any(
         " ".join(norm[i:j]) == evn for i in range(len(norm)) for j in range(i + 1, min(i + 13, len(norm)) + 1))
 
 
@@ -401,7 +403,7 @@ def apply_evidence(verdict: Verdict, diff: str, root: Path | None) -> tuple[Verd
     index = {f.path: f for f in ai.parse_diff(diff)}
     out, n = [], 0
     for f in verdict.findings:
-        fd = ai.cited_file({"file": f.file.strip().removeprefix("./")}, index) if f.severity == "blocking" else None
+        fd = cited_in_pr(f.file, index) if f.severity == "blocking" else None
         if fd is not None:
             raw = f.evidence.replace("\r\n", "\n")
             lines = per_file.get(fd.path, [])
@@ -414,10 +416,16 @@ def apply_evidence(verdict: Verdict, diff: str, root: Path | None) -> tuple[Verd
     return dataclasses.replace(verdict, findings=tuple(out)), n
 
 
+def cited_in_pr(path: str, index: dict) -> "ai.FileDiff | None":
+    """The PR's diff of a cited path: stripped, a leading ./ removed, then a/ or b/ (ai.cited_file). The one place
+    this is decided, so the evidence check, the unverified check and decide() agree."""
+    return ai.cited_file({"file": path.strip().removeprefix("./")}, index)
+
+
 def in_pr_blockers(v: Verdict, diff: str) -> int:
     """Blocking findings of `v` that cite a file of the PR (the rest are dropped by decide())."""
     index = {f.path: f for f in ai.parse_diff(diff)}
-    return sum(f.severity == "blocking" and ai.cited_file({"file": f.file.strip().removeprefix("./")}, index) is not None
+    return sum(f.severity == "blocking" and cited_in_pr(f.file, index) is not None
                for f in v.findings)
 
 
@@ -472,7 +480,7 @@ def decide(verdict: Verdict, index: dict, label: str, downgraded: int = 0) -> De
     blocking, dropped, notes = [], [], []
     for f in verdict.findings:
         d = _as_dict(f)
-        fd = ai.cited_file(d, index)
+        fd = cited_in_pr(f.file, index)
         if f.severity != "blocking":
             notes.append(d)
         elif fd is None:

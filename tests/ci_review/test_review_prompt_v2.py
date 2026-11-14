@@ -1191,3 +1191,21 @@ def test_replay_a_partial_result_is_not_scored_and_is_retried(env):
     rc, out = replay(env, corpus)
     (rec,) = json.loads(out.read_text())["cases"]
     assert rc == 0 and rec["state"] == "scored"
+
+
+@pytest.mark.parametrize("path", ["./src/a.py", "a/src/a.py", "b/src/a.py", " src/a.py "])
+def test_a_verified_blocker_with_a_prefixed_path_still_blocks_end_to_end(env, path):
+    f = {**block()["findings"][0], "file": path}
+    env.reviewer("claude", answer={**block(), "findings": [f]})
+    env.config(post=True)
+    assert env.review("tier2", post=True) == 0
+    assert terminal(env)[-1]["state"] == "failure"
+
+
+@pytest.mark.parametrize("quote", ["except Exception as e:", "from __future__ import annotations",
+                                   'if __name__ == "__main__":', "raise NotImplementedError()"])
+def test_trivial_lines_are_not_evidence_even_when_long(quote):
+    m = load()
+    d = diff_two_files(a_line="    " + quote)
+    assert m.apply_evidence(fnd(m, ev=quote), d, None)[1] == 1
+    assert m.apply_evidence(fnd(m, ev="    " + quote.upper()), d, None)[1] == 1      # not even a different-case copy

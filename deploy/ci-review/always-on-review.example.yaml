@@ -57,7 +57,7 @@ tiers:
 
 prompt:
   checklist_file: review-checklist.yaml   # relative paths resolve against this file; use an absolute path once copied elsewhere
-  require_evidence: true                 # a blocking finding needs a meaningful quote (>= 20 chars, or a whole non-trivial line of >= 12) found in the cited
+  require_evidence: true                 # a blocking finding needs a meaningful quote (>= 20 chars, or a whole line of >= 12 that is not boilerplate like `except Exception:`) found in the cited
                                          # file's hunks or at head, plus a how_it_fails, else it becomes a note; if the model said
                                          # block and ALL its blockers were downgraded, tier 2 stays pending (never success)
   # replay.reviewers (below `replay:`): extra logins, bots included, whose review comments `corpus build` counts
