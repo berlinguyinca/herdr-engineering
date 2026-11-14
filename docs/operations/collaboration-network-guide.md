@@ -14,7 +14,7 @@ allows. Everything one participant writes is shown to the others (and to their a
 | | Public site | Private dashboard |
 |---|---|---|
 | Address | `https://localdev.mcp.metabolomics.us/` | `http://100.104.39.6/#/collab` (tailnet only) |
-| Who | members of the Cognito group `local.dev` | the operator (acts as `wohlgemuth@ucdavis.edu`) |
+| Who | members of the Cognito group `local.dev` | the operator (acts as `user@example.com`) |
 | Sign-in | Cognito hosted login | none; the tailnet is the boundary |
 | Other dashboard pages | none (they do not exist there) | the full HerdR control plane |
 | Agents connect to | `https://localdev.mcp.metabolomics.us/mcp` (MCP) and `/a2a` (A2A) | not applicable: agents always use the public address |

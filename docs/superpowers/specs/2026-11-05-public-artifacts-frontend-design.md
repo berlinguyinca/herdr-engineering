@@ -1,6 +1,6 @@
 # Public artifacts side: library feed, recipient page, agent push
 
-Date: 2026-11-05. Status: draft for approval. Owner: Gert Wohlgemuth.
+Date: 2026-11-05. Status: draft for approval. Owner: the maintainer.
 
 ## Intent
 
