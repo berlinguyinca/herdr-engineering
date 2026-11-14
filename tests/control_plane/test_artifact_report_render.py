@@ -793,3 +793,133 @@ def test_narrow_tables_stack_into_labelled_rows_but_keep_table_semantics():
 def test_stacked_rows_keep_their_evidence_anchors():
     page = _render()
     assert 'id="evidence-e1"' in page and '<tr id="evidence-e1" role="row">' in page
+
+
+# --- link-preview metadata, honest share notice, section quota redistribution -------------------------------------
+
+def _head(page: str) -> str:
+    return page.split("</head>")[0]
+
+
+def test_preview_head_carries_link_preview_metadata():
+    report = descriptor()
+    report["summary"] = 'He said "hi" <b>& more</b>'
+    head = _head(_render(report))
+    assert '<meta name="description" content="He said &quot;hi&quot; &lt;b&gt;&amp; more&lt;/b&gt;">' in head
+    assert '<meta property="og:description" content="He said &quot;hi&quot; &lt;b&gt;&amp; more&lt;/b&gt;">' in head
+    for needle in ('<meta property="og:title" content="', '<meta property="og:type" content="article">',
+                   '<meta property="og:site_name" content="HerdR">', '<meta name="twitter:card" content="summary">'):
+        assert needle in head, needle
+    assert "<b>" not in head and 'content="He said "' not in head
+    assert "rel=\"canonical\"" not in head
+
+
+def test_description_is_cut_near_160_chars_and_falls_back_to_counts():
+    report = descriptor()
+    report["summary"] = "word " * 100
+    desc = re.search(r'<meta name="description" content="([^"]*)">', _render(report)).group(1)
+    assert len(desc) <= 160
+    report.pop("summary", None)
+    desc = re.search(r'<meta name="description" content="([^"]*)">', _render(report)).group(1)
+    assert "findings" in desc and "evidence" in desc
+
+
+def test_metadata_keeps_one_csp_and_the_rich_toggle_working():
+    from herdr_engineering.control_plane.share_rich_view import with_toggle
+
+    page = _render()
+    assert page.count('http-equiv="Content-Security-Policy"') == 1
+    assert with_toggle(page).count("</header>") >= 1
+
+
+def test_minimum_cap_still_renders_with_metadata_dropped_if_it_cannot_fit():
+    page = _render(max_bytes=4096)
+    assert len(page.encode()) <= 4096
+
+
+def test_share_notice_has_no_dead_descriptor_link():
+    from herdr_engineering.control_plane.artifact_share_api import _report_preview
+
+    report = _big_report(findings=50, evidence=10)
+    public = _report_preview(report, max_bytes=8192).decode()
+    assert "Some content was shortened or omitted" in public
+    assert "full descriptor" not in public and 'href="report"' not in public
+    assert "the full report is available to its owner" in public
+
+
+def _big_report(findings=200, evidence=500):
+    import hashlib
+
+    sha = lambda i: hashlib.sha256(str(i).encode()).hexdigest()  # noqa: E731
+    assets = [{"id": f"a{i}", "name": f"file-{i}.csv", "role": "data", "media_type": "text/csv", "sha256": sha(i),
+               "size_bytes": 1000 + i} for i in range(100)]
+    questions = [{"id": f"q{i}", "text": f"Question {i}: " + "x " * 30} for i in range(10)]
+    ev = [{"id": f"e{i}", "title": f"Evidence {i} title", "description": "Description " + "lorem ipsum " * 20,
+           "asset_ids": [f"a{i % 100}"]} for i in range(evidence)]
+    fs = [{"id": f"f{i}", "title": f"Finding {i}", "statement": "Statement " + "dolor sit amet " * 25,
+           "question_ids": [f"q{i % 10}"], "evidence_ids": [f"e{i % evidence}"], "limitations": ["limit " * 10],
+           "next_steps": ["next " * 10]} for i in range(findings)]
+    return {"schema_version": 1, "title": "Synthetic large report", "summary": "Summary " * 20, "questions": questions,
+            "evidence": ev, "findings": fs, "figures": [], "assets": assets}
+
+
+def test_unused_section_quota_goes_to_overflowing_sections():
+    report = _big_report()
+    cap = 1024 * 1024
+    page = _render(report, max_bytes=cap)
+    assert len(page.encode()) <= cap
+    assert page.count('id="evidence-') == 500, "evidence rows were dropped though the cap had room"
+    assert page.count('class="card finding"') == 200
+    assert "Some content was shortened or omitted" not in page
+
+
+def test_everything_that_fits_is_kept_and_a_tight_cap_is_still_respected():
+    report = _big_report(findings=20, evidence=60)
+    full = _render(report, max_bytes=1024 * 1024)
+    assert full.count('id="evidence-') == 60 and full.count('class="card finding"') == 20
+    cap = len(full.encode()) // 2
+    tight = _render(report, max_bytes=cap)
+    assert len(tight.encode()) <= cap
+    assert tight.count('class="card finding"') > 0 and tight.count('id="evidence-') > 0
+    assert "Some content was shortened or omitted" in tight
+
+
+# --- share-aware wording, size cap after wording, quota rounding -------------------------------------------------
+
+def _long_field_report(length=3000):
+    report = descriptor()
+    report["findings"][0]["statement"] = "long " * (length // 5)
+    return report
+
+
+def test_share_markers_for_a_long_field_never_point_at_the_descriptor():
+    from herdr_engineering.control_plane.artifact_share_api import _report_preview
+
+    public = _report_preview(_long_field_report()).decode()
+    assert "text shortened" in public
+    assert "see full descriptor" not in public and "full descriptor" not in public
+    assert "[text shortened; the full report is available to its owner]" in public
+    owner = _render(_long_field_report())
+    assert "[text shortened; see full descriptor]" in owner
+
+
+def test_share_wording_never_pushes_the_page_over_the_cap():
+    from herdr_engineering.control_plane.artifact_share_api import _report_preview
+
+    report = _big_report(findings=30, evidence=30)
+    for finding in report["findings"]:
+        finding["statement"] = "wordy " * 600
+    for cap in (4096, 6000, 9000, 16 * 1024, 64 * 1024):
+        public = _report_preview(report, max_bytes=cap)
+        assert len(public) <= cap, cap
+        assert b"full descriptor" not in public
+
+
+def test_quota_rounding_leftover_is_distributed_not_dropped():
+    # At this cap the integer-division remainder used to be dropped, costing one entry that fits (38 kept, not 39).
+    report = _big_report(findings=12, evidence=40)
+    report["assets"] = report["assets"][:3]
+    for row in report["evidence"]:
+        row["asset_ids"] = ["a0"]
+    page = _render(report, max_bytes=40212)
+    assert page.count('class="card finding"') + page.count('id="evidence-') == 39

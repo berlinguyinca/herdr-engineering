@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Refresh the files the (credential-less, offline) collab container reads:
 #   jwks.json    - the Cognito pool's signing keys
-#   members.json - usernames in the required group, stamped with the refresh time
+#   members.json - usernames in the required group, stamped with the refresh time, plus "disabled": the
+#                  usernames in the required group whose Cognito account is disabled (additive key)
 # Runs on the host with the operator's AWS credentials; the container only sees the output.
 # The pool and group come from the central fleet config (control_plane.collab), via the
 # slice deploy.sh renders with `herdr-eng fleet config render-collab`.
@@ -94,6 +95,9 @@ once() {
   python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["keys"]' "$tmp/jwks.json"
   aws cognito-idp list-users-in-group --region "$REGION" --user-pool-id "$POOL" --group-name "$GROUP" \
     --query 'Users[].Username' --output json > "$tmp/users.json"
+  # The disabled members of the same group ride along (the artifact host revokes a disabled account at any age).
+  aws cognito-idp list-users-in-group --region "$REGION" --user-pool-id "$POOL" --group-name "$GROUP" \
+    --query 'Users[?Enabled==`false`].Username' --output json > "$tmp/disabled.json"
   # The Rakazo phone bridge's group rides in the same file (its own container re-checks membership from it). Only
   # ENABLED users are listed, so disabling someone in Cognito ends their app session like removing them does.
   echo '[]' > "$tmp/rakazo.json"
@@ -101,12 +105,12 @@ once() {
     aws cognito-idp list-users-in-group --region "$REGION" --user-pool-id "$POOL" --group-name "$RAKAZO_GROUP" \
       --query 'Users[?Enabled==`true`].Username' --output json > "$tmp/rakazo.json"
   fi
-  python3 - "$tmp/users.json" "$tmp/members.json" "$GROUP" "$tmp/rakazo.json" "$RAKAZO_GROUP" <<'PY'
+  python3 - "$tmp/users.json" "$tmp/members.json" "$GROUP" "$tmp/rakazo.json" "$RAKAZO_GROUP" "$tmp/disabled.json" <<'PY'
 import json, sys, time
 groups = {sys.argv[3]: json.load(open(sys.argv[1]))}
 if sys.argv[5]:
     groups[sys.argv[5]] = json.load(open(sys.argv[4]))
-json.dump({"updated": time.time(), "groups": groups}, open(sys.argv[2], "w"))
+json.dump({"updated": time.time(), "groups": groups, "disabled": json.load(open(sys.argv[6]))}, open(sys.argv[2], "w"))
 PY
   chmod 644 "$tmp"/*.json
   mv -f "$tmp/jwks.json" "$DIR/jwks.json"; mv -f "$tmp/members.json" "$DIR/members.json"   # atomic per file
