@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: Woodpecker agent pruner and fabric firewall script polish
+
+- `wpci-agent-prune`: a null or non-object queue response, a null `agent_id` in a queue task, or a non-list agents response now exits 1 with the normal `abort: API error` line instead of a traceback. The unreachable "more candidates than agents" abort is removed (candidates are a subset of the agents listed). README documents that after a >24h Woodpecker outage up to `--max-deletions` live agents per run may be removed (they re-register) and how to lower the cap.
+- `collab-fabric-firewall.sh --check`: a missing iptables binary is exit 3 with a clear message (was folded into 2, "need root"); one chain absent plus the other unreadable reports absent (1). `deploy.sh` treats 3 like absent (the strong WARNING). `--install`/`--remove` unchanged apart from the message. Exit-code list in `docs/operations/fabric-trust.md` updated.
+
 ### Fix: deploy.sh no longer warns that the fabric firewall is missing when it merely cannot read it
 
 - `collab-fabric-firewall.sh --check` run as the non-root deploy user exits 2 (cannot read), which `deploy.sh` treated like absent rules and always printed the install WARNING. Exit 1 (absent) keeps the WARNING; exit 2 now prints a one-line NOTE (verify with `sudo <script> --check`, noting if `herdr-collab-fabric-firewall.service` is enabled). Never fails the deploy. Docs in `docs/operations/fabric-trust.md` updated.

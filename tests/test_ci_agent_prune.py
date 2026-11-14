@@ -10,6 +10,8 @@ import time
 import urllib.parse
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 _loader = importlib.machinery.SourceFileLoader("wpci_agent_prune", str(ROOT / "deploy/ci-agent-hygiene/wpci-agent-prune"))
 _spec = importlib.util.spec_from_loader("wpci_agent_prune", _loader)
@@ -97,6 +99,8 @@ class FakeWoodpecker:
             def do_GET(self):
                 outer.auth.add(self.headers.get("Authorization"))
                 url = urllib.parse.urlparse(self.path)
+                if url.path == "/api/agents" and isinstance(outer.agents, dict):
+                    return self._send(200, outer.agents)  # error object instead of a list
                 if url.path == "/api/agents":
                     q = urllib.parse.parse_qs(url.query)
                     per, page = int(q["perPage"][0]), int(q["page"][0])
@@ -293,3 +297,25 @@ def test_loose_token_permissions_refused(tmp_path):
         r = run(srv, tmp_path, mode=0o644)
     assert r.returncode == 2 and srv.deleted == [] and srv.queue_calls == 0
     assert "0600" in r.stderr and TOKEN not in r.stderr
+
+
+def _clean_api_error(r, srv):
+    assert r.returncode == 1, (r.returncode, r.stderr)
+    assert "abort: API error" in r.stderr and "Traceback" not in r.stderr
+    assert srv.deleted == []
+
+
+@pytest.mark.parametrize("body", [None, [], "oops"])
+def test_non_dict_queue_response_is_a_clean_api_error(tmp_path, body):
+    with FakeWoodpecker(healthy(3), queue_fn=lambda n: (200, body)) as srv:
+        _clean_api_error(run(srv, tmp_path), srv)
+
+
+def test_null_agent_id_in_queue_is_a_clean_api_error(tmp_path):
+    with FakeWoodpecker(healthy(3), queue_fn=lambda n: (200, {"pending": [{"agent_id": None}]})) as srv:
+        _clean_api_error(run(srv, tmp_path), srv)
+
+
+def test_non_list_agents_response_is_a_clean_api_error(tmp_path):
+    with FakeWoodpecker({"error": "boom"}) as srv:
+        _clean_api_error(run(srv, tmp_path), srv)

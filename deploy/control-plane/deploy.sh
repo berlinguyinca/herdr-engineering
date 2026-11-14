@@ -593,7 +593,7 @@ if [ "$COLLAB" = 1 ] && grep -q 'fabric-listener' "$WORK/herdr_engineering/cli.p
              FW_BOOT="; boot unit herdr-collab-fabric-firewall.service is enabled"
            fi
            echo "NOTE: fabric network firewall rules could not be verified without root${FW_BOOT}. To verify: sudo $FABRIC_FW --check" >&2 ;;
-        *) echo "WARNING: fabric network firewall is not confirmed present: collab-public's network has a default route" \
+        1|3) echo "WARNING: fabric network firewall is not confirmed present: collab-public's network has a default route" \
              "and can reach this host's own addresses. As root run: $FABRIC_FW --install  (docs/operations/fabric-trust.md, Required hardening)" >&2 ;;
       esac
     fi

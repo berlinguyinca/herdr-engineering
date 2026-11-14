@@ -1261,6 +1261,13 @@ def test_fabric_firewall_rules_absent_keeps_the_strong_install_warning(env):
     assert "collab-fabric-firewall.sh --install" in r.stderr
 
 
+def test_fabric_firewall_missing_iptables_keeps_the_strong_install_warning(env):
+    r = _fabric_deploy_with_iptables(env, 127)
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: fabric network firewall is not confirmed present" in r.stderr
+    assert "NOTE: fabric network firewall" not in r.stderr
+
+
 def test_fabric_firewall_rules_present_prints_no_firewall_message(env):
     r = _fabric_deploy_with_iptables(env, 0)
     assert r.returncode == 0, r.stderr

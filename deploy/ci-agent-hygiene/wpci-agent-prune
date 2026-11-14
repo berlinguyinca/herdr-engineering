@@ -39,6 +39,8 @@ def list_agents(server, token):
     agents, seen, page = [], set(), 1
     while True:
         rows = call(server, token, "GET", f"/api/agents?perPage={PAGE}&page={page}") or []
+        if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+            raise ValueError("agents response is not a list of objects")
         new = [r for r in rows if r.get("id") not in seen]
         if not new:
             return agents
@@ -49,8 +51,17 @@ def list_agents(server, token):
 
 def busy_ids(server, token):
     queue = call(server, token, "GET", "/api/queue/info")
+    if not isinstance(queue, dict):
+        raise ValueError("queue info is not an object")
     tasks = (queue.get("pending") or []) + (queue.get("running") or []) + (queue.get("waiting_on_deps") or [])
-    return {t["agent_id"] for t in tasks if t.get("agent_id", 0) > 0}
+    ids = set()
+    for t in tasks:
+        agent_id = t.get("agent_id", 0) if isinstance(t, dict) else None
+        if isinstance(agent_id, bool) or not isinstance(agent_id, int):
+            raise ValueError("queue task has a missing or non-integer agent_id")
+        if agent_id > 0:
+            ids.add(agent_id)
+    return ids
 
 
 def verdict(agent, now, busy, never_secs, stale_secs):
@@ -131,9 +142,6 @@ def run(args, token):
         horizon = now - args.recent_contact_mins * 60
         if not any((a.get("last_contact") or 0) > horizon for a in system):
             return skip(f"no agent has contacted the server in the last {args.recent_contact_mins} minutes")
-        if len(cands) > len(agents):
-            print("abort: more candidates than agents listed (inconsistent data)", file=sys.stderr)
-            return 1
     removed = skipped = 0
     kept = len(agents) - len(cands)
     for agent, reason in cands[:args.max_deletions]:
