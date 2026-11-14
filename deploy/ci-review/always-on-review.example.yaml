@@ -62,6 +62,34 @@ tiers:
       - {name: security, focus: "Focus on security: secrets, untrusted input reaching a shell, SQL or path, permissions, and roles."}
       - {name: migrations, focus: "Focus on schema and config migrations: rollback safety, indexes versus queries, defaults, and restart keys."}
 
+# Codex second reviewer for risky paths (the spec's "Independence trade-off"). Opus reviewing Claude-authored PRs
+# loses the different-family rule, so a PR that touches any path matching `globs` also needs a Codex verdict:
+# `Opus agent review` is posted success only when Opus AND Codex approve (a Codex block posts failure with its
+# findings). Opus runs first; Codex only runs if Opus approved cleanly, in a read-only sandbox on the same worktree.
+# If Codex cannot run (not installed or not logged in, time cap, bad exit, malformed answer, a block whose blockers
+# cannot be verified, spend it cannot count) the status stays pending: never success on failure to run.
+# PRs that match nothing never call Codex. `globs: []` (the default) turns the feature off. A rename counts by its old
+# and new path. Matching is case-insensitive; `**/` = any directories (or none), `*` stays inside one path segment.
+risky:
+  globs:
+    - "deploy/**"
+    - "**/migrations/**"
+    - "**/*.sql"
+    - "**/*security*/**"
+    - "**/*auth*"
+    - "**/secrets*"
+  codex:
+    command: codex                       # needs `codex login` on the host; the user's config.toml is ignored (--ignore-user-config)
+    wrapper: []                          # optional sandbox prefix, as for claude
+    model: ""                            # "" = the codex CLI's own default model
+    time_cap_s: 1800
+    diff_bytes: 200000                   # the diff and commit log are in the prompt; cut here
+    # daily_budget_usd: 10               # optional; unset = no limit. codex reports tokens, not dollars, so the cost is
+    # input_usd_per_mtok: 2              # computed from these two prices (cached input counts as full input) and logged
+    # output_usd_per_mtok: 10            # in reviews.jsonl with tier "codex". Both prices are REQUIRED with a budget.
+                                         # Summed since 00:00 UTC like tier2's budget: at or over it, a risky PR's review
+                                         # is skipped BEFORE Opus runs (status unchanged, even with --force).
+
 prompt:
   checklist_file: review-checklist.yaml   # relative paths resolve against this file; use an absolute path once copied elsewhere
   require_evidence: true                 # a blocking finding needs a meaningful quote (>= 20 chars, or a whole line of >= 12 that is not boilerplate like `except Exception:`) found in the cited
