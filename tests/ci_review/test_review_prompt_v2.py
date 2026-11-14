@@ -9,6 +9,7 @@ from __future__ import annotations
 import functools
 import importlib.util
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -245,9 +246,10 @@ def test_apply_evidence_accepts_a_quote_from_the_file_at_head_but_not_the_diff(t
     (tmp_path / "src/a.py").write_text("def f(x):\n    helper(x)\n    return x\n")
     f = m.Finding("src/a.py", 2, "blocking", "code", "w", "def f(x):\n    helper(x)", "x=1 -> crash")
     v = m.Verdict("s", "block", (f,), ("code",))
-    out, n = m.apply_evidence(v, "diff --git a/x b/x\n+unrelated line here\n", tmp_path)
+    d = "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1,1 +1,2 @@\n x\n+unrelated line here\n"
+    out, n = m.apply_evidence(v, d, tmp_path)
     assert n == 0 and out.findings[0].severity == "blocking"
-    out, n = m.apply_evidence(v, "diff --git a/x b/x\n", None)                      # no worktree: the diff only
+    out, n = m.apply_evidence(v, d, None)                                           # no worktree: the diff only
     assert n == 1 and out.findings[0].severity == "note" and out.findings[0].downgraded
 
 
@@ -259,9 +261,8 @@ def test_apply_evidence_ignores_diff_line_prefixes_and_refuses_escaping_paths(tm
     assert n == 0
     (tmp_path / "wt").mkdir()
     (tmp_path / "secret.txt").write_text("outside the worktree text")
-    esc = m.Finding("../secret.txt", 1, "blocking", "code", "w", "outside the worktree text", "h")
-    out, n = m.apply_evidence(m.Verdict("s", "block", (esc,), ("code",)), "", tmp_path / "wt")
-    assert n == 1
+    assert m._read_at_head(tmp_path / "wt", "../secret.txt") == ""
+    assert m._read_at_head(tmp_path / "wt", "") == ""
 
 
 def test_notes_need_no_evidence_and_the_rule_can_be_switched_off(env):
@@ -905,7 +906,9 @@ def test_each_pass_gets_a_fair_share_of_the_cap(env):
 def test_the_example_config_documents_a_shared_cap():
     text = (CI / "always-on-review.example.yaml").read_text()
     assert "shared" in text.lower()
-    assert "shared" in (CI / "README.md").read_text().lower()
+    assert yaml.safe_load(text)["tiers"]["tier2"]["time_cap_s"] == 3600
+    readme = (CI / "README.md").read_text().lower()
+    assert "shared" in readme and "equal share of the time left" in readme
     assert "shared" in (ROOT / "CHANGELOG.md").read_text().split("### Always-on review")[0].lower()
 
 
@@ -947,7 +950,7 @@ def test_evidence_must_come_from_the_cited_files_hunks_not_the_whole_diff():
     out, n = m.apply_evidence(fnd(m, file="src/b.py", ev="secret_call(token_value)"), diff_two_files(), None)
     assert n == 0
     out, n = m.apply_evidence(fnd(m, ev="removed_only_line_here(1, 2)", file="src/b.py"), diff_two_files(), None)
-    assert n == 1                                                       # removed lines are not at head
+    assert n == 0                                                       # a removed line is valid evidence
 
 
 def test_evidence_needs_twenty_characters_or_a_whole_line():
@@ -956,8 +959,14 @@ def test_evidence_needs_twenty_characters_or_a_whole_line():
     assert m.apply_evidence(fnd(m, ev="eval(x)"), d, None)[1] == 1                       # a fragment of a line
     assert m.apply_evidence(fnd(m, ev="return eval(x) + other_value_here"), d, None)[1] == 0     # a whole line
     assert m.apply_evidence(fnd(m, ev="eval(x) + other_value"), d, None)[1] == 0         # 20 characters
-    d2 = diff_two_files(a_line="    go()")
-    assert m.apply_evidence(fnd(m, ev="go()"), d2, None)[1] == 0                         # short but a whole line
+    d2 = diff_two_files(a_line="    go_somewhere()")
+    assert m.apply_evidence(fnd(m, ev="go_somewhere()"), d2, None)[1] == 0               # 12+ chars, a whole line
+    d3 = diff_two_files(a_line="    go()")
+    assert m.apply_evidence(fnd(m, ev="go()"), d3, None)[1] == 1                         # under 12 chars proves nothing
+    d4 = diff_two_files(a_line="    else:")
+    assert m.apply_evidence(fnd(m, ev="else:"), d4, None)[1] == 1
+    d5 = diff_two_files(a_line="    except Exception:")
+    assert m.apply_evidence(fnd(m, ev="except Exception:"), d5, None)[1] == 1            # 17 chars but a trivial line
 
 
 def test_a_blocker_needs_a_non_empty_how_it_fails():
@@ -1103,3 +1112,82 @@ def test_corpus_build_counts_configured_reviewer_logins_even_if_bots(env):
                          "--config", str(env.cfg_path)]) == 0
     ids = {g["id"] for g in env.mod.load_case(out / "acme-widget-pr12.json")["ground_truth"]}
     assert ids == {"comment-724"}
+
+
+PLUS_DIFF = ("diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1,3 +1,4 @@\n def f(x):\n"
+             "+    first_added_line(1)\n+    second_added_line(2)\n-    removed_guard_check(x)\n")
+
+
+def test_evidence_may_carry_diff_markers_and_the_path_a_prefix():
+    m = load()
+    ok = lambda f, ev: m.apply_evidence(fnd(m, file=f, ev=ev), PLUS_DIFF, None)[1] == 0
+    assert ok("src/a.py", "+    first_added_line(1)")                               # one marker, one line
+    assert ok("src/a.py", "+    first_added_line(1)\n+    second_added_line(2)")    # markers on every line
+    assert ok("b/src/a.py", "first_added_line(1)\nsecond_added_line(2)")
+    assert ok("./src/a.py", "first_added_line(1)\nsecond_added_line(2)")
+    assert ok("a/src/a.py", "-    removed_guard_check(x)")
+    assert ok("src/a.py", "removed_guard_check(x)")                                 # a removed line is evidence
+    assert not ok("src/a.py", "+    never_in_the_diff(99)")
+
+
+def test_evidence_for_a_deleted_file_comes_from_its_removed_lines():
+    m = load()
+    d = ("diff --git a/old.py b/old.py\ndeleted file mode 100644\n--- a/old.py\n+++ /dev/null\n@@ -1,2 +0,0 @@\n"
+         "-def gone():\n-    dangerous_removed_call(1)\n")
+    assert m.apply_evidence(fnd(m, file="old.py", ev="dangerous_removed_call(1)"), d, None)[1] == 0
+    assert m.apply_evidence(fnd(m, file="old.py", ev="made_up_call_somewhere(1)"), d, None)[1] == 1
+
+
+def test_a_blocker_outside_the_pr_is_dropped_but_an_invented_in_pr_blocker_stays_pending(env):
+    env.config(post=True)
+    env.reviewer("claude", answer=block(file="src/other.py"))
+    assert env.review("tier2", post=True) == 0
+    last = terminal(env)[-1]
+    assert last["state"] == "success" and "1 finding dropped" in last["description"]
+    f = block()["findings"][0]
+    f["evidence"] = "totally_invented_call(1, 2, 3)"
+    env.reviewer("claude", answer={**block(), "findings": [f]})
+    assert env.review("tier2", post=True, *["--force"]) == 1
+    assert "unverified" in [x["state"] for x in logs(env)[1:]]
+
+
+def test_corpus_build_records_the_final_head_as_a_fallback_when_it_pins_an_earlier_commit(env):
+    first = "1" * 40
+    rc, out = build_with(env, lambda st: comments12(st, [cm(701, 9, first), cm(702, 11, first)]))
+    c = env.mod.load_case(out / "acme-widget-pr12.json")
+    assert c["head_sha"] == first and c["head_sha_fallback"] == "c" * 40
+    shutil.rmtree(out)
+    rc, out = build_with(env, lambda st: comments12(st, [cm(701, 9, "", commit_id="")]))
+    assert "head_sha_fallback" not in env.mod.load_case(out / "acme-widget-pr12.json")
+
+
+def test_replay_falls_back_to_the_final_head_when_the_pinned_commit_is_gone(env):
+    env.reviewer("claude", answer=block())
+    corpus = env.tmp / "corpus"
+    p = write_case(corpus, env, head_sha_fallback=env.head)
+    c = json.loads(p.read_text())
+    c["head_sha"] = "1" * 40
+    p.write_text(json.dumps(c))
+    rc, out = replay(env, corpus)
+    (rec,) = json.loads(out.read_text())["cases"]
+    assert rc == 0 and rec["state"] == "scored" and rec["head_sha_used"] == env.head
+    assert "fallback" in rec["note"] and "1" * 12 in rec["note"]
+
+
+def test_replay_a_partial_result_is_not_scored_and_is_retried(env):
+    env.reviewer("claude", answer=block())
+    flaky(env, fail_from=1)
+    env.config(PASSES)
+    corpus = env.tmp / "corpus"
+    write_case(corpus, env)
+    rc, out = replay(env, corpus)
+    rep = json.loads(out.read_text())
+    (rec,) = rep["cases"]
+    assert rc == 1 and rec["state"] == "partial" and "tests" in rec["partial"] and rec["passes"]
+    agg = rep["aggregate"]
+    assert agg["cases_scored"] == 0 and agg["cases_partial"] == 1 and agg["items"] == 0 and "recall" not in rec
+    (env.bin / "flaky.json").write_text("{}")                                   # the pass works now
+    env.reviewer("claude", answer=block())
+    rc, out = replay(env, corpus)
+    (rec,) = json.loads(out.read_text())["cases"]
+    assert rc == 0 and rec["state"] == "scored"

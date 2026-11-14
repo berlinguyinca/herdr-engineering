@@ -319,7 +319,7 @@ def parse_verdict(answer: str | dict, sha: str) -> Verdict:
 # ---------------- the evidence rule and merging passes ----------------
 
 EVIDENCE_MIN = 20                       # normalised characters a quote needs, unless it is a whole line
-EVIDENCE_LINE_MIN = 4                   # a whole-line quote shorter than this proves nothing
+EVIDENCE_LINE_MIN = 12                  # a whole-line quote shorter than this proves nothing
 WHY_KEY_CHARS = 60                      # merge treats findings whose why starts alike as one
 FILE_READ_MAX = 4_000_000
 
@@ -342,8 +342,8 @@ def _read_at_head(root: Path | None, rel: str) -> str:
 
 
 def _diff_lines(diff: str) -> dict[str, list[str]]:
-    """The lines a pinned head holds per file of the diff: the added and context lines of each hunk, prefix removed.
-    Removed lines are not at head and are left out."""
+    """The text of each file's hunks in the diff, marker removed: added, context and removed lines (a blocker may say
+    "this deletion removes a guard"). Keyed by the file's new path, or its old path when it was deleted."""
     out: dict[str, list[str]] = {}
     lines, cur, inhunk, i = diff.splitlines(), None, False, 0
     while i < len(lines):
@@ -353,50 +353,72 @@ def _diff_lines(diff: str) -> dict[str, list[str]]:
         if header:
             inhunk = False
             if ln.startswith("--- "):
-                p = lines[i + 1][4:].split("\t")[0]
-                cur = p[2:] if p.startswith("b/") else None if p == "/dev/null" else p
-                if cur is not None:
-                    out.setdefault(cur, [])
+                old, new = (x[4:].split("\t")[0] for x in (ln, lines[i + 1]))
+                path = old.removeprefix("a/") if new == "/dev/null" else new.removeprefix("b/")
+                cur = path
+                out.setdefault(cur, [])
                 i += 1
             i += 1
             continue
         if ln.startswith("@@"):
             inhunk = True
-        elif inhunk and cur is not None and ln[:1] in ("+", " "):
+        elif inhunk and cur is not None and ln[:1] in ("+", "-", " "):
             out[cur].append(ln[1:])
         i += 1
     return out
 
 
+TRIVIAL_LINES = frozenset({"if __name__ == \"__main__\":", "from __future__ import annotations", "raise notimplementederror",
+                           "raise notimplementederror()", "return true", "return false", "return none", "except exception:",
+                           "except exception as e:", "} catch (e) {", "} else {", "try {", "finally {"})
+
+
+def _marker_stripped(ev: str) -> str:
+    """The quote with one leading diff marker (+ or -) removed from every line that has one."""
+    return "\n".join(ln[1:] if ln[:1] in ("+", "-") else ln for ln in ev.split("\n"))
+
+
 def _quote_in(ev: str, lines: list[str]) -> bool:
-    """The quote `ev` is in `lines` (whitespace-normalised): a run of at least EVIDENCE_MIN characters inside their
-    text, or a whole line (or a run of whole consecutive lines) of at least EVIDENCE_LINE_MIN characters."""
+    """The quote `ev` is in `lines` (whitespace-normalised): at least EVIDENCE_MIN characters inside their text, or a
+    whole line (or a run of whole consecutive lines) of at least EVIDENCE_LINE_MIN characters that is not a trivial
+    line such as `else:` or `pass`."""
     norm = [x for x in (_ws(ln) for ln in lines) if x]
     evn = _ws(ev)
     if len(evn) >= EVIDENCE_MIN and evn in " ".join(norm):
         return True
-    return len(evn) >= EVIDENCE_LINE_MIN and any(
+    return len(evn) >= EVIDENCE_LINE_MIN and evn.lower() not in TRIVIAL_LINES and any(
         " ".join(norm[i:j]) == evn for i in range(len(norm)) for j in range(i + 1, min(i + 13, len(norm)) + 1))
 
 
 def apply_evidence(verdict: Verdict, diff: str, root: Path | None) -> tuple[Verdict, int]:
-    """The poster's evidence rule. A blocking finding becomes a note when its `how_it_fails` is empty or its `evidence`
-    is not a meaningful quote (see _quote_in) of the added or context lines of the cited file's hunks in the diff, or of
-    the cited file at the pinned head. Quotes found only in another file's hunk, or only in removed lines, do not
-    count. Returns the verdict and the number downgraded."""
+    """The poster's evidence rule. A blocking finding in a file of the PR becomes a note when its `how_it_fails` is
+    empty or its `evidence` is not a meaningful quote (see _quote_in) of the cited file's hunks (added, context and
+    removed lines; for a deleted file its removed lines) or of the cited file at the pinned head. The quote may carry
+    the diff's +/- markers and the path an a/ or b/ prefix. A quote found only in another file's hunk does not count.
+    A blocker on a file that is not in the PR is left alone: decide() drops it. Returns the verdict and the number
+    downgraded."""
     per_file = _diff_lines(diff)
+    index = {f.path: f for f in ai.parse_diff(diff)}
     out, n = [], 0
     for f in verdict.findings:
-        if f.severity == "blocking":
+        fd = ai.cited_file({"file": f.file.strip().removeprefix("./")}, index) if f.severity == "blocking" else None
+        if fd is not None:
             raw = f.evidence.replace("\r\n", "\n")
-            ev = _ws(raw)
-            ok = bool(f.how_it_fails.strip()) and len(ev) >= EVIDENCE_LINE_MIN and (
-                _quote_in(raw, per_file.get(f.file.removeprefix("./"), []))
-                or _quote_in(raw, _read_at_head(root, f.file).splitlines()))
+            lines = per_file.get(fd.path, [])
+            at_head = _read_at_head(root, fd.path).splitlines()
+            ok = bool(f.how_it_fails.strip()) and any(
+                _quote_in(q, src) for q in (raw, _marker_stripped(raw)) for src in (lines, at_head))
             if not ok:
                 f, n = dataclasses.replace(f, severity="note", downgraded=True), n + 1
         out.append(f)
     return dataclasses.replace(verdict, findings=tuple(out)), n
+
+
+def in_pr_blockers(v: Verdict, diff: str) -> int:
+    """Blocking findings of `v` that cite a file of the PR (the rest are dropped by decide())."""
+    index = {f.path: f for f in ai.parse_diff(diff)}
+    return sum(f.severity == "blocking" and ai.cited_file({"file": f.file.strip().removeprefix("./")}, index) is not None
+               for f in v.findings)
 
 
 def _why_key(why: str) -> str:
@@ -1099,7 +1121,7 @@ def run_passes(cfg: dict, tier: dict, backend: Backend, req: ReviewRequest, root
             failed.append(f"pass {ps['name']} did not complete: {str(e)[:150]}")
             info.append({"name": ps["name"], "error": ai.redact(str(e))[:200]})
             continue
-        n, blockers = 0, sum(f.severity == "blocking" for f in v.findings)
+        n, blockers = 0, in_pr_blockers(v, req.diff)
         if p["require_evidence"]:
             v, n = apply_evidence(v, req.diff, root)
         said_block = said_block or (v.verdict == "block" and blockers > 0 and n == blockers)
@@ -1112,7 +1134,7 @@ def run_passes(cfg: dict, tier: dict, backend: Backend, req: ReviewRequest, root
                      "findings": len(v.findings), "blocking": sum(f.severity == "blocking" for f in v.findings),
                      "downgraded": n})
     merged = merge_verdicts(verdicts, req.sha)
-    unverified = said_block and not any(f.severity == "blocking" for f in merged.findings)
+    unverified = said_block and in_pr_blockers(merged, req.diff) == 0
     return PassesResult(merged, "+".join(dict.fromkeys(models)), _sum_usage(usages), info, down, "; ".join(failed), unverified)
 
 
@@ -1181,7 +1203,7 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
 
 SOURCES = ("opus", "human", "revert", "follow-up-fix")
 CASE_REQUIRED = ("repo", "pr", "head_sha", "ground_truth", "source")
-CASE_OPTIONAL = ("base_sha", "base_ref", "title", "notes", "known_false_claims")
+CASE_OPTIONAL = ("base_sha", "base_ref", "title", "notes", "known_false_claims", "head_sha_fallback")
 GT_REQUIRED = ("id", "file", "line", "category", "summary", "severity")
 GT_OPTIONAL = ("confirmed",)
 CLAIM_REQUIRED = ("id", "file", "summary")
@@ -1191,7 +1213,7 @@ KEYWORDS_NEEDED = 2
 STOPWORDS = frozenset("""a an and are as at be been but by can could do does for from had has have if in into is it its
 may no not of on or our so such than that the their then there these this those to was were when where which while will
 with would you your should must also any all each only over under via per""".split())
-REPLAY_STATES = ("scored", "failed", "skipped")
+REPLAY_STATES = ("scored", "failed", "skipped", "partial")
 
 
 def _hex40(v: object) -> bool:
@@ -1211,8 +1233,8 @@ def validate_case(c: object, where: str = "case") -> dict:
         bad("repo must be OWNER/NAME")
     if type(c["pr"]) is not int or c["pr"] < 1:
         bad("pr must be a positive integer")
-    if not _hex40(c["head_sha"]) or ("base_sha" in c and not _hex40(c["base_sha"])):
-        bad("head_sha and base_sha must be 40 lowercase hex characters")
+    if not _hex40(c["head_sha"]) or any(k in c and not _hex40(c[k]) for k in ("base_sha", "head_sha_fallback")):
+        bad("head_sha, base_sha and head_sha_fallback must be 40 lowercase hex characters")
     if c["source"] not in SOURCES:
         bad("source must be one of " + ", ".join(SOURCES))
     if "base_ref" in c and not (isinstance(c["base_ref"], str) and BASE_RE.fullmatch(c["base_ref"])):
@@ -1340,6 +1362,7 @@ def aggregate(cases: list[dict]) -> dict:
         d["recall"] = _rate(d["found"], d["total"])
     items, found = total("scored_items"), total("found")
     return {"cases_scored": len(sc), "cases_failed": sum(c.get("state") == "failed" for c in cases),
+            "cases_partial": sum(c.get("state") == "partial" for c in cases),
             "cases_skipped": sum(c.get("state") == "skipped" for c in cases), "items": items, "found": found,
             "partial": total("partial"), "missed": total("missed"), "recall": _rate(found, items),
             "recall_lenient": _rate(found + total("partial"), items), "blocking": total("blocking"),
@@ -1376,9 +1399,21 @@ def replay_case(cfg: dict, tier: dict, backend: Backend, cid: str, case: dict) -
     if not any(g.get("confirmed", True) is not False for g in case["ground_truth"]):
         return {**base, "state": "skipped", "reason": "no confirmed ground truth"}
     rcfg = {**cfg, "clone": clone_for(cfg, case["repo"])}
-    sha = case["head_sha"]
+    sha, note = case["head_sha"], ""
     try:
-        with Worktree(rcfg, case["pr"], sha, case.get("base_ref", "main"), case.get("base_sha", ""), True) as wt:
+        with contextlib.ExitStack() as stack:
+            try:
+                wt = stack.enter_context(Worktree(rcfg, case["pr"], sha, case.get("base_ref", "main"),
+                                                  case.get("base_sha", ""), True))
+            except (ReviewFailed, HeadMoved) as e:
+                fb = case.get("head_sha_fallback")
+                if not fb or fb == sha:
+                    raise
+                note = (f"the pinned commit {sha[:12]} could not be checked out ({ai.redact(str(e))[:120]}); used the "
+                        f"PR's final head {fb[:12]} as a fallback, so line coordinates may not match")
+                sha = fb
+                wt = stack.enter_context(Worktree(rcfg, case["pr"], sha, case.get("base_ref", "main"),
+                                                  case.get("base_sha", ""), True))
             diff = git(["diff", "--no-color", "--no-ext-diff", wt.base_sha, sha], wt.path) + "\n"
             files = ai.parse_diff(diff)
             if not files:
@@ -1390,6 +1425,11 @@ def replay_case(cfg: dict, tier: dict, backend: Backend, cid: str, case: dict) -
     except (ReviewFailed, HeadMoved) as e:
         return {**base, "state": "failed", "error": ai.redact(str(e))[:300],
                 "duration_s": round(time.monotonic() - started, 1)}
+    if note:
+        base = {**base, "head_sha_used": sha, "note": note}
+    if result.partial:                                              # a pass failed: its recall would be understated
+        return {**base, "state": "partial", "partial": ai.redact(str(result.partial))[:300], "passes": result.passes,
+                "cost_usd": result.usage.get("cost_usd"), "duration_s": round(time.monotonic() - started, 1)}
     found = [{"file": f.file, "line": f.line, "severity": f.severity, "category": f.category, "why": f.why,
               "evidence": f.evidence, "how_it_fails": f.how_it_fails, **({"downgraded": True} if f.downgraded else {})}
              for f in result.verdict.findings]
@@ -1454,7 +1494,7 @@ def replay(cfg: dict, corpus: Path, tier_name: str, out: Path, limit: int | None
     finally:
         held.close()
     print(format_report(report))
-    return FAILED if report["aggregate"]["cases_failed"] else OK
+    return FAILED if report["aggregate"]["cases_failed"] or report["aggregate"]["cases_partial"] else OK
 
 
 def _f(v: object, spec: str = ".2f") -> str:
@@ -1473,9 +1513,9 @@ def format_report(report: dict) -> str:
                         f"{c['missed']:>5}{c['blocking']:>6}{c['false_blockers']:>4}{c['candidates']:>5}"
                         f"{_f(c.get('cost_usd')):>8}{_f(c.get('duration_s'), '.1f'):>8}")
         else:
-            rows.append(f"{str(c.get('id'))[:27]:<28}{c.get('state', '?'):<9} {c.get('error') or c.get('reason') or ''}")
+            rows.append(f"{str(c.get('id'))[:27]:<28}{c.get('state', '?'):<9} {c.get('error') or c.get('reason') or c.get('partial') or ''}")
     rows += ["", f"AGGREGATE over {agg['cases_scored']} scored case(s) ({agg['cases_failed']} failed, "
-                 f"{agg['cases_skipped']} skipped)",
+                 f"{agg.get('cases_partial', 0)} partial and not scored, {agg['cases_skipped']} skipped)",
              f"  recall {_f(agg['recall'])} (found {agg['found']}/{agg['items']}; with partial "
              f"{_f(agg['recall_lenient'])})",
              f"  false-blocker rate {_f(agg['false_blocker_rate'])} ({agg['false_blockers']} confirmed, "
@@ -1633,6 +1673,8 @@ def build_case(repo: str, pr: dict, commits: list[dict], reviewers: frozenset[st
             "ground_truth": gt}
     if _hex40(base.get("sha")):
         case["base_sha"] = base["sha"]
+    if pinned != str(pr["headRefOid"]) and _hex40(pr["headRefOid"]):
+        case["head_sha_fallback"] = str(pr["headRefOid"])           # replay uses it if the pinned commit is gone
     return validate_case(case, f"built case {repo}#{n}")
 
 

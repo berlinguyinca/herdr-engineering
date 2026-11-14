@@ -481,13 +481,6 @@ def test_findings_on_files_outside_the_pr_are_dropped(env):
     assert d.state == "success" and "1 finding dropped" in d.description and len(d.dropped) == 1
 
 
-def test_a_blocker_on_a_file_outside_the_pr_cannot_be_verified_so_tier2_stays_pending(env):
-    env.config(post=True)
-    env.reviewer("claude", answer=block(file="src/other.py"))
-    assert env.review("tier2", post=True) == 1
-    assert [s for s in env.statuses_posted() if s["state"] in ("success", "failure")] == []
-
-
 def test_a_malformed_answer_leaves_the_status_pending(env):
     env.config(post=True)
     for bad in ("LGTM, approve!", {**APPROVE, "head_sha": "b" * 40}, {**APPROVE, "extra": 1}):
