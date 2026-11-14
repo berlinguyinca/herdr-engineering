@@ -26,7 +26,7 @@ id = "open"
 title = "Open Agent Operations map"
 description = "Open the Agent Operations map in a split pane"
 contexts = ["workspace", "global"]
-command = ["herdr", "plugin", "pane", "open", "herdr.agent-ops", "map"]
+command = ["herdr", "plugin", "pane", "open", "--plugin", "herdr.agent-ops", "--entrypoint", "map"]
 
 # Doctor: fetch one frame from the control plane; exits non-zero when the API is unreachable or agent_ops is off.
 [[actions]]
