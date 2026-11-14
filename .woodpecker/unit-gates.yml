@@ -22,7 +22,7 @@ when:
 # superseded pipeline in seconds instead of letting it run the gate.
 concurrency:
   limit: 1
-  group: "{{branch}}"
+  group: "${CI_WORKFLOW_NAME}-${CI_COMMIT_SOURCE_BRANCH}"
 
 # The whole suite starts real HTTP services and PostgreSQL clusters. Use the
 # dedicated 16-CPU/64-GiB Hive pool. The generic hive label also matches

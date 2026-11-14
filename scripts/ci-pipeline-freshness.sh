@@ -1,43 +1,45 @@
 #!/bin/bash
-# Stop a pipeline whose commit has been superseded on its branch.
+# Stop a pipeline whose commit has been superseded on its pull request.
 #
 # .woodpecker/unit-gates.yml and .woodpecker/ui-gates.yml declare
-#     concurrency: {limit: 1, group: "{{branch}}"}
+#     concurrency: {limit: 1, group: "${CI_WORKFLOW_NAME}-${CI_COMMIT_SOURCE_BRANCH}"}
 # so a new commit on a branch queues its pipeline instead of running it on a
 # second agent beside the older one. Without this guard, every superseded
 # pipeline that reaches the queue would still spend the whole gate (a full
 # venv + the entire test suite) on a commit that is no longer the head of its
-# branch. The guard compares this pipeline's commit against the current head:
-#   push          -> head of main (push pipelines exist only on main)
-#   pull_request  -> head of the PR's source branch (Woodpecker checks out the
-#                    PR head commit, not a merge with main)
+# pull request. The guard compares this pipeline's commit against the current
+# head of the PR: refs/pull/N/head (it exists for fork PRs too), falling back
+# to the source branch. Woodpecker checks out the PR head commit, not a merge
+# with main. Only source-branch variables are used: CI_COMMIT_BRANCH is the
+# TARGET branch (main) for a pull_request pipeline.
 # A superseded pipeline exits 1 here, before any install work; the newer
 # pipeline is the one that runs the gate.
 #
-# Manual runs (and any event this script does not recognise) always run:
-# re-running an old commit by hand is how a pipeline is debugged.
+# Every other event (push, cron, manual) always runs: re-running an old commit
+# by hand is how a pipeline is debugged, and push/cron pipelines run on main.
 #
 # Fail open on anything unexpected (missing variables, no remote, empty
 # answer): a guard that cannot tell must not stop a pipeline that is the
 # newest on its branch.
 set -eu
 
-case "${CI_EVENT:-}" in
-  push|pull_request) ;;
-  *) exit 0 ;;
-esac
+[ "${CI_PIPELINE_EVENT:-${CI_EVENT:-}}" = "pull_request" ] || exit 0
 
-if [ "$CI_EVENT" = "push" ]; then
-  branch="main"
-else
-  branch="${CI_BRANCH:-${CI_COMMIT_BRANCH:-}}"
+pr="${CI_COMMIT_PULL_REQUEST:-}"
+branch="${CI_COMMIT_SOURCE_BRANCH:-}"
+if [ -n "$pr" ]; then ref="refs/pull/${pr}/head"
+elif [ -n "$branch" ]; then ref="refs/heads/${branch}"
+else exit 0
 fi
-[ -n "$branch" ] || exit 0
 
 # The checkout step created `origin` in this workspace.
-head="$(git ls-remote origin "refs/heads/${branch}" 2>/dev/null | awk '{print $1}' || true)"
+head="$(git ls-remote origin "$ref" 2>/dev/null | awk '{print $1}' || true)"
+if [ -z "$head" ] && [ -n "$branch" ] && [ "$ref" != "refs/heads/${branch}" ]; then
+  ref="refs/heads/${branch}"
+  head="$(git ls-remote origin "$ref" 2>/dev/null | awk '{print $1}' || true)"
+fi
 if [ -z "$head" ]; then
-  echo "freshness guard: could not read the head of ${branch}; running the pipeline" >&2
+  echo "freshness guard: could not read the head of ${ref}; running the pipeline" >&2
   exit 0
 fi
 
@@ -45,6 +47,6 @@ commit="${CI_COMMIT_SHA:-}"
 [ -n "$commit" ] || exit 0
 
 if [ "$head" != "$commit" ]; then
-  echo "superseded: commit ${commit} is no longer the head of ${branch} (now ${head}); the newer pipeline runs the gate"
+  echo "superseded: commit ${commit} is no longer the head of ${ref} (now ${head}); the newer pipeline runs the gate"
   exit 1
 fi
