@@ -4,7 +4,15 @@
 (`https://ci.metabolomics.us`). It runs on bender every 30 minutes from the
 user timer `herdr-ci-agent-prune.timer`; each deletion is logged to the journal
 (`journalctl --user -u herdr-ci-agent-prune`). The token is read from
-`~/.config/woodpecker/token` and is never printed.
+`~/.config/woodpecker/token` and is never printed; create it with mode 0600
+(`install -m0600 /dev/null ~/.config/woodpecker/token`), the script refuses a
+group/other-accessible token file.
+
+Guards: a run aborts with nothing deleted (exit 3) if candidates exceed 50% of
+scanned system agents, or if no agent has contacted the server in the last 60
+minutes (`--recent-contact-mins`; e.g. server just restarted). At most 50
+deletions per run (`--max-deletions`). Agents missing owner/org fields are never
+deleted. A 409 on one delete is skipped and counted.
 
 Deleted: system agents (`owner_id=-1`) that never contacted the server and are
 older than 1 hour, or have had no contact and no work for 24 hours. Never
@@ -23,4 +31,7 @@ install -D -m0755 deploy/ci-agent-hygiene/wpci-agent-prune ~/.local/libexec/wpci
 install -D -m0644 deploy/ci-agent-hygiene/herdr-ci-agent-prune.{service,timer} -t ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now herdr-ci-agent-prune.timer
 ~/.local/libexec/wpci-agent-prune          # dry run
+loginctl enable-linger "$USER"             # user timer keeps running without a login session
 ```
+
+Disable: `systemctl --user disable --now herdr-ci-agent-prune.timer`.
