@@ -619,6 +619,31 @@ def test_429_and_5xx_are_retried_with_backoff(env):
     assert len(env.rev_calls()) == 3 and len(env.sleeps) == 2 and env.sleeps[0] >= 3
 
 
+def test_a_busy_single_slot_gateway_is_waited_for_beyond_the_retry_count(env):
+    # deepseek has one slot: while another review holds it every call answers 429, for minutes. That is waiting for
+    # the slot, not a failure, so it is not bounded by `retries` (4 retries = ~75 s) but by `busy_wait_s`.
+    env.responses([{"status": 429}] * 9 + [{"content": EMPTY}])
+    assert review(env) == 0
+    assert [s["state"] for s in env.terminal()] == ["success"]
+    assert len(env.rev_calls()) == 10 and len(env.sleeps) == 9
+    assert max(env.sleeps) <= 60
+
+
+def test_a_gateway_busy_for_longer_than_busy_wait_fails_and_posts_no_success(env):
+    env.responses([{"status": 429}])
+    env.config({"reviewer": {"busy_wait_s": 100}})
+    assert review(env) == 1
+    assert env.terminal() == []
+    assert sum(env.sleeps) <= 100
+
+
+def test_429_does_not_spend_the_5xx_retry_budget(env):
+    env.responses([{"status": 429}, {"status": 429}, {"status": 503}, {"status": 503}, {"status": 503},
+                   {"status": 503}, {"content": EMPTY}])
+    assert review(env) == 0
+    assert [s["state"] for s in env.terminal()] == ["success"]
+
+
 def test_persistent_5xx_fails_the_run(env):
     env.responses([{"status": 500}])
     assert review(env) == 1

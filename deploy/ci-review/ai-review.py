@@ -80,6 +80,9 @@ DEFAULTS: dict = {
         "deadline_s": 1800,                      # longest one streamed answer may take
         "retries": 4,                            # extra attempts on 429 / 5xx / connection errors
         "backoff_s": 5.0,                        # first backoff; doubles; Retry-After wins (capped at 60 s)
+        # 429 means "the slot is taken" (deepseek serves one request at a time; another review may hold it for
+        # minutes). It is waited out for up to this many seconds in total, and does not spend `retries`
+        "busy_wait_s": 1800,
         "parallel": 1,                           # chunks in flight at once; the gateway is shared
         # exact tailnet IPv4 literals (100.64.0.0/10) whose provider baseUrl may be plain http: the key then crosses
         # the tailnet without TLS (WireGuard still encrypts the link). Empty: https only
@@ -197,8 +200,8 @@ def load_config(path: str | None) -> dict:
         raise Refused("config: reviewer.response_format must be json_schema, json_object or none")
     if not 1 <= r["parallel"] <= 8:
         raise Refused("config: reviewer.parallel must be 1..8")
-    if r["max_tokens"] < 1024 or r["timeout_s"] < 1 or r["retries"] < 0:
-        raise Refused("config: reviewer.max_tokens/timeout_s/retries out of range")
+    if r["max_tokens"] < 1024 or r["timeout_s"] < 1 or r["retries"] < 0 or r["busy_wait_s"] < 0:
+        raise Refused("config: reviewer.max_tokens/timeout_s/retries/busy_wait_s out of range")
     for h in r["allow_plain_http_hosts"]:
         if not plain_http_host_ok(h):
             raise Refused(f"config: reviewer.allow_plain_http_hosts: {h!r} is not an exact IPv4 address in the "
@@ -486,9 +489,14 @@ class Gateway:
             conn.close()
 
     def call(self, method: str, sub: str, body: dict | None = None) -> dict:
-        attempts = self.r["retries"] + 1
-        for k in range(attempts):
-            wait = float(self.r["backoff_s"]) * (2 ** k)
+        """Retries 5xx and connection errors `retries` times. 429 (a single-slot model that is busy) is waited out
+        separately, up to `busy_wait_s` of total waiting, so a slow neighbour does not fail the review. Anything
+        that stays failing raises ReviewFailed; nothing here ever turns a failure into a success."""
+        failures = busy = 0
+        busy_waited = 0.0
+        while True:
+            is_busy = False
+            wait = float(self.r["backoff_s"]) * (2 ** failures)
             try:
                 status, headers, raw = self._once(method, sub, body)
             except Transient as e:
@@ -509,14 +517,26 @@ class Gateway:
                 if status != 429 and status < 500:
                     raise ReviewFailed(f"the gateway refused {sub}: HTTP {status}: {snippet}")
                 why = f"HTTP {status}"
+                is_busy = status == 429
+                if is_busy:
+                    wait = float(self.r["backoff_s"]) * (2 ** busy)
                 try:
                     wait = min(RETRY_AFTER_MAX, max(wait, float(headers.get("retry-after", ""))))
                 except ValueError:
-                    pass
-            if k + 1 < attempts:
-                say(f"gateway {sub}: {why}; retrying in {wait:.0f}s")
-                pause(wait)
-        raise ReviewFailed(f"the gateway kept failing on {sub}: {why}")
+                    if is_busy:
+                        wait = min(RETRY_AFTER_MAX, wait)
+            if is_busy:
+                busy += 1
+                if busy_waited + wait > float(self.r["busy_wait_s"]):
+                    raise ReviewFailed(f"the gateway stayed busy (HTTP 429) on {sub} for "
+                                       f"{busy_waited:.0f}s; reviewer.busy_wait_s is {self.r['busy_wait_s']}")
+                busy_waited += wait
+            else:
+                failures += 1
+                if failures > self.r["retries"]:
+                    raise ReviewFailed(f"the gateway kept failing on {sub}: {why}")
+            say(f"gateway {sub}: {why}; retrying in {wait:.0f}s")
+            pause(wait)
 
     def models(self) -> list[str]:
         out = self.call("GET", "/models")
