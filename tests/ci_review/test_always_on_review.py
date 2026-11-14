@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,8 @@ if argv[:2] == ["pr", "view"]:
     out({"number": int(n), "headRefOid": head(n), "state": "OPEN", "isDraft": p.get("draft", False),
          "title": p.get("title", "t"), "body": p.get("body", ""), "baseRefName": "main", "commits": []})
 elif argv[:2] == ["pr", "diff"]:
+    if pr(argv[2]).get("diff_error"):
+        sys.stderr.write(pr(argv[2])["diff_error"]); sys.exit(1)
     sys.stdout.write(pr(argv[2])["diff"])
 elif argv[:2] == ["pr", "list"]:
     out([{"number": int(n), "headRefOid": head(n), "isDraft": pr(n).get("draft", False)} for n in st["prs"]])
@@ -128,7 +131,8 @@ if name == "claude":
     sys.stdout.write(json.dumps({"is_error": cfg.get("is_error", False), "result": json.dumps(ans),
                                  "structured_output": ans if isinstance(ans, dict) else None,
                                  "total_cost_usd": 0.5, "usage": cfg.get("usage", {"input_tokens": 10, "output_tokens": 5}),
-                                 "modelUsage": {"claude-opus-5-5": {}}}))
+                                 "modelUsage": {"claude-opus-5-5": {}},
+                                 **({"num_turns": cfg["num_turns"]} if "num_turns" in cfg else {})}))
 else:
     sys.stdout.write(ans if isinstance(ans, str) else json.dumps(ans))
 '''
@@ -138,7 +142,8 @@ APPROVE = {"head_sha": "@HEAD", "verdict": "approve", "findings": [], "checked":
 
 def block(file="src/a.py", line=2, why="eval of input"):
     return {"head_sha": "@HEAD", "verdict": "block", "checked": ["code"],
-            "findings": [{"file": file, "line": line, "severity": "blocking", "category": "security", "why": why}]}
+            "findings": [{"file": file, "line": line, "severity": "blocking", "category": "security", "why": why,
+                          "evidence": "return eval(x)", "how_it_fails": "x = '__import__(\"os\")' runs code"}]}
 
 
 def sh(*a, cwd):
@@ -186,12 +191,13 @@ class Env:
         self.config()
         self.mod = load()
 
-    def config(self, extra: str = "", post: bool = False) -> None:
+    def config(self, extra: str = "", post: bool = False, wait: bool | None = True) -> None:
+        wait_key = "" if wait is None else f", wait_for_green: {str(wait).lower()}"
         self.cfg_path.write_text(textwrap.dedent(f"""\
             state_dir: {self.tmp}/state
             clone: {self.clone}
             post: {str(post).lower()}
-            gates: {{required: {json.dumps(GATES)}, when_present: [{WHEN_PRESENT}]}}
+            gates: {{required: {json.dumps(GATES)}, when_present: [{WHEN_PRESENT}]{wait_key}}}
             poll: {{max_per_run: 5}}
             """) + textwrap.dedent(extra))
 
@@ -338,7 +344,7 @@ def test_config_rejects_unknown_keys_backends_and_equal_contexts(env):
 def test_posting_needs_both_the_config_key_and_the_flag(env):
     for post_cfg, flag in ((False, False), (True, False), (False, True)):
         env.config(post=post_cfg)
-        assert env.review("tier2", post=flag, *["--force"]) == 0
+        assert env.review("tier2", "--force", post=flag) == 0
     assert env.gh_writes() == []                               # three real reviews, not one write
     assert len(env.reviewer_calls()) == 3
 
@@ -466,24 +472,24 @@ def test_a_blocking_finding_posts_failure_and_one_marked_comment(env):
     assert env.statuses_posted()[-1]["state"] == "failure"
     (c,) = env.gh_state()["comments"]
     assert c["body"].startswith("<!-- always-on-review:opus-agent-review -->") and "src/a.py:2" in c["body"]
-    assert env.review("tier2", post=True, *["--force"]) == 0                        # a re-run updates, not adds
+    assert env.review("tier2", "--force", post=True) == 0                        # a re-run updates, not adds
     assert len(env.gh_state()["comments"]) == 1
 
 
 def test_findings_on_files_outside_the_pr_are_dropped(env):
-    env.config(post=True)
-    env.reviewer("claude", answer=block(file="src/other.py"))
-    assert env.review("tier2", post=True) == 0
-    last = env.statuses_posted()[-1]
-    assert last["state"] == "success" and "1 finding dropped" in last["description"]
-    assert env.gh_state().get("comments", []) == []
+    m = env.mod
+    diff = env.gh_state()["prs"]["7"]["diff"]
+    index = {f.path: f for f in m.ai.parse_diff(diff)}
+    ans = {**block(file="src/other.py"), "head_sha": "a" * 40}
+    d = m.decide(m.parse_verdict(ans, "a" * 40), index, "m")
+    assert d.state == "success" and "1 finding dropped" in d.description and len(d.dropped) == 1
 
 
 def test_a_malformed_answer_leaves_the_status_pending(env):
     env.config(post=True)
     for bad in ("LGTM, approve!", {**APPROVE, "head_sha": "b" * 40}, {**APPROVE, "extra": 1}):
         env.reviewer("claude", answer=bad)
-        assert env.review("tier2", post=True, *["--force"]) == 1
+        assert env.review("tier2", "--force", post=True) == 1
     assert {s["state"] for s in env.statuses_posted()} == {"pending"}
     assert env.gh_state().get("comments", []) == []
 
@@ -613,3 +619,217 @@ def test_gateway_backend_reviews_through_the_openai_compatible_endpoint(env, tmp
         assert env.reviewer_calls() == [] and T.KEY not in (env.bin / "gh.log").read_text()
     finally:
         gw.stop()
+
+
+# ---------------- the clone the worktrees come from ----------------
+
+def test_a_bare_clone_is_accepted_for_the_detached_worktree(env, tmp_path):
+    bare = tmp_path / "bare.git"
+    sh("git", "clone", "-q", "--bare", str(env.origin), str(bare), cwd=tmp_path)
+    sh("git", "remote", "set-url", "origin", str(env.origin), cwd=bare)
+    env.cfg_path.write_text(env.cfg_path.read_text().replace(f"clone: {env.clone}", f"clone: {bare}"))
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+    assert env.reviewer_calls()[0]["head"] == env.head
+    assert sh("git", "for-each-ref", "refs/herdr-review", cwd=bare) == ""
+
+
+@pytest.mark.parametrize("kind", ["missing", "empty-dir", "inside-other-repo", "dot-git-file-to-nowhere"])
+def test_a_clone_that_is_not_a_git_repository_root_is_refused(env, tmp_path, kind):
+    path = tmp_path / "notaclone"
+    if kind != "missing":
+        path.mkdir()
+    if kind == "inside-other-repo":
+        path = env.clone / "src"                    # inside a work tree, but not a repository root
+    if kind == "dot-git-file-to-nowhere":
+        (path / ".git").write_text("gitdir: /nonexistent\n")
+    env.cfg_path.write_text(env.cfg_path.read_text().replace(f"clone: {env.clone}", f"clone: {path}"))
+    assert env.review("tier2") == 2 and env.reviewer_calls() == []
+
+
+# ---------------- the green-only gate is optional ----------------
+
+def _red_head(env):
+    st = env.gh_state()
+    st["statuses"][env.head][1]["state"] = "pending"
+    st["check_runs"][env.head][0]["conclusion"] = "failure"
+    env.write_gh(st)
+
+
+def test_by_default_tier2_reviews_a_head_whose_checks_are_not_green(env):
+    env.config(wait=None)                                    # the key is absent: the default applies
+    _red_head(env)
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+    assert env.reviewer_calls()[0]["head"] == env.head
+
+
+def test_by_default_tier2_needs_no_configured_gates(env):
+    env.cfg_path.write_text(env.cfg_path.read_text().replace(json.dumps(GATES), "[]").replace(
+        ", wait_for_green: true", ""))
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+
+
+def test_wait_for_green_true_restores_the_gate(env):
+    env.config(wait=True)
+    _red_head(env)
+    assert env.review("tier2") == 4 and env.reviewer_calls() == []
+
+
+def test_wait_for_green_false_skips_the_gate_and_must_be_a_boolean(env):
+    env.config(wait=False)
+    _red_head(env)
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+    env.cfg_path.write_text(env.cfg_path.read_text().replace("wait_for_green: false", "wait_for_green: yes please"))
+    assert env.review("tier2", "--force") == 2
+
+
+# ---------------- issue #790: diffs over GitHub's 20,000-line limit ----------------
+
+TOO_LARGE = ("could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines "
+             "(20000) (https://api.github.com/repos/acme/widget/pulls/7)")
+
+
+def _too_large(env, error=TOO_LARGE):
+    st = env.gh_state()
+    st["prs"]["7"]["diff_error"] = error
+    env.write_gh(st)
+
+
+def test_a_diff_over_githubs_line_limit_is_taken_from_the_local_worktree(env):
+    _too_large(env)
+    env.config(post=True)
+    assert env.review("tier2", post=True) == 0
+    [call] = env.reviewer_calls()
+    assert call["head"] == env.head and "return eval(x)" in call["stdin"] + " ".join(call["argv"])
+    assert [s["state"] for s in env.statuses_posted()] == ["pending", "success"]
+
+
+def test_the_local_diff_still_drives_the_in_pr_rules(env):
+    _too_large(env)
+    env.reviewer("claude", answer=block(file="src/a.py", line=2))
+    env.config(post=True)
+    assert env.review("tier2", post=True) == 0
+    assert env.statuses_posted()[-1]["state"] == "failure"                  # the finding is on a file in the diff
+    env.reviewer("claude", answer=block(file="src/not_in_pr.py", line=2))
+    assert env.review("tier2", "--force", post=True) == 0
+    assert env.statuses_posted()[-1]["state"] != "failure"                  # dropped: not in the local diff
+
+
+def test_any_other_diff_failure_still_fails_the_review(env):
+    _too_large(env, "gh: HTTP 502: bad gateway")
+    assert env.review("tier2") == 1 and env.reviewer_calls() == []
+
+
+# ---------------- issue #792 follow-up: tiers.<name>.daily_budget_usd ----------------
+
+BUDGET = "tiers: {tier2: {daily_budget_usd: 1.0}}\n"      # the fake claude reports total_cost_usd 0.5 per review
+
+
+def _log_lines(env):
+    return [json.loads(x) for x in (env.tmp / "state/reviews.jsonl").read_text().splitlines()]
+
+
+def test_below_the_daily_budget_the_review_runs(env):
+    env.config(BUDGET, post=True)
+    assert env.review("tier2", post=True) == 0
+    assert len(env.reviewer_calls()) == 1 and _log_lines(env)[-1]["usage"]["cost_usd"] == 0.5
+
+
+def test_at_the_daily_budget_the_review_is_skipped_and_stays_pending(env, capsys):
+    env.config(BUDGET, post=True)
+    assert env.review("tier2", post=True) == 0                      # 0.5 spent, under 1.0
+    assert env.review("tier2", "--force", post=True) == 0        # 1.0 spent: now at the budget
+    posted = env.statuses_posted()
+    capsys.readouterr()
+    assert env.review("tier2", "--force", post=True) == 4        # SKIPPED, nothing run, nothing posted
+    assert len(env.reviewer_calls()) == 2 and env.statuses_posted() == posted
+    err = capsys.readouterr().err
+    assert err.count("daily budget") == 1 and "tier2" in err and "exhausted" in err
+
+
+def test_spend_from_a_previous_utc_day_is_ignored(env):
+    env.config(BUDGET, post=True)
+    env.review("tier2", post=True)
+    env.review("tier2", "--force", post=True)
+    yesterday = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path = env.tmp / "state/reviews.jsonl"
+    path.write_text("".join(json.dumps({**x, "ts": yesterday}) + "\n" for x in _log_lines(env)))
+    assert env.review("tier2", "--force", post=True) == 0 and len(env.reviewer_calls()) == 3
+
+
+def test_only_the_same_tiers_spend_counts(env):
+    env.config(BUDGET, post=True)
+    assert env.review("tier1", post=True) == 0
+    env.reviewer("pi", answer=APPROVE)
+    path = env.tmp / "state/reviews.jsonl"
+    path.write_text("".join(json.dumps({**x, "usage": {"cost_usd": 99}}) + "\n" for x in _log_lines(env)))
+    assert env.review("tier2", post=True) == 0 and len(env.reviewer_calls()) == 2
+
+
+def test_no_budget_means_no_limit(env):
+    env.config(post=True)
+    for _ in range(4):
+        assert env.review("tier2", "--force", post=True) == 0
+    assert len(env.reviewer_calls()) == 4
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "'5'", "true", ".nan", ".inf", "[1]", str(10**400)])
+def test_an_invalid_daily_budget_is_refused(env, bad):
+    env.config(f"tiers: {{tier2: {{daily_budget_usd: {bad}}}}}\n")
+    assert env.review("tier2") == 2 and env.reviewer_calls() == []
+
+
+def test_spend_of_a_review_whose_head_moved_counts(env):
+    env.config(BUDGET, post=True)
+    st = env.gh_state()
+    st["prs"]["7"]["head_after_review"] = "c" * 40
+    env.write_gh(st)
+    assert env.review("tier2", post=True) == 3
+    assert _log_lines(env)[-1]["state"] == "head-moved" and _log_lines(env)[-1]["usage"]["cost_usd"] == 0.5
+    assert env.mod.spent_today_usd(env.mod.load_config(env.cfg_path), "tier2") == 0.5
+
+
+def test_spend_of_a_review_whose_passes_all_failed_counts(env):
+    env.config(BUDGET, post=True)
+    env.reviewer("claude", answer={"head_sha": "@HEAD", "verdict": "maybe"})      # model ran and billed; not a verdict
+    assert env.review("tier2", post=True) == 1
+    assert _log_lines(env)[-1]["state"] == "not-run" and _log_lines(env)[-1]["usage"]["cost_usd"] == 0.5
+    assert env.mod.spent_today_usd(env.mod.load_config(env.cfg_path), "tier2") == 0.5
+
+
+def test_a_non_finite_logged_cost_counts_as_zero(env):
+    env.config(BUDGET, post=True)
+    assert env.review("tier2", post=True) == 0
+    now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with (env.tmp / "state/reviews.jsonl").open("a") as f:
+        for bad in ("NaN", "Infinity", "-Infinity"):
+            f.write('{"ts": "%s", "tier": "tier2", "usage": {"cost_usd": %s}}\n' % (now, bad))
+    assert env.mod.spent_today_usd(env.mod.load_config(env.cfg_path), "tier2") == 0.5
+
+
+def test_an_undecodable_byte_in_the_log_skips_that_line_only(env):
+    env.config(BUDGET, post=True)
+    assert env.review("tier2", post=True) == 0
+    with (env.tmp / "state/reviews.jsonl").open("ab") as f:
+        f.write(b'\xff\xfe not utf-8\n')
+    assert env.mod.spent_today_usd(env.mod.load_config(env.cfg_path), "tier2") == 0.5
+    assert env.review("tier2", "--force", post=True) == 0
+
+
+def test_a_pass_that_hits_the_time_cap_does_not_recount_the_previous_passes_usage(env):
+    """A real Backend (it sleeps, then answers) used directly: pass 1 uses up the whole cap, so pass 2 stops at the
+    cap check before it calls any backend. Pass 1's usage must be counted exactly once."""
+    env.config(BUDGET)
+    cfg = env.mod.load_config(env.cfg_path)
+
+    class Slow:
+        name, needs_worktree = "slow", False
+
+        def review(self, req, time_cap_s):
+            time.sleep(0.3)
+            answer = {"head_sha": req.sha, "verdict": "approve", "findings": [], "checked": ["code"]}
+            return env.mod.RawReview(answer, "m", 0.3, {"cost_usd": 0.5})
+
+    tier = {**cfg["tiers"]["tier2"], "time_cap_s": 0.2, "passes": [{"name": "a", "focus": ""}, {"name": "b", "focus": ""}]}
+    req = env.mod.ReviewRequest(REPO, 7, env.head, "t", "", "", "", [])
+    result = env.mod.run_passes(cfg, tier, Slow(), req, None)
+    assert result.partial and result.usage["cost_usd"] == 0.5

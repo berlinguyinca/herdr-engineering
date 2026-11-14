@@ -3,7 +3,7 @@
 ## Provenance
 
 - Execution host: `bender` (Linux); Mac origin: SSH alias `macbook-pro`, remote hostname `mac.lan`.
-- Archive origin: `/Users/wohlgemuth/Downloads/herdr-fabric-scheduler-2026-10-25.zip`.
+- Archive origin: `<home>/Downloads/herdr-fabric-scheduler-2026-10-25.zip`.
 - Archive SHA-256: `85c84d7f72c9e668aca47e0196a8ce9af75cefa87bc13a44403b4d1d9beae39c`.
 - Extraction: this directory only; the verified ZIP prefix is `herdr-fabric-scheduler-2026-10-25/`.
 - Repository branch: `main`; HEAD and dirty-worktree state were captured before scheduler edits. Existing dirty control-plane/publication work is preserved.

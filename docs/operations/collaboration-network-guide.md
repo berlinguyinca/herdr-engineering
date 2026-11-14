@@ -829,6 +829,35 @@ helper's own agent (their cursor still moves past them).
   provisioner added them (they were not in the group before), and they never accepted any invitation. Anyone you
   added to the group by hand, or who already joined a room, stays; the Cognito account is never deleted.
 * A leaked agent credential: revoke it on the AI agents page.
+* An agent whose credential expired: **Renew access** on the AI agents page (or `POST /api/v1/collab/agents/<id>/renew`
+  as the signed-in owner). It keeps the agent id, name and device, mints a NEW credential (shown once; re-run the connect
+  snippet with it) and starts a fresh window of the connect lifetime (30 days by default). The old credential stops
+  working at once. Only the owner can do it (anyone else gets 404). Revoked agents, helper agents, fabric-machine
+  identities and externally invited agents are refused: an external agent never lives past its invite's hard expiry.
+* From a shell: `herdr-eng collab agents list` (id, name, harness, status, expires_at, renewable; never a credential) and
+  `herdr-eng collab agents renew <agent-id|@name> --credential-file ~/.config/herdr/<name>.cred`. It calls the collab
+  operator listener (`--operator-url`, else `HERDR_COLLAB_OPERATOR_URL`, default `http://127.0.0.1:9482`; no sign-in, the
+  listener acts as the operator) and writes the NEW credential only to that file (created 0600; an existing file is refused
+  without `--force`, and before anything is renewed). It prints the agent id, the new `expires_at` and `grants_restored`,
+  never the credential, unless you pass `--print-credential` (stdout only). `--json` gives the same fields. Exit 1 with the
+  server's message on 404 (not yours), 403 (cannot be renewed), 409 (revoked) and 429 (agent cap); 2 when neither
+  `--credential-file` nor `--print-credential` is given, because the old credential dies at once.
+  **After renewing, update the harness with the new credential**: the `claude mcp add` header, `~/.codex/config.toml`, or the
+  credential file a collab-spawn reads. Until then that harness is locked out.
+* Room grants have their own expiry (30 days by default) and the service drops a lapsed grant, so an expired agent has
+  usually lost its rooms. A renew therefore also re-grants, with the SAME actions, every room grant of the agent that
+  lapsed, and extends every one that would lapse before the new credential does, to the new credential expiry (the reply
+  lists them as `grants_restored`). Only rooms the renewing user owns are restored: where the owner is only a
+  contributor the room owner must approve the agent again, and a grant the owner removed by hand is never brought back.
+  A restored grant runs to the new credential expiry, not its old one. Once a grant has lapsed the owner cannot stop its
+  restore by removing it (that answers 404): revoke the agent, or remove the person from the room. Team-attached and
+  coordinator grants are left alone, and a team attach or a coordinator designation replaces the lapsed direct grant for good.
+* Agents made by **Connect an agent** also slide: a successful use once less than half the window is left pushes the
+  expiry out to a full window again (about two log events per window), so an agent in daily use does not expire. Sliding
+  stops at 180 days after the agent was made or last renewed (an absolute cap): after that it expires and the owner must
+  renew it. A stolen credential that is used regularly therefore lives until the owner revokes it or that cap is
+  reached. Sliding does not touch room grants, which keep their own expiry. An agent that is already expired or revoked
+  is never revived by use; renew it instead. Helper, fabric and external agents never slide.
 
 ### 5.3 Health and routine tasks
 * Containers: `docker ps | grep herdr-collab` shows `herdr-collab-edge` (TLS front),

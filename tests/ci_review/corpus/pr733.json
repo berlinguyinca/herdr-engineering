@@ -1,0 +1,68 @@
+{
+ "repo": "berlinguyinca/herdr-engineering",
+ "pr": 733,
+ "head_sha": "7225e12dd9bdb174ed816285902a3f50c1d58c5b",
+ "base_sha": "22ecf0f16d104c4ca9d0d47934f1323ee7633289",
+ "base_ref": "main",
+ "title": "perf(web): configurable gc thresholds via control_plane.gc",
+ "source": "opus",
+ "notes": "Seeded from the Opus review of the pre-fix head. Files and lines are approximate positions in that head; severities are the seeding agent's reading (blocking for behaviour defects, note for test hygiene). Confirm before treating as final.",
+ "ground_truth": [
+  {
+   "id": "order-dependent-gc-test",
+   "file": "tests/control_plane/test_stall_watch.py",
+   "line": 97,
+   "category": "tests",
+   "summary": "order-dependent test_tune_gc_without_freeze_keeps_heap_collectable",
+   "severity": "note"
+  },
+  {
+   "id": "web-tests-leak-gc-state",
+   "file": "tests/control_plane/test_stall_watch.py",
+   "line": 81,
+   "category": "tests",
+   "summary": "web tests leak gc thresholds and freeze state to later tests",
+   "severity": "note"
+  },
+  {
+   "id": "hardcoded-python312-gen0",
+   "file": "herdr_engineering/control_plane/stall_watch.py",
+   "line": 89,
+   "category": "code",
+   "summary": "hardcoded python3.12 default gen0 700 depends on the interpreter version",
+   "severity": "blocking"
+  },
+  {
+   "id": "gen2-default-undocumented",
+   "file": "CHANGELOG.md",
+   "line": null,
+   "category": "docs",
+   "summary": "default gen2 changed from 10 to 1000 undocumented in the changelog",
+   "severity": "blocking"
+  },
+  {
+   "id": "no-upper-bound-gc-values",
+   "file": "herdr_engineering/control_plane/stall_watch.py",
+   "line": 98,
+   "category": "code",
+   "summary": "no upper bound on gc values, a bad value crashes after serving starts instead of at startup",
+   "severity": "blocking"
+  },
+  {
+   "id": "missing-cli-wiring-test",
+   "file": "tests/control_plane/test_stall_watch.py",
+   "line": null,
+   "category": "tests",
+   "summary": "missing CLI wiring test for a bad gc block in the fleet config",
+   "severity": "note"
+  },
+  {
+   "id": "gc-not-in-restart-required",
+   "file": "herdr_engineering/cli.py",
+   "line": 5096,
+   "category": "code",
+   "summary": "gc missing from RESTART_REQUIRED_KEYS",
+   "severity": "blocking"
+  }
+ ]
+}

@@ -40,9 +40,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version",
                         version=f"herdr-eng {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("communications", help="install, sync or inspect native agent communication audit")
 
     from .assistant_cli import register as register_assistant_cli
     register_assistant_cli(sub)
+
+    from .agent_ops_tui import register as register_agent_ops_tui
+    register_agent_ops_tui(sub)
 
     p = sub.add_parser("build-cleanup", help="reclaim stale Rust build caches")
     cleanup_sub = p.add_subparsers(dest="cleanup_command", required=True)
@@ -237,6 +241,9 @@ def _build_parser() -> argparse.ArgumentParser:
     rp = rsub.add_parser("status", help="show the room, agent, rights and expiry from the state file")
     rp.add_argument("--config", required=True)
     rp.set_defaults(func=_cmd_relay_status)
+    # collab ---------------------------------------------------------------
+    from .collab_agents_client import add_collab_subparser as add_collab_agents_subparser
+    add_collab_agents_subparser(sub)
     # fabric ---------------------------------------------------------------
     p = sub.add_parser("fabric", help="fabric trust helpers (control_plane.collab.fabric_trust)")
     fasub = p.add_subparsers(dest="fabric_command", required=True)
@@ -4816,6 +4823,7 @@ def _cmd_cp_web(args) -> int:
                              summary_report_config=cp.get("summary_report") or {},
                              unified_workspace_config=cp.get("unified_workspace") if isinstance(cp.get("unified_workspace"), dict) else None,
                              work_center_config=cp.get("work_center") if isinstance(cp.get("work_center"), dict) else None,
+                             agent_ops_config=cp.get("agent_ops") if isinstance(cp.get("agent_ops"), dict) else None,
                              assistant_config=_assistant_config(cp),
                              review_quorum=_review_quorum_config(cp),
                              single_operator=cp.get("single_operator") is True,
@@ -6040,6 +6048,10 @@ def _cmd_cp_worker(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    communication_args = list(sys.argv[1:] if argv is None else argv)
+    if communication_args[:1] == ["communications"]:
+        from .communications import main as communications_main
+        return communications_main(communication_args[1:])
     parser = _build_parser()
     effective_argv = list(sys.argv[1:] if argv is None else argv)
     if effective_argv and effective_argv[0] == "assistant":

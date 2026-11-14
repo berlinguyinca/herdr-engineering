@@ -11,11 +11,14 @@ state_dir: ~/.local/state/herdr-review   # locks, state.json (cooldowns), review
 post: false                              # key 1 of 2 for posting; key 2 is the --post flag
 clone: ~/IdeaProjects/herdr-engineering  # a clone with `origin` = GitHub; claude/pi get a detached worktree of the PR head
 
-# Tier 2 runs only on a head whose gates are green on that exact SHA (commit status context or check-run name).
+# By default tier 2 reviews a head without waiting for its checks. Set wait_for_green: true to restore the
+# green-only gate: tier 2 then runs only on a head whose gates are green on that exact SHA (commit status context
+# or check-run name). required/when_present are read only when wait_for_green is true.
 #   required:     each name must be PRESENT and success. neutral/skipped is NOT green. Empty is refused for tier 2.
 #   when_present: optional checks (some pipelines only run on some PRs): absent is fine, neutral/skipped is fine,
 #                 but if the check exists it must be success; pending or failed blocks tier 2.
 gates:
+  wait_for_green: false                  # true = review only green heads (then `required` must not be empty)
   required:
     - ci/woodpecker/pr/artifact-handoff
     - ci/woodpecker/pr/structural-gates
@@ -46,8 +49,39 @@ tiers:
     context: Opus agent review
     backend: claude
     model: opus                          # claude: any --model value (alias or full id)
-    time_cap_s: 1800
+    time_cap_s: 3600                     # ONE cap shared by all passes: each pass may use an equal share of what is left
+                                         # (four passes ~ 900 s each; unused time passes on to the later ones)
     comment: true                        # one marked PR comment (updated in place) when it blocks
+    # daily_budget_usd: 25               # optional; unset = no limit. Before each review the poller sums this tier's
+                                         # cost_usd in state_dir/reviews.jsonl since 00:00 UTC; at or over the budget the
+                                         # review is skipped (one log line, status left as it is, even with --force).
+                                         # Finished reviews are never affected. Must be a positive number.
+    passes:                              # one sequential claude run per pass; `passes: []` = one unfocused review
+      - {name: general, focus: "Review the change as a whole: correctness, design, and anything the other passes would miss."}
+      - {name: tests, focus: "Focus on the tests: isolation, order dependence, global state, resource leaks, and whether they prove the change."}
+      - {name: security, focus: "Focus on security: secrets, untrusted input reaching a shell, SQL or path, permissions, and roles."}
+      - {name: migrations, focus: "Focus on schema and config migrations: rollback safety, indexes versus queries, defaults, and restart keys."}
+
+prompt:
+  checklist_file: review-checklist.yaml   # relative paths resolve against this file; use an absolute path once copied elsewhere
+  require_evidence: true                 # a blocking finding needs a meaningful quote (>= 20 chars, or a whole line of >= 12 that is not boilerplate like `except Exception:`) found in the cited
+                                         # file's hunks or at head, plus a how_it_fails, else it becomes a note; if the model said
+                                         # block and ALL its blockers were downgraded, tier 2 stays pending (never success)
+  # replay.reviewers (below `replay:`): extra logins, bots included, whose review comments `corpus build` counts
+  project_rules:                         # trusted instructions, added to both tiers' system prompt
+    - "TDD: every change ships with a test that fails without it."
+    - "No mocks, stubs, or fakes in tests; use real dependencies."
+    - "Configuration is YAML only; no environment variables."
+    - "Every Postgres schema change needs a migration; queries are parameterized only."
+    - "Strict typing: TypeScript has no `any`; Scala 3 uses immutable data."
+    - "Prefer MessagePack or Protobuf over JSON for API traffic."
+    - "No secrets or passwords in the repo, logs, or errors."
+    - "Mass tolerances are written in mDa or Da, never ppm."
+    - "Every changed default or new config key is documented in CHANGELOG with its rollback."
+    - "A new restart-required config key is listed where the restart keys are enumerated."
+
+replay:
+  clones: []                             # [{repo: OWNER/NAME, path: ~/clone}] per-repo clones for replay; else `clone`
 
 backends:
   gateway:                               # the OpenAI-compatible call of ai-review.py; same keys as its `reviewer:`

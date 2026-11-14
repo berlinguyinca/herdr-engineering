@@ -60,8 +60,12 @@ is refused, and nothing from models.json is run.
   reasoning tokens keep a slow answer alive. Only `content` deltas count as the answer; `reasoning_content` is
   ignored.
 - `finish_reason=length` or an empty answer is retried once, then the chunk fails.
-- 429, 5xx and connection errors are retried 4 times, with a backoff of 5 s doubling each time. A `Retry-After`
+- 5xx and connection errors are retried 4 times, with a backoff of 5 s doubling each time. A `Retry-After`
   header wins, capped at 60 s.
+- 429 means the model's single slot is taken (deepseek and qwen serve one request at a time; another review may
+  hold the slot for minutes). It is waited out separately, for up to `reviewer.busy_wait_s` (default 1800 s) in
+  total, and does not use up `retries`. If the gateway stays busy past that, the run fails and posts no terminal
+  status; `poll` retries the head once its pending status goes stale.
 - The answer's `model` field must also be of an independent family. The status names that id.
 - Chunks run one at a time (`reviewer.parallel: 1`), because the gateway is shared.
 
@@ -140,7 +144,7 @@ decides the state" rule. `ai-review.py` itself keeps working unchanged (the gate
 | Tier | Default context | Backend (config) | When it runs | Required? |
 |---|---|---|---|---|
 | tier1 | `Open-weight pre-review` | `pi` with an open-weight alias | every non-draft head | no, advisory |
-| tier2 | `Opus agent review` | `claude` with `opus` | only when every `gates.required` name is success on that exact SHA and every existing `gates.when_present` check is success | yes, once the ruleset is changed by the operator |
+| tier2 | `Opus agent review` | `claude` with `opus` | every non-draft head, without waiting for checks; with `gates.wait_for_green: true`, only when every `gates.required` name is success on that exact SHA and every existing `gates.when_present` check is success | yes, once the ruleset is changed by the operator |
 
 Backends (`tiers.<t>.backend`, settings under `backends.<name>`):
 
@@ -159,6 +163,16 @@ Backends (`tiers.<t>.backend`, settings under `backends.<name>`):
   secrets: the pi provider key and the `gh auth token` value are added to the redaction set (best effort, exact
   strings only: other secrets are NOT covered), and a tier that uses pi with `comment: true` is refused unless
   `backends.pi.wrapper` is set (for example a `bwrap` prefix). Statuses and `reviews.jsonl` are redacted the same way.
+
+### Review prompt v2, passes, evidence and replay
+
+- `prompt.project_rules` (list of strings) and `prompt.checklist_file` (`review-checklist.yaml`: categories code, security, tests, docs, performance, migrations; each item an `id` and a one-line `question`; unknown keys refused) go into both tiers' system prompt. The reviewer names the ids it considered in `checked_items`.
+- Evidence rule: a blocking finding carries `evidence` (text quoted from the diff or the file) and `how_it_fails`. The script, not the model, downgrades it to a note when `how_it_fails` is empty or the evidence is not a meaningful quote: at least 20 normalised characters, or (shorter) a whole line of at least 12 characters (a trivial line such as `except Exception as e:`, `from __future__ import annotations` or `raise NotImplementedError()` is never evidence, of any length), found in the added, context or removed lines of the cited file's hunks (for a deleted file, its removed lines), or in that file at the pinned head. Diff `+`/`-` markers on the quote and an `a/`, `b/` or `./` prefix on the path are ignored; a quote from another file's hunk does not count. A blocker citing a file that is not in the PR is not downgraded: it is dropped (`N finding dropped`), and a `block` verdict whose only blockers were dropped does not count as unverified. The downgrade count goes into the status description (`N downgraded`) and the failure comment. If the model said `block` and every blocker was downgraded, tier 2 does NOT post success: it stays pending (logged as `unverified` with the findings), while tier 1 (advisory) posts success noting `N unverified blockers downgraded`. Disable with `prompt.require_evidence: false`.
+- `tiers.tier2.passes: [{name, focus}]`: one claude run per pass, in order, focus appended to the prompt; findings are merged (deduped by file, line, category and the start of the reason; the one with evidence or higher severity is kept) and any surviving blocker blocks. The time cap is shared: one `time_cap_s` covers all passes, each pass may use an equal share of the time left (unused time passes on). If a pass fails or times out after another completed, the completed passes' findings are kept and logged with `partial` set: a surviving blocker still posts failure, otherwise the status stays pending, never success. Size `time_cap_s` for all passes together (the example uses 3600 for four). The one-review lock covers the whole review. `passes: []` or one pass behaves like a single review.
+- `tiers.<tier>.daily_budget_usd` (optional positive number, default unset = no limit): before a review the poller sums that tier's `usage.cost_usd` in `state_dir/reviews.jsonl` since 00:00 UTC; at or over the budget the review is skipped (one `daily budget exhausted` log line, status unchanged, `--force` does not bypass it). Finished reviews are unaffected.
+- `reviews.jsonl`: each completed review line has `downgraded`, `passes` (name, duration_s, cost_usd, turns when the backend reports them), `checked_items`, and `findings`: up to 20 of `file, line, severity, category, why, evidence, how_it_fails`, each text field cut at 600 chars and passed through `redact()`.
+- Replay: `always-on-review.py replay --corpus DIR --tier tier1|tier2 --config YAML [--limit N] [--out FILE]` checks out each case's head in a detached worktree, runs the tier read-only and posts nothing (no gh client is built; posting functions refuse inside replay). The corpus is one JSON per case: `{repo, pr, head_sha, base_sha?, source: opus|human|revert|follow-up-fix, notes, ground_truth: [{id, file, line|null, category, summary, severity, confirmed?}], known_false_claims?}`. Scoring: FOUND (same file and line within 10, or two shared keywords), PARTIAL (file only), MISSED; a blocking finding matching no ground truth is FALSE_BLOCKER_CANDIDATE (unconfirmed), one matching a known false claim is FALSE_BLOCKER. The report gives per-case and aggregate recall, false-blocker rate, per-category recall, cost and duration. `replay compare a.json b.json` compares two runs.
+- Intended corpus: thousands of PRs across the org's repos. Replay is resumable (cases already scored in `--out` are skipped; failed and skipped ones are retried, and a case whose head or ground truth changed is scored again) and runs one case at a time (a lock refuses a second replay). `corpus build --repo OWNER/NAME --since YYYY-MM-DD --out DIR` derives cases from merged PRs with read-only `gh` calls (reverts, follow-up fixes, review comments). Only thread-root comments by humans, or by logins listed in `replay.reviewers` (pass `--config`), and not by the PR author, count; the case is pinned to the commit most comments were made on (`original_commit_id`) and only those comments keep their line; its ground truth is `confirmed: false` and is not scored until confirmed.
 
 ### Choosing a pi model or alias
 
@@ -179,7 +193,9 @@ always-on-review.py poll --config CFG                                           
 always-on-review.py poll --config CFG --post                                     # posts only if CFG has post: true
 ```
 
-Gates: `gates.required` names must be present and `success`; `neutral` and `skipped` do not count as green. A
+Gates: by default tier 2 does not wait for green checks, so Opus can review every pushed head. Set
+`gates.wait_for_green: true` (YAML only; it must be a boolean) to restore the green-only gate, and then
+`gates.required` is mandatory. With it on, `gates.required` names must be present and `success`; `neutral` and `skipped` do not count as green. A
 `gates.when_present` name (a pipeline that only runs on some PRs, such as `ui-gates`) may be absent or neutral/skipped,
 but when it exists it must be `success`: pending or failed blocks tier 2.
 
