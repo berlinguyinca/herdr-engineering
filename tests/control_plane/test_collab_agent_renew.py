@@ -264,6 +264,28 @@ def test_a_team_grant_that_replaced_a_lapsed_direct_grant_is_left_alone(gw):
     assert w.s.renew_agent(w.alice, aid)["grants_restored"] == []      # the old direct grant is not resurrected
 
 
+def test_a_coordinator_designation_replaces_a_lapsed_direct_grant_for_good(gw):
+    from herdr_engineering.control_plane.collab_coordinators import normalize_coordinators
+    from herdr_engineering.control_plane.collab_team_rooms import normalize_team_rooms
+    from herdr_engineering.control_plane.collab_team_roles import normalize_team_roles
+    w = gw
+    w.s.team_rooms = normalize_team_rooms({"enabled": True})
+    w.s.team_roles = normalize_team_roles({"enabled": True})
+    w.s.coordinators = normalize_coordinators({"enabled": True})
+    _, info = w.agent("alice", actions=("read", "post", "execute", "instruct"))
+    aid = info["agent_id"]
+    team = "team-" + "d" * 20
+    w.s.attach_team(w.alice, w.room, team, {"roles": {"implementer": [w.s.connect_agent(w.alice, {})["agent_id"]]}})
+    w.s.clock.t += 11 * DAY
+    w.s.agent_rooms(w.alice)                                            # the direct grant lapsed
+    assert w.s._lapsed_grants[aid]
+    w.s.set_team_coordinator(w.alice, w.room, team, {"holder": "agent:" + aid})
+    w.s.clear_team_coordinator(w.alice, w.room, team)                   # a revocation: the agent holds nothing here now
+    assert aid not in w.s._rooms[w.room]["grants"]
+    assert w.s.renew_agent(w.alice, aid)["grants_restored"] == []
+    assert w.s.agent_rooms(auth(w.s, w.s.renew_agent(w.alice, aid)))["rooms"] == []
+
+
 def test_a_removed_member_does_not_get_their_agents_lapsed_grants_back(gw):
     w = gw
     _, info = w.agent("bob")                                            # bob owns it; alice approved the grant

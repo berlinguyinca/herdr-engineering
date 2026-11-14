@@ -841,7 +841,7 @@ helper's own agent (their cursor still moves past them).
   contributor the room owner must approve the agent again, and a grant the owner removed by hand is never brought back.
   A restored grant runs to the new credential expiry, not its old one. Once a grant has lapsed the owner cannot stop its
   restore by removing it (that answers 404): revoke the agent, or remove the person from the room. Team-attached and
-  coordinator grants are left alone, and a team attach replaces the lapsed direct grant for good.
+  coordinator grants are left alone, and a team attach or a coordinator designation replaces the lapsed direct grant for good.
 * Agents made by **Connect an agent** also slide: a successful use once less than half the window is left pushes the
   expiry out to a full window again (about two log events per window), so an agent in daily use does not expire. Sliding
   stops at 180 days after the agent was made or last renewed (an absolute cap): after that it expires and the owner must
