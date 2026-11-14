@@ -654,11 +654,13 @@ def test_v1_ingest_cannot_forge_the_agent_ops_block():
     forged = {"_envelope": {"agent_ops": {"session_id": "forged", "sanitized_label": "/Users/bob/x",
                                           "provenance": "observed"}}}
     for version in (None, 1):
-        body = {"entity_type": "lifecycle", "entity_id": "a1", "event_type": "tool.started",
-                "payload": dict(forged), "source": "pi"}
-        if version:
-            body["schema_version"] = version
-        IngestService(repo).ingest(body, OPERATOR)
+        for entity_type, event_type in (("lifecycle", "tool.started"), ("lifecycle", "node.upsert"),
+                                        ("session", "node.upsert"), ("host", "edge.add")):   # lineage-style names on non-lineage streams
+            body = {"entity_type": entity_type, "entity_id": "a1", "event_type": event_type,
+                    "payload": dict(forged), "source": "pi"}
+            if version:
+                body["schema_version"] = version
+            IngestService(repo).ingest(body, OPERATOR)
     assert agent_ops.envelope_events(repo) == []
     for stream in repo._events.values():
         assert all("_envelope" not in e["payload"] for e in stream)

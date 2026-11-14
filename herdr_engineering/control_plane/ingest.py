@@ -28,7 +28,7 @@ from .federation import (
     peer_of,
     policy_from_source,
 )
-from .graph import LINEAGE_EVENT_TYPES, validate_lineage
+from .graph import validate_lineage
 from .host_metrics_store import STATE_KEYS, clean_metrics, clean_state
 from .ids import validate_mission_id
 from .project_links import canonical_repository
@@ -332,7 +332,7 @@ class IngestService:
         payload = body.get("payload") or {}
         if not isinstance(payload, dict):
             raise ValueError("payload must be a JSON object")
-        if "_envelope" in payload and event_type not in LINEAGE_EVENT_TYPES:   # lineage events reject '_' keys with a 400 below
+        if "_envelope" in payload and entity_type != "lineage":   # lineage streams reject '_' keys with a 400 in _prevalidate
             payload = {k: v for k, v in payload.items() if k != "_envelope"}   # server-owned metadata, never client-set
         source = body.get("source") or "herdr"
         if not isinstance(source, str):

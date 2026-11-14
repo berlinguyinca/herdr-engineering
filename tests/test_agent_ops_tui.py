@@ -342,6 +342,7 @@ def test_interactive_pane_in_a_real_pty_against_the_real_server():
     import sys
     import termios
     import time
+    sel = selectors.DefaultSelector()   # poll/kqueue: select() fails once the full suite leaks fds past 1024
     server = LiveServer()
     try:
         ingest(server.repo, 1, "session.started", agent_id="a1", session_id="s1")
@@ -353,7 +354,6 @@ def test_interactive_pane_in_a_real_pty_against_the_real_server():
         proc = subprocess.Popen([sys.executable, "-m", "herdr_engineering.cli", "agent-ops"], stdin=slave, stdout=slave,
                                 stderr=slave, env=env)
         seen = b""
-        sel = selectors.DefaultSelector()   # poll/kqueue: select() fails once the full suite leaks fds past 1024
         sel.register(master, selectors.EVENT_READ)
 
         def pump(seconds):
@@ -371,6 +371,7 @@ def test_interactive_pane_in_a_real_pty_against_the_real_server():
         for needle in ("[LIVE]", "HANDOFFS AND DELEGATIONS", "KEYS", "REPLAY", "model ?"):
             assert needle in text, needle
     finally:
+        sel.close()
         server.stop()
 
 
