@@ -5,7 +5,7 @@ Talks to the collab service's OPERATOR listener (``<url>/api/v1/collab/...``, ac
 same routes ``HttpCollab`` uses: GET /me, /agents, /rooms, /rooms/{id}/agents, /rooms/{id}/events/tail;
 POST /agents/connect, /projects, /projects/{id}/rooms, /rooms/{id}/agents, /rooms/{id}/messages.
 
-Steps: wait for the service and the bridge (one shared deadline) -> ensure agents (create only when missing or expired)
+Steps: wait for the service and the bridge (one shared deadline) -> ensure agents (create only when missing; an expired one of the operator's is renewed in place, keeping its id and grants)
 -> ensure the room (a new project is always created with it: the service cannot list projects, so re-creating a
 deleted room may leave an extra project) and its two members (create only when missing) -> verify (room listed, a smoke message POSTED
 to the room with a nonce and read back, bridge ``groups/list`` when a bridge token is supplied in
@@ -76,12 +76,19 @@ def is_active(agent: dict[str, Any], now: float | None = None) -> bool:
     return agent.get("status", "active") == "active" and not expired
 
 
+def grant_lapsed(member: dict[str, Any], now: float | None = None) -> bool:
+    """A listed room grant whose expires_at has passed: the service drops it at its next housekeeping (up to 30s later), but
+    it already gives no access, so it counts as absent."""
+    expires = member.get("expires_at")
+    return isinstance(expires, (int, float)) and expires <= (time.time() if now is None else now)
+
+
 def plan(agents: list[dict[str, Any]], rooms: list[dict[str, Any]], members: list[dict[str, Any]] | None) -> dict[str, Any]:
     """What is missing. ``agents``/``rooms`` are the service's lists; ``members`` the room's agents (None: no room yet)."""
     live = {a["name"] for a in agents if is_active(a)}
     live_ids = {a.get("agent_id") for a in agents if is_active(a)}
     room = next((r for r in rooms if r.get("name") == ROOM_NAME), None)
-    have = {m["name"] for m in members or [] if m.get("agent_id") in live_ids}     # a grant to an expired agent is no grant
+    have = {m["name"] for m in members or [] if m.get("agent_id") in live_ids and not grant_lapsed(m)}   # nor is a lapsed grant
     return {"agents": [n for n in AGENT_NAMES if n not in live], "room": room is None,
             "members": [n for n in AGENT_NAMES if n not in have]}
 
@@ -139,11 +146,25 @@ def has_group(body: Any) -> bool:
     return isinstance(groups, list) and any(isinstance(g, dict) and g.get("name") == ROOM_NAME for g in groups)
 
 
+def expired_agent(agents: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    """The operator's own agent of this handle that is active but past its expires_at: renewable, never to be replaced."""
+    return next((a for a in agents if a.get("name") == name and a.get("status", "active") == "active" and not is_active(a)), None)
+
+
 def ensure(api: Http, p: dict[str, Any], dry: bool) -> None:
+    listed = api.call("GET", BASE + "/agents")["agents"]               # /agents lists the operator's own agents only
     for name in p["agents"]:
+        old = expired_agent(listed, name)
         if dry:
-            print(f"WOULD create agent {name}")
+            print(f"WOULD {'renew' if old else 'create'} agent {name}")
             continue
+        if old:                          # keeps the id, name and room grants; the new credential in the reply is dropped unread
+            try:
+                api.call("POST", BASE + f"/agents/{old['agent_id']}/renew")
+                print(f"RENEWED agent {name}")
+                continue
+            except RuntimeError as exc:
+                print(redact(f"RENEW refused for {name}, creating a new agent instead: {exc}"))
         info = api.call("POST", BASE + "/agents/connect", {"harness_type": "tui-smoke", "name": name})
         print(f"CREATED agent {info['name']} id={info['agent_id']}")           # the credential is dropped unread
     mine = api.call("GET", BASE + "/agents")["agents"]
@@ -164,6 +185,8 @@ def ensure(api: Http, p: dict[str, Any], dry: bool) -> None:
     for name in p["members"]:
         if dry or room is None:
             print(f"WOULD add {name} to room {ROOM_NAME}")
+            continue
+        if any(m["agent_id"] == ids[name] and not grant_lapsed(m) for m in stale):    # a renewed agent kept its grant
             continue
         for m in stale:                  # only the operator's own grant to an expired agent of the operator's holds the handle
             if m["name"] == name and m.get("owner_user_id") == operator and m["agent_id"] in expired_ids:

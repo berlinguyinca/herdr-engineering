@@ -241,6 +241,9 @@ def _build_parser() -> argparse.ArgumentParser:
     rp = rsub.add_parser("status", help="show the room, agent, rights and expiry from the state file")
     rp.add_argument("--config", required=True)
     rp.set_defaults(func=_cmd_relay_status)
+    # collab ---------------------------------------------------------------
+    from .collab_agents_client import add_collab_subparser as add_collab_agents_subparser
+    add_collab_agents_subparser(sub)
     # fabric ---------------------------------------------------------------
     p = sub.add_parser("fabric", help="fabric trust helpers (control_plane.collab.fabric_trust)")
     fasub = p.add_subparsers(dest="fabric_command", required=True)

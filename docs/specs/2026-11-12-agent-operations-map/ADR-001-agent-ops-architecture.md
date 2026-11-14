@@ -50,5 +50,9 @@ else (no org or private events, with the viewer key or the operator key). The tr
 map rather than the org map, even though their sign-in is still valid.
 - "Lapsed guest" means the person's latest room membership was a guest one. A later non-guest add clears it
   (`_ever_guests` is rebuilt identically on log replay). Re-added as contributor then removed, they read org scope again.
+- The `_ever_guests` fold in `collab.py` is always on; it is not behind the `agent_ops` feature flag.
+- Split deployment (`collab_operator_url` set, `server.collab` is None): agent-ops has no room data. It fails closed:
+  rooms are empty and non-operators see only org-scope events.
 - An agent inherits its owner's lapsed-guest status only when the owner reads no room other than guest rooms.
 - An external agent is treated as a guest bound to its invited room; once the binding expires it sees nothing.
+- The operator key's synthesized principal (`admin` is set only there, never by `authenticate()`) is never guest-only, even if that user was once added to a room as a guest.
