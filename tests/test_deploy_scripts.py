@@ -1261,6 +1261,26 @@ def test_fabric_firewall_rules_absent_keeps_the_strong_install_warning(env):
     assert "collab-fabric-firewall.sh --install" in r.stderr
 
 
+def test_fabric_firewall_unexpected_check_exit_code_still_warns(env):
+    _with_collab(env, dict(COLLAB, fabric_trust=FABRIC_TRUST))
+    # the iptables shim kills its parent (the firewall script), so deploy.sh sees an exit code (137) the script never returns
+    _shim(env, "iptables", 'kill -9 "$PPID"')
+    _shim(env, "systemctl", "exit 0")
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: fabric network firewall is not confirmed present" in r.stderr
+    assert "NOTE: fabric network firewall" not in r.stderr
+
+
+# Guards the missing-binary path end to end (script maps 127 to 3, deploy.sh treats 3 like absent); the deploy.sh arm alone
+# is also covered by the unexpected-exit-code test above.
+def test_fabric_firewall_missing_iptables_keeps_the_strong_install_warning(env):
+    r = _fabric_deploy_with_iptables(env, 127)
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: fabric network firewall is not confirmed present" in r.stderr
+    assert "NOTE: fabric network firewall" not in r.stderr
+
+
 def test_fabric_firewall_rules_present_prints_no_firewall_message(env):
     r = _fabric_deploy_with_iptables(env, 0)
     assert r.returncode == 0, r.stderr

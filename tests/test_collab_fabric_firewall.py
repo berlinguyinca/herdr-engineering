@@ -102,3 +102,31 @@ def test_bad_arguments_are_refused(ipt):
     assert run(stub, "--subnet", "not-a-cidr", "--check").returncode == 64
     assert run(stub).returncode == 64                                   # a mode is required
     assert run(stub, "--install", "--remove").returncode == 64
+
+
+def test_missing_iptables_binary_is_exit_3_with_a_clear_message(tmp_path):
+    r = run(tmp_path / "no-such-iptables", "--check")
+    assert r.returncode == 3 and "iptables" in r.stderr and "not found" in r.stderr and "need root" not in r.stderr
+
+
+def test_install_with_missing_iptables_says_not_found(tmp_path):
+    r = run(tmp_path / "no-such-iptables", "--install")
+    assert r.returncode == 2 and "not found" in r.stderr
+
+
+def test_absent_in_one_chain_and_unreadable_in_the_other_reports_absent(ipt, tmp_path):
+    stub, _ = ipt
+    # DOCKER-USER: absent (rc 1); INPUT: unreadable (rc 4)
+    wrapper = tmp_path / "ipt2"
+    wrapper.write_text(f"#!/usr/bin/env bash\n[ \"$2\" != INPUT ] || exit 4\nexec {stub} \"$@\"\n")
+    wrapper.chmod(0o755)
+    r = run(wrapper, "--check")
+    assert r.returncode == 1 and "DOCKER-USER: absent" in r.stdout
+
+
+def test_unreadable_first_then_absent_reports_absent(ipt, tmp_path):
+    stub, _ = ipt
+    wrapper = tmp_path / "ipt3"
+    wrapper.write_text(f"#!/usr/bin/env bash\n[ \"$2\" != DOCKER-USER ] || exit 4\nexec {stub} \"$@\"\n")
+    wrapper.chmod(0o755)
+    assert run(wrapper, "--check").returncode == 1

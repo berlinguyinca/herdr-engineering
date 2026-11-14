@@ -16,6 +16,10 @@ backlog drains over successive runs. Agents missing owner/org fields are never
 deleted. A 409 on one delete is skipped and counted. Exit codes: 0 ok or
 guarded skip, 1 API error, 2 token file missing or not 0600, 64 bad arguments.
 
+After a Woodpecker outage longer than 24 hours, agents that are in fact alive can look stale until they reconnect, so up to `--max-deletions`
+(default 50) live agents per run may be removed first; they re-register on their own. To limit that, lower the cap: add `--max-deletions 5` to
+`ExecStart` in `herdr-ci-agent-prune.service` (then `systemctl --user daemon-reload`), or `--max-deletions 0` to make every run a no-op.
+
 Deleted: system agents (`owner_id=-1`) that never contacted the server and are
 older than 1 hour, or have had no contact and no work for 24 hours. Never
 deleted: any agent referenced by a pending, running or waiting workflow in

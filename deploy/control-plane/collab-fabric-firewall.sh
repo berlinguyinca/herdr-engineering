@@ -12,7 +12,8 @@
 #
 #   collab-fabric-firewall.sh --install | --check | --remove  [--subnet CIDR] [--iptables CMD] [--dry-run]
 #
-# --check exits 0 when every rule is present, 1 when one is absent, 2 when the rules cannot be read (not root).
+# --check exits 0 when every rule is present, 1 when one is absent (even if another cannot be read), 2 when the rules cannot
+# be read (not root), 3 when the iptables binary is not found.
 # Rules live in the kernel and vanish on reboot: run --install again at boot (a oneshot unit After=docker.service).
 set -euo pipefail
 
@@ -47,31 +48,34 @@ done
 
 rule=(-s "$SUBNET" -m conntrack --ctstate NEW -m comment --comment "$TAG" -j DROP)
 
-# present <chain>: 0 present, 1 absent, 2 cannot tell
+# present <chain>: 0 present, 1 absent, 2 cannot tell, 3 iptables binary not found (rc 127)
 present() {
   local rc=0
   "$IPT" -C "$1" "${rule[@]}" >/dev/null 2>&1 || rc=$?
-  case "$rc" in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
+  case "$rc" in 0) return 0 ;; 1) return 1 ;; 127) return 3 ;; *) return 2 ;; esac
 }
 
 run() {
   if [ "$DRY" = 1 ]; then echo "[dry-run] $IPT $*"; else "$IPT" "$@"; fi
 }
 
-status=0
+absent=0; unreadable=0; missing=0
 for chain in "${CHAINS[@]}"; do
   rc=0; present "$chain" || rc=$?
   case "$MODE" in
     check)
       case "$rc" in
         0) echo "$chain: present" ;;
-        1) echo "$chain: absent"; [ "$status" = 2 ] || status=1 ;;
-        *) echo "cannot read the $chain rules (need root and $IPT)" >&2; status=2 ;;
+        1) echo "$chain: absent"; absent=1 ;;
+        3) echo "iptables not found ($IPT): cannot check the $chain rules" >&2; missing=1 ;;
+        *) echo "cannot read the $chain rules (need root and $IPT)" >&2; unreadable=1 ;;
       esac ;;
     install)
+      [ "$rc" != 3 ] || { echo "iptables not found ($IPT)" >&2; exit 2; }
       [ "$rc" != 2 ] || { echo "cannot read the $chain rules (need root and $IPT)" >&2; exit 2; }
       if [ "$rc" = 1 ]; then run -I "$chain" 1 "${rule[@]}"; echo "$chain: installed"; else echo "$chain: already present"; fi ;;
     remove)
+      [ "$rc" != 3 ] || { echo "iptables not found ($IPT)" >&2; exit 2; }
       [ "$rc" != 2 ] || { echo "cannot read the $chain rules (need root and $IPT)" >&2; exit 2; }
       if [ "$DRY" = 1 ]; then
         [ "$rc" != 0 ] || echo "[dry-run] $IPT -D $chain ${rule[*]}"
@@ -81,4 +85,7 @@ for chain in "${CHAINS[@]}"; do
       echo "$chain: removed" ;;
   esac
 done
-exit "$status"
+if [ "$MODE" = check ]; then
+  if [ "$absent" = 1 ]; then exit 1; elif [ "$missing" = 1 ]; then exit 3; elif [ "$unreadable" = 1 ]; then exit 2; fi
+fi
+exit 0
