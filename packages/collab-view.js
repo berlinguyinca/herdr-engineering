@@ -75,8 +75,8 @@ const roleLabel = (r) => ROLE_LABEL[r] || r;
 const shortId = (id) => `…${String(id || '').slice(-6)}`;
 const hue = (s) => { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
 // An agent's name as a coloured badge, with a pencil for those allowed to rename it.
-// An expired agent the owner may renew (the server also refuses external, fabric and helper agents).
-const canRenew = (a) => a.status === 'active' && a.expires_at * 1000 < Date.now() && !a.external && !a.fabric;
+// An expired agent the owner may renew (`renewable` is the server's verdict: never external, fabric, fabric-join or helper agents).
+const canRenew = (a) => a.status === 'active' && a.renewable === true && a.expires_at * 1000 < Date.now();
 const agentBadge = (name) => `<span class="cx-av cx-av--sm" style="--h:${hue(name)}" aria-hidden="true">${esc((String(name).match(/[a-z0-9]/gi) || ['?'])[0].toUpperCase())}</span>`;
 const agentTitle = (a, canRename) => `<span class="cx-ntitle">${agentBadge(a.name)}<b class="cx-nname">${esc(a.display_name || `@${a.name}`)}</b>${a.display_name?`<small class="hd-ident">@${esc(a.name)}</small>`:''}${canRename ? `<button type="button" class="cx-edit" data-rename="${esc(a.agent_id)}" data-name="${esc(a.name)}" title="Rename @ handle" aria-label="Rename @${esc(a.name)} handle">✎</button>` : ''}</span>`;
 

@@ -177,6 +177,17 @@ def test_member_grant_to_an_expired_agent_is_not_a_grant():
     assert rb.plan(agents, [{"name": rb.ROOM_NAME}], members)["members"] == ["tui-smoke-a"]
 
 
+def test_a_listed_grant_that_already_lapsed_is_not_a_grant():
+    """The service drops a lapsed grant at its next housekeeping (up to 30s later); until then it is still listed."""
+    now = 1_000.0
+    assert rb.grant_lapsed({"expires_at": now - 1}, now) and not rb.grant_lapsed({"expires_at": now + 1}, now)
+    assert not rb.grant_lapsed({"expires_at": None}, now) and not rb.grant_lapsed({}, now)
+    agents = [{"name": n, "status": "active", "expires_at": None, "agent_id": "id-" + n} for n in rb.AGENT_NAMES]
+    members = [{"name": n, "agent_id": "id-" + n, "expires_at": time.time() + 3600} for n in rb.AGENT_NAMES]
+    members[0]["expires_at"] = time.time() - 5
+    assert rb.plan(agents, [{"name": rb.ROOM_NAME}], members)["members"] == [rb.AGENT_NAMES[0]]
+
+
 def test_redact_hides_any_dsn_with_credentials_only():
     out = rb.redact("a mongodb+srv://user:pw0rd@host/db b redis://:x@h c")
     assert "pw0rd" not in out and "user:" not in out and "x@h" not in out

@@ -91,7 +91,8 @@ BULK_EVENTS = frozenset({"message", "comment_added", "comment_revised", "audit_d
 SILENT_EVENTS = frozenset({"workspace_terminal_authorized", "artifact_tool_used", "artifact_commit_submitted",
                            "artifact_upload_staged"})
 # events after which the artifact bridge's agents.json may be out of date
-AGENT_RENEW_AFTER = 86400.0     # a connected agent's sliding window is written once a day at most
+AGENT_MAX_LIFE = 180 * 86400.0   # a connected agent's sliding window never carries it past this age; the owner's renew restarts it
+# (a slide is written only when under half the credential window is left, so the log pays about twice per window)
 AGENT_FEED_EVENTS = frozenset({"agent_revoked", "user_decided", "agent_enrolled"})
 # creation event -> kind (what is outstanding is recomputed from state, see _recount)
 REVOCABLE_CREATE = {"member_added": "member", "agent_granted": "grant", "agent_enrolled": "agent",
@@ -549,6 +550,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         self._requests_by_room: dict[str, set] = defaultdict(set)
         self._requests_by_agent: dict[str, set] = defaultdict(set)
         self._rooms_by_agent: dict[str, set] = defaultdict(set)
+        # grants that lapsed (agent_id -> room_id -> actions): the state drops a lapsed grant, an owner renew restores it
+        self._lapsed_grants: dict[str, dict[str, list]] = defaultdict(dict)
         self._links: dict[str, dict] = {}                    # link id -> room/workspace link
         self._links_by_room: dict[str, list] = defaultdict(list)
         self._primary: dict[tuple, str] = {}                 # (host, workspace id) -> link id of its primary room
@@ -929,7 +932,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "slot": slot, "_legacy_slot": taken, "aliases": [], "skills": list(p.get("skills") or []),
                 "owner": p["owner_user_id"], "device_id": p["device_id"], "harness_type": p["harness_type"],
                 "instance_id": p.get("instance_id"), "status": "active",
-                "machine": p.get("machine"), "origin": p.get("origin"),
+                "machine": p.get("machine"), "origin": p.get("origin"), "life_end": p.get("life_end_epoch"),
                 # additive (older logs have neither); the bit starts OFF, except for an agent made by fabric-join (whois vouched)
                 "fabric": p.get("origin") == "fabric_join" and p.get("fabric") is True,
                 "fabric_expires_at": p.get("fabric_expires_at") if p.get("origin") == "fabric_join" else None,
@@ -982,6 +985,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             a = self._agents[p["agent_id"]]
             self._by_cred.pop(a["cred_digest"], None)
             a.update(cred_digest=p["secret_digest"], expires_at=p["expires_at_epoch"])
+            if p.get("life_end_epoch") is not None:
+                a["life_end"] = p["life_end_epoch"]
             self._by_cred[p["secret_digest"]] = p["agent_id"]
         elif t == "agent_revoked":
             self._agents[p["agent_id"]]["status"] = "revoked"
@@ -993,7 +998,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             for rid in self._requests_by_agent.get(p["agent_id"], ()):
                 self._requests[rid]["open"] = False
         elif t in ("agent_grant_revoked", "agent_grant_expired"):
-            self._rooms[p["room_id"]]["grants"].pop(p["agent_id"], None)
+            gone = self._rooms[p["room_id"]]["grants"].pop(p["agent_id"], None)
+            self._lapsed_grants[p["agent_id"]].pop(p["room_id"], None)
+            if t == "agent_grant_expired" and gone and not gone.get("team_id") and not gone.get("coordinate_team"):
+                self._lapsed_grants[p["agent_id"]][p["room_id"]] = list(gone["actions"])
             self._rooms_by_agent[p["agent_id"]].discard(p["room_id"])
             self._prune_terminal(p["room_id"], lambda k: k == "agent:" + p["agent_id"])
         elif t == "agent_access_requested":
@@ -1196,6 +1204,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 self._rooms[runtime["room_id"]]["grants"].pop(aid, None)
                 self._rooms_by_agent[aid].discard(runtime["room_id"])
         elif t == "agent_granted":
+            self._lapsed_grants[p["agent_id"]].pop(p["room_id"], None)
             self._rooms[p["room_id"]]["grants"][p["agent_id"]] = {
                 "actions": list(p["actions"]), "expires_at": p.get("expires_at"), "granted_seq": seq,
                 **({"coordinate_team": p["coordinate_team"],
@@ -1446,20 +1455,30 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
 
     def _slide_agent(self, pr: Principal, agent: dict) -> None:
         """Sliding window for an agent made by ``connect_agent``: a successful use moves ``expires_at`` to now + the remote TTL,
-        written at most once a day (a quarter of the window when that is shorter). Never a helper, fabric or externally bound
-        agent (their life is bound elsewhere); only called after the agent proved active and unexpired. Best effort: a full or
-        failing log must not fail authentication. Caller holds the lock."""
+        written only once less than half the window is left (about twice per window, so a busy agent does not spend the log),
+        and never past ``life_end`` (AGENT_MAX_LIFE after creation or the owner's last renew; an agent made before the cap
+        existed gets its cap at its first slide). Never a helper, fabric or externally bound agent (their life is bound
+        elsewhere); only called after the agent proved active and unexpired. Room grants are NOT slid: they keep their own
+        expiry. Best effort: a full or failing log must not fail authentication. Caller holds the lock."""
         aid = pr.id
         if (agent.get("origin") != "connect" or agent.get("external") or agent.get("fabric")
                 or aid in self._helper_minted or aid in self._helper_by_agent):
             return
-        expires = self._now() + self.remote_credential_ttl
-        if expires - agent["expires_at"] < min(AGENT_RENEW_AFTER, self.remote_credential_ttl / 4):
+        now = self._now()
+        if agent["expires_at"] - now >= self.remote_credential_ttl / 2:
             return
+        life_end = agent.get("life_end")
+        capless = life_end is None
+        if capless:
+            life_end = now + AGENT_MAX_LIFE
+        expires = min(now + self.remote_credential_ttl, life_end)
+        if expires <= agent["expires_at"]:
+            return                                        # the cap is reached: the owner renews
         try:
             self._commit("credential_rotated", self._actor(
                 pr, agent_id=aid, secret_digest=agent["cred_digest"], expires_at_epoch=expires,
-                action="agent.renew", outcome="allowed", project_ids=[], resource_id=aid))
+                action="agent.slide", outcome="allowed", project_ids=[], resource_id=aid,
+                **({"life_end_epoch": life_end} if capless else {})))
         except CollabError:
             pass
 
@@ -2275,6 +2294,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "owner_user_id": pr.id, "code_digest": None, "device_id": device,
                 "harness_type": label, "instance_id": None, "name": handle, "parent_agent_id": parent,
                 "origin": "connect",             # marks the agents whose window slides on use (see _slide_agent)
+                "life_end_epoch": self._now() + AGENT_MAX_LIFE,
                 **({"skills": skills} if skills else {}), **({"machine": machine} if machine else {}),
                 "secret_digest": _digest(cred),
                 "expires_at_epoch": expires, "action": "agent.connect", "outcome": "allowed",
@@ -3150,7 +3170,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                                            "pane_id": a["workspace"].get("pane_id")} if a.get("workspace") else None),
                             "online": any(self._online(r["room_id"], "agent", aid) for r in rooms),
                             "status": a["status"], "expires_at": a["expires_at"], "rooms": rooms,
-                            "pending": pending})
+                            "renewable": self._renewable(aid, a), "pending": pending})
         return {"agents": out}
 
     def agent_rooms(self, pr: Principal) -> dict:
@@ -3198,17 +3218,53 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 raise CollabError(404, "not found")
             if agent["status"] != "active":
                 raise CollabError(409, "a revoked agent cannot be renewed")
-            if (agent.get("external") or agent.get("fabric") or agent.get("origin") == "fabric_join"
-                    or agent_id in self._helper_minted or agent_id in self._helper_by_agent):
+            if not self._renewable(agent_id, agent):
                 raise CollabError(403, "this agent cannot be renewed")
             if self._now() >= agent["expires_at"]:
                 self._agent_slots(pr.id)                  # an expired agent holds no slot; renewing takes one back
             expires = self._now() + self.remote_credential_ttl
             self._commit("credential_rotated", self._actor(
                 pr, agent_id=agent_id, secret_digest=_digest(cred), expires_at_epoch=expires,
+                life_end_epoch=self._now() + AGENT_MAX_LIFE,
                 action="agent.renew", outcome="allowed", project_ids=[], resource_id=agent_id))
             device, name = agent["device_id"], agent["name"]
-        return {"agent_id": agent_id, "credential": cred, "device_id": device, "expires_at": expires, "name": name}
+            restored = self._restore_grants(pr, agent_id, expires)
+        return {"agent_id": agent_id, "credential": cred, "device_id": device, "expires_at": expires, "name": name,
+                "grants_restored": restored}
+
+    def _renewable(self, agent_id: str, agent: dict) -> bool:
+        """The kinds of agent an owner may renew: not external, fabric, fabric-join or helper ones (a revoked one is refused apart)."""
+        return not (agent.get("external") or agent.get("fabric") or agent.get("origin") == "fabric_join"
+                    or agent_id in self._helper_minted or agent_id in self._helper_by_agent)
+
+    def _restore_grants(self, pr: Principal, agent_id: str, expires: float) -> list[str]:
+        """After an owner renew: re-grant, with the SAME actions, every room grant of the agent that lapsed (housekeeping drops
+        it from state; the actions are kept in ``_lapsed_grants``) or lapses before ``expires``, running to ``expires``. Only
+        rooms the owner owns (the rule for a direct grant); team-attached and coordinate grants are left alone (their own
+        approval or team decides). A room that no longer allows it is skipped, never fatal. Caller holds the lock."""
+        wanted = {rid: list(actions) for rid, actions in self._lapsed_grants.get(agent_id, {}).items()}
+        for rid in self._rooms_by_agent.get(agent_id, ()):
+            g = (self._rooms.get(rid) or {}).get("grants", {}).get(agent_id)
+            if (g and g["expires_at"] is not None and g["expires_at"] < expires
+                    and not g.get("team_id") and not g.get("coordinate_team")):
+                wanted[rid] = list(g["actions"])
+        done = []
+        name = self._agents[agent_id]["name"]
+        for rid, actions in sorted(wanted.items()):
+            room = self._rooms.get(rid)
+            m = self._member(room, pr.id) if room else None
+            if not m or m["role"] != "owner":
+                continue
+            try:
+                self._name_free(room, agent_id, name)
+                self._commit("agent_granted", self._actor(
+                    pr, project_id=room["project_id"], room_id=rid, agent_id=agent_id, actions=actions,
+                    expires_at=expires, action="agent.grant", outcome="allowed",
+                    project_ids=[room["project_id"]], resource_id=agent_id))
+            except CollabError:
+                continue
+            done.append(rid)
+        return done
 
     def revoke_agent(self, pr: Principal, agent_id: str) -> dict:
         self._require_user(pr)
@@ -4350,7 +4406,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 a = self._agents.get(aid)
                 if a and a["status"] == "active":
                     out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
-                                "owner_user_id": a["owner"], "actions": g["actions"],
+                                "owner_user_id": a["owner"], "actions": g["actions"], "expires_at": g["expires_at"],
                                 "external": bool(a.get("external")), "address": self._address(aid),
                                 "aliases": list(a.get("aliases", ())), "skills": list(a.get("skills", ())),
                                 "online": self._online(room_id, "agent", aid),

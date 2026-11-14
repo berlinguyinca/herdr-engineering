@@ -830,15 +830,22 @@ helper's own agent (their cursor still moves past them).
   added to the group by hand, or who already joined a room, stays; the Cognito account is never deleted.
 * A leaked agent credential: revoke it on the AI agents page.
 * An agent whose credential expired: **Renew access** on the AI agents page (or `POST /api/v1/collab/agents/<id>/renew`
-  as the signed-in owner). It keeps the agent id, name, device and room grants, mints a NEW credential (shown once;
-  re-run the connect snippet with it) and starts a fresh window of the connect lifetime (30 days by default). The old
-  credential stops working at once. Only the owner can do it (anyone else gets 404). Revoked agents, helper agents,
-  fabric-machine identities and externally invited agents are refused: an external agent never lives past its invite's
-  hard expiry. Room grants have their own expiry and are not extended by a renew.
-* Agents made by **Connect an agent** also slide: a successful use after more than a day since the last extension pushes
-  the expiry out to a full window again (one log event a day at most), so an agent in daily use does not expire. An
-  agent that is already expired or revoked is never revived by use; renew it instead. Helper, fabric and external agents
-  never slide.
+  as the signed-in owner). It keeps the agent id, name and device, mints a NEW credential (shown once; re-run the connect
+  snippet with it) and starts a fresh window of the connect lifetime (30 days by default). The old credential stops
+  working at once. Only the owner can do it (anyone else gets 404). Revoked agents, helper agents, fabric-machine
+  identities and externally invited agents are refused: an external agent never lives past its invite's hard expiry.
+* Room grants have their own expiry (30 days by default) and the service drops a lapsed grant, so an expired agent has
+  usually lost its rooms. A renew therefore also re-grants, with the SAME actions, every room grant of the agent that
+  lapsed, and extends every one that would lapse before the new credential does, to the new credential expiry (the reply
+  lists them as `grants_restored`). Only rooms the renewing user owns are restored: where the owner is only a
+  contributor the room owner must approve the agent again, and a grant the owner removed by hand is never brought back.
+  Team-attached and coordinator grants are left alone.
+* Agents made by **Connect an agent** also slide: a successful use once less than half the window is left pushes the
+  expiry out to a full window again (about two log events per window), so an agent in daily use does not expire. Sliding
+  stops at 180 days after the agent was made or last renewed (an absolute cap): after that it expires and the owner must
+  renew it. A stolen credential that is used regularly therefore lives until the owner revokes it or that cap is
+  reached. Sliding does not touch room grants, which keep their own expiry. An agent that is already expired or revoked
+  is never revived by use; renew it instead. Helper, fabric and external agents never slide.
 
 ### 5.3 Health and routine tasks
 * Containers: `docker ps | grep herdr-collab` shows `herdr-collab-edge` (TLS front),

@@ -76,12 +76,19 @@ def is_active(agent: dict[str, Any], now: float | None = None) -> bool:
     return agent.get("status", "active") == "active" and not expired
 
 
+def grant_lapsed(member: dict[str, Any], now: float | None = None) -> bool:
+    """A listed room grant whose expires_at has passed: the service drops it at its next housekeeping (up to 30s later), but
+    it already gives no access, so it counts as absent."""
+    expires = member.get("expires_at")
+    return isinstance(expires, (int, float)) and expires <= (time.time() if now is None else now)
+
+
 def plan(agents: list[dict[str, Any]], rooms: list[dict[str, Any]], members: list[dict[str, Any]] | None) -> dict[str, Any]:
     """What is missing. ``agents``/``rooms`` are the service's lists; ``members`` the room's agents (None: no room yet)."""
     live = {a["name"] for a in agents if is_active(a)}
     live_ids = {a.get("agent_id") for a in agents if is_active(a)}
     room = next((r for r in rooms if r.get("name") == ROOM_NAME), None)
-    have = {m["name"] for m in members or [] if m.get("agent_id") in live_ids}     # a grant to an expired agent is no grant
+    have = {m["name"] for m in members or [] if m.get("agent_id") in live_ids and not grant_lapsed(m)}   # nor is a lapsed grant
     return {"agents": [n for n in AGENT_NAMES if n not in live], "room": room is None,
             "members": [n for n in AGENT_NAMES if n not in have]}
 
@@ -179,7 +186,7 @@ def ensure(api: Http, p: dict[str, Any], dry: bool) -> None:
         if dry or room is None:
             print(f"WOULD add {name} to room {ROOM_NAME}")
             continue
-        if any(m["agent_id"] == ids[name] for m in stale):         # a renewed agent kept its grant
+        if any(m["agent_id"] == ids[name] and not grant_lapsed(m) for m in stale):    # a renewed agent kept its grant
             continue
         for m in stale:                  # only the operator's own grant to an expired agent of the operator's holds the handle
             if m["name"] == name and m.get("owner_user_id") == operator and m["agent_id"] in expired_ids:
