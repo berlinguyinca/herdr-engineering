@@ -6,7 +6,8 @@ same routes ``HttpCollab`` uses: GET /me, /agents, /rooms, /rooms/{id}/agents, /
 POST /agents/connect, /projects, /projects/{id}/rooms, /rooms/{id}/agents, /rooms/{id}/messages.
 
 Steps: wait for the service and the bridge (one shared deadline) -> ensure agents (create only when missing or expired)
--> ensure the project, room and its two members (create only when missing) -> verify (room listed, a smoke message POSTED
+-> ensure the room (a new project is always created with it: the service cannot list projects, so re-creating a
+deleted room may leave an extra project) and its two members (create only when missing) -> verify (room listed, a smoke message POSTED
 to the room with a nonce and read back, bridge ``groups/list`` when a bridge token is supplied in
 HERDR_ROOMS_BRIDGE_TOKEN; the bridge signs in with the account's own password, nothing is invented here). ``--check-only``
 creates no agents/rooms/memberships but still posts the smoke message; add ``--no-post`` to skip it (that check reports
@@ -43,12 +44,12 @@ CHAT_ACTIONS = ["read", "post"]
 GROUP_MEMBER_MIN = 2
 _HANDLE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 _SECRET = re.compile(
-    r"(hca_[A-Za-z0-9_\-]{8,}"
+    r"((?:hca|hcj)_[A-Za-z0-9_\-]{8,}"
     r"|(?:Proxy-)?Authorization\"?\s*[:=]\s*(?:\"[^\"]*\"|[^\r\n\",}]+)"
     r"|(?:Set-)?Cookie\"?\s*[:=]\s*(?:\"[^\"]*\"|[^\r\n\"]+)"
     r"|\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=\-]+"
     r"|\w+(?:\+\w+)?://[^\s:/@]*:[^\s@]+@\S+"
-    r"|(?:password|passwd|token|secret|api[_-]?key|credential|session)\"?\s*[:=]\s*(?:\"[^\"]*\"|[^\s\",}]+))", re.I)
+    r"|(?:password|passwd|token|secret|api[_-]?key|private[_-]?key|credential|session)[A-Za-z_-]*\"?\s*[:=]\s*(?:\"[^\"]*\"|[^\s\",}]+))", re.I)
 CAUGHT = (RuntimeError, KeyError, ValueError, TypeError)
 
 
@@ -131,18 +132,6 @@ class Result:
         print(redact(f"{tag} {name}" + (f": {detail}" if detail else "")))
 
 
-def find_project(api: Http, rooms: list[dict[str, Any]]) -> str | None:
-    """An existing project id: GET /projects when the service has it (404: it does not), else a tui-smoke room's project."""
-    try:
-        projects = api.call("GET", BASE + "/projects").get("projects", [])
-    except RuntimeError as exc:
-        if "HTTP 404" not in str(exc):
-            raise
-        projects = []
-    found = next((p["project_id"] for p in projects if isinstance(p, dict) and p.get("name") == PROJECT_NAME), None)
-    return found or next((r["project_id"] for r in rooms if r.get("name") == ROOM_NAME and r.get("project_id")), None)
-
-
 def has_group(body: Any) -> bool:
     """True when the groups array of the bridge's groups/list JSON holds a group named exactly ROOM_NAME."""
     node = body.get("json", body) if isinstance(body, dict) else body
@@ -157,23 +146,27 @@ def ensure(api: Http, p: dict[str, Any], dry: bool) -> None:
             continue
         info = api.call("POST", BASE + "/agents/connect", {"harness_type": "tui-smoke", "name": name})
         print(f"CREATED agent {info['name']} id={info['agent_id']}")           # the credential is dropped unread
-    ids = {a["name"]: a["agent_id"] for a in api.call("GET", BASE + "/agents")["agents"] if is_active(a)}
+    mine = api.call("GET", BASE + "/agents")["agents"]
+    ids = {a["name"]: a["agent_id"] for a in mine if is_active(a)}
+    expired_ids = {a["agent_id"] for a in mine if not is_active(a)}
     rooms = api.call("GET", BASE + "/rooms")["rooms"]
     room = next((r for r in rooms if r["name"] == ROOM_NAME), None)
     if room is None:
         if dry:
             print(f"WOULD create project {PROJECT_NAME!r} and room {ROOM_NAME!r}")
         else:
-            project_id = find_project(api, rooms) or api.call("POST", BASE + "/projects", {"name": PROJECT_NAME})["project_id"]
+            project_id = api.call("POST", BASE + "/projects", {"name": PROJECT_NAME})["project_id"]
             room = api.call("POST", BASE + f"/projects/{project_id}/rooms", {"name": ROOM_NAME})
             print(f"CREATED room {ROOM_NAME} id={room['room_id']}")
-    stale = api.call("GET", BASE + f"/rooms/{room['room_id']}/agents")["agents"] if room and p["members"] and not dry else []
+    removable = room and p["members"] and not dry
+    stale = api.call("GET", BASE + f"/rooms/{room['room_id']}/agents")["agents"] if removable else []
+    operator = api.call("GET", BASE + "/me")["user_id"] if removable else None
     for name in p["members"]:
         if dry or room is None:
             print(f"WOULD add {name} to room {ROOM_NAME}")
             continue
-        for m in stale:                  # a grant to an expired agent holds the handle: take it out first
-            if m["name"] == name and m["agent_id"] != ids[name]:
+        for m in stale:                  # only the operator's own grant to an expired agent of the operator's holds the handle
+            if m["name"] == name and m.get("owner_user_id") == operator and m["agent_id"] in expired_ids:
                 api.call("POST", BASE + f"/rooms/{room['room_id']}/agents/{m['agent_id']}/remove")
                 print(f"REMOVED stale membership {name} (expired agent) from {ROOM_NAME}")
         api.call("POST", BASE + f"/rooms/{room['room_id']}/agents", {"agent_id": ids[name], "actions": CHAT_ACTIONS})
@@ -192,7 +185,8 @@ def verify(api: Http, bridge_url: str, res: Result, post: bool = True) -> None:
     try:
         p, room = current(api)
         res.line(room is not None and is_noop(p), "rooms list has tui-smoke with both agents",
-                 f"id={room['room_id']}" if room else "room missing")
+                 "room missing" if room is None else
+                 "ok" if is_noop(p) else f"missing or expired agents={p['agents']} members without a live agent={p['members']}")
         if room is None or not is_noop(p):
             res.line(None, "bridge groups/list", "skipped: room or its live members incomplete")
             return

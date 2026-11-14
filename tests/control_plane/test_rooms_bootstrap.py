@@ -76,7 +76,7 @@ def _stack(tmp_path, **service_options):
     t2 = threading.Thread(target=dash.serve, daemon=True)
     t2.start()
     dash.wait_until_ready()
-    yield type("S", (), dict(op=port, bridge=f"http://127.0.0.1:{dash.port}", url=f"http://127.0.0.1:{port}"))
+    yield type("S", (), dict(op=port, public=srv.public_port, bridge=f"http://127.0.0.1:{dash.port}", url=f"http://127.0.0.1:{port}"))
     dash.shutdown()
     srv.shutdown()
     t.join(timeout=5)
@@ -186,6 +186,8 @@ def test_redact_hides_any_dsn_with_credentials_only():
 def test_redact_hides_headers_cookies_sessions_and_quoted_values():
     out = rb.redact('Authorization: Basic dXNlcjpwYXNz\nAuthorization: Bearer abc.def\nSet-Cookie: sid=cook1e; Path=/\n'
                     'Cookie: a=cook2e; b=c\n{"session": "sess1on", "token": "two words", "x": 1}')
+    more = rb.redact("hcj_Abcdefgh12345 private_key=pk1 aws_secret_access_key: awsK3y")
+    assert "Abcdefgh" not in more and "pk1" not in more and "awsK3y" not in more
     for secret in ("dXNlcjpwYXNz", "abc.def", "cook1e", "cook2e", "sess1on", "two", "words"):
         assert secret not in out
     assert '"x": 1' in out
@@ -223,15 +225,6 @@ def test_verify_fails_when_a_member_is_not_a_live_agent(short_ttl_stack, capsys)
     rc, out = run_main(stack, capsys, "--check-only", "--no-post")
     assert rc == 1 and "FAIL rooms list has tui-smoke with both agents" in out
     assert "SKIP bridge groups/list" in out
-
-
-def test_find_project_on_the_real_service(stack):
-    api = rb.Http(stack.url)
-    assert rb.find_project(api, []) is None                  # GET /projects is a 404 there: create instead
-    assert rb.find_project(api, [{"name": rb.ROOM_NAME, "project_id": "p1"}]) == "p1"
-    assert rb.find_project(api, [{"name": "other", "project_id": "p2"}]) is None
-    with pytest.raises(RuntimeError, match="unreachable"):
-        rb.find_project(rb.Http("http://127.0.0.1:1"), [])
 
 
 class _Serve:
@@ -281,3 +274,33 @@ def test_bridge_bearer_token_never_follows_a_redirect(monkeypatch, capsys):
     finally:
         front.close()
         target.close()
+
+
+def test_another_owners_live_agent_with_the_same_handle_is_never_removed(stack, capsys):
+    """bob (a second real user on the public listener) holds tui-smoke-a in the room; the operator's run must leave it."""
+    host = f"127.0.0.1:{stack.op}"
+    pub = {"Authorization": f"Bearer {TOKENS['bob']}", "X-Forwarded-Proto": "https"}
+    s, proj = call(stack.op, "POST", f"{BASE}/projects", {"name": rb.PROJECT_NAME}, host=host)
+    s, room = call(stack.op, "POST", f"{BASE}/projects/{proj['project_id']}/rooms", {"name": rb.ROOM_NAME}, host=host)
+    rid = room["room_id"]
+    s, _ = call(stack.op, "POST", f"{BASE}/rooms/{rid}/members", {"user_id": "bob", "role": "contributor"}, host=host)
+    assert s == 201
+    s, bob_agent = call(stack.public, "POST", f"{BASE}/agents/connect",
+                        {"harness_type": "tui-smoke", "name": "tui-smoke-a"}, headers=pub)
+    assert s == 201, bob_agent
+    s, req = call(stack.public, "POST", f"{BASE}/rooms/{rid}/agents",
+                  {"agent_id": bob_agent["agent_id"], "actions": rb.CHAT_ACTIONS}, headers=pub)
+    assert s in (200, 201, 202), req
+    s, pending = call(stack.op, "GET", f"{BASE}/rooms/{rid}/agent-requests", host=host)
+    for r in pending.get("requests", []):
+        s, _ = call(stack.op, "POST", f"{BASE}/rooms/{rid}/agent-requests/{r['request_id']}/decide",
+                    {"decision": "approve"}, host=host)
+        assert s == 200
+    members = call(stack.op, "GET", f"{BASE}/rooms/{rid}/agents", host=host)[1]["agents"]
+    assert [m["owner_user_id"] for m in members] == ["bob"], members
+    rc, out = run_main(stack, capsys)
+    assert rc == 1 and "REMOVED" not in out and "FAIL" in out, out
+    after = call(stack.op, "GET", f"{BASE}/rooms/{rid}/agents", host=host)[1]["agents"]
+    assert [(m["owner_user_id"], m["agent_id"]) for m in after] == [("bob", bob_agent["agent_id"])]
+    rc, out = run_main(stack, capsys, "--check-only", "--no-post")
+    assert rc == 1 and "members without a live agent=" in out and "tui-smoke-a" in out
