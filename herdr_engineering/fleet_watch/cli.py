@@ -220,27 +220,20 @@ def cmd_loop(args) -> int:
     directory = state.state_dir()
     try:
         with state.single_instance(directory, name="loop.lock"):
-            _clear_restart_pending(directory)
             return _loop(args, directory, local)
     except state.WatcherBusy:
         print("fleet-watch loop: another loop is already running", file=sys.stderr)
         return 3
 
 
-def _restart_pending(directory: Path) -> bool:
-    """A rollout (any process) installed a new herdr-engineering on this host after this loop started."""
-    return bool(state.load(directory).get("restart_pending"))
-
-
-def _clear_restart_pending(directory: Path) -> None:
-    """A freshly started loop runs the installed build, so a restart flagged before it started is already served."""
+def _restart_token(directory: Path) -> str | None:
+    """Stamp of the last rollout that installed a new herdr-engineering on this host (None: never, or unreadable)."""
     try:
-        with state.single_instance(directory):
-            saved = state.load(directory)
-            if saved.pop("restart_pending", None):
-                state.save(saved, directory)
-    except state.WatcherBusy:
-        pass                                                   # a pass is mid-write; at worst one extra restart
+        return state.load(directory).get("restart_pending_at")
+    except (OSError, ValueError) as exc:                       # unreadable or corrupt state: no restart, never a crash
+        print(f"fleet-watch loop: cannot read restart state ({type(exc).__name__}); not restarting",
+              file=sys.stderr, flush=True)
+        return None
 
 
 def _loop(args, directory: Path, local: str | None) -> int:
@@ -259,6 +252,7 @@ def _loop(args, directory: Path, local: str | None) -> int:
     dog = service.Watchdog(_watchdog_markers(directory), soft_s=args.soft_limit, hard_s=args.hard_limit,
                            on_soft=soft, on_hard=hard)
     dog.start()
+    started_with = _restart_token(directory)               # the build running now is at least this new
     passes = 0
     try:
         while True:
@@ -272,7 +266,8 @@ def _loop(args, directory: Path, local: str | None) -> int:
             except Exception as exc:                       # a bad pass must not stop the service; the class is enough
                 outcome = f"error {type(exc).__name__}"
             print(f"pass {passes}: {outcome}", flush=True)
-            if _restart_pending(directory):                   # read from state: a failed pass cannot lose it
+            token = _restart_token(directory)                 # read from state: a failed pass cannot lose it
+            if token and token != started_with:
                 print("fleet-watch loop: a rollout installed a new herdr-engineering on this host; "
                       f"exiting {service.RESTART_EXIT}, the service restarts into the new build",
                       file=sys.stderr, flush=True)

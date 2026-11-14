@@ -325,7 +325,7 @@ class Runner:
         rollout["status"] = "succeeded"
         local = self.transport.local_host
         if local and rollout["rows"].get(f"{local}/herdr-engineering", {}).get("updated") is True:
-            saved["restart_pending"] = True        # saved WITH the success: the running loop still has the old build
+            saved["restart_pending_at"] = str(time.time_ns())   # saved WITH the success; a loop restarts when it differs from its start value
         rollout["lock"] = "pending"                # saved with the success: a crash before the pin is repaired later
         saved["converged"].update(rollout["targets"])
         state.save(saved, self.directory)

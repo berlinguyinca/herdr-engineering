@@ -520,7 +520,7 @@ def test_the_restart_decision_survives_the_pass_that_made_it(fleet):
             time.sleep(0.2)
         applied = fleet.cli("--local-host", "beast", "--remote-bin", str(fleet.shims["beast"]))   # another process
         assert applied.returncode == 0, applied.stderr
-        assert fleet.saved()["restart_pending"] is True
+        assert fleet.saved()["restart_pending_at"]
         assert proc.wait(timeout=60) == 75
     finally:
         proc.kill()
@@ -536,7 +536,29 @@ def test_no_restart_storm_after_the_update_restart(fleet):
                            text=True, env=fleet.env(), timeout=120)
     assert again.returncode == 0, again.stderr                                     # the new build does not restart again
     assert "idle" in again.stdout and fleet.saved()["rollouts"] == rollouts        # and found nothing new to roll out
-    assert not fleet.saved().get("restart_pending")
+
+
+def test_a_stale_restart_flag_does_not_restart_a_loop_that_cannot_take_the_pass_lock(fleet):
+    """The flag is a token compared with the value read at start: no clear-write, so a busy pass lock at startup
+    cannot leave it set and make every fresh loop exit 75 again."""
+    first = subprocess.run(local_loop_argv(fleet, fleet.shims["beast"], "--max-passes", "5"), capture_output=True,
+                           text=True, env=fleet.env(), timeout=120)
+    assert first.returncode == 75, first.stderr
+    assert fleet.saved()["restart_pending_at"]
+    with state.single_instance(fleet.state_dir):                                   # another process holds the pass lock
+        again = subprocess.run(local_loop_argv(fleet, fleet.shims["beast"], "--max-passes", "1"),
+                               capture_output=True, text=True, env=fleet.env(), timeout=120)
+    assert again.returncode == 0, again.stderr
+    assert "busy" in again.stdout
+
+
+def test_an_unreadable_state_file_means_no_restart_not_a_crash(fleet):
+    fleet.state_dir.mkdir(parents=True, exist_ok=True)
+    (fleet.state_dir / "state.json").write_text("{not json")
+    out = subprocess.run([sys.executable, "-I", "-c", BOOT, "fleet-watch", "loop", *common(fleet), "--repo", HE,
+                           "--interval", "1", "--max-passes", "1"], capture_output=True, text=True,
+                         env=fleet.env(), timeout=120)
+    assert out.returncode == 0, out.stderr
 
 
 # --------------------------------------------------------------------------- systemd unit and ansible task
