@@ -91,6 +91,7 @@ BULK_EVENTS = frozenset({"message", "comment_added", "comment_revised", "audit_d
 SILENT_EVENTS = frozenset({"workspace_terminal_authorized", "artifact_tool_used", "artifact_commit_submitted",
                            "artifact_upload_staged"})
 # events after which the artifact bridge's agents.json may be out of date
+AGENT_RENEW_AFTER = 86400.0     # a connected agent's sliding window is written once a day at most
 AGENT_FEED_EVENTS = frozenset({"agent_revoked", "user_decided", "agent_enrolled"})
 # creation event -> kind (what is outstanding is recomputed from state, see _recount)
 REVOCABLE_CREATE = {"member_added": "member", "agent_granted": "grant", "agent_enrolled": "agent",
@@ -1438,9 +1439,29 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                     raise CollabError(401, "unauthorized")
                 pr = Principal("agent", aid, agent["owner"], digest)
                 pr.external = bool(agent.get("external"))
+                self._slide_agent(pr, agent)
                 return pr
         self.stats["auth_failures"] += 1
         raise CollabError(401, "unauthorized")
+
+    def _slide_agent(self, pr: Principal, agent: dict) -> None:
+        """Sliding window for an agent made by ``connect_agent``: a successful use moves ``expires_at`` to now + the remote TTL,
+        written at most once a day (a quarter of the window when that is shorter). Never a helper, fabric or externally bound
+        agent (their life is bound elsewhere); only called after the agent proved active and unexpired. Best effort: a full or
+        failing log must not fail authentication. Caller holds the lock."""
+        aid = pr.id
+        if (agent.get("origin") != "connect" or agent.get("external") or agent.get("fabric")
+                or aid in self._helper_minted or aid in self._helper_by_agent):
+            return
+        expires = self._now() + self.remote_credential_ttl
+        if expires - agent["expires_at"] < min(AGENT_RENEW_AFTER, self.remote_credential_ttl / 4):
+            return
+        try:
+            self._commit("credential_rotated", self._actor(
+                pr, agent_id=aid, secret_digest=agent["cred_digest"], expires_at_epoch=expires,
+                action="agent.renew", outcome="allowed", project_ids=[], resource_id=aid))
+        except CollabError:
+            pass
 
     _REFUSED = {"denied": "your request to join was declined", "disabled": "your account is disabled",
                 "kicked": "your access was removed"}
@@ -2253,6 +2274,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "actor_user_id": pr.id, "actor_agent_id": None, "agent_id": aid,
                 "owner_user_id": pr.id, "code_digest": None, "device_id": device,
                 "harness_type": label, "instance_id": None, "name": handle, "parent_agent_id": parent,
+                "origin": "connect",             # marks the agents whose window slides on use (see _slide_agent)
                 **({"skills": skills} if skills else {}), **({"machine": machine} if machine else {}),
                 "secret_digest": _digest(cred),
                 "expires_at_epoch": expires, "action": "agent.connect", "outcome": "allowed",
@@ -3162,6 +3184,31 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 action="agent.rotate", outcome="allowed",
                 project_ids=[bound["project_id"]] if bound else [], resource_id=pr.id))
         return {"agent_id": pr.id, "credential": cred, "expires_at": expires}
+
+    def renew_agent(self, pr: Principal, agent_id: str) -> dict:
+        """Owner only: give one of the owner's own agents a NEW credential and a fresh window, even when it has expired, keeping
+        its id, device, name and room grants. The old secret stops working at once; the new one is shown once. Never a revoked
+        agent, a helper (its life is the helper's), a fabric-machine identity, or an externally bound one (the invite's
+        hard expiry is never extended). An agent cannot call this (it has ``rotate``)."""
+        self._require_user(pr)
+        cred = "hca_" + secrets.token_urlsafe(32)
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if not agent or agent["owner"] != pr.id:
+                raise CollabError(404, "not found")
+            if agent["status"] != "active":
+                raise CollabError(409, "a revoked agent cannot be renewed")
+            if (agent.get("external") or agent.get("fabric") or agent.get("origin") == "fabric_join"
+                    or agent_id in self._helper_minted or agent_id in self._helper_by_agent):
+                raise CollabError(403, "this agent cannot be renewed")
+            if self._now() >= agent["expires_at"]:
+                self._agent_slots(pr.id)                  # an expired agent holds no slot; renewing takes one back
+            expires = self._now() + self.remote_credential_ttl
+            self._commit("credential_rotated", self._actor(
+                pr, agent_id=agent_id, secret_digest=_digest(cred), expires_at_epoch=expires,
+                action="agent.renew", outcome="allowed", project_ids=[], resource_id=agent_id))
+            device, name = agent["device_id"], agent["name"]
+        return {"agent_id": agent_id, "credential": cred, "device_id": device, "expires_at": expires, "name": name}
 
     def revoke_agent(self, pr: Principal, agent_id: str) -> dict:
         self._require_user(pr)
@@ -7177,6 +7224,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                     return 200, self.rename_agent(pr, parts[1], body)
                 if n == 3 and parts[0] == "agents" and parts[2] == "revoke":
                     return 200, self.revoke_agent(pr, parts[1])
+                if n == 3 and parts[0] == "agents" and parts[2] == "renew":
+                    return 200, self.renew_agent(pr, parts[1])
                 if n == 3 and parts[0] == "agents" and parts[2] == "fabric":
                     return 200, self.set_agent_fabric(pr, parts[1], body)
                 if n >= 3 and parts[0] == "rooms":
