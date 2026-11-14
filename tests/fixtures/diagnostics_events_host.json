@@ -83,9 +83,9 @@
     {
      "entity_id": "hive",
      "entity_type": "host",
-     "event_id": "event_recorded_0",
+     "event_id": "event_recorded_2",
      "event_type": "HostHeartbeat",
-     "ingest_timestamp": "2026-11-14T02:00:01+00:00",
+     "ingest_timestamp": "2026-11-14T02:02:01+00:00",
      "mission_id": null,
      "payload": {
       "cpu": null,
@@ -95,9 +95,9 @@
       "tailnet_ip": null
      },
      "schema_version": 1,
-     "sequence": 0,
+     "sequence": 2,
      "session_id": null,
-     "source_timestamp": "2026-11-14T02:00:00+00:00"
+     "source_timestamp": "2026-11-14T02:02:00+00:00"
     }
    ],
    "has_more": true,

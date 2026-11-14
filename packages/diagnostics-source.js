@@ -53,7 +53,8 @@ export function toTimelineRecord(row) {
  * One host from `GET /api/v1/hosts` to the H02 incidents it reported. The feed carries `problems[]` of
  * `{code, message, severity}` alongside `host_id` and `last_seen`; each becomes one incident whose instant is
  * the host's own `last_seen` (the reading the problem was computed against — the feed reports no separate
- * time), and whose fingerprint is `host_id:code`. A problem with no code, or a severity outside H02's
+ * time), and whose fingerprint is the local convention `host_id:code` (the feed gives no fingerprint of its
+ * own, and H02 requires one to group repeats). A problem with no code, or a severity outside H02's
  * vocabulary, is passed through anyway: H04 shows it as a rejected record rather than quietly discarding it.
  * A host reporting no problems returns nothing, which is the feed's fact, not an unreadable section.
  */
@@ -106,7 +107,20 @@ export function hostEventsPath(hostId, limit = HOST_EVENT_PAGE_SIZE) {
  * or a host list longer than HOST_READ_CAP, in which case only the first HOST_READ_CAP hosts are read.
  */
 export function createHostDiagnosticsSource({ request, listHosts, now } = {}) {
-  const readHosts = async () => (typeof listHosts === 'function' ? listHosts() : request('/api/v1/hosts'));
+  // One host-list read is shared by both sections of a load: the two sections are read concurrently, so an
+  // in-flight request is handed to the second caller instead of issuing a second GET. It is released when it
+  // settles, so a later load asks the server again rather than reusing an answer — the page still reads each
+  // feed exactly once, and now the control plane sees one host-list request per page load, not two that could
+  // disagree.
+  let inflight = null;
+  function readHosts() {
+    if (inflight) return inflight;
+    const settled = (value, error) => { if (inflight === promise) inflight = null; if (error) throw error; return value; };
+    const promise = (typeof listHosts === 'function' ? listHosts() : request('/api/v1/hosts'))
+      .then((value) => settled(value), (error) => settled(undefined, error));
+    inflight = promise;
+    return promise;
+  }
   async function fetchHosts() { return readHosts(); }
   async function fetchEvents() {
     const listing = await readHosts().catch(() => null);
