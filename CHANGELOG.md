@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Collab: `herdr-eng collab agents list|renew`
+
+- New CLI over the collab operator listener (`HERDR_COLLAB_OPERATOR_URL`, default `http://127.0.0.1:9482`): `collab agents list` shows id, name, harness, status, expires_at and `renewable`; `collab agents renew <agent-id|@name>` renews via `POST /api/v1/collab/agents/{id}/renew` and writes the NEW credential only to `--credential-file` (0600, no overwrite without `--force`, checked before renewing) or to stdout with `--print-credential`; the credential is never logged or in `--json`. After renewing, update the harness config (`claude mcp add` header, `~/.codex/config.toml`, collab-spawn credential file).
+
 ### Collab: owner renew of expired agents, sliding window on use
 
 - New `POST /api/v1/collab/agents/{id}/renew` (`CollabService.renew_agent`, dashboard **Renew access** on an expired agent card, shown only when the agent list says `renewable`): the signed-in owner (404 for anyone else, 403 for an agent caller) gets a new credential for the same agent id, device and name, shown once, with expiry now + `remote_credential_ttl`. The old credential dies at once. Refused: revoked (409), helper, fabric-machine, fabric-join and externally bound agents (403; an external agent's `hard_expiry` is never extended). It reuses the `credential_rotated` event with action `agent.renew`, so replay and audit work unchanged; a renewal of an expired agent counts against the agent cap again (429).
