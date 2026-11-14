@@ -41,11 +41,18 @@ def test_parse_native_prompt(args, expected):
 def test_receipts_are_truthful():
     receipt = {"result": {"type": "agent_prompted", "agent": {"pane_id": "w1:p1"}}}
     assert delivery_status(0, json.dumps(receipt).encode()) == "delivered"
-    assert delivery_status(1, json.dumps(receipt).encode()) == "failed"
+    # A later --wait failure cannot undo an actual transport acknowledgement.
+    assert delivery_status(1, json.dumps(receipt).encode()) == "delivered"
     assert delivery_status(0, b"not a receipt") == "unknown"
     assert delivery_status(0, b'{"ok":true}') == "unknown"
     assert delivery_status(0, b'{"error":{"code":"agent_blocked"}}') == "failed"
     assert delivery_status(0, b"[]") == "unknown"
+
+
+def test_timeout_or_signal_is_not_proof_that_a_prompt_was_not_delivered():
+    assert delivery_status(1, b"", b'{"error":{"code":"timeout"}}') == "unknown"
+    assert delivery_status(-15, b"") == "unknown"
+    assert delivery_status(1, b"", b'{"error":{"code":"agent_not_found"}}') == "failed"
 
 
 def test_outbox_redacts_before_persisting_and_replays_phases(tmp_path):
@@ -214,6 +221,25 @@ def test_unresolved_native_inventory_does_not_claim_an_observed_sender():
     if not native:
         pytest.skip("Real HerdR CLI is not installed on this runner")
     assert _agent(native, [], "audit-target-does-not-exist") == {}
+
+
+def test_capture_uses_the_enrolled_host_identity_when_configured(tmp_path):
+    from herdr_engineering.communications import run_native
+
+    native = shutil.which("herdr")
+    if not native:
+        pytest.skip("Real HerdR CLI is not installed on this runner")
+    box = Outbox(tmp_path / "audit.sqlite")
+    assert (
+        run_native(
+            native,
+            ["agent", "prompt", "audit-target-does-not-exist", "hello"],
+            box,
+            host_id="mac.lan",
+        )
+        != 0
+    )
+    assert box.pending()[-1]["host_id"] == "mac.lan"
 
 
 def test_failed_audit_storage_does_not_block_native_behavior(tmp_path):

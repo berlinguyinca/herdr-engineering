@@ -237,3 +237,13 @@ def test_invalid_cursor_and_limit_are_refused():
             decode_before(cursor)
     with pytest.raises(ValueError):
         communication_page(ControlPlaneRepo(), limit=101)
+
+
+def test_timeout_delivery_policy_is_unknown_not_a_confirmed_refusal():
+    from herdr_engineering.control_plane.communications import command_failure_status
+    from herdr_engineering.errors import InvalidError, TimeoutError_Engineering
+    from herdr_engineering.herdr_adapter import NativeDeliveryUnconfirmed
+
+    assert command_failure_status(TimeoutError_Engineering("native command timed out")) == "unknown"
+    assert command_failure_status(NativeDeliveryUnconfirmed("receipt was lost")) == "unknown"
+    assert command_failure_status(InvalidError("target was refused")) == "failed"

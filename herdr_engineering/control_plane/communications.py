@@ -127,6 +127,17 @@ def record_observation(
     return True
 
 
+def command_failure_status(error: Exception) -> str:
+    from ..errors import TimeoutError_Engineering
+    from ..herdr_adapter import NativeDeliveryUnconfirmed
+
+    return (
+        "unknown"
+        if isinstance(error, (TimeoutError_Engineering, NativeDeliveryUnconfirmed))
+        else "failed"
+    )
+
+
 def record_command(
     repo: ControlPlaneRepo, session: dict[str, object], receipt: dict[str, object]
 ) -> None:

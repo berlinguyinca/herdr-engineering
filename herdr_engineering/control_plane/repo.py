@@ -757,7 +757,8 @@ class ControlPlaneRepo:
                 result["status"] = "delivered"
                 result["delivery"] = redact_payload(delivery)
             except Exception as exc:
-                result.update(status="failed", error="transport_error",
+                from .communications import command_failure_status
+                result.update(status=command_failure_status(exc), error="transport_error",
                               detail=redact_payload(str(exc)))
             try:
                 self.record_event("session", session_id, "SessionCommandSettled",

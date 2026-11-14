@@ -24,6 +24,10 @@ from .errors import (
 )
 
 
+class NativeDeliveryUnconfirmed(InvalidError):
+    """The native invocation ended without proof of delivery or refusal."""
+
+
 @dataclass
 class Machine:
     id: str
@@ -317,11 +321,15 @@ class NativeHerdrAdapter:
         if not isinstance(text, str) or not text.strip():
             raise InvalidError("prompt text is required")
         environment = {"HERDR_COMMUNICATION_OPERATION_ID": operation_id} if operation_id else None
-        result = json.loads(self._run(self._routing(machine, session)
-                            + ["agent", "prompt", target, text], environment=environment))
+        raw = self._run(self._routing(machine, session)
+                        + ["agent", "prompt", target, text], environment=environment)
         from .communications import delivery_status
-        if delivery_status(0, json.dumps(result).encode()) != "delivered":
-            raise InvalidError("native prompt did not acknowledge delivery")
+        status = delivery_status(0, raw.encode())
+        if status == "unknown":
+            raise NativeDeliveryUnconfirmed("native prompt did not acknowledge delivery")
+        if status != "delivered":
+            raise InvalidError("native prompt refused delivery")
+        result = json.loads(raw)
         return {"status": "delivered", "target": target, "machine": machine,
                 "session": session, "mission_progress_verified": False,
                 "receipt": result}
@@ -337,5 +345,12 @@ class _SubprocessRunner:
             [self.herdr_bin] + args, capture_output=True, text=True, timeout=timeout,
             env={**os.environ, **environment} if environment else None)
         if proc.returncode != 0:
+            from .communications import delivery_status, parse_prompt
+            if parse_prompt(args) is not None:
+                status = delivery_status(proc.returncode, proc.stdout.encode(), proc.stderr.encode())
+                if status == "delivered":
+                    return proc.stdout
+                if status == "unknown":
+                    raise NativeDeliveryUnconfirmed("native prompt outcome is unconfirmed")
             raise InvalidError(f"herdr {args[0]} failed: {proc.stderr.strip()[:300]}")
         return proc.stdout

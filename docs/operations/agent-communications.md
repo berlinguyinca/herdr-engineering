@@ -3,9 +3,9 @@
 Open **Agents → Communications** (`#/communications`) to see messages submitted
 through the native CLI integration and the control-plane session message API.
 The history shows sender/recipient, available session links, time, redacted text,
-and delivery evidence. A native delivery acknowledgement means transport accepted
+and delivery evidence. Reported time is distinct from server record time for offline uploads. A native delivery acknowledgement means transport accepted
 the prompt, not that the agent read it or completed the work. Unresolved sender
-identity and unknown delivery outcomes remain explicit.
+identity and unknown delivery outcomes remain explicit. Timeouts, signals and missing receipts are unconfirmed outcomes, not proof a prompt was refused; a later wait failure cannot undo a native acknowledgement.
 
 ## Native capture
 
@@ -21,7 +21,7 @@ Install from a persistent, installed release of herdr-engineering (not a scratch
 checkout or a virtual environment you intend to delete):
 
 ```sh
-herdr-eng communications install --native "$HOME/.local/bin/herdr" \
+herdr-eng communications install --native "$HOME/.local/bin/herdr" --host-id YOUR-ENROLLED-HOST-ID \
   --url http://YOUR-CONTROL-PLANE \
   --key-file "$HOME/.config/herdr-engineering/YOUR-INGEST-KEY"
 herdr-eng communications status

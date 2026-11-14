@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
+import selectors
 import shutil
 import socket
 import sqlite3
@@ -80,25 +82,41 @@ def parse_prompt(args: list[str]) -> tuple[list[str], str, str] | None:
     return args[:i], positions[0], positions[1]
 
 
-def delivery_status(code: int, output: bytes) -> str:
-    if code:
+def delivery_status(code: int, output: bytes, errors: bytes = b"") -> str:
+    """Report transport evidence, not merely the exit status of --wait."""
+    refusal = False
+    for raw in (output, errors):
+        try:
+            body = json.loads(raw)
+        except (ValueError, UnicodeError):
+            continue
+        if not isinstance(body, dict):
+            continue
+        result = body.get("result")
+        if (
+            body.get("ok") is not False
+            and isinstance(result, dict)
+            and (
+                result.get("type") == "agent_prompted"
+                and isinstance(result.get("agent"), dict)
+                or body.get("ok") is True
+                and result.get("submitted") is True
+            )
+        ):
+            return "delivered"
+        error = body.get("error")
+        if isinstance(error, dict) and error.get("code") in {
+            "agent_not_found",
+            "agent_blocked",
+            "pane_not_found",
+            "invalid_request",
+            "unauthorized",
+            "permission_denied",
+            "agent_not_ready",
+        }:
+            refusal = True
+    if refusal or code == 2:  # CLI syntax rejection occurs before transport.
         return "failed"
-    try:
-        body = json.loads(output)
-    except (ValueError, UnicodeError):
-        return "unknown"
-    if not isinstance(body, dict):
-        return "unknown"
-    if body.get("error") or body.get("ok") is False:
-        return "failed"
-    result = body.get("result")
-    if isinstance(result, dict) and (
-        result.get("type") == "agent_prompted"
-        and isinstance(result.get("agent"), dict)
-        or body.get("ok") is True
-        and result.get("submitted") is True
-    ):
-        return "delivered"
     return "unknown"
 
 
@@ -217,7 +235,7 @@ def _agent(native: str, route: list[str], target: str) -> dict[str, object]:
     return {}
 
 
-def run_native(native: str, args: list[str], box: Outbox) -> int:
+def run_native(native: str, args: list[str], box: Outbox, *, host_id: str | None = None) -> int:
     parsed = parse_prompt(args)
     if parsed is None:
         return subprocess.call([native, *args])
@@ -230,7 +248,7 @@ def run_native(native: str, args: list[str], box: Outbox) -> int:
     sender = _agent(native, [], sender_pane) if sender_pane else {}
     data: dict[str, object] = {
         "text": text,
-        "host_id": socket.gethostname(),
+        "host_id": host_id or socket.gethostname(),
         "sender": sender,
         "recipient": _agent(native, route, target) or {"name": target},
         "route": route,
@@ -249,20 +267,30 @@ def run_native(native: str, args: list[str], box: Outbox) -> int:
             )
 
     record("queued")
-    captured = bytearray()
+    captured, errors = bytearray(), bytearray()
+    child = None
     try:
-        child = subprocess.Popen([native, *args], stdout=subprocess.PIPE)
-        assert child.stdout is not None
-        with child.stdout:
-            while chunk := child.stdout.read(8192):
-                sys.stdout.buffer.write(chunk)
-                sys.stdout.buffer.flush()
-                captured.extend(chunk[: max(0, 256 * 1024 - len(captured))])
+        child = subprocess.Popen([native, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert child.stdout is not None and child.stderr is not None
+        with child.stdout, child.stderr, selectors.DefaultSelector() as ready:
+            ready.register(child.stdout, selectors.EVENT_READ, (sys.stdout.buffer, captured))
+            ready.register(child.stderr, selectors.EVENT_READ, (sys.stderr.buffer, errors))
+            while ready.get_map():
+                for key, _ in ready.select():
+                    stream = cast(io.BufferedReader, key.fileobj)
+                    chunk = stream.read1(8192)
+                    if not chunk:
+                        ready.unregister(stream)
+                        continue
+                    output, retained = key.data
+                    output.write(chunk)
+                    output.flush()
+                    retained.extend(chunk[: max(0, 256 * 1024 - len(retained))])
         code = child.wait()
     except OSError:
-        record("failed")
+        record("failed" if child is None else "unknown")
         raise
-    status = delivery_status(code, bytes(captured))
+    status = delivery_status(code, bytes(captured), bytes(errors))
     actual_recipient = receipt_recipient(bytes(captured)) if status == "delivered" else {}
     if actual_recipient:
         data["recipient"] = actual_recipient
@@ -304,7 +332,15 @@ def sync(box: Outbox, url: str, key_file: Path, *, limit: int = 100, max_seconds
 
         # Do not send credentials to a redirect destination.
         class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+            def redirect_request(
+                self,
+                req: urllib.request.Request,
+                fp: object,
+                code: int,
+                msg: str,
+                headers: object,
+                newurl: str,
+            ) -> None:
                 return None
 
         with urllib.request.build_opener(NoRedirect()).open(
@@ -323,7 +359,9 @@ def sync(box: Outbox, url: str, key_file: Path, *, limit: int = 100, max_seconds
     return count
 
 
-def install(native: Path, config: Path, *, url: str = "", key_file: str = "") -> None:
+def install(
+    native: Path, config: Path, *, url: str = "", key_file: str = "", host_id: str = ""
+) -> None:
     """Opt-in local shim; original executable retained beside it for rollback."""
     native = native.absolute()
     if native.is_symlink() or not native.is_file():
@@ -334,6 +372,7 @@ def install(native: Path, config: Path, *, url: str = "", key_file: str = "") ->
     config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = {
         "native": str(backup),
+        "host_id": host_id,
         "url": url,
         "key_file": key_file,
         "outbox": str(Path.home() / ".local/state/herdr-engineering/communications.sqlite"),
@@ -366,6 +405,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--native", type=Path)
     parser.add_argument("--url", default="")
     parser.add_argument("--key-file", default="")
+    parser.add_argument(
+        "--host-id", default="", help="existing fleet host id for session correlation"
+    )
     arguments = sys.argv[1:] if argv is None else argv
     boundary = arguments.index("--") if "--" in arguments else len(arguments)
     args = parser.parse_args(arguments[:boundary])
@@ -375,6 +417,7 @@ def main(argv: list[str] | None = None) -> int:
             args.config,
             url=args.url,
             key_file=args.key_file,
+            host_id=args.host_id,
         )
         return 0
     native_args = arguments[boundary + 1 :]
@@ -400,7 +443,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.action == "status":
         print(json.dumps({"pending": len(box.pending(MAX_RECORDS)), "database": cfg["outbox"]}))
         return 0
-    code = run_native(cfg["native"], native_args, box) if args.action == "native" else 0
+    code = (
+        run_native(cfg["native"], native_args, box, host_id=cfg.get("host_id"))
+        if args.action == "native"
+        else 0
+    )
     if args.action == "sync" and not (cfg.get("url") and cfg.get("key_file")):
         print(
             "HerdR audit: no dashboard URL/key file configured; observations remain local.",
