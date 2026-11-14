@@ -206,7 +206,7 @@ def test_coordinator_rollback_restores_previous_profile_before_verification(harn
 memory_client_preflight
 memory_client_snapshot
 PREV_COMMIT=old; PREV_SHA=old; PREV_TAG=old; PREVIOUS_IMAGE=old
-SHA=new; REPO="$WORK"; STATE_HELPER="{state}"; COLLAB=0
+SHA=new; REPO="$WORK"; STATE_HELPER="{state}"; PY=python3; ARTIFACT_HOST=0; PREV_AH=0; AH_MIGRATED=0; AH_MANUAL=0; NEW_AH=""; COLLAB=0
 APP_SERVICES=(control-plane-web); EDGE_SERVICE=(); SHARE_SERVICE=()
 HOST_MUTATED=1; DEPLOY_FINISHED=0; WORKER_PAUSED=0
 DEPLOY_LOCK_PHASES=()
@@ -216,6 +216,7 @@ git() {{ return 0; }}
 compose_up() {{ return 0; }}
 rollback_share() {{ return 0; }}
 rollback_services() {{ return 0; }}
+rollback_artifact_host() {{ return 0; }}
 verify() {{ printf '%s\\n' '{{"action":"verify-rollback","args":[]}}' >> "{harness['log']}"; }}
 cleanup() {{ return 0; }}
 {rollback}

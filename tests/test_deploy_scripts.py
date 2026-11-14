@@ -134,6 +134,17 @@ PY
 fi
 if [ "$1" = build ] && [ -n "${{FAIL_BUILD:-}}" ]; then exit 1; fi
 if [ "$1" = compose ]; then
+  case " $* " in *"/deploy/artifact-host/compose.yaml "*)   # the artifact host's own project: logged, never the control plane's
+    echo "$@" >> {log}
+    # STUB_FAIL_AH="<word>": a host-project call containing that word (e.g. migrate, pg_dump) fails
+    [ -z "${{STUB_FAIL_AH:-}}" ] || case " $* " in *" $STUB_FAIL_AH "*) exit 1 ;; esac
+    # the migrate service marks the schema as moved; a schema_migrations count query answers the value before / after it
+    case " $* " in *" artifact-host-migrate "*) touch {log}.migrated ;; esac
+    case " $* " in *schema_migrations*)
+      # STUB_AH_COUNT_FAIL=1: the count query fails (no output, non-zero), before and after the migration alike
+      if [ -n "${{STUB_AH_COUNT_FAIL:-}}" ]; then exit 1; fi
+      if [ -f {log}.migrated ]; then echo "${{STUB_AH_SCHEMA_AFTER:-3}}"; else echo "${{STUB_AH_SCHEMA_BEFORE:-3}}"; fi ;; esac
+    exit 0 ;; esac
   echo "composeenv fleetdir=${{HERDR_CP_FLEET_DIR:-}} tag=${{HERDR_CP_IMAGE_TAG:-}} collabdir=${{HERDR_COLLAB_CONFIG_DIR:-}} llmdir=${{HERDR_LLM_SLICE_DIR:-}} githubappdir=${{HERDR_CP_GITHUB_APP_DIR:-}}" >> {log}
   if [ -n "${{HERDR_LLM_SLICE_DIR:-}}" ]; then echo "llmslice $(cat "$HERDR_LLM_SLICE_DIR/llm-config.json" | tr -d '\n')" >> {log}; fi
   prev=""; files=""; up=0; pins=""

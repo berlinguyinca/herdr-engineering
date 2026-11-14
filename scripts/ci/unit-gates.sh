@@ -49,6 +49,9 @@ export PATH="$venv/bin:$PATH"
 t2=$(date +%s)
 
 echo "== pytest =="
+# CI agents are Slurm exec hosts with no docker daemon: the real `docker compose up` tests of the artifact host skip here
+# (they fail, not skip, under CI otherwise) and run wherever docker exists; no pipeline has docker today.
+export HERDR_SKIP_DOCKER=1
 echo "pytest arguments: ${PYTEST_PARALLEL[*]:-(serial)}"
 watched() { python3 scripts/ci/run-watched.py "${HERDR_PYTEST_SOFT_SECONDS:-3600}" "${HERDR_PYTEST_HANG_SECONDS:-1800}" -- "$@"; }
 watched python -m pytest -q -m "$HERDR_PYTEST_FAST_MARKEXPR" ${PYTEST_PARALLEL[@]+"${PYTEST_PARALLEL[@]}"}
