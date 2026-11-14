@@ -1195,11 +1195,11 @@ def run_passes(cfg: dict, tier: dict, backend: Backend, req: ReviewRequest, root
     deadline = time.monotonic() + tier["time_cap_s"]
     verdicts, usages, info, models, down, failed, said_block = [], [], [], [], 0, [], False
     for i, ps in enumerate(passes):
+        raw = None                                      # before the cap check: never reuse the previous pass's result
         remaining = deadline - time.monotonic()
         try:
             if remaining <= 0:
                 raise ReviewFailed(f"the review took longer than the time cap ({tier['time_cap_s']:.0f}s)")
-            raw = None
             raw = backend.review(dataclasses.replace(req, focus=ps["focus"]), remaining / (len(passes) - i))
             v = parse_verdict(raw.answer, req.sha)
         except ReviewFailed as e:

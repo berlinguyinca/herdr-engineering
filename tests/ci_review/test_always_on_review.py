@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -343,7 +344,7 @@ def test_config_rejects_unknown_keys_backends_and_equal_contexts(env):
 def test_posting_needs_both_the_config_key_and_the_flag(env):
     for post_cfg, flag in ((False, False), (True, False), (False, True)):
         env.config(post=post_cfg)
-        assert env.review("tier2", post=flag, *["--force"]) == 0
+        assert env.review("tier2", "--force", post=flag) == 0
     assert env.gh_writes() == []                               # three real reviews, not one write
     assert len(env.reviewer_calls()) == 3
 
@@ -471,7 +472,7 @@ def test_a_blocking_finding_posts_failure_and_one_marked_comment(env):
     assert env.statuses_posted()[-1]["state"] == "failure"
     (c,) = env.gh_state()["comments"]
     assert c["body"].startswith("<!-- always-on-review:opus-agent-review -->") and "src/a.py:2" in c["body"]
-    assert env.review("tier2", post=True, *["--force"]) == 0                        # a re-run updates, not adds
+    assert env.review("tier2", "--force", post=True) == 0                        # a re-run updates, not adds
     assert len(env.gh_state()["comments"]) == 1
 
 
@@ -488,7 +489,7 @@ def test_a_malformed_answer_leaves_the_status_pending(env):
     env.config(post=True)
     for bad in ("LGTM, approve!", {**APPROVE, "head_sha": "b" * 40}, {**APPROVE, "extra": 1}):
         env.reviewer("claude", answer=bad)
-        assert env.review("tier2", post=True, *["--force"]) == 1
+        assert env.review("tier2", "--force", post=True) == 1
     assert {s["state"] for s in env.statuses_posted()} == {"pending"}
     assert env.gh_state().get("comments", []) == []
 
@@ -736,10 +737,10 @@ def test_below_the_daily_budget_the_review_runs(env):
 def test_at_the_daily_budget_the_review_is_skipped_and_stays_pending(env, capsys):
     env.config(BUDGET, post=True)
     assert env.review("tier2", post=True) == 0                      # 0.5 spent, under 1.0
-    assert env.review("tier2", post=True, *["--force"]) == 0        # 1.0 spent: now at the budget
+    assert env.review("tier2", "--force", post=True) == 0        # 1.0 spent: now at the budget
     posted = env.statuses_posted()
     capsys.readouterr()
-    assert env.review("tier2", post=True, *["--force"]) == 4        # SKIPPED, nothing run, nothing posted
+    assert env.review("tier2", "--force", post=True) == 4        # SKIPPED, nothing run, nothing posted
     assert len(env.reviewer_calls()) == 2 and env.statuses_posted() == posted
     err = capsys.readouterr().err
     assert err.count("daily budget") == 1 and "tier2" in err and "exhausted" in err
@@ -748,11 +749,11 @@ def test_at_the_daily_budget_the_review_is_skipped_and_stays_pending(env, capsys
 def test_spend_from_a_previous_utc_day_is_ignored(env):
     env.config(BUDGET, post=True)
     env.review("tier2", post=True)
-    env.review("tier2", post=True, *["--force"])
+    env.review("tier2", "--force", post=True)
     yesterday = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     path = env.tmp / "state/reviews.jsonl"
     path.write_text("".join(json.dumps({**x, "ts": yesterday}) + "\n" for x in _log_lines(env)))
-    assert env.review("tier2", post=True, *["--force"]) == 0 and len(env.reviewer_calls()) == 3
+    assert env.review("tier2", "--force", post=True) == 0 and len(env.reviewer_calls()) == 3
 
 
 def test_only_the_same_tiers_spend_counts(env):
@@ -767,7 +768,7 @@ def test_only_the_same_tiers_spend_counts(env):
 def test_no_budget_means_no_limit(env):
     env.config(post=True)
     for _ in range(4):
-        assert env.review("tier2", post=True, *["--force"]) == 0
+        assert env.review("tier2", "--force", post=True) == 0
     assert len(env.reviewer_calls()) == 4
 
 
@@ -811,4 +812,24 @@ def test_an_undecodable_byte_in_the_log_skips_that_line_only(env):
     with (env.tmp / "state/reviews.jsonl").open("ab") as f:
         f.write(b'\xff\xfe not utf-8\n')
     assert env.mod.spent_today_usd(env.mod.load_config(env.cfg_path), "tier2") == 0.5
-    assert env.review("tier2", post=True, *["--force"]) == 0
+    assert env.review("tier2", "--force", post=True) == 0
+
+
+def test_a_pass_that_hits_the_time_cap_does_not_recount_the_previous_passes_usage(env):
+    """A real Backend (it sleeps, then answers) used directly: pass 1 uses up the whole cap, so pass 2 stops at the
+    cap check before it calls any backend. Pass 1's usage must be counted exactly once."""
+    env.config(BUDGET)
+    cfg = env.mod.load_config(env.cfg_path)
+
+    class Slow:
+        name, needs_worktree = "slow", False
+
+        def review(self, req, time_cap_s):
+            time.sleep(0.3)
+            answer = {"head_sha": req.sha, "verdict": "approve", "findings": [], "checked": ["code"]}
+            return env.mod.RawReview(answer, "m", 0.3, {"cost_usd": 0.5})
+
+    tier = {**cfg["tiers"]["tier2"], "time_cap_s": 0.2, "passes": [{"name": "a", "focus": ""}, {"name": "b", "focus": ""}]}
+    req = env.mod.ReviewRequest(REPO, 7, env.head, "t", "", "", "", [])
+    result = env.mod.run_passes(cfg, tier, Slow(), req, None)
+    assert result.partial and result.usage["cost_usd"] == 0.5
