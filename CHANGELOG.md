@@ -5,6 +5,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### xdist follow-ups: collision-free ports, accurate comments, stronger parallel tests
+
+- `test_allocation_skips_os_bound_port` and `test_failed_forwarder_start_is_retried_on_next_sync` bound fixed ports (18500, 24700) that could collide across files running concurrently under `--dist=loadfile`; they now use OS-assigned ports.
+- `scripts/ci/pytest-parallel.sh` comments corrected: `loadfile` does not honour `xdist_group` (only `loadgroup` does), and `--maxprocesses` caps explicit worker counts too.
+- The loadfile test now runs four real files on two workers and asserts more than one worker was used with each file on exactly one; added refusal tests for `HERDR_PYTEST_MAXPROCESSES` of `0` or non-numeric.
+- `tree._live_processes` runs `ps -ww`: xdist workers export `COLUMNS=80`, which truncated process args (regression test added).
+- `execnet==2.1.2` (what `pytest-xdist==3.8.0` resolves to) is pinned in the dev extra.
+
 ### Review prompt v2: rules, checklist, evidence, passes, replay harness (always-on-review.py)
 
 - New YAML keys: `prompt.project_rules` (trusted rules in both tiers' prompt), `prompt.checklist_file` (`deploy/ci-review/review-checklist.yaml`, validated, the reviewer lists the ids it considered in `checked_items`), `prompt.require_evidence` (default true), `tiers.tier2.passes` (the example ships general, tests, security, migrations; unset or `[]` keeps one unfocused review) and `replay.clones`. The claude prompt now tells the reviewer to read callers, tests and migrations before the verdict.

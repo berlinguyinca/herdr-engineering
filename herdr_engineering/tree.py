@@ -125,7 +125,7 @@ def _live_processes() -> list[dict[str, Any]]:
         return out
     try:
         rows = subprocess.run(
-            ["ps", "-eo", "pid,ppid,args"], capture_output=True, text=True,
+            ["ps", "-ww", "-eo", "pid,ppid,args"], capture_output=True, text=True,
             timeout=5).stdout.splitlines()
     except Exception:
         return out

@@ -98,12 +98,32 @@ def test_xdist_is_a_pinned_dev_dependency() -> None:
     assert pins and re.fullmatch(r"pytest-xdist==\d+\.\d+\.\d+", pins[0]), pins
 
 
-def test_loadfile_keeps_a_files_tests_on_one_worker(tmp_path: Path) -> None:
-    """A real two-worker run: every test of a file reports the same worker id."""
-    for name in ("test_a.py", "test_b.py", "test_c.py"):
-        (tmp_path / name).write_text(
-            "import os\n"
-            + "".join(f"def test_{i}(record_property):\n    record_property('w', os.environ['PYTEST_XDIST_WORKER'])\n" for i in range(6))
+def test_a_zero_or_non_numeric_cap_is_refused() -> None:
+    for bad in ("0", "lots"):
+        done = subprocess.run(
+            ["bash", "-c", f'unset HERDR_PYTEST_WORKERS HERDR_PYTEST_MAXPROCESSES; export HERDR_PYTEST_MAXPROCESSES={bad}; . "{HELPER}"; herdr_pytest_parallel_args'],
+            capture_output=True, text=True, cwd=ROOT,
+        )
+        assert done.returncode != 0 and "HERDR_PYTEST_MAXPROCESSES" in done.stderr, (bad, done.stderr)
+        assert done.stdout == ""
+
+
+def test_xdist_dependencies_are_pinned_exactly() -> None:
+    dev = tomllib.loads(PYPROJECT.read_text())["project"]["optional-dependencies"]["dev"]
+    assert any(re.fullmatch(r"execnet==\d+\.\d+\.\d+", d) for d in dev), dev
+
+
+def test_loadfile_spreads_files_over_workers_but_keeps_each_file_on_one(tmp_path: Path) -> None:
+    """A real two-worker run on four small files: more than one worker is used, and every file stays on exactly one."""
+    names = ("test_a", "test_b", "test_c", "test_d")
+    for name in names:
+        (tmp_path / f"{name}.py").write_text(
+            "import os, time\n"
+            + "".join(
+                f"def test_{i}(record_property):\n    time.sleep(0.05)\n"
+                "    record_property('w', os.environ['PYTEST_XDIST_WORKER'])\n"
+                for i in range(6)
+            )
         )
     (tmp_path / "pytest.ini").write_text("[pytest]\n")
     report = tmp_path / "r.xml"
@@ -114,6 +134,10 @@ def test_loadfile_keeps_a_files_tests_on_one_worker(tmp_path: Path) -> None:
     )
     assert done.returncode == 0, done.stdout + done.stderr
     xml = report.read_text()
-    for name in ("test_a", "test_b", "test_c"):
-        workers = set(re.findall(rf'classname="{name}"[^>]*>\s*<properties>\s*<property name="w" value="(gw\d)"', xml))
-        assert len(workers) == 1, (name, workers)
+    all_workers: set[str] = set()
+    for name in names:
+        workers = re.findall(rf'classname="{name}"[^>]*>\s*<properties>\s*<property name="w" value="(gw\d+)"', xml)
+        assert len(workers) == 6, (name, workers)
+        assert len(set(workers)) == 1, (name, workers)
+        all_workers |= set(workers)
+    assert len(all_workers) > 1, f"all files ran on {all_workers}: the run was not parallel"

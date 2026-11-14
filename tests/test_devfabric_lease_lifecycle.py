@@ -195,13 +195,17 @@ def test_failed_forwarder_start_is_retried_on_next_sync(tmp_path):
     leave the slot retryable: the NEXT sync starts it once the port frees,
     instead of remembering the failure for the life of the process."""
     from herdr_engineering.cli import _ensure_origin_forwarder
-    reg = _reg(tmp_path)
-    lease = reg.register(target_machine_id="m", target_host="127.0.0.1",
-                         target_port=8601, preferred_port=24700)
+    import dataclasses
+    # The blocker holds an OS-assigned port for the whole test (no probe/close/rebind race, and a fixed port would collide
+    # with other files running on the same host under xdist --dist=loadfile).
     blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    blocker.bind(("127.0.0.1", 24700))
+    blocker.bind(("127.0.0.1", 0))
     blocker.listen(1)
+    port = blocker.getsockname()[1]
+    lease = dataclasses.replace(
+        _reg(tmp_path).register(target_machine_id="m", target_host="127.0.0.1", target_port=8601),
+        external_port=port)
     fwd: dict = {}
     err = _ensure_origin_forwarder(fwd, "app", lease, "127.0.0.1")
     assert err is not None, "start failure must be reported"
