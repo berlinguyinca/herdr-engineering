@@ -32,7 +32,7 @@ import { agentStory, renderStory } from './agents-lineage.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
 import { RANGES, safeHostId } from './host-view.js';
 import { mountHosts, loadHosts, mountDiagnostics } from './hosts-view.js';
-import { createDiagnosticsSource } from './diagnostics-source.js';
+import { createHostDiagnosticsSource } from './diagnostics-source.js';
 import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountActivity, loadActivity } from './activity-view.js';
 import { mountAnalytics, loadAnalytics, usageStrip } from './analytics-view.js';
@@ -1126,7 +1126,10 @@ async function viewHosts(_parts, revision) {
 // mount writes into this route's own node, so a read that finishes after the operator navigated away cannot write over the page they moved to.
 async function viewDiagnostics(_parts, revision) {
   root.innerHTML = '<div data-diagnostics></div>';
-  const source = createDiagnosticsSource({ fetchEvents: () => client.request('/api/v1/events').catch(() => null), fetchHosts: () => client.listHosts().catch(() => null), now: Date.now() });
+  // Only feeds that exist: the host list, then one event page per host through the adapter's own path builder.
+  // The bare events endpoint answers 400 (it requires both entity parameters), so that query lives in
+  // hostEventsPath beside the adapter that maps the answer, and this page names no URL of its own.
+  const source = createHostDiagnosticsSource({ request: (path) => client.request(path), listHosts: () => client.listHosts(), now: Date.now() });
   await mountDiagnostics(root.querySelector('[data-diagnostics]'), { source });
   if (revision !== renderRevision) return NO_REFRESH;
   addSnapshotChip();
