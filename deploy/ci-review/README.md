@@ -193,6 +193,30 @@ always-on-review.py poll --config CFG                                           
 always-on-review.py poll --config CFG --post                                     # posts only if CFG has post: true
 ```
 
+### Codex second reviewer on risky paths
+
+Opus reviewing Claude-authored PRs drops the different-family rule of `Independent AI review`. For PRs that touch a
+path matching `risky.globs` (YAML; default `[]` = off; the example config lists `deploy/**`, `**/migrations/**`,
+`**/*.sql`, `**/*security*/**`, `**/*auth*`, `**/secrets*`), `Opus agent review` is posted `success` only when a
+Codex review of the same head is also clean:
+
+- Opus runs first. A block, or an incomplete or unverified Opus review, decides as before and Codex is not called.
+  Otherwise `codex exec` reviews the same detached worktree (`--sandbox read-only --ephemeral --ignore-user-config
+  --ignore-rules`, strict `--output-schema`, scrubbed environment, time cap, same prompt, evidence rule and verdict
+  parser). The two verdicts are merged and the script decides the state: any surviving blocking finding from either
+  posts `failure` (with the usual marked comment); both approving posts `success`.
+- If Codex cannot produce a verified verdict (not installed or not logged in, time cap, non-zero exit, malformed
+  answer or wrong `head_sha`, a block whose blockers fail the evidence rule, or a daily budget that cannot be
+  counted) the status stays `pending`: never `success`, and it counts toward the failure cooldown. Opus has already
+  run by then and runs again on the retry; the cooldown bounds that.
+- Non-risky PRs and tier 1 never call Codex. A head that moved posts nothing. Dry-run is unchanged (Codex runs, nothing
+  is posted; posting needs `post: true` and `--post`).
+- Cost: `risky.codex.daily_budget_usd` (optional) is summed from `reviews.jsonl` lines with `tier: codex`, since
+  00:00 UTC. Codex reports tokens only, so the cost is `input_usd_per_mtok` and `output_usd_per_mtok` (both required
+  with a budget) times the tokens. At or over the budget a risky PR is skipped before Opus runs, status unchanged.
+- `show-command --tier codex` prints the command line. The host needs `codex` on PATH and `codex login` (or API key
+  in codex's own auth store); concurrency stays 1 and nothing uses a GPU.
+
 Gates: by default tier 2 does not wait for green checks, so Opus can review every pushed head. Set
 `gates.wait_for_green: true` (YAML only; it must be a boolean) to restore the green-only gate, and then
 `gates.required` is mandatory. With it on, `gates.required` names must be present and `success`; `neutral` and `skipped` do not count as green. A
