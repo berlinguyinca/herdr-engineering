@@ -202,7 +202,7 @@ def _flatten(value, prefix: str = ""):
         yield prefix, text
 
 
-def _how_to_read(report: dict, anchors: bool) -> str:
+def _how_to_read(report: dict, anchors: bool, shared: bool = False) -> str:
     """The collapsed "How to read this report" legend. Static text only (no descriptor text is copied in), and a term
     is explained only when this report actually shows it: the labels are the ones ``render_report_preview`` prints.
     The descriptor has no severity or confidence field, and the legend says so rather than inventing a scale."""
@@ -233,21 +233,25 @@ def _how_to_read(report: dict, anchors: bool) -> str:
     if anchors:
         rows.append(("#", "Beside each section, finding and figure heading. It links to exactly that part; copy it to "
                           "share."))
-    rows.append(("Shortened or omitted", "A notice at the end means this is a size-limited preview; the full "
-                                         "descriptor has everything."))
+    rows.append(("Shortened or omitted", "A notice at the end means this is a size-limited preview; "
+                                         + ("the full report is available to its owner." if shared
+                                            else "the full descriptor has everything.")))
     return ('<details class="howto"><summary>How to read this report</summary><dl>'
             + "".join(f"<dt>{term}</dt><dd>{meaning}</dd>" for term, meaning in rows) + "</dl></details>")
 
 
 def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] | None = None,
                           max_bytes: int = DEFAULT_PREVIEW_BYTES,
-                          figure_images: FigureImages | None = None) -> str:
+                          figure_images: FigureImages | None = None, shared: bool = False) -> str:
     """Render a styled preview without opening evidence blobs or executing report source.
 
     Every section has a bounded share of the byte budget so an oversized evidence
     inventory cannot suppress all findings. Whole entries are omitted rather than
     cutting HTML; one small note with counts and the full-descriptor link discloses
     omissions or shortened text, and appears only when something was left out.
+
+    ``shared`` words every pointer to the full report (notice, legend, per-field markers) for a reader who has no
+    descriptor link, so the byte cap already counts the longer text.
 
     ``figure_images`` maps an asset id to ``(media_type, bytes)``; a figure whose asset is present, is an image
     type and fits the per-figure cap is shown inline. Images are the first thing given up when the budget is
@@ -267,7 +271,8 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
         nonlocal shortened
         if len(value) > limit:
             shortened = True
-            value = value[:limit] + " … [text shortened; see full descriptor]"
+            value = value[:limit] + (" … [text shortened; the full report is available to its owner]" if shared
+                                     else " … [text shortened; see full descriptor]")
         return html.escape(value, quote=True)
 
     def tracked(build: Callable, *args) -> tuple[str, bool]:
@@ -412,7 +417,9 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
 
     def note(counts: list[tuple[str, int, int]]) -> str:
         shown = ", ".join(f"{kept} of {total} {label}" for label, kept, total in counts if kept < total)
-        parts = ["Some content was shortened or omitted; see the <a href=\"report\">full descriptor</a>."]
+        parts = ["Some content was shortened or omitted; " + (
+            "the full report is available to its owner." if shared
+            else "see the <a href=\"report\">full descriptor</a>.")]
         if shown:
             parts.append(f"Shown: {shown}.")
         return f'<aside class="notice" role="note">{" ".join(parts)}</aside>'
@@ -424,31 +431,53 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
     summary_html = f'<p class="lede">{text(report["summary"])}</p>' if report.get("summary") else ""
     summary_shortened, shortened = shortened, False
 
-    legend = _how_to_read(report, anchors) if anchors else ""   # same size gate as the permalinks
+    legend = _how_to_read(report, anchors, shared) if anchors else ""   # same size gate as the permalinks
+
+    summary_plain = " ".join(str(report.get("summary") or "").split())
+    description = html.escape(
+        (summary_plain[:159].rstrip() + "\u2026") if len(summary_plain) > 160 else summary_plain
+        or f"Report with {len(report['findings'])} findings and {len(report['evidence'])} evidence entries.",
+        quote=True)
+    with_meta = [True]  # the link-preview tags are dropped only when even the smallest cap cannot hold them
+
+    def preview_meta() -> str:
+        """Link-preview tags. Everything is attribute-escaped; no CSP or sanitiser allowlist change (plain meta)."""
+        if not with_meta[0]:
+            return ""
+        return (f'<meta name="description" content="{description}">'
+                f'<meta property="og:title" content="{title}">'
+                f'<meta property="og:description" content="{description}">'
+                '<meta property="og:type" content="article">'
+                '<meta property="og:site_name" content="HerdR">'
+                '<meta name="twitter:card" content="summary">')
 
     def document(css: str, hero_summary: str, nav: str, body: str, footer: str) -> str:
         return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
                 '<meta name="viewport" content="width=device-width,initial-scale=1">'
-                f'<meta http-equiv="Content-Security-Policy" content="{_CSP}">'
+                f'<meta http-equiv="Content-Security-Policy" content="{_CSP}">{preview_meta()}'
                 f'<title>{title}</title><style>{css}</style></head><body><main class="rp">'
                 f'<header class="hero"><h1>{title}</h1>{hero_summary}{nav}{legend if css is _FULL_CSS else ""}</header>{body}{footer}'
                 "</main></body></html>")
 
     # Reserve the largest possible contents list and omission note (every count is no wider than its
-    # total). The title appears twice, so it is cut until the envelope fits even the smallest cap.
+    # total). The title appears in the head, the meta tags and the hero, so it is cut until the envelope fits even the smallest cap.
     worst_note = note([(label, 0, len(items)) for _, _, label, items in present_sections])
     nav_html = toc([(a, t) for a, t, *_ in present_sections])
-    for title_limit in (256, 128, 64, 32, 16, 8, 0):
-        title_shortened = len(title_source) > title_limit
-        title = html.escape(title_source[:title_limit] + ("\u2026" if title_shortened else ""), quote=True)
-        css = _FULL_CSS if len(document(_FULL_CSS, "", "", "", "").encode()) + _FULL_CSS_MARGIN <= max_bytes \
-            else _CORE_CSS
-        stacked[0] = css is _FULL_CSS
-        wrappers = sum(len(wrap(a, t, k, "").encode()) for a, t, _, _, _, k, _ in sections)
-        fixed = len(document(css, "", nav_html, "", worst_note).encode())
-        remaining = max_bytes - fixed - wrappers
-        if remaining >= 0:
-            break
+    for with_meta[0] in (True, False):
+        for title_limit in (256, 128, 64, 32, 16, 8, 0):
+            title_shortened = len(title_source) > title_limit
+            title = html.escape(title_source[:title_limit] + ("\u2026" if title_shortened else ""), quote=True)
+            css = _FULL_CSS if len(document(_FULL_CSS, "", "", "", "").encode()) + _FULL_CSS_MARGIN <= max_bytes \
+                else _CORE_CSS
+            stacked[0] = css is _FULL_CSS
+            wrappers = sum(len(wrap(a, t, k, "").encode()) for a, t, _, _, _, k, _ in sections)
+            fixed = len(document(css, "", nav_html, "", worst_note).encode())
+            remaining = max_bytes - fixed - wrappers
+            if remaining >= 0:
+                break
+        else:
+            continue
+        break
     else:
         raise ValueError("max_bytes is too small for the preview envelope")
     summary_omitted = bool(summary_html) and len(summary_html.encode()) > remaining // 4
@@ -456,15 +485,35 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
         summary_html = ""
     else:
         remaining -= len(summary_html.encode())
-    total_weight = sum(weight for _, _, _, items, weight, _, _ in sections if items)
+    active = [section for section in sections if section[3]]
+    sizes = [[len(item.encode()) for item, _ in section[3]] for section in active]
+    # Weighted quotas, then unused quota is handed to sections that overflow (weights again) until none is left.
+    quotas = [0] * len(active)
+    unspent, needy = remaining, list(range(len(active)))
+    while unspent > 0 and needy:
+        total_weight = sum(active[index][4] for index in needy)
+        grants = {index: unspent * active[index][4] // total_weight for index in needy}
+        for index in needy[: unspent - sum(grants.values())]:    # the rounding leftover, one byte each in order
+            grants[index] += 1
+        unspent = 0
+        still = []
+        for index in needy:
+            limit = active[index][6]
+            wants = sum(sizes[index][: limit]) if limit is not None else sum(sizes[index])
+            room = wants - quotas[index]
+            if grants[index] >= room:
+                unspent += grants[index] - max(room, 0)
+                quotas[index] += max(room, 0)
+            else:
+                quotas[index] += grants[index]
+                still.append(index)
+        needy = still if unspent else []
     chosen, kept_shortened = [], False
-    for anchor, title_text, label, items, weight, kind, limit in sections:
-        if not items:
-            continue
-        quota = remaining * weight // total_weight
+    for index, (anchor, title_text, label, items, weight, kind, limit) in enumerate(active):
+        quota = quotas[index]
         selected, used = [], 0
         for position, (item, cut) in enumerate(items):
-            size = len(item.encode())
+            size = sizes[index][position]
             if used + size <= quota and (limit is None or len(selected) < limit):
                 selected.append(position)
                 used += size
