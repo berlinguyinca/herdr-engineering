@@ -214,9 +214,9 @@ def test_the_gate_runs_the_parallel_pass_then_a_serial_tail_both_under_the_watch
     assert "timeout" not in fast_line + slow_line           # no guessed flat cap on the run
 
 
-def watch(soft: str, hard: str, script: str) -> subprocess.CompletedProcess[str]:
+def watch(soft: str, hard: str, script: str, **env: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run([sys.executable, str(WATCHER), soft, hard, "--", sys.executable, "-u", "-c", script],
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, text=True, timeout=60, env={**os.environ, **env})
 
 
 def test_the_watchdog_kills_a_silent_idle_hang_with_124() -> None:
@@ -304,3 +304,65 @@ def test_a_signal_killed_command_exits_128_plus_signal_not_a_wrapped_status() ->
 def test_the_gate_gives_pytest_timeout_room_to_name_a_hung_slow_test_before_the_watchdog_fires() -> None:
     m = re.search(r'HERDR_PYTEST_HANG_SECONDS="\$\{HERDR_PYTEST_SLOW_HANG_SECONDS:-(\d+)\}"', GATE)
     assert m and int(m.group(1)) > 3600
+
+
+def daemonize_cmd(pidfile: Path, body: str) -> str:
+    """A shell that starts a setsid python in the background and exits at once: the postmaster-via-pg_ctl shape."""
+    code = f"import os, time; open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n{body}"
+    return f"subprocess.run(['bash', '-c', 'setsid {sys.executable} -c \"$0\" & exit 0', {code!r}])"
+
+
+def wait_file(path: Path) -> int:
+    end = time.monotonic() + 15
+    while time.monotonic() < end:
+        if path.exists() and path.read_text():
+            return int(path.read_text())
+        time.sleep(0.1)
+    raise AssertionError(f"{path} never appeared")
+
+
+def test_a_daemon_orphaned_before_the_first_poll_still_counts_as_progress(tmp_path: Path) -> None:
+    pidfile = tmp_path / "pid"
+    spawn = daemonize_cmd(pidfile, "end = time.time() + 7\nwhile time.time() < end: sum(range(10000))")
+    # The silent root sleeps; only the orphaned daemon computes. Without finding it, hard=4 would kill at 124.
+    done = watch("1", "4", f"import subprocess, time; {spawn}; time.sleep(8)")
+    assert done.returncode == 0 and "hung" not in done.stderr, done.stderr
+
+
+def test_a_hang_kill_stops_an_orphaned_daemon_too(tmp_path: Path) -> None:
+    pidfile = tmp_path / "pid"
+    spawn = daemonize_cmd(pidfile, "time.sleep(1234)")
+    done = watch("1", "3", f"import subprocess, time; {spawn}; time.sleep(1234)")
+    assert done.returncode == 124
+    assert wait_gone(wait_file(pidfile)), "a hang kill leaked the orphaned daemon"
+
+
+def test_sigterm_to_the_watchdog_stops_an_orphaned_daemon_too(tmp_path: Path) -> None:
+    pidfile = tmp_path / "pid"
+    spawn = daemonize_cmd(pidfile, "time.sleep(1234)")
+    wd = subprocess.Popen([sys.executable, str(WATCHER), "100", "100", "--", sys.executable, "-c",
+                           f"import subprocess, time; {spawn}; time.sleep(1234)"], stderr=subprocess.PIPE)
+    daemon = wait_file(pidfile)
+    time.sleep(1.5)
+    wd.send_signal(signal.SIGTERM)
+    assert wd.wait(timeout=30) == 128 + signal.SIGTERM
+    assert wait_gone(daemon), "SIGTERM left the orphaned daemon running"
+
+
+def test_a_leaked_busy_survivor_does_not_keep_the_watchdog_alive_and_is_stopped(tmp_path: Path) -> None:
+    pidfile = tmp_path / "pid"
+    spawn = daemonize_cmd(pidfile, "while True: sum(range(10000))")
+    started = time.monotonic()
+    done = watch("100", "100", f"import subprocess; {spawn}", HERDR_WATCHED_ORPHAN_GRACE="3")
+    assert done.returncode == 0                      # the root's own status
+    assert time.monotonic() - started < 30
+    assert wait_gone(wait_file(pidfile)), "the leaked busy process was left running"
+
+
+def test_a_closed_reader_does_not_kill_or_hang_the_run() -> None:
+    done = subprocess.run(
+        f'{sys.executable} {WATCHER} 100 100 -- {sys.executable} -u -c '
+        '"import time\nfor i in range(5): print(i); time.sleep(0.3)" | head -1',
+        shell=True, capture_output=True, text=True, timeout=60, env={**os.environ},
+    )
+    assert done.stdout == "0\n" and "Traceback" not in done.stderr and "BrokenPipe" not in done.stderr, done.stderr

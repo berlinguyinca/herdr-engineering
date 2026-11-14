@@ -13,7 +13,7 @@
 # scripts/ci/pytest-parallel.sh. The descriptor limit is per process, so each worker leaks only its share of the ~3,000.
 #
 # Hang protection (user rule: timeouts only kill hangs). Each pytest pass runs under scripts/ci/run-watched.py (a copy of the shared
-# run-watched helper, extended to track descendants in other sessions, handle SIGTERM/SIGINT/SIGHUP and exit 128+signal): after HERDR_PYTEST_SOFT_SECONDS (default 3600) of wall time it prints one notice and keeps going; it kills the
+# run-watched helper, extended: it tracks the command's session, parent-pid descendants and any process carrying its per-run token in its environment, which covers a Postgres started by pg_ctl; a hang or SIGTERM/SIGINT/SIGHUP stops that whole tree, and survivors left after the command exits get a bounded grace and are then stopped): after HERDR_PYTEST_SOFT_SECONDS (default 3600) of wall time it prints one notice and keeps going; it kills the
 # pass (exit 124) only after HERDR_PYTEST_HANG_SECONDS (default 1800) with no output AND no CPU use anywhere in the pass. A slow but
 # live run is never killed; a wedged one (pipeline 1362 sat ~8 h with no result) fails with a clear message. There is no flat cap.
 #
