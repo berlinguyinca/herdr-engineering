@@ -278,7 +278,7 @@ class Gh:
         return out
 
     def check_runs(self, repo: str, sha: str) -> list[dict]:
-        """Every check run of this commit (all pages), newest first, so the first of a duplicated name wins."""
+        """Every check run of this commit (all pages), newest (highest id) first, so the first of a duplicated name wins."""
         out: list[dict] = []
         for page in range(1, 51):
             batch = self.json(["api", f"repos/{repo}/commits/{sha}/check-runs?per_page=100&page={page}"]).get(
@@ -286,7 +286,7 @@ class Gh:
             out.extend(batch)
             if len(batch) < 100:
                 break
-        return sorted(out, key=lambda c: (str(c.get("started_at") or ""), int(c.get("id") or 0)), reverse=True)
+        return sorted(out, key=lambda c: int(c.get("id") or 0), reverse=True)
 
     def comments(self, repo: str, n: int) -> list[dict]:
         out: list[dict] = []
