@@ -1233,15 +1233,22 @@ def test_recovery_receipt_parent_traversal_is_rejected(tree: Tree) -> None:
     assert not candidate.path.exists()
 
 
-def test_real_compiler_cwd_protects_cache_without_cache_path_in_argv(tree: Tree) -> None:
+@pytest.mark.parametrize("requested_compiler", ["native", "gcc"])
+def test_real_compiler_cwd_protects_cache_without_cache_path_in_argv(
+    tree: Tree, requested_compiler: str
+) -> None:
     import shutil
 
-    clang = shutil.which("clang")
-    assert clang is not None, "native compiler safety acceptance requires clang"
+    compiler = (
+        shutil.which("clang") or shutil.which("gcc")
+        if requested_compiler == "native"
+        else shutil.which("gcc")
+    )
+    assert compiler is not None, "native compiler safety acceptance requires Clang or GCC"
     source = tree[1] / "source"
     source.mkdir()
     child = subprocess.Popen(
-        [clang, "-x", "c", "-fsyntax-only", "-"],
+        [compiler, "-x", "c", "-fsyntax-only", "-"],
         cwd=source,
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
