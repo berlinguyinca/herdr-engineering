@@ -13,7 +13,7 @@
 # scripts/ci/pytest-parallel.sh. The descriptor limit is per process, so each worker leaks only its share of the ~3,000.
 #
 # Hang protection (user rule: timeouts only kill hangs). Each pytest pass runs under scripts/ci/run-watched.py (a copy of the shared
-# run-watched helper): after HERDR_PYTEST_SOFT_SECONDS (default 3600) of wall time it prints one notice and keeps going; it kills the
+# run-watched helper, extended to track descendants in other sessions, handle SIGTERM/SIGINT/SIGHUP and exit 128+signal): after HERDR_PYTEST_SOFT_SECONDS (default 3600) of wall time it prints one notice and keeps going; it kills the
 # pass (exit 124) only after HERDR_PYTEST_HANG_SECONDS (default 1800) with no output AND no CPU use anywhere in the pass. A slow but
 # live run is never killed; a wedged one (pipeline 1362 sat ~8 h with no result) fails with a clear message. There is no flat cap.
 #
@@ -40,7 +40,10 @@ echo "pytest arguments: ${PYTEST_PARALLEL[*]:-(serial)}"
 watched() { python3 scripts/ci/run-watched.py "${HERDR_PYTEST_SOFT_SECONDS:-3600}" "${HERDR_PYTEST_HANG_SECONDS:-1800}" -- "$@"; }
 watched python -m pytest -q -m "$HERDR_PYTEST_FAST_MARKEXPR" ${PYTEST_PARALLEL[@]+"${PYTEST_PARALLEL[@]}"}
 echo "== pytest (slow tests, serial tail) =="
-watched python -m pytest -q -m "$HERDR_PYTEST_SLOW_MARKEXPR"
+# Tail pass: pytest-timeout (3600 s on the slow test) must be able to fire and NAME a hung test before the watchdog kills the pass,
+# so the no-progress limit here is above it (4200 s). Exit 5 (no slow tests collected) fails the gate on purpose: the slow tests
+# disappearing silently would mean the coverage moved out of the gate; remove the marker and this pass together.
+HERDR_PYTEST_HANG_SECONDS="${HERDR_PYTEST_SLOW_HANG_SECONDS:-4200}" watched python -m pytest -q -m "$HERDR_PYTEST_SLOW_MARKEXPR"
 echo "== client tests =="
 npm ci --no-audit --no-fund       # the component tests import playwright
 npx playwright install chromium     # one component test drives a real browser; a no-op when cached

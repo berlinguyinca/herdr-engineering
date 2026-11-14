@@ -8,9 +8,12 @@ These drive the real shell function in a subshell, and a real pytest-xdist run, 
 
 from __future__ import annotations
 
+import os
 import re
+import signal
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -207,7 +210,7 @@ def test_the_gate_runs_the_parallel_pass_then_a_serial_tail_both_under_the_watch
     fast_line = next(line for line in GATE.splitlines() if "HERDR_PYTEST_FAST_MARKEXPR" in line and "pytest" in line)
     slow_line = next(line for line in GATE.splitlines() if "HERDR_PYTEST_SLOW_MARKEXPR" in line and "pytest" in line)
     assert fast_line.startswith("watched ") and "PYTEST_PARALLEL" in fast_line
-    assert slow_line.startswith("watched ") and "PYTEST_PARALLEL" not in slow_line
+    assert " watched python" in slow_line and "PYTEST_PARALLEL" not in slow_line
     assert "timeout" not in fast_line + slow_line           # no guessed flat cap on the run
 
 
@@ -227,9 +230,77 @@ def test_the_watchdog_never_kills_a_slow_run_that_keeps_printing() -> None:
 
 
 def test_the_watchdog_never_kills_a_silent_run_that_is_busy_on_cpu() -> None:
-    done = watch("1", "2", "import time\nend = time.time() + 5\nwhile time.time() < end: sum(range(10000))")
+    done = watch("1", "4", "import time\nend = time.time() + 6\nwhile time.time() < end: sum(range(10000))")
     assert done.returncode == 0 and "hung" not in done.stderr
 
 
 def test_the_watchdog_passes_the_exit_status_through() -> None:
     assert watch("5", "5", "raise SystemExit(3)").returncode == 3
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0] != "Z"
+
+
+def wait_gone(pid: int, seconds: float = 15) -> bool:
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if not alive(pid):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def test_sigterm_to_the_watchdog_stops_the_command_and_exits_128_plus_signal(tmp_path: Path) -> None:
+    pidfile = tmp_path / "pid"
+    script = f"import os, time; open({str(pidfile)!r}, 'w').write(str(os.getpid())); time.sleep(1234)"
+    wd = subprocess.Popen([sys.executable, str(WATCHER), "100", "100", "--", sys.executable, "-c", script],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    end = time.monotonic() + 15
+    while not pidfile.exists() and time.monotonic() < end:
+        time.sleep(0.1)
+    child = int(pidfile.read_text())
+    assert alive(child)
+    time.sleep(0.5)
+    wd.send_signal(signal.SIGTERM)
+    assert wd.wait(timeout=30) == 128 + signal.SIGTERM
+    assert wait_gone(child), "the command outlived the watchdog"
+
+
+def test_a_busy_parent_is_not_hung_after_a_cpu_heavy_child_exits() -> None:
+    script = (
+        "import subprocess, sys, time\n"
+        "subprocess.run([sys.executable, '-c', 'import time\\nend = time.time() + 4\\nwhile time.time() < end: sum(range(10000))'])\n"
+        "end = time.time() + 6\n"
+        "while time.time() < end: sum(range(10000))"
+    )
+    done = watch("100", "4", script)
+    assert done.returncode == 0 and "hung" not in done.stderr, done.stderr
+
+
+def test_cpu_in_a_descendant_that_called_setsid_counts_and_a_hang_kills_it(tmp_path: Path) -> None:
+    pidfile = tmp_path / "pid"
+    daemon = f"import os, time; os.setsid(); open({str(pidfile)!r}, 'w').write(str(os.getpid())); time.sleep(1234)"
+    # Silent, idle parent; its own-session child sleeps: no progress anywhere -> killed as hung, daemon included.
+    script = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {daemon!r}]); time.sleep(1234)"
+    done = watch("1", "4", script)
+    assert done.returncode == 124
+    assert wait_gone(int(pidfile.read_text())), "a hang kill left a setsid descendant running"
+    # The same shape, but the other-session child burns CPU while the parent is silent: not a hang.
+    busy = "import os, time; os.setsid(); end = time.time() + 6\nwhile time.time() < end: sum(range(10000))"
+    script = f"import subprocess, sys; subprocess.run([sys.executable, '-c', {busy!r}])"
+    assert watch("1", "4", script).returncode == 0
+
+
+def test_a_signal_killed_command_exits_128_plus_signal_not_a_wrapped_status() -> None:
+    done = watch("5", "5", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
+    assert done.returncode == 128 + signal.SIGKILL
+
+
+def test_the_gate_gives_pytest_timeout_room_to_name_a_hung_slow_test_before_the_watchdog_fires() -> None:
+    m = re.search(r'HERDR_PYTEST_HANG_SECONDS="\$\{HERDR_PYTEST_SLOW_HANG_SECONDS:-(\d+)\}"', GATE)
+    assert m and int(m.group(1)) > 3600
