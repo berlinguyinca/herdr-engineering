@@ -18,7 +18,7 @@ test("host registered reads as a human sentence with tailnet ip", () => {
     payload: { host_name: "bender", tailnet_ip: "100.64.8.6" },
   }, ctx);
   assert.equal(d.title, "Host online");
-  assert.match(d.detail, /bender joined the fabric \(100\.104\.39\.6\)/);
+  assert.match(d.detail, /bender joined the fabric \(100\.64\.8\.6\)/);
   assert.equal(d.muted, undefined);
 });
 
