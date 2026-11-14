@@ -1,37 +1,41 @@
 #!/usr/bin/env bash
+# Install or update the herdr-handoff dependency: the CLI at the pinned revision, plus the `herdr` and
+# `herdr-handoff` skills linked into every harness that runs an agent on this machine.
 #
-# Install or refresh the herdr-handoff dependency at the revision herdr-engineering declares.
+# This script is the only place the revision of that dependency is resolved.  It used to be declared in
+# two places (lock/upstreams.yaml, and a hardcoded default in scripts/install.sh), which let a host report
+# a complete install while running a revision older than the one `herdr-eng fleet status` reported against.
 #
-# The revision comes from lock/upstreams.yaml, the same file `herdr-eng fleet release` reads and
-# `herdr-eng fleet status` compares against, so install, update and drift reporting cannot disagree
-# the way they used to: `scripts/install.sh` carried its own hardcoded default revision and could
-# silently install something other than the pinned one.  This script is the only place the pin is
-# resolved; both install.sh and `herdr-eng fleet update` call it.
+# Upstream, the CLI and the skills are two halves of one install: `pip install .` gives you the executable,
+# `install/install.sh` symlinks the skills into ~/.codex/skills, ~/.claude/skills, ~/.pi/agent/skills and
+# ~/.config/opencode/skills.  Calling only the first half - which is what this repo used to do - leaves
+# every agent with no skill to read while appearing to have installed the dependency.
 #
-# It fetches the pinned tree, runs the upstream installer (which links the `herdr` and `herdr-handoff`
-# skills into ~/.codex/skills, ~/.claude/skills, ~/.pi/agent/skills and ~/.config/opencode/skills by
-# symlink, never by copy), installs the CLI with pip and falls back to `uv tool install`, and puts the
-# entrypoint on PATH.  It never copies skill text: a copy is a revision nobody maintains, and copies
-# are why a host running v0.2.0 skills could pass a check for v0.3.0 behaviour.  Nothing here needs a
-# venv.
+# Linking is what makes the install updatable.  A copied skill directory never notices a new revision; a
+# symlink into ~/.local/share/herdr-handoff/<revision> moves when this script fetches one.
 #
-# Usage: install-handoff.sh [options]
-#   --plan             print the resolved pin, cache, interpreter and skill directories and exit 0
-#                      without touching anything
+# Convergence is attested, not assumed: the script ends by comparing the version the pinned tree declares
+# against the version the entrypoint on PATH reports, and fails if they differ.  Reporting success while an
+# older CLI stays on PATH is the failure mode that made this dependency invisible before, and a symlink is
+# only proof of intent, not of which program runs.
+#
+# Usage: install-handoff.sh [--plan] [--skills-only] [--no-path-link] [--migrate-copies] [--force]
+#
+#   --plan             print the pin, the resolved cache, the interpreter, the PATH directory and the skill
+#                      directories it would write, then exit 0 without touching anything
 #   --skills-only      link the skills; leave the CLI install and the PATH entry alone
 #   --no-path-link     skip the PATH entrypoint (HERDR_HANDOFF_NO_PATH_LINK=1 does the same)
-#   --migrate-copies   authorize moving aside what this script would otherwise refuse to touch:
-#                      a plain skill directory that predates the linker, and a PATH entry that is a
-#                      hand-written file or a link to something we do not manage.  Each is renamed to
-#                      <name>.pre-<revision>.bak first; the script refuses rather than nest a backup
-#                      inside an existing one
-#   --force            redo the CLI install even when the version already matches, and authorize the
-#                      PATH collision the same way --migrate-copies does
+#   --migrate-copies   authorize moving aside what this script would otherwise refuse to touch: a plain
+#                      skill directory that predates the linker, and a PATH entry that neither is the pin
+#                      nor came from this script.  Each is renamed to <name>.pre-<revision>.bak first; the
+#                      script refuses rather than nest a backup inside an existing one
+#   --force            authorize the PATH collision the same way --migrate-copies does
 #
 # Environment: HERDR_HANDOFF_REF (override the pin for a controlled rollout), HERDR_HANDOFF_URL,
-# HERDR_HANDOFF_REPO (install from a local checkout instead of cloning upstream),
-# HERDR_HANDOFF_CACHE, HERDR_HANDOFF_PYTHON, HERDR_LOCAL_BIN, HERDR_HANDOFF_SKILL_ROOT,
-# HERDR_HANDOFF_NO_PATH_LINK, CODEX_HOME, CLAUDE_SKILLS_DIR, PI_SKILLS_DIR, OPENCODE_SKILLS_DIR.
+# HERDR_HANDOFF_REPO (install from a local checkout instead of cloning upstream), HERDR_HANDOFF_CACHE,
+# HERDR_HANDOFF_PYTHON, HERDR_LOCAL_BIN, HERDR_HANDOFF_NO_PATH_LINK, CODEX_HOME, CLAUDE_SKILLS_DIR,
+# PI_SKILLS_DIR, OPENCODE_SKILLS_DIR.  HERDR_HANDOFF_SKILL_ROOT means the same thing here as it does
+# upstream: the directory whose codex/, claude/, pi/ and opencode/ children hold the skills.
 set -euo pipefail
 
 PLAN=0
@@ -46,7 +50,7 @@ for arg in "$@"; do
     --no-path-link) PATH_LINK=0 ;;
     --migrate-copies) MIGRATE=1 ;;
     --force) FORCE=1 ;;
-    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
     *) printf 'unknown option: %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
@@ -68,18 +72,31 @@ CACHE="${HERDR_HANDOFF_CACHE:-$HOME/.local/share/herdr-handoff/$REF}"
 LINK_DIR="${HERDR_LOCAL_BIN:-$HOME/.local/bin}"
 if [ "${HERDR_HANDOFF_NO_PATH_LINK:-0}" = 1 ]; then PATH_LINK=0; fi
 
-# An interpreter named as a bare word (`python3`) makes every derived path relative:
-# `dirname python3` is `.`, so the entrypoint candidate becomes `./herdr-handoff`, is never found, and
-# the script used to exit 0 having linked nothing.  Resolve it to the binary that will really run.
+# An interpreter named as a bare word (`python3`) makes every derived path relative: `dirname python3` is
+# `.`, so the entrypoint candidate becomes `./herdr-handoff`, is never found, and the script used to exit 0
+# having linked nothing.  Resolve it to the binary that will really run.
 PYTHON="${HERDR_HANDOFF_PYTHON:-python3}"
 if command -v "$PYTHON" >/dev/null 2>&1; then PYTHON="$(command -v "$PYTHON")"; fi
 
-# The four harness skill directories, honouring the per-harness overrides.  `CLAUDE_SKILLS_DIR`,
-# `PI_SKILLS_DIR` and `OPENCODE_SKILLS_DIR` name the skills directory itself (that is what the upstream
-# installer treats them as); only `CODEX_HOME` names a home whose `skills` child is used.
+# Absolute paths with every symlink resolved, including the last component.  `/tmp` and `/var` are symlinks
+# on macOS, and pytest's tmp_path is not, so a comparison that resolved only the parent directory looked
+# fine in tests and failed on a fresh host: the entrypoint pip had just installed did not match the path
+# this script believed its own, and nothing got linked.
+normalize() {
+  if [ -e "$1" ] || [ -L "$1" ]; then
+    (cd "$(dirname "$1")" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$1")") && return 0
+  fi
+  printf '%s\n' "$1"
+}
+
+# The four harness skill directories.  HERDR_HANDOFF_SKILL_ROOT is the parent of the per-harness dirs,
+# exactly as upstream's installer treats it; otherwise the per-harness variables apply, and
+# CLAUDE_SKILLS_DIR / PI_SKILLS_DIR / OPENCODE_SKILLS_DIR name the skills directory itself while CODEX_HOME
+# names a home whose `skills` child is used.
 skill_dirs() {
   if [ -n "${HERDR_HANDOFF_SKILL_ROOT:-}" ]; then
-    printf '%s\n' "$HERDR_HANDOFF_SKILL_ROOT"
+    printf '%s\n' "$HERDR_HANDOFF_SKILL_ROOT/codex/skills" "$HERDR_HANDOFF_SKILL_ROOT/claude/skills" \
+      "$HERDR_HANDOFF_SKILL_ROOT/pi/skills" "$HERDR_HANDOFF_SKILL_ROOT/opencode/skills"
     return
   fi
   printf '%s\n' "${CODEX_HOME:-$HOME/.codex}/skills" "${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}" \
@@ -143,9 +160,14 @@ else
 fi
 [ -f "$TREE/install/install.sh" ] || { printf '%s has no install/install.sh\n' "$TREE" >&2; exit 1; }
 
-# The version the pinned tree declares, used at the end to attest that the CLI on PATH is this
-# revision and not an older one that happens to be on PATH.
+# The version the pinned tree declares is what the entrypoint on PATH is attested against at the end.  If
+# it cannot be read there is nothing to attest against, so the script stops here rather than exiting 0 with
+# an unverified CLI - that is the same hole this whole step exists to close.
 expected_version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' "$TREE/pyproject.toml" 2>/dev/null | head -n 1)"
+if [ -z "$expected_version" ] && [ "$SKILLS_ONLY" = 0 ]; then
+  printf 'cannot read a static version from %s/pyproject.toml, so the CLI cannot be attested\n' "$TREE" >&2
+  exit 1
+fi
 
 # --- 2. the CLI, into the interpreter the caller names -------------------------------------------------
 if [ "$SKILLS_ONLY" = 0 ]; then
@@ -165,8 +187,12 @@ if [ "$SKILLS_ONLY" = 0 ]; then
   fi
   if [ "$installed" = 0 ] && command -v uv >/dev/null 2>&1; then
     printf 'pip did not install it (%s); using uv\n' "$(printf '%s' "$pip_report" | tail -n 1)" >&2
-    uv tool install --force --reinstall "$TREE" >/dev/null
-    printf 'cli: uv tool install --force %s\n' "$TREE"
+    # Ask uv to build the tool environment on the same interpreter the caller named.  Without --python uv
+    # picks one of its own, and the report would claim an interpreter that had nothing to do with the
+    # install.  uv still keeps the tool in its own venv (~/.local/share/uv/tools/<tool>); what binds the
+    # result to this pin is the attestation at the end, not a directory.
+    uv tool install --python "$PYTHON" --force --reinstall "$TREE" >/dev/null
+    printf 'cli: uv tool install --python %s --force --reinstall %s\n' "$PYTHON" "$TREE"
     installed=1
   fi
   if [ "$installed" = 0 ]; then
@@ -197,6 +223,7 @@ if [ "$MIGRATE" = 1 ]; then
   done < <(skill_dirs)
 fi
 # The upstream installer is POSIX sh; running it through $SHELL makes a fish or csh login shell fail it.
+# It is also the only thing that knows the real skill layout, so it is run rather than reimplemented.
 skill_report="$(/bin/sh "$TREE/install/install.sh" 2>&1)" || { printf '%s\n' "$skill_report" >&2; exit 1; }
 printf 'skills:\n%s\n' "$skill_report"
 case "$skill_report" in
@@ -207,108 +234,103 @@ case "$skill_report" in
 esac
 
 # --- 4. PATH: make the entrypoint reachable, and prove we did -----------------------------------------
-# --skills-only says "leave the CLI install and the PATH entry alone", so this whole step is skipped:
-# an operator pointing the PATH entry somewhere deliberate is not something this script should judge.
+# --skills-only says "leave the CLI install and the PATH entry alone", so this whole step is skipped: an
+# operator pointing the PATH entry somewhere deliberate is not something this script should judge.
 if [ "$PATH_LINK" = 1 ] && [ "$SKILLS_ONLY" = 0 ]; then
   destination="$LINK_DIR/herdr-handoff"
-  # Entrypoints the installs above can produce.  Each is normalized before comparison: linking the
-  # entrypoint that already IS the PATH entry turns it into a self-referencing symlink
-  # (`Too many levels of symbolic links`), which is how this ran once and broke a working uv tool shim.
-  # `dirname` of a bare `python3` is `.`; the interpreter is resolved above so this stays absolute.
-  uv_shim="$HOME/.local/share/uv/tools/herdr-handoff/bin/herdr-handoff"
-  normalize() { # absolute path of an existing file, without needing realpath on older macOS
-    (cd "$(dirname "$1")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$1")")
-  }
-  ours() { # whether a path is one of the entrypoints this script installs
+  python_bin="$(normalize "$(dirname "$PYTHON")")"
+  uv_shim="$(normalize "$HOME/.local/share/uv/tools/herdr-handoff/bin/herdr-handoff")"
+  cache_root="$(normalize "$CACHE")"
+  # Entrypoints the installs above can produce, compared resolved-to-resolved.  Linking the entrypoint that
+  # already IS the PATH entry turns it into a self-referencing symlink (`Too many levels of symbolic
+  # links`), which is how this ran once against a real ~/.local/bin and left a working CLI broken.
+  ours() {
     case "$1" in
-      "$(dirname "$PYTHON")/herdr-handoff"|"$uv_shim"|"$CACHE"/*) return 0 ;;
+      "$python_bin/herdr-handoff"|"$uv_shim"|"$cache_root"/*) return 0 ;;
       *) return 1 ;;
     esac
   }
-  # Where the entrypoint already sits, normalized.  An entrypoint that this script's own installs put
-  # here (pip into <python>/bin when HERDR_LOCAL_BIN is that bin dir, or a uv shim when it is the uv
-  # tool's bin) is ours, and is attested below rather than treated as somebody else's file.
-  destination_abs="$destination"
-  { [ -e "$destination" ] || [ -L "$destination" ]; } && destination_abs="$(normalize "$destination")"
-  ours_here=0
-  ours "$destination_abs" && ours_here=1
-
+  # Whether what is on PATH right now already reports the pinned version.  This runs the entrypoint - the
+  # same command the attestation below runs - because a symlink, a directory name and a pip log are all
+  # evidence of intent, and none of them is evidence of which program runs.
+  reports_the_pin() {
+    [ -x "$destination" ] || return 1
+    [ "$( "$destination" --version 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)" = "$expected_version" ]
+  }
+  # Where an entrypoint this install produced already sits.  pip into a prefix whose bin *is* LINK_DIR, and
+  # the uv shim when LINK_DIR is the uv tool's bin, both land exactly on $destination: those are this
+  # script's own files, and on a Linux box a pip `--user` install lands there every single run.
   chosen=""
-  for candidate in "$(dirname "$PYTHON")/herdr-handoff" "$HOME/.local/bin/herdr-handoff" "$uv_shim"; do
-    [ -x "$candidate" ] || continue
-    absolute="$(normalize "$candidate")"
-    # Installing here put the entrypoint in the link directory already; linking it onto itself is the
-    # self-referencing symlink that made a working CLI answer "Too many levels of symbolic links".
-    if [ "$absolute" = "$destination_abs" ]; then continue; fi
-    ours "$absolute" || continue
-    chosen="$absolute"
-    break
+  for candidate in "$python_bin/herdr-handoff" "$uv_shim" "$CACHE/herdr-handoff"; do
+    [ -x "$candidate" ] && { chosen="$candidate"; break; }
   done
-
-  if [ "$ours_here" = 0 ] && [ -e "$destination" ] && [ ! -L "$destination" ]; then
-    # A regular file or directory where the entrypoint belongs is hand-written, or another tool's.  It
-    # used to be overwritten by `ln -sf` with no backup and no message; that is the loss this script must
-    # never cause, so it is moved aside only when the caller says so.
-    if [ "$MIGRATE" = 1 ] || [ "$FORCE" = 1 ]; then
-      backup="$destination.pre-$REF.bak"
-      if [ -e "$backup" ]; then printf 'refusing to replace %s: %s already exists\n' "$destination" "$backup" >&2; exit 1; fi
-      mv "$destination" "$backup"
-      printf 'moved aside %s -> %s\n' "$destination" "$backup"
-    else
-      printf 'collision: %s is a %s this script does not manage and will not overwrite.\n' \
-        "$destination" "$([ -d "$destination" ] && printf directory || printf file)" >&2
-      printf '  Remove it, point HERDR_LOCAL_BIN somewhere else, or re-run with --migrate-copies to back\n' >&2
-      printf '  it up as %s.pre-%s.bak\n' "$destination" "$REF" >&2
-      exit 2
+  destination_is_ours() { # whether what sits on PATH came from this script's own installs
+    local probe="${1:-$destination}"
+    if [ -L "$destination" ]; then
+      # Judge a link by where it points: a PATH entry left by an earlier install of ours resolves into the
+      # cache or the interpreter's bin, and is not "somebody else's file" however it is spelled.
+      local target; target="$(readlink "$destination")"
+      case "$target" in /*) ;; *) target="$(dirname "$destination")/$target" ;; esac
+      probe="$target"
     fi
-  elif [ "$ours_here" = 0 ] && [ -L "$destination" ]; then
-    target="$(readlink "$destination")"
-    absolute="$target"
-    case "$target" in /*) : ;; *) absolute="$(normalize "$LINK_DIR/$target")" ;; esac
-    if ! ours "$absolute"; then
-      # A symlink pointing at something we do not install is a deliberate choice by someone else; the
-      # same rule applies.  (Comparing the link itself, not its target, is what made this fire on links
-      # this script made itself.)
-      target_abs="$absolute"
-      if [ "$MIGRATE" = 1 ] || [ "$FORCE" = 1 ]; then
-        backup="$destination.pre-$REF.bak"
-        if [ -e "$backup" ]; then printf 'refusing to replace %s: %s already exists\n' "$destination" "$backup" >&2; exit 1; fi
-        mv "$destination" "$backup"
-        printf 'moved aside %s -> %s\n' "$destination" "$backup"
-      else
-        printf 'collision: %s links to %s, which this script does not manage.\n' "$destination" "$target_abs" >&2
-        printf '  Re-run with --migrate-copies to back it up and link the pinned entrypoint instead.\n' >&2
+    ours "$(normalize "$probe")"
+  }
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    if reports_the_pin; then
+      printf 'path: %s already reports %s; nothing linked\n' "$destination" "$expected_version"
+    elif [ -d "$destination" ] && [ ! -L "$destination" ]; then
+      if [ "$MIGRATE$FORCE" = "00" ]; then
+        printf 'collision: %s is a directory this script does not manage; refusing to replace it.\n' "$destination" >&2
+        printf '         --migrate-copies moves it aside to %s.pre-%s.bak first.\n' "$destination" "$REF" >&2
         exit 2
       fi
+      backup="$destination.pre-$REF.bak"
+      if [ -e "$backup" ]; then printf 'refusing to move %s aside: %s already exists\n' "$destination" "$backup" >&2; exit 1; fi
+      mv "$destination" "$backup"; printf 'moved aside %s -> %s\n' "$destination" "$backup"
+    elif destination_is_ours; then
+      # This script's own artifact (pip's entrypoint, or the uv shim) at the wrong version: the install
+      # above did not move it.  Deleting it here would leave no CLI at all behind a failed install, so it
+      # stays and the attestation below fails naming both versions.
+      here_version="$( "$destination" --version 2>/dev/null | head -n 1 | tr -d '[:space:]' || printf '<no version>')"
+      printf 'path: %s is where this script installs, but reports %s instead of %s\n' \
+        "$destination" "$here_version" "$expected_version" >&2
+    else
+      # A hand-written file, or a link into a tree this script did not install - a conda shim, a wrapper
+      # that exports a token, an install from a vendor checkout.  Moving one aside is the operator's call.
+      if [ "$MIGRATE$FORCE" = "00" ]; then
+        printf 'collision: %s exists (%s) and does not report %s; refusing to replace it.\n' \
+          "$destination" "$([ -L "$destination" ] && printf 'link to %s' "$(readlink "$destination")" || printf 'file')"\
+          "$expected_version" >&2
+        printf '         Either install herdr-handoff into %s yourself, or run\n' "$LINK_DIR" >&2
+        printf '         scripts/install-handoff.sh --migrate-copies to back it up as %s.pre-%s.bak.\n' \
+          "$destination" "$REF" >&2
+        exit 2
+      fi
+      backup="$destination.pre-$REF.bak"
+      if [ -e "$backup" ]; then printf 'refusing to move %s aside: %s already exists\n' "$destination" "$backup" >&2; exit 1; fi
+      mv "$destination" "$backup"; printf 'moved aside %s -> %s\n' "$destination" "$backup"
     fi
   fi
-
-  if [ -n "$chosen" ]; then
+  if [ ! -e "$destination" ] && [ ! -L "$destination" ]; then
+    [ -n "$chosen" ] || { printf 'no entrypoint to link into %s (%s is not installed there)\n' "$LINK_DIR" "$PYTHON" >&2; exit 1; }
     mkdir -p "$LINK_DIR"
-    ln -sf "$chosen" "$destination"
+    # -n so a destination that is a symlink to a directory is replaced, not followed: without it the new
+    # link was written *inside* the pinned checkout and the PATH entry never changed.
+    ln -sfn "$chosen" "$destination"
     printf 'path: %s -> %s\n' "$destination" "$chosen"
-  elif [ -e "$destination" ] || [ -L "$destination" ]; then
-    printf 'path: %s already resolves; nothing linked\n' "$destination"
-  else
-    printf 'no entrypoint to link into %s (%s is not installed there)\n' "$LINK_DIR" "$PYTHON" >&2
-    printf '  Set HERDR_HANDOFF_PYTHON to the interpreter the CLI was installed into, or HERDR_LOCAL_BIN\n' >&2
-    printf '  to a directory that already has one.\n' >&2
+  fi
+  # Attestation.  An older CLI answering --version from PATH is the exact failure this step exists to
+  # catch, and a link alone does not disprove it.  What is proven here is the version the entrypoint
+  # reports; the revision it came from is the one fetched above, and both are printed so a reader can see
+  # which is which.
+  [ -x "$destination" ] || { printf '%s is still not executable\n' "$destination" >&2; exit 1; }
+  got_version="$("$destination" --version 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+  if [ "$got_version" != "$expected_version" ]; then
+    printf 'MISMATCH: herdr-handoff at %s reports %s; the pinned tree %s declares version %s\n' \
+      "$destination" "${got_version:-<no version>}" "$REF" "$expected_version" >&2
+    printf 'The CLI on PATH is not the revision this install fetched.  What --version reports wins over\n' >&2
+    printf 'the symlink, the directory name and the pip log; remove or replace it, or run --migrate-copies.\n' >&2
     exit 1
   fi
-
-  # Attest the thing we just claimed is reachable.  "leaving PATH alone" plus exit 0 used to report
-  # success while the CLI on PATH stayed on the previous revision; comparing the version the pinned tree
-  # declares against the version the entrypoint reports makes that impossible to report as success.
-  if [ -z "$expected_version" ]; then
-    printf 'cannot read the version from %s/pyproject.toml; not attesting the CLI\n' "$TREE" >&2
-  else
-    reported="$( "$destination" --version 2>/dev/null | head -n 1 || true)"
-    if [ "$reported" != "$expected_version" ]; then
-      printf 'PATH does not match the pin: %s reports %s, %s declares %s\n' \
-        "$destination" "${reported:-<no version>}" "$TREE" "$expected_version" >&2
-      printf '  Refresh did not converge.  Check HERDR_HANDOFF_PYTHON and that %s is on PATH.\n' "$LINK_DIR" >&2
-      exit 1
-    fi
-    printf 'attested: %s reports %s (pin %s)\n' "$destination" "$reported" "$REF"
-  fi
+  printf 'attested: %s reports %s (pinned revision %s)\n' "$destination" "$got_version" "$REF"
 fi

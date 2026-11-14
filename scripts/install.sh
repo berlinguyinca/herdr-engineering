@@ -277,16 +277,29 @@ step "7/8 making herdr-eng and herdr-handoff available on PATH"
 LINK_DIR="$HOME/.local/bin"
 if [ -d "$LINK_DIR" ] || mkdir -p "$LINK_DIR" 2>/dev/null; then
   if command -v python3 >/dev/null 2>&1 && case "$PATH" in *"$LINK_DIR"*) true;; *) false;; esac; then
-    ln -sf "$VENV/bin/herdr-eng" "$LINK_DIR/herdr-eng"
-    printf '  linked %s -> %s\n' "$LINK_DIR/herdr-eng" "$VENV/bin/herdr-eng"
-    # A regular file here was not written by this installer (step 3 links symlinks), so it is someone's own
-    # and `ln -sf` would have destroyed it silently.
-    if [ -e "$LINK_DIR/herdr-handoff" ] && [ ! -L "$LINK_DIR/herdr-handoff" ]; then
-      warn "$LINK_DIR/herdr-handoff is a file this installer does not own; leaving it. Remove it to link "\
-"the pinned CLI ($VENV/bin/herdr-handoff)."
+    # The same rule as for herdr-handoff, applied to this repo's own CLI: a PATH entry that is not a link to
+    # this venv belongs to someone else's install and is reported, not repointed.
+    eng_link="$LINK_DIR/herdr-eng"
+    if { [ -L "$eng_link" ] && [ "$(readlink "$eng_link")" != "$VENV/bin/herdr-eng" ]; } || \
+       { [ -e "$eng_link" ] && [ ! -L "$eng_link" ]; }; then
+      warn "$eng_link exists and is not a link to $VENV/bin/herdr-eng; leaving it. Remove it to link this"
+      warn "checkout's CLI ($VENV/bin/herdr-eng)."
     else
-      ln -sf "$VENV/bin/herdr-handoff" "$LINK_DIR/herdr-handoff"
-      printf '  linked %s -> %s\n' "$LINK_DIR/herdr-handoff" "$VENV/bin/herdr-handoff"
+      ln -sfn "$VENV/bin/herdr-eng" "$eng_link"
+      printf '  linked %s -> %s\n' "$eng_link" "$VENV/bin/herdr-eng"
+    fi
+    # Only nothing, or a link this installer made, may be replaced.  A regular file, or a symlink into
+    # another tree (conda, a uv tool shim, a vendor checkout), is someone's own setup and replacing it
+    # silently is how a deliberate PATH entry disappears.  Step 3 attests which CLI actually runs, so a
+    # PATH entry it did not produce has to be reported rather than overwritten here.
+    handoff_link="$LINK_DIR/herdr-handoff"
+    if [ -L "$handoff_link" ] && [ "$(readlink "$handoff_link")" != "$VENV/bin/herdr-handoff" ]; then
+      warn "$handoff_link links to $(readlink "$handoff_link"), not $VENV/bin/herdr-handoff; leaving it. Remove it to link the pinned CLI, or run scripts/install-handoff.sh --migrate-copies."
+    elif [ -e "$handoff_link" ] && [ ! -L "$handoff_link" ]; then
+      warn "$handoff_link is a file this installer does not own; leaving it. Remove it to link the pinned CLI ($VENV/bin/herdr-handoff)."
+    else
+      ln -sfn "$VENV/bin/herdr-handoff" "$handoff_link"
+      printf '  linked %s -> %s\n' "$handoff_link" "$VENV/bin/herdr-handoff"
     fi
   else
     warn "$LINK_DIR is not on PATH; activate the venv instead: source $VENV/bin/activate"

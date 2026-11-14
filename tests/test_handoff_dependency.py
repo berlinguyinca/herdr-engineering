@@ -132,3 +132,15 @@ def test_the_capability_probe_reads_subcommands_and_not_prose():
              "    takeover    hand a session to a fresh pane\n")
     assert _advertises(lines, "takeover") is True, "a command listed one per line is still advertised"
     assert _advertises("herdr-handoff - move a session elsewhere", "takeover") is False
+
+
+def test_a_brace_group_that_is_an_option_does_not_hide_a_prose_command():
+    # Only argparse's closed subcommand set (`{a,b,c} ...`) decides on its own.  Reading every brace group
+    # as one made a CLI that renders an option as `--mode {fast,slow}` and spells its commands one per line
+    # look like it lacked them - so doctor would have reported a working CLI as missing `takeover`.
+    from herdr_engineering.handoff_dependency import _advertises
+
+    option = ("usage: herdr-handoff [-h] [--mode {fast,slow}]\n"
+              "commands:\n    takeover    hand a session to a fresh pane\n")
+    assert _advertises(option, "takeover") is True
+    assert _advertises(option, "confirm") is False

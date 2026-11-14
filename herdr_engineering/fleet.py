@@ -400,10 +400,10 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
     # with the controller means the controller's pin and its machine cannot drift apart the way
     # install.sh's own hardcoded default and the lock file did.
     #
-    # It runs on the controller only.  Fleet hosts are installed by scripts/install.sh / the ansible playbooks
-    # and are *checked* per host by `herdr-eng fleet doctor`, which reports this gate for every host; this
-    # step is not how a remote host converges, and saying so here is the difference between a report an
-    # operator can trust and one that quietly covers one machine.
+    # It runs on the controller only.  Fleet hosts are installed by scripts/install.sh and the ansible
+    # playbooks; nothing probes herdr-handoff on a remote host yet, and that gap is issue #799.  There is no
+    # `herdr-eng fleet doctor` subcommand, so do not send an operator to one - saying what is and is not
+    # covered here is the difference between a report they can trust and one that quietly covers one machine.
     #
     # The interpreter is pinned to this process's own, because the alternative is whatever `python3` the
     # transport's PATH happens to resolve - which installs the CLI somewhere the caller never intended and
@@ -417,8 +417,8 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
             report.setdefault("warnings", []).append(
                 "herdr-handoff refresh failed on the controller (interpreter "
                 f"{sys.executable}); the pinned dependency may be stale - run "
-                "scripts/install-handoff.sh and check `herdr-eng doctor`; fleet hosts are reported "
-                "per host by `herdr-eng fleet doctor`")
+                "scripts/install-handoff.sh and check `herdr-eng doctor`; fleet hosts are not covered "
+                "by this step (issue #799)")
 
     from .config import load_config
     cleanup = load_config().get("build_cleanup", {})

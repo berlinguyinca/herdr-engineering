@@ -33,16 +33,19 @@ def _advertises(help_text: str, command: str) -> bool:
 
     argparse lists subcommands as one brace group on the usage line
     (`{create,inspect,...,takeover,confirm}`), so matching "word at start of line" reads the newest CLI
-    as missing the commands it just gained.  The choices are read out of that group when it exists, and
-    a word-boundary search (which ignores `herdr-handoff` and `--flags`) covers help that spells the
-    commands out some other way.
+    as missing the commands it just gained.  A brace group elsewhere - an option rendered
+    `--mode {fast,slow}` - is not a list of subcommands, and reading every group as one made a CLI that
+    spells its commands out in prose look like it lacked them.
     """
     groups = re.findall(r"\{([A-Za-z0-9][A-Za-z0-9,_\- ]*)\}", help_text)
-    if groups:
-        # A help text that lists its subcommands as brace groups is read from those groups alone.  Also
-        # searching the prose would credit `confirm` to a CLI that only mentions it in the description of
-        # another command - which is the false confidence this check exists to remove.
-        return any(command in [choice.strip() for choice in group.split(",")] for group in groups)
+    if any(command in [choice.strip() for choice in group.split(",")] for group in groups):
+        return True
+    # A *closed* subcommand set is rendered as a group followed by `...`.  When the CLI declares one and
+    # the command is not in it, nothing else counts: `confirm` appearing in the description of another
+    # command is exactly the false confidence this check exists to remove.  Without such a set, the
+    # word-boundary search (which ignores `herdr-handoff` and `--flags`) reads the rest of the help.
+    if re.search(r"\{[A-Za-z0-9][A-Za-z0-9,_\- ]*\}\s*\.\.\.\s", help_text):
+        return False
     return re.search(rf"(?<![\w-]){re.escape(command)}(?![\w-])", help_text) is not None
 
 

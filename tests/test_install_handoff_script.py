@@ -65,8 +65,25 @@ def _upstream(tmp_path: Path, revision_marker: str) -> tuple[Path, str]:
     (source / "install").mkdir()
     (source / "install" / "install.sh").write_text(
         "#!/bin/sh\nset -eu\n"
-        'here="$(dirname -- "$0")/.."\n'
-        'echo "linked $(cat "$here/skill/herdr-handoff/SKILL.md")"\n'
+        'here="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"\n'
+        'if [ -n "${HERDR_HANDOFF_SKILL_ROOT:-}" ]; then root="$HERDR_HANDOFF_SKILL_ROOT";\n'
+        '  codex_dir="$root/codex/skills"; claude_dir="$root/claude/skills"\n'
+        '  pi_dir="$root/pi/skills"; opencode_dir="$root/opencode/skills"\n'
+        'else\n'
+        '  codex_dir="$HOME/.codex/skills"; claude_dir="$HOME/.claude/skills"\n'
+        '  pi_dir="$HOME/.pi/agent/skills"; opencode_dir="$HOME/.config/opencode/skills"\n'
+        'fi\n'
+        'for dir in "$codex_dir" "$claude_dir" "$pi_dir" "$opencode_dir"; do\n'
+        '  for skill in herdr herdr-handoff; do\n'
+        '    mkdir -p "$dir"\n'
+        '    if [ -L "$dir/$skill" ] && [ "$(readlink "$dir/$skill")" = "$here/skill/$skill" ]; then continue; fi\n'
+        '    if [ -e "$dir/$skill" ] || [ -L "$dir/$skill" ]; then\n'
+        '      echo "collision: leaving existing $dir/$skill unchanged" >&2; continue\n'
+        '    fi\n'
+        '    ln -s "$here/skill/$skill" "$dir/$skill"\n'
+        '    echo "installed $dir/$skill"\n'
+        '  done\n'
+        'done\n'
     )
     subprocess.run(["git", "-C", str(source), "init", "-q"], check=True)
     subprocess.run(["git", "-C", str(source), "add", "-A"], check=True)
@@ -130,7 +147,13 @@ def test_installing_a_pin_clones_it_and_runs_the_upstream_skill_installer(tmp_pa
     assert (cache / "skill" / "herdr-handoff" / "SKILL.md").read_text().strip().endswith("revision A")
     assert subprocess.run(["git", "-C", str(cache), "rev-parse", "HEAD"], capture_output=True,
                           text=True, check=True).stdout.strip() == sha
-    assert "revision A" in result.stdout       # the upstream installer's own report
+    assert "revision A" in (cache / "skill" / "herdr-handoff" / "SKILL.md").read_text()
+    # The point of running the upstream linker instead of reimplementing it is that the skills really land
+    # in all four harnesses, as links into the pinned tree, so a later revision moves them.
+    for harness in ("codex", "claude", "pi", "opencode"):
+        link = skill_root / harness / "skills" / "herdr-handoff"
+        assert link.is_symlink(), (str(link), result.stdout, result.stderr)
+        assert os.readlink(str(link)) == str(cache / "skill" / "herdr-handoff")
 
 
 def test_re_running_the_same_revision_is_a_no_op(tmp_path):
@@ -228,7 +251,7 @@ def test_the_path_link_never_points_the_entrypoint_at_itself(tmp_path):
                              "HERDR_LOCAL_BIN": str(uv_bin), "PATH": "/usr/bin:/bin"})
     assert shim.is_file() and not shim.is_symlink(), result.stdout + result.stderr
     assert shim.read_text() == "#!/bin/sh\necho 0.0.0\n", result.stdout + result.stderr
-    assert "already resolves" in result.stdout, result.stdout + result.stderr
+    assert "already reports 0.0.0" in result.stdout, result.stdout + result.stderr
     assert f"attested: {uv_bin / 'herdr-handoff'} reports 0.0.0" in result.stdout, result.stdout
 
 
@@ -336,3 +359,166 @@ def test_a_branch_head_ref_is_refetched_rather_than_reused(tmp_path):
 def _head(path: Path) -> str:
     return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True,
                           check=True).stdout.strip()
+
+
+# --- the PATH entry is judged by what it reports, not by what it is -------------------------------------
+
+def _env(tmp_path, bare, sha, **extra):
+    base = {"HERDR_HANDOFF_URL": str(bare), "HERDR_HANDOFF_REF": sha,
+            "HERDR_HANDOFF_CACHE": str(tmp_path / "cache"),
+            "HERDR_HANDOFF_SKILL_ROOT": str(tmp_path / "harness-homes"),
+            "PATH": f"{tmp_path}:/usr/bin:/bin"}
+    return {**base, **extra}
+
+
+def test_a_cli_pip_installed_into_the_path_directory_is_attested_not_replaced(tmp_path):
+    # A pip user install lands a regular file exactly where this script wants its symlink (~/.local/bin on
+    # Linux, every run).  Judging the PATH entry by its type refused it - exit 2 - and --migrate-copies,
+    # which that error message itself recommended, then moved the freshly installed pinned CLI away and
+    # left nothing on PATH.  What is on PATH is now judged by the version it reports.
+    link_dir = tmp_path / "home" / ".local" / "bin"
+    link_dir.mkdir(parents=True)
+    python = _fake_python(tmp_path, 'if [ "$3" = "install" ]; then printf \'#!/bin/sh\\necho 0.0.0\\n\' > "'
+                                    + str(link_dir) + '/herdr-handoff"; chmod 755 "' + str(link_dir)
+                                    + '/herdr-handoff"; fi\nexit 0\n')
+    bare, sha = _upstream(tmp_path, "revision A")
+    result = run_script(env=_env(tmp_path, bare, sha, HERDR_HANDOFF_PYTHON=str(python),
+                                 HERDR_LOCAL_BIN=str(link_dir)))
+    entry = link_dir / "herdr-handoff"
+    assert entry.is_file() and not entry.is_symlink(), (result.stdout, result.stderr)
+    assert "already reports 0.0.0" in result.stdout, result.stdout
+    assert f"attested: {entry} reports 0.0.0 (pinned revision {sha})" in result.stdout
+    assert list(link_dir.iterdir()) == [entry], list(link_dir.iterdir())   # nothing moved aside
+
+
+def test_an_interpreter_behind_a_symlinked_directory_still_links_the_entrypoint(tmp_path):
+    # Comparing the entrypoint candidates against the destination with only the parent directory resolved
+    # looked fine in tests (pytest's tmp_path is already resolved) and linked nothing on a fresh host,
+    # because /tmp and /var are symlinks on macOS: pip's entrypoint was real, the path built from
+    # $HERDR_HANDOFF_PYTHON did not resolve to it, and the run ended with "no entrypoint to link".
+    real = tmp_path / "real-env"
+    real.mkdir()
+    python = _fake_python(real, _pip_that_lands_next_to_itself())
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    bare, sha = _upstream(tmp_path, "revision A")
+    link_dir = tmp_path / "bin"
+    result = run_script(env=_env(tmp_path, bare, sha, HERDR_HANDOFF_PYTHON=str(alias / python.name),
+                                 HERDR_LOCAL_BIN=str(link_dir)))
+    entry = link_dir / "herdr-handoff"
+    assert entry.is_symlink(), (result.stdout, result.stderr)
+    assert os.path.realpath(os.readlink(str(entry))) == os.path.realpath(str(real / "herdr-handoff"))
+    assert "attested" in result.stdout, result.stdout
+
+
+def test_a_path_entry_that_is_a_link_to_a_directory_is_never_written_into(tmp_path):
+    # `ln -sf` follows a destination that is a symlink to a directory, so the new link was created *inside*
+    # the pinned checkout and the PATH entry never changed; the attestation then failed on a file nobody
+    # intended to put there.
+    bare, sha = _upstream(tmp_path, "revision A")
+    cache = tmp_path / "cache"
+    python = _fake_python(tmp_path, "exit 0\n")
+    env = _env(tmp_path, bare, sha, HERDR_HANDOFF_PYTHON=str(python), HERDR_HANDOFF_NO_PATH_LINK="1")
+    run_script("--skills-only", env=env)                     # populate the cache first; clone needs it absent
+    inside = cache / "somewhere"
+    inside.mkdir()
+    link_dir = tmp_path / "home" / ".local" / "bin"
+    link_dir.mkdir(parents=True)
+    (link_dir / "herdr-handoff").symlink_to(inside, target_is_directory=True)
+    before = sorted(p.name for p in inside.iterdir())
+    result = run_script(env=_env(tmp_path, bare, sha, HERDR_HANDOFF_PYTHON=str(python),
+                                 HERDR_LOCAL_BIN=str(link_dir)), expect=1)
+    assert sorted(p.name for p in inside.iterdir()) == before, (result.stdout, result.stderr)
+    assert "MISMATCH" in result.stderr or "not executable" in result.stderr, result.stderr
+    assert (link_dir / "herdr-handoff").is_symlink()
+    assert os.path.realpath(os.readlink(str(link_dir / "herdr-handoff"))) == str(inside)
+
+
+def test_a_broken_relative_symlink_on_path_is_reported_not_a_raw_cd_error(tmp_path):
+    # Resolving a path must not stop the script with a shell's own complaint; the operator needs to be told
+    # what sits on PATH and what to do about it.
+    link_dir = tmp_path / "home" / ".local" / "bin"
+    link_dir.mkdir(parents=True)
+    (link_dir / "herdr-handoff").symlink_to("../gone/herdr-handoff")
+    python = _fake_python(tmp_path, "exit 0\n")
+    bare, sha = _upstream(tmp_path, "revision A")
+    result = run_script(env=_env(tmp_path, bare, sha, HERDR_HANDOFF_PYTHON=str(python),
+                                 HERDR_LOCAL_BIN=str(link_dir)), expect=2)
+    assert "collision" in result.stderr, result.stderr
+    assert "cd:" not in result.stderr, result.stderr
+
+
+def test_a_pinned_tree_with_no_static_version_stops_the_install(tmp_path):
+    # The attestation compares the entrypoint against the version the pinned tree declares.  If that cannot
+    # be read there is nothing to compare against, and exiting 0 there is the same hole this whole step
+    # closes: a stale CLI on PATH, reported as installed.
+    bare, sha = _upstream(tmp_path, "revision A")
+    source = tmp_path / "upstream"
+    (source / "pyproject.toml").write_text('[project]\nname = "herdr-handoff"\ndynamic = ["version"]\n'
+                                           'requires-python = ">=3.9"\n')
+    subprocess.run(["git", "-C", str(source), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.email=t@example.com", "-c", "user.name=Test",
+                    "commit", "-q", "-m", "no static version"], check=True)
+    subprocess.run(["git", "-C", str(bare), "fetch", "-q", str(source),
+                    "+refs/heads/*:refs/heads/*"], check=True)
+    new_sha = subprocess.run(["git", "-C", str(bare), "rev-parse", "HEAD"], capture_output=True,
+                             text=True).stdout.strip()
+    python = _fake_python(tmp_path, "exit 0\n")
+    result = run_script(env=_env(tmp_path, bare, new_sha, HERDR_HANDOFF_PYTHON=str(python),
+                                 HERDR_LOCAL_BIN=str(tmp_path / "bin")), expect=1)
+    assert "pyproject.toml" in result.stderr and "attest" in result.stderr, result.stderr
+
+
+def test_the_skill_root_override_uses_the_layout_the_upstream_installer_writes(tmp_path):
+    # HERDR_HANDOFF_SKILL_ROOT means the parent of the per-harness directories upstream; reading it as the
+    # skills directory itself made --plan name a directory nothing was ever written to and made
+    # --migrate-copies scan the wrong place.
+    root = tmp_path / "harness-homes"
+    result = run_script("--plan", env={"HERDR_HANDOFF_SKILL_ROOT": str(root)})
+    for harness in ("codex", "claude", "pi", "opencode"):
+        assert f"{root}/{harness}/skills" in result.stdout, result.stdout
+
+
+def test_migrate_copies_refuses_to_nest_a_backup_inside_an_existing_one(tmp_path):
+    # `mv dir existing_dir` puts the copy *inside* the old backup and reports success.  Two revisions of
+    # hand-written skill or wrapper text are not something to merge silently.
+    link_dir = tmp_path / "home" / ".local" / "bin"
+    link_dir.mkdir(parents=True)
+    hand_written = link_dir / "herdr-handoff"
+    hand_written.write_text("#!/bin/sh\necho my wrapper\n")
+    hand_written.chmod(0o755)
+    bare, sha = _upstream(tmp_path, "revision A")
+    (link_dir / f"herdr-handoff.pre-{sha}.bak").write_text("#!/bin/sh\necho an older backup\n")
+    python = _fake_python(tmp_path, _pip_that_lands_next_to_itself())
+    result = run_script("--migrate-copies", env=_env(tmp_path, bare, sha, HERDR_HANDOFF_PYTHON=str(python),
+                                                     HERDR_LOCAL_BIN=str(link_dir)), expect=1)
+    assert "already exists" in result.stderr, result.stderr
+    assert hand_written.read_text() == "#!/bin/sh\necho my wrapper\n"
+    assert (link_dir / f"herdr-handoff.pre-{sha}.bak").read_text() == "#!/bin/sh\necho an older backup\n"
+
+
+def test_installing_from_a_local_repo_says_which_revision_it_used(tmp_path):
+    # scripts/install.sh used to install herdr-handoff from a sibling checkout when one was present.  The
+    # override still does that, but a local checkout is not the pin, so the script must name what it
+    # actually installed rather than report "installed" against a revision it never looked at.
+    bare, sha = _upstream(tmp_path, "revision A")
+    local = tmp_path / "upstream"          # the working checkout behind the bare remote
+    python = _fake_python(tmp_path, _pip_that_lands_next_to_itself())
+    result = run_script("--skills-only", env=_env(tmp_path, bare, sha, HERDR_HANDOFF_REPO=str(local),
+                                                  HERDR_HANDOFF_PYTHON=str(python),
+                                                  HERDR_HANDOFF_NO_PATH_LINK="1"))
+    assert f"resolved: {sha}" in result.stdout, result.stdout
+    assert "warning" not in result.stderr, result.stderr
+
+    # ... and when that checkout is on something else, the run says so instead of printing the pin.
+    (local / "skill" / "herdr-handoff" / "SKILL.md").write_text("---\nname: herdr-handoff\n---\nlocal work\n")
+    subprocess.run(["git", "-C", str(local), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(local), "-c", "user.email=t@example.com", "-c", "user.name=Test",
+                    "commit", "-q", "-m", "local work"], check=True)
+    local_sha = subprocess.run(["git", "-C", str(local), "rev-parse", "HEAD"], capture_output=True,
+                               text=True).stdout.strip()
+    result = run_script("--skills-only", env=_env(tmp_path, bare, sha, HERDR_HANDOFF_REPO=str(local),
+                                                  HERDR_HANDOFF_PYTHON=str(python),
+                                                  HERDR_HANDOFF_NO_PATH_LINK="1"))
+    assert f"resolved: {local_sha}" in result.stdout, result.stdout
+    assert "is not the pinned revision" in result.stderr, result.stderr
