@@ -1531,6 +1531,7 @@ class HuskWire(Wire):
         self.husk_instance = None
         self.husk_pid = 43
         self.unverifiable_pane = False
+        self.husk_duplicate = False
 
     def native(self, target):
         rows = super().native(target)
@@ -1561,6 +1562,8 @@ class HuskWire(Wire):
                     "reply": {"ok": True, "data": {"runtime": {}, "missions": []}},
                 }
             )
+            if self.husk_duplicate:
+                rows.append(copy.deepcopy(rows[-1]))
         return rows
 
 
@@ -1614,6 +1617,29 @@ def test_identityless_session_plus_coverage_error_stays_blocked(tmp_path):
     assert beast["status"] == "blocked"
     assert "unverified" in beast["error"]
     assert beast["coverageErrors"]
+    assert after["status"] != "complete"
+
+
+def test_a_retired_husk_that_becomes_ambiguous_is_never_re_retired(tmp_path):
+    """#798 review: a stale blockReason must not let a real disagreement be settled as a husk."""
+    from herdr_engineering.fleet_rollout import retire_identityless
+
+    store, plan = setup_rollout(tmp_path)
+    wire = HuskWire()
+    apply(store, plan, wire)
+    assert retire_identityless(store, plan["id"])["retired"]
+
+    wire.husk_duplicate = True
+    apply(store, plan, wire)
+    state = store.read(plan["id"])["hosts"]["beast"]["sessions"]["husk-conversation"]
+    assert state["status"] == "blocked"
+    assert "blockReason" not in state
+
+    again = retire_identityless(store, plan["id"])
+    assert again["retired"] == []
+    assert "beast/husk-conversation" in again["stillBlocked"]
+    after = store.read(plan["id"])
+    assert after["hosts"]["beast"]["status"] == "blocked"
     assert after["status"] != "complete"
 
 

@@ -810,6 +810,7 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                         save()
                         _session(plan, state, transport, target, root, save)
                     except (ConnectionError, OSError, subprocess.SubprocessError) as exc:
+                        state.pop("blockReason", None)
                         state.update(status="pending", error=str(exc)[:500])
                     except MissingInstanceIdentity as exc:
                         # A retired registration stays retired and stays out of the blocking set:
@@ -829,6 +830,9 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                             )
                             session_errors.append(str(exc)[:500])
                     except (ValueError, TypeError, KeyError) as exc:
+                        # Any other block replaces the reason too: a stale identity_missing here
+                        # would let retire_identityless settle a real disagreement as a husk.
+                        state.pop("blockReason", None)
                         state.update(status="blocked", error=str(exc)[:500])
                         session_errors.append(str(exc)[:500])
                     finally:
@@ -975,6 +979,9 @@ def retire_identityless(store, rollout_id, *, settled_by="operator"):
             "rolloutId": rollout_id,
             "retired": retired,
             "stillBlocked": still_blocked,
+            "blockedHosts": [
+                h for h, hs in (plan.get("hosts") or {}).items() if hs.get("status") == "blocked"
+            ],
             "status": plan["status"],
             "note": "retired sessions are recorded in each host's retiredSessions and are "
             "picked back up if their identity resolves",
