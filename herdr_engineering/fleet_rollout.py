@@ -40,6 +40,16 @@ def _identifier(value):
     return value
 
 
+class MissingInstanceIdentity(ValueError):
+    """A registration is reachable and unique, but nothing in it names a live Pi instance.
+
+    This is not an *ambiguous* identity -- there is exactly one candidate, and it simply has
+    no instance identity to act on, so no pass can ever make progress on it. Fail-closed is
+    right; being un-recoverable is not. `retire_identityless` is the operator's supported way
+    to settle such a registration, and the rollout report keeps the evidence.
+    """
+
+
 def _target(target):
     _identifier(target["host"])
     _identifier(target["sshTarget"])
@@ -427,7 +437,13 @@ def _live(rows, session_id, pid=None):
         raise ValueError("session identity missing or ambiguous")
     row = matches[0]
     descriptor = row["descriptor"]
-    _identifier(descriptor.get("instanceId"))
+    try:
+        _identifier(descriptor.get("instanceId"))
+    except ValueError as exc:
+        raise MissingInstanceIdentity(
+            "session identity missing or ambiguous: registration "
+            f"{session_id} has no instanceId to act on (instanceId={descriptor.get('instanceId')!r})"
+        ) from exc
     if (
         type(descriptor.get("pid")) is not int
         or descriptor["pid"] <= 0
@@ -763,22 +779,60 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                         descriptor, _ = _live(rows, session_id)
                         if "pid" not in state:
                             state.update(pid=descriptor["pid"], instanceId=descriptor["instanceId"])
+                        if state.get("status") == "retired":
+                            # The identity resolved after the operator retired the registration,
+                            # so the retirement was wrong: pick the session back up and say so.
+                            state["unretiredAt"] = datetime.now(UTC).isoformat()
+                            state["status"] = "discovered"
+                            host_state["retiredSessions"] = [
+                                entry
+                                for entry in host_state.get("retiredSessions", [])
+                                if entry.get("sessionId") != session_id
+                            ]
                         save()
                         _session(plan, state, transport, target, root, save)
                     except (ConnectionError, OSError, subprocess.SubprocessError) as exc:
                         state.update(status="pending", error=str(exc)[:500])
+                    except MissingInstanceIdentity as exc:
+                        # A retired registration stays retired and stays out of the blocking set:
+                        # the operator settled it, and the evidence stays in the report.
+                        if state.get("status") == "retired":
+                            coverage_errors.append(
+                                {
+                                    "error": f"retired identity-less registration {session_id} "
+                                    "is still present and still has no instance identity"
+                                }
+                            )
+                        else:
+                            state.update(status="blocked", error=str(exc)[:500])
+                            session_errors.append(str(exc)[:500])
                     except (ValueError, TypeError, KeyError) as exc:
                         state.update(status="blocked", error=str(exc)[:500])
                         session_errors.append(str(exc)[:500])
                     finally:
                         save()
+                host_state["retiredSessions"] = [
+                    {
+                        "sessionId": s.get("sessionId"),
+                        "pid": s.get("pid"),
+                        "terminalId": (s.get("native") or {}).get("terminal_id"),
+                        "error": s.get("error"),
+                        "retiredAt": s.get("retiredAt"),
+                        "settledBy": s.get("settledBy"),
+                    }
+                    for s in host_state["sessions"].values()
+                    if s.get("status") == "retired"
+                ]
                 host_state["status"] = (
                     "blocked"
                     if session_errors
                     or any(s["status"] == "blocked" for s in host_state["sessions"].values())
                     else "complete"
                     if host_state["sessions"]
-                    and all(s["status"] == "complete" for s in host_state["sessions"].values())
+                    and all(
+                        s["status"] in ("complete", "retired")
+                        for s in host_state["sessions"].values()
+                    )
                     else "pending"
                 )
                 if session_errors:
@@ -796,6 +850,89 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
         )
         save()
         return plan
+
+
+def retire_identityless(store, rollout_id, *, settled_by="operator"):
+    """Settle registrations a rollout can never act on, keeping the evidence in the report (#779).
+
+    A session whose registration carries no instance identity blocks its host permanently:
+    no pass can manufacture an identity for it, and `--max-passes` only repeats the same
+    refusal. Refusing to act is correct; being un-recoverable by design is not, so this is the
+    supported way for an operator to say "that registration is dead, stop waiting on it".
+
+    Only sessions blocked on a *missing* identity are retired. An ambiguous or conflicting one
+    stays blocked -- that is a real disagreement, not a stale husk. A retired session is picked
+    back up automatically by the next pass if its identity ever resolves.
+    """
+    with store.lock():
+        plan = store.read(rollout_id)
+        retired, still_blocked = [], []
+        for host, host_state in (plan.get("hosts") or {}).items():
+            sessions = host_state.get("sessions") or {}
+            for session_id, state in sessions.items():
+                error = str(state.get("error") or "")
+                # Only the typed refusal is settle-able. A plain "identity missing or ambiguous"
+                # may be a genuine disagreement between two live registrations, which is never a
+                # stale husk and must stay blocked.
+                identity_missing = "no instanceId to act on" in error
+                if state.get("status") != "blocked" or not identity_missing:
+                    if state.get("status") == "blocked":
+                        still_blocked.append(f"{host}/{session_id}")
+                    continue
+                state["status"] = "retired"
+                state["retiredAt"] = datetime.now(UTC).isoformat()
+                state["settledBy"] = settled_by
+                retired.append(
+                    {
+                        "host": host,
+                        "sessionId": session_id,
+                        "pid": state.get("pid"),
+                        "terminalId": (state.get("native") or {}).get("terminal_id"),
+                        "error": error[:500],
+                        "retiredAt": state["retiredAt"],
+                    }
+                )
+            blocking = [s for s in sessions.values() if s.get("status") == "blocked"]
+            host_state["retiredSessions"] = [
+                {
+                    "sessionId": s.get("sessionId"),
+                    "pid": s.get("pid"),
+                    "terminalId": (s.get("native") or {}).get("terminal_id"),
+                    "error": s.get("error"),
+                    "retiredAt": s.get("retiredAt"),
+                    "settledBy": s.get("settledBy"),
+                }
+                for s in sessions.values()
+                if s.get("status") == "retired"
+            ]
+            host_state["status"] = (
+                "blocked"
+                if blocking
+                else "complete"
+                if sessions and all(
+                    s.get("status") in ("complete", "retired") for s in sessions.values()
+                )
+                else "pending"
+            )
+            if not blocking:
+                host_state.pop("error", None)
+        plan["status"] = (
+            "complete"
+            if plan.get("hosts") and all(
+                h.get("status") == "complete" for h in plan["hosts"].values()
+            )
+            else "pending"
+        )
+        store.write(plan)
+        return {
+            "ok": True,
+            "rolloutId": rollout_id,
+            "retired": retired,
+            "stillBlocked": still_blocked,
+            "status": plan["status"],
+            "note": "retired sessions are recorded in each host's retiredSessions and are "
+            "picked back up if their identity resolves",
+        }
 
 
 def _offline_failure(state):
