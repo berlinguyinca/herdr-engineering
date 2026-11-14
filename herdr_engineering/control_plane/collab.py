@@ -572,6 +572,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         self._joins: dict[str, dict] = {}                    # token digest -> record
         self._joins_by_id: dict[str, str] = {}               # join id -> digest
         self._externals_by_room: dict[str, list] = defaultdict(list)   # room id -> external agent ids (T10)
+        self._ever_guests: set[str] = set()                  # users ever added to a room as a guest (survives lapse/removal)
         self._presence: dict[str, dict] = {}                 # external agent id -> last heartbeat; memory only, by design
         # Lineage write counters per ("agent"|"sponsor"|"room", id). Each is made durable AHEAD of its value
         # (reserve-ahead rows in the log), so after a restart a count can be too high by up to
@@ -885,6 +886,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             u = self._users.setdefault(p["user_id"], {"since": p["at"]})
             u.update(status=p["status"], decided_by=p["decided_by"], decided_at=p["at"], reason=p.get("reason"))
         elif t == "member_added":
+            # "lapsed guest" = the person's LATEST membership was a guest one: a later non-guest add clears it.
+            if p["role"] == "guest":
+                self._ever_guests.add(p["subject_user_id"])
+            else:
+                self._ever_guests.discard(p["subject_user_id"])
             self._rooms[p["room_id"]]["members"][p["subject_user_id"]] = {
                 "role": p["role"], "expires_at": p.get("expires_at"), "joined_seq": seq,
                 "joined_at": p.get("created_at")}
@@ -1698,6 +1704,17 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             if not room or self._member(room, pr.id) is None:
                 raise CollabError(404, "not found")
         return self.artifact_room_handle(pr.id, room_id, query)
+
+    def readable_room_ids(self, pr: Principal) -> list[str]:
+        """Ids of the rooms ``pr`` may read right now. Same rule as ``_authorize(.., "read", ..)`` but silent (no audit row,
+        no denial counter): for projections that must filter, not probe."""
+        with self._lock:
+            out = []
+            for rid, room in self._rooms.items():
+                eff = self._effective(pr, room)
+                if eff is not None and "read" in eff[0]:
+                    out.append(rid)
+            return out
 
     def room_exists(self, room_id: str) -> bool:
         """Whether a room by this id exists. For callers (API keys) that have no room membership of their own."""
@@ -7070,6 +7087,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                     if parts[2:] == ["events"]:
                         return 200, self.read_events(pr, rid, _int(query, "cursor", 0),
                                                      _int(query, "limit", 100, 1, 200))
+                    if parts[2:] == ["events", "tail"]:         # the newest events, side-effect free (the app's head and tail reads)
+                        return 200, self.read_tail(pr, rid, _int(query, "limit", 100, 1, 500))
+                    if parts[2:] == ["people"]:                 # handles only; unlike /state it records no presence and takes no waiter slot
+                        return 200, {"people": self.room_people(pr, rid)}
                     if parts[2:] == ["events", "stream"]:
                         return self.open_stream(pr, rid, _int(query, "cursor", 0))
             elif method in ("PUT", "POST") and n == 3 and parts[0] == "rooms" and parts[2] == "profile":
