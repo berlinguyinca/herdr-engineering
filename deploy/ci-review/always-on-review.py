@@ -762,7 +762,11 @@ def register_pi_secret(model: str) -> None:
 
 
 def register_gh_secret() -> None:
-    """Best effort: the operator's `gh auth token` joins the redaction set (pi can read ~/.config/gh). Never raises."""
+    """Best effort: the operator's `gh auth token` and any GH_TOKEN / GITHUB_TOKEN value join the redaction set (pi can
+    read ~/.config/gh). Never raises."""
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        if len(os.environ.get(name, "")) >= 8:
+            ai.REDACT.add(os.environ[name])
     try:
         p = subprocess.run(["gh", "auth", "token"], capture_output=True, timeout=30, env=child_env())
         tok = p.stdout.decode("utf-8", "replace").strip()
