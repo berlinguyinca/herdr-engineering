@@ -128,8 +128,31 @@ def test_cache_trust_decision(env: dict[str, str], expected: bool) -> None:
     assert trusted(**env) is expected
 
 
-def test_unit_gates_wires_trust_and_flock() -> None:
-    text = UNIT_GATES.read_text()
+@pytest.mark.parametrize("script", [UNIT_GATES, ROOT / "scripts" / "ci" / "ui-gates.sh"])
+def test_gates_use_the_trust_aware_cache_and_flock(script: Path) -> None:
+    text = script.read_text()
     assert "need flock" in text
-    assert "herdr_ci_cache_trusted" in text
-    assert "PLAYWRIGHT_SKIP_BROWSER_GC=1" in text
+    assert "herdr_ci_cache_setup" in text
+    assert "cp -a" not in text and "|| true" not in text.split("herdr_ci_cache_setup")[1].split("venv=")[0]
+
+
+def cache_setup(tmp_path: Path, **env: str) -> dict[str, str]:
+    shared = tmp_path / "shared"
+    base = {k: v for k, v in os.environ.items() if not k.startswith("CI_")}
+    script = f'. {TRUST}; herdr_ci_cache_setup t 2>/dev/null; echo "$PIP_CACHE_DIR|$PLAYWRIGHT_BROWSERS_PATH|$PLAYWRIGHT_SKIP_BROWSER_GC|$HERDR_CI_PRIVATE_CACHE"'
+    out = subprocess.run(["bash", "-c", script], env={**base, "HERDR_CI_CACHE": str(shared), "TMPDIR": str(tmp_path), **env},
+                         capture_output=True, text=True, check=True).stdout.strip()
+    pip, pw, gc, private = out.split("|")
+    assert gc == "1"
+    return {"pip": pip, "pw": pw, "private": private, "shared": str(shared)}
+
+
+def test_pull_request_never_touches_the_shared_cache(tmp_path: Path) -> None:
+    got = cache_setup(tmp_path, CI_PIPELINE_EVENT="pull_request", CI_COMMIT_BRANCH="main", CI_REPO="o/r")
+    assert got["private"] and got["pw"].startswith(got["private"])
+    assert not got["pip"].startswith(got["shared"]) and not Path(got["shared"]).exists()
+
+
+def test_trusted_event_uses_the_shared_cache(tmp_path: Path) -> None:
+    got = cache_setup(tmp_path, CI_PIPELINE_EVENT="push", CI_COMMIT_BRANCH="main", CI_REPO="o/r")
+    assert got["private"] == "" and got["pw"] == got["shared"] + "/playwright"

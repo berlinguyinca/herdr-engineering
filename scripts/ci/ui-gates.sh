@@ -8,26 +8,16 @@ cd "$(dirname "$0")/../.."
 . "$(dirname "$0")/journal.sh"; ci_journal ui-gates     # first, so a run is readable even when the agent drops the tail of the step log
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing on this host: $1" >&2; exit 1; }; }
-need node; need python3; need git
+need node; need python3; need git; need flock
 node -e 'if (Number(process.versions.node.split(".")[0]) < 22) { console.error("Node 22 or newer is required, found " + process.version); process.exit(1); }'
 test -d /etc/fonts/conf.d || { echo "no /etc/fonts/conf.d: the screenshots depend on its rendering settings" >&2; exit 1; }
 
-# --- shared dependency cache ---------------------------------------------------------
-# Same as unit-gates.sh: the exec agents get a private per-job /tmp, so the venv wheels, the npm tree and Chromium were
-# paid on every run. The shared path is the rw CI store mount /home/wohlgemuth/woodpecker/ci (host: /quobyte/
-# metabolomicsgrp/it/ci/woodpecker); /quobyte inside the image is NOT mounted. The content-addressed caches are safe
-# to share between concurrent pipelines; when the path is not writable the script falls back to a private dir.
-cache_root="${HERDR_CI_CACHE:-/home/wohlgemuth/woodpecker/ci/cache/herdr}"
-cache_root_fallback=""
-if ! mkdir -p "$cache_root" 2>/dev/null || [ ! -w "$cache_root" ]; then
-  cache_root_fallback="$(mktemp -d "${TMPDIR:-/tmp}/herdr-ci-cache.XXXXXX")"
-  cache_root="$cache_root_fallback"
-  echo "ui-gates: shared cache not writable; using private $cache_root (cold)" >&2
-fi
-export PIP_CACHE_DIR="$cache_root/pip"
-export npm_config_cache="$cache_root/npm"
-export PLAYWRIGHT_BROWSERS_PATH="$cache_root/playwright"
-mkdir -p "$PIP_CACHE_DIR" "$npm_config_cache" "$PLAYWRIGHT_BROWSERS_PATH"
+# --- dependency cache ----------------------------------------------------------------
+# Same as unit-gates.sh: only trusted events (push/cron/manual on main) use the shared rw CI store; pull_request pipelines
+# get a private cold cache (herdr_ci_cache_setup in scripts/ci/cache-trust.sh).
+. "$(dirname "$0")/cache-trust.sh"
+herdr_ci_cache_setup ui-gates
+cache_root="$HERDR_CI_CACHE_ROOT"; cache_root_fallback="$HERDR_CI_PRIVATE_CACHE"
 
 # a private venv per run: two jobs on one agent must not share (and race on) one fixed path
 venv="$(mktemp -d "${TMPDIR:-/tmp}/herdr-ui-gates-venv.XXXXXX")"

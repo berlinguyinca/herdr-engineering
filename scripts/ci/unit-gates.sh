@@ -29,37 +29,13 @@ need python3; need node; need git; need flock
 . scripts/ci/pytest-parallel.sh
 herdr_pytest_parallel_load || exit 1     # a bad override fails loudly instead of silently running serial
 
-# --- shared dependency cache ---------------------------------------------------------
-# The exec agents get a private per-job /tmp, so the venv wheels, the npm tree and Chromium used to be paid on every
-# single run (~5-10 min of the ~45 min gate). The one shared path the agent mounts rw into every job is the CI store
-# mount /home/wohlgemuth/woodpecker/ci (host: /quobyte/metabolomicsgrp/it/ci/woodpecker); /quobyte inside the image
-# is NOT mounted and must not be used. When the path is not writable (docker agents, a dev host) the script falls back
-# to a private per-job dir and keeps working, just cold. Override with HERDR_CI_CACHE.
-#
-# Trust: PR code runs in this script, so a PR must never write what a later main / cron pipeline executes (Chromium,
-# wheels). Only trusted events (scripts/ci/cache-trust.sh: push/cron/manual on main) write the shared cache; every other
-# pipeline gets a private per-pipeline copy seeded from it (read only) and discards the copy on exit.
+# --- dependency cache ----------------------------------------------------------------
+# The exec agents get a private per-job /tmp; the shared path is the rw CI store mount /home/wohlgemuth/woodpecker/ci (host:
+# /quobyte/metabolomicsgrp/it/ci/woodpecker; /quobyte inside the image is NOT mounted). Only trusted events (push/cron/manual
+# on main) use it; pull_request pipelines get a private cold cache. See herdr_ci_cache_setup in scripts/ci/cache-trust.sh.
 . scripts/ci/cache-trust.sh
-shared_root="${HERDR_CI_CACHE:-/home/wohlgemuth/woodpecker/ci/cache/herdr}"
-cache_root="$shared_root"
-private_cache=""
-if herdr_ci_cache_trusted && mkdir -p "$shared_root" 2>/dev/null && [ -w "$shared_root" ]; then
-  echo "unit-gates: trusted event; writing the shared cache $shared_root" >&2
-else
-  private_cache="$(mktemp -d "${TMPDIR:-/tmp}/herdr-ci-cache.XXXXXX")"
-  cache_root="$private_cache"
-  if [ -d "$shared_root" ]; then
-    cp -a "$shared_root/." "$cache_root/" 2>/dev/null || true   # seed only; nothing is written back
-    echo "unit-gates: untrusted event or unwritable cache; private copy of $shared_root at $cache_root" >&2
-  else
-    echo "unit-gates: no shared cache; using private $cache_root (cold)" >&2
-  fi
-fi
-export PIP_CACHE_DIR="$cache_root/pip"
-export npm_config_cache="$cache_root/npm"
-export PLAYWRIGHT_BROWSERS_PATH="$cache_root/playwright"
-export PLAYWRIGHT_SKIP_BROWSER_GC=1   # an install must never delete a browser build another running job still uses
-mkdir -p "$PIP_CACHE_DIR" "$npm_config_cache" "$PLAYWRIGHT_BROWSERS_PATH"
+herdr_ci_cache_setup unit-gates
+cache_root="$HERDR_CI_CACHE_ROOT"; private_cache="$HERDR_CI_PRIVATE_CACHE"
 
 # --- private venv per run (two jobs on one agent must not share one) -----------------
 venv="$(mktemp -d "${TMPDIR:-/tmp}/herdr-unit-gates-venv.XXXXXX")"
