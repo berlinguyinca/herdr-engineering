@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: daily budget hardening (always-on-review.py, #818 follow-up)
+
+- Spend already incurred is now logged (`usage`) when a review's head moves after the model ran and when every pass fails with an unusable answer, so `spent_today_usd` counts it (the billed usage of an unusable later pass is counted too). A logged NaN or infinite cost is counted as zero instead of making the sum NaN (which never tripped the budget). An integer `daily_budget_usd` too large for a float (e.g. `10**400`) is refused as a config error instead of raising `OverflowError`. `reviews.jsonl` is read with `errors="replace"`, so an undecodable byte skips that line instead of crashing a review. Per-PR locking and the whole-log read are unchanged. Rollback: revert the commit.
+
 ### Daily budget per tier (always-on-review.py, #792 follow-up)
 
 - New optional YAML key `tiers.<tier>.daily_budget_usd` (positive number; default unset = no limit, behaviour unchanged). Before starting a review the poller sums the `usage.cost_usd` that tier logged in `state_dir/reviews.jsonl` since 00:00 UTC today (partial and dry-run reviews count; other days and the other tier do not). At or over the budget the review is skipped with one log line (`daily budget exhausted`) and the status is left exactly as it was (never success, no new pending); `--force` does not bypass it. Reviews already finished are unaffected. Zero, negative, non-numeric, boolean, NaN and infinite values are refused at config load. Rollback: remove the key and restart the poller.
