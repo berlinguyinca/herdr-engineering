@@ -1208,4 +1208,31 @@ def test_trivial_lines_are_not_evidence_even_when_long(quote):
     m = load()
     d = diff_two_files(a_line="    " + quote)
     assert m.apply_evidence(fnd(m, ev=quote), d, None)[1] == 1
-    assert m.apply_evidence(fnd(m, ev="    " + quote.upper()), d, None)[1] == 1      # not even a different-case copy
+
+
+def test_the_stoplist_is_case_insensitive():
+    m = load()
+    quote = "Except Exception As E:"
+    d = diff_two_files(a_line="    " + quote)
+    assert m.apply_evidence(fnd(m, ev=quote), d, None)[1] == 1
+
+
+def test_a_verified_blocker_on_a_non_ascii_path_stays_blocking():
+    m = load()
+    d = ('diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n--- "a/caf\\303\\251.py"\n+++ "b/caf\\303\\251.py"\n'
+         "@@ -1,1 +1,2 @@\n x = 1\n+    return eval(user_input)\n")
+    out, n = m.apply_evidence(fnd(m, file="café.py", ev="return eval(user_input)"), d, None)
+    assert n == 0 and out.findings[0].severity == "blocking"
+
+
+def test_quote_search_in_a_large_file_is_fast_and_finds_a_multiline_quote(tmp_path):
+    import time
+    m = load()
+    body = ["    pass"] * 60000 + ["    first_line_of_it = 1", "    second_line_of_it = 2"] + ["    pass"] * 60000
+    (tmp_path / "big.py").write_text("\n".join(body))
+    d = "diff --git a/big.py b/big.py\n--- a/big.py\n+++ b/big.py\n@@ -1,1 +1,2 @@\n x = 1\n+y = 2\n"
+    ev = "first_line_of_it = 1\nsecond_line_of_it = 2"
+    t = time.monotonic()
+    ok = m.apply_evidence(fnd(m, file="big.py", ev=ev), d, tmp_path)[1] == 0
+    miss = m.apply_evidence(fnd(m, file="big.py", ev="first_line_of_it = 1\nnot_there_at_all_x"), d, tmp_path)[1] == 1
+    assert ok and miss and time.monotonic() - t < 2
