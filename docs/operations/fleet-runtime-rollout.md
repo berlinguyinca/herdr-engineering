@@ -162,13 +162,42 @@ Existing sessions without the new control API need this explicit first bootstrap
 An unreachable machine remains pending on the original immutable release. Operator
 pauses survive maintenance and do not count as a mission recovery failure.
 
+## Registrations with no instance identity
+
+A Pi registration can exist and be reachable while carrying no `instanceId` — a pane whose
+session ended but whose metadata outlived it. The rollout refuses to act on it, which is
+correct: there is no instance to send a prepare or reload to. The refusal is also permanent,
+so `--max-passes` repeats the same blocked host forever and the release can never reach
+`complete`. An operator settles it explicitly:
+
+```bash
+herdr-eng fleet rollout retire-identityless --id <rollout-id>
+```
+
+Only sessions blocked on a **missing** identity are retired. A session blocked because two
+live registrations claim one conversation stays blocked — that is a real disagreement, not a
+stale husk, and nothing here settles it. Retired sessions are recorded per host in
+`retiredSessions` (sessionId, pid, terminal, the refusal, when, who settled it), stay visible
+in every later report, and appear in `coverageErrors` while the husk is still present. If the
+identity ever resolves, the next pass picks the session back up and stamps `unretiredAt` — a
+wrong retirement is corrected rather than carried forever.
+
+Retirement settles only the identity refusal. A host blocked for a host-level reason
+(unverified native coverage, ambiguous native identity, a missing discovered session) stays
+blocked with that reason in `error`/`coverageErrors` and keeps the plan from completing. A retired
+session is terminal for the runner and keeps its refusal in `error`; it vanishing from the native
+inventory is not a blocker. The command exits 2 while `stillBlocked` is non-empty.
+
 ## Validation coverage
 
 `tests/test_fleet_rollout.py` exercises real durable state and the production JSON
 transport through a subprocess fixture: two hosts, offline recovery, controller
 restart and lost replies, exact replay, old loaded code, stable Host mismatch,
 operator pause, busy preparation, duplicate/stale identities, missing native
-coverage, corrupt receipts, progress regression and expired waits. Runner tests
+coverage, corrupt receipts, progress regression and expired waits. Identity-less
+registrations are covered for the refusal, operator retirement, the evidence kept in the
+report, ambiguous identity refusing to be retired, and a retired session rejoining when its
+identity resolves. Runner tests
 cover reconnect, durable restart/backoff, interruption, duplicate controllers and
 explicit operator-attention stops. These tests do
 not constitute a live multi-workstation rollout; validate a canary before fleet

@@ -1,0 +1,10 @@
+[run]
+branch = True
+parallel = True
+patch = subprocess,execv
+source = herdr_engineering.build_metrics
+relative_files = True
+
+[report]
+show_missing = True
+fail_under = 80

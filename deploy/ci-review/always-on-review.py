@@ -9,7 +9,7 @@ Built on ai-review.py (same `gh` wrapper, diff parser, chunker, citation check, 
 reviewer backends chosen in YAML only: `gateway` (an OpenAI-compatible chat completion, as ai-review.py), `claude`
 (headless Claude Code, read-only tools, a fresh detached worktree of the PR head) and `pi` (the pi harness, read-only
 tools, same worktree). Tier 1 is advisory and posts its own context; tier 2 posts the required context, and only for
-a head whose required gates are all green.
+the head it was asked about, without waiting for green checks unless `gates.wait_for_green` is set.
 
 DRY-RUN IS THE DEFAULT. Reviews run and are logged, and nothing is posted unless the config sets `post: true` AND the
 command line passes `--post`. The script, never the model, decides the state: the reviewer's answer must parse under
@@ -27,6 +27,7 @@ import hashlib
 import datetime as dt
 import importlib.util
 import json
+import math
 import os
 import re
 import secrets
@@ -69,16 +70,18 @@ DEFAULTS: dict = {
     "state_dir": "~/.local/state/herdr-review",
     "post": False,                      # with the --post flag, the second of the two keys that allow any posting
     "clone": "",                        # a clone the claude/pi backends create read-only worktrees from
-    "gates": {"required": [], "when_present": []},   # tier 2: required must be success; when_present only if it exists
+    "gates": {"wait_for_green": False,  # true: tier 2 waits until the gates below are green on the head; false: reviews at once
+              "required": [], "when_present": []},   # with wait_for_green: required must be success; when_present only if it exists
     "poll": {"max_per_run": 5, "pending_stale_minutes": 120, "cooldown_failures": 3, "cooldown_minutes": 60},
     "prompt": {"project_rules": [], "checklist_file": "", "require_evidence": True},
     "replay": {"clones": [],            # [{repo: OWNER/NAME, path: DIR}]: the clone replay uses for that repo
                "reviewers": []},        # logins (bots too) whose review comments `corpus build` counts; humans always count
     "tiers": {
         "tier1": {"enabled": True, "context": "Open-weight pre-review", "backend": "pi",
-                  "model": "metabolomics/qwen3.8-27b", "time_cap_s": 900, "comment": False},
+                  "model": "metabolomics/qwen3.8-27b", "time_cap_s": 900, "comment": False,
+                  "daily_budget_usd": None},     # None = no limit; else skip once today's (UTC) logged cost_usd reaches it
         "tier2": {"enabled": True, "context": "Opus agent review", "backend": "claude", "model": "opus",
-                  "time_cap_s": 1800, "comment": True, "passes": []},     # [{name, focus}]; [] = one unfocused review
+                  "time_cap_s": 1800, "comment": True, "passes": [], "daily_budget_usd": None},     # [{name, focus}]; [] = one unfocused review
     },
     "backends": {
         "gateway": {**ai.DEFAULTS["reviewer"], "chunk_bytes": 24000},
@@ -89,6 +92,16 @@ DEFAULTS: dict = {
 
 
 # ---------------- configuration ----------------
+
+def _valid_budget(b) -> bool:
+    """A positive, finite number; an int too large for a float (10**400) is refused, not an OverflowError."""
+    if isinstance(b, bool) or not isinstance(b, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(b)) and b > 0
+    except OverflowError:
+        return False
+
 
 def load_config(path: str | None) -> dict:
     over: dict = {}
@@ -114,6 +127,9 @@ def load_config(path: str | None) -> dict:
             raise Refused(f"config: tiers.{name}.context must be 1..100 characters")
         if t["time_cap_s"] < 10:
             raise Refused(f"config: tiers.{name}.time_cap_s must be at least 10")
+        b = t.get("daily_budget_usd")
+        if b is not None and not _valid_budget(b):
+            raise Refused(f"config: tiers.{name}.daily_budget_usd must be a positive number (or unset for no limit)")
         contexts.append(t["context"])
     if len(set(contexts)) != len(contexts):
         raise Refused("config: tier contexts must differ")
@@ -123,6 +139,8 @@ def load_config(path: str | None) -> dict:
             raise Refused(f"config: backends.{name}.wrapper must be a list of strings")
         if not b["command"].strip():
             raise Refused(f"config: backends.{name}.command is empty")
+    if not isinstance(cfg["gates"]["wait_for_green"], bool):
+        raise Refused("config: gates.wait_for_green must be true or false")
     for g in ("required", "when_present"):
         if not isinstance(cfg["gates"][g], list) or not all(isinstance(x, str) and x for x in cfg["gates"][g]):
             raise Refused(f"config: gates.{g} must be a list of names")
@@ -759,7 +777,11 @@ def register_pi_secret(model: str) -> None:
 
 
 def register_gh_secret() -> None:
-    """Best effort: the operator's `gh auth token` joins the redaction set (pi can read ~/.config/gh). Never raises."""
+    """Best effort: the operator's `gh auth token` and any GH_TOKEN / GITHUB_TOKEN value join the redaction set (pi can
+    read ~/.config/gh). Never raises."""
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        if len(os.environ.get(name, "")) >= 8:
+            ai.REDACT.add(os.environ[name])
     try:
         p = subprocess.run(["gh", "auth", "token"], capture_output=True, timeout=30, env=child_env())
         tok = p.stdout.decode("utf-8", "replace").strip()
@@ -838,6 +860,22 @@ def git(args: list[str], cwd: Path | str) -> str:
     return p.stdout.decode("utf-8", "replace").strip()
 
 
+def is_git_clone(path: Path) -> bool:
+    """`path` is the root of a usable repository, bare or with a work tree. Asked of git itself, so a bare clone
+    (no `.git` entry) passes and a `.git` file pointing nowhere, or a directory merely inside another repo, fails."""
+    if not path.is_dir():
+        return False
+    env = child_env()
+    p = subprocess.run(["git", "rev-parse", "--absolute-git-dir", "--is-bare-repository"], cwd=path,
+                       capture_output=True, timeout=60, env=env)
+    out = p.stdout.decode("utf-8", "replace").split()
+    if p.returncode != 0 or len(out) != 2:
+        return False
+    git_dir, bare = Path(out[0]).resolve(), out[1] == "true"
+    root = path.resolve()
+    return git_dir == root if bare else (root / ".git").exists()
+
+
 class Worktree:
     """A fresh detached worktree of exactly the pinned head, read-only fetched, removed afterwards."""
 
@@ -845,8 +883,8 @@ class Worktree:
         """replay=True is for the replay harness: the head need only be reachable from refs/pull/N/head (a PR's older
         head, not its latest), `base_sha` (if given) fixes the base, and the fetched refs have their own names."""
         clone = cfg["clone"]
-        if not clone or not (ai.expand(clone) / ".git").exists():
-            raise Refused("config: clone must name a git clone (the claude and pi backends need one)")
+        if not clone or not is_git_clone(ai.expand(clone)):
+            raise Refused("config: clone must name a git clone, bare or not (the claude and pi backends need one)")
         if not BASE_RE.fullmatch(base_ref):
             raise ReviewFailed("the PR's base ref is not a plain branch name")
         self.clone, self.pr, self.sha, self.base_ref = ai.expand(clone), pr, sha, base_ref
@@ -987,6 +1025,28 @@ def log_findings(findings: tuple[Finding, ...]) -> list[dict]:
              **({"downgraded": True} if f.downgraded else {})} for f in findings[:LOG_FINDINGS_MAX]]
 
 
+def spent_today_usd(cfg: dict, tier_name: str) -> float:
+    """The cost_usd the tier's reviews logged in reviews.jsonl since 00:00 UTC today (any state: a partial or dry-run
+    review spent money too). Unreadable lines and lines without a numeric cost count as zero."""
+    today = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d")
+    total = 0.0
+    try:
+        lines = (ai.expand(cfg["state_dir"]) / "reviews.jsonl").read_text(errors="replace").splitlines()
+    except OSError:
+        return 0.0
+    for raw in lines:
+        try:
+            e = json.loads(raw)
+            cost = e["usage"]["cost_usd"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        if (isinstance(e, dict) and e.get("tier") == tier_name and str(e.get("ts", "")).startswith(today)
+                and isinstance(cost, (int, float)) and not isinstance(cost, bool)
+                and math.isfinite(cost)):                   # a NaN/inf cost would poison the sum: count it as zero
+            total += cost
+    return total
+
+
 def log_line(cfg: dict, **kv) -> None:
     kv = {"ts": dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), **kv}
     line = ai.redact(json.dumps(kv))
@@ -1067,11 +1127,16 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
         if state.cooling(key, sha, cfg) and not force:
             ai.say(f"{key}: cooling down after repeated failures; skipped")
             return SKIPPED
-        if tier_name == "tier2":
+        if tier_name == "tier2" and cfg["gates"]["wait_for_green"]:
             green, missing = gates_green(gh, repo, sha, cfg["gates"]["required"], cfg["gates"]["when_present"])
             if not green:
                 ai.say(f"{key} @ {sha[:12]}: waiting for gates: {', '.join(missing)}")
                 return SKIPPED
+        budget = tier.get("daily_budget_usd")
+        if budget is not None and (spent := spent_today_usd(cfg, tier_name)) >= budget:
+            ai.say(f"{key} @ {sha[:12]}: {tier_name} daily budget exhausted (${spent:.2f} of ${budget:.2f} spent today, "
+                   "UTC); review skipped, status unchanged")
+            return SKIPPED
         backend = make_backend(cfg, tier)
         try:
             return _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started)
@@ -1081,12 +1146,14 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
                 count = old.get("failures", 0) + 1 if old.get("failure_sha") == sha else 1
                 state.put(key, failures=count, last_failure=time.time(), failure_sha=sha)
             log_line(cfg, repo=repo, pr=n, sha=sha, tier=tier_name, state="not-run", model=tier["model"],
-                     duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=str(e)[:200])
+                     duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=str(e)[:200],
+                     **({"usage": e.usage} if getattr(e, "usage", None) else {}))
             raise
     except HeadMoved as e:
         ai.say(f"{repo}#{n}: {e}; nothing posted (a new run handles the new head)")
         log_line(cfg, repo=repo, pr=n, sha=sha, tier=tier_name, state="head-moved", model=tier["model"],
-                 duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=str(e)[:200])
+                 duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=str(e)[:200],
+                 **({"usage": e.usage} if getattr(e, "usage", None) else {}))
         return MOVED
     finally:
         held.close()
@@ -1128,6 +1195,7 @@ def run_passes(cfg: dict, tier: dict, backend: Backend, req: ReviewRequest, root
     deadline = time.monotonic() + tier["time_cap_s"]
     verdicts, usages, info, models, down, failed, said_block = [], [], [], [], 0, [], False
     for i, ps in enumerate(passes):
+        raw = None                                      # before the cap check: never reuse the previous pass's result
         remaining = deadline - time.monotonic()
         try:
             if remaining <= 0:
@@ -1135,7 +1203,10 @@ def run_passes(cfg: dict, tier: dict, backend: Backend, req: ReviewRequest, root
             raw = backend.review(dataclasses.replace(req, focus=ps["focus"]), remaining / (len(passes) - i))
             v = parse_verdict(raw.answer, req.sha)
         except ReviewFailed as e:
+            if raw is not None:                         # the model ran and billed even though its answer was unusable
+                usages.append(raw.usage)
             if not verdicts:
+                e.usage = _sum_usage(usages)
                 raise
             failed.append(f"pass {ps['name']} did not complete: {str(e)[:150]}")
             info.append({"name": ps["name"], "error": ai.redact(str(e))[:200]})
@@ -1157,26 +1228,56 @@ def run_passes(cfg: dict, tier: dict, backend: Backend, req: ReviewRequest, root
     return PassesResult(merged, "+".join(dict.fromkeys(models)), _sum_usage(usages), info, down, "; ".join(failed), unverified)
 
 
+DIFF_TOO_LARGE_RE = re.compile(r"exceeded the maximum number of lines|diff_too_large|too_large|HTTP 406")
+
+
+def github_diff(gh, repo: str, n: int) -> str | None:
+    """The PR's diff from GitHub, or None when GitHub refuses it as too large (over 20,000 lines; `gh pr diff` then
+    fails with HTTP 406). Any other failure still raises."""
+    try:
+        return gh.diff(repo, n)
+    except ReviewFailed as e:
+        if DIFF_TOO_LARGE_RE.search(str(e)):
+            return None
+        raise
+
+
+def local_diff(wt: Worktree) -> str:
+    """The same three-dot diff GitHub shows: merge base to the pinned head, from the worktree's own objects."""
+    return git(["diff", "--no-color", "--no-ext-diff", wt.base_sha, wt.sha], wt.path) + "\n"
+
+
 def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started) -> int:
     global LAST_RESULT
     context = tier["context"]
-    diff = gh.diff(repo, n)
+    diff = github_diff(gh, repo, n)                  # None: too large for GitHub; read it from the worktree instead
     if gh.head(repo, n) != sha:
         raise HeadMoved("the head moved while the diff was read")
-    files = ai.parse_diff(diff)
-    if not files:
+    files = ai.parse_diff(diff) if diff is not None else []
+    if diff is not None and not files:
         raise ReviewFailed("the diff is empty")
     index = {f.path: f for f in files}
     if post_on:
         gh.write("POST", f"repos/{repo}/statuses/{sha}",
                  {"state": "pending", "context": context, "description": ai.fit(f"Review running ({tier['model']})")})
-    req = ReviewRequest(repo, n, sha, str(pr.get("title", "")), str(pr.get("body") or ""), "", diff,
+    req = ReviewRequest(repo, n, sha, str(pr.get("title", "")), str(pr.get("body") or ""), "", diff or "",
                         sorted(index))
-    if backend.needs_worktree:
+    if backend.needs_worktree or diff is None:
         with Worktree(cfg, n, sha, str(pr.get("baseRefName", "main"))) as wt:
-            req.worktree, req.base_sha = wt.path, wt.base_sha
-            req.log = git(["log", "--format=%h %s", f"{wt.base_sha}..{sha}"], wt.path)
-            result = run_passes(cfg, tier, backend, req, wt.path)
+            if diff is None:
+                req.diff = local_diff(wt)
+                files = ai.parse_diff(req.diff)
+                if not files:
+                    raise ReviewFailed("the diff is empty")
+                index = {f.path: f for f in files}
+                req.files = sorted(index)
+                ai.say(f"{repo}#{n}: the diff is over GitHub's limit; reviewing the local diff of {len(files)} files")
+            if backend.needs_worktree:
+                req.worktree, req.base_sha = wt.path, wt.base_sha
+                req.log = git(["log", "--format=%h %s", f"{wt.base_sha}..{sha}"], wt.path)
+                result = run_passes(cfg, tier, backend, req, wt.path)
+            else:
+                result = run_passes(cfg, tier, backend, req, None)
     else:
         result = run_passes(cfg, tier, backend, req, None)
     verdict = result.verdict
@@ -1194,7 +1295,9 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
                  findings=log_findings(verdict.findings))
         raise ReviewFailed(f"{why}; status stays pending")
     if gh.head(repo, n) != sha:
-        raise HeadMoved("the head moved during the review")
+        moved = HeadMoved("the head moved during the review")
+        moved.usage = result.usage                      # the model ran: the spend counts toward the daily budget
+        raise moved
     url = None
     if decision.state == "failure" and tier["comment"]:
         url = upsert_comment(gh, repo, n, context, comment_text(context, sha, decision))

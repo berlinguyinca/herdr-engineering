@@ -18,6 +18,7 @@ share = ["cryptography>=42"]   # lab-share session AEAD (share_session.py)
 federation = ["cryptography>=42"]   # Ed25519 request/export signing (ADR-0008 P2); imported lazily
 
 [project.scripts]
+agent-scratch-reaper = "herdr_engineering.scratch_reaper:main"
 herdr-eng = "herdr_engineering.cli:main"
 herdr-plannotator = "herdr_engineering.plannotator:main"
 
