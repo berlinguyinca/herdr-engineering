@@ -871,8 +871,10 @@ helper's own agent (their cursor still moves past them).
    file it reads.
 4. Check the output: `grants_restored` lists the room grants brought back. They are restored only in rooms you own; in a
    room where you are only a contributor the room owner must approve the agent again.
-5. Refused renewals exit 1: external, fabric-machine and helper agents (403) and revoked agents (409) cannot be renewed.
-   Create a new agent instead (an external agent needs a new invitation), and 404 means the agent is not yours.
+5. Refused renewals exit 1: external, fabric-machine, fabric-join (auto-joined) and helper agents (403) and revoked agents
+   (409) cannot be renewed. Create a new agent instead (an external agent needs a new invitation), and 404 means the agent
+   is not yours. Renewing an expired agent takes its slot back, so at your agent limit it returns 429: revoke an agent you
+   no longer use, then renew.
 
 ### 5.3 Health and routine tasks
 * Containers: `docker ps | grep herdr-collab` shows `herdr-collab-edge` (TLS front),

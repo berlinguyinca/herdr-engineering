@@ -349,25 +349,82 @@ def test_stale_memberships_of_expired_unrenewable_agents_are_removed_and_counted
     assert rb.is_noop(rb.current(rb.Http(stack.url))[0])
 
 
-def test_an_operator_without_an_id_removes_nothing():
+@pytest.mark.parametrize("me, owner", [({}, {}), ({"user_id": ""}, {"owner_user_id": ""}), ({"user_id": None}, {}),
+                                       ({"user_id": None}, {"owner_user_id": None}), ({"user_id": 0}, {"owner_user_id": 0}),
+                                       ({"user_id": False}, {"owner_user_id": False})])
+def test_an_operator_without_an_id_removes_nothing(me, owner):
+    """Every falsy id shape would equal the unowned grant's owner (absent, "", None, 0): the guard must refuse before any remove."""
+    posts = []
+
     class Stub(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
-        def do_GET(self):
-            agents = [{"name": "tui-smoke-a", "status": "active", "agent_id": "a1"}]
-            body = {"/api/v1/collab/agents": {"agents": agents}, "/api/v1/collab/rooms": {"rooms": [{"name": rb.ROOM_NAME, "room_id": "r1"}]},
-                    "/api/v1/collab/rooms/r1/agents": {"agents": []}}.get(self.path, {})
+        def _send(self, body):
             raw = json.dumps(body).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
 
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            posts.append(self.path)
+            self._send({})
+
+        def do_GET(self):
+            agents = [{"name": "tui-smoke-a", "status": "active", "agent_id": "a0", "expires_at": 1.0},   # expired: its grant is stale
+                      {"name": "tui-smoke-a", "status": "active", "agent_id": "a1"}]
+            self._send({"/api/v1/collab/agents": {"agents": agents}, "/api/v1/collab/me": me,
+                        "/api/v1/collab/rooms": {"rooms": [{"name": rb.ROOM_NAME, "room_id": "r1"}]},
+                        "/api/v1/collab/rooms/r1/agents": {"agents": [{"name": "tui-smoke-a", "agent_id": "a0", **owner}]}}.get(self.path, {}))
+
     srv = _Serve(Stub)
     try:
-        api = rb.Http(srv.url)
         with pytest.raises(RuntimeError, match="without a user id"):
-            rb.ensure(api, {"agents": [], "room": False, "members": ["tui-smoke-a"]}, False)
+            rb.ensure(rb.Http(srv.url), {"agents": [], "room": False, "members": ["tui-smoke-a"]}, False)
     finally:
         srv.close()
+    assert not [x for x in posts if x.endswith("/remove")], posts
+
+
+def test_only_a_real_409_status_is_a_conflict_not_text_that_says_so(capsys):
+    """A 500 whose body quotes "HTTP 409" must propagate; a genuine 409 is the tolerated conflict."""
+    def serve(status, text):
+        class Stub(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, body):
+                raw = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self._send(status, {"error": text})
+
+            def do_GET(self):
+                self._send(200, {"/api/v1/collab/agents": {"agents": [{"name": "tui-smoke-a", "status": "active", "agent_id": "a1"}]},
+                                 "/api/v1/collab/me": {"user_id": "alice"},
+                                 "/api/v1/collab/rooms": {"rooms": [{"name": rb.ROOM_NAME, "room_id": "r1"}]},
+                                 "/api/v1/collab/rooms/r1/agents": {"agents": []}}.get(self.path, {}))
+        return _Serve(Stub)
+
+    plan = {"agents": [], "room": False, "members": ["tui-smoke-a"]}
+    srv = serve(500, "upstream said HTTP 409 earlier")
+    try:
+        with pytest.raises(RuntimeError, match="-> HTTP 500"):
+            rb.ensure(rb.Http(srv.url), plan, False)
+    finally:
+        srv.close()
+    assert "CONFLICT" not in capsys.readouterr().out
+    srv = serve(409, "taken")
+    try:
+        with pytest.raises(RuntimeError, match="refused with 409"):
+            rb.ensure(rb.Http(srv.url), plan, False)
+    finally:
+        srv.close()
+    assert "CONFLICT membership tui-smoke-a" in capsys.readouterr().out

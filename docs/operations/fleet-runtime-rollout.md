@@ -186,7 +186,7 @@ Retirement settles only the identity refusal. A host blocked for a host-level re
 (unverified native coverage, ambiguous native identity, a missing discovered session) stays
 blocked with that reason in `error`/`coverageErrors` and keeps the plan from completing. A retired
 session is terminal for the runner and keeps its refusal in `error`; it vanishing from the native
-inventory is not a blocker. The command exits 2 while `stillBlocked` is non-empty.
+inventory is not a blocker. The command exits 2 while `stillBlocked` sessions or `blockedHosts` remain. Run `apply` first on plans written before this change, so sessions carry the typed `blockReason` and hosts carry `hostLevelError`.
 
 ## Validation coverage
 

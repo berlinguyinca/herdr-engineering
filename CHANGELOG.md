@@ -9,6 +9,20 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - New YAML block `risky` (default `globs: []` = off, behaviour unchanged). For a PR touching a path that matches `risky.globs` (`**` globs, case-insensitive, a rename counts by old and new path), `Opus agent review` is posted success only when a Codex review of the same head also approves: Opus runs first, and only if it approved cleanly `codex exec` (read-only sandbox, `--ignore-user-config`, strict verdict schema, same evidence rule) reviews the same worktree; the verdicts are merged and the script decides the state. A Codex block posts failure with its findings. If Codex cannot run or its answer cannot be verified (missing binary or login, time cap, bad exit, malformed answer, unverifiable block) the status stays pending, never success. Non-risky PRs and tier 1 never call Codex; a moved head posts nothing; dry-run and the two-key post rule are unchanged. Cost: `risky.codex.daily_budget_usd` with `input_usd_per_mtok` / `output_usd_per_mtok` (codex reports tokens only; the prices are required with a budget) is summed from `reviews.jsonl` (`tier: codex`) since 00:00 UTC and skips a risky review before Opus runs once reached. A Codex block whose blockers all cite files outside the PR also stays pending; `-c project_doc_max_bytes=0` keeps a PR-added AGENTS.md out of Codex's instructions; implausible token counts (negative, non-integer, over 10**12) fail the review. `show-command --tier codex` prints the command. Not installed or deployed by this change; beast needs `codex login`. Rollback: set `risky.globs: []` (or remove the block) and restart the poller.
 
+### xdist follow-ups: collision-free ports, accurate comments, stronger parallel tests
+
+- `test_allocation_skips_os_bound_port` and `test_failed_forwarder_start_is_retried_on_next_sync` bound fixed ports (18500, 24700) that could collide across files running concurrently under `--dist=loadfile`; they now use OS-assigned ports.
+- `scripts/ci/pytest-parallel.sh` comments corrected: `loadfile` does not honour `xdist_group` (only `loadgroup` does), and `--maxprocesses` caps explicit worker counts too.
+- The loadfile test now runs four real files on two workers and asserts more than one worker was used with each file on exactly one; added refusal tests for `HERDR_PYTEST_MAXPROCESSES` of `0` or non-numeric.
+- `tree._live_processes` runs `ps -ww`: xdist workers export `COLUMNS=80`, which truncated process args (regression test added).
+- `execnet==2.1.2` (what `pytest-xdist==3.8.0` resolves to) is pinned in the dev extra.
+
+### Fix: leftovers from the review of the collab agents follow-ups
+
+- `herdr-eng collab agents renew`: a failed write with `--json --print-credential` now prints the one JSON object (with `credential`) on stdout, not the bare credential; a failed move into place with `--print-credential` also prints the credential (or the JSON object) on stdout, keeping the 0600 temp file and its path on stderr.
+- `deploy/control-plane/rooms-bootstrap.py`: a membership conflict is recognised by the real HTTP status (409), not by the text "HTTP 409" in the message, so a non-409 error quoting it is no longer swallowed. The missing-operator-id test now covers every falsy `user_id` shape against a real stub that would otherwise remove an unowned grant.
+- Runbook 5.2a step 5: fabric-join agents are refused (403) and renewing an expired agent at the agent limit returns 429.
+
 ### Fix: collab agents CLI and rooms-bootstrap follow-ups, flaky MCP upload tests, renewal runbook
 
 - `herdr-eng collab agents renew`: `--json --print-credential` now prints one JSON object that includes `credential` (no second line); a failed file write with `--print-credential` prints the credential on stdout as requested instead of stderr; the temp file is fsynced before it is renamed into place; a read timeout on an error body, a malformed `--operator-url` (`http://[::1`) and a listed agent without an id are one-line errors (exit 1), not tracebacks.
