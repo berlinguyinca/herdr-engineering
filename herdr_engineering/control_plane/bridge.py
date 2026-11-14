@@ -399,7 +399,7 @@ class PostgresSource(DurableSource):
                 import asyncpg
                 self._conn = await asyncpg.connect(self._dsn)
             return await fetch_page(self._conn, table, session_id, limit=limit, before=before,
-                                    cutoff=cutoff, kinds=kinds)
+                                    cutoff=cutoff, kinds=kinds, archive_table=table[:-1] + '_archive"')
         with self._query_lock:
             return self._run(read())
 

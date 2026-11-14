@@ -24,6 +24,23 @@ from .errors import (
 )
 
 
+class NativeDeliveryUnconfirmed(InvalidError):
+    """The native invocation ended without proof of delivery or refusal."""
+
+
+def confirm_recipient(expected: dict[str, object], delivery: dict[str, object]) -> None:
+    """Native 0.9.1 has no atomic expected-conversation prompt selector."""
+    from .communications import receipt_recipient
+    actual = receipt_recipient(json.dumps(delivery.get("receipt", {})).encode())
+    conversation = expected.get("agent_session")
+    terminal = expected.get("terminal_id")
+    if (not isinstance(conversation, dict) or not conversation.get("value")
+            or not isinstance(terminal, str) or not terminal
+            or actual.get("agent_session") != conversation or actual.get("terminal_id") != terminal):
+        raise NativeDeliveryUnconfirmed("native recipient changed or could not be confirmed; do not automatically retry",
+                                       details={"delivery": delivery})
+
+
 @dataclass
 class Machine:
     id: str
@@ -112,8 +129,10 @@ class NativeHerdrAdapter:
         self._capabilities: HerdrCapabilities | None = None
 
     # -- low-level ---------------------------------------------------------
-    def _run(self, args: list[str], timeout: int = 30) -> str:
+    def _run(self, args: list[str], timeout: int = 30, environment: dict[str, str] | None = None) -> str:
         try:
+            if environment and isinstance(self._runner, _SubprocessRunner):
+                return self._runner.run(args, timeout=timeout, environment=environment)
             return self._runner.run(args, timeout=timeout)
         except subprocess.TimeoutExpired:
             raise TimeoutError_Engineering("herdr command timed out",
@@ -304,7 +323,7 @@ class NativeHerdrAdapter:
 
     # -- input ---------------------------------------------------------------
     def send_input(self, target: str, text: str, machine: str | None = None,
-                   session: str | None = None) -> dict[str, Any]:
+                   session: str | None = None, operation_id: str | None = None) -> dict[str, Any]:
         """Submit a native prompt; delivery does not establish mission progress.
 
         ``session`` selects the named HerdR server, ``target`` selects an agent
@@ -314,10 +333,16 @@ class NativeHerdrAdapter:
             raise InvalidError("an explicit native agent target is required")
         if not isinstance(text, str) or not text.strip():
             raise InvalidError("prompt text is required")
-        result = self._run_json(self._routing(machine, session)
-                                + ["agent", "prompt", "--", target, text])
-        if not isinstance(result, dict) or result.get("ok") is not True:
-            raise InvalidError("native prompt did not acknowledge delivery")
+        environment = {"HERDR_COMMUNICATION_OPERATION_ID": operation_id} if operation_id else None
+        raw = self._run(self._routing(machine, session)
+                        + ["agent", "prompt", target, text], environment=environment)
+        from .communications import delivery_status
+        status = delivery_status(0, raw.encode())
+        if status == "unknown":
+            raise NativeDeliveryUnconfirmed("native prompt did not acknowledge delivery")
+        if status != "delivered":
+            raise InvalidError("native prompt refused delivery")
+        result = json.loads(raw)
         return {"status": "delivered", "target": target, "machine": machine,
                 "session": session, "mission_progress_verified": False,
                 "receipt": result}
@@ -327,9 +352,18 @@ class _SubprocessRunner:
     def __init__(self, herdr_bin: str) -> None:
         self.herdr_bin = herdr_bin
 
-    def run(self, args: list[str], timeout: int = 30) -> str:
+    def run(self, args: list[str], timeout: int = 30, environment: dict[str, str] | None = None) -> str:
+        import os
         proc = subprocess.run(
-            [self.herdr_bin] + args, capture_output=True, text=True, timeout=timeout)
+            [self.herdr_bin] + args, capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, **environment} if environment else None)
         if proc.returncode != 0:
+            from .communications import delivery_status, parse_prompt
+            if parse_prompt(args) is not None:
+                status = delivery_status(proc.returncode, proc.stdout.encode(), proc.stderr.encode())
+                if status == "delivered":
+                    return proc.stdout
+                if status == "unknown":
+                    raise NativeDeliveryUnconfirmed("native prompt outcome is unconfirmed")
             raise InvalidError(f"herdr {args[0]} failed: {proc.stderr.strip()[:300]}")
         return proc.stdout

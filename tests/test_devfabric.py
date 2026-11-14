@@ -161,16 +161,19 @@ def test_port_exhaustion_raises_conflict(tmp_path):
 
 def test_allocation_skips_os_bound_port(tmp_path):
     import socket
+    # OS-assigned port: a fixed one collides with other test files running on the same host under xdist --dist=loadfile.
     blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    blocker.bind(("127.0.0.1", 18500))
+    blocker.bind(("127.0.0.1", 0))
+    bound = blocker.getsockname()[1]
     blocker.listen(1)
     try:
         r = DevServiceRegistry(store_path=tmp_path / "leases.json",
-                               port_range=(18500, 18501))
+                               port_range=(bound, bound + 50))
         lease = r.register(target_machine_id="a", target_host="h", target_port=1,
                            owner_process_id="p1")
-        assert lease.external_port == 18501  # 18500 is bound by the blocker
+        # `bound` is held by the blocker, so the allocator must move on within the range
+        assert bound < lease.external_port <= bound + 50
     finally:
         blocker.close()
 

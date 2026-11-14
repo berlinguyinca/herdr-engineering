@@ -31,7 +31,8 @@ import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { agentStory, renderStory } from './agents-lineage.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
 import { RANGES, safeHostId } from './host-view.js';
-import { mountHosts, loadHosts } from './hosts-view.js';
+import { mountHosts, loadHosts, mountDiagnostics } from './hosts-view.js';
+import { createHostDiagnosticsSource } from './diagnostics-source.js';
 import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountActivity, loadActivity } from './activity-view.js';
 import { mountAnalytics, loadAnalytics, usageStrip } from './analytics-view.js';
@@ -43,6 +44,8 @@ import { mountFabricServices } from './fabric-services-view.js';
 import { mountAiSync } from './ai-sync-view.js';
 import { mountPrTrail } from './pr-trail-view.js';
 import { mountTeamMap } from './team-map-view.js';
+import { mountAgentOps } from './agent-ops-view.js';
+import { lineageEnabled, mountAgentOpsLineage } from './agent-ops-lineage.js';
 import { mountTeams } from './teams-view.js';
 import { mountAgentEvolution, tabsHtml, TABS_STYLE, wireTabs } from './agent-evolution-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
@@ -61,6 +64,7 @@ import { mountDeployments } from './deployments-view.js';
 import { mountBuildCache, mountBuildDetail } from './build-cache-view.js';
 import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
 import { mountEventHistory } from './event-history.js';
+import { mountCommunications } from './communications-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -90,12 +94,13 @@ const root = document.getElementById('view');
 const NAV = [
   { group: 'Monitor', path: '/overview', label: 'Overview' },
   { group: 'Monitor', path: '/attention', label: 'Attention', match: ['/activity'] },
-  { group: 'Agents', path: '/herd', label: 'Agents', match: ['/missions', '/handoffs', '/topology'] },
+  { group: 'Agents', path: '/herd', label: 'Agents', match: ['/missions', '/handoffs', '/topology', '/communications'] },
   { group: 'Agents', path: '/collab', label: 'Collaboration', capability: 'collab_v1' },
   { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
   { group: 'Agents', path: '/teams', label: 'Your teams', capability: 'unified_workspace_v1' },
   { group: 'Agents', path: '/team-map', label: 'Team map', capability: 'unified_workspace_v1' },
-  { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync', '/build-cache'] },
+  { group: 'Agents', path: '/agent-ops', label: 'Agent Operations', capability: 'agent_ops_v1' },
+  { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync', '/build-cache', '/diagnostics'] },
   { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
   { group: 'Fabric', path: '/settings', label: 'Settings' },
   { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
@@ -110,9 +115,9 @@ const NAV = [
 // Handoffs are the thread through the Agents section: who started whom, and why. Topology is no longer listed (the lineage
 // graph replaces it); its route still answers for old links.
 const SECTION_TABS = [
-  [['/herd', 'Agents'], ['/missions', 'Missions'], ['/handoffs', 'Handoffs']],
+  [['/herd', 'Agents'], ['/missions', 'Missions'], ['/handoffs', 'Handoffs'], ['/communications', 'Communications']],
   [['/attention', 'Attention'], ['/activity', 'Activity']],
-  [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync'], ['/build-cache', 'Build cache', 'build_cache_v1']],
+  [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync'], ['/build-cache', 'Build cache', 'build_cache_v1'], ['/diagnostics', 'Diagnostics']],
   [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
   [['/ci', 'CI'], ['/deployments', 'Deployments']],
   [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate', 'review_gate_v1']],
@@ -251,12 +256,15 @@ const ROUTES = {
   '/pr/:owner/:repo/:number': viewPrTrail,
   '/teams': viewTeams,
   '/team-map': viewTeamMap,
+  '/agent-ops': viewAgentOps,
   '/services/:id': viewService,
   '/hosts': viewHosts,
+  '/diagnostics': viewDiagnostics,
   '/personal-assistant': viewPersonalAssistant,
   '/intelligence': viewIntelligence,
   '/hosts/:id': viewHost,
   '/activity': viewActivity,
+  '/communications': () => mountCommunications(root, client),
   '/analytics': viewAnalytics,
   '/analytics/missions': viewAnalytics,
   '/analytics/models': viewAnalytics,
@@ -486,6 +494,12 @@ async function viewTeamMap() {
   return ownPolling(view);   // positions the person moved must survive a live event, so only the Open button reloads
 }
 
+async function viewAgentOps() {
+  root.innerHTML = `${liveHead('<h1>Agent Operations</h1>')}<div id="agent-ops"></div>`;
+  const view = mountAgentOps(root.querySelector('#agent-ops'), client, { freshness: chipIn(root), filters: { task: route().query.get('task') || '' } });
+  return { refresh: () => view.refresh(), dispose: () => view.dispose() };   // the view owns its own SSE stream (cursor resume) and replay state
+}
+
 async function viewHandoffs() {
   root.innerHTML = `${liveHead('<h1>Handoffs</h1>')}<div id="handoffs"></div>`;
   return mountHandoffs(root.querySelector('#handoffs'), client, { freshness: chipIn(root), open: route().query.get('open') || '' });
@@ -518,7 +532,11 @@ async function viewOverview() {
   const host = document.getElementById('overview-dashboard');
   const workCenter = await workCenterOn();
   if (!host.isConnected) return { refresh() {}, dispose() {} };   // navigated away while the capability probe was pending
-  return ownPolling(mountOverview(host, client, { freshness: chipIn(root), workCenter }));
+  const overview = mountOverview(host, client, { freshness: chipIn(root), workCenter });
+  // Slice 07: task lineage from Agent Operations, only while BOTH work_center_v1 and agent_ops_v1 are advertised.
+  let lineage = null;
+  if (lineageEnabled(capabilities)) { const slot = document.createElement('div'); slot.id = 'agent-lineage'; host.after(slot); lineage = mountAgentOpsLineage(slot, client); }
+  return ownPolling({ dispose() { overview.dispose(); lineage?.dispose(); document.getElementById('agent-lineage')?.remove(); } });
 }
 
 async function viewAttention() {
@@ -1115,6 +1133,21 @@ async function viewHosts(_parts, revision) {
   const data = await loadHosts(client);
   if (revision !== renderRevision) return;
   return mountHosts(root, client, { data, driftedOnly: route().query.get('drift') === '1' });
+}
+
+// Diagnostics is a snapshot the way the LLM pages are (addSnapshotChip): one read per navigation, never refreshed by a live event, because H03 reads
+// each feed once. The two calls below are feeds that already exist — the event stream and the host list — so no endpoint is invented here, and the
+// mount writes into this route's own node, so a read that finishes after the operator navigated away cannot write over the page they moved to.
+async function viewDiagnostics(_parts, revision) {
+  root.innerHTML = '<div data-diagnostics></div>';
+  // Only feeds that exist: the host list, then one event page per host through the adapter's own path builder.
+  // The bare events endpoint answers 400 (it requires both entity parameters), so that query lives in
+  // hostEventsPath beside the adapter that maps the answer, and this page names no URL of its own.
+  const source = createHostDiagnosticsSource({ request: (path) => client.request(path), listHosts: () => client.listHosts(), now: Date.now() });
+  await mountDiagnostics(root.querySelector('[data-diagnostics]'), { source });
+  if (revision !== renderRevision) return NO_REFRESH;
+  addSnapshotChip();
+  return NO_REFRESH;
 }
 
 async function viewHost(parts, revision) {

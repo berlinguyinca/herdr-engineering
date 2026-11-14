@@ -312,7 +312,16 @@ async function main() {
   const envelopes = info && Object.keys(info).length
     ? mapEvent(env, { host, info })
     : base;
-  if (envelopes.length === 0) return;
+  // Agent Operations (additive, off unless HERDR_AGENT_OPS=1): provenance=observed lifecycle events.
+  let ops = [];
+  try {
+    if (env.HERDR_AGENT_OPS === "1") {
+      // Dynamic so a plugin copy without ../agent-ops-adapters keeps working (fail open).
+      const { mapHerdrAgentOps } = await import("../agent-ops-adapters/herdr.js");
+      ops = mapHerdrAgentOps(env, { host, scope: env.HERDR_AGENT_OPS_SCOPE || "private" });
+    }
+  } catch { ops = []; }
+  if (envelopes.length === 0 && ops.length === 0) return;
   // Enrich session envelopes with live detail (cwd/branch/pid/summary/attach)
   // via the herdr CLI + git, then send everything. Enrichment is best-effort.
   const enriched = await Promise.all(
@@ -328,7 +337,7 @@ async function main() {
   // Keyed control plane: the host config's ingest key. Absent or unreachable
   // config keeps the open (keyless) behaviour.
   const apiKey = await loadHostConfig().then((c) => c?.apiKey ?? null).catch(() => null);
-  await Promise.allSettled(enriched.map((e) => send(url, e, apiKey)));
+  await Promise.allSettled([...enriched, ...ops].map((e) => send(url, e, apiKey)));
 }
 
 // Only run when executed directly (not when imported by tests).
