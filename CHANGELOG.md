@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Collab: owner renew of expired agents, sliding window on use
+
+- New `POST /api/v1/collab/agents/{id}/renew` (`CollabService.renew_agent`, dashboard **Renew access** on an expired agent card): the signed-in owner (404 for anyone else, 403 for an agent caller) gets a new credential for the same agent id, device, name and room grants, shown once, with expiry now + `remote_credential_ttl`. The old credential dies at once. Refused: revoked (409), helper, fabric-machine and externally bound agents (403; an external agent's `hard_expiry` is never extended). It reuses the `credential_rotated` event with action `agent.renew`, so replay and audit work unchanged; a renewal of an expired agent counts against the agent cap again (429).
+- Agents made by `connect_agent` (new `origin: "connect"` on `agent_enrolled`; older ones do not slide, renew them by hand) now slide: a successful Agent auth moves `expires_at` to now + `remote_credential_ttl`, written at most once a day per agent, best effort (a full log never fails the request), never for helper/fabric/external agents and never for an expired or revoked one.
+- `deploy/control-plane/rooms-bootstrap.py` renews an expired operator-owned agent in place (`RENEWED agent <handle>`, the credential is dropped unread) instead of removing its grant and connecting a new agent; foreign-owner handling is unchanged, and a refused renew falls back to creating one.
+
 ### Review prompt v2: rules, checklist, evidence, passes, replay harness (always-on-review.py)
 
 - New YAML keys: `prompt.project_rules` (trusted rules in both tiers' prompt), `prompt.checklist_file` (`deploy/ci-review/review-checklist.yaml`, validated, the reviewer lists the ids it considered in `checked_items`), `prompt.require_evidence` (default true), `tiers.tier2.passes` (the example ships general, tests, security, migrations; unset or `[]` keeps one unfocused review) and `replay.clones`. The claude prompt now tells the reviewer to read callers, tests and migrations before the verdict.

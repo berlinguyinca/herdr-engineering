@@ -829,6 +829,16 @@ helper's own agent (their cursor still moves past them).
   provisioner added them (they were not in the group before), and they never accepted any invitation. Anyone you
   added to the group by hand, or who already joined a room, stays; the Cognito account is never deleted.
 * A leaked agent credential: revoke it on the AI agents page.
+* An agent whose credential expired: **Renew access** on the AI agents page (or `POST /api/v1/collab/agents/<id>/renew`
+  as the signed-in owner). It keeps the agent id, name, device and room grants, mints a NEW credential (shown once;
+  re-run the connect snippet with it) and starts a fresh window of the connect lifetime (30 days by default). The old
+  credential stops working at once. Only the owner can do it (anyone else gets 404). Revoked agents, helper agents,
+  fabric-machine identities and externally invited agents are refused: an external agent never lives past its invite's
+  hard expiry. Room grants have their own expiry and are not extended by a renew.
+* Agents made by **Connect an agent** also slide: a successful use after more than a day since the last extension pushes
+  the expiry out to a full window again (one log event a day at most), so an agent in daily use does not expire. An
+  agent that is already expired or revoked is never revived by use; renew it instead. Helper, fabric and external agents
+  never slide.
 
 ### 5.3 Health and routine tasks
 * Containers: `docker ps | grep herdr-collab` shows `herdr-collab-edge` (TLS front),
