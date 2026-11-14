@@ -1,0 +1,12 @@
+[run]
+branch = True
+parallel = True
+patch = subprocess,execv
+source =
+    herdr_engineering.scratch_reaper
+    herdr_engineering.scratch_safety
+relative_files = True
+
+[report]
+show_missing = True
+fail_under = 80

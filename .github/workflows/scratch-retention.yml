@@ -1,0 +1,67 @@
+name: Agent scratch retention
+
+on:
+  pull_request:
+    paths:
+      - 'herdr_engineering/scratch_*.py'
+      - 'tests/test_scratch_reaper.py'
+      - 'tests/test_scratch_swift_macos.py'
+      - 'deploy/agent-scratch-reaper.plist'
+      - 'pyproject.toml'
+      - '.coveragerc-scratch-reaper'
+      - '.github/workflows/scratch-retention.yml'
+      - 'playwright.scratch.config.ts'
+      - 'tests/playwright/scratch-retention.spec.ts'
+      - 'eslint.scratch.config.mjs'
+      - 'package*.json'
+  workflow_dispatch:
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      HERDR_SCRATCH_TEST_WHEEL: ${{ github.workspace }}/dist/herdr_engineering-0.1.0-py3-none-any.whl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install pinned verification tools
+        run: python -m pip install -e '.[dev]' ruff==0.14.5 mypy==1.18.2 types-PyYAML==6.0.12.20261103 pytest-cov==7.0.0 coverage==7.13.1 build==1.3.0
+      - name: Verify real process and compiler tools
+        run: |
+          command -v lsof
+          rustup which cargo
+          rustc --version
+      - name: Lint, format and type-check
+        run: |
+          ruff check herdr_engineering/scratch_reaper.py herdr_engineering/scratch_safety.py tests/test_scratch_reaper.py tests/test_scratch_swift_macos.py
+          ruff format --check herdr_engineering/scratch_reaper.py herdr_engineering/scratch_safety.py tests/test_scratch_reaper.py tests/test_scratch_swift_macos.py
+          mypy --follow-imports=silent --ignore-missing-imports --check-untyped-defs --disallow-untyped-defs herdr_engineering/scratch_reaper.py herdr_engineering/scratch_safety.py tests/test_scratch_reaper.py tests/test_scratch_swift_macos.py
+      - name: Build installed-wheel acceptance artifact
+        run: python -m build --wheel
+      - name: Real unit, integration, smoke and compiler E2E with coverage
+        run: |
+          mkdir -p .superpowers
+          files=(tests/test_scratch_reaper.py)
+          if [ "$RUNNER_OS" = macOS ]; then files+=(tests/test_scratch_swift_macos.py); fi
+          python -m pytest -q -m '' "${files[@]}" --cov --cov-config=.coveragerc-scratch-reaper --cov-report=term-missing --cov-report=json:.superpowers/scratch-coverage.json
+          python scripts/ci/check-cargo-coverage.py .superpowers/scratch-coverage.json
+      - name: Playwright CLI end-to-end and strict TypeScript lint
+        env:
+          SCRATCH_TEST_PYTHON: python
+        run: |
+          npm ci --ignore-scripts
+          npx tsc --strict --skipLibCheck --module NodeNext --moduleResolution NodeNext --target ES2022 --types node --outDir .superpowers/scratch-js playwright.scratch.config.ts tests/playwright/scratch-retention.spec.ts
+          npx eslint --config eslint.scratch.config.mjs .superpowers/scratch-js/playwright.scratch.config.js .superpowers/scratch-js/tests/playwright/scratch-retention.spec.js
+          npx prettier --check playwright.scratch.config.ts tests/playwright/scratch-retention.spec.ts eslint.scratch.config.mjs
+          npx playwright test --config playwright.scratch.config.ts
