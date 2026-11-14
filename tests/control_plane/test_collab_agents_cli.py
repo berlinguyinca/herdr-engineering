@@ -352,3 +352,36 @@ def test_a_failed_move_into_place_keeps_the_0600_temp_file_and_prints_its_path(t
     assert tmp in err and "hca_secretvalue" not in err and "0600" in err
     assert stat.S_IMODE(os.stat(tmp).st_mode) == 0o600
     assert open(tmp).read() == "hca_secretvalue\n"
+
+
+def test_a_failed_write_with_json_and_print_credential_prints_the_json_object_on_stdout(stack, tmp_path):
+    info = connect(stack, "diskfulljson")
+    res = subprocess.run([sys.executable, "-B", "-c", CHILD_CODE, "collab", "agents", "renew", info["agent_id"],
+                          "--credential-file", str(tmp_path / "cred"), "--print-credential", "--json", "--operator-url", stack.url],
+                         capture_output=True, text=True, timeout=60)
+    assert res.returncode == 1 and "Traceback" not in res.stderr
+    body = json.loads(res.stdout)                            # exactly one JSON object, not the bare credential
+    assert body["credential"].startswith("hca_") and body["credential"] != info["credential"]
+    assert body["agent_id"] == info["agent_id"] and "hca_" not in res.stderr
+    assert agent_authenticates(stack, info, body["credential"])
+
+
+def test_a_failed_move_into_place_with_print_credential_prints_it_on_stdout_and_keeps_the_file(tmp_path, capsys):
+    from herdr_engineering.collab_agents_client import _reserve, _store
+    dest = tmp_path / "cred"
+    tmp, fd = _reserve(str(dest), False)
+    dest.mkdir()
+    assert _store("hca_secretvalue", tmp, fd, str(dest), True) is False
+    cap = capsys.readouterr()
+    assert cap.out.split() == ["hca_secretvalue"] and tmp in cap.err and "hca_secretvalue" not in cap.err
+    assert stat.S_IMODE(os.stat(tmp).st_mode) == 0o600 and open(tmp).read() == "hca_secretvalue\n"
+
+
+def test_a_failed_move_into_place_with_json_prints_the_json_object_on_stdout(tmp_path, capsys):
+    from herdr_engineering.collab_agents_client import _reserve, _store
+    dest = tmp_path / "cred"
+    tmp, fd = _reserve(str(dest), False)
+    dest.mkdir()
+    assert _store("hca_secretvalue", tmp, fd, str(dest), True, {"agent_id": "a1"}) is False
+    cap = capsys.readouterr()
+    assert json.loads(cap.out) == {"agent_id": "a1", "credential": "hca_secretvalue"} and tmp in cap.err
