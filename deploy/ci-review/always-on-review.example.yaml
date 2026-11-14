@@ -48,6 +48,29 @@ tiers:
     model: opus                          # claude: any --model value (alias or full id)
     time_cap_s: 1800
     comment: true                        # one marked PR comment (updated in place) when it blocks
+    passes:                              # one sequential claude run per pass; `passes: []` = one unfocused review
+      - {name: general, focus: "Review the change as a whole: correctness, design, and anything the other passes would miss."}
+      - {name: tests, focus: "Focus on the tests: isolation, order dependence, global state, resource leaks, and whether they prove the change."}
+      - {name: security, focus: "Focus on security: secrets, untrusted input reaching a shell, SQL or path, permissions, and roles."}
+      - {name: migrations, focus: "Focus on schema and config migrations: rollback safety, indexes versus queries, defaults, and restart keys."}
+
+prompt:
+  checklist_file: review-checklist.yaml   # relative paths resolve against this file; use an absolute path once copied elsewhere
+  require_evidence: true                 # a blocking finding without quoted evidence found in the diff or file becomes a note
+  project_rules:                         # trusted instructions, added to both tiers' system prompt
+    - "TDD: every change ships with a test that fails without it."
+    - "No mocks, stubs, or fakes in tests; use real dependencies."
+    - "Configuration is YAML only; no environment variables."
+    - "Every Postgres schema change needs a migration; queries are parameterized only."
+    - "Strict typing: TypeScript has no `any`; Scala 3 uses immutable data."
+    - "Prefer MessagePack or Protobuf over JSON for API traffic."
+    - "No secrets or passwords in the repo, logs, or errors."
+    - "Mass tolerances are written in mDa or Da, never ppm."
+    - "Every changed default or new config key is documented in CHANGELOG with its rollback."
+    - "A new restart-required config key is listed where the restart keys are enumerated."
+
+replay:
+  clones: []                             # [{repo: OWNER/NAME, path: ~/clone}] per-repo clones for replay; else `clone`
 
 backends:
   gateway:                               # the OpenAI-compatible call of ai-review.py; same keys as its `reviewer:`

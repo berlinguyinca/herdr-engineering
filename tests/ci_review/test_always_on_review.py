@@ -128,7 +128,8 @@ if name == "claude":
     sys.stdout.write(json.dumps({"is_error": cfg.get("is_error", False), "result": json.dumps(ans),
                                  "structured_output": ans if isinstance(ans, dict) else None,
                                  "total_cost_usd": 0.5, "usage": cfg.get("usage", {"input_tokens": 10, "output_tokens": 5}),
-                                 "modelUsage": {"claude-opus-5-5": {}}}))
+                                 "modelUsage": {"claude-opus-5-5": {}},
+                                 **({"num_turns": cfg["num_turns"]} if "num_turns" in cfg else {})}))
 else:
     sys.stdout.write(ans if isinstance(ans, str) else json.dumps(ans))
 '''

@@ -6,10 +6,10 @@ fixture findings files from tests/ci_review/fixtures. Nothing here calls a model
 """
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import sys
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -31,7 +31,7 @@ def _ta():
 
 
 TA = _ta()
-load, block, APPROVE, REPO = TA.load, TA.block, TA.APPROVE, TA.REPO
+load, block, APPROVE, REPO = functools.cache(TA.load), TA.block, TA.APPROVE, TA.REPO
 
 
 @pytest.fixture
@@ -175,7 +175,7 @@ def test_claude_is_told_to_read_callers_tests_and_schemas_before_the_verdict(env
     env.review("tier2")
     s = system_of(env.reviewer_calls()[0]).lower()
     assert "callers of every changed function" in s and "existing tests" in s and "migrations" in s
-    assert "not from the diff alone" in s
+    assert "judge from the diff alone" in s
 
 
 def test_pi_prompt_has_no_claude_investigation_orders(env):
@@ -818,6 +818,7 @@ def test_reviews_jsonl_keeps_the_findings_capped_and_redacted(env):
     many = [{"file": "src/a.py", "line": i + 1, "severity": "note", "category": "code", "why": "n" * 700,
              "evidence": "", "how_it_fails": ""} for i in range(25)]
     first = {**block()["findings"][0], "why": "key " + TA.SECRET + " leaked", "evidence": "return eval(x)"}
+    env.mod.ai.REDACT.add(TA.SECRET)             # what the pi backend does when it reads its key
     env.reviewer("claude", answer={**block(), "findings": [first, *many]})
     assert env.review("tier2") == 0
     rec = logs(env)[0]

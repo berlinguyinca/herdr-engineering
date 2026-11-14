@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Review prompt v2: rules, checklist, evidence, passes, replay harness (always-on-review.py)
+
+- New YAML keys: `prompt.project_rules` (trusted rules in both tiers' prompt), `prompt.checklist_file` (`deploy/ci-review/review-checklist.yaml`, validated, the reviewer lists the ids it considered in `checked_items`), `prompt.require_evidence` (default true), `tiers.tier2.passes` (the example ships general, tests, security, migrations; unset or `[]` keeps one unfocused review) and `replay.clones`. The claude prompt now tells the reviewer to read callers, tests and migrations before the verdict.
+- Findings gain `evidence` and `how_it_fails`; the script downgrades a blocking finding to a note when its evidence is absent from the diff and the file at the pinned head. Old-shape answers still validate. `reviews.jsonl` lines gain `downgraded`, per-pass `passes`, `checked_items` and a capped, redacted `findings` array.
+- New `replay --corpus DIR --tier tier1|tier2` (never posts, resumable, one at a time), `replay compare A B` and `corpus build --repo --since --out` (read-only `gh`). Two seed cases in `tests/ci_review/corpus/`.
+- Default change: with the shipped example config tier 2 now makes four sequential claude runs, so cost and time per review rise about fourfold. Rollback: set `tiers.tier2.passes: []`, `prompt.require_evidence: false`, `prompt.project_rules: []`, drop `checklist_file`. Restart: the polling service reads the config at start, so restart it after editing.
+
 ### Always-on review: two tiers, claude and pi backends (dry-run by default)
 
 - New `deploy/ci-review/always-on-review.py` builds on `ai-review.py`: tier 1 `Open-weight pre-review` (advisory, pi) and tier 2 `Opus agent review` (claude, only for heads with all gates green), pluggable `gateway` / `claude` / `pi` backends chosen in YAML only, strict verdict parsing, one review per head SHA, cooldown, time cap, detached read-only worktree, scrubbed environment. Posting needs `post: true` in config and `--post`. Nothing is installed or enabled; added example config, systemd --user service/timer and a herdr pane tail script. `ai-review.py` gained an optional schema argument on `Gateway.chat` and `Gh.check_runs`.

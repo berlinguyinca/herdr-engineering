@@ -160,6 +160,15 @@ Backends (`tiers.<t>.backend`, settings under `backends.<name>`):
   strings only: other secrets are NOT covered), and a tier that uses pi with `comment: true` is refused unless
   `backends.pi.wrapper` is set (for example a `bwrap` prefix). Statuses and `reviews.jsonl` are redacted the same way.
 
+### Review prompt v2, passes, evidence and replay
+
+- `prompt.project_rules` (list of strings) and `prompt.checklist_file` (`review-checklist.yaml`: categories code, security, tests, docs, performance, migrations; each item an `id` and a one-line `question`; unknown keys refused) go into both tiers' system prompt. The reviewer names the ids it considered in `checked_items`.
+- Evidence rule: a blocking finding carries `evidence` (text quoted from the diff or the file) and `how_it_fails`. The script, not the model, downgrades it to a note when the evidence is missing or not found (whitespace-normalised) in the diff or in the file at the pinned head. Disable with `prompt.require_evidence: false`.
+- `tiers.tier2.passes: [{name, focus}]`: one claude run per pass, in order, focus appended to the prompt; findings are merged (deduped by file, line and category) and any surviving blocker blocks. The time cap and the one-review lock cover the whole review. `passes: []` or one pass behaves like a single review.
+- `reviews.jsonl`: each completed review line has `downgraded`, `passes` (name, duration_s, cost_usd, turns when the backend reports them), `checked_items`, and `findings`: up to 20 of `file, line, severity, category, why, evidence, how_it_fails`, each text field cut at 600 chars and passed through `redact()`.
+- Replay: `always-on-review.py replay --corpus DIR --tier tier1|tier2 --config YAML [--limit N] [--out FILE]` checks out each case's head in a detached worktree, runs the tier read-only and posts nothing (no gh client is built; posting functions refuse inside replay). The corpus is one JSON per case: `{repo, pr, head_sha, base_sha?, source: opus|human|revert|follow-up-fix, notes, ground_truth: [{id, file, line|null, category, summary, severity, confirmed?}], known_false_claims?}`. Scoring: FOUND (same file and line within 10, or two shared keywords), PARTIAL (file only), MISSED; a blocking finding matching no ground truth is FALSE_BLOCKER_CANDIDATE (unconfirmed), one matching a known false claim is FALSE_BLOCKER. The report gives per-case and aggregate recall, false-blocker rate, per-category recall, cost and duration. `replay compare a.json b.json` compares two runs.
+- Intended corpus: thousands of PRs across the org's repos. Replay is resumable (cases already scored in `--out` are skipped, failed ones retried) and runs one case at a time (a lock refuses a second replay). `corpus build --repo OWNER/NAME --since YYYY-MM-DD --out DIR` derives cases from merged PRs with read-only `gh` calls (reverts, follow-up fixes, review comments); its ground truth is `confirmed: false` and is not scored until confirmed.
+
 ### Choosing a pi model or alias
 
 pi "aliases" are the gateway aliases listed as model entries under a provider in `~/.pi/agent/models.json` (for
