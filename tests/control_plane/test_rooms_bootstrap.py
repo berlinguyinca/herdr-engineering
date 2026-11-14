@@ -201,21 +201,33 @@ def test_bridge_group_match_is_exact():
     assert not rb.has_group({"json": {"groups": [], "other": [{"name": "tui-smoke"}]}})
 
 
-def test_expired_agents_are_replaced_and_granted(short_ttl_stack, capsys):
+def test_expired_agents_are_renewed_in_place_and_keep_their_grants(short_ttl_stack, capsys):
     stack = short_ttl_stack
     host = f"127.0.0.1:{stack.op}"
     rc, out = run_main(stack, capsys)
     assert rc == 0 and len(created(out)) == 5, out
+    before = {a["name"]: a["agent_id"] for a in call(stack.op, "GET", f"{BASE}/agents", host=host)[1]["agents"]}
     time.sleep(2.5)                                          # past remote_credential_ttl
     rc, out = run_main(stack, capsys)
     assert rc == 0 and "FAIL" not in out, out
-    assert [ln.split()[1] for ln in created(out)] == ["agent", "agent", "membership", "membership"]
+    assert created(out) == [] and "REMOVED" not in out      # no new agent, no new membership
+    assert sorted(ln for ln in out.splitlines() if ln.startswith("RENEWED")) == [
+        "RENEWED agent tui-smoke-a", "RENEWED agent tui-smoke-b"]
+    assert "hca_" not in out                                 # the new credential is never printed
     agents = call(stack.op, "GET", f"{BASE}/agents", host=host)[1]["agents"]
+    assert {a["name"]: a["agent_id"] for a in agents} == before          # same ids: nothing was created
     live = {a["agent_id"] for a in agents if rb.is_active(a)}
     room = call(stack.op, "GET", f"{BASE}/rooms", host=host)[1]["rooms"][0]
     members = call(stack.op, "GET", f"{BASE}/rooms/{room['room_id']}/agents", host=host)[1]["agents"]
     assert len(live) == 2 and {m["agent_id"] for m in members} == live
     assert rb.is_noop(rb.current(rb.Http(stack.url))[0])
+
+
+def test_dry_run_says_renew_for_an_expired_agent(short_ttl_stack, capsys):
+    run_main(short_ttl_stack, capsys)
+    time.sleep(2.5)
+    rc, out = run_main(short_ttl_stack, capsys, "--dry-run")
+    assert rc == 0 and "WOULD renew agent tui-smoke-a" in out and "RENEWED" not in out, out
 
 
 def test_verify_fails_when_a_member_is_not_a_live_agent(short_ttl_stack, capsys):
