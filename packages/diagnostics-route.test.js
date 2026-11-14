@@ -10,22 +10,37 @@ import { createDiagnosticsSource } from './diagnostics-source.js';
 const APP = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
 const NAV_AT = APP.indexOf('const NAV = [');
 const navPaths = [...APP.slice(NAV_AT, APP.indexOf('];', NAV_AT)).matchAll(/\bpath:\s*'([^']+)'/g)].map((m) => m[1]);
-// Every page the sidebar listed before the diagnostics route existed; the delta adds a link and rewrites nothing.
+// Every page the sidebar listed before the diagnostics route existed; the delta adds no sidebar row and rewrites nothing.
 const BEFORE = ['/overview', '/attention', '/herd', '/collab', '/personal-assistant', '/teams', '/team-map', '/hosts', '/services',
   '/llm', '/ci', '/reviews', '/github', '/architecture', '/artifacts', '/memory', '/intelligence'];
 // Pages main gained between H07 being written and this series landing. They are named rather than tolerated:
 // the assertion stays "nothing was added, dropped, renamed or moved out of NAV" and only grows deliberately.
 const ADDED_ON_MAIN_SINCE_H07 = ['/settings'];
+const SECTION_AT = APP.indexOf('const SECTION_TABS = [');
+const sectionBlock = APP.slice(SECTION_AT, APP.indexOf('];', SECTION_AT));
+const hostsRow = sectionBlock.split('\n').find((line) => line.includes("'/hosts', 'Hosts'")) || '';
 const event = (id, at, over = {}) => Object.freeze({ id, missionKey: 'm1', at, eventType: 'error', ...over });
 const feed = (value) => { const calls = []; return { calls, fn: async () => { calls.push(1); if (value instanceof Error) throw value; return value; } }; };
 // The mount only writes markup, so a plain object is the whole container: no DOM is needed to read what a page shows.
 const mount = async (source) => { const el = { innerHTML: '' }; const returned = await mountDiagnostics(el, { source }); return { html: el.innerHTML, returned }; };
 
-test('no navigation regression: every page listed before H07 is still a NAV entry and /diagnostics is the only addition', () => {
+// The sidebar is in EVERY dashboard screenshot the ui-gates compare (docs/operations/ui-gates.md): the five
+// captured surfaces are full-page captures of #/missions and #/personal-assistant, so one new sidebar row
+// re-baselines all of them at desktop light and dark, and the row count is already tight enough that a
+// content change on Missions overflows a phone (pipeline 1243). Diagnostics describes hosts, so it is a tab
+// of the Hosts section instead: one click from every Hosts page, highlighted in the sidebar with them, and
+// the Hosts section has no committed baselines at all, so no captured surface moves.
+test('no navigation regression: the sidebar lists exactly what it listed before H07, and Diagnostics is a Hosts tab', () => {
   for (const page of BEFORE) assert.ok(navPaths.includes(page), `NAV no longer lists ${page}`);
-  assert.deepEqual([...navPaths].sort(), [...BEFORE, '/diagnostics', ...ADDED_ON_MAIN_SINCE_H07].sort());   // 17 unchanged + the diagnostics link + what main added since
-  assert.match(APP, /\{ group: 'Fabric', path: '\/diagnostics', label: 'Diagnostics' \},\n/);
-  assert.ok(APP.indexOf("'/diagnostics', label: 'Diagnostics'") > APP.indexOf("'/services', label: 'Services'"));   // the new link sits after /services
+  assert.deepEqual([...navPaths].sort(), [...BEFORE, ...ADDED_ON_MAIN_SINCE_H07].sort());   // 17 unchanged + what main added since, nothing else
+  assert.ok(!navPaths.includes('/diagnostics'), 'a sidebar row for /diagnostics would move every captured dashboard surface');
+  // The sidebar marks Hosts as the current page while the operator reads diagnostics, the same way it does
+  // for /scheduling, /ai-sync and /build-cache.
+  assert.match(APP, /\{ group: 'Fabric', path: '\/hosts', label: 'Hosts', match: \[[^\]]*'\/diagnostics'[^\]]*\] \},/);
+  // ...and the tab strip of that section offers it, which is what makes the route reachable by clicking.
+  assert.match(hostsRow, /\['\/diagnostics', 'Diagnostics'\]/);
+  // KNOWN_PAGES is built from NAV and SECTION_TABS together, so a tab is a page the shell knows.
+  assert.match(APP, /const KNOWN_PAGES = new Set\(\[\.\.\.NAV\.flatMap\(.*\.\.\.SECTION_TABS\.flat\(\)\.map\(\(\[p\]\) => p\)\]\)/);
 });
 
 test('the route is wired: app.js imports the mount and routes the /diagnostics path over the feeds that already exist', () => {
