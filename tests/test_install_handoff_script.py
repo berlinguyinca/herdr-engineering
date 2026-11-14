@@ -252,7 +252,10 @@ def test_the_path_link_never_points_the_entrypoint_at_itself(tmp_path):
     assert shim.is_file() and not shim.is_symlink(), result.stdout + result.stderr
     assert shim.read_text() == "#!/bin/sh\necho 0.0.0\n", result.stdout + result.stderr
     assert "already reports 0.0.0" in result.stdout, result.stdout + result.stderr
-    assert f"attested: {uv_bin / 'herdr-handoff'} reports 0.0.0" in result.stdout, result.stdout
+    # The line says what was proven: the version the entry reports, and the tree that declares it. It never
+    # claims the revision behind the entry was checked, because a CLI from an older commit can still declare
+    # the same version (issue #802).
+    assert f"attested: {uv_bin / 'herdr-handoff'} reports version 0.0.0, which the pinned tree" in result.stdout, result.stdout
 
 
 def _fake_python(tmp_path, body):
@@ -387,7 +390,7 @@ def test_a_cli_pip_installed_into_the_path_directory_is_attested_not_replaced(tm
     entry = link_dir / "herdr-handoff"
     assert entry.is_file() and not entry.is_symlink(), (result.stdout, result.stderr)
     assert "already reports 0.0.0" in result.stdout, result.stdout
-    assert f"attested: {entry} reports 0.0.0 (pinned revision {sha})" in result.stdout
+    assert f"attested: {entry} reports version 0.0.0, which the pinned tree {sha} declares" in result.stdout, result.stdout
     assert list(link_dir.iterdir()) == [entry], list(link_dir.iterdir())   # nothing moved aside
 
 

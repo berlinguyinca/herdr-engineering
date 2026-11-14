@@ -118,7 +118,7 @@ if [ -n "$REPO" ]; then
   [ -f "$REPO/install/install.sh" ] || { printf '%s has no install/install.sh\n' "$REPO" >&2; exit 1; }
   # A local checkout is honoured as-is, so say which revision it actually is: "installed from a local
   # repo" without a SHA is how a machine ends up quietly behind the pin.
-  have="$(git -C "$REPO" rev-parse -q --verify HEAD^{commit} 2>/dev/null || printf unknown)"
+  have="$(git -C "$REPO" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null || printf unknown)"
   printf 'pin: %s\nresolved: %s\nrepo: %s\n' "$REF" "$have" "$REPO"
   [ "$have" = "$REF" ] || printf '  warning: %s is not the pinned revision %s\n' "$have" "$REF" >&2
 else
@@ -320,9 +320,11 @@ if [ "$PATH_LINK" = 1 ] && [ "$SKILLS_ONLY" = 0 ]; then
     printf 'path: %s -> %s\n' "$destination" "$chosen"
   fi
   # Attestation.  An older CLI answering --version from PATH is the exact failure this step exists to
-  # catch, and a link alone does not disprove it.  What is proven here is the version the entrypoint
-  # reports; the revision it came from is the one fetched above, and both are printed so a reader can see
-  # which is which.
+  # catch, and a link alone does not disprove it.  What is proven here is only the version the entrypoint
+  # reports — the revision of the code behind it is never read, so a CLI built from an older commit that
+  # still declares this version passes this check.  The line below says exactly that much; closing the gap
+  # itself (a provenance sidecar written at install time and required before the word "attested") is
+  # issue #802.
   [ -x "$destination" ] || { printf '%s is still not executable\n' "$destination" >&2; exit 1; }
   got_version="$("$destination" --version 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
   if [ "$got_version" != "$expected_version" ]; then
@@ -332,5 +334,5 @@ if [ "$PATH_LINK" = 1 ] && [ "$SKILLS_ONLY" = 0 ]; then
     printf 'the symlink, the directory name and the pip log; remove or replace it, or run --migrate-copies.\n' >&2
     exit 1
   fi
-  printf 'attested: %s reports %s (pinned revision %s)\n' "$destination" "$got_version" "$REF"
+  printf 'attested: %s reports version %s, which the pinned tree %s declares\n' "$destination" "$got_version" "$REF"
 fi
