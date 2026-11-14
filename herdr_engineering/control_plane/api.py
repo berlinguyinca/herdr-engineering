@@ -1555,7 +1555,7 @@ class ControlPlaneServer:
 
     def _dispatch_native_message(self, record, message, artifact_ids):
         from ..errors import InvalidError
-        from ..herdr_adapter import NativeHerdrAdapter
+        from ..herdr_adapter import NativeHerdrAdapter, confirm_recipient
 
         if artifact_ids:
             if not all(isinstance(aid, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,200}', aid)
@@ -1586,9 +1586,12 @@ class ControlPlaneServer:
         prompt_target = matches[0].pane_id or target
         operation_id = record.get("communication_operation_id")
         if operation_id:
-            return adapter.send_input(prompt_target, message, machine=machine, session=server,
-                                      operation_id=operation_id)
-        return adapter.send_input(prompt_target, message, machine=machine, session=server)
+            delivery = adapter.send_input(prompt_target, message, machine=machine, session=server,
+                                          operation_id=operation_id)
+        else:
+            delivery = adapter.send_input(prompt_target, message, machine=machine, session=server)
+        confirm_recipient(record, delivery)
+        return delivery
 
     def _canonical_person(self, tenant, user):
         """Single-operator rule (RakazoBridge.canonical_person); identity when there is no bridge."""
@@ -3370,6 +3373,10 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 return self._send_json(403, {"error": "not permitted to modify this lineage object",
                                              "reason": "lineage_forbidden"})
             except ValueError as exc:
+                if resource == "ingest":
+                    from .communications import InvalidObservation
+                    if isinstance(exc, InvalidObservation):
+                        return self._send_json(400, {"error": str(exc), "code": "invalid_communication_observation"})
                 if getattr(exc, "code", None) == "not_found":
                     return self._send_json(404, {"error": "not found"})
                 message = "Invalid GitHub query." if resource == "github" else str(exc)

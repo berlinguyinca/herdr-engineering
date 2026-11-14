@@ -63,7 +63,7 @@ def test_ingestion_replay_is_idempotent_and_does_not_mutate_sessions(tmp_path):
         ("text", "a" * 17000),
         ("reported_at", float("inf")),
         ("reported_at", 1e300),
-        ("sender", {"unexpected": "payload"}),
+        ("sender", "not-an-object"),
     ],
 )
 def test_invalid_observation_is_rejected_before_recording(tmp_path, field, value):
@@ -173,6 +173,12 @@ def test_authenticated_real_http_offline_queue_replay(tmp_path):
         with pytest.raises(urllib.error.HTTPError) as refusal:
             urllib.request.urlopen(url + "/api/v1/communications")
         assert refusal.value.code == 401
+        wrong = tmp_path / "wrong-key"
+        wrong.write_text("not-the-ingest-key")
+        with pytest.raises(urllib.error.HTTPError) as denied:
+            sync(box, url, wrong)
+        assert denied.value.code == 401
+        assert len(box.pending()) == 1 and box.rejected() == []
         assert sync(box, url, key, max_seconds=0) == 0
         assert len(box.pending()) == 1
         assert sync(box, url, key) == 1
@@ -184,6 +190,23 @@ def test_authenticated_real_http_offline_queue_replay(tmp_path):
             body = json.load(response)
         assert body["communications"][0]["operation_id"] == payload["operation_id"]
         assert body["communications"][0]["status"] == "delivered"
+        from herdr_engineering.communications import permanent_rejection
+
+        invalid = {**payload, "route": "not a route"}
+        request = urllib.request.Request(
+            url + "/api/v1/ingest",
+            data=json.dumps(envelope(invalid)).encode(),
+            headers={"Content-Type": "application/json", "X-API-Key": key.read_text()},
+        )
+        with pytest.raises(urllib.error.HTTPError) as bad:
+            urllib.request.urlopen(request)
+        assert bad.value.code == 400
+        assert permanent_rejection(400, json.loads(bad.value.read())) is True
+        assert (
+            permanent_rejection(400, {"error": "entity type is not accepted by generic ingestion"})
+            is False
+        )
+        assert permanent_rejection(401, {"code": "invalid_communication_observation"}) is False
         from herdr_engineering.communications import main
 
         config = tmp_path / "config.json"
@@ -206,9 +229,7 @@ def test_authenticated_real_http_offline_queue_replay(tmp_path):
         ("record_id", 5),
         ("truncated", "true"),
         ("route", "--machine mac"),
-        ("recipient", {"agent_session": "not an object"}),
-        ("recipient", {"pane_id": 5}),
-        ("recipient", {"name": "x" * 4100}),
+        ("recipient", "not-an-object"),
     ],
 )
 def test_invalid_identity_and_bounds_are_refused(tmp_path, field, value):
@@ -216,6 +237,62 @@ def test_invalid_identity_and_bounds_are_refused(tmp_path, field, value):
     payload[field] = value
     with pytest.raises(ValueError):
         IngestService(ControlPlaneRepo()).ingest(envelope(payload))
+
+
+def test_bad_identity_metadata_does_not_block_the_message(tmp_path):
+    repo = ControlPlaneRepo()
+    payload = observation(tmp_path)
+    payload["recipient"] = {"pane_id": "w1:p2", "agent_session": None, "name": None, "future": True}
+    IngestService(repo).ingest(envelope(payload))
+    assert communication_page(repo)["communications"][0]["recipient"] == {"pane_id": "w1:p2"}
+
+
+def test_one_bad_record_is_rejected_and_later_good_records_replay(tmp_path):
+    repo = ControlPlaneRepo()
+    server = ControlPlaneServer(repo, api_key="test-ingestion-key")
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    server.wait_until_ready()
+    key = tmp_path / "key"
+    key.write_text("test-ingestion-key")
+    payload = observation(tmp_path)
+    box = Outbox(tmp_path / "outbox.sqlite")
+    # Retire the helper's first row, then enqueue an actual malformed payload ahead of a valid one.
+    box.acknowledge(payload["record_id"])
+    box.put("bad", "queued", {**payload, "route": "invalid route"})
+    box.put(
+        "good",
+        "queued",
+        {**payload, "recipient": {"pane_id": "w1:p2", "name": None, "agent_session": None}},
+    )
+    try:
+        assert sync(box, f"http://127.0.0.1:{server.port}", key) == 1
+        assert box.pending() == []
+        assert len(box.rejected()) == 1
+        assert communication_page(repo)["communications"][0]["operation_id"] == "good"
+    finally:
+        server.shutdown()
+
+
+def test_ingestion_is_independent_of_an_inflight_dashboard_send(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    repo = ControlPlaneRepo()
+    payload = observation(tmp_path)
+    started = threading.Event()
+
+    def ingest():
+        started.set()
+        return IngestService(repo).ingest(envelope(payload))
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        with repo._command_lock:
+            future = pool.submit(ingest)
+            assert started.wait(2)
+            assert future.result(timeout=2)["entity_id"] == payload["operation_id"]
+    finally:
+        pool.shutdown(wait=True)
 
 
 def test_remote_or_ambiguous_identity_never_links_to_local_session(tmp_path):

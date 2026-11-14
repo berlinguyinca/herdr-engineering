@@ -370,6 +370,9 @@ class IngestService:
             self._check_reserved_nodes(env, event_type, payload)
             self._check_evidence_namespace(env, event_type, payload)
         self._prevalidate(entity_type, entity_id, payload, event_type, source)
+        if entity_type == "communication":
+            from .communications import validate_observation
+            payload = validate_observation(entity_id, event_type, payload)
         if env is None:
             return self._dispatch(entity_type, entity_id, event_type, payload, source)
         env["entity_type"] = entity_type

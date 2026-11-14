@@ -6,10 +6,22 @@ import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
 from herdr_engineering.communications import Outbox, delivery_status, parse_prompt
+
+
+def _native_binary() -> str | None:
+    native = shutil.which("herdr")
+    if native:
+        path = Path(native)
+        retained = path.with_name(path.name + ".native-untracked")
+        with path.open("rb") as executable:
+            if executable.read(2) == b"#!" and retained.is_file():
+                return str(retained)
+    return native
 
 
 @pytest.mark.parametrize(
@@ -52,6 +64,7 @@ def test_receipts_are_truthful():
 def test_timeout_or_signal_is_not_proof_that_a_prompt_was_not_delivered():
     assert delivery_status(1, b"", b'{"error":{"code":"timeout"}}') == "unknown"
     assert delivery_status(-15, b"") == "unknown"
+    assert delivery_status(2, b"usage or another unrecognized output") == "unknown"
     assert delivery_status(1, b"", b'{"error":{"code":"agent_not_found"}}') == "failed"
 
 
@@ -100,6 +113,26 @@ def test_receipt_recipient_comes_from_the_actual_native_acknowledgement():
     assert receipt_recipient(b"not JSON") == {}
     assert receipt_recipient(b'{"result": "wrong"}') == {}
     assert receipt_recipient(b'{"result":{"agent":[]}}') == {}
+
+
+def test_nullable_native_identity_fields_are_not_persisted_or_uploaded(tmp_path):
+    from herdr_engineering.communications import receipt_recipient
+
+    raw = b'{"result":{"agent":{"pane_id":"w1:p1","name":null,"agent_session":null}}}'
+    assert receipt_recipient(raw) == {"pane_id": "w1:p1"}
+    box = Outbox(tmp_path / "audit.sqlite")
+    box.put(
+        "nullable",
+        "queued",
+        {
+            "text": "keep message",
+            "sender": {"name": None},
+            "recipient": {"pane_id": "w1:p1", "agent_session": None, "unrecognised": "ignore"},
+        },
+    )
+    row = box.pending()[0]
+    assert row["sender"] == {}
+    assert row["recipient"] == {"pane_id": "w1:p1"}
 
 
 @pytest.mark.parametrize(
@@ -154,11 +187,22 @@ def test_concurrent_writers_do_not_exceed_limit(tmp_path):
     assert len(Outbox(path).pending()) == 8
 
 
+def test_rejected_diagnostics_are_bounded_and_do_not_return_to_pending(tmp_path):
+    box = Outbox(tmp_path / "audit.sqlite")
+    for n in range(105):
+        box.put(str(n), "queued", {"text": "redacted diagnostic"})
+        box.reject(box.pending()[0]["record_id"], "client_validation")
+    assert box.pending() == []
+    assert len(box.rejected()) == 100
+    box.reject("already absent", "client_validation")
+    assert len(box.rejected()) == 100
+
+
 def test_real_native_cli_refusal_smoke(tmp_path):
     """The real installed binary refuses an absent target; it sends no message."""
     from herdr_engineering.communications import run_native
 
-    native = shutil.which("herdr")
+    native = _native_binary()
     if not native:
         pytest.skip("Real HerdR CLI is not installed on this runner")
     box = Outbox(tmp_path / "audit.sqlite")
@@ -173,7 +217,7 @@ def test_real_native_cli_refusal_smoke(tmp_path):
 def test_installation_preserves_native_passthrough_and_records_refusal(tmp_path):
     from herdr_engineering.communications import install, main
 
-    native = shutil.which("herdr")
+    native = _native_binary()
     if not native:
         pytest.skip("Real HerdR CLI is not installed on this runner")
     target = tmp_path / "herdr"
@@ -182,6 +226,7 @@ def test_installation_preserves_native_passthrough_and_records_refusal(tmp_path)
     config = tmp_path / "config.json"
     assert main(["install", "--native", str(target), "--config", str(config)]) == 0
     assert subprocess.check_output([target, "--version"]) == expected
+
     with pytest.raises(ValueError):
         install(target, config)
     with pytest.raises(ValueError):
@@ -199,11 +244,48 @@ def test_installation_preserves_native_passthrough_and_records_refusal(tmp_path)
     assert subprocess.check_output([target, "--version"]) == expected
 
 
+def test_installation_works_from_a_real_runtime_path_with_spaces(tmp_path):
+    from pathlib import Path
+
+    native = _native_binary()
+    if not native:
+        pytest.skip("Real HerdR CLI is not installed on this runner")
+    runtime = tmp_path / "persistent runtime with spaces"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(runtime)], check=True)
+    python = runtime / "bin/python"
+    target = tmp_path / "herdr"
+    shutil.copy2(native, target)
+    config = tmp_path / "config.json"
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    subprocess.run(
+        [
+            python,
+            "-m",
+            "herdr_engineering.communications",
+            "install",
+            "--native",
+            str(target),
+            "--config",
+            str(config),
+        ],
+        env=env,
+        check=True,
+    )
+    assert subprocess.check_output([target, "--version"], env=env) == subprocess.check_output(
+        [native, "--version"]
+    )
+    # Losing the optional audit runtime must leave the retained native binary usable.
+    runtime.rename(tmp_path / "runtime-retired")
+    assert subprocess.check_output([target, "--version"], env=env) == subprocess.check_output(
+        [native, "--version"]
+    )
+
+
 def test_adapter_uses_the_real_native_literal_argument_grammar():
     from herdr_engineering.errors import InvalidError
     from herdr_engineering.herdr_adapter import NativeHerdrAdapter
 
-    native = shutil.which("herdr")
+    native = _native_binary()
     if not native:
         pytest.skip("Real HerdR CLI is not installed on this runner")
     with pytest.raises(InvalidError) as refusal:
@@ -217,7 +299,7 @@ def test_adapter_uses_the_real_native_literal_argument_grammar():
 def test_unresolved_native_inventory_does_not_claim_an_observed_sender():
     from herdr_engineering.communications import _agent
 
-    native = shutil.which("herdr")
+    native = _native_binary()
     if not native:
         pytest.skip("Real HerdR CLI is not installed on this runner")
     assert _agent(native, [], "audit-target-does-not-exist") == {}
@@ -226,7 +308,7 @@ def test_unresolved_native_inventory_does_not_claim_an_observed_sender():
 def test_capture_uses_the_enrolled_host_identity_when_configured(tmp_path):
     from herdr_engineering.communications import run_native
 
-    native = shutil.which("herdr")
+    native = _native_binary()
     if not native:
         pytest.skip("Real HerdR CLI is not installed on this runner")
     box = Outbox(tmp_path / "audit.sqlite")
@@ -242,8 +324,47 @@ def test_capture_uses_the_enrolled_host_identity_when_configured(tmp_path):
     assert box.pending()[-1]["host_id"] == "mac.lan"
 
 
+def test_post_delivery_identity_check_refuses_replacement_and_absent_receipts():
+    from herdr_engineering.herdr_adapter import NativeDeliveryUnconfirmed, confirm_recipient
+
+    native = {"source": "herdr:claude", "kind": "id", "agent": "claude", "value": "expected"}
+    expected = {"terminal_id": "terminal-one", "agent_session": native}
+    good = {
+        "status": "delivered",
+        "receipt": {
+            "result": {
+                "agent": {
+                    "terminal_id": "terminal-one",
+                    "pane_id": "w1:p1",
+                    "agent_session": native,
+                }
+            }
+        },
+    }
+    confirm_recipient(expected, good)
+    with pytest.raises(NativeDeliveryUnconfirmed):
+        confirm_recipient(
+            expected,
+            {
+                "status": "delivered",
+                "receipt": {
+                    "result": {
+                        "agent": {
+                            "terminal_id": "terminal-one",
+                            "agent_session": {**native, "value": "replacement"},
+                        }
+                    }
+                },
+            },
+        )
+    with pytest.raises(NativeDeliveryUnconfirmed):
+        confirm_recipient(
+            expected, {"status": "delivered", "receipt": {"result": {"submitted": True}}}
+        )
+
+
 def test_failed_audit_storage_does_not_block_native_behavior(tmp_path):
-    native = shutil.which("herdr")
+    native = _native_binary()
     if not native:
         pytest.skip("Real HerdR CLI is not installed on this runner")
     config = tmp_path / "config.json"
@@ -284,7 +405,7 @@ def test_large_messages_are_explicitly_truncated_and_symlinks_refused(tmp_path):
 def test_main_status_and_native_paths_use_real_private_storage(tmp_path, capsys):
     from herdr_engineering.communications import main
 
-    native = shutil.which("herdr")
+    native = _native_binary()
     if not native:
         pytest.skip("Real HerdR CLI is not installed on this runner")
     config = tmp_path / "config.json"
@@ -331,7 +452,7 @@ def test_native_execution_failure_is_audited_and_storage_refusal_is_explicit(tmp
     assert box.pending()[-1]["status"] == "failed"
     with pytest.raises(ValueError):
         box.put("bad", "completed", {"text": "unknown status"})
-    native = shutil.which("herdr")
+    native = _native_binary()
     if native:
         full = Outbox(tmp_path / "full.sqlite", max_records=0)
         assert (
@@ -354,7 +475,20 @@ def test_offline_sync_retains_pending_observations(tmp_path):
     port = sock.getsockname()[1]
     sock.close()
     box = Outbox(tmp_path / "audit.sqlite")
-    box.put("offline", "queued", {"text": "keep"})
+    box.put(
+        "offline",
+        "queued",
+        {
+            "text": "keep",
+            "host_id": "test",
+            "sender": {},
+            "recipient": {},
+            "route": [],
+            "sender_origin": "unknown",
+            "channel": "herdr.agent.prompt",
+            "evidence_kind": "host_observation",
+        },
+    )
     key = tmp_path / "key"
     key.write_text("test-ingestion-key")
     with pytest.raises(OSError):
@@ -363,3 +497,14 @@ def test_offline_sync_retains_pending_observations(tmp_path):
     for url in ("file:///tmp/audit", "https://user:secret@example.test"):
         with pytest.raises(ValueError):
             sync(box, url, key)
+
+
+def test_real_native_inventory_uses_the_pinned_protocol():
+    from herdr_engineering.herdr_adapter import NativeHerdrAdapter
+
+    native = _native_binary()
+    if not native:
+        pytest.skip("Real HerdR CLI is not installed on this runner")
+    agents = NativeHerdrAdapter(herdr_bin=native).list_agents()
+    assert isinstance(agents, list)
+    assert all(agent.pane_id and agent.terminal_id for agent in agents)

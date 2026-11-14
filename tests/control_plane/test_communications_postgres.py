@@ -1,7 +1,11 @@
 """Actual Postgres durability/restart coverage, never a substituted database."""
 
 import asyncio
+import json
 import os
+import threading
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -75,3 +79,78 @@ def test_postgres_recovery_and_paginated_deduplication(tmp_path):
         history.close()
         if sink._conn:
             sink._run(sink._conn.close())
+
+
+def test_real_mirror_database_failure_does_not_break_primary_command_receipts(tmp_path, caplog):
+    from herdr_engineering.control_plane.api import ControlPlaneServer
+
+    dsn = os.environ.get("HERDR_COMMUNICATION_TEST_DSN")
+    if not dsn:
+        pytest.skip("Set HERDR_COMMUNICATION_TEST_DSN to a disposable herdr_comm_test database")
+    assert urlsplit(dsn).path.rsplit("/", 1)[-1].startswith("herdr_comm_test")
+
+    async def setup(block):
+        conn = await asyncpg.connect(dsn)
+        try:
+            await Migrator(conn).apply(
+                str(Path(__file__).parents[2] / "deploy/control-plane/migrations")
+            )
+            await conn.execute(
+                "ALTER TABLE fabric_events DROP CONSTRAINT IF EXISTS test_communication_mirror_refusal"
+            )
+            if block:
+                await conn.execute(
+                    "ALTER TABLE fabric_events ADD CONSTRAINT test_communication_mirror_refusal CHECK (entity_type <> 'communication') NOT VALID"
+                )
+        finally:
+            await conn.close()
+
+    asyncio.run(setup(True))
+    sink = DurableEventSink(dsn)
+    repo = ControlPlaneRepo(sink=sink)
+    sid = repo.create_session()
+    server = ControlPlaneServer(repo, api_key="test-ingestion-key")
+    thread = threading.Thread(target=server.serve, daemon=True)
+    thread.start()
+    server.wait_until_ready()
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.port}/api/v1/sessions/{sid}/messages",
+            data=json.dumps(
+                {
+                    "message": "No live target: refusal must stay a transport refusal",
+                    "operation_id": "mirror_" + uuid.uuid4().hex,
+                }
+            ).encode(),
+            headers={"Content-Type": "application/json", "X-API-Key": "test-ingestion-key"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as response:
+            urllib.request.urlopen(request)
+        assert response.value.code == 502
+        result = json.loads(response.value.read())
+        assert result["error"] == "transport_error"
+        assert result["status"] == "failed"
+        events = repo.stream("session", sid)
+        assert any(e["event_type"] == "SessionCommandQueued" for e in events)
+        assert events[-1]["event_type"] == "SessionCommandSettled"
+        assert events[-1]["payload"]["status"] == "failed"
+        # The exact same real database fault also cannot rewrite a durably saved successful receipt.
+        delivered = {
+            "operation_id": "delivered_" + uuid.uuid4().hex,
+            "status": "delivered",
+            "text": "receipt fixture",
+        }
+        repo.record_event(
+            "session", sid, "SessionCommandSettled", delivered, session_id=sid, require_durable=True
+        )
+        from herdr_engineering.control_plane.communications import record_command_safely
+
+        record_command_safely(repo, repo.get_session(sid), delivered)
+        assert delivered["status"] == "delivered"
+        assert repo.stream("session", sid)[-1]["payload"]["status"] == "delivered"
+        assert "communication mirror unavailable" in caplog.text
+    finally:
+        server.shutdown()
+        if sink._conn:
+            sink._run(sink._conn.close())
+        asyncio.run(setup(False))

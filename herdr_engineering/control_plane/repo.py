@@ -214,6 +214,7 @@ class ControlPlaneRepo:
         reported; every read presents the canonical name."""
         self._host_aliases = {str(k): str(v) for k, v in (host_aliases or {}).items() if k and v and k != v}
         self._command_lock = threading.RLock()
+        self._communication_lock = threading.RLock()
         self._event_lock = threading.RLock()
         self._usage_row_lock = threading.RLock()  # request_id dedupe + write must be atomic
         self._agent_projection_lock = threading.RLock()
@@ -743,11 +744,11 @@ class ControlPlaneRepo:
             try:
                 self.record_event("session", session_id, "SessionCommandQueued",
                                   dict(result), session_id=session_id, require_durable=True)
-                from .communications import record_command
-                record_command(self, session, result)
             except Exception:
                 result.update(status="failed", error="receipt_persistence_failed")
                 return result
+            from .communications import record_command_safely
+            record_command_safely(self, session, result)
             if dispatcher is None:
                 return result
             try:
@@ -760,14 +761,17 @@ class ControlPlaneRepo:
                 from .communications import command_failure_status
                 result.update(status=command_failure_status(exc), error="transport_error",
                               detail=redact_payload(str(exc)))
+                details = getattr(exc, "details", None)
+                if isinstance(details, dict) and isinstance(details.get("delivery"), dict):
+                    result["delivery"] = redact_payload(details["delivery"])
             try:
                 self.record_event("session", session_id, "SessionCommandSettled",
                                   _deep_copy(result), session_id=session_id, require_durable=True)
-                record_command(self, session, result)
             except Exception:
                 # The durable queued receipt prevents resending after restart.
                 result.update(status="queued", error="receipt_settlement_unknown")
                 return result
+            record_command_safely(self, session, result)
             if result["status"] == "delivered":
                 session["messages"] += 1
                 session["updated_at"] = self._stamp()

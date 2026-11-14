@@ -473,17 +473,17 @@ def test_default_native_dispatch_checks_conversation_before_prompt(monkeypatch):
             calls.append(args)
             if args[-2:] == ["api", "snapshot"]:
                 return json.dumps({"ok": True, "result": {"snapshot": {"agents": [{
-                    "agent": "pi", "terminal_id": "term-1", "agent_session": conversation,
+                    "agent": "pi", "terminal_id": "term-1", "pane_id": "w1:p1", "agent_session": conversation,
                     "agent_status": "idle", "interactive_ready": True,
                 }]}}})
-            return '{"ok": true, "result": {"submitted": true}}'
+            return json.dumps({"result":{"type":"agent_prompted","agent":{"terminal_id":"term-1","pane_id":"w1:p1","agent_session":conversation}}})
     adapter = NativeHerdrAdapter(runner=Runner())
     monkeypatch.setattr("herdr_engineering.herdr_adapter.NativeHerdrAdapter", lambda: adapter)
     record = {"host_id": "beast", "machine": "machine-beast", "herdr_session": "eng",
               "terminal_id": "term-1", "agent_session": dict(conversation)}
     receipt = ControlPlaneServer._dispatch_native_message(None, record, "literal hello", [])
     assert receipt["status"] == "delivered"
-    assert calls[-1] == ["--machine", "machine-beast", "--session", "eng", "agent", "prompt", "term-1", "literal hello"]
+    assert calls[-1] == ["--machine", "machine-beast", "--session", "eng", "agent", "prompt", "w1:p1", "literal hello"]
     record["agent_session"] = {**conversation, "value": "/tmp/different-session.jsonl"}
     from herdr_engineering.errors import InvalidError
     with pytest.raises(InvalidError, match="identity changed"):

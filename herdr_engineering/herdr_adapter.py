@@ -28,6 +28,19 @@ class NativeDeliveryUnconfirmed(InvalidError):
     """The native invocation ended without proof of delivery or refusal."""
 
 
+def confirm_recipient(expected: dict[str, object], delivery: dict[str, object]) -> None:
+    """Native 0.9.1 has no atomic expected-conversation prompt selector."""
+    from .communications import receipt_recipient
+    actual = receipt_recipient(json.dumps(delivery.get("receipt", {})).encode())
+    conversation = expected.get("agent_session")
+    terminal = expected.get("terminal_id")
+    if (not isinstance(conversation, dict) or not conversation.get("value")
+            or not isinstance(terminal, str) or not terminal
+            or actual.get("agent_session") != conversation or actual.get("terminal_id") != terminal):
+        raise NativeDeliveryUnconfirmed("native recipient changed or could not be confirmed; do not automatically retry",
+                                       details={"delivery": delivery})
+
+
 @dataclass
 class Machine:
     id: str

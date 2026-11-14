@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import math
 import re
 from typing import TYPE_CHECKING, cast
@@ -34,6 +35,10 @@ FIELDS = frozenset(
 )
 
 
+class InvalidObservation(ValueError):
+    """A permanently malformed observation, distinct from auth/version outages."""
+
+
 def validate_observation(
     identity: str, event_type: str, payload: dict[str, object], *, trusted: bool = False
 ) -> dict[str, object]:
@@ -42,62 +47,47 @@ def validate_observation(
         or payload.get("operation_id") != identity
         or set(payload) - FIELDS
     ):
-        raise ValueError("invalid communication operation")
+        raise InvalidObservation("invalid communication operation")
     status = payload.get("status")
     if (
         not isinstance(status, str)
         or status not in STATUSES
         or event_type != "communication." + status
     ):
-        raise ValueError("invalid communication status")
+        raise InvalidObservation("invalid communication status")
     if payload.get("evidence_kind") != ("server_receipt" if trusted else "host_observation"):
-        raise ValueError("host observations cannot assert server authority")
+        raise InvalidObservation("host observations cannot assert server authority")
     text = payload.get("text")
     if not isinstance(text, str) or len(text.encode()) > 16 * 1024:
-        raise ValueError("communication text exceeds 16 KiB")
+        raise InvalidObservation("communication text exceeds 16 KiB")
     for key in ("record_id", "host_id", "sender_origin", "channel"):
         if not isinstance(payload.get(key), str) or len(str(payload[key])) > 300:
-            raise ValueError("invalid communication metadata")
+            raise InvalidObservation("invalid communication metadata")
     stamp = payload.get("reported_at")
     if (
         type(stamp) not in (int, float)
         or not math.isfinite(cast(float, stamp))
         or not 0 <= cast(float, stamp) <= 253402300799
     ):
-        raise ValueError("invalid observation time")
+        raise InvalidObservation("invalid observation time")
     if type(payload.get("truncated")) is not bool:
-        raise ValueError("invalid truncation flag")
+        raise InvalidObservation("invalid truncation flag")
     route = payload.get("route")
     if (
         not isinstance(route, list)
         or len(route) > 16
         or any(not isinstance(v, str) or len(v) > 1000 for v in route)
     ):
-        raise ValueError("invalid native route")
+        raise InvalidObservation("invalid native route")
+    from ..communications import normalize_party
+
+    clean = dict(payload)
     for name in ("sender", "recipient"):
         value = payload.get(name)
-        if not isinstance(value, dict) or set(value) - {
-            "pane_id",
-            "terminal_id",
-            "agent_session",
-            "agent",
-            "name",
-            "session_id",
-        }:
-            raise ValueError("invalid communication identity")
-        if len(json.dumps(value).encode()) > 4096:
-            raise ValueError("communication identity exceeds its bound")
-        for key, item in value.items():
-            if key == "agent_session":
-                if (
-                    not isinstance(item, dict)
-                    or set(item) - {"source", "agent", "kind", "value"}
-                    or any(not isinstance(v, str) for v in item.values())
-                ):
-                    raise ValueError("invalid native conversation identity")
-            elif not isinstance(item, str) or len(item) > 1000:
-                raise ValueError("invalid communication identity field")
-    return cast(dict[str, object], redact_payload(payload))
+        if value is not None and not isinstance(value, dict):
+            raise InvalidObservation("invalid communication identity")
+        clean[name] = normalize_party(value)
+    return cast(dict[str, object], redact_payload(clean))
 
 
 def record_observation(
@@ -105,7 +95,7 @@ def record_observation(
 ) -> bool:
     identity, status = str(payload.get("operation_id", "")), str(payload.get("status", ""))
     clean = validate_observation(identity, "communication." + status, payload, trusted=trusted)
-    with repo._command_lock:
+    with repo._communication_lock:
         for event in repo.stream("communication", identity):
             previous = event.get("payload", {})
             if (previous.get("evidence_kind"), previous.get("status"), previous.get("host_id")) == (
@@ -179,6 +169,18 @@ def record_command(
     )
 
 
+def record_command_safely(
+    repo: ControlPlaneRepo, session: dict[str, object], receipt: dict[str, object]
+) -> None:
+    """Secondary history cannot change the authoritative command's outcome."""
+    try:
+        record_command(repo, session, receipt)
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "communication mirror unavailable; primary session receipt retained"
+        )
+
+
 def decode_before(value: str | None) -> tuple[str, str] | None:
     if value is None:
         return None
@@ -214,10 +216,14 @@ def _rank(event: dict[str, object]) -> tuple[bool, bool, str, int]:
 
 
 def _link(
-    repo: ControlPlaneRepo, party: object, host: str, *, remote: bool = False
+    repo: ControlPlaneRepo,
+    party: object,
+    host: str,
+    sessions: list[dict[str, object]],
+    *,
+    remote: bool = False,
 ) -> dict[str, object]:
     identity = dict(party) if isinstance(party, dict) else {}
-    sessions = repo.list_sessions()
     # A remote route is not proof that the recipient lives on the reporting host.
     if remote:
         identity.pop("session_id", None)
@@ -275,6 +281,7 @@ def communication_page(
         candidates.sort(key=lambda e: (e["communication_started"], e["entity_id"]), reverse=True)
         candidates = candidates[: limit + 1]
     rows = []
+    sessions = repo.list_sessions()
     for event in candidates[:limit]:
         payload = cast(dict[str, object], redact_payload(event["payload"]))
         host = str(payload.get("host_id", ""))
@@ -284,11 +291,12 @@ def communication_page(
                 **payload,
                 "created_at": str(event["communication_started"]),
                 "recorded_at": str(event["ingest_timestamp"]),
-                "sender": _link(repo, payload.get("sender"), host),
+                "sender": _link(repo, payload.get("sender"), host, sessions),
                 "recipient": _link(
                     repo,
                     payload.get("recipient"),
                     host,
+                    sessions,
                     remote=any(
                         part.split("=", 1)[0] in {"--machine", "--remote"} for part in route
                     ),

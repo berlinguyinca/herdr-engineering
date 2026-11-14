@@ -72,3 +72,67 @@ test("invalid server data is rejected rather than presented as a communication",
     { communications: [], has_more: false, next_cursor: null },
   );
 });
+
+test("unresolved remote sessions remain identifiable from recorded native metadata", () => {
+  const html = renderCommunications([
+    {
+      operation_id: "remote",
+      status: "delivered",
+      text: "hello",
+      created_at: "",
+      sender: { pane_id: "w2:p1" },
+      recipient: {
+        agent: "claude",
+        terminal_id: "term-1",
+        agent_session: { value: "conversation-1" },
+      },
+      host_id: "mac.lan",
+      route: ["--machine", "bender"],
+      evidence_kind: "host_observation",
+      truncated: false,
+    },
+  ]);
+  assert.ok(html.includes("mac.lan"));
+  assert.ok(html.includes("conversation-1"));
+  assert.ok(html.includes("--machine bender"));
+  assert.ok(html.includes("w2:p1"));
+});
+
+test("native metadata is validated before display", () => {
+  const row = {
+    operation_id: "one",
+    status: "delivered",
+    text: "hello",
+    created_at: "",
+    sender: {},
+    recipient: {
+      terminal_id: "terminal-only",
+      agent_session: { value: "native-one" },
+    },
+    host_id: "mac.lan",
+    route: ["--machine", "bender"],
+    evidence_kind: "host_observation",
+    truncated: false,
+  };
+  const page = { communications: [row], has_more: false, next_cursor: null };
+  assert.equal(
+    parsePage(page).communications[0].recipient.agent_session.value,
+    "native-one",
+  );
+  for (const changed of [
+    { host_id: 5 },
+    { route: [5] },
+    { recipient: { terminal_id: 5 } },
+    { recipient: { agent_session: null } },
+    { recipient: { agent_session: { value: 5 } } },
+  ]) {
+    assert.throws(() =>
+      parsePage({ ...page, communications: [{ ...row, ...changed }] }),
+    );
+  }
+  assert.ok(
+    renderCommunications([
+      { ...row, recipient: { terminal_id: "terminal-only" } },
+    ]).includes("terminal-only"),
+  );
+});

@@ -9,12 +9,14 @@ import json
 import os
 import re
 import selectors
+import shlex
 import shutil
 import socket
 import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Iterator
@@ -29,6 +31,27 @@ MAX_RECORDS = 10_000
 MAX_BYTES = 64 * 1024 * 1024
 MAX_AGE = 14 * 86400
 STATUSES = frozenset({"queued", "delivered", "failed", "unknown"})
+
+
+def normalize_party(value: object) -> dict[str, object]:
+    """Keep usable identity hints; nullable/new native fields must not poison audit."""
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, object] = {
+        key: item
+        for key in ("pane_id", "terminal_id", "agent", "name", "session_id")
+        if isinstance(item := value.get(key), str) and 0 < len(item) <= 1000
+    }
+    session = value.get("agent_session")
+    if isinstance(session, dict):
+        clean = {
+            key: item
+            for key in ("source", "agent", "kind", "value")
+            if isinstance(item := session.get(key), str) and 0 < len(item) <= 1000
+        }
+        if len(clean) == 4 and clean["kind"] in {"id", "path"}:
+            result["agent_session"] = clean
+    return result
 
 
 def operation_identity(value: str) -> str:
@@ -115,7 +138,7 @@ def delivery_status(code: int, output: bytes, errors: bytes = b"") -> str:
             "agent_not_ready",
         }:
             refusal = True
-    if refusal or code == 2:  # CLI syntax rejection occurs before transport.
+    if refusal:  # Never infer nondelivery from an exit status alone.
         return "failed"
     return "unknown"
 
@@ -127,11 +150,7 @@ def receipt_recipient(output: bytes) -> dict[str, object]:
         result = body.get("result", {}) if isinstance(body, dict) else {}
         agent = result.get("agent", {}) if isinstance(result, dict) else {}
         if isinstance(agent, dict):
-            return {
-                key: agent[key]
-                for key in ("pane_id", "terminal_id", "agent_session", "agent", "name")
-                if key in agent
-            }
+            return normalize_party(agent)
     except (ValueError, UnicodeError):
         pass
     return {}
@@ -157,7 +176,11 @@ class Outbox:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS observations (id TEXT PRIMARY KEY, created REAL NOT NULL, body TEXT NOT NULL, bytes INTEGER NOT NULL)"
             )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS rejected (id TEXT PRIMARY KEY, created REAL NOT NULL, body TEXT NOT NULL, bytes INTEGER NOT NULL, reason TEXT NOT NULL)"
+            )
             db.execute("DELETE FROM observations WHERE created < ?", (time.time() - MAX_AGE,))
+            db.execute("DELETE FROM rejected WHERE created < ?", (time.time() - MAX_AGE,))
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -175,7 +198,11 @@ class Outbox:
         if status not in STATUSES:
             raise ValueError("invalid communication status")
         operation_id = operation_identity(operation_id)
-        record = cast(dict[str, object], redact_payload(data))
+        prepared = dict(data)
+        for name in ("sender", "recipient"):
+            if name in prepared:
+                prepared[name] = normalize_party(prepared[name])
+        record = cast(dict[str, object], redact_payload(prepared))
         text = str(record.get("text", "")).encode("utf-8")
         record["text"] = text[:MAX_TEXT].decode("utf-8", errors="ignore")
         record["truncated"] = len(text) > MAX_TEXT
@@ -191,7 +218,7 @@ class Outbox:
             if db.execute("SELECT 1 FROM observations WHERE id=?", (identity,)).fetchone():
                 return
             count, used = db.execute(
-                "SELECT count(*),coalesce(sum(bytes),0) FROM observations"
+                "SELECT count(*),coalesce(sum(bytes),0) FROM (SELECT bytes FROM observations UNION ALL SELECT bytes FROM rejected)"
             ).fetchone()
             if count >= self.max_records or used + size > self.max_bytes:
                 raise BufferError("communication audit outbox full; native delivery is unaffected")
@@ -212,6 +239,28 @@ class Outbox:
         with self._connect() as db:
             db.execute("DELETE FROM observations WHERE id=?", (str(record_id),))
 
+    def reject(self, record_id: object, reason: str) -> None:
+        """Retain at most 100 redacted bad records without blocking healthy uploads."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT id,created,body,bytes FROM observations WHERE id=?", (str(record_id),)
+            ).fetchone()
+            if row is None:
+                return
+            db.execute("DELETE FROM observations WHERE id=?", (str(record_id),))
+            db.execute("INSERT OR IGNORE INTO rejected VALUES (?,?,?,?,?)", (*row, reason[:100]))
+            db.execute(
+                "DELETE FROM rejected WHERE id NOT IN (SELECT id FROM rejected ORDER BY created DESC,id DESC LIMIT 100)"
+            )
+
+    def rejected(self) -> list[dict[str, object]]:
+        with self._connect() as db:
+            return [
+                {"record_id": row[0], "reason": row[1]}
+                for row in db.execute("SELECT id,reason FROM rejected ORDER BY created,id")
+            ]
+
 
 def _agent(native: str, route: list[str], target: str) -> dict[str, object]:
     try:
@@ -225,11 +274,7 @@ def _agent(native: str, route: list[str], target: str) -> dict[str, object]:
         result = body.get("result", {})
         agent = result.get("agent", {})
         if proc.returncode == 0 and isinstance(agent, dict):
-            return {
-                key: agent[key]
-                for key in ("pane_id", "terminal_id", "agent_session", "agent", "name")
-                if key in agent
-            }
+            return normalize_party(agent)
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
         pass
     return {}
@@ -298,6 +343,14 @@ def run_native(native: str, args: list[str], box: Outbox, *, host_id: str | None
     return code
 
 
+def permanent_rejection(status: int, body: object) -> bool:
+    return (
+        status in {400, 422}
+        and isinstance(body, dict)
+        and body.get("code") == "invalid_communication_observation"
+    )
+
+
 def sync(box: Outbox, url: str, key_file: Path, *, limit: int = 100, max_seconds: float = 5) -> int:
     """Upload observations only. An unavailable server leaves them pending."""
     from urllib.parse import urlsplit
@@ -317,6 +370,21 @@ def sync(box: Outbox, url: str, key_file: Path, *, limit: int = 100, max_seconds
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
+        from .control_plane.communications import validate_observation
+
+        try:
+            record = validate_observation(
+                str(record.get("operation_id", "")),
+                "communication." + str(record.get("status", "")),
+                record,
+            )
+        except ValueError:
+            box.reject(record["record_id"], "client_validation")
+            print(
+                "HerdR audit warning: invalid observation isolated; later records can upload.",
+                file=sys.stderr,
+            )
+            continue
         body = {
             "source": "herdr-cli",
             "entity_type": "communication",
@@ -343,17 +411,33 @@ def sync(box: Outbox, url: str, key_file: Path, *, limit: int = 100, max_seconds
             ) -> None:
                 return None
 
-        with urllib.request.build_opener(NoRedirect()).open(
-            request, timeout=min(3, remaining)
-        ) as response:
-            if response.status != 200:
-                break
-            result = json.loads(response.read(64 * 1024))
-            if (
-                result.get("ok") is not True
-                or result.get("entity", {}).get("entity_id") != record["operation_id"]
-            ):
-                raise ValueError("control plane did not acknowledge the observation")
+        try:
+            with urllib.request.build_opener(NoRedirect()).open(
+                request, timeout=min(3, remaining)
+            ) as response:
+                if response.status != 200:
+                    break
+                result = json.loads(response.read(64 * 1024))
+                entity = result.get("entity") if isinstance(result, dict) else None
+                if (
+                    not isinstance(entity, dict)
+                    or result.get("ok") is not True
+                    or entity.get("entity_id") != record["operation_id"]
+                ):
+                    raise ValueError("control plane did not acknowledge the observation")
+        except urllib.error.HTTPError as error:
+            try:
+                error_body: object = json.loads(error.read(64 * 1024))
+            except (ValueError, UnicodeError):
+                error_body = None
+            if not permanent_rejection(error.code, error_body):
+                raise
+            box.reject(record["record_id"], "server_validation")
+            print(
+                "HerdR audit warning: rejected observation isolated; later records can upload.",
+                file=sys.stderr,
+            )
+            continue
         box.acknowledge(record["record_id"])
         count += 1
     return count
@@ -363,11 +447,13 @@ def install(
     native: Path, config: Path, *, url: str = "", key_file: str = "", host_id: str = ""
 ) -> None:
     """Opt-in local shim; original executable retained beside it for rollback."""
+    if os.name != "posix":
+        raise ValueError("native audit installation currently requires macOS or Linux")
     native = native.absolute()
     if native.is_symlink() or not native.is_file():
         raise ValueError("select the actual native executable, not a symlink")
     backup = native.with_name(native.name + ".native-untracked")
-    if backup.exists() or config.exists():
+    if os.path.lexists(backup) or os.path.lexists(config):
         raise ValueError("audit shim or configuration already exists; refusing to overwrite")
     config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = {
@@ -381,8 +467,22 @@ def install(
         os.chmod(config, 0o600)
         json.dump(payload, stream)
     launcher = native.with_name(native.name + ".audit-install-" + uuid.uuid4().hex)
+    program = (
+        "import os,sys\n"
+        "try:\n from herdr_engineering.communications import main\n"
+        "except Exception:\n"
+        " print('HerdR audit warning: module unavailable; using native delivery.',file=sys.stderr)\n"
+        f" os.execv({str(backup)!r}, [{str(backup)!r}, *sys.argv[1:]])\n"
+        f"raise SystemExit(main(['native','--native',{str(backup)!r},'--config',{str(config)!r},'--',*sys.argv[1:]]))\n"
+    )
+    python, retained = shlex.quote(sys.executable), shlex.quote(str(backup))
     launcher.write_text(
-        f"#!{sys.executable}\nfrom herdr_engineering.communications import main\nraise SystemExit(main(['native', '--native', {str(backup)!r}, '--config', {str(config)!r}, '--', *__import__('sys').argv[1:]]))\n"
+        "#!/bin/sh\n"
+        f"if [ ! -x {python} ]; then\n"
+        "  printf '%s\\n' 'HerdR audit warning: runtime unavailable; using native delivery.' >&2\n"
+        f'  exec {retained} "$@"\n'
+        "fi\n"
+        f'exec {python} -c {shlex.quote(program)} "$@"\n'
     )
     launcher.chmod(0o755)
     try:
@@ -441,7 +541,15 @@ def main(argv: list[str] | None = None) -> int:
         print("HerdR audit warning: storage unavailable; using native delivery.", file=sys.stderr)
         os.execv(cfg["native"], [cfg["native"], *native_args])
     if args.action == "status":
-        print(json.dumps({"pending": len(box.pending(MAX_RECORDS)), "database": cfg["outbox"]}))
+        print(
+            json.dumps(
+                {
+                    "pending": len(box.pending(MAX_RECORDS)),
+                    "rejected": len(box.rejected()),
+                    "database": cfg["outbox"],
+                }
+            )
+        )
         return 0
     code = (
         run_native(cfg["native"], native_args, box, host_id=cfg.get("host_id"))
@@ -459,7 +567,7 @@ def main(argv: list[str] | None = None) -> int:
             count = sync(box, cfg["url"], Path(cfg["key_file"]))
             if args.action == "sync":
                 print(json.dumps({"synced": count}))
-        except (OSError, ValueError):
+        except (OSError, ValueError, sqlite3.Error):
             print(
                 "HerdR audit: dashboard unavailable; observations remain queued locally.",
                 file=sys.stderr,

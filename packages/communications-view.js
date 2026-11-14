@@ -33,11 +33,32 @@ export function parsePage(body) {
     )
       throw new Error("Invalid communication record");
     for (const party of [row.sender, row.recipient]) {
-      for (const field of ["name", "agent", "pane_id", "session_id"]) {
+      for (const field of [
+        "name",
+        "agent",
+        "pane_id",
+        "session_id",
+        "terminal_id",
+      ]) {
         if (party[field] !== undefined && typeof party[field] !== "string")
           throw new Error("Invalid session identity");
       }
+      if (
+        party.agent_session !== undefined &&
+        (!object(party.agent_session) ||
+          (party.agent_session.value !== undefined &&
+            typeof party.agent_session.value !== "string"))
+      )
+        throw new Error("Invalid native identity");
     }
+    if (row.host_id !== undefined && typeof row.host_id !== "string")
+      throw new Error("Invalid host identity");
+    if (
+      row.route !== undefined &&
+      (!Array.isArray(row.route) ||
+        row.route.some((value) => typeof value !== "string"))
+    )
+      throw new Error("Invalid native route");
     if (
       row.reported_at !== undefined &&
       (typeof row.reported_at !== "number" ||
@@ -62,6 +83,14 @@ function party(value, fallback) {
     ? `<a href="#/herd/session/${esc(encodeURIComponent(value.session_id))}">${label}</a>`
     : label;
 }
+function nativeReference(value) {
+  return esc(
+    value.agent_session?.value ||
+      value.terminal_id ||
+      value.pane_id ||
+      "Unknown",
+  );
+}
 export function renderCommunications(rows) {
   if (!rows.length)
     return '<p class="hd-empty">No recorded communications yet.</p>';
@@ -75,7 +104,9 @@ export function renderCommunications(rows) {
     <p>${party(row.sender, "Unknown sender")} → ${party(row.recipient, "Unknown recipient")} · <strong>${statuses[row.status]}</strong></p>
     <p class="comm-meta">Reported <time datetime="${esc(reported)}">${esc(formatTimestamp(reported))}</time> · ${row.evidence_kind === "server_receipt" ? "Control-plane receipt" : "Host observation"}</p>
     <pre class="comm-message">${esc(row.text)}</pre>${row.truncated ? "<p>Message truncated at the capture limit.</p>" : ""}
-    <details><summary>Message reference</summary><code>${esc(row.operation_id)}</code><p>Recorded ${esc(formatTimestamp(row.recorded_at || row.created_at))}</p></details>
+    <details><summary>Message reference</summary><code>${esc(row.operation_id)}</code><p>Recorded ${esc(formatTimestamp(row.recorded_at || row.created_at))}</p>
+      <dl><dt>${row.evidence_kind === "server_receipt" ? "Recipient host" : "Reporting host"}</dt><dd>${esc(row.host_id || "Unknown")}</dd><dt>Native route</dt><dd>${esc(row.route?.join(" ") || (row.evidence_kind === "server_receipt" ? "Not recorded" : "Local server"))}</dd>
+      <dt>Sender identity</dt><dd>${nativeReference(row.sender)}</dd><dt>Recipient identity</dt><dd>${nativeReference(row.recipient)}</dd></dl></details>
   </article>`;
     })
     .join("");
@@ -88,7 +119,7 @@ export function mountCommunications(container, client) {
   let browsingOlder = false;
   let rows = [];
   let signature = "";
-  container.innerHTML = `<style>.comm-message{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;max-height:24em;overflow:auto}.comm-meta{color:var(--text-secondary);overflow-wrap:anywhere}.comm-actions{display:flex;gap:12px;margin:12px 0}.comm-history{display:grid;gap:12px}</style>
+  container.innerHTML = `<style>.comm-message{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;max-height:24em;overflow:auto}.comm-meta{color:var(--text-secondary);overflow-wrap:anywhere}.comm-actions{display:flex;gap:12px;margin:12px 0}.comm-history{display:grid;gap:12px}.comm-history dd{margin:0 0 8px;overflow-wrap:anywhere}</style>
     <h1>Agent communications</h1>
     <p>Messages routed through HerdR. Delivered means accepted by the native transport; it does not mean read or completed. Harness-private channels are not included.</p>
     <div class="comm-actions"><button class="hd-btn" data-comm-latest>Latest</button><button class="hd-btn" data-comm-older hidden>Older messages</button></div>
