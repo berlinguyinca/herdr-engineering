@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import hashlib
 import datetime as dt
 import importlib.util
 import json
@@ -71,7 +72,8 @@ DEFAULTS: dict = {
     "gates": {"required": [], "when_present": []},   # tier 2: required must be success; when_present only if it exists
     "poll": {"max_per_run": 5, "pending_stale_minutes": 120, "cooldown_failures": 3, "cooldown_minutes": 60},
     "prompt": {"project_rules": [], "checklist_file": "", "require_evidence": True},
-    "replay": {"clones": []},           # [{repo: OWNER/NAME, path: DIR}]: the clone replay uses for that repo
+    "replay": {"clones": [],            # [{repo: OWNER/NAME, path: DIR}]: the clone replay uses for that repo
+               "reviewers": []},        # logins (bots too) whose review comments `corpus build` counts; humans always count
     "tiers": {
         "tier1": {"enabled": True, "context": "Open-weight pre-review", "backend": "pi",
                   "model": "metabolomics/qwen3.8-27b", "time_cap_s": 900, "comment": False},
@@ -195,6 +197,9 @@ def _check_passes_and_replay(cfg: dict) -> None:
         names.append(x["name"])
     if len(set(names)) != len(names):
         raise Refused("config: tiers.tier2.passes names must differ")
+    rv = cfg["replay"]["reviewers"]
+    if not isinstance(rv, list) or not all(isinstance(x, str) and x for x in rv):
+        raise Refused("config: replay.reviewers must be a list of logins")
     for c in cfg["replay"]["clones"]:
         if (not isinstance(c, dict) or sorted(c) != ["path", "repo"] or not isinstance(c["repo"], str)
                 or not ai.REPO_RE.fullmatch(c["repo"]) or not isinstance(c["path"], str) or not c["path"]):
@@ -260,16 +265,16 @@ def _finding(f: object) -> Finding:
     if not isinstance(f, dict) or not _keys_ok(f, FINDING_KEYS, FINDING_OPTIONAL):
         raise ReviewFailed("a finding must have " + ", ".join(FINDING_KEYS) + " and may have "
                            + ", ".join(FINDING_OPTIONAL))
-    if not all(isinstance(f[k], str) and len(f[k]) <= ai.TEXT_MAX for k in ("file", "why", *FINDING_OPTIONAL)
-               if k in f):
+    if not all(isinstance(f[k], str) for k in ("file", "why", *FINDING_OPTIONAL) if k in f) or not all(
+            len(f[k]) <= ai.TEXT_MAX for k in ("file", "why")):
         raise ReviewFailed("a finding's file, why, evidence and how_it_fails must be strings")
     line = f["line"]
     if line is not None and (type(line) is not int or line < 0):
         raise ReviewFailed("a finding's line must be null or a non-negative integer")
     if f["severity"] not in SEVERITIES or f["category"] not in CATEGORIES:
         raise ReviewFailed("a finding's severity or category is not in the schema")
-    return Finding(f["file"], line, f["severity"], f["category"], f["why"], f.get("evidence", ""),
-                   f.get("how_it_fails", ""))
+    cut = lambda k: f.get(k, "")[:ai.TEXT_MAX]          # over-long quotes are cut, not a reason to fail the review
+    return Finding(f["file"], line, f["severity"], f["category"], f["why"], cut("evidence"), cut("how_it_fails"))
 
 
 def parse_verdict(answer: str | dict, sha: str) -> Verdict:
@@ -313,7 +318,9 @@ def parse_verdict(answer: str | dict, sha: str) -> Verdict:
 
 # ---------------- the evidence rule and merging passes ----------------
 
-EVIDENCE_MIN = 6                        # normalised characters; shorter quotes prove nothing
+EVIDENCE_MIN = 20                       # normalised characters a quote needs, unless it is a whole line
+EVIDENCE_LINE_MIN = 4                   # a whole-line quote shorter than this proves nothing
+WHY_KEY_CHARS = 60                      # merge treats findings whose why starts alike as one
 FILE_READ_MAX = 4_000_000
 
 
@@ -334,33 +341,83 @@ def _read_at_head(root: Path | None, rel: str) -> str:
         return ""
 
 
+def _diff_lines(diff: str) -> dict[str, list[str]]:
+    """The lines a pinned head holds per file of the diff: the added and context lines of each hunk, prefix removed.
+    Removed lines are not at head and are left out."""
+    out: dict[str, list[str]] = {}
+    lines, cur, inhunk, i = diff.splitlines(), None, False, 0
+    while i < len(lines):
+        ln = lines[i]
+        header = (ln.startswith("--- ") and i + 2 < len(lines) and lines[i + 1].startswith("+++ ")
+                  and lines[i + 2].startswith("@@")) or ln.startswith("diff --git ")
+        if header:
+            inhunk = False
+            if ln.startswith("--- "):
+                p = lines[i + 1][4:].split("\t")[0]
+                cur = p[2:] if p.startswith("b/") else None if p == "/dev/null" else p
+                if cur is not None:
+                    out.setdefault(cur, [])
+                i += 1
+            i += 1
+            continue
+        if ln.startswith("@@"):
+            inhunk = True
+        elif inhunk and cur is not None and ln[:1] in ("+", " "):
+            out[cur].append(ln[1:])
+        i += 1
+    return out
+
+
+def _quote_in(ev: str, lines: list[str]) -> bool:
+    """The quote `ev` is in `lines` (whitespace-normalised): a run of at least EVIDENCE_MIN characters inside their
+    text, or a whole line (or a run of whole consecutive lines) of at least EVIDENCE_LINE_MIN characters."""
+    norm = [x for x in (_ws(ln) for ln in lines) if x]
+    evn = _ws(ev)
+    if len(evn) >= EVIDENCE_MIN and evn in " ".join(norm):
+        return True
+    return len(evn) >= EVIDENCE_LINE_MIN and any(
+        " ".join(norm[i:j]) == evn for i in range(len(norm)) for j in range(i + 1, min(i + 13, len(norm)) + 1))
+
+
 def apply_evidence(verdict: Verdict, diff: str, root: Path | None) -> tuple[Verdict, int]:
-    """The poster's evidence rule. A blocking finding whose `evidence` is missing, too short or found neither in the
-    diff nor in the cited file at the pinned head (whitespace-normalised) becomes a note. Returns the verdict and the
-    number downgraded. The diff is searched as written and without its +/-/space line prefixes."""
-    stripped = "\n".join(ln[1:] if ln[:1] in "+- " else ln for ln in diff.splitlines())
-    hay = (_ws(diff), _ws(stripped))
+    """The poster's evidence rule. A blocking finding becomes a note when its `how_it_fails` is empty or its `evidence`
+    is not a meaningful quote (see _quote_in) of the added or context lines of the cited file's hunks in the diff, or of
+    the cited file at the pinned head. Quotes found only in another file's hunk, or only in removed lines, do not
+    count. Returns the verdict and the number downgraded."""
+    per_file = _diff_lines(diff)
     out, n = [], 0
     for f in verdict.findings:
         if f.severity == "blocking":
-            ev = _ws(f.evidence)
-            ok = len(ev) >= EVIDENCE_MIN and (any(ev in h for h in hay) or ev in _ws(_read_at_head(root, f.file)))
+            raw = f.evidence.replace("\r\n", "\n")
+            ev = _ws(raw)
+            ok = bool(f.how_it_fails.strip()) and len(ev) >= EVIDENCE_LINE_MIN and (
+                _quote_in(raw, per_file.get(f.file.removeprefix("./"), []))
+                or _quote_in(raw, _read_at_head(root, f.file).splitlines()))
             if not ok:
                 f, n = dataclasses.replace(f, severity="note", downgraded=True), n + 1
         out.append(f)
     return dataclasses.replace(verdict, findings=tuple(out)), n
 
 
+def _why_key(why: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", why.lower()).strip()[:WHY_KEY_CHARS]
+
+
+def _strength(f: Finding) -> tuple[bool, bool, bool]:
+    return (f.severity == "blocking", bool(f.evidence and not f.downgraded), bool(f.evidence or f.how_it_fails))
+
+
 def merge_verdicts(vs: list[Verdict], sha: str) -> Verdict:
-    """One verdict from the passes: findings deduplicated by (file, line, category), the stronger severity kept; block
-    if any blocking finding survives. A single verdict is returned unchanged."""
+    """One verdict from the passes: findings deduplicated by (file, line, category, the start of the normalised why);
+    of duplicates the stronger one is kept (blocking, then with verified evidence, then with any evidence). Block if
+    any blocking finding survives. A single verdict is returned unchanged."""
     if len(vs) == 1:
         return vs[0]
     merged: dict[tuple, Finding] = {}
     for v in vs:
         for f in v.findings:
-            k = (f.file, f.line, f.category)
-            if k not in merged or (f.severity == "blocking" and merged[k].severity != "blocking"):
+            k = (f.file, f.line, f.category, _why_key(f.why))
+            if k not in merged or _strength(f) > _strength(merged[k]):
                 merged[k] = f
     findings = tuple(merged.values())
     uniq = lambda seq: tuple(dict.fromkeys(x for v in vs for x in getattr(v, seq)))
@@ -378,6 +435,7 @@ class Decision:
     claims: tuple[str, ...]
     label: str
     verdict: Verdict | None
+    downgraded: int = 0                 # blockers the evidence rule turned into notes
 
 
 def _as_dict(f: Finding) -> dict:
@@ -386,7 +444,7 @@ def _as_dict(f: Finding) -> dict:
             **({"how_it_fails": f.how_it_fails} if f.how_it_fails else {})}
 
 
-def decide(verdict: Verdict, index: dict, label: str) -> Decision:
+def decide(verdict: Verdict, index: dict, label: str, downgraded: int = 0) -> Decision:
     """The poster's decision: blocking findings that cite no file of the PR are dropped; success only when none
     remain."""
     blocking, dropped, notes = [], [], []
@@ -400,12 +458,20 @@ def decide(verdict: Verdict, index: dict, label: str) -> Decision:
         else:
             blocking.append({**d, "file": fd.path, **({} if ai.line_shown(d, fd) else {"line_unverified": True})})
     claims = tuple(c for c in ai.CLAIMABLE if c in verdict.checked)
+    s = "s" if downgraded != 1 else ""
     if blocking:
         desc = ai.blocked_text(label, len(blocking))
+        if downgraded and len(desc) + len(f", {downgraded} downgraded") <= ai.DESC_MAX:
+            desc += f", {downgraded} downgraded"
     else:
         desc = ai.success_text(label, list(claims), len(dropped)).replace(" (visual review not run)", "")
+        if downgraded:
+            for extra in (f", {downgraded} unverified blocker{s} downgraded", f", {downgraded} downgraded"):
+                if len(desc) + len(extra) <= ai.DESC_MAX:
+                    desc += extra
+                    break
     return Decision("failure" if blocking else "success", desc, tuple(blocking), tuple(dropped), tuple(notes),
-                    claims, label, verdict)
+                    claims, label, verdict, downgraded)
 
 
 REPLAYING = False                       # True only inside replay_guard(): replay can never post anything
@@ -903,6 +969,9 @@ def comment_text(context: str, sha: str, d: Decision) -> str:
               + (" (line unverified)" if f.get("line_unverified") else "") + f": {ai.safe(f['why'], 800)}"
               + (f" Fails when: {ai.safe(f['how_it_fails'], 400)}" if f.get("how_it_fails") else "")
               for f in d.blocking]
+    if d.downgraded:
+        lines += ["", f"**Downgraded ({d.downgraded})**: blocking findings turned into notes because their evidence "
+                      "or how-it-fails was missing or not found in the cited file."]
     if d.dropped:
         lines += ["", f"**Dropped ({len(d.dropped)})**: blocking findings that cite a file not in this PR."]
     lines += ["", "_Advisory text from an AI reviewer; it can be wrong or misled by the PR. The status is decided by "
@@ -989,6 +1058,8 @@ class PassesResult:
     usage: dict
     passes: list[dict]
     downgraded: int
+    partial: str = ""                   # why a later pass did not complete ("" = all did); the verdict is then incomplete
+    unverified: bool = False            # a pass said block, but every blocker it raised failed the evidence rule
 
 
 def _sum_usage(parts: list[dict]) -> dict:
@@ -996,30 +1067,42 @@ def _sum_usage(parts: list[dict]) -> dict:
     for u in parts:
         for k, v in u.items():
             if isinstance(v, (int, float)) and not isinstance(v, bool):
-                out[k] = out.get(k, 0) + v
+                cur = out.get(k)
+                out[k] = (cur if isinstance(cur, (int, float)) and not isinstance(cur, bool) else 0) + v
             else:
                 out.setdefault(k, v)
     return out
 
 
 def run_passes(cfg: dict, tier: dict, backend: Backend, req: ReviewRequest, root: Path | None) -> PassesResult:
-    """One backend invocation per configured pass, in order, each with its own focus; the tier's time cap covers all
-    of them together. Every pass is parsed under the schema and put through the evidence rule, then merged. With no
-    passes this is exactly one unfocused review."""
+    """One backend invocation per configured pass, in order, each with its own focus. The tier's time cap is shared:
+    each pass may use at most an equal share of what is left (time a pass does not use passes on to the later ones).
+    Every pass is parsed under the schema and put through the evidence rule, then merged. If a pass after the first
+    completed one fails or times out, the completed passes' findings are kept, the remaining passes still run and the
+    result is marked `partial`; the caller never treats that as approval. A failure before any pass completed raises. With no passes this is exactly one
+    unfocused review."""
     p = cfg["prompt"]
     req = dataclasses.replace(req, rules=tuple(p["project_rules"]), checklist=p["checklist"])
     passes = tier.get("passes") or [{"name": "review", "focus": ""}]
     deadline = time.monotonic() + tier["time_cap_s"]
-    verdicts, usages, info, models, down = [], [], [], [], 0
-    for ps in passes:
+    verdicts, usages, info, models, down, failed, said_block = [], [], [], [], 0, [], False
+    for i, ps in enumerate(passes):
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise ReviewFailed(f"the review took longer than the time cap ({tier['time_cap_s']:.0f}s)")
-        raw = backend.review(dataclasses.replace(req, focus=ps["focus"]), remaining)
-        v = parse_verdict(raw.answer, req.sha)
-        n = 0
+        try:
+            if remaining <= 0:
+                raise ReviewFailed(f"the review took longer than the time cap ({tier['time_cap_s']:.0f}s)")
+            raw = backend.review(dataclasses.replace(req, focus=ps["focus"]), remaining / (len(passes) - i))
+            v = parse_verdict(raw.answer, req.sha)
+        except ReviewFailed as e:
+            if not verdicts:
+                raise
+            failed.append(f"pass {ps['name']} did not complete: {str(e)[:150]}")
+            info.append({"name": ps["name"], "error": ai.redact(str(e))[:200]})
+            continue
+        n, blockers = 0, sum(f.severity == "blocking" for f in v.findings)
         if p["require_evidence"]:
             v, n = apply_evidence(v, req.diff, root)
+        said_block = said_block or (v.verdict == "block" and blockers > 0 and n == blockers)
         verdicts.append(v)
         usages.append(raw.usage)
         models.append(raw.model)
@@ -1028,8 +1111,9 @@ def run_passes(cfg: dict, tier: dict, backend: Backend, req: ReviewRequest, root
                      **({"turns": raw.usage["turns"]} if "turns" in raw.usage else {}),
                      "findings": len(v.findings), "blocking": sum(f.severity == "blocking" for f in v.findings),
                      "downgraded": n})
-    return PassesResult(merge_verdicts(verdicts, req.sha), "+".join(dict.fromkeys(models)), _sum_usage(usages), info,
-                        down)
+    merged = merge_verdicts(verdicts, req.sha)
+    unverified = said_block and not any(f.severity == "blocking" for f in merged.findings)
+    return PassesResult(merged, "+".join(dict.fromkeys(models)), _sum_usage(usages), info, down, "; ".join(failed), unverified)
 
 
 def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started) -> int:
@@ -1055,7 +1139,19 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
     else:
         result = run_passes(cfg, tier, backend, req, None)
     verdict = result.verdict
-    decision = decide(verdict, index, ai.redact(result.model))
+    decision = decide(verdict, index, ai.redact(result.model), result.downgraded)
+    incomplete = result.partial or (result.unverified and tier_name == "tier2")
+    if incomplete and decision.state != "failure":
+        # Never success: the findings are kept in the log, the status stays pending (a partial review, or a block
+        # verdict whose blockers all failed the evidence rule on the tier that decides).
+        why = result.partial or "the reviewer said block but none of its blockers could be verified"
+        log_line(cfg, repo=repo, pr=n, sha=sha, tier=tier_name, backend=backend.name,
+                 state="partial" if result.partial else "unverified", model=decision.label,
+                 duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=why[:200],
+                 partial=result.partial, blocking=0, usage=result.usage, downgraded=result.downgraded,
+                 passes=result.passes, checked_items=list(verdict.checked_items),
+                 findings=log_findings(verdict.findings))
+        raise ReviewFailed(f"{why}; status stays pending")
     if gh.head(repo, n) != sha:
         raise HeadMoved("the head moved during the review")
     url = None
@@ -1069,8 +1165,8 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
     log_line(cfg, repo=repo, pr=n, sha=sha, tier=tier_name, backend=backend.name, state=decision.state,
              model=decision.label, duration_s=round(time.monotonic() - started, 1), dry_run=not post_on,
              blocking=len(decision.blocking), dropped=len(decision.dropped), usage=result.usage,
-             downgraded=result.downgraded, passes=result.passes, checked_items=list(verdict.checked_items),
-             findings=log_findings(verdict.findings))
+             downgraded=result.downgraded, partial=result.partial, passes=result.passes,
+             checked_items=list(verdict.checked_items), findings=log_findings(verdict.findings))
     return OK
 
 
@@ -1266,10 +1362,17 @@ def clone_for(cfg: dict, repo: str) -> str:
     return next((c["path"] for c in cfg["replay"]["clones"] if c["repo"] == repo), cfg["clone"])
 
 
+def case_hash(case: dict) -> str:
+    """Identifies what a score depends on (head, base, ground truth, known false claims); a changed case is scored again."""
+    keys = ("head_sha", "base_sha", "ground_truth", "known_false_claims")
+    return hashlib.sha256(json.dumps({k: case.get(k) for k in keys}, sort_keys=True).encode()).hexdigest()[:16]
+
+
 def replay_case(cfg: dict, tier: dict, backend: Backend, cid: str, case: dict) -> dict:
     """Run the tier on the case's head in a detached read-only worktree and score it. Nothing is posted."""
     started = time.monotonic()
-    base = {"id": cid, "repo": case["repo"], "pr": case["pr"], "head_sha": case["head_sha"], "source": case["source"]}
+    base = {"id": cid, "repo": case["repo"], "pr": case["pr"], "head_sha": case["head_sha"], "source": case["source"],
+            "case_hash": case_hash(case)}
     if not any(g.get("confirmed", True) is not False for g in case["ground_truth"]):
         return {**base, "state": "skipped", "reason": "no confirmed ground truth"}
     rcfg = {**cfg, "clone": clone_for(cfg, case["repo"])}
@@ -1320,8 +1423,9 @@ def load_report(path: Path, tier_name: str, tier: dict) -> dict:
 
 
 def replay(cfg: dict, corpus: Path, tier_name: str, out: Path, limit: int | None) -> int:
-    """Run the tier over the corpus, one case at a time, never posting. Resumable: cases already `scored` (or
-    `skipped`) in --out are not run again; failed ones are retried. --limit counts cases actually run."""
+    """Run the tier over the corpus, one case at a time, never posting. Resumable: cases already `scored` in --out for
+    the same case_hash (head, base, ground truth) are not run again; failed and skipped ones are retried, and a case
+    whose ground truth changed is scored again. --limit counts cases that ran the reviewer (skipped ones cost nothing)."""
     tier = cfg["tiers"][tier_name]
     cases = corpus_cases(corpus)
     report = load_report(out, tier_name, tier)
@@ -1332,7 +1436,9 @@ def replay(cfg: dict, corpus: Path, tier_name: str, out: Path, limit: int | None
     try:
         with replay_guard():
             backend = make_backend(cfg, tier)
-            done = {c["id"] for c in report["cases"] if c.get("state") in ("scored", "skipped")}
+            hashes = {cid: case_hash(case) for cid, case in cases}
+            done = {c["id"] for c in report["cases"]
+                    if c.get("state") == "scored" and c.get("case_hash") == hashes.get(c["id"])}
             ran = 0
             for cid, case in cases:
                 if cid in done:
@@ -1342,7 +1448,7 @@ def replay(cfg: dict, corpus: Path, tier_name: str, out: Path, limit: int | None
                 rec = replay_case(cfg, tier, backend, cid, case)
                 report["cases"] = [c for c in report["cases"] if c["id"] != cid] + [rec]
                 _write_report(out, report)
-                ran += 1
+                ran += rec["state"] != "skipped"
                 ai.say(f"replay {cid}: {rec['state']}" + (f" recall={rec['recall']}" if rec["state"] == "scored" else ""))
             _write_report(out, report)
     finally:
@@ -1454,7 +1560,27 @@ def _test_path(p: str) -> bool:
     return p.startswith(("tests/", "test/")) or "/test_" in p or p.rsplit("/", 1)[-1].startswith("test_")
 
 
-def build_case(repo: str, pr: dict, commits: list[dict]) -> dict | None:
+def _reviewer_comment(c: dict, pr_author: str, reviewers: frozenset[str]) -> bool:
+    """A thread-root review comment by a human or a configured reviewer login, not by the PR's author."""
+    login = str((c.get("user") or {}).get("login", ""))
+    if c.get("in_reply_to_id") is not None or not login or login == pr_author:
+        return False
+    return login in reviewers or not login.endswith("[bot]")
+
+
+def _comment_coord(c: dict) -> tuple[str, int | None]:
+    """The commit a comment was made on and the line in that commit: (original_commit_id, original_line), else
+    (commit_id, line). The two pairs are never mixed. A comment with no commit at all keeps whichever line it has."""
+    for sha_key, line_key in (("original_commit_id", "original_line"), ("commit_id", "line")):
+        sha = c.get(sha_key)
+        if _hex40(sha):
+            line = c.get(line_key)
+            return sha, line if type(line) is int else None
+    line = c.get("line") or c.get("original_line")
+    return "", line if type(line) is int else None
+
+
+def build_case(repo: str, pr: dict, commits: list[dict], reviewers: frozenset[str] = frozenset()) -> dict | None:
     n, own = int(pr["number"]), (pr.get("mergeCommit") or {}).get("oid", "")
     ref = re.compile(rf"#{n}(?!\d)")
     fixes, reverts = [], []
@@ -1464,9 +1590,12 @@ def build_case(repo: str, pr: dict, commits: list[dict]) -> dict | None:
             continue
         (reverts if msg.startswith("Revert") or (own and f"reverts commit {own}" in msg) else
          fixes if FIX_RE.search(msg) else []).append(c)
+    author = str((pr.get("author") or {}).get("login", ""))
     comments = [c for c in gh_read(["api", f"repos/{repo}/pulls/{n}/comments", "--paginate"])
-                if isinstance(c, dict) and str(c.get("body", "")).strip() and c.get("path")]
-    is_opus = lambda c: ((c.get("user") or {}).get("login", "").endswith("[bot]")
+                if isinstance(c, dict) and str(c.get("body", "")).strip() and c.get("path")
+                and _reviewer_comment(c, author, reviewers)]
+    is_opus = lambda c: ((str((c.get("user") or {}).get("login", "")) in reviewers
+                          and str((c.get("user") or {}).get("login", "")).endswith("[bot]"))
                          or "always-on-review" in str(c.get("body", "")) or "Opus agent review" in str(c.get("body", "")))
     opus_c = [c for c in comments if is_opus(c)]
     human_c = [c for c in comments if not is_opus(c)]
@@ -1482,23 +1611,32 @@ def build_case(repo: str, pr: dict, commits: list[dict]) -> dict | None:
                 gt.append({"id": f"{kind}-{c['sha'][:7]}-{i}", "file": f["filename"], "line": None,
                            "category": "tests" if _test_path(f["filename"]) else "code", "summary": title,
                            "severity": "note", "confirmed": False})
+    # Line numbers only mean something at the commit the comment was made on. The case is pinned to the commit most
+    # comments were made on (earliest on a tie); a comment made elsewhere keeps its text and file but no line.
+    coords = {c["id"]: _comment_coord(c) for c in comments[:30]}
+    votes: dict[str, int] = {}
+    for sha, _ in coords.values():
+        if sha:
+            votes[sha] = votes.get(sha, 0) + 1
+    pinned = max(votes, key=lambda k: (votes[k], -list(votes).index(k))) if votes else str(pr["headRefOid"])
     for c in comments[:30]:
-        line = c.get("line") or c.get("original_line")
-        gt.append({"id": f"comment-{c['id']}", "file": str(c["path"]), "line": line if type(line) is int else None,
+        csha, line = coords[c["id"]]
+        gt.append({"id": f"comment-{c['id']}", "file": str(c["path"]), "line": line if csha in ("", pinned) else None,
                    "category": "code", "summary": str(c["body"]).strip()[:300], "severity": "note", "confirmed": False})
     base = (gh_read(["api", f"repos/{repo}/pulls/{n}"]) or {}).get("base") or {}
-    case = {"repo": repo, "pr": n, "head_sha": pr["headRefOid"], "source": source,
+    case = {"repo": repo, "pr": n, "head_sha": pinned, "source": source,
             "title": str(pr.get("title", ""))[:200], "base_ref": str(pr.get("baseRefName") or "main"),
             "notes": (f"derived by corpus build; reverts={len(reverts)} follow-up fixes={len(fixes)} review comments: "
-                      f"human={len(human_c)} opus={len(opus_c)}; head_sha is the PR's final head; every ground-truth "
-                      "item is unconfirmed (confirmed: false) until a human or Opus confirms it"),
+                      f"human={len(human_c)} opus={len(opus_c)}; head_sha is pinned to the commit "
+                      f"{'most review comments were made on' if votes else 'the PR ended on'}, and comment lines only "
+                      "for that commit; every ground-truth item is unconfirmed (confirmed: false) until a human or Opus confirms it"),
             "ground_truth": gt}
     if _hex40(base.get("sha")):
         case["base_sha"] = base["sha"]
     return validate_case(case, f"built case {repo}#{n}")
 
 
-def corpus_build(repo: str, since: str, out: Path) -> int:
+def corpus_build(repo: str, since: str, out: Path, reviewers: frozenset[str] = frozenset()) -> int:
     if not ai.REPO_RE.fullmatch(repo):
         raise Refused(f"corpus build: bad --repo {repo!r}")
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", since):
@@ -1513,7 +1651,7 @@ def corpus_build(repo: str, since: str, out: Path) -> int:
         if path.exists():
             skipped += 1                                # resumable; never overwrites a case a human has edited
             continue
-        case = build_case(repo, pr, commits)
+        case = build_case(repo, pr, commits, reviewers)
         if case:
             path.write_text(json.dumps(case, indent=1) + "\n")
             made += 1
@@ -1608,6 +1746,7 @@ def main(argv: list[str] | None = None) -> int:
     cb.add_argument("--repo", required=True)
     cb.add_argument("--since", required=True)
     cb.add_argument("--out", required=True)
+    cb.add_argument("--config")
     for x in (p, r, s):
         x.add_argument("--config")
     for x in (p, r):
@@ -1615,7 +1754,7 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     try:
         if a.cmd == "corpus":
-            return corpus_build(a.repo, a.since, Path(a.out))
+            return corpus_build(a.repo, a.since, Path(a.out), frozenset(load_config(a.config)["replay"]["reviewers"]))
         if a.cmd == "replay" and a.compare[:1] == ["compare"]:
             if len(a.compare) != 3:
                 raise Refused("replay compare: need exactly two report files")

@@ -226,10 +226,10 @@ def test_evidence_missing_or_invented_downgrades_the_blocker_to_a_note(env, ev):
         pytest.skip("whitespace variant is the passing case, tested below")
     env.reviewer("claude", answer={**block(), "findings": [f]})
     env.config(post=True)
-    assert env.review("tier2", post=True) == 0
-    assert env.statuses_posted()[-1]["state"] == "success"
+    assert env.review("tier2", post=True) == 1                                   # the model said block: never success
+    assert [s for s in env.statuses_posted() if s["state"] in ("success", "failure")] == []
     assert env.gh_state().get("comments", []) == []
-    assert logs(env)[0]["downgraded"] == 1 and logs(env)[0]["blocking"] == 0
+    assert logs(env)[0]["downgraded"] == 1 and logs(env)[0]["blocking"] == 0 and logs(env)[0]["state"] == "unverified"
 
 
 def test_evidence_is_whitespace_normalised(env):
@@ -332,8 +332,8 @@ def test_one_blocking_pass_blocks_and_duplicate_findings_merge(env):
 def test_merge_verdicts_dedupes_by_file_line_category_and_keeps_the_stronger_severity():
     m = load()
     mk = lambda sev, why: m.Finding("a.py", 3, sev, "code", why, "e" * 8, "h")
-    a = m.Verdict("s", "approve", (mk("note", "first"),), ("code",), ("x",))
-    b = m.Verdict("s", "block", (mk("blocking", "second"), m.Finding("a.py", 3, "note", "tests", "t")), ("tests",), ("y",))
+    a = m.Verdict("s", "approve", (mk("note", "same problem"),), ("code",), ("x",))
+    b = m.Verdict("s", "block", (mk("blocking", "Same  problem"), m.Finding("a.py", 3, "note", "tests", "t")), ("tests",), ("y",))
     out = m.merge_verdicts([a, b], "s")
     assert [(f.category, f.severity) for f in out.findings] == [("code", "blocking"), ("tests", "note")]
     assert out.verdict == "block" and set(out.checked) == {"code", "tests"} and set(out.checked_items) == {"x", "y"}
@@ -346,17 +346,18 @@ def test_a_pass_whose_blockers_are_all_downgraded_does_not_block(env):
     f.pop("evidence")
     env.reviewer("claude", answer={**block(), "findings": [f]})
     env.config(PASSES, post=True)
-    env.review("tier2", post=True)
-    assert env.statuses_posted()[-1]["state"] == "success" and logs(env)[0]["downgraded"] == 3
+    assert env.review("tier2", post=True) == 1
+    assert [s for s in env.statuses_posted() if s["state"] in ("success", "failure")] == []
+    assert logs(env)[0]["downgraded"] == 3 and logs(env)[0]["findings"][0]["severity"] == "note"
 
 
 def test_the_time_cap_covers_all_passes_together(env):
     env.reviewer("claude", answer=APPROVE, sleep=4)
     env.config("tiers: {tier2: {time_cap_s: 10, passes: [{name: a, focus: A}, {name: b, focus: B}, {name: c, focus: C}]}}\n",
                post=True)
-    assert env.review("tier2", post=True) == 1                                   # 3 x 4 s > 10 s; stays pending
+    assert env.review("tier2", post=True) == 1                                   # each pass gets 10/3 s, not 4; pending
     assert [s for s in env.statuses_posted() if s["state"] in ("success", "failure")] == []
-    assert len(env.reviewer_calls()) == 3 and "time cap" in logs(env)[-1]["why"]
+    assert len(env.reviewer_calls()) == 1 and "time cap" in logs(env)[-1]["why"]
 
 
 def test_a_failing_pass_fails_the_whole_review(env):
@@ -835,3 +836,270 @@ def test_a_downgraded_finding_is_logged_as_a_note(env):
     env.reviewer("claude", answer={**block(), "findings": [f]})
     env.review("tier2")
     assert logs(env)[0]["findings"][0]["severity"] == "note" and logs(env)[0]["findings"][0]["downgraded"] is True
+
+
+# ---------------- review fixes: partial passes, unverified blockers, evidence, merge, usage ----------------
+
+FLAKY = r"""#!/usr/bin/env python3
+import json, os, sys
+d = os.path.dirname(os.path.abspath(__file__))
+plan = json.load(open(os.path.join(d, "flaky.json")))
+cf = os.path.join(d, "flaky.count")
+n = int(open(cf).read()) if os.path.exists(cf) else 0
+open(cf, "w").write(str(n + 1))
+cfg = json.load(open(os.path.join(d, "claude.json")))
+cfg["sleep"] = plan.get("sleeps", [])[n] if n < len(plan.get("sleeps", [])) else 0
+if n >= plan.get("fail_from", 10 ** 6):
+    cfg["exit"] = 3
+json.dump(cfg, open(os.path.join(d, "claude.json"), "w"))
+exec(compile(open(os.path.join(d, "claude.real")).read(), "claude", "exec"))
+"""
+
+
+def flaky(env, **plan):
+    real = env.bin / "claude"
+    (env.bin / "claude.real").write_text(real.read_text())
+    real.write_text(FLAKY)
+    (env.bin / "flaky.json").write_text(json.dumps(plan))
+
+
+def terminal(env):
+    return [s for s in env.statuses_posted() if s["state"] in ("success", "failure")]
+
+
+def test_a_later_pass_failing_keeps_the_earlier_blockers_and_posts_failure(env):
+    env.reviewer("claude", answer=block())
+    flaky(env, fail_from=1)
+    env.config(PASSES, post=True)
+    assert env.review("tier2", post=True) == 0
+    assert terminal(env)[-1]["state"] == "failure"                      # the completed pass found a real blocker
+    rec = logs(env)[0]
+    assert rec["partial"]
+    assert rec["blocking"] == 1 and rec["passes"][0]["name"] == "general" and rec["findings"]
+
+
+def test_a_later_pass_failing_never_posts_success_but_logs_the_findings(env):
+    note = {**APPROVE, "findings": [{"file": "src/a.py", "line": 2, "severity": "note", "category": "code",
+                                     "why": "naming"}]}
+    env.reviewer("claude", answer=note)
+    flaky(env, fail_from=1)
+    env.config(PASSES, post=True)
+    assert env.review("tier2", post=True) == 1
+    assert terminal(env) == []
+    first = logs(env)[0]
+    assert first["state"] == "partial" and first["findings"][0]["why"] == "naming" and "tests" in first["partial"]
+
+
+def test_each_pass_gets_a_fair_share_of_the_cap(env):
+    import time
+    env.reviewer("claude", answer=APPROVE)
+    flaky(env, sleeps=[0, 100, 0])
+    env.config("tiers: {tier2: {time_cap_s: 10, passes: [{name: a, focus: A}, {name: b, focus: B}, {name: c, focus: C}]}}\n", post=True)
+    t = time.monotonic()
+    assert env.review("tier2", post=True) == 1
+    assert time.monotonic() - t < 8.5                                   # pass b was cut at its ~5 s share, not 10 s
+    assert terminal(env) == [] and logs(env)[0]["state"] == "partial"
+    assert len(env.reviewer_calls()) == 3 and "pass b" in logs(env)[0]["partial"]      # pass c still ran
+
+
+def test_the_example_config_documents_a_shared_cap():
+    text = (CI / "always-on-review.example.yaml").read_text()
+    assert "shared" in text.lower()
+    assert "shared" in (CI / "README.md").read_text().lower()
+    assert "shared" in (ROOT / "CHANGELOG.md").read_text().split("### Always-on review")[0].lower()
+
+
+def test_all_blockers_downgraded_is_pending_for_tier2_and_a_noted_success_for_tier1(env):
+    f = block()["findings"][0]
+    f.pop("evidence")
+    env.reviewer("claude", answer={**block(), "findings": [f]})
+    env.reviewer("pi", answer={**block(), "findings": [f]})
+    env.config(post=True)
+    assert env.review("tier2", post=True) == 1 and terminal(env) == []
+    assert env.review("tier1", post=True) == 0
+    last = terminal(env)[-1]
+    assert last["state"] == "success" and "1 unverified blocker" in last["description"]
+
+
+def test_a_downgrade_beside_a_surviving_blocker_is_counted_in_the_failure_text(env):
+    bad = {**block()["findings"][0], "line": 1, "category": "code", "evidence": ""}
+    env.reviewer("claude", answer={**block(), "findings": [block()["findings"][0], bad]})
+    env.config(post=True)
+    assert env.review("tier2", post=True) == 0
+    last = terminal(env)[-1]
+    assert last["state"] == "failure" and "1 downgraded" in last["description"]
+
+
+def diff_two_files(a_line="    return eval(x)", b_line="    secret_call(token_value)"):
+    return (f"diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1,2 +1,2 @@\n def f(x):\n+{a_line}\n"
+            f"diff --git a/src/b.py b/src/b.py\n--- a/src/b.py\n+++ b/src/b.py\n@@ -1,1 +1,2 @@\n x = 1\n+{b_line}\n"
+            "-    removed_only_line_here(1, 2)\n")
+
+
+def fnd(m, file="src/a.py", ev="return eval(x)", how="x runs code", sev="blocking"):
+    return m.Verdict("s", "block", (m.Finding(file, 2, sev, "code", "w", ev, how),), ("code",))
+
+
+def test_evidence_must_come_from_the_cited_files_hunks_not_the_whole_diff():
+    m = load()
+    out, n = m.apply_evidence(fnd(m, ev="secret_call(token_value)"), diff_two_files(), None)
+    assert n == 1                                                       # it is in b.py's hunk, the finding cites a.py
+    out, n = m.apply_evidence(fnd(m, file="src/b.py", ev="secret_call(token_value)"), diff_two_files(), None)
+    assert n == 0
+    out, n = m.apply_evidence(fnd(m, ev="removed_only_line_here(1, 2)", file="src/b.py"), diff_two_files(), None)
+    assert n == 1                                                       # removed lines are not at head
+
+
+def test_evidence_needs_twenty_characters_or_a_whole_line():
+    m = load()
+    d = diff_two_files(a_line="    return eval(x) + other_value_here")
+    assert m.apply_evidence(fnd(m, ev="eval(x)"), d, None)[1] == 1                       # a fragment of a line
+    assert m.apply_evidence(fnd(m, ev="return eval(x) + other_value_here"), d, None)[1] == 0     # a whole line
+    assert m.apply_evidence(fnd(m, ev="eval(x) + other_value"), d, None)[1] == 0         # 20 characters
+    d2 = diff_two_files(a_line="    go()")
+    assert m.apply_evidence(fnd(m, ev="go()"), d2, None)[1] == 0                         # short but a whole line
+
+
+def test_a_blocker_needs_a_non_empty_how_it_fails():
+    m = load()
+    for how in ("", "   "):
+        out, n = m.apply_evidence(fnd(m, how=how), diff_two_files(), None)
+        assert n == 1 and out.findings[0].severity == "note"
+    assert m.apply_evidence(fnd(m, how="", sev="note"), diff_two_files(), None)[1] == 0
+
+
+def test_sum_usage_ignores_none_values():
+    m = load()
+    got = m._sum_usage([{"cost_usd": None, "turns": 1}, {"cost_usd": 0.5, "turns": None}, {"cost_usd": None, "x": "a"}])
+    assert got == {"cost_usd": 0.5, "turns": 1, "x": "a"}
+    assert m._sum_usage([{"a": None}]) == {"a": None}
+
+
+def test_merge_keeps_findings_with_different_reasons_apart_and_prefers_the_one_with_evidence():
+    m = load()
+    mk = lambda why, ev="", sev="note": m.Finding("a.py", 3, sev, "code", why, ev, "h" if ev else "")
+    a = m.Verdict("s", "approve", (mk("the loop never ends"), mk("a leaked handle in close()")), ("c",))
+    b = m.Verdict("s", "approve", (mk("The  loop never ends", "while True: pass"),), ("c",))
+    out = m.merge_verdicts([a, b], "s")
+    assert len(out.findings) == 2
+    kept = [f for f in out.findings if f.why.lower().startswith("the")][0]
+    assert kept.evidence == "while True: pass"
+
+
+def test_over_long_evidence_and_how_it_fails_are_truncated_not_fatal():
+    m = load()
+    ans = {**block(), "head_sha": "a" * 40}
+    ans["findings"][0]["evidence"] = "e" * (m.ai.TEXT_MAX + 10)
+    ans["findings"][0]["how_it_fails"] = "h" * (m.ai.TEXT_MAX + 10)
+    v = m.parse_verdict(ans, "a" * 40)
+    assert len(v.findings[0].evidence) == m.ai.TEXT_MAX and len(v.findings[0].how_it_fails) == m.ai.TEXT_MAX
+    ans["findings"][0]["why"] = "w" * (m.ai.TEXT_MAX + 1)
+    with pytest.raises(m.ReviewFailed):
+        m.parse_verdict(ans, "a" * 40)
+
+
+def test_replay_retries_skipped_cases_once_they_have_ground_truth(env):
+    corpus = env.tmp / "corpus"
+    p = write_case(corpus, env)
+    c = json.loads(p.read_text())
+    good = json.loads(p.read_text())
+    for g in c["ground_truth"]:
+        g["confirmed"] = False
+    p.write_text(json.dumps(c))
+    env.reviewer("claude", answer=block())
+    rc, out = replay(env, corpus)
+    assert json.loads(out.read_text())["cases"][0]["state"] == "skipped"
+    p.write_text(json.dumps(good))
+    rc, out = replay(env, corpus)
+    assert json.loads(out.read_text())["cases"][0]["state"] == "scored" and len(env.reviewer_calls()) == 1
+
+
+def test_replay_rescores_a_case_whose_ground_truth_changed_but_not_an_unchanged_one(env):
+    corpus = env.tmp / "corpus"
+    p = write_case(corpus, env)
+    env.reviewer("claude", answer=block())
+    replay(env, corpus)
+    replay(env, corpus)
+    assert len(env.reviewer_calls()) == 1
+    c = json.loads(p.read_text())
+    c["ground_truth"][0]["summary"] = "eval of the request body runs attacker code"
+    p.write_text(json.dumps(c))
+    rc, out = replay(env, corpus)
+    assert len(env.reviewer_calls()) == 2 and len(json.loads(out.read_text())["cases"]) == 1
+
+
+def test_skipped_cases_do_not_use_up_the_limit(env):
+    corpus = env.tmp / "corpus"
+    p = write_case(corpus, env, "case-a")
+    c = json.loads(p.read_text())
+    for g in c["ground_truth"]:
+        g["confirmed"] = False
+    p.write_text(json.dumps(c))
+    write_case(corpus, env, "case-b")
+    replay(env, corpus, "--limit", "1")
+    assert len(env.reviewer_calls()) == 1
+
+
+def build_with(env, mutate):
+    import copy
+    st = copy.deepcopy(BUILD_STATE)
+    mutate(st)
+    (env.bin / "gh").write_text(FAKE_BUILD_GH)
+    (env.bin / "build-state.json").write_text(json.dumps(st))
+    out = env.tmp / "built"
+    rc = env.mod.main(["corpus", "build", "--repo", "acme/widget", "--since", "2026-10-01", "--out", str(out)])
+    return rc, out
+
+
+def comments12(st, comments):
+    st["api"]["repos/acme/widget/pulls/12/comments"] = comments
+
+
+def cm(i, line, commit, login="reviewer", **kw):
+    return {"id": i, "path": "src/c.py", "body": f"problem number {i} in the handler", "original_line": line,
+            "line": kw.pop("line", None), "original_commit_id": commit, "commit_id": kw.pop("commit_id", "c" * 40),
+            "user": {"login": login, "type": "User"}, **kw}
+
+
+def test_corpus_build_pins_the_case_to_the_commit_the_comment_was_made_on(env):
+    first, last = "1" * 40, "c" * 40
+    rc, out = build_with(env, lambda st: comments12(st, [cm(701, 9, first), cm(702, 11, first), cm(703, 40, last)]))
+    c = env.mod.load_case(out / "acme-widget-pr12.json")
+    assert c["head_sha"] == first                                       # most comments were made on it, not the final head
+    by = {g["id"]: g for g in c["ground_truth"]}
+    assert by["comment-701"]["line"] == 9 and by["comment-702"]["line"] == 11
+    assert by["comment-703"]["line"] is None                            # its coordinate belongs to another commit
+    assert "pinned" in c["notes"]
+
+
+def test_corpus_build_uses_the_line_for_commit_id_when_there_is_no_original(env):
+    rc, out = build_with(env, lambda st: comments12(st, [
+        {"id": 710, "path": "src/c.py", "body": "x can be None here", "line": 14, "commit_id": "d" * 40,
+         "user": {"login": "reviewer", "type": "User"}}]))
+    c = env.mod.load_case(out / "acme-widget-pr12.json")
+    assert c["head_sha"] == "d" * 40 and c["ground_truth"][0]["line"] == 14
+
+
+def test_corpus_build_excludes_bots_unless_configured_replies_and_the_authors_own_comments(env):
+    rc, out = build_with(env, lambda st: comments12(st, [
+        cm(720, 5, "c" * 40),
+        cm(721, 6, "c" * 40, login="ci-bot[bot]", user_type="Bot"),
+        cm(722, 7, "c" * 40, in_reply_to_id=720),
+        cm(723, 8, "c" * 40, login="dev"),
+        cm(724, 9, "c" * 40, login="listed[bot]")]))
+    ids = {g["id"] for g in env.mod.load_case(out / "acme-widget-pr12.json")["ground_truth"]}
+    assert ids == {"comment-720"}
+
+
+def test_corpus_build_counts_configured_reviewer_logins_even_if_bots(env):
+    env.config("replay: {reviewers: ['listed[bot]']}\n")
+    (env.bin / "gh").write_text(FAKE_BUILD_GH)
+    import copy
+    st = copy.deepcopy(BUILD_STATE)
+    comments12(st, [cm(724, 9, "c" * 40, login="listed[bot]"), cm(721, 6, "c" * 40, login="ci-bot[bot]")])
+    (env.bin / "build-state.json").write_text(json.dumps(st))
+    out = env.tmp / "built"
+    assert env.mod.main(["corpus", "build", "--repo", "acme/widget", "--since", "2026-10-01", "--out", str(out),
+                         "--config", str(env.cfg_path)]) == 0
+    ids = {g["id"] for g in env.mod.load_case(out / "acme-widget-pr12.json")["ground_truth"]}
+    assert ids == {"comment-724"}

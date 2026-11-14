@@ -46,7 +46,8 @@ tiers:
     context: Opus agent review
     backend: claude
     model: opus                          # claude: any --model value (alias or full id)
-    time_cap_s: 1800
+    time_cap_s: 3600                     # ONE cap shared by all passes: each pass may use an equal share of what is left
+                                         # (four passes ~ 900 s each; unused time passes on to the later ones)
     comment: true                        # one marked PR comment (updated in place) when it blocks
     passes:                              # one sequential claude run per pass; `passes: []` = one unfocused review
       - {name: general, focus: "Review the change as a whole: correctness, design, and anything the other passes would miss."}
@@ -56,7 +57,10 @@ tiers:
 
 prompt:
   checklist_file: review-checklist.yaml   # relative paths resolve against this file; use an absolute path once copied elsewhere
-  require_evidence: true                 # a blocking finding without quoted evidence found in the diff or file becomes a note
+  require_evidence: true                 # a blocking finding needs a meaningful quote (>= 20 chars or a whole line) found in the cited
+                                         # file's hunks or at head, plus a how_it_fails, else it becomes a note; if the model said
+                                         # block and ALL its blockers were downgraded, tier 2 stays pending (never success)
+  # replay.reviewers (below `replay:`): extra logins, bots included, whose review comments `corpus build` counts
   project_rules:                         # trusted instructions, added to both tiers' system prompt
     - "TDD: every change ships with a test that fails without it."
     - "No mocks, stubs, or fakes in tests; use real dependencies."

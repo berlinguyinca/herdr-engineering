@@ -473,12 +473,19 @@ def test_a_blocking_finding_posts_failure_and_one_marked_comment(env):
 
 
 def test_findings_on_files_outside_the_pr_are_dropped(env):
+    m = env.mod
+    diff = env.gh_state()["prs"]["7"]["diff"]
+    index = {f.path: f for f in m.ai.parse_diff(diff)}
+    ans = {**block(file="src/other.py"), "head_sha": "a" * 40}
+    d = m.decide(m.parse_verdict(ans, "a" * 40), index, "m")
+    assert d.state == "success" and "1 finding dropped" in d.description and len(d.dropped) == 1
+
+
+def test_a_blocker_on_a_file_outside_the_pr_cannot_be_verified_so_tier2_stays_pending(env):
     env.config(post=True)
     env.reviewer("claude", answer=block(file="src/other.py"))
-    assert env.review("tier2", post=True) == 0
-    last = env.statuses_posted()[-1]
-    assert last["state"] == "success" and "1 finding dropped" in last["description"]
-    assert env.gh_state().get("comments", []) == []
+    assert env.review("tier2", post=True) == 1
+    assert [s for s in env.statuses_posted() if s["state"] in ("success", "failure")] == []
 
 
 def test_a_malformed_answer_leaves_the_status_pending(env):
