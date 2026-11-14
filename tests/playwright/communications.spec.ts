@@ -3,6 +3,19 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+test("agent section navigation fits a phone viewport", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
+  await page.goto("/#/missions");
+  await expect(
+    page.locator("#subnav").getByRole("link", { name: "Communications" }),
+  ).toBeVisible();
+  await page.screenshot({
+    path: ".superpowers/communications-phone-reflow.png",
+  });
+  const width = await page.evaluate(() => document.documentElement.scrollWidth);
+  expect(width).toBeLessThanOrEqual(375);
+});
+
 test("real dashboard shows communication history, links, redaction and distinct messages", async ({
   page,
 }) => {
