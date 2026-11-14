@@ -1,0 +1,24 @@
+HERDR / AGENT OPERATIONS  [LIVE]  Activity
+5 agents  1 rooms  7 edges  4 tasks
+fleet ctx 75%  hosts 4: dev-02 ? 68%  dev-03 ? ?  mac-01 ? 82%  mac-02 ? ? 
+╭────────────────────╮       ╭────────────────────╮       ╭────────────────────╮
+│ ● ▸claude          │╍╍╍╍╍╍▶│ ● codex            │       │ × gem              │
+│ opus-4.1 working   │›──◉───│ gpt-4o working     │       │ model ? ended      │
+│ [█████████░░] 82%! │✗━━◉━━╎│ ctx unknown        │ ══════│ ctx unknown        │
+╰─ ~drift? ──────────╯══║  ┃╎╰─ ~drift? ──────────╯ ║     ╰─ ~drift? ──────────╯
+                       ╌║╌╌╌╎delegate · api-impl    ║                           
+╭────────────────────╮ ╎║  ┃ ╭────────────────────╮ ║                           
+│ × opus             │⇒╎║  ┃▶│ ● qwen             │ ║                           
+│ model ? disc       │◇┄┄┄┄┄┄│ qwen3-72b working  │ ║ handoff FAILED · docs     
+│ ctx unknown        │  ║    │ [████████░░░░] 68% │ ║                           
+╰─ ~drift?2 ─────────╯  ║    ╰─ ~drift? ──────────╯ ║                           
+                        ════════════════════════════║                           
+──›comm ━━▶dele ══⇒hand ──◇revi ┈┈●owne  ╌╌ planned  ╌╌ stalled  ✗ failed
+╭ Tasks ───────────────────────────────╮╭ Activity ────────────────────────────╮
+│api-impl owner:claude                 ││12:43:25 handoff gem → claude failed  │
+│  by:qwen rev:opus                    ││12:43:24 handoff codex → opus stalled │
+│  ~drift? repeated_tool_failures,repo…││12:43:18 communication codex → claude…│
+│docs owner:?                          ││12:43:17 review qwen → opus planned   │
+╰──────────────────────────────────────╯╰──────────────────────────────────────╯
+●────────────●─────────────●─────────────●──●───●──●──●────────────────────●───●
+Tab pane ←↑↓→ ⏎ inspect h handoff t time r replay f filter m mode ? help q quit

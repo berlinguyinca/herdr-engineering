@@ -1,0 +1,541 @@
+// Agent Operations Activity Map: pure model. Snapshot (GET /api/v1/agent-ops/snapshot) -> scene (positions, rings, edge geometry),
+// plus the replay helpers the scrubber uses. No DOM, no clock, no randomness: the same snapshot always gives the same scene.
+//
+// Visual semantics (docs/specs/2026-11-12-agent-operations-map/.../01-product-ux.md):
+//   node = a real agent/session; label inside = name + model; outer ring = measured context fraction ("ctx unknown" when not measured,
+//   never 0%); halo = activity state; edge colour/dash = kind + planned/accepted. Every signal also has a text form (colour is never alone).
+
+const text = (v) => (typeof v === 'string' ? v : v == null ? '' : String(v));
+const list = (v) => (Array.isArray(v) ? v : []);
+
+export const CAPABILITY = 'agent_ops_v1';
+export const agentOpsEnabled = (capabilities) => Array.isArray(capabilities) && capabilities.includes(CAPABILITY);
+
+// ---- geometry constants (scene units; the SVG scales the viewBox) ----------------------------------------------------------
+export const NODE_R = 52;
+export const RING_GAP = 8;
+export const RING_W = 8;
+export const RING_R = NODE_R + RING_GAP;
+export const HALO_R = RING_R + 12;
+export const CLUSTER_PAD = 40;
+export const LABEL_BELOW = 124;   // distance below a node centre that its state label and switched-model pill need
+const GRID_COL = 214, GRID_ROW = 205;   // phone layout: two columns, one row per pair
+export const NO_ROOM = '';
+
+// ---- context fraction (ADR: amber >= 70, red >= 90) -------------------------------------------------------------------------
+export const CTX_WARN = 0.7;
+export const CTX_CRITICAL = 0.9;
+
+/** Context utilisation of a snapshot agent. `fraction` is null unless both a measured numerator and a positive limit exist. */
+export function contextInfo(context, health = null) {
+  if ((!context || !Number.isFinite(context.used)) && health && health.measured && Number.isFinite(health.fraction)) {
+    // The backend measured a fraction (used/limit) even though the raw numbers are not in this row: show it, still never as 0.
+    const raw = health.fraction, percent = Math.round(raw * 100), fraction = Math.max(0, Math.min(1, raw));
+    const level = raw >= CTX_CRITICAL ? 'critical' : raw >= CTX_WARN ? 'warn' : 'ok';
+    const tag = level === 'critical' ? ' critical' : level === 'warn' ? ' high' : '';
+    return { known: true, fraction, percent, level, label: `${percent}% ctx${tag}`, words: `${percent}% of context used${tag ? `, ${tag.trim()}` : ''}`, used: null, limit: null };
+  }
+  const used = context && Number.isFinite(context.used) ? context.used : null;
+  const limit = context && Number.isFinite(context.limit) && context.limit > 0 ? context.limit : null;
+  if (used == null) return { known: false, fraction: null, percent: null, level: 'unknown', label: 'ctx unknown', words: 'context not reported', used: null, limit: null };
+  if (limit == null) return { known: true, fraction: null, percent: null, level: 'unknown', label: `ctx ${used} used`, words: `${used} tokens used, limit not reported`, used, limit: null };
+  const raw = used / limit;
+  const fraction = Math.max(0, Math.min(1, raw));
+  const percent = Math.round(raw * 100);
+  const level = raw >= CTX_CRITICAL ? 'critical' : raw >= CTX_WARN ? 'warn' : 'ok';
+  const tag = level === 'critical' ? ' critical' : level === 'warn' ? ' high' : '';
+  return { known: true, fraction, percent, level, label: `${percent}% ctx${tag}`, words: `${percent}% of context used (${used} of ${limit})${tag ? `, ${tag.trim()}` : ''}`, used, limit };
+}
+
+/** SVG stroke arithmetic for the ring: dash = filled arc, gap = the rest. An unknown fraction draws a dotted track only. */
+export function ringGeometry(fraction, r = RING_R) {
+  const circumference = Math.round(2 * Math.PI * r * 100) / 100;
+  if (fraction == null) return { r, circumference, dash: 0, gap: circumference, unknown: true };
+  const dash = Math.round(circumference * fraction * 100) / 100;
+  return { r, circumference, dash, gap: Math.round((circumference - dash) * 100) / 100, unknown: false };
+}
+
+// ---- state halo ---------------------------------------------------------------------------------------------------------------
+export const STATES = {
+  working: { label: 'Working', tone: 'active' },
+  idle: { label: 'Idle', tone: 'ok' },
+  attention: { label: 'Needs attention', tone: 'attention' },
+  blocked: { label: 'Blocked', tone: 'blocked' },
+  disconnected: { label: 'Disconnected', tone: 'muted' },
+  ended: { label: 'Ended', tone: 'muted' },
+  unknown: { label: 'State unknown', tone: 'unknown' },
+};
+export function stateInfo(state) {
+  const key = text(state).toLowerCase();
+  if (STATES[key]) return { key, ...STATES[key] };
+  return { key: 'unknown', ...STATES.unknown };
+}
+
+// ---- edge styling ---------------------------------------------------------------------------------------------------------------
+export const EDGE_KINDS = {
+  communication: { label: 'Communication', tone: 'comm', meaning: 'a message between two agents or people' },
+  delegation: { label: 'Delegation', tone: 'delegation', meaning: 'work handed to another agent; ownership stays where it was' },
+  handoff: { label: 'Handoff', tone: 'handoff', meaning: 'a session handed to another harness or agent' },
+  review: { label: 'Review', tone: 'review', meaning: 'a review asked of or done by another agent' },
+  ownership: { label: 'Ownership', tone: 'ownership', meaning: 'accountability for a task moved to another owner' },
+};
+export const KIND_ORDER = Object.keys(EDGE_KINDS);
+const PLANNED = new Set(['planned', 'proposed', 'queued', 'claimed', 'pending', 'requested']);
+const REJECTED = new Set(['rejected', 'declined', 'denied', 'cancelled', 'failed', 'expired']);
+const STALLED = new Set(['stalled']);   // a handoff whose endpoint went away: neither accepted nor refused, so it gets its own line
+
+export const DASH_PLANNED = '9 7';
+export const DASH_REJECTED = '2 7';
+export const DASH_STALLED = '14 4 2 4';
+
+/** Solid = accepted (or done), dashed = planned, dotted = rejected. The state word is always part of the label. */
+export function edgeStyle(edge) {
+  const kind = Object.hasOwn(EDGE_KINDS, edge?.kind) ? edge.kind : 'communication';
+  const meta = EDGE_KINDS[kind];
+  const state = text(edge?.state).toLowerCase() || 'unknown';
+  const planned = PLANNED.has(state), rejected = REJECTED.has(state), stalled = STALLED.has(state);
+  const dash = planned ? DASH_PLANNED : rejected ? DASH_REJECTED : stalled ? DASH_STALLED : null;
+  return {
+    kind, tone: meta.tone, kindLabel: meta.label, state, planned, rejected, stalled, dashed: dash != null, dash,
+    line: planned ? 'dashed' : rejected ? 'dotted' : stalled ? 'stalled' : 'solid',
+    // Flowing particles only on edges that are live: accepted or in-flight, never a refused one.
+    flowing: !rejected && !stalled, label: `${meta.label} · ${state}`,
+  };
+}
+
+// ---- modes and filters ------------------------------------------------------------------------------------------------------------
+export const MODES = [
+  { key: 'activity', label: 'Activity', kinds: null },
+  { key: 'communication', label: 'Communication', kinds: ['communication'] },
+  { key: 'handoffs', label: 'Handoffs', kinds: ['handoff', 'delegation'] },
+  { key: 'ownership', label: 'Ownership', kinds: ['ownership', 'review'] },
+  { key: 'replay', label: 'Replay', kinds: null },
+];
+export const modeKinds = (mode) => MODES.find((m) => m.key === mode)?.kinds ?? null;
+
+export const FILTER_KEYS = ['room', 'task', 'host', 'provider', 'model', 'kind'];
+export const emptyFilters = () => ({ room: '', task: '', host: '', provider: '', model: '', kind: '' });
+
+const uniqSorted = (values) => [...new Set(values.map(text).filter(Boolean))].sort();
+
+/** The distinct values a person can filter on, from the unfiltered snapshot. */
+export function filterOptions(snapshot) {
+  const agents = list(snapshot?.agents);
+  return {
+    room: uniqSorted(list(snapshot?.rooms).map((r) => r.room_id)),
+    roomName: Object.fromEntries(list(snapshot?.rooms).filter((r) => r && r.room_id && text(r.name)).map((r) => [r.room_id, text(r.name)])),
+    task: uniqSorted(list(snapshot?.tasks).map((t) => t.task_id)),
+    host: uniqSorted(agents.map((a) => a.host_id)),
+    provider: uniqSorted(agents.map((a) => a.provider)),
+    model: uniqSorted(agents.map((a) => a.model)),
+    kind: KIND_ORDER.filter((k) => list(snapshot?.edges).some((e) => e.kind === k)),
+  };
+}
+
+const isPerson = (id) => text(id).startsWith('user:');
+
+/** Narrow a snapshot. Edges survive only while both ends do (a person end survives with the edge). Pure; the input is untouched. */
+export function filterSnapshot(snapshot, filters = {}) {
+  const f = { ...emptyFilters(), ...filters };
+  const agents0 = list(snapshot?.agents), edges0 = list(snapshot?.edges), tasks0 = list(snapshot?.tasks);
+  const task = f.task ? tasks0.find((t) => t.task_id === f.task) : null;
+  const taskNodes = f.task ? new Set([task?.accountable_owner, task?.reviewer, ...list(task?.contributors),
+    ...edges0.filter((e) => e.task_id === f.task).flatMap((e) => [e.from, e.to])].filter(Boolean)) : null;
+  const agents = agents0.filter((a) => (!f.room || list(a.room_ids).includes(f.room)) && (!f.host || a.host_id === f.host)
+    && (!f.provider || a.provider === f.provider) && (!f.model || a.model === f.model) && (!taskNodes || taskNodes.has(a.node_id)));
+  const keep = new Set(agents.map((a) => a.node_id));
+  // A person has no room of their own: under a Room filter they stay only through an edge that belongs to that room.
+  const personOk = (e) => !f.room || !(isPerson(e.from) || isPerson(e.to)) || !e.room_id || e.room_id === f.room;
+  const edges = edges0.filter((e) => (!f.kind || e.kind === f.kind) && (!f.task || e.task_id === f.task) && personOk(e)
+    && (keep.has(e.from) || isPerson(e.from)) && (keep.has(e.to) || isPerson(e.to)) && (keep.has(e.from) || keep.has(e.to)));
+  const rooms = list(snapshot?.rooms).filter((r) => !f.room || r.room_id === f.room)
+    .map((r) => ({ ...r, agent_ids: list(r.agent_ids).filter((id) => keep.has(id)) }));
+  return { ...snapshot, agents, edges, rooms, tasks: f.task ? tasks0.filter((t) => t.task_id === f.task) : tasks0 };
+}
+
+// ---- naming ---------------------------------------------------------------------------------------------------------------------
+const clip = (s, n) => { const t = text(s); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
+export const shortId = (id) => { const t = text(id).replace(/^user:/, ''); return t.length > 14 ? `${t.slice(0, 6)}…${t.slice(-5)}` : t; };
+
+/** Name shown inside a node: the sanitized label when the agent reported one, else its agent/session id. */
+export function nodeName(agent) {
+  if (isPerson(agent?.node_id)) return text(agent.node_id).slice(5) || 'person';
+  return text(agent?.label) || text(agent?.agent_id) || text(agent?.node_id) || 'agent';
+}
+/** The model label shown inside a node; absent means the model is not known, which is said out loud. */
+export const modelLabel = (agent) => text(agent?.model) || 'model unknown';
+export const roomLabel = (id, name = null) => (id === NO_ROOM ? 'No room' : text(name) || `Room ${shortId(id)}`);
+
+// ---- fleet hosts and drift ------------------------------------------------------------------------------------------------------
+const HOST_STATES = ['connected', 'disconnected'];
+/** One chip per host: id, how many agents, connection state (anything not reported as connected/disconnected is "unknown"). */
+export function hostStrip(snapshot) {
+  return list(snapshot?.hosts).filter((h) => h && h.host_id).map((h) => {
+    const agg = h.context_health;
+    return { id: text(h.host_id), agents: list(h.agents).length, state: HOST_STATES.includes(h.state) ? h.state : 'unknown', lastSeen: h.last_seen || null, reconnects: h.reconnects || 0,
+      ctx: contextInfo(null, agg && Number.isFinite(agg.average_fraction) ? { measured: true, fraction: agg.average_fraction } : null) };
+  });
+}
+
+const driftTitle = (kind) => { const t = text(kind).replace(/_/g, ' '); return t ? t[0].toUpperCase() + t.slice(1) : 'Drift'; };
+/** Drift signals of an agent or task. They are heuristics from event metadata, never proof of a policy violation; the UI says so. */
+export function driftItems(owner) {
+  return list(owner?.drift).filter(Boolean).map((d) => ({ kind: text(d.kind), title: driftTitle(d.kind), provenance: text(d.provenance) || 'unknown',
+    evidence: list(d.evidence_event_ids).map(text), task: d.task_id || null, note: text(d.note) }));
+}
+
+// ---- layout ---------------------------------------------------------------------------------------------------------------------
+const r1 = (n) => Math.round(n * 10) / 10;
+
+/** What the agent's model was before its latest switch (the model_changes entry), or null when it never switched. */
+function switchedFrom(agent) {
+  const changes = list(agent?.model_changes);
+  if (!changes.length) return null;
+  return text(changes[changes.length - 1]?.from) || 'unknown model';
+}
+
+function personStub(id) { return { node_id: id, agent_id: id, session_id: null, host_id: null, provider: null, model: null, model_changes: [], state: 'unknown', context: null, room_ids: [], label: null, provenance: 'unknown', kind: 'person' }; }
+
+/** Rooms are clusters (membership, not ownership); an agent sits in the first of its rooms (sorted), else in the "No room" cluster. */
+function groupByRoom(nodes, rooms) {
+  const known = new Set(list(rooms).map((r) => r.room_id));
+  const groups = new Map();
+  for (const n of nodes) {
+    const own = list(n.room_ids).filter((id) => known.size === 0 || known.has(id)).sort();
+    const room = own[0] ?? NO_ROOM;
+    if (!groups.has(room)) groups.set(room, []);
+    groups.get(room).push(n);
+  }
+  const keys = [...groups.keys()].sort((a, b) => (a === NO_ROOM ? 1 : b === NO_ROOM ? -1 : a < b ? -1 : a > b ? 1 : 0));
+  return keys.map((id) => ({ id, members: groups.get(id).sort((a, b) => (a.node_id < b.node_id ? -1 : a.node_id > b.node_id ? 1 : 0)) }));
+}
+
+// Members sit on a ring wide enough that neighbours keep a gap of about one node width: room for the edge between them and its label.
+const memberRing = (n) => Math.max(HALO_R * 2.1, (n * (2 * HALO_R + 110)) / (2 * Math.PI));
+
+function clusterRadius(n) {
+  if (n <= 1) return LABEL_BELOW + 12;
+  return memberRing(n) + LABEL_BELOW + 12;
+}
+
+export const edgeId = (e) => [e.kind, e.from, e.to, e.room_id || '', e.task_id || e.handoff_id || ''].join('|');
+
+function curve(a, b, bend) {
+  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
+  const ux = dx / len, uy = dy / len, nx = -uy, ny = ux;
+  const cut = RING_R + RING_W / 2 + 6;
+  // Start/end sit on the ring of each node, aimed at the curve's control point so a bent edge still leaves the circle cleanly.
+  const cx = (a.x + b.x) / 2 + nx * bend, cy = (a.y + b.y) / 2 + ny * bend;
+  const sa = Math.hypot(cx - a.x, cy - a.y) || 1, sb = Math.hypot(cx - b.x, cy - b.y) || 1;
+  const x1 = a.x + ((cx - a.x) / sa) * cut, y1 = a.y + ((cy - a.y) / sa) * cut;
+  const x2 = b.x + ((cx - b.x) / sb) * (cut + 4), y2 = b.y + ((cy - b.y) / sb) * (cut + 4);
+  const mid = { x: r1(0.25 * x1 + 0.5 * cx + 0.25 * x2), y: r1(0.25 * y1 + 0.5 * cy + 0.25 * y2) };
+  const at = (t) => ({ x: (1 - t) ** 2 * x1 + 2 * (1 - t) * t * cx + t * t * x2, y: (1 - t) ** 2 * y1 + 2 * (1 - t) * t * cy + t * t * y2 });
+  return { d: `M${r1(x1)} ${r1(y1)} Q${r1(cx)} ${r1(cy)} ${r1(x2)} ${r1(y2)}`, mid, at, length: Math.round(len), ux, uy };
+}
+
+// Edge labels: try the middle of the curve first, then slide along it, keeping clear of earlier labels and of node halos.
+// When no spot is free the label turns quiet (shown on hover, focus or selection) instead of printing over other text.
+const LABEL_H = 18, LABEL_CHAR = 7, LABEL_TS = [0.5, 0.42, 0.58, 0.34, 0.66, 0.27, 0.73, 0.2, 0.8, 0.14, 0.86], LABEL_DYS = [0, -20, 20, -38, 38];
+const CROWD_CAP = 4;   // past this many collisions a spot is just "crowded": a quiet label does not need an exact count
+const SAMPLE_GAP = 12, MAX_SAMPLES = 240, GRID_CELL = 40, MAX_GRID_CELLS = 250000;
+/** Uniform grid over [minX,maxX]x[minY,maxY]: an item goes into every cell its extent touches (clamped at the border), so a box query only looks at nearby cells. */
+function makeGrid(minX, minY, maxX, maxY) {
+  const w = maxX - minX, h = maxY - minY;
+  // A huge or non-finite extent widens the cell so the grid never exceeds MAX_GRID_CELLS (one cell when the bounds are not finite).
+  const cell = Number.isFinite(w) && Number.isFinite(h) ? Math.max(GRID_CELL, Math.sqrt((Math.max(w, 0) * Math.max(h, 0)) / MAX_GRID_CELLS), Math.max(w, h) / 500) : Infinity;
+  const cols = Number.isFinite(cell) ? Math.max(1, Math.ceil(w / cell) + 1) : 1, rows = Number.isFinite(cell) ? Math.max(1, Math.ceil(h / cell) + 1) : 1;
+  const cells = Array.from({ length: cols * rows }, () => null);
+  const cx = (x) => Math.min(cols - 1, Math.max(0, Math.floor((x - minX) / cell)));
+  const cy = (y) => Math.min(rows - 1, Math.max(0, Math.floor((y - minY) / cell)));
+  return {
+    add(item, x0, x1, y0, y1) {
+      for (let gx = cx(x0), ex = cx(x1); gx <= ex; gx += 1) for (let gy = cy(y0), ey = cy(y1); gy <= ey; gy += 1) { const k = gx * rows + gy; if (cells[k]) cells[k].push(item); else cells[k] = [item]; }
+    },
+    /** Calls visit(item) for every item in the cells touched by the box; visit returns true to stop. */
+    query(x0, x1, y0, y1, visit) {
+      for (let gx = cx(x0), ex = cx(x1); gx <= ex; gx += 1) for (let gy = cy(y0), ey = cy(y1); gy <= ey; gy += 1) { const c = cells[gx * rows + gy]; if (c) for (let i = 0; i < c.length; i += 1) if (visit(c[i])) return; }
+    },
+  };
+}
+function placeLabels(items, nodes, charW = LABEL_CHAR) {
+  if (!items.length) return;
+  // Every edge is sampled along its curve (a point at most SAMPLE_GAP px apart, so a label box cannot slip between samples):
+  // a label box that contains a point of ANOTHER edge sits on that edge's line and counts as crowded.
+  const pts = [];
+  items.forEach((it, i) => {
+    const n = Math.min(MAX_SAMPLES, Math.max(8, Math.ceil((it.length * 1.25) / SAMPLE_GAP)));
+    for (let k = 0; k <= n; k += 1) { const p = it.at(k / n); pts.push(i, p.x, p.y); }
+  });
+  const count = pts.length / 3, PI = new Int32Array(count), PX = new Float64Array(count), PY = new Float64Array(count);
+  for (let k = 0; k < count; k += 1) { PI[k] = pts[3 * k]; PX[k] = pts[3 * k + 1]; PY[k] = pts[3 * k + 2]; }
+  const xs = [...PX, ...nodes.map((n) => n.x)], ys = [...PY, ...nodes.map((n) => n.y)];
+  const [minX, maxX, minY, maxY] = [xs.reduce((m, v) => Math.min(m, v), Infinity), xs.reduce((m, v) => Math.max(m, v), -Infinity), ys.reduce((m, v) => Math.min(m, v), Infinity), ys.reduce((m, v) => Math.max(m, v), -Infinity)];
+  const lineGrid = makeGrid(minX, minY, maxX, maxY);
+  for (let k = 0; k < count; k += 1) lineGrid.add(k, PX[k], PX[k], PY[k], PY[k]);
+  const rectGrid = makeGrid(minX, minY, maxX, maxY);
+  const addRect = (b) => rectGrid.add(b, b.x - b.w / 2, b.x + b.w / 2, b.y - b.h / 2, b.y + b.h / 2);
+  nodes.flatMap((n) => [{ x: n.x, y: n.y, w: 2 * RING_R, h: 2 * RING_R }, { x: n.x, y: n.y + RING_R + 22, w: 170, h: 18 }, { x: n.x, y: n.y + RING_R + 46, w: 170, h: 20 }]).forEach(addRect);
+  const hit = (a, b) => Math.abs(a.x - b.x) < (a.w + b.w) / 2 && Math.abs(a.y - b.y) < (a.h + b.h) / 2;
+  const rectSeen = new Set(), lineStamp = new Int32Array(items.length).fill(-1);
+  let stampNo = 0;
+  // Crowd of a box = overlapping labels/halos + other edges running through it; counting stops once it can no longer beat `limit`.
+  const crowdOf = (box, self, limit) => {
+    let n = 0;
+    rectSeen.clear(); stampNo += 1;
+    rectGrid.query(box.x - box.w / 2, box.x + box.w / 2, box.y - box.h / 2, box.y + box.h / 2, (b) => {
+      if (rectSeen.has(b)) return false;
+      rectSeen.add(b);
+      if (hit(box, b)) n += 1;
+      return n >= limit;
+    });
+    if (n >= limit) return n;
+    const hw = box.w / 2 + 2, hh = box.h / 2 + 2;
+    lineGrid.query(box.x - hw, box.x + hw, box.y - hh, box.y + hh, (k) => {
+      if (Math.abs(PX[k] - box.x) < hw && Math.abs(PY[k] - box.y) < hh && PI[k] !== self && lineStamp[PI[k]] !== stampNo) { lineStamp[PI[k]] = stampNo; n += 1; return n >= limit; }
+      return false;
+    });
+    return n;
+  };
+  for (const [self, it] of items.entries()) {
+    const w = String(it.label || '').length * charW + 10;
+    let best = null;
+    search: for (const t of LABEL_TS) for (const dy of LABEL_DYS) {
+      const p = it.at(t), box = { x: p.x, y: p.y - 6 + dy, w, h: LABEL_H };
+      const crowd = crowdOf(box, self, best ? best.crowd : CROWD_CAP);
+      if (!best || crowd < best.crowd) best = { crowd, box };
+      if (!crowd) break search;
+    }
+    it.labelBox = { x: r1(best.box.x), y: r1(best.box.y), w: best.box.w, h: best.box.h };
+    it.labelAt = { x: it.labelBox.x, y: r1(best.box.y + 6) };
+    it.labelQuiet = best.crowd > 0;   // no free spot: the label shows on hover, focus or selection (text stays in the aria-label, legend and table)
+    if (!it.labelQuiet) addRect(best.box);
+  }
+}
+
+/**
+ * snapshot -> scene. Deterministic: clusters sorted by room id, members by node id, parallel edges fanned by index.
+ * `mode` only decides which edges are dimmed; `filters` (see filterSnapshot) decide what is drawn at all.
+ */
+export function layoutScene(snapshot, { mode = 'activity', filters = {}, aspect: aspectIn = 1.35 } = {}) {
+  const aspect = Number.isFinite(aspectIn) ? aspectIn : 1.35;
+  const view = filterSnapshot(snapshot || {}, filters);
+  const agents = view.agents.map((a) => ({ ...a }));
+  const byId = new Map(agents.map((a) => [a.node_id, a]));
+  for (const e of view.edges) for (const id of [e.from, e.to]) if (id && !byId.has(id)) { const stub = personStub(id); byId.set(id, stub); agents.push(stub); }
+  // A person has no room id of their own; they belong to the room(s) their edges are in (else the room of the agent on the other end).
+  for (const p of agents.filter((a) => a.kind === 'person')) {
+    const rs = new Set();
+    for (const e of view.edges) {
+      if (e.from !== p.node_id && e.to !== p.node_id) continue;
+      if (e.room_id) rs.add(e.room_id); else for (const r of list(byId.get(e.from === p.node_id ? e.to : e.from)?.room_ids)) rs.add(r);
+    }
+    p.room_ids = [...rs].sort();
+  }
+  const compact = aspect < 0.8, asp = Math.max(0.5, Math.min(1.8, aspect));
+  const roles = new Map();
+  const role = (id, r, task) => { if (!id) return; if (!roles.has(id)) roles.set(id, []); roles.get(id).push({ role: r, task }); };
+  for (const t of view.tasks) { role(t.accountable_owner, 'owner', t.task_id); role(t.reviewer, 'reviewer', t.task_id); for (const c of list(t.contributors)) role(c, 'contributor', t.task_id); }
+
+  const groups = groupByRoom(agents, view.rooms);
+  const radii = groups.map((g) => clusterRadius(g.members.length));
+  const k = groups.length, maxR = Math.max(0, ...radii);
+  const sx = k <= 1 ? Math.max(0.85, Math.sqrt(asp)) : 1, sy = k <= 1 ? Math.max(0.85, 1 / Math.sqrt(asp)) : 1;   // one room: its members sit on an ellipse shaped like the canvas
+  const orbit = k <= 1 ? 0 : k === 2 ? maxR + 24 : maxR / Math.sin(Math.PI / k) + 24;
+  const rooms = [], nodes = [];
+  groups.forEach((g, gi) => {
+    const angle = k <= 1 ? 0 : -Math.PI / 2 + (2 * Math.PI * gi) / k;
+    const cx = k <= 1 ? 0 : orbit * Math.cos(angle) * 1.25, cy = k <= 1 ? 0 : orbit * Math.sin(angle);
+    const n = g.members.length, ringR = n <= 1 ? 0 : memberRing(n);
+    let rx = n <= 1 ? radii[gi] : ringR * sx + LABEL_BELOW + 12, ry = n <= 1 ? radii[gi] : ringR * sy + LABEL_BELOW + 12;
+    // Phone: one room is two columns of nodes in a rounded box, so the scene is narrow and scales up instead of shrinking the text away.
+    const grid = k <= 1 && compact && n > 1;
+    const rows = Math.ceil(n / 2), top0 = -((rows - 1) * GRID_ROW) / 2;
+    if (grid) { rx = GRID_COL / 2 + HALO_R + 10; ry = ((rows - 1) * GRID_ROW) / 2 + (HALO_R + 40 + LABEL_BELOW) / 2; }
+    g.members.forEach((m, i) => {
+      const a = n <= 1 ? 0 : -Math.PI / 2 + (2 * Math.PI * i) / n;
+      const gx = grid ? ((i % 2) - 0.5) * GRID_COL * (n % 2 && i === n - 1 ? 0 : 1) : 0, gy = grid ? top0 + Math.floor(i / 2) * GRID_ROW : 0;
+      const ctx = contextInfo(m.context, m.context_health), st = stateInfo(m.state);
+      nodes.push({
+        id: m.node_id, x: r1(cx + (grid ? gx : ringR * sx * Math.cos(a))), y: r1(cy + (grid ? gy : ringR * sy * Math.sin(a))), r: NODE_R, room: g.id, person: m.kind === 'person' || isPerson(m.node_id),
+        name: nodeName(m), model: modelLabel(m), modelKnown: Boolean(m.model), provider: m.provider || null, host: m.host_id || null,
+        ctx, ring: ringGeometry(ctx.fraction), state: st, provenance: m.provenance || 'unknown', parent: m.parent_session_id || null,
+        modelChanges: list(m.model_changes).length, switchedFrom: switchedFrom(m), hasDrift: !m.kind && (list(m.drift).length > 0 || (m.drift_warnings || 0) > 0), compactions: m.compactions || 0, drift: m.drift_warnings || 0, driftItems: driftItems(m), lastEventAt: m.last_event_at || null,
+        roles: roles.get(m.node_id) || [], agent: m,
+      });
+    });
+    const rh = list(view.rooms).find((r) => r.room_id === g.id)?.context_health;
+    rooms.push({ id: g.id, ctx: contextInfo(null, rh && Number.isFinite(rh.average_fraction) ? { measured: true, fraction: rh.average_fraction } : null), name: list(view.rooms).find((r) => r.room_id === g.id)?.name || null, label: roomLabel(g.id, list(view.rooms).find((r) => r.room_id === g.id)?.name),
+      cx: r1(cx), cy: r1(cy + (grid ? (LABEL_BELOW - HALO_R - 40) / 2 : 0)), r: r1(Math.max(rx, ry)), rx: r1(rx), ry: r1(ry), shape: grid ? 'rect' : 'ellipse', members: g.members.map((m) => m.node_id) });
+  });
+
+  for (const n of nodes) n.roomLabel = rooms.find((r) => r.id === n.room)?.label || roomLabel(n.room);
+  const at = new Map(nodes.map((n) => [n.id, n]));
+  const pairs = new Map();
+  const live = view.edges.filter((e) => at.has(e.from) && at.has(e.to) && e.from !== e.to);
+  for (const e of live) { const key = [e.from, e.to].sort().join('>'); pairs.set(key, (pairs.get(key) || 0) + 1); }
+  const seen = new Map();
+  const kinds = modeKinds(mode);
+  const edges = live.map((e) => {
+    const key = [e.from, e.to].sort().join('>'), i = seen.get(key) || 0, total = pairs.get(key);
+    seen.set(key, i + 1);
+    const forward = e.from < e.to ? 1 : -1;
+    // Bend: a slight arc always (so lines read as flows), parallel edges fan out to either side of the chord.
+    const bend = forward * (30 + (i - (total - 1) / 2) * 44);
+    const g = curve(at.get(e.from), at.get(e.to), bend);
+    const style = edgeStyle(e);
+    return {
+      id: edgeId(e), from: e.from, to: e.to, kind: style.kind, state: style.state, style, d: g.d, mid: g.mid, at: g.at, length: g.length,
+      label: style.label, task: e.task_id || null, handoff: e.handoff_id || null, room: e.room_id || null, eventId: e.event_id || null,
+      provenance: e.provenance || 'unknown', updatedAt: e.updated_at || null, dimmed: kinds != null && !kinds.includes(style.kind), raw: e,
+    };
+  });
+
+  placeLabels(edges, nodes, compact ? LABEL_CHAR * 1.3 : LABEL_CHAR);
+  for (const e of edges) delete e.at;
+
+  // Fit: the box around every room ellipse and node (with its labels), padded, never smaller than a sane minimum so one node is not blown up.
+  const xs = [...rooms.flatMap((r) => [r.cx - r.rx, r.cx + r.rx]), ...nodes.flatMap((n) => [n.x - HALO_R, n.x + HALO_R])];
+  const ys = [...rooms.flatMap((r) => [r.cy - r.ry, r.cy + r.ry]), ...nodes.flatMap((n) => [n.y - HALO_R, n.y + LABEL_BELOW])];
+  let minX = xs.length ? Math.min(...xs) - 12 : -260, maxX = xs.length ? Math.max(...xs) + 12 : 260;
+  let minY = ys.length ? Math.min(...ys) - 12 : -170, maxY = ys.length ? Math.max(...ys) + 12 : 170;
+  const grow = (lo, hi, min) => (hi - lo >= min ? [lo, hi] : [(lo + hi) / 2 - min / 2, (lo + hi) / 2 + min / 2]);
+  [minX, maxX] = grow(minX, maxX, compact ? 380 : 520); [minY, maxY] = grow(minY, maxY, 340);
+  return { mode, nodes, edges, rooms, tasks: view.tasks, viewBox: { x: r1(minX), y: r1(minY), w: r1(maxX - minX), h: r1(maxY - minY) }, compact,
+    counts: { nodes: nodes.length, edges: edges.length, rooms: rooms.length, tasks: view.tasks.length }, cursor: snapshot?.cursor ?? null, truncated: Boolean(snapshot?.truncated) };
+}
+
+// ---- text that has to stay inside a node circle ------------------------------------------------------------------------------------
+// No DOM here (the model runs under node), so widths are estimated per character class: deliberately a little wide, so an estimate that
+// says "fits" is true in a real font too. The map tests re-measure the rendered text with getBBox in a real browser.
+const NARROW = new Set([...".iljtfrI,:;'|! "]), WIDE = new Set([...'mwMW']);
+export function estimateTextWidth(str, px, mono = false) {
+  if (mono) return [...String(str)].length * px * 0.605;
+  return [...String(str)].reduce((w, ch) => w + px * (NARROW.has(ch) ? 0.38 : WIDE.has(ch) ? 0.92 : ch >= 'A' && ch <= 'Z' ? 0.70 : ch.codePointAt(0) >= 0x1100 ? 1 : 0.58), 0);
+}
+/** Width of the horizontal chord of the node body that a text line (baseline y, font size px) may use, minus `pad` on each side. */
+export function chordWidth(baselineY, px, pad = 6, radius = NODE_R) {
+  const far = Math.max(Math.abs(baselineY - 0.75 * px), Math.abs(baselineY + 0.25 * px));
+  return Math.max(0, 2 * Math.sqrt(Math.max(radius * radius - far * far, 0)) - 2 * pad);
+}
+/** SVG attributes that squeeze a line that is too wide to maxW (glyph spacing), for text that must stay whole: 'ctx unknown', 'model unknown'. */
+export function squeezeAttrs(str, maxW, px, mono = false) {
+  return estimateTextWidth(str, px, mono) <= maxW ? '' : ` textLength="${Math.round(maxW * 10) / 10}" lengthAdjust="spacingAndGlyphs"`;
+}
+/** The text, ellipsised so that its estimated width is at most maxW. */
+export function fitText(str, maxW, px, mono = false) {
+  const chars = [...String(str)];
+  if (estimateTextWidth(chars.join(''), px, mono) <= maxW) return chars.join('');
+  let n = chars.length;
+  while (n > 1 && estimateTextWidth(`${chars.slice(0, n - 1).join('').trimEnd()}…`, px, mono) > maxW) n -= 1;
+  return `${chars.slice(0, Math.max(n - 1, 1)).join('').trimEnd()}…`;
+}
+
+// ---- change detection: what animates ----------------------------------------------------------------------------------------------
+/**
+ * What changed between two snapshots. A model change on an existing node is a ring pulse on that node; a session that was not there
+ * before is a new node. Nothing here invents identity: nodes are matched by node_id only.
+ */
+export function diffSnapshots(prev, next) {
+  const before = new Map(list(prev?.agents).map((a) => [a.node_id, a]));
+  const out = { added: [], removed: [], modelChanged: [], stateChanged: [], edgesAdded: [], edgesChanged: [] };
+  for (const a of list(next?.agents)) {
+    const p = before.get(a.node_id);
+    if (!p) { out.added.push(a.node_id); continue; }
+    if (p.model !== a.model || list(a.model_changes).length > list(p.model_changes).length) out.modelChanged.push(a.node_id);
+    if (p.state !== a.state) out.stateChanged.push(a.node_id);
+  }
+  const now = new Set(list(next?.agents).map((a) => a.node_id));
+  for (const id of before.keys()) if (!now.has(id)) out.removed.push(id);
+  const old = new Map(list(prev?.edges).map((e) => [edgeId(e), e]));
+  for (const e of list(next?.edges)) {
+    const p = old.get(edgeId(e));
+    if (!p) out.edgesAdded.push(edgeId(e)); else if (p.state !== e.state) out.edgesChanged.push(edgeId(e));
+  }
+  return out;
+}
+
+// ---- text alternatives ------------------------------------------------------------------------------------------------------------
+export function describeNode(n) {
+  const who = n.person ? `Person ${n.name}` : `Agent ${n.name}`;
+  const parts = [who, n.person ? '' : `model ${n.modelKnown ? n.model : 'unknown'}`, n.person ? '' : n.ctx.known ? n.ctx.words : 'context unknown',
+    `state ${n.state.label.toLowerCase()}`, n.hasDrift ? 'drift signal (heuristic)' : '', n.switchedFrom ? `model switched from ${n.switchedFrom}` : '', n.host ? `host ${n.host}` : '', n.roomLabel || roomLabel(n.room),
+    ...n.roles.map((r) => `${r.role} of task ${r.task}`)];
+  return parts.filter(Boolean).join(', ');
+}
+export function describeEdge(e, scene) {
+  const name = (id) => scene.nodes.find((n) => n.id === id)?.name || id;
+  return `${e.style.kindLabel} from ${name(e.from)} to ${name(e.to)}, ${e.style.state}${e.style.dashed ? (e.style.planned ? ' (planned, dashed)' : ' (rejected, dotted)') : ' (solid)'}${e.task ? `, task ${e.task}` : ''}`;
+}
+/** Rows for the visually hidden table that carries everything the picture says. */
+export function altTable(scene) {
+  return {
+    nodes: scene.nodes.map((n) => ({ id: n.id, name: n.name, model: n.person ? '' : n.model, context: n.person ? '' : n.ctx.label, state: n.state.label, room: n.roomLabel || roomLabel(n.room), host: n.host || '' })),
+    edges: scene.edges.map((e) => ({ id: e.id, kind: e.style.kindLabel, from: scene.nodes.find((n) => n.id === e.from)?.name || e.from, to: scene.nodes.find((n) => n.id === e.to)?.name || e.to, state: e.style.state, line: e.style.line, task: e.task || '' })),
+  };
+}
+
+// ---- keyboard order -----------------------------------------------------------------------------------------------------------------
+/** Visual reading order: cluster by cluster, left to right; arrows move to the nearest node in that direction. */
+export function neighbour(scene, id, dir) {
+  const from = scene.nodes.find((n) => n.id === id);
+  if (!from) return scene.nodes[0]?.id ?? null;
+  const v = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[dir];
+  if (!v) return null;
+  let best = null, score = Infinity;
+  for (const n of scene.nodes) {
+    if (n.id === id) continue;
+    const dx = n.x - from.x, dy = n.y - from.y, along = dx * v[0] + dy * v[1];
+    if (along <= 1) continue;
+    const across = Math.abs(dx * v[1] - dy * v[0]);
+    const s = along + across * 2;
+    if (s < score) { score = s; best = n.id; }
+  }
+  return best;
+}
+
+// ---- replay -----------------------------------------------------------------------------------------------------------------------
+export const SPEEDS = [0.5, 1, 2, 4, 8];
+
+/** a server cursor (`<ingest time>~...`) -> epoch ms of the ingest time (NaN when malformed). Cursors stay opaque otherwise. */
+export const cursorTime = (cursor) => Date.parse(text(cursor).split('~')[0]);
+
+export function eventLabel(ev) {
+  const what = text(ev?.event_type).replace(/\./g, ' ');
+  const who = text(ev?.agent_id) || text(ev?.session_id);
+  return `${what}${who ? ` · ${shortId(who)}` : ''}`;
+}
+
+/** Normalized /events rows -> ordered, de-duplicated timeline entries, newest `cap` kept. Cursor order = server order. */
+export const TIMELINE_CAP = 2000;
+export function buildTimeline(events, previous = [], cap = TIMELINE_CAP) {
+  const byCursor = new Map(previous.map((t) => [t.cursor, t]));
+  for (const ev of list(events)) {
+    if (!ev || !ev.event_id || !ev.ingested_at || typeof ev.cursor !== 'string' || !ev.cursor) continue;
+    const cursor = ev.cursor;   // the server's opaque cursor, never built here
+    byCursor.set(cursor, { cursor, id: ev.event_id, type: text(ev.event_type), at: cursorTime(cursor), agent: ev.agent_id || null, session: ev.session_id || null,
+      room: ev.room_id || null, task: ev.task_id || null, provenance: ev.provenance || 'unknown', label: eventLabel(ev) });
+  }
+  const sorted = [...byCursor.values()].sort((a, b) => (a.cursor < b.cursor ? -1 : a.cursor > b.cursor ? 1 : 0));
+  return sorted.length > cap ? sorted.slice(sorted.length - cap) : sorted;   // ring buffer: the oldest entries fall off
+}
+
+/** Where the scrubber stands. `index` null = Live. */
+export function replayFrame(timeline, index) {
+  const count = timeline.length;
+  if (index == null || count === 0) return { live: true, index: null, count, cursor: null, at: count ? timeline[count - 1].at : null, fraction: 1, entry: count ? timeline[count - 1] : null };
+  const i = Math.max(0, Math.min(count - 1, Math.round(index)));
+  return { live: false, index: i, count, cursor: timeline[i].cursor, at: timeline[i].at, fraction: count > 1 ? i / (count - 1) : 1, entry: timeline[i] };
+}
+/** Slider fraction (0..1) -> timeline index. */
+export const indexAtFraction = (timeline, fraction) => (timeline.length ? Math.max(0, Math.min(timeline.length - 1, Math.round(fraction * (timeline.length - 1)))) : null);
+/** Next index while playing; null when it runs past the end (the player then returns to Live). */
+export const nextIndex = (timeline, index, step = 1) => { const n = (index ?? -1) + step; return n >= timeline.length ? null : Math.max(0, n); };
+/** Milliseconds to wait before showing the event after `index`: real gap scaled by speed, bounded so a quiet hour does not stall. */
+export function stepDelay(timeline, index, speed = 1) {
+  const s = SPEEDS.includes(speed) ? speed : 1;
+  const a = timeline[index], b = timeline[index + 1];
+  const gap = a && b && Number.isFinite(a.at) && Number.isFinite(b.at) ? Math.max(0, b.at - a.at) : 600;
+  return Math.round(Math.max(120, Math.min(1500, gap)) / s);
+}
+export const formatClock = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString().slice(11, 19) : '--:--:--');

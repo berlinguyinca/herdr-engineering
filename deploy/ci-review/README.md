@@ -60,8 +60,12 @@ is refused, and nothing from models.json is run.
   reasoning tokens keep a slow answer alive. Only `content` deltas count as the answer; `reasoning_content` is
   ignored.
 - `finish_reason=length` or an empty answer is retried once, then the chunk fails.
-- 429, 5xx and connection errors are retried 4 times, with a backoff of 5 s doubling each time. A `Retry-After`
+- 5xx and connection errors are retried 4 times, with a backoff of 5 s doubling each time. A `Retry-After`
   header wins, capped at 60 s.
+- 429 means the model's single slot is taken (deepseek and qwen serve one request at a time; another review may
+  hold the slot for minutes). It is waited out separately, for up to `reviewer.busy_wait_s` (default 1800 s) in
+  total, and does not use up `retries`. If the gateway stays busy past that, the run fails and posts no terminal
+  status; `poll` retries the head once its pending status goes stale.
 - The answer's `model` field must also be of an independent family. The status names that id.
 - Chunks run one at a time (`reviewer.parallel: 1`), because the gateway is shared.
 

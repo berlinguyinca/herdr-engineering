@@ -75,6 +75,8 @@ const roleLabel = (r) => ROLE_LABEL[r] || r;
 const shortId = (id) => `…${String(id || '').slice(-6)}`;
 const hue = (s) => { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
 // An agent's name as a coloured badge, with a pencil for those allowed to rename it.
+// An expired agent the owner may renew (`renewable` is the server's verdict: never external, fabric, fabric-join or helper agents).
+const canRenew = (a) => a.status === 'active' && a.renewable === true && a.expires_at * 1000 < Date.now();
 const agentBadge = (name) => `<span class="cx-av cx-av--sm" style="--h:${hue(name)}" aria-hidden="true">${esc((String(name).match(/[a-z0-9]/gi) || ['?'])[0].toUpperCase())}</span>`;
 const agentTitle = (a, canRename) => `<span class="cx-ntitle">${agentBadge(a.name)}<b class="cx-nname">${esc(a.display_name || `@${a.name}`)}</b>${a.display_name?`<small class="hd-ident">@${esc(a.name)}</small>`:''}${canRename ? `<button type="button" class="cx-edit" data-rename="${esc(a.agent_id)}" data-name="${esc(a.name)}" title="Rename @ handle" aria-label="Rename @${esc(a.name)} handle">✎</button>` : ''}</span>`;
 
@@ -563,7 +565,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         ${knownSessions.has(a.instance_id) ? nativeSessionLink(a.instance_id) : ''}
         <span class="hd-card__sub">Expires ${esc(new Date(a.expires_at * 1000).toLocaleDateString())} · ${a.rooms.length ? `in ${esc(a.rooms.map((r) => r.name).join(', '))}` : 'not in any room yet'}</span>
         ${sessions ? `<label class="cx-msg">Fabric agent <select data-link="${esc(a.agent_id)}"><option value="">not linked</option>${sessionOptions(a.instance_id)}</select></label>` : ''}
-        <div><button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-revoke="${esc(a.agent_id)}">Stop access</button></div></div>`).join('')}</div>`
+        <div>${canRenew(a) ? `<button type="button" class="hd-btn hd-btn--sm" data-renew="${esc(a.agent_id)}" title="New credential, same agent, name and rooms">Renew access</button> ` : ''}<button type="button" class="hd-btn hd-btn--danger hd-btn--sm" data-revoke="${esc(a.agent_id)}">Stop access</button></div></div>`).join('')}</div>`
       : '<div class="hd-empty">No connected agents yet.</div>';
     if (focusLinkedAgent) {
       const selected = [...box.querySelectorAll('[data-agent-card]')].find((card) => card.dataset.agentCard === linkedAgent);
@@ -571,6 +573,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     }
     wireRename(box, renderAgents);
     box.querySelectorAll('[data-link]').forEach((sel) => { sel.onchange = async () => { try { await api.linkAgent(sel.dataset.link, sel.value); } catch (e) { alert(e.message); } }; });
+    box.querySelectorAll('[data-renew]').forEach((b) => { b.onclick = async () => { try { showCredential(await api.renewAgent(b.dataset.renew)); await renderAgents(); } catch (e) { alert(e.message); } }; });
     box.querySelectorAll('[data-revoke]').forEach((b) => { b.onclick = async () => { if (!window.confirm('Revoke this agent access and stop it?')) return; await api.revokeAgent(b.dataset.revoke); renderAgents(); }; });
     const filter=box.querySelector('[data-agent-family-filter]'),countBox=box.querySelector('[data-agent-selected-count]'),selectedButton=box.querySelector('[data-agent-stop-selected]');
     const syncBulk=()=>{const chosen=[...box.querySelectorAll('[data-agent-select]:checked')];if(countBox)countBox.textContent=`${chosen.length} selected`;if(selectedButton)selectedButton.disabled=!chosen.length;box.querySelectorAll('[data-agent-card]').forEach(card=>{card.hidden=!!(filter?.value&&card.dataset.agentFamily!==filter.value);});};
