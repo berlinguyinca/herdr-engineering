@@ -2,7 +2,7 @@
  "_provenance": {
   "generated_by": "tests/control_plane/record_diagnostics_events.py",
   "generated_with": "PYTHONPATH=. python tests/control_plane/record_diagnostics_events.py",
-  "ids_and_timestamps": "replaced with stable values; every other key and value is the server's own",
+  "ids_and_timestamps": "event ids, page cursors and wall-clock instants replaced with stable values; every other key and value is the server's own",
   "server": "herdr_engineering.control_plane.api.ControlPlaneServer over a loopback socket"
  },
  "events_bare": {
@@ -71,7 +71,7 @@
     }
    ],
    "has_more": false,
-   "last_event_id": "event_01m7byrmw8000001zerqj0gt85",
+   "last_event_id": "event_recorded_last",
    "latest_sequence": 2,
    "next_cursor": null
   },
@@ -101,9 +101,9 @@
     }
    ],
    "has_more": true,
-   "last_event_id": "event_01m7byrmw8000001zerqj0gt85",
+   "last_event_id": "event_recorded_last",
    "latest_sequence": 2,
-   "next_cursor": "WzEsMiwiOGJjODRlZDk2NDY2MTY4ODYyNTk0ZDYyYTJlMjBlNzEwNTI1N2M0MWJmYmU2MDAwN2Q4NDYwNGEwOTIwYzE3ZiIsImUyYTNhNjMxZWM3MWE0ZGY3Yjk3NmMyMzZjMWZjN2UwNDllOTFiNTlkNzI3ZWViZTkxMTc2YjkyODg5NmNhZTgiXQ"
+   "next_cursor": "recorded_cursor"
   },
   "status": 200
  },
@@ -112,10 +112,10 @@
    "hosts": [
     {
      "cpu": null,
-     "created_at": "2026-11-14T02:39:11.753006+00:00",
+     "created_at": "2026-11-14T02:03:00+00:00",
      "host_id": "farm",
      "host_name": "farm",
-     "last_seen": "2026-11-14T02:39:11.753006+00:00",
+     "last_seen": "2026-11-14T02:03:00+00:00",
      "mem": null,
      "problem_count": 1,
      "problems": [
@@ -130,10 +130,10 @@
     },
     {
      "cpu": null,
-     "created_at": "2026-11-14T02:39:11.751693+00:00",
+     "created_at": "2026-11-14T02:03:00+00:00",
      "host_id": "hive",
      "host_name": "hive",
-     "last_seen": "2026-11-14T02:39:11.752621+00:00",
+     "last_seen": "2026-11-14T02:03:00+00:00",
      "mem": null,
      "problem_count": 1,
      "problems": [
