@@ -439,6 +439,20 @@ def _build_parser() -> argparse.ArgumentParser:
             rp.add_argument("--max-unchanged-online-passes", type=int, default=8, help="stop for review after this many unchanged online passes per session (1..1000)")
         rp.set_defaults(func=_cmd_fleet_rollout)
 
+    rp = rsub.add_parser(
+        "retire-identityless",
+        help="settle blocked registrations whose instance identity cannot be resolved, so the "
+        "rollout can finish for what it can prove; the evidence stays in the report",
+    )
+    rp.add_argument("--state", default=None, help="private rollout state directory")
+    rp.add_argument("--id", required=True, help="rollout ID printed by plan")
+    rp.add_argument(
+        "--settled-by",
+        default="operator",
+        help="who is settling the registration; recorded per session in the report",
+    )
+    rp.set_defaults(func=_cmd_fleet_rollout)
+
     # artifacts ------------------------------------------------------------
     p = sub.add_parser("artifacts", help="shared artifact workspace (spec 0080)")
     asub = p.add_subparsers(dest="artifacts_command", required=True)
@@ -1875,6 +1889,7 @@ def _cmd_fleet_rollout(args) -> int:
         apply_rollout,
         create_rollout,
         inventory_targets,
+        retire_identityless,
         run_rollout,
     )
 
@@ -1887,6 +1902,8 @@ def _cmd_fleet_rollout(args) -> int:
             report = apply_rollout(store, args.id)
         elif args.rollout_command == "run":
             report = run_rollout(store, args.id, interval_seconds=args.interval_seconds, max_passes=args.max_passes, max_unchanged_online_passes=args.max_unchanged_online_passes)
+        elif args.rollout_command == "retire-identityless":
+            report = retire_identityless(store, args.id, settled_by=args.settled_by)
         else:
             report = store.read(args.id)
     except (OSError, ValueError, RuntimeError) as exc:
@@ -1895,6 +1912,8 @@ def _cmd_fleet_rollout(args) -> int:
     _print_json(report)
     if report.get("runner", {}).get("status") == "interrupted" and args.rollout_command == "run":
         return 130
+    if args.rollout_command == "retire-identityless" and report.get("stillBlocked"):
+        return 2
     return 0 if args.rollout_command not in ("apply", "run") or report["status"] == "complete" else 2
 
 

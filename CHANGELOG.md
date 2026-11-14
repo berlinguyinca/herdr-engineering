@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: retired identity-less registrations are terminal and keep host-level blockers (#779, #798 review)
+
+- `fleet rollout retire-identityless` now settles only what it can: the identity refusal is recorded as a typed `blockReason` on the session (no string matching), and host-level reasons (unverified native coverage, ambiguous native identity, a missing discovered session) are recorded separately as `hostLevelError`, so a host with an identity-less session plus a coverage error stays blocked with its reason and `coverageErrors`. Hosts with nothing retired are untouched.
+- A retired session is terminal: the runner no longer stops as blocked or stalled on it, its husk leaving the native inventory no longer raises "previously discovered session is missing", and it keeps its refusal in `error` and `retiredSessions`. If its identity resolves, the next pass un-retires it and replaces `pid`/`instanceId` with the real values.
+- The command exits 2 when `stillBlocked` is non-empty. Rollback: revert the commit.
+
 ### Fix: daily budget hardening (always-on-review.py, #818 follow-up)
 
 - Spend already incurred is now logged (`usage`) when a review's head moves after the model ran and when every pass fails with an unusable answer, so `spent_today_usd` counts it (the billed usage of an unusable later pass is counted too). A logged NaN or infinite cost is counted as zero instead of making the sum NaN (which never tripped the budget). An integer `daily_budget_usd` too large for a float (e.g. `10**400`) is refused as a config error instead of raising `OverflowError`. `reviews.jsonl` is read with `errors="replace"`, so an undecodable byte skips that line instead of crashing a review. Per-PR locking and the whole-log read are unchanged. Rollback: revert the commit.
