@@ -164,6 +164,9 @@ def _report_preview(descriptor: dict, *, max_bytes: int | None = None, figure_im
     from .artifact_report_render import render_report_preview
     options = {} if max_bytes is None else {"max_bytes": max_bytes}
     page = render_report_preview(descriptor, asset_url=lambda asset: "#", figure_images=figure_images, **options)
+    # the descriptor is not shared either: say so instead of leaving a plain-text "full descriptor" that suggests a link
+    page = page.replace('see the <a href="report">full descriptor</a>.', "the full report is available to its owner.")
+    page = page.replace("the full descriptor has everything.", "the full report is available to its owner.")
     page = re.sub(r'<a class="btn" href="#" download>.*?</a>', "", page)  # a download button has no target here
     # keep chip styling; a chip whose target was omitted points at the descriptor ("report"), which is not shared
     page = re.sub(r'<a (class="[a-z ]+") href="(?:#|report)">(.*?)</a>', r"<span \1>\2</span>", page)

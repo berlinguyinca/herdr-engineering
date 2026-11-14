@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Report preview: link-preview metadata, honest share notice, fairer section quotas
+
+- The report preview head now carries `description`, `og:title`, `og:description`, `og:type=article`, `og:site_name` and `twitter:card=summary` (summary cut near 160 characters, falling back to finding/evidence counts; every value attribute-escaped). The CSP and the sanitiser allowlist are unchanged. The tags are dropped only when even the 4 KiB minimum cap cannot hold them.
+- In a share, the truncation notice no longer says "see the full descriptor" (that link was rewritten to plain text because the descriptor is not shared); it now says the full report is available to its owner.
+- Section quotas: unused quota of a section that fits is now handed to sections that overflow, so a 1 MiB preview of 500 evidence rows no longer drops about 16 of them under the fixed 4/2/2/1 weight split. Output still never exceeds the cap.
+
 ### Fix: Woodpecker agent pruner and fabric firewall script polish
 
 - `wpci-agent-prune`: a null or non-object queue response, a null `agent_id` in a queue task, or a non-list agents response now exits 1 with the normal `abort: API error` line instead of a traceback. The unreachable "more candidates than agents" abort is removed (candidates are a subset of the agents listed). README documents that after a >24h Woodpecker outage up to `--max-deletions` live agents per run may be removed (they re-register) and how to lower the cap.
