@@ -265,3 +265,19 @@ def test_both_scripts_are_valid_bash():
     for script in (APPLICABLE, CRON):
         out = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
         assert out.returncode == 0, f"{script.name}: {out.stderr}"
+
+
+def test_cron_without_a_state_dir_fails_loudly_instead_of_guessing(tree, tmp_path):
+    env = {k: v for k, v in os.environ.items() if k not in ("HERDR_CI_STATE", "XDG_STATE_HOME")}
+    env.update(RUN_LOG=str(tmp_path / "ran"), HOME=str(tmp_path / "home"))
+    result = subprocess.run(["bash", str(tree / "scripts" / "ci" / "main-cron-gates.sh")],
+                            cwd=tree, env=env, capture_output=True, text=True)
+    assert result.returncode == 2 and "HERDR_CI_STATE is not set" in result.stderr
+    assert not (tmp_path / "ran").exists() and not (tmp_path / "home").exists()
+
+
+def test_the_cron_pipeline_takes_its_state_dir_from_the_runner_with_runtime_escaping():
+    commands = yaml.safe_load(CRON_YML)["steps"][1]["commands"]
+    export = next(c for c in commands if "HERDR_CI_STATE" in c)
+    assert "$${WPCI_CI_DIR" in export, "Woodpecker substitutes single-$ vars at parse time; the runtime var needs $$"
+    assert "/home/" not in CRON_YML

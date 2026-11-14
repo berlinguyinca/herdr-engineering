@@ -30,8 +30,8 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Chore: scrub private infrastructure identifiers from tracked files
 
 - Tailscale IPs, the tailnet name, and a personal hostname in docs, tests, examples and help text are now documentation placeholders (100.64.8.x, <tailnet>, operator-laptop). Git history still contains the old values; a history rewrite has not been done (owner decision). deploy/fabric-stack/config.yaml keeps the live tailnet name because the deployment mounts it.
-- scripts/ci/main-cron-gates.sh no longer defaults HERDR_CI_STATE to a personal home path: it falls back to ${XDG_STATE_HOME:-$HOME/.local/state}/herdr-ci, and .woodpecker/main-cron.yml exports the same $HOME/woodpecker/ci/state/herdr path the script used before.
->>>>>>> 282da8e3 (chore: scrub private infrastructure identifiers from tracked files)
+
+- scripts/ci/main-cron-gates.sh no longer defaults HERDR_CI_STATE to a personal home path and now fails (exit 2) when it is unset, rather than guessing a non-persistent directory. .woodpecker/main-cron.yml sets it to $${WPCI_CI_DIR}/state/herdr; the runner must export WPCI_CI_DIR as the in-container mount of the shared CI store (the runner WPCI_CI_MOUNT).
 
 ### Fix: deploy.sh no longer warns that the fabric firewall is missing when it merely cannot read it
 
