@@ -5,6 +5,43 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Review prompt v2: rules, checklist, evidence, passes, replay harness (always-on-review.py)
+
+- New YAML keys: `prompt.project_rules` (trusted rules in both tiers' prompt), `prompt.checklist_file` (`deploy/ci-review/review-checklist.yaml`, validated, the reviewer lists the ids it considered in `checked_items`), `prompt.require_evidence` (default true), `tiers.tier2.passes` (the example ships general, tests, security, migrations; unset or `[]` keeps one unfocused review) and `replay.clones`. The claude prompt now tells the reviewer to read callers, tests and migrations before the verdict.
+- Findings gain `evidence` and `how_it_fails`; the script downgrades a blocking finding to a note when its evidence is absent from the diff and the file at the pinned head. Old-shape answers still validate. `reviews.jsonl` lines gain `downgraded`, per-pass `passes`, `checked_items` and a capped, redacted `findings` array.
+- New `replay --corpus DIR --tier tier1|tier2` (never posts, resumable, one at a time), `replay compare A B` and `corpus build --repo --since --out` (read-only `gh`). Two seed cases in `tests/ci_review/corpus/`.
+- Review fixes: `time_cap_s` is one cap shared by all passes (each pass gets an equal share of the time left; the example tier 2 cap is now 3600). A later pass failing keeps the completed passes' findings (logged, `partial`); it never posts success. With `require_evidence`, a blocker now also needs `how_it_fails` and a quote of at least 20 characters or a whole line from the cited file's hunks; the downgrade count appears in the status text, and a `block` verdict whose blockers were all downgraded leaves tier 2 pending (tier 1 posts an advisory success). Merge dedupes on file, line, category and reason prefix. Over-long evidence is truncated instead of failing the verdict. Evidence quotes may keep their diff `+`/`-` markers and an `a/`/`b/` path prefix, removed lines and deleted files count, a short quote must be a whole line of at least 12 characters, boilerplate lines (`except Exception as e:`, `from __future__ import annotations`, `raise NotImplementedError()`) are never evidence, and a blocker on a file outside the PR is dropped rather than left pending. Replay marks a case whose pass failed `partial` (not scored, retried, exit 1), and `corpus build` records the PR's final head as `head_sha_fallback` for replay when the pinned commit is gone. Upgrade note: an existing config with `time_cap_s: 1800` should raise it to 3600, because the cap is now shared across passes. Replay retries skipped cases and re-scores a case whose ground truth changed. `corpus build` pins each case to the commit the comments were made on, counts only human or `replay.reviewers` thread-root comments and skips the PR author's.
+- Default change: with the shipped example config tier 2 now makes four sequential claude runs, so cost and time per review rise about fourfold. Rollback: set `tiers.tier2.passes: []`, `prompt.require_evidence: false`, `prompt.project_rules: []`, drop `checklist_file`. Restart: the polling service reads the config at start, so restart it after editing.
+
+### Always-on review: two tiers, claude and pi backends (dry-run by default)
+
+- New `deploy/ci-review/always-on-review.py` builds on `ai-review.py`: tier 1 `Open-weight pre-review` (advisory, pi) and tier 2 `Opus agent review` (claude, only for heads with all gates green), pluggable `gateway` / `claude` / `pi` backends chosen in YAML only, strict verdict parsing, one review per head SHA, cooldown, time cap, detached read-only worktree, scrubbed environment. Posting needs `post: true` in config and `--post`. Nothing is installed or enabled; added example config, systemd --user service/timer and a herdr pane tail script. `ai-review.py` gained an optional schema argument on `Gateway.chat` and `Gh.check_runs`.
+
+### Docs: ruleset now requires `Opus agent review`
+
+- Ruleset 25691548 requires the commit status `Opus agent review`, posted by a Claude session after an Opus subagent reviews the exact head (re-post after any push). `Independent AI review` (`ai-review.py`) is advisory; the different-model-family rule no longer holds. Docs only.
+
+### Inspector history reads the archive too
+
+- `GET /api/v1/sessions/{id}/inspector/history` now continues into `fabric_events_archive` once the requested range goes past what the archive job moved out of `fabric_events`. The two tables are merged under the one keyset order and the same opaque cursor, so a page can straddle the boundary with no gap and no duplicate (a row present in both is returned once). No new setting: with no archive table, behaviour is unchanged. Replaces the earlier caveat that archived rows were not read; the archive job itself stays off by default.
+
+### Fleet rollout watcher step 5: service, lock pinning, resume/abandon (off by default)
+- `herdr-eng fleet-watch loop` (poll + plan; rolls out only with `--enable-rollouts`; flock single instance; soft limit warns, hard limit exits only after no progress), user unit `herdr-eng-fleet-watch.service` and `ansible/tasks/fleet-watch.yml` (disabled unless `fleet_watch_enabled: true` on beast). `lock.pin_repos` moves `fleet.lock.yaml` only after a full success with the D3 published-history check, atomically with a backup; `herdr-eng fleet lock verify`. `fleet-watch resume|abandon` (the `run --resume` flag is a deprecated alias). New reasons `downgrade`, `lock_invalid`. Nothing is enabled by this change. See `docs/operations/fleet-rollout-watcher.md`.
+
+### Web: configurable GC thresholds, boot-heap freeze (`control_plane.gc`)
+
+- `control_plane.gc: {gen0, gen1, gen2, freeze}` tunes the collector at web start (restart required). Keys left unset: `gen0`/`gen1` keep the running interpreter's values; `gen2` defaults to 1000.
+- Behaviour change with no `gc` block at all: the default `gen2` goes from 10 to 1000, and the boot heap is frozen. Rollback: `gc: {gen2: 10, freeze: false}` in the fleet YAML.
+- Values must be integers from 1 to 2147483647; a bad block stops startup with `--fleet-config: control_plane.gc...`.
+
+### Design: always-on review pane
+
+- Added `docs/superpowers/specs/2026-11-13-always-on-review-pane-design.md`, a proposal for a dedicated two-tier review process (advisory open-weight first pass, Opus on mergeable heads posting `Opus agent review`) with measured open-weight evidence, a replay-set plan, failure modes and rollback. Docs only.
+
+### Test fix: cargo target-storage CLI test no longer depends on ambient CARGO_TARGET_DIR
+
+- `test_target_management_cli_enable_and_migration_safety` inherited the host environment; a CI agent exporting `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR` made the migrator report "Explicit target setting remains authoritative" instead of "same filesystem". The test now drops those two variables from the child environment and separately asserts the explicit-override verdict. No production code changed.
+
 ### Inspector snapshot boot: used on the complete-replay fallback, strictly validated
 
 - With projection checkpoints on (the default), a missing or rejected checkpoint fell back to a complete replay that ignored `inspector_snapshots` and re-ran every stored inspector row through redaction. That fallback now hands the stored snapshot to the repo, which verifies it by count and ordering and replays everything on any doubt.
@@ -23,6 +60,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Rakazo bridge: `open_owner_origins` (default unchanged)
 - New optional `control_plane.rakazo_bridge.open_owner_origins` (list of 1-8 `scheme://[host]` strings, default `["rakazo://"]`): the exact `Origin` values `open_owner` accepts, so a second native app can use it. http/https, wildcards, whitespace and duplicates are refused at startup; every other guard (network allowlist, proxy checks, 30s interval, operator account) is unchanged. Tests: `tests/control_plane/test_rakazo_bridge.py`.
+
+### CI: unit-gates runs pytest in parallel (pytest-xdist)
+- `scripts/ci/unit-gates.sh` now runs `python -m pytest -q -n auto --maxprocesses=8 --dist=loadfile` (arguments come from `scripts/ci/pytest-parallel.sh`), so the ~90 minute serial run is spread over workers; a file's tests stay on one worker. Overrides: `HERDR_PYTEST_WORKERS=<n>|auto|0` (0 = serial as before), `HERDR_PYTEST_MAXPROCESSES=<cap>`. The file-descriptor floor still applies first (the limit is per process, so each worker leaks only its share). Nothing is deselected or skipped. `pytest-xdist==3.8.0` is pinned in the `dev` extra. Tests: `tests/test_ci_pytest_parallel.py`.
+- `join.sh --stop` now uses `ps -ww`: xdist workers export `COLUMNS=80`, which made `ps -o args=` truncate the worker's command line before `worker.sh`, so `--stop` silently stopped nothing (`tests/control_plane/test_collab_join_script.py` failed only under xdist).
 
 ### Fleet rollout watcher step 4: host-apply and the serial runner (manual, `--apply` required)
 - `herdr-eng fleet host-apply` (precheck/apply/health/rollback per repo, D6 checkout gate, idempotent `no_change`, `fleet-auto-update.lock`, atomic Pi `current` switch keeping 3 releases) and `herdr-eng fleet-watch run [--apply]` (serial beast -> bender -> macbook-pro, halt on first failure, durable crash-resume, ssh timeouts, D8 rollback for pointer flips and ff-only, events through the existing emitter/outbox). Output and events carry no free text. No systemd unit (step 5). Tests: `tests/test_fleet_host_apply.py`, `tests/test_fleet_watch_run.py`. See `docs/operations/fleet-rollout-events.md`.

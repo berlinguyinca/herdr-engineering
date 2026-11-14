@@ -59,7 +59,9 @@ def test_sink_is_idempotent_across_restart_like_sequences():
     sid = repo2.create_session(agent_role="pi")
     repo2.send_message(sid, "hi")
     repo2.record_tool_call(sid, "bash")
-    assert [r[1] for r in conn2.inserts] == [0, 1, 2]
+    assert [r[1] for r in conn2.inserts if r[3] == "session"] == [0, 1, 2]
+    # The command's audit mirror has its own independently sequenced stream.
+    assert [r[1] for r in conn2.inserts if r[3] == "communication"] == [0]
 
 
 def test_sink_failure_never_breaks_repo():

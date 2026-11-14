@@ -61,6 +61,7 @@ import { mountDeployments } from './deployments-view.js';
 import { mountBuildCache, mountBuildDetail } from './build-cache-view.js';
 import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
 import { mountEventHistory } from './event-history.js';
+import { mountCommunications } from './communications-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -90,7 +91,7 @@ const root = document.getElementById('view');
 const NAV = [
   { group: 'Monitor', path: '/overview', label: 'Overview' },
   { group: 'Monitor', path: '/attention', label: 'Attention', match: ['/activity'] },
-  { group: 'Agents', path: '/herd', label: 'Agents', match: ['/missions', '/handoffs', '/topology'] },
+  { group: 'Agents', path: '/herd', label: 'Agents', match: ['/missions', '/handoffs', '/topology', '/communications'] },
   { group: 'Agents', path: '/collab', label: 'Collaboration', capability: 'collab_v1' },
   { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
   { group: 'Agents', path: '/teams', label: 'Your teams', capability: 'unified_workspace_v1' },
@@ -110,7 +111,7 @@ const NAV = [
 // Handoffs are the thread through the Agents section: who started whom, and why. Topology is no longer listed (the lineage
 // graph replaces it); its route still answers for old links.
 const SECTION_TABS = [
-  [['/herd', 'Agents'], ['/missions', 'Missions'], ['/handoffs', 'Handoffs']],
+  [['/herd', 'Agents'], ['/missions', 'Missions'], ['/handoffs', 'Handoffs'], ['/communications', 'Communications']],
   [['/attention', 'Attention'], ['/activity', 'Activity']],
   [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync'], ['/build-cache', 'Build cache', 'build_cache_v1']],
   [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
@@ -257,6 +258,7 @@ const ROUTES = {
   '/intelligence': viewIntelligence,
   '/hosts/:id': viewHost,
   '/activity': viewActivity,
+  '/communications': () => mountCommunications(root, client),
   '/analytics': viewAnalytics,
   '/analytics/missions': viewAnalytics,
   '/analytics/models': viewAnalytics,
