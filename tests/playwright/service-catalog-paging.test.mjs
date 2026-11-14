@@ -12,7 +12,7 @@ async function browser() {
   const options={headless:true,args:['--no-sandbox']};
   if(process.env.PLAYWRIGHT_CHROMIUM)return chromium.launch({...options,executablePath:process.env.PLAYWRIGHT_CHROMIUM});
   try{return await chromium.launch(options);}catch(error){
-    const fallback='/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
+    const fallback='/home/user/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
     try{await access(fallback);}catch{throw error;}
     return chromium.launch({...options,executablePath:fallback});
   }

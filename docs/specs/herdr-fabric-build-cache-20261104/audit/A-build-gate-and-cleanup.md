@@ -44,7 +44,7 @@ Grep of whole repo (excluding the spec bundle) for `sccache`, `RUSTC_WRAPPER`, `
 
 ## 5. Tests
 - tests/test_build_coord.py (11 fns), test_build_cleanup.py (29 fns, some parametrized), test_build_maintenance.py (6), test_cleanup_deploy.py (6). Also references in tests/test_fleet.py (build_gate checksum fixtures), tests/test_deploy_units.py etc. No test for build-gate.ts itself (packages/herdr-web-components/host-view.test.js only mentions it) and no test of `--status`/`--json` CLI output.
-- Venv: none in worktree; system `python3` and `/home/wohlgemuth/.local/bin/pytest` work. pyproject addopts: `--import-mode=importlib -m 'not e2e and not integration'`.
+- Venv: none in worktree; system `python3` and `/home/user/.local/bin/pytest` work. pyproject addopts: `--import-mode=importlib -m 'not e2e and not integration'`.
 - Command run (worked): `cd <repo> && python3 -m pytest tests/test_build_coord.py tests/test_build_cleanup.py tests/test_build_maintenance.py tests/test_cleanup_deploy.py -q -p no:cacheprovider`
 - Baseline: **63 passed in 11.30s**, 0 failed.
 

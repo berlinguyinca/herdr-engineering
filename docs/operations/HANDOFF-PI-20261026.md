@@ -11,7 +11,7 @@ No release was deployed during this final work interval. Work is incomplete.
 Start Pi in this exact integration checkout:
 
 ```bash
-cd /home/wohlgemuth/IdeaProjects/.worktrees/herdr-complete-20261026
+cd /home/user/IdeaProjects/.worktrees/herdr-complete-20261026
 pi "Read docs/operations/HANDOFF-PI-20261026.md and continue the remaining work in order. Preserve the current uncommitted work and all existing functionality and UX. Verify the final source before committing and redeploying."
 ```
 
@@ -26,7 +26,7 @@ steps. Never claim complete or green based on the partial suite results below.
 The standalone `herdr-handoff` CLI is absent from PATH. This is a local private
 handoff, not a server-queued/claimed handoff. A local JSON package, source patch,
 untracked-source archive, status, and available evidence are saved under:
-`/home/wohlgemuth/.local/state/herdr-engineering/handoffs/20261026-dashboard/`.
+`/home/user/.local/state/herdr-engineering/handoffs/20261026-dashboard/`.
 No target Pi process was launched. Do not claim a remote transfer occurred.
 
 ## Goal and required outcome
@@ -38,13 +38,13 @@ UX, permissions, or durable history. The user asked to do the work in order.
 
 ## Source of truth
 
-- Working directory: `/home/wohlgemuth/IdeaProjects/.worktrees/herdr-complete-20261026`.
+- Working directory: `/home/user/IdeaProjects/.worktrees/herdr-complete-20261026`.
 - Branch: `integration/herdr-complete-20261026`.
 - HEAD at stop: `c75f10bc7717baf8dfbe2fbbae82a476ae08ad16`.
 - **Important:** final UI/history/diagnostic fixes remain uncommitted. Deploying
   HEAD now would omit them. Use `git status` and `git diff`, including untracked
   source/tests, then commit the verified final candidate before deployment.
-- Original `/home/wohlgemuth/IdeaProjects/herdr-engineering` is a different,
+- Original `/home/user/IdeaProjects/herdr-engineering` is a different,
   dirty, old checkout with user work. Preserve it. Never reset it or deploy it.
 - Other sessions actively work in sibling checkouts and sometimes deploy the
   same services. Never kill their tests or overwrite their changes. Recheck
@@ -200,26 +200,26 @@ Useful logs/reports (available files copied into private evidence directory):
 Last read-only audit: web/worker/proxy use `bce35fb967bf`, collaboration uses
 `d58294d5e399`. Web health OK, zero restarts observed. Recheck these facts.
 Canonical configuration directory is mounted read-only on web/worker:
-`/home/wohlgemuth/.config/herdr-engineering/fleet`.
+`/home/user/.config/herdr-engineering/fleet`.
 
 Use canonical file:
-`/home/wohlgemuth/.config/herdr-engineering/fleet/fleet-config.yaml`.
+`/home/user/.config/herdr-engineering/fleet/fleet-config.yaml`.
 It must be alone in its directory. Never repurpose HOME/CODEX_HOME or use
 temporary rollback fleet directories. Do not print or copy its credentials.
 Real durable deployment state:
-`/home/wohlgemuth/.local/state/herdr-engineering/deploys/`.
+`/home/user/.local/state/herdr-engineering/deploys/`.
 Legacy receipt `bce35fb967bf.json` lacks protected previous snapshots; the new
 script creates them before changing services and pins each actual image ID.
 
 After verification, replace FINAL_COMMIT with the new committed full revision:
 
 ```bash
-test "$HOME" = /home/wohlgemuth &&
+test "$HOME" = /home/user &&
 HERDR_CP_HEALTH_TRIES=180 HERDR_CP_HEALTH_INTERVAL=2 \
-flock -n /home/wohlgemuth/.local/state/herdr-engineering/deploys/rollout.lock \
+flock -n /home/user/.local/state/herdr-engineering/deploys/rollout.lock \
 bash deploy/control-plane/deploy.sh \
   --ref FINAL_COMMIT --no-fetch \
-  --fleet-config /home/wohlgemuth/.config/herdr-engineering/fleet/fleet-config.yaml
+  --fleet-config /home/user/.config/herdr-engineering/fleet/fleet-config.yaml
 ```
 
 Do not wrap rollout in an external timeout: termination traps do not initiate

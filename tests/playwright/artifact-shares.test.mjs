@@ -28,7 +28,7 @@ async function withShares(callback, env = {}) {
     if (process.env.PLAYWRIGHT_CHROMIUM) options.executablePath = process.env.PLAYWRIGHT_CHROMIUM;
     try { browser = await chromium.launch(options); }
     catch (error) {
-      const fallback = '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
+      const fallback = '/home/user/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
       if (!fs.existsSync(fallback)) throw error;
       browser = await chromium.launch({ ...options, executablePath: fallback });
     }

@@ -28,7 +28,7 @@ const PY = process.env.PYTHON
 // headless_shell-1248), fall back to a locally-pinned chromium. Override with
 // PLAYWRIGHT_CHROMIUM to force a specific executable.
 const EXE_FALLBACK = process.env.PLAYWRIGHT_CHROMIUM
-  || '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
+  || '/home/user/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
 
 const ROUTES = [
   ['/overview', 'Overview'],

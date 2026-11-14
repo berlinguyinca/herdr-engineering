@@ -20,7 +20,7 @@ test('CI reports publish over HTTP and drive history, pipeline logs and responsi
   }
   const options={headless:true,args:['--no-sandbox']};
   if(process.env.PLAYWRIGHT_CHROMIUM)options.executablePath=process.env.PLAYWRIGHT_CHROMIUM;
-  try{browser=await chromium.launch(options);}catch(error){const exe='/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';if(!existsSync(exe))throw error;browser=await chromium.launch({...options,executablePath:exe});}
+  try{browser=await chromium.launch(options);}catch(error){const exe='/home/user/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';if(!existsSync(exe))throw error;browser=await chromium.launch({...options,executablePath:exe});}
   const page=await browser.newPage({viewport:{width:1440,height:1000}});const errors=[],reportReads=[];page.on('pageerror',e=>errors.push(e.message));
   page.on('request',request=>{const url=new URL(request.url());if(request.method()==='GET'&&url.pathname==='/api/v1/ci/reports')reportReads.push(url);});
   await page.goto(`${base}/#/ci`);

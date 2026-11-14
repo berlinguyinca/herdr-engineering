@@ -102,7 +102,7 @@ doctor → OK credential:* (0600 in 0700), OK server healthy; overall: unknown
 `herdr-eng` there also predates `memory`, so `origin/main` was installed into a **separate
 venv** `~/.venvs/herdr-eng-main` (production venv `~/.venvs/herdr-engineering` untouched;
 the inactive `herdr-eng-agent` unit still points at it). Managed blocks record that
-absolute path, e.g. `command = "/home/wohlgemuth/.venvs/herdr-eng-main/bin/herdr-eng"`,
+absolute path, e.g. `command = "/home/user/.venvs/herdr-eng-main/bin/herdr-eng"`,
 `args = ["memory","mcp-serve","--harness","codex"]`. Install created
 `pi skill, claude mcp, claude hooks, claude skill, codex mcp, codex skill`, skipped
 `opencode` (no binary), and the second `status` reports all `current`.

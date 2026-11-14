@@ -1,6 +1,6 @@
 # Audit B: control plane, dashboard, metrics, Slurm, config, CLI (what EXISTS)
 
-Repo: /home/wohlgemuth/herdr-engineering-wt/fabric-build-cache, branch feat/fabric-build-cache, HEAD 0ab6931c.
+Repo: /home/user/herdr-engineering-wt/fabric-build-cache, branch feat/fabric-build-cache, HEAD 0ab6931c.
 All paths below are relative to that root. Read-only audit; nothing was modified. The untracked
 docs/specs/herdr-fabric-build-cache-20261104/ was ignored.
 

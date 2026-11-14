@@ -163,7 +163,7 @@
 ### Task 7: Enable the scoped CI-fix runner and perform live smoke verification
 
 **Files:**
-- Modify live YAML only: `/home/wohlgemuth/.config/herdr-engineering/fleet/fleet-config.yaml`
+- Modify live YAML only: `/home/user/.config/herdr-engineering/fleet/fleet-config.yaml`
 - Use: `deploy/control-plane/deploy.sh` from a clean worktree at the approved implementation ref
 - Verify: `/api/v1/health`, `/api/v1/ci/fix`, `systemctl --user list-timers`, runner process list
 - Verify: `https://github.com/berlinguyinca/herdr-ci-fix-sandbox/pull/1` history and no new unscoped branches

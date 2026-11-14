@@ -3,7 +3,7 @@
 Mode: **local source audit + local host inspection**. No live Hindsight server was reachable from this host; nothing below was verified against a running service unless stated. Secrets were never read or echoed.
 
 ## Execution host
-- `Gerts-MacBook-Pro.local`, Darwin 27.2.0 arm64, user `wohlgemuth`. Tailnet peers: `beast` (linux), `bender` (linux), `macbook-pro` (this host), iOS devices.
+- `Gerts-MacBook-Pro.local`, Darwin 27.2.0 arm64, user `user`. Tailnet peers: `beast` (linux), `bender` (linux), `macbook-pro` (this host), iOS devices.
 - Spec ZIP found locally at `~/Downloads/herdr-unified-hindsight-memory-20261102.zip` (no transfer needed). SHA-256 `0e90da34814b84c00fcdd6ce7fd3434b7ca619e14df039232e9ce3781a6a287f`; 10 entries, no absolute or `..` paths. Extracted to this directory in worktree `~/IdeaProjects/.worktrees/herdr-unified-memory` (branch `feat/unified-hindsight-memory`, from `origin/main` `daa44f4a`). The original checkout (`feat/llm-gateway-prototype`, untracked `personal-agent-system-20261030/`) was not touched.
 
 ## Resolved: `herdr-memory` ownership

@@ -17,7 +17,7 @@ function reportingHost(over = {}) {
       gpus: [{ name: 'RTX 4090', util_pct: 88, vram_used_b: 20 * 2 ** 30, vram_total_b: 24 * 2 ** 30, temp_c: 71, cores: 16384 }],
       top: {
         cpu: [{ pid: 11, command: 'llama-server', user: 'gw', cpu_pct: 380, mem_pct: 12, owner: 'service:llama' }],
-        mem: [{ pid: 12, command: 'node', user: 'wohlgemuth', cpu_pct: 4, mem_pct: 22, owner: null }],
+        mem: [{ pid: 12, command: 'node', user: 'user', cpu_pct: 4, mem_pct: 22, owner: null }],
       },
     },
     updates: { manager: 'apt', outdated: 12, security: 2, packages: [{ name: 'openssl', from: '3.0.1', to: '3.0.2' }], reboot_required: true, failed_units: ['foo.service'] },
@@ -117,7 +117,7 @@ test('test_top_consumers_two_tables', () => {
   assert.equal((html.match(/<table[^>]*data-top="(cpu|mem)"/g) || []).length, 2);
   assert.match(html, /llama-server/);
   assert.match(html, /service:llama/);
-  assert.match(html, /wohlgemuth/);
+  assert.match(html, /user/);
 });
 
 test('test_updates_unknown_not_zero', () => {

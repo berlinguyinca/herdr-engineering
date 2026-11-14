@@ -1,6 +1,6 @@
 # Final selection and credential contract fixes
 
-Worktree: `/home/wohlgemuth/IdeaProjects/.worktrees/ci-observability-design-20261025`.
+Worktree: `/home/user/IdeaProjects/.worktrees/ci-observability-design-20261025`.
 Base: `eb1340a` (`feat/ci-observability-command-center`). Implementation and this report are committed together.
 
 ## Changes

@@ -9,7 +9,7 @@ import { chromium } from 'playwright';
 
 const REPO = path.resolve(import.meta.dirname, '..', '..');
 const PY = process.env.PYTHON || (fs.existsSync(path.join(REPO, '.venv', 'bin', 'python')) ? path.join(REPO, '.venv', 'bin', 'python') : 'python3');
-const EXE_FALLBACK = process.env.PLAYWRIGHT_CHROMIUM || '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
+const EXE_FALLBACK = process.env.PLAYWRIGHT_CHROMIUM || '/home/user/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
 
 async function startServer() {
   const proc = spawn(PY, [path.join(REPO, 'tests', 'playwright', 'server.py')], { env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] });

@@ -19,7 +19,7 @@ async function withWorkspace(run) {
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   let browser;
   try {
-    browser = await chromium.launch({headless: true, args: ['--no-sandbox'], executablePath: process.env.PLAYWRIGHT_CHROMIUM || '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome'});
+    browser = await chromium.launch({headless: true, args: ['--no-sandbox'], executablePath: process.env.PLAYWRIGHT_CHROMIUM || '/home/user/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome'});
     const context = await browser.newContext({viewport: {width: 1400, height: 1000}, permissions: ['clipboard-read', 'clipboard-write']});
     const page = await context.newPage();
     const errors = []; page.on('pageerror', (e) => errors.push(e.message));

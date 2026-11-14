@@ -19,7 +19,7 @@ test('native CI charts follow context/search across tabs and preserve focus thro
     const options={headless:true,args:['--no-sandbox']};
     if(process.env.PLAYWRIGHT_CHROMIUM)browser=await chromium.launch({...options,executablePath:process.env.PLAYWRIGHT_CHROMIUM});
     else try{browser=await chromium.launch(options);}catch(error){
-      const fallback='/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
+      const fallback='/home/user/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
       try{await access(fallback);}catch{throw error;}
       browser=await chromium.launch({...options,executablePath:fallback});
     }
@@ -104,7 +104,7 @@ test('cache health loads independently, switches windows safely and keeps access
   try{
     const options={headless:true,args:['--no-sandbox']};
     if(process.env.PLAYWRIGHT_CHROMIUM)options.executablePath=process.env.PLAYWRIGHT_CHROMIUM;
-    try{browser=await chromium.launch(options);}catch(error){const fallback='/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';try{await access(fallback);}catch{throw error;}browser=await chromium.launch({...options,executablePath:fallback});}
+    try{browser=await chromium.launch(options);}catch(error){const fallback='/home/user/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';try{await access(fallback);}catch{throw error;}browser=await chromium.launch({...options,executablePath:fallback});}
     const page=await browser.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));
     await page.goto(`http://127.0.0.1:${server.address().port}`);
     await page.evaluate(async()=>{
