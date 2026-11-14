@@ -112,6 +112,10 @@ Operating rules:
   beast; a dedicated node later needs only the same files. Watch it with `herdr-review-pane.example.sh` in a herdr pane.
 - Cost: only tier 2 spends Opus tokens, once per green head; `reviews.jsonl` records cost and duration.
 
+### Prompt v2, passes and replay
+
+Both tiers now get the operator's project rules and a review checklist (`deploy/ci-review/review-checklist.yaml`). A blocking finding must quote evidence that exists in the diff or the pinned file, otherwise the script downgrades it to a note. Tier 2 can run several focused passes (general, tests, security, migrations in the example config), which multiplies cost and time; `passes: []` restores one review. `always-on-review.py replay` scores a tier against a corpus of PRs with known outcomes, posts nothing, is resumable and runs one case at a time; the intended corpus is thousands of PRs across the org's repos, built with `corpus build`. Details: `deploy/ci-review/README.md`.
+
 ## Limits: advisory strength
 
 - **Prompt injection.** The diff, the PR title and body, and the file contents are untrusted. The model has no

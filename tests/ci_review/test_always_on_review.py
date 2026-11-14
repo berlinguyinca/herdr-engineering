@@ -128,7 +128,8 @@ if name == "claude":
     sys.stdout.write(json.dumps({"is_error": cfg.get("is_error", False), "result": json.dumps(ans),
                                  "structured_output": ans if isinstance(ans, dict) else None,
                                  "total_cost_usd": 0.5, "usage": cfg.get("usage", {"input_tokens": 10, "output_tokens": 5}),
-                                 "modelUsage": {"claude-opus-5-5": {}}}))
+                                 "modelUsage": {"claude-opus-5-5": {}},
+                                 **({"num_turns": cfg["num_turns"]} if "num_turns" in cfg else {})}))
 else:
     sys.stdout.write(ans if isinstance(ans, str) else json.dumps(ans))
 '''
@@ -138,7 +139,8 @@ APPROVE = {"head_sha": "@HEAD", "verdict": "approve", "findings": [], "checked":
 
 def block(file="src/a.py", line=2, why="eval of input"):
     return {"head_sha": "@HEAD", "verdict": "block", "checked": ["code"],
-            "findings": [{"file": file, "line": line, "severity": "blocking", "category": "security", "why": why}]}
+            "findings": [{"file": file, "line": line, "severity": "blocking", "category": "security", "why": why,
+                          "evidence": "return eval(x)", "how_it_fails": "x = '__import__(\"os\")' runs code"}]}
 
 
 def sh(*a, cwd):
@@ -471,12 +473,12 @@ def test_a_blocking_finding_posts_failure_and_one_marked_comment(env):
 
 
 def test_findings_on_files_outside_the_pr_are_dropped(env):
-    env.config(post=True)
-    env.reviewer("claude", answer=block(file="src/other.py"))
-    assert env.review("tier2", post=True) == 0
-    last = env.statuses_posted()[-1]
-    assert last["state"] == "success" and "1 finding dropped" in last["description"]
-    assert env.gh_state().get("comments", []) == []
+    m = env.mod
+    diff = env.gh_state()["prs"]["7"]["diff"]
+    index = {f.path: f for f in m.ai.parse_diff(diff)}
+    ans = {**block(file="src/other.py"), "head_sha": "a" * 40}
+    d = m.decide(m.parse_verdict(ans, "a" * 40), index, "m")
+    assert d.state == "success" and "1 finding dropped" in d.description and len(d.dropped) == 1
 
 
 def test_a_malformed_answer_leaves_the_status_pending(env):
