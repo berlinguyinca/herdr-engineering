@@ -7,7 +7,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Fix: Independent AI review poller waits for a busy single-slot model
 
-- `ai-review.py`: a 429 from the gateway (deepseek and qwen have one slot, so any parallel caller gets 429) used to share the 4-retry budget (about 75 s) with 5xx errors, shorter than one chunk's generation time, so a busy slot failed the review. 429 is now waited out for up to the new `reviewer.busy_wait_s` (default 1800 s of total waiting, each wait capped at 60 s, `Retry-After` honoured) and no longer spends `retries`. When the budget runs out the run fails and posts no success (and no terminal status). Config: `reviewer.busy_wait_s` (>= 0). Rollback: revert the commit;.
+- `ai-review.py`: a 429 from the gateway (deepseek and qwen have one slot, so any parallel caller gets 429) used to share the 4-retry budget (about 75 s) with 5xx errors, shorter than one chunk's generation time, so a busy slot failed the review. 429 is now waited out for up to the new `reviewer.busy_wait_s` (default 1800 s of total waiting, each wait capped at 60 s, `Retry-After` honoured) and no longer spends `retries`. When the budget runs out the run fails and posts no success (and no terminal status). Config: `reviewer.busy_wait_s` (>= 0). Rollback: revert the commit. `reviewer.backoff_s` must now be greater than 0, and backoff waits are capped at 60 s.
 
 ### Review prompt v2: rules, checklist, evidence, passes, replay harness (always-on-review.py)
 

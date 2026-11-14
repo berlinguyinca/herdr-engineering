@@ -631,10 +631,23 @@ def test_a_busy_single_slot_gateway_is_waited_for_beyond_the_retry_count(env):
 
 def test_a_gateway_busy_for_longer_than_busy_wait_fails_and_posts_no_success(env):
     env.responses([{"status": 429}])
-    env.config({"reviewer": {"busy_wait_s": 100}})
+    env.config({"reviewer": {"busy_wait_s": 200}})
     assert review(env) == 1
     assert env.terminal() == []
-    assert sum(env.sleeps) <= 100
+    assert sum(env.sleeps) <= 200
+    assert len(env.sleeps) > 4 and len(env.rev_calls()) > 5   # more than retries + 1 calls: 429 is waited out
+
+
+def test_backoff_never_overflows_or_hot_loops(env):
+    assert env.mod.backoff(5.0, 100000) == env.mod.RETRY_AFTER_MAX
+    assert env.mod.backoff(5.0, 0) == 5.0
+    assert env.mod.backoff(0.001, 3) > 0
+
+
+@pytest.mark.parametrize("bad", [0, -1, 0.0])
+def test_backoff_s_must_be_positive(env, bad):
+    env.config({"reviewer": {"backoff_s": bad}})
+    assert review(env) == 2
 
 
 def test_429_does_not_spend_the_5xx_retry_budget(env):

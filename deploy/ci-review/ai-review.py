@@ -78,7 +78,7 @@ DEFAULTS: dict = {
         "response_format": "json_schema",        # json_schema | json_object | none
         "timeout_s": 900,                        # longest silence on the connection (socket read timeout)
         "deadline_s": 1800,                      # longest one streamed answer may take
-        "retries": 4,                            # extra attempts on 429 / 5xx / connection errors
+        "retries": 4,                            # extra attempts on 5xx / connection errors (429 has busy_wait_s)
         "backoff_s": 5.0,                        # first backoff; doubles; Retry-After wins (capped at 60 s)
         # 429 means "the slot is taken" (deepseek serves one request at a time; another review may hold it for
         # minutes). It is waited out for up to this many seconds in total, and does not spend `retries`
@@ -118,6 +118,11 @@ REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 ENV_REF = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 REDACT: set[str] = set()             # secrets that must never be printed
+
+
+def backoff(base: float, n: int) -> float:
+    """base * 2**n, with the exponent capped so it cannot overflow, and never above RETRY_AFTER_MAX."""
+    return min(RETRY_AFTER_MAX, base * (2 ** min(n, 16)))
 
 
 def pause(seconds: float) -> None:
@@ -200,8 +205,8 @@ def load_config(path: str | None) -> dict:
         raise Refused("config: reviewer.response_format must be json_schema, json_object or none")
     if not 1 <= r["parallel"] <= 8:
         raise Refused("config: reviewer.parallel must be 1..8")
-    if r["max_tokens"] < 1024 or r["timeout_s"] < 1 or r["retries"] < 0 or r["busy_wait_s"] < 0:
-        raise Refused("config: reviewer.max_tokens/timeout_s/retries/busy_wait_s out of range")
+    if r["max_tokens"] < 1024 or r["timeout_s"] < 1 or r["retries"] < 0 or r["busy_wait_s"] < 0 or r["backoff_s"] <= 0:
+        raise Refused("config: reviewer.max_tokens/timeout_s/retries/busy_wait_s/backoff_s out of range")
     for h in r["allow_plain_http_hosts"]:
         if not plain_http_host_ok(h):
             raise Refused(f"config: reviewer.allow_plain_http_hosts: {h!r} is not an exact IPv4 address in the "
@@ -496,7 +501,7 @@ class Gateway:
         busy_waited = 0.0
         while True:
             is_busy = False
-            wait = float(self.r["backoff_s"]) * (2 ** failures)
+            wait = backoff(float(self.r["backoff_s"]), failures)
             try:
                 status, headers, raw = self._once(method, sub, body)
             except Transient as e:
@@ -519,7 +524,7 @@ class Gateway:
                 why = f"HTTP {status}"
                 is_busy = status == 429
                 if is_busy:
-                    wait = float(self.r["backoff_s"]) * (2 ** busy)
+                    wait = backoff(float(self.r["backoff_s"]), busy)
                 try:
                     wait = min(RETRY_AFTER_MAX, max(wait, float(headers.get("retry-after", ""))))
                 except ValueError:
