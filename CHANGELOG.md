@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: unit gate no longer starves or hangs on the 1.77M-row recovery test
+
+- `test_production_cardinality_snapshot_recovery_and_database_restart` (~5.5 min alone, >23 min under disk contention) is marked `slow` with an explicit `@pytest.mark.timeout(3600)`; the suite-wide 900 s ceiling failed pipeline 1334 after ~57 min.
+- `scripts/ci/unit-gates.sh` runs everything else under xdist with `-m 'not e2e and not integration and not slow'`, then the `slow` tests serially in a tail pass, so coverage is identical and the slow test no longer competes with the workers.
+- Both passes run under `scripts/ci/run-watched.py` (copy of the shared run-watched helper): a soft notice after `HERDR_PYTEST_SOFT_SECONDS` (3600), and a kill (exit 124) only after `HERDR_PYTEST_HANG_SECONDS` (1800) with no output and no CPU, so a wedged run (pipeline 1362, ~8 h) fails instead of hanging; a slow live run is never killed.
+- Tests: real-subprocess coverage that slow tests are deselected from the parallel pass and run in the tail, that the two selections partition the default collection, and the watchdog's kill / no-kill behaviour. Rollback: revert the commit.
+
 ### xdist follow-ups: collision-free ports, accurate comments, stronger parallel tests
 
 - `test_allocation_skips_os_bound_port` and `test_failed_forwarder_start_is_retried_on_next_sync` bound fixed ports (18500, 24700) that could collide across files running concurrently under `--dist=loadfile`; they now use OS-assigned ports.

@@ -48,6 +48,7 @@ addopts = "--import-mode=importlib -m 'not e2e and not integration'"
 markers = [
     "e2e: real command-line end-to-end workflows; opt in explicitly",
     "integration: needs an external dependency (a live Postgres via PA_PG_DSN, or a real CLI such as claude); deselected by default, opt in with -m integration",
+    "slow: minutes-long test (~1.77M Postgres rows); scripts/ci/unit-gates.sh runs it serially after the parallel pass, not under xdist",
 ]
 #
 # A per-test ceiling, so a stall names itself instead of eating the pipeline. The suite has been observed to stall for 6-12

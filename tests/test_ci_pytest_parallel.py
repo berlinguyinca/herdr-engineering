@@ -141,3 +141,95 @@ def test_loadfile_spreads_files_over_workers_but_keeps_each_file_on_one(tmp_path
         assert len(set(workers)) == 1, (name, workers)
         all_workers |= set(workers)
     assert len(all_workers) > 1, f"all files ran on {all_workers}: the run was not parallel"
+
+
+# --- slow tests run in a serial tail, and the gate is protected against hangs ---------------------------------------------------
+
+WATCHER = ROOT / "scripts" / "ci" / "run-watched.py"
+
+
+def markexpr(name: str) -> str:
+    done = subprocess.run(["bash", "-c", f'. "{HELPER}"; printf %s "${name}"'], capture_output=True, text=True, cwd=ROOT)
+    assert done.returncode == 0, done.stderr
+    return done.stdout
+
+
+def collected(expr: str) -> set[str]:
+    done = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", "-m", expr,
+         "tests/control_plane/test_postgres_recovery.py"],
+        capture_output=True, text=True, cwd=ROOT,
+    )
+    assert done.returncode in (0, 5), done.stdout + done.stderr
+    return {line for line in done.stdout.splitlines() if "::" in line}
+
+
+def test_the_cardinality_test_is_slow_with_an_explicit_timeout_and_runs_only_in_the_tail() -> None:
+    name = "test_production_cardinality_snapshot_recovery_and_database_restart"
+    fast, slow = collected(markexpr("HERDR_PYTEST_FAST_MARKEXPR")), collected(markexpr("HERDR_PYTEST_SLOW_MARKEXPR"))
+    assert any(name in t for t in slow) and not any(name in t for t in fast)
+    assert fast and not (fast & slow)
+    everything = collected("not e2e and not integration")   # pyproject's own default expression
+    assert fast | slow == everything                         # coverage is identical
+    source = (ROOT / "tests" / "control_plane" / "test_postgres_recovery.py").read_text()
+    assert re.search(r"@pytest\.mark\.slow\s+@pytest\.mark\.timeout\((\d+)\)\s+def " + name, source)
+    assert int(re.search(r"mark\.timeout\((\d+)\)", source).group(1)) > 900
+
+
+def test_a_real_run_deselects_slow_tests_from_the_parallel_pass_and_runs_them_in_the_tail(tmp_path: Path) -> None:
+    (tmp_path / "test_x.py").write_text(
+        "import os, pytest\n"
+        "def test_fast(record_property):\n    record_property('w', os.environ.get('PYTEST_XDIST_WORKER', 'serial'))\n"
+        "@pytest.mark.slow\ndef test_slow(record_property):\n    record_property('w', os.environ.get('PYTEST_XDIST_WORKER', 'serial'))\n"
+        "@pytest.mark.integration\ndef test_integ():\n    pass\n"
+    )
+    (tmp_path / "pytest.ini").write_text("[pytest]\naddopts = -m 'not e2e and not integration'\nmarkers =\n    slow\n    integration\n    e2e\n")
+
+    def run(expr: str, *extra: str) -> str:
+        done = subprocess.run(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-c", str(tmp_path / "pytest.ini"), "-m", expr,
+             "-v", *extra, str(tmp_path)],
+            capture_output=True, text=True, cwd=tmp_path,
+        )
+        assert done.returncode == 0, done.stdout + done.stderr
+        return done.stdout
+
+    parallel = run(markexpr("HERDR_PYTEST_FAST_MARKEXPR"), "-n", "2", "--dist=loadfile")
+    assert "test_fast" in parallel and "test_slow" not in parallel and "test_integ" not in parallel
+    tail = run(markexpr("HERDR_PYTEST_SLOW_MARKEXPR"))
+    assert "test_slow PASSED" in tail and "test_fast" not in tail and "test_integ" not in tail
+    assert "gw0" not in tail and "gw1" not in tail      # serial: no xdist worker
+
+
+def test_the_gate_runs_the_parallel_pass_then_a_serial_tail_both_under_the_watchdog() -> None:
+    assert "run-watched.py" in GATE and WATCHER.exists()
+    assert GATE.index('"$HERDR_PYTEST_FAST_MARKEXPR"') < GATE.index('"$HERDR_PYTEST_SLOW_MARKEXPR"')
+    fast_line = next(line for line in GATE.splitlines() if "HERDR_PYTEST_FAST_MARKEXPR" in line and "pytest" in line)
+    slow_line = next(line for line in GATE.splitlines() if "HERDR_PYTEST_SLOW_MARKEXPR" in line and "pytest" in line)
+    assert fast_line.startswith("watched ") and "PYTEST_PARALLEL" in fast_line
+    assert slow_line.startswith("watched ") and "PYTEST_PARALLEL" not in slow_line
+    assert "timeout" not in fast_line + slow_line           # no guessed flat cap on the run
+
+
+def watch(soft: str, hard: str, script: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, str(WATCHER), soft, hard, "--", sys.executable, "-u", "-c", script],
+                          capture_output=True, text=True, timeout=60)
+
+
+def test_the_watchdog_kills_a_silent_idle_hang_with_124() -> None:
+    done = watch("1", "3", "import time; time.sleep(30)")
+    assert done.returncode == 124 and "hung" in done.stderr and "soft limit" in done.stderr
+
+
+def test_the_watchdog_never_kills_a_slow_run_that_keeps_printing() -> None:
+    done = watch("1", "3", "import time\nfor i in range(6):\n    print(i); time.sleep(1)")
+    assert done.returncode == 0 and "soft limit" in done.stderr and "hung" not in done.stderr
+
+
+def test_the_watchdog_never_kills_a_silent_run_that_is_busy_on_cpu() -> None:
+    done = watch("1", "2", "import time\nend = time.time() + 5\nwhile time.time() < end: sum(range(10000))")
+    assert done.returncode == 0 and "hung" not in done.stderr
+
+
+def test_the_watchdog_passes_the_exit_status_through() -> None:
+    assert watch("5", "5", "raise SystemExit(3)").returncode == 3
