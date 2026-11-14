@@ -1,7 +1,13 @@
 """`herdr-eng collab agents list|renew`: the real CLI against a real CollabService behind the real operator listener."""
 import json
 import os
+import resource
 import stat
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -97,14 +103,19 @@ def test_print_credential_is_explicit_and_goes_to_stdout_only(stack, capsys):
     assert "hca_" in out.out and "hca_" not in out.err
 
 
+def agent_authenticates(stack, info, credential=None):
+    """Whether the public listener accepts the credential (any answer but 401; this route is just switched off for agents)."""
+    headers = {"Authorization": f"Agent {credential or info['credential']}", "X-Herdr-Device": info["device_id"],
+               "X-Forwarded-Proto": "https"}
+    return call(stack.public, "GET", f"{BASE}/delegations/inbox", headers=headers)[0] != 401
+
+
 def test_renew_without_a_destination_is_refused_before_any_request(stack, capsys):
     info = connect(stack, "nodest")
+    assert agent_authenticates(stack, info)
     assert run(stack, "renew", info["agent_id"]) == 2
     assert "--credential-file" in capsys.readouterr().err
-    assert run(stack, "list", "--json") == 0
-    assert agents_json(capsys)[0]["status"] == "active"
-    assert call(stack.op, "POST", f"{BASE}/agents/{info['agent_id']}/renew", {},
-                host=f"127.0.0.1:{stack.op}")[0] == 200           # the old credential was still live: nothing was renewed
+    assert agent_authenticates(stack, info)            # the original credential still authenticates: nothing was renewed
 
 
 def agents_json(capsys):
@@ -149,3 +160,93 @@ def test_registered_in_the_top_level_cli(stack, tmp_path, capsys):
     info = connect(stack, "wired")
     assert cli.main(["collab", "agents", "list", "--operator-url", stack.url, "--json"]) == 0
     assert any(r["agent_id"] == info["agent_id"] for r in agents_json(capsys))
+
+
+def test_a_directory_target_is_refused_before_renewing_even_with_force(stack, tmp_path, capsys):
+    info = connect(stack, "dirtarget")
+    target = tmp_path / "adir"
+    target.mkdir()
+    assert run(stack, "renew", info["agent_id"], "--credential-file", str(target), "--force") == 1
+    assert "directory" in capsys.readouterr().err
+    assert agent_authenticates(stack, info)
+
+
+def _limit_file_size():
+    resource.setrlimit(resource.RLIMIT_FSIZE, (0, resource.getrlimit(resource.RLIMIT_FSIZE)[1]))
+
+
+def test_a_failed_write_after_renewing_hands_the_credential_to_stderr_with_a_hint(stack, tmp_path):
+    """The real CLI in a process that may not write any file bytes (EFBIG): the old credential is dead, so the new one must survive."""
+    info = connect(stack, "diskfull")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    dest = out_dir / "cred"
+    code = "import sys; from herdr_engineering.cli import main; sys.exit(main(sys.argv[1:]))"
+    done = subprocess.run([sys.executable, "-B", "-c", code, "collab", "agents", "renew", info["agent_id"],
+                           "--credential-file", str(dest), "--operator-url", stack.url],
+                          capture_output=True, text=True, preexec_fn=_limit_file_size, timeout=60)
+    assert done.returncode == 1 and "Traceback" not in done.stderr
+    recovered = [w for w in done.stderr.split() if w.startswith("hca_")]
+    assert len(recovered) == 1 and recovered[0] != info["credential"] and recovered[0] not in done.stdout
+    assert "only copy" in done.stderr and not list(out_dir.iterdir())
+    assert not agent_authenticates(stack, info)
+    assert agent_authenticates(stack, info, recovered[0])
+
+
+def test_helper_style_refusal_is_403(stack, tmp_path, capsys):
+    info = connect(stack, "fabricated")
+    host = f"127.0.0.1:{stack.op}"
+    assert call(stack.op, "POST", f"{BASE}/agents/{info['agent_id']}/fabric", {"fabric": True, "machine": "bender"},
+                host=host)[0] == 200
+    dest = tmp_path / "cred"
+    assert run(stack, "renew", info["agent_id"], "--credential-file", str(dest)) == 1
+    assert "403" in capsys.readouterr().err and not dest.exists()
+
+
+def test_agent_cap_is_429(tmp_path, capsys):
+    stk = next(_stack(tmp_path, remote_credential_ttl=1.0, max_agents_per_user=1))
+    info = connect(stk, "first")
+    time.sleep(1.2)                                    # the first agent expires and frees its slot
+    connect(stk, "second")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    dest = out_dir / "cred"
+    assert run(stk, "renew", info["agent_id"], "--credential-file", str(dest)) == 1
+    assert "429" in capsys.readouterr().err and not list(out_dir.iterdir())
+
+
+class _Garbage(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def do_POST(self):
+        body = b"<html>not json"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.do_POST()
+
+
+def test_a_bad_renew_answer_says_the_outcome_is_unknown_not_unreachable(tmp_path, capsys):
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Garbage)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_port}"
+        dest = tmp_path / "cred"
+        assert agents_main(["renew", "some-agent", "--credential-file", str(dest), "--operator-url", url]) == 1
+        err = capsys.readouterr().err
+        assert "outcome unknown" in err and "re-run" in err and "unreachable" not in err and not dest.exists()
+        assert agents_main(["list", "--operator-url", url]) == 1               # a malformed list is a message, not a traceback
+        assert "unreachable" not in capsys.readouterr().err
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.parametrize("url", ["file:///etc/passwd", "ftp://127.0.0.1/", "http://example.com:9482"])
+def test_operator_url_must_be_http_loopback_or_https(url, capsys):
+    assert agents_main(["list", "--operator-url", url]) == 1
+    assert "operator-url" in capsys.readouterr().err
