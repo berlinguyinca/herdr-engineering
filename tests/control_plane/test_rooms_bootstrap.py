@@ -1,6 +1,7 @@
 """deploy/control-plane/rooms-bootstrap.py: pure rules plus real-service integration (no mocks)."""
 import http.server
 import importlib.util
+import json
 import socket
 import threading
 import time
@@ -323,7 +324,50 @@ def test_another_owners_live_agent_with_the_same_handle_is_never_removed(stack, 
     assert [m["owner_user_id"] for m in members] == ["bob"], members
     rc, out = run_main(stack, capsys)
     assert rc == 1 and "REMOVED" not in out and "FAIL" in out, out
+    assert "CONFLICT membership tui-smoke-a" in out and "CREATED membership tui-smoke-b" in out, out   # a 409 does not abort
     after = call(stack.op, "GET", f"{BASE}/rooms/{rid}/agents", host=host)[1]["agents"]
-    assert [(m["owner_user_id"], m["agent_id"]) for m in after] == [("bob", bob_agent["agent_id"])]
+    assert sorted((m["owner_user_id"], m["name"]) for m in after) == [("alice", "tui-smoke-b"), ("bob", "tui-smoke-a")]
+    assert [m["agent_id"] for m in after if m["owner_user_id"] == "bob"] == [bob_agent["agent_id"]]
     rc, out = run_main(stack, capsys, "--check-only", "--no-post")
     assert rc == 1 and "members without a live agent=" in out and "tui-smoke-a" in out
+
+
+def test_stale_memberships_of_expired_unrenewable_agents_are_removed_and_counted(short_ttl_stack, capsys):
+    stack = short_ttl_stack
+    host = f"127.0.0.1:{stack.op}"
+    rc, out = run_main(stack, capsys)
+    assert rc == 0 and len(created(out)) == 5, out
+    for a in call(stack.op, "GET", f"{BASE}/agents", host=host)[1]["agents"]:      # fabric agents refuse renewal (403)
+        assert call(stack.op, "POST", f"{BASE}/agents/{a['agent_id']}/fabric", {"fabric": True, "machine": "bender"},
+                    host=host)[0] == 200
+    time.sleep(2.5)
+    rc, out = run_main(stack, capsys)
+    assert rc == 0 and "FAIL" not in out, out
+    assert out.count("RENEW refused") == 2 and "RENEWED" not in out, out
+    assert out.count("REMOVED stale membership") == 2, out
+    assert len([ln for ln in out.splitlines() if ln.startswith("CREATED membership")]) == 2
+    assert rb.is_noop(rb.current(rb.Http(stack.url))[0])
+
+
+def test_an_operator_without_an_id_removes_nothing():
+    class Stub(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            agents = [{"name": "tui-smoke-a", "status": "active", "agent_id": "a1"}]
+            body = {"/api/v1/collab/agents": {"agents": agents}, "/api/v1/collab/rooms": {"rooms": [{"name": rb.ROOM_NAME, "room_id": "r1"}]},
+                    "/api/v1/collab/rooms/r1/agents": {"agents": []}}.get(self.path, {})
+            raw = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    srv = _Serve(Stub)
+    try:
+        api = rb.Http(srv.url)
+        with pytest.raises(RuntimeError, match="without a user id"):
+            rb.ensure(api, {"agents": [], "room": False, "members": ["tui-smoke-a"]}, False)
+    finally:
+        srv.close()

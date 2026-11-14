@@ -5,6 +5,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: collab agents CLI and rooms-bootstrap follow-ups, flaky MCP upload tests, renewal runbook
+
+- `herdr-eng collab agents renew`: `--json --print-credential` now prints one JSON object that includes `credential` (no second line); a failed file write with `--print-credential` prints the credential on stdout as requested instead of stderr; the temp file is fsynced before it is renamed into place; a read timeout on an error body, a malformed `--operator-url` (`http://[::1`) and a listed agent without an id are one-line errors (exit 1), not tracebacks.
+- Tests: the agent-cap test uses a real fixture (servers and threads are torn down) with a wider TTL margin; the disk-full test sets `RLIMIT_FSIZE` inside the child instead of `preexec_fn`; added coverage for the failed rename (temp file kept at 0600, path printed).
+- `deploy/control-plane/rooms-bootstrap.py`: a 409 on one member no longer aborts the others (the run still fails at the end), and a missing operator id from `/me` refuses to remove any membership. The `REMOVED stale membership` count is now asserted.
+- `test_collab_mcp_artifacts.py`: the raw-socket waits in the two load-sensitive tests are 30 s, so they pass under `-n 4`; assertions unchanged.
+- Docs: new "Renewing an expired agent" runbook (section 5.2a) in the collaboration network guide. Rollback: revert the commit.
+
 ### Fix: retired identity-less registrations are terminal and keep host-level blockers (#779, #798 review)
 
 - `fleet rollout retire-identityless` now settles only what it can: the identity refusal is recorded as a typed `blockReason` on the session (no string matching), and host-level reasons (unverified native coverage, ambiguous native identity, a missing discovered session) are recorded separately as `hostLevelError`, so a host with an identity-less session plus a coverage error stays blocked with its reason and `coverageErrors`. Hosts with nothing retired are untouched.
