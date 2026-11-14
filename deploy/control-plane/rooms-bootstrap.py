@@ -181,7 +181,10 @@ def ensure(api: Http, p: dict[str, Any], dry: bool) -> None:
             print(f"CREATED room {ROOM_NAME} id={room['room_id']}")
     removable = room and p["members"] and not dry
     stale = api.call("GET", BASE + f"/rooms/{room['room_id']}/agents")["agents"] if removable else []
-    operator = api.call("GET", BASE + "/me")["user_id"] if removable else None
+    operator = api.call("GET", BASE + "/me").get("user_id") if removable else None
+    if removable and not operator:       # an empty id would match every unowned grant: never remove on that
+        raise RuntimeError("GET /me answered without a user id; refusing to remove any membership")
+    refused: list[str] = []
     for name in p["members"]:
         if dry or room is None:
             print(f"WOULD add {name} to room {ROOM_NAME}")
@@ -192,8 +195,17 @@ def ensure(api: Http, p: dict[str, Any], dry: bool) -> None:
             if m["name"] == name and m.get("owner_user_id") == operator and m["agent_id"] in expired_ids:
                 api.call("POST", BASE + f"/rooms/{room['room_id']}/agents/{m['agent_id']}/remove")
                 print(f"REMOVED stale membership {name} (expired agent) from {ROOM_NAME}")
-        api.call("POST", BASE + f"/rooms/{room['room_id']}/agents", {"agent_id": ids[name], "actions": CHAT_ACTIONS})
+        try:
+            api.call("POST", BASE + f"/rooms/{room['room_id']}/agents", {"agent_id": ids[name], "actions": CHAT_ACTIONS})
+        except RuntimeError as exc:
+            if "HTTP 409" not in str(exc):
+                raise
+            print(redact(f"CONFLICT membership {name} -> {ROOM_NAME}, continuing with the others: {exc}"))
+            refused.append(name)
+            continue
         print(f"CREATED membership {name} -> {ROOM_NAME}")
+    if refused:                          # the others were still added; the run is not clean
+        raise RuntimeError(f"membership refused with 409 for {refused}")
 
 
 def current(api: Http) -> tuple[dict[str, Any], dict[str, Any] | None]:
