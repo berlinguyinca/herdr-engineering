@@ -31,7 +31,7 @@
 3. Review and merge order: herdr-memory#1 → pin bump → #560/#562/#563/handoff#1/pi#556.
 
 ## Deployment — bender (2026-11-02, authorized by operator; option 3: merge #564, fresh stack, old candidate untouched)
-- Control plane redeployed from origin/main `562eb9cd` via `deploy.sh --with-memory` (exit 0, receipt written, all services healthy; dashboard health 200 at 100.104.39.6:80).
+- Control plane redeployed from origin/main `562eb9cd` via `deploy.sh --with-memory` (exit 0, receipt written, all services healthy; dashboard health 200 at 100.64.8.6:80).
 - New stack `herdr-hindsight` + `herdr-hindsight-db` healthy; `/health` 200 on 127.0.0.1:8897; bad token -> 401. Backup timer `herdr-hindsight-backup.timer` active. Fleet config backup: `fleet-backups/fleet-config.yaml.bak-20261102T235913689490Z`.
 - Old candidate `herdr-memory-api-1/-db-1` (port 8888, 6 daily dumps) untouched; not migrated.
 - **Open:** the fabric agent (`herdr-eng devfabric agent`) mirrors 127.0.0.1:8897 onto the tailnet IP (plain HTTP, bearer-auth enforced). Consider `fabric.agent_exclude_ports: [8897]`. The `memory.dev.lan` gateway route is OFF (port in config is 8888; set to 8897 then `fabric-stack.sh memory-route enable` + gateway recreate). No tenant keys exported to clients; canary checklist, doctor, restore test and cross-host acceptance not run.
@@ -58,7 +58,7 @@
 ## Post-deploy re-verification (2026-11-03T18:23Z, live on bender; mode: production smoke)
 
 - `herdr-hindsight` Up (healthy) `herdr-memory-hindsight:5a672f0cdb89…`, `herdr-hindsight-db` Up (healthy) `pgvector/pgvector`, `herdr-cp-web` on `herdr-engineering:492445c98a90`, `herdr-fabric-gateway` Up (healthy).
-- `http://127.0.0.1:8897/health` = **200**; tailnet `http://100.104.39.6:8897/health` = **refused** (the `fabric.agent_exclude_ports: [8897]` exclusion survived the redeploy); `https://memory.local.metabolomics.us/health` = **200** from the Mac.
+- `http://127.0.0.1:8897/health` = **200**; tailnet `http://100.64.8.6:8897/health` = **refused** (the `fabric.agent_exclude_ports: [8897]` exclusion survived the redeploy); `https://memory.local.metabolomics.us/health` = **200** from the Mac.
 - Real P01 client on bender, `herdr-memory --project canary --harness pi status` → `{"healthy": true, "pending": 0, "outbox_pending": 0, "dead_letter": 0, "contract": 1}`.
 
 ## Pi provider (pi-engineering) — merged + locally re-verified (2026-11-03)

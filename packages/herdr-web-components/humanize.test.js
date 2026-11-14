@@ -15,7 +15,7 @@ test("host registered reads as a human sentence with tailnet ip", () => {
   const d = describeEvent({
     event_type: "HostRegistered",
     entity_id: "bender",
-    payload: { host_name: "bender", tailnet_ip: "100.104.39.6" },
+    payload: { host_name: "bender", tailnet_ip: "100.64.8.6" },
   }, ctx);
   assert.equal(d.title, "Host online");
   assert.match(d.detail, /bender joined the fabric \(100\.104\.39\.6\)/);

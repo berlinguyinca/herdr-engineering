@@ -35,4 +35,6 @@ steps:
     image: bash
     commands:
       - 'set -eu'
+      # Shared CI store memo; resolves under the agent user HOME (the path the script used to hard-code).
+      - 'export HERDR_CI_STATE="$HOME/woodpecker/ci/state/herdr"'
       - 'bash scripts/ci/main-cron-gates.sh'

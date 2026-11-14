@@ -13,11 +13,12 @@
 # (a dev host, a docker agent, a first run) the script cannot tell, so it runs the suite - the same fail-open rule as
 # unit-gates-applicable.sh: a guard that cannot read state must not hand back a green.
 #
-# Override the memo location with HERDR_CI_STATE for a dev host or a test.
+# Set the memo location with HERDR_CI_STATE (the Woodpecker job does, in .woodpecker/main-cron.yml); unset, it defaults to
+# ${XDG_STATE_HOME:-$HOME/.local/state}/herdr-ci.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-state_dir="${HERDR_CI_STATE:-/home/wohlgemuth/woodpecker/ci/state/herdr}"
+state_dir="${HERDR_CI_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr-ci}"
 memo="${state_dir}/main-unit-gates-green.txt"
 head_sha="$(git rev-parse HEAD)"
 

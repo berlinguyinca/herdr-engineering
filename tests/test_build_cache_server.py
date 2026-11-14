@@ -23,7 +23,7 @@ SECRET = "sUp3rS3cretKeyValue/AbC123+xyz"
 
 @pytest.mark.parametrize("host,ok", [
     ("127.0.0.1:9000", True), ("127.5.5.5", True), ("localhost:9000", True),
-    ("100.104.39.6:9000", True), ("100.64.0.1:9", True), ("100.127.255.254", True),
+    ("100.64.8.6:9000", True), ("100.64.0.1:9", True), ("100.127.255.254", True),
     ("bender.tail1234.ts.net:9000", True), ("bender:9000", True), ("bender", True),
     ("100.63.255.255:9000", False), ("100.128.0.1:9000", False), ("10.0.0.5:9000", False),
     ("192.168.1.2:9000", False), ("s3.amazonaws.com", False), ("example.org:9000", False),
@@ -37,7 +37,7 @@ def _reg(tmp_path, host):
     return _registry(tmp_path, host=host, use_ssl=False)
 
 
-@pytest.mark.parametrize("host", ["127.0.0.1:9000", "100.104.39.6:9000", "bender.x.ts.net:9000"])
+@pytest.mark.parametrize("host", ["127.0.0.1:9000", "100.64.8.6:9000", "bender.x.ts.net:9000"])
 def test_plaintext_to_loopback_and_tailnet_passes_validation(tmp_path, host):
     p = _plan(tmp_path, _cfg(tmp_path, registry=_reg(tmp_path, host)), reachable=True)
     assert p.shared_setup is not None

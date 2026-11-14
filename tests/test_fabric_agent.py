@@ -1131,24 +1131,24 @@ _SIGV4_AUTH = (b"Authorization: AWS4-HMAC-SHA256 Credential=AKID/20261104/us-eas
 
 def test_a_sigv4_authorization_header_keeps_its_signed_host():
     got, _reply, _port = _through_forwarder(
-        {"100.104.39.6"}, b"GET /b?list-type=2 HTTP/1.1\r\nHost: 100.104.39.6:9000\r\n"
+        {"100.64.8.6"}, b"GET /b?list-type=2 HTTP/1.1\r\nHost: 100.64.8.6:9000\r\n"
                           + _SIGV4_AUTH + b"X-Amz-Date: 20261104T000000Z\r\n\r\n")
-    assert b"Host: 100.104.39.6:9000\r\n" in got
+    assert b"Host: 100.64.8.6:9000\r\n" in got
     assert b"127.0.0.1" not in got
 
 
 def test_a_sigv4_query_string_keeps_its_signed_host():
     for q in (b"X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=1", b"a=1&X-Amz-Signature=ff"):
         got, _reply, _port = _through_forwarder(
-            {"100.104.39.6"}, b"GET /b/k?" + q + b" HTTP/1.1\r\n"
-                              b"Host: 100.104.39.6:9000\r\n\r\n")
-        assert b"Host: 100.104.39.6:9000\r\n" in got
+            {"100.64.8.6"}, b"GET /b/k?" + q + b" HTTP/1.1\r\n"
+                              b"Host: 100.64.8.6:9000\r\n\r\n")
+        assert b"Host: 100.64.8.6:9000\r\n" in got
         assert b"Connection: close" not in got
 
 
 def test_an_unsigned_request_is_still_rewritten_byte_for_byte():
     got, _reply, port = _through_forwarder(
-        {"100.104.39.6"}, b"GET /?x=1 HTTP/1.1\r\nHost: 100.104.39.6:9000\r\n"
+        {"100.64.8.6"}, b"GET /?x=1 HTTP/1.1\r\nHost: 100.64.8.6:9000\r\n"
                           b"Accept: */*\r\n\r\n")
     assert got == (b"GET /?x=1 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nAccept: */*\r\n"
                    b"Connection: close\r\n\r\n" % port)
@@ -1162,8 +1162,8 @@ def test_a_non_sigv4_authorization_is_still_rewritten():
 
 
 def test_a_signed_request_with_two_hosts_is_forwarded_as_received():
-    req = (b"GET / HTTP/1.1\r\nHost: 100.104.39.6\r\nHost: evil\r\n" + _SIGV4_AUTH + b"\r\n")
-    got, _reply, _port = _through_forwarder({"100.104.39.6"}, req)
+    req = (b"GET / HTTP/1.1\r\nHost: 100.64.8.6\r\nHost: evil\r\n" + _SIGV4_AUTH + b"\r\n")
+    got, _reply, _port = _through_forwarder({"100.64.8.6"}, req)
     assert got == req
 
 
@@ -1192,12 +1192,12 @@ def test_signed_chunked_put_and_keepalive_framing_survive():
 
     _t.Thread(target=_serve, daemon=True).start()
     fwd = AgentForwarder("127.0.0.1", srv.getsockname()[1],
-                         fabric_names=frozenset({"100.104.39.6"})).start()
+                         fabric_names=frozenset({"100.64.8.6"})).start()
     try:
         c = _s.create_connection(("127.0.0.1", fwd.port), timeout=5)
-        put = (b"PUT /b/k HTTP/1.1\r\nHost: 100.104.39.6:9000\r\n" + _SIGV4_AUTH +
+        put = (b"PUT /b/k HTTP/1.1\r\nHost: 100.64.8.6:9000\r\n" + _SIGV4_AUTH +
                b"Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
-        get = b"GET /two HTTP/1.1\r\nHost: 100.104.39.6:9000\r\n" + _SIGV4_AUTH + b"\r\n"
+        get = b"GET /two HTTP/1.1\r\nHost: 100.64.8.6:9000\r\n" + _SIGV4_AUTH + b"\r\n"
         c.sendall(put)
         assert c.recv(4096).startswith(b"HTTP/1.1 200")  # connection still open
         c.sendall(get)

@@ -696,10 +696,10 @@ def _build_parser() -> argparse.ArgumentParser:
                          "the gateway keeps using per-port URLs)")
     p2.add_argument("--apex-upstream", default=None, metavar="HOST:PORT",
                     help="where the bare fleet names (https://dev.lan, https://<acme-domain>) go: the dashboard, e.g. "
-                         "100.104.39.6:80. Needs the named listener (--acme-domain) and a certificate for the name")
+                         "100.64.8.6:80. Needs the named listener (--acme-domain) and a certificate for the name")
     p2.add_argument("--route", action="append", default=[], metavar="HOST=UP:PORT",
                     help="send one exact host name on the named port to an upstream (repeatable), e.g. "
-                         "bender.tail0c50da.ts.net=127.0.0.1:8787 to take over a `tailscale serve` rule")
+                         "bender.<tailnet>.ts.net=127.0.0.1:8787 to take over a `tailscale serve` rule")
     p2.add_argument("--tailscale-cert", default=None, metavar="NAME",
                     help="also serve this node's ts.net NAME with the certificate `tailscale cert` provides")
     p2.add_argument("--no-named-urls", action="store_true", help="do not serve stable service-name URLs")
@@ -1027,7 +1027,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Cognito Hosted UI base URL, e.g. https://<prefix>.auth.us-west-2.amazoncognito.com")
     p2.add_argument("--collab-public-url", default=None,
                     help="the https URL users open (must equal a registered callback URL), e.g. "
-                         "https://bender.tail0c50da.ts.net:9447/")
+                         "https://bender.<tailnet>.ts.net:9447/")
     p2.add_argument("--collab-cognito-group", default=None,
                     help="required cognito:groups membership (default: local.dev)")
     p2.add_argument("--collab-open-signup", action="store_true",
@@ -5790,8 +5790,8 @@ def _parse_api_keys(single_key, pairs_str):
 
 def _seed_demo(repo):
     """Populate a fresh repo with demo missions/sessions/hosts/services."""
-    hid1 = repo.register_host("bender", "100.104.39.6")
-    hid2 = repo.register_host("beast", "100.96.156.65")
+    hid1 = repo.register_host("bender", "100.64.8.6")
+    hid2 = repo.register_host("beast", "100.64.8.65")
     repo.record_telemetry(hid1, {"cpu_pct": 12, "mem_pct": 38, "disk_pct": 54})
     repo.record_telemetry(hid2, {"cpu_pct": 3, "mem_pct": 21, "disk_pct": 30})
 

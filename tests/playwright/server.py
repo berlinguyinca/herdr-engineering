@@ -46,11 +46,11 @@ def _seed(repo):
                                      ownership=launch, **options)
 
     s1 = repo.create_session(mission_id=m1, agent_role="pi", model="gpt-4o")
-    repo.upsert_host("beast", "beast", "100.96.156.65", inventory={
+    repo.upsert_host("beast", "beast", "100.64.8.65", inventory={
         "tools": {"claude": "2.1.0", "pi": "1.2.0"}, "plugins": {"claude:superpowers": "7.0.0"}})
-    repo.upsert_host("bender", "bender", "100.104.39.6", inventory={
+    repo.upsert_host("bender", "bender", "100.64.8.6", inventory={
         "tools": {"claude": "2.1.0", "pi": "1.3.0"}, "plugins": {"claude:superpowers": "7.0.0"}})
-    repo.upsert_host("mac.lan", "macbook-pro", "100.84.185.100")
+    repo.upsert_host("mac.lan", "macbook-pro", "100.64.8.100")
     owned_service("web", 8080)
     repo.register_service("gateway", "bender", 9000)
     repo.record_event("mission", m1, "MissionStarted",

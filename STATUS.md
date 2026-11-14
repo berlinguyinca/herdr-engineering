@@ -115,8 +115,8 @@ overridden by repo `config/herdr-engineering.yaml`, then `$HERDR_ENGINEERING_CON
   devfabric gateway` on bender (control :29999 on tailnet+loopback,
   router on loopback+tailnet). `register --host auto` for a local app
   allocated external port 18000 and bound it immediately; both
-  `curl http://bender.tail0c50da.ts.net:18000/` and
-  `curl http://100.104.39.6:18000/` returned the app's page (HTTP 200).
+  `curl http://bender.<tailnet>.ts.net:18000/` and
+  `curl http://100.64.8.6:18000/` returned the app's page (HTTP 200).
   A gateway restart auto-rebound a surviving lease from the store
   (port 18001) without any registrar action. Dead-target port release is
   probe/TTL-driven (unhealthy → no renewal → TTL expiry → unbind with
