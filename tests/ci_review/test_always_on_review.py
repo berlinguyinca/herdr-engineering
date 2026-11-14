@@ -771,7 +771,44 @@ def test_no_budget_means_no_limit(env):
     assert len(env.reviewer_calls()) == 4
 
 
-@pytest.mark.parametrize("bad", ["0", "-1", "'5'", "true", ".nan", ".inf", "[1]"])
+@pytest.mark.parametrize("bad", ["0", "-1", "'5'", "true", ".nan", ".inf", "[1]", str(10**400)])
 def test_an_invalid_daily_budget_is_refused(env, bad):
     env.config(f"tiers: {{tier2: {{daily_budget_usd: {bad}}}}}\n")
     assert env.review("tier2") == 2 and env.reviewer_calls() == []
+
+
+def test_spend_of_a_review_whose_head_moved_counts(env):
+    env.config(BUDGET, post=True)
+    st = env.gh_state()
+    st["prs"]["7"]["head_after_review"] = "c" * 40
+    env.write_gh(st)
+    assert env.review("tier2", post=True) == 3
+    assert _log_lines(env)[-1]["state"] == "head-moved" and _log_lines(env)[-1]["usage"]["cost_usd"] == 0.5
+    assert env.mod.spent_today_usd(env.mod.load_config(env.cfg_path), "tier2") == 0.5
+
+
+def test_spend_of_a_review_whose_passes_all_failed_counts(env):
+    env.config(BUDGET, post=True)
+    env.reviewer("claude", answer={"head_sha": "@HEAD", "verdict": "maybe"})      # model ran and billed; not a verdict
+    assert env.review("tier2", post=True) == 1
+    assert _log_lines(env)[-1]["state"] == "not-run" and _log_lines(env)[-1]["usage"]["cost_usd"] == 0.5
+    assert env.mod.spent_today_usd(env.mod.load_config(env.cfg_path), "tier2") == 0.5
+
+
+def test_a_non_finite_logged_cost_counts_as_zero(env):
+    env.config(BUDGET, post=True)
+    assert env.review("tier2", post=True) == 0
+    now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with (env.tmp / "state/reviews.jsonl").open("a") as f:
+        for bad in ("NaN", "Infinity", "-Infinity"):
+            f.write('{"ts": "%s", "tier": "tier2", "usage": {"cost_usd": %s}}\n' % (now, bad))
+    assert env.mod.spent_today_usd(env.mod.load_config(env.cfg_path), "tier2") == 0.5
+
+
+def test_an_undecodable_byte_in_the_log_skips_that_line_only(env):
+    env.config(BUDGET, post=True)
+    assert env.review("tier2", post=True) == 0
+    with (env.tmp / "state/reviews.jsonl").open("ab") as f:
+        f.write(b'\xff\xfe not utf-8\n')
+    assert env.mod.spent_today_usd(env.mod.load_config(env.cfg_path), "tier2") == 0.5
+    assert env.review("tier2", post=True, *["--force"]) == 0

@@ -93,6 +93,16 @@ DEFAULTS: dict = {
 
 # ---------------- configuration ----------------
 
+def _valid_budget(b) -> bool:
+    """A positive, finite number; an int too large for a float (10**400) is refused, not an OverflowError."""
+    if isinstance(b, bool) or not isinstance(b, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(b)) and b > 0
+    except OverflowError:
+        return False
+
+
 def load_config(path: str | None) -> dict:
     over: dict = {}
     if path:
@@ -118,7 +128,7 @@ def load_config(path: str | None) -> dict:
         if t["time_cap_s"] < 10:
             raise Refused(f"config: tiers.{name}.time_cap_s must be at least 10")
         b = t.get("daily_budget_usd")
-        if b is not None and (isinstance(b, bool) or not isinstance(b, (int, float)) or not math.isfinite(b) or b <= 0):
+        if b is not None and not _valid_budget(b):
             raise Refused(f"config: tiers.{name}.daily_budget_usd must be a positive number (or unset for no limit)")
         contexts.append(t["context"])
     if len(set(contexts)) != len(contexts):
@@ -1021,7 +1031,7 @@ def spent_today_usd(cfg: dict, tier_name: str) -> float:
     today = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d")
     total = 0.0
     try:
-        lines = (ai.expand(cfg["state_dir"]) / "reviews.jsonl").read_text().splitlines()
+        lines = (ai.expand(cfg["state_dir"]) / "reviews.jsonl").read_text(errors="replace").splitlines()
     except OSError:
         return 0.0
     for raw in lines:
@@ -1031,7 +1041,8 @@ def spent_today_usd(cfg: dict, tier_name: str) -> float:
         except (ValueError, KeyError, TypeError):
             continue
         if (isinstance(e, dict) and e.get("tier") == tier_name and str(e.get("ts", "")).startswith(today)
-                and isinstance(cost, (int, float)) and not isinstance(cost, bool)):
+                and isinstance(cost, (int, float)) and not isinstance(cost, bool)
+                and math.isfinite(cost)):                   # a NaN/inf cost would poison the sum: count it as zero
             total += cost
     return total
 
@@ -1135,12 +1146,14 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
                 count = old.get("failures", 0) + 1 if old.get("failure_sha") == sha else 1
                 state.put(key, failures=count, last_failure=time.time(), failure_sha=sha)
             log_line(cfg, repo=repo, pr=n, sha=sha, tier=tier_name, state="not-run", model=tier["model"],
-                     duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=str(e)[:200])
+                     duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=str(e)[:200],
+                     **({"usage": e.usage} if getattr(e, "usage", None) else {}))
             raise
     except HeadMoved as e:
         ai.say(f"{repo}#{n}: {e}; nothing posted (a new run handles the new head)")
         log_line(cfg, repo=repo, pr=n, sha=sha, tier=tier_name, state="head-moved", model=tier["model"],
-                 duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=str(e)[:200])
+                 duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=str(e)[:200],
+                 **({"usage": e.usage} if getattr(e, "usage", None) else {}))
         return MOVED
     finally:
         held.close()
@@ -1186,10 +1199,14 @@ def run_passes(cfg: dict, tier: dict, backend: Backend, req: ReviewRequest, root
         try:
             if remaining <= 0:
                 raise ReviewFailed(f"the review took longer than the time cap ({tier['time_cap_s']:.0f}s)")
+            raw = None
             raw = backend.review(dataclasses.replace(req, focus=ps["focus"]), remaining / (len(passes) - i))
             v = parse_verdict(raw.answer, req.sha)
         except ReviewFailed as e:
+            if raw is not None:                         # the model ran and billed even though its answer was unusable
+                usages.append(raw.usage)
             if not verdicts:
+                e.usage = _sum_usage(usages)
                 raise
             failed.append(f"pass {ps['name']} did not complete: {str(e)[:150]}")
             info.append({"name": ps["name"], "error": ai.redact(str(e))[:200]})
@@ -1278,7 +1295,9 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
                  findings=log_findings(verdict.findings))
         raise ReviewFailed(f"{why}; status stays pending")
     if gh.head(repo, n) != sha:
-        raise HeadMoved("the head moved during the review")
+        moved = HeadMoved("the head moved during the review")
+        moved.usage = result.usage                      # the model ran: the spend counts toward the daily budget
+        raise moved
     url = None
     if decision.state == "failure" and tier["comment"]:
         url = upsert_comment(gh, repo, n, context, comment_text(context, sha, decision))
