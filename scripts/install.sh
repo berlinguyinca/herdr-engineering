@@ -116,9 +116,9 @@ fi
 
 # --- 3. required cross-harness handoff ------------------------------------
 step "3/8 installing required herdr-handoff integration"
-# One script resolves the pin, fetches it, installs the CLI and links the skills, so an install and an
-# update cannot disagree about what "installed" means (they used to: install.sh carried its own default
-# revision, which had silently drifted from the pin in lock/upstreams.yaml).
+# One script resolves the pin, fetches it, installs the CLI, links the skills and attests the entrypoint on
+# PATH. install.sh used to declare the revision a second time beside the lock entry, so bumping the pin in
+# lock/upstreams.yaml changed what `herdr-eng fleet status` reported and not what this machine installed.
 HERDR_HANDOFF_PYTHON="$PY" bash "$REPO_ROOT/scripts/install-handoff.sh"
 
 if [ ! -f "$ARTIFACT_REPO/install/install.sh" ]; then
@@ -279,8 +279,15 @@ if [ -d "$LINK_DIR" ] || mkdir -p "$LINK_DIR" 2>/dev/null; then
   if command -v python3 >/dev/null 2>&1 && case "$PATH" in *"$LINK_DIR"*) true;; *) false;; esac; then
     ln -sf "$VENV/bin/herdr-eng" "$LINK_DIR/herdr-eng"
     printf '  linked %s -> %s\n' "$LINK_DIR/herdr-eng" "$VENV/bin/herdr-eng"
-    ln -sf "$VENV/bin/herdr-handoff" "$LINK_DIR/herdr-handoff"
-    printf '  linked %s -> %s\n' "$LINK_DIR/herdr-handoff" "$VENV/bin/herdr-handoff"
+    # A regular file here was not written by this installer (step 3 links symlinks), so it is someone's own
+    # and `ln -sf` would have destroyed it silently.
+    if [ -e "$LINK_DIR/herdr-handoff" ] && [ ! -L "$LINK_DIR/herdr-handoff" ]; then
+      warn "$LINK_DIR/herdr-handoff is a file this installer does not own; leaving it. Remove it to link "\
+"the pinned CLI ($VENV/bin/herdr-handoff)."
+    else
+      ln -sf "$VENV/bin/herdr-handoff" "$LINK_DIR/herdr-handoff"
+      printf '  linked %s -> %s\n' "$LINK_DIR/herdr-handoff" "$VENV/bin/herdr-handoff"
+    fi
   else
     warn "$LINK_DIR is not on PATH; activate the venv instead: source $VENV/bin/activate"
   fi

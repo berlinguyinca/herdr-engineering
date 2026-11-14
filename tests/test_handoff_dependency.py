@@ -1,9 +1,10 @@
 from pathlib import Path
 
-import pytest
-
-from herdr_engineering.handoff_dependency import CLI_COMMANDS, HARNESS_DIRS, \
-    check_handoff_dependency
+from herdr_engineering.handoff_dependency import (
+    CLI_COMMANDS,
+    HARNESS_DIRS,
+    check_handoff_dependency,
+)
 
 
 def test_handoff_dependency_accepts_a_complete_install(tmp_path: Path):
@@ -113,3 +114,21 @@ def test_a_cli_that_cannot_be_run_reports_no_capabilities(tmp_path):
     assert result.capabilities == {}
     assert "could not be run" in result.detail
 
+
+
+def test_the_capability_probe_reads_subcommands_and_not_prose():
+    # Two formats have to be told apart.  argparse prints subcommands as a brace group, and the word can
+    # also appear in the description of another command - counting that mention is the false confidence
+    # that lets `herdr-eng doctor` credit takeover behaviour to a CLI which does not have it.
+    from herdr_engineering.handoff_dependency import _advertises
+
+    brace = ("usage: herdr-handoff [-h] {create,launch,drift} ...\n"
+             "  takeover    hand a session to a fresh pane and close this one\n")
+    assert _advertises(brace, "takeover") is False, "prose mention is not a subcommand"
+    assert _advertises(brace, "drift") is True
+
+    lines = ("usage: herdr-handoff [-h]\n"
+             "commands:\n"
+             "    takeover    hand a session to a fresh pane\n")
+    assert _advertises(lines, "takeover") is True, "a command listed one per line is still advertised"
+    assert _advertises("herdr-handoff - move a session elsewhere", "takeover") is False

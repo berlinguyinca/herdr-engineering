@@ -4,9 +4,9 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
 
 HARNESS_DIRS = ("codex", "claude", "pi", "opencode")
 
@@ -37,9 +37,12 @@ def _advertises(help_text: str, command: str) -> bool:
     a word-boundary search (which ignores `herdr-handoff` and `--flags`) covers help that spells the
     commands out some other way.
     """
-    for group in re.findall(r"\{([A-Za-z0-9][A-Za-z0-9,_\- ]*)\}", help_text):
-        if command in [choice.strip() for choice in group.split(",")]:
-            return True
+    groups = re.findall(r"\{([A-Za-z0-9][A-Za-z0-9,_\- ]*)\}", help_text)
+    if groups:
+        # A help text that lists its subcommands as brace groups is read from those groups alone.  Also
+        # searching the prose would credit `confirm` to a CLI that only mentions it in the description of
+        # another command - which is the false confidence this check exists to remove.
+        return any(command in [choice.strip() for choice in group.split(",")] for group in groups)
     return re.search(rf"(?<![\w-]){re.escape(command)}(?![\w-])", help_text) is not None
 
 

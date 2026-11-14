@@ -54,9 +54,17 @@ def repo_root() -> Path:
     return cwd
 
 
-def _run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
+def _run(cmd: list[str], timeout: int = 600, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+    """Run a command, optionally adding to the environment.
+
+    `env` extends os.environ rather than replacing it, so a caller can pin one variable (the interpreter
+    a dependency installs into) without stripping PATH out from under the command.
+    """
+    child_env = None
+    if env:
+        child_env = {**os.environ, **env}
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=child_env)
     except subprocess.TimeoutExpired:
         return 124, "", "timed out"
     except OSError as exc:
@@ -303,10 +311,16 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
         report["error"] = f"agent_rules pin: {exc}"
         return report
 
-    def step(name: str, cmd: list[str], timeout: int) -> tuple[bool, str]:
-        rc, out, err = _run(cmd, timeout=timeout)
-        report["steps"][name] = {"ok": rc == 0, "rc": rc,
-                                "stderr": err.strip()[-1000:] or None}
+    def step(name: str, cmd: list[str], timeout: int,
+             env: dict[str, str] | None = None) -> tuple[bool, str]:
+        rc, out, err = _run(cmd, timeout=timeout, env=env)
+        entry: dict[str, object] = {"ok": rc == 0, "rc": rc,
+                                    "stderr": err.strip()[-1000:] or None}
+        if env:
+            # Say which interpreter a dependency step ran under: "refreshed" without that is how install
+            # and update came to disagree about what "installed" means.
+            entry["env"] = dict(env)
+        report["steps"][name] = entry
         return rc == 0, out.strip()
 
     try:
@@ -383,16 +397,28 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
 
     # herdr-handoff is a required operational dependency pinned in lock/upstreams.yaml: `herdr-eng`
     # hands sessions to its CLI and every `/herdr::*` command comes from its skill tree.  Refreshing it
-    # with the controller means the pin and the machine cannot drift apart the way install.sh's own
-    # hardcoded default and the lock file did.  A failure here is reported, not fatal: a host whose
-    # handoff install is broken still syncs, and `herdr-eng doctor` names the gap.
+    # with the controller means the controller's pin and its machine cannot drift apart the way
+    # install.sh's own hardcoded default and the lock file did.
+    #
+    # It runs on the controller only.  Fleet hosts are installed by scripts/install.sh / the ansible playbooks
+    # and are *checked* per host by `herdr-eng fleet doctor`, which reports this gate for every host; this
+    # step is not how a remote host converges, and saying so here is the difference between a report an
+    # operator can trust and one that quietly covers one machine.
+    #
+    # The interpreter is pinned to this process's own, because the alternative is whatever `python3` the
+    # transport's PATH happens to resolve - which installs the CLI somewhere the caller never intended and
+    # leaves the entrypoint on PATH at the previous revision.  A failure here is reported, not fatal: a
+    # host whose handoff install is broken still syncs, and `herdr-eng doctor` names the gap.
     handoff_installer = root / "scripts" / "install-handoff.sh"
     if handoff_installer.exists():
-        handoff_ok, _ = step("handoff_refresh", ["bash", str(handoff_installer)], 600)
+        handoff_ok, _ = step("controller_handoff_refresh", ["bash", str(handoff_installer)], 600,
+                             env={"HERDR_HANDOFF_PYTHON": sys.executable})
         if not handoff_ok:
             report.setdefault("warnings", []).append(
-                "herdr-handoff refresh failed; the pinned dependency may be stale - run "
-                "scripts/install-handoff.sh and check `herdr-eng doctor`")
+                "herdr-handoff refresh failed on the controller (interpreter "
+                f"{sys.executable}); the pinned dependency may be stale - run "
+                "scripts/install-handoff.sh and check `herdr-eng doctor`; fleet hosts are reported "
+                "per host by `herdr-eng fleet doctor`")
 
     from .config import load_config
     cleanup = load_config().get("build_cleanup", {})

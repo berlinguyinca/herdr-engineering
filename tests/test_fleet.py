@@ -1,5 +1,7 @@
 """Tests for the one-command fleet onboarding (herdr_engineering/fleet.py)."""
 import hashlib
+import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -578,9 +580,39 @@ def test_update_refreshes_the_pinned_handoff_dependency(tmp_path, monkeypatch):
     monkeypatch.setattr(fleet, '_run', run)
     monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: STATUS)
     result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
-    assert any('install-handoff.sh' in ' '.join(cmd) for cmd in calls)
-    assert result['steps']['handoff_refresh']['ok'] is False
+    handoff_calls = [c for c in calls if 'install-handoff.sh' in ' '.join(c)]
+    assert handoff_calls, calls
+    assert result['steps']['controller_handoff_refresh']['ok'] is False
     assert any('herdr-handoff' in warning for warning in result.get('warnings', []))
     # A host with a stale handoff still syncs: blocking the fleet on it would trade a reportable gap
     # for an outage.
     assert result['ok']
+
+
+def test_the_handoff_refresh_names_the_interpreter_it_installs_into(tmp_path, monkeypatch):
+    # The installer resolves `HERDR_HANDOFF_PYTHON`, and without a value it falls back to whatever
+    # `python3` means in the caller's environment.  That installed the CLI into an interpreter nobody
+    # chose while reporting the refresh as done, so the pin and `herdr-eng doctor` could disagree forever.
+    repo = _fake_repo(tmp_path)
+    (repo / 'scripts').mkdir()
+    (repo / 'scripts/install-handoff.sh').write_text('#!/bin/sh\n')
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    seen = {}
+    def run(cmd, **kwargs):
+        if 'install-handoff.sh' in ' '.join(cmd):
+            seen.update(kwargs.get('env') or {})
+            return 0, 'attested', ''
+        return _success(cmd, **kwargs)
+    monkeypatch.setattr(fleet, '_run', run)
+    monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: STATUS)
+    result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
+    assert seen.get('HERDR_HANDOFF_PYTHON') == sys.executable, seen
+    assert result['steps']['controller_handoff_refresh']['env']['HERDR_HANDOFF_PYTHON'] == sys.executable
+
+
+def test_env_included_in_the_environment_extends_it(tmp_path):
+    # A caller that pins one variable must not strip PATH out from under the command it runs.
+    from herdr_engineering.fleet import _run
+    rc, out, err = _run(['sh', '-c', 'printf %s "$PATH"'], env={'HERDR_HANDOFF_PYTHON': 'x'})
+    assert rc == 0, err
+    assert out == os.environ['PATH']
