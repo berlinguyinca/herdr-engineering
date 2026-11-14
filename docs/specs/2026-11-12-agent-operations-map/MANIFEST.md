@@ -1,7 +1,7 @@
 # Mission manifest
 
 Branch: feat/agent-operations-map (worktree ~/IdeaProjects/herdr-engineering-wt/agent-ops-map), base 22ecf0f1.
-Integration branch: feat/agent-operations-map only; nothing pushed, no merge to main without user authorization.
+Integration branch: feat/agent-operations-map. Merged to main as PR #783 (squash f3adb917, 2026-11-14).
 Rollback: set `control_plane.agent_ops.enabled: false` (capability `agent_ops_v1` disappears, NAV entry hides, adapters stay inert without HERDR_AGENT_OPS=1); or drop the branches below.
 
 | Slice | Branch | Status |
@@ -19,7 +19,9 @@ Rollback: set `control_plane.agent_ops.enabled: false` (capability `agent_ops_v1
 Test evidence at 00daf836 (focused): 166 Python tests pass (agent_ops, envelope, health, adapters, tui); 48 web unit tests pass.
 Known flaky: test_pi_null_context_after_compaction_emits_compaction_not_a_metric failed once in a combined run and passed on 5 reruns; test_interactive_pane_in_a_real_pty_against_the_real_server is timing based.
 
-Test evidence at final tip: 258 Python (same five files), 65 node, tests/playwright/agent-ops.test.mjs 12/12. Earlier at 5cc60e00: 240 Python tests (agent_ops, envelope, health, adapters, tui; two clean runs), 61 node tests (model 36, view 21, lineage 4), tests/playwright/agent-ops.test.mjs 11/11.
+Test evidence at the merged head 3b899a5b: 365 Python (agent_ops, envelope, health, adapters, tui, collab_http, graph), 65 node, tests/playwright/agent-ops.test.mjs 12/12.
+CI and merge of PR #783: unit-gates had been green on af8d31df. The merge used an admin bypass; the Opus-agent-review status was posted by the operator after an Opus subagent approved 3b899a5b.
+Earlier at 5cc60e00: 240 Python tests (agent_ops, envelope, health, adapters, tui; two clean runs), 61 node tests (model 36, view 21, lineage 4), tests/playwright/agent-ops.test.mjs 11/11.
 Known flaky: test_interactive_pane_in_a_real_pty_against_the_real_server (timing); a Claude-hook adapter test once under load. nav-groups.test.mjs and calm.test.mjs fail/hang on the pre-mission base 22ecf0f1 too.
 
 ## Authz follow-up (after round 5)
