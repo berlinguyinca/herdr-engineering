@@ -96,15 +96,25 @@ control_plane:
     max_tail_rows: 100000    # change-log rows since the checkpoint
     max_dirty_rows: 600000   # rows re-read from streams that cannot fold incrementally
     hard_dirty_rows: 2000000 # above this a complete replay is cheaper; default max(2000000, max_dirty_rows)
+    hard_tail_rows: 500000   # a stale checkpoint tolerated up to this many change-log rows; default max(500000, max_tail_rows)
 ```
 
-Values must be positive integers (`hard_dirty_rows` >= `max_dirty_rows`); anything
+Values must be positive integers (`hard_dirty_rows` >= `max_dirty_rows`, `hard_tail_rows` >= `max_tail_rows`); anything
 else stops startup with an error naming the key. Between `max_dirty_rows` and
 `hard_dirty_rows` recovery logs a warning (`over the dirty budget; refolding ...`)
 and still recovers from the checkpoint, re-reading only the dirty streams. Above
 `hard_dirty_rows` the checkpoint is rejected with `dirty rows <actual> > hard cap
 <configured>` and the top five entity types by row count, and recovery falls back
 to a complete replay.
+
+A tail between `max_tail_rows` and `hard_tail_rows` (a slightly stale checkpoint) is not
+rejected: recovery logs `over the tail budget; folding the tail incrementally ...` with
+the tail size, frontier, position and per-type row counts by operation, then folds it. Above
+`hard_tail_rows` the rejection names `tail rows > hard cap <n>` with the same per-type
+counts. Every other rejection (structural mutation, inspector non-append, legacy
+coverage) logs its full reason, including the operation and type counts, and a complete
+replay remains the fallback. Rejection reasons are no longer cut at 200 characters
+(bound: 2000).
 
 What folds without re-reading the stream (it does not count against the dirty
 budgets): `token_usage` and `resource_usage` streams, whose checkpointed rows are

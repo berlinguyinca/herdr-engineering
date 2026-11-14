@@ -584,9 +584,18 @@ if [ "$COLLAB" = 1 ] && grep -q 'fabric-listener' "$WORK/herdr_engineering/cli.p
     echo "fabric-trust listener: $FABRIC_HOST:$FABRIC_PORT (whois sidecar fabric-whois)"
     # Host hardening the listener relies on but a deploy cannot install (root): warn, never fail.
     FABRIC_FW="$WORK/deploy/control-plane/collab-fabric-firewall.sh"
-    if [ -x "$FABRIC_FW" ] && ! "$FABRIC_FW" --check >/dev/null 2>&1; then
-      echo "WARNING: fabric network firewall is not confirmed present (or not readable without root): collab-public's network has a default route" \
-        "and can reach this host's own addresses. As root run: $FABRIC_FW --install  (docs/operations/fabric-trust.md, Required hardening)" >&2
+    if [ -x "$FABRIC_FW" ]; then
+      FW_RC=0; "$FABRIC_FW" --check >/dev/null 2>&1 || FW_RC=$?
+      case "$FW_RC" in
+        0) ;;
+        2) FW_BOOT=""
+           if systemctl is-enabled herdr-collab-fabric-firewall.service >/dev/null 2>&1; then
+             FW_BOOT="; boot unit herdr-collab-fabric-firewall.service is enabled"
+           fi
+           echo "NOTE: fabric network firewall rules could not be verified without root${FW_BOOT}. To verify: sudo $FABRIC_FW --check" >&2 ;;
+        *) echo "WARNING: fabric network firewall is not confirmed present: collab-public's network has a default route" \
+             "and can reach this host's own addresses. As root run: $FABRIC_FW --install  (docs/operations/fabric-trust.md, Required hardening)" >&2 ;;
+      esac
     fi
     if [ ! -e /etc/systemd/system/docker.service.d/after-tailscale.conf ]; then
       echo "WARNING: docker is not ordered after tailscaled: after a reboot the published fabric port may fail to bind and the PUBLIC collab site" \

@@ -1,5 +1,5 @@
 # Session summary
-**Session:** Claude Code · **Repository:** metabolomics-us/wcmc (isolated clones under /home/wohlgemuth/work) · **Branch/worktree:** session cwd /home/wohlgemuth/IdeaProjects/wcmc3 (shared tree, untouched); release clone wcmc-release-run on master_ai at 66da8a22de
+**Session:** Claude Code · **Repository:** metabolomics-us/wcmc (isolated clones under /home/user/work) · **Branch/worktree:** session cwd /home/user/IdeaProjects/wcmc3 (shared tree, untouched); release clone wcmc-release-run on master_ai at 66da8a22de
 **Overall status:** in progress (code merged; production release not yet run, waiting for the user's go)
 
 1. **Original objective** — Fix the upstream cause of duplicate bin groups in LC-BinBase. The ratchet fix a8beb1b55c was already in production. This stretch of the session: add a cross-process mint lock plus a real-data ratchet regression test, get them through CI and merged, then make `release.sh` work so a production release can ship them.
@@ -47,13 +47,13 @@
    - Watcher process for pipeline 45 may still be running (PID 52242 earlier).
 
 9. **Prioritized next actions**
-   1. Get the user's "go", then run `./release.sh --release-env prod --github-deploy --to-hive --report` from /home/wohlgemuth/work/wcmc-release-run. Done when the report says success and the tag is pushed.
+   1. Get the user's "go", then run `./release.sh --release-env prod --github-deploy --to-hive --report` from /home/user/work/wcmc-release-run. Done when the report says success and the tag is pushed.
    2. Immediately check squeue for go-prioritize (a new binary makes the running instance exit about 2 minutes later; resubmit if gone).
    3. Keep hive-fast-deploy.log and find why verification exits 1.
    4. Approve and check pipeline 48; confirm the merged mint-lock build is green on master_ai.
    5. Remeasure the 42-of-1,115 same-burst duplicates on new bins after the release.
    6. Remove the finished worktrees and branches if the user agrees.
 
-10. **Resume point** — Awaiting the user's explicit go for the real production release. Run it from /home/wohlgemuth/work/wcmc-release-run (clean, master_ai at 66da8a22de), then verify prioritize in squeue and read the Hive deploy log.
+10. **Resume point** — Awaiting the user's explicit go for the real production release. Run it from /home/user/work/wcmc-release-run (clean, master_ai at 66da8a22de), then verify prioritize in squeue and read the Hive deploy log.
 
 **Evidence coverage:** complete. The history helper resolved this session via the Herdr pane with no gaps. Not independently re-verified: the content of the 2026-10-27 release logs (deleted) and whether the herdr dashboard lists ci-pipeline-45.html.

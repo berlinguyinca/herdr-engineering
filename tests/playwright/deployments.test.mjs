@@ -107,6 +107,19 @@ test('a CI-reported component shows a badge, its last deploy and the run link, a
  assert.doesNotMatch(await page.locator('[data-deploy-plan]').innerText(),/lc-binbase/);
 }));
 
+test('a failed CI deploy shows its cause on the row and in a recent-problems list with the run link',async()=>withServer('ci',async(page,base)=>{
+ await step('open the page',()=>page.goto(`${base}/#/deployments`));
+ const problems=page.locator('[data-deploy-problems] [data-deploy-problem]');
+ await step('problems loaded',()=>problems.first().waitFor({timeout:WAIT}));
+ const failed=problems.filter({hasText:'lc-binbase-backend'});
+ assert.equal(await failed.count(),1);
+ assert.match(await failed.locator('[data-deploy-problem-detail]').innerText(),/FAILED MODULES: go-assistant-mcp \(pipeline #154\)/);
+ assert.equal(await failed.locator('[data-deploy-ci-evidence]').getAttribute('href'),'https://ci.metabolomics.us/repos/7/pipeline/412');
+ assert.match(await failed.innerText(),/failed/);
+ const row=page.locator('[data-deploy-stage="CI-reported"] [data-deploy-row="lc-binbase-backend"]');
+ assert.match(await row.locator('[data-deploy-ci-detail]').innerText(),/FAILED MODULES: go-assistant-mcp/);
+}));
+
 test('without definitions the tab shows its empty state with the config hint',async()=>withServer('empty',async(page,base)=>{
  await step('open the page',()=>page.goto(`${base}/#/deployments`));
  await step('empty state',()=>page.locator('[data-deploy-empty]').waitFor({timeout:WAIT}));

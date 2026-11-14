@@ -192,6 +192,32 @@ services:
       - "--fleet-config"
       - "/etc/herdr/fleet/fleet-config.yaml"
 
+  # ---- OPTIONAL: same-origin key-injecting proxy for the browser dashboard (keyed mode) ---
+  # Opt-in: `docker compose --profile dashboard-proxy up -d dashboard-proxy`. Needs
+  # control_plane.dashboard_proxy in the central file (key files under the mounted dir, mode 0600).
+  # Browsers point at this port instead of the web port; the proxy adds the viewer/operator key.
+  dashboard-proxy:
+    profiles: ["dashboard-proxy"]
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:-unset}
+    container_name: herdr-cp-dashboard-proxy
+    restart: unless-stopped
+    depends_on:
+      - control-plane-web
+    volumes:
+      - ${HERDR_CP_FLEET_DIR:-/etc/herdr/fleet}:/etc/herdr/fleet:ro
+      - ${HERDR_DASHBOARD_PROXY_KEY_DIR:-/var/lib/herdr-dashboard-proxy}:/etc/herdr/dashboard-proxy:ro
+    ports:
+      - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_DASHBOARD_PROXY_PORT:-8081}:8081"
+    command:
+      - "control-plane"
+      - "dashboard-proxy"
+      - "--fleet-config"
+      - "/etc/herdr/fleet/fleet-config.yaml"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8081"
+
   control-plane-worker:
     build:
       context: ../..
@@ -254,6 +280,8 @@ services:
       # ONLY the llm slice (llm + control_plane.llm_proxy, `fleet config render-llm`),
       # in a directory of its own; the process refuses any file carrying more.
       - ${HERDR_LLM_SLICE_DIR:?run deploy.sh}:/etc/herdr/llm:ro
+      # OPTIONAL: an API key (agent role) for a keyed control plane. Unset = no mount, no header.
+      - ${HERDR_CP_CLIENT_KEY_FILE:-/dev/null}:/run/secrets/cp-client-key:ro
     ports:
       - "${HERDR_CP_WEB_BIND:-127.0.0.1}:${HERDR_LLM_PROXY_PORT:-8088}:8088"
     command:
@@ -267,6 +295,7 @@ services:
       - "http://control-plane-web:8080"
       - "--fleet-config"
       - "/etc/herdr/llm/llm-config.json"
+      - "--control-plane-key-file=${HERDR_CP_CLIENT_KEY_FILE:+/run/secrets/cp-client-key}"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8088/healthz"]
       interval: 15s
@@ -292,11 +321,14 @@ services:
       - control-plane-web
     volumes:
       - ${HERDR_LLM_GATEWAY_DIR:-/var/lib/herdr-llm-gateway}:/var/lib/herdr-llm-gateway
+      # OPTIONAL: an API key (agent role) for a keyed control plane. Unset = no mount, no header.
+      - ${HERDR_CP_CLIENT_KEY_FILE:-/dev/null}:/run/secrets/cp-client-key:ro
     command:
       - "control-plane"
       - "llm-gateway-sync"
       - "--control-plane"
       - "http://control-plane-web:8080"
+      - "--control-plane-key-file=${HERDR_CP_CLIENT_KEY_FILE:+/run/secrets/cp-client-key}"
       - "--principals-file"
       - "/var/lib/herdr-llm-gateway/principals.json"
     healthcheck:
@@ -351,11 +383,14 @@ services:
         condition: service_healthy
     volumes:
       - ${HERDR_LLM_GATEWAY_DIR:-/var/lib/herdr-llm-gateway}:/var/lib/herdr-llm-gateway
+      # OPTIONAL: an API key (agent role) for a keyed control plane. Unset = no mount, no header.
+      - ${HERDR_CP_CLIENT_KEY_FILE:-/dev/null}:/run/secrets/cp-client-key:ro
     command:
       - "control-plane"
       - "llm-gateway-usage"
       - "--control-plane"
       - "http://control-plane-web:8080"
+      - "--control-plane-key-file=${HERDR_CP_CLIENT_KEY_FILE:+/run/secrets/cp-client-key}"
       - "--gateway"
       - "http://llm-gateway:8089"
       - "--admin-secret-file"
@@ -403,11 +438,14 @@ services:
         condition: service_healthy
     volumes:
       - ${HERDR_LLM_GATEWAY_DIR:-/var/lib/herdr-llm-gateway}:/var/lib/herdr-llm-gateway
+      # OPTIONAL: an API key (agent role) for a keyed control plane. Unset = no mount, no header.
+      - ${HERDR_CP_CLIENT_KEY_FILE:-/dev/null}:/run/secrets/cp-client-key:ro
     command:
       - "control-plane"
       - "llm-gateway-usage"
       - "--control-plane"
       - "http://control-plane-web:8080"
+      - "--control-plane-key-file=${HERDR_CP_CLIENT_KEY_FILE:+/run/secrets/cp-client-key}"
       - "--gateway"
       - "http://llm-relay:8080"
       - "--usage-path"

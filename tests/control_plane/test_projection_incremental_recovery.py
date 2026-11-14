@@ -88,7 +88,7 @@ async def append_usage(conn):
 
 def test_budget_hard_cap_is_validated_and_defaults_above_the_soft_budget():
     assert checkpoint_budgets(None).hard_dirty_rows >= checkpoint_budgets(None).max_dirty_rows
-    assert checkpoint_budgets({"max_dirty_rows": 7, "hard_dirty_rows": 9}) == (100_000, 7, 9)
+    assert checkpoint_budgets({"max_dirty_rows": 7, "hard_dirty_rows": 9}) == (100_000, 7, 9, 500_000)
     # A soft budget raised past the default hard cap drags the hard cap with it.
     assert checkpoint_budgets({"max_dirty_rows": 10_000_000}).hard_dirty_rows == 10_000_000
     with pytest.raises(ValueError, match="hard_dirty_rows"):

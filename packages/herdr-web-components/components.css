@@ -175,7 +175,7 @@
 [data-freshness] { transition: color var(--motion-normal, 200ms), background-color var(--motion-normal, 200ms); }
 
 /* Tab strip above a page that belongs to a tabbed sidebar section (app.js SECTION_TABS). */
-.hd-subnav { display: flex; gap: 2px; margin: -4px 0 14px; border-bottom: 1px solid var(--border-subtle); }
+.hd-subnav { display: flex; flex-wrap: wrap; gap: 2px; margin: -4px 0 14px; border-bottom: 1px solid var(--border-subtle); }
 .hd-subnav[hidden] { display: none; }
 .hd-subnav a { padding: 8px 14px; margin-bottom: -1px; font-size: .875rem; color: var(--text-secondary); text-decoration: none; border-bottom: 2px solid transparent; }
 @media (max-width: 900px) { .hd-subnav a { display: inline-flex; align-items: center; min-height: 44px; box-sizing: border-box; } }

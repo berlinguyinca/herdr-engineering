@@ -78,8 +78,11 @@ DEFAULTS: dict = {
         "response_format": "json_schema",        # json_schema | json_object | none
         "timeout_s": 900,                        # longest silence on the connection (socket read timeout)
         "deadline_s": 1800,                      # longest one streamed answer may take
-        "retries": 4,                            # extra attempts on 429 / 5xx / connection errors
+        "retries": 4,                            # extra attempts on 5xx / connection errors (429 has busy_wait_s)
         "backoff_s": 5.0,                        # first backoff; doubles; Retry-After wins (capped at 60 s)
+        # 429 means "the slot is taken" (deepseek serves one request at a time; another review may hold it for
+        # minutes). It is waited out for up to this many seconds in total, and does not spend `retries`
+        "busy_wait_s": 1800,
         "parallel": 1,                           # chunks in flight at once; the gateway is shared
         # exact tailnet IPv4 literals (100.64.0.0/10) whose provider baseUrl may be plain http: the key then crosses
         # the tailnet without TLS (WireGuard still encrypts the link). Empty: https only
@@ -115,6 +118,11 @@ REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 ENV_REF = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 REDACT: set[str] = set()             # secrets that must never be printed
+
+
+def backoff(base: float, n: int) -> float:
+    """base * 2**n, with the exponent capped so it cannot overflow, and never above RETRY_AFTER_MAX."""
+    return min(RETRY_AFTER_MAX, base * (2 ** min(n, 16)))
 
 
 def pause(seconds: float) -> None:
@@ -197,8 +205,8 @@ def load_config(path: str | None) -> dict:
         raise Refused("config: reviewer.response_format must be json_schema, json_object or none")
     if not 1 <= r["parallel"] <= 8:
         raise Refused("config: reviewer.parallel must be 1..8")
-    if r["max_tokens"] < 1024 or r["timeout_s"] < 1 or r["retries"] < 0:
-        raise Refused("config: reviewer.max_tokens/timeout_s/retries out of range")
+    if r["max_tokens"] < 1024 or r["timeout_s"] < 1 or r["retries"] < 0 or r["busy_wait_s"] < 0 or r["backoff_s"] <= 0:
+        raise Refused("config: reviewer.max_tokens/timeout_s/retries/busy_wait_s/backoff_s out of range")
     for h in r["allow_plain_http_hosts"]:
         if not plain_http_host_ok(h):
             raise Refused(f"config: reviewer.allow_plain_http_hosts: {h!r} is not an exact IPv4 address in the "
@@ -268,7 +276,25 @@ class Gh:
         return str(self.json(["api", "user"]).get("login", ""))
 
     def statuses(self, repo: str, sha: str) -> list[dict]:
-        return self.json(["api", f"repos/{repo}/commits/{sha}/status"]).get("statuses", []) or []
+        out: list[dict] = []
+        for page in range(1, 51):
+            batch = self.json(["api", f"repos/{repo}/commits/{sha}/status?per_page=100&page={page}"]).get(
+                "statuses", []) or []
+            out.extend(batch)
+            if len(batch) < 100:
+                break
+        return out
+
+    def check_runs(self, repo: str, sha: str) -> list[dict]:
+        """Every check run of this commit (all pages), newest (highest id) first, so the first of a duplicated name wins."""
+        out: list[dict] = []
+        for page in range(1, 51):
+            batch = self.json(["api", f"repos/{repo}/commits/{sha}/check-runs?per_page=100&page={page}"]).get(
+                "check_runs", []) or []
+            out.extend(batch)
+            if len(batch) < 100:
+                break
+        return sorted(out, key=lambda c: int(c.get("id") or 0), reverse=True)
 
     def comments(self, repo: str, n: int) -> list[dict]:
         out: list[dict] = []
@@ -468,9 +494,14 @@ class Gateway:
             conn.close()
 
     def call(self, method: str, sub: str, body: dict | None = None) -> dict:
-        attempts = self.r["retries"] + 1
-        for k in range(attempts):
-            wait = float(self.r["backoff_s"]) * (2 ** k)
+        """Retries 5xx and connection errors `retries` times. 429 (a single-slot model that is busy) is waited out
+        separately, up to `busy_wait_s` of total waiting, so a slow neighbour does not fail the review. Anything
+        that stays failing raises ReviewFailed; nothing here ever turns a failure into a success."""
+        failures = busy = 0
+        busy_waited = 0.0
+        while True:
+            is_busy = False
+            wait = backoff(float(self.r["backoff_s"]), failures)
             try:
                 status, headers, raw = self._once(method, sub, body)
             except Transient as e:
@@ -491,20 +522,32 @@ class Gateway:
                 if status != 429 and status < 500:
                     raise ReviewFailed(f"the gateway refused {sub}: HTTP {status}: {snippet}")
                 why = f"HTTP {status}"
+                is_busy = status == 429
+                if is_busy:
+                    wait = backoff(float(self.r["backoff_s"]), busy)
                 try:
                     wait = min(RETRY_AFTER_MAX, max(wait, float(headers.get("retry-after", ""))))
                 except ValueError:
-                    pass
-            if k + 1 < attempts:
-                say(f"gateway {sub}: {why}; retrying in {wait:.0f}s")
-                pause(wait)
-        raise ReviewFailed(f"the gateway kept failing on {sub}: {why}")
+                    if is_busy:
+                        wait = min(RETRY_AFTER_MAX, wait)
+            if is_busy:
+                busy += 1
+                if busy_waited + wait > float(self.r["busy_wait_s"]):
+                    raise ReviewFailed(f"the gateway stayed busy (HTTP 429) on {sub} for "
+                                       f"{busy_waited:.0f}s; reviewer.busy_wait_s is {self.r['busy_wait_s']}")
+                busy_waited += wait
+            else:
+                failures += 1
+                if failures > self.r["retries"]:
+                    raise ReviewFailed(f"the gateway kept failing on {sub}: {why}")
+            say(f"gateway {sub}: {why}; retrying in {wait:.0f}s")
+            pause(wait)
 
     def models(self) -> list[str]:
         out = self.call("GET", "/models")
         return [str(m.get("id")) for m in out.get("data", []) if isinstance(m, dict)]
 
-    def chat(self, model: str, system: str, user: str) -> Answer:
+    def chat(self, model: str, system: str, user: str, schema: dict | None = None) -> Answer:
         body = {"model": model, "messages": [{"role": "system", "content": system},
                                              {"role": "user", "content": user}],
                 self.max_tokens_field: self.r["max_tokens"], "temperature": self.r["temperature"],
@@ -513,7 +556,8 @@ class Gateway:
             body["chat_template_kwargs"] = {"enable_thinking": False}
         if self.r["response_format"] == "json_schema":
             body["response_format"] = {"type": "json_schema",
-                                       "json_schema": {"name": "verdict", "strict": True, "schema": VERDICT_SCHEMA}}
+                                       "json_schema": {"name": "verdict", "strict": True,
+                                                       "schema": schema or VERDICT_SCHEMA}}
         elif self.r["response_format"] == "json_object":
             body["response_format"] = {"type": "json_object"}
         t = time.monotonic()

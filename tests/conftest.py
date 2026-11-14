@@ -1,4 +1,5 @@
 import copy
+import gc
 
 import pytest
 
@@ -19,6 +20,16 @@ def acknowledged_sink():
             self.events.append(copy.deepcopy(event))
 
     return AcknowledgedSink()
+
+
+@pytest.fixture(autouse=True)
+def _restore_gc_state():
+    """In-process web starts call tune_gc (freeze + thresholds); never let that leak into later tests."""
+    saved = gc.get_threshold()
+    gc.unfreeze()
+    yield
+    gc.set_threshold(*saved)
+    gc.unfreeze()
 
 
 @pytest.fixture(autouse=True)

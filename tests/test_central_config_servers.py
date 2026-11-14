@@ -199,6 +199,11 @@ def test_web_reads_everything_from_the_fleet_file_and_ignores_env(tmp_path, monk
     assert seen["server_kw"]["github_pg_dsn"] == cp["pg_dsn"]  # the GitHub catalog persists there
 
 
+def test_web_refuses_invalid_gc_block(tmp_path, monkeypatch, old_env, capsys):
+    with pytest.raises(SystemExit, match=r"--fleet-config: control_plane\.gc"):
+        _run_web(monkeypatch, make_file(tmp_path, gc={"gen2": 0}))
+
+
 def test_web_wires_personal_assistant_from_fleet_config(tmp_path, monkeypatch, old_env, capsys):
     # enabled section is passed through to the server as assistant_config
     p1 = make_file(tmp_path / "pa", personal_assistant={"enabled": True, "inference": {"endpoint": "x"}})
@@ -432,7 +437,7 @@ def test_proxy_limits_from_arguments_not_env(old_env):
 
 def _proxy_args(path, **kw):
     base = dict(host="127.0.0.1", port=0, control_plane="http://cp", upstream=None,
-                fleet_config=str(path))
+                fleet_config=str(path), control_plane_key_file=None)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -452,7 +457,26 @@ def test_llm_proxy_command_reads_key_url_and_tuning_from_fleet_file(tmp_path, mo
     fcc.render_llm(fcc.load_fleet_config(path), slice_)
     assert cli._cmd_cp_llm_proxy(_proxy_args(slice_)) == 0
     assert seen["a"][3] == "https://llm.example.test" and seen["a"][4] == "placeholder-llm-value"
-    assert seen["kw"] == {"max_inflight": 4, "wait_seconds": 1.5}
+    assert seen["kw"] == {"max_inflight": 4, "wait_seconds": 1.5, "control_key_file": None}
+
+
+def test_llm_proxy_command_takes_control_plane_key_file_from_slice_or_flag(tmp_path, monkeypatch, old_env):
+    path = make_file(tmp_path, llm_proxy={"control_plane_key_file": "/run/keys/from-slice"})
+    seen = {}
+
+    class Httpd:
+        server_address = ("127.0.0.1", 1)
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+    import herdr_engineering.llm_proxy as lp
+    monkeypatch.setattr(lp, "serve", lambda *a, **kw: (seen.update(kw=kw), Httpd())[1])
+    slice_ = tmp_path / "llm-proxy" / "llm-config.json"
+    fcc.render_llm(fcc.load_fleet_config(path), slice_)
+    assert cli._cmd_cp_llm_proxy(_proxy_args(slice_)) == 0
+    assert seen["kw"]["control_key_file"] == "/run/keys/from-slice"
+    assert cli._cmd_cp_llm_proxy(_proxy_args(slice_, control_plane_key_file="/run/keys/flag")) == 0
+    assert seen["kw"]["control_key_file"] == "/run/keys/flag"
 
 
 def test_llm_proxy_command_requires_a_fleet_file(tmp_path, capsys, old_env):

@@ -59,6 +59,8 @@ class ProjectionStore:
         """Explicit preparation only; never called by read-only web startup."""
         if self.conn.is_in_transaction():
             raise RuntimeError('concurrent checkpoint index preparation requires autocommit')
+        if await self.conn.fetchval("SELECT relkind = 'p' FROM pg_class WHERE oid = to_regclass('fabric_events')"):
+            return  # partitioned journal: CONCURRENTLY is unsupported and migration 0053 built this index already
         valid = await self.conn.fetchval("SELECT indisvalid AND indisready FROM pg_index "
             "WHERE indexrelid=to_regclass('idx_fabric_events_projection_position')")
         if valid is False:

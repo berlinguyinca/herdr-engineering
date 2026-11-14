@@ -62,6 +62,8 @@ _HOST_TERMINAL_OUT = re.compile(r"^/api/v1/host/terminal/[^/]+/output$")
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure)"
+                        # Usage reporters (llm-proxy, llm-gateway-usage): an agent key may report tokens, nothing wider.
+                        r"|token-usage"
                         r"|architecture/(?:snapshots|analyses|analyses/claim)"
                         # CI fix runner: claim, report state, report result. Never create or cancel.
                         r"|ci/fix/claim|ci/fix/[^/]+/(?:state|result))$")
@@ -318,7 +320,7 @@ class ControlPlaneServer:
                  assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None, build_cache=None,
-                 memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
+                 memory_adapter=None, memory_config=None, unified_workspace_config=None, work_center_config=None, agent_ops_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None, library=None,
                  library_viewers=None, member_directory=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
@@ -377,7 +379,8 @@ class ControlPlaneServer:
         from .deployment_definitions import DeploymentDefinitions
         self.deployment_definitions = DeploymentDefinitions(
             lambda: self._control_plane_value(fleet_config, "deployment_definitions"),
-            ci_components=lambda: self._control_plane_value(fleet_config, "ci_deployments"),
+            # fail CLOSED: an unreadable fleet file means an empty allowlist, not the last good one
+            ci_components=lambda: self._deployment_secure_value("ci_deployments"),
             ci_snapshot=lambda: self.ci_monitor.snapshot(start=True))
         # The stage coordinator (Task 3), ticked by _deployments_loop; GET /api/v1/deployments
         # serves the last tick and never ticks itself. `deployment_evidence` is the release-evidence
@@ -439,6 +442,21 @@ class ControlPlaneServer:
         self.summary_report = None
         # unified_workspace_v1 (P01): capability advertisement only; no route consumes it yet. YAML-only, default off.
         self.unified_workspace_enabled = isinstance(unified_workspace_config, dict) and unified_workspace_config.get("enabled") is True
+        # work_center_v1 (WC-006): gates every Work Command Center UI surface in the dashboard (This week card, session Work Context
+        # header, board "Open in Herdr" links). Advertisement only; no route consumes it. YAML-only, strict True, default off.
+        self.work_center_enabled = isinstance(work_center_config, dict) and work_center_config.get("enabled") is True
+        # agent_ops_v1 (docs/specs/2026-11-12-agent-operations-map): the read-only Agent Operations projection routes.
+        # YAML-only, strict True, default off; off means 404 and no capability.
+        self.agent_ops_enabled = isinstance(agent_ops_config, dict) and agent_ops_config.get("enabled") is True
+        self.agent_ops_poll_seconds = 1.0
+        self.agent_ops_reauth_seconds = 30.0          # a live stream re-checks its credential this often
+        self.agent_ops_streams = threading.BoundedSemaphore(16)   # concurrent SSE readers; each tick is a full gather
+        per_caller = agent_ops_config.get("streams_per_principal") if isinstance(agent_ops_config, dict) else None
+        # ...of which one caller (person, agent or key) may hold this many (config streams_per_principal, default 4)
+        self.agent_ops_streams_per_principal = per_caller if isinstance(per_caller, int) and not isinstance(per_caller, bool) and per_caller >= 1 else 4
+        self._agent_ops_stream_counts: dict[str, int] = {}
+        self._agent_ops_stream_lock = threading.Lock()
+        self.agent_ops_skipped_frames = 0              # stored events whose cursor could not be framed safely
         self._summary_stop = threading.Event()
         self._summary_scanner = None
         if not collab_only:
@@ -552,17 +570,22 @@ class ControlPlaneServer:
         _bridge_cfg = rakazo_bridge_config(rakazo_bridge)
         if _bridge_cfg["enabled"]:       # the assistant user ids the bridge accounts act as (hashes, no email), for ci_watch.users
             log.info("rakazo bridge assistant users: %s", ", ".join(a.principal_id for a in _bridge_cfg["accounts"]))
+        from .collab_http import HttpCollab
         self.rakazo = (RakazoBridge(_bridge_cfg, self.assistant, version=__version__,
                                     persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     space_persistence=PostgresSpacePersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     prefs_persistence=PostgresPrefsPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     push_persistence=PostgresPushPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
-                                    collab=collab, artifacts_fn=lambda: RegistryBackend(self))
+                                    collab=collab if collab is not None else (HttpCollab(collab_operator_url.rstrip("/"))
+                                                      if collab_operator_url else None),
+                                    artifacts_fn=lambda: RegistryBackend(self))
                        if _bridge_cfg["enabled"] else None)
         self._build_assistant_apps(assistant_apps_dsn)
         if self.rakazo is not None:
             self.rakazo.single_operator_fn = lambda: self.single_operator
-            self.rakazo.operator_user_fn = lambda: self.operator_user
+            # the split deployment has no operator_user here; the collab service names its own operator (HTTP mode only)
+            self.rakazo.operator_user_fn = lambda: self.operator_user or (
+                self.rakazo.collab.operator_user() if isinstance(self.rakazo.collab, HttpCollab) else None)
         self._build_reminders(assistant_apps_dsn)
         self.assistant.canonical_person = self._canonical_person
         from .ingest import IngestService
@@ -630,6 +653,8 @@ class ControlPlaneServer:
         from .single_flight_cache import SingleFlightCache
         self.ci_reports_cache = SingleFlightCache(ttl=15.0)     # /api/v1/ci/reports, see single_flight_cache.py
         self.collab = collab
+        from .agent_ops import AgentOpsService
+        self.agent_ops = AgentOpsService(repo, handoffs=self.handoffs, collab_source=lambda: self.collab)
         if self.assistant.host_candidates is None:       # looked up per call: `collab` may be swapped after startup
             self.assistant.host_candidates = lambda: (
                 self.collab.assistant_runtime_host_candidates() if self.collab is not None else [])
@@ -1549,7 +1574,7 @@ class ControlPlaneServer:
 
     def _dispatch_native_message(self, record, message, artifact_ids):
         from ..errors import InvalidError
-        from ..herdr_adapter import NativeHerdrAdapter
+        from ..herdr_adapter import NativeHerdrAdapter, confirm_recipient
 
         if artifact_ids:
             if not all(isinstance(aid, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,200}', aid)
@@ -1577,7 +1602,15 @@ class ControlPlaneServer:
             raise InvalidError("native session identity changed; refresh before delivery")
         if matches[0].interactive_ready is False or matches[0].launch_pending:
             raise InvalidError("native agent is not ready for prompt delivery")
-        return adapter.send_input(target, message, machine=machine, session=server)
+        prompt_target = matches[0].pane_id or target
+        operation_id = record.get("communication_operation_id")
+        if operation_id:
+            delivery = adapter.send_input(prompt_target, message, machine=machine, session=server,
+                                          operation_id=operation_id)
+        else:
+            delivery = adapter.send_input(prompt_target, message, machine=machine, session=server)
+        confirm_recipient(record, delivery)
+        return delivery
 
     def _canonical_person(self, tenant, user):
         """Single-operator rule (RakazoBridge.canonical_person); identity when there is no bridge."""
@@ -1663,6 +1696,10 @@ class ControlPlaneServer:
             caps.append("memory_v1")
         if getattr(self, "unified_workspace_enabled", False):
             caps.append("unified_workspace_v1")
+        if getattr(self, "work_center_enabled", False):
+            caps.append("work_center_v1")
+        if getattr(self, "agent_ops_enabled", False):
+            caps.append("agent_ops_v1")
         if getattr(self, "skills", None) is not None:
             caps.append("skill_registry_v1")
         if getattr(self, "build_cache", None) is not None:
@@ -3357,6 +3394,10 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 return self._send_json(403, {"error": "not permitted to modify this lineage object",
                                              "reason": "lineage_forbidden"})
             except ValueError as exc:
+                if resource == "ingest":
+                    from .communications import InvalidObservation
+                    if isinstance(exc, InvalidObservation):
+                        return self._send_json(400, {"error": str(exc), "code": "invalid_communication_observation"})
                 if getattr(exc, "code", None) == "not_found":
                     return self._send_json(404, {"error": "not found"})
                 message = "Invalid GitHub query." if resource == "github" else str(exc)
@@ -3709,12 +3750,17 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
             if resource == "mission-outcomes" and len(parts) == 4:
-                from .mission_outcome import outcome_summaries
+                from .mission_outcome import (
+                    issue_refs_by_mission,
+                    outcome_summaries,
+                    pr_refs_by_mission,
+                )
                 try:
                     server.mission_outcomes.sweep()
                 except Exception:  # noqa: BLE001
                     pass
-                return self._json({"outcomes": outcome_summaries(r)})
+                return self._json({"outcomes": outcome_summaries(r), "pr_refs": pr_refs_by_mission(r),
+                                   "issue_refs": issue_refs_by_mission(r)})
             if resource == "missions":
                 try:
                     server.mission_outcomes.sweep()   # throttled; closes missions that went silent
@@ -3906,6 +3952,9 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     return self._etag_json(h) if h else self._json(
                         {"error": "not found"}, 404)
                 return self._etag_json({"hosts": r.list_hosts()})
+            if resource == "communications" and len(parts) == 4:
+                from .communications import communication_page
+                return self._json(communication_page(r, limit=_qint(self.path, "limit", 50), before=_q(self.path, "before")))
             if resource == "activity":
                 evs = [_redact_event(e) for e in r.recent_events(limit=_qint(self.path, "limit", 50))
                        if self._sse_readable(e)]        # artifact events only for callers who may read that artifact
@@ -3927,6 +3976,18 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     return self._json(r.usage_analytics(
                         mission_id=_q(self.path, "mission")))
                 return self._json({"error": "unknown analytics kind"}, 404)
+            if resource == "work":
+                # G1: read-only cross-entity lifecycle window; same viewer-level read auth as /events, gated by work_center_v1.
+                if not getattr(server, "work_center_enabled", False) or parts[4:] != ["weekly-events"]:
+                    return self._json({"error": "not found"}, 404)
+                from .work_weekly import weekly_events
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                for key in ("since", "until", "limit", "after"):
+                    if len(query.get(key, [])) > 1:
+                        raise ValueError(f"{key} must be supplied once")
+                return self._json(weekly_events(
+                    r, since=query.get("since", [None])[0], until=query.get("until", [None])[0],
+                    limit=query.get("limit", [None])[0], after=query.get("after", [None])[0]))
             if resource == "events":
                 if len(parts) > 4 and parts[4] == "stream":
                     return self._sse()
@@ -4085,6 +4146,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 if what in ("stats", "timeseries", "errors", "spend") and len(parts) == 5:
                     return self._llm_stats(what)
                 return self._json({"error": "not found"}, 404)
+            if resource == "agent-ops":
+                return self._agent_ops(parts[4:])
             if resource == "graph":
                 return self._graph_get(parts)
             if resource == "steering":
@@ -5938,6 +6001,134 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     out = {**out, **view}
             return self._json(out)
 
+        def _agent_ops_caller(self):
+            """(principal, operator): the collab person/agent behind the request, if any. Room scope comes ONLY from a
+            collab principal (or the single operator's own identity); an API key alone reads no room."""
+            from .collab import CollabError
+            service = server.collab
+            operator = self._role() == "operator"
+            if service is None:
+                return None, operator
+            authorization = self.headers.get("Authorization", "")
+            if authorization:
+                try:
+                    return service.authenticate(authorization, self.headers.get("X-Herdr-Device")), operator
+                except CollabError:
+                    raise PermissionError("unauthorized") from None
+            if operator and server.operator_user and service.auth.exists(server.operator_user):
+                from .collab import Principal
+                pr = Principal("user", server.operator_user, server.operator_user)
+                pr.admin = pr.approver = True
+                return pr, operator
+            return None, operator
+
+        def _agent_ops(self, sub):
+            """``/api/v1/agent-ops/{snapshot,events,replay,stream}``: metadata-only, room-authorized, read-only. Off (default)
+            it is a 404 like any unknown route."""
+            if not getattr(server, "agent_ops_enabled", False) or len(sub) != 1 or sub[0] not in (
+                    "snapshot", "events", "replay", "stream"):
+                return self._json({"error": "not found"}, 404)
+            try:
+                principal, operator = self._agent_ops_caller()
+            except PermissionError:
+                return self._json({"error": "unauthorized"}, 401)
+            from .agent_ops import PAGE_MAX, valid_cursor
+            service = server.agent_ops
+            query = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+            cursor = query.get("cursor") or self.headers.get("Last-Event-ID") or None
+            if sub[0] == "stream":
+                return self._agent_ops_stream(service, principal, operator, cursor)
+            for given in (query.get("until"), cursor):
+                if given and sub[0] in ("events", "replay") and not valid_cursor(given):
+                    return self._json({"error": "invalid cursor: take one from the cursor field of a snapshot or event "
+                                                "row (re-fetch the snapshot)"}, 400)
+            viewer = service.viewer(principal, operator)
+            if sub[0] == "snapshot":
+                return self._json(service.snapshot(viewer, principal))
+            if sub[0] == "replay":
+                return self._json(service.replay(viewer, principal, query.get("until") or cursor))
+            try:
+                limit = int(query.get("limit", 100))
+            except ValueError:
+                return self._json({"error": "limit must be an integer"}, 400)
+            return self._json(service.events(viewer, principal, cursor, min(max(limit, 1), PAGE_MAX)))
+
+        def _agent_ops_stream(self, service, principal, operator, cursor):
+            """SSE with cursor resume (``?cursor=`` or ``Last-Event-ID``). Access is re-evaluated on every tick (a revoked
+            room stops flowing at once) and the credential itself every ``agent_ops_reauth_seconds`` (a revoked key, token
+            or disabled person ends the stream); the queue is the bounded page read each tick (no unbounded subscriber
+            queue), and the number of concurrent streams is capped."""
+            from .agent_ops import STREAM_PAGE, valid_cursor
+            reset = cursor is not None and not valid_cursor(cursor)
+            # open mode (no API keys) has no identity: one shared bucket, never one per (attacker-chosen) header value
+            caller = f"p:{principal.id}" if principal is not None else "open" if not server._keys else \
+                "k:" + hashlib.sha256(self.headers.get("X-API-Key", "").encode()).hexdigest()
+            with server._agent_ops_stream_lock:
+                if server._agent_ops_stream_counts.get(caller, 0) >= server.agent_ops_streams_per_principal:
+                    return self._json({"error": "too many agent-ops streams for this caller"}, 503)
+                if not server.agent_ops_streams.acquire(blocking=False):
+                    return self._json({"error": "too many agent-ops streams"}, 503)
+                server._agent_ops_stream_counts[caller] = server._agent_ops_stream_counts.get(caller, 0) + 1
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                self.close_connection = True
+                try:
+                    self.connection.settimeout(30)
+                except OSError:
+                    pass
+                started = last_write = last_auth = time.monotonic()
+                try:
+                    if reset:        # an unusable Last-Event-ID is ignored: say so, then continue from the current snapshot
+                        cursor = service.snapshot(service.viewer(principal, operator), principal)["cursor"]
+                    self.wfile.write(
+                        f"event: connected\ndata: {json.dumps({'cursor': None, 'reset': True} if reset else {'cursor': cursor})}\n\n".encode())
+                    self.wfile.flush()
+                    while time.monotonic() - started < _MAX_SSE_SECONDS:
+                        if time.monotonic() - last_auth >= server.agent_ops_reauth_seconds:
+                            last_auth = time.monotonic()
+                            try:
+                                if self._role() is None:
+                                    raise PermissionError("unauthorized")
+                                principal, operator = self._agent_ops_caller()
+                            except PermissionError:
+                                self.wfile.write(b"event: revoked\ndata: {}\n\n")
+                                self.wfile.flush()
+                                break
+                        page = service.events(service.viewer(principal, operator), principal, cursor, STREAM_PAGE,
+                                              cached=True)
+                        for ev in page["events"]:
+                            frame_id = ev["cursor"]
+                            if any(c in frame_id for c in "\r\n\0"):
+                                server.agent_ops_skipped_frames += 1
+                                continue          # never let a stored id forge or split an SSE frame
+                            self.wfile.write(f"id: {frame_id}\ndata: {json.dumps(ev)}\n\n".encode())
+                        if page["events"]:
+                            cursor = page["next_cursor"]
+                            self.wfile.flush()
+                            last_write = time.monotonic()
+                            if page["has_more"]:
+                                continue
+                        elif time.monotonic() - last_write >= _SSE_IDLE_SECONDS:
+                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.flush()
+                            last_write = time.monotonic()
+                        time.sleep(server.agent_ops_poll_seconds)
+                except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                    pass
+            finally:
+                server.agent_ops_streams.release()
+                with server._agent_ops_stream_lock:
+                    left = server._agent_ops_stream_counts.get(caller, 1) - 1
+                    if left > 0:
+                        server._agent_ops_stream_counts[caller] = left
+                    else:
+                        server._agent_ops_stream_counts.pop(caller, None)
+            return None
+
         def _work_graph(self, sub, body=None):
             """``/api/v1/graph/work/*`` (unified workspace P02): the persistent Work Graph. Off (default) it is a 404 like any
             unknown route; on without a database it is a 503. Reads need the viewer role; layout writes and reconcile are
@@ -6050,6 +6241,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         limit=_qint(self.path, "limit", 200),
                         before_seq=(_qint(self.path, "before_seq", -1)
                                     if _q(self.path, "before_seq") else None)), sid))
+                if tail[0] == "history" and len(tail) == 1:
+                    return self._inspector_history(sid, role)
                 if tail[0] == "events" and len(tail) == 2:
                     if not tail[1].isdigit():
                         return self._json({"error": "invalid sequence"}, 400)
@@ -6068,6 +6261,29 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             except KeyError:
                 return self._json({"error": "not found"}, 404)
             return self._json({"error": "not found"}, 404)
+
+        def _inspector_history(self, sid, role):
+            """Older inspector events from Postgres, paged by an opaque cursor (``before``); additive to the ring."""
+            from .inspector_history import HistoryCursorInvalid, parse_inspector_history
+            cfg = parse_inspector_history(server._control_plane_value(server.fleet_config, "inspector_history"))
+            if not cfg["enabled"]:
+                return self._json({"error": "inspector history is disabled"}, 404)
+            if not server.repo.inspector.has_session(sid) and server.repo.get_session(sid) is None:
+                return self._json({"error": "session not found"}, 404)
+            raw = _q(self.path, "limit")
+            if raw is not None and not raw.isdigit():
+                return self._json({"error": "invalid limit"}, 400)
+            limit = max(1, min(int(raw) if raw else cfg["page_size"], cfg["max_page_size"]))
+            try:
+                body = server.repo.inspector_history_page(
+                    sid, role, view=_q(self.path, "view") or "all", limit=limit, before=_q(self.path, "before"))
+            except (HistoryCursorInvalid, ValueError) as exc:
+                return self._json({"error": str(exc)}, 400)
+            except LookupError:
+                return self._json({"error": "durable inspector history is not available"}, 503)
+            except Exception:   # a failed durable read must not take the dashboard down; static message only
+                return self._json({"error": "durable inspector history is unavailable"}, 503)
+            return self._json(body)
 
         def _inspector_set_prefs(self, sid):
             body = self._read_json() or {}

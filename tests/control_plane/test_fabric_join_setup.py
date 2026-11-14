@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -327,3 +328,26 @@ def test_cli_install_check_and_uninstall_manage_the_codex_rule(tmp_path):
     assert rc == 0 and RULE in (tmp_path / RULES_REL).read_text()
     rc, out, _ = cli(tmp_path, "summary", "uninstall", "--skill", "herdr-join", "--json")
     assert RULE not in (tmp_path / RULES_REL).read_text()
+
+
+def test_slow_join_is_left_running_not_killed_and_the_hook_returns_in_time(tmp_path):
+    """A listener that accepts and never answers: the hook must return within `wait`, say so, and not hang the session."""
+    import io
+    import socket
+    import time
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    home = tmp_path / "home"
+    cfg = home / CFG_REL
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(f"fabric_join:\n  control_plane_url: http://127.0.0.1:{srv.getsockname()[1]}\n")
+    out = io.StringIO()
+    env = {**os.environ, "HOME": str(home), "HERDR_WORKSPACE_ID": "ws-1", "HERDR_PANE_ID": "slow1"}
+    t0 = time.monotonic()
+    try:
+        assert fj.run_join_hook("claude", env=env, out=out, wait=1.0) == 0
+        assert time.monotonic() - t0 < 6
+        assert "claude-slow1" in out.getvalue() and "background" in out.getvalue()
+    finally:
+        srv.close()

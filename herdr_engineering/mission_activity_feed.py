@@ -225,6 +225,25 @@ def _snapshot_signature(path: Path) -> tuple[int, int, int, int, int]:
     return (info.st_ino, info.st_mtime_ns, info.st_size, info.st_mode, info.st_uid)
 
 
+SUPPORTED_CONTRACTS = (3, 4)   # v4 is additive: created_at, completed_at, links on each mission
+_LINK_KEYS = ('kind', 'repository', 'number')
+_FEED_MAX_LINKS = 80
+
+
+def _pi_v4_extras(match: dict) -> dict:
+    """Forward only the v4 fields in their expected shapes; the control plane validates them again and drops bad entries."""
+    out: dict = {}
+    for name in ('created_at', 'completed_at'):
+        value = match.get(name)
+        if isinstance(value, str) and len(value) <= 64:
+            out[name] = value
+    links = match.get('links')
+    if isinstance(links, list):
+        out['links'] = [{k: item[k] for k in _LINK_KEYS if k in item}
+                        for item in links[:_FEED_MAX_LINKS] if isinstance(item, dict)]
+    return out
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # Never forward the collector key to an unconfigured origin.
@@ -283,7 +302,7 @@ class MissionActivityFeed:
         snapshot = _read_json(path, MAX_SNAPSHOT_BYTES)
         self._snapshot_reads += 1
         self._snapshot_bytes += signature[2]
-        if snapshot.get('contractVersion') != 3:
+        if snapshot.get('contractVersion') not in SUPPORTED_CONTRACTS:
             raise ValueError('unsupported native snapshot')
         self._snapshot_cache[str(path)] = (signature, snapshot)
         while len(self._snapshot_cache) > MAX_SNAPSHOT_CACHE_ENTRIES:
@@ -356,6 +375,8 @@ class MissionActivityFeed:
                             'status': _sanitize(brief.get('status', 'unknown'))},
                 'activity': _sanitize(match['observability']) if valid else {},
             }
+            if valid:
+                payload['mission'].update(_pi_v4_extras(match))
             found.append(payload)
         return found
 
