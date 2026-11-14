@@ -16,6 +16,12 @@ when:
   - event: manual
   - event: pull_request
 
+# The whole suite starts real HTTP services and PostgreSQL clusters. Use the
+# same 16-CPU/64-GiB Hive pool as ui-gates rather than 4-CPU/16-GiB overflow
+# workers, where short client deadlines failed under concurrent test load.
+labels:
+  cluster: hive
+
 skip_clone: true
 
 steps:
