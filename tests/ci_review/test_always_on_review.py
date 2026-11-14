@@ -615,3 +615,28 @@ def test_gateway_backend_reviews_through_the_openai_compatible_endpoint(env, tmp
         assert env.reviewer_calls() == [] and T.KEY not in (env.bin / "gh.log").read_text()
     finally:
         gw.stop()
+
+
+# ---------------- the clone the worktrees come from ----------------
+
+def test_a_bare_clone_is_accepted_for_the_detached_worktree(env, tmp_path):
+    bare = tmp_path / "bare.git"
+    sh("git", "clone", "-q", "--bare", str(env.origin), str(bare), cwd=tmp_path)
+    sh("git", "remote", "set-url", "origin", str(env.origin), cwd=bare)
+    env.cfg_path.write_text(env.cfg_path.read_text().replace(f"clone: {env.clone}", f"clone: {bare}"))
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+    assert env.reviewer_calls()[0]["head"] == env.head
+    assert sh("git", "for-each-ref", "refs/herdr-review", cwd=bare) == ""
+
+
+@pytest.mark.parametrize("kind", ["missing", "empty-dir", "inside-other-repo", "dot-git-file-to-nowhere"])
+def test_a_clone_that_is_not_a_git_repository_root_is_refused(env, tmp_path, kind):
+    path = tmp_path / "notaclone"
+    if kind != "missing":
+        path.mkdir()
+    if kind == "inside-other-repo":
+        path = env.clone / "src"                    # inside a work tree, but not a repository root
+    if kind == "dot-git-file-to-nowhere":
+        (path / ".git").write_text("gitdir: /nonexistent\n")
+    env.cfg_path.write_text(env.cfg_path.read_text().replace(f"clone: {env.clone}", f"clone: {path}"))
+    assert env.review("tier2") == 2 and env.reviewer_calls() == []

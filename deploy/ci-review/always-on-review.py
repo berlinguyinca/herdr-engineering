@@ -827,6 +827,22 @@ def git(args: list[str], cwd: Path | str) -> str:
     return p.stdout.decode("utf-8", "replace").strip()
 
 
+def is_git_clone(path: Path) -> bool:
+    """`path` is the root of a usable repository, bare or with a work tree. Asked of git itself, so a bare clone
+    (no `.git` entry) passes and a `.git` file pointing nowhere, or a directory merely inside another repo, fails."""
+    if not path.is_dir():
+        return False
+    env = child_env()
+    p = subprocess.run(["git", "rev-parse", "--absolute-git-dir", "--is-bare-repository"], cwd=path,
+                       capture_output=True, timeout=60, env=env)
+    out = p.stdout.decode("utf-8", "replace").split()
+    if p.returncode != 0 or len(out) != 2:
+        return False
+    git_dir, bare = Path(out[0]).resolve(), out[1] == "true"
+    root = path.resolve()
+    return git_dir == root if bare else (root / ".git").exists()
+
+
 class Worktree:
     """A fresh detached worktree of exactly the pinned head, read-only fetched, removed afterwards."""
 
@@ -834,8 +850,8 @@ class Worktree:
         """replay=True is for the replay harness: the head need only be reachable from refs/pull/N/head (a PR's older
         head, not its latest), `base_sha` (if given) fixes the base, and the fetched refs have their own names."""
         clone = cfg["clone"]
-        if not clone or not (ai.expand(clone) / ".git").exists():
-            raise Refused("config: clone must name a git clone (the claude and pi backends need one)")
+        if not clone or not is_git_clone(ai.expand(clone)):
+            raise Refused("config: clone must name a git clone, bare or not (the claude and pi backends need one)")
         if not BASE_RE.fullmatch(base_ref):
             raise ReviewFailed("the PR's base ref is not a plain branch name")
         self.clone, self.pr, self.sha, self.base_ref = ai.expand(clone), pr, sha, base_ref
