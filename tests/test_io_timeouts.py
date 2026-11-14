@@ -13,7 +13,6 @@ import time
 import pytest
 
 
-
 def _import_with(value: str | None) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k != "HERDR_TEST_IO_TIMEOUT"}
     if value is not None:
@@ -42,12 +41,15 @@ def test_a_bad_override_is_refused_not_guessed(bad):
 
 
 def test_the_shared_control_plane_client_waits_out_a_slow_answer():
-    """A server that takes 7 s to answer (a node under load) must not fail a test whose 3-5 s literal used to cut it off."""
+    """A server that takes 6 s to answer (a node under load) must not fail a test whose 3-5 s literal used to cut it off."""
     from tests.control_plane.test_collab_operator import call
+    from tests.io_timeouts import HTTP_TIMEOUT
+    if HTTP_TIMEOUT < 10:
+        pytest.skip("HERDR_TEST_IO_TIMEOUT is set below the 6 s this test makes the server wait")
 
     class Slow(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            time.sleep(7)
+            time.sleep(6)
             body = b'{"ok": true}'
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))

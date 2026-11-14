@@ -109,7 +109,7 @@ def registry_pg():
             stop_postgres(bindir / "pg_ctl", data)
 
         def restart():
-            stop()
+            stop_postgres(bindir / "pg_ctl", data, fallback=False)   # a restart test needs the clean shutdown it is about
             start()
 
         start()

@@ -9,8 +9,10 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-# Nothing in a test cluster needs to survive power loss; a clean restart still keeps its data (the OS cache holds it).
-FAST_TEST_OPTIONS = "-c fsync=off -c synchronous_commit=off -c full_page_writes=off"
+# Nothing in a test cluster needs to survive power loss, so no fsync and no full-page writes. synchronous_commit stays on on purpose: with
+# it off, an immediate stop (the fallback below) loses the last few hundred ms of commits; with fsync=off alone a committed row is in the
+# WAL in the OS cache and survives any postmaster stop.
+FAST_TEST_OPTIONS = "-c fsync=off -c full_page_writes=off"
 
 _FAST_WAIT_SECONDS = 300
 _IMMEDIATE_WAIT_SECONDS = 120
@@ -24,11 +26,17 @@ def postgres_running(pg_ctl: str | Path, data: str | Path) -> bool:
     return _ctl(pg_ctl, data, "status").returncode == 0
 
 
-def stop_postgres(pg_ctl: str | Path, data: str | Path, *, timeout: int = _FAST_WAIT_SECONDS, fallback: bool = True) -> None:
+def stop_postgres(pg_ctl: str | Path, data: str | Path, *, timeout: int = _FAST_WAIT_SECONDS, fallback: bool = True,
+                  immediate: bool = False) -> None:
     """Stop the cluster at `data`. Fast shutdown first, waiting `timeout` seconds; if that fails and the postmaster is still up,
     an immediate stop (a throwaway cluster needs no clean shutdown). Raises RuntimeError only when the cluster is still running
-    afterwards. An already-stopped cluster is fine. With `fallback=False` (a restart that must keep its clean shutdown) a failed
+    afterwards. An already-stopped cluster is fine. With `immediate=True` the clean stop is skipped. With `fallback=False` (a restart that must keep its clean shutdown) a failed
     fast stop raises instead of crashing the cluster."""
+    if immediate:                                   # a teardown that never needed the clean shutdown
+        _ctl(pg_ctl, data, "-m", "immediate", "-w", "-t", str(_IMMEDIATE_WAIT_SECONDS), "stop")
+        if postgres_running(pg_ctl, data):
+            raise RuntimeError("pg_ctl could not stop the cluster (immediate)")
+        return
     fast = _ctl(pg_ctl, data, "-m", "fast", "-w", "-t", str(timeout), "stop")
     if fast.returncode == 0 or not postgres_running(pg_ctl, data):
         return

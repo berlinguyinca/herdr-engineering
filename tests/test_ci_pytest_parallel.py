@@ -17,6 +17,8 @@ import time
 import tomllib
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "scripts" / "ci" / "pytest-parallel.sh"
 GATE = (ROOT / "scripts" / "ci" / "unit-gates.sh").read_text()
@@ -369,53 +371,97 @@ def test_a_closed_reader_does_not_kill_or_hang_the_run() -> None:
     assert done.stdout == "0\n" and "Traceback" not in done.stderr and "BrokenPipe" not in done.stderr, done.stderr
 
 
-def _cpu_budget_args(cgroup_root: Path, **env: str) -> list[str]:
-    return args_with(HERDR_CGROUP_ROOT=str(cgroup_root), **env)
+VISIBLE = len(os.sched_getaffinity(0))
+CAP = 8
+# Quotas are chosen relative to the CPUs this test process may use, so the tests hold on any host (and under `taskset -c 0-1`).
+Q = min(VISIBLE, CAP) - 1          # the largest quota that must shrink the worker count
+needs_two_cpus = pytest.mark.skipif(Q < 1, reason="needs at least 2 visible CPUs to show a quota below them")
 
 
+def cg(tmp_path: Path, *, v2: dict[str, str] | None = None, v1: dict[str, tuple[int, int]] | None = None,
+       proc: str = "0::/") -> dict[str, str]:
+    """A real cgroup tree: v2 maps 'a/b' -> cpu.max text; v1 maps 'job' -> (quota, period) under the cpu,cpuacct controller."""
+    root = tmp_path / "cgroup"
+    root.mkdir()
+    for rel, text in (v2 or {}).items():
+        (root / rel).mkdir(parents=True, exist_ok=True)
+        (root / rel / "cpu.max").write_text(text + "\n")
+    for rel, (quota, period) in (v1 or {}).items():
+        d = root / "cpu,cpuacct" / rel
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "cpu.cfs_quota_us").write_text(f"{quota}\n")
+        (d / "cpu.cfs_period_us").write_text(f"{period}\n")
+    (tmp_path / "proc-cgroup").write_text(proc + "\n")
+    return {"HERDR_CGROUP_ROOT": str(root), "HERDR_PROC_CGROUP": str(tmp_path / "proc-cgroup")}
+
+
+def workers_for(env: dict[str, str], **more: str) -> list[str]:
+    return args_with(**env, **more)[:2]
+
+
+@needs_two_cpus
 def test_auto_is_capped_by_a_cgroup_cpu_quota_smaller_than_the_visible_cores(tmp_path: Path) -> None:
-    """xdist's `auto` counts the cores the process may be scheduled on, not the CPU quota of its cgroup: a job granted 2 CPUs on a
-    24-core node would start 8 workers that all stall each other (3 s socket reads timing out, `pg_ctl stop` past its wait)."""
-    (tmp_path / "cpu.max").write_text("200000 100000\n")
-    args = _cpu_budget_args(tmp_path)
-    assert args[:2] == ["-n", "2"]
-    assert "--dist=loadfile" in args
+    """xdist's `auto` counts the cores in the affinity mask, not the CPU quota of the cgroup: a job granted fewer CPUs than it can see
+    starts workers that starve each other (3 s socket reads timing out, `pg_ctl stop` past its wait)."""
+    env = cg(tmp_path, v2={"job": f"{Q * 100000} 100000"}, proc="0::/job")
+    args = args_with(**env)
+    assert args[:2] == ["-n", str(Q)] and "--dist=loadfile" in args
 
 
-def test_a_quota_of_one_and_a_half_cpus_rounds_down_but_never_to_zero(tmp_path: Path) -> None:
-    (tmp_path / "cpu.max").write_text("150000 100000\n")
-    assert _cpu_budget_args(tmp_path)[:2] == ["-n", "1"]
-    (tmp_path / "cpu.max").write_text("50000 100000\n")
-    assert _cpu_budget_args(tmp_path)[:2] == ["-n", "1"]
+@needs_two_cpus
+def test_the_smallest_quota_up_the_cgroup_path_wins(tmp_path: Path) -> None:
+    """Slurm and containers often put the limit on a parent: the job's own cgroup says `max` or something larger."""
+    env = cg(tmp_path, v2={"a": f"{Q * 100000} 100000", "a/b": "max 100000", "a/b/c": f"{(Q + 5) * 100000} 100000"}, proc="0::/a/b/c")
+    assert workers_for(env) == ["-n", str(Q)]
+    (tmp_path / "t2").mkdir()
+    env = cg(tmp_path / "t2", v2={"a": "max 100000", "a/b": f"{Q * 100000} 100000"}, proc="0::/a/b")
+    assert workers_for(env) == ["-n", str(Q)]
+
+
+@needs_two_cpus
+def test_a_fractional_quota_rounds_down_but_never_to_zero(tmp_path: Path) -> None:
+    assert workers_for(cg(tmp_path, v2={"j": "150000 100000"}, proc="0::/j")) == ["-n", "1"]
+    (tmp_path / "x").mkdir()
+    assert workers_for(cg(tmp_path / "x", v2={"j": "50000 100000"}, proc="0::/j")) == ["-n", "1"]
 
 
 def test_an_unlimited_or_generous_quota_keeps_auto(tmp_path: Path) -> None:
-    (tmp_path / "cpu.max").write_text("max 100000\n")
-    assert _cpu_budget_args(tmp_path)[:2] == ["-n", "auto"]
-    (tmp_path / "cpu.max").write_text("1600000 100000\n")   # 16 CPUs: the cap of 8 is the limit, as before
-    assert _cpu_budget_args(tmp_path)[:2] == ["-n", "auto"]
+    assert workers_for(cg(tmp_path, v2={"j": "max 100000"}, proc="0::/j")) == ["-n", "auto"]
+    (tmp_path / "y").mkdir()
+    generous = f"{max(VISIBLE, CAP) * 100000} 100000"          # at or above both the cap and the visible cores
+    assert workers_for(cg(tmp_path / "y", v2={"j": generous}, proc="0::/j")) == ["-n", "auto"]
 
 
-def test_cgroup_v1_quota_files_are_read_too(tmp_path: Path) -> None:
-    (tmp_path / "cpu").mkdir()
-    (tmp_path / "cpu" / "cpu.cfs_quota_us").write_text("300000\n")
-    (tmp_path / "cpu" / "cpu.cfs_period_us").write_text("100000\n")
-    assert _cpu_budget_args(tmp_path)[:2] == ["-n", "3"]
+@needs_two_cpus
+def test_cgroup_v1_reads_the_cpu_controller_path_from_proc_self_cgroup_and_its_parents(tmp_path: Path) -> None:
+    env = cg(tmp_path, v1={"": (Q * 100000, 100000), "job": (-1, 100000)}, proc="4:cpu,cpuacct:/job")
+    assert workers_for(env) == ["-n", str(Q)]
 
 
 def test_an_explicit_worker_count_is_not_second_guessed_by_the_quota(tmp_path: Path) -> None:
-    (tmp_path / "cpu.max").write_text("200000 100000\n")
-    assert _cpu_budget_args(tmp_path, HERDR_PYTEST_WORKERS="6")[:2] == ["-n", "6"]
+    env = cg(tmp_path, v2={"j": "100000 100000"}, proc="0::/j")
+    assert workers_for(env, HERDR_PYTEST_WORKERS="6") == ["-n", "6"]
 
 
 def test_no_cgroup_files_means_auto(tmp_path: Path) -> None:
-    assert _cpu_budget_args(tmp_path)[:2] == ["-n", "auto"]
+    assert workers_for(cg(tmp_path)) == ["-n", "auto"]
 
 
-def test_the_gate_prints_the_host_facts_that_explain_a_starved_run() -> None:
+@needs_two_cpus
+def test_the_scaling_really_reaches_pytest_as_a_worker_count(tmp_path: Path) -> None:
+    """End to end for one case: the exact words the gate passes are `-n <Q>`, and xdist accepts them."""
+    env = cg(tmp_path, v2={"job": f"{Q * 100000} 100000"}, proc="0::/job")
+    assert args_with(**env) == ["-n", str(Q), f"--maxprocesses={CAP}", "--dist=loadfile"]
+
+
+@needs_two_cpus
+def test_the_gate_prints_the_same_effective_quota_the_worker_count_uses(tmp_path: Path) -> None:
     """Pipelines on hive-as-11-2-39 and -40 failed 7 of 7 while other nodes passed: the next failure must say what the node looked like."""
     assert "ci_host_facts" in GATE
-    done = subprocess.run(["bash", "-c", f'. "{ROOT}/scripts/ci/host-facts.sh"; ci_host_facts'], capture_output=True, text=True)
+    env = cg(tmp_path, v2={"a": f"{Q * 100000} 100000", "a/b": "max 100000"}, proc="0::/a/b")
+    exports = "".join(f"export {k}={v}; " for k, v in env.items())
+    done = subprocess.run(["bash", "-c", f'{exports}. "{ROOT}/scripts/ci/host-facts.sh"; ci_host_facts'], capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
-    for key in ("host:", "cpus visible:", "cgroup cpu quota:", "loadavg:", "tmp filesystem:"):
+    for key in ("host:", "cpus visible:", "loadavg:", "tmp filesystem:"):
         assert key in done.stdout, done.stdout
+    assert f"cgroup cpu quota: {Q} CPUs" in done.stdout, done.stdout

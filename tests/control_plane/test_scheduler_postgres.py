@@ -104,7 +104,7 @@ def scheduler_postgres():
             asyncio.run(initialize())
             yield dsn
         finally:
-            stop_postgres(bindir / "pg_ctl", data)
+            stop_postgres(bindir / "pg_ctl", data, immediate=True)
 
 
 def test_one_hundred_requests_across_processes_never_overcommit(scheduler_postgres):

@@ -236,7 +236,7 @@ def test_unreachable_shared_endpoint_builds_locally_with_reason_and_exit_code(tm
     r = _cli(["--max-load", "0", "--", "cargo", "build", "7"], state, tmp_path,
              cfg=cfg, bin_=bin_, CHAOS_SEEN=str(seen))
     assert r.returncode == 7, r.stderr                        # exit code preserved
-    assert time.monotonic() - t0 < PROCESS_TIMEOUT / 3  # bounded
+    assert time.monotonic() - t0 < 60  # bounded (was 30: measured 40 s on a starved CI node; a hang is minutes)
     ev = _events(state / "build-gates")
     fin = [e for e in ev if e["event"] == "build_finished"][-1]
     assert fin["exit_code"] == 7
