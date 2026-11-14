@@ -30,13 +30,13 @@
 
 **Interfaces:** typed `Policy`, `Candidate`, `Report`; `run_once(root: Path, quarantine: Path, state_dir: Path, policy: Policy, *, apply: bool=False, gate_state: Path | None=None, live_roots: list[Path] | None=None) -> Report`; `main(argv: list[str] | None=None) -> int`.
 
-- [ ] Add real-file recognition tests for numbered/nested DerivedData, Cargo and SwiftPM metadata; source/diagnostic retention, UUID isolation and overlap.
-- [ ] Add pure-policy/real-files budget and pressure tests with explicit small limits, plus invalid-policy cases; run missing-module RED.
-- [ ] Implement bounded discovery/inspection and structured status; keep unknowns untouched.
-- [ ] Add real subprocess/Git/lsof/lock tests for open files, cwd, argv, maintenance exclusion, unreadable state, `.keep`, dirty/unpushed repos and symlink escape.
-- [ ] Implement fail-closed guards and same-filesystem claim/revalidation/removal; prove RED→GREEN.
-- [ ] Test general-session quarantine admission, expiry and safety using real files with explicit short test TTLs; preserve7day production default.
-- [ ] Add real CLI smoke/E2E tests and native compiler artifact acceptance; verify no source/evidence loss and no orphaned processes.
+- [x] Add real-file recognition tests for numbered/nested DerivedData, Cargo and SwiftPM metadata; source/diagnostic retention, UUID isolation and overlap.
+- [x] Add pure-policy/real-files budget and pressure tests with explicit small limits, plus invalid-policy cases; run missing-module RED.
+- [x] Implement bounded discovery/inspection and structured status; keep unknowns untouched.
+- [x] Add real subprocess/Git/lsof/lock tests for open files, cwd, argv, maintenance exclusion, unreadable state, `.keep`, dirty/unpushed repos and symlink escape.
+- [x] Implement fail-closed guards and same-filesystem claim/revalidation/removal; prove RED→GREEN.
+- [x] Test general-session quarantine admission, expiry and safety using real files with explicit short test TTLs; preserve7day production default.
+- [x] Add real CLI smoke/E2E tests and native compiler artifact acceptance; verify no source/evidence loss and no orphaned processes.
 
 ### Task2: Ship and install
 
