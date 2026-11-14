@@ -716,3 +716,62 @@ def test_the_local_diff_still_drives_the_in_pr_rules(env):
 def test_any_other_diff_failure_still_fails_the_review(env):
     _too_large(env, "gh: HTTP 502: bad gateway")
     assert env.review("tier2") == 1 and env.reviewer_calls() == []
+
+
+# ---------------- issue #792 follow-up: tiers.<name>.daily_budget_usd ----------------
+
+BUDGET = "tiers: {tier2: {daily_budget_usd: 1.0}}\n"      # the fake claude reports total_cost_usd 0.5 per review
+
+
+def _log_lines(env):
+    return [json.loads(x) for x in (env.tmp / "state/reviews.jsonl").read_text().splitlines()]
+
+
+def test_below_the_daily_budget_the_review_runs(env):
+    env.config(BUDGET, post=True)
+    assert env.review("tier2", post=True) == 0
+    assert len(env.reviewer_calls()) == 1 and _log_lines(env)[-1]["usage"]["cost_usd"] == 0.5
+
+
+def test_at_the_daily_budget_the_review_is_skipped_and_stays_pending(env, capsys):
+    env.config(BUDGET, post=True)
+    assert env.review("tier2", post=True) == 0                      # 0.5 spent, under 1.0
+    assert env.review("tier2", post=True, *["--force"]) == 0        # 1.0 spent: now at the budget
+    posted = env.statuses_posted()
+    capsys.readouterr()
+    assert env.review("tier2", post=True, *["--force"]) == 4        # SKIPPED, nothing run, nothing posted
+    assert len(env.reviewer_calls()) == 2 and env.statuses_posted() == posted
+    err = capsys.readouterr().err
+    assert err.count("daily budget") == 1 and "tier2" in err and "exhausted" in err
+
+
+def test_spend_from_a_previous_utc_day_is_ignored(env):
+    env.config(BUDGET, post=True)
+    env.review("tier2", post=True)
+    env.review("tier2", post=True, *["--force"])
+    yesterday = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path = env.tmp / "state/reviews.jsonl"
+    path.write_text("".join(json.dumps({**x, "ts": yesterday}) + "\n" for x in _log_lines(env)))
+    assert env.review("tier2", post=True, *["--force"]) == 0 and len(env.reviewer_calls()) == 3
+
+
+def test_only_the_same_tiers_spend_counts(env):
+    env.config(BUDGET, post=True)
+    assert env.review("tier1", post=True) == 0
+    env.reviewer("pi", answer=APPROVE)
+    path = env.tmp / "state/reviews.jsonl"
+    path.write_text("".join(json.dumps({**x, "usage": {"cost_usd": 99}}) + "\n" for x in _log_lines(env)))
+    assert env.review("tier2", post=True) == 0 and len(env.reviewer_calls()) == 2
+
+
+def test_no_budget_means_no_limit(env):
+    env.config(post=True)
+    for _ in range(4):
+        assert env.review("tier2", post=True, *["--force"]) == 0
+    assert len(env.reviewer_calls()) == 4
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "'5'", "true", ".nan", ".inf", "[1]"])
+def test_an_invalid_daily_budget_is_refused(env, bad):
+    env.config(f"tiers: {{tier2: {{daily_budget_usd: {bad}}}}}\n")
+    assert env.review("tier2") == 2 and env.reviewer_calls() == []

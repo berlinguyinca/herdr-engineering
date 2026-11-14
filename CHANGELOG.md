@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Daily budget per tier (always-on-review.py, #792 follow-up)
+
+- New optional YAML key `tiers.<tier>.daily_budget_usd` (positive number; default unset = no limit, behaviour unchanged). Before starting a review the poller sums the `usage.cost_usd` that tier logged in `state_dir/reviews.jsonl` since 00:00 UTC today (partial and dry-run reviews count; other days and the other tier do not). At or over the budget the review is skipped with one log line (`daily budget exhausted`) and the status is left exactly as it was (never success, no new pending); `--force` does not bypass it. Reviews already finished are unaffected. Zero, negative, non-numeric, boolean, NaN and infinite values are refused at config load. Rollback: remove the key and restart the poller.
+
 ### Reviewer fixes: bare clones, optional green-only gate, diffs over 20,000 lines (always-on-review.py)
 
 - Fix: the `clone:` check required `<clone>/.git`, so the bare clone the README recommends was refused. It now asks git (`is_git_clone`): a bare or non-bare repository root passes; a missing path, a plain directory, a directory inside another repo or a dangling `.git` is refused.
