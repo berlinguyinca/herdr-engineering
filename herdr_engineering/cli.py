@@ -306,6 +306,7 @@ def _build_parser() -> argparse.ArgumentParser:
                       ("fabric-listener", "print `HOST PORT` of control_plane.collab.fabric_trust's dedicated listener (nothing when not configured)"),
                       ("render-llm", "write the llm-proxy container's config slice (0600)"),
                       ("render-share", "write the share-public container's config slice (0600)"),
+                      ("render-artifact-host", "write the artifact host's per-role config slices into a directory (0600; nothing when disabled)"),
                       ("render-edge", "write the collab edge's nginx.conf (with /s/ when shares are enabled)")):
         sp = csub.add_parser(name, help=hlp)
         sp.add_argument("--path", default=FLEET_CONFIG_DEFAULT)
@@ -338,6 +339,11 @@ def _build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--out", required=True,
                             help="file to write (0600): only control_plane.share's serving keys and the Cognito "
                                  "identifiers; refused when share is enabled but incomplete")
+        if name == "render-artifact-host":
+            sp.add_argument("--out", required=True,
+                            help="directory to write (0700; files 0600): one config slice per role, the database "
+                                 "admin password and roles.sql; written only when control_plane.artifact_host.enabled "
+                                 "is true, refused when it is incomplete")
         if name == "render-edge":
             sp.add_argument("--template", required=True, help="collab-edge/nginx.conf (snippets beside it)")
             sp.add_argument("--out", required=True, help="nginx.conf to write")
@@ -1735,6 +1741,13 @@ def _cmd_fleet_config(args) -> int:
             fcc.render_share(cfg, Path(args.out).expanduser())
             # deploy.sh reads the last word: whether share-public runs and the edge routes /s/
             print(f"wrote {args.out} (0600) share={'enabled' if fcc.share_enabled(cfg) else 'disabled'}")
+        elif cmd == "render-artifact-host":
+            cfg = load_fleet_config(path)
+            fcc.render_artifact_host(cfg, Path(args.out).expanduser())
+            # deploy.sh reads the last word: whether the host runs and the edge routes to it
+            on = fcc.artifact_host_enabled(cfg)
+            print(f"{'wrote ' + args.out + '/ (0600 files)' if on else 'wrote nothing'} "
+                  f"artifact_host={'enabled' if on else 'disabled'}")
         elif cmd == "render-edge":
             fcc.render_edge(load_fleet_config(path), Path(args.template).expanduser(), Path(args.out).expanduser())
             print(f"wrote {args.out}")
@@ -4439,32 +4452,16 @@ def _member_admin_wiring(cp: dict, dsn: str | None):
     return artifact_adapter.SyncArtifactAdapter(create)
 
 
-def _library_wiring(dsn: str | None):
-    """The dashboard artifact library (adapter over ``LibraryStore`` on its own small pool) when a DSN exists, else None."""
-    if not dsn:
-        return None
-    from .control_plane.artifact_library_api import make_library_adapter
-
-    async def pool():
-        import asyncpg
-        return await asyncpg.create_pool(dsn, min_size=1, max_size=3)
-
+def _library_wiring(cp: dict):
+    """The dashboard artifact library: an ``ArtifactHostClient`` (read-only HTTP client of the artifact host's internal
+    listener) built from ``control_plane.artifact_library.host_url`` / ``host_key``, else None (the routes answer 503).
+    No database is opened.  Invalid settings stop the start (the key value is never printed)."""
+    from .control_plane.artifact_host_client import parse_library_host
     try:
-        return make_library_adapter(pool)
-    except RuntimeError as exc:  # database unreachable at start: the library routes answer 503, the dashboard still starts
-        print(f"warning: artifact library unavailable ({exc.__cause__ or exc})", file=sys.stderr)
-        return None
-
-
-def _library_viewers(cp) -> dict[str, str]:
-    """``control_plane.artifact_library.viewers`` (YAML only): ``{"key:<digest>": "<member id>"}``, the dashboard keys that
-    read a member's library.  A malformed entry stops the start (it would silently show the wrong library)."""
-    from .control_plane.artifact_library_api import parse_library_viewers
-    section = cp.get("artifact_library") if isinstance(cp, dict) else None
-    try:
-        return parse_library_viewers(section.get("viewers") if isinstance(section, dict) else None)
+        settings = parse_library_host(cp.get("artifact_library") if isinstance(cp, dict) else None)
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
+    return settings.client() if settings is not None else None
 
 
 def _collab_grant_wiring(cp: dict, dsn: str | None):
@@ -4670,7 +4667,7 @@ def _cmd_cp_web(args) -> int:
     share_store, shares_root, share_settings = _share_wiring(cp, dsn)
     annotation_store = _annotation_wiring(cp, dsn)
     member_admin = _member_admin_wiring(cp, dsn)
-    library = _library_wiring(dsn)
+    library = _library_wiring(cp)
     try:
         from .control_plane.artifact_delete_api import owner_digests_config
         artifact_delete = owner_digests_config(cp.get("artifact_delete"))
@@ -4818,7 +4815,6 @@ def _cmd_cp_web(args) -> int:
                              collab_dashboard_hosts=args.collab_dashboard_host,
                              share_store=share_store, shares_root=shares_root, share_settings=share_settings,
                              annotation_store=annotation_store, member_admin=member_admin, library=library,
-                             library_viewers=_library_viewers(cp),
                              artifact_delete_owners=artifact_delete.digests,
                              artifact_delete_allow_keyless_owner=artifact_delete.allow_keyless,
                              collab_grant_store=collab_grant_store, collab_artifacts_enabled=collab_artifacts_enabled,
@@ -4872,9 +4868,6 @@ def _cmd_cp_web(args) -> int:
             artifact_adapter.close()
         if member_admin is not None:
             member_admin.close()
-        if library is not None:
-            library("close")        # the pool first, then the adapter's loop
-            library.close()
         if share_store is not None:
             share_store.close()
         if annotation_store is not None:
@@ -5058,7 +5051,8 @@ def _apply_collab_config(args, cp) -> None:
             continue
         value = collab[key]
         if key == "members":
-            _members_settings({"collab": {"members": value}, "share": cp.get("share")})   # validated here, read again where used
+            _members_settings({"collab": {"members": value}, "share": cp.get("share"),
+                               "artifact_host": cp.get("artifact_host")})   # validated here, read again where used
             setattr(args, dest, dict(value))
             continue
         if kind is dict and key == "summary_fix":
@@ -5191,6 +5185,9 @@ def _members_settings(cp) -> dict | None:
     a ``group``, a ``session_secret`` and ``control_plane.share.public_host``; see ``members_config``. A bad section
     stops the start."""
     from .control_plane.members_config import parse_members
+    host = cp.get("artifact_host") if isinstance(cp, dict) else None
+    if isinstance(host, dict) and host.get("enabled") is True:
+        return None     # the dedicated artifact host owns the member web: a leftover collab.members is never read
     collab = cp.get("collab") if isinstance(cp, dict) else None
     raw = collab.get("members") if isinstance(collab, dict) else None
     share = cp.get("share") if isinstance(cp, dict) else None

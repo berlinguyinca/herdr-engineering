@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { renderFeedList, renderFeedRow, renderChips, renderFolderSidebar } from './member-artifacts-view.js';
-import { SEARCH_DEBOUNCE_MS, chipCounts, describe, renderLibrary, rowHref } from './library-view.js';
+import { SEARCH_DEBOUNCE_MS, chipCounts, describe, renderLibrary, renderLibraryItem, rowHref } from './library-view.js';
 
 const folders = [{ folder_id: 'fld_1', name: 'Reading <list>', item_count: 1 }];
 const base = { sharer: 'member:alice', shared_at: '2026-11-01T10:00:00+00:00', expires_at: null, share_id: null, artifact_type: 'web', size_bytes: 10 };
@@ -15,31 +15,25 @@ const items = [
 const rowsOf = (html) => html.match(/<li class="row[\s\S]*?<\/li>/g) || [];
 const withoutTitle = (li) => li.replace(/<(?:a|button|span) class="row-title[^>]*>[\s\S]*?<\/(?:a|button|span)>/, '<TITLE>');
 
-test('the dashboard draws the same row markup as the member site, apart from the title link', () => {
-  const dash = rowsOf(renderLibrary({ items, folders, chip: 'all' }));
-  const sitePending = renderFeedRow(items[1], { folders });
-  const siteMine = renderFeedRow(items[0], { folders });
-  const siteExpired = renderFeedRow(items[2], { folders });
-  const byId = (id) => dash.find((li) => li.includes(`data-feed-row="${id}"`));
-  assert.equal(withoutTitle(byId('a1')), withoutTitle(siteMine));
-  assert.equal(byId('a3'), siteExpired);                                  // no link at all: identical
-  // the pending row is hidden from "All" (pending is its own chip) and identical on its chip
-  assert.equal(byId('a2'), undefined);
-  const pendingChip = rowsOf(renderLibrary({ items, folders, chip: 'pending' }));
-  assert.equal(withoutTitle(pendingChip[0]), withoutTitle(sitePending));
-  assert.match(pendingChip[0], /data-action="accept"[\s\S]*data-action="discard"/);
+test('the dashboard draws the member site rows in read-only form, with no write control anywhere', () => {
+  const html = renderLibrary({ items, folders, chip: 'all' });
+  const pending = renderLibrary({ items, folders, chip: 'pending' });
+  const inFolder = renderLibrary({ items: [items[0]], folders, chip: 'all', folderId: 'fld_1' });
+  for (const page of [html, pending, inFolder]) {
+    assert.doesNotMatch(page, /data-action="(accept|discard|unfile|rename-folder|delete-folder|file|revoke|approve)"/);
+    assert.doesNotMatch(page, /<form|<select|data-folder-form/);
+  }
+  assert.equal(rowsOf(html).length, 3);
 });
 
-test('active and pending rows link to the artifact page, expired and revoked rows do not', () => {
+test('active rows open the library item page, expired and revoked rows do not', () => {
   const html = renderLibrary({ items, folders, chip: 'all' });
-  assert.match(html, /<a class="row-title row-open" data-action="open" data-artifact="a1" href="#\/artifacts\/a1">/);
+  assert.match(html, /<a class="row-title row-open" data-action="open" data-artifact="a1" href="#\/library\/a1">/);
   assert.equal(rowHref(items[2]), null);
   assert.equal(rowHref(items[3]), null);
-  assert.equal(rowHref(items[1]), '#/artifacts/a2');
-  assert.equal(rowHref({ artifact_id: 'a9', status: 'active', readable: false }), null);
-  assert.equal(rowHref({ artifact_id: 'a9', status: 'active', readable: true }), '#/artifacts/a9');
+  assert.equal(rowHref(items[1]), '#/library/a2');
   assert.doesNotMatch(rowsOf(html).find((l) => l.includes('"a3"')), /href=/);
-  assert.equal(rowHref({ artifact_id: 'x/y z', status: 'active' }), '#/artifacts/x%2Fy%20z');
+  assert.equal(rowHref({ artifact_id: 'x/y z', status: 'active' }), '#/library/x%2Fy%20z');
 });
 
 test('titles and folder names are escaped, and the sidebar links stay inside the dashboard router', () => {
@@ -59,13 +53,36 @@ test('chips count the feed by source and pending shows only when there is some',
   assert.ok(!renderLibrary({ items: [items[0]], folders: [], chip: 'all' }).includes('data-chip="pending"'));
 });
 
-test('a folder view shows its name, filing controls and a missing folder is not available', () => {
+test('a folder view shows its name and a missing folder is not available', () => {
   const inFolder = renderLibrary({ items: [items[0]], folders, chip: 'all', folderId: 'fld_1' });
   assert.match(inFolder, /<h2>Reading &lt;list&gt;<\/h2>/);
-  assert.match(inFolder, /data-action="unfile"[^>]*data-folder="fld_1"/);
-  assert.match(inFolder, /data-action="rename-folder"/);
   assert.match(renderLibrary({ items, folders, folderId: 'fld_other' }), /not available/);
   assert.equal(renderFeedList([]).includes('data-empty'), true);
+});
+
+test('the item page lists versions, files and shares, escapes them and has only read controls', () => {
+  const item = { artifact_id: 'a1', title: 'T <b>x</b>', owner: 'member:alice', artifact_type: 'web', updated_at: '2026-11-01T10:00:00+00:00', current_version_id: 'v2', files: [{ path: 'index.html', media_type: 'text/html', size: 12 }] };
+  const versions = [{ version_id: 'v2', version_number: 2, state: 'ready', current: true, created_at: '2026-11-01T10:00:00+00:00', files: item.files }, { version_id: 'v1', version_number: 1, state: 'ready', current: false, created_at: '2026-10-01T10:00:00+00:00', files: [{ path: 'old<i>.html', media_type: 'text/html', size: 1 }] }];
+  const shares = [{ audience: 'lab_group', state: 'live', active: true, expires_at: null }];
+  const html = renderLibraryItem({ item, versions, shares });
+  assert.ok(!html.includes('<b>x</b>'));
+  assert.match(html, /href="#\/library\/a1\?version=v1"/);
+  assert.match(html, /data-action="open-file" data-path="index.html"/);
+  assert.match(html, /lab_group · live \(active\)/);
+  assert.doesNotMatch(html, /<form|<select|<iframe|revoke|approve|delete/i);
+  assert.match(renderLibraryItem({ item, versions, shares, versionId: 'v1' }), /old&lt;i&gt;\.html/);
+  assert.match(renderLibraryItem({}), /not available/);
+});
+
+test('member-controlled file paths and share audiences are escaped on the item page', () => {
+  const evil = '"><img src=x onerror=alert(1)>.html';
+  const item = { artifact_id: 'a1', title: 't', owner: 'member:<i>x</i>', artifact_type: 'web<b>', current_version_id: 'v1', files: [{ path: evil, media_type: 'text/<u>', size: 1 }] };
+  const versions = [{ version_id: 'v1', version_number: 1, state: 'ready', current: true, created_at: null, files: item.files }];
+  const shares = [{ audience: '<script>alert(2)</script>', state: 's"><svg onload=1>', active: false, expires_at: null }];
+  const html = renderLibraryItem({ item, versions, shares });
+  for (const raw of ['<img', '<script', '<svg', '<i>x', '<b>', '<u>', 'onerror=alert(1)>']) assert.ok(!html.includes(raw), raw);
+  assert.match(html, /data-path="&quot;&gt;&lt;img src=x onerror=alert\(1\)&gt;\.html"/);
+  assert.match(html, /&lt;script&gt;alert\(2\)&lt;\/script&gt;/);
 });
 
 test('the search debounce is 150 ms and a refusal shows the server message', () => {

@@ -29,6 +29,9 @@ python3 -m venv "$venv"
 export PATH="$venv/bin:$PATH"
 
 echo "== pytest =="
+# CI agents are Slurm exec hosts with no docker daemon: the real `docker compose up` tests of the artifact host skip here
+# (they fail, not skip, under CI otherwise) and run wherever docker exists; no pipeline has docker today.
+export HERDR_SKIP_DOCKER=1
 echo "pytest arguments: ${PYTEST_PARALLEL[*]:-(serial)}"
 python -m pytest -q ${PYTEST_PARALLEL[@]+"${PYTEST_PARALLEL[@]}"}
 echo "== client tests =="

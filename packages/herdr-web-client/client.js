@@ -197,8 +197,7 @@ export class HerdrClient {
     return this.request(`/api/v1/artifacts${query.size ? `?${query}` : ''}`, { signal });
   }
 
-  // The dashboard artifact library (same feed and folders as the member site). Writes need an operator key; the viewer is
-  // always the authenticated key, never a field of the request.
+  // The dashboard artifact library: the artifact host's feed and folders, read-only.
   listLibrary({ q, sources, folderId, type, since, until, offset, limit, signal } = {}) {
     const query = new URLSearchParams();
     const wanted = { q, sources: Array.isArray(sources) ? sources.join(',') : sources, folder_id: folderId, type, since, until, offset, limit };
@@ -208,32 +207,23 @@ export class HerdrClient {
     return this.request(`/api/v1/library${query.size ? `?${query}` : ''}`, { signal });
   }
 
-  createFolder(name, { signal } = {}) {
-    return this.request('/api/v1/library/folders', { method: 'POST', body: { name }, signal });
+  // Read-only: the library has no write call (approve, revoke, file and delete stay on the member page).
+  libraryItem(artifactId, { signal } = {}) {
+    return this.request(`/api/v1/library/items/${encodeURIComponent(artifactId)}`, { signal });
   }
 
-  renameFolder(folderId, name, { signal } = {}) {
-    return this.request(`/api/v1/library/folders/${encodeURIComponent(folderId)}`, { method: 'PUT', body: { name }, signal });
+  libraryVersions(artifactId, { signal } = {}) {
+    return this.request(`/api/v1/library/items/${encodeURIComponent(artifactId)}/versions`, { signal });
   }
 
-  deleteFolder(folderId, { signal } = {}) {
-    return this.request(`/api/v1/library/folders/${encodeURIComponent(folderId)}`, { method: 'DELETE', signal });
+  libraryShares(artifactId, { signal } = {}) {
+    return this.request(`/api/v1/library/shares?artifact_id=${encodeURIComponent(artifactId)}`, { signal });
   }
 
-  fileItem(folderId, artifactId, { signal } = {}) {
-    return this.request('/api/v1/library/items', { method: 'POST', body: { folder_id: folderId, artifact_id: artifactId }, signal });
-  }
-
-  unfileItem(folderId, artifactId, { signal } = {}) {
-    return this.request(`/api/v1/library/folders/${encodeURIComponent(folderId)}/items/${encodeURIComponent(artifactId)}`, { method: 'DELETE', signal });
-  }
-
-  acceptPending(artifactId, { signal } = {}) {
-    return this.request(`/api/v1/library/pending/${encodeURIComponent(artifactId)}/accept`, { method: 'POST', body: {}, signal });
-  }
-
-  discardPending(artifactId, { signal } = {}) {
-    return this.request(`/api/v1/library/pending/${encodeURIComponent(artifactId)}/discard`, { method: 'POST', body: {}, signal });
+  /** The dashboard-origin URL of one content file (the server proxies the host; the host key never reaches the browser). */
+  libraryContentUrl(itemId, versionId, path) {
+    const pieces = String(path).split('/').map(encodeURIComponent).join('/');
+    return `${this.base}/api/v1/library/content/${encodeURIComponent(itemId)}/${encodeURIComponent(versionId)}/${pieces}`;
   }
 
   // Owner-only delete (tombstone / purge now) and restore. The server answers a non-owner with a plain 404.

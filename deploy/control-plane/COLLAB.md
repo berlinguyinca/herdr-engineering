@@ -246,6 +246,75 @@ edge (nginx, server_name <public_host>): /s/ -> share-public:8083
   -v <conf>:/etc/nginx/nginx.conf:ro -v <certdir>:/etc/acme:ro nginx:1.29-alpine nginx -t` (a test does this when
   Docker is available).
 
+## Artifact host (`control_plane.artifact_host`)
+
+The dedicated artifact host (`herdr_artifact_host`, image `herdr-artifact-host`) replaces share-public for member
+artifacts. It is enabled with `control_plane.artifact_host.enabled: true` (needs the collab marker; refused together
+with `control_plane.share.enabled`, since both want the edge's `/s/`). `deploy.sh` renders the slice with
+`herdr-eng fleet config render-artifact-host`, builds the image, runs `migrate`, brings the host up with `--wait`
+BEFORE the control plane and the edge, and stops it again when the section is disabled. `--dry-run` renders and
+validates the slice and the compose files without printing any secret.
+
+- Services (`deploy/artifact-host/compose.yaml`): `artifact-host-db`, `artifact-host-migrate` (one-shot),
+  `artifact-host-public` (8090), `artifact-host-internal` (8091) and `artifact-host-relay` (a pinned, hardened nginx).
+  No host ports are published. Each role has its own compose healthcheck (`herdr-artifact-host healthcheck <role>`,
+  loopback port 8092 on public).
+- Database roles (three, none a superuser; `artifact_admin` is only the bootstrap account and is used by `deploy.sh`
+  for roles, backup and restore): `artifact_owner` runs migrations (DDL), `artifact_public` has DML only,
+  `artifact_internal` has SELECT only and `default_transaction_read_only`. Each service gets only its own slice
+  (`public.json`, `internal.json`, `migrate.json`) and its own password, derived by HMAC from `db_password`.
+  `roles.sql` is idempotent and is applied through the local socket on every deploy. Rotating `db_password` and
+  redeploying changes all role passwords (the roles step runs before the services restart). `db_user` is not a setting.
+- Networks: every host network is `internal: true` with `gateway_mode_ipv4: isolated`, so a container has neither a
+  route out nor a host-side gateway to dial, and external names do not resolve.
+  - The public role needs no egress. Cognito keys and group membership arrive through the synced `jwks.json` and
+    `members.json` (mounted read-only from `HERDR_COLLAB_SYNC_DIR`), and the browser exchanges the sign-in code with
+    Cognito itself.
+  - The edge reaches public over `<prefix>-edge` (fixed subnet 172.31.252.0/28, also denied on the `:8082` operator
+    listener). `control-plane-web` is NOT on a host network that reaches the internal role: it joins only
+    `<prefix>-relay`, where the relay (GET-only `/v1/`, everything else 405/404) forwards to the internal role on
+    `<prefix>-internal` (172.31.252.16/28, internal role at the fixed address .18). Set
+    `control_plane.artifact_library.host_url: http://artifact-host-relay:8091` (fleet validation refuses any other value
+    while the host is enabled). The relay streams (`proxy_buffering off`), so a blob larger than its tmpfs still arrives whole.
+  - The database sits on its own network with the public, internal and migrate roles; db and internal cannot
+    reach each other except through their own roles, and public and internal share no network.
+- Fixed names and addresses: the compose project (`herdr-artifact-host`), network prefix, both subnets and the
+  internal address are not deploy settings. `deploy.sh` exits 2 if `HERDR_ARTIFACT_HOST_PROJECT`,
+  `HERDR_ARTIFACT_NET_PREFIX`, `HERDR_ARTIFACT_EDGE_SUBNET`, `HERDR_ARTIFACT_INTERNAL_SUBNET`,
+  `HERDR_ARTIFACT_INTERNAL_IP`, `HERDR_ARTIFACT_HOST_DIR` or `HERDR_ARTIFACT_HOST_TAG` is set in its environment.
+  `public_host` must not equal an `mcp_public_hosts` name or the dashboard's name, and the secrets need real entropy.
+- Config secret: Compose file secrets are bind mounts and ignore `uid`/`gid`/`mode`. `deploy.sh` therefore installs
+  the slices and the db admin password as 0644 files inside a 0700 directory
+  (`~/.config/herdr-engineering/artifact-host/`); `roles.sql` stays 0600. The directory mode is the access control.
+- Deploy order and safety: certificate check (the edge certificate must name `public_host`, as for share), image
+  build, database up (never force-recreated on a routine deploy), roles, `pg_dump` backup to
+  `artifact-host/backups/pre-<tag>-<time>.dump` (0600; a failed backup stops the deploy before migrating), migrate,
+  public/internal/relay recreated with `--wait`, then the control plane and edge, then a probe of
+  `https://<public_host>/s/probe/` through the edge.
+- Rollback: the deploy records the previous state (`artifact-host.state`: `enabled` or `disabled`). A failed deploy
+  rolls the control plane back with the overlay only if the previous release ran the host. If the host was off before,
+  it is stopped again and the files this deploy installed are removed. If it was on and this deploy had not yet
+  changed the schema (the applied-migration count did not move and the migration did not fail), the previous host
+  release is brought back from the rollback worktree and the previous roles.sql is re-applied. If a migration ran or
+  failed, the host is not silently reverted (the previous code may not run against the changed schema): the
+  deploy exits 3 and prints the exact manual steps (stop the roles, `pg_restore` of the backup, redeploy the previous
+  ref).
+- Python: `deploy.sh` runs the fleet commands with the repo's `.venv/bin/python` (override with
+  `HERDR_DEPLOY_PYTHON`), falling back to `python3`.
+- Membership: the host reads `members.json` and `jwks.json` from the synced directory (`SyncedDirectory`).
+  `collab-sync.sh` writes the optional `disabled` list into `members.json`; the host treats a stale or empty listing as
+  no evidence (sign-in fails closed) and denies accounts on the `disabled` list.
+- Edge (`artifact-host-http.conf`, `artifact-host-mcp.conf`, rendered in place of the share snippets): the artifact
+  host name routes `/s/`, `/api/member/`, `/` and `/my/` to `artifact-host-public:8090` (run-time DNS via the
+  `resolver`); `mcp.` routes `POST /mcp/artifacts` there too. Nothing routes to the internal role. Each route class
+  has its own upstream (`share`, `member`, `upload`, `mcp`) with its own `max_conns`, so a flood on one cannot
+  starve the others (limits are in `artifact-host-http.conf`). `X-Forwarded-For`
+  is overwritten with `$remote_addr`; on `/mcp/artifacts` `Forwarded`, `X-Real-IP` and `X-Forwarded-Host` are also
+  stripped; `/healthz` and `/internal/` answer 404 at the edge. Body caps: `/s/` 1k,
+  annotations 32k, `/api/member/` 1m, run uploads 17m, `/mcp/artifacts` 768k. Existing room routes are unchanged.
+- Check: `tests/test_artifact_host_compose.py` parses the files and, when Docker is available (required under CI or
+  `HERDR_REQUIRE_DOCKER=1`), starts the stack and runs `nginx -t` on the rendered edge.
+
 ## Artifact collaborator bridge (`control_plane.collab_artifacts`)
 
 External agents can read and commit to an artifact whose owner granted them access. Off unless

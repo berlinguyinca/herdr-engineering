@@ -1,0 +1,306 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from herdr_artifact_host.annotation_anchor import (
+    ANNOTATION_ID_RE,
+    AnnotationInputError,
+    clean_anchor,
+    clean_comment,
+    parse_annotation_request,
+    parse_delete_request,
+    parse_edit_request,
+)
+
+
+def code(fn, *args, **kwargs) -> str:
+    with pytest.raises(AnnotationInputError) as exc:
+        fn(*args, **kwargs)
+    return exc.value.code
+
+
+def body(anchor: object, comment: object = "hi") -> bytes:
+    return json.dumps({"anchor": anchor, "comment": comment}, ensure_ascii=False).encode()
+
+
+def test_document_minimal_and_extras_stripped():
+    assert clean_anchor({"kind": "document", "file": "a/b.html", "junk": 1}) == {
+        "kind": "document",
+        "file": "a/b.html",
+    }
+
+
+def test_text_quote_min_and_max():
+    assert clean_anchor({"kind": "text_quote", "file": "a", "exact": "x"}) == {
+        "kind": "text_quote",
+        "file": "a",
+        "exact": "x",
+        "prefix": "",
+        "suffix": "",
+    }
+    full = {
+        "kind": "text_quote",
+        "file": "a",
+        "exact": "e" * 1000,
+        "prefix": "p" * 64,
+        "suffix": "s" * 64,
+    }
+    assert clean_anchor(full) == full
+    assert code(clean_anchor, {**full, "exact": "e" * 1001}) == "too_long"
+    assert code(clean_anchor, {**full, "prefix": "p" * 65}) == "too_long"
+    assert code(clean_anchor, {**full, "suffix": "s" * 65}) == "too_long"
+    assert code(clean_anchor, {"kind": "text_quote", "file": "a", "exact": ""}) == "bad_anchor"
+
+
+def test_pdf_page_with_and_without_region():
+    assert clean_anchor({"kind": "pdf_page", "file": "a.pdf", "page": 1}) == {
+        "kind": "pdf_page",
+        "file": "a.pdf",
+        "page": 1,
+    }
+    region = {"x": 0.5, "y": 0, "w": 0.5, "h": 1, "z": 9}
+    got = clean_anchor(
+        {"kind": "pdf_page", "file": "a.pdf", "page": 100000, "exact": "q", "region": region}
+    )
+    assert got["region"] == {"x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0}
+    assert got["exact"] == "q" and got["page"] == 100000
+
+
+@pytest.mark.parametrize("page", [0, 100001, True, 1.5, "1", None])
+def test_page_bounds(page):
+    assert code(clean_anchor, {"kind": "pdf_page", "file": "a", "page": page}) == "bad_anchor"
+
+
+@pytest.mark.parametrize("bad", [1.0000001, float("nan"), float("inf"), -0.1, True, "0.1"])
+def test_regions_refuse_bad_numbers(bad):
+    img = {"kind": "image_region", "file": "a.png", "x": 0, "y": 0, "w": 0.5, "h": 0.5}
+    assert code(clean_anchor, {**img, "w": bad}) == "bad_anchor"
+    pdf = {
+        "kind": "pdf_page",
+        "file": "a.pdf",
+        "page": 1,
+        "region": {"x": 0, "y": 0, "w": 0.5, "h": 0.5},
+    }
+    assert code(clean_anchor, {**pdf, "region": {**pdf["region"], "h": bad}}) == "bad_anchor"
+
+
+def test_sum_overflow_refused_both_kinds():
+    assert (
+        code(
+            clean_anchor,
+            {"kind": "image_region", "file": "a", "x": 0.5000001, "y": 0, "w": 0.5, "h": 1},
+        )
+        == "bad_anchor"
+    )
+    region = {"x": 0, "y": 0.5000001, "w": 1, "h": 0.5}
+    assert (
+        code(clean_anchor, {"kind": "pdf_page", "file": "a", "page": 1, "region": region})
+        == "bad_anchor"
+    )
+    ok = clean_anchor(
+        {"kind": "image_region", "file": "a", "x": 0.25, "y": 0.25, "w": 0.75, "h": 0.75}
+    )
+    assert ok["w"] == 0.75
+
+
+@pytest.mark.parametrize("name", ["../a", "a//b", "/abs", "x" * 1025, "", 5, None])
+def test_bad_file(name):
+    assert code(clean_anchor, {"kind": "document", "file": name}) == "bad_file"
+
+
+def test_bad_kind_and_shape():
+    assert code(clean_anchor, {"kind": "nope", "file": "a"}) == "bad_anchor"
+    assert code(clean_anchor, []) == "bad_anchor"
+
+
+def test_comment_boundaries():
+    assert clean_comment("a" * 4000) == "a" * 4000
+    assert code(clean_comment, "a" * 4001) == "too_long"
+    assert clean_comment("a" * 500, max_chars=500)
+    assert code(clean_comment, "a" * 501, max_chars=500) == "too_long"
+    assert clean_comment("a" * 4000, max_chars=99999) == "a" * 4000
+    assert code(clean_comment, "a" * 4001, max_chars=99999) == "too_long"
+
+
+def test_comment_chars():
+    assert code(clean_comment, "  \n ") == "empty"
+    for bad in ("\x00", "\x1b", "\ud800"):
+        assert code(clean_comment, bad) == "bad_chars"
+    assert clean_comment("a\n\tb") == "a\n\tb"
+    assert code(clean_comment, 5) == "bad_anchor"
+
+
+def test_hostile_comment_unchanged():
+    hostile = "<img src=x onerror=1>"
+    assert clean_comment(hostile) == hostile
+
+
+def test_parse_request_ok_and_top_level_extras():
+    anchor, comment = parse_annotation_request(
+        body({"kind": "document", "file": "a", "z": 1}, " hi ")
+    )
+    assert anchor == {"kind": "document", "file": "a"} and comment == "hi"
+    raw = json.dumps(
+        {"anchor": {"kind": "document", "file": "a"}, "comment": "x", "extra": 1}
+    ).encode()
+    assert code(parse_annotation_request, raw) == "bad_anchor"
+    assert code(parse_annotation_request, b'{"comment":"x"}') == "bad_anchor"
+
+
+def test_body_shapes():
+    assert code(parse_annotation_request, b"not json") == "bad_anchor"
+    assert code(parse_annotation_request, b"[]") == "bad_anchor"
+    assert code(parse_annotation_request, b"\xff\xfe") == "bad_anchor"
+    assert code(parse_annotation_request, b"[" * 100000) == "too_long"
+    assert code(parse_annotation_request, b"[" * 30000) == "bad_anchor"
+    assert code(parse_annotation_request, b" " * 32769) == "too_long"
+    assert code(parse_annotation_request, b" " * 32768) == "bad_anchor"
+    assert code(parse_annotation_request, "x") == "bad_anchor"  # type: ignore[arg-type]
+
+
+def test_max_realistic_body_accepted():
+    raw = body({"kind": "text_quote", "file": "a", "exact": "e" * 1000}, "\U0001f600" * 4000)
+    assert len(raw) <= 32768
+    _, comment = parse_annotation_request(raw)
+    assert len(comment) == 4000
+
+
+def test_edit_and_delete():
+    assert parse_edit_request(b'{"comment":" x "}') == "x"
+    assert code(parse_edit_request, b'{"comment":"x","anchor":{}}') == "bad_anchor"
+    assert code(parse_edit_request, b"{}") == "bad_anchor"
+    assert code(parse_edit_request, b'{"comment":"a"}', max_chars=0) == "too_long"
+    assert parse_delete_request(b"{}") is None
+    assert code(parse_delete_request, b'{"x":1}') == "bad_anchor"
+
+
+def test_id_regex_and_error_code():
+    assert ANNOTATION_ID_RE.fullmatch("ann_" + "A" * 22)
+    assert not ANNOTATION_ID_RE.fullmatch("ann_" + "A" * 21)
+    with pytest.raises(ValueError):
+        AnnotationInputError("nonsense")
+
+
+def test_huge_int_region_values_refused_not_overflow():
+    huge = int("9" * 400)
+    img = {"kind": "image_region", "file": "a", "x": 0, "y": 0, "w": huge, "h": 0.5}
+    assert code(clean_anchor, img) == "bad_anchor"
+    pdf = {
+        "kind": "pdf_page",
+        "file": "a",
+        "page": 1,
+        "region": {"x": 0, "y": 0, "w": 1, "h": -huge},
+    }
+    assert code(clean_anchor, pdf) == "bad_anchor"
+    raw = (
+        '{"anchor":{"kind":"image_region","file":"a","x":0,"y":0,"w":'
+        + "9" * 400
+        + ',"h":1},"comment":"c"}'
+    ).encode()
+    assert code(parse_annotation_request, raw) == "bad_anchor"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("exact", "\x00"), ("prefix", "\ud800"), ("suffix", "a\rb"), ("exact", "\x1b")],
+)
+def test_anchor_text_control_chars_refused(field, value):
+    anchor = {"kind": "text_quote", "file": "a", "exact": "x", field: value}
+    assert code(clean_anchor, anchor) == "bad_chars"
+    pdf = {"kind": "pdf_page", "file": "a", "page": 1, "exact": "\x00"}
+    assert code(clean_anchor, pdf) == "bad_chars"
+
+
+BIDI = [chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))]
+
+
+@pytest.mark.parametrize("ch", BIDI)
+def test_bidi_controls_are_refused_in_comments_and_anchors(ch):
+    """Plan 4 C4: an explicit directional embedding / override / isolate can reorder what the owner reads (Trojan Source)."""
+    assert code(clean_comment, f"safe {ch} text") == "bad_chars"
+    for field in ("exact", "prefix", "suffix"):
+        anchor = {"kind": "text_quote", "file": "a", "exact": "x", field: f"a{ch}b"}
+        assert code(clean_anchor, anchor) == "bad_chars", field
+    assert (
+        code(clean_anchor, {"kind": "pdf_page", "file": "a", "page": 1, "exact": f"a{ch}"})
+        == "bad_chars"
+    )
+
+
+def test_ordinary_bidi_text_and_marks_are_still_accepted():
+    assert clean_comment("שלום עולם مرحبا ‏‎ ok") == "שלום עולם مرحبا ‏‎ ok"
+
+
+INVISIBLE = [
+    chr(c)
+    for c in (
+        0x80,
+        0x85,
+        0x9F,
+        0xAD,
+        0x2028,
+        0x2029,
+        0x2060,
+        0x2064,
+        0x206A,
+        0x206F,
+        0xFEFF,
+        0xFFF9,
+        0xFFFB,
+        0xE0001,
+        0xE0041,
+        0xE007F,
+        0xE000,
+        0x0378,
+        0x034F,
+        0x115F,
+        0x1160,
+        0x17B4,
+        0x3164,
+        0xFFA0,
+    )
+]
+
+
+@pytest.mark.parametrize("ch", INVISIBLE, ids=lambda c: f"U+{ord(c):04X}")
+def test_invisible_characters_are_refused_by_unicode_category(ch):
+    """Plan 4 C4: Cc, Cf, Cs, Co and Cn are refused (C1 controls, tag characters, invisible operators, BOM, annotation
+    anchors, private use, unassigned) apart from an explicit allow-list."""
+    assert code(clean_comment, f"hello {ch} world") == "bad_chars"
+    assert (
+        code(clean_anchor, {"kind": "text_quote", "file": "a", "exact": f"a{ch}b"}) == "bad_chars"
+    )
+    assert (
+        code(clean_anchor, {"kind": "text_quote", "file": "a", "exact": "x", "prefix": ch})
+        == "bad_chars"
+    )
+
+
+def test_joiners_and_directional_marks_are_still_accepted():
+    for ok in ("‍", "‌", "‎", "‏", "؜"):
+        assert clean_comment(f"a{ok}b") == f"a{ok}b"
+    assert clean_comment("👨‍👩‍👧 family\n\tindented") == "👨‍👩‍👧 family\n\tindented"
+
+
+def test_emoji_variation_selector_is_still_accepted():
+    assert clean_comment("\u2764\ufe0f ok") == "\u2764\ufe0f ok"
+
+
+def test_ideographic_variation_selectors_and_braille_blank_are_accepted():
+    text = "\u845b\U000e0100 \u2800\u2801"
+    assert clean_comment(text) == text
+    assert clean_anchor({"kind": "text_quote", "file": "a", "exact": text})["exact"] == text
+
+
+def test_the_worker_does_not_judge_unassigned_code_points_but_the_edge_does():
+    unassigned = "ok \u0378 ok"  # unassigned in every Unicode version so far; a newer table may assign others
+    assert code(clean_comment, unassigned) == "bad_chars"
+    assert clean_comment(unassigned, unassigned=False) == unassigned
+    anchor = {"kind": "text_quote", "file": "a", "exact": unassigned}
+    assert code(clean_anchor, anchor) == "bad_chars"
+    assert clean_anchor(anchor, unassigned=False)["exact"] == unassigned
+    assert (
+        code(lambda v: clean_comment(v, unassigned=False), "x\u202ey") == "bad_chars"
+    )  # real format chars still refused

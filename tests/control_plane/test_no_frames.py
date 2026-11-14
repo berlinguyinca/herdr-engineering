@@ -39,9 +39,11 @@ ROOT = Path(__file__).resolve().parents[2]
 TAG = re.compile(r"<\s*(iframe|frame|frameset|object|embed|portal|fencedframe)(?=[\s/>])", re.I)
 API = re.compile(r"createElement\(\s*['\"`](iframe|frame|object|embed)|\.srcdoc\b|\bsrcdoc=|postMessage\(", re.I)
 RICH_VIEW = "packages/artifact-rich-view.js"
+LIBRARY_FRAME = "packages/library-frame.js"
 SHARE_RICH = "herdr_engineering/control_plane/share_static/rich-toggle.js"
 ALLOWED: dict[str, str] = {       # "relative/path" -> reason; a new entry needs a reason a reviewer can check
     SHARE_RICH: "share Rich view (opt-in, 2026-11-05): one iframe with an empty sandbox whose src is the bundled author page",
+    LIBRARY_FRAME: "dashboard library item preview (2026-11-08): one iframe with an empty sandbox whose src can only be the library content route (pinned below)",
     RICH_VIEW: "report Rich view: one iframe with an empty sandbox, whose src can only be the rich route (pinned below)",
 }
 SCANNED_SUFFIXES = {".js", ".mjs", ".html", ".css"}
@@ -121,8 +123,57 @@ def test_the_rich_view_is_the_one_allowed_frame_shape():
     # no other shipped script or page may name the rich frame's pieces: the exception is exactly one file
     for path in _scanned_files():
         rel = path.relative_to(ROOT).as_posix()
-        if rel not in (RICH_VIEW, SHARE_RICH) and path.suffix == ".js":
+        if rel not in (RICH_VIEW, SHARE_RICH, LIBRARY_FRAME) and path.suffix == ".js":
             assert "createElement('iframe')" not in path.read_text(encoding="utf-8", errors="replace"), rel
+
+
+def library_frame_shape_problems(text: str) -> list[str]:
+    """Why ``text`` is not the library's one allowed frame (empty list when it is)."""
+    problems = []
+    if len(re.findall(r"createElement\(\s*'iframe'\s*\)", text)) != 1:
+        problems.append("exactly one createElement('iframe') is allowed")
+    if re.findall(r"createElement\(\s*['\"`](?!iframe)(?:frame|object|embed)", text, re.I) or re.search(
+            r"<\s*(?:iframe|frame|frameset|object|embed|portal|fencedframe)\b", text, re.I):
+        problems.append("no other frame, plugin or markup element")
+    if len(re.findall(r"setAttribute\(\s*'sandbox'\s*,\s*''\s*\)", text)) != 1:
+        problems.append("sandbox must be set to the empty string")
+    if "allow-" in text or re.search(r"\bsandbox\s*\.\s*(?:add|value|toggle)|\.sandbox\s*=", text):
+        problems.append("no sandbox token of any kind")
+    if re.search(r"srcdoc|postMessage|contentWindow|contentDocument", text):
+        problems.append("no srcdoc, postMessage or contentWindow")
+    if re.findall(r"setAttribute\(\s*'src'\s*,\s*([^)]*)\)", text) != ["url"] or "if (!isContentUrl(url)) throw" not in text:
+        problems.append("src must be the guarded url")
+    route = re.search(r"const CONTENT_ROUTE = (/.*/i);", text)
+    if not route or route.group(1) != (r"/^\/api\/v1\/library\/content\/[^/?#]+"
+                                       r"\/[^/?#]+\/[^?#]+$/i"):
+        problems.append("the route pattern changed")
+    return problems
+
+
+def test_the_library_frame_is_the_one_allowed_library_frame_shape():
+    assert library_frame_shape_problems((ROOT / LIBRARY_FRAME).read_text(encoding="utf-8")) == []
+
+
+@pytest.mark.parametrize("old, new", [
+    ("setAttribute('sandbox', '')", "setAttribute('sandbox', 'allow-scripts')"),
+    ("setAttribute('sandbox', '')", "setAttribute('sandbox', 'allow-same-origin')"),
+    ("frame.setAttribute('src', url);", "frame.setAttribute('src', 'https://evil.example/');"),
+    ("frame.setAttribute('src', url);", "frame.setAttribute('src', url); frame.setAttribute('srcdoc', '<p>');"),
+    ("frame.setAttribute('src', url);", "frame.setAttribute('src', url); frame.sandbox.add('allow-scripts');"),
+    ("frame.setAttribute('loading', 'lazy');", "frame.setAttribute('loading', 'lazy'); frame.contentWindow.postMessage(1, '*');"),
+    ("if (!isContentUrl(url)) throw", "if (false) throw"),
+    ("const frame = doc.createElement('iframe');", "const frame = doc.createElement('iframe'); doc.createElement('iframe');"),
+    ("const frame = doc.createElement('iframe');", "const frame = doc.createElement('iframe'); doc.createElement('embed');"),
+    ("\\/library\\/content\\/", "\\/artifacts\\/content\\/"),
+    ("const CONTENT_ROUTE = /^\\/api", "const CONTENT_ROUTE = /^(?:[a-z][a-z0-9+.-]*:\\/\\/[^/]+)?\\/api"),   # scheme://host allowed again
+    ("const CONTENT_ROUTE = /^\\/api", "const CONTENT_ROUTE = /^(?:\\/\\/[^/]+)?\\/api"),                      # //host allowed
+    ("const CONTENT_ROUTE = /^\\/api", "const CONTENT_ROUTE = /\\/api"),                                       # unanchored
+    ("[^?#]+$/i;", "[^?#]*$/i;"),                                                                              # empty path allowed
+])
+def test_any_other_library_frame_shape_is_rejected(old, new):
+    text = (ROOT / LIBRARY_FRAME).read_text(encoding="utf-8")
+    assert old in text, old
+    assert library_frame_shape_problems(text.replace(old, new, 1)), new
 
 
 def share_rich_shape_problems(text: str) -> list[str]:
