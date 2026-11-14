@@ -1229,11 +1229,58 @@ def test_forward_deploy_with_the_listener_starts_the_sidecar_even_when_the_slice
 
 def test_dry_run_with_the_listener_warns_non_fatally_about_firewall_and_boot_order(env):
     _with_collab(env, dict(COLLAB, fabric_trust=FABRIC_TRUST))
+    _shim(env, "iptables", "exit 1")
     r = deploy(env, "--dry-run")
     assert r.returncode == 0, r.stderr
     assert "WARNING: fabric network firewall" in r.stderr and "collab-fabric-firewall.sh --install" in r.stderr
     if not Path("/etc/systemd/system/docker.service.d/after-tailscale.conf").exists():
         assert "WARNING: docker is not ordered after tailscaled" in r.stderr and "docker-after-tailscale.conf" in r.stderr
+
+
+def _shim(env, name, body):
+    path = Path(env["env"]["PATH"].split(os.pathsep)[0]) / name
+    path.write_text(f"#!/usr/bin/env bash\n{body}\n")
+    path.chmod(0o755)
+
+
+def _fabric_deploy_with_iptables(env, iptables_exit, unit_enabled=True):
+    _with_collab(env, dict(COLLAB, fabric_trust=FABRIC_TRUST))
+    _shim(env, "iptables", f"exit {iptables_exit}")
+    _shim(env, "systemctl", "exit 0" if unit_enabled else "echo disabled; exit 1")
+    return deploy(env, "--dry-run")
+
+
+def _note(stderr):
+    return next(ln for ln in stderr.splitlines() if ln.startswith("NOTE: fabric network firewall"))
+
+
+def test_fabric_firewall_rules_absent_keeps_the_strong_install_warning(env):
+    r = _fabric_deploy_with_iptables(env, 1)
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: fabric network firewall is not confirmed present" in r.stderr
+    assert "collab-fabric-firewall.sh --install" in r.stderr
+
+
+def test_fabric_firewall_rules_present_prints_no_firewall_message(env):
+    r = _fabric_deploy_with_iptables(env, 0)
+    assert r.returncode == 0, r.stderr
+    assert "fabric network firewall" not in r.stderr
+
+
+def test_fabric_firewall_unreadable_without_root_is_a_note_not_the_install_warning(env):
+    r = _fabric_deploy_with_iptables(env, 4)
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: fabric network firewall" not in r.stderr
+    note = _note(r.stderr)
+    assert "without root" in note and "sudo " in note and "collab-fabric-firewall.sh --check" in note
+    assert "--install" not in note
+    assert "herdr-collab-fabric-firewall.service is enabled" in note
+
+
+def test_fabric_firewall_unreadable_and_boot_unit_not_enabled_does_not_claim_enabled(env):
+    r = _fabric_deploy_with_iptables(env, 4, unit_enabled=False)
+    assert r.returncode == 0, r.stderr
+    assert "is enabled" not in _note(r.stderr)
 
 
 def test_rollback_to_a_checkout_without_the_fabric_overlay_drops_the_sidecar_service(env):

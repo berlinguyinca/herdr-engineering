@@ -57,7 +57,7 @@ Build a replay set: past PRs (start with #733 and #782 pre-fix diffs, add more) 
 
 ### Independence trade-off
 
-Opus reviewing Claude-authored PRs drops the different-family rule that `Independent AI review` enforces. Proposal: for risky paths (deploy, migrations, security), add Codex as a second reviewer whose verdict must also be success; the path list lives in YAML config. This is a proposal and costs extra, so it is limited to those paths.
+Opus reviewing Claude-authored PRs drops the different-family rule that `Independent AI review` enforces. Proposal: for risky paths (deploy, migrations, security), add Codex as a second reviewer whose verdict must also be success; the path list lives in YAML config. This is a proposal and costs extra, so it is limited to those paths. Implemented (operator approved 2026-11-14) as the `risky` YAML block of `always-on-review.py`: default globs `deploy/**`, `**/migrations/**`, `**/*.sql`, `**/*security*/**`, `**/*auth*`, `**/secrets*`; see `deploy/ci-review/README.md`.
 
 ### The pane
 
@@ -79,5 +79,5 @@ Rollback is to stop and uninstall the review unit and fall back to the manual po
 1. Which dedicated node replaces beast, and when.
 2. Opus token budget per review and per day, and the wall-clock cap.
 3. Does Tier 1 post a PR comment, or only log? (Comments are visible but noisy.)
-4. Which paths count as risky for the Codex second reviewer.
+4. ~~Which paths count as risky for the Codex second reviewer.~~ Decided: the globs above, in YAML, editable.
 5. Which models and how large a replay set before Tier 1 is allowed to influence anything.

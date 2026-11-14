@@ -9,7 +9,7 @@ Built on ai-review.py (same `gh` wrapper, diff parser, chunker, citation check, 
 reviewer backends chosen in YAML only: `gateway` (an OpenAI-compatible chat completion, as ai-review.py), `claude`
 (headless Claude Code, read-only tools, a fresh detached worktree of the PR head) and `pi` (the pi harness, read-only
 tools, same worktree). Tier 1 is advisory and posts its own context; tier 2 posts the required context, and only for
-a head whose required gates are all green.
+the head it was asked about, without waiting for green checks unless `gates.wait_for_green` is set.
 
 DRY-RUN IS THE DEFAULT. Reviews run and are logged, and nothing is posted unless the config sets `post: true` AND the
 command line passes `--post`. The script, never the model, decides the state: the reviewer's answer must parse under
@@ -27,6 +27,7 @@ import hashlib
 import datetime as dt
 import importlib.util
 import json
+import math
 import os
 import re
 import secrets
@@ -34,6 +35,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -69,16 +71,23 @@ DEFAULTS: dict = {
     "state_dir": "~/.local/state/herdr-review",
     "post": False,                      # with the --post flag, the second of the two keys that allow any posting
     "clone": "",                        # a clone the claude/pi backends create read-only worktrees from
-    "gates": {"required": [], "when_present": []},   # tier 2: required must be success; when_present only if it exists
+    "gates": {"wait_for_green": False,  # true: tier 2 waits until the gates below are green on the head; false: reviews at once
+              "required": [], "when_present": []},   # with wait_for_green: required must be success; when_present only if it exists
     "poll": {"max_per_run": 5, "pending_stale_minutes": 120, "cooldown_failures": 3, "cooldown_minutes": 60},
     "prompt": {"project_rules": [], "checklist_file": "", "require_evidence": True},
     "replay": {"clones": [],            # [{repo: OWNER/NAME, path: DIR}]: the clone replay uses for that repo
                "reviewers": []},        # logins (bots too) whose review comments `corpus build` counts; humans always count
+    "risky": {"globs": [],              # paths (repo-relative, ** allowed) whose PRs need a Codex verdict too; [] = off
+              "codex": {"command": "codex", "wrapper": [], "model": "",   # model "" = the codex CLI's own default
+                        "time_cap_s": 1800, "diff_bytes": 200000,
+                        "daily_budget_usd": None,           # counted from the cost this script computes (see below)
+                        "input_usd_per_mtok": None, "output_usd_per_mtok": None}},   # codex reports tokens, not dollars
     "tiers": {
         "tier1": {"enabled": True, "context": "Open-weight pre-review", "backend": "pi",
-                  "model": "metabolomics/qwen3.8-27b", "time_cap_s": 900, "comment": False},
+                  "model": "metabolomics/qwen3.8-27b", "time_cap_s": 900, "comment": False,
+                  "daily_budget_usd": None},     # None = no limit; else skip once today's (UTC) logged cost_usd reaches it
         "tier2": {"enabled": True, "context": "Opus agent review", "backend": "claude", "model": "opus",
-                  "time_cap_s": 1800, "comment": True, "passes": []},     # [{name, focus}]; [] = one unfocused review
+                  "time_cap_s": 1800, "comment": True, "passes": [], "daily_budget_usd": None},     # [{name, focus}]; [] = one unfocused review
     },
     "backends": {
         "gateway": {**ai.DEFAULTS["reviewer"], "chunk_bytes": 24000},
@@ -89,6 +98,16 @@ DEFAULTS: dict = {
 
 
 # ---------------- configuration ----------------
+
+def _valid_budget(b) -> bool:
+    """A positive, finite number; an int too large for a float (10**400) is refused, not an OverflowError."""
+    if isinstance(b, bool) or not isinstance(b, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(b)) and b > 0
+    except OverflowError:
+        return False
+
 
 def load_config(path: str | None) -> dict:
     over: dict = {}
@@ -114,6 +133,9 @@ def load_config(path: str | None) -> dict:
             raise Refused(f"config: tiers.{name}.context must be 1..100 characters")
         if t["time_cap_s"] < 10:
             raise Refused(f"config: tiers.{name}.time_cap_s must be at least 10")
+        b = t.get("daily_budget_usd")
+        if b is not None and not _valid_budget(b):
+            raise Refused(f"config: tiers.{name}.daily_budget_usd must be a positive number (or unset for no limit)")
         contexts.append(t["context"])
     if len(set(contexts)) != len(contexts):
         raise Refused("config: tier contexts must differ")
@@ -123,6 +145,9 @@ def load_config(path: str | None) -> dict:
             raise Refused(f"config: backends.{name}.wrapper must be a list of strings")
         if not b["command"].strip():
             raise Refused(f"config: backends.{name}.command is empty")
+    _check_risky(cfg)
+    if not isinstance(cfg["gates"]["wait_for_green"], bool):
+        raise Refused("config: gates.wait_for_green must be true or false")
     for g in ("required", "when_present"):
         if not isinstance(cfg["gates"][g], list) or not all(isinstance(x, str) and x for x in cfg["gates"][g]):
             raise Refused(f"config: gates.{g} must be a list of names")
@@ -204,6 +229,29 @@ def _check_passes_and_replay(cfg: dict) -> None:
         if (not isinstance(c, dict) or sorted(c) != ["path", "repo"] or not isinstance(c["repo"], str)
                 or not ai.REPO_RE.fullmatch(c["repo"]) or not isinstance(c["path"], str) or not c["path"]):
             raise Refused("config: replay.clones must be a list of {repo: OWNER/NAME, path: DIR}")
+
+
+def _check_risky(cfg: dict) -> None:
+    r = cfg["risky"]
+    globs = r["globs"]
+    if not isinstance(globs, list) or not all(isinstance(g, str) and g.strip() and not g.startswith("/")
+                                              and ".." not in g.split("/") for g in globs):
+        raise Refused("config: risky.globs must be a list of repo-relative globs (no leading /, no ..)")
+    c = r["codex"]
+    if not isinstance(c["wrapper"], list) or not all(isinstance(x, str) for x in c["wrapper"]):
+        raise Refused("config: risky.codex.wrapper must be a list of strings")
+    if not isinstance(c["command"], str) or not c["command"].strip():
+        raise Refused("config: risky.codex.command is empty")
+    if not isinstance(c["model"], str) or (c["model"] and not ai.MODEL_RE.fullmatch(c["model"])):
+        raise Refused("config: risky.codex.model must be empty (the codex default) or a model id")
+    if isinstance(c["time_cap_s"], bool) or not isinstance(c["time_cap_s"], (int, float)) or c["time_cap_s"] < 10:
+        raise Refused("config: risky.codex.time_cap_s must be at least 10")
+    for k in ("daily_budget_usd", "input_usd_per_mtok", "output_usd_per_mtok"):
+        if c[k] is not None and not _valid_budget(c[k]):
+            raise Refused(f"config: risky.codex.{k} must be a positive number (or unset)")
+    if c["daily_budget_usd"] is not None and (c["input_usd_per_mtok"] is None or c["output_usd_per_mtok"] is None):
+        raise Refused("config: risky.codex.daily_budget_usd needs input_usd_per_mtok and output_usd_per_mtok "
+                      "(codex reports tokens only, so the cost is computed from them)")
 
 
 def post_allowed(cfg: dict, flag: bool) -> bool:
@@ -759,7 +807,11 @@ def register_pi_secret(model: str) -> None:
 
 
 def register_gh_secret() -> None:
-    """Best effort: the operator's `gh auth token` joins the redaction set (pi can read ~/.config/gh). Never raises."""
+    """Best effort: the operator's `gh auth token` and any GH_TOKEN / GITHUB_TOKEN value join the redaction set (pi can
+    read ~/.config/gh). Never raises."""
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        if len(os.environ.get(name, "")) >= 8:
+            ai.REDACT.add(os.environ[name])
     try:
         p = subprocess.run(["gh", "auth", "token"], capture_output=True, timeout=30, env=child_env())
         tok = p.stdout.decode("utf-8", "replace").strip()
@@ -823,6 +875,168 @@ class GatewayBackend:
         return RawReview(merged, used, took, {})
 
 
+# ---------------- risky paths and the Codex second reviewer ----------------
+
+def glob_regex(glob: str) -> re.Pattern[str]:
+    """`**/` = any directories (or none), `**` = anything, `*` = anything but `/`, `?` = one non-`/` character.
+    Case-insensitive: a path that only differs in case still counts as risky."""
+    out, i = "", 0
+    while i < len(glob):
+        if glob.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif glob.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif glob[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif glob[i] == "?":
+            out, i = out + "[^/]", i + 1
+        else:
+            out, i = out + re.escape(glob[i]), i + 1
+    return re.compile(out, re.I)
+
+
+def risky_paths(cfg: dict, files: list[ai.FileDiff]) -> list[str]:
+    """The changed paths that match risky.globs. A rename or move counts by both its old and its new path (moving a
+    file out of deploy/ is a change to deploy/)."""
+    pats = [glob_regex(g) for g in cfg["risky"]["globs"]]
+    hits = []
+    for f in files:
+        for p in dict.fromkeys(x for x in (f.path, f.old_path) if x):
+            if any(r.fullmatch(p) for r in pats):
+                hits.append(p)
+                break
+    return hits
+
+
+def codex_cost_usd(ccfg: dict, usage: dict) -> float | None:
+    """Dollars from the tokens codex reported and the operator's per-million-token prices; None when either is
+    missing. Cached input tokens are charged as full input (an overestimate, so the budget errs on the safe side)."""
+    i, o = usage.get("input_tokens"), usage.get("output_tokens")
+    pi, po = ccfg["input_usd_per_mtok"], ccfg["output_usd_per_mtok"]
+    if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (i, o, pi, po)):
+        return None
+    try:
+        return round(i * pi / 1e6 + o * po / 1e6, 6)
+    except OverflowError:                                   # an int too large for a float: not a usable count
+        return None
+
+
+TOKENS_MAX = 10**12                     # no real review reports more; larger, negative or non-int counts are invalid
+
+
+def codex_usage(stdout: str) -> dict:
+    """Token usage from `codex exec --json`: the sum of the `usage` of every turn.completed event. Lines that are not
+    JSON events are ignored."""
+    tot: dict = {}
+    for line in stdout.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        u = e.get("usage") if isinstance(e, dict) and e.get("type") == "turn.completed" else None
+        if isinstance(u, dict):
+            for k in ("input_tokens", "cached_input_tokens", "output_tokens"):
+                if k in u and not (type(u[k]) is int and 0 <= u[k] <= TOKENS_MAX):
+                    raise ReviewFailed("codex reported an implausible token count; its usage cannot be trusted")
+                if k in u:
+                    tot[k] = tot.get(k, 0) + u[k]
+    if any(v > TOKENS_MAX for v in tot.values()):
+        raise ReviewFailed("codex reported an implausible token count; its usage cannot be trusted")
+    return tot
+
+
+class CodexBackend:
+    """`codex exec` in the read-only sandbox, in a detached worktree of the PR head. Same boundary as the others:
+    scrubbed environment, own process group killed on the time cap, bounded output, strict verdict schema
+    (--output-schema), the answer taken from --output-last-message. The user's codex config is ignored (only its
+    login is used), so a stale config.toml cannot break or widen a review."""
+    name, needs_worktree = "codex", True
+
+    def __init__(self, ccfg: dict):
+        self.ccfg = ccfg
+
+    def argv(self, schema: Path, out: Path, worktree: Path) -> list[str]:
+        c = self.ccfg
+        return [*c["wrapper"], c["command"], "exec", "--sandbox", "read-only", "--ephemeral", "--ignore-user-config",
+                "--ignore-rules", "--color", "never", "--json", "--cd", str(worktree), "--output-schema", str(schema),
+                "--output-last-message", str(out), *(["--model", c["model"]] if c["model"] else []),
+                "-c", 'approval_policy="never"',
+                "-c", "project_doc_max_bytes=0",            # a PR-added AGENTS.md is not loaded as instructions
+                "-"]
+
+    def prompt(self, req: ReviewRequest) -> str:
+        fence = "=====UNTRUSTED-" + secrets.token_hex(8) + "====="
+        tools = ("You are the SECOND reviewer of a change to risky paths (deploy, migrations, security). Another "
+                 "model has already approved it; assume nothing it said. Your sandbox is read-only: you may read the "
+                 "checked-out PR head in the current directory (callers, tests, migrations, config). The diff and "
+                 "commit log are in the message.\n")
+        return instructions(req, fence, tools) + "\n" + untrusted(req, fence, self.ccfg["diff_bytes"])
+
+    def review(self, req: ReviewRequest, time_cap_s: float) -> RawReview:
+        with tempfile.TemporaryDirectory(prefix="codex-review-") as d:
+            schema, out = Path(d) / "schema.json", Path(d) / "answer.txt"
+            schema.write_text(json.dumps(GATEWAY_SCHEMA))
+            stdout, took = run_reviewer(self.argv(schema, out, req.worktree), req.worktree, self.prompt(req),
+                                        time_cap_s)
+            usage = codex_usage(stdout)
+            try:
+                answer = out.read_text(errors="replace")
+            except OSError:
+                raise ReviewFailed("codex wrote no answer") from None
+        cost = codex_cost_usd(self.ccfg, usage)
+        return RawReview(answer, self.ccfg["model"] or "codex", took, {**usage, "cost_usd": cost})
+
+
+def codex_budget_left(cfg: dict) -> str | None:
+    """None when Codex may run; else the reason it may not (today's logged codex cost has reached the budget)."""
+    budget = cfg["risky"]["codex"]["daily_budget_usd"]
+    if budget is not None and (spent := spent_today_usd(cfg, "codex")) >= budget:
+        return f"codex daily budget exhausted (${spent:.2f} of ${budget:.2f} spent today, UTC)"
+    return None
+
+
+def codex_review(cfg: dict, req: ReviewRequest, tier_name: str, post_on: bool, started: float
+                 ) -> tuple[Verdict, dict, str, int]:
+    """The second review of a risky PR. Returns (verdict, usage, model, downgraded). Anything that stops it from
+    producing a verified verdict (budget, cannot start, time cap, bad exit, malformed answer, a block whose blockers
+    all failed the evidence rule, spend that cannot be accounted for) raises ReviewFailed: the caller then leaves the
+    status pending. Every attempt that ran is logged with tier "codex" so its cost counts toward the budget."""
+    c = cfg["risky"]["codex"]
+    why = codex_budget_left(cfg)
+    if why:
+        raise ReviewFailed(why)
+    p = cfg["prompt"]
+    req = dataclasses.replace(req, rules=tuple(p["project_rules"]), checklist=p["checklist"], focus="")
+
+    def log(state: str, **kv) -> None:
+        log_line(cfg, repo=req.repo, pr=req.pr, sha=req.sha, tier="codex", state=state, model=c["model"] or "codex",
+                 duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, for_tier=tier_name, **kv)
+
+    try:
+        raw = CodexBackend(c).review(req, c["time_cap_s"])
+    except ReviewFailed as e:
+        log("not-run", why=str(e)[:200])
+        raise
+    usage = raw.usage
+    try:
+        if c["daily_budget_usd"] is not None and usage.get("cost_usd") is None:
+            raise ReviewFailed("codex reported no token usage, so its cost cannot be counted against the budget")
+        v = parse_verdict(raw.answer, req.sha)
+        n = 0
+        if p["require_evidence"]:
+            v, n = apply_evidence(v, req.diff, req.worktree)
+        if v.verdict == "block" and in_pr_blockers(v, req.diff) == 0:
+            # every blocker was downgraded by the evidence rule or cites a file outside the PR (decide() drops it):
+            # a block that leaves nothing standing must never become a success
+            raise ReviewFailed("codex said block but none of its blockers could be verified in this PR")
+    except ReviewFailed as e:
+        log("not-run", why=str(e)[:200], usage=usage)
+        raise
+    log("reviewed", usage=usage, blocking=sum(f.severity == "blocking" for f in v.findings), downgraded=n,
+        findings=log_findings(v.findings))
+    return v, usage, raw.model, n
+
+
 def make_backend(cfg: dict, tier: dict) -> Backend:
     name = tier["backend"]
     ctor: Callable[[dict, str], Backend] = {"gateway": GatewayBackend, "claude": ClaudeBackend, "pi": PiBackend}[name]
@@ -838,6 +1052,22 @@ def git(args: list[str], cwd: Path | str) -> str:
     return p.stdout.decode("utf-8", "replace").strip()
 
 
+def is_git_clone(path: Path) -> bool:
+    """`path` is the root of a usable repository, bare or with a work tree. Asked of git itself, so a bare clone
+    (no `.git` entry) passes and a `.git` file pointing nowhere, or a directory merely inside another repo, fails."""
+    if not path.is_dir():
+        return False
+    env = child_env()
+    p = subprocess.run(["git", "rev-parse", "--absolute-git-dir", "--is-bare-repository"], cwd=path,
+                       capture_output=True, timeout=60, env=env)
+    out = p.stdout.decode("utf-8", "replace").split()
+    if p.returncode != 0 or len(out) != 2:
+        return False
+    git_dir, bare = Path(out[0]).resolve(), out[1] == "true"
+    root = path.resolve()
+    return git_dir == root if bare else (root / ".git").exists()
+
+
 class Worktree:
     """A fresh detached worktree of exactly the pinned head, read-only fetched, removed afterwards."""
 
@@ -845,8 +1075,8 @@ class Worktree:
         """replay=True is for the replay harness: the head need only be reachable from refs/pull/N/head (a PR's older
         head, not its latest), `base_sha` (if given) fixes the base, and the fetched refs have their own names."""
         clone = cfg["clone"]
-        if not clone or not (ai.expand(clone) / ".git").exists():
-            raise Refused("config: clone must name a git clone (the claude and pi backends need one)")
+        if not clone or not is_git_clone(ai.expand(clone)):
+            raise Refused("config: clone must name a git clone, bare or not (the claude and pi backends need one)")
         if not BASE_RE.fullmatch(base_ref):
             raise ReviewFailed("the PR's base ref is not a plain branch name")
         self.clone, self.pr, self.sha, self.base_ref = ai.expand(clone), pr, sha, base_ref
@@ -987,6 +1217,28 @@ def log_findings(findings: tuple[Finding, ...]) -> list[dict]:
              **({"downgraded": True} if f.downgraded else {})} for f in findings[:LOG_FINDINGS_MAX]]
 
 
+def spent_today_usd(cfg: dict, tier_name: str) -> float:
+    """The cost_usd the tier's reviews logged in reviews.jsonl since 00:00 UTC today (any state: a partial or dry-run
+    review spent money too). Unreadable lines and lines without a numeric cost count as zero."""
+    today = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d")
+    total = 0.0
+    try:
+        lines = (ai.expand(cfg["state_dir"]) / "reviews.jsonl").read_text(errors="replace").splitlines()
+    except OSError:
+        return 0.0
+    for raw in lines:
+        try:
+            e = json.loads(raw)
+            cost = e["usage"]["cost_usd"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        if (isinstance(e, dict) and e.get("tier") == tier_name and str(e.get("ts", "")).startswith(today)
+                and isinstance(cost, (int, float)) and not isinstance(cost, bool)
+                and math.isfinite(cost)):                   # a NaN/inf cost would poison the sum: count it as zero
+            total += cost
+    return total
+
+
 def log_line(cfg: dict, **kv) -> None:
     kv = {"ts": dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), **kv}
     line = ai.redact(json.dumps(kv))
@@ -1067,11 +1319,16 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
         if state.cooling(key, sha, cfg) and not force:
             ai.say(f"{key}: cooling down after repeated failures; skipped")
             return SKIPPED
-        if tier_name == "tier2":
+        if tier_name == "tier2" and cfg["gates"]["wait_for_green"]:
             green, missing = gates_green(gh, repo, sha, cfg["gates"]["required"], cfg["gates"]["when_present"])
             if not green:
                 ai.say(f"{key} @ {sha[:12]}: waiting for gates: {', '.join(missing)}")
                 return SKIPPED
+        budget = tier.get("daily_budget_usd")
+        if budget is not None and (spent := spent_today_usd(cfg, tier_name)) >= budget:
+            ai.say(f"{key} @ {sha[:12]}: {tier_name} daily budget exhausted (${spent:.2f} of ${budget:.2f} spent today, "
+                   "UTC); review skipped, status unchanged")
+            return SKIPPED
         backend = make_backend(cfg, tier)
         try:
             return _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started)
@@ -1081,12 +1338,14 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
                 count = old.get("failures", 0) + 1 if old.get("failure_sha") == sha else 1
                 state.put(key, failures=count, last_failure=time.time(), failure_sha=sha)
             log_line(cfg, repo=repo, pr=n, sha=sha, tier=tier_name, state="not-run", model=tier["model"],
-                     duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=str(e)[:200])
+                     duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=str(e)[:200],
+                     **({"usage": e.usage} if getattr(e, "usage", None) else {}))
             raise
     except HeadMoved as e:
         ai.say(f"{repo}#{n}: {e}; nothing posted (a new run handles the new head)")
         log_line(cfg, repo=repo, pr=n, sha=sha, tier=tier_name, state="head-moved", model=tier["model"],
-                 duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=str(e)[:200])
+                 duration_s=round(time.monotonic() - started, 1), dry_run=not post_on, why=str(e)[:200],
+                 **({"usage": e.usage} if getattr(e, "usage", None) else {}))
         return MOVED
     finally:
         held.close()
@@ -1128,6 +1387,7 @@ def run_passes(cfg: dict, tier: dict, backend: Backend, req: ReviewRequest, root
     deadline = time.monotonic() + tier["time_cap_s"]
     verdicts, usages, info, models, down, failed, said_block = [], [], [], [], 0, [], False
     for i, ps in enumerate(passes):
+        raw = None                                      # before the cap check: never reuse the previous pass's result
         remaining = deadline - time.monotonic()
         try:
             if remaining <= 0:
@@ -1135,7 +1395,10 @@ def run_passes(cfg: dict, tier: dict, backend: Backend, req: ReviewRequest, root
             raw = backend.review(dataclasses.replace(req, focus=ps["focus"]), remaining / (len(passes) - i))
             v = parse_verdict(raw.answer, req.sha)
         except ReviewFailed as e:
+            if raw is not None:                         # the model ran and billed even though its answer was unusable
+                usages.append(raw.usage)
             if not verdicts:
+                e.usage = _sum_usage(usages)
                 raise
             failed.append(f"pass {ps['name']} did not complete: {str(e)[:150]}")
             info.append({"name": ps["name"], "error": ai.redact(str(e))[:200]})
@@ -1157,30 +1420,75 @@ def run_passes(cfg: dict, tier: dict, backend: Backend, req: ReviewRequest, root
     return PassesResult(merged, "+".join(dict.fromkeys(models)), _sum_usage(usages), info, down, "; ".join(failed), unverified)
 
 
+DIFF_TOO_LARGE_RE = re.compile(r"exceeded the maximum number of lines|diff_too_large|too_large|HTTP 406")
+
+
+def github_diff(gh, repo: str, n: int) -> str | None:
+    """The PR's diff from GitHub, or None when GitHub refuses it as too large (over 20,000 lines; `gh pr diff` then
+    fails with HTTP 406). Any other failure still raises."""
+    try:
+        return gh.diff(repo, n)
+    except ReviewFailed as e:
+        if DIFF_TOO_LARGE_RE.search(str(e)):
+            return None
+        raise
+
+
+def local_diff(wt: Worktree) -> str:
+    """The same three-dot diff GitHub shows: merge base to the pinned head, from the worktree's own objects."""
+    return git(["diff", "--no-color", "--no-ext-diff", wt.base_sha, wt.sha], wt.path) + "\n"
+
+
 def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started) -> int:
     global LAST_RESULT
     context = tier["context"]
-    diff = gh.diff(repo, n)
+    diff = github_diff(gh, repo, n)                  # None: too large for GitHub; read it from the worktree instead
     if gh.head(repo, n) != sha:
         raise HeadMoved("the head moved while the diff was read")
-    files = ai.parse_diff(diff)
-    if not files:
+    files = ai.parse_diff(diff) if diff is not None else []
+    if diff is not None and not files:
         raise ReviewFailed("the diff is empty")
     index = {f.path: f for f in files}
+    risky = tier_name == "tier2" and bool(risky_paths(cfg, files))
+    if risky and (why := codex_budget_left(cfg)):
+        ai.say(f"{key} @ {sha[:12]}: {why}; review skipped, status unchanged")
+        return SKIPPED
     if post_on:
         gh.write("POST", f"repos/{repo}/statuses/{sha}",
                  {"state": "pending", "context": context, "description": ai.fit(f"Review running ({tier['model']})")})
-    req = ReviewRequest(repo, n, sha, str(pr.get("title", "")), str(pr.get("body") or ""), "", diff,
+    req = ReviewRequest(repo, n, sha, str(pr.get("title", "")), str(pr.get("body") or ""), "", diff or "",
                         sorted(index))
-    if backend.needs_worktree:
+    codex: tuple[Verdict, dict, str, int] | None = None
+    if backend.needs_worktree or diff is None or risky:
         with Worktree(cfg, n, sha, str(pr.get("baseRefName", "main"))) as wt:
+            if diff is None:
+                req.diff = local_diff(wt)
+                files = ai.parse_diff(req.diff)
+                if not files:
+                    raise ReviewFailed("the diff is empty")
+                index = {f.path: f for f in files}
+                req.files = sorted(index)
+                risky = tier_name == "tier2" and bool(risky_paths(cfg, files))
+                ai.say(f"{repo}#{n}: the diff is over GitHub's limit; reviewing the local diff of {len(files)} files")
             req.worktree, req.base_sha = wt.path, wt.base_sha
             req.log = git(["log", "--format=%h %s", f"{wt.base_sha}..{sha}"], wt.path)
-            result = run_passes(cfg, tier, backend, req, wt.path)
+            result = run_passes(cfg, tier, backend, req, wt.path if backend.needs_worktree else None)
+            # Risky paths: Opus must have approved cleanly first (a block already decides failure, and an incomplete
+            # review stays pending), then Codex reviews the same head and its verdict is merged in.
+            if risky and not result.partial and not result.unverified and decide(
+                    result.verdict, index, "", result.downgraded).state == "success":
+                try:
+                    codex = codex_review(cfg, req, tier_name, post_on, started)
+                except ReviewFailed as e:
+                    e.usage = result.usage              # Opus ran and billed; Codex logged its own spend
+                    raise
     else:
         result = run_passes(cfg, tier, backend, req, None)
-    verdict = result.verdict
-    decision = decide(verdict, index, ai.redact(result.model), result.downgraded)
+    verdict, label, downgraded = result.verdict, ai.redact(result.model), result.downgraded
+    if codex is not None:
+        verdict = merge_verdicts([verdict, codex[0]], sha)
+        label, downgraded = f"{label}+{ai.redact(codex[2])}", downgraded + codex[3]
+    decision = decide(verdict, index, label, downgraded)
     incomplete = result.partial or (result.unverified and tier_name == "tier2")
     if incomplete and decision.state != "failure":
         # Never success: the findings are kept in the log, the status stays pending (a partial review, or a block
@@ -1194,7 +1502,9 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
                  findings=log_findings(verdict.findings))
         raise ReviewFailed(f"{why}; status stays pending")
     if gh.head(repo, n) != sha:
-        raise HeadMoved("the head moved during the review")
+        moved = HeadMoved("the head moved during the review")
+        moved.usage = result.usage                      # the model ran: the spend counts toward the daily budget
+        raise moved
     url = None
     if decision.state == "failure" and tier["comment"]:
         url = upsert_comment(gh, repo, n, context, comment_text(context, sha, decision))
@@ -1768,6 +2078,10 @@ def _poll_one(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool) -> 
 
 
 def show_command(cfg: dict, tier_name: str) -> int:
+    if tier_name == "codex":
+        argv = CodexBackend(cfg["risky"]["codex"]).argv(Path("SCHEMA.json"), Path("ANSWER.txt"), Path("WORKTREE"))
+        print(shlex.join(argv))
+        return OK
     tier = cfg["tiers"][tier_name]
     req = ReviewRequest("OWNER/NAME", 1, "0" * 40, "title", "body", "1" * 40, "", ["a.py"])
     b = make_backend(cfg, tier)
@@ -1793,7 +2107,7 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--tier", choices=["tier1", "tier2", "all"], default="all")
     r.add_argument("--force", action="store_true", help="review even a head that already has a terminal status")
     s = sub.add_parser("show-command", help="print the reviewer's command line without running it")
-    s.add_argument("--tier", choices=["tier1", "tier2"], required=True)
+    s.add_argument("--tier", choices=["tier1", "tier2", "codex"], required=True)
     rp = sub.add_parser("replay", help="score a reviewer tier against a corpus of known outcomes; never posts")
     rp.add_argument("--corpus")
     rp.add_argument("--tier", choices=["tier1", "tier2"])

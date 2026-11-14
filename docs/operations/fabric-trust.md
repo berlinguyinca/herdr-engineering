@@ -286,7 +286,7 @@ sudo deploy/control-plane/collab-fabric-firewall.sh --remove
 It inserts, in `DOCKER-USER` (forwarded traffic) and in `INPUT` (traffic to the host itself, which `DOCKER-USER` never sees), a rule that drops every NEW
 connection whose source is the fabric subnet. Inbound connections to the published port are untouched (their source is the caller) and so are their replies.
 The network has no IPv6, so no `ip6tables` rule applies. The rules are kernel state: re-run `--install` at boot (a oneshot unit `After=docker.service`) and
-after anything that flushes iptables. `deploy.sh` only warns while `--check` does not succeed (it cannot install them: root); it never fails the deploy.
+after anything that flushes iptables. `deploy.sh` runs `--check` as the deploy user (it cannot install the rules: root): exit 1 (absent) prints a WARNING with the install command; exit 2 (unreadable without root) prints a one-line NOTE with `sudo <script> --check` (and says so if the boot unit is enabled); it never fails the deploy.
 Verify: from `docker exec herdr-collab-public` open a TCP connection to the host's tailnet IP; it must hang, not connect.
 
 ### Boot order: docker must start after the tailnet address exists
