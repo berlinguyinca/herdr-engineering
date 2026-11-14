@@ -20,10 +20,12 @@ Rules this module keeps:
 """
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
 import re
+import select
 import shutil
 import signal
 import socket
@@ -397,6 +399,42 @@ def emit_event(state_dir: Path | str, event: str, **fields: Any) -> bool:
         return False
 
 
+def _wait_without_reaping(pid: int) -> None:
+    """Observe our child's exit while retaining its PID and wait4 accounting."""
+    if sys.platform != "darwin":
+        while True:
+            try:
+                os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+                return
+            except InterruptedError:
+                continue
+    # Python 3.12 on macOS has kqueue but no os.waitid. An already-exited child
+    # can report ESRCH on registration. We still own its unreaped PID, so this
+    # is exit evidence; wait4 below remains the sole status/resource collector.
+    queue = select.kqueue()
+    try:
+        changes = [select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                                flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                fflags=select.KQ_NOTE_EXIT)]
+        while True:
+            try:
+                events = queue.control(changes, 1, None)
+                changes = []
+            except InterruptedError:
+                continue
+            except ProcessLookupError:
+                return
+            for event in events:
+                if event.flags & select.KQ_EV_ERROR:
+                    if event.data == errno.ESRCH:
+                        return
+                    raise OSError(event.data, os.strerror(event.data))
+                if event.fflags & select.KQ_NOTE_EXIT:
+                    return
+    finally:
+        queue.close()
+
+
 def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
                  slot: int | None = None, cwd: str | None = None,
                  emit: bool = True, env: dict[str, str] | None = None,
@@ -491,12 +529,7 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
         # Wait WITHOUT reaping: while the child is a zombie its pid cannot be
         # recycled, so signal forwarding and the heartbeat/cancel thread are
         # shut down first and only then is the pid released with wait4.
-        while True:
-            try:
-                os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
-                break
-            except InterruptedError:
-                continue
+        _wait_without_reaping(pid)
         exited.set()
         if run is not None:
             run.halt()
@@ -510,8 +543,8 @@ def run_measured(cmd: list[str], *, state_dir: Path | str | None = None,
         exited.set()
         stop.set()
         th.join(timeout=1)
-        for s, h in old.items():
-            signal.signal(s, h)
+        for signum, handler in old.items():
+            signal.signal(signum, handler)
     proc.returncode = 0  # reaped via wait4; keep Popen from re-waiting
     elapsed = time.monotonic() - t0
     code = _exit_code(status)

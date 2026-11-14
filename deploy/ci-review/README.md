@@ -60,8 +60,12 @@ is refused, and nothing from models.json is run.
   reasoning tokens keep a slow answer alive. Only `content` deltas count as the answer; `reasoning_content` is
   ignored.
 - `finish_reason=length` or an empty answer is retried once, then the chunk fails.
-- 429, 5xx and connection errors are retried 4 times, with a backoff of 5 s doubling each time. A `Retry-After`
+- 5xx and connection errors are retried 4 times, with a backoff of 5 s doubling each time. A `Retry-After`
   header wins, capped at 60 s.
+- 429 means the model's single slot is taken (deepseek and qwen serve one request at a time; another review may
+  hold the slot for minutes). It is waited out separately, for up to `reviewer.busy_wait_s` (default 1800 s) in
+  total, and does not use up `retries`. If the gateway stays busy past that, the run fails and posts no terminal
+  status; `poll` retries the head once its pending status goes stale.
 - The answer's `model` field must also be of an independent family. The status names that id.
 - Chunks run one at a time (`reviewer.parallel: 1`), because the gateway is shared.
 
@@ -140,7 +144,7 @@ decides the state" rule. `ai-review.py` itself keeps working unchanged (the gate
 | Tier | Default context | Backend (config) | When it runs | Required? |
 |---|---|---|---|---|
 | tier1 | `Open-weight pre-review` | `pi` with an open-weight alias | every non-draft head | no, advisory |
-| tier2 | `Opus agent review` | `claude` with `opus` | only when every `gates.required` name is success on that exact SHA and every existing `gates.when_present` check is success | yes, once the ruleset is changed by the operator |
+| tier2 | `Opus agent review` | `claude` with `opus` | every non-draft head, without waiting for checks; with `gates.wait_for_green: true`, only when every `gates.required` name is success on that exact SHA and every existing `gates.when_present` check is success | yes, once the ruleset is changed by the operator |
 
 Backends (`tiers.<t>.backend`, settings under `backends.<name>`):
 
@@ -188,7 +192,9 @@ always-on-review.py poll --config CFG                                           
 always-on-review.py poll --config CFG --post                                     # posts only if CFG has post: true
 ```
 
-Gates: `gates.required` names must be present and `success`; `neutral` and `skipped` do not count as green. A
+Gates: by default tier 2 does not wait for green checks, so Opus can review every pushed head. Set
+`gates.wait_for_green: true` (YAML only; it must be a boolean) to restore the green-only gate, and then
+`gates.required` is mandatory. With it on, `gates.required` names must be present and `success`; `neutral` and `skipped` do not count as green. A
 `gates.when_present` name (a pipeline that only runs on some PRs, such as `ui-gates`) may be absent or neutral/skipped,
 but when it exists it must be `success`: pending or failed blocks tier 2.
 

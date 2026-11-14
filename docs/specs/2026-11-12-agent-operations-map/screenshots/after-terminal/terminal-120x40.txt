@@ -1,0 +1,40 @@
+HERDR / AGENT OPERATIONS  [LIVE]  Activity
+5 agents  1 rooms  7 edges  4 tasks
+fleet ctx 75% (2/5)  hosts 4: dev-02 ? ctx 68%  dev-03 ? ctx unknown  mac-01 ? ctx 82%  mac-02 ? ctx unknown 
+┏ Map · Activity ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓ ╭ Tasks ───────────────────────────────╮
+┃                            ╭────────────────────╮                           ┃ │api-impl owner:claude                 │
+┃                            │ ● ▸claude          │                           ┃ │  by:qwen rev:opus                    │
+┃                            │ opus-4.1 working   │                           ┃ │  ~drift? repeated_tool_failures,repo…│
+┃                    ━━━━◉━━━│ [█████████░░] 82%! │╍╍╍╍╍╍╍                    ┃ │docs owner:?                          │
+┃                    ┃       ╰─ ~drift? ──────────╯      ╏                    ┃ │  by:- rev:-                          │
+┃                    ┃                         ✗›        ╏                    ┃ │  ~drift? handoff_failed,handoff_fail…│
+┃delegate · api-impl ┃             message · ui║│        ╏ ~delegate · ui     ┃ ╰──────────────────────────────────────╯
+┃                    ▶                         ║│        ▶                    ┃ ╭ Agents ──────────────────────────────╮
+┃ ╭────────────────────╮                       ║│      ╭────────────────────╮ ┃ │claude   opus-4.1   working   82%     │
+┃ │ ● qwen             │                       ║───◉───│ ● codex            │ ┃ │codex    gpt-4o     working   ctx ?   │
+┃ │ qwen3-72b working  │                       ══║     │ gpt-4o working     │ ┃ │gem      model ?    ended     ctx ?   │
+┃ │ [████████░░░░] 68% │    ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌║╌╌╌╌╌│ ctx unknown        │ ┃ │opus     model ?    disconne… ctx ?   │
+┃ ╰─ ~drift? ──────────╯    ╎     handoff STALLED║     ╰─ ~drift? ──────────╯ ┃ │qwen     qwen3-72b  working   68%     │
+┃             ┆             ╎ ╭┈ room …z23w9q ┈╮ ║                            ┃ │                                      │
+┃             ┆             ╎ ┊   5 members    ┊ ║                            ┃ │                                      │
+┃             ┆             ╎ ╰┈ ctx 75% 2/5 ┈┈╯ ║ handoff FAILED · docs      ┃ │                                      │
+┃             ┆             ╎                    ║                            ┃ ╰──────────────────────────────────────╯
+┃             ┆ ~review     ╎                    ║                            ┃ ╭ Recent activity ─────────────────────╮
+┃             ┆             ╎                    ║                            ┃ │12:43:25 handoff gem → claude failed  │
+┃             ┆             ╎                    ║                            ┃ │12:43:24 handoff codex → opus stalled │
+┃             ┆             ╎                    ║                            ┃ │12:43:18 communication codex → claude…│
+┃             ◇             ⇒                    ║                            ┃ │12:43:17 review qwen → opus planned   │
+┃           ╭────────────────────╮           ╭────────────────────╮           ┃ │12:43:16 delegation claude → codex pl…│
+┃           │ × opus             │           │ × gem              │           ┃ │12:43:15 delegation claude → qwen acc…│
+┃           │ mode… disconne…    │           │ model ? ended      │           ┃ │12:43:14 ownership claude → claude tr…│
+┃           │ ctx unknown        │           │ ctx unknown        │           ┃ │12:43:10 codex model ? → gpt-4o       │
+┃           ╰─ ~drift?2 ─────────╯           ╰─ ~drift? ──────────╯           ┃ │12:43:06 qwen model ? → qwen3-72b     │
+┃                                                                             ┃ │12:43:02 claude model ? → opus-4.1    │
+┃                                                                             ┃ │                                      │
+┃──›comm ━━▶dele ══⇒hand ──◇revi ┈┈●owne  ╌╌ planned  ╌╌ stalled  ✗ failed    ┃ │                                      │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛ ╰──────────────────────────────────────╯
+╭ Timeline ────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│●───────────────────●───────────────────●────────────────────●────●────●────●────●─────────────────────────────●─────●│
+│live · 12:43:25                                                                                                       │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Tab pane  ←↑↓→ nodes  ⏎ inspect  h handoffs  t timeline  r replay  f filter  m modes  ? help  q quit

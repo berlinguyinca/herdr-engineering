@@ -320,7 +320,7 @@ class ControlPlaneServer:
                  assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None, build_cache=None,
-                 memory_adapter=None, memory_config=None, unified_workspace_config=None, work_center_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
+                 memory_adapter=None, memory_config=None, unified_workspace_config=None, work_center_config=None, agent_ops_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
                  share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None, library=None,
                  library_viewers=None, member_directory=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
@@ -445,6 +445,18 @@ class ControlPlaneServer:
         # work_center_v1 (WC-006): gates every Work Command Center UI surface in the dashboard (This week card, session Work Context
         # header, board "Open in Herdr" links). Advertisement only; no route consumes it. YAML-only, strict True, default off.
         self.work_center_enabled = isinstance(work_center_config, dict) and work_center_config.get("enabled") is True
+        # agent_ops_v1 (docs/specs/2026-11-12-agent-operations-map): the read-only Agent Operations projection routes.
+        # YAML-only, strict True, default off; off means 404 and no capability.
+        self.agent_ops_enabled = isinstance(agent_ops_config, dict) and agent_ops_config.get("enabled") is True
+        self.agent_ops_poll_seconds = 1.0
+        self.agent_ops_reauth_seconds = 30.0          # a live stream re-checks its credential this often
+        self.agent_ops_streams = threading.BoundedSemaphore(16)   # concurrent SSE readers; each tick is a full gather
+        per_caller = agent_ops_config.get("streams_per_principal") if isinstance(agent_ops_config, dict) else None
+        # ...of which one caller (person, agent or key) may hold this many (config streams_per_principal, default 4)
+        self.agent_ops_streams_per_principal = per_caller if isinstance(per_caller, int) and not isinstance(per_caller, bool) and per_caller >= 1 else 4
+        self._agent_ops_stream_counts: dict[str, int] = {}
+        self._agent_ops_stream_lock = threading.Lock()
+        self.agent_ops_skipped_frames = 0              # stored events whose cursor could not be framed safely
         self._summary_stop = threading.Event()
         self._summary_scanner = None
         if not collab_only:
@@ -641,6 +653,8 @@ class ControlPlaneServer:
         from .single_flight_cache import SingleFlightCache
         self.ci_reports_cache = SingleFlightCache(ttl=15.0)     # /api/v1/ci/reports, see single_flight_cache.py
         self.collab = collab
+        from .agent_ops import AgentOpsService
+        self.agent_ops = AgentOpsService(repo, handoffs=self.handoffs, collab_source=lambda: self.collab)
         if self.assistant.host_candidates is None:       # looked up per call: `collab` may be swapped after startup
             self.assistant.host_candidates = lambda: (
                 self.collab.assistant_runtime_host_candidates() if self.collab is not None else [])
@@ -1684,6 +1698,8 @@ class ControlPlaneServer:
             caps.append("unified_workspace_v1")
         if getattr(self, "work_center_enabled", False):
             caps.append("work_center_v1")
+        if getattr(self, "agent_ops_enabled", False):
+            caps.append("agent_ops_v1")
         if getattr(self, "skills", None) is not None:
             caps.append("skill_registry_v1")
         if getattr(self, "build_cache", None) is not None:
@@ -4130,6 +4146,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 if what in ("stats", "timeseries", "errors", "spend") and len(parts) == 5:
                     return self._llm_stats(what)
                 return self._json({"error": "not found"}, 404)
+            if resource == "agent-ops":
+                return self._agent_ops(parts[4:])
             if resource == "graph":
                 return self._graph_get(parts)
             if resource == "steering":
@@ -5982,6 +6000,134 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 if view is not None:
                     out = {**out, **view}
             return self._json(out)
+
+        def _agent_ops_caller(self):
+            """(principal, operator): the collab person/agent behind the request, if any. Room scope comes ONLY from a
+            collab principal (or the single operator's own identity); an API key alone reads no room."""
+            from .collab import CollabError
+            service = server.collab
+            operator = self._role() == "operator"
+            if service is None:
+                return None, operator
+            authorization = self.headers.get("Authorization", "")
+            if authorization:
+                try:
+                    return service.authenticate(authorization, self.headers.get("X-Herdr-Device")), operator
+                except CollabError:
+                    raise PermissionError("unauthorized") from None
+            if operator and server.operator_user and service.auth.exists(server.operator_user):
+                from .collab import Principal
+                pr = Principal("user", server.operator_user, server.operator_user)
+                pr.admin = pr.approver = True
+                return pr, operator
+            return None, operator
+
+        def _agent_ops(self, sub):
+            """``/api/v1/agent-ops/{snapshot,events,replay,stream}``: metadata-only, room-authorized, read-only. Off (default)
+            it is a 404 like any unknown route."""
+            if not getattr(server, "agent_ops_enabled", False) or len(sub) != 1 or sub[0] not in (
+                    "snapshot", "events", "replay", "stream"):
+                return self._json({"error": "not found"}, 404)
+            try:
+                principal, operator = self._agent_ops_caller()
+            except PermissionError:
+                return self._json({"error": "unauthorized"}, 401)
+            from .agent_ops import PAGE_MAX, valid_cursor
+            service = server.agent_ops
+            query = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+            cursor = query.get("cursor") or self.headers.get("Last-Event-ID") or None
+            if sub[0] == "stream":
+                return self._agent_ops_stream(service, principal, operator, cursor)
+            for given in (query.get("until"), cursor):
+                if given and sub[0] in ("events", "replay") and not valid_cursor(given):
+                    return self._json({"error": "invalid cursor: take one from the cursor field of a snapshot or event "
+                                                "row (re-fetch the snapshot)"}, 400)
+            viewer = service.viewer(principal, operator)
+            if sub[0] == "snapshot":
+                return self._json(service.snapshot(viewer, principal))
+            if sub[0] == "replay":
+                return self._json(service.replay(viewer, principal, query.get("until") or cursor))
+            try:
+                limit = int(query.get("limit", 100))
+            except ValueError:
+                return self._json({"error": "limit must be an integer"}, 400)
+            return self._json(service.events(viewer, principal, cursor, min(max(limit, 1), PAGE_MAX)))
+
+        def _agent_ops_stream(self, service, principal, operator, cursor):
+            """SSE with cursor resume (``?cursor=`` or ``Last-Event-ID``). Access is re-evaluated on every tick (a revoked
+            room stops flowing at once) and the credential itself every ``agent_ops_reauth_seconds`` (a revoked key, token
+            or disabled person ends the stream); the queue is the bounded page read each tick (no unbounded subscriber
+            queue), and the number of concurrent streams is capped."""
+            from .agent_ops import STREAM_PAGE, valid_cursor
+            reset = cursor is not None and not valid_cursor(cursor)
+            # open mode (no API keys) has no identity: one shared bucket, never one per (attacker-chosen) header value
+            caller = f"p:{principal.id}" if principal is not None else "open" if not server._keys else \
+                "k:" + hashlib.sha256(self.headers.get("X-API-Key", "").encode()).hexdigest()
+            with server._agent_ops_stream_lock:
+                if server._agent_ops_stream_counts.get(caller, 0) >= server.agent_ops_streams_per_principal:
+                    return self._json({"error": "too many agent-ops streams for this caller"}, 503)
+                if not server.agent_ops_streams.acquire(blocking=False):
+                    return self._json({"error": "too many agent-ops streams"}, 503)
+                server._agent_ops_stream_counts[caller] = server._agent_ops_stream_counts.get(caller, 0) + 1
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                self.close_connection = True
+                try:
+                    self.connection.settimeout(30)
+                except OSError:
+                    pass
+                started = last_write = last_auth = time.monotonic()
+                try:
+                    if reset:        # an unusable Last-Event-ID is ignored: say so, then continue from the current snapshot
+                        cursor = service.snapshot(service.viewer(principal, operator), principal)["cursor"]
+                    self.wfile.write(
+                        f"event: connected\ndata: {json.dumps({'cursor': None, 'reset': True} if reset else {'cursor': cursor})}\n\n".encode())
+                    self.wfile.flush()
+                    while time.monotonic() - started < _MAX_SSE_SECONDS:
+                        if time.monotonic() - last_auth >= server.agent_ops_reauth_seconds:
+                            last_auth = time.monotonic()
+                            try:
+                                if self._role() is None:
+                                    raise PermissionError("unauthorized")
+                                principal, operator = self._agent_ops_caller()
+                            except PermissionError:
+                                self.wfile.write(b"event: revoked\ndata: {}\n\n")
+                                self.wfile.flush()
+                                break
+                        page = service.events(service.viewer(principal, operator), principal, cursor, STREAM_PAGE,
+                                              cached=True)
+                        for ev in page["events"]:
+                            frame_id = ev["cursor"]
+                            if any(c in frame_id for c in "\r\n\0"):
+                                server.agent_ops_skipped_frames += 1
+                                continue          # never let a stored id forge or split an SSE frame
+                            self.wfile.write(f"id: {frame_id}\ndata: {json.dumps(ev)}\n\n".encode())
+                        if page["events"]:
+                            cursor = page["next_cursor"]
+                            self.wfile.flush()
+                            last_write = time.monotonic()
+                            if page["has_more"]:
+                                continue
+                        elif time.monotonic() - last_write >= _SSE_IDLE_SECONDS:
+                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.flush()
+                            last_write = time.monotonic()
+                        time.sleep(server.agent_ops_poll_seconds)
+                except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                    pass
+            finally:
+                server.agent_ops_streams.release()
+                with server._agent_ops_stream_lock:
+                    left = server._agent_ops_stream_counts.get(caller, 1) - 1
+                    if left > 0:
+                        server._agent_ops_stream_counts[caller] = left
+                    else:
+                        server._agent_ops_stream_counts.pop(caller, None)
+            return None
 
         def _work_graph(self, sub, body=None):
             """``/api/v1/graph/work/*`` (unified workspace P02): the persistent Work Graph. Off (default) it is a 404 like any

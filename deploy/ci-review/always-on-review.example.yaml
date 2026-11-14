@@ -11,11 +11,14 @@ state_dir: ~/.local/state/herdr-review   # locks, state.json (cooldowns), review
 post: false                              # key 1 of 2 for posting; key 2 is the --post flag
 clone: ~/IdeaProjects/herdr-engineering  # a clone with `origin` = GitHub; claude/pi get a detached worktree of the PR head
 
-# Tier 2 runs only on a head whose gates are green on that exact SHA (commit status context or check-run name).
+# By default tier 2 reviews a head without waiting for its checks. Set wait_for_green: true to restore the
+# green-only gate: tier 2 then runs only on a head whose gates are green on that exact SHA (commit status context
+# or check-run name). required/when_present are read only when wait_for_green is true.
 #   required:     each name must be PRESENT and success. neutral/skipped is NOT green. Empty is refused for tier 2.
 #   when_present: optional checks (some pipelines only run on some PRs): absent is fine, neutral/skipped is fine,
 #                 but if the check exists it must be success; pending or failed blocks tier 2.
 gates:
+  wait_for_green: false                  # true = review only green heads (then `required` must not be empty)
   required:
     - ci/woodpecker/pr/artifact-handoff
     - ci/woodpecker/pr/structural-gates
