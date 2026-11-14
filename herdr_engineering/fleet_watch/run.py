@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from ..control_plane.fleet_rollout import validate_fleet_rollout
-from . import events, state
+from . import core, events, lock, state
 
 DEFAULT_REMOTE_BIN = "$HOME/.local/bin/herdr-eng"
 DEFAULT_TIMEOUTS = {"precheck": 60.0, "apply": 1800.0, "health": 120.0, "rollback": 600.0}
@@ -160,6 +160,7 @@ class Runner:
     transport: SshTransport
     rollback_scope: str = "failed_host"
     timeouts: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_TIMEOUTS))
+    lock_path: Path | None = None             # fleet.lock.yaml moved after a rollout succeeded (spec section 7); None = never
 
     def __post_init__(self) -> None:
         if self.rollback_scope not in ROLLBACK_SCOPES:
@@ -196,6 +197,16 @@ class Runner:
         if rollout.get("announced"):
             self._emit(rid, "rollout.resumed", **({"reason": "operator"} if operator else {}))
         return self.run(saved, rid)
+
+    def abandon(self, saved: dict, rid: str) -> None:
+        """Operator decision (spec 6.1): a halted rollout is given up. Nothing runs, converged and the lock stay put;
+        newer heads are unblocked, and the same heads are not planned again."""
+        rollout = saved["rollouts"][rid]
+        if rollout.get("halt") and not rollout.get("halt_emitted"):          # the halt a crash swallowed
+            self._emit_halted(saved, rid, rollout)
+        rollout["status"] = "abandoned"
+        state.save(saved, self.directory)
+        self._emit(rid, "rollout.abandoned", reason="operator")
 
     def supersede(self, saved: dict, rid: str) -> None:
         saved["rollouts"][rid]["status"] = "superseded"
@@ -267,10 +278,43 @@ class Runner:
                 self._emit_halted(saved, rid, rollout)
             return "halted"
         rollout["status"] = "succeeded"
+        rollout["lock"] = "pending"                # saved with the success: a crash before the pin is repaired later
         saved["converged"].update(rollout["targets"])
         state.save(saved, self.directory)
         self._emit(rid, "rollout.succeeded")
+        self._pin_lock(saved, rid, rollout)
         return "succeeded"
+
+    # -- fleet.lock.yaml (spec section 7) ------------------------------------------------------------
+
+    def settle_locks(self, saved: dict) -> None:
+        """Finish the lock move of a rollout whose success was saved but whose pin outcome was lost to a crash."""
+        for rid, rollout in saved["rollouts"].items():
+            if rollout.get("status") == "succeeded" and rollout.get("lock") == "pending":
+                self._pin_lock(saved, rid, rollout)
+
+    def _pin_lock(self, saved: dict, rid: str, rollout: dict) -> None:
+        """Move the lock to the converged targets: only after success, only through `lock.pin_repos` (D3 history
+        check, no downgrade). A refusal is recorded and emitted; it never undoes the converged rollout."""
+        targets = [{"repo": short(repo), "sha": sha, **({"before": rollout["before"][repo]}
+                                                         if rollout["before"].get(repo) else {})}
+                   for repo, sha in rollout["targets"].items()]
+        if self.lock_path is None or not self.lock_path.exists():
+            rollout["lock"] = "absent"             # the operator's lock is never invented by a rollout
+            state.save(saved, self.directory)
+            self._emit(rid, "lock.refused", targets=targets, reason="lock_invalid")
+            return
+        try:
+            lock.pin_repos(rollout["targets"], self.lock_path, directory=self.directory, base=core.git_base())
+        except lock.LockRefused as exc:
+            outcome, extra = "refused", {"reason": exc.reason}
+        except OSError:
+            outcome, extra = "refused", {"reason": "lock_invalid"}
+        else:
+            outcome, extra = "pinned", {}
+        rollout["lock"] = outcome
+        state.save(saved, self.directory)
+        self._emit(rid, "lock.pinned" if outcome == "pinned" else "lock.refused", targets=targets, **extra)
 
     @staticmethod
     def _carry(row: dict, host: str) -> str | None:
