@@ -7,6 +7,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Report preview: link-preview metadata, honest share notice, fairer section quotas
 
+- Follow-up to #748 (merged before these review fixes): in a share, per-field truncation markers, the omission notice and the legend no longer point at the unshared descriptor, share wording never pushes the page over the cap, post-hoc replacements in the preview are removed, and quota rounding leftover is distributed instead of dropped.
 - The report preview head now carries `description`, `og:title`, `og:description`, `og:type=article`, `og:site_name` and `twitter:card=summary` (summary cut near 160 characters, falling back to finding/evidence counts; every value attribute-escaped). The CSP and the sanitiser allowlist are unchanged. The tags are dropped only when even the 4 KiB minimum cap cannot hold them.
 - In a share, the truncation notice no longer says "see the full descriptor" (that link was rewritten to plain text because the descriptor is not shared); it now says the full report is available to its owner.
 - Section quotas: unused quota of a section that fits is now handed to sections that overflow, so a 1 MiB preview of 500 evidence rows no longer drops about 16 of them under the fixed 4/2/2/1 weight split. Output still never exceeds the cap.
