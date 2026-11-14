@@ -15,6 +15,7 @@ from herdr_engineering.control_plane.artifact_report_state import (
     ArtifactReportState,
     ReportStateError,
 )
+from tests.control_plane.pg_stop import FAST_TEST_OPTIONS, stop_postgres
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -53,12 +54,11 @@ def report_postgres():
 
         def start():
             subprocess.run([str(bindir / "pg_ctl"), "-D", str(data), "-l", str(area / "server.log"),
-                            "-o", f"-c listen_addresses='' -k {area} -c dynamic_shared_memory_type=mmap", "-w", "start"],
+                            "-o", f"-c listen_addresses='' -k {area} -c dynamic_shared_memory_type=mmap {FAST_TEST_OPTIONS}", "-w", "start"],
                            check=True, capture_output=True)
 
         def stop():
-            subprocess.run([str(bindir / "pg_ctl"), "-D", str(data), "-m", "fast", "-w", "stop"],
-                           check=True, capture_output=True)
+            stop_postgres(bindir / "pg_ctl", data)
 
         def restart():
             stop()

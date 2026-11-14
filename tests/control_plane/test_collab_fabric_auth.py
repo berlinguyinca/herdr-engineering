@@ -25,6 +25,7 @@ from herdr_engineering.fabric_access import TailscaleWhois
 from tests.control_plane.test_collab import BASE, read_frame
 from tests.control_plane.test_collab_fabric_trust import localapi  # noqa: F401
 from tests.control_plane.test_collab_tasks import USERS, W, _digest, code, svc  # noqa: F401
+from tests.io_timeouts import HTTP_TIMEOUT
 
 BENDER, BEAST, STRANGER = "100.64.0.1", "100.64.0.2", "100.64.0.9"
 SUFFIX = "tail1234.ts.net"
@@ -340,7 +341,7 @@ def http_world(fw, request, monkeypatch):
 
 
 def req(w, method, path, *, host=None, headers=None, body=None, public=False):
-    c = http.client.HTTPConnection(host or w.lan, w.public_port if public else w.port, timeout=5)
+    c = http.client.HTTPConnection(host or w.lan, w.public_port if public else w.port, timeout=HTTP_TIMEOUT)
     h = dict(headers or {})
     data = None
     if body is not None:

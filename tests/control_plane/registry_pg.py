@@ -14,6 +14,7 @@ import pytest
 
 from herdr_engineering.control_plane.db import Migrator
 from herdr_engineering.control_plane.rustfs import IntegrityError
+from tests.control_plane.pg_stop import FAST_TEST_OPTIONS, stop_postgres
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -102,10 +103,10 @@ def registry_pg():
             subprocess.run([str(bindir / "pg_ctl"), "-D", str(data), *args], check=True, capture_output=True)
 
         def start():
-            pg_ctl("-l", str(area / "server.log"), "-o", f"-c listen_addresses='' -k {area} -c dynamic_shared_memory_type=mmap", "-w", "start")
+            pg_ctl("-l", str(area / "server.log"), "-o", f"-c listen_addresses='' -k {area} -c dynamic_shared_memory_type=mmap {FAST_TEST_OPTIONS}", "-w", "start")
 
         def stop():
-            pg_ctl("-m", "fast", "-w", "stop")
+            stop_postgres(bindir / "pg_ctl", data)
 
         def restart():
             stop()

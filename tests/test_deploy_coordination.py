@@ -11,6 +11,7 @@ from contextlib import contextmanager
 
 import pytest
 
+from tests.io_timeouts import PROCESS_TIMEOUT
 from tests.test_deploy_scripts import (
     DEPLOY,
     ROOT,
@@ -27,7 +28,7 @@ __all__ = ["candidate_ref", "env"]
 # Complete candidate CLI imports and Git worktree cleanup can exceed 30s on the
 # shared integration host. Keep the real process checks bounded without changing
 # the separate 10s contention checks or any state/ownership assertions.
-DEPLOY_TIMEOUT = 90
+DEPLOY_TIMEOUT = PROCESS_TIMEOUT
 
 
 def state(e):

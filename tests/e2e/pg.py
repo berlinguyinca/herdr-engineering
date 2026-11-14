@@ -10,6 +10,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from tests.control_plane.pg_stop import FAST_TEST_OPTIONS, stop_postgres
 from tests.e2e import harness
 
 
@@ -52,7 +53,7 @@ class ThrowawayPostgres:
         # dynamic_shared_memory_type=mmap keeps parallel-query segments as files under the data dir, not in /dev/shm: in a CI
         # container /dev/shm is small, shared or cleaned under the cluster, and "could not open shared memory segment
         # /PostgreSQL.N" then fails whichever test was running (8 errors in test_postgres_recovery.py, CI runs 414 and 415).
-        return (f"-c listen_addresses='' -c unix_socket_directories='{self.sock}' -c fsync=off "
+        return (f"-c listen_addresses='' -c unix_socket_directories='{self.sock}' {FAST_TEST_OPTIONS} "
                 "-c dynamic_shared_memory_type=mmap")
 
     def start(self) -> ThrowawayPostgres:
@@ -98,8 +99,7 @@ class ThrowawayPostgres:
 
     def stop(self) -> None:
         if self.started:
-            subprocess.run([str(self.bins / "pg_ctl"), "-D", str(self.data), "-m", "fast", "-w", "stop"],
-                           capture_output=True)
+            stop_postgres(self.bins / "pg_ctl", self.data)
             self.started = False
 
     def close(self) -> None:

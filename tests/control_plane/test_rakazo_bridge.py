@@ -19,6 +19,7 @@ from herdr_engineering.control_plane import rakazo_events as ev
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.assistant import AssistantService, assistant_config
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
+from tests.io_timeouts import HTTP_TIMEOUT
 
 PW_A, PW_B = "correct horse battery A", "correct horse battery B"
 FAST = dict(n=2 ** 14)                       # the smallest N the parser accepts: keeps the suite quick
@@ -42,7 +43,7 @@ class Api:
         data = body if isinstance(body, bytes) else (json.dumps(body).encode() if body is not None else None)
         req = urllib.request.Request(self.base + path, data=data, headers=h, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
                 return r.status, r.read(), dict(r.headers)
         except urllib.error.HTTPError as e:
             return e.code, e.read(), dict(e.headers)

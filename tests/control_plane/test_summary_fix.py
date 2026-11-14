@@ -10,6 +10,7 @@ import pytest
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from herdr_engineering.control_plane.summary_fix import MAX_PACKET_CHARS
+from tests.io_timeouts import HTTP_TIMEOUT
 
 SID = 'herdr:bender:eng:w1%3Ap1'
 PATH = '/api/v1/sessions/' + urllib.parse.quote(SID, safe='') + '/summary/fix'
@@ -69,7 +70,7 @@ class Harness:
         request = urllib.request.Request(f'http://127.0.0.1:{self.server.port}' + PATH, data=data,
                                          headers=hdrs, method='POST')
         try:
-            with urllib.request.urlopen(request, timeout=3) as response:
+            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
                 return response.status, json.load(response)
         except urllib.error.HTTPError as error:
             return error.code, json.load(error)
@@ -128,7 +129,7 @@ def test_next_steps_are_fixable_and_capability_is_operator_only(harness):
     assert h.post({'list': 'next_steps', 'index': 1, 'text': 'Open the PR'})[0] == 200
     url = f'http://127.0.0.1:{h.server.port}/api/v1/sessions/' + urllib.parse.quote(SID, safe='')
     for key, expected in (('read', False), ('write', True)):
-        with urllib.request.urlopen(urllib.request.Request(url, headers={'X-API-Key': key}), timeout=3) as resp:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={'X-API-Key': key}), timeout=HTTP_TIMEOUT) as resp:
             assert json.load(resp)['capabilities']['fix_summary_item'] is expected
 
 
@@ -252,7 +253,7 @@ def test_disabled_or_missing_summary_and_unknown_session(harness):
                                      data=b'{"list":"blockers","index":0,"text":"x"}',
                                      headers={'Content-Type': 'application/json', 'X-API-Key': 'write'})
     with pytest.raises(urllib.error.HTTPError) as error:
-        urllib.request.urlopen(request, timeout=3)
+        urllib.request.urlopen(request, timeout=HTTP_TIMEOUT)
     assert error.value.code == 404
     assert h.sent == [] and h2.sent == []
 

@@ -367,3 +367,55 @@ def test_a_closed_reader_does_not_kill_or_hang_the_run() -> None:
         shell=True, capture_output=True, text=True, timeout=60, env={**os.environ},
     )
     assert done.stdout == "0\n" and "Traceback" not in done.stderr and "BrokenPipe" not in done.stderr, done.stderr
+
+
+def _cpu_budget_args(cgroup_root: Path, **env: str) -> list[str]:
+    return args_with(HERDR_CGROUP_ROOT=str(cgroup_root), **env)
+
+
+def test_auto_is_capped_by_a_cgroup_cpu_quota_smaller_than_the_visible_cores(tmp_path: Path) -> None:
+    """xdist's `auto` counts the cores the process may be scheduled on, not the CPU quota of its cgroup: a job granted 2 CPUs on a
+    24-core node would start 8 workers that all stall each other (3 s socket reads timing out, `pg_ctl stop` past its wait)."""
+    (tmp_path / "cpu.max").write_text("200000 100000\n")
+    args = _cpu_budget_args(tmp_path)
+    assert args[:2] == ["-n", "2"]
+    assert "--dist=loadfile" in args
+
+
+def test_a_quota_of_one_and_a_half_cpus_rounds_down_but_never_to_zero(tmp_path: Path) -> None:
+    (tmp_path / "cpu.max").write_text("150000 100000\n")
+    assert _cpu_budget_args(tmp_path)[:2] == ["-n", "1"]
+    (tmp_path / "cpu.max").write_text("50000 100000\n")
+    assert _cpu_budget_args(tmp_path)[:2] == ["-n", "1"]
+
+
+def test_an_unlimited_or_generous_quota_keeps_auto(tmp_path: Path) -> None:
+    (tmp_path / "cpu.max").write_text("max 100000\n")
+    assert _cpu_budget_args(tmp_path)[:2] == ["-n", "auto"]
+    (tmp_path / "cpu.max").write_text("1600000 100000\n")   # 16 CPUs: the cap of 8 is the limit, as before
+    assert _cpu_budget_args(tmp_path)[:2] == ["-n", "auto"]
+
+
+def test_cgroup_v1_quota_files_are_read_too(tmp_path: Path) -> None:
+    (tmp_path / "cpu").mkdir()
+    (tmp_path / "cpu" / "cpu.cfs_quota_us").write_text("300000\n")
+    (tmp_path / "cpu" / "cpu.cfs_period_us").write_text("100000\n")
+    assert _cpu_budget_args(tmp_path)[:2] == ["-n", "3"]
+
+
+def test_an_explicit_worker_count_is_not_second_guessed_by_the_quota(tmp_path: Path) -> None:
+    (tmp_path / "cpu.max").write_text("200000 100000\n")
+    assert _cpu_budget_args(tmp_path, HERDR_PYTEST_WORKERS="6")[:2] == ["-n", "6"]
+
+
+def test_no_cgroup_files_means_auto(tmp_path: Path) -> None:
+    assert _cpu_budget_args(tmp_path)[:2] == ["-n", "auto"]
+
+
+def test_the_gate_prints_the_host_facts_that_explain_a_starved_run() -> None:
+    """Pipelines on hive-as-11-2-39 and -40 failed 7 of 7 while other nodes passed: the next failure must say what the node looked like."""
+    assert "ci_host_facts" in GATE
+    done = subprocess.run(["bash", "-c", f'. "{ROOT}/scripts/ci/host-facts.sh"; ci_host_facts'], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    for key in ("host:", "cpus visible:", "cgroup cpu quota:", "loadavg:", "tmp filesystem:"):
+        assert key in done.stdout, done.stdout
