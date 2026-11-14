@@ -9,6 +9,7 @@ are removed, so the operator's real credentials are never read and nothing can r
 Why this is safe and sufficient: github.com itself cannot be redirected, but gh treats any other GH_HOST as GitHub
 Enterprise Server (REST under /api/v3, GraphQL at /api/graphql), which is the same wire protocol.
 """
+
 from __future__ import annotations
 
 import http.server
@@ -28,9 +29,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 REPO = "acme/widget"
 SHA = "c" * 40
-DIFF = ("diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1,1 +1,2 @@\n x = 1\n+y = eval(x)\n")
+DIFF = "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1,1 +1,2 @@\n x = 1\n+y = eval(x)\n"
 
-pytestmark = pytest.mark.skipif(not (shutil.which("gh") and shutil.which("openssl")), reason="needs gh and openssl")
+pytestmark = pytest.mark.skipif(
+    not (shutil.which("gh") and shutil.which("openssl")), reason="needs gh and openssl"
+)
 
 
 def _load(name: str, file: str):
@@ -45,9 +48,28 @@ class GitHubApi:
     """A real HTTPS server speaking the GitHub endpoints the reviewer calls. Every request is recorded."""
 
     def __init__(self, certdir: Path):
-        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(certdir / "k.pem"),
-                        "-out", str(certdir / "c.pem"), "-days", "2", "-subj", "/CN=localhost", "-addext",
-                        "subjectAltName=DNS:localhost,IP:127.0.0.1"], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                str(certdir / "k.pem"),
+                "-out",
+                str(certdir / "c.pem"),
+                "-days",
+                "2",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            ],
+            check=True,
+            capture_output=True,
+        )
         self.cert = certdir / "c.pem"
         self.requests: list[dict] = []
         self.statuses: list[dict] = []
@@ -82,11 +104,19 @@ class GitHubApi:
             def handle_any(self):
                 raw = self.read_body()
                 u = urlparse(self.path)
-                rec = {"method": self.command, "path": u.path, "query": parse_qs(u.query), "body": raw,
-                       "auth": self.headers.get("authorization"), "accept": self.headers.get("accept")}
+                rec = {
+                    "method": self.command,
+                    "path": u.path,
+                    "query": parse_qs(u.query),
+                    "body": raw,
+                    "auth": self.headers.get("authorization"),
+                    "accept": self.headers.get("accept"),
+                }
                 api.requests.append(rec)
                 code, body, ctype = api.route(rec)
-                self.reply(code, body if isinstance(body, bytes) else json.dumps(body).encode(), ctype)
+                self.reply(
+                    code, body if isinstance(body, bytes) else json.dumps(body).encode(), ctype
+                )
 
             do_GET = do_POST = do_PATCH = handle_any
 
@@ -98,22 +128,60 @@ class GitHubApi:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def pr_node(self) -> dict:
-        return {"id": "PR_1", "number": 7, "headRefOid": self.head, "state": "OPEN", "isDraft": False,
-                "title": "Add y", "body": "body text", "baseRefName": "main",
-                "commits": {"totalCount": 1, "nodes": [{"commit": {
-                    "oid": self.head, "messageHeadline": "add y", "messageBody": "Co-Authored-By: Claude <a@b.c>",
-                    "authoredDate": "2026-01-01T00:00:00Z", "committedDate": "2026-01-01T00:00:00Z",
-                    "authors": {"nodes": []}}}]}}
+        return {
+            "id": "PR_1",
+            "number": 7,
+            "headRefOid": self.head,
+            "state": "OPEN",
+            "isDraft": False,
+            "title": "Add y",
+            "body": "body text",
+            "baseRefName": "main",
+            "commits": {
+                "totalCount": 1,
+                "nodes": [
+                    {
+                        "commit": {
+                            "oid": self.head,
+                            "messageHeadline": "add y",
+                            "messageBody": "Co-Authored-By: Claude <a@b.c>",
+                            "authoredDate": "2026-01-01T00:00:00Z",
+                            "committedDate": "2026-01-01T00:00:00Z",
+                            "authors": {"nodes": []},
+                        }
+                    }
+                ],
+            },
+        }
 
     def route(self, r: dict) -> tuple[int, object, str]:
         p, m = r["path"], r["method"]
         if p == "/api/graphql":
             q = json.loads(r["body"])["query"]
             if "PullRequestList" in q:
-                return 200, {"data": {"repository": {"pullRequests": {
-                    "totalCount": 2, "pageInfo": {"hasNextPage": False, "endCursor": ""},
-                    "nodes": [self.pr_node(), {**self.pr_node(), "number": 8, "isDraft": True}]}}}}, "application/json"
-            return 200, {"data": {"repository": {"pullRequest": self.pr_node()}}}, "application/json"
+                return (
+                    200,
+                    {
+                        "data": {
+                            "repository": {
+                                "pullRequests": {
+                                    "totalCount": 2,
+                                    "pageInfo": {"hasNextPage": False, "endCursor": ""},
+                                    "nodes": [
+                                        self.pr_node(),
+                                        {**self.pr_node(), "number": 8, "isDraft": True},
+                                    ],
+                                }
+                            }
+                        }
+                    },
+                    "application/json",
+                )
+            return (
+                200,
+                {"data": {"repository": {"pullRequest": self.pr_node()}}},
+                "application/json",
+            )
         p = p.removeprefix("/api/v3")
         if m == "GET" and p == f"/repos/{REPO}/pulls/7":
             return 200, DIFF.encode(), "text/plain"
@@ -128,15 +196,23 @@ class GitHubApi:
         if m == "GET" and p == f"/repos/{REPO}/issues/7/comments":
             page = int(r["query"].get("page", ["1"])[0])
             return 200, self.comments if page == 1 else [], "application/json"
-        if m == "GET" and p == f"/repos/{REPO}/contents/src/a%20b.py".replace("%20", " ") or unquote(p) == f"/repos/{REPO}/contents/src/a b.py":
+        if (
+            m == "GET"
+            and p == f"/repos/{REPO}/contents/src/a%20b.py".replace("%20", " ")
+            or unquote(p) == f"/repos/{REPO}/contents/src/a b.py"
+        ):
             return 200, b"x = 1\ny = eval(x)\n", "text/plain"
         if m == "POST" and p == f"/repos/{REPO}/statuses/{SHA}":
             s = json.loads(r["body"])
             self.statuses.append(s)
             return 201, {"id": len(self.statuses), **s}, "application/json"
         if m == "POST" and p == f"/repos/{REPO}/issues/7/comments":
-            c = {"id": 100 + len(self.comments), "user": {"login": "review-bot"}, **json.loads(r["body"]),
-                 "html_url": f"https://example.test/c/{len(self.comments)}"}
+            c = {
+                "id": 100 + len(self.comments),
+                "user": {"login": "review-bot"},
+                **json.loads(r["body"]),
+                "html_url": f"https://example.test/c/{len(self.comments)}",
+            }
             self.comments.append(c)
             return 201, c, "application/json"
         if m == "PATCH" and (mm := re.fullmatch(rf"/repos/{REPO}/issues/comments/(\d+)", p)):
@@ -185,7 +261,10 @@ def always():
 def test_real_gh_really_hits_the_local_server_only(env, ai):
     """Guard against the test silently talking to the real GitHub: the server must see the request and its token."""
     assert ai.Gh().viewer() == "review-bot"
-    assert env.requests[-1]["auth"] == "token local-test-token" or env.requests[-1]["auth"] == "Bearer local-test-token"
+    assert (
+        env.requests[-1]["auth"] == "token local-test-token"
+        or env.requests[-1]["auth"] == "Bearer local-test-token"
+    )
 
 
 def test_pr_view_list_and_diff(env, ai):
@@ -199,10 +278,23 @@ def test_pr_view_list_and_diff(env, ai):
 
 
 def test_statuses_check_runs_and_gates(env, ai, always):
-    env.statuses.extend([{"context": "lint", "state": "success", "created_at": "2026-01-01T00:00:00Z"},
-                         {"context": "Independent AI review", "state": "pending"}])
-    env.check_runs.extend([{"id": 1, "name": "build", "status": "completed", "conclusion": "success",
-                            "started_at": "2026-01-01T00:00:00Z"}])
+    env.statuses.extend(
+        [
+            {"context": "lint", "state": "success", "created_at": "2026-01-01T00:00:00Z"},
+            {"context": "Independent AI review", "state": "pending"},
+        ]
+    )
+    env.check_runs.extend(
+        [
+            {
+                "id": 1,
+                "name": "build",
+                "status": "completed",
+                "conclusion": "success",
+                "started_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+    )
     gh = ai.Gh()
     assert {s["context"] for s in gh.statuses(REPO, SHA)} == {"lint", "Independent AI review"}
     assert [c["name"] for c in gh.check_runs(REPO, SHA)] == ["build"]
@@ -221,26 +313,40 @@ def test_post_status_reaches_server_with_body_on_stdin(env, ai, always):
     gh = ai.Gh(dry_run=False)
     d = always.Decision("failure", "one blocking finding", (), (), (), (), "x", None)
     always.post_status(gh, REPO, SHA, "Opus agent review", d, "https://example.test/run/1")
-    assert env.statuses == [{"state": "failure", "context": "Opus agent review",
-                             "description": "one blocking finding", "target_url": "https://example.test/run/1"}]
+    assert env.statuses == [
+        {
+            "state": "failure",
+            "context": "Opus agent review",
+            "description": "one blocking finding",
+            "target_url": "https://example.test/run/1",
+        }
+    ]
 
 
 def test_dry_run_sends_no_write_to_the_server(env, ai, always):
     gh = ai.Gh(dry_run=True)
-    always.post_status(gh, REPO, SHA, "Opus agent review", always.Decision("failure", "x", (), (), (), (), "x", None))
+    always.post_status(
+        gh,
+        REPO,
+        SHA,
+        "Opus agent review",
+        always.Decision("failure", "x", (), (), (), (), "x", None),
+    )
     assert env.statuses == [] and [r for r in env.requests if r["method"] != "GET"] == []
     assert gh.posted and gh.posted[0]["dry_run"]
 
 
-def test_register_gh_secret_reads_real_gh_auth_token_and_redacts_the_posted_status(env, ai, always, tmp_path,
-                                                                                    monkeypatch):
+def test_register_gh_secret_reads_real_gh_auth_token_and_redacts_the_posted_status(
+    env, ai, always, tmp_path, monkeypatch
+):
     """The operator's `gh auth token` (from a throwaway gh config under a temp HOME) joins the redaction set, and the
     real `gh api` POST then carries `[redacted]` instead of the token."""
     token = "gho_REALGHTOKEN0123456789abcdefABCDEF"
     cfg = tmp_path / "home" / ".config" / "gh"
     cfg.mkdir(parents=True)
-    (cfg / "hosts.yml").write_text(f"github.com:\n    oauth_token: {token}\n    user: operator\n"
-                                   "    git_protocol: https\n")
+    (cfg / "hosts.yml").write_text(
+        f"github.com:\n    oauth_token: {token}\n    user: operator\n    git_protocol: https\n"
+    )
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
@@ -253,8 +359,13 @@ def test_register_gh_secret_reads_real_gh_auth_token_and_redacts_the_posted_stat
         monkeypatch.setenv("GH_HOST", env.host)
         monkeypatch.setenv("GH_ENTERPRISE_TOKEN", "local-test-token")
         monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "ghcfg2"))
-        always.post_status(always.ai.Gh(dry_run=False), REPO, SHA, "Opus agent review",
-                           always.Decision("failure", f"leaked {token} here", (), (), (), (), "x", None))
+        always.post_status(
+            always.ai.Gh(dry_run=False),
+            REPO,
+            SHA,
+            "Opus agent review",
+            always.Decision("failure", f"leaked {token} here", (), (), (), (), "x", None),
+        )
     finally:
         always.ai.REDACT.clear()
         always.ai.REDACT.update(saved)
@@ -277,18 +388,42 @@ def test_failure_from_server_surfaces_as_review_failed(env, ai):
 
 # ---- #792 follow-ups, exercised through the real gh ----
 
+
 def test_check_runs_sort_by_id_alone_even_with_missing_or_odd_started_at(env, ai):
-    env.check_runs.extend([{"id": 5, "name": "old-id-late-start", "started_at": "2030-01-01T00:00:00Z"},
-                           {"id": 9, "name": "newest-id", "started_at": None},
-                           {"id": 7, "name": "mid", "started_at": "2020-01-01T00:00:00Z"}])
-    assert [c["name"] for c in ai.Gh().check_runs(REPO, SHA)] == ["newest-id", "mid", "old-id-late-start"]
+    env.check_runs.extend(
+        [
+            {"id": 5, "name": "old-id-late-start", "started_at": "2030-01-01T00:00:00Z"},
+            {"id": 9, "name": "newest-id", "started_at": None},
+            {"id": 7, "name": "mid", "started_at": "2020-01-01T00:00:00Z"},
+        ]
+    )
+    assert [c["name"] for c in ai.Gh().check_runs(REPO, SHA)] == [
+        "newest-id",
+        "mid",
+        "old-id-late-start",
+    ]
 
 
 def test_commit_subjects_lose_control_characters(env, ai):
     node = env.pr_node
-    env.pr_node = lambda: {**node(), "commits": {"totalCount": 1, "nodes": [{"commit": {
-        "oid": SHA, "messageHeadline": "fix\u001b[31m red\u0007 bell", "messageBody": "b\u0000ody",
-        "authoredDate": "2026-01-01T00:00:00Z", "committedDate": "2026-01-01T00:00:00Z", "authors": {"nodes": []}}}]}}
+    env.pr_node = lambda: {
+        **node(),
+        "commits": {
+            "totalCount": 1,
+            "nodes": [
+                {
+                    "commit": {
+                        "oid": SHA,
+                        "messageHeadline": "fix\u001b[31m red\u0007 bell",
+                        "messageBody": "b\u0000ody",
+                        "authoredDate": "2026-01-01T00:00:00Z",
+                        "committedDate": "2026-01-01T00:00:00Z",
+                        "authors": {"nodes": []},
+                    }
+                }
+            ],
+        },
+    }
     try:
         c = ai.Gh().pr(REPO, 7)["commits"][0]
     finally:
@@ -303,7 +438,10 @@ def test_gh_token_env_values_are_registered_for_redaction(env, always, monkeypat
     saved = set(always.ai.REDACT)
     try:
         always.register_gh_secret()
-        assert {"ghp_ENVTOKEN0123456789abcdefABCDEF", "ghs_GHACTIONS0123456789abcdefABCDEF"} <= always.ai.REDACT
+        assert {
+            "ghp_ENVTOKEN0123456789abcdefABCDEF",
+            "ghs_GHACTIONS0123456789abcdefABCDEF",
+        } <= always.ai.REDACT
     finally:
         always.ai.REDACT.clear()
         always.ai.REDACT.update(saved)
