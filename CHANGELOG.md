@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: deploy.sh no longer warns that the fabric firewall is missing when it merely cannot read it
+
+- `collab-fabric-firewall.sh --check` run as the non-root deploy user exits 2 (cannot read), which `deploy.sh` treated like absent rules and always printed the install WARNING. Exit 1 (absent) keeps the WARNING; exit 2 now prints a one-line NOTE (verify with `sudo <script> --check`, noting if `herdr-collab-fabric-firewall.service` is enabled). Never fails the deploy. Docs in `docs/operations/fabric-trust.md` updated.
+
 ### Fix: unit gate no longer starves or hangs on the 1.77M-row recovery test
 
 - `test_production_cardinality_snapshot_recovery_and_database_restart` (~5.5 min alone, >23 min under disk contention) is marked `slow` with an explicit `@pytest.mark.timeout(3600)`; the suite-wide 900 s ceiling failed pipeline 1334 after ~57 min.
