@@ -163,7 +163,7 @@ Remaining: fry, beast, bender convergence (operator go-ahead per host).
 Real Ansible convergence — `beast` and `bender` (2026-09-25)
 ---
 beast (Ubuntu 24.04.4, tailnet 100.96.156.65, Tailscale SSH with interactive
-  check approval, fleet user wohlgemuth, passwordless sudo):
+  check approval, fleet user `<user>`, passwordless sudo):
   Run 1:  ok=15 changed=6  failed=0 (tailscale reported up)
   Run 2:  ok=15 changed=0  failed=0 (idempotent)
   Run 3:  ok=15 changed=1  failed=0 — the re-runs caught a REAL BUG: with
@@ -198,7 +198,7 @@ The persistent private web UI is now exposed tailnet-only via `tailscale
 serve`. Evidence:
 
 * Enablement: tailnet admin console used once to enable Serve;
-  `sudo tailscale set --operator=wohlgemuth` was needed once so the fleet
+  `sudo tailscale set --operator=<user>` was needed once so the fleet
   user could manage serve config (otherwise `tailscale serve` returned
   `Access denied: serve config denied`).
 * Serve: `tailscale serve --bg 8787` on bender maps

@@ -23,9 +23,9 @@
 ### Task 1: Runner cache-operation telemetry
 
 **Files:**
-- Modify: `/home/wohlgemuth/IdeaProjects/woodpecker-slurm/bin/wpci-cache`
-- Test: `/home/wohlgemuth/IdeaProjects/woodpecker-slurm/tests/test_cache.py`
-- Modify: `/home/wohlgemuth/IdeaProjects/woodpecker-slurm/docs/persistent-cache.md`
+- Modify: `/home/user/IdeaProjects/woodpecker-slurm/bin/wpci-cache`
+- Test: `/home/user/IdeaProjects/woodpecker-slurm/tests/test_cache.py`
+- Modify: `/home/user/IdeaProjects/woodpecker-slurm/docs/persistent-cache.md`
 
 **Interfaces:**
 - Produce `cache-operation-v1` JSON records under the configured timing/proof directory with `operation_id`, `schema_version`, `repo`, `pipeline`, `phase`, `kind`, `operation`, `outcome`, `wall_seconds`, `compressed_bytes`, `expanded_bytes`, and `entry_count`.
@@ -41,9 +41,9 @@
 ### Task 2: Quobyte summary relay
 
 **Files:**
-- Create: `/home/wohlgemuth/IdeaProjects/woodpecker-slurm/bin/wpci-telemetry-relay`
-- Test: `/home/wohlgemuth/IdeaProjects/woodpecker-slurm/tests/test_telemetry_relay.py`
-- Modify: `/home/wohlgemuth/IdeaProjects/woodpecker-slurm/docs/persistent-cache.md`
+- Create: `/home/user/IdeaProjects/woodpecker-slurm/bin/wpci-telemetry-relay`
+- Test: `/home/user/IdeaProjects/woodpecker-slurm/tests/test_telemetry_relay.py`
+- Modify: `/home/user/IdeaProjects/woodpecker-slurm/docs/persistent-cache.md`
 
 **Interfaces:**
 - `wpci-telemetry-relay scan --root ROOT --state STATE --endpoint URL [--dry-run]` reads only completed `cache-operation-v1` and existing timing records.
@@ -59,11 +59,11 @@
 ### Task 3: HerdR ingestion and aggregate API
 
 **Files:**
-- Modify: `/home/wohlgemuth/IdeaProjects/herdr-engineering/herdr_engineering/control_plane/repo.py`
-- Modify: `/home/wohlgemuth/IdeaProjects/herdr-engineering/herdr_engineering/control_plane/api.py`
-- Create: `/home/wohlgemuth/IdeaProjects/herdr-engineering/herdr_engineering/control_plane/ci_performance.py`
-- Test: `/home/wohlgemuth/IdeaProjects/herdr-engineering/tests/control_plane/test_ci_performance.py`
-- Modify: `/home/wohlgemuth/IdeaProjects/herdr-engineering/tests/control_plane/test_ci_api.py`
+- Modify: `/home/user/IdeaProjects/herdr-engineering/herdr_engineering/control_plane/repo.py`
+- Modify: `/home/user/IdeaProjects/herdr-engineering/herdr_engineering/control_plane/api.py`
+- Create: `/home/user/IdeaProjects/herdr-engineering/herdr_engineering/control_plane/ci_performance.py`
+- Test: `/home/user/IdeaProjects/herdr-engineering/tests/control_plane/test_ci_performance.py`
+- Modify: `/home/user/IdeaProjects/herdr-engineering/tests/control_plane/test_ci_api.py`
 
 **Interfaces:**
 - `validate_ci_telemetry(payload) -> list[dict]` accepts only schema-v1 records and returns normalized records.
@@ -82,11 +82,11 @@
 ### Task 4: HerdR dashboard
 
 **Files:**
-- Modify: `/home/wohlgemuth/IdeaProjects/herdr-engineering/packages/ci-performance.js`
-- Modify: `/home/wohlgemuth/IdeaProjects/herdr-engineering/packages/ci-charts.js`
-- Modify: `/home/wohlgemuth/IdeaProjects/herdr-engineering/packages/integrations-view.js`
-- Modify: `/home/wohlgemuth/IdeaProjects/herdr-engineering/packages/herdr-web-components/ci-charts.test.js`
-- Modify: `/home/wohlgemuth/IdeaProjects/herdr-engineering/tests/playwright/ci-charts.test.mjs`
+- Modify: `/home/user/IdeaProjects/herdr-engineering/packages/ci-performance.js`
+- Modify: `/home/user/IdeaProjects/herdr-engineering/packages/ci-charts.js`
+- Modify: `/home/user/IdeaProjects/herdr-engineering/packages/integrations-view.js`
+- Modify: `/home/user/IdeaProjects/herdr-engineering/packages/herdr-web-components/ci-charts.test.js`
+- Modify: `/home/user/IdeaProjects/herdr-engineering/tests/playwright/ci-charts.test.mjs`
 
 **Interfaces:**
 - `ciPerformanceModel` consumes the API's normalized performance payload and returns cache groups, trend points, and alerts.
@@ -101,8 +101,8 @@
 ### Task 5: Pilot and delivery
 
 **Files:**
-- Modify: `/home/wohlgemuth/IdeaProjects/inferweave-rust-cache-pilot/.woodpecker/rust.yaml`
-- Modify: `/home/wohlgemuth/IdeaProjects/go-modules/.woodpecker.yml` only, preserving its existing commands
+- Modify: `/home/user/IdeaProjects/inferweave-rust-cache-pilot/.woodpecker/rust.yaml`
+- Modify: `/home/user/IdeaProjects/go-modules/.woodpecker.yml` only, preserving its existing commands
 - Create: `docs/performance/ci-observability-pilot-20261023/README.md`
 
 - [ ] Add relay invocation after successful Rust registry publication and the Go modules cache save; keep failure status independent of telemetry upload.

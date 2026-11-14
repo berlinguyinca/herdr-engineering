@@ -4,7 +4,7 @@ Branch `docs/wc001-g7-pi-engineering-audit` (worktree herdr-wc001), stacked on G
 
 ## Source used
 
-- Canonical checkout: `/home/wohlgemuth/pi-engineering`, origin `ssh://git@github.com/berlinguyinca/pi-engineering.git`.
+- Canonical checkout: `/home/user/pi-engineering`, origin `ssh://git@github.com/berlinguyinca/pi-engineering.git`.
 - Local `main` is c16a501 (2026-10-29) and 167 commits behind. I read `origin/main` ec107d8 (2026-11-04) with `git show` / `git grep` only (no checkout, no fetch). All Pi paths below are relative to that tree at ec107d8.
 - The installed-copy path in HANDOFF-pi-engineering-2026-10-06.md was used for reference only.
 - Herdr references are to this worktree, HEAD cb3536b8.

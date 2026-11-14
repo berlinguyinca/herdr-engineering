@@ -96,7 +96,7 @@ def test_control_plane_config_overrides():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd /home/wohlgemuth/IdeaProjects/herdr-engineering && .venv/bin/python -m pytest tests/control_plane/test_db.py -q`
+Run: `cd /home/user/IdeaProjects/herdr-engineering && .venv/bin/python -m pytest tests/control_plane/test_db.py -q`
 Expected: FAIL (`ModuleNotFoundError: No module named 'herdr_engineering.control_plane'`).
 
 - [ ] **Step 3: Implement**

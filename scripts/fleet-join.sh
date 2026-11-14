@@ -24,8 +24,8 @@
 #       [--gateway http://dev.lan:29999]
 #
 # Examples:
-#   scripts/fleet-join.sh newbox --ansible-host newbox.tail0c50da.ts.net --user wohlgemuth
-#   scripts/fleet-join.sh newbox --os macos --ansible-host macbook-pro.tail0c50da.ts.net --user wohlgemuth
+#   scripts/fleet-join.sh newbox --ansible-host newbox.tail0c50da.ts.net --user user
+#   scripts/fleet-join.sh newbox --os macos --ansible-host macbook-pro.tail0c50da.ts.net --user user
 #
 set -euo pipefail
 

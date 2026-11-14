@@ -13,9 +13,9 @@
 
 | Repo | Path | Role in this spec | Availability |
 |---|---|---|---|
-| **Herdr Engineering** (canonical) | `/home/wohlgemuth/IdeaProjects/herdr-engineering` | Herdr dashboard + control plane + mission services | ✅ present, tests run |
-| **Pi Engineering** (runtime) | `/home/wohlgemuth/IdeaProjects/pi-engineering` | mission/task/session/event contracts, worker execution | ✅ present |
-| **InferWeave** | `/home/wohlgemuth/IdeaProjects/inferweave` | request traces, spans, model/GPU placement telemetry | ✅ present |
+| **Herdr Engineering** (canonical) | `/home/user/IdeaProjects/herdr-engineering` | Herdr dashboard + control plane + mission services | ✅ present, tests run |
+| **Pi Engineering** (runtime) | `/home/user/IdeaProjects/pi-engineering` | mission/task/session/event contracts, worker execution | ✅ present |
+| **InferWeave** | `/home/user/IdeaProjects/inferweave` | request traces, spans, model/GPU placement telemetry | ✅ present |
 | **Artifact Studio / Libre WebUI** | no separate repo found; artifact tooling is **inside herdr-engineering** (`herdr_engineering/artifacts.py`, `control_plane/artifacts.py`, `packages/`) | persisted visual artifacts | ✅ present (in-repo) |
 
 **Finding:** There is **no second orchestration service and no separate Artifact Studio repo**. Artifact authoring/storage already lives inside herdr-engineering. This satisfies the spec's non-goal *"No second orchestration service"* — the graph should extend the existing control plane, not spawn a sibling service.

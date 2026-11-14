@@ -16,7 +16,7 @@ async function withApp(fn){
   const port=await new Promise((resolve,reject)=>{let text='';const timeout=setTimeout(()=>reject(new Error('Fixture startup timed out')),20000);server.stdout.on('data',data=>{text+=data;const hit=text.match(/PORT=(\d+)/);if(hit){clearTimeout(timeout);resolve(hit[1]);}});server.once('exit',code=>{clearTimeout(timeout);reject(new Error(`Fixture exited ${code}`));});});
   const options={headless:true,args:['--no-sandbox']};
   if(process.env.PLAYWRIGHT_CHROMIUM)options.executablePath=process.env.PLAYWRIGHT_CHROMIUM;
-  try{browser=await chromium.launch(options);}catch(error){const fallback='/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';if(!fs.existsSync(fallback))throw error;browser=await chromium.launch({...options,executablePath:fallback});}
+  try{browser=await chromium.launch(options);}catch(error){const fallback=(process.env.HOME+'/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome');if(!fs.existsSync(fallback))throw error;browser=await chromium.launch({...options,executablePath:fallback});}
   const page=await browser.newPage();await fn(page,`http://127.0.0.1:${port}`);
  }finally{await browser?.close();server.kill();}
 }

@@ -59,4 +59,4 @@ Frontend tests cover successful-only statistics, provider prefixes, row identity
 - Live validation exposed provider PR/commit URLs being mistaken for repository identities; added realistic context-URL regressions and verified the correction after redeployment.
 - Fresh checks: 124 targeted Python tests before the context fix, 42 project-link/API tests after it; 264 JS/client/component/browser tests after rebase; Ruff, compilation/syntax, independent review.
 - Rust pilot PR #1205 remains unmerged; full-workspace Woodpecker check is pending. Four independent small executable allocations completed; compiled-target reuse rejected after registry controls. Runner PR #13 includes bounded evidence.
-- Evidence and screenshots: `/home/wohlgemuth/IdeaProjects/artifacts/herdr-ci-performance-20261022/`. No default-branch merge performed.
+- Evidence and screenshots: `/home/user/IdeaProjects/artifacts/herdr-ci-performance-20261022/`. No default-branch merge performed.

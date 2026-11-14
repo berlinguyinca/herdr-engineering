@@ -14,7 +14,7 @@ async function withLogTests(run) {
  try {
   const port=await new Promise((resolve,reject)=>{let text='';const timer=setTimeout(()=>reject(Error(`startup timeout: ${stderr}`)),30000);server.stdout.on('data',d=>{text+=d;const m=text.match(/PORT=(\d+)/);if(m){clearTimeout(timer);resolve(Number(m[1]));}});server.on('exit',()=>reject(Error(stderr)));});
   const options={headless:true,args:['--no-sandbox'],...(process.env.PLAYWRIGHT_CHROMIUM?{executablePath:process.env.PLAYWRIGHT_CHROMIUM}:{})};
-  try{browser=await chromium.launch(options);}catch(error){const exe='/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';if(!existsSync(exe))throw error;browser=await chromium.launch({...options,executablePath:exe});}
+  try{browser=await chromium.launch(options);}catch(error){const exe=(process.env.HOME+'/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome');if(!existsSync(exe))throw error;browser=await chromium.launch({...options,executablePath:exe});}
   const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors=[];
   page.on('pageerror',e=>errors.push(e.message));
   await run({page,base:`http://127.0.0.1:${port}`});

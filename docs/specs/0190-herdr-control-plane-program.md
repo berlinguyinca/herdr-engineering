@@ -1,6 +1,6 @@
 # 0190 — HerdR Dev Fabric Control Plane (program roadmap)
 
-Status: **proposed** · Owner: wohlgemuth · Started: 2026-10-06
+Status: **proposed** · Owner: user · Started: 2026-10-06
 
 This is the **program-level roadmap** for the "HerdR Dev Fabric Control Plane"
 spec (the user-supplied 116-section spec, hereafter "the Spec"). It is the
