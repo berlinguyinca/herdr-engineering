@@ -145,15 +145,21 @@ def test_native_delivery_includes_artifact_references_after_identity_verificatio
     from herdr_engineering.herdr_adapter import NativeHerdrAdapter
 
     received = []
+    conversation = {'source': 'integration', 'agent': 'claude', 'kind': 'uuid',
+                    'value': 'conversation1'}
     monkeypatch.setattr(NativeHerdrAdapter, 'list_agents', lambda *_a, **_k: [
-        SimpleNamespace(terminal_id='term1', agent_session='conversation1',
+        SimpleNamespace(terminal_id='term1', pane_id='w1:p1', agent_session=conversation,
                         interactive_ready=True, launch_pending=False)])
+    def acknowledge(_self, target, message, **_kwargs):
+        received.append((target, message))
+        return {'receipt': {'ok': True, 'result': {'submitted': True, 'agent': {
+            'terminal_id': 'term1', 'pane_id': 'w1:p1', 'agent_session': conversation}}}}
     monkeypatch.setattr(NativeHerdrAdapter, 'send_input',
-                        lambda _self, target, message, **_kwargs: received.append((target, message)))
+                        acknowledge)
     server = ControlPlaneServer(ControlPlaneRepo())
-    server._dispatch_native_message({'terminal_id': 'term1', 'agent_session': 'conversation1',
+    server._dispatch_native_message({'terminal_id': 'term1', 'agent_session': conversation,
         'host_id': socket.gethostname(), 'herdr_session': 'workspace1'}, 'Please inspect', ['artifact_1'])
-    assert received == [('term1', 'Please inspect\n\nAttached HerdR artifact references:\n- herdr-artifact://artifact_1')]
+    assert received == [('w1:p1', 'Please inspect\n\nAttached HerdR artifact references:\n- herdr-artifact://artifact_1')]
 
 
 def test_artifact_reviews_list_needs_read_permission_with_the_acl_too():

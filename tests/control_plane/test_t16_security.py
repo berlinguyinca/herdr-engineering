@@ -115,7 +115,7 @@ def test_the_allow_list_is_exactly_what_the_dispatcher_handles_plus_plain_activi
                                        "review_finding", "pull_request", "token_usage", "resource_usage", "ai_sync", "fleet_rollout"}
     assert INGEST_ENTITY_TYPES - DISPATCHED_ENTITY_TYPES == {"task", "note", "workspace", "ledger",
                                                                         "platform", "lifecycle",
-                                                                        "repository", "request", "span"}
+                                                                        "repository", "request", "span", "communication"}
 
 
 @pytest.mark.parametrize("entity_type", ["repository", "request", "span"])
