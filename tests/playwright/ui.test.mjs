@@ -383,7 +383,7 @@ test('mission detail surfaces telemetry state and stall age (issue #31)', async 
     assert.match(badge, /Telemetry unknown/, `telemetry badge should say unknown (got "${badge}")`);
     // A Stall age metric is rendered and, for a no-collector mission, is unknown.
     const metric = page.locator('herdr-metric[label="Stall age"]');
-    await metric.waitFor({ state: 'visible', timeout: 15000 });
+    await metric.waitFor({ state: 'visible', timeout: scaled(15000) });
     const value = await metric.locator('.hd-metric__value').innerText();
     assert.match(value, /Unknown/, `stall age should be unknown for a no-collector mission (got "${value}")`);
   });
@@ -700,13 +700,13 @@ test('Pi detail lifecycle history refreshes on real SSE without replacing live i
       source: 'pi', entity_type: 'mission', entity_id: 'MSN-PI1', event_type: 'MissionStopped', payload: {title: 'Pi mission', stage: 'complete'},
     })});
     assert.equal(response.status, 200);
-    await page.waitForFunction(() => document.querySelector('#mission-history herdr-status')?.getAttribute('stage') === 'complete', null, {timeout: 12000});
+    await page.waitForFunction(() => document.querySelector('#mission-history herdr-status')?.getAttribute('stage') === 'complete', null, {timeout: scaled(12000)});
     assert.equal(await page.evaluate(() => window.livePaneBefore === document.querySelector('#live-mission-detail')), true);
     assert.equal(await page.locator('[data-worker="reviewer"]').evaluate(el => el.open), true);
     assert.equal(await page.locator('[data-history-panel=events]').evaluate(el=>el.open),true);
     assert.equal(await page.locator('[data-history-panel=timeline]').evaluate(el=>el.open),true);
     assert.match(await page.locator('#mission-stream').innerText(), /complete|stopped/i);
-    await page.waitForFunction(() => /complete|stopped/i.test(document.querySelector('#mission-timeline')?.innerText || ''), null, {timeout: 5000});
+    await page.waitForFunction(() => /complete|stopped/i.test(document.querySelector('#mission-timeline')?.innerText || ''), null, {timeout: scaled(5000)});
     assert.match(await page.locator('#mission-timeline').innerText(), /complete|stopped/i);
   }, {BURST: '0'});
 });
@@ -896,7 +896,7 @@ test('leaving session detail cancels its initial read and cannot overwrite the n
   const seen=new Promise(resolve=>{started=resolve;});
   await page.route('**/api/v1/sessions/late-session',r=>{held=r;started();});
   await page.goto(`${base}/#/herd/session/late-session`);await seen;
-  const canceled=page.waitForEvent('requestfailed',{predicate:r=>r.url().endsWith('/api/v1/sessions/late-session'),timeout:5000});
+  const canceled=page.waitForEvent('requestfailed',{predicate:r=>r.url().endsWith('/api/v1/sessions/late-session'),timeout:scaled(5000)});
   await page.evaluate(()=>{location.hash='#/hosts';});
   await canceled;
   await page.waitForFunction(()=>document.querySelector('#view h1')?.textContent==='Hosts');
@@ -1088,7 +1088,7 @@ test('session inspection renders before optional mission context and cancels tha
   await page.goto(`${base}/#/herd/session/context-session`);await requested;
   await page.locator('#session-details').waitFor();assert.match(await page.locator('#view h1').innerText(),/Context agent/);
   assert.match(await page.locator('#session-mission').innerText(),/not resolved/);
-  const canceled=page.waitForEvent('requestfailed',{predicate:r=>r.url().endsWith('/api/v1/missions'),timeout:5000});
+  const canceled=page.waitForEvent('requestfailed',{predicate:r=>r.url().endsWith('/api/v1/missions'),timeout:scaled(5000)});
   await page.evaluate(()=>{location.hash='#/hosts';});await canceled;await page.locator('#view h1').filter({hasText:'Hosts'}).waitFor();
   await held.fulfill({json:{missions:[{mission_id:'some-mission',title:'Late mission',sessions:[{session_id:'context-session'}]}]}}).catch(()=>{});
   assert.equal(await page.locator('#view h1').innerText(),'Hosts');
@@ -1134,7 +1134,7 @@ test('inspector resynchronizes events written between the initial snapshot and s
    await inspectorHarness(page,base,sid);const initial=await captured;assert.equal(initial.events.length,0);
    await postInspector(base,sid,Array.from({length:60},(_,i)=>({kind:'message',role:'assistant',text:`gap-${i}`})));
    releaseStream();await page.waitForFunction(()=>window.inspectorConnected===true);
-   await page.waitForFunction(()=>document.querySelectorAll('.hd-ins__row').length===60,null,{timeout:5000});
+   await page.waitForFunction(()=>document.querySelectorAll('.hd-ins__row').length===60,null,{timeout:scaled(5000)});
    assert.ok(reads>=2,'a connected stream must resynchronize even while its initial snapshot is pending');
    releaseSnapshot();await fulfilled;await page.evaluate(()=>new Promise(requestAnimationFrame));
    assert.equal(await page.locator('.hd-ins__row').count(),60);
@@ -1176,7 +1176,7 @@ test('inspector HTTP cursor catches events received before its baseline even whe
    await page.evaluate(()=>window.inspectorBuffered.slice(50).forEach(deliver=>deliver()));
    await page.clock.runFor(2200);const cursor=await delta;
    assert.equal(cursor,baselineRevision,'stream rows cannot advance the HTTP synchronization cursor past unseen events');
-   await page.waitForFunction(()=>document.querySelectorAll('.hd-ins__row').length===60,null,{timeout:5000});
+   await page.waitForFunction(()=>document.querySelectorAll('.hd-ins__row').length===60,null,{timeout:scaled(5000)});
    assert.match(await page.locator('#ins-list').innerText(),/cursor-0/);
    assert.match(await page.locator('#ins-list').innerText(),/cursor-59/);
   }finally{gates.forEach(release=>release());}
@@ -1203,7 +1203,7 @@ test('CI catalog keeps filters and step inspection through refresh and shows sta
     await page.locator('[data-ci-workspace="runs"]').click();
     const search=page.getByRole('searchbox',{name:'Search runs'});await search.fill('spectra');await search.focus();
     const before=logReads;authError=true;
-    await page.waitForFunction(()=>document.body.innerText.includes('Woodpecker authentication failed'),{},{timeout:12000});
+    await page.waitForFunction(()=>document.body.innerText.includes('Woodpecker authentication failed'),{},{timeout:scaled(12000)});
     assert.ok(reads>=2);assert.ok(logReads>before);
     assert.equal(await search.inputValue(),'spectra');assert.equal(await search.evaluate(e=>e===document.activeElement),true);
     await page.locator('[data-ci-workspace="health"]').click();
@@ -1239,11 +1239,11 @@ test('Reviews groups decisions and preserves plan inspection with safe upstream 
     await page.locator('#ig-results').getByText('Plan and feedback',{exact:true}).first().click();
     await page.waitForFunction(()=>document.querySelector('#ig-results .ig-log')?.textContent.includes('Detail 1'));
     const before=reads;
-    await page.waitForTimeout(5500);
+    await page.waitForTimeout(scaled(5500));
     assert.ok(reads>before);assert.equal(await page.locator('#ig-results details[data-review-details]').first().evaluate(e=>e.open),true);
     assert.equal(await page.locator('#ig-results .ig-log script').count(),0);assert.equal(detailReads,1);
     reviews[0].updated_at='2026-10-20T12:01:00Z';
-    await page.waitForFunction(()=>document.querySelector('#ig-results .ig-log')?.textContent.includes('Detail 2'),{},{timeout:12000});
+    await page.waitForFunction(()=>document.querySelector('#ig-results .ig-log')?.textContent.includes('Detail 2'),{},{timeout:scaled(12000)});
     assert.equal(detailReads,2);
     await page.getByRole('tab',{name:/^Changes requested/}).click();
     await page.locator('#ig-results').getByText('Revise decoder',{exact:true}).waitFor();

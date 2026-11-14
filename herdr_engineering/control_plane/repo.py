@@ -2925,6 +2925,8 @@ class ControlPlaneRepo:
                 ev["ingest_timestamp"] = env["received_at"]
                 ev["mission_id"] = mission_id or env.get("mission_id")
                 meta = {"content_sha256": env["content_hash"]}
+                if env.get("agent_ops"):
+                    meta["agent_ops"] = dict(env["agent_ops"])
                 if env.get("lineage_seq") is not None:
                     meta["lineage_seq"] = env["lineage_seq"]
                 if env.get("lineage_mode"):
