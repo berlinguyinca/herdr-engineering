@@ -155,7 +155,8 @@ test('the client source reads the host list then one event page per host, over r
   try {
     const request = async (path) => { const response = await fetch(`${origin}${path}`); const body = await response.json(); if (!response.ok) throw new Error(`HTTP ${response.status}`); return body; };
     const read = await loadDiagnostics(createHostDiagnosticsSource({ request }));
-    assert.deepEqual([...requests].sort(), ['/api/v1/events?entity_type=host&entity_id=farm&limit=50', '/api/v1/events?entity_type=host&entity_id=hive&limit=50', '/api/v1/hosts', '/api/v1/hosts'], 'the hosts feed (once per section), then one page per host — no other URL');
+    assert.deepEqual([...requests].sort(), ['/api/v1/events?entity_type=host&entity_id=farm&limit=50', '/api/v1/events?entity_type=host&entity_id=hive&limit=50', '/api/v1/hosts'],
+      'one host-list read shared by both sections, then one page per host, and no other URL: a second GET whose answer could disagree with the first is not a second opinion')
     assert.deepEqual(read.events.timeline.map((e) => e.id), envelope.events.map((e) => e.event_id), 'the host that answered is shown, in the page order the server gave');
     assert.match(read.events.note, /farm could not be read/);
     assert.equal(read.events.partial, true);

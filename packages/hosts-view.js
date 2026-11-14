@@ -93,8 +93,9 @@ export function mountHosts(container, client, { data = null, driftedOnly = false
 // Host diagnostics is the one page here that is NOT live: H03 reads each feed once and the plan forbids polling it, so this mount starts no
 // refresh bus, no poll, no timer and no control, writes what that single read could see, and returns nothing. What H03 could not read travels
 // through as `unavailable`, so a section that failed renders its unavailable banner instead of an empty list that would read as "nothing is wrong".
-// The events feed carries events, not incidents, and mapping one onto the other would mean inventing a severity, so H04 shows what it cannot use
-// as a rejected record. The same feeds carry no drift report, so H06 prints unknown for every field rather than a value supplied here.
+// Issues are the host problems the feed reported, mapped to H02 incidents with their own severity; an event carries no severity, so events are
+// never turned into issues here, and H04 shows anything it cannot use as a rejected record. The same feeds carry no drift report, so H06 prints
+// unknown for every field rather than a value supplied here.
 // The hosts the page actually read, named: host id, the status and instant the feed reported, and how many
 // problems it reported with them. A host list that could not be read says so — an empty grid would otherwise
 // read as "no hosts".

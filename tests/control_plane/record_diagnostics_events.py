@@ -58,13 +58,16 @@ def post(server, path, body):
         return response.status, json.load(response)
 
 
-def stable(event, index):
-    """Keep the shape and the semantics, drop the run-specific identifiers."""
+def stable(event):
+    """Keep the shape and the semantics, drop the run-specific identifiers.
+
+    The id is derived from the event's own `sequence`, which the server assigns and which is stable across pages,
+    so the same event carries the same recorded id in the limit=50 page and in the limit=1 page. Renumbering by
+    position would make `event_recorded_0` a different event in each page."""
     out = dict(event)
-    out["event_id"] = f"event_recorded_{index}"
-    out["source_timestamp"] = f"2026-11-14T02:0{index}:00+00:00"
-    out["ingest_timestamp"] = f"2026-11-14T02:0{index}:01+00:00"
-    out["sequence"] = index
+    out["event_id"] = f"event_recorded_{event['sequence']}"
+    out["source_timestamp"] = f"2026-11-14T02:0{event['sequence']}:00+00:00"
+    out["ingest_timestamp"] = f"2026-11-14T02:0{event['sequence']}:01+00:00"
     return out
 
 
@@ -98,9 +101,9 @@ def record():
             },
             "events_bare": {"status": bare_status, "body": pin(bare_body)},
             "events_host_hive": {"status": page_status, "body": pin({**page_body,
-                                     "events": [stable(e, i) for i, e in enumerate(page_body["events"])]})},
+                                     "events": [stable(e) for e in page_body["events"]]})},
             "events_host_hive_limit_1": {"status": first_status, "body": pin({**first_page,
-                                     "events": [stable(e, 0) for e in first_page["events"]]})},
+                                     "events": [stable(e) for e in first_page["events"]]})},
             "hosts": {"status": hosts_status, "body": pin(hosts_body)},
         }
         OUT.write_text(json.dumps(fixture, indent=1, sort_keys=True) + "\n")
