@@ -52,6 +52,10 @@ tiers:
     time_cap_s: 3600                     # ONE cap shared by all passes: each pass may use an equal share of what is left
                                          # (four passes ~ 900 s each; unused time passes on to the later ones)
     comment: true                        # one marked PR comment (updated in place) when it blocks
+    # daily_budget_usd: 25               # optional; unset = no limit. Before each review the poller sums this tier's
+                                         # cost_usd in state_dir/reviews.jsonl since 00:00 UTC; at or over the budget the
+                                         # review is skipped (one log line, status left as it is, even with --force).
+                                         # Finished reviews are never affected. Must be a positive number.
     passes:                              # one sequential claude run per pass; `passes: []` = one unfocused review
       - {name: general, focus: "Review the change as a whole: correctness, design, and anything the other passes would miss."}
       - {name: tests, focus: "Focus on the tests: isolation, order dependence, global state, resource leaks, and whether they prove the change."}

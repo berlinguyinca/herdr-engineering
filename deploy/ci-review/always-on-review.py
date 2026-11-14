@@ -27,6 +27,7 @@ import hashlib
 import datetime as dt
 import importlib.util
 import json
+import math
 import os
 import re
 import secrets
@@ -77,9 +78,10 @@ DEFAULTS: dict = {
                "reviewers": []},        # logins (bots too) whose review comments `corpus build` counts; humans always count
     "tiers": {
         "tier1": {"enabled": True, "context": "Open-weight pre-review", "backend": "pi",
-                  "model": "metabolomics/qwen3.8-27b", "time_cap_s": 900, "comment": False},
+                  "model": "metabolomics/qwen3.8-27b", "time_cap_s": 900, "comment": False,
+                  "daily_budget_usd": None},     # None = no limit; else skip once today's (UTC) logged cost_usd reaches it
         "tier2": {"enabled": True, "context": "Opus agent review", "backend": "claude", "model": "opus",
-                  "time_cap_s": 1800, "comment": True, "passes": []},     # [{name, focus}]; [] = one unfocused review
+                  "time_cap_s": 1800, "comment": True, "passes": [], "daily_budget_usd": None},     # [{name, focus}]; [] = one unfocused review
     },
     "backends": {
         "gateway": {**ai.DEFAULTS["reviewer"], "chunk_bytes": 24000},
@@ -115,6 +117,9 @@ def load_config(path: str | None) -> dict:
             raise Refused(f"config: tiers.{name}.context must be 1..100 characters")
         if t["time_cap_s"] < 10:
             raise Refused(f"config: tiers.{name}.time_cap_s must be at least 10")
+        b = t.get("daily_budget_usd")
+        if b is not None and (isinstance(b, bool) or not isinstance(b, (int, float)) or not math.isfinite(b) or b <= 0):
+            raise Refused(f"config: tiers.{name}.daily_budget_usd must be a positive number (or unset for no limit)")
         contexts.append(t["context"])
     if len(set(contexts)) != len(contexts):
         raise Refused("config: tier contexts must differ")
@@ -1010,6 +1015,27 @@ def log_findings(findings: tuple[Finding, ...]) -> list[dict]:
              **({"downgraded": True} if f.downgraded else {})} for f in findings[:LOG_FINDINGS_MAX]]
 
 
+def spent_today_usd(cfg: dict, tier_name: str) -> float:
+    """The cost_usd the tier's reviews logged in reviews.jsonl since 00:00 UTC today (any state: a partial or dry-run
+    review spent money too). Unreadable lines and lines without a numeric cost count as zero."""
+    today = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d")
+    total = 0.0
+    try:
+        lines = (ai.expand(cfg["state_dir"]) / "reviews.jsonl").read_text().splitlines()
+    except OSError:
+        return 0.0
+    for raw in lines:
+        try:
+            e = json.loads(raw)
+            cost = e["usage"]["cost_usd"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        if (isinstance(e, dict) and e.get("tier") == tier_name and str(e.get("ts", "")).startswith(today)
+                and isinstance(cost, (int, float)) and not isinstance(cost, bool)):
+            total += cost
+    return total
+
+
 def log_line(cfg: dict, **kv) -> None:
     kv = {"ts": dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), **kv}
     line = ai.redact(json.dumps(kv))
@@ -1095,6 +1121,11 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
             if not green:
                 ai.say(f"{key} @ {sha[:12]}: waiting for gates: {', '.join(missing)}")
                 return SKIPPED
+        budget = tier.get("daily_budget_usd")
+        if budget is not None and (spent := spent_today_usd(cfg, tier_name)) >= budget:
+            ai.say(f"{key} @ {sha[:12]}: {tier_name} daily budget exhausted (${spent:.2f} of ${budget:.2f} spent today, "
+                   "UTC); review skipped, status unchanged")
+            return SKIPPED
         backend = make_backend(cfg, tier)
         try:
             return _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started)
