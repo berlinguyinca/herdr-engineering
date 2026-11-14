@@ -15,6 +15,7 @@ from __future__ import annotations
 import http.server
 import importlib.util
 import json
+import os
 import re
 import shutil
 import ssl
@@ -196,11 +197,7 @@ class GitHubApi:
         if m == "GET" and p == f"/repos/{REPO}/issues/7/comments":
             page = int(r["query"].get("page", ["1"])[0])
             return 200, self.comments if page == 1 else [], "application/json"
-        if (
-            m == "GET"
-            and p == f"/repos/{REPO}/contents/src/a%20b.py".replace("%20", " ")
-            or unquote(p) == f"/repos/{REPO}/contents/src/a b.py"
-        ):
+        if m == "GET" and unquote(p) == f"/repos/{REPO}/contents/src/a b.py":
             return 200, b"x = 1\ny = eval(x)\n", "text/plain"
         if m == "POST" and p == f"/repos/{REPO}/statuses/{SHA}":
             s = json.loads(r["body"])
@@ -240,6 +237,7 @@ def env(api, tmp_path, monkeypatch):
     monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "ghcfg"))
     monkeypatch.setenv("SSL_CERT_FILE", str(api.cert))
     monkeypatch.setenv("GH_PROMPT_DISABLED", "1")
+    monkeypatch.setenv("GH_NO_UPDATE_NOTIFIER", "1")
     api.requests.clear()
     api.statuses.clear()
     api.comments.clear()
@@ -432,16 +430,29 @@ def test_commit_subjects_lose_control_characters(env, ai):
     assert "\x00" not in c["messageBody"]
 
 
-def test_gh_token_env_values_are_registered_for_redaction(env, always, monkeypatch):
+def test_gh_token_env_values_are_registered_for_redaction(env, always, monkeypatch, tmp_path):
+    """No gh on PATH and an empty HOME: the env-var half of register_gh_secret runs without touching any real gh
+    credential. (A real `gh auth token` would also consult the OS keyring, which HOME does not isolate: running this
+    with gh on PATH added the operator's own token to the redaction set.)"""
+    home = tmp_path / "emptyhome"
+    home.mkdir()
+    nobin = tmp_path / "nobin"
+    nobin.mkdir()
+    monkeypatch.setenv("PATH", str(nobin))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
     monkeypatch.setenv("GH_TOKEN", "ghp_ENVTOKEN0123456789abcdefABCDEF")
     monkeypatch.setenv("GITHUB_TOKEN", "ghs_GHACTIONS0123456789abcdefABCDEF")
     saved = set(always.ai.REDACT)
     try:
         always.register_gh_secret()
-        assert {
+        # Exactly the two env tokens: had the real HOME been read, the operator's own token would be added too.
+        assert always.ai.REDACT - saved == {
             "ghp_ENVTOKEN0123456789abcdefABCDEF",
             "ghs_GHACTIONS0123456789abcdefABCDEF",
-        } <= always.ai.REDACT
+        }
+        assert os.environ["HOME"] == str(home) and not (home / ".config").exists()
     finally:
         always.ai.REDACT.clear()
         always.ai.REDACT.update(saved)
