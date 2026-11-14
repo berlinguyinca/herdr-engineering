@@ -42,7 +42,7 @@ test('the page shows no developer commentary: the rendered text carries no comme
   }));
   const shown = html.replace(/<[^>]*>/g, ' ');        // what a reader sees, markup stripped
   assert.ok(!shown.includes('//'), `a comment line is rendered as page text: ${shown.slice(0, 240)}`);
-  assert.ok(!shown.includes('Error issues'), 'the retired heading must not appear anywhere on the page');
+  assert.ok(!html.includes('Error issues'), 'the retired wording must not survive anywhere in the markup, not even as a screen-reader label');
   assert.equal((shown.match(/Problems the host feed reported/g) || []).length, 1);   // the scope note is said once
 });
 

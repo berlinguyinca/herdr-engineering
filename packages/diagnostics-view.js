@@ -1,4 +1,4 @@
-// The error issue list (H04): what the host diagnostics feeds reported, as read-only cards — fingerprint, severity, occurrences,
+// The host issue list (H04): what the host diagnostics feeds reported, as read-only cards — fingerprint, severity, occurrences,
 // sessions, last seen and recovery state. Nothing is fetched, clicked, timed or counted here, and nothing is invented: a figure the record
 // does not carry reads "unknown" (never zero, never "resolved"), a record H02 refuses is shown as a rejected record instead of a half-rendered
 // card, and a section H03 could not read says so instead of an empty list that looks like "no issues". An issue record is either an H02 incident
@@ -52,5 +52,5 @@ export function renderIssueList(incidents, { state } = {}) {
   const withheld = describeUnavailable(state?.unavailable);
   const banner = withheld ? note('unavailable', `${withheld}, so what is listed here — or not listed — is not evidence about the part that could not be read`)
     : plain(state) && state.partial ? note('partial', 'the feeds reported a partial page, so issues beyond what arrived are not listed') : '';
-  return `${STYLE}${banner}${!views.length && !banner ? note('empty', 'nothing was reported by the feeds that could be read') : ''}<ul class="diag-list" role="list" aria-label="Error issues">${cards}${rejected}</ul>`;
+  return `${STYLE}${banner}${!views.length && !banner ? note('empty', 'nothing was reported by the feeds that could be read') : ''}<ul class="diag-list" role="list" aria-label="Host issues">${cards}${rejected}</ul>`;
 }
