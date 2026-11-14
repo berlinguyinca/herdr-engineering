@@ -683,20 +683,20 @@ class AgentOpsService:
         self._collab, self._collab_source = value, None
 
     def viewer(self, principal: Any = None, operator: bool = False) -> Viewer:
-        rooms = frozenset(self.collab.readable_room_ids(principal)) if self.collab and principal is not None else frozenset()
-        guests = self._guest_rooms(principal, rooms)
+        collab = self.collab                 # read once: one request sees one collab object
+        rooms = frozenset(collab.readable_room_ids(principal)) if collab and principal is not None else frozenset()
+        guests = self._guest_rooms(principal, rooms, collab)
         # Fail closed: someone who is (or ever was) a guest and reads no other room has nothing to see. A lapsed or
         # revoked guest keeps a valid sign-in, so without this they would fall back to org-scoped visibility.
         external = bool(getattr(principal, "external", False))
         # An external agent is chat-only like a guest: its bound room(s) are the only sources it may read, and with no
         # room left (binding expired or revoked) it reads nothing, never the org scope.
-        guest_only = external or (bool(guests) and guests == rooms) or (not rooms and self._was_guest(principal))
+        guest_only = external or (bool(guests) and guests == rooms) or (not rooms and self._was_guest(principal, collab))
         return Viewer(rooms=rooms, operator=operator, external=external,
                       guest_rooms=rooms if external else guests, guest_only=guest_only)
 
-    def _was_guest(self, principal: Any) -> bool:
+    def _was_guest(self, principal: Any, collab: Any) -> bool:
         """Latest membership was a guest one. For an agent, only when its owner reads no room other than guest rooms."""
-        collab = self.collab
         if collab is None or principal is None:
             return False
         with collab._lock:
@@ -707,11 +707,10 @@ class AgentOpsService:
         if is_user:
             return True
         owner_rooms = frozenset(collab.readable_room_ids(type(principal)("user", uid, uid)))
-        return not owner_rooms or owner_rooms == self._guest_rooms(type(principal)("user", uid, uid), owner_rooms)
+        return not owner_rooms or owner_rooms == self._guest_rooms(type(principal)("user", uid, uid), owner_rooms, collab)
 
-    def _guest_rooms(self, principal: Any, rooms: frozenset) -> frozenset:
+    def _guest_rooms(self, principal: Any, rooms: frozenset, collab: Any) -> frozenset:
         """Rooms where the caller (or the person an agent acts for) is a guest."""
-        collab = self.collab
         if collab is None or principal is None or not rooms:
             return frozenset()
         with collab._lock:
