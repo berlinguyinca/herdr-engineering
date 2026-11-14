@@ -17,6 +17,7 @@ import re
 
 from ..host_policy import normalize_aliases
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
+from .admission import AdmissionContext
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
 from .federation import (
@@ -431,7 +432,10 @@ class IngestService:
                             and not payload.get("occurred_at"):
                         payload = {**payload, "occurred_at": env.get("occurred_at") or env.get("received_at")}
                     result = self._dispatch(entity_type, entity_id, event_type, payload, source,
-                                            record_generic=False)
+                                            record_generic=False,
+                                            admission=(AdmissionContext.from_admitted(env, entity_id)
+                                                if entity_type == "inspector" and callable(getattr(
+                                                    self.repo._sink, "record_required", None)) else None))
             finally:
                 # The row is durable, so its (source, sequence) is consumed even
                 # if the handler then fails; the failure is reported once.
@@ -548,7 +552,7 @@ class IngestService:
                     not isinstance(r, dict) for r in results):
                 raise ValueError("results must be a list of objects")
     def _dispatch(self, entity_type, entity_id, event_type, payload, source,
-                  record_generic=True) -> dict:
+                  record_generic=True, *, admission: AdmissionContext | None = None) -> dict:
         # System-graph live-ingest adapter (opt-in): reflect lifecycle events
         # into the running lineage graph as lineage envelopes. Best-effort: a
         # failure here is logged inside the adapter and never breaks the source
@@ -603,7 +607,7 @@ class IngestService:
             # by the store; not recorded on the global event feed.
             if "kind" not in payload and "events" not in payload and event_type != "inspector.batch":
                 payload = {**payload, "kind": event_type.removeprefix("inspector.")}
-            res = self.repo.inspector.ingest(entity_id, payload)
+            res = self.repo.inspector.ingest(entity_id, payload, admission=admission)
             return {"entity_type": "inspector", "entity_id": entity_id,
                     "event_type": event_type, **res}
         if entity_type in ("test_run", "build"):
