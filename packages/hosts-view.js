@@ -11,6 +11,7 @@ import { loadDiagnostics, SECTIONS } from './diagnostics-source.js';
 import { renderIssueList } from './diagnostics-view.js';
 import { renderSessionTimeline } from './diagnostics-timeline.js';
 import { renderDriftComparison } from './task-drift-view.js';
+import { escapeHtml } from './herdr-web-components/util.js';
 
 // Motion keys: a meter by host and kind, a fleet cell by component row and host. Matrix rows are
 // paired by position in morph, so the key is the row's component name, never the DOM node.
@@ -94,12 +95,30 @@ export function mountHosts(container, client, { data = null, driftedOnly = false
 // through as `unavailable`, so a section that failed renders its unavailable banner instead of an empty list that would read as "nothing is wrong".
 // The events feed carries events, not incidents, and mapping one onto the other would mean inventing a severity, so H04 shows what it cannot use
 // as a rejected record. The same feeds carry no drift report, so H06 prints unknown for every field rather than a value supplied here.
+// The hosts the page actually read, named: host id, the status and instant the feed reported, and how many
+// problems it reported with them. A host list that could not be read says so — an empty grid would otherwise
+// read as "no hosts".
+function renderHostsRead(hosts, unavailable) {
+  if ((Array.isArray(unavailable) ? unavailable : []).includes('hosts')) return '<p class="diag-note" data-diagnostics-hosts-unavailable>the host list could not be read, so no host is named here</p>';
+  const rows = (Array.isArray(hosts?.items) ? hosts.items : []).filter((host) => host && typeof host === 'object');
+  if (!rows.length) return '<p class="diag-note" data-diagnostics-hosts-empty>the host list is empty</p>';
+  const shown = (value) => (typeof value === 'string' && value.trim() ? escapeHtml(value) : 'unknown');
+  return `<ul class="diag-list" role="list" aria-label="Hosts read">${rows.map((host) => `<li class="diag-card" data-diagnostics-host data-host-id="${escapeHtml(String(host.host_id ?? ''))}">`
+    + `<h3>${shown(text(host.host_id))}</h3><div class="diag-fields">${hostField('status', text(host.status))}${hostField('problems', Number.isInteger(host.problem_count) ? String(host.problem_count) : 'unknown')}${hostField('last seen', text(host.last_seen))}</div></li>`).join('')}</ul>`;
+}
+const hostField = (label, value) => `<div class="diag-field"><b>${escapeHtml(value || 'unknown')}</b><span>${escapeHtml(label)}</span></div>`;
+const text = (v) => (typeof v === 'string' ? v : '');
+
 export async function mountDiagnostics(container, { source } = {}) {
   const read = await loadDiagnostics(source).catch(() => null);   // loadDiagnostics already swallows every feed failure; this covers a source that is not a source at all
-  const diagnostics = read || { events: { timeline: [] }, unavailable: [...SECTIONS], partial: true };
+  const diagnostics = read || { events: { timeline: [] }, issues: { items: [] }, hosts: { items: [] }, unavailable: [...SECTIONS], partial: true };
   const events = diagnostics.events?.timeline || [];
+  // Task drift keeps its "unknown" reading: no feed on this page carries an expected-versus-actual pair, and
+  // H06 says an unreported comparison is unknown, not zero. Passing null says that explicitly.
   container.innerHTML = `<h1>Diagnostics</h1>
-    <section data-diagnostics-issues><h2>Error issues</h2>${renderIssueList(events, { state: diagnostics })}</section>
+    ${diagnostics.note ? `<p class="diag-note" role="status" data-diagnostics-note>${escapeHtml(diagnostics.note)}</p>` : ''}
+    <section data-diagnostics-hosts><h2>Hosts read</h2>${renderHostsRead(diagnostics.hosts, diagnostics.unavailable)}</section>
+    <section data-diagnostics-issues><h2>Error issues</h2>${renderIssueList(diagnostics.issues?.items || [], { state: diagnostics })}</section>
     <section data-diagnostics-timeline><h2>Session timeline</h2>${renderSessionTimeline(events, { unavailable: diagnostics.unavailable })}</section>
-    <section data-diagnostics-drift><h2>Task drift</h2>${renderDriftComparison(diagnostics.drift)}</section>`;
+    <section data-diagnostics-drift><h2>Task drift</h2>${renderDriftComparison(null)}</section>`;
 }

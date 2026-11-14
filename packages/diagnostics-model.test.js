@@ -23,10 +23,24 @@ test('an unusable incident is rejected with reasons, never repaired into looking
 test('an event needs identity, a finite instant, a type, and a plain object payload at most', () => {
   const ok = event('e1', 3, { payload: { status: 'running' }, sessionId: 's1' });
   assert.deepEqual(normalizeEvent(ok), { ok: true, event: { ...ok } });
-  const cases = [[{ id: 'e1', at: 1, eventType: 'status' }, 'missionKey must be a non-empty string'], [event('', 1), 'id must be a non-empty string'], [event('e1', '2026-11-08T12:00:00Z'), 'at must be a finite number'],
+  const cases = [[event('e6', 1, { missionKey: '' }), 'missionKey must be a non-empty string when present'], [event('', 1), 'id must be a non-empty string'], [event('e1', '2026-11-08T12:00:00Z'), 'at must be a finite number'],
     [event('e1', Infinity), 'at must be a finite number'], [event('e2', 1, { eventType: '' }), 'eventType must be a non-empty string'], [event('e3', 1, { payload: [] }), 'payload must be a plain object when present'],
-    [event('e4', 1, { missionKey: 9 }), 'missionKey must be a non-empty string'], [event('e5', 1, { html: '<b>' }), 'unknown key html']];
+    [event('e4', 1, { missionKey: 9 }), 'missionKey must be a non-empty string when present'], [event('e5', 1, { html: '<b>' }), 'unknown key html']];
   for (const [raw, phrase] of cases) rejects(normalizeEvent, raw, phrase);
+});
+
+test('a record with no mission is a valid point, because host-scoped events carry none', () => {
+  // Measured against the real control plane (`GET /api/v1/events?entity_type=host&entity_id=hive`, recorded in
+  // tests/fixtures/diagnostics_events_host.json): every host-scoped envelope has `mission_id: null` — the
+  // ingest path binds a host record to its host, not to a mission. A model that required a missionKey would
+  // drop every record the host diagnostics page can actually read. A mission filter still excludes it.
+  const hostScoped = Object.freeze({ id: 'event_recorded_1', at: 5, eventType: 'HostHeartbeat', hostId: 'hive' });
+  assert.deepEqual(normalizeEvent(hostScoped), { ok: true, event: hostScoped });
+  const items = [event('m1_record', 5), hostScoped];
+  assert.deepEqual(buildTimeline(items).timeline.map((e) => e.id), ['m1_record', 'event_recorded_1']);
+  const filtered = buildTimeline(items, { missionKey: 'm1' });
+  assert.deepEqual(filtered.timeline.map((e) => e.id), ['m1_record']);
+  assert.equal(filtered.dropped, 1);
 });
 
 test('events sharing an instant keep the order they arrived in', () => {

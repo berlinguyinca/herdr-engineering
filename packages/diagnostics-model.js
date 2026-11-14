@@ -23,12 +23,19 @@ export function normalizeIncident(raw) {
   return errors.length ? { ok: false, errors } : { ok: true, incident: { ...raw } };
 }
 
-/** One point on the timeline: its mission, when it happened (a number, never a clock reading), and what kind of thing it is. */
+/**
+ * One point on the timeline: identity, when it happened (a number, never a clock reading), what kind of thing it
+ * is, and — only when the feed binds one — the mission it belongs to. missionKey is optional because host-scoped
+ * records carry none: measured on the real control plane, `GET /api/v1/events?entity_type=host&entity_id=hive`
+ * answers envelopes with `mission_id: null` (recorded in tests/fixtures/diagnostics_events_host.json), so a
+ * required mission would discard every record the host diagnostics page can read. A mission filter still
+ * excludes a mission-less record; it is simply not identity.
+ */
 export function normalizeEvent(raw) {
   if (!plain(raw)) return { ok: false, errors: ['event must be a plain object'] };
   const errors = extraKeys(raw, EVENT_KEYS);
   if (!text(raw.id)) errors.push('id must be a non-empty string');
-  if (!text(raw.missionKey)) errors.push('missionKey must be a non-empty string');
+  if (raw.missionKey !== undefined && !text(raw.missionKey)) errors.push('missionKey must be a non-empty string when present');
   if (!finite(raw.at)) errors.push('at must be a finite number');
   if (!text(raw.eventType)) errors.push('eventType must be a non-empty string');
   if (raw.payload !== undefined && !plain(raw.payload)) errors.push('payload must be a plain object when present');
