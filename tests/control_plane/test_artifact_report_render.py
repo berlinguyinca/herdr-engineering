@@ -882,3 +882,44 @@ def test_everything_that_fits_is_kept_and_a_tight_cap_is_still_respected():
     assert len(tight.encode()) <= cap
     assert tight.count('class="card finding"') > 0 and tight.count('id="evidence-') > 0
     assert "Some content was shortened or omitted" in tight
+
+
+# --- share-aware wording, size cap after wording, quota rounding -------------------------------------------------
+
+def _long_field_report(length=3000):
+    report = descriptor()
+    report["findings"][0]["statement"] = "long " * (length // 5)
+    return report
+
+
+def test_share_markers_for_a_long_field_never_point_at_the_descriptor():
+    from herdr_engineering.control_plane.artifact_share_api import _report_preview
+
+    public = _report_preview(_long_field_report()).decode()
+    assert "text shortened" in public
+    assert "see full descriptor" not in public and "full descriptor" not in public
+    assert "[text shortened; the full report is available to its owner]" in public
+    owner = _render(_long_field_report())
+    assert "[text shortened; see full descriptor]" in owner
+
+
+def test_share_wording_never_pushes_the_page_over_the_cap():
+    from herdr_engineering.control_plane.artifact_share_api import _report_preview
+
+    report = _big_report(findings=30, evidence=30)
+    for finding in report["findings"]:
+        finding["statement"] = "wordy " * 600
+    for cap in (4096, 6000, 9000, 16 * 1024, 64 * 1024):
+        public = _report_preview(report, max_bytes=cap)
+        assert len(public) <= cap, cap
+        assert b"full descriptor" not in public
+
+
+def test_quota_rounding_leftover_is_distributed_not_dropped():
+    # At this cap the integer-division remainder used to be dropped, costing one entry that fits (38 kept, not 39).
+    report = _big_report(findings=12, evidence=40)
+    report["assets"] = report["assets"][:3]
+    for row in report["evidence"]:
+        row["asset_ids"] = ["a0"]
+    page = _render(report, max_bytes=40212)
+    assert page.count('class="card finding"') + page.count('id="evidence-') == 39
