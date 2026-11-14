@@ -133,6 +133,13 @@ if name == "claude":
                                  "total_cost_usd": 0.5, "usage": cfg.get("usage", {"input_tokens": 10, "output_tokens": 5}),
                                  "modelUsage": {"claude-opus-5-5": {}},
                                  **({"num_turns": cfg["num_turns"]} if "num_turns" in cfg else {})}))
+elif name == "codex":
+    out = sys.argv[sys.argv.index("--output-last-message") + 1]
+    open(out, "w").write(ans if isinstance(ans, str) else json.dumps(ans))
+    sys.stdout.write(json.dumps({"type": "thread.started"}) + "\n")
+    if "usage" in cfg or not cfg.get("no_usage"):
+        sys.stdout.write(json.dumps({"type": "turn.completed", "usage": cfg.get(
+            "usage", {"input_tokens": 1000000, "cached_input_tokens": 0, "output_tokens": 500000})}) + "\n")
 else:
     sys.stdout.write(ans if isinstance(ans, str) else json.dumps(ans))
 '''
@@ -156,7 +163,7 @@ class Env:
     def __init__(self, tmp: Path, monkeypatch):
         self.tmp, self.bin = tmp, tmp / "bin"
         self.bin.mkdir()
-        for name, body in (("gh", FAKE_GH), ("claude", FAKE_REVIEWER), ("pi", FAKE_REVIEWER)):
+        for name, body in (("gh", FAKE_GH), ("claude", FAKE_REVIEWER), ("pi", FAKE_REVIEWER), ("codex", FAKE_REVIEWER)):
             (self.bin / name).write_text(body)
             (self.bin / name).chmod(0o755)
         self.origin, self.clone = tmp / "origin.git", tmp / "clone"
@@ -183,6 +190,7 @@ class Env:
             "check_runs": {self.head: [{"name": "GitGuardian Security Checks", "conclusion": "success"}]}})
         self.reviewer("claude", answer=APPROVE)
         self.reviewer("pi", answer=APPROVE)
+        self.reviewer("codex", answer=APPROVE)
         monkeypatch.setenv("HOME", str(self.home))
         monkeypatch.setenv("PATH", f"{self.bin}:{os.environ['PATH']}")
         monkeypatch.setenv("GH_TOKEN", "ghp_NOTFORREVIEWERS")
@@ -833,3 +841,217 @@ def test_a_pass_that_hits_the_time_cap_does_not_recount_the_previous_passes_usag
     req = env.mod.ReviewRequest(REPO, 7, env.head, "t", "", "", "", [])
     result = env.mod.run_passes(cfg, tier, Slow(), req, None)
     assert result.partial and result.usage["cost_usd"] == 0.5
+
+
+# ---------------- Codex second reviewer on risky paths ----------------
+
+RISKY = """
+    risky:
+      globs: ["src/**"]
+"""
+PRICES = ", input_usd_per_mtok: 2, output_usd_per_mtok: 10"       # the stand-in's usage costs 2 + 5 = 7 dollars
+
+
+def codex_calls(env):
+    return [c for c in env.reviewer_calls() if c["tool"] == "codex"]
+
+
+def only_pending(env):
+    return [s["state"] for s in env.statuses_posted()] == ["pending"]
+
+
+def test_a_non_risky_pr_never_calls_codex(env):
+    env.config('risky: {globs: ["deploy/**"]}\n', post=True)
+    assert env.review("tier2", post=True) == env.mod.OK
+    assert codex_calls(env) == []
+    assert [s["state"] for s in env.statuses_posted()] == ["pending", "success"]
+
+
+def test_with_no_risky_globs_codex_is_off(env):
+    assert env.review("tier2", post=True) == env.mod.OK          # the default config
+    assert codex_calls(env) == []
+
+
+def test_a_risky_pr_needs_both_verdicts_then_posts_success(env):
+    env.config(RISKY, post=True)
+    assert env.review("tier2", post=True) == env.mod.OK
+    assert [c["tool"] for c in env.reviewer_calls()] == ["claude", "codex"]
+    c = codex_calls(env)[0]
+    assert c["head"] == env.head and c["porcelain"] == ""                 # the exact head, a clean worktree
+    assert "/worktrees/" in c["cwd"]
+    a = c["argv"]
+    assert a[0] == "exec" and a[a.index("--sandbox") + 1] == "read-only"
+    for flag in ("--ephemeral", "--ignore-user-config", "--ignore-rules", "--output-schema"):
+        assert flag in a
+    assert "GH_TOKEN" not in c["env"] and "ANTHROPIC_API_KEY" not in c["env"]
+    assert env.head in c["stdin"] and "UNTRUSTED" in c["stdin"]
+    posted = env.statuses_posted()
+    assert [s["state"] for s in posted] == ["pending", "success"]
+    assert "opus" in posted[-1]["description"] and "codex" in posted[-1]["description"]
+    assert env.worktrees() == [env.worktrees()[0]]                        # removed afterwards
+
+
+def test_a_codex_block_posts_failure_with_its_finding(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=block(why="codex found an eval"))
+    assert env.review("tier2", post=True) == env.mod.OK
+    states = [s["state"] for s in env.statuses_posted()]
+    assert states == ["pending", "failure"]
+    assert any("codex found an eval" in w["body"].get("body", "") for w in env.gh_writes())
+
+
+def test_an_opus_block_decides_failure_without_calling_codex(env):
+    env.config(RISKY, post=True)
+    env.reviewer("claude", answer=block())
+    env.review("tier2", post=True)
+    assert codex_calls(env) == []
+    assert [s["state"] for s in env.statuses_posted()] == ["pending", "failure"]
+
+
+@pytest.mark.parametrize("how", ["exit", "garbage", "wrong-head", "missing-binary", "no-answer-file"])
+def test_codex_that_cannot_run_leaves_the_status_pending(env, how):
+    env.config(RISKY if how != "missing-binary" else RISKY + "      codex: {command: no-such-codex}\n", post=True)
+    if how == "exit":
+        env.reviewer("codex", answer=APPROVE, exit=3)
+    elif how == "garbage":
+        env.reviewer("codex", answer="I approve, trust me")
+    elif how == "wrong-head":
+        env.reviewer("codex", answer={**APPROVE, "head_sha": "0" * 40})
+    elif how == "no-answer-file":
+        (env.bin / "codex").write_text("#!/bin/sh\nexit 0\n")
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    assert only_pending(env)                                           # never a terminal state
+
+
+def test_unverifiable_codex_blockers_leave_the_status_pending(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer={**block(), "findings": [{**block()["findings"][0], "evidence": "this is not code"}]})
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    assert only_pending(env)
+
+
+def test_codex_failures_are_logged_and_cool_down(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=APPROVE, exit=3)
+    for _ in range(3):
+        env.review("tier2", post=True)
+    assert len(codex_calls(env)) == 3
+    assert env.review("tier2", post=True) == env.mod.SKIPPED            # cooling down, no fourth call
+    assert len(codex_calls(env)) == 3
+
+
+def test_a_risky_dry_run_runs_codex_but_posts_nothing(env):
+    env.config(RISKY)
+    assert env.review("tier2") == env.mod.OK
+    assert [c["tool"] for c in env.reviewer_calls()] == ["claude", "codex"]
+    assert env.statuses_posted() == []
+
+
+def test_tier1_never_calls_codex_even_on_risky_paths(env):
+    env.config(RISKY, post=True)
+    env.review("tier1", post=True)
+    assert codex_calls(env) == []
+
+
+def test_a_head_that_moves_during_a_risky_review_posts_nothing_terminal(env):
+    env.config(RISKY, post=True)
+    st = env.gh_state()
+    st["prs"]["7"]["head_after_review"] = "f" * 40
+    env.write_gh(st)
+    assert env.review("tier2", post=True) == env.mod.MOVED
+    assert only_pending(env)
+
+
+def read_log(env):
+    return [json.loads(x) for x in (env.tmp / "state/reviews.jsonl").read_text().splitlines()]
+
+
+def test_codex_cost_is_logged_from_tokens_and_prices(env):
+    env.config(RISKY + "      codex: {" + PRICES.lstrip(", ") + "}\n")
+    env.review("tier2")
+    line = next(x for x in read_log(env) if x["tier"] == "codex")
+    assert line["usage"]["cost_usd"] == 7.0 and line["state"] == "reviewed" and line["sha"] == env.head
+    assert env.mod.spent_today_usd(env.mod.load_config(str(env.cfg_path)), "codex") == 7.0
+
+
+def spend_codex(env, usd):
+    (env.tmp / "state").mkdir(exist_ok=True)
+    now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(env.tmp / "state/reviews.jsonl", "a") as fh:
+        fh.write(json.dumps({"ts": now, "tier": "codex", "usage": {"cost_usd": usd}}) + "\n")
+
+
+def test_an_exhausted_codex_budget_skips_the_risky_review_before_opus_runs(env):
+    env.config(RISKY + "      codex: {daily_budget_usd: 5" + PRICES + "}\n", post=True)
+    spend_codex(env, 5.0)
+    assert env.review("tier2", post=True) == env.mod.SKIPPED
+    assert env.reviewer_calls() == [] and env.statuses_posted() == []    # no Opus spend, status unchanged
+
+
+def test_codex_budget_does_not_touch_non_risky_prs_or_other_tiers(env):
+    env.config('risky: {globs: ["deploy/**"], codex: {daily_budget_usd: 1' + PRICES + '}}\n', post=True)
+    spend_codex(env, 99.0)
+    assert env.review("tier2", post=True) == env.mod.OK
+
+
+def test_below_the_codex_budget_it_runs_and_the_spend_adds_up(env):
+    env.config(RISKY + "      codex: {daily_budget_usd: 10" + PRICES + "}\n")
+    spend_codex(env, 2.0)
+    assert env.review("tier2") == env.mod.OK                             # 2 spent, 10 allowed
+    assert env.mod.spent_today_usd(env.mod.load_config(str(env.cfg_path)), "codex") == 9.0
+    spend_codex(env, 1.0)
+    assert env.review("tier2", "--force") == env.mod.SKIPPED             # --force does not bypass the budget
+
+
+def test_codex_without_token_usage_cannot_be_budgeted_so_it_stays_pending(env):
+    env.config(RISKY + "      codex: {daily_budget_usd: 50" + PRICES + "}\n", post=True)
+    env.reviewer("codex", answer=APPROVE, no_usage=True)
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    assert only_pending(env)
+
+
+@pytest.mark.parametrize("bad", [
+    'risky: {globs: "deploy/**"}', 'risky: {globs: [""]}', 'risky: {globs: ["/etc/**"]}',
+    'risky: {globs: ["../x"]}', 'risky: {codex: {daily_budget_usd: 5}}',
+    'risky: {codex: {daily_budget_usd: -1, input_usd_per_mtok: 1, output_usd_per_mtok: 1}}',
+    'risky: {codex: {time_cap_s: 1}}', 'risky: {codex: {wrapper: "bwrap"}}', 'risky: {codex: {command: ""}}',
+    'risky: {codex: {nope: 1}}', 'risky: {extra: 1}'])
+def test_bad_risky_config_is_refused(env, bad):
+    env.config(bad + "\n")
+    with pytest.raises(env.mod.Refused):
+        env.mod.load_config(str(env.cfg_path))
+
+
+@pytest.mark.parametrize("glob,path,hit", [
+    ("deploy/**", "deploy/a.sh", True), ("deploy/**", "deploy/x/y/z.yaml", True), ("deploy/**", "mydeploy/a", False),
+    ("**/migrations/**", "db/migrations/001.sql", True), ("**/migrations/**", "migrations/001.sql", True),
+    ("**/migrations/**", "db/migrationsx/1.sql", False), ("**/*.sql", "a/b/c.sql", True), ("**/*.sql", "c.sql", True),
+    ("**/*.sql", "c.sqlx", False), ("**/*security*/**", "src/app_security/x.py", True),
+    ("**/*security*/**", "security.py", False), ("**/*auth*", "pkg/oauth.go", True), ("**/*auth*", "pkg/authz/x", False),
+    ("**/secrets*", "a/secrets.env", True), ("**/secrets*", "a/not_secrets.env", False),
+    ("src/?.py", "src/a.py", True), ("src/?.py", "src/ab.py", False), ("a.b", "aXb", False)])
+def test_glob_matching(env, glob, path, hit):
+    assert bool(env.mod.glob_regex(glob).fullmatch(path)) is hit
+
+
+def test_a_file_moved_out_of_a_risky_path_still_counts(env):
+    diff = ("diff --git a/deploy/run.sh b/tools/run.sh\nsimilarity index 100%\nrename from deploy/run.sh\n"
+            "rename to tools/run.sh\n")
+    cfg = {"risky": {"globs": ["deploy/**"]}}
+    assert env.mod.risky_paths(cfg, env.mod.ai.parse_diff(diff)) == ["deploy/run.sh"]
+    assert env.mod.risky_paths({"risky": {"globs": ["docs/**"]}}, env.mod.ai.parse_diff(diff)) == []
+
+
+def test_show_command_prints_the_codex_command_line(env, capsys):
+    assert env.run("show-command", "--tier", "codex") == env.mod.OK
+    out = capsys.readouterr().out
+    assert "codex exec --sandbox read-only" in out and "--ignore-user-config" in out
+    assert env.reviewer_calls() == []
+
+
+def test_posting_still_needs_both_keys_on_a_risky_pr(env):
+    env.config(RISKY, post=True)
+    env.review("tier2")                                                  # config key only, no --post
+    env.config(RISKY, post=False)
+    env.review("tier2", "--force", post=True)                            # flag only, no config key
+    assert env.statuses_posted() == []
