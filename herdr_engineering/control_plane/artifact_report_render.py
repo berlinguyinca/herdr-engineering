@@ -202,7 +202,7 @@ def _flatten(value, prefix: str = ""):
         yield prefix, text
 
 
-def _how_to_read(report: dict, anchors: bool) -> str:
+def _how_to_read(report: dict, anchors: bool, shared: bool = False) -> str:
     """The collapsed "How to read this report" legend. Static text only (no descriptor text is copied in), and a term
     is explained only when this report actually shows it: the labels are the ones ``render_report_preview`` prints.
     The descriptor has no severity or confidence field, and the legend says so rather than inventing a scale."""
@@ -233,21 +233,25 @@ def _how_to_read(report: dict, anchors: bool) -> str:
     if anchors:
         rows.append(("#", "Beside each section, finding and figure heading. It links to exactly that part; copy it to "
                           "share."))
-    rows.append(("Shortened or omitted", "A notice at the end means this is a size-limited preview; the full "
-                                         "descriptor has everything."))
+    rows.append(("Shortened or omitted", "A notice at the end means this is a size-limited preview; "
+                                         + ("the full report is available to its owner." if shared
+                                            else "the full descriptor has everything.")))
     return ('<details class="howto"><summary>How to read this report</summary><dl>'
             + "".join(f"<dt>{term}</dt><dd>{meaning}</dd>" for term, meaning in rows) + "</dl></details>")
 
 
 def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] | None = None,
                           max_bytes: int = DEFAULT_PREVIEW_BYTES,
-                          figure_images: FigureImages | None = None) -> str:
+                          figure_images: FigureImages | None = None, shared: bool = False) -> str:
     """Render a styled preview without opening evidence blobs or executing report source.
 
     Every section has a bounded share of the byte budget so an oversized evidence
     inventory cannot suppress all findings. Whole entries are omitted rather than
     cutting HTML; one small note with counts and the full-descriptor link discloses
     omissions or shortened text, and appears only when something was left out.
+
+    ``shared`` words every pointer to the full report (notice, legend, per-field markers) for a reader who has no
+    descriptor link, so the byte cap already counts the longer text.
 
     ``figure_images`` maps an asset id to ``(media_type, bytes)``; a figure whose asset is present, is an image
     type and fits the per-figure cap is shown inline. Images are the first thing given up when the budget is
@@ -267,7 +271,8 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
         nonlocal shortened
         if len(value) > limit:
             shortened = True
-            value = value[:limit] + " … [text shortened; see full descriptor]"
+            value = value[:limit] + (" … [text shortened; the full report is available to its owner]" if shared
+                                     else " … [text shortened; see full descriptor]")
         return html.escape(value, quote=True)
 
     def tracked(build: Callable, *args) -> tuple[str, bool]:
@@ -412,7 +417,9 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
 
     def note(counts: list[tuple[str, int, int]]) -> str:
         shown = ", ".join(f"{kept} of {total} {label}" for label, kept, total in counts if kept < total)
-        parts = ["Some content was shortened or omitted; see the <a href=\"report\">full descriptor</a>."]
+        parts = ["Some content was shortened or omitted; " + (
+            "the full report is available to its owner." if shared
+            else "see the <a href=\"report\">full descriptor</a>.")]
         if shown:
             parts.append(f"Shown: {shown}.")
         return f'<aside class="notice" role="note">{" ".join(parts)}</aside>'
@@ -424,7 +431,7 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
     summary_html = f'<p class="lede">{text(report["summary"])}</p>' if report.get("summary") else ""
     summary_shortened, shortened = shortened, False
 
-    legend = _how_to_read(report, anchors) if anchors else ""   # same size gate as the permalinks
+    legend = _how_to_read(report, anchors, shared) if anchors else ""   # same size gate as the permalinks
 
     summary_plain = " ".join(str(report.get("summary") or "").split())
     description = html.escape(
@@ -453,7 +460,7 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
                 "</main></body></html>")
 
     # Reserve the largest possible contents list and omission note (every count is no wider than its
-    # total). The title appears twice, so it is cut until the envelope fits even the smallest cap.
+    # total). The title appears in the head, the meta tags and the hero, so it is cut until the envelope fits even the smallest cap.
     worst_note = note([(label, 0, len(items)) for _, _, label, items in present_sections])
     nav_html = toc([(a, t) for a, t, *_ in present_sections])
     for with_meta[0] in (True, False):
@@ -486,8 +493,8 @@ def render_report_preview(descriptor: dict, *, asset_url: Callable[[dict], str] 
     while unspent > 0 and needy:
         total_weight = sum(active[index][4] for index in needy)
         grants = {index: unspent * active[index][4] // total_weight for index in needy}
-        if not any(grants.values()):
-            grants[needy[0]] = unspent
+        for index in needy[: unspent - sum(grants.values())]:    # the rounding leftover, one byte each in order
+            grants[index] += 1
         unspent = 0
         still = []
         for index in needy:
