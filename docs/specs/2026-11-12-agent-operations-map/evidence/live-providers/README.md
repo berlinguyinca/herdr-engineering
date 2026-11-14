@@ -5,7 +5,7 @@ Binaries present: pi 1.3.0, claude 2.1.306, codex-cli 0.167.1, herdr 0.9.1.
 
 | Provider | Result | Mechanism |
 |---|---|---|
-| Pi | Ran: extension loaded in the real Pi runtime; session.started + session.ended only. No model turn: the throwaway PI_CODING_AGENT_DIR has no credentials (real auth.json deliberately not copied). model/context stay unknown. | `pi -e pi.js -p` (`run-pi.sh`) |
+| Pi | Real model turn ran: model `metabolomics/qwen3.8-flash_next`, reply `ok` (`pi-real-reply.out`), the map showed 1 agent at ctx 2% (`pi-real-frame.txt`), using `--no-extensions --no-mcp --no-skills`. With default extensions loaded the run hung until timeout with no events (cause not yet known). Earlier no-credential run: extension loaded, session.started + session.ended only. | `pi -e pi.js -p --no-extensions --no-mcp --no-skills` (`run-pi.sh`) |
 | Claude | Ran: real haiku turn via `--settings` hooks (session-only; user settings untouched; `--setting-sources project`). Model and context unknown: Claude hook payloads carry no model (`hook-claude-payload-keys.txt`). | `run-claude.sh` |
 | Codex | Ran: real `codex exec` with `-c notify=[...]` override (config.toml untouched), then `codex.js rollout <file>`. Model `gpt-6-astra`, context 26981/828400 are real values from the rollout. | `run-codex.sh` |
 | Herdr manifest | `herdr plugin link` succeeded against a throwaway HERDR_HOME/XDG/HOME; real ~/.config/herdr/plugins.json unchanged (`link.out`). | `run-link.sh` |
