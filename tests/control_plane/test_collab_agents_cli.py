@@ -1,7 +1,6 @@
 """`herdr-eng collab agents list|renew`: the real CLI against a real CollabService behind the real operator listener."""
 import json
 import os
-import resource
 import stat
 import subprocess
 import sys
@@ -27,11 +26,21 @@ def short_stack(tmp_path):
     yield from _stack(tmp_path, remote_credential_ttl=2.0)
 
 
+@pytest.fixture
+def capped_stack(tmp_path):
+    yield from _stack(tmp_path, remote_credential_ttl=3.0, max_agents_per_user=1)
+
+
 def connect(stack, name, harness="tui-smoke"):
     s, info = call(stack.op, "POST", f"{BASE}/agents/connect", {"harness_type": harness, "name": name},
                    host=f"127.0.0.1:{stack.op}")
     assert s == 201
     return info
+
+
+# The size limit is set inside the child (never via preexec_fn, which can deadlock with server threads alive in the parent).
+CHILD_CODE = ("import resource, sys; resource.setrlimit(resource.RLIMIT_FSIZE, (0, resource.getrlimit(resource.RLIMIT_FSIZE)[1])); "
+              "from herdr_engineering.cli import main; sys.exit(main(sys.argv[1:]))")
 
 
 def run(stack, *argv):
@@ -171,20 +180,16 @@ def test_a_directory_target_is_refused_before_renewing_even_with_force(stack, tm
     assert agent_authenticates(stack, info)
 
 
-def _limit_file_size():
-    resource.setrlimit(resource.RLIMIT_FSIZE, (0, resource.getrlimit(resource.RLIMIT_FSIZE)[1]))
-
-
 def test_a_failed_write_after_renewing_hands_the_credential_to_stderr_with_a_hint(stack, tmp_path):
     """The real CLI in a process that may not write any file bytes (EFBIG): the old credential is dead, so the new one must survive."""
     info = connect(stack, "diskfull")
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     dest = out_dir / "cred"
-    code = "import sys; from herdr_engineering.cli import main; sys.exit(main(sys.argv[1:]))"
+    code = CHILD_CODE
     done = subprocess.run([sys.executable, "-B", "-c", code, "collab", "agents", "renew", info["agent_id"],
                            "--credential-file", str(dest), "--operator-url", stack.url],
-                          capture_output=True, text=True, preexec_fn=_limit_file_size, timeout=60)
+                          capture_output=True, text=True, timeout=60)
     assert done.returncode == 1 and "Traceback" not in done.stderr
     recovered = [w for w in done.stderr.split() if w.startswith("hca_")]
     assert len(recovered) == 1 and recovered[0] != info["credential"] and recovered[0] not in done.stdout
@@ -203,10 +208,10 @@ def test_helper_style_refusal_is_403(stack, tmp_path, capsys):
     assert "403" in capsys.readouterr().err and not dest.exists()
 
 
-def test_agent_cap_is_429(tmp_path, capsys):
-    stk = next(_stack(tmp_path, remote_credential_ttl=1.0, max_agents_per_user=1))
+def test_agent_cap_is_429(capped_stack, tmp_path, capsys):
+    stk = capped_stack
     info = connect(stk, "first")
-    time.sleep(1.2)                                    # the first agent expires and frees its slot
+    time.sleep(3.6)                                    # the first agent expires and frees its slot
     connect(stk, "second")
     out_dir = tmp_path / "out"
     out_dir.mkdir()
@@ -250,3 +255,100 @@ def test_a_bad_renew_answer_says_the_outcome_is_unknown_not_unreachable(tmp_path
 def test_operator_url_must_be_http_loopback_or_https(url, capsys):
     assert agents_main(["list", "--operator-url", url]) == 1
     assert "operator-url" in capsys.readouterr().err
+
+
+def test_a_failed_write_with_print_credential_prints_it_on_stdout_not_stderr(stack, tmp_path):
+    info = connect(stack, "diskfull2")
+    done = subprocess.run([sys.executable, "-B", "-c", CHILD_CODE, "collab", "agents", "renew", info["agent_id"],
+                           "--credential-file", str(tmp_path / "cred"), "--print-credential", "--operator-url", stack.url],
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode == 1 and "Traceback" not in done.stderr
+    printed = done.stdout.split()
+    assert len(printed) == 1 and printed[0].startswith("hca_") and printed[0] != info["credential"]
+    assert "hca_" not in done.stderr and "stdout" in done.stderr
+    assert agent_authenticates(stack, info, printed[0])
+
+
+def test_json_with_print_credential_is_one_json_object_carrying_the_credential(stack, capsys):
+    info = connect(stack, "jsoncred")
+    assert run(stack, "renew", info["agent_id"], "--print-credential", "--json") == 0
+    out = capsys.readouterr().out
+    body = json.loads(out)                                   # the whole stdout is exactly one JSON document
+    assert body["credential"].startswith("hca_") and body["agent_id"] == info["agent_id"]
+    assert len(out.strip().splitlines()) == 1
+    assert agent_authenticates(stack, info, body["credential"])
+
+
+def test_a_malformed_operator_url_is_a_one_line_error(capsys):
+    assert agents_main(["list", "--operator-url", "http://[::1"]) == 1
+    err = capsys.readouterr().err
+    assert "operator-url" in err and "Traceback" not in err and len(err.strip().splitlines()) == 1
+
+
+class _SlowErrorBody(BaseHTTPRequestHandler):
+    """Sends an error status whose body never arrives, so reading the detail times out."""
+
+    def log_message(self, *_):
+        pass
+
+    def do_GET(self):
+        self.send_response(500)
+        self.send_header("Content-Length", "100")
+        self.end_headers()
+        self.wfile.flush()
+        time.sleep(2.5)
+
+
+def test_a_timeout_reading_an_error_body_is_a_clean_error(capsys, monkeypatch):
+    from herdr_engineering import collab_agents_client as client
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _SlowErrorBody)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    real = client._call
+    monkeypatch.setattr(client, "_call", lambda base, method, path, timeout=0.5: real(base, method, path, 0.5))
+    try:
+        assert agents_main(["list", "--operator-url", f"http://127.0.0.1:{srv.server_port}"]) == 1
+        err = capsys.readouterr().err
+        assert "HTTP 500" in err and "Traceback" not in err
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+class _NoIdRow(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def do_GET(self):
+        body = b'{"agents": [{"name": "idless", "status": "active"}]}'
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_a_listed_agent_without_an_id_is_a_clean_error(tmp_path, capsys):
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _NoIdRow)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        dest = tmp_path / "cred"
+        assert agents_main(["renew", "@idless", "--credential-file", str(dest),
+                            "--operator-url", f"http://127.0.0.1:{srv.server_port}"]) == 1
+        err = capsys.readouterr().err
+        assert "no agent id" in err and "Traceback" not in err and not dest.exists()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_a_failed_move_into_place_keeps_the_0600_temp_file_and_prints_its_path(tmp_path, capsys):
+    """os.replace fails for real: the destination became a directory after the temp file was reserved."""
+    from herdr_engineering.collab_agents_client import _reserve, _store
+    dest = tmp_path / "cred"
+    tmp, fd = _reserve(str(dest), False)
+    dest.mkdir()
+    assert _store("hca_secretvalue", tmp, fd, str(dest)) is False
+    err = capsys.readouterr().err
+    assert tmp in err and "hca_secretvalue" not in err and "0600" in err
+    assert stat.S_IMODE(os.stat(tmp).st_mode) == 0o600
+    assert open(tmp).read() == "hca_secretvalue\n"

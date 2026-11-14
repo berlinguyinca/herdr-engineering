@@ -859,6 +859,21 @@ helper's own agent (their cursor still moves past them).
   reached. Sliding does not touch room grants, which keep their own expiry. An agent that is already expired or revoked
   is never revived by use; renew it instead. Helper, fabric and external agents never slide.
 
+### 5.2a Renewing an expired agent (runbook)
+1. Find it: `herdr-eng collab agents list`. An expired agent shows its old `expires_at` and, if it can be renewed, `renewable=yes`.
+2. Renew it: `herdr-eng collab agents renew <agent-id|@name> --credential-file ~/.config/herdr/<name>.cred`. The old
+   credential stops working at once; the NEW one goes only to that 0600 file. Add `--force` to replace an existing file.
+   `--print-credential` puts it on stdout instead (with `--json` it is the `credential` key of the one JSON object). If the
+   write fails after the renew, the command still exits 1 and keeps the credential (kept temp file, or stdout when you asked
+   for it there): re-running renew would replace it, so save it first.
+3. Update the harness that used the agent, or it stays locked out: for Claude re-run `claude mcp add` with the new
+   `Authorization` header; for Codex edit the token in `~/.codex/config.toml`; for a collab-spawn replace the credential
+   file it reads.
+4. Check the output: `grants_restored` lists the room grants brought back. They are restored only in rooms you own; in a
+   room where you are only a contributor the room owner must approve the agent again.
+5. Refused renewals exit 1: external, fabric-machine and helper agents (403) and revoked agents (409) cannot be renewed.
+   Create a new agent instead (an external agent needs a new invitation), and 404 means the agent is not yours.
+
 ### 5.3 Health and routine tasks
 * Containers: `docker ps | grep herdr-collab` shows `herdr-collab-edge` (TLS front),
   `herdr-collab-public` (the service, should say healthy) and the dashboard `herdr-cp-web`.

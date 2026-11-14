@@ -3,7 +3,7 @@
 Talks to the collab OPERATOR listener (HERDR_COLLAB_OPERATOR_URL, default http://127.0.0.1:9482): it acts as the
 signed-in operator and takes no token, so this client sends no credential of its own. Renewing returns a NEW agent
 credential exactly once. It is written only to the file named by --credential-file (created 0600, an existing file is
-refused without --force) or, when --print-credential is given, to stdout. It is never logged or put in --json output.
+refused without --force) or, when --print-credential is given, to stdout. It is never logged or put in --json output, except that `--json --print-credential` carries it as the `credential` key of the one JSON object.
 """
 from __future__ import annotations
 
@@ -37,10 +37,14 @@ class AgentsError(RuntimeError):
 
 def _check_url(base):
     """http(s) only; plain http only to loopback, because the renew answer carries the new credential."""
-    u = urlparse(base)
-    if u.scheme not in ("http", "https") or not u.hostname:
+    try:
+        u = urlparse(base)
+        host = u.hostname
+    except ValueError:
+        raise AgentsError(f"--operator-url must be an http(s) URL, got {base!r}") from None
+    if u.scheme not in ("http", "https") or not host:
         raise AgentsError(f"--operator-url must be an http(s) URL, got {base!r}")
-    if u.scheme == "http" and u.hostname not in LOOPBACK:
+    if u.scheme == "http" and host not in LOOPBACK:
         raise AgentsError("--operator-url: plain http is only allowed to loopback (the answer carries a credential); use https")
 
 
@@ -57,7 +61,7 @@ def _call(base, method, path, timeout=15.0):
     except urllib.error.HTTPError as exc:
         try:
             detail = json.loads(exc.read(4096)).get("error")
-        except (ValueError, AttributeError):
+        except (ValueError, AttributeError, OSError):      # unreadable body, or the read timed out
             detail = None
         text = detail if isinstance(detail, str) else HINTS.get(exc.code, "request failed")
         raise AgentsError(f"HTTP {exc.code}: {text[:300]}") from None
@@ -88,7 +92,10 @@ def _resolve(base, ref):
         raise AgentsError(f"no agent named {ref[1:]!r}")
     if len(rows) > 1:
         raise AgentsError(f"{len(rows)} agents are named {ref[1:]!r}; use the agent id")
-    return rows[0]["agent_id"]
+    agent_id = rows[0].get("agent_id")
+    if not isinstance(agent_id, str) or not agent_id:
+        raise AgentsError(f"the agent named {ref[1:]!r} has no agent id in the listener's answer")
+    return agent_id
 
 
 def _reserve(path, force):
@@ -111,19 +118,27 @@ def _discard(tmp, fd):
         os.unlink(tmp)
 
 
-def _store(credential, tmp, fd, dest):
+def _store(credential, tmp, fd, dest, to_stdout=False):
     """Write the new credential to the reserved temp file and move it into place. The old credential is already dead, so a
-    failure here must not lose the new one: keep the temp file (path to stderr) or, with no file at all, put it on stderr."""
+    failure here must not lose the new one: keep the temp file (path to stderr) or, with no file at all, put it on stderr
+    (on stdout instead when the caller asked for it there with --print-credential)."""
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(credential + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())                                 # durable before the rename makes it the live file
     except OSError as exc:
         try:
             os.unlink(tmp)
         except OSError:
             pass
-        print(f"collab agents: the agent WAS renewed but writing {dest} failed ({exc.strerror}). This is the only copy of "
-              f"the new credential; save it now: {credential}", file=sys.stderr)
+        if to_stdout:
+            print(f"collab agents: the agent WAS renewed but writing {dest} failed ({exc.strerror}). This is the only copy of "
+                  "the new credential; it is printed on stdout as requested: save it now.", file=sys.stderr)
+            print(credential)
+        else:
+            print(f"collab agents: the agent WAS renewed but writing {dest} failed ({exc.strerror}). This is the only copy of "
+                  f"the new credential; save it now: {credential}", file=sys.stderr)
         return False
     try:
         os.replace(tmp, dest)
@@ -163,17 +178,17 @@ def _cmd_renew(args):
     if not isinstance(credential, str) or not credential:
         _discard(tmp, fd)
         raise AgentsError("the control plane answered without a credential; outcome unknown, the agent may have been renewed: re-run renew")
-    if args.credential_file and not _store(credential, tmp, fd, args.credential_file):
+    if args.credential_file and not _store(credential, tmp, fd, args.credential_file, args.print_credential):
         return 1
     shown = {k: out.get(k) for k in ("agent_id", "expires_at", "grants_restored")}
     if args.json:
-        print(json.dumps(shown))
+        print(json.dumps({**shown, "credential": credential} if args.print_credential else shown))
     else:
         print(f"renewed agent {shown['agent_id']}: new expires_at={shown['expires_at']}, "
               f"grants_restored={json.dumps(shown['grants_restored'])}")
         if args.credential_file:
             print(f"credential written to {args.credential_file} (0600); update the harness config with it")
-    if args.print_credential:
+    if args.print_credential and not args.json:
         print(credential)
     return 0
 
