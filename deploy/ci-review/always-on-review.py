@@ -915,7 +915,13 @@ def codex_cost_usd(ccfg: dict, usage: dict) -> float | None:
     pi, po = ccfg["input_usd_per_mtok"], ccfg["output_usd_per_mtok"]
     if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (i, o, pi, po)):
         return None
-    return round(i * pi / 1e6 + o * po / 1e6, 6)
+    try:
+        return round(i * pi / 1e6 + o * po / 1e6, 6)
+    except OverflowError:                                   # an int too large for a float: not a usable count
+        return None
+
+
+TOKENS_MAX = 10**12                     # no real review reports more; larger, negative or non-int counts are invalid
 
 
 def codex_usage(stdout: str) -> dict:
@@ -930,8 +936,12 @@ def codex_usage(stdout: str) -> dict:
         u = e.get("usage") if isinstance(e, dict) and e.get("type") == "turn.completed" else None
         if isinstance(u, dict):
             for k in ("input_tokens", "cached_input_tokens", "output_tokens"):
-                if type(u.get(k)) is int:
+                if k in u and not (type(u[k]) is int and 0 <= u[k] <= TOKENS_MAX):
+                    raise ReviewFailed("codex reported an implausible token count; its usage cannot be trusted")
+                if k in u:
                     tot[k] = tot.get(k, 0) + u[k]
+    if any(v > TOKENS_MAX for v in tot.values()):
+        raise ReviewFailed("codex reported an implausible token count; its usage cannot be trusted")
     return tot
 
 
@@ -950,7 +960,9 @@ class CodexBackend:
         return [*c["wrapper"], c["command"], "exec", "--sandbox", "read-only", "--ephemeral", "--ignore-user-config",
                 "--ignore-rules", "--color", "never", "--json", "--cd", str(worktree), "--output-schema", str(schema),
                 "--output-last-message", str(out), *(["--model", c["model"]] if c["model"] else []),
-                "-c", 'approval_policy="never"', "-"]
+                "-c", 'approval_policy="never"',
+                "-c", "project_doc_max_bytes=0",            # a PR-added AGENTS.md is not loaded as instructions
+                "-"]
 
     def prompt(self, req: ReviewRequest) -> str:
         fence = "=====UNTRUSTED-" + secrets.token_hex(8) + "====="
@@ -1010,11 +1022,13 @@ def codex_review(cfg: dict, req: ReviewRequest, tier_name: str, post_on: bool, s
         if c["daily_budget_usd"] is not None and usage.get("cost_usd") is None:
             raise ReviewFailed("codex reported no token usage, so its cost cannot be counted against the budget")
         v = parse_verdict(raw.answer, req.sha)
-        blockers, n = in_pr_blockers(v, req.diff), 0
+        n = 0
         if p["require_evidence"]:
             v, n = apply_evidence(v, req.diff, req.worktree)
-        if v.verdict == "block" and blockers > 0 and n == blockers:
-            raise ReviewFailed("codex said block but none of its blockers could be verified")
+        if v.verdict == "block" and in_pr_blockers(v, req.diff) == 0:
+            # every blocker was downgraded by the evidence rule or cites a file outside the PR (decide() drops it):
+            # a block that leaves nothing standing must never become a success
+            raise ReviewFailed("codex said block but none of its blockers could be verified in this PR")
     except ReviewFailed as e:
         log("not-run", why=str(e)[:200], usage=usage)
         raise

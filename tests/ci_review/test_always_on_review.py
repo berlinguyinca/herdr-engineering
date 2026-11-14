@@ -1055,3 +1055,35 @@ def test_posting_still_needs_both_keys_on_a_risky_pr(env):
     env.config(RISKY, post=False)
     env.review("tier2", "--force", post=True)                            # flag only, no config key
     assert env.statuses_posted() == []
+
+
+def test_a_codex_block_whose_blockers_all_cite_files_outside_the_pr_stays_pending(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=block(file="elsewhere/other.py"))
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    assert only_pending(env)                                              # not success
+
+
+@pytest.mark.parametrize("bad", [10**400, 10**13, -5])
+def test_absurd_codex_token_counts_are_invalid_usage_and_fail_the_review(env, bad):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=APPROVE, usage={"input_tokens": bad, "output_tokens": 1})
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    assert only_pending(env)
+
+
+def test_codex_cost_survives_huge_numbers_without_overflowing(env):
+    c = {"input_usd_per_mtok": 2, "output_usd_per_mtok": 10}
+    assert env.mod.codex_cost_usd(c, {"input_tokens": 10**400, "output_tokens": 1}) is None
+
+
+def test_codex_does_not_load_a_pr_added_agents_md_as_instructions(env):
+    env.config(RISKY)
+    env.review("tier2")
+    a = codex_calls(env)[0]["argv"]
+    assert "project_doc_max_bytes=0" in a and a[a.index("project_doc_max_bytes=0") - 1] == "-c"
+
+
+def test_the_example_config_counts_auth_directories_as_risky(env):
+    cfg = env.mod.load_config(str(ROOT / "deploy/ci-review/always-on-review.example.yaml"))
+    assert any(env.mod.glob_regex(g).fullmatch("pkg/auth/login.go") for g in cfg["risky"]["globs"])

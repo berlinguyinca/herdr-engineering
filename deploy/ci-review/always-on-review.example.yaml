@@ -77,6 +77,7 @@ risky:
     - "**/*.sql"
     - "**/*security*/**"
     - "**/*auth*"
+    - "**/*auth*/**"                     # auth directories (the line above only matches a path's last segment)
     - "**/secrets*"
   codex:
     command: codex                       # needs `codex login` on the host; the user's config.toml is ignored (--ignore-user-config)
