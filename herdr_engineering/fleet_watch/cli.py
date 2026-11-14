@@ -89,7 +89,7 @@ def _resolve_local(requested: str) -> tuple[str | None, str | None]:
 
 
 def _engine(args, directory: Path, local: str | None):
-
+    """The runner for this invocation's transport/timeout options (shared by run, resume, abandon, loop)."""
     timeouts = {**runner.DEFAULT_TIMEOUTS, "precheck": args.precheck_timeout, "apply": args.apply_timeout,
                 "health": args.health_timeout}
     return runner.Runner(
@@ -193,36 +193,18 @@ def cmd_abandon(args) -> int:
     return 0
 
 
-def _updated_local_build(saved: dict, before: set[str], local: str | None) -> bool:
-    """True when a rollout that succeeded during this pass installed herdr-engineering on THIS host: the running
-    process still has the old code, so the loop must restart to pick up what it just installed."""
-    if local is None:
-        return False
-    for rid, rollout in saved["rollouts"].items():
-        if rid in before or rollout.get("status") != "succeeded":
-            continue
-        row = rollout.get("rows", {}).get(f"{local}/herdr-engineering")
-        if row and row.get("updated") is True:
-            return True
-    return False
-
-
-def _loop_pass(args, local: str | None) -> tuple[dict, str, bool]:
-    """One service pass: poll + plan; with --enable-rollouts also run (or continue) the rollout.
-
-    The third value says the loop must restart (a rollout just installed a new herdr-engineering on this host)."""
+def _loop_pass(args, local: str | None) -> tuple[dict, str]:
+    """One service pass: poll + plan; with --enable-rollouts also run (or continue) the rollout."""
     report = core.run_once(args.repo or list(core.DEFAULT_REPOS), lock_path=args.lock, auth=poll.token())
     rollout = report["rollout"]
     if not args.enable_rollouts:
-        return report, f"plan only ({'rollout ' + rollout['rollout_id'] if rollout else 'nothing to roll out'})", False
+        return report, f"plan only ({'rollout ' + rollout['rollout_id'] if rollout else 'nothing to roll out'})"
     directory = state.state_dir()
     with state.single_instance(directory):
         saved = state.load(directory)
-        done = {rid for rid, r in saved["rollouts"].items() if r.get("status") == "succeeded"}
         engine = _engine(args, directory, local)
         engine.settle_locks(saved)
-        outcome = _drive(engine, saved, rollout, False)
-        return report, outcome, outcome == "succeeded" and _updated_local_build(saved, done, local)
+        return report, _drive(engine, saved, rollout, False)
 
 
 def _watchdog_markers(directory: Path) -> list[Path]:
@@ -238,10 +220,27 @@ def cmd_loop(args) -> int:
     directory = state.state_dir()
     try:
         with state.single_instance(directory, name="loop.lock"):
+            _clear_restart_pending(directory)
             return _loop(args, directory, local)
     except state.WatcherBusy:
         print("fleet-watch loop: another loop is already running", file=sys.stderr)
         return 3
+
+
+def _restart_pending(directory: Path) -> bool:
+    """A rollout (any process) installed a new herdr-engineering on this host after this loop started."""
+    return bool(state.load(directory).get("restart_pending"))
+
+
+def _clear_restart_pending(directory: Path) -> None:
+    """A freshly started loop runs the installed build, so a restart flagged before it started is already served."""
+    try:
+        with state.single_instance(directory):
+            saved = state.load(directory)
+            if saved.pop("restart_pending", None):
+                state.save(saved, directory)
+    except state.WatcherBusy:
+        pass                                                   # a pass is mid-write; at worst one extra restart
 
 
 def _loop(args, directory: Path, local: str | None) -> int:
@@ -265,16 +264,15 @@ def _loop(args, directory: Path, local: str | None) -> int:
         while True:
             passes += 1
             report: dict = {"repos": {}}
-            restart = False
             try:
                 with dog.guard():
-                    report, outcome, restart = _loop_pass(args, local)
+                    report, outcome = _loop_pass(args, local)
             except state.WatcherBusy:
                 outcome = "busy"
             except Exception as exc:                       # a bad pass must not stop the service; the class is enough
                 outcome = f"error {type(exc).__name__}"
             print(f"pass {passes}: {outcome}", flush=True)
-            if restart:
+            if _restart_pending(directory):                   # read from state: a failed pass cannot lose it
                 print("fleet-watch loop: a rollout installed a new herdr-engineering on this host; "
                       f"exiting {service.RESTART_EXIT}, the service restarts into the new build",
                       file=sys.stderr, flush=True)

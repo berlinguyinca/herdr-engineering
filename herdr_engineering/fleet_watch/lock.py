@@ -114,6 +114,17 @@ def _reserve_backup(path: Path, now: datetime) -> Path:
     raise LockRefused("lock_invalid")
 
 
+def _make_backup(path: Path, now: datetime) -> Path:
+    """Copy `path` to a fresh backup name; a failed copy removes the empty file it reserved."""
+    backup = _reserve_backup(path, now)
+    try:
+        shutil.copy2(path, backup)
+    except BaseException:
+        backup.unlink(missing_ok=True)
+        raise
+    return backup
+
+
 def _write_atomic(path: Path, text: str, mode: int, previous: bytes | None, now: datetime) -> None:
     path = path.resolve()                      # a symlinked lock keeps its link; the target file is replaced
     tmp = path.with_name(path.name + ".tmp")
@@ -127,8 +138,7 @@ def _write_atomic(path: Path, text: str, mode: int, previous: bytes | None, now:
         if previous is not None:
             if path.read_bytes() != previous:      # changed since pin_repos read it: never overwrite someone else's edit
                 raise LockRefused("lock_invalid")
-            backup = _reserve_backup(path, now)
-            shutil.copy2(path, backup)
+            _make_backup(path, now)
         os.replace(tmp, path)
     except BaseException:                          # also SystemExit/KeyboardInterrupt: no stray `<lock>.tmp`
         tmp.unlink(missing_ok=True)

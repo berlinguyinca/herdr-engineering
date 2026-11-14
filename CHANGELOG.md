@@ -44,10 +44,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Fix: fleet watcher review follow-ups (self-update restart, orphaned children, lock edge cases)
 
-- `fleet-watch loop` now picks up its own update: after a pass in which a rollout succeeded and changed herdr-engineering on the local host it exits 75 and systemd starts the new build (`RestartForceExitStatus=75`; 2 and 3 still never restart). Other hosts or repos do not trigger it.
-- SIGTERM and the hard-limit exit 70 kill the in-flight local `host-apply` process group instead of orphaning it.
+- `fleet-watch loop` now picks up its own update: a rollout that succeeded and changed herdr-engineering on the local host saves `restart_pending` with the success, and the loop exits 75 at the end of its next pass (even if that pass failed, or another process ran the rollout); systemd starts the new build (`RestartForceExitStatus=75`, `SuccessExitStatus=75` so the unit is not marked failed; 2 and 3 still never restart). A freshly started loop clears the flag, so there is no restart storm. Other hosts or repos do not trigger it.
+- SIGTERM and the hard-limit exit 70 now stop an in-flight local `host-apply`: the watcher sends it SIGTERM first (5 s grace), host-apply kills the commands it started (they run in their own sessions, which a group kill of host-apply would miss), then SIGKILL. A grandchild that deliberately leaves its session is still left to the systemd cgroup (`KillMode` default `control-group`), which kills the whole unit on stop.
 - A CRLF `fleet.lock.yaml` can be pinned (it was always refused as changed-since-read) and keeps its line endings; same-second lock backups no longer overwrite each other; an interrupted write no longer strands `<lock>.tmp`.
-- `herdr-eng fleet lock verify` no longer creates the watcher state directory or lock file when it does not exist.
+- `herdr-eng fleet lock verify` no longer creates the watcher state directory or lock file when it does not exist. A failed backup copy removes its empty `.bak` file.
 - Tests: exact event tails instead of `in types[-2:]`, SIGTERM must exit 0. Operator doc: self-update restart, restart-mid-rollout safety, symlinked-lock backup location.
 >>>>>>> b7698d72 (fix(fleet-watch): review follow-ups for the step 5 watcher)
 

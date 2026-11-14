@@ -1825,6 +1825,7 @@ def _cmd_fleet_lock_verify(args) -> int:
 
 def _cmd_fleet_host_apply(args) -> int:
     from .fleet_watch import host_apply
+    host_apply.terminate_on_sigterm()
     try:
         result = host_apply.run_phase(args.phase, rollout_id=args.rollout, repo=args.repo, sha=args.sha,
                                       host=args.host, before_sha=args.before_sha, busy_retries=args.busy_retries,

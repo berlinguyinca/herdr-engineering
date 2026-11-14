@@ -387,6 +387,7 @@ def test_the_unit_restarts_on_the_update_exit_code_but_never_on_refused_or_busy(
     assert service.RESTART_EXIT == 75
     assert unit["Restart"] == "on-failure"                                         # 75 is a failure status: restarted
     assert "75" in unit["RestartForceExitStatus"].split()
+    assert "75" in unit["SuccessExitStatus"].split()                               # the update exit is not a failed unit
     assert set(unit["RestartPreventExitStatus"].split()) == {"2", "3"}             # 75 is not among them
 
 
@@ -458,6 +459,84 @@ def test_the_hard_limit_exit_kills_the_child_process_group(fleet, tmp_path):
         for pid in pids:
             if alive(pid):
                 os.kill(pid, signal.SIGKILL)
+
+
+def grandchild_remote_bin(fleet, tmp_path: Path) -> tuple[Path, Path]:
+    """The real beast `herdr-eng` shim, but its install command hangs with a child of its own. host_apply runs that
+    command with start_new_session=True, so it and its child are in a different session and process group than
+    host-apply: killing host-apply's group alone would miss both."""
+    pidfile = tmp_path / "grandchild.pid"
+    hang = tmp_path / "hang-install.sh"
+    hang.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {pidfile}\nwait\n")
+    hang.chmod(0o755)
+    shim = fleet.shims["beast"].read_text()
+    install = fleet.home("beast") / "install.sh"
+    assert str(install) in shim
+    wrapper = tmp_path / "beast-hung-herdr-eng"
+    wrapper.write_text(shim.replace(str(install), str(hang), 1).replace(
+        "#!/bin/sh\n", f"#!/bin/sh\nexport HOME={fleet.home('beast')}\n", 1))
+    wrapper.chmod(0o755)
+    return wrapper, pidfile
+
+
+@pytest.mark.parametrize("how", ["sigterm", "hard_limit"])
+def test_a_grandchild_in_its_own_session_dies_with_the_watcher(fleet, tmp_path, how):
+    wrapper, pidfile = grandchild_remote_bin(fleet, tmp_path)
+    extra = ("--soft-limit", "1", "--hard-limit", "4") if how == "hard_limit" else ()
+    proc = subprocess.Popen(local_loop_argv(fleet, wrapper, *extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=fleet.env())
+    pids: list[int] = []
+    try:
+        pids = [wait_for(pidfile)]
+        assert alive(pids[0]) and os.getsid(pids[0]) != os.getsid(proc.pid)   # not in the watcher's session
+        if how == "sigterm":
+            proc.send_signal(signal.SIGTERM)
+            assert proc.wait(timeout=40) == 0
+        else:
+            assert proc.wait(timeout=60) == 70
+        assert_dead_soon(*pids)
+    finally:
+        proc.kill()
+        proc.communicate()
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def start_plan_only_loop(fleet) -> subprocess.Popen:
+    argv = [sys.executable, "-I", "-c", BOOT, "fleet-watch", "loop", *common(fleet), "--repo", HE, "--interval", "1",
+            "--max-passes", "60"]
+    return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=fleet.env())
+
+
+def test_the_restart_decision_survives_the_pass_that_made_it(fleet):
+    """The success is saved with a restart_pending flag, so a pass that fails (or a different process that ran the
+    rollout) cannot lose the restart: the running loop still exits 75 at the end of its next pass."""
+    fleet.identify("beast")
+    proc = start_plan_only_loop(fleet)
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and "head" not in json.dumps(fleet.saved()["repos"]):
+            time.sleep(0.2)
+        applied = fleet.cli("--local-host", "beast", "--remote-bin", str(fleet.shims["beast"]))   # another process
+        assert applied.returncode == 0, applied.stderr
+        assert fleet.saved()["restart_pending"] is True
+        assert proc.wait(timeout=60) == 75
+    finally:
+        proc.kill()
+        proc.communicate()
+
+
+def test_no_restart_storm_after_the_update_restart(fleet):
+    out = subprocess.run(local_loop_argv(fleet, fleet.shims["beast"], "--max-passes", "5"), capture_output=True,
+                         text=True, env=fleet.env(), timeout=120)
+    assert out.returncode == 75, out.stderr
+    rollouts = dict(fleet.saved()["rollouts"])
+    again = subprocess.run(local_loop_argv(fleet, fleet.shims["beast"], "--max-passes", "1"), capture_output=True,
+                           text=True, env=fleet.env(), timeout=120)
+    assert again.returncode == 0, again.stderr                                     # the new build does not restart again
+    assert "idle" in again.stdout and fleet.saved()["rollouts"] == rollouts        # and found nothing new to roll out
+    assert not fleet.saved().get("restart_pending")
 
 
 # --------------------------------------------------------------------------- systemd unit and ansible task

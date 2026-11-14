@@ -464,3 +464,17 @@ def test_lock_verify_still_reports_busy_and_the_converged_state_when_the_directo
     state.save({**state.empty_state(), "converged": {AUTO: "0" * 40}}, held)
     out = verify_cli(forge, home, path, "--json")
     assert out.returncode == 1 and {p["repo"]: p["status"] for p in json.loads(out.stdout)["pins"]}["autospec"] == "converged_mismatch"
+
+
+def test_a_failed_backup_copy_leaves_no_empty_backup_file(world):
+    if os.geteuid() == 0:
+        pytest.skip("root reads anything")
+    forge, _, path = world
+    write_lock(path, forge)
+    path.chmod(0)                                            # readable for the earlier checks in real use, not here
+    try:
+        with pytest.raises(OSError):
+            lock._make_backup(path, datetime.now(UTC))
+    finally:
+        path.chmod(0o600)
+    assert [p.name for p in path.parent.iterdir() if ".bak-" in p.name] == []

@@ -23,6 +23,7 @@ import shlex
 import signal
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,19 +61,34 @@ class Outcome:
     timed_out: bool = False
 
 
-_CHILDREN: set[int] = set()                      # process groups of in-flight host-apply children
+CHILD_GRACE_S = 5.0                               # SIGTERM first: host-apply kills ITS children (own sessions) itself
+_CHILDREN: dict[int, subprocess.Popen] = {}       # in-flight host-apply children, each the leader of its own session
 _CHILDREN_LOCK = threading.Lock()
 
 
+def _stop_group(proc: subprocess.Popen, grace: float = CHILD_GRACE_S) -> None:
+    """SIGTERM the child's group, give it `grace` seconds to clean up, then SIGKILL the group.
+
+    host-apply starts its own commands with start_new_session=True, so they are NOT in this group: only host-apply's
+    own SIGTERM handling (which kills them) reaches them. Hence TERM first, KILL only after the grace."""
+    with contextlib.suppress(OSError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    with contextlib.suppress(OSError):
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
 def kill_children() -> None:
-    """SIGKILL every in-flight host-apply process group (each child runs in its own session, so it would otherwise be
-    orphaned when the watcher exits on SIGTERM or the hard limit). Safe from any thread; a remote phase may still
-    finish, which host-apply's idempotence allows."""
-    with _CHILDREN_LOCK:
-        groups = list(_CHILDREN)
-    for pgid in groups:
-        with contextlib.suppress(OSError):
-            os.killpg(pgid, signal.SIGKILL)
+    """Stop every in-flight host-apply; ONLY for a process that is about to exit (the hard-limit `os._exit`, which runs
+    no cleanup): it deliberately never releases the registry lock. A remote phase may still finish, which
+    host-apply's idempotence allows."""
+    # The lock stays held until the caller exits: the pass thread, once its child dies, blocks in its `finally` instead
+    # of recording a failed row and carrying on (the hard-limit exit must stay a 70, not a normal pass end).
+    _CHILDREN_LOCK.acquire()
+    for proc in list(_CHILDREN.values()):
+        _stop_group(proc)
 
 
 class SshTransport:
@@ -103,15 +119,17 @@ class SshTransport:
         else:
             argv = [self.ssh_bin, "-o", "BatchMode=yes", "-o", f"ConnectTimeout={self.connect_timeout}",
                     "-T", host, "--", command]
+        proc: subprocess.Popen | None = None
         try:
             proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, start_new_session=True, cwd="/")
-        except OSError:
-            return Outcome(SSH_FAILED_RC, "")
-        with _CHILDREN_LOCK:
-            _CHILDREN.add(proc.pid)
-        try:
+            with _CHILDREN_LOCK:
+                _CHILDREN[proc.pid] = proc
             out, _ = proc.communicate(timeout=timeout)
+        except OSError:
+            if proc is None:
+                return Outcome(SSH_FAILED_RC, "")
+            raise
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -120,12 +138,13 @@ class SshTransport:
             proc.communicate()
             return Outcome(None, "", timed_out=True)
         except BaseException:                      # SIGTERM -> SystemExit, KeyboardInterrupt: never orphan the child
-            with contextlib.suppress(OSError):
-                os.killpg(proc.pid, signal.SIGKILL)
+            if proc is not None:
+                _stop_group(proc)
             raise
         finally:
-            with _CHILDREN_LOCK:
-                _CHILDREN.discard(proc.pid)
+            if proc is not None:
+                with _CHILDREN_LOCK:
+                    _CHILDREN.pop(proc.pid, None)
         return Outcome(proc.returncode, out[:MAX_STDOUT].decode("utf-8", "replace"))
 
 
@@ -304,6 +323,9 @@ class Runner:
                 self._emit_halted(saved, rid, rollout)
             return "halted"
         rollout["status"] = "succeeded"
+        local = self.transport.local_host
+        if local and rollout["rows"].get(f"{local}/herdr-engineering", {}).get("updated") is True:
+            saved["restart_pending"] = True        # saved WITH the success: the running loop still has the old build
         rollout["lock"] = "pending"                # saved with the success: a crash before the pin is repaired later
         saved["converged"].update(rollout["targets"])
         state.save(saved, self.directory)
