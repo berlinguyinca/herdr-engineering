@@ -316,6 +316,12 @@ def test_null_agent_id_in_queue_is_a_clean_api_error(tmp_path):
         _clean_api_error(run(srv, tmp_path), srv)
 
 
+@pytest.mark.parametrize("key", ["pending", "running", "waiting_on_deps"])
+def test_non_list_queue_section_is_a_clean_api_error(tmp_path, key):
+    with FakeWoodpecker(healthy(3), queue_fn=lambda n: (200, {key: {"agent_id": 1}})) as srv:
+        _clean_api_error(run(srv, tmp_path), srv)
+
+
 def test_non_list_agents_response_is_a_clean_api_error(tmp_path):
     with FakeWoodpecker({"error": "boom"}) as srv:
         _clean_api_error(run(srv, tmp_path), srv)

@@ -53,7 +53,12 @@ def busy_ids(server, token):
     queue = call(server, token, "GET", "/api/queue/info")
     if not isinstance(queue, dict):
         raise ValueError("queue info is not an object")
-    tasks = (queue.get("pending") or []) + (queue.get("running") or []) + (queue.get("waiting_on_deps") or [])
+    tasks = []
+    for key in ("pending", "running", "waiting_on_deps"):
+        section = queue.get(key) or []
+        if not isinstance(section, list):
+            raise ValueError(f"queue {key} is not a list")
+        tasks += section
     ids = set()
     for t in tasks:
         agent_id = t.get("agent_id", 0) if isinstance(t, dict) else None

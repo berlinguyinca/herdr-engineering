@@ -111,7 +111,7 @@ def test_missing_iptables_binary_is_exit_3_with_a_clear_message(tmp_path):
 
 def test_install_with_missing_iptables_says_not_found(tmp_path):
     r = run(tmp_path / "no-such-iptables", "--install")
-    assert r.returncode != 0 and "not found" in r.stderr
+    assert r.returncode == 2 and "not found" in r.stderr
 
 
 def test_absent_in_one_chain_and_unreadable_in_the_other_reports_absent(ipt, tmp_path):
