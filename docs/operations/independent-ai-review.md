@@ -154,7 +154,7 @@ Both tiers now get the operator's project rules and a review checklist (`deploy/
   - routes sometimes ended mid-answer (`upstream_transport_error`), and qwen's single slot answered 429;
   - for a while the gateway advertised no models at all.
 
-  Route failures, 429s and 5xx responses are retried with backoff. A stream that closes unfinished (no `[DONE]`,
+  Route failures and 5xx responses are retried with backoff; 429s are waited out for up to `reviewer.busy_wait_s` (1800 s) without using the retries. A stream that closes unfinished (no `[DONE]`,
   no `finish_reason`) is retried the same way. A model that is not advertised fails the run before anything is
   posted.
 - **qwen on the `development` provider.** That provider sets `compat.thinkingFormat: qwen-chat-template`. pi then
