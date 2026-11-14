@@ -1230,3 +1230,22 @@ def test_every_share_host_response_forces_referrer_policy_no_referrer(env):
         seen.add(status)
         assert got.get("referrer-policy") == "no-referrer", (method, path, status)
     assert {200, 204, 206, 304, 404, 412, 416} <= seen
+
+
+def test_public_share_of_a_report_preview_delivers_its_link_preview_meta_unsanitised(tmp_path):
+    # The public route (f/) serves the generated preview bytes as they are; only the signed-in annotate view runs the
+    # sanitiser (which drops meta, and which crawlers never see). So the og/twitter tags reach the public response.
+    from herdr_engineering.control_plane.artifact_share_api import _report_preview
+    from tests.control_plane.test_artifact_report_render import descriptor
+
+    page = _report_preview(descriptor())
+    env = Env(tmp_path, files={"preview.html": page}, entry="preview.html")
+    try:
+        status, headers, body = env.request("GET", f("preview.html"))
+    finally:
+        env.close()
+    assert status == 200
+    head = body.decode().split("</head>")[0]
+    for needle in ('<meta property="og:title" content="', '<meta property="og:type" content="article">',
+                   '<meta name="twitter:card" content="summary">', '<meta name="description" content="'):
+        assert needle in head, needle
