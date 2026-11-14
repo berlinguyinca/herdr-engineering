@@ -138,7 +138,8 @@ APPROVE = {"head_sha": "@HEAD", "verdict": "approve", "findings": [], "checked":
 
 def block(file="src/a.py", line=2, why="eval of input"):
     return {"head_sha": "@HEAD", "verdict": "block", "checked": ["code"],
-            "findings": [{"file": file, "line": line, "severity": "blocking", "category": "security", "why": why}]}
+            "findings": [{"file": file, "line": line, "severity": "blocking", "category": "security", "why": why,
+                          "evidence": "return eval(x)", "how_it_fails": "x = '__import__(\"os\")' runs code"}]}
 
 
 def sh(*a, cwd):
