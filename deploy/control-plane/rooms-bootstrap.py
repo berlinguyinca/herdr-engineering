@@ -97,6 +97,14 @@ def is_noop(p: dict[str, Any]) -> bool:
     return not (p["agents"] or p["room"] or p["members"])
 
 
+class HttpStatusError(RuntimeError):
+    """A non-2xx answer; ``status`` is the real status code, so callers never parse the message (it can quote server text)."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
 class Http:
     def __init__(self, base: str, timeout: float = 15.0):
         self.base, self.timeout = base.rstrip("/"), timeout
@@ -110,7 +118,7 @@ class Http:
             with _OPENER.open(req, timeout=self.timeout) as resp:
                 raw = resp.read(4_000_000)
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"{method} {path} -> HTTP {exc.code}: {redact(exc.read(500).decode('utf-8', 'replace'))}") from None
+            raise HttpStatusError(exc.code, f"{method} {path} -> HTTP {exc.code}: {redact(exc.read(500).decode('utf-8', 'replace'))}") from None
         except Exception as exc:  # noqa: BLE001 - refused, timed out, DNS
             raise RuntimeError(f"{method} {path} unreachable: {type(exc).__name__}") from None
         return json.loads(raw) if raw else {}
@@ -197,8 +205,8 @@ def ensure(api: Http, p: dict[str, Any], dry: bool) -> None:
                 print(f"REMOVED stale membership {name} (expired agent) from {ROOM_NAME}")
         try:
             api.call("POST", BASE + f"/rooms/{room['room_id']}/agents", {"agent_id": ids[name], "actions": CHAT_ACTIONS})
-        except RuntimeError as exc:
-            if "HTTP 409" not in str(exc):
+        except HttpStatusError as exc:
+            if exc.status != 409:
                 raise
             print(redact(f"CONFLICT membership {name} -> {ROOM_NAME}, continuing with the others: {exc}"))
             refused.append(name)
