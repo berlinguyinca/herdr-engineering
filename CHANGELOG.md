@@ -5,9 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
-### Always-on review: bare clones work, the green-only gate is optional
+### Reviewer fixes: bare clones, optional green-only gate, diffs over 20,000 lines (always-on-review.py)
 
 - Fix: the `clone:` check required `<clone>/.git`, so the bare clone the README recommends was refused. It now asks git (`is_git_clone`): a bare or non-bare repository root passes; a missing path, a plain directory, a directory inside another repo or a dangling `.git` is refused.
+- Fix (#790, diffs over GitHub's 20,000-line limit): when `gh pr diff` fails because GitHub refuses the diff as too large (HTTP 406), the always-on reviewer now builds the diff locally in the detached worktree (merge base to the pinned head, the same three-dot diff), so the in-PR file index, evidence checks and prompt work as usual. Any other `gh pr diff` failure still fails the review. This covers the 20,000-line limit only; the separate `github-fleet-automerge` 120 KB per-file limit named in the issue body lives in a service outside this repository and is not changed here.
 - Default change (operator approved): tier 2 no longer waits for green checks; it reviews every non-draft head. New YAML key `gates.wait_for_green` (boolean, default `false`) restores the old gate; `gates.required` is only needed, and only validated as non-empty, when it is `true`. Cost note: Opus now runs on heads whose CI is still pending or red, so expect more reviews. Rollback: `gates: {wait_for_green: true, ...}`; restart the polling service after editing, it reads the config at start.
 
 ### Review prompt v2: rules, checklist, evidence, passes, replay harness (always-on-review.py)

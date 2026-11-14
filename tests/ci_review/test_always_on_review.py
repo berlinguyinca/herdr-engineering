@@ -67,6 +67,8 @@ if argv[:2] == ["pr", "view"]:
     out({"number": int(n), "headRefOid": head(n), "state": "OPEN", "isDraft": p.get("draft", False),
          "title": p.get("title", "t"), "body": p.get("body", ""), "baseRefName": "main", "commits": []})
 elif argv[:2] == ["pr", "diff"]:
+    if pr(argv[2]).get("diff_error"):
+        sys.stderr.write(pr(argv[2])["diff_error"]); sys.exit(1)
     sys.stdout.write(pr(argv[2])["diff"])
 elif argv[:2] == ["pr", "list"]:
     out([{"number": int(n), "headRefOid": head(n), "isDraft": pr(n).get("draft", False)} for n in st["prs"]])
@@ -677,3 +679,40 @@ def test_wait_for_green_false_skips_the_gate_and_must_be_a_boolean(env):
     assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
     env.cfg_path.write_text(env.cfg_path.read_text().replace("wait_for_green: false", "wait_for_green: yes please"))
     assert env.review("tier2", "--force") == 2
+
+
+# ---------------- issue #790: diffs over GitHub's 20,000-line limit ----------------
+
+TOO_LARGE = ("could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines "
+             "(20000) (https://api.github.com/repos/acme/widget/pulls/7)")
+
+
+def _too_large(env, error=TOO_LARGE):
+    st = env.gh_state()
+    st["prs"]["7"]["diff_error"] = error
+    env.write_gh(st)
+
+
+def test_a_diff_over_githubs_line_limit_is_taken_from_the_local_worktree(env):
+    _too_large(env)
+    env.config(post=True)
+    assert env.review("tier2", post=True) == 0
+    [call] = env.reviewer_calls()
+    assert call["head"] == env.head and "return eval(x)" in call["stdin"] + " ".join(call["argv"])
+    assert [s["state"] for s in env.statuses_posted()] == ["pending", "success"]
+
+
+def test_the_local_diff_still_drives_the_in_pr_rules(env):
+    _too_large(env)
+    env.reviewer("claude", answer=block(file="src/a.py", line=2))
+    env.config(post=True)
+    assert env.review("tier2", post=True) == 0
+    assert env.statuses_posted()[-1]["state"] == "failure"                  # the finding is on a file in the diff
+    env.reviewer("claude", answer=block(file="src/not_in_pr.py", line=2))
+    assert env.review("tier2", "--force", post=True) == 0
+    assert env.statuses_posted()[-1]["state"] != "failure"                  # dropped: not in the local diff
+
+
+def test_any_other_diff_failure_still_fails_the_review(env):
+    _too_large(env, "gh: HTTP 502: bad gateway")
+    assert env.review("tier2") == 1 and env.reviewer_calls() == []

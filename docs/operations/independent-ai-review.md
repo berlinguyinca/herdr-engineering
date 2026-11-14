@@ -103,6 +103,8 @@ security posture.
 
 Operating rules:
 
+- A diff over GitHub's 20,000-line limit (`gh pr diff` fails with HTTP 406) is read locally from the review worktree
+  instead (merge base to the pinned head), so such PRs are still reviewed.
 - Dry-run is the default. Posting needs `post: true` in the config and `--post` on the command line.
 - Tier 1 never posts the required context. The ruleset already requires `Opus agent review`; turning on tier 2 posting
   (`post: true` plus `--post`) is a separate operator step, taken after watching dry-run output in `reviews.jsonl`.

@@ -1165,26 +1165,56 @@ def run_passes(cfg: dict, tier: dict, backend: Backend, req: ReviewRequest, root
     return PassesResult(merged, "+".join(dict.fromkeys(models)), _sum_usage(usages), info, down, "; ".join(failed), unverified)
 
 
+DIFF_TOO_LARGE_RE = re.compile(r"exceeded the maximum number of lines|diff_too_large|too_large|HTTP 406")
+
+
+def github_diff(gh, repo: str, n: int) -> str | None:
+    """The PR's diff from GitHub, or None when GitHub refuses it as too large (over 20,000 lines; `gh pr diff` then
+    fails with HTTP 406). Any other failure still raises."""
+    try:
+        return gh.diff(repo, n)
+    except ReviewFailed as e:
+        if DIFF_TOO_LARGE_RE.search(str(e)):
+            return None
+        raise
+
+
+def local_diff(wt: Worktree) -> str:
+    """The same three-dot diff GitHub shows: merge base to the pinned head, from the worktree's own objects."""
+    return git(["diff", "--no-color", "--no-ext-diff", wt.base_sha, wt.sha], wt.path) + "\n"
+
+
 def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started) -> int:
     global LAST_RESULT
     context = tier["context"]
-    diff = gh.diff(repo, n)
+    diff = github_diff(gh, repo, n)                  # None: too large for GitHub; read it from the worktree instead
     if gh.head(repo, n) != sha:
         raise HeadMoved("the head moved while the diff was read")
-    files = ai.parse_diff(diff)
-    if not files:
+    files = ai.parse_diff(diff) if diff is not None else []
+    if diff is not None and not files:
         raise ReviewFailed("the diff is empty")
     index = {f.path: f for f in files}
     if post_on:
         gh.write("POST", f"repos/{repo}/statuses/{sha}",
                  {"state": "pending", "context": context, "description": ai.fit(f"Review running ({tier['model']})")})
-    req = ReviewRequest(repo, n, sha, str(pr.get("title", "")), str(pr.get("body") or ""), "", diff,
+    req = ReviewRequest(repo, n, sha, str(pr.get("title", "")), str(pr.get("body") or ""), "", diff or "",
                         sorted(index))
-    if backend.needs_worktree:
+    if backend.needs_worktree or diff is None:
         with Worktree(cfg, n, sha, str(pr.get("baseRefName", "main"))) as wt:
-            req.worktree, req.base_sha = wt.path, wt.base_sha
-            req.log = git(["log", "--format=%h %s", f"{wt.base_sha}..{sha}"], wt.path)
-            result = run_passes(cfg, tier, backend, req, wt.path)
+            if diff is None:
+                req.diff = local_diff(wt)
+                files = ai.parse_diff(req.diff)
+                if not files:
+                    raise ReviewFailed("the diff is empty")
+                index = {f.path: f for f in files}
+                req.files = sorted(index)
+                ai.say(f"{repo}#{n}: the diff is over GitHub's limit; reviewing the local diff of {len(files)} files")
+            if backend.needs_worktree:
+                req.worktree, req.base_sha = wt.path, wt.base_sha
+                req.log = git(["log", "--format=%h %s", f"{wt.base_sha}..{sha}"], wt.path)
+                result = run_passes(cfg, tier, backend, req, wt.path)
+            else:
+                result = run_passes(cfg, tier, backend, req, None)
     else:
         result = run_passes(cfg, tier, backend, req, None)
     verdict = result.verdict
