@@ -214,6 +214,7 @@ class ControlPlaneRepo:
         reported; every read presents the canonical name."""
         self._host_aliases = {str(k): str(v) for k, v in (host_aliases or {}).items() if k and v and k != v}
         self._command_lock = threading.RLock()
+        self._communication_lock = threading.RLock()
         self._event_lock = threading.RLock()
         self._usage_row_lock = threading.RLock()  # request_id dedupe + write must be atomic
         self._agent_projection_lock = threading.RLock()
@@ -746,17 +747,23 @@ class ControlPlaneRepo:
             except Exception:
                 result.update(status="failed", error="receipt_persistence_failed")
                 return result
+            from .communications import record_command_safely
+            record_command_safely(self, session, result)
             if dispatcher is None:
                 return result
             try:
-                delivery = dispatcher(_deep_copy(session), message, list(artifact_ids))
+                delivery = dispatcher({**_deep_copy(session), "communication_operation_id": operation_id}, message, list(artifact_ids))
                 if not isinstance(delivery, dict) or delivery.get("status") != "delivered":
                     raise ValueError("transport did not acknowledge delivery")
                 result["status"] = "delivered"
                 result["delivery"] = redact_payload(delivery)
             except Exception as exc:
-                result.update(status="failed", error="transport_error",
+                from .communications import command_failure_status
+                result.update(status=command_failure_status(exc), error="transport_error",
                               detail=redact_payload(str(exc)))
+                details = getattr(exc, "details", None)
+                if isinstance(details, dict) and isinstance(details.get("delivery"), dict):
+                    result["delivery"] = redact_payload(details["delivery"])
             try:
                 self.record_event("session", session_id, "SessionCommandSettled",
                                   _deep_copy(result), session_id=session_id, require_durable=True)
@@ -764,6 +771,7 @@ class ControlPlaneRepo:
                 # The durable queued receipt prevents resending after restart.
                 result.update(status="queued", error="receipt_settlement_unknown")
                 return result
+            record_command_safely(self, session, result)
             if result["status"] == "delivered":
                 session["messages"] += 1
                 session["updated_at"] = self._stamp()
