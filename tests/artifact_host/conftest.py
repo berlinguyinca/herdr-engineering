@@ -16,6 +16,7 @@ import asyncpg
 import pytest
 
 from herdr_artifact_host.db import Migrator, create_pool
+from tests.control_plane.pg_stop import FAST_TEST_OPTIONS, stop_postgres
 
 
 @pytest.fixture(scope="session")
@@ -45,13 +46,12 @@ def host_postgres_server() -> Iterator[tuple[str, Path]]:
         subprocess.run([str(initdb), "-D", str(data), "-A", "trust", "--no-locale", "-E", "UTF8", "--no-sync"],
                        check=True, capture_output=True)
         subprocess.run([str(bindir / "pg_ctl"), "-D", str(data), "-l", str(area / "server.log"),
-                        "-o", f"-c listen_addresses='' -k {area} -c dynamic_shared_memory_type=mmap", "-w", "start"],
+                        "-o", f"-c listen_addresses='' -k {area} -c dynamic_shared_memory_type=mmap {FAST_TEST_OPTIONS}", "-w", "start"],
                        check=True, capture_output=True)
         try:
             yield f"postgresql:///postgres?host={area}", area
         finally:
-            subprocess.run([str(bindir / "pg_ctl"), "-D", str(data), "-m", "fast", "-w", "stop"],
-                           check=True, capture_output=True)
+            stop_postgres(bindir / "pg_ctl", data)
 
 
 @pytest.fixture

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Print the effective CPU quota of this process's cgroup as a whole number >= 1, or nothing when no quota applies.
+"""Print the effective CPU quota of this process's cgroup as a whole number >= 1, or nothing when no quota
+applies.
 
-xdist's `auto` counts the cores in the CPU affinity mask; a cgroup quota does not shrink that. The quota that binds is the smallest one on
-the path from the process's cgroup up to the root (Slurm and container runtimes often set it on a parent), on cgroup v2 (`cpu.max`) and
-v1 (`cpu.cfs_quota_us` / `cpu.cfs_period_us` under the cpu controller).
-Usage: cpu-quota.py [cgroup-root] [proc-cgroup-file]   (defaults /sys/fs/cgroup and /proc/self/cgroup; tests pass real directories)"""
+xdist's `auto` counts the cores in the CPU affinity mask; a cgroup quota does not shrink that. The quota
+that binds is the smallest one on the path from the process's cgroup up to the root (Slurm and container
+runtimes often set it on a parent), on cgroup v2 (`cpu.max`) and v1 (`cpu.cfs_quota_us` /
+`cpu.cfs_period_us` under the cpu controller).
+Usage: cpu-quota.py [cgroup-root] [proc-cgroup-file]
+(defaults /sys/fs/cgroup and /proc/self/cgroup; tests pass real directories)"""
 import math
 import sys
 from pathlib import Path
