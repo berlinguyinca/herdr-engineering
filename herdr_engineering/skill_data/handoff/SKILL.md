@@ -1,15 +1,15 @@
 ---
 name: handoff
-description: Hand the current session off to a fresh agent in a new Herdr pane, defaulting to the same harness. Builds a self-sufficient, evidence-based briefing (goal, done, remaining, decisions, risks, validation, resume point, repo/branch/PRs, next commands, constraints) and launches the target. Use when asked to hand off, continue in a fresh session, or move work to claude, pi, codex or opencode.
+description: Hand the current session off to a fresh agent in a new Herdr pane, defaulting to the same harness. Builds a self-sufficient, evidence-based briefing (goal, done, remaining, decisions, risks, validation, resume point, repo/branch/PRs, next commands, constraints) and hands the pane over to the target, closing the replaced pane only once the successor is proven live. Use when asked to hand off, continue in a fresh session, or move work to claude, pi, codex or opencode.
 ---
 
 # Session handoff
 
 Usage: `/handoff [pi|claude|codex|opencode]`. With no argument the target is the **same harness** as this session.
 
-This skill composes the briefing and then reuses the `herdr-handoff` CLI (`create`, then `launch`); it does not fork it. It is the *default-target, history-grounded* form of the explicit `/herdr::toClaude`, `/herdr::toPi`, `/herdr::toCodex` and `/herdr::toOpenCode` commands, which use the same two CLI calls. Pi's built-in `/handoff` is a different, planner-worker feature: this skill does not replace it. For a read-only narrative of the session, use `/summary`.
+This skill composes the briefing and then reuses the `herdr-handoff` CLI (`create`, then `takeover`); it does not fork it. It is the *default-target, history-grounded* form of the explicit `/herdr::toClaude`, `/herdr::toPi`, `/herdr::toCodex` and `/herdr::toOpenCode` commands, which use the same two CLI calls. Pi's built-in `/handoff` is a different, planner-worker feature: this skill does not replace it. For a read-only narrative of the session, use `/summary`.
 
-Remain otherwise read-only: never modify files, commit, push, build, deploy or restart anything. The only writes are the handoff files `herdr-handoff` makes under its own outbox and the new pane it opens.
+Remain otherwise read-only: never modify files, commit, push, build, deploy or restart anything. The only writes are the handoff files `herdr-handoff` makes under its own outbox, the new pane it opens, and the close of the pane it replaces (which happens only after the successor is proven live, and never while that pane still holds work).
 
 ## 1. Pick the target
 
@@ -41,15 +41,21 @@ Build one JSON object. Every item must be traceable to the history, a tool resul
 
 Rules: never fabricate paths, hashes, URLs, counts or results; mark doubt in `unverified` rather than leaving it out; never include credentials, tokens, private keys, hidden reasoning or raw transcripts (`herdr-handoff` also redacts known secret shapes, but do not rely on it). The briefing must be enough for an agent that cannot see this conversation.
 
-## 4. Create and launch
+## 4. Create and hand over
 
-1. Check the CLI: `herdr-handoff --version` must print `0.2.0` or newer (older versions lack the flags below). If it is missing or older, stop and tell the user to update herdr-handoff; do not fall back to a thinner briefing silently.
+1. Check the CLI: `herdr-handoff --version` must print `0.4.0` or newer (older versions lack the flags below, and pre-0.3.0 cannot close a replaced pane at all). If it is missing or older, stop and tell the user to update herdr-handoff; do not fall back to a thinner briefing silently.
 2. Create, passing the JSON on stdin through a quoted heredoc:
    `herdr-handoff create --goal "<goal>" --source-harness <source> --target-harness <target> --from-json - <<'HANDOFF_EOF'` ... `HANDOFF_EOF`
    Add `--model <id>` only if the user asked for a model. The command prints the queued envelope; take `handoff_id` from it. A validation error means fix the briefing and retry.
-3. Launch: `herdr-handoff launch <handoff_id> --cwd <worktree>`.
-   - `status: interactive_started`: a new pane (a split of this one, else a new tab or workspace) is running the target with a prompt that tells it to read the handoff document first.
+3. Make the source worktree durable, then hand over: commit and push what matters, from the worktree `git -C <worktree>` resolves to (for a linked worktree that is its own path, not the upstream checkout), and only then run `herdr-handoff takeover <handoff_id> --cwd <worktree>`.
+   - `status: interactive_started`: the target is running in this tab (a split of this pane, else a new tab or workspace) with a prompt to read the handoff document first, and this pane is closing. Report only what the result actually reports; never claim the old session was closed when it was not.
+   - `status: launch_unconfirmed` / `launch_failed`: the close was refused, so BOTH panes stay up - nothing was destroyed. Report it; do not re-run the handoff to force it.
+   - `status: source_dirty`: this pane's worktree has uncommitted tracked changes or commits with no upstream, so the close was refused. The successor is live and the handoff succeeded; only the close did not. Make the work durable, then close explicitly with `herdr-handoff confirm --close-source <handoff_id> --pane <source_pane_id>`.
+   - `status: source_close_failed`: the handoff went ahead and herdr refused the close - report it, do not force it.
    - `status: manual_launch_required`: herdr is not usable here. Show the user the printed `command` verbatim, run from `cwd`; `resume_command` prints the full resume prompt.
+   - Keep the source pane up (the pre-0.4.0 behaviour) with `--keep-source`.
+   - `--allow-dirty-source` closes a pane with uncommitted or unpushed work and loses it. Use it only when the user says to; `git -C <worktree> status --short` and `git -C <worktree> log @{u}..HEAD --oneline` show what would be lost. It cannot bypass the live-successor or same-tab checks, and it is never a retry of a refusal.
+   - Never close a pane by hand to make a refusal go away: a refusal is the guard working, and the pane you delete by hand is the one holding the work.
 4. Reply with the target, the handoff id, the document path and the placement or command. No recap of the briefing.
 
 ## Notes
