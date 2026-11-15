@@ -102,15 +102,19 @@ artifact-publication action.
 
 Closing a pane destroys an interactive session, so `herdr-handoff takeover` does it last and only on
 proof. The pane it replaces is closed after herdr reports the successor live and that successor has
-registered the handoff through `herdr-handoff confirm` — `--no-confirm` skips the wait. Before the close
-it asks git about the source worktree (`--source-cwd`, defaulting to `--cwd`, because a linked worktree
-resolves to its own path and not the upstream checkout):
+registered the handoff through `herdr-handoff confirm` (the successor registers itself, from the pane it
+is actually running in; the wait for herdr is bounded by `--confirm-timeout`, 25 seconds by default).
+Before the close it asks git about the source worktree — `--source-cwd`, defaulting to the directory herdr
+reports for the source pane and falling back to `--cwd`, because a linked worktree resolves to its own
+path and not the upstream checkout:
 
-* `status: source_dirty` — the worktree has uncommitted tracked changes or commits with no upstream, so
-  the close is refused. The successor is live and the handoff succeeded; only the close did not. Commit
-  or push, then `herdr-handoff confirm --close-source <handoff_id> --pane <source_pane_id>`.
-* `status: worktree_unknown` — git could not be consulted (missing, not a repo, timed out). Absence of
-  evidence is not evidence of cleanliness, so this refuses too.
+* `status: source_dirty` — the worktree holds work that is not durable, so the close is refused. The
+  successor is live and the handoff succeeded; only the close did not. The reason says which of three
+  things git reported: `worktree_dirty` (tracked changes uncommitted), `worktree_unpushed` (commits no
+  remote branch has) or `worktree_unknown` (git could not be consulted — missing, not a repo, timed out;
+  absence of evidence is not evidence of cleanliness). Commit or push, then run `herdr-handoff takeover
+  <handoff_id>` again with the same id: it reuses the successor already recorded for that handoff instead
+  of starting a second pane, and closes the source now that git reports it clean.
 * `status: launch_unconfirmed` or `launch_failed` — the close was refused and both panes remain up;
   nothing was destroyed. Report it rather than re-running the command to force it.
 * `status: source_close_failed` — the handoff completed and herdr refused the close; report it.
