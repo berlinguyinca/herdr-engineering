@@ -11,8 +11,11 @@ tests keep the three written surfaces honest about that one behaviour.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 from herdr_engineering.handoff_dependency import CLI_COMMANDS
@@ -96,3 +99,39 @@ def test_the_ops_doc_documents_the_default_and_every_refusal():
 
 def test_the_ops_doc_does_not_keep_the_stale_pin_note():
     assert "still names the revision without" not in _doc()
+
+
+# Interfaces herdr-handoff 0.4.0 does NOT offer.  Each was once written here: `confirm` takes only
+# `--pane`, `takeover` has no `--no-confirm` (the wait is `--confirm-timeout`), and an unreadable worktree
+# surfaces as `source_dirty` with a `worktree_unknown` reason rather than as its own status.  A skill that
+# names a flag which does not exist tells the agent to type something that will fail, mid-handoff.
+PHANTOM_INTERFACES = ("--close-source", "--no-confirm", "status: worktree_unknown")
+
+
+def test_the_shipped_text_promises_no_interface_the_cli_does_not_have():
+    text = _skill() + _doc()
+    for phantom in PHANTOM_INTERFACES:
+        assert phantom not in text, f"{phantom} is not part of the herdr-handoff takeover interface"
+
+
+def test_flags_the_skill_types_for_takeover_exist_in_the_installed_cli():
+    """Against the CLI on PATH, because argparse rejects an unknown flag with exit 2."""
+    cli = shutil.which("herdr-handoff")
+    if cli is None:
+        pytest.skip("herdr-handoff CLI is not installed here")
+    shown = subprocess.run([cli, "takeover", "--help"], capture_output=True, text=True, timeout=30)
+    assert shown.returncode == 0, shown.stderr
+    advertised = set(re.findall(r"--[a-z][a-z-]+", shown.stdout + shown.stderr))
+    for surface, text in (("skill", _skill()), ("ops doc", _doc())):
+        for line in text.splitlines():
+            if "herdr-handoff takeover" not in line:
+                continue
+            # Flags inside a shell substitution belong to whatever command is in there (`git rev-parse
+            # --show-toplevel`), not to herdr-handoff.
+            line = re.sub(r"\$\([^)]*\)", "", line)
+            unknown = sorted(
+                flag for flag in re.findall(r"--[a-z][a-z-]+", line) if flag not in advertised
+            )
+            assert not unknown, (
+                f"the {surface} types {unknown}; takeover offers {sorted(advertised)}"
+            )
