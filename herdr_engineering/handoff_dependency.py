@@ -49,20 +49,29 @@ def _advertises(help_text: str, command: str) -> bool:
     return re.search(rf"(?<![\w-]){re.escape(command)}(?![\w-])", help_text) is not None
 
 
-def _probe_cli(path: str) -> tuple[str, dict[str, bool]]:
+def _probe_cli(path: str) -> tuple[str, dict[str, bool], str]:
     """Ask the installed CLI what version it is and which commands it offers.
 
-    A probe that cannot run reports nothing (`({},)`) rather than assuming a capability; the caller turns
-    that into a gap.  Neither `--version` nor `--help` changes state.
+    A probe that cannot run reports nothing (no capabilities) rather than assuming a capability, and says
+    why in the third element (the exit status, or `unavailable`); the caller turns that into a gap.  Output
+    is trusted only from a command that exited 0 and printed something.  Neither `--version` nor `--help`
+    changes state.
     """
     try:
         shown = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=15)
         help_out = subprocess.run([path, "--help"], capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError):
-        return "", {}
+        return "", {}, "unavailable"
+    for result in (shown, help_out):
+        if result.returncode != 0:
+            return "", {}, str(result.returncode)
+    help_text = help_out.stdout + help_out.stderr
     lines = shown.stdout.strip().splitlines()
-    return (lines[0] if lines else ""), {
-        command: _advertises(help_out.stdout + help_out.stderr, command) for command in CLI_COMMANDS}
+    if not lines and not help_text.strip():
+        return "", {}, "0"
+    return lines[0] if lines else "", {
+        command: _advertises(help_text, command) for command in CLI_COMMANDS}, ""
+
 
 
 def check_handoff_dependency(*, skill_root: Path | None = None,
@@ -83,7 +92,7 @@ def check_handoff_dependency(*, skill_root: Path | None = None,
                for skill in ("herdr", "herdr-handoff", "herdr-artifact")
                if not (path.parent / skill / "SKILL.md").is_file()]
     resolved = shutil.which("herdr-handoff") if executable == "auto" else executable
-    version, capabilities = _probe_cli(resolved) if resolved else ("", {})
+    version, capabilities, probe_failure = _probe_cli(resolved) if resolved else ("", {}, "")
     if missing or not resolved:
         # Report the version even here: an operator fixing missing skills needs to know which CLI the
         # skills are supposed to match.
@@ -94,7 +103,7 @@ def check_handoff_dependency(*, skill_root: Path | None = None,
                                        version, capabilities)
     problems: list[str] = []
     if not capabilities:
-        problems.append(f"CLI at {resolved} could not be run to check its commands")
+        problems.append(f"CLI at {resolved}: could not run the herdr-handoff CLI ({probe_failure})")
     else:
         absent = [command for command in required_commands if not capabilities.get(command)]
         if absent:

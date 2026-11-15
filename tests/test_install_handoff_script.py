@@ -129,6 +129,14 @@ def test_no_script_carries_a_literal_handoff_revision():
     assert "does not own" in install, install
 
 
+def test_install_sh_handles_the_collision_exit_instead_of_aborting_under_set_e():
+    # A stale regular file at ~/.local/bin/herdr-handoff makes the script exit 2; install.sh runs under
+    # `set -e`, so the bare call used to end the whole install with no explanation of its own.
+    install = (REPO / "scripts" / "install.sh").read_text()
+    assert re.search(r'install-handoff\.sh"? \|\| handoff_rc=\$\?', install), install
+    assert 'handoff_rc" = 2' in install and "rm $HOME/.local/bin/herdr-handoff" in install
+
+
 def test_an_explicit_override_still_wins(tmp_path):
     result = run_script("--plan", env={"HERDR_HANDOFF_REF": "deadbeef", "HERDR_HANDOFF_SKILL_ROOT": str(tmp_path)})
     assert "pin: deadbeef" in result.stdout
@@ -183,6 +191,17 @@ def test_a_new_revision_replaces_the_installed_one(tmp_path):
     result = run_script("--skills-only", env=env)
     assert f"pin: {sha_b}" in result.stdout
     assert "takeover" in (tmp_path / "cache" / "skill" / "herdr-handoff" / "SKILL.md").read_text()
+
+
+def test_a_short_sha_override_resolves_from_the_clone_instead_of_being_fetched_by_name(tmp_path):
+    # GitHub refuses `git fetch origin <short sha>`, so a short-SHA rollout override used to exit 1.
+    bare, sha = _upstream(tmp_path, "revision A")
+    cache = tmp_path / "cache"
+    result = run_script("--skills-only", env={"HERDR_HANDOFF_URL": str(bare), "HERDR_HANDOFF_REF": sha[:7],
+                                              "HERDR_HANDOFF_CACHE": str(cache),
+                                              "HERDR_HANDOFF_SKILL_ROOT": str(tmp_path / "harness-homes")})
+    assert f"resolved: {sha}" in result.stdout
+    assert _head(cache) == sha
 
 
 def test_an_unreachable_revision_fails_loudly(tmp_path):

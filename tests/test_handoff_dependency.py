@@ -112,7 +112,7 @@ def test_a_cli_that_cannot_be_run_reports_no_capabilities(tmp_path):
     result = check_handoff_dependency(skill_root=tree, required_commands=("takeover",), executable=str(broken))
     assert result.status == "fail"
     assert result.capabilities == {}
-    assert "could not be run" in result.detail
+    assert "could not run the herdr-handoff CLI" in result.detail
 
 
 
@@ -144,3 +144,30 @@ def test_a_brace_group_that_is_an_option_does_not_hide_a_prose_command():
               "commands:\n    takeover    hand a session to a fresh pane\n")
     assert _advertises(option, "takeover") is True
     assert _advertises(option, "confirm") is False
+
+
+def _sh_cli(tmp_path: Path, name: str, body: str) -> str:
+    path = tmp_path / name
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_a_cli_that_exits_non_zero_is_not_trusted_for_what_it_printed(tmp_path):
+    # A wrapper that prints a usage line listing every command and then exits 2 is not a working CLI.
+    tree = _skills_tree(tmp_path)
+    cli = _sh_cli(tmp_path, "failing-handoff",
+                  'echo "0.3.0"; echo "usage: herdr-handoff {create,launch,takeover,confirm} ..."; exit 2\n')
+    result = check_handoff_dependency(skill_root=tree, required_commands=REQUIRED, executable=cli)
+    assert result.status == "fail"
+    assert "could not run the herdr-handoff CLI (2)" in result.detail
+    assert "does not provide" not in result.detail
+
+
+def test_a_cli_that_prints_nothing_is_reported_as_unrunnable_not_as_missing_commands(tmp_path):
+    tree = _skills_tree(tmp_path)
+    cli = _sh_cli(tmp_path, "silent-handoff", "exit 0\n")
+    result = check_handoff_dependency(skill_root=tree, required_commands=REQUIRED, executable=cli)
+    assert result.status == "fail"
+    assert "could not run the herdr-handoff CLI (0)" in result.detail
+    assert "does not provide" not in result.detail

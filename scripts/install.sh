@@ -119,7 +119,18 @@ step "3/8 installing required herdr-handoff integration"
 # One script resolves the pin, fetches it, installs the CLI, links the skills and attests the entrypoint on
 # PATH. install.sh used to declare the revision a second time beside the lock entry, so bumping the pin in
 # lock/upstreams.yaml changed what `herdr-eng fleet status` reported and not what this machine installed.
-HERDR_HANDOFF_PYTHON="$PY" bash "$REPO_ROOT/scripts/install-handoff.sh"
+# Exit 2 is its collision verdict (a PATH entry that is not ours); it has already named the file, and under
+# `set -e` it used to abort the whole install here. The rest of the install does not depend on it, so say
+# what is unproven and go on; any other failure still stops.
+handoff_rc=0
+HERDR_HANDOFF_PYTHON="$PY" bash "$REPO_ROOT/scripts/install-handoff.sh" || handoff_rc=$?
+if [ "$handoff_rc" = 2 ]; then
+  warn "herdr-handoff was NOT linked onto PATH: $HOME/.local/bin/herdr-handoff is a file or link this installer does not own"
+  warn "(for example an old pip --user install). Remove it (rm $HOME/.local/bin/herdr-handoff) or run"
+  warn "scripts/install-handoff.sh --migrate-copies to back it up, then re-run; the pinned CLI is unattested until then."
+elif [ "$handoff_rc" != 0 ]; then
+  die "scripts/install-handoff.sh failed (exit $handoff_rc)"
+fi
 
 if [ ! -f "$ARTIFACT_REPO/install/install.sh" ]; then
   command -v git >/dev/null 2>&1 || die "git is required to install herdr-artifacts"

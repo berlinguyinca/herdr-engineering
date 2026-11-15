@@ -78,10 +78,11 @@ if [ "${HERDR_HANDOFF_NO_PATH_LINK:-0}" = 1 ]; then PATH_LINK=0; fi
 PYTHON="${HERDR_HANDOFF_PYTHON:-python3}"
 if command -v "$PYTHON" >/dev/null 2>&1; then PYTHON="$(command -v "$PYTHON")"; fi
 
-# Absolute paths with every symlink resolved, including the last component.  `/tmp` and `/var` are symlinks
-# on macOS, and pytest's tmp_path is not, so a comparison that resolved only the parent directory looked
-# fine in tests and failed on a fresh host: the entrypoint pip had just installed did not match the path
-# this script believed its own, and nothing got linked.
+# Absolute paths with every symlink in the parent directory resolved; the last component is kept as named
+# (a PATH entry that is itself a link is judged separately, by readlink, in destination_is_ours).  `/tmp`
+# and `/var` are symlinks on macOS, and pytest's tmp_path is not, so a comparison that skipped the
+# directory resolution looked fine in tests and failed on a fresh host: the entrypoint pip had just
+# installed did not match the path this script believed its own, and nothing got linked.
 normalize() {
   if [ -e "$1" ] || [ -L "$1" ]; then
     (cd "$(dirname "$1")" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$1")") && return 0
@@ -132,10 +133,12 @@ else
   # A full SHA is immutable, so a cached copy of it is already correct.  A branch name is not: the ref
   # sitting in the cache is whatever was fetched the last time, so a branch-head override must be
   # re-fetched on every run or it installs a stale commit forever.
-  if printf '%s' "$REF" | grep -qE '^[0-9a-fA-F]{40}$'; then
+  # A short SHA (7-39 hex) cannot be fetched by name - GitHub refuses it - so it is looked up in the clone
+  # after refreshing the branches and tags, and only a ref that is still unknown falls through to a fetch.
+  have=""
+  if printf '%s' "$REF" | grep -qE '^[0-9a-fA-F]{7,40}$'; then
+    printf '%s' "$REF" | grep -qE '^[0-9a-fA-F]{40}$' || git -C "$CACHE" fetch --quiet --tags origin 2>/dev/null || true
     have="$(git -C "$CACHE" rev-parse -q --verify "$REF^{commit}" 2>/dev/null || true)"
-  else
-    have=""
   fi
   if [ -z "$have" ]; then
     git -C "$CACHE" fetch --quiet --depth 1 origin "$REF" \
