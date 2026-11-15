@@ -292,6 +292,25 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
     return report
 
 
+def _refresh_controller_handoff(root: Path, report: dict) -> None:
+    """Run scripts/install-handoff.sh for the controller; a failure is a warning in `report`, never fatal."""
+    handoff_installer = root / "scripts" / "install-handoff.sh"
+    if not handoff_installer.exists():
+        return
+    env = {"HERDR_HANDOFF_PYTHON": sys.executable}
+    rc, _, err = _run(["bash", str(handoff_installer)], timeout=600, env=env)
+    # Say which interpreter the step ran under: "refreshed" without that is how install and update came
+    # to disagree about what "installed" means.
+    report["steps"]["controller_handoff_refresh"] = {
+        "ok": rc == 0, "rc": rc, "stderr": err.strip()[-1000:] or None, "env": dict(env)}
+    if rc != 0:
+        report.setdefault("warnings", []).append(
+            "herdr-handoff refresh failed on the controller (interpreter "
+            f"{sys.executable}); the pinned dependency may be stale - run "
+            "scripts/install-handoff.sh and check `herdr-eng doctor`; fleet hosts are not covered "
+            "by this step (issue #799)")
+
+
 def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                  inventory: Path | None = None, pull_controller: bool = True,
                  reinstall_local: bool = True, revision: str | None = None,
@@ -409,16 +428,7 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
     # transport's PATH happens to resolve - which installs the CLI somewhere the caller never intended and
     # leaves the entrypoint on PATH at the previous revision.  A failure here is reported, not fatal: a
     # host whose handoff install is broken still syncs, and `herdr-eng doctor` names the gap.
-    handoff_installer = root / "scripts" / "install-handoff.sh"
-    if handoff_installer.exists():
-        handoff_ok, _ = step("controller_handoff_refresh", ["bash", str(handoff_installer)], 600,
-                             env={"HERDR_HANDOFF_PYTHON": sys.executable})
-        if not handoff_ok:
-            report.setdefault("warnings", []).append(
-                "herdr-handoff refresh failed on the controller (interpreter "
-                f"{sys.executable}); the pinned dependency may be stale - run "
-                "scripts/install-handoff.sh and check `herdr-eng doctor`; fleet hosts are not covered "
-                "by this step (issue #799)")
+    _refresh_controller_handoff(root, report)
 
     from .config import load_config
     cleanup = load_config().get("build_cleanup", {})

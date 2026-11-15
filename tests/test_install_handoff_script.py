@@ -9,6 +9,7 @@ real `sh` programs, because a test must not install a CLI into the environment i
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import subprocess
@@ -137,6 +138,13 @@ def test_install_sh_handles_the_collision_exit_instead_of_aborting_under_set_e()
     assert 'handoff_rc" = 2' in install and "rm $HOME/.local/bin/herdr-handoff" in install
 
 
+def test_install_sh_ends_honestly_when_the_handoff_cli_was_not_attested():
+    # A continued install with an old CLI left on PATH must not finish with "set up" and exit 0.
+    install = (REPO / "scripts" / "install.sh").read_text()
+    assert "exit 3" in install and "installed with warnings" in install, install
+    assert install.rindex("HANDOFF_UNATTESTED") > install.index("Done.")
+
+
 def test_an_explicit_override_still_wins(tmp_path):
     result = run_script("--plan", env={"HERDR_HANDOFF_REF": "deadbeef", "HERDR_HANDOFF_SKILL_ROOT": str(tmp_path)})
     assert "pin: deadbeef" in result.stdout
@@ -202,6 +210,36 @@ def test_a_short_sha_override_resolves_from_the_clone_instead_of_being_fetched_b
                                               "HERDR_HANDOFF_SKILL_ROOT": str(tmp_path / "harness-homes")})
     assert f"resolved: {sha}" in result.stdout
     assert _head(cache) == sha
+
+
+def test_an_ambiguous_short_sha_says_so_instead_of_claiming_a_fetch_failure(tmp_path):
+    bare, sha = _upstream(tmp_path, "revision A")
+    source = tmp_path / "upstream"
+    # Two commits whose ids share a 7-character prefix (found by hashing, ~20k tries over the message),
+    # written as real commit objects on two branches so the clone holds both: an abbreviation of that
+    # prefix is then genuinely ambiguous between commits.
+    tree = _head(source) and subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD^{tree}"],
+                                            capture_output=True, text=True, check=True).stdout.strip()
+    seen: dict[str, bytes] = {}
+    clash = ""
+    n = 0
+    while not clash:
+        n += 1
+        body = (f"tree {tree}\nauthor T <t@example.com> 1 +0000\ncommitter T <t@example.com> 1 +0000\n"
+                f"\nclash {n}\n").encode()
+        oid = hashlib.sha1(b"commit %d\0" % len(body) + body).hexdigest()
+        if oid[:7] in seen:
+            clash, pair = oid[:7], (seen[oid[:7]], body)
+        seen[oid[:7]] = body
+    for index, body in enumerate(pair):
+        oid = subprocess.run(["git", "-C", str(source), "hash-object", "-t", "commit", "-w", "--stdin"],
+                             input=body, capture_output=True, check=True).stdout.decode().strip()
+        subprocess.run(["git", "-C", str(source), "update-ref", f"refs/heads/clash{index}", oid], check=True)
+    subprocess.run(["git", "-C", str(bare), "fetch", "-q", str(source), "+refs/heads/*:refs/heads/*"], check=True)
+    result = run_script("--skills-only", expect=1, env={"HERDR_HANDOFF_URL": str(bare), "HERDR_HANDOFF_REF": clash,
+                                                        "HERDR_HANDOFF_CACHE": str(tmp_path / "cache"),
+                                                        "HERDR_HANDOFF_SKILL_ROOT": str(tmp_path / "harness-homes")})
+    assert f"ambiguous ref {clash}: use a longer SHA" in result.stderr
 
 
 def test_an_unreachable_revision_fails_loudly(tmp_path):

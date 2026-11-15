@@ -143,7 +143,13 @@ else
   if [ -z "$have" ]; then
     git -C "$CACHE" fetch --quiet --depth 1 origin "$REF" \
       || git -C "$CACHE" fetch --quiet origin "$REF" \
-      || { printf 'cannot fetch herdr-handoff %s from %s\n' "$REF" "$UPSTREAM" >&2; exit 1; }
+      || {
+        probe="$(git -C "$CACHE" rev-parse --verify "$REF^{commit}" 2>&1 || true)"
+        if printf '%s' "$probe" | grep -qi 'ambiguous'; then
+          printf 'ambiguous ref %s: use a longer SHA\n' "$REF" >&2; exit 1
+        fi
+        printf 'cannot fetch herdr-handoff %s from %s\n' "$REF" "$UPSTREAM" >&2; exit 1
+      }
     # Ask FETCH_HEAD first.  A fetch of a branch updates FETCH_HEAD; the same name may also resolve to a
     # stale local branch in the cache, and preferring that made a branch-head override install the commit
     # fetched the first time, forever.

@@ -123,11 +123,13 @@ step "3/8 installing required herdr-handoff integration"
 # `set -e` it used to abort the whole install here. The rest of the install does not depend on it, so say
 # what is unproven and go on; any other failure still stops.
 handoff_rc=0
+HANDOFF_UNATTESTED=0
 HERDR_HANDOFF_PYTHON="$PY" bash "$REPO_ROOT/scripts/install-handoff.sh" || handoff_rc=$?
 if [ "$handoff_rc" = 2 ]; then
   warn "herdr-handoff was NOT linked onto PATH: $HOME/.local/bin/herdr-handoff is a file or link this installer does not own"
   warn "(for example an old pip --user install). Remove it (rm $HOME/.local/bin/herdr-handoff) or run"
   warn "scripts/install-handoff.sh --migrate-copies to back it up, then re-run; the pinned CLI is unattested until then."
+  HANDOFF_UNATTESTED=1
 elif [ "$handoff_rc" != 0 ]; then
   die "scripts/install-handoff.sh failed (exit $handoff_rc)"
 fi
@@ -346,3 +348,9 @@ cat <<EOF
   This machine is now in the private inventory at: $INVENTORY
   Herdr was NOT modified; your running agent sessions are unaffected.
 EOF
+
+# Honest ending: an old CLI may still be what runs on PATH, so "set up" with exit 0 would be a false report.
+if [ "$HANDOFF_UNATTESTED" = 1 ]; then
+  warn "installed with warnings: the herdr-handoff CLI was not attested (see step 3); exiting 3"
+  exit 3
+fi
