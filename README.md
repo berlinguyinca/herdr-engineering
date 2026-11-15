@@ -185,6 +185,10 @@ installation (verified against `herdr 0.9.1`).
 **not** install, upgrade, or restart Herdr — your running agent sessions are
 unaffected. It is idempotent.
 
+Exit status: 0 on success; 3 means it finished with warnings because the pinned
+herdr-handoff CLI could not be attested (for example a stale
+`~/.local/bin/herdr-handoff` it does not own; the warning names the file).
+
 ```bash
 git clone https://github.com/berlinguyinca/herdr-engineering
 cd herdr-engineering
