@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: recurring unit-gates flakes (pipelines 1428, 1444, 1446, 1453, 1454)
+
+- Throwaway test Postgres clusters skip disk syncs (`fsync=off`, `full_page_writes=off`; commits stay durable across an immediate stop) and stop through `tests/control_plane/pg_stop.stop_postgres`: a fast stop that waits up to 300 s (pg_ctl's default is 60 s and exits 1 on timeout, which failed the owning test at teardown and left `the database system is shutting down` for the module's later tests), then an immediate stop if the postmaster is still up (restart helpers pass `fallback=False`). A guard test requires every launcher to use both.
+- Shared `tests/io_timeouts.py` (`HERDR_TEST_IO_TIMEOUT`, default 30 s) replaces the 3-10 s literals on the local-server HTTP helpers and the 60-90 s CLI/deploy subprocess waits that failed on a starved node.
+- `test_watchdog_does_not_fire_when_cycles_complete` uses a 2 s cycle timeout (was 0.5 s) and runs past it, so it still proves the cycle clock is refreshed.
+- `scripts/ci/pytest-parallel.sh`: `-n auto` is capped by the effective cgroup CPU quota (smallest on the path to the root, v2 `cpu.max` and v1 `cfs_quota_us`; `scripts/ci/cpu-quota.py`) when it is smaller than the cap and the visible cores; `scripts/ci/host-facts.sh` prints host, CPUs, quota, load, memory and tmp filesystem at the start of the gate.
 ### Report preview: link-preview metadata, honest share notice, fairer section quotas
 
 - Follow-up to #748 (merged before these review fixes): in a share, per-field truncation markers, the omission notice and the legend no longer point at the unshared descriptor, share wording never pushes the page over the cap, post-hoc replacements in the preview are removed, and quota rounding leftover is distributed instead of dropped.

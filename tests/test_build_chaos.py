@@ -33,6 +33,7 @@ from herdr_engineering import build_registry as br
 from herdr_engineering import build_slurm_adapter as sa
 from herdr_engineering.build_cache_config import validate
 from herdr_engineering.build_cache_storage import Endpoint, probe_health
+from tests.io_timeouts import PROCESS_TIMEOUT
 
 REPO = Path(__file__).resolve().parents[1]
 PY = sys.executable
@@ -90,7 +91,7 @@ def _cli_argv(*args: str) -> list[str]:
     return [PY, "-m", "herdr_engineering.cli", "build-coordinate", *args]
 
 
-def _cli(args, state, home, *, cfg=None, bin_=None, cwd=None, timeout=60, **extra):
+def _cli(args, state, home, *, cfg=None, bin_=None, cwd=None, timeout=PROCESS_TIMEOUT, **extra):
     return subprocess.run(_cli_argv(*args), capture_output=True, text=True, timeout=timeout,
                           env=_env(state, home, cfg=cfg, bin_=bin_, **extra), cwd=cwd or home)
 
@@ -235,7 +236,7 @@ def test_unreachable_shared_endpoint_builds_locally_with_reason_and_exit_code(tm
     r = _cli(["--max-load", "0", "--", "cargo", "build", "7"], state, tmp_path,
              cfg=cfg, bin_=bin_, CHAOS_SEEN=str(seen))
     assert r.returncode == 7, r.stderr                        # exit code preserved
-    assert time.monotonic() - t0 < 30                          # bounded
+    assert time.monotonic() - t0 < 60  # bounded (was 30: measured 40 s on a starved CI node; a hang is minutes)
     ev = _events(state / "build-gates")
     fin = [e for e in ev if e["event"] == "build_finished"][-1]
     assert fin["exit_code"] == 7

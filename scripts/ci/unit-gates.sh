@@ -26,6 +26,7 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "missing on this host: $1" >&
 need python3; need node; need git; need flock
 
 . scripts/ci/ensure-fd-limit.sh; herdr_ensure_fd_limit || exit 1
+. scripts/ci/host-facts.sh; ci_host_facts || true
 . scripts/ci/pytest-parallel.sh
 herdr_pytest_parallel_load || exit 1     # a bad override fails loudly instead of silently running serial
 

@@ -11,6 +11,15 @@
 # --dist=loadfile keeps every test of a file on one worker, because the suite's fixtures and module state are written per file. It
 # does NOT honour `xdist_group` marks (only --dist=loadgroup does), so files still run concurrently with each other: a test that
 # cannot share a machine with other files (fixed port, shared path) must use an OS-assigned port or a per-test tmp path instead.
+# The CPUs this process may really use under a cgroup CPU quota (smallest quota from its cgroup up to the root, v1 and v2), as a whole
+# number >= 1, or nothing when there is no quota: scripts/ci/cpu-quota.py. xdist's `auto` counts the cores in the affinity mask, which a
+# quota does not shrink: a job granted 2 CPUs on a 24-core node starts 8 workers that starve each other, and then 3 s socket reads and
+# `pg_ctl stop` waits time out in tests that did nothing wrong. HERDR_CGROUP_ROOT and HERDR_PROC_CGROUP override /sys/fs/cgroup and
+# /proc/self/cgroup (tests/test_ci_pytest_parallel.py builds real directory trees).
+herdr_cpu_quota() {
+  python3 "$(dirname "${BASH_SOURCE[0]}")/cpu-quota.py" "${HERDR_CGROUP_ROOT:-/sys/fs/cgroup}" "${HERDR_PROC_CGROUP:-/proc/self/cgroup}"
+}
+
 herdr_pytest_parallel_args() {
   local workers="${HERDR_PYTEST_WORKERS:-auto}" cap="${HERDR_PYTEST_MAXPROCESSES:-8}"
   case "$workers" in
@@ -19,6 +28,13 @@ herdr_pytest_parallel_args() {
     ''|*[!0-9]*) echo "HERDR_PYTEST_WORKERS must be a number or 'auto', got '$workers'" >&2; return 1 ;;
   esac
   case "$cap" in ''|*[!0-9]*|0) echo "HERDR_PYTEST_MAXPROCESSES must be a positive number, got '$cap'" >&2; return 1 ;; esac
+  if [ "$workers" = auto ]; then
+    local quota; quota="$(herdr_cpu_quota 2>/dev/null || true)"
+    # A quota below both the cap and the visible cores is the real budget; otherwise `auto` is right as before.
+    if [ -n "$quota" ] && [ "$quota" -lt "$cap" ] && [ "$quota" -lt "$(python3 -c 'import os; print(len(os.sched_getaffinity(0)))')" ]; then
+      workers="$quota"
+    fi
+  fi
   printf '%s\n' -n "$workers" "--maxprocesses=$cap" --dist=loadfile
 }
 

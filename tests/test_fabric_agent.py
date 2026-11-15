@@ -762,10 +762,10 @@ def test_watchdog_does_not_fire_when_cycles_complete(tmp_path, monkeypatch):
     stop = threading.Event()
     threading.Thread(
         target=agent.run, args=(stop,),
-        kwargs={"cycle_timeout": 0.5, "poll": 0.05},
+        kwargs={"cycle_timeout": 2.0, "poll": 0.05},  # 20x the 0.1 s interval: a CPU-starved CI node stalled one cycle past the old 0.5 s
         daemon=True).start()
     try:
-        time.sleep(1.0)  # several healthy cycles
+        time.sleep(2.6)  # longer than cycle_timeout, so only a refreshed cycle clock keeps the watchdog quiet
         assert exited == []
     finally:
         stop.set()  # a failed assert must not leave the watchdog running past monkeypatch's restore of os._exit

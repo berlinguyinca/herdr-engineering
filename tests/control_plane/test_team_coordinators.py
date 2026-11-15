@@ -26,6 +26,7 @@ from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from tests.control_plane.test_collab import BASE, Api, Clock, _digest
 from tests.control_plane.test_team_rooms import USERS
 from tests.control_plane.wg_pg import wg, wg_pg  # noqa: F401
+from tests.io_timeouts import HTTP_TIMEOUT
 
 TEAM = "team-" + "c" * 20
 TEAM2 = "team-" + "d" * 20
@@ -806,7 +807,7 @@ def test_everything_an_external_coordinator_must_not_do_is_403_with_an_audit_den
 
 def _http(port, method, path, body=None, headers=None):
     import http.client
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=HTTP_TIMEOUT)
     h = {"Content-Type": "application/json", **(headers or {})}
     conn.request(method, path, body=json.dumps(body) if body is not None else None, headers=h)
     resp = conn.getresponse()
