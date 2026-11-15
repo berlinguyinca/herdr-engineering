@@ -47,11 +47,15 @@ planner-worker feature and keeps its name; in Pi use the skill (`/skill:handoff`
   links, key files, exact next commands, constraints and a pointer to the published `/summary` report.
   Unconfirmed items go in `unverified`; secrets are redacted.
 * Transport: reuse, not fork. The skill runs `herdr-handoff create ... --from-json -` then
-  `herdr-handoff launch`; `/herdr::to*` runs the same two calls with an explicit target. The envelope is
+  `herdr-handoff takeover`; `/herdr::to*` runs the same two calls with an explicit target. The envelope is
   `schema_version` 2 (additive, `schemas/handoff-v2.schema.json` in herdr-handoff, which needs
-  herdr-handoff 0.2.0 or newer: the skill checks `herdr-handoff --version`). `launch` writes the full
+  herdr-handoff 0.4.0 or newer: the skill checks `herdr-handoff --version`). The handover writes the full
   handoff as a markdown document and starts the harness with a one-line prompt telling it to read that
   absolute path first.
+* Handover, not duplication: `herdr-handoff takeover` starts the successor in the **same tab** as the
+  invoking pane and closes the pane it replaces once herdr has reported the successor live **and** that
+  successor has registered (`herdr-handoff confirm`). `launch` still exists and still leaves both panes
+  running; use it, or `takeover --keep-source`, when the operator wants the old session kept.
 * No pane: without `HERDR_PANE_ID`, `launch` adds a tab to the focused workspace (or creates a
   workspace) in `--cwd`; without a running herdr it prints the exact one-line command
   (`status: manual_launch_required`), leaves the handoff `queued`, and `herdr-handoff resume <id>`
@@ -60,14 +64,18 @@ planner-worker feature and keeps its name; in Pi use the skill (`/skill:handoff`
   `--model` is passed to all four (opencode wants `provider/model`; a bare name is dropped with a note).
   Verified against each CLI's `--help` in herdr-handoff's integration tests.
 
-The scripts/install.sh pin of herdr-handoff (`lock/upstreams.yaml`) still names the revision without
-the v2 flags; bump it after the herdr-handoff change merges.
+`lock/upstreams.yaml` names the pinned herdr-handoff revision and
+`scripts/install-handoff.sh` is the only place that revision is resolved; the pin notes the capabilities
+the skills here depend on (v2 envelope, takeover/confirm, takeover-by-default with the worktree guard).
 
 The `to*` commands are interactive: they split the invoking `HERDR_PANE_ID` to
 the right, start the target harness in that child pane, send the bounded resume
 prompt, and report the handoff/pane metadata back to Herdr. If the current pane
 identity is unavailable, the command fails rather than launching a detached
-process.
+process. Since herdr-handoff 0.4.0 they run `takeover`, so the invoking pane is
+closed once the successor is proven live (see *Ordering and refusals*). The
+slash commands take only an optional model; when the user says to keep both
+sessions running, the skill runs `herdr-handoff takeover --keep-source` instead.
 
 The control plane accepts those packages at `POST /api/v1/handoffs`. The
 operator API key is required. A package is queued before a recipient can claim
@@ -80,12 +88,39 @@ herdr-handoff create --goal "Continue the current session" \
   --remaining "Run the review" --artifact art_123
 
 herdr-handoff sync --url "$HERDR_CONTROL_PLANE_URL" --token "$HERDR_API_KEY"
+
+# Hand over: start the successor in this tab, then close this pane on proof.
+herdr-handoff takeover hnd_123 --cwd "$(git rev-parse --show-toplevel)"
 ```
 
 The model argument is a hint, not a guarantee. The receiving harness must
 report the resolved model. Handoffs do not launch processes or publish
 anything automatically. Public sharing remains a separate, human-approved
 artifact-publication action.
+
+## Ordering and refusals
+
+Closing a pane destroys an interactive session, so `herdr-handoff takeover` does it last and only on
+proof. The pane it replaces is closed after herdr reports the successor live and that successor has
+registered the handoff through `herdr-handoff confirm` — `--no-confirm` skips the wait. Before the close
+it asks git about the source worktree (`--source-cwd`, defaulting to `--cwd`, because a linked worktree
+resolves to its own path and not the upstream checkout):
+
+* `status: source_dirty` — the worktree has uncommitted tracked changes or commits with no upstream, so
+  the close is refused. The successor is live and the handoff succeeded; only the close did not. Commit
+  or push, then `herdr-handoff confirm --close-source <handoff_id> --pane <source_pane_id>`.
+* `status: worktree_unknown` — git could not be consulted (missing, not a repo, timed out). Absence of
+  evidence is not evidence of cleanliness, so this refuses too.
+* `status: launch_unconfirmed` or `launch_failed` — the close was refused and both panes remain up;
+  nothing was destroyed. Report it rather than re-running the command to force it.
+* `status: source_close_failed` — the handoff completed and herdr refused the close; report it.
+
+Untracked files (`.claude/`, `.venv/`, build output) do not refuse a close: they appear in almost every
+checkout, and a guard that cries wolf trains operators to pass `--allow-dirty-source`, which is the flag
+that really loses work. It skips only the worktree check — never the live-successor or same-tab checks —
+and `git -C <path> status --short` plus `git -C <path> log @{u}..HEAD --oneline` show what it would drop.
+
+To keep the old pane instead of handing over, pass `--keep-source` (or use `launch` directly).
 
 ## Optional `memory_context`
 
