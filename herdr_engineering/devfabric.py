@@ -886,9 +886,6 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
     upgrade = is_upgrade(req_head)
     if not upgrade and req_head.endswith(b"\r\n\r\n"):
         req_head = force_close(req_head[:-4]) + b"\r\n\r\n"
-    if upgrade:
-        prefixed_pipe(client, target, client_prefix=req_head + rest)
-        return
     try:
         target.sendall(req_head + rest)
     except OSError:
@@ -909,10 +906,21 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
             except OSError:
                 pass
 
-    t = threading.Thread(target=up, daemon=True)
-    t.start()
+    t: threading.Thread | None = None
+    if not upgrade:
+        t = threading.Thread(target=up, daemon=True)
+        t.start()
     try:
         resp_head, body = _read_head(target)
+        if upgrade and _status_code(resp_head) == 101:
+            # only an accepted upgrade turns the connection into a raw pipe
+            client.sendall(resp_head + body)
+            prefixed_pipe(client, target)
+            return
+        # anything else: relay this one response and close (no keep-alive reuse, so a
+        # second request on the connection can never skip the head rewrite)
+        if upgrade:
+            target.settimeout(5.0)      # a keep-alive upstream must not hold the worker open
         if rewrite_head and resp_head.endswith(b"\r\n\r\n"):
             resp_head = rewrite_response_head(resp_head[:-4], port, external,
                                               "https" if tls else None) + b"\r\n\r\n"
@@ -929,7 +937,13 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
             client.shutdown(socket.SHUT_WR)
         except OSError:
             pass
-    t.join(timeout=5)
+    if t is not None:
+        t.join(timeout=5)
+
+
+def _status_code(head: bytes) -> int | None:
+    parts = head.split(b"\r\n", 1)[0].split(None, 2)
+    return int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
 
 
 def route_and_pipe(client: socket.socket, routes, fallback_host: str,
