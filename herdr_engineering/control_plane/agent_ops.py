@@ -216,6 +216,8 @@ def _norm_envelope(ev: dict) -> dict | None:
     ops = meta.get("agent_ops") if isinstance(meta, dict) else None
     if not isinstance(ops, dict) or ev.get("event_type") not in EVENT_TYPES:
         return None
+    if ev["event_type"] == DISMISSED and ops.get("operator_action") is not True:
+        return None                          # only the server's operator path stamps this; a stored forgery is ignored
     sequence = ev.get("source_sequence")
     scope = ev.get("visibility_scope") or "private"
     return _event(
@@ -805,7 +807,7 @@ class AgentOpsService:
                     "provenance": "observed", "payload": {"reason": reason} if reason else {},
                     **{k: v for k, v in (("agent_id", agent_id), ("session_id", session_id), ("host_id", host_id),
                                          ("room_id", room or None)) if v}}
-            ingest.ingest(body, principal)
+            ingest.ingest(body, principal, server_owned=True)
             ids.append(event_id)
         with self._cache_lock:
             self._cache.clear()

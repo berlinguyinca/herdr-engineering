@@ -247,3 +247,52 @@ def test_cli_dismisses_by_agent_and_by_session_and_reports_failures():
         assert run_cli(server, "dismiss").returncode == 2                      # neither an agent nor --session
     finally:
         server.stop()
+
+
+# --------------------------------------------------------------------------- reservation: clients cannot forge it
+def forged(event_id, source="operator"):
+    return {"schema_version": 2, "event_id": event_id, "source": source, "source_sequence": 7,
+            "entity_type": "lifecycle", "entity_id": "a1", "event_type": "session.dismissed",
+            "visibility_scope": "org", "agent_id": "a1", "provenance": "observed", "payload": {}}
+
+
+def test_ingest_and_agent_keys_cannot_forge_a_tombstone_through_ingest():
+    repo = two_agents()
+    server = Server.__new__(Server)
+    server.srv = ControlPlaneServer(repo, host="127.0.0.1", port=0, agent_ops_config={"enabled": True},
+                                    api_keys={"op-key": "operator", "view-key": "viewer", "ing-key": "ingest",
+                                              "agent-key": "agent"})
+    server.thread = threading.Thread(target=server.srv.serve, daemon=True)
+    server.thread.start()
+    server.srv.wait_until_ready()
+    try:
+        for key in ("ing-key", "agent-key", "op-key"):
+            for source in ("operator", "pi"):
+                status, _ = server.call("POST", "/api/v1/ingest", forged(f"f-{key}-{source}", source), key=key)
+                assert 400 <= status < 500, (key, source, status)
+        assert [a["node_id"] for a in server.snapshot()["agents"]] == ["s1", "s2"]
+        _, page = server.call("GET", "/api/v1/agent-ops/events?limit=100")
+        assert "session.dismissed" not in [e["event_type"] for e in page["events"]]
+    finally:
+        server.stop()
+
+
+def test_a_stored_tombstone_without_the_server_marker_is_ignored_by_the_projection():
+    repo = two_agents()
+    # a row that predates the reservation or was written around it: no server-stamped operator marker
+    repo.record_event("lifecycle", "a1", "session.dismissed", {}, envelope={
+        "schema_version": 2, "event_id": "raw1", "source": "operator", "source_sequence": 9,
+        "received_at": repo._stamp(), "occurred_at": None, "visibility_scope": "org", "evidence_refs": None,
+        "actor": {"kind": "ingest", "id": "key:x", "authenticated_by": "api_key"}, "claimed_actor": None,
+        "agent_id": "a1", "content_hash": "h", "agent_ops": {"provenance": "observed"}, "entity_type": "lifecycle"})
+    snap = AgentOpsService(repo).snapshot(Viewer(operator=True))
+    assert [a["node_id"] for a in snap["agents"]] == ["s1", "s2"]
+
+
+def test_a_federation_peer_principal_cannot_ingest_one():
+    import pytest
+    repo = two_agents()
+    with pytest.raises((ValueError, PermissionError)):
+        IngestService(repo).ingest(forged("peer1"), {"kind": "peer", "id": "peer:x", "authenticated_by": "api_key"})
+    with pytest.raises((ValueError, PermissionError)):
+        IngestService(repo).ingest(forged("op1"), OPERATOR)
