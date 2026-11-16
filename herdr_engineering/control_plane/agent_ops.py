@@ -16,6 +16,7 @@ import json
 import re
 import threading
 import time
+import uuid
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
@@ -27,7 +28,8 @@ EVENT_TYPES = frozenset({
     "message.acknowledged", "delegation.proposed", "delegation.accepted", "delegation.rejected",
     "owner.transferred", "review.requested", "review.completed", "artifact.created", "artifact.verified",
     "tests.started", "tests.completed", "room.joined", "room.left", "agent.disconnected", "agent.reconnected",
-    "drift.warning", "handoff.state"})
+    "drift.warning", "handoff.state", "session.dismissed"})
+DISMISSED = "session.dismissed"     # operator tombstone: hides a node until a newer event of that node
 PROVENANCE = ("observed", "derived", "inferred", "unknown")
 
 MAX_EVENTS = 5000                # newest events kept per request, across all sources
@@ -239,7 +241,8 @@ def _category(ev: dict) -> str | None:
     """The kinds whose LAST value is still the current truth after older history slides out of a window."""
     kind = ev["event_type"]
     return ("model" if kind in ("model.selected", "model.switched") else "context" if kind == "context.metric"
-            else "state" if kind in _STATES else "room" if kind in ("room.joined", "room.left") else None)
+            else "state" if kind in _STATES else "room" if kind in ("room.joined", "room.left")
+            else "dismissal" if kind == DISMISSED else None)
 
 
 def carry_forward(dropped: list[dict]) -> list[dict]:
@@ -415,7 +418,7 @@ class _Fold:
                 "node_id": key, "agent_id": agent_id or key, "session_id": session_id, "host_id": None,
                 "provider": None, "model": None, "model_changes": [], "state": "unknown", "context": None,
                 "room_ids": [], "parent_session_id": None, "compactions": 0, "drift_warnings": 0,
-                "label": None, "provenance": "unknown", "last_event_at": None,
+                "label": None, "provenance": "unknown", "last_event_at": None, "_dismissed": False,
                 "_prior": None, "_by_host": None, "_fails": [], "_reported": []}
         elif agent_id and self.nodes[key]["agent_id"] == key and agent_id != key:
             self.nodes[key]["agent_id"] = agent_id
@@ -458,7 +461,11 @@ class _Fold:
     def apply(self, ev: dict) -> None:
         kind, payload = ev["event_type"], ev["payload"]
         when = ev["occurred_at"] or ev["ingested_at"]
+        if kind == DISMISSED:
+            return self._dismiss(ev)
         me = self.node(ev["agent_id"], ev["session_id"])
+        if me in self.nodes:
+            self.nodes[me]["_dismissed"] = False   # events apply in time order: anything after a tombstone revives
         if ev["host_id"]:
             host = self.hosts.setdefault(ev["host_id"], {"connected": None, "reconnects": 0, "last_seen": ""})
             host["last_seen"] = max(host["last_seen"], when)
@@ -502,6 +509,15 @@ class _Fold:
                           ev["handoff_id"] or "")
         elif kind in _CONTRIBUTION and task is not None and me and not me.startswith(_USER):
             self._add(task["contributors"], me)
+
+    def _dismiss(self, ev: dict) -> None:
+        """Hide the node of ``session_id`` (else every node of ``agent_id``). Never creates a node or touches a host."""
+        if ev["session_id"]:
+            hit = [self.nodes[ev["session_id"]]] if ev["session_id"] in self.nodes else []
+        else:
+            hit = [n for n in self.nodes.values() if ev["agent_id"] and n["agent_id"] == ev["agent_id"]]
+        for node in hit:
+            node["_dismissed"] = True
 
     def _host_link(self, host_id: str, host: dict, kind: str, ev: dict) -> None:
         """A host-level (agent-less) disconnect/reconnect moves every agent known on that host."""
@@ -591,23 +607,28 @@ class _Fold:
                 ref, seen = self.redirect[ref], seen + 1
             return ref
 
-        agents = sorted(self.nodes.values(), key=lambda n: n["node_id"])[:MAX_AGENTS]
+        gone = {k for k, n in self.nodes.items() if n["_dismissed"]}
+        nodes = {k: n for k, n in self.nodes.items() if k not in gone}
+        agents = sorted(nodes.values(), key=lambda n: n["node_id"])[:MAX_AGENTS]
         by_id = {n["node_id"]: n for n in agents}
         for node in agents:
             node["context_health"] = context_health(node["context"])
         rooms = []
         for room in sorted(self.rooms.values(), key=lambda r: r["room_id"])[:MAX_ROOMS]:
-            ids = sorted({fix(a) for a in room["agent_ids"]})
+            ids = sorted({fix(a) for a in room["agent_ids"]} - gone)
             rooms.append({"room_id": room["room_id"], "agent_ids": ids,
                           "context_health": context_aggregate([by_id[i] for i in ids if i in by_id])})
         edges = []
         for edge in sorted(self.edges.values(), key=lambda e: (e["kind"], e["from"], e["to"], e["event_id"])):
-            edges.append({**edge, "from": fix(edge["from"]), "to": fix(edge["to"])})
+            ends = fix(edge["from"]), fix(edge["to"])
+            if not gone.intersection(ends):
+                edges.append({**edge, "from": ends[0], "to": ends[1]})
         tasks = []
         for task in sorted(self.tasks.values(), key=lambda t: t["task_id"]):
-            tasks.append({**task, "accountable_owner": fix(task["accountable_owner"]),
-                          "reviewer": fix(task["reviewer"]),
-                          "contributors": sorted({fix(c) for c in task["contributors"]})})
+            owner, reviewer = fix(task["accountable_owner"]), fix(task["reviewer"])
+            tasks.append({**task, "accountable_owner": None if owner in gone else owner,
+                          "reviewer": None if reviewer in gone else reviewer,
+                          "contributors": sorted({fix(c) for c in task["contributors"]} - gone)})
         for node in agents:
             node["room_ids"] = sorted(node["room_ids"])
         _drift(agents, by_id, edges, tasks)
@@ -617,7 +638,7 @@ class _Fold:
                 "cursor": cursor, "hosts": hosts, "health": {"context": context_aggregate(agents)},
                 "counts": {"agents": len(agents), "rooms": len(rooms), "edges": len(edges[:MAX_EDGES]),
                            "tasks": len(tasks), "events": event_count, "hosts": len(hosts)},
-                "truncated": len(self.nodes) > MAX_AGENTS or len(self.edges) > MAX_EDGES
+                "truncated": len(nodes) > MAX_AGENTS or len(self.edges) > MAX_EDGES
                 or len(self.rooms) > MAX_ROOMS}
 
 
@@ -757,6 +778,39 @@ class AgentOpsService:
                     name = (self.collab._rooms.get(room["room_id"]) or {}).get("name")
             room["name"] = name if isinstance(name, str) and name else None
         return snap
+
+    def dismiss(self, ingest: Any, principal: dict | None, agent_id: str | None, session_id: str | None,
+                reason: str | None = None) -> dict | None:
+        """Record the operator's ``session.dismissed`` tombstone(s) for an agent or session through the normal ingest
+        path (durable, so it survives a restart). One tombstone per distinct (scope, room) the target was seen in, so
+        every viewer who could see the agent also sees it dropped and nobody learns of an agent they could not see.
+        None when no stored event names the target."""
+        mine = [e for e in self._gather(Viewer(operator=True), None)
+                if not (e["agent_id"] or "").startswith(_USER)
+                and (e["session_id"] == session_id if session_id else e["agent_id"] == agent_id)
+                and (not (session_id and agent_id) or e["agent_id"] == agent_id)]
+        if not mine:
+            return None
+        agent_id = agent_id or next((e["agent_id"] for e in reversed(mine) if e["agent_id"]), None)
+        host_id = next((e["host_id"] for e in reversed(mine) if e["host_id"]), None) if session_id else None
+        scopes = sorted({(e["visibility_scope"], e["room_id"] or "") for e in mine})[:MAX_TARGETS]
+        entity = agent_id or session_id
+        stamp = time.time_ns() // 1000               # per (actor, source) sequence: unique per call, ordered by time
+        ids = []
+        for index, (scope, room) in enumerate(scopes):
+            event_id = f"dismiss:{uuid.uuid4().hex}"
+            body = {"schema_version": 2, "event_id": event_id, "source": "operator", "source_sequence": stamp + index,
+                    "entity_type": "lifecycle", "entity_id": entity, "event_type": DISMISSED,
+                    "occurred_at": datetime.now(UTC).isoformat(), "visibility_scope": scope,
+                    "provenance": "observed", "payload": {"reason": reason} if reason else {},
+                    **{k: v for k, v in (("agent_id", agent_id), ("session_id", session_id), ("host_id", host_id),
+                                         ("room_id", room or None)) if v}}
+            ingest.ingest(body, principal)
+            ids.append(event_id)
+        with self._cache_lock:
+            self._cache.clear()
+        stored = [e for e in envelope_events(self.repo) if e["event_id"] in ids]
+        return {"dismissed": session_id or entity, "cursor": max(cursor_of(e) for e in stored)}
 
     def snapshot(self, viewer: Viewer, principal: Any = None) -> dict:
         return self._named(fold(self._gather(viewer, principal)), viewer)
