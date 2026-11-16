@@ -50,7 +50,7 @@ def upstream():
     srv.close()
 
 
-def _through_gateway(up_port, raw: bytes, rewrite: str | None = "gw.example", binder_kwargs=None) -> bytes:
+def _through_gateway(up_port, raw: bytes, rewrite: str | None = "gw.example") -> bytes:
     router = GatewayRouter(["127.0.0.1"])
     port = _free_port()
     assert router.bind(port, "127.0.0.1", up_port, None, rewrite)
@@ -66,7 +66,7 @@ def _through_gateway(up_port, raw: bytes, rewrite: str | None = "gw.example", bi
                 pass
             return out
     finally:
-        router.unbind(port) if hasattr(router, "unbind") else None
+        router.unbind(port)
 
 
 def _xff(head: bytes) -> list[str]:
@@ -191,3 +191,67 @@ def test_a_101_upgrade_still_becomes_a_raw_pipe(keepalive_upstream):
     finally:
         router.unbind(port)
     assert any(b"frame-bytes" in bytes(r) for r in received)
+
+
+# ---- route_and_pipe and proxy_pair ---------------------------------------------
+def _xff_in(received) -> list[str]:
+    return [v for r in received for v in _xff(bytes(r))]
+
+
+def test_route_and_pipe_replaces_a_client_forwarded_for(keepalive_upstream):
+    up_port, received, _ = keepalive_upstream
+    lsn = socket.socket()
+    lsn.bind(("127.0.0.1", 0))
+    lsn.listen(1)
+    t = threading.Thread(target=lambda: route_and_pipe(lsn.accept()[0], [Route("/api", "127.0.0.1", up_port)],
+                                                       "127.0.0.1", up_port, forwarded_for="100.64.0.7"), daemon=True)
+    t.start()
+    with socket.create_connection(lsn.getsockname(), timeout=5) as c:
+        c.sendall(b"GET /api/x HTTP/1.1\r\nHost: h\r\nX-Forwarded-For: 9.9.9.9\r\n\r\n")
+        c.shutdown(socket.SHUT_WR)
+        assert b"200" in _drain(c)
+    lsn.close()
+    assert _xff_in(received) == ["100.64.0.7"]
+
+
+def test_proxy_pair_replaces_a_client_forwarded_for_and_passes_non_http_untouched(keepalive_upstream):
+    up_port, received, _ = keepalive_upstream
+    lsn = socket.socket()
+    lsn.bind(("127.0.0.1", 0))
+    lsn.listen(2)
+
+    def serve_once() -> None:
+        cl = lsn.accept()[0]
+        proxy_pair(cl, socket.create_connection(("127.0.0.1", up_port)), forwarded_for="100.64.0.7")
+
+    threading.Thread(target=serve_once, daemon=True).start()
+    with socket.create_connection(lsn.getsockname(), timeout=5) as c:
+        c.sendall(b"GET / HTTP/1.1\r\nHost: h\r\nX-Forwarded-For: 9.9.9.9\r\n\r\n")
+        c.shutdown(socket.SHUT_WR)
+        assert b"200" in _drain(c)
+    assert _xff_in(received) == ["100.64.0.7"]
+
+    threading.Thread(target=serve_once, daemon=True).start()
+    with socket.create_connection(lsn.getsockname(), timeout=5) as c:
+        c.sendall(b"\x00\x01binary\r\n\r\n")
+        c.shutdown(socket.SHUT_WR)
+        _drain(c)
+    lsn.close()
+    assert any(bytes(r).startswith(b"\x00\x01binary") for r in received)
+
+
+def test_gateway_routes_and_plain_pipe_overwrite_forwarded_for_end_to_end(keepalive_upstream):
+    up_port, received, _ = keepalive_upstream
+    for routes in (None, [Route("/", "127.0.0.1", up_port)]):
+        router = GatewayRouter(["127.0.0.1"])
+        port = _free_port()
+        assert router.bind(port, "127.0.0.1", up_port, routes, None)
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as c:
+                c.sendall(b"GET / HTTP/1.1\r\nHost: h\r\nX-Forwarded-For: 9.9.9.9\r\n\r\n")
+                c.shutdown(socket.SHUT_WR)
+                _drain(c)
+        finally:
+            router.unbind(port)
+    time.sleep(0.2)
+    assert _xff_in(received) == ["127.0.0.1", "127.0.0.1"]

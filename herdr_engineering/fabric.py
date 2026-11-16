@@ -257,7 +257,7 @@ class GatewayRouter:
             real_peer = client.getpeername()[0]
         except OSError:
             real_peer = None
-        if (tls or rewrite or external) and not routes and real_peer is None:
+        if real_peer is None:
             try:
                 client.close()      # fail closed: no peer address, no X-Forwarded-For to set
             except OSError:
@@ -269,12 +269,8 @@ class GatewayRouter:
             try:
                 target = socket.create_connection((target_host, target_port), timeout=5)
                 from .devfabric import rewriting_pipe
-                try:
-                    peer = client.getpeername()[0]
-                except OSError:
-                    peer = None
                 rewriting_pipe(client, target, target_port, external or rewrite or f"{target_host}:{port}",
-                               tls=True, rewrite_head=external is not None, forwarded_for=peer)
+                               tls=True, rewrite_head=external is not None, forwarded_for=real_peer)
             except OSError:
                 pass
             finally:
@@ -302,12 +298,12 @@ class GatewayRouter:
                             pass
             return
         if routes:
-            route_and_pipe(client, routes, target_host, target_port)
+            route_and_pipe(client, routes, target_host, target_port, forwarded_for=real_peer)
             return
         target = None
         try:
             target = socket.create_connection((target_host, target_port), timeout=5)
-            proxy_pair(client, target)
+            proxy_pair(client, target, forwarded_for=real_peer)
         except OSError:
             pass  # target down: drop connection; probe loop will expire the lease
         finally:

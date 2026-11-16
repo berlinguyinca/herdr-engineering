@@ -636,7 +636,7 @@ class DevServiceForwarder:
 
 
 def proxy_pair(client: socket.socket, target: socket.socket,
-               inactivity_timeout: float = 30.0) -> None:
+               inactivity_timeout: float = 30.0, forwarded_for: str | None = None) -> None:
     """Bidirectionally pump bytes between two sockets until either closes.
 
     Protocol-transparent: HTTP/HTTPS/WebSocket/SSE/HMR/generic TCP all flow
@@ -649,7 +649,14 @@ def proxy_pair(client: socket.socket, target: socket.socket,
     after the timeout instead of blocking the worker forever. Both directions
     are joined with a bounded ``join`` so a leaked pump cannot hang the caller,
     and both sockets are shut down and closed when the pipe ends.
+
+    ``forwarded_for``: when the client speaks HTTP first, the head is rewritten so X-Forwarded-For is
+    exactly this value (see :func:`rewriting_pipe`); anything else stays a transparent byte pipe.
     """
+    if forwarded_for:
+        _pipe_with_forwarded_for(client, target, forwarded_for, inactivity_timeout)
+        return
+
     def _pump(src: socket.socket, dst: socket.socket) -> None:
         try:
             src.settimeout(inactivity_timeout)
@@ -685,6 +692,33 @@ def proxy_pair(client: socket.socket, target: socket.socket,
             s.close()
         except OSError:
             pass
+
+
+def _pipe_with_forwarded_for(client: socket.socket, target: socket.socket, forwarded_for: str,
+                             inactivity_timeout: float, buffered: bytes | None = None,
+                             path: str | None = None) -> None:
+    """Pipe with the client's X-Forwarded-For replaced by ``forwarded_for`` when the client opens with HTTP.
+
+    ``buffered``/``path`` are an already-peeked first line (route_and_pipe); otherwise the client is peeked
+    here, unless the server speaks first (non-HTTP) or the client sends nothing (then it is a plain pipe)."""
+    if buffered is None:
+        import select
+        readable, _, _ = select.select([client, target], [], [], 5.0)
+        if client in readable:
+            path, buffered = _peek_request_path(client)
+        else:
+            buffered = b""
+    if path is None:
+        prefixed_pipe(client, target, client_prefix=buffered, inactivity_timeout=inactivity_timeout)
+        return
+    try:
+        rewriting_pipe(client, target, 0, "", rewrite_head=False, forwarded_for=forwarded_for, prefix=buffered)
+    finally:
+        for s in (client, target):
+            try:
+                s.close()
+            except OSError:
+                pass
 
 
 def _log_devfabric(component: str, level: str, msg: str, *args) -> None:
@@ -847,9 +881,9 @@ def prefixed_pipe(client: socket.socket, target: socket.socket,
             pass
 
 
-def _read_head(sock: socket.socket) -> tuple[bytes, bytes]:
+def _read_head(sock: socket.socket, initial: bytes = b"") -> tuple[bytes, bytes]:
     """Read up to the end of an HTTP head; returns (head incl. blank line, remainder)."""
-    buf = b""
+    buf = initial
     while b"\r\n\r\n" not in buf and len(buf) < 65536:
         chunk = sock.recv(65536)
         if not chunk:
@@ -862,13 +896,14 @@ def _read_head(sock: socket.socket) -> tuple[bytes, bytes]:
 
 
 def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, external: str,
-                   *, tls: bool = False, rewrite_head: bool = True, forwarded_for: str | None = None) -> None:
+                   *, tls: bool = False, rewrite_head: bool = True, forwarded_for: str | None = None,
+                   prefix: bytes = b"") -> None:
     """Byte-pipe that filters the headers of the origin's responses.
 
     Each exchange is forced to ``Connection: close`` so every response passes the
     head filter. Upgrade requests (websockets) are passed through untouched."""
     from .urlrewrite import force_close, inject_request_headers, is_upgrade, rewrite_response_head
-    req_head, rest = _read_head(client)
+    req_head, rest = _read_head(client, prefix)
     complete = req_head.endswith(b"\r\n\r\n")
     if forwarded_for and not complete:
         return      # fail closed: a head we cannot rewrite is never relayed with a client-chosen X-Forwarded-For
@@ -948,7 +983,7 @@ def _status_code(head: bytes) -> int | None:
 
 def route_and_pipe(client: socket.socket, routes, fallback_host: str,
                    fallback_port: int, inactivity_timeout: float = 30.0,
-                   peek_timeout: float = 5.0) -> None:
+                   peek_timeout: float = 5.0, forwarded_for: str | None = None) -> None:
     """Peek the first request line, pick the target (longest-prefix route match,
     else fallback), and byte-pipe. The peeked bytes are replayed first, so the
     target sees the original request intact.
@@ -970,6 +1005,9 @@ def route_and_pipe(client: socket.socket, routes, fallback_host: str,
                            "route_and_pipe: target %s:%s unreachable: %s",
                            host, port, exc)
             _send_http_502(client)
+            return
+        if forwarded_for:
+            _pipe_with_forwarded_for(client, target, forwarded_for, inactivity_timeout, buffered, path)
             return
         prefixed_pipe(client, target, client_prefix=buffered,
                       inactivity_timeout=inactivity_timeout)
