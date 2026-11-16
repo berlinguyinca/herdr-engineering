@@ -153,6 +153,11 @@ class MemberWeb:
         self.public_host = public_host
         self.origin = f"https://{public_host}"
         # Optional own origin for the member UI, served IN ADDITION to public_host (None: exactly as before).
+        if member_host is not None:
+            from .members_config import valid_public_host
+
+            if not valid_public_host(member_host) or member_host == public_host:
+                raise ValueError("member_host must be a lowercase DNS name other than public_host")
         self.member_host = member_host
         self.member_origin = f"https://{member_host}" if member_host else None
         self.secret = session_secret

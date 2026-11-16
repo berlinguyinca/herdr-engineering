@@ -810,3 +810,9 @@ def test_each_host_accepts_only_its_own_origin_on_writes(dual_stack):
     assert req(dual_stack, "POST", "/api/member/artifacts", body=body, host=OWN_HOST, origin=ORIGIN).status == 403
     assert req(dual_stack, "POST", "/api/member/artifacts", body=body, host=HOST, origin=OWN_ORIGIN).status == 403
     assert req(dual_stack, "POST", "/api/member/artifacts", body=body, host=HOST, origin=ORIGIN).status != 403
+
+
+@pytest.mark.parametrize("bad", ["Own.Lab.Example", "https://own.lab.example", "own.lab.example:8443", "", HOST])
+def test_a_bad_member_host_is_refused(tmp_path, bad) -> None:
+    with pytest.raises(ValueError, match="member_host"):
+        next(_stack(tmp_path, member_host=bad))

@@ -6,6 +6,8 @@ import json
 import re
 import time
 
+import pytest
+
 from herdr_artifact_host import member_session as ms
 from herdr_artifact_host.member_api import CHUNK_BYTES, MAX_UPLOAD_BYTES
 from herdr_artifact_host.share_session import CLAIM_DOMAIN, mint_session
@@ -138,8 +140,34 @@ def test_a_member_session_works_on_the_member_host(migrated_dsn, tmp_path) -> No
         assert me.status == 200 and me.header("Set-Cookie") is None  # host-only: no cookie at all
 
 
-def test_a_member_host_without_members_configured_is_refused_at_start_up(migrated_dsn, tmp_path) -> None:
-    import pytest
+@pytest.mark.parametrize(
+    "hosts",
+    [
+        [("Host", MEMBER_HOST), ("Host", "share.example")],
+        [("Host", "share.example"), ("Host", MEMBER_HOST)],
+        [("Host", MEMBER_HOST.upper())],
+        [("Host", MEMBER_HOST + ".")],
+        [("Host", MEMBER_HOST + ":8443")],
+    ],
+)
+def test_a_spoofed_member_host_header_is_a_404(migrated_dsn, tmp_path, hosts) -> None:
+    from tests.artifact_host.seed import running_host
+
+    with running_host(migrated_dsn, tmp_path, OWN) as h:
+        for path in ("/", "/my/", "/api/member/config"):
+            assert h.request("GET", path, hosts).status == 404, (path, hosts)
+
+
+def test_x_forwarded_host_never_moves_the_member_origin(migrated_dsn, tmp_path) -> None:
+    from tests.artifact_host.seed import running_host
+
+    with running_host(migrated_dsn, tmp_path, OWN) as h:
+        r = h.get("/api/member/config", {"Host": MEMBER_HOST, "X-Forwarded-Host": "share.example"})
+        assert r.status == 200
+        assert r.json()["redirect_uri"] == f"{MEMBER_ORIGIN}/my/callback"
+
+
+def test_a_member_host_equal_to_the_public_or_an_mcp_host_is_refused_at_start_up(migrated_dsn, tmp_path) -> None:
 
     from tests.artifact_host.seed import running_host
 

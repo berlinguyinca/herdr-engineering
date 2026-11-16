@@ -631,11 +631,13 @@ class PublicSurface:
         if host == wanted or host == wanted + ":443":
             return True
         # the member UI may have its own name: it answers member routes only, never /s/
+        # (matched on the Host exactly as sent: a non-canonical spelling of the member name is refused)
         member = self.config.member_host
+        sent = hosts[0].strip()
         if (
             member is not None
             and self.member is not None
-            and (host == member or host == member + ":443")
+            and (sent == member or sent == member + ":443")
         ):
             return self.member.owns(request.raw_path)
         # the agent endpoint may also answer on its own names, and only that path

@@ -591,7 +591,23 @@ def artifact_host_member_host(cfg: FleetConfig) -> str | None:
     """The member web UI's own name when the host is enabled and sets member_host, else None."""
     if not artifact_host_enabled(cfg):
         return None
-    return _artifact_host_mapping(cfg).get("member_host") or None
+    section = _artifact_host_mapping(cfg)
+    member_host = section.get("member_host")
+    if member_host is None:
+        return None
+    mcp_hosts = section.get("mcp_public_hosts", [])
+    _check_member_host(member_host, section.get("public_host"), mcp_hosts if isinstance(mcp_hosts, list) else [])
+    return member_host
+
+
+def _check_member_host(member_host: object, public_host: object, mcp_hosts: list) -> None:
+    from .control_plane.members_config import valid_public_host
+
+    if not valid_public_host(member_host) or member_host == public_host or member_host in mcp_hosts:
+        raise FleetConfigError(
+            "control_plane.artifact_host.member_host must be a lowercase DNS name other than "
+            "public_host and mcp_public_hosts (the member web UI's own origin)"
+        )
 
 
 def artifact_host_slices(cfg: FleetConfig) -> dict[str, dict] | None:
@@ -629,13 +645,8 @@ def artifact_host_slices(cfg: FleetConfig) -> dict[str, dict] | None:
             "other than public_host (the names agents reach /mcp/artifacts on)"
         )
     member_host = section.get("member_host")
-    if member_host is not None and (
-        not valid_public_host(member_host) or member_host == host or member_host in mcp_hosts
-    ):
-        raise FleetConfigError(
-            "control_plane.artifact_host.member_host must be a lowercase DNS name other than "
-            "public_host and mcp_public_hosts (the member web UI's own origin)"
-        )
+    if member_host is not None:
+        _check_member_host(member_host, host, mcp_hosts)
     secrets_: dict[str, str] = {}
     for key in ("session_secret", "claim_key"):
         value = section.get(key)
@@ -857,6 +868,7 @@ def render_edge_conf(
     members: bool = False,
     artifact_host: str | None = None,
     member_host: str | None = None,
+    mcp_hosts: list[str] | None = None,
 ) -> str:
     """The edge's nginx.conf: the template, plus the share host's zones, upstream and server when ``share`` is true.
 
@@ -893,10 +905,7 @@ def render_edge_conf(
         server = server.replace(EDGE_ARTIFACT_HOST_MARKER, artifact_host)
         if member_host is not None:
             # a second server of its own: the member UI routes only, never /s/ (rendered only when member_host is set)
-            if not valid_public_host(member_host) or member_host == artifact_host:
-                raise FleetConfigError(
-                    f"the edge needs the member host's DNS name (not the artifact host's), got {member_host!r}"
-                )
+            _check_member_host(member_host, artifact_host, mcp_hosts or [])
             member = (base / EDGE_ARTIFACT_MEMBER_SNIPPET).read_text(encoding="utf-8")
             if EDGE_ARTIFACT_MEMBER_MARKER not in member:
                 raise FleetConfigError(
@@ -964,7 +973,8 @@ def render_edge(cfg: FleetConfig, template: Path, out: Path) -> None:
     text = render_edge_conf(template.read_text(encoding="utf-8"), share=share, share_host=share_host,
                             snippets_dir=template.parent, members=share and _members_enabled(cfg),
                             artifact_host=artifact_host_public_host(cfg),
-                            member_host=artifact_host_member_host(cfg))
+                            member_host=artifact_host_member_host(cfg),
+                            mcp_hosts=list(_artifact_host_mapping(cfg).get("mcp_public_hosts") or []))
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")

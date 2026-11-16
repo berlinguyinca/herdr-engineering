@@ -861,9 +861,18 @@ def docker_ok() -> None:
         pytest.skip(reason)
 
 
+@pytest.mark.parametrize("member_host", [None, "my.artifacts.example.test"])
 def test_nginx_accepts_the_rendered_edge_conf(
-    docker_ok: None, tmp_path: Path, rendered_edge: str
+    docker_ok: None, tmp_path: Path, rendered_edge: str, member_host: str | None
 ) -> None:
+    if member_host:
+        rendered_edge = fcc.render_edge_conf(
+            (EDGE_DIR / "nginx.conf").read_text(encoding="utf-8"),
+            share=False,
+            artifact_host=HOST,
+            snippets_dir=EDGE_DIR,
+            member_host=member_host,
+        )
     if shutil.which("openssl") is None:
         pytest.fail("openssl is required for this test") if _STRICT else pytest.skip(
             "openssl is not installed"
@@ -1608,9 +1617,17 @@ def test_the_member_server_routes_the_member_ui_only_and_never_shares() -> None:
         assert (_select(locs, path) or "").strip() == "return 404;", path
 
 
-def test_the_member_host_must_differ_from_the_artifact_host() -> None:
-    with pytest.raises(FleetConfigError, match="member host"):
+def test_the_member_host_must_differ_from_the_artifact_and_mcp_hosts() -> None:
+    with pytest.raises(FleetConfigError, match="member_host"):
+        _edge(member_host=MCP_HOST, mcp_hosts=[MCP_HOST])
+    with pytest.raises(FleetConfigError, match="member_host"):
         _edge(member_host=HOST)
-    with pytest.raises(FleetConfigError, match="member host"):
+    with pytest.raises(FleetConfigError, match="member_host"):
         _edge(member_host="Bad_Host")
 
+
+
+def test_the_edge_refuses_a_member_host_that_is_an_mcp_host_even_with_the_slices_unrendered(tmp_path: Path) -> None:
+    central = _central(tmp_path, host_section=_host_section(member_host=MCP_HOST))
+    with pytest.raises(FleetConfigError, match="member_host"):
+        fcc.render_edge(load_fleet_config(central), EDGE_DIR / "nginx.conf", tmp_path / "edge.conf")
