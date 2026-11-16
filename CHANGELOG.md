@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: CI report relay skips bundles whose provider run was removed
+
+- A bundle whose Woodpecker run the control plane reports as removed (`Pipeline was not found.` or `This Woodpecker resource is unavailable or has been removed.`) is a permanent skip: it is never published, is recorded in the checkpoint as `state: skipped` (`reason`, `skipped_at`), logs `CI report relay: skipped <bundle>: provider run removed`, and is not re-read on later passes. The summary line is now `N published, M failed, K skipped` and the exit status is 1 only for failures. A run that exists with a mismatched identity, HTTP errors, timeouts, auth errors and malformed responses still fail closed and stay retriable.
+
 ### Fix: CI report relay failures are no longer silent
 
 - `ci_report_relay` printed only `N published, M failed`. It now writes one stderr line per failing bundle (`CI report relay: failed <bundle>: <reason>`), per unreadable source file (errno name), and for whole-run failures, plus the reader exit status on source errors. Reasons are fixed strings or errno names: no URLs, keys or bundle contents. Delivery and fail-closed identity checks are unchanged.

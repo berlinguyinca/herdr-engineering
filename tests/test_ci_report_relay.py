@@ -5,7 +5,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from herdr_engineering.ci_report_relay import Relay, read_source, validate_bundle
+from herdr_engineering.ci_report_relay import Outcomes, Relay, read_source, validate_bundle
+from herdr_engineering.control_plane.ci_monitor import REMOVED_RUN_ERRORS
 
 REVISION = 'a' * 40
 NAME = f'42-{REVISION}-hive-slurm.json'
@@ -20,12 +21,18 @@ def bundle(**overrides):
 
 
 @contextmanager
-def control_plane(*, revision=REVISION, branch='main', acknowledge=True):
+def control_plane(*, revision=REVISION, branch='main', acknowledge=True, pipeline=None, pipeline_status=200):
     received = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             assert self.path == '/api/v1/ci/pipeline?repository=116&number=42'
+            if pipeline == 'drop':
+                self.close_connection = True
+                return
+            if pipeline is not None:
+                self.respond(pipeline, pipeline_status)
+                return
             value = dict(available=True, pipeline=dict(number=42, commit=revision, branch=branch))
             self.respond(value)
 
@@ -272,10 +279,10 @@ def test_failed_newest_batch_does_not_starve_older_native_report_after_restart(t
         os.utime(path, ns=(index, index))
     with control_plane() as (url, received):
         relay = Relay(url, tmp_path / 'state', allow_open=True)
-        assert relay.process_source(str(source)) == (0, 10)
+        assert relay.process_source(str(source)) == Outcomes(0, 10, 0)
         assert relay.checkpoints == {}
         restarted = Relay(url, tmp_path / 'state', allow_open=True)
-        published, failed = restarted.process_source(str(source))
+        published, failed, _ = restarted.process_source(str(source))
         assert published == 1
         assert len(received) == 1
         assert NAME in restarted.checkpoints
@@ -311,7 +318,7 @@ def test_each_failed_item_is_logged_with_its_reason_and_never_the_key(tmp_path, 
     source = _source_with_one_bundle(tmp_path)
     with control_plane(revision='b' * 40) as (url, received):
         relay = Relay(url, tmp_path / 'state', key='super-secret-key')
-        assert relay.process_source(str(source)) == (0, 1)
+        assert relay.process_source(str(source)) == Outcomes(0, 1, 0)
     err = capsys.readouterr().err
     assert NAME in err
     assert 'does not match the observed provider run identity' in err
@@ -323,7 +330,7 @@ def test_control_plane_refusal_logs_http_status(tmp_path, capsys):
     source = _source_with_one_bundle(tmp_path)
     with control_plane(acknowledge=False) as (url, received):
         relay = Relay(url, tmp_path / 'state', allow_open=True)
-        assert relay.process_source(str(source)) == (0, 1)
+        assert relay.process_source(str(source)) == Outcomes(0, 1, 0)
     assert 'HTTP 503' in capsys.readouterr().err
 
 
@@ -337,7 +344,7 @@ def test_unreadable_source_file_is_logged_by_name_and_errno(tmp_path, capsys):
     try:
         with control_plane() as (url, received):
             relay = Relay(url, tmp_path / 'state', allow_open=True)
-            assert relay.process_source(str(source)) == (0, 1)
+            assert relay.process_source(str(source)) == Outcomes(0, 1, 0)
     finally:
         (source / NAME).chmod(0o600)
     err = capsys.readouterr().err
@@ -356,5 +363,114 @@ def test_main_logs_the_reason_when_the_whole_run_fails(tmp_path, capsys):
                  'http://127.0.0.1:1', '--state-dir', str(link), '--allow-open', '--once'])
     captured = capsys.readouterr()
     assert code == 1
-    assert 'CI report relay: 0 published, 1 failed' in captured.out
+    assert 'CI report relay: 0 published, 1 failed, 0 skipped' in captured.out
     assert 'State directory must be a private owned directory' in captured.err
+
+
+# Provider run removed/pruned: a permanent skip, distinct from mismatch and transient errors.
+REMOVED_TEXT = 'This Woodpecker resource is unavailable or has been removed.'
+REMOVED = {'available': False, 'status': 'unavailable', 'error': REMOVED_TEXT}
+NOT_FOUND = {'available': False, 'error': 'Pipeline was not found.'}
+
+
+@pytest.mark.parametrize('answer', [REMOVED, NOT_FOUND])
+def test_removed_run_is_skipped_checkpointed_and_not_retried(tmp_path, capsys, answer):
+    source = _source_with_one_bundle(tmp_path)
+    with control_plane(pipeline=answer) as (url, received):
+        relay = Relay(url, tmp_path / 'state', allow_open=True)
+        assert relay.process_source(str(source)) == Outcomes(0, 0, 1)
+        assert received == []
+        row = relay.checkpoints[NAME]
+        assert row['state'] == 'skipped' and row['reason'] == 'provider_run_removed'
+        assert row['skipped_at'].endswith('+00:00')
+        captured = capsys.readouterr()
+        assert f'CI report relay: skipped {NAME}: provider run removed' in captured.err
+        assert 'failed' not in captured.err
+        # A fresh process reloads the checkpoint and does not even re-read the bundle.
+        again = Relay(url, tmp_path / 'state', allow_open=True)
+        assert NAME in again.checkpoints
+        assert again.process_source(str(source)) == Outcomes(0, 0, 0)
+
+
+def test_the_relay_recognises_the_control_planes_real_removed_run_texts():
+    from herdr_engineering.ci import CIProviderError
+    from herdr_engineering.control_plane.ci_monitor import _error
+
+    assert _error(CIProviderError('not_found', 404))[1] in REMOVED_RUN_ERRORS
+    assert REMOVED_TEXT in REMOVED_RUN_ERRORS and NOT_FOUND['error'] in REMOVED_RUN_ERRORS
+
+
+def test_existing_run_with_identity_mismatch_still_fails_closed(tmp_path, capsys):
+    source = _source_with_one_bundle(tmp_path)
+    with control_plane(revision='b' * 40) as (url, received):
+        relay = Relay(url, tmp_path / 'state', allow_open=True)
+        assert relay.process_source(str(source)) == Outcomes(0, 1, 0)
+    assert relay.checkpoints == {} and received == []
+    assert 'does not match the observed provider run identity' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('kwargs', [
+    dict(pipeline={'error': 'boom'}, pipeline_status=500),
+    dict(pipeline=REMOVED, pipeline_status=502),
+    dict(pipeline={'available': False, 'status': 'auth_error', 'error': 'Woodpecker rejected the credential (HTTP 401).'}),
+    dict(pipeline={'available': False, 'status': 'unavailable', 'error': 'Woodpecker did not respond before the read timeout. Retrying automatically.'}),
+    dict(pipeline={'available': False, 'error': 'Woodpecker is not configured.'}),
+    dict(pipeline={'unexpected': True}),
+    dict(pipeline='drop'),
+])
+def test_transient_or_unrecognised_provider_answers_fail_and_are_not_skipped(tmp_path, kwargs):
+    source = _source_with_one_bundle(tmp_path)
+    with control_plane(**kwargs) as (url, received):
+        relay = Relay(url, tmp_path / 'state', allow_open=True)
+        assert relay.process_source(str(source)) == Outcomes(0, 1, 0)
+    assert relay.checkpoints == {} and received == []
+
+
+def test_mixed_batch_counts_published_failed_and_skipped(tmp_path):
+    source = tmp_path / 'source'
+    source.mkdir()
+    names = {n: f'{n}-{REVISION}-hive-slurm.json' for n in (42, 43, 44)}
+    for number, name in names.items():
+        (source / name).write_text(json.dumps(bundle() | {'run_number': number}))
+    answers = {42: None, 43: REMOVED, 44: {'error': 'boom'}}
+    statuses = {44: 500}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            number = int(self.path.rsplit('=', 1)[1])
+            answer = answers[number] or dict(available=True, pipeline=dict(
+                number=number, commit=REVISION, branch='main'))
+            self.reply(answer, statuses.get(number, 200))
+
+        def do_POST(self):
+            value = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            self.reply({**{k: value[k] for k in ('repository', 'provider_repo_id', 'run_number', 'branch', 'revision')},
+                        'report_id': 'ok', 'summary': {'total': 1}}, 200)
+
+        def reply(self, value, status):
+            raw = json.dumps(value).encode()
+            self.send_response(status)
+            self.send_header('Content-Length', str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        relay = Relay(f'http://127.0.0.1:{server.server_port}', tmp_path / 'state', allow_open=True)
+        assert relay.process_source(str(source)) == Outcomes(1, 1, 1)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert {n: r.get('state', 'published') for n, r in relay.checkpoints.items()} == {
+        names[42]: 'published', names[43]: 'skipped'}
+
+
+def test_summary_line_counts_skips_and_only_failures_fail_the_run():
+    assert Outcomes(0, 0, 4).summary_line() == 'CI report relay: 0 published, 0 failed, 4 skipped'
+    assert Outcomes(0, 0, 4).exit_status() == 0
+    assert Outcomes(3, 0, 1).exit_status() == 0
+    assert Outcomes(0, 1, 4).exit_status() == 1

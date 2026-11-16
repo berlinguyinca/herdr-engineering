@@ -29,6 +29,13 @@ def _provider():
     return WoodpeckerProvider()
 
 
+# The detail endpoint's two answers for a provider run that no longer exists. The CI report relay
+# treats exactly these as a permanent skip; every other unavailable answer stays retriable.
+PIPELINE_NOT_FOUND_ERROR = 'Pipeline was not found.'
+RESOURCE_REMOVED_ERROR = 'This Woodpecker resource is unavailable or has been removed.'
+REMOVED_RUN_ERRORS = frozenset({PIPELINE_NOT_FOUND_ERROR, RESOURCE_REMOVED_ERROR})
+
+
 def _error(exc):
     reason = getattr(exc, 'reason', 'unavailable')
     status = getattr(exc, 'status_code', None)
@@ -40,7 +47,7 @@ def _error(exc):
         'response_too_large': 'This output exceeds the preview limit. Open the run in Woodpecker for the full log.',
         'timeout': 'Woodpecker did not respond before the read timeout. Retrying automatically.',
         'rate_limited': 'Woodpecker is limiting requests. Retrying automatically.',
-        'not_found': 'This Woodpecker resource is unavailable or has been removed.',
+        'not_found': RESOURCE_REMOVED_ERROR,
     }
     return 'unavailable', messages.get(reason, 'Woodpecker could not be read. Check connection and provider configuration.')
 
@@ -437,7 +444,7 @@ class CIMonitor:
             self._measurements.provider_call()
             row = provider.pipeline(repository, number)
             if row is None:
-                return {'available': False, 'error': 'Pipeline was not found.'}
+                return {'available': False, 'error': PIPELINE_NOT_FOUND_ERROR}
             row = _dict(row)
             # Details carry execution metadata only; logs stay on the lazy route.
             row = {key: value for key, value in row.items() if key in {
