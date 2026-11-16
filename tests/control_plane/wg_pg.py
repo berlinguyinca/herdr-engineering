@@ -15,6 +15,7 @@ import pytest
 
 from herdr_engineering.control_plane.db import Migrator
 from herdr_engineering.control_plane.work_graph_store import init_connection
+from tests.control_plane.pg_stop import FAST_TEST_OPTIONS, stop_postgres
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -68,13 +69,13 @@ def wg_pg():
         def pg_ctl(*args):
             subprocess.run([str(bindir / "pg_ctl"), "-D", str(data), *args], check=True, capture_output=True)
 
-        pg_ctl("-l", str(area / "server.log"), "-o", f"-c listen_addresses='' -k {area} -c fsync=off -c dynamic_shared_memory_type=mmap", "-w", "start")
+        pg_ctl("-l", str(area / "server.log"), "-o", f"-c listen_addresses='' -k {area} -c dynamic_shared_memory_type=mmap {FAST_TEST_OPTIONS}", "-w", "start")
         try:
             dsn = f"postgresql:///postgres?host={area}"
             asyncio.run(_migrate(dsn))
             yield {"dsn": dsn}
         finally:
-            pg_ctl("-m", "fast", "-w", "stop")
+            stop_postgres(bindir / "pg_ctl", data)
 
 
 class Runner:

@@ -4,7 +4,7 @@
 (b) after fetching `origin/main` into the watcher's own bare cache clone,
     `git merge-base --is-ancestor <sha> origin/main` succeeds.
 A stray unpushed commit, or a SHA that a force-push removed from `main`, is refused.
-The same check is meant for the lock-writing path (spec section 7) in a later phase.
+The lock-writing path (spec section 7, `lock.py`) applies the same history test to every pin it writes or verifies.
 """
 
 from __future__ import annotations
@@ -86,3 +86,26 @@ def verify_published(sha: str, *, api_head: str | None, cache: Path, url: str,
         if tip != sha:
             return Verdict(False, "not_api_head", f"origin/main is {tip}")
     return Verdict(True)
+
+
+def verify_on_main(sha: str, *, cache: Path, url: str) -> Verdict:
+    """Is `sha` somewhere in the published history of `main`? (the lock path, spec section 7 rule 2)
+
+    Unlike `verify_published` the SHA need not be the tip: a pin may legitimately trail the head. It must still be
+    a commit that the remote's `main` (fetched into the watcher's own bare cache) contains.
+    """
+    if not _SHA.fullmatch(sha or ""):
+        return Verdict(False, "malformed_sha")
+    fetched = fetch_main(cache, url)
+    if not fetched.ok:
+        return fetched
+    if _git(cache, "cat-file", "-e", f"{sha}^{{commit}}").returncode:
+        return Verdict(False, "unknown_commit")
+    if _git(cache, "merge-base", "--is-ancestor", sha, "refs/remotes/origin/main").returncode:
+        return Verdict(False, "not_on_origin_main")
+    return Verdict(True)
+
+
+def is_ancestor(cache: Path, older: str, newer: str) -> bool:
+    """`older` is an ancestor of `newer` in the cache (False when either is unknown there)."""
+    return _git(cache, "merge-base", "--is-ancestor", older, newer).returncode == 0

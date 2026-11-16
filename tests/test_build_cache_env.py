@@ -336,6 +336,10 @@ def test_cache_config_none_child_env_unchanged(tmp_path, monkeypatch):
 
 
 def test_sccache_absent_build_proceeds_uncached(tmp_path, monkeypatch):
+    # The operator's installed Cargo adapter enables recording independently of
+    # sccache availability. Exercise the uninstalled-host contract in its own home.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
     out = _fake_env(tmp_path, monkeypatch)
     (tmp_path / "bin/sccache").unlink()
     # hermetic: a real sccache installed on this host (e.g. ~/.local/bin) must not leak in

@@ -15,12 +15,13 @@ from herdr_engineering.control_plane.collab import (
 )
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from tests.control_plane.test_collab import TOKENS, _digest
+from tests.io_timeouts import HTTP_TIMEOUT
 
 HOST = "100.64.0.9:8082"
 
 
 def call(port, method, path, body=None, *, host=HOST, headers=None):
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=HTTP_TIMEOUT)
     h = {"Host": host, **(headers or {})}
     data = None
     if body is not None:

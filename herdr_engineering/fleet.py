@@ -54,9 +54,17 @@ def repo_root() -> Path:
     return cwd
 
 
-def _run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
+def _run(cmd: list[str], timeout: int = 600, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+    """Run a command, optionally adding to the environment.
+
+    `env` extends os.environ rather than replacing it, so a caller can pin one variable (the interpreter
+    a dependency installs into) without stripping PATH out from under the command.
+    """
+    child_env = None
+    if env:
+        child_env = {**os.environ, **env}
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=child_env)
     except subprocess.TimeoutExpired:
         return 124, "", "timed out"
     except OSError as exc:
@@ -189,7 +197,8 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
                attach: bool = True, provision: bool = True,
                inventory: Path | None = None, host_vars_dir: Path | None = None,
                fleet_config: Path | None = None, roles: list[str] | None = None,
-               control_plane_url: str | None = None) -> dict:
+               control_plane_url: str | None = None,
+               agent_rules_config: Path | None = None) -> dict:
     """One command: attach via herdr + add to inventory + converge + verify.
 
     Returns a JSON-serializable report.
@@ -247,9 +256,18 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
 
     # 3) converge herdr-eng + fabric agent + build-gate on the host
     if provision:
+        from .control_plane.agent_rules_config import AgentRulesConfigError
         playbook = root / "ansible" / "playbooks" / "fleet-sync.yml"
         cmd = ["ansible-playbook", "-i", str(inv), str(playbook), "-l", host,
                "-e", f"fabric_agent_gateway_url={gateway}"]
+        try:
+            for key, value in _playbook_vars(agent_rules_config or fleet_config).items():
+                cmd += ["-e", f"{key}={value}"]
+        except AgentRulesConfigError as exc:
+            report["steps"]["provision"] = {"ok": False, "rc": None, "error": str(exc)}
+            report.setdefault("errors", []).append(f"agent_rules pin: {exc}")
+            cmd = []
+    if provision and cmd:
         rc, out, err = _run(cmd)
         report["steps"]["provision"] = {"ok": rc == 0, "rc": rc,
                                         "stderr": err.strip()[-500:] or None}
@@ -274,10 +292,29 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
     return report
 
 
+def _refresh_controller_handoff(root: Path, report: dict) -> None:
+    """Run scripts/install-handoff.sh for the controller; a failure is a warning in `report`, never fatal."""
+    handoff_installer = root / "scripts" / "install-handoff.sh"
+    if not handoff_installer.exists():
+        return
+    env = {"HERDR_HANDOFF_PYTHON": sys.executable}
+    rc, _, err = _run(["bash", str(handoff_installer)], timeout=600, env=env)
+    # Say which interpreter the step ran under: "refreshed" without that is how install and update came
+    # to disagree about what "installed" means.
+    report["steps"]["controller_handoff_refresh"] = {
+        "ok": rc == 0, "rc": rc, "stderr": err.strip()[-1000:] or None, "env": dict(env)}
+    if rc != 0:
+        report.setdefault("warnings", []).append(
+            "herdr-handoff refresh failed on the controller (interpreter "
+            f"{sys.executable}); the pinned dependency may be stale - run "
+            "scripts/install-handoff.sh and check `herdr-eng doctor`; fleet hosts are not covered "
+            "by this step (issue #799)")
+
+
 def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                  inventory: Path | None = None, pull_controller: bool = True,
                  reinstall_local: bool = True, revision: str | None = None,
-                 pi_revision: str | None = None) -> dict:
+                 pi_revision: str | None = None, fleet_config: Path | None = None) -> dict:
     """Self-update the whole fleet (controller + all reachable hosts) to the
     current version, then report parity. One command.
 
@@ -286,11 +323,23 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
     root = repo_root()
     inv = inventory or (root / "ansible" / "inventory" / "hosts.yml")
     report: dict = {"target": host or "all inventory hosts", "steps": {}, "ok": False}
+    from .control_plane.agent_rules_config import AgentRulesConfigError
+    try:   # before anything is pulled or deployed: a broken pin must stop the run, not be skipped
+        rules_vars = _playbook_vars(fleet_config)
+    except AgentRulesConfigError as exc:
+        report["error"] = f"agent_rules pin: {exc}"
+        return report
 
-    def step(name: str, cmd: list[str], timeout: int) -> tuple[bool, str]:
-        rc, out, err = _run(cmd, timeout=timeout)
-        report["steps"][name] = {"ok": rc == 0, "rc": rc,
-                                "stderr": err.strip()[-1000:] or None}
+    def step(name: str, cmd: list[str], timeout: int,
+             env: dict[str, str] | None = None) -> tuple[bool, str]:
+        rc, out, err = _run(cmd, timeout=timeout, env=env)
+        entry: dict[str, object] = {"ok": rc == 0, "rc": rc,
+                                    "stderr": err.strip()[-1000:] or None}
+        if env:
+            # Say which interpreter a dependency step ran under: "refreshed" without that is how install
+            # and update came to disagree about what "installed" means.
+            entry["env"] = dict(env)
+        report["steps"][name] = entry
         return rc == 0, out.strip()
 
     try:
@@ -365,6 +414,22 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
         if not ok:
             return report
 
+    # herdr-handoff is a required operational dependency pinned in lock/upstreams.yaml: `herdr-eng`
+    # hands sessions to its CLI and every `/herdr::*` command comes from its skill tree.  Refreshing it
+    # with the controller means the controller's pin and its machine cannot drift apart the way
+    # install.sh's own hardcoded default and the lock file did.
+    #
+    # It runs on the controller only.  Fleet hosts are installed by scripts/install.sh and the ansible
+    # playbooks; nothing probes herdr-handoff on a remote host yet, and that gap is issue #799.  There is no
+    # `herdr-eng fleet doctor` subcommand, so do not send an operator to one - saying what is and is not
+    # covered here is the difference between a report they can trust and one that quietly covers one machine.
+    #
+    # The interpreter is pinned to this process's own, because the alternative is whatever `python3` the
+    # transport's PATH happens to resolve - which installs the CLI somewhere the caller never intended and
+    # leaves the entrypoint on PATH at the previous revision.  A failure here is reported, not fatal: a
+    # host whose handoff install is broken still syncs, and `herdr-eng doctor` names the gap.
+    _refresh_controller_handoff(root, report)
+
     from .config import load_config
     cleanup = load_config().get("build_cleanup", {})
     roots = cleanup.get("roots", []) if isinstance(cleanup, dict) else []
@@ -409,6 +474,7 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
 
     playbook = root / "ansible" / "playbooks" / "fleet-sync.yml"
     variables = {"fabric_agent_gateway_url": gateway, "herdr_engineering_revision": revision}
+    variables.update(rules_vars)
     if pi_revision:
         variables["pi_engineering_revision"] = pi_revision
     cmd = ["ansible-playbook", "-i", str(inv), str(playbook), "-e", json.dumps(variables)]
@@ -420,8 +486,11 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
     report["status"] = fleet_status(inventory=inv, host=limit)
     report["steps"]["revision_parity"] = _parity(
         report["status"], expected_hosts, revision, pi_revision, expected_build_gate=gate_checksum)
+    rules_failed = sorted(h["host"] for h in report["status"].get("hosts", [])
+                          if str(h.get("rules", "")).startswith("FAILED"))
+    report["steps"]["agent_rules"] = {"ok": not rules_failed, "failed_hosts": rules_failed}
     report["ok"] = (ok and report["status"].get("rc") == 0
-                    and report["steps"]["revision_parity"]["ok"])
+                    and report["steps"]["revision_parity"]["ok"] and not rules_failed)
     return report
 
 
@@ -454,8 +523,33 @@ def fleet_status(*, inventory: Path | None = None, host: str | None = None) -> d
                           "cleanup": _clean(parts[5]).removeprefix("cleanup=") if len(parts) > 5 else "unknown",
                           "pi_revision": _clean(parts[6]).removeprefix("pi-revision=") if len(parts) > 6 else "unknown",
                           "pi_path": _clean(parts[7]).removeprefix("pi-path=") if len(parts) > 7 else "",
-                          "summary": _summary_state(parts, root)})
+                          "summary": _summary_state(parts, root),
+                          "rules": _rules_revision(line)})
     return {"rc": rc, "hosts": hosts, "stderr": err.strip()[-300:] or None}
+
+
+_RULES_FIELD = re.compile(r"(?:^|\|)\s*rules=([^|\"\n]*?)\s*(?=\||\"|$)")
+
+
+def _rules_revision(line: str) -> str:
+    """The fingerprint's `rules=` field: short sha, 'MISSING', 'FAILED:<reason>', or 'unknown' on old fingerprints."""
+    match = _RULES_FIELD.search(line)
+    return match.group(1) if match and match.group(1) else "unknown"
+
+
+def _playbook_vars(fleet_config: Path | None = None) -> dict[str, str]:
+    """Extra vars for the fleet playbooks from the central fleet config (pinned shared agent rules).
+
+    No file or no section is a legitimate 'no pin' (noted on stderr, rules are skipped); an unusable file or a bad
+    section raises AgentRulesConfigError so the caller can stop instead of leaving hosts on stale rules."""
+    from .control_plane.agent_rules_config import agent_rules_vars
+    from .fleet_config_cli import DEFAULT_CONFIG_PATH
+    path = Path(fleet_config or DEFAULT_CONFIG_PATH).expanduser()
+    found = agent_rules_vars(path)
+    if not found:
+        print(f"note: no agent-rules pin (control_plane.agent_rules) in {path}; shared agent rules are not converged",
+              file=sys.stderr)
+    return found
 
 
 def _summary_state(parts: list[str], root: Path) -> str:

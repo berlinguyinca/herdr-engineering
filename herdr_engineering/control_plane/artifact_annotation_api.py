@@ -156,6 +156,17 @@ def route_annotations(handler, server, parts, resource) -> bool:
     return True
 
 
+def _display_safe(row):
+    """Rows stored before the input check may carry invisible or direction-changing characters in the free-text body: the
+    owner's list gets the same display-safe text external agents do (``clean_text``). The anchor fields the UI matches
+    quotes against (exact, prefix, suffix, file) are returned as stored: they were validated at input."""
+    from .collab_external import clean_text
+    out = dict(row)
+    if isinstance(out.get("body"), str):
+        out["body"] = clean_text(out["body"], 8000, multiline=True)
+    return out
+
+
 def _list(handler, server, artifact_id: str) -> None:
     try:
         status, limit, before = _query(urlsplit(handler.path).query)
@@ -171,7 +182,8 @@ def _list(handler, server, artifact_id: str) -> None:
     if not done:
         return
     rows, cursor = page
-    handler._json({"artifact_id": artifact_id, "annotations": _jsonable(rows), "next": cursor})
+    handler._json({"artifact_id": artifact_id, "annotations": [_display_safe(r) for r in _jsonable(rows)],
+                   "next": cursor})
 
 
 def _dismiss(handler, server, artifact_id: str, annotation_id: str) -> None:

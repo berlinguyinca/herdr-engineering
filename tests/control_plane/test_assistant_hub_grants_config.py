@@ -21,6 +21,7 @@ def test_grants_defaults() -> None:
         "grant_ttl_days": 30,
         "extra_vetoes": [],
         "policy_version": 1,
+        "approval_ttl_minutes": 15,
     }
     assert assistant_config({})["grants"] == _grants()
 

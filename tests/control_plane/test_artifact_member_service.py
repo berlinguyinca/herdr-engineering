@@ -522,6 +522,17 @@ def test_share_approve_needs_confirm_true(world):
     assert intent_keys(world) == []
 
 
+def test_an_agent_cannot_approve_a_share_but_can_create_one(world):
+    agent, _ = world.agent("op")
+    actor = member_actor(agent)
+    assert world.ms.share_create(actor, ART, "v_1", "public")["status"] == "pending"       # proposing is fine
+    e = refuse(world.ms.share_approve, actor, ART, "share_" + "a" * 24, True)
+    assert (e.status, e.code) == (403, "forbidden") and "agent cannot approve" in e.message
+    kinds = [json.loads(p.read_text())["kind"] for p in (world.outbox / "intents").glob("*.json")]
+    assert kinds == ["member.share_create"]                                                  # nothing queued for approval
+    assert world.ms.share_approve(world.user("op"), ART, "share_" + "a" * 24, True)["status"] == "pending"   # the owner can
+
+
 def test_the_secret_url_is_returned_exactly_once(world):
     r = world.ms.share_approve(world.user("op"), ART, "share_" + "a" * 24, True)
     t = r["ticket"]
@@ -566,3 +577,7 @@ def test_share_list_drops_links_the_caller_neither_created_nor_owns(world):
     atomic_write_json(world.bridge.mirror / "member-views", f"{key}.json", doc)
     got = [r["share_id"][6] for r in world.ms.share_list(world.user("op"))["links"]]
     assert got == ["a", "b"]
+
+
+def test_library_defaults_to_empty_without_a_view(world):
+    assert world.ms.library(world.user("op")) == {"items": [], "folders": []}

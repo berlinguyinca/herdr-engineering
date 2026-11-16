@@ -215,7 +215,7 @@ def test_a_whole_rollout_round_trips_through_the_read_endpoints(tmp_path, live):
                 after_sha=SHA_A if status == "ok" else None,
                 started_at="2026-11-04T10:00:00+00:00", finished_at="2026-11-04T10:01:00+00:00", duration_ms=60000,
                 checks=[{"name": "parity_ok", "status": "ok" if status == "ok" else "failed"}],
-                log=em.record_log(RID, host, "updater", "installed into /home/wohlgemuth/venv\nGITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz012345\n"))
+                log=em.record_log(RID, host, "updater", "installed into /home/someuser/venv\nGITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz012345\n"))
     em.emit(RID, "rollout.halted", halted_at_host="bender", reason="health_failed")
     assert em.pending() == []
     [summary] = get(base, "/api/v1/fleet-rollouts")["rollouts"]
@@ -223,7 +223,7 @@ def test_a_whole_rollout_round_trips_through_the_read_endpoints(tmp_path, live):
     detail = get(base, f"/api/v1/fleet-rollouts/{RID}")
     assert [(h["host"], h["status"]) for h in detail["hosts"]] == [("beast", "ok"), ("bender", "failed")]
     blob = json.dumps(detail)
-    assert "wohlgemuth" not in blob and "ghp_" not in blob                 # the log text never left the host
+    assert "someuser" not in blob and "ghp_" not in blob                 # the log text never left the host
     assert all(h["log"]["bytes"] > 0 and len(h["log"]["sha256"]) == 64 for h in detail["hosts"])
     assert get(base, "/api/v1/fleet-rollouts/versions")["hosts"][0]["repos"]["autospec"]["sha"] == SHA_A
 
@@ -477,7 +477,7 @@ def test_log_text_is_stored_locally_privately_and_only_a_reference_is_emitted(tm
     import hashlib
     repo, base = live
     em = events.Emitter(tmp_path, client=MetadataClient(base))
-    secret_log = "pip install failed\nTOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\n/home/wohlgemuth/venv\n"
+    secret_log = "pip install failed\nTOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\n/home/someuser/venv\n"
     ref = em.record_log(RID, "beast", "installer", secret_log)
     assert ref == {"host": "beast", "path_id": "installer", "sha256": hashlib.sha256(secret_log.encode()).hexdigest(),
                    "bytes": len(secret_log.encode()), "lines": 3}
@@ -487,7 +487,7 @@ def test_log_text_is_stored_locally_privately_and_only_a_reference_is_emitted(tm
     em.emit(RID, "rollout.observed", trigger=TRIGGER, targets=TARGETS)
     em.emit(RID, "host.finished", host="beast", repo="autospec", status="failed", reason="apply_failed", log=ref)
     wire = json.dumps(get(base, f"/api/v1/fleet-rollouts/{RID}")) + json.dumps([e["payload"] for e in repo.stream("fleet_rollout", RID)])
-    assert "ghp_" not in wire and "wohlgemuth" not in wire and "pip install" not in wire
+    assert "ghp_" not in wire and "someuser" not in wire and "pip install" not in wire
     assert ref["sha256"] in wire
 
 

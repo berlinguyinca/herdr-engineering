@@ -1,0 +1,38 @@
+# Woodpecker CI -- the scheduled proof that `main` is green.
+#
+# Until now nothing ran tests on `main`. unit-gates.yml and ui-gates.yml trigger on pull_request only, so the sole pipeline that
+# fires on a push to main is structural-gates.yml, a 1.3s check of YAML/merge artifacts/pin agreement that never runs pytest.
+# #709 landed four deterministic test failures at 23:52 and nothing on main noticed for five hours (issue #719).
+#
+# This is the cheap half of the fix. It does not run per push - the suite is ~45 min and main takes several pushes an hour during
+# active work - it runs on a schedule, and scripts/ci/main-cron-gates.sh exits in about a second when main has not moved since the
+# last green run, so a quiet day costs almost nothing and the schedule only pays for work that is genuinely unproven.
+#
+# The schedule itself lives in the CI server (repo settings -> cron), not in this file, and is what to edit to change the cadence:
+#     name main-unit-gates   schedule 0 */4 * * *   branch main
+# A cadence of four hours bounds "main is red and nobody knows" to four hours, against five hours and counting before this existed.
+#
+# The per-push alternative is strictly better at detection but costs a suite per push; it wants `concurrency` plus the freshness
+# guard from #712 first, or consecutive pushes to main each spend an agent-hour on a commit already superseded.
+when:
+  - event: cron
+
+skip_clone: true
+
+steps:
+  - name: checkout
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
+      - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
+      - 'git remote add origin "https://github.com/${CI_REPO}.git"'
+      - 'git fetch --no-tags origin "$CI_COMMIT_SHA"'
+      - 'git checkout -q FETCH_HEAD'
+      - 'git --no-pager log --oneline -1'
+
+  - name: main-cron-gates
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'bash scripts/ci/main-cron-gates.sh'

@@ -146,3 +146,158 @@ test('the public notice names the member when the name is known, escaped, and ke
   assert.ok(!html.includes('<img'));
   assert.ok(renderShareSummary({ audience: 'public', summary: {} }, { name: 'Ada' }).includes('Shared by Ada'));
 });
+
+// ---------------------------------------------------------------------------------------------- the library (Task 10)
+import { filterFeed, renderFeedRow, renderFeedList, renderChips, renderFolderSidebar, chooseEntry } from './member-artifacts-view.js';
+
+const item = (o = {}) => ({
+  artifact_id: 'art-1', title: 'Plate map', sharer: 'ada@lab.example', shared_at: '2026-10-01T10:00:00Z', source: 'mine',
+  status: 'active', expires_at: null, share_id: null, folder_ids: [], artifact_type: 'html', size_bytes: 10,
+  files: [{ path: 'index.html', sha256: 'a'.repeat(64), size: 10, content_type: 'text/html' }], ...o,
+});
+const FEED = [
+  item(),
+  item({ artifact_id: 'art-2', title: 'QC report', sharer: 'Bo', source: 'assigned', shared_at: '2026-10-05T00:00:00Z', folder_ids: ['f1'], artifact_type: 'pdf' }),
+  item({ artifact_id: 'art-3', title: 'Old link', sharer: 'Cy', source: 'opened', status: 'expired', shared_at: '2026-09-01T00:00:00Z', expires_at: '2026-09-30T00:00:00Z' }),
+  item({ artifact_id: 'art-4', title: 'Agent push', sharer: 'agent', source: 'pending', status: 'pending', shared_at: '2026-10-07T00:00:00Z' }),
+];
+const ids = (rows) => rows.map((r) => r.artifact_id);
+
+test('filterFeed: default sources hide pending; sources, folder, type, dates and text combine; newest first', () => {
+  assert.deepEqual(ids(filterFeed(FEED, {})), ['art-2', 'art-1', 'art-3']);
+  assert.deepEqual(ids(filterFeed(FEED, { sources: ['pending'] })), ['art-4']);
+  assert.deepEqual(ids(filterFeed(FEED, { sources: ['assigned', 'opened'] })), ['art-2', 'art-3']);
+  assert.deepEqual(ids(filterFeed(FEED, { folderId: 'f1' })), ['art-2']);
+  assert.deepEqual(ids(filterFeed(FEED, { type: 'PDF' })), ['art-2']);
+  assert.deepEqual(ids(filterFeed(FEED, { since: '2026-10-01T10:00:00Z' })), ['art-2', 'art-1']);   // since is inclusive
+  assert.deepEqual(ids(filterFeed(FEED, { until: '2026-10-05T00:00:00Z' })), ['art-1', 'art-3']);   // until is exclusive
+  assert.deepEqual(ids(filterFeed(FEED, { q: 'QC' })), ['art-2']);
+  assert.deepEqual(ids(filterFeed(FEED, { q: 'BO' })), ['art-2']);                                   // sharer, case-insensitive
+  assert.deepEqual(ids(filterFeed(FEED, { q: 'pdf' })), ['art-2']);                                  // type
+  assert.deepEqual(ids(filterFeed(FEED, { q: 'qc', sources: ['mine'] })), []);
+  assert.deepEqual(ids(filterFeed(FEED, { q: 'topic', folders: [{ folder_id: 'f1', name: 'Topic A' }] })), ['art-2']);   // own folder names
+  assert.deepEqual(ids(filterFeed(FEED, { q: '  ' })), ['art-2', 'art-1', 'art-3']);
+  assert.deepEqual(ids(filterFeed(null, {})), []);
+});
+
+test('filterFeed: file names are searched only on readable rows (expired rows reveal nothing but title and sharer)', () => {
+  const rows = [item({ files: [{ path: 'secret.csv' }] }), item({ artifact_id: 'x', status: 'revoked', files: [{ path: 'secret.csv' }] })];
+  assert.deepEqual(ids(filterFeed(rows, { q: 'secret' })), ['art-1']);
+});
+
+test('renderFeedRow: badge per source, escaped text, content link on the content route (never a share token)', () => {
+  const badge = (source) => renderFeedRow(item({ source }));
+  assert.match(badge('mine'), /badge-mine">Mine</);
+  assert.match(badge('assigned'), /badge-assigned">Assigned</);
+  assert.match(badge('opened'), /badge-opened">Opened via link</);
+  assert.match(badge('pending'), /badge-pending">Pending</);
+  const html = renderFeedRow(item({ title: HOSTILE, sharer: HOSTILE, share_id: 'shr_secret', source: 'opened', expires_at: '2026-12-01T00:00:00Z' }));
+  inert(html);
+  assert.match(html, /data-artifact="art-1" data-path="index\.html"/);
+  assert.doesNotMatch(html, /shr_secret/);
+  assert.match(html, /Expires 2026-12-01/);
+  assert.match(html, /2026-10-01/);
+});
+
+test('renderFeedRow: expired and revoked rows are muted, tagged, and have no href and no button', () => {
+  for (const [status, tag] of [['expired', 'Expired'], ['revoked', 'Revoked']]) {
+    const html = renderFeedRow(item({ status, source: 'opened', title: 'Gone', sharer: 'Cy' }));
+    assert.match(html, /class="row[^"]*row-muted/);
+    assert.ok(html.includes(`>${tag}<`));
+    assert.match(html, /Gone/);
+    assert.match(html, /Cy/);
+    assert.doesNotMatch(html, /href=/);
+    assert.doesNotMatch(html, /<button/);
+    assert.doesNotMatch(html, /<select/);
+  }
+});
+
+test('renderFeedRow: Accept and Discard only on pending rows; folder select only where folders exist', () => {
+  const pending = renderFeedRow(item({ source: 'pending', status: 'pending' }));
+  assert.match(pending, /data-action="accept"/);
+  assert.match(pending, /data-action="discard"/);
+  const mine = renderFeedRow(item());
+  assert.doesNotMatch(mine, /data-action="accept"|data-action="discard"/);
+  assert.doesNotMatch(mine, /<select/);
+  const filed = renderFeedRow(item({ folder_ids: ['f1'] }), { folders: [{ folder_id: 'f1', name: '<b>x</b>' }, { folder_id: 'f2', name: 'B' }], activeFolder: 'f1' });
+  assert.match(filed, /<select[^>]*data-action="file"/);
+  assert.match(filed, /<option value="f2">B</);
+  assert.ok(!filed.includes('<b>'));
+  assert.match(filed, /data-action="unfile"/);
+  assert.doesNotMatch(renderFeedRow(item(), { folders: [{ folder_id: 'f1', name: 'A' }] }), /data-action="unfile"/);
+});
+
+test('chooseEntry prefers index.html, then the first file; none gives null', () => {
+  assert.equal(chooseEntry(item({ files: [{ path: 'a.csv' }, { path: 'index.html' }] })).path, 'index.html');
+  assert.equal(chooseEntry(item({ files: [{ path: 'a.csv' }] })).path, 'a.csv');
+  assert.equal(chooseEntry(item({ files: [] })), null);
+  assert.equal(chooseEntry(item({ files: undefined })), null);
+});
+
+test('renderFeedList: empty state per filter, otherwise one list', () => {
+  assert.match(renderFeedList([]), /Nothing here yet/);
+  assert.match(renderFeedList([], { filter: 'pending' }), /Nothing here yet/);
+  const html = renderFeedList([item()]);
+  assert.match(html, /data-feed/);
+  assert.doesNotMatch(html, /Nothing here yet/);
+});
+
+test('renderChips: four chips, Pending only when pending > 0, active is pressed, counts shown', () => {
+  const none = renderChips({ all: 3, assigned: 1, opened: 1, mine: 1, pending: 0 }, 'all');
+  for (const label of ['All', 'Assigned to me', 'Opened via link', 'Mine']) assert.ok(none.includes(label));
+  assert.doesNotMatch(none, /Pending/);
+  assert.match(none, /data-chip="all"[^>]*aria-pressed="true"/);
+  assert.match(none, /data-chip="mine"[^>]*aria-pressed="false"/);
+  const some = renderChips({ pending: 2 }, 'pending');
+  assert.match(some, /data-chip="pending"[^>]*aria-pressed="true"[^>]*>Pending <span[^>]*>2</);
+  assert.match(renderChips({}, 'nonsense'), /data-chip="all"[^>]*aria-pressed="true"/);
+});
+
+test('renderFolderSidebar: folders link to #/f/<id>, names escaped, active marked, create form and manage buttons', () => {
+  const html = renderFolderSidebar([{ folder_id: 'f1', name: HOSTILE, item_count: 2 }, { folder_id: 'f2', name: 'B', item_count: 0 }], 'f2');
+  inert(html);
+  assert.match(html, /href="#\/f\/f1"/);
+  assert.match(html, /href="#\/f\/f2"[^>]*aria-current="page"/);
+  assert.match(html, /data-folder-form/);
+  assert.match(html, /data-action="rename-folder"/);
+  assert.match(html, /data-action="delete-folder"/);
+  assert.doesNotMatch(renderFolderSidebar([], null), /rename-folder/);
+  assert.match(renderFolderSidebar([], null), /data-folder-form/);
+});
+
+test('renderNav keeps My artifacts reachable at #/mine next to the Library tab', () => {
+  const html = renderNav('library', true);
+  assert.match(html, /href="#\/"[^>]*aria-current="page">Library/);
+  assert.match(html, /href="#\/mine"[^>]*>My artifacts/);
+});
+
+// ---------------------------------------------------------------------------------------------- fix round 1
+import { contentMode, rejectionText } from './member-artifacts-view.js';
+
+test('contentMode shows only the server inline types; html, css, js, xml, svg and the rest are downloaded', () => {
+  for (const t of ['text/plain', 'text/plain; charset=utf-8', 'application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp']) {
+    assert.equal(contentMode(t), 'inline', t);
+  }
+  for (const t of ['text/html', 'text/html; charset=utf-8', 'text/css', 'text/javascript', 'text/xml', 'application/xhtml+xml',
+    'image/svg+xml', 'application/json', 'text/csv', 'application/octet-stream', '', undefined, 'TEXT/HTML']) {
+    assert.equal(contentMode(t), 'download', String(t));
+  }
+});
+
+test('rejectionText reads the worker refusal (HTTP 200 result rejected) and nothing else', () => {
+  assert.match(rejectionText({ result: 'rejected', reason: 'pending_cap' }), /pending_cap/);
+  assert.equal(rejectionText({ result: 'rejected', reason: 'folder_cap', message: 'You have 200 folders' }), 'You have 200 folders');
+  assert.match(rejectionText({ result: 'rejected' }), /refused/i);
+  assert.equal(rejectionText({ result: 'created' }), null);
+  assert.equal(rejectionText(null), null);
+  assert.equal(rejectionText(undefined), null);
+});
+
+test('the open action is a button without an href; expired rows hide the source badge', () => {
+  const open = renderFeedRow(item());
+  assert.match(open, /<button[^>]*data-action="open"[^>]*data-path="index\.html"/);
+  assert.doesNotMatch(open, /href=/);
+  const gone = renderFeedRow(item({ status: 'expired', source: 'opened' }));
+  assert.doesNotMatch(gone, /badge-opened|Opened via link/);
+  assert.match(gone, />Expired</);
+});

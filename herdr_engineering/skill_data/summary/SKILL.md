@@ -5,6 +5,8 @@ description: Produce an evidence-based, read-only summary of the current agent s
 
 # Current session summary
 
+To move this work into a fresh agent session instead, use `/handoff [pi|claude|codex|opencode]`.
+
 You are preparing a *session recovery report*, not a generic project overview. Remain read-only: never modify files, generate commits, run builds, restart services, start agents, or perform side effects. Safe read-only inspection of git status/log/diff and existing local records is allowed. The one permitted write is publishing the finished report as described under **Delivering the report**.
 
 ## Source and scope
@@ -79,6 +81,6 @@ When the history helper's output has a `prompts` list with at least 5 entries, y
 - **Otherwise, when `herdr-eng` is on PATH:** a long report must not flood the terminal. Do not print the report. Publish it once with a single command, taking `agent` and `session_id` from the history helper's JSON and passing the complete report on stdin through a quoted heredoc:
   `herdr-eng summary publish --agent <agent> --session <session_id> <<'SUMMARY_EOF'` … the full report … `SUMMARY_EOF`
   This is the only write allowed: it saves the report to the user's private cache, posts it to the dashboard's Summary view for this agent, and opens it in a Herdr pane beside the terminal (with the drift graph in a pane under it when the report has a valid `drift-graph` block).
-  - If it prints `"ok": true`, reply with **only** its `message` line. No report text, no recap.
+  - If it prints `"ok": true`, reply with its `message` line, then its `digest` (a few lines: overall status, the opening of the report, the report file path and the dashboard reference). Nothing else: no further report text, no recap. The pane is reused and focused when one is still open from an earlier publish.
   - If it fails, or prints `"ok": false`, print the complete report in the conversation instead, so nothing is lost.
 - **Without `herdr-eng`:** write the report to the current conversation. Do not save a file unless explicitly asked.

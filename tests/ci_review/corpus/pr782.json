@@ -1,0 +1,104 @@
+{
+ "repo": "berlinguyinca/herdr-engineering",
+ "pr": 782,
+ "head_sha": "b36058ff18f625d1c900b1a0217201d6b097d131",
+ "base_sha": "22ecf0f16d104c4ca9d0d47934f1323ee7633289",
+ "base_ref": "main",
+ "title": "Inspector history: continue into fabric_events_archive",
+ "source": "opus",
+ "notes": "Seeded from the Opus notes on the pre-fix head (all severity note). Lines are approximate. known_false_claims are findings an open-weight reviewer made that are wrong; a blocking finding matching one is a confirmed false blocker.",
+ "ground_truth": [
+  {
+   "id": "dedup-on-event-id-alone",
+   "file": "herdr_engineering/control_plane/inspector_history.py",
+   "line": 117,
+   "category": "code",
+   "summary": "dedup on event_id alone, but event_id is only unique per actor",
+   "severity": "note"
+  },
+  {
+   "id": "inspector-page-untested",
+   "file": "herdr_engineering/control_plane/bridge.py",
+   "line": 401,
+   "category": "tests",
+   "summary": "PostgresSource.inspector_page path untested",
+   "severity": "note"
+  },
+  {
+   "id": "to-regclass-every-page",
+   "file": "herdr_engineering/control_plane/inspector_history.py",
+   "line": 114,
+   "category": "performance",
+   "summary": "to_regclass executed on every page",
+   "severity": "note"
+  },
+  {
+   "id": "archive-duplicates-not-removed",
+   "file": "herdr_engineering/control_plane/inspector_history.py",
+   "line": 116,
+   "category": "code",
+   "summary": "duplicates inside the archive are not removed, there is no unique constraint",
+   "severity": "note"
+  },
+  {
+   "id": "archive-unreadable-fails-page",
+   "file": "herdr_engineering/control_plane/inspector_history.py",
+   "line": 115,
+   "category": "code",
+   "summary": "archive unreadable by the role fails the whole page instead of degrading",
+   "severity": "note"
+  },
+  {
+   "id": "partial-index-unusable",
+   "file": "deploy/control-plane/migrations/0052_fabric_events_archive_inspector_index.sql",
+   "line": 10,
+   "category": "migrations",
+   "summary": "partial index WHERE entity_id <> '' is not usable under a generic prepared plan",
+   "severity": "note"
+  },
+  {
+   "id": "test-container-leak",
+   "file": "tests/control_plane/test_inspector_history_archive.py",
+   "line": 62,
+   "category": "tests",
+   "summary": "test container leaks if seeding raises",
+   "severity": "note"
+  },
+  {
+   "id": "duplicated-teardown-private-loop",
+   "file": "tests/control_plane/test_inspector_history_archive.py",
+   "line": 66,
+   "category": "tests",
+   "summary": "duplicated teardown and use of private runner._loop",
+   "severity": "note"
+  },
+  {
+   "id": "two-selects-no-snapshot",
+   "file": "herdr_engineering/control_plane/inspector_history.py",
+   "line": 114,
+   "category": "code",
+   "summary": "two SELECTs not one snapshot and the ordering is undocumented",
+   "severity": "note"
+  }
+ ],
+ "known_false_claims": [
+  {
+   "id": "archive-identifier-invalid",
+   "file": "herdr_engineering/control_plane/bridge.py",
+   "line": 402,
+   "summary": "table[:-1] + '_archive\"' is a valid quoted archive table identifier because table is already quoted"
+  },
+  {
+   "id": "to-regclass-quoted",
+   "file": "herdr_engineering/control_plane/inspector_history.py",
+   "line": 114,
+   "summary": "to_regclass accepts quoted names"
+  },
+  {
+   "id": "limit-plus-one",
+   "file": "herdr_engineering/control_plane/inspector_history.py",
+   "line": 120,
+   "summary": "limit+1 truncation is fine"
+  }
+ ]
+}

@@ -244,7 +244,7 @@ JSON schema (common fields; per-type subsets in the validator):
   "host": "beast|bender|macbook-pro (inventory name, [a-z0-9-]{1,40})",
   "repo": "str (for host events)",
   "status": "pending|precheck|applying|checking|ok|blocked|failed|unreachable|skipped|rolled_back",
-  "reason": "enum: dirty_checkout|not_on_main|unpublished_commits|busy|timeout|health_failed|apply_failed|ssh_failed|halted|optional_unreachable|not_published|rate_limited|operator",
+  "reason": "enum: dirty_checkout|not_on_main|unpublished_commits|busy|timeout|health_failed|apply_failed|ssh_failed|halted|optional_unreachable|not_published|rate_limited|ahead_of_target|operator",
   "before_sha": "40 hex|null", "after_sha": "40 hex|null",
   "started_at": "ISO", "finished_at": "ISO", "duration_ms": "int >= 0",
   "checks": [{"name": "closed enum", "status": "ok|failed|skipped", "duration_ms": "int >= 0"}],

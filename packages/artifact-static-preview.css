@@ -5,4 +5,4 @@
 .hd-pdf-page .textLayer { position: absolute; inset: 0; overflow: clip; line-height: 1; text-size-adjust: none; forced-color-adjust: none; transform-origin: 0 0; z-index: 1; }
 .hd-pdf-page .textLayer :is(span, br) { position: absolute; color: transparent; white-space: pre; cursor: text; transform-origin: 0 0; }
 .hd-pdf-page .textLayer ::selection { background: rgba(0, 80, 255, .3); }
-[data-static-preview] { border: 1px solid var(--border, currentColor); border-radius: 6px; padding: 8px; background: #fff; color: #111; }
+[data-static-preview] { border: 1px solid var(--border, currentColor); border-radius: 6px; padding: 8px; background: var(--surface, #fff); color: var(--text, #111); color-scheme: light dark; }

@@ -1,0 +1,9 @@
+/* Dashboard Rich view: the sandboxed frame for a report's own HTML page. Tokens come from herdr-design-system/theme.css. */
+[data-rich-view] [data-rich-toggle] { margin-bottom: 12px; }
+[data-rich-frame] {
+  display: block; width: 100%; height: 70vh; min-height: 320px; max-height: 900px;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color-scheme: light dark;
+}
+[data-rich-view] [data-rich-note] { margin: 8px 0; }
+[data-rich-view] [data-rich-open] { display: inline-flex; align-items: center; text-decoration: none; }
+@media (max-width: 480px) { [data-rich-frame] { height: 60vh; min-height: 280px; } }

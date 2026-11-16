@@ -115,6 +115,12 @@ async def _may_share_active(conn: Any, artifact_id: str | None, principal: str) 
     return lifecycle == "active" and await _may_share(conn, artifact_id, principal)
 
 
+async def _is_pending(conn: Any, artifact_id: str | None) -> bool:
+    """An agent push the owner has not accepted: nothing may be shared (created, approved or made live) before then."""
+    return artifact_id is not None and await conn.fetchval("SELECT intake FROM artifacts WHERE artifact_id=$1",
+                                                           artifact_id) == "pending"
+
+
 def _http_reason(exc: Any) -> str:
     from .collab_intents import REASON_MAX
     return "not_found" if exc.status == 404 else str(exc.message)[:REASON_MAX] or "refused"
@@ -153,6 +159,8 @@ async def handle_share_create(ctx: IntentContext, intent: Intent) -> dict:
     p, aid, rt = intent.payload, intent.artifact_id, who.rt
     if not await _may_share_active(ctx.conn, aid, who.principal):
         return await _refuse(ctx, who, "share_create", "not_found", intent, audience=p.audience)
+    if await _is_pending(ctx.conn, aid):
+        return await _refuse(ctx, who, "share_create", "pending_not_accepted", intent, audience=p.audience)
     key = f"share:{intent.idempotency_key}" if intent.idempotency_key else None
     digest = hashlib.sha256(json.dumps([aid, p.version_id, p.audience, p.allow_groups, p.allow_emails,
                                         p.expires_in_days, p.entry, p.title], default=list).encode()).hexdigest()
@@ -220,6 +228,9 @@ async def handle_share_approve(ctx: IntentContext, intent: Intent) -> dict:
     if share is None or share["artifact_id"] != aid or share["created_by"] != who.principal \
             or not await _may_share_active(ctx.conn, aid, who.principal):
         return await _refuse(ctx, who, "share_approve", "not_found", intent, share_id=share_id)
+    if await _is_pending(ctx.conn, aid):
+        return await _refuse(ctx, who, "share_approve", "pending_not_accepted", intent, share_id=share_id,
+                             audience=share["audience"])
     if share["state"] == "live":        # a replay or a second call: the URL was shown once, never again
         return {"result": "already_approved", "share_id": share_id, "audience": share["audience"],
                 "_principal": who.principal}

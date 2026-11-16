@@ -103,6 +103,16 @@ export const BUILD_CACHE_STYLE = `<style>
 .bc-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
 .bc-dl{display:grid;grid-template-columns:minmax(8rem,14rem) 1fr;gap:4px 12px}.bc-dl dd{margin:0;overflow-wrap:anywhere}
 @media (max-width:40rem){.bc-dl{grid-template-columns:1fr}.bc-dl dd{margin-bottom:8px}}
+@media (max-width:40rem){
+/* Phone: each build is a stacked card with the column name beside every value. display:block drops native table semantics in some engines, so the table carries explicit ARIA roles. */
+.bc-wrap table[data-bc-builds]{min-width:0;display:block}
+.bc-wrap table[data-bc-builds] thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.bc-wrap table[data-bc-builds] tbody{display:block}
+.bc-wrap table[data-bc-builds] tr{display:block;border:1px solid var(--border-subtle);border-radius:var(--radius);margin:0 0 12px;padding:4px 0;background:var(--surface)}
+.bc-wrap table[data-bc-builds] :is(th,td){display:grid;grid-template-columns:minmax(6rem,9rem) 1fr;gap:8px;border-bottom:0;padding:4px 12px;text-align:left;background:transparent}
+.bc-wrap table[data-bc-builds] :is(th,td)::before{content:attr(data-label);font-size:.75rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--text)}
+.bc-wrap table[data-bc-builds] td.bc-num{text-align:left;white-space:normal}
+}
 </style>`;
 
 const card = (label, valueHtml, noteHtml = '') => `<div class="bc-card"><dt>${esc(label)}</dt><dd>${valueHtml}</dd>${noteHtml ? `<p>${noteHtml}</p>` : ''}</div>`;
@@ -144,16 +154,16 @@ function hostsSection(hostsRes) {
 
 function buildsTable(builds, hasMore) {
   if (!builds.length) return '<herdr-empty data-bc-empty message="No builds recorded yet"></herdr-empty><p class="bc-note">Builds appear here once a gated build runs on the control-plane host.</p>';
-  const rows = builds.map((b) => `<tr data-bc-build="${esc(b.build_id)}">
-      <th scope="row"><a href="${buildHref(b.build_id)}"><code>${esc(b.build_id)}</code></a></th>
-      <td>${statusBadge(text(b.status, 'unknown'))}</td><td>${esc(text(b.cmd_kind))}</td><td>${esc(text(b.host))}</td>
-      <td>${esc(text(b.ts))}</td><td class="bc-num">${seconds(b.elapsed_s) == null ? '—' : esc(seconds(b.elapsed_s))}</td>
-      <td>${esc(cacheAppliedCell(b))}</td><td class="bc-num">${writeCell(b.proc_io_write_bytes)}</td><td class="bc-num">${writeCell(b.host_disk_write_bytes_delta)}</td>
-      <td>${traceCell(b.trace)}</td></tr>`).join('');
-  return `<div class="bc-wrap" role="region" aria-label="Builds table" tabindex="0"><table class="hd-table" data-bc-builds>
+  const rows = builds.map((b) => `<tr role="row" data-bc-build="${esc(b.build_id)}">
+      <th scope="row" role="rowheader" data-label="Build"><a href="${buildHref(b.build_id)}"><code>${esc(b.build_id)}</code></a></th>
+      <td role="cell" data-label="Status">${statusBadge(text(b.status, 'unknown'))}</td><td role="cell" data-label="Command">${esc(text(b.cmd_kind))}</td><td role="cell" data-label="Host">${esc(text(b.host))}</td>
+      <td role="cell" data-label="Time">${esc(text(b.ts))}</td><td role="cell" data-label="Elapsed" class="bc-num">${seconds(b.elapsed_s) == null ? '—' : esc(seconds(b.elapsed_s))}</td>
+      <td role="cell" data-label="Cache">${esc(cacheAppliedCell(b))}</td><td role="cell" data-label="Logical writes (lower bound)" class="bc-num">${writeCell(b.proc_io_write_bytes)}</td><td role="cell" data-label="Host disk delta" class="bc-num">${writeCell(b.host_disk_write_bytes_delta)}</td>
+      <td role="cell" data-label="Trace">${traceCell(b.trace)}</td></tr>`).join('');
+  return `<div class="bc-wrap" role="region" aria-label="Builds table" tabindex="0"><table class="hd-table" role="table" data-bc-builds>
     <caption class="visually-hidden">Recorded builds, newest first</caption>
-    <thead><tr><th scope="col">Build</th><th scope="col">Status</th><th scope="col">Command</th><th scope="col">Host</th><th scope="col">Time</th><th scope="col">Elapsed</th><th scope="col">Cache</th><th scope="col">Logical writes (lower bound)</th><th scope="col">Host disk delta</th><th scope="col">Trace</th></tr></thead>
-    <tbody>${rows}</tbody></table></div>
+    <thead><tr role="row"><th scope="col">Build</th><th scope="col">Status</th><th scope="col">Command</th><th scope="col">Host</th><th scope="col">Time</th><th scope="col">Elapsed</th><th scope="col">Cache</th><th scope="col">Logical writes (lower bound)</th><th scope="col">Host disk delta</th><th scope="col">Trace</th></tr></thead>
+    <tbody role="rowgroup">${rows}</tbody></table></div>
     <p class="bc-note" data-bc-count>${builds.length} build${builds.length === 1 ? '' : 's'} loaded${hasMore ? ' · more are available' : ' · end of list'}.</p>`;
 }
 
@@ -305,7 +315,7 @@ export function mountBuildCache(container, client, { freshness = () => null } = 
     if (disposed || controller) return;
     const request = controller = new AbortController();
     retry.hidden = true;
-    if (!loaded) content.innerHTML = skeleton('build cache', { rows: 3, height: 64 });
+    if (!loaded) content.innerHTML = skeleton('build cache', { rows: 3, height: 120 });
     try {
       const res = await loadBuildCache(client);
       if (disposed || request.signal.aborted) return;

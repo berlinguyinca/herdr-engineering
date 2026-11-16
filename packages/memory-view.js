@@ -122,8 +122,8 @@ export function renderDrawer(d) {
 }
 
 export function renderStatus(s) {
-  const wrap = (inner) => `<section class="mem-status" aria-labelledby="mem-status-h"><h2 id="mem-status-h">Integration status</h2>${inner}</section>`;
-  if (s.phase === 'loading') return wrap(skeleton('integration status', { rows: 3, height: 54 }));
+  const wrap = (inner, loading = false) => `<section class="mem-status${loading ? ' mem-status--loading' : ''}" aria-labelledby="mem-status-h"><h2 id="mem-status-h">Integration status</h2>${inner}</section>`;
+  if (s.phase === 'loading') return wrap(skeleton('integration status', { rows: 3, height: 54 }), true);
   if (s.phase === 'forbidden') return wrap('<p class="mem-note">You do not have access to memory status.</p>');
   if (s.phase === 'disabled') return wrap('<p class="mem-note">Memory is not enabled on this control plane.</p>');
   if (s.phase === 'unavailable') return wrap('<p class="mem-note" role="alert"><strong>Memory service unavailable.</strong> Service health, queue depth and versions are UNKNOWN.</p>');
@@ -141,6 +141,7 @@ export function mountMemory(root, client, { query, setQuery = () => {}, freshnes
   for (const k of FIELDS) form[k] = query?.get ? query.get(k) || '' : '';
   const st = { phase: 'idle', results: [], offset: Number(query?.get?.('offset')) || 0, has_more: false };
   let drawer = null, status = { phase: 'loading' }, lastFocus = null, token = 0, disposed = false;
+  let detailToken = 0, detailController = null;
   root.innerHTML = `<div class="mem"><div data-mem-filters></div><div class="mem-grid"><div data-mem-results aria-live="polite"></div><div data-mem-side></div></div>
     <aside class="mem-drawer" data-mem-drawer role="dialog" aria-modal="false" aria-labelledby="mem-drawer-title" hidden></aside><div data-mem-status></div></div>`;
   const $ = (sel) => root.querySelector(sel);
@@ -171,14 +172,28 @@ export function mountMemory(root, client, { query, setQuery = () => {}, freshnes
     paint();
   }
   async function open(id) {
+    const row = st.results.find(item => item.memory_id === id);
+    if (disposed || !row) return;
+    detailController?.abort();
+    const mine = ++detailToken, controller = new AbortController();
+    detailController = controller;
+    const options = { signal: controller.signal, kind: row.kind === 'summary' ? 'summary' : 'fact', scope: row.scope };
+    if (row.scope === 'project' || row.scope?.startsWith('mission:')) options.project = row.project;
     drawer = { phase: 'loading' }; paintDrawer();
     $('#mem-drawer-title')?.focus();
-    try { const body = await client.getMemoryRecord(id); if (!disposed) drawer = { phase: 'ok', ...body }; }
-    catch (err) { drawer = err?.status === 404 ? { phase: 'notfound' } : classify(err); }
-    if (disposed) return;
+    try {
+      const body = await client.getMemoryRecord(id, options);
+      if (disposed || mine !== detailToken || controller.signal.aborted) return;
+      drawer = { phase: 'ok', ...body };
+    } catch (err) {
+      if (disposed || mine !== detailToken || controller.signal.aborted) return;
+      drawer = err?.status === 404 ? { phase: 'notfound' } : classify(err);
+    } finally {
+      if (detailController === controller) detailController = null;
+    }
     paintDrawer(); $('#mem-drawer-title')?.focus();
   }
-  function close() { drawer = null; paintDrawer(); lastFocus?.focus?.(); }
+  function close() { detailToken += 1; detailController?.abort(); drawer = null; paintDrawer(); lastFocus?.focus?.(); }
   // Only a real failure turns the chip red: forbidden, disabled and unavailable are answers the control plane gave, shown calmly on the page.
   function reportFailure(err) { classify(err).phase === 'error' ? freshness?.(false, err?.message) : freshness?.(true); }
   async function loadStatus() {
@@ -207,5 +222,5 @@ export function mountMemory(root, client, { query, setQuery = () => {}, freshnes
 
   loadStatus();
   if (form.q) search(st.offset);
-  return { refresh() {}, dispose() { disposed = true; token += 1; } };
+  return { refresh() {}, dispose() { disposed = true; token += 1; detailToken += 1; detailController?.abort(); } };
 }

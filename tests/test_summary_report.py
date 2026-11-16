@@ -252,7 +252,7 @@ def test_publish_sends_to_the_dashboard_and_a_side_pane_and_prints_one_line(tmp_
     assert posted[0]["agent"] == "claude" and posted[0]["target"] == "abc-123" and posted[0]["report"].startswith("# Session summary")
     assert "\n" not in out["message"] and "dashboard" in out["message"] and "side pane" in out["message"]
     split = next(c for c in calls if c[1:3] == ["pane", "split"])
-    assert split[split.index("--pane") + 1] == "w1:p1" and "--no-focus" in split and "right" in split
+    assert split[split.index("--pane") + 1] == "w1:p1" and "--focus" in split and "--no-focus" not in split and "right" in split
     shown = next(c for c in calls if c[1:3] == ["pane", "run"])
     assert shown[3] == "w1:p9"
     # the pane runs the viewer on the report and tells it which pane to close when the reader quits
@@ -613,3 +613,19 @@ def test_a_history_without_metrics_still_publishes_the_graph(tmp_path):
     out = _publish(tmp_path, [])
     graph = json.loads(Path(out["file"] + ".graph.json").read_text())
     assert out["graph"]["ok"] is True and graph["segments"][0]["fresh"] is None and graph["totals"]["worked_s"] is None
+
+
+def test_publish_prints_a_digest_with_status_path_and_dashboard_reference(tmp_path):
+    out = sr.publish_report("claude", "abc-123", REPORT, home=tmp_path, environ={"HERDR_PANE_ID": "w1:p1"},
+                            run=_fake_herdr([]), load_config=lambda: _Cfg, post=lambda cfg, body: (200, {}))
+    lines = out["digest"].splitlines()
+    assert lines[0] == "**Overall status:** completed"
+    assert f"Report file: {out['file']}" in lines
+    assert "Dashboard: dashboard Summary view (claude session abc-123)" in lines
+    failed = sr.publish_report("claude", "abc-123", REPORT, home=tmp_path, environ={"HERDR_PANE_ID": "w1:p1"},
+                               run=_fake_herdr([]), load_config=lambda: _Cfg,
+                               post=lambda cfg, body: (404, {"reason": "no_session"}))
+    assert "Dashboard: not posted (no_session)" in failed["digest"]
+    nothing = sr.publish_report("claude", "abc-123", REPORT, home=tmp_path, environ={}, run=_fake_herdr([]),
+                                dashboard=False, pane=False)
+    assert nothing["digest"] == "" and nothing["ok"] is False

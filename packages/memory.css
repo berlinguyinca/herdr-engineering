@@ -31,6 +31,9 @@
 .mem-dl dd { margin: 0; overflow-wrap: anywhere; }
 .mem-links, .mem-revs { padding-left: 20px; }
 .mem-status { margin-top: 24px; border-top: 1px solid var(--border-subtle); padding-top: 8px; }
+/* The loaded status block is 228px tall, 360px once the definition list stacks on a phone: the placeholder holds that space. */
+.mem-status--loading { min-height: 228px; }
+@media (max-width: 640px) { .mem-status--loading { min-height: 360px; } }
 .mem-table { border-collapse: collapse; width: 100%; }
 .mem-table th, .mem-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border-subtle); }
 @media (max-width: 640px) { .mem-bar { flex-direction: column; align-items: stretch; } .mem-dl { grid-template-columns: 1fr; } .mem-drawer { width: 100vw; } }

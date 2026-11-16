@@ -17,6 +17,7 @@ import os
 import shlex
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 from .shellparse import XARGS_MARKER, SimpleCommand, Unparseable, parse
 from .verbs import STRICTER, VERB_RISK, ActionKey, FlagClass, Verb
@@ -66,6 +67,9 @@ class Derived:
     hint_host: str = ""
     unparsed: bool = False
     hint_cwd: str = ""
+    one_shot_safe: bool = False   # True only when key.target digests the WHOLE action (see policy one-shot approvals)
+    deploy: Any = None            # a deploy.DeployMatch when the hub matched a configured deploy scope (else None)
+    scope_gated: bool = False     # a ``deploy`` tool call for a repo with configured deploy scopes: only the scope flow
 
 
 @dataclass(frozen=True)
@@ -845,7 +849,8 @@ def _hint(raw: RawAction) -> dict[str, str]:
 def _unknown_derived(raw: RawAction, reason: str, facts: list[str], details: tuple[Element, ...] = (),
                      hint_host: str = "") -> Derived:
     key = mk_key(raw.tool.strip().lower() or "unknown", Verb.UNKNOWN, raw.repo or "", raw_digest(raw.command or ""))
-    return Derived(key, (), True, reason, tuple(facts), details, raw.command or "", hint_host)
+    return Derived(key, (), True, reason, tuple(facts), details, raw.command or "", hint_host,
+                   one_shot_safe=_text_is_stable(raw.command or ""))
 
 
 def split_recipients(values: Iterable[str]) -> tuple[set[str], bool]:
@@ -874,6 +879,8 @@ def _email(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
     if "recipient" in hint:
         attested, bad = split_recipients([hint["recipient"]])
         facts.append(f"recipient={hint['recipient'].lower()}")
+        if bad:
+            invalid = True
         if bad or (recipients and not attested <= recipients):
             owner = True
             notes.append("hint recipient disagrees with the request")
@@ -886,7 +893,7 @@ def _email(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
         notes.append("send without recipients")
     flag = FlagClass.MULTIPLE if len(recipients) > 1 else FlagClass.NONE
     key = mk_key("email", Verb.EMAIL_SEND if op == "send" else Verb.EMAIL_DRAFT, scope, "", flag)
-    return Derived(key, (key,), owner, "; ".join(notes), tuple(facts))
+    return Derived(key, (key,), owner, "; ".join(notes), tuple(facts), one_shot_safe=not invalid)
 
 
 def _deploy(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
@@ -899,14 +906,15 @@ def _deploy(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
             verb = {"canary": Verb.DEPLOY_CANARY, "prod": Verb.DEPLOY_PROD,
                     "production": Verb.DEPLOY_PROD}.get(env, Verb.UNKNOWN)
             key = mk_key("deploy", verb, repo)
-            return Derived(key, (key,), True, "hint repo disagrees with the request", tuple(facts))
+            return Derived(key, (key,), True, "hint repo disagrees with the request", tuple(facts))   # unsafe: no target
         repo = repo or hint["repo"]
     verb = {"canary": Verb.DEPLOY_CANARY, "prod": Verb.DEPLOY_PROD, "production": Verb.DEPLOY_PROD}.get(env)
     if verb is None:
         key = mk_key("deploy", Verb.UNKNOWN, repo, raw_digest(env))
-        return Derived(key, (key,), True, f"unknown deploy environment {env!r}", tuple(facts))
+        return Derived(key, (key,), True, f"unknown deploy environment {env!r}", tuple(facts),
+                       one_shot_safe=bool(env))
     key = mk_key("deploy", verb, repo)
-    return Derived(key, (key,), False, "", tuple(facts))
+    return Derived(key, (key,), False, "", tuple(facts), one_shot_safe=True)
 
 
 def _bare_env_records(text: str, cwd: str | None) -> list[Element]:
@@ -976,7 +984,30 @@ def _shell(raw: RawAction, hint: dict[str, str], facts: list[str]) -> Derived:
         owner = True
         reasons.append("too complex")
         best = replace(best, target=raw_digest(_normalized_text(text)))
-    return Derived(best, keys, owner, "; ".join(reasons), tuple(facts), details, text, host, False, hint_cwd)
+    safe = best.verb is not Verb.UNKNOWN and not owner          # already classified: unchanged behaviour
+    if not safe:
+        safe = _digests_whole_action(text, cmds, st.out)
+    return Derived(best, keys, owner, "; ".join(reasons), tuple(facts), details, text, host, False, hint_cwd, safe)
+
+
+_DYNAMIC_CHARS = frozenset("$`*?[]{}~")
+
+
+def _static_text(text: str) -> bool:
+    """Non-blank and free of expansion characters ($ ` globs ~ braces)."""
+    return bool(text.strip()) and not any(c in _DYNAMIC_CHARS for c in text)
+
+
+def _text_is_stable(text: str) -> bool:
+    """Fail closed on unparsed text: static, and no ``xargs`` word anywhere (it cannot be detected structurally)."""
+    return _static_text(text) and "xargs" not in text
+
+
+def _digests_whole_action(text: str, cmds: list, out: list[Element]) -> bool:
+    """Fail closed: the same text must mean the same thing at run time (no expansion, no xargs)."""
+    if not _static_text(text):
+        return False
+    return not (any(XARGS_MARKER in c.argv for c in cmds) or any(el.xargs for el in out))
 
 
 def _single_simple(text: str, cmds: list, out: list[Element]) -> bool:
@@ -1012,15 +1043,47 @@ _TOOLS: dict[str, Callable[[RawAction, dict[str, str], list[str]], Derived]] = {
 }
 
 
-def derive(raw: RawAction) -> Derived:
+def _with_deploy(raw: RawAction, derived: Derived, deploy_cfg: Any) -> Derived:
+    """Pre-step for configured deploy scopes: an exact ``<command> --ref <sha>`` becomes a sha-bound deploy.prod key.
+    Everything the shell analysis found (details for the vetoes, facts, text) is kept; only the key and flags change."""
+    from .deploy import match_deploy, request_key
+    match = match_deploy(raw, deploy_cfg)
+    if match is None:
+        return derived
+    key = request_key(match)
+    argv = (raw.command or "").split(" ")
+    # The vetoes (fixed and the owner's extra verb rules) read the element keys: the deploy element is deploy.prod too.
+    details = tuple(replace(e, key=key, owner_decides=False) if list(e.argv) == argv else e for e in derived.details)
+    return replace(derived, key=key, elements=(key,), owner_decides=False, reason="", one_shot_safe=True, deploy=match,
+                   details=details)
+
+
+def _scope_gated(derived: Derived, deploy_cfg: Any) -> Derived:
+    """A ``deploy`` tool call for a repo that has configured deploy scopes must not be a way around them: it is never
+    one-shot and never grantable (its key becomes unknown), so it is always pending and the owner is pointed at the
+    scope flow.  A repo with no configured scope keeps the ordinary deploy key."""
+    from .deploy import _scopes
+    key = derived.key
+    if key is None or key.verb not in (Verb.DEPLOY_PROD, Verb.DEPLOY_CANARY):
+        return derived
+    if not any(repo.casefold() == key.resource_scope.casefold() for _, _, repo, _ in _scopes(deploy_cfg)):
+        return derived
+    unknown = mk_key("deploy", Verb.UNKNOWN, key.resource_scope, raw_digest(key.verb.value))
+    return replace(derived, key=unknown, elements=(unknown,), owner_decides=True, one_shot_safe=False,
+                   scope_gated=True, reason="deploys of this repo are authorized per configured scope")
+
+
+def derive(raw: RawAction, deploy_cfg: Any = None) -> Derived:
     tool = raw.tool.strip().lower()
     hint = _hint(raw)
     facts: list[str] = []
     if tool in _TOOLS:
-        return _TOOLS[tool](raw, hint, facts)
+        derived = _TOOLS[tool](raw, hint, facts)
+        return _scope_gated(derived, deploy_cfg) if tool == "deploy" and deploy_cfg else derived
     if tool in SHELL_TOOLS:
         try:
-            return _shell(raw, hint, facts)
+            derived = _shell(raw, hint, facts)
         except RecursionError:
             return _unknown_derived(raw, "too complex", facts)
+        return _with_deploy(raw, derived, deploy_cfg) if deploy_cfg else derived
     return _unknown_derived(raw, f"unknown tool {tool!r}", facts)

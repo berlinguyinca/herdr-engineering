@@ -13,6 +13,7 @@ import pytest
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from herdr_engineering.control_plane.scheduler_service import SchedulerService
 from herdr_engineering.control_plane.sink import DurableEventSink
+from tests.control_plane.pg_stop import FAST_TEST_OPTIONS, stop_postgres
 
 
 def service_for(dsn):
@@ -86,7 +87,7 @@ def scheduler_postgres():
         subprocess.run([str(bindir / "initdb"), "-D", str(data), "-A", "trust", "--no-locale"],
                        check=True, capture_output=True)
         subprocess.run([str(bindir / "pg_ctl"), "-D", str(data), "-l", str(area / "postgres.log"),
-                        "-o", f"-c listen_addresses='' -k {area} -c dynamic_shared_memory_type=mmap", "-w", "start"],
+                        "-o", f"-c listen_addresses='' -k {area} -c dynamic_shared_memory_type=mmap {FAST_TEST_OPTIONS}", "-w", "start"],
                        check=True, capture_output=True)
         try:
             dsn = f"postgresql:///postgres?host={area}"
@@ -103,8 +104,7 @@ def scheduler_postgres():
             asyncio.run(initialize())
             yield dsn
         finally:
-            subprocess.run([str(bindir / "pg_ctl"), "-D", str(data), "-m", "immediate", "-w", "stop"],
-                           check=True, capture_output=True)
+            stop_postgres(bindir / "pg_ctl", data, immediate=True)
 
 
 def test_one_hundred_requests_across_processes_never_overcommit(scheduler_postgres):

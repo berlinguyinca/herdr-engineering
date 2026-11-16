@@ -466,7 +466,9 @@ function pdfConfig(data) {
 async function drawPdf(native, data, onAnchor) {
   const status = h('p', { class: 'herdr-pdf-status', role: 'status', text: 'Loading the PDF' });
   const pages = h('div', { class: 'herdr-pdf-pages' });
-  native.append(status, pages);
+  const hint = h('p', { id: 'herdr-pdf-hint', class: 'herdr-pdf-hint', role: 'status', 'aria-live': 'polite',
+    text: onAnchor ? 'Keyboard: Tab to a page, Enter or Space comments on the whole page. After Mark region, the arrow keys move a region on the focused page, Shift and the arrow keys resize it, Enter comments on it, Escape drops it.' : '' });
+  native.append(status, hint, pages);
   const fail = () => {
     status.textContent = 'This PDF could not be drawn';
     status.append(' ', h('a', { href: data.raw_href, rel: 'noopener', text: 'Open the PDF' }));
@@ -505,6 +507,7 @@ async function drawPdf(native, data, onAnchor) {
   const regionLayers = new Map();
   for (let n = 1; n <= total; n += 1) {
     const holder = h('div', { class: 'herdr-pdf-page', 'data-page': String(n), role: 'group', 'aria-label': `Page ${n} of ${doc.numPages}` });
+    if (onAnchor) { holder.setAttribute('tabindex', '0'); holder.setAttribute('aria-describedby', 'herdr-pdf-hint'); }
     holder.style.setProperty('width', `${Math.floor(base.width * scale)}px`);
     holder.style.setProperty('height', `${Math.floor(base.height * scale)}px`);
     const layer = h('div', { class: 'herdr-region-layer', 'aria-hidden': 'true' });
@@ -576,6 +579,51 @@ async function drawPdf(native, data, onAnchor) {
       if (box) onAnchor({ kind: 'pdf_page', file: data.file, page, region: box });
     });
     pages.addEventListener('pointercancel', () => { drag = null; });
+    // Keyboard alternative: Enter / Space comments on the focused page; in region mode the arrows move a default region,
+    // Shift+arrows resize it, Enter uses it, Escape drops it (the same keys as the image view).
+    let keyed = null;
+    let keyedLive = null;
+    const clampTo = (value, low, high) => Math.min(high, Math.max(low, value));
+    const dropKeyed = () => { keyed = null; if (keyedLive) { keyedLive.remove(); keyedLive = null; } };
+    pages.addEventListener('keydown', (event) => {
+      const holder = event.target;
+      if (!holder || holder.nodeType !== 1 || !holder.classList.contains('herdr-pdf-page')) return;
+      const page = Number(holder.getAttribute('data-page'));
+      if (event.key === 'Escape') {
+        if (keyed) { dropKeyed(); hint.textContent = 'Region dropped.'; event.preventDefault(); }
+        return;
+      }
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        if (keyed && keyed.page === page) {
+          const box = unitBox(keyed.x, keyed.y, keyed.x + keyed.w, keyed.y + keyed.h, 1, 1);
+          dropKeyed();
+          if (box) onAnchor({ kind: 'pdf_page', file: data.file, page, region: box }, true);
+        } else {
+          onAnchor({ kind: 'pdf_page', file: data.file, page }, true);
+        }
+        return;
+      }
+      const delta = regionOn ? { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[event.key] : null;
+      if (!delta) return;
+      event.preventDefault();
+      if (keyed && keyed.page !== page) dropKeyed();
+      const step = 0.02;
+      keyed = keyed || { page, x: 0.35, y: 0.35, w: 0.3, h: 0.3 };
+      if (event.shiftKey) {
+        keyed.w = clampTo(keyed.w + delta[0] * step, 0.02, 1 - keyed.x);
+        keyed.h = clampTo(keyed.h + delta[1] * step, 0.02, 1 - keyed.y);
+      } else {
+        keyed.x = clampTo(keyed.x + delta[0] * step, 0, 1 - keyed.w);
+        keyed.y = clampTo(keyed.y + delta[1] * step, 0, 1 - keyed.h);
+      }
+      if (!keyedLive) {
+        keyedLive = h('div', { class: 'herdr-region herdr-region-live' });
+        regionLayers.get(page).append(keyedLive);
+      }
+      for (const [prop, key] of [['left', 'x'], ['top', 'y'], ['width', 'w'], ['height', 'h']]) keyedLive.style.setProperty(prop, `${keyed[key] * 100}%`);
+      hint.textContent = `Page ${page}, region ${boxText(keyed)}. Press Enter to comment on it.`;
+    });
     pages.addEventListener('click', (event) => {
       const selection = document.getSelection();
       if (regionOn || event.altKey || (selection && selection.toString())) return;
@@ -674,7 +722,7 @@ function buildPanel(aside, data, hooks) {
   const expires = data.expires_at ? new Date(data.expires_at * 1000).toLocaleString() : null;
   const note = h('p', { class: 'note', text: `You are commenting on the copy of the file as it was shared; the live page may differ.${expires ? ` Your link works until ${expires}.` : ''}` });
   const anchorTitle = h('p', { class: 'anchor-title', id: 'anchor-title' });
-  const anchorQuote = h('blockquote', { class: 'anchor-quote', tabindex: '0', 'aria-labelledby': 'anchor-title' });
+  const anchorQuote = h('blockquote', { class: 'anchor-quote', dir: 'auto', tabindex: '0', 'aria-labelledby': 'anchor-title' });
   const reset = h('button', { type: 'button', text: 'Whole file instead' });
   const regionButton = data.kind === 'pdf' ? h('button', { type: 'button', 'aria-pressed': 'false', text: 'Mark region' }) : null;
   const comment = h('textarea', { id: 'comment', rows: '4', maxlength: String(data.max_comment_chars || 4000), 'aria-describedby': 'count' });
@@ -747,8 +795,8 @@ function buildPanel(aside, data, hooks) {
     const head = h('div', { class: 'row-head' }, h('span', { class: 'badge', 'data-status': row.status, text: statusLabel(row) }),
       current ? null : h('span', { class: 'file', text: `in ${row.file}` }));
     li.append(head, h('p', { class: 'row-anchor', text: t }));
-    if (quote) li.append(h('blockquote', { text: quote }));
-    const body = h('p', { class: 'row-body', text: row.body });
+    if (quote) li.append(h('blockquote', { dir: 'auto', text: quote }));
+    const body = h('p', { class: 'row-body', dir: 'auto', text: row.body });
     li.append(body);
     if (['open', 'submitted', 'edited'].includes(row.status)) {
       const editButton = h('button', { type: 'button', text: 'Edit', 'aria-label': 'Edit this annotation', disabled: busy.has(row.annotation_id) });
@@ -968,7 +1016,11 @@ async function start() {
   let canvas = { setRegions() {}, regionMode() {} };
   let lastRows = [];
   const highlighter = root ? makeHighlighter(root, model, (id) => panel && panel.focusRow(id)) : null;
-  const choose = (anchor) => { if (panel) panel.setAnchor(anchor); };
+  const choose = (anchor, fromKeyboard) => {
+    if (!panel) return;
+    panel.setAnchor(anchor);
+    if (fromKeyboard) panel.focusComment();
+  };
   const hooks = {
     rows(rows) {
       lastRows = rows;

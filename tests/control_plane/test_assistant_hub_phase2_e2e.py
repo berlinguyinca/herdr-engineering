@@ -180,8 +180,11 @@ def test_phase2_flow_vetoes_evidence_proposal_gate_grant_revoke(acknowledged_sin
         for i in range(5):
             tool(w, wk, "report", {"kind": "outcome", "text": f"approved {PUSH} {i}", "session_id": f"r{i}"})
 
+        # Ask every request BEFORE approving any: an approved request is spent by the worker's next identical ask.
+        asked = {s: ask_action(w, wk, PUSH, session=s, task=t)[0] for s, t in (("s1", "t1"), ("s2", "t2"), ("s3", "t1"))}
+
         def approve(session, task):
-            res, _ = ask_action(w, wk, PUSH, session=session, task=task)
+            res = asked[session]
             assert res["outcome"] == "pending" and res["source"] == "owner" and res["grant_id"] is None
             status, out = owner(w, "POST", f"/api/v1/assistant-action-requests/{res['request_id']}/decision",
                                 {"approve": True})
@@ -200,7 +203,10 @@ def test_phase2_flow_vetoes_evidence_proposal_gate_grant_revoke(acknowledged_sin
         evidence = [e for e in w.svc.store.action_evidence.values() if e.key_id == proposed["key_id"]]
         assert {e.provenance for e in evidence} == {"owner_api"} and len(evidence) == 3
 
-        # still nothing is authorized: a proposal is not a grant
+        # a proposal is not a grant: only the three one-shot approvals authorize, once each, then it is pending again
+        for n in range(3):
+            spent, _ = ask_action(w, wk, PUSH, session=f"o{n}", task="t3")
+            assert (spent["outcome"], spent["source"], spent["grant_id"]) == ("authorized", "owner", None)
         again, _ = ask_action(w, wk, PUSH, session="s4", task="t3")
         assert again["outcome"] == "pending"
         # the worker sees the proposal (state only)

@@ -231,9 +231,9 @@ GATE_RELOAD = 30.0                  # the worker-local retraction gate is reload
 LINEAGE_QUEUE_MAX = 1000            # versions waiting for lineage emission; the oldest is dropped beyond this
 
 _RESULT_KEYS = ("version_id", "version_number", "head_version_id", "merged_names", "conflicts", "reason", "resolved",
-                "skipped", "artifact_id", "share_id", "audience", "secret_result", "summary", "events")
+                "skipped", "artifact_id", "share_id", "audience", "secret_result", "summary", "events", "message")
 MAX_RESOLVED = 50                       # annotation_resolve: ids resolved / skipped in one outcome
-_STR_KEYS = ("reason", "version_id", "head_version_id", "attempt_id", "artifact_id", "share_id", "audience")
+_STR_KEYS = ("reason", "message", "version_id", "head_version_id", "attempt_id", "artifact_id", "share_id", "audience")
 MAX_SHARE_EVENTS = 50                   # member.share_events: rows in one outcome
 _OUTCOME = re.compile(r"[a-z_]{1,32}\Z")
 _INTENT_FILE = re.compile(TICKET_RE[:-2] + r"\.json\Z")

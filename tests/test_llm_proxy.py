@@ -247,12 +247,14 @@ def _gpu_model(**changes):
             "slots": 1, "ctx_per_request": 8192, "x_modality": "text", **changes}
 
 
-def _policy_setup(catalog=None, gpu_status=200, catalog_status=200):
+def _policy_setup(catalog=None, gpu_status=200, catalog_status=200, **custom_changes):
     repo, key, proxy, seen, cpu, srvs = _setup()
     state = proxy.RequestHandlerClass.state
     custom = {"name": "summary", "base_url": f"http://127.0.0.1:{srvs[1].server_address[1]}",
               "upstream_model": "cpu-small", "fabric_model": "qwen-small",
-              "context_window": 8192, "project": "proj-a"}
+              "context_window": 8192, "project": "proj-a", **custom_changes}
+    custom = {k: v for k, v in custom.items() if v is not None}
+    statuses = list(gpu_status) if isinstance(gpu_status, list) else None
     original_config = state.control.config
     state.control.config = lambda: {**original_config(), "custom_models": [custom]}
     state.refresh(force=True)
@@ -267,14 +269,15 @@ def _policy_setup(catalog=None, gpu_status=200, catalog_status=200):
         self.wfile.write(json.dumps({"data": catalog if catalog is not None else [_gpu_model()]}).encode())
 
     def post(self):
-        if gpu_status == 200:
+        code = (statuses.pop(0) if statuses else 200) if statuses is not None else gpu_status
+        if code == 200:
             return original_post(self)
         self.rfile.read(int(self.headers["Content-Length"]))
-        seen.append({"status": gpu_status})
-        if gpu_status == -1:
+        seen.append({"status": code})
+        if code == -1:
             self.close_connection = True
             return
-        self.send_response(gpu_status)
+        self.send_response(code)
         self.end_headers()
         self.wfile.write(b'{"error":"capacity"}')
 
@@ -322,6 +325,56 @@ def test_ineligible_fabric_catalog_falls_back_only_to_registered_cpu(catalog):
         assert gpu == [] and cpu[0]["body"]["model"] == "cpu-small"
         assert cpu[0]["auth"] is None
         assert "x-herdr-require-registered-model" not in cpu[0]["headers"]
+    finally:
+        _teardown(proxy, srvs)
+
+
+def _qwen(**changes):
+    return {"id": "qwen3.8-flash_next", "aliases": [], "x_state": "hot", "slots": 4, "ctx_per_request": 262144,
+            "x_modality": "text", **changes}
+
+
+FALLBACK = {"fallback_models": ["qwen3.8-*"]}
+
+
+def test_unadvertised_model_falls_back_to_a_gateway_qwen_before_any_cpu_service():
+    _, key, proxy, gpu, cpu, srvs, _ = _policy_setup([_qwen(), _qwen(id="qwen3.8-27b", slots=1), _gpu_model(id="other", aliases=[])], **FALLBACK)
+    try:
+        status, headers, _ = _summary_post(proxy, key)
+        assert status == 200 and headers["X-Herdr-LLM-Route"] == "fallback"
+        assert gpu[0]["body"]["model"] == "qwen3.8-flash_next" and gpu[0]["auth"] == "Bearer UPSTREAM-SECRET"
+        assert cpu == []
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_capacity_failure_of_the_advertised_model_retries_once_on_a_gateway_qwen():
+    _, key, proxy, gpu, cpu, srvs, _ = _policy_setup([_gpu_model(), _qwen()], gpu_status=[503, 200], **FALLBACK)
+    try:
+        status, headers, _ = _summary_post(proxy, key)
+        assert status == 200 and headers["X-Herdr-LLM-Route"] == "fallback"
+        assert [g.get("status") or g["body"]["model"] for g in gpu] == [503, "qwen3.8-flash_next"]
+        assert cpu == []
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_advertised_model_wins_when_it_is_ready_even_with_a_fallback_configured():
+    _, key, proxy, gpu, cpu, srvs, _ = _policy_setup([_gpu_model(), _qwen()], **FALLBACK)
+    try:
+        status, headers, _ = _summary_post(proxy, key)
+        assert headers["X-Herdr-LLM-Route"] == "fabric" and gpu[0]["body"]["model"] == "gpu/qwen-small"
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_no_cpu_service_and_no_ready_fallback_returns_the_gateway_answer_unchanged():
+    _, key, proxy, gpu, cpu, srvs, _ = _policy_setup([_gpu_model(), _qwen(x_state="cold")], gpu_status=503,
+                                                      base_url=None, **FALLBACK)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as err:
+            _summary_post(proxy, key)
+        assert err.value.code == 503 and cpu == []
     finally:
         _teardown(proxy, srvs)
 

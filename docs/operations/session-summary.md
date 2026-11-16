@@ -21,7 +21,9 @@ herdr-eng summary install --scope project    # current repository only
 herdr-eng summary install --dry-run          # show what would change
 ```
 
-Rerun it to upgrade. Global layout:
+`herdr-eng summary install` also installs the sibling `/handoff` skill (see
+`handoff.md`); pass `--skill summary` to manage only this one (`--skill handoff|all` also exist on
+`uninstall` and `verify`). Rerun it to upgrade. Global layout:
 
 | What | Where |
 | --- | --- |
@@ -67,6 +69,22 @@ herdr-eng summary verify --json
 `# Session summary` and end with *Evidence coverage*.
 
 Tests: `pytest tests/test_session_summary.py tests/test_session_history.py`.
+
+## After publishing: digest, pane reuse, focus
+
+`herdr-eng summary publish` prints JSON. Besides the one-line `message` it now carries a `digest`
+(overall status line, the first lines of the report, `Report file: <absolute path>` and
+`Dashboard: ...`), and the skill shows both, so the result is visible without opening the pane.
+
+The report pane is no longer closed and re-split on every publish. While the viewer from an earlier
+publish is still running (its pid is in `<report>.viewer.pid`, checked against `/proc/<pid>/cmdline`),
+the publisher rewrites the report, sends the viewer `SIGWINCH` (it re-reads the file on redraw) and
+returns `{"pane": {"ok": true, "pane_id": ..., "reused": true}}`. If the viewer was quit, or a graph
+pane appeared or went away (the peers' ids would be stale), the old pair is closed and a new pair is
+opened as before. A new pane is split with `--focus`; a reused one is focused with
+`herdr pane focus --pane $HERDR_PANE_ID --direction right`, so the reader lands on the report.
+Tests: `tests/test_summary_report_herdr.py` runs a real isolated herdr server and viewer process
+(skipped when `herdr` is not installed).
 
 ## What it reads, and its limits
 
@@ -187,8 +205,10 @@ It publishes the report and prints one line:
   A total line closes the graph and the drift marker carries the cost of everything after the topic change. A figure
   that was not recorded is left out, never shown as 0 or estimated; child-agent usage in separate records is not
   counted and the total says "main session only". A valid graph is saved beside the report as `<report>.graph.json` (0600) and drawn in a second pane
-  split below the summary (`herdr-eng summary graph FILE --close-pane ID --peer ID`): boxes joined by arrows in a
-  row when they fit, a column when they do not, a numbered list below 30 columns, ASCII when the terminal is not
+  split below the summary (`herdr-eng summary graph FILE --close-pane ID --peer ID`): boxes joined by arrows, routed to fill the
+  pane: one row when they fit, otherwise balanced rows of boxes with an elbow connector from the end of each row
+  to the start of the next (the arrangement with the fewest lines wins, wider labels on a tie), a single column
+  only when no row of two boxes fits, a numbered list below 30 columns, ASCII when the terminal is not
   UTF-8. The marker `◆ Looks like a new task from prompt N` is a judgement, not a fact. The graph reflows on
   resize and has the same scroll keys. The result of `publish` carries `graph` (`ok`, `pane_id`, `error`,
   `skipped`); a failure there never affects the summary. The two viewers are peers: closing either closes both, and

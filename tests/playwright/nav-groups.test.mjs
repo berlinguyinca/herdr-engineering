@@ -31,6 +31,7 @@ test('the sidebar is grouped, merged pages share one link with tabs, and the cur
     assert.equal(await page.locator('#subnav a[aria-current=page]').count(), 1);
     assert.equal(await page.locator('#subnav a[aria-current=page]').textContent(), 'Boards');
 
+    await page.route('**/api/v1/health*', (route) => route.fulfill({ json: { status: 'ok', capabilities: ['collab_v1'] } }));
     await page.goto(`${base}/#/collab`);                  // a page with no tabs shows no tab strip
     await page.locator('herdr-app-shell a.hd-shell__link.active').waitFor({ timeout: 10000 });
     assert.equal(await page.locator('#subnav:not([hidden])').count(), 0);
@@ -49,7 +50,7 @@ test('with every optional capability advertised the sidebar still fits, and Depl
     for (const optional of ['Assistant', 'Architecture', 'Project intelligence']) {
       assert.ok(labels.some((l) => l.startsWith(optional)), `${optional} is listed: ${labels.join(', ')}`);
     }
-    assert.ok(labels.length <= 14, `sidebar has ${labels.length} links with every capability: ${labels.join(', ')}`);
+    assert.ok(labels.length <= 15, `sidebar has ${labels.length} links with every capability: ${labels.join(', ')}`);
     assert.ok(!labels.some((l) => l.startsWith('Deployments')), 'Deployments is a tab, not a sidebar link');
 
     await page.goto(`${base}/#/deployments`);

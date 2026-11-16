@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Delete dead Woodpecker agent registrations.
+
+Dead means a system agent (owner_id=-1) that either never contacted the server
+and is older than --never-contacted-secs (default 1h), or has had no contact
+and no work for --stale-secs (default 24h). An agent that any pending or
+running workflow in the queue references is never touched, and the server
+itself refuses to delete an agent with a running task. Dry run unless --apply.
+Guard: if no system agent has contacted the server in --recent-contact-mins
+(default 60; the server just came back, or it is a quiet night) nothing is
+deleted and the run exits 0 with a NOTICE on stderr. At most --max-deletions
+(default 50) are deleted per run; the rest wait for the next run.
+Exit codes: 0 ok or guarded skip, 1 API error, 2 token file missing or not
+0600, 64 bad arguments. Missing owner/org fields make an agent ineligible.
+The API token is read from a file and is never printed.
+"""
+import argparse
+import json
+import stat
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+PAGE = 50
+
+
+def call(server, token, method, path):
+    req = urllib.request.Request(server.rstrip("/") + path, method=method,
+                                 headers={"Authorization": "Bearer " + token})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read()
+    return json.loads(body) if body.strip() else None
+
+
+def list_agents(server, token):
+    """Page until an empty page, or a page with nothing new (server ignoring page)."""
+    agents, seen, page = [], set(), 1
+    while True:
+        rows = call(server, token, "GET", f"/api/agents?perPage={PAGE}&page={page}") or []
+        if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+            raise ValueError("agents response is not a list of objects")
+        new = [r for r in rows if r.get("id") not in seen]
+        if not new:
+            return agents
+        seen.update(r.get("id") for r in new)
+        agents += new
+        page += 1
+
+
+def busy_ids(server, token):
+    queue = call(server, token, "GET", "/api/queue/info")
+    if not isinstance(queue, dict):
+        raise ValueError("queue info is not an object")
+    tasks = []
+    for key in ("pending", "running", "waiting_on_deps"):
+        section = queue.get(key) or []
+        if not isinstance(section, list):
+            raise ValueError(f"queue {key} is not a list")
+        tasks += section
+    ids = set()
+    for t in tasks:
+        agent_id = t.get("agent_id", 0) if isinstance(t, dict) else None
+        if isinstance(agent_id, bool) or not isinstance(agent_id, int):
+            raise ValueError("queue task has a missing or non-integer agent_id")
+        if agent_id > 0:
+            ids.add(agent_id)
+    return ids
+
+
+def verdict(agent, now, busy, never_secs, stale_secs):
+    """Return a delete reason, or None to keep the agent. Fails safe on missing fields."""
+    if agent.get("id") in busy:
+        return None
+    if agent.get("owner_id") != -1 or agent.get("org_id") != -1:
+        return None
+    last_contact, created = agent.get("last_contact"), agent.get("created")
+    if not isinstance(last_contact, (int, float)) or not isinstance(created, (int, float)):
+        return None
+    if last_contact == 0:
+        return "never-contacted" if now - created > never_secs else None
+    newest = max(last_contact, agent.get("last_work") or 0)
+    return "stale" if now - newest > stale_secs else None
+
+
+def is_system(agent):
+    return agent.get("owner_id") == -1 and agent.get("org_id") == -1
+
+
+def skip(msg):
+    print("NOTICE: " + msg + "; nothing deleted", file=sys.stderr)
+    return 0
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        sys.exit(64)
+
+
+def main(argv):
+    ap = Parser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--server", default="https://ci.metabolomics.us")
+    ap.add_argument("--token-file", default=str(Path.home() / ".config/woodpecker/token"))
+    ap.add_argument("--never-contacted-secs", type=int, default=3600)
+    ap.add_argument("--stale-secs", type=int, default=86400)
+    ap.add_argument("--max-deletions", type=int, default=50)
+    ap.add_argument("--recent-contact-mins", type=int, default=60)
+    ap.add_argument("--apply", action="store_true")
+    args = ap.parse_args(argv)
+    if args.max_deletions < 0:
+        ap.error("--max-deletions must be >= 0")
+    if args.recent_contact_mins <= 0:
+        ap.error("--recent-contact-mins must be > 0")
+    token_path = Path(args.token_file)
+    try:
+        mode = token_path.stat().st_mode
+        if mode & (stat.S_IRWXG | stat.S_IRWXO):
+            print(f"refusing: {token_path} must be mode 0600 (chmod 600 it)", file=sys.stderr)
+            return 2
+        token = token_path.read_text().strip()
+    except OSError as exc:
+        print(f"cannot read token file {token_path}: {exc.strerror}", file=sys.stderr)
+        return 2
+    try:
+        return run(args, token)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"abort: API error ({type(exc).__name__}: {exc}); run stopped", file=sys.stderr)
+        return 1
+
+
+def run(args, token):
+    now = time.time()
+    agents = list_agents(args.server, token)
+    busy = busy_ids(args.server, token)
+    if not agents:
+        return skip("server returned no agents")
+    system = [a for a in agents if is_system(a)]
+    cands = []
+    for a in sorted(agents, key=lambda a: a.get("id", 0)):
+        reason = verdict(a, now, busy, args.never_contacted_secs, args.stale_secs)
+        if reason:
+            cands.append((a, reason))
+    if cands:
+        horizon = now - args.recent_contact_mins * 60
+        if not any((a.get("last_contact") or 0) > horizon for a in system):
+            return skip(f"no agent has contacted the server in the last {args.recent_contact_mins} minutes")
+    removed = skipped = 0
+    kept = len(agents) - len(cands)
+    for agent, reason in cands[:args.max_deletions]:
+        label = f"agent_id={agent['id']} name={agent.get('name') or '-'} reason={reason}"
+        if not args.apply:
+            print("would-remove " + label)
+            removed += 1
+            continue
+        # Fresh queue check right before each delete.
+        if agent["id"] in busy_ids(args.server, token):
+            kept += 1
+            continue
+        try:
+            call(args.server, token, "DELETE", f"/api/agents/{agent['id']}")
+        except urllib.error.HTTPError as exc:
+            if exc.code != 409:
+                raise
+            print("skipped (409 conflict) " + label)
+            skipped += 1
+            continue
+        print("removed " + label)
+        removed += 1
+    deferred = max(len(cands) - args.max_deletions, 0)
+    print(f"summary scanned={len(agents)} removed={removed} skipped={skipped} kept={kept} "
+          f"deferred={deferred} mode={'apply' if args.apply else 'dry-run'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

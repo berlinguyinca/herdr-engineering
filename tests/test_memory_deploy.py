@@ -344,7 +344,7 @@ rc=0; memory_phase || rc=$?; echo rc=$rc''')
 def test_deploy_sh_wiring_is_opt_in_and_after_the_control_plane_receipt():
     text = DEPLOY.read_text()
     assert "--with-memory) MEMORY=1" in text and "MEMORY=0" in text
-    assert text.index("python3 \"$STATE_HELPER\" outcome \"$ATTEMPT\" succeeded") < text.index("memory_phase || exit 4")
+    assert text.index("\"$PY\" \"$STATE_HELPER\" outcome \"$ATTEMPT\" succeeded") < text.index("memory_phase || exit 4")
     assert "memory_preflight || exit 1" in text
     # the control plane's own compose up never names a memory service; the memory step always passes the profile
     assert "hindsight" not in text.split("memory_phase || exit 4")[0].split("compose_up()")[1].split("healthy_commit")[0]

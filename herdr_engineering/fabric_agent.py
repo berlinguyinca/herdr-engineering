@@ -799,6 +799,9 @@ class AgentConfig:
     # services to, so every dev:<port> lease shows up on the fleet Services
     # page with a clickable route. Empty = reporting disabled.
     control_plane_url: str = ""
+    # ``ingest.api_key`` from the host config, sent as ``X-API-Key`` on ingest
+    # POSTs. Empty = send no key (an open control plane).
+    api_key: str = ""
     # Fleet domains (local.metabolomics.us, legacy dev.lan): a Host that is one of them or a subdomain is the
     # fabric's, so an app behind the forwarder sees 127.0.0.1 and its own rebinding guard accepts the request.
     fabric_domains: tuple[str, ...] = ()
@@ -1277,6 +1280,12 @@ class FabricAgent:
                 self._cp_unavailable.pop(label, None)
                 self._cp_last_report.pop(label, None)
 
+    def _ingest_headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.cfg.api_key:
+            headers["X-API-Key"] = self.cfg.api_key
+        return headers
+
     def _report_service(self, entry: dict[str, Any], status: str,
                         *, heartbeat: bool = False, timeout: float = 2.0) -> bool:
         """Best-effort report of a discovered service to the control plane.
@@ -1317,8 +1326,7 @@ class FabricAgent:
         url = f"{self.cfg.control_plane_url.rstrip('/')}/api/v1/ingest"
         try:
             req = urllib.request.Request(
-                url, data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"})
+                url, data=json.dumps(body).encode(), headers=self._ingest_headers())
             with urllib.request.urlopen(req, timeout=timeout):
                 pass
             return True
@@ -1349,7 +1357,7 @@ class FabricAgent:
             url = f"{self.cfg.control_plane_url.rstrip('/')}/api/v1/ingest"
             req = urllib.request.Request(
                 url, data=json.dumps(body, default=str).encode(),
-                headers={"Content-Type": "application/json"})
+                headers=self._ingest_headers())
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return int(resp.status)
         except urllib.error.HTTPError as exc:
@@ -1458,10 +1466,13 @@ class FabricAgent:
 
     # -- run loop ---------------------------------------------------------
 
-    def retarget(self, client: Any, control_plane_url: str) -> None:
-        """Swap the gateway client / control-plane URL used from the next pass."""
+    def retarget(self, client: Any, control_plane_url: str,
+                 api_key: str | None = None) -> None:
+        """Swap the gateway client / control-plane URL (and ingest key, when
+        given; ``None`` keeps the current one) used from the next pass."""
         self._client = client
-        self.cfg = replace(self.cfg, control_plane_url=control_plane_url)
+        self.cfg = replace(self.cfg, control_plane_url=control_plane_url,
+                           api_key=self.cfg.api_key if api_key is None else api_key)
         # Live forwarders rewrite a Host naming the control-plane host (#117); a
         # fleet-config refresh that moves it must reach them too, not only the
         # forwarders created after it.

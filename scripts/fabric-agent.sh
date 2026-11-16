@@ -65,6 +65,8 @@ step "2/4 installing systemd user unit -> $UNIT_DST"
 mkdir -p "$UNIT_DIR"
 # Replace the __HERDR_ENG__ placeholder with the resolved binary path.
 sed "s|__HERDR_ENG__|$HERDR_ENG|g" "$UNIT_SRC" > "$UNIT_DST"
+# Follow the release this script runs from (the drop-in was hand-pinned and went stale).
+bash "$REPO_ROOT/scripts/fabric-agent-pin.sh" "$UNIT_DST.d"
 systemctl --user daemon-reload
 echo "  installed herdr-eng-fabric-agent.service"
 

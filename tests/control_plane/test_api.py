@@ -473,17 +473,17 @@ def test_default_native_dispatch_checks_conversation_before_prompt(monkeypatch):
             calls.append(args)
             if args[-2:] == ["api", "snapshot"]:
                 return json.dumps({"ok": True, "result": {"snapshot": {"agents": [{
-                    "agent": "pi", "terminal_id": "term-1", "agent_session": conversation,
+                    "agent": "pi", "terminal_id": "term-1", "pane_id": "w1:p1", "agent_session": conversation,
                     "agent_status": "idle", "interactive_ready": True,
                 }]}}})
-            return '{"ok": true, "result": {"submitted": true}}'
+            return json.dumps({"result":{"type":"agent_prompted","agent":{"terminal_id":"term-1","pane_id":"w1:p1","agent_session":conversation}}})
     adapter = NativeHerdrAdapter(runner=Runner())
     monkeypatch.setattr("herdr_engineering.herdr_adapter.NativeHerdrAdapter", lambda: adapter)
     record = {"host_id": "beast", "machine": "machine-beast", "herdr_session": "eng",
               "terminal_id": "term-1", "agent_session": dict(conversation)}
     receipt = ControlPlaneServer._dispatch_native_message(None, record, "literal hello", [])
     assert receipt["status"] == "delivered"
-    assert calls[-1] == ["--machine", "machine-beast", "--session", "eng", "agent", "prompt", "--", "term-1", "literal hello"]
+    assert calls[-1] == ["--machine", "machine-beast", "--session", "eng", "agent", "prompt", "w1:p1", "literal hello"]
     record["agent_session"] = {**conversation, "value": "/tmp/different-session.jsonl"}
     from herdr_engineering.errors import InvalidError
     with pytest.raises(InvalidError, match="identity changed"):
@@ -541,6 +541,79 @@ def test_services_archive_filter_is_optional_and_detail_history_remains(server):
     _, _, body = c.get('/api/v1/services?host_id=other')
     data = json.loads(body)
     assert data['services'] == [] and data['summary']['total'] == 0  # summary follows the filter
+
+
+def test_services_list_is_paged_with_default_cap_and_next_offset(server):
+    c, repo = server
+    for port in range(8000, 8007):
+        repo.register_service(f'svc{port}', 'host', port, status='healthy')
+    # No parameters: the capped default page, with an explicit marker.
+    _, _, body = c.get('/api/v1/services')
+    data = json.loads(body)
+    assert len(data['services']) == 7
+    assert data['pagination'] == {'total': 7, 'limit': 500, 'offset': 0,
+                                  'next_offset': None, 'truncated': False}
+    # Explicit paging walks the whole inventory exactly once, summary spans all.
+    seen, offset = [], 0
+    while offset is not None:
+        _, _, body = c.get(f'/api/v1/services?limit=3&offset={offset}')
+        data = json.loads(body)
+        assert data['summary']['total'] == 7
+        assert len(data['services']) <= 3
+        seen += [s['service_id'] for s in data['services']]
+        offset = data['pagination']['next_offset']
+    assert len(seen) == 7 and len(set(seen)) == 7
+    _, _, body = c.get('/api/v1/services?limit=3')
+    page = json.loads(body)['pagination']
+    assert page == {'total': 7, 'limit': 3, 'offset': 0, 'next_offset': 3, 'truncated': True}
+    # Feed projection pages the same way.
+    _, _, body = c.get('/api/v1/services?host_id=host&fields=feed&limit=2&offset=6')
+    data = json.loads(body)
+    assert len(data['services']) == 1 and data['pagination']['next_offset'] is None
+    for bad in ('limit=0', 'limit=abc', 'limit=100000', 'offset=-1', 'offset=x'):
+        assert c.get(f'/api/v1/services?{bad}')[0] == 400
+
+
+def test_services_page_order_is_stable_with_an_id_tiebreaker(server):
+    c, repo = server
+    repo._stamp = lambda: '2026-01-01T00:00:00+00:00'  # identical created_at for every row
+    for port in range(9000, 9006):
+        repo.register_service(f'tie{port}', 'host', port, status='healthy')
+    ids = [s['service_id'] for s in json.loads(c.get('/api/v1/services')[2])['services']]
+    assert ids == sorted(ids, reverse=True)
+    paged = []
+    for offset in range(0, 6, 2):
+        paged += [s['service_id'] for s in
+                  json.loads(c.get(f'/api/v1/services?limit=2&offset={offset}')[2])['services']]
+    assert paged == ids
+
+
+def test_services_offset_beyond_total_is_an_empty_final_page(server):
+    c, repo = server
+    for port in range(9100, 9103):
+        repo.register_service(f'svc{port}', 'host', port, status='healthy')
+    data = json.loads(c.get('/api/v1/services?limit=2&offset=50')[2])
+    assert data['services'] == []
+    assert data['pagination'] == {'total': 3, 'limit': 2, 'offset': 50,
+                                  'next_offset': None, 'truncated': False}
+
+
+def test_services_paging_combines_with_filters(server):
+    c, repo = server
+    clock = [1_800_000_000]
+    repo._now = lambda: clock[0]
+    repo.register_service('old', 'hostA', 9200, status='unavailable')
+    clock[0] += 8 * 86400
+    for port in range(9201, 9206):
+        repo.register_service(f'a{port}', 'hostA', port, status='healthy')
+    repo.register_service('b', 'hostB', 9300, status='healthy')
+    seen, offset = [], 0
+    while offset is not None:
+        data = json.loads(c.get(f'/api/v1/services?host_id=hostA&include_archived=false&limit=2&offset={offset}')[2])
+        assert data['pagination']['total'] == 5 and data['summary']['total'] == 6
+        seen += [s['service_name'] for s in data['services']]
+        offset = data['pagination']['next_offset']
+    assert sorted(seen) == [f'a{p}' for p in range(9201, 9206)]
 
 
 def test_retire_endpoint_is_a_dry_run_unless_told_otherwise(server):

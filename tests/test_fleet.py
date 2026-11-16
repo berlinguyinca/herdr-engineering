@@ -1,5 +1,7 @@
 """Tests for the one-command fleet onboarding (herdr_engineering/fleet.py)."""
 import hashlib
+import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -559,3 +561,51 @@ def test_fleet_status_reports_summary_skill_state_without_gating(tmp_path, monke
         host = fleet.fleet_status()['hosts'][0]
         assert host['summary'] == expected
         assert host['build_gate'] == 'b' * 32 and host['pi_path'] == '/p'
+
+
+def _repo_with_handoff_installer(tmp_path, body):
+    (tmp_path / 'scripts').mkdir()
+    (tmp_path / 'scripts/install-handoff.sh').write_text(body)
+    return tmp_path
+
+
+def test_a_failed_handoff_refresh_is_a_warning_not_a_fleet_outage(tmp_path):
+    # herdr-handoff is a required dependency pinned in lock/upstreams.yaml; a controller update that
+    # only reinstalls herdr-eng leaves the handoff CLI on whatever revision was cloned at install time.
+    # A host with a stale handoff still syncs: blocking the fleet on it would trade a reportable gap
+    # for an outage.  Runs a real installer script that fails.
+    root = _repo_with_handoff_installer(tmp_path, 'echo "cannot fetch the pinned revision" >&2\nexit 1\n')
+    report = {'steps': {}}
+    fleet._refresh_controller_handoff(root, report)
+    assert report['steps']['controller_handoff_refresh']['ok'] is False
+    assert report['steps']['controller_handoff_refresh']['rc'] == 1
+    assert 'cannot fetch' in report['steps']['controller_handoff_refresh']['stderr']
+    assert any('herdr-handoff' in warning for warning in report['warnings'])
+    assert 'error' not in report
+
+
+def test_the_handoff_refresh_names_the_interpreter_it_installs_into(tmp_path):
+    # Without HERDR_HANDOFF_PYTHON the installer falls back to whatever `python3` means in the caller's
+    # environment, installing the CLI into an interpreter nobody chose while reporting the refresh as done.
+    seen = tmp_path / 'seen'
+    root = _repo_with_handoff_installer(tmp_path, f'printf %s "$HERDR_HANDOFF_PYTHON" > {seen}\n')
+    report = {'steps': {}}
+    fleet._refresh_controller_handoff(root, report)
+    assert seen.read_text() == sys.executable
+    step = report['steps']['controller_handoff_refresh']
+    assert step['ok'] is True and step['env']['HERDR_HANDOFF_PYTHON'] == sys.executable
+    assert 'warnings' not in report
+
+
+def test_no_handoff_installer_means_no_handoff_step(tmp_path):
+    report = {'steps': {}}
+    fleet._refresh_controller_handoff(tmp_path, report)
+    assert report == {'steps': {}}
+
+
+def test_env_included_in_the_environment_extends_it(tmp_path):
+    # A caller that pins one variable must not strip PATH out from under the command it runs.
+    from herdr_engineering.fleet import _run
+    rc, out, err = _run(['sh', '-c', 'printf %s "$PATH"'], env={'HERDR_HANDOFF_PYTHON': 'x'})
+    assert rc == 0, err
+    assert out == os.environ['PATH']

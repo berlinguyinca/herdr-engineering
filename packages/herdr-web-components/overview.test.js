@@ -133,10 +133,10 @@ test('attention uses recency within severity and actionability and retains faile
 
 test('overview preferences discard unknown and fixed cards and restore omitted cards safely', () => {
   assert.deepEqual(overview.sanitizeOverviewPreferences({order:['ci','ci','attention','bogus','health'],hidden:['ci','attention','health','bogus']}),{
-    order:['ci','sessions','missions','fleet','reviews','services','hosts','activity'],hidden:['ci'],
+    order:['ci','week','sessions','missions','fleet','reviews','services','hosts','activity'],hidden:['ci'],
   });
   for(const value of [null,42,'bad',[],{order:'ci',hidden:{ci:true}}]) {
-    assert.deepEqual(overview.sanitizeOverviewPreferences(value),{order:['sessions','missions','fleet','ci','reviews','services','hosts','activity'],hidden:[]});
+    assert.deepEqual(overview.sanitizeOverviewPreferences(value),{order:['week','sessions','missions','fleet','ci','reviews','services','hosts','activity'],hidden:[]});
   }
 });
 

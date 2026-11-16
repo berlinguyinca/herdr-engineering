@@ -54,7 +54,7 @@ test('report reader uses versioned metadata and fetches preview/evidence only on
     assert.match(await preview.getAttribute('style'), /contain:\s*paint/);
     await preview.getByRole('heading', { name: 'Findings', exact: true }).click();
     assert.equal(page.url(), `${base}/#/artifacts/report_1`);
-    await page.getByText('Scripts, frames and embedded media are not shown in this static copy', { exact: true }).waitFor();
+    await page.getByText('Scripts, frames, audio and video are not shown in this static copy', { exact: true }).waitFor();
     assert.equal(requests.filter(r => r.url.endsWith('/versions/version_2/preview/render')).length, 1);
     assert.equal(requests.filter(r => r.url.endsWith('/versions/version_2/preview')).length, 0);
     assert.equal(requests.filter(r => /\/assets\//.test(r.url)).length, 0);

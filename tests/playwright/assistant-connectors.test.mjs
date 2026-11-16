@@ -32,7 +32,7 @@ async function withPage(scenario, fn, { width = 1100, path = '/', colorScheme = 
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   let browser;
   try {
-    const fallback = '/home/wohlgemuth/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
+    const fallback = (process.env.HOME+'/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome');
     browser = await chromium.launch({ headless: true, args: ['--no-sandbox'], executablePath: existsSync(fallback) ? fallback : undefined });
     const ctx = await browser.newContext({ viewport: { width, height: 900 }, colorScheme });
     const page = await ctx.newPage();
