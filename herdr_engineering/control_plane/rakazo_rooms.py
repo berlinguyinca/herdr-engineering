@@ -146,10 +146,11 @@ class Rooms:
         return bot
 
     def agent_bots(self, ctx) -> list[dict[str, Any]]:
+        """Owned agents that are online now. Stale/offline ones stay reachable by id (``find_agent``), never listed."""
         pr = self.principal(ctx, required=False)
         if pr is None or ctx.space != sp.DEFAULT_SPACE_ID:
             return []
-        return [self.agent_bot(ctx, a) for a in self.my_agents(ctx, pr)]
+        return [self.agent_bot(ctx, a) for a in self.my_agents(ctx, pr) if a.get("online")]
 
     def find_agent(self, ctx, bot_id: Any) -> dict[str, Any] | None:
         pr = self.principal(ctx, required=False)
