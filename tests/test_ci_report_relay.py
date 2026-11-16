@@ -358,3 +358,20 @@ def test_main_logs_the_reason_when_the_whole_run_fails(tmp_path, capsys):
     assert code == 1
     assert 'CI report relay: 0 published, 1 failed' in captured.out
     assert 'State directory must be a private owned directory' in captured.err
+
+
+GOOD_NAME = '3062-' + 'a' * 40 + '-hive-slurm.json'
+
+
+@pytest.mark.parametrize('bad', [None, 'oops', 7, {'a': 'b'}, [None], [1], ['xy'], [['only-one']], [[GOOD_NAME, 5]],
+                                 [[5, 'EIO']], [['../etc/passwd', 'EIO']], [[GOOD_NAME, 'bad code!']],
+                                 [[GOOD_NAME, 'EIO', 'extra']]])
+def test_malformed_read_errors_are_dropped_not_raised(bad):
+    from herdr_engineering.ci_report_relay import _read_errors
+    assert _read_errors({'read_errors': bad}) == []
+
+
+def test_well_formed_read_errors_survive_next_to_malformed_rows():
+    from herdr_engineering.ci_report_relay import _read_errors
+    rows = [None, [GOOD_NAME, 'EACCES'], ['junk'], (GOOD_NAME, 'EIO')]
+    assert _read_errors({'read_errors': rows}) == [(GOOD_NAME, 'EACCES'), (GOOD_NAME, 'EIO')]

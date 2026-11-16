@@ -241,10 +241,15 @@ def log_failure(subject, reason):
 
 
 def _read_errors(batch):
+    # Diagnostic-only field from the reader: tolerate any malformed shape (non-list, None or
+    # non-pair rows) by dropping what does not conform, never by raising out of the service loop.
     rows = batch.get('read_errors', [])
-    return [(name, code) for name, code in rows
-            if isinstance(name, str) and BASENAME.fullmatch(name) and isinstance(code, str)
-            and re.fullmatch('[A-Za-z0-9_]{1,32}', code)]
+    if not isinstance(rows, list):
+        return []
+    return [(row[0], row[1]) for row in rows
+            if isinstance(row, (list, tuple)) and len(row) == 2
+            and isinstance(row[0], str) and BASENAME.fullmatch(row[0])
+            and isinstance(row[1], str) and re.fullmatch('[A-Za-z0-9_]{1,32}', row[1])]
 
 
 def _write_private(path, raw):
