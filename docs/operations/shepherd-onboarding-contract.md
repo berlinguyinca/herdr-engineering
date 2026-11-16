@@ -10,7 +10,7 @@ Server side: [shepherd-discovery.md](shepherd-discovery.md). Goal: a phone on th
    - `tailnet: true` and `"tailnet"` in `auth_modes`: call `POST <bridge_url or url>/api/auth/open` with `Origin: rakazo://` (or the configured app origin), empty JSON body. A 200 returns `{token}`: store it in the keychain and go to the home screen. Nothing is shown to the user.
    - `tailnet: true` but no `"tailnet"` in `auth_modes`: the server has not enabled it; show the password sign-in (this is the only screen with typing).
    - `tailnet: false`: show the **Connect Tailscale** screen.
-4. Use `bridge_url` from the response for all later calls when it is non-null (it may differ from the probed URL).
+4. Use `bridge_url` from the response for all later calls when it is non-null (it may differ from the probed URL). It is null when `tailnet` is false: keep using the URL you probed.
 
 ## Connect Tailscale screen (tailnet is false)
 
