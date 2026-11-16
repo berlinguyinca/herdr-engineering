@@ -202,29 +202,6 @@ def _open_owner_origins(value) -> tuple[str, ...]:
     return tuple(value)
 
 
-_TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
-_TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
-
-
-def _open_owner_allowed_sources(value) -> tuple:
-    """``open_owner_allowed_sources``: up to 64 IPs or CIDR ranges. Empty (the default) means no extra restriction."""
-    where = "control_plane.rakazo_bridge.open_owner_allowed_sources"
-    if not isinstance(value, list) or len(value) > 64:
-        raise ValueError(f"{where} must be a list of up to 64 addresses or CIDR ranges")
-    nets = []
-    for i, item in enumerate(value):
-        try:
-            if not isinstance(item, str) or not item.strip():
-                raise ValueError
-            net = ipaddress.ip_network(item.strip(), strict=True)       # host bits set ("100.104.39.6/24") is a typo, not a wider range
-        except ValueError:
-            raise ValueError(f"{where}[{i}] is not an address or CIDR range with no host bits set") from None
-        if net.version == 6 and net.subnet_of(ipaddress.ip_network("::ffff:0:0/96")):
-            raise ValueError(f"{where}[{i}] is an IPv4-mapped IPv6 range: write it as plain IPv4")
-        nets.append(net)
-    return tuple(nets)
-
-
 def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
     """Validate ``control_plane.rakazo_bridge``. Disabled (and unchecked beyond its type) unless ``enabled`` is true;
     when enabled, anything missing or malformed raises ValueError so the control plane refuses to start."""
@@ -233,13 +210,11 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("control_plane.rakazo_bridge must be a mapping")
     if raw.get("enabled") is not True:
-        if "open_owner_allowed_sources" in raw:
-            _open_owner_allowed_sources(raw["open_owner_allowed_sources"])     # a typo is caught before the bridge is switched on
         return {"enabled": False}
     now = time.time() if now is None else now
     unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies",
                                  "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms", "cognito", "push", "default_tools", "open_owner",
-                                 "open_owner_origins", "open_owner_allowed_sources"})
+                                 "open_owner_origins"})
     if unknown:
         raise ValueError(f"control_plane.rakazo_bridge has unknown keys: {', '.join(map(str, unknown))} "
                          "(accounts are listed under accounts: [{email, password_scrypt, role}])")
@@ -312,15 +287,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
     if open_owner and not any(a.role == "operator" for a in accounts):
         raise ValueError("control_plane.rakazo_bridge.open_owner needs an account with role operator to act as")
     open_owner_origins = _open_owner_origins(raw.get("open_owner_origins", ["rakazo://"]))
-    open_owner_allowed = _open_owner_allowed_sources(raw.get("open_owner_allowed_sources", []))
-    if open_owner_allowed and not open_owner:
-        log.warning("rakazo bridge: open_owner_allowed_sources is set but open_owner is off, so it restricts nothing")
-    for net in open_owner_allowed:
-        if not net.subnet_of(_TAILNET_V4 if net.version == 4 else _TAILNET_V6):
-            log.warning("rakazo bridge: open_owner_allowed_sources entry %s is outside the tailnet ranges "
-                        "(100.64.0.0/10, fd7a:115c:a1e0::/48): it admits non-tailnet sources", net)
-    return {"enabled": True, "open_owner": open_owner, "open_owner_origins": open_owner_origins,
-            "open_owner_allowed_sources": open_owner_allowed, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
+    return {"enabled": True, "open_owner": open_owner, "open_owner_origins": open_owner_origins, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
             "trusted_proxies": tuple(nets), "routine_runner_seconds": runner, "hindsight": hindsight,
             "vault_key_file": vault_key_file, "auto_join_rooms": tuple(auto_join), "default_tools": tuple(dict.fromkeys(tools)),
             "cognito": cognito_cfg, "push": _push_config(raw.get("push"))}
@@ -744,10 +711,6 @@ class RakazoBridge:
         self.accounts: list[Account] = list(config["accounts"])
         self.open_owner = bool(config.get("open_owner"))
         self.open_owner_origins: tuple[str, ...] = tuple(config.get("open_owner_origins") or ("rakazo://",))
-        self.open_owner_allowed_sources = tuple(config.get("open_owner_allowed_sources") or ())
-        if self.open_owner and not self.open_owner_allowed_sources:
-            log.warning("rakazo bridge: open_owner is on with no open_owner_allowed_sources: any tailnet node, including a "
-                        "shared-in guest, can open an owner session. List your own devices' tailnet IPs.")
         self._open_lock = threading.Lock()
         self._open_last: dict[str, float] = {}
         self._by_principal = {a.principal_id: a for a in self.accounts}
@@ -1029,9 +992,6 @@ class RakazoBridge:
             raise refuse                                      # a configured proxy that named no client
         if not any(addr in net for net in OPEN_OWNER_NETWORKS):
             log.warning("rakazo bridge: refused an open owner session from %s", ip[:64])
-            raise refuse
-        if self.open_owner_allowed_sources and not any(addr in net for net in self.open_owner_allowed_sources):
-            log.warning("rakazo bridge: refused an open owner session from %s (not in open_owner_allowed_sources)", ip[:64])
             raise refuse
         now = self._monotonic()
         with self._open_lock:

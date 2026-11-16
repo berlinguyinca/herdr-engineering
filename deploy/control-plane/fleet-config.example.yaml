@@ -285,8 +285,6 @@ sections:
       #                                  # address as the control plane sees it goes here so lockout keys on the real client
       #   open_owner_origins: ["rakazo://", "shepherd://"]   # app Origins the passwordless open_owner session accepts
       #                                  # (default ["rakazo://"]; scheme:// or scheme://host, never http/https, max 8)
-      #   open_owner_allowed_sources: ["100.104.39.6", "100.64.12.34"]   # optional: only these IPs/CIDRs (your own devices'
-      #                                  # tailnet IPs) may open the passwordless session; empty/unset = any tailnet address
       #   accounts:                      # shape reserved for a later multi-user mode; today only role: operator
       #     - email: "you@example.com"
       #       password_scrypt: "scrypt$32768$8$1$<salt_b64>$<hash_b64>"

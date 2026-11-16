@@ -253,24 +253,18 @@ class GatewayRouter:
         client, tls = self._terminate_tls(client)
         if client is None:
             return
-        try:
-            real_peer = client.getpeername()[0]
-        except OSError:
-            real_peer = None
-        if real_peer is None:
-            try:
-                client.close()      # fail closed: no peer address, no X-Forwarded-For to set
-            except OSError:
-                pass
-            return
         if tls and not routes:
             external = external or (self.external_for(port) if port is not None else None)
             target = None
             try:
                 target = socket.create_connection((target_host, target_port), timeout=5)
                 from .devfabric import rewriting_pipe
+                try:
+                    peer = client.getpeername()[0]
+                except OSError:
+                    peer = None
                 rewriting_pipe(client, target, target_port, external or rewrite or f"{target_host}:{port}",
-                               tls=True, rewrite_head=external is not None, forwarded_for=real_peer)
+                               tls=True, rewrite_head=external is not None, forwarded_for=peer)
             except OSError:
                 pass
             finally:
@@ -286,7 +280,7 @@ class GatewayRouter:
             try:
                 target = socket.create_connection((target_host, target_port), timeout=5)
                 from .devfabric import rewriting_pipe
-                rewriting_pipe(client, target, target_port, external or rewrite, forwarded_for=real_peer)
+                rewriting_pipe(client, target, target_port, external or rewrite)
             except OSError:
                 pass
             finally:
@@ -298,12 +292,12 @@ class GatewayRouter:
                             pass
             return
         if routes:
-            route_and_pipe(client, routes, target_host, target_port, forwarded_for=real_peer)
+            route_and_pipe(client, routes, target_host, target_port)
             return
         target = None
         try:
             target = socket.create_connection((target_host, target_port), timeout=5)
-            proxy_pair(client, target, forwarded_for=real_peer)
+            proxy_pair(client, target)
         except OSError:
             pass  # target down: drop connection; probe loop will expire the lease
         finally:

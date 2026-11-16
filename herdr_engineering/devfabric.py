@@ -9,10 +9,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
-import re
 import socket
 import threading
-import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -638,8 +636,7 @@ class DevServiceForwarder:
 
 
 def proxy_pair(client: socket.socket, target: socket.socket,
-               inactivity_timeout: float = 30.0, forwarded_for: str | None = None,
-               head_timeout: float = 10.0) -> None:
+               inactivity_timeout: float = 30.0) -> None:
     """Bidirectionally pump bytes between two sockets until either closes.
 
     Protocol-transparent: HTTP/HTTPS/WebSocket/SSE/HMR/generic TCP all flow
@@ -652,14 +649,7 @@ def proxy_pair(client: socket.socket, target: socket.socket,
     after the timeout instead of blocking the worker forever. Both directions
     are joined with a bounded ``join`` so a leaked pump cannot hang the caller,
     and both sockets are shut down and closed when the pipe ends.
-
-    ``forwarded_for``: when the client speaks HTTP first, the head is rewritten so X-Forwarded-For is
-    exactly this value (see :func:`rewriting_pipe`); anything else stays a transparent byte pipe.
     """
-    if forwarded_for:
-        _pipe_with_forwarded_for(client, target, forwarded_for, inactivity_timeout, head_timeout=head_timeout)
-        return
-
     def _pump(src: socket.socket, dst: socket.socket) -> None:
         try:
             src.settimeout(inactivity_timeout)
@@ -695,42 +685,6 @@ def proxy_pair(client: socket.socket, target: socket.socket,
             s.close()
         except OSError:
             pass
-
-
-def _pipe_with_forwarded_for(client: socket.socket, target: socket.socket, forwarded_for: str,
-                             inactivity_timeout: float, buffered: bytes | None = None,
-                             path: str | None = None, head_timeout: float = 10.0) -> None:
-    """Pipe with the client's X-Forwarded-For replaced by ``forwarded_for`` when the client opens with HTTP.
-
-    ``buffered``/``path`` are an already-peeked first line (route_and_pipe); otherwise the client is peeked
-    here. The decision to relay raw is made from the bytes seen, never from elapsed time: only a server that
-    speaks first or a first line that is definitely not HTTP (e.g. a TLS ClientHello) is piped raw; a client that
-    stays silent or whose request line is still incomplete at the deadline is closed."""
-    try:
-        server_first = False
-        if buffered is None:
-            import select
-            deadline = time.monotonic() + head_timeout
-            readable, _, _ = select.select([client, target], [], [], head_timeout)
-            if client in readable:
-                path, buffered = _peek_request_path(client, max(0.0, deadline - time.monotonic()))
-            elif target in readable:
-                buffered, server_first = b"", True      # the server speaks first: not an HTTP client
-            else:
-                return
-        if path is None:
-            if not server_first and not _is_raw_protocol(buffered):
-                return                  # silent, EOF, or an undecided/malformed HTTP start: fail closed
-            prefixed_pipe(client, target, client_prefix=buffered, inactivity_timeout=inactivity_timeout)
-            return
-        rewriting_pipe(client, target, 0, "", rewrite_head=False, forwarded_for=forwarded_for, prefix=buffered,
-                       inactivity_timeout=inactivity_timeout)
-    finally:
-        for s in (client, target):
-            try:
-                s.close()
-            except OSError:
-                pass
 
 
 def _log_devfabric(component: str, level: str, msg: str, *args) -> None:
@@ -778,55 +732,18 @@ _HTTP_METHODS = frozenset(
     {"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE", "CONNECT"})
 
 
-_RAW_SIGNATURES = (b"\x16\x03", b"SSH-")      # TLS ClientHello record, SSH banner: positively not HTTP
-
-
-def _head_class(buf: bytes) -> str:
-    """Classify the first bytes: ``raw`` (positive non-HTTP signature), ``http`` (strict ``METHOD `` start),
-    ``partial`` (could still become either) or ``reject`` (anything else: stray leading whitespace/CRLF/NUL,
-    unknown method, ...). Only ``raw`` may be relayed untouched when X-Forwarded-For is being rewritten; a
-    lenient backend might parse any ``reject`` bytes as HTTP, so they are never piped raw."""
-    if not buf:
-        return "partial"
-    for sig in _RAW_SIGNATURES:
-        if buf.startswith(sig):
-            return "raw"
-    if any(sig.startswith(buf) for sig in _RAW_SIGNATURES):
-        return "partial"
-    m = re.match(rb"([A-Za-z]+)( |$)", buf)
-    if not m:
-        return "reject"
-    token = m.group(1).decode("ascii").upper()
-    if m.group(2):
-        return "http" if token in _HTTP_METHODS else "reject"
-    return "partial" if any(x.startswith(token) for x in _HTTP_METHODS) else "reject"
-
-
-def _is_raw_protocol(buf: bytes) -> bool:
-    return _head_class(buf) == "raw"
-
-
 def _peek_request_path(client: socket.socket, timeout: float = 5.0,
                        max_bytes: int = 8192) -> tuple[str | None, bytes]:
     """Read the first HTTP request line.
 
     Returns ``(path, buffered)``: ``buffered`` is every byte read so far (to be
-    replayed to the target) and ``path`` is the request target, or ``None`` when
-    the line is not (yet) a complete HTTP request line. ``timeout`` is a TOTAL
-    deadline, so a client dribbling bytes cannot stretch it; reading stops early
-    once the bytes cannot be HTTP any more (e.g. a raw TLS ClientHello). Callers
-    that must not relay unrewritten traffic tell the cases apart with
-    :func:`_is_raw_protocol`.
+    replayed to the target) and ``path`` is the request target — or ``None`` when
+    the bytes do not look like an HTTP request (e.g. a raw TLS ClientHello).
     """
+    client.settimeout(timeout)
     buf = b""
-    deadline = time.monotonic() + timeout
     try:
-        while len(buf) < max_bytes and (_head_class(buf) == "partial"
-                                        or (_head_class(buf) == "http" and b"\r\n" not in buf)):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            client.settimeout(remaining)
+        while b"\r\n" not in buf and len(buf) < max_bytes:
             chunk = client.recv(4096)
             if not chunk:
                 break
@@ -842,7 +759,7 @@ def _peek_request_path(client: socket.socket, timeout: float = 5.0,
         return None, buf
     line = buf.split(b"\r\n", 1)[0].decode("latin-1", "replace")
     parts = line.split()
-    if _head_class(buf) == "http" and len(parts) >= 2 and parts[0].upper() in _HTTP_METHODS:
+    if len(parts) >= 2 and parts[0].upper() in _HTTP_METHODS:
         return parts[1], buf
     return None, buf
 
@@ -930,9 +847,9 @@ def prefixed_pipe(client: socket.socket, target: socket.socket,
             pass
 
 
-def _read_head(sock: socket.socket, initial: bytes = b"") -> tuple[bytes, bytes]:
+def _read_head(sock: socket.socket) -> tuple[bytes, bytes]:
     """Read up to the end of an HTTP head; returns (head incl. blank line, remainder)."""
-    buf = initial
+    buf = b""
     while b"\r\n\r\n" not in buf and len(buf) < 65536:
         chunk = sock.recv(65536)
         if not chunk:
@@ -945,38 +862,28 @@ def _read_head(sock: socket.socket, initial: bytes = b"") -> tuple[bytes, bytes]
 
 
 def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, external: str,
-                   *, tls: bool = False, rewrite_head: bool = True, forwarded_for: str | None = None,
-                   prefix: bytes = b"", inactivity_timeout: float = 30.0) -> None:
+                   *, tls: bool = False, rewrite_head: bool = True, forwarded_for: str | None = None) -> None:
     """Byte-pipe that filters the headers of the origin's responses.
 
     Each exchange is forced to ``Connection: close`` so every response passes the
     head filter. Upgrade requests (websockets) are passed through untouched."""
     from .urlrewrite import force_close, inject_request_headers, is_upgrade, rewrite_response_head
-    try:
-        client.settimeout(inactivity_timeout)       # bounds each head recv; re-armed for the whole exchange
-        req_head, rest = _read_head(client, prefix)
-    except OSError:
-        return
-    complete = req_head.endswith(b"\r\n\r\n")
-    if forwarded_for and not complete:
-        return      # fail closed: a head we cannot rewrite is never relayed with a client-chosen X-Forwarded-For
-    if complete and (tls or forwarded_for):
-        pairs: dict[str, str] = {}
-        if tls:
-            # TLS ends here: tell the origin the browser spoke https and which name it used.
-            host = next((ln.split(b":", 1)[1].strip().decode("latin-1") for ln in req_head.split(b"\r\n")[1:]
-                         if ln.lower().startswith(b"host:")), external)
-            pairs.update({"X-Forwarded-Proto": "https", "X-Forwarded-Host": host})
+    req_head, rest = _read_head(client)
+    if tls and req_head.endswith(b"\r\n\r\n"):
+        # TLS ends here: tell the origin the browser spoke https and which name it used.
+        host = next((ln.split(b":", 1)[1].strip().decode("latin-1") for ln in req_head.split(b"\r\n")[1:]
+                     if ln.lower().startswith(b"host:")), external)
+        pairs = {"X-Forwarded-Proto": "https", "X-Forwarded-Host": host}
         if forwarded_for:
-            # on every path (plaintext too) the client's own copy is replaced by the real peer
             pairs["X-Forwarded-For"] = forwarded_for
         req_head = inject_request_headers(req_head[:-4], pairs) + b"\r\n\r\n"
     upgrade = is_upgrade(req_head)
     if not upgrade and req_head.endswith(b"\r\n\r\n"):
         req_head = force_close(req_head[:-4]) + b"\r\n\r\n"
+    if upgrade:
+        prefixed_pipe(client, target, client_prefix=req_head + rest)
+        return
     try:
-        # the target keeps only the short connect timeout from create_connection otherwise: re-arm both sockets
-        target.settimeout(inactivity_timeout)
         target.sendall(req_head + rest)
     except OSError:
         return
@@ -996,21 +903,10 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
             except OSError:
                 pass
 
-    t: threading.Thread | None = None
-    if not upgrade:
-        t = threading.Thread(target=up, daemon=True)
-        t.start()
+    t = threading.Thread(target=up, daemon=True)
+    t.start()
     try:
         resp_head, body = _read_head(target)
-        if upgrade and _status_code(resp_head) == 101:
-            # only an accepted upgrade turns the connection into a raw pipe
-            client.sendall(resp_head + body)
-            prefixed_pipe(client, target, inactivity_timeout=inactivity_timeout)
-            return
-        # anything else: relay this one response and close (no keep-alive reuse, so a
-        # second request on the connection can never skip the head rewrite)
-        if upgrade:
-            target.settimeout(5.0)      # a keep-alive upstream must not hold the worker open
         if rewrite_head and resp_head.endswith(b"\r\n\r\n"):
             resp_head = rewrite_response_head(resp_head[:-4], port, external,
                                               "https" if tls else None) + b"\r\n\r\n"
@@ -1027,18 +923,12 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
             client.shutdown(socket.SHUT_WR)
         except OSError:
             pass
-    if t is not None:
-        t.join(timeout=5)
-
-
-def _status_code(head: bytes) -> int | None:
-    parts = head.split(b"\r\n", 1)[0].split(None, 2)
-    return int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
+    t.join(timeout=5)
 
 
 def route_and_pipe(client: socket.socket, routes, fallback_host: str,
                    fallback_port: int, inactivity_timeout: float = 30.0,
-                   peek_timeout: float = 5.0, forwarded_for: str | None = None) -> None:
+                   peek_timeout: float = 5.0) -> None:
     """Peek the first request line, pick the target (longest-prefix route match,
     else fallback), and byte-pipe. The peeked bytes are replayed first, so the
     target sees the original request intact.
@@ -1052,8 +942,6 @@ def route_and_pipe(client: socket.socket, routes, fallback_host: str,
     """
     try:
         path, buffered = _peek_request_path(client, timeout=peek_timeout)
-        if forwarded_for and path is None and not _is_raw_protocol(buffered):
-            return      # silent/undecided client: never relayed raw with a client-chosen X-Forwarded-For
         host, port = match_target(path, routes, fallback_host, fallback_port)
         try:
             target = socket.create_connection((host, port), timeout=5)
@@ -1062,9 +950,6 @@ def route_and_pipe(client: socket.socket, routes, fallback_host: str,
                            "route_and_pipe: target %s:%s unreachable: %s",
                            host, port, exc)
             _send_http_502(client)
-            return
-        if forwarded_for:
-            _pipe_with_forwarded_for(client, target, forwarded_for, inactivity_timeout, buffered, path)
             return
         prefixed_pipe(client, target, client_prefix=buffered,
                       inactivity_timeout=inactivity_timeout)

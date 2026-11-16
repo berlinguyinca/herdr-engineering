@@ -708,12 +708,6 @@ control_plane:
 matched; `http`/`https`, wildcards, spaces, duplicates and more than 8 entries are refused at startup. The network allowlist,
 trusted-proxy checks and per-address rate limit apply to every origin alike.
 
-`open_owner_allowed_sources` (optional, default empty = unchanged) narrows `open_owner` from "any tailnet address" to your own devices:
-a list of up to 64 IPs or CIDR ranges. When non-empty, a request whose resolved client address (the TCP peer, or the last
-`X-Forwarded-For` entry only when the peer is loopback or in `trusted_proxies`) is in none of them gets the usual 403.
-Invalid entries stop the control plane at startup. Recommended: your own devices' tailnet IPs, one per entry, for example
-`["100.104.39.6", "100.64.12.34"]` (`tailscale ip -4` on each device). This keeps a shared-in guest node from getting an owner session.
-
 `enabled: true` with no account, a malformed hash, an unknown key or any role but `operator` (`family` is reserved, not
 implemented) stops the control plane at startup with a message naming the field. Disabled (the default) leaves every
 `/rpc/*` and `/api/auth/*` path a 404, as before.
