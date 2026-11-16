@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Shepherd tailnet discovery (zero-typing onboarding)
+
+- New unauthenticated `GET /.well-known/herdr-shepherd` on the rakazo bridge: `{name, bridge_url, api_version, auth_modes, tailnet}`, no secrets. `tailnet` is true only when the real socket peer is identified by tailnet whois (fabric-trust `TailscaleWhois`); `X-Forwarded-For` counts only from `trusted_proxies`; whois errors fail closed.
+- New `control_plane.rakazo_bridge` YAML keys: `tailnet_open_owner` (default off: whois-identified tailnet callers get the single-operator session from `POST /api/auth/open`, app Origin still required), `public_url`, `name`, `whois_socket`. `open_owner` and password sign-in are unchanged.
+- Docs: `docs/operations/shepherd-discovery.md`, `docs/operations/shepherd-onboarding-contract.md` (app-side probe order).
+
 ### Fix: phone Assistants tab lists only online agent bots
 
 - `bots/list` (and the bootstrap payload built from it) now returns only collab agents that are online; stale tokenless-join test agents no longer flood the tab. Nothing is revoked or deleted: an offline agent still resolves through `bots/get`, `threads/get` and `threads/send` by id. A separate list of offline agents is not exposed (the archived list means disabled assistants and `bots/restore` cannot restore an agent).
