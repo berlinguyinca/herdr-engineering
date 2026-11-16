@@ -15,6 +15,7 @@ a reasoning capability, and it is never synthesised.
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 import secrets
@@ -447,7 +448,7 @@ class InspectorStore:
                 # Current policy may disable reasoning capture entirely.
                 if entry["kind"] == "reasoning" and not self.store_reasoning:
                     continue
-                entry["size"] = self._size(entry["data"])
+                entry["size"] = self._entry_size(entry)
                 sess.events.append(entry)
                 sess.by_seq[entry["seq"]] = entry
                 sess.bytes += entry["size"]
@@ -845,6 +846,12 @@ class InspectorStore:
                 n += 8
         return n
 
+    @classmethod
+    def _entry_size(cls, entry: dict) -> int:
+        """Ring cost of an entry: its data plus the private admission context it carries."""
+        admission = entry.get("admission")
+        return cls._size(entry["data"]) + (len(json.dumps(admission).encode("utf-8")) if admission else 0)
+
     def _store(self, sess: _Session, kind: str, base: dict, data: dict, flagged: bool,
                persist: bool) -> dict:
         flags = data.pop("_flags", {"redacted": False, "truncated": False})
@@ -856,7 +863,7 @@ class InspectorStore:
         if persist and kind in DURABLE_KINDS - REQUIRED_DURABLE_KINDS:
             self._persist_detail(sess, kind, base, data, flagged, flags)
         sess.next_seq += 1
-        entry["size"] = self._size(data)
+        entry["size"] = self._entry_size(entry)
         sess.bytes += entry["size"]
         sess.events.append(entry)
         sess.by_seq[entry["seq"]] = entry
@@ -975,7 +982,7 @@ class InspectorStore:
 
     def _touch(self, sess: _Session, entry: dict, *, account: bool = True) -> None:
         if account:
-            new = self._size(entry["data"])
+            new = self._entry_size(entry)
             sess.bytes += new - entry["size"]
             entry["size"] = new
         sess.rev += 1

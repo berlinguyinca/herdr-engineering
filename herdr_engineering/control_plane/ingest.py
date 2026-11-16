@@ -405,7 +405,7 @@ class IngestService:
             # The envelope row is persisted FIRST. If that fails nothing has
             # been applied and the ledger is untouched, so the emitter retries.
             try:
-                self.repo.record_event(
+                recorded = self.repo.record_event(
                     entity_type, entity_id, event_type, row_payload,
                     envelope=env, feed=entity_type not in ENVELOPE_ONLY_TYPES,
                     publish=entity_type not in ENVELOPE_ONLY_TYPES)
@@ -434,8 +434,8 @@ class IngestService:
                     result = self._dispatch(entity_type, entity_id, event_type, payload, source,
                                             record_generic=False,
                                             admission=(AdmissionContext.from_admitted(env, entity_id)
-                                                if entity_type == "inspector" and callable(getattr(
-                                                    self.repo._sink, "record_required", None)) else None))
+                                                if entity_type == "inspector"
+                                                and recorded["durably_acknowledged"] else None))
             finally:
                 # The row is durable, so its (source, sequence) is consumed even
                 # if the handler then fails; the failure is reported once.

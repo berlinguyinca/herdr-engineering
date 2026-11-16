@@ -45,7 +45,11 @@ writes `{version: 2, admission: ...}` under the reserved `_inspector_context`
 field in the existing private detail payload. Sanitization never copies that
 field from a client event. Replay consumes it only from persisted private detail,
 validates the exact allowlisted schema and session match, and does not expose it
-through event rendering, queries, detail or SSE. Old rows, invalid/unsupported
+through event rendering, queries, detail, SSE or durable history. The history
+reader (`inspector_history.entries_from_rows`) drops every `_`-prefixed payload
+key, so viewer and operator history pages never carry the context, actor digest
+or admitted envelope event id. Each entry's size accounting includes its private
+admission context, so session and total byte budgets hold with long event ids. Old rows, invalid/unsupported
 wrappers and mismatched contexts replay with unknown attribution. Activity itself
 is not discarded merely because attribution is missing or invalid.
 
@@ -72,7 +76,12 @@ boundary or claim full restoration.
 Synthetic tests cover payload actor/reserved-field forgery, typed context,
 open-listener and key HTTP requests, mixed writers, batches/duplicates, admission
 and projection write failures, actual event serialization, legacy replay,
-checkpoint/snapshot validation and delta replay. Existing public Inspector and
+checkpoint/snapshot validation, delta replay, durable-history privacy for both
+roles, admission byte accounting under eviction, and `record_event`'s durable
+acknowledgement flag. `test_inspector_admission_postgres.py` (integration marker)
+repeats the history-privacy and replay round trip against a real Postgres when
+one is available. The history HTTP endpoint is covered through the same
+`inspector_history_page` path, not by a separate HTTP test. Existing public Inspector and
 ingestion response shapes remain unchanged; raw credentials are not retained in
 the new private context.
 

@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from herdr_engineering.control_plane.envelope import normalize_envelope
 from herdr_engineering.control_plane.ingest import IngestService
 from herdr_engineering.control_plane.inspector import InspectorStore, SnapshotStale
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
@@ -369,3 +370,61 @@ def test_unattributed_payload_cannot_supply_reserved_replay_context():
     restored = InspectorStore()
     restored.hydrate(sink.events)
     assert entry(restored)["admission"] is None
+
+
+def _history_rows(sink):
+    return [
+        {"payload": row["payload"], "source_timestamp": row["source_timestamp"], "event_id": row["event_id"]}
+        for row in details(sink)
+    ]
+
+
+def test_durable_history_never_returns_private_admission_to_any_role():
+    from herdr_engineering.control_plane.inspector_history import entries_from_rows
+
+    sink, repo, service = setup()
+    envelope = body(payload={"kind": "message", "role": "user", "text": "hello"})
+    envelope["event_id"] = "envelope-secret-event-id"
+    service.ingest(envelope, principal={**KEY, "api_key": "NEVER_COPY"})
+    rows = _history_rows(sink)
+    assert rows
+    entries = entries_from_rows(rows)
+    assert entries
+    for role in ("viewer", "operator"):
+        text = json.dumps(repo.inspector.render_history(entries, role))
+        for needle in ("_inspector_context", "admission", KEY["id"], "envelope-secret-event-id", "open-listener"):
+            assert needle not in text, (role, needle)
+    assert all(not k.startswith("_") for e in entries for k in e["data"])
+
+
+def test_admission_bytes_count_toward_ring_budget_with_multibyte_event_ids():
+    from herdr_engineering.control_plane.admission import AdmissionContext
+
+    budget = 20_000
+    store = InspectorStore(limits={"max_bytes_per_session": budget})
+    for i in range(60):
+        context = AdmissionContext.from_admitted(
+            {"event_id": f"{i:03d}" + "é" * 2000, "source": "claimed-harness", "source_sequence": i,
+             "received_at": "2026-11-16T00:00:00Z", "actor": KEY},
+            "session",
+        )
+        store.ingest("session", {"kind": "file", "path": f"src/{i}.py", "op": "edit"}, admission=context)
+    sess = store._sessions["session"]
+    assert 0 < len(sess.events) < 60
+    accounted = sum(e["size"] for e in sess.events)
+    assert accounted == sess.bytes
+    assert all(e["size"] >= len(json.dumps(e["admission"]).encode()) for e in sess.events)
+    assert sess.bytes <= budget
+
+
+def test_record_event_reports_durable_acknowledgement():
+    class BestEffort:
+        def record(self, event):
+            pass
+
+    for sink, expected in ((Sink(), True), (BestEffort(), False), (None, False)):
+        repo = ControlPlaneRepo(sink=sink)
+        envelope = normalize_envelope(body(), OPERATOR, repo._stamp())
+        recorded = repo.record_event("inspector", "session", "inspector.batch", {"kind": "file"}, envelope=envelope)
+        assert recorded["durably_acknowledged"] is expected
+        assert "durably_acknowledged" not in repo.record_event("inspector", "session", "inspector.batch", {})
