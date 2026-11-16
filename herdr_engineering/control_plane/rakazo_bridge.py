@@ -202,6 +202,10 @@ def _open_owner_origins(value) -> tuple[str, ...]:
     return tuple(value)
 
 
+_TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
+_TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+
+
 def _open_owner_allowed_sources(value) -> tuple:
     """``open_owner_allowed_sources``: up to 64 IPs or CIDR ranges. Empty (the default) means no extra restriction."""
     where = "control_plane.rakazo_bridge.open_owner_allowed_sources"
@@ -229,6 +233,8 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("control_plane.rakazo_bridge must be a mapping")
     if raw.get("enabled") is not True:
+        if "open_owner_allowed_sources" in raw:
+            _open_owner_allowed_sources(raw["open_owner_allowed_sources"])     # a typo is caught before the bridge is switched on
         return {"enabled": False}
     now = time.time() if now is None else now
     unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies",
@@ -307,6 +313,12 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
         raise ValueError("control_plane.rakazo_bridge.open_owner needs an account with role operator to act as")
     open_owner_origins = _open_owner_origins(raw.get("open_owner_origins", ["rakazo://"]))
     open_owner_allowed = _open_owner_allowed_sources(raw.get("open_owner_allowed_sources", []))
+    if open_owner_allowed and not open_owner:
+        log.warning("rakazo bridge: open_owner_allowed_sources is set but open_owner is off, so it restricts nothing")
+    for net in open_owner_allowed:
+        if not net.subnet_of(_TAILNET_V4 if net.version == 4 else _TAILNET_V6):
+            log.warning("rakazo bridge: open_owner_allowed_sources entry %s is outside the tailnet ranges "
+                        "(100.64.0.0/10, fd7a:115c:a1e0::/48): it admits non-tailnet sources", net)
     return {"enabled": True, "open_owner": open_owner, "open_owner_origins": open_owner_origins,
             "open_owner_allowed_sources": open_owner_allowed, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
             "trusted_proxies": tuple(nets), "routine_runner_seconds": runner, "hindsight": hindsight,

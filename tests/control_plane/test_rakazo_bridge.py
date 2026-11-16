@@ -385,6 +385,28 @@ def test_open_owner_without_allowed_sources_warns_at_startup(make_server, caplog
     assert "no open_owner_allowed_sources" in caplog.text
 
 
+def test_open_owner_allowed_sources_is_validated_even_when_the_bridge_is_disabled():
+    with pytest.raises(ValueError, match="open_owner_allowed_sources"):
+        rb.rakazo_bridge_config({"enabled": False, "open_owner_allowed_sources": ["not-an-ip"]})
+    with pytest.raises(ValueError, match="open_owner_allowed_sources"):
+        rb.rakazo_bridge_config({"open_owner_allowed_sources": "100.64.0.1"})
+    assert rb.rakazo_bridge_config({"enabled": False, "open_owner_allowed_sources": ["100.64.0.1"]}) == {"enabled": False}
+
+
+def test_open_owner_allowed_sources_warnings(caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger=rb.log.name):
+        rb.rakazo_bridge_config({"enabled": True, "accounts": ACCOUNTS, "open_owner_allowed_sources": ["100.64.0.1"]})
+    assert "open_owner is off" in caplog.text and "outside the tailnet" not in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=rb.log.name):
+        rb.rakazo_bridge_config({"enabled": True, "open_owner": True, "accounts": ACCOUNTS,
+                                 "open_owner_allowed_sources": ["100.64.0.1", "fd7a:115c:a1e0::5", "192.168.1.0/24", "0.0.0.0/0"]})
+    assert "192.168.1.0/24" in caplog.text and "0.0.0.0/0" in caplog.text
+    assert "entry 100.64.0.1 " not in caplog.text and "entry fd7a:115c:a1e0::5 " not in caplog.text
+    assert "open_owner is off" not in caplog.text
+
+
 def test_open_owner_needs_an_operator_account_to_act_as():
     with pytest.raises(ValueError, match="open_owner"):
         rb.rakazo_bridge_config({"enabled": True, "open_owner": True,
