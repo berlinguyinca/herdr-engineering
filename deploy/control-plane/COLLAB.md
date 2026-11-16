@@ -312,6 +312,24 @@ validates the slice and the compose files without printing any secret.
   is overwritten with `$remote_addr`; on `/mcp/artifacts` `Forwarded`, `X-Real-IP` and `X-Forwarded-Host` are also
   stripped; `/healthz` and `/internal/` answer 404 at the edge. Body caps: `/s/` 1k,
   annotations 32k, `/api/member/` 1m, run uploads 17m, `/mcp/artifacts` 768k. Existing room routes are unchanged.
+- Member UI on its own origin (`control_plane.artifact_host.member_host`, optional, off by default). Moving the member
+  page from `artifacts.metabolomics.us` to `my.artifacts.metabolomics.us` separates it from the untrusted `/s/` content
+  origin. Phased:
+  - Phase 1 (this change, safe to deploy before DNS or Cognito exist): when `member_host` is set the host serves `/`,
+    `/my/` and `/api/member/` on that name too, building `redirect_uri`, `logout_uri` and the page CSP from it, adding
+    `Cross-Origin-Opener-Policy: same-origin`, and answering 404 for everything else (never `/s/`). Cookies stay
+    host-only. The old host keeps working unchanged. The edge renders a second server block (same listen, TLS and
+    limits, no access log) only when it is set; `deploy.sh` refuses a certificate that does not name it and probes it.
+    Unset, the rendered edge and behavior are unchanged. The key must be a DNS name distinct from `public_host` and
+    `mcp_public_hosts`.
+  - Owner-only steps, in order: (1) DNS: `my.artifacts.metabolomics.us` to the same edge as `artifacts.metabolomics.us`;
+    (2) the front proxy's SNI stream map: add the name; (3) certbot `--expand` so the certificate names it;
+    (4) Cognito app client `herdr-collab-web`: add callback `https://my.artifacts.metabolomics.us/my/callback` and
+    sign-out `https://my.artifacts.metabolomics.us/` (keep the old ones); (5) set `member_host` in the fleet config;
+    (6) deploy.
+  - Phase 2 (follow-up, not in this change): redirect the old host's member pages to the new origin.
+  - Phase 3 (follow-up): remove the member routes from the old host and the old Cognito URLs.
+  - Not wired: the legacy share-public `MemberWeb` accepts a `member_host` argument, but no fleet config feeds it.
 - Check: `tests/test_artifact_host_compose.py` parses the files and, when Docker is available (required under CI or
   `HERDR_REQUIRE_DOCKER=1`), starts the stack and runs `nginx -t` on the rendered edge.
 
