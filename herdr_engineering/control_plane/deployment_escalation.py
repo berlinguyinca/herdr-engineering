@@ -765,10 +765,11 @@ class GitHubIssueSink:
 
     MAX_RESPONSE = 256 * 1024
 
-    def __init__(self, *, token=None, opener=None, credentials=None):
+    def __init__(self, *, token=None, opener=None, credentials=None, capability="escalations"):
         import urllib.request
         self._token = token
         self._credentials = credentials
+        self._capability = capability       # the GitHub App write capability this sink may mint (team issues use their own)
         from ..github import _NoRedirect
         self._opener = opener or urllib.request.build_opener(_NoRedirect())
 
@@ -780,7 +781,7 @@ class GitHubIssueSink:
         provider = self._credentials() if callable(self._credentials) else github_auth.credentials()
         owner = repo.split("/", 1)[0]
         try:
-            return provider.capability_token_or_raise(owner, "escalations", [repo.split("/", 1)[1]]), (provider, owner)
+            return provider.capability_token_or_raise(owner, self._capability, [repo.split("/", 1)[1]]), (provider, owner)
         except github_auth.GitHubAuthError as exc:
             if exc.reason == "write_disabled":
                 return None, None
@@ -796,16 +797,27 @@ class GitHubIssueSink:
             raise IssueRefused("no GitHub token configured")
         return value
 
-    def __call__(self, repo, title, body, key, *, timeout=None):
-        import json
-        import urllib.error
-        import urllib.request
+    def credential(self, repo):
+        """``(token, source, app)`` for a write to ``repo``: the App capability when it is enabled, else the static
+        ``github.token``. Raises ``IssueRefused`` (fixed reason, never the secret) when neither can be had."""
         if not isinstance(repo, str) or not _REPO.fullmatch(repo):
             raise IssueRefused("invalid repository")
         token, app = self._app_token(repo)
         source = "github_app" if token is not None else "github_token"
         if token is None:
             token = self._token_value()
+        return token, source, app
+
+    def reject(self, app):
+        """Drop the App's cached token after GitHub answered 401 for it."""
+        if app is not None:
+            app[0].invalidate(app[1])
+
+    def __call__(self, repo, title, body, key, *, timeout=None):
+        import json
+        import urllib.error
+        import urllib.request
+        token, source, app = self.credential(repo)
         request = urllib.request.Request(
             f"https://api.github.com/repos/{repo}/issues", method="POST",
             data=json.dumps({"title": title[:256], "body": body}).encode(),

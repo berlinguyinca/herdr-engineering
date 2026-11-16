@@ -195,6 +195,11 @@ def test_phase3_flow_shadow_labels_gate_judge_on_the_authorize_path(acknowledged
             status, activated = owner(w, "POST", f"/api/v1/assistant-grants/{gid}/activate", {"confirm": True})
             assert status == 200 and activated["state"] == "active", activated
 
+            # the three step-2 approvals are still unspent one-shots (skip shadow and judge): spend them first
+            for n in range(3):
+                spent = ask_action(w, wk, PUSH, f"o{n}", "t1")
+                assert (spent["outcome"], spent["source"], spent["grant_id"]) == ("authorized", "owner", None)
+
             # 5. an ACTIVE grant still needs the judge: a disabled judge is the same fail-closed answer
             w.cfg["enabled"] = False
             off = ask_action(w, wk, PUSH, "s11", "t11")

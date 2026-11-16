@@ -49,6 +49,15 @@ def report_document():
                                        "media_type": "text/csv", "sha256": sha, "size_bytes": 8}]}
 
 
+HOSTILE_SVG = (b'<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><script>alert(2)</script>'
+               b'<style>@import url(http://evil.example/x.css);</style><foreignObject><iframe src="http://e.example"/>'
+               b'</foreignObject><image href="http://evil.example/p.png"/><use href="http://evil.example/s.svg#a"/></svg>')
+FIGURE_FILES = [("svg", "image/svg+xml", HOSTILE_SVG), ("png", "image/png", b"\x89PNG\r\n\x1a\n" + b"\x01" * 30),
+                ("html", "text/html", b"<script>alert(3)</script>"),
+                ("blob", "application/octet-stream", b"\x00\x01\x02"),
+                ("huge", "image/png", b"\x02" * 200_000)]
+
+
 class Bytes:
     """RustFS stand-in: content-addressed bytes, served in small chunks, counting reads."""
 
@@ -108,9 +117,23 @@ class Registry:
                                        "state": "building"}
         self.versions["v_csv"] = {"version_id": "v_csv", "artifact_id": AID, "state": "ready",
                                   "output_manifest": [output("t.csv", b"a,b\n1,2\n", media_type="text/csv")]}
+        self.versions["v_figs"] = self._figure_version(blobs)
         self.versions["v_report"] = {"version_id": "v_report", "artifact_id": AID, "state": "ready",
                                      "report_descriptor": report_document(),
                                      "output_manifest": [output("data.csv", b"evidence", media_type="text/csv")]}
+
+    @staticmethod
+    def _figure_version(blobs):
+        figures, assets = [], []
+        for name, media, data in FIGURE_FILES:
+            sha = blobs.add(data)
+            assets.append({"id": name, "name": f"{name}.bin", "role": "figure", "media_type": media,
+                           "sha256": sha, "size_bytes": len(data)})
+            figures.append({"id": f"fig-{name}", "title": f"Figure {name}", "asset_id": name, "caption": f"cap {name}"})
+        document = report_document()
+        document["figures"], document["assets"] = figures, document["assets"] + assets
+        return {"version_id": "v_figs", "artifact_id": AID, "state": "ready", "report_descriptor": document,
+                "output_manifest": [output("data.csv", b"evidence", media_type="text/csv")]}
 
     def sync_call(self, method, *args, **kwargs):
         return asyncio.run(getattr(self, method)(*args, **kwargs))
@@ -137,6 +160,13 @@ class Registry:
 
     async def get_report_descriptor(self, aid, vid):
         return copy.deepcopy(self.versions[vid]["report_descriptor"])
+
+    async def get_report_asset(self, aid, vid, asset_id):
+        descriptor = self.versions[vid]["report_descriptor"]
+        asset = next((a for a in descriptor["assets"] if a["id"] == asset_id), None)
+        if asset is None:
+            raise ArtifactError("no artifact report asset")
+        return {**asset, "storage_key": key_for(asset["sha256"])}
 
     async def verify_share_outputs(self, aid, vid):
         if vid in self.foreign:
@@ -465,6 +495,33 @@ def test_report_version_gets_generated_preview_html_entry(env):
     assert shares.rows[share_id]["entry"] == "preview.html"
     state_files = list((root / "by-token").glob("*/state.json"))
     assert len(state_files) == 1 and json.loads(state_files[0].read_text())["entry"] == "preview.html"
+
+
+def test_report_share_embeds_safe_figure_images_inline_and_nothing_else(env):
+    import re
+
+    from herdr_engineering.control_plane import share_render as sr
+
+    base, _, shares, blobs, root = env
+    status, body = create(base, version="v_figs")
+    assert status == 201, body
+    share_id = body["share"]["share_id"]
+    status, body = approve(base, share_id)
+    assert status == 200, body
+    preview = (root / share_id / "files" / "preview.html").read_bytes()
+    text = preview.decode()
+    sources = re.findall(r'<img class="fig-img" alt="([^"]*)" src="([^"]*)">', text)
+    assert sorted(alt for alt, _ in sources) == ["Figure png", "Figure svg"]   # html, octet-stream and oversize: links only
+    assert {src.split(";")[0] for _, src in sources} == {"data:image/svg+xml", "data:image/png"}
+    for needle in ("<svg", "<script", "onload", "evil.example", "javascript:", "alert("):
+        assert needle not in text, needle
+    for caption in ("cap html", "cap blob", "cap huge"):
+        assert caption in text                       # the figure is still described
+    assert "shortened or omitted" in text            # the oversize image was dropped, and the page says so
+    # the share view's real sanitiser (nh3 in its killable child) keeps both images and nothing else
+    out = sr.sanitize_html(preview, resolve=lambda _context, url: url)
+    assert out.count("<img") == 2 and "data:image/svg+xml;base64," in out and "data:image/png;base64," in out
+    assert "<svg" not in out and "<script" not in out and "src=\"http" not in out
 
 
 def test_caps_enforced_including_total_live_bytes(tmp_path):

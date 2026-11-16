@@ -1,0 +1,3 @@
+SessionStart: ['cwd', 'hook_event_name', 'session_id', 'source', 'transcript_path']
+Stop: ['background_tasks', 'cwd', 'effort', 'hook_event_name', 'last_assistant_message', 'permission_mode', 'prompt_id', 'session_crons', 'session_id', 'stop_hook_active', 'transcript_path']
+SessionEnd: ['cwd', 'hook_event_name', 'prompt_id', 'reason', 'session_id', 'transcript_path']

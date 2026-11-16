@@ -91,6 +91,9 @@ ALLOWED_PERMISSIONS = frozenset({"contents", "metadata", "issues", "organization
 WRITE_CAPABILITIES = {
     "review_gate": {"contents": "write", "metadata": "read", "pull_requests": "write", "statuses": "write"},
     "escalations": {"issues": "write", "metadata": "read"},
+    # team collaboration slice 5: an operator-approved issue from an email brief. Its own name so that enabling deployment
+    # escalations does not silently allow it (and the other way round).
+    "team_issues": {"issues": "write", "metadata": "read"},
 }
 _RANK = {"read": 1, "write": 2}
 

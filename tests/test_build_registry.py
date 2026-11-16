@@ -596,3 +596,54 @@ def test_registry_warns_on_network_state_dir(tmp_path, caplog):
     br.warn_if_network_fs(tmp_path, mountinfo=f"1 0 0:1 / {tmp_path} rw - nfs4 x rw\n")
     assert any("network filesystem" in r.message for r in caplog.records
                if r.levelno == logging.WARNING)
+
+
+# ---- #746: registry open must not be a writer, and a lost lock must not drop a build ----
+
+def test_opening_an_initialised_registry_takes_no_write_lock(tmp_path):
+    """Every open used to run `BEGIN IMMEDIATE`, the schema, and the prune, so N simultaneous builds
+    queued on one write lock and one could lose the 5 s busy_timeout. An open that has nothing to
+    change must not ask for the lock at all."""
+    state = tmp_path / "state"
+    br.Registry(state)                                   # creates the schema
+    holder = sqlite3.connect(br.db_path(state), timeout=0)
+    holder.isolation_level = None
+    holder.execute("BEGIN IMMEDIATE")                    # somebody else owns the write lock
+    try:
+        started = time.monotonic()
+        br.Registry(state)                               # used to block here, then raise "locked"
+        assert time.monotonic() - started < 2
+    finally:
+        holder.close()
+
+
+def test_a_transient_busy_on_open_is_retried_instead_of_dropping_the_build(tmp_path, monkeypatch):
+    """The loser of that lock race raised `database is locked`, `BuildRun.open` swallowed it, and the
+    build ran with no row in the registry - 19 rows for 20 builds. A transient lock has to stay
+    transient."""
+    real, calls = br._connect, {"n": 0}
+
+    def flaky(path, create):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(path, create)
+
+    monkeypatch.setattr(br, "_connect", flaky)
+    try:
+        reg = br.Registry(tmp_path / "state")
+    finally:
+        monkeypatch.setattr(br, "_connect", real)
+    assert calls["n"] >= 2                               # we retried rather than propagated
+    reg.register(repo_id="r1", input_digest="d", cmd_kind="cargo build")   # and it works
+
+
+def test_an_unrecorded_build_keeps_the_reason(tmp_path):
+    """`build_finished` could already say `registry_unavailable`, but never *why* - and "database is
+    locked" versus "schema too new" want different answers."""
+    blocker = tmp_path / "state"
+    blocker.write_text("not a directory")
+    run = br.BuildRun.open(str(blocker / "nested"), cwd=str(tmp_path), cmd_kind="cargo build",
+                           host="h", cmd=["cargo", "build"])
+    assert run.unavailable is True
+    assert run.unavailable_reason and "cannot initialise registry" in run.unavailable_reason

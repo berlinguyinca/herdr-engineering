@@ -1,0 +1,18 @@
+{
+ "findings": [
+  {
+   "file": "tests/control_plane/test_stall_watch.py",
+   "line": 400,
+   "severity": "note",
+   "category": "tests",
+   "why": "Naming style is inconsistent"
+  },
+  {
+   "file": "herdr_engineering/control_plane/stall_watch.py",
+   "line": 500,
+   "severity": "note",
+   "category": "code",
+   "why": "Prefer a dataclass here"
+  }
+ ]
+}

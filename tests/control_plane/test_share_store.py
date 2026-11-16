@@ -16,6 +16,7 @@ import pytest
 
 from herdr_engineering.control_plane.artifact_shares import ShareError, ShareStore, new_token
 from herdr_engineering.control_plane.share_bundle import BundleFile, BundleIndex
+from tests.control_plane.pg_stop import FAST_TEST_OPTIONS, stop_postgres
 
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS = ROOT / "deploy/control-plane/migrations"
@@ -42,7 +43,7 @@ def share_postgres():
         subprocess.run([str(initdb), "-D", str(data), "-A", "trust", "--no-locale", "-E", "UTF8", "--no-sync"],
                        check=True, capture_output=True)
         subprocess.run([str(bindir / "pg_ctl"), "-D", str(data), "-l", str(area / "server.log"),
-                        "-o", f"-c listen_addresses='' -k {area} -c dynamic_shared_memory_type=mmap", "-w", "start"],
+                        "-o", f"-c listen_addresses='' -k {area} -c dynamic_shared_memory_type=mmap {FAST_TEST_OPTIONS}", "-w", "start"],
                        check=True, capture_output=True)
         try:
             dsn = f"postgresql:///postgres?host={area}"
@@ -50,7 +51,7 @@ def share_postgres():
             async def initialize():
                 conn = await asyncpg.connect(dsn)
                 try:
-                    for name in (*PREREQ, "0041_artifact_shares.sql"):
+                    for name in (*PREREQ, "0041_artifact_shares.sql", "0051_artifact_library.sql"):
                         await conn.execute((MIGRATIONS / name).read_text())
                     # re-running must be a no-op (idempotent)
                     await conn.execute((MIGRATIONS / "0041_artifact_shares.sql").read_text())
@@ -60,8 +61,7 @@ def share_postgres():
             asyncio.run(initialize())
             yield dsn
         finally:
-            subprocess.run([str(bindir / "pg_ctl"), "-D", str(data), "-m", "fast", "-w", "stop"],
-                           check=True, capture_output=True)
+            stop_postgres(bindir / "pg_ctl", data)
 
 
 def run(dsn, body):

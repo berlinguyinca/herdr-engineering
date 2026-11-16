@@ -4,6 +4,7 @@ Real sockets, real frozen bundles, sessions minted with the real signing code. T
 ``test_share_public`` (``Env``) and ``test_share_lab`` (``lab_config``).
 """
 import hashlib
+import functools
 import json
 import re
 import socket
@@ -61,6 +62,7 @@ def lab(tmp_path):
     e.close()
 
 
+@functools.lru_cache(maxsize=None)
 def session(identity="alice", email=EMAIL, exp=NOW0 + 3600, share_id="shr-1", basis="e"):
     return mint_session(SECRET, share_id, identity, exp, email=email, basis=basis)
 
@@ -276,7 +278,12 @@ def test_public_share_and_disabled_annotations_are_untouched(tmp_path):
     pub_dir.mkdir()
     pub = Env(pub_dir, audience="public", files=FILES, config_extra=lab_config(pub_dir))
     try:
-        assert_raw(pub, f"/s/{TOKEN}/f/index.html", {"Sec-Fetch-Dest": "document"}, "index.html", HTML)
+        # a public share gets the recipient landing bar (Task 8) but never the annotation layer
+        status, _headers, body = pub.request("GET", f"/s/{TOKEN}/f/index.html", {"Sec-Fetch-Dest": "document"})
+        assert status == 200 and b"data-herdr-landing" in body and b"<p>hello</p></BODY></html>" in body
+        assert b"annotate" not in body.lower()
+        status, _headers, body = pub.request("GET", f"/s/{TOKEN}/f/index.html", {"Sec-Fetch-Dest": "empty"})
+        assert status == 200 and body == HTML
     finally:
         pub.close()
     off_dir = tmp_path / "off"
@@ -575,8 +582,8 @@ def test_group_admitted_sessions_may_write(lab):
 
 def test_a_forged_basis_is_an_invalid_session(lab):
     bob = session("bob", "bob@lab.example", basis="g")
-    a_id, a_mail, _, a_exp, a_mac = bob.split(".")
-    forged = ".".join((a_id, a_mail, "e", a_exp, a_mac))
+    _, a_exp, a_blob = bob.split(".")
+    forged = ".".join(("e", a_exp, a_blob))
     refused(lab, api(forged), create_body(), sess=forged)
 
 
@@ -708,6 +715,8 @@ def test_edit_and_delete_an_open_own_row(lab):
     assert edit["author_identity"] == "alice" and edit["share_id"] == "shr-1" and edit["v"] == 1 and edit["at"]
     assert delete["op"] == "delete" and delete["annotation_id"] == CID and "body" not in delete
     assert delete["author_identity"] == "alice"
+    assert edit["author_email"] == delete["author_email"] == EMAIL
+    assert edit["basis"] == delete["basis"] == "e"          # the worker re-checks admission by this basis (plan 4 C3)
 
 
 def test_edit_refusals(lab):

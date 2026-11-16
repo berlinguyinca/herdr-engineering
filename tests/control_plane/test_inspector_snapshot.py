@@ -181,6 +181,8 @@ class FakeConn:
     async def fetchval(self, sql, *args):
         if "inspector_snapshots" in sql:
             return 1 if self.saved else None
+        if "to_regclass" in sql:
+            return False  # no archive table in this fake
         return sum(1 for r in self.rows if r["sequence"] <= args[0])
 
     async def fetchrow(self, sql):
@@ -313,9 +315,10 @@ def test_repo_boot_uses_the_snapshot_and_matches_a_full_boot():
 def test_snapshot_settings_are_off_unless_explicitly_enabled():
     from herdr_engineering.cli import _inspector_snapshot_settings as settings
     assert settings({}) == (False, 600.0)
-    assert settings({"inspector_snapshots": {"enabled": "yes"}}) == (False, 600.0)
     assert settings({"inspector_snapshots": {"enabled": True, "interval_seconds": 120}}) == (True, 120.0)
-    assert settings({"inspector_snapshots": {"enabled": True, "interval_seconds": 5}}) == (True, 600.0)
+    for bad in ({"enabled": "yes"}, {"enabled": True, "interval_seconds": 5}, {"enabled": True, "typo": 1}):
+        with pytest.raises(SystemExit):
+            settings({"inspector_snapshots": bad})
     with pytest.raises(SystemExit):
         settings({"inspector_snapshots": "on"})
 

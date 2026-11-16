@@ -33,8 +33,9 @@ def durable():
     admin, conn = runner.run(prepare())
     sources = []
 
-    def recover(*, publish=False):
-        source = PostgresSource(conn, dsn=DSN, run=runner.run, checkpoint_publish=publish)
+    def recover(*, publish=False, budgets=None):
+        source = PostgresSource(conn, dsn=DSN, run=runner.run, checkpoint_publish=publish,
+                                checkpoint_budgets=budgets)
         sources.append(source)
         repo = ControlPlaneRepo(now=lambda: 1000)
         repo.inspector._clock = lambda: 1000

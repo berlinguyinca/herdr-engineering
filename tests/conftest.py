@@ -1,4 +1,5 @@
 import copy
+import gc
 
 import pytest
 
@@ -19,6 +20,16 @@ def acknowledged_sink():
             self.events.append(copy.deepcopy(event))
 
     return AcknowledgedSink()
+
+
+@pytest.fixture(autouse=True)
+def _restore_gc_state():
+    """In-process web starts call tune_gc (freeze + thresholds); never let that leak into later tests."""
+    saved = gc.get_threshold()
+    gc.unfreeze()
+    yield
+    gc.set_threshold(*saved)
+    gc.unfreeze()
 
 
 @pytest.fixture(autouse=True)
@@ -43,3 +54,8 @@ def fake_host_config(monkeypatch):
         monkeypatch.setattr(hc, "host_config", lambda: cfg)
         return cfg
     return install
+
+
+def pytest_addoption(parser):
+    parser.addoption("--allow-fabric-http-skip", action="store_true", default=False,
+                     help="skip (instead of fail) the Fabric HTTP tests on a host with no non-loopback address")

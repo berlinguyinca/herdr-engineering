@@ -25,13 +25,24 @@ from typing import Any, Final
 from .artifact_member_intents import (
     KIND_CREATE,
     KIND_DELETE,
+    KIND_LIBRARY_ACCEPT,
+    KIND_LIBRARY_DISCARD,
+    KIND_LIBRARY_FILE,
+    KIND_LIBRARY_FOLDER_CREATE,
+    KIND_LIBRARY_FOLDER_DELETE,
+    KIND_LIBRARY_FOLDER_RENAME,
+    KIND_LIBRARY_UNFILE,
     KIND_PUBLISH,
     KIND_SHARE_APPROVE,
     KIND_SHARE_CREATE,
     KIND_SHARE_EVENTS,
     KIND_SHARE_REVOKE,
+    LIBRARY_CONTENT_DIR,
     MEMBER_VIEWS_DIR,
     take_secret,
+)
+from .artifact_member_intents import (
+    LIB_MAX_FILE_BYTES as LIBRARY_FILE_MAX,
 )
 from .artifact_members import member_owner_key
 from .collab import CollabError, CollabService, Principal
@@ -46,6 +57,7 @@ from .collab_bridge_files import (
     BridgeLimits,
     file_exists_beneath,
     list_parts,
+    open_beneath,
     read_json_beneath,
     read_staged_meta,
     remove_tree_beneath,
@@ -96,7 +108,7 @@ def _present(ticket: str, doc: Mapping[str, Any]) -> dict[str, Any]:
     if doc.get("status") == "pending" or "result" not in doc:
         return {"ticket": ticket, "status": "pending"}
     keep = ("result", "artifact_id", "version_id", "version_number", "head_version_id", "reason", "share_id", "audience",
-            "summary", "events")
+            "summary", "events", "message")
     return {"ticket": ticket, "status": "done", **{k: doc[k] for k in keep if doc.get(k) is not None}}
 
 
@@ -287,6 +299,9 @@ class MemberService:
     def share_approve(self, actor: Mapping[str, Any], artifact_id: Any, share_id: Any, confirm: Any,
                       idempotency_key: Any = None) -> dict[str, Any]:
         who = self._caller(actor, "share_approve")
+        if who.pr.is_agent:
+            raise self._fail(who.pr, "share_approve", "agent_cannot_approve", 403, "forbidden",
+                             "an agent cannot approve a share link; the owner approves it in the web page", artifact_id)
         if confirm is not True:
             raise MemberServiceError(400, "bad_request", "confirm must be true to make a share link live")
         self._shareable(who, "share_approve", artifact_id)
@@ -318,6 +333,78 @@ class MemberService:
         who = self._caller(actor, "mine")
         view = self._view(who)
         return {k: view.get(k) for k in ("available", "updated", "usage", "artifacts", "shared_with_me", "links")}
+
+    def library(self, actor: Mapping[str, Any], *, available_only: bool = False) -> dict[str, Any]:
+        """The caller's library (feed items and folders) from their view file; empty when there is none yet, or, with
+        ``available_only``, a 503 ``unavailable`` (the agent tool must not mistake a missing view for an empty library)."""
+        view = self._view(self._caller(actor, "library"))
+        if available_only and not (view.get("available") and isinstance(view.get("library"), dict)):
+            raise MemberServiceError(503, "unavailable", "your library is not available right now; try again shortly")
+        library = view.get("library")
+        if not isinstance(library, dict):
+            return {"items": [], "folders": []}
+        return {"items": library.get("items") if isinstance(library.get("items"), list) else [],
+                "folders": library.get("folders") if isinstance(library.get("folders"), list) else []}
+
+    def library_content(self, actor: Mapping[str, Any], artifact_id: Any, path: Any) -> tuple[dict[str, Any], bytes]:
+        """``(file entry, bytes)`` of ``path`` in the head version of a library item of the caller.  The item must be in
+        the caller's own view (active or pending) with a ``files`` entry for exactly this path; the bytes come from the
+        worker's gated pool by their digest.  Everything else (stranger, missing, revoked, expired, unknown path, pool
+        blob gone or changed) is one 404; an owner whose item is over the size caps is told ``too_large``."""
+        who = self._caller(actor, "content")
+        view = self._view(who)
+        item = self._entry((view.get("library") or {}).get("items") if isinstance(view.get("library"), dict) else None,
+                           artifact_id)
+        if item is None or item.get("status") not in ("active", "pending") or not isinstance(path, str):
+            raise self._fail(who.pr, "content", "not_visible", 404, "not_found", NOT_FOUND, artifact_id)
+        files = item.get("files") if isinstance(item.get("files"), list) else []
+        entry = next((f for f in files if isinstance(f, dict) and f.get("path") == path), None)
+        if entry is None:
+            if item.get("too_large") is True and self._entry(view.get("artifacts"), artifact_id) is not None:
+                raise MemberServiceError(404, "too_large", "this artifact is too large to open here")
+            raise self._fail(who.pr, "content", "no_file", 404, "not_found", NOT_FOUND, artifact_id)
+        sha, size = entry.get("sha256"), entry.get("size")
+        if (not isinstance(sha, str) or not _SHA.match(sha) or isinstance(size, bool) or not isinstance(size, int)
+                or not 0 <= size <= LIBRARY_FILE_MAX):
+            raise self._fail(who.pr, "content", "bad_entry", 404, "not_found", NOT_FOUND, artifact_id)
+        fh = open_beneath(self.bridge.mirror, [LIBRARY_CONTENT_DIR, sha], max_bytes=size)
+        if fh is None:
+            raise self._fail(who.pr, "content", "no_blob", 404, "not_found", NOT_FOUND, artifact_id)
+        try:
+            with fh:
+                data = fh.read(size + 1)
+        except (OSError, BridgeError):
+            raise self._fail(who.pr, "content", "no_blob", 404, "not_found", NOT_FOUND, artifact_id) from None
+        if len(data) != size or hashlib.sha256(data).hexdigest() != sha:
+            raise self._fail(who.pr, "content", "bad_blob", 404, "not_found", NOT_FOUND, artifact_id)
+        return entry, data
+
+    def library_write(self, actor: Mapping[str, Any], kind: str, payload: dict, artifact_id: str | None = None) -> dict[str, Any]:
+        """Enqueue one library intent (folders, filing, accept or discard of a push) and return the ticket result.  The
+        worker validates the payload and re-checks ownership; this only gates on group membership."""
+        who = self._caller(actor, "library")
+        return self._submit(who, kind, payload, artifact_id, "library")
+
+    def library_folder_create(self, actor, name):
+        return self.library_write(actor, KIND_LIBRARY_FOLDER_CREATE, {"name": name})
+
+    def library_folder_rename(self, actor, folder_id, name):
+        return self.library_write(actor, KIND_LIBRARY_FOLDER_RENAME, {"folder_id": folder_id, "name": name})
+
+    def library_folder_delete(self, actor, folder_id):
+        return self.library_write(actor, KIND_LIBRARY_FOLDER_DELETE, {"folder_id": folder_id})
+
+    def library_file(self, actor, folder_id, artifact_id):
+        return self.library_write(actor, KIND_LIBRARY_FILE, {"folder_id": folder_id}, artifact_id)
+
+    def library_unfile(self, actor, folder_id, artifact_id):
+        return self.library_write(actor, KIND_LIBRARY_UNFILE, {"folder_id": folder_id}, artifact_id)
+
+    def library_accept(self, actor, artifact_id):
+        return self.library_write(actor, KIND_LIBRARY_ACCEPT, {}, artifact_id)
+
+    def library_discard(self, actor, artifact_id):
+        return self.library_write(actor, KIND_LIBRARY_DISCARD, {}, artifact_id)
 
     @staticmethod
     def _grants(entry: Mapping[str, Any] | None, need: str) -> bool:

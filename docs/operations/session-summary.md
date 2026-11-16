@@ -205,8 +205,10 @@ It publishes the report and prints one line:
   A total line closes the graph and the drift marker carries the cost of everything after the topic change. A figure
   that was not recorded is left out, never shown as 0 or estimated; child-agent usage in separate records is not
   counted and the total says "main session only". A valid graph is saved beside the report as `<report>.graph.json` (0600) and drawn in a second pane
-  split below the summary (`herdr-eng summary graph FILE --close-pane ID --peer ID`): boxes joined by arrows in a
-  row when they fit, a column when they do not, a numbered list below 30 columns, ASCII when the terminal is not
+  split below the summary (`herdr-eng summary graph FILE --close-pane ID --peer ID`): boxes joined by arrows, routed to fill the
+  pane: one row when they fit, otherwise balanced rows of boxes with an elbow connector from the end of each row
+  to the start of the next (the arrangement with the fewest lines wins, wider labels on a tie), a single column
+  only when no row of two boxes fits, a numbered list below 30 columns, ASCII when the terminal is not
   UTF-8. The marker `◆ Looks like a new task from prompt N` is a judgement, not a fact. The graph reflows on
   resize and has the same scroll keys. The result of `publish` carries `graph` (`ok`, `pane_id`, `error`,
   `skipped`); a failure there never affects the summary. The two viewers are peers: closing either closes both, and

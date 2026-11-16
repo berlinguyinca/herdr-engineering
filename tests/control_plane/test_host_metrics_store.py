@@ -209,7 +209,7 @@ def test_bad_telemetry_does_not_touch_host_record():
 
 
 def _realistic_sample(cpu=20.0):
-    top = [{"pid": 1000 + i, "command": "python3", "user": "wohlgemuth",
+    top = [{"pid": 1000 + i, "command": "python3", "user": "user",
             "cpu_pct": 12.5, "mem_pct": 3.1, "owner": "pi-worker-1"} for i in range(5)]
     return {
         **_sample(cpu=cpu), "load5": 0.4, "load15": 0.3, "swap": 2.0,

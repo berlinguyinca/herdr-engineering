@@ -166,7 +166,7 @@ def test_invalid_explicit_names_are_rejected(name):
 
 
 @pytest.mark.parametrize('title', [
-    'codex: /home/wohlgemuth/IdeaProjects/herdr-engineering',
+    'codex: /home/user/IdeaProjects/herdr-engineering',
     'Claude Code 🤖 — fixing agent summaries',
     '', '   ', 'A' * 81, 'title\nwith controls', 42, '<script>',
 ])

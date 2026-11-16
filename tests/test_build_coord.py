@@ -187,9 +187,9 @@ def test_sccache_server_daemon_does_not_pin_slot_or_maintenance_lock(tmp_path):
         f"state_dir={str(state)!r}, child_env=dict(os.environ, RUSTC_WRAPPER={str(stub)!r})))"
     )
     try:
-        r = subprocess.run([sys.executable, "-c", script], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=30)
-        assert r.returncode == 0
+        r = subprocess.run([sys.executable, "-c", script], capture_output=True,
+                           text=True, timeout=30)
+        assert r.returncode == 0, r.stderr
         deadline = time.monotonic() + 5
         while not pidfile.exists() and time.monotonic() < deadline:
             time.sleep(0.05)

@@ -952,6 +952,17 @@ class CollabArtifactBridge:
                 anchor["region"] = {k: v for k, v in anchor["region"].items() if k in ("x", "y", "w", "h")
                                     and isinstance(v, (int, float)) and not isinstance(v, bool)}
             out["anchor"] = anchor
+        # Rows stored before the input check existed may carry invisible or direction-changing characters; the agent
+        # gets the same display-safe text external agents do (tag characters, bidi, zero-width, secrets removed).
+        from . import collab_external as ext
+        if isinstance(out.get("body"), str):
+            out["body"] = ext.clean_text(out["body"], 8000, multiline=True)
+        if isinstance(out.get("file"), str):
+            out["file"] = ext.clean_text(out["file"], 512)
+        if isinstance(out.get("anchor"), dict):
+            for key in ("exact", "prefix", "suffix", "file"):
+                if isinstance(out["anchor"].get(key), str):
+                    out["anchor"][key] = ext.clean_text(out["anchor"][key], 8000, multiline=True)
         return out
 
     def annotations(self, pr: Principal, artifact_id, *, limit: int = 200) -> dict:

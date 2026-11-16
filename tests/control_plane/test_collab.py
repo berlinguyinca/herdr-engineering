@@ -20,6 +20,7 @@ from herdr_engineering.control_plane.collab import (
     StaticTokenAuthenticator,
 )
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
+from tests.io_timeouts import HTTP_TIMEOUT
 
 TOKENS = {"alice": "tok-alice-0123456789", "bob": "tok-bob-0123456789abc",
           "carol": "tok-carol-0123456789ab", "mallory": "tok-mallory-0123456789"}
@@ -46,7 +47,7 @@ class Api:
 
     def call(self, method, path, body=None, *, user=None, agent=None, device=None,
              headers=None, raw_token=None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=HTTP_TIMEOUT)
         h = dict(headers or {})
         if user:
             h["Authorization"] = f"Bearer {TOKENS[user]}"
@@ -70,7 +71,7 @@ class Api:
         return resp.status, parsed
 
     def stream(self, path, **auth):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=HTTP_TIMEOUT)
         h = {}
         if auth.get("user"):
             h["Authorization"] = f"Bearer {TOKENS[auth['user']]}"

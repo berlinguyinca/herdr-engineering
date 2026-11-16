@@ -44,12 +44,20 @@ MAX_TOKEN_CHARS: Final = 8192
 READ_BLOCK: Final = 64 * 1024
 _PATH = re.compile(r"[A-Za-z0-9_.~/-]{1,512}")
 _ID = re.compile(r"[A-Za-z0-9_.~-]{1,200}\Z")
+_FOLDER = re.compile(r"fld_[0-9a-f]{24}\Z")
+_ARTIFACT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}\Z")      # the mirror's artifact id rule
+_CTYPE = re.compile(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+(; ?charset=[A-Za-z0-9_-]+)?")
+# inline only where the browser cannot run script from it (html and svg are attachments)
+_INLINE_TYPES: Final = frozenset({"text/plain", "image/png", "image/jpeg", "image/gif", "image/webp",
+                                  "application/pdf"})
 _UPLOAD = re.compile(UPLOAD_RE)
 _SHA = re.compile(SHA_RE)
 _DIGITS = re.compile(r"[0-9]{1,15}\Z")
 _HTML: Final = "text/html; charset=utf-8"
 _JS: Final = "text/javascript; charset=utf-8"
 _CSS: Final = "text/css; charset=utf-8"
+_FONT: Final = "font/woff2"
+FONT_CACHE: Final = "public, max-age=86400"   # fixed file names: one day, not immutable
 # Every file the page loads, by EXACT path (url -> (source, content type)).  A source is relative to ``web_root``, or
 # ("share_static", name) for the sign-in helpers shared with the share viewer.  The page CSP names exactly these paths
 # (never 'self'), so adding a file here is the one place a new script or style is admitted.
@@ -62,7 +70,9 @@ _STATIC: Final = {"/": ("member-artifacts.html", _HTML),
                   "/my/sha256-stream.js": ("sha256-stream.js", _JS),
                   "/my/herdr-web-components/util.js": ("herdr-web-components/util.js", _JS),
                   "/my/lab-signin.js": (("share_static", "lab-signin.js"), _JS),
-                  "/my/theme.css": ("herdr-design-system/theme.css", _CSS),
+                  "/my/tokens.css": (("share_static", "tokens.css"), _CSS),
+                  "/my/fonts/inter-latin-400.woff2": (("share_static", "fonts/inter-latin-400.woff2"), _FONT),
+                  "/my/fonts/inter-latin-600.woff2": (("share_static", "fonts/inter-latin-600.woff2"), _FONT),
                   "/my/base.css": ("herdr-design-system/base.css", _CSS),
                   "/my/member-artifacts.css": ("member-artifacts.css", _CSS)}
 _SHARE_STATIC: Final = Path(__file__).resolve().parent / "share_static"
@@ -75,6 +85,8 @@ _BODY_KEYS = {
     "publish": ({"base_version_id", "files", "message", "entry", "idempotency_key"}, {"files", "message"}),
     "share_create": ({"version_id", "audience", "allow_groups", "allow_emails", "expires_in_days", "entry", "title",
                       "idempotency_key"}, {"version_id", "audience"}),
+    "folder": ({"name"}, {"name"}),
+    "folder_item": ({"artifact_id"}, {"artifact_id"}),
     "approve": ({"confirm", "idempotency_key"}, {"confirm"}),
 }
 
@@ -93,6 +105,10 @@ def _unauthorized() -> _Reply:
 
 def _bad(message: str = "bad request") -> _Reply:
     return _Reply(400, "bad_request", message)
+
+
+CONTENT_READS = 8       # concurrent content reads (each holds a whole file, up to 25 MB, in memory)
+_content_gate = threading.BoundedSemaphore(CONTENT_READS)     # the server is threaded, so a thread semaphore
 
 
 class _Window:
@@ -175,7 +191,8 @@ class MemberWeb:
         h._response_status = status
         h.send_response(status)
         h.send_header("Content-Type", ctype)
-        h.send_header("Cache-Control", "no-store")
+        if "Cache-Control" not in (headers or {}):
+            h.send_header("Cache-Control", "no-store")
         h.send_header("X-Content-Type-Options", "nosniff")
         h.send_header("Referrer-Policy", "no-referrer")
         h.send_header("Content-Length", str(len(payload)))
@@ -217,7 +234,7 @@ class MemberWeb:
             h.close_connection = True
             return
         method = h.command
-        if method not in ("GET", "POST", "PUT"):
+        if method not in ("GET", "POST", "PUT", "DELETE"):
             raise _Reply(405, "method_not_allowed", "method not allowed")
         if method != "GET":
             origins = h.headers.get_all("Origin") or []
@@ -258,9 +275,12 @@ class MemberWeb:
         scripts = " ".join(f"{self.origin}{u}" for u in _STATIC if u.endswith(".js"))
         styles = " ".join(f"{self.origin}{u}" for u in _STATIC if u.endswith(".css"))
         csp = (f"default-src 'none'; script-src {scripts}; style-src {styles}; "
-               f"img-src 'self' data:; connect-src {connect}; frame-src 'none'; object-src 'none'; "
+               f"img-src 'self' data:; font-src 'self'; connect-src {connect}; frame-src 'none'; object-src 'none'; "
                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-        self._send(h, 200, target.read_bytes(), ctype, {"Content-Security-Policy": csp, "X-Frame-Options": "DENY"})
+        extra = {"Content-Security-Policy": csp, "X-Frame-Options": "DENY"}
+        if ctype == _FONT:
+            extra["Cache-Control"] = FONT_CACHE
+        self._send(h, 200, target.read_bytes(), ctype, extra)
 
     def _cognito_origin(self) -> str | None:
         domain = self.public_config.get("hosted_ui_domain")
@@ -336,16 +356,34 @@ class MemberWeb:
                 return self._r_me
             if rest == ["links"]:
                 return self._r_links
+            if rest == ["library"]:
+                return self._r_library
             if n == 2 and rest[0] == "results":
                 return self._r_result
             if n == 2 and rest[0] == "artifacts":
                 return self._r_head
+            if n >= 4 and rest[0] == "artifacts" and rest[2] == "content":
+                return self._r_content
             if n == 3 and rest[0] == "artifacts" and rest[2] in ("history", "shares"):
                 return self._r_history if rest[2] == "history" else self._r_shares
             return None
+        if method == "DELETE":
+            if n == 2 and rest[0] == "folders":
+                return self._r_folder_delete
+            if n == 4 and rest[0] == "folders" and rest[2] == "items":
+                return self._r_unfile
+            return None
+        if method == "PUT" and n == 2 and rest[0] == "folders":
+            return self._r_folder_rename
         if method == "POST":
             if rest == ["artifacts"]:
                 return self._r_create
+            if rest == ["folders"]:
+                return self._r_folder_create
+            if n == 3 and rest[0] == "folders" and rest[2] == "items":
+                return self._r_file
+            if n == 3 and rest[0] == "pending" and rest[2] in ("accept", "discard"):
+                return self._r_accept if rest[2] == "accept" else self._r_discard
             if n == 3 and rest[0] == "artifacts":
                 return {"delete": self._r_delete, "publish": self._r_publish,
                         "shares": self._r_share_create}.get(rest[2])
@@ -515,6 +553,75 @@ class MemberWeb:
     def _r_abort(self, h, ms, pr, actor, rest, query):
         self._body(h, None)
         self._json(h, ms.upload_abort(actor, self._live(ms, actor, self._ident(rest[1])), rest[3]))
+
+    # ----------------------------------------------------------------------------------------------- the library
+    def _r_content(self, h, ms, pr, actor, rest, query):
+        """``GET /api/member/artifacts/{id}/content/{path}``: one file of a library item, gated by the caller's own view."""
+        self._query(query, set())
+        if not _ARTIFACT.match(rest[1]) or h.path.partition("?")[0].endswith("/"):
+            raise _Reply(404, "not_found", "not found")
+        if not _content_gate.acquire(timeout=5):
+            raise _Reply(503, "busy", "too many downloads, retry shortly", {"Retry-After": "2"})
+        try:
+            entry, data = ms.library_content(actor, rest[1], "/".join(rest[3:]))
+        finally:
+            _content_gate.release()
+        ctype = entry.get("content_type") if isinstance(entry.get("content_type"), str) else "application/octet-stream"
+        base = ctype.split(";", 1)[0].strip().lower()
+        inline = base in _INLINE_TYPES
+        name = rest[-1]
+        disposition = "inline" if inline else f'attachment; filename="{name}"'
+        self._send(h, 200, data, ctype if _CTYPE.fullmatch(ctype) else "application/octet-stream",
+                   {"Content-Security-Policy": "default-src 'none'; sandbox", "Content-Disposition": disposition,
+                    "X-Frame-Options": "DENY"})
+
+    @staticmethod
+    def _folder_id(value: str) -> str:
+        if not _FOLDER.match(value):
+            raise _Reply(404, "not_found", "not found")
+        return value
+
+    @staticmethod
+    def _artifact_id(value: Any) -> str:
+        if not isinstance(value, str) or not _ARTIFACT.match(value):
+            raise _bad("bad artifact id")
+        return value
+
+    def _r_library(self, h, ms, pr, actor, rest, query):
+        self._query(query, set())
+        self._json(h, ms.library(actor))
+
+    def _r_folder_create(self, h, ms, pr, actor, rest, query):
+        self._json(h, ms.library_folder_create(actor, self._body(h, "folder")["name"]))
+
+    def _r_folder_rename(self, h, ms, pr, actor, rest, query):
+        folder = self._folder_id(rest[1])
+        self._json(h, ms.library_folder_rename(actor, folder, self._body(h, "folder")["name"]))
+
+    def _r_folder_delete(self, h, ms, pr, actor, rest, query):
+        folder = self._folder_id(rest[1])
+        self._body(h, None)
+        self._json(h, ms.library_folder_delete(actor, folder))
+
+    def _r_file(self, h, ms, pr, actor, rest, query):
+        folder = self._folder_id(rest[1])
+        self._json(h, ms.library_file(actor, folder, self._artifact_id(self._body(h, "folder_item")["artifact_id"])))
+
+    def _r_unfile(self, h, ms, pr, actor, rest, query):
+        folder = self._folder_id(rest[1])
+        artifact = self._artifact_id(rest[3])
+        self._body(h, None)
+        self._json(h, ms.library_unfile(actor, folder, artifact))
+
+    def _r_accept(self, h, ms, pr, actor, rest, query):
+        artifact = self._artifact_id(rest[1])
+        self._body(h, None)
+        self._json(h, ms.library_accept(actor, artifact))
+
+    def _r_discard(self, h, ms, pr, actor, rest, query):
+        artifact = self._artifact_id(rest[1])
+        self._body(h, None)
+        self._json(h, ms.library_discard(actor, artifact))
 
     # ----------------------------------------------------------------------------------------------- the run PUT
     def _header_once(self, h, name: str) -> str:

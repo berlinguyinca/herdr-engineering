@@ -26,9 +26,11 @@ import hashlib
 import json
 import logging
 import math
+import mimetypes
 import os
 import re
 import stat
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -54,6 +56,7 @@ from .collab_bridge_files import (
     read_staged_meta,
     register_intent_kind,
     remove_tree_beneath,
+    stream_new_beneath,
     tree_entry_cap,
     unlink_beneath,
 )
@@ -67,6 +70,13 @@ log = logging.getLogger(__name__)
 KIND_CREATE = "member.artifact_create"
 KIND_PUBLISH = "member.publish"
 KIND_DELETE = "member.artifact_delete"
+KIND_LIBRARY_ACCEPT = "library_accept"
+KIND_LIBRARY_DISCARD = "library_discard"
+KIND_LIBRARY_FOLDER_CREATE = "library_folder_create"
+KIND_LIBRARY_FOLDER_RENAME = "library_folder_rename"
+KIND_LIBRARY_FOLDER_DELETE = "library_folder_delete"
+KIND_LIBRARY_FILE = "library_file"
+KIND_LIBRARY_UNFILE = "library_unfile"
 KIND_SHARE_CREATE = "member.share_create"
 KIND_SHARE_APPROVE = "member.share_approve"
 KIND_SHARE_REVOKE = "member.share_revoke"
@@ -83,6 +93,7 @@ VIEW_MAX_ARTIFACTS = 500
 VIEW_MAX_VERSIONS = 50
 VIEW_MAX_LINKS = 200
 VIEW_MAX_SHARED = 500
+LIBRARY_VIEW_MAX = 2000
 VIEW_INTERVAL = 60.0
 MEDIA_TYPES = {
     ".html": "text/html", ".pdf": "application/pdf", ".parquet": "application/vnd.apache.parquet",
@@ -117,6 +128,7 @@ class MemberRuntime:
     share_settings: Mapping[str, Any] | None = None   # ``share_settings_config`` plus ``member_share_limits``; None = off
     secret_mode: int = 0o600           # file mode of a secret result when ``secret_gid`` is None
     secret_gid: int | None = None      # group of collab-public: the secret dir becomes 0770 and the file 0640 in it
+    rustfs: Any = None                 # blob client the library content pool is filled from (None: no content is mirrored)
 
 
 # ----------------------------------------------------------------------------- payloads
@@ -268,13 +280,58 @@ def _share_ref(kind: str, extra: frozenset[str] = frozenset()):
 
 _BOTH = frozenset({"agent", "user"})
 register_intent_kind(KIND_SHARE_CREATE, validate_share_create_payload, actors=_BOTH, requires_artifact=True)
-register_intent_kind(KIND_SHARE_APPROVE, _share_ref(KIND_SHARE_APPROVE, frozenset({"confirm"})), actors=_BOTH,
-                     requires_artifact=True)
+# Making a link live is a human decision: users only.  An agent may create a pending share, never approve it.
+register_intent_kind(KIND_SHARE_APPROVE, _share_ref(KIND_SHARE_APPROVE, frozenset({"confirm"})),
+                     actors=frozenset({"user"}), requires_artifact=True)
 register_intent_kind(KIND_SHARE_REVOKE, _share_ref(KIND_SHARE_REVOKE), actors=_BOTH, requires_artifact=True)
 register_intent_kind(KIND_SHARE_EVENTS, _share_ref(KIND_SHARE_EVENTS), actors=_BOTH, requires_artifact=True)
 register_intent_kind(KIND_CREATE, validate_create_payload, actors=_BOTH, requires_artifact=False)
 register_intent_kind(KIND_PUBLISH, validate_publish_payload, actors=_BOTH, requires_artifact=True)
 register_intent_kind(KIND_DELETE, validate_delete_payload, actors=_BOTH, requires_artifact=True)
+
+
+def _validate_empty(kind: str):
+    def validate(raw: dict, limits: BridgeLimits) -> dict:
+        if raw != {}:
+            raise _bad(kind)
+        return {}
+    return validate
+
+
+# Reviewing agent pushes is a human decision: users only, and never on the agent tool menu.
+register_intent_kind(KIND_LIBRARY_ACCEPT, _validate_empty(KIND_LIBRARY_ACCEPT), actors=frozenset({"user"}),
+                     requires_artifact=True)
+register_intent_kind(KIND_LIBRARY_DISCARD, _validate_empty(KIND_LIBRARY_DISCARD), actors=frozenset({"user"}),
+                     requires_artifact=True)
+
+
+_FOLDER_ID = re.compile(r"fld_[0-9a-f]{24}\Z")
+
+
+def _folder_payload(kind: str, keys: frozenset[str]):
+    """A payload of exactly ``keys`` (``folder_id``, ``name``, ``share_id``), checked; the plain dict."""
+    def validate(raw: dict, limits: BridgeLimits) -> dict:
+        if not isinstance(raw, dict) or set(raw) != keys:
+            raise _bad(kind)
+        if "folder_id" in keys and (not isinstance(raw["folder_id"], str) or not _FOLDER_ID.match(raw["folder_id"])):
+            raise _bad(kind)
+        if "name" in keys and (not isinstance(raw["name"], str) or not 1 <= len(raw["name"]) <= 400):
+            raise _bad(kind)
+        if "share_id" in keys and (not isinstance(raw["share_id"], str) or not _SHARE_ID.match(raw["share_id"])):
+            raise _bad(kind)
+        return dict(raw)
+    return validate
+
+
+# The library is a person's own filing: users only, never on the agent tool menu.
+_USER = frozenset({"user"})
+for _kind, _keys, _needs_artifact in (
+        (KIND_LIBRARY_FOLDER_CREATE, frozenset({"name"}), False),
+        (KIND_LIBRARY_FOLDER_RENAME, frozenset({"folder_id", "name"}), False),
+        (KIND_LIBRARY_FOLDER_DELETE, frozenset({"folder_id"}), False),
+        (KIND_LIBRARY_FILE, frozenset({"folder_id"}), True),
+        (KIND_LIBRARY_UNFILE, frozenset({"folder_id"}), True)):
+    register_intent_kind(_kind, _folder_payload(_kind, _keys), actors=_USER, requires_artifact=_needs_artifact)
 
 
 # ----------------------------------------------------------------------------- the member directory
@@ -384,7 +441,7 @@ async def _own(conn: Any, artifact_id: str | None, principal: str) -> Mapping[st
 async def _conclude(ctx: IntentContext, who: _Who, action: str, out: dict, *, artifact_id: str | None) -> dict:
     """Audit the outcome, stamp ``last_used_at`` and hand the principal to the after-hook."""
     from .artifact_members import MemberStore
-    ok = out.get("result") in ("created", "deleted")
+    ok = out.get("result") in ("created", "deleted", "accepted", "renamed", "filed", "unfiled")
     await MemberStore(ctx.conn).record(
         who.principal, action, actor=_actor_json(who.actor), artifact_id=artifact_id,
         outcome="ok" if ok else "refused", code=None if ok else str(out.get("reason") or out.get("result")))
@@ -396,6 +453,12 @@ async def _conclude(ctx: IntentContext, who: _Who, action: str, out: dict, *, ar
 # ----------------------------------------------------------------------------- create
 
 async def handle_create(ctx: IntentContext, intent: Intent) -> dict:
+    from .artifact_library import (
+        PENDING_CAP,
+        PENDING_CAP_CODE,
+        PENDING_CAP_MESSAGE,
+        count_pending_on,
+    )
     from .artifact_member_quota import QuotaExceeded, check_new_artifact
     who, refusal = await _member(ctx, "artifact_create")
     if refusal is not None:
@@ -416,9 +479,16 @@ async def handle_create(ctx: IntentContext, intent: Intent) -> dict:
         except QuotaExceeded as exc:
             out = _rejected(exc.code)
         else:
+            agent_push = who.actor.kind == "agent"
+            if agent_push:             # the usage row is already locked by the quota check: counting here is race-free
+                if await count_pending_on(ctx.conn, who.principal) >= PENDING_CAP:
+                    out = {**_rejected(PENDING_CAP_CODE), "message": PENDING_CAP_MESSAGE}
+                    return await _conclude(ctx, who, "artifact_create", out, artifact_id=None)
             made = await ctx.store.register_logical(original_filename=payload.filename, artifact_type="other",
                                                     created_by=who.principal)
             aid = made["artifact_id"]
+            if agent_push:
+                await ctx.conn.execute("UPDATE artifacts SET intake='pending' WHERE artifact_id=$1", aid)
             await ctx.conn.execute(
                 "UPDATE artifacts SET display_name=$2, payload=$3::jsonb WHERE artifact_id=$1", aid, payload.title,
                 json.dumps({"profile": payload.profile}))
@@ -516,10 +586,14 @@ async def _publish(ctx: IntentContext, intent: Intent, who: _Who) -> dict:
 
 async def revoke_share(conn: Any, rt: MemberRuntime, share_id: str, *, actor: str) -> None:
     """Revoke one share: its served state first (the next lookup finds nothing), then the row, then the bundle."""
+    await revoke_share_at(conn, rt.shares_root, share_id, actor=actor)
+
+
+async def revoke_share_at(conn: Any, root: Path | None, share_id: str, *, actor: str) -> None:
+    """``revoke_share`` for a caller that has the share bundle directory but no ``MemberRuntime`` (the dashboard)."""
     from .artifact_shares import ShareStore
     from .share_bundle import remove_bundle, remove_state
     store = ShareStore(conn)
-    root = rt.shares_root
     seen = await store.get(share_id)
     if seen is None:
         return
@@ -552,24 +626,152 @@ def _remove_member_staging(rt: MemberRuntime, owner_key: str, artifact_id: str, 
 
 
 async def handle_delete(ctx: IntentContext, intent: Intent) -> dict:
-    from .artifact_member_quota import settle
-    from .artifact_shares import ShareStore
     who, refusal = await _member(ctx, "artifact_delete")
     if refusal is not None:
         return refusal
-    aid = intent.artifact_id
-    async with ctx.conn.transaction():
-        row = await _own(ctx.conn, aid, who.principal)
+    return await _delete_own(ctx, who, intent.artifact_id, "artifact_delete")
+
+
+async def delete_member_rows(conn: Any, store: Any, shares_root: Path | None, principal: str, aid: str | None) -> bool:
+    """The member delete, in one transaction: retract the artifact, revoke every share of it and settle the quota.
+    False when ``principal`` does not own a live ``aid`` (nothing is changed).  The one implementation behind a
+    member's delete/discard intents and the dashboard's discard for a key mapped to that member."""
+    from .artifact_member_quota import settle
+    from .artifact_shares import ShareStore
+    async with conn.transaction():
+        row = await _own(conn, aid, principal)
         if row is None:
-            return await _conclude(ctx, who, "artifact_delete", _rejected("not_found"), artifact_id=aid)
+            return False
         if row["lifecycle"] == "active":
-            await ctx.store.record_retraction(aid, reason="member delete")
-        for share in await ShareStore(ctx.conn).list_for_artifact(aid):     # any creator, any audience
+            await store.record_retraction(aid, reason="member delete")
+        for share in await ShareStore(conn).list_for_artifact(aid):     # any creator, any audience
             if share["state"] != "revoked":
-                await revoke_share(ctx.conn, who.rt, share["share_id"], actor=f"member-delete:{who.principal}")
-        await settle(ctx.conn, who.principal)
+                await revoke_share_at(conn, shares_root, share["share_id"], actor=f"member-delete:{principal}")
+        await settle(conn, principal)
+    return True
+
+
+async def _delete_own(ctx: IntentContext, who: _Who, aid: str | None, action: str) -> dict:
+    if not await delete_member_rows(ctx.conn, ctx.store, who.rt.shares_root, who.principal, aid):
+        return await _conclude(ctx, who, action, _rejected("not_found"), artifact_id=aid)
     await asyncio.to_thread(_remove_member_staging, who.rt, who.owner_key, aid, ctx.limits)
-    return await _conclude(ctx, who, "artifact_delete", {"result": "deleted"}, artifact_id=aid)
+    return await _conclude(ctx, who, action, {"result": "deleted"}, artifact_id=aid)
+
+
+# ----------------------------------------------------------------------------- library: accept or discard a push
+
+async def handle_library_accept(ctx: IntentContext, intent: Intent) -> dict:
+    from .artifact_library import LibraryError, accept_pending_on
+    who, refusal = await _member(ctx, "library_accept")
+    if refusal is not None:
+        return refusal
+    try:
+        async with ctx.conn.transaction():
+            await accept_pending_on(ctx.conn, who.principal, intent.artifact_id)
+    except LibraryError:
+        out = _rejected("not_found")
+    else:
+        out = {"result": "accepted"}
+    return await _conclude(ctx, who, "library_accept", out, artifact_id=intent.artifact_id)
+
+
+async def handle_library_discard(ctx: IntentContext, intent: Intent) -> dict:
+    from .artifact_library import LibraryError, require_pending_on
+    who, refusal = await _member(ctx, "library_discard")
+    if refusal is not None:
+        return refusal
+    try:
+        await require_pending_on(ctx.conn, who.principal, intent.artifact_id)
+    except LibraryError:
+        out = _rejected("not_found")
+        return await _conclude(ctx, who, "library_discard", out, artifact_id=intent.artifact_id)
+    return await _delete_own(ctx, who, intent.artifact_id, "library_discard")
+
+
+# ----------------------------------------------------------------------------- library: folders, filing, claims
+
+class _OneConn:
+    """Lets ``LibraryStore`` run on the worker's own connection: ``acquire()`` hands that connection back."""
+    def __init__(self, conn: Any):
+        self._conn = conn
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    def acquire(self):
+        import contextlib
+
+        @contextlib.asynccontextmanager
+        async def held():
+            yield self._conn
+        return held()
+
+
+def _library_handler(action: str, run: Callable[..., Any], result: str):
+    """A user-only library intent: ``run(store, principal, intent, who)`` returns extra result fields.
+    Results carry no ids (the view has them). A ``LibraryError`` becomes a rejection with its code (``not_found`` for another member's folder, as for a missing one)."""
+    async def handle(ctx: IntentContext, intent: Intent) -> dict:
+        from .artifact_library import LibraryError, LibraryStore
+        who, refusal = await _member(ctx, action)
+        if refusal is not None:
+            return refusal
+        store = LibraryStore(_OneConn(ctx.conn))
+        try:
+            async with ctx.conn.transaction():
+                extra = await run(store, who.principal, intent, who)
+        except LibraryError as exc:
+            out = _rejected(exc.code)
+            if exc.status == 429:                  # a cap: the member is told why, in words
+                out["message"] = exc.message
+        else:
+            out = {"result": result, **extra}
+        return await _conclude(ctx, who, action, out, artifact_id=intent.artifact_id)
+    return handle
+
+
+def _folder_json(folder: Any) -> dict:
+    return {"folder_id": folder.folder_id, "name": folder.name, "item_count": folder.item_count}
+
+
+async def _folder_create(store: Any, principal: str, intent: Intent, _who: Any) -> dict:
+    """Create-or-get by name, so a replayed intent (or a double click) yields the same folder.  This deliberately
+    differs from ``LibraryStore.create_folder`` (409 ``duplicate_name``): replays must be idempotent.  The member's lane is
+    serial, so looking first cannot race; an insert that failed would abort the transaction."""
+    name = intent.payload["name"]
+    if not any(f.name.lower() == name.strip().lower() for f in await store.list_folders(principal)):
+        await store.create_folder(principal, name)
+    return {}
+
+
+async def _folder_rename(store: Any, principal: str, intent: Intent, _who: Any) -> dict:
+    await store.rename_folder(principal, intent.payload["folder_id"], intent.payload["name"])
+    return {}
+
+
+async def _folder_delete(store: Any, principal: str, intent: Intent, _who: Any) -> dict:
+    await store.delete_folder(principal, intent.payload["folder_id"])
+    return {}
+
+
+async def _file(store: Any, principal: str, intent: Intent, who: Any) -> dict:
+    email, groups = await _member_identity(principal, who.rt)      # a stale directory fails closed: own items only
+    await store.file_artifact(principal, intent.payload["folder_id"], intent.artifact_id,
+                              member_email=email, member_groups=groups)
+    return {}
+
+
+async def _unfile(store: Any, principal: str, intent: Intent, _who: Any) -> dict:
+    await store.unfile_artifact(principal, intent.payload["folder_id"], intent.artifact_id)
+    return {}
+
+
+LIBRARY_HANDLERS = (
+    (KIND_LIBRARY_FOLDER_CREATE, _library_handler("library_folder_create", _folder_create, "created")),
+    (KIND_LIBRARY_FOLDER_RENAME, _library_handler("library_folder_rename", _folder_rename, "renamed")),
+    (KIND_LIBRARY_FOLDER_DELETE, _library_handler("library_folder_delete", _folder_delete, "deleted")),
+    (KIND_LIBRARY_FILE, _library_handler("library_file", _file, "filed")),
+    (KIND_LIBRARY_UNFILE, _library_handler("library_unfile", _unfile, "unfiled")),
+)
 
 
 # ----------------------------------------------------------------------------- the member view
@@ -582,7 +784,224 @@ def _json(value: object) -> Any:
     return json.loads(value) if isinstance(value, str) else value
 
 
-async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: Mapping[str, Any] | None = None) -> None:
+async def _member_identity(principal: str, rt: MemberRuntime | None) -> tuple[str, frozenset[str]]:
+    """The member's (email, groups) from the worker's member directory; empty when it cannot be known (no runtime,
+    stale or missing directory, unknown member). Nothing is guessed."""
+    from .artifact_members import member_principal
+    if rt is None:
+        return "", frozenset()
+    directory = await asyncio.to_thread(load_directory, rt)
+    for user_id, entry in (directory or {}).items():
+        try:
+            if member_principal(user_id) != principal:
+                continue
+        except ValueError:
+            continue
+        email, groups = entry.get("email"), entry.get("groups")
+        return (email if isinstance(email, str) else ""), frozenset(g for g in groups or [] if isinstance(g, str))
+    return "", frozenset()
+
+
+def _item_json(item: Any) -> dict:
+    return {"artifact_id": item.artifact_id, "title": item.title, "sharer": item.sharer,
+            "shared_at": _iso(item.shared_at), "source": item.source, "status": item.status,
+            "expires_at": _iso(item.expires_at), "share_id": item.share_id, "folder_ids": list(item.folder_ids),
+            "artifact_type": item.artifact_type, "size_bytes": item.size_bytes}
+
+
+LIBRARY_CONTENT_DIR = "library-content"          # <mirror>/library-content/<sha256>: the shared, gated blob pool
+LIB_MAX_FILES = 200
+LIB_MAX_FILE_BYTES = 25 * 1024 * 1024
+LIB_MAX_ITEM_BYTES = 100 * 1024 * 1024
+POOL_GC_MIN_AGE = 600.0
+POOL_TICK_FILL_BYTES = 200 * 1024 * 1024          # new pool bytes fetched per publish tick; the rest waits for the next
+POOL_FILE_MODE, POOL_DIR_MODE = 0o640, 0o750      # with the collab-public group (``MemberRuntime.secret_gid``)
+POOL_FILE_MODE_OPEN, POOL_DIR_MODE_OPEN = 0o644, 0o755   # no group known: world-readable, the mirror's own modes
+_SHA_HEX = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def safe_content_path(path: object) -> bool:
+    """A relative, normalised path: no empty, dot or dotdot component, no NUL, no backslash, not absolute."""
+    return (isinstance(path, str) and 0 < len(path) <= 512 and "\0" not in path and "\\" not in path
+            and all(part not in ("", ".", "..") for part in path.split("/")))
+
+
+def _touch_pooled(root: Path, sha: str, perms: tuple[int, int, int | None] | None = None) -> bool:
+    """Blocking: refresh the mtime of a pooled blob (no-follow) so the GC age guard protects it, and bring its mode and
+    group (and the directory's) to ``perms``; False when absent."""
+    try:
+        dfd = os.open(root / LIBRARY_CONTENT_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        fd = os.open(sha, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+    except OSError:
+        os.close(dfd)
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        os.utime(fd)
+        if perms is not None and perms[2] is not None:
+            try:
+                os.fchown(fd, -1, perms[2])
+                os.fchmod(fd, perms[0])
+                os.fchown(dfd, -1, perms[2])
+                os.fchmod(dfd, perms[1])
+            except OSError as exc:
+                log.warning("library content pool: mode/group not repaired (%s)", type(exc).__name__)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+        os.close(dfd)
+
+
+def _pool_perms(rt: MemberRuntime | None) -> tuple[int, int, int | None]:
+    """(file mode, dir mode, gid): 0640/0750 in the collab-public group, else 0644/0755 with a warning."""
+    gid = getattr(rt, "secret_gid", None)
+    if gid is None:
+        log.warning("library content pool: no collab-public group (members.secrets_gid / HERDR_COLLAB_CERT_UID) is "
+                    "known; pool files are world-readable (0644)")
+        return POOL_FILE_MODE_OPEN, POOL_DIR_MODE_OPEN, None
+    return POOL_FILE_MODE, POOL_DIR_MODE, gid
+
+
+def _fetch_into_pool(rustfs: Any, root: Path, entry: dict, perms: tuple[int, int, int | None] | None = None,
+                     budget: list[int] | None = None) -> bool:
+    """Blocking: put one blob into the pool unless it is there (digest verified while streaming; never replaced).
+
+    A blob already pooled is touched (the GC age guard then protects it) and costs nothing; a new one is refused,
+    to be fetched next tick, once ``budget[0]`` (bytes left this tick) cannot cover it."""
+    sha, size = entry["sha256"], entry["size"]
+    if _touch_pooled(root, sha, perms):
+        return True
+    if budget is not None and budget[0] < size:
+        return False
+    key = entry["storage_key"]
+    if isinstance(key, str) and _SHA_HEX.match(key):
+        key = f"sha256/{key[:2]}/{key[2:4]}/{key}"
+    fmode, dmode, gid = perms or (POOL_FILE_MODE_OPEN, POOL_DIR_MODE_OPEN, None)
+    try:
+        try:
+            ok = stream_new_beneath(root, [LIBRARY_CONTENT_DIR], sha, rustfs.iter_get(key, sha), max_bytes=size,
+                                    mode=fmode, dir_mode=dmode, gid=gid)
+        except PermissionError:      # the group cannot be set (not root, not a member of it): readable, but say so
+            log.warning("library content pool: cannot set the collab-public group; storing world-readable")
+            ok = stream_new_beneath(root, [LIBRARY_CONTENT_DIR], sha, rustfs.iter_get(key, sha), max_bytes=size,
+                                    mode=POOL_FILE_MODE_OPEN, dir_mode=POOL_DIR_MODE_OPEN)
+        if ok and budget is not None:
+            budget[0] -= size
+        return ok
+    except Exception as exc:                                   # noqa: BLE001 - one blob never stops the view
+        log.warning("library content blob not pooled (%s)", type(exc).__name__)
+        return False
+
+
+async def _attach_files(conn: Any, items: list[dict], rustfs: Any, root: Path, rt: MemberRuntime | None = None,
+                        budget: list[int] | None = None) -> set[str]:
+    """Give every active or pending item its files and pool their bytes; the pooled shas.
+
+    Owned, ACL-assigned and pending items list the head version; a row with a ``share_id`` (opened, or assigned by a
+    lab share) the version its share pinned.
+
+    Anything else (revoked, expired, no head, over a cap, bytes unavailable) gets ``files: []``; an item over a cap is
+    also marked ``too_large`` (the owner is told, nobody else).  Access ends when the view is rewritten."""
+    for item in items:
+        item["files"] = []
+    wanted = [i["artifact_id"] for i in items if i["status"] in ("active", "pending")]
+    if not wanted or rustfs is None:
+        return set()
+    rows = await conn.fetch(
+        "SELECT a.artifact_id, v.output_manifest FROM artifacts a JOIN artifact_versions v"
+        " ON v.version_id=a.current_version_id WHERE a.artifact_id = ANY($1::text[])"
+        " AND a.lifecycle NOT IN ('retracted','tombstoned') AND v.state <> 'retracted'", wanted)
+    heads = {r["artifact_id"]: _json(r["output_manifest"]) for r in rows}
+    claimed = [i["share_id"] for i in items if i["status"] in ("active", "pending") and i.get("share_id")]
+    pinned: dict[str, Any] = {}
+    if claimed:
+        for r in await conn.fetch(
+                "SELECT s.share_id, v.output_manifest FROM artifact_shares s"
+                " JOIN artifact_versions v ON v.version_id=s.version_id AND v.artifact_id=s.artifact_id"
+                " JOIN artifacts a ON a.artifact_id=s.artifact_id WHERE s.share_id = ANY($1::text[])"
+                " AND a.lifecycle NOT IN ('retracted','tombstoned') AND v.state <> 'retracted'", claimed):
+            pinned[r["share_id"]] = _json(r["output_manifest"])
+    perms = _pool_perms(rt)
+    pooled: set[str] = set()
+    for item in items:
+        # a row that came through a share (opened, or assigned by a lab share) shows only the version the share pinned
+        manifest = pinned.get(item["share_id"]) if item.get("share_id") else heads.get(item["artifact_id"])
+        if item["status"] not in ("active", "pending") or not isinstance(manifest, list):
+            continue
+        entries: list[dict] = []
+        for m in manifest:
+            if not isinstance(m, dict):
+                continue
+            sha = m.get("sha256") or m.get("blob_sha256")
+            size = m.get("size_bytes")
+            if (safe_content_path(m.get("name")) and isinstance(sha, str) and _SHA_HEX.match(sha)
+                    and isinstance(size, int) and not isinstance(size, bool) and size >= 0):
+                entries.append({"path": m["name"], "sha256": sha, "size": size,
+                                "content_type": m.get("media_type") if isinstance(m.get("media_type"), str) else None,
+                                "storage_key": m.get("storage_key") or m.get("blob_sha256") or sha})
+        if (len(entries) > LIB_MAX_FILES or any(e["size"] > LIB_MAX_FILE_BYTES for e in entries)
+                or sum(e["size"] for e in entries) > LIB_MAX_ITEM_BYTES):
+            item["too_large"] = True
+            continue
+        ok = True
+        for e in entries:
+            ok = ok and await asyncio.to_thread(_fetch_into_pool, rustfs, root, e, perms, budget)
+        if not ok:
+            continue
+        item["files"] = [{"path": e["path"], "sha256": e["sha256"], "size": e["size"],
+                          "content_type": e["content_type"] or mimetypes.guess_type(e["path"])[0]
+                          or "application/octet-stream"} for e in entries]
+        pooled.update(e["sha256"] for e in entries)
+    return pooled
+
+
+def sweep_pool(root: Path, referenced: set[str], now: float) -> int:
+    """Blocking: delete pool blobs no view references, skipping files younger than ``POOL_GC_MIN_AGE``."""
+    try:
+        listing = list_beneath(root, [LIBRARY_CONTENT_DIR], max_entries=1_000_000)
+    except BridgeError:
+        return 0
+    removed = 0
+    for name, st in listing or []:
+        if stat.S_ISREG(st.st_mode) and name not in referenced and now - st.st_mtime >= POOL_GC_MIN_AGE:
+            removed += bool(unlink_beneath(root, [LIBRARY_CONTENT_DIR], name))
+    return removed
+
+
+async def _library_view(conn: Any, principal: str, rt: MemberRuntime | None, rustfs: Any = None,
+                        root: Path | None = None, budget: list[int] | None = None) -> tuple[dict, set[str]]:
+    """``({items, folders}, pooled shas)``: the feed (own pending included) newest first, at most ``LIBRARY_VIEW_MAX``."""
+    from .artifact_library import DEFAULT_SOURCES, MAX_PAGE, LibraryStore
+    store = LibraryStore(_OneConn(conn))
+    email, groups = await _member_identity(principal, rt)   # an empty/stale directory fails closed: fewer items
+    member_id = principal.removeprefix("member:")
+    sources = frozenset({*DEFAULT_SOURCES, "pending"})
+    items: list[dict] = []
+    while len(items) < LIBRARY_VIEW_MAX:
+        page = await store.feed(member_id, email, groups, sources=sources,
+                                limit=min(MAX_PAGE, LIBRARY_VIEW_MAX - len(items)), offset=len(items))
+        items.extend(_item_json(i) for i in page.items)
+        if page.next_offset is None or not page.items:
+            break
+    # the original filename (searchable by the agent tool), only while the item is readable: same rule as the SQL search
+    names = {r["artifact_id"]: r["original_filename"] or "" for r in await conn.fetch(
+        "SELECT artifact_id, original_filename FROM artifacts WHERE artifact_id = ANY($1::text[])",
+        [i["artifact_id"] for i in items])}
+    for item in items:
+        item["filename"] = names.get(item["artifact_id"], "") if item["status"] in ("active", "pending") else ""
+    pooled = await _attach_files(conn, items, rustfs, root, rt, budget) if root is not None else set()
+    return {"items": items, "folders": [_folder_json(f) for f in await store.list_folders(principal)]}, pooled
+
+
+async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: Mapping[str, Any] | None = None,
+                            rt: MemberRuntime | None = None, rustfs: Any = None,
+                            budget: list[int] | None = None) -> set[str]:
     """Write ``<root>/member-views/<member_owner_key>.json``: the member's usage, artifacts, shared-with-me and links."""
     from .artifact_member_quota import _NOT_PURGED
     from .artifact_members import MemberStore, member_owner_key
@@ -622,6 +1041,10 @@ async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: 
         " AND NOT EXISTS (SELECT 1 FROM artifacts t WHERE t.artifact_id=s.artifact_id AND t.lifecycle='tombstoned')"
         " ORDER BY s.created_at DESC, s.share_id LIMIT $2",
         principal, VIEW_MAX_LINKS, [a["artifact_id"] for a in artifacts])
+    root = Path(root)
+    from .collab_bridge_files import DIR_MODE
+    ensure_dir(root, mode=DIR_MODE, public_mode=True)
+    library, pooled = await _library_view(conn, principal, rt, rustfs if rustfs is not None else getattr(rt, "rustfs", None), root, budget)
     doc = {
         "principal": principal, "updated": __import__("time").time(),
         "usage": {"bytes_used": usage["bytes_used"], "bytes_retracted": usage["bytes_retracted"],
@@ -637,21 +1060,25 @@ async def write_member_view(conn: Any, principal: str, root: Path, *, defaults: 
                    "audience": s["audience"], "state": s["state"], "expires_at": _iso(s["expires_at"]),
                    "recipients": [*(s["allow_emails"] or []), *(s["allow_groups"] or [])],
                    "created_at": _iso(s["created_at"]), "mine": s["mine"]} for s in links],
+        "library": library,
     }
-    root = Path(root)
-    from .collab_bridge_files import DIR_MODE
 
     def write() -> None:
-        ensure_dir(root, mode=DIR_MODE, public_mode=True)
         atomic_write_json(root / MEMBER_VIEWS_DIR, member_owner_key(principal) + ".json", doc)
     await asyncio.to_thread(write)
+    return pooled
 
 
 async def _after(ctx: IntentContext, intent: Intent, out: dict, private: dict) -> None:
-    """Rewrite the acting member's view once the outcome is durable."""
+    """Rewrite the acting member's view once the outcome is durable.
+
+    The pool fill is capped by the same per-tick byte budget as the publish tick, and a rejected intent fills nothing
+    (it changed no content): whatever is not pooled yet waits for the next tick."""
     principal, rt = private.get("_principal"), ctx.extras.get("members")
     if isinstance(principal, str) and isinstance(rt, MemberRuntime):
-        await write_member_view(ctx.conn, principal, rt.mirror_root, defaults=rt.defaults)
+        budget = [0 if out.get("result") == "rejected" else POOL_TICK_FILL_BYTES]
+        await write_member_view(ctx.conn, principal, rt.mirror_root, defaults=rt.defaults, rt=rt,
+                                rustfs=getattr(ctx.store, "rustfs", None), budget=budget)
 
 
 # ----------------------------------------------------------------------------- secret results
@@ -735,19 +1162,54 @@ async def sweep_disabled_members(conn: Any, rt: MemberRuntime) -> int:
     return revoked
 
 
+async def _lab_share_recipients(conn: Any, rt: MemberRuntime) -> set[str]:
+    """Approved directory members that match a live lab share (email or group): they need a view before any intent."""
+    from .artifact_members import member_principal
+    shares = await conn.fetch("SELECT allow_emails, allow_groups FROM artifact_shares WHERE state='live'"
+                              " AND audience='lab' AND (expires_at IS NULL OR expires_at > now())")
+    if not shares:
+        return set()
+    emails = {e.strip().lower() for r in shares for e in r["allow_emails"] or [] if isinstance(e, str)}
+    groups = {g for r in shares for g in r["allow_groups"] or [] if isinstance(g, str)}
+    directory = await asyncio.to_thread(load_directory, rt) or {}       # a stale directory fails closed: no extra views
+    found: set[str] = set()
+    for user_id, entry in directory.items():
+        if entry.get("status") != "approved":
+            continue
+        email = entry.get("email")
+        held = {g for g in entry.get("groups") or [] if isinstance(g, str)}
+        if (isinstance(email, str) and email.strip().lower() in emails) or held & groups:
+            try:
+                found.add(member_principal(user_id))
+            except ValueError:
+                continue
+    return found
+
+
 async def publish_member_views(conn: Any, rt: MemberRuntime) -> int:
     """Rewrite the view of every known member, then run ``sweep_disabled_members``; returns the views written."""
     rows = await conn.fetch(
         "SELECT created_by AS p FROM artifacts WHERE created_by LIKE 'member:%'"
         " UNION SELECT member_principal FROM artifact_member_usage"
-        " UNION SELECT principal_id FROM artifact_acl WHERE principal_id LIKE 'member:%'")
-    written = 0
-    for r in rows:
+        " UNION SELECT principal_id FROM artifact_acl WHERE principal_id LIKE 'member:%'"
+        " UNION SELECT 'member:' || member_id FROM artifact_share_claims"      # a member who only opens links
+        " UNION SELECT owner FROM artifact_library_folders WHERE owner LIKE 'member:%'")
+    principals = {r["p"] for r in rows} | await _lab_share_recipients(conn, rt)
+    written, failed = 0, False
+    referenced: set[str] = set()
+    budget = [POOL_TICK_FILL_BYTES]
+    for principal in sorted(principals):
         try:
-            await write_member_view(conn, r["p"], rt.mirror_root, defaults=rt.defaults)
+            referenced |= await write_member_view(conn, principal, rt.mirror_root, defaults=rt.defaults, rt=rt,
+                                                   budget=budget)
             written += 1
         except Exception as exc:
+            failed = True
             log.error("member view not written (%s)", type(exc).__name__)
+    if rt.rustfs is not None and failed:      # a view that failed still lists its blobs: collect nothing then
+        log.warning("library content pool: garbage collection skipped, a member view was not written this tick")
+    elif rt.rustfs is not None:
+        await asyncio.to_thread(sweep_pool, rt.mirror_root, referenced, time.time())
     await sweep_disabled_members(conn, rt)
     await asyncio.to_thread(sweep_secrets, rt)
     return written
@@ -801,13 +1263,17 @@ def _lane(intent: Intent, agent: Mapping[str, Any] | None) -> str:
 def register_member_intents(applier: CollabIntentApplier) -> None:
     """Attach the handlers and the ``m_`` staging rule; the runtime comes from the applier's ``context_extras``."""
     for kind, handler, outcomes in ((KIND_CREATE, handle_create, "created"), (KIND_PUBLISH, handle_publish, "created"),
-                                    (KIND_DELETE, handle_delete, "deleted")):
+                                    (KIND_DELETE, handle_delete, "deleted"),
+                                    (KIND_LIBRARY_ACCEPT, handle_library_accept, "accepted"),
+                                    (KIND_LIBRARY_DISCARD, handle_library_discard, "deleted")):
         # No ``replay_outcomes``: the applier would replay a stored result before the handler runs, i.e. before the
         # directory/admission check. The handlers are idempotent themselves, behind ``_member``.
         applier.register(kind, handler, lane_key=_lane, after=_after)
     from . import (
         artifact_member_shares as shares,  # the worker only: collab-public never imports the handlers
     )
+    for kind, handler in LIBRARY_HANDLERS:
+        applier.register(kind, handler, lane_key=_lane, after=_after)
     for kind, handler in ((KIND_SHARE_CREATE, shares.handle_share_create), (KIND_SHARE_APPROVE, shares.handle_share_approve),
                           (KIND_SHARE_REVOKE, shares.handle_share_revoke), (KIND_SHARE_EVENTS, shares.handle_share_events)):
         applier.register(kind, handler, lane_key=_lane, after=_after)

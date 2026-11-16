@@ -115,7 +115,7 @@ def test_the_allow_list_is_exactly_what_the_dispatcher_handles_plus_plain_activi
                                        "review_finding", "pull_request", "token_usage", "resource_usage", "ai_sync", "fleet_rollout"}
     assert INGEST_ENTITY_TYPES - DISPATCHED_ENTITY_TYPES == {"task", "note", "workspace", "ledger",
                                                                         "platform", "lifecycle",
-                                                                        "repository", "request", "span"}
+                                                                        "repository", "request", "span", "communication"}
 
 
 @pytest.mark.parametrize("entity_type", ["repository", "request", "span"])
@@ -447,6 +447,7 @@ def _switch_values(svc):
         "team_rooms": svc.team_rooms_active(),
         "team_roles": svc.team_roles_active(),
         "coordinators": svc.coordinators_active(),
+        "fabric_trust": svc.fabric_trust_active(),
         "delegation_enabled": svc.delegation_enabled,
         "replay_history": svc.replay_history,
     }
@@ -454,10 +455,11 @@ def _switch_values(svc):
 
 FEATURES = {"steering": {"enabled": True}, "contextual": {"enabled": True}, "insights": {"enabled": True},
             "team_rooms": {"enabled": True}, "team_roles": {"enabled": True}, "coordinators": {"enabled": True},
+            "fabric_trust": {"enabled": True, "machines": ["bender"], "tailnet_suffix": "tail1234.ts.net"},
             "delegation_enabled": True,
             "replay_history": "full"}
 OFF = {"steering": False, "contextual": False, "insights": False, "team_rooms": False, "team_roles": False,
-       "coordinators": False, "delegation_enabled": False,
+       "coordinators": False, "fabric_trust": False, "delegation_enabled": False,
        "replay_history": "since_join"}
 
 
@@ -475,7 +477,7 @@ def test_every_feature_switch_fails_closed_identically_when_the_fleet_file_break
     svc = CollabService(StaticTokenAuthenticator({"a": "0" * 64}))
     cli._wire_collab_switches(svc, store)
     assert _switch_values(svc) == {"steering": True, "contextual": True, "insights": True, "team_rooms": True,
-                                   "team_roles": True, "coordinators": True, "delegation_enabled": True,
+                                   "team_roles": True, "coordinators": True, "fabric_trust": True, "delegation_enabled": True,
                                    "replay_history": "full"}
     if breakage == "delete":
         path.unlink()
@@ -489,7 +491,7 @@ def test_every_feature_switch_fails_closed_identically_when_the_fleet_file_break
     else:
         data = yaml.safe_load(path.read_text())
         coll = data["sections"]["control_plane"]["values"]["collab"]
-        for key in ("steering", "contextual", "insights", "team_rooms", "team_roles", "coordinators"):
+        for key in ("steering", "contextual", "insights", "team_rooms", "team_roles", "coordinators", "fabric_trust"):
             coll[key] = {"kill_switch": "yes"}
         coll["delegation_enabled"] = "yes"
         coll["replay_history"] = "everything"

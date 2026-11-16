@@ -44,7 +44,7 @@ class SanitizerFailed(Exception):
 
 
 _STRIP_IN_URL = re.compile(r"[\t\r\n]")
-_DATA_IMAGE = re.compile(r"data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]{0,262144}", re.I)
+_DATA_IMAGE = re.compile(r"data:image/(?:png|jpeg|gif|webp|svg\+xml);base64,[A-Za-z0-9+/=]{0,262144}", re.I)
 _ABSOLUTE_OK = {"http", "https", "mailto"}
 _FRAGMENT_SAFE = "-._~!$&'()*+,;=:@/?"
 

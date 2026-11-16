@@ -362,13 +362,20 @@ def _cache_env(cfg: BuildCacheConfig, cmd: list[str], state_dir: Path | None):
     today). Planning failure never blocks a build: it just runs uncached.
     """
     from .build_cache_env import NOT_REQUESTED, activate_shared, detect_tools, plan
+    from .build_cache_location import select_storage
     from .build_cache_storage import check_shared
     directory = Path(state_dir) if state_dir is not None else _default_state_dir()
     try:
         env = dict(os.environ)
         reachable = check_shared(cfg, directory)  # bounded probe, negative-cached
         tools = detect_tools(env.get("PATH"))
-        p = plan(cfg, cmd, env, tools, Path.cwd(), directory, reachable)
+        if cfg.local.storage_tiers:
+            selected = select_storage(cfg.local.storage_tiers, directory / "sccache",
+                                      cfg.local.min_free_disk_percent)
+            p = plan(cfg, cmd, env, tools, Path.cwd(), directory, reachable,
+                     cache_dir=selected.directory)
+        else:
+            p = plan(cfg, cmd, env, tools, Path.cwd(), directory, reachable)
         if p.shared_setup is not None:
             p = activate_shared(p, tools, env)  # credentials: server env only
     except Exception as exc:  # noqa: BLE001 - never break a build
@@ -416,6 +423,11 @@ def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5
     if cache_config is not None and cmd:
         child_env, cache = _cache_env(cache_config, cmd, state_dir)
         record = record or child_env is not None
+    if cache_config is not None and cmd and os.path.basename(cmd[0]) == "cargo":
+        from .cargo_host import COORDINATED, host_root, is_managed_wrapper
+        if is_managed_wrapper(str(host_root(Path.home()) / "rustc-cache"), Path.home()):
+            child_env = {**(child_env if child_env is not None else os.environ), COORDINATED: "1"}
+            record = True
     maintenance_fd = None
     if cmd and _HAS_FCNTL:
         directory = Path(state_dir) if state_dir is not None else _default_state_dir()

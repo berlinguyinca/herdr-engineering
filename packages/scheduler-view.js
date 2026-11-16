@@ -71,7 +71,7 @@ export function mountScheduling(container, client, { freshness = () => null } = 
     if (reading) return reading;
     const generation = epoch;
     const request = new AbortController(); controller = request;
-    if (!loaded) content.innerHTML = skeleton('scheduling', { rows: 6, height: 64 });
+    if (!loaded) content.innerHTML = skeleton('scheduling', { rows: 8, height: 64 });
     retry.hidden = true;
     reading = (async () => {
     try {

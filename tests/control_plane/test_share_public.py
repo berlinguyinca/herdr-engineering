@@ -1209,3 +1209,43 @@ def test_record_event_swallows_an_append_failure():
         raise OSError("disk full")
 
     sp._record_event(boom, "share_x", "who", "why")               # must not raise
+
+
+def test_every_share_host_response_forces_referrer_policy_no_referrer(env):
+    """Plan 4 C1: the header is on every response the host sends, whatever the status, so a share URL that carries a
+    session never leaves in a Referer unless the (author-controlled) document itself loosens it with a meta tag."""
+    etag = '"%s"' % _sha(FILES["index.html"])
+    requests = [
+        ("GET", f("index.html"), {}), ("HEAD", f("index.html"), {}),
+        ("GET", f("data/table.parquet"), {"Range": "bytes=0-9"}),               # 206
+        ("GET", f("data/table.parquet"), {"Range": "bytes=999999-"}),           # 416
+        ("GET", f("index.html"), {"If-None-Match": etag}),                      # 304
+        ("GET", f("index.html"), {"If-Match": '"other"'}),                      # 412
+        ("OPTIONS", f("index.html"), {"Origin": "https://x.example", "Access-Control-Request-Method": "GET"}),  # 204
+        ("GET", f("missing.html"), {}), ("GET", "/nothing-here", {}),           # 404
+    ]
+    seen = set()
+    for method, path, headers in requests:
+        status, got, _ = env.request(method, path, headers)
+        seen.add(status)
+        assert got.get("referrer-policy") == "no-referrer", (method, path, status)
+    assert {200, 204, 206, 304, 404, 412, 416} <= seen
+
+
+def test_public_share_of_a_report_preview_delivers_its_link_preview_meta_unsanitised(tmp_path):
+    # The public route (f/) serves the generated preview bytes as they are; only the signed-in annotate view runs the
+    # sanitiser (which drops meta, and which crawlers never see). So the og/twitter tags reach the public response.
+    from herdr_engineering.control_plane.artifact_share_api import _report_preview
+    from tests.control_plane.test_artifact_report_render import descriptor
+
+    page = _report_preview(descriptor())
+    env = Env(tmp_path, files={"preview.html": page}, entry="preview.html")
+    try:
+        status, headers, body = env.request("GET", f("preview.html"))
+    finally:
+        env.close()
+    assert status == 200
+    head = body.decode().split("</head>")[0]
+    for needle in ('<meta property="og:title" content="', '<meta property="og:type" content="article">',
+                   '<meta name="twitter:card" content="summary">', '<meta name="description" content="'):
+        assert needle in head, needle

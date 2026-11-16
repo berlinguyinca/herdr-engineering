@@ -55,13 +55,15 @@ class TombstoneUnavailable(Exception):
 # narrow `agent` role, besides /api/v1/ingest. Nothing else.
 _SUMMARY_FIX = re.compile(r"^/api/v1/sessions/[^/]+/summary/(?:fix|report)$")
 # The per-host worker that runs full /summary reports where the session records live (ingest role).
-_HOST_REPORT = re.compile(r"^/api/v1/host/summary-reports/(?:claim|result|publish)$")
+_HOST_REPORT = re.compile(r"^/api/v1/host/(?:summary-reports/(?:claim|result|publish)|build-cache/report)$")
 # Terminal broker, host side: the relay's output POST (per-host token like the fleet routes, never an API key).
 _HOST_TERMINAL_OUT = re.compile(r"^/api/v1/host/terminal/[^/]+/output$")
 # Terminal button: builds (never runs) the viewer-side attach command; same guard as summary fix.
 _TERMINAL_ATTACH = re.compile(r"^/api/v1/sessions/[^/]+/terminal$")
 _AGENT_POST = re.compile(r"^/api/v1/(?:llm/keys|reviews|llm/keys/[^/]+/revoke"
                         r"|reviews/[^/]+/(?:heartbeat|result|failure)"
+                        # Usage reporters (llm-proxy, llm-gateway-usage): an agent key may report tokens, nothing wider.
+                        r"|token-usage"
                         r"|architecture/(?:snapshots|analyses|analyses/claim)"
                         # CI fix runner: claim, report state, report result. Never create or cancel.
                         r"|ci/fix/claim|ci/fix/[^/]+/(?:state|result))$")
@@ -211,6 +213,10 @@ class _DaemonThreadingServer(ThreadingHTTPServer):
             self._request_slots.release()
 
 
+class _DaemonThreadingServerV6(_DaemonThreadingServer):
+    address_family = socket.AF_INET6
+
+
 
 def _dashboard_host_ok(host_header, extra_hosts):
     """A Host an attacker cannot make point here: an IP literal, localhost, or a configured name.
@@ -314,11 +320,13 @@ class ControlPlaneServer:
                  assistant_service=None, assistant_config=None, assistant_delegation_adapter=None,
                  fabric_resolver=None, fabric_services=None, fabric_names=None,
                  scheduler_admission=False, scheduler_limits=None, skill_registry=None, build_cache=None,
-                 memory_adapter=None, memory_config=None, unified_workspace_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
-                 share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None,
+                 memory_adapter=None, memory_config=None, unified_workspace_config=None, work_center_config=None, agent_ops_config=None, rakazo_bridge=None, rakazo_bridge_dsn=None, assistant_apps_dsn=None,
+                 share_store=None, shares_root=None, share_settings=None, annotation_store=None, member_admin=None, library=None,
+                 member_directory=None,
                  artifact_delete_owners=frozenset(), artifact_delete_allow_keyless_owner: bool = False,
                  collab_grant_store=None, collab_artifacts_enabled: bool = False,
-                 assistant_workers=None, assistant_judge=None, member_web=None):
+                 assistant_workers=None, assistant_judge=None, assistant_slack=None, member_web=None,
+                 fabric_listen=None, fabric_bind_host=None, fabric_allow_any_host: bool = False):
         """
         Auth (Spec §104): either a single `api_key` (all-access) or a mapping
         `api_keys={key: role}` with roles "viewer" (read-only) / "operator"
@@ -371,6 +379,8 @@ class ControlPlaneServer:
         from .deployment_definitions import DeploymentDefinitions
         self.deployment_definitions = DeploymentDefinitions(
             lambda: self._control_plane_value(fleet_config, "deployment_definitions"),
+            # fail CLOSED: an unreadable fleet file means an empty allowlist, not the last good one
+            ci_components=lambda: self._deployment_secure_value("ci_deployments"),
             ci_snapshot=lambda: self.ci_monitor.snapshot(start=True))
         # The stage coordinator (Task 3), ticked by _deployments_loop; GET /api/v1/deployments
         # serves the last tick and never ticks itself. `deployment_evidence` is the release-evidence
@@ -432,6 +442,21 @@ class ControlPlaneServer:
         self.summary_report = None
         # unified_workspace_v1 (P01): capability advertisement only; no route consumes it yet. YAML-only, default off.
         self.unified_workspace_enabled = isinstance(unified_workspace_config, dict) and unified_workspace_config.get("enabled") is True
+        # work_center_v1 (WC-006): gates every Work Command Center UI surface in the dashboard (This week card, session Work Context
+        # header, board "Open in Herdr" links). Advertisement only; no route consumes it. YAML-only, strict True, default off.
+        self.work_center_enabled = isinstance(work_center_config, dict) and work_center_config.get("enabled") is True
+        # agent_ops_v1 (docs/specs/2026-11-12-agent-operations-map): the read-only Agent Operations projection routes.
+        # YAML-only, strict True, default off; off means 404 and no capability.
+        self.agent_ops_enabled = isinstance(agent_ops_config, dict) and agent_ops_config.get("enabled") is True
+        self.agent_ops_poll_seconds = 1.0
+        self.agent_ops_reauth_seconds = 30.0          # a live stream re-checks its credential this often
+        self.agent_ops_streams = threading.BoundedSemaphore(16)   # concurrent SSE readers; each tick is a full gather
+        per_caller = agent_ops_config.get("streams_per_principal") if isinstance(agent_ops_config, dict) else None
+        # ...of which one caller (person, agent or key) may hold this many (config streams_per_principal, default 4)
+        self.agent_ops_streams_per_principal = per_caller if isinstance(per_caller, int) and not isinstance(per_caller, bool) and per_caller >= 1 else 4
+        self._agent_ops_stream_counts: dict[str, int] = {}
+        self._agent_ops_stream_lock = threading.Lock()
+        self.agent_ops_skipped_frames = 0              # stored events whose cursor could not be framed safely
         self._summary_stop = threading.Event()
         self._summary_scanner = None
         if not collab_only:
@@ -457,6 +482,10 @@ class ControlPlaneServer:
         self.share_settings = share_settings
         # Operator controls for member-owned artifacts (a SyncArtifactAdapter over MemberAdmin): absent -> 503.
         self.member_admin = member_admin
+        # Dashboard artifact library (a SyncArtifactAdapter over LibraryStore): absent -> the routes answer 503.
+        self.library = library
+        # ``member_directory`` returns the member directory body (``{"group", "users": {...}}``) or None; default: the collab service's.
+        self.member_directory = member_directory
         # Owner annotation API (list/dismiss): a SyncArtifactAdapter over AnnotationStore, or the routes answer 503.
         self.annotation_store = annotation_store
         # Key digests allowed to delete/purge/restore artifacts (control_plane.artifact_delete.owner_key_digests).
@@ -522,6 +551,7 @@ class ControlPlaneServer:
         # The tailnet hub's WorkerRegistry (ONE instance, shared with the HubServer); None while the hub is off.
         # The owner routes /api/v1/assistant-workers read it at request time, so it may be attached after startup.
         self.assistant_workers = assistant_workers
+        self.assistant_slack = assistant_slack       # SlackRuntime | None; None: the status route reports it off
         self.assistant_judge = assistant_judge       # JudgeRuntime | None; None: the activation gate refuses
         # control_plane.rakazo_bridge (off by default: nothing is constructed and /rpc/* + /api/auth/* answer 404).
         # A bad section raises here, so an enabled but malformed bridge stops startup instead of running open.
@@ -537,16 +567,22 @@ class ControlPlaneServer:
         _bridge_cfg = rakazo_bridge_config(rakazo_bridge)
         if _bridge_cfg["enabled"]:       # the assistant user ids the bridge accounts act as (hashes, no email), for ci_watch.users
             log.info("rakazo bridge assistant users: %s", ", ".join(a.principal_id for a in _bridge_cfg["accounts"]))
+        from .collab_http import HttpCollab
         self.rakazo = (RakazoBridge(_bridge_cfg, self.assistant, version=__version__,
                                     persistence=PostgresTokenPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     space_persistence=PostgresSpacePersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     prefs_persistence=PostgresPrefsPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
                                     push_persistence=PostgresPushPersistence(rakazo_bridge_dsn) if rakazo_bridge_dsn else None,
-                                    collab=collab, artifacts_fn=lambda: RegistryBackend(self))
+                                    collab=collab if collab is not None else (HttpCollab(collab_operator_url.rstrip("/"))
+                                                      if collab_operator_url else None),
+                                    artifacts_fn=lambda: RegistryBackend(self))
                        if _bridge_cfg["enabled"] else None)
         self._build_assistant_apps(assistant_apps_dsn)
         if self.rakazo is not None:
             self.rakazo.single_operator_fn = lambda: self.single_operator
+            # the split deployment has no operator_user here; the collab service names its own operator (HTTP mode only)
+            self.rakazo.operator_user_fn = lambda: self.operator_user or (
+                self.rakazo.collab.operator_user() if isinstance(self.rakazo.collab, HttpCollab) else None)
         self._build_reminders(assistant_apps_dsn)
         self.assistant.canonical_person = self._canonical_person
         from .ingest import IngestService
@@ -614,6 +650,8 @@ class ControlPlaneServer:
         from .single_flight_cache import SingleFlightCache
         self.ci_reports_cache = SingleFlightCache(ttl=15.0)     # /api/v1/ci/reports, see single_flight_cache.py
         self.collab = collab
+        from .agent_ops import AgentOpsService
+        self.agent_ops = AgentOpsService(repo, handoffs=self.handoffs, collab_source=lambda: self.collab)
         if self.assistant.host_candidates is None:       # looked up per call: `collab` may be swapped after startup
             self.assistant.host_candidates = lambda: (
                 self.collab.assistant_runtime_host_candidates() if self.collab is not None else [])
@@ -630,6 +668,27 @@ class ControlPlaneServer:
         if public_port is not None and collab is None:
             raise ValueError("a public collaboration listener needs collab enabled")
         self.collab_only = collab_only
+        # Fabric trust slice 6a: a dedicated listener on a TAILNET address that serves the collab API and nothing else and accepts
+        # only ``Authorization: Fabric``. Same process as the other handlers (the event log has one writer). ``fabric_bind_host``
+        # is what the process binds when it cannot own the tailnet address itself (inside a container whose published port lands
+        # here); ``fabric_allow_any_host`` is a test-only escape hatch and is never fed from configuration.
+        self.fabric_listen, self.fabric_bind_host = None, fabric_bind_host
+        if fabric_listen is not None:
+            from .collab_fabric_trust import validate_listen_host
+            if collab is None:
+                raise ValueError("a fabric listener needs collab enabled")
+            f_host, f_port = fabric_listen
+            if fabric_allow_any_host:
+                ipaddress.ip_address(f_host)
+            else:
+                f_host = validate_listen_host(f_host, "fabric listener host")
+            if isinstance(f_port, bool) or not isinstance(f_port, int) or not 0 <= f_port <= 65535:
+                raise ValueError("fabric listener port must be an integer 0-65535")
+            if fabric_bind_host is not None:
+                ipaddress.ip_address(fabric_bind_host)
+            self.fabric_listen = (f_host, f_port)
+        self.fabric_port = None
+        self._fabric_httpd = None
         if operator_port is not None and not (collab_only and operator_user and operator_hosts):
             raise ValueError("the operator listener needs collab-only mode, a user and allowed hosts")
         self.operator_port, self.operator_user = operator_port, operator_user
@@ -757,6 +816,13 @@ class ControlPlaneServer:
                     self.collab.assistant_briefs_source = lambda: self.assistant.config["team_briefs"]
                 if getattr(self, "google", None) is not None and self.assistant.mail_source is None:
                     self.assistant.mail_source = lambda t, u, mid: self.google.get_raw_message(*self._canonical_person(t, u), mid)
+            if self.assistant.config["external_actions"]["enabled"]:
+                # team collaboration slice 5: the same rule, wired ONLY when the flag is on
+                from .assistant_adapters import ExternalActionsBridge, wire_external_providers
+                if self.collab is not None:
+                    self.collab.external_actions_hook = ExternalActionsBridge(self)
+                    self.collab.external_actions_source = lambda: self.assistant.config["external_actions"]
+                wire_external_providers(self)
             self.assistant.artifact_writer = draft_writer_hook(self)
             self.assistant.ci_board_request = self.intelligence.assistant_ci_repair
             self.assistant.ci_rerun_request = self.intelligence.assistant_ci_rerun
@@ -1505,7 +1571,7 @@ class ControlPlaneServer:
 
     def _dispatch_native_message(self, record, message, artifact_ids):
         from ..errors import InvalidError
-        from ..herdr_adapter import NativeHerdrAdapter
+        from ..herdr_adapter import NativeHerdrAdapter, confirm_recipient
 
         if artifact_ids:
             if not all(isinstance(aid, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,200}', aid)
@@ -1533,7 +1599,15 @@ class ControlPlaneServer:
             raise InvalidError("native session identity changed; refresh before delivery")
         if matches[0].interactive_ready is False or matches[0].launch_pending:
             raise InvalidError("native agent is not ready for prompt delivery")
-        return adapter.send_input(target, message, machine=machine, session=server)
+        prompt_target = matches[0].pane_id or target
+        operation_id = record.get("communication_operation_id")
+        if operation_id:
+            delivery = adapter.send_input(prompt_target, message, machine=machine, session=server,
+                                          operation_id=operation_id)
+        else:
+            delivery = adapter.send_input(prompt_target, message, machine=machine, session=server)
+        confirm_recipient(record, delivery)
+        return delivery
 
     def _canonical_person(self, tenant, user):
         """Single-operator rule (RakazoBridge.canonical_person); identity when there is no bridge."""
@@ -1611,12 +1685,18 @@ class ControlPlaneServer:
             caps.append("assistant_v1")
             if self.assistant.team_briefs.enabled():
                 caps.append("assistant_team_briefs")
+            if self.assistant.external_actions.enabled():
+                caps.append("assistant_external_actions")
         if getattr(self, "intelligence", None) is not None and self.intelligence._cfg()[0]["enabled"]:
             caps.append("project_intelligence_v1")
         if getattr(self, "memory", None) is not None and self.memory.enabled():
             caps.append("memory_v1")
         if getattr(self, "unified_workspace_enabled", False):
             caps.append("unified_workspace_v1")
+        if getattr(self, "work_center_enabled", False):
+            caps.append("work_center_v1")
+        if getattr(self, "agent_ops_enabled", False):
+            caps.append("agent_ops_v1")
         if getattr(self, "skills", None) is not None:
             caps.append("skill_registry_v1")
         if getattr(self, "build_cache", None) is not None:
@@ -1630,6 +1710,33 @@ class ControlPlaneServer:
             caps.append("architecture_v1")
             if self.architecture.explain_config:
                 caps.append("architecture_explain_v1")
+        caps.extend(self._service_capabilities())
+        return caps
+
+    def _service_capabilities(self):
+        """Flags for the optional services the Settings page lists. Each mirrors the exact guard its routes apply (the 503
+        "not enabled" checks), so a flag is never true while the route refuses. Presence and booleans only, never values."""
+        caps = []
+        store = self.artifact_store is not None
+        stored = self.share_store is not None and self.shares_root is not None and store
+        if stored and self.share_settings is not None:
+            caps.append("share_v1")
+        if stored and self.member_admin is not None:      # the member routes do not need share_settings
+            caps.append("members_v1")
+        if self.collab_artifacts_enabled and self.collab_grant_store is not None and store:
+            caps.append("collab_artifacts_v1")
+        if getattr(self, "gate_service", None) is not None:
+            caps.append("review_gate_v1")
+        if store and (self.artifact_delete_owners or self.artifact_delete_allow_keyless_owner):
+            caps.append("artifact_delete_v1")
+        if self.ci_monitor.actions_enabled:
+            caps.append("ci_actions_v1")
+        try:
+            # the same predicate the force/ack routes apply: flag on AND definitions configured AND loaded
+            if self.deployment_actions_enabled() and self._loaded_deployment_definitions() is not None:
+                caps.append("deployment_actions_v1")
+        except Exception:  # noqa: BLE001 - health must answer even if the definitions cannot be read
+            pass
         return caps
 
     def _health_probe(self, with_capabilities=True):
@@ -1703,6 +1810,20 @@ class ControlPlaneServer:
             self._serving_listeners.add(httpd)
         httpd.serve_forever()
 
+    def _start_fabric_listener(self):
+        """Bind the dedicated fabric listener when configured. A bind failure propagates: configured means required, and
+        ``serve`` tears everything down and re-raises it."""
+        if self.fabric_listen is None:
+            return
+        host, port = self.fabric_listen
+        bind = self.fabric_bind_host or host
+        self._fabric_httpd = (_DaemonThreadingServerV6 if ":" in bind else _DaemonThreadingServer)(
+            (bind, port), _make_handler(self, fabric=True),
+            request_workers=self.request_workers, request_queue=self.request_queue)
+        self.fabric_port = self._fabric_httpd.server_address[1]
+        self._start_background_thread(self._fabric_httpd.serve_forever)
+        self._serving_listeners.add(self._fabric_httpd)
+
     def _start_server(self):
         if self.collab_only:
             # No operator listener at all: this process serves the public collab surface only.
@@ -1715,6 +1836,7 @@ class ControlPlaneServer:
                 self.operator_port = self._operator_httpd.server_address[1]
                 self._start_background_thread(self._operator_httpd.serve_forever)
                 self._serving_listeners.add(self._operator_httpd)
+            self._start_fabric_listener()
             self._ready.set()
             return self._httpd
         self._httpd = _DaemonThreadingServer(
@@ -1727,6 +1849,7 @@ class ControlPlaneServer:
             self.public_port = self._public_httpd.server_address[1]
             self._start_background_thread(self._public_httpd.serve_forever)
             self._serving_listeners.add(self._public_httpd)
+        self._start_fabric_listener()
         if self.agent_summaries and self.agent_summaries.config.enabled:
             self.agent_summaries.start()
             self._summary_scanner = threading.Thread(target=self._summary_loop, daemon=True)
@@ -1861,7 +1984,7 @@ class ControlPlaneServer:
         self.github_monitor.close()
         if getattr(self, "work_graph", None) is not None:
             self.work_graph.close()
-        for attr in ("_operator_httpd", "_public_httpd", "_httpd"):
+        for attr in ("_operator_httpd", "_public_httpd", "_fabric_httpd", "_httpd"):
             listener = getattr(self, attr)
             if listener is not None:
                 # BaseServer.shutdown waits forever if serve_forever was never
@@ -1964,6 +2087,7 @@ _PUBLIC_STATIC = {
     "/collab-tabs.js": ("collab-tabs.js", "text/javascript"),
     "/collab-proposals.js": ("collab-proposals.js", "text/javascript"),
     "/collab-lineage.js": ("collab-lineage.js", "text/javascript"),
+    "/collab-fabric.js": ("collab-fabric.js", "text/javascript"),
     "/collab-attention.js": ("collab-attention.js", "text/javascript"),
     "/collab-mention.js": ("collab-mention.js", "text/javascript"),
     "/collab-context.js": ("collab-context.js", "text/javascript"),
@@ -1990,7 +2114,11 @@ _PUBLIC_CSP = ("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-
                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
-def _make_handler(server, public=False, operator=False):
+_FORWARDING_HEADERS = ("X-Forwarded-For", "Forwarded", "X-Real-IP", "X-Forwarded-Host", "X-Forwarded-Server",
+                       "Tailscale-User-Login", "Tailscale-User-Name", "Via")
+
+
+def _make_handler(server, public=False, operator=False, fabric=False):
     class _Handler(BaseHTTPRequestHandler):
         server_version = "HerdrControlPlane/0.1"
         protocol_version = "HTTP/1.1"
@@ -2017,7 +2145,8 @@ def _make_handler(server, public=False, operator=False):
                         return "agent"
                     return None
                 # With no api keys EVERY caller on this listener is the operator, including for member-owned
-                # artifacts (D4); members therefore require api keys (fleet-config check refuses otherwise).
+                # artifacts (D4); the legacy share-public member path therefore requires api keys (fleet-config check refuses
+                # otherwise). The artifact host path has no member data in this process, so it needs none.
                 # open — only reachable via loopback or an explicit --allow-open
                 # (Tailnet trust boundary); the fail-closed guard enforces this
                 return "operator"
@@ -2133,6 +2262,17 @@ def _make_handler(server, public=False, operator=False):
                         and artifact_id and self._artifact_call(
                 "report_permission", artifact_id, self._resource_principal(), permission, **extra))
 
+        def _registry_read_ok(self, artifact_id):
+            """Principal check for registry-backed reads when no in-memory ACL exists (embedded/test setups).
+
+            With an ``ArtifactAcl`` the ACL already decided (production: unchanged, True here). Without one but with a
+            registry store, the registry's ``report_permission`` decides; a caller it refuses gets the same plain 404 as a
+            missing id."""
+            if server.artifact_store is None or server.artifact_acl is not None:
+                return True
+            return bool(artifact_id and self._artifact_call(
+                "report_permission", artifact_id, self._resource_principal(), "read"))
+
         def _artifact_acl_allows(self, artifact_id, permission):
             principal = self._resource_principal()
             if server.artifact_acl.can(artifact_id, principal, permission):
@@ -2208,6 +2348,41 @@ def _make_handler(server, public=False, operator=False):
 
         # ------------------------------------------------------------ routes
         # -------------------------------------------- public (collab-only) listener
+        def _fabric_hosts(self):
+            """Host header values the fabric listener answers to: ``<listen_host>:<port>`` (IPv6 bracketed), plus the bare
+            host only when the port is the scheme default (80), the one case a client omits it."""
+            host, _ = server.fabric_listen
+            port = server.fabric_port
+            name = f"[{host}]" if ":" in host else host
+            allowed = {f"{name}:{port}".lower()}
+            if port == 80:
+                allowed.add(name.lower())
+            return allowed
+
+        def _is_fabric_join(self):
+            """``POST agents/fabric-join`` is authenticated by the tailnet machine alone (whois on the real peer): it carries no
+            Authorization header, and whatever one it carries is ignored."""
+            return self.command == "POST" and self.path.split("?")[0].rstrip("/") == "/api/v1/collab/agents/fabric-join"
+
+        def _fabric_listener(self):
+            """The dedicated fabric listener (tailnet address, no proxy, no TLS): the collab API and nothing else, and ONLY
+            ``Authorization: Fabric``. Any other scheme (or none) is a 401 before the service sees it, so a Bearer token or an
+            agent credential presented here is never evaluated. Everything outside /api/v1/collab is the single 404."""
+            cl = self.headers.get_all("Content-Length") or []
+            if (len(cl) > 1 or "Transfer-Encoding" in self.headers
+                    or (self.command in ("GET", "DELETE") and cl and cl[0].strip() not in ("", "0"))):
+                return self._deny(400, "ambiguous request framing")
+            # DNS rebinding: a browser that resolved an attacker name to this address sends that name as Host. Only the
+            # address the listener is published on is accepted, and it is checked before routing or authentication.
+            if self.headers.get("Host", "").lower() not in self._fabric_hosts():
+                return self._deny(421, "misdirected request")
+            if not self._is_collab_path() or server.collab is None:
+                return self._deny(404, "not found")
+            scheme, _, rest = self.headers.get("Authorization", "").partition(" ")
+            if (scheme != "Fabric" or not rest.strip()) and not self._is_fabric_join():
+                return self._deny(401, "unauthorized")
+            return self._collab()
+
         def _public(self):
             """Everything not on the allow-list is a plain 404: the legacy API, the
             dashboard and its static files do not exist on this listener."""
@@ -2355,7 +2530,7 @@ def _make_handler(server, public=False, operator=False):
                     return self._deny(400, "ambiguous request framing")
                 try:
                     principal = server.collab.authenticate(
-                        self.headers.get("Authorization", ""), self.headers.get("X-Herdr-Device"))
+                        self.headers.get("Authorization", ""), self.headers.get("X-Herdr-Device"), **self._fabric_args())
                     big_tools = collab_mcp.admitted_tools(server.collab, principal) if principal.is_agent else frozenset()
                 except Exception:
                     big_tools = frozenset()
@@ -2376,7 +2551,7 @@ def _make_handler(server, public=False, operator=False):
                 extra = {} if principal is None else {"principal": principal}
                 status, payload = handle(
                     server.collab, message, self.headers.get("Authorization", ""),
-                    self.headers.get("X-Herdr-Device"), **extra)
+                    self.headers.get("X-Herdr-Device"), **extra, **self._fabric_args())
             except Exception:
                 return self._json({"jsonrpc": "2.0", "id": None,
                                    "error": {"code": -32603, "message": "internal error"}}, 500)
@@ -2459,6 +2634,8 @@ def _make_handler(server, public=False, operator=False):
             super().end_headers()
 
         def _do_GET(self):
+            if fabric:
+                return self._fabric_listener()
             if operator:
                 return self._operator()
             if public:
@@ -2505,6 +2682,8 @@ def _make_handler(server, public=False, operator=False):
             return self._timed_request(self._do_POST)
 
         def _do_POST(self):
+            if fabric:
+                return self._fabric_listener()
             if operator:
                 return self._operator()
             if public:
@@ -2543,7 +2722,8 @@ def _make_handler(server, public=False, operator=False):
             res = segs[3] if len(segs) > 3 and segs[:3] == ["", "api", "v1"] else ""
             if (res.startswith("reviews") or res in {"attention", "architecture", "scheduler", "assistant-apps", "assistant-workers",
                                     "assistant-action-requests", "assistant-grants", "assistant-judges",
-                                    "assistant-team-briefs"}
+                                    "assistant-slack", "assistant-deploys", "assistant-team-briefs",
+                                    "assistant-external-actions"}
                     or (res == "graph" and len(segs) > 4 and segs[4] == "work")
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
                     or _TERMINAL_ATTACH.match(dpath) or _HOST_TERMINAL_OUT.match(dpath) or _STEER_ACK.match(dpath)
@@ -2644,7 +2824,8 @@ def _make_handler(server, public=False, operator=False):
             # 501, decided before any listener-specific handler (operator/public/federation/collab) sees the request.
             if public and server.member_web is not None and self.path.startswith("/api/member/"):
                 return self._timed_request(self._public)      # the member run upload (only on the member host)
-            if operator or public or not self.path.startswith("/api/v1/assistant-apps/"):
+            if operator or public or fabric or not self.path.startswith(("/api/v1/assistant-apps/",)):
+                self.close_connection = True  # the unread body would otherwise be parsed as the next request
                 return self._timed_request(lambda: self._send_json(501, {"error": "not implemented"}))
             return self._timed_request(self._mutate_verb)
 
@@ -2654,9 +2835,12 @@ def _make_handler(server, public=False, operator=False):
                                         "assistant-delegations", "assistant-proposals",
                                         "assistant-notifications", "assistant-apps",
                                         "assistant-reminders", "assistant-workers",
-                                        "assistant-action-requests", "assistant-grants", "assistant-judges"}
+                                        "assistant-action-requests", "assistant-grants", "assistant-judges",
+                                        "assistant-slack", "assistant-deploys"}
 
         def _mutate_verb(self):
+            if fabric:
+                return self._fabric_listener()
             if operator:
                 return self._operator()
             if public:
@@ -2680,12 +2864,14 @@ def _make_handler(server, public=False, operator=False):
             if resource not in self._ASSISTANT_MUTABLE_RESOURCES or (
                     self.command == "PUT" and resource != "assistant-apps"):
                 # preserve the pre-existing 501 for PATCH/DELETE elsewhere
+                self.close_connection = True  # the unread body would otherwise be parsed as the next request
                 return self._send_json(501, {"error": "not implemented"})
             err = self._require("operator")
             if err:
                 return err
             if resource in ("assistant-apps", "assistant-reminders", "assistant-workers",
-                            "assistant-action-requests", "assistant-grants", "assistant-judges"):
+                            "assistant-action-requests", "assistant-grants", "assistant-judges",
+                            "assistant-slack", "assistant-deploys"):
                 origin = self.headers.get("Origin")
                 if origin and (urlsplit(origin).netloc != self.headers.get("Host")
                                or urlsplit(origin).scheme not in {"http", "https"}):
@@ -3010,14 +3196,14 @@ def _make_handler(server, public=False, operator=False):
             is per-user / per-agent (collab.authenticate)."""
             service = server.collab
             if service is None:
-                if server.collab_operator_url and not operator and not public:
+                if server.collab_operator_url and not operator and not public and not fabric:
                     return self._collab_proxy()
                 return self._deny(404, "not found")
             if self._rate_limit(self._proxied_client()):
                 return None
             # On a shared plain-HTTP listener, refuse collaboration unless the request
             # came through the TLS-terminating proxy (`tailscale serve` sets this header).
-            if (server.collab_require_https and not operator
+            if (server.collab_require_https and not operator and not fabric
                     and self.headers.get("X-Forwarded-Proto", "").lower() != "https"):
                 return self._deny(400, "collaboration is only served over https")
             if self.command == "POST":
@@ -3051,7 +3237,9 @@ def _make_handler(server, public=False, operator=False):
                                           self.headers.get("Authorization", ""),
                                           self.headers.get("X-Herdr-Device"),
                                           operator=server.operator_user if operator else None,
-                                          client=self._proxied_client())
+                                          client=self._proxied_client(), fabric_listener=fabric,
+                                          fabric_owner=server.operator_user if fabric else None,
+                                          **self._fabric_args())
             except Exception:
                 return self._json({"error": "internal error"}, 500)  # never echo internals
             if isinstance(result, tuple):
@@ -3088,10 +3276,23 @@ def _make_handler(server, public=False, operator=False):
                 frames.close()
             return None
 
+        def _fabric_args(self):
+            """What ``Authorization: Fabric`` may use to identify the caller: the REAL socket peer and the informational
+            machine header, nothing else. A request that carries any forwarding header was relayed by something, so the socket
+            peer is that relay and not the caller: no peer is offered and Fabric fails closed. (Behind `tailscale serve` the
+            peer is 127.0.0.1, which the service refuses on its own.) X-Forwarded-For is never read as an address."""
+            if public or operator:      # Fabric is for the main collab listener only: never the internet-facing or operator ones
+                return {}
+            relayed = any(h in self.headers for h in _FORWARDING_HEADERS)
+            return {"peer_ip": None if relayed else self.client_address[0],
+                    "machine": self.headers.get("X-Herdr-Machine")}
+
         def _proxied_client(self):
             """Behind `tailscale serve` every peer is 127.0.0.1; key the limiter on the
             forwarded address, but only trust it from a loopback peer (the proxy)."""
             peer = self.client_address[0]
+            if fabric:          # the dedicated listener has no proxy in front: a forwarded address is never believed
+                return peer
             fwd = self.headers.get("X-Forwarded-For", "").split(",")[-1].strip()
             # The public listener is reachable only from the host's own proxy (possibly
             # across the Docker bridge), so a private peer is trusted there too.
@@ -3143,6 +3344,9 @@ def _make_handler(server, public=False, operator=False):
                 from .artifact_members_api import route_members
                 if route_members(self, server, parts, resource):
                     return None
+                from .artifact_library_api import route_library
+                if route_library(self, server, parts, resource):
+                    return None
                 from .artifact_delete_api import route_delete
                 if route_delete(self, server, parts, resource):
                     return None
@@ -3190,6 +3394,10 @@ def _make_handler(server, public=False, operator=False):
                 return self._send_json(403, {"error": "not permitted to modify this lineage object",
                                              "reason": "lineage_forbidden"})
             except ValueError as exc:
+                if resource == "ingest":
+                    from .communications import InvalidObservation
+                    if isinstance(exc, InvalidObservation):
+                        return self._send_json(400, {"error": str(exc), "code": "invalid_communication_observation"})
                 if getattr(exc, "code", None) == "not_found":
                     return self._send_json(404, {"error": "not found"})
                 message = "Invalid GitHub query." if resource == "github" else str(exc)
@@ -3542,12 +3750,17 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"activities": r.mission_activity.list_summaries(),
                                    "server_time": r._stamp()})
             if resource == "mission-outcomes" and len(parts) == 4:
-                from .mission_outcome import outcome_summaries
+                from .mission_outcome import (
+                    issue_refs_by_mission,
+                    outcome_summaries,
+                    pr_refs_by_mission,
+                )
                 try:
                     server.mission_outcomes.sweep()
                 except Exception:  # noqa: BLE001
                     pass
-                return self._json({"outcomes": outcome_summaries(r)})
+                return self._json({"outcomes": outcome_summaries(r), "pr_refs": pr_refs_by_mission(r),
+                                   "issue_refs": issue_refs_by_mission(r)})
             if resource == "missions":
                 try:
                     server.mission_outcomes.sweep()   # throttled; closes missions that went silent
@@ -3671,6 +3884,11 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({'error':'staleCatalogCursor','message':str(exc)},409)
                     except ValueError as exc:
                         return self._json({'error':str(exc)},400)
+                try:
+                    limit, offset = _page_window(self.path, default_limit=SERVICES_PAGE_DEFAULT,
+                                                 max_limit=SERVICES_PAGE_MAX)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
                 services = r.list_services()
                 host_filter = _q(self.path, "host_id")
                 if host_filter:
@@ -3680,11 +3898,13 @@ def _make_handler(server, public=False, operator=False):
                 summary["total"] = len(services)
                 if _q(self.path, "include_archived") in {"false", "0"}:
                     services = [s for s in services if not s["lifecycle"]["archived"]]
+                services, pagination = _page_slice(services, limit, offset)
                 if _q(self.path, "fields") == "feed":
                     # The ownership feed needs identity and proof only; the full
                     # catalog projection is most of the bytes of a large inventory.
                     services = [{k: s.get(k) for k in _FEED_SERVICE_FIELDS} for s in services]
-                return self._etag_json({"services": services, "summary": summary})
+                return self._etag_json({"services": services, "summary": summary,
+                                        "pagination": pagination})
             if resource == "fleet" and parts[4:] == ["config", "status"]:
                 if server.fleet_config is None:
                     return self._json({"error": "not found"}, 404)
@@ -3697,6 +3917,15 @@ def _make_handler(server, public=False, operator=False):
                 raw = server._control_plane_value(server.fleet_config, "ai_sync")
                 try:
                     return self._json(parse_ai_sync(raw)) if raw is not None else self._json(
+                        {"error": "not configured"}, 404)
+                except ValueError:
+                    return self._json({"error": "not configured"}, 404)
+            if resource == "agent-rules" and parts[4:] == ["config"]:
+                # Read-only, from the central fleet YAML; an unusable or invalid section reads as not configured.
+                from .agent_rules_config import parse_agent_rules
+                raw = server._control_plane_value(server.fleet_config, "agent_rules")
+                try:
+                    return self._json(parse_agent_rules(raw)) if raw is not None else self._json(
                         {"error": "not configured"}, 404)
                 except ValueError:
                     return self._json({"error": "not configured"}, 404)
@@ -3723,9 +3952,12 @@ def _make_handler(server, public=False, operator=False):
                     return self._etag_json(h) if h else self._json(
                         {"error": "not found"}, 404)
                 return self._etag_json({"hosts": r.list_hosts()})
+            if resource == "communications" and len(parts) == 4:
+                from .communications import communication_page
+                return self._json(communication_page(r, limit=_qint(self.path, "limit", 50), before=_q(self.path, "before")))
             if resource == "activity":
-                evs = [_redact_event(e) for e in r.recent_events(
-                    limit=_qint(self.path, "limit", 50))]
+                evs = [_redact_event(e) for e in r.recent_events(limit=_qint(self.path, "limit", 50))
+                       if self._sse_readable(e)]        # artifact events only for callers who may read that artifact
                 return self._json({"events": evs})
             if resource == "analytics":
                 kind = parts[4]
@@ -3744,6 +3976,18 @@ def _make_handler(server, public=False, operator=False):
                     return self._json(r.usage_analytics(
                         mission_id=_q(self.path, "mission")))
                 return self._json({"error": "unknown analytics kind"}, 404)
+            if resource == "work":
+                # G1: read-only cross-entity lifecycle window; same viewer-level read auth as /events, gated by work_center_v1.
+                if not getattr(server, "work_center_enabled", False) or parts[4:] != ["weekly-events"]:
+                    return self._json({"error": "not found"}, 404)
+                from .work_weekly import weekly_events
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                for key in ("since", "until", "limit", "after"):
+                    if len(query.get(key, [])) > 1:
+                        raise ValueError(f"{key} must be supplied once")
+                return self._json(weekly_events(
+                    r, since=query.get("since", [None])[0], until=query.get("until", [None])[0],
+                    limit=query.get("limit", [None])[0], after=query.get("after", [None])[0]))
             if resource == "events":
                 if len(parts) > 4 and parts[4] == "stream":
                     return self._sse()
@@ -3763,6 +4007,10 @@ def _make_handler(server, public=False, operator=False):
                     if not etype or not eid:
                         return self._json(
                             {"error": "entity_type and entity_id required"}, 400)
+                    if etype == "artifact" and not (self._artifact_allowed(eid, "read") and self._registry_read_ok(eid)):
+                        # An id the caller may not read answers exactly as one that does not exist: the lookup runs
+                        # against an id no artifact can have (never NUL: Postgres text cannot hold it).
+                        eid = "artifact_unreadable_by_caller"
                     query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
                     if "limit" in query or "before" in query:
                         try:
@@ -3780,6 +4028,8 @@ def _make_handler(server, public=False, operator=False):
                         return self._json({**page, "events": [_redact_event(event) for event in page["events"]]})
                     return self._json({"events": [_redact_event(event) for event in r.stream(etype, eid)]})
             if resource == "artifacts" and len(parts) > 5 and parts[5] == "download":
+                if not self._registry_read_ok(parts[4]):
+                    return self._json({"error": "not found"}, 404)
                 a, data = self._artifact_current_file(parts[4])
                 if data is None or a is None:
                     return self._json({"error": "not found"}, 404)
@@ -3840,9 +4090,7 @@ def _make_handler(server, public=False, operator=False):
                 if len(parts) == 6 and parts[5] == "reviews":
                     # without an ACL the registry decides (like the versions routes); with one, the blanket guard above already did
                     # (legacy uploads have no registry row). No answer reveals that the artifact exists
-                    if (server.artifact_store is not None and server.artifact_acl is None
-                            and not self._artifact_call(
-                            "report_permission", parts[4], self._resource_principal(), "read")):
+                    if not self._registry_read_ok(parts[4]):
                         return self._json({"error": "not found"}, 404)
                     return self._json({"artifact_id": parts[4],
                                        "reviews": server.artifact_review_manager.list_for_artifact(parts[4])})
@@ -3857,7 +4105,8 @@ def _make_handler(server, public=False, operator=False):
                            else server.artifact_job_manager.get(parts[4]))
                     if job is None:
                         return self._json({'error': 'not found'}, 404)
-                    if not self._artifact_allowed(job['artifact_id'], 'read'):
+                    if (not self._artifact_allowed(job['artifact_id'], 'read')
+                            or not self._registry_read_ok(job['artifact_id'])):
                         return self._json({'error': 'not found'}, 404)
                     server.artifact_job_manager.load([job])
                     if job.get("profile") == "report" and server.artifact_store is not None:
@@ -3868,17 +4117,20 @@ def _make_handler(server, public=False, operator=False):
             if resource == "artifact-reviews" and server.artifact_review_manager is not None:
                 if len(parts) == 5:
                     review = server.artifact_review_manager.get(parts[4])
-                    if review and not self._artifact_allowed(review['artifact_id'], 'read'):
+                    if review and (not self._artifact_allowed(review['artifact_id'], 'read')
+                                   or not self._registry_read_ok(review['artifact_id'])):
                         return self._json({'error': 'not found'}, 404)
                     return self._json(review) if review else self._json({"error": "not found"}, 404)
             if resource == "publications" and server.publication_controller is not None:
                 if len(parts) == 4:
                     publications = [p for p in server.publication_controller.list()
-                                    if self._artifact_allowed(p['resource_id'], 'read')]
+                                    if self._artifact_allowed(p['resource_id'], 'read')
+                                    and self._registry_read_ok(p['resource_id'])]
                     return self._json({"publications": publications})
                 if len(parts) == 5:
                     publication = server.publication_controller.get(parts[4])
-                    if publication and not self._artifact_allowed(publication['resource_id'], 'read'):
+                    if publication and (not self._artifact_allowed(publication['resource_id'], 'read')
+                                        or not self._registry_read_ok(publication['resource_id'])):
                         return self._json({'error': 'not found'}, 404)
                     return self._json(publication) if publication else self._json({"error": "not found"}, 404)
             if resource == "leases":
@@ -3894,6 +4146,8 @@ def _make_handler(server, public=False, operator=False):
                 if what in ("stats", "timeseries", "errors", "spend") and len(parts) == 5:
                     return self._llm_stats(what)
                 return self._json({"error": "not found"}, 404)
+            if resource == "agent-ops":
+                return self._agent_ops(parts[4:])
             if resource == "graph":
                 return self._graph_get(parts)
             if resource == "steering":
@@ -3952,8 +4206,18 @@ def _make_handler(server, public=False, operator=False):
                         languages if isinstance(languages, dict) else {}))
                 if what == "history":
                     from .project_links import annotate_ci_history, cached_github_languages
-                    return self._json(annotate_ci_history(server.ci_monitor.history(), r,
-                        repository_languages=cached_github_languages(server.github_monitor)))
+                    try:
+                        limit, offset = _page_window(self.path, default_limit=CI_HISTORY_PAGE_DEFAULT,
+                                                     max_limit=CI_HISTORY_PAGE_MAX)
+                    except ValueError as exc:
+                        return self._json({"error": str(exc)}, 400)
+                    # Only the requested window is copied, then annotated.
+                    snapshot = server.ci_monitor.history(window=(offset, limit))
+                    pagination = snapshot.pop("pagination")
+                    view = annotate_ci_history(snapshot, r,
+                        repository_languages=cached_github_languages(server.github_monitor))
+                    view["pagination"] = pagination
+                    return self._json(view)
                 if what == "reports":
                     from .project_links import annotate_ci_history, cached_github_languages
                     filters = _ci_reports_query(self.path)
@@ -4032,8 +4296,14 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_hub_owner(parts, resource)
             if resource == "assistant-judges":
                 return self._assistant_judges(parts)
+            if resource == "assistant-slack":
+                return self._assistant_slack(parts)
+            if resource == "assistant-deploys":
+                return self._assistant_deploys(parts)
             if resource in ("assistant-team-briefs", "assistant-references"):
                 return self._assistant_briefs(parts, resource, None)
+            if resource == "assistant-external-actions":
+                return self._assistant_external(parts, None)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations", "assistant-graph", "assistant-types", "assistant-placement", "assistant-route",
                             "assistant-proposals", "assistant-notifications", "assistant-audit"):
                 return self._assistant_get(parts, resource)
@@ -4511,8 +4781,12 @@ def _make_handler(server, public=False, operator=False):
                 return self._assistant_hub_owner(parts, resource, body)
             if resource == "assistant-judges":
                 return self._assistant_judges(parts, body)
+            if resource == "assistant-deploys":
+                return self._assistant_deploys(parts, body)
             if resource == "assistant-team-briefs":
                 return self._assistant_briefs(parts, resource, body)
+            if resource == "assistant-external-actions":
+                return self._assistant_external(parts, body)
             if resource in ("assistants", "assistant-runs", "assistant-approvals", "assistant-memory", "assistant-routines", "assistant-connectors", "assistant-delegations",
                             "assistant-proposals", "assistant-notifications"):
                 # the body is already read above (line ~2170) into the local
@@ -4903,6 +5177,125 @@ def _make_handler(server, public=False, operator=False):
             except (KeyError, AssistantNotFound):
                 return self._json({"error": "not found"}, 404)
 
+        def _assistant_deploys(self, parts, body=None):
+            """Owner-only deploy permission per project and scope.
+
+            GET    /api/v1/assistant-deploys                              configured projects/scopes, live standing grants
+            POST   /api/v1/assistant-deploys/<project>/<scope>/auto       {"worker_id", "confirm": true}: ASKS in Slack
+            DELETE /api/v1/assistant-deploys/<project>/<scope>/auto?worker_id=...   revokes the standing grant
+
+            The POST only posts a confirmation to the owner's Slack; the standing grant is created by the owner's
+            verified Confirm tap and by nothing else.  No token, token path or secret is ever returned."""
+            from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
+            from .assistant_hub.actiongrants import GrantState
+            from .assistant_hub.deploy import DeployMatch, scope_key
+            from .assistant_hub.policy import STANDING, current_judge_version, revoke_action_grant
+            from .assistant_hub.slack import SlackError
+            if self._require("operator"):
+                return None
+            try:
+                svc = server.assistant
+                svc._require_enabled()
+                tenant_id, user_id = self._assistant_scope()
+                svc.check_rate_limit(key=f"{tenant_id}:{user_id}")
+                projects = (svc.config.get("deploy") or {}).get("projects") or {}
+                policy, now = int(svc.config["grants"]["policy_version"]), svc.now()
+                version = current_judge_version(server.assistant_judge)
+
+                def standing(match):
+                    key_id = scope_key(match).key_id()
+                    return [g for g in svc.store.list_action_grants(tenant_id, user_id)
+                            if g.key_id == key_id and g.source == STANDING
+                            and g.effective_state(now, policy, version) is GrantState.ACTIVE]
+
+                if len(parts) == 4 and self.command == "GET":
+                    out = []
+                    for pid, proj in projects.items():
+                        scopes = []
+                        for sid, scope in proj["scopes"].items():
+                            workers = sorted({g.worker_id for g in standing(DeployMatch(pid, sid, proj["repo"], "", ""))})
+                            scopes.append({"scope": sid, "mode": scope["mode"], "command": scope["command"],
+                                           "require": list(scope["require"]), "standing_grant": bool(workers),
+                                           "workers": workers})
+                        out.append({"project": pid, "repo": proj["repo"], "scopes": scopes})
+                    return self._json({"projects": out})
+                if len(parts) != 7 or parts[6] != "auto" or self.command not in ("POST", "DELETE"):
+                    return self._json({"error": "not found"}, 404)
+                proj = projects.get(parts[4])
+                if proj is None or parts[5] not in proj["scopes"]:
+                    return self._json({"error": "not found"}, 404)
+                project, scope = parts[4], parts[5]
+                if self.command == "POST" and proj["scopes"][scope]["mode"] != "auto":
+                    return self._json({"error": "this scope is not set to mode: auto in the config, so auto-deploy "
+                                                "cannot be confirmed", "code": "mode_not_auto"}, 409)
+
+                def active_worker(worker_id):
+                    w = svc.store.workers.get(worker_id) if isinstance(worker_id, str) else None
+                    return (w is not None and w.status == "active"
+                            and (w.tenant_id, w.user_id) == (tenant_id, user_id))
+
+                runtime = server.assistant_slack
+                if self.command == "POST":
+                    if (not isinstance(body, dict) or set(body) != {"worker_id", "confirm"} or body["confirm"] is not True
+                            or not isinstance(body["worker_id"], str)
+                            or not re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", body["worker_id"])):
+                        return self._json({"error": 'body must be exactly {"worker_id": "...", "confirm": true}'}, 400)
+                    if not active_worker(body["worker_id"]):
+                        return self._json({"error": "not found"}, 404)
+                    if runtime is None or not runtime.is_enabled():
+                        return self._json({"error": "Slack is not enabled, so the confirmation cannot be asked",
+                                           "code": "unavailable"}, 503)
+                    try:
+                        ask = runtime.ask_deploy_auto(tenant_id, user_id, project, scope, body["worker_id"])
+                    except SlackError as exc:
+                        return self._json({"error": "the confirmation could not be posted to Slack",
+                                           "code": exc.code}, 502)
+                    return self._json({"status": "awaiting_confirmation", "ask_id": ask.ask_id,
+                                       "expires_at": self._iso(ask.expires_at)}, 202)
+                from urllib.parse import parse_qs, urlsplit
+                worker_id = _q(self.path, "worker_id")
+                if (set(parse_qs(urlsplit(self.path).query)) != {"worker_id"} or not worker_id
+                        or not re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", worker_id)):
+                    return self._json({"error": "exactly one query parameter, worker_id, is required"}, 400)
+                if runtime is not None:
+                    runtime.retire_deploy_asks(tenant_id, user_id, project, scope, worker_id)
+                live = [g for g in standing(DeployMatch(project, scope, proj["repo"], "", "")) if g.worker_id == worker_id]
+                if not live:
+                    return self._json({"error": "no standing grant"}, 404)
+                for g in live:
+                    revoke_action_grant(svc.store, now, tenant_id, user_id, g.grant_id, revoked_by=user_id,
+                                        policy_version=policy, judge_version=version)
+                return self._json({"revoked": len(live)})
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+
+        def _assistant_slack(self, parts):
+            """Owner-only Slack front door status: whether it is on and connected, when it last heard from Slack and
+            how many asks are open.  Read-only; no token, token path or message text ever leaves here."""
+            from .assistant import AssistantNotFound, AssistantUnavailable, RateLimited
+            if self._require("operator"):
+                return None
+            try:
+                server.assistant._require_enabled()
+                tenant_id, user_id = self._assistant_scope()
+                server.assistant.check_rate_limit(key=f"{tenant_id}:{user_id}")
+                if len(parts) != 4 or self.command != "GET":
+                    return self._json({"error": "not found"}, 404)
+                runtime = server.assistant_slack
+                if runtime is None:
+                    return self._json({"enabled": False, "connected": False, "last_event_at": None, "open_asks": 0})
+                return self._json(runtime.status(tenant_id, user_id))
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+
         def _assistant_briefs(self, parts, resource, body):
             """Team collaboration slice 4 (assistant_briefs.py): the operator's assistant offers a team a derived brief.
 
@@ -4962,6 +5355,69 @@ def _make_handler(server, public=False, operator=False):
                 return self._json({"error": "not found"}, 404)
             except (AssistantError, ValueError) as exc:
                 return self._json({"error": str(exc)}, 400)
+
+        def _assistant_external(self, parts, body):
+            """Team collaboration slice 5 (external_actions.py): the operator's own door onto approval-gated external actions.
+
+            GET  /api/v1/assistant-external-actions[?state=]           the caller's actions, with the full card
+            GET  /api/v1/assistant-external-actions/<id>                one action
+            POST /api/v1/assistant-external-actions                     {kind, room_id, reference[, title, labels, body]}
+            POST /api/v1/assistant-external-actions/<id>/decision       {decision, expected_sha256}
+            POST /api/v1/assistant-external-actions/<id>/retry          {expected_sha256}
+
+            The scope is the authenticated API-key principal's own ``(tenant, user)``; collaboration credentials do not
+            authenticate here. Filing, deciding and retrying go through the collaboration service (the same authorisation and
+            audit as the collab door); that mapping needs ``actions.collab_users``. Off answers like a route that does not exist."""
+            from .assistant import (
+                AssistantError,
+                AssistantNotFound,
+                AssistantUnavailable,
+                RateLimited,
+            )
+            from .assistant_adapters import ExternalActionsBridge
+            from .collab import CollabError, Principal
+            try:
+                tenant_id, user_id = self._assistant_scope()
+                svc = server.assistant
+                svc._require_enabled()
+                ext = svc.external_actions
+                ext._require_enabled()
+                svc.check_rate_limit(key=f"{tenant_id}:{user_id}")
+                collab, n = server.collab, len(parts)
+                collab_user = svc.config["actions"]["collab_users"].get(user_id)
+                if n == 4 and self.command == "GET":
+                    return self._json({"actions": ext.list(tenant_id=tenant_id, user_id=user_id, state=_q(self.path, "state"))})
+                if n == 5 and self.command == "GET":
+                    return self._json(ext.get(parts[4], tenant_id=tenant_id, user_id=user_id))
+                if collab is None or not collab_user or not collab.auth.exists(collab_user):
+                    raise AssistantNotFound("not found")
+                owner = Principal("user", collab_user, collab_user)
+                body = body if isinstance(body, dict) else {}
+                if n == 4 and self.command == "POST":
+                    room_id = body.get("room_id")
+                    if not isinstance(room_id, str) or not room_id:
+                        return self._json({"error": "room_id is required"}, 400)
+                    status, out = collab.file_external_action(owner, room_id, {k: v for k, v in body.items() if k != "room_id"},
+                                                              via="assistant")
+                    return self._json({**out, "card": ext.get(out["action_id"], tenant_id=tenant_id, user_id=user_id)["card"]}, status)
+                if n == 6 and self.command == "POST" and parts[5] in ("decision", "retry"):
+                    row = ext.get(parts[4], tenant_id=tenant_id, user_id=user_id)
+                    return self._json(collab.decide_external_action(owner, row["room_id"], parts[4], body, parts[5]))
+                return self._json({"error": "not found"}, 404)
+            except CollabError as exc:
+                return self._json({"error": exc.message}, exc.status)
+            except AssistantUnavailable as exc:
+                return self._json({"error": str(exc), "code": "unavailable"}, 503)
+            except RateLimited as exc:
+                return self._json({"error": str(exc), "code": "rate_limited"}, 429)
+            except (KeyError, AssistantNotFound):
+                return self._json({"error": "not found"}, 404)
+            except (AssistantError, ValueError) as exc:
+                try:
+                    mapped = ExternalActionsBridge.error(exc)
+                except Exception:                                  # noqa: BLE001
+                    return self._json({"error": str(exc)}, 400)
+                return self._json({"error": mapped.message}, mapped.status)
 
         def _assistant_get(self, parts, resource):
             from .assistant import (
@@ -5545,6 +6001,134 @@ def _make_handler(server, public=False, operator=False):
                     out = {**out, **view}
             return self._json(out)
 
+        def _agent_ops_caller(self):
+            """(principal, operator): the collab person/agent behind the request, if any. Room scope comes ONLY from a
+            collab principal (or the single operator's own identity); an API key alone reads no room."""
+            from .collab import CollabError
+            service = server.collab
+            operator = self._role() == "operator"
+            if service is None:
+                return None, operator
+            authorization = self.headers.get("Authorization", "")
+            if authorization:
+                try:
+                    return service.authenticate(authorization, self.headers.get("X-Herdr-Device")), operator
+                except CollabError:
+                    raise PermissionError("unauthorized") from None
+            if operator and server.operator_user and service.auth.exists(server.operator_user):
+                from .collab import Principal
+                pr = Principal("user", server.operator_user, server.operator_user)
+                pr.admin = pr.approver = True
+                return pr, operator
+            return None, operator
+
+        def _agent_ops(self, sub):
+            """``/api/v1/agent-ops/{snapshot,events,replay,stream}``: metadata-only, room-authorized, read-only. Off (default)
+            it is a 404 like any unknown route."""
+            if not getattr(server, "agent_ops_enabled", False) or len(sub) != 1 or sub[0] not in (
+                    "snapshot", "events", "replay", "stream"):
+                return self._json({"error": "not found"}, 404)
+            try:
+                principal, operator = self._agent_ops_caller()
+            except PermissionError:
+                return self._json({"error": "unauthorized"}, 401)
+            from .agent_ops import PAGE_MAX, valid_cursor
+            service = server.agent_ops
+            query = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+            cursor = query.get("cursor") or self.headers.get("Last-Event-ID") or None
+            if sub[0] == "stream":
+                return self._agent_ops_stream(service, principal, operator, cursor)
+            for given in (query.get("until"), cursor):
+                if given and sub[0] in ("events", "replay") and not valid_cursor(given):
+                    return self._json({"error": "invalid cursor: take one from the cursor field of a snapshot or event "
+                                                "row (re-fetch the snapshot)"}, 400)
+            viewer = service.viewer(principal, operator)
+            if sub[0] == "snapshot":
+                return self._json(service.snapshot(viewer, principal))
+            if sub[0] == "replay":
+                return self._json(service.replay(viewer, principal, query.get("until") or cursor))
+            try:
+                limit = int(query.get("limit", 100))
+            except ValueError:
+                return self._json({"error": "limit must be an integer"}, 400)
+            return self._json(service.events(viewer, principal, cursor, min(max(limit, 1), PAGE_MAX)))
+
+        def _agent_ops_stream(self, service, principal, operator, cursor):
+            """SSE with cursor resume (``?cursor=`` or ``Last-Event-ID``). Access is re-evaluated on every tick (a revoked
+            room stops flowing at once) and the credential itself every ``agent_ops_reauth_seconds`` (a revoked key, token
+            or disabled person ends the stream); the queue is the bounded page read each tick (no unbounded subscriber
+            queue), and the number of concurrent streams is capped."""
+            from .agent_ops import STREAM_PAGE, valid_cursor
+            reset = cursor is not None and not valid_cursor(cursor)
+            # open mode (no API keys) has no identity: one shared bucket, never one per (attacker-chosen) header value
+            caller = f"p:{principal.id}" if principal is not None else "open" if not server._keys else \
+                "k:" + hashlib.sha256(self.headers.get("X-API-Key", "").encode()).hexdigest()
+            with server._agent_ops_stream_lock:
+                if server._agent_ops_stream_counts.get(caller, 0) >= server.agent_ops_streams_per_principal:
+                    return self._json({"error": "too many agent-ops streams for this caller"}, 503)
+                if not server.agent_ops_streams.acquire(blocking=False):
+                    return self._json({"error": "too many agent-ops streams"}, 503)
+                server._agent_ops_stream_counts[caller] = server._agent_ops_stream_counts.get(caller, 0) + 1
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                self.close_connection = True
+                try:
+                    self.connection.settimeout(30)
+                except OSError:
+                    pass
+                started = last_write = last_auth = time.monotonic()
+                try:
+                    if reset:        # an unusable Last-Event-ID is ignored: say so, then continue from the current snapshot
+                        cursor = service.snapshot(service.viewer(principal, operator), principal)["cursor"]
+                    self.wfile.write(
+                        f"event: connected\ndata: {json.dumps({'cursor': None, 'reset': True} if reset else {'cursor': cursor})}\n\n".encode())
+                    self.wfile.flush()
+                    while time.monotonic() - started < _MAX_SSE_SECONDS:
+                        if time.monotonic() - last_auth >= server.agent_ops_reauth_seconds:
+                            last_auth = time.monotonic()
+                            try:
+                                if self._role() is None:
+                                    raise PermissionError("unauthorized")
+                                principal, operator = self._agent_ops_caller()
+                            except PermissionError:
+                                self.wfile.write(b"event: revoked\ndata: {}\n\n")
+                                self.wfile.flush()
+                                break
+                        page = service.events(service.viewer(principal, operator), principal, cursor, STREAM_PAGE,
+                                              cached=True)
+                        for ev in page["events"]:
+                            frame_id = ev["cursor"]
+                            if any(c in frame_id for c in "\r\n\0"):
+                                server.agent_ops_skipped_frames += 1
+                                continue          # never let a stored id forge or split an SSE frame
+                            self.wfile.write(f"id: {frame_id}\ndata: {json.dumps(ev)}\n\n".encode())
+                        if page["events"]:
+                            cursor = page["next_cursor"]
+                            self.wfile.flush()
+                            last_write = time.monotonic()
+                            if page["has_more"]:
+                                continue
+                        elif time.monotonic() - last_write >= _SSE_IDLE_SECONDS:
+                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.flush()
+                            last_write = time.monotonic()
+                        time.sleep(server.agent_ops_poll_seconds)
+                except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                    pass
+            finally:
+                server.agent_ops_streams.release()
+                with server._agent_ops_stream_lock:
+                    left = server._agent_ops_stream_counts.get(caller, 1) - 1
+                    if left > 0:
+                        server._agent_ops_stream_counts[caller] = left
+                    else:
+                        server._agent_ops_stream_counts.pop(caller, None)
+            return None
+
         def _work_graph(self, sub, body=None):
             """``/api/v1/graph/work/*`` (unified workspace P02): the persistent Work Graph. Off (default) it is a 404 like any
             unknown route; on without a database it is a 503. Reads need the viewer role; layout writes and reconcile are
@@ -5657,6 +6241,8 @@ def _make_handler(server, public=False, operator=False):
                         limit=_qint(self.path, "limit", 200),
                         before_seq=(_qint(self.path, "before_seq", -1)
                                     if _q(self.path, "before_seq") else None)), sid))
+                if tail[0] == "history" and len(tail) == 1:
+                    return self._inspector_history(sid, role)
                 if tail[0] == "events" and len(tail) == 2:
                     if not tail[1].isdigit():
                         return self._json({"error": "invalid sequence"}, 400)
@@ -5675,6 +6261,29 @@ def _make_handler(server, public=False, operator=False):
             except KeyError:
                 return self._json({"error": "not found"}, 404)
             return self._json({"error": "not found"}, 404)
+
+        def _inspector_history(self, sid, role):
+            """Older inspector events from Postgres, paged by an opaque cursor (``before``); additive to the ring."""
+            from .inspector_history import HistoryCursorInvalid, parse_inspector_history
+            cfg = parse_inspector_history(server._control_plane_value(server.fleet_config, "inspector_history"))
+            if not cfg["enabled"]:
+                return self._json({"error": "inspector history is disabled"}, 404)
+            if not server.repo.inspector.has_session(sid) and server.repo.get_session(sid) is None:
+                return self._json({"error": "session not found"}, 404)
+            raw = _q(self.path, "limit")
+            if raw is not None and not raw.isdigit():
+                return self._json({"error": "invalid limit"}, 400)
+            limit = max(1, min(int(raw) if raw else cfg["page_size"], cfg["max_page_size"]))
+            try:
+                body = server.repo.inspector_history_page(
+                    sid, role, view=_q(self.path, "view") or "all", limit=limit, before=_q(self.path, "before"))
+            except (HistoryCursorInvalid, ValueError) as exc:
+                return self._json({"error": str(exc)}, 400)
+            except LookupError:
+                return self._json({"error": "durable inspector history is not available"}, 503)
+            except Exception:   # a failed durable read must not take the dashboard down; static message only
+                return self._json({"error": "durable inspector history is unavailable"}, 503)
+            return self._json(body)
 
         def _inspector_set_prefs(self, sid):
             body = self._read_json() or {}
@@ -5781,6 +6390,16 @@ def _make_handler(server, public=False, operator=False):
             return self._json(r.get_artifact(aid))
 
         # ------------------------------------------------------------ SSE
+        def _sse_readable(self, event) -> bool:
+            """Artifact events reach only subscribers who may read that artifact (same rule as the per-entity stream)."""
+            if not isinstance(event, dict) or event.get("entity_type") != "artifact":
+                return True
+            try:
+                artifact_id = event.get("entity_id")
+                return bool(self._artifact_allowed(artifact_id, "read") and self._registry_read_ok(artifact_id))
+            except Exception:       # noqa: BLE001 - fail closed: an unanswerable check shows nothing
+                return False
+
         def _sse(self):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -5801,29 +6420,43 @@ def _make_handler(server, public=False, operator=False):
                 self.wfile.flush()
                 # replay recent history so a fresh client catches up (Spec §52)
                 for ev in reversed(server.repo.recent_events(limit=100)):
-                    self.wfile.write(_sse_frame(ev))
-                    self.wfile.flush()
-                started = time.monotonic()
-                # Bounded lifetime frees threads held by half-open clients;
-                # EventSource reconnects and replays.
-                while time.monotonic() - started < _MAX_SSE_SECONDS:
-                    try:
-                        ev = q.get(timeout=_SSE_IDLE_SECONDS)
-                    except queue.Empty:
-                        if q not in server._subscribers:
-                            break  # dropped as a slow subscriber: close so the client reconnects
-                        # A data frame (not an SSE comment, which EventSource never surfaces)
-                        # keeps proxies from timing out AND tells the UI the stream is alive on
-                        # a quiet fleet; the client filters it out like StreamConnected.
-                        self.wfile.write(_sse_frame({
-                            "event_type": "StreamKeepalive",
-                            "entity_type": "stream", "entity_id": "control-plane",
-                            "sequence": 0, "payload": {},
-                        }))
-                        self.wfile.flush()
+                    if not self._sse_readable(ev):
                         continue
                     self.wfile.write(_sse_frame(ev))
                     self.wfile.flush()
+                started = time.monotonic()
+                last_write = started       # keepalives run on the wall clock from the last WRITE: a skipped event is no write
+                # Bounded lifetime frees threads held by half-open clients;
+                # EventSource reconnects and replays.
+                while time.monotonic() - started < _MAX_SSE_SECONDS:
+                    wait = _SSE_IDLE_SECONDS - (time.monotonic() - last_write)
+                    ev = None
+                    if wait > 0:
+                        try:
+                            ev = q.get(timeout=wait)
+                        except queue.Empty:
+                            ev = None
+                    if ev is not None:
+                        if not self._sse_readable(ev):
+                            continue
+                        self.wfile.write(_sse_frame(ev))
+                        self.wfile.flush()
+                        last_write = time.monotonic()
+                        continue
+                    if time.monotonic() - last_write < _SSE_IDLE_SECONDS:
+                        continue
+                    if q not in server._subscribers:
+                        break  # dropped as a slow subscriber: close so the client reconnects
+                    # A data frame (not an SSE comment, which EventSource never surfaces)
+                    # keeps proxies from timing out AND tells the UI the stream is alive on
+                    # a quiet fleet; the client filters it out like StreamConnected.
+                    self.wfile.write(_sse_frame({
+                        "event_type": "StreamKeepalive",
+                        "entity_type": "stream", "entity_id": "control-plane",
+                        "sequence": 0, "payload": {},
+                    }))
+                    self.wfile.flush()
+                    last_write = time.monotonic()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             finally:
@@ -6464,6 +7097,35 @@ def _evolution_body(server, r, session_id, session=None):
 def _q(path, key):
     from urllib.parse import parse_qs, urlparse
     return parse_qs(urlparse(path).query).get(key, [None])[0]
+
+
+def _page_window(path, *, default_limit, max_limit):
+    """Parse ``limit``/``offset`` for a flat list endpoint (ValueError -> 400)."""
+    values = {}
+    for key, low in (("limit", 1), ("offset", 0)):
+        raw = _q(path, key)
+        if raw is None:
+            continue
+        if not re.fullmatch(r"[0-9]{1,9}", raw) or int(raw) < low:
+            raise ValueError(f"{key} must be an integer >= {low}")
+        values[key] = int(raw)
+    limit = values.get("limit", default_limit)
+    if limit > max_limit:
+        raise ValueError(f"limit must be an integer between 1 and {max_limit}")
+    return limit, values.get("offset", 0)
+
+
+def _page_slice(rows, limit, offset):
+    """Return (page rows, pagination marker) for an already ordered list."""
+    page = rows[offset:offset + limit]
+    end = offset + len(page)
+    more = end < len(rows)
+    return page, {"total": len(rows), "limit": limit, "offset": offset,
+                  "next_offset": end if more else None, "truncated": more}
+
+
+SERVICES_PAGE_DEFAULT, SERVICES_PAGE_MAX = 500, 1000
+CI_HISTORY_PAGE_DEFAULT, CI_HISTORY_PAGE_MAX = 1000, 2000
 
 
 def _qint(path, key, default):

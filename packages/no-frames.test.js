@@ -9,6 +9,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const shareStatic = join(here, '..', 'herdr_engineering', 'control_plane', 'share_static');
 const PLAN_FILES = ['member-artifacts.html', 'member-artifacts-app.js', 'member-artifacts-view.js', 'member-api.js',
   'member-upload.js', 'sha256-stream.js'];
+// The one allowed share frame: an empty-sandbox iframe whose src is the fixed bundled author page (opt-in Rich view).
+// Its exact shape is pinned by tests/control_plane/test_no_frames.py (share_rich_shape_problems), so it is skipped here only.
+const ALLOWED = new Set(['rich-toggle.js']);
 const TAG = /<\s*(iframe|frame|frameset|object|embed)(?=[\s/>])/i;
 const API = /createElement\(\s*['"`](iframe|frameset|frame|object|embed)/i;
 
@@ -30,6 +33,7 @@ test('the plan files and share_static contain no frame, object or embed markup o
   assert.ok(files.length > 8);
   assert.ok(files.some((f) => f.includes('vendor')), 'the vendored pdf.js is scanned too');
   for (const file of files) {
+    if (ALLOWED.has(file.split('/').pop()) && file.includes('share_static')) continue;
     const text = readFileSync(file, 'utf8');
     assert.doesNotMatch(text, TAG, file);
     assert.doesNotMatch(text, API, file);

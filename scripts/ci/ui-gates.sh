@@ -8,18 +8,28 @@ cd "$(dirname "$0")/../.."
 . "$(dirname "$0")/journal.sh"; ci_journal ui-gates     # first, so a run is readable even when the agent drops the tail of the step log
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing on this host: $1" >&2; exit 1; }; }
-need node; need python3; need git
+need node; need python3; need git; need flock
 node -e 'if (Number(process.versions.node.split(".")[0]) < 22) { console.error("Node 22 or newer is required, found " + process.version); process.exit(1); }'
 test -d /etc/fonts/conf.d || { echo "no /etc/fonts/conf.d: the screenshots depend on its rendering settings" >&2; exit 1; }
 
+# --- dependency cache ----------------------------------------------------------------
+# Same as unit-gates.sh: only trusted events (push/cron/manual on main) use the shared rw CI store; pull_request pipelines
+# get a private cold cache (herdr_ci_cache_setup in scripts/ci/cache-trust.sh).
+. "$(dirname "$0")/cache-trust.sh"
+herdr_ci_cache_setup ui-gates
+cache_root="$HERDR_CI_CACHE_ROOT"; cache_root_fallback="$HERDR_CI_PRIVATE_CACHE"
+
 # a private venv per run: two jobs on one agent must not share (and race on) one fixed path
 venv="$(mktemp -d "${TMPDIR:-/tmp}/herdr-ui-gates-venv.XXXXXX")"
-trap 'rm -rf "$venv"' EXIT
+cleanup() { rm -rf "$venv" "${cache_root_fallback:-/nonexistent-$$}"; }
+trap cleanup EXIT
 python3 -m venv "$venv"
 "$venv/bin/pip" install -q -e '.[dev]'
 export PATH="$venv/bin:$PATH"     # the fixture server starts with `python3`
 npm ci --no-audit --no-fund
-npx playwright install chromium         # the build the baselines were made with (Playwright 1.64); a no-op when cached
+# The build the baselines were made with (Playwright 1.64); a no-op when cached. flock serializes concurrent first runs
+# on the shared cache so two pipelines never race the same download.
+flock "$cache_root/playwright-install.lock" npx playwright install chromium
 
 # Phase budgets. A healthy run is ~11 min for the suite and ~1 min for the baseline check, so a phase that blows through 2x that is a
 # regression in the harness (the 2026-10-28 networkidle wait made every capture ~10 s slower: 11 min -> 49 min and never failed), not a

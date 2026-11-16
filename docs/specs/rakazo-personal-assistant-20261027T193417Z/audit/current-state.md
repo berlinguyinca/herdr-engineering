@@ -10,7 +10,7 @@ was performed against the **actual repository on this host**, not the spec's
 tree, the discrepancy is recorded under "integration hazard".
 
 Upstream Rakazo reference: pinned read-only checkout at
-`/home/wohlgemuth/upstream-refs/rakazo` @ `c03cd4a9` (Apache-2.0, 2026-10-27,
+`/home/user/upstream-refs/rakazo` @ `c03cd4a9` (Apache-2.0, 2026-10-27,
 "Release mobile 1.0.10 (#2474)"). No Rakazo code was copied into this change.
 
 ---

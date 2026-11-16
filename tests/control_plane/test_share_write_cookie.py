@@ -77,8 +77,8 @@ def test_the_session_exchange_sets_a_scoped_httponly_strict_secure_cookie(lab):
 def test_the_cookie_value_is_domain_separated_from_session_and_csrf():
     session = mint_session(SECRET, "shr-1", "alice", NOW0 + 100, email=EMAIL, basis="e")
     value = ss.write_cookie_value(SECRET, "shr-1", session)
-    assert value != csrf_token(SECRET, "shr-1", session) and value != session.split(".")[4]
-    assert ss._WRITE_DOMAIN not in (ss._DOMAIN, ss._CSRF_DOMAIN)
+    assert value != csrf_token(SECRET, "shr-1", session) and value != session.split(".")[2]
+    assert ss._WRITE_DOMAIN not in (ss._VERSION, ss._CSRF_DOMAIN)
     assert value != ss.write_cookie_value(SECRET, "shr-2", session)
     assert not ss.check_csrf(SECRET, "shr-1", session, value)
 

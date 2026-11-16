@@ -8,14 +8,32 @@ production journal (1,762,189 service rows -> 349,664, all 6,544 reconstructed s
   and last row; every row between them is removable.
 * ``ServiceUpdated``: removable only when its payload equals the service's previous ``ServiceUpdated`` payload and it
   is not the last one. Other ``ServiceUpdated`` rows carry state transitions (``unavailable_since``) and stay.
+  "Equal" ignores three pure timestamps (``metadata_updated_at``, ``verified_origin.verified_at``,
+  ``metadata_observation.observed_at``) when ``normalize_service_timestamps`` is true (the default): every heartbeat
+  restamps them, so exact equality removed 32 of 235,252 rows while 99.6% differed only by those timestamps. This is
+  replay-safe because a replay overwrites those keys from the next row and the service's last ``ServiceUpdated`` is never
+  removed; ``updated_at`` comes from that last row's timestamp.
 
 Only rows without a v2 envelope (no source, source sequence or actor) are candidates, and only rows older than
 ``min_age_days``. A pass scans the journal once (read only) into a session temp table of event ids, then moves them
 in small chunks, ``chunk_rows`` per transaction with ``chunk_pause_seconds`` between, so a large backlog never holds the
 WAL or the table for minutes (one 250,000-row statement stalled every ingest write for ~8 minutes). Each chunk is ONE
 statement that deletes the rows and inserts them into ``fabric_events_archive``, so a row is never lost half way, and
-rows already listed stay removable (later rows can only make more of a stream interior). Removing rows changes the journal a recovery checkpoint covered; the checkpoint
-loader then replays the affected streams in full (correct, slower), so after a drain the job rebuilds the checkpoint.
+rows already listed stay removable (later rows can only make more of a stream interior). Removing rows changes the journal a recovery checkpoint covered. The checkpoint
+loader accepts those deletes (they are ``D`` change rows on ``service`` streams; the checkpoint already reflects each
+service's final state) and rebuilds only the affected service streams from their surviving rows, so the result equals a
+complete replay. Any other delete, update or truncate still forces a complete replay. After a drain the job rebuilds the
+recovery checkpoint (``rebuild_checkpoint``).
+
+The deleted-service streams are rebuilt at load and count against the loader's incremental budget, so a checkpoint older
+than a large backlog drain is rejected and a boot replays the whole journal. With ``publish_projection_checkpoint`` the
+job also publishes a fresh PROJECTION checkpoint (``projection_refresh.refresh_checkpoint``, the path the worker's
+refresh thread uses) after a drained pass that moved rows, so the next boot finds one that already covers the deletes.
+Lock order: the compaction advisory lock (``_LOCK``) is released when the move ends, and only then does the publish take
+the materializer lock (on its own connection, waiting up to ``projection_lock_wait_seconds``); the two are never held
+together, so they cannot deadlock. The blocking publish runs in a thread. A busy lock or a failed publish logs a warning,
+leaves the publish pending and never fails the pass; every later tick (even inside ``interval_seconds``) retries it, with
+no compaction work, until it succeeds.
 Off unless ``enabled`` is true; ``dry_run`` (the default) only counts.
 """
 from __future__ import annotations
@@ -44,15 +62,24 @@ class CompactionSettings:
     archive_retention_days: float | None = 30.0
     rebuild_checkpoint: bool = True
     keep_checkpoints: int = 2
+    publish_projection_checkpoint: bool = False   # publish a projection checkpoint after a drained pass that moved rows
+    projection_lock_wait_seconds: float = 60.0    # how long that publish waits for the materializer lock
+    normalize_service_timestamps: bool = True     # ServiceUpdated rows that differ only by heartbeat timestamps are repeats
 
 
-# The candidate rows. Windows run over the whole stream so "first" and "last" are real, age is applied afterwards.
-_REMOVABLE = """
+# A ServiceUpdated payload without the timestamps every heartbeat restamps (see the module docstring).
+_NORMALISED_PAYLOAD = "((payload - 'metadata_updated_at') #- '{verified_origin,verified_at}' #- '{metadata_observation,observed_at}')"
+
+
+def removable_sql(normalize_service_timestamps: bool = True) -> str:
+    """The candidate rows. Windows run over the whole stream so "first" and "last" are real, age is applied afterwards."""
+    compared = _NORMALISED_PAYLOAD if normalize_service_timestamps else "payload"
+    return f"""
     SELECT event_id, event_type FROM (
         SELECT event_id, event_type, ingest_timestamp, payload,
                schema_version, source, source_sequence, actor,
                row_number() OVER w AS rn, count(*) OVER (PARTITION BY entity_id, event_type) AS cnt,
-               lag(payload) OVER w AS prev_payload
+               lag({compared}) OVER w AS prev_payload
         FROM fabric_events
         WHERE entity_type = 'service' AND entity_id IS NOT NULL
           AND event_type IN ('ServiceListenerObserved', 'ServiceMetadataObserved', 'ServiceUpdated')
@@ -62,14 +89,17 @@ _REMOVABLE = """
       AND schema_version = 1 AND source IS NULL AND source_sequence IS NULL AND actor IS NULL
       AND rn < cnt
       AND ((event_type <> 'ServiceUpdated' AND rn > 1)
-           OR (event_type = 'ServiceUpdated' AND payload IS NOT DISTINCT FROM prev_payload))
+           OR (event_type = 'ServiceUpdated' AND {compared} IS NOT DISTINCT FROM prev_payload))
 """
 
-_COUNT = f"SELECT event_type, count(*) AS n FROM ({_REMOVABLE}) r GROUP BY event_type"
 
-_LIST = f"""
-    CREATE TEMP TABLE compaction_pending AS SELECT event_id FROM ({_REMOVABLE}) r LIMIT $2
-"""
+def _count_sql(normalize: bool) -> str:
+    return f"SELECT event_type, count(*) AS n FROM ({removable_sql(normalize)}) r GROUP BY event_type"
+
+
+def _list_sql(normalize: bool) -> str:
+    return f"CREATE TEMP TABLE compaction_pending AS SELECT event_id FROM ({removable_sql(normalize)}) r LIMIT $2"
+
 
 _MOVE_CHUNK = """
     WITH batch AS (
@@ -101,22 +131,42 @@ def move_chunk_sql(columns: list[str]) -> str:
                               moved_columns=", ".join("moved." + _quote(c) for c in columns))
 
 
+async def sync_archive_columns(conn) -> list[str]:
+    """Give the archive every column the journal has. A column added to ``fabric_events`` after the archive was created
+    (``trace_id``) made ``INSERT ... SELECT moved.*`` fail with "more expressions than target columns", so no pass
+    moved anything and the journal grew until a boot took ten minutes. Returns the journal's column names."""
+    journal = await conn.fetch(_JOURNAL_COLUMNS)
+    have = {r["name"] for r in await conn.fetch(_ARCHIVE_COLUMNS)}
+    for col in journal:
+        if col["name"] not in have:
+            async with conn.transaction():        # never wait long on a lock while the caller's lock is held
+                await conn.execute("SET LOCAL lock_timeout = '5s'")
+                await conn.execute(
+                    f"ALTER TABLE fabric_events_archive ADD COLUMN IF NOT EXISTS {_quote(col['name'])} {col['type']}")
+            log.warning("fabric archive added missing column %s", col["name"])
+    return [r["name"] for r in journal]
+
+
 class FabricCompactor:
     """Run :meth:`tick` from the worker loop; it does nothing until ``interval_seconds`` have passed."""
 
-    def __init__(self, settings: CompactionSettings, *, clock=time.monotonic, pass_clock=time.monotonic, checkpoint_builder=None):
+    def __init__(self, settings: CompactionSettings, *, clock=time.monotonic, pass_clock=time.monotonic, checkpoint_builder=None,
+                 projection_publisher=None):
         self.settings = settings
         self._clock = clock
         self._pass_clock = pass_clock       # times one pass against max_pass_seconds; the tick clock only paces ticks
         self._last: float | None = None
         self._rebuild_pending = False
         self._checkpoint_builder = checkpoint_builder
+        self._projection_publisher = projection_publisher     # blocking callable(lock_wait_seconds); None = not wired
+        self._projection_pending = False
+        self._projection_retry_due = False    # a publish was attempted and deferred: retry it on every tick
         self.last_outcome = "not run"
 
     async def tick(self, conn) -> str:
         now = self._clock()
         if self._last is not None and now - self._last < self.settings.interval_seconds:
-            return "waiting"
+            return await self._retry_projection() or "waiting"
         self._last = now
         try:
             self.last_outcome = await self._run(conn)
@@ -133,7 +183,7 @@ class FabricCompactor:
             return "skipped: apply migration 0035 (fabric_events_archive) first"
         age = s.min_age_days * 86400.0
         if s.dry_run:
-            counts = {r["event_type"]: int(r["n"]) for r in await conn.fetch(_COUNT, age)}
+            counts = {r["event_type"]: int(r["n"]) for r in await conn.fetch(_count_sql(s.normalize_service_timestamps), age)}
             return f"dry run: would archive {sum(counts.values())} rows {dict(sorted(counts.items()))}"
         moved, drained = await self._move(conn, age)
         if moved is None:
@@ -141,16 +191,47 @@ class FabricCompactor:
         purged = 0
         if s.archive_retention_days is not None:
             purged = int((await conn.execute(
-                "DELETE FROM fabric_events_archive WHERE archived_at < now() - make_interval(secs => $1)",
+                "DELETE FROM fabric_events_archive WHERE archived_at < now() - make_interval(secs => $1) "
+                "AND entity_type IS DISTINCT FROM 'inspector'",      # inspector rows are accounted for by the snapshot
                 s.archive_retention_days * 86400.0)).split()[-1])
         if moved:
             self._rebuild_pending = True
+            self._projection_pending = True
         if not drained:
             self._last = self._clock() - s.interval_seconds + 60.0       # more to drain: come back in a minute
         outcome = f"archived {moved} rows, purged {purged} from the archive"
         if self._rebuild_pending and drained and s.rebuild_checkpoint:
             outcome += "; " + await self._rebuild(conn)
+        if self._projection_pending and drained and s.publish_projection_checkpoint:
+            outcome += "; " + await self._publish_projection()      # after _move released _LOCK: never nested
         return outcome
+
+    async def _retry_projection(self) -> str | None:
+        """On a tick inside the interval: retry a deferred publish only. No compaction work, no connection used; the
+        wait is the short ``projection_lock_wait_seconds``. Returns None when there is nothing to retry."""
+        s = self.settings
+        if not (self._projection_retry_due and self._projection_pending and s.publish_projection_checkpoint
+                and not s.dry_run):
+            return None
+        outcome = await self._publish_projection()
+        self.last_outcome = outcome
+        return outcome
+
+    async def _publish_projection(self) -> str:
+        """Publish a projection checkpoint off the event loop. Never raises; any failure leaves the publish pending."""
+        if self._projection_publisher is None:
+            log.warning("fabric compaction cannot publish a projection checkpoint: no publisher is wired")
+            self._projection_retry_due = True
+            return "projection checkpoint deferred (no publisher)"
+        try:
+            await asyncio.to_thread(self._projection_publisher, self.settings.projection_lock_wait_seconds)
+        except Exception as exc:    # the archived rows are consistent either way; the next drained pass retries
+            log.warning("fabric compaction projection checkpoint publish failed (%s)", type(exc).__name__)
+            self._projection_retry_due = True
+            return f"projection checkpoint deferred ({type(exc).__name__})"
+        self._projection_pending = False
+        self._projection_retry_due = False
+        return "projection checkpoint published"
 
     async def _move(self, conn, age):
         """List the removable rows once, then move them chunk by chunk. Returns (moved, drained); moved is None when
@@ -165,7 +246,7 @@ class FabricCompactor:
             await conn.execute("DROP TABLE IF EXISTS compaction_pending")
             columns = await self._sync_archive_columns(conn)
             move_sql = move_chunk_sql(columns)
-            await conn.execute(_LIST, age, s.batch_rows)
+            await conn.execute(_list_sql(s.normalize_service_timestamps), age, s.batch_rows)
             listed = int(await conn.fetchval("SELECT count(*) FROM compaction_pending"))
             while moved < listed:
                 async with conn.transaction():
@@ -193,19 +274,7 @@ class FabricCompactor:
                 log.warning("fabric compaction cleanup failed", exc_info=True)
 
     async def _sync_archive_columns(self, conn) -> list[str]:
-        """Give the archive every column the journal has. A column added to ``fabric_events`` after the archive was created
-        (``trace_id``) made ``INSERT ... SELECT moved.*`` fail with "more expressions than target columns", so no pass
-        moved anything and the journal grew until a boot took ten minutes. Returns the journal's column names."""
-        journal = await conn.fetch(_JOURNAL_COLUMNS)
-        have = {r["name"] for r in await conn.fetch(_ARCHIVE_COLUMNS)}
-        for col in journal:
-            if col["name"] not in have:
-                async with conn.transaction():        # never wait long on a lock while the compaction lock is held
-                    await conn.execute("SET LOCAL lock_timeout = '5s'")
-                    await conn.execute(
-                        f"ALTER TABLE fabric_events_archive ADD COLUMN IF NOT EXISTS {_quote(col['name'])} {col['type']}")
-                log.warning("fabric compaction added missing archive column %s", col["name"])
-        return [r["name"] for r in journal]
+        return await sync_archive_columns(conn)
 
     async def _rebuild(self, conn) -> str:
         from . import recovery_checkpoint as rc

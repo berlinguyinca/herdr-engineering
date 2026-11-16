@@ -17,8 +17,12 @@ def test_handoff_skill_source_is_valid_and_symlinked():
     assert "\nname: handoff\n" in head + "\n" and "description:" in head
     assert (ROOT / "skills/handoff").resolve() == ss.HANDOFF_SOURCE.resolve()
     for command in ("herdr-eng handoff harness", "herdr-eng summary history --json", "herdr-handoff create",
-                    "herdr-handoff launch", "--from-json -", "manual_launch_required"):
+                    "herdr-handoff takeover", "--from-json -", "manual_launch_required"):
         assert command in body
+    # The handover closes a pane, so the skill that ships must name the refusals rather than assume the
+    # close happened (`herdr-handoff` 0.4.0; see tests/test_handoff_takeover_default.py for the rest).
+    for refusal in ("launch_unconfirmed", "source_close_failed", "source_dirty", "--keep-source"):
+        assert refusal in body
     assert "/herdr::toClaude" in body and "Pi's built-in `/handoff`" in body
 
 

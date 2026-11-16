@@ -93,10 +93,8 @@ Rolling back the migration drops queued deletes (their bytes stay orphaned, none
 
 Digest locks (purge, merge, publish) are always taken in sorted digest order, so concurrent operations over
 overlapping digests queue instead of deadlocking. The reviews list of an artifact needs the same read permission as
-its versions (otherwise the plain 404).
-
-Known limitation: with a store but no in-memory ACL (embedded/test setups only; the production CLI always builds an
-`ArtifactAcl`) the sibling routes `artifact-reviews/{id}`, `artifact-jobs` and publications lack a principal check.
+its versions (otherwise the plain 404). The artifact download/render/live routes, job, review and publication reads apply the
+same registry check when there is a store but no in-memory ACL; with an ACL the ACL decides, unchanged.
 
 Parked (not done): route names `tombstoned` and `delete-access` shadow artifacts with those literal ids; the tombstone
 listing is capped at 200 and has no pagination; bulk purges run synchronously and `_key_shared` scans have no GIN index

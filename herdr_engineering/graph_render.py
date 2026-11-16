@@ -14,7 +14,7 @@ from .md_render import visible_width
 MIN_WIDTH = 30
 MAX_LABEL_LINES = 3
 _ARROW = 2                      # columns between boxes in a row: the shaft and the head
-_ROW_WRAPS = (18, 12, 8)        # label wrap widths tried, widest first, before falling back to a column
+_ROW_WRAPS = (40, 30, 24, 18, 12, 8)   # label wrap widths the router tries, widest first
 _UNI = dict(tl="┌", tr="┐", bl="└", br="┘", h="─", v="│", right="▶", down="▼", up="▲", mark="◆", dot="·")
 _ASCII = dict(tl="+", tr="+", bl="+", br="+", h="-", v="|", right=">", down="v", up="^", mark="*", dot="-")
 _STYLES = (("[┌┐└┘─│]+", "38;5;244"), ("[▶▼]", "38;5;75"), ("[▲◆]", "1;38;5;221"))
@@ -177,15 +177,12 @@ def render_graph(graph: dict, width: int, *, unicode: bool = True, color: bool =
             out += [f"{i}. " + wrapped[0]] + ["   " + line for line in wrapped[1:]]
         out += [fix(line) for line in _drift_text(graph, g, width)]
     else:
-        row = None
-        for wrap in _ROW_WRAPS:
-            boxes = [_box(seg_lines(seg, wrap), g) for seg in segments]
-            if sum(visible_width(b[0]) for b in boxes) + _ARROW * (len(boxes) - 1) <= width:
-                row = boxes
-                break
-        out = _row(row, segments, drift_at, g) if row else _column(segments, drift_at, g, width, seg_lines, graph, fix)
-        if row:
-            out += [fix(line) for line in _drift_text(graph, g, width)]
+        grid = _route(segments, width, drift_at, g, seg_lines)
+        column = _column(segments, drift_at, g, width, seg_lines, graph, fix)
+        if grid and len(grid) <= len(column):
+            out = grid + [fix(line) for line in _drift_text(graph, g, width)]
+        else:
+            out = column
     if not graph.get("drift"):
         out.append("No drift found.")
     out += [fix(line) for line in _total_text(graph, g, width)]
@@ -201,22 +198,103 @@ class _Text:
         return text if self.unicode else text.encode("ascii", "replace").decode()
 
 
-def _row(boxes, segments, drift_at, g):
-    height = max(len(b) for b in boxes)
-    rows = []
-    for r in range(height):
+def _balanced(n: int, rows: int) -> list[int]:
+    """``n`` items spread over ``rows`` rows as evenly as possible, the longer rows first."""
+    base, extra = divmod(n, rows)
+    return [base + 1] * extra + [base] * (rows - extra)
+
+
+def _greedy(widths: list[int], width: int) -> list[int] | None:
+    """Row sizes filling each row left to right while it fits; ``None`` if one box alone is too wide."""
+    sizes, used, count = [], 0, 0
+    for w in widths:
+        if w > width:
+            return None
+        need = w + (_ARROW if count else 0)
+        if count and used + need > width:
+            sizes.append(count)
+            used, count, need = 0, 0, w
+        used += need
+        count += 1
+    return sizes + [count]
+
+
+def _fits(widths: list[int], width: int) -> bool:
+    return sum(widths) + _ARROW * (len(widths) - 1) <= width
+
+
+def _route(segments, width, drift_at, g, seg_lines):
+    """The shortest arrangement of the boxes in rows that fits ``width``; wider labels win a tie. ``None`` if none fits."""
+    best = None
+    for wrap in _ROW_WRAPS:
+        boxes = [_box(seg_lines(seg, wrap), g) for seg in segments]
+        widths = [visible_width(b[0]) for b in boxes]
+        splits = [_balanced(len(boxes), rows) for rows in range(1, len(boxes) + 1)]
+        splits.append(_greedy(widths, width) or [])
+        for sizes in splits:
+            at, groups = 0, []
+            for size in sizes:
+                groups.append((boxes[at:at + size], segments[at:at + size]))
+                at += size
+            if not groups or not all(_fits([visible_width(b[0]) for b in bs], width) for bs, _ in groups):
+                continue
+            lines = _grid(groups, segments[0], drift_at, g)
+            if best is None or len(lines) < len(best):
+                best = lines
+    return best
+
+
+def _row(boxes, g):
+    """The boxes side by side, joined by arrows; also each box's left edge."""
+    rows, lefts, x = [], [], 0
+    for box in boxes:
+        lefts.append(x)
+        x += visible_width(box[0]) + _ARROW
+    for r in range(max(len(b) for b in boxes)):
         parts = []
         for i, box in enumerate(boxes):
-            w = visible_width(box[0])
-            parts.append(box[r] if r < len(box) else " " * w)
+            parts.append(box[r] if r < len(box) else " " * visible_width(box[0]))
             if i < len(boxes) - 1:
                 parts.append(g["h"] + g["right"] if r == 1 else "  ")
         rows.append("".join(parts))
-    for i, seg in enumerate(segments):
-        if seg["from_prompt"] == drift_at and i:
-            x = sum(visible_width(b[0]) for b in boxes[:i]) + _ARROW * i
-            rows.append(" " * (x + visible_width(boxes[i][0]) // 2) + g["up"])
-    return rows
+    return rows, lefts
+
+
+def _cells(width: int, marks: dict[int, str]) -> str:
+    line = [" "] * (max(marks) + 1 if marks else 0)
+    for col, ch in marks.items():
+        line[col] = ch
+    return "".join(line).ljust(width).rstrip() if width else "".join(line)
+
+
+def _grid(groups, first_segment, drift_at, g):
+    """Rows of boxes; the end of each row connects down to the start of the next with an elbow."""
+    out = []
+    for r, (boxes, segs) in enumerate(groups):
+        lines, lefts = _row(boxes, g)
+        out += lines
+        centre = [left + visible_width(box[0]) // 2 for left, box in zip(lefts, boxes)]
+        marks = {}
+        last = len(boxes) - 1
+        conn = centre[last]
+        for i, seg in enumerate(segs):
+            if seg["from_prompt"] == drift_at and seg is not first_segment:
+                marks[centre[i]] = g["up"]
+                if i == last:
+                    conn = lefts[i] + 2
+        if r == len(groups) - 1:
+            if marks:
+                out.append(_cells(0, marks))
+            continue
+        start = visible_width(groups[r + 1][0][0][0]) // 2        # the next row's first box, centred
+        if start == conn:
+            elbow = _cells(0, {conn: g["v"]})
+        elif start < conn:
+            elbow = " " * start + g["tl"] + g["h"] * (conn - start - 1) + g["br"]
+        else:
+            elbow = " " * conn + g["bl"] + g["h"] * (start - conn - 1) + g["tr"]
+        out += [_cells(0, {**marks, conn: g["v"]}), elbow, _cells(0, {start: g["down"]})]
+    return out
 
 
 def _column(segments, drift_at, g, width, seg_lines, graph, fix):

@@ -33,7 +33,8 @@ def activation(home: Path, harness: str) -> tuple[Path, str, str]:
         path = next((path.parent / name for name in candidates
                      if (path.parent / name).is_file()), path)
     original = path.read_text(encoding="utf-8") if path.exists() else ""
-    skill = home / TARGETS[harness] / "SKILL.md"
+    # Home-relative (~/...) so the block is byte-identical on every host and survives config sync.
+    skill = Path("~") / TARGETS[harness] / "SKILL.md"
     launcher = skill.parent / "scripts/open-client.py"
     block = f"""{START}
 ## HerdR generated-file viewing
