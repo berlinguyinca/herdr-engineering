@@ -255,3 +255,163 @@ def test_gateway_routes_and_plain_pipe_overwrite_forwarded_for_end_to_end(keepal
             router.unbind(port)
     time.sleep(0.2)
     assert _xff_in(received) == ["127.0.0.1", "127.0.0.1"]
+
+
+# ---- slow / split request lines (security) and inactivity timeouts (regression) -----------------
+FORGED = b"POST /api/auth/open HTTP/1.1\r\nHost: h\r\nOrigin: rakazo://\r\nX-Forwarded-For: 100.104.39.6\r\n\r\n"
+
+
+def _serve_proxy_pair(up_port: int, **kw):
+    lsn = socket.socket()
+    lsn.bind(("127.0.0.1", 0))
+    lsn.listen(2)
+
+    def serve_once() -> None:
+        cl = lsn.accept()[0]
+        proxy_pair(cl, socket.create_connection(("127.0.0.1", up_port), timeout=0.5),
+                   forwarded_for="100.64.0.7", **kw)
+
+    threading.Thread(target=serve_once, daemon=True).start()
+    return lsn
+
+
+def _serve_route_and_pipe(up_port: int, **kw):
+    lsn = socket.socket()
+    lsn.bind(("127.0.0.1", 0))
+    lsn.listen(2)
+    threading.Thread(target=lambda: route_and_pipe(lsn.accept()[0], [Route("/api", "127.0.0.1", up_port)],
+                                                   "127.0.0.1", up_port, forwarded_for="100.64.0.7", **kw),
+                     daemon=True).start()
+    return lsn
+
+
+@pytest.mark.parametrize("serve", [_serve_proxy_pair, _serve_route_and_pipe])
+def test_a_stalled_client_then_forged_forwarded_for_never_reaches_the_upstream(keepalive_upstream, serve):
+    up_port, received, _ = keepalive_upstream
+    lsn = serve(up_port, **({"head_timeout": 0.4} if serve is _serve_proxy_pair else {"peek_timeout": 0.4}))
+    with socket.create_connection(lsn.getsockname(), timeout=5) as c:
+        time.sleep(0.9)                      # silent past the head deadline
+        try:
+            c.sendall(FORGED)
+        except OSError:
+            pass
+        _drain(c)
+    lsn.close()
+    time.sleep(0.2)
+    assert all(b"100.104.39.6" not in bytes(r) for r in received)
+
+
+@pytest.mark.parametrize("serve", [_serve_proxy_pair, _serve_route_and_pipe])
+def test_a_split_method_then_forged_forwarded_for_only_reaches_the_upstream_rewritten(keepalive_upstream, serve):
+    up_port, received, _ = keepalive_upstream
+    lsn = serve(up_port, **({"head_timeout": 0.4} if serve is _serve_proxy_pair else {"peek_timeout": 0.4}))
+    with socket.create_connection(lsn.getsockname(), timeout=5) as c:
+        c.sendall(b"PO")
+        time.sleep(0.9)
+        try:
+            c.sendall(FORGED[2:])
+        except OSError:
+            pass
+        _drain(c)
+    lsn.close()
+    time.sleep(0.2)
+    assert all(b"100.104.39.6" not in bytes(r) for r in received)
+
+
+def test_a_head_split_within_the_deadline_is_still_rewritten(keepalive_upstream):
+    up_port, received, _ = keepalive_upstream
+    lsn = _serve_proxy_pair(up_port, head_timeout=3.0)
+    with socket.create_connection(lsn.getsockname(), timeout=5) as c:
+        c.sendall(b"GE")
+        time.sleep(0.3)
+        c.sendall(b"T / HTTP/1.1\r\nHost: h\r\nX-Forwarded-For: 9.9.9.9\r\n\r\n")
+        assert b"200" in _drain(c)
+    lsn.close()
+    assert _xff_in(received) == ["100.64.0.7"]
+
+
+def test_a_tls_client_hello_is_still_piped_raw(keepalive_upstream):
+    up_port, received, _ = keepalive_upstream
+    lsn = _serve_proxy_pair(up_port, head_timeout=1.0)
+    with socket.create_connection(lsn.getsockname(), timeout=5) as c:
+        c.sendall(b"\x16\x03\x01\x00\x05hello")
+        c.shutdown(socket.SHUT_WR)
+        _drain(c)
+    lsn.close()
+    assert any(bytes(r).startswith(b"\x16\x03\x01") for r in received)
+
+
+def _slow_upstream(delay: float, chunks: list[tuple[float, bytes]]):
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                d = conn.recv(65536)
+                if not d:
+                    break
+                buf += d
+            time.sleep(delay)
+            try:
+                for pause, data in chunks:
+                    time.sleep(pause)
+                    conn.sendall(data)
+            except OSError:
+                pass
+            conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv
+
+
+def test_rewriting_path_waits_longer_than_the_connect_timeout_for_the_response_head():
+    from herdr_engineering.devfabric import rewriting_pipe
+    srv = _slow_upstream(1.2, [(0, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")])
+    lsn = socket.socket()
+    lsn.bind(("127.0.0.1", 0))
+    lsn.listen(1)
+
+    def serve() -> None:
+        cl = lsn.accept()[0]
+        tg = socket.create_connection(srv.getsockname(), timeout=0.4)      # connect timeout < upstream delay
+        rewriting_pipe(cl, tg, 0, "", rewrite_head=False, forwarded_for="1.1.1.1", inactivity_timeout=5.0)
+        cl.close()
+        tg.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    with socket.create_connection(lsn.getsockname(), timeout=8) as c:
+        c.sendall(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        out = _drain(c, 5)
+    srv.close()
+    lsn.close()
+    assert out.endswith(b"ok") and b"200" in out
+
+
+def test_rewriting_path_keeps_a_stream_that_goes_quiet_mid_body():
+    from herdr_engineering.devfabric import rewriting_pipe
+    srv = _slow_upstream(0, [(0, b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\npart1-"), (1.2, b"part2")])
+    lsn = socket.socket()
+    lsn.bind(("127.0.0.1", 0))
+    lsn.listen(1)
+
+    def serve() -> None:
+        cl = lsn.accept()[0]
+        tg = socket.create_connection(srv.getsockname(), timeout=0.4)
+        rewriting_pipe(cl, tg, 0, "", rewrite_head=False, forwarded_for="1.1.1.1", inactivity_timeout=5.0)
+        cl.close()
+        tg.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    with socket.create_connection(lsn.getsockname(), timeout=8) as c:
+        c.sendall(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        out = _drain(c, 5)
+    srv.close()
+    lsn.close()
+    assert out.endswith(b"part1-part2")

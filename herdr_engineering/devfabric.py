@@ -11,6 +11,7 @@ import json
 import os
 import socket
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -636,7 +637,8 @@ class DevServiceForwarder:
 
 
 def proxy_pair(client: socket.socket, target: socket.socket,
-               inactivity_timeout: float = 30.0, forwarded_for: str | None = None) -> None:
+               inactivity_timeout: float = 30.0, forwarded_for: str | None = None,
+               head_timeout: float = 10.0) -> None:
     """Bidirectionally pump bytes between two sockets until either closes.
 
     Protocol-transparent: HTTP/HTTPS/WebSocket/SSE/HMR/generic TCP all flow
@@ -654,7 +656,7 @@ def proxy_pair(client: socket.socket, target: socket.socket,
     exactly this value (see :func:`rewriting_pipe`); anything else stays a transparent byte pipe.
     """
     if forwarded_for:
-        _pipe_with_forwarded_for(client, target, forwarded_for, inactivity_timeout)
+        _pipe_with_forwarded_for(client, target, forwarded_for, inactivity_timeout, head_timeout=head_timeout)
         return
 
     def _pump(src: socket.socket, dst: socket.socket) -> None:
@@ -696,23 +698,32 @@ def proxy_pair(client: socket.socket, target: socket.socket,
 
 def _pipe_with_forwarded_for(client: socket.socket, target: socket.socket, forwarded_for: str,
                              inactivity_timeout: float, buffered: bytes | None = None,
-                             path: str | None = None) -> None:
+                             path: str | None = None, head_timeout: float = 10.0) -> None:
     """Pipe with the client's X-Forwarded-For replaced by ``forwarded_for`` when the client opens with HTTP.
 
     ``buffered``/``path`` are an already-peeked first line (route_and_pipe); otherwise the client is peeked
-    here, unless the server speaks first (non-HTTP) or the client sends nothing (then it is a plain pipe)."""
-    if buffered is None:
-        import select
-        readable, _, _ = select.select([client, target], [], [], 5.0)
-        if client in readable:
-            path, buffered = _peek_request_path(client)
-        else:
-            buffered = b""
-    if path is None:
-        prefixed_pipe(client, target, client_prefix=buffered, inactivity_timeout=inactivity_timeout)
-        return
+    here. The decision to relay raw is made from the bytes seen, never from elapsed time: only a server that
+    speaks first or a first line that is definitely not HTTP (e.g. a TLS ClientHello) is piped raw; a client that
+    stays silent or whose request line is still incomplete at the deadline is closed."""
     try:
-        rewriting_pipe(client, target, 0, "", rewrite_head=False, forwarded_for=forwarded_for, prefix=buffered)
+        server_first = False
+        if buffered is None:
+            import select
+            deadline = time.monotonic() + head_timeout
+            readable, _, _ = select.select([client, target], [], [], head_timeout)
+            if client in readable:
+                path, buffered = _peek_request_path(client, max(0.0, deadline - time.monotonic()))
+            elif target in readable:
+                buffered, server_first = b"", True      # the server speaks first: not an HTTP client
+            else:
+                return
+        if path is None:
+            if not server_first and not _definitely_not_http(buffered):
+                return                  # silent, EOF, or an undecided/malformed HTTP start: fail closed
+            prefixed_pipe(client, target, client_prefix=buffered, inactivity_timeout=inactivity_timeout)
+            return
+        rewriting_pipe(client, target, 0, "", rewrite_head=False, forwarded_for=forwarded_for, prefix=buffered,
+                       inactivity_timeout=inactivity_timeout)
     finally:
         for s in (client, target):
             try:
@@ -766,18 +777,39 @@ _HTTP_METHODS = frozenset(
     {"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE", "CONNECT"})
 
 
+def _definitely_not_http(buf: bytes) -> bool:
+    """True when ``buf`` can no longer become an HTTP request line (decided from the bytes alone)."""
+    if not buf:
+        return False
+    line = buf.split(b"\r\n", 1)[0]
+    token = line.split(b" ", 1)[0].decode("latin-1", "replace").upper()
+    if b" " in line:
+        return token not in _HTTP_METHODS
+    if not any(m.startswith(token) for m in _HTTP_METHODS):
+        return True
+    return False        # a method (or a prefix of one) without a target yet: HTTP, or malformed HTTP
+
+
 def _peek_request_path(client: socket.socket, timeout: float = 5.0,
                        max_bytes: int = 8192) -> tuple[str | None, bytes]:
     """Read the first HTTP request line.
 
     Returns ``(path, buffered)``: ``buffered`` is every byte read so far (to be
-    replayed to the target) and ``path`` is the request target — or ``None`` when
-    the bytes do not look like an HTTP request (e.g. a raw TLS ClientHello).
+    replayed to the target) and ``path`` is the request target, or ``None`` when
+    the line is not (yet) a complete HTTP request line. ``timeout`` is a TOTAL
+    deadline, so a client dribbling bytes cannot stretch it; reading stops early
+    once the bytes cannot be HTTP any more (e.g. a raw TLS ClientHello). Callers
+    that must not relay unrewritten traffic tell the cases apart with
+    :func:`_definitely_not_http`.
     """
-    client.settimeout(timeout)
     buf = b""
+    deadline = time.monotonic() + timeout
     try:
-        while b"\r\n" not in buf and len(buf) < max_bytes:
+        while b"\r\n" not in buf and len(buf) < max_bytes and not _definitely_not_http(buf):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            client.settimeout(remaining)
             chunk = client.recv(4096)
             if not chunk:
                 break
@@ -897,13 +929,17 @@ def _read_head(sock: socket.socket, initial: bytes = b"") -> tuple[bytes, bytes]
 
 def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, external: str,
                    *, tls: bool = False, rewrite_head: bool = True, forwarded_for: str | None = None,
-                   prefix: bytes = b"") -> None:
+                   prefix: bytes = b"", inactivity_timeout: float = 30.0) -> None:
     """Byte-pipe that filters the headers of the origin's responses.
 
     Each exchange is forced to ``Connection: close`` so every response passes the
     head filter. Upgrade requests (websockets) are passed through untouched."""
     from .urlrewrite import force_close, inject_request_headers, is_upgrade, rewrite_response_head
-    req_head, rest = _read_head(client, prefix)
+    try:
+        client.settimeout(inactivity_timeout)       # bounds each head recv; re-armed for the whole exchange
+        req_head, rest = _read_head(client, prefix)
+    except OSError:
+        return
     complete = req_head.endswith(b"\r\n\r\n")
     if forwarded_for and not complete:
         return      # fail closed: a head we cannot rewrite is never relayed with a client-chosen X-Forwarded-For
@@ -922,6 +958,8 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
     if not upgrade and req_head.endswith(b"\r\n\r\n"):
         req_head = force_close(req_head[:-4]) + b"\r\n\r\n"
     try:
+        # the target keeps only the short connect timeout from create_connection otherwise: re-arm both sockets
+        target.settimeout(inactivity_timeout)
         target.sendall(req_head + rest)
     except OSError:
         return
@@ -950,7 +988,7 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
         if upgrade and _status_code(resp_head) == 101:
             # only an accepted upgrade turns the connection into a raw pipe
             client.sendall(resp_head + body)
-            prefixed_pipe(client, target)
+            prefixed_pipe(client, target, inactivity_timeout=inactivity_timeout)
             return
         # anything else: relay this one response and close (no keep-alive reuse, so a
         # second request on the connection can never skip the head rewrite)
@@ -997,6 +1035,8 @@ def route_and_pipe(client: socket.socket, routes, fallback_host: str,
     """
     try:
         path, buffered = _peek_request_path(client, timeout=peek_timeout)
+        if forwarded_for and path is None and not _definitely_not_http(buffered):
+            return      # silent/undecided client: never relayed raw with a client-chosen X-Forwarded-For
         host, port = match_target(path, routes, fallback_host, fallback_port)
         try:
             target = socket.create_connection((host, port), timeout=5)
