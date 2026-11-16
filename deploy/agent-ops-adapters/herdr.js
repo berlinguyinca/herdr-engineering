@@ -2,8 +2,13 @@
 // Pure mapping; emit.js sends the result through the same ingest path as its other envelopes.
 import { buildEnvelope, uint } from "./core.js";
 
+// Herdr sends {"event": ..., "data": {pane_id, agent, agent_status, ...}}; older/flat payloads put the fields at the top level.
 function parse(raw) {
-  try { const v = JSON.parse(raw); return v && typeof v === "object" ? v : {}; } catch { return {}; }
+  try {
+    const v = JSON.parse(raw);
+    if (!v || typeof v !== "object") return {};
+    return v.data && typeof v.data === "object" ? { ...v, ...v.data } : v;
+  } catch { return {}; }
 }
 
 // `pane.report_metadata` tokens (display-only): "model" is a name, "ctx" a percent like "42" or "42%".
