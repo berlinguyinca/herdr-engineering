@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Rakazo default assistant: review fixes
+- Fabric gateway: only a `101` reply turns an Upgrade request into a raw pipe; any other reply is relayed once and the connection closed, so a pipelined second request can no longer skip the `X-Forwarded-For` overwrite. `route_and_pipe` and `proxy_pair` now overwrite a client `X-Forwarded-For` for HTTP traffic too (non-HTTP stays a transparent pipe). Tests: `tests/test_fabric_forwarded_for.py`.
+- Bots: every bot-meta read-modify-write (archive, restore, set-computer, mark-unread, sections, default flag) runs under one reentrant lock, so clearing the default can no longer drop `archivedAt`. Archiving clears `isDefault`; `bots/update` with `isDefault: true` on an archived bot returns 409. Tests: `tests/control_plane/test_rakazo_bots.py`.
+- Bridge config: `open_owner_allowed_sources` is validated even when the bridge is disabled, and warns when set with `open_owner` off or for entries outside `100.64.0.0/10` / `fd7a:115c:a1e0::/48`.
+- Docs: a gateway on another host must be in `trusted_proxies` for `open_owner` to see the real client (README, Security model).
+
 ### Inspector snapshot boot: used on the complete-replay fallback, strictly validated
 
 - With projection checkpoints on (the default), a missing or rejected checkpoint fell back to a complete replay that ignored `inspector_snapshots` and re-ran every stored inspector row through redaction. That fallback now hands the stored snapshot to the repo, which verifies it by count and ordering and replays everything on any doubt.

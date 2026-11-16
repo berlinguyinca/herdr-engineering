@@ -307,6 +307,13 @@ per-user keys:
   an HTTPS URL), add **rate-limiting** (no brute-force protection today), and
   treat **redaction as best-effort** regex.
 
+**Rakazo bridge `open_owner` behind the fabric gateway.** The gateway sets `X-Forwarded-For` to the real peer
+(replacing any client copy, on every path, including Upgrade requests), but the bridge believes that header only from
+loopback or an address in `control_plane.rakazo_bridge.trusted_proxies`. A gateway running on a different host than the
+control plane must therefore be listed in `trusted_proxies`; otherwise the bridge sees the gateway's address, and
+`open_owner` / `open_owner_allowed_sources` judge that instead of the real client. Request heads over 64 KiB are dropped
+by the gateway rather than relayed.
+
 ### Control plane (spec 0190)
 
 The control plane is a structured `/api/v1` JSON + SSE server with a web UI
