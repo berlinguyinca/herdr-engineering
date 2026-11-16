@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: CI report relay failures are no longer silent
+
+- `ci_report_relay` printed only `N published, M failed`. It now writes one stderr line per failing bundle (`CI report relay: failed <bundle>: <reason>`), per unreadable source file (errno name), and for whole-run failures, plus the reader exit status on source errors. Reasons are fixed strings or errno names: no URLs, keys or bundle contents. Delivery and fail-closed identity checks are unchanged.
+
 ### Fix: phone Assistants tab lists only online agent bots
 
 - `bots/list` (and the bootstrap payload built from it) now returns only collab agents that are online; stale tokenless-join test agents no longer flood the tab. Nothing is revoked or deleted: an offline agent still resolves through `bots/get`, `threads/get` and `threads/send` by id. A separate list of offline agents is not exposed (the archived list means disabled assistants and `bots/restore` cannot restore an agent).

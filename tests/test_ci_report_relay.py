@@ -298,3 +298,63 @@ def test_reader_reports_unreadable_artifact_as_failure(tmp_path):
         assert result['read_failures'] == 1
     finally:
         artifact.chmod(0o600)
+
+
+def _source_with_one_bundle(tmp_path):
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / NAME).write_text(json.dumps(bundle()))
+    return source
+
+
+def test_each_failed_item_is_logged_with_its_reason_and_never_the_key(tmp_path, capsys):
+    source = _source_with_one_bundle(tmp_path)
+    with control_plane(revision='b' * 40) as (url, received):
+        relay = Relay(url, tmp_path / 'state', key='super-secret-key')
+        assert relay.process_source(str(source)) == (0, 1)
+    err = capsys.readouterr().err
+    assert NAME in err
+    assert 'does not match the observed provider run identity' in err
+    assert 'super-secret-key' not in err
+    assert received == []
+
+
+def test_control_plane_refusal_logs_http_status(tmp_path, capsys):
+    source = _source_with_one_bundle(tmp_path)
+    with control_plane(acknowledge=False) as (url, received):
+        relay = Relay(url, tmp_path / 'state', allow_open=True)
+        assert relay.process_source(str(source)) == (0, 1)
+    assert 'HTTP 503' in capsys.readouterr().err
+
+
+def test_unreadable_source_file_is_logged_by_name_and_errno(tmp_path, capsys):
+    import os
+
+    if os.getuid() == 0:
+        pytest.skip('File permission checks require a non-root test user')
+    source = _source_with_one_bundle(tmp_path)
+    (source / NAME).chmod(0)
+    try:
+        with control_plane() as (url, received):
+            relay = Relay(url, tmp_path / 'state', allow_open=True)
+            assert relay.process_source(str(source)) == (0, 1)
+    finally:
+        (source / NAME).chmod(0o600)
+    err = capsys.readouterr().err
+    assert NAME in err
+    assert 'EACCES' in err
+
+
+def test_main_logs_the_reason_when_the_whole_run_fails(tmp_path, capsys):
+    from herdr_engineering.ci_report_relay import main
+
+    real = tmp_path / 'real'
+    real.mkdir()
+    link = tmp_path / 'link'
+    link.symlink_to(real)
+    code = main(['--source-host', 'localhost', '--source-dir', str(tmp_path), '--control-plane',
+                 'http://127.0.0.1:1', '--state-dir', str(link), '--allow-open', '--once'])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert 'CI report relay: 0 published, 1 failed' in captured.out
+    assert 'State directory must be a private owned directory' in captured.err

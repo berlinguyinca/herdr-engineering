@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import hashlib
 import http.client
 import json
@@ -43,7 +44,7 @@ root, known, batch = config['root'], config['known'], config['batch']
 pattern = re.compile(r'[1-9][0-9]{0,15}-[0-9a-f]{40}-hive-slurm\.json\Z')
 root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 try:
-    entries, failures = [], 0
+    entries, failures, errors = [], 0, []
     with os.scandir(root_fd) as iterator:
         for index, entry in enumerate(iterator):
             if index >= 20000:
@@ -85,7 +86,9 @@ try:
         except OSError as exc:
             if exc.errno not in (errno.ENOENT, errno.ELOOP):
                 failures += 1
-    print(json.dumps({'files': results, 'read_failures': failures, 'cursor': cursor}, separators=(',', ':')))
+                errors.append([name, errno.errorcode.get(exc.errno, 'OSError')])
+    print(json.dumps({'files': results, 'read_failures': failures, 'read_errors': errors[:10],
+                      'cursor': cursor}, separators=(',', ':')))
 finally:
     os.close(root_fd)
 '''
@@ -169,11 +172,12 @@ def _run_reader(command, payload):
                         output.extend(chunk)
                         if len(output) > MAX_REMOTE_BYTES:
                             raise ValueError('Source response exceeds the batch limit')
-        if process.wait(timeout=max(0.1, deadline - time.monotonic())):
-            raise ValueError('Cannot read the configured source')
+        status = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        if status:
+            raise ValueError(f'Cannot read the configured source (reader exited with status {status})')
         return bytes(output)
-    except (OSError, subprocess.SubprocessError):
-        raise ValueError('Cannot read the configured source') from None
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f'Cannot read the configured source ({type(exc).__name__})') from None
     finally:
         if process.poll() is None:
             process.kill()
@@ -222,6 +226,25 @@ def read_source(source_dir, checkpoints, *, batch_size=MAX_BATCH, host=None, cur
         return result if with_status else files
     except (KeyError, TypeError, ValueError):
         raise ValueError('Source returned an invalid bounded bundle batch') from None
+
+
+def describe_error(exc):
+    """Failure reason for logs: our own bounded ValueError messages, or the OSError type and errno."""
+    if isinstance(exc, OSError):
+        return f'{type(exc).__name__} ({errno.errorcode.get(exc.errno, exc.errno)})'
+    return str(exc)
+
+
+def log_failure(subject, reason):
+    # Only the bundle basename (fixed pattern) and a sanitized reason: never URLs, keys or contents.
+    print(f'CI report relay: failed {subject}: {reason}', file=sys.stderr, flush=True)
+
+
+def _read_errors(batch):
+    rows = batch.get('read_errors', [])
+    return [(name, code) for name, code in rows
+            if isinstance(name, str) and BASENAME.fullmatch(name) and isinstance(code, str)
+            and re.fullmatch('[A-Za-z0-9_]{1,32}', code)]
 
 
 def _write_private(path, raw):
@@ -343,11 +366,14 @@ class Relay:
         batch = read_source(source_dir, self.checkpoints, host=host,
                             cursor=self._scan_cursor(), with_status=True)
         published, failed = 0, batch['read_failures']
+        for name, code in _read_errors(batch):
+            log_failure(name, f'source file unreadable ({code})')
         for row in batch['files']:
             try:
                 published += self.consume(row['name'], row['content'], mtime_ns=row['mtime_ns'])
-            except (ValueError, OSError):
+            except (ValueError, OSError) as exc:
                 failed += 1
+                log_failure(row['name'], describe_error(exc))
         # This cursor records scan position only, never successful delivery.
         _write_private(self.state_dir / 'scan-cursor.json', json.dumps(
             {'version': 1, 'after': batch['cursor']}).encode())
@@ -396,9 +422,11 @@ def main(argv=None):
             relay = Relay(args.control_plane, args.state_dir,
                           key=os.environ.get('HERDR_ENGINEERING_API_KEY', ''), allow_open=args.allow_open)
             published, failed = relay.process_source(args.source_dir, host=args.source_host)
-        except (ValueError, OSError):
+        except (ValueError, OSError) as exc:
             failed += 1
-        # No filenames, URLs, credentials, source contents or server responses.
+            log_failure('run', describe_error(exc))
+        # The counts line stays free of filenames, URLs and credentials; per-item
+        # reasons go to stderr above so a non-zero count is never unexplained.
         print(f'CI report relay: {published} published, {failed} failed', flush=True)
         if args.once:
             return 1 if failed else 0
