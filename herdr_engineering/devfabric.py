@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -718,7 +719,7 @@ def _pipe_with_forwarded_for(client: socket.socket, target: socket.socket, forwa
             else:
                 return
         if path is None:
-            if not server_first and not _definitely_not_http(buffered):
+            if not server_first and not _is_raw_protocol(buffered):
                 return                  # silent, EOF, or an undecided/malformed HTTP start: fail closed
             prefixed_pipe(client, target, client_prefix=buffered, inactivity_timeout=inactivity_timeout)
             return
@@ -777,17 +778,32 @@ _HTTP_METHODS = frozenset(
     {"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE", "CONNECT"})
 
 
-def _definitely_not_http(buf: bytes) -> bool:
-    """True when ``buf`` can no longer become an HTTP request line (decided from the bytes alone)."""
+_RAW_SIGNATURES = (b"\x16\x03", b"SSH-")      # TLS ClientHello record, SSH banner: positively not HTTP
+
+
+def _head_class(buf: bytes) -> str:
+    """Classify the first bytes: ``raw`` (positive non-HTTP signature), ``http`` (strict ``METHOD `` start),
+    ``partial`` (could still become either) or ``reject`` (anything else: stray leading whitespace/CRLF/NUL,
+    unknown method, ...). Only ``raw`` may be relayed untouched when X-Forwarded-For is being rewritten; a
+    lenient backend might parse any ``reject`` bytes as HTTP, so they are never piped raw."""
     if not buf:
-        return False
-    line = buf.split(b"\r\n", 1)[0]
-    token = line.split(b" ", 1)[0].decode("latin-1", "replace").upper()
-    if b" " in line:
-        return token not in _HTTP_METHODS
-    if not any(m.startswith(token) for m in _HTTP_METHODS):
-        return True
-    return False        # a method (or a prefix of one) without a target yet: HTTP, or malformed HTTP
+        return "partial"
+    for sig in _RAW_SIGNATURES:
+        if buf.startswith(sig):
+            return "raw"
+    if any(sig.startswith(buf) for sig in _RAW_SIGNATURES):
+        return "partial"
+    m = re.match(rb"([A-Za-z]+)( |$)", buf)
+    if not m:
+        return "reject"
+    token = m.group(1).decode("ascii").upper()
+    if m.group(2):
+        return "http" if token in _HTTP_METHODS else "reject"
+    return "partial" if any(x.startswith(token) for x in _HTTP_METHODS) else "reject"
+
+
+def _is_raw_protocol(buf: bytes) -> bool:
+    return _head_class(buf) == "raw"
 
 
 def _peek_request_path(client: socket.socket, timeout: float = 5.0,
@@ -800,12 +816,13 @@ def _peek_request_path(client: socket.socket, timeout: float = 5.0,
     deadline, so a client dribbling bytes cannot stretch it; reading stops early
     once the bytes cannot be HTTP any more (e.g. a raw TLS ClientHello). Callers
     that must not relay unrewritten traffic tell the cases apart with
-    :func:`_definitely_not_http`.
+    :func:`_is_raw_protocol`.
     """
     buf = b""
     deadline = time.monotonic() + timeout
     try:
-        while b"\r\n" not in buf and len(buf) < max_bytes and not _definitely_not_http(buf):
+        while len(buf) < max_bytes and (_head_class(buf) == "partial"
+                                        or (_head_class(buf) == "http" and b"\r\n" not in buf)):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -825,7 +842,7 @@ def _peek_request_path(client: socket.socket, timeout: float = 5.0,
         return None, buf
     line = buf.split(b"\r\n", 1)[0].decode("latin-1", "replace")
     parts = line.split()
-    if len(parts) >= 2 and parts[0].upper() in _HTTP_METHODS:
+    if _head_class(buf) == "http" and len(parts) >= 2 and parts[0].upper() in _HTTP_METHODS:
         return parts[1], buf
     return None, buf
 
@@ -1035,7 +1052,7 @@ def route_and_pipe(client: socket.socket, routes, fallback_host: str,
     """
     try:
         path, buffered = _peek_request_path(client, timeout=peek_timeout)
-        if forwarded_for and path is None and not _definitely_not_http(buffered):
+        if forwarded_for and path is None and not _is_raw_protocol(buffered):
             return      # silent/undecided client: never relayed raw with a client-chosen X-Forwarded-For
         host, port = match_target(path, routes, fallback_host, fallback_port)
         try:

@@ -233,11 +233,11 @@ def test_proxy_pair_replaces_a_client_forwarded_for_and_passes_non_http_untouche
 
     threading.Thread(target=serve_once, daemon=True).start()
     with socket.create_connection(lsn.getsockname(), timeout=5) as c:
-        c.sendall(b"\x00\x01binary\r\n\r\n")
+        c.sendall(b"\x16\x03binary\r\n\r\n")
         c.shutdown(socket.SHUT_WR)
         _drain(c)
     lsn.close()
-    assert any(bytes(r).startswith(b"\x00\x01binary") for r in received)
+    assert any(bytes(r).startswith(b"\x16\x03binary") for r in received)
 
 
 def test_gateway_routes_and_plain_pipe_overwrite_forwarded_for_end_to_end(keepalive_upstream):
@@ -415,3 +415,21 @@ def test_rewriting_path_keeps_a_stream_that_goes_quiet_mid_body():
     srv.close()
     lsn.close()
     assert out.endswith(b"part1-part2")
+
+
+LENIENT_FORGED = [b" " + FORGED, b"\t" + FORGED, b"\r\n" + FORGED, b"\r\n\r\n" + FORGED, b"\x00" + FORGED,
+                  b"\x01\x02" + FORGED, FORGED.replace(b"POST", b"post", 1), b"\x0b" + FORGED]
+
+
+@pytest.mark.parametrize("serve", [_serve_proxy_pair, _serve_route_and_pipe])
+@pytest.mark.parametrize("raw", LENIENT_FORGED)
+def test_oddly_prefixed_or_cased_request_lines_never_relay_a_forged_forwarded_for(keepalive_upstream, serve, raw):
+    up_port, received, _ = keepalive_upstream
+    lsn = serve(up_port)
+    with socket.create_connection(lsn.getsockname(), timeout=5) as c:
+        c.sendall(raw)
+        c.shutdown(socket.SHUT_WR)
+        _drain(c)
+    lsn.close()
+    time.sleep(0.2)
+    assert all(b"100.104.39.6" not in bytes(r) for r in received)
