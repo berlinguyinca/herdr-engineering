@@ -110,6 +110,7 @@ def test_paging_older_group_messages(world):
 
 def test_agent_bots_are_listed_and_a_message_to_one_goes_to_its_room(world):
     agent, info = world.agent("alice", name="atlas")
+    world.s.room_state(agent, world.room, 0, 0, 0)                           # online: only live agents are listed
     bots = ok(world.api, "bots/list", {}, world.alice_t)
     validate("bots/list", bots)
     [bot] = [b for b in bots if b["id"] == info["agent_id"]]
@@ -124,6 +125,20 @@ def test_agent_bots_are_listed_and_a_message_to_one_goes_to_its_room(world):
     # bob does not see alice's agent as a bot of his own
     assert info["agent_id"] not in {b["id"] for b in ok(world.api, "bots/list", {}, world.bob_t)}
     assert rpc(world.api, "bots/get", {"botId": info["agent_id"]}, world.bob_t)[0] == 404
+
+
+def test_assistants_list_only_online_agent_bots_but_an_offline_one_still_resolves_by_id(world):
+    live_agent, live = world.agent("alice", name="live")
+    _, stale = world.agent("alice", name="stale")
+    world.s.room_state(live_agent, world.room, 0, 0, 0)                      # the live agent polls its room: online
+    infos = {a["agent_id"]: a for a in world.s.list_my_agents(world.alice)["agents"]}
+    assert infos[live["agent_id"]]["online"] and not infos[stale["agent_id"]]["online"]
+    ids = {b["id"] for b in ok(world.api, "bots/list", {}, world.alice_t)}
+    assert live["agent_id"] in ids and stale["agent_id"] not in ids
+    validate("bots/list", ok(world.api, "bots/list", {}, world.alice_t))
+    # nothing was removed: the offline agent is still addressable by id
+    assert ok(world.api, "bots/get", {"botId": stale["agent_id"]}, world.alice_t)["name"] == "stale"
+    ok(world.api, "threads/send", {"botId": stale["agent_id"], "text": "ping", "clientNonce": "s1"}, world.alice_t)
 
 
 def test_an_agent_that_is_in_no_room_cannot_be_messaged(world):

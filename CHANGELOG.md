@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: phone Assistants tab lists only online agent bots
+
+- `bots/list` (and the bootstrap payload built from it) now returns only collab agents that are online; stale tokenless-join test agents no longer flood the tab. Nothing is revoked or deleted: an offline agent still resolves through `bots/get`, `threads/get` and `threads/send` by id. A separate list of offline agents is not exposed (the archived list means disabled assistants and `bots/restore` cannot restore an agent).
+
 ### Fix: recurring unit-gates flakes (pipelines 1428, 1444, 1446, 1453, 1454)
 
 - Throwaway test Postgres clusters skip disk syncs (`fsync=off`, `full_page_writes=off`; commits stay durable across an immediate stop) and stop through `tests/control_plane/pg_stop.stop_postgres`: a fast stop that waits up to 300 s (pg_ctl's default is 60 s and exits 1 on timeout, which failed the owning test at teardown and left `the database system is shutting down` for the module's later tests), then an immediate stop if the postmaster is still up (restart helpers pass `fallback=False`). A guard test requires every launcher to use both.
