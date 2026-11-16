@@ -349,6 +349,7 @@ class InspectorStore:
 
     def restore_checkpoint(self, state) -> None:
         state = _checkpoint_json(state)
+        _checkpoint_require(type(state) is dict)
         private_schema = state.pop("inspector_private_schema", 1)
         _checkpoint_require(type(private_schema) is int and private_schema in (1, 2))
         state = _checkpoint_header(state, "inspector", ("sessions", "global_prefs", "stats", "replay"))
