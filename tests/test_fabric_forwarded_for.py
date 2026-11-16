@@ -92,3 +92,102 @@ def test_an_incomplete_head_is_never_relayed_with_a_client_forwarded_for(upstrea
     before = len(heads)
     _through_gateway(up_port, b"GET / HTTP/1.1\r\nX-Forwarded-For: 100.64.1.1\r\n")      # no blank line: head never completes
     assert all(b"100.64.1.1" not in h for h in heads[before:])    # the upstream is at most connected to, never sent the head
+
+
+# ---- upgrade bypass, route_and_pipe and proxy_pair ---------------------------------------------
+import time
+
+from herdr_engineering.contracts import Route  # noqa: E402
+from herdr_engineering.devfabric import proxy_pair, route_and_pipe  # noqa: E402
+
+
+@pytest.fixture
+def keepalive_upstream():
+    """Answers each connection's first head with 200 keep-alive (or 101 when asked) and records every byte received."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    received: list[bytearray] = []
+    mode = {"reply": b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"}
+
+    def handle(conn: socket.socket) -> None:
+        data = bytearray()
+        received.append(data)
+        conn.settimeout(2)
+        answered = False
+        try:
+            while True:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if not answered and b"\r\n\r\n" in data:
+                    answered = True
+                    conn.sendall(mode["reply"])
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    yield srv.getsockname()[1], received, mode
+    srv.close()
+
+
+def _drain(c: socket.socket, seconds: float = 1.5) -> bytes:
+    out = b""
+    c.settimeout(seconds)
+    try:
+        while chunk := c.recv(65536):
+            out += chunk
+    except OSError:
+        pass
+    return out
+
+
+def test_non_101_upgrade_reply_never_lets_a_second_request_bypass_the_header_rewrite(keepalive_upstream):
+    up_port, received, _ = keepalive_upstream
+    router = GatewayRouter(["127.0.0.1"])
+    port = _free_port()
+    assert router.bind(port, "127.0.0.1", up_port, None, "gw.example")
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as c:
+            c.sendall(b"GET /ws HTTP/1.1\r\nHost: gw.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+            first = c.recv(65536)
+            assert b"200" in first
+            time.sleep(0.3)
+            try:
+                c.sendall(b"GET /api/auth/open HTTP/1.1\r\nHost: gw.example\r\nX-Forwarded-For: 100.104.39.99\r\n\r\n")
+            except OSError:
+                pass                    # the gateway already closed the connection: also correct
+            _drain(c)
+    finally:
+        router.unbind(port)
+    time.sleep(0.3)
+    assert all(b"100.104.39.99" not in bytes(r) for r in received)
+    assert all(bytes(r).count(b"HTTP/1.1") == 1 for r in received)
+
+
+def test_a_101_upgrade_still_becomes_a_raw_pipe(keepalive_upstream):
+    up_port, received, mode = keepalive_upstream
+    mode["reply"] = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+    router = GatewayRouter(["127.0.0.1"])
+    port = _free_port()
+    assert router.bind(port, "127.0.0.1", up_port, None, "gw.example")
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as c:
+            c.sendall(b"GET /ws HTTP/1.1\r\nHost: gw.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+            assert b"101" in c.recv(65536)
+            c.sendall(b"frame-bytes")
+            time.sleep(0.5)
+    finally:
+        router.unbind(port)
+    assert any(b"frame-bytes" in bytes(r) for r in received)
