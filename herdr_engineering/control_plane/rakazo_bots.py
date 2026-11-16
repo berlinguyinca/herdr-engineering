@@ -48,7 +48,8 @@ class Bots:
         self.b = bridge
         self.Error = error_type
         self.prefs = bridge.prefs
-        self._default_lock = threading.Lock()      # clear-others + set must not interleave
+        # every bot-meta read-modify-write (and the clear-others + set pair) runs under this one reentrant lock
+        self._default_lock = threading.RLock()
 
     def procs(self) -> dict[str, Any]:
         return {"bots/update": self.update, "bots/archive": self.archive, "bots/remove": self.archive,
@@ -78,8 +79,9 @@ class Bots:
         return self.b._assistant(ctx, inp.get("botId"))
 
     def _put_meta(self, ctx, bot_id: str, changes: dict[str, Any]) -> None:
-        meta = {**self.meta(ctx, bot_id), **changes}
-        self.b.prefs_put(ctx.account.account_id, ctx.space, META_KIND, bot_id, meta)
+        with self._default_lock:
+            meta = {**self.meta(ctx, bot_id), **changes}
+            self.b.prefs_put(ctx.account.account_id, ctx.space, META_KIND, bot_id, meta)
 
     # bots ---------------------------------------------------------------------------------------------------
     def update(self, ctx, inp):
@@ -116,6 +118,8 @@ class Bots:
         if meta:
             with self._default_lock:
                 if meta.get("isDefault") is True:
+                    if not assistant.enabled or self.meta(ctx, assistant.assistant_id).get("archivedAt"):
+                        raise self.Error(409, "CONFLICT", "An archived bot cannot be the default.")
                     self._clear_default(ctx, except_id=assistant.assistant_id)
                 self._put_meta(ctx, assistant.assistant_id, meta)
         if patch:
@@ -160,16 +164,17 @@ class Bots:
         assistant = self._assistant(ctx, inp)
         if assistant.enabled:
             self.b.svc.archive_assistant(assistant.assistant_id, tenant_id=ctx.tenant, user_id=ctx.user)
-        self._put_meta(ctx, assistant.assistant_id, {"archivedAt": _now()})
+        self._put_meta(ctx, assistant.assistant_id, {"archivedAt": _now(), "isDefault": False})
         return {"ok": True}
 
     def restore(self, ctx, inp):
         assistant = self._assistant(ctx, inp)
         self.b.svc.update_assistant(assistant.assistant_id, tenant_id=ctx.tenant, user_id=ctx.user,
                                     patch={"enabled": True})
-        meta = self.meta(ctx, assistant.assistant_id)
-        meta.pop("archivedAt", None)
-        self.b.prefs_put(ctx.account.account_id, ctx.space, META_KIND, assistant.assistant_id, meta)
+        with self._default_lock:
+            meta = self.meta(ctx, assistant.assistant_id)
+            meta.pop("archivedAt", None)
+            self.b.prefs_put(ctx.account.account_id, ctx.space, META_KIND, assistant.assistant_id, meta)
         return {"ok": True}
 
     def list_archived(self, ctx, inp):
@@ -245,9 +250,10 @@ class Bots:
         if key not in self._sections(ctx):
             raise self.Error(404, "NOT_FOUND", "Not found.")
         released = 0
-        for bot_id, meta in self.prefs.items(ctx.account.account_id, ctx.space, META_KIND).items():
-            if meta.get("sectionId") == key:
-                self.b.prefs_put(ctx.account.account_id, ctx.space, META_KIND, bot_id, {**meta, "sectionId": None})
+        with self._default_lock:
+            for bot_id in [i for i, m in self.prefs.items(ctx.account.account_id, ctx.space, META_KIND).items()
+                           if m.get("sectionId") == key]:
+                self._put_meta(ctx, bot_id, {"sectionId": None})
                 released += 1
         self.prefs.delete(ctx.account.account_id, ctx.space, SECTION_KIND, key)
         return {"id": key, "releasedBots": released, "releasedGroups": 0}
