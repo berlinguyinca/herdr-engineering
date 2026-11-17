@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import shlex
 import shutil
+import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +24,6 @@ from .memory_install import (
     STALE,
     ClaudeHooksUnit,
     _atomic_write,
-    _default_command,
     _diff,
 )
 
@@ -70,7 +71,7 @@ class WorkflowInstaller:
     def __init__(self, home: Path | None = None, *, command: list[str] | None = None,
                  which: Callable[[str], str | None] | None = None):
         self.home = Path(home) if home else Path.home()
-        self.command = command or _default_command()
+        self.command = command or [sys.executable, "-m", "herdr_engineering.cli"]
         self.which = which or shutil.which
         self.unit = _WorkflowHooksUnit(
             "workflow-hooks", self.home / ".claude" / "settings.json",
@@ -93,7 +94,9 @@ class WorkflowInstaller:
         if path.is_file():
             dest = self.home / ".local" / "share" / "herdr-engineering" / "workflow" / "backups"
             dest.mkdir(parents=True, exist_ok=True, mode=0o700)
-            shutil.copy2(path, dest / f"{path.name}.bak")
+            pristine = dest / f"{path.name}.bak"
+            # The first backup is the untouched pre-install copy; later ones never overwrite it.
+            shutil.copy2(path, pristine if not pristine.exists() else dest / f"{path.name}.{time.time_ns()}.bak")
 
     def install(self, *, dry_run: bool = False) -> Result:
         if not self._claude_present():

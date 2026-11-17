@@ -14,10 +14,10 @@ scripts/install.sh                      # step 7c installs them; --no-workflow-h
 | `PreCompact` | `systemMessage` recommending `/handoff` before compaction | run `herdr-handoff` or open a pane |
 
 - Entries carry `herdr-workflow:managed` in the command, which is guarded with
-  `[ -x herdr-eng ] && ... || true` and always exits 0. They are separate from the
+  `[ -x <python> ] && <python> -m herdr_engineering.cli workflow hook <event> || true` and always exits 0. The command uses the interpreter that ran the installer (`sys.executable`), not `herdr-eng` from `PATH`, so an older install on `PATH` cannot make the hooks silently no-op. They are separate from the
   herdr-memory hooks (`herdr-memory:managed`); neither installer touches the other's or any foreign entries.
 - Install is idempotent (second run changes nothing), atomic, backed up to
-  `~/.local/share/herdr-engineering/workflow/backups/`, and skipped when Claude Code is absent.
+  `~/.local/share/herdr-engineering/workflow/backups/` (`settings.json.bak` is the pristine pre-install copy and is never overwritten; later backups get a timestamp suffix), and skipped when Claude Code is absent.
   Invalid JSON is reported and never rewritten. `doctor` exits 1 on drift or absence; `repair` re-applies.
 - The reminder text is a constant in `herdr_engineering/workflow_hooks.py`, not a copy of `AGENTS.md`.
 

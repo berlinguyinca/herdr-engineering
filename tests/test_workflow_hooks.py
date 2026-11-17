@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
+import sys
 
 import pytest
 
@@ -117,3 +119,42 @@ def test_cli_install_doctor_uninstall(home, capsys):
     assert main(["workflow", "uninstall", "--home", str(home)]) == 0
     assert not json.loads(settings(home).read_text()).get("hooks")
     assert main(["workflow", "doctor", "--home", str(home)]) == 1
+
+
+def test_default_command_uses_installing_interpreter(home):
+    cmd = wh.WorkflowInstaller(home).command
+    assert cmd == [sys.executable, "-m", "herdr_engineering.cli"]
+
+
+def test_pristine_backup_survives_install_repair_uninstall(home):
+    original = '{"theme": "dark"}\n'
+    settings(home).write_text(original)
+    i = inst(home)
+    i.install()
+    settings(home).write_text(settings(home).read_text().replace("workflow hook", "workflow hook "))
+    i.repair()
+    i.uninstall()
+    backups = home / ".local" / "share" / "herdr-engineering" / "workflow" / "backups"
+    assert (backups / "settings.json.bak").read_text() == original
+    assert len(list(backups.iterdir())) >= 3
+
+
+def _hook_commands(home, command):
+    wh.WorkflowInstaller(home, command=command).install()
+    hooks = json.loads(settings(home).read_text())["hooks"]
+    return {ev: v[0]["hooks"][0]["command"] for ev, v in hooks.items()}
+
+
+def test_generated_command_executes_via_sh(home):
+    cmds = _hook_commands(home, [sys.executable, "-m", "herdr_engineering.cli"])
+    done = subprocess.run(["sh", "-c", cmds["SessionStart"]], input="{}", capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    out = json.loads(done.stdout)
+    assert out["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert "/handoff" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_generated_command_with_missing_executable_is_silent_noop(home):
+    cmds = _hook_commands(home, ["/nonexistent/python", "-m", "herdr_engineering.cli"])
+    done = subprocess.run(["sh", "-c", cmds["SessionStart"]], input="{}", capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0 and done.stdout == ""
