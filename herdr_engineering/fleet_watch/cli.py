@@ -1,4 +1,8 @@
-"""`herdr-eng fleet-watch once --dry-run` (phase 2: read-only; off unless invoked)."""
+"""`herdr-eng fleet-watch`: poll the merged `main` heads of the fleet repos.
+
+`once`/`run` plan and (with `--apply`) roll out serially; `loop` is the D11 service command - plan only
+without `--enable-rollouts`, and after a successful rollout that updated this host's herdr-engineering
+install it requests a self-restart so the fleet runs the build it just shipped (issue #865)."""
 
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import core, events, logs, poll, service, state
+from . import core, events, logs, poll, selfrestart, service, state
 
 
 def render(report: dict) -> str:
@@ -123,7 +127,7 @@ def cmd_run(args) -> int:
             saved = state.load(directory)
             engine = _engine(args, directory, local)
             engine.settle_locks(saved)
-            outcome = _drive(engine, saved, report["rollout"], args.resume)
+            outcome, _ = _drive(engine, saved, report["rollout"], args.resume)
     except state.WatcherBusy as exc:
         print(str(exc), file=sys.stderr)
         return 3
@@ -205,7 +209,12 @@ def _loop_pass(args, local: str | None) -> tuple[dict, str]:
         saved = state.load(directory)
         engine = _engine(args, directory, local)
         engine.settle_locks(saved)
-        return report, _drive(engine, saved, rollout, False)
+        outcome, rid = _drive(engine, saved, rollout, False)
+        if outcome == "succeeded" and rid is not None and \
+                selfrestart.needs_self_restart(saved["rollouts"].get(rid), local):
+            if selfrestart.request_self_restart(log=lambda line: print(line, file=sys.stderr)):
+                return report, selfrestart.RESTART_OUTCOME
+        return report, outcome
 
 
 def _watchdog_markers(directory: Path) -> list[Path]:
@@ -255,6 +264,8 @@ def _loop(args, directory: Path, local: str | None) -> int:
             except Exception as exc:                       # a bad pass must not stop the service; the class is enough
                 outcome = f"error {type(exc).__name__}"
             print(f"pass {passes}: {outcome}", flush=True)
+            if outcome == selfrestart.RESTART_OUTCOME:   # the restart is in flight; the new build takes over
+                return 0
             if args.max_passes and passes >= args.max_passes:
                 return 0
             time.sleep(service.next_sleep(report, args.interval, rng))
@@ -262,26 +273,27 @@ def _loop(args, directory: Path, local: str | None) -> int:
         dog.stop()
 
 
-def _drive(engine, saved: dict, plan: dict | None, resume: bool) -> str:
+def _drive(engine, saved: dict, plan: dict | None, resume: bool) -> tuple[str, str | None]:
+    """Drive the rollout for one pass; returns (outcome, rollout id) - the id for restart decisions."""
     rollouts = saved["rollouts"]
     running = [rid for rid, r in rollouts.items() if r.get("status") == "running"]
     if running:                                           # a crashed run: continue where it stopped
-        return engine.resume(saved, running[0])
+        return engine.resume(saved, running[0]), running[0]
     halted = [rid for rid, r in rollouts.items() if r.get("status") == "halted"]
     if plan and plan["rollout_id"] in halted:
         if not resume:
             print(f"rollout {plan['rollout_id']} halted earlier; fix the cause, then `fleet-watch resume` "
                   "(or `fleet-watch abandon`); --resume is its deprecated alias", file=sys.stderr)
-            return "needs_resume"
-        return engine.resume(saved, plan["rollout_id"], operator=True)
+            return "needs_resume", plan["rollout_id"]
+        return engine.resume(saved, plan["rollout_id"], operator=True), plan["rollout_id"]
     if plan:
         for rid in halted:
             engine.supersede(saved, rid)
-        return engine.start(saved, plan)
+        return engine.start(saved, plan), plan["rollout_id"]
     if resume and halted:
-        return engine.resume(saved, halted[-1], operator=True)
+        return engine.resume(saved, halted[-1], operator=True), halted[-1]
     print("plan: nothing to roll out", file=sys.stderr)
-    return "idle"
+    return "idle", None
 
 
 def _outbox_client(args):

@@ -134,6 +134,17 @@ is a host-level operator job that must run `ssh`/`herdr-eng` as the user (the sa
 fabric agent has), and the control plane itself stays a container. It targets the other hosts only via
 `ssh <host> herdr-eng fleet host-apply ...` (below). macOS needs no watcher.
 
+**D12 The watcher self-updates on its own repo's merge.** When a rollout has **succeeded** and it updated
+the watcher's own herdr-engineering install (checkout fast-forwarded + new build installed + receipt), the
+loop requests a detached `systemctl --user restart herdr-eng-fleet-watch.service` and exits 0, so the next
+pass runs the build it just shipped (issue #865). It never requests a restart for a `halted`/`running`
+rollout (the fleet has not converged; the old loop is what handles the halt), for a rollout that did not
+change this host's install (`no_change`/`skipped`), in plan-only mode, or when the process is not running
+under the unit (dev runs and tests are detected via `/proc/self/cgroup` and left alone, with a log note).
+The request is best-effort: a failure is logged and the loop keeps running the old build (an operator
+restarts by hand). The one-shot `run --apply` does not request a restart - the process exits anyway.
+Test/dev seam: `HERDR_FLEET_WATCH_RESTART_CMD` replaces the restart command.
+
 ## 5. Components
 
 ```
@@ -352,7 +363,9 @@ dependency"); client-rendered diagrams from untrusted strings.
   rate-limit headers (a protocol-faithful fixture server, not a mock of our code); a real `git` pair proves
   D3 (stray unpushed commit refused, ancestor accepted, force-pushed-away SHA refused); real flock contention
   with the nightly updater lock; control plane started for real and queried through `/api/v1/fleet-rollouts*`;
-  outbox replay after killing the control plane; dirty-checkout pre-check against a real dirty repo.
+  outbox replay after killing the control plane; dirty-checkout pre-check against a real dirty repo; the loop
+  requests its self-restart (D12) exactly when a rollout succeeded and updated this host's herdr-engineering
+  row (seam-observed in throwaway HOMEs, and not for halted rollouts or an unchanged local install).
 - **Smoke** (`scripts/validate.sh` target + CI): `herdr-eng fleet-watch once --dry-run` against the fixture
   server; `fleet lock verify` on a sample lock; unit-file lint (`systemd-analyze verify`) for the service.
 - **E2E**: Playwright CLI (`npx playwright test`, never MCP) loads `#/fabric-management` against a control

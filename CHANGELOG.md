@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fleet watch: the watcher self-restarts after a herdr-engineering self-update
+
+- After a fleet-watch rollout **succeeded** and updated the watcher's own herdr-engineering install, `herdr-eng fleet-watch loop --enable-rollouts` now requests a detached `systemctl --user restart herdr-eng-fleet-watch.service` and exits 0, so the fleet runs the build it just shipped (issue #865; spec D12 in `docs/specs/herdr-fleet-rollout-watcher-20261104/spec.md`). It never requests a restart for a halted or running rollout, for a rollout that left this host's install unchanged, in plan-only mode, or when not running under the unit (dev runs and tests, detected via `/proc/self/cgroup`). A failed request is logged and the loop keeps running; `HERDR_FLEET_WATCH_RESTART_CMD` replaces the restart command for tests and dev. See `docs/operations/fleet-rollout-watcher.md`.
+
 ### Fix: inspector readers no longer wait on a durable write
 
 - `InspectorStore.ingest` held the store-wide lock across the durable sink write. The sink serialises every write behind one asyncpg connection and a write lock, so under an ingest burst the lock holder waited behind unrelated writes and every reader (`agents/list` via `phone_digest`, `health`, `has_session`, `newest_seq`) waited with it; `agents/list` took up to 30 s on bender on 2026-11-17. The durable write now runs with the store lock released; ingest writers, `sweep`, `set_prefs` and checkpoint restore are serialised by a separate ingest lock (order: ingest lock, store lock, sink lock) and a reader sees the state from before an event until that event is durable, as before.

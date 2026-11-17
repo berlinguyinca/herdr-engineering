@@ -34,6 +34,19 @@ Set the variables back to false and re-run the playbook (stops, disables, remove
 - Hard limit (default 5400 s): the loop exits 70 only after NO progress (no write to state, outbox, logs) for that long; progress resets it. systemd restarts it and the durable rollout resumes. A long healthy rollout is never killed.
 - A failed pass logs only the exception class and the loop continues. SIGTERM stops it cleanly.
 
+## Self-update: the watcher runs the build it just shipped (D12)
+
+When a rollout **succeeded** and it updated the watcher's own herdr-engineering install (checkout
+fast-forwarded, new build installed, receipt written), the loop requests a detached
+`systemctl --user restart herdr-eng-fleet-watch.service` and exits 0; systemd brings the unit back on the
+new build (the pass line reads `pass N: succeeded (watcher self-restart requested)`).
+
+It never requests a restart for a `halted`/`running` rollout, for a rollout that left this host's install
+unchanged (`no_change`/`skipped`), in plan-only mode, or when the process is not running under the unit
+(dev runs and tests, detected via `/proc/self/cgroup` - a note is logged instead). A failed restart request
+is logged and the loop keeps running the old build; restart by hand to pick up the new one. `HERDR_FLEET_WATCH_RESTART_CMD`
+replaces the restart command for tests and dev.
+
 ## Status
 
 `journalctl --user -u herdr-eng-fleet-watch`, and the events in the control plane. Lines look like `pass N: <outcome>`.
