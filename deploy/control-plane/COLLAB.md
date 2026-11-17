@@ -335,7 +335,8 @@ validates the slice and the compose files without printing any secret.
     DNS name distinct from `share.public_host` and the collab host, and is copied into the collab slice and the share
     slice (never authored under `collab.members`). Behaviour matches the artifact host: the member routes use the
     member origin for `redirect_uri`, `logout_uri` and the CSP, COOP is `same-origin` there, the Host must match exactly
-    (other spellings, a second Host header and `X-Forwarded-Host` get 404), and `/s/` is 404 on it. The old share host
+    (other spellings, a second Host header and `X-Forwarded-Host` get 404; the member server blocks forward the client's
+    `Host` as sent via `$http_host`, since `$host` would lowercase it and drop the port), and `/s/` is 404 on it. The old share host
     keeps serving the member routes unchanged. The edge renders one extra server block (member locations only,
     everything else 404, same listen/TLS/limits/headers) only when it is set; `deploy.sh` refuses a certificate that
     does not name it and probes `/s/probe/` on it (expects 404). Unset, the render and behavior are byte-identical.

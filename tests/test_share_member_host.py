@@ -227,3 +227,28 @@ def test_a_deploy_without_the_member_host_neither_checks_nor_probes_it(env):
     unit = (env["home"] / ".config/systemd/user/herdr-collab-sync.service").read_text()
     assert "--member-host" not in unit and MEMBER not in env["log"].read_text()
     assert MEMBER not in (env["home"] / ".config/herdr-engineering/collab-edge/nginx.conf").read_text()
+
+
+# ------------------------------------------------------------------- the Host header reaches the app as the client sent it
+AH = "artifacts2.example.test"
+AH_MEMBER = "my.artifacts2.example.test"
+
+
+def _host_lines(block: str) -> list[str]:
+    return re.findall(r"^\s*proxy_set_header Host (\S+);", block, re.M)
+
+
+def test_both_member_blocks_forward_the_clients_own_host_header():
+    """nginx's $host is lowercased and loses the port, which would defeat the app's exact Host match."""
+    share_on = _edge(share_member_host=MEMBER)
+    ah_on = _md._edge(share=False, artifact_host=AH, member_host=AH_MEMBER, mcp_hosts=[])
+    for block in (_md._server(share_on, MEMBER), _md._server(ah_on, AH_MEMBER)):
+        assert _host_lines(block) == ["$http_host"]
+        assert "$host" not in re.sub(r"#.*", "", block)
+
+
+def test_the_public_blocks_still_forward_the_normalised_host():
+    share_on = _edge(share_member_host=MEMBER)
+    ah_on = _md._edge(share=False, artifact_host=AH, member_host=AH_MEMBER, mcp_hosts=[])
+    assert _host_lines(_md._server(share_on, HOST)) == ["$host"]
+    assert _host_lines(_md._server(ah_on, AH)) == ["$host"]
