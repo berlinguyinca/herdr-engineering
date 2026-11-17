@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: `/api/auth/open` no longer waits on the audit write
+
+- The open-owner sign-in queued its audit entry synchronously: `audit_record` holds the assistant store lock across the durable write and a full snapshot persist, so any contention there (a stall of 70.6 s was seen on 2026-11-17 against a normal 1.3 s) stalled the phone's first launch past its 8 s timeout. The entry now goes to a bounded background queue (256, drop-and-log on overflow, flushed on `RakazoBridge.close`); password sign-in and sign-out still audit inline. Rate limit and tailnet/origin checks are unchanged.
+- The slow-call line for `auth/open` (and password sign-in) now ends with per-phase timings, e.g. `auth/open took 1275 ms (status 200, mint 1200 ms, audit 0 ms)`.
+
 ### Fix: `control-plane checkpoint` names the reason for any ValueError
 
 - The CLI JSON error carried a `reason` only for `CheckpointInvalid`; any other `ValueError` (for example `invalid projection checkpoint schema`) printed just its type and stage, so a failing deploy prewarm was undiagnosable. It now prints `reason` for a `CheckpointInvalid` at any stage and for any other `ValueError` once the connection is open (migration, index preparation, materialization), redacted through the worker's `_safe_message` (URLs and DSNs become `<url>`, at most 500 characters). The `projection restore rejected; complete replay required` warning carries the same safe message. Exit code and `ok: false` are unchanged; `configuration` and `database_connection` stage errors (a malformed DSN can be quoted without `://`) and other exception types still print only name and stage.
