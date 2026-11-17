@@ -1910,3 +1910,172 @@ def test_package_json_other_keys_need_bootstrap(tmp_path, changes):
 def test_invalid_package_json_on_one_side_needs_bootstrap(tmp_path):
     _, state = _host_result(tmp_path, {"package.json": "{not json"}, "old", stage_old=True)
     assert state["status"] == "bootstrap_required"
+
+
+class LoadedHostWire(Wire):
+    """bender's list misses replies like a loaded host: the first `misses` lists are unreachable."""
+
+    def __init__(self, *, misses=0, error="session_unresponsive"):
+        super().__init__()
+        self.offline.clear()
+        self.misses = misses
+        self.error = error
+        self.lists = 0
+        self.duplicate = False
+
+    def sessions(self, target, root):
+        rows = super().sessions(target, root)
+        if target["host"] != "bender":
+            return rows
+        self.lists += 1
+        if self.lists <= self.misses:
+            return [
+                {
+                    "descriptor": copy.deepcopy(rows[0]["descriptor"]),
+                    "reachable": False,
+                    "error": self.error,
+                }
+            ]
+        if self.duplicate:
+            rows.append(copy.deepcopy(rows[0]))
+        return rows
+
+
+@pytest.fixture
+def no_backoff(monkeypatch):
+    monkeypatch.setattr("herdr_engineering.fleet_rollout._UNREACHABLE_BACKOFF_SECONDS", (0, 0))
+
+
+def _bender(report):
+    return report["hosts"]["bender"]["sessions"]["bender-conversation"]
+
+
+def test_transient_unresponsive_row_keeps_a_complete_session_complete(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire()
+    mission = wire.rows["bender"]["reply"]["data"]["missions"][0]
+    mission.update(status="COMPLETE", resumeEligible=False)
+    done = apply(store, plan, wire)
+    assert _bender(done)["status"] == "complete"
+    wire.misses = wire.lists + 100
+    after = apply(store, plan, wire)
+    session = _bender(after)
+    assert session["status"] == "complete"
+    assert session["lastUnreachableAt"]
+    assert "session_unresponsive" in session["note"]
+    assert "error" not in session
+    assert after["hosts"]["bender"]["status"] == "complete"
+
+
+def test_transiently_unreachable_pending_session_is_not_blocked(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire(misses=100, error="timeout")
+    report = apply(store, plan, wire)
+    session = _bender(report)
+    assert session["status"] == "pending"
+    assert session["lastUnreachableAt"]
+    assert report["hosts"]["bender"]["status"] == "pending"
+    assert "error" not in report["hosts"]["bender"]
+    wire.misses = 0
+    recovered = apply(store, plan, wire)
+    assert _bender(recovered)["status"] == "awaiting_progress"
+
+
+def test_two_reachable_rows_for_one_session_stay_blocked(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire()
+    wire.duplicate = True
+    report = apply(store, plan, wire)
+    assert _bender(report)["status"] == "blocked"
+    assert "ambiguous" in _bender(report)["error"]
+    assert report["hosts"]["bender"]["status"] == "blocked"
+
+
+def test_in_pass_retry_recovers_when_the_second_list_succeeds(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire(misses=1)
+    report = apply(store, plan, wire)
+    session = _bender(report)
+    assert session["status"] == "awaiting_progress"
+    assert "lastUnreachableAt" not in session
+    assert wire.lists >= 2
+
+
+def test_all_process_gone_rows_end_the_session_without_counting_a_success(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire(misses=100, error="session_process_gone")
+    report = apply(store, plan, wire)
+    session = _bender(report)
+    assert session["status"] == "ended"
+    assert session["endedAt"]
+    assert "error" not in session
+    assert report["hosts"]["bender"]["endedSessions"] == ["bender-conversation"]
+    assert report["hosts"]["bender"]["status"] != "blocked"
+    assert not [m for m in wire.mutations if m[0] == "bender"]
+    # The same conversation answering again is picked back up.
+    wire.misses = 0
+    back = apply(store, plan, wire)
+    assert _bender(back)["status"] == "awaiting_progress"
+
+
+class VanishingWire(Wire):
+    """beast's second session leaves the native inventory; its rows may report an error."""
+
+    def __init__(self, error=None):
+        super().__init__()
+        self.offline.clear()
+        self.error = error
+        self.present = True
+
+    def native(self, target):
+        rows = super().native(target)
+        if target["host"] == "beast" and self.present:
+            rows.append(
+                {
+                    "agent": "pi",
+                    "terminal_id": "terminal-2",
+                    "agent_session": {"value": "second-conversation"},
+                    "session": "main",
+                }
+            )
+        return rows
+
+    def sessions(self, target, root):
+        rows = super().sessions(target, root)
+        if target["host"] == "beast":
+            second = copy.deepcopy(rows[0])
+            second["descriptor"].update(sessionId="second-conversation", pid=43)
+            if self.present:
+                rows.append(second)
+            elif self.error:
+                second.update(reachable=False, error=self.error)
+                second.pop("reply")
+                rows.append(second)
+        return rows
+
+
+@pytest.mark.parametrize("error", ["session_process_gone", None])
+def test_session_that_left_the_native_inventory_has_ended(tmp_path, no_backoff, error):
+    store, plan = setup_rollout(tmp_path)
+    wire = VanishingWire(error)
+    first = apply(store, plan, wire)
+    assert first["hosts"]["beast"]["sessions"]["second-conversation"]["status"] != "ended"
+    wire.present = False
+    after = apply(store, plan, wire)
+    beast = after["hosts"]["beast"]
+    assert beast["sessions"]["second-conversation"]["status"] == "ended"
+    assert beast["endedSessions"] == ["second-conversation"]
+    assert not any("missing from native" in e["error"] for e in beast["coverageErrors"])
+    assert "hostLevelError" not in beast
+
+
+def test_unresponsive_session_missing_from_native_is_not_an_error(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = VanishingWire("session_unresponsive")
+    before = apply(store, plan, wire)["hosts"]["beast"]["sessions"]["second-conversation"]
+    wire.present = False
+    beast = apply(store, plan, wire)["hosts"]["beast"]
+    session = beast["sessions"]["second-conversation"]
+    assert session["status"] == before["status"]
+    assert session["lastUnreachableAt"]
+    assert "hostLevelError" not in beast
