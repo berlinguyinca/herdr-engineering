@@ -256,3 +256,40 @@ def test_generated_command_blocks_via_sh(home, tmp_path):
         capture_output=True, text=True, timeout=60)
     assert done.returncode == 0
     assert json.loads(done.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# ---- reviewer bypasses (PR #862) --------------------------------------------------------
+@pytest.mark.parametrize("cmd", [
+    "git push -u origin HEAD", "git push origin HEAD", "git push origin @", "git push origin +HEAD",
+    "git push origin +@", "git push origin +main", "git push origin +HEAD:main",
+    "git push origin HEAD:refs/heads/main", "git push --signed origin main",
+    "git push --force-with-lease origin HEAD", "git push -o ci.skip origin HEAD",
+    "git status\ngit push origin main", "git status\ngit push -u origin HEAD",
+])
+def test_bypass_forms_denied_on_main(cmd, on_main):
+    assert decision(bash(cmd, on_main)) == "deny"
+
+
+@pytest.mark.parametrize("cmd", ["git push --signed origin main", "git status\ngit push origin main",
+                                 "git push origin +main", "git push origin +HEAD:main"])
+def test_bypass_forms_denied_from_feature_branch(cmd, feature):
+    assert decision(bash(cmd, feature)) == "deny"
+
+
+def test_cd_then_push_on_next_line_denied(on_main, tmp_path):
+    assert decision(bash(f"cd {on_main}\ngit push origin main", tmp_path)) == "deny"
+
+
+@pytest.mark.parametrize("cmd", ["git push -u origin HEAD", "git push origin @", "git push origin +HEAD",
+                                 "git push --signed origin feat/x", "git push origin HEAD:feat/y"])
+def test_head_and_signed_on_feature_branch_allowed(cmd, feature):
+    assert decision(bash(cmd, feature)) is None
+
+
+def test_multiline_message_with_unbalanced_quote_fails_open(feature):
+    assert decision(bash('git commit -m "line one\nline two"', feature)) is None
+
+
+def test_head_push_to_herdr_engineering_feature_asks(tmp_path):
+    repo = make_repo(tmp_path / "he", "feat/z", origin="git@github.com:b/herdr-engineering.git")
+    assert decision(bash("git push -u origin HEAD", repo)) == "ask"

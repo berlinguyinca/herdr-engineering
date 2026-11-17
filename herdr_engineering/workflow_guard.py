@@ -16,7 +16,7 @@ MATCHER = "Bash|Write|Edit|MultiEdit|NotebookEdit"
 _WRITE_TOOLS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path",
                 "NotebookEdit": "notebook_path"}
 _PROTECTED = {"main", "master"}
-_SEPARATORS = {"&&", "||", ";", "|", "&", "\n"}
+_SEPARATORS = {"&&", "||", ";", "|", "&"}
 _SCRATCHPAD = re.compile(r"^/(?:private/)?tmp/claude-\d+(?:/|$)")
 _GIT_TIMEOUT_S = 1.0
 
@@ -45,8 +45,8 @@ def check_write_path(path: str, cwd: str) -> Decision | None:
     return "deny", TMP_REASON
 
 
-def _split_commands(command: str) -> list[list[str]]:
-    lex = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+def _split_line(line: str) -> list[list[str]]:
+    lex = shlex.shlex(line, posix=True, punctuation_chars=";&|")
     lex.whitespace_split = True
     lex.commenters = ""
     cmds: list[list[str]] = [[]]
@@ -56,6 +56,20 @@ def _split_commands(command: str) -> list[list[str]]:
         else:
             cmds[-1].append(tok)
     return [c for c in cmds if c]
+
+
+def _split_commands(command: str) -> list[list[str]]:
+    """Split on newlines first (shlex treats them as blanks), then on ``&&``/``||``/``;``/``|``.
+
+    A line that does not tokenize on its own (e.g. a quoted string spanning lines) is skipped.
+    """
+    cmds: list[list[str]] = []
+    for line in command.splitlines():
+        try:
+            cmds += _split_line(line)
+        except ValueError:
+            continue
+    return cmds
 
 
 def _parse_push(argv: list[str]) -> tuple[str | None, list[str]] | None:
@@ -77,7 +91,7 @@ def _parse_push(argv: list[str]) -> tuple[str | None, list[str]] | None:
             break
     if i >= len(argv) or argv[i] != "push":
         return None
-    opts_with_value = {"--repo", "--receive-pack", "--exec", "-o", "--push-option", "--signed"}
+    opts_with_value = {"--repo", "--receive-pack", "--exec", "-o", "--push-option"}
     pos: list[str] = []
     j = i + 1
     while j < len(argv):
@@ -103,22 +117,23 @@ def _git(repo: str, *args: str) -> str | None:
     return done.stdout.strip() if done.returncode == 0 else None
 
 
-def _targets_protected(refspec: str) -> bool:
-    dst = refspec.lstrip("+").rsplit(":", 1)[-1]
-    dst = dst.removeprefix("refs/heads/")
-    return dst in _PROTECTED
+def _targets_protected(refspec: str, current: str | None) -> bool:
+    spec = refspec.lstrip("+")
+    if ":" in spec:
+        dst = spec.rsplit(":", 1)[-1]
+    elif spec in ("HEAD", "@"):
+        dst = current or ""  # HEAD/@ without a destination pushes to the current branch
+    else:
+        dst = spec
+    return dst.removeprefix("refs/heads/") in _PROTECTED
 
 
 def _check_push(workdir: str | None, pos: list[str], cwd: str) -> Decision | None:
     repo = _norm(workdir, cwd) if workdir else cwd
     refspecs = pos[1:]  # pos[0] is the remote
-    if refspecs:
-        if any(_targets_protected(r) for r in refspecs):
-            return "deny", MAIN_REASON
-    else:
-        branch = _git(repo, "symbolic-ref", "--short", "-q", "HEAD")
-        if branch in _PROTECTED:
-            return "deny", MAIN_REASON
+    branch = _git(repo, "symbolic-ref", "--short", "-q", "HEAD")
+    if any(_targets_protected(r, branch) for r in refspecs) or (not refspecs and branch in _PROTECTED):
+        return "deny", MAIN_REASON
     url = _git(repo, "remote", "get-url", "origin")
     if url and "herdr-engineering" in url:
         return "ask", HERDR_REASON
