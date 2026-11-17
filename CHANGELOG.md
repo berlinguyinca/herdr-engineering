@@ -7,7 +7,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Fix: `control-plane checkpoint` names the reason for any ValueError
 
-- The CLI JSON error carried a `reason` only for `CheckpointInvalid`; any other `ValueError` (for example `invalid projection checkpoint schema`) printed just its type and stage, so a failing deploy prewarm was undiagnosable. It now prints `reason` for every `ValueError`, redacted through the worker's `_safe_message` (URLs and DSNs become `<url>`, at most 500 characters). The `projection restore rejected; complete replay required` warning carries the same safe message. Exit code and `ok: false` are unchanged; other exception types still print only name and stage.
+- The CLI JSON error carried a `reason` only for `CheckpointInvalid`; any other `ValueError` (for example `invalid projection checkpoint schema`) printed just its type and stage, so a failing deploy prewarm was undiagnosable. It now prints `reason` for a `CheckpointInvalid` at any stage and for any other `ValueError` once the connection is open (migration, index preparation, materialization), redacted through the worker's `_safe_message` (URLs and DSNs become `<url>`, at most 500 characters). The `projection restore rejected; complete replay required` warning carries the same safe message. Exit code and `ok: false` are unchanged; `configuration` and `database_connection` stage errors (a malformed DSN can be quoted without `://`) and other exception types still print only name and stage.
 
 ### Fix: phone Assistants tab lists only online agent bots
 

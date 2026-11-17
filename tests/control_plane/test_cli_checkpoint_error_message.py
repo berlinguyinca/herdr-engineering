@@ -66,6 +66,17 @@ def test_checkpoint_cli_prints_reason_for_value_error(tmp_path, capsys):
     assert len(out["reason"]) <= 500 and "://" not in json.dumps(out)
 
 
+def test_checkpoint_cli_withholds_value_error_text_at_connection_stage(tmp_path, capsys):
+    # A password containing '/' makes asyncpg raise a ValueError that quotes DSN fragments without '://'.
+    dsn = "postgresql://user:pa/ssword9@localhost:5432/db"
+    code = cli.main(["control-plane", "checkpoint", "--fleet-config", str(_fleet_file(tmp_path, dsn))])
+    raw = capsys.readouterr().out
+    out = json.loads(raw)
+    assert code == 1 and out["ok"] is False and out["stage"] == "database_connection"
+    assert out["error"] == "ValueError" and "reason" not in out
+    assert "pa'" not in raw and "ssword9" not in raw and "localhost" not in raw
+
+
 def test_restore_rejection_warning_carries_safe_message(caplog):
     # A stored checkpoint with a valid checksum and frontier but a schema-invalid body.
     with private_postgres() as dsn:

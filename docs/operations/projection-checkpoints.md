@@ -52,11 +52,15 @@ When a stored candidate is rejected, the server log line
 the validation reason (at most 200 printable characters; only our own
 `CheckpointInvalid` messages).
 
-`herdr-eng control-plane checkpoint` prints `reason` for any `ValueError`
-(`CheckpointInvalid` included), and the worker's refresh warning and the
-`projection restore rejected; complete replay required` warning carry the same
-text. It is redacted (anything URL-shaped, such as a DSN, becomes `<url>`) and cut
-at 500 characters. Other exception types still print only their name and stage.
+`herdr-eng control-plane checkpoint` prints `reason` for a `CheckpointInvalid` at any
+stage, and for any other `ValueError` only once the database connection is open
+(stages `migration`, `index_preparation`, `materialization`). That text is redacted
+(anything URL-shaped, such as a DSN, becomes `<url>`) and cut at 500 characters. A
+`ValueError` at the `configuration` or `database_connection` stage, and any other
+exception type, prints only its name and stage, because a malformed DSN can be
+quoted in the message without a `://`. The worker's refresh warning and the
+`projection restore rejected; complete replay required` warning carry the redacted
+text.
 
 The background worker refreshes on its own connection and thread, one build at a
 time. A database advisory lock excludes overlapping materializers. Web startup
