@@ -5,10 +5,16 @@ context limit, the machine hands it to a fresh pane by itself — before the har
 summarizer replaces the conversation with a lossy recap.
 
 ```bash
-scripts/install.sh                    # arms it (step 7c); re-running is idempotent
-herdr-eng handoff autopilot status    # policy, what is installed, what has fired
-herdr-eng doctor                      # handoff-autopilot: ok | warn | skip | fail
+scripts/install.sh                       # arms it (step 7c); re-running is idempotent
+herdr-eng handoff autopilot status       # policy, what is installed, what has fired
+herdr-eng handoff autopilot install      # arm it on a machine that was installed earlier
+herdr-eng handoff autopilot uninstall    # remove both triggers; the audit ledger is kept
+herdr-eng doctor                         # handoff-autopilot: ok | warn | skip | fail
 ```
+
+Installing is safe on a machine with existing hooks: Claude Code entries are written only
+inside groups the autopilot wrote itself, so foreign hooks in `~/.claude/settings.json` are
+kept, and `uninstall` removes only what it added.
 
 ## What is installed
 
@@ -68,8 +74,13 @@ Read from the machine config (`~/.config/herdr-engineering/config.yaml`) and the
 **Switch it off without uninstalling:**
 
 ```bash
-export HERDR_HANDOFF_AUTOPILOT=off        # this shell / this session only
-herdr-eng config set handoff_autopilot.enabled false   # machine-wide
+export HERDR_HANDOFF_AUTOPILOT=off       # this shell, and any session started from it
+```
+
+```yaml
+# ~/.config/herdr-engineering/config.yaml  — machine-wide
+handoff_autopilot:
+  enabled: false
 ```
 
 `status` and `doctor` name whichever switch is holding it off, and how to put it back.
@@ -83,8 +94,8 @@ do not ask, do not finish the current task first, commit and push before the tak
 the tool refuses to close the source pane because of uncommitted or unpushed work, stop and
 report it rather than forcing the close. The trigger never calls the handoff tool itself: the
 skill is the only component that knows how to prove a takeover, and the CLI still refuses on
-`launch_unconfirmed`, `launch_failed`, `source_close_failed`, `source_unpushed`,
-`source_dirty` and `successor_not_ready`.
+`launch_unconfirmed`, `launch_failed`, `source_close_failed` and `source_dirty` (whose reason
+names whether the work is uncommitted, unpushed, or unknown to git).
 
 ## Failure modes
 
@@ -96,6 +107,11 @@ skill is the only component that knows how to prove a takeover, and the CLI stil
 | Trigger ledger corrupt | triggers stay armed; `status` and `doctor` warn and name the file |
 | Injection refused by the harness | nothing is recorded, so the next boundary re-arms the trigger |
 | A handoff for this session is already `draft`/`queued`/`claimed`/`accepted`/`in_progress` | `handoff_underway` — no second instruction |
+| `herdr-handoff confirm` answered `launch_unconfirmed` | the close was refused and both panes stay up — nothing was destroyed; report it, because re-running does not make an unobserved successor live |
+
+**Where it deliberately does not act:** mid-turn (only turn boundaries), a second time in the
+same session, on a harness policy does not name, on `SessionEnd`/`PreToolUse`/`PostToolUse`
+(wrong moment or fires many times a turn), or on a pane the successor did not prove.
 
 Failing open is deliberate: a broken autopilot must never be able to stall the session it was
 installed to protect. Every `handoff autopilot hook` path exits 0.
@@ -119,3 +135,19 @@ The ledger records, per session: how many times it was told to hand off, when, o
 harness, the percent that triggered it, the boundary that noticed, and a hash of the
 instruction. `handoff autopilot uninstall` removes the extension and the hooks but keeps this
 file — it is the audit record of when the machine took over on its own.
+
+## Checking the trigger itself
+
+```bash
+npm run typecheck:handoff-autopilot   # the Pi trigger, checked against the Pi API it targets
+node --test packages/herdr-handoff-autopilot.test.js
+```
+
+Pi's extension API has changed field names between builds (`ContextUsage`, how a message is
+injected silently), so the extension ships with its own `tsconfig.json` and is also driven by
+a recording Pi host in the Node suite — the test imports the file that installs, not a copy.
+
+The `record` half of every path is explicit: Pi calls `record` only after the injection
+returned, and a Claude hook records only when its command carries `--record` — which is what
+`handoff autopilot install` writes, but a hand-written hook without the flag reports without
+consuming. Nothing consumes a trigger on a path where delivery was not proven.

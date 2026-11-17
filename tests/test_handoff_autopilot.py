@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -612,8 +613,8 @@ assert.equal(ledger.sessions["s-node"].count, 1);
 assert.equal(ledger.sessions["s-node"].harness, "pi");
 """)
     env = dict(host["env"])
-    env["HERDR_ENG_BIN"] = sys.executable
-    env["HERDR_ENG_ARGS"] = json.dumps(["-m", "herdr_engineering.cli"])
+    # The same argv install.sh hands pi: interpreter first, module after.
+    env["HERDR_ENG_ARGS"] = json.dumps([sys.executable, "-m", "herdr_engineering.cli"])
     env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
     env["HERDR_TEST_PYTHON"] = sys.executable
     done = subprocess.run(
@@ -625,3 +626,95 @@ assert.equal(ledger.sessions["s-node"].harness, "pi");
         cwd=str(host["work"]),
     )
     assert done.returncode == 0, f"stdout:\n{done.stdout}\nstderr:\n{done.stderr}"
+
+
+# ------------------------------------------------------- installer and docs wiring
+
+
+INSTALL_SH = Path(ha.__file__).resolve().parents[1] / "scripts" / "install.sh"
+DOC = Path(ha.__file__).resolve().parents[1] / "docs" / "automatic-handoffs.md"
+
+
+def test_the_installer_arms_automatic_handoffs_by_default() -> None:
+    """`scripts/install.sh` is the only thing an operator runs; the trigger has to be in it.
+
+    Asserted on the script text rather than by running it: the installer clones upstreams and
+    writes the operator's real home. What is checked is the part that decides whether the
+    trigger is installed - the default, the opt-out flag, and the step that runs the CLI.
+    """
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert 'HANDOFF_AUTOPILOT="${HERDR_INSTALL_HANDOFF_AUTOPILOT:-1}"' in text, (
+        "automatic handoffs must be the default, with an env override for automated installs"
+    )
+    assert "--no-handoff-autopilot) HANDOFF_AUTOPILOT=0 ;;" in text
+    # `install.sh --help` prints lines 2-36 of the script; the opt-out has to be in that text.
+    assert "--no-handoff-autopilot" in "\n".join(text.splitlines()[1:36]), (
+        "the opt-out must be discoverable from `install.sh --help`"
+    )
+    assert '"$PY" -m herdr_engineering.cli handoff autopilot install' in text
+    # A step that can fail must not take the whole installer down with it (`set -euo pipefail`).
+    step = text.split("# --- 7c.", 1)[1].split("# --- 8.", 1)[0]
+    assert "|| warn" in step, "a failed trigger install must warn, not abort the installer"
+    syntax = subprocess.run(
+        ["bash", "-n", str(INSTALL_SH)], capture_output=True, text=True, timeout=60
+    )
+    assert syntax.returncode == 0, syntax.stderr
+
+
+def test_the_operator_doc_names_only_commands_that_exist() -> None:
+    """A doc that tells an operator to type something the CLI rejects is worse than no doc.
+
+    The same trap the pinned handoff skill tests guard: prose written ahead of, or behind, the
+    parser. Every top-level `herdr-eng <command>` in the doc must be a real subcommand.
+    """
+    assert DOC.is_file(), "automatic handoffs need an operator-facing doc"
+    text = DOC.read_text(encoding="utf-8")
+    help_out = subprocess.run(
+        CLI + ["--help"], capture_output=True, text=True, timeout=120, cwd=str(Path(ha.__file__).resolve().parents[1])
+    ).stdout
+    choices = set(re.findall(r"\n\s{0,2}\{([a-z0-9,\-]+)\}", help_out))
+    known: set[str] = set()
+    for group in choices:
+        known.update(group.split(","))
+    assert known, "could not read the CLI's subcommands from --help"
+    named = set(re.findall(r"\bherdr-eng\s+([a-z][a-z0-9-]*)", text))
+    assert named, "the doc names no herdr-eng commands at all, so it proves nothing"
+    unknown = sorted(word for word in named if word not in known)
+    assert not unknown, f"the doc names commands the CLI does not have: {unknown}"
+    # The three verbs an operator needs must be spelled out, and the switches named exactly.
+    for verb in ("status", "install", "uninstall"):
+        assert f"handoff autopilot {verb}" in text, f"the doc never mentions `handoff autopilot {verb}`"
+    assert "HERDR_HANDOFF_AUTOPILOT" in text and "handoff_autopilot" in text
+
+    # Codes the doc tells an operator to expect must be codes something in this repo really answers
+    # with - the autopilot itself, or the handoff vocabulary the operations runbook and the pinned
+    # skill already use. Prose inventing a status is how an operator ends up chasing a ghost.
+    root = Path(ha.__file__).resolve().parents[1]
+    vocabulary = [Path(ha.__file__).read_text(encoding="utf-8")]
+    for source in (root / "docs" / "operations" / "handoff.md", root / "herdr_engineering" / "skill_data" / "handoff" / "SKILL.md"):
+        vocabulary.append(source.read_text(encoding="utf-8"))
+    coded = set(re.findall(r"`([a-z][a-z0-9_]{3,})`", text))
+    interesting = {
+        word for word in coded
+        if re.search(r"(_unconfirmed|_failed$|_underway|_unpushed|_dirty|_not_ready|_unsupported|_is_full|_unavailable$|unknown_context)", word)
+    }
+    invented = sorted(word for word in interesting if not any(word in source for source in vocabulary))
+    assert not invented, f"the doc names statuses nothing in this repo produces: {invented}"
+
+
+def test_the_trigger_can_be_type_checked_against_the_pi_it_runs_on() -> None:
+    """pi's extension API moves between builds; the trigger must be checkable against it.
+
+    The fields this extension reads (`ContextUsage`, `sessionManager.getSessionId`, the silent
+    `sendUserMessage` options) have changed names across pi versions. A tsconfig next to the
+    extension, and a script that uses it, is how that drift gets caught before install time.
+    """
+    root = Path(ha.__file__).resolve().parents[1]
+    tsconfig = json.loads((root / "herdr_engineering" / "extension_data" / "tsconfig.json").read_text())
+    assert "herdr-handoff-autopilot.ts" in tsconfig["include"]
+    assert tsconfig["compilerOptions"]["strict"] is True
+    assert tsconfig["compilerOptions"]["noEmit"] is True
+    scripts = json.loads((root / "package.json").read_text())["scripts"]
+    assert scripts.get("typecheck:handoff-autopilot") == (
+        "tsc -p herdr_engineering/extension_data/tsconfig.json"
+    )

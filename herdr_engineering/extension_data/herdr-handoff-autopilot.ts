@@ -109,7 +109,8 @@ type UsageLike = {
 };
 
 function rawUsage(ctx: ExtensionContext): UsageLike | null {
-	const usage = ctx.getContextUsage?.() as UsageLike | undefined | null;
+	// Read defensively: pi's ContextUsage has changed field names between builds.
+	const usage = ctx.getContextUsage?.() as unknown as UsageLike | undefined | null;
 	return usage ?? null;
 }
 
@@ -145,11 +146,14 @@ function usageTokens(usage: UsageLike | null): number | null {
  * per-session memo here and the ledger the CLI writes; "" means the host cannot say, and we leave it alone.
  */
 function sessionKey(ctx: ExtensionContext): string {
-	const fromManager = (ctx as { sessionManager?: { getSessionId?: () => string } }).sessionManager
-		?.getSessionId?.();
+	// Read defensively: `sessionManager.getSessionId()` in current pi, a bare `sessionId` in older builds.
+	const host = ctx as unknown as {
+		sessionManager?: { getSessionId?: () => string };
+		sessionId?: string;
+	};
+	const fromManager = host.sessionManager?.getSessionId?.();
 	if (typeof fromManager === "string" && fromManager) return fromManager;
-	const bare = (ctx as { sessionId?: string }).sessionId;
-	return typeof bare === "string" ? bare : "";
+	return typeof host.sessionId === "string" ? host.sessionId : "";
 }
 
 /**
