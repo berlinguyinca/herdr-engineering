@@ -37,7 +37,6 @@ SHA = re.compile(r"[0-9a-f]{40}\Z")
 #: purpose: a Host import added later still lands in a covered directory, and an
 #: over-broad match only costs a bootstrap, never a false "current".
 HOST_CODE_PATHS = (
-    "package.json",
     "scripts/diagnose-errors.ts",
     "src/aps/fingerprint.ts",
     "src/aps/types.ts",
@@ -54,6 +53,9 @@ HOST_CODE_PATHS = (
     "src/telemetry",
     "src/update",
 )
+#: ``package.json`` is compared parsed, minus these keys only. The Host never reads them;
+#: everything else (``pi.extensions``, ``dependencies``, ``type``, ...) must be equal.
+PACKAGE_JSON_IGNORED_KEYS = ("devDependencies", "scripts")
 #: Git reads these before the working directory; a probe must not inherit them.
 GIT_ENV_UNSET = (
     "GIT_DIR",
@@ -280,9 +282,19 @@ class PiTransport:
         for name in GIT_ENV_UNSET:
             argv.extend(["-u", name])
         argv.extend(["git", "-C", root, *args])
-        return self.runner(
-            self._command(target, argv), capture_output=True, text=True, timeout=45
-        ).returncode
+        return self.runner(self._command(target, argv), capture_output=True, text=True, timeout=45)
+
+    def _package_json(self, target, root, commit):
+        shown = self._git(target, root, "show", commit + ":package.json")
+        if shown.returncode:
+            return None
+        try:
+            value = json.loads(shown.stdout)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(value, dict):
+            return None
+        return {k: v for k, v in value.items() if k not in PACKAGE_JSON_IGNORED_KEYS}
 
     def host_code_unchanged(self, target, root, host_commit, revision):
         """True/False when the staged release can compare Host code; None when it cannot.
@@ -293,22 +305,40 @@ class PiTransport:
         if not SHA.fullmatch(str(host_commit)) or not SHA.fullmatch(str(revision)):
             return None
         try:
-            if self._git(target, root, "cat-file", "-e", revision + "^{commit}"):
+            if self._git(target, root, "cat-file", "-e", revision + "^{commit}").returncode:
                 return None
-            if self._git(target, root, "cat-file", "-e", host_commit + "^{commit}"):
+            if self._git(target, root, "cat-file", "-e", host_commit + "^{commit}").returncode:
                 # Releases are depth-1 clones; the old Host's own staged release, if still
                 # on this machine, supplies its commit without any network access.
                 sibling = root.rsplit("/", 1)[0] + "/" + host_commit
-                if self._git(
-                    target, root, "fetch", "--quiet", "--no-tags", "--depth=1", sibling, host_commit
-                ) or self._git(target, root, "cat-file", "-e", host_commit + "^{commit}"):
+                if (
+                    self._git(
+                        target,
+                        root,
+                        "fetch",
+                        "--quiet",
+                        "--no-tags",
+                        "--depth=1",
+                        sibling,
+                        host_commit,
+                    ).returncode
+                    or self._git(
+                        target, root, "cat-file", "-e", host_commit + "^{commit}"
+                    ).returncode
+                ):
                     return None
             code = self._git(
                 target, root, "diff", "--quiet", host_commit, revision, "--", *HOST_CODE_PATHS
-            )
+            ).returncode
+            if code != 0:
+                return {1: False}.get(code)
+            old = self._package_json(target, root, host_commit)
+            new = self._package_json(target, root, revision)
         except (OSError, subprocess.SubprocessError):
             return None
-        return {0: True, 1: False}.get(code)
+        if old is None or new is None:
+            return None
+        return old == new
 
     def _json(self, target, argv, *, allow_failed_receipt=False):
         command = self._command(target, argv)
@@ -662,6 +692,7 @@ def _session(plan, state, transport, target, root, save):
                 "hostCommit": runtime["hostCommit"],
                 "revision": plan["revision"],
                 "paths": list(HOST_CODE_PATHS),
+                "packageJsonIgnoredKeys": list(PACKAGE_JSON_IGNORED_KEYS),
             }
         else:
             state["status"] = "bootstrap_required"
