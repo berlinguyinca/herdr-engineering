@@ -1754,6 +1754,15 @@ def _commit(repo, files, message):
     return _git(repo, "rev-parse", "HEAD")
 
 
+PKG = {
+    "name": "p",
+    "scripts": {"test": "a"},
+    "devDependencies": {"x": "1"},
+    "dependencies": {"y": "1"},
+    "pi": {"extensions": ["./src/runtime/host/entry.ts"]},
+}
+
+
 class HostWorld:
     """Real source repo plus the staged-release layout the Pi stager produces."""
 
@@ -1765,7 +1774,7 @@ class HostWorld:
         self.source.mkdir()
         _git(self.source, "init", "-q")
         base = {
-            "package.json": "{}",
+            "package.json": json.dumps(PKG),
             "src/runtime/host/entry.ts": "export const a = 1;\n",
             "src/runtime/other.ts": "export const b = 1;\n",
         }
@@ -1838,7 +1847,7 @@ def test_unchanged_host_files_accepted_when_both_commits_are_present(tmp_path):
 
 @pytest.mark.parametrize("path", ["src/runtime/host/entry.ts", "package.json"])
 def test_changed_host_file_still_needs_bootstrap(tmp_path, path):
-    _, state = _host_result(tmp_path, {path: "changed"}, "old", stage_old=True)
+    _, state = _host_result(tmp_path, {path: "{changed"}, "old", stage_old=True)
     assert state["status"] == "bootstrap_required"
     assert "hostAcceptance" not in state
 
@@ -1874,3 +1883,30 @@ def test_ambient_git_dir_cannot_redirect_the_probe(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path))
     target = {"host": "bender", "sshTarget": "bender", "port": 22, "local": True}
     assert PiTransport().host_code_unchanged(target, str(release), world.old, world.new) is False
+
+
+def _pkg(**changes):
+    return {"package.json": json.dumps({**PKG, **changes})}
+
+
+@pytest.mark.parametrize(
+    "changes", [{"scripts": {"test": "b", "test:coverage": "c"}}, {"devDependencies": {"x": "2"}}]
+)
+def test_package_json_ignored_keys_are_accepted(tmp_path, changes):
+    world, state = _host_result(tmp_path, _pkg(**changes), "old", stage_old=True)
+    assert state["status"] != "bootstrap_required"
+    assert state["hostAcceptance"]["hostCommit"] == world.old
+    assert state["hostAcceptance"]["packageJsonIgnoredKeys"] == ["devDependencies", "scripts"]
+
+
+@pytest.mark.parametrize(
+    "changes", [{"pi": {"extensions": ["./other.ts"]}}, {"dependencies": {"y": "2"}}]
+)
+def test_package_json_other_keys_need_bootstrap(tmp_path, changes):
+    _, state = _host_result(tmp_path, _pkg(**changes), "old", stage_old=True)
+    assert state["status"] == "bootstrap_required"
+
+
+def test_invalid_package_json_on_one_side_needs_bootstrap(tmp_path):
+    _, state = _host_result(tmp_path, {"package.json": "{not json"}, "old", stage_old=True)
+    assert state["status"] == "bootstrap_required"
