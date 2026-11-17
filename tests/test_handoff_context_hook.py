@@ -108,3 +108,38 @@ def test_firing_prunes_stale_markers_but_keeps_recent_ones(tmp_path):
     code, out, _ = run_hook(payload(transcript(tmp_path, usage_line(150_000)), "fresh"), tmp_path)
     assert code == 0 and "additionalContext" in out
     assert not old.exists() and recent.exists() and (markers / "fresh.fired").exists()
+
+
+def test_window_is_inferred_as_one_million_once_usage_exceeds_200k(tmp_path):
+    # 600k tokens cannot fit a 200k window, so it is 60% of 1M, not 300%.
+    code, out, _ = run_hook(payload(transcript(tmp_path, usage_line(600_000))), tmp_path)
+    assert code == 0 and "60%" in out and "300%" not in out
+
+
+def test_an_ignored_instruction_is_repeated_only_after_ten_more_points(tmp_path):
+    t = tmp_path / "t.jsonl"
+
+    def call(tokens: int) -> str:
+        t.write_text(usage_line(tokens) + "\n")
+        return run_hook(payload(t), tmp_path)[1]
+
+    assert "50%" in call(100_000)
+    assert call(105_000) == ""          # 52%: under +10 points since the last reminder
+    assert "60%" in call(120_000)       # +10 points: remind again
+    assert call(125_000) == ""
+
+
+def test_reminders_survive_the_window_growing_from_200k_to_1m(tmp_path):
+    """Ignored reminders below 200k must not suppress the one due at 50% of the real 1M window."""
+    t = tmp_path / "t.jsonl"
+
+    def call(tokens: int) -> str:
+        t.write_text(usage_line(tokens) + "\n")
+        return run_hook(payload(t), tmp_path)[1]
+
+    for tokens in (100_000, 120_000, 140_000, 160_000, 180_000, 200_000):
+        assert "additionalContext" in call(tokens)
+    assert call(210_000) == ""                   # 21% of 1M: under the threshold
+    assert "50%" in call(500_000)                # 50% of 1M: due, whatever was said at 200k scale
+    assert call(520_000) == ""
+    assert "60%" in call(600_000)
