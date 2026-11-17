@@ -12,6 +12,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Security hardening: tagged devices and this host's own addresses are refused; optional `tailnet_open_owner_users` allowlist; IPv4-mapped proxies and peers are unwrapped everywhere; whois decides whenever `tailnet_open_owner` is on (even with `open_owner`); repeated `X-Forwarded-For` headers are refused; whois errors cached 2 s with single-flight lookups; `bridge_url` only for tailnet callers.
 - Docs: `docs/operations/shepherd-discovery.md`, `docs/operations/shepherd-onboarding-contract.md` (app-side probe order).
 
+### Install: screenwright is installed and kept at the latest origin/main
+
+- New `scripts/install-screenwright.sh` (wired into `scripts/install.sh` as step 7d, default on, non-fatal; `--no-screenwright` or `HERDR_INSTALL_SCREENWRIGHT=0` opts out) clones `berlinguyinca/screenwright` to `~/.local/share/herdr-engineering/screenwright`, fast-forwards it to `origin/main` on every run, runs `npm install` when HEAD moved, and calls the repo's own `ensure-install.sh` to link `screenwright-review` into the four harnesses. A dirty or non-main checkout is skipped with a message (exit 0). Prints `screenwright=<short sha> changed=<bool>`. `HERDR_SCREENWRIGHT_REF` pins instead of tracking. `lock/upstreams.yaml` records it as `revision: "tracking origin/main"`. See `docs/operations/screenwright.md`.
+
 ### Fix: inspector readers no longer wait on a durable write
 
 - `InspectorStore.ingest` held the store-wide lock across the durable sink write. The sink serialises every write behind one asyncpg connection and a write lock, so under an ingest burst the lock holder waited behind unrelated writes and every reader (`agents/list` via `phone_digest`, `health`, `has_session`, `newest_seq`) waited with it; `agents/list` took up to 30 s on bender on 2026-11-17. The durable write now runs with the store lock released; ingest writers, `sweep`, `set_prefs` and checkpoint restore are serialised by a separate ingest lock (order: ingest lock, store lock, sink lock) and a reader sees the state from before an event until that event is durable, as before.
