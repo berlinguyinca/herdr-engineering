@@ -136,14 +136,18 @@ fabric agent has), and the control plane itself stays a container. It targets th
 
 **D12 The watcher self-updates on its own repo's merge.** When a rollout has **succeeded** and it updated
 the watcher's own herdr-engineering install (checkout fast-forwarded + new build installed + receipt), the
-loop requests a detached `systemctl --user restart herdr-eng-fleet-watch.service` and exits 0, so the next
-pass runs the build it just shipped (issue #865). It never requests a restart for a `halted`/`running`
-rollout (the fleet has not converged; the old loop is what handles the halt), for a rollout that did not
-change this host's install (`no_change`/`skipped`), in plan-only mode, or when the process is not running
-under the unit (dev runs and tests are detected via `/proc/self/cgroup` and left alone, with a log note).
-The request is best-effort: a failure is logged and the loop keeps running the old build (an operator
-restarts by hand). The one-shot `run --apply` does not request a restart - the process exits anyway.
-Test/dev seam: `HERDR_FLEET_WATCH_RESTART_CMD` replaces the restart command.
+loop exits with a dedicated status (75, sysexits EX_TEMPFAIL): the unit's existing `Restart=on-failure`
+(75 is not in `RestartPreventExitStatus=2 3`) restarts the service about 30 s later, and the fresh main
+process is the newly installed build, so the next pass runs the build the fleet just shipped (issue #865).
+The restart comes from systemd itself - no detached `systemctl` child is spawned, because the unit's
+cgroup cleanup (`KillMode=control-group`) would SIGTERM such a child before it queued its job, and an
+exit 0 would not restart the unit at all. It never requests a restart for a `halted`/`running` rollout
+(the fleet has not converged; the old loop is what handles the halt), for a rollout that did not change
+this host's install (`no_change`/`skipped`), in plan-only mode, or when the process is not running under
+the unit (dev runs and tests are detected via `/proc/self/cgroup` and left alone, with a log note; the
+loop keeps running the old build). The one-shot `run --apply` does not request a restart - the process
+exits anyway. Test/dev seam: `HERDR_FLEET_WATCH_RESTART_CMD` runs an injectable command; the loop still
+exits 75.
 
 ## 5. Components
 

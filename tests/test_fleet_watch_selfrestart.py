@@ -1,6 +1,6 @@
 """Watcher self-restart (issue #865): after the loop's rollout has successfully updated
-this host's herdr-engineering install, the loop requests a restart of its own user
-service so the fleet runs the build it just shipped.
+this host's herdr-engineering install, the loop exits 75 so the unit's Restart=on-failure
+restarts it on the newly installed build - the fleet runs the build it just shipped.
 
 No mocks: the decision is a pure function tested directly; the dispatch is tested with
 an injectable spawn/cgroup seam; the loop tests drive real subprocesses with the Fleet
@@ -59,7 +59,7 @@ def test_needs_self_restart_only_for_a_succeeded_rollout_that_updated_this_host(
 
 # ---------------------------------------------------------------- dispatch (injectable)
 
-def test_request_runs_the_seam_instead_of_systemctl():
+def test_request_spawns_the_seam_when_set():
     spawned: list[list[str]] = []
     out: list[str] = []
     ok = request_self_restart(env={"HERDR_FLEET_WATCH_RESTART_CMD": "/bin/touch /tmp/marker"},
@@ -67,13 +67,14 @@ def test_request_runs_the_seam_instead_of_systemctl():
     assert ok is True and spawned == [["/bin/touch", "/tmp/marker"]] and out == []
 
 
-def test_request_uses_systemctl_when_running_under_the_unit(monkeypatch):
-    monkeypatch.setattr(selfrestart.shutil, "which", lambda name: "/usr/bin/systemctl")
+def test_request_is_true_under_the_unit_without_spawning():
+    # no seam, running under the unit: True and NOTHING is spawned - systemd restarts the
+    # unit on the exit-75; a detached systemctl would be SIGTERM'd by the unit's own
+    # cgroup cleanup before it could queue its job (review of #867)
     spawned: list[list[str]] = []
     ok = request_self_restart(env={}, spawn=spawned.append, log=lambda line: None,
                               cgroup=lambda: f"0::/user.slice/user-1000.slice/user@1000.service/{DEFAULT_UNIT}")
-    assert ok is True
-    assert spawned == [["/usr/bin/systemctl", "--user", "restart", DEFAULT_UNIT]]
+    assert ok is True and spawned == []
 
 
 def test_request_is_a_logged_noop_outside_the_unit():
@@ -85,20 +86,13 @@ def test_request_is_a_logged_noop_outside_the_unit():
     assert any("not running under" in line for line in out)
 
 
-def test_request_refuses_without_systemctl_on_path(monkeypatch):
-    monkeypatch.setattr(selfrestart.shutil, "which", lambda name: None)
-    out: list[str] = []
-    ok = request_self_restart(env={}, spawn=lambda argv: None, log=out.append,
-                              cgroup=lambda: f"0::/{DEFAULT_UNIT}")
-    assert ok is False and any("systemctl not found" in line for line in out)
-
-
-def test_request_never_raises_when_the_spawn_fails():
+def test_request_never_raises_when_the_seam_spawn_fails():
     def boom(argv: list[str]) -> None:
         raise OSError("nope")
 
     out: list[str] = []
-    ok = request_self_restart(env={}, spawn=boom, log=out.append, cgroup=lambda: f"0::/{DEFAULT_UNIT}")
+    ok = request_self_restart(env={"HERDR_FLEET_WATCH_RESTART_CMD": "/bin/echo"}, spawn=boom, log=out.append,
+                              cgroup=lambda: f"0::/{DEFAULT_UNIT}")
     assert ok is False and any("self-restart request failed" in line for line in out)
 
 
@@ -150,12 +144,13 @@ def test_loop_requests_a_self_restart_after_updating_this_hosts_herdr_engineerin
     marker, seam_path = seam(fleet, "restart.marker")
     monkeypatch.setenv(selfrestart.SEAM, str(seam_path))
     out = loop(fleet, "--enable-rollouts", "--max-passes", "1")
-    assert out.returncode == 0, out.stderr
+    # 75 = the unit's Restart=on-failure now restarts the service on the new build
+    assert out.returncode == selfrestart.RESTART_EXIT_CODE == 75, out.stderr
     assert fleet.saved()["converged"] == {HE: fleet.forge.head(HE)}
     assert fleet.installed("beast") == fleet.forge.head(HE)
     assert fleet.installed("bender") == fleet.forge.head(HE)
     assert "self-restart" in out.stdout                                   # the pass line says why it exits
-    assert wait_for(marker)                                               # the detached request went out
+    assert wait_for(marker)                                               # the seam command went out
 
 
 def test_loop_keeps_running_when_the_restart_cannot_be_requested(fleet):

@@ -2,7 +2,7 @@
 
 `once`/`run` plan and (with `--apply`) roll out serially; `loop` is the D11 service command - plan only
 without `--enable-rollouts`, and after a successful rollout that updated this host's herdr-engineering
-install it requests a self-restart so the fleet runs the build it just shipped (issue #865)."""
+install it exits 75 so the unit's Restart=on-failure restarts it on the new build (issue #865)."""
 
 from __future__ import annotations
 
@@ -264,8 +264,11 @@ def _loop(args, directory: Path, local: str | None) -> int:
             except Exception as exc:                       # a bad pass must not stop the service; the class is enough
                 outcome = f"error {type(exc).__name__}"
             print(f"pass {passes}: {outcome}", flush=True)
-            if outcome == selfrestart.RESTART_OUTCOME:   # the restart is in flight; the new build takes over
-                return 0
+            if outcome == selfrestart.RESTART_OUTCOME:
+                # the unit's Restart=on-failure now restarts the service on the new build; 75 is
+                # not in RestartPreventExitStatus=2 3. (Not 0: a clean exit would not restart, and a
+                # detached systemctl here would be killed by the unit's own cgroup cleanup.)
+                return selfrestart.RESTART_EXIT_CODE
             if args.max_passes and passes >= args.max_passes:
                 return 0
             time.sleep(service.next_sleep(report, args.interval, rng))
