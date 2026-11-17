@@ -6,6 +6,8 @@ import json
 import re
 import time
 
+import pytest
+
 from herdr_artifact_host import member_session as ms
 from herdr_artifact_host.member_api import CHUNK_BYTES, MAX_UPLOAD_BYTES
 from herdr_artifact_host.share_session import CLAIM_DOMAIN, mint_session
@@ -50,6 +52,131 @@ def test_page_config_and_static(host: Host) -> None:
         cfg["redirect_uri"] == "https://share.example/my/callback"
         and cfg["max_upload_bytes"] == 17 * 1024 * 1024
     )
+
+
+# ---------------------------------------------------------------- the member host (own origin, overlap period)
+
+MEMBER_HOST = "my.share.example"
+MEMBER_ORIGIN = f"https://{MEMBER_HOST}"
+OWN = {"public_host": "share.example", "member_host": MEMBER_HOST}
+
+
+def _on(name: str) -> dict[str, str]:
+    return {"Host": name}
+
+
+def test_member_host_serves_the_page_and_config_from_its_own_origin(migrated_dsn, tmp_path) -> None:
+    from tests.artifact_host.seed import running_host
+
+    with running_host(migrated_dsn, tmp_path, OWN) as h:
+        page = h.get("/", _on(MEMBER_HOST))
+        assert page.status == 200 and b"My artifacts" in page.body
+        csp = page.header("Content-Security-Policy") or ""
+        assert f"script-src {MEMBER_ORIGIN}/my/static/member.js" in csp
+        assert f"connect-src {MEMBER_ORIGIN}/api/member/" in csp and "https://share.example/" not in csp
+        assert page.header("Cross-Origin-Opener-Policy") == "same-origin"
+        assert h.get("/my/callback?code=x&state=y", _on(MEMBER_HOST)).status == 200
+        cfg = h.get("/api/member/config", _on(MEMBER_HOST))
+        assert cfg.json()["redirect_uri"] == f"{MEMBER_ORIGIN}/my/callback"
+        assert cfg.json()["logout_uri"] == f"{MEMBER_ORIGIN}/"
+        assert cfg.header("Cross-Origin-Opener-Policy") == "same-origin"
+        assert h.get("/my/static/member.js", _on(MEMBER_HOST + ":443")).status == 200
+
+
+def test_the_old_host_is_unchanged_while_a_member_host_is_configured(migrated_dsn, tmp_path) -> None:
+    from tests.artifact_host.seed import running_host
+
+    with running_host(migrated_dsn, tmp_path, OWN) as h:
+        page = h.get("/", _on("share.example"))
+        csp = page.header("Content-Security-Policy") or ""
+        assert page.status == 200 and "script-src https://share.example/my/static/member.js" in csp
+        assert MEMBER_HOST not in csp and page.header("Cross-Origin-Opener-Policy") is None
+        cfg = h.get("/api/member/config", _on("share.example")).json()
+        assert cfg["redirect_uri"] == "https://share.example/my/callback"
+        assert cfg["logout_uri"] == "https://share.example/"
+
+
+def test_the_member_host_never_serves_shares_or_the_agent_endpoint(migrated_dsn, tmp_path) -> None:
+    from tests.artifact_host.seed import running_host
+
+    with running_host(migrated_dsn, tmp_path, OWN) as h:
+        for path in ("/s/" + "a" * 43 + "/", "/s/static/x.js", "/s/callback", "/mcp/artifacts", "/nope"):
+            r = h.get(path, _on(MEMBER_HOST))
+            assert r.status == 404, path
+        assert h.get("/", _on("elsewhere.example")).status == 404  # an unknown host still reaches nothing
+
+
+def test_each_host_accepts_only_its_own_origin_on_writes(migrated_dsn, tmp_path) -> None:
+    from tests.artifact_host.seed import running_host
+
+    with running_host(migrated_dsn, tmp_path, OWN) as h:
+        mine = {"Origin": MEMBER_ORIGIN, "Host": MEMBER_HOST}
+        wrong = {"Origin": "https://share.example", "Host": MEMBER_HOST}
+        assert h.request("POST", "/api/member/session", wrong, b"").status == 403
+        assert h.request("POST", "/api/member/session", mine, b"").status == 401  # past the origin gate: no credentials
+        old = {"Origin": MEMBER_ORIGIN, "Host": "share.example"}
+        assert h.request("POST", "/api/member/session", old, b"").status == 403
+
+
+def test_a_member_session_works_on_the_member_host(migrated_dsn, tmp_path) -> None:
+    from tests.artifact_host.seed import running_host
+
+    with running_host(migrated_dsn, tmp_path, OWN) as h:
+        r = h.request(
+            "POST",
+            "/api/member/session",
+            {
+                "Host": MEMBER_HOST,
+                "Origin": MEMBER_ORIGIN,
+                "Authorization": f"Bearer {access('alice', groups=('local.dev',))}",
+                "X-Id-Token": ident("alice", email="alice@lab.example", nonce="n"),
+                "X-Nonce": "n",
+            },
+            b"",
+        )
+        assert r.status == 200 and r.header("Cross-Origin-Opener-Policy") == "same-origin"
+        session = r.json()["session"]
+        me = h.request("GET", "/api/member/me", {"Host": MEMBER_HOST, "Authorization": f"Member {session}"})
+        assert me.status == 200 and me.header("Set-Cookie") is None  # host-only: no cookie at all
+
+
+@pytest.mark.parametrize(
+    "hosts",
+    [
+        [("Host", MEMBER_HOST), ("Host", "share.example")],
+        [("Host", "share.example"), ("Host", MEMBER_HOST)],
+        [("Host", MEMBER_HOST.upper())],
+        [("Host", MEMBER_HOST + ".")],
+        [("Host", MEMBER_HOST + ":8443")],
+    ],
+)
+def test_a_spoofed_member_host_header_is_a_404(migrated_dsn, tmp_path, hosts) -> None:
+    from tests.artifact_host.seed import running_host
+
+    with running_host(migrated_dsn, tmp_path, OWN) as h:
+        for path in ("/", "/my/", "/api/member/config"):
+            assert h.request("GET", path, hosts).status == 404, (path, hosts)
+
+
+def test_x_forwarded_host_never_moves_the_member_origin(migrated_dsn, tmp_path) -> None:
+    from tests.artifact_host.seed import running_host
+
+    with running_host(migrated_dsn, tmp_path, OWN) as h:
+        r = h.get("/api/member/config", {"Host": MEMBER_HOST, "X-Forwarded-Host": "share.example"})
+        assert r.status == 200
+        assert r.json()["redirect_uri"] == f"{MEMBER_ORIGIN}/my/callback"
+
+
+def test_a_member_host_equal_to_the_public_or_an_mcp_host_is_refused_at_start_up(migrated_dsn, tmp_path) -> None:
+
+    from tests.artifact_host.seed import running_host
+
+    with pytest.raises(ValueError, match="member_host"):
+        with running_host(migrated_dsn, tmp_path, {**OWN, "member_host": "share.example"}):
+            pass
+    with pytest.raises(ValueError, match="member_host"):
+        with running_host(migrated_dsn, tmp_path, {**OWN, "mcp_public_hosts": (MEMBER_HOST,)}):
+            pass
 
 
 def test_unconfigured_members_are_uniform_404(migrated_dsn, tmp_path) -> None:
