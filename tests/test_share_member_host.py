@@ -252,3 +252,19 @@ def test_the_public_blocks_still_forward_the_normalised_host():
     ah_on = _md._edge(share=False, artifact_host=AH, member_host=AH_MEMBER, mcp_hosts=[])
     assert _host_lines(_md._server(share_on, HOST)) == ["$host"]
     assert _host_lines(_md._server(ah_on, AH)) == ["$host"]
+
+
+def test_the_legacy_path_without_share_artifact_host_or_member_hosts_still_deploys(env):
+    """deploy.sh runs under set -u: the member-host variables must be safe to read when nothing set them."""
+    r = _sd._ds.deploy(env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "unbound variable" not in r.stderr and "/s/probe/" not in env["log"].read_text()
+    dry = _sd._ds.deploy(env, "--dry-run")
+    assert dry.returncode == 0 and "unbound variable" not in dry.stderr, dry.stdout + dry.stderr
+
+
+def test_a_share_deploy_without_a_member_host_has_no_unbound_variable(env):
+    _set(env, None)
+    _sd._live_cert(env, MCP, _sd.SHARE_HOST)
+    r = _sd._ds.deploy(env)
+    assert r.returncode == 0 and "unbound variable" not in r.stderr, r.stdout + r.stderr
