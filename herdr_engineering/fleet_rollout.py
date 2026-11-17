@@ -31,6 +31,40 @@ CAPABILITIES = {
 }
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
+#: Everything the stable Pi Host loads once at extension load (import closure of
+#: ``src/runtime/host/entry.ts`` + ``extension.ts``, including its lazy diagnose imports,
+#: excluding runtime generations and the legacy fallback). Directories are listed whole on
+#: purpose: a Host import added later still lands in a covered directory, and an
+#: over-broad match only costs a bootstrap, never a false "current".
+HOST_CODE_PATHS = (
+    "scripts/diagnose-errors.ts",
+    "src/aps/fingerprint.ts",
+    "src/aps/types.ts",
+    "src/git",
+    "src/incidents",
+    "src/platform/eventstore",
+    "src/platform/processIncarnation.ts",
+    "src/platform/redact.ts",
+    "src/platform/runtimeDir.ts",
+    "src/runtime/host",
+    "src/runtime/isolation",
+    "src/runtime/migrations",
+    "src/runtime/rotateFile.ts",
+    "src/telemetry",
+    "src/update",
+)
+#: ``package.json`` is compared parsed, minus these keys only. The Host never reads them;
+#: everything else (``pi.extensions``, ``dependencies``, ``type``, ...) must be equal.
+PACKAGE_JSON_IGNORED_KEYS = ("devDependencies", "scripts")
+#: Git reads these before the working directory; a probe must not inherit them.
+GIT_ENV_UNSET = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
 REMOTE_EXEC_PREFIX = 'PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" exec '
 
 
@@ -226,9 +260,9 @@ class PiTransport:
             raise ValueError("native pane process identity unavailable or mismatched")
         return info
 
-    def _json(self, target, argv, *, allow_failed_receipt=False):
+    def _command(self, target, argv):
         _target(target)
-        command = (
+        return (
             argv
             if target["local"]
             else [
@@ -242,6 +276,72 @@ class PiTransport:
                 REMOTE_EXEC_PREFIX + shlex.join(argv),
             ]
         )
+
+    def _git(self, target, root, *args):
+        argv = ["env"]
+        for name in GIT_ENV_UNSET:
+            argv.extend(["-u", name])
+        argv.extend(["git", "-C", root, *args])
+        return self.runner(self._command(target, argv), capture_output=True, text=True, timeout=45)
+
+    def _package_json(self, target, root, commit):
+        shown = self._git(target, root, "show", commit + ":package.json")
+        if shown.returncode:
+            return None
+        try:
+            value = json.loads(shown.stdout)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(value, dict):
+            return None
+        return {k: v for k, v in value.items() if k not in PACKAGE_JSON_IGNORED_KEYS}
+
+    def host_code_unchanged(self, target, root, host_commit, revision):
+        """True/False when the staged release can compare Host code; None when it cannot.
+
+        Runs on the target host through the same transport as ``sessions list``. Any
+        failure to compare (missing objects, no ``.git``, git or transport error) is None.
+        """
+        if not SHA.fullmatch(str(host_commit)) or not SHA.fullmatch(str(revision)):
+            return None
+        try:
+            if self._git(target, root, "cat-file", "-e", revision + "^{commit}").returncode:
+                return None
+            if self._git(target, root, "cat-file", "-e", host_commit + "^{commit}").returncode:
+                # Releases are depth-1 clones; the old Host's own staged release, if still
+                # on this machine, supplies its commit without any network access.
+                sibling = root.rsplit("/", 1)[0] + "/" + host_commit
+                if (
+                    self._git(
+                        target,
+                        root,
+                        "fetch",
+                        "--quiet",
+                        "--no-tags",
+                        "--depth=1",
+                        sibling,
+                        host_commit,
+                    ).returncode
+                    or self._git(
+                        target, root, "cat-file", "-e", host_commit + "^{commit}"
+                    ).returncode
+                ):
+                    return None
+            code = self._git(
+                target, root, "diff", "--quiet", host_commit, revision, "--", *HOST_CODE_PATHS
+            ).returncode
+            if code != 0:
+                return {1: False}.get(code)
+            old = self._package_json(target, root, host_commit)
+            new = self._package_json(target, root, revision)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if old is None or new is None:
+            return None
+        return old == new
+
+    def _json(self, target, argv, *, allow_failed_receipt=False):
+        command = self._command(target, argv)
         result = self.runner(command, capture_output=True, text=True, timeout=45)
         try:
             reply = json.loads(result.stdout)
@@ -585,9 +685,19 @@ def _session(plan, state, transport, target, root, save):
             return
     state["loaded"] = {k: runtime.get(k) for k in ("commit", "hostCommit", "generation")}
     if runtime.get("hostCommit") != plan["revision"]:
-        state["status"] = "bootstrap_required"
-        state["error"] = "Runtime activated, but stable Host still needs the selected release"
-        return
+        # A hot reload never changes hostCommit; unchanged Host code is as good as the commit.
+        if transport.host_code_unchanged(target, root, runtime.get("hostCommit"), plan["revision"]):
+            state["hostAcceptance"] = {
+                "mode": "code-equivalence",
+                "hostCommit": runtime["hostCommit"],
+                "revision": plan["revision"],
+                "paths": list(HOST_CODE_PATHS),
+                "packageJsonIgnoredKeys": list(PACKAGE_JSON_IGNORED_KEYS),
+            }
+        else:
+            state["status"] = "bootstrap_required"
+            state["error"] = "Runtime activated, but stable Host still needs the selected release"
+            return
     if not isinstance(missions, list) or any(not isinstance(m, dict) for m in missions):
         raise ValueError("missing owned mission inventory after activation")
     outcomes = state.setdefault("missions", {})
