@@ -35,7 +35,6 @@ def _blocked(monitor, conn) -> bool:
 MESSAGE = {"kind": "message", "event_id": "e1", "role": "assistant", "text": "hello"}
 
 
-@pytest.mark.integration
 def test_readers_do_not_wait_for_a_durable_write_blocked_in_postgres(tmp_path):
     psycopg2 = pytest.importorskip("psycopg2")
     schema = tmp_path / "schema.sql"
@@ -155,7 +154,6 @@ def _msg(i):
     return {"kind": "message", "event_id": f"m{i}", "role": "assistant", "text": f"t{i}"}
 
 
-@pytest.mark.integration
 def test_sweep_does_not_let_an_ingest_interleave_with_an_eviction(journal):
     clock = [1000.0]
     store = InspectorStore(persist=journal.hook, limits={"retention_hours": 1}, clock=lambda: clock[0])
@@ -180,7 +178,6 @@ def test_sweep_does_not_let_an_ingest_interleave_with_an_eviction(journal):
     assert [e["data"]["call_id"] for e in sess.events if e["kind"] == "tool"] == ["c1"]    # one row, not a duplicate
 
 
-@pytest.mark.integration
 def test_concurrent_set_prefs_journal_in_the_order_memory_applied_them(journal):
     store = InspectorStore(persist=journal.hook)
     journal.park = lambda ev: ev.get("event_type") == "inspector.preferences" and ev["payload"]["prefs"]["retention_hours"] == 5
@@ -197,7 +194,6 @@ def test_concurrent_set_prefs_journal_in_the_order_memory_applied_them(journal):
     assert store.get_prefs()["retention_hours"] == 6
 
 
-@pytest.mark.integration
 def test_concurrent_ingest_journals_in_sequence_order(journal):
     store = InspectorStore(persist=journal.hook)
     threads = [threading.Thread(target=lambda i=i: store.ingest(SID, {"events": [_msg(i)]}), daemon=True) for i in range(12)]
@@ -209,7 +205,6 @@ def test_concurrent_ingest_journals_in_sequence_order(journal):
     assert len(in_memory) == 12 and journal.tags() == in_memory
 
 
-@pytest.mark.integration
 def test_a_failed_durable_write_leaves_the_lock_held_by_nobody_and_state_unchanged(journal):
     store = InspectorStore(persist=journal.hook)
     store.ingest(SID, {"events": [_msg(0)]})
@@ -229,7 +224,6 @@ def test_a_failed_durable_write_leaves_the_lock_held_by_nobody_and_state_unchang
     assert store.newest_seq(SID) == before[0] + 1
 
 
-@pytest.mark.integration
 def test_a_reentrant_store_lock_is_fully_released_and_restored_to_the_same_depth(journal):
     store = InspectorStore(persist=journal.hook)
     free = []
