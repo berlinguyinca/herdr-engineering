@@ -387,10 +387,21 @@ def test_more_than_one_forwarded_for_header_is_refused_over_real_http(localapi):
     svr = over_http(localapi)
     try:
         two = [("Origin", "rakazo://"), ("X-Forwarded-For", "8.8.8.8"), ("X-Forwarded-For", "100.64.0.5")]
-        assert http_call(svr, "POST", "/api/auth/open", two)[0] == 403
+        assert http_call(svr, "POST", "/api/auth/open", two)[0] == 400
         flipped = [("Origin", "rakazo://"), ("X-Forwarded-For", "100.64.0.5"), ("X-Forwarded-For", "8.8.8.8")]
-        assert http_call(svr, "POST", "/api/auth/open", flipped)[0] == 403
-        status, data = http_call(svr, "GET", WK, two[1:])
-        assert json.loads(data)["tailnet"] is False
+        assert http_call(svr, "POST", "/api/auth/open", flipped)[0] == 400
+        assert http_call(svr, "GET", WK, two[1:])[0] == 400
+    finally:
+        svr.shutdown()
+
+
+def test_repeated_forwarded_for_never_becomes_the_loopback_proxy_in_plain_open_owner_mode(localapi):
+    """Review blocker: a loopback proxy that adds its own XFF line (HAProxy forwardfor) must not let a repeated header
+    collapse to the proxy's own 127.0.0.1, which plain open_owner trusts."""
+    svr = over_http(localapi, tailnet_open_owner=False, open_owner=True)
+    try:
+        two = [("Origin", "rakazo://"), ("X-Forwarded-For", "1.2.3.4"), ("X-Forwarded-For", "5.6.7.8")]
+        status, data = http_call(svr, "POST", "/api/auth/open", two)
+        assert status == 400 and b"token" not in data
     finally:
         svr.shutdown()
