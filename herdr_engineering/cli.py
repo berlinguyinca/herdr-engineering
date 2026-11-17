@@ -4287,8 +4287,8 @@ def _cmd_cp_checkpoint(args) -> int:
     import asyncio
 
     from .control_plane.db import Migrator
-    from .control_plane.projection_refresh import refresh_checkpoint
-    from .control_plane.projection_store import CheckpointInvalid, ProjectionStore
+    from .control_plane.projection_refresh import _safe_message, refresh_checkpoint
+    from .control_plane.projection_store import ProjectionStore
 
     stage = 'configuration'
     try:
@@ -4319,9 +4319,9 @@ def _cmd_cp_checkpoint(args) -> int:
                                     lock_wait=max(0.0, getattr(args, "lock_wait", 0.0) or 0.0))
     except (Exception, SystemExit) as exc:
         error = {"ok": False, "error": type(exc).__name__, "stage": stage}
-        if isinstance(exc, CheckpointInvalid):
-            # Only our own static validation messages are safe to surface.
-            error['reason'] = str(exc)
+        if isinstance(exc, ValueError):
+            # CheckpointInvalid is a ValueError; URLs (DSNs) are redacted and the text capped.
+            error['reason'] = _safe_message(exc)
         _print_json(error)
         return 1
     _print_json({"ok": True, **result})

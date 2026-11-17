@@ -48,9 +48,15 @@ two ways:
   recreation replaces the worker container anyway.
 
 When a stored candidate is rejected, the server log line
-`projection checkpoint candidate rejected: CheckpointInvalid: <reason>` now carries
+`projection checkpoint candidate rejected: CheckpointInvalid: <reason>` carries
 the validation reason (at most 200 printable characters; only our own
-`CheckpointInvalid` messages, never other exception text, DSNs or row data).
+`CheckpointInvalid` messages).
+
+`herdr-eng control-plane checkpoint` prints `reason` for any `ValueError`
+(`CheckpointInvalid` included), and the worker's refresh warning and the
+`projection restore rejected; complete replay required` warning carry the same
+text. It is redacted (anything URL-shaped, such as a DSN, becomes `<url>`) and cut
+at 500 characters. Other exception types still print only their name and stage.
 
 The background worker refreshes on its own connection and thread, one build at a
 time. A database advisory lock excludes overlapping materializers. Web startup
