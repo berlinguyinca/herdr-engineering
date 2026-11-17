@@ -1068,7 +1068,36 @@ def resolve_token(args, env) -> tuple[str, bool]:
     return env.get("HERDR_AGENT_OPS_TOKEN") or env.get("HERDR_COLLAB_TOKEN", ""), False
 
 
+def dismiss(args) -> int:
+    """``agent-ops dismiss <agent_id | --session ID> [--reason TEXT]``: drop an agent from the map (operator key)."""
+    if bool(args.target) == bool(args.session):
+        print("agent-ops dismiss: give an agent id or --session ID (not both)", file=sys.stderr)
+        return 2
+    base = args.url or os.environ.get("HERDR_CP_URL", "http://127.0.0.1:8080")
+    client = Client(base, args.api_key or os.environ.get("HERDR_CP_API_KEY", ""))
+    body = {("session_id" if args.session else "agent_id"): args.session or args.target,
+            **({"reason": args.reason} if args.reason else {})}
+    conn, prefix = client._conn()
+    try:
+        conn.request("POST", f"{prefix}/api/v1/agent-ops/dismiss", body=json.dumps(body),
+                     headers={**client.headers, "Content-Type": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read()
+    except (OSError, http.client.HTTPException) as exc:
+        print(f"agent-ops dismiss: {clean(exc, 60)}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    if resp.status != 200:
+        print(f"agent-ops dismiss: HTTP {resp.status}", file=sys.stderr)
+        return 1
+    print(f"dismissed {json.loads(raw).get('dismissed')}")
+    return 0
+
+
 def run(args) -> int:
+    if getattr(args, "action", None) == "dismiss":
+        return dismiss(args)
     base = args.url or os.environ.get("HERDR_CP_URL", "http://127.0.0.1:8080")
     token, from_argv = resolve_token(args, os.environ)
     if from_argv:
@@ -1162,6 +1191,10 @@ def _safe_replay(client: Client, cursor: str, previous: dict | None) -> dict | N
 
 def register(sub) -> None:
     p = sub.add_parser("agent-ops", help="terminal Agent Operations map (live, replay, inspect) for a Herdr pane")
+    p.add_argument("action", nargs="?", choices=["dismiss"], help="dismiss: drop an agent from the map (operator key)")
+    p.add_argument("target", nargs="?", help="agent id to dismiss")
+    p.add_argument("--session", help="dismiss this session id instead of an agent id")
+    p.add_argument("--reason", help="short note stored with the dismissal (metadata only)")
     p.add_argument("--url", help="control-plane base URL (default $HERDR_CP_URL or http://127.0.0.1:8080)")
     p.add_argument("--api-key", help="viewer API key (default $HERDR_CP_API_KEY)")
     p.add_argument("--token", help="collab bearer token for room visibility. WARNING: visible to every local user in the "

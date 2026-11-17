@@ -150,10 +150,28 @@ Pi agents remains coverage-unverified rather than silently succeeding.
 - `activation_unverified`: Pi acknowledged reload but still reports old or pending
   code. Inspect the saved activation receipt and Pi host diagnostics.
 - `bootstrap_required`: a session lacks maintenance capabilities, or its stable Host
-  commit differs from the target. Runtime hot reload cannot replace that stable
+  code differs from the target. Runtime hot reload cannot replace that stable
   Host. Preserve its conversation and work, then perform a controlled extension or
   process bootstrap before a new reconciliation plan. This command intentionally
   provides no forced kill/restart fallback.
+
+  A hot reload never changes the session's reported `hostCommit`, so a differing
+  commit alone does not prove stale Host code. When `hostCommit` differs from the
+  target, the coordinator runs `git diff --quiet <hostCommit> <revision> -- <Host paths>`
+  in the staged release on the target host (same transport as `sessions list`, with
+  `GIT_DIR`, `GIT_WORK_TREE` and `GIT_COMMON_DIR` unset). No change means the Host is
+  accepted by code equivalence and the session continues; its state records
+  `hostAcceptance` with `mode: "code-equivalence"`, both commits and the paths
+  compared. Any change, or any inability to compare (release without `.git`, either
+  commit unavailable, git or transport error), keeps `bootstrap_required`. The Host
+  paths are the fixed list `HOST_CODE_PATHS` in `herdr_engineering/fleet_rollout.py`
+  (`src/runtime/host/` and the rest of the stable Host's import closure). `package.json`
+  is compared parsed through `git show`, ignoring only `scripts` and `devDependencies`
+  (the Host never reads them); `hostAcceptance.packageJsonIgnoredKeys` records that.
+  An unreadable or unparsable `package.json` keeps `bootstrap_required`. Staged releases are depth-1 clones, so a missing old `hostCommit` is
+  fetched without network access from the sibling release
+  `pi/releases/<hostCommit>` when that directory still exists; otherwise the
+  session stays `bootstrap_required`.
 - `blocked`: identity, protocol, revision, or coverage evidence was rejected.
   Inspect the per-host error and per-session receipt. An uncertain request is never
   replaced with a fresh resume against a different mission revision.
@@ -188,6 +206,27 @@ blocked with that reason in `error`/`coverageErrors` and keeps the plan from com
 session is terminal for the runner and keeps its refusal in `error`; it vanishing from the native
 inventory is not a blocker. The command exits 2 while `stillBlocked` sessions or `blockedHosts` remain. Run `apply` first on plans written before this change, so sessions carry the typed `blockReason` and hosts carry `hostLevelError`.
 
+## Unresponsive and exited sessions
+
+`sessions list` waits a bounded time per session. On a loaded controller every live session can
+miss its reply in the same pass (rows come back `reachable:false`, `error:"session_unresponsive"`),
+which says nothing about the sessions. A session with no reachable row is classified by its rows:
+
+| Rows for the session | Outcome |
+| --- | --- |
+| 2 or more `reachable:true` | `blocked` (`session identity missing or ambiguous`), unchanged |
+| 0 reachable, at least one unreachable with a non-terminal error (`session_unresponsive`, a timeout, no error) | transient: re-list up to twice in the pass (0.5 s, then 1 s backoff); if still unreachable the session **keeps its previous status and error** and is retried next pass. A `complete` session stays `complete`; a new one becomes `pending`. `lastUnreachableAt` and `note` record the miss. Never blocks. |
+| every row `session_process_gone`, or no rows and the session left the native inventory | `ended`: the process exited and there is nothing to update. |
+
+`ended` is terminal and non-failing, like `retired`: it does not block the host, does not hold
+the rollout open, and does not consume the online stall budget. It is never a success. The host
+lists such sessions in `endedSessions`, and the session keeps `endedAt` and `note`, so a report
+can tell "updated" from "exited". If the same conversation answers again (possibly in a new process on an old runtime), the
+next pass restarts it as a fresh `discovered` session: prepare, reload and resume receipts,
+`prepared`, `loaded`, `missions` and `hostAcceptance` from the old process are discarded and
+only `previousIncarnations` (pid, instanceId, endedAt, last status) is kept for the report. A discovered session that is unreachable (not exited) and
+absent from the native inventory is treated as transient, not as a missing-session blocker.
+
 ## Validation coverage
 
 `tests/test_fleet_rollout.py` exercises real durable state and the production JSON
@@ -197,7 +236,8 @@ operator pause, busy preparation, duplicate/stale identities, missing native
 coverage, corrupt receipts, progress regression and expired waits. Identity-less
 registrations are covered for the refusal, operator retirement, the evidence kept in the
 report, ambiguous identity refusing to be retired, and a retired session rejoining when its
-identity resolves. Runner tests
+identity resolves. Transient unresponsive rows, ambiguous rows, exited sessions and the in-pass
+retry are covered with a subprocess runner that returns different lists on successive calls. Runner tests
 cover reconnect, durable restart/backoff, interruption, duplicate controllers and
 explicit operator-attention stops. These tests do
 not constitute a live multi-workstation rollout; validate a canary before fleet

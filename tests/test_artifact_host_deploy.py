@@ -268,6 +268,38 @@ def test_a_successful_deploy_probes_the_hosts_own_name(env) -> None:
     assert f"curl https://{HOST}/s/probe/" in env["log"].read_text()
 
 
+MEMBER_HOST = "my.artifacts.example.test"
+
+
+def test_the_certificate_must_name_the_member_host_when_one_is_set(env) -> None:
+    _set(env, _section(member_host=MEMBER_HOST))
+    _cert(env, MCP_HOST, HOST)  # names the artifact host but not the member host
+    r = _ds.deploy(env)
+    assert r.returncode != 0
+    assert MEMBER_HOST in r.stderr and "certificate" in r.stderr
+    _no_secrets(r.stdout + r.stderr)
+    assert not any(" run --rm artifact-host-migrate" in ln for ln in env["log"].read_text().splitlines())
+
+
+def test_a_member_host_deploy_keeps_checking_the_cert_and_probes_the_member_origin(env) -> None:
+    _set(env, _section(member_host=MEMBER_HOST))
+    _cert(env, MCP_HOST, HOST, MEMBER_HOST)
+    r = _ds.deploy(env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    unit = (env["home"] / ".config/systemd/user/herdr-collab-sync.service").read_text()
+    assert f"--member-host {MEMBER_HOST}" in unit
+    assert f"curl https://{MEMBER_HOST}/s/probe/" in env["log"].read_text()
+
+
+def test_without_a_member_host_the_deploy_neither_checks_nor_probes_one(env) -> None:
+    _set(env, _section())
+    _cert(env, MCP_HOST, HOST)
+    r = _ds.deploy(env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    unit = (env["home"] / ".config/systemd/user/herdr-collab-sync.service").read_text()
+    assert "--member-host" not in unit and "my." not in env["log"].read_text()
+
+
 @pytest.mark.parametrize(
     "name",
     [

@@ -12,6 +12,15 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Security hardening: tagged devices and this host's own addresses are refused; optional `tailnet_open_owner_users` allowlist; IPv4-mapped proxies and peers are unwrapped everywhere; whois decides whenever `tailnet_open_owner` is on (even with `open_owner`); repeated `X-Forwarded-For` headers are refused; whois errors cached 2 s with single-flight lookups; `bridge_url` only for tailnet callers.
 - Docs: `docs/operations/shepherd-discovery.md`, `docs/operations/shepherd-onboarding-contract.md` (app-side probe order).
 
+### Fix: `/api/auth/open` no longer waits on the audit write
+
+- The open-owner sign-in queued its audit entry synchronously: `audit_record` holds the assistant store lock across the durable write and a full snapshot persist, so any contention there (a stall of 70.6 s was seen on 2026-11-17 against a normal 1.3 s) stalled the phone's first launch past its 8 s timeout. The entry now goes to a bounded background queue (256, drop-and-log on overflow, flushed on `RakazoBridge.close`); password sign-in and sign-out still audit inline. Rate limit and tailnet/origin checks are unchanged.
+- The slow-call line for `auth/open` (and password sign-in) now ends with per-phase timings, e.g. `auth/open took 1275 ms (status 200, mint 1200 ms, audit 0 ms)`.
+
+### Fix: `control-plane checkpoint` names the reason for any ValueError
+
+- The CLI JSON error carried a `reason` only for `CheckpointInvalid`; any other `ValueError` (for example `invalid projection checkpoint schema`) printed just its type and stage, so a failing deploy prewarm was undiagnosable. It now prints `reason` for a `CheckpointInvalid` at any stage and for any other `ValueError` once the connection is open (migration, index preparation, materialization), redacted through the worker's `_safe_message` (URLs and DSNs become `<url>`, at most 500 characters). The `projection restore rejected; complete replay required` warning carries the same safe message. Exit code and `ok: false` are unchanged; `configuration` and `database_connection` stage errors (a malformed DSN can be quoted without `://`) and other exception types still print only name and stage.
+
 ### Fix: phone Assistants tab lists only online agent bots
 
 - `bots/list` (and the bootstrap payload built from it) now returns only collab agents that are online; stale tokenless-join test agents no longer flood the tab. Nothing is revoked or deleted: an offline agent still resolves through `bots/get`, `threads/get` and `threads/send` by id. A separate list of offline agents is not exposed (the archived list means disabled assistants and `bots/restore` cannot restore an agent).
@@ -162,6 +171,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Test fix: cargo target-storage CLI test no longer depends on ambient CARGO_TARGET_DIR
 
 - `test_target_management_cli_enable_and_migration_safety` inherited the host environment; a CI agent exporting `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR` made the migrator report "Explicit target setting remains authoritative" instead of "same filesystem". The test now drops those two variables from the child environment and separately asserts the explicit-override verdict. No production code changed.
+
+### Rakazo default assistant: review fixes
+- Bots: every bot-meta read-modify-write (archive, restore, set-computer, mark-unread, sections, default flag) runs under one reentrant lock, so clearing the default can no longer drop `archivedAt`. Archiving clears `isDefault`; `bots/update` with `isDefault: true` on an archived bot returns 409. Tests: `tests/control_plane/test_rakazo_bots.py`.
 
 ### Inspector snapshot boot: used on the complete-replay fallback, strictly validated
 

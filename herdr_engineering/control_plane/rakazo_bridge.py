@@ -20,6 +20,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import queue
 import re
 import secrets
 import socket
@@ -743,6 +744,9 @@ class RakazoBridge:
     """Dispatches ``/rpc/*`` and ``/api/auth/*``. ``handle`` returns a :class:`BridgeResponse`, or None for a path that is
     not the bridge's (the caller then answers exactly as it did before the bridge existed)."""
 
+    AUDIT_QUEUE_MAX = 256
+    _phase = threading.local()                        # per-request phase timings, read by handle()
+
     def __init__(self, config: dict[str, Any], assistant, *, version: str = "0", persistence=None, space_persistence=None,
                  prefs_persistence=None, collab=None, artifacts_fn=None, cognito_signin=None, push_persistence=None,
                  push_sender=None, whois: TailscaleWhois | None = None,
@@ -768,6 +772,9 @@ class RakazoBridge:
         self._whois_flights: dict[str, threading.Lock] = {}
         self._open_lock = threading.Lock()
         self._open_last: dict[str, float] = {}
+        self._audit_q: queue.Queue = queue.Queue(maxsize=self.AUDIT_QUEUE_MAX)
+        self._audit_worker: threading.Thread | None = None
+        self._audit_start = threading.Lock()
         self._by_principal = {a.principal_id: a for a in self.accounts}
         self._by_id = {a.account_id: a for a in self.accounts}
         self._cognito_users: dict[str, str] = {}      # account id -> Cognito username, for pool members who signed in
@@ -879,6 +886,7 @@ class RakazoBridge:
 
     def close(self) -> None:
         self._closed.set()
+        self._stop_audit_worker()
         try:
             self.terminal.close_all()
         except Exception as exc:  # noqa: BLE001
@@ -926,13 +934,16 @@ class RakazoBridge:
         """``headers`` has lower-case names; ``peer`` is the TCP peer address. Never raises. Slow calls are logged by
         procedure name and duration only (a stream's duration is just its setup), so a slow screen can be found."""
         started = time.monotonic()
+        self._phase.timings = None
         out = self._handle(method, path, headers, body, peer)
         if out is not None:
             ms = (time.monotonic() - started) * 1000
             if ms >= SLOW_CALL_MS:
                 name = re.sub(r"[^A-Za-z0-9/_-]", "", path.split("?", 1)[0].split("/", 2)[-1])[:60]
+                phases = getattr(self._phase, "timings", None)
+                detail = "".join(f", {k} {v:.0f} ms" for k, v in phases.items()) if phases else ""
                 (log.warning if ms >= VERY_SLOW_CALL_MS else log.info)(
-                    "rakazo bridge: %s took %.0f ms (status %s)", name, ms, getattr(out, "status", "?"))
+                    "rakazo bridge: %s took %.0f ms (status %s%s)", name, ms, getattr(out, "status", "?"), detail)
         return out
 
     def _handle(self, method: str, path: str, headers: dict[str, str], body: bytes, peer: str) -> BridgeResponse | None:
@@ -1140,11 +1151,17 @@ class RakazoBridge:
         return self._finish_sign_in(owner, ip, "rakazo.bridge.open_owner")
 
     def _finish_sign_in(self, matched: Account, ip: str, action: str = "rakazo.bridge.sign_in") -> BridgeResponse:
+        t0 = time.monotonic()
         try:
             token = self.tokens.mint(matched.account_id, ip)
         except TokenStoreError:
             raise BridgeError(500, "INTERNAL_SERVER_ERROR", "Could not start a session. Try again later.") from None
-        self._audit(matched, action)
+        t1 = time.monotonic()
+        if action == "rakazo.bridge.open_owner":
+            self._audit_later(matched, action)            # the first launch must not wait on the audit store
+        else:
+            self._audit(matched, action)
+        self._phase.timings = {"mint": (t1 - t0) * 1000, "audit": (time.monotonic() - t1) * 1000}
         return _json_response(200, {"token": token, "redirect": False,
                                     "user": {"id": matched.principal_id, "email": matched.email,
                                              "name": matched.email.split("@", 1)[0]}},
@@ -1178,6 +1195,36 @@ class RakazoBridge:
                                         subject_id=subject or account.account_id, detail=detail)
         except Exception as exc:  # noqa: BLE001
             log.warning("rakazo bridge: could not write the audit entry %s (%s)", action, type(exc).__name__)
+
+    def _audit_later(self, account: Account, action: str) -> None:
+        """Queue an audit entry for a background writer. Bounded: when full the entry is dropped and logged, so a stuck
+        audit store can neither block a sign-in nor grow memory."""
+        with self._audit_start:
+            if self._audit_worker is None and not self._closed.is_set():
+                self._audit_worker = threading.Thread(target=self._audit_loop, name="rakazo-audit", daemon=True)
+                self._audit_worker.start()
+        try:
+            self._audit_q.put_nowait((account, action))
+        except queue.Full:
+            log.warning("rakazo bridge: audit queue full; dropped the audit entry %s", action)
+
+    def _audit_loop(self) -> None:
+        while True:
+            item = self._audit_q.get()
+            if item is None:
+                return
+            self._audit(*item)
+
+    def _stop_audit_worker(self) -> None:
+        with self._audit_start:
+            worker = self._audit_worker
+        if worker is None:
+            return
+        try:
+            self._audit_q.put(None, timeout=1)            # after everything already queued
+        except queue.Full:
+            return
+        worker.join(5)
 
     # rpc -------------------------------------------------------------------------------------------------------
     def _rpc(self, method: str, proc: str, headers, body: bytes, ip: str) -> BridgeResponse:

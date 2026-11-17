@@ -31,6 +31,40 @@ CAPABILITIES = {
 }
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
+#: Everything the stable Pi Host loads once at extension load (import closure of
+#: ``src/runtime/host/entry.ts`` + ``extension.ts``, including its lazy diagnose imports,
+#: excluding runtime generations and the legacy fallback). Directories are listed whole on
+#: purpose: a Host import added later still lands in a covered directory, and an
+#: over-broad match only costs a bootstrap, never a false "current".
+HOST_CODE_PATHS = (
+    "scripts/diagnose-errors.ts",
+    "src/aps/fingerprint.ts",
+    "src/aps/types.ts",
+    "src/git",
+    "src/incidents",
+    "src/platform/eventstore",
+    "src/platform/processIncarnation.ts",
+    "src/platform/redact.ts",
+    "src/platform/runtimeDir.ts",
+    "src/runtime/host",
+    "src/runtime/isolation",
+    "src/runtime/migrations",
+    "src/runtime/rotateFile.ts",
+    "src/telemetry",
+    "src/update",
+)
+#: ``package.json`` is compared parsed, minus these keys only. The Host never reads them;
+#: everything else (``pi.extensions``, ``dependencies``, ``type``, ...) must be equal.
+PACKAGE_JSON_IGNORED_KEYS = ("devDependencies", "scripts")
+#: Git reads these before the working directory; a probe must not inherit them.
+GIT_ENV_UNSET = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
 REMOTE_EXEC_PREFIX = 'PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" exec '
 
 
@@ -226,9 +260,9 @@ class PiTransport:
             raise ValueError("native pane process identity unavailable or mismatched")
         return info
 
-    def _json(self, target, argv, *, allow_failed_receipt=False):
+    def _command(self, target, argv):
         _target(target)
-        command = (
+        return (
             argv
             if target["local"]
             else [
@@ -242,6 +276,72 @@ class PiTransport:
                 REMOTE_EXEC_PREFIX + shlex.join(argv),
             ]
         )
+
+    def _git(self, target, root, *args):
+        argv = ["env"]
+        for name in GIT_ENV_UNSET:
+            argv.extend(["-u", name])
+        argv.extend(["git", "-C", root, *args])
+        return self.runner(self._command(target, argv), capture_output=True, text=True, timeout=45)
+
+    def _package_json(self, target, root, commit):
+        shown = self._git(target, root, "show", commit + ":package.json")
+        if shown.returncode:
+            return None
+        try:
+            value = json.loads(shown.stdout)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(value, dict):
+            return None
+        return {k: v for k, v in value.items() if k not in PACKAGE_JSON_IGNORED_KEYS}
+
+    def host_code_unchanged(self, target, root, host_commit, revision):
+        """True/False when the staged release can compare Host code; None when it cannot.
+
+        Runs on the target host through the same transport as ``sessions list``. Any
+        failure to compare (missing objects, no ``.git``, git or transport error) is None.
+        """
+        if not SHA.fullmatch(str(host_commit)) or not SHA.fullmatch(str(revision)):
+            return None
+        try:
+            if self._git(target, root, "cat-file", "-e", revision + "^{commit}").returncode:
+                return None
+            if self._git(target, root, "cat-file", "-e", host_commit + "^{commit}").returncode:
+                # Releases are depth-1 clones; the old Host's own staged release, if still
+                # on this machine, supplies its commit without any network access.
+                sibling = root.rsplit("/", 1)[0] + "/" + host_commit
+                if (
+                    self._git(
+                        target,
+                        root,
+                        "fetch",
+                        "--quiet",
+                        "--no-tags",
+                        "--depth=1",
+                        sibling,
+                        host_commit,
+                    ).returncode
+                    or self._git(
+                        target, root, "cat-file", "-e", host_commit + "^{commit}"
+                    ).returncode
+                ):
+                    return None
+            code = self._git(
+                target, root, "diff", "--quiet", host_commit, revision, "--", *HOST_CODE_PATHS
+            ).returncode
+            if code != 0:
+                return {1: False}.get(code)
+            old = self._package_json(target, root, host_commit)
+            new = self._package_json(target, root, revision)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if old is None or new is None:
+            return None
+        return old == new
+
+    def _json(self, target, argv, *, allow_failed_receipt=False):
+        command = self._command(target, argv)
         result = self.runner(command, capture_output=True, text=True, timeout=45)
         try:
             reply = json.loads(result.stdout)
@@ -418,6 +518,36 @@ def _foreground_identity(transport, target, agent, rows):
     }
 
 
+class TransientlyUnreachable(ValueError):
+    """No registration for the session answered, but none reported a terminal failure.
+
+    Pi's `sessions list` waits a bounded time per session, so on a loaded host every live session
+    can miss its reply in the same pass. That says nothing about the session itself, so the
+    rollout keeps the session's previous status instead of blocking it.
+    """
+
+
+class SessionGone(ValueError):
+    """Every registration for the session reports its process exited (`session_process_gone`)."""
+
+
+#: Error the Pi control socket reports when a registration's process no longer exists.
+_PROCESS_GONE = "session_process_gone"
+#: Pause before each in-pass re-list when a session is transiently unreachable. The number of
+#: entries is the number of retries.
+_UNREACHABLE_BACKOFF_SECONDS = (0.5, 1.0)
+
+
+def _unreachable_kind(rows, session_id):
+    """Classify a session with no reachable row: "gone", "transient" or "none" (no rows)."""
+    mine = [r for r in rows if r["descriptor"].get("sessionId") == session_id]
+    if not mine:
+        return "none"
+    if all(r.get("error") == _PROCESS_GONE for r in mine):
+        return "gone"
+    return "transient"
+
+
 def _rows(transport, target, root):
     rows = transport.sessions(target, root)
     if not isinstance(rows, list) or any(
@@ -433,6 +563,21 @@ def _live(rows, session_id, pid=None):
         for r in rows
         if r["descriptor"].get("sessionId") == session_id and r.get("reachable") is True
     ]
+    if not matches:
+        kind = _unreachable_kind(rows, session_id)
+        if kind == "gone":
+            raise SessionGone(f"session {session_id} process exited ({_PROCESS_GONE})")
+        if kind == "transient":
+            errors = sorted(
+                {
+                    str(r.get("error"))
+                    for r in rows
+                    if r["descriptor"].get("sessionId") == session_id
+                }
+            )
+            raise TransientlyUnreachable(
+                f"session {session_id} did not answer the list ({', '.join(errors)[:200]})"
+            )
     if len(matches) != 1:
         raise ValueError("session identity missing or ambiguous")
     row = matches[0]
@@ -454,6 +599,19 @@ def _live(rows, session_id, pid=None):
     if reply.get("ok") is not True or not isinstance(reply.get("data"), dict):
         raise ValueError("invalid session status reply")
     return descriptor, reply["data"]
+
+
+def _live_with_retry(transport, target, root, session_id, pid=None, rows=None):
+    """`_live`, re-listing with a short backoff while the session is only transiently unreachable."""
+    attempts = len(_UNREACHABLE_BACKOFF_SECONDS)
+    for attempt in range(attempts + 1):
+        current = rows if attempt == 0 and rows is not None else _rows(transport, target, root)
+        try:
+            return _live(current, session_id, pid)
+        except TransientlyUnreachable:
+            if attempt == attempts:
+                raise
+            time.sleep(_UNREACHABLE_BACKOFF_SECONDS[attempt])
 
 
 def _operation(plan, state, key, action, fields, transport, target, root, save):
@@ -531,7 +689,7 @@ def _receipt_reason(receipt):
 
 
 def _session(plan, state, transport, target, root, save):
-    descriptor, data = _live(_rows(transport, target, root), state["sessionId"], state["pid"])
+    descriptor, data = _live_with_retry(transport, target, root, state["sessionId"], state["pid"])
     state["instanceId"] = descriptor["instanceId"]
     runtime = data.get("runtime") or {}
     if not CAPABILITIES.issubset(set(runtime.get("capabilities") or [])):
@@ -576,7 +734,9 @@ def _session(plan, state, transport, target, root, save):
                 state["status"] = "pending" if receipt["status"] == "running" else "blocked"
                 state["error"] = _receipt_reason(receipt)
             return
-        descriptor, data = _live(_rows(transport, target, root), state["sessionId"], state["pid"])
+        descriptor, data = _live_with_retry(
+            transport, target, root, state["sessionId"], state["pid"]
+        )
         state["instanceId"] = descriptor["instanceId"]
         runtime = data.get("runtime") or {}
         missions = data.get("missions")
@@ -585,9 +745,19 @@ def _session(plan, state, transport, target, root, save):
             return
     state["loaded"] = {k: runtime.get(k) for k in ("commit", "hostCommit", "generation")}
     if runtime.get("hostCommit") != plan["revision"]:
-        state["status"] = "bootstrap_required"
-        state["error"] = "Runtime activated, but stable Host still needs the selected release"
-        return
+        # A hot reload never changes hostCommit; unchanged Host code is as good as the commit.
+        if transport.host_code_unchanged(target, root, runtime.get("hostCommit"), plan["revision"]):
+            state["hostAcceptance"] = {
+                "mode": "code-equivalence",
+                "hostCommit": runtime["hostCommit"],
+                "revision": plan["revision"],
+                "paths": list(HOST_CODE_PATHS),
+                "packageJsonIgnoredKeys": list(PACKAGE_JSON_IGNORED_KEYS),
+            }
+        else:
+            state["status"] = "bootstrap_required"
+            state["error"] = "Runtime activated, but stable Host still needs the selected release"
+            return
     if not isinstance(missions, list) or any(not isinstance(m, dict) for m in missions):
         raise ValueError("missing owned mission inventory after activation")
     outcomes = state.setdefault("missions", {})
@@ -696,6 +866,22 @@ def _session(plan, state, transport, target, root, save):
         )
 
 
+def _note_unreachable(state, note):
+    state["lastUnreachableAt"] = datetime.now(UTC).isoformat()
+    state["note"] = note[:500]
+
+
+def _mark_ended(state, note):
+    """The process exited: terminal and non-failing, but never a success."""
+    state.pop("error", None)
+    if state.get("status") == "ended":
+        # Later passes keep the status it exited from and when it exited.
+        state["note"] = note[:500]
+        return
+    state["lastStatus"] = state.get("status")
+    state.update(status="ended", endedAt=datetime.now(UTC).isoformat(), note=note[:500])
+
+
 def apply_rollout(store, rollout_id, *, transport=None, stage=None):
     transport = transport or PiTransport()
     stage = stage or fleet.stage_pi_runtime
@@ -773,12 +959,27 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                     raise ValueError("no native Pi sessions; expected coverage unverified")
                 # A retired husk is expected to leave the native inventory; its absence is the
                 # settled end state, not a fresh blocker no later pass could ever clear (#798 review).
-                retired_ids = {
+                # An ended session (process exited) is likewise settled.
+                settled_ids = {
                     session_id
                     for session_id, state in host_state["sessions"].items()
-                    if state.get("status") == "retired"
+                    if state.get("status") in ("retired", "ended")
                 }
-                if set(host_state["sessions"]) - set(identities) - retired_ids:
+                missing_ids = sorted(set(host_state["sessions"]) - set(identities) - settled_ids)
+                lost = False
+                for session_id in missing_ids:
+                    state = host_state["sessions"][session_id]
+                    if any(
+                        r.get("reachable") is True
+                        and r["descriptor"].get("sessionId") == session_id
+                        for r in rows
+                    ):
+                        lost = True
+                    elif _unreachable_kind(rows, session_id) == "transient":
+                        _note_unreachable(state, f"session {session_id} did not answer the list")
+                    else:
+                        _mark_ended(state, "gone from the native inventory and the session list")
+                if lost:
                     coverage_errors.append(
                         {"error": "previously discovered session is missing from native inventory"}
                     )
@@ -791,14 +992,38 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                         session_id,
                         {"sessionId": session_id, "native": agent, "status": "discovered"},
                     )
+                    previous_error = state.get("error")
                     if state.get("status") != "retired":
                         # A retired session keeps the refusal that justified retiring it.
                         state.pop("error", None)
                         state.pop("blockReason", None)
+                        state.pop("note", None)
                     if identity_proof is not None:
                         state["identityProof"] = identity_proof
                     try:
-                        descriptor, _ = _live(rows, session_id)
+                        descriptor, _ = _live_with_retry(
+                            transport, target, root, session_id, rows=rows
+                        )
+                        if state.get("status") == "ended":
+                            # The conversation answers again, possibly in a new process on an
+                            # old runtime. Nothing per-process carries over (receipts, prepared,
+                            # loaded, missions, hostAcceptance); only the history does.
+                            history = [
+                                *state.get("previousIncarnations", []),
+                                {
+                                    key: state.get(key)
+                                    for key in ("pid", "instanceId", "endedAt", "lastStatus")
+                                },
+                            ]
+                            keep = ("sessionId", "native", "identityProof")
+                            for key in [k for k in state if k not in keep]:
+                                del state[key]
+                            state.update(
+                                status="discovered",
+                                pid=descriptor["pid"],
+                                instanceId=descriptor["instanceId"],
+                                previousIncarnations=history,
+                            )
                         if "pid" not in state or state.get("status") == "retired":
                             # `_live` only returns a descriptor with a real identity, so for a
                             # retired husk these replace the stale values.
@@ -820,6 +1045,16 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                     except (ConnectionError, OSError, subprocess.SubprocessError) as exc:
                         state.pop("blockReason", None)
                         state.update(status="pending", error=str(exc)[:500])
+                    except SessionGone as exc:
+                        state.pop("blockReason", None)
+                        _mark_ended(state, str(exc))
+                    except TransientlyUnreachable as exc:
+                        # Never block on a missed reply: keep the previous status and error.
+                        if previous_error is not None and state.get("status") != "retired":
+                            state["error"] = previous_error
+                        if state.get("status") == "discovered":
+                            state["status"] = "pending"
+                        _note_unreachable(state, str(exc))
                     except MissingInstanceIdentity as exc:
                         # A retired registration stays retired and stays out of the blocking set:
                         # the operator settled it, and the evidence stays in the report.
@@ -864,10 +1099,13 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                     else "complete"
                     if host_state["sessions"]
                     and all(
-                        s["status"] in ("complete", "retired")
+                        s["status"] in ("complete", "retired", "ended")
                         for s in host_state["sessions"].values()
                     )
                     else "pending"
+                )
+                host_state["endedSessions"] = sorted(
+                    sid for sid, s in host_state["sessions"].items() if s.get("status") == "ended"
                 )
                 if host_level_errors:
                     host_state["hostLevelError"] = "; ".join(host_level_errors)[:1000]
@@ -972,7 +1210,10 @@ def retire_identityless(store, rollout_id, *, settled_by="operator"):
                     if blocking or host_level
                     else "complete"
                     if sessions
-                    and all(s.get("status") in ("complete", "retired") for s in sessions.values())
+                    and all(
+                        s.get("status") in ("complete", "retired", "ended")
+                        for s in sessions.values()
+                    )
                     else "pending"
                 )
         plan["status"] = (
@@ -1028,8 +1269,9 @@ def _automatic_blocker(plan):
         if host_state.get("error") and not _offline_failure(host_state):
             return f"{host}: {host_state['error']}"
         for session_id, session in host_state["sessions"].items():
-            if session["status"] == "retired":
-                # Settled by the operator: terminal for the runner, evidence kept in the report.
+            if session["status"] in ("retired", "ended"):
+                # Settled (by the operator, or the process exited): terminal for the runner,
+                # evidence kept in the report.
                 continue
             if session["status"] not in ("complete", "pending", "awaiting_progress", "discovered"):
                 return f"{host}/{session_id}: {session['status']}: {session.get('error', 'operator attention required')}"
@@ -1072,7 +1314,7 @@ def _online_stall_budget(plan, previous, limit):
             continue
         for session_id, session in host_state["sessions"].items():
             key = host + "/" + session_id
-            if session["status"] in ("complete", "retired"):
+            if session["status"] in ("complete", "retired", "ended"):
                 budgets.pop(key, None)
                 continue
             if _offline_failure(session):

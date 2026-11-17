@@ -4283,11 +4283,14 @@ def _assistant_worker_install_hooks(args) -> int:
     return 0
 
 
+_CP_CHECKPOINT_REASON_STAGES = frozenset({'migration', 'index_preparation', 'materialization'})
+
+
 def _cmd_cp_checkpoint(args) -> int:
     import asyncio
 
     from .control_plane.db import Migrator
-    from .control_plane.projection_refresh import refresh_checkpoint
+    from .control_plane.projection_refresh import _safe_message, refresh_checkpoint
     from .control_plane.projection_store import CheckpointInvalid, ProjectionStore
 
     stage = 'configuration'
@@ -4320,8 +4323,11 @@ def _cmd_cp_checkpoint(args) -> int:
     except (Exception, SystemExit) as exc:
         error = {"ok": False, "error": type(exc).__name__, "stage": stage}
         if isinstance(exc, CheckpointInvalid):
-            # Only our own static validation messages are safe to surface.
+            # Only our own static validation messages are safe to surface at any stage.
             error['reason'] = str(exc)
+        elif isinstance(exc, ValueError) and stage in _CP_CHECKPOINT_REASON_STAGES:
+            # After the connection is open; a connection-stage ValueError can quote DSN fragments.
+            error['reason'] = _safe_message(exc)
         _print_json(error)
         return 1
     _print_json({"ok": True, **result})
@@ -5221,8 +5227,9 @@ def _members_settings(cp) -> dict | None:
     share = cp.get("share") if isinstance(cp, dict) else None
     host = share.get("public_host") if isinstance(share, dict) else None
     seconds = share.get("session_seconds") if isinstance(share, dict) else None
+    own = share.get("member_host") if isinstance(share, dict) else None
     try:
-        return parse_members(raw, public_host=host, session_seconds=seconds)
+        return parse_members(raw, public_host=host, session_seconds=seconds, member_host=own)
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
 
@@ -5242,7 +5249,7 @@ def _member_web(cp, collab, args):
         return None
     from .control_plane.member_web import MemberWeb
     return MemberWeb(collab, public_host=got["public_host"], session_secret=got["session_secret"].encode("utf-8"),
-                     session_seconds=got["session_seconds"],
+                     session_seconds=got["session_seconds"], member_host=got.get("member_host"),
                      web_root=getattr(args, "web_root", None), public_config=collab.public_config,
                      require_https=bool(getattr(args, "collab_require_https", False)))
 
