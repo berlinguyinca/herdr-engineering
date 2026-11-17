@@ -176,7 +176,7 @@ the threshold it injects an instruction (`hookSpecificOutput.additionalContext`)
 telling the agent to finish or record running subagents and run the `/handoff`
 skill now, which hands over to a successor pane and closes this one. The hook
 cannot write the handoff itself; it only injects the instruction. Each `session_id` has a
-marker file recording the percentage of the last reminder; an ignored instruction is
+marker file recording the context size (tokens) at the last reminder; an ignored instruction is
 repeated only after usage grows another 10 points. Markers older than 30 days are
 pruned (marker files under `$HERDR_ENGINEERING_STATE/handoff-context`,
 default `~/.local/share/herdr-engineering/state/handoff-context`).

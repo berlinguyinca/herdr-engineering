@@ -74,8 +74,9 @@ def _window(env: Mapping[str, str], used: int) -> float:
     return window
 
 
-def _claim(marker: Path, percent: int) -> bool:
-    """Record this reminder. False when one was already given within REMIND_STEP_POINTS of this percentage."""
+def _claim(marker: Path, used: int, window: float) -> bool:
+    """Record this reminder (as absolute tokens, so a change of window cannot skew it). False when one was
+    already given within REMIND_STEP_POINTS of the current window."""
     try:
         fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
@@ -83,12 +84,12 @@ def _claim(marker: Path, percent: int) -> bool:
             last = int(marker.read_text().strip())
         except (OSError, ValueError):
             return False
-        if percent < last + REMIND_STEP_POINTS:
+        if used < last + window * REMIND_STEP_POINTS / 100:
             return False
-        marker.write_text(str(percent))
+        marker.write_text(str(used))
         return True
     with os.fdopen(fd, "w") as fh:
-        fh.write(str(percent))
+        fh.write(str(used))
     return True
 
 
@@ -115,7 +116,7 @@ def evaluate(raw: str, env: Mapping[str, str]) -> str | None:
     percent = round(100 * used / window)
     marker = _state_dir(env) / (re.sub(r"[^A-Za-z0-9._-]", "_", session)[:128] + ".fired")
     marker.parent.mkdir(parents=True, exist_ok=True)
-    if not _claim(marker, percent):
+    if not _claim(marker, used, window):
         return None
     _prune_stale_markers(marker.parent)
     return json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",

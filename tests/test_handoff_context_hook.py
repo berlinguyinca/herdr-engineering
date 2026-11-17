@@ -127,3 +127,19 @@ def test_an_ignored_instruction_is_repeated_only_after_ten_more_points(tmp_path)
     assert call(105_000) == ""          # 52%: under +10 points since the last reminder
     assert "60%" in call(120_000)       # +10 points: remind again
     assert call(125_000) == ""
+
+
+def test_reminders_survive_the_window_growing_from_200k_to_1m(tmp_path):
+    """Ignored reminders below 200k must not suppress the one due at 50% of the real 1M window."""
+    t = tmp_path / "t.jsonl"
+
+    def call(tokens: int) -> str:
+        t.write_text(usage_line(tokens) + "\n")
+        return run_hook(payload(t), tmp_path)[1]
+
+    for tokens in (100_000, 120_000, 140_000, 160_000, 180_000, 200_000):
+        assert "additionalContext" in call(tokens)
+    assert call(210_000) == ""                   # 21% of 1M: under the threshold
+    assert "50%" in call(500_000)                # 50% of 1M: due, whatever was said at 200k scale
+    assert call(520_000) == ""
+    assert "60%" in call(600_000)
