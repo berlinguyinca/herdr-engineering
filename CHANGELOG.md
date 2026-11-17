@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Claude Code: blocking `PreToolUse` guard in the managed workflow hooks
+
+- `herdr-eng workflow install|repair` now also registers a `PreToolUse` hook (matcher `Bash|Write|Edit|MultiEdit|NotebookEdit`, same `herdr-workflow:managed` marker and guard) that denies `Write`/`Edit`/`MultiEdit`/`NotebookEdit` under `/tmp` and `/private/tmp` (the harness scratchpad `/tmp/claude-<digits>/` is allowed), denies `git push` to `main`/`master` (explicit refspec, or a bare push from a repo on that branch, including `git -C` and chained commands), and asks before any other push from a repo whose `origin` contains `herdr-engineering`. It fails open and uses no network. Existing installs show as drift in `workflow doctor` until `workflow repair`. `ClaudeHooksUnit` gained an optional per-event `matchers` map. See `docs/operations/workflow-hooks.md`.
+
 ### Fix: inspector readers no longer wait on a durable write
 
 - `InspectorStore.ingest` held the store-wide lock across the durable sink write. The sink serialises every write behind one asyncpg connection and a write lock, so under an ingest burst the lock holder waited behind unrelated writes and every reader (`agents/list` via `phone_digest`, `health`, `has_session`, `newest_seq`) waited with it; `agents/list` took up to 30 s on bender on 2026-11-17. The durable write now runs with the store lock released; ingest writers, `sweep`, `set_prefs` and checkpoint restore are serialised by a separate ingest lock (order: ingest lock, store lock, sink lock) and a reader sees the state from before an event until that event is durable, as before.

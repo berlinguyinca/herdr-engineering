@@ -33,7 +33,7 @@ def test_install_creates_managed_entries(home):
     res = inst(home).install()
     assert res.ok and res.action == "create"
     hooks = json.loads(settings(home).read_text())["hooks"]
-    assert set(hooks) == {"SessionStart", "PreCompact"}
+    assert set(hooks) == {"SessionStart", "PreCompact", "PreToolUse"}
     cmd = hooks["PreCompact"][0]["hooks"][0]["command"]
     assert wh.MARKER in cmd and cmd.startswith("[ -x /opt/herdr-eng ] && ") and cmd.count("|| true") == 1
     assert "workflow hook PreCompact" in cmd

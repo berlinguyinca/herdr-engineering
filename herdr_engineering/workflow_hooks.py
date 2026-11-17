@@ -26,9 +26,11 @@ from .memory_install import (
     _atomic_write,
     _diff,
 )
+from .workflow_guard import MATCHER as GUARD_MATCHER
+from .workflow_guard import decide
 
 MARKER = "herdr-workflow:managed"
-EVENTS = ("SessionStart", "PreCompact")
+EVENTS = ("SessionStart", "PreCompact", "PreToolUse")
 
 REMINDER = """Engineering defaults (herdr-engineering managed hook):
 - Delegate multi-file changes, refactors, debugging, reviews and research to sonnet subagents; do trivial work directly.
@@ -46,6 +48,7 @@ PRECOMPACT_MESSAGE = ("Context is about to be compacted. Consider /handoff first
 
 class _WorkflowHooksUnit(ClaudeHooksUnit):
     marker = MARKER
+    matchers = {"PreToolUse": GUARD_MATCHER}
 
 
 def _hook_command(command: list[str], event: str) -> str:
@@ -148,10 +151,16 @@ def run_hook(event: str, stdin: IO[str], stdout: IO[str]) -> int:
     """Print the reminder for ``event``. Always returns 0 and prints nothing on any failure."""
     try:
         try:
-            stdin.read()
+            raw = stdin.read()
         except (OSError, ValueError):
-            pass
-        if event == "SessionStart":
+            raw = ""
+        if event == "PreToolUse":
+            verdict = decide(json.loads(raw))
+            if verdict is None:
+                return 0
+            out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": verdict[0],
+                                          "permissionDecisionReason": verdict[1]}}
+        elif event == "SessionStart":
             out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": REMINDER}}
         elif event == "PreCompact":
             out = {"systemMessage": PRECOMPACT_MESSAGE}
