@@ -175,8 +175,10 @@ body. It is **not installed by default**. When the session's context usage reach
 the threshold it injects an instruction (`hookSpecificOutput.additionalContext`)
 telling the agent to finish or record running subagents and run the `/handoff`
 skill now, which hands over to a successor pane and closes this one. The hook
-cannot write the handoff itself; it only injects the instruction, at most once per
-`session_id` (marker files under `$HERDR_ENGINEERING_STATE/handoff-context`,
+cannot write the handoff itself; it only injects the instruction. Each `session_id` has a
+marker file recording the context size (tokens) at the last reminder; an ignored instruction is
+repeated only after usage grows another 10 points. Markers older than 30 days are
+pruned (marker files under `$HERDR_ENGINEERING_STATE/handoff-context`,
 default `~/.local/share/herdr-engineering/state/handoff-context`).
 
 Context used is read from the last assistant message in the transcript:
@@ -187,12 +189,13 @@ exits 0, so it never blocks a prompt.
 | Variable | Default | Meaning |
 |---|---|---|
 | `HERDR_HANDOFF_CONTEXT_THRESHOLD` | `0.50` | fraction of the window that triggers the instruction |
-| `HERDR_HANDOFF_CONTEXT_MAX_TOKENS` | `200000` | context window size |
+| `HERDR_HANDOFF_CONTEXT_MAX_TOKENS` | `200000`, or `1000000` once usage exceeds 200000 | context window size; setting the variable disables the inference |
 | `HERDR_HANDOFF_AUTO` | unset | `0` disables the hook |
 
-Known limitation: the window defaults to 200000 tokens. Models with a 1M-token
-context need `HERDR_HANDOFF_CONTEXT_MAX_TOKENS=1000000`, otherwise the hook fires
-too early.
+The transcript does not name the context window, so the hook assumes 200000 tokens and
+switches to 1000000 once usage proves a 200000 window cannot be right. A 1M-token
+session below 200000 tokens is therefore measured against 200000 and is reminded
+early; set `HERDR_HANDOFF_CONTEXT_MAX_TOKENS=1000000` to measure it exactly.
 
 To opt in, add this to `~/.claude/settings.json`:
 
