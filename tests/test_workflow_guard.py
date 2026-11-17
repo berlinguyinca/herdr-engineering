@@ -75,10 +75,11 @@ def test_scratchpad_lookalikes_are_denied(path, tmp_path):
     assert decision(call({"tool_name": "Write", "tool_input": {"file_path": path}, "cwd": str(tmp_path)})) == "deny"
 
 
-def test_project_and_relative_paths_allowed(tmp_path):
-    ok = tmp_path / ".proj" / "x.md"
-    assert decision(call({"tool_name": "Write", "tool_input": {"file_path": str(ok)}, "cwd": str(tmp_path)})) is None
-    rel = {"tool_name": "Edit", "tool_input": {"file_path": "notes.md"}, "cwd": str(tmp_path)}
+def test_project_and_relative_paths_allowed():
+    # The check is path-only, so use a fixed project dir: pytest's tmp_path is under /tmp on Linux CI.
+    proj = "/home/dev/proj"
+    assert decision(call({"tool_name": "Write", "tool_input": {"file_path": f"{proj}/.proj/x.md"}, "cwd": proj})) is None
+    rel = {"tool_name": "Edit", "tool_input": {"file_path": "notes.md"}, "cwd": proj}
     assert decision(call(rel)) is None
 
 
