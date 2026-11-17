@@ -174,6 +174,15 @@ def run_doctor(config: dict[str, Any] | None = None,
                handoff.detail, {"missing_harnesses": handoff.missing_harnesses,
                                 "executable": handoff.executable})
 
+    # automatic handoff triggers: is the next full-context session going to hand itself off?
+    try:
+        from .handoff_autopilot import doctor_check
+        autopilot = doctor_check()
+        detail = autopilot["detail"] if not autopilot["fix"] else f"{autopilot['detail']}; fix: {autopilot['fix']}"
+        report.add(autopilot["name"], autopilot["status"], detail, autopilot["data"])
+    except Exception as exc:  # doctor must never crash on an optional section
+        report.add("handoff-autopilot", "warn", f"autopilot check failed: {type(exc).__name__}")
+
     # herdr-memory managed adapters (only when opted in; never fake healthy)
     try:
         from .memory_install import MemoryInstaller

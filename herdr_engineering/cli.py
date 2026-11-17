@@ -530,6 +530,41 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--json", action="store_true")
     p2.set_defaults(func=_cmd_handoff_auto)
 
+    # handoff autopilot ----------------------------------------------------
+    p2 = hsub.add_parser("autopilot", help="handoffs without being asked: install, status, check, record, hook")
+    asub = p2.add_subparsers(dest="autopilot_command", required=True)
+    for name, helptext in (("install", "install the automatic triggers (Pi extension, Claude Code hooks)"),
+                           ("uninstall", "remove only what install wrote; the trigger ledger is kept")):
+        p3 = asub.add_parser(name, help=helptext)
+        p3.add_argument("--home", default=None, help="override $HOME (tests)")
+        p3.add_argument("--dry-run", action="store_true")
+        p3.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
+        p3.set_defaults(func=_cmd_handoff_autopilot_manage)
+    p3 = asub.add_parser("status", help="policy, what is installed, and the per-session trigger ledger")
+    p3.add_argument("--home", default=None, help="override $HOME (tests)")
+    p3.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
+    p3.set_defaults(func=_cmd_handoff_autopilot_status)
+    for name, helptext in (("check", "read-only: should this session hand off now? (never records)"),
+                           ("record", "record that the handoff instruction was delivered")):
+        p3 = asub.add_parser(name, help=helptext)
+        p3.add_argument("--session-id", required=True)
+        p3.add_argument("--harness", default="pi", choices=("claude", "codex", "opencode", "pi"))
+        p3.add_argument("--percent", type=_percent_arg, default=None,
+                        help="percent of the context window in use, as the harness reported it")
+        p3.add_argument("--tokens", type=int, default=None, help="tokens in use (fallback for --percent)")
+        p3.add_argument("--context-window", type=int, default=None, help="the harness's context window")
+        p3.add_argument("--boundary", default="turn_end", help="what noticed the full context")
+        p3.add_argument("--cwd", default=None, help="project root to look for handoffs already underway")
+        p3.add_argument("--home", default=None, help="override $HOME (tests)")
+        p3.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
+        p3.set_defaults(func=_cmd_handoff_autopilot_check if name == "check" else _cmd_handoff_autopilot_record)
+    p3 = asub.add_parser("hook", help="harness hook body: reads the event on stdin, prints the verdict, never fails")
+    p3.add_argument("--harness", required=True, choices=("claude", "codex", "opencode", "pi"))
+    p3.add_argument("--record", action="store_true", help="consume the trigger once the event is delivered")
+    p3.add_argument("--home", default=None, help="override $HOME (tests)")
+    p3.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
+    p3.set_defaults(func=_cmd_handoff_autopilot_hook)
+
     # summary --------------------------------------------------------------
     p = sub.add_parser("summary", help="/summary skill: install, verify, remove, read session history")
     smsub = p.add_subparsers(dest="summary_command", required=True)
@@ -1525,6 +1560,79 @@ def _cmd_handoff_subagent_hook(args) -> int:
 def _cmd_handoff_subagents(args) -> int:
     from .handoff_subagent_registry import run_subagents
     return run_subagents(args.pane, as_json=args.json)
+
+
+def _percent_arg(value: str) -> float:
+    try:
+        percent = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"percent must be a number, not {value!r}") from exc
+    if not 0 <= percent <= 100:
+        raise argparse.ArgumentTypeError(f"percent must be between 0 and 100, not {percent:g}")
+    return percent
+
+
+def _cmd_handoff_autopilot_manage(args) -> int:
+    from . import handoff_autopilot as autopilot
+    home = Path(args.home) if args.home else None
+    if args.autopilot_command == "install":
+        result = autopilot.install(home=home, dry_run=args.dry_run)
+    else:
+        result = autopilot.uninstall(home=home, dry_run=args.dry_run)
+    _print_json(result)
+    return 0
+
+
+def _cmd_handoff_autopilot_status(args) -> int:
+    from . import handoff_autopilot as autopilot
+    home = Path(args.home) if args.home else None
+    _print_json(autopilot.status(home=home))
+    return 0  # status reports; `herdr-eng doctor` is the command that judges
+
+
+def _autopilot_decision_args(args, *, boundary_default: str = "turn_end") -> dict:
+    return dict(session_id=args.session_id, harness=args.harness, percent=args.percent,
+                tokens=args.tokens, context_window=args.context_window,
+                cwd=Path(args.cwd) if args.cwd else None,
+                home=Path(args.home) if args.home else None,
+                boundary=getattr(args, "boundary", None) or boundary_default)
+
+
+def _cmd_handoff_autopilot_check(args) -> int:
+    from . import handoff_autopilot as autopilot
+    _print_json(autopilot.decide(**_autopilot_decision_args(args)).to_dict())
+    return 0
+
+
+def _cmd_handoff_autopilot_record(args) -> int:
+    from . import handoff_autopilot as autopilot
+    kwargs = _autopilot_decision_args(args)
+    entry = autopilot.record_trigger(session_id=kwargs.pop("session_id"),
+                                     harness=kwargs.pop("harness"),
+                                     percent=kwargs.pop("percent"),
+                                     boundary=kwargs.pop("boundary"),
+                                     home=kwargs.pop("home"))
+    _print_json({"schema_version": 1, "ok": True, "session_id": args.session_id, **entry})
+    return 0
+
+
+def _cmd_handoff_autopilot_hook(args) -> int:
+    """Claude Code (and friends) hook body: read the event, print what to do, never fail.
+
+    A hook that can fail is a hook that can stall the agent it was installed to help, so
+    every path here returns 0; an unusable event simply produces no output.
+    """
+    from . import handoff_autopilot as autopilot
+    try:
+        payload = autopilot.hook(args.harness, sys.stdin.read(), record=args.record,
+                                 home=Path(args.home) if args.home else None)
+    except Exception as exc:  # fail open: the session must keep running
+        _print_json({"schema_version": 1, "trigger": False, "code": "internal",
+                     "reason": str(exc)})
+        return 0
+    if payload:
+        _print_json(payload)
+    return 0
 
 
 def _cmd_summary_manage(args) -> int:

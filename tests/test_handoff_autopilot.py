@@ -11,6 +11,7 @@ real Claude Code transcript format, the real Pi extension API surface. The only
 stand-in is the Pi host itself (`pi.on` / `pi.sendUserMessage`), which cannot be
 driven headlessly; the Node test in packages/ drives the real extension against it.
 """
+
 from __future__ import annotations
 
 import json
@@ -19,20 +20,19 @@ import shutil
 import stat
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 
 import pytest
 
 from herdr_engineering import handoff_autopilot as ha
 
-
 CLI = [sys.executable, "-m", "herdr_engineering.cli"]
 
 
 def _cli(args: list[str], env: dict[str, str], cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(CLI + args, capture_output=True, text=True, timeout=120,
-                          cwd=str(cwd), env=env)
+    return subprocess.run(
+        CLI + args, capture_output=True, text=True, timeout=120, cwd=str(cwd), env=env
+    )
 
 
 @pytest.fixture()
@@ -44,11 +44,15 @@ def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     for path in (home, state, work):
         path.mkdir(parents=True)
     env = dict(os.environ)
-    env.update({
-        "HOME": str(home), "USERPROFILE": str(home),
-        "XDG_STATE_HOME": str(state), "XDG_CONFIG_HOME": str(home / ".config"),
-        "XDG_DATA_HOME": str(home / ".local" / "share"),
-    })
+    env.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "XDG_STATE_HOME": str(state),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_DATA_HOME": str(home / ".local" / "share"),
+        }
+    )
     env.pop("HERDR_HANDOFF_AUTOPILOT", None)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
@@ -63,18 +67,28 @@ def write_config(home: Path, body: str) -> Path:
     return path
 
 
-def write_transcript(path: Path, *, session_id: str, input_tokens: int, cache_read: int,
-                     cache_write: int = 0) -> Path:
+def write_transcript(
+    path: Path, *, session_id: str, input_tokens: int, cache_read: int, cache_write: int = 0
+) -> Path:
     """A Claude Code transcript in the shape the installed CLI actually writes."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         {"type": "user", "sessionId": session_id, "message": {"role": "user", "content": "go"}},
-        {"type": "assistant", "sessionId": session_id, "model": "claude-opus-4-5",
-         "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}],
-                     "usage": {"input_tokens": input_tokens,
-                               "cache_creation_input_tokens": cache_write,
-                               "cache_read_input_tokens": cache_read,
-                               "output_tokens": 857}}},
+        {
+            "type": "assistant",
+            "sessionId": session_id,
+            "model": "claude-opus-4-5",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "done"}],
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "cache_creation_input_tokens": cache_write,
+                    "cache_read_input_tokens": cache_read,
+                    "output_tokens": 857,
+                },
+            },
+        },
     ]
     path.write_text("".join(json.dumps(line) + "\n" for line in lines))
     return path
@@ -111,15 +125,17 @@ def test_does_not_trigger_while_context_is_comfortable(host: dict) -> None:
 
 def test_percent_is_derived_from_tokens_when_the_harness_reports_none(host: dict) -> None:
     # pi returns percent: null when tokensUsed or contextWindow is 0.
-    decision = ha.decide(session_id="s-tokens", harness="pi", percent=None,
-                         tokens=170_000, context_window=200_000)
+    decision = ha.decide(
+        session_id="s-tokens", harness="pi", percent=None, tokens=170_000, context_window=200_000
+    )
     assert decision.trigger is True
     assert decision.percent == pytest.approx(85.0)
 
 
 def test_unknown_context_never_triggers(host: dict) -> None:
-    decision = ha.decide(session_id="s-unknown", harness="pi", percent=None,
-                         tokens=None, context_window=None)
+    decision = ha.decide(
+        session_id="s-unknown", harness="pi", percent=None, tokens=None, context_window=None
+    )
     assert decision.trigger is False
     assert decision.code == "unknown_context"
 
@@ -133,7 +149,9 @@ def test_config_can_opt_out_and_the_reason_names_the_way_back(host: dict) -> Non
     assert "config.yaml" in decision.reason
 
 
-def test_environment_can_opt_out_for_one_session(host: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_environment_can_opt_out_for_one_session(
+    host: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("HERDR_HANDOFF_AUTOPILOT", "off")
     decision = ha.decide(session_id="s-env", harness="pi", percent=90.0)
     assert decision.trigger is False
@@ -167,22 +185,39 @@ def test_repeat_limit_is_configurable(host: dict) -> None:
 def test_a_handoff_already_underway_suppresses_a_second_trigger(host: dict) -> None:
     root = host["work"] / ".herdr" / "handoffs"
     root.mkdir(parents=True)
-    (root / "handoff_live.json").write_text(json.dumps(
-        {"handoff_id": "handoff_live", "schema_version": 2, "state": "in_progress",
-         "source": {"harness": "pi", "session_id": "s-live"}, "target": {"harness": "pi"},
-         "context": {}}))
+    (root / "handoff_live.json").write_text(
+        json.dumps(
+            {
+                "handoff_id": "handoff_live",
+                "schema_version": 2,
+                "state": "in_progress",
+                "source": {"harness": "pi", "session_id": "s-live"},
+                "target": {"harness": "pi"},
+                "context": {},
+            }
+        )
+    )
     suppressed = ha.decide(session_id="s-live", harness="pi", percent=90.0, cwd=host["work"])
     assert suppressed.trigger is False
     assert suppressed.code == "handoff_underway"
     assert "handoff_live" in suppressed.reason
 
     # A finished handoff for the same session is not a reason to stay silent.
-    (root / "handoff_live.json").write_text(json.dumps(
-        {"handoff_id": "handoff_live", "schema_version": 2, "state": "completed",
-         "source": {"harness": "pi", "session_id": "s-live"}, "target": {"harness": "pi"},
-         "context": {}}))
-    assert ha.decide(session_id="s-live", harness="pi", percent=90.0,
-                     cwd=host["work"]).trigger is True
+    (root / "handoff_live.json").write_text(
+        json.dumps(
+            {
+                "handoff_id": "handoff_live",
+                "schema_version": 2,
+                "state": "completed",
+                "source": {"harness": "pi", "session_id": "s-live"},
+                "target": {"harness": "pi"},
+                "context": {},
+            }
+        )
+    )
+    assert (
+        ha.decide(session_id="s-live", harness="pi", percent=90.0, cwd=host["work"]).trigger is True
+    )
 
 
 def test_trigger_ledger_is_auditable_and_per_session(host: dict) -> None:
@@ -211,9 +246,22 @@ def test_a_corrupt_ledger_is_ignored_but_reported(host: dict) -> None:
 
 
 def test_cli_check_decides_without_recording(host: dict) -> None:
-    done = _cli(["handoff", "autopilot", "check", "--session-id", "s1",
-                 "--harness", "pi", "--percent", "62", "--json"],
-                host["env"], host["work"])
+    done = _cli(
+        [
+            "handoff",
+            "autopilot",
+            "check",
+            "--session-id",
+            "s1",
+            "--harness",
+            "pi",
+            "--percent",
+            "62",
+            "--json",
+        ],
+        host["env"],
+        host["work"],
+    )
     assert done.returncode == 0, done.stderr
     payload = json.loads(done.stdout)
     assert payload["trigger"] is True and payload["code"] == "context_is_full"
@@ -223,19 +271,49 @@ def test_cli_check_decides_without_recording(host: dict) -> None:
 
 def test_cli_record_consumes_the_trigger_for_that_session(host: dict) -> None:
     for percent in ("62", "90"):
-        done = _cli(["handoff", "autopilot", "record", "--session-id", "s2",
-                     "--harness", "pi", "--percent", percent, "--json"],
-                    host["env"], host["work"])
+        done = _cli(
+            [
+                "handoff",
+                "autopilot",
+                "record",
+                "--session-id",
+                "s2",
+                "--harness",
+                "pi",
+                "--percent",
+                percent,
+                "--json",
+            ],
+            host["env"],
+            host["work"],
+        )
         assert done.returncode == 0, done.stderr
     assert json.loads(done.stdout)["count"] == 2
-    check = _cli(["handoff", "autopilot", "check", "--session-id", "s2", "--harness", "pi",
-                  "--percent", "95", "--json"], host["env"], host["work"])
+    check = _cli(
+        [
+            "handoff",
+            "autopilot",
+            "check",
+            "--session-id",
+            "s2",
+            "--harness",
+            "pi",
+            "--percent",
+            "95",
+            "--json",
+        ],
+        host["env"],
+        host["work"],
+    )
     assert json.loads(check.stdout)["code"] == "already_triggered"
 
 
 def test_cli_reports_invalid_percent_as_usage_error(host: dict) -> None:
-    done = _cli(["handoff", "autopilot", "check", "--session-id", "s3", "--percent", "140"],
-                host["env"], host["work"])
+    done = _cli(
+        ["handoff", "autopilot", "check", "--session-id", "s3", "--percent", "140"],
+        host["env"],
+        host["work"],
+    )
     assert done.returncode == 2
     assert "percent" in done.stdout.lower() or "percent" in done.stderr.lower()
 
@@ -243,28 +321,47 @@ def test_cli_reports_invalid_percent_as_usage_error(host: dict) -> None:
 def test_install_is_default_idempotent_and_preserves_foreign_hooks(host: dict) -> None:
     settings = host["home"] / ".claude" / "settings.json"
     settings.parent.mkdir(parents=True)
-    settings.write_text(json.dumps({
-        "hooks": {"SessionStart": [{"matcher": "startup", "hooks": [
-            {"type": "command", "command": "printf '%s' 'someone elses hook'"}]}]},
-        "theme": "dark",
-    }))
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "startup",
+                            "hooks": [
+                                {"type": "command", "command": "printf '%s' 'someone elses hook'"}
+                            ],
+                        }
+                    ]
+                },
+                "theme": "dark",
+            }
+        )
+    )
 
     first = _cli(["handoff", "autopilot", "install", "--json"], host["env"], host["work"])
     assert first.returncode == 0, first.stderr
     created = json.loads(first.stdout)
     kinds = {item["kind"] for item in created["items"]}
     assert {"pi-extension", "claude-hook", "state-dir"} <= kinds
-    assert all(item["status"] in {"created", "unchanged"} for item in created["items"])
+    # "updated" is the honest status for a settings file that already existed with foreign hooks.
+    assert all(item["status"] in {"created", "updated", "unchanged"} for item in created["items"])
 
     extension = ha.extension_path(home=host["home"])
     text = extension.read_text()
-    assert "context_is_full" in text and "sendUserMessage" in text
-    assert "handoff autopilot check" in text  # asks the real CLI, decides nothing itself
+    assert "turn_end" in text and "getContextUsage" in text  # the boundary that still has it all
+    assert "sendUserMessage" in text and "inject: false" in text  # silent, actionable injection
+    # The argv it runs is the CLI's decision point; line-wrapping must not hide that it exists.
+    argv = "".join(text.split())
+    assert '["handoff","autopilot","check"' in argv  # asks the real CLI, decides nothing itself
+    assert '["handoff","autopilot","record"' in argv  # consumes only after delivering
+    assert "--percent" in argv and "--session-id" in argv  # reports what it measured
 
     merged = json.loads(settings.read_text())
     assert merged["theme"] == "dark"  # unrelated settings survive
-    assert any("someone elses hook" in json.dumps(group)
-               for group in merged["hooks"]["SessionStart"])
+    assert any(
+        "someone elses hook" in json.dumps(group) for group in merged["hooks"]["SessionStart"]
+    )
     events = set(merged["hooks"])
     assert {"Stop", "PreCompact"} & events
     our_commands = [hook["command"] for group in merged["hooks"]["Stop"] for hook in group["hooks"]]
@@ -276,24 +373,72 @@ def test_install_is_default_idempotent_and_preserves_foreign_hooks(host: dict) -
 
 
 def test_uninstall_removes_only_what_install_added(host: dict) -> None:
-    _cli(["handoff", "autopilot", "install"], host["env"], host["work"])
     settings = host["home"] / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "startup",
+                            "hooks": [
+                                {"type": "command", "command": "printf '%s' 'someone elses hook'"}
+                            ],
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    _cli(["handoff", "autopilot", "install"], host["env"], host["work"])
     before = json.loads(settings.read_text())
-    foreign = [hook for group in before["hooks"].get("SessionStart", []) for hook in group["hooks"]
-               if "someone elses hook" in hook.get("command", "")]
+    foreign = [
+        hook
+        for group in before["hooks"].get("SessionStart", [])
+        for hook in group["hooks"]
+        if "someone elses hook" in hook.get("command", "")
+    ]
+    assert foreign, "the fixture must seed a foreign hook to preserve"
     removed = _cli(["handoff", "autopilot", "uninstall", "--json"], host["env"], host["work"])
     assert removed.returncode == 0, removed.stderr
     assert not ha.extension_path(home=host["home"]).exists()
     after = json.loads(settings.read_text())
-    assert not any("handoff autopilot hook" in json.dumps(group) for group in after["hooks"].get("Stop", []))
-    assert foreign and any("someone elses hook" in json.dumps(group)
-                           for group in after["hooks"].get("SessionStart", []))
+    assert not any(
+        "handoff autopilot hook" in json.dumps(group) for group in after["hooks"].get("Stop", [])
+    )
+    assert not any(
+        "handoff autopilot hook" in json.dumps(group)
+        for group in after["hooks"].get("PreCompact", [])
+    )
+    assert any(
+        "someone elses hook" in json.dumps(group)
+        for group in after["hooks"].get("SessionStart", [])
+    )
+    # Uninstalling twice is not an error; the ledger is kept as the audit record.
+    again = _cli(["handoff", "autopilot", "uninstall", "--json"], host["env"], host["work"])
+    assert again.returncode == 0, again.stderr
+    assert json.loads(again.stdout)["ok"] is True
 
 
 def test_status_reports_the_policy_paths_and_recent_triggers(host: dict) -> None:
     _cli(["handoff", "autopilot", "install", "--json"], host["env"], host["work"])
-    _cli(["handoff", "autopilot", "record", "--session-id", "s3", "--harness", "pi",
-          "--percent", "66", "--json"], host["env"], host["work"])
+    _cli(
+        [
+            "handoff",
+            "autopilot",
+            "record",
+            "--session-id",
+            "s3",
+            "--harness",
+            "pi",
+            "--percent",
+            "66",
+            "--json",
+        ],
+        host["env"],
+        host["work"],
+    )
     done = _cli(["handoff", "autopilot", "status", "--json"], host["env"], host["work"])
     assert done.returncode == 0, done.stderr
     status = json.loads(done.stdout)
@@ -301,6 +446,7 @@ def test_status_reports_the_policy_paths_and_recent_triggers(host: dict) -> None
     assert status["installed"]["pi_extension"] is True
     assert status["ledger"]["sessions"]["s3"]["count"] == 1
     assert "next boundary" in status["summary"]
+    assert status["installed"]["claude_hooks"]["Stop"] is True
 
 
 def test_doctor_reports_the_autopilot_and_names_the_fix(host: dict) -> None:
@@ -324,23 +470,42 @@ def test_doctor_reports_the_autopilot_and_names_the_fix(host: dict) -> None:
 
 
 def test_claude_percent_comes_from_the_real_transcript_usage_fields(host: dict) -> None:
-    transcript = write_transcript(host["work"] / "t.jsonl", session_id="s-cc",
-                                 input_tokens=2, cache_write=2_602, cache_read=104_948)
+    transcript = write_transcript(
+        host["work"] / "t.jsonl",
+        session_id="s-cc",
+        input_tokens=2,
+        cache_write=2_602,
+        cache_read=104_948,
+    )
     percent = ha.transcript_percent(transcript, context_window=200_000)
     assert percent == pytest.approx((2 + 2_602 + 104_948) / 2_000.0)
 
 
 def test_claude_hook_injects_the_prompt_and_always_exits_zero(host: dict) -> None:
-    transcript = write_transcript(host["work"] / "full.jsonl", session_id="s-cc-full",
-                                 input_tokens=2, cache_write=3_000, cache_read=150_000)
+    transcript = write_transcript(
+        host["work"] / "full.jsonl",
+        session_id="s-cc-full",
+        input_tokens=2,
+        cache_write=3_000,
+        cache_read=150_000,
+    )
     # The hook reads its event from stdin, exactly as Claude Code passes it.
-    done = subprocess.run(CLI + ["handoff", "autopilot", "hook", "--harness", "claude",
-                                 "--record", "--json"],
-                          input=json.dumps({"session_id": "s-cc-full",
-                                            "transcript_path": str(transcript),
-                                            "hook_event_name": "Stop", "cwd": str(host["work"])}),
-                          capture_output=True, text=True, timeout=120, env=host["env"],
-                          cwd=str(host["work"]))
+    done = subprocess.run(
+        CLI + ["handoff", "autopilot", "hook", "--harness", "claude", "--record", "--json"],
+        input=json.dumps(
+            {
+                "session_id": "s-cc-full",
+                "transcript_path": str(transcript),
+                "hook_event_name": "Stop",
+                "cwd": str(host["work"]),
+            }
+        ),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=host["env"],
+        cwd=str(host["work"]),
+    )
     assert done.returncode == 0, done.stderr
     payload = json.loads(done.stdout)
     assert payload["trigger"] is True
@@ -349,22 +514,35 @@ def test_claude_hook_injects_the_prompt_and_always_exits_zero(host: dict) -> Non
     assert ha.read_ledger()["sessions"]["s-cc-full"]["count"] == 1
 
     # A second Stop in the same session is silenced by the per-session cap.
-    again = subprocess.run(CLI + ["handoff", "autopilot", "hook", "--harness", "claude",
-                                 "--record", "--json"],
-                          input=json.dumps({"session_id": "s-cc-full",
-                                            "transcript_path": str(transcript)}),
-                          capture_output=True, text=True, timeout=120, env=host["env"],
-                          cwd=str(host["work"]))
+    again = subprocess.run(
+        CLI + ["handoff", "autopilot", "hook", "--harness", "claude", "--record", "--json"],
+        input=json.dumps({"session_id": "s-cc-full", "transcript_path": str(transcript)}),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=host["env"],
+        cwd=str(host["work"]),
+    )
     assert again.returncode == 0, again.stderr
     assert json.loads(again.stdout)["trigger"] is False
 
 
 def test_claude_hook_fails_open_on_unusable_input(host: dict) -> None:
-    for payload in ("", "{not json", json.dumps({"session_id": "s-x"}),
-                    json.dumps({"session_id": "s-y", "transcript_path": "/nope/t.jsonl"})):
-        done = subprocess.run(CLI + ["handoff", "autopilot", "hook", "--harness", "claude"],
-                              input=payload, capture_output=True, text=True, timeout=120,
-                              env=host["env"], cwd=str(host["work"]))
+    for payload in (
+        "",
+        "{not json",
+        json.dumps({"session_id": "s-x"}),
+        json.dumps({"session_id": "s-y", "transcript_path": "/nope/t.jsonl"}),
+    ):
+        done = subprocess.run(
+            CLI + ["handoff", "autopilot", "hook", "--harness", "claude"],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=host["env"],
+            cwd=str(host["work"]),
+        )
         assert done.returncode == 0, f"{payload!r} -> {done.returncode}: {done.stderr}"
         assert done.stdout.strip() in ("", "{}") or json.loads(done.stdout)["trigger"] is False
 
@@ -438,6 +616,12 @@ assert.equal(ledger.sessions["s-node"].harness, "pi");
     env["HERDR_ENG_ARGS"] = json.dumps(["-m", "herdr_engineering.cli"])
     env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
     env["HERDR_TEST_PYTHON"] = sys.executable
-    done = subprocess.run([node, str(runner)], capture_output=True, text=True, timeout=180,
-                          env=env, cwd=str(host["work"]))
+    done = subprocess.run(
+        [node, str(runner)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+        cwd=str(host["work"]),
+    )
     assert done.returncode == 0, f"stdout:\n{done.stdout}\nstderr:\n{done.stderr}"

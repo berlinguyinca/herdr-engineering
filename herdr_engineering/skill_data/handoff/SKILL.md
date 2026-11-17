@@ -59,7 +59,20 @@ Rules: never fabricate paths, hashes, URLs, counts or results; mark doubt in `un
    - Never close a pane by hand to make a refusal go away: a refusal is the guard working, and the pane you delete by hand is the one holding the work.
 5. Reply with the target, the handoff id, the document path and the placement or command. No recap of the briefing.
 
+## Automatic triggers
+
+A handoff is not something the operator has to ask for. `scripts/install.sh` arms automatic
+handoffs (step 7c): a Pi extension on `turn_end` and Claude Code `Stop`/`PreCompact` hooks
+watch the context window, and when a session reaches the threshold they inject this skill's
+instruction mid-session. Treat that instruction as the operator's standing authorization - do
+not ask "would you like me to hand off?", do not finish the current task first, and record the
+trigger (percent, boundary) in the briefing's constraints so the successor knows the handoff was
+unprompted. Everything above still holds: durable before the close, and a refusal is the guard
+working - report it, never `--allow-dirty-source` it away. Policy and opt-out:
+`docs/automatic-handoffs.md`.
+
 ## Notes
 
 - Models: pass only what the user requested; opencode wants `provider/model`, and `herdr-handoff` drops a bare model for opencode with a note.
-- The automatic context trigger (`herdr-eng handoff context-hook claude`) exists but is not installed by default; opt in as described in `docs/operations/handoff.md`.
+- Automatic handoffs are installed by default (`scripts/install.sh` step 7c): the Pi extension fires at `turn_end`, the Claude Code hooks at `Stop` and `PreCompact`, and all of them ask `herdr-eng handoff autopilot` what to do. Policy and opt-out: `docs/automatic-handoffs.md`; the check is `handoff-autopilot` in `herdr-eng doctor`.
+- `herdr-eng handoff context-hook claude` is the older, opt-in Claude `UserPromptSubmit` trigger. It is not installed by default; opt in as described in `docs/operations/handoff.md`.

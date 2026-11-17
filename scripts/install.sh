@@ -19,6 +19,11 @@
 #      key via $TS_AUTH_KEY or ~/.config/herdr-engineering/tailscale-auth.key;
 #      otherwise it prints the command and continues)
 #   7. puts `herdr-eng` and `herdr-handoff` on PATH (~/.local/bin) when writable
+#   7c. arms AUTOMATIC handoffs (default on): installs the Pi extension and the Claude
+#       Code Stop/PreCompact hooks, so a session that reaches the context threshold hands
+#       itself off to a fresh pane instead of waiting to be asked or losing detail to a
+#       summarizer. `--no-handoff-autopilot` (or HERDR_HANDOFF_AUTOPILOT=off at runtime)
+#       keeps handoffs on-request-only; `herdr-eng handoff autopilot uninstall` removes it.
 #   8. runs `herdr-eng doctor` and prints a summary
 #   2b. build-cache toolchain: checksum-pinned sccache 0.19.0 into ~/.local/bin
 #      (per-user, no root; non-fatal). --no-build-cache-tools skips it;
@@ -47,6 +52,10 @@ BUILD_CACHE_TOOLS=1
 BUILD_CACHE_TOOLS_ONLY=0
 WITH_WORKFLOW_HOOKS="${HERDR_INSTALL_WORKFLOW_HOOKS:-1}"
 WITH_SCREENWRIGHT="${HERDR_INSTALL_SCREENWRIGHT:-1}"
+# Automatic handoffs are installed by default: the operator's rule is that a handoff is
+# never something they have to ask for, so arming the triggers is the expected state of an
+# installed machine. Opt out with --no-handoff-autopilot (or the runtime env var).
+HANDOFF_AUTOPILOT="${HERDR_INSTALL_HANDOFF_AUTOPILOT:-1}"
 for arg in "$@"; do
   case "$arg" in
     --no-workflow-hooks) WITH_WORKFLOW_HOOKS=0 ;;
@@ -54,7 +63,8 @@ for arg in "$@"; do
     --with-memory) WITH_MEMORY=1 ;;
     --no-build-cache-tools) BUILD_CACHE_TOOLS=0 ;;
     --build-cache-tools-only) BUILD_CACHE_TOOLS_ONLY=1 ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    --no-handoff-autopilot) HANDOFF_AUTOPILOT=0 ;;
+    -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
     *) printf 'unknown option: %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
@@ -356,6 +366,18 @@ if [ "$WITH_SCREENWRIGHT" = "1" ]; then
   bash "$REPO_ROOT/scripts/install-screenwright.sh" || warn "screenwright not installed/updated (see above); the rest of the install is unaffected"
 else
   printf '\n  (screenwright not installed; HERDR_INSTALL_SCREENWRIGHT=0 or --no-screenwright)\n'
+fi
+
+# --- 7e. automatic handoff triggers (default on) ----------------------------
+if [ "$HANDOFF_AUTOPILOT" = "1" ]; then
+  step "7e/8 arming automatic handoffs (Pi extension + Claude Code hooks)"
+  # Idempotent and content-checked: a second run reports every item unchanged. It only ever
+  # rewrites the hook group it wrote itself, so the workflow hooks in 7c - and any foreign
+  # ~/.claude/settings.json entries - stay exactly where the previous steps put them.
+  "$PY" -m herdr_engineering.cli handoff autopilot install \
+    || warn "automatic handoff triggers are not fully installed (see above); handoffs will still work when asked for"
+else
+  printf '\n  (automatic handoffs not armed; handoffs will have to be asked for. Re-run without --no-handoff-autopilot)\n'
 fi
 
 # --- 8. doctor ------------------------------------------------------------

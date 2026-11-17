@@ -71,6 +71,17 @@ DEFAULTS: dict[str, Any] = {
         "report": {"enabled": False, "url": None, "key_file": None, "interval_s": 60, "host_id": None},
     },
     "herdr": {"capability_cache_ttl_seconds": 30},
+    # Automatic handoffs (default on): when a session reaches this share of its context
+    # window, the installed trigger tells the agent to hand off to a fresh pane by itself -
+    # no operator prompt. Set enabled: false, or export HERDR_HANDOFF_AUTOPILOT=off, to go
+    # back to handoffs-on-request-only. See herdr_engineering/handoff_autopilot.py.
+    "handoff_autopilot": {
+        "enabled": True,
+        "context_percent": 50.0,
+        "max_per_session": 1,
+        "harnesses": ["pi", "claude"],
+        "context_window_tokens": 200000,
+    },
     "web": {"private_only": True, "host": "127.0.0.1", "port": 8787},
     "artifacts": {
         "provider": "filesystem",
