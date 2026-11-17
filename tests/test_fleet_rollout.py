@@ -1455,6 +1455,34 @@ def test_ambiguous_identity_is_never_retired(tmp_path):
     assert after["status"] != "complete"
 
 
+def test_dead_registration_is_retirable_and_is_not_reported_as_a_disagreement(tmp_path):
+    """A registration with no live instance behind it is a husk, not a disagreement.
+
+    `no reachable row` and `two live rows` used to raise one untyped error, and the only
+    settlement refuses the untyped text -- so a session whose process is gone blocked its host
+    with no supported way past it, and every later plan reproduced the same block.
+    """
+    from herdr_engineering.fleet_rollout import retire_identityless
+
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.rows["beast"]["reachable"] = False
+
+    result = apply(store, plan, wire)
+    session = result["hosts"]["beast"]["sessions"]["beast-conversation"]
+    assert session["status"] == "blocked"
+    assert "no live instance to act on" in session["error"]
+    assert session["blockReason"] == "identity_missing"
+    # Nothing here may read as a disagreement between two live registrations.
+    assert "ambiguous" not in session["error"]
+
+    settled = retire_identityless(store, plan["id"])
+    assert [entry["sessionId"] for entry in settled["retired"]] == ["beast-conversation"]
+    assert settled["stillBlocked"] == []
+    assert store.read(plan["id"])["hosts"]["beast"]["status"] == "complete"
+
+
 def test_retired_registration_is_picked_back_up_when_its_identity_resolves(tmp_path):
     """Retiring was a guess about a dead pane; if it comes back, the rollout must use it."""
     from herdr_engineering.fleet_rollout import retire_identityless

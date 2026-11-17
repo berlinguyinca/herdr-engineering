@@ -433,7 +433,18 @@ def _live(rows, session_id, pid=None):
         for r in rows
         if r["descriptor"].get("sessionId") == session_id and r.get("reachable") is True
     ]
-    if len(matches) != 1:
+    if len(matches) == 0:
+        # Nothing reachable reports this conversation, so there is no instance to act on. That is
+        # a stale husk an operator can settle, which is a different thing from two live
+        # registrations disagreeing, and it must not be reported as one: the untyped refusal is
+        # deliberately un-settle-able, so collapsing the two left dead registrations blocking
+        # their host with no supported way past it in any later plan either (#779's rule:
+        # refusing to act is right, being un-recoverable by design is not).
+        raise MissingInstanceIdentity(
+            f"session identity missing: registration {session_id} has no live instance to act "
+            "on (no reachable registration reports this conversation)"
+        )
+    if len(matches) > 1:
         raise ValueError("session identity missing or ambiguous")
     row = matches[0]
     descriptor = row["descriptor"]
