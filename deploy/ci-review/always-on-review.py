@@ -2642,15 +2642,21 @@ def repo_skip_reason(cfg: dict, gh, repo: str) -> str:
 def poll_cutoff(cfg: dict, state: State, repo: str) -> dt.datetime | None:
     """PRs last updated at or before this are not polled. The later of `only_prs_updated_after` and, unless `backfill`,
     the time this repo was first polled (recorded now if this is the first poll): enrolling a repo never reviews the
-    PRs that were already open and quiet."""
+    PRs that were already open and quiet. A repo state.json already holds review keys for is grandfathered (no cutoff)."""
     cuts = [c for c in (parse_when(cfg["only_prs_updated_after"]),) if c]
     if not cfg["backfill"]:
         e = state.get(f"repo:{repo}").get("enrolled_at")
         if not isinstance(e, str) or parse_when(e) is None:
-            e = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-            state.put(f"repo:{repo}", enrolled_at=e)
-            ai.say(f"{repo}: enrolled at {e}; only PRs opened or updated after that are reviewed "
-                   "(backfill: true reviews the older open ones too)")
+            if any(k.startswith(f"{repo}#") for k in state._load()):
+                # Polled before this version existed: its in-progress PRs stay in scope (no cutoff).
+                e = "1970-01-01T00:00:00Z"
+                state.put(f"repo:{repo}", enrolled_at=e)
+                ai.say(f"{repo}: already polled before enrollment tracking; no cutoff")
+            else:
+                e = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                state.put(f"repo:{repo}", enrolled_at=e)
+                ai.say(f"{repo}: enrolled at {e}; only PRs opened or updated after that are reviewed "
+                       "(backfill: true reviews the older open ones too)")
         cuts.append(parse_when(e))
     return max(cuts) if cuts else None
 

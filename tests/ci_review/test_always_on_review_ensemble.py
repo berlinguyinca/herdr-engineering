@@ -522,3 +522,16 @@ def test_two_state_holders_never_clobber_each_others_keys(env):
     a.put("x", w=3)
     assert json.loads((env.tmp / "state/state.json").read_text()) == {"x": {"v": 1, "w": 3}, "y": {"v": 2}}
     assert b.get("x") == {"v": 1, "w": 3}                             # readers see the other holder's writes
+
+
+def test_a_repo_the_state_already_knows_is_grandfathered_not_newly_enrolled(env):
+    set_pr(env, updated_at=OLD)                                       # in progress: CI moved, updatedAt did not
+    state = env.tmp / "state/state.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps({f"{REPO}#7#tier2": {"failures": 1, "failure_sha": "0" * 40}}))
+    assert polled(env) is True                                        # an upgraded deployment keeps its PRs in scope
+    saved = json.loads(state.read_text())[f"repo:{REPO}"]["enrolled_at"]
+    assert saved.startswith("1970-01-01")                             # recorded as "always enrolled": no cutoff
+    # a keys-for-another-repo state does not grandfather this repo
+    state.write_text(json.dumps({"acme/other#7#tier2": {"failures": 1}}))
+    assert polled(env) is False
