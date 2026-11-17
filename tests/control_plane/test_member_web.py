@@ -35,6 +35,8 @@ HOST = "my.lab.example"
 ORIGIN = f"https://{HOST}"
 SECRET = b"m" * 48
 GROUP = "local.dev"
+OWN_HOST = "own.lab.example"        # the member UI's own name (member_host), served in addition to HOST
+OWN_ORIGIN = f"https://{OWN_HOST}"
 
 
 def sha(b: bytes) -> str:
@@ -68,6 +70,15 @@ class Reply:
 
 @pytest.fixture
 def stack(tmp_path):
+    yield from _stack(tmp_path)
+
+
+@pytest.fixture
+def dual_stack(tmp_path):
+    yield from _stack(tmp_path, member_host=OWN_HOST)
+
+
+def _stack(tmp_path, **member_web_kwargs):
     web = tmp_path / "web"
     web.mkdir()
     (web / "member-artifacts.html").write_text("<!doctype html><title>member</title>")
@@ -79,7 +90,7 @@ def stack(tmp_path):
     world.view("op", [ART])
     world.view("lab", [OTHER])
     mw = MemberWeb(svc, public_host=HOST, session_secret=SECRET, session_seconds=3600, web_root=web,
-                   require_https=True)
+                   require_https=True, **member_web_kwargs)
     srv = ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, collab=svc, public_port=0, web_root=web,
                              collab_require_https=True, member_web=mw)
     t = threading.Thread(target=srv.serve, daemon=True)
@@ -765,3 +776,43 @@ def test_an_unexpected_failure_is_a_fixed_500_that_names_no_path(stack):
         page.chmod(0o644)
     assert got.status == 500 and got.json == {"error": "internal", "message": "internal error"}
     assert b"member-artifacts.html" not in got.raw and b"Permission" not in got.raw
+
+
+# ------------------------------------------------------------------------------ member_host (own origin, overlap)
+def test_without_member_host_the_own_name_is_just_another_wrong_host(stack):
+    assert req(stack, "GET", "/", member=None, host=OWN_HOST).status == 404
+    assert "cross-origin-opener-policy" not in req(stack, "GET", "/", member=None).headers
+
+
+def test_the_member_host_page_csp_and_config_use_its_own_origin(dual_stack):
+    got = req(dual_stack, "GET", "/", member=None, host=OWN_HOST)
+    assert got.status == 200 and got.headers["cross-origin-opener-policy"] == "same-origin"
+    csp = got.headers["content-security-policy"]
+    assert f"connect-src {OWN_ORIGIN}/api/member/ https://auth.lab.example" in csp
+    assert ORIGIN not in csp
+    cfg = req(dual_stack, "GET", "/api/member/config", member=None, host=OWN_HOST)
+    assert cfg.json["redirect_uri"] == f"{OWN_ORIGIN}/my/callback" and cfg.json["logout_uri"] == f"{OWN_ORIGIN}/"
+    assert cfg.headers["cross-origin-opener-policy"] == "same-origin"
+
+
+def test_the_old_host_is_unchanged_while_the_member_host_is_configured(dual_stack):
+    got = req(dual_stack, "GET", "/", member=None)
+    assert got.status == 200 and OWN_ORIGIN not in got.headers["content-security-policy"]
+    assert f"connect-src {ORIGIN}/api/member/" in got.headers["content-security-policy"]
+    assert "cross-origin-opener-policy" not in got.headers
+    cfg = req(dual_stack, "GET", "/api/member/config", member=None).json
+    assert cfg["redirect_uri"] == f"{ORIGIN}/my/callback" and cfg["logout_uri"] == f"{ORIGIN}/"
+
+
+def test_each_host_accepts_only_its_own_origin_on_writes(dual_stack):
+    body = {"title": "t", "filename": "a.html", "profile": "web"}
+    assert req(dual_stack, "POST", "/api/member/artifacts", body=body, host=OWN_HOST, origin=OWN_ORIGIN).status != 403
+    assert req(dual_stack, "POST", "/api/member/artifacts", body=body, host=OWN_HOST, origin=ORIGIN).status == 403
+    assert req(dual_stack, "POST", "/api/member/artifacts", body=body, host=HOST, origin=OWN_ORIGIN).status == 403
+    assert req(dual_stack, "POST", "/api/member/artifacts", body=body, host=HOST, origin=ORIGIN).status != 403
+
+
+@pytest.mark.parametrize("bad", ["Own.Lab.Example", "https://own.lab.example", "own.lab.example:8443", "", HOST])
+def test_a_bad_member_host_is_refused(tmp_path, bad) -> None:
+    with pytest.raises(ValueError, match="member_host"):
+        next(_stack(tmp_path, member_host=bad))

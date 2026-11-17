@@ -147,10 +147,19 @@ class MemberWeb:
 
     def __init__(self, service: CollabService, *, public_host: str, session_secret: bytes, session_seconds: int = 14400,
                  web_root: Path | None = None, public_config: Mapping[str, Any] | None = None,
-                 require_https: bool = False, clock: Callable[[], float] | None = None):
+                 require_https: bool = False, clock: Callable[[], float] | None = None,
+                 member_host: str | None = None):
         self.service = service
         self.public_host = public_host
         self.origin = f"https://{public_host}"
+        # Optional own origin for the member UI, served IN ADDITION to public_host (None: exactly as before).
+        if member_host is not None:
+            from .members_config import valid_public_host
+
+            if not valid_public_host(member_host) or member_host == public_host:
+                raise ValueError("member_host must be a lowercase DNS name other than public_host")
+        self.member_host = member_host
+        self.member_origin = f"https://{member_host}" if member_host else None
         self.secret = session_secret
         self.session_seconds = session_seconds
         self.web_root = Path(web_root) if web_root else None
@@ -166,7 +175,18 @@ class MemberWeb:
         if len(hosts) != 1:
             return False
         host = hosts[0].strip().lower()
+        if self.member_host and host in (self.member_host, self.member_host + ":443"):
+            return True
         return host == self.public_host or host == self.public_host + ":443"
+
+    def _on_member_host(self, h) -> bool:
+        hosts = h.headers.get_all("Host") or []
+        return bool(self.member_host) and len(hosts) == 1 and hosts[0].strip().lower() in (
+            self.member_host, f"{self.member_host}:443")
+
+    def _origin(self, h) -> str:
+        """The origin this request arrived on: the member host's when it names it, else the public host's."""
+        return self.member_origin if self.member_origin and self._on_member_host(h) else self.origin
 
     def handle(self, h) -> None:
         """Answer the request completely; never raises."""
@@ -198,6 +218,8 @@ class MemberWeb:
         h.send_header("Content-Length", str(len(payload)))
         for name, value in (headers or {}).items():
             h.send_header(name, value)
+        if self._on_member_host(h):
+            h.send_header("Cross-Origin-Opener-Policy", "same-origin")
         if h.close_connection:
             h.send_header("Connection", "close")
         h.end_headers()
@@ -238,7 +260,7 @@ class MemberWeb:
             raise _Reply(405, "method_not_allowed", "method not allowed")
         if method != "GET":
             origins = h.headers.get_all("Origin") or []
-            if len(origins) != 1 or origins[0] != self.origin:
+            if len(origins) != 1 or origins[0] != self._origin(h):
                 raise _Reply(403, "forbidden", "forbidden")
             if query:                                           # no write route takes one
                 raise _bad()
@@ -271,9 +293,10 @@ class MemberWeb:
         cognito = self._cognito_origin()
         # Exact files, never 'self': the same origin serves member-uploaded bundles (/s/<token>/f/x.js), which a bare
         # 'self' would let an HTML-injection bug load as a script and drive this API.
-        connect = f"{self.origin}/api/member/" + (f" {cognito}" if cognito else "")
-        scripts = " ".join(f"{self.origin}{u}" for u in _STATIC if u.endswith(".js"))
-        styles = " ".join(f"{self.origin}{u}" for u in _STATIC if u.endswith(".css"))
+        origin = self._origin(h)
+        connect = f"{origin}/api/member/" + (f" {cognito}" if cognito else "")
+        scripts = " ".join(f"{origin}{u}" for u in _STATIC if u.endswith(".js"))
+        styles = " ".join(f"{origin}{u}" for u in _STATIC if u.endswith(".css"))
         csp = (f"default-src 'none'; script-src {scripts}; style-src {styles}; "
                f"img-src 'self' data:; font-src 'self'; connect-src {connect}; frame-src 'none'; object-src 'none'; "
                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
@@ -294,7 +317,7 @@ class MemberWeb:
         if not isinstance(client_id, str) or not client_id or domain is None:
             raise _Reply(503, "unavailable", "sign-in is not configured")
         self._json(h, {"cognito_domain": domain, "client_id": client_id,
-                       "redirect_uri": f"{self.origin}/my/callback", "logout_uri": f"{self.origin}/",
+                       "redirect_uri": f"{self._origin(h)}/my/callback", "logout_uri": f"{self._origin(h)}/",
                        "http_chunks_per_request": self.service.member_service.config.http_chunks_per_request})
 
     def _single(self, h, name: str, *, limit: int = MAX_TOKEN_CHARS) -> str:
