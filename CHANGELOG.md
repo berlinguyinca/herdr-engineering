@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Claude Code: the default engineering workflow registers itself as managed hooks
+- New `herdr-eng workflow plan|install|status|doctor|repair|uninstall` (and `scripts/install.sh` step 7c, on by default; `--no-workflow-hooks` or `HERDR_INSTALL_WORKFLOW_HOOKS=0` opts out) writes two hooks into `~/.claude/settings.json`, marked `herdr-workflow:managed`: `SessionStart` prints a short engineering-defaults reminder (sonnet delegation, evidence before claims, branch -> PR -> CI, real deps, never push herdr-engineering, nothing under /tmp, Woodpecker CI, `/handoff`), and `PreCompact` prints a reminder to run `/handoff` first. Both only print, always exit 0, and are guarded by `[ -x <python> ] && ... || true`, where the command is `<installing python> -m herdr_engineering.cli` (not `herdr-eng` from `PATH`). The hooks never run `herdr-handoff`.
+- Reuses the herdr-memory `ClaudeHooksUnit` with its own marker (`marker` class attribute), so foreign hooks and the herdr-memory hooks are untouched, writes are atomic and backed up (the first backup is kept pristine), a second run is a no-op, and invalid JSON is never rewritten. See `docs/operations/workflow-hooks.md` and `docs/operations/handoff.md`.
+
 ### Fix: `/api/auth/open` no longer waits on the audit write
 
 - The open-owner sign-in queued its audit entry synchronously: `audit_record` holds the assistant store lock across the durable write and a full snapshot persist, so any contention there (a stall of 70.6 s was seen on 2026-11-17 against a normal 1.3 s) stalled the phone's first launch past its 8 s timeout. The entry now goes to a bounded background queue (256, drop-and-log on overflow, flushed on `RakazoBridge.close`); password sign-in and sign-out still audit inline. Rate limit and tailnet/origin checks are unchanged.
