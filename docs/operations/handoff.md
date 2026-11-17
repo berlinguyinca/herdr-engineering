@@ -163,6 +163,52 @@ Hindsight Memory, CONTRACT.md). It is produced by `herdr-handoff` only when a
 Claude Code `PreCompact` hook. It **only prompts**: it prints a message
 recommending `/handoff` (a new Herdr pane, same harness) before the context is
 compacted. It does not run `herdr-handoff`, create or sync a package, open a pane,
-or publish anything. Automatic handoff triggers are still intentionally not
-installed; the decision to hand off stays with the person. Remove the hook with
+or publish anything. The automatic context trigger below exists but is not
+installed by default; the decision to hand off stays with the person unless they
+opt in. Remove the hook with
 `herdr-eng workflow uninstall`. Details: `docs/operations/workflow-hooks.md`.
+
+## Opt-in automatic trigger: hand off when the context fills up
+
+`herdr-eng handoff context-hook claude` is a Claude Code `UserPromptSubmit` hook
+body. It is **not installed by default**. When the session's context usage reaches
+the threshold it injects an instruction (`hookSpecificOutput.additionalContext`)
+telling the agent to finish or record running subagents and run the `/handoff`
+skill now, which hands over to a successor pane and closes this one. The hook
+cannot write the handoff itself; it only injects the instruction, at most once per
+`session_id` (marker files under `$HERDR_ENGINEERING_STATE/handoff-context`,
+default `~/.local/share/herdr-engineering/state/handoff-context`).
+
+Context used is read from the last assistant message in the transcript:
+`input_tokens + cache_read_input_tokens + cache_creation_input_tokens`. Below the
+threshold, with a missing transcript, bad input or any error, it prints nothing and
+exits 0, so it never blocks a prompt.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HERDR_HANDOFF_CONTEXT_THRESHOLD` | `0.50` | fraction of the window that triggers the instruction |
+| `HERDR_HANDOFF_CONTEXT_MAX_TOKENS` | `200000` | context window size |
+| `HERDR_HANDOFF_AUTO` | unset | `0` disables the hook |
+
+Known limitation: the window defaults to 200000 tokens. Models with a 1M-token
+context need `HERDR_HANDOFF_CONTEXT_MAX_TOKENS=1000000`, otherwise the hook fires
+too early.
+
+To opt in, add this to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -x \"$HOME/.local/bin/herdr-eng\" ] && \"$HOME/.local/bin/herdr-eng\" handoff context-hook claude || true # herdr-handoff-auto"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
