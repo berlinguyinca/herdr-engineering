@@ -79,3 +79,34 @@ $ sha256sum snap.html snap2.html                     # render twice
   checkout). `bash -n` passes on both the stub and the `HEAD` (`git show
   HEAD:deploy/control-plane/deploy.sh`) copy. The stub is intentionally not committed:
   it hard-codes an operator-local path and is not part of the spec delivery.
+
+## 2026-11-17T07:50Z — Repair pass 2: re-verified on current `origin/main`
+
+The earlier entries in this log were written against `b30a634a`. `origin/main`
+has since advanced (`bce82271`); this pass re-runs the gates on the current
+main and records the environment fix that the earlier "Blockers" note flagged.
+
+- Delivery path: `main` is now branch-protected ("Changes must be made through
+  a pull request", GH013). The two docs commits were pushed on
+  `docs/system-graph-exec-log` and merged into `main` as
+  `53f076f7` + `d7ea4d77` via PR #854 (`gh pr view 854` →
+  `state: MERGED`, `mergedAt: 2026-11-17T07:44:03Z`). Local `main` was then
+  reset to `origin/main` (`d7ea4d77`), so `git diff origin/main -- docs` is
+  empty and the branch was deleted on the remote.
+- Environment fix: `tests/control_plane/test_graph.py` had 4 HTTP failures
+  (`assert 500 == 200`) caused by `ModuleNotFoundError: No module named
+  'msgpack'` inside `artifact_host_client.py:28`, reached from
+  `api.py:3347`. Installed `msgpack 1.2.4` into `.venv`; the failures are
+  environment-only, not product regressions. This closes the "6 control-plane
+  test files error at collection locally due to missing deps" note above.
+- Gate re-runs after the fix (all green, this session):
+  - `test_graph.py test_graph_history.py test_graph_artifact.py
+     test_graph_slices.py` → **101 passed** (11.58s) — matches gate #12.
+  - `test_graph_membership.py test_graph_ingest.py
+     test_artifact_graph_routes.py` → **59 passed** (11.56s).
+  - `tests/test_ci_gate_routing.py` → **32 passed** (1.88s).
+  - `tests/test_deploy_scripts.py` → **155 passed** (697.61s).
+- `deploy/control-plane/deploy.sh` remains an uncommitted operator-local
+  routing stub to `~/.local/bin/herdr-deploy`; `bash -n` passes on both the
+  stub and `git show HEAD:deploy/control-plane/deploy.sh`. It is deliberately
+  not committed (hard-coded operator path, out of spec scope).
