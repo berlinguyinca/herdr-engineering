@@ -428,7 +428,9 @@ def _recover_repository(repo, source):
                 structured=prepared['structured'],coverage=prepared['coverage'])
             mode='checkpoint'
         except (ValueError,KeyError,TypeError) as exc:
-            log.warning('projection restore rejected; complete replay required: %s',type(exc).__name__)
+            from .projection_refresh import _safe_message
+            log.warning('projection restore rejected; complete replay required: %s: %s',
+                        type(exc).__name__,_safe_message(exc))
             _reset_private(repo)
             prepared = source._run(_read_full_prepared(source))
             checkpoint=None
