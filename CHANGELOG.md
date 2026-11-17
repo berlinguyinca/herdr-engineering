@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: a dead Pi registration no longer blocks its host forever
+
+- `fleet rollout`: `_live` reported "no reachable registration" and "two live registrations claiming one conversation" with the same untyped error (`session identity missing or ambiguous`), and `retire_identityless` deliberately refuses that untyped text because it cannot tell a stale husk from a real disagreement. A session whose instance is therefore gone was un-settle-able by design: every pass repeated the refusal, every later plan re-read the same registrations and reproduced the block, and the host stayed `blocked` with no supported way past it. The two cases are now distinct -- zero reachable rows raise the typed `MissingInstanceIdentity` refusal ("has no live instance to act on", `blockReason=identity_missing`), which the operator can settle with `fleet rollout retire-identityless`, while more than one live row keeps the untyped ambiguity refusal and is still never retired. Observed on the live fleet: 80 of 143 blocked session entries across 17 rollout records carried that one error, 60 of them with no `pid` at all, and the same registrations recurred in up to 6 of 17 plans.
+
 ### Fix: phone Assistants tab lists only online agent bots
 
 - `bots/list` (and the bootstrap payload built from it) now returns only collab agents that are online; stale tokenless-join test agents no longer flood the tab. Nothing is revoked or deleted: an offline agent still resolves through `bots/get`, `threads/get` and `threads/send` by id. A separate list of offline agents is not exposed (the archived list means disabled assistants and `bots/restore` cannot restore an agent).
