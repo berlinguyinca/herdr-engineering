@@ -5221,8 +5221,9 @@ def _members_settings(cp) -> dict | None:
     share = cp.get("share") if isinstance(cp, dict) else None
     host = share.get("public_host") if isinstance(share, dict) else None
     seconds = share.get("session_seconds") if isinstance(share, dict) else None
+    own = share.get("member_host") if isinstance(share, dict) else None
     try:
-        return parse_members(raw, public_host=host, session_seconds=seconds)
+        return parse_members(raw, public_host=host, session_seconds=seconds, member_host=own)
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
 
@@ -5242,7 +5243,7 @@ def _member_web(cp, collab, args):
         return None
     from .control_plane.member_web import MemberWeb
     return MemberWeb(collab, public_host=got["public_host"], session_secret=got["session_secret"].encode("utf-8"),
-                     session_seconds=got["session_seconds"],
+                     session_seconds=got["session_seconds"], member_host=got.get("member_host"),
                      web_root=getattr(args, "web_root", None), public_config=collab.public_config,
                      require_https=bool(getattr(args, "collab_require_https", False)))
 

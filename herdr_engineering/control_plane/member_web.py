@@ -174,15 +174,15 @@ class MemberWeb:
         hosts = h.headers.get_all("Host") or []
         if len(hosts) != 1:
             return False
-        host = hosts[0].strip().lower()
-        if self.member_host and host in (self.member_host, self.member_host + ":443"):
+        if self._on_member_host(h):
             return True
+        host = hosts[0].strip().lower()
         return host == self.public_host or host == self.public_host + ":443"
 
     def _on_member_host(self, h) -> bool:
         hosts = h.headers.get_all("Host") or []
-        return bool(self.member_host) and len(hosts) == 1 and hosts[0].strip().lower() in (
-            self.member_host, f"{self.member_host}:443")
+        return bool(self.member_host) and len(hosts) == 1 and hosts[0].strip() in (
+            self.member_host, f"{self.member_host}:443")      # exact as sent: no case folding on the member origin
 
     def _origin(self, h) -> str:
         """The origin this request arrived on: the member host's when it names it, else the public host's."""

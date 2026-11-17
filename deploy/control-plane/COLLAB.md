@@ -329,7 +329,19 @@ validates the slice and the compose files without printing any secret.
     (6) deploy.
   - Phase 2 (follow-up, not in this change): redirect the old host's member pages to the new origin.
   - Phase 3 (follow-up): remove the member routes from the old host and the old Cognito URLs.
-  - Not wired: the legacy share-public `MemberWeb` accepts a `member_host` argument, but no fleet config feeds it.
+  - Legacy share path: `control_plane.share.member_host` does the same for the share-public path (collab-public's
+    `MemberWeb`), for example `my.artifacts.local.metabolomics.us` next to a `share.public_host` of
+    `artifacts.local.metabolomics.us`. It needs `control_plane.collab.members.enabled: true`, is validated as a lowercase
+    DNS name distinct from `share.public_host` and the collab host, and is copied into the collab slice and the share
+    slice (never authored under `collab.members`). Behaviour matches the artifact host: the member routes use the
+    member origin for `redirect_uri`, `logout_uri` and the CSP, COOP is `same-origin` there, the Host must match exactly
+    (other spellings, a second Host header and `X-Forwarded-Host` get 404), and `/s/` is 404 on it. The old share host
+    keeps serving the member routes unchanged. The edge renders one extra server block (member locations only,
+    everything else 404, same listen/TLS/limits/headers) only when it is set; `deploy.sh` refuses a certificate that
+    does not name it and probes `/s/probe/` on it (expects 404). Unset, the render and behavior are byte-identical.
+    Owner steps already done for that name: DNS A record, certificate SAN, and Cognito callback
+    `https://my.artifacts.local.metabolomics.us/my/callback` plus sign-out `https://my.artifacts.local.metabolomics.us/`
+    (the old ones are kept). The remaining step: set `control_plane.share.member_host` and deploy.
 - Check: `tests/test_artifact_host_compose.py` parses the files and, when Docker is available (required under CI or
   `HERDR_REQUIRE_DOCKER=1`), starts the stack and runs `nginx -t` on the rendered edge.
 

@@ -78,7 +78,7 @@ def dual_stack(tmp_path):
     yield from _stack(tmp_path, member_host=OWN_HOST)
 
 
-def _stack(tmp_path, **member_web_kwargs):
+def _stack(tmp_path, cp=None, **member_web_kwargs):
     web = tmp_path / "web"
     web.mkdir()
     (web / "member-artifacts.html").write_text("<!doctype html><title>member</title>")
@@ -89,9 +89,13 @@ def _stack(tmp_path, **member_web_kwargs):
     world.write_grants(max_pending_intents_per_agent=50)      # the cap itself is tested below
     world.view("op", [ART])
     world.view("lab", [OTHER])
-    mw = MemberWeb(svc, public_host=HOST, session_secret=SECRET, session_seconds=3600, web_root=web,
-                   require_https=True, **member_web_kwargs)
-    srv = ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, collab=svc, public_port=0, web_root=web,
+    if cp is not None:      # the production wiring: the member web built from the fleet config, as share-public does
+        from herdr_engineering import cli
+        mw = cli._member_web(cp, svc, SimpleNamespace(collab_only=True, web_root=web, collab_require_https=True))
+    else:
+        mw = MemberWeb(svc, public_host=HOST, session_secret=SECRET, session_seconds=3600, web_root=web,
+                       require_https=True, **member_web_kwargs)
+    srv =ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, collab=svc, public_port=0, web_root=web,
                              collab_require_https=True, member_web=mw)
     t = threading.Thread(target=srv.serve, daemon=True)
     t.start()
@@ -816,3 +820,117 @@ def test_each_host_accepts_only_its_own_origin_on_writes(dual_stack):
 def test_a_bad_member_host_is_refused(tmp_path, bad) -> None:
     with pytest.raises(ValueError, match="member_host"):
         next(_stack(tmp_path, member_host=bad))
+
+
+# ------------------------------------------------------------------------------ member_host fed from the fleet config
+def share_cp(**share_over):
+    """The legacy share path's config: control_plane.share.member_host feeds MemberWeb."""
+    cp = members_cp(session_secret=SECRET.decode())
+    cp["share"] = {"public_host": HOST, "session_seconds": 3600, **share_over}
+    return cp
+
+
+@pytest.fixture
+def cfg_stack(tmp_path):
+    yield from _stack(tmp_path, cp=share_cp(member_host=OWN_HOST))
+
+
+@pytest.fixture
+def cfg_stack_off(tmp_path):
+    yield from _stack(tmp_path, cp=share_cp())
+
+
+def test_cli_feeds_member_host_from_the_share_config(stack):
+    from herdr_engineering import cli
+    args = SimpleNamespace(collab_only=True, web_root=stack.web, collab_require_https=True)
+    mw = cli._member_web(share_cp(member_host=OWN_HOST), stack.s, args)
+    assert (mw.member_host, mw.member_origin, mw.public_host) == (OWN_HOST, OWN_ORIGIN, HOST)
+    assert cli._member_web(share_cp(), stack.s, args).member_host is None
+
+
+def test_member_host_reaches_collab_public_through_the_rendered_slice(stack, tmp_path):
+    """collab-public loads only the rendered collab slice, never ``control_plane.share``: build exactly that file."""
+    from herdr_engineering import cli
+    from herdr_engineering import fleet_config_cli as fcc
+    from herdr_engineering.fleet_config import load_fleet_config
+    from tests.test_members_deploy_config import cfg_of, members, share
+    args = SimpleNamespace(collab_only=True, web_root=stack.web, collab_require_https=True)
+    out = tmp_path / "with.json"
+    fcc.render_collab(cfg_of(tmp_path / "w", sh=share(member_host="my.artifacts.example.test"), mem=members()), out)
+    cp = load_fleet_config(out).section("control_plane")
+    assert "share" not in cp
+    mw = cli._member_web(cp, stack.s, args)
+    assert (mw.public_host, mw.member_host) == ("artifacts.example.test", "my.artifacts.example.test")
+    out2 = tmp_path / "without.json"
+    fcc.render_collab(cfg_of(tmp_path / "wo", sh=share(), mem=members()), out2)
+    assert cli._member_web(load_fleet_config(out2).section("control_plane"), stack.s, args).member_host is None
+
+
+def test_unset_the_config_built_member_web_is_exactly_the_old_one(cfg_stack_off):
+    assert req(cfg_stack_off, "GET", "/", member=None, host=OWN_HOST).status == 404
+    got = req(cfg_stack_off, "GET", "/", member=None)
+    assert got.status == 200 and "cross-origin-opener-policy" not in got.headers
+    assert f"connect-src {ORIGIN}/api/member/" in got.headers["content-security-policy"]
+
+
+def test_member_host_page_config_csp_and_coop_use_its_own_origin(cfg_stack):
+    page = req(cfg_stack, "GET", "/", member=None, host=OWN_HOST)
+    assert page.status == 200 and page.headers["cross-origin-opener-policy"] == "same-origin"
+    csp = page.headers["content-security-policy"]
+    assert f"connect-src {OWN_ORIGIN}/api/member/ https://auth.lab.example" in csp and ORIGIN not in csp
+    cfg = req(cfg_stack, "GET", "/api/member/config", member=None, host=OWN_HOST)
+    assert cfg.json["redirect_uri"] == f"{OWN_ORIGIN}/my/callback" and cfg.json["logout_uri"] == f"{OWN_ORIGIN}/"
+    assert cfg.headers["cross-origin-opener-policy"] == "same-origin"
+    assert req(cfg_stack, "GET", "/my/", member=None, host=OWN_HOST).status == 200
+    assert req(cfg_stack, "GET", "/my/callback", member=None, host=OWN_HOST).status == 200
+    assert req(cfg_stack, "GET", "/api/member/me", host=OWN_HOST).status == 200
+
+
+def test_the_old_share_host_keeps_serving_member_routes_unchanged(cfg_stack):
+    page = req(cfg_stack, "GET", "/", member=None)
+    assert page.status == 200 and "cross-origin-opener-policy" not in page.headers
+    assert OWN_ORIGIN not in page.headers["content-security-policy"]
+    cfg = req(cfg_stack, "GET", "/api/member/config", member=None).json
+    assert cfg["redirect_uri"] == f"{ORIGIN}/my/callback" and cfg["logout_uri"] == f"{ORIGIN}/"
+    assert req(cfg_stack, "GET", "/api/member/me").status == 200
+
+
+def test_share_routes_and_everything_else_are_404_on_the_member_host(cfg_stack):
+    token = "A" * 43
+    for path in (f"/s/{token}/", f"/s/{token}/f/index.html", "/s/callback", "/healthz", "/internal/x", "/mcp/artifacts",
+                 "/nothing", "/api/v1/status"):
+        got = req(cfg_stack, "GET", path, member=None, host=OWN_HOST)
+        assert got.status == 404, path
+
+
+def test_writes_on_each_host_accept_only_that_hosts_origin(cfg_stack):
+    body = {"title": "t", "filename": "a.html", "profile": "web"}
+    assert req(cfg_stack, "POST", "/api/member/artifacts", body=body, host=OWN_HOST, origin=OWN_ORIGIN).status != 403
+    assert req(cfg_stack, "POST", "/api/member/artifacts", body=body, host=OWN_HOST, origin=ORIGIN).status == 403
+    assert req(cfg_stack, "POST", "/api/member/artifacts", body=body, host=HOST, origin=OWN_ORIGIN).status == 403
+    assert req(cfg_stack, "POST", "/api/member/artifacts", body=body, host=HOST, origin=ORIGIN).status != 403
+
+
+@pytest.mark.parametrize("hosts", [
+    [OWN_HOST.upper()], [OWN_HOST.title()], [OWN_HOST + "."], [OWN_HOST + ":8443"], [OWN_HOST + ".evil"],
+    [OWN_HOST, "other.example"], ["other.example", OWN_HOST], [OWN_HOST, OWN_HOST], [],
+])
+def test_a_spoofed_member_host_is_a_404_on_every_member_route(cfg_stack, hosts):
+    extra = tuple(f"Host: {h}" for h in hosts)
+    for path in ("/", "/my/", "/my/callback", "/api/member/config", "/api/member/me"):
+        got = req(cfg_stack, "GET", path, member="op", host=None, extra=extra)
+        assert got.status == 404, (path, hosts)
+
+
+def test_the_member_host_accepts_its_port_443_spelling_only(cfg_stack):
+    assert req(cfg_stack, "GET", "/api/member/config", member=None, host=OWN_HOST + ":443").status == 200
+    assert req(cfg_stack, "GET", "/api/member/config", member=None, host=OWN_HOST + ":444").status == 404
+
+
+def test_forwarded_host_never_moves_the_member_origin(cfg_stack):
+    cfg = req(cfg_stack, "GET", "/api/member/config", member=None, host=OWN_HOST,
+              extra=(f"X-Forwarded-Host: {HOST}", f"Forwarded: host={HOST}"))
+    assert cfg.json["redirect_uri"] == f"{OWN_ORIGIN}/my/callback"
+    cfg = req(cfg_stack, "GET", "/api/member/config", member=None, host=HOST, extra=(f"X-Forwarded-Host: {OWN_HOST}",))
+    assert cfg.json["redirect_uri"] == f"{ORIGIN}/my/callback"
+    assert "cross-origin-opener-policy" not in cfg.headers
