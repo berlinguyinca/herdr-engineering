@@ -165,8 +165,10 @@ Pi agents remains coverage-unverified rather than silently succeeding.
   compared. Any change, or any inability to compare (release without `.git`, either
   commit unavailable, git or transport error), keeps `bootstrap_required`. The Host
   paths are the fixed list `HOST_CODE_PATHS` in `herdr_engineering/fleet_rollout.py`
-  (`src/runtime/host/`, `package.json` and the rest of the stable Host's import
-  closure). Staged releases are depth-1 clones, so a missing old `hostCommit` is
+  (`src/runtime/host/` and the rest of the stable Host's import closure). `package.json`
+  is compared parsed through `git show`, ignoring only `scripts` and `devDependencies`
+  (the Host never reads them); `hostAcceptance.packageJsonIgnoredKeys` records that.
+  An unreadable or unparsable `package.json` keeps `bootstrap_required`. Staged releases are depth-1 clones, so a missing old `hostCommit` is
   fetched without network access from the sibling release
   `pi/releases/<hostCommit>` when that directory still exists; otherwise the
   session stays `bootstrap_required`.
