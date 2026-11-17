@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: inspector readers no longer wait on a durable write
+
+- `InspectorStore.ingest` held the store-wide lock across the durable sink write. The sink serialises every write behind one asyncpg connection and a write lock, so under an ingest burst the lock holder waited behind unrelated writes and every reader (`agents/list` via `phone_digest`, `health`, `has_session`, `newest_seq`) waited with it; `agents/list` took up to 30 s on bender on 2026-11-17. The durable write now runs with the store lock released; ingest writers, `sweep`, `set_prefs` and checkpoint restore are serialised by a separate ingest lock (order: ingest lock, store lock, sink lock) and a reader sees the state from before an event until that event is durable, as before.
+- Measured on bender (py-spy, 2300 samples over 100 s): readers blocked on the inspector lock in 10% of samples, the lock holder blocked on the sink write lock in 4%.
+
 ### Claude Code: the default engineering workflow registers itself as managed hooks
 - New `herdr-eng workflow plan|install|status|doctor|repair|uninstall` (and `scripts/install.sh` step 7c, on by default; `--no-workflow-hooks` or `HERDR_INSTALL_WORKFLOW_HOOKS=0` opts out) writes two hooks into `~/.claude/settings.json`, marked `herdr-workflow:managed`: `SessionStart` prints a short engineering-defaults reminder (sonnet delegation, evidence before claims, branch -> PR -> CI, real deps, never push herdr-engineering, nothing under /tmp, Woodpecker CI, `/handoff`), and `PreCompact` prints a reminder to run `/handoff` first. Both only print, always exit 0, and are guarded by `[ -x <python> ] && ... || true`, where the command is `<installing python> -m herdr_engineering.cli` (not `herdr-eng` from `PATH`). The hooks never run `herdr-handoff`.
 - Reuses the herdr-memory `ClaudeHooksUnit` with its own marker (`marker` class attribute), so foreign hooks and the herdr-memory hooks are untouched, writes are atomic and backed up (the first backup is kept pristine), a second run is a no-op, and invalid JSON is never rewritten. See `docs/operations/workflow-hooks.md` and `docs/operations/handoff.md`.
