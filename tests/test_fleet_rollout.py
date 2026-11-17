@@ -153,6 +153,9 @@ def apply(store, plan, wire):
                 assert remote[-2:] == ["api", "snapshot"]
                 reply = {"result": {"snapshot": {"agents": wire.native({"host": host})}}}
             return subprocess.CompletedProcess(argv, 0, json.dumps(reply), "")
+        if remote[0] == "env":
+            # The Host-equivalence probe is real git against a real release directory.
+            return subprocess.run(remote, capture_output=True, text=True, timeout=30)
         assert remote[0] == "node"
         root = remote[1].removesuffix("/scripts/pi-engineering.ts")
         if remote[3] == "list":
@@ -1718,3 +1721,156 @@ def test_retire_identityless_is_a_supported_command():
     assert args.rollout_command == "retire-identityless"
     assert args.id == "2a94fdcfa602409989400171a2cd46df"
     assert args.settled_by == "operator"
+
+
+# --- Host code equivalence -------------------------------------------------
+
+
+def _git(cwd, *args):
+    import subprocess
+
+    env = {
+        "PATH": __import__("os").environ["PATH"],
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+    out = subprocess.run(
+        ["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True, env=env
+    )
+    return out.stdout.strip()
+
+
+def _commit(repo, files, message):
+    for name, text in files.items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", message)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+class HostWorld:
+    """Real source repo plus the staged-release layout the Pi stager produces."""
+
+    def __init__(self, tmp_path, changes):
+        self.home = tmp_path / "home"
+        self.releases = self.home / ".local/share/herdr-engineering/pi/releases"
+        self.releases.mkdir(parents=True)
+        self.source = tmp_path / "source"
+        self.source.mkdir()
+        _git(self.source, "init", "-q")
+        base = {
+            "package.json": "{}",
+            "src/runtime/host/entry.ts": "export const a = 1;\n",
+            "src/runtime/other.ts": "export const b = 1;\n",
+        }
+        self.old = _commit(self.source, base, "old")
+        self.new = _commit(self.source, changes, "new")
+
+    def stage_release(self, commit, *, shallow):
+        """Mirror ansible/files/stage-release.py: a depth-1 clone of one commit."""
+        release = self.releases / commit
+        _git(release.parent, "init", "-q", str(release))
+        _git(release, "remote", "add", "origin", self.source.as_uri())
+        _git(release, "fetch", "-q", *(["--depth", "1"] if shallow else []), "origin", commit)
+        _git(release, "checkout", "-q", "--detach", "FETCH_HEAD")
+        return release
+
+
+def _host_result(tmp_path, changes, host_commit, *, stage_old=False, shallow=True):
+    from herdr_engineering.fleet_rollout import RolloutStore, create_rollout
+
+    world = HostWorld(tmp_path, changes)
+    release = world.stage_release(world.new, shallow=shallow)
+    if stage_old:
+        world.stage_release(world.old, shallow=shallow)
+    wire = Wire()
+    wire.offline = set()
+    revision = world.new
+    wire.stage = lambda rev, *, host, inventory: {
+        "ok": True,
+        "revision": rev,
+        "host": host,
+        "sourceRoot": str(release),
+    }
+    runtime = wire.rows["bender"]["reply"]["data"]["runtime"]
+    runtime["commit"] = revision
+    runtime["hostCommit"] = {"old": world.old, "new": world.new}.get(host_commit, host_commit)
+    wire.rows["bender"]["reply"]["data"]["missions"] = []
+    store = RolloutStore(tmp_path / "state")
+    plan = create_rollout(
+        store,
+        revision,
+        [{"host": "bender", "sshTarget": "bender", "port": 22, "local": False}],
+        inventory=tmp_path / "inventory.yml",
+    )
+    result = apply(store, plan, wire)
+    return world, result["hosts"]["bender"]["sessions"]["bender-conversation"]
+
+
+def test_host_commit_equal_to_release_is_current(tmp_path):
+    _, state = _host_result(tmp_path, {"src/runtime/other.ts": "x"}, "new")
+    assert state["status"] != "bootstrap_required"
+    assert "hostAcceptance" not in state
+
+
+def test_unchanged_host_files_are_accepted_by_code_equivalence(tmp_path):
+    world, state = _host_result(
+        tmp_path, {"src/runtime/other.ts": "export const b = 2;\n"}, "old", stage_old=True
+    )
+    assert state["status"] != "bootstrap_required"
+    assert state["hostAcceptance"]["mode"] == "code-equivalence"
+    assert state["hostAcceptance"]["hostCommit"] == world.old
+    assert state["hostAcceptance"]["revision"] == world.new
+
+
+def test_unchanged_host_files_accepted_when_both_commits_are_present(tmp_path):
+    world, state = _host_result(
+        tmp_path, {"src/runtime/other.ts": "export const b = 2;\n"}, "old", shallow=False
+    )
+    assert state["hostAcceptance"]["hostCommit"] == world.old
+
+
+@pytest.mark.parametrize("path", ["src/runtime/host/entry.ts", "package.json"])
+def test_changed_host_file_still_needs_bootstrap(tmp_path, path):
+    _, state = _host_result(tmp_path, {path: "changed"}, "old", stage_old=True)
+    assert state["status"] == "bootstrap_required"
+    assert "hostAcceptance" not in state
+
+
+def test_unknown_host_commit_still_needs_bootstrap(tmp_path):
+    _, state = _host_result(tmp_path, {"src/runtime/other.ts": "x"}, "c" * 40)
+    assert state["status"] == "bootstrap_required"
+
+
+def test_unreachable_old_commit_in_shallow_release_still_needs_bootstrap(tmp_path):
+    _, state = _host_result(tmp_path, {"src/runtime/other.ts": "x"}, "old")
+    assert state["status"] == "bootstrap_required"
+
+
+def test_release_without_git_still_needs_bootstrap(tmp_path):
+    import shutil
+
+    from herdr_engineering.fleet_rollout import PiTransport
+
+    world = HostWorld(tmp_path, {"src/runtime/other.ts": "x"})
+    release = world.stage_release(world.new, shallow=False)
+    shutil.rmtree(release / ".git")
+    target = {"host": "bender", "sshTarget": "bender", "port": 22, "local": True}
+    assert PiTransport().host_code_unchanged(target, str(release), world.old, world.new) is None
+
+
+def test_ambient_git_dir_cannot_redirect_the_probe(tmp_path, monkeypatch):
+    from herdr_engineering.fleet_rollout import PiTransport
+
+    world = HostWorld(tmp_path, {"src/runtime/host/entry.ts": "changed"})
+    release = world.stage_release(world.new, shallow=False)
+    monkeypatch.setenv("GIT_DIR", str(world.source / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path))
+    target = {"host": "bender", "sshTarget": "bender", "port": 22, "local": True}
+    assert PiTransport().host_code_unchanged(target, str(release), world.old, world.new) is False

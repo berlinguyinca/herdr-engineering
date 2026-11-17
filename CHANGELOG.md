@@ -156,6 +156,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - `test_target_management_cli_enable_and_migration_safety` inherited the host environment; a CI agent exporting `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR` made the migrator report "Explicit target setting remains authoritative" instead of "same filesystem". The test now drops those two variables from the child environment and separately asserts the explicit-override verdict. No production code changed.
 
+### Rakazo default assistant: review fixes
+- Bots: every bot-meta read-modify-write (archive, restore, set-computer, mark-unread, sections, default flag) runs under one reentrant lock, so clearing the default can no longer drop `archivedAt`. Archiving clears `isDefault`; `bots/update` with `isDefault: true` on an archived bot returns 409. Tests: `tests/control_plane/test_rakazo_bots.py`.
+
 ### Inspector snapshot boot: used on the complete-replay fallback, strictly validated
 
 - With projection checkpoints on (the default), a missing or rejected checkpoint fell back to a complete replay that ignored `inspector_snapshots` and re-ran every stored inspector row through redaction. That fallback now hands the stored snapshot to the repo, which verifies it by count and ordering and replays everything on any doubt.
