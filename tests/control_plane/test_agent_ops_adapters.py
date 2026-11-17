@@ -324,3 +324,17 @@ def test_herdr_missing_fields_stay_absent_and_off_by_default(open_plane, tmp_pat
     assert agent["model"] is None and agent["context"] is None and agent["provider"] is None
     run_emit(open_plane, tmp_path, "pane.agent_detected", {}, pane="p4", HERDR_AGENT_OPS="0")
     assert "herdr:host-1:srv:p4" not in open_plane.agents(key="")
+
+
+def _real_event(**data):
+    """The payload shape Herdr 0.9 really sends: the fields sit under `data`, not at the top level."""
+    return {"event": "pane_agent_status_changed", "data": {"type": "pane_agent_status_changed", "pane_id": "w1:p1", **data}}
+
+
+def test_herdr_real_nested_event_shape_reaches_the_map(open_plane, tmp_path):
+    run_emit(open_plane, tmp_path, "pane.agent_detected", _real_event(agent="claude"), pane="p7")
+    run_emit(open_plane, tmp_path, "pane.agent_status_changed",
+             _real_event(agent="claude", agent_status="working", tokens={"model": "opus", "ctx": "42%"}), pane="p7")
+    agent = open_plane.agents(key="")["herdr:host-1:srv:p7"]
+    assert agent["state"] == "working" and agent["provider"] == "claude" and agent["model"] == "opus"
+    assert agent["context"] == {"used": 42, "limit": 100, "source": "herdr-ctx-pct"}

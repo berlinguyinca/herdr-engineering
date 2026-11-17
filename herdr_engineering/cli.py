@@ -4283,11 +4283,14 @@ def _assistant_worker_install_hooks(args) -> int:
     return 0
 
 
+_CP_CHECKPOINT_REASON_STAGES = frozenset({'migration', 'index_preparation', 'materialization'})
+
+
 def _cmd_cp_checkpoint(args) -> int:
     import asyncio
 
     from .control_plane.db import Migrator
-    from .control_plane.projection_refresh import refresh_checkpoint
+    from .control_plane.projection_refresh import _safe_message, refresh_checkpoint
     from .control_plane.projection_store import CheckpointInvalid, ProjectionStore
 
     stage = 'configuration'
@@ -4320,8 +4323,11 @@ def _cmd_cp_checkpoint(args) -> int:
     except (Exception, SystemExit) as exc:
         error = {"ok": False, "error": type(exc).__name__, "stage": stage}
         if isinstance(exc, CheckpointInvalid):
-            # Only our own static validation messages are safe to surface.
+            # Only our own static validation messages are safe to surface at any stage.
             error['reason'] = str(exc)
+        elif isinstance(exc, ValueError) and stage in _CP_CHECKPOINT_REASON_STAGES:
+            # After the connection is open; a connection-stage ValueError can quote DSN fragments.
+            error['reason'] = _safe_message(exc)
         _print_json(error)
         return 1
     _print_json({"ok": True, **result})

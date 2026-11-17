@@ -97,7 +97,9 @@ function eventJson(env) {
   if (!raw) return {};
   try {
     const v = JSON.parse(raw);
-    return v && typeof v === "object" ? v : {};
+    if (!v || typeof v !== "object") return {};
+    // Herdr sends {"event": ..., "data": {...}}; flat payloads are still accepted.
+    return v.data && typeof v.data === "object" ? { ...v, ...v.data } : v;
   } catch {
     return {};
   }
