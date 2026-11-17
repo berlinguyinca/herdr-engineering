@@ -2766,6 +2766,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             except ValueError:
                 return self._deny(400, "bad length")
             headers = {k.lower(): v for k, v in self.headers.items()}
+            if len(self.headers.get_all("X-Forwarded-For") or []) > 1:
+                return self._deny(400, "ambiguous forwarded-for chain")   # never guess a client: a loopback proxy would win
             if length < 0 or length > server.rakazo.body_limit(self.path, headers):
                 self.close_connection = True              # the unread body would otherwise be parsed as the next request
                 return self._deny(413, "body too large")
