@@ -163,6 +163,6 @@ def test_tracked_marker_is_accepted_but_other_prose_revisions_are_not(repo):
     lock = repo / "lock" / "upstreams.yaml"
     base = lock.read_text()
     lock.write_text(base + '  screenwright:\n    source: "a/b"\n    revision: "tracking origin/main"\n    decision: ADOPT\n')
-    assert sg.check_lock_and_pin(files_of(repo)) == []
+    assert sg.check_lock_and_pin_agree(files_of(repo)) == []
     lock.write_text(base + '  screenwright:\n    source: "a/b"\n    revision: "latest"\n    decision: ADOPT\n')
-    assert any("'latest'" in f for f in sg.check_lock_and_pin(files_of(repo)))
+    assert any("'latest'" in f for f in sg.check_lock_and_pin_agree(files_of(repo)))
