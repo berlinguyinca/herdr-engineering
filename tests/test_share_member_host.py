@@ -192,6 +192,7 @@ def _set(e, member_host):
     cpv = data["sections"]["control_plane"]["values"]
     cpv["collab"]["members"] = _md.members()
     cpv["collab_artifacts"] = {"enabled": True}
+    cpv["api_keys"] = {"placeholder-api-key-value": "operator"}      # members need API keys (the prerequisite)
     e["central"].unlink()
     fcc.write_private_file(e["central"], yaml.safe_dump(data, sort_keys=False))
 

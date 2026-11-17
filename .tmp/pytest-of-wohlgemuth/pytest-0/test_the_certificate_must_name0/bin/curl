@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+out=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in -o|-m) [ "$1" = -o ] && out="$2"; shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac
+done
+echo "curl $url" >> /Users/wohlgemuth/.local/share/worktrees/herdr-engineering-share-member-host/.tmp/pytest-of-wohlgemuth/pytest-0/test_the_certificate_must_name0/docker.log
+case "$url" in
+  *api/v1/health*)
+    tag="$(cat /Users/wohlgemuth/.local/share/worktrees/herdr-engineering-share-member-host/.tmp/pytest-of-wohlgemuth/pytest-0/test_the_certificate_must_name0/running-tag 2>/dev/null)"
+    [ -n "$tag" ] || exit 7
+    if [ -n "${STUB_READY_AFTER:-}" ]; then
+      count="$(cat /Users/wohlgemuth/.local/share/worktrees/herdr-engineering-share-member-host/.tmp/pytest-of-wohlgemuth/pytest-0/test_the_certificate_must_name0/health-reads 2>/dev/null || echo 0)"
+      count=$((count + 1)); echo "$count" > /Users/wohlgemuth/.local/share/worktrees/herdr-engineering-share-member-host/.tmp/pytest-of-wohlgemuth/pytest-0/test_the_certificate_must_name0/health-reads
+      [ "$count" -gt "$STUB_READY_AFTER" ] || exit 7
+    fi
+    case " ${STUB_UNHEALTHY_TAGS:-} " in *" $tag "*) exit 22 ;; esac
+    echo '{"status":"ok","commit":"'"$tag"'"}' ;;
+  *) echo '{"keys":[{"kid":"k"}]}' > "${out:-/dev/stdout}" ;;
+esac

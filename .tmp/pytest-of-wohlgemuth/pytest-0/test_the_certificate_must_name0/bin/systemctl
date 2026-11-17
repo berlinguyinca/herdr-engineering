@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+echo systemctl "$*" >> /Users/wohlgemuth/.local/share/worktrees/herdr-engineering-share-member-host/.tmp/pytest-of-wohlgemuth/pytest-0/test_the_certificate_must_name0/docker.log
+exit 0

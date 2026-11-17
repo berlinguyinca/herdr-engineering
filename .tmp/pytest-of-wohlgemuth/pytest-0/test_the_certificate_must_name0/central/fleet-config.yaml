@@ -1,0 +1,91 @@
+version: 1
+sections:
+  control_plane:
+    roles:
+    - control-plane
+    values:
+      public_url: https://cp.example.test
+      pg_dsn: postgresql://herdr_b6062bc5:6ea1d4fd0af4e0b04841e5a98daa87e7@postgres:5432/herdr
+      host_aliases: ''
+      api_keys: {}
+      rustfs_endpoint: http://rustfs:9000
+      rustfs_bucket: herdr-artifacts
+      ci_actions: false
+      minio_user: herdr_767c5945
+      minio_password: 1aee7fc09ccf5e1d546832bfd7bfc269
+      compose:
+        HERDR_CP_PG_USER: herdr_b6062bc5
+        HERDR_CP_PG_PASSWORD: 6ea1d4fd0af4e0b04841e5a98daa87e7
+        HERDR_CP_MINIO_USER: herdr_767c5945
+        HERDR_CP_MINIO_PASSWORD: 1aee7fc09ccf5e1d546832bfd7bfc269
+        HERDR_CP_WEB_BIND: 127.0.0.1
+        HERDR_CP_WEB_PUBLIC_PORT: '8080'
+        HERDR_CP_PG_PORT: '5432'
+        GATEWAY_TAILNET_IP: 127.0.0.1
+        HERDR_COLLAB_CERT_DIR: /Users/wohlgemuth/.local/share/worktrees/herdr-engineering-share-member-host/.tmp/pytest-of-wohlgemuth/pytest-0/test_the_certificate_must_name0/edge-certs
+      collab:
+        cognito_pool: us-west-2_TESTPOOL
+        cognito_clients:
+        - client-a
+        cognito_group: team.test
+        cognito_web_client: webclient1
+        cognito_domain: https://pool.auth.us-west-2.amazoncognito.com
+        public_url: https://mcp.example.test/
+        operator_user: owner-test
+        members:
+          enabled: true
+          group: staff
+          session_secret: m-70878c1e8b189ae536ae574ebc621ca5bc466f5d1798937fac63997c0e87f5ab
+      share:
+        enabled: true
+        signing_secret: 439a65ae01c7cb3c1e7f22dc01f4102b1c1ac56103bc7bb2ba1b25a4ac4bb57e
+        public_host: artifacts.example.test
+        member_host: my.artifacts.example.test
+      collab_artifacts:
+        enabled: true
+  ingest:
+    roles:
+    - all
+    values:
+      api_key: ''
+  agent:
+    roles:
+    - all
+    values:
+      api_key: ''
+  llm:
+    roles:
+    - builder
+    values:
+      upstream_url: https://llm.example.test
+      upstream_key: placeholder-llm-one
+  ci:
+    roles:
+    - builder
+    - ci
+    values:
+      url: https://ci.example.test
+      token: placeholder-ci-two
+  github:
+    roles:
+    - ci
+    values:
+      token: placeholder-gh-three
+  fabric:
+    roles:
+    - all
+    values:
+      url: ''
+      token: ''
+  inspector:
+    roles:
+    - all
+    values:
+      enabled: false
+      reasoning: 'off'
+hosts:
+  bender:
+    roles:
+    - builder
+    token_sha256: 4c4e5161ddaa64c2f89792a04581b105bac10ab25bfaa7daa2d160342dffcc9e
+    overrides: {}

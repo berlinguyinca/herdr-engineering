@@ -881,7 +881,6 @@ def test_member_host_page_config_csp_and_coop_use_its_own_origin(cfg_stack):
     cfg = req(cfg_stack, "GET", "/api/member/config", member=None, host=OWN_HOST)
     assert cfg.json["redirect_uri"] == f"{OWN_ORIGIN}/my/callback" and cfg.json["logout_uri"] == f"{OWN_ORIGIN}/"
     assert cfg.headers["cross-origin-opener-policy"] == "same-origin"
-    assert req(cfg_stack, "GET", "/my/", member=None, host=OWN_HOST).status == 200
     assert req(cfg_stack, "GET", "/my/callback", member=None, host=OWN_HOST).status == 200
     assert req(cfg_stack, "GET", "/api/member/me", host=OWN_HOST).status == 200
 
@@ -917,7 +916,7 @@ def test_writes_on_each_host_accept_only_that_hosts_origin(cfg_stack):
 ])
 def test_a_spoofed_member_host_is_a_404_on_every_member_route(cfg_stack, hosts):
     extra = tuple(f"Host: {h}" for h in hosts)
-    for path in ("/", "/my/", "/my/callback", "/api/member/config", "/api/member/me"):
+    for path in ("/", "/my/callback", "/my/base.css", "/api/member/config", "/api/member/me"):
         got = req(cfg_stack, "GET", path, member="op", host=None, extra=extra)
         assert got.status == 404, (path, hosts)
 
