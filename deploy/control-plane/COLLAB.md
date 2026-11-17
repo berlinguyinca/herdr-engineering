@@ -341,7 +341,10 @@ validates the slice and the compose files without printing any secret.
     does not name it and probes `/s/probe/` on it (expects 404). Unset, the render and behavior are byte-identical.
     Owner steps already done for that name: DNS A record, certificate SAN, and Cognito callback
     `https://my.artifacts.local.metabolomics.us/my/callback` plus sign-out `https://my.artifacts.local.metabolomics.us/`
-    (the old ones are kept). The remaining step: set `control_plane.share.member_host` and deploy.
+    (the old ones are kept). The front proxy routes by an explicit SNI list, so the name also needs its own entry in
+    the front proxy's SNI stream map (next to the share host's entry), applied with its playbook, before the deploy;
+    without it the edge never sees the name and the post-deploy probe only warns. Then set
+    `control_plane.share.member_host` and deploy.
 - Check: `tests/test_artifact_host_compose.py` parses the files and, when Docker is available (required under CI or
   `HERDR_REQUIRE_DOCKER=1`), starts the stack and runs `nginx -t` on the rendered edge.
 

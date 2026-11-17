@@ -95,7 +95,7 @@ def _stack(tmp_path, cp=None, **member_web_kwargs):
     else:
         mw = MemberWeb(svc, public_host=HOST, session_secret=SECRET, session_seconds=3600, web_root=web,
                        require_https=True, **member_web_kwargs)
-    srv =ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, collab=svc, public_port=0, web_root=web,
+    srv = ControlPlaneServer(ControlPlaneRepo(), host="127.0.0.1", port=0, collab=svc, public_port=0, web_root=web,
                              collab_require_https=True, member_web=mw)
     t = threading.Thread(target=srv.serve, daemon=True)
     t.start()
