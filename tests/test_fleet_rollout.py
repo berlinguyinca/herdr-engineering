@@ -2079,3 +2079,49 @@ def test_unresponsive_session_missing_from_native_is_not_an_error(tmp_path, no_b
     assert session["status"] == before["status"]
     assert session["lastUnreachableAt"]
     assert "hostLevelError" not in beast
+
+
+@pytest.mark.parametrize("new_pid", [43, 42])
+def test_revived_session_restarts_maintenance_instead_of_reusing_old_receipts(
+    tmp_path, no_backoff, new_pid
+):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire()
+    first = apply(store, plan, wire)
+    old = _bender(first)
+    assert old["prepared"] is True and old["loaded"]["commit"] == SHA
+    old_operations = copy.deepcopy(old["operations"])
+    assert wire.rows["bender"]["descriptor"]["instanceId"] == "bender-instance-new"
+
+    wire.misses, wire.error = wire.lists + 100, "session_process_gone"
+    ended = _bender(apply(store, plan, wire))
+    assert ended["status"] == "ended"
+
+    # The same conversation resumes in a new process still on the old runtime commit.
+    wire.misses = 0
+    wire.rows["bender"] = wire.row("bender")
+    wire.rows["bender"]["descriptor"].update(pid=new_pid, instanceId="bender-instance-b")
+    calls_before = len(wire.calls)
+    revived = _bender(apply(store, plan, wire))
+
+    new_calls = wire.calls[calls_before:]
+    assert [c["action"] for c in new_calls if c["action"] in ("prepare", "reload")] == [
+        "prepare",
+        "reload",
+    ]
+    old_ids = {op["request"]["operationId"] for op in old_operations.values()}
+    assert not {c["operationId"] for c in new_calls} & old_ids
+    assert {op["request"]["operationId"] for op in revived["operations"].values()}.isdisjoint(
+        old_ids
+    )
+    assert revived["pid"] == new_pid
+    assert revived["loaded"]["commit"] == SHA
+    assert wire.rows["bender"]["reply"]["data"]["runtime"]["commit"] == SHA
+    assert revived["previousIncarnations"] == [
+        {
+            "pid": 42,
+            "instanceId": "bender-instance-new",
+            "endedAt": ended["endedAt"],
+            "lastStatus": old["status"],
+        }
+    ]

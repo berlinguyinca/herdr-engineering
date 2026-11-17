@@ -874,6 +874,7 @@ def _note_unreachable(state, note):
 def _mark_ended(state, note):
     """The process exited: terminal and non-failing, but never a success."""
     state.pop("error", None)
+    state["lastStatus"] = state.get("status")
     state.update(status="ended", endedAt=datetime.now(UTC).isoformat(), note=note[:500])
 
 
@@ -1000,10 +1001,25 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                             transport, target, root, session_id, rows=rows
                         )
                         if state.get("status") == "ended":
-                            # The same conversation answers again: pick it back up.
-                            state["status"] = "discovered"
-                            state.pop("endedAt", None)
-                            state.update(pid=descriptor["pid"], instanceId=descriptor["instanceId"])
+                            # The conversation answers again, possibly in a new process on an
+                            # old runtime. Nothing per-process carries over (receipts, prepared,
+                            # loaded, missions, hostAcceptance); only the history does.
+                            history = [
+                                *state.get("previousIncarnations", []),
+                                {
+                                    key: state.get(key)
+                                    for key in ("pid", "instanceId", "endedAt", "lastStatus")
+                                },
+                            ]
+                            keep = ("sessionId", "native", "identityProof")
+                            for key in [k for k in state if k not in keep]:
+                                del state[key]
+                            state.update(
+                                status="discovered",
+                                pid=descriptor["pid"],
+                                instanceId=descriptor["instanceId"],
+                                previousIncarnations=history,
+                            )
                         if "pid" not in state or state.get("status") == "retired":
                             # `_live` only returns a descriptor with a real identity, so for a
                             # retired husk these replace the stale values.

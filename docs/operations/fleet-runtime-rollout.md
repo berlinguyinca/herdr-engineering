@@ -221,8 +221,10 @@ which says nothing about the sessions. A session with no reachable row is classi
 `ended` is terminal and non-failing, like `retired`: it does not block the host, does not hold
 the rollout open, and does not consume the online stall budget. It is never a success. The host
 lists such sessions in `endedSessions`, and the session keeps `endedAt` and `note`, so a report
-can tell "updated" from "exited". If the same conversation answers again, the next pass picks it
-back up as a fresh `discovered` session. A discovered session that is unreachable (not exited) and
+can tell "updated" from "exited". If the same conversation answers again (possibly in a new process on an old runtime), the
+next pass restarts it as a fresh `discovered` session: prepare, reload and resume receipts,
+`prepared`, `loaded`, `missions` and `hostAcceptance` from the old process are discarded and
+only `previousIncarnations` (pid, instanceId, endedAt, last status) is kept for the report. A discovered session that is unreachable (not exited) and
 absent from the native inventory is treated as transient, not as a missing-session blocker.
 
 ## Validation coverage
