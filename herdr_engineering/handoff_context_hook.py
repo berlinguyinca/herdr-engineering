@@ -15,7 +15,9 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TextIO
 
-DEFAULT_MAX_TOKENS = 200_000  # known limitation: 1M-context models need HERDR_HANDOFF_CONTEXT_MAX_TOKENS
+DEFAULT_MAX_TOKENS = 200_000  # the transcript does not name the window; see _window()
+LARGE_MAX_TOKENS = 1_000_000  # assumed once usage has exceeded the default window
+REMIND_STEP_POINTS = 10  # an ignored instruction is repeated only after this many more points of context
 DEFAULT_THRESHOLD = 0.50
 _TAIL_BYTES = 1_048_576
 _MARKER_MAX_AGE_SECONDS = 30 * 86400
@@ -64,6 +66,32 @@ def context_tokens(transcript: Path) -> int | None:
     return None
 
 
+def _window(env: Mapping[str, str], used: int) -> float:
+    """Window size: the env override, else 200k, else 1M once usage proves a 200k window cannot be right."""
+    window = _float_env(env, "HERDR_HANDOFF_CONTEXT_MAX_TOKENS", DEFAULT_MAX_TOKENS)
+    if "HERDR_HANDOFF_CONTEXT_MAX_TOKENS" not in env and used > window:
+        return float(LARGE_MAX_TOKENS)
+    return window
+
+
+def _claim(marker: Path, percent: int) -> bool:
+    """Record this reminder. False when one was already given within REMIND_STEP_POINTS of this percentage."""
+    try:
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        try:
+            last = int(marker.read_text().strip())
+        except (OSError, ValueError):
+            return False
+        if percent < last + REMIND_STEP_POINTS:
+            return False
+        marker.write_text(str(percent))
+        return True
+    with os.fdopen(fd, "w") as fh:
+        fh.write(str(percent))
+    return True
+
+
 def _message(percent: int) -> str:
     return (f"Context is at {percent}% of the window. Finish or record any running subagents, then run the "
             "/handoff skill now so the work moves to a fresh pane. If the user's current message is mid-task, "
@@ -81,18 +109,17 @@ def evaluate(raw: str, env: Mapping[str, str]) -> str | None:
     used = context_tokens(Path(path))
     if used is None:
         return None
-    window = _float_env(env, "HERDR_HANDOFF_CONTEXT_MAX_TOKENS", DEFAULT_MAX_TOKENS)
+    window = _window(env, used)
     if used / window < _float_env(env, "HERDR_HANDOFF_CONTEXT_THRESHOLD", DEFAULT_THRESHOLD):
         return None
+    percent = round(100 * used / window)
     marker = _state_dir(env) / (re.sub(r"[^A-Za-z0-9._-]", "_", session)[:128] + ".fired")
     marker.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-    except FileExistsError:
+    if not _claim(marker, percent):
         return None
     _prune_stale_markers(marker.parent)
     return json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
-                                              "additionalContext": _message(round(100 * used / window))}})
+                                              "additionalContext": _message(percent)}})
 
 
 def run_context_hook(harness: str, env: Mapping[str, str] | None = None, stdin: TextIO | None = None,
