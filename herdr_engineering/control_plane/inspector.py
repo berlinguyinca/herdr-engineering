@@ -467,7 +467,7 @@ class InspectorStore:
             restored._sessions[sid] = sess
             restored._enforce(sess)
         restored._enforce_global()
-        with self._lock:
+        with self._ingest_lock, self._lock:   # swaps the projection: no ingest may sit in an unlocked durable write (startup/recovery only)
             for sess in self._sessions.values():
                 for sub in sess.subs:
                     sub.close()
@@ -527,7 +527,7 @@ class InspectorStore:
     def set_prefs(self, raw: Any, session_id: str | None = None, *,
                   persist: bool = True) -> dict:
         clean = validate_prefs(raw)
-        with self._lock:
+        with self._ingest_lock, self._lock:
             if session_id is None:
                 self._global_prefs.update(clean)
             else:
@@ -1141,7 +1141,7 @@ class InspectorStore:
 
     def sweep(self) -> int:
         """Apply retention to every session (called periodically / on demand)."""
-        with self._lock:
+        with self._ingest_lock, self._lock:
             before = self.stats["evicted_events"]
             for s in list(self._sessions.values()):
                 self._enforce(s)
@@ -1567,7 +1567,7 @@ class InspectorStore:
             raise
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise SnapshotStale(f"snapshot is malformed ({type(exc).__name__}: {exc})") from exc
-        with self._lock:
+        with self._ingest_lock, self._lock:
             self._sessions, self._global_prefs, self.stats = sessions, global_prefs, {**self.stats, **stats}
             self._replay_key = tuple(key) if key is not None else None
             self._replay_watermark, self._replay_count = watermark, count
@@ -1575,7 +1575,7 @@ class InspectorStore:
 
     def reset_replay(self) -> None:
         """Back to an empty projection, for a boot that decided not to trust a snapshot."""
-        with self._lock:
+        with self._ingest_lock, self._lock:
             self._sessions = OrderedDict()
             self._global_prefs = {}
             self.stats = {"accepted": 0, "duplicates": 0, "rejected": 0, "evicted_events": 0, "evicted_sessions": 0}
@@ -1612,7 +1612,7 @@ class InspectorStore:
                 elif isinstance(et, str) and et.startswith("inspector.") and p.get("kind") in DURABLE_KINDS:
                     if p["kind"] == "message" and p.get("role") not in ("user", "assistant"):
                         continue
-                    with self._lock:
+                    with self._ingest_lock, self._lock:
                         before_seq = (self._sessions[sid].next_seq
                                       if isinstance(sid, str) and sid in self._sessions else 0)
                         result = self.ingest(sid, {**p, "ts": _iso_of(ev.get("source_timestamp")),

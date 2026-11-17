@@ -7,7 +7,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Fix: inspector readers no longer wait on a durable write
 
-- `InspectorStore.ingest` held the store-wide lock across the durable sink write. The sink serialises every write behind one asyncpg connection and a write lock, so under an ingest burst the lock holder waited behind unrelated writes and every reader (`agents/list` via `phone_digest`, `health`, `has_session`, `newest_seq`) waited with it; `agents/list` took up to 30 s on bender on 2026-11-17. The durable write now runs with the store lock released; ingest writers stay serialised by a separate lock and a reader sees the state from before an event until that event is durable, as before.
+- `InspectorStore.ingest` held the store-wide lock across the durable sink write. The sink serialises every write behind one asyncpg connection and a write lock, so under an ingest burst the lock holder waited behind unrelated writes and every reader (`agents/list` via `phone_digest`, `health`, `has_session`, `newest_seq`) waited with it; `agents/list` took up to 30 s on bender on 2026-11-17. The durable write now runs with the store lock released; ingest writers, `sweep`, `set_prefs` and checkpoint restore are serialised by a separate ingest lock (order: ingest lock, store lock, sink lock) and a reader sees the state from before an event until that event is durable, as before.
 - Measured on bender (py-spy, 2300 samples over 100 s): readers blocked on the inspector lock in 10% of samples, the lock holder blocked on the sink write lock in 4%.
 
 ### Fix: `/api/auth/open` no longer waits on the audit write
