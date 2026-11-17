@@ -150,10 +150,26 @@ Pi agents remains coverage-unverified rather than silently succeeding.
 - `activation_unverified`: Pi acknowledged reload but still reports old or pending
   code. Inspect the saved activation receipt and Pi host diagnostics.
 - `bootstrap_required`: a session lacks maintenance capabilities, or its stable Host
-  commit differs from the target. Runtime hot reload cannot replace that stable
+  code differs from the target. Runtime hot reload cannot replace that stable
   Host. Preserve its conversation and work, then perform a controlled extension or
   process bootstrap before a new reconciliation plan. This command intentionally
   provides no forced kill/restart fallback.
+
+  A hot reload never changes the session's reported `hostCommit`, so a differing
+  commit alone does not prove stale Host code. When `hostCommit` differs from the
+  target, the coordinator runs `git diff --quiet <hostCommit> <revision> -- <Host paths>`
+  in the staged release on the target host (same transport as `sessions list`, with
+  `GIT_DIR`, `GIT_WORK_TREE` and `GIT_COMMON_DIR` unset). No change means the Host is
+  accepted by code equivalence and the session continues; its state records
+  `hostAcceptance` with `mode: "code-equivalence"`, both commits and the paths
+  compared. Any change, or any inability to compare (release without `.git`, either
+  commit unavailable, git or transport error), keeps `bootstrap_required`. The Host
+  paths are the fixed list `HOST_CODE_PATHS` in `herdr_engineering/fleet_rollout.py`
+  (`src/runtime/host/`, `package.json` and the rest of the stable Host's import
+  closure). Staged releases are depth-1 clones, so a missing old `hostCommit` is
+  fetched without network access from the sibling release
+  `pi/releases/<hostCommit>` when that directory still exists; otherwise the
+  session stays `bootstrap_required`.
 - `blocked`: identity, protocol, revision, or coverage evidence was rejected.
   Inspect the per-host error and per-session receipt. An uncertain request is never
   replaced with a fresh resume against a different mission revision.
