@@ -514,8 +514,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--proc-root", default="/proc", help=argparse.SUPPRESS)
     p2.set_defaults(func=_cmd_handoff_harness)
     p2 = hsub.add_parser("context-hook", help="UserPromptSubmit hook body (opt-in): ask for /handoff when context is high; never fails")
-    p2.add_argument("harness", choices=("claude",))
-    p2.set_defaults(func=lambda a: __import__("herdr_engineering.handoff_context_hook", fromlist=["x"]).run_context_hook(a.harness))
+    p2.add_argument("harness", help="only claude is supported; anything else is a silent no-op so a hook never fails")
+    p2.set_defaults(func=_cmd_handoff_context_hook)
 
     # summary --------------------------------------------------------------
     p = sub.add_parser("summary", help="/summary skill: install, verify, remove, read session history")
@@ -1470,6 +1470,11 @@ def _cmd_session_run(args) -> int:
 def _cmd_doctor(args) -> int:
     from .doctor import doctor_main
     return doctor_main(args)
+
+
+def _cmd_handoff_context_hook(args) -> int:
+    from .handoff_context_hook import run_context_hook
+    return run_context_hook(args.harness)
 
 
 def _cmd_handoff_harness(args) -> int:

@@ -88,3 +88,23 @@ def test_uses_last_assistant_message_only(tmp_path):
 @pytest.mark.parametrize("bad", ["[1,2]", '{"session_id": 5}', '{"transcript_path": "/x"}'])
 def test_malformed_payload_shapes_are_silent(tmp_path, bad):
     assert run_hook(bad, tmp_path) == (0, "", "")
+
+
+def test_unknown_harness_argument_still_exits_zero_and_silent(tmp_path):
+    p = subprocess.run([sys.executable, "-c", CODE, "handoff", "context-hook", "bogus"], input="{}",
+                       env={"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "PYTHONPATH": str(ROOT)},
+                       capture_output=True, text=True, timeout=60)
+    assert (p.returncode, p.stdout) == (0, "")
+
+
+def test_firing_prunes_stale_markers_but_keeps_recent_ones(tmp_path):
+    markers = tmp_path / "state" / "handoff-context"
+    markers.mkdir(parents=True)
+    old, recent = markers / "old.fired", markers / "recent.fired"
+    old.write_text("")
+    recent.write_text("")
+    long_ago = old.stat().st_mtime - 40 * 86400
+    os.utime(old, (long_ago, long_ago))
+    code, out, _ = run_hook(payload(transcript(tmp_path, usage_line(150_000)), "fresh"), tmp_path)
+    assert code == 0 and "additionalContext" in out
+    assert not old.exists() and recent.exists() and (markers / "fresh.fired").exists()

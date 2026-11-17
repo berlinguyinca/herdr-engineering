@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TextIO
@@ -17,6 +18,7 @@ from typing import TextIO
 DEFAULT_MAX_TOKENS = 200_000  # known limitation: 1M-context models need HERDR_HANDOFF_CONTEXT_MAX_TOKENS
 DEFAULT_THRESHOLD = 0.50
 _TAIL_BYTES = 1_048_576
+_MARKER_MAX_AGE_SECONDS = 30 * 86400
 _USAGE_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 
 
@@ -31,6 +33,17 @@ def _float_env(env: Mapping[str, str], name: str, default: float) -> float:
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+def _prune_stale_markers(directory: Path) -> None:
+    """Drop markers for sessions older than 30 days so the state directory cannot grow without bound."""
+    cutoff = time.time() - _MARKER_MAX_AGE_SECONDS
+    for old in directory.glob("*.fired"):
+        try:
+            if old.stat().st_mtime < cutoff:
+                old.unlink()
+        except OSError:
+            pass
 
 
 def context_tokens(transcript: Path) -> int | None:
@@ -77,6 +90,7 @@ def evaluate(raw: str, env: Mapping[str, str]) -> str | None:
         os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
     except FileExistsError:
         return None
+    _prune_stale_markers(marker.parent)
     return json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                               "additionalContext": _message(round(100 * used / window))}})
 
