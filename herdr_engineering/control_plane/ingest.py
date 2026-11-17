@@ -17,6 +17,7 @@ import re
 
 from ..host_policy import normalize_aliases
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
+from .admission import AdmissionContext
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
 from .federation import (
@@ -153,6 +154,7 @@ INGEST_ENTITY_TYPES = DISPATCHED_ENTITY_TYPES | GENERIC_ENTITY_TYPES
 SERVER_OWNED_EVENT_TYPES = {
     "session": frozenset({"SessionCommandQueued", "SessionCommandSettled"}),
     "host": frozenset({"HostPolicyChanged"}),
+    "lifecycle": frozenset({"session.dismissed"}),     # the operator's Agent Operations tombstone (AgentOpsService.dismiss)
 }
 
 # Sources whose host events prove the host is alive: its fabric agent, and the
@@ -306,7 +308,7 @@ class IngestService:
             raise ValueError("events must contain at most 64 envelopes")
         return [self.ingest(body, principal, valid=valid) for body in bodies]
 
-    def ingest(self, body: dict, principal: dict | None = None, valid=None) -> dict:
+    def ingest(self, body: dict, principal: dict | None = None, valid=None, *, server_owned: bool = False) -> dict:
         """Apply one ingest body.
 
         ``valid`` (T10) is an optional zero-argument callable evaluated inside the ledger lock,
@@ -355,7 +357,7 @@ class IngestService:
             raise ValueError("entity type is not accepted by generic ingestion")
         if entity_type in ("token_usage", "resource_usage") and not payload:
             raise ValueError("token_usage/resource_usage payload is not accepted without usage fields")
-        if event_type in SERVER_OWNED_EVENT_TYPES.get(entity_type, ()):
+        if event_type in SERVER_OWNED_EVENT_TYPES.get(entity_type, ()) and not server_owned:
             raise ValueError("event type is reserved for the server")
         clamp = self._peer_clamp(principal, entity_type)
         env = normalize_envelope(body, principal, self.repo._stamp(), clamp=clamp)
@@ -378,6 +380,8 @@ class IngestService:
         if env is None:
             return self._dispatch(entity_type, entity_id, event_type, payload, source)
         env["entity_type"] = entity_type
+        if server_owned and "agent_ops" in env:
+            env["agent_ops"]["operator_action"] = True    # server-stamped: the projection honours a tombstone only with it
         ledger = self.repo.ledger
         ack = {"event_id": env["event_id"], "source": env["source"],
                "source_sequence": env["source_sequence"]}
@@ -404,7 +408,7 @@ class IngestService:
             # The envelope row is persisted FIRST. If that fails nothing has
             # been applied and the ledger is untouched, so the emitter retries.
             try:
-                self.repo.record_event(
+                recorded = self.repo.record_event(
                     entity_type, entity_id, event_type, row_payload,
                     envelope=env, feed=entity_type not in ENVELOPE_ONLY_TYPES,
                     publish=entity_type not in ENVELOPE_ONLY_TYPES)
@@ -431,7 +435,10 @@ class IngestService:
                             and not payload.get("occurred_at"):
                         payload = {**payload, "occurred_at": env.get("occurred_at") or env.get("received_at")}
                     result = self._dispatch(entity_type, entity_id, event_type, payload, source,
-                                            record_generic=False)
+                                            record_generic=False,
+                                            admission=(AdmissionContext.from_admitted(env, entity_id)
+                                                if entity_type == "inspector"
+                                                and recorded["durably_acknowledged"] else None))
             finally:
                 # The row is durable, so its (source, sequence) is consumed even
                 # if the handler then fails; the failure is reported once.
@@ -548,7 +555,7 @@ class IngestService:
                     not isinstance(r, dict) for r in results):
                 raise ValueError("results must be a list of objects")
     def _dispatch(self, entity_type, entity_id, event_type, payload, source,
-                  record_generic=True) -> dict:
+                  record_generic=True, *, admission: AdmissionContext | None = None) -> dict:
         # System-graph live-ingest adapter (opt-in): reflect lifecycle events
         # into the running lineage graph as lineage envelopes. Best-effort: a
         # failure here is logged inside the adapter and never breaks the source
@@ -603,7 +610,7 @@ class IngestService:
             # by the store; not recorded on the global event feed.
             if "kind" not in payload and "events" not in payload and event_type != "inspector.batch":
                 payload = {**payload, "kind": event_type.removeprefix("inspector.")}
-            res = self.repo.inspector.ingest(entity_id, payload)
+            res = self.repo.inspector.ingest(entity_id, payload, admission=admission)
             return {"entity_type": "inspector", "entity_id": entity_id,
                     "event_type": event_type, **res}
         if entity_type in ("test_run", "build"):
