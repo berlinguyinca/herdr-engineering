@@ -597,6 +597,26 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("hook_event")
     p2.set_defaults(func=_cmd_memory_hook)
 
+    # workflow -------------------------------------------------------------
+    p = sub.add_parser("workflow", help="managed Claude Code hooks for the default engineering workflow: "
+                                        "plan/install/status/doctor/repair/uninstall")
+    wsub = p.add_subparsers(dest="workflow_command", required=True)
+    for name, helptext in (("plan", "show what install would change (read-only)"),
+                           ("install", "register the managed SessionStart/PreCompact hooks in ~/.claude/settings.json"),
+                           ("status", "managed-hook state (read-only)"),
+                           ("doctor", "drift check"),
+                           ("repair", "re-apply missing or drifted managed hooks"),
+                           ("uninstall", "remove only the managed hooks (backup first)")):
+        p2 = wsub.add_parser(name, help=helptext)
+        p2.add_argument("--home", default=None, help="override $HOME (isolated testing)")
+        if name in ("install", "repair", "uninstall"):
+            p2.add_argument("--dry-run", action="store_true", help="show the plan; write nothing")
+        p2.add_argument("--json", action="store_true")
+        p2.set_defaults(func=_cmd_workflow)
+    p2 = wsub.add_parser("hook", help="hook runner (prints a short reminder; never fails a session)")
+    p2.add_argument("hook_event")
+    p2.set_defaults(func=_cmd_workflow_hook)
+
     # journal --------------------------------------------------------------
     p = sub.add_parser("journal", help="session journal & timeline (spec 0090)")
     jsub = p.add_subparsers(dest="journal_command", required=True)
@@ -1537,6 +1557,41 @@ def _cmd_memory(args) -> int:
             if r.diff and (dry or cmd == "plan"):
                 print(r.diff, end="")
     return 0 if res.ok else 1
+
+
+def _cmd_workflow(args) -> int:
+    from .workflow_hooks import WorkflowInstaller
+    inst = WorkflowInstaller(Path(args.home) if args.home else None)
+    cmd, dry = args.workflow_command, getattr(args, "dry_run", False)
+    if cmd == "doctor":
+        out = inst.doctor()
+        if args.json:
+            _print_json(out)
+        else:
+            for c in out["checks"]:
+                print(f"{c['status'].upper():8} {c['name']}  {c['detail']}")
+            print(f"overall: {out['overall']}")
+        return 0 if out["ok"] else 1
+    if cmd == "status":
+        res = inst.status()
+    elif cmd == "plan":
+        res = inst.install(dry_run=True)
+    elif cmd in ("install", "repair"):
+        res = inst.install(dry_run=dry)
+    else:
+        res = inst.uninstall(dry_run=dry)
+    if args.json:
+        _print_json(res.to_dict())
+    else:
+        print(f"{res.action:9} {res.path}" + (f"  [{res.state}]" if res.state != "absent" else ""))
+        if res.diff and (dry or cmd == "plan"):
+            print(res.diff, end="")
+    return 0 if res.ok else 1
+
+
+def _cmd_workflow_hook(args) -> int:
+    from .workflow_hooks import run_hook
+    return run_hook(args.hook_event, sys.stdin, sys.stdout)
 
 
 def _cmd_memory_mcp_serve(args) -> int:

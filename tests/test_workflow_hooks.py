@@ -1,0 +1,119 @@
+"""Managed Claude Code workflow hooks. Real temp HOMEs only; never the real one."""
+from __future__ import annotations
+
+import io
+import json
+
+import pytest
+
+from herdr_engineering import workflow_hooks as wh
+from herdr_engineering.cli import main
+
+CMD = ["/opt/herdr-eng"]
+
+
+@pytest.fixture
+def home(tmp_path):
+    h = tmp_path / "home"
+    (h / ".claude").mkdir(parents=True)
+    return h
+
+
+def inst(home):
+    return wh.WorkflowInstaller(home, command=CMD)
+
+
+def settings(home):
+    return home / ".claude" / "settings.json"
+
+
+def test_install_creates_managed_entries(home):
+    res = inst(home).install()
+    assert res.ok and res.action == "create"
+    hooks = json.loads(settings(home).read_text())["hooks"]
+    assert set(hooks) == {"SessionStart", "PreCompact"}
+    cmd = hooks["PreCompact"][0]["hooks"][0]["command"]
+    assert wh.MARKER in cmd and cmd.startswith("[ -x /opt/herdr-eng ] && ") and cmd.count("|| true") == 1
+    assert "workflow hook PreCompact" in cmd
+
+
+def test_second_install_is_noop(home):
+    inst(home).install()
+    before, mtime = settings(home).read_bytes(), settings(home).stat().st_mtime_ns
+    res = inst(home).install()
+    assert res.action == "noop"
+    assert settings(home).read_bytes() == before and settings(home).stat().st_mtime_ns == mtime
+
+
+def test_foreign_hooks_preserved_and_uninstall_removes_only_managed(home):
+    user = {"model": "x", "hooks": {
+        "Stop": [{"hooks": [{"type": "command", "command": "mine"}]}],
+        "SessionStart": [{"hooks": [{"type": "command", "command": "memory # herdr-memory:managed"}]}]}}
+    settings(home).write_text(json.dumps(user, indent=2))
+    inst(home).install()
+    data = json.loads(settings(home).read_text())
+    assert data["hooks"]["Stop"] == user["hooks"]["Stop"]
+    assert len(data["hooks"]["SessionStart"]) == 2
+    inst(home).uninstall()
+    assert json.loads(settings(home).read_text()) == user
+
+
+def test_doctor_reports_drift_and_repair_fixes(home):
+    assert inst(home).doctor()["overall"] == "absent"
+    inst(home).install()
+    assert inst(home).doctor()["ok"]
+    data = json.loads(settings(home).read_text())
+    data["hooks"]["SessionStart"][0]["hooks"][0]["command"] = f"old # {wh.MARKER}"
+    settings(home).write_text(json.dumps(data))
+    d = inst(home).doctor()
+    assert not d["ok"] and d["overall"] == "stale"
+    inst(home).install()
+    assert inst(home).doctor()["ok"]
+
+
+def test_dry_run_writes_nothing_and_invalid_json_untouched(home):
+    res = inst(home).install(dry_run=True)
+    assert res.action == "create" and not settings(home).exists()
+    settings(home).write_text("{not json")
+    res = inst(home).install()
+    assert not res.ok and res.action == "invalid"
+    assert settings(home).read_text() == "{not json"
+
+
+def test_skips_when_claude_absent(tmp_path):
+    h = tmp_path / "bare"
+    h.mkdir()
+    res = wh.WorkflowInstaller(h, command=CMD, which=lambda n: None).install()
+    assert res.action == "skip" and not (h / ".claude").exists()
+
+
+def run_hook(event, stdin="{}"):
+    out = io.StringIO()
+    assert wh.run_hook(event, io.StringIO(stdin), out) == 0
+    return json.loads(out.getvalue())
+
+
+def test_session_start_reminder_is_short_and_covers_defaults():
+    ctx = run_hook("SessionStart")["hookSpecificOutput"]["additionalContext"]
+    assert len(ctx.splitlines()) <= 15
+    for needle in ("sonnet", "verify", "never push herdr-engineering", "/tmp", "woodpecker", "/handoff"):
+        assert needle in ctx.lower()
+    assert run_hook("SessionStart")["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+
+
+def test_precompact_only_prompts_for_handoff():
+    msg = run_hook("PreCompact")["systemMessage"]
+    assert "/handoff" in msg and "herdr-handoff create" not in msg
+
+
+def test_hook_never_fails_on_bad_input():
+    out = io.StringIO()
+    assert wh.run_hook("Bogus", io.StringIO("not json"), out) == 0 and out.getvalue() == ""
+
+
+def test_cli_install_doctor_uninstall(home, capsys):
+    assert main(["workflow", "install", "--home", str(home)]) == 0
+    assert main(["workflow", "doctor", "--home", str(home)]) == 0
+    assert main(["workflow", "uninstall", "--home", str(home)]) == 0
+    assert not json.loads(settings(home).read_text()).get("hooks")
+    assert main(["workflow", "doctor", "--home", str(home)]) == 1
