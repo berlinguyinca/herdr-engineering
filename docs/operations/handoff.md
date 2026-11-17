@@ -194,7 +194,21 @@ Known limitation: the window defaults to 200000 tokens. Models with a 1M-token
 context need `HERDR_HANDOFF_CONTEXT_MAX_TOKENS=1000000`, otherwise the hook fires
 too early.
 
-To opt in, add this to `~/.claude/settings.json`:
+To opt in, run:
+
+```bash
+herdr-eng handoff auto install     # idempotent; also: uninstall | check [--dry-run] [--json]
+```
+
+`install` appends one `UserPromptSubmit` entry carrying the marker `herdr-handoff-auto`
+to `~/.claude/settings.json`, keeping every other hook and key, and writes atomically.
+An entry already present with that marker (even one you added by hand) is left as is
+(`unchanged`, or `preserved` if its command differs), so it never duplicates. If
+`settings.json` is not valid JSON the command reports `refused` and does not touch the
+file. `uninstall` removes only hooks carrying the marker. `check` reports `ok` or
+`missing` (exit 1).
+
+Manual alternative: add this to `~/.claude/settings.json` yourself:
 
 ```json
 {
