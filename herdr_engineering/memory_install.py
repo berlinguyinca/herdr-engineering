@@ -193,6 +193,7 @@ class JsonKeyUnit(Unit):
 class ClaudeHooksUnit(Unit):
     """Managed hook entries inside ``settings.json`` ``hooks`` (marker in command)."""
     kind = "claude-hooks"
+    marker = MARKER   # a sibling installer (workflow_hooks) overrides this with its own
 
     def __init__(self, name, path, entries: dict[str, str]):
         super().__init__(name, path)
@@ -202,10 +203,9 @@ class ClaudeHooksUnit(Unit):
     def _wrap(command):
         return {"hooks": [{"type": "command", "command": command, "timeout": 3}]}
 
-    @staticmethod
-    def _is_managed(entry):
+    def _is_managed(self, entry):
         return isinstance(entry, dict) and any(
-            isinstance(h, dict) and MARKER in str(h.get("command", ""))
+            isinstance(h, dict) and self.marker in str(h.get("command", ""))
             for h in entry.get("hooks", []) if isinstance(h, dict))
 
     def _load(self, text):
