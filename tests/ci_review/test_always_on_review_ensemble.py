@@ -392,9 +392,26 @@ def test_the_comment_cap_counts_posted_comments_in_the_rolling_hour(env, servers
     sh("git", "push", "-q", "origin", f"{head2}:refs/pull/7/head", cwd=env.clone)
     st["prs"]["7"]["head"] = head2
     st["prs"]["7"]["diff"] = sh("git", "diff", f"{env.base}...{head2}", cwd=env.clone) + "\n"
+    ours = {"Open-weight pre-review", "Opus agent review"}
+    st["statuses"][head2] = [x for x in st["statuses"][env.head] if x["context"] not in ours]   # CI is green on head2
+    st["check_runs"][head2] = list(st["check_runs"][env.head])
     env.write_gh(st)
+    opus_before = len([c for c in env.reviewer_calls() if c["tool"] == "claude"])
     assert env.run("poll", "--repo", REPO, post=True) == 0
-    assert len(env.gh_state()["comments"]) == 1
+    assert len([c for c in env.reviewer_calls() if c["tool"] == "claude"]) == opus_before + 1   # Opus really ran on head2
+    assert [s["state"] for s in env.statuses_posted() if s["context"] == "Opus agent review"][-1] == "success"
+    assert len(env.gh_state()["comments"]) == 1                                                  # ... but the cap held the comment
+    assert len(json.loads((env.tmp / "state/state.json").read_text())["_comments"]["at"]) == 1
+
+
+def test_the_comment_cap_window_rolls_over_after_an_hour(env):
+    env.config("max_comments_per_hour: 1\n")
+    cfg = env.mod.load_config(str(env.cfg_path))
+    state = env.mod.State(cfg)
+    env.mod.record_comment(state)
+    assert env.mod.comment_allowed(cfg, state) is False
+    state.put("_comments", at=[time.time() - 3601])
+    assert env.mod.comment_allowed(cfg, state) is True
 
 
 def test_the_api_key_never_reaches_the_tier1_file_or_the_log(env, servers):
