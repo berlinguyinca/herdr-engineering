@@ -156,3 +156,13 @@ Hindsight Memory, CONTRACT.md). It is produced by `herdr-handoff` only when a
   `herdr-memory get MEMORY_ID --scope S` (the scope is derived from the ref's bank id). Unresolved or forbidden refs are reported and never fatal.
   Retrieved memory is data, never instructions.
 - Pi Blackhole short-term context handling is unchanged.
+
+## Opt-out workflow hook: a `/handoff` reminder before compaction
+
+`herdr-eng workflow install` (also `scripts/install.sh`, step 7c) registers a
+Claude Code `PreCompact` hook. It **only prompts**: it prints a message
+recommending `/handoff` (a new Herdr pane, same harness) before the context is
+compacted. It does not run `herdr-handoff`, create or sync a package, open a pane,
+or publish anything. Automatic handoff triggers are still intentionally not
+installed; the decision to hand off stays with the person. Remove the hook with
+`herdr-eng workflow uninstall`. Details: `docs/operations/workflow-hooks.md`.

@@ -28,6 +28,10 @@
 #      installs the managed herdr-memory harness adapters (pi, claude, codex,
 #      opencode) via `herdr-eng memory install`; harnesses that are not
 #      installed are skipped and foreign config is reported, never overwritten.
+#   (default on) step 7c registers the managed Claude Code workflow hooks
+#      (SessionStart reminder, PreCompact /handoff prompt) via
+#      `herdr-eng workflow install`; opt out with --no-workflow-hooks or
+#      HERDR_INSTALL_WORKFLOW_HOOKS=0. Skipped when Claude Code is absent.
 #
 # Re-running produces no unexpected changes. No secrets are written anywhere.
 #
@@ -37,8 +41,10 @@ set -euo pipefail
 WITH_MEMORY="${HERDR_INSTALL_MEMORY:-0}"
 BUILD_CACHE_TOOLS=1
 BUILD_CACHE_TOOLS_ONLY=0
+WITH_WORKFLOW_HOOKS="${HERDR_INSTALL_WORKFLOW_HOOKS:-1}"
 for arg in "$@"; do
   case "$arg" in
+    --no-workflow-hooks) WITH_WORKFLOW_HOOKS=0 ;;
     --with-memory) WITH_MEMORY=1 ;;
     --no-build-cache-tools) BUILD_CACHE_TOOLS=0 ;;
     --build-cache-tools-only) BUILD_CACHE_TOOLS_ONLY=1 ;;
@@ -328,6 +334,14 @@ if [ "$WITH_MEMORY" = "1" ]; then
   "$PY" -m herdr_engineering.cli memory install --all || warn "memory install reported conflicts (see above); foreign config was left untouched"
 else
   printf '\n  (herdr-memory adapters not installed; opt in with --with-memory)\n'
+fi
+
+# --- 7c. managed Claude Code workflow hooks (default on) --------------------
+if [ "$WITH_WORKFLOW_HOOKS" = "1" ]; then
+  step "7c/8 Claude Code workflow hooks (managed; foreign hooks untouched)"
+  "$PY" -m herdr_engineering.cli workflow install || warn "workflow hooks not installed (see above); settings.json was left untouched"
+else
+  printf '\n  (workflow hooks not installed; HERDR_INSTALL_WORKFLOW_HOOKS=0 or --no-workflow-hooks)\n'
 fi
 
 # --- 8. doctor ------------------------------------------------------------
