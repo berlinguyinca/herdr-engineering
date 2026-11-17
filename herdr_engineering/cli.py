@@ -516,6 +516,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = hsub.add_parser("context-hook", help="UserPromptSubmit hook body (opt-in): ask for /handoff when context is high; never fails")
     p2.add_argument("harness", help="only claude is supported; anything else is a silent no-op so a hook never fails")
     p2.set_defaults(func=_cmd_handoff_context_hook)
+    p2 = hsub.add_parser("auto", help="install, remove or check the opt-in context-hook in ~/.claude/settings.json")
+    p2.add_argument("auto_action", choices=("install", "uninstall", "check"))
+    p2.add_argument("--home", default=None, help="override $HOME (tests)")
+    p2.add_argument("--dry-run", action="store_true", help="report what would change without writing")
+    p2.add_argument("--json", action="store_true")
+    p2.set_defaults(func=_cmd_handoff_auto)
 
     # summary --------------------------------------------------------------
     p = sub.add_parser("summary", help="/summary skill: install, verify, remove, read session history")
@@ -1486,6 +1492,21 @@ def _cmd_handoff_harness(args) -> int:
         return 2
     _print_json(found.to_dict())
     return 0
+
+
+def _cmd_handoff_auto(args) -> int:
+    from . import handoff_auto_setup as ha
+    home = Path(args.home) if args.home else None
+    if args.auto_action == "check":
+        item = ha.check(home)
+    else:
+        item = (ha.install if args.auto_action == "install" else ha.uninstall)(home, dry_run=args.dry_run)
+    ok = item.action not in ha.FAIL_ACTIONS
+    if args.json:
+        _print_json({"ok": ok, "results": [item.to_dict()]})
+    else:
+        print(f"{item.action:10} {item.target}" + (f"  ({item.detail})" if item.detail else ""))
+    return 0 if ok else 1
 
 
 def _cmd_summary_manage(args) -> int:
