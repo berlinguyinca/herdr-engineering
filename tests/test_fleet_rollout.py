@@ -2069,6 +2069,30 @@ def test_session_that_left_the_native_inventory_has_ended(tmp_path, no_backoff, 
     assert "hostLevelError" not in beast
 
 
+class ExitedButListedWire(VanishingWire):
+    """The process exits but its terminal stays in the native inventory."""
+
+    def native(self, target):
+        present, self.present = self.present, True
+        try:
+            return super().native(target)
+        finally:
+            self.present = present
+
+
+@pytest.mark.parametrize("wire_type", [VanishingWire, ExitedButListedWire])
+def test_later_passes_keep_an_ended_sessions_history(tmp_path, no_backoff, wire_type):
+    store, plan = setup_rollout(tmp_path)
+    wire = wire_type("session_process_gone")
+    before = apply(store, plan, wire)["hosts"]["beast"]["sessions"]["second-conversation"]
+    wire.present = False
+    ended = apply(store, plan, wire)["hosts"]["beast"]["sessions"]["second-conversation"]
+    again = apply(store, plan, wire)["hosts"]["beast"]["sessions"]["second-conversation"]
+    assert again["status"] == "ended"
+    assert again["lastStatus"] == before["status"] != "ended"
+    assert again["endedAt"] == ended["endedAt"]
+
+
 def test_unresponsive_session_missing_from_native_is_not_an_error(tmp_path, no_backoff):
     store, plan = setup_rollout(tmp_path)
     wire = VanishingWire("session_unresponsive")

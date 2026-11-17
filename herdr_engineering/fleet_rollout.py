@@ -874,6 +874,10 @@ def _note_unreachable(state, note):
 def _mark_ended(state, note):
     """The process exited: terminal and non-failing, but never a success."""
     state.pop("error", None)
+    if state.get("status") == "ended":
+        # Later passes keep the status it exited from and when it exited.
+        state["note"] = note[:500]
+        return
     state["lastStatus"] = state.get("status")
     state.update(status="ended", endedAt=datetime.now(UTC).isoformat(), note=note[:500])
 
