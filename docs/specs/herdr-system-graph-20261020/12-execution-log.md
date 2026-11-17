@@ -64,3 +64,18 @@ $ sha256sum snap.html snap2.html                     # render twice
 - Full `tests/control_plane/` suite exceeds a single 25-minute wall budget on
   this host (long e2e tests); gates above were run as targeted suites instead.
 - ETA: gate re-verification ≈ 5 min; no implementation remaining for P0–P6.
+
+## 2026-11-02T05:05Z — Repair pass: deploy routing verification (F-FBqUeG/F-788Oib)
+
+- Finding: review reported an empty change. Verified the delivered spec commit is
+  `b87ea6d7` (`docs(spec): P0-P6 execution log — gates run 2026-11-02`, +50 lines,
+  `git show --stat b87ea6d7`); `git diff b87ea6d7 origin/main` is empty, so the
+  candidate is byte-identical to `origin/main`.
+- Additional gate re-run in this session:
+  `tests/test_deploy_scripts.py tests/test_ci_gate_routing.py` → 187 passed, 0 failed.
+- `deploy/control-plane/deploy.sh` working-tree state: routing stub that execs the
+  canonical `herdr-deploy` entrypoint (`command -v herdr-deploy` →
+  `/home/wohlgemuth/.local/bin/herdr-deploy`, resolves to the `b30a634a` deploy-tool
+  checkout). `bash -n` passes on both the stub and the `HEAD` (`git show
+  HEAD:deploy/control-plane/deploy.sh`) copy. The stub is intentionally not committed:
+  it hard-codes an operator-local path and is not part of the spec delivery.
