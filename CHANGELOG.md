@@ -5,6 +5,15 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Tier-1 ensemble checked by Opus, poll scope, Muse serve unit (always-on-review)
+
+- `tiers.tier1.reviewers` (new, default empty = unchanged behavior): several open-weight reviewers run in parallel per PR head, `backend: gateway` (e.g. qwen3.8-27b) or the new generic `backend: openai` (base_url, model, `api_key_file`; llama.cpp such as Muse-Glimmer-30B on 127.0.0.1:28931, requests serialized per server). They reuse the eval's system prompt, prompt (diff + touched files, 60k cap) and JSON findings parsing. Tier 1 stays advisory: no status, no comment. A down reviewer is recorded and skipped.
+- Tier 2 (Opus, `claude -p`) receives the deduped union (file + nearby line + title similarity) and answers `tier1_checks` (confirm or reject plus a one-line reason per finding) and may add findings. Only one comment per head SHA is posted, by tier 2: confirmed, Opus-only, rejected (collapsed in `<details>`), and which models found each. Tier 1 empty: Opus still runs normally.
+- New scope keys (documented in `always-on-review.example.yaml`): `skip_archived` (true), `skip_forks` (false), `skip_drafts` (true), `only_prs_updated_after`, `backfill` (false), `max_comments_per_hour` (unset).
+- BEHAVIOR CHANGE: a repo polled for the first time is enrolled at that moment and only PRs updated after it are reviewed (previously every open PR was). Archived repos are now skipped by default. `backfill: true` and `skip_archived: false` restore the old behavior.
+- `deploy/ci-review/herdr-muse-serve.sh` and `herdr-muse-serve.service`: example llama.cpp server-cuda-b11804 for Muse (not installed by anything).
+- Rollback: delete `tiers.tier1.reviewers` (tier 1 and tier 2 behave as before), set `backfill: true` and `skip_archived: false`; or revert the PR. State keys added to state.json (`repo:*.enrolled_at`, `_comments`) are ignored by older versions.
+
 ### Fix: `control-plane checkpoint` names the reason for any ValueError
 
 - The CLI JSON error carried a `reason` only for `CheckpointInvalid`; any other `ValueError` (for example `invalid projection checkpoint schema`) printed just its type and stage, so a failing deploy prewarm was undiagnosable. It now prints `reason` for a `CheckpointInvalid` at any stage and for any other `ValueError` once the connection is open (migration, index preparation, materialization), redacted through the worker's `_safe_message` (URLs and DSNs become `<url>`, at most 500 characters). The `projection restore rejected; complete replay required` warning carries the same safe message. Exit code and `ok: false` are unchanged; `configuration` and `database_connection` stage errors (a malformed DSN can be quoted without `://`) and other exception types still print only name and stage.

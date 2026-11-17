@@ -72,7 +72,10 @@ elif argv[:2] == ["pr", "diff"]:
         sys.stderr.write(pr(argv[2])["diff_error"]); sys.exit(1)
     sys.stdout.write(pr(argv[2])["diff"])
 elif argv[:2] == ["pr", "list"]:
-    out([{"number": int(n), "headRefOid": head(n), "isDraft": pr(n).get("draft", False)} for n in st["prs"]])
+    out([{"number": int(n), "headRefOid": head(n), "isDraft": pr(n).get("draft", False),
+          "updatedAt": pr(n).get("updated_at", "2999-01-01T00:00:00Z")} for n in st["prs"]])
+elif argv[:2] == ["repo", "view"]:
+    out(st.get("repos", {}).get(argv[2], {"isArchived": False, "isFork": False}))
 elif argv[:2] == ["auth", "token"]:
     sys.stdout.write("gho_FAKEGHAUTHTOKEN0123456789\n")
 elif argv[:2] == ["api", "user"]:
