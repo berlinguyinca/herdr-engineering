@@ -1733,19 +1733,29 @@ class State:
         self.dir = ai.expand(cfg["state_dir"])
         self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = self.dir / "state.json"
+        self.data = self._load()
+
+    def _load(self) -> dict:
         try:
-            self.data = json.loads(self.path.read_text())
+            d = json.loads(self.path.read_text())
         except (OSError, ValueError):
-            self.data = {}
+            return {}
+        return d if isinstance(d, dict) else {}
 
     def get(self, key: str) -> dict:
+        """Always the file's current content: another State (a review inside the same poll) may have written since."""
+        self.data = self._load()
         return self.data.get(key, {})
 
     def put(self, key: str, **kv) -> None:
-        self.data[key] = {**self.data.get(key, {}), **kv}
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data))
-        tmp.replace(self.path)
+        """Read-modify-write under a file lock, so no holder can overwrite keys another one saved since it loaded."""
+        with open(self.dir / "state.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.data = self._load()
+            self.data[key] = {**self.data.get(key, {}), **kv}
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.data))
+            tmp.replace(self.path)
 
     def failed_here(self, key: str, sha: str) -> bool:
         e = self.get(key)

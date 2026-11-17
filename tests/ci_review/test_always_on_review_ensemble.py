@@ -480,3 +480,28 @@ def test_repos_in_the_config_are_what_poll_watches(env):
     set_pr(env, updated_at=NEW)
     env.config(f"repos: [{REPO}]\n")
     assert env.run("poll") == 0 and len(env.reviewer_calls()) == 2
+
+
+def test_enrolling_a_later_repo_does_not_erase_what_an_earlier_repos_reviews_saved(env):
+    other = "acme/other"
+    state = env.tmp / "state/state.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps({f"repo:{REPO}": {"enrolled_at": "2020-01-01T00:00:00Z"}}))   # A enrolled, B is new
+    env.config()
+    assert env.run("poll", "--repo", REPO, "--repo", other) == 0
+    saved = json.loads(state.read_text())
+    assert saved[f"{REPO}#7#tier1"]["dry_sha"] == env.head and saved[f"{REPO}#7#tier2"]["dry_sha"] == env.head
+    assert f"repo:{other}" in saved and saved[f"repo:{REPO}"]["enrolled_at"] == "2020-01-01T00:00:00Z"
+    calls = len(env.reviewer_calls())
+    assert env.run("poll", "--repo", REPO, "--repo", other) == 0
+    assert len(env.reviewer_calls()) == calls                         # nothing is reviewed twice
+
+
+def test_two_state_holders_never_clobber_each_others_keys(env):
+    cfg = env.mod.load_config(str(env.cfg_path))
+    a, b = env.mod.State(cfg), env.mod.State(cfg)                     # both snapshots taken before either writes
+    a.put("x", v=1)
+    b.put("y", v=2)
+    a.put("x", w=3)
+    assert json.loads((env.tmp / "state/state.json").read_text()) == {"x": {"v": 1, "w": 3}, "y": {"v": 2}}
+    assert b.get("x") == {"v": 1, "w": 3}                             # readers see the other holder's writes
