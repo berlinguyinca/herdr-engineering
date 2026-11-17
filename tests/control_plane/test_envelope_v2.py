@@ -76,6 +76,19 @@ def test_gap_opens_on_jump_and_closes_on_out_of_order_arrival():
     assert state["gaps"] == [] and state["last_sequence"] == 3
 
 
+def test_late_arrival_splitting_a_gap_keeps_the_ledger_restorable():
+    from herdr_engineering.control_plane import envelope
+    repo, s = svc()
+    for i in range(0, 64 * 10 + 1, 10):  # 64 wide gaps: exactly at the cap
+        s.ingest(body(i), PRINCIPAL)
+    assert len(repo.ledger.source_state("pi")["gaps"]) == envelope.MAX_GAPS_PER_SOURCE
+    s.ingest(body(75), PRINCIPAL)  # lands mid-gap: closing it splits one gap into two
+    state = repo.ledger.source_state("pi")
+    assert len(state["gaps"]) <= envelope.MAX_GAPS_PER_SOURCE and state["gaps_truncated"] is True
+    # the exported checkpoint must restore (restore rejects a source over the cap)
+    envelope.SourceLedger().restore_checkpoint(repo.ledger.export_checkpoint())
+
+
 def test_freshness_is_stale_without_events_and_healthy_after_one():
     clock = [1_000_000.0]
     repo = ControlPlaneRepo(now=lambda: clock[0])
