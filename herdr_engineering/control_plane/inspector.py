@@ -313,6 +313,9 @@ class InspectorStore:
         #: Changes on every process start; clients resync when it differs (seq/rev restart).
         self.epoch = secrets.token_hex(6)
         self._lock = threading.RLock()
+        # Serialises ingest writers. ``_lock`` is released while a durable write waits on the database, so this keeps
+        # two ingests from interleaving in that window; readers only ever need ``_lock``.
+        self._ingest_lock = threading.RLock()
         self.stats = {"accepted": 0, "duplicates": 0, "rejected": 0,
                       "evicted_events": 0, "evicted_sessions": 0}
         # Replay cursor: the largest replay order key, fabric sequence and event count that hydrate() has consumed.
@@ -561,7 +564,7 @@ class InspectorStore:
         if len(events) > _MAX_BATCH:
             raise ValueError(f"batch too large (max {_MAX_BATCH})")
         result = {"accepted": 0, "duplicates": 0, "rejected": [], "session_id": session_id}
-        with self._lock:
+        with self._ingest_lock, self._lock:
             sess = self._session(session_id)
             for i, ev in enumerate(events):
                 try:
@@ -893,7 +896,7 @@ class InspectorStore:
             return
         if kind in REQUIRED_DURABLE_KINDS:
             try:
-                self._persist(durable)
+                self._persist_unlocked(durable)
             except Exception as exc:
                 raise RuntimeError("inspector persistence unavailable") from exc
         else:
@@ -924,7 +927,7 @@ class InspectorStore:
             self._safe_persist(durable)
             return
         try:
-            self._persist(durable)
+            self._persist_unlocked(durable)
         except Exception as exc:
             raise RuntimeError("inspector persistence unavailable") from exc
 
@@ -1069,9 +1072,24 @@ class InspectorStore:
         self._touch(sess, live)
         return "ok"
 
-    def _safe_persist(self, ev: dict) -> None:
+    def _persist_unlocked(self, ev: dict) -> None:
+        """Run the durable write without holding ``_lock``. The write can wait seconds behind the sink's single
+        database connection; holding the store lock meanwhile stalled every reader (agents/list, health, has_session).
+        Callers are ingest, which still holds ``_ingest_lock``, so ordering between writers is unchanged and the
+        commit-before-projection rule holds: readers see the state from before the event until it is durable."""
+        lock = self._lock
+        if not lock._is_owned():                    # type: ignore[attr-defined]  # not under the store lock: nothing to release
+            self._persist(ev)
+            return
+        state = lock._release_save()                # type: ignore[attr-defined]  # every re-entrant level, as Condition.wait does
         try:
             self._persist(ev)
+        finally:
+            lock._acquire_restore(state)            # type: ignore[attr-defined]
+
+    def _safe_persist(self, ev: dict) -> None:
+        try:
+            self._persist_unlocked(ev)
         except Exception:  # durability is best-effort and never breaks ingest
             pass
 
