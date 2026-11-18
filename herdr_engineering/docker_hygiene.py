@@ -1,8 +1,9 @@
 """Docker hygiene for agent-started test containers.
 
-Only things labelled ``herdr.ephemeral=1`` are ever removed (containers, volumes). Unlabelled
-named volumes (databases, registries, corpora) are never touched. Builder cache is trimmed to a
-budget and dangling images are pruned, neither of which can drop a named volume or a tagged image.
+Only things labelled ``herdr.ephemeral=1`` are removed by default (containers, volumes).
+Unlabelled named volumes (databases, registries, corpora) are never touched. ``docker builder
+prune`` has no label filter and ``docker image prune`` removes any dangling image, so both are
+opt-in (``builder_prune`` / ``image_prune``) and off by default.
 
 Start throwaway containers with ``docker run $(herdr-eng cleanup --print-run-args) ...`` or set
 ``HERDR_DOCKER_RUN_LABELS`` (documented in docs/disk-hygiene.md): ``--rm --label herdr.ephemeral=1``.
@@ -88,8 +89,19 @@ def remove_ephemeral_container(ref: str, *, dry_run: bool) -> dict[str, Any]:
     return {"container": info["Id"][:12]}
 
 
+def prune_steps(keep_storage: str = "5GB", *, builder_prune: bool = False,
+                image_prune: bool = False) -> list[tuple[str, list[str]]]:
+    """Prune commands of the sweep. Only the label-filtered volume prune is on by default."""
+    steps = [("volumes", ["volume", "prune", "-f", "--all", "--filter", f"label={EPHEMERAL_LABEL}"])]
+    if builder_prune:
+        steps.append(("builder", ["builder", "prune", "-f", "--keep-storage", keep_storage]))
+    if image_prune:
+        steps.append(("images", ["image", "prune", "-f"]))
+    return steps
+
+
 def sweep(*, dry_run: bool = False, min_age_seconds: int = 3600, keep_storage: str = "5GB",
-          now: float | None = None) -> dict[str, Any]:
+          now: float | None = None, builder_prune: bool = False, image_prune: bool = False) -> dict[str, Any]:
     """The nightly job. Returns a JSON-able report; never raises for a docker failure."""
     report: dict[str, Any] = {"job": "docker", "dry_run": dry_run, "containers": [], "steps": []}
     if not docker_available():
@@ -107,11 +119,7 @@ def sweep(*, dry_run: bool = False, min_age_seconds: int = 3600, keep_storage: s
             done = _docker("rm", "-v", cid)
             entry["removed"] = done.returncode == 0
         report["containers"].append(entry)
-    steps = [
-        ("volumes", ["volume", "prune", "-f", "--all", "--filter", f"label={EPHEMERAL_LABEL}"]),
-        ("builder", ["builder", "prune", "-f", "--keep-storage", keep_storage]),
-        ("images", ["image", "prune", "-f"]),
-    ]
+    steps = prune_steps(keep_storage, builder_prune=builder_prune, image_prune=image_prune)
     for name, args in steps:
         if dry_run:
             report["steps"].append({"step": name, "command": ["docker", *args], "ran": False})

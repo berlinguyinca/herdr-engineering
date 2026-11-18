@@ -170,6 +170,55 @@ def test_opt_out_by_config_and_env(monkeypatch: pytest.MonkeyPatch, env: Env) ->
     assert run(load_policy({}))["status"] == "disabled"
 
 
+def test_timer_opt_out_is_read_from_user_config_not_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A launchd/systemd job has no shell env and a different cwd: only the user file counts."""
+    cfg = tmp_path / "home" / ".config" / "herdr-engineering" / "config.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("disk_hygiene:\n  enabled: false\n")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("HERDR_DISK_HYGIENE", raising=False)
+    monkeypatch.delenv("HERDR_ENGINEERING_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert not load_policy().enabled
+    assert run(load_policy())["status"] == "disabled"
+
+
+def test_repo_local_config_cannot_choose_reaper_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "herdr-engineering.yaml").write_text(f"disk_hygiene:\n  roots: ['{tmp_path}']\n  worktrees: {{enabled: false}}\n")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    assert load_policy().roots == () and load_policy().worktrees
+
+
+def test_users_own_worktrees_in_ideaprojects_are_never_reaped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    env = Env(tmp_path, root=home / "IdeaProjects")
+    wt = env.worktree("mine")
+    merge_into_main(env, wt)
+    out = reap_worktrees(policy(), extra_repos=[env.repo], now=time.time() + 30 * DAY)
+    row = out["repos"][0]["worktrees"][0]
+    assert row["action"] == "kept" and row["reason"] == "outside_roots"
+    assert wt.is_dir()
+
+
+def test_agent_worktree_in_agent_root_is_discovered_and_reaped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The repo is in the user's ~/IdeaProjects (not a root); only its agent worktree is."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    env = Env(tmp_path, root=home / "IdeaProjects")
+    agent_root = home / ".local" / "share" / "worktrees"
+    agent_root.mkdir(parents=True)
+    wt = agent_root / "done"
+    git(env.repo, "worktree", "add", "-q", "-b", "done", str(wt), "origin/main")
+    git(wt, "push", "-q", "origin", "done")
+    merge_into_main(env, wt)
+    out = reap_worktrees(policy(), now=time.time())  # no extra_repos: discovery through the worktree
+    rows = [w for r in out["repos"] for w in r["worktrees"]]
+    assert [(w["action"], w["reason"]) for w in rows] == [("removed", "pr_merged")]
+    assert env.repo.is_dir()
+
+
 def test_defaults_are_on() -> None:
     p = load_policy({})
     assert p.enabled and p.worktrees and p.docker and p.ttl_days == 7 and p.builder_keep_storage == "5GB"
@@ -182,6 +231,17 @@ def test_parse_docker_time() -> None:
     assert parse_docker_time("") is None
     assert parse_docker_time("2026-11-18T10:00:00.123456789Z") == parse_docker_time("2026-11-18T10:00:00Z")
     assert parse_docker_time("2026-11-18T10:00:00Z") == parse_docker_time("2026-11-18T11:00:00+01:00")
+
+
+def test_default_prune_steps_are_label_filtered_only() -> None:
+    from herdr_engineering.docker_hygiene import prune_steps
+    steps = prune_steps()
+    assert [name for name, _ in steps] == ["volumes"]
+    assert "label=herdr.ephemeral=1" in steps[0][1]
+    assert [n for n, _ in prune_steps(builder_prune=True, image_prune=True)] == ["volumes", "builder", "images"]
+    p = load_policy({})
+    assert not p.builder_prune and not p.image_prune
+    assert load_policy({"docker": {"builder_prune": True}}).builder_prune
 
 
 def test_run_args_default_and_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -211,6 +271,12 @@ def _create(label: bool) -> str:
 
 def _exists(name: str) -> bool:
     return subprocess.run(["docker", "inspect", name], capture_output=True).returncode == 0
+
+
+@needs_docker
+def test_sweep_dry_run_default_plans_no_unlabelled_prune() -> None:
+    report = sweep(dry_run=True)
+    assert [s["step"] for s in report["steps"]] == ["volumes"]
 
 
 @needs_docker

@@ -179,12 +179,25 @@ def test_install_adds_cleanup_allow_rule_and_reminder_mentions_command(home):
     assert json.loads(settings(home).read_text()) == {"permissions": {"allow": ["Bash(ls:*)"]}}
 
 
-def test_missing_allow_rule_is_drift_and_repair_restores_it(home):
+def test_installed_rule_is_exactly_the_cleanup_command(home):
+    inst(home).install()
+    assert json.loads(settings(home).read_text())["permissions"]["allow"] == ["Bash(herdr-eng cleanup:*)"]
+
+
+def test_removed_allow_rule_is_not_drift_and_never_re_added(home):
     inst(home).install()
     data = json.loads(settings(home).read_text())
     del data["permissions"]
     settings(home).write_text(json.dumps(data, indent=2))
+    before = settings(home).read_bytes()
+    assert inst(home).status().state == "current"
+    assert inst(home).install().action == "noop"
+    assert inst(home).repair().action == "noop"
+    assert settings(home).read_bytes() == before
+    # a genuine hook drift is repaired, still without resurrecting the permission
+    data["hooks"]["SessionStart"][0]["hooks"][0]["command"] = "tampered # " + wh.MARKER
+    settings(home).write_text(json.dumps(data, indent=2))
     assert inst(home).status().state == "stale"
     inst(home).repair()
     assert inst(home).status().state == "current"
-    assert "Bash(herdr-eng cleanup:*)" in json.loads(settings(home).read_text())["permissions"]["allow"]
+    assert "permissions" not in json.loads(settings(home).read_text())

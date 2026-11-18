@@ -6,8 +6,9 @@
 #
 #   scripts/install-disk-hygiene.sh [install|uninstall|status] [--dry-run] [--no-load]
 #
-# Opt out: HERDR_DISK_HYGIENE=0, or `disk_hygiene: {enabled: false}` in the herdr-eng config
-# (the jobs then exit immediately), or `scripts/install-disk-hygiene.sh uninstall`.
+# Opt out: `disk_hygiene: {enabled: false}` in ~/.config/herdr-engineering/config.yaml (the jobs
+# read exactly that file and then exit immediately), or `scripts/install-disk-hygiene.sh uninstall`.
+# HERDR_DISK_HYGIENE=0 only affects interactive runs; a shell export never reaches these jobs.
 # Environment: HERDR_ENG (binary, default: herdr-eng on PATH, else <repo>/.venv/bin/herdr-eng).
 set -euo pipefail
 

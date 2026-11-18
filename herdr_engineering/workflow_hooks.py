@@ -55,22 +55,21 @@ ALLOW_RULE = "Bash(herdr-eng cleanup:*)"
 
 
 class _WorkflowHooksUnit(ClaudeHooksUnit):
-    """Managed hooks plus the permission allow rule for the sanctioned cleanup command."""
+    """Managed hooks plus, on first install only, the allow rule for the cleanup command.
+
+    The rule is the user's to keep or revoke: it is added only when the hooks were absent (a
+    fresh install), never counts toward drift, and is never re-added by repair or a re-run.
+    """
     marker = MARKER
     matchers = {"PreToolUse": GUARD_MATCHER}
 
-    def state(self, text):
-        state = super().state(text)
-        if state == CURRENT and ALLOW_RULE not in self._load(text).get("permissions", {}).get("allow", []):
-            return STALE
-        return state
-
     def install(self, text):
+        fresh = super().state(text) == ABSENT
         data = self._load(super().install(text))
-        permissions = data.setdefault("permissions", {})
-        allow = permissions.setdefault("allow", [])
-        if ALLOW_RULE not in allow:
-            allow.append(ALLOW_RULE)
+        if fresh:
+            allow = data.setdefault("permissions", {}).setdefault("allow", [])
+            if ALLOW_RULE not in allow:
+                allow.append(ALLOW_RULE)
         return _dump_json(data, text)
 
     def remove(self, text):

@@ -14,10 +14,18 @@ Config (``disk_hygiene`` in the herdr-eng config; everything optional, default o
 
     disk_hygiene: {enabled: true, repos: [], roots: [], worktree_ttl_days: 7,
                    min_idle_hours: 2, pr_source: gh,          # gh | git (offline, ancestry only)
-                   worktrees: {enabled: true}, docker: {enabled: true, min_age_hours: 1,
-                                                        builder_keep_storage: 5GB}}
+                   worktrees: {enabled: true},
+                   docker: {enabled: true, min_age_hours: 1,
+                            builder_prune: false, builder_keep_storage: 5GB,   # opt-in, unlabelled
+                            image_prune: false}}                               # opt-in, unlabelled
 
-Opt out entirely with ``enabled: false`` or ``HERDR_DISK_HYGIENE=0``.
+Opt out entirely with ``disk_hygiene.enabled: false`` in the USER config file
+(``~/.config/herdr-engineering/config.yaml``); the scheduled jobs read exactly that file.
+``HERDR_DISK_HYGIENE=0`` only affects interactive runs: a shell export never reaches a
+launchd/systemd job. Repo-local config is never read here.
+
+Only worktrees inside the agent roots (``cleanup_command.default_roots`` plus the user config's
+``disk_hygiene.roots``) are ever reaped; the user's own repos and worktrees are not.
 """
 from __future__ import annotations
 
@@ -32,11 +40,13 @@ from typing import Any
 from .cleanup_command import (
     Refusal,
     _git,
+    _origin_owner,
     busy_paths,
     checked_path,
     configured_roots,
     gh_pr_state,
     remove_worktree,
+    user_disk_hygiene_config,
 )
 
 _DISCOVERY_DEPTH = 2
@@ -54,16 +64,14 @@ class Policy:
     roots: tuple[str, ...] = ()
     docker_min_age_hours: float = 1.0
     builder_keep_storage: str = "5GB"
+    builder_prune: bool = False
+    image_prune: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
 
 def load_policy(cfg: dict[str, Any] | None = None) -> Policy:
     if cfg is None:
-        try:
-            from .config import load_config
-            cfg = load_config().get("disk_hygiene") or {}
-        except Exception:  # noqa: BLE001 - unreadable config means defaults, i.e. on
-            cfg = {}
+        cfg = user_disk_hygiene_config()  # user-level file only; unreadable means defaults (on)
     wt, dk = cfg.get("worktrees") or {}, cfg.get("docker") or {}
     off = os.environ.get("HERDR_DISK_HYGIENE", "1").strip().lower() in ("0", "false", "no", "off")
     return Policy(
@@ -77,12 +85,16 @@ def load_policy(cfg: dict[str, Any] | None = None) -> Policy:
         roots=tuple(str(r) for r in cfg.get("roots", [])),
         docker_min_age_hours=float(dk.get("min_age_hours", 1)),
         builder_keep_storage=str(dk.get("builder_keep_storage", "5GB")),
+        builder_prune=bool(dk.get("builder_prune", False)),
+        image_prune=bool(dk.get("image_prune", False)),
     )
 
 
 def find_repos(roots: list[Path]) -> list[Path]:
-    """Main checkouts (a ``.git`` directory) near the roots. Discovery only, never a removal rule."""
-    found: list[Path] = []
+    """Main checkouts near the roots, plus the main checkout behind every linked worktree found
+    there (agent worktrees live in an agent root, their repo usually does not). Discovery only,
+    never a removal rule."""
+    found: set[Path] = set()
     for root in roots:
         pending = [(Path(os.path.abspath(root)), 0)]
         while pending:
@@ -92,12 +104,17 @@ def find_repos(roots: list[Path]) -> list[Path]:
             except OSError:
                 continue
             if any(e.name == ".git" and e.is_dir(follow_symlinks=False) for e in entries):
-                found.append(directory)
+                found.add(directory)
+                continue
+            if any(e.name == ".git" and e.is_file(follow_symlinks=False) for e in entries):
+                common = _git(directory, "rev-parse", "--path-format=absolute", "--git-common-dir")
+                if common.returncode == 0 and common.stdout.strip():
+                    found.add(Path(common.stdout.strip()).resolve().parent)
                 continue
             if depth < _DISCOVERY_DEPTH:
                 pending += [(Path(e.path), depth + 1) for e in entries
                             if e.is_dir(follow_symlinks=False) and not e.name.startswith(".")]
-    return sorted(set(found))
+    return sorted(found)
 
 
 def list_worktrees(repo: Path) -> list[dict[str, Any]]:
@@ -142,7 +159,8 @@ def pr_state(repo: Path, wt: Path, branch: str, source: str) -> str:
     if not branch:
         return "none"
     if source == "gh":
-        pr = gh_pr_state(repo, branch)
+        pr = gh_pr_state(repo, branch, _git(wt, "rev-parse", "HEAD").stdout.strip(),
+                         _origin_owner(repo))
         if pr is None:
             return "unknown"
         return {"MERGED": "merged", "CLOSED": "closed", "OPEN": "open", "NONE": "none"}.get(
@@ -215,7 +233,7 @@ def reap_worktrees(policy: Policy, *, dry_run: bool = False, extra_repos: list[P
 def run(policy: Policy, *, only: str | None = None, dry_run: bool = False,
         extra_repos: list[Path] | None = None, extra_roots: list[str] | None = None) -> dict[str, Any]:
     if not policy.enabled:
-        return {"status": "disabled", "reason": "disk_hygiene.enabled is false or HERDR_DISK_HYGIENE=0"}
+        return {"status": "disabled", "reason": "disk_hygiene.enabled is false (user config) or HERDR_DISK_HYGIENE=0"}
     jobs: list[dict[str, Any]] = []
     if policy.worktrees and only in (None, "worktrees"):
         jobs.append(reap_worktrees(policy, dry_run=dry_run, extra_repos=extra_repos,
@@ -223,7 +241,8 @@ def run(policy: Policy, *, only: str | None = None, dry_run: bool = False,
     if policy.docker and only in (None, "docker"):
         from .docker_hygiene import sweep
         jobs.append(sweep(dry_run=dry_run, min_age_seconds=int(policy.docker_min_age_hours * 3600),
-                          keep_storage=policy.builder_keep_storage))
+                          keep_storage=policy.builder_keep_storage, builder_prune=policy.builder_prune,
+                          image_prune=policy.image_prune))
     return {"status": "dry_run" if dry_run else "ok", "jobs": jobs}
 
 
@@ -246,7 +265,6 @@ def register(sub: Any) -> None:
         cp.add_argument("--dry-run", action="store_true")
         cp.add_argument("--json", action="store_true")
         cp.add_argument("--repo", action="append", default=[], help="repository main checkout (repeatable)")
-        cp.add_argument("--root", action="append", default=[])
         cp.add_argument("--ttl-days", type=float)
         cp.add_argument("--pr-source", choices=("gh", "git"))
         cp.set_defaults(func=main_args)
@@ -264,7 +282,7 @@ def main_args(args: argparse.Namespace) -> int:
                              "pr_source": policy.pr_source}}
     else:
         report = run(policy, only=args.only, dry_run=args.dry_run,
-                     extra_repos=[Path(r).expanduser() for r in args.repo], extra_roots=args.root)
+                     extra_repos=[Path(r).expanduser() for r in args.repo])
         if not args.dry_run:
             _write_status(report)
     print(json.dumps(report, indent=None if args.json else 2, default=str))
