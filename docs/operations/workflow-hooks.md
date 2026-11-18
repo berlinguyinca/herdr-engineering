@@ -12,7 +12,7 @@ scripts/install.sh                      # step 7c installs them; --no-workflow-h
 |---|---|---|
 | `SessionStart` | `additionalContext`: a <=15 line reminder (delegate multi-file work to sonnet subagents, verify with command output, branch -> PR -> review -> CI green, real deps, never push herdr-engineering, nothing under /tmp, Woodpecker CI, `/handoff`) | run commands, read files, call the network |
 | `PreCompact` | `systemMessage` recommending `/handoff` before compaction | run `herdr-handoff` or open a pane |
-| `PreToolUse` (matcher `Bash\|Write\|Edit\|MultiEdit\|NotebookEdit`) | a `permissionDecision` of `deny` or `ask` with a reason, only for the rules below; otherwise nothing | use the network, parse arbitrary shell for `/tmp` writes, or fail a tool call on an internal error (it fails open) |
+| `PreToolUse` (matcher `Bash\|Write\|Edit\|MultiEdit\|NotebookEdit`) | a `permissionDecision` of `deny` with a reason, only for the rules below; otherwise nothing | use the network, parse arbitrary shell for `/tmp` writes, or fail a tool call on an internal error (it fails open) |
 
 ### PreToolUse guard (`herdr_engineering/workflow_guard.py`)
 
@@ -20,12 +20,16 @@ scripts/install.sh                      # step 7c installs them; --no-workflow-h
 |---|---|---|
 | No scratch writes under `/tmp` | `Write`, `Edit`, `MultiEdit`, `NotebookEdit` whose resolved path is under `/tmp` or `/private/tmp` | `deny`, telling the agent to use a gitignored project dir such as `.<project>/<topic>/` |
 | No push to main/master | `Bash` containing `git push` (also `git -C <dir> push`, chained with `&&`, `;`, `\|`) whose refspec targets `main`/`master` (`origin main`, `HEAD:main`, `x:refs/heads/main`), or with no refspec while the repo's current branch is `main`/`master` | `deny` |
-| herdr-engineering push needs approval | any other `git push` whose repo (the `-C` dir, else the hook's `cwd`) has an `origin` URL containing `herdr-engineering` | `ask` ("pushing herdr-engineering needs explicit user approval") |
+| herdr-engineering push needs approval | any other `git push` whose repo (the `-C` dir, else the hook's `cwd`) has an `origin` URL containing `herdr-engineering` | `deny` unless the one-shot approval token exists (see below) |
+| Unknown repo for a push | a `git push` with no refspec or a `HEAD` refspec after a `cd` the hook cannot resolve | `deny` unless the token exists |
+| No self-approval | `Write`/`Edit`/`MultiEdit`/`NotebookEdit` targeting the token path, or `Bash` whose command mentions it | `deny` |
 
 - Scratchpad exception: paths under `/tmp/claude-<digits>/` and `/private/tmp/claude-<digits>/` (the Claude Code harness scratchpad) are allowed.
 - `Bash` writes to `/tmp` (redirects, `tee`, `cp`) are deliberately not inspected.
 - The branch and `origin` URL come from real `git` calls with a 1 s timeout; there is no network access. Any parse error, timeout, missing repo or malformed stdin prints nothing and exits 0.
-- A `deny` from a hook is final for that call; `ask` falls back to the normal interactive prompt.
+- A `deny` from a hook is final for that call. The guard never returns `ask`: Claude Code auto permission mode does not prompt for it, so the rule would do nothing.
+- One-shot push approval: the human runs `! touch ~/.local/state/herdr-engineering/allow-push` in the session (the `!` prefix runs it as the user, not the agent). The next guarded push (herdr-engineering origin, or unknown repo) is allowed and the file is deleted, so each approval covers one push. The deny reason tells the agent to ask for exactly this. A push to main/master is denied regardless and does not consume the token. Set `HERDR_WORKFLOW_ALLOW_PUSH` to move the token path (tests do).
+- This is a speed bump, not a security boundary: the `Bash` check for the token path is a substring match (`~`, `$HOME` and absolute forms, and `herdr-engineering/allow-push`), so a determined agent can build the path indirectly. It stops accidental and casual self-approval only.
 - Opt out: `herdr-eng workflow uninstall` (removes all managed workflow hooks), or install with `--no-workflow-hooks`; to drop only this guard, delete the `PreToolUse` entry whose command contains `herdr-workflow:managed` from `~/.claude/settings.json` (a later `install`/`repair` re-adds it).
 
 - Entries carry `herdr-workflow:managed` in the command, which is guarded with
