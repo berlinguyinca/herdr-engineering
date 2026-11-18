@@ -1,13 +1,12 @@
 """Claude Code adapter: context from the session transcript, drain and exit by typing into the pane."""
 import json
 import re
-import shutil
-import subprocess
 import time
 from collections.abc import Mapping
 from pathlib import Path
 
 from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
+from .herdr_session import herdr_session_id
 from .windows import lookup_window
 
 PROMPT_MARKER = "❯"  # the empty input box of Claude Code, on a line of its own between two rules
@@ -57,21 +56,6 @@ def _last_usage(path: Path) -> tuple[int, str | None] | None:
         chunk *= 2
 
 
-def _herdr_session_id(pane_id: str, env: Mapping[str, str] | None) -> str | None:
-    """The conversation id Herdr reports for the pane's agent (``herdr agent get``), or None."""
-    exe = shutil.which("herdr", path=None if env is None else env.get("PATH", ""))
-    if not exe:
-        return None
-    try:
-        out = subprocess.run([exe, "agent", "get", pane_id], capture_output=True, text=True, timeout=10,
-                             env=None if env is None else dict(env))
-        session = json.loads(out.stdout)["result"]["agent"].get("agent_session")
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError):
-        return None
-    value = session.get("value") if isinstance(session, dict) and session.get("kind") == "id" else None
-    return value if isinstance(value, str) and value else None
-
-
 class ClaudeAdapter:
     harness = Harness.CLAUDE
 
@@ -92,7 +76,7 @@ class ClaudeAdapter:
         return SessionRef(self.harness, pane_id, cwd, transcripts[0].stem, transcripts[0])
 
     def locate(self, pane_id: str, cwd: Path) -> SessionRef | None:
-        return self.locate_session(_herdr_session_id(pane_id, self._env), cwd, pane_id)
+        return self.locate_session(herdr_session_id(pane_id, self._env), cwd, pane_id)
 
     def read_context(self, ref: SessionRef) -> ContextReading | None:
         if ref.record_path is None:
