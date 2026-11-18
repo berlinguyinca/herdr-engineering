@@ -542,17 +542,21 @@ def test_agent_cannot_write_the_token(tool, key, token, tmp_path):
     for path in (str(token), str(token.parent / ".." / "state" / "allow-push")):
         res = call({"tool_name": tool, "tool_input": {key: path}, "cwd": str(tmp_path)})
         assert decision(res) == "deny"
+        assert "push-approval token" in res[2]["permissionDecisionReason"]
     assert not token.exists()
 
 
 def test_relative_token_write_denied(token):
     res = call({"tool_name": "Write", "tool_input": {"file_path": "allow-push"}, "cwd": str(token.parent)})
     assert decision(res) == "deny"
+    assert "push-approval token" in res[2]["permissionDecisionReason"]
 
 
 @pytest.mark.parametrize("fmt", ["touch {t}", "echo > {t}", "python -c \"open('{t}','w')\""])
 def test_bash_referencing_token_is_denied(fmt, token, tmp_path):
-    assert decision(bash(fmt.format(t=token), tmp_path)) == "deny"
+    res = bash(fmt.format(t=token), tmp_path)
+    assert decision(res) == "deny"
+    assert "push-approval token" in res[2]["permissionDecisionReason"]
     assert not token.exists()
 
 
