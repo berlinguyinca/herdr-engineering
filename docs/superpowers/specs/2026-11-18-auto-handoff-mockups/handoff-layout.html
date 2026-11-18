@@ -1,0 +1,85 @@
+<style>
+.tab{background:#0f1115;color:#d7dae0;font:12px/1.45 ui-monospace,Menlo,monospace;border-radius:8px;overflow:hidden;border:1px solid #2a2f3a}
+.tabbar{background:#1a1d24;padding:6px 10px;color:#8b93a4;display:flex;gap:14px}
+.tabbar b{color:#e6e9ef}
+.body{display:flex;height:330px}
+.panes{flex:1;display:flex;flex-direction:column}
+.pane{flex:1;border-right:1px solid #2a2f3a;padding:8px 10px;position:relative}
+.pane+.pane{border-top:1px solid #2a2f3a}
+.pane .hd{color:#8b93a4;margin-bottom:6px}
+.pane.old{opacity:.45}
+.ctx{display:inline-block;width:90px;height:7px;background:#2a2f3a;border-radius:4px;vertical-align:middle;margin-left:6px}
+.ctx i{display:block;height:100%;border-radius:4px}
+.side{width:250px;background:#13161c;display:flex;flex-direction:column}
+.stabs{display:flex;border-bottom:1px solid #2a2f3a}
+.stabs span{padding:6px 10px;color:#8b93a4}
+.stabs span.on{color:#e6e9ef;border-bottom:2px solid #5b8cff}
+.stabs .col{margin-left:auto}
+.sbody{padding:10px}
+.node{display:flex;align-items:center;gap:8px;margin:2px 0}
+.dot{width:10px;height:10px;border-radius:50%;background:#3a4150;flex:none}
+.dot.live{background:#3fb950;box-shadow:0 0 0 3px #3fb95033}
+.line{margin-left:4px;border-left:2px solid #3a4150;height:12px}
+.muted{color:#6b7385}
+.stat{display:flex;gap:12px;margin-bottom:10px}
+.stat div{background:#1a1d24;padding:4px 8px;border-radius:5px}
+.stat b{display:block;color:#e6e9ef;font-size:14px}
+.frames{display:grid;grid-template-columns:1fr;gap:18px}
+.cap{font-weight:600;margin:6px 0}
+</style>
+
+<h2>Your picture, as I understood it</h2>
+<p class="subtitle">One Herdr tab. The session on the left, a collapsible side pane on the right with two tabs: Summary and Handoffs. Three moments of a handoff.</p>
+
+<div class="frames">
+
+<div>
+<div class="cap">1 · Working, context getting full</div>
+<div class="tab"><div class="tabbar"><b>screenwright</b><span>tab 2</span></div>
+<div class="body">
+ <div class="panes">
+  <div class="pane"><div class="hd">claude · session #3 · context <span class="ctx"><i style="width:88%;background:#d29922"></i></span> 88%</div>
+  &gt; fixing filter toggles…<br>&gt; running vitest…<br><span class="muted">… working …</span></div>
+ </div>
+ <div class="side"><div class="stabs"><span>Summary</span><span class="on">Handoffs</span><span class="col">⟩</span></div>
+  <div class="sbody">
+   <div class="stat"><div><b>2</b>handoffs</div><div><b>3</b>sessions</div><div><b>5h 10m</b>total</div></div>
+   <div class="node"><span class="dot"></span>#1 brainstorm guard <span class="muted">1h 40m</span></div><div class="line"></div>
+   <div class="node"><span class="dot"></span>#2 guard PR + CI <span class="muted">2h 05m</span></div><div class="line"></div>
+   <div class="node"><span class="dot live"></span><b>#3 filter toggles</b> <span class="muted">1h 25m · 88%</span></div>
+  </div></div>
+</div></div>
+</div>
+
+<div>
+<div class="cap">2 · Mandatory limit hit → new session opens in a pane below</div>
+<div class="tab"><div class="tabbar"><b>screenwright</b><span>tab 2</span></div>
+<div class="body">
+ <div class="panes">
+  <div class="pane old"><div class="hd">claude · session #3 · context 95% · handing off…</div>&gt; wrote handoff briefing<br>&gt; waiting for #4 to confirm</div>
+  <div class="pane"><div class="hd">claude · session #4 · context <span class="ctx"><i style="width:6%;background:#3fb950"></i></span> 6%</div>&gt; read handoff, resuming at "run vitest"</div>
+ </div>
+ <div class="side"><div class="stabs"><span>Summary</span><span class="on">Handoffs</span><span class="col">⟩</span></div>
+  <div class="sbody">
+   <div class="stat"><div><b>3</b>handoffs</div><div><b>4</b>sessions</div></div>
+   <div class="node"><span class="dot"></span>#1 brainstorm guard</div><div class="line"></div>
+   <div class="node"><span class="dot"></span>#2 guard PR + CI</div><div class="line"></div>
+   <div class="node"><span class="dot"></span>#3 filter toggles <span class="muted">→ handed off</span></div><div class="line"></div>
+   <div class="node"><span class="dot live"></span><b>#4 filter toggles (cont.)</b></div>
+  </div></div>
+</div></div>
+</div>
+
+<div>
+<div class="cap">3 · New session confirmed → old session exits, its pane closes</div>
+<div class="tab"><div class="tabbar"><b>screenwright</b><span>tab 2</span></div>
+<div class="body">
+ <div class="panes">
+  <div class="pane"><div class="hd">claude · session #4 · context <span class="ctx"><i style="width:8%;background:#3fb950"></i></span> 8%</div>&gt; running vitest…</div>
+ </div>
+ <div class="side"><div class="stabs"><span class="on">Summary</span><span>Handoffs</span><span class="col">⟩</span></div>
+  <div class="sbody"><b>Goal</b><br>Filter chips → single-select toggles<br><br><b>Done</b><br>· toggle groups + tests<br><b>Now</b><br>· full vitest run<br><b>Next</b><br>· push, PR, CI<br><span class="muted">updated at handoff #3</span></div></div>
+</div></div>
+</div>
+
+</div>
