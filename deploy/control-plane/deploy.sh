@@ -1212,7 +1212,7 @@ forward() {
   if [ "$COLLAB" = 1 ]; then
     install_private "$NEW_COLLAB" "$COLLAB_CONFIG" || return 1
     mkdir -p "$HERDR_COLLAB_DATA_DIR" && chmod 700 "$HERDR_COLLAB_DATA_DIR" || return 1
-    if [ "$FABRIC" = 1 ]; then   # the sidecar's socket directory: created before either container mounts it
+    if [ "$FABRIC" = 1 ]; then   # the sidecar's socket directory: created before any container mounts it (collab-public, control-plane-web)
       mkdir -p "$HERDR_COLLAB_FABRIC_WHOIS_DIR" && chmod 700 "$HERDR_COLLAB_FABRIC_WHOIS_DIR" || return 1
     fi
     # keys + membership files, the edge certificate, the 1-minute timer and the cert renew

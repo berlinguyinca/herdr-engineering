@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: control-plane-web can reach the fabric whois sidecar for the phone bridge
+
+- `tailnet_open_owner` failed closed on the live host because `herdr-cp-web` had no whois socket. `compose.collab-fabric.yaml` now mounts the sidecar's socket directory **read-only** at `/run/fabric-whois` in `control-plane-web` (only when that overlay is layered). Set `rakazo_bridge.whois_socket: /run/fabric-whois/whois.sock`. No other service, capability or network changes; the sidecar keeps its hardening. See `docs/operations/shepherd-discovery.md`.
+
 ### Fix: fleet-watch host-apply smoke checks resolve the launcher and use `autospec doctor`
 
 - The rollout's first live pass (2026-11-17) halted on `beast/autospec` and would never converge: the autospec health smoke ran bare `autospec --version`, and (a) the autospec CLI has **no** `--version` flag (it exits 2 with `unknown autospec command`), and (b) neither a systemd unit's PATH nor a non-interactive ssh shell's PATH contains `~/.autospec/bin`, so bare `autospec` was not found at all. `pi` had the same PATH gap (`~/.local/bin` missing on the Linux ssh/service PATHs).
