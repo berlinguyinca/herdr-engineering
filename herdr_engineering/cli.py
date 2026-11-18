@@ -516,6 +516,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = hsub.add_parser("context-hook", help="UserPromptSubmit hook body (opt-in): ask for /handoff when context is high; never fails")
     p2.add_argument("harness", help="only claude is supported; anything else is a silent no-op so a hook never fails")
     p2.set_defaults(func=_cmd_handoff_context_hook)
+    p2 = hsub.add_parser("subagent-hook", help="SubagentStart/SubagentStop hook body: record running subagents per pane; never fails")
+    p2.add_argument("phase", choices=("start", "stop"))
+    p2.set_defaults(func=_cmd_handoff_subagent_hook)
+    p2 = hsub.add_parser("subagents", help="list running subagents registered for a pane (prunes entries older than 6h)")
+    p2.add_argument("--pane", default=None, help="pane id (default: $HERDR_PANE_ID)")
+    p2.add_argument("--json", action="store_true")
+    p2.set_defaults(func=_cmd_handoff_subagents)
     p2 = hsub.add_parser("auto", help="install, remove or check the opt-in context-hook in ~/.claude/settings.json")
     p2.add_argument("auto_action", choices=("install", "uninstall", "check"))
     p2.add_argument("--home", default=None, help="override $HOME (tests)")
@@ -1498,15 +1505,26 @@ def _cmd_handoff_auto(args) -> int:
     from . import handoff_auto_setup as ha
     home = Path(args.home) if args.home else None
     if args.auto_action == "check":
-        item = ha.check(home)
+        items = ha.check(home)
     else:
-        item = (ha.install if args.auto_action == "install" else ha.uninstall)(home, dry_run=args.dry_run)
-    ok = item.action not in ha.FAIL_ACTIONS
+        items = (ha.install if args.auto_action == "install" else ha.uninstall)(home, dry_run=args.dry_run)
+    ok = all(i.action not in ha.FAIL_ACTIONS for i in items)
     if args.json:
-        _print_json({"ok": ok, "results": [item.to_dict()]})
+        _print_json({"ok": ok, "results": [i.to_dict() for i in items]})
     else:
-        print(f"{item.action:10} {item.target}" + (f"  ({item.detail})" if item.detail else ""))
+        for item in items:
+            print(f"{item.action:10} {item.target}" + (f"  ({item.detail})" if item.detail else ""))
     return 0 if ok else 1
+
+
+def _cmd_handoff_subagent_hook(args) -> int:
+    from .handoff_subagent_registry import run_subagent_hook
+    return run_subagent_hook(args.phase)
+
+
+def _cmd_handoff_subagents(args) -> int:
+    from .handoff_subagent_registry import run_subagents
+    return run_subagents(args.pane, as_json=args.json)
 
 
 def _cmd_summary_manage(args) -> int:
