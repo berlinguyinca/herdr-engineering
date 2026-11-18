@@ -1292,7 +1292,7 @@ def test_a_usage_limit_is_not_run_and_not_a_cooldown_strike(env, msg):
 
 def test_a_codex_usage_limit_is_labelled_and_keeps_the_opus_approve(env):
     env.config(RISKY, post=True)
-    env.reviewer("codex", answer=APPROVE, exit=1, fail_stdout="You've hit your usage limit. Try again later.")
+    env.reviewer("codex", answer=APPROVE, exit=1, fail_stdout=codex_error_event("You've hit your usage limit. Try again."))
     env.review("tier2", post=True)
     assert codex_lines(env)[0]["why"].startswith("usage-limit:")
     env.reviewer("codex", answer=APPROVE)
@@ -1307,3 +1307,118 @@ def test_poll_stops_launching_tier2_reviews_once_the_account_is_out_of_quota(env
     env.reviewer("claude", answer=APPROVE, exit=1, fail_stdout=LIMIT_MSG)
     env.run("poll", "--repo", REPO)
     assert [c["tool"] for c in env.reviewer_calls()] == ["pi", "claude", "pi"]     # PR 8: tier 1 only, no claude
+
+
+def codex_error_event(msg):
+    return json.dumps({"type": "thread.started"}) + "\n" + json.dumps({"type": "error", "message": msg}) + "\n"
+
+
+def codex_output_event(text):
+    """What `codex exec --json` emits for a command that printed `text` (file contents from the PR under review)."""
+    return json.dumps({"type": "item.completed", "item": {"type": "command_execution", "command": "cat NOTES.md",
+                                                          "aggregated_output": text, "exit_code": 0}}) + "\n"
+
+
+def add_pr(env, n, path):
+    """PR n changes only `path` (non-risky under the RISKY globs), on its own head."""
+    sh("git", "checkout", "-q", "-b", f"pr{n}", env.base, cwd=env.clone)
+    (env.clone / path).parent.mkdir(parents=True, exist_ok=True)
+    (env.clone / path).write_text(f"pr {n}\n")
+    sh("git", "add", ".", cwd=env.clone)
+    sh("git", "commit", "-qm", f"pr {n}", cwd=env.clone)
+    head = sh("git", "rev-parse", "HEAD", cwd=env.clone)
+    sh("git", "push", "-q", "origin", f"{head}:refs/pull/{n}/head", cwd=env.clone)
+    st = env.gh_state()
+    st["prs"][str(n)] = {"head": head, "diff": sh("git", "diff", f"{env.base}...{head}", cwd=env.clone) + "\n"}
+    st["statuses"][head] = [x for x in st["statuses"][env.head] if x["context"] in ("ci/woodpecker/pr/lint", "verify")]
+    st["check_runs"][head] = st["check_runs"][env.head]
+    env.write_gh(st)
+    return head
+
+
+def test_a_codex_output_that_mentions_a_usage_limit_is_not_a_usage_limit(env):
+    out = (json.dumps({"type": "thread.started"}) + "\n"
+           + codex_output_event("# notes\nWhen you hit your daily limit, see the usage limit docs.") + "\n")
+    err = env.mod._exit_failure("codex", 1, out.encode(), b"", json_events=True)
+    assert not isinstance(err, env.mod.UsageLimit) and not str(err).startswith("usage-limit:")
+    assert "usage limit" not in str(err)                               # command output is not an error message
+
+
+def test_a_codex_run_with_limit_text_in_command_output_is_an_ordinary_failure_with_a_strike(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=APPROVE, exit=1, fail_stdout=codex_output_event("you hit your limit, usage limit"))
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    assert not codex_lines(env)[0]["why"].startswith("usage-limit:")
+    st = env.mod.State(env.mod.load_config(str(env.cfg_path))).get(f"{REPO}#7#tier2")
+    assert st["failures"] == 1 and "limit_sha" not in st
+
+
+@pytest.mark.parametrize("event", [{"type": "error", "message": "You've hit your usage limit."},
+                                   {"type": "turn.failed", "error": {"message": "You've hit your 5-hour limit"}}])
+def test_codex_error_events_are_still_recognised(env, event):
+    err = env.mod._exit_failure("codex", 1, (json.dumps(event) + "\n").encode(), b"", json_events=True)
+    assert isinstance(err, env.mod.UsageLimit) and str(err).startswith("usage-limit:")
+
+
+def test_codex_stderr_is_scanned_too(env):
+    err = env.mod._exit_failure("codex", 1, b"", b"Error: usage limit reached", json_events=True)
+    assert isinstance(err, env.mod.UsageLimit)
+
+
+def test_a_codex_limit_only_stops_codex_not_opus_on_later_non_risky_prs(env):
+    add_pr(env, 8, "docs/x.md")
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=APPROVE, exit=1, fail_stdout=codex_error_event("You've hit your usage limit."))
+    env.run("poll", "--repo", REPO, post=True)
+    assert [c["tool"] for c in env.reviewer_calls()] == ["pi", "claude", "codex", "pi", "claude"]
+    assert any(s["state"] == "success" for s in env.statuses_posted())    # PR 8 got its Opus review
+
+
+def test_a_codex_limit_skips_codex_for_later_risky_prs_before_running_opus(env):
+    h9 = add_pr(env, 9, "src/b.py")
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=APPROVE, exit=1, fail_stdout=codex_error_event("You've hit your usage limit."))
+    env.run("poll", "--repo", REPO, post=True)
+    assert [c["tool"] for c in env.reviewer_calls()] == ["pi", "claude", "codex", "pi"]     # PR 9: no Opus, no Codex
+    assert not [w for w in env.gh_writes() if h9 in w["path"] and w["body"]["context"] == "Opus agent review"]
+
+
+def test_an_opus_limit_still_stops_opus_for_the_poll(env):
+    add_pr(env, 8, "docs/x.md")
+    env.config(RISKY, post=True)
+    env.reviewer("claude", answer=APPROVE, exit=1, fail_stdout=LIMIT_MSG)
+    env.run("poll", "--repo", REPO, post=True)
+    assert [c["tool"] for c in env.reviewer_calls()] == ["pi", "claude", "pi"]
+
+
+def test_a_pr_stuck_on_a_codex_limit_is_retried_after_the_others(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=APPROVE, exit=1, fail_stdout=codex_error_event("You've hit your usage limit."))
+    env.run("poll", "--repo", REPO, post=True)
+    add_pr(env, 9, "docs/y.md")
+    n = len(env.reviewer_calls())
+    env.run("poll", "--repo", REPO, post=True)
+    assert [c["tool"] for c in env.reviewer_calls()[n:]] == ["pi", "claude", "codex"]    # PR 9 first, PR 7's retry last
+    assert len(opus_calls(env)) == 2                                    # PR 7's Opus approve was remembered
+
+
+def test_the_remembered_opus_approve_needs_the_same_base(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=APPROVE, exit=3)
+    env.review("tier2", post=True)
+    sp = env.tmp / "state/state.json"
+    st = json.loads(sp.read_text())
+    assert st[f"{REPO}#7#tier2"]["opus_approved"]["base_sha"] == env.base
+    st[f"{REPO}#7#tier2"]["opus_approved"]["base_sha"] = "0" * 40         # as if the PR were retargeted
+    sp.write_text(json.dumps(st))
+    env.reviewer("codex", answer=APPROVE)
+    assert env.review("tier2", post=True) == env.mod.OK
+    assert len(opus_calls(env)) == 2
+
+
+@pytest.mark.parametrize("glob", ["**", "**/", "**/**", "/**", "***", "**//"])
+def test_a_glob_that_matches_every_path_is_refused(env, glob):
+    env.config(f'risky: {{globs: ["{glob}"]}}\n')
+    with pytest.raises(env.mod.Refused) as e:
+        env.mod.load_config(str(env.cfg_path))
+    assert "risky.globs[0]" in str(e.value)

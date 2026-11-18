@@ -368,6 +368,8 @@ def _check_risky(cfg: dict) -> None:
             raise Refused(f"config: risky.globs[{i}] must be a string, not {type(g).__name__}")
         if not g.strip() or g.startswith("/") or ".." in g.split("/"):
             raise Refused(f"config: risky.globs[{i}] must be a repo-relative glob (not empty, no leading /, no ..)")
+        if "**" in g and set(g) <= {"*", "/"}:
+            raise Refused(f"config: risky.globs[{i}] ({g!r}) would match every path and make every PR risky")
     c = r["codex"]
     if not isinstance(c["wrapper"], list) or not all(isinstance(x, str) for x in c["wrapper"]):
         raise Refused("config: risky.codex.wrapper must be a list of strings")
@@ -889,7 +891,9 @@ def child_env() -> dict[str, str]:
 
 class UsageLimit(ReviewFailed):
     """The reviewer's account is out of quota. Not a strike against the PR (nothing is wrong with it), and the poll
-    stops launching more reviews of that tier."""
+    stops launching more reviews of that tier. `bucket` names the quota that ran out when it is not the tier's own
+    (Codex has its own: "codex")."""
+    bucket: str | None = None
 
 
 USAGE_LIMIT_RE = re.compile(r"hit your.{0,40}limit|usage limit", re.I)
@@ -907,11 +911,30 @@ def usage_limit_text(text: str) -> bool:
     return USAGE_LIMIT_RE.search(text) is not None
 
 
-def _exit_failure(name: str, rc: int, out: bytes, err: bytes) -> ReviewFailed:
+def jsonl_error_messages(out: bytes) -> str:
+    """The messages of the error events (`error`, `turn.failed`) in a JSONL event stream. Nothing else in the stream:
+    command output and agent messages carry text of the PR under review."""
+    msgs = []
+    for line in out.decode("utf-8", "replace").splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and e.get("type") in ("error", "turn.failed"):
+            m = e.get("message") if isinstance(e.get("message"), str) else (
+                e["error"].get("message") if isinstance(e.get("error"), dict) else None)
+            if isinstance(m, str):
+                msgs.append(m)
+    return " ".join(msgs)
+
+
+def _exit_failure(name: str, rc: int, out: bytes, err: bytes, json_events: bool = False) -> ReviewFailed:
     """The failure of a reviewer that exited non-zero. claude prints its errors to STDOUT, so when stderr is empty the
-    tail comes from the first 300 characters of stdout. A usage-limit message becomes a UsageLimit."""
-    tail = one_line(err[-2000:]) or one_line(out)
-    if usage_limit_text(one_line(err, 2000) + " " + one_line(out, 2000)):
+    tail comes from the first 300 characters of stdout. A usage-limit message becomes a UsageLimit. With json_events
+    (codex --json) stdout is an event stream full of the PR's own text: only stderr and the error events are used."""
+    text = jsonl_error_messages(out) if json_events else one_line(out, 2000)
+    tail = one_line(err[-2000:]) or one_line(text)
+    if usage_limit_text(one_line(err, 2000) + " " + one_line(text, 2000)):
         return UsageLimit(f"usage-limit: {name} exited {rc}: {tail}")
     return ReviewFailed(f"{name} exited {rc}: {tail}")
 
@@ -922,7 +945,8 @@ def _with_stdout(e: ReviewFailed, out: bytes | None) -> ReviewFailed:
     return e
 
 
-def run_reviewer(argv: list[str], cwd: Path, stdin: str | None, time_cap_s: float) -> tuple[str, float]:
+def run_reviewer(argv: list[str], cwd: Path, stdin: str | None, time_cap_s: float,
+                 json_events: bool = False) -> tuple[str, float]:
     """The one subprocess boundary: scrubbed env, own process group (killed whole on the time cap), bounded output."""
     t = time.monotonic()
     try:
@@ -939,7 +963,7 @@ def run_reviewer(argv: list[str], cwd: Path, stdin: str | None, time_cap_s: floa
         raise _with_stdout(ReviewFailed(f"the review took longer than the time cap ({time_cap_s:.0f}s); killed"),
                            out) from None
     if p.returncode != 0:
-        raise _with_stdout(_exit_failure(Path(argv[0]).name, p.returncode, out, err), out)
+        raise _with_stdout(_exit_failure(Path(argv[0]).name, p.returncode, out, err, json_events), out)
     if len(out) > OUTPUT_MAX:
         raise ReviewFailed("the reviewer's output is larger than any verdict can be")
     return out.decode("utf-8", "replace"), time.monotonic() - t
@@ -1586,8 +1610,10 @@ class CodexBackend:
             schema.write_text(json.dumps(GATEWAY_SCHEMA))
             try:
                 stdout, took = run_reviewer(self.argv(schema, out, req.worktree), req.worktree, self.prompt(req),
-                                            time_cap_s)
+                                            time_cap_s, json_events=True)
             except ReviewFailed as e:
+                if isinstance(e, UsageLimit):
+                    e.bucket = "codex"
                 raise self._with_spend(e, getattr(e, "stdout", "")) from None
             try:
                 usage = codex_usage(stdout)
@@ -1927,7 +1953,8 @@ def upsert_comment(gh, repo: str, n: int, context: str, body: str, mk: str | Non
 
 # ---------------- one review ----------------
 
-def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, force: bool = False) -> int:
+def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, force: bool = False,
+                codex_blocked: bool = False) -> int:
     global LAST_RESULT
     LAST_RESULT = None
     assert_not_replaying("a review of a live pull request")
@@ -1976,7 +2003,8 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
         try:
             if ensemble:
                 return _run_tier1(cfg, gh, pr, repo, n, sha, tier, state, key, started, post_on)
-            return _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started, force)
+            return _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started, force,
+                        codex_blocked)
         except (ReviewFailed, Refused) as e:
             if isinstance(e, UsageLimit):               # out of quota is nobody's strike; just retry next time
                 state.put(key, limit_sha=sha)
@@ -2021,12 +2049,13 @@ def verdict_from_json(d: dict) -> Verdict:
                    tuple(d["checked_items"]), tuple(dict(c) for c in d["tier1_checks"]))
 
 
-def remembered_opus(state: State, key: str, sha: str, tier: dict) -> PassesResult | None:
-    """The clean Opus approve of exactly this head that a risky review saved when only Codex failed to run; the retry
-    then runs Codex alone. Another head, another model, or a damaged entry means Opus reviews again."""
+def remembered_opus(state: State, key: str, sha: str, base_sha: str, tier: dict) -> PassesResult | None:
+    """The clean Opus approve of exactly this head and base that a risky review saved when only Codex failed to run; the retry
+    then runs Codex alone. Another head or base (a retarget), another model, or a damaged entry means Opus reviews again."""
     e = state.get(key).get("opus_approved")
     try:
-        if not isinstance(e, dict) or e.get("sha") != sha or e.get("tier_model") != tier["model"]:
+        if (not isinstance(e, dict) or e.get("sha") != sha or e.get("base_sha") != base_sha
+                or e.get("tier_model") != tier["model"]):
             return None
         v = verdict_from_json(e["verdict"])
         if v.head_sha != sha or v.verdict != "approve":
@@ -2114,7 +2143,8 @@ def local_diff(wt: Worktree) -> str:
     return git(["diff", "--no-color", "--no-ext-diff", wt.base_sha, wt.sha], wt.path) + "\n"
 
 
-def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started, force=False) -> int:
+def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started, force=False,
+         codex_blocked=False) -> int:
     global LAST_RESULT
     context = tier["context"]
     diff = github_diff(gh, repo, n)                  # None: too large for GitHub; read it from the worktree instead
@@ -2125,7 +2155,8 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
         raise ReviewFailed("the diff is empty")
     index = {f.path: f for f in files}
     risky = tier_name == "tier2" and bool(risky_paths(cfg, files))
-    if risky and (why := codex_budget_left(cfg)):
+    if risky and (why := codex_budget_left(cfg) or ("codex is out of quota for this poll run" if codex_blocked
+                                                     else None)):
         ai.say(f"{key} @ {sha[:12]}: {why}; review skipped, status unchanged")
         return SKIPPED
     if post_on:
@@ -2149,10 +2180,13 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
                 index = {f.path: f for f in files}
                 req.files = sorted(index)
                 risky = tier_name == "tier2" and bool(risky_paths(cfg, files))
+                if risky and codex_blocked:
+                    ai.say(f"{key} @ {sha[:12]}: codex is out of quota for this poll run; review skipped")
+                    return SKIPPED
                 ai.say(f"{repo}#{n}: the diff is over GitHub's limit; reviewing the local diff of {len(files)} files")
             req.worktree, req.base_sha = wt.path, wt.base_sha
             req.log = git(["log", "--format=%h %s", f"{wt.base_sha}..{sha}"], wt.path)
-            result = None if (force or not risky) else remembered_opus(state, key, sha, tier)
+            result = None if (force or not risky) else remembered_opus(state, key, sha, wt.base_sha, tier)
             if result is not None:
                 ai.say(f"{key} @ {sha[:12]}: Opus already approved this head; running Codex only")
             else:
@@ -2165,7 +2199,7 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
                     codex = codex_review(cfg, req, tier_name, post_on, started)
                 except ReviewFailed as e:
                     e.usage = result.usage              # Opus ran and billed; Codex logged its own spend
-                    state.put(key, opus_approved={"sha": sha, "tier_model": tier["model"], "model": result.model,
+                    state.put(key, opus_approved={"sha": sha, "base_sha": wt.base_sha, "tier_model": tier["model"], "model": result.model,
                                                   "downgraded": result.downgraded,
                                                   "verdict": verdict_to_json(result.verdict)})
                     raise
@@ -2789,6 +2823,15 @@ def poll_prs(cfg: dict, state: State, repo: str, prs: list[dict]) -> list[dict]:
     return out
 
 
+def stuck_last(state: State, repo: str, prs: list[dict]) -> list[dict]:
+    """PRs whose tier-2 review last stopped on a usage limit (for this very head) go after the others, so one stuck
+    risky PR is retried only once the rest have had their turn (and their share of max_per_run)."""
+    def stuck(p: dict) -> bool:
+        return state.get(f"{repo}#{p.get('number')}#tier2").get("limit_sha") == p.get("headRefOid")
+
+    return sorted(prs, key=stuck)                                         # stable: number order within each group
+
+
 def poll(cfg: dict, repos: list[str], post_flag: bool) -> int:
     held = ai.lock(cfg, "always-on-poll")
     if held is None:
@@ -2797,7 +2840,7 @@ def poll(cfg: dict, repos: list[str], post_flag: bool) -> int:
     post_on = post_allowed(cfg, post_flag)
     ai.say(f"poll: {'POSTING enabled' if post_on else 'DRY RUN: nothing will be posted'}")
     gh, worst, done, state = ai.Gh(dry_run=True), OK, 0, State(cfg)
-    out_of_quota: set[str] = set()          # tiers whose reviewer reported a usage limit: no more launches this run
+    out_of_quota: set[str] = set()          # quotas ("tier1", "tier2", "codex") that reported a usage limit this run
     try:
         for repo in repos:
             try:
@@ -2809,7 +2852,7 @@ def poll(cfg: dict, repos: list[str], post_flag: bool) -> int:
                 ai.say(f"{repo}: {e}")
                 worst = FAILED
                 continue
-            for p in prs:
+            for p in stuck_last(state, repo, prs):
                 for tier_name in ("tier1", "tier2"):
                     if tier_name in out_of_quota:
                         continue
@@ -2827,11 +2870,12 @@ def poll(cfg: dict, repos: list[str], post_flag: bool) -> int:
 def _poll_one(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool,
               out_of_quota: set[str] | None = None) -> int:
     try:
-        return review_tier(cfg, repo, n, tier_name, post_flag)
+        return review_tier(cfg, repo, n, tier_name, post_flag, codex_blocked="codex" in (out_of_quota or ()))
     except UsageLimit as e:
-        ai.say(f"{repo}#{n} {tier_name}: {e}; no further {tier_name} reviews in this poll run")
+        bucket = e.bucket or tier_name
+        ai.say(f"{repo}#{n} {tier_name}: {e}; no further {bucket} reviews in this poll run")
         if out_of_quota is not None:
-            out_of_quota.add(tier_name)
+            out_of_quota.add(bucket)
         return FAILED
     except Refused as e:
         ai.say(f"{repo}#{n} {tier_name}: refused: {e}")

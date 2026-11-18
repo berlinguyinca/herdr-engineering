@@ -18,6 +18,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - A failed reviewer's `why` falls back to the first 300 characters of stdout (control characters stripped) when stderr is
   empty (claude prints its errors to stdout). A usage-limit message logs `why: usage-limit: ...`, is not a cooldown
   strike (state `limit_sha` lets the next poll retry), and stops the poll launching more reviews of that tier in the run.
+- Review fixes: Codex has its own usage-limit bucket (a Codex limit skips only later risky PRs, before Opus; an Opus
+  limit still stops Opus for the poll; a PR stuck on a limit is polled after the others). Codex limit detection scans
+  only stderr and the `error` / `turn.failed` events, never command output. `opus_approved` also records the base sha
+  (a retarget reruns Opus). A glob of only `**` / `**/` is refused.
 - Rollback: revert this PR. The extra `state.json` keys (`opus_approved`, `limit_sha`) are ignored by older code;
   `risky: null` then fails the old config check, so restore a mapping (or remove the key) first.
 
