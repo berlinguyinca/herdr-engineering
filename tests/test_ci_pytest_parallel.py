@@ -8,11 +8,14 @@ These drive the real shell function in a subshell, and a real pytest-xdist run, 
 
 from __future__ import annotations
 
+import ast
+import importlib.util
 import os
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -258,8 +261,8 @@ def wait_gone(pid: int, seconds: float = 15) -> bool:
     return False
 
 
-def test_sigterm_to_the_watchdog_stops_the_command_and_exits_128_plus_signal(tmp_path: Path) -> None:
-    pidfile = tmp_path / "pid"
+def test_sigterm_to_the_watchdog_stops_the_command_and_exits_128_plus_signal(pidfiles) -> None:
+    pidfile = pidfiles()
     script = f"import os, time; open({str(pidfile)!r}, 'w').write(str(os.getpid())); time.sleep(1234)"
     wd = subprocess.Popen([sys.executable, str(WATCHER), "100", "100", "--", sys.executable, "-c", script],
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -285,8 +288,8 @@ def test_a_busy_parent_is_not_hung_after_a_cpu_heavy_child_exits() -> None:
     assert done.returncode == 0 and "hung" not in done.stderr, done.stderr
 
 
-def test_cpu_in_a_descendant_that_called_setsid_counts_and_a_hang_kills_it(tmp_path: Path) -> None:
-    pidfile = tmp_path / "pid"
+def test_cpu_in_a_descendant_that_called_setsid_counts_and_a_hang_kills_it(pidfiles) -> None:
+    pidfile = pidfiles()
     daemon = f"import os, time; os.setsid(); open({str(pidfile)!r}, 'w').write(str(os.getpid())); time.sleep(1234)"
     # Silent, idle parent; its own-session child sleeps: no progress anywhere -> killed as hung, daemon included.
     script = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {daemon!r}]); time.sleep(1234)"
@@ -324,24 +327,24 @@ def wait_file(path: Path) -> int:
     raise AssertionError(f"{path} never appeared")
 
 
-def test_a_daemon_orphaned_before_the_first_poll_still_counts_as_progress(tmp_path: Path) -> None:
-    pidfile = tmp_path / "pid"
+def test_a_daemon_orphaned_before_the_first_poll_still_counts_as_progress(pidfiles) -> None:
+    pidfile = pidfiles()
     spawn = daemonize_cmd(pidfile, "end = time.time() + 7\nwhile time.time() < end: sum(range(10000))")
     # The silent root sleeps; only the orphaned daemon computes. Without finding it, hard=4 would kill at 124.
     done = watch("1", "4", f"import subprocess, time; {spawn}; time.sleep(8)")
     assert done.returncode == 0 and "hung" not in done.stderr, done.stderr
 
 
-def test_a_hang_kill_stops_an_orphaned_daemon_too(tmp_path: Path) -> None:
-    pidfile = tmp_path / "pid"
+def test_a_hang_kill_stops_an_orphaned_daemon_too(pidfiles) -> None:
+    pidfile = pidfiles()
     spawn = daemonize_cmd(pidfile, "time.sleep(1234)")
     done = watch("1", "3", f"import subprocess, time; {spawn}; time.sleep(1234)")
     assert done.returncode == 124
     assert wait_gone(wait_file(pidfile)), "a hang kill leaked the orphaned daemon"
 
 
-def test_sigterm_to_the_watchdog_stops_an_orphaned_daemon_too(tmp_path: Path) -> None:
-    pidfile = tmp_path / "pid"
+def test_sigterm_to_the_watchdog_stops_an_orphaned_daemon_too(pidfiles) -> None:
+    pidfile = pidfiles()
     spawn = daemonize_cmd(pidfile, "time.sleep(1234)")
     wd = subprocess.Popen([sys.executable, str(WATCHER), "100", "100", "--", sys.executable, "-c",
                            f"import subprocess, time; {spawn}; time.sleep(1234)"], stderr=subprocess.PIPE)
@@ -352,8 +355,8 @@ def test_sigterm_to_the_watchdog_stops_an_orphaned_daemon_too(tmp_path: Path) ->
     assert wait_gone(daemon), "SIGTERM left the orphaned daemon running"
 
 
-def test_a_leaked_busy_survivor_does_not_keep_the_watchdog_alive_and_is_stopped(tmp_path: Path) -> None:
-    pidfile = tmp_path / "pid"
+def test_a_leaked_busy_survivor_does_not_keep_the_watchdog_alive_and_is_stopped(pidfiles) -> None:
+    pidfile = pidfiles()
     spawn = daemonize_cmd(pidfile, "while True: sum(range(10000))")
     started = time.monotonic()
     done = watch("100", "100", f"import subprocess; {spawn}", HERDR_WATCHED_ORPHAN_GRACE="3")
@@ -465,3 +468,307 @@ def test_the_gate_prints_the_same_effective_quota_the_worker_count_uses(tmp_path
     for key in ("host:", "cpus visible:", "loadavg:", "tmp filesystem:"):
         assert key in done.stdout, done.stdout
     assert f"cgroup cpu quota: {Q} CPUs" in done.stdout, done.stdout
+
+
+# --- review nits from #824 -------------------------------------------------------------------------------------------------------
+
+
+def load_watcher():
+    spec = importlib.util.spec_from_file_location("run_watched_under_test", WATCHER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def started_before(pid: int, when: float) -> bool:
+    """True if the process now holding `pid` started no later than `when` (the pidfile's mtime): a pid reused after the file was
+    written belongs to a stranger and must not be killed."""
+    try:
+        start_ticks = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        boot = next(int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines() if line.startswith("btime "))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return False
+    return boot + start_ticks / os.sysconf("SC_CLK_TCK") <= when + 1.0
+
+
+def reap_pidfiles(paths: list[Path]) -> None:
+    """Kill whatever pid each file names (if it is still ours to kill) and delete the file."""
+    for path in paths:
+        try:
+            pid = int(path.read_text())
+        except (OSError, ValueError):
+            pid = None
+        if pid and pid > 1 and started_before(pid, path.stat().st_mtime):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        path.unlink(missing_ok=True)
+
+
+@pytest.fixture
+def pidfiles(tmp_path: Path):
+    """Factory for pidfile paths; teardown kills leaked daemons (a failing test must not leave sleepers) and removes the files."""
+    made: list[Path] = []
+
+    def make(name: str = "pid") -> Path:
+        path = tmp_path / f"{name}.{len(made)}"
+        made.append(path)
+        return path
+
+    yield make
+    reap_pidfiles(made)
+
+
+def test_the_pidfile_fixture_kills_a_leaked_process_and_removes_the_file(tmp_path: Path) -> None:
+    pidfile = tmp_path / "leak"
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1234)"])
+    pidfile.write_text(str(sleeper.pid))
+    reap_pidfiles([pidfile])
+    assert sleeper.wait(timeout=10) == -signal.SIGKILL and not pidfile.exists()
+    # A pidfile naming a process that started AFTER the file was written is a reused pid: leave the stranger alone.
+    stale = tmp_path / "stale"
+    stale.write_text("0")
+    stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1234)"])
+    try:
+        time.sleep(1.2)
+        stale.write_text(str(stranger.pid))
+        os.utime(stale, (time.time() - 60, time.time() - 60))
+        reap_pidfiles([stale])
+        assert stranger.poll() is None and not stale.exists()
+    finally:
+        stranger.kill()
+        stranger.wait()
+    reap_pidfiles([tmp_path / "never-written"])      # a missing or empty pidfile is not an error
+    (tmp_path / "empty").write_text("")
+    reap_pidfiles([tmp_path / "empty"])
+
+
+def out_probe(prelude: str, **popen: object) -> subprocess.CompletedProcess[str]:
+    code = (
+        "import importlib.util, os, sys\n"
+        f"spec = importlib.util.spec_from_file_location('rw', {str(WATCHER)!r}); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+        f"{prelude}\n"
+        "o = m.Out(); o.write(b'hello'); o.write(b'again')\n"
+        "os.write(2, b'survived')\n"
+    )
+    return subprocess.run([sys.executable, "-I", "-c", code], stderr=subprocess.PIPE, text=True, timeout=30, **{"stdout": subprocess.PIPE, **popen})
+
+
+def test_out_write_survives_a_full_nonblocking_stdout_pipe() -> None:
+    r, w = os.pipe()
+    os.set_blocking(w, False)
+    try:
+        while True:
+            os.write(w, b"x" * 65536)
+    except BlockingIOError:
+        pass
+    reader_leaves = threading.Timer(1.0, os.close, (r,))     # the reader goes away while the pipe is full: EPIPE, not a hang
+    reader_leaves.start()
+    try:
+        done = out_probe("", stdout=w)
+    finally:
+        reader_leaves.join()
+        os.close(w)
+    assert done.returncode == 0 and "survived" in done.stderr, done.stderr
+
+
+def test_out_write_waits_for_a_late_reader_of_a_nonblocking_stdout_and_loses_nothing() -> None:
+    total = 1_000_000
+    for via in ("out", "watchdog"):
+        r, w = os.pipe()
+        os.set_blocking(w, False)
+        if via == "out":
+            code = (
+                "import importlib.util, sys\n"
+                f"spec = importlib.util.spec_from_file_location('rw', {str(WATCHER)!r}); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+                f"o = m.Out(); o.write(b'x' * {total}); assert not o.broken\n"
+            )
+            argv = [sys.executable, "-I", "-c", code]
+        else:
+            argv = [sys.executable, str(WATCHER), "100", "100", "--", sys.executable, "-c", f"import sys; sys.stdout.write('x' * {total})"]
+        proc = subprocess.Popen(argv, stdout=w, stderr=subprocess.PIPE, text=True)
+        os.close(w)
+        time.sleep(1.5)                                      # the reader starts late: the pipe is full and EAGAIN is returned
+        got = 0
+        while chunk := os.read(r, 65536):
+            got += len(chunk)
+        os.close(r)
+        assert proc.wait(timeout=60) == 0, (via, proc.stderr.read())
+        assert got == total, (via, got)
+
+
+def test_out_write_survives_a_closed_or_missing_stdout() -> None:
+    closed = out_probe("os.close(1)")
+    assert closed.returncode == 0 and "survived" in closed.stderr, closed.stderr
+    missing = out_probe("sys.stdout = None")
+    assert missing.returncode == 0 and "survived" in missing.stderr, missing.stderr
+
+
+def test_the_group_is_not_signalled_once_the_root_is_reaped_unless_a_member_proves_it_is_ours(monkeypatch) -> None:
+    mod = load_watcher()
+    proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    proc.wait()                                              # reaped: its pid/pgid may now be reused by anyone
+    tree = mod.Tree(proc.pid, "tok")
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(mod.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+    tree.signal_all(signal.SIGTERM)
+    assert calls == [], "signalled a process group whose leader was already reaped and which has no live member"
+    # An unreaped root's group is always ours.
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    try:
+        t2 = mod.Tree(live.pid, "tok", live)
+        t2.signal_all(signal.SIGCONT)
+        assert calls == [(live.pid, signal.SIGCONT)], "an unreaped root's group must still be signalled"
+    finally:
+        live.kill()
+        live.wait()
+
+
+def test_a_reaped_root_whose_pid_was_reused_by_an_unrelated_group_leader_is_never_group_signalled(monkeypatch) -> None:
+    mod = load_watcher()
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()                                               # reaped: returncode is set
+    stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    try:
+        tree = mod.Tree(stranger.pid, "tok", gone)            # as if the stranger had been handed the root's old pid
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(mod.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+        tree.signal_all(signal.SIGCONT)
+        assert calls == [], "signalled an unrelated process group that reused the root's pid"
+    finally:
+        stranger.kill()
+        stranger.wait()
+
+
+def test_a_reaped_root_whose_group_still_holds_a_known_member_is_group_signalled(monkeypatch) -> None:
+    mod = load_watcher()
+    root = subprocess.Popen(["sh", "-c", "sleep 60 & echo $!"], stdout=subprocess.PIPE, text=True, start_new_session=True)
+    member = int(root.stdout.readline())
+    try:
+        root.wait()                                           # the leader is reaped; its child still holds the group
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(mod.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+        tree = mod.Tree(root.pid, "tok", root)
+        tree.known[member] = mod.read_stat(member)[3] + 1     # same pid, wrong start time: not our member
+        tree.signal_all(signal.SIGCONT)
+        assert calls == []
+        tree.known[member] = mod.read_stat(member)[3]
+        tree.signal_all(signal.SIGCONT)
+        assert calls == [(root.pid, signal.SIGCONT)]
+    finally:
+        os.kill(member, signal.SIGKILL)
+
+
+def test_a_token_that_appears_in_the_environ_after_the_first_look_is_found(tmp_path: Path) -> None:
+    mod = load_watcher()
+    token = "late-token-1"
+    code = (
+        f"import os, sys, time; time.sleep(1.5); os.execve(sys.executable, [sys.executable, '-c', 'import time; time.sleep(30)'], "
+        f"{{**os.environ, 'HERDR_RUN_WATCHED_TOKEN': {token!r}}})"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "HERDR_RUN_WATCHED_TOKEN"}
+    child = subprocess.Popen([sys.executable, "-c", code], env=env)
+    try:
+        tree = mod.Tree(os.getpid(), token)
+        start = mod.read_stat(child.pid)[3]
+        assert tree.has_token(child.pid, start) is False        # before the exec: no token yet
+        end = time.monotonic() + 15
+        while time.monotonic() < end and not tree.has_token(child.pid, start):
+            time.sleep(0.2)
+        assert tree.has_token(child.pid, start), "a negative result was cached and the token was never seen"
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_cpu_of_a_reused_pid_with_a_new_start_time_counts_as_progress() -> None:
+    mod = load_watcher()
+    tree = mod.Tree(1, "tok")
+    assert tree.note_cpu(4242, 100, 50.0) is True            # first sight
+    assert tree.note_cpu(4242, 100, 50.0) is False           # idle
+    assert tree.note_cpu(4242, 100, 51.0) is True            # CPU rose
+    assert tree.note_cpu(4242, 999, 0.5) is True, "a new process on a reused pid has no history to compare with"
+    assert tree.note_cpu(4242, 999, 0.5) is False
+
+
+def test_signal_handlers_are_installed_before_the_command_is_spawned() -> None:
+    main = next(n for n in ast.parse(WATCHER.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    lines = {"popen": [], "handler": []}
+    for node in ast.walk(main):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "Popen":
+                lines["popen"].append(node.lineno)
+            if node.func.attr == "signal" and isinstance(node.func.value, ast.Name) and node.func.value.id == "signal":
+                lines["handler"].append(node.lineno)
+    assert lines["popen"] and lines["handler"] and max(lines["handler"]) < min(lines["popen"])
+
+
+def test_a_signal_sent_by_the_command_the_instant_it_starts_still_stops_it_cleanly(pidfiles) -> None:
+    pidfile = pidfiles()
+    script = f"import os, signal, time; open({str(pidfile)!r}, 'w').write(str(os.getpid())); os.kill(os.getppid(), signal.SIGTERM); time.sleep(1234)"
+    done = subprocess.run([sys.executable, str(WATCHER), "100", "100", "--", sys.executable, "-c", script],
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode == 128 + signal.SIGTERM, (done.returncode, done.stderr)
+    assert wait_gone(wait_file(pidfile)), "the command outlived the watchdog"
+
+
+@pytest.mark.parametrize("args", [
+    ["abc", "5", "--", "true"], ["5", "xyz", "--", "true"], ["-1", "5", "--", "true"], ["5", "0", "--", "true"],
+    ["nan", "5", "--", "true"], ["5", "inf", "--", "true"], ["5", "5", "--"], ["5", "5", "true"], ["5", "--", "5", "true"],
+])
+def test_bad_arguments_print_a_usage_error_and_exit_2_without_a_traceback(args: list[str]) -> None:
+    done = subprocess.run([sys.executable, str(WATCHER), *args], capture_output=True, text=True, timeout=30)
+    assert done.returncode == 2, (args, done.returncode, done.stderr)
+    assert "Traceback" not in done.stderr and "usage" in done.stderr.lower()
+
+
+def test_a_missing_command_is_a_clear_error_not_a_traceback() -> None:
+    done = subprocess.run([sys.executable, str(WATCHER), "5", "5", "--", "/nonexistent/definitely-not-here"],
+                          capture_output=True, text=True, timeout=30)
+    assert done.returncode == 127 and "Traceback" not in done.stderr and "definitely-not-here" in done.stderr
+
+
+def test_a_hang_kill_sends_sigterm_first_so_the_command_can_clean_up(tmp_path: Path) -> None:
+    marker = tmp_path / "got-term"
+    script = (
+        "import signal, sys, time\n"
+        f"def h(*_):\n    open({str(marker)!r}, 'w').write('x'); sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, h)\n"
+        "time.sleep(1234)"
+    )
+    done = watch("1", "2", script)
+    assert done.returncode == 124 and marker.exists(), "the hang kill went straight to SIGKILL"
+    # ...and a command that ignores SIGTERM is still killed after the grace.
+    stubborn = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(1234)"
+    assert watch("1", "2", stubborn).returncode == 124
+
+
+def test_cleanup_output_written_by_a_sigterm_handler_is_forwarded_and_does_not_stall(tmp_path: Path) -> None:
+    script = (
+        "import signal, sys, time\n"
+        "def h(*_):\n    sys.stdout.write('c' * 200000); sys.stdout.flush(); sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, h)\n"
+        "time.sleep(1234)"
+    )
+    began = time.monotonic()
+    done = watch("1", "2", script)
+    assert done.returncode == 124
+    assert done.stdout.count("c") == 200000, len(done.stdout)
+    assert time.monotonic() - began < 8, "the hang kill stalled on a full pipe until SIGKILL"
+
+
+@pytest.mark.parametrize("value", ["soon", "nan", "inf", "-1"])
+def test_a_bad_orphan_grace_value_is_a_usage_error_and_never_starts_the_command(tmp_path: Path, value: str) -> None:
+    marker = tmp_path / "started"
+    done = watch("5", "5", f"open({str(marker)!r}, 'w').write('x')", HERDR_WATCHED_ORPHAN_GRACE=value)
+    assert done.returncode == 2 and "Traceback" not in done.stderr and not marker.exists()
+
+
+def test_a_flooding_tree_cannot_hold_off_the_sigkill_after_the_grace(tmp_path: Path) -> None:
+    flood = ("import signal, sys, time\n"
+             "def h(*_):\n    while True: sys.stdout.write('f' * 65536)\n"      # floods only once told to stop, and never exits
+             "signal.signal(signal.SIGTERM, h)\ntime.sleep(1234)")
+    began = time.monotonic()
+    done = watch("1", "1", flood)
+    assert done.returncode == 124 and time.monotonic() - began < 20, "the drain loop starved the SIGKILL"
