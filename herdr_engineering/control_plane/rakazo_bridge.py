@@ -23,6 +23,7 @@ import logging
 import queue
 import re
 import secrets
+import socket
 import threading
 import time
 import traceback
@@ -32,7 +33,9 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
+from ..fabric_access import Identity, TailscaleWhois
 from . import project_intelligence as pi
+from .collab_fabric_trust import _real_peer
 from . import rakazo_agents
 from . import rakazo_terminal
 from . import rakazo_artifacts as artifacts
@@ -76,6 +79,24 @@ SCRYPT_N, SCRYPT_R, SCRYPT_P, SALT_BYTES, HASH_BYTES = 2 ** 15, 8, 1, 16, 32
 # ULA prefix). LAN and container ranges (RFC 1918, other unique-local) are deliberately absent: a docker bridge peer or a
 # neighbour on the Wi-Fi is not the owner, and this session reaches the terminal. Explicit on purpose: ``is_private`` also
 # covers Teredo, 6to4, documentation and link-local ranges.
+WELL_KNOWN_PATH = "/.well-known/herdr-shepherd"
+
+
+def _unmap(addr):
+    """An IPv4-mapped IPv6 address as the IPv4 address it carries; anything else unchanged."""
+    return getattr(addr, "ipv4_mapped", None) or addr
+
+
+def _is_local_address(ip: str) -> bool:
+    """True when ``ip`` is configured on one of this host's interfaces (only a local address can be bound)."""
+    try:
+        addr = ipaddress.ip_address(ip)
+        with socket.socket(socket.AF_INET6 if addr.version == 6 else socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind((ip, 0))
+        return True
+    except (ValueError, OSError):
+        return False
+
 OPEN_OWNER_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
     "127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48"))
 # Procedures that ride the keystroke stream: already bounded by their sequence number, the 64 KB cap and the session cap,
@@ -215,7 +236,7 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
     now = time.time() if now is None else now
     unknown = sorted(set(raw) - {"enabled", "accounts", "token_ttl_days", "max_tokens", "trusted_proxies",
                                  "routine_runner_seconds", "hindsight", "vault_key_file", "auto_join_rooms", "cognito", "push", "default_tools", "open_owner",
-                                 "open_owner_origins"})
+                                 "open_owner_origins", "tailnet_open_owner", "tailnet_open_owner_users", "public_url", "name", "whois_socket"})
     if unknown:
         raise ValueError(f"control_plane.rakazo_bridge has unknown keys: {', '.join(map(str, unknown))} "
                          "(accounts are listed under accounts: [{email, password_scrypt, role}])")
@@ -288,7 +309,28 @@ def rakazo_bridge_config(raw: Any, now: float | None = None) -> dict[str, Any]:
     if open_owner and not any(a.role == "operator" for a in accounts):
         raise ValueError("control_plane.rakazo_bridge.open_owner needs an account with role operator to act as")
     open_owner_origins = _open_owner_origins(raw.get("open_owner_origins", ["rakazo://"]))
-    return {"enabled": True, "open_owner": open_owner, "open_owner_origins": open_owner_origins, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
+    tailnet_open_owner = raw.get("tailnet_open_owner", False)
+    if not isinstance(tailnet_open_owner, bool):
+        raise ValueError("control_plane.rakazo_bridge.tailnet_open_owner must be true or false")
+    if tailnet_open_owner and not any(a.role == "operator" for a in accounts):
+        raise ValueError("control_plane.rakazo_bridge.tailnet_open_owner needs an account with role operator to act as")
+    users = raw.get("tailnet_open_owner_users", [])
+    if (not isinstance(users, list) or len(users) > 50
+            or not all(isinstance(u, str) and 3 <= len(u) <= 254 and "@" in u and u == u.strip() for u in users)):
+        raise ValueError("control_plane.rakazo_bridge.tailnet_open_owner_users must be a list of up to 50 tailnet login names "
+                         "(user@domain); empty or absent allows any tailnet user")
+    public_url = raw.get("public_url")
+    if public_url is not None and (not isinstance(public_url, str) or len(public_url) > 200
+                                   or not re.fullmatch(r"https://[A-Za-z0-9.\-]+(:\d{1,5})?(/[A-Za-z0-9._~/\-]*)?", public_url)):
+        raise ValueError("control_plane.rakazo_bridge.public_url must be an https URL such as https://local.example.ts.net")
+    name = raw.get("name", "herdr-shepherd")
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._\-]{0,63}", name):
+        raise ValueError("control_plane.rakazo_bridge.name must be 1-64 letters, digits, spaces, dots, underscores or hyphens")
+    whois_socket = raw.get("whois_socket")
+    if whois_socket is not None and (not isinstance(whois_socket, str) or not whois_socket.startswith("/")):
+        raise ValueError("control_plane.rakazo_bridge.whois_socket must be an absolute socket path (a whois sidecar)")
+    return {"enabled": True, "open_owner": open_owner, "tailnet_open_owner": tailnet_open_owner, "tailnet_open_owner_users": tuple(dict.fromkeys(u.lower() for u in users)), "public_url": public_url,
+            "name": name, "whois_socket": whois_socket, "open_owner_origins": open_owner_origins, "token_ttl_days": ttl_days, "max_tokens": max_tokens, "accounts": accounts,
             "trusted_proxies": tuple(nets), "routine_runner_seconds": runner, "hindsight": hindsight,
             "vault_key_file": vault_key_file, "auto_join_rooms": tuple(auto_join), "default_tools": tuple(dict.fromkeys(tools)),
             "cognito": cognito_cfg, "push": _push_config(raw.get("push"))}
@@ -707,7 +749,8 @@ class RakazoBridge:
 
     def __init__(self, config: dict[str, Any], assistant, *, version: str = "0", persistence=None, space_persistence=None,
                  prefs_persistence=None, collab=None, artifacts_fn=None, cognito_signin=None, push_persistence=None,
-                 push_sender=None, clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic):
+                 push_sender=None, whois: TailscaleWhois | None = None,
+                 is_local_address: Callable[[str], bool] | None = None, clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic):
         if not config.get("enabled"):
             raise ValueError("RakazoBridge needs an enabled configuration")
         self.svc = assistant
@@ -715,6 +758,18 @@ class RakazoBridge:
         self.accounts: list[Account] = list(config["accounts"])
         self.open_owner = bool(config.get("open_owner"))
         self.open_owner_origins: tuple[str, ...] = tuple(config.get("open_owner_origins") or ("rakazo://",))
+        self.tailnet_open_owner = bool(config.get("tailnet_open_owner"))
+        self.public_url: str | None = config.get("public_url")
+        self.server_name: str = config.get("name") or "herdr-shepherd"
+        # tailnet identity of the REAL peer: tailscaled whois (or a whois sidecar), the same machinery as fabric trust
+        if whois is None:
+            sock = config.get("whois_socket")
+            whois = TailscaleWhois(sockets=(sock,), proxy=True) if sock else TailscaleWhois()
+        self._whois = whois
+        self._is_local = is_local_address or _is_local_address
+        self.tailnet_users = frozenset(config.get("tailnet_open_owner_users") or ())
+        self._whois_cache: dict[str, tuple[float, Identity | None]] = {}
+        self._whois_flights: dict[str, threading.Lock] = {}
         self._open_lock = threading.Lock()
         self._open_last: dict[str, float] = {}
         self._audit_q: queue.Queue = queue.Queue(maxsize=self.AUDIT_QUEUE_MAX)
@@ -827,7 +882,7 @@ class RakazoBridge:
     @staticmethod
     def handles(path: str) -> bool:
         path = path.split("?", 1)[0]
-        return path.startswith("/rpc/") or path.startswith("/api/auth/")
+        return path.startswith("/rpc/") or path.startswith("/api/auth/") or path == WELL_KNOWN_PATH
 
     def close(self) -> None:
         self._closed.set()
@@ -861,15 +916,19 @@ class RakazoBridge:
         believed only when the TCP peer is loopback or inside ``trusted_proxies``; anything else, or an entry that is not
         an IP address, leaves the peer itself, so a caller cannot choose its own key."""
         try:
-            addr = ipaddress.ip_address(peer)
+            addr = _unmap(ipaddress.ip_address(peer))
         except ValueError:
             return peer[:64]
-        if addr.is_loopback or any(addr in net for net in self.trusted_proxies):
+        if addr.is_loopback or self._is_proxy(addr):
             try:
-                return str(ipaddress.ip_address(forwarded_for.split(",")[-1].strip()))
+                return str(_unmap(ipaddress.ip_address(forwarded_for.split(",")[-1].strip())))
             except ValueError:
                 pass
         return str(addr)
+
+    def _is_proxy(self, addr) -> bool:
+        addr = _unmap(addr)
+        return any(addr in net for net in self.trusted_proxies)
 
     def handle(self, method: str, path: str, headers: dict[str, str], body: bytes, peer: str) -> BridgeResponse | None:
         """``headers`` has lower-case names; ``peer`` is the TCP peer address. Never raises. Slow calls are logged by
@@ -893,6 +952,8 @@ class RakazoBridge:
             return None
         ip = self.client_address(peer, headers.get("x-forwarded-for", ""))
         try:
+            if path == WELL_KNOWN_PATH:
+                return self._well_known(method, peer, headers.get("x-forwarded-for", ""))
             if path.startswith("/api/auth/"):
                 return self._auth(method, path[len("/api/auth/"):], headers, body, ip, peer)
             return self._rpc(method, path[len("/rpc/"):], headers, body, ip)
@@ -904,6 +965,71 @@ class RakazoBridge:
             fail = BridgeError(500, "INTERNAL_SERVER_ERROR", "The server could not complete that request.")
             return _rpc_error(fail) if path.startswith("/rpc/") else _auth_error(500, fail.code, fail.message)
 
+    # discovery ---------------------------------------------------------------------------------------------------
+    def _tailnet_peer(self, peer: str, forwarded_for: str = "") -> tuple[str, Identity] | None:
+        """``(real address, identity)`` when the REAL caller is a tailnet node that whois knows as a user, else None. The socket
+        peer is the caller unless it is inside ``trusted_proxies`` (IPv4-mapped forms included), in which case the last
+        X-Forwarded-For entry is (absent, empty or malformed means no caller). Loopback, non-tailnet addresses, this host's own
+        addresses, tagged devices (no user) and every lookup error answer None (fail closed). Note: whois identifies the
+        last-hop node, so a relay that does not set X-Forwarded-For lends its own identity to whoever reaches it."""
+        try:
+            addr = _unmap(ipaddress.ip_address(peer.split("%")[0]))
+            if self._is_proxy(addr):
+                addr = _unmap(ipaddress.ip_address(forwarded_for.split(",")[-1].strip()))
+        except ValueError:
+            return None
+        real = _real_peer(str(addr))
+        if real is None or self._is_local(real):
+            return None
+        ident = self._whois_identity(real)
+        return (real, ident) if ident is not None and ident.user else None
+
+    def _whois_identity(self, real: str) -> Identity | None:
+        """Cached whois: 30 s for an answer (including "not a tailnet node"), 2 s for an error, one lookup in flight per address."""
+        def cached():
+            with self._open_lock:
+                hit = self._whois_cache.get(real)
+            return hit if hit and self._monotonic() < hit[0] else None
+        hit = cached()
+        if hit:
+            return hit[1]
+        with self._open_lock:
+            flight = self._whois_flights.setdefault(real, threading.Lock())
+        with flight:
+            hit = cached()
+            if hit:
+                return hit[1]
+            try:
+                ident, ttl = self._whois.lookup(real), 30.0
+            except Exception:  # noqa: BLE001 - tailscaled down or a bad answer: not identified; retry soon, not at once
+                ident, ttl = None, 2.0
+            with self._open_lock:
+                if len(self._whois_cache) >= 256:
+                    self._whois_cache.clear()
+                self._whois_cache[real] = (self._monotonic() + ttl, ident)
+                self._whois_flights.pop(real, None)
+        return ident
+
+    def _tailnet_member(self, peer: str, forwarded_for: str = "") -> bool:
+        return self._tailnet_peer(peer, forwarded_for) is not None
+
+    def _tailnet_session_allowed(self, ident: Identity) -> bool:
+        return not self.tailnet_users or (ident.user or "").lower() in self.tailnet_users
+
+    def _well_known(self, method: str, peer: str, forwarded_for: str) -> BridgeResponse:
+        """``GET /.well-known/herdr-shepherd``: unauthenticated and secret-free, so the phone app can find the server and learn
+        whether this very request arrived over the tailnet (``tailnet``) with nothing typed."""
+        if method != "GET":
+            raise BridgeError(405, "METHOD_NOT_ALLOWED", "Method not allowed")
+        found = self._tailnet_peer(peer, forwarded_for)
+        tailnet = found is not None
+        modes = ["password"]
+        if found and self.tailnet_open_owner and self._tailnet_session_allowed(found[1]):
+            modes.insert(0, "tailnet")
+        # the server URL is only disclosed to callers identified as tailnet members
+        return _json_response(200, {"name": self.server_name, "bridge_url": self.public_url if tailnet else None, "api_version": 1,
+                                    "auth_modes": modes, "tailnet": tailnet})
+
     # auth ------------------------------------------------------------------------------------------------------
     def _auth(self, method: str, name: str, headers, body: bytes, ip: str, peer: str = "") -> BridgeResponse:
         if method == "GET" and name == "capabilities":
@@ -913,7 +1039,7 @@ class RakazoBridge:
                                         "nativePasskeys": {"ios": False, "android": False}, "crispWebsiteId": None})
         if method == "POST" and name == "sign-in/email":
             return self._sign_in(body, ip)
-        if method == "POST" and name == "open" and self.open_owner:
+        if method == "POST" and name == "open" and (self.open_owner or self.tailnet_open_owner):
             return self._open_owner(headers, ip, peer)
         if method == "POST" and name == "sign-out":
             token = self._bearer(headers)
@@ -991,17 +1117,25 @@ class RakazoBridge:
             peer_addr = ipaddress.ip_address(peer) if peer else None
         except ValueError:
             raise refuse from None
-        addr = getattr(addr, "ipv4_mapped", None) or addr
+        addr = _unmap(addr)
+        if peer_addr is not None:
+            peer_addr = _unmap(peer_addr)
         if headers.get("x-forwarded-for") and peer_addr is not None:
-            direct = getattr(peer_addr, "ipv4_mapped", None) or peer_addr
-            if not (direct.is_loopback or any(peer_addr in net for net in self.trusted_proxies)):
+            if not (peer_addr.is_loopback or self._is_proxy(peer_addr)):
                 # a proxy we do not trust relayed this: its forwarded value is never the client
                 log.warning("rakazo bridge: refused an open owner session with X-Forwarded-For from untrusted peer %s", peer[:64])
                 raise refuse
-        if peer_addr is not None and any(peer_addr in net for net in self.trusted_proxies) and ip == str(peer_addr):
+        if peer_addr is not None and self._is_proxy(peer_addr) and ip == str(peer_addr):
             log.warning("rakazo bridge: refused an open owner session relayed by %s without a client address", ip[:64])
             raise refuse                                      # a configured proxy that named no client
-        if not any(addr in net for net in OPEN_OWNER_NETWORKS):
+        if self.tailnet_open_owner:
+            # whois decides whenever it is on, even with open_owner also on; the range rule is for open_owner alone
+            found = self._tailnet_peer(peer, headers.get("x-forwarded-for", ""))
+            if found is None or not self._tailnet_session_allowed(found[1]):
+                log.warning("rakazo bridge: refused a tailnet owner session from %s (not identified by whois)", ip[:64])
+                raise refuse
+            ip = found[0]                                     # rate limit and attribution use the address whois checked
+        elif not any(addr in net for net in OPEN_OWNER_NETWORKS):
             log.warning("rakazo bridge: refused an open owner session from %s", ip[:64])
             raise refuse
         now = self._monotonic()

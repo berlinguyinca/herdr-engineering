@@ -157,3 +157,12 @@ def test_a_clean_repository_exits_zero(repo, monkeypatch):
 def test_main_without_a_file_listing_asks_git():
     """The default path is what CI uses, so it must be exercised rather than only the injected one."""
     assert sg.tracked_files(), "git ls-files returned nothing inside the real repository"
+
+
+def test_tracked_marker_is_accepted_but_other_prose_revisions_are_not(repo):
+    lock = repo / "lock" / "upstreams.yaml"
+    base = lock.read_text()
+    lock.write_text(base + '  screenwright:\n    source: "a/b"\n    revision: "tracking origin/main"\n    decision: ADOPT\n')
+    assert sg.check_lock_and_pin_agree(files_of(repo)) == []
+    lock.write_text(base + '  screenwright:\n    source: "a/b"\n    revision: "latest"\n    decision: ADOPT\n')
+    assert any("'latest'" in f for f in sg.check_lock_and_pin_agree(files_of(repo)))
