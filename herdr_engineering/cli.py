@@ -618,7 +618,7 @@ def _build_parser() -> argparse.ArgumentParser:
                                         "plan/install/status/doctor/repair/uninstall")
     wsub = p.add_subparsers(dest="workflow_command", required=True)
     for name, helptext in (("plan", "show what install would change (read-only)"),
-                           ("install", "register the managed SessionStart/PreCompact hooks in ~/.claude/settings.json"),
+                           ("install", "register the managed SessionStart/PreCompact/PreToolUse hooks in ~/.claude/settings.json"),
                            ("status", "managed-hook state (read-only)"),
                            ("doctor", "drift check"),
                            ("repair", "re-apply missing or drifted managed hooks"),

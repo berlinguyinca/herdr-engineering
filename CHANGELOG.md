@@ -12,6 +12,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `herdr-eng fleet lock verify` no longer creates the watcher state directory or lock file when it does not exist.
 - Audit of the #865 self-restart (no code change needed): a freshly started loop does not restart again while the succeeded rollout is still the latest saved one (the decision is taken only in the pass that ran the rollout), and unreadable or corrupt state means no restart and no crash. Real-process tests pin both.
 - Tests: exact event tails instead of `in types[-2:]`, SIGTERM must exit 0. Operator doc: restart-mid-rollout safety, symlinked-lock backup location. Supersedes #825 (its own restart-token mechanism is dropped in favour of #865).
+### Claude Code: blocking `PreToolUse` guard in the managed workflow hooks
+
+- `herdr-eng workflow install|repair` now also registers a `PreToolUse` hook (matcher `Bash|Write|Edit|MultiEdit|NotebookEdit`, same `herdr-workflow:managed` marker and guard) that denies `Write`/`Edit`/`MultiEdit`/`NotebookEdit` under `/tmp` and `/private/tmp` (the harness scratchpad `/tmp/claude-<digits>/` is allowed), denies `git push` to `main`/`master` (explicit refspec, `HEAD`/`@`, or a bare push from a repo on that branch; it parses the whole command, follows `cd` and `git -C`, sees through subshells, keywords, `env`/`time`/`sudo` and `bash -c`, ignores redirections and heredoc bodies, asks when the target directory is unknown, and denies a plain `main`/`master` push it cannot tokenize), and asks before any other push from a repo whose `origin` contains `herdr-engineering`. It fails open and uses no network. Existing installs show as drift in `workflow doctor` until `workflow repair`. `ClaudeHooksUnit` gained an optional per-event `matchers` map. See `docs/operations/workflow-hooks.md`.
 
 ### Quieter client disconnects; fallback timeout no longer caps the body read
 
