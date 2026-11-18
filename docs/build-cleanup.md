@@ -79,10 +79,15 @@ Linux, a launchd interval job on macOS).
 build_cleanup:
   pressure_percent: 90          # at/above this, targets idle >= pressure_min_age_hours go
   pressure_min_age_hours: 2     # minimum allowed value is 1
-  refuse_builds_percent: 90     # cargo wrapper / build-coordinate refuse new builds
+  refuse_builds_percent: 90     # cargo wrapper / build-coordinate refuse new builds ...
+  refuse_builds_min_free_gib: 50  # ... only when less than this is also available
 ```
 
 Targets still in use (live process, build lease, open file, held pool-slot lock) are
-never removed in any tier. When usage is at or above `refuse_builds_percent`, a new
-build triggers one pressure cleanup (at most every 10 minutes) and is refused with exit
-code 75 if the disk is still too full. `HERDR_DISK_GUARD_OVERRIDE=1` builds anyway.
+never removed in any tier. When the build's filesystem is at or above `refuse_builds_percent`
+and has less than `refuse_builds_min_free_gib` available, a new cargo/build command
+(`build-coordinate` guards cargo, rustc, make, cmake, ninja, tsc and go, never tests) triggers
+one pressure cleanup (at most every 10 minutes; a sweep that found a build running does not
+count) and is refused with exit code 75 if the disk is still too full. Setting
+`build_cleanup.enabled: false` stops the sweeps (the launchd/systemd job is removed on the
+next install/`fleet update`, and `build-cleanup run` exits early) and the guard. `HERDR_DISK_GUARD_OVERRIDE=1` builds anyway.

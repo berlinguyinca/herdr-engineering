@@ -311,6 +311,20 @@ def _refresh_controller_handoff(root: Path, report: dict) -> None:
             "by this step (issue #799)")
 
 
+def _has_systemd_user_bus() -> bool:
+    rc, _, _ = _run(["systemctl", "--user", "show-environment"], timeout=15)
+    return rc == 0
+
+
+def _install_controller_cleanup(installer: Path, step, report: dict, have_bus: bool) -> None:
+    """Run the systemd cleanup installer; never fatal (a controller without a user bus just skips it)."""
+    if not have_bus:
+        report["steps"]["controller_cleanup"] = {"ok": True, "rc": 0, "skipped": "no systemd user bus",
+                                                  "stderr": None}
+        return
+    step("controller_cleanup", ["bash", str(installer)], 120)  # failure is recorded in the report
+
+
 def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                  inventory: Path | None = None, pull_controller: bool = True,
                  reinstall_local: bool = True, revision: str | None = None,
@@ -438,9 +452,7 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                and all(isinstance(path, str) and path.strip() for path in roots))
     installer = root / "scripts" / "build-cleanup.sh"
     if enabled and installer.exists() and sys.platform.startswith("linux"):
-        ok, _ = step("controller_cleanup", ["bash", str(installer)], 120)
-        if not ok:
-            return report
+        _install_controller_cleanup(installer, step, report, _has_systemd_user_bus())
 
     elif not enabled and sys.platform.startswith("linux"):
         loaded, value, _ = _run(["systemctl", "--user", "show",

@@ -91,10 +91,13 @@ def command(args) -> int:
         return run_once(roots=roots, state_dir=state_dir, dry_run=args.dry_run,
                         **policy_kwargs(cfg))
     if args.cleanup_command == 'run':
+        if not cfg.get('enabled', True):
+            print(json.dumps({'status': 'disabled', 'message': 'build_cleanup.enabled is false'}))
+            return 0
         result = cleanup()
         print(json.dumps(result, indent=2, sort_keys=True))
         return 1 if result.get('status') == 'error' else 0
-    if not cfg.get('enabled', False):
+    if not cfg.get('enabled', True):
         print(json.dumps({'status': 'disabled', 'message': 'set build_cleanup.enabled: true'}))
         return 0
     logging.basicConfig(level=logging.INFO)

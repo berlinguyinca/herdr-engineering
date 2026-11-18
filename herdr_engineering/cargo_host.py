@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -288,20 +289,60 @@ def enable_retention(config_path: Path, *, schedule: bool = True) -> dict[str, o
             "min_idle_hours": config.local.target_min_idle_hours}
 
 
-def _disk_guard_refusal() -> int | None:
+def _build_output_probe(config, argv: list[str]) -> Path:
+    """A path on the filesystem the build is going to write to (nearest existing ancestor is measured)."""
+    from .build_coord import _default_state_dir
+    from .cargo_target_storage import target_override
+    for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
+        if os.environ.get(key):
+            return Path(os.environ[key])
+    if config.local.manage_targets and not target_override(argv, os.environ, Path.cwd()):
+        try:
+            from .build_cache_location import select_storage
+            selected = select_storage(config.local.storage_tiers, _default_state_dir() / "sccache",
+                                      config.local.min_free_disk_percent)
+        except Exception:  # noqa: BLE001 - measuring is best effort
+            return _default_state_dir()
+        return selected.directory or _default_state_dir()
+    return Path.cwd()
+
+
+def _disk_guard_refusal(probe: Path) -> int | None:
     """Exit code when the disk-budget guard refuses a new build, else None. Never blocks on faults."""
     from .build_coord import _default_state_dir
     from .config import load_config
     from .disk_guard import EXIT_REFUSED, check_build_allowed
     try:
         policy = load_config().get("build_cleanup", {})
-        decision = check_build_allowed(Path.home(), policy, _default_state_dir())
+        decision = check_build_allowed(probe, policy, _default_state_dir())
     except Exception as error:  # noqa: BLE001 - a guard fault must never stop a build
         print(f"cargo-host: disk guard unavailable ({type(error).__name__})", file=sys.stderr)
         return None
     if decision.message:
         print(f"cargo-host: {decision.message}", file=sys.stderr)
     return None if decision.allowed else EXIT_REFUSED
+
+
+def _clean_shared_slots(real: Path, argv: list[str], repo_pool: Path, toolchain_id: str) -> int:
+    """``cargo clean`` for every idle pool slot of this repo+toolchain (a busy slot is never touched)."""
+    from .cargo_target_storage import SLOT_LOCK
+    status = 0
+    for slot in sorted(repo_pool.glob(f"{toolchain_id}-*")):
+        if not (slot / "target").is_dir():
+            continue
+        fd = os.open(slot / SLOT_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(f"cargo-host: skipped busy target {slot / 'target'}", file=sys.stderr)
+                status = status or 1
+                continue
+            result = subprocess.run([str(real), *argv], env={**os.environ, "CARGO_TARGET_DIR": str(slot / "target")})
+            status = status or result.returncode
+        finally:
+            os.close(fd)
+    return status
 
 
 def run_cargo(argv: list[str]) -> int:
@@ -318,7 +359,7 @@ def run_cargo(argv: list[str]) -> int:
     from .build_cache_policy import effective_slots
     from .build_coord import _default_slots, _default_state_dir, run_gated
     if subcommand != "clean" and not already_coordinated:
-        refused = _disk_guard_refusal()
+        refused = _disk_guard_refusal(_build_output_probe(config, argv))
         if refused is not None:
             return refused
     if config.local.manage_targets:
@@ -350,22 +391,28 @@ def run_cargo(argv: list[str]) -> int:
                         raise ValueError("Selected external storage disappeared")
                     selected.directory.mkdir(parents=True, mode=0o700, exist_ok=True)
                 workspace = workspace_root(real, argv, Path.cwd())
-                if config.local.target_mode == "shared" and subcommand != "clean":
-                    # One pooled target per repo+toolchain, shared by all worktrees of the repo.
-                    toolchain = subprocess.run(
-                        [str(real), *[a for a in argv[:1] if a.startswith("+")], "-vV"],
-                        cwd=Path.cwd(), capture_output=True, text=True, timeout=30, check=True).stdout
-                    target, _slot_lock = acquire_shared_target(
-                        shared_targets_root(selected.directory.parent), repo_identity(workspace),
-                        toolchain_identity(toolchain), config.local.target_pool_size, workspace)
-                    os.environ["CARGO_TARGET_DIR"] = str(target)
+                old_target = workspace / "target"
+                if (old_target.exists() or old_target.is_symlink()) and not alias_owned(_default_state_dir(), workspace):
+                    # An operator's own ./target (or link) is never replaced or redirected.
                     if already_coordinated:
                         os.execvpe(str(real), command, dict(os.environ))
                         return 127  # pragma: no cover
                     return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
                                      record=True, cache_config=config, max_load=1.5)
-                old_target = workspace / "target"
-                if (old_target.exists() or old_target.is_symlink()) and not alias_owned(_default_state_dir(), workspace):
+                if config.local.target_mode == "shared":
+                    # One pooled target per repo+toolchain, shared by all worktrees of the repo.
+                    toolchain = subprocess.run(
+                        [str(real), *[a for a in argv[:1] if a.startswith("+")], "-vV"],
+                        cwd=Path.cwd(), capture_output=True, text=True, timeout=30, check=True).stdout
+                    pool = shared_targets_root(selected.directory.parent) / repo_identity(workspace)
+                    if subcommand == "clean":
+                        return _clean_shared_slots(real, argv, pool, toolchain_identity(toolchain))
+                    target, _slot_lock = acquire_shared_target(
+                        shared_targets_root(selected.directory.parent), repo_identity(workspace),
+                        toolchain_identity(toolchain), config.local.target_pool_size, workspace)
+                    # Keep ./target usable: it points at the slot of the most recent build here.
+                    compatibility_alias(_default_state_dir(), workspace, target)
+                    os.environ["CARGO_TARGET_DIR"] = str(target)
                     if already_coordinated:
                         os.execvpe(str(real), command, dict(os.environ))
                         return 127  # pragma: no cover

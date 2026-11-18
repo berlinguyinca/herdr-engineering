@@ -203,7 +203,7 @@ def test_pool_falls_back_to_a_stable_slot_when_all_are_busy(tmp_path):
 def guard_policy(root: Path, refuse: float) -> dict:
     return {"enabled": True, "roots": [str(root)], "high_water_percent": 1, "low_water_percent": 0,
             "min_age_hours": 24, "pressure_percent": 0, "pressure_min_age_hours": 2,
-            "refuse_builds_percent": refuse}
+            "refuse_builds_percent": refuse, "refuse_builds_min_free_gib": 1e12}
 
 
 @pytest.fixture
@@ -249,7 +249,7 @@ def cargo_env(tmp_path: Path, extra: dict | None = None, refuse: float | None = 
     install(home, Path(cargo), Path(sys.executable))
     settings: dict = {"fabric_build_cache": {"local": {"capacity_gib": 1, "min_free_disk_percent": 0}}}
     if refuse is not None:
-        settings["build_cleanup"] = {"refuse_builds_percent": refuse}
+        settings["build_cleanup"] = {"refuse_builds_percent": refuse, "refuse_builds_min_free_gib": 1e12}
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(settings))
     env = {**os.environ, "HOME": str(home), "CARGO_HOME": str(home / ".cargo"),
@@ -295,8 +295,13 @@ def test_default_install_shares_one_incremental_free_target_across_worktrees(tmp
     assert len(slots) == 1 and slots[0].name.endswith("-0")
     debug = slots[0] / "target/debug"
     assert (debug / "shared-demo").is_file()
-    assert not (debug / "incremental").exists()  # CARGO_INCREMENTAL=0 applied by the wrapper
-    assert not (repo / "target").exists() and not (worktree / "target").exists()
+    # CARGO_INCREMENTAL=0 applied by the wrapper: no incremental artifacts (cargo may keep an empty dir)
+    assert not any((debug / "incremental").rglob("*"))
+    # ./target stays usable: a managed alias to the slot the last build there used
+    for checkout in (repo, worktree):
+        assert (checkout / "target").is_symlink()
+        assert (checkout / "target/debug/shared-demo").is_file()
+        assert (checkout / "target").resolve() == (slots[0] / "target").resolve()
 
 
 @pytest.mark.integration
@@ -380,3 +385,256 @@ def test_install_by_default_installs_job_and_cargo_launcher_and_doctor_sees_them
     assert names["build_cleanup"].status == "ok" and names["cargo_host"].status == "ok"
     assert names["disk_pressure"].data["usage_percent"] >= 0
     json.dumps(after.to_dict())
+
+
+@pytest.mark.integration
+def test_shared_alias_follows_the_slot_of_the_last_build(tmp_path):
+    home, env = cargo_env(tmp_path)
+    repo, _ = crate_with_worktree(tmp_path)
+    assert build(repo, home, env).returncode == 0
+    pool = tmp_path / "state/build-gates/shared-targets"
+    from herdr_engineering.cargo_target_storage import toolchain_identity
+    toolchain = subprocess.run([shutil.which("cargo"), "-vV"], cwd=repo, env=env, capture_output=True,
+                               text=True, check=True).stdout
+    _, held = acquire_shared_target(pool, repo_identity(repo), toolchain_identity(toolchain), 2, repo)
+    try:
+        assert build(repo, home, env).returncode == 0
+    finally:
+        os.close(held)
+    slot_one = pool / repo_identity(repo) / f"{toolchain_identity(toolchain)}-1/target"
+    assert (repo / "target").resolve() == slot_one.resolve()
+
+
+@pytest.mark.integration
+def test_unmanaged_target_directory_is_left_alone(tmp_path):
+    home, env = cargo_env(tmp_path)
+    repo, _ = crate_with_worktree(tmp_path)
+    (repo / "target").mkdir()
+    (repo / "target/keep.txt").write_text("mine")
+    result = build(repo, home, env)
+    assert result.returncode == 0, result.stderr
+    assert (repo / "target/keep.txt").read_text() == "mine" and not (repo / "target").is_symlink()
+    assert (repo / "target/debug/shared-demo").is_file()
+    assert not (tmp_path / "state/build-gates/shared-targets").exists()
+
+
+@pytest.mark.integration
+def test_cargo_clean_cleans_the_shared_slot_and_creates_no_per_workspace_target(tmp_path):
+    home, env = cargo_env(tmp_path)
+    repo, worktree = crate_with_worktree(tmp_path)
+    assert build(repo, home, env).returncode == 0
+    slot = next(p for p in (tmp_path / "state/build-gates/shared-targets").glob("*/*") if p.is_dir())
+    assert (slot / "target/debug/shared-demo").is_file()
+    cleaned = subprocess.run([str(home / ".local/bin/cargo"), "clean"], cwd=worktree, env=env,
+                             capture_output=True, text=True, timeout=120)
+    assert cleaned.returncode == 0, cleaned.stderr
+    assert not (slot / "target/debug").exists()
+    assert not (tmp_path / "state/build-gates/targets").exists()  # no per-workspace managed target
+    assert not (worktree / "target").exists()  # clean created no alias for a worktree that never built
+
+
+@pytest.mark.integration
+def test_cargo_clean_skips_a_slot_a_build_holds(tmp_path):
+    home, env = cargo_env(tmp_path)
+    repo, _ = crate_with_worktree(tmp_path)
+    assert build(repo, home, env).returncode == 0
+    pool = tmp_path / "state/build-gates/shared-targets"
+    slot = next(p for p in pool.glob("*/*") if p.is_dir())
+    fd = os.open(slot / ".herdr-slot.lock", os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        cleaned = subprocess.run([str(home / ".local/bin/cargo"), "clean"], cwd=repo, env=env,
+                                 capture_output=True, text=True, timeout=120)
+    finally:
+        os.close(fd)
+    assert cleaned.returncode != 0 and "busy" in cleaned.stderr
+    assert (slot / "target/debug/shared-demo").is_file()
+
+
+# --- review round 1 fixes -------------------------------------------------------------------
+
+def run_cli(tmp_path: Path, *args: str, settings: dict | None = None, extra_env: dict | None = None):
+    config_path = tmp_path / "cli-config.yaml"
+    config_path.write_text(yaml.safe_dump(settings or {}))
+    env = {**os.environ, "HERDR_ENGINEERING_CONFIG": str(config_path),
+           "HERDR_ENGINEERING_STATE": str(tmp_path / "cli-state"),
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1]), **(extra_env or {})}
+    env.pop(disk_guard.OVERRIDE_ENV, None)
+    return subprocess.run([sys.executable, "-m", "herdr_engineering.cli", *args], env=env,
+                          capture_output=True, text=True, timeout=120)
+
+
+def test_fleet_cleanup_installer_failure_is_recorded_not_fatal(tmp_path):
+    from herdr_engineering import fleet
+    installer = tmp_path / "build-cleanup.sh"
+    installer.write_text("#!/bin/sh\nexit 3\n")
+    report: dict = {"steps": {}}
+
+    def step(name, cmd, timeout):
+        rc, _, err = fleet._run(cmd, timeout=timeout)
+        report["steps"][name] = {"ok": rc == 0, "rc": rc, "stderr": err.strip() or None}
+        return rc == 0, ""
+
+    fleet._install_controller_cleanup(installer, step, report, have_bus=True)  # must not raise
+    assert report["steps"]["controller_cleanup"]["ok"] is False
+    assert report["steps"]["controller_cleanup"]["rc"] == 3
+
+
+def test_fleet_cleanup_installer_is_skipped_without_a_systemd_user_bus(tmp_path):
+    from herdr_engineering import fleet
+    installer = tmp_path / "build-cleanup.sh"
+    ran = tmp_path / "ran"
+    installer.write_text(f"#!/bin/sh\ntouch {ran}\n")
+    report: dict = {"steps": {}}
+    fleet._install_controller_cleanup(installer, lambda *a: (False, ""), report, have_bus=False)
+    assert report["steps"]["controller_cleanup"]["skipped"] == "no systemd user bus"
+    assert not ran.exists()
+
+
+def test_job_command_is_the_venv_binary_or_python_dash_m_never_a_module_path():
+    command = build_hygiene.default_command()
+    assert command[0] == sys.executable or (Path(command[0]).name == "herdr-eng"
+                                            and Path(command[0]).parent == Path(sys.executable).parent)
+    if command[0] == sys.executable:
+        assert command[1:] == ["-m", "herdr_engineering.cli"]
+    assert not any(part.endswith(".py") for part in command)
+
+
+def test_install_writes_a_runnable_job_command_and_keeps_a_working_job(tmp_path):
+    fallback = [sys.executable, "-m", "herdr_engineering.cli"]
+    config = {"build_cleanup": {"enabled": True}, "fabric_build_cache": {"enabled": False}}
+    result = build_hygiene.install(tmp_path, fallback, platform="darwin", activate=False, config=config)
+    plist = plistlib.loads(Path(result["build_cleanup"]["job"]).read_bytes())
+    assert plist["ProgramArguments"] == [*fallback, "build-cleanup", "run"]
+    # A working job with a real binary is not replaced by the `-m` fallback.
+    working = tmp_path / "second"
+    build_hygiene.install_cleanup_job(working, Path(sys.executable), platform="darwin", activate=False)
+    job = working / "Library/LaunchAgents" / f"{build_hygiene.LAUNCHD_LABEL}.plist"
+    before = job.read_bytes()
+    again = build_hygiene.install(working, fallback, platform="darwin", activate=False, config=config)
+    assert "kept" in again["build_cleanup"] and job.read_bytes() == before
+
+
+def test_systemd_unit_quotes_every_argument_of_the_command(tmp_path):
+    result = build_hygiene.install_cleanup_job(
+        tmp_path, [sys.executable, "-m", "herdr_engineering.cli"], platform="linux", activate=False)
+    text = Path(result["job"]).read_text()
+    assert f'ExecStart="{sys.executable}" "-m" "herdr_engineering.cli" build-cleanup watch' in text
+
+
+def test_jobs_pin_the_state_and_config_the_builds_use(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "custom-state"))
+    monkeypatch.setenv("HERDR_ENGINEERING_CONFIG", str(tmp_path / "custom.yaml"))
+    (tmp_path / "custom-state").mkdir()
+    mac = build_hygiene.install_cleanup_job(tmp_path / "mac", Path("/opt/herdr-eng"), platform="darwin",
+                                           activate=False)
+    environment = plistlib.loads(Path(mac["job"]).read_bytes())["EnvironmentVariables"]
+    assert environment["HERDR_ENGINEERING_STATE"] == str((tmp_path / "custom-state").resolve())
+    assert environment["HERDR_ENGINEERING_CONFIG"] == str(tmp_path / "custom.yaml")
+    linux = build_hygiene.install_cleanup_job(tmp_path / "lin", Path("/opt/herdr-eng"), platform="linux",
+                                             activate=False)
+    text = Path(linux["job"]).read_text()
+    assert f'Environment="HERDR_ENGINEERING_STATE={(tmp_path / "custom-state").resolve()}"' in text
+    assert f'Environment="HERDR_ENGINEERING_CONFIG={tmp_path / "custom.yaml"}"' in text
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_opt_out_removes_an_installed_job(tmp_path, platform):
+    installed = build_hygiene.install_cleanup_job(tmp_path, Path("/opt/herdr-eng"), platform=platform,
+                                                 activate=False)
+    assert Path(installed["job"]).is_file()
+    config = {"build_cleanup": {"enabled": False}, "fabric_build_cache": {"enabled": False}}
+    result = build_hygiene.install(tmp_path, Path("/opt/herdr-eng"), platform=platform, activate=False,
+                                  config=config)
+    assert result["build_cleanup"]["removed"] == installed["job"]
+    assert not Path(installed["job"]).exists()
+
+
+def test_build_cleanup_run_exits_early_when_disabled(tmp_path, root):
+    cache = make_target(root)
+    refused = run_cli(tmp_path, "build-cleanup", "run", "--root", str(root),
+                      settings={"build_cleanup": {"enabled": False, "high_water_percent": 1,
+                                                  "low_water_percent": 0}})
+    assert refused.returncode == 0 and json.loads(refused.stdout)["status"] == "disabled"
+    assert cache.exists()
+    swept = run_cli(tmp_path, "build-cleanup", "run", "--root", str(root),
+                    settings={"build_cleanup": {"high_water_percent": 1, "low_water_percent": 0}})
+    assert swept.returncode == 0 and not cache.exists()
+
+
+def test_guard_busy_sweep_does_not_use_up_the_cooldown(root, state_env):
+    cache = make_target(root, age_hours=5)
+    state_env.mkdir(parents=True)
+    fd = os.open(state_env / "build-maintenance.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_SH)  # another gated build is running
+    try:
+        busy = disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={})
+    finally:
+        os.close(fd)
+    assert not busy.allowed and not busy.cleanup_ran and cache.exists()
+    assert not (state_env / "disk-guard.json").exists()
+    later = disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={})
+    assert not later.allowed and later.cleanup_ran and not cache.exists()
+
+
+def test_guard_still_refuses_when_the_cooldown_stamp_cannot_be_written(root, state_env):
+    cache = make_target(root, age_hours=5)
+    state_env.mkdir(parents=True)
+    (state_env / "disk-guard.json").mkdir()  # an unwritable stamp, as on a full disk
+    decision = disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={})
+    assert not decision.allowed and decision.cleanup_ran and not cache.exists()
+    assert disk_guard.OVERRIDE_ENV in decision.message
+
+
+def test_guard_does_not_refuse_a_disk_with_ample_free_space(root, state_env):
+    policy = {**guard_policy(root, 0), "refuse_builds_min_free_gib": 0}
+    decision = disk_guard.check_build_allowed(root, policy, state_env, env={})
+    assert decision.allowed and not decision.cleanup_ran
+
+
+def test_guard_is_off_when_build_cleanup_is_disabled(root, state_env):
+    policy = {**guard_policy(root, 0), "enabled": False}
+    assert disk_guard.check_build_allowed(root, policy, state_env, env={}).allowed
+
+
+def test_guard_measures_the_nearest_existing_ancestor_of_the_build_output(root, state_env):
+    decision = disk_guard.check_build_allowed(root / "not/yet/created", guard_policy(root, 101),
+                                              state_env, env={})
+    assert decision.allowed and 0 <= decision.usage_percent <= 100
+    percent, free_gib = disk_guard.measure(root)
+    assert 0 <= percent <= 100 and free_gib > 0
+
+
+def test_build_coordinate_guards_build_commands_but_not_tests(tmp_path):
+    settings = {"build_cleanup": {"enabled": True, "roots": [], "refuse_builds_percent": 0,
+                                  "refuse_builds_min_free_gib": 1e12}}
+    build_cmd = run_cli(tmp_path, "build-coordinate", "--", "cargo", "--version", settings=settings)
+    assert build_cmd.returncode == disk_guard.EXIT_REFUSED
+    assert "refusing to start a new build" in build_cmd.stderr
+    other = run_cli(tmp_path, "build-coordinate", "--", "true", settings=settings)
+    assert other.returncode == 0, other.stderr
+
+
+def test_real_cargo_prefers_the_rustup_proxy_over_path(tmp_path):
+    proxy_dir = tmp_path / "home/.cargo/bin"
+    distro = tmp_path / "usr/bin"
+    proxy_dir.mkdir(parents=True)
+    distro.mkdir(parents=True)
+    binary = Path(shutil.which("true"))
+    shutil.copy(binary, proxy_dir / "cargo")
+    shutil.copy(binary, distro / "cargo")
+    resolved = build_hygiene.resolve_real_cargo(tmp_path / "home", path_env=str(distro))
+    assert resolved == proxy_dir / "cargo"
+
+
+def test_real_cargo_respects_a_valid_recorded_install(tmp_path):
+    home = tmp_path / "home"
+    (home / ".cargo/bin").mkdir(parents=True)
+    recorded = tmp_path / "recorded/cargo"
+    recorded.parent.mkdir()
+    shutil.copy(shutil.which("true"), recorded)
+    shutil.copy(shutil.which("true"), home / ".cargo/bin/cargo")
+    from herdr_engineering.cargo_host import host_root
+    (host_root(home)).mkdir(parents=True)
+    (host_root(home) / "install.json").write_text(json.dumps({"real_cargo": str(recorded)}))
+    assert build_hygiene.resolve_real_cargo(home, path_env="") == recorded

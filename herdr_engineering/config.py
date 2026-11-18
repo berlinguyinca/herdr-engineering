@@ -30,7 +30,8 @@ DEFAULTS: dict[str, Any] = {
     # Normal sweeps need ``min_age_hours`` idle; once usage reaches ``pressure_percent`` the
     # idle floor drops to ``pressure_min_age_hours`` (live process/lease/lock guards still apply).
     # Cargo wrapper / build-coordinate refuse new builds at ``refuse_builds_percent``
-    # unless HERDR_DISK_GUARD_OVERRIDE=1 is set.
+    # when the build's filesystem also has less than ``refuse_builds_min_free_gib`` available,
+    # unless HERDR_DISK_GUARD_OVERRIDE=1 is set. ``enabled: false`` disables the guard too.
     "build_cleanup": {
         "enabled": True,
         "roots": ["~/IdeaProjects", "~/work", "~/.cache"],
@@ -41,6 +42,7 @@ DEFAULTS: dict[str, Any] = {
         "pressure_percent": 90,
         "pressure_min_age_hours": 2,
         "refuse_builds_percent": 90,
+        "refuse_builds_min_free_gib": 50,
     },
     # Spec 02: on by default (local_only; shared cache/slurm stay off); validated by
     # build_cache_config.validate (fails closed). Opt out with ``enabled: false``.

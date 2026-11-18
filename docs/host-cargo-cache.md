@@ -126,5 +126,13 @@ These are **soft retention budgets**, not active-build quotas. If everything is 
 a pool of `local.target_pool_size` (default 2) `CARGO_TARGET_DIR` slots, one flock per slot
 (`local.target_mode: per_workspace` restores one target per workspace). An explicit
 `CARGO_TARGET_DIR` wins, and `CARGO_INCREMENTAL=0` is the default for managed builds.
-The wrapper refuses new builds at `build_cleanup.refuse_builds_percent` disk usage (exit 75)
-unless `HERDR_DISK_GUARD_OVERRIDE=1`. Opt out with `fabric_build_cache: {enabled: false}`.
+`./target` keeps working: it becomes a managed symlink to the pool slot used by the most
+recent build in that worktree (slots vary when builds overlap, so re-read it after a build);
+a real `./target` directory or foreign link is never replaced, and that workspace then keeps
+building into its own `./target`. `cargo clean` cleans this repo+toolchain's idle slots
+(a slot a build holds is skipped and reported).
+The wrapper refuses new builds when the filesystem the build writes to is at least
+`build_cleanup.refuse_builds_percent` used **and** has less than
+`build_cleanup.refuse_builds_min_free_gib` (default 50) available (exit 75), after one
+cleanup attempt, unless `HERDR_DISK_GUARD_OVERRIDE=1`; `build_cleanup.enabled: false`
+turns the guard off. Opt out with `fabric_build_cache: {enabled: false}`.

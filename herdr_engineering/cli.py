@@ -3236,15 +3236,20 @@ def _cmd_build_coordinate(args) -> int:
     if getattr(args, "trace_session", None) and trace is None:
         print("build-coordinate: --trace-session ignored (not a plain non-secret id)",
               file=sys.stderr)
-    from .cargo_host import _disk_guard_refusal
-    refused = _disk_guard_refusal()
-    if refused is not None:
-        return refused
+    if cmd and os.path.basename(cmd[0]) in _GUARDED_BUILD_COMMANDS:
+        from .cargo_host import _disk_guard_refusal
+        refused = _disk_guard_refusal(Path(os.environ.get("CARGO_TARGET_DIR") or Path.cwd()))
+        if refused is not None:
+            return refused
     return run_gated(cmd, slots=slots, max_load=args.max_load,
                      wait_seconds=args.wait, json_out=args.json,
                      bypass_on_timeout=args.bypass_on_timeout,
                      record=getattr(args, "record", False),
                      cache_config=cache_cfg, trace=trace)
+
+
+# Commands whose output size the disk-budget guard protects; tests and scripts are never refused.
+_GUARDED_BUILD_COMMANDS = frozenset({"cargo", "rustc", "make", "cmake", "ninja", "tsc", "go"})
 
 
 def _is_gate_command(cmd: list[str]) -> bool:
