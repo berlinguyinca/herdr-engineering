@@ -6,7 +6,8 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
-from .herdr_session import herdr_session_id
+from .herdr_session import herdr_session_id, is_safe_session_id
+from .records import lines_newest_first
 from .windows import lookup_window
 
 PROMPT_MARKER = "❯"  # the empty input box of Claude Code, on a line of its own between two rules
@@ -14,7 +15,6 @@ _READY_STATUSES = frozenset({"idle", "done"})
 _LINES_BELOW_PROMPT = 4  # the closing rule and the status line(s); anything more means the box is not last
 _SYNTHETIC_MODEL = "<synthetic>"  # zero-usage placeholder entries Claude Code writes for local events
 _USAGE_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")  # as handoff_context_hook
-_FIRST_CHUNK = 1_048_576
 
 
 def _slug(cwd: Path) -> str:
@@ -37,23 +37,15 @@ def _main_chain_usage(record: object) -> tuple[int, str | None] | None:
 
 
 def _last_usage(path: Path) -> tuple[int, str | None] | None:
-    """Scan the transcript from the end in doubling chunks; a partial line at a chunk start or end is skipped."""
-    size = path.stat().st_size
-    chunk = _FIRST_CHUNK
-    while True:
-        with open(path, "rb") as fh:
-            fh.seek(max(0, size - chunk))
-            lines = fh.read().decode("utf-8", "replace").splitlines()
-        for line in reversed(lines):
-            try:
-                found = _main_chain_usage(json.loads(line))
-            except ValueError:
-                continue
-            if found:
-                return found
-        if chunk >= size:
-            return None
-        chunk *= 2
+    """The latest main-chain usage; a half-written line is skipped."""
+    for line in lines_newest_first(path):
+        try:
+            found = _main_chain_usage(json.loads(line))
+        except ValueError:
+            continue
+        if found:
+            return found
+    return None
 
 
 class ClaudeAdapter:
@@ -66,7 +58,7 @@ class ClaudeAdapter:
     def locate_session(self, session_id: str | None, cwd: Path, pane_id: str) -> SessionRef | None:
         directory = self._home / ".claude" / "projects" / _slug(cwd)
         if session_id:
-            if "/" in session_id or "\\" in session_id or session_id == "..":
+            if not is_safe_session_id(session_id):
                 return None  # the id comes from outside; never let it leave the project directory
             path = directory / f"{session_id}.jsonl"
             return SessionRef(self.harness, pane_id, cwd, session_id, path) if path.is_file() else None

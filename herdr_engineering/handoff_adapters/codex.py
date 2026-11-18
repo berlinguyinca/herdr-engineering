@@ -5,13 +5,13 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
-from .herdr_session import herdr_session_id
+from .herdr_session import herdr_session_id, is_safe_session_id
+from .records import lines_newest_first
 from .windows import lookup_window
 
 PROMPT_MARKER = "›"  # the empty Codex composer; unconfirmed against a live pane, measured in Task 7
 _READY_STATUSES = frozenset({"idle", "done"})
 _LINES_BELOW_PROMPT = 4  # the status line(s) under the composer; anything more means it is not last
-_FIRST_CHUNK = 1_048_576
 
 
 def _token_count(record: object) -> tuple[int, int | None] | None:
@@ -37,32 +37,24 @@ def _turn_model(record: object) -> str | None:
 
 
 def _last_usage(path: Path) -> tuple[int, int | None, str | None] | None:
-    """(tokens, recorded window, model) of the latest usage event; scans from the end in doubling chunks.
+    """(tokens, recorded window, model) of the latest usage event, scanning from the end.
 
-    The model is read only when the event records no window: the turn_context before it. A partial
-    line at a chunk start or end is skipped.
+    The model is read only when the event records no window: the turn_context before it. A half-written
+    line is skipped.
     """
-    size = path.stat().st_size
-    chunk = _FIRST_CHUNK
-    while True:
-        with open(path, "rb") as fh:
-            fh.seek(max(0, size - chunk))
-            lines = fh.read().decode("utf-8", "replace").splitlines()
-        found: tuple[int, int | None] | None = None
-        for line in reversed(lines):
-            try:
-                record = json.loads(line)
-            except ValueError:
-                continue
-            if found is None:
-                found = _token_count(record)
-                if found and found[1] is not None:
-                    return found[0], found[1], None
-            elif (model := _turn_model(record)) is not None:
-                return found[0], None, model
-        if chunk >= size:
-            return (found[0], None, None) if found else None
-        chunk *= 2
+    found: tuple[int, int | None] | None = None
+    for line in lines_newest_first(path):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if found is None:
+            found = _token_count(record)
+            if found and found[1] is not None:
+                return found[0], found[1], None
+        elif (model := _turn_model(record)) is not None:
+            return found[0], None, model
+    return (found[0], None, None) if found else None
 
 
 class CodexAdapter:
@@ -73,7 +65,7 @@ class CodexAdapter:
         self._env = env  # environment for the herdr call; None inherits the process environment
 
     def locate_session(self, session_id: str | None, cwd: Path, pane_id: str) -> SessionRef | None:
-        if not session_id or any(c in session_id for c in "/\\*?[") or session_id == "..":
+        if not is_safe_session_id(session_id):
             return None  # the id comes from outside; never let it leave the sessions tree or act as a glob
         matches = sorted((self._home / ".codex" / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl"))
         if len(matches) != 1:

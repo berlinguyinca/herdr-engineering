@@ -18,3 +18,10 @@ def herdr_session_id(pane_id: str, env: Mapping[str, str] | None) -> str | None:
         return None
     value = session.get("value") if isinstance(session, dict) and session.get("kind") == "id" else None
     return value if isinstance(value, str) and value else None
+
+
+def is_safe_session_id(session_id: str | None) -> bool:
+    """True for an id that is safe to put in a path or glob: no separators, no `..`, no glob metacharacters."""
+    if not session_id or session_id == "..":
+        return False
+    return not any(c in session_id for c in "/\\*?[")
