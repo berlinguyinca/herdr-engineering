@@ -70,7 +70,7 @@ with `scripts/fleet-auto-update.sh`; see [fleet lifecycle](operations/fleet-life
 ## Defaults, pressure mode and the disk guard
 
 Cleanup is on by default (roots `~/IdeaProjects`, `~/work`, `~/.cache`; roots that do
-not exist are skipped, and the shared cargo target pool is added automatically). Opt out
+not exist are skipped; the shared cargo target pools, including those on enrolled storage tiers, and legacy per-workspace `targets/` dirs are added automatically and re-evaluated every cycle). Opt out
 with `build_cleanup: {enabled: false}`. `scripts/install.sh` and `fleet update` install
 the job; `herdr-eng build-hygiene install|status` does it by hand (systemd user unit on
 Linux, a launchd interval job on macOS).
@@ -86,7 +86,7 @@ build_cleanup:
 Targets still in use (live process, build lease, open file, held pool-slot lock) are
 never removed in any tier. When the build's filesystem is at or above `refuse_builds_percent`
 and has less than `refuse_builds_min_free_gib` available, a new cargo/build command
-(`build-coordinate` guards cargo, rustc, make, cmake, ninja, tsc and go, never tests) triggers
+(`build-coordinate` guards rustc, make, cmake, ninja, tsc and `go build|install|generate`, never tests; cargo is guarded by the wrapper, also under `build-coordinate`) triggers
 one pressure cleanup (at most every 10 minutes; a sweep that found a build running does not
 count) and is refused with exit code 75 if the disk is still too full. Setting
 `build_cleanup.enabled: false` stops the sweeps (the launchd/systemd job is removed on the

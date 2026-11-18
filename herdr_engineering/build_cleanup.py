@@ -28,7 +28,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .cargo_target_storage import SLOT_LOCK
+from .cargo_target_storage import SLOT_LOCK, TARGET_MARKER
 
 _PRUNE = {".git", "node_modules", ".venv", "venv", ".cache", "__pycache__"}
 _MAX_ENTRIES = 500_000
@@ -139,6 +139,10 @@ def _discover(root: Path) -> list[Path]:
                 path = Path(entry.path)
                 if entry.stat(follow_symlinks=False).st_dev != device:
                     continue
+                if _legacy_workspace(path) is not None:
+                    if _cargo_markers(path):
+                        found.append(path)
+                    continue
                 if entry.name == "target":
                     if _cargo_markers(path) and ((directory / "Cargo.toml").is_file()
                                                  or _cache_only_target(path)):
@@ -168,6 +172,28 @@ def _cache_only_target(target: Path) -> bool:
                 and tag.read_bytes()[:128].find(_CACHEDIR_SIGNATURE) >= 0)
     except OSError:
         return False
+
+
+def _legacy_workspace(path: Path) -> Path | None:
+    """Workspace of a per-workspace managed target (``targets/<label-hash>``, written before the
+    shared pool became the default), proven by the manager's root marker and the target's own marker."""
+    try:
+        root_marker, marker = path.parent / ".herdr-target-root.json", path / TARGET_MARKER
+        if root_marker.is_symlink() or marker.is_symlink() or not root_marker.is_file() or not marker.is_file():
+            return None
+        if json.loads(root_marker.read_text()).get("owner_uid") != os.getuid():
+            return None
+        data = json.loads(marker.read_text())
+        if data.get("owner_uid") != os.getuid() or not isinstance(data.get("workspace"), str):
+            return None
+        return Path(data["workspace"])
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _project(target: Path) -> Path:
+    """Directory whose activity keeps a target alive: its manifest directory, or the owning workspace."""
+    return _legacy_workspace(target) or target.parent
 
 
 def _slot_busy(target: Path) -> bool:
@@ -216,10 +242,15 @@ def _inspect(target: Path) -> tuple[float, int]:
 
 def _untracked(target: Path) -> bool:
     """Git must verify the entire target is untracked, including nested files."""
-    if not (target.parent / "Cargo.toml").is_file():
-        return True  # cache-only directory (verified by CACHEDIR.TAG); no repository owns it
+    if _legacy_workspace(target) is not None:
+        return True  # lives in the state directory, not in a repository
+    cache_only = not (target.parent / "Cargo.toml").is_file()
+    if cache_only and subprocess.run(
+            ["git", "-C", str(target.parent), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, timeout=30, check=False).returncode != 0:
+        return True  # cache-only directory (verified by CACHEDIR.TAG) outside any repository
     result = subprocess.run(
-        ["git", "-C", str(target.parent), "ls-files", "--", "target"],
+        ["git", "-C", str(target.parent), "ls-files", "--", target.name],
         capture_output=True, timeout=30, check=False,
     )
     return result.returncode == 0 and not result.stdout
@@ -227,6 +258,8 @@ def _untracked(target: Path) -> bool:
 
 def _recognized(target: Path) -> bool:
     """Same recognition rule as discovery: a Cargo ``target`` with build markers."""
+    if _legacy_workspace(target) is not None:
+        return _cargo_markers(target)
     return (target.name == "target" and _cargo_markers(target)
             and ((target.parent / "Cargo.toml").is_file() or _cache_only_target(target)))
 
@@ -240,7 +273,7 @@ def _lease_block(state_dir: Path, target: Path) -> str | None:
         scopes = active_scopes(state_dir)
     except RegistryError:
         return "registry_unreadable"
-    project = target.parent
+    project = _project(target)
     for raw in scopes:
         if not raw.startswith("/"):
             continue  # named scopes do not describe a path
@@ -250,12 +283,17 @@ def _lease_block(state_dir: Path, target: Path) -> str | None:
     return None
 
 
+def _in_use(target: Path, active: list[Path]) -> bool:
+    project = _project(target)
+    return any(path.is_relative_to(project) or path.is_relative_to(target) for path in active)
+
+
 def _usage(path: Path) -> float:
     usage = shutil.disk_usage(path)
-    if usage.total <= 0:
+    if usage.used + usage.free <= 0:
         raise OSError(f"Cannot measure filesystem at {path}")
-    # Use available space (rather than used) so reserved blocks count as unavailable.
-    return 100 * (usage.total - usage.free) / usage.total
+    # Same figure as ``df`` and the disk guard: reserved blocks count as neither used nor available.
+    return 100 * usage.used / (usage.used + usage.free)
 
 
 def _write_status(state_dir: Path, result: dict) -> None:
@@ -297,7 +335,7 @@ def run_once(
         "timestamp": datetime.now(UTC).isoformat(), "status": "ok", "dry_run": dry_run,
         "roots": [], "removed_count": 0, "removed_bytes": 0, "reclaimed_bytes": 0,
         "removed": [], "would_remove": [], "skipped": [], "errors": [], "warnings": [],
-        "reconciled": [], "pressure": False,
+        "reconciled": [], "pressure": False, "process_scans": 0,
     }
     lock_fd = os.open(state_dir / "build-maintenance.lock",
                       os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -393,6 +431,7 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
         if not candidates:
             return
         # Verify process visibility before deleting anything.
+        result["process_scans"] += 1
         active = _process_paths()
     except (OSError, ValueError) as exc:
         result["errors"].append(str(exc))
@@ -407,7 +446,7 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
             root = roots_by_device[target.stat().st_dev]
             if _usage(root) <= low_water:
                 continue
-            if any(path.is_relative_to(target.parent) for path in active):
+            if _in_use(target, active):
                 result["skipped"].append({"path": name, "reason": "active project"})
                 continue
             if _skip_for_registry(state_dir, target, name, result):
@@ -423,17 +462,21 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
             if _slot_busy(target):
                 result["skipped"].append({"path": name, "reason": "build in progress"})
                 continue
-            active = _process_paths()
-            if any(path.is_relative_to(target.parent) for path in active):
-                result["skipped"].append({"path": name, "reason": "active project"})
-                continue
-            if _skip_for_registry(state_dir, target, name, result):
-                continue  # lease re-read after the last scan, before any removal
             if not _recognized(target):
                 raise OSError(f"Target no longer recognized as a Cargo output: {name}")
-            if result["dry_run"]:
-                result["would_remove"].append(name)
+            if result["dry_run"]:  # nothing is removed, so the first scan stands
+                if not _skip_for_registry(state_dir, target, name, result):
+                    result["would_remove"].append(name)
                 continue
+            result["process_scans"] += 1  # fresh scan, right before the only destructive step
+            active = _process_paths()
+            if _in_use(target, active):
+                result["skipped"].append({"path": name, "reason": "active project"})
+                continue
+            if not _recognized(target):
+                raise OSError(f"Target no longer recognized as a Cargo output: {name}")
+            if _skip_for_registry(state_dir, target, name, result):
+                continue  # lease re-read after the last scan, before any removal
             before = shutil.disk_usage(root).free
             # CPython's fd-based rmtree prevents symlink substitution attacks.
             if not shutil.rmtree.avoids_symlink_attacks:

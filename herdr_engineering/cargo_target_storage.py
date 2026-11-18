@@ -253,24 +253,68 @@ def toolchain_identity(version_text: str) -> str:
     return hashlib.sha256(version_text.encode()).hexdigest()[:12]
 
 
+def _toolchain_cache_key(real: Path, argv: list[str], cwd: Path) -> str:
+    """Everything that decides which toolchain a cargo invocation resolves to (rustup proxy rules)."""
+    stat = real.resolve().stat()
+    parts = [str(real.resolve()), str(stat.st_mtime_ns), str(stat.st_size),
+             *[a for a in argv[:1] if a.startswith("+")], os.environ.get("RUSTUP_TOOLCHAIN", "")]
+    for directory in (cwd.resolve(), *cwd.resolve().parents):
+        for name in ("rust-toolchain.toml", "rust-toolchain"):
+            candidate = directory / name
+            if candidate.is_file():
+                parts += [str(candidate), candidate.read_text(errors="replace")]
+                break
+        else:
+            continue
+        break
+    rustup_settings = Path(os.environ.get("RUSTUP_HOME", Path.home() / ".rustup")) / "settings.toml"
+    if rustup_settings.is_file():
+        parts.append(str(rustup_settings.stat().st_mtime_ns))
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:20]
+
+
+def cached_toolchain_identity(real: Path, argv: list[str], cwd: Path, state: Path) -> str:
+    """Toolchain id of ``cargo -vV``, spawning cargo only when what selects the toolchain changed."""
+    cache = state / f"toolchain-{_toolchain_cache_key(real, argv, cwd)}.json"
+    try:
+        return str(json.loads(cache.read_text())["identity"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    version = subprocess.run([str(real), *[a for a in argv[:1] if a.startswith("+")], "-vV"],
+                             cwd=cwd, capture_output=True, text=True, timeout=30, check=True).stdout
+    identity = toolchain_identity(version)
+    try:
+        cache.write_text(json.dumps({"identity": identity}))
+    except OSError:
+        pass  # cache only: the next build asks cargo again
+    return identity
+
+
+def slot_name(toolchain_id: str, workspace: Path, index: int) -> str:
+    """Pool slot directory of one worktree: slots are owned by a worktree, never shared between them."""
+    owner = hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()[:10]
+    return f"{toolchain_id}-{owner}-{index}"
+
+
 def acquire_shared_target(root: Path, repo_id: str, toolchain_id: str, pool_size: int,
                           workspace: Path) -> tuple[Path, int]:
-    """Pick a pool slot and hold its lock for as long as the returned descriptor stays open.
+    """Pick one of this worktree's pool slots and hold its lock while the returned descriptor is open.
 
-    The lowest free slot wins, so sequential builds from any worktree reuse slot 0 while
-    concurrent builds spill to the next slot instead of queuing behind one cargo lock; when
-    every slot is busy the worktree's stable hash picks one (cargo itself serialises the build).
-    The descriptor is inheritable so the lock survives ``exec`` into cargo and is released when
-    the build exits; cleanup treats a held lock as an active build.
+    Slots are owned by a worktree (the name embeds its path hash), so two worktrees, which may
+    be on different branches, never write the same final artifacts. The lowest free slot of the
+    worktree wins, so sequential builds reuse slot 0 while concurrent builds spill to the next
+    slot instead of queuing behind one cargo lock; when every slot is busy the last one is used
+    (cargo itself serialises the build). The descriptor is inheritable so the lock survives
+    ``exec`` into cargo and is released when the build exits; cleanup treats a held lock as an
+    active build.
     """
     if root.is_symlink():
         raise ValueError("Shared target root cannot be a symlink")
     parent = root / repo_id
     parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    start = int(hashlib.sha256(str(workspace.resolve()).encode()).hexdigest(), 16) % pool_size
     chosen: tuple[Path, int] | None = None
     for index in range(pool_size):
-        slot = parent / f"{toolchain_id}-{index}"
+        slot = parent / slot_name(toolchain_id, workspace, index)
         slot.mkdir(exist_ok=True, mode=0o700)
         fd = os.open(slot / SLOT_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
@@ -281,7 +325,7 @@ def acquire_shared_target(root: Path, repo_id: str, toolchain_id: str, pool_size
         chosen = (slot / "target", fd)
         break
     if chosen is None:
-        slot = parent / f"{toolchain_id}-{start}"
+        slot = parent / slot_name(toolchain_id, workspace, pool_size - 1)
         fd = os.open(slot / SLOT_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         chosen = (slot / "target", fd)  # unlocked: another build owns the slot lock
     os.set_inheritable(chosen[1], True)

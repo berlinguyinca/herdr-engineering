@@ -265,6 +265,9 @@ def _add_build_hygiene(report: DoctorReport, config: dict[str, Any]) -> None:
     elif not info["build_cleanup_job_installed"]:
         report.add("build_cleanup", "warn",
                    "build cleanup enabled but its timer is not installed; fix: herdr-eng build-hygiene install")
+    elif info.get("build_cleanup_job_loaded") is False:
+        report.add("build_cleanup", "warn",
+                   "build cleanup job is written but not loaded in launchd; fix: herdr-eng build-hygiene install")
     else:
         report.add("build_cleanup", "ok",
                    f"build cleanup job installed; last run {info['build_cleanup_last_run'] or 'never'}")

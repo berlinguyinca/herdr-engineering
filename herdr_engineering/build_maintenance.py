@@ -58,22 +58,53 @@ def policy_kwargs(cfg: dict) -> dict:
     }
 
 
-def effective_roots(cfg: dict, explicit: list[str] | None = None) -> list[Path]:
-    """Configured roots (or explicit ones) that exist, plus the shared cargo target pool."""
+def _managed_output_dirs() -> list[Path]:
+    """Existing shared pools and per-workspace target folders of the state dir and every storage tier."""
+    from .build_cache_config import validate
+    from .build_coord import _default_state_dir
     from .cargo_target_storage import shared_targets_root
+    bases = [_default_state_dir()]
+    try:
+        from .config import load_config
+        section = load_config().get("fabric_build_cache")
+        if section:
+            bases += [Path(tier.directory).expanduser().parent for tier in validate(section).local.storage_tiers]
+    except Exception:  # noqa: BLE001 - a config problem must not stop the sweep of the default pool
+        pass
+    found = []
+    for base in bases:
+        for path in (shared_targets_root(base), base / "targets"):
+            real = Path(os.path.realpath(path))
+            if real.is_dir() and real not in found:
+                found.append(real)
+    return found
+
+
+def effective_roots(cfg: dict, explicit: list[str] | None = None) -> list[Path]:
+    """Configured roots (or explicit ones) plus every managed target pool that exists right now.
+
+    Explicit and configured roots are returned as given (only ``~`` expanded) so the sweep's
+    canonical-root check still sees a symlinked root; managed pools are resolved because they
+    are derived from state locations. Recomputed by the watcher on every cycle, so a pool created
+    after it started is picked up.
+    """
     roots = list(explicit if explicit is not None else cfg.get('roots', []))
     paths = [Path(root).expanduser() for root in roots]
     if explicit is None:
-        pool = shared_targets_root()
-        if pool.is_dir():
-            paths.append(pool)
         # Default roots may not exist on every host (e.g. no ~/work); explicit ones must.
         paths = [path for path in paths if path.is_dir()]
-    return [Path(os.path.realpath(path)) for path in paths]
+        paths += [path for path in _managed_output_dirs() if path not in paths]
+    return paths
+
+
+def cleanup_cycle(cfg: dict, explicit: list[str] | None, state_dir: Path, dry_run: bool = False) -> dict:
+    """One sweep. Roots are re-evaluated every cycle: pools appear after the watcher has started."""
+    from .build_cleanup import run_once
+    return run_once(roots=effective_roots(cfg, explicit), state_dir=state_dir, dry_run=dry_run,
+                    **policy_kwargs(cfg))
 
 
 def command(args) -> int:
-    from .build_cleanup import run_once
     from .build_coord import _default_state_dir
     from .config import load_config
 
@@ -88,8 +119,7 @@ def command(args) -> int:
         print(json.dumps({'error': 'configure build_cleanup.roots or pass --root'}))
         return 2
     def cleanup():
-        return run_once(roots=roots, state_dir=state_dir, dry_run=args.dry_run,
-                        **policy_kwargs(cfg))
+        return cleanup_cycle(cfg, args.root, state_dir, args.dry_run)
     if args.cleanup_command == 'run':
         if not cfg.get('enabled', True):
             print(json.dumps({'status': 'disabled', 'message': 'build_cleanup.enabled is false'}))

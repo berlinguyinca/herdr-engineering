@@ -122,14 +122,14 @@ These are **soft retention budgets**, not active-build quotas. If everything is 
 ## Defaults: managed shared targets
 
 `fabric_build_cache` and `local.manage_targets` are on by default and `scripts/install.sh`
-/ `fleet update` install the wrapper. Builds of all worktrees of one repo and toolchain share
-a pool of `local.target_pool_size` (default 2) `CARGO_TARGET_DIR` slots, one flock per slot
+/ `fleet update` install the wrapper. Builds of one repo and toolchain use
+a pool of `local.target_pool_size` (default 2) `CARGO_TARGET_DIR` slots per worktree (a slot is owned by one worktree, so worktrees never share final artifacts), one flock per slot
 (`local.target_mode: per_workspace` restores one target per workspace). An explicit
 `CARGO_TARGET_DIR` wins, and `CARGO_INCREMENTAL=0` is the default for managed builds.
 `./target` keeps working: it becomes a managed symlink to the pool slot used by the most
 recent build in that worktree (slots vary when builds overlap, so re-read it after a build);
 a real `./target` directory or foreign link is never replaced, and that workspace then keeps
-building into its own `./target`. `cargo clean` cleans this repo+toolchain's idle slots
+building into its own `./target`. `cargo clean` cleans this worktree's idle slots for the repo+toolchain
 (a slot a build holds is skipped and reported).
 The wrapper refuses new builds when the filesystem the build writes to is at least
 `build_cleanup.refuse_builds_percent` used **and** has less than

@@ -325,6 +325,12 @@ def _install_controller_cleanup(installer: Path, step, report: dict, have_bus: b
     step("controller_cleanup", ["bash", str(installer)], 120)  # failure is recorded in the report
 
 
+def _build_hygiene_command(*, legacy_installer_ran: bool) -> list[str]:
+    """``build-hygiene install`` for the controller; the cleanup job is left to the systemd script when it ran."""
+    command = [sys.executable, "-m", "herdr_engineering.cli", "build-hygiene", "install"]
+    return [*command, "--skip-cleanup-job"] if legacy_installer_ran else command
+
+
 def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                  inventory: Path | None = None, pull_controller: bool = True,
                  reinstall_local: bool = True, revision: str | None = None,
@@ -451,7 +457,8 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                and isinstance(roots, list) and bool(roots)
                and all(isinstance(path, str) and path.strip() for path in roots))
     installer = root / "scripts" / "build-cleanup.sh"
-    if enabled and installer.exists() and sys.platform.startswith("linux"):
+    legacy_installer_ran = enabled and installer.exists() and sys.platform.startswith("linux")
+    if legacy_installer_ran:
         _install_controller_cleanup(installer, step, report, _has_systemd_user_bus())
 
     elif not enabled and sys.platform.startswith("linux"):
@@ -466,8 +473,7 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
 
     # Disk hygiene is on by default: the cleanup job (launchd on macOS) and the managed cargo
     # launcher. Non-fatal - `herdr-eng doctor` reports a host where it is missing.
-    step("controller_build_hygiene", [sys.executable, "-m", "herdr_engineering.cli",
-                                     "build-hygiene", "install"], 120)
+    step("controller_build_hygiene", _build_hygiene_command(legacy_installer_ran=legacy_installer_ran), 120)
 
     # Refresh whichever unattended updater the controller actually has loaded - the installer
     # holds the unit/plist templates, so a schedule or working-directory change reaches a host

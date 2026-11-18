@@ -323,11 +323,12 @@ def _disk_guard_refusal(probe: Path) -> int | None:
     return None if decision.allowed else EXIT_REFUSED
 
 
-def _clean_shared_slots(real: Path, argv: list[str], repo_pool: Path, toolchain_id: str) -> int:
-    """``cargo clean`` for every idle pool slot of this repo+toolchain (a busy slot is never touched)."""
-    from .cargo_target_storage import SLOT_LOCK
+def _clean_shared_slots(real: Path, argv: list[str], repo_pool: Path, toolchain_id: str,
+                        workspace: Path) -> int:
+    """``cargo clean`` for every idle pool slot this worktree owns (a busy slot is never touched)."""
+    from .cargo_target_storage import SLOT_LOCK, slot_name
     status = 0
-    for slot in sorted(repo_pool.glob(f"{toolchain_id}-*")):
+    for slot in sorted(repo_pool.glob(slot_name(toolchain_id, workspace, 0).removesuffix("0") + "*")):
         if not (slot / "target").is_dir():
             continue
         fd = os.open(slot / SLOT_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -358,22 +359,23 @@ def run_cargo(argv: list[str]) -> int:
         return 127  # pragma: no cover
     from .build_cache_policy import effective_slots
     from .build_coord import _default_slots, _default_state_dir, run_gated
-    if subcommand != "clean" and not already_coordinated:
+    if subcommand != "clean":
         refused = _disk_guard_refusal(_build_output_probe(config, argv))
         if refused is not None:
             return refused
     if config.local.manage_targets:
+        from .build_cache_config import TargetMode
         from .build_cache_location import select_storage
         from .cargo_target_storage import (
             acquire_shared_target,
             alias_owned,
+            cached_toolchain_identity,
             compatibility_alias,
             maintenance_lock,
             prepare_target,
             repo_identity,
             shared_targets_root,
             target_override,
-            toolchain_identity,
             workspace_root,
         )
         # Managed builds never pay for incremental artifacts (they multiply target size).
@@ -399,17 +401,16 @@ def run_cargo(argv: list[str]) -> int:
                         return 127  # pragma: no cover
                     return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
                                      record=True, cache_config=config, max_load=1.5)
-                if config.local.target_mode == "shared":
-                    # One pooled target per repo+toolchain, shared by all worktrees of the repo.
-                    toolchain = subprocess.run(
-                        [str(real), *[a for a in argv[:1] if a.startswith("+")], "-vV"],
-                        cwd=Path.cwd(), capture_output=True, text=True, timeout=30, check=True).stdout
-                    pool = shared_targets_root(selected.directory.parent) / repo_identity(workspace)
+                if config.local.target_mode is TargetMode.SHARED:
+                    # Pooled targets per repo+toolchain; every worktree owns its slots, so branches never
+                    # overwrite each other's artifacts.
+                    toolchain_id = cached_toolchain_identity(real, argv, Path.cwd(), _default_state_dir())
+                    shared_root = shared_targets_root(selected.directory.parent)
+                    repo_id = repo_identity(workspace)
                     if subcommand == "clean":
-                        return _clean_shared_slots(real, argv, pool, toolchain_identity(toolchain))
+                        return _clean_shared_slots(real, argv, shared_root / repo_id, toolchain_id, workspace)
                     target, _slot_lock = acquire_shared_target(
-                        shared_targets_root(selected.directory.parent), repo_identity(workspace),
-                        toolchain_identity(toolchain), config.local.target_pool_size, workspace)
+                        shared_root, repo_id, toolchain_id, config.local.target_pool_size, workspace)
                     # Keep ./target usable: it points at the slot of the most recent build here.
                     compatibility_alias(_default_state_dir(), workspace, target)
                     os.environ["CARGO_TARGET_DIR"] = str(target)

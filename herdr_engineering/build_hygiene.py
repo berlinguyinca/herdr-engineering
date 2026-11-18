@@ -1,8 +1,9 @@
 """Disk hygiene on by default: install/inspect the cleanup timer and the cargo wrapper.
 
-``install`` is called by ``scripts/install.sh`` and by the fleet update/host-apply flows, so a
-fresh or updated host gets the build-cleanup job (systemd user unit on Linux, launchd agent on
-macOS) and the managed cargo launcher without manual steps. ``build_cleanup.enabled: false`` and
+``install`` is called by ``scripts/install.sh`` and by the controller step of ``fleet update``
+(fleet hosts get it through ``install.sh``), so a fresh or updated host gets the build-cleanup
+job (systemd user unit on Linux, launchd agent on macOS) and the managed cargo launcher without
+manual steps. ``build_cleanup.enabled: false`` and
 ``fabric_build_cache.enabled: false`` are the explicit opt-outs.
 """
 from __future__ import annotations
@@ -14,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -98,7 +100,35 @@ def _plist_path(home: Path) -> Path:
 
 
 def _unit_path(home: Path) -> Path:
-    return home / ".config/systemd/user" / SYSTEMD_UNIT
+    xdg = os.environ.get("XDG_CONFIG_HOME") if home == Path.home() else None
+    return (Path(xdg) if xdg and Path(xdg).is_absolute() else home / ".config") / "systemd/user" / SYSTEMD_UNIT
+
+
+def _has_systemd_user_bus() -> bool:
+    try:
+        return subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True,
+                              timeout=15, check=False).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def reload_launchd_job(domain: str, label: str, plist: Path) -> None:
+    """(Re)load a launchd job. ``bootout`` is asynchronous, so wait until the old job is gone and retry."""
+    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True, timeout=30, check=False)
+    for _ in range(20):  # up to ~10 s for the teardown
+        if subprocess.run(["launchctl", "print", f"{domain}/{label}"], capture_output=True,
+                          timeout=30, check=False).returncode != 0:
+            break
+        time.sleep(0.5)
+    for attempt in range(5):
+        try:
+            subprocess.run(["launchctl", "bootstrap", domain, str(plist)],
+                           capture_output=True, timeout=30, check=True)
+            return
+        except subprocess.CalledProcessError:
+            if attempt == 4:
+                raise
+            time.sleep(1)
 
 
 def _systemd_quote(value: str) -> str:
@@ -114,11 +144,7 @@ def install_cleanup_job(home: Path, herdr_eng: Command, *, platform: str,
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(launchd_plist(herdr_eng, interval_seconds, environment))
         if activate:
-            domain = f"gui/{__import__('os').getuid()}"
-            subprocess.run(["launchctl", "bootout", f"{domain}/{LAUNCHD_LABEL}"],
-                           capture_output=True, timeout=30, check=False)
-            subprocess.run(["launchctl", "bootstrap", domain, str(path)],
-                           capture_output=True, timeout=30, check=True)
+            reload_launchd_job(f"gui/{os.getuid()}", LAUNCHD_LABEL, path)
         return {"job": str(path), "kind": "launchd", "activated": activate}
     path = _unit_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -126,6 +152,9 @@ def install_cleanup_job(home: Path, herdr_eng: Command, *, platform: str,
                                   for key, value in environment.items())
     path.write_text(_UNIT_TEMPLATE.replace("__ENVIRONMENT__", environment_lines).replace(
         "__HERDR_ENG__", " ".join(_systemd_quote(part) for part in _argv(herdr_eng))))
+    if activate and not _has_systemd_user_bus():
+        return {"job": str(path), "kind": "systemd", "activated": False,
+                "skipped": "no systemd user bus; unit written, not started"}
     if activate:
         for argv in (["daemon-reload"], ["enable", SYSTEMD_UNIT], ["restart", SYSTEMD_UNIT]):
             subprocess.run(["systemctl", "--user", *argv], capture_output=True, timeout=60, check=True)
@@ -176,15 +205,21 @@ def resolve_real_cargo(home: Path, path_env: str | None = None) -> Path:
 
 
 def install(home: Path, herdr_eng: Command | None = None, *, platform: str | None = None,
-            activate: bool = True, config: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Install the cleanup job and cargo launcher unless the config opts out. Never raises."""
+            activate: bool = True, config: dict[str, Any] | None = None,
+            skip_cleanup_job: bool = False) -> dict[str, Any]:
+    """Install the cleanup job and cargo launcher unless the config opts out. Never raises.
+
+    ``skip_cleanup_job`` leaves the job to another installer (the controller's systemd script).
+    """
     from .config import load_config
     platform = platform or ("darwin" if sys.platform == "darwin" else "linux")
     config = config if config is not None else load_config()
     herdr_eng = herdr_eng if herdr_eng is not None else default_command()
     result: dict[str, Any] = {}
     cleanup = config.get("build_cleanup") or {}
-    if cleanup.get("enabled", True):
+    if skip_cleanup_job:
+        result["build_cleanup"] = {"skipped": "installed by the controller cleanup step"}
+    elif cleanup.get("enabled", True):
         job = _plist_path(home) if platform == "darwin" else _unit_path(home)
         try:
             if len(_argv(herdr_eng)) > 1 and _job_works(job):
@@ -220,6 +255,15 @@ def _last_run(state_dir: Path) -> str | None:
         return None
 
 
+def _launchd_loaded() -> bool | None:
+    """Whether launchd really has the job loaded (None when it cannot be asked)."""
+    try:
+        return subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"],
+                              capture_output=True, timeout=30, check=False).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def status(home: Path, config: dict[str, Any], state_dir: Path, *, platform: str | None = None,
            ) -> dict[str, Any]:
     """Read-only snapshot used by ``doctor`` and ``build-hygiene status``."""
@@ -236,6 +280,7 @@ def status(home: Path, config: dict[str, Any], state_dir: Path, *, platform: str
         "refuse_builds_percent": float(cleanup.get("refuse_builds_percent", 90)),
         "build_cleanup_enabled": bool(cleanup.get("enabled", True)),
         "build_cleanup_job_installed": job.exists(),
+        "build_cleanup_job_loaded": _launchd_loaded() if platform == "darwin" else None,
         "build_cleanup_last_run": last,
         "cargo_host_enabled": bool(cache.get("enabled", True)
                                    and (cache.get("local") or {}).get("manage_targets", True)),
@@ -252,10 +297,13 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="herdr-eng build-hygiene")
     parser.add_argument("action", choices=["install", "status"])
     parser.add_argument("--no-activate", action="store_true")
+    parser.add_argument("--skip-cleanup-job", action="store_true",
+                        help="the cleanup job is installed by another step (controller systemd script)")
     args = parser.parse_args(argv)
     home = Path.home()
     if args.action == "install":
-        print(json.dumps(install(home, activate=not args.no_activate), indent=2))
-        return 0
+        result = install(home, activate=not args.no_activate, skip_cleanup_job=args.skip_cleanup_job)
+        print(json.dumps(result, indent=2))
+        return 1 if any("error" in part for part in result.values()) else 0
     print(json.dumps(status(home, load_config(), _default_state_dir()), indent=2))
     return 0

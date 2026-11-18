@@ -3236,7 +3236,7 @@ def _cmd_build_coordinate(args) -> int:
     if getattr(args, "trace_session", None) and trace is None:
         print("build-coordinate: --trace-session ignored (not a plain non-secret id)",
               file=sys.stderr)
-    if cmd and os.path.basename(cmd[0]) in _GUARDED_BUILD_COMMANDS:
+    if cmd and _guarded_build(cmd):
         from .cargo_host import _disk_guard_refusal
         refused = _disk_guard_refusal(Path(os.environ.get("CARGO_TARGET_DIR") or Path.cwd()))
         if refused is not None:
@@ -3248,8 +3248,18 @@ def _cmd_build_coordinate(args) -> int:
                      cache_config=cache_cfg, trace=trace)
 
 
-# Commands whose output size the disk-budget guard protects; tests and scripts are never refused.
-_GUARDED_BUILD_COMMANDS = frozenset({"cargo", "rustc", "make", "cmake", "ninja", "tsc", "go"})
+# Commands whose output size the disk-budget guard protects here. Cargo is left out on purpose: the
+# managed cargo wrapper guards it against the filesystem its target really lands on, also when it runs
+# under build-coordinate. Tests and scripts are never refused.
+_GUARDED_BUILD_COMMANDS = frozenset({"rustc", "make", "cmake", "ninja", "tsc"})
+_GUARDED_GO_SUBCOMMANDS = frozenset({"build", "install", "generate"})
+
+
+def _guarded_build(cmd: list[str]) -> bool:
+    name = os.path.basename(cmd[0])
+    if name == "go":
+        return len(cmd) > 1 and cmd[1] in _GUARDED_GO_SUBCOMMANDS
+    return name in _GUARDED_BUILD_COMMANDS
 
 
 def _is_gate_command(cmd: list[str]) -> bool:

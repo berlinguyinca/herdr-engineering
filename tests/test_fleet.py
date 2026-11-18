@@ -199,7 +199,6 @@ def test_update_refreshes_enabled_local_cleanup(tmp_path, monkeypatch):
     (repo / 'scripts').mkdir()
     (repo / 'scripts/build-cleanup.sh').write_text('#!/bin/sh\n')
     monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
-    monkeypatch.setattr(fleet.sys, 'platform', 'linux')  # build-cleanup.sh is the systemd installer
     from herdr_engineering import config
     monkeypatch.setattr(config, 'load_config', lambda: {'build_cleanup': {'enabled': True, 'roots': ['/projects']}})
     calls = []
@@ -210,7 +209,10 @@ def test_update_refreshes_enabled_local_cleanup(tmp_path, monkeypatch):
     monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: STATUS)
     result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
     assert result['ok']
-    assert any(str(repo / 'scripts/build-cleanup.sh') in cmd for cmd in calls)
+    # build-cleanup.sh is the systemd installer: it runs on Linux controllers only (real platform, no stub)
+    assert any(str(repo / 'scripts/build-cleanup.sh') in cmd for cmd in calls) == sys.platform.startswith('linux')
+    hygiene = next(cmd for cmd in calls if 'build-hygiene' in cmd)
+    assert ('--skip-cleanup-job' in hygiene) == sys.platform.startswith('linux')
 
 
 def test_update_status_failure_is_not_success(tmp_path, monkeypatch):

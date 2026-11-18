@@ -302,7 +302,7 @@ def test_managed_cargo_build_evict_and_rebuild_via_public_cli(tmp_path: Path):
     install(home, Path(cargo), Path(sys.executable))
     config = tmp_path / "config.yaml"
     config.write_text(yaml.safe_dump({"fabric_build_cache": {"enabled": True, "local": {
-        "manage_targets": True, "target_retention_enabled": True, "target_internal_gib": .000001,
+        "manage_targets": True, "target_mode": "per_workspace", "target_retention_enabled": True, "target_internal_gib": .000001,
         "min_free_disk_percent": 0, "storage_tiers": [{"name": "internal", "directory": str(cache)}]}}}))
     env = {**os.environ, "HOME": str(home), "CARGO_HOME": str(home / ".cargo"), "RUSTC": rustc,
            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),

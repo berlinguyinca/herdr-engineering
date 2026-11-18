@@ -21,10 +21,11 @@ import yaml
 from herdr_engineering import build_cleanup as cleanup
 from herdr_engineering import build_hygiene, disk_guard
 from herdr_engineering.build_cache_config import validate
-from herdr_engineering.cargo_target_storage import acquire_shared_target, repo_identity
+from herdr_engineering.cargo_target_storage import acquire_shared_target, repo_identity, slot_name
 from herdr_engineering.config import load_config
 from herdr_engineering.doctor import DoctorReport, _add_build_hygiene
 
+REAL_HOME = Path.home()
 CACHEDIR_TAG = "Signature: 8a477f597d28d172789f06886806bc55\n# Cargo target\n"
 
 
@@ -57,6 +58,15 @@ def make_pool_target(slot: Path, age_hours: float = 48) -> Path:
 def sweep(root: Path, **kwargs):
     base = {"high_water": 1, "low_water": 0, "min_age_hours": 24}
     return cleanup.run_once([root], root.parent / "state", **{**base, **kwargs})
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch):
+    """Sweeps include the default tier's pools under the home directory: never the developer's own."""
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
 
 
 @pytest.fixture
@@ -179,7 +189,7 @@ def test_pool_reuses_slot_zero_then_spills_when_it_is_busy(tmp_path):
     workspace.mkdir()
     first, fd0 = acquire_shared_target(tmp_path / "pool", "repo", "tc", 2, workspace)
     second, fd1 = acquire_shared_target(tmp_path / "pool", "repo", "tc", 2, workspace)
-    assert first.parent.name == "tc-0" and second.parent.name == "tc-1"
+    assert first.parent.name.endswith("-0") and second.parent.name.endswith("-1")
     os.close(fd0)
     os.close(fd1)
     again, fd2 = acquire_shared_target(tmp_path / "pool", "repo", "tc", 2, workspace)
@@ -253,7 +263,7 @@ def cargo_env(tmp_path: Path, extra: dict | None = None, refuse: float | None = 
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(settings))
     env = {**os.environ, "HOME": str(home), "CARGO_HOME": str(home / ".cargo"),
-           "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
+           "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(REAL_HOME / ".rustup")),
            "RUSTC": rustc, "HERDR_ENGINEERING_CONFIG": str(config_path),
            "HERDR_ENGINEERING_STATE": str(tmp_path / "state"),
            "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
@@ -284,7 +294,7 @@ def build(cwd: Path, home: Path, env: dict):
 
 
 @pytest.mark.integration
-def test_default_install_shares_one_incremental_free_target_across_worktrees(tmp_path):
+def test_default_install_gives_each_worktree_an_incremental_free_pool_target(tmp_path):
     home, env = cargo_env(tmp_path)
     repo, worktree = crate_with_worktree(tmp_path)
     for cwd in (repo, worktree):
@@ -292,16 +302,17 @@ def test_default_install_shares_one_incremental_free_target_across_worktrees(tmp
         assert result.returncode == 0, result.stderr
     pool = tmp_path / "state/build-gates/shared-targets"
     slots = [p for p in pool.glob("*/*") if p.is_dir()]
-    assert len(slots) == 1 and slots[0].name.endswith("-0")
-    debug = slots[0] / "target/debug"
-    assert (debug / "shared-demo").is_file()
-    # CARGO_INCREMENTAL=0 applied by the wrapper: no incremental artifacts (cargo may keep an empty dir)
-    assert not any((debug / "incremental").rglob("*"))
+    assert len(slots) == 2 and all(slot.name.endswith("-0") for slot in slots)
+    for slot in slots:
+        debug = slot / "target/debug"
+        assert (debug / "shared-demo").is_file()
+        # CARGO_INCREMENTAL=0 applied by the wrapper: no incremental artifacts (cargo may keep an empty dir)
+        assert not any((debug / "incremental").rglob("*"))
     # ./target stays usable: a managed alias to the slot the last build there used
     for checkout in (repo, worktree):
         assert (checkout / "target").is_symlink()
         assert (checkout / "target/debug/shared-demo").is_file()
-        assert (checkout / "target").resolve() == (slots[0] / "target").resolve()
+        assert (checkout / "target").resolve() in {(slot / "target").resolve() for slot in slots}
 
 
 @pytest.mark.integration
@@ -318,7 +329,7 @@ def test_concurrent_build_spills_to_the_second_pool_slot(tmp_path):
     finally:
         os.close(held)
     assert result.returncode == 0, result.stderr
-    assert (pool / repo_identity(repo) / f"{toolchain_identity(toolchain)}-1/target/debug/shared-demo").is_file()
+    assert (pool / repo_identity(repo) / slot_name(toolchain_identity(toolchain), repo, 1) / "target/debug/shared-demo").is_file()
 
 
 @pytest.mark.integration
@@ -382,7 +393,10 @@ def test_install_by_default_installs_job_and_cargo_launcher_and_doctor_sees_them
     after = DoctorReport()
     _add_build_hygiene(after, load_config([]))
     names = {c.name: c for c in after.checks}
-    assert names["build_cleanup"].status == "ok" and names["cargo_host"].status == "ok"
+    # Installed but never loaded (activate=False) is reported as such where launchd can be asked.
+    unloaded = sys.platform == "darwin" and build_hygiene._launchd_loaded() is False
+    assert names["build_cleanup"].status == ("warn" if unloaded else "ok")
+    assert names["cargo_host"].status == "ok"
     assert names["disk_pressure"].data["usage_percent"] >= 0
     json.dumps(after.to_dict())
 
@@ -401,7 +415,7 @@ def test_shared_alias_follows_the_slot_of_the_last_build(tmp_path):
         assert build(repo, home, env).returncode == 0
     finally:
         os.close(held)
-    slot_one = pool / repo_identity(repo) / f"{toolchain_identity(toolchain)}-1/target"
+    slot_one = pool / repo_identity(repo) / slot_name(toolchain_identity(toolchain), repo, 1) / "target"
     assert (repo / "target").resolve() == slot_one.resolve()
 
 
@@ -425,7 +439,11 @@ def test_cargo_clean_cleans_the_shared_slot_and_creates_no_per_workspace_target(
     assert build(repo, home, env).returncode == 0
     slot = next(p for p in (tmp_path / "state/build-gates/shared-targets").glob("*/*") if p.is_dir())
     assert (slot / "target/debug/shared-demo").is_file()
-    cleaned = subprocess.run([str(home / ".local/bin/cargo"), "clean"], cwd=worktree, env=env,
+    other = subprocess.run([str(home / ".local/bin/cargo"), "clean"], cwd=worktree, env=env,
+                           capture_output=True, text=True, timeout=120)
+    assert other.returncode == 0, other.stderr
+    assert (slot / "target/debug/shared-demo").is_file()  # another worktree's clean never touches it
+    cleaned = subprocess.run([str(home / ".local/bin/cargo"), "clean"], cwd=repo, env=env,
                              capture_output=True, text=True, timeout=120)
     assert cleaned.returncode == 0, cleaned.stderr
     assert not (slot / "target/debug").exists()
@@ -605,16 +623,6 @@ def test_guard_measures_the_nearest_existing_ancestor_of_the_build_output(root, 
     assert 0 <= percent <= 100 and free_gib > 0
 
 
-def test_build_coordinate_guards_build_commands_but_not_tests(tmp_path):
-    settings = {"build_cleanup": {"enabled": True, "roots": [], "refuse_builds_percent": 0,
-                                  "refuse_builds_min_free_gib": 1e12}}
-    build_cmd = run_cli(tmp_path, "build-coordinate", "--", "cargo", "--version", settings=settings)
-    assert build_cmd.returncode == disk_guard.EXIT_REFUSED
-    assert "refusing to start a new build" in build_cmd.stderr
-    other = run_cli(tmp_path, "build-coordinate", "--", "true", settings=settings)
-    assert other.returncode == 0, other.stderr
-
-
 def test_real_cargo_prefers_the_rustup_proxy_over_path(tmp_path):
     proxy_dir = tmp_path / "home/.cargo/bin"
     distro = tmp_path / "usr/bin"
@@ -638,3 +646,248 @@ def test_real_cargo_respects_a_valid_recorded_install(tmp_path):
     (host_root(home)).mkdir(parents=True)
     (host_root(home) / "install.json").write_text(json.dumps({"real_cargo": str(recorded)}))
     assert build_hygiene.resolve_real_cargo(home, path_env="") == recorded
+
+
+# --- review round 2 fixes -------------------------------------------------------------------
+
+def test_each_worktree_owns_its_pool_slots_and_never_shares_artifacts(tmp_path):
+    first_ws, second_ws = tmp_path / "a", tmp_path / "b"
+    first_ws.mkdir()
+    second_ws.mkdir()
+    pool = tmp_path / "pool"
+    first, fd = acquire_shared_target(pool, "repo", "tc", 2, first_ws)
+    os.close(fd)
+    second, fd = acquire_shared_target(pool, "repo", "tc", 2, second_ws)
+    os.close(fd)
+    again, fd = acquire_shared_target(pool, "repo", "tc", 2, first_ws)
+    os.close(fd)
+    assert first.parent != second.parent  # idle slot of another worktree is never reused
+    assert again == first  # a worktree gets its own last slot back
+
+
+@pytest.mark.integration
+def test_two_worktrees_build_into_separate_targets_and_keep_their_own_binaries(tmp_path):
+    home, env = cargo_env(tmp_path)
+    repo, worktree = crate_with_worktree(tmp_path)
+    assert build(repo, home, env).returncode == 0
+    binary = (repo / "target/debug/shared-demo").resolve()
+    before = binary.stat().st_mtime_ns
+    (worktree / "src/main.rs").write_text('fn main() { println!("other branch"); }\n')
+    assert build(worktree, home, env).returncode == 0
+    assert (repo / "target").resolve() != (worktree / "target").resolve()
+    assert (repo / "target/debug/shared-demo").resolve() == binary
+    assert binary.stat().st_mtime_ns == before  # the other branch's build did not overwrite it
+    assert subprocess.run([str(binary)], capture_output=True, text=True).stdout == ""
+
+
+def test_guard_and_sweep_measure_usage_the_same_way(root):
+    assert cleanup._usage(root) == pytest.approx(disk_guard.measure(root)[0], abs=0.5)
+
+
+def test_each_cleanup_cycle_picks_up_a_pool_created_after_the_watcher_started(tmp_path, root, monkeypatch):
+    from herdr_engineering.build_maintenance import cleanup_cycle
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "wstate"))
+    cfg = {"roots": [str(root)], "high_water_percent": 100.0, "low_water_percent": 0}
+    state = tmp_path / "wstate/build-gates"
+    state.mkdir(parents=True)
+    pool = state / "shared-targets"
+    assert cleanup_cycle(cfg, None, state)["roots"] == [str(root)]
+    pool.mkdir()
+    assert os.path.realpath(pool) in cleanup_cycle(cfg, None, state)["roots"]
+
+
+def test_pools_and_legacy_targets_on_an_enrolled_tier_are_swept_roots(tmp_path, monkeypatch):
+    from herdr_engineering.build_maintenance import effective_roots
+    volume = tmp_path / "vol/herdr-build"
+    (volume / "shared-targets").mkdir(parents=True)
+    (volume / "targets").mkdir()
+    config = tmp_path / "tiers.yaml"
+    config.write_text(yaml.safe_dump({"fabric_build_cache": {"local": {"storage_tiers": [
+        {"name": "ext", "directory": str(volume / "compiler-cache")}]}}}))
+    monkeypatch.setenv("HERDR_ENGINEERING_CONFIG", str(config))
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "estate"))
+    roots = {str(path) for path in effective_roots({"roots": []})}
+    assert os.path.realpath(volume / "shared-targets") in roots
+    assert os.path.realpath(volume / "targets") in roots
+
+
+def make_legacy_target(targets: Path, name: str = "app-1234", age_hours: float = 48) -> Path:
+    """A per-workspace managed target as written before the shared pool became the default."""
+    targets.mkdir(parents=True, exist_ok=True)
+    (targets / ".herdr-target-root.json").write_text(json.dumps({"version": 1, "owner_uid": os.getuid()}))
+    target = targets / name
+    (target / "debug/.fingerprint").mkdir(parents=True)
+    (target / "debug/artifact").write_bytes(b"x" * 4096)
+    (target / ".herdr-cargo-target.json").write_text(json.dumps(
+        {"version": 1, "workspace": str(targets.parent / "ws"), "owner_uid": os.getuid()}))
+    stamp = time.time() - age_hours * 3600
+    for path in [*target.rglob("*"), target]:
+        os.utime(path, (stamp, stamp))
+    return target
+
+
+def test_orphaned_per_workspace_targets_are_reclaimed_when_idle(tmp_path):
+    targets = tmp_path / "state/targets"
+    target = make_legacy_target(targets)
+    recent = make_legacy_target(targets, "fresh-5678", age_hours=0)
+    result = cleanup.run_once([Path(os.path.realpath(targets))], tmp_path / "state2", high_water=1,
+                              low_water=0, min_age_hours=24)
+    assert str(Path(os.path.realpath(target))) in result["removed"] and not target.exists()
+    assert recent.exists()
+
+
+def test_unmarked_directories_under_a_targets_folder_are_not_removed(tmp_path):
+    targets = tmp_path / "state/targets"
+    target = make_legacy_target(targets)
+    (target / ".herdr-cargo-target.json").unlink()
+    cleanup.run_once([Path(os.path.realpath(targets))], tmp_path / "state2", high_water=1,
+                     low_water=0, min_age_hours=24)
+    assert target.exists()
+
+
+def test_tracked_cache_only_target_in_a_repository_is_never_removed(root):
+    repo = root / "tools"
+    fixture = repo / "tests/fixtures/ws/target"
+    (fixture / "debug/.fingerprint").mkdir(parents=True)
+    (fixture / "CACHEDIR.TAG").write_text(CACHEDIR_TAG)
+    (fixture / ".rustc_info.json").write_text("{}")
+    git("init", "-q", cwd=repo)
+    git("add", ".", cwd=repo)
+    git("commit", "-q", "-m", "fixture", cwd=repo)
+    stamp = time.time() - 48 * 3600
+    for path in [*fixture.rglob("*"), fixture]:
+        os.utime(path, (stamp, stamp))
+    result = sweep(root)
+    assert fixture.exists() and not result["removed"]
+    assert any(item["reason"] == "tracked or unverifiable output" for item in result["skipped"])
+
+
+def test_dry_run_scans_processes_once_not_per_candidate(root):
+    for name in ("one", "two", "three"):
+        make_target(root, name)
+    result = sweep(root, dry_run=True)
+    assert len(result["would_remove"]) == 3 and result["process_scans"] == 1
+
+
+def test_explicit_roots_are_not_resolved_so_the_canonical_root_guard_applies(tmp_path, root):
+    from herdr_engineering.build_maintenance import effective_roots
+    link = tmp_path / "link"
+    link.symlink_to(root)
+    assert effective_roots({}, [str(link)]) == [link]
+    result = cleanup.run_once([link], tmp_path / "state", high_water=1, low_water=0)
+    assert result["status"] == "error" and "canonical" in result["errors"][0]
+
+
+def test_toolchain_identity_is_cached_between_builds(tmp_path, monkeypatch):
+    from herdr_engineering.cargo_target_storage import cached_toolchain_identity
+    cargo = REAL_HOME / ".cargo/bin/cargo"
+    if not cargo.is_file():
+        pytest.skip("rustup's cargo is required")
+    monkeypatch.setenv("RUSTUP_HOME", os.environ.get("RUSTUP_HOME", str(REAL_HOME / ".rustup")))
+    monkeypatch.setenv("CARGO_HOME", str(REAL_HOME / ".cargo"))
+    state = tmp_path / "state"
+    state.mkdir()
+    first = cached_toolchain_identity(Path(cargo), [], tmp_path, state)
+    entries = list(state.glob("toolchain-*.json"))
+    assert len(entries) == 1
+    entries[0].write_text(json.dumps({"identity": "cached-marker"}))
+    assert cached_toolchain_identity(Path(cargo), [], tmp_path, state) == "cached-marker"
+    entries[0].unlink()
+    assert cached_toolchain_identity(Path(cargo), [], tmp_path, state) == first
+
+
+def test_target_mode_is_an_enum_and_rejects_unknown_values():
+    from herdr_engineering.build_cache_config import TargetMode
+    from herdr_engineering.errors import InvalidError
+    section = load_config([])["fabric_build_cache"]
+    assert validate(section).local.target_mode is TargetMode.SHARED
+    section["local"]["target_mode"] = "per_workspace"
+    assert validate(section).local.target_mode is TargetMode.PER_WORKSPACE
+    section["local"]["target_mode"] = "bogus"
+    with pytest.raises(InvalidError):
+        validate(section)
+
+
+def test_build_hygiene_install_exits_nonzero_when_a_step_fails(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    config = tmp_path / "c.yaml"
+    config.write_text(yaml.safe_dump({}))
+    env = {"HOME": str(home), "PATH": str(tmp_path / "empty"), "HERDR_ENGINEERING_CONFIG": str(config),
+           "HERDR_ENGINEERING_STATE": str(tmp_path / "s"),
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    result = subprocess.run([sys.executable, "-m", "herdr_engineering.cli", "build-hygiene", "install",
+                             "--no-activate"], env=env, capture_output=True, text=True, timeout=120)
+    assert json.loads(result.stdout)["cargo_host"]["error"]
+    assert result.returncode != 0
+
+
+def test_systemd_install_without_a_user_bus_writes_the_unit_and_does_not_fail(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "no-runtime-dir"))
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    result = build_hygiene.install_cleanup_job(tmp_path, [sys.executable, "-m", "herdr_engineering.cli"],
+                                               platform="linux", activate=True)
+    assert result["activated"] is False and "user bus" in result["skipped"]
+    assert Path(result["job"]).is_file()
+
+
+def test_systemd_unit_lives_under_xdg_config_home_for_the_real_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert build_hygiene._unit_path(Path.home()) == tmp_path / "xdg/systemd/user" / build_hygiene.SYSTEMD_UNIT
+    assert build_hygiene._unit_path(tmp_path / "other") == (
+        tmp_path / "other/.config/systemd/user" / build_hygiene.SYSTEMD_UNIT)
+
+
+def test_install_can_leave_the_cleanup_job_to_the_controller_step(tmp_path):
+    result = build_hygiene.install(tmp_path, [sys.executable, "-m", "x"], platform="linux", activate=False,
+                                   config={"fabric_build_cache": {"enabled": False}}, skip_cleanup_job=True)
+    assert "installed by the controller" in result["build_cleanup"]["skipped"]
+    assert not build_hygiene._unit_path(tmp_path).exists()
+
+
+def test_fleet_runs_a_single_cleanup_installer_per_platform():
+    from herdr_engineering import fleet
+    assert "--skip-cleanup-job" in fleet._build_hygiene_command(legacy_installer_ran=True)
+    assert "--skip-cleanup-job" not in fleet._build_hygiene_command(legacy_installer_ran=False)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="launchd")
+def test_launchd_reload_survives_the_asynchronous_bootout(tmp_path):
+    import plistlib
+    import uuid
+    label = f"com.herdr-engineering.test-{uuid.uuid4().hex[:8]}"
+    plist = tmp_path / f"{label}.plist"
+    plist.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": ["/usr/bin/true"],
+                                      "RunAtLoad": False}))
+    domain = f"gui/{os.getuid()}"
+    if subprocess.run(["launchctl", "print", domain], capture_output=True).returncode != 0:
+        pytest.skip("no launchd GUI domain")
+    try:
+        build_hygiene.reload_launchd_job(domain, label, plist)
+        build_hygiene.reload_launchd_job(domain, label, plist)  # job is loaded: bootout races bootstrap
+        assert subprocess.run(["launchctl", "print", f"{domain}/{label}"],
+                              capture_output=True).returncode == 0
+    finally:
+        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True)
+
+
+def test_build_coordinate_guards_by_command_and_leaves_cargo_to_the_wrapper(tmp_path):
+    settings = {"build_cleanup": {"enabled": True, "roots": [], "refuse_builds_percent": 0,
+                                  "refuse_builds_min_free_gib": 1e12}}
+    assert run_cli(tmp_path, "build-coordinate", "--", "ninja", "--version",
+                   settings=settings).returncode == disk_guard.EXIT_REFUSED
+    for command in (["go", "test", "./..."], ["go", "vet"], ["cargo", "--version"], ["true"]):
+        result = run_cli(tmp_path, "build-coordinate", "--", *command, settings=settings)
+        assert result.returncode != disk_guard.EXIT_REFUSED, command
+    assert run_cli(tmp_path, "build-coordinate", "--", "go", "build", settings=settings
+                   ).returncode == disk_guard.EXIT_REFUSED
+
+
+@pytest.mark.integration
+def test_wrapper_still_guards_when_it_runs_under_build_coordinate(tmp_path):
+    home, env = cargo_env(tmp_path, refuse=0)
+    repo, _ = crate_with_worktree(tmp_path)
+    result = subprocess.run([sys.executable, "-m", "herdr_engineering.cli", "build-coordinate", "--",
+                             str(home / ".local/bin/cargo"), "build", "--offline"],
+                            cwd=repo, env=env, capture_output=True, text=True, timeout=180)
+    assert result.returncode == disk_guard.EXIT_REFUSED, result.stderr
