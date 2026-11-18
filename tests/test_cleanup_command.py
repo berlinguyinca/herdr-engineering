@@ -353,15 +353,11 @@ def test_busy_check_sees_cwd_and_open_files(env: Env, mode: str) -> None:
     assert cleanup("tmp", scratch, roots=env.roots, temp_roots=env.roots)["action"] == "removed"
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="lsof path is the non-/proc fallback")
-def test_busy_check_fails_closed_without_lsof_or_on_timeout(tmp_path: Path,
-                                                            monkeypatch: pytest.MonkeyPatch) -> None:
-    from herdr_engineering.cleanup_command import busy_paths
+def test_busy_check_fails_closed_without_lsof(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from herdr_engineering.cleanup_command import in_use_snapshot
+    monkeypatch.setenv("PATH", str(tmp_path))  # no ps/lsof on PATH
     with pytest.raises(Refusal, match="in_use"):
-        busy_paths(timeout=0.001)  # real lsof, real timeout
-    monkeypatch.setenv("PATH", str(tmp_path))  # no lsof on PATH
-    with pytest.raises(Refusal, match="in_use"):
-        busy_paths()
+        in_use_snapshot()
 
 
 def test_select_pr_requires_branch_sha_and_owner() -> None:

@@ -172,6 +172,19 @@ class Report:
         return cast(dict[str, object], value)
 
 
+def default_root() -> Path:
+    """Claude Code's scratch root (``/tmp/claude-<uid>`` on macOS and Linux alike)."""
+    return Path(f"/tmp/claude-{os.getuid()}")
+
+
+def default_live_roots() -> list[Path]:
+    return [
+        Path.home() / ".claude/projects",
+        Path.home() / ".codex/sessions",
+        Path.home() / ".pi/agent/sessions",
+    ]
+
+
 def _small_json(path: Path) -> dict[str, object]:
     if path.is_symlink() or path.stat().st_size > 2**20:
         raise ValueError("unsafe metadata")
@@ -942,11 +955,7 @@ def run_once(
                 remaining -= candidate.allocated_bytes
                 if candidate.quarantine and qbytes is not None:
                     qbytes -= candidate.allocated_bytes
-        defaults = [
-            Path.home() / ".claude/projects",
-            Path.home() / ".codex/sessions",
-            Path.home() / ".pi/agent/sessions",
-        ]
+        defaults = default_live_roots()
         _general(
             root,
             quarantine,
@@ -999,7 +1008,7 @@ def run_once(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path(f"/tmp/claude-{os.getuid()}"))
+    parser.add_argument("--root", type=Path, default=default_root())
     parser.add_argument(
         "--quarantine", type=Path, default=Path.home() / ".local/state/scratch-reaper/quarantine"
     )

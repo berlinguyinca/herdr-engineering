@@ -148,13 +148,13 @@ def test_unknown_pr_state_fails_closed(env: Env) -> None:
     assert rows["done"]["action"] == "kept" and wt.is_dir()
 
 
-def test_stale_registration_pruned(env: Env) -> None:
+def test_stale_registration_is_reported_not_pruned(env: Env) -> None:
     wt = env.worktree("gone")
     import shutil
     shutil.rmtree(wt)
     rows = reap(env)
-    assert rows["gone"]["action"] == "pruned"
-    assert "gone" not in git(env.repo, "worktree", "list")
+    assert rows["gone"]["action"] == "kept" and rows["gone"]["reason"] == "missing_directory"
+    assert "gone" in git(env.repo, "worktree", "list")
 
 
 def test_find_repos_discovers_main_checkouts_only(env: Env) -> None:

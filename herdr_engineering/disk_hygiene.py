@@ -7,8 +7,12 @@ worktree (its in-tree ``target`` goes with it) only when git and PR state agree 
 * no PR at all, idle for ``worktree_ttl_days`` (default 7), tree clean, fully pushed.
 
 An open PR, an unknown PR state (gh missing, offline), recent activity, a running process, a
-dirty tree or an unpushed commit all keep the worktree. The safety checks are the same
-``cleanup_command`` code an agent hits, so the reaper cannot do what the command refuses.
+dirty tree, hidden (skip-worktree) edits or an unpushed commit all keep the worktree. The safety
+checks are the same ``cleanup_command`` / ``scratch_safety`` code an agent hits, so the reaper
+cannot do what the command refuses. It never runs ``git worktree prune``: registrations whose
+directory is missing are reported, not deleted (they may sit on an unmounted volume).
+
+An unreadable user config disables the destructive jobs (status ``config_unreadable``).
 
 Config (``disk_hygiene`` in the herdr-eng config; everything optional, default on)::
 
@@ -25,13 +29,15 @@ Opt out entirely with ``disk_hygiene.enabled: false`` in the USER config file
 launchd/systemd job. Repo-local config is never read here.
 
 Only worktrees inside the agent roots (``cleanup_command.default_roots`` plus the user config's
-``disk_hygiene.roots``) are ever reaped; the user's own repos and worktrees are not.
+``disk_hygiene.roots``, plus autospec's ``/tmp/wt-*``) are ever reaped; the user's own repos and
+worktrees are not.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,10 +47,11 @@ from .cleanup_command import (
     Refusal,
     _git,
     _origin_owner,
-    busy_paths,
     checked_path,
     configured_roots,
+    default_temp_worktree_parents,
     gh_pr_state,
+    in_use_snapshot,
     remove_worktree,
     user_disk_hygiene_config,
 )
@@ -66,12 +73,16 @@ class Policy:
     builder_keep_storage: str = "5GB"
     builder_prune: bool = False
     image_prune: bool = False
+    config_error: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
 
 def load_policy(cfg: dict[str, Any] | None = None) -> Policy:
     if cfg is None:
-        cfg = user_disk_hygiene_config()  # user-level file only; unreadable means defaults (on)
+        try:
+            cfg = user_disk_hygiene_config()  # user-level file only
+        except Refusal as exc:  # unreadable: fail CLOSED, the destructive jobs do not run
+            return Policy(enabled=False, worktrees=False, docker=False, config_error=exc.message)
     wt, dk = cfg.get("worktrees") or {}, cfg.get("docker") or {}
     off = os.environ.get("HERDR_DISK_HYGIENE", "1").strip().lower() in ("0", "false", "no", "off")
     return Policy(
@@ -90,13 +101,27 @@ def load_policy(cfg: dict[str, Any] | None = None) -> Policy:
     )
 
 
-def find_repos(roots: list[Path]) -> list[Path]:
-    """Main checkouts near the roots, plus the main checkout behind every linked worktree found
-    there (agent worktrees live in an agent root, their repo usually does not). Discovery only,
-    never a removal rule."""
+def _repo_handle(common: Path) -> Path:
+    """What ``git -C`` should be pointed at: the checkout for a normal repo, the git dir itself
+    for bare and separate-git-dir layouts."""
+    common = common.resolve()
+    return common.parent if common.name == ".git" else common
+
+
+def find_repos(roots: list[Path], temp_worktree_parents: list[Path] | None = None) -> list[Path]:
+    """Repositories near the roots, plus the one behind every linked worktree found there (agent
+    worktrees live in an agent root, their repo usually does not). Discovery only, never a
+    removal rule. ``<parent>/wt-*`` directories of ``temp_worktree_parents`` are scanned too."""
     found: set[Path] = set()
-    for root in roots:
-        pending = [(Path(os.path.abspath(root)), 0)]
+    starts = [(Path(os.path.abspath(root)), 0) for root in roots]
+    for parent in temp_worktree_parents or []:
+        try:
+            starts += [(Path(e.path), _DISCOVERY_DEPTH) for e in os.scandir(parent)
+                       if e.name.startswith("wt-") and e.is_dir(follow_symlinks=False)]
+        except OSError:
+            continue
+    for start in starts:
+        pending = [start]
         while pending:
             directory, depth = pending.pop()
             try:
@@ -109,7 +134,7 @@ def find_repos(roots: list[Path]) -> list[Path]:
             if any(e.name == ".git" and e.is_file(follow_symlinks=False) for e in entries):
                 common = _git(directory, "rev-parse", "--path-format=absolute", "--git-common-dir")
                 if common.returncode == 0 and common.stdout.strip():
-                    found.add(Path(common.stdout.strip()).resolve().parent)
+                    found.add(_repo_handle(Path(common.stdout.strip())))
                 continue
             if depth < _DISCOVERY_DEPTH:
                 pending += [(Path(e.path), depth + 1) for e in entries
@@ -159,38 +184,36 @@ def pr_state(repo: Path, wt: Path, branch: str, source: str) -> str:
     if not branch:
         return "none"
     if source == "gh":
-        pr = gh_pr_state(repo, branch, _git(wt, "rev-parse", "HEAD").stdout.strip(),
-                         _origin_owner(repo))
+        pr = gh_pr_state(wt, branch, _git(wt, "rev-parse", "HEAD").stdout.strip(),
+                         _origin_owner(wt))
         if pr is None:
             return "unknown"
         return {"MERGED": "merged", "CLOSED": "closed", "OPEN": "open", "NONE": "none"}.get(
             pr["state"], "unknown")
     tip = _git(wt, "rev-parse", "HEAD").stdout.strip()
     for ref in ("origin/HEAD", "origin/main", "origin/master"):
-        base = _git(repo, "rev-parse", "--verify", "-q", ref).stdout.strip()
-        if base and base != tip and _git(repo, "merge-base", "--is-ancestor", tip, base).returncode == 0:
+        base = _git(wt, "rev-parse", "--verify", "-q", ref).stdout.strip()
+        if base and base != tip and _git(wt, "merge-base", "--is-ancestor", tip, base).returncode == 0:
             return "merged"
     return "none"
 
 
 def reap_repo(repo: Path, policy: Policy, roots: list[Path], *, dry_run: bool, now: float,
-              busy: list[Path]) -> dict[str, Any]:
+              snapshot: Any, temp_worktree_parents: list[Path] | None = None) -> dict[str, Any]:
     result: dict[str, Any] = {"repo": str(repo), "worktrees": []}
     entries = list_worktrees(repo)
     for item in entries[1:]:  # the first entry is the main checkout
         path: Path = item["path"]
         row: dict[str, Any] = {"path": str(path), "branch": item["branch"]}
         result["worktrees"].append(row)
-        if item["prunable"]:
-            if not dry_run:
-                _git(repo, "worktree", "prune")
-            row.update(action="pruned" if not dry_run else "would_prune", reason="missing_directory")
+        if item["prunable"]:  # directory missing: maybe an unmounted volume. Never pruned here.
+            row.update(action="kept", reason="missing_directory")
             continue
         if item["locked"]:
             row.update(action="kept", reason="locked")
             continue
         try:
-            path = checked_path(path, roots)
+            path = checked_path(path, roots, temp_worktree_parents)
             idle = now - last_activity(path)
             if idle < policy.min_idle_hours * 3600:
                 row.update(action="kept", reason="recent_activity")
@@ -205,24 +228,37 @@ def reap_repo(repo: Path, policy: Policy, roots: list[Path], *, dry_run: bool, n
                 continue
             reason = f"pr_{state}" if state != "none" else "orphan_ttl"
             remove_worktree(path, dry_run=dry_run, merged_ok=state in ("merged", "closed"),
-                            busy=busy)
+                            snapshot=snapshot)
             row.update(action="would_remove" if dry_run else "removed", reason=reason)
         except Refusal as exc:
             row.update(action="kept", reason=exc.code)
+        except subprocess.TimeoutExpired:
+            row.update(action="kept", reason="timeout")
         except OSError as exc:
             row.update(action="kept", reason=f"error: {exc}")
     return result
 
 
 def reap_worktrees(policy: Policy, *, dry_run: bool = False, extra_repos: list[Path] | None = None,
-                   extra_roots: list[str] | None = None, now: float | None = None) -> dict[str, Any]:
+                   extra_roots: list[str] | None = None, now: float | None = None,
+                   temp_worktree_parents: list[Path] | None = None) -> dict[str, Any]:
     roots = configured_roots([*policy.roots, *(extra_roots or [])])
-    repos = [*policy.repos, *(extra_repos or [])] or find_repos(roots)
-    busy = busy_paths() if repos else []
+    parents = default_temp_worktree_parents() if temp_worktree_parents is None else temp_worktree_parents
+    repos = [*policy.repos, *(extra_repos or [])] or find_repos(roots, parents)
+    snapshot: Any = None
+    if repos:
+        try:
+            snapshot = in_use_snapshot()
+        except Refusal as exc:  # fail closed: nothing is removed, but the run still reports
+            snapshot = exc
     now = time.time() if now is None else now
     report: dict[str, Any] = {"job": "worktrees", "dry_run": dry_run, "repos": []}
     for repo in repos:
-        report["repos"].append(reap_repo(Path(repo), policy, roots, dry_run=dry_run, now=now, busy=busy))
+        try:
+            report["repos"].append(reap_repo(Path(repo), policy, roots, dry_run=dry_run, now=now,
+                                             snapshot=snapshot, temp_worktree_parents=parents))
+        except (Refusal, OSError, subprocess.SubprocessError) as exc:
+            report["repos"].append({"repo": str(repo), "worktrees": [], "error": str(exc)})
     rows = [w for r in report["repos"] for w in r["worktrees"]]
     report["removed"] = sum(w["action"] in ("removed", "would_remove") for w in rows)
     report["kept"] = sum(w["action"] == "kept" for w in rows)
@@ -232,17 +268,25 @@ def reap_worktrees(policy: Policy, *, dry_run: bool = False, extra_repos: list[P
 
 def run(policy: Policy, *, only: str | None = None, dry_run: bool = False,
         extra_repos: list[Path] | None = None, extra_roots: list[str] | None = None) -> dict[str, Any]:
+    if policy.config_error:
+        return {"status": "config_unreadable", "reason": policy.config_error}
     if not policy.enabled:
         return {"status": "disabled", "reason": "disk_hygiene.enabled is false (user config) or HERDR_DISK_HYGIENE=0"}
     jobs: list[dict[str, Any]] = []
     if policy.worktrees and only in (None, "worktrees"):
-        jobs.append(reap_worktrees(policy, dry_run=dry_run, extra_repos=extra_repos,
-                                   extra_roots=extra_roots))
+        try:
+            jobs.append(reap_worktrees(policy, dry_run=dry_run, extra_repos=extra_repos,
+                                       extra_roots=extra_roots))
+        except (Refusal, OSError, subprocess.SubprocessError) as exc:
+            jobs.append({"job": "worktrees", "status": "error", "reason": str(exc)})
     if policy.docker and only in (None, "docker"):
         from .docker_hygiene import sweep
-        jobs.append(sweep(dry_run=dry_run, min_age_seconds=int(policy.docker_min_age_hours * 3600),
-                          keep_storage=policy.builder_keep_storage, builder_prune=policy.builder_prune,
-                          image_prune=policy.image_prune))
+        try:
+            jobs.append(sweep(dry_run=dry_run, min_age_seconds=int(policy.docker_min_age_hours * 3600),
+                              keep_storage=policy.builder_keep_storage, builder_prune=policy.builder_prune,
+                              image_prune=policy.image_prune))
+        except (OSError, subprocess.SubprocessError) as exc:
+            jobs.append({"job": "docker", "status": "error", "reason": str(exc)})
     return {"status": "dry_run" if dry_run else "ok", "jobs": jobs}
 
 
@@ -281,10 +325,13 @@ def main_args(args: argparse.Namespace) -> int:
                              "docker": policy.docker, "ttl_days": policy.ttl_days,
                              "pr_source": policy.pr_source}}
     else:
-        report = run(policy, only=args.only, dry_run=args.dry_run,
-                     extra_repos=[Path(r).expanduser() for r in args.repo])
+        try:
+            report = run(policy, only=args.only, dry_run=args.dry_run,
+                         extra_repos=[Path(r).expanduser() for r in args.repo])
+        except (Refusal, OSError, subprocess.SubprocessError) as exc:
+            report = {"status": "error", "reason": str(exc)}
         if not args.dry_run:
-            _write_status(report)
+            _write_status(report)  # always, so the file never shows a stale "last good" report
     print(json.dumps(report, indent=None if args.json else 2, default=str))
-    return 0
+    return 1 if report.get("status") == "error" else 0
 

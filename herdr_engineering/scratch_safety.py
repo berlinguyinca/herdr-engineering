@@ -162,6 +162,18 @@ def git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def hidden_index_reason(repo: Path) -> str | None:
+    """skip-worktree / assume-unchanged entries hide edits from ``git status`` and from removal."""
+    index = git(repo, "ls-files", "-v", "-z")
+    if index.returncode:
+        return "repository_unverifiable"
+    if any(
+        entry[:1].islower() or entry.startswith("S ") for entry in index.stdout.split("\0") if entry
+    ):
+        return "repository_hidden_index_state"
+    return None
+
+
 def repository_reason(repo: Path) -> str | None:
     filters = git(
         repo,
@@ -178,13 +190,8 @@ def repository_reason(repo: Path) -> str | None:
     top = git(repo, "rev-parse", "--show-toplevel")
     if top.returncode or Path(top.stdout.strip()).resolve() != repo.resolve():
         return "repository_unverifiable"
-    index = git(repo, "ls-files", "-v", "-z")
-    if index.returncode:
-        return "repository_unverifiable"
-    if any(
-        entry[:1].islower() or entry.startswith("S ") for entry in index.stdout.split("\0") if entry
-    ):
-        return "repository_hidden_index_state"
+    if reason := hidden_index_reason(repo):
+        return reason
     checks = [
         ("dirty_repository", ("status", "--porcelain", "--untracked-files=all", "--ignored")),
         (
@@ -280,14 +287,16 @@ def _comparison(value: str) -> str:
     return unicodedata.normalize("NFC", value).casefold()
 
 
-def process_snapshot() -> Snapshot:
+def process_snapshot(ignore_arguments_of: frozenset[int] = frozenset()) -> Snapshot:
+    """``ignore_arguments_of``: pids (the caller's own ancestors) whose command line is not a
+    reference; their open files and cwd still count."""
     try:
-        return _process_snapshot()
+        return _process_snapshot(ignore_arguments_of)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         raise InspectionUnavailable("process visibility is unavailable; cleanup blocked") from error
 
 
-def _process_snapshot() -> Snapshot:
+def _process_snapshot(ignore_arguments_of: frozenset[int] = frozenset()) -> Snapshot:
     listing = subprocess.run(
         ["ps", "-ww", "-axo", "pid=,args="], capture_output=True, text=True, timeout=15
     )
@@ -301,8 +310,9 @@ def _process_snapshot() -> Snapshot:
         pieces = line.strip().split(None, 1)
         if len(pieces) != 2 or not pieces[0].isdigit() or int(pieces[0]) == own:
             continue
-        arguments.append(_comparison(pieces[1]))
-        commands[int(pieces[0])] = _comparison(pieces[1])
+        if int(pieces[0]) not in ignore_arguments_of:
+            arguments.append(_comparison(pieces[1]))
+            commands[int(pieces[0])] = _comparison(pieces[1])
         if Path(pieces[1].split()[0]).name in _COMPILERS:
             compilers.add(int(pieces[0]))
     result = subprocess.run(

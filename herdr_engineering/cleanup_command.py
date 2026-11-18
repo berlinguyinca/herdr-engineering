@@ -4,11 +4,16 @@ Agents are blocked from raw ``rm -rf`` / ``git worktree remove`` / ``docker rm``
 is the allow-listable replacement, so it must never be a bypass:
 
 * only paths inside agent-owned roots (``default_roots`` plus ``disk_hygiene.roots`` from the
-  USER-level config file only: no CLI flag, no env var, never repo-local config), never a root
-  itself, never ``..``, never through a symlink, only entries owned by the current uid;
-* ``tmp`` only under temp roots, and never a git repo/worktree or a directory containing one;
-* ``worktree`` refuses repo main checkouts, dirty trees and commits that exist on no remote
-  (``--merged-ok`` relaxes the last one only when the work is merged or its PR is closed);
+  USER-level config file only: no CLI flag, no env var, never repo-local config; ``worktree``
+  also accepts ``/tmp/wt-*``, where autospec makes its worktrees), never a root itself, never
+  ``..``, never through a symlink, only entries owned by the current uid;
+* ``tmp`` only under temp roots, never a git repo/bare repo/worktree or a directory containing
+  one, and under the Claude scratch root only strictly inside a live-checked ``<session>`` dir;
+* ``worktree`` refuses repo main checkouts, dirty trees, skip-worktree/assume-unchanged edits
+  and commits that exist on no remote (``--merged-ok`` relaxes the last one only when the work
+  is merged or its PR is closed);
+* process, hidden-index and scratch-session checks reuse ``scratch_safety`` / ``scratch_reaper``
+  (one safety contract, not two);
 * ``target`` accepts only a Cargo ``target`` with build markers and no tracked files;
 * ``docker`` removes only stopped containers labelled ``herdr.ephemeral=1``.
 
@@ -26,12 +31,18 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .scratch_safety import Snapshot
 
 EPHEMERAL_LABEL = "herdr.ephemeral=1"
 SCOPES = ("worktree", "target", "docker", "tmp")
 _MAIN_REFS = ("origin/HEAD", "origin/main", "origin/master")
+GIT_TIMEOUT = 60
+TEMP_WORKTREE_PREFIX = "wt-"
 
 
 class Refusal(Exception):
@@ -41,16 +52,27 @@ class Refusal(Exception):
         self.message = message
 
 
+def scratch_root() -> Path:
+    """Claude's scratch root, resolved exactly as ``scratch_reaper`` does (``/tmp/claude-<uid>``)."""
+    from .scratch_reaper import default_root
+    return default_root()
+
+
 def default_roots(home: Path | None = None) -> list[Path]:
     """Agent-created locations only. ``~/IdeaProjects`` and ``~/work`` hold the user's own repos."""
     home = home or Path.home()
     return [home / ".local" / "share" / "worktrees", home / ".cache" / "herdr-engineering",
-            Path(tempfile.gettempdir()) / f"claude-{os.getuid()}"]
+            scratch_root()]
 
 
 def default_temp_roots() -> list[Path]:
     """Where scratch files may live; ``tmp`` scope is confined to these."""
-    return [Path(tempfile.gettempdir()), Path("/tmp"), Path(tempfile.gettempdir()) / f"claude-{os.getuid()}"]
+    return [Path(tempfile.gettempdir()), Path("/tmp"), scratch_root()]
+
+
+def default_temp_worktree_parents() -> list[Path]:
+    """Directories whose ``wt-*`` children are agent worktrees (autospec uses ``/tmp/wt-<branch>``)."""
+    return [Path("/tmp")]
 
 
 def user_config_path(home: Path | None = None) -> Path:
@@ -58,16 +80,21 @@ def user_config_path(home: Path | None = None) -> Path:
 
 
 def user_disk_hygiene_config(home: Path | None = None) -> dict[str, Any]:
-    """``disk_hygiene`` from the user-level config file only (repo-local config is untrusted)."""
+    """``disk_hygiene`` from the user-level config file only (repo-local config is untrusted).
+
+    An unreadable file raises ``Refusal('config_unreadable')``: destructive jobs fail CLOSED
+    instead of reading a broken opt-out as "enabled"."""
     path = user_config_path(home)
     if not path.is_file():
         return {}
     try:
         from .config import load_config
         section = load_config([path]).get("disk_hygiene") or {}
-    except Exception:  # noqa: BLE001 - a broken config must not widen or break the command
-        return {}
-    return section if isinstance(section, dict) else {}
+    except Exception as exc:  # noqa: BLE001 - any failure to read the user's opt-outs
+        raise Refusal("config_unreadable", f"{path} cannot be read ({exc}); fix it first") from exc
+    if not isinstance(section, dict):
+        raise Refusal("config_unreadable", f"{path}: disk_hygiene must be a mapping")
+    return section
 
 
 def configured_roots(extra: list[str] | None = None, home: Path | None = None) -> list[Path]:
@@ -78,63 +105,88 @@ def configured_roots(extra: list[str] | None = None, home: Path | None = None) -
     return roots
 
 
-def _git(cwd: Path, *args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+def _git(cwd: Path, *args: str, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
-                          timeout=timeout, check=False)
+                          timeout=GIT_TIMEOUT if timeout is None else timeout, check=False)
 
 
-def checked_path(path: Path | str, roots: list[Path]) -> Path:
-    """Return the absolute path, or raise ``Refusal``. Never follows a symlink."""
+def _bases(paths: list[Path]) -> list[Path]:
+    """Each path as spelled and canonicalised (macOS ``/tmp`` is ``/private/tmp``)."""
+    found: list[Path] = []
+    for p in paths:
+        for base in (Path(os.path.abspath(p)), Path(os.path.realpath(p))):
+            if base not in found:
+                found.append(base)
+    return found
+
+
+def _verified(target: Path, base: Path) -> Path:
+    current = base
+    for part in target.relative_to(base).parts:
+        current = current / part
+        if current.is_symlink():
+            raise Refusal("symlink", f"{current} is a symlink; refusing to follow it")
+    try:
+        owner = target.lstat().st_uid
+    except FileNotFoundError:
+        raise Refusal("not_found", f"{target} does not exist") from None
+    if owner != os.getuid():
+        raise Refusal("not_owned", f"{target} is not owned by uid {os.getuid()}")
+    return target
+
+
+def checked_path(path: Path | str, roots: list[Path],
+                 temp_worktree_parents: list[Path] | None = None) -> Path:
+    """Return the absolute path, or raise ``Refusal``. Never follows a symlink.
+
+    ``temp_worktree_parents``: ``<parent>/wt-*`` children are acceptable too (worktree scope)."""
     raw = Path(path).expanduser()
     if ".." in raw.parts:
         raise Refusal("outside_roots", f"{raw}: '..' is not allowed")
     if not raw.is_absolute():
         raw = Path.cwd() / raw
     target = Path(os.path.abspath(raw))
-    for root in roots:
-        base = Path(os.path.abspath(root))
-        if target == base:
-            raise Refusal("is_root", f"{target} is a configured root, not removable")
-        if not target.is_relative_to(base):
-            continue
-        current = base
-        for part in target.relative_to(base).parts:
-            current = current / part
-            if current.is_symlink():
-                raise Refusal("symlink", f"{current} is a symlink; refusing to follow it")
-        try:
-            owner = target.lstat().st_uid
-        except FileNotFoundError:
-            raise Refusal("not_found", f"{target} does not exist") from None
-        if owner != os.getuid():
-            raise Refusal("not_owned", f"{target} is not owned by uid {os.getuid()}")
-        return target
+    canonical = Path(os.path.realpath(target.parent)) / target.name  # symlinks above the roots
+    for candidate in dict.fromkeys((target, canonical)):
+        for base in _bases(roots):
+            if candidate == base:
+                raise Refusal("is_root", f"{candidate} is a configured root, not removable")
+            if candidate.is_relative_to(base):
+                return _verified(candidate, base)
+        for parent in _bases(temp_worktree_parents or []):
+            if candidate.parent == parent and candidate.name.startswith(TEMP_WORKTREE_PREFIX):
+                return _verified(candidate, parent)
     raise Refusal("outside_roots", f"{target} is outside the agent-owned roots")
 
 
-def busy_paths(timeout: float = 60) -> list[Path]:
-    """Working directories / executables / open files of this user's processes. Fails CLOSED:
-    any inspection failure or timeout raises ``Refusal('in_use')``."""
-    if Path("/proc").is_dir():
-        from .build_cleanup import _process_paths
-        try:
-            return _process_paths()
-        except OSError as exc:
-            raise Refusal("in_use", f"cannot verify running processes: {exc}") from exc
+def _ancestors() -> frozenset[int]:
+    """This process's ancestors. The shell that ran ``cd / && herdr-eng cleanup --path X`` names X
+    in its own command line; that is the caller, not a user of X."""
+    found: set[int] = set()
+    pid = os.getppid()
+    while pid > 1 and pid not in found and len(found) < 64:
+        found.add(pid)
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=15, check=False).stdout.strip()
+        pid = int(out) if out.isdigit() else 0
+    return frozenset(found)
+
+
+def in_use_snapshot() -> Snapshot:
+    """The ``scratch_safety`` process snapshot (open files, cwds, argv). Fails CLOSED: any
+    inspection failure raises ``Refusal('in_use')``."""
+    from .scratch_safety import InspectionUnavailable, process_snapshot
     try:
-        out = subprocess.run(["lsof", "-nP", "-u", str(os.getuid()), "-Fn"],
-                             capture_output=True, text=True, timeout=timeout, check=False).stdout
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise Refusal("in_use", f"cannot verify running processes (lsof): {exc}") from exc
-    paths = [Path(line[1:]) for line in out.splitlines() if line.startswith("n/")]
-    if not paths:
-        raise Refusal("in_use", "cannot verify running processes: lsof returned nothing")
-    return paths
+        return process_snapshot(_ancestors())
+    except (InspectionUnavailable, OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise Refusal("in_use", f"cannot verify running processes: {exc}") from exc
 
 
-def _not_in_use(path: Path, busy: list[Path] | None = None) -> None:
-    real = path.resolve()
-    if any(p == real or p.is_relative_to(real) for p in (busy_paths() if busy is None else busy)):
+def _not_in_use(path: Path, snapshot: Snapshot | Refusal | None = None) -> None:
+    if isinstance(snapshot, Refusal):
+        raise snapshot
+    snap = snapshot or in_use_snapshot()
+    if any(snap.uses(p) for p in dict.fromkeys((path, Path(os.path.realpath(path))))):
         raise Refusal("in_use", f"a running process is using {path}")
 
 
@@ -186,24 +238,31 @@ def worktree_facts(path: Path) -> dict[str, Any]:
         raise Refusal("not_a_worktree", f"{path} is not a git worktree root (not a git worktree)")
     gitdir = _git(path, "rev-parse", "--absolute-git-dir").stdout.strip()
     common = _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    if not gitdir or not common:
+        raise Refusal("not_a_worktree", f"{path}: git did not report its directories")
     if Path(gitdir).resolve() == Path(common).resolve():
         raise Refusal("main_checkout", f"{path} is a repo main checkout; refusing")
     branch = _git(path, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
-    main = Path(common).resolve().parent
-    return {"branch": branch, "common": common, "main": main,
+    return {"branch": branch, "common": common,
             "head": _git(path, "rev-parse", "HEAD").stdout.strip()}
 
 
-REBUILDABLE = ("target", "node_modules", ".venv", "__pycache__")
+REBUILDABLE = ("target", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache",
+               ".ruff_cache", ".mypy_cache", ".tox", ".nox", "*.egg-info", "dist", "build",
+               "coverage", ".coverage", "htmlcov", ".gradle", ".next", ".turbo", ".cache")
 
 
 def is_dirty(path: Path) -> bool:
-    status = _git(path, "status", "--porcelain")
+    status = _git(path, "status", "--porcelain", "--untracked-files=all")
     return status.returncode != 0 or bool(status.stdout.strip())
 
 
 def foreign_ignored(path: Path, rebuildable: tuple[str, ...] = REBUILDABLE) -> list[str]:
-    """Ignored-but-present entries that are not well-known rebuildable output (``.env``, DBs...)."""
+    """Ignored-but-present entries that are not well-known rebuildable output (``.env``, DBs...).
+
+    Git collapses a wholly ignored directory to one entry, so the last component is the thing
+    that is ignored; only that name is matched against the (glob) rebuildable list."""
+    from fnmatch import fnmatchcase
     status = _git(path, "status", "--porcelain", "--ignored")
     if status.returncode != 0:
         return ["<unknown>"]
@@ -211,7 +270,7 @@ def foreign_ignored(path: Path, rebuildable: tuple[str, ...] = REBUILDABLE) -> l
     for line in status.stdout.splitlines():
         if line.startswith("!! "):
             entry = line[3:].rstrip("/")
-            if not any(part in rebuildable for part in entry.split("/")):
+            if not any(fnmatchcase(entry.rsplit("/", 1)[-1], pattern) for pattern in rebuildable):
                 found.append(entry)
     return found
 
@@ -236,10 +295,14 @@ def patch_merged(path: Path) -> bool:
 
 
 def check_worktree_removable(path: Path, *, merged_ok: bool,
-                             busy: list[Path] | None = None) -> dict[str, Any]:
+                             snapshot: Snapshot | Refusal | None = None) -> dict[str, Any]:
+    from .scratch_safety import hidden_index_reason
     facts = worktree_facts(path)
     if is_dirty(path):
         raise Refusal("dirty", f"{path} has uncommitted or untracked changes")
+    if reason := hidden_index_reason(path):
+        raise Refusal("hidden_index_state",
+                      f"{path} has skip-worktree/assume-unchanged entries whose edits git hides ({reason})")
     extra = tuple(user_disk_hygiene_config().get("rebuildable", []) or [])
     if ignored := foreign_ignored(path, (*REBUILDABLE, *extra)):
         raise Refusal("ignored_files",
@@ -247,25 +310,26 @@ def check_worktree_removable(path: Path, *, merged_ok: bool,
     if unpushed(path):
         merged = False
         if merged_ok:
-            pr = gh_pr_state(facts["main"], facts["branch"], facts["head"],
-                             _origin_owner(facts["main"]))
+            pr = gh_pr_state(path, facts["branch"], facts["head"], _origin_owner(path))
             merged = patch_merged(path) or bool(pr and pr["state"] in ("MERGED", "CLOSED")
                                                 and pr["head"] == facts["head"])
         if not merged:
             raise Refusal("unpushed_commits",
                           f"{path} has commits that are on no remote and not merged (unpushed)")
-    _not_in_use(path, busy)
+    _not_in_use(path, snapshot)
     return facts
 
 
 def remove_worktree(path: Path, *, dry_run: bool, merged_ok: bool,
-                    busy: list[Path] | None = None) -> dict[str, Any]:
-    facts = check_worktree_removable(path, merged_ok=merged_ok, busy=busy)
+                    snapshot: Snapshot | Refusal | None = None) -> dict[str, Any]:
+    facts = check_worktree_removable(path, merged_ok=merged_ok, snapshot=snapshot)
     if not dry_run:
-        done = _git(facts["main"], "worktree", "remove", str(path), timeout=600)
+        # --git-dir=<common dir> works for normal, bare and separate-git-dir repositories alike,
+        # and `worktree remove` drops its own registration: no repo-wide `worktree prune`.
+        done = subprocess.run(["git", f"--git-dir={facts['common']}", "worktree", "remove", str(path)],
+                              capture_output=True, text=True, timeout=600, check=False)
         if done.returncode != 0:
             raise Refusal("git_refused", done.stderr.strip() or "git worktree remove failed")
-        _git(facts["main"], "worktree", "prune")
     return {"branch": facts["branch"]}
 
 
@@ -293,27 +357,58 @@ def _rmtree(path: Path) -> None:
         path.unlink()
 
 
-_GIT_WALK_CAP = 200_000
+_UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+_LIVE_SECONDS = 3600
 
 
-def _refuse_git(path: Path, stop: list[Path]) -> None:
-    """``tmp`` never deletes a repo/worktree, or something inside or containing one."""
-    for parent in (path, *path.parents):
-        if any(parent == s for s in stop):
-            break
-        if (parent / ".git").exists() or (parent / ".git").is_symlink():
-            raise Refusal("git_repository", f"{path} is or is inside a git repository; use --scope worktree")
-    seen = 0
-    for _, dirs, files in os.walk(path, followlinks=False):
-        seen += len(dirs) + len(files)
-        if ".git" in dirs or ".git" in files:
-            raise Refusal("git_repository", f"{path} contains a git repository; use --scope worktree")
-        if seen > _GIT_WALK_CAP:
-            raise Refusal("too_large", f"{path} is too large to verify it holds no git repository")
+def _refuse_git(path: Path) -> None:
+    """``tmp`` never deletes a repo (normal, bare, separate git dir), a worktree, something
+    inside one, or a directory containing one. Detection is by content, via git and
+    ``scratch_safety.inspect_tree``."""
+    from .scratch_safety import git as safe_git
+    from .scratch_safety import inspect_tree
+    is_dir = path.is_dir() and not path.is_symlink()
+    probe = safe_git(path if is_dir else path.parent, "rev-parse", "--git-dir")
+    if probe.returncode == 0:
+        raise Refusal("git_repository", f"{path} is or is inside a git repository; use --scope worktree")
+    if probe.returncode != 128 or "not a git repository" not in probe.stderr:
+        raise Refusal("git_repository", f"{path}: cannot verify it is outside a git repository")
+    if not is_dir:
+        return
+    try:
+        info = inspect_tree(path, accounting_only=True)
+    except OSError as exc:
+        raise Refusal("unverifiable", f"{path} cannot be inspected for repositories: {exc}") from exc
+    if info.repositories:
+        raise Refusal("git_repository", f"{path} contains a git repository; use --scope worktree")
+    if info.keep:
+        raise Refusal("keep_marker", f"{path} contains a .keep marker")
 
 
-def _remove_tmp(path: Path, *, dry_run: bool, temp_roots: list[Path]) -> dict[str, Any]:
-    _refuse_git(path, temp_roots)
+def _guard_scratch(path: Path, scratch: Path, live_roots: list[Path]) -> None:
+    """Under Claude's scratch root only strictly inside a ``<session>`` dir, never the root, a
+    ``<project>`` dir or the session dir itself; ``scratch_reaper``'s liveness and ``.keep``
+    protections apply."""
+    from .scratch_reaper import _live_ids
+    from .scratch_safety import keep_ancestor
+    for base in _bases([scratch]):
+        if path != base and not path.is_relative_to(base):
+            continue
+        parts = path.relative_to(base).parts
+        index = 0 if parts and _UUID.fullmatch(parts[0]) else 1 if len(parts) > 1 and _UUID.fullmatch(parts[1]) else None
+        if index is None or len(parts) <= index + 1:
+            raise Refusal("scratch_structure",
+                          f"{path} is the scratch root, a project or a session directory; only paths inside a session are removable")
+        if keep_ancestor(path, base):
+            raise Refusal("keep_marker", f"{path} is under a .keep marker")
+        if parts[index] in _live_ids(live_roots, time.time() - _LIVE_SECONDS):
+            raise Refusal("live_session", f"session {parts[index]} is still live")
+        return
+
+
+def _remove_tmp(path: Path, *, dry_run: bool, scratch: Path, live_roots: list[Path]) -> dict[str, Any]:
+    _guard_scratch(path, scratch, live_roots)
+    _refuse_git(path)
     _not_in_use(path)
     if not dry_run:
         _rmtree(path)
@@ -327,8 +422,26 @@ def _remove_docker(name: str, *, dry_run: bool) -> dict[str, Any]:
 
 def cleanup(scope: str, path: Path | str | None, *, roots: list[Path], dry_run: bool = False,
             merged_ok: bool = False, state_dir: Path | None = None,
-            temp_roots: list[Path] | None = None) -> dict[str, Any]:
-    """Remove one thing; returns a report dict or raises ``Refusal``."""
+            temp_roots: list[Path] | None = None,
+            temp_worktree_parents: list[Path] | None = None,
+            scratch_root: Path | None = None,
+            live_roots: list[Path] | None = None) -> dict[str, Any]:
+    """Remove one thing; returns a report dict or raises ``Refusal`` (never a raw timeout/OSError)."""
+    try:
+        return _cleanup(scope, path, roots=roots, dry_run=dry_run, merged_ok=merged_ok,
+                        state_dir=state_dir, temp_roots=temp_roots,
+                        temp_worktree_parents=temp_worktree_parents, scratch=scratch_root,
+                        live_roots=live_roots)
+    except subprocess.TimeoutExpired as exc:
+        raise Refusal("timeout", f"{' '.join(map(str, exc.cmd))[:120]} timed out; nothing more was done") from exc
+    except OSError as exc:
+        raise Refusal("error", f"{exc}") from exc
+
+
+def _cleanup(scope: str, path: Path | str | None, *, roots: list[Path], dry_run: bool,
+             merged_ok: bool, state_dir: Path | None, temp_roots: list[Path] | None,
+             temp_worktree_parents: list[Path] | None, scratch: Path | None,
+             live_roots: list[Path] | None) -> dict[str, Any]:
     if scope not in SCOPES:
         raise Refusal("bad_scope", f"scope must be one of {', '.join(SCOPES)}")
     if scope == "docker":
@@ -340,13 +453,18 @@ def cleanup(scope: str, path: Path | str | None, *, roots: list[Path], dry_run: 
     if not path:
         raise Refusal("missing_path", f"{scope} scope needs --path")
     temp = default_temp_roots() if temp_roots is None else temp_roots
-    target = checked_path(path, temp if scope == "tmp" else roots)
+    parents = default_temp_worktree_parents() if temp_worktree_parents is None else temp_worktree_parents
+    target = checked_path(path, temp if scope == "tmp" else roots,
+                          parents if scope == "worktree" else None)
     if scope == "worktree":
         extra = remove_worktree(target, dry_run=dry_run, merged_ok=merged_ok)
     elif scope == "target":
         extra = _remove_target(target, dry_run=dry_run, state_dir=state_dir)
     else:
-        extra = _remove_tmp(target, dry_run=dry_run, temp_roots=temp)
+        from .scratch_reaper import default_live_roots
+        extra = _remove_tmp(target, dry_run=dry_run,
+                            scratch=scratch_root() if scratch is None else scratch,
+                            live_roots=default_live_roots() if live_roots is None else live_roots)
     return {"scope": scope, "path": str(target), "dry_run": dry_run,
             "action": "would_remove" if dry_run else "removed", **extra}
 
