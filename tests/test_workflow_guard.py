@@ -390,3 +390,92 @@ def test_untokenizable_herdr_engineering_push_asks(tmp_path):
 def test_untokenizable_non_push_and_feature_push_allowed(feature):
     assert decision(bash("echo 'unterminated", feature)) is None
     assert decision(bash("git push origin feat/x 'unterminated", feature)) is None
+
+
+# ---- cd tracking, wrappers and shell keywords -------------------------------------------
+def test_cd_then_push_uses_the_cd_dir(on_main, feature, tmp_path):
+    assert decision(bash(f"cd {on_main} && git push", feature)) == "deny"
+    assert decision(bash(f"cd {on_main} && git push -u origin HEAD", tmp_path)) == "deny"
+    assert decision(bash(f"cd {on_main}; git push origin", feature)) == "deny"
+    assert decision(bash(f"cd {on_main}\ngit push", feature)) == "deny"
+    assert decision(bash(f"cd {feature} && git push", on_main)) is None
+    assert decision(bash(f"cd {feature} && git push -u origin HEAD", on_main)) is None
+
+
+def test_relative_cd_resolves_against_session_cwd(on_main, tmp_path):
+    assert decision(bash("cd mainrepo && git push -u origin HEAD", tmp_path)) == "deny"
+    other = make_repo(tmp_path / "feat2", "feat/q")
+    assert decision(bash("cd ../mainrepo && git push", other)) == "deny"
+
+
+def test_cd_chain_and_dash_c_override(on_main, feature, tmp_path):
+    assert decision(bash(f"cd {tmp_path} && cd mainrepo && git push", feature)) == "deny"
+    assert decision(bash(f"cd {on_main} && git -C {feature} push", feature)) is None
+    assert decision(bash(f"cd {feature} && git -C {on_main} push", feature)) == "deny"
+
+
+def test_cd_to_herdr_engineering_repo_asks(tmp_path, feature):
+    repo = make_repo(tmp_path / "he", "feat/z", origin="git@github.com:b/herdr-engineering.git")
+    assert decision(bash(f"cd {repo} && git push origin feat/z", feature)) == "ask"
+
+
+def test_unknown_cd_target_makes_bare_and_head_pushes_ask(feature, tmp_path):
+    for cd in ("cd /no/such/dir", "cd -", "cd $SOMEWHERE"):
+        assert decision(bash(f"{cd} && git push", feature)) == "ask"
+        assert decision(bash(f"{cd} && git push -u origin HEAD", feature)) == "ask"
+        assert decision(bash(f"{cd} && git push origin main", feature)) == "deny"
+        assert decision(bash(f"{cd} && git push origin feat/x", feature)) is None
+
+
+def test_tilde_cd_is_expanded(feature):
+    # ~ expands to the real home, which is not a main-branch repo checkout we control: just
+    # require that it resolves (no "unknown cwd" ask) for an explicit feature refspec.
+    assert decision(bash("cd ~ && git push origin feat/x", feature)) is None
+
+
+def test_subshell_cd_does_not_leak(on_main, feature):
+    assert decision(bash(f"(cd {on_main} && git status); git push", feature)) is None
+    assert decision(bash(f"(cd {feature} && git status); git push", on_main)) == "deny"
+
+
+WRAPPED_MAIN = [
+    "(cd {r} && git push origin main)", "( git push origin main )", "(git push origin main)",
+    "if true; then git push origin main; fi", "if true\nthen\n  git push origin main\nfi",
+    "while false; do git push origin main; done", "! git push origin main",
+    "env GIT_X=1 git push origin main", "env -i GIT_X=1 git push origin main",
+    "GIT_X=1 git push origin main", "A=1 B=2 git push origin main", "time git push origin main",
+    "bash -c 'git push origin main'", "sh -c \"git push origin main\"", "zsh -c 'cd {r} && git push'",
+    "{ git push origin main; }", "{ git push origin main;}", "command git push origin main",
+    "exec git push origin main", "nohup git push origin main", "sudo git push origin main",
+    "sudo -u bob git push origin main", "echo $(git push origin main)", "bash -c 'bash -c \"git push origin main\"'",
+    "true && (git push origin main)", "git status || { git push origin main; }",
+]
+
+
+@pytest.mark.parametrize("cmd", WRAPPED_MAIN)
+def test_wrapped_push_to_main_denied(cmd, on_main, feature):
+    assert decision(bash(cmd.replace("{r}", str(on_main)), feature)) == "deny"
+
+
+WRAPPED_FEATURE = [
+    "(git push origin feat/x)", "if true; then git push origin feat/x; fi", "env A=1 git push origin feat/x",
+    "A=1 git push -u origin HEAD", "time git push origin feat/x", "bash -c 'git push -u origin HEAD'",
+    "{ git push origin feat/x; }", "nohup git push origin feat/x", "sudo git push origin feat/x",
+    "(cd {r} && git push)", "bash -c 'echo hi'",
+]
+
+
+@pytest.mark.parametrize("cmd", WRAPPED_FEATURE)
+def test_wrapped_feature_push_allowed(cmd, feature):
+    assert decision(bash(cmd.replace("{r}", str(feature)), feature)) is None
+
+
+def test_bash_c_bare_push_on_main_denied_and_uses_effective_cwd(on_main, feature):
+    assert decision(bash("bash -c 'git push'", on_main)) == "deny"
+    assert decision(bash(f"cd {on_main} && bash -c 'git push'", feature)) == "deny"
+
+
+def test_wrapped_herdr_engineering_push_asks(tmp_path):
+    repo = make_repo(tmp_path / "he", "feat/z", origin="git@github.com:b/herdr-engineering.git")
+    assert decision(bash("(env A=1 git push origin feat/z)", repo)) == "ask"
+    assert decision(bash("bash -c 'git push origin feat/z'", repo)) == "ask"

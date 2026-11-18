@@ -27,6 +27,8 @@ TMP_REASON = ("Writing scratch files under /tmp is not allowed. Use a gitignored
               "/tmp/claude-<id>/ is the only exception).")
 MAIN_REASON = "Pushing to main/master is blocked. Push a feature branch and open a PR instead."
 HERDR_REASON = "pushing herdr-engineering needs explicit user approval"
+UNKNOWN_REASON = ("Cannot tell which repository or branch this push targets (unresolved cd). "
+                  "Confirm it does not push to main/master.")
 
 
 def _norm(path: str, cwd: str) -> str:
@@ -50,7 +52,7 @@ _REDIR_BARE = re.compile(r"^\d*(?:>>?|<<<?|<)$")
 
 
 def _tokenize(line: str) -> list[list[str]]:
-    lex = shlex.shlex(line, posix=True, punctuation_chars=";&|\n")
+    lex = shlex.shlex(line, posix=True, punctuation_chars=";&|\n(){}")
     lex.whitespace_split = True
     lex.whitespace = " \t\r"  # an unquoted newline is a command separator
     lex.commenters = ""
@@ -63,8 +65,9 @@ def _tokenize(line: str) -> list[list[str]]:
         i += 1
         if tok == "&" and _REDIR.match(nxt):
             continue  # the "&" of "&>file"; the redirect itself is dropped next
-        if tok in _SEPARATORS or (tok and set(tok) <= set(";&|\n")):
-            cmds.append([])
+        if tok and set(tok) <= set(";&|\n(){}"):
+            for ch in tok:  # runs like ");" merge into one token; "()" are subshell scope markers
+                cmds += [[ch], []] if ch in "()" else [[]]
         elif _REDIR_BARE.match(tok):
             if i < len(toks) and toks[i] == "&":  # "2>&1": shlex splits it into "2>", "&", "1"
                 i += 1
@@ -184,33 +187,99 @@ def _targets_protected(refspec: str, current: str | None) -> bool:
     return dst.removeprefix("refs/heads/") in _PROTECTED
 
 
-def _check_push(workdir: str | None, pos: list[str], cwd: str) -> Decision | None:
-    repo = _norm(workdir, cwd) if workdir else cwd
+def _check_push(workdir: str | None, pos: list[str], cwd: str | None) -> Decision | None:
+    if workdir:
+        repo = _norm(workdir, cwd) if cwd or os.path.isabs(workdir) else None
+    else:
+        repo = cwd
     refspecs = pos[1:]  # pos[0] is the remote
-    branch = _git(repo, "symbolic-ref", "--short", "-q", "HEAD")
+    branch = _git(repo, "symbolic-ref", "--short", "-q", "HEAD") if repo else None
     if any(_targets_protected(r, branch) for r in refspecs) or (not refspecs and branch in _PROTECTED):
         return "deny", MAIN_REASON
+    if repo is None:
+        if not refspecs or any(r.lstrip("+") in ("HEAD", "@") for r in refspecs):
+            return "ask", UNKNOWN_REASON
+        return None
     url = _git(repo, "remote", "get-url", "origin")
     if url and "herdr-engineering" in url:
         return "ask", HERDR_REASON
     return None
 
 
-def check_bash(command: str, cwd: str) -> Decision | None:
-    try:
-        argvs = _split_commands(command)
-    except ValueError:
-        return _fallback(command, cwd)
+_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "time", "command", "exec",
+             "nohup", "sudo", "env"}
+_ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
+_SHELLS = {"bash", "sh", "zsh"}
+_MAX_DEPTH = 3
+
+
+def _strip_prefix(argv: list[str]) -> list[str]:
+    """Drop leading keywords, ``VAR=val`` assignments and ``env``/``sudo``-style wrappers."""
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in _KEYWORDS:
+            i += 1
+            if a == "sudo" and i < len(argv) and argv[i] in ("-u", "-g"):
+                i += 2
+            while a in ("env", "sudo", "nohup") and i < len(argv) and argv[i].startswith("-"):
+                i += 1
+        elif _ASSIGN.match(a):
+            i += 1
+        else:
+            break
+    return argv[i:]
+
+
+def _cd(argv: list[str], cwd: str | None) -> str | None:
+    args = [a for a in argv[1:] if not a.startswith("-") or a == "-"]
+    target = args[0] if args else "~"
+    if target == "-":
+        return None
+    path = os.path.expanduser(target)
+    if not os.path.isabs(path):
+        if cwd is None:
+            return None
+        path = os.path.join(cwd, path)
+    path = os.path.normpath(path)
+    return path if os.path.isdir(path) else None
+
+
+def _guard_argvs(argvs: list[list[str]], cwd: str | None, depth: int) -> Decision | None:
     result: Decision | None = None
-    for argv in argvs:
-        parsed = _parse_push(argv)
-        if parsed is None:
+    stack: list[str | None] = []
+    for raw in argvs:
+        if raw == ["("]:
+            stack.append(cwd)
             continue
-        d = _check_push(parsed[0], parsed[1], cwd)
+        if raw == [")"]:
+            cwd = stack.pop() if stack else cwd
+            continue
+        argv = _strip_prefix(raw)
+        if not argv:
+            continue
+        name = os.path.basename(argv[0])
+        d: Decision | None = None
+        if name == "cd":
+            cwd = _cd(argv, cwd)
+        elif name in _SHELLS and "-c" in argv[:-1] and depth < _MAX_DEPTH:
+            d = check_bash(argv[argv.index("-c") + 1], cwd, depth + 1)
+        else:
+            parsed = _parse_push(argv)
+            if parsed is not None:
+                d = _check_push(parsed[0], parsed[1], cwd)
         if d and d[0] == "deny":
             return d
         result = result or d
     return result
+
+
+def check_bash(command: str, cwd: str | None, depth: int = 0) -> Decision | None:
+    try:
+        argvs = _split_commands(command)
+    except ValueError:
+        return _fallback(command, cwd or os.getcwd())
+    return _guard_argvs(argvs, cwd, depth)
 
 
 def decide(payload: object) -> Decision | None:
