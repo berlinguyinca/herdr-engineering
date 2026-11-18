@@ -137,6 +137,22 @@ def _override(ctx: Context, name: str) -> list[str] | None:
     return shlex.split(value) if value is not None else None
 
 
+def _resolve_binary(ctx: Context, name: str, stable_rel: tuple[str, ...]) -> str:
+    """The host's launcher for `name`: PATH (the ctx env), then the stable install location, then the bare name.
+
+    Service units and non-interactive ssh shells do not put the launcher's directory on PATH (the autospec
+    runtime keeps it in ~/.autospec/bin, pi in ~/.local/bin), so a bare name is not found there; the stable
+    path keeps the check working without a PATH entry. The bare name is the last resort so a truly missing
+    launcher still fails closed with a useful log line instead of a silent pass."""
+    found = shutil.which(name, path=ctx.env.get("PATH"))
+    if found:
+        return found
+    stable = ctx.home.joinpath(*stable_rel)
+    if stable.is_file() and os.access(stable, os.X_OK):
+        return str(stable)
+    return name
+
+
 # --------------------------------------------------------------------------- D6 gate
 
 #: The owner is pinned: every deployment checkout in the fleet is a clone of github.com/berlinguyinca/<repo>, in the https,
@@ -419,7 +435,9 @@ class Autospec:
                                   "--repo-dir", str(root)], cwd=root)
 
     def checks(self, ctx: Context) -> list[dict]:
-        smoke = _override(ctx, "AUTOSPEC_SMOKE") or ["autospec", "--version"]
+        # `doctor`, not `--version`: the autospec CLI has no --version flag (it exits 2), so the smoke could
+        # never pass; `doctor` is read-only, fast, and exits 0 on a working installation.
+        smoke = _override(ctx, "AUTOSPEC_SMOKE") or [_resolve_binary(ctx, "autospec", (".autospec", "bin", "autospec")), "doctor"]
         return [_check("generation_receipt", self.installed(ctx) == ctx.sha
                        or (self.past_target(ctx) and self.installed_past_target(ctx))),
                 _timed("version_smoke", lambda: _run(ctx, smoke, timeout=60)[0] == 0)]
@@ -504,7 +522,7 @@ class Pi:
         self.prune(ctx, {before} if before else set())
 
     def checks(self, ctx: Context) -> list[dict]:
-        smoke = _override(ctx, "PI_SMOKE") or ["pi", "--version"]
+        smoke = _override(ctx, "PI_SMOKE") or [_resolve_binary(ctx, "pi", (".local", "bin", "pi")), "--version"]
         return [_check("release_complete", self.complete(ctx, ctx.sha)),
                 _check("current_symlink", self.installed(ctx) == ctx.sha),
                 _timed("version_smoke", lambda: _run(ctx, smoke, timeout=60)[0] == 0)]

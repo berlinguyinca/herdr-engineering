@@ -19,6 +19,8 @@ The unit runs the installed `~/.local/bin/herdr-eng fleet-watch loop` from `/`, 
 
 Prerequisites on beast: the service has no interactive session, so it relies on stored `gh`/git credentials and on unencrypted ssh keys (there is no `SSH_AUTH_SOCK`).
 
+Prerequisites on EVERY host (the herdr-engineering row): the host's DEPLOYMENT checkout (a dedicated clone of `herdr-engineering`, separate from any development checkout) plus the one-line pointer file `~/.config/herdr-engineering/deployment-checkout` (an absolute path; a non-interactive ssh shell has no profile environment). `ansible/tasks/fleet-deployment-checkout.yml` (fleet-sync, before the watcher unit) keeps both in place; the path is overridable per host in host_vars via `fleet_deployment_checkout:`. The 2026-11-17 first rollout hit this missing prerequisite on all three hosts (masked by the earlier autospec-row halt).
+
 Exit statuses 2 (refused) and 3 (busy) are not restarted by systemd (`RestartPreventExitStatus=2 3`); the unit also `Wants=` the network. A playbook re-run does not restart a healthy watcher unless the unit or drop-in changed.
 
 ## Disable
@@ -32,7 +34,26 @@ Set the variables back to false and re-run the playbook (stops, disables, remove
 - One loop at a time: flock on `~/.local/state/herdr-fleet-watch/loop.lock` (a second loop exits 3). A pass also takes the per-pass `lock`.
 - Soft limit (default 3600 s): one pass running that long only logs a warning.
 - Hard limit (default 5400 s): the loop exits 70 only after NO progress (no write to state, outbox, logs) for that long; progress resets it. systemd restarts it and the durable rollout resumes. A long healthy rollout is never killed.
-- A failed pass logs only the exception class and the loop continues. SIGTERM stops it cleanly.
+- Exit statuses: 2 (refused) and 3 (busy) are not restarted (see above); 70 (hard limit) and 75 (self-restart requested, D12) are restarted by `Restart=on-failure`.
+
+## Self-update: the watcher runs the build it just shipped (D12)
+
+When a rollout **succeeded** and it updated the watcher's own herdr-engineering install (checkout
+fast-forwarded, new build installed, receipt written), the loop exits with status **75** after the pass
+line `pass N: succeeded (watcher self-restart requested)`. The unit's existing `Restart=on-failure`
+(75 is not in `RestartPreventExitStatus=2 3`, `RestartSec=30`) then restarts the service, and the fresh
+main process is the newly installed build. The restart comes from systemd itself: no detached `systemctl`
+child is spawned (the unit's cgroup cleanup would kill it before it queued its job), and exit 0 would not
+restart the unit at all.
+
+It never requests a restart for a `halted`/`running` rollout, for a rollout that left this host's install
+unchanged (`no_change`/`skipped`), in plan-only mode, or when the process is not running under the unit
+(dev runs and tests, detected via `/proc/self/cgroup` - a note is logged and the loop keeps running the
+old build; restart by hand to pick up the new one). `HERDR_FLEET_WATCH_RESTART_CMD` runs an injectable
+command for tests and dev; the loop still exits 75.
+
+In the journal, a self-restart looks like `Main process exited, code=exited, status=75/EX_TEMPFAIL`
+followed by the unit starting again ~30 s later.
 
 ## Status
 
