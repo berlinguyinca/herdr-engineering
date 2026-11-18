@@ -565,5 +565,5 @@ def test_bash_home_forms_of_default_token_denied(tmp_path, monkeypatch):
 
 def test_unrelated_bash_and_writes_unaffected(tmp_path):
     assert decision(bash("ls", tmp_path)) is None
-    res = call({"tool_name": "Write", "tool_input": {"file_path": str(tmp_path / "x")}, "cwd": str(tmp_path)})
+    res = call({"tool_name": "Write", "tool_input": {"file_path": "/home/dev/proj/x"}, "cwd": "/home/dev/proj"})
     assert decision(res) is None
