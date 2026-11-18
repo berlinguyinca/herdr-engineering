@@ -203,13 +203,13 @@ To opt in, run:
 herdr-eng handoff auto install     # idempotent; also: uninstall | check [--dry-run] [--json]
 ```
 
-`install` appends one `UserPromptSubmit` entry carrying the marker `herdr-handoff-auto`
+`install` appends one `UserPromptSubmit` entry (plus the `SubagentStart` and `SubagentStop` entries described in the next section), each carrying the marker `herdr-handoff-auto`
 to `~/.claude/settings.json`, keeping every other hook and key, and writes atomically.
 An entry already present with that marker (even one you added by hand) is left as is
-(`unchanged`, or `preserved` if its command differs), so it never duplicates. If
+(`unchanged`, or `preserved` if its command differs), so it never duplicates; the result has one item per event, and a settings file that only has the older `UserPromptSubmit` entry gets the two new ones added. If
 `settings.json` is not valid JSON the command reports `refused` and does not touch the
 file. `uninstall` removes only hooks carrying the marker. `check` reports `ok` or
-`missing` (exit 1).
+`missing` per event (exit 1 if any of the three is missing).
 
 Manual alternative: add this to `~/.claude/settings.json` yourself:
 
@@ -225,6 +225,44 @@ Manual alternative: add this to `~/.claude/settings.json` yourself:
           }
         ]
       }
+    ]
+  }
+}
+```
+
+## Running-subagent registry
+
+`herdr-handoff takeover` must not close a pane that still has running subagents. To make that knowable,
+`herdr-eng handoff subagent-hook start|stop` is the body of the Claude Code `SubagentStart` / `SubagentStop`
+hooks. It reads the hook JSON from stdin (`agent_id`, `agent_type`) and keeps one file per running subagent:
+
+```
+$HERDR_ENGINEERING_STATE/subagents/<pane_id>/<agent_id>      # default state root: ~/.local/share/herdr-engineering/state
+{"agent_id": "...", "agent_type": "...", "started": <unix seconds>}
+```
+
+`<pane_id>` is `$HERDR_PANE_ID` of the hook process (the hook does nothing when it is unset). Both ids are
+sanitised to `[A-Za-z0-9_.:-]` (anything else becomes `_`), so a hostile id such as `../x` cannot leave the
+directory. `start` writes the file atomically; `stop` removes it (a missing file is fine). The hook always exits 0
+and prints nothing, even on garbage input or an unwritable state directory.
+
+Inspect the registry with `herdr-eng handoff subagents [--pane ID] [--json]` (default pane `$HERDR_PANE_ID`). It
+lists the live entries and deletes entries older than 6 hours (a subagent that never reported a stop) as stale. It
+always exits 0.
+
+`herdr-eng handoff auto install` installs these two hooks together with the `UserPromptSubmit` one. Manual
+alternative, merged into `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SubagentStart": [
+      {"hooks": [{"type": "command",
+        "command": "[ -x \"$HOME/.local/bin/herdr-eng\" ] && \"$HOME/.local/bin/herdr-eng\" handoff subagent-hook start || true # herdr-handoff-auto"}]}
+    ],
+    "SubagentStop": [
+      {"hooks": [{"type": "command",
+        "command": "[ -x \"$HOME/.local/bin/herdr-eng\" ] && \"$HOME/.local/bin/herdr-eng\" handoff subagent-hook stop || true # herdr-handoff-auto"}]}
     ]
   }
 }

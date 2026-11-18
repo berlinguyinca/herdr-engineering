@@ -1,4 +1,4 @@
-"""Install, remove and check the opt-in ``/handoff`` UserPromptSubmit hook in ``~/.claude/settings.json``.
+"""Install, remove and check the opt-in ``/handoff`` hooks (UserPromptSubmit, SubagentStart, SubagentStop) in ``~/.claude/settings.json``.
 
 Mirrors the join-hook installer in ``fabric_join_setup`` (same ``Item`` results, same atomic, format-preserving write), but ownership is
 decided by the command's trailing marker comment rather than a manifest, so a hand-added identical entry is recognised and never duplicated.
@@ -15,8 +15,13 @@ HOOK_MARKER = "herdr-handoff-auto"
 HOOK_EVENT = "UserPromptSubmit"
 HOOK_COMMAND = ('[ -x "$HOME/.local/bin/herdr-eng" ] && "$HOME/.local/bin/herdr-eng" handoff context-hook claude || true '
                 f"# {HOOK_MARKER}")
+_BIN = '[ -x "$HOME/.local/bin/herdr-eng" ] && "$HOME/.local/bin/herdr-eng"'
+START_COMMAND = f"{_BIN} handoff subagent-hook start || true # {HOOK_MARKER}"
+STOP_COMMAND = f"{_BIN} handoff subagent-hook stop || true # {HOOK_MARKER}"
+HOOKS: dict[str, str] = {HOOK_EVENT: HOOK_COMMAND, "SubagentStart": START_COMMAND, "SubagentStop": STOP_COMMAND}
 SETTINGS_REL = Path(".claude/settings.json")
-__all__ = ["FAIL_ACTIONS", "HOOK_COMMAND", "HOOK_EVENT", "HOOK_MARKER", "check", "install", "uninstall"]
+__all__ = ["FAIL_ACTIONS", "HOOKS", "HOOK_COMMAND", "HOOK_EVENT", "HOOK_MARKER", "START_COMMAND", "STOP_COMMAND", "check", "install",
+           "uninstall"]
 
 
 class _Unusable(Exception):
@@ -34,7 +39,7 @@ def _load(path: Path) -> tuple[dict, str]:
     except ValueError as exc:
         raise _Unusable("settings.json is not valid JSON; left untouched") from exc
     hooks = data.get("hooks", {}) if isinstance(data, dict) else None
-    if not isinstance(hooks, dict) or not isinstance(hooks.get(HOOK_EVENT, []), list):
+    if not isinstance(hooks, dict) or not all(isinstance(hooks.get(e, []), list) for e in HOOKS):
         raise _Unusable("settings.json has an unexpected shape; left untouched")
     return data, text
 
@@ -49,37 +54,25 @@ def _marked(command: str) -> bool:
     return command.rstrip().endswith(f"# {HOOK_MARKER}")
 
 
-def _present(data: dict) -> list[str]:
-    return [c for e in data.get("hooks", {}).get(HOOK_EVENT, []) for c in _commands(e) if _marked(c)]
+def _present(data: dict, event: str) -> list[str]:
+    return [c for e in data.get("hooks", {}).get(event, []) for c in _commands(e) if _marked(c)]
 
 
-def install(home: Path | None = None, *, dry_run: bool = False) -> Item:
-    path = _home(home) / SETTINGS_REL
-    try:
-        data, text = _load(path)
-    except _Unusable as exc:
-        return Item(str(path), "refused", str(exc))
-    found = _present(data)
+def _install_one(data: dict, event: str, command: str, target: str) -> tuple[Item, bool]:
+    found = _present(data, event)
     if found:
-        if HOOK_COMMAND in found:
-            return Item(str(path), "unchanged", f"{HOOK_EVENT} handoff hook already present")
-        return Item(str(path), "preserved", f"{HOOK_EVENT} handoff hook present with a different command; left as is")
-    data.setdefault("hooks", {}).setdefault(HOOK_EVENT, []).append({"hooks": [{"type": "command", "command": HOOK_COMMAND}]})
-    if not dry_run:
-        _save_settings(path, data, text)
-    return Item(str(path), "installed", f"{HOOK_EVENT} handoff hook")
+        if command in found:
+            return Item(target, "unchanged", f"{event} handoff hook already present"), False
+        return Item(target, "preserved", f"{event} handoff hook present with a different command; left as is"), False
+    data.setdefault("hooks", {}).setdefault(event, []).append({"hooks": [{"type": "command", "command": command}]})
+    return Item(target, "installed", f"{event} handoff hook"), True
 
 
-def uninstall(home: Path | None = None, *, dry_run: bool = False) -> Item:
-    path = _home(home) / SETTINGS_REL
-    try:
-        data, text = _load(path)
-    except _Unusable as exc:
-        return Item(str(path), "refused", str(exc))
-    if not _present(data):
-        return Item(str(path), "unchanged", f"no {HOOK_EVENT} handoff hook present")
+def _uninstall_one(data: dict, event: str, target: str) -> tuple[Item, bool]:
+    if not _present(data, event):
+        return Item(target, "unchanged", f"no {event} handoff hook present"), False
     kept: list = []
-    for entry in data["hooks"][HOOK_EVENT]:
+    for entry in data["hooks"][event]:
         if any(_marked(c) for c in _commands(entry)):
             rest = [h for h in entry["hooks"] if not (isinstance(h, dict) and isinstance(h.get("command"), str) and _marked(h["command"]))]
             if rest:
@@ -87,22 +80,44 @@ def uninstall(home: Path | None = None, *, dry_run: bool = False) -> Item:
         else:
             kept.append(entry)
     if kept:
-        data["hooks"][HOOK_EVENT] = kept
+        data["hooks"][event] = kept
     else:
-        del data["hooks"][HOOK_EVENT]
+        del data["hooks"][event]
         if not data["hooks"]:
             del data["hooks"]
-    if not dry_run:
+    return Item(target, "removed", f"{event} handoff hook"), True
+
+
+def install(home: Path | None = None, *, dry_run: bool = False) -> list[Item]:
+    """One Item per hook event, in HOOKS order; a single ``refused`` Item when settings.json is unusable."""
+    path = _home(home) / SETTINGS_REL
+    try:
+        data, text = _load(path)
+    except _Unusable as exc:
+        return [Item(str(path), "refused", str(exc))]
+    results = [_install_one(data, event, command, str(path)) for event, command in HOOKS.items()]
+    if any(changed for _, changed in results) and not dry_run:
         _save_settings(path, data, text)
-    return Item(str(path), "removed", f"{HOOK_EVENT} handoff hook")
+    return [item for item, _ in results]
 
 
-def check(home: Path | None = None) -> Item:
+def uninstall(home: Path | None = None, *, dry_run: bool = False) -> list[Item]:
+    path = _home(home) / SETTINGS_REL
+    try:
+        data, text = _load(path)
+    except _Unusable as exc:
+        return [Item(str(path), "refused", str(exc))]
+    results = [_uninstall_one(data, event, str(path)) for event in HOOKS]
+    if any(changed for _, changed in results) and not dry_run:
+        _save_settings(path, data, text)
+    return [item for item, _ in results]
+
+
+def check(home: Path | None = None) -> list[Item]:
     path = _home(home) / SETTINGS_REL
     try:
         data, _ = _load(path)
     except _Unusable as exc:
-        return Item(str(path), "refused", str(exc))
-    if _present(data):
-        return Item(str(path), "ok", f"{HOOK_EVENT} handoff hook present")
-    return Item(str(path), "missing", f"{HOOK_EVENT} handoff hook not installed; run `herdr-eng handoff auto install`")
+        return [Item(str(path), "refused", str(exc))]
+    return [Item(str(path), "ok", f"{event} handoff hook present") if _present(data, event) else
+            Item(str(path), "missing", f"{event} handoff hook not installed; run `herdr-eng handoff auto install`") for event in HOOKS]
