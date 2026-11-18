@@ -31,6 +31,10 @@ from herdr_engineering.handoff_adapters.records import records_newest_first  # n
 
 _WINDOW_KEY = re.compile(r"(?i)window(?!s)|context_?size|context_?limit|max_?input|max_?context")
 _SCHEMA_KEYS = frozenset({"input_schema", "properties", "schema"})  # tool definitions list parameter names, not limits
+# Structural field names that may be printed as they are. Any other intermediate key (a provider, project, flag or
+# model name, even a plain word) is shown as "*"; a key that itself looks like a window or limit is a leaf we report.
+_KNOWN_KEYS = frozenset({"cachedGrowthBookFeatures", "catalog", "config", "models", "providers", "provider", "limit",
+                         "payload", "info", "rate_limits", "primary", "secondary", "state", "runtime"})
 _MAX_SESSIONS = 200  # newest sessions per harness
 _TAIL_RECORDS = 300  # newest records read from a session file when listing its field names
 _FALLBACK = "-"
@@ -39,12 +43,13 @@ _FALLBACK = "-"
 def _field_paths(value: object, found: dict[str, set[int]], path: str = "") -> None:
     """Collect the key paths whose last key looks like a window or limit, with the integers seen there.
 
-    A key that is not a plain field name (a model id, uuid, project path), or that names a model, is shown as "*",
-    so no id or path is printed. A `context` key counts only inside a `limit` object (OpenCode's limit.context).
+    A key that is not a known field name or a window-like leaf (a model id, uuid, project path, provider or flag
+    name), or that names a model, is shown as "*", so no id or path is printed. A `context` key counts only inside a `limit` object (OpenCode's limit.context).
     """
     if isinstance(value, dict):
         for key, child in value.items():
-            plain = isinstance(key, str) and not re.search(r"[^A-Za-z_]", key) and not path.endswith("models")
+            plain = (isinstance(key, str) and not path.endswith("models") and not re.search(r"[^A-Za-z_]", key)
+                     and (key in _KNOWN_KEYS or bool(_WINDOW_KEY.search(key)) or key == "context"))
             name = key if plain else "*"
             if name in _SCHEMA_KEYS:
                 continue
@@ -144,7 +149,7 @@ def _opencode_fields(home: Path, cutoff: float, db: Path) -> list[str]:
     found: dict[str, set[int]] = {}
     columns: list[str] = []
     try:
-        with closing(opencode._connect(db)) as con:
+        with closing(opencode.connect(db)) as con:
             for table in ("session", "session_context_epoch"):
                 columns += [f"{table}.{row[1]}" for row in con.execute(f"pragma table_info({table})")
                             if _WINDOW_KEY.search(row[1])]
@@ -169,7 +174,7 @@ def _readings(harness: Harness, home: Path, env: dict[str, str], files: list[Pat
     if harness is Harness.OPENCODE:
         db = _opencode_db(home, env)
         try:
-            with closing(opencode._connect(db)) as con:
+            with closing(opencode.connect(db)) as con:
                 ids = [r[0] for r in con.execute("select id from session where time_updated >= ? order by time_updated desc limit ?",
                                                  (int(cutoff * 1000), _MAX_SESSIONS))]
         except sqlite3.Error:
@@ -192,18 +197,18 @@ def _readings(harness: Harness, home: Path, env: dict[str, str], files: list[Pat
 def _model_of(harness: Harness, ref: SessionRef) -> str:
     assert ref.record_path is not None
     if harness is Harness.CLAUDE:
-        found = claude._last_usage(ref.record_path)
+        found = claude.last_usage(ref.record_path)
         return found[1] or _FALLBACK if found else _FALLBACK
     if harness is Harness.CODEX:
         for record in records_newest_first(ref.record_path):
-            if model := codex._turn_model(record):
+            if model := codex.turn_model(record):
                 return model
         return _FALLBACK
     if harness is Harness.PI:
-        found = pi._last_usage(ref.record_path)
+        found = pi.last_usage(ref.record_path)
         return f"{found[1]}/{found[2]}" if found else _FALLBACK
     assert ref.session_id is not None
-    found = opencode._last_usage(ref.record_path, ref.session_id)
+    found = opencode.last_usage(ref.record_path, ref.session_id)
     return f"{found[1]}/{found[2]}" if found else _FALLBACK
 
 

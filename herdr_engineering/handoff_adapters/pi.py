@@ -51,7 +51,7 @@ def _usage(record: object) -> tuple[int, str | None, str | None] | None:
     return total, provider if isinstance(provider, str) else None, model if isinstance(model, str) else None
 
 
-def _last_usage(path: Path) -> tuple[int, str | None, str | None] | None:
+def last_usage(path: Path) -> tuple[int, str | None, str | None] | None:
     """The latest usage entry; a half-written line is skipped.
 
     A compaction after it makes it stale (the context just shrank): no reading until the next reply.
@@ -109,7 +109,7 @@ class PiAdapter:
         if ref.record_path is None:
             return None
         try:
-            found = _last_usage(ref.record_path)
+            found = last_usage(ref.record_path)
         except OSError:
             return None
         if found is None:

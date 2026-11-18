@@ -40,6 +40,11 @@ def test_context_is_last_token_usage_and_falls_after_compaction(tmp_path):
     assert reading is not None and reading.used_tokens == 35545
 
 
+def test_a_compacted_record_after_the_last_usage_means_no_reading(tmp_path):
+    # real layout: a top-level {"type": "compacted"} record; the usage before it is the context that was just discarded
+    assert CodexAdapter(home=tmp_path).read_context(_ref(_install(tmp_path, "compaction_last.jsonl"))) is None
+
+
 def test_none_when_no_token_count_event(tmp_path):
     assert CodexAdapter(home=tmp_path).read_context(_ref(_install(tmp_path, "no_token_count.jsonl"))) is None
 

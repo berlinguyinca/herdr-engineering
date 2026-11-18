@@ -50,9 +50,9 @@ def test_prints_a_section_per_harness_with_sources_models_and_the_over_100_check
     assert "transcript ~/.claude/projects/*/<session>.jsonl: none found" in out
     assert "catalog.config.models[].runtime.max_input_tokens [200000, 1000000]" in out
     assert "payload.info.model_context_window [828400]" in out
-    assert "providers.metabolomics.models[].contextWindow" in out
+    assert "providers.*.models[].contextWindow" in out
     assert "limit.context" in out
-    assert "  claude-opus-4-8  window=1000000  window_source=recorded  sessions=1" in out
+    assert "  claude-opus-4-8  window=200000  window_source=model_table  sessions=1" in out  # catalogue 1000000 vs table 200000: the smaller
     assert "  gpt-6.1-sol  window=828400  window_source=recorded  sessions=1" in out
     assert "  metabolomics/qwen3.8-flash_next  window=131072  window_source=recorded  sessions=1" in out
     assert re.search(r"  ollama/gemma4:26b  window=131072  window_source=recorded  sessions=1", out)
@@ -71,13 +71,25 @@ def test_flags_a_session_above_100_percent_of_its_window(tmp_path):
     home = _home(tmp_path)
     catalog = home / ".claude" / "cache" / "model-catalog" / "org-x-cc.json"
     data = json.loads(catalog.read_text())
+    data["catalog"]["config"]["models"][0]["id"] = "claude-future-9"  # not in the table, so only the catalogue sets the window
     data["catalog"]["config"]["models"][0]["runtime"]["max_input_tokens"] = 1000  # real usage in the fixture is 5702
     catalog.write_text(json.dumps(data))
+    transcript = home / ".claude" / "projects" / "-work" / "s.jsonl"
+    transcript.write_text(transcript.read_text().replace("claude-opus-4-8", "claude-future-9"))
     out = _run(home)
-    assert "  OVER 100%: claude-opus-4-8 used=5702 window=1000 window_source=recorded" in out
+    assert "  OVER 100%: claude-future-9 used=5702 window=1000 window_source=recorded" in out
 
 
 def test_a_home_with_no_records_prints_none_found_not_an_error(tmp_path):
     out = _run(tmp_path)
     assert out.count("none found") >= 4
     assert out.count("none (no recent session with usage)") == 4
+
+
+def test_an_intermediate_key_that_is_a_plain_word_is_masked(tmp_path):
+    home = _home(tmp_path)
+    (home / ".claude.json").write_text(json.dumps({"acmeproject": {"contextWindow": 5}, "tengu_secret_flag": {"windowDays": 7}}))
+    out = _run(home)
+    assert "acmeproject" not in out and "tengu_secret_flag" not in out
+    assert "*.contextWindow [5]" in out and "*.windowDays [7]" in out
+    assert "providers.metabolomics" not in out and "provider.metabolomics" not in out

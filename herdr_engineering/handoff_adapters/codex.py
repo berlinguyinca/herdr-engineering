@@ -29,25 +29,28 @@ def _token_count(record: object) -> tuple[int, int | None] | None:
     return used, window if isinstance(window, int) and window > 0 else None
 
 
-def _turn_model(record: object) -> str | None:
+def turn_model(record: object) -> str | None:
     payload = record.get("payload") if isinstance(record, dict) and record.get("type") == "turn_context" else None
     model = payload.get("model") if isinstance(payload, dict) else None
     return model if isinstance(model, str) and model else None
 
 
-def _last_usage(path: Path) -> tuple[int, int | None, str | None] | None:
+def last_usage(path: Path) -> tuple[int, int | None, str | None] | None:
     """(tokens, recorded window, model) of the latest usage event, scanning from the end.
 
+    A top-level ``compacted`` record after it makes it stale: no reading until the next token_count.
     The model is read only when the event records no window: the turn_context before it. A half-written
     line is skipped.
     """
     found: tuple[int, int | None] | None = None
     for record in records_newest_first(path):
         if found is None:
+            if record.get("type") == "compacted":
+                return None  # the usage before a compaction is the context that was just discarded
             found = _token_count(record)
             if found and found[1] is not None:
                 return found[0], found[1], None
-        elif (model := _turn_model(record)) is not None:
+        elif (model := turn_model(record)) is not None:
             return found[0], None, model
     return (found[0], None, None) if found else None
 
@@ -74,7 +77,7 @@ class CodexAdapter:
         if ref.record_path is None:
             return None
         try:
-            found = _last_usage(ref.record_path)
+            found = last_usage(ref.record_path)
         except OSError:
             return None
         if found is None:

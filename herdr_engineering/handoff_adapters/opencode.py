@@ -25,7 +25,7 @@ def _xdg(env: Mapping[str, str], name: str, default: Path) -> Path:
     return Path(value) if value else default
 
 
-def _connect(db: Path) -> sqlite3.Connection:
+def connect(db: Path) -> sqlite3.Connection:
     """A read-only connection: never writes, never creates a missing database."""
     return sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT_S)
 
@@ -63,12 +63,12 @@ def _assistant_messages(con: sqlite3.Connection, session_id: str) -> Iterator[di
             yield data
 
 
-def _last_usage(db: Path, session_id: str) -> tuple[int, str | None, str | None] | None:
+def last_usage(db: Path, session_id: str) -> tuple[int, str | None, str | None] | None:
     """(context tokens, provider, model) of the session's latest reply with usage, else None.
 
     A compaction summary after it makes it stale (the context just shrank): no reading until the next reply.
     """
-    with closing(_connect(db)) as con:
+    with closing(connect(db)) as con:
         for data in _assistant_messages(con, session_id):
             # a summary reply is `{"mode": "compaction", "summary": true}` in the real database (142 rows seen)
             if data.get("mode") == "compaction" or data.get("summary") is True:
@@ -111,7 +111,7 @@ class OpenCodeAdapter:
         # from where the session was started. That is only safe because the id comes from Herdr for this pane.
         db = self._db_path()
         try:
-            with closing(_connect(db)) as con:
+            with closing(connect(db)) as con:
                 if session_id is not None:
                     found = con.execute("select id from session where id = ?", (session_id,)).fetchall()
                 else:  # no id from Herdr: only an unambiguous cwd; subagent and archived sessions are not the pane's
@@ -140,7 +140,7 @@ class OpenCodeAdapter:
         if ref.record_path is None or ref.session_id is None:
             return None
         try:
-            found = _last_usage(ref.record_path, ref.session_id)
+            found = last_usage(ref.record_path, ref.session_id)
         except sqlite3.Error:  # locked, busy, unreadable or not a database: no reading this time
             return None
         if found is None:

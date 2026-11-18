@@ -5,10 +5,10 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
-from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
+from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput, WindowSource
 from .herdr_session import herdr_session_id, is_safe_session_id
 from .records import records_newest_first
-from .windows import lookup_window
+from .windows import lookup_window, strip_date_suffix
 
 PROMPT_MARKER = "❯"  # the empty input box of Claude Code, on a line of its own between two rules
 _READY_STATUSES = frozenset({"idle", "done"})
@@ -36,9 +36,14 @@ def _main_chain_usage(record: object) -> tuple[int, str | None] | None:
     return used, model if isinstance(model, str) else None
 
 
-def _last_usage(path: Path) -> tuple[int, str | None] | None:
-    """The latest main-chain usage; a half-written line is skipped."""
+def last_usage(path: Path) -> tuple[int, str | None] | None:
+    """The latest main-chain usage; a half-written line is skipped.
+
+    A compact_boundary after it makes it stale (the context just shrank): no reading until the next reply.
+    """
     for record in records_newest_first(path):
+        if record.get("type") == "system" and record.get("subtype") == "compact_boundary" and record.get("isSidechain") is not True:
+            return None
         if found := _main_chain_usage(record):
             return found
     return None
@@ -48,8 +53,11 @@ def _catalog_window(home: Path, model: str | None) -> int | None:
     """runtime.max_input_tokens Claude Code's cached model catalogue lists for the model, else None.
 
     The catalogue (~/.claude/cache/model-catalog/<org>-<hash>-cc.json, one file per account) is Claude Code's own
-    record of each model's limits; the newest file that lists the model wins.
+    record of each model's limits. The newest fetchedAt across the files that list the model wins; every call
+    globs and parses every file (one per account, about 20 KB each, so well under a millisecond each), which is
+    cheaper than the invalidation a cache would need. A dated and an undated spelling of an id are the same model.
     """
+    wanted = strip_date_suffix(model) if model else None
     best: tuple[int, int] | None = None  # (fetchedAt, window)
     for path in (home / ".claude" / "cache" / "model-catalog").glob("*-cc.json"):
         try:
@@ -61,11 +69,27 @@ def _catalog_window(home: Path, model: str | None) -> int | None:
         if not isinstance(fetched, int) or not isinstance(models, list):
             continue
         for entry in models:  # one malformed entry must not hide the others
-            runtime = entry.get("runtime") if isinstance(entry, dict) and entry.get("id") == model else None
+            runtime = entry.get("runtime") if isinstance(entry, dict) and isinstance(entry.get("id"), str) and strip_date_suffix(entry["id"]) == wanted else None
             window = runtime.get("max_input_tokens") if isinstance(runtime, dict) else None
             if isinstance(window, int) and not isinstance(window, bool) and window > 0 and (best is None or fetched > best[0]):
                 best = (fetched, window)
     return best[1] if best else None
+
+
+def _resolve_window(recorded: int | None, used: int, model: str | None) -> tuple[int, WindowSource]:
+    """Window from the catalogue (`recorded`) and the table; they can disagree and nobody has measured which is right.
+
+    A window that is too large makes a nearly full session look empty and a handoff never fires; one that is too small
+    only hands off early. So on a conflict the smaller wins, unless the session's own usage already exceeds it, which
+    proves the smaller one wrong for this session.
+    """
+    table, table_source = lookup_window(model)
+    if recorded is None:
+        return table, table_source
+    if table_source == "fallback" or recorded == table:
+        return recorded, "recorded"
+    smaller, larger = sorted(((recorded, "recorded"), (table, "model_table")))
+    return larger if used > smaller[0] else smaller
 
 
 class ClaudeAdapter:
@@ -94,14 +118,13 @@ class ClaudeAdapter:
         if ref.record_path is None:
             return None
         try:
-            found = _last_usage(ref.record_path)
+            found = last_usage(ref.record_path)
         except OSError:
             return None
         if found is None:
             return None
         used, model = found
-        recorded = _catalog_window(self._home, model)  # the transcript records no window; Claude Code's catalogue does
-        window, window_source = (recorded, "recorded") if recorded is not None else lookup_window(model)
+        window, window_source = _resolve_window(_catalog_window(self._home, model), used, model)  # transcripts record none
         return ContextReading(used, window, "claude-transcript", window_source, time.time())
 
     def drain_input(self, order: str) -> TypedInput:

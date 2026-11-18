@@ -48,9 +48,14 @@ MODEL_WINDOWS: Mapping[str, int] = MappingProxyType(_MODEL_WINDOWS)
 _DATE_SUFFIX = re.compile(r"-\d{8}$")
 
 
+def strip_date_suffix(model: str) -> str:
+    """The id without a trailing -YYYYMMDD, so a dated and an undated spelling of one model compare equal."""
+    return _DATE_SUFFIX.sub("", model)
+
+
 def lookup_window(model: str | None) -> tuple[int, WindowSource]:
     """Window for a model id when the harness recorded none: the table, else the fallback."""
-    for candidate in (model, _DATE_SUFFIX.sub("", model) if model else None):
+    for candidate in (model, strip_date_suffix(model) if model else None):
         if candidate and candidate in MODEL_WINDOWS:
             return MODEL_WINDOWS[candidate], "model_table"
     return FALLBACK_WINDOW, "fallback"

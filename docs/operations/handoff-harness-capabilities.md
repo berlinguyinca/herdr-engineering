@@ -9,7 +9,7 @@ session in that state.
 Window rule, shared by all adapters: the window the harness itself recorded (`window_source='recorded'`),
 else `MODEL_WINDOWS` (`'model_table'`; a `-YYYYMMDD` dated id falls back to its undated entry), else 128,000
 (`'fallback'`). `read_context` returns `None` only when no usage has been recorded yet, never because a window is
-missing. A fallback window errs towards handing off early, never late, for a model whose real window is larger.
+missing. The fallback errs towards handing off early only for a model whose real window is at least 128,000; a model with a smaller real window and no recorded limit would be read too low, and a handoff would come late.
 
 ## Claude Code
 
@@ -17,12 +17,12 @@ missing. A fallback window errs towards handing off early, never late, for a mod
 | --- | --- |
 | Record location | `~/.claude/projects/<cwd with every non-alphanumeric as "-">/<session id>.jsonl` |
 | Context size | latest main-chain assistant entry (`isSidechain` false, model not `<synthetic>`): `message.usage.input_tokens + cache_read_input_tokens + cache_creation_input_tokens`; output tokens are not included (same sum as `handoff_context_hook`) |
-| Window source | Transcripts record none. Claude Code's own model catalogue, `~/.claude/cache/model-catalog/<org>-<hash>-cc.json`, field `catalog.config.models[].runtime.max_input_tokens` (one file per account; the newest `fetchedAt` that lists the model wins). `window_source='recorded'`. A model the catalogue does not list falls to `MODEL_WINDOWS`, then 128,000 |
+| Window source | Transcripts record none. Claude Code's own model catalogue, `~/.claude/cache/model-catalog/<org>-<hash>-cc.json`, field `catalog.config.models[].runtime.max_input_tokens` (one file per account; the newest `fetchedAt` that lists the model wins). `window_source='recorded'`; a dated and an undated spelling of an id match each other (the catalogue lists `claude-haiku-4-5-20251001` dated and everything else undated). A model the catalogue does not list falls to `MODEL_WINDOWS`, then 128,000. When both list the model and disagree, see "Catalogue against table" below |
 | Corroboration (not used) | The statusline input JSON carries `context_window.context_window_size`; a cached copy written by the oh-my-claudecode HUD (`~/.claude/hud/cache/stdin.<session>.json`) shows 1,000,000 for `claude-sonnet-5-5`, which agrees with the catalogue. No `statusLine` is configured in `~/.claude/settings.json`, and the cache belongs to a third-party plugin and goes stale, so it is not read |
 | Checked, no window | `~/.claude.json` has no per-model window (`tengu_hawthorn_window`, 200000, is a feature flag with no model attached). No `[1m]` suffix appears in transcript model ids or in `requestedModel`; it is a model-setting suffix (the binary says to "append [1m] to the model name for 1M" and to set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` for a custom id), and the transcript records the bare id |
-| Compaction marker | a `system` record with `subtype: "compact_boundary"` (265 in the last 30 days) |
+| Compaction marker | a `system` record with `subtype: "compact_boundary"` (265 in the last 30 days); a usage entry before the latest one is stale, so there is no reading until the next reply |
 | Session id in Herdr | `herdr agent get <pane>`, `agent_session.kind == "id"`; the transcript is `<id>.jsonl` in the project directory, matched by id even when the pane cwd differs from the session directory |
-| Unconfirmed | (1) Whether `max_input_tokens` equals the effective window for a session whose model setting has no `[1m]`. For the 5.x models in use here it does: `claude-sonnet-5-5` sessions reached 966,904 tokens and `claude-opus-5-5` 568,085, so their window is above 200,000. For models not seen recently the catalogue (1,000,000 for `claude-opus-4-8`) and the table (200,000, from the autospec monitor) disagree; the table entry is kept and nothing measures it. (2) The adapter does not yet treat a `compact_boundary` as "no reading until the next reply", so the reading right after `/compact` is the stale pre-compaction size until the next reply. No task assigned |
+| Unconfirmed | (1) Whether `max_input_tokens` equals the effective window for a session whose model setting has no `[1m]`. For the 5.x models in use here it does: `claude-sonnet-5-5` sessions reached 966,904 tokens and `claude-opus-5-5` 568,085, so their window is above 200,000. For models not seen recently the catalogue (1,000,000 for `claude-opus-4-8`) and the table (200,000, from the autospec monitor) disagree; the table entry is kept and nothing measures it. (2) Nothing measures which window a session really has for the three conflicting models below |
 
 Model ids seen in the last 30 days and how each resolves:
 
@@ -30,6 +30,8 @@ Model ids seen in the last 30 days and how each resolves:
 | --- | --- | --- | --- |
 | `claude-sonnet-5-5`, `claude-opus-5-5`, `claude-opus-5`, `claude-fable-5-1`, `claude-fable-5-2` | 1,000,000 | `recorded` (catalogue present), else `model_table` | the catalogue's `max_input_tokens`; the same values are in `MODEL_WINDOWS` for a machine without the catalogue |
 | `claude-opus-4-5-20251101`, `claude-sonnet-4-5-20250929` | 200,000 | `model_table` | not in the catalogue; the dated id resolves to `claude-opus-4-5` / `claude-sonnet-4-5` (200,000, autospec context monitor table); the binary says every dated id of a version resolves to the undated id |
+
+Catalogue against table. Both are consulted; if only one lists the model it is used (`recorded` or `model_table`); if they agree it is `recorded`; if they differ the smaller wins, with the `window_source` of whichever supplied it, unless the session's own used tokens already exceed the smaller window, which proves it wrong for that session, and the larger is used. Why: a window that is too large makes a nearly full session look empty so a handoff fires late or never, while one that is too small only hands off early. The models where the two disagree on this machine are `claude-opus-4-7`, `claude-opus-4-8` and `claude-sonnet-4-6` (catalogue 1,000,000, table 200,000), so those read as 200,000 `model_table` until usage passes 200,000. The catalogue also lists `claude-fable-5`, `claude-haiku-5-5`, `claude-mythos-5-1`, `claude-mythos-5-2`, `claude-opus-4-6` and `claude-sonnet-5` (1,000,000), which the table lacks, so they are `recorded` where the catalogue is present and fall back to 128,000 without it.
 
 Window unknown, falls back to 128,000: none of the ids seen. Before this task `claude-opus-5-5` was not in the table, so a real
 session at about 247,000 tokens read as 193% of a 128,000 fallback.
@@ -41,9 +43,9 @@ session at about 247,000 tokens read as 193% of a 128,000 fallback.
 | Record location | `~/.codex/sessions/<Y>/<M>/<D>/rollout-<timestamp>-<session id>.jsonl` |
 | Context size | `event_msg` records with `payload.type == "token_count"`: `payload.info.last_token_usage.total_tokens` is the current context. It fell from 785,180 to 35,545 across a compaction while `total_token_usage` (cumulative) kept growing, so the cumulative figure is not used |
 | Window source | `payload.info.model_context_window` on the same event (828,400 for `gpt-6.1-sol` and `gpt-6-astra`). `window_source='recorded'`. `~/.codex/config.toml` has `model_context_window = 1000000`, which disagrees with what the events record; the recorded figure wins. When an event records none, the model of the preceding `turn_context` goes through `MODEL_WINDOWS` |
-| Compaction marker | a top-level record with `type: "compacted"` (29 in the last 30 days) |
+| Compaction marker | a top-level record with `type: "compacted"` (29 in the last 30 days); a usage event before it is stale, so there is no reading until the next `token_count` (in 16 of 16 real compactions one followed, with a lower value) |
 | Session id in Herdr | `agent_session.kind == "id"`; the rollout file name ends in `-<id>.jsonl`, matched by id |
-| Unconfirmed | The adapter does not treat `compacted` as "no reading until the next reply". No task assigned. Composer prompt marker and exit command: Task 7 |
+| Unconfirmed | Composer prompt marker and exit command: Task 7 |
 
 Model ids seen: `gpt-6.1-sol`, `gpt-6-astra`, both `recorded`. Window unknown: none.
 
@@ -83,7 +85,7 @@ Model ids seen: `qwen3.8-27b`, `qwen3.8-27b-vision` (provider `metabolomics`), b
 
 ## Rules the adapters implement beyond the original plan
 
-1. After a compaction there is no reading until the next reply (Pi and OpenCode). The usage entry before the marker is the
+1. After a compaction there is no reading until the next reply (all four adapters: Claude `compact_boundary`, Codex `compacted`, Pi `compaction`, OpenCode `summary`). The usage entry before the marker is the
    size of the context that was just discarded; reading it would trigger a handoff for a context that is already small.
 2. A session is selected by its id even when the pane's cwd differs from the session's directory (all four adapters; Pi looks in
    the cwd's directory first and then anywhere, OpenCode never compares `directory`). The id comes from Herdr for that pane, which

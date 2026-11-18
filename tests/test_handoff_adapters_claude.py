@@ -191,39 +191,136 @@ def _catalog_limit(name: str, model: str) -> int:
     return next(m["runtime"]["max_input_tokens"] for m in models if m["id"] == model)
 
 
-def test_read_context_window_matches_recorded_field(tmp_path):
+def _write_catalog(home: Path, name: str, models: dict[str, int], fetched: int | None = 1_795_040_000_000) -> Path:
+    directory = home / ".claude" / "cache" / "model-catalog"
+    directory.mkdir(parents=True, exist_ok=True)
+    body: dict = {"version": 2, "catalog": {"config": {"models": [
+        {"id": m, "runtime": {"max_input_tokens": w}} for m, w in models.items()]}}}
+    if fetched is not None:
+        body["fetchedAt"] = fetched
+    path = directory / f"{name}-cc.json"
+    path.write_text(json.dumps(body))
+    return path
+
+
+def _with_used(path: Path, used: int) -> None:
+    """Rewrite the latest main-chain usage so that it sums to `used` (all of it as cache reads)."""
+    path.write_text(path.read_text().replace('"cache_read_input_tokens": 5000', f'"cache_read_input_tokens": {used - 702}'))
+
+
+def _read(tmp_path: Path, used: int | None = None, model: str | None = None):
     cwd = tmp_path / "work"
     path = _install(tmp_path, cwd, "main_chain.jsonl")  # model claude-opus-4-8, which the table says is 200000
+    if used is not None:
+        _with_used(path, used)
+    if model is not None:
+        path.write_text(path.read_text().replace("claude-opus-4-8", model))
+    return ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd))
+
+
+def test_read_context_window_matches_recorded_field(tmp_path):
     _install_catalog(tmp_path, "model-catalog.json")
-    reading = ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd))
+    reading = _read(tmp_path, model="claude-mythos-5-1")  # only the catalogue lists it
     assert reading is not None
-    assert reading.window_tokens == _catalog_limit("model-catalog.json", "claude-opus-4-8") == 1_000_000
+    assert reading.window_tokens == _catalog_limit("model-catalog.json", "claude-mythos-5-1") == 1_000_000
     assert reading.window_source == "recorded"
 
 
 def test_newest_catalogue_listing_the_model_wins(tmp_path):
-    cwd = tmp_path / "work"
-    path = _install(tmp_path, cwd, "main_chain.jsonl")
     _install_catalog(tmp_path, "model-catalog-older.json", "model-catalog.json")
-    reading = ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd))
+    reading = _read(tmp_path, model="claude-mythos-5-1")
     assert (reading.window_tokens, reading.window_source) == (1_000_000, "recorded")
 
 
 def test_model_the_catalogue_does_not_list_uses_the_table(tmp_path):
-    cwd = tmp_path / "work"
-    path = _install(tmp_path, cwd, "main_chain.jsonl")
-    path.write_text(path.read_text().replace("claude-opus-4-8", "claude-opus-4-5"))
     _install_catalog(tmp_path, "model-catalog.json")
-    reading = ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd))
+    reading = _read(tmp_path, model="claude-opus-4-5")
     assert (reading.window_tokens, reading.window_source) == (200_000, "model_table")
 
 
 def test_unreadable_catalogue_falls_back_to_the_table(tmp_path):
-    cwd = tmp_path / "work"
-    path = _install(tmp_path, cwd, "main_chain.jsonl")
-    directory = tmp_path / ".claude" / "cache" / "model-catalog"
-    directory.mkdir(parents=True)
-    (directory / "org-x-cc.json").write_text("{not json")
-    (directory / "org-y-cc.json").write_text('{"catalog": {"config": {"models": [{"id": "claude-opus-4-8", "runtime": {"max_input_tokens": 0}}]}}}')
-    reading = ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd))
+    _write_catalog(tmp_path, "org-y", {"claude-opus-4-8": 0})  # a valid fetchedAt, so the non-positive check is what rejects it
+    (tmp_path / ".claude" / "cache" / "model-catalog" / "org-x-cc.json").write_text("{not json")
+    reading = _read(tmp_path)
     assert (reading.window_tokens, reading.window_source) == (200_000, "model_table")
+
+
+def test_catalogue_without_fetched_at_is_ignored(tmp_path):
+    _write_catalog(tmp_path, "org-y", {"claude-opus-4-8": 150_000}, fetched=None)
+    reading = _read(tmp_path)
+    assert (reading.window_tokens, reading.window_source) == (200_000, "model_table")
+
+
+def test_a_half_written_catalogue_is_skipped_and_a_valid_one_still_used(tmp_path):
+    good = _write_catalog(tmp_path, "org-good", {"claude-mythos-5-1": 1_000_000})
+    text = good.read_text()
+    (good.parent / "org-half-cc.json").write_text(text[: len(text) // 2])  # truncated JSON
+    reading = _read(tmp_path, model="claude-mythos-5-1")
+    assert (reading.window_tokens, reading.window_source) == (1_000_000, "recorded")
+
+
+@pytest.mark.parametrize("listed,seen", [("claude-future-7", "claude-future-7-20260101"),
+                                         ("claude-future-7-20260101", "claude-future-7"),
+                                         ("claude-future-7-20260101", "claude-future-7-20260202")])
+def test_dated_and_undated_ids_match_each_other_in_the_catalogue(tmp_path, listed, seen):
+    _write_catalog(tmp_path, "org-x", {listed: 300_000})
+    reading = _read(tmp_path, model=seen)
+    assert (reading.window_tokens, reading.window_source) == (300_000, "recorded")
+
+
+def test_the_real_dated_catalogue_id_matches_a_dated_transcript_id(tmp_path):
+    # the real catalogue lists claude-haiku-4-5-20251001 (dated); the table says 200000 for claude-haiku-4-5
+    _install_catalog(tmp_path, "model-catalog.json")
+    reading = _read(tmp_path, model="claude-haiku-4-5-20251001")
+    assert (reading.window_tokens, reading.window_source) == (200_000, "recorded")
+
+
+def test_conflict_with_usage_below_the_smaller_window_uses_the_smaller_table_window(tmp_path):
+    _write_catalog(tmp_path, "org-x", {"claude-opus-4-8": 1_000_000})  # the table says 200000 for the same id
+    reading = _read(tmp_path, used=150_000)
+    assert (reading.window_tokens, reading.window_source) == (200_000, "model_table")
+
+
+def test_conflict_with_usage_above_the_smaller_window_uses_the_larger_recorded_window(tmp_path):
+    _write_catalog(tmp_path, "org-x", {"claude-opus-4-8": 1_000_000})
+    reading = _read(tmp_path, used=250_000)  # more than 200000 proves the table's window wrong for this session
+    assert (reading.window_tokens, reading.window_source) == (1_000_000, "recorded")
+
+
+def test_conflict_with_a_smaller_catalogue_window_uses_it_while_usage_fits(tmp_path):
+    _write_catalog(tmp_path, "org-x", {"claude-opus-4-8": 150_000})
+    reading = _read(tmp_path, used=100_000)
+    assert (reading.window_tokens, reading.window_source) == (150_000, "recorded")
+
+
+def test_conflict_with_a_smaller_catalogue_window_uses_the_larger_table_window_once_usage_exceeds_it(tmp_path):
+    _write_catalog(tmp_path, "org-x", {"claude-opus-4-8": 150_000})
+    reading = _read(tmp_path, used=170_000)
+    assert (reading.window_tokens, reading.window_source) == (200_000, "model_table")
+
+
+def test_catalogue_and_table_that_agree_are_recorded(tmp_path):
+    _write_catalog(tmp_path, "org-x", {"claude-opus-4-8": 200_000})
+    reading = _read(tmp_path)
+    assert (reading.window_tokens, reading.window_source) == (200_000, "recorded")
+
+
+def test_table_only_and_catalogue_only_use_what_exists(tmp_path):
+    only_table = _read(tmp_path)
+    assert (only_table.window_tokens, only_table.window_source) == (200_000, "model_table")
+    _write_catalog(tmp_path / "c", "org-x", {"claude-future-9": 400_000})
+    only_catalogue = _read(tmp_path / "c", model="claude-future-9")
+    assert (only_catalogue.window_tokens, only_catalogue.window_source) == (400_000, "recorded")
+
+
+def test_a_compact_boundary_after_the_last_usage_means_no_reading(tmp_path):
+    cwd = tmp_path / "work"
+    path = _install(tmp_path, cwd, "compaction_last.jsonl")
+    assert ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd)) is None
+
+
+def test_a_reply_after_the_compact_boundary_is_read(tmp_path):
+    cwd = tmp_path / "work"
+    path = _install(tmp_path, cwd, "compaction_then_reply.jsonl")
+    reading = ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd))
+    assert reading is not None and reading.used_tokens == 4 + 900 + 100

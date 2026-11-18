@@ -24,6 +24,12 @@
      "runtime": {
       "max_input_tokens": 200000
      }
+    },
+    {
+     "id": "claude-mythos-5-1",
+     "runtime": {
+      "max_input_tokens": 1000000
+     }
     }
    ]
   }
