@@ -441,7 +441,11 @@ def set_pr(env, **kw):
     env.write_gh(st)
 
 
-def polled(env, *args, cfg="") -> bool:
+def polled(env, *args, cfg="", fresh=False) -> bool:
+    """One dry-run poll; True when a reviewer ran. `fresh` forgets state.json first: a dry run records dry_sha for every
+    head it reviewed, which would make a later poll skip the PR for that reason and hide the filter under test."""
+    if fresh:
+        (env.tmp / "state/state.json").unlink(missing_ok=True)
     env.config(cfg)
     n = len(env.reviewer_calls())
     assert env.run("poll", "--repo", REPO, *args) == 0
@@ -476,21 +480,28 @@ def test_only_prs_updated_after_is_an_absolute_floor(env):
     assert polled(env, cfg="backfill: true\nonly_prs_updated_after: '2030-01-01'\n") is True
 
 
-def test_archived_and_fork_repos_are_skipped_by_the_filters(env):
+def set_repo(env, **flags):
     st = env.gh_state()
-    st["repos"] = {REPO: {"isArchived": True, "isFork": False}}
+    st["repos"] = {REPO: {"isArchived": False, "isFork": False, **flags}}
     env.write_gh(st)
-    assert polled(env) is False                                       # skip_archived defaults to true
-    assert polled(env, cfg="skip_archived: false\n") is True
-    st["repos"] = {REPO: {"isArchived": False, "isFork": True}}
-    env.write_gh(st)
-    assert polled(env, cfg="skip_forks: true\n") is False
+
+
+def test_archived_repos_are_skipped_by_default(env):
+    set_repo(env, isArchived=True)
+    assert polled(env, fresh=True) is False                           # skip_archived defaults to true
+    assert polled(env, cfg="skip_archived: false\n", fresh=True) is True
+
+
+def test_fork_repos_are_skipped_only_when_skip_forks_is_on(env):
+    set_repo(env, isFork=True)
+    assert polled(env, fresh=True) is True                            # skip_forks defaults to false: reviewed
+    assert polled(env, cfg="skip_forks: true\n", fresh=True) is False
 
 
 def test_drafts_are_skipped_by_default_and_reviewed_when_skip_drafts_is_false(env):
     set_pr(env, draft=True)
-    assert polled(env) is False
-    assert polled(env, cfg="skip_drafts: false\n") is True
+    assert polled(env, fresh=True) is False
+    assert polled(env, cfg="skip_drafts: false\n", fresh=True) is True
 
 
 def test_repos_in_the_config_are_what_poll_watches(env):
