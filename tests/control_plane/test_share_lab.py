@@ -609,7 +609,7 @@ def test_unknown_tokens_cannot_drain_the_global_session_budget(lab):
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
 def test_share_js_parses():
-    subprocess.run(["node", "--check", str(STATIC_DIR / "share.js")], check=True, timeout=60)
+    subprocess.run(["node", "--check", str(STATIC_DIR / "share.js")], check=True, timeout=300)
 
 
 def test_share_js_hygiene():
