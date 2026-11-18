@@ -21,7 +21,7 @@ fabric:
   ca_dir: /ca
   tailscale_cert: "bender.tail0c50da.ts.net"
   tailnet_cert_dir: /tailnet-cert
-  routes: ["bender.tail0c50da.ts.net=127.0.0.1:8787"]
+  routes: ["bender.tail0c50da.ts.net=127.0.0.1:8787", "memory.local.metabolomics.us=127.0.0.1:8897", "memory.dev.lan=127.0.0.1:8897"]
   bind: auto
   probe_interval_seconds: 15
 
