@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: unit-gates reruns the parallel pass once if xdist workers die
+
+- `scripts/ci/pytest-rerun.sh`: exit 3 or a worker-crash signature reruns the parallel pass once on 2 workers (never for test failures or hangs); `auto` workers also shrink on a loaded host.
+
 ### Fix: run-watched review nits from #824
 
 - `scripts/ci/run-watched.py`: `Out.write` also survives a full non-blocking stdout (EAGAIN), a closed fd and a `None` stdout (it stops forwarding and keeps draining); the process group is only signalled once the root is reaped if a live process still holds that group (a reaped pid can be reused); `has_token` no longer caches negatives (a fork child reads as its parent until it execs); CPU history is keyed by (pid, start time) so a reused pid cannot corrupt deltas; signal handlers are installed before the command is spawned; bad SOFT/HARD, a missing `--` or command print a usage error and exit 2, and an unstartable command exits 127/126 with a message instead of a traceback; a hang now stops the tree with SIGTERM, a short grace, then SIGKILL (exit still 124).

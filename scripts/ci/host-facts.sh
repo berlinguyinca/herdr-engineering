@@ -10,7 +10,7 @@ ci_host_facts() {
   if [ -z "$quota" ]; then
     command -v python3 >/dev/null 2>&1 && quota=none || quota=unknown
   fi
-  load="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo unknown)"
+  load="$(cut -d' ' -f1-3 "$(. "$(dirname "${BASH_SOURCE[0]}")/pytest-parallel.sh"; herdr_loadavg_file)" 2>/dev/null || echo unknown)"
   tmpfs="$(df -P -T "${TMPDIR:-/tmp}" 2>/dev/null | awk 'NR==2 {print $2" "$7" ("$5" free of "$3" 1K blocks)"}')"
   mem="$(awk '/MemAvailable/ {printf "%d MiB available", $2/1024}' /proc/meminfo 2>/dev/null)"
   busy="$(ps -eo comm= 2>/dev/null | grep -cE '^(pytest|python3?|postgres)$' || true)"
