@@ -41,3 +41,4 @@ venv/
 .ruff_cache/
 .coverage
 htmlcov/
+.omx/
