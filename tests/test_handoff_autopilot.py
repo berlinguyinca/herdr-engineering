@@ -31,6 +31,19 @@ from herdr_engineering import handoff_autopilot as ha
 CLI = [sys.executable, "-m", "herdr_engineering.cli"]
 
 
+# Shell operators that must stay unquoted when a hook command is rebuilt token by token.
+_SHELL_OPERATORS = frozenset({"[", "]", "&&", "||", "-x", "-f", "!"})
+
+
+def _shell_join(tokens: list[str]) -> str:
+    """Rebuild a command line, quoting arguments but leaving shell operators as operators.
+
+    `shlex.join` quotes `[`, `]` and `&&`, which turns a guarded hook command into
+    `[: missing ]` - a syntax error that looks like the guard failed.
+    """
+    return " ".join(token if token in _SHELL_OPERATORS else shlex.quote(token) for token in tokens)
+
+
 def _cli(args: list[str], env: dict[str, str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         CLI + args, capture_output=True, text=True, timeout=120, cwd=str(cwd), env=env
@@ -789,10 +802,12 @@ def test_the_autopilot_and_the_managed_workflow_hooks_share_settings_json(host: 
 def test_the_claude_hook_command_survives_a_missing_cli(host: dict) -> None:
     """A hook whose binary is gone must not turn every turn into a hook error.
 
-    Claude Code treats a non-zero hook exit as a failure it reports to the session, and a
-    CLI that was uninstalled, or a venv that moved, makes the command exit 127. The command
-    is written guarded - the same shape the managed workflow hooks use - so a missing
-    `herdr-eng` is silence, not an error on every Stop and PreCompact.
+    Claude Code treats a non-zero hook exit as a failure it reports to the session, and a CLI
+    that was uninstalled - or a venv that moved - makes the command exit 127. The command is
+    written guarded, the same shape the managed workflow hooks use, so a missing `herdr-eng`
+    is silence instead of an error on every Stop and PreCompact. The control at the end runs
+    the same missing binary unguarded: without the `[ -x ]` test the assertion above would
+    only be proving that bash exits 0 for a reason the guard had nothing to do with.
     """
     (host["home"] / ".claude").mkdir()
     assert _cli(["handoff", "autopilot", "install"], host["env"], host["work"]).returncode == 0
@@ -804,16 +819,31 @@ def test_the_claude_hook_command_survives_a_missing_cli(host: dict) -> None:
     assert command.startswith("[ -x "), command
     assert command.rstrip().endswith("|| true"), command
 
-    # And it really is silence: run the guarded command with the binary removed.
-    binary = shlex.split(command)[2]           # [ -x <binary> ] && <binary> handoff ...
-    assert shlex.split(command)[5] == binary, shlex.split(command)
-    missing = str(Path(binary).parent / "definitely-not-here")
-    probe = subprocess.run(
-        ["bash", "-c", command.replace(f'"{binary}"', f'"{missing}"'), json.dumps(
-            {"hook_event_name": "Stop", "session_id": "s-guard", "transcript_path": "/nope.jsonl"})],
-        capture_output=True, text=True, timeout=60, env=host["env"],
-    )
-    assert probe.returncode == 0 and probe.stdout.strip() == "", (probe.returncode, probe.stdout, probe.stderr)
+    # Rebuild the installed command against a binary that does not exist, token by token:
+    # `[ -x <bin> ] && <bin> handoff ... || true` names it twice, and string replacement would
+    # silently miss both when shlex.quote leaves the path unquoted.
+    tokens = shlex.split(command)
+    binary, guard_test, invocation = tokens[2], tokens[1], tokens[5]
+    assert guard_test == "-x" and invocation == binary, tokens
+    missing = str(Path(binary).with_name("definitely-not-here"))
+    replaced = [missing if token == binary else token for token in tokens]
+    guarded = _shell_join(replaced)
+
+    # Claude Code hands the hook its event on stdin, so that is how this runs.
+    event = json.dumps({"hook_event_name": "Stop", "session_id": "s-guard",
+                        "transcript_path": "/nope.jsonl"})
+    probe = subprocess.run(["bash", "-c", guarded], input=event, capture_output=True,
+                           text=True, timeout=60, env=host["env"], cwd=str(host["work"]))
+    assert probe.returncode == 0, (probe.returncode, probe.stdout, probe.stderr)
+    assert probe.stdout.strip() == "", probe.stdout
+
+    # Control: the same missing binary, without the guard, is the failure the guard prevents.
+    # Everything after `||` belongs to the guard, so the control stops at it.
+    guarded_tail = tokens.index("||")
+    bare = _shell_join([missing, *tokens[6:guarded_tail]])
+    control = subprocess.run(["bash", "-c", bare], input=event, capture_output=True,
+                             text=True, timeout=60, env=host["env"], cwd=str(host["work"]))
+    assert control.returncode != 0, (control.returncode, control.stdout)
 
 
 def test_a_session_the_context_hook_already_warned_is_not_told_again(host: dict) -> None:
@@ -854,3 +884,58 @@ def test_a_session_the_context_hook_already_warned_is_not_told_again(host: dict)
     blocked.write_text("not a directory")
     host["env"]["HERDR_ENGINEERING_STATE"] = str(blocked / "handoff-context")
     assert check("session-c")["code"] == "context_is_full"
+
+
+def test_precompact_advises_without_spending_the_trigger(host: dict) -> None:
+    """PreCompact cannot reach the model, so it must not consume the per-session trigger.
+
+    The installed command carries --record on both events. With the default
+    max_per_session of 1, a PreCompact that spent the budget left the next Stop answering
+    `already_triggered`: the operator got a systemMessage saying "the next Stop hook will
+    do it" and the agent was never told. Delivery is what consumes the trigger, and this
+    event cannot deliver.
+    """
+    transcript = write_transcript(
+        host["work"] / "full.jsonl",
+        session_id="s-precompact",
+        input_tokens=2,
+        cache_write=3_000,
+        cache_read=150_000,
+    )
+
+    def run(event: str) -> dict:
+        done = subprocess.run(
+            CLI + ["handoff", "autopilot", "hook", "--harness", "claude", "--record", "--json"],
+            input=json.dumps(
+                {
+                    "session_id": "s-precompact",
+                    "transcript_path": str(transcript),
+                    "hook_event_name": event,
+                    "cwd": str(host["work"]),
+                }
+            ),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=host["env"],
+            cwd=str(host["work"]),
+        )
+        assert done.returncode == 0, done.stderr
+        return json.loads(done.stdout)
+
+    compacted = run("PreCompact")
+    assert compacted["trigger"] is True, compacted
+    assert "hookSpecificOutput" not in compacted, compacted
+    assert "Stop" in compacted["systemMessage"], compacted
+    assert compacted["recorded"] is False, compacted
+    assert not ha.state_path().exists(), (
+        "PreCompact consumed the trigger it could not deliver: "
+        f"{ha.state_path().read_text() if ha.state_path().exists() else ''}"
+    )
+
+    # The promise the systemMessage made: the next Stop is the one that tells the agent.
+    stopped = run("Stop")
+    assert stopped["trigger"] is True, stopped
+    assert stopped["hookSpecificOutput"]["additionalContext"].startswith("[HerdR automatic handoff]")
+    assert stopped["recorded"]["count"] == 1, stopped["recorded"]
+    assert ha.read_ledger()["sessions"]["s-precompact"]["count"] == 1

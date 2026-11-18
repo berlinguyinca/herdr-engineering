@@ -565,20 +565,24 @@ def hook(
     out["hook_event"] = event
     if not decision.trigger:
         return out
-    if record:
-        out["recorded"] = record_trigger(
-            session_id=session_id,
-            harness=harness,
-            percent=decision.percent,
-            prompt=decision.prompt,
-            boundary=f"{harness} hook {event}",
-            home=home,
-        )
     if event in CLAUDE_MODEL_REACHING_EVENTS:
         out["hookSpecificOutput"] = {
             "hookEventName": event,
             "additionalContext": decision.prompt[:8000],
         }
+        # Delivery is what spends the budget. An event that can reach the model but whose
+        # record failed still counts as told (the instruction went out); an event that cannot
+        # reach the model must leave the budget alone, or the default max_per_session of 1
+        # would silence the next Stop with an instruction that was never delivered.
+        if record:
+            out["recorded"] = record_trigger(
+                session_id=session_id,
+                harness=harness,
+                percent=decision.percent,
+                prompt=decision.prompt,
+                boundary=f"{harness} hook {event}",
+                home=home,
+            )
     else:
         # Verified against the installed Claude Code binary: PreCompact output does not
         # carry additionalContext, so the model cannot be reached here. Record and tell the
@@ -588,6 +592,7 @@ def hook(
             f"the model on {event}; the next Stop hook will do it"
         )
         out["note"] = f"{event} hooks cannot deliver additionalContext in Claude Code"
+        out["recorded"] = False
     return out
 
 
