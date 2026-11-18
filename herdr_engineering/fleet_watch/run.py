@@ -15,12 +15,15 @@ for `failed_host` (default) or `all_updated` scope.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shlex
 import signal
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -58,6 +61,44 @@ class Outcome:
     timed_out: bool = False
 
 
+CHILD_GRACE_S = 5.0                               # SIGTERM first: host-apply kills ITS children (own sessions) itself
+_CHILDREN: dict[int, subprocess.Popen] = {}       # in-flight host-apply children, each the leader of its own session
+_CHILDREN_LOCK = threading.Lock()
+
+
+def _stop_group(proc: subprocess.Popen, grace: float = CHILD_GRACE_S) -> None:
+    """SIGTERM the child's group, give it `grace` seconds to clean up, then SIGKILL the group.
+
+    host-apply starts its own commands with start_new_session=True, so they are NOT in this group: only host-apply's
+    own SIGTERM handling (which kills them) reaches them. Hence TERM first, KILL only after the grace. The KILL is in
+    a `finally`, so an exception raised while waiting (a second signal) cannot skip it."""
+    with contextlib.suppress(OSError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        deadline = time.monotonic() + grace
+        while proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        try:
+            os.killpg(proc.pid, 0)                # the group is gone (and its id may be reused): nothing to kill
+        except OSError:
+            pass
+        else:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+
+
+def kill_children() -> None:
+    """Stop every in-flight host-apply; ONLY for a process that is about to exit (the hard-limit `os._exit`, which runs
+    no cleanup): it deliberately never releases the registry lock. A remote phase may still finish, which
+    host-apply's idempotence allows."""
+    # The lock stays held until the caller exits: the pass thread, once its child dies, blocks in its `finally` instead
+    # of recording a failed row and carrying on (the hard-limit exit must stay a 70, not a normal pass end).
+    _CHILDREN_LOCK.acquire()
+    for proc in list(_CHILDREN.values()):
+        _stop_group(proc)
+
+
 class SshTransport:
     """Runs `herdr-eng fleet host-apply` on a host: over ssh (BatchMode, ConnectTimeout), or directly for the local host.
 
@@ -86,13 +127,18 @@ class SshTransport:
         else:
             argv = [self.ssh_bin, "-o", "BatchMode=yes", "-o", f"ConnectTimeout={self.connect_timeout}",
                     "-T", host, "--", command]
+        proc: subprocess.Popen | None = None
         try:
             proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, start_new_session=True, cwd="/")
-        except OSError:
-            return Outcome(SSH_FAILED_RC, "")
-        try:
+            with _CHILDREN_LOCK:
+                _CHILDREN[proc.pid] = proc
             out, _ = proc.communicate(timeout=timeout)
+        except OSError:
+            if proc is None:
+                return Outcome(SSH_FAILED_RC, "")
+            _stop_group(proc)                      # started but unreadable: do not leave it running
+            raise
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -100,6 +146,14 @@ class SshTransport:
                 proc.kill()
             proc.communicate()
             return Outcome(None, "", timed_out=True)
+        except BaseException:                      # SIGTERM -> SystemExit, KeyboardInterrupt: never orphan the child
+            if proc is not None:
+                _stop_group(proc)
+            raise
+        finally:
+            if proc is not None:
+                with _CHILDREN_LOCK:
+                    _CHILDREN.pop(proc.pid, None)
         return Outcome(proc.returncode, out[:MAX_STDOUT].decode("utf-8", "replace"))
 
 

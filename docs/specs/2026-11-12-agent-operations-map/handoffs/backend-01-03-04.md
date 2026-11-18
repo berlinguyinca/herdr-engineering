@@ -25,6 +25,28 @@ counts, rooms and edges never include unauthorized data.
   Polls once per second, `: keep-alive` comments when idle, closes after the max SSE duration.
   Permissions are re-evaluated each tick.
 
+## Dismissing an agent (POST)
+`POST /api/v1/agent-ops/dismiss`, operator API key only (viewer and ingest keys get 403; with `agent_ops` off it is the
+same 404 as the GET routes; the capability stays `agent_ops_v1`). JSON body: `agent_id` and/or `session_id` (each
+`[A-Za-z0-9._:@-]{1,160}`, at least one) and an optional `reason` (string, at most 200 characters; stored, never
+projected). 200 `{"dismissed": <session_id or agent_id>, "cursor": <cursor of the tombstone>}`; 404 when no stored event
+names the target (or it is a `user:` endpoint); 400 on a bad body.
+
+It records a durable envelope-v2 event `session.dismissed` (entity `lifecycle`, source `operator`, provenance `observed`,
+actor = the authenticated key) through the normal ingest path, so it is persisted and survives a restart. One event is
+written per distinct (visibility scope, room) the target was seen in, so everyone who could see the agent sees it dropped
+and no one learns of an agent they could not see. History is never rewritten: `events` and `replay?until=` still return
+the tombstone and the earlier state.
+
+Fold semantics: a `session.dismissed` event hides the node of its `session_id` (else every node of its `agent_id`) from
+`agents`, and with it its edges, room membership, host membership and task links. Any later event of that node (in fold
+order, by time) revives it, so a live agent comes back on its next heartbeat and a dead one stays gone. The fold stays
+pure, order-independent and duplicate-safe; a tombstone never creates a node.
+
+CLI: `herdr-eng agent-ops dismiss <agent_id> [--reason TEXT]` or `dismiss --session ID` (uses `HERDR_CP_URL` and
+`HERDR_CP_API_KEY`/`--api-key`, which must be an operator key). The terminal map has no per-agent action list yet, so
+there is no key binding.
+
 Cursor format: `<ingested_at UTC fixed-width>~<event_id>`; treat as opaque, compare as string.
 
 ## Snapshot JSON

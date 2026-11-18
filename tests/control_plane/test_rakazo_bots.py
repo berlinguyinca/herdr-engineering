@@ -89,3 +89,123 @@ def test_duplicate_computer_unread_and_misc(srv, alice):
     assert api.ok("bots/get", {"botId": bot["id"]}, alice)["unread"] is False
     validate("bots/reorder", api.ok("bots/reorder", {"botIds": [bot["id"]]}, alice))
     validate("threads/endCall", api.ok("threads/endCall", {"botId": bot["id"], "callId": "c1"}, alice))
+
+
+def _listed(api, token):
+    return {b["id"]: b for b in api.ok("bots/list", {}, token)}
+
+
+def test_list_includes_isdefault_false_by_default(srv, alice):
+    _, api = srv
+    bot = new_bot(api, alice)
+    assert _listed(api, alice)[bot["id"]]["isDefault"] is False
+    assert api.ok("bots/get", {"botId": bot["id"]}, alice)["isDefault"] is False
+
+
+def test_update_sets_default_and_clears_previous(srv, alice):
+    _, api = srv
+    a, b = new_bot(api, alice, "A"), new_bot(api, alice, "B")
+    assert api.ok("bots/update", {"botId": a["id"], "isDefault": True}, alice)["isDefault"] is True
+    api.ok("bots/update", {"botId": b["id"], "isDefault": True}, alice)
+    listed = _listed(api, alice)
+    assert [i for i, v in listed.items() if v["isDefault"]] == [b["id"]]
+
+
+def test_update_rejects_non_bool_isdefault(srv, alice):
+    _, api = srv
+    bot = new_bot(api, alice)
+    status, body = rpc(api, "bots/update", {"botId": bot["id"], "isDefault": "yes"}, alice)
+    assert status == 400 and "BAD_REQUEST" in str(body)
+
+
+def test_duplicate_does_not_copy_isdefault(srv, alice):
+    _, api = srv
+    bot = new_bot(api, alice)
+    api.ok("bots/update", {"botId": bot["id"], "isDefault": True}, alice)
+    copy = api.ok("bots/duplicate", {"botId": bot["id"]}, alice)
+    assert copy["isDefault"] is False
+    assert api.ok("bots/get", {"botId": bot["id"]}, alice)["isDefault"] is True
+
+
+def test_archive_default_leaves_no_default_listed(srv, alice):
+    _, api = srv
+    bot = new_bot(api, alice)
+    api.ok("bots/update", {"botId": bot["id"], "isDefault": True}, alice)
+    api.ok("bots/archive", {"botId": bot["id"]}, alice)
+    assert bot["id"] not in _listed(api, alice)
+
+
+def test_concurrent_default_updates_leave_exactly_one(srv, alice):
+    import threading
+    _, api = srv
+    bots = [new_bot(api, alice, f"B{i}") for i in range(4)]
+    errors: list[BaseException] = []
+
+    def mark(bot_id):
+        try:
+            api.ok("bots/update", {"botId": bot_id, "isDefault": True}, alice)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=mark, args=(b["id"],)) for b in bots]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert not errors
+    assert sum(1 for v in _listed(api, alice).values() if v["isDefault"]) == 1
+
+
+def test_archive_racing_set_default_never_loses_archived_at(srv, alice):
+    """The default-flag clear and archive are both read-modify-write on one bot's meta: neither may drop the other's field."""
+    import threading
+    import time
+    server, api = srv
+    x, y = new_bot(api, alice, "X"), new_bot(api, alice, "Y")
+    api.ok("bots/update", {"botId": x["id"], "isDefault": True}, alice)
+    prefs = server.rakazo.prefs
+
+    class SlowReads(type(prefs)):            # a slow store widens the read-modify-write window deterministically
+        def get(self, account, space, kind, key, default=None):
+            found = super().get(account, space, kind, key, default)
+            if kind == "bot_meta":
+                time.sleep(0.2)
+            return found
+
+    prefs.__class__ = SlowReads
+    errors: list[BaseException] = []
+
+    def run(proc, inp):
+        try:
+            api.ok(proc, inp, alice)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    a = threading.Thread(target=run, args=("bots/archive", {"botId": x["id"]}))
+    b = threading.Thread(target=run, args=("bots/update", {"botId": y["id"], "isDefault": True}))
+    b.start()
+    time.sleep(0.1)         # the clear has read X's meta (isDefault) before archive writes; it writes after
+    a.start()
+    a.join()
+    b.join()
+    assert not errors
+    meta = prefs.items(next(iter(server.rakazo.accounts)).account_id, "herdr", "bot_meta")
+    assert meta[x["id"]].get("archivedAt")
+    assert meta[y["id"]]["isDefault"] is True
+
+
+def test_archiving_the_default_clears_the_flag_and_restore_does_not_bring_it_back(srv, alice):
+    _, api = srv
+    bot = new_bot(api, alice)
+    api.ok("bots/update", {"botId": bot["id"], "isDefault": True}, alice)
+    api.ok("bots/archive", {"botId": bot["id"]}, alice)
+    assert next(b for b in api.ok("bots/listArchived", {}, alice) if b["id"] == bot["id"])["isDefault"] is False
+    api.ok("bots/restore", {"botId": bot["id"]}, alice)
+    assert api.ok("bots/get", {"botId": bot["id"]}, alice)["isDefault"] is False
+
+
+def test_an_archived_bot_cannot_be_made_the_default(srv, alice):
+    _, api = srv
+    keep, gone = new_bot(api, alice, "Keep"), new_bot(api, alice, "Gone")
+    api.ok("bots/update", {"botId": keep["id"], "isDefault": True}, alice)
+    api.ok("bots/archive", {"botId": gone["id"]}, alice)
+    assert rpc(api, "bots/update", {"botId": gone["id"], "isDefault": True}, alice)[0] == 409
+    assert api.ok("bots/get", {"botId": keep["id"]}, alice)["isDefault"] is True

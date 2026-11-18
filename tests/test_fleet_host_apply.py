@@ -690,6 +690,79 @@ def test_autospec_dirty_checkout_blocks_and_failed_refresh_leaves_previous_gener
     assert world.run("precheck", repo="autospec", sha=third, env=env)["reason"] == "dirty_checkout"
 
 
+# --------------------------------------------------------------------------- default smoke: launcher resolution
+#
+# The default smoke commands run in the service/ssh environment: the unit's PATH has no ~/.autospec/bin and a
+# non-interactive ssh shell's PATH has no ~/.local/bin, so a bare `autospec`/`pi` is not found there (and
+# `autospec --version` is not a command at all - it exits 2). The adapter resolves the launcher (PATH, then the
+# stable install location, then the bare name so a truly missing launcher still fails closed) and smokes
+# `autospec doctor` instead.
+
+MINIMAL_PATH = "/usr/bin:/bin"        # has `sh`, no autospec/pi on the test hosts or CI runners
+
+
+def recording_binary(path: Path, argv_log: Path, rc: int = 0) -> Path:
+    """A real launcher stand-in: records its argv one per line, then exits rc."""
+    return script(path, f'printf "%s\\n" "$@" >> "{argv_log}"; exit {rc}')
+
+
+def test_autospec_smoke_defaults_to_doctor_and_resolves_the_launcher_from_path(world):
+    world, env = autospec_world(world)
+    target = world.publish("two")
+    assert world.run("apply", repo="autospec", sha=target, env=env)["status"] == "ok"
+    bin_dir = world.root / "bin"
+    bin_dir.mkdir()
+    argv_log = world.root / "autospec.argv"
+    recording_binary(bin_dir / "autospec", argv_log)
+    env = {**env, "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}"}
+    env.pop("HERDR_FLEET_AUTOSPEC_SMOKE_CMD")
+    health = world.run("health", repo="autospec", sha=target, env=env)
+    assert health["status"] == "ok"
+    assert {c["name"]: c["status"] for c in health["checks"]} == {"generation_receipt": "ok", "version_smoke": "ok"}
+    assert argv_log.read_text().splitlines() == ["doctor"]
+    assert_closed(health)
+
+
+def test_autospec_smoke_falls_back_to_the_runtime_bin_when_not_on_path(world):
+    world, env = autospec_world(world)
+    target = world.publish("two")
+    assert world.run("apply", repo="autospec", sha=target, env=env)["status"] == "ok"
+    bin_dir = world.home / ".autospec" / "bin"
+    bin_dir.mkdir(parents=True)
+    argv_log = world.root / "autospec.argv"
+    recording_binary(bin_dir / "autospec", argv_log)
+    env = {**env, "PATH": MINIMAL_PATH}
+    env.pop("HERDR_FLEET_AUTOSPEC_SMOKE_CMD")
+    health = world.run("health", repo="autospec", sha=target, env=env)
+    assert health["status"] == "ok"
+    assert {c["name"]: c["status"] for c in health["checks"]}["version_smoke"] == "ok"
+    assert argv_log.read_text().splitlines() == ["doctor"]
+
+
+def test_autospec_smoke_fails_closed_when_the_launcher_is_nowhere(world):
+    world, env = autospec_world(world)
+    target = world.publish("two")
+    assert world.run("apply", repo="autospec", sha=target, env=env)["status"] == "ok"
+    env = {**env, "PATH": MINIMAL_PATH}
+    env.pop("HERDR_FLEET_AUTOSPEC_SMOKE_CMD")
+    health = world.run("health", repo="autospec", sha=target, env=env)
+    assert (health["status"], health["reason"]) == ("failed", "health_failed")
+    assert {c["name"]: c["status"] for c in health["checks"]} == {"generation_receipt": "ok", "version_smoke": "failed"}
+
+
+def test_pi_smoke_falls_back_to_local_bin_when_not_on_path(world):
+    (world.home / ".local" / "bin").mkdir(parents=True)
+    argv_log = world.root / "pi.argv"
+    recording_binary(world.home / ".local" / "bin" / "pi", argv_log)
+    env = {**world.env, "HERDR_FLEET_PI_STAGE_CMD": str(pi_stage_script(world)), "PATH": MINIMAL_PATH}
+    assert "HERDR_FLEET_PI_SMOKE_CMD" not in env
+    out = world.run("all", repo="pi-engineering", sha=PI_SHAS[0], env=env)
+    assert out["status"] == "ok" and out["after_sha"] == PI_SHAS[0]
+    assert {c["name"]: c["status"] for c in out["checks"]}["version_smoke"] == "ok"
+    assert argv_log.read_text().splitlines() == ["--version"]
+    assert_closed(out)
+
+
 # --------------------------------------------------------------------------- the real CLI
 
 CHECKOUT_ROOT = Path(__file__).resolve().parent.parent

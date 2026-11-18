@@ -1,0 +1,17 @@
+# Example user unit (not installed by anything; the operator installs it). Serves Muse-Glimmer-30B on 127.0.0.1:28931
+# for the always-on review's second tier-1 reviewer. It takes the GPU: do not start it while another job needs it.
+#   cp deploy/ci-review/herdr-muse-serve.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user start herdr-muse-serve.service
+# Leave it disabled (no `enable`) if the GPU is shared: the review treats an unreachable Muse as "reviewer down" and
+# continues with the other reviewers and Opus.
+[Unit]
+Description=Muse-Glimmer-30B llama.cpp server (loopback 28931) for the always-on review
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+ExecStart=%h/IdeaProjects/herdr-engineering/deploy/ci-review/herdr-muse-serve.sh %h/bench-lfm/models
+ExecStop=/usr/bin/docker stop herdr-muse-srv
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=600

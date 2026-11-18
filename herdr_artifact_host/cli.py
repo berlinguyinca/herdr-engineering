@@ -62,6 +62,7 @@ def public_config(cfg: HostConfig) -> PublicConfig:
         public_url=cfg.public_url,
         public_host=cfg.public_host,
         mcp_public_hosts=cfg.mcp_public_hosts,
+        member_host=cfg.member_host or None,
         signing_secret=cfg.claim_key,
         session_seconds=cfg.session_seconds,
         sync_dir=Path(SYNC_DIR),

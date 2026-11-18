@@ -234,6 +234,13 @@ SHA), blocking findings must cite a file in the PR (others are dropped), and a f
 `GH_TOKEN`, no API keys) and the PR title, body and diff are treated as untrusted. "No network" means no network
 tools; the CLIs still reach their own model API.
 
+Tier-1 ensemble: `tiers.tier1.reviewers` runs several open-weight reviewers (`backend: gateway` or `openai`) in
+parallel, read-only. Their deduped findings go to tier 2, where Opus confirms or rejects each (`tier1_checks`) and
+adds its own; tier 2 posts the single comment per head (confirmed, rejected in `<details>`, models per finding). A
+down reviewer is recorded, never fatal. `poll` scope: `repos`, `skip_archived`, `skip_forks`, `skip_drafts`,
+`only_prs_updated_after`, `backfill` (enrolling a repo does not review PRs older than the enrollment) and
+`max_comments_per_hour`; see the example YAML. `herdr-muse-serve.{sh,service}` serve Muse on 127.0.0.1:28931.
+
 Examples (not installed by anything): `always-on-review.example.yaml`, `herdr-always-on-review.service` / `.timer`
 (systemd --user), and `herdr-review-pane.example.sh` (a herdr pane that tails `reviews.jsonl`).
 

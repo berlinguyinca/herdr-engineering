@@ -419,7 +419,8 @@ def test_enabled_members_read_group_ttl_and_optional_limits():
     assert {k: v for k, v in got.items() if k not in ("session_secret", "public_host", "limits")} == {
         "group": "staff", "groups_ttl": 60.0, "removed_grace": 3600.0,
         "defaults": {"max_artifact_bytes": None, "max_member_bytes": 10, "max_artifacts": None},
-        "share_limits": {}, "share_creates_per_hour": 20, "secrets_gid": None, "session_seconds": 14400}
+        "share_limits": {}, "share_creates_per_hour": 20, "secrets_gid": None, "session_seconds": 14400,
+        "member_host": None}
     shares = cli._members_settings(collab(enabled=True, group="staff", share_creates_per_hour=5,
                                           share_limits={"max_share_bytes": 9, "max_total_bytes": None}))
     assert shares["share_creates_per_hour"] == 5

@@ -972,3 +972,29 @@ def test_tagged_content_is_gated_by_operator_egress_routes():
         assert state.egress_check("plain", None)[0] is False
     finally:
         _teardown(proxy, srvs)
+
+
+def test_connect_timeout_guards_only_the_fallback_attempt_not_the_body_read(monkeypatch):
+    """The 10 s first-attempt budget decides when to fall back; once the gateway answered and no fallback
+    exists, a slow body must be read under the long upstream timeout, not the short attempt timeout."""
+    from herdr_engineering import llm_proxy
+    monkeypatch.setattr(llm_proxy, "FALLBACK_ATTEMPT_TIMEOUT_SECONDS", 0.5)
+    _, key, proxy, gpu, cpu, srvs, _ = _policy_setup(base_url=None)
+    handler = srvs[0].RequestHandlerClass
+
+    def slow_body(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.flush()
+        threading.Event().wait(1.5)
+        self.wfile.write(b"{}")
+
+    handler.do_POST = slow_body
+    try:
+        status, _, body = _summary_post(proxy, key)
+        assert status == 200 and body == b"{}"
+    finally:
+        _teardown(proxy, srvs)

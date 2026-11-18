@@ -309,7 +309,7 @@ class Gh:
 
     def open_prs(self, repo: str) -> list[dict]:
         return self.json(["pr", "list", "--repo", repo, "--state", "open", "--limit", "200",
-                          "--json", "number,headRefOid,isDraft"])
+                          "--json", "number,headRefOid,isDraft,updatedAt"])
 
     def file_text(self, repo: str, sha: str, path: str) -> str:
         """One file's full text at exactly this commit (the raw media type: no 1 MB JSON limit)."""

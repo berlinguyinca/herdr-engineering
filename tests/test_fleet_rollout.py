@@ -153,6 +153,9 @@ def apply(store, plan, wire):
                 assert remote[-2:] == ["api", "snapshot"]
                 reply = {"result": {"snapshot": {"agents": wire.native({"host": host})}}}
             return subprocess.CompletedProcess(argv, 0, json.dumps(reply), "")
+        if remote[0] == "env":
+            # The Host-equivalence probe is real git against a real release directory.
+            return subprocess.run(remote, capture_output=True, text=True, timeout=30)
         assert remote[0] == "node"
         root = remote[1].removesuffix("/scripts/pi-engineering.ts")
         if remote[3] == "list":
@@ -1718,3 +1721,431 @@ def test_retire_identityless_is_a_supported_command():
     assert args.rollout_command == "retire-identityless"
     assert args.id == "2a94fdcfa602409989400171a2cd46df"
     assert args.settled_by == "operator"
+
+
+# --- Host code equivalence -------------------------------------------------
+
+
+def _git(cwd, *args):
+    import subprocess
+
+    env = {
+        "PATH": __import__("os").environ["PATH"],
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+    out = subprocess.run(
+        ["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True, env=env
+    )
+    return out.stdout.strip()
+
+
+def _commit(repo, files, message):
+    for name, text in files.items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", message)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+PKG = {
+    "name": "p",
+    "scripts": {"test": "a"},
+    "devDependencies": {"x": "1"},
+    "dependencies": {"y": "1"},
+    "pi": {"extensions": ["./src/runtime/host/entry.ts"]},
+}
+
+
+class HostWorld:
+    """Real source repo plus the staged-release layout the Pi stager produces."""
+
+    def __init__(self, tmp_path, changes):
+        self.home = tmp_path / "home"
+        self.releases = self.home / ".local/share/herdr-engineering/pi/releases"
+        self.releases.mkdir(parents=True)
+        self.source = tmp_path / "source"
+        self.source.mkdir()
+        _git(self.source, "init", "-q")
+        base = {
+            "package.json": json.dumps(PKG),
+            "src/runtime/host/entry.ts": "export const a = 1;\n",
+            "src/runtime/other.ts": "export const b = 1;\n",
+        }
+        self.old = _commit(self.source, base, "old")
+        self.new = _commit(self.source, changes, "new")
+
+    def stage_release(self, commit, *, shallow):
+        """Mirror ansible/files/stage-release.py: a depth-1 clone of one commit."""
+        release = self.releases / commit
+        _git(release.parent, "init", "-q", str(release))
+        _git(release, "remote", "add", "origin", self.source.as_uri())
+        _git(release, "fetch", "-q", *(["--depth", "1"] if shallow else []), "origin", commit)
+        _git(release, "checkout", "-q", "--detach", "FETCH_HEAD")
+        return release
+
+
+def _host_result(tmp_path, changes, host_commit, *, stage_old=False, shallow=True):
+    from herdr_engineering.fleet_rollout import RolloutStore, create_rollout
+
+    world = HostWorld(tmp_path, changes)
+    release = world.stage_release(world.new, shallow=shallow)
+    if stage_old:
+        world.stage_release(world.old, shallow=shallow)
+    wire = Wire()
+    wire.offline = set()
+    revision = world.new
+    wire.stage = lambda rev, *, host, inventory: {
+        "ok": True,
+        "revision": rev,
+        "host": host,
+        "sourceRoot": str(release),
+    }
+    runtime = wire.rows["bender"]["reply"]["data"]["runtime"]
+    runtime["commit"] = revision
+    runtime["hostCommit"] = {"old": world.old, "new": world.new}.get(host_commit, host_commit)
+    wire.rows["bender"]["reply"]["data"]["missions"] = []
+    store = RolloutStore(tmp_path / "state")
+    plan = create_rollout(
+        store,
+        revision,
+        [{"host": "bender", "sshTarget": "bender", "port": 22, "local": False}],
+        inventory=tmp_path / "inventory.yml",
+    )
+    result = apply(store, plan, wire)
+    return world, result["hosts"]["bender"]["sessions"]["bender-conversation"]
+
+
+def test_host_commit_equal_to_release_is_current(tmp_path):
+    _, state = _host_result(tmp_path, {"src/runtime/other.ts": "x"}, "new")
+    assert state["status"] != "bootstrap_required"
+    assert "hostAcceptance" not in state
+
+
+def test_unchanged_host_files_are_accepted_by_code_equivalence(tmp_path):
+    world, state = _host_result(
+        tmp_path, {"src/runtime/other.ts": "export const b = 2;\n"}, "old", stage_old=True
+    )
+    assert state["status"] != "bootstrap_required"
+    assert state["hostAcceptance"]["mode"] == "code-equivalence"
+    assert state["hostAcceptance"]["hostCommit"] == world.old
+    assert state["hostAcceptance"]["revision"] == world.new
+
+
+def test_unchanged_host_files_accepted_when_both_commits_are_present(tmp_path):
+    world, state = _host_result(
+        tmp_path, {"src/runtime/other.ts": "export const b = 2;\n"}, "old", shallow=False
+    )
+    assert state["hostAcceptance"]["hostCommit"] == world.old
+
+
+@pytest.mark.parametrize("path", ["src/runtime/host/entry.ts", "package.json"])
+def test_changed_host_file_still_needs_bootstrap(tmp_path, path):
+    _, state = _host_result(tmp_path, {path: "{changed"}, "old", stage_old=True)
+    assert state["status"] == "bootstrap_required"
+    assert "hostAcceptance" not in state
+
+
+def test_unknown_host_commit_still_needs_bootstrap(tmp_path):
+    _, state = _host_result(tmp_path, {"src/runtime/other.ts": "x"}, "c" * 40)
+    assert state["status"] == "bootstrap_required"
+
+
+def test_unreachable_old_commit_in_shallow_release_still_needs_bootstrap(tmp_path):
+    _, state = _host_result(tmp_path, {"src/runtime/other.ts": "x"}, "old")
+    assert state["status"] == "bootstrap_required"
+
+
+def test_release_without_git_still_needs_bootstrap(tmp_path):
+    import shutil
+
+    from herdr_engineering.fleet_rollout import PiTransport
+
+    world = HostWorld(tmp_path, {"src/runtime/other.ts": "x"})
+    release = world.stage_release(world.new, shallow=False)
+    shutil.rmtree(release / ".git")
+    target = {"host": "bender", "sshTarget": "bender", "port": 22, "local": True}
+    assert PiTransport().host_code_unchanged(target, str(release), world.old, world.new) is None
+
+
+def test_ambient_git_dir_cannot_redirect_the_probe(tmp_path, monkeypatch):
+    from herdr_engineering.fleet_rollout import PiTransport
+
+    world = HostWorld(tmp_path, {"src/runtime/host/entry.ts": "changed"})
+    release = world.stage_release(world.new, shallow=False)
+    monkeypatch.setenv("GIT_DIR", str(world.source / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path))
+    target = {"host": "bender", "sshTarget": "bender", "port": 22, "local": True}
+    assert PiTransport().host_code_unchanged(target, str(release), world.old, world.new) is False
+
+
+def _pkg(**changes):
+    return {"package.json": json.dumps({**PKG, **changes})}
+
+
+@pytest.mark.parametrize(
+    "changes", [{"scripts": {"test": "b", "test:coverage": "c"}}, {"devDependencies": {"x": "2"}}]
+)
+def test_package_json_ignored_keys_are_accepted(tmp_path, changes):
+    world, state = _host_result(tmp_path, _pkg(**changes), "old", stage_old=True)
+    assert state["status"] != "bootstrap_required"
+    assert state["hostAcceptance"]["hostCommit"] == world.old
+    assert state["hostAcceptance"]["packageJsonIgnoredKeys"] == ["devDependencies", "scripts"]
+
+
+@pytest.mark.parametrize(
+    "changes", [{"pi": {"extensions": ["./other.ts"]}}, {"dependencies": {"y": "2"}}]
+)
+def test_package_json_other_keys_need_bootstrap(tmp_path, changes):
+    _, state = _host_result(tmp_path, _pkg(**changes), "old", stage_old=True)
+    assert state["status"] == "bootstrap_required"
+
+
+def test_invalid_package_json_on_one_side_needs_bootstrap(tmp_path):
+    _, state = _host_result(tmp_path, {"package.json": "{not json"}, "old", stage_old=True)
+    assert state["status"] == "bootstrap_required"
+
+
+class LoadedHostWire(Wire):
+    """bender's list misses replies like a loaded host: the first `misses` lists are unreachable."""
+
+    def __init__(self, *, misses=0, error="session_unresponsive"):
+        super().__init__()
+        self.offline.clear()
+        self.misses = misses
+        self.error = error
+        self.lists = 0
+        self.duplicate = False
+
+    def sessions(self, target, root):
+        rows = super().sessions(target, root)
+        if target["host"] != "bender":
+            return rows
+        self.lists += 1
+        if self.lists <= self.misses:
+            return [
+                {
+                    "descriptor": copy.deepcopy(rows[0]["descriptor"]),
+                    "reachable": False,
+                    "error": self.error,
+                }
+            ]
+        if self.duplicate:
+            rows.append(copy.deepcopy(rows[0]))
+        return rows
+
+
+@pytest.fixture
+def no_backoff(monkeypatch):
+    monkeypatch.setattr("herdr_engineering.fleet_rollout._UNREACHABLE_BACKOFF_SECONDS", (0, 0))
+
+
+def _bender(report):
+    return report["hosts"]["bender"]["sessions"]["bender-conversation"]
+
+
+def test_transient_unresponsive_row_keeps_a_complete_session_complete(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire()
+    mission = wire.rows["bender"]["reply"]["data"]["missions"][0]
+    mission.update(status="COMPLETE", resumeEligible=False)
+    done = apply(store, plan, wire)
+    assert _bender(done)["status"] == "complete"
+    wire.misses = wire.lists + 100
+    after = apply(store, plan, wire)
+    session = _bender(after)
+    assert session["status"] == "complete"
+    assert session["lastUnreachableAt"]
+    assert "session_unresponsive" in session["note"]
+    assert "error" not in session
+    assert after["hosts"]["bender"]["status"] == "complete"
+
+
+def test_transiently_unreachable_pending_session_is_not_blocked(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire(misses=100, error="timeout")
+    report = apply(store, plan, wire)
+    session = _bender(report)
+    assert session["status"] == "pending"
+    assert session["lastUnreachableAt"]
+    assert report["hosts"]["bender"]["status"] == "pending"
+    assert "error" not in report["hosts"]["bender"]
+    wire.misses = 0
+    recovered = apply(store, plan, wire)
+    assert _bender(recovered)["status"] == "awaiting_progress"
+
+
+def test_two_reachable_rows_for_one_session_stay_blocked(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire()
+    wire.duplicate = True
+    report = apply(store, plan, wire)
+    assert _bender(report)["status"] == "blocked"
+    assert "ambiguous" in _bender(report)["error"]
+    assert report["hosts"]["bender"]["status"] == "blocked"
+
+
+def test_in_pass_retry_recovers_when_the_second_list_succeeds(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire(misses=1)
+    report = apply(store, plan, wire)
+    session = _bender(report)
+    assert session["status"] == "awaiting_progress"
+    assert "lastUnreachableAt" not in session
+    assert wire.lists >= 2
+
+
+def test_all_process_gone_rows_end_the_session_without_counting_a_success(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire(misses=100, error="session_process_gone")
+    report = apply(store, plan, wire)
+    session = _bender(report)
+    assert session["status"] == "ended"
+    assert session["endedAt"]
+    assert "error" not in session
+    assert report["hosts"]["bender"]["endedSessions"] == ["bender-conversation"]
+    assert report["hosts"]["bender"]["status"] != "blocked"
+    assert not [m for m in wire.mutations if m[0] == "bender"]
+    # The same conversation answering again is picked back up.
+    wire.misses = 0
+    back = apply(store, plan, wire)
+    assert _bender(back)["status"] == "awaiting_progress"
+
+
+class VanishingWire(Wire):
+    """beast's second session leaves the native inventory; its rows may report an error."""
+
+    def __init__(self, error=None):
+        super().__init__()
+        self.offline.clear()
+        self.error = error
+        self.present = True
+
+    def native(self, target):
+        rows = super().native(target)
+        if target["host"] == "beast" and self.present:
+            rows.append(
+                {
+                    "agent": "pi",
+                    "terminal_id": "terminal-2",
+                    "agent_session": {"value": "second-conversation"},
+                    "session": "main",
+                }
+            )
+        return rows
+
+    def sessions(self, target, root):
+        rows = super().sessions(target, root)
+        if target["host"] == "beast":
+            second = copy.deepcopy(rows[0])
+            second["descriptor"].update(sessionId="second-conversation", pid=43)
+            if self.present:
+                rows.append(second)
+            elif self.error:
+                second.update(reachable=False, error=self.error)
+                second.pop("reply")
+                rows.append(second)
+        return rows
+
+
+@pytest.mark.parametrize("error", ["session_process_gone", None])
+def test_session_that_left_the_native_inventory_has_ended(tmp_path, no_backoff, error):
+    store, plan = setup_rollout(tmp_path)
+    wire = VanishingWire(error)
+    first = apply(store, plan, wire)
+    assert first["hosts"]["beast"]["sessions"]["second-conversation"]["status"] != "ended"
+    wire.present = False
+    after = apply(store, plan, wire)
+    beast = after["hosts"]["beast"]
+    assert beast["sessions"]["second-conversation"]["status"] == "ended"
+    assert beast["endedSessions"] == ["second-conversation"]
+    assert not any("missing from native" in e["error"] for e in beast["coverageErrors"])
+    assert "hostLevelError" not in beast
+
+
+class ExitedButListedWire(VanishingWire):
+    """The process exits but its terminal stays in the native inventory."""
+
+    def native(self, target):
+        present, self.present = self.present, True
+        try:
+            return super().native(target)
+        finally:
+            self.present = present
+
+
+@pytest.mark.parametrize("wire_type", [VanishingWire, ExitedButListedWire])
+def test_later_passes_keep_an_ended_sessions_history(tmp_path, no_backoff, wire_type):
+    store, plan = setup_rollout(tmp_path)
+    wire = wire_type("session_process_gone")
+    before = apply(store, plan, wire)["hosts"]["beast"]["sessions"]["second-conversation"]
+    wire.present = False
+    ended = apply(store, plan, wire)["hosts"]["beast"]["sessions"]["second-conversation"]
+    again = apply(store, plan, wire)["hosts"]["beast"]["sessions"]["second-conversation"]
+    assert again["status"] == "ended"
+    assert again["lastStatus"] == before["status"] != "ended"
+    assert again["endedAt"] == ended["endedAt"]
+
+
+def test_unresponsive_session_missing_from_native_is_not_an_error(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = VanishingWire("session_unresponsive")
+    before = apply(store, plan, wire)["hosts"]["beast"]["sessions"]["second-conversation"]
+    wire.present = False
+    beast = apply(store, plan, wire)["hosts"]["beast"]
+    session = beast["sessions"]["second-conversation"]
+    assert session["status"] == before["status"]
+    assert session["lastUnreachableAt"]
+    assert "hostLevelError" not in beast
+
+
+@pytest.mark.parametrize("new_pid", [43, 42])
+def test_revived_session_restarts_maintenance_instead_of_reusing_old_receipts(
+    tmp_path, no_backoff, new_pid
+):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire()
+    first = apply(store, plan, wire)
+    old = _bender(first)
+    assert old["prepared"] is True and old["loaded"]["commit"] == SHA
+    old_operations = copy.deepcopy(old["operations"])
+    assert wire.rows["bender"]["descriptor"]["instanceId"] == "bender-instance-new"
+
+    wire.misses, wire.error = wire.lists + 100, "session_process_gone"
+    ended = _bender(apply(store, plan, wire))
+    assert ended["status"] == "ended"
+
+    # The same conversation resumes in a new process still on the old runtime commit.
+    wire.misses = 0
+    wire.rows["bender"] = wire.row("bender")
+    wire.rows["bender"]["descriptor"].update(pid=new_pid, instanceId="bender-instance-b")
+    calls_before = len(wire.calls)
+    revived = _bender(apply(store, plan, wire))
+
+    new_calls = wire.calls[calls_before:]
+    assert [c["action"] for c in new_calls if c["action"] in ("prepare", "reload")] == [
+        "prepare",
+        "reload",
+    ]
+    old_ids = {op["request"]["operationId"] for op in old_operations.values()}
+    assert not {c["operationId"] for c in new_calls} & old_ids
+    assert {op["request"]["operationId"] for op in revived["operations"].values()}.isdisjoint(
+        old_ids
+    )
+    assert revived["pid"] == new_pid
+    assert revived["loaded"]["commit"] == SHA
+    assert wire.rows["bender"]["reply"]["data"]["runtime"]["commit"] == SHA
+    assert revived["previousIncarnations"] == [
+        {
+            "pid": 42,
+            "instanceId": "bender-instance-new",
+            "endedAt": ended["endedAt"],
+            "lastStatus": old["status"],
+        }
+    ]

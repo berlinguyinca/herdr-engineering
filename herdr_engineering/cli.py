@@ -324,8 +324,8 @@ def _build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--answers", default=None, metavar="PATH",
                             help="YAML/JSON answers file (mode 0600); overrides --from-env")
             sp.add_argument("--with-api-keys", action="store_true",
-                            help="generate control-plane API keys (keyed mode); the dashboard, "
-                                 "llm-proxy and emit hook do not send keys yet")
+                            help="generate control-plane API keys (keyed mode); the dashboard needs the "
+                                 "dashboard proxy, llm-proxy and emit hook send keys once configured")
         if name == "revoke":
             sp.add_argument("host", help="host id in the fleet config")
         if name == "token":
@@ -513,6 +513,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--harness", default=None, help="skip detection and validate this name")
     p2.add_argument("--proc-root", default="/proc", help=argparse.SUPPRESS)
     p2.set_defaults(func=_cmd_handoff_harness)
+    p2 = hsub.add_parser("context-hook", help="UserPromptSubmit hook body (opt-in): ask for /handoff when context is high; never fails")
+    p2.add_argument("harness", help="only claude is supported; anything else is a silent no-op so a hook never fails")
+    p2.set_defaults(func=_cmd_handoff_context_hook)
+    p2 = hsub.add_parser("subagent-hook", help="SubagentStart/SubagentStop hook body: record running subagents per pane; never fails")
+    p2.add_argument("phase", choices=("start", "stop"))
+    p2.set_defaults(func=_cmd_handoff_subagent_hook)
+    p2 = hsub.add_parser("subagents", help="list running subagents registered for a pane (prunes entries older than 6h)")
+    p2.add_argument("--pane", default=None, help="pane id (default: $HERDR_PANE_ID)")
+    p2.add_argument("--json", action="store_true")
+    p2.set_defaults(func=_cmd_handoff_subagents)
+    p2 = hsub.add_parser("auto", help="install, remove or check the opt-in context-hook in ~/.claude/settings.json")
+    p2.add_argument("auto_action", choices=("install", "uninstall", "check"))
+    p2.add_argument("--home", default=None, help="override $HOME (tests)")
+    p2.add_argument("--dry-run", action="store_true", help="report what would change without writing")
+    p2.add_argument("--json", action="store_true")
+    p2.set_defaults(func=_cmd_handoff_auto)
 
     # summary --------------------------------------------------------------
     p = sub.add_parser("summary", help="/summary skill: install, verify, remove, read session history")
@@ -596,6 +612,26 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("hook_harness", choices=("pi", "claude", "codex", "opencode"))
     p2.add_argument("hook_event")
     p2.set_defaults(func=_cmd_memory_hook)
+
+    # workflow -------------------------------------------------------------
+    p = sub.add_parser("workflow", help="managed Claude Code hooks for the default engineering workflow: "
+                                        "plan/install/status/doctor/repair/uninstall")
+    wsub = p.add_subparsers(dest="workflow_command", required=True)
+    for name, helptext in (("plan", "show what install would change (read-only)"),
+                           ("install", "register the managed SessionStart/PreCompact/PreToolUse hooks in ~/.claude/settings.json"),
+                           ("status", "managed-hook state (read-only)"),
+                           ("doctor", "drift check"),
+                           ("repair", "re-apply missing or drifted managed hooks"),
+                           ("uninstall", "remove only the managed hooks (backup first)")):
+        p2 = wsub.add_parser(name, help=helptext)
+        p2.add_argument("--home", default=None, help="override $HOME (isolated testing)")
+        if name in ("install", "repair", "uninstall"):
+            p2.add_argument("--dry-run", action="store_true", help="show the plan; write nothing")
+        p2.add_argument("--json", action="store_true")
+        p2.set_defaults(func=_cmd_workflow)
+    p2 = wsub.add_parser("hook", help="hook runner (prints a short reminder; never fails a session)")
+    p2.add_argument("hook_event")
+    p2.set_defaults(func=_cmd_workflow_hook)
 
     # journal --------------------------------------------------------------
     p = sub.add_parser("journal", help="session journal & timeline (spec 0090)")
@@ -1449,6 +1485,11 @@ def _cmd_doctor(args) -> int:
     return doctor_main(args)
 
 
+def _cmd_handoff_context_hook(args) -> int:
+    from .handoff_context_hook import run_context_hook
+    return run_context_hook(args.harness)
+
+
 def _cmd_handoff_harness(args) -> int:
     from . import handoff_harness as hh
     try:
@@ -1458,6 +1499,32 @@ def _cmd_handoff_harness(args) -> int:
         return 2
     _print_json(found.to_dict())
     return 0
+
+
+def _cmd_handoff_auto(args) -> int:
+    from . import handoff_auto_setup as ha
+    home = Path(args.home) if args.home else None
+    if args.auto_action == "check":
+        items = ha.check(home)
+    else:
+        items = (ha.install if args.auto_action == "install" else ha.uninstall)(home, dry_run=args.dry_run)
+    ok = all(i.action not in ha.FAIL_ACTIONS for i in items)
+    if args.json:
+        _print_json({"ok": ok, "results": [i.to_dict() for i in items]})
+    else:
+        for item in items:
+            print(f"{item.action:10} {item.target}" + (f"  ({item.detail})" if item.detail else ""))
+    return 0 if ok else 1
+
+
+def _cmd_handoff_subagent_hook(args) -> int:
+    from .handoff_subagent_registry import run_subagent_hook
+    return run_subagent_hook(args.phase)
+
+
+def _cmd_handoff_subagents(args) -> int:
+    from .handoff_subagent_registry import run_subagents
+    return run_subagents(args.pane, as_json=args.json)
 
 
 def _cmd_summary_manage(args) -> int:
@@ -1537,6 +1604,41 @@ def _cmd_memory(args) -> int:
             if r.diff and (dry or cmd == "plan"):
                 print(r.diff, end="")
     return 0 if res.ok else 1
+
+
+def _cmd_workflow(args) -> int:
+    from .workflow_hooks import WorkflowInstaller
+    inst = WorkflowInstaller(Path(args.home) if args.home else None)
+    cmd, dry = args.workflow_command, getattr(args, "dry_run", False)
+    if cmd == "doctor":
+        out = inst.doctor()
+        if args.json:
+            _print_json(out)
+        else:
+            for c in out["checks"]:
+                print(f"{c['status'].upper():8} {c['name']}  {c['detail']}")
+            print(f"overall: {out['overall']}")
+        return 0 if out["ok"] else 1
+    if cmd == "status":
+        res = inst.status()
+    elif cmd == "plan":
+        res = inst.install(dry_run=True)
+    elif cmd in ("install", "repair"):
+        res = inst.install(dry_run=dry)
+    else:
+        res = inst.uninstall(dry_run=dry)
+    if args.json:
+        _print_json(res.to_dict())
+    else:
+        print(f"{res.action:9} {res.path}" + (f"  [{res.state}]" if res.state != "absent" else ""))
+        if res.diff and (dry or cmd == "plan"):
+            print(res.diff, end="")
+    return 0 if res.ok else 1
+
+
+def _cmd_workflow_hook(args) -> int:
+    from .workflow_hooks import run_hook
+    return run_hook(args.hook_event, sys.stdin, sys.stdout)
 
 
 def _cmd_memory_mcp_serve(args) -> int:
@@ -1796,10 +1898,17 @@ def _cmd_fleet_config(args) -> int:
 
 
 def _cmd_fleet_lock_verify(args) -> int:
+    import tempfile
+
     from .fleet_watch import lock, state
+    directory = state.state_dir()
     try:
-        with state.single_instance(state.state_dir()):      # the watcher fetches into the same cache clones
-            rows = lock.verify_lock(args.lock, converged=state.load().get("converged", {}))
+        if directory.is_dir():
+            with state.single_instance(directory):          # the watcher fetches into the same cache clones
+                rows = lock.verify_lock(args.lock, converged=state.load(directory).get("converged", {}))
+        else:                                               # no watcher ever ran: read-only means leaving no state behind
+            with tempfile.TemporaryDirectory(prefix="herdr-lock-verify-") as scratch:
+                rows = lock.verify_lock(args.lock, directory=Path(scratch))
     except state.WatcherBusy:
         print(json.dumps({"ok": False, "status": "busy"}) if args.json else "lock verify: busy (watcher pass running)")
         return 3
@@ -1818,6 +1927,7 @@ def _cmd_fleet_lock_verify(args) -> int:
 
 def _cmd_fleet_host_apply(args) -> int:
     from .fleet_watch import host_apply
+    host_apply.terminate_on_sigterm()
     try:
         result = host_apply.run_phase(args.phase, rollout_id=args.rollout, repo=args.repo, sha=args.sha,
                                       host=args.host, before_sha=args.before_sha, busy_retries=args.busy_retries,
@@ -4283,11 +4393,14 @@ def _assistant_worker_install_hooks(args) -> int:
     return 0
 
 
+_CP_CHECKPOINT_REASON_STAGES = frozenset({'migration', 'index_preparation', 'materialization'})
+
+
 def _cmd_cp_checkpoint(args) -> int:
     import asyncio
 
     from .control_plane.db import Migrator
-    from .control_plane.projection_refresh import refresh_checkpoint
+    from .control_plane.projection_refresh import _safe_message, refresh_checkpoint
     from .control_plane.projection_store import CheckpointInvalid, ProjectionStore
 
     stage = 'configuration'
@@ -4320,8 +4433,11 @@ def _cmd_cp_checkpoint(args) -> int:
     except (Exception, SystemExit) as exc:
         error = {"ok": False, "error": type(exc).__name__, "stage": stage}
         if isinstance(exc, CheckpointInvalid):
-            # Only our own static validation messages are safe to surface.
+            # Only our own static validation messages are safe to surface at any stage.
             error['reason'] = str(exc)
+        elif isinstance(exc, ValueError) and stage in _CP_CHECKPOINT_REASON_STAGES:
+            # After the connection is open; a connection-stage ValueError can quote DSN fragments.
+            error['reason'] = _safe_message(exc)
         _print_json(error)
         return 1
     _print_json({"ok": True, **result})
@@ -5221,8 +5337,9 @@ def _members_settings(cp) -> dict | None:
     share = cp.get("share") if isinstance(cp, dict) else None
     host = share.get("public_host") if isinstance(share, dict) else None
     seconds = share.get("session_seconds") if isinstance(share, dict) else None
+    own = share.get("member_host") if isinstance(share, dict) else None
     try:
-        return parse_members(raw, public_host=host, session_seconds=seconds)
+        return parse_members(raw, public_host=host, session_seconds=seconds, member_host=own)
     except ValueError as exc:
         raise SystemExit(f"fleet config {exc}") from None
 
@@ -5242,7 +5359,7 @@ def _member_web(cp, collab, args):
         return None
     from .control_plane.member_web import MemberWeb
     return MemberWeb(collab, public_host=got["public_host"], session_secret=got["session_secret"].encode("utf-8"),
-                     session_seconds=got["session_seconds"],
+                     session_seconds=got["session_seconds"], member_host=got.get("member_host"),
                      web_root=getattr(args, "web_root", None), public_config=collab.public_config,
                      require_https=bool(getattr(args, "collab_require_https", False)))
 

@@ -1,0 +1,44 @@
+---
+# Keep the herdr-engineering DEPLOYMENT checkout and its pointer file in place on every fleet host.
+#
+# The herdr-engineering rollout row (fleet-watch `fleet host-apply`) resolves the host's deployment
+# checkout from $HERDR_ENGINEERING_REPO or the one-line file ~/.config/herdr-engineering/
+# deployment-checkout (a non-interactive ssh shell has no profile environment), then fast-forwards it
+# and pip-installs from it. Nothing else provisions either, so on a fresh host the row fails closed
+# with "no deployment checkout" - the 2026-11-17 first rollout hit exactly that on all three hosts
+# (it was masked: the rollout had already halted on the autospec row).
+#
+# The clone is DEDICATED: separate from any development checkout (the D6 gate requires clean + main +
+# published) and never the immutable per-revision release dirs under herdr/releases/ (those are pinned
+# to a sha, not on main - fabric-agent.yml's set_fact repurposes the `herdr_engineering_checkout`
+# variable to point at them, which is why this task uses its own variable). `update: true` keeps the
+# clone fresh between rollouts, like the autospec fleet checkout; fast-forwarding AT rollout time is
+# the row's job. Override the path per host in host_vars with `fleet_deployment_checkout:`.
+- name: "Resolve the deployment checkout path (dedicated clone, not dev work, not the release dirs)"
+  become: false
+  ansible.builtin.set_fact:
+    fleet_deployment_checkout: "{{ fleet_deployment_checkout | default(fleet_home ~ '/.local/share/herdr-engineering/fleet-checkout') }}"
+
+- name: "Create the deployment checkout parent directory"
+  become: false
+  ansible.builtin.file:
+    path: "{{ fleet_deployment_checkout | dirname }}"
+    state: directory
+    mode: "0755"
+
+- name: "Check out the herdr-engineering deployment clone (ff to main; never touches dev work)"
+  become: false
+  ansible.builtin.git:
+    repo: "ssh://git@github.com/berlinguyinca/herdr-engineering.git"
+    dest: "{{ fleet_deployment_checkout }}"
+    version: main
+    update: true
+    force: false
+    accept_hostkey: true
+
+- name: "Point host-apply at the deployment checkout (one-line file, absolute path, 0600)"
+  become: false
+  ansible.builtin.copy:
+    dest: "{{ fleet_home }}/.config/herdr-engineering/deployment-checkout"
+    mode: "0600"
+    content: "{{ fleet_deployment_checkout }}\n"

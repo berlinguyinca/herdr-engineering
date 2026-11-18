@@ -135,3 +135,13 @@ def test_flags_the_skill_types_for_takeover_exist_in_the_installed_cli():
             assert not unknown, (
                 f"the {surface} types {unknown}; takeover offers {sorted(advertised)}"
             )
+
+
+def test_the_skill_finishes_or_hands_over_running_subagents_before_the_close():
+    """Closing the pane kills this session's subagents; the skill must not close under running work."""
+    text = _skill().lower()
+    assert "subagent" in text, "the skill must address subagents that are still running"
+    assert "before the close" in text or "before running `herdr-handoff takeover`" in text
+    assert "--keep-source" in text and "still running" in text, (
+        "the skill must say to keep the source when work is still running"
+    )
