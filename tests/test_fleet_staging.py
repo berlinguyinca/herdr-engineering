@@ -261,3 +261,90 @@ def test_already_staged_release_is_reused_without_change(repository, tmp_path):
     again, changed = stage.stage_or_reuse(home, sha, 'pi', str(repo), runner)
     assert changed is False and again == first
     assert 'npm' not in calls  # nothing reinstalled
+
+
+# --- #881: receipts prove the artifact they describe --------------------------
+
+
+def test_receipt_records_deterministic_artifact_digest(repository, tmp_path):
+    stage = module()
+    repo, sha = repository
+    one = stage.stage_pi(tmp_path / 'home-a', sha, repository=str(repo), runner=install_ok)
+    two = stage.stage_pi(tmp_path / 'home-b', sha, repository=str(repo), runner=install_ok)
+    # The digest proves the staged content, not just the recorded commit.
+    assert one['artifactDigest'].startswith('sha256:')
+    # Two independent stagings of one commit must agree: the digest is content,
+    # order-independent, and free of install-specific noise (node_modules, .git).
+    assert one['artifactDigest'] == two['artifactDigest']
+    release = Path(one['sourceRoot'])
+    assert one['artifactDigest'] == stage.compute_digest(release)
+    # A receipt also carries an (initially empty) patch ledger.
+    assert one['patches'] == []
+
+
+def test_artifact_digest_ignores_git_and_node_modules(repository, tmp_path):
+    stage = module()
+    repo, sha = repository
+    result = stage.stage_pi(tmp_path / 'home', sha, repository=str(repo), runner=install_ok)
+    release = Path(result['sourceRoot'])
+    baseline = stage.compute_digest(release)
+    # node_modules is install-owned and .git is VCS metadata; neither is the artifact.
+    (release / 'node_modules' / 'injected.js').write_text('side effect')
+    (release / '.git' / 'injected').write_text('tamper')
+    assert stage.compute_digest(release) == baseline
+
+
+def test_artifact_digest_changes_when_a_tracked_file_is_edited(repository, tmp_path):
+    stage = module()
+    repo, sha = repository
+    result = stage.stage_pi(tmp_path / 'home', sha, repository=str(repo), runner=install_ok)
+    release = Path(result['sourceRoot'])
+    baseline = stage.compute_digest(release)
+    (release / 'package.json').write_text('{"name":"pi-engineering-runtime","edited":true}')
+    assert stage.compute_digest(release) != baseline
+
+
+def test_verify_artifact_reports_drift_when_digest_disagrees_and_no_patches(repository, tmp_path):
+    # The exact 599c06d0 incident shape: artifact changed, patch ledger empty.
+    stage = module()
+    repo, sha = repository
+    result = stage.stage_pi(tmp_path / 'home', sha, repository=str(repo), runner=install_ok)
+    release = Path(result['sourceRoot'])
+    receipt = json.loads((release.parents[1] / 'receipts' / (sha + '.json')).read_text())
+    assert stage.verify_artifact(release, receipt) == 'verified'
+    (release / 'package.json').write_text('{"name":"pi-engineering-runtime","hotpatch":true}')
+    assert stage.verify_artifact(release, receipt) == 'drift'
+
+
+def test_verify_artifact_reports_unknown_for_pre_digest_receipt(repository, tmp_path):
+    # Receipts written before #881 have no artifactDigest: unknown, never verified.
+    stage = module()
+    repo, sha = repository
+    result = stage.stage_pi(tmp_path / 'home', sha, repository=str(repo), runner=install_ok)
+    release = Path(result['sourceRoot'])
+    assert stage.verify_artifact(release, {'revision': sha, 'sourceRoot': str(release)}) == 'unknown'
+
+
+def test_record_patch_appends_ledger_entry_and_keeps_verification_honest(repository, tmp_path):
+    stage = module()
+    repo, sha = repository
+    result = stage.stage_pi(tmp_path / 'home', sha, repository=str(repo), runner=install_ok)
+    release = Path(result['sourceRoot'])
+    root = release.parents[1]
+    target = release / 'package.json'
+    before = stage.compute_digest(release)
+    target.write_text('{"name":"pi-engineering-runtime","hotpatch":683}')
+    after = stage.compute_digest(release)
+    entry = stage.record_patch(root, sha, path='package.json', before=before, after=after,
+                               actor='operator', reason='pi#683 hotpatch')
+    assert entry['path'] == 'package.json'
+    assert entry['beforeDigest'] == before and entry['afterDigest'] == after
+    assert entry['actor'] == 'operator' and entry['reason'] == 'pi#683 hotpatch'
+    assert 'appliedAt' in entry
+    receipt = json.loads((root / 'receipts' / (sha + '.json')).read_text())
+    assert receipt['patches'] == [entry]
+    # A recorded patch chain that explains the current content verifies.
+    assert stage.verify_artifact(release, receipt) == 'verified'
+    # A further undocumented edit drifts again.
+    target.write_text('{"name":"pi-engineering-runtime","hotpatch":683,"sneaky":true}')
+    assert stage.verify_artifact(release, receipt) == 'drift'

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -499,6 +500,48 @@ class Autospec:
 
 # --------------------------------------------------------------------------- pi-engineering (D7)
 
+# #881: a release receipt must prove the content it names, not merely exist. The
+# digest contract matches ansible/files/stage-release.py (a standalone, stdlib-only
+# script pushed to hosts); it is duplicated here rather than imported because the two
+# live in different deployment units. sha256 over sorted relpath + NUL + bytes,
+# excluding install-owned (node_modules) and VCS (.git) trees.
+_DIGEST_EXCLUDED = {".git", "node_modules"}
+
+
+def _artifact_digest(release: Path) -> str:
+    entries = [p for p in release.rglob("*")
+               if p.is_file() and not p.is_symlink()
+               and p.relative_to(release).parts[0] not in _DIGEST_EXCLUDED]
+    digest = hashlib.sha256()
+    for path in sorted(entries, key=lambda p: p.relative_to(release).as_posix()):
+        digest.update(path.relative_to(release).as_posix().encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(path.read_bytes())
+    return "sha256:" + digest.hexdigest()
+
+
+def receipt_status(release: Path, receipt: dict) -> str:
+    """Classify a staged release by content against its receipt: ``verified`` (digest
+    matches, or a recorded patch chain explains the difference), ``drift`` (content
+    changed with no ledger entry -- the 599c06d0 shape), or ``unknown`` (a pre-#881
+    receipt carries no digest, so it is neither trusted nor condemned)."""
+    recorded = receipt.get("artifactDigest")
+    if not recorded:
+        return "unknown"
+    current = _artifact_digest(release)
+    if current == recorded:
+        return "verified"
+    expected = recorded
+    patches = receipt.get("patches") or []
+    for patch in patches:
+        if patch.get("beforeDigest") != expected:
+            return "drift"
+        expected = patch.get("afterDigest")
+    if patches and expected == current:
+        return "verified"
+    return "drift"
+
+
 class Pi:
     def root(self, ctx: Context) -> Path:
         return ctx.home / ".local" / "share" / "herdr-engineering" / "pi"
@@ -514,8 +557,21 @@ class Pi:
     def complete(self, ctx: Context, sha: str) -> bool:
         root = self.root(ctx)
         release = root / "releases" / sha
-        return ((release / "package.json").is_file() and (release / "node_modules").is_dir()
-                and (root / "receipts" / f"{sha}.json").is_file())
+        receipt = root / "receipts" / f"{sha}.json"
+        if not ((release / "package.json").is_file() and (release / "node_modules").is_dir()
+                and receipt.is_file()):
+            return False
+        # Existence is not integrity (#881): a receipt that records a digest is checked
+        # against the on-disk content, so an in-place edit reads as incomplete, not clean.
+        # A pre-#881 receipt has no digest (unknown) and stays reusable.
+        try:
+            data = json.loads(receipt.read_text())
+        except (OSError, ValueError):
+            return False
+        if receipt_status(release, data) == "drift":
+            ctx.note(f"release {sha} content does not match its receipt digest")
+            return False
+        return True
 
     def converged(self, ctx: Context) -> bool:
         return self.installed(ctx) == ctx.sha and self.complete(ctx, ctx.sha)

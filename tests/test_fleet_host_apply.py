@@ -644,6 +644,44 @@ def test_pi_incomplete_stage_is_failed(world):
     assert not (world.home / ".local/share/herdr-engineering/pi/current").exists()
 
 
+def _pi_artifact_digest(release: Path) -> str:
+    # The #881 content digest contract: sha256 over sorted relpath + NUL + bytes,
+    # excluding install-owned (node_modules) and VCS (.git) trees.
+    digest = hashlib.sha256()
+    files = [p for p in sorted(release.rglob("*"), key=lambda p: p.relative_to(release).as_posix())
+             if p.is_file() and not p.is_symlink()
+             and p.relative_to(release).parts[0] not in {".git", "node_modules"}]
+    for path in files:
+        digest.update(path.relative_to(release).as_posix().encode())
+        digest.update(b"\x00")
+        digest.update(path.read_bytes())
+    return "sha256:" + digest.hexdigest()
+
+
+def test_pi_complete_consults_the_artifact_digest(world):
+    # A receipt that records a digest must be checked against the content: an
+    # in-place edit (the 599c06d0 shape) makes the release incomplete, not clean.
+    release = make_release(world, PI_SHAS[0])
+    root = world.home / ".local/share/herdr-engineering/pi"
+    receipt = root / "receipts" / f"{PI_SHAS[0]}.json"
+    receipt.write_text(json.dumps({"revision": PI_SHAS[0], "sourceRoot": str(release),
+                                   "artifactDigest": _pi_artifact_digest(release), "patches": []}))
+    ctx = host_apply.Context(RID, "pi-engineering", PI_SHAS[0], "bender", env={"HOME": str(world.home)})
+    pi = host_apply.Pi()
+    assert pi.complete(ctx, PI_SHAS[0]) is True
+    (release / "package.json").write_text('{"name":"pi-engineering-runtime","hotpatch":true}')
+    assert pi.complete(ctx, PI_SHAS[0]) is False
+
+
+def test_pi_complete_tolerates_pre_digest_receipt(world):
+    # A pre-#881 receipt has no digest (unknown): still reusable, not condemned.
+    release = make_release(world, PI_SHAS[0])
+    ctx = host_apply.Context(RID, "pi-engineering", PI_SHAS[0], "bender", env={"HOME": str(world.home)})
+    assert host_apply.Pi().complete(ctx, PI_SHAS[0]) is True
+    (release / "package.json").write_text('{"name":"pi-engineering-runtime","edited":true}')
+    assert host_apply.Pi().complete(ctx, PI_SHAS[0]) is True
+
+
 def test_pi_refuses_to_replace_a_real_current_directory(world):
     root = world.home / ".local/share/herdr-engineering/pi"
     (root / "current").mkdir(parents=True)

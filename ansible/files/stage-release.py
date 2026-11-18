@@ -8,13 +8,19 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import platform
 import re
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
+
+# Content that is install-owned (node_modules) or VCS metadata (.git) is not the
+# artifact a release name denotes, so it is excluded from the content digest.
+DIGEST_EXCLUDED = {'.git', 'node_modules'}
 
 REPOSITORIES = {
     'pi': 'https://github.com/berlinguyinca/pi-engineering.git',
@@ -47,6 +53,64 @@ def validate_revision(revision):
         raise ValueError('A full immutable commit ID is required')
     if platform.system() not in ('Linux', 'Darwin'):
         raise RuntimeError('Release staging supports Linux and macOS only')
+
+
+def compute_digest(release):
+    """sha256 over sorted ``relpath + NUL + bytes`` for every regular file under
+    ``release`` except install-owned/VCS trees. Order-independent and
+    rename-sensitive, so it proves the staged content, not the recorded commit.
+    Two stagings of one commit produce the same digest; any in-place edit changes it."""
+    release = Path(release)
+    entries = []
+    for path in release.rglob('*'):
+        relative = path.relative_to(release)
+        if relative.parts and relative.parts[0] in DIGEST_EXCLUDED:
+            continue
+        if path.is_file() and not path.is_symlink():
+            entries.append(relative)
+    digest = hashlib.sha256()
+    for relative in sorted(entries, key=lambda item: item.as_posix()):
+        digest.update(relative.as_posix().encode('utf-8'))
+        digest.update(b'\x00')
+        digest.update((release / relative).read_bytes())
+    return 'sha256:' + digest.hexdigest()
+
+
+def verify_artifact(release, receipt):
+    """Classify a staged release against its receipt by content, not by HEAD.
+
+    ``verified`` -- current content matches the receipt's digest, or a recorded
+    patch chain explains the difference end to end. ``drift`` -- content differs
+    with no ledger entry that accounts for it (the 599c06d0 incident shape).
+    ``unknown`` -- a pre-#881 receipt has no digest, so it can be neither trusted
+    nor condemned."""
+    recorded = receipt.get('artifactDigest')
+    if not recorded:
+        return 'unknown'
+    current = compute_digest(release)
+    if current == recorded:
+        return 'verified'
+    expected = recorded
+    patches = receipt.get('patches') or []
+    for patch in patches:
+        if patch.get('beforeDigest') != expected:
+            return 'drift'
+        expected = patch.get('afterDigest')
+    if patches and expected == current:
+        return 'verified'
+    return 'drift'
+
+
+def record_patch(root, revision, *, path, before, after, actor, reason):
+    """Append one ledger entry to a release receipt's ``patches`` list so an
+    in-place edit leaves a verifiable paper trail instead of silent drift."""
+    receipt = Path(root) / 'receipts' / (revision + '.json')
+    data = json.loads(receipt.read_text())
+    entry = {'path': path, 'beforeDigest': before, 'afterDigest': after,
+             'appliedAt': datetime.now(timezone.utc).isoformat(), 'actor': actor, 'reason': reason}
+    data.setdefault('patches', []).append(entry)
+    atomic_json(receipt, data)
+    return entry
 
 
 def verify_checkout(path, revision, runner):
@@ -158,7 +222,8 @@ def _stage(home, revision, kind, repository, runner):
             runner([str(venv / 'bin/python'), '-m', 'pip', 'install', '--quiet', '--upgrade', str(release)])
             verify_herdr_distribution(home, release, runner)
         verify_checkout(release, revision, runner)
-        result = {'revision': revision, 'sourceRoot': str(release)}
+        result = {'revision': revision, 'sourceRoot': str(release),
+                  'artifactDigest': compute_digest(release), 'patches': []}
         atomic_json(receipt, result)
         if pending_settings:
             settings, before, value = pending_settings
@@ -199,7 +264,15 @@ def describe(home, kind, runner=run):
         if result['sourceRoot'] != str(release):
             return None
         verify_checkout(release, revision, runner)
-        if json.loads((root / 'receipts' / (revision + '.json')).read_text()) != result:
+        receipt = json.loads((root / 'receipts' / (revision + '.json')).read_text())
+        # installed.json and the receipt must agree on identity; the receipt may
+        # additionally carry a patch ledger that installed.json does not mirror.
+        if ({k: v for k, v in receipt.items() if k != 'patches'}
+                != {k: v for k, v in result.items() if k != 'patches'}):
+            return None
+        # Verify by content: a drifted artifact is not the release it claims to be.
+        # A pre-#881 receipt (unknown) stays reusable but is surfaced by callers.
+        if verify_artifact(release, receipt) == 'drift':
             return None
         if kind == 'pi':
             packages = json.loads((home / '.pi/agent/settings.json').read_text()).get('packages', [])
