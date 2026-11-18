@@ -11,7 +11,9 @@ from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
 from .herdr_session import herdr_session_id, is_safe_session_id
 from .windows import lookup_window
 
-PROMPT_PLACEHOLDER = "Ask anything"  # the empty prompt's placeholder, from the OpenCode binary's strings; not read from a live pane
+# UNCONFIRMED until the live measurement task: the empty prompt's placeholder as found in the OpenCode binary's
+# strings (`Ask anything... "<example>"`), not read from a live pane
+PROMPT_PLACEHOLDER = "Ask anything"
 _READY_STATUSES = frozenset({"idle", "done"})
 _LINES_AT_BOTTOM = 8  # the prompt box, its agent/model row and the footer; the placeholder higher up is old output
 _BUSY_TIMEOUT_S = 0.25  # a busy database must not hold the controller up; the next poll asks again
@@ -25,23 +27,27 @@ def _xdg(env: Mapping[str, str], name: str, default: Path) -> Path:
 
 def _connect(db: Path) -> sqlite3.Connection:
     """A read-only connection: never writes, never creates a missing database."""
-    return sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT_S)
+    return sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT_S)
+
+
+def _count(value: object) -> int:
+    """A token count, else 0 (a bool is not a count)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _context_tokens(tokens: object) -> int | None:
     """Tokens in the context after this reply, else None when none were recorded.
 
     `total` is input + output + reasoning + cache read + cache write of the reply (checked on real rows);
-    a reply that never completed records all zeros and no total.
+    a reply that never completed records all zeros and no total. When total is absent or 0 the parts are summed.
     """
     if not isinstance(tokens, dict):
         return None
-    total = tokens.get("total")
-    if not isinstance(total, int):
+    total = _count(tokens.get("total"))
+    if total <= 0:
         cache = tokens.get("cache")
-        parts = [tokens.get(key) for key in _USAGE_FIELDS]
-        parts += [cache.get("read"), cache.get("write")] if isinstance(cache, dict) else []
-        total = sum(part for part in parts if isinstance(part, int))
+        cache = cache if isinstance(cache, dict) else {}
+        total = sum(_count(tokens.get(key)) for key in _USAGE_FIELDS) + _count(cache.get("read")) + _count(cache.get("write"))
     return total if total > 0 else None
 
 
@@ -64,6 +70,7 @@ def _last_usage(db: Path, session_id: str) -> tuple[int, str | None, str | None]
     """
     with closing(_connect(db)) as con:
         for data in _assistant_messages(con, session_id):
+            # a summary reply is `{"mode": "compaction", "summary": true}` in the real database (142 rows seen)
             if data.get("mode") == "compaction" or data.get("summary") is True:
                 return None
             used = _context_tokens(data.get("tokens"))
@@ -100,6 +107,8 @@ class OpenCodeAdapter:
     def locate_session(self, session_id: str | None, cwd: Path, pane_id: str) -> SessionRef | None:
         if session_id is not None and not is_safe_session_id(session_id):
             return None
+        # An id is matched on its own, without comparing the session's directory with cwd: a pane's cwd can differ
+        # from where the session was started. That is only safe because the id comes from Herdr for this pane.
         db = self._db_path()
         try:
             with closing(_connect(db)) as con:
@@ -150,7 +159,10 @@ class OpenCodeAdapter:
         return any(PROMPT_PLACEHOLDER in line for line in lines[-_LINES_AT_BOTTOM:])
 
     def exit_plan(self) -> ExitPlan:
+        # UNCONFIRMED until the live measurement task: /exit is OpenCode's documented command (aliases /quit, /q);
+        # the name was not found in the binary's strings, and the Enter submit key and 15 s timeout are unmeasured
         return ExitPlan("/exit", ("Enter",), 15.0)
 
     def compact_input(self) -> TypedInput:
+        # /compact is confirmed in the binary's slash command list (alias /summarize); Enter as the submit key is unmeasured
         return TypedInput("/compact", ("Enter",))

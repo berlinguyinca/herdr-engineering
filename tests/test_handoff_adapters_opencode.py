@@ -27,10 +27,19 @@ def _db_path(home: Path) -> Path:
     return home / ".local" / "share" / "opencode" / "opencode.db"
 
 
+def _build(db: Path) -> None:
+    """Build a database from the committed SQL dump (a .db file is gitignored, so the fixture is text)."""
+    con = sqlite3.connect(db)
+    try:
+        con.executescript((FIXTURES / "opencode.sql").read_text(encoding="utf-8"))
+    finally:
+        con.close()
+
+
 def _install(home: Path, config: bool = True, catalogue: bool = True) -> Path:
     db = _db_path(home)
     db.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy(FIXTURES / "opencode.db", db)
+    _build(db)
     if config:
         (home / ".config" / "opencode").mkdir(parents=True)
         shutil.copy(FIXTURES / "opencode.json", home / ".config" / "opencode" / "opencode.json")
@@ -100,7 +109,7 @@ def test_zero_or_missing_usage_is_skipped_not_read_as_zero(tmp_path):
     reading = OpenCodeAdapter(home=tmp_path, env={}).read_context(_ref(db))
     assert reading is not None and reading.used_tokens == 54542
     only = tmp_path / "only.db"
-    shutil.copy(FIXTURES / "opencode.db", only)
+    _build(only)
     con = sqlite3.connect(only)
     con.execute("delete from message where json_extract(data, '$.role') = 'assistant' and "
                 "coalesce(json_extract(data, '$.tokens.total'), 0) > 0")
@@ -196,7 +205,7 @@ def test_malformed_window_entries_fall_through(tmp_path):
 def test_xdg_directories_come_from_the_given_env(tmp_path):
     data, config, cache = tmp_path / "d", tmp_path / "c", tmp_path / "k"
     (data / "opencode").mkdir(parents=True)
-    shutil.copy(FIXTURES / "opencode.db", data / "opencode" / "opencode.db")
+    _build(data / "opencode" / "opencode.db")
     (config / "opencode").mkdir(parents=True)
     shutil.copy(FIXTURES / "opencode.json", config / "opencode" / "opencode.json")
     env = {"XDG_DATA_HOME": str(data), "XDG_CONFIG_HOME": str(config), "XDG_CACHE_HOME": str(cache)}
@@ -255,6 +264,7 @@ def test_not_a_database_gives_none(tmp_path):
 
 
 def test_db_opened_read_only(tmp_path):
+    """Rollback-journal mode (the fixture as built): a writer's open transaction does not stop a read-only reader."""
     db = _install(tmp_path)
     writer = sqlite3.connect(db, isolation_level=None)
     writer.execute("BEGIN IMMEDIATE")  # a second real connection holds an open write transaction
@@ -353,12 +363,101 @@ def test_harness_and_registry():
 
 
 def test_fixture_and_test_carry_no_personal_data():
-    for path in (FIXTURES / "opencode.db", FIXTURES / "opencode.json", FIXTURES / "models.json", Path(__file__)):
+    for path in (FIXTURES / "opencode.sql", FIXTURES / "opencode.json", FIXTURES / "models.json", Path(__file__)):
         text = path.read_bytes().decode("latin-1")
         assert "/" + "Users/" not in text and "wohl" + "gemuth" not in text.lower()
-    con = sqlite3.connect(f"{(FIXTURES / 'opencode.db').as_uri()}?mode=ro", uri=True)
+    con = sqlite3.connect(":memory:")
+    con.executescript((FIXTURES / "opencode.sql").read_text(encoding="utf-8"))
     try:
         assert con.execute("select count(*) from session").fetchone() == (1,)
         assert con.execute("select title, slug, directory from session").fetchone() == ("redacted", "redacted", "/home/user/proj")
     finally:
         con.close()
+
+
+def _wal(db: Path) -> sqlite3.Connection:
+    """A writer connection on the database in WAL mode (as OpenCode runs it), with checkpointing off."""
+    writer = sqlite3.connect(db, isolation_level=None)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    return writer
+
+
+def test_wal_reader_is_not_blocked_by_an_open_write_transaction(tmp_path):
+    db = _install(tmp_path)
+    writer = _wal(db)
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute("insert into message (id, session_id, time_created, time_updated, data) "
+                   "values ('msg_held', ?, 3000000000000, 3000000000000, ?)", (SESSION, json.dumps(_reply("gemma4:26b", 1))))
+    try:
+        reading = OpenCodeAdapter(home=tmp_path, env={}).read_context(_ref(db))
+        assert reading is not None and reading.used_tokens == 54542  # the old committed state, not None, not the held row
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
+
+
+def test_wal_rows_committed_but_not_checkpointed_are_visible(tmp_path):
+    db = _install(tmp_path)
+    writer = _wal(db)
+    try:
+        writer.execute("insert into message (id, session_id, time_created, time_updated, data) "
+                       "values ('msg_wal', ?, 3000000000000, 3000000000000, ?)", (SESSION, json.dumps(_reply("gemma4:26b", 61000))))
+        assert (db.parent / "opencode.db-wal").stat().st_size > 0  # the row is in the -wal file only
+        reading = OpenCodeAdapter(home=tmp_path, env={}).read_context(_ref(db))
+        assert reading is not None and reading.used_tokens == 61000
+        assert OpenCodeAdapter(home=tmp_path, env={}).locate_session(SESSION, CWD, "w1:p1") is not None
+    finally:
+        writer.close()
+
+
+def test_session_id_resolves_even_when_its_directory_differs_from_the_pane_cwd(tmp_path):
+    db = _install(tmp_path)
+    moved = Path("/home/user/elsewhere")  # the id comes from Herdr for this pane; the session was started in CWD
+    ref = OpenCodeAdapter(home=tmp_path, env={}).locate_session(SESSION, moved, "w1:p1")
+    assert ref == SessionRef(Harness.OPENCODE, "w1:p1", moved, SESSION, db)
+
+
+def test_relative_xdg_data_home_is_resolved_not_raised(tmp_path, monkeypatch):
+    (tmp_path / "rel" / "opencode").mkdir(parents=True)
+    _build(tmp_path / "rel" / "opencode" / "opencode.db")
+    monkeypatch.chdir(tmp_path)  # a relative path is taken against the working directory
+    adapter = OpenCodeAdapter(home=tmp_path / "elsewhere", env={"XDG_DATA_HOME": "rel"})
+    ref = adapter.locate_session(SESSION, CWD, "w1:p1")
+    assert ref is not None
+    assert adapter.read_context(ref).used_tokens == 54542
+
+
+def test_total_of_zero_with_parts_sums_the_parts(tmp_path):
+    db = _install(tmp_path)
+    parts = {"input": 100, "output": 20, "reasoning": 5, "cache": {"read": 300, "write": 7}}
+    _message(db, 1, {"role": "assistant", "providerID": "ollama", "modelID": "gemma4:26b", "tokens": {"total": 0, **parts}})
+    assert OpenCodeAdapter(home=tmp_path, env={}).read_context(_ref(db)).used_tokens == 432
+
+
+def test_a_bool_is_not_a_token_count(tmp_path):
+    db = _install(tmp_path)
+    _message(db, 1, {"role": "assistant", "providerID": "ollama", "modelID": "gemma4:26b",
+                     "tokens": {"total": True, "input": True, "output": 0, "cache": {"read": True, "write": 0}}})
+    assert OpenCodeAdapter(home=tmp_path, env={}).read_context(_ref(db)).used_tokens == 54542  # skipped as no usage
+
+
+def test_database_without_a_message_table_gives_none(tmp_path):
+    db = tmp_path / "other.db"
+    con = sqlite3.connect(db)
+    con.execute("create table unrelated (x integer)")
+    con.commit()
+    con.close()
+    adapter = OpenCodeAdapter(home=tmp_path, env={"XDG_DATA_HOME": str(tmp_path / "d")})
+    assert adapter.read_context(_ref(db)) is None
+
+
+@pytest.mark.parametrize("payload", ["[1, 2]", "42", '"text"', "null", "not json"])
+def test_message_data_that_is_not_an_object_is_skipped(tmp_path, payload):
+    db = _install(tmp_path)
+    con = sqlite3.connect(db)
+    con.execute("insert into message (id, session_id, time_created, time_updated, data) "
+                "values ('msg_odd', ?, 3000000000000, 3000000000000, ?)", (SESSION, payload))
+    con.commit()
+    con.close()
+    assert OpenCodeAdapter(home=tmp_path, env={}).read_context(_ref(db)).used_tokens == 54542
