@@ -9,13 +9,13 @@ from pathlib import Path
 
 from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
 from .herdr_session import herdr_session_id, is_safe_session_id
+from .screen import screen_rows
 from .windows import lookup_window
 
-# UNCONFIRMED until the live measurement task: the empty prompt's placeholder as found in the OpenCode binary's
-# strings (`Ask anything... "<example>"`), not read from a live pane
+# the empty prompt's placeholder, `Ask anything... "<example>"`; measured in a live pane (OpenCode 1.18.23, 2026-11-18)
 PROMPT_PLACEHOLDER = "Ask anything"
 _READY_STATUSES = frozenset({"idle", "done"})
-_LINES_AT_BOTTOM = 8  # the prompt box, its agent/model row and the footer; the placeholder higher up is old output
+_LINES_AT_BOTTOM = 8  # non-blank rows: the prompt box (placeholder is its 7th from last), hints and footer; higher up is old output
 _BUSY_TIMEOUT_S = 0.25  # a busy database must not hold the controller up; the next poll asks again
 _USAGE_FIELDS = ("input", "output", "reasoning")
 
@@ -155,14 +155,14 @@ class OpenCodeAdapter:
     def is_ready_for_input(self, screen: str, agent_status: str) -> bool:
         if agent_status not in _READY_STATUSES:
             return False
-        lines = screen.rstrip().splitlines()  # a pane screen is padded with blank rows
+        lines = [plain for _, plain in screen_rows(screen) if plain]  # coloured, and OpenCode leaves blank rows inside its layout
         return any(PROMPT_PLACEHOLDER in line for line in lines[-_LINES_AT_BOTTOM:])
 
     def exit_plan(self) -> ExitPlan:
-        # UNCONFIRMED until the live measurement task: /exit is OpenCode's documented command (aliases /quit, /q);
-        # the name was not found in the binary's strings, and the Enter submit key and 15 s timeout are unmeasured
+        # measured in a live pane (OpenCode 1.18.23, 2026-11-18): /exit then Enter ended the process in 0.4 s; the 15 s is margin
         return ExitPlan("/exit", ("Enter",), 15.0)
 
     def compact_input(self) -> TypedInput:
-        # /compact is confirmed in the binary's slash command list (alias /summarize); Enter as the submit key is unmeasured
+        # still unconfirmed live: the slash menu of a session-less pane does not list /compact (it is in the binary's
+        # command list, alias /summarize), and no session was started to see it
         return TypedInput("/compact", ("Enter",))

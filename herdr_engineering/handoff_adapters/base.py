@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 MAX_TYPED_BYTES = 900  # typed into a terminal pane; longer input is mangled by paste handling
+# Pause between typing text and sending its submit keys. Codex 0.169.0 ignored an Enter sent in the same instant as
+# "/exit" (the text stayed in the composer) and obeyed it after 0.1 s; 0.3 s is the margin. Measured 2026-11-18.
+TYPE_TO_SUBMIT_DELAY_S = 0.3
 
 WindowSource = Literal["recorded", "model_table", "fallback"]
 

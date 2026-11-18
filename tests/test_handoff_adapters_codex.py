@@ -167,3 +167,22 @@ def test_read_context_window_matches_recorded_field(tmp_path):
     assert reading is not None
     assert reading.window_tokens == events[-1]["model_context_window"]
     assert reading.window_source == "recorded"
+
+
+# screens captured from a real codex pane (`herdr pane read --format ansi`), 2026-11-18, redacted
+REAL_EMPTY = (FIXTURES / "screen_empty.ansi").read_text(encoding="utf-8")
+REAL_TYPED = (FIXTURES / "screen_typed.ansi").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("status", ["idle", "done"])
+def test_real_screen_with_an_empty_prompt_is_ready(status):
+    assert CodexAdapter().is_ready_for_input(REAL_EMPTY, status)
+
+
+def test_real_screen_with_typed_text_is_not_ready():
+    assert not CodexAdapter().is_ready_for_input(REAL_TYPED, "idle")
+
+
+@pytest.mark.parametrize("status", ["working", "blocked", "unknown"])
+def test_real_empty_screen_is_not_ready_while_the_harness_is_busy(status):
+    assert not CodexAdapter().is_ready_for_input(REAL_EMPTY, status)

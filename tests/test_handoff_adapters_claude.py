@@ -324,3 +324,22 @@ def test_a_reply_after_the_compact_boundary_is_read(tmp_path):
     path = _install(tmp_path, cwd, "compaction_then_reply.jsonl")
     reading = ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd))
     assert reading is not None and reading.used_tokens == 4 + 900 + 100
+
+
+# screens captured from a real claude pane (`herdr pane read --format ansi`), 2026-11-18, redacted
+REAL_EMPTY = (FIXTURES / "screen_empty.ansi").read_text(encoding="utf-8")
+REAL_TYPED = (FIXTURES / "screen_typed.ansi").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("status", ["idle", "done"])
+def test_real_screen_with_an_empty_prompt_is_ready(status):
+    assert ClaudeAdapter().is_ready_for_input(REAL_EMPTY, status)
+
+
+def test_real_screen_with_typed_text_is_not_ready():
+    assert not ClaudeAdapter().is_ready_for_input(REAL_TYPED, "idle")
+
+
+@pytest.mark.parametrize("status", ["working", "blocked", "unknown"])
+def test_real_empty_screen_is_not_ready_while_the_harness_is_busy(status):
+    assert not ClaudeAdapter().is_ready_for_input(REAL_EMPTY, status)

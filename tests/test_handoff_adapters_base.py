@@ -67,7 +67,6 @@ def test_unknown_model_resolves_to_fallback(model):
     assert FALLBACK_WINDOW == 128_000
 
 
-@pytest.mark.skip(reason="adapter modules land in Tasks 2-5 and are wired in Task 7")
 @pytest.mark.parametrize("harness", list(Harness))
 def test_adapter_for_returns_adapter_per_harness(harness):
     assert adapter_for(harness).harness is harness

@@ -8,9 +8,10 @@ from pathlib import Path
 from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput, WindowSource
 from .herdr_session import herdr_session_id, is_safe_session_id
 from .records import records_newest_first
+from .screen import screen_rows, typed_text
 from .windows import lookup_window, strip_date_suffix
 
-PROMPT_MARKER = "❯"  # the empty input box of Claude Code, on a line of its own between two rules
+PROMPT_MARKER = "❯"  # the input box row of Claude Code between two rules, a faint suggestion after it when empty; live pane, 2.1.306, 2026-11-18
 _READY_STATUSES = frozenset({"idle", "done"})
 _LINES_BELOW_PROMPT = 4  # the closing rule and the status line(s); anything more means the box is not last
 _SYNTHETIC_MODEL = "<synthetic>"  # zero-usage placeholder entries Claude Code writes for local events
@@ -133,12 +134,11 @@ class ClaudeAdapter:
     def is_ready_for_input(self, screen: str, agent_status: str) -> bool:
         if agent_status not in _READY_STATUSES:
             return False
-        lines = [line.strip() for line in screen.rstrip().splitlines()]  # a pane screen is padded with blank rows
-        for index in range(len(lines) - 1, -1, -1):
-            if lines[index] == PROMPT_MARKER:
-                return len(lines) - 1 - index <= _LINES_BELOW_PROMPT
-            if lines[index].startswith(PROMPT_MARKER):
-                return False  # input already typed
+        rows = screen_rows(screen)  # Herdr's screen carries colour codes; the prompt's faint suggestion is not typed text
+        for index in range(len(rows) - 1, -1, -1):
+            typed = typed_text(rows[index][0], PROMPT_MARKER)
+            if typed is not None:
+                return not typed and len(rows) - 1 - index <= _LINES_BELOW_PROMPT
         return False
 
     def exit_plan(self) -> ExitPlan:

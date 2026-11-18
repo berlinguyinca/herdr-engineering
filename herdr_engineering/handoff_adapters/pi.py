@@ -9,9 +9,10 @@ from pathlib import Path
 from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
 from .herdr_session import herdr_agent_session, is_safe_session_id
 from .records import records_newest_first
+from .screen import screen_rows
 from .windows import lookup_window
 
-EDITOR_RULE = "─"  # Pi draws its input editor as a blank line between two rows of these; read from a live pane
+EDITOR_RULE = "─"  # Pi draws its input editor as a blank line between two rows of these; live pane, Pi 1.3.0, 2026-11-18
 _READY_STATUSES = frozenset({"idle", "done"})
 _LINES_BELOW_EDITOR = 3  # the footer rows under the closing rule; anything more means the editor is not last
 _UUID_AT_END = re.compile(r"_([0-9A-Fa-f-]{36})$")  # <timestamp>_<uuid>.jsonl
@@ -128,7 +129,7 @@ class PiAdapter:
     def is_ready_for_input(self, screen: str, agent_status: str) -> bool:
         if agent_status not in _READY_STATUSES:
             return False
-        lines = [line.strip() for line in screen.rstrip().splitlines()]  # a pane screen is padded with blank rows
+        lines = [plain for _, plain in screen_rows(screen)]  # a pane screen is padded with blank rows and coloured
         for index in range(len(lines) - 1, 1, -1):
             if lines[index] and set(lines[index]) == {EDITOR_RULE}:  # the closing rule: a bare row of rule characters
                 return (not lines[index - 1] and set(lines[index - 2]) == {EDITOR_RULE}

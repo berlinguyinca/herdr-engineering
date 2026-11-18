@@ -245,3 +245,22 @@ def test_read_context_window_matches_recorded_field(tmp_path):
     assert reading is not None
     assert reading.window_tokens == next(e["contextWindow"] for e in entries if e["id"] == "qwen3.8-flash_next")
     assert reading.window_source == "recorded"
+
+
+# screens captured from a real pi pane (`herdr pane read --format ansi`), 2026-11-18, redacted
+REAL_EMPTY = (FIXTURES / "screen_empty.ansi").read_text(encoding="utf-8")
+REAL_TYPED = (FIXTURES / "screen_typed.ansi").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("status", ["idle", "done"])
+def test_real_screen_with_an_empty_prompt_is_ready(status):
+    assert PiAdapter().is_ready_for_input(REAL_EMPTY, status)
+
+
+def test_real_screen_with_typed_text_is_not_ready():
+    assert not PiAdapter().is_ready_for_input(REAL_TYPED, "idle")
+
+
+@pytest.mark.parametrize("status", ["working", "blocked", "unknown"])
+def test_real_empty_screen_is_not_ready_while_the_harness_is_busy(status):
+    assert not PiAdapter().is_ready_for_input(REAL_EMPTY, status)

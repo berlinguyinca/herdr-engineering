@@ -18,6 +18,8 @@ def pytest_configure(config):
 
 def pytest_collection_modifyitems(items):
     for item in items:
+        if item.get_closest_marker("herdr_live"):
+            continue  # opens panes in the user's own Herdr: opt in with -m herdr_live, never part of the acceptance run
         path = str(item.fspath).replace("\\", "/")
         if "tests/e2e" in path:
             unit = path.rsplit("/", 1)[-1] in _UNIT_FILES
