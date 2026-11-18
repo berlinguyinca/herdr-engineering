@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# herdr-deploy canonical routing v1
+if [ ! -x /home/wohlgemuth/.local/bin/herdr-deploy ]; then
+  echo 'canonical herdr-deploy unavailable; refusing legacy deployment' >&2
+  exit 69
+fi
+exec /home/wohlgemuth/.local/bin/herdr-deploy "$@"
+exit 69
+# Original entry point retained verbatim below (unreachable).
+#!/usr/bin/env bash
 # Build the control-plane web image from a git ref and roll it, with rollback.
 #
 #   deploy/control-plane/deploy.sh [--ref origin/main] [--dry-run] [--no-fetch]
@@ -282,7 +291,7 @@ if [ -z "$HEALTH_URL" ]; then
   case "$BIND" in *:*) BIND="[$BIND]" ;; esac   # IPv6 literal
   HEALTH_URL="http://${BIND:-127.0.0.1}:${PORT:-80}/api/v1/health"
 fi
-HEALTH_TRIES="${HERDR_CP_HEALTH_TRIES:-30}"
+HEALTH_TRIES="${HERDR_CP_HEALTH_TRIES:-300}"
 HEALTH_INTERVAL="${HERDR_CP_HEALTH_INTERVAL:-2}"
 
 COLLAB_HASH=""
