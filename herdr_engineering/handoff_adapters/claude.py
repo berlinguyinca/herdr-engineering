@@ -1,4 +1,5 @@
 """Claude Code adapter: context from the session transcript, drain and exit by typing into the pane."""
+import json
 import re
 import time
 from collections.abc import Mapping
@@ -43,6 +44,30 @@ def _last_usage(path: Path) -> tuple[int, str | None] | None:
     return None
 
 
+def _catalog_window(home: Path, model: str | None) -> int | None:
+    """runtime.max_input_tokens Claude Code's cached model catalogue lists for the model, else None.
+
+    The catalogue (~/.claude/cache/model-catalog/<org>-<hash>-cc.json, one file per account) is Claude Code's own
+    record of each model's limits; the newest file that lists the model wins.
+    """
+    best: tuple[int, int] | None = None  # (fetchedAt, window)
+    for path in (home / ".claude" / "cache" / "model-catalog").glob("*-cc.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            fetched = data["fetchedAt"]
+            models = data["catalog"]["config"]["models"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if not isinstance(fetched, int) or not isinstance(models, list):
+            continue
+        for entry in models:  # one malformed entry must not hide the others
+            runtime = entry.get("runtime") if isinstance(entry, dict) and entry.get("id") == model else None
+            window = runtime.get("max_input_tokens") if isinstance(runtime, dict) else None
+            if isinstance(window, int) and not isinstance(window, bool) and window > 0 and (best is None or fetched > best[0]):
+                best = (fetched, window)
+    return best[1] if best else None
+
+
 class ClaudeAdapter:
     harness = Harness.CLAUDE
 
@@ -75,7 +100,8 @@ class ClaudeAdapter:
         if found is None:
             return None
         used, model = found
-        window, window_source = lookup_window(model)  # the transcript records no window
+        recorded = _catalog_window(self._home, model)  # the transcript records no window; Claude Code's catalogue does
+        window, window_source = (recorded, "recorded") if recorded is not None else lookup_window(model)
         return ContextReading(used, window, "claude-transcript", window_source, time.time())
 
     def drain_input(self, order: str) -> TypedInput:

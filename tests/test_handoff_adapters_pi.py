@@ -1,4 +1,5 @@
 """Pi adapter, against real (redacted) session lines laid out as Pi lays them out (sessions/<slug>/<ts>_<uuid>.jsonl)."""
+import json
 import shutil
 from pathlib import Path
 
@@ -236,3 +237,11 @@ def test_not_ready_while_working_or_with_typed_input_or_without_editor():
 
 def test_ready_ignores_blank_padding_below_the_screen():
     assert PiAdapter().is_ready_for_input(IDLE_SCREEN + "\n" * 40, "idle")
+
+
+def test_read_context_window_matches_recorded_field(tmp_path):
+    reading = _read(tmp_path, "main.jsonl")  # provider metabolomics, model qwen3.8-flash_next
+    entries = json.loads((FIXTURES / "models.json").read_text())["providers"]["metabolomics"]["models"]
+    assert reading is not None
+    assert reading.window_tokens == next(e["contextWindow"] for e in entries if e["id"] == "qwen3.8-flash_next")
+    assert reading.window_source == "recorded"

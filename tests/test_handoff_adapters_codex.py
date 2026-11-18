@@ -1,4 +1,5 @@
 """Codex adapter, against real (redacted) rollout lines laid out as Codex lays them out (sessions/Y/M/D)."""
+import json
 import shutil
 from pathlib import Path
 
@@ -151,3 +152,13 @@ def test_not_ready_while_working_or_with_typed_input_or_without_prompt():
 
 def test_ready_ignores_blank_padding_below_the_screen():
     assert CodexAdapter().is_ready_for_input(IDLE_SCREEN + "\n" * 40, "idle")
+
+
+def test_read_context_window_matches_recorded_field(tmp_path):
+    path = _install(tmp_path, "main.jsonl")
+    events = [json.loads(line)["payload"]["info"] for line in path.read_text().splitlines()
+              if '"token_count"' in line]
+    reading = CodexAdapter(home=tmp_path).read_context(_ref(path))
+    assert reading is not None
+    assert reading.window_tokens == events[-1]["model_context_window"]
+    assert reading.window_source == "recorded"

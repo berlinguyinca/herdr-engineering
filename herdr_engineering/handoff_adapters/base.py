@@ -33,6 +33,10 @@ class ContextReading:
     window_source: WindowSource
     measured_at: float
 
+    def __post_init__(self) -> None:
+        if self.window_tokens <= 0:
+            raise ValueError("window_tokens must be positive")  # a zero window would divide by zero in percent
+
     @property
     def percent(self) -> float:
         return self.used_tokens / self.window_tokens * 100

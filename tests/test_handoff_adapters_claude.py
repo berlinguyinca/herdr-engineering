@@ -1,4 +1,5 @@
 """Claude Code adapter, against real (redacted) transcript files laid out as Claude Code lays them out."""
+import json
 import re
 import shutil
 from pathlib import Path
@@ -176,3 +177,53 @@ def test_not_ready_while_working_or_with_typed_input_or_without_prompt():
 
 def test_ready_ignores_blank_padding_below_the_screen():
     assert ClaudeAdapter().is_ready_for_input(IDLE_SCREEN + "\n" * 40, "idle")
+
+
+def _install_catalog(home: Path, *names: str) -> None:
+    directory = home / ".claude" / "cache" / "model-catalog"
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        shutil.copy(FIXTURES / name, directory / f"org-{name.removesuffix('.json')}-cc.json")
+
+
+def _catalog_limit(name: str, model: str) -> int:
+    models = json.loads((FIXTURES / name).read_text())["catalog"]["config"]["models"]
+    return next(m["runtime"]["max_input_tokens"] for m in models if m["id"] == model)
+
+
+def test_read_context_window_matches_recorded_field(tmp_path):
+    cwd = tmp_path / "work"
+    path = _install(tmp_path, cwd, "main_chain.jsonl")  # model claude-opus-4-8, which the table says is 200000
+    _install_catalog(tmp_path, "model-catalog.json")
+    reading = ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd))
+    assert reading is not None
+    assert reading.window_tokens == _catalog_limit("model-catalog.json", "claude-opus-4-8") == 1_000_000
+    assert reading.window_source == "recorded"
+
+
+def test_newest_catalogue_listing_the_model_wins(tmp_path):
+    cwd = tmp_path / "work"
+    path = _install(tmp_path, cwd, "main_chain.jsonl")
+    _install_catalog(tmp_path, "model-catalog-older.json", "model-catalog.json")
+    reading = ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd))
+    assert (reading.window_tokens, reading.window_source) == (1_000_000, "recorded")
+
+
+def test_model_the_catalogue_does_not_list_uses_the_table(tmp_path):
+    cwd = tmp_path / "work"
+    path = _install(tmp_path, cwd, "main_chain.jsonl")
+    path.write_text(path.read_text().replace("claude-opus-4-8", "claude-opus-4-5"))
+    _install_catalog(tmp_path, "model-catalog.json")
+    reading = ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd))
+    assert (reading.window_tokens, reading.window_source) == (200_000, "model_table")
+
+
+def test_unreadable_catalogue_falls_back_to_the_table(tmp_path):
+    cwd = tmp_path / "work"
+    path = _install(tmp_path, cwd, "main_chain.jsonl")
+    directory = tmp_path / ".claude" / "cache" / "model-catalog"
+    directory.mkdir(parents=True)
+    (directory / "org-x-cc.json").write_text("{not json")
+    (directory / "org-y-cc.json").write_text('{"catalog": {"config": {"models": [{"id": "claude-opus-4-8", "runtime": {"max_input_tokens": 0}}]}}}')
+    reading = ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd))
+    assert (reading.window_tokens, reading.window_source) == (200_000, "model_table")

@@ -461,3 +461,11 @@ def test_message_data_that_is_not_an_object_is_skipped(tmp_path, payload):
     con.commit()
     con.close()
     assert OpenCodeAdapter(home=tmp_path, env={}).read_context(_ref(db)).used_tokens == 54542
+
+
+def test_read_context_window_matches_recorded_field(tmp_path):
+    reading = _read(tmp_path)  # the fixture's latest reply is ollama/gemma4:26b
+    config = json.loads((FIXTURES / "opencode.json").read_text())
+    assert reading is not None
+    assert reading.window_tokens == config["provider"]["ollama"]["models"]["gemma4:26b"]["limit"]["context"]
+    assert reading.window_source == "recorded"
