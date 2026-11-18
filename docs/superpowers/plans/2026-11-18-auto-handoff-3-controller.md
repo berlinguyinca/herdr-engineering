@@ -103,7 +103,7 @@
 
 **Files:** Create `handoff_controller/run.py`, `deploy/herdr-handoff-controller-plugin/herdr-plugin.toml` (`[[startup]]` command `herdr-eng handoff controller run`; `[[actions]]` `handoff-controller-status`; `min_herdr_version = "0.9.1"`, as in `deploy/herdr-agent-ops-plugin/herdr-plugin.toml`); Modify `herdr_engineering/cli.py` (handoff subparser: `controller run [--once] [--interval 5]`); Test `tests/test_handoff_controller_run.py`.
 
-**Interfaces:** Produces `run_once`, `serve` (index). Skips a pane with `is_enabled` False (event `handoff.skipped`, reason `switch_off`) or `read_context` None (reason `no_window`/`no_record`), once per pane per reason. Tick interval 5s. The side pane (plan 4) creation hook: on the first managed session in a tab, call `side_pane.ensure(tab_id)` when that module exists.
+**Interfaces:** Produces `run_once`, `serve` (index). Skips a pane with `is_enabled` False (event `handoff.skipped`, reason `switch_off`) or `read_context` None (reason `no_record`: no usage yet; a missing window never skips — adapters fall back per plan 0), once per pane per reason. Tick interval 5s. The side pane (plan 4) creation hook: on the first managed session in a tab, call `side_pane.ensure(tab_id)` when that module exists.
 
 - [ ] **Step 1: Failing tests:** `test_run_once_drains_session_at_limit` (a real pane running a script that appends usage lines to a fixture Claude transcript to reach 81%), `test_run_once_ignores_session_below_limit`, `test_skipped_event_once_per_reason`, `test_restart_resumes_from_event_log`, manifest parse test `test_plugin_manifest_valid` (via `herdr plugin link` dry run or the existing manifest tests' loader).
 - [ ] **Step 2-4:** FAIL, implement, PASS.
