@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Memory client pin: 0.1.8 → 0.1.10
+
+- `PINNED_REVISION`/`PINNED_CLIENT_VERSION` and `lock/upstreams.yaml` move to `eb1338a4067d4e17910a9f651fc7c08551f5b8a9` (client `0.1.10`, contract v1 unchanged). Three commits ahead of the previous pin: `f3a20ba` makes recall/documents degrade to empty on a never-written bank and adds `provision` plus per-bank `bank:<id>` doctor checks (herdr-memory#18, closes #17); `66eb463` bumps to 0.1.9 and adds the repo's first CI plus the version-parity test that guards the two-builds-one-version-string incident (herdr-memory#19); `eb1338a` gives every queued operation a terminal attempt record and surfaces vanished rows as `status.lost` / doctor `lost` (herdr-memory#20, closes #4). Every host in the fleet was already running 0.1.10, so `memory doctor` reported `package_revision` and `client_version` drift on each one; this reconciles the pin with what is deployed rather than pulling anything new in, the same shape as the 0.1.7 → 0.1.8 bump. Verified against the upstream tree at that revision (`pyproject.toml` → `version = "0.1.10"`, `herdr_memory/__init__.py` → `__version__ = '0.1.10'`), not from a tag or a version string in a log. `tests/test_memory_install.py::test_pin_matches_lock` fails on a partial bump. Because the pin is part of the managed-block marker, hosts need `herdr-eng memory upgrade` after this ships.
+
 ### Fix: phone Assistants tab lists only online agent bots
 
 - `bots/list` (and the bootstrap payload built from it) now returns only collab agents that are online; stale tokenless-join test agents no longer flood the tab. Nothing is revoked or deleted: an offline agent still resolves through `bots/get`, `threads/get` and `threads/send` by id. A separate list of offline agents is not exposed (the archived list means disabled assistants and `bots/restore` cannot restore an agent).

@@ -35,9 +35,9 @@ from typing import Any
 MARKER = "herdr-memory:managed"
 ADAPTER_VERSION = 3
 # Pinned herdr-memory revision; must match lock/upstreams.yaml (tested).
-PINNED_REVISION = "d48b334b6236065aa188a696dc6e9095b04ca761"
+PINNED_REVISION = "eb1338a4067d4e17910a9f651fc7c08551f5b8a9"
 #: Client release the fleet is expected to run (`herdr-memory --version`).
-PINNED_CLIENT_VERSION = "0.1.8"
+PINNED_CLIENT_VERSION = "0.1.10"
 #: An unattended controller update older than this looks like a timer that stopped landing.
 FRESH_UPDATE_HOURS = 26
 SERVER_NAME = "herdr-memory"
