@@ -13,11 +13,11 @@ dependencies:
     note: "Required cross-harness artifact skill, installed into the same four harnesses as herdr-handoff."
   herdr-memory:
     source: "berlinguyinca/herdr-memory"
-    revision: "d48b334b6236065aa188a696dc6e9095b04ca761"
+    revision: "eb1338a4067d4e17910a9f651fc7c08551f5b8a9"
     decision: ADOPT
     license: "private"
-    maintenance: "active; private Hindsight-backed memory client (contract v1, client 0.1.8)"
-    note: "Optional managed harness config via herdr-eng memory install; also the canonical dashboard CLI when authorized viewers are configured. Pin must match herdr_engineering.memory_install.PINNED_REVISION and PINNED_CLIENT_VERSION (0.1.8). Offline validate-config checks schema/URL without credentials, network or cache state (herdr-memory#15); 0.1.8 names the row that stops an outbox from draining (herdr-memory#16)."
+    maintenance: "active; private Hindsight-backed memory client (contract v1, client 0.1.10)"
+    note: "Optional managed harness config via herdr-eng memory install; also the canonical dashboard CLI when authorized viewers are configured. Pin must match herdr_engineering.memory_install.PINNED_REVISION and PINNED_CLIENT_VERSION (0.1.10). Offline validate-config checks schema/URL without credentials, network or cache state (herdr-memory#15); 0.1.8 names the row that stops an outbox from draining (herdr-memory#16); 0.1.9 adds the repo's first CI and a version-parity test guarding the two-builds-one-version-string incident (herdr-memory#19); 0.1.10 gives every queued operation a terminal attempt record and surfaces vanished rows as `status.lost` / doctor `lost` (herdr-memory#20, closes #4), and 0.1.9's line also makes recall/documents degrade to empty on a never-written bank and adds `provision` plus per-bank `bank:<id>` doctor checks (herdr-memory#18, closes #17)."
   herdr-memory-deploy:
     source: "berlinguyinca/herdr-memory"
     revision: "c4e0c64"

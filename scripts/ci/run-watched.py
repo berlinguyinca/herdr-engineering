@@ -2,7 +2,7 @@
 """run-watched SOFT HARD -- command...
 
 SOFT seconds of wall time: print one notice to stderr, keep running (never kills).
-HARD seconds with NO progress: kill the command and everything it started, exit 124. Progress = any new output byte, or CPU time
+HARD seconds with NO progress: stop the command (SIGTERM, short grace, then SIGKILL) and everything it started, exit 124. Progress = any new output byte, or CPU time
 used by (or a new process appearing in) the command's process tree. The tree is every process that is in the command's session, a
 descendant by parent pid, or carries this run's unique token in its environment (HERDR_RUN_WATCHED_TOKEN, inherited through fork/exec).
 The token is what finds a Postgres started by `pg_ctl start`: pg_ctl forks a setsid child that execs postgres and exits, so the
@@ -14,6 +14,7 @@ at most 2 s without any CPU progress), then the tree is stopped and the command'
 SIGTERM/SIGINT/SIGHUP to this watchdog stop the whole tree (SIGTERM, brief wait, SIGKILL) and exit 128+signal.
 Exit status is the command's (128+signal if it died of a signal), or 124 when killed as hung. Linux only (/proc).
 """
+import math
 import os
 import select
 import signal
@@ -26,14 +27,14 @@ TERM_GRACE = 5.0
 
 
 def read_stat(pid: int):
-    """(ppid, session, cpu_seconds, starttime, state) from /proc/<pid>/stat, or None if gone. comm may hold spaces/parens."""
+    """(ppid, session, cpu_seconds, starttime, state, pgrp) from /proc/<pid>/stat, or None if gone. comm may hold spaces/parens."""
     try:
         with open(f"/proc/{pid}/stat") as f:
             raw = f.read()
     except OSError:
         return None
     rest = raw[raw.rindex(")") + 2:].split()
-    return int(rest[1]), int(rest[3]), (int(rest[11]) + int(rest[12])) / TICKS, int(rest[19]), rest[0]
+    return int(rest[1]), int(rest[3]), (int(rest[11]) + int(rest[12])) / TICKS, int(rest[19]), rest[0], int(rest[2])
 
 
 def snapshot() -> dict:
@@ -49,22 +50,35 @@ def snapshot() -> dict:
 class Tree:
     """The command's process tree, accumulated across polls so reparented descendants stay known."""
 
-    def __init__(self, root: int, token: str):
+    def __init__(self, root: int, token: str, proc: "subprocess.Popen | None" = None):
         self.root = root
+        self.proc = proc        # lets us tell whether the root has been reaped (its pid is then free for reuse)
         self.token = b"HERDR_RUN_WATCHED_TOKEN=" + token.encode()
         self.known: dict[int, int] = {root: -1}   # pid -> starttime (-1 until first seen)
-        self.cpu: dict[int, float] = {}
+        self.cpu: dict[tuple[int, int], float] = {}     # (pid, starttime) -> cpu seconds: a reused pid has no history
         self.tagged: dict[tuple[int, int], bool] = {}
 
     def has_token(self, pid: int, start: int) -> bool:
+        """Only a positive answer is cached: a process can gain the token after we first look (a fork child reads as its parent's
+        environment until it execs), so a negative must be re-checked on the next poll."""
         key = (pid, start)
-        if key not in self.tagged:
-            try:
-                with open(f"/proc/{pid}/environ", "rb") as f:
-                    self.tagged[key] = self.token in f.read().split(b"\0")
-            except OSError:
-                self.tagged[key] = False
-        return self.tagged[key]
+        if key in self.tagged:
+            return True
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                found = self.token in f.read().split(b"\0")
+        except OSError:
+            return False
+        if found:
+            self.tagged[key] = True
+        return found
+
+    def note_cpu(self, pid: int, start: int, cpu: float) -> bool:
+        """Record a member's CPU; True if it is new (pid, starttime) or its CPU rose."""
+        key = (pid, start)
+        rose = key not in self.cpu or cpu > self.cpu[key]
+        self.cpu[key] = cpu
+        return rose
 
     def poll(self) -> bool:
         """Refresh membership; return True if any member's CPU rose or a new member appeared."""
@@ -83,10 +97,10 @@ class Tree:
         for p in members:
             st = snap[p]
             self.known[p] = st[3]
-            if p not in self.cpu or st[2] > self.cpu[p]:
+            if self.note_cpu(p, st[3], st[2]):
                 progress = True
-            self.cpu[p] = st[2]
         self.known = {p: t for p, t in self.known.items() if p in members or p == self.root}
+        self.cpu = {k: v for k, v in self.cpu.items() if k[0] in members and snap[k[0]][3] == k[1]}
         self.alive = {p for p in members if p != self.root}
         return progress
 
@@ -102,25 +116,60 @@ class Tree:
                     os.kill(pid, sig)
                 except (ProcessLookupError, PermissionError):
                     pass
-        try:
-            os.killpg(self.root, sig)
-        except (ProcessLookupError, PermissionError):
-            pass
+        if self.group_is_ours():
+            try:
+                os.killpg(self.root, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def group_is_ours(self) -> bool:
+        """The root's pid is only safe to use as a pgid while it cannot have been reused: while the root is unreaped (an unreaped
+        pid is never reused), or after reaping, only if a live process of ours (a known member, same start time, not the root pid
+        itself, which may now be a stranger) still holds that group."""
+        if self.proc is not None and self.proc.returncode is None:
+            return True
+        return any(p != self.root and st[5] == self.root and st[4] != "Z" and self.known.get(p) == st[3]
+                   for p, st in snapshot().items())
 
 
-def stop_tree(proc: subprocess.Popen, tree: Tree) -> None:
+def drain(fd: int, out: "Out", wait: float, deadline: float | None = None) -> bool:
+    """Forward whatever the command has written (waiting up to `wait` s for the first byte); True at EOF. `deadline` (monotonic)
+    bounds the call, so a tree that floods the pipe cannot hold the caller off forever."""
+    while select.select([fd], [], [], wait)[0]:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return True
+        out.write(chunk)
+        wait = 0
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+    return False
+
+
+def stop_tree(proc: subprocess.Popen, tree: Tree, out: "Out") -> None:
+    """SIGTERM, grace, SIGKILL; the pipe is drained throughout so a handler's cleanup output is kept and never blocks on a full pipe."""
+    fd = proc.stdout.fileno()
+    eof = False
     tree.poll()
     tree.signal_all(signal.SIGTERM)
     deadline = time.monotonic() + TERM_GRACE
     while time.monotonic() < deadline and (proc.poll() is None or any(read_stat(p) for p in tree.alive)):
-        time.sleep(0.1)
+        if eof:
+            time.sleep(0.1)
+        else:
+            eof = drain(fd, out, 0.1, deadline)
     tree.poll()
     tree.signal_all(signal.SIGKILL)
     proc.wait()
+    if not eof:
+        drain(fd, out, 0, time.monotonic() + 2.0)
 
 
 class Out:
-    """Forwards the command's output; a closed reader (`| head -1`) means keep draining without forwarding."""
+    """Forwards the command's output. main() forces fd 1 blocking, so a reader that truly stops will block the writer (and with
+    it the watchdog's hang detection); that limitation predates this code and is out of scope. If the fd is non-blocking anyway
+    (Out used on its own), EAGAIN waits for writability and retries the remainder. A gone reader (`| head -1`, EPIPE) or a
+    closed/missing stdout means keep draining without forwarding, with one notice on stderr."""
 
     def __init__(self) -> None:
         self.broken = False
@@ -129,37 +178,82 @@ class Out:
         if self.broken:
             return
         try:
-            sys.stdout.buffer.write(chunk)
-            sys.stdout.buffer.flush()
-        except (BrokenPipeError, ValueError):
+            fd = sys.stdout.fileno()
+            view = memoryview(chunk)
+            while view:
+                try:
+                    view = view[os.write(fd, view):]
+                except BlockingIOError:
+                    select.select([], [fd], [], 0.5)
+        except (OSError, ValueError, AttributeError):     # EPIPE, EBADF, closed stdout, stdout is None
             self.broken = True
-            os.dup2(os.open(os.devnull, os.O_WRONLY), 1)     # so interpreter shutdown does not flush into the dead pipe
+            try:
+                print("[run-watched] output no longer forwarded (reader gone or stdout closed); the command keeps running", file=sys.stderr)
+            except (OSError, ValueError):
+                pass
+            try:
+                os.dup2(os.open(os.devnull, os.O_WRONLY), 1)     # so interpreter shutdown does not flush into the dead pipe
+            except OSError:
+                pass
+
+
+def usage_error(message: str) -> None:
+    print(f"run-watched: {message}\n\n{__doc__}", file=sys.stderr)
+
+
+def parse_args(argv: list[str]) -> tuple[float, float, list[str]] | None:
+    """(soft, hard, command) or None after printing a usage error."""
+    if len(argv) < 4 or argv[2] != "--":
+        usage_error("usage: run-watched SOFT HARD -- command...")
+        return None
+    try:
+        soft, hard = float(argv[0]), float(argv[1])
+    except ValueError:
+        usage_error(f"usage: SOFT and HARD must be numbers of seconds, got {argv[0]!r} and {argv[1]!r}")
+        return None
+    if not (math.isfinite(soft) and math.isfinite(hard) and soft >= 0 and hard > 0):
+        usage_error("usage: SOFT must be >= 0 and HARD > 0 (finite seconds)")
+        return None
+    return soft, hard, argv[3:]
 
 
 def main() -> int:
-    if len(sys.argv) < 4 or "--" not in sys.argv:
-        print(__doc__, file=sys.stderr)
+    parsed = parse_args(sys.argv[1:])
+    if parsed is None:
         return 2
-    soft, hard = float(sys.argv[1]), float(sys.argv[2])
-    cmd = sys.argv[sys.argv.index("--") + 1:]
+    soft, hard, cmd = parsed
     token = f"{os.getpid()}-{time.time_ns()}"
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
-                            env={**os.environ, "HERDR_RUN_WATCHED_TOKEN": token})
-    tree = Tree(proc.pid, token)
+    try:
+        orphan_grace = float(os.environ.get("HERDR_WATCHED_ORPHAN_GRACE", "30"))     # parsed before the spawn: a bad value must not orphan it
+        if not (math.isfinite(orphan_grace) and orphan_grace >= 0):
+            raise ValueError
+    except ValueError:
+        usage_error("HERDR_WATCHED_ORPHAN_GRACE must be a finite number of seconds >= 0")
+        return 2
+    try:
+        os.set_blocking(1, True)        # a non-blocking stdout inherited from the caller would turn a slow reader into lost output
+    except OSError:
+        pass
     got: list[int] = []         # first signal received; the loop acts on it (nothing blocking runs in the handler)
 
     def on_signal(signum, _frame):
         if not got:
             got.append(signum)
 
-    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):      # before the spawn: no window where a signal kills us and orphans it
         signal.signal(s, on_signal)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
+                                env={**os.environ, "HERDR_RUN_WATCHED_TOKEN": token})
+    except OSError as e:
+        print(f"run-watched: cannot start {cmd[0]!r}: {e.strerror or e}", file=sys.stderr)
+        return 127 if isinstance(e, FileNotFoundError) else 126
+    tree = Tree(proc.pid, token, proc)
 
-    orphan_grace = float(os.environ.get("HERDR_WATCHED_ORPHAN_GRACE", "30"))
     out = Out()
     start = last_progress = time.monotonic()
     root_exited_at = last_orphan_progress = None
-    warned = eof = finished = False
+    warned = eof = False
     fd = proc.stdout.fileno()
     try:
         while True:
@@ -185,11 +279,7 @@ def main() -> int:
                 if progressed:
                     last_orphan_progress = now
                 if not tree.alive or now - last_orphan_progress >= 2.0 or now - root_exited_at >= orphan_grace:
-                    while select.select([fd], [], [], 0)[0]:     # drain what the command wrote before exiting
-                        chunk = os.read(fd, 65536)
-                        if not chunk:
-                            break
-                        out.write(chunk)
+                    drain(fd, out, 0, time.monotonic() + 2.0)     # what the command wrote before exiting
                     rc = proc.returncode
                     return 128 - rc if rc < 0 else rc       # the finally block stops any survivors
                 continue
@@ -200,13 +290,9 @@ def main() -> int:
                 print(f"[run-watched] still running after {soft:g}s (soft limit; not killing)", file=sys.stderr)
             if now - last_progress >= hard:
                 print(f"[run-watched] no output and no CPU for {hard:g}s -- hung; killing", file=sys.stderr)
-                finished = True
-                tree.signal_all(signal.SIGKILL)
-                proc.wait()
-                return 124
+                return 124          # the finally block stops the tree: SIGTERM, grace, SIGKILL
     finally:
-        if not finished:
-            stop_tree(proc, tree)
+        stop_tree(proc, tree, out)
 
 
 if __name__ == "__main__":

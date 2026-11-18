@@ -1697,7 +1697,8 @@ class MemberSurface:
         if member is None:
             return False
         hosts = request.headers.getall("Host", [])
-        return len(hosts) == 1 and hosts[0].strip().lower() in (member, member + ":443")
+        # exact as sent (nginx forwards $http_host unchanged), like member_web.py: no case folding on the member origin
+        return len(hosts) == 1 and hosts[0].strip() in (member, member + ":443")
 
     def _origin(self, request: web.Request) -> str:
         member = self.s.member_origin

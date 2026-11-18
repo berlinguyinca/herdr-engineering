@@ -16,8 +16,8 @@ sections:
       # {} = open on the tailnet (the default `fleet config init` writes; the web port is
       # bound to the tailnet interface and runs --allow-open).
       # Keyed mode: adding entries here (key: role, roles viewer | operator | ingest | agent)
-      # gates every route but /api/v1/health and the host endpoints. The llm-proxy and the
-      # emit hook do not send keys yet (401 until they do). The browser dashboard works only
+      # gates every route but /api/v1/health and the host endpoints. The llm-proxy
+      # (HERDR_CP_CLIENT_KEY_FILE) and the emit hook (ingest.api_key / agent.api_key) send keys once configured (401 until then). The browser dashboard works only
       # behind the dashboard proxy (dashboard_proxy below). Put the ingest key in
       # ingest.api_key and the agent key in agent.api_key.
       api_keys: {}

@@ -753,3 +753,15 @@ def test_content_with_invalid_utf8_name_is_a_uniform_404(host: Host) -> None:
     bad = call(host, s, "GET", f"/artifacts/{aid}/content/%ff%fe")
     missing = call(host, s, "GET", f"/artifacts/{aid}/content/nope.txt")
     assert bad.status == 404 and bad.shape() == missing.shape()
+
+
+def test_the_member_host_matches_exactly_as_sent_like_member_web(migrated_dsn, tmp_path) -> None:
+    # nginx forwards $http_host unchanged, so only the lowercase spelling names the member host; any other spelling is
+    # an unknown host and a 404, as in member_web.py (test_a_spoofed_member_host_is_a_404_on_every_member_route).
+    # PublicServer.host_ok refuses it before MemberSurface.on_member_host runs, so this pins the end-to-end behaviour.
+    from tests.artifact_host.seed import running_host
+
+    with running_host(migrated_dsn, tmp_path, OWN) as h:
+        assert h.get("/api/member/config", _on(MEMBER_HOST.upper())).status == 404
+        cfg = h.get("/api/member/config", _on(MEMBER_HOST)).json()
+        assert cfg["redirect_uri"] == f"{MEMBER_ORIGIN}/my/callback"
