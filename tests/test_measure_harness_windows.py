@@ -1,0 +1,83 @@
+"""Smoke test: scripts/measure_harness_windows.py run as a real subprocess against the committed fixtures."""
+import json
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+FIXTURES = REPO / "tests" / "fixtures" / "handoff_adapters"
+SCRIPT = REPO / "scripts" / "measure_harness_windows.py"
+
+
+def _home(root: Path, catalog: str = "model-catalog.json") -> Path:
+    home = root / "home"
+    claude = home / ".claude"
+    (claude / "projects" / "-work").mkdir(parents=True)
+    shutil.copy(FIXTURES / "claude" / "main_chain.jsonl", claude / "projects" / "-work" / "s.jsonl")
+    (claude / "cache" / "model-catalog").mkdir(parents=True)
+    shutil.copy(FIXTURES / "claude" / catalog, claude / "cache" / "model-catalog" / "org-x-cc.json")
+    codex = home / ".codex" / "sessions" / "2026" / "11" / "13"
+    codex.mkdir(parents=True)
+    shutil.copy(FIXTURES / "codex" / "main.jsonl", codex / "rollout-2026-11-13T13-45-32-01a1d6df-7c12-7671-bbf8-7c2d51d1a84b.jsonl")
+    pi = home / ".pi" / "agent"
+    (pi / "sessions" / "--work--").mkdir(parents=True)
+    shutil.copy(FIXTURES / "pi" / "main.jsonl", pi / "sessions" / "--work--" / "2026-11-17T18-08-38-549Z_11111111-1111-7111-8111-111111111111.jsonl")
+    shutil.copy(FIXTURES / "pi" / "models.json", pi / "models.json")
+    db = home / ".local" / "share" / "opencode" / "opencode.db"
+    db.parent.mkdir(parents=True)
+    con = sqlite3.connect(db)
+    con.executescript((FIXTURES / "opencode" / "opencode.sql").read_text(encoding="utf-8"))
+    con.close()
+    (home / ".config" / "opencode").mkdir(parents=True)
+    shutil.copy(FIXTURES / "opencode" / "opencode.json", home / ".config" / "opencode" / "opencode.json")
+    return home
+
+
+def _run(home: Path) -> str:
+    done = subprocess.run([sys.executable, str(SCRIPT), "--home", str(home), "--days", "100000"],
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    return done.stdout
+
+
+def test_prints_a_section_per_harness_with_sources_models_and_the_over_100_check(tmp_path):
+    out = _run(_home(tmp_path))
+    for harness in ("claude", "codex", "pi", "opencode"):
+        assert f"== {harness} (last 100000 days) ==" in out
+    assert "transcript ~/.claude/projects/*/<session>.jsonl: none found" in out
+    assert "catalog.config.models[].runtime.max_input_tokens [200000, 1000000]" in out
+    assert "payload.info.model_context_window [828400]" in out
+    assert "providers.metabolomics.models[].contextWindow" in out
+    assert "limit.context" in out
+    assert "  claude-opus-4-8  window=1000000  window_source=recorded  sessions=1" in out
+    assert "  gpt-6.1-sol  window=828400  window_source=recorded  sessions=1" in out
+    assert "  metabolomics/qwen3.8-flash_next  window=131072  window_source=recorded  sessions=1" in out
+    assert re.search(r"  ollama/gemma4:26b  window=131072  window_source=recorded  sessions=1", out)
+    assert out.count("sessions above 100% of their window:\n  none") == 4
+
+
+def test_prints_no_absolute_path_session_id_or_message_text(tmp_path):
+    home = _home(tmp_path)
+    out = _run(home)
+    assert str(tmp_path) not in out and str(home) not in out
+    assert "11111111-1111" not in out and "ses_fixture" not in out
+    assert "redacted" not in out
+
+
+def test_flags_a_session_above_100_percent_of_its_window(tmp_path):
+    home = _home(tmp_path)
+    catalog = home / ".claude" / "cache" / "model-catalog" / "org-x-cc.json"
+    data = json.loads(catalog.read_text())
+    data["catalog"]["config"]["models"][0]["runtime"]["max_input_tokens"] = 1000  # real usage in the fixture is 5702
+    catalog.write_text(json.dumps(data))
+    out = _run(home)
+    assert "  OVER 100%: claude-opus-4-8 used=5702 window=1000 window_source=recorded" in out
+
+
+def test_a_home_with_no_records_prints_none_found_not_an_error(tmp_path):
+    out = _run(tmp_path)
+    assert out.count("none found") >= 4
+    assert out.count("none (no recent session with usage)") == 4
