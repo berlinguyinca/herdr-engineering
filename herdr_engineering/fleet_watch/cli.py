@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 from . import core, events, logs, poll, selfrestart, service, state
+from . import run as runner
 
 
 def render(report: dict) -> str:
@@ -93,8 +94,6 @@ def _resolve_local(requested: str) -> tuple[str | None, str | None]:
 
 def _engine(args, directory: Path, local: str | None):
     """The runner for this invocation's transport/timeout options (shared by run, resume, abandon, loop)."""
-    from . import run as runner
-
     timeouts = {**runner.DEFAULT_TIMEOUTS, "precheck": args.precheck_timeout, "apply": args.apply_timeout,
                 "health": args.health_timeout}
     return runner.Runner(
@@ -244,6 +243,7 @@ def _loop(args, directory: Path, local: str | None) -> int:
     def hard(stalled: float) -> None:
         print(f"fleet-watch loop: no progress for {int(stalled)}s (hard limit {int(args.hard_limit)}s); "
               "exiting 70, the service restarts and resumes the durable rollout", file=sys.stderr, flush=True)
+        runner.kill_children()                            # os._exit runs no cleanup: do not orphan host-apply children
         os._exit(70)
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))

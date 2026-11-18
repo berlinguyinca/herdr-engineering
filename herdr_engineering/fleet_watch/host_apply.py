@@ -122,9 +122,19 @@ def _run(ctx: Context, argv: list[str], *, cwd: str | Path | None = None, timeou
         ctx.note(f"timed out after {timeout}s")
         ctx.note(out or "")
         return 124, out or ""
+    except BaseException:                          # SIGTERM (see `terminate_on_sigterm`): the command is in ITS OWN session
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        raise
     ctx.note(out or "")
     ctx.note(f"exit {proc.returncode}")
     return proc.returncode, out or ""
+
+
+def terminate_on_sigterm() -> None:
+    """Turn SIGTERM into SystemExit so `_run` kills the in-flight command's group (it runs in its own session, so a
+    signal to host-apply's group would never reach it). The watcher sends SIGTERM first, SIGKILL after a grace."""
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
 
 def _git(ctx: Context, root: Path, *args: str, timeout: float = GIT_TIMEOUT_S) -> tuple[int, str]:

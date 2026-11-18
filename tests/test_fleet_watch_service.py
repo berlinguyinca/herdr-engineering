@@ -7,6 +7,7 @@ stand-in, throwaway HOMEs) drives real subprocesses. Nothing here starts or enab
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import signal
@@ -337,10 +338,131 @@ def test_loop_stops_cleanly_on_sigterm_between_passes(fleet):
         while time.monotonic() < deadline and "head" not in json.dumps(fleet.saved()["repos"]):
             time.sleep(0.2)
         proc.send_signal(signal.SIGTERM)
-        assert proc.wait(timeout=20) in (0, -signal.SIGTERM)
+        assert proc.wait(timeout=20) == 0                                          # a clean stop, not death by signal
     finally:
         proc.kill()
         proc.communicate()
+
+
+# --------------------------------------------------------------------------- orphaned children
+
+def local_loop_argv(fleet, remote_bin, *extra: str) -> list[str]:
+    """A loop that applies the local host (beast) without ssh through `remote_bin`."""
+    fleet.identify("beast")
+    return [sys.executable, "-I", "-c", BOOT, "fleet-watch", "loop", "--lock", str(fleet.lock), "--repo", HE,
+            "--interval", "1", "--enable-rollouts", "--local-host", "beast", "--remote-bin", str(remote_bin), *extra]
+
+
+def hung_remote_bin(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A host-apply stand-in that hangs, leaving a parent shell and a sleeping child, both recorded by pid."""
+    parent, child = tmp_path / "hung.parent.pid", tmp_path / "hung.child.pid"
+    bin_ = tmp_path / "hung-herdr-eng"
+    bin_.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {child}\necho $$ > {parent}\nwait\n")
+    bin_.chmod(0o755)
+    return bin_, parent, child
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    stat = Path(f"/proc/{pid}/stat")
+    return not (stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] == "Z")
+
+
+def wait_for(path: Path, seconds: float = 30) -> int:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if path.exists() and path.read_text().strip():
+            return int(path.read_text())
+        time.sleep(0.1)
+    raise AssertionError(f"{path} never appeared")
+
+
+def assert_dead_soon(*pids: int) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and any(alive(p) for p in pids):
+        time.sleep(0.1)
+    assert not [p for p in pids if alive(p)], "a host-apply child outlived the watcher"
+
+
+def test_sigterm_during_a_local_host_apply_kills_the_child_process_group(fleet, tmp_path):
+    bin_, parent, child = hung_remote_bin(tmp_path)
+    proc = subprocess.Popen(local_loop_argv(fleet, bin_), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            env=fleet.env())
+    pids: list[int] = []
+    try:
+        pids = [wait_for(parent), wait_for(child)]
+        assert all(alive(p) for p in pids)
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=30) == 0
+        assert_dead_soon(*pids)
+    finally:
+        proc.kill()
+        proc.communicate()
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_the_hard_limit_exit_kills_the_child_process_group(fleet, tmp_path):
+    bin_, parent, child = hung_remote_bin(tmp_path)
+    argv = local_loop_argv(fleet, bin_, "--soft-limit", "1", "--hard-limit", "3")
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=fleet.env())
+    pids: list[int] = []
+    try:
+        pids = [wait_for(parent), wait_for(child)]
+        assert proc.wait(timeout=60) == 70
+        assert_dead_soon(*pids)
+    finally:
+        proc.kill()
+        proc.communicate()
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def grandchild_remote_bin(fleet, tmp_path: Path) -> tuple[Path, Path]:
+    """The real beast `herdr-eng` shim, but its install command hangs with a child of its own. host_apply runs that
+    command with start_new_session=True, so it and its child are in a different session and process group than
+    host-apply: killing host-apply's group alone would miss both."""
+    pidfile = tmp_path / "grandchild.pid"
+    hang = tmp_path / "hang-install.sh"
+    hang.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {pidfile}\nwait\n")
+    hang.chmod(0o755)
+    shim = fleet.shims["beast"].read_text()
+    install = fleet.home("beast") / "install.sh"
+    assert str(install) in shim
+    wrapper = tmp_path / "beast-hung-herdr-eng"
+    wrapper.write_text(shim.replace(str(install), str(hang), 1).replace(
+        "#!/bin/sh\n", f"#!/bin/sh\nexport HOME={fleet.home('beast')}\n", 1))
+    wrapper.chmod(0o755)
+    return wrapper, pidfile
+
+
+@pytest.mark.parametrize("how", ["sigterm", "hard_limit"])
+def test_a_grandchild_in_its_own_session_dies_with_the_watcher(fleet, tmp_path, how):
+    wrapper, pidfile = grandchild_remote_bin(fleet, tmp_path)
+    extra = ("--soft-limit", "1", "--hard-limit", "4") if how == "hard_limit" else ()
+    proc = subprocess.Popen(local_loop_argv(fleet, wrapper, *extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=fleet.env())
+    pids: list[int] = []
+    try:
+        pids = [wait_for(pidfile)]
+        assert alive(pids[0]) and os.getsid(pids[0]) != os.getsid(proc.pid)   # not in the watcher's session
+        if how == "sigterm":
+            proc.send_signal(signal.SIGTERM)
+            assert proc.wait(timeout=40) == 0
+        else:
+            assert proc.wait(timeout=60) == 70
+        assert_dead_soon(*pids)
+    finally:
+        proc.kill()
+        proc.communicate()
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
 
 
 # --------------------------------------------------------------------------- systemd unit and ansible task

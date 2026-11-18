@@ -81,7 +81,7 @@ def test_pin_repos_keeps_a_backup_of_the_previous_file(world):
     pin(forge, directory, path, {AUTO: forge.commit(AUTO, "two")})
     (backup,) = [p for p in path.parent.iterdir() if p.name.startswith("fleet.lock.yaml.bak-")]
     assert backup.read_text() == old
-    assert re.fullmatch(r"fleet\.lock\.yaml\.bak-\d{8}(-\d{6})?", backup.name)
+    assert re.fullmatch(r"fleet\.lock\.yaml\.bak-\d{8}(-\d{12}(-\d+)?)?", backup.name)
     pin(forge, directory, path, {AUTO: forge.commit(AUTO, "three")})         # a second write the same day
     backups = sorted(p for p in path.parent.iterdir() if p.name.startswith("fleet.lock.yaml.bak-"))
     assert len(backups) == 2 and old in {b.read_text() for b in backups}
@@ -229,6 +229,9 @@ def test_lock_verify_reports_a_pin_that_left_origin_main_and_a_malformed_pin(wor
     forge, _, path = world
     doomed = forge.commit(AUTO, "doomed")
     path.write_text(f"repos:\n  autospec: {doomed}\n")
+    watcher_dir = tmp_path / "home" / "state" / "herdr-engineering" / "fleet-watch"
+    state.private_dir(watcher_dir)                                            # the watcher ran here and cached the pin
+    assert [r["status"] for r in lock.verify_lock(path, directory=watcher_dir, base=str(forge.root))] == ["ok"]
     assert verify_cli(forge, tmp_path / "home", path).returncode == 0         # published now
     work = forge.work[AUTO]
     git(work, "reset", "-q", "--hard", "HEAD~1")
@@ -300,8 +303,9 @@ def test_a_refused_pin_is_recorded_but_does_not_undo_the_converged_rollout(fleet
     head = fleet.forge.head(HE)
     ahead = fleet.forge.commit(HE, "three")                                   # the lock is ahead of what main will be
     fleet.lock.write_text(f"repos:\n  herdr-engineering: {ahead}\n")
-    assert subprocess.run([sys.executable, "-I", "-c", BOOT, "fleet", "lock", "verify", "--lock", str(fleet.lock)],
-                          env=fleet.env(), capture_output=True).returncode == 0   # caches `ahead` while published
+    state.private_dir(fleet.state_dir)
+    assert [r["status"] for r in lock.verify_lock(fleet.lock, directory=fleet.state_dir,
+                                                  base=str(fleet.forge.root))] == ["ok"]   # caches `ahead` while published
     work = fleet.forge.work[HE]
     git(work, "reset", "-q", "--hard", "HEAD~1")
     git(work, "push", "-q", "-f", "origin", "main")
@@ -382,3 +386,95 @@ def test_a_rollout_without_a_lock_file_emits_lock_refused_lock_invalid_but_never
     assert not fleet.lock.exists()
     events = lock_events(fleet)
     assert [e["event_type"] for e in events] == ["lock.refused"] and events[0]["payload"]["reason"] == "lock_invalid"
+
+
+# --------------------------------------------------------------------------- follow-ups to the step 5 review
+
+def test_a_crlf_lock_is_pinned_and_keeps_its_line_endings(world):
+    forge, directory, path = world
+    crlf = LOCK_TEXT.format(auto=forge.head(AUTO), pi=forge.head(PI)).replace("\n", "\r\n").encode()
+    path.write_bytes(crlf)
+    new_auto = forge.commit(AUTO, "two")
+    changed = pin(forge, directory, path, {AUTO: new_auto})
+    assert changed == [{"repo": "autospec", "before": forge_old(crlf.decode(), "autospec"), "after": new_auto}]
+    was = forge_old(crlf.decode(), "autospec")
+    assert path.read_bytes() == crlf.replace(f"autospec: {was}".encode(), f"autospec: {new_auto}".encode())
+    assert b"\r\n" in path.read_bytes() and b"\n" not in path.read_bytes().replace(b"\r\n", b"")
+    (backup,) = [p for p in path.parent.iterdir() if p.name.startswith("fleet.lock.yaml.bak-")]
+    assert backup.read_bytes() == crlf
+
+
+def test_a_missing_pin_is_added_to_a_crlf_lock_with_crlf(world):
+    forge, directory, path = world
+    path.write_bytes(f"repos:\r\n  pi-engineering: {forge.head(PI)}\r\nother:\r\n  keep: me\r\n".encode())
+    pin(forge, directory, path, {AUTO: forge.head(AUTO)})
+    data = path.read_bytes()
+    assert b"  autospec: " in data and b"\n" not in data.replace(b"\r\n", b"")
+
+
+def test_two_backups_in_the_same_second_never_overwrite_each_other(world):
+    forge, directory, path = world
+    old = write_lock(path, forge)
+    stamp = datetime(2026, 11, 14, 12, 0, 0, 123456, tzinfo=UTC)
+    seen = [old]
+    for n in range(4):                                       # same calendar day AND same wall-clock second
+        updated = forge.commit(AUTO, f"c{n}")
+        pin(forge, directory, path, {AUTO: updated}, now=stamp)
+        seen.append(path.read_text())
+    backups = sorted(p for p in path.parent.iterdir() if p.name.startswith("fleet.lock.yaml.bak-"))
+    assert len(backups) == 4 and len({b.name for b in backups}) == 4
+    assert {b.read_text() for b in backups} == set(seen[:-1])        # every previous version survived
+
+
+def test_an_interrupted_write_leaves_no_temp_file(world):
+    """A SystemExit (SIGTERM handler) while the lock is being replaced must not strand `<lock>.tmp`."""
+    import signal
+    forge, directory, path = world
+    path.unlink(missing_ok=True)
+    os.mkfifo(path)                                          # reading it blocks until the timer's SystemExit lands
+    def stop(*_):
+        raise SystemExit(0)
+    old = signal.signal(signal.SIGALRM, stop)
+    signal.setitimer(signal.ITIMER_REAL, 0.3)
+    try:
+        with pytest.raises(SystemExit):
+            lock._write_atomic(path, "repos: {}\n", 0o600, b"previous", datetime.now(UTC))
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+    assert [p.name for p in path.parent.iterdir() if "tmp" in p.name] == []
+
+
+def test_lock_verify_creates_no_state_directory_or_lock_file(world, tmp_path):
+    forge, _, path = world
+    write_lock(path, forge)
+    home = tmp_path / "home"
+    out = verify_cli(forge, home, path, "--json")
+    assert out.returncode == 0, out.stderr
+    assert not (home / "state").exists()                     # a read-only command leaves no trace
+    assert not (home / ".local").exists()
+
+
+def test_lock_verify_still_reports_busy_and_the_converged_state_when_the_directory_exists(world, tmp_path):
+    forge, _, path = world
+    write_lock(path, forge)
+    home = tmp_path / "home"
+    held = home / "state" / "herdr-engineering" / "fleet-watch"
+    state.private_dir(held)
+    state.save({**state.empty_state(), "converged": {AUTO: "0" * 40}}, held)
+    out = verify_cli(forge, home, path, "--json")
+    assert out.returncode == 1 and {p["repo"]: p["status"] for p in json.loads(out.stdout)["pins"]}["autospec"] == "converged_mismatch"
+
+
+def test_a_failed_backup_copy_leaves_no_empty_backup_file(world):
+    if os.geteuid() == 0:
+        pytest.skip("root reads anything")
+    forge, _, path = world
+    write_lock(path, forge)
+    path.chmod(0)                                            # readable for the earlier checks in real use, not here
+    try:
+        with pytest.raises(OSError):
+            lock._make_backup(path, datetime.now(UTC))
+    finally:
+        path.chmod(0o600)
+    assert [p.name for p in path.parent.iterdir() if ".bak-" in p.name] == []

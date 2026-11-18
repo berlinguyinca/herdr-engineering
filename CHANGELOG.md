@@ -5,6 +5,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: fleet watcher review follow-ups (orphaned children, lock edge cases), on top of the self-restart
+
+- SIGTERM and the hard-limit exit 70 now stop an in-flight local `host-apply`: the watcher sends it SIGTERM first (5 s grace), host-apply kills the commands it started (they run in their own sessions, which a group kill of host-apply would miss), then SIGKILL. A grandchild that deliberately leaves its session is still left to the systemd cgroup (`KillMode` default `control-group`), which kills the whole unit on stop. The hard-limit exit never releases the registry lock before `os._exit(70)`.
+- A CRLF `fleet.lock.yaml` can be pinned (it was always refused as changed-since-read) and keeps its line endings; same-second lock backups no longer overwrite each other; an interrupted write no longer strands `<lock>.tmp`; a failed backup copy removes its empty `.bak` file.
+- `herdr-eng fleet lock verify` no longer creates the watcher state directory or lock file when it does not exist.
+- Audit of the #865 self-restart (no code change needed): a freshly started loop does not restart again while the succeeded rollout is still the latest saved one (the decision is taken only in the pass that ran the rollout), and unreadable or corrupt state means no restart and no crash. Real-process tests pin both.
+- Tests: exact event tails instead of `in types[-2:]`, SIGTERM must exit 0. Operator doc: restart-mid-rollout safety, symlinked-lock backup location. Supersedes #825 (its own restart-token mechanism is dropped in favour of #865).
+
 ### Quieter client disconnects; fallback timeout no longer caps the body read
 
 - Control-plane listeners (`_DaemonThreadingServer`) no longer print a stdlib traceback for `ConnectionResetError`, `BrokenPipeError` or `ConnectionAbortedError` (about 6,700 resets and 100 broken pipes per day in `herdr-cp-web`); they log at debug. Any other handler exception still logs its traceback.
