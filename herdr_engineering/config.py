@@ -26,17 +26,26 @@ GITHUB_PROJECTS_DEFAULTS = {"enabled": False, "item_limit": 2000}
 
 DEFAULTS: dict[str, Any] = {
     "version": 1,
+    # Disk hygiene is ON by default; opt out with ``build_cleanup: {enabled: false}``.
+    # Normal sweeps need ``min_age_hours`` idle; once usage reaches ``pressure_percent`` the
+    # idle floor drops to ``pressure_min_age_hours`` (live process/lease/lock guards still apply).
+    # Cargo wrapper / build-coordinate refuse new builds at ``refuse_builds_percent``
+    # unless HERDR_DISK_GUARD_OVERRIDE=1 is set.
     "build_cleanup": {
-        "enabled": False,
-        "roots": [],
+        "enabled": True,
+        "roots": ["~/IdeaProjects", "~/work", "~/.cache"],
         "interval_seconds": 900,
         "high_water_percent": 85,
         "low_water_percent": 80,
         "min_age_hours": 24,
+        "pressure_percent": 90,
+        "pressure_min_age_hours": 2,
+        "refuse_builds_percent": 90,
     },
-    # Spec 02: default-off; validated by build_cache_config.validate (fails closed).
+    # Spec 02: on by default (local_only; shared cache/slurm stay off); validated by
+    # build_cache_config.validate (fails closed). Opt out with ``enabled: false``.
     "fabric_build_cache": {
-        "enabled": False,
+        "enabled": True,
         "mode": "local_only",
         "allowed_hosts": [],
         "shared_cache": {
@@ -48,7 +57,9 @@ DEFAULTS: dict[str, Any] = {
             "capacity_gib": 20, "ram_scratch_gib": 0, "min_free_disk_percent": 20,
             "incremental_disabled_for_cacheable_builds": True,
             "storage_tiers": [],
-            "manage_targets": False,
+            "manage_targets": True,
+            "target_mode": "shared",
+            "target_pool_size": 2,
             "target_retention_enabled": False,
             "target_internal_gib": 32,
             "target_external_gib": 256,
@@ -304,6 +315,7 @@ def load_config(paths: list[Path] | None = None, *, strict_build_cache: bool = F
         logging.getLogger(__name__).warning(
             "fabric_build_cache config invalid, feature disabled: %s", exc)
         cfg["fabric_build_cache"] = copy.deepcopy(DEFAULTS["fabric_build_cache"])
+        cfg["fabric_build_cache"]["enabled"] = False
     return cfg
 
 

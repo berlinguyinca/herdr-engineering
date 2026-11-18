@@ -36,6 +36,10 @@
 #      origin/main (not pinned), and links its screenwright-review skill via
 #      scripts/install-screenwright.sh; opt out with --no-screenwright or
 #      HERDR_INSTALL_SCREENWRIGHT=0. Non-fatal; dirty/non-main checkouts are skipped.
+#   (default on) step 7f installs the build-cleanup timer (systemd user unit on Linux,
+#      launchd agent on macOS) and the managed cargo launcher via
+#      `herdr-eng build-hygiene install`; opt out with --no-build-hygiene or
+#      HERDR_INSTALL_BUILD_HYGIENE=0 (or build_cleanup.enabled: false in config). Non-fatal.
 #
 # Re-running produces no unexpected changes. No secrets are written anywhere.
 #
@@ -47,10 +51,12 @@ BUILD_CACHE_TOOLS=1
 BUILD_CACHE_TOOLS_ONLY=0
 WITH_WORKFLOW_HOOKS="${HERDR_INSTALL_WORKFLOW_HOOKS:-1}"
 WITH_SCREENWRIGHT="${HERDR_INSTALL_SCREENWRIGHT:-1}"
+WITH_BUILD_HYGIENE="${HERDR_INSTALL_BUILD_HYGIENE:-1}"
 for arg in "$@"; do
   case "$arg" in
     --no-workflow-hooks) WITH_WORKFLOW_HOOKS=0 ;;
     --no-screenwright) WITH_SCREENWRIGHT=0 ;;
+    --no-build-hygiene) WITH_BUILD_HYGIENE=0 ;;
     --with-memory) WITH_MEMORY=1 ;;
     --no-build-cache-tools) BUILD_CACHE_TOOLS=0 ;;
     --build-cache-tools-only) BUILD_CACHE_TOOLS_ONLY=1 ;;
@@ -356,6 +362,14 @@ if [ "$WITH_SCREENWRIGHT" = "1" ]; then
   bash "$REPO_ROOT/scripts/install-screenwright.sh" || warn "screenwright not installed/updated (see above); the rest of the install is unaffected"
 else
   printf '\n  (screenwright not installed; HERDR_INSTALL_SCREENWRIGHT=0 or --no-screenwright)\n'
+fi
+
+# --- 7f. build hygiene (default on): build-cleanup timer + managed cargo launcher -------
+if [ "$WITH_BUILD_HYGIENE" = "1" ]; then
+  step "7f/8 build hygiene (build-cleanup timer, managed cargo launcher; non-fatal)"
+  "$PY" -m herdr_engineering.cli build-hygiene install || warn "build hygiene not installed (see above); opt out with build_cleanup.enabled: false"
+else
+  printf '\n  (build hygiene not installed; HERDR_INSTALL_BUILD_HYGIENE=0 or --no-build-hygiene)\n'
 fi
 
 # --- 8. doctor ------------------------------------------------------------

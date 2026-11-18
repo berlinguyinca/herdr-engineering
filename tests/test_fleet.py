@@ -199,6 +199,7 @@ def test_update_refreshes_enabled_local_cleanup(tmp_path, monkeypatch):
     (repo / 'scripts').mkdir()
     (repo / 'scripts/build-cleanup.sh').write_text('#!/bin/sh\n')
     monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    monkeypatch.setattr(fleet.sys, 'platform', 'linux')  # build-cleanup.sh is the systemd installer
     from herdr_engineering import config
     monkeypatch.setattr(config, 'load_config', lambda: {'build_cleanup': {'enabled': True, 'roots': ['/projects']}})
     calls = []

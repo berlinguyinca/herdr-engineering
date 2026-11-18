@@ -29,7 +29,8 @@ requires_lsof = pytest.mark.skipif(
 
 def test_managed_target_storage_is_an_explicit_valid_option():
     assert validate({"enabled": True, "local": {"manage_targets": True}}).local.manage_targets
-    assert not validate(None).local.manage_targets
+    assert validate(None).local.manage_targets  # on by default
+    assert not validate({"enabled": True, "local": {"manage_targets": False}}).local.manage_targets
 
 
 def test_unique_workspaces_and_ownership_are_preserved(tmp_path: Path):
@@ -299,7 +300,7 @@ def test_target_management_cli_enable_and_migration_safety(tmp_path: Path):
     # to the migrator and would hide the same-filesystem verdict this test asserts.
     ambient = {key: value for key, value in os.environ.items()
                if key not in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR")}
-    env = {**ambient, "HOME": str(home), "CARGO_HOME": str(home / ".cargo"),
+    env = {**ambient, "HERDR_DISK_GUARD_OVERRIDE": "1", "HOME": str(home), "CARGO_HOME": str(home / ".cargo"),
            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
            "HERDR_ENGINEERING_CONFIG": str(config), "HERDR_ENGINEERING_STATE": str(state),
            "PYTHONPATH": str(Path(__file__).resolve().parents[1])}

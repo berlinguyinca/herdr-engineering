@@ -47,6 +47,31 @@ def watch(cleanup, *, interval: float, stop: threading.Event,
         wait(interval)
 
 
+def policy_kwargs(cfg: dict) -> dict:
+    """``run_once`` policy values from a ``build_cleanup`` config block (defaults match config.DEFAULTS)."""
+    return {
+        "high_water": float(cfg.get('high_water_percent', 85)),
+        "low_water": float(cfg.get('low_water_percent', 80)),
+        "min_age_hours": float(cfg.get('min_age_hours', 24)),
+        "pressure_water": float(cfg.get('pressure_percent', 90)),
+        "pressure_min_age_hours": float(cfg.get('pressure_min_age_hours', 2)),
+    }
+
+
+def effective_roots(cfg: dict, explicit: list[str] | None = None) -> list[Path]:
+    """Configured roots (or explicit ones) that exist, plus the shared cargo target pool."""
+    from .cargo_target_storage import shared_targets_root
+    roots = list(explicit if explicit is not None else cfg.get('roots', []))
+    paths = [Path(root).expanduser() for root in roots]
+    if explicit is None:
+        pool = shared_targets_root()
+        if pool.is_dir():
+            paths.append(pool)
+        # Default roots may not exist on every host (e.g. no ~/work); explicit ones must.
+        paths = [path for path in paths if path.is_dir()]
+    return [Path(os.path.realpath(path)) for path in paths]
+
+
 def command(args) -> int:
     from .build_cleanup import run_once
     from .build_coord import _default_state_dir
@@ -58,16 +83,13 @@ def command(args) -> int:
         status = state_dir / 'build-cleanup.json'
         print(status.read_text() if status.exists() else json.dumps({'status': 'never_run'}))
         return 0
-    roots = args.root if args.root is not None else cfg.get('roots', [])
+    roots = effective_roots(cfg, args.root)
     if not roots:
         print(json.dumps({'error': 'configure build_cleanup.roots or pass --root'}))
         return 2
     def cleanup():
-        return run_once(
-            roots=[Path(root).expanduser() for root in roots], state_dir=state_dir,
-            dry_run=args.dry_run, high_water=float(cfg.get('high_water_percent', 85)),
-            low_water=float(cfg.get('low_water_percent', 80)),
-            min_age_hours=float(cfg.get('min_age_hours', 24)))
+        return run_once(roots=roots, state_dir=state_dir, dry_run=args.dry_run,
+                        **policy_kwargs(cfg))
     if args.cleanup_command == 'run':
         result = cleanup()
         print(json.dumps(result, indent=2, sort_keys=True))

@@ -59,3 +59,9 @@ def fake_host_config(monkeypatch):
 def pytest_addoption(parser):
     parser.addoption("--allow-fabric-http-skip", action="store_true", default=False,
                      help="skip (instead of fail) the Fabric HTTP tests on a host with no non-loopback address")
+
+
+@pytest.fixture(autouse=True)
+def _disk_guard_override_by_default(monkeypatch):
+    """A nearly full dev disk must not refuse builds in unrelated tests; guard tests unset this."""
+    monkeypatch.setenv("HERDR_DISK_GUARD_OVERRIDE", "1")

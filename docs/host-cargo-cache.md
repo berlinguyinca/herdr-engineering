@@ -118,3 +118,13 @@ A sweep skips busy builds immediately, scans only enrolled owned target roots, a
 Reclamation takes Cargo's native profile lock exclusively and preserves profile directories and all `.cargo*-lock` inodes, protecting both older Cargo and waiting processes. Only contents of recognized idle profile directories are reclaimed; output such as root-level documentation/package archives and unrelated physical workspace targets is reported but remains intact. Entry/deadline limits cover enumeration and deletion; a sweep can stop after partially clearing regenerable output, leaving sources and lock files untouched. The next Cargo build regenerates missing output.
 
 These are **soft retention budgets**, not active-build quotas. If everything is recent, busy or uncertain, the report shows pressure and exclusions instead of deleting it. Estimated reclaimed allocation can differ from physical free-space gain because of hardlinks and APFS sharing. Growth compares successful inventory samples; an unavailable/busy tier has no current usage measurement. The existing free-disk admission reserve remains in effect.
+
+## Defaults: managed shared targets
+
+`fabric_build_cache` and `local.manage_targets` are on by default and `scripts/install.sh`
+/ `fleet update` install the wrapper. Builds of all worktrees of one repo and toolchain share
+a pool of `local.target_pool_size` (default 2) `CARGO_TARGET_DIR` slots, one flock per slot
+(`local.target_mode: per_workspace` restores one target per workspace). An explicit
+`CARGO_TARGET_DIR` wins, and `CARGO_INCREMENTAL=0` is the default for managed builds.
+The wrapper refuses new builds at `build_cleanup.refuse_builds_percent` disk usage (exit 75)
+unless `HERDR_DISK_GUARD_OVERRIDE=1`. Opt out with `fabric_build_cache: {enabled: false}`.

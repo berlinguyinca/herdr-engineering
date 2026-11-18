@@ -55,11 +55,13 @@ class Local:
     min_free_disk_percent: float
     incremental_disabled_for_cacheable_builds: bool
     storage_tiers: tuple[StorageTier, ...] = ()
-    manage_targets: bool = False
+    manage_targets: bool = True
     target_retention_enabled: bool = False
     target_internal_gib: float = 32
     target_external_gib: float = 256
     target_min_idle_hours: float = 168
+    target_mode: str = "shared"  # "shared": one pooled target per repo+toolchain; "per_workspace"
+    target_pool_size: int = 2
 
 
 @dataclass(frozen=True)
@@ -177,6 +179,8 @@ class BuildCacheConfig:
                 "target_internal_gib": lo.target_internal_gib,
                 "target_external_gib": lo.target_external_gib,
                 "target_min_idle_hours": lo.target_min_idle_hours,
+                "target_mode": lo.target_mode,
+                "target_pool_size": lo.target_pool_size,
                 "incremental_disabled_for_cacheable_builds":
                     lo.incremental_disabled_for_cacheable_builds,
             },
@@ -375,6 +379,10 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     internal = _num(lo, "target_internal_gib", lp, lo=0, lo_incl=False)
     external = _num(lo, "target_external_gib", lp, lo=0, lo_incl=False)
     target_idle = _num(lo, "target_min_idle_hours", lp, lo=24, lo_incl=True)
+    target_mode = lo["target_mode"]
+    if target_mode not in ("shared", "per_workspace"):
+        raise _bad(f"{lp}.target_mode", "must be 'shared' or 'per_workspace'")
+    pool = int(_num(lo, "target_pool_size", lp, lo=1, lo_incl=True, hi=16, hi_incl=True, integer=True))
     import math
     if not all(math.isfinite(value) for value in (internal, external, target_idle)):
         raise _bad(lp, "target retention limits must be finite")
@@ -443,7 +451,8 @@ def validate(section: dict[str, Any] | None) -> BuildCacheConfig:
     return BuildCacheConfig(
         enabled=enabled, mode=mode, allowed_hosts=allowed_hosts,
         shared_cache=SharedCache(s_enabled, ep, s["namespace"], writes, max_total, tls, cred, reg),
-        local=Local(capacity, ram, free, incr, tiers, manage_targets, target_retention, internal, external, target_idle),
+        local=Local(capacity, ram, free, incr, tiers, manage_targets, target_retention, internal, external, target_idle,
+                    target_mode, pool),
         execution=Execution(slurm, clusters, parts, gpu, fb, slots),
         cleanup=Cleanup(dry, idle, evict),
         observability=Observability(obs, exp),

@@ -64,6 +64,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("arguments", nargs=argparse.REMAINDER)
     p.set_defaults(func=_cmd_cargo_host)
 
+    p = sub.add_parser("build-hygiene", help="install or inspect default disk hygiene (cleanup job, cargo wrapper)")
+    p.add_argument("arguments", nargs=argparse.REMAINDER)
+    p.set_defaults(func=_cmd_build_hygiene)
+
     from .open_client import register_parser
     register_parser(sub)
 
@@ -3168,6 +3172,11 @@ def _cmd_dev_gateway(args) -> int:
     return 0
 
 
+def _cmd_build_hygiene(args) -> int:
+    from .build_hygiene import main
+    return main(args.arguments)
+
+
 def _cmd_cargo_host(args) -> int:
     from .cargo_host import main
     return main(args.arguments)
@@ -3227,6 +3236,10 @@ def _cmd_build_coordinate(args) -> int:
     if getattr(args, "trace_session", None) and trace is None:
         print("build-coordinate: --trace-session ignored (not a plain non-secret id)",
               file=sys.stderr)
+    from .cargo_host import _disk_guard_refusal
+    refused = _disk_guard_refusal()
+    if refused is not None:
+        return refused
     return run_gated(cmd, slots=slots, max_load=args.max_load,
                      wait_seconds=args.wait, json_out=args.json,
                      bypass_on_timeout=args.bypass_on_timeout,

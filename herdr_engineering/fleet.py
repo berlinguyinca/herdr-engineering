@@ -437,7 +437,7 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                and isinstance(roots, list) and bool(roots)
                and all(isinstance(path, str) and path.strip() for path in roots))
     installer = root / "scripts" / "build-cleanup.sh"
-    if enabled and installer.exists():
+    if enabled and installer.exists() and sys.platform.startswith("linux"):
         ok, _ = step("controller_cleanup", ["bash", str(installer)], 120)
         if not ok:
             return report
@@ -451,6 +451,11 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                          "--now", "herdr-eng-build-cleanup.service"], 120)
             if not ok:
                 return report
+
+    # Disk hygiene is on by default: the cleanup job (launchd on macOS) and the managed cargo
+    # launcher. Non-fatal - `herdr-eng doctor` reports a host where it is missing.
+    step("controller_build_hygiene", [sys.executable, "-m", "herdr_engineering.cli",
+                                     "build-hygiene", "install"], 120)
 
     # Refresh whichever unattended updater the controller actually has loaded - the installer
     # holds the unit/plist templates, so a schedule or working-directory change reaches a host

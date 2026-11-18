@@ -66,3 +66,23 @@ policy. This feature does not automatically enable deletion on remote hosts.
 Fleet updates now install and refresh this companion automatically, preserving
 each host's explicit policy. Enable the controller's optional daily update timer
 with `scripts/fleet-auto-update.sh`; see [fleet lifecycle](operations/fleet-lifecycle.md).
+
+## Defaults, pressure mode and the disk guard
+
+Cleanup is on by default (roots `~/IdeaProjects`, `~/work`, `~/.cache`; roots that do
+not exist are skipped, and the shared cargo target pool is added automatically). Opt out
+with `build_cleanup: {enabled: false}`. `scripts/install.sh` and `fleet update` install
+the job; `herdr-eng build-hygiene install|status` does it by hand (systemd user unit on
+Linux, a launchd interval job on macOS).
+
+```yaml
+build_cleanup:
+  pressure_percent: 90          # at/above this, targets idle >= pressure_min_age_hours go
+  pressure_min_age_hours: 2     # minimum allowed value is 1
+  refuse_builds_percent: 90     # cargo wrapper / build-coordinate refuse new builds
+```
+
+Targets still in use (live process, build lease, open file, held pool-slot lock) are
+never removed in any tier. When usage is at or above `refuse_builds_percent`, a new
+build triggers one pressure cleanup (at most every 10 minutes) and is refused with exit
+code 75 if the disk is still too full. `HERDR_DISK_GUARD_OVERRIDE=1` builds anyway.

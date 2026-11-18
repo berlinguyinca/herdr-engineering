@@ -28,9 +28,12 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .cargo_target_storage import SLOT_LOCK
+
 _PRUNE = {".git", "node_modules", ".venv", "venv", ".cache", "__pycache__"}
 _MAX_ENTRIES = 500_000
 _MAX_DEPTH = 6
+MIN_IDLE_HOURS = 1
 
 
 
@@ -67,8 +70,31 @@ def _managed_process(pid: Path, proc: Path) -> bool:
     return False
 
 
+def _lsof_paths() -> list[Path]:
+    """Open files, cwds and executables of this user's processes where /proc is absent (macOS).
+
+    Fails closed: if lsof cannot run, cleanup must not guess that nothing is in use.
+    """
+    try:
+        result = subprocess.run(["lsof", "-w", "-n", "-P", "-u", str(os.getuid()), "-Fpn"],
+                                capture_output=True, text=True, timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise OSError(f"Cannot inspect running processes: {exc}") from exc
+    if result.returncode > 1 or (result.returncode == 1 and not result.stdout):
+        raise OSError("Cannot inspect running processes: lsof failed")
+    paths, own = [], False
+    for line in result.stdout.splitlines():
+        if line.startswith("p"):
+            own = line[1:] == str(os.getpid())  # like the /proc scan, ignore this process
+        elif line.startswith("n/") and not own:
+            paths.append(Path(line[1:]))
+    return paths
+
+
 def _process_paths(proc: Path = Path("/proc")) -> list[Path]:
     """Inspect visible same-user processes; hidden Herdr descendants block cleanup."""
+    if not proc.is_dir():
+        return _lsof_paths()
     paths = []
     with os.scandir(proc) as entries:
         pids = [Path(entry.path) for entry in entries if entry.name.isdigit()]
@@ -114,9 +140,8 @@ def _discover(root: Path) -> list[Path]:
                 if entry.stat(follow_symlinks=False).st_dev != device:
                     continue
                 if entry.name == "target":
-                    markers = [path / ".rustc_info.json", path / "debug/.fingerprint",
-                               path / "release/.fingerprint"]
-                    if (directory / "Cargo.toml").is_file() and any(p.exists() for p in markers):
+                    if _cargo_markers(path) and ((directory / "Cargo.toml").is_file()
+                                                 or _cache_only_target(path)):
                         found.append(path)
                     continue
                 if entry.name in _PRUNE:
@@ -125,6 +150,39 @@ def _discover(root: Path) -> list[Path]:
                     continue  # deeper directories are outside this bounded sweep
                 pending.append((path, depth + 1))
     return found
+
+
+_CACHEDIR_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
+
+
+def _cargo_markers(target: Path) -> bool:
+    return any((target / m).exists() for m in
+               (".rustc_info.json", "debug/.fingerprint", "release/.fingerprint"))
+
+
+def _cache_only_target(target: Path) -> bool:
+    """A Cargo target not beside a manifest (shared pool, CARGO_TARGET_DIR) proven by CACHEDIR.TAG."""
+    tag = target / "CACHEDIR.TAG"
+    try:
+        return (not tag.is_symlink() and tag.is_file()
+                and tag.read_bytes()[:128].find(_CACHEDIR_SIGNATURE) >= 0)
+    except OSError:
+        return False
+
+
+def _slot_busy(target: Path) -> bool:
+    """True while a cargo wrapper holds the shared-pool slot lock beside this target."""
+    lock = target.parent / SLOT_LOCK
+    if not lock.is_file() or lock.is_symlink():
+        return False
+    fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
 
 
 def _inspect(target: Path) -> tuple[float, int]:
@@ -158,6 +216,8 @@ def _inspect(target: Path) -> tuple[float, int]:
 
 def _untracked(target: Path) -> bool:
     """Git must verify the entire target is untracked, including nested files."""
+    if not (target.parent / "Cargo.toml").is_file():
+        return True  # cache-only directory (verified by CACHEDIR.TAG); no repository owns it
     result = subprocess.run(
         ["git", "-C", str(target.parent), "ls-files", "--", "target"],
         capture_output=True, timeout=30, check=False,
@@ -167,9 +227,8 @@ def _untracked(target: Path) -> bool:
 
 def _recognized(target: Path) -> bool:
     """Same recognition rule as discovery: a Cargo ``target`` with build markers."""
-    return (target.name == "target" and (target.parent / "Cargo.toml").is_file()
-            and any((target / m).exists() for m in
-                    (".rustc_info.json", "debug/.fingerprint", "release/.fingerprint")))
+    return (target.name == "target" and _cargo_markers(target)
+            and ((target.parent / "Cargo.toml").is_file() or _cache_only_target(target)))
 
 
 def _lease_block(state_dir: Path, target: Path) -> str | None:
@@ -213,26 +272,32 @@ def _write_status(state_dir: Path, result: dict) -> None:
 def run_once(
     roots: list[str | Path], state_dir: str | Path, dry_run: bool = False,
     high_water: float = 85, low_water: float = 80, min_age_hours: float = 24,
+    pressure_water: float = 90, pressure_min_age_hours: float = 2,
 ) -> dict:
     """Run one bounded sweep and atomically save its inspectable status.
 
     ``state_dir`` must be the same build-gates directory used by ``run_gated``.
     ``reclaimed_bytes`` measures observed free-space gain; ``removed_bytes`` is
     the allocated size of removed files. Concurrent filesystem activity can
-    affect the former. Dry runs fully validate eligible targets but never remove
+    affect the former. Targets must be idle ``min_age_hours``; when a root's usage reaches
+    ``pressure_water`` the idle floor drops to ``pressure_min_age_hours`` (never below
+    ``MIN_IDLE_HOURS``). Process, lease and slot-lock guards apply in both tiers. Dry runs fully validate eligible targets but never remove
     them. Busy sweeps return immediately without overwriting the last report.
     """
-    if not all(math.isfinite(v) for v in (high_water, low_water, min_age_hours)):
+    if not all(math.isfinite(v) for v in (high_water, low_water, min_age_hours,
+                                          pressure_water, pressure_min_age_hours)):
         raise ValueError("Cleanup policy values must be finite")
-    if not 0 <= low_water < high_water <= 100 or min_age_hours < 24:
-        raise ValueError("Require 0 <= low_water < high_water <= 100 and min_age_hours >= 24")
+    if not 0 <= low_water < high_water <= 100 or not 0 <= pressure_water <= 100:
+        raise ValueError("Require 0 <= low_water < high_water <= 100 and 0 <= pressure_water <= 100")
+    if min_age_hours < MIN_IDLE_HOURS or pressure_min_age_hours < MIN_IDLE_HOURS:
+        raise ValueError(f"Idle floors must be at least {MIN_IDLE_HOURS} hour(s)")
     state_dir = Path(state_dir).expanduser().absolute()
     state_dir.mkdir(parents=True, exist_ok=True)
     result = {
         "timestamp": datetime.now(UTC).isoformat(), "status": "ok", "dry_run": dry_run,
         "roots": [], "removed_count": 0, "removed_bytes": 0, "reclaimed_bytes": 0,
         "removed": [], "would_remove": [], "skipped": [], "errors": [], "warnings": [],
-        "reconciled": [],
+        "reconciled": [], "pressure": False,
     }
     lock_fd = os.open(state_dir / "build-maintenance.lock",
                       os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -243,7 +308,8 @@ def run_once(
             result["status"] = "busy"
             return result
         _reconcile_registry(state_dir, result)
-        _sweep(roots, state_dir, result, high_water, low_water, min_age_hours)
+        _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
+               pressure_water, pressure_min_age_hours)
         if result["warnings"]:
             result["status"] = "warning"
         if result["errors"]:
@@ -286,18 +352,26 @@ def _skip_for_registry(state_dir: Path, target: Path, name: str, result: dict) -
     return True
 
 
-def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours):
+def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
+           pressure_water=90, pressure_min_age_hours=2):
     roots_by_device = {}
     candidates = []
-    cutoff = time.time() - min_age_hours * 3600
+    cutoffs: dict[str, float] = {}
+    now = time.time()
     try:
         for raw in roots:
             root = Path(raw).expanduser().absolute()
             if root != root.resolve(strict=True) or not root.is_dir() or root == Path("/"):
                 raise OSError(f"Root must be a canonical project directory: {root}")
             result["roots"].append(str(root))
-            if _usage(root) < high_water:
+            usage = _usage(root)
+            if usage < high_water:
                 continue
+            under_pressure = usage >= pressure_water
+            cutoff = now - (min(min_age_hours, pressure_min_age_hours) if under_pressure
+                            else min_age_hours) * 3600
+            if under_pressure:
+                result["pressure"] = True
             roots_by_device[root.stat().st_dev] = root
             for target in _discover(root):
                 if state_dir.is_relative_to(target):
@@ -315,6 +389,7 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours):
                     result["skipped"].append({"path": str(target), "reason": "recent activity"})
                 else:
                     candidates.append((newest, str(target), size))
+                    cutoffs[str(target)] = cutoff
         if not candidates:
             return
         # Verify process visibility before deleting anything.
@@ -342,8 +417,11 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours):
                 continue
             # Revalidate immediately before deletion while still holding the build lock.
             newest, size = _inspect(target)
-            if newest > cutoff:
+            if newest > cutoffs[name]:
                 result["skipped"].append({"path": name, "reason": "recent activity"})
+                continue
+            if _slot_busy(target):
+                result["skipped"].append({"path": name, "reason": "build in progress"})
                 continue
             active = _process_paths()
             if any(path.is_relative_to(target.parent) for path in active):

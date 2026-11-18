@@ -196,8 +196,11 @@ def test_proc_reads_cwd_executable_and_open_files(tmp_path):
     assert set(paths) == {Path("/project"), Path("/binary"), Path("/project/target/output")}
 
 
-def test_missing_proc_is_an_error(tmp_path):
-    with pytest.raises(FileNotFoundError):
+def test_missing_proc_falls_back_to_lsof_or_fails_closed(tmp_path, monkeypatch):
+    def no_lsof(*args, **kwargs):
+        raise FileNotFoundError("lsof")
+    monkeypatch.setattr(cleanup.subprocess, "run", no_lsof)
+    with pytest.raises(OSError):
         cleanup._process_paths(tmp_path / "no-proc")
 
 
