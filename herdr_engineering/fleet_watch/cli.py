@@ -246,7 +246,11 @@ def _loop(args, directory: Path, local: str | None) -> int:
         runner.kill_children()                            # os._exit runs no cleanup: do not orphan host-apply children
         os._exit(70)
 
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    def stop(*_) -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)     # one-shot: a second SIGTERM must not cut the child cleanup short
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
     rng = random.Random()
     dog = service.Watchdog(_watchdog_markers(directory), soft_s=args.soft_limit, hard_s=args.hard_limit,
                            on_soft=soft, on_hard=hard)

@@ -70,14 +70,22 @@ def _stop_group(proc: subprocess.Popen, grace: float = CHILD_GRACE_S) -> None:
     """SIGTERM the child's group, give it `grace` seconds to clean up, then SIGKILL the group.
 
     host-apply starts its own commands with start_new_session=True, so they are NOT in this group: only host-apply's
-    own SIGTERM handling (which kills them) reaches them. Hence TERM first, KILL only after the grace."""
+    own SIGTERM handling (which kills them) reaches them. Hence TERM first, KILL only after the grace. The KILL is in
+    a `finally`, so an exception raised while waiting (a second signal) cannot skip it."""
     with contextlib.suppress(OSError):
         os.killpg(proc.pid, signal.SIGTERM)
-    deadline = time.monotonic() + grace
-    while proc.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.05)
-    with contextlib.suppress(OSError):
-        os.killpg(proc.pid, signal.SIGKILL)
+    try:
+        deadline = time.monotonic() + grace
+        while proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        try:
+            os.killpg(proc.pid, 0)                # the group is gone (and its id may be reused): nothing to kill
+        except OSError:
+            pass
+        else:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
 
 
 def kill_children() -> None:
