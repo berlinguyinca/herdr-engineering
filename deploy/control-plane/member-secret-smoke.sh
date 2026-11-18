@@ -39,8 +39,8 @@ from herdr_engineering.control_plane.artifact_member_shares import (
     SECRET_DIR_MODE_SHARED, SECRET_FILE_MODE_SHARED, SECRETS_DIR)
 from herdr_engineering.control_plane.collab_bridge_files import link_new_beneath
 import json
-assert link_new_beneath(Path(os.environ["OUT"]), [SECRETS_DIR], "tkt_smoke.json",
-                        json.dumps({"ticket": "tkt_smoke", "principal": "p", "url": "https://x/s/t", "at": 1}).encode(),
+assert link_new_beneath(Path(os.environ["OUT"]), [SECRETS_DIR], "ict_000000000000000000000000.json",
+                        json.dumps({"ticket": "ict_000000000000000000000000", "principal": "p", "url": "https://x/s/t", "at": 1}).encode(),
                         mode=SECRET_FILE_MODE_SHARED, create_dirs=True, dir_mode=SECRET_DIR_MODE_SHARED,
                         gid=int(os.environ["UID_PUB"]))
 PY
@@ -48,8 +48,8 @@ PY
 as() { setpriv --reuid "$1" --regid "$1" --clear-groups "${@:2}"; }
 
 # an unrelated uid can neither read nor delete
-if as 65534 cat "$OUT/secrets/tkt_smoke.json" 2>/dev/null; then echo "FAIL: an unrelated uid read the secret" >&2; exit 1; fi
-if as 65534 rm "$OUT/secrets/tkt_smoke.json" 2>/dev/null; then echo "FAIL: an unrelated uid deleted the secret" >&2; exit 1; fi
+if as 65534 cat "$OUT/secrets/ict_000000000000000000000000.json" 2>/dev/null; then echo "FAIL: an unrelated uid read the secret" >&2; exit 1; fi
+if as 65534 rm "$OUT/secrets/ict_000000000000000000000000.json" 2>/dev/null; then echo "FAIL: an unrelated uid deleted the secret" >&2; exit 1; fi
 
 # collab-public reads and deletes it (take_secret is what collab-public runs)
 as "$UID_PUB" "$PYTHON" - <<'PY'
@@ -57,8 +57,8 @@ import os
 from pathlib import Path
 from herdr_engineering.control_plane.artifact_member_intents import take_secret
 out = Path(os.environ["OUT"])
-assert take_secret(out, "tkt_smoke", "p") == "https://x/s/t", "collab-public could not read the secret"
-assert take_secret(out, "tkt_smoke", "p") is None
-assert not (out / "secrets" / "tkt_smoke.json").exists(), "collab-public could not delete the secret"
+assert take_secret(out, "ict_000000000000000000000000", "p") == "https://x/s/t", "collab-public could not read the secret"
+assert take_secret(out, "ict_000000000000000000000000", "p") is None
+assert not (out / "secrets" / "ict_000000000000000000000000.json").exists(), "collab-public could not delete the secret"
 PY
 echo "OK: the secret crossed root -> uid $UID_PUB and was deleted; uid 65534 was refused"

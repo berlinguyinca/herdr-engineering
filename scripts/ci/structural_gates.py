@@ -38,6 +38,9 @@ CONFLICT_MARKERS = (re.compile(r"^<{7}(?: |$)", re.MULTILINE), re.compile(r"^>{7
 PARSE_ALLOWLIST: frozenset[str] = frozenset()
 
 
+TRACKED_REVISION = "tracking origin/main"
+
+
 def tracked_files() -> list[str]:
     """Every path git tracks that is a real file, relative to the repository root.
 
@@ -121,8 +124,9 @@ def check_lock_and_pin_agree(files: list[str]) -> list[str]:
             failures.append(f"lock/upstreams.yaml: dependency {name!r} has no 'source'")
         # `revision: null` is a deliberate choice, not an omission: several dependencies are tracked by source and are not
         # commit-pinned. Only a value that is present must look like a commit or a release.
+        # `TRACKED_REVISION` is the one explicit marker for a deliberately unpinned upstream (screenwright tracks origin/main).
         revision = entry.get("revision")
-        if revision is not None and not re.fullmatch(r"[0-9a-f]{7,40}|[0-9][0-9a-zA-Z.+_-]*", str(revision)):
+        if revision is not None and revision != TRACKED_REVISION and not re.fullmatch(r"[0-9a-f]{7,40}|[0-9][0-9a-zA-Z.+_-]*", str(revision)):
             failures.append(f"lock/upstreams.yaml: dependency {name!r} revision {revision!r} is neither a hex commit nor a version")
     constant = re.search(r'^PINNED_REVISION\s*=\s*"([0-9a-f]+)"', _read("herdr_engineering/memory_install.py"), re.MULTILINE)
     pinned = deps.get("herdr-memory", {}).get("revision") if isinstance(deps.get("herdr-memory"), dict) else None

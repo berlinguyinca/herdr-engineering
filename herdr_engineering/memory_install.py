@@ -193,19 +193,22 @@ class JsonKeyUnit(Unit):
 class ClaudeHooksUnit(Unit):
     """Managed hook entries inside ``settings.json`` ``hooks`` (marker in command)."""
     kind = "claude-hooks"
+    marker = MARKER   # a sibling installer (workflow_hooks) overrides this with its own
+    matchers: dict[str, str] = {}   # event -> tool matcher, for events that need one
 
     def __init__(self, name, path, entries: dict[str, str]):
         super().__init__(name, path)
         self.entries = entries   # event -> shell command (already marked)
 
-    @staticmethod
-    def _wrap(command):
-        return {"hooks": [{"type": "command", "command": command, "timeout": 3}]}
+    def _wrap(self, command, event=None):
+        entry = {"hooks": [{"type": "command", "command": command, "timeout": 3}]}
+        if event in self.matchers:
+            entry = {"matcher": self.matchers[event], **entry}
+        return entry
 
-    @staticmethod
-    def _is_managed(entry):
+    def _is_managed(self, entry):
         return isinstance(entry, dict) and any(
-            isinstance(h, dict) and MARKER in str(h.get("command", ""))
+            isinstance(h, dict) and self.marker in str(h.get("command", ""))
             for h in entry.get("hooks", []) if isinstance(h, dict))
 
     def _load(self, text):
@@ -225,7 +228,7 @@ class ClaudeHooksUnit(Unit):
                 managed = [e for e in lst if self._is_managed(e)]
                 if not managed:
                     states.append(ABSENT)
-                elif managed == [self._wrap(command)]:
+                elif managed == [self._wrap(command, event)]:
                     states.append(CURRENT)
                 else:
                     states.append(STALE)
@@ -240,7 +243,7 @@ class ClaudeHooksUnit(Unit):
         hooks = data.setdefault("hooks", {})
         for event, command in self.entries.items():
             lst = [e for e in hooks.get(event, []) if not self._is_managed(e)]
-            hooks[event] = [*lst, self._wrap(command)]
+            hooks[event] = [*lst, self._wrap(command, event)]
         return _dump_json(data, text)
 
     def remove(self, text):

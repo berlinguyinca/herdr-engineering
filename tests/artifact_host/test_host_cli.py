@@ -90,6 +90,35 @@ def test_parse_refuses_bad_files_naming_keys_never_values(mutate, key: str) -> N
         assert secret not in str(err.value)
 
 
+def test_member_host_is_optional_and_off_by_default(tmp_path: Path) -> None:
+    cfg = host_config.load(write(tmp_path, good()))
+    assert cfg.member_host == "" and cfg.member_url == ""
+    assert cli.public_config(cfg).member_host is None
+
+
+def test_member_host_is_carried_into_the_public_config(tmp_path: Path) -> None:
+    cfg = host_config.load(write(tmp_path, {**good(), "member_host": "my.artifacts.example.test"}))
+    assert cfg.member_host == "my.artifacts.example.test"
+    assert cfg.member_url == "https://my.artifacts.example.test"
+    assert cli.public_config(cfg).member_host == "my.artifacts.example.test"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["Bad_Host", "https://my.example.test", "artifacts.example.test", "mcp.example.test", "127.0.0.1", 5, None],
+)
+def test_member_host_must_be_a_distinct_dns_name(bad: object) -> None:
+    data = {**good(), "member_host": bad}
+    with pytest.raises(ValueError, match="member_host"):
+        host_config.parse(data)
+
+
+def test_member_host_is_a_public_role_key_only() -> None:
+    internal = {**good_internal(), "member_host": "my.artifacts.example.test"}
+    with pytest.raises(ValueError, match="unknown keys"):
+        host_config.parse(internal)
+
+
 def test_load_reports_unreadable_and_non_json_files_without_content(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="cannot read"):
         host_config.load(tmp_path / "missing.json")

@@ -49,6 +49,7 @@ ROLE_KEYS: Final = {
         "public_host",
         "public_url",
         "mcp_public_hosts",
+        "member_host",
         "session_seconds",
         "cognito",
         "session_secret",
@@ -95,6 +96,7 @@ class HostConfig:
     public_host: str = ""
     public_url: str = ""
     mcp_public_hosts: tuple[str, ...] = ()
+    member_host: str = ""
     session_seconds: int = 0
     pool_id: str = ""
     client_ids: tuple[str, ...] = ()
@@ -106,6 +108,11 @@ class HostConfig:
     internal_key_digest: str = ""
     bind: str = ""
     health_port: int = DEFAULT_HEALTH_PORT
+
+    @property
+    def member_url(self) -> str:
+        """The member web origin, or empty when the member UI stays on ``public_host``."""
+        return f"https://{self.member_host}" if self.member_host else ""
 
     @property
     def dsn(self) -> str:
@@ -150,6 +157,13 @@ def _public(raw: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "mcp_public_hosts must be a list of lowercase DNS names other than public_host"
         )
+    member_host = raw.get("member_host", "")
+    if member_host != "" and (
+        not _dns(member_host) or member_host == host or member_host in mcp
+    ):
+        raise ValueError(
+            "member_host must be a lowercase DNS name other than public_host and mcp_public_hosts"
+        )
     seconds = raw.get("session_seconds", 14400)
     if isinstance(seconds, bool) or not isinstance(seconds, int) or not 60 <= seconds <= 7 * 86400:
         raise ValueError("session_seconds must be an integer from 60 to 604800")
@@ -174,6 +188,7 @@ def _public(raw: Mapping[str, Any]) -> dict[str, Any]:
         "public_host": host,
         "public_url": f"https://{host}",
         "mcp_public_hosts": tuple(mcp),
+        "member_host": member_host,
         "session_seconds": seconds,
         "pool_id": cognito["pool_id"],
         "client_ids": tuple(clients),
