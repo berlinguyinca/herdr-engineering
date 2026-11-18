@@ -2,7 +2,7 @@
 """run-watched SOFT HARD -- command...
 
 SOFT seconds of wall time: print one notice to stderr, keep running (never kills).
-HARD seconds with NO progress: kill the command and everything it started, exit 124. Progress = any new output byte, or CPU time
+HARD seconds with NO progress: stop the command (SIGTERM, short grace, then SIGKILL) and everything it started, exit 124. Progress = any new output byte, or CPU time
 used by (or a new process appearing in) the command's process tree. The tree is every process that is in the command's session, a
 descendant by parent pid, or carries this run's unique token in its environment (HERDR_RUN_WATCHED_TOKEN, inherited through fork/exec).
 The token is what finds a Postgres started by `pg_ctl start`: pg_ctl forks a setsid child that execs postgres and exits, so the
@@ -14,6 +14,7 @@ at most 2 s without any CPU progress), then the tree is stopped and the command'
 SIGTERM/SIGINT/SIGHUP to this watchdog stop the whole tree (SIGTERM, brief wait, SIGKILL) and exit 128+signal.
 Exit status is the command's (128+signal if it died of a signal), or 124 when killed as hung. Linux only (/proc).
 """
+import math
 import os
 import select
 import signal
@@ -26,14 +27,14 @@ TERM_GRACE = 5.0
 
 
 def read_stat(pid: int):
-    """(ppid, session, cpu_seconds, starttime, state) from /proc/<pid>/stat, or None if gone. comm may hold spaces/parens."""
+    """(ppid, session, cpu_seconds, starttime, state, pgrp) from /proc/<pid>/stat, or None if gone. comm may hold spaces/parens."""
     try:
         with open(f"/proc/{pid}/stat") as f:
             raw = f.read()
     except OSError:
         return None
     rest = raw[raw.rindex(")") + 2:].split()
-    return int(rest[1]), int(rest[3]), (int(rest[11]) + int(rest[12])) / TICKS, int(rest[19]), rest[0]
+    return int(rest[1]), int(rest[3]), (int(rest[11]) + int(rest[12])) / TICKS, int(rest[19]), rest[0], int(rest[2])
 
 
 def snapshot() -> dict:
@@ -53,18 +54,30 @@ class Tree:
         self.root = root
         self.token = b"HERDR_RUN_WATCHED_TOKEN=" + token.encode()
         self.known: dict[int, int] = {root: -1}   # pid -> starttime (-1 until first seen)
-        self.cpu: dict[int, float] = {}
+        self.cpu: dict[tuple[int, int], float] = {}     # (pid, starttime) -> cpu seconds: a reused pid has no history
         self.tagged: dict[tuple[int, int], bool] = {}
 
     def has_token(self, pid: int, start: int) -> bool:
+        """Only a positive answer is cached: a process can gain the token after we first look (a fork child reads as its parent's
+        environment until it execs), so a negative must be re-checked on the next poll."""
         key = (pid, start)
-        if key not in self.tagged:
-            try:
-                with open(f"/proc/{pid}/environ", "rb") as f:
-                    self.tagged[key] = self.token in f.read().split(b"\0")
-            except OSError:
-                self.tagged[key] = False
-        return self.tagged[key]
+        if key in self.tagged:
+            return True
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                found = self.token in f.read().split(b"\0")
+        except OSError:
+            return False
+        if found:
+            self.tagged[key] = True
+        return found
+
+    def note_cpu(self, pid: int, start: int, cpu: float) -> bool:
+        """Record a member's CPU; True if it is new (pid, starttime) or its CPU rose."""
+        key = (pid, start)
+        rose = key not in self.cpu or cpu > self.cpu[key]
+        self.cpu[key] = cpu
+        return rose
 
     def poll(self) -> bool:
         """Refresh membership; return True if any member's CPU rose or a new member appeared."""
@@ -83,10 +96,10 @@ class Tree:
         for p in members:
             st = snap[p]
             self.known[p] = st[3]
-            if p not in self.cpu or st[2] > self.cpu[p]:
+            if self.note_cpu(p, st[3], st[2]):
                 progress = True
-            self.cpu[p] = st[2]
         self.known = {p: t for p, t in self.known.items() if p in members or p == self.root}
+        self.cpu = {k: v for k, v in self.cpu.items() if k[0] in members and snap[k[0]][3] == k[1]}
         self.alive = {p for p in members if p != self.root}
         return progress
 
@@ -102,10 +115,18 @@ class Tree:
                     os.kill(pid, sig)
                 except (ProcessLookupError, PermissionError):
                     pass
-        try:
-            os.killpg(self.root, sig)
-        except (ProcessLookupError, PermissionError):
-            pass
+        if self.group_is_ours():
+            try:
+                os.killpg(self.root, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def group_is_ours(self) -> bool:
+        """The root's pid is only safe to use as a pgid while it cannot have been reused: while the root is unreaped (even as a
+        zombie), or while some live process still has it as its process group (the kernel never reuses an id that is in use)."""
+        if read_stat(self.root):
+            return True
+        return any(st[5] == self.root and st[4] != "Z" for st in snapshot().values())
 
 
 def stop_tree(proc: subprocess.Popen, tree: Tree) -> None:
@@ -131,35 +152,58 @@ class Out:
         try:
             sys.stdout.buffer.write(chunk)
             sys.stdout.buffer.flush()
-        except (BrokenPipeError, ValueError):
+        except (OSError, ValueError, AttributeError):     # closed reader, EAGAIN on a full non-blocking pipe, closed/None stdout
             self.broken = True
             os.dup2(os.open(os.devnull, os.O_WRONLY), 1)     # so interpreter shutdown does not flush into the dead pipe
 
 
+def usage_error(message: str) -> None:
+    print(f"run-watched: {message}\n\n{__doc__}", file=sys.stderr)
+
+
+def parse_args(argv: list[str]) -> tuple[float, float, list[str]] | None:
+    """(soft, hard, command) or None after printing a usage error."""
+    if len(argv) < 4 or argv[2] != "--":
+        usage_error("usage: run-watched SOFT HARD -- command...")
+        return None
+    try:
+        soft, hard = float(argv[0]), float(argv[1])
+    except ValueError:
+        usage_error(f"usage: SOFT and HARD must be numbers of seconds, got {argv[0]!r} and {argv[1]!r}")
+        return None
+    if not (math.isfinite(soft) and math.isfinite(hard) and soft >= 0 and hard > 0):
+        usage_error("usage: SOFT must be >= 0 and HARD > 0 (finite seconds)")
+        return None
+    return soft, hard, argv[3:]
+
+
 def main() -> int:
-    if len(sys.argv) < 4 or "--" not in sys.argv:
-        print(__doc__, file=sys.stderr)
+    parsed = parse_args(sys.argv[1:])
+    if parsed is None:
         return 2
-    soft, hard = float(sys.argv[1]), float(sys.argv[2])
-    cmd = sys.argv[sys.argv.index("--") + 1:]
+    soft, hard, cmd = parsed
     token = f"{os.getpid()}-{time.time_ns()}"
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
-                            env={**os.environ, "HERDR_RUN_WATCHED_TOKEN": token})
-    tree = Tree(proc.pid, token)
     got: list[int] = []         # first signal received; the loop acts on it (nothing blocking runs in the handler)
 
     def on_signal(signum, _frame):
         if not got:
             got.append(signum)
 
-    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):      # before the spawn: no window where a signal kills us and orphans it
         signal.signal(s, on_signal)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
+                                env={**os.environ, "HERDR_RUN_WATCHED_TOKEN": token})
+    except OSError as e:
+        print(f"run-watched: cannot start {cmd[0]!r}: {e.strerror or e}", file=sys.stderr)
+        return 127 if isinstance(e, FileNotFoundError) else 126
+    tree = Tree(proc.pid, token)
 
     orphan_grace = float(os.environ.get("HERDR_WATCHED_ORPHAN_GRACE", "30"))
     out = Out()
     start = last_progress = time.monotonic()
     root_exited_at = last_orphan_progress = None
-    warned = eof = finished = False
+    warned = eof = False
     fd = proc.stdout.fileno()
     try:
         while True:
@@ -200,13 +244,9 @@ def main() -> int:
                 print(f"[run-watched] still running after {soft:g}s (soft limit; not killing)", file=sys.stderr)
             if now - last_progress >= hard:
                 print(f"[run-watched] no output and no CPU for {hard:g}s -- hung; killing", file=sys.stderr)
-                finished = True
-                tree.signal_all(signal.SIGKILL)
-                proc.wait()
-                return 124
+                return 124          # the finally block stops the tree: SIGTERM, grace, SIGKILL
     finally:
-        if not finished:
-            stop_tree(proc, tree)
+        stop_tree(proc, tree)
 
 
 if __name__ == "__main__":
