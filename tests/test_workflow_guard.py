@@ -171,7 +171,7 @@ def test_other_remote_feature_push_allowed(feature):
 # ---- fail open -------------------------------------------------------------------------
 @pytest.mark.parametrize("raw", ["", "not json", "[]", "null", '{"tool_name": 5}',
                                  '{"tool_name": "Bash", "tool_input": "x"}',
-                                 '{"tool_name": "Bash", "tool_input": {"command": "git push \'unterminated"}}',
+                                 '{"tool_name": "Bash", "tool_input": {"command": "git push \'unterminated"}, "cwd": "/"}',
                                  '{"tool_name": "Write", "tool_input": {"file_path": 3}}'])
 def test_malformed_input_is_silent_exit_zero(raw):
     assert call(None, raw=raw)[:2] == (0, "")
@@ -329,3 +329,64 @@ def test_ampersand_in_redirect_does_not_hide_a_second_push(on_main):
 def test_herdr_engineering_ask_survives_redirect(redir, tmp_path):
     repo = make_repo(tmp_path / "he", "feat/z", origin="git@github.com:b/herdr-engineering.git")
     assert decision(bash(f"git push origin feat/z {redir}", repo)) == "ask"
+
+
+# ---- heredocs, multi-line quotes, continuations, untokenizable input --------------------
+HEREDOC = "git commit -m \"$(cat <<'EOF'\nmsg line\nsecond\nEOF\n)\""
+MULTILINE = 'git commit -m "first line\nsecond line"'
+
+
+@pytest.mark.parametrize("prefix", [HEREDOC, MULTILINE, "git status\n\ngit add -A",
+                                    "cat <<EOF\nbody\nEOF", "cat <<-'EOF'\n\tbody\n\tEOF"])
+@pytest.mark.parametrize("sep", [" && ", "\n", " ; ", "\n\n"])
+def test_push_main_after_multiline_prefix_denied(prefix, sep, feature):
+    assert decision(bash(f"{prefix}{sep}git push origin main", feature)) == "deny"
+
+
+@pytest.mark.parametrize("prefix", [HEREDOC, MULTILINE])
+def test_bare_and_head_push_on_main_after_multiline_prefix_denied(prefix, on_main):
+    assert decision(bash(f"{prefix} && git push", on_main)) == "deny"
+    assert decision(bash(f"{prefix}\ngit push -u origin HEAD", on_main)) == "deny"
+
+
+@pytest.mark.parametrize("prefix", [HEREDOC, MULTILINE])
+def test_feature_push_after_multiline_prefix_allowed(prefix, feature):
+    assert decision(bash(f"{prefix} && git push origin feat/x", feature)) is None
+    assert decision(bash(f"{prefix}\ngit push -u origin HEAD", feature)) is None
+
+
+@pytest.mark.parametrize("cmd", ["git push \\\norigin main", "git push origin \\\n  main",
+                                 "git push \\\n  -u \\\n  origin HEAD:main"])
+def test_backslash_continuation_denied(cmd, feature):
+    assert decision(bash(cmd, feature)) == "deny"
+
+
+def test_backslash_continuation_bare_push_on_main_denied(on_main):
+    assert decision(bash("git push \\\n  -u origin \\\n  HEAD", on_main)) == "deny"
+
+
+def test_backslash_continuation_feature_push_allowed(feature):
+    assert decision(bash("git push \\\n  -u origin \\\n  feat/x", feature)) is None
+
+
+def test_heredoc_body_text_is_not_a_command(feature):
+    cmd = "git commit -F - <<'EOF'\nnever run git push origin main\nEOF\ngit push origin feat/x"
+    assert decision(bash(cmd, feature)) is None
+    msg = "git commit -m \"$(cat <<'EOF'\ndocs: git push origin main is blocked\nEOF\n)\""
+    assert decision(bash(msg, feature)) is None
+
+
+@pytest.mark.parametrize("cmd", ["git push origin main 'unterminated", 'echo "oops && git push origin main',
+                                 "git push origin HEAD:main \"x", "git push +main '", "git push origin refs/heads/master `"])
+def test_untokenizable_push_to_main_denied(cmd, feature):
+    assert decision(bash(cmd, feature)) == "deny"
+
+
+def test_untokenizable_herdr_engineering_push_asks(tmp_path):
+    repo = make_repo(tmp_path / "he", "feat/z", origin="git@github.com:b/herdr-engineering.git")
+    assert decision(bash("git push origin feat/z 'unterminated", repo)) == "ask"
+
+
+def test_untokenizable_non_push_and_feature_push_allowed(feature):
+    assert decision(bash("echo 'unterminated", feature)) is None
+    assert decision(bash("git push origin feat/x 'unterminated", feature)) is None

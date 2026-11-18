@@ -49,9 +49,10 @@ _REDIR = re.compile(r"^\d*(?:>>?|<<<?|<)")
 _REDIR_BARE = re.compile(r"^\d*(?:>>?|<<<?|<)$")
 
 
-def _split_line(line: str) -> list[list[str]]:
-    lex = shlex.shlex(line, posix=True, punctuation_chars=";&|")
+def _tokenize(line: str) -> list[list[str]]:
+    lex = shlex.shlex(line, posix=True, punctuation_chars=";&|\n")
     lex.whitespace_split = True
+    lex.whitespace = " \t\r"  # an unquoted newline is a command separator
     lex.commenters = ""
     toks = list(lex)
     cmds: list[list[str]] = [[]]
@@ -62,7 +63,7 @@ def _split_line(line: str) -> list[list[str]]:
         i += 1
         if tok == "&" and _REDIR.match(nxt):
             continue  # the "&" of "&>file"; the redirect itself is dropped next
-        if tok in _SEPARATORS or (tok and set(tok) <= set(";&|")):
+        if tok in _SEPARATORS or (tok and set(tok) <= set(";&|\n")):
             cmds.append([])
         elif _REDIR_BARE.match(tok):
             if i < len(toks) and toks[i] == "&":  # "2>&1": shlex splits it into "2>", "&", "1"
@@ -75,18 +76,56 @@ def _split_line(line: str) -> list[list[str]]:
     return [c for c in cmds if c]
 
 
-def _split_commands(command: str) -> list[list[str]]:
-    """Split on newlines first (shlex treats them as blanks), then on ``&&``/``||``/``;``/``|``.
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
 
-    A line that does not tokenize on its own (e.g. a quoted string spanning lines) is skipped.
+
+def _strip_heredocs(command: str) -> str:
+    """Drop heredoc bodies and their terminator lines so body text is not parsed as commands.
+
+    Limit: the scan is textual, so a quoted ``<<WORD`` that is not a heredoc swallows the lines up
+    to a later ``WORD`` line, which could hide a push placed there.
     """
-    cmds: list[list[str]] = []
-    for line in command.splitlines():
-        try:
-            cmds += _split_line(line)
-        except ValueError:
+    out: list[str] = []
+    terminators: list[str] = []
+    for line in command.split("\n"):
+        if terminators:
+            if line.strip() == terminators[0]:
+                terminators.pop(0)
             continue
-    return cmds
+        out.append(line)
+        terminators = [m.group(2) for m in _HEREDOC.finditer(line) if m.group(0) != "<<<"]
+    if terminators:  # unterminated heredoc: keep everything rather than hide a command
+        return command
+    return "\n".join(out)
+
+
+def _split_commands(command: str) -> list[list[str]]:
+    """Tokenize the whole command; unquoted newlines separate commands like ``;``.
+
+    Backslash-newline joins lines and heredoc bodies are skipped.  Raises ValueError when the
+    command cannot be tokenized.
+    """
+    return _tokenize(_strip_heredocs(command).replace("\\\n", ""))
+
+
+_GIT_PUSH = re.compile(r"\bgit\b[^;&|\n]*?\bpush\b([^;&|\n]*)")
+
+
+def _fallback(command: str, cwd: str) -> Decision | None:
+    """Conservative scan for a command shlex rejected: fail closed for obvious pushes to main.
+
+    Trade-off: this works on the raw text, so a push-looking string inside an untokenizable
+    quoted message can be denied even though it is only text.
+    """
+    result: Decision | None = None
+    for m in _GIT_PUSH.finditer(command):
+        words = [w.strip("'\"`") for w in m.group(1).split()]
+        if any(_targets_protected(w, None) for w in words if w and not w.startswith("-")):
+            return "deny", MAIN_REASON
+        url = _git(cwd, "remote", "get-url", "origin")
+        if url and "herdr-engineering" in url:
+            result = ("ask", HERDR_REASON)
+    return result
 
 
 def _parse_push(argv: list[str]) -> tuple[str | None, list[str]] | None:
@@ -158,8 +197,12 @@ def _check_push(workdir: str | None, pos: list[str], cwd: str) -> Decision | Non
 
 
 def check_bash(command: str, cwd: str) -> Decision | None:
+    try:
+        argvs = _split_commands(command)
+    except ValueError:
+        return _fallback(command, cwd)
     result: Decision | None = None
-    for argv in _split_commands(command):
+    for argv in argvs:
         parsed = _parse_push(argv)
         if parsed is None:
             continue
