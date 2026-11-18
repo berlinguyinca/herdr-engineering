@@ -137,6 +137,7 @@ class SshTransport:
         except OSError:
             if proc is None:
                 return Outcome(SSH_FAILED_RC, "")
+            _stop_group(proc)                      # started but unreadable: do not leave it running
             raise
         except subprocess.TimeoutExpired:
             try:

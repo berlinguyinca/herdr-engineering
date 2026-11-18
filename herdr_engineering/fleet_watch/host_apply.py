@@ -119,19 +119,18 @@ def _run(ctx: Context, argv: list[str], *, cwd: str | Path | None = None, timeou
             _exit_on_sigterm()
         out, _ = proc.communicate(timeout=timeout)
     except OSError as exc:
-        if proc is not None:
+        if proc is not None:                       # the command runs but could not be read: never leave it behind
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
             raise
+        if _SIGNALS.term_pending:                  # a SIGTERM held during the spawn must not be lost with the failure
+            _exit_on_sigterm()
         ctx.note(f"cannot start: {exc}")
         return 127, ""
     except subprocess.TimeoutExpired:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
-        try:
-            out, _ = proc.communicate()
-        except BaseException:                      # SIGTERM while draining: the group is already dead, just leave
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            raise
+        out, _ = proc.communicate()                # the group is dead; a SIGTERM here just leaves (143)
         ctx.note(f"timed out after {timeout}s")
         ctx.note(out or "")
         return 124, out or ""
@@ -148,8 +147,10 @@ def _run(ctx: Context, argv: list[str], *, cwd: str | Path | None = None, timeou
 class _Signals:
     """SIGTERM bookkeeping for `terminate_on_sigterm`: whether a command is being spawned right now, and a SIGTERM
     that arrived meanwhile. Raising between `Popen` returning and `proc` being bound would orphan the command."""
-    spawning = False
-    term_pending = False
+
+    def __init__(self) -> None:
+        self.spawning = False
+        self.term_pending = False
 
 
 _SIGNALS = _Signals()
