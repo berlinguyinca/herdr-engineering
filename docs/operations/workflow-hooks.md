@@ -10,8 +10,8 @@ scripts/install.sh                      # step 7c installs them; --no-workflow-h
 
 | Event | What it prints | What it never does |
 |---|---|---|
-| `SessionStart` | `additionalContext`: a <=15 line reminder (delegate multi-file work to sonnet subagents, verify with command output, branch -> PR -> review -> CI green, real deps, never push herdr-engineering, nothing under /tmp, Woodpecker CI, `/handoff`) | run commands, read files, call the network |
-| `PreCompact` | `systemMessage` recommending `/handoff` before compaction | run `herdr-handoff` or open a pane |
+| `SessionStart` | `additionalContext`: a <=15 line reminder (delegate multi-file work to sonnet subagents, verify with command output, branch -> PR -> review -> CI green, real deps, never push herdr-engineering, nothing under /tmp, Woodpecker CI, do not ask the user about choices these defaults settle, and run `/handoff` yourself without asking when context is long, after background subagents report and work is committed/pushed where allowed) | run commands, read files, call the network |
+| `PreCompact` | `systemMessage` telling the agent to run `/handoff` itself, without asking the user, before compaction (after background subagents report and work is committed/pushed where allowed) | run `herdr-handoff` or open a pane |
 | `PreToolUse` (matcher `Bash\|Write\|Edit\|MultiEdit\|NotebookEdit`) | a `permissionDecision` of `deny` with a reason, only for the rules below; otherwise nothing | use the network, parse arbitrary shell for `/tmp` writes, or fail a tool call on an internal error (it fails open) |
 
 ### PreToolUse guard (`herdr_engineering/workflow_guard.py`)

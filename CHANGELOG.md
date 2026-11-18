@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Workflow hooks: hand off automatically on long context
+- The `PreCompact` message and the `SessionStart` reminder now tell the agent to run `/handoff` itself, without asking the user, after background subagents have reported and work is committed/pushed where allowed (previously a suggestion). The reminder also says not to ask the user about choices the defaults already settle. The hooks still only print text.
+
 ### Fix: workflow guard denies guarded pushes, with a one-shot human override
 - `ask` is not prompted in Claude Code auto permission mode, so the herdr-engineering push rule (and the unknown-cwd push rule) did nothing. `herdr_engineering/workflow_guard.py` now returns `deny` for both; the reason tells the agent to ask the user to run `! touch ~/.local/state/herdr-engineering/allow-push` and retry. If that token file exists, the next guarded push is allowed and the file is deleted (one-shot; `HERDR_WORKFLOW_ALLOW_PUSH` overrides the path). Main/master push denial is unchanged and never consumes the token; the guard still fails open on internal error.
 - `Write`/`Edit`/`MultiEdit`/`NotebookEdit` on the token path, and `Bash` commands mentioning it, are denied so the agent cannot approve itself. A speed bump, not a security boundary (substring check). See `docs/operations/workflow-hooks.md`.
