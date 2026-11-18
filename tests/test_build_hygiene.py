@@ -19,7 +19,7 @@ import pytest
 import yaml
 
 from herdr_engineering import build_cleanup as cleanup
-from herdr_engineering import disk_guard, build_hygiene
+from herdr_engineering import build_hygiene, disk_guard
 from herdr_engineering.build_cache_config import validate
 from herdr_engineering.cargo_target_storage import acquire_shared_target, repo_identity
 from herdr_engineering.config import load_config
