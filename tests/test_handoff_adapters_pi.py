@@ -126,7 +126,7 @@ def test_session_directory_slug_follows_pi_naming(tmp_path):
 def test_cwd_with_glob_characters_is_matched_literally(tmp_path):
     cwd = Path("/home/user/p[1]")
     expected = _install(tmp_path, "main.jsonl", slug="--home-user-p[1]--")
-    _install(tmp_path, "main.jsonl", OTHER, slug="--home-user-p1--")
+    _install(tmp_path, "main.jsonl", slug="--home-user-p1--")  # same uuid: an unescaped [1] would match here
     assert PiAdapter(home=tmp_path).locate_session(SESSION, cwd, "w1:p1").record_path == expected
 
 
