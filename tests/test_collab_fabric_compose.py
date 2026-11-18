@@ -80,6 +80,9 @@ def test_overlay_is_static_and_isolated():
     assert set(pub) == {"volumes", "ports", "networks"}            # no capability, environment or command change
     assert all("tailscale" not in v for v in pub["volumes"])       # collab-public never sees tailscaled
     assert pub["volumes"] == ["${HERDR_COLLAB_FABRIC_WHOIS_DIR:?run deploy.sh}:/run/fabric-whois:ro"]
+    web = doc["services"]["control-plane-web"]                      # the phone bridge asks the same sidecar
+    assert set(web) == {"volumes"}
+    assert web["volumes"] == ["${HERDR_COLLAB_FABRIC_WHOIS_DIR:?run deploy.sh}:/run/fabric-whois:ro"]
     assert len(pub["ports"]) == 1 and pub["ports"][0].startswith("${HERDR_COLLAB_FABRIC_BIND:?")
     assert doc["networks"]["fabric"]["driver_opts"]["com.docker.network.bridge.enable_ip_masquerade"] == "false"
 
@@ -154,3 +157,31 @@ def test_overlay_renders_with_the_real_compose(tmp_path):
                                extra_env=extra).stdout)
     assert "fabric-whois" not in plain["services"]
     assert not any(p.get("target") == 8484 for p in plain["services"]["collab-public"].get("ports", []))
+
+
+def _render(tmp_path, *overlays):
+    central = _central(tmp_path, dict(TRUST))
+    envfile = tmp_path / "compose.env"
+    fcc.render_compose(load_fleet_config(central), envfile)
+    slice_ = tmp_path / "collab" / "collab-config.json"
+    fcc.render_collab(load_fleet_config(central), slice_)
+    extra = {"HERDR_COLLAB_CONFIG_DIR": str(slice_.parent), "HERDR_COLLAB_DATA_DIR": str(tmp_path / "data"),
+             "HERDR_COLLAB_SYNC_DIR": str(tmp_path / "sync"), "HERDR_SHARE_CONFIG_DIR": str(tmp_path / "share"),
+             "HERDR_COLLAB_EDGE_CONF": str(CP / "collab-edge" / "nginx.conf"),
+             "HERDR_COLLAB_FABRIC_BIND": "100.64.0.7", "HERDR_COLLAB_FABRIC_PORT": "8484",
+             "HERDR_COLLAB_FABRIC_WHOIS_DIR": str(tmp_path / "whois")}
+    r = _config(central, envfile, "compose.yaml", "compose.collab.yaml", *overlays, fmt="json", extra_env=extra)
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)["services"]["control-plane-web"]["volumes"]
+
+
+@pytest.mark.skipif(not _compose_ok(), reason="docker compose not available")
+def test_web_mounts_the_whois_dir_read_only_only_with_the_overlay(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    with_overlay = _render(tmp_path / "a", "compose.collab-fabric.yaml")
+    mounts = [v for v in with_overlay if v["target"] == "/run/fabric-whois"]
+    assert len(mounts) == 1 and mounts[0]["read_only"] is True
+    assert mounts[0]["source"] == str(tmp_path / "a" / "whois")
+    without = _render(tmp_path / "b")
+    assert all(v["target"] != "/run/fabric-whois" for v in without)
