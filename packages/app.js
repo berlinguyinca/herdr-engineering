@@ -422,22 +422,25 @@ function missionSectionNav(key) {
     + `</nav>`;
 }
 
-async function viewMissionTests(parts) {
+async function viewMissionTests(parts, revision) {
   const key = decodeURIComponent(parts[1]);
   let mission = null;
   try { mission = await client.getMission(key); } catch (error) { if (error.status !== 404) throw error; }
+  if (revision !== renderRevision) return;
   if (!mission) {
     root.innerHTML = `<a href="#/missions">← Missions</a><herdr-error message="Mission not found"></herdr-error>`;
     return;
   }
   const title = (mission.title || 'Mission').slice(0, 180);
-  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${esc(title)} · Tests & builds</h1>${missionSectionNav(key)}<div id="mission-tests"></div>`;
+  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${esc(title)} · Tests & builds</h1>${missionSectionNav(key)}<div id="mission-tests"><herdr-spinner label="Loading tests and builds"></herdr-spinner></div>`;
   const host = document.getElementById('mission-tests');
   let tests = [], builds = [];
   try {
     const [t, b] = await Promise.all([client.missionTests(key), client.missionBuilds(key)]);
+    if (revision !== renderRevision || !host.isConnected) return;
     tests = (t && t.tests) || []; builds = (b && b.builds) || [];
   } catch (error) {
+    if (revision !== renderRevision || !host.isConnected) return;
     host.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
     return;
   }
@@ -457,7 +460,7 @@ async function viewMissionTests(parts) {
     const kind = run.isBuild ? 'Build' : 'Test run';
     return `<div class="hd-card" style="margin:8px 0">`
       + `<div class="hd-card__title">${kind} · <herdr-status stage="${esc(st.tone)}"></herdr-status> <span class="hd-card__sub">${esc(st.label)}</span></div>`
-      + (counts ? `<div class="hd-card__sub">${counts}</div>` : `<div class="hd-card__sub">Counts not recorded</div>`)
+      + (counts ? `<div class="hd-card__sub">${counts}</div>` : `<div class="hd-card__sub">Counts unknown</div>`)
       + `<div class="hd-card__sub">${duration ? `Duration ${esc(duration)}` : 'Duration not recorded'}${run.started_at ? ` · started ${esc(formatTimestamp(run.started_at))}` : ''}</div>`
       + `</div>`;
   }).join('');
@@ -468,6 +471,7 @@ async function viewMissionTests(parts) {
 function reviewVerdictText(verdict) {
   const v = typeof verdict === 'string' ? verdict.trim().toLowerCase() : '';
   if (!v) return { label: 'Unknown', tone: 'unknown' };
+  if (v === 'unknown') return { label: 'Unknown', tone: 'unknown' };
   if (v === 'approved' || v === 'approve') return { label: 'Approved', tone: 'healthy' };
   if (v.includes('changes') || v === 'request_changes' || v === 'rejected' || v === 'denied') return { label: 'Changes requested', tone: 'attention' };
   if (v === 'commented' || v === 'comment') return { label: 'Commented', tone: 'waiting' };
@@ -482,22 +486,25 @@ function prStatusText(status) {
   return { label: status || 'Unknown', tone: s || 'unknown' };
 }
 
-async function viewMissionReviews(parts) {
+async function viewMissionReviews(parts, revision) {
   const key = decodeURIComponent(parts[1]);
   let mission;
   try { mission = await client.getMission(key); } catch (error) { if (error.status !== 404) throw error; }
+  if (revision !== renderRevision) return;
   if (!mission) {
     root.innerHTML = `<a href="#/missions">← Missions</a><herdr-error message="Mission not found"></herdr-error>`;
     return;
   }
   const title = (mission.title || 'Mission').slice(0, 180);
-  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${esc(title)} · Reviews & PRs</h1>${missionSectionNav(key)}<div id="mission-reviews"></div>`;
+  root.innerHTML = `<a href="#/missions">← Missions</a><h1 style="overflow-wrap:anywhere">${esc(title)} · Reviews & PRs</h1>${missionSectionNav(key)}<div id="mission-reviews"><herdr-spinner label="Loading reviews and pull requests"></herdr-spinner></div>`;
   const host = document.getElementById('mission-reviews');
   let reviews = [], pulls = [];
   try {
     const [rv, pr] = await Promise.all([client.missionReviews(key), client.missionPulls(key)]);
+    if (revision !== renderRevision || !host.isConnected) return;
     reviews = (rv && rv.reviews) || []; pulls = (pr && pr.pulls) || [];
   } catch (error) {
+    if (revision !== renderRevision || !host.isConnected) return;
     host.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error>`;
     return;
   }

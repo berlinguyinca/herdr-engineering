@@ -97,12 +97,19 @@ def _seed(repo):
                        status='completed', verdict='changes_requested',
                        started_at='2026-10-01T11:00:00+00:00',
                        completed_at='2026-10-01T11:05:00+00:00')
+    repo.upsert_review('alpha-review-unknown', mission_id=m1, reviewer='automation',
+                       status='completed', verdict='UNKNOWN',
+                       started_at='2026-10-01T11:10:00+00:00',
+                       completed_at='2026-10-01T11:10:01+00:00')
     repo.add_review_finding('alpha-review-1', severity='blocker',
                             summary='Parser crashes on empty input',
                             detail='Reproduce with an empty spectra file.')
     repo.upsert_pull_request('alpha-pr-1', mission_id=m1, number=7,
                              url='https://example.com/pr/7', status='open',
                              branch='ws/alpha', base='main')
+    repo.upsert_pull_request('alpha-pr-unsafe', mission_id=m1, number=99,
+                             url='javascript:alert(1)', status='open',
+                             branch='unsafe', base='main')
     return m1, m2, s1
 
 
