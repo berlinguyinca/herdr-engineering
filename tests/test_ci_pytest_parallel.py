@@ -15,6 +15,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -562,10 +563,12 @@ def test_out_write_survives_a_full_nonblocking_stdout_pipe() -> None:
             os.write(w, b"x" * 65536)
     except BlockingIOError:
         pass
+    reader_leaves = threading.Timer(1.0, os.close, (r,))     # the reader goes away while the pipe is full: EPIPE, not a hang
+    reader_leaves.start()
     try:
-        done = out_probe("", stdout=w, env={"HERDR_WATCHED_WRITE_STALL": "1"})     # nobody ever reads: give up after a second
+        done = out_probe("", stdout=w)
     finally:
-        os.close(r)
+        reader_leaves.join()
         os.close(w)
     assert done.returncode == 0 and "survived" in done.stderr, done.stderr
 

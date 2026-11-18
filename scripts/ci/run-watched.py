@@ -166,15 +166,13 @@ def stop_tree(proc: subprocess.Popen, tree: Tree, out: "Out") -> None:
 
 
 class Out:
-    """Forwards the command's output. A slow reader is waited for (EAGAIN on a non-blocking pipe retries once writable); a gone
-    reader (`| head -1`, EPIPE) or a closed/missing stdout means keep draining without forwarding, with one notice on stderr."""
+    """Forwards the command's output. main() forces fd 1 blocking, so a reader that truly stops will block the writer (and with
+    it the watchdog's hang detection); that limitation predates this code and is out of scope. If the fd is non-blocking anyway
+    (Out used on its own), EAGAIN waits for writability and retries the remainder. A gone reader (`| head -1`, EPIPE) or a
+    closed/missing stdout means keep draining without forwarding, with one notice on stderr."""
 
     def __init__(self) -> None:
         self.broken = False
-        try:     # a reader that neither reads nor closes must not stall the watchdog (and its hang detection) for ever
-            self.stall = float(os.environ.get("HERDR_WATCHED_WRITE_STALL", "60"))
-        except ValueError:
-            self.stall = 60.0
 
     def write(self, chunk: bytes) -> None:
         if self.broken:
@@ -182,22 +180,15 @@ class Out:
         try:
             fd = sys.stdout.fileno()
             view = memoryview(chunk)
-            stalled_since = None
             while view:
                 try:
                     view = view[os.write(fd, view):]
-                    stalled_since = None
                 except BlockingIOError:
-                    stalled_since = stalled_since or time.monotonic()
-                    if time.monotonic() - stalled_since >= self.stall:
-                        raise TimeoutError("reader stalled") from None
                     select.select([], [fd], [], 0.5)
-                except InterruptedError:
-                    pass
         except (OSError, ValueError, AttributeError):     # EPIPE, EBADF, closed stdout, stdout is None
             self.broken = True
             try:
-                print("[run-watched] output no longer forwarded (reader gone, closed or stalled); the command keeps running", file=sys.stderr)
+                print("[run-watched] output no longer forwarded (reader gone or stdout closed); the command keeps running", file=sys.stderr)
             except (OSError, ValueError):
                 pass
             try:
