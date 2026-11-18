@@ -294,3 +294,38 @@ def test_multiline_message_with_unbalanced_quote_fails_open(feature):
 def test_head_push_to_herdr_engineering_feature_asks(tmp_path):
     repo = make_repo(tmp_path / "he", "feat/z", origin="git@github.com:b/herdr-engineering.git")
     assert decision(bash("git push -u origin HEAD", repo)) == "ask"
+
+
+# ---- shell redirections are not refspecs ------------------------------------------------
+REDIRECTS = ["2>&1", ">/dev/null", "2>/dev/null", "&>log", "&> log", ">>log", ">> log", "> log",
+             "2> log", "2>> log", "1>&2", "<<< x", "< in", ">&2", "2>&1 | tail -3", ">/dev/null 2>&1"]
+
+
+@pytest.mark.parametrize("redir", REDIRECTS)
+def test_redirect_after_bare_push_on_main_denied(redir, on_main):
+    assert decision(bash(f"git push origin {redir}", on_main)) == "deny"
+    assert decision(bash(f"git push {redir}", on_main)) == "deny"
+    assert decision(bash(f"git push -u origin HEAD {redir}", on_main)) == "deny"
+
+
+@pytest.mark.parametrize("redir", [r for r in REDIRECTS if "|" not in r])
+def test_redirect_before_refspec_still_sees_main(redir, feature):
+    assert decision(bash(f"git push origin main {redir}", feature)) == "deny"
+    assert decision(bash(f"git push {redir} origin main", feature)) == "deny"
+
+
+@pytest.mark.parametrize("redir", REDIRECTS)
+def test_redirect_on_feature_branch_allowed(redir, feature):
+    assert decision(bash(f"git push origin feat/x {redir}", feature)) is None
+    assert decision(bash(f"git push origin {redir}", feature)) is None
+
+
+def test_ampersand_in_redirect_does_not_hide_a_second_push(on_main):
+    assert decision(bash("echo hi 2>&1 && git push origin main", on_main)) == "deny"
+    assert decision(bash("sleep 1 & git push origin main", on_main)) == "deny"
+
+
+@pytest.mark.parametrize("redir", ["2>&1", ">/dev/null", "&>log"])
+def test_herdr_engineering_ask_survives_redirect(redir, tmp_path):
+    repo = make_repo(tmp_path / "he", "feat/z", origin="git@github.com:b/herdr-engineering.git")
+    assert decision(bash(f"git push origin feat/z {redir}", repo)) == "ask"

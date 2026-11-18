@@ -45,14 +45,31 @@ def check_write_path(path: str, cwd: str) -> Decision | None:
     return "deny", TMP_REASON
 
 
+_REDIR = re.compile(r"^\d*(?:>>?|<<<?|<)")
+_REDIR_BARE = re.compile(r"^\d*(?:>>?|<<<?|<)$")
+
+
 def _split_line(line: str) -> list[list[str]]:
     lex = shlex.shlex(line, posix=True, punctuation_chars=";&|")
     lex.whitespace_split = True
     lex.commenters = ""
+    toks = list(lex)
     cmds: list[list[str]] = [[]]
-    for tok in lex:
+    i = 0
+    while i < len(toks):
+        tok = toks[i]
+        nxt = toks[i + 1] if i + 1 < len(toks) else ""
+        i += 1
+        if tok == "&" and _REDIR.match(nxt):
+            continue  # the "&" of "&>file"; the redirect itself is dropped next
         if tok in _SEPARATORS or (tok and set(tok) <= set(";&|")):
             cmds.append([])
+        elif _REDIR_BARE.match(tok):
+            if i < len(toks) and toks[i] == "&":  # "2>&1": shlex splits it into "2>", "&", "1"
+                i += 1
+            i += 1  # drop the redirect target
+        elif _REDIR.match(tok):
+            continue  # attached target (">/dev/null", "2>log")
         else:
             cmds[-1].append(tok)
     return [c for c in cmds if c]
