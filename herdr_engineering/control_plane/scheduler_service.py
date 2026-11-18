@@ -427,6 +427,47 @@ class SchedulerService:
                 self.repo.save_scheduler_reservation(reservation.to_dict())
             return [self._reservation(reservation) for reservation in expired]
 
+    def heartbeat_for_host(self, authenticated_host, lease_id, *, generation, token):
+        """Renew an observed host's claimed execution without granting lifecycle authority."""
+        denied = "lease renewal is not authorized"
+        if (not isinstance(authenticated_host, str) or not authenticated_host
+                or not isinstance(lease_id, str) or not 1 <= len(lease_id) <= 128
+                or not isinstance(token, str) or not 1 <= len(token) <= 256 or not token.isascii()
+                or type(generation) is not int or generation <= 0):
+            raise PermissionError(denied)
+        with self.repo.scheduler_admission() as rows:
+            observation = self.repo.scheduler_observation(authenticated_host)
+            host = observation.get("host") if isinstance(observation, dict) else None
+            uid = host.get("host_uid") if isinstance(host, dict) else None
+            lease = next((row for row in self.repo.list_scheduler_leases()
+                          if row.get("lease_id") == lease_id), None)
+            if (not isinstance(uid, str) or not uid or host.get("host_id") != authenticated_host
+                    or lease is None or lease.get("host_uid") != uid
+                    or not isinstance(lease.get("reservation_id"), str) or not lease["reservation_id"]
+                    or type(lease.get("generation")) is not int or lease["generation"] != generation):
+                raise PermissionError(denied)
+            reservation = next((row for row in rows
+                                if row.get("reservation_id") == lease["reservation_id"]), None)
+            if reservation is None:
+                raise PermissionError(denied)
+            context = reservation.get("request_snapshot")
+            if (reservation.get("host_uid") != uid or reservation.get("lease_id") != lease_id
+                    or reservation.get("state") != "committed"
+                    or reservation.get("execution_claimed") is not True
+                    or not isinstance(reservation.get("request_id"), str) or not reservation["request_id"]
+                    or lease.get("request_id") != reservation["request_id"]
+                    or not isinstance(context, dict) or context.get("request_id") != reservation["request_id"]
+                    or not isinstance(context.get("owner_id"), str) or not context["owner_id"].strip()
+                    or not isinstance(lease.get("token"), str) or not lease["token"].isascii()
+                    or not isinstance(reservation.get("lease_token"), str) or not reservation["lease_token"].isascii()
+                    or not secrets.compare_digest(lease["token"], reservation["lease_token"])):
+                raise PermissionError(denied)
+            try:
+                renewed = self._heartbeat(lease_id, generation=generation, token=token, ttl=90)
+            except (KeyError, TypeError, ValueError, PermissionError):
+                raise PermissionError(denied) from None
+            return {key: renewed[key] for key in ("lease_id", "state", "generation", "expires_at")}
+
     def heartbeat(self, lease_id, *, generation, token, ttl=90):
         with self.repo.scheduler_admission():
             return self._heartbeat(lease_id, generation=generation, token=token, ttl=ttl)

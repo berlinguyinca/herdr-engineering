@@ -1308,6 +1308,8 @@ def _make_handler(server, public=False, operator=False):
                 return self._fleet_config_applied()
             if self._path_only() == _FLEET_CONFIG_PATH + "/telemetry":
                 return self._fleet_resource_telemetry()
+            if self._path_only() == "/api/v1/fleet/runtime/leases/heartbeat":
+                return self._fleet_runtime_lease_heartbeat()
             # The ingest route is reachable by the ingest role; every other
             # POST requires the operator role (Spec §104).
             path = self.path.split("?")[0]
@@ -1435,6 +1437,35 @@ def _make_handler(server, public=False, operator=False):
                 return self._deny(400, "invalid resource observation")
             except RuntimeError:
                 return self._deny(503, "resource persistence unavailable")
+
+        def _fleet_runtime_lease_heartbeat(self):
+            from ..fleet_config import FleetConfigError
+
+            if server.fleet_config is None:
+                return self._deny(404, "not found")
+            try:
+                config = server.fleet_config.current()
+            except FleetConfigError:
+                return self._deny(503, "host configuration unavailable")
+            host = self._fleet_host(config)
+            if host is None:
+                return self._deny(401, "unauthorized")
+            try:
+                body = self._read_json()
+                if not isinstance(body, dict):
+                    return self._deny(400, "lease heartbeat must be an object")
+                if (not isinstance(body.get("lease_id"), str)
+                        or not isinstance(body.get("token"), str)
+                        or type(body.get("generation")) is not int or body["generation"] <= 0):
+                    return self._deny(400, "invalid lease heartbeat")
+                return self._json(server.scheduler.heartbeat_for_host(
+                    host, body.get("lease_id"), generation=body.get("generation"), token=body.get("token")))
+            except (TypeError, ValueError):
+                return self._deny(400, "invalid lease heartbeat")
+            except PermissionError:
+                return self._deny(403, "lease is not available to this host")
+            except RuntimeError:
+                return self._deny(503, "lease persistence unavailable")
 
         # --------------------------------------------------- collaboration (HCN)
         def _is_collab_path(self):
