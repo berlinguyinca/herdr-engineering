@@ -19,6 +19,8 @@ The unit runs the installed `~/.local/bin/herdr-eng fleet-watch loop` from `/`, 
 
 Prerequisites on beast: the service has no interactive session, so it relies on stored `gh`/git credentials and on unencrypted ssh keys (there is no `SSH_AUTH_SOCK`).
 
+Prerequisites on EVERY host (the herdr-engineering row): the host's DEPLOYMENT checkout (a dedicated clone of `herdr-engineering`, separate from any development checkout) plus the one-line pointer file `~/.config/herdr-engineering/deployment-checkout` (an absolute path; a non-interactive ssh shell has no profile environment). `ansible/tasks/fleet-deployment-checkout.yml` (fleet-sync, before the watcher unit) keeps both in place; the path is overridable per host in host_vars via `fleet_deployment_checkout:`. The 2026-11-17 first rollout hit this missing prerequisite on all three hosts (masked by the earlier autospec-row halt).
+
 Exit statuses 2 (refused) and 3 (busy) are not restarted by systemd (`RestartPreventExitStatus=2 3`); the unit also `Wants=` the network. A playbook re-run does not restart a healthy watcher unless the unit or drop-in changed.
 
 ## Disable

@@ -173,8 +173,8 @@ New module layout is a package `herdr_engineering/fleet_watch/` so `fleet.py` (5
 | repo | host-apply action | health check (all must pass) |
 |---|---|---|
 | `herdr-engineering` | pre-check (D6); `fleet_update(host=<this>, revision=sha, pull_controller=<is controller>)` equivalent for a non-controller: ff-only fetch of the deployment checkout, `pip install` into the venv, converge agent; report before/after from `git rev-parse HEAD` and `herdr-eng --version` | installed revision == sha (`fleet_status` fingerprint), fabric-agent unit/launchd label active, gateway registration present, `herdr-eng fleet status` parity ok |
-| `pi-engineering` | `stage_pi_runtime(sha)` then symlink switch (D7) | release dir exists and complete, `current` -> sha, `pi --version` smoke from the new release in a throwaway cwd, no session signalled |
-| `autospec` | the existing `autospec-fleet.yml` path (ff-only checkout + `autospec-runtime-install.sh`, generation publish) | active generation receipt names sha; `autospec --version` |
+| `pi-engineering` | `stage_pi_runtime(sha)` then symlink switch (D7) | release dir exists and complete, `current` -> sha, `pi --version` smoke (launcher resolved PATH -> `~/.local/bin/pi`; a unit or non-interactive ssh PATH has no `~/.local/bin`) |
+| `autospec` | the existing `autospec-fleet.yml` path (ff-only checkout + `autospec-runtime-install.sh`, generation publish) | active generation receipt names sha; `autospec doctor` smoke (launcher resolved PATH -> `~/.autospec/bin/autospec`; the CLI has no `--version` - it exits 2) |
 | `ai-sync` / `claude-config` (phase 2) | `ai_sync_enforce` forced pull + verify; **beast is the publisher, so its step is verify-only** (the enforcer already refuses there) and the canary shifts to bender for this repo | `ai-sync verify --json` ok, feed `behind == 0` |
 
 Because Ansible is the existing convergence engine, `host-apply` for `herdr-engineering` on remote hosts
