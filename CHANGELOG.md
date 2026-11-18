@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: fleet-watch host-apply smoke checks resolve the launcher and use `autospec doctor`
+
+- The rollout's first live pass (2026-11-23) halted on `beast/autospec` and would never converge: the autospec health smoke ran bare `autospec --version`, and (a) the autospec CLI has **no** `--version` flag (it exits 2 with `unknown autospec command`), and (b) neither a systemd unit's PATH nor a non-interactive ssh shell's PATH contains `~/.autospec/bin`, so bare `autospec` was not found at all. `pi` had the same PATH gap (`~/.local/bin` missing on the Linux ssh/service PATHs).
+- The host-apply adapters now resolve the launcher as **PATH (the host env) -> the stable install location -> the bare name** (`autospec`: `~/.autospec/bin/autospec`; `pi`: `~/.local/bin/pi`), and the autospec smoke is **`autospec doctor`** (read-only, fast, exits 0 on a working install) instead of the nonexistent `--version`. The `HERDR_FLEET_AUTOSPEC_SMOKE_CMD` / `HERDR_FLEET_PI_SMOKE_CMD` seams are unchanged; a launcher that is nowhere still fails closed (`version_smoke` failed -> `health_failed` -> the rollout halts, nothing half-applied).
+- Spec: the health-check table in `docs/specs/herdr-fleet-rollout-watcher-20261104/spec.md` now names the resolved launchers and `autospec doctor`.
+
 ### Fleet watch: the watcher self-restarts after a herdr-engineering self-update
 
 - After a fleet-watch rollout **succeeded** and updated the watcher's own herdr-engineering install, `herdr-eng fleet-watch loop --enable-rollouts` now exits with status 75; the unit's existing `Restart=on-failure` (75 is not in `RestartPreventExitStatus=2 3`) restarts the service on the newly installed build, so the fleet runs the build it just shipped (issue #865; spec D12 in `docs/specs/herdr-fleet-rollout-watcher-20261104/spec.md`). The restart comes from systemd itself - no detached `systemctl` child, which the unit's cgroup cleanup would race (review of #867), and an exit 0 would not restart the unit. It never requests a restart for a halted or running rollout, for a rollout that left this host's install unchanged, in plan-only mode, or when not running under the unit (dev runs and tests, detected via `/proc/self/cgroup` - the loop keeps running). `HERDR_FLEET_WATCH_RESTART_CMD` runs an injectable command for tests and dev; the loop still exits 75. See `docs/operations/fleet-rollout-watcher.md`.
