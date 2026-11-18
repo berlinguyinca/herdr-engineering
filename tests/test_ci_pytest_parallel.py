@@ -563,11 +563,36 @@ def test_out_write_survives_a_full_nonblocking_stdout_pipe() -> None:
     except BlockingIOError:
         pass
     try:
-        done = out_probe("", stdout=w)
+        done = out_probe("", stdout=w, env={"HERDR_WATCHED_WRITE_STALL": "1"})     # nobody ever reads: give up after a second
     finally:
         os.close(r)
         os.close(w)
     assert done.returncode == 0 and "survived" in done.stderr, done.stderr
+
+
+def test_out_write_waits_for_a_late_reader_of_a_nonblocking_stdout_and_loses_nothing() -> None:
+    total = 1_000_000
+    for via in ("out", "watchdog"):
+        r, w = os.pipe()
+        os.set_blocking(w, False)
+        if via == "out":
+            code = (
+                "import importlib.util, sys\n"
+                f"spec = importlib.util.spec_from_file_location('rw', {str(WATCHER)!r}); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+                f"o = m.Out(); o.write(b'x' * {total}); assert not o.broken\n"
+            )
+            argv = [sys.executable, "-I", "-c", code]
+        else:
+            argv = [sys.executable, str(WATCHER), "100", "100", "--", sys.executable, "-c", f"import sys; sys.stdout.write('x' * {total})"]
+        proc = subprocess.Popen(argv, stdout=w, stderr=subprocess.PIPE, text=True)
+        os.close(w)
+        time.sleep(1.5)                                      # the reader starts late: the pipe is full and EAGAIN is returned
+        got = 0
+        while chunk := os.read(r, 65536):
+            got += len(chunk)
+        os.close(r)
+        assert proc.wait(timeout=60) == 0, (via, proc.stderr.read())
+        assert got == total, (via, got)
 
 
 def test_out_write_survives_a_closed_or_missing_stdout() -> None:
@@ -730,7 +755,17 @@ def test_cleanup_output_written_by_a_sigterm_handler_is_forwarded_and_does_not_s
     assert time.monotonic() - began < 8, "the hang kill stalled on a full pipe until SIGKILL"
 
 
-def test_a_bad_orphan_grace_value_is_a_usage_error_and_never_starts_the_command(tmp_path: Path) -> None:
+@pytest.mark.parametrize("value", ["soon", "nan", "inf", "-1"])
+def test_a_bad_orphan_grace_value_is_a_usage_error_and_never_starts_the_command(tmp_path: Path, value: str) -> None:
     marker = tmp_path / "started"
-    done = watch("5", "5", f"open({str(marker)!r}, 'w').write('x')", HERDR_WATCHED_ORPHAN_GRACE="soon")
+    done = watch("5", "5", f"open({str(marker)!r}, 'w').write('x')", HERDR_WATCHED_ORPHAN_GRACE=value)
     assert done.returncode == 2 and "Traceback" not in done.stderr and not marker.exists()
+
+
+def test_a_flooding_tree_cannot_hold_off_the_sigkill_after_the_grace(tmp_path: Path) -> None:
+    flood = ("import signal, sys, time\n"
+             "def h(*_):\n    while True: sys.stdout.write('f' * 65536)\n"      # floods only once told to stop, and never exits
+             "signal.signal(signal.SIGTERM, h)\ntime.sleep(1234)")
+    began = time.monotonic()
+    done = watch("1", "1", flood)
+    assert done.returncode == 124 and time.monotonic() - began < 20, "the drain loop starved the SIGKILL"

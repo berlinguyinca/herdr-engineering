@@ -132,14 +132,17 @@ class Tree:
                    for p, st in snapshot().items())
 
 
-def drain(fd: int, out: "Out", wait: float) -> bool:
-    """Forward whatever the command has written (waiting up to `wait` s for the first byte); True at EOF."""
+def drain(fd: int, out: "Out", wait: float, deadline: float | None = None) -> bool:
+    """Forward whatever the command has written (waiting up to `wait` s for the first byte); True at EOF. `deadline` (monotonic)
+    bounds the call, so a tree that floods the pipe cannot hold the caller off forever."""
     while select.select([fd], [], [], wait)[0]:
         chunk = os.read(fd, 65536)
         if not chunk:
             return True
         out.write(chunk)
         wait = 0
+        if deadline is not None and time.monotonic() >= deadline:
+            break
     return False
 
 
@@ -154,29 +157,53 @@ def stop_tree(proc: subprocess.Popen, tree: Tree, out: "Out") -> None:
         if eof:
             time.sleep(0.1)
         else:
-            eof = drain(fd, out, 0.1)
+            eof = drain(fd, out, 0.1, deadline)
     tree.poll()
     tree.signal_all(signal.SIGKILL)
     proc.wait()
     if not eof:
-        drain(fd, out, 0)
+        drain(fd, out, 0, time.monotonic() + 2.0)
 
 
 class Out:
-    """Forwards the command's output; a closed reader (`| head -1`) means keep draining without forwarding."""
+    """Forwards the command's output. A slow reader is waited for (EAGAIN on a non-blocking pipe retries once writable); a gone
+    reader (`| head -1`, EPIPE) or a closed/missing stdout means keep draining without forwarding, with one notice on stderr."""
 
     def __init__(self) -> None:
         self.broken = False
+        try:     # a reader that neither reads nor closes must not stall the watchdog (and its hang detection) for ever
+            self.stall = float(os.environ.get("HERDR_WATCHED_WRITE_STALL", "60"))
+        except ValueError:
+            self.stall = 60.0
 
     def write(self, chunk: bytes) -> None:
         if self.broken:
             return
         try:
-            sys.stdout.buffer.write(chunk)
-            sys.stdout.buffer.flush()
-        except (OSError, ValueError, AttributeError):     # closed reader, EAGAIN on a full non-blocking pipe, closed/None stdout
+            fd = sys.stdout.fileno()
+            view = memoryview(chunk)
+            stalled_since = None
+            while view:
+                try:
+                    view = view[os.write(fd, view):]
+                    stalled_since = None
+                except BlockingIOError:
+                    stalled_since = stalled_since or time.monotonic()
+                    if time.monotonic() - stalled_since >= self.stall:
+                        raise TimeoutError("reader stalled") from None
+                    select.select([], [fd], [], 0.5)
+                except InterruptedError:
+                    pass
+        except (OSError, ValueError, AttributeError):     # EPIPE, EBADF, closed stdout, stdout is None
             self.broken = True
-            os.dup2(os.open(os.devnull, os.O_WRONLY), 1)     # so interpreter shutdown does not flush into the dead pipe
+            try:
+                print("[run-watched] output no longer forwarded (reader gone, closed or stalled); the command keeps running", file=sys.stderr)
+            except (OSError, ValueError):
+                pass
+            try:
+                os.dup2(os.open(os.devnull, os.O_WRONLY), 1)     # so interpreter shutdown does not flush into the dead pipe
+            except OSError:
+                pass
 
 
 def usage_error(message: str) -> None:
@@ -207,9 +234,15 @@ def main() -> int:
     token = f"{os.getpid()}-{time.time_ns()}"
     try:
         orphan_grace = float(os.environ.get("HERDR_WATCHED_ORPHAN_GRACE", "30"))     # parsed before the spawn: a bad value must not orphan it
+        if not (math.isfinite(orphan_grace) and orphan_grace >= 0):
+            raise ValueError
     except ValueError:
-        usage_error("HERDR_WATCHED_ORPHAN_GRACE must be a number of seconds")
+        usage_error("HERDR_WATCHED_ORPHAN_GRACE must be a finite number of seconds >= 0")
         return 2
+    try:
+        os.set_blocking(1, True)        # a non-blocking stdout inherited from the caller would turn a slow reader into lost output
+    except OSError:
+        pass
     got: list[int] = []         # first signal received; the loop acts on it (nothing blocking runs in the handler)
 
     def on_signal(signum, _frame):
@@ -255,11 +288,7 @@ def main() -> int:
                 if progressed:
                     last_orphan_progress = now
                 if not tree.alive or now - last_orphan_progress >= 2.0 or now - root_exited_at >= orphan_grace:
-                    while select.select([fd], [], [], 0)[0]:     # drain what the command wrote before exiting
-                        chunk = os.read(fd, 65536)
-                        if not chunk:
-                            break
-                        out.write(chunk)
+                    drain(fd, out, 0, time.monotonic() + 2.0)     # what the command wrote before exiting
                     rc = proc.returncode
                     return 128 - rc if rc < 0 else rc       # the finally block stops any survivors
                 continue
