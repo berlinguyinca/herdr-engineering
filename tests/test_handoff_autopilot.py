@@ -654,12 +654,13 @@ def test_the_installer_arms_automatic_handoffs_by_default() -> None:
     )
     assert '"$PY" -m herdr_engineering.cli handoff autopilot install' in text
     # The managed workflow hooks write the same settings.json; the autopilot installs after them
-    # and only ever rewrites its own hook group, so the order is pinned here.
-    assert text.index("# --- 7c.") < text.index("# --- 7d."), (
-        "the autopilot must install after `workflow install`, not before it"
-    )
+    # and only ever rewrites its own hook group, so the order is pinned here (7c workflow hooks,
+    # 7d screenwright, 7e the autopilot - which is last because it is the only one that reads
+    # policy and can therefore report what the others left behind).
+    order = [text.index(f"# --- {step}.") for step in ("7c", "7d", "7e")]
+    assert order == sorted(order), "the autopilot must install after `workflow install`, not before it"
     # A step that can fail must not take the whole installer down with it (`set -euo pipefail`).
-    step = text.split("# --- 7d.", 1)[1].split("# --- 8.", 1)[0]
+    step = text.split("# --- 7e.", 1)[1].split("# --- 8.", 1)[0]
     assert "|| warn" in step, "a failed trigger install must warn, not abort the installer"
     syntax = subprocess.run(
         ["bash", "-n", str(INSTALL_SH)], capture_output=True, text=True, timeout=60
@@ -755,7 +756,10 @@ def test_the_autopilot_and_the_managed_workflow_hooks_share_settings_json(host: 
     ours = {event: commands
             for event, entries in events.items()
             if (commands := [c["command"] for c in entries if ha.HOOK_MARKER in c["command"]])}
-    assert sorted(managed) == ["PreCompact", "SessionStart"], sorted(managed)
+    # Whatever events upstream decides to manage, the autopilot must not disturb any of them,
+    # and its own events are exactly the two that can carry an instruction.
+    from herdr_engineering.workflow_hooks import EVENTS as WORKFLOW_EVENTS
+    assert sorted(managed) == sorted(WORKFLOW_EVENTS), (sorted(managed), WORKFLOW_EVENTS)
     assert sorted(ours) == ["PreCompact", "Stop"], sorted(ours)
     # Both PreCompact hooks are still in the same event list, in the order Claude runs them.
     assert len(events["PreCompact"]) == 2, events["PreCompact"]

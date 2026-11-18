@@ -5,7 +5,7 @@ context limit, the machine hands it to a fresh pane by itself — before the har
 summarizer replaces the conversation with a lossy recap.
 
 ```bash
-scripts/install.sh                       # arms it (step 7d); re-running is idempotent
+scripts/install.sh                       # arms it (step 7e); re-running is idempotent
 herdr-eng handoff autopilot status       # policy, what is installed, what has fired
 herdr-eng handoff autopilot install      # arm it on a machine that was installed earlier
 herdr-eng handoff autopilot uninstall    # remove both triggers; the audit ledger is kept
@@ -33,7 +33,7 @@ Two other triggers write to the same `~/.claude/settings.json`, and they are sep
 | `handoff context-hook claude` | never; paste the block into `~/.claude/settings.json` | Claude `UserPromptSubmit` | advises at half the window (default), once per session |
 
 Each installer owns its own marker, so installing one never rewrites or removes another's hook
-group, and `install.sh` runs the workflow hooks (7c) before the autopilot (7d). A session warned
+group, and `install.sh` runs the workflow hooks (7c) before the autopilot (7e). A session warned
 by the opt-in `context-hook` is not told again by the autopilot: `decide()` reads that trigger's
 `$HERDR_ENGINEERING_STATE/handoff-context/<session>.fired` marker before spending its own
 per-session budget. The reverse is not true — the `context-hook` does not read the autopilot's
