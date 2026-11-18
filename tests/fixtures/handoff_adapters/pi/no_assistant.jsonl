@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"11111111-1111-7111-8111-111111111111","timestamp":"2026-11-17T18:08:38.549Z","cwd":"/work"}
+{"type":"model_change","id":"000000a1","parentId":null,"timestamp":"2026-11-17T18:08:42.989Z","provider":"metabolomics","modelId":"qwen3.8-flash_next"}
+{"type":"thinking_level_change","id":"000000a2","parentId":"000000a1","timestamp":"2026-11-17T18:08:42.989Z","thinkingLevel":"medium"}
+{"type":"message","id":"000000a3","parentId":"000000a2","timestamp":"2026-11-17T18:08:43.516Z","message":{"role":"system","content":"redacted","timestamp":1794938923513}}
+{"type":"message","id":"000000a4","parentId":"000000a3","timestamp":"2026-11-17T18:08:43.517Z","message":{"role":"user","content":[{"type":"text","text":"redacted"}],"timestamp":1794938923513}}

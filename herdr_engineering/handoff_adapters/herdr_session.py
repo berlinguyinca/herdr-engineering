@@ -5,8 +5,11 @@ import subprocess
 from collections.abc import Mapping
 
 
-def herdr_session_id(pane_id: str, env: Mapping[str, str] | None) -> str | None:
-    """The conversation id Herdr reports for the pane's agent (``herdr agent get``), or None."""
+def herdr_agent_session(pane_id: str, env: Mapping[str, str] | None) -> tuple[str, str] | None:
+    """The (kind, value) Herdr reports for the pane's agent session (``herdr agent get``), or None.
+
+    kind is "id" for a conversation id (Claude Code, Codex) and "path" for a record file (Pi).
+    """
     exe = shutil.which("herdr", path=None if env is None else env.get("PATH", ""))
     if not exe:
         return None
@@ -16,8 +19,16 @@ def herdr_session_id(pane_id: str, env: Mapping[str, str] | None) -> str | None:
         session = json.loads(out.stdout)["result"]["agent"].get("agent_session")
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError):
         return None
-    value = session.get("value") if isinstance(session, dict) and session.get("kind") == "id" else None
-    return value if isinstance(value, str) and value else None
+    if not isinstance(session, dict):
+        return None
+    kind, value = session.get("kind"), session.get("value")
+    return (kind, value) if isinstance(kind, str) and isinstance(value, str) and value else None
+
+
+def herdr_session_id(pane_id: str, env: Mapping[str, str] | None) -> str | None:
+    """The conversation id Herdr reports for the pane's agent, or None."""
+    session = herdr_agent_session(pane_id, env)
+    return session[1] if session and session[0] == "id" else None
 
 
 def is_safe_session_id(session_id: str | None) -> bool:
