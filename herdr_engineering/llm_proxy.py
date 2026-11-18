@@ -46,6 +46,12 @@ DEFAULT_MAX_INFLIGHT = 32  # per project; the gateway's whole admission ceiling 
 DEFAULT_QUEUE_WAIT_SECONDS = 10.0
 
 
+# A fabric request that may fall back gets this long to connect and to answer with headers; after that the proxy
+# moves on. Once an upstream answers and no fallback is taken, the body is read under UPSTREAM_TIMEOUT_SECONDS.
+FALLBACK_ATTEMPT_TIMEOUT_SECONDS = 10
+UPSTREAM_TIMEOUT_SECONDS = 600
+
+
 def _meta(value: str | None) -> str | None:
     return value if value is not None and _META_OK.match(value) else None
 
@@ -589,6 +595,14 @@ def make_handler(state: ProxyState):
                 except OSError:
                     self.close_connection = True
 
+        @staticmethod
+        def _widen_timeout(conn, resp) -> None:
+            """The short fallback budget applied to connect + headers only; the body may take far longer.
+            A `Connection: close` reply detaches the socket from conn and leaves it only on the response."""
+            sock = conn.sock or getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+            if sock is not None:
+                sock.settimeout(UPSTREAM_TIMEOUT_SECONDS)
+
         def _client_write(self, data: bytes):
             try:
                 self.wfile.write(data)
@@ -642,14 +656,16 @@ def make_handler(state: ProxyState):
                     if bearer:
                         headers["Authorization"] = f"Bearer {bearer}"
                     try:
-                        conn = conn_cls(parts.hostname, parts.port, timeout=10 if may_fall_back else 600)
+                        conn = conn_cls(parts.hostname, parts.port, timeout=FALLBACK_ATTEMPT_TIMEOUT_SECONDS if may_fall_back else UPSTREAM_TIMEOUT_SECONDS)
                         sent = time.monotonic()
                         conn.request(self.command, parts.path + (f"?{parts.query}" if parts.query else ""),
                                      body=raw or None, headers=headers)
                         resp = conn.getresponse()
                         if not may_fall_back or resp.status not in {429, 503}:
+                            self._widen_timeout(conn, resp)
                             break
                         if state.degraded_route(custom, model)[0] is None:
+                            self._widen_timeout(conn, resp)
                             break           # nowhere else to go: the caller gets the gateway's own answer
                     except (OSError, http.client.HTTPException):
                         if not may_fall_back or state.degraded_route(custom, model)[0] is None:

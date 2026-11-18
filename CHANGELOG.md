@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Quieter client disconnects; fallback timeout no longer caps the body read
+
+- Control-plane listeners (`_DaemonThreadingServer`) no longer print a stdlib traceback for `ConnectionResetError`, `BrokenPipeError` or `ConnectionAbortedError` (about 6,700 resets and 100 broken pipes per day in `herdr-cp-web`); they log at debug. Any other handler exception still logs its traceback.
+- llm-proxy: the 10 s fallback-attempt timeout covered the whole upstream socket, so when a fabric answer arrived but no fallback was taken, a body slower than 10 s failed as `TimeoutError`. The socket is widened to the 600 s upstream timeout once headers arrive. Both values are now module constants (`FALLBACK_ATTEMPT_TIMEOUT_SECONDS`, `UPSTREAM_TIMEOUT_SECONDS`).
+
 ### Tier-1 ensemble checked by Opus, poll scope, Muse serve unit (always-on-review)
 
 - `tiers.tier1.reviewers` (new, default empty = unchanged behavior): several open-weight reviewers run in parallel per PR head, `backend: gateway` (e.g. qwen3.8-27b) or the new generic `backend: openai` (base_url, model, `api_key_file`; llama.cpp such as Muse-Glimmer-30B on 127.0.0.1:28931, requests serialized per server). They reuse the eval's system prompt, prompt (diff + touched files, 60k cap) and JSON findings parsing. Tier 1 stays advisory: no status, no comment. A down reviewer is recorded and skipped.
