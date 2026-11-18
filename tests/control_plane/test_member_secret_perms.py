@@ -121,6 +121,24 @@ def test_smoke_script_is_shell_valid():
     assert subprocess.run(["bash", "-n", str(ROOT / "deploy/control-plane/member-secret-smoke.sh")]).returncode == 0
 
 
+def test_smoke_script_ticket_is_one_take_secret_accepts():
+    # take_secret refuses a malformed ticket before opening the file, so a stale id fails the host smoke as
+    # "could not read" while proving nothing about the cross-uid read.  The root-only test above never runs in CI.
+    import re
+
+    from herdr_engineering.control_plane.collab_bridge_files import TICKET_RE
+    text = (ROOT / "deploy/control-plane/member-secret-smoke.sh").read_text()
+    tickets = set(re.findall(r'take_secret\(out, "([^"]+)"', text)) | set(re.findall(r'"ticket": "([^"]+)"', text))
+    assert len(tickets) == 1, tickets
+    ticket = tickets.pop()
+    assert re.match(TICKET_RE, ticket), ticket
+    # every secret file the script writes, cats, rms or checks is that ticket's (a drifted name would let the uid-65534
+    # refusals pass on a missing file)
+    names = set(re.findall(r'([A-Za-z0-9_]+)\.json', text))
+    assert names == {ticket}, names
+    assert "tkt_" not in text
+
+
 # ----------------------------------------------------------------------------- the worker resolves the gid or refuses
 
 def _worker_env():
