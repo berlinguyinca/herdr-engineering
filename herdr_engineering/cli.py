@@ -324,8 +324,8 @@ def _build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--answers", default=None, metavar="PATH",
                             help="YAML/JSON answers file (mode 0600); overrides --from-env")
             sp.add_argument("--with-api-keys", action="store_true",
-                            help="generate control-plane API keys (keyed mode); the dashboard, "
-                                 "llm-proxy and emit hook do not send keys yet")
+                            help="generate control-plane API keys (keyed mode); the dashboard needs the "
+                                 "dashboard proxy, llm-proxy and emit hook send keys once configured")
         if name == "revoke":
             sp.add_argument("host", help="host id in the fleet config")
         if name == "token":

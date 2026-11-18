@@ -280,8 +280,10 @@ def _check_members(collab: dict, share: dict, cfg: FleetConfig | None = None) ->
         raise FleetConfigError("control_plane.share.public_host must be a host other than control_plane.collab."
                                "public_url's: the member web and share links live there, MCP stays on the collab host")
     members = collab.get("members")
-    if (share.get("member_host") is not None and not (isinstance(members, dict) and members.get("enabled") is True)
-            and not (cfg is not None and artifact_host_enabled(cfg))):
+    if share.get("member_host") is not None and cfg is not None and artifact_host_enabled(cfg):
+        raise FleetConfigError("control_plane.share.member_host is ignored while control_plane.artifact_host is "
+                               "enabled (the host serves the member web): set control_plane.artifact_host.member_host")
+    if share.get("member_host") is not None and not (isinstance(members, dict) and members.get("enabled") is True):
         raise FleetConfigError("control_plane.share.member_host needs control_plane.collab.members.enabled: true "
                                "(it is the member web's own origin on the share path)")
     if members is None:
@@ -614,7 +616,7 @@ def artifact_host_member_host(cfg: FleetConfig) -> str | None:
 def _check_member_host(
     member_host: object,
     public_host: object,
-    mcp_hosts: list,
+    mcp_hosts: list[str],
     where: str = "control_plane.artifact_host",
 ) -> None:
     from .control_plane.members_config import valid_public_host
@@ -1004,6 +1006,14 @@ def _members_enabled(cfg: FleetConfig) -> bool:
     return isinstance(members, dict) and members.get("enabled") is True
 
 
+def _edge_mcp_hosts(cfg: FleetConfig) -> list[str]:
+    """control_plane.artifact_host.mcp_public_hosts as a list of names (a malformed value is refused, not rendered)."""
+    hosts = _artifact_host_mapping(cfg).get("mcp_public_hosts") or []
+    if artifact_host_enabled(cfg) and not (isinstance(hosts, list) and all(isinstance(h, str) for h in hosts)):
+        raise FleetConfigError("control_plane.artifact_host.mcp_public_hosts must be a list of lowercase DNS names")
+    return list(hosts) if isinstance(hosts, list) else []
+
+
 def render_edge(cfg: FleetConfig, template: Path, out: Path) -> None:
     """Write the edge nginx.conf (0644: it holds no secret) rendered for this fleet config."""
     template = Path(template)
@@ -1017,7 +1027,7 @@ def render_edge(cfg: FleetConfig, template: Path, out: Path) -> None:
                             artifact_host=artifact_host_public_host(cfg),
                             member_host=artifact_host_member_host(cfg),
                             share_member_host=_share_member_host(cfg, share),
-                            mcp_hosts=list(_artifact_host_mapping(cfg).get("mcp_public_hosts") or []))
+                            mcp_hosts=_edge_mcp_hosts(cfg))
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")
@@ -1128,7 +1138,8 @@ def _collect_hosts(answers: dict, prompt: Callable) -> dict[str, list[str]]:
 
 API_KEYS_WARNING = (
     "warning: --with-api-keys turns on X-API-Key auth for the control plane. The llm-proxy "
-    "and the emit hook do not send keys yet, so they will get 401 until they do. The browser "
+    "(HERDR_CP_CLIENT_KEY_FILE) and the emit hook (ingest.api_key / agent.api_key) send keys "
+    "once configured; until then they get 401. The browser "
     "dashboard works only behind the dashboard proxy: set control_plane.dashboard_proxy "
     "(viewer_key_file, operator_key_file) and run `herdr-eng control-plane dashboard-proxy` "
     "(compose profile dashboard-proxy); without it the dashboard gets 401. Leave "
@@ -1146,7 +1157,7 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
     The control plane stays open on the tailnet (``control_plane.api_keys: {}``) and
     ``ingest.api_key`` / ``agent.api_key`` are empty, so clients send no X-API-Key.
     ``with_api_keys`` generates operator/ingest/agent keys instead (keyed mode; the
-    llm-proxy and emit hook do not support keys yet, the dashboard needs the dashboard proxy - see API_KEYS_WARNING).
+    llm-proxy and emit hook send keys once configured, the dashboard needs the dashboard proxy - see API_KEYS_WARNING).
 
     Hosts get a placeholder hash of a discarded token: they cannot authenticate
     until ``fleet join`` / ``fleet config token`` installs a real one.

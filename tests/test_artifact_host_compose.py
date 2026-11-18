@@ -1631,3 +1631,10 @@ def test_the_edge_refuses_a_member_host_that_is_an_mcp_host_even_with_the_slices
     central = _central(tmp_path, host_section=_host_section(member_host=MCP_HOST))
     with pytest.raises(FleetConfigError, match="member_host"):
         fcc.render_edge(load_fleet_config(central), EDGE_DIR / "nginx.conf", tmp_path / "edge.conf")
+
+
+@pytest.mark.parametrize("bad", ["a.example.test", {"a": 1}, [7]])
+def test_render_edge_refuses_a_malformed_mcp_public_hosts(tmp_path: Path, bad: object) -> None:
+    central = _central(tmp_path, host_section=_host_section(mcp_public_hosts=bad))
+    with pytest.raises(FleetConfigError, match="mcp_public_hosts"):
+        fcc.render_edge(load_fleet_config(central), EDGE_DIR / "nginx.conf", tmp_path / "nginx.conf")
