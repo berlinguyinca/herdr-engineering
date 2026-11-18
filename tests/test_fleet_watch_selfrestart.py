@@ -12,11 +12,14 @@ here starts or enables a real service.
 from __future__ import annotations
 
 import json
+import os
 import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+import pytest
 
 from herdr_engineering.fleet_watch import selfrestart
 from herdr_engineering.fleet_watch.selfrestart import (
@@ -192,3 +195,64 @@ def test_loop_does_not_request_a_restart_for_a_halted_rollout(fleet, monkeypatch
     assert out.returncode == 0, out.stderr
     assert "halted" in out.stdout
     assert not marker.exists()
+
+
+# ---------------------------------------------------------------- audit: restart storm, unreadable state
+
+def test_a_fresh_loop_after_the_restart_does_not_restart_again_while_the_succeeded_rollout_is_the_latest(fleet, monkeypatch):
+    as_beast(fleet)
+    marker, seam_path = seam(fleet, "storm.marker")
+    monkeypatch.setenv(selfrestart.SEAM, str(seam_path))
+    first = loop(fleet, "--enable-rollouts", "--max-passes", "1")
+    assert first.returncode == 75, first.stderr
+    assert wait_for(marker)
+    marker.unlink()
+    saved = fleet.saved()
+    (rid,) = saved["rollouts"]
+    assert saved["rollouts"][rid]["status"] == "succeeded"                # still the latest saved rollout, row updated
+    again = loop(fleet, "--enable-rollouts", "--max-passes", "3")         # what systemd starts 30 s later
+    assert again.returncode == 0, again.stderr
+    assert again.stdout.count("pass ") == 3 and "self-restart" not in again.stdout
+    assert not marker.exists()
+    assert fleet.saved()["rollouts"] == saved["rollouts"]                 # nothing re-ran
+
+
+def broken_state(fleet, how: str) -> None:
+    fleet.state_dir.mkdir(parents=True, exist_ok=True)
+    path = fleet.state_dir / "state.json"
+    if how == "directory":
+        path.mkdir()
+    else:
+        path.write_text("{}")
+        path.chmod(0)
+
+
+@pytest.mark.parametrize("how", ["directory", "chmod000"])
+def test_unreadable_state_means_no_restart_and_no_crash(fleet, monkeypatch, how):
+    if how == "chmod000" and os.geteuid() == 0:
+        pytest.skip("root reads mode-000 files")
+    as_beast(fleet)
+    marker, seam_path = seam(fleet, f"unreadable-{how}.marker")
+    monkeypatch.setenv(selfrestart.SEAM, str(seam_path))
+    broken_state(fleet, how)
+    try:
+        out = loop(fleet, "--enable-rollouts", "--max-passes", "2")
+    finally:
+        if how == "chmod000":
+            (fleet.state_dir / "state.json").chmod(0o600)
+    assert out.returncode == 0, out.stderr                                # the loop survived: no crash, no exit 75
+    assert out.stdout.count("pass ") == 2 and "self-restart" not in out.stdout
+    assert not marker.exists()
+
+
+def test_corrupt_state_after_a_self_update_means_no_second_restart_and_no_crash(fleet, monkeypatch):
+    as_beast(fleet)
+    marker, seam_path = seam(fleet, "corrupt.marker")
+    monkeypatch.setenv(selfrestart.SEAM, str(seam_path))
+    assert loop(fleet, "--enable-rollouts", "--max-passes", "1").returncode == 75
+    assert wait_for(marker)
+    marker.unlink()
+    (fleet.state_dir / "state.json").write_text("{not json")             # the saved success is lost; the host IS current
+    out = loop(fleet, "--enable-rollouts", "--max-passes", "2")
+    assert out.returncode == 0, out.stderr                                # re-planned, found no change: no restart
+    assert "self-restart" not in out.stdout and not marker.exists()

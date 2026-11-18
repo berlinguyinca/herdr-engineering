@@ -106,25 +106,73 @@ def _run(ctx: Context, argv: list[str], *, cwd: str | Path | None = None, timeou
            "HERDR_FLEET_BEFORE_SHA": ctx.before_sha or "", "GIT_TERMINAL_PROMPT": "0", **(extra_env or {})}
     timeout = COMMAND_TIMEOUT_S if timeout is None else timeout
     ctx.note("$ " + shlex.join(argv))
+    proc: subprocess.Popen | None = None
     try:
-        proc = subprocess.Popen(argv, cwd=str(cwd) if cwd else tempfile.gettempdir(), env=env, text=True,
-                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                start_new_session=True)
+        _SIGNALS.spawning = True                   # a SIGTERM in the next lines is held until `proc` is bound
+        try:
+            proc = subprocess.Popen(argv, cwd=str(cwd) if cwd else tempfile.gettempdir(), env=env, text=True,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        finally:
+            _SIGNALS.spawning = False
+        if _SIGNALS.term_pending:                  # raised here, inside the try, with `proc` known: its group is killed
+            _exit_on_sigterm()
+        out, _ = proc.communicate(timeout=timeout)
     except OSError as exc:
+        if proc is not None:                       # the command runs but could not be read: never leave it behind
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            raise
+        if _SIGNALS.term_pending:                  # a SIGTERM held during the spawn must not be lost with the failure
+            _exit_on_sigterm()
         ctx.note(f"cannot start: {exc}")
         return 127, ""
-    try:
-        out, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
-        out, _ = proc.communicate()
+        out, _ = proc.communicate()                # the group is dead; a SIGTERM here just leaves (143)
         ctx.note(f"timed out after {timeout}s")
         ctx.note(out or "")
         return 124, out or ""
+    except BaseException:                          # SIGTERM (see `terminate_on_sigterm`): the command is in ITS OWN session
+        if proc is not None:                       # (None: the signal came before the command existed)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+        raise
     ctx.note(out or "")
     ctx.note(f"exit {proc.returncode}")
     return proc.returncode, out or ""
+
+
+class _Signals:
+    """SIGTERM bookkeeping for `terminate_on_sigterm`: whether a command is being spawned right now, and a SIGTERM
+    that arrived meanwhile. Raising between `Popen` returning and `proc` being bound would orphan the command."""
+
+    def __init__(self) -> None:
+        self.spawning = False
+        self.term_pending = False
+
+
+_SIGNALS = _Signals()
+
+
+def _exit_on_sigterm() -> None:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    sys.exit(143)
+
+
+def terminate_on_sigterm() -> None:
+    """Turn SIGTERM into SystemExit so `_run` kills the in-flight command's group (it runs in its own session, so a
+    signal to host-apply's group would never reach it). The watcher sends SIGTERM first, SIGKILL after a grace.
+    One-shot (a second SIGTERM is ignored while the group is being killed); during the spawn of a command the
+    SIGTERM is only recorded and `_run` raises it as soon as the command's handle exists."""
+    def stop(*_) -> None:
+        if _SIGNALS.spawning:
+            _SIGNALS.term_pending = True
+            return
+        _exit_on_sigterm()
+
+    signal.signal(signal.SIGTERM, stop)
 
 
 def _git(ctx: Context, root: Path, *args: str, timeout: float = GIT_TIMEOUT_S) -> tuple[int, str]:
