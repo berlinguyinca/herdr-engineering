@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Any
 
 from .bridge import _LoopRunner
-from .events import V2_COLUMNS, Event, EventStore
+from .events import Event, EventStore
 
 log = logging.getLogger(__name__)
 
@@ -38,11 +38,6 @@ def _parse_dt(value: Any) -> datetime:
     return datetime.now(UTC)
 
 
-def prune_events_sql(table: str) -> str:
-    """The retention DELETE; migration 0003 indexes fabric_events(entity_type, source_timestamp) for it."""
-    return f"DELETE FROM {table} WHERE entity_type=$1 AND source_timestamp < $2"
-
-
 def _dict_to_event(ev: dict) -> Event:
     return Event(
         event_id=ev.get("event_id") or f"ev_{secrets.token_hex(16)}",
@@ -56,12 +51,7 @@ def _dict_to_event(ev: dict) -> Event:
         sequence=ev.get("sequence", 0),
         event_type=ev.get("event_type", ""),
         payload=ev.get("payload") or {},
-        **{name: ev.get(name) for name in V2_COLUMNS},
     )
-
-
-class EventAlreadyStored(RuntimeError):
-    """The durable log already holds this event_id (not a write failure)."""
 
 
 class DurableEventSink:
@@ -106,16 +96,11 @@ class DurableEventSink:
         with self._write_lock:
             self._ensure_store()
             event = _dict_to_event(ev)
-            if (event.entity_type in {"scheduler_reservation", "scheduler_lease", "scheduler_observation"}
-                    or event.event_type == "HostPolicyChanged"):
+            if event.entity_type in {"scheduler_reservation", "scheduler_lease", "scheduler_recovery", "scheduler_observation"} or event.event_type == "HostPolicyChanged":
                 event = replace(event, sequence=self._run(self._store.next_sequence(
                     event.entity_type, event.entity_id)))
-            # append() returns False only for an existing event_id; any write
-            # error propagates from here unchanged.
             if not self._run(self._store.append(event)):
-                raise EventAlreadyStored(
-                    "durable event insert was not acknowledged "
-                    "(event_id already stored)")
+                raise RuntimeError("durable event insert was not acknowledged")
 
     @contextmanager
     def scheduler_admission(self):
@@ -137,14 +122,6 @@ class DurableEventSink:
                 self._run(conn.execute("ROLLBACK"))
                 raise
 
-    def scheduler_leases(self):
-        """Read latest lease state while the caller holds the admission lock."""
-        rows = self._run(self._store._conn.fetch(
-            f"SELECT DISTINCT ON (entity_id) entity_id, payload FROM {self._events_table} "
-            "WHERE entity_type='scheduler_lease' ORDER BY entity_id, sequence DESC"))
-        return {row["entity_id"]: json.loads(row["payload"]) if isinstance(row["payload"], str)
-                else dict(row["payload"]) for row in rows}
-
     def scheduler_observations(self):
         """Latest token-bound host facts, read under the admission transaction."""
         rows = self._run(self._store._conn.fetch(
@@ -158,39 +135,34 @@ class DurableEventSink:
         rows = self._run(self._store._conn.fetch(
             f"SELECT DISTINCT ON (entity_id) entity_id, payload FROM {self._events_table} "
             "WHERE entity_type='host' AND event_type='HostPolicyChanged' "
-            "AND NOT (payload ? '_envelope') "
             "ORDER BY entity_id, sequence DESC"))
         return {row["entity_id"]: json.loads(row["payload"]) if isinstance(row["payload"], str)
                 else dict(row["payload"]) for row in rows}
 
-    def stored_identity(self, event_id: str, actor_id: str = ""):
-        """(source, source_sequence) of this principal's stored event, or None when absent."""
+    def scheduler_recovery_latest(self, operation_id):
         with self._write_lock:
             self._ensure_store()
-            return self._run(self._store.identity(event_id, actor_id))
+            rows = self._run(self._store._conn.fetch(
+                f"SELECT payload FROM {self._events_table} "
+                "WHERE entity_type='scheduler_recovery' AND entity_id=$1 ORDER BY sequence DESC LIMIT 1",
+                operation_id))
+        if not rows:
+            return None
+        payload = rows[0]["payload"]
+        return json.loads(payload) if isinstance(payload, str) else dict(payload)
 
-    def record_source_state(self, state: dict) -> None:
-        """Best-effort upsert of per-source ingest state (fabric_event_sources)."""
-        import json
+    @contextmanager
+    def scheduler_recovery_operation(self, operation_id):
+        """Serialize one recovery while each transition commits before side effects."""
+        if not self._dsn:
+            raise RuntimeError("recovery requires a dedicated PostgreSQL lock connection")
+        import asyncpg
+        connection = self._run(asyncpg.connect(self._dsn))
         try:
-            with self._write_lock:
-                self._ensure_store()
-                self._run(self._store._conn.execute(
-                    "INSERT INTO fabric_event_sources "
-                    "(source_actor, source, last_sequence, last_seen_at, gaps) VALUES ($1,$2,$3,$4,$5) "
-                    "ON CONFLICT (source_actor, source) DO UPDATE SET "
-                    "last_sequence=EXCLUDED.last_sequence, "
-                    "last_seen_at=EXCLUDED.last_seen_at, gaps=EXCLUDED.gaps",
-                    state.get("actor") or "", state["source"], state["last_sequence"],
-                    _parse_dt(state["last_seen_at"]), json.dumps(state["gaps"])))
-        except Exception:
-            log.exception("durable sink failed to persist source state %s",
-                          state.get("source"))
-
-
-    def prune_events_before(self, entity_type: str, cutoff: datetime) -> None:
-        """Delete one entity type's durable events older than ``cutoff`` (retention)."""
-        with self._write_lock:
-            self._ensure_store()
-            self._run(self._store._conn.execute(
-                prune_events_sql(self._events_table), entity_type, cutoff))
+            self._run(connection.execute(
+                "SELECT pg_advisory_lock(hashtextextended($1, 724965310221))", operation_id))
+            yield
+        finally:
+            # Closing the dedicated session releases its lock even if the
+            # coordinator loses transport or an unlock statement cannot run.
+            self._run(connection.close())

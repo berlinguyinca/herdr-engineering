@@ -31,11 +31,31 @@ class SchedulerService:
         self._owner_queue_limit = owner_queue_limit
         self._project_queue_limit = project_queue_limit
         self._global_queue_limit = int(global_queue_limit)
+        self.native_registry = None
 
     def _fresh_scheduler(self):
         return Scheduler(self._hosts, **self._scheduler_options)
 
+    def configure_native(self, adapter):
+        from ..adapter_registry import AdapterRegistry, register_native_families
+        from ..workspace import WorkspaceManifestStore
+        def resolve_host(uid):
+            host = next((host for host in self.repo.list_hosts() if host.get("host_uid") == uid), None)
+            if host is None:
+                return None
+            for alias in host.get("aliases") or [host["host_id"]]:
+                machine = adapter.resolve_machine(alias)
+                if machine is not None:
+                    return {"host_uid": uid, "machine": machine.label}
+            return None
+        self.native_registry = register_native_families(
+            AdapterRegistry(self), adapter, resolve_host=resolve_host,
+            resolve_workspace=WorkspaceManifestStore(self.repo).resolve)
 
+    def launch_native(self, body, principal):
+        if self.native_registry is None:
+            raise RuntimeError("native scheduler launcher is disabled")
+        return asdict(self.native_registry.launch(body, principal))
 
     def _hosts(self):
         rows = []
@@ -211,6 +231,25 @@ class SchedulerService:
                                     if row.get("state") in {"reserved", "committed"}),
                 "queue": [row for row in history if row.get("state") == "queued"]}
 
+    def simulate(self, body):
+        from ..replay import placement_preview
+        excluded = body.get("excluded_hosts", [])
+        if not isinstance(excluded, list) or len(excluded) > 200 or not all(isinstance(uid, str) for uid in excluded):
+            raise ValueError("excluded_hosts must be a bounded list")
+        days = body.get("days", 1)
+        if days not in (1, 7, 30):
+            raise ValueError("simulator window must be 1, 7, or 30 days")
+        cutoff = datetime.now(UTC) - timedelta(days=days)
+        rows = []
+        for row in self.repo.list_scheduler_reservations():
+            try:
+                captured = datetime.fromisoformat((row.get("decision") or {})["created_at"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if captured.tzinfo is not None and captured >= cutoff:
+                rows.append(row)
+        return placement_preview(rows, cpu_weight=body.get("cpu_weight", .6),
+                                  memory_weight=body.get("memory_weight", .4), excluded_hosts=excluded)
 
     def plan(self, body, principal):
         request = self.request(body, principal)
@@ -233,8 +272,6 @@ class SchedulerService:
             existing = next((row for row in rows if row.get("request_id") == body.get("request_id")), None)
             if existing is not None:
                 snapshot = existing.get("request_snapshot") or {}
-                if not snapshot:
-                    raise RuntimeError("legacy reservation requires operator reconciliation")
                 if snapshot.get("owner_id") != principal:
                     raise PermissionError("reservation owner mismatch")
                 normalized = {**asdict(request), "required_tags": sorted(request.required_tags)}
@@ -318,8 +355,6 @@ class SchedulerService:
             row = next((row for row in rows if row.get("reservation_id") == reservation_id), None)
             if row is None:
                 raise KeyError(reservation_id)
-            if not row.get("request_snapshot"):
-                raise RuntimeError("legacy reservation requires operator reconciliation")
             if row.get("state") == "committed":
                 lease = next((lease for lease in self.repo.list_scheduler_leases()
                               if lease.get("lease_id") == row.get("lease_id")), None)
@@ -355,7 +390,7 @@ class SchedulerService:
             row = next((row for row in rows if row.get("reservation_id") == reservation_id), None)
             if row is None:
                 raise KeyError(reservation_id)
-            if row.get("state") == "committed" and (row.get("execution_claimed") or not row.get("request_snapshot")):
+            if row.get("state") == "committed" and row.get("execution_claimed"):
                 raise PermissionError("verified execution stop is required before capacity release")
             self.scheduler = self._fresh_scheduler()
             self.scheduler.restore(rows)
@@ -372,7 +407,43 @@ class SchedulerService:
                 self.repo.save_scheduler_lease(lease)
         return self._reservation(reservation)
 
+    def stop_supervised(self, reservation_id, *, supervisor, receipt):
+        """Host-side stop proof; HTTP callers cannot supply a stop boolean."""
+        from ..recovery import ExecutionLease
+        with self.repo.scheduler_admission() as rows:
+            row = next((row for row in rows if row.get("reservation_id") == reservation_id), None)
+            if row is None:
+                raise KeyError(reservation_id)
+            if receipt.agent_id != row["request_id"] or receipt.host_uid != row.get("host_uid"):
+                raise PermissionError("scope receipt does not match reservation")
+            lease = next((lease for lease in self.repo.list_scheduler_leases()
+                          if lease.get("lease_id") == row.get("lease_id")), None)
+            if lease is None or lease.get("generation") != receipt.generation:
+                raise PermissionError("execution lease generation mismatch")
+            execution = ExecutionLease(row["request_id"], row["host_uid"], lease["generation"],
+                                       lease.get("token", ""), False)
+            stopped = supervisor.stop(execution, receipt)
+            if not isinstance(stopped, dict) or stopped.get("stop_verified") is not True:
+                raise RuntimeError("execution stop remains unverified")
+            self.scheduler = self._fresh_scheduler()
+            self.scheduler.restore(rows)
+            return self._release(reservation_id)
 
+    def record_scope_accounting(self, reservation_id, *, supervisor, receipt):
+        with self.repo.scheduler_admission() as rows:
+            row = next((row for row in rows if row.get("reservation_id") == reservation_id), None)
+            if row is None:
+                raise KeyError(reservation_id)
+            if receipt.agent_id != row["request_id"] or receipt.host_uid != row.get("host_uid"):
+                raise PermissionError("scope accounting identity mismatch")
+            metrics = supervisor.accounting(receipt)
+            if (metrics.get("agent_id") != row["request_id"]
+                    or metrics.get("host_uid") != row["host_uid"]
+                    or metrics.get("generation") != receipt.generation):
+                raise PermissionError("scope accounting observation mismatch")
+            self.repo.record_event("scheduler_execution", reservation_id, "ExecutionResourceObserved",
+                                   metrics, require_durable=True, publish=False)
+            return metrics
 
     def claim_execution(self, reservation_id):
         """Claim native submission once; uncertain submissions remain claimed."""
@@ -382,24 +453,7 @@ class SchedulerService:
                 raise KeyError(reservation_id)
             if row.get("state") != "committed" or row.get("execution_claimed"):
                 raise RuntimeError("execution requires reconciliation before launch")
-            if not row.get("request_snapshot"):
-                raise RuntimeError("legacy reservation requires operator reconciliation")
             host = next((host for host, _ in self._hosts() if host.host_uid == row.get("host_uid")), None)
-            lease = next((lease for lease in self.repo.list_scheduler_leases()
-                          if lease.get("lease_id") == row.get("lease_id")), None)
-            try:
-                expiry = datetime.fromisoformat(lease["expires_at"]) if lease else None
-                live = expiry is not None and expiry.tzinfo is not None and expiry > datetime.now(UTC)
-            except (KeyError, TypeError, ValueError):
-                live = False
-            if (lease is None or lease.get("state") != "running" or not live
-                    or lease.get("request_id") != row.get("request_id")
-                    or lease.get("reservation_id") != reservation_id
-                    or lease.get("host_uid") != row.get("host_uid")
-                    or not isinstance(lease.get("token"), str)
-                    or not isinstance(row.get("lease_token"), str)
-                    or not secrets.compare_digest(lease["token"], row["lease_token"])):
-                raise RuntimeError("execution lease requires reconciliation before launch")
             request = row.get("request_snapshot") or {}
             if host is None or host.policy.revision != row.get("policy_revision"):
                 raise RuntimeError("policy changed before execution claim")
@@ -428,10 +482,6 @@ class SchedulerService:
             return [self._reservation(reservation) for reservation in expired]
 
     def heartbeat(self, lease_id, *, generation, token, ttl=90):
-        with self.repo.scheduler_admission():
-            return self._heartbeat(lease_id, generation=generation, token=token, ttl=ttl)
-
-    def _heartbeat(self, lease_id, *, generation, token, ttl=90):
         lease = next((row for row in self.repo.list_scheduler_leases()
                       if row.get("lease_id") == lease_id), None)
         if lease is None:
@@ -455,10 +505,6 @@ class SchedulerService:
         return self.repo.save_scheduler_lease(lease)
 
     def reconcile_leases(self, now=None):
-        with self.repo.scheduler_admission():
-            return self._reconcile_leases(now)
-
-    def _reconcile_leases(self, now=None):
         now = now or datetime.now(UTC)
         fenced = []
         for lease in self.repo.list_scheduler_leases():

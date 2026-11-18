@@ -206,9 +206,6 @@ class Scheduler:
         explicit = explicit_host_uid or request.explicit_host_uid
         snapshots = [(snapshot, self._capacity(snapshot, capacity))
                      for snapshot, capacity in self._snapshot()]
-        legacy_context = any(reservation.state in {"reserved", "committed"}
-                             and not reservation.request_snapshot
-                             for reservation in self._reservations.values())
         workspace_busy = request.workspace_id is not None and any(
             reservation.request_id != request.request_id
             and reservation.state in {"reserved", "committed"}
@@ -246,8 +243,6 @@ class Scheduler:
                 required_tags=request.required_tags, now=now,
             )
             reasons = list(eligibility.reason_codes)
-            if legacy_context:
-                reasons.append("LEGACY_CONTEXT_UNKNOWN")
             if owner_full:
                 reasons.append("USER_QUOTA")
             if owner_resources_full:
@@ -336,8 +331,6 @@ class Scheduler:
     def commit(self, reservation_id: str) -> Reservation:
         with self._lock:
             reservation = self._reservations[reservation_id]
-            if not reservation.request_snapshot:
-                raise RuntimeError("legacy reservation requires operator reconciliation")
             if reservation.state == "committed":
                 return reservation
             if reservation.state != "reserved":

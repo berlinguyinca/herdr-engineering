@@ -29,3 +29,19 @@ def test_host_policy_uses_revision_and_records_audit_event():
     with pytest.raises(ValueError, match="revision conflict"):
         repo.set_host_policy("beast", mode="automatic", expected_revision=0)
 
+
+def test_policy_write_failure_preserves_previous_policy():
+    class FailedSink:
+        def record(self, event):
+            pass
+
+        def record_required(self, event):
+            raise RuntimeError("storage unavailable")
+
+    repo = ControlPlaneRepo(sink=FailedSink())
+    repo.upsert_host("mac", "mac", None,
+                     scheduler_policy={"mode": "manual_only", "revision": 1})
+    with pytest.raises(RuntimeError, match="storage unavailable"):
+        repo.set_host_policy("mac", mode="automatic", expected_revision=1)
+    assert repo.get_host("mac")["scheduler_policy"] == {"mode": "manual_only", "revision": 1}
+

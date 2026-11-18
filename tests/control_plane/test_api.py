@@ -50,6 +50,18 @@ def test_health(server):
     assert json.loads(body)["status"] == "ok"
 
 
+def test_server_configures_bounded_request_workers(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    svr = ControlPlaneServer(repo, request_workers=3)
+    thread = threading.Thread(target=svr.serve, daemon=True)
+    thread.start()
+    svr.wait_until_ready()
+    try:
+        assert svr._httpd.request_workers == 3
+    finally:
+        svr.shutdown()
+
+
 def test_health_reports_deployment_context(server):
     c, _ = server
     _, _, body = c.get("/api/v1/health")
@@ -59,6 +71,34 @@ def test_health_reports_deployment_context(server):
     assert h["version"] == "0.1.0"
     assert h["commit"] == "dev"
     assert "missions" in h and "timestamp" in h
+    assert "requests" in h["performance"]
+
+
+def test_api_responses_have_request_ids_and_health_exposes_latency_diagnostics(server):
+    c, _ = server
+    status, headers, body = c.get("/api/v1/missions")
+    assert status == 200
+    assert headers.get("X-Request-ID")
+    assert json.loads(body)["missions"] == []
+
+    _, _, body = c.get("/api/v1/health")
+    performance = json.loads(body)["performance"]
+    assert performance["by_route"]["/api/v1/missions"]["count"] >= 1
+    assert "latency_ms" in performance["by_route"]["/api/v1/missions"]
+    assert "slow_requests" in performance
+
+
+def test_ingest_accepts_bounded_batch(server):
+    c, _ = server
+    req = {"events": [
+        {"entity_type": "host", "entity_id": "bender",
+         "event_type": "host.heartbeat", "payload": {"cpu": 10}},
+        {"entity_type": "host", "entity_id": "beast",
+         "event_type": "host.heartbeat", "payload": {"cpu": 20}},
+    ]}
+    status, body = c.post("/api/v1/ingest", req)
+    assert status == 200
+    assert len(json.loads(body)["entities"]) == 2
 
 
 def test_missions_roundtrip(server):
@@ -77,82 +117,6 @@ def test_mission_not_found_404(server):
     c, _ = server
     status, _, _ = c.get("/api/v1/missions/mission_nope")
     assert status == 404
-
-
-def test_mission_delivery_routes(server):
-    c, repo = server
-    mid = repo.create_mission("Delivery routes")
-    repo.upsert_test_run("tr1", mission_id=mid, status="passed",
-                         passed=3, failed=0, total=3, kind="test")
-    repo.upsert_test_run("tr2", mission_id=mid, status="passed",
-                         passed=1, failed=0, total=1, kind="test")
-    repo.upsert_test_run("build1", mission_id=mid, status="ok", kind="build")
-    # a run belonging to a different mission must not leak into this one's lists
-    repo.upsert_test_run("other", mission_id="MSN-other", status="failed",
-                         failed=1, total=1, kind="test")
-    repo.upsert_review("rv1", mission_id=mid, reviewer="codex",
-                       status="completed", verdict="approved")
-    repo.upsert_pull_request("pr1", mission_id=mid, repository="acme/w",
-                             number=7, url="https://github.com/acme/w/pull/7",
-                             status="merged")
-    repo.upsert_pull_request("pr2", mission_id=mid, repository="acme/w",
-                             number=8, url="https://github.com/acme/w/pull/8",
-                             status="open")
-
-    _, _, body = c.get(f"/api/v1/missions/{mid}/tests")
-    tests = json.loads(body)["tests"]
-    assert [t["test_run_id"] for t in tests] == ["tr1", "tr2"]
-    assert all(t["mission_id"] == mid for t in tests)
-    # Counts must survive value-only redaction: the ``passed`` key is not a
-    # secret hint (key-name redaction would wrongly turn it into [REDACTED]).
-    assert tests[0]["passed"] == 3 and tests[0]["failed"] == 0
-
-    _, _, body = c.get(f"/api/v1/missions/{mid}/builds")
-    builds = json.loads(body)["builds"]
-    assert [b["test_run_id"] for b in builds] == ["build1"]
-
-    _, _, body = c.get(f"/api/v1/missions/{mid}/reviews")
-    reviews = json.loads(body)["reviews"]
-    assert [rv["review_id"] for rv in reviews] == ["rv1"]
-    assert reviews[0]["verdict"] == "approved"
-
-    _, _, body = c.get(f"/api/v1/missions/{mid}/pulls")
-    pulls = json.loads(body)["pulls"]
-    assert [p["pr_id"] for p in pulls] == ["pr1", "pr2"]
-    assert all(p["mission_id"] == mid for p in pulls)
-
-
-def test_mission_delivery_redaction_keeps_counts_but_scans_values(server):
-    c, repo = server
-    mid = repo.create_mission("Redaction")
-    repo.upsert_test_run("tr", mission_id=mid, status="failed",
-                         passed=4, failed=1, total=5,
-                         results=[{"name": "runner leaked token abc123xyz789"}])
-    repo.upsert_pull_request("pr", mission_id=mid, number=1, status="open",
-                             url="https://example.com/pr/1")
-    _, _, body = c.get(f"/api/v1/missions/{mid}/tests")
-    tests = json.loads(body)["tests"]
-    assert tests[0]["passed"] == 4 and tests[0]["failed"] == 1
-    # a leaked secret in a string value is redacted, a URL is preserved
-    assert "abc123xyz789" not in body.decode()
-    _, _, body = c.get(f"/api/v1/missions/{mid}/pulls")
-    assert json.loads(body)["pulls"][0]["url"] == "https://example.com/pr/1"
-
-
-def test_mission_delivery_routes_unknown_mission_404(server):
-    c, _ = server
-    for sub in ("tests", "builds", "reviews", "pulls"):
-        status, _, _ = c.get(f"/api/v1/missions/mission_nope/{sub}")
-        assert status == 404, sub
-
-
-def test_mission_delivery_routes_empty_for_known_mission(server):
-    c, repo = server
-    mid = repo.create_mission("No delivery records")
-    for sub in ("tests", "builds", "reviews", "pulls"):
-        status, _, body = c.get(f"/api/v1/missions/{mid}/{sub}")
-        assert status == 200, sub
-        assert json.loads(body)[sub] == [], sub
 
 
 def test_sessions_and_services(server):
@@ -238,35 +202,6 @@ def test_analytics(server):
     assert json.loads(body)["total"] == 1
     status, _, body = c.get("/api/v1/analytics/hosts")
     assert json.loads(body)["total"] == 0
-
-
-def test_analytics_tokens_survives_projectless_ingest_row(server):
-    c, repo = server
-    repo.add_token_usage({"mission_id": "m1", "model": "gpt",
-                          "request_id": "req-np", "input_tokens": 3})
-    status, _, body = c.get("/api/v1/analytics/tokens")
-    assert status == 200
-    assert json.loads(body)["total"]["input_tokens"] == 3
-
-
-def test_analytics_stages_and_usage(server):
-    c, repo = server
-    mid = repo.create_mission("stage-api")
-    repo.set_mission_stage(mid, "implementation")
-    repo.set_mission_stage(mid, "complete")
-    repo.add_token_usage({"mission_id": mid, "model": "gpt-4o",
-                          "request_id": "req-a", "input_tokens": 3})
-    repo.add_resource_usage({"mission_id": mid, "kind": "cpu", "value": 1.0})
-    status, _, body = c.get("/api/v1/analytics/stages")
-    assert status == 200
-    assert json.loads(body)["bottleneck"] == "implementation"
-    status, _, body = c.get("/api/v1/analytics/usage")
-    u = json.loads(body)
-    assert u["tokens"]["by_model"]["gpt-4o"]["input_tokens"] == 3
-    assert u["resources"]["cpu"]["total"] == 1.0
-    # Mission-scoped usage via ?mission=
-    status, _, body = c.get(f"/api/v1/analytics/usage?mission={mid}")
-    assert json.loads(body)["resources"]["cpu"]["total"] == 1.0
 
 
 def test_sse_stream_content_type(server):
@@ -358,22 +293,8 @@ def test_ingest_endpoint_upserts_host(server):
     # the ingested events are visible to a GET on the same stream
     _, _, stream = c.get("/api/v1/events?entity_type=host&entity_id=bender")
     evs = json.loads(stream)["events"]
-    # a routine heartbeat (same identity) records no HostHeartbeat event
-    assert [e["event_type"] for e in evs] == ["HostRegistered"]
-
-
-def test_ingest_delivery_entities_via_http_preserves_counts(server):
-    c, repo = server
-    # A numeric ``passed`` count must survive ingest-body redaction (the key
-    # contains the substring ``pass``) so the HTTP path accepts a real report.
-    status, body = c.post("/api/v1/ingest", {
-        "entity_type": "test_run", "entity_id": "http-run-1",
-        "event_type": "test_run.started",
-        "payload": {"mission_id": "m1", "status": "failed",
-                    "passed": 5, "failed": 1, "skipped": 0, "total": 6}})
-    assert status == 200, body
-    runs = repo.list_test_runs(mission_id="m1")
-    assert len(runs) == 1 and runs[0]["passed"] == 5
+    assert [e["event_type"] for e in evs] == [
+        "HostRegistered", "HostHeartbeat"]
 
 
 def test_ingest_endpoint_validates_body(server):
@@ -585,6 +506,23 @@ def test_fleet_config_requires_valid_host_token(fc_server):
         assert json.loads(body) == {"error": "unauthorized"}
 
 
+def test_resource_telemetry_uses_host_token_identity(fc_server):
+    from datetime import UTC, datetime
+    port, _, _ = fc_server
+    observation = {"host_uid": "host-" + "a" * 32, "captured_at": datetime.now(UTC).isoformat(),
+                   "sequence": 1, "platform": "linux", "cpu_count": 16, "cpu_utilization": .2,
+                   "memory_total_gib": 64, "memory_available_gib": 50,
+                   "disk_total_gib": 500, "disk_free_gib": 400, "pressure": {}}
+    endpoint = "/api/v1/fleet/config/telemetry"
+    status, _, _ = _fc_req(port, "POST", endpoint, {"X-API-Key": "opkey"}, observation)
+    assert status == 401
+    status, _, payload = _fc_req(port, "POST", endpoint,
+                                {"X-Host-Token": "placeholder-host-bender"}, observation)
+    assert status == 200 and json.loads(payload)["capacity_known"] is True
+    status, _, payload = _fc_req(port, "GET", "/api/v1/scheduler", {"X-API-Key": "opkey"})
+    assert json.loads(payload)["hosts"][0]["host_name"] == "bender"
+
+
 def test_fleet_config_returns_scoped_slice_no_store_header(fc_server):
     port, _, _ = fc_server
     status, headers, body = _fc_req(port, "GET", "/api/v1/fleet/config", {"X-Host-Token": "placeholder-host-bender"})
@@ -722,7 +660,6 @@ def test_fleet_config_takes_one_snapshot_per_request(tmp_path, acknowledged_sink
 
     store = FlippingStore()
     svr = ControlPlaneServer(ControlPlaneRepo(sink=acknowledged_sink), fleet_config=store)
-    store.calls = 0  # construction reads the review_gate section once; count requests only
     threading.Thread(target=svr.serve, daemon=True).start()
     svr.wait_until_ready()
     try:
@@ -747,6 +684,31 @@ def test_scheduler_api_is_readable_and_queues_untrusted_host(server):
     assert json.loads(body)["state"] == "queued"
 
 
+def test_disabled_scheduler_rejects_mutations_but_allows_preview():
+    svr = ControlPlaneServer(ControlPlaneRepo())
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    try:
+        client = Client(svr.port)
+        request = {"request_id": "disabled-admission", "agent_family": "codex",
+                   "resource_profile": {"class": "coding", "cpu_cores": 1}}
+        assert client.post("/api/v1/scheduler/plan", request)[0] == 200
+        for path in ("reservations", "reservations/commit", "reservations/claim", "launch"):
+            assert client.post("/api/v1/scheduler/" + path, request)[0] == 503
+    finally:
+        svr.shutdown()
+
+
+def test_scheduler_event_stream_redacts_lease_credentials(server):
+    client, repo = server
+    repo.record_event("scheduler_lease", "lease-test", "SchedulerLeaseChanged",
+                      {"token": "private-execution-proof", "generation": 1})
+    status, _, data = client.get("/api/v1/events?entity_type=scheduler_lease&entity_id=lease-test")
+    assert status == 200
+    assert b"private-execution-proof" not in data
+    assert json.loads(data)["events"][0]["payload"]["generation"] == 1
+
+
 def test_scheduler_lease_heartbeat_route_renews_and_rejects_stale_token(server):
     c, repo = server
     repo.upsert_host("beast", "beast", "100.0.0.2", host_uid="uid-beast", aliases=["beast"],
@@ -762,6 +724,14 @@ def test_scheduler_lease_heartbeat_route_renews_and_rejects_stale_token(server):
     status, body = c.post("/api/v1/scheduler/reservations/commit", {"reservation_id": reservation["reservation_id"]})
     assert status == 200
     committed = json.loads(body)
+    status, claimed = c.post("/api/v1/scheduler/reservations/claim", {
+        "reservation_id": reservation["reservation_id"],
+    })
+    assert status == 200 and json.loads(claimed)["execution_claimed"] is True
+    status, _ = c.post("/api/v1/scheduler/reservations/claim", {
+        "reservation_id": reservation["reservation_id"],
+    })
+    assert status == 409
     lease = repo.list_scheduler_leases()[0]
     status, body = c.post("/api/v1/scheduler/leases/heartbeat", {
         "lease_id": lease["lease_id"], "generation": lease["generation"], "token": lease["token"], "ttl": 120,

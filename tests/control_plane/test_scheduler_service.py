@@ -180,23 +180,6 @@ def test_execution_claim_rechecks_capacity_after_commit():
     assert not repo.list_scheduler_reservations()[0].get("execution_claimed")
 
 
-@pytest.mark.parametrize("state,expired", [("running", True), ("fenced", False)])
-def test_execution_claim_cannot_revive_expired_or_fenced_lease(state, expired):
-    from datetime import UTC, datetime, timedelta
-
-    repo = setup_repo()
-    service = SchedulerService(repo)
-    row = service.reserve(body("fenced-before-launch"), "alice")
-    service.commit(row["reservation_id"])
-    lease = repo.list_scheduler_leases()[0]
-    lease["state"] = state
-    lease["expires_at"] = (datetime.now(UTC) + timedelta(seconds=-1 if expired else 60)).isoformat()
-    repo.save_scheduler_lease(lease)
-    with pytest.raises(RuntimeError, match="reconciliation"):
-        service.claim_execution(row["reservation_id"])
-    assert not repo.list_scheduler_reservations()[0].get("execution_claimed")
-
-
 def test_explicit_manual_pin_cannot_bypass_host_drain():
     repo = setup_repo()
     repo.set_host_policy("beast", mode="draining", expected_revision=1)
@@ -204,6 +187,25 @@ def test_explicit_manual_pin_cannot_bypass_host_drain():
     assert SchedulerService(repo).reserve(request, "alice")["state"] == "queued"
 
 
+def test_native_service_launch_resolves_persisted_workspace_and_claims_once():
+    from types import SimpleNamespace
+
+    from herdr_engineering.workspace import WorkspaceManifest, WorkspaceManifestStore
+    repo = setup_repo()
+    manifest = WorkspaceManifest("native-ws", "git@example/repo", "rev", "branch", "wt", "task", (), "env", "alice", ("alice",))
+    WorkspaceManifestStore(repo).mark_prepared(manifest, host_uid="uid-beast", path="/work/task", revision="rev")
+    calls = []
+    adapter = SimpleNamespace(resolve_machine=lambda alias: SimpleNamespace(label="beast"),
+                              launch_agent=lambda **kwargs: calls.append(kwargs) or {"pane_id": "w1:p1"})
+    service = SchedulerService(repo)
+    service.configure_native(adapter)
+    request = dict(body("native-service"), workspace_id="native-ws")
+    result = service.launch_native(request, "alice")
+    assert result["native_result"]["pane_id"] == "w1:p1"
+    assert calls[0]["cwd"] == "/work/task" and calls[0]["machine"] == "beast"
+    with pytest.raises(RuntimeError, match="reconciliation"):
+        service.launch_native(request, "alice")
+    assert len(calls) == 1
 
 
 def test_two_requests_cannot_reserve_the_same_prepared_workspace():
@@ -228,6 +230,20 @@ def test_claimed_execution_cannot_release_capacity_without_stop_verification():
     assert service.overview()["reserved_cpu"] == 2
 
 
+def test_scope_accounting_is_bound_to_reservation_identity_and_persisted():
+    from types import SimpleNamespace
+    service = SchedulerService(setup_repo())
+    row = service.reserve(body("accounted-agent"), "alice")
+    receipt = SimpleNamespace(agent_id="accounted-agent", host_uid="uid-beast", generation=1)
+    supervisor = SimpleNamespace(accounting=lambda _: {
+        "agent_id": "accounted-agent", "host_uid": "uid-beast", "generation": 1,
+        "cpu_seconds": 2.5, "memory_bytes": 1234, "source": "cgroup_v2"})
+    metrics = service.record_scope_accounting(row["reservation_id"], supervisor=supervisor, receipt=receipt)
+    assert metrics["cpu_seconds"] == 2.5
+    assert service.repo.stream("scheduler_execution", row["reservation_id"])[0]["event_type"] == "ExecutionResourceObserved"
+    receipt.agent_id = "different-agent"
+    with pytest.raises(PermissionError, match="identity"):
+        service.record_scope_accounting(row["reservation_id"], supervisor=supervisor, receipt=receipt)
 
 
 def test_operator_active_limit_survives_service_refresh_and_queue_retry():

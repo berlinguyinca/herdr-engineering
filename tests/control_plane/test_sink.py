@@ -29,6 +29,33 @@ def fake_run(coro):
     return asyncio.run(coro)
 
 
+def test_scheduler_admission_locks_before_read_and_rolls_back_on_failure():
+    import pytest
+
+    class TransactionConn(FakeConn):
+        def __init__(self):
+            super().__init__()
+            self.commands = []
+
+        async def execute(self, sql):
+            self.commands.append(sql)
+
+        async def fetch(self, sql, *args):
+            self.commands.append("read")
+            return [{"payload": '{"request_id":"existing"}'}]
+
+    conn = TransactionConn()
+    sink = DurableEventSink(conn=conn, run=fake_run)
+    with sink.scheduler_admission() as rows:
+        assert rows == [{"request_id": "existing"}]
+        assert conn.commands == ["BEGIN", "SELECT pg_advisory_xact_lock(724965310221)", "read"]
+    assert conn.commands[-1] == "COMMIT"
+    with pytest.raises(RuntimeError):
+        with sink.scheduler_admission():
+            raise RuntimeError("injected admission failure")
+    assert conn.commands[-1] == "ROLLBACK"
+
+
 def test_sink_persists_repo_events():
     conn = FakeConn()
     sink = DurableEventSink(conn=conn, run=fake_run)
@@ -103,9 +130,7 @@ def test_required_command_receipt_propagates_database_failure_before_delivery():
     receipt = repo.send_message(sid, "hello", dispatcher=deliver)
     assert receipt["error"] == "receipt_persistence_failed"
     assert calls == []
-    # Inspect the receipt's counter without attempting a separate durable name
-    # allocation against the deliberately unavailable database.
-    assert repo.export_state()["sessions"][sid]["messages"] == 0
+    assert repo.get_session(sid)["messages"] == 0
 
 
 def test_sink_reconnects_a_closed_database_connection(monkeypatch):

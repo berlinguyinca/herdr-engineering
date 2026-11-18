@@ -87,6 +87,34 @@ def test_unreachable_structured_error():
         a.list_machines()
 
 
+@pytest.mark.parametrize("family,kind", [("pi", "pi"), ("claude-code", "claude"), ("codex", "codex")])
+def test_native_launch_uses_real_workspace_and_agent_start_commands(family, kind):
+    class LauncherRunner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, args, timeout=30):
+            self.calls.append(args)
+            if "workspace" in args:
+                return json.dumps({"ok": True, "result": {"root_pane": {"pane_id": "w1:p1"}}})
+            return json.dumps({"ok": True, "result": {"ready": True}})
+    runner = LauncherRunner()
+    result = NativeHerdrAdapter(runner=runner).launch_agent(
+        name="task-1", family=family, cwd="/work/prepared", machine="beast")
+    assert result["pane_id"] == "w1:p1"
+    assert runner.calls == [
+        ["--machine", "beast", "workspace", "create", "--cwd", "/work/prepared", "--label", "task-1", "--no-focus"],
+        ["--machine", "beast", "agent", "start", "task-1", "--kind", kind, "--pane", "w1:p1"],
+    ]
+
+
+def test_native_worktree_uses_installed_create_contract():
+    runner = FakeRunner()
+    NativeHerdrAdapter(runner=runner).create_worktree("/work/task", "task", machine="beast", cwd="/work/repo", revision="abc")
+    assert runner.calls[-1] == ["--machine", "beast", "worktree", "create", "--path", "/work/task",
+                                "--branch", "task", "--no-focus", "--cwd", "/work/repo", "--base", "abc"]
+
+
 class NativeRunner:
     def __init__(self):
         self.calls = []

@@ -12,6 +12,7 @@ supported; otherwise the adapter records the raw text behind a capability.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -298,9 +299,39 @@ class NativeHerdrAdapter:
         except Exception:
             raise UnsupportedError("worktree list not supported by this Herdr version")
 
-    def create_worktree(self, path: str, branch: str) -> dict[str, Any]:
-        out = self._run(["worktree", "add", path, "-b", branch])
+    def create_worktree(self, path: str, branch: str, *, machine=None, session=None,
+                        cwd=None, revision=None) -> dict[str, Any]:
+        args = self._routing(machine, session) + ["worktree", "create", "--path", path,
+                                                 "--branch", branch, "--no-focus"]
+        if cwd is not None:
+            args += ["--cwd", cwd]
+        if revision is not None:
+            args += ["--base", revision]
+        out = self._run(args)
         return {"path": path, "branch": branch, "output": out}
+
+    def launch_agent(self, *, name: str, family: str, cwd: str, machine=None, session=None):
+        kinds = {"pi": "pi", "claude-code": "claude", "codex": "codex"}
+        if family not in kinds:
+            raise InvalidError("unsupported native agent family")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
+            raise InvalidError("invalid native agent name")
+        if not isinstance(cwd, str) or not cwd.startswith("/") or any(char in cwd for char in "\x00\r\n"):
+            raise InvalidError("native launch requires an absolute prepared workspace path")
+        routing = self._routing(machine, session)
+        workspace = self._run_json(routing + ["workspace", "create", "--cwd", cwd,
+                                               "--label", name, "--no-focus"])
+        if not isinstance(workspace, dict) or workspace.get("ok") is False:
+            raise InvalidError("native workspace creation was not acknowledged")
+        result = workspace.get("result") or {}
+        pane = (result.get("root_pane") or result.get("pane") or {}).get("pane_id")
+        if not isinstance(pane, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_.-]{0,127}", pane):
+            raise InvalidError("native workspace omitted its pane identity")
+        started = self._run_json(routing + ["agent", "start", name, "--kind", kinds[family], "--pane", pane])
+        if not isinstance(started, dict) or started.get("ok") is not True:
+            raise InvalidError("native agent start was not acknowledged; reconcile pane before retry")
+        return {"workspace": workspace, "pane_id": pane, "machine": machine,
+                "family": family, "start": started}
 
     # -- input ---------------------------------------------------------------
     def send_input(self, target: str, text: str, machine: str | None = None,

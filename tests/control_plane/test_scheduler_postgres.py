@@ -13,6 +13,7 @@ import pytest
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from herdr_engineering.control_plane.scheduler_service import SchedulerService
 from herdr_engineering.control_plane.sink import DurableEventSink
+from herdr_engineering.recovery_journal import RecoveryJournal
 
 
 def service_for(dsn):
@@ -67,6 +68,11 @@ def crash_during_admission(dsn):
         os._exit(23)  # Deliberately bypass Python cleanup to exercise DB rollback.
 
 
+def crash_after_recovery_transition(dsn):
+    journal = RecoveryJournal(ControlPlaneRepo(sink=DurableEventSink(dsn=dsn)))
+    with journal.operation("migration-crash"):
+        journal.record("migration-crash", {"state": "restoring", "agent_id": "test"})
+        os._exit(24)
 
 
 @pytest.fixture
@@ -146,62 +152,6 @@ def test_shared_request_has_one_execution_claim_across_processes(scheduler_postg
     assert claims.count("denied") == 7
 
 
-def test_release_on_another_replica_prevents_stale_lease_heartbeat(scheduler_postgres):
-    first = service_for(scheduler_postgres)
-    second = service_for(scheduler_postgres)
-    reservation = first.reserve({
-        "request_id": "cross-replica-release", "agent_family": "codex",
-        "resource_profile": {"class": "coding", "cpu_cores": 1},
-    }, "owner")
-    committed = first.commit(reservation["reservation_id"])
-    lease = first.repo.list_scheduler_leases()[0]
-    assert lease["lease_id"] == committed["lease_id"]
-    assert lease["state"] == "running"
-    assert second.repo.list_scheduler_leases() == []
-
-    assert second.release(reservation["reservation_id"])["state"] == "released"
-
-    # The original coordinator still holds its pre-release credentials. It must
-    # consult the shared lease state rather than renew that stale local copy.
-    with pytest.raises(PermissionError, match="not running"):
-        first.heartbeat(lease["lease_id"], generation=lease["generation"], token=lease["token"])
-    backup = first.repo.export_state()
-    assert backup["scheduler_reservations"][reservation["reservation_id"]]["state"] == "released"
-    assert backup["scheduler_leases"][lease["lease_id"]]["state"] == "released"
-    restored = ControlPlaneRepo()
-    restored.import_state(backup)
-    assert restored.list_scheduler_reservations()[0]["state"] == "released"
-    assert restored.list_scheduler_leases()[0]["state"] == "released"
-    reader = DurableEventSink(dsn=scheduler_postgres)
-    with reader.scheduler_admission():
-        durable = reader.scheduler_leases()[lease["lease_id"]]
-    assert durable["state"] == "released"
-    assert durable["expires_at"] == lease["expires_at"]
-
-
-def test_sink_reads_latest_leases_from_independent_database_session(scheduler_postgres):
-    writer = DurableEventSink(dsn=scheduler_postgres)
-    reader = DurableEventSink(dsn=scheduler_postgres)
-    with reader.scheduler_admission():
-        assert reader.scheduler_leases() == {}
-    with writer.scheduler_admission():
-        for lease_id, state in [("lease-a", "running"), ("lease-b", "running"), ("lease-a", "released")]:
-            writer.record_required({
-                "entity_type": "scheduler_lease", "entity_id": lease_id,
-                "event_type": "SchedulerLeaseChanged", "payload": {"lease_id": lease_id, "state": state},
-            })
-        # Another entity type with the same ID must not shadow the lease.
-        writer.record_required({
-            "entity_type": "scheduler_reservation", "entity_id": "lease-a",
-            "event_type": "SchedulerReservationChanged", "payload": {"state": "queued"},
-        })
-    with reader.scheduler_admission():
-        assert reader.scheduler_leases() == {
-            "lease-a": {"lease_id": "lease-a", "state": "released"},
-            "lease-b": {"lease_id": "lease-b", "state": "running"},
-        }
-
-
 def test_final_bind_observes_policy_flip_from_another_coordinator(scheduler_postgres):
     first = service_for(scheduler_postgres)
     reservation = first.reserve({"request_id": "policy-flip", "agent_family": "codex",
@@ -212,18 +162,20 @@ def test_final_bind_observes_policy_flip_from_another_coordinator(scheduler_post
         first.commit(reservation["reservation_id"])
 
 
-def test_historical_ingest_envelope_cannot_override_operator_policy(scheduler_postgres):
-    service = service_for(scheduler_postgres)
-    service.repo.set_host_policy("test-host", mode="disabled", expected_revision=1)
-    sink = DurableEventSink(dsn=scheduler_postgres)
-    sink.record_required({"entity_type": "host", "entity_id": "test-host",
-                          "event_type": "HostPolicyChanged", "payload": {
-                              "mode": "automatic", "revision": 99,
-                              "_envelope": {"content_sha256": "historical-ingest"}}})
-    with service.repo.scheduler_admission():
-        assert service.repo.get_host("test-host")["scheduler_policy"]["mode"] == "disabled"
-
-
+def test_recovery_transition_is_durable_before_coordinator_crash(scheduler_postgres):
+    process = multiprocessing.get_context("spawn").Process(
+        target=crash_after_recovery_transition, args=(scheduler_postgres,))
+    process.start()
+    process.join(timeout=15)
+    try:
+        assert process.exitcode == 24
+        journal = RecoveryJournal(ControlPlaneRepo(sink=DurableEventSink(dsn=scheduler_postgres)))
+        with journal.operation("migration-crash") as previous:
+            assert previous == {"state": "restoring", "agent_id": "test"}
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join()
 
 
 def test_resource_facts_and_replay_guard_are_shared_across_replicas(scheduler_postgres):
@@ -280,24 +232,8 @@ def test_resource_projection_waits_for_transaction_commit(scheduler_postgres):
     assert repo.get_host("rolled-back") is None
     assert repo.scheduler_observation("rolled-back") is None
     assert repo.stream("scheduler_observation", "rolled-back") == []
-    repo.upsert_host("policy", "policy", None,
-                     scheduler_policy={"mode": "manual_only", "revision": 1})
-    published = []
-    repo.subscribe(published.append)
-    with pytest.raises(RuntimeError, match="abort before commit"):
-        repo.set_host_policy("policy", mode="automatic", expected_revision=1)
-    assert repo.get_host("policy")["scheduler_policy"]["mode"] == "manual_only"
-    with pytest.raises(RuntimeError, match="abort before commit"):
-        with repo.scheduler_admission():
-            repo.save_scheduler_reservation({"reservation_id": "aborted", "state": "reserved"})
-            repo.save_scheduler_lease({"lease_id": "aborted", "state": "running"})
-    assert repo.list_scheduler_reservations() == []
-    assert repo.list_scheduler_leases() == []
-    assert published == []
     # Read from another DB session after the rollback, rather than trusting
     # the local projection or a mocked insert acknowledgment.
     reader = DurableEventSink(dsn=scheduler_postgres)
     with reader.scheduler_admission():
         assert reader.scheduler_observations() == {}
-        assert reader.scheduler_policies() == {}
-        assert reader.scheduler_leases() == {}

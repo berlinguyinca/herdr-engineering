@@ -1,6 +1,10 @@
 import pytest
 
-from herdr_engineering.adapter_registry import AdapterRegistry, native_machine_launcher
+from herdr_engineering.adapter_registry import (
+    AdapterRegistry,
+    native_machine_launcher,
+    register_native_families,
+)
 
 
 class FakeScheduler:
@@ -23,6 +27,9 @@ class FakeScheduler:
     def release(self, reservation_id, state="released"):
         self.released.append((reservation_id, state))
 
+    def claim_execution(self, reservation_id):
+        return {"reservation_id": reservation_id, "execution_claimed": True}
+
 
 def body(family="codex"):
     return {"request_id": "req-1", "agent_family": family, "placement_mode": "automatic",
@@ -40,13 +47,24 @@ def test_registry_routes_all_native_families_through_one_admission_boundary():
     assert result.host_uid == "host-b" and seen == [("host-b", "parent-1")]
 
 
-def test_registry_releases_commit_when_native_launcher_fails():
+def test_registry_retains_commit_when_native_launcher_outcome_is_uncertain():
     scheduler = FakeScheduler()
     registry = AdapterRegistry(scheduler)
     registry.register("pi", lambda *_: (_ for _ in ()).throw(RuntimeError("native failed")))
     with pytest.raises(RuntimeError, match="native failed"):
         registry.launch(body("pi"), "alice")
-    assert scheduler.released == [("r1", "released")]
+    assert scheduler.released == []
+
+
+def test_retry_of_committed_request_does_not_invoke_native_launcher_again():
+    scheduler = FakeScheduler()
+    scheduler.reserve = lambda *_: {"state": "committed", "reservation_id": "r1"}
+    calls = []
+    registry = AdapterRegistry(scheduler)
+    registry.register("pi", lambda *_: calls.append(True))
+    with pytest.raises(RuntimeError, match="reconciliation"):
+        registry.launch(body("pi"), "alice")
+    assert calls == []
 
 
 def test_native_launcher_resolves_saved_machine_and_forwards_safe_argv():
@@ -69,4 +87,26 @@ def test_native_launcher_resolves_saved_machine_and_forwards_safe_argv():
 def registry_request():
     from herdr_engineering.scheduler import PlacementRequest
     return PlacementRequest("native-1", "alice", "codex", "automatic", {"class": "coding"})
+
+
+def test_registered_native_families_require_destination_workspace_ownership():
+    class Adapter:
+        def __init__(self):
+            self.calls = []
+
+        def launch_agent(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"pane_id": "w1:p1"}
+    adapter = Adapter()
+    workspace = {"ready": True, "owner": "alice", "host_uid": "host-b", "path": "/prepared/task"}
+    registry = register_native_families(AdapterRegistry(FakeScheduler()), adapter,
+        resolve_host=lambda uid: {"host_uid": uid, "machine": "beast"},
+        resolve_workspace=lambda *_: workspace)
+    result = registry.launch(body("pi"), "alice")
+    assert result.native_result["pane_id"] == "w1:p1"
+    assert adapter.calls[0]["machine"] == "beast" and adapter.calls[0]["family"] == "pi"
+    workspace["owner"] = "other"
+    with pytest.raises(RuntimeError, match="ownership"):
+        registry.launch(body("codex"), "alice")
+    assert len(adapter.calls) == 1
 

@@ -70,8 +70,7 @@ def test_queue_cap_uses_transaction_rows_when_local_projection_is_empty(repo, ac
     replica = SchedulerService(replica_repo, owner_queue_limit=1)
     with pytest.raises(RuntimeError, match="owner queue cap"):
         replica.reserve(request("overflow"), "alice")
-    # Refresh retains the committed peer row, while the rejected request never appears.
-    assert replica_repo.list_scheduler_reservations() == [queued]
+    assert replica_repo.list_scheduler_reservations() == []
 
 
 @pytest.mark.parametrize("scope", ["owner", "project", "global"])

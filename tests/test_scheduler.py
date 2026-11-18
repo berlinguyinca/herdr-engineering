@@ -94,20 +94,3 @@ def test_project_budget_cannot_be_bypassed_by_another_owner():
     assert queued.state == "queued"
     assert "PROJECT_QUOTA" in queued.decision.explanations["a"]["reason_codes"]
 
-
-def test_legacy_active_reservation_requires_reconciliation_before_new_admission():
-    snapshot, capacity = host("a", cpu=100)
-    source = Scheduler(lambda: [(snapshot, capacity)])
-    row = source.reserve(request("legacy-writer")).to_dict()
-    row.pop("request_snapshot")
-    row.pop("queued_at")
-    restored = Scheduler(lambda: [(snapshot, capacity)])
-    restored.restore([row])
-    decision = restored.plan(request("new-writer"))
-    assert decision.state == "queued"
-    assert "LEGACY_CONTEXT_UNKNOWN" in decision.explanations["a"]["reason_codes"]
-    with pytest.raises(RuntimeError, match="reconciliation"):
-        restored.commit(row["reservation_id"])
-    restored.release(row["reservation_id"], state="cancelled")
-    assert restored.plan(request("after-reconciliation")).state == "planned"
-

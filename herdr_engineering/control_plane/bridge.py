@@ -18,8 +18,6 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from .envelope import ENVELOPE_ONLY_TYPES
-from .events import V2_COLUMNS
 from .service_catalog import normalize_project, normalize_source_port, track_availability
 
 
@@ -96,39 +94,19 @@ class PostgresSource(DurableSource):
             import asyncpg
             self._conn = await asyncpg.connect(self._dsn)
         conn = self._conn
-        use_cursor = callable(getattr(conn, "cursor", None)) and callable(getattr(conn, "transaction", None))
-        if use_cursor:
-            # Entity rows and the complete event log must share one snapshot.
-            # asyncpg cursors require a transaction; keep all work on our loop.
-            async with conn.transaction(isolation="repeatable_read", readonly=True):
-                return await self._fetch_snapshot(use_cursor=True)
-        # Lightweight fetch-only connections remain supported by the bridge tests.
-        return await self._fetch_snapshot(use_cursor=False)
-
-    async def _fetch_snapshot(self, *, use_cursor: bool) -> dict:
-        conn = self._conn
-        snapshot = {
+        # Do not replay the unbounded event log during web startup. The log is
+        # durable history, while the web projection is reconstructed from the
+        # current entity tables and receives new events through live ingest.
+        # Replaying millions of wide JSON rows blocks the listener and can use
+        # many gigabytes before the first health response.
+        events = []
+        return {
             "missions": [dict(r) for r in await conn.fetch("SELECT * FROM missions")],
             "sessions": [dict(r) for r in await conn.fetch("SELECT * FROM sessions")],
             "services": [dict(r) for r in await conn.fetch("SELECT * FROM services")],
             "hosts": [dict(r) for r in await conn.fetch("SELECT * FROM hosts")],
+            "events": events,
         }
-        query = f"SELECT * FROM {self._events_table} ORDER BY ingest_timestamp, sequence"
-        if use_cursor:
-            events = []
-            async for row in conn.cursor(query, prefetch=1000):
-                event = dict(row)
-                # Decode while each bounded batch is alive so the complete raw
-                # JSON text never coexists with the complete decoded replay.
-                event["payload"] = _ev_payload(event)
-                for name in ("actor", "evidence_refs"):
-                    if name in event:
-                        event[name] = _v2_value(name, event[name])
-                events.append(event)
-        else:
-            events = [dict(row) for row in await conn.fetch(query)]
-        snapshot["events"] = events
-        return snapshot
 
     def missions(self) -> list[dict]:
         return self._load()["missions"]
@@ -143,30 +121,11 @@ class PostgresSource(DurableSource):
         return self._load()["hosts"]
 
     def events(self) -> list[dict]:
-        if "events" not in self._load():
-            # load_into consumes the heavy event cache. Explicit later event
-            # reads get a fresh complete snapshot, never an empty placeholder.
-            self._cache = self._run(self._fetch_all())
-        return self._cache["events"]
-
-    def take_events(self) -> list[dict]:
-        """Transfer event-row ownership to replay; retain cheap resource reads."""
-        self.events()
-        return self._cache.pop("events")
+        return self._load()["events"]
 
 
-def _v2_value(name: str, value: Any) -> Any:
-    """Envelope v2 column from a fabric_events row (jsonb arrives as str)."""
-    if name in ("actor", "evidence_refs") and isinstance(value, str):
-        try:
-            return json.loads(value)
-        except ValueError:
-            return None
-    return value
-
-
-def _rebuild_events(rows: list[dict], *, reuse: bool = False) -> tuple[dict, list]:
-    """Fold rows into streams/order; reuse only source-owned, transferred rows."""
+def _rebuild_events(rows: list[dict]) -> tuple[dict, list]:
+    """Fold fabric_events rows into repo's {stream: [event]} + chronological order."""
     streams: dict = {}
     order: list = []
     for row in rows:
@@ -176,7 +135,7 @@ def _rebuild_events(rows: list[dict], *, reuse: bool = False) -> tuple[dict, lis
         key = f"{etype}|{eid}"
         stream = streams.setdefault(key, [])
         seq = int(row.get("sequence", len(stream)))
-        event = {
+        stream.append({
             "event_id": row.get("event_id"),
             "schema_version": row.get("schema_version") or 1,
             "source_timestamp": _iso(row.get("source_timestamp")),
@@ -185,17 +144,9 @@ def _rebuild_events(rows: list[dict], *, reuse: bool = False) -> tuple[dict, lis
             "mission_id": row.get("mission_id"),
             "session_id": row.get("session_id"),
             "sequence": seq, "event_type": row.get("event_type"),
-            "payload": _ev_payload(row),     # asyncpg yields jsonb as str; every consumer expects a dict
-            **{name: _v2_value(name, row.get(name))
-               for name in V2_COLUMNS if row.get(name) is not None},
-        }
-        if reuse:
-            row.clear()
-            row.update(event)
-            event = row
-        stream.append(event)
-        if not (row.get("source_sequence") is not None and etype in ENVELOPE_ONLY_TYPES):
-            order.append((etype, eid, seq))
+            "payload": row.get("payload") or {},
+        })
+        order.append((etype, eid, seq))
     for stream in streams.values():
         stream.sort(key=lambda e: e["sequence"])
     return streams, order
@@ -235,19 +186,14 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
         et, eid = ev.get("entity_type"), ev.get("entity_id")
         if not et or not eid:
             continue
-        if ev.get("source_sequence") is not None and et in ENVELOPE_ONLY_TYPES:
-            continue  # envelope-only row; the handler's own events rebuild state
         ts = _iso(ev.get("source_timestamp"))
         p = _ev_payload(ev)
         etype = ev.get("event_type") or ""
         if et == "host":
             if etype == "HostPolicyChanged":
-                if "_envelope" in p:
-                    continue
-                # Policy edits are not evidence that the host is alive.
-                host = hosts.get(eid)
-                if host is not None:
-                    host["scheduler_policy"] = p
+                host = hosts.setdefault(eid, {"host_id": eid, "host_name": eid,
+                                             "status": "unknown"})
+                host["scheduler_policy"] = dict(p)
                 continue
             h = hosts.setdefault(eid, {
                 "host_id": eid, "host_name": None, "tailnet_ip": None,
@@ -264,12 +210,7 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 h["mem"] = p["mem"]
             if isinstance(p.get("inventory"), dict):
                 h["inventory"] = {**p["inventory"], "collected_at": ts}
-            for key in ("host_uid", "aliases", "platform", "scheduler_owned", "scheduler_trusted",
-                        "scheduler_policy", "scheduler_capacity"):
-                if key in p:
-                    h[key] = p[key]
-            h["status"] = "unavailable" if "unavailable" in etype.lower() else p.get("status", "healthy")
-            h["last_seen"] = ts
+            h["status"] = "unavailable" if "unavailable" in etype.lower() else "healthy"
             h["updated_at"] = ts
         elif et == "mission":
             source = p.get("source") or (eid.split(":", 1)[0] if ":" in eid else "herdr")
@@ -315,8 +256,8 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                     s[k] = p[k]
             for k in ("pane_id", "terminal_id", "herdr_session", "machine", "agent_session",
                       "revision", "interactive_ready", "launch_pending", "state_change_seq",
-                      "repository_id", "commit_sha", "worktree_id", "mission_key", "mission_source",
-                      "transcript", "parent_session_id", "name", "runtime"):
+                      "repository_id", "commit_sha", "mission_key", "mission_source",
+                      "transcript", "parent_session_id", "name"):
                 if p.get(k) is not None or (k == "commit_sha" and k in p):
                     s[k] = p[k]
             # Command receipts are transport state, never observed agent state.
@@ -335,11 +276,10 @@ def _reconstruct_from_events(streams: dict) -> tuple[dict, dict, dict, dict, dic
                 "original_filename": None, "mime_type": None,
                 "size_bytes": 0, "sha256": None, "storage_key": None,
                 "status": "available", "materializations": 0,
-                "artifact_type": "other",
                 "created_at": ts, "updated_at": ts,
             })
             for k in ("session_id", "mission_id", "mime_type", "size_bytes",
-                      "sha256", "storage_key", "artifact_type", "created_by"):
+                      "sha256", "storage_key"):
                 if p.get(k):
                     a[k] = p[k]
             if p.get("filename"):
@@ -417,9 +357,6 @@ def load_into(repo, source: DurableSource) -> dict:
     Designed for a fresh repo at server startup: replaces all structured state
     with the durable view so the API/UI read exactly what Postgres holds.
     """
-    if isinstance(source, PostgresSource):
-        # Refresh a previously consumed snapshot BEFORE reading its tables.
-        source.events()
     missions: dict = {}
     for row in source.missions():
         mid = row["mission_id"]
@@ -485,10 +422,7 @@ def load_into(repo, source: DurableSource) -> dict:
             "updated_at": _iso(row.get("updated_at") or row.get("created_at")),
         }
 
-    if isinstance(source, PostgresSource):
-        events, event_order = _rebuild_events(source.take_events(), reuse=True)
-    else:
-        events, event_order = _rebuild_events(source.events())
+    events, event_order = _rebuild_events(source.events())
 
     # Reconstruct the ingestion-managed entities from the event log so durable
     # events (the only thing the write-through sink persists) survive restart.

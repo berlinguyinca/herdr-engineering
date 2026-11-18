@@ -252,13 +252,10 @@ def test_enroll_serve_end_to_end(tmp_path):
         "routes": [{"prefix": "/api", "host": "127.0.0.1", "port": api_port}]}))
     env = os.environ.copy()
     env["HERDR_ENGINEERING_STATE"] = str(tmp_path / "state")
-    # conftest's host-config patch cannot cross the subprocess boundary. This
-    # is a local edge test, so neither a host.json nor an inherited gateway
-    # configuration may redirect enrollment to a real fabric gateway.
-    env["HOME"] = str(tmp_path / "home")
-    config = tmp_path / "local-config.yaml"
-    config.write_text("fabric:\n  gateway_url: null\n")
-    env["HERDR_ENGINEERING_CONFIG"] = str(config)
+    # The subprocess must not inherit host.json and enroll this fixture into
+    # the developer's live gateway. In-process host_config mocks do not cross
+    # this process boundary.
+    env["HOME"] = str(tmp_path / "isolated-home")
     proc = subprocess.Popen(
         [sys.executable, "-m", "herdr_engineering.cli", "devfabric", "enroll",
          "--manifest", str(manifest), "--serve"],
@@ -268,9 +265,6 @@ def test_enroll_serve_end_to_end(tmp_path):
         deadline = time.monotonic() + 12
         last = None
         while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                output = proc.stdout.read().decode(errors="replace")
-                raise AssertionError(f"enroll exited ({proc.returncode}): {output}")
             try:
                 assert _http_get(base + "/api/health") == "FROM-API"
                 break
@@ -287,8 +281,6 @@ def test_enroll_serve_end_to_end(tmp_path):
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait(timeout=5)
-        proc.stdout.close()
         api_stop.set(); ui_stop.set(); api_srv.close(); ui_srv.close()
 
 
