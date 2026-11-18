@@ -4,7 +4,7 @@
 
 **Goal:** One adapter per harness (Claude Code, Codex, Pi, OpenCode) that reads context use and window, builds the typed drain order, detects an input-ready session, and exits it cleanly.
 
-**Architecture:** New package `herdr_engineering/handoff_adapters/` with a `HarnessAdapter` protocol (see the index's Cross-plan interfaces) and four implementations. Each reads the harness's own session record; nothing is inferred from a model name. Where a capability is unverified, a verification task measures it from real records and the adapter returns `None` rather than guessing.
+**Architecture:** New package `herdr_engineering/handoff_adapters/` with a `HarnessAdapter` protocol (see the index's Cross-plan interfaces) and four implementations. Each reads the harness's own session record; nothing is inferred from a model name. Where a capability is unverified, a verification task measures it from real records. The context *window* is the one exception to never-guess (user rule: every session, every harness, non-negotiable): when no recorded window field exists, the adapter uses `herdr_engineering/handoff_adapters/windows.py` `MODEL_WINDOWS` (model id → window, seeded from autospec_context_monitor's MODEL_MAX) and, for an unknown model, `FALLBACK_WINDOW = 128_000` (smallest common window, so it hands off early, never late). The `ContextReading` carries `window_source: Literal['recorded','model_table','fallback']`.
 
 **Tech Stack:** Python 3.13 standard library (`json`, `sqlite3` read-only, `pathlib`), pytest. Real record fixtures copied from real sessions (redacted), no mocks.
 
@@ -79,7 +79,7 @@
 
 **Interfaces:** Produces `class PiAdapter(HarnessAdapter)`.
 
-- [ ] **Step 1: Write failing tests**: `test_read_context_uses_last_message_usage_total_tokens` (messages carry `usage.totalTokens`, verified in a real record), `test_none_without_window` (the window source is unverified; with none found the adapter returns `None`), `test_locate_by_session_uuid`.
+- [ ] **Step 1: Write failing tests**: `test_read_context_uses_last_message_usage_total_tokens` (messages carry `usage.totalTokens`, verified in a real record), `test_window_from_model_table_when_unrecorded` and `test_unknown_model_uses_fallback_window` (window_source `model_table` / `fallback`, never None), `test_locate_by_session_uuid`.
 - [ ] **Step 2: Run**; expect FAIL.
 - [ ] **Step 3: Implement.** Window source comes from Task 6; Pi also exposes `contextHandoffTrigger` in pi-engineering (per `docs/operations/handoff-auto-triggers.md`), which is consulted only if it reports the window.
 - [ ] **Step 4: Run**; PASS. **Step 5: Commit** `feat(handoff): Pi adapter`.
@@ -101,7 +101,7 @@
 
 - [ ] **Step 1: Measure.** Write `scripts/measure_harness_windows.py` that, for each harness, scans its own session records and prints where a window or a model's limit appears (Claude: transcript fields and the statusline JSON; Pi: `~/.pi/agent/` config and records; OpenCode: `opencode.db` tables `session`, `session_context_epoch`, provider config; Codex: confirm `model_context_window` and whether `last_token_usage` drops after a compaction).
 - [ ] **Step 2: Run it** and paste the real output for each harness into the capabilities doc. Expected: a documented source for each window, or an explicit "none found".
-- [ ] **Step 3: Wire** each adapter's window source to the measured field. A harness with none returns `None` from `read_context`; plan 3 then skips the trigger and reports `handoff.skipped` with reason `no_window`. Add a test per harness `test_read_context_window_matches_recorded_field`.
+- [ ] **Step 3: Wire** each adapter's window source to the measured field. A harness with no recorded window uses `MODEL_WINDOWS` then `FALLBACK_WINDOW`; `read_context` never returns None because of a missing window (only for no usage yet). Add a test per harness `test_read_context_window_matches_recorded_field`.
 - [ ] **Step 4: Run** `pytest tests/test_handoff_adapters_*.py -v`; PASS. **Step 5: Commit** `docs(handoff): measured context window sources per harness`.
 
 ### Task 7: Verify idle/prompt detection and clean exit per harness in real Herdr panes
