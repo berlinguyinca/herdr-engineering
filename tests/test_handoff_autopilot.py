@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -652,8 +653,13 @@ def test_the_installer_arms_automatic_handoffs_by_default() -> None:
         "the opt-out must be discoverable from `install.sh --help`"
     )
     assert '"$PY" -m herdr_engineering.cli handoff autopilot install' in text
+    # The managed workflow hooks write the same settings.json; the autopilot installs after them
+    # and only ever rewrites its own hook group, so the order is pinned here.
+    assert text.index("# --- 7c.") < text.index("# --- 7d."), (
+        "the autopilot must install after `workflow install`, not before it"
+    )
     # A step that can fail must not take the whole installer down with it (`set -euo pipefail`).
-    step = text.split("# --- 7c.", 1)[1].split("# --- 8.", 1)[0]
+    step = text.split("# --- 7d.", 1)[1].split("# --- 8.", 1)[0]
     assert "|| warn" in step, "a failed trigger install must warn, not abort the installer"
     syntax = subprocess.run(
         ["bash", "-n", str(INSTALL_SH)], capture_output=True, text=True, timeout=60
@@ -718,3 +724,129 @@ def test_the_trigger_can_be_type_checked_against_the_pi_it_runs_on() -> None:
     assert scripts.get("typecheck:handoff-autopilot") == (
         "tsc -p herdr_engineering/extension_data/tsconfig.json"
     )
+
+
+def test_the_autopilot_and_the_managed_workflow_hooks_share_settings_json(host: dict) -> None:
+    """`install.sh` writes ~/.claude/settings.json twice: workflow hooks (7c), then the autopilot (7d).
+
+    Both installers own a `PreCompact` entry in the same file, so each has to treat the other's
+    group as foreign. Nothing proves that today except this test: the two installers were written
+    in separate PRs, and the second one running first is exactly how a hook disappears.
+    """
+    claude_dir = host["home"] / ".claude"
+    claude_dir.mkdir()
+    settings = claude_dir / "settings.json"
+
+    workflow = _cli(["workflow", "install"], host["env"], host["work"])
+    assert workflow.returncode == 0, workflow.stderr
+    assert ha.HOOK_MARKER not in settings.read_text(), "the autopilot arrived before it was asked"
+
+    autopilot = _cli(["handoff", "autopilot", "install"], host["env"], host["work"])
+    assert autopilot.returncode == 0, autopilot.stderr
+    text = settings.read_text()
+    assert ha.HOOK_MARKER in text and "herdr-workflow:managed" in text, text
+
+    hooks = json.loads(text)["hooks"]
+    events = {event: [entry for group in groups for entry in group.get("hooks", [])]
+              for event, groups in hooks.items()}
+    managed = {event: commands
+               for event, entries in events.items()
+               if (commands := [c["command"] for c in entries if "herdr-workflow:managed" in c["command"]])}
+    ours = {event: commands
+            for event, entries in events.items()
+            if (commands := [c["command"] for c in entries if ha.HOOK_MARKER in c["command"]])}
+    assert sorted(managed) == ["PreCompact", "SessionStart"], sorted(managed)
+    assert sorted(ours) == ["PreCompact", "Stop"], sorted(ours)
+    # Both PreCompact hooks are still in the same event list, in the order Claude runs them.
+    assert len(events["PreCompact"]) == 2, events["PreCompact"]
+
+    # Removing the autopilot must leave the workflow hooks exactly where they were.
+    before = json.dumps(json.loads(settings.read_text())["hooks"]["SessionStart"], sort_keys=True)
+    removed = _cli(["handoff", "autopilot", "uninstall"], host["env"], host["work"])
+    assert removed.returncode == 0, removed.stderr
+    after_text = settings.read_text()
+    assert ha.HOOK_MARKER not in after_text, "the autopilot removed more than it owns"
+    assert "herdr-workflow:managed" in after_text
+    after = json.loads(after_text)["hooks"]
+    assert json.dumps(after["SessionStart"], sort_keys=True) == before
+    assert [c["command"] for group in after["PreCompact"] for c in group.get("hooks", [])] == managed["PreCompact"]
+
+    # ... and the other way round: re-arming the autopilot then dropping the workflow hooks.
+    assert _cli(["handoff", "autopilot", "install"], host["env"], host["work"]).returncode == 0
+    assert _cli(["workflow", "uninstall"], host["env"], host["work"]).returncode == 0
+    final = json.loads(settings.read_text())["hooks"]
+    assert "SessionStart" not in final, list(final)
+    assert [c["command"] for group in final["PreCompact"] for c in group.get("hooks", [])] and all(
+        ha.HOOK_MARKER in c["command"] for c in final["PreCompact"][0]["hooks"]
+    ), "the autopilot's PreCompact hook was taken with the workflow hooks"
+    assert any(ha.HOOK_MARKER in c["command"] for group in final["Stop"] for c in group.get("hooks", []))
+
+
+def test_the_claude_hook_command_survives_a_missing_cli(host: dict) -> None:
+    """A hook whose binary is gone must not turn every turn into a hook error.
+
+    Claude Code treats a non-zero hook exit as a failure it reports to the session, and a
+    CLI that was uninstalled, or a venv that moved, makes the command exit 127. The command
+    is written guarded - the same shape the managed workflow hooks use - so a missing
+    `herdr-eng` is silence, not an error on every Stop and PreCompact.
+    """
+    (host["home"] / ".claude").mkdir()
+    assert _cli(["handoff", "autopilot", "install"], host["env"], host["work"]).returncode == 0
+    settings = json.loads((host["home"] / ".claude" / "settings.json").read_text())
+    commands = [hook["command"] for group in settings["hooks"]["Stop"] for hook in group["hooks"]
+                if ha.HOOK_MARKER in hook["command"]]
+    assert len(commands) == 1, commands
+    command = commands[0]
+    assert command.startswith("[ -x "), command
+    assert command.rstrip().endswith("|| true"), command
+
+    # And it really is silence: run the guarded command with the binary removed.
+    binary = shlex.split(command)[2]           # [ -x <binary> ] && <binary> handoff ...
+    assert shlex.split(command)[5] == binary, shlex.split(command)
+    missing = str(Path(binary).parent / "definitely-not-here")
+    probe = subprocess.run(
+        ["bash", "-c", command.replace(f'"{binary}"', f'"{missing}"'), json.dumps(
+            {"hook_event_name": "Stop", "session_id": "s-guard", "transcript_path": "/nope.jsonl"})],
+        capture_output=True, text=True, timeout=60, env=host["env"],
+    )
+    assert probe.returncode == 0 and probe.stdout.strip() == "", (probe.returncode, probe.stdout, probe.stderr)
+
+
+def test_a_session_the_context_hook_already_warned_is_not_told_again(host: dict) -> None:
+    """`handoff context-hook claude` (opt-in, UserPromptSubmit) warns at half the window.
+
+    It keeps its own marker file in a different state directory, so the autopilot's
+    per-session budget never saw it: with both installed a session got one instruction
+    from each, which is the nagging the budget exists to prevent. The autopilot honours
+    the other mechanism's marker; a marker root that is not a directory is not a reason
+    to stall the decision.
+    """
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
+    markers = host["tmp"] / "hero-state"
+    host["env"]["HERDR_ENGINEERING_STATE"] = str(markers)
+
+    def check(session: str) -> dict:
+        result = _cli(
+            ["handoff", "autopilot", "check", "--harness", "claude", "--session-id", session,
+             "--tokens", "185000", "--context-window", "200000", "--json"],
+            host["env"], host["work"],
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return json.loads(result.stdout)
+
+    assert check("session-a")["code"] == "context_is_full"
+
+    # The context hook got there first, on the same session.
+    (markers / "handoff-context").mkdir(parents=True)
+    (markers / "handoff-context" / "session-a.fired").write_text("")
+    warned = check("session-a")
+    assert warned["code"] == "already_triggered", warned
+    assert warned["trigger"] is False
+    assert not (host["state"] / "handoff-autopilot.json").exists(), "a warning is not a trigger"
+
+    # Another session is still told, and an unreadable marker root never blocks the decision.
+    assert check("session-b")["code"] == "context_is_full"
+    blocked = host["tmp"] / "blocked"
+    blocked.write_text("not a directory")
+    host["env"]["HERDR_ENGINEERING_STATE"] = str(blocked / "handoff-context")
+    assert check("session-c")["code"] == "context_is_full"

@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import shutil
 import sys
 from collections.abc import Iterable
@@ -321,6 +323,13 @@ def decide(
             "below_threshold",
             f"context at {used:.0f}% is below the {threshold:.0f}% handoff threshold",
         )
+    if _context_hook_warned(session_id):
+        return Decision(
+            False,
+            "already_triggered",
+            f"{session_id} was already told to hand off by `handoff context-hook claude` "
+            "(the opt-in UserPromptSubmit trigger); this session will not be told twice",
+        )
     entries = (ledger if ledger is not None else read_ledger(home=home)).get("sessions", {})
     count = int((entries.get(session_id) or {}).get("count", 0))
     if count >= active_policy.max_per_session:
@@ -586,16 +595,43 @@ def hook(
 
 
 def _cli_command() -> str:
-    """The stable command line the Claude hook runs (quote-aware, one fixed form)."""
+    """The stable command line the Claude hook runs, guarded against a missing CLI.
+
+    Claude Code reports a non-zero hook exit to the session, so an uninstalled CLI or a moved
+    venv would turn every Stop and PreCompact into a hook error (exit 127). The `[ -x ... ] &&
+    ... || true` wrapper - the same shape the managed workflow hooks write - makes a missing
+    binary silence instead. One fixed form so install is idempotent and `status` can compare it.
+    """
     arguments = ["handoff", "autopilot", "hook", "--harness", "claude", "--record", "--json"]
     override = os.environ.get("HERDR_ENG_BIN", "").strip()
     if override:
-        extra = json.loads(os.environ.get("HERDR_ENG_ARGS") or "[]")
-        return " ".join([f'"{override}"', *[str(a) for a in extra], *arguments])
-    found = shutil.which("herdr-eng")
-    if found:
-        return " ".join([f'"{found}"', *arguments])
-    return " ".join([f'"{sys.executable}"', "-m", "herdr_engineering.cli", *arguments])
+        binary = override
+        prefix = [str(a) for a in json.loads(os.environ.get("HERDR_ENG_ARGS") or "[]")]
+    elif (found := shutil.which("herdr-eng")):
+        binary, prefix = found, []
+    else:
+        binary, prefix = sys.executable, ["-m", "herdr_engineering.cli"]
+    run = " ".join([shlex.quote(binary), *prefix, *arguments])
+    return f"[ -x {shlex.quote(binary)} ] && {run} || true"
+
+
+def _context_hook_warned(session_id: str) -> bool:
+    """Whether the opt-in `handoff context-hook claude` trigger already told this session.
+
+    That trigger keeps its own per-session marker under `$HERDR_ENGINEERING_STATE/handoff-context`
+    (default `~/.local/share/herdr-engineering/state`), outside this module's ledger. Without this
+    check a session with both installed is told twice - once at half the window, once at the
+    configured threshold - which is the nagging `max_per_session` exists to prevent. A marker root
+    that is not a directory is read as "not warned": the decision must still be made.
+    """
+    root = os.environ.get("HERDR_ENGINEERING_STATE") or str(
+        Path.home() / ".local/share/herdr-engineering/state"
+    )
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id)[:128]
+    try:
+        return (Path(root) / "handoff-context" / f"{safe}.fired").is_file()
+    except OSError:
+        return False
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:

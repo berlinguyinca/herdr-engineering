@@ -5,7 +5,7 @@ context limit, the machine hands it to a fresh pane by itself — before the har
 summarizer replaces the conversation with a lossy recap.
 
 ```bash
-scripts/install.sh                       # arms it (step 7c); re-running is idempotent
+scripts/install.sh                       # arms it (step 7d); re-running is idempotent
 herdr-eng handoff autopilot status       # policy, what is installed, what has fired
 herdr-eng handoff autopilot install      # arm it on a machine that was installed earlier
 herdr-eng handoff autopilot uninstall    # remove both triggers; the audit ledger is kept
@@ -15,6 +15,30 @@ herdr-eng doctor                         # handoff-autopilot: ok | warn | skip |
 Installing is safe on a machine with existing hooks: Claude Code entries are written only
 inside groups the autopilot wrote itself, so foreign hooks in `~/.claude/settings.json` are
 kept, and `uninstall` removes only what it added.
+
+## What is not automatic
+
+Publishing is not automatic. A trigger tells the agent to run the handoff skill; the skill
+creates a private handoff, opens a pane, and takes over a branch and a worktree. Nothing here
+shares an artifact, publishes a report, opens a pull request against a protected branch, or
+touches `main`. Those stay human-approved publication actions, exactly as they were before the
+triggers existed — see [Handoffs](operations/handoff.md).
+
+Two other triggers write to the same `~/.claude/settings.json`, and they are separate installs:
+
+| Trigger | Installed by | Fires on | What it does |
+|---|---|---|---|
+| `handoff autopilot install` (this page) | `install.sh`, default on | Pi `turn_end`; Claude `Stop`, `PreCompact` | tells the agent to run the handoff skill, once per session, after subagents drain |
+| `workflow install` | `install.sh`, default on | Claude `SessionStart`, `PreCompact` | reminds the agent of the engineering defaults, and of `/handoff` before compaction; starts nothing |
+| `handoff context-hook claude` | never; paste the block into `~/.claude/settings.json` | Claude `UserPromptSubmit` | advises at half the window (default), once per session |
+
+Each installer owns its own marker, so installing one never rewrites or removes another's hook
+group, and `install.sh` runs the workflow hooks (7c) before the autopilot (7d). A session warned
+by the opt-in `context-hook` is not told again by the autopilot: `decide()` reads that trigger's
+`$HERDR_ENGINEERING_STATE/handoff-context/<session>.fired` marker before spending its own
+per-session budget. The reverse is not true — the `context-hook` does not read the autopilot's
+ledger, so a session already told at the threshold can still get the earlier advice on its next
+prompt. `docs/operations/workflow-hooks.md` covers the workflow reminder.
 
 ## What is installed
 
