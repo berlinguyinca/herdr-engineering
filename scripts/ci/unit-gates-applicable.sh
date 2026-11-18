@@ -17,17 +17,42 @@
 # worse than no guard: it turns a routing bug into a silent green.
 set -euo pipefail
 
-# Covered paths: anything that can change what the suite proves. Deliberately a prefix match on directories, so a new module under
-# herdr_engineering/ or a new test file is covered without editing this list.
-COVERED_PREFIXES='herdr_engineering/
+# One decision, two gates. `unit-gates-applicable.sh [unit|ui]` (default unit) selects which gate's covered paths are asked about;
+# the ui-gates pipeline (.woodpecker/ui-gates.yml) had the same never-reports problem and uses `ui`. An unknown gate is an error,
+# never a skip.
+gate="${1:-unit}"
+case "$gate" in
+  unit)
+    # Anything that can change what the suite proves. Deliberately a prefix match on directories, so a new module under
+    # herdr_engineering/ or a new test file is covered without editing this list.
+    COVERED_PREFIXES='herdr_engineering/
 tests/
 packages/
 scripts/ci/
 deploy/
 lock/'
-COVERED_FILES='pyproject.toml
+    COVERED_FILES='pyproject.toml
 .woodpecker/unit-gates.yml
 .woodpecker/main-cron.yml'
+    ;;
+  ui)
+    # Anything that can change the browser gates' result: the old `when: path: include` list of ui-gates.yml, plus the routing
+    # config and this script, which decide whether the gate runs at all.
+    COVERED_PREFIXES='packages/
+tests/playwright/
+tests/visual/
+docs/assets/screenshots/
+herdr_engineering/control_plane/'
+    COVERED_FILES='scripts/ci/ui-gates.sh
+scripts/ci-pipeline-freshness.sh
+package.json
+package-lock.json
+.woodpecker/ui-gates.yml
+scripts/ci/unit-gates-applicable.sh'
+    ;;
+  *) echo "applicability: unknown gate '${gate}' (expected unit or ui)" >&2; exit 2 ;;
+esac
+label="${gate}-gates"
 
 herdr_covered_path() {
   local path="$path"
@@ -47,7 +72,7 @@ herdr_covered_path() {
 # someone asking for the suite by name. With no CI environment at all (a local run) the same question is asked against origin/main.
 case "${CI_EVENT:-}" in
   pull_request|'') ;;
-  *) echo "unit-gates applicability: event '${CI_EVENT}' always runs the suite"; exit 0 ;;
+  *) echo "${label} applicability: event '${CI_EVENT}' always runs the suite"; exit 0 ;;
 esac
 
 base_ref="${HERDR_APPLICABILITY_BASE:-origin/${CI_TARGET_BRANCH:-main}}"
@@ -58,27 +83,27 @@ git rev-parse --verify -q "$base_ref" >/dev/null || git fetch -q --no-tags origi
   "+refs/heads/${CI_TARGET_BRANCH:-main}:${base_ref}" 2>/dev/null || true
 merge_base="$(git merge-base "$base_ref" "$head_ref" 2>/dev/null || true)"
 if [ -z "$merge_base" ]; then
-  echo "unit-gates applicability: no merge base against ${base_ref}; running the suite (fail open)" >&2
+  echo "${label} applicability: no merge base against ${base_ref}; running the suite (fail open)" >&2
   exit 0
 fi
 
 changed="$(git diff --name-only "$merge_base" "$head_ref" 2>/dev/null)" || {
-  echo "unit-gates applicability: could not diff ${merge_base}..${head_ref}; running the suite (fail open)" >&2
+  echo "${label} applicability: could not diff ${merge_base}..${head_ref}; running the suite (fail open)" >&2
   exit 0
 }
 
 if [ -z "$changed" ]; then
-  echo "unit-gates applicability: ${head_ref} is identical to the merge base; nothing to prove"
+  echo "${label} applicability: ${head_ref} is identical to the merge base; nothing to prove"
   exit 3
 fi
 
 while IFS= read -r path; do
   [ -n "$path" ] || continue
   if herdr_covered_path "$path"; then
-    echo "unit-gates applicability: '${path}' is covered; running the suite"
+    echo "${label} applicability: '${path}' is covered; running the suite"
     exit 0
   fi
 done <<< "$changed"
 
-echo "unit-gates applicability: no covered path in $(echo "$changed" | grep -c .) changed file(s); skipping the suite"
+echo "${label} applicability: no covered path in $(echo "$changed" | grep -c .) changed file(s); skipping the suite"
 exit 3

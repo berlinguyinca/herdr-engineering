@@ -22,6 +22,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 APPLICABLE = ROOT / "scripts" / "ci" / "unit-gates-applicable.sh"
 CRON = ROOT / "scripts" / "ci" / "main-cron-gates.sh"
+UI_GATES_YML = (ROOT / ".woodpecker" / "ui-gates.yml").read_text()
 UNIT_GATES_YML = (ROOT / ".woodpecker" / "unit-gates.yml").read_text()
 CRON_YML = (ROOT / ".woodpecker" / "main-cron.yml").read_text()
 
@@ -68,10 +69,12 @@ def change(repo: Path, path: str, branch: str = "feature") -> str:
     return git(repo, "rev-parse", "HEAD")
 
 
-def applicability(repo: Path, sha: str, event: str = "pull_request", base: str = "main") -> subprocess.CompletedProcess[str]:
+def applicability(repo: Path, sha: str, event: str = "pull_request", base: str = "main",
+                  gate: str | None = None) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "CI_EVENT": event, "CI_COMMIT_SHA": sha, "CI_TARGET_BRANCH": "main",
            "HERDR_APPLICABILITY_BASE": base}
-    return subprocess.run(["bash", str(APPLICABLE)], cwd=repo, env=env, capture_output=True, text=True)
+    args = ["bash", str(APPLICABLE), *([gate] if gate else [])]
+    return subprocess.run(args, cwd=repo, env=env, capture_output=True, text=True)
 
 
 # ------------------------------------------------------------------ applicability: what must run ------------------------------------
@@ -265,3 +268,78 @@ def test_both_scripts_are_valid_bash():
     for script in (APPLICABLE, CRON):
         out = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
         assert out.returncode == 0, f"{script.name}: {out.stderr}"
+
+
+# ------------------------------------------------------------------ ui-gates: the same decision, a different path list -----------
+
+@pytest.mark.parametrize("path", [
+    "packages/herdr-web-client/app.js",
+    "tests/playwright/ui-gates-lib.mjs",
+    "tests/visual/baseline.png",
+    "docs/assets/screenshots/home.png",
+    "scripts/ci/ui-gates.sh",
+    "scripts/ci-pipeline-freshness.sh",
+    "package.json",
+    "package-lock.json",
+    "herdr_engineering/control_plane/server.py",
+    ".woodpecker/ui-gates.yml",              # the routing config
+    "scripts/ci/unit-gates-applicable.sh",   # the decision itself
+])
+def test_a_change_that_can_affect_the_ui_gates_runs_them(repo, path):
+    result = applicability(repo, change(repo, path), gate="ui")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ui-gates applicability" in result.stdout and "running the" in result.stdout
+
+
+@pytest.mark.parametrize("path", [
+    "docs/operations/ci-gates.md",
+    "CHANGELOG.md",
+    "herdr_engineering/cli.py",                  # python outside control_plane: unit-gates' business, not the browser's
+    "tests/test_cli.py",
+    "scripts/ci/unit-gates.sh",
+    "docs/packages/notes.md",                    # contains a covered prefix; must not match on substring
+])
+def test_a_change_that_cannot_affect_the_ui_gates_is_skipped(repo, path):
+    result = applicability(repo, change(repo, path), gate="ui")
+    assert result.returncode == 3, (result.stdout, result.stderr)
+    assert "ui-gates applicability" in result.stdout and "skipping" in result.stdout
+
+
+def test_the_two_gates_decide_independently(repo):
+    sha = change(repo, "herdr_engineering/cli.py")
+    assert applicability(repo, sha).returncode == 0
+    assert applicability(repo, sha, gate="ui").returncode == 3
+
+
+def test_ui_gates_manual_and_push_events_always_run(repo):
+    sha = change(repo, "docs/whatever.md")
+    for event in ("manual", "push"):
+        assert applicability(repo, sha, event=event, gate="ui").returncode == 0
+
+
+def test_ui_gates_unresolvable_base_fails_open(repo):
+    result = applicability(repo, git(repo, "rev-parse", "HEAD"), base="origin/no-such-branch", gate="ui")
+    assert result.returncode == 0 and "fail open" in result.stderr
+
+
+def test_an_unknown_gate_is_an_error_not_a_skip(repo):
+    result = applicability(repo, git(repo, "rev-parse", "HEAD"), gate="nope")
+    assert result.returncode not in (0, 3)
+
+
+def test_ui_gates_is_no_longer_path_filtered():
+    """A filtered pipeline never reports, so ci/woodpecker/pr/ui-gates could never be required."""
+    triggers = yaml.safe_load(UI_GATES_YML)["when"]
+    assert [t for t in triggers if t.get("event") == "pull_request"]
+    assert [t for t in triggers if t.get("event") == "manual"], "a manual run must still run the gate"
+    offenders = [t for t in triggers if "path" in t or "include" in t]
+    assert not offenders, f"a path filter here re-creates the never-reports problem: {offenders}"
+
+
+def test_ui_gates_skip_is_reported_rather_than_silently_absent():
+    steps = {s["name"]: s for s in yaml.safe_load(UI_GATES_YML)["steps"]}
+    assert list(steps) == ["checkout", "freshness", "applicability", "ui-gates"]
+    assert "unit-gates-applicable.sh ui" in UI_GATES_YML
+    assert ".ci-ui-gates-not-applicable" in UI_GATES_YML
+    assert "nothing to run" in UI_GATES_YML, "a skipped run must say why, in the log"
+    assert "bash scripts/ci/ui-gates.sh" in UI_GATES_YML
