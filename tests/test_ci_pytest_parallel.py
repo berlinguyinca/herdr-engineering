@@ -472,12 +472,22 @@ def test_the_gate_prints_the_same_effective_quota_the_worker_count_uses(tmp_path
 # --- review nits from #824 -------------------------------------------------------------------------------------------------------
 
 
-
 def load_watcher():
     spec = importlib.util.spec_from_file_location("run_watched_under_test", WATCHER)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def started_before(pid: int, when: float) -> bool:
+    """True if the process now holding `pid` started no later than `when` (the pidfile's mtime): a pid reused after the file was
+    written belongs to a stranger and must not be killed."""
+    try:
+        start_ticks = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        boot = next(int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines() if line.startswith("btime "))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return False
+    return boot + start_ticks / os.sysconf("SC_CLK_TCK") <= when + 1.0
 
 
 def reap_pidfiles(paths: list[Path]) -> None:
@@ -487,7 +497,7 @@ def reap_pidfiles(paths: list[Path]) -> None:
             pid = int(path.read_text())
         except (OSError, ValueError):
             pid = None
-        if pid and pid > 1:
+        if pid and pid > 1 and started_before(pid, path.stat().st_mtime):
             try:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
@@ -515,6 +525,19 @@ def test_the_pidfile_fixture_kills_a_leaked_process_and_removes_the_file(tmp_pat
     pidfile.write_text(str(sleeper.pid))
     reap_pidfiles([pidfile])
     assert sleeper.wait(timeout=10) == -signal.SIGKILL and not pidfile.exists()
+    # A pidfile naming a process that started AFTER the file was written is a reused pid: leave the stranger alone.
+    stale = tmp_path / "stale"
+    stale.write_text("0")
+    stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1234)"])
+    try:
+        time.sleep(1.2)
+        stale.write_text(str(stranger.pid))
+        os.utime(stale, (time.time() - 60, time.time() - 60))
+        reap_pidfiles([stale])
+        assert stranger.poll() is None and not stale.exists()
+    finally:
+        stranger.kill()
+        stranger.wait()
     reap_pidfiles([tmp_path / "never-written"])      # a missing or empty pidfile is not an error
     (tmp_path / "empty").write_text("")
     reap_pidfiles([tmp_path / "empty"])
@@ -563,15 +586,50 @@ def test_the_group_is_not_signalled_once_the_root_is_reaped_unless_a_member_prov
     monkeypatch.setattr(mod.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
     tree.signal_all(signal.SIGTERM)
     assert calls == [], "signalled a process group whose leader was already reaped and which has no live member"
-    # A live descendant still in the group (a setsid'd root's own child) proves the group is ours.
+    # An unreaped root's group is always ours.
     live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
     try:
-        t2 = mod.Tree(live.pid, "tok")
+        t2 = mod.Tree(live.pid, "tok", live)
         t2.signal_all(signal.SIGCONT)
         assert calls == [(live.pid, signal.SIGCONT)], "an unreaped root's group must still be signalled"
     finally:
         live.kill()
         live.wait()
+
+
+def test_a_reaped_root_whose_pid_was_reused_by_an_unrelated_group_leader_is_never_group_signalled(monkeypatch) -> None:
+    mod = load_watcher()
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()                                               # reaped: returncode is set
+    stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    try:
+        tree = mod.Tree(stranger.pid, "tok", gone)            # as if the stranger had been handed the root's old pid
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(mod.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+        tree.signal_all(signal.SIGCONT)
+        assert calls == [], "signalled an unrelated process group that reused the root's pid"
+    finally:
+        stranger.kill()
+        stranger.wait()
+
+
+def test_a_reaped_root_whose_group_still_holds_a_known_member_is_group_signalled(monkeypatch) -> None:
+    mod = load_watcher()
+    root = subprocess.Popen(["sh", "-c", "sleep 60 & echo $!"], stdout=subprocess.PIPE, text=True, start_new_session=True)
+    member = int(root.stdout.readline())
+    try:
+        root.wait()                                           # the leader is reaped; its child still holds the group
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(mod.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+        tree = mod.Tree(root.pid, "tok", root)
+        tree.known[member] = mod.read_stat(member)[3] + 1     # same pid, wrong start time: not our member
+        tree.signal_all(signal.SIGCONT)
+        assert calls == []
+        tree.known[member] = mod.read_stat(member)[3]
+        tree.signal_all(signal.SIGCONT)
+        assert calls == [(root.pid, signal.SIGCONT)]
+    finally:
+        os.kill(member, signal.SIGKILL)
 
 
 def test_a_token_that_appears_in_the_environ_after_the_first_look_is_found(tmp_path: Path) -> None:
@@ -656,3 +714,23 @@ def test_a_hang_kill_sends_sigterm_first_so_the_command_can_clean_up(tmp_path: P
     # ...and a command that ignores SIGTERM is still killed after the grace.
     stubborn = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(1234)"
     assert watch("1", "2", stubborn).returncode == 124
+
+
+def test_cleanup_output_written_by_a_sigterm_handler_is_forwarded_and_does_not_stall(tmp_path: Path) -> None:
+    script = (
+        "import signal, sys, time\n"
+        "def h(*_):\n    sys.stdout.write('c' * 200000); sys.stdout.flush(); sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, h)\n"
+        "time.sleep(1234)"
+    )
+    began = time.monotonic()
+    done = watch("1", "2", script)
+    assert done.returncode == 124
+    assert done.stdout.count("c") == 200000, len(done.stdout)
+    assert time.monotonic() - began < 8, "the hang kill stalled on a full pipe until SIGKILL"
+
+
+def test_a_bad_orphan_grace_value_is_a_usage_error_and_never_starts_the_command(tmp_path: Path) -> None:
+    marker = tmp_path / "started"
+    done = watch("5", "5", f"open({str(marker)!r}, 'w').write('x')", HERDR_WATCHED_ORPHAN_GRACE="soon")
+    assert done.returncode == 2 and "Traceback" not in done.stderr and not marker.exists()

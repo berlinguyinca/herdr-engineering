@@ -50,8 +50,9 @@ def snapshot() -> dict:
 class Tree:
     """The command's process tree, accumulated across polls so reparented descendants stay known."""
 
-    def __init__(self, root: int, token: str):
+    def __init__(self, root: int, token: str, proc: "subprocess.Popen | None" = None):
         self.root = root
+        self.proc = proc        # lets us tell whether the root has been reaped (its pid is then free for reuse)
         self.token = b"HERDR_RUN_WATCHED_TOKEN=" + token.encode()
         self.known: dict[int, int] = {root: -1}   # pid -> starttime (-1 until first seen)
         self.cpu: dict[tuple[int, int], float] = {}     # (pid, starttime) -> cpu seconds: a reused pid has no history
@@ -122,22 +123,43 @@ class Tree:
                 pass
 
     def group_is_ours(self) -> bool:
-        """The root's pid is only safe to use as a pgid while it cannot have been reused: while the root is unreaped (even as a
-        zombie), or while some live process still has it as its process group (the kernel never reuses an id that is in use)."""
-        if read_stat(self.root):
+        """The root's pid is only safe to use as a pgid while it cannot have been reused: while the root is unreaped (an unreaped
+        pid is never reused), or after reaping, only if a live process of ours (a known member, same start time, not the root pid
+        itself, which may now be a stranger) still holds that group."""
+        if self.proc is not None and self.proc.returncode is None:
             return True
-        return any(st[5] == self.root and st[4] != "Z" for st in snapshot().values())
+        return any(p != self.root and st[5] == self.root and st[4] != "Z" and self.known.get(p) == st[3]
+                   for p, st in snapshot().items())
 
 
-def stop_tree(proc: subprocess.Popen, tree: Tree) -> None:
+def drain(fd: int, out: "Out", wait: float) -> bool:
+    """Forward whatever the command has written (waiting up to `wait` s for the first byte); True at EOF."""
+    while select.select([fd], [], [], wait)[0]:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return True
+        out.write(chunk)
+        wait = 0
+    return False
+
+
+def stop_tree(proc: subprocess.Popen, tree: Tree, out: "Out") -> None:
+    """SIGTERM, grace, SIGKILL; the pipe is drained throughout so a handler's cleanup output is kept and never blocks on a full pipe."""
+    fd = proc.stdout.fileno()
+    eof = False
     tree.poll()
     tree.signal_all(signal.SIGTERM)
     deadline = time.monotonic() + TERM_GRACE
     while time.monotonic() < deadline and (proc.poll() is None or any(read_stat(p) for p in tree.alive)):
-        time.sleep(0.1)
+        if eof:
+            time.sleep(0.1)
+        else:
+            eof = drain(fd, out, 0.1)
     tree.poll()
     tree.signal_all(signal.SIGKILL)
     proc.wait()
+    if not eof:
+        drain(fd, out, 0)
 
 
 class Out:
@@ -183,6 +205,11 @@ def main() -> int:
         return 2
     soft, hard, cmd = parsed
     token = f"{os.getpid()}-{time.time_ns()}"
+    try:
+        orphan_grace = float(os.environ.get("HERDR_WATCHED_ORPHAN_GRACE", "30"))     # parsed before the spawn: a bad value must not orphan it
+    except ValueError:
+        usage_error("HERDR_WATCHED_ORPHAN_GRACE must be a number of seconds")
+        return 2
     got: list[int] = []         # first signal received; the loop acts on it (nothing blocking runs in the handler)
 
     def on_signal(signum, _frame):
@@ -197,9 +224,8 @@ def main() -> int:
     except OSError as e:
         print(f"run-watched: cannot start {cmd[0]!r}: {e.strerror or e}", file=sys.stderr)
         return 127 if isinstance(e, FileNotFoundError) else 126
-    tree = Tree(proc.pid, token)
+    tree = Tree(proc.pid, token, proc)
 
-    orphan_grace = float(os.environ.get("HERDR_WATCHED_ORPHAN_GRACE", "30"))
     out = Out()
     start = last_progress = time.monotonic()
     root_exited_at = last_orphan_progress = None
@@ -246,7 +272,7 @@ def main() -> int:
                 print(f"[run-watched] no output and no CPU for {hard:g}s -- hung; killing", file=sys.stderr)
                 return 124          # the finally block stops the tree: SIGTERM, grace, SIGKILL
     finally:
-        stop_tree(proc, tree)
+        stop_tree(proc, tree, out)
 
 
 if __name__ == "__main__":
