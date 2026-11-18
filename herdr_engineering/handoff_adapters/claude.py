@@ -1,8 +1,10 @@
 """Claude Code adapter: context from the session transcript, drain and exit by typing into the pane."""
 import json
+import re
 import shutil
 import subprocess
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
@@ -17,7 +19,7 @@ _FIRST_CHUNK = 1_048_576
 
 
 def _slug(cwd: Path) -> str:
-    return str(cwd).replace("/", "-").replace(".", "-")
+    return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))  # e.g. m_/x.y -> m--x-y, as in the real ~/.claude/projects names
 
 
 def _main_chain_usage(record: object) -> tuple[int, str | None] | None:
@@ -29,7 +31,10 @@ def _main_chain_usage(record: object) -> tuple[int, str | None] | None:
     if not isinstance(usage, dict) or message.get("model") == _SYNTHETIC_MODEL:
         return None
     model = message.get("model")
-    return sum(v for k in _USAGE_KEYS if isinstance(v := usage.get(k), int)), model if isinstance(model, str) else None
+    used = sum(v for k in _USAGE_KEYS if isinstance(v := usage.get(k), int))
+    if used <= 0:
+        return None  # no usage recorded yet; never read as 0%
+    return used, model if isinstance(model, str) else None
 
 
 def _last_usage(path: Path) -> tuple[int, str | None] | None:
@@ -52,15 +57,33 @@ def _last_usage(path: Path) -> tuple[int, str | None] | None:
         chunk *= 2
 
 
+def _herdr_session_id(pane_id: str, env: Mapping[str, str] | None) -> str | None:
+    """The conversation id Herdr reports for the pane's agent (``herdr agent get``), or None."""
+    exe = shutil.which("herdr", path=None if env is None else env.get("PATH", ""))
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "agent", "get", pane_id], capture_output=True, text=True, timeout=10,
+                             env=None if env is None else dict(env))
+        session = json.loads(out.stdout)["result"]["agent"].get("agent_session")
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    value = session.get("value") if isinstance(session, dict) and session.get("kind") == "id" else None
+    return value if isinstance(value, str) and value else None
+
+
 class ClaudeAdapter:
     harness = Harness.CLAUDE
 
-    def __init__(self, home: Path | None = None) -> None:
+    def __init__(self, home: Path | None = None, env: Mapping[str, str] | None = None) -> None:
         self._home = home if home is not None else Path.home()
+        self._env = env  # environment for the herdr call; None inherits the process environment
 
     def locate_session(self, session_id: str | None, cwd: Path, pane_id: str) -> SessionRef | None:
         directory = self._home / ".claude" / "projects" / _slug(cwd)
         if session_id:
+            if "/" in session_id or "\\" in session_id or session_id == "..":
+                return None  # the id comes from outside; never let it leave the project directory
             path = directory / f"{session_id}.jsonl"
             return SessionRef(self.harness, pane_id, cwd, session_id, path) if path.is_file() else None
         transcripts = sorted(directory.glob("*.jsonl"))
@@ -69,7 +92,7 @@ class ClaudeAdapter:
         return SessionRef(self.harness, pane_id, cwd, transcripts[0].stem, transcripts[0])
 
     def locate(self, pane_id: str, cwd: Path) -> SessionRef | None:
-        return self.locate_session(_herdr_session_id(pane_id), cwd, pane_id)
+        return self.locate_session(_herdr_session_id(pane_id, self._env), cwd, pane_id)
 
     def read_context(self, ref: SessionRef) -> ContextReading | None:
         if ref.record_path is None:
@@ -90,7 +113,7 @@ class ClaudeAdapter:
     def is_ready_for_input(self, screen: str, agent_status: str) -> bool:
         if agent_status not in _READY_STATUSES:
             return False
-        lines = [line.strip() for line in screen.splitlines()]
+        lines = [line.strip() for line in screen.rstrip().splitlines()]  # a pane screen is padded with blank rows
         for index in range(len(lines) - 1, -1, -1):
             if lines[index] == PROMPT_MARKER:
                 return len(lines) - 1 - index <= _LINES_BELOW_PROMPT
@@ -103,17 +126,3 @@ class ClaudeAdapter:
 
     def compact_input(self) -> TypedInput:
         return TypedInput("/compact", ("Enter",))
-
-
-def _herdr_session_id(pane_id: str) -> str | None:
-    """The conversation id Herdr reports for the pane's agent (``herdr agent get``), or None."""
-    exe = shutil.which("herdr")
-    if not exe:
-        return None
-    try:
-        out = subprocess.run([exe, "agent", "get", pane_id], capture_output=True, text=True, timeout=10)
-        session = json.loads(out.stdout)["result"]["agent"].get("agent_session")
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError):
-        return None
-    value = session.get("value") if isinstance(session, dict) and session.get("kind") == "id" else None
-    return value if isinstance(value, str) and value else None

@@ -1,4 +1,5 @@
 """Claude Code adapter, against real (redacted) transcript files laid out as Claude Code lays them out."""
+import re
 import shutil
 from pathlib import Path
 
@@ -13,12 +14,8 @@ SESSION = "11111111-1111-4111-8111-111111111111"
 OTHER = "22222222-2222-4222-8222-222222222222"
 
 
-def _slug(cwd: Path) -> str:
-    return str(cwd).replace("/", "-").replace(".", "-")
-
-
 def _install(home: Path, cwd: Path, fixture: str, session: str = SESSION) -> Path:
-    directory = home / ".claude" / "projects" / _slug(cwd)
+    directory = home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / f"{session}.jsonl"
     shutil.copy(FIXTURES / fixture, target)
@@ -60,11 +57,59 @@ def test_partial_last_line_is_skipped(tmp_path):
     assert reading is not None and reading.used_tokens == 1203 == context_tokens(path)  # same sum as the hook
 
 
-def test_window_follows_the_model_of_the_latest_usage_entry(tmp_path):
+@pytest.mark.parametrize("fixture,window", [("model_change.jsonl", 200_000),
+                                            ("model_change_reversed.jsonl", 1_000_000)])
+def test_window_follows_the_model_of_the_latest_usage_entry(tmp_path, fixture, window):
     cwd = tmp_path / "work"
-    path = _install(tmp_path, cwd, "model_change.jsonl")
+    path = _install(tmp_path, cwd, fixture)
     reading = ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd))
-    assert reading is not None and reading.used_tokens == 6104
+    assert reading is not None
+    assert (reading.window_tokens, reading.window_source) == (window, "model_table")
+    assert reading.used_tokens == 6104
+
+
+def test_usage_without_token_keys_is_skipped_not_read_as_zero(tmp_path):
+    cwd = tmp_path / "work"
+    path = _install(tmp_path, cwd, "empty_usage_last.jsonl")
+    reading = ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd))
+    assert reading is not None and reading.used_tokens == 1203
+    only = tmp_path / "only.jsonl"
+    only.write_text(path.read_text().splitlines()[-1] + "\n")
+    assert ClaudeAdapter(home=tmp_path).read_context(_ref(only, cwd)) is None
+
+
+def test_read_context_none_when_record_is_missing(tmp_path):
+    cwd = tmp_path / "work"
+    assert ClaudeAdapter(home=tmp_path).read_context(_ref(tmp_path / "gone.jsonl", cwd)) is None
+
+
+def test_transcript_directory_replaces_every_non_alphanumeric_character(tmp_path):
+    # Real Claude Code names: /private/var/folders/m_/hg7g..tg_b_l04..  ->  -private-var-folders-m--hg7g..tg-b-l04..
+    cwd = Path("/private/var/m_/a_b c.d/é")
+    expected = tmp_path / ".claude" / "projects" / "-private-var-m--a-b-c-d--"
+    expected.mkdir(parents=True)
+    (expected / f"{SESSION}.jsonl").write_text("")
+    ref = ClaudeAdapter(home=tmp_path).locate_session(SESSION, cwd, "w1:p1")
+    assert ref is not None and ref.record_path == expected / f"{SESSION}.jsonl"
+
+
+@pytest.mark.parametrize("bad", ["../x", "a/b", "..", "a\\b"])
+def test_session_id_with_path_parts_is_rejected(tmp_path, bad):
+    cwd = tmp_path / "work"
+    _install(tmp_path, cwd, "main_chain.jsonl")
+    assert ClaudeAdapter(home=tmp_path).locate_session(bad, cwd, "w1:p1") is None
+
+
+def test_locate_without_herdr_on_path_falls_back_to_the_only_transcript(tmp_path):
+    cwd = tmp_path / "work"
+    empty = tmp_path / "empty-bin"
+    empty.mkdir()
+    adapter = ClaudeAdapter(home=tmp_path, env={"PATH": str(empty)})
+    assert adapter.locate("w1:p1", cwd) is None
+    only = _install(tmp_path, cwd, "main_chain.jsonl")
+    assert adapter.locate("w1:p1", cwd).record_path == only
+    _install(tmp_path, cwd, "model_change.jsonl", OTHER)
+    assert adapter.locate("w1:p1", cwd) is None
 
 
 def test_unknown_model_uses_fallback_window_not_none(tmp_path):
@@ -127,3 +172,7 @@ def test_not_ready_while_working_or_with_typed_input_or_without_prompt():
     assert not adapter.is_ready_for_input(typed, "idle")
     assert not adapter.is_ready_for_input("just output\nmore output\n", "idle")
     assert not adapter.is_ready_for_input("", "done")
+
+
+def test_ready_ignores_blank_padding_below_the_screen():
+    assert ClaudeAdapter().is_ready_for_input(IDLE_SCREEN + "\n" * 40, "idle")
