@@ -41,5 +41,16 @@ listener, or list the proxy in `trusted_proxies` if it sets a truthful `X-Forwar
 | `name` | `herdr-shepherd` | display name reported as `name` |
 | `whois_socket` | tailscaled LocalAPI | absolute path of a whois sidecar socket (`herdr-eng fabric whois-proxy`), same as `collab.fabric_trust.whois_socket` |
 
+**Whois socket in the control-plane-web container.** `control-plane-web` has no tailscaled socket, so `tailnet_open_owner` fails closed unless it can reach the whois sidecar. When the collab overlay is on and `collab.fabric_trust.listen_*` is configured, `deploy/control-plane/compose.collab-fabric.yaml` (layered by `deploy.sh`) runs the `fabric-whois` sidecar and mounts its socket directory read-only into `control-plane-web` at `/run/fabric-whois`. Set:
+
+```yaml
+control_plane:
+  rakazo_bridge:
+    tailnet_open_owner: true
+    whois_socket: /run/fabric-whois/whois.sock
+```
+
+Requirement: the fabric-trust listener must be configured (otherwise the sidecar and the mount do not exist). The socket is 0660 in a 0700 directory owned by `HERDR_COLLAB_CERT_UID`; `control-plane-web` runs as root with default capabilities (`CAP_DAC_OVERRIDE`), so it can connect. If web is ever made non-root or drops capabilities, give it the sidecar's uid/gid.
+
 **Precedence:** when `tailnet_open_owner` is on, whois decides every `/api/auth/open`, even if `open_owner` is also on. The address-range rule
 (loopback + tailnet range, no whois) applies only when `open_owner` is on and `tailnet_open_owner` is off. Password sign-in is unchanged.
