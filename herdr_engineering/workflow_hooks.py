@@ -25,6 +25,7 @@ from .memory_install import (
     ClaudeHooksUnit,
     _atomic_write,
     _diff,
+    _dump_json,
 )
 from .workflow_guard import MATCHER as GUARD_MATCHER
 from .workflow_guard import decide
@@ -38,6 +39,8 @@ REMINDER = """Engineering defaults (herdr-engineering managed hook):
 - Ship via branch -> PR -> review -> CI green -> ready; never commit to main.
 - Use real dependencies in tests; no mocks, stubs or fakes.
 - Never push herdr-engineering. Keep nothing under /tmp.
+- To delete a worktree, build target, scratch dir or test container you created, run `herdr-eng cleanup --scope {worktree,target,tmp,docker} --path <p>`; never raw rm -rf, git worktree remove or docker rm.
+- Start throwaway containers with `docker run $(herdr-eng cleanup --print-run-args)` so they are reaped.
 - CI is Woodpecker (ci.metabolomics.us) where the repo uses it.
 - Do not ask the user about choices these defaults already settle; apply them.
 - Context getting long? Run /handoff yourself, without asking: first wait for background subagents to report and commit/push the work where pushing is allowed. It moves the work to a fresh Herdr pane on the same harness."""
@@ -48,9 +51,38 @@ PRECOMPACT_MESSAGE = ("Context is about to be compacted. Run /handoff yourself n
                       "with a self-sufficient briefing. The hook only prints this; nothing was started.")
 
 
+ALLOW_RULE = "Bash(herdr-eng cleanup:*)"
+
+
 class _WorkflowHooksUnit(ClaudeHooksUnit):
+    """Managed hooks plus the permission allow rule for the sanctioned cleanup command."""
     marker = MARKER
     matchers = {"PreToolUse": GUARD_MATCHER}
+
+    def state(self, text):
+        state = super().state(text)
+        if state == CURRENT and ALLOW_RULE not in self._load(text).get("permissions", {}).get("allow", []):
+            return STALE
+        return state
+
+    def install(self, text):
+        data = self._load(super().install(text))
+        permissions = data.setdefault("permissions", {})
+        allow = permissions.setdefault("allow", [])
+        if ALLOW_RULE not in allow:
+            allow.append(ALLOW_RULE)
+        return _dump_json(data, text)
+
+    def remove(self, text):
+        data = self._load(super().remove(text))
+        permissions = data.get("permissions", {})
+        if ALLOW_RULE in permissions.get("allow", []):
+            permissions["allow"].remove(ALLOW_RULE)
+            if not permissions["allow"]:
+                del permissions["allow"]
+            if not permissions:
+                del data["permissions"]
+        return _dump_json(data, text)
 
 
 def _hook_command(command: list[str], event: str) -> str:

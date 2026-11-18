@@ -165,3 +165,26 @@ def test_generated_command_with_missing_executable_is_silent_noop(home):
     cmds = _hook_commands(home, ["/nonexistent/python", "-m", "herdr_engineering.cli"])
     done = subprocess.run(["sh", "-c", cmds["SessionStart"]], input="{}", capture_output=True, text=True, timeout=60)
     assert done.returncode == 0 and done.stdout == ""
+
+
+def test_install_adds_cleanup_allow_rule_and_reminder_mentions_command(home):
+    settings(home).write_text(json.dumps({"permissions": {"allow": ["Bash(ls:*)"]}}))
+    inst(home).install()
+    assert json.loads(settings(home).read_text())["permissions"]["allow"] == [
+        "Bash(ls:*)", "Bash(herdr-eng cleanup:*)"]
+    assert inst(home).install().action == "noop"
+    ctx = run_hook("SessionStart")["hookSpecificOutput"]["additionalContext"]
+    assert "herdr-eng cleanup" in ctx and "--print-run-args" in ctx
+    inst(home).uninstall()
+    assert json.loads(settings(home).read_text()) == {"permissions": {"allow": ["Bash(ls:*)"]}}
+
+
+def test_missing_allow_rule_is_drift_and_repair_restores_it(home):
+    inst(home).install()
+    data = json.loads(settings(home).read_text())
+    del data["permissions"]
+    settings(home).write_text(json.dumps(data, indent=2))
+    assert inst(home).status().state == "stale"
+    inst(home).repair()
+    assert inst(home).status().state == "current"
+    assert "Bash(herdr-eng cleanup:*)" in json.loads(settings(home).read_text())["permissions"]["allow"]
