@@ -132,7 +132,11 @@ def test_smoke_script_ticket_is_one_take_secret_accepts():
     assert len(tickets) == 1, tickets
     ticket = tickets.pop()
     assert re.match(TICKET_RE, ticket), ticket
-    assert f"{ticket}.json" in text and "tkt_" not in text
+    # every secret file the script writes, cats, rms or checks is that ticket's (a drifted name would let the uid-65534
+    # refusals pass on a missing file)
+    names = set(re.findall(r'([A-Za-z0-9_]+)\.json', text))
+    assert names == {ticket}, names
+    assert "tkt_" not in text
 
 
 # ----------------------------------------------------------------------------- the worker resolves the gid or refuses
