@@ -21,6 +21,7 @@ import queue
 import re
 import secrets
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -211,6 +212,14 @@ class _DaemonThreadingServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._request_slots.release()
+
+    def handle_error(self, request, client_address):
+        # A client that resets or abandons its connection is routine (agents restart, proxies time out); the
+        # stdlib would print a full traceback to stderr each time. Real handler bugs keep their traceback.
+        if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            log.debug("client %s went away: %s", client_address[0], type(sys.exc_info()[1]).__name__)
+            return
+        super().handle_error(request, client_address)
 
 
 class _DaemonThreadingServerV6(_DaemonThreadingServer):
