@@ -1,12 +1,11 @@
 """Codex adapter: context from the session rollout, drain and exit by typing into the pane."""
-import json
 import time
 from collections.abc import Mapping
 from pathlib import Path
 
 from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
 from .herdr_session import herdr_session_id, is_safe_session_id
-from .records import lines_newest_first
+from .records import records_newest_first
 from .windows import lookup_window
 
 PROMPT_MARKER = "›"  # the empty Codex composer; unconfirmed against a live pane, measured in Task 7
@@ -43,11 +42,7 @@ def _last_usage(path: Path) -> tuple[int, int | None, str | None] | None:
     line is skipped.
     """
     found: tuple[int, int | None] | None = None
-    for line in lines_newest_first(path):
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
+    for record in records_newest_first(path):
         if found is None:
             found = _token_count(record)
             if found and found[1] is not None:

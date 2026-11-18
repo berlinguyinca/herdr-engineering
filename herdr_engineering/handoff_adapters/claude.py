@@ -1,5 +1,4 @@
 """Claude Code adapter: context from the session transcript, drain and exit by typing into the pane."""
-import json
 import re
 import time
 from collections.abc import Mapping
@@ -7,7 +6,7 @@ from pathlib import Path
 
 from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
 from .herdr_session import herdr_session_id, is_safe_session_id
-from .records import lines_newest_first
+from .records import records_newest_first
 from .windows import lookup_window
 
 PROMPT_MARKER = "❯"  # the empty input box of Claude Code, on a line of its own between two rules
@@ -38,12 +37,8 @@ def _main_chain_usage(record: object) -> tuple[int, str | None] | None:
 
 def _last_usage(path: Path) -> tuple[int, str | None] | None:
     """The latest main-chain usage; a half-written line is skipped."""
-    for line in lines_newest_first(path):
-        try:
-            found = _main_chain_usage(json.loads(line))
-        except ValueError:
-            continue
-        if found:
+    for record in records_newest_first(path):
+        if found := _main_chain_usage(record):
             return found
     return None
 

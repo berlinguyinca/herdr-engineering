@@ -1,4 +1,5 @@
 """Pi adapter: context from the session record, drain and exit by typing into the pane."""
+import glob
 import json
 import re
 import time
@@ -7,7 +8,7 @@ from pathlib import Path
 
 from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
 from .herdr_session import herdr_agent_session, is_safe_session_id
-from .records import lines_newest_first
+from .records import records_newest_first
 from .windows import lookup_window
 
 EDITOR_RULE = "─"  # Pi draws its input editor as a blank line between two rows of these; read from a live pane
@@ -25,6 +26,13 @@ def session_id_from_record_path(path: str) -> str | None:
     """The session uuid in a Pi record's file name (Herdr reports Pi sessions by path), else None."""
     match = _UUID_AT_END.search(Path(path).stem)
     return match.group(1) if match else None
+
+
+def session_id_from_agent_session(kind: str, value: str) -> str | None:
+    """The session uuid from Herdr's agent_session (kind, value): an id as is, a record path by its file name."""
+    if kind == "id":
+        return value
+    return session_id_from_record_path(value) if kind == "path" else None
 
 
 def _usage(record: object) -> tuple[int, str | None, str | None] | None:
@@ -48,12 +56,8 @@ def _last_usage(path: Path) -> tuple[int, str | None, str | None] | None:
 
     A compaction after it makes it stale (the context just shrank): no reading until the next reply.
     """
-    for line in lines_newest_first(path):
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(record, dict) and record.get("type") == "compaction":
+    for record in records_newest_first(path):
+        if record.get("type") == "compaction":
             return None
         if found := _usage(record):
             return found
@@ -64,11 +68,16 @@ def _configured_window(models_json: Path, provider: str | None, model: str | Non
     """contextWindow Pi's models.json lists for the provider's model, else None."""
     try:
         providers = json.loads(models_json.read_text(encoding="utf-8"))["providers"]
-        for entry in providers[provider]["models"]:
-            if entry["id"] == model and isinstance(window := entry["contextWindow"], int) and window > 0:
-                return window
+        entries = providers[provider]["models"]
     except (OSError, ValueError, KeyError, TypeError):
-        pass
+        return None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:  # one malformed entry must not hide the others
+        if isinstance(entry, dict) and entry.get("id") == model:
+            window = entry.get("contextWindow")
+            if isinstance(window, int) and window > 0:
+                return window
     return None
 
 
@@ -83,7 +92,8 @@ class PiAdapter:
         if not is_safe_session_id(session_id):
             return None  # the id comes from outside; never let it leave the sessions tree or act as a glob
         sessions = self._home / ".pi" / "agent" / "sessions"
-        for pattern in (f"{_slug(cwd)}/*_{session_id}.jsonl", f"*/*_{session_id}.jsonl"):  # the pane cwd may have moved
+        # the cwd's directory first and alone if it matches; else any one directory (the pane cwd may have moved)
+        for pattern in (f"{glob.escape(_slug(cwd))}/*_{session_id}.jsonl", f"*/*_{session_id}.jsonl"):
             matches = sorted(sessions.glob(pattern))
             if len(matches) == 1:
                 return SessionRef(self.harness, pane_id, cwd, session_id, matches[0])
@@ -93,8 +103,7 @@ class PiAdapter:
         session = herdr_agent_session(pane_id, self._env)
         if session is None:
             return None
-        kind, value = session
-        return self.locate_session(session_id_from_record_path(value) if kind == "path" else value, cwd, pane_id)
+        return self.locate_session(session_id_from_agent_session(*session), cwd, pane_id)
 
     def read_context(self, ref: SessionRef) -> ContextReading | None:
         if ref.record_path is None:
@@ -107,7 +116,7 @@ class PiAdapter:
             return None
         used, provider, model = found
         recorded = _configured_window(self._home / ".pi" / "agent" / "models.json", provider, model)
-        if recorded is not None:
+        if recorded is not None:  # Pi's own configuration for that model, not a figure written with the usage entry
             window, window_source = recorded, "recorded"
         else:
             window, window_source = lookup_window(model)

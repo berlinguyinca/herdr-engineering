@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from herdr_engineering.handoff_adapters.herdr_session import is_safe_session_id
-from herdr_engineering.handoff_adapters.records import lines_newest_first
+from herdr_engineering.handoff_adapters.records import lines_newest_first, records_newest_first
 
 
 def test_lines_come_newest_first_without_blank_lines(tmp_path: Path) -> None:
@@ -35,7 +35,7 @@ def test_every_block_size_yields_the_same_whole_lines(tmp_path: Path, block: int
 
 def test_unicode_line_separators_inside_a_line_do_not_split_it(tmp_path: Path) -> None:
     path = tmp_path / "r.jsonl"
-    odd = '{"text":"a b c\u0085d"}'
+    odd = '{"text":"a\u2028b\u2029c\u0085d"}'
     path.write_text(f'{{"n":1}}\n{odd}\n{{"n":3}}\n', encoding="utf-8")
     assert list(lines_newest_first(path)) == ['{"n":3}', odd, '{"n":1}']
     assert list(lines_newest_first(path, 5)) == ['{"n":3}', odd, '{"n":1}']
@@ -50,3 +50,9 @@ def test_safe_session_ids(good: str) -> None:
 @pytest.mark.parametrize("bad", [None, "", "..", "../x", "a/b", "a\\b", "*", "a?b", "[a]"])
 def test_unsafe_session_ids(bad: str | None) -> None:
     assert not is_safe_session_id(bad)
+
+
+def test_records_are_parsed_objects_skipping_half_written_and_non_object_lines(tmp_path: Path) -> None:
+    path = tmp_path / "r.jsonl"
+    path.write_text('{"n":1}\n[1,2]\n"text"\n{"n":2}\n{"n":3,"cut')
+    assert list(records_newest_first(path)) == [{"n": 2}, {"n": 1}]

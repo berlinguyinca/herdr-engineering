@@ -1,4 +1,5 @@
 """Newest-first reading of a JSONL record file, shared by the adapters that scan a session record's tail."""
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -24,3 +25,14 @@ def lines_newest_first(path: Path, block: int = _BLOCK) -> Iterator[str]:
                 if part:
                     yield part.decode("utf-8", "replace")
             pos = start
+
+
+def records_newest_first(path: Path, block: int = _BLOCK) -> Iterator[dict[str, object]]:
+    """Yield the file's JSON objects, last first; lines that do not parse (a half-written one) or are not objects are skipped."""
+    for line in lines_newest_first(path, block):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            yield record

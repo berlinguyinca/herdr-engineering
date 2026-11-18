@@ -8,14 +8,15 @@ from herdr_engineering.handoff_adapters.base import ExitPlan, Harness, SessionRe
 from herdr_engineering.handoff_adapters.pi import (
     EDITOR_RULE,
     PiAdapter,
+    session_id_from_agent_session,
     session_id_from_record_path,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "handoff_adapters" / "pi"
 SESSION = "11111111-1111-7111-8111-111111111111"
 OTHER = "22222222-2222-7222-8222-222222222222"
-CWD = Path("/Users/wohlgemuth/IdeaProjects/fsc-fwd-auth")
-SLUG = "--Users-wohlgemuth-IdeaProjects-fsc-fwd-auth--"  # a real directory name under ~/.pi/agent/sessions
+CWD = Path("/home/user/proj")
+SLUG = "--home-user-proj--"  # Pi's directory naming, as observed on real session directories
 
 
 def _install(home: Path, fixture: str, session: str = SESSION, slug: str = SLUG, models: bool = True) -> Path:
@@ -109,16 +110,36 @@ def test_read_context_none_when_record_is_missing_or_unset(tmp_path):
     assert adapter.read_context(SessionRef(Harness.PI, "w1:p1", CWD, SESSION, None)) is None
 
 
-def test_session_directory_slug_matches_real_pi_directory_names(tmp_path):
-    # Pi: "--" + cwd without its leading separator, every / \ : as "-", + "--"; . and _ are kept
+def test_session_directory_slug_follows_pi_naming(tmp_path):
+    # Rule observed on real Pi session directories: "--" + cwd minus its leading separator, with / \ : as "-", + "--";
+    # "." and "_" are kept.
     for cwd, slug in [
-        (Path("/Users/wohlgemuth/IdeaProjects/fsc-fwd-auth"), "--Users-wohlgemuth-IdeaProjects-fsc-fwd-auth--"),
-        (Path("/Users/wohlgemuth/.cache/hindsight/pi-fixture"), "--Users-wohlgemuth-.cache-hindsight-pi-fixture--"),
-        (Path("/private/var/folders/m_/hg7g/T/sw-draft"), "--private-var-folders-m_-hg7g-T-sw-draft--"),
+        (Path("/home/user/proj"), "--home-user-proj--"),
+        (Path("/home/user/.cache/some_dir/pi-fixture"), "--home-user-.cache-some_dir-pi-fixture--"),
+        (Path("C:\\work\\proj"), "--C--work-proj--"),
     ]:
         expected = _install(tmp_path, "main.jsonl", slug=slug)
         ref = PiAdapter(home=tmp_path).locate_session(SESSION, cwd, "w1:p1")
         assert ref == SessionRef(Harness.PI, "w1:p1", cwd, SESSION, expected)
+
+
+def test_cwd_with_glob_characters_is_matched_literally(tmp_path):
+    cwd = Path("/home/user/p[1]")
+    expected = _install(tmp_path, "main.jsonl", slug="--home-user-p[1]--")
+    _install(tmp_path, "main.jsonl", OTHER, slug="--home-user-p1--")
+    assert PiAdapter(home=tmp_path).locate_session(SESSION, cwd, "w1:p1").record_path == expected
+
+
+def test_same_uuid_in_two_other_directories_is_ambiguous(tmp_path):
+    _install(tmp_path, "main.jsonl", slug="--home-user-a--")
+    _install(tmp_path, "main.jsonl", slug="--home-user-b--")
+    assert PiAdapter(home=tmp_path).locate_session(SESSION, CWD, "w1:p1") is None
+
+
+def test_the_cwd_directory_wins_over_another_directory_holding_the_same_uuid(tmp_path):
+    _install(tmp_path, "main.jsonl", slug="--home-user-other--")
+    wanted = _install(tmp_path, "main.jsonl")  # SLUG, the directory of CWD
+    assert PiAdapter(home=tmp_path).locate_session(SESSION, CWD, "w1:p1").record_path == wanted
 
 
 def test_locate_by_session_uuid(tmp_path):
@@ -130,7 +151,7 @@ def test_locate_by_session_uuid(tmp_path):
 
 
 def test_locate_finds_the_session_when_the_pane_cwd_differs_from_the_session_directory(tmp_path):
-    wanted = _install(tmp_path, "main.jsonl", slug="--Users-wohlgemuth-IdeaProjects--")
+    wanted = _install(tmp_path, "main.jsonl", slug="--home-user--")
     ref = PiAdapter(home=tmp_path).locate_session(SESSION, CWD, "w1:p1")
     assert ref is not None and ref.record_path == wanted
 
@@ -149,11 +170,28 @@ def test_session_id_with_path_parts_or_glob_characters_is_rejected(tmp_path, bad
 
 
 def test_session_id_from_the_record_path_herdr_reports():
-    # Herdr reports Pi sessions as kind "path", not "id" (real `herdr agent list` output)
-    path = "/Users/wohlgemuth/.pi/agent/sessions/--Users-wohlgemuth--/2026-11-17T18-39-46-319Z_01a1eace-d68e-77ed-a039-85869e2b28cf.jsonl"
-    assert session_id_from_record_path(path) == "01a1eace-d68e-77ed-a039-85869e2b28cf"
+    # Herdr reports Pi sessions as kind "path", not "id"
+    path = "/home/user/.pi/agent/sessions/--home-user-proj--/2026-01-02T03-04-05-678Z_33333333-3333-7333-8333-333333333333.jsonl"
+    assert session_id_from_record_path(path) == "33333333-3333-7333-8333-333333333333"
     assert session_id_from_record_path("/x/notatimestamp.jsonl") is None
     assert session_id_from_record_path("") is None
+
+
+def test_agent_session_kinds_id_and_path_are_accepted_and_others_rejected():
+    uuid = "33333333-3333-7333-8333-333333333333"
+    assert session_id_from_agent_session("id", uuid) == uuid
+    assert session_id_from_agent_session("path", f"/h/sessions/--s--/2026-01-02T03-04-05-678Z_{uuid}.jsonl") == uuid
+    assert session_id_from_agent_session("name", uuid) is None
+    assert session_id_from_agent_session("", uuid) is None
+
+
+def test_one_malformed_models_json_entry_does_not_hide_a_valid_match(tmp_path):
+    path = _install(tmp_path, "main.jsonl")
+    (tmp_path / ".pi" / "agent" / "models.json").write_text(
+        '{"providers":{"metabolomics":{"models":[{"contextWindow":5},"junk",{"id":"qwen3.8-flash_next"},'
+        '{"id":"qwen3.8-flash_next","contextWindow":65536}]}}}')
+    reading = PiAdapter(home=tmp_path).read_context(_ref(path))
+    assert reading is not None and (reading.window_tokens, reading.window_source) == (65_536, "recorded")
 
 
 def test_locate_without_herdr_on_path_is_none(tmp_path):
@@ -171,6 +209,8 @@ def test_drain_compact_and_exit_inputs():
     assert adapter.exit_plan() == ExitPlan("/quit", ("Enter",), 15.0)
     with pytest.raises(ValueError):
         adapter.drain_input("x" * 901)
+    with pytest.raises(ValueError):
+        adapter.drain_input("é" * 451)  # 902 bytes in 451 characters
 
 
 RULE = EDITOR_RULE * 80
