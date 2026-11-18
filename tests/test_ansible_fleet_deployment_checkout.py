@@ -1,6 +1,6 @@
 """Structural guards for ansible/tasks/fleet-deployment-checkout.yml (the herdr-engineering
 deployment checkout + pointer file the fleet-watch rollout rows require; first live rollout
-2026-11-23 failed closed on every host because nothing provisioned them)."""
+2026-11-17 failed closed on every host because nothing provisioned them)."""
 import re
 from pathlib import Path
 

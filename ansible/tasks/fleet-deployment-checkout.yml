@@ -5,7 +5,7 @@
 # checkout from $HERDR_ENGINEERING_REPO or the one-line file ~/.config/herdr-engineering/
 # deployment-checkout (a non-interactive ssh shell has no profile environment), then fast-forwards it
 # and pip-installs from it. Nothing else provisions either, so on a fresh host the row fails closed
-# with "no deployment checkout" - the 2026-11-23 first rollout hit exactly that on all three hosts
+# with "no deployment checkout" - the 2026-11-17 first rollout hit exactly that on all three hosts
 # (it was masked: the rollout had already halted on the autospec row).
 #
 # The clone is DEDICATED: separate from any development checkout (the D6 gate requires clean + main +
