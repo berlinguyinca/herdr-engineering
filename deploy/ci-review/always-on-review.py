@@ -130,6 +130,16 @@ def _valid_budget(b) -> bool:
         return False
 
 
+def _null_means_default(over: dict, key: str, subkeys: tuple[str, ...]) -> None:
+    """`risky:` or `risky: {codex: null}` in YAML is an empty block, not a wrong type: drop it so the defaults apply."""
+    if key in over and over[key] is None:
+        del over[key]
+    elif isinstance(over.get(key), dict):
+        for sub in subkeys:
+            if sub in over[key] and over[key][sub] is None:
+                del over[key][sub]
+
+
 def load_config(path: str | None) -> dict:
     over: dict = {}
     if path:
@@ -139,6 +149,7 @@ def load_config(path: str | None) -> dict:
             raise Refused(f"config: cannot read {path}: {e}") from e
         if not isinstance(over, dict):
             raise Refused("config: the file must hold a mapping")
+    _null_means_default(over, "risky", ("codex",))
     cfg = ai.merge(DEFAULTS, over)
     _check_prompt(cfg, Path(path).resolve().parent if path else Path.cwd())
     _check_passes_and_replay(cfg)
@@ -350,9 +361,13 @@ def _check_reviewers(cfg: dict) -> None:
 def _check_risky(cfg: dict) -> None:
     r = cfg["risky"]
     globs = r["globs"]
-    if not isinstance(globs, list) or not all(isinstance(g, str) and g.strip() and not g.startswith("/")
-                                              and ".." not in g.split("/") for g in globs):
-        raise Refused("config: risky.globs must be a list of repo-relative globs (no leading /, no ..)")
+    if not isinstance(globs, list):
+        raise Refused(f"config: risky.globs must be a list of glob strings, not {type(globs).__name__}")
+    for i, g in enumerate(globs):
+        if not isinstance(g, str):
+            raise Refused(f"config: risky.globs[{i}] must be a string, not {type(g).__name__}")
+        if not g.strip() or g.startswith("/") or ".." in g.split("/"):
+            raise Refused(f"config: risky.globs[{i}] must be a repo-relative glob (not empty, no leading /, no ..)")
     c = r["codex"]
     if not isinstance(c["wrapper"], list) or not all(isinstance(x, str) for x in c["wrapper"]):
         raise Refused("config: risky.codex.wrapper must be a list of strings")
@@ -872,6 +887,41 @@ def child_env() -> dict[str, str]:
     return {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
 
 
+class UsageLimit(ReviewFailed):
+    """The reviewer's account is out of quota. Not a strike against the PR (nothing is wrong with it), and the poll
+    stops launching more reviews of that tier."""
+
+
+USAGE_LIMIT_RE = re.compile(r"hit your.{0,40}limit|usage limit", re.I)
+FAIL_TAIL_MAX = 300
+
+
+def one_line(raw: bytes | str, limit: int = FAIL_TAIL_MAX) -> str:
+    """Untrusted reviewer text as data for a log line: redacted, control characters (escape sequences, newlines) turned
+    into spaces, cut to `limit`."""
+    text = raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
+    return re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f]", " ", ai.redact(text))).strip()[:limit]
+
+
+def usage_limit_text(text: str) -> bool:
+    return USAGE_LIMIT_RE.search(text) is not None
+
+
+def _exit_failure(name: str, rc: int, out: bytes, err: bytes) -> ReviewFailed:
+    """The failure of a reviewer that exited non-zero. claude prints its errors to STDOUT, so when stderr is empty the
+    tail comes from the first 300 characters of stdout. A usage-limit message becomes a UsageLimit."""
+    tail = one_line(err[-2000:]) or one_line(out)
+    if usage_limit_text(one_line(err, 2000) + " " + one_line(out, 2000)):
+        return UsageLimit(f"usage-limit: {name} exited {rc}: {tail}")
+    return ReviewFailed(f"{name} exited {rc}: {tail}")
+
+
+def _with_stdout(e: ReviewFailed, out: bytes | None) -> ReviewFailed:
+    """The stdout the process wrote before it failed, kept for what it reported (Codex's token usage)."""
+    e.stdout = (out or b"")[:OUTPUT_MAX].decode("utf-8", "replace")
+    return e
+
+
 def run_reviewer(argv: list[str], cwd: Path, stdin: str | None, time_cap_s: float) -> tuple[str, float]:
     """The one subprocess boundary: scrubbed env, own process group (killed whole on the time cap), bounded output."""
     t = time.monotonic()
@@ -885,11 +935,11 @@ def run_reviewer(argv: list[str], cwd: Path, stdin: str | None, time_cap_s: floa
         out, err = p.communicate(stdin.encode() if stdin is not None else None, timeout=time_cap_s)
     except subprocess.TimeoutExpired:
         os.killpg(p.pid, signal.SIGKILL)
-        p.communicate()
-        raise ReviewFailed(f"the review took longer than the time cap ({time_cap_s:.0f}s); killed") from None
+        out, _ = p.communicate()
+        raise _with_stdout(ReviewFailed(f"the review took longer than the time cap ({time_cap_s:.0f}s); killed"),
+                           out) from None
     if p.returncode != 0:
-        tail = ai.redact(err.decode("utf-8", "replace")[-300:]).replace("\n", " ")
-        raise ReviewFailed(f"{Path(argv[0]).name} exited {p.returncode}: {tail}")
+        raise _with_stdout(_exit_failure(Path(argv[0]).name, p.returncode, out, err), out)
     if len(out) > OUTPUT_MAX:
         raise ReviewFailed("the reviewer's output is larger than any verdict can be")
     return out.decode("utf-8", "replace"), time.monotonic() - t
@@ -920,6 +970,8 @@ class ClaudeBackend:
             raise ReviewFailed("claude did not answer with JSON") from None
         if not isinstance(d, dict) or d.get("is_error"):
             why = ai.redact(str(d.get("result", ""))[:200]) if isinstance(d, dict) else "?"
+            if usage_limit_text(why):
+                raise UsageLimit(f"usage-limit: claude reported an error: {one_line(why)}")
             raise ReviewFailed(f"claude reported an error: {why}")
         answer = d.get("structured_output") if isinstance(d.get("structured_output"), dict) else d.get("result", "")
         models = list(d.get("modelUsage") or {})
@@ -1432,7 +1484,10 @@ def _run_tier1(cfg, gh, pr, repo, n, sha, tier, state, key, started, post_on) ->
 
 def glob_regex(glob: str) -> re.Pattern[str]:
     """`**/` = any directories (or none), `**` = anything, `*` = anything but `/`, `?` = one non-`/` character.
+    A trailing `/` means everything below: `deploy/` is `deploy/**`.
     Case-insensitive: a path that only differs in case still counts as risky."""
+    if glob.endswith("/"):
+        glob = glob.rstrip("/") + "/**"
     out, i = "", 0
     while i < len(glob):
         if glob.startswith("**/", i):
@@ -1529,15 +1584,34 @@ class CodexBackend:
         with tempfile.TemporaryDirectory(prefix="codex-review-") as d:
             schema, out = Path(d) / "schema.json", Path(d) / "answer.txt"
             schema.write_text(json.dumps(GATEWAY_SCHEMA))
-            stdout, took = run_reviewer(self.argv(schema, out, req.worktree), req.worktree, self.prompt(req),
-                                        time_cap_s)
-            usage = codex_usage(stdout)
+            try:
+                stdout, took = run_reviewer(self.argv(schema, out, req.worktree), req.worktree, self.prompt(req),
+                                            time_cap_s)
+            except ReviewFailed as e:
+                raise self._with_spend(e, getattr(e, "stdout", "")) from None
+            try:
+                usage = codex_usage(stdout)
+            except ReviewFailed as e:
+                raise _with_stdout(e, b"") from None            # implausible counts: nothing to account
             try:
                 answer = out.read_text(errors="replace")
             except OSError:
-                raise ReviewFailed("codex wrote no answer") from None
-        cost = codex_cost_usd(self.ccfg, usage)
-        return RawReview(answer, self.ccfg["model"] or "codex", took, {**usage, "cost_usd": cost})
+                raise self._with_spend(ReviewFailed("codex wrote no answer"), stdout) from None
+        return RawReview(answer, self.ccfg["model"] or "codex", took, self._priced(usage))
+
+    def _priced(self, usage: dict) -> dict:
+        return {**usage, "cost_usd": codex_cost_usd(self.ccfg, usage)}
+
+    def _with_spend(self, e: ReviewFailed, stdout: str) -> ReviewFailed:
+        """A failed run still spent what its tokens say: attach them (priced) so the failure is logged and counted.
+        No parsable tokens means unknown: attach nothing and let the log line say so, never a guessed cost."""
+        try:
+            usage = codex_usage(stdout)
+        except ReviewFailed:
+            usage = {}
+        if usage:
+            e.usage = self._priced(usage)
+        return e
 
 
 def codex_budget_left(cfg: dict) -> str | None:
@@ -1568,7 +1642,8 @@ def codex_review(cfg: dict, req: ReviewRequest, tier_name: str, post_on: bool, s
     try:
         raw = CodexBackend(c).review(req, c["time_cap_s"])
     except ReviewFailed as e:
-        log("not-run", why=str(e)[:200])
+        spent = getattr(e, "usage", None)
+        log("not-run", why=str(e)[:200], **({"usage": spent} if spent else {"usage_unknown": True}))
         raise
     usage = raw.usage
     try:
@@ -1583,7 +1658,8 @@ def codex_review(cfg: dict, req: ReviewRequest, tier_name: str, post_on: bool, s
             # a block that leaves nothing standing must never become a success
             raise ReviewFailed("codex said block but none of its blockers could be verified in this PR")
     except ReviewFailed as e:
-        log("not-run", why=str(e)[:200], usage=usage)
+        log("not-run", why=str(e)[:200], **({"usage": usage} if usage.get("cost_usd") is not None else
+                                             {"usage": usage, "usage_unknown": True}))
         raise
     log("reviewed", usage=usage, blocking=sum(f.severity == "blocking" for f in v.findings), downgraded=n,
         findings=log_findings(v.findings))
@@ -1759,7 +1835,7 @@ class State:
 
     def failed_here(self, key: str, sha: str) -> bool:
         e = self.get(key)
-        return e.get("failures", 0) > 0 and e.get("failure_sha") == sha
+        return (e.get("failures", 0) > 0 and e.get("failure_sha") == sha) or e.get("limit_sha") == sha
 
     def cooling(self, key: str, sha: str, cfg: dict) -> bool:
         e = self.get(key)
@@ -1900,9 +1976,11 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
         try:
             if ensemble:
                 return _run_tier1(cfg, gh, pr, repo, n, sha, tier, state, key, started, post_on)
-            return _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started)
+            return _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started, force)
         except (ReviewFailed, Refused) as e:
-            if isinstance(e, ReviewFailed):
+            if isinstance(e, UsageLimit):               # out of quota is nobody's strike; just retry next time
+                state.put(key, limit_sha=sha)
+            elif isinstance(e, ReviewFailed):
                 old = state.get(key)
                 count = old.get("failures", 0) + 1 if old.get("failure_sha") == sha else 1
                 state.put(key, failures=count, last_failure=time.time(), failure_sha=sha)
@@ -1929,6 +2007,33 @@ class PassesResult:
     downgraded: int
     partial: str = ""                   # why a later pass did not complete ("" = all did); the verdict is then incomplete
     unverified: bool = False            # a pass said block, but every blocker it raised failed the evidence rule
+
+
+def verdict_to_json(v: Verdict) -> dict:
+    return {"head_sha": v.head_sha, "verdict": v.verdict, "findings": [dataclasses.asdict(f) for f in v.findings],
+            "checked": list(v.checked), "checked_items": list(v.checked_items),
+            "tier1_checks": [dict(c) for c in v.tier1_checks]}
+
+
+def verdict_from_json(d: dict) -> Verdict:
+    """What verdict_to_json wrote to state.json. A damaged entry raises (the caller then reviews afresh)."""
+    return Verdict(d["head_sha"], d["verdict"], tuple(Finding(**f) for f in d["findings"]), tuple(d["checked"]),
+                   tuple(d["checked_items"]), tuple(dict(c) for c in d["tier1_checks"]))
+
+
+def remembered_opus(state: State, key: str, sha: str, tier: dict) -> PassesResult | None:
+    """The clean Opus approve of exactly this head that a risky review saved when only Codex failed to run; the retry
+    then runs Codex alone. Another head, another model, or a damaged entry means Opus reviews again."""
+    e = state.get(key).get("opus_approved")
+    try:
+        if not isinstance(e, dict) or e.get("sha") != sha or e.get("tier_model") != tier["model"]:
+            return None
+        v = verdict_from_json(e["verdict"])
+        if v.head_sha != sha or v.verdict != "approve":
+            return None
+        return PassesResult(v, str(e["model"]), {}, [], int(e["downgraded"]))      # usage {}: billed when it ran
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _sum_usage(parts: list[dict]) -> dict:
@@ -2009,7 +2114,7 @@ def local_diff(wt: Worktree) -> str:
     return git(["diff", "--no-color", "--no-ext-diff", wt.base_sha, wt.sha], wt.path) + "\n"
 
 
-def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started) -> int:
+def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started, force=False) -> int:
     global LAST_RESULT
     context = tier["context"]
     diff = github_diff(gh, repo, n)                  # None: too large for GitHub; read it from the worktree instead
@@ -2047,7 +2152,11 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
                 ai.say(f"{repo}#{n}: the diff is over GitHub's limit; reviewing the local diff of {len(files)} files")
             req.worktree, req.base_sha = wt.path, wt.base_sha
             req.log = git(["log", "--format=%h %s", f"{wt.base_sha}..{sha}"], wt.path)
-            result = run_passes(cfg, tier, backend, req, wt.path if backend.needs_worktree else None)
+            result = None if (force or not risky) else remembered_opus(state, key, sha, tier)
+            if result is not None:
+                ai.say(f"{key} @ {sha[:12]}: Opus already approved this head; running Codex only")
+            else:
+                result = run_passes(cfg, tier, backend, req, wt.path if backend.needs_worktree else None)
             # Risky paths: Opus must have approved cleanly first (a block already decides failure, and an incomplete
             # review stays pending), then Codex reviews the same head and its verdict is merged in.
             if risky and not result.partial and not result.unverified and decide(
@@ -2056,6 +2165,9 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
                     codex = codex_review(cfg, req, tier_name, post_on, started)
                 except ReviewFailed as e:
                     e.usage = result.usage              # Opus ran and billed; Codex logged its own spend
+                    state.put(key, opus_approved={"sha": sha, "tier_model": tier["model"], "model": result.model,
+                                                  "downgraded": result.downgraded,
+                                                  "verdict": verdict_to_json(result.verdict)})
                     raise
     else:
         result = run_passes(cfg, tier, backend, req, None)
@@ -2099,7 +2211,7 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
         else:
             ai.say(f"{key} @ {sha[:12]}: max_comments_per_hour reached; comment skipped, status still posted")
     post_status(gh, repo, sha, context, decision, url)
-    state.put(key, failures=0, **({} if post_on else {"dry_sha": sha}))
+    state.put(key, failures=0, opus_approved=None, limit_sha=None, **({} if post_on else {"dry_sha": sha}))
     LAST_RESULT = {"repo": repo, "pr": n, "sha": sha, "tier": tier_name, "state": decision.state,
                    "description": decision.description, "blocking": list(decision.blocking),
                    "dropped": list(decision.dropped), "dry_run": not post_on, "posted": gh.posted}
@@ -2685,6 +2797,7 @@ def poll(cfg: dict, repos: list[str], post_flag: bool) -> int:
     post_on = post_allowed(cfg, post_flag)
     ai.say(f"poll: {'POSTING enabled' if post_on else 'DRY RUN: nothing will be posted'}")
     gh, worst, done, state = ai.Gh(dry_run=True), OK, 0, State(cfg)
+    out_of_quota: set[str] = set()          # tiers whose reviewer reported a usage limit: no more launches this run
     try:
         for repo in repos:
             try:
@@ -2698,10 +2811,12 @@ def poll(cfg: dict, repos: list[str], post_flag: bool) -> int:
                 continue
             for p in prs:
                 for tier_name in ("tier1", "tier2"):
+                    if tier_name in out_of_quota:
+                        continue
                     if done >= cfg["poll"]["max_per_run"]:
                         ai.say("max_per_run reached; the rest waits for the next poll")
                         return worst
-                    rc = _poll_one(cfg, repo, int(p["number"]), tier_name, post_flag)
+                    rc = _poll_one(cfg, repo, int(p["number"]), tier_name, post_flag, out_of_quota)
                     done += rc not in (SKIPPED,)
                     worst = FAILED if rc in (FAILED, REFUSED) else worst
         return worst
@@ -2709,9 +2824,15 @@ def poll(cfg: dict, repos: list[str], post_flag: bool) -> int:
         held.close()
 
 
-def _poll_one(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool) -> int:
+def _poll_one(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool,
+              out_of_quota: set[str] | None = None) -> int:
     try:
         return review_tier(cfg, repo, n, tier_name, post_flag)
+    except UsageLimit as e:
+        ai.say(f"{repo}#{n} {tier_name}: {e}; no further {tier_name} reviews in this poll run")
+        if out_of_quota is not None:
+            out_of_quota.add(tier_name)
+        return FAILED
     except Refused as e:
         ai.say(f"{repo}#{n} {tier_name}: refused: {e}")
         return REFUSED

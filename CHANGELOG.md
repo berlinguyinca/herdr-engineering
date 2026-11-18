@@ -5,6 +5,22 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: Codex second-reviewer follow-ups from #820 (always-on-review.py)
+
+- Codex spend is counted when Codex fails: a non-zero exit, time cap or missing answer after it reported tokens logs a
+  `tier: codex` line with the priced `usage` (counts toward `daily_budget_usd`); with no tokens the line says
+  `usage_unknown: true` and no cost is invented.
+- A clean Opus approve is remembered per head in `state.json` (`opus_approved`, with the tier model) when only Codex
+  failed to run, so the retry runs Codex alone; a new head, another model or `--force` reruns Opus. Cooldown and
+  budget rules are unchanged; the entry is cleared once a verdict is posted.
+- Config: `risky: null` / `risky.codex: null` mean the defaults; non-list or non-string `risky.globs` raise a config
+  error naming the entry; a glob with a trailing `/` (`deploy/`) means `deploy/**`.
+- A failed reviewer's `why` falls back to the first 300 characters of stdout (control characters stripped) when stderr is
+  empty (claude prints its errors to stdout). A usage-limit message logs `why: usage-limit: ...`, is not a cooldown
+  strike (state `limit_sha` lets the next poll retry), and stops the poll launching more reviews of that tier in the run.
+- Rollback: revert this PR. The extra `state.json` keys (`opus_approved`, `limit_sha`) are ignored by older code;
+  `risky: null` then fails the old config check, so restore a mapping (or remove the key) first.
+
 ### Fix: run-watched review nits from #824
 
 - `scripts/ci/run-watched.py`: `Out.write` also survives a full non-blocking stdout (EAGAIN), a closed fd and a `None` stdout (it stops forwarding and keeps draining); the process group is only signalled once the root is reaped if a live process still holds that group (a reaped pid can be reused); `has_token` no longer caches negatives (a fork child reads as its parent until it execs); CPU history is keyed by (pid, start time) so a reused pid cannot corrupt deltas; signal handlers are installed before the command is spawned; bad SOFT/HARD, a missing `--` or command print a usage error and exit 2, and an unstartable command exits 127/126 with a message instead of a traceback; a hang now stops the tree with SIGTERM, a short grace, then SIGKILL (exit still 124).

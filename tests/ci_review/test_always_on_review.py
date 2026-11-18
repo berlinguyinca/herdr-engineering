@@ -124,9 +124,17 @@ porcelain = subprocess.run(["git", "status", "--porcelain"], capture_output=True
 open(os.path.join(d, "reviewer.log"), "a").write(json.dumps(
     {"tool": name, "argv": sys.argv[1:], "cwd": os.getcwd(), "stdin": stdin, "env": sorted(os.environ), "head": head,
      "porcelain": porcelain}) + "\n")
+if name == "codex" and cfg.get("usage_on_fail"):          # tokens reported before the process fails or hangs
+    sys.stdout.write(json.dumps({"type": "turn.completed", "usage": cfg.get(
+        "usage", {"input_tokens": 1000000, "cached_input_tokens": 0, "output_tokens": 500000})}) + "\n")
+    sys.stdout.flush()
 time.sleep(cfg.get("sleep", 0))
 if cfg.get("exit"):
-    sys.stderr.write("boom"); sys.exit(cfg["exit"])
+    if "fail_stdout" in cfg:                                    # claude prints its errors to stdout, not stderr
+        sys.stdout.write(cfg["fail_stdout"])
+    else:
+        sys.stderr.write("boom")
+    sys.exit(cfg["exit"])
 ans = cfg["answer"]
 if isinstance(ans, dict) and ans.get("head_sha") == "@HEAD":
     ans = {**ans, "head_sha": head}
@@ -1090,3 +1098,212 @@ def test_codex_does_not_load_a_pr_added_agents_md_as_instructions(env):
 def test_the_example_config_counts_auth_directories_as_risky(env):
     cfg = env.mod.load_config(str(ROOT / "deploy/ci-review/always-on-review.example.yaml"))
     assert any(env.mod.glob_regex(g).fullmatch("pkg/auth/login.go") for g in cfg["risky"]["globs"])
+
+
+# ---------------- follow-ups: failed-Codex spend, Opus approve memory, loose config, claude diagnosability ----------------
+
+CODEX_BUDGET = "      codex: {daily_budget_usd: 50" + PRICES + "}\n"
+
+
+def codex_lines(env):
+    return [x for x in read_log(env) if x["tier"] == "codex"]
+
+
+def spent_codex(env):
+    return env.mod.spent_today_usd(env.mod.load_config(str(env.cfg_path)), "codex")
+
+
+def test_codex_that_exits_after_reporting_tokens_still_counts_its_cost(env):
+    env.config(RISKY + CODEX_BUDGET, post=True)
+    env.reviewer("codex", answer=APPROVE, exit=3, usage_on_fail=True)
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    (line,) = codex_lines(env)
+    assert line["state"] == "not-run" and line["usage"]["cost_usd"] == 7.0 and "usage_unknown" not in line
+    assert spent_codex(env) == 7.0
+    assert only_pending(env)
+
+
+def test_codex_that_times_out_after_reporting_tokens_still_counts_its_cost(env):
+    env.config(RISKY + "      codex: {time_cap_s: 10, daily_budget_usd: 50" + PRICES + "}\n", post=True)
+    env.reviewer("codex", answer=APPROVE, sleep=60, usage_on_fail=True)
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    (line,) = codex_lines(env)
+    assert "time cap" in line["why"] and line["usage"]["cost_usd"] == 7.0
+    assert spent_codex(env) == 7.0
+
+
+def test_codex_that_fails_without_tokens_says_so_and_invents_no_cost(env):
+    env.config(RISKY + CODEX_BUDGET, post=True)
+    env.reviewer("codex", answer=APPROVE, exit=3)
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    (line,) = codex_lines(env)
+    assert line["state"] == "not-run" and line["usage_unknown"] is True and "usage" not in line
+    assert spent_codex(env) == 0.0
+
+
+def test_failed_codex_spend_exhausts_the_daily_budget(env):
+    env.config(RISKY + "      codex: {daily_budget_usd: 7" + PRICES + "}\n", post=True)
+    env.reviewer("codex", answer=APPROVE, exit=3, usage_on_fail=True)
+    env.review("tier2", post=True)
+    assert env.review("tier2", post=True) == env.mod.SKIPPED             # $7 of $7 spent on the failed run
+    assert len(codex_calls(env)) == 1
+
+
+def opus_calls(env):
+    return [c for c in env.reviewer_calls() if c["tool"] == "claude"]
+
+
+def test_a_codex_retry_does_not_rerun_opus_for_the_same_head(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=APPROVE, exit=3)
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    env.reviewer("codex", answer=APPROVE)
+    assert env.review("tier2", post=True) == env.mod.OK
+    assert len(opus_calls(env)) == 1 and len(codex_calls(env)) == 2
+    assert [s["state"] for s in env.statuses_posted()][-1] == "success"
+    assert "opus" in env.statuses_posted()[-1]["description"] and "codex" in env.statuses_posted()[-1]["description"]
+    assert env.mod.State(env.mod.load_config(str(env.cfg_path))).get(f"{REPO}#7#tier2").get("opus_approved") is None
+
+
+def test_the_remembered_opus_approve_keeps_its_notes_and_adds_no_spend(env):
+    env.config(RISKY, post=True)
+    note = {"file": "src/a.py", "line": 2, "severity": "note", "category": "tests", "why": "no test for eval"}
+    env.reviewer("claude", answer={**APPROVE, "findings": [note]})
+    env.reviewer("codex", answer=APPROVE, exit=3)
+    env.review("tier2", post=True)
+    env.reviewer("codex", answer=APPROVE)
+    env.review("tier2", post=True)
+    done = [x for x in read_log(env) if x["tier"] == "tier2" and x["state"] == "success"][-1]
+    assert [f["why"] for f in done["findings"]] == ["no test for eval"]
+    assert not done["usage"]                                             # the Opus run was billed once, when it ran
+
+
+def test_a_different_head_reruns_opus(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=APPROVE, exit=3)
+    env.review("tier2", post=True)
+    sp = env.tmp / "state/state.json"
+    st = json.loads(sp.read_text())
+    assert st[f"{REPO}#7#tier2"]["opus_approved"]["sha"] == env.head
+    st[f"{REPO}#7#tier2"]["opus_approved"]["sha"] = "0" * 40               # as if the head had moved on
+    sp.write_text(json.dumps(st))
+    env.reviewer("codex", answer=APPROVE)
+    assert env.review("tier2", post=True) == env.mod.OK
+    assert len(opus_calls(env)) == 2
+
+
+def test_force_reruns_opus(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=APPROVE, exit=3)
+    env.review("tier2", post=True)
+    env.reviewer("codex", answer=APPROVE)
+    assert env.review("tier2", "--force", post=True) == env.mod.OK
+    assert len(opus_calls(env)) == 2
+
+
+def test_the_retry_keeps_the_cooldown_and_the_budget_rules(env):
+    env.config(RISKY + "      codex: {daily_budget_usd: 5" + PRICES + "}\n", post=True)
+    env.reviewer("codex", answer=APPROVE, exit=3)
+    for _ in range(3):
+        env.review("tier2", post=True)
+    assert len(opus_calls(env)) == 1 and len(codex_calls(env)) == 3
+    assert env.review("tier2", post=True) == env.mod.SKIPPED             # cooling down
+    spend_codex(env, 5.0)
+    env.reviewer("codex", answer=APPROVE)
+    assert env.review("tier2", "--force", post=True) == env.mod.SKIPPED   # budget: skipped before anything runs
+
+
+@pytest.mark.parametrize("cfg", ["risky: null", "risky: {codex: null}", "risky: {globs: [\"src/**\"], codex: null}",
+                                 "risky:"])
+def test_null_risky_blocks_are_the_defaults(env, cfg):
+    env.config(cfg + "\n")
+    loaded = env.mod.load_config(str(env.cfg_path))
+    assert loaded["risky"]["codex"]["command"] == "codex" and loaded["risky"]["codex"]["time_cap_s"] == 1800
+    assert loaded["risky"]["globs"] == (["src/**"] if "src/**" in cfg else [])
+
+
+@pytest.mark.parametrize("bad,where", [
+    ('risky: {globs: "deploy/**"}', "risky.globs"), ('risky: {globs: null}', "risky.globs"),
+    ('risky: {globs: {a: b}}', "risky.globs"), ('risky: {globs: ["ok/**", 5]}', "risky.globs[1]"),
+    ('risky: {globs: [["a"]]}', "risky.globs[0]"), ('risky: {globs: ["ok", ""]}', "risky.globs[1]"),
+    ('risky: {globs: ["/etc/**"]}', "risky.globs[0]"), ('risky: {globs: ["a/../b"]}', "risky.globs[0]"),
+    ('risky: [1]', "risky"), ('risky: {codex: [1]}', "risky.codex")])
+def test_bad_risky_shapes_name_the_offending_key(env, bad, where):
+    env.config(bad + "\n")
+    with pytest.raises(env.mod.Refused) as e:
+        env.mod.load_config(str(env.cfg_path))
+    assert where in str(e.value)
+
+
+@pytest.mark.parametrize("glob,path,hit", [
+    ("deploy/", "deploy/a.sh", True), ("deploy/", "deploy/x/y.yaml", True), ("deploy/", "deployment/a", False),
+    ("deploy//", "deploy/a.sh", True), ("db/migrations/", "db/migrations/1.sql", True),
+    ("**/migrations/", "a/migrations/1.sql", True), ("deploy/", "deploy", False)])
+def test_a_trailing_slash_glob_means_everything_below(env, glob, path, hit):
+    assert bool(env.mod.glob_regex(glob).fullmatch(path)) is hit
+
+
+def test_a_trailing_slash_glob_makes_the_pr_risky(env):
+    env.config('risky: {globs: ["src/"]}\n', post=True)
+    assert env.review("tier2", post=True) == env.mod.OK
+    assert len(codex_calls(env)) == 1
+
+
+LIMIT_MSG = "You've hit your 5-hour limit \u00b7 resets 3:10pm (America/Los_Angeles)"
+
+
+def test_a_claude_error_printed_to_stdout_shows_in_the_why(env):
+    env.reviewer("claude", answer=APPROVE, exit=1, fail_stdout="Something \x1b[31mbroke\x07 badly\nsecond line")
+    assert env.review("tier2") == env.mod.FAILED
+    why = next(x for x in read_log(env) if x["tier"] == "tier2")["why"]
+    assert why.startswith("claude exited 1: Something") and "broke" in why and "badly" in why
+    assert "\x1b" not in why and "\x07" not in why and "\n" not in why
+    assert not why.startswith("usage-limit:")
+    st = env.mod.State(env.mod.load_config(str(env.cfg_path))).get(f"{REPO}#7#tier2")
+    assert st["failures"] == 1                                         # an ordinary failure still strikes
+
+
+def test_stderr_is_still_preferred_when_present(env):
+    env.reviewer("claude", answer=APPROVE, exit=1)                      # the stand-in writes "boom" to stderr
+    env.review("tier2")
+    assert next(x for x in read_log(env) if x["tier"] == "tier2")["why"] == "claude exited 1: boom"
+
+
+def test_the_stdout_tail_is_cut_at_300_characters(env):
+    env.reviewer("claude", answer=APPROVE, exit=1, fail_stdout="x" * 5000)
+    env.review("tier2")
+    why = next(x for x in read_log(env) if x["tier"] == "tier2")["why"]
+    assert len(why) <= len("claude exited 1: ") + 300
+
+
+@pytest.mark.parametrize("msg", [LIMIT_MSG, "Claude AI usage limit reached|1731", "you HIT YOUR weekly LIMIT"])
+def test_a_usage_limit_is_not_run_and_not_a_cooldown_strike(env, msg):
+    env.config(post=True)
+    env.reviewer("claude", answer=APPROVE, exit=1, fail_stdout=msg)
+    assert env.review("tier2", post=True) == env.mod.FAILED
+    line = next(x for x in read_log(env) if x["tier"] == "tier2")
+    assert line["state"] == "not-run" and line["why"].startswith("usage-limit:")
+    assert env.mod.State(env.mod.load_config(str(env.cfg_path))).get(f"{REPO}#7#tier2").get("failures", 0) == 0
+    assert only_pending(env)
+    for _ in range(4):                                                  # never cools down: it is retried next time
+        env.review("tier2", post=True)
+    assert len(opus_calls(env)) == 5
+
+
+def test_a_codex_usage_limit_is_labelled_and_keeps_the_opus_approve(env):
+    env.config(RISKY, post=True)
+    env.reviewer("codex", answer=APPROVE, exit=1, fail_stdout="You've hit your usage limit. Try again later.")
+    env.review("tier2", post=True)
+    assert codex_lines(env)[0]["why"].startswith("usage-limit:")
+    env.reviewer("codex", answer=APPROVE)
+    assert env.review("tier2", post=True) == env.mod.OK and len(opus_calls(env)) == 1
+
+
+def test_poll_stops_launching_tier2_reviews_once_the_account_is_out_of_quota(env):
+    st = env.gh_state()
+    st["prs"]["8"] = dict(st["prs"]["7"])
+    env.write_gh(st)
+    sh("git", "push", "-q", "origin", f"{env.head}:refs/pull/8/head", cwd=env.clone)
+    env.reviewer("claude", answer=APPROVE, exit=1, fail_stdout=LIMIT_MSG)
+    env.run("poll", "--repo", REPO)
+    assert [c["tool"] for c in env.reviewer_calls()] == ["pi", "claude", "pi"]     # PR 8: tier 1 only, no claude
