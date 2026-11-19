@@ -56,11 +56,15 @@ def _fit(line: str, width: int) -> str:
 
 
 def run_viewer(render: Callable[[int, int], list[str]], *, scroll: bool, title: str = "", fd_in: int = 0,
-               out=None, size: Callable[[], tuple[int, int]] | None = None) -> int:
+               out=None, size: Callable[[], tuple[int, int]] | None = None, refresh_s: float | None = None,
+               on_text: Callable[[str], bool] | None = None) -> int:
     """Show ``render(width, height)`` full screen until the reader quits; returns 0 on quit, 1 on error.
 
     ``height`` is the body height (the screen minus the footer line). A resize makes ``render`` run again at the new
     size, with the reader kept at the same fraction of the document. The terminal is restored on every exit path.
+
+    ``refresh_s`` redraws that often even when nothing was typed; ``on_text`` sees every typed chunk before the built-in
+    keys and returns True to redraw (q still quits). Both default to off.
     """
     out = out or sys.stdout
 
@@ -100,7 +104,9 @@ def run_viewer(render: Callable[[int, int], list[str]], *, scroll: bool, title: 
                 top = min(round(fraction * len(lines)), max(len(lines) - body, 0))
                 _draw(out, lines, top, width, body, scroll, title)
                 dirty = False
-            ready, _, _ = select.select([fd_in, wake_r], [], [])
+            ready, _, _ = select.select([fd_in, wake_r], [], [], refresh_s)
+            if not ready:
+                dirty = True
             if wake_r in ready:
                 while True:
                     try:
@@ -114,6 +120,8 @@ def run_viewer(render: Callable[[int, int], list[str]], *, scroll: bool, title: 
                 if not data:
                     return 0
                 moved = False
+                if on_text is not None and on_text(data.decode("utf-8", "ignore")):
+                    dirty = True
                 for action in _parse_keys(data):
                     if action == "quit":
                         return 0

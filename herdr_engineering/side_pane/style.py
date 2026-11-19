@@ -5,6 +5,7 @@ neighbours already use; a line that fits is returned whole, escape codes include
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 
 from ..agent_ops_tui import _ASCII, RESET, RenderOpts, cell_width, fit, sgr
@@ -12,6 +13,15 @@ from ..agent_ops_tui import _ASCII, RESET, RenderOpts, cell_width, fit, sgr
 Seg = tuple[str, str | None]  # text, style names joined with "+" as `agent_ops_tui.sgr` takes them
 _PLAIN = {**_ASCII, ord("│"): "|", ord("▶"): ">", ord("✓"): "+", ord("─"): "-"}
 _ELLIPSIS = "…"
+_ESCAPES = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]?|\x1b[ -/]*[@-~]?|\x9b[0-?]*[ -/]*[@-~]?")
+_BLANKS = re.compile(r"[\t\n\r\x0b\x0c]+")
+_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def clean(text: str) -> str:
+    """`text` without terminal escape sequences or control characters: what a record, title or reason may carry must
+    never reach the terminal as a command. The one place text is made safe: every renderer draws through `line`."""
+    return _CONTROLS.sub("", _BLANKS.sub(" ", _ESCAPES.sub("", text)))
 
 
 def paint(text: str, style: str | None, opts: RenderOpts) -> str:
@@ -23,6 +33,7 @@ def line(segs: Sequence[Seg], width: int, opts: RenderOpts) -> str:
     """The segments as one line of at most `width` columns; what does not fit is replaced by a final ellipsis."""
     if width < 1:
         return ""
+    segs = [(clean(t), s) for t, s in segs]
     segs = [(t if opts.unicode else t.translate(_PLAIN), s) for t, s in segs]
     total = sum(cell_width(t) for t, _ in segs)
     budget = width if total <= width else width - 1
