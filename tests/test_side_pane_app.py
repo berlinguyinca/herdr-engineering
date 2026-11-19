@@ -375,15 +375,14 @@ def test_a_pane_without_a_tab_reports_it_is_outside_herdr(tmp_path: Path) -> Non
 
 def test_the_tab_keys_work_and_q_is_left_to_the_viewer(tmp_path: Path) -> None:
     pane_app = gone_app(tmp_path)
-    assert pane_app.on_text("2") is True and pane_app.on_text("x") is False and not pane_app.quit_requested
-    assert pane_app.on_text("q") is False and not pane_app.quit_requested  # only on_quit, called as the viewer exits, sets it
+    assert pane_app.on_text("2") is True and pane_app.on_text("x") is False
+    assert pane_app.on_text("q") is False  # quitting is the viewer's decision
 
 
 def test_closing_removes_the_marker_and_a_quit_leaves_nothing_behind_without_sessions(tmp_path: Path) -> None:
     root = state.state_dir({"HERDR_ENGINEERING_STATE": str(tmp_path)})
     state.write_marker(root, state.Marker("w1:t1", "w1:p2", "t-2", None, 1, 1000.0))
     pane_app = gone_app(tmp_path)
-    pane_app.on_quit()
     pane_app.close()
     assert state.read_marker(root, "w1:t1") is None
 

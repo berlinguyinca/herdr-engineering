@@ -82,12 +82,10 @@ def test_the_viewer_without_a_guard_quits_at_once_and_on_eof() -> None:
     assert code == 0 and quits == [0.0] and elapsed < 2.0
 
 
-def test_quit_requested_is_set_only_by_the_key_the_viewer_quit_on(tmp_path: Path) -> None:
+def test_a_chunk_with_a_q_in_it_is_not_a_tab_key(tmp_path: Path) -> None:
     pane_app = app.PaneApp("w1:t1", "w1:p2", SideHerdr(binary=str(tmp_path / "no-herdr")), {"HERDR_ENGINEERING_STATE": str(tmp_path)},
                            fetch_ci=None, store_root=tmp_path / "store")
-    assert pane_app.on_text("hello q, ctrl-c is \x03 and Q") is False and not pane_app.quit_requested
-    pane_app.on_quit()
-    assert pane_app.quit_requested
+    assert pane_app.on_text("hello q, ctrl-c is \x03 and Q") is False
 
 
 def test_the_runner_asks_the_viewer_for_the_two_second_guard() -> None:

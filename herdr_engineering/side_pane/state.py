@@ -154,14 +154,15 @@ def process_start(pid: int) -> str | None:
     return text if done.returncode == 0 and text else None
 
 
-def marker_live(marker: Marker, now: float, grace_s: float = STARTUP_GRACE_S) -> bool:
+def marker_live(marker: Marker, now: float, grace_s: float = STARTUP_GRACE_S, started: str | None = None) -> bool:
     """Whether the marker's runner is alive, or has not started yet (a marker `ensure` wrote, within the start grace).
-    A recorded start time must match the process now holding the pid."""
+    A recorded start time must match the process now holding the pid; `started` is that process's start when the caller
+    already asked `ps` (it is asked here otherwise)."""
     if marker.pid is None:
         return 0 <= now - marker.created < grace_s
     if not _alive(marker.pid):
         return False
-    return marker.runner_start is None or process_start(marker.pid) == marker.runner_start
+    return marker.runner_start is None or (started or process_start(marker.pid)) == marker.runner_start
 
 
 def is_marked(root: Path, pane: AgentPane, now: float, terminal_id: str | None = None, grace_s: float = STARTUP_GRACE_S) -> bool:
@@ -176,11 +177,11 @@ def is_marked(root: Path, pane: AgentPane, now: float, terminal_id: str | None =
     if terminal_id is not None and terminal_id != marker.terminal_id:
         clear_marker(root, pane.tab_id)
         return False
-    if marker.pid is not None and marker.runner_start is not None and _alive(marker.pid) \
-            and process_start(marker.pid) != marker.runner_start:
+    started = process_start(marker.pid) if marker.pid is not None and marker.runner_start is not None and _alive(marker.pid) else None
+    if started is not None and started != marker.runner_start:
         clear_marker(root, pane.tab_id)
         return False
-    return marker_live(marker, now, grace_s)
+    return marker_live(marker, now, grace_s, started)
 
 
 @contextmanager
