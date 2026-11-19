@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: CI report relay failures are no longer silent
+
+- `ci_report_relay` printed only `N published, M failed`. It now writes one stderr line per failing bundle (`CI report relay: failed <bundle>: <reason>`), per unreadable source file (errno name), and for whole-run failures, plus the reader exit status on source errors. Reasons are fixed strings or errno names: no URLs, keys or bundle contents. Delivery and fail-closed identity checks are unchanged.
+
 ### Workflow hooks: hand off automatically on long context
 - The `PreCompact` message and the `SessionStart` reminder now tell the agent to run `/handoff` itself, without asking the user, after background subagents have reported and work is committed/pushed where allowed (previously a suggestion). The reminder also says not to ask the user about choices the defaults already settle. The hooks still only print text.
 
