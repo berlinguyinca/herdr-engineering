@@ -203,6 +203,7 @@ To opt in, run:
 
 ```bash
 herdr-eng handoff auto install     # idempotent; also: uninstall | check [--dry-run] [--json]
+herdr-eng handoff auto off|on [--pane ID]   # per-pane switch for automatic handoff (default pane: $HERDR_PANE_ID)
 ```
 
 `install` appends one `UserPromptSubmit` entry (plus the `SubagentStart` and `SubagentStop` entries described in the next section), each carrying the marker `herdr-handoff-auto`

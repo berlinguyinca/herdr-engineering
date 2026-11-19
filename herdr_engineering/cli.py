@@ -540,8 +540,9 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="wait until no subagent is live: exit 0 when idle, 3 on timeout")
     mode.add_argument("--purge", action="store_true", help="delete the pane's registry entries (pane closed)")
     p2.set_defaults(func=_cmd_handoff_subagents, subagents_parser=p2)
-    p2 = hsub.add_parser("auto", help="install, remove or check the opt-in context-hook in ~/.claude/settings.json")
-    p2.add_argument("auto_action", choices=("install", "uninstall", "check"))
+    p2 = hsub.add_parser("auto", help="install, remove or check the opt-in context-hook in ~/.claude/settings.json; off/on switch a pane")
+    p2.add_argument("auto_action", choices=("install", "uninstall", "check", "off", "on"))
+    p2.add_argument("--pane", default=None, help="off/on: pane id (default: $HERDR_PANE_ID)")
     p2.add_argument("--home", default=None, help="override $HOME (tests)")
     p2.add_argument("--dry-run", action="store_true", help="report what would change without writing")
     p2.add_argument("--subagents-only", action="store_true", help="install: only the SubagentStart/SubagentStop registry hooks")
@@ -1627,6 +1628,8 @@ def _cmd_handoff_context(args) -> int:
 
 
 def _cmd_handoff_auto(args) -> int:
+    if args.auto_action in ("off", "on"):
+        return _cmd_handoff_auto_switch(args)
     from . import handoff_auto_setup as ha
     home = Path(args.home) if args.home else None
     if args.subagents_only and args.auto_action != "install":
@@ -1644,6 +1647,19 @@ def _cmd_handoff_auto(args) -> int:
         for item in items:
             print(f"{item.action:10} {item.target}" + (f"  ({item.detail})" if item.detail else ""))
     return 0 if ok else 1
+
+
+def _cmd_handoff_auto_switch(args) -> int:
+    from .handoff_controller.switch import set_enabled
+    from .handoff_subagent_registry import _state_dir
+    pane = args.pane or os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        args.auto_parser.error("--pane is required when $HERDR_PANE_ID is not set")
+    if args.subagents_only:
+        args.auto_parser.error("--subagents-only only applies to the install action")
+    set_enabled(pane, args.auto_action == "on", _state_dir(os.environ).parent)
+    print(f"auto-handoff {args.auto_action} for pane {pane}")
+    return 0
 
 
 def _cmd_handoff_subagent_hook(args) -> int:
