@@ -26,6 +26,7 @@ from .memory_install import (
     _atomic_write,
     _diff,
     _dump_json,
+    writable_target,
 )
 from .workflow_guard import MATCHER as GUARD_MATCHER
 from .workflow_guard import decide
@@ -102,10 +103,11 @@ class Result:
     path: str = ""
     diff: str = ""
     dry_run: bool = False
+    detail: str = ""
 
     def to_dict(self):
         return {"ok": self.ok, "action": self.action, "state": self.state, "path": self.path,
-                "dry_run": self.dry_run}
+                "dry_run": self.dry_run, **({"detail": self.detail} if self.detail else {})}
 
 
 class WorkflowInstaller:
@@ -139,6 +141,15 @@ class WorkflowInstaller:
             # The first backup is the untouched pre-install copy; later ones never overwrite it.
             shutil.copy2(path, pristine if not pristine.exists() else dest / f"{path.name}.{time.time_ns()}.bak")
 
+    def _write(self, res: Result, new: str) -> None:
+        """Back up, then write; a read-only file or directory turns `res` into a failure with a one-line reason and writes nothing."""
+        try:
+            writable_target(self.unit.path)
+            self._backup()
+            _atomic_write(self.unit.path, new)
+        except OSError as exc:
+            res.ok, res.action, res.detail = False, "refused", f"cannot write settings.json: {exc}"
+
     def install(self, *, dry_run: bool = False) -> Result:
         if not self._claude_present():
             return Result(True, "skip", ABSENT, str(self.unit.path), "claude not installed", dry_run)
@@ -154,8 +165,7 @@ class WorkflowInstaller:
         res.action = "create" if state == ABSENT else "update"
         res.diff = _diff(text, new, self.unit.path.name)
         if not dry_run:
-            self._backup()
-            _atomic_write(self.unit.path, new)
+            self._write(res, new)
         return res
 
     repair = install
@@ -168,8 +178,7 @@ class WorkflowInstaller:
             new = self.unit.remove(text)
             res.action, res.diff = "remove", _diff(text, new, self.unit.path.name)
             if not dry_run:
-                self._backup()
-                _atomic_write(self.unit.path, new)
+                self._write(res, new)
         elif state == INVALID:
             res.ok, res.action = False, "invalid"
         return res

@@ -645,7 +645,7 @@ def _build_parser() -> argparse.ArgumentParser:
                                         "plan/install/status/doctor/repair/uninstall")
     wsub = p.add_subparsers(dest="workflow_command", required=True)
     for name, helptext in (("plan", "show what install would change (read-only)"),
-                           ("install", "register the managed SessionStart/PreCompact/PreToolUse hooks in ~/.claude/settings.json"),
+                           ("install", "register the managed SessionStart/PreToolUse hooks in ~/.claude/settings.json"),
                            ("status", "managed-hook state (read-only)"),
                            ("doctor", "drift check"),
                            ("repair", "re-apply missing or drifted managed hooks"),
@@ -1779,7 +1779,8 @@ def _cmd_workflow(args) -> int:
     if args.json:
         _print_json(res.to_dict())
     else:
-        print(f"{res.action:9} {res.path}" + (f"  [{res.state}]" if res.state != "absent" else ""))
+        print(f"{res.action:9} {res.path}" + (f"  [{res.state}]" if res.state != "absent" else "")
+              + (f"  {res.detail}" if res.detail else ""))
         if res.diff and (dry or cmd == "plan"):
             print(res.diff, end="")
     return 0 if res.ok else 1

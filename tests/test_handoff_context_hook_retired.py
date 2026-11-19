@@ -66,3 +66,21 @@ def test_global_off_switch_still_honoured_by_the_controller(tmp_path: Path) -> N
     assert not is_enabled("%1", {"HERDR_HANDOFF_AUTO": "0"}, tmp_path)
     set_enabled("%1", True, tmp_path)  # a pane switched on does not override the global off switch
     assert not is_enabled("%1", {"HERDR_HANDOFF_AUTO": "0"}, tmp_path)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read a chmod 000 file")
+def test_legacy_command_never_opens_the_transcript(tmp_path: Path) -> None:
+    stdin = over_fifty_percent(tmp_path)
+    transcript = tmp_path / "t.jsonl"
+    transcript.chmod(0o000)
+    try:
+        done = run(["claude"], stdin, tmp_path)
+    finally:
+        transcript.chmod(0o600)
+    assert (done.returncode, done.stdout, done.stderr) == (0, b"", b"")
+
+
+def test_workflow_help_does_not_offer_precompact_as_installed(tmp_path: Path) -> None:
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "PYTHONPATH": str(ROOT)}
+    done = subprocess.run([sys.executable, "-c", CODE, "workflow", "--help"], env=env, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0 and "SessionStart/PreToolUse" in done.stdout and "PreCompact" not in done.stdout

@@ -26,6 +26,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from .memory_install import writable_target
+
 CONFIG_REL = Path(".config/herdr-engineering/config.yaml")
 FLEET_RELS = (Path(".config/herdr-engineering/fleet/fleet-config.yaml"), Path(".config/herdr-engineering/fleet-config.yaml"))
 HOOK_MARKER = "herdr-join-auto"
@@ -145,6 +147,7 @@ def resolve_listener(home: Path | None = None) -> tuple[str, str] | None:
 # --------------------------------------------------------------------------
 
 def _write_text(path: Path, text: str) -> None:
+    path = writable_target(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.fj-")
