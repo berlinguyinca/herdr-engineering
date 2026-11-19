@@ -152,6 +152,7 @@ def test_the_controller_raises_for_an_outcome_the_retry_logic_should_see(monkeyp
 
 def test_the_controller_treats_a_held_lock_as_retryable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path))
+    monkeypatch.setenv("PATH", str(tmp_path))  # whatever happens, no real `herdr` is run
     root = state.state_dir(os.environ)
     with state.tab_lock(root, "w1:t1", 0) as held:
         assert held

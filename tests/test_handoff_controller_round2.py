@@ -383,7 +383,8 @@ def test_the_side_pane_is_ensured_for_each_new_session_in_a_tab_and_not_on_every
     assert asked.count("t2") == 1
 
 
-def test_the_default_side_pane_check_is_false_while_the_package_is_missing() -> None:
+def test_the_default_side_pane_check_is_false_for_a_pane_without_a_marker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "state"))  # the check reads markers only, never Herdr
     w_pane = AgentPane("p1", "t1", "claude", "idle", None, None)
     assert ctlrun.default_is_side_pane(w_pane) is False
     assert ctlrun.Controller.__dataclass_fields__["is_side_pane"].default is ctlrun.default_is_side_pane
