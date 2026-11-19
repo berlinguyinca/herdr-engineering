@@ -404,6 +404,9 @@ def test_install_sh_links_the_handoff_plugins_with_an_opt_out() -> None:
     link = script.index("handoff controller link")
     assert script.index("handoff auto install --subagents-only") < link           # after the hook steps
     assert '--herdr-eng "$VENV/bin/herdr-eng"' in script                           # the absolute path the plugins run
+    assert '--stable-link "$LINK_DIR/herdr-eng"' in script and "--editable" in script  # the stable entry point, and the checkout says so
+    after = script[link:script.index("# --- 7d.")]
+    assert "next Herdr start" in after and "herdr-eng handoff controller run" in after  # said right after linking
     assert script.rindex("handoff auto check") > link                              # the end prints the controller check
     assert "--no-handoff-plugins" in subprocess.run(["bash", str(Path(REPO) / "scripts/install.sh"), "--help"], capture_output=True,
                                                     text=True, timeout=30, env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"}).stdout

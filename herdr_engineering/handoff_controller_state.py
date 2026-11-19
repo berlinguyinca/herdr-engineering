@@ -15,6 +15,7 @@ import os
 import re
 import shlex
 import subprocess
+import tempfile
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -39,13 +40,26 @@ class ControllerState(StrEnum):
     RUNNING = "running"                    # a controller holds the lock
     LINKED = "linked"                      # plugin linked; its startup command runs when Herdr next starts
     NOT_LINKED = "not_linked"
+    DISABLED = "disabled"                  # linked but switched off in Herdr: its startup command never runs
     HERDR_UNAVAILABLE = "herdr_unavailable"  # herdr missing or not answering: no way to tell, and no controller without it
+    REPLY_NOT_UNDERSTOOD = "reply_not_understood"  # herdr answered, but `plugin list` was not the JSON this code reads
 
 
 class SidePaneState(StrEnum):
     LINKED = "linked"
     NOT_LINKED = "not_linked"
+    DISABLED = "disabled"
     HERDR_UNAVAILABLE = "herdr_unavailable"
+    REPLY_NOT_UNDERSTOOD = "reply_not_understood"
+
+
+class Presence(StrEnum):
+    """What `herdr plugin list` says about one plugin id."""
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+    ABSENT = "absent"
+    UNAVAILABLE = "unavailable"
+    NOT_UNDERSTOOD = "not_understood"
 
 
 @dataclass(frozen=True)
@@ -56,21 +70,20 @@ class Finding:
     fix: str = ""
 
 
-def classify_controller(*, linked: bool | None, running: bool, switched_off: bool) -> ControllerState:
-    """`linked` is None when Herdr could not be asked."""
+def classify_controller(*, plugin: Presence, running: bool, switched_off: bool) -> ControllerState:
     if switched_off:
         return ControllerState.SWITCHED_OFF
     if running:
         return ControllerState.RUNNING
-    if linked is None:
-        return ControllerState.HERDR_UNAVAILABLE
-    return ControllerState.LINKED if linked else ControllerState.NOT_LINKED
+    return {Presence.ENABLED: ControllerState.LINKED, Presence.ABSENT: ControllerState.NOT_LINKED,
+            Presence.DISABLED: ControllerState.DISABLED, Presence.UNAVAILABLE: ControllerState.HERDR_UNAVAILABLE,
+            Presence.NOT_UNDERSTOOD: ControllerState.REPLY_NOT_UNDERSTOOD}[plugin]
 
 
-def classify_side_pane(linked: bool | None) -> SidePaneState:
-    if linked is None:
-        return SidePaneState.HERDR_UNAVAILABLE
-    return SidePaneState.LINKED if linked else SidePaneState.NOT_LINKED
+def classify_side_pane(plugin: Presence) -> SidePaneState:
+    return {Presence.ENABLED: SidePaneState.LINKED, Presence.ABSENT: SidePaneState.NOT_LINKED,
+            Presence.DISABLED: SidePaneState.DISABLED, Presence.UNAVAILABLE: SidePaneState.HERDR_UNAVAILABLE,
+            Presence.NOT_UNDERSTOOD: SidePaneState.REPLY_NOT_UNDERSTOOD}[plugin]
 
 
 def _link_fix(deploy_dir: Path, plugin: str) -> str:
@@ -89,9 +102,15 @@ def describe_controller(state: ControllerState, deploy_dir: Path) -> Finding:
             state, True, "controller plugin not linked in Herdr and no controller running: nothing hands a session off",
             f"{fix_link}, or `herdr plugin link {deploy_dir / CONTROLLER_PLUGIN}`; then restart Herdr or run "
             "`herdr-eng handoff controller run`"),
+        ControllerState.DISABLED: Finding(
+            state, True, "controller plugin linked but disabled in Herdr, and no controller running: nothing hands a session off",
+            f"run `herdr plugin enable {CONTROLLER_ID}`; then restart Herdr or run `herdr-eng handoff controller run`"),
         ControllerState.HERDR_UNAVAILABLE: Finding(
             state, True, "herdr is not installed or not answering, and no controller is running",
             "install Herdr 0.9.1 or newer, then run `herdr-eng handoff controller link`"),
+        ControllerState.REPLY_NOT_UNDERSTOOD: Finding(
+            state, True, "herdr reply not understood (`herdr plugin list --json` was not the expected JSON), and no controller is running",
+            "update herdr-eng or Herdr so they agree on the plugin list format, or run `herdr-eng handoff controller run` by hand"),
     }[state]
 
 
@@ -100,7 +119,10 @@ def describe_side_pane(state: SidePaneState, deploy_dir: Path) -> Finding:
         SidePaneState.LINKED: Finding(state, False, "session side pane plugin linked"),
         SidePaneState.NOT_LINKED: Finding(state, False, "session side pane plugin not linked (the controller works without it)",
                                           _link_fix(deploy_dir, SESSION_PANE_PLUGIN)),
+        SidePaneState.DISABLED: Finding(state, False, "session side pane plugin linked but disabled in Herdr",
+                                        f"run `herdr plugin enable {SESSION_PANE_ID}`"),
         SidePaneState.HERDR_UNAVAILABLE: Finding(state, False, "herdr is not installed or not answering; side pane not checked"),
+        SidePaneState.REPLY_NOT_UNDERSTOOD: Finding(state, False, "herdr reply not understood; side pane not checked"),
     }[state]
 
 
@@ -128,16 +150,21 @@ class PluginHost:
         done = self._run("--version")
         return parse_version(done.stdout) if done and done.returncode == 0 else None
 
-    def plugin_roots(self) -> dict[str, str] | None:
-        """Enabled plugin id -> plugin root; None when herdr cannot be asked."""
+    def listing(self) -> tuple[dict[str, tuple[str, bool]], Presence | None]:
+        """(plugin id -> (root, enabled), None) or ({}, UNAVAILABLE | NOT_UNDERSTOOD)."""
         done = self._run("plugin", "list", "--json")
         if done is None or done.returncode != 0:
-            return None
+            return {}, Presence.UNAVAILABLE
         try:
             plugins = json.loads(done.stdout)["result"]["plugins"]
-            return {p["plugin_id"]: p["plugin_root"] for p in plugins if p.get("enabled")}
+            return {p["plugin_id"]: (p["plugin_root"], bool(p.get("enabled"))) for p in plugins}, None
         except (ValueError, KeyError, TypeError):
-            return None
+            return {}, Presence.NOT_UNDERSTOOD
+
+    def plugin_roots(self) -> dict[str, str] | None:
+        """Linked plugin id -> plugin root; None when herdr cannot be asked or its reply is not understood."""
+        plugins, problem = self.listing()
+        return None if problem else {pid: root for pid, (root, _) in plugins.items()}
 
     def link(self, path: Path) -> str | None:
         """None when linked, else the reason."""
@@ -161,10 +188,17 @@ def controller_findings(env: Mapping[str, str] | None = None, *, herdr_bin: str 
     deploy = deploy_dir or default_deploy_dir()
     running = lock_held(state_root(env))
     switched_off = env.get("HERDR_HANDOFF_AUTO") == "0"
-    roots = PluginHost(herdr_bin, env, cwd).plugin_roots()
-    controller = classify_controller(linked=None if roots is None else CONTROLLER_ID in roots, running=running,
-                                     switched_off=switched_off)
-    side = classify_side_pane(None if roots is None else SESSION_PANE_ID in roots)
+    plugins, problem = PluginHost(herdr_bin, env, cwd).listing()
+
+    def presence(plugin_id: str) -> Presence:
+        if problem:
+            return problem
+        if plugin_id not in plugins:
+            return Presence.ABSENT
+        return Presence.ENABLED if plugins[plugin_id][1] else Presence.DISABLED
+
+    controller = classify_controller(plugin=presence(CONTROLLER_ID), running=running, switched_off=switched_off)
+    side = classify_side_pane(presence(SESSION_PANE_ID))
     return describe_controller(controller, deploy), describe_side_pane(side, deploy)
 
 
@@ -188,6 +222,44 @@ def render_manifest(text: str, herdr_eng: str) -> str:
     return out
 
 
+@dataclass(frozen=True)
+class EntryPoint:
+    path: str
+    notes: tuple[str, ...] = ()
+
+
+def choose_entry_point(stable_link: Path, own_binary: Path, *, editable: bool) -> EntryPoint:
+    """The `herdr-eng` the plugin manifests name: the stable link a user's shell runs (normally ~/.local/bin/herdr-eng) when it is a
+    symlink to this install's own binary; otherwise the install's own binary, with a warning when another install owns the link."""
+    notes: list[str] = []
+    is_ours = stable_link.is_symlink() and stable_link.resolve() == own_binary.resolve()
+    if is_ours:
+        path = stable_link
+    else:
+        path = own_binary
+        if stable_link.is_symlink() or stable_link.exists():
+            notes.append(f"warning: {stable_link} belongs to another install and was left alone; the plugins run {own_binary}, "
+                         "which may differ from the herdr-eng you type")
+        else:
+            notes.append(f"note: {stable_link} is not linked; the plugins run {own_binary}")
+    if editable:
+        notes.append(f"note: this is a checkout install; the plugins run {own_binary} inside the checkout and stop working if it is removed")
+    return EntryPoint(str(path), tuple(notes))
+
+
+def write_atomically(path: Path, text: str) -> None:
+    """Temp file in the same directory, then replace: Herdr never reads a half-written manifest."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def link_plugins(deploy_dir: Path, herdr_eng: str, *, data_dir: Path, herdr_bin: str = "herdr",
                  env: Mapping[str, str] | None = None, cwd: Path | None = None) -> list[Item]:
     """Link both plugins into Herdr from copies under `data_dir` whose commands use the absolute `herdr_eng`. Idempotent: a plugin
@@ -199,6 +271,9 @@ def link_plugins(deploy_dir: Path, herdr_eng: str, *, data_dir: Path, herdr_bin:
         return [Item("herdr", "skipped", "herdr is not installed or not answering; plugins not linked")]
     if version < MIN_HERDR:
         return [Item("herdr", "skipped", f"herdr {'.'.join(map(str, version))} is older than 0.9.1 (plugins need it); plugins not linked")]
+    exe = Path(herdr_eng)
+    if not (exe.is_file() and os.access(exe, os.X_OK)):
+        return [Item("herdr-eng", "unresolved", f"{herdr_eng} is not an executable file; plugins not linked")]
     items: list[Item] = []
     for name in PLUGINS:
         source = deploy_dir / name / "herdr-plugin.toml"
@@ -210,13 +285,17 @@ def link_plugins(deploy_dir: Path, herdr_eng: str, *, data_dir: Path, herdr_bin:
             continue
         target = (data_dir / name).resolve()
         manifest = target / "herdr-plugin.toml"
-        roots = host.plugin_roots() or {}
-        current = manifest.read_text(encoding="utf-8") if manifest.is_file() else None
-        if current == rendered and roots.get(plugin_id) == str(target):
-            items.append(Item(plugin_id, "unchanged", f"linked to {target}"))
+        try:
+            roots = host.plugin_roots() or {}
+            current = manifest.read_text(encoding="utf-8") if manifest.is_file() else None
+            if current == rendered and roots.get(plugin_id) == str(target):
+                items.append(Item(plugin_id, "unchanged", f"linked to {target}"))
+                continue
+            target.mkdir(parents=True, exist_ok=True)
+            write_atomically(manifest, rendered)
+        except OSError as exc:
+            items.append(Item(plugin_id, "unresolved", f"cannot write {manifest}: {exc.strerror or exc}"))
             continue
-        target.mkdir(parents=True, exist_ok=True)
-        manifest.write_text(rendered, encoding="utf-8")
         failure = host.link(target)
         items.append(Item(plugin_id, "unresolved", f"herdr plugin link failed: {failure}") if failure else
                      Item(plugin_id, "installed", f"linked to {target}"
