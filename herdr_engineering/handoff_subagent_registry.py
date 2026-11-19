@@ -21,9 +21,13 @@ from typing import TextIO
 STALE_SECONDS = 6 * 3600
 
 
+def state_root(env: Mapping[str, str]) -> Path:
+    """The state directory of every herdr-eng feature: `HERDR_ENGINEERING_STATE`, else under the `HOME` of `env`."""
+    return Path(env.get("HERDR_ENGINEERING_STATE") or Path(env.get("HOME") or Path.home()) / ".local/share/herdr-engineering/state")
+
+
 def _state_dir(env: Mapping[str, str]) -> Path:
-    root = env.get("HERDR_ENGINEERING_STATE") or str(Path.home() / ".local/share/herdr-engineering/state")
-    return Path(root) / "subagents"
+    return state_root(env) / "subagents"
 
 
 def sanitize(name: str) -> str:

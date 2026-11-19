@@ -1583,11 +1583,11 @@ def _cmd_handoff_auto(args) -> int:
 
 def _cmd_handoff_auto_switch(args) -> int:
     from .handoff_controller.switch import set_enabled
-    from .handoff_subagent_registry import _state_dir
+    from .handoff_subagent_registry import state_root
     pane = args.pane or os.environ.get("HERDR_PANE_ID")
     if not pane:
         args.auto_parser.error("--pane is required when $HERDR_PANE_ID is not set")
-    set_enabled(pane, args.auto_action == "on", _state_dir(os.environ).parent)
+    set_enabled(pane, args.auto_action == "on", state_root(os.environ))
     print(f"auto-handoff {args.auto_action} for pane {pane}")
     return 0
 

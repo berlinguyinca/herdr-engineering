@@ -25,8 +25,8 @@ from herdr_engineering.handoff_controller.run import (
     Chain,
     Controller,
     ControllerLock,
+    LoopStep,
     PaneRuntime,
-    Step,
     build_controller,
     drain_not_typed_reason,
     lock_held,
@@ -52,8 +52,8 @@ WINDOW = 200_000  # claude-opus-4-8 in the model table; the adapter below has no
 
 def _event(name: str, at: float = 1000.0, *, chain: str = "c1", pane: str = "p1", session: str | None = "s1",
            reason: str | None = None, colour: Colour | None = None, handoff_id: str | None = None) -> HandoffEvent:
-    from herdr_engineering.handoff_controller.run import _iso
-    return HandoffEvent(name, _iso(at), chain, pane, session, Harness.CLAUDE, handoff_id, None, None, colour, reason, None)
+    from herdr_engineering.handoff_controller.events import iso
+    return HandoffEvent(name, iso(at), chain, pane, session, Harness.CLAUDE, handoff_id, None, None, colour, reason, None)
 
 
 def _usage_line(used: int) -> str:
@@ -146,36 +146,36 @@ def test_the_agent_names_the_loop_and_the_drain_guard_share() -> None:
 
 def test_next_step_starts_a_chain_only_at_the_limit_and_only_when_allowed() -> None:
     rt = PaneRuntime("s1")
-    assert next_step(None, rt, Decision.NONE, 0, CFG, True) is Step.NONE
-    assert next_step(None, rt, Decision.DRAIN, 0, CFG, True) is Step.DRAIN
-    assert next_step(None, rt, Decision.OVER_CEILING, 0, CFG, True) is Step.DRAIN
-    assert next_step(None, rt, Decision.DRAIN, 0, CFG, False) is Step.NONE
+    assert next_step(None, rt, Decision.NONE, 0, CFG, True) is LoopStep.NONE
+    assert next_step(None, rt, Decision.DRAIN, 0, CFG, True) is LoopStep.DRAIN
+    assert next_step(None, rt, Decision.OVER_CEILING, 0, CFG, True) is LoopStep.DRAIN
+    assert next_step(None, rt, Decision.DRAIN, 0, CFG, False) is LoopStep.NONE
 
 
 def test_next_step_waits_for_the_briefing_then_falls_back_once_the_timeout_passes() -> None:
     chain = Chain("c1", 100.0, "t", None, False)
     rt = PaneRuntime("s1", typed=True, wait_since=100.0, quiet_since=100.0)  # idle, no live subagent, since the typing
-    assert next_step(chain, rt, Decision.DRAIN, 100.0 + CFG.briefing_timeout_s - 1, CFG, True) is Step.CHECK_BRIEFING
-    assert next_step(chain, rt, Decision.NONE, 100.0 + CFG.briefing_timeout_s, CFG, True) is Step.FALLBACK
+    assert next_step(chain, rt, Decision.DRAIN, 100.0 + CFG.briefing_timeout_s - 1, CFG, True) is LoopStep.CHECK_BRIEFING
+    assert next_step(chain, rt, Decision.NONE, 100.0 + CFG.briefing_timeout_s, CFG, True) is LoopStep.FALLBACK
     busy = PaneRuntime("s1", typed=True, wait_since=100.0)  # working or with live subagents: not before the bound
-    assert next_step(chain, busy, Decision.NONE, 100.0 + CFG.briefing_timeout_s + 1, CFG, True) is Step.CHECK_BRIEFING
-    assert next_step(chain, busy, Decision.NONE, 100.0 + CFG.drain_timeout_s, CFG, True) is Step.FALLBACK
+    assert next_step(chain, busy, Decision.NONE, 100.0 + CFG.briefing_timeout_s + 1, CFG, True) is LoopStep.CHECK_BRIEFING
+    assert next_step(chain, busy, Decision.NONE, 100.0 + CFG.drain_timeout_s, CFG, True) is LoopStep.FALLBACK
 
 
 def test_next_step_retries_the_drain_until_the_drain_timeout_and_never_types_during_a_cooldown() -> None:
     chain = Chain("c1", 100.0, None, None, False)
     rt = PaneRuntime("s1")
-    assert next_step(chain, rt, Decision.DRAIN, 150.0, CFG, True) is Step.DRAIN
+    assert next_step(chain, rt, Decision.DRAIN, 150.0, CFG, True) is LoopStep.DRAIN
     cooling = PaneRuntime("s1", cooldown_until=500.0)
-    assert next_step(chain, cooling, Decision.DRAIN, 150.0, CFG, True) is Step.CHECK_BRIEFING
-    assert next_step(chain, cooling, Decision.DRAIN, 500.0, CFG, True) is Step.DRAIN
-    assert next_step(chain, rt, Decision.DRAIN, 100.0 + CFG.drain_timeout_s, CFG, True) is Step.DRAIN_STUCK
+    assert next_step(chain, cooling, Decision.DRAIN, 150.0, CFG, True) is LoopStep.CHECK_BRIEFING
+    assert next_step(chain, cooling, Decision.DRAIN, 500.0, CFG, True) is LoopStep.DRAIN
+    assert next_step(chain, rt, Decision.DRAIN, 100.0 + CFG.drain_timeout_s, CFG, True) is LoopStep.DRAIN_STUCK
 
 
 def test_next_step_finishes_a_chain_that_has_a_briefing_or_a_started_takeover() -> None:
     rt = PaneRuntime("s1")
-    assert next_step(Chain("c", 1.0, "t", "handoff_x", False), rt, Decision.NONE, 2.0, CFG, True) is Step.FINISH
-    assert next_step(Chain("c", 1.0, "t", None, True), rt, Decision.NONE, 2.0, CFG, True) is Step.FINISH
+    assert next_step(Chain("c", 1.0, "t", "handoff_x", False), rt, Decision.NONE, 2.0, CFG, True) is LoopStep.FINISH
+    assert next_step(Chain("c", 1.0, "t", None, True), rt, Decision.NONE, 2.0, CFG, True) is LoopStep.FINISH
 
 
 def test_open_chain_is_the_last_triggered_chain_without_a_terminal_event() -> None:

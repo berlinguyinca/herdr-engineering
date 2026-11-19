@@ -286,20 +286,6 @@ def _create_args(ref: SessionRef, worktree: Path, store_root: Path, answer: Mapp
     return args
 
 
-def _mark_fallback(store_root: Path, handoff_id: str) -> bool:
-    """Until `herdr-handoff create --fallback` exists (0.5.0 will have it) there is no provenance option; set `provenance.fallback` in the record it just wrote."""
-    path = store_root / "outbox" / f"{handoff_id}.json"
-    try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-        record["provenance"] = {**(record.get("provenance") or {}), "fallback": True}
-        temp = path.with_suffix(".json.tmp")
-        temp.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(temp, path)
-    except (OSError, ValueError, AttributeError, TypeError):
-        return False
-    return True
-
-
 def write_fallback_briefing(ref: SessionRef, worktree: Path, store_root: Path, harness_runner: HarnessRunner, *,
                             handoff: HandoffCli | None = None, gh: tuple[str, ...] = ("gh",),
                             transcript_tail_bytes: int = 200_000, timeout_s: float = 300.0,
@@ -358,8 +344,6 @@ def write_fallback_briefing(ref: SessionRef, worktree: Path, store_root: Path, h
             return None
         if not isinstance(handoff_id, str):
             return None
-        if not native:
-            _mark_fallback(store_root, handoff_id)  # best effort: the first `unverified` entry says so as well
         return handoff_id
     finally:
         shutil.rmtree(work, ignore_errors=True)

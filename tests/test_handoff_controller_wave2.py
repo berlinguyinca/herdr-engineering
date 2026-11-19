@@ -300,9 +300,9 @@ def test_an_uncertain_order_is_retyped_at_most_once_per_chain() -> None:
     ctlrun.note_uncertain(rt, 2000.0, CFG)  # the retype was uncertain too: no third order
     assert rt.cooldown_until == float("inf") and rt.retypes == 2
     chain = ctlrun.Chain("c", 1000.0, "t", None, False, 1000.0)
-    assert ctlrun.next_step(chain, rt, ctlrun.Decision.DRAIN, 2000.0 + D, CFG, True) is ctlrun.Step.DRAIN_STUCK
+    assert ctlrun.next_step(chain, rt, ctlrun.Decision.DRAIN, 2000.0 + D, CFG, True) is ctlrun.LoopStep.DRAIN_STUCK
     rt.typed = False
-    assert ctlrun.next_step(chain, rt, ctlrun.Decision.DRAIN, 1000.0 + D - 1, CFG, True) is ctlrun.Step.CHECK_BRIEFING
+    assert ctlrun.next_step(chain, rt, ctlrun.Decision.DRAIN, 1000.0 + D - 1, CFG, True) is ctlrun.LoopStep.CHECK_BRIEFING
 
 
 # --- I9 -------------------------------------------------------------------------------------------------------------
