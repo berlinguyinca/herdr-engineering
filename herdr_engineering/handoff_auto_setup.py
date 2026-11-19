@@ -145,7 +145,10 @@ def _install_events(events: dict[str, str], home: Path | None, dry_run: bool) ->
     if legacy[1]:
         results.append(legacy)
     if any(changed for _, changed in results) and not dry_run:
-        _save(home, path, data, text)
+        try:
+            _save(home, path, data, text)
+        except OSError as exc:
+            return [Item(str(path), "refused", f"cannot write settings.json: {exc}")]
     return [item for item, _ in results]
 
 
@@ -177,7 +180,10 @@ def uninstall(home: Path | None = None, *, dry_run: bool = False) -> list[Item]:
     if legacy[1]:
         results.append(legacy)
     if any(changed for _, changed in results) and not dry_run:
-        _save(home, path, data, text)
+        try:
+            _save(home, path, data, text)
+        except OSError as exc:
+            return [Item(str(path), "refused", f"cannot write settings.json: {exc}")]
     return [item for item, _ in results]
 
 

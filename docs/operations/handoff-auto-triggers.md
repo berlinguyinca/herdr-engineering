@@ -34,6 +34,32 @@ Until you do, the old commands are harmless: `herdr-eng handoff context-hook <an
 are a silent no-op (they read stdin, print nothing, exit 0), so a session with the old hooks installed is not disturbed and no
 longer gets a reminder.
 
+### The controller plugins
+
+`scripts/install.sh` links both Herdr plugins (`deploy/herdr-handoff-controller-plugin` and `deploy/herdr-session-pane-plugin`)
+with `herdr-eng handoff controller link`. It links a copy of each manifest whose commands name the absolute path of the installed
+`herdr-eng` (Herdr starts plugin commands with its own short PATH, which usually lacks `~/.local/bin`). A second run changes
+nothing; a plugin linked from another path is relinked. It is skipped, with a message, when Herdr is missing or older than 0.9.1,
+and `--no-handoff-plugins` or `HERDR_INSTALL_HANDOFF_PLUGINS=0` opts out. Herdr starts the controller when Herdr itself next
+starts (measured on 0.9.1: linking does not run the startup command), so restart Herdr or run `herdr-eng handoff controller run`.
+
+Check it with any of:
+
+```
+herdr-eng handoff auto check          # controller and side pane rows; exit 1 with the fix when no policy exists
+herdr-eng handoff controller status
+herdr-eng doctor                      # a warning (a failure under --strict)
+```
+
+If linking was skipped or opted out and no controller runs, the host has NO automatic handoff policy: the old 50% hook and
+autospec's monitor are gone and nothing replaces them. The fix is `herdr-eng handoff controller link` (or
+`herdr plugin link <repo>/deploy/herdr-handoff-controller-plugin`), then restart Herdr or run `herdr-eng handoff controller run`.
+Only `HERDR_HANDOFF_AUTO=0` is a deliberate "off", and the check accepts it.
+
+Release order: the controller needs herdr-handoff 0.5.0. Release herdr-handoff 0.5.0 first, then merge the pin change in
+`lock/upstreams.yaml`; `herdr-eng doctor` enforces the pin once that change is in. Merged before that, this change leaves hosts
+on an older herdr-handoff that the doctor does not yet flag.
+
 autospec's monitor skips a session that was started from a Herdr pane (`AUTOSPEC_CONTEXT_MONITOR_SKIP_HERDR`, default on).
 The skip is keyed on `HERDR_PANE_ID` being set in the session's environment: a shell where it is unset, such as a remote shell
 that reaches a host over ssh, is not a Herdr session to the monitor and keeps the old behaviour. The consequence for a Herdr pane

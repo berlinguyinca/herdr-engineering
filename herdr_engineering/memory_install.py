@@ -80,7 +80,19 @@ def _hook_command(command: list[str] | None, harness: str, event: str) -> str:
     return f"[ -x {_dq(base[0])} ] && {words} || true # {MARKER}"
 
 
+def writable_target(path: Path) -> Path:
+    """The file an atomic write must replace: a symlink is followed (the link stays a link), and a read-only file or directory is
+    refused with a one-line PermissionError before anything is written."""
+    real = path.resolve() if path.is_symlink() else path
+    if real.exists() and not os.access(real, os.W_OK):
+        raise PermissionError(f"{real} is read-only; left untouched")
+    if real.parent.exists() and not os.access(real.parent, os.W_OK):
+        raise PermissionError(f"{real.parent} is not writable; {real.name} left untouched")
+    return real
+
+
 def _atomic_write(path: Path, text: str) -> None:
+    path = writable_target(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.hm-")

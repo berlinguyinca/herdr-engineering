@@ -316,6 +316,16 @@ panes are gone, so nothing else types a handoff order into a session. See
 [handoff-auto-triggers.md](handoff-auto-triggers.md#upgrading) for the one-time upgrade and for what a pane with the controller
 switched off gets (no automatic policy).
 
+### Linking and checking the controller
+
+`scripts/install.sh` links the controller plugin and the session pane plugin (`herdr-eng handoff controller link`), with the
+absolute path of the installed `herdr-eng` in the commands. Herdr starts the controller when Herdr next starts, so restart Herdr
+or run `herdr-eng handoff controller run` after the first install. Check with `herdr-eng handoff auto check`,
+`herdr-eng handoff controller status` or `herdr-eng doctor`. If linking was skipped (no Herdr, Herdr older than 0.9.1,
+`--no-handoff-plugins`) and no controller runs, the host has no automatic policy; run `herdr-eng handoff controller link`.
+The controller needs herdr-handoff 0.5.0: release that and the pin change first (see
+[handoff-auto-triggers.md](handoff-auto-triggers.md#upgrading)).
+
 ### When it acts
 
 The controller reads each session's context use from the session's own record. The limit is 80 percent of the
