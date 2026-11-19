@@ -16,6 +16,7 @@ from herdr_engineering.cleanup_command import (
     configured_roots,
     default_roots,
     main,
+    user_roots,
 )
 
 
@@ -268,7 +269,7 @@ def test_roots_come_from_user_config(home_env: Env, tmp_path: Path) -> None:
     cfg.parent.mkdir(parents=True)
     extra = tmp_path / "extra-root"
     cfg.write_text(f"disk_hygiene:\n  roots: ['{extra}']\n")
-    assert extra in configured_roots()
+    assert extra in configured_roots(user_roots())
 
 
 def test_tmp_scope_refused_under_worktree_roots(env: Env) -> None:

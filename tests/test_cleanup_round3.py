@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -24,13 +25,21 @@ def env(tmp_path: Path) -> Env:
     return Env(tmp_path)
 
 
-def claim_session(home: Path, session: str) -> None:  # noqa: F811
+def process_started(pid: int) -> float:
+    """Start time of a live process, epoch seconds (what ``ps`` reports)."""
+    out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                         env={**os.environ, "LC_ALL": "C"}, check=True).stdout.strip()
+    return time.mktime(time.strptime(out, "%a %b %d %H:%M:%S %Y"))
+
+
+def claim_session(home: Path, session: str, *, started_ms: float | None = None) -> None:  # noqa: F811
     """What Claude Code does: ``~/.claude/sessions/<pid>.json`` for its own pid. Our parent
     process is a real ancestor, so it stands in for the Claude process."""
     pid = os.getppid()
     directory = home / ".claude" / "sessions"
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / f"{pid}.json").write_text(json.dumps({"pid": pid, "sessionId": session}))
+    started = process_started(pid) * 1000 + 2000 if started_ms is None else started_ms
+    (directory / f"{pid}.json").write_text(json.dumps({"pid": pid, "sessionId": session, "startedAt": started}))
 
 
 def _tmp_cleanup(tmp_path: Path, target: Path, root: Path, *, live: Path | None = None,

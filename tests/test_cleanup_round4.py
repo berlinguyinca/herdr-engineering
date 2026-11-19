@@ -89,9 +89,9 @@ def test_commit_made_after_the_pr_lookup_is_not_excused(env: Env) -> None:
 
 
 def test_moved_head_is_refused_between_inspection_and_removal(env: Env) -> None:
-    from herdr_engineering.cleanup_command import worktree_local_checks
+    from herdr_engineering.cleanup_command import worktree_quick_facts
     wt = env.worktree("moved")
-    facts = worktree_local_checks(wt, ())
+    facts = worktree_quick_facts(wt)
     env.commit(wt)
     git(wt, "push", "-q", "origin", "HEAD")
     with pytest.raises(Refusal, match="changed"):

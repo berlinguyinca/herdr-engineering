@@ -125,7 +125,11 @@ herdr-eng disk-hygiene run --dry-run --json        # preview what would be remov
 
 ## Strictness and exit codes
 
-- Every git call runs through the hardened `scratch_safety.git` runner: `GIT_*` stripped, no user or system git config, no fsmonitor or hooks. A repo or user setting such as `status.showUntrackedFiles=no` cannot hide ignored files from the checks.
+- Every git call runs through the hardened `scratch_safety.git` runner: `GIT_*` stripped, no user or system git config, no fsmonitor or hooks. A repo or user setting such as `status.showUntrackedFiles=no` cannot hide ignored files from the checks. The one thing kept from the user's global config is `core.excludesFile` (`.DS_Store`, `.idea/`, ...): such files count as ignored, not untracked; list them under `rebuildable` to let a worktree containing them be removed.
+- Ignored files are judged with `--ignored=matching`: a file inside a directory that is not itself ignored (`dist/prod.env` under `*.env`) is never rebuildable because of the directory's name.
+- `disk_hygiene.roots` must be a list of absolute paths (`~` allowed); anything else fails closed, on the CLI as in the reaper.
+- `--merged-ok` and the reaper accept only a MERGED PR (or patch-merged commits); the full ignored/hidden-index/dirty/HEAD re-check runs once, after the PR lookup, right before removal.
+- An own session needs the ancestor's `sessions/<pid>.json` to match the running process's start time, so a stale file under a recycled pid is not ours.
 - Unknown keys in `disk_hygiene`, `worktrees` or `docker` (for example `enable: false`), a non-list `rebuildable` and a malformed `docker.builder_keep_storage` fail closed: every destructive job is disabled.
 - `disk-hygiene run` and `status` exit 1 and report `config_error` when the config is unreadable or invalid.
 - Without `lsof` on Linux the process check falls back to the real `/proc` plus `ps`; with neither it refuses (`in_use`).

@@ -11,7 +11,7 @@ is the allow-listable replacement, so it must never be a bypass:
   one, and under the Claude scratch root only strictly inside a live-checked ``<session>`` dir;
 * ``worktree`` refuses repo main checkouts, dirty trees, skip-worktree/assume-unchanged edits
   and commits that exist on no remote (``--merged-ok`` relaxes the last one only when the work
-  is merged or its PR is closed);
+  is patch-merged or its PR is MERGED; a closed PR does not count);
 * process, hidden-index and scratch-session checks reuse ``scratch_safety`` / ``scratch_reaper``
   (one safety contract, not two);
 * ``target`` accepts only a Cargo ``target`` with build markers and no tracked files;
@@ -23,6 +23,7 @@ rules of ``build_cleanup``.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import re
@@ -32,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterable
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -39,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .scratch_safety import Snapshot
 
+_START_SLACK_SECONDS = 120  # Claude writes startedAt a moment after the process starts
 EPHEMERAL_LABEL = "herdr.ephemeral=1"
 
 
@@ -107,12 +110,27 @@ def user_disk_hygiene_config(home: Path | None = None) -> dict[str, Any]:
     return section
 
 
-def configured_roots(extra: list[str] | None = None, home: Path | None = None) -> list[Path]:
-    """Defaults + ``disk_hygiene.roots`` of the user config. ``extra`` is for in-process callers."""
-    roots = default_roots(home)
-    roots += [Path(r).expanduser() for r in user_disk_hygiene_config(home).get("roots", []) or []]
-    roots += [Path(r).expanduser() for r in extra or []]
+def absolute_roots(value: Any, name: str = "roots") -> tuple[str, ...]:
+    """A config list of absolute directories (``~`` allowed). An empty or relative entry would
+    resolve against whatever the current directory happens to be; a scalar would split into
+    characters. Both are invalid."""
+    roots = config_strings(value, name)
+    if bad := [r for r in roots if not r.strip() or not Path(r).expanduser().is_absolute()]:
+        raise ValueError(f"{name} must be absolute paths, got {bad[0]!r}")
     return roots
+
+
+def configured_roots(extra: Iterable[str] = (), home: Path | None = None) -> list[Path]:
+    """Defaults + already validated ``extra`` roots (the caller reads and validates the config)."""
+    return [*default_roots(home), *(Path(r).expanduser() for r in extra)]
+
+
+def user_roots(home: Path | None = None) -> tuple[str, ...]:
+    """``disk_hygiene.roots`` of the user config, validated; invalid fails CLOSED."""
+    try:
+        return absolute_roots(user_disk_hygiene_config(home).get("roots"))
+    except ValueError as exc:
+        raise Refusal("config_unreadable", f"disk_hygiene.{exc}") from exc
 
 
 def _git(cwd: Path, *args: str, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
@@ -120,7 +138,23 @@ def _git(cwd: Path, *args: str, timeout: int | None = None) -> subprocess.Comple
     no user/system config, no fsmonitor or hooks, ``LC_ALL=C``. A ``GIT_DIR`` in the environment
     or ``status.showUntrackedFiles=no`` in a config must not change what a check sees."""
     from .scratch_safety import git as safe_git
-    return safe_git(cwd, *args, timeout=GIT_TIMEOUT if timeout is None else timeout)
+    excludes = _user_excludes_file(os.environ.get("HOME", ""))
+    options = ("-c", f"core.excludesFile={excludes}") if excludes else ()
+    return safe_git(cwd, *options, *args, timeout=GIT_TIMEOUT if timeout is None else timeout)
+
+
+@functools.lru_cache(maxsize=8)
+def _user_excludes_file(home: str) -> str:
+    """``core.excludesFile`` of the user's own global git config (``.DS_Store``, ``.idea/``...),
+    the one setting the hardened runner keeps from it. Read once per home; empty when unset."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    try:
+        done = subprocess.run(["git", "config", "--global", "--type=path", "--get", "core.excludesFile"],
+                              capture_output=True, text=True, timeout=15, check=False, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    value = done.stdout.strip() if done.returncode == 0 else ""
+    return value if value.startswith("/") else ""
 
 
 def config_strings(value: Any, name: str) -> tuple[str, ...]:
@@ -205,32 +239,27 @@ def checked_path(path: Path | str, roots: list[Path],
 
 
 def _ancestors() -> frozenset[int]:
-    """This process's ancestors. The shell that ran ``cd / && herdr-eng cleanup --path X`` names X
-    in its own command line; that is the caller, not a user of X."""
+    """This process's ancestors, from one ``ps`` listing. The shell that ran ``cd / && herdr-eng
+    cleanup --path X`` names X in its own command line; that is the caller, not a user of X."""
+    listing = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True,
+                             timeout=15, check=False).stdout
+    parents = {int(pid): int(ppid) for pid, ppid in (line.split() for line in listing.splitlines()
+                                                    if len(line.split()) == 2) if pid.isdigit() and ppid.isdigit()}
     found: set[int] = set()
     pid = os.getppid()
     while pid > 1 and pid not in found and len(found) < 64:
         found.add(pid)
-        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
-                             timeout=15, check=False).stdout.strip()
-        pid = int(out) if out.isdigit() else 0
+        pid = parents.get(pid, 0)
     return frozenset(found)
 
 
 def _argument_lines(ignore: frozenset[int]) -> tuple[str, ...]:
     """Command lines of other processes (they name paths too), best effort."""
-    from .scratch_safety import _comparison
+    from .scratch_safety import _comparison, process_listing
     try:
-        listing = subprocess.run(["ps", "-ww", "-axo", "pid=,args="], capture_output=True, text=True,
-                                 timeout=15, check=False).stdout
+        return tuple(_comparison(command) for pid, command in process_listing() if pid not in ignore)
     except (OSError, subprocess.SubprocessError):
         return ()
-    lines = []
-    for line in listing.splitlines():
-        pieces = line.strip().split(None, 1)
-        if len(pieces) == 2 and pieces[0].isdigit() and int(pieces[0]) not in ignore | {os.getpid()}:
-            lines.append(_comparison(pieces[1]))
-    return tuple(lines)
 
 
 def in_use_snapshot() -> Snapshot:
@@ -334,14 +363,17 @@ def is_dirty(path: Path) -> bool:
 def foreign_ignored(path: Path, rebuildable: tuple[str, ...] = REBUILDABLE) -> list[str]:
     """Ignored-but-present entries that are not plain rebuildable output.
 
-    Git collapses a wholly ignored directory to one entry, so the last component is the thing
-    that is ignored; only that name is matched against the (glob) rebuildable list. A matching
-    directory is still looked inside: a nested repository (an editable checkout in ``.venv``,
-    a vendored clone in ``build``) or an unverifiable tree makes it foreign."""
+    ``--ignored=matching`` lists each file by the pattern that ignored it and collapses a
+    directory to one ``dir/`` entry only when the directory itself is ignored. A directory
+    entry's name is matched against the (glob) rebuildable list (and ``git check-ignore``
+    confirms the directory is itself ignored); a file entry's name must match on its own, so
+    ``dist/prod.env`` is never "rebuildable" because of ``dist``. A matching directory is still
+    looked inside: a nested repository (an editable checkout in ``.venv``, a vendored clone in
+    ``build``) or an unverifiable tree makes it foreign."""
     from fnmatch import fnmatchcase
 
     from .scratch_safety import inspect_tree
-    status = _git(path, "status", "--porcelain", "--untracked-files=normal", "--ignored=traditional")
+    status = _git(path, "status", "--porcelain", "--untracked-files=normal", "--ignored=matching")
     if status.returncode != 0:
         return ["<unknown>"]
     found = []
@@ -354,6 +386,9 @@ def foreign_ignored(path: Path, rebuildable: tuple[str, ...] = REBUILDABLE) -> l
             continue
         full = path / entry
         if full.is_symlink() or not full.is_dir():
+            continue
+        if _git(path, "check-ignore", "--no-index", "-q", f"{entry}/").returncode != 0:
+            found.append(entry)  # collapsed, but not ignored as a directory: judge its files
             continue
         try:
             if inspect_tree(full, accounting_only=True).repositories:
@@ -382,11 +417,21 @@ def patch_merged(path: Path) -> bool:
     return False
 
 
-def worktree_local_checks(path: Path, rebuildable: tuple[str, ...] | None = None) -> dict[str, Any]:
-    """The cheap, local, no-network refusals. ``rebuildable``: the user's extra patterns (the
-    caller reads the config once; None reads it here)."""
-    from .scratch_safety import hidden_index_reason
+def worktree_quick_facts(path: Path) -> dict[str, Any]:
+    """Facts plus the cheapest refusal (dirty), before any network call."""
     facts = worktree_facts(path)
+    if is_dirty(path):
+        raise Refusal("dirty", f"{path} has uncommitted or untracked changes")
+    return facts
+
+
+def settle_worktree(path: Path, facts: dict[str, Any], rebuildable: tuple[str, ...] | None = None) -> None:
+    """The refusals that must hold at the moment of removal: HEAD is still the inspected one,
+    clean, no hidden index state, no ignored file that is not rebuildable output. ``rebuildable``:
+    the user's extra patterns (None reads the config here)."""
+    from .scratch_safety import hidden_index_reason
+    if _git(path, "rev-parse", "HEAD").stdout.strip() != facts["head"]:
+        raise Refusal("changed", f"{path}: HEAD moved since it was inspected")
     if is_dirty(path):
         raise Refusal("dirty", f"{path} has uncommitted or untracked changes")
     if reason := hidden_index_reason(path):
@@ -397,11 +442,9 @@ def worktree_local_checks(path: Path, rebuildable: tuple[str, ...] | None = None
             rebuildable = config_strings(user_disk_hygiene_config().get("rebuildable"), "rebuildable")
         except ValueError as exc:
             raise Refusal("config_unreadable", f"disk_hygiene.{exc}") from exc
-    extra = rebuildable
-    if ignored := foreign_ignored(path, (*REBUILDABLE, *extra)):
+    if ignored := foreign_ignored(path, (*REBUILDABLE, *rebuildable)):
         raise Refusal("ignored_files",
                       f"{path} has ignored files that are not plain rebuildable output: {', '.join(ignored[:5])}")
-    return facts
 
 
 def check_worktree_removable(path: Path, *, merged_ok: bool,
@@ -409,29 +452,23 @@ def check_worktree_removable(path: Path, *, merged_ok: bool,
                              rebuildable: tuple[str, ...] | None = None,
                              pr_head: str | None = None,
                              prechecked: dict[str, Any] | None = None) -> dict[str, Any]:
-    """``pr_head``: the head SHA of a merged/closed PR the caller already looked up; it only
-    excuses unpushed commits when it equals the HEAD being removed NOW (None looks the PR up here
-    when ``merged_ok``). ``prechecked``: the facts from ``worktree_local_checks``; then only HEAD
-    and cleanliness are re-checked. The in-use check runs last, right before any removal."""
-    if prechecked is None:
-        facts = worktree_local_checks(path, rebuildable)
-    else:
-        facts = dict(prechecked)
-        head = _git(path, "rev-parse", "HEAD").stdout.strip()
-        if head != facts["head"]:
-            raise Refusal("changed", f"{path}: HEAD moved since it was inspected")
-        if is_dirty(path):
-            raise Refusal("dirty", f"{path} has uncommitted or untracked changes")
+    """``prechecked``: facts from ``worktree_quick_facts`` (taken before the caller's own PR
+    lookup). ``pr_head``: the head SHA of a MERGED PR the caller already looked up (None looks it
+    up here when ``merged_ok``); it excuses unpushed commits only while it equals the HEAD. The
+    full ``settle_worktree`` checks run once, AFTER any network lookup, and the in-use check runs
+    last, right before any removal."""
+    facts = dict(prechecked) if prechecked is not None else worktree_quick_facts(path)
     if unpushed(path):
         merged = False
         if merged_ok:
             if pr_head is None:
                 pr = gh_pr_state(path, facts["branch"], facts["head"], _origin_owner(path))
-                pr_head = pr["head"] if pr and pr["state"] in ("MERGED", "CLOSED") else ""
+                pr_head = pr["head"] if pr and pr["state"] == "MERGED" else ""
             merged = patch_merged(path) or pr_head == facts["head"]
         if not merged:
             raise Refusal("unpushed_commits",
                           f"{path} has commits that are on no remote and not merged (unpushed)")
+    settle_worktree(path, facts, rebuildable)
     _not_in_use(path, snapshot)
     return facts
 
@@ -503,11 +540,22 @@ def _refuse_git(path: Path) -> None:
         raise Refusal("keep_marker", f"{path} contains a .keep marker")
 
 
+def _process_started(pid: int) -> float | None:
+    """Start time (epoch seconds) of a live process, None if it cannot be read."""
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=15, check=False, env={**os.environ, "LC_ALL": "C"}).stdout.strip()
+        return time.mktime(time.strptime(out, "%a %b %d %H:%M:%S %Y"))
+    except (OSError, subprocess.SubprocessError, ValueError, OverflowError):
+        return None
+
+
 def own_sessions(home: Path | None = None) -> frozenset[str]:
     """Session ids of the Claude processes this process descends from. Claude records
-    ``<pid> -> sessionId`` in ``~/.claude/sessions/<pid>.json``; the pid must be one of OUR
-    ancestors, so an environment variable (inherited, or typed by hand) never makes a session
-    "own"."""
+    ``<pid> -> sessionId, startedAt`` in ``~/.claude/sessions/<pid>.json``; the pid must be one of
+    OUR ancestors AND the process now running under it must have started when the file says (a
+    crashed session's stale file under a recycled pid is not ours). An environment variable never
+    makes a session "own"."""
     directory = (home or Path.home()) / ".claude" / "sessions"
     found: set[str] = set()
     for pid in _ancestors():
@@ -515,7 +563,11 @@ def own_sessions(home: Path | None = None) -> frozenset[str]:
             data = json.loads((directory / f"{pid}.json").read_text())
         except (OSError, ValueError):
             continue
-        if isinstance(data, dict) and data.get("pid") == pid and isinstance(data.get("sessionId"), str):
+        if not (isinstance(data, dict) and data.get("pid") == pid and isinstance(data.get("sessionId"), str)
+                and isinstance(data.get("startedAt"), int | float)):
+            continue
+        started = _process_started(pid)
+        if started is not None and abs(started - data["startedAt"] / 1000) <= _START_SLACK_SECONDS:
             found.add(data["sessionId"].lower())
     return frozenset(found)
 
@@ -629,7 +681,7 @@ def _arguments(p: argparse.ArgumentParser) -> None:
                    help="print the docker run arguments that make a container reapable")
     p.add_argument("--path", help="path (container name or id for docker)")
     p.add_argument("--merged-ok", action="store_true",
-                   help="worktree: allow commits on no remote when merged or the PR is closed")
+                   help="worktree: allow commits on no remote when they are patch-merged or the PR is merged")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--json", action="store_true")
 
@@ -644,7 +696,7 @@ def main_args(args: argparse.Namespace) -> int:
         return 2
     try:
         from .build_coord import _default_state_dir
-        out = cleanup(args.scope, args.path, roots=configured_roots(), dry_run=args.dry_run,
+        out = cleanup(args.scope, args.path, roots=configured_roots(user_roots()), dry_run=args.dry_run,
                       merged_ok=args.merged_ok, state_dir=_default_state_dir())
     except Refusal as exc:
         if args.json:

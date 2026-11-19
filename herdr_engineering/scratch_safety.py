@@ -296,25 +296,33 @@ def process_snapshot(ignore_arguments_of: frozenset[int] = frozenset()) -> Snaps
         raise InspectionUnavailable("process visibility is unavailable; cleanup blocked") from error
 
 
-def _process_snapshot(ignore_arguments_of: frozenset[int] = frozenset()) -> Snapshot:
+def process_listing() -> list[tuple[int, str]]:
+    """``(pid, command line)`` of every other process; raises ``OSError`` when ``ps`` is unusable."""
     listing = subprocess.run(
         ["ps", "-ww", "-axo", "pid=,args="], capture_output=True, text=True, timeout=15
     )
     if listing.returncode or len(listing.stdout) > 32 * 2**20:
         raise OSError("process argument inspection failed")
+    own = os.getpid()
+    rows: list[tuple[int, str]] = []
+    for line in listing.stdout.splitlines():
+        pieces = line.strip().split(None, 1)
+        if len(pieces) == 2 and pieces[0].isdigit() and int(pieces[0]) != own:
+            rows.append((int(pieces[0]), pieces[1]))
+    return rows
+
+
+def _process_snapshot(ignore_arguments_of: frozenset[int] = frozenset()) -> Snapshot:
     arguments: list[str] = []
     commands: dict[int, str] = {}
     compilers: set[int] = set()
     own = os.getpid()
-    for line in listing.stdout.splitlines():
-        pieces = line.strip().split(None, 1)
-        if len(pieces) != 2 or not pieces[0].isdigit() or int(pieces[0]) == own:
-            continue
-        if int(pieces[0]) not in ignore_arguments_of:
-            arguments.append(_comparison(pieces[1]))
-            commands[int(pieces[0])] = _comparison(pieces[1])
-        if Path(pieces[1].split()[0]).name in _COMPILERS:
-            compilers.add(int(pieces[0]))
+    for pid, command in process_listing():
+        if pid not in ignore_arguments_of:
+            arguments.append(_comparison(command))
+            commands[pid] = _comparison(command)
+        if Path(command.split()[0]).name in _COMPILERS:
+            compilers.add(pid)
     result = subprocess.run(
         ["lsof", "-nP", "-w", "-a", "-u", str(os.getuid()), "-F0pcnft"],
         capture_output=True,

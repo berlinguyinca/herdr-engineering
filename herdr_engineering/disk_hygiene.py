@@ -49,6 +49,7 @@ from .cleanup_command import (
     Refusal,
     _git,
     _origin_owner,
+    absolute_roots,
     checked_path,
     config_strings,
     configured_roots,
@@ -56,7 +57,7 @@ from .cleanup_command import (
     gh_pr_state,
     remove_worktree,
     user_disk_hygiene_config,
-    worktree_local_checks,
+    worktree_quick_facts,
 )
 
 _DISCOVERY_DEPTH = 2
@@ -150,7 +151,7 @@ def _parse_policy(cfg: dict[str, Any]) -> Policy:
         min_idle_hours=_number(cfg.get("min_idle_hours", 2), "min_idle_hours"),
         pr_source=PrSource(cfg.get("pr_source", "gh")),
         repos=tuple(Path(r).expanduser() for r in _strings(cfg.get("repos"), "repos")),
-        roots=_strings(cfg.get("roots"), "roots"),
+        roots=absolute_roots(cfg.get("roots")),
         docker_min_age_hours=_number(dk.get("min_age_hours", 1), "docker.min_age_hours"),
         builder_keep_storage=storage.strip(),
         builder_prune=_flag(dk.get("builder_prune", False), "docker.builder_prune"),
@@ -293,7 +294,7 @@ def reap_repo(repo: Path, policy: Policy, roots: list[Path], *, dry_run: bool, n
             if idle < policy.min_idle_hours * 3600:
                 row.update(action="kept", reason="recent_activity")
                 continue
-            facts = worktree_local_checks(path, policy.rebuildable)  # cheap, before any network call
+            facts = worktree_quick_facts(path)  # cheap, before any network call
             state = pr_state(repo, path, item["branch"], facts["head"], policy.pr_source)
             row["pr"] = state.value
             if state in (PrState.OPEN, PrState.UNKNOWN):
