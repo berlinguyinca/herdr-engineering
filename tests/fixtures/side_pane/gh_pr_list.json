@@ -1,0 +1,8 @@
+[
+  {"number": 44, "title": "box size + Copy as CSS", "headRefName": "feat/running", "state": "OPEN", "mergedAt": null, "url": "https://github.com/acme/widgets/pull/44"},
+  {"number": 45, "title": "compare/live-edit controls", "headRefName": "feat/failed", "state": "OPEN", "mergedAt": null, "url": "https://github.com/acme/widgets/pull/45"},
+  {"number": 39, "title": "guard the filter toggles", "headRefName": "feat/merged", "state": "MERGED", "mergedAt": "2026-11-18T09:00:00Z", "url": "https://github.com/acme/widgets/pull/39"},
+  {"number": 50, "title": "zero workflow pipeline", "headRefName": "feat/zero", "state": "OPEN", "mergedAt": null, "url": "https://github.com/acme/widgets/pull/50"},
+  {"number": 51, "title": "never pushed to CI", "headRefName": "feat/none", "state": "OPEN", "mergedAt": null, "url": "https://github.com/acme/widgets/pull/51"},
+  {"number": 52, "title": "closed without merge", "headRefName": "feat/closed", "state": "CLOSED", "mergedAt": null, "url": "https://github.com/acme/widgets/pull/52"}
+]
