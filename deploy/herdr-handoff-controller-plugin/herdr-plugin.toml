@@ -1,0 +1,18 @@
+id = "herdr.handoff-controller"
+name = "HerdR Auto-Handoff Controller"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Watches every agent session's context use, drains a session at the limit and hands it to a same-harness successor in a pane below it"
+platforms = ["linux", "macos"]
+
+# The controller itself: one process per Herdr, ticks every 5 s. A second instance exits 0 at once (lock file).
+[[startup]]
+command = ["herdr-eng", "handoff", "controller", "run"]
+
+# Whether the controller runs, and the last event of every chain in progress.
+[[actions]]
+id = "handoff-controller-status"
+title = "Auto-handoff controller status"
+description = "Print whether the controller runs and the last event of each chain in progress"
+contexts = ["global"]
+command = ["herdr-eng", "handoff", "controller", "status"]

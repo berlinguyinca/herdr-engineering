@@ -9,8 +9,26 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from ..handoff_adapters.base import Harness
+
 _CALL_MARGIN_S = 5.0  # a herdr call gets its own timeout plus this much before the subprocess is abandoned
 _QUICK_CALL_S = 15.0  # herdr calls that answer from memory
+
+
+# Herdr's agent name per harness, the one place the controller and the drain's wrong-agent guard read. Measured on a
+# live Herdr 0.9.1 (`herdr agent list`, 2026-11-18): `claude` and `pi`. ASSUMED, never seen: `codex` and `opencode`
+# (Herdr names a pane's agent after the program it detects, as it does for the two measured ones).
+_AGENT_NAMES: dict[str, Harness] = {"claude": Harness.CLAUDE, "pi": Harness.PI, "codex": Harness.CODEX,
+                                    "opencode": Harness.OPENCODE}
+
+
+def harness_for_agent_name(name: str | None) -> Harness | None:
+    """The harness Herdr's agent name stands for, None for an agent the controller does not manage."""
+    return _AGENT_NAMES.get(name) if name else None
+
+
+def _text(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 class PromptResult(StrEnum):
@@ -23,6 +41,17 @@ class PromptResult(StrEnum):
 class AgentInfo:
     name: str | None  # what Herdr detected in the pane: the harness name (claude, codex, pi, opencode) or None
     status: str | None
+
+
+@dataclass(frozen=True)
+class AgentPane:
+    """One row of `herdr agent list`: an agent Herdr detected in a pane."""
+    pane_id: str
+    tab_id: str | None
+    name: str | None
+    status: str | None
+    cwd: Path | None
+    session: str | None  # agent_session.value: a conversation id (Claude, Codex) or a record path (Pi)
 
 
 class HerdrCli:
@@ -51,6 +80,28 @@ class HerdrCli:
         except (ValueError, KeyError, TypeError, AttributeError):
             return None
         return AgentInfo(name if isinstance(name, str) else None, status if isinstance(status, str) else None)
+
+    def agents(self) -> list[AgentPane] | None:
+        """Every agent Herdr detects, or None when Herdr cannot be asked (an empty list means there are none)."""
+        done = self._run(["agent", "list"], _QUICK_CALL_S)
+        if done is None or done.returncode != 0:
+            return None
+        try:
+            rows = json.loads(done.stdout)["result"]["agents"]
+        except (ValueError, KeyError, TypeError):
+            return None
+        if not isinstance(rows, list):
+            return None
+        found: list[AgentPane] = []
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("pane_id"), str):
+                continue
+            session, cwd = row.get("agent_session"), row.get("cwd")
+            value = session.get("value") if isinstance(session, dict) else None
+            found.append(AgentPane(row["pane_id"], _text(row.get("tab_id")), _text(row.get("agent")),
+                                   _text(row.get("agent_status")), Path(cwd) if isinstance(cwd, str) and cwd else None,
+                                   _text(value)))
+        return found
 
     def agent_status(self, pane_id: str) -> str | None:
         info = self.agent(pane_id)
