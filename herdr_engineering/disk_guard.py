@@ -115,6 +115,8 @@ def relieve(cleanup_cfg: Mapping, state_dir: Path, at_percent: float,
     if result.get("status") == "busy":  # another sweep is running: its result is what we need
         _wait_for_other_sweep(state_dir, busy_wait)
         return False
+    if result.get("status") == "error":
+        return True  # the sweep ran but failed (a lsof or registry fault): retrying soon may work
     try:
         _stamp(state_dir).write_text(json.dumps({"triggered_at": now}))
     except OSError:

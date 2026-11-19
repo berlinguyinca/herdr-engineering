@@ -85,9 +85,9 @@ build_cleanup:
   refuse_builds_min_free_gib: 50  # ... only when less than this is also available
 ```
 
-A sweep takes `build-cleanup.lock` exclusively (one sweep at a time) and `build-maintenance.lock` shared, so it never waits for a running build (the guard runs inside builds) and only yields to the exclusive maintenance jobs. A running build is protected per target: the wrapper holds a shared lock on `targets/<name>.lock` from before cargo starts until the build ends, and the sweep takes it exclusively (non-blocking) right before deleting and keeps it through the delete. A target whose lock is held is skipped (`build in progress`); a build that starts during a delete waits for it and then starts on a fresh target. A subdirectory a sweep cannot read is skipped with a warning; the rest of its root is still swept. A root that is missing or not canonical is skipped with a logged reason; it never aborts the sweep.
+A sweep takes `build-cleanup.lock` exclusively (one sweep at a time) and `build-maintenance.lock` shared, so it never waits for a running build (the guard runs inside builds) and only yields to the exclusive maintenance jobs. A running build is protected per target: the sweep takes Cargo's own build locks (see "Reserve and removal locks") exclusively and non-blocking right before deleting and keeps them through the delete. A target whose lock is held is skipped (`build in progress`); a managed target is renamed away before the delete, so a build that starts meanwhile gets a fresh target. A subdirectory a sweep cannot read is skipped with a warning; the rest of its root is still swept. A root that is missing or not canonical is skipped with a logged reason; it never aborts the sweep.
 
-Targets still in use (live process, build lease, open file, held build lock) are
+Targets still in use (live process, build lease, open file, held Cargo lock) are
 never removed in any tier. When the build's filesystem is at or above `refuse_builds_percent`
 and has less than `refuse_builds_min_free_gib` available, a new cargo/build command
 (`build-coordinate` guards rustc, make, cmake, ninja, tsc and `go build|install|generate`, never `go test`/scripts; cargo is guarded by the wrapper, also under `build-coordinate`, for build, check, test, nextest, bench, run and the like, but not `cargo clean`) triggers
@@ -118,8 +118,21 @@ again and exits 75 if none fits (the message says "even after cleaning up" only 
 `build_cleanup.enabled: false` none does). The guard's own refusal still runs the sweep in pressure mode.
 A failed sweep does not start the 10-minute cooldown.
 
-A managed target has one lock file, `<name>.lock`, beside it. Builds and the sweep both create it if it is missing
-(the sweep skips that target on a full disk), neither ever deletes it, and the build holds a shared lock for as
-long as its wrapper process lives (the lock is close-on-exec and kept by the wrapper, which waits for cargo, so a
-daemon cargo starts does not keep the target locked). The sweep takes it exclusively without waiting and skips the target when held. A dry run takes no lock
-file and creates none. Unmanaged targets are checked against a fresh process snapshot right before each removal.
+A running build is detected through Cargo's own locks, so it does not matter how the build was started (the
+wrapper, `build-coordinate`, an IDE, a script). Cargo flocks `<profile>/.cargo-lock` (1.75), and newer versions also
+`.cargo-build-lock` and `.cargo-artifact-lock`, in `<target>/<profile>/` and `<target>/<triple>/<profile>/`. Before
+removing any target, managed or not, the sweep takes a non-blocking exclusive flock on every such file, keeps them all
+through the delete and skips the target (`build in progress`) when any is held; a lock file it cannot open skips that
+target only (`cannot lock`). There is no lock file of ours: the wrapper execs cargo as before, so cargo is never
+orphaned. What remains is the instant between a build starting and cargo taking its first lock, which the marker
+touch (recent activity) and the pressure age floor cover. A dry run takes the locks only to look and releases them.
+
+A managed target is renamed to a tombstone `.<name>.deleting-<id>` in the same `targets/` directory (under the
+manager lock) before it is deleted, so a build always finds a whole target or none; an interrupted delete leaves the
+tombstone, which the next sweep and the retention report collect. Unmanaged targets are checked against a process
+snapshot right before each removal; a snapshot younger than about 5 seconds is reused rather than taken again.
+
+`build_cleanup: false` means `enabled: false` with the default thresholds (a bool is accepted everywhere; any other
+non-mapping value is a configuration error). `herdr-eng build-cleanup run --root PATH` sweeps the named root even when
+`enabled` is false; without `--root` a disabled job reports `disabled`. `build-coordinate -- cargo build` guards
+cargo itself whenever the `cargo` on PATH is not the herdr wrapper, so an IDE-style run is refused the same way.

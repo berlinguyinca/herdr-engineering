@@ -3248,15 +3248,20 @@ def _cmd_build_coordinate(args) -> int:
                      cache_config=cache_cfg, trace=trace)
 
 
-# Commands whose output size the disk-budget guard protects here. Cargo is left out on purpose: the
-# managed cargo wrapper guards it against the filesystem its target really lands on, also when it runs
-# under build-coordinate. Scripts are never refused; the cargo wrapper also guards test, nextest, bench and run.
+# Commands whose output size the disk-budget guard protects here. Cargo is guarded here only when the
+# cargo on PATH is not the managed wrapper: the wrapper guards it against the filesystem its target really
+# lands on, also under build-coordinate. Scripts are never refused.
 _GUARDED_BUILD_COMMANDS = frozenset({"rustc", "make", "cmake", "ninja", "tsc"})
 _GUARDED_GO_SUBCOMMANDS = frozenset({"build", "install", "generate"})
 
 
 def _guarded_build(cmd: list[str]) -> bool:
     name = os.path.basename(cmd[0])
+    if name == "cargo":
+        from .cargo_host import BUILD_SUBCOMMANDS, cargo_subcommand, path_cargo_is_wrapper
+        subcommand = cargo_subcommand(cmd[1:])
+        return (subcommand in BUILD_SUBCOMMANDS and subcommand != "clean"
+                and not path_cargo_is_wrapper(cmd[0]))
     if name == "go":
         return len(cmd) > 1 and cmd[1] in _GUARDED_GO_SUBCOMMANDS
     return name in _GUARDED_BUILD_COMMANDS

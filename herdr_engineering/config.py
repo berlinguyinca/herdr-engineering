@@ -308,6 +308,18 @@ def _filter_repo_local(path: Path, data: dict[str, Any]) -> dict[str, Any]:
     return kept
 
 
+def _normalize_build_cleanup(cfg: dict[str, Any], path: Path) -> None:
+    """``build_cleanup`` is a mapping; the shorthand ``build_cleanup: false`` (or ``true``) means disabled
+    (or defaults). Checked here once, so no reader ever sees another type."""
+    value = cfg.get("build_cleanup")
+    if isinstance(value, dict):
+        return
+    if isinstance(value, bool):
+        cfg["build_cleanup"] = {**copy.deepcopy(DEFAULTS["build_cleanup"]), "enabled": value}
+        return
+    raise InvalidError(f"{path}: build_cleanup must be a mapping or a boolean")
+
+
 def load_config(paths: list[Path] | None = None, *, strict_build_cache: bool = False
                 ) -> dict[str, Any]:
     """Load config by precedence. Each path may be missing (skipped).
@@ -341,6 +353,7 @@ def load_config(paths: list[Path] | None = None, *, strict_build_cache: bool = F
         if not trusted:
             data = _filter_repo_local(path, data)
         cfg = _deep_merge(cfg, data)
+        _normalize_build_cleanup(cfg, path)
     validate_github(cfg.get("github"))
     cfg = _expand_env(cfg)
     from .build_cache_config import validate as validate_build_cache

@@ -177,8 +177,8 @@ def sweep_while_racing(root, state, tmp_path, race):
     shim.write_text(f"#!/bin/sh\n[ -e '{ready}' ] || {{ : > '{ready}'; while [ ! -e '{go}' ]; do sleep 0.05; done; }}\n"
                     f"exec '{real_git}' \"$@\"\n")
     shim.chmod(0o755)
-    code = ("import json, sys; from herdr_engineering.build_cleanup import run_once; "
-            "print(json.dumps(run_once([sys.argv[1]], sys.argv[2], high_water=1, low_water=0, min_age_hours=24)))")
+    code = ("import json, sys; import herdr_engineering.build_cleanup as c; c._SNAPSHOT_REUSE_SECONDS = 0.0; "
+            "run_once = c.run_once; print(json.dumps(run_once([sys.argv[1]], sys.argv[2], high_water=1, low_water=0, min_age_hours=24)))")
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
            "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
     child = subprocess.Popen([sys.executable, "-c", code, str(root), str(state)], env=env,
@@ -223,7 +223,8 @@ def test_target_no_longer_recognized_is_never_removed(env, tmp_path):
 
 def test_process_started_after_the_first_scan_keeps_an_unmanaged_target(env, tmp_path):
     """The first process scan saw nothing; a real process then starts inside the target. The removal-moment
-    snapshot sees it and the target survives."""
+    snapshot sees it and the target survives (the sweep child runs with the snapshot-reuse window at zero:
+    a snapshot younger than the window would stand)."""
     root, state = env
     t = project(root)
     holder = []

@@ -34,7 +34,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .cargo_target_storage import TARGET_MARKER, target_lock_path
+from .cargo_target_storage import TARGET_MARKER, TOMBSTONE, _manager_lock, tombstone_path
 from .disk_guard import measure
 
 log = logging.getLogger(__name__)
@@ -130,7 +130,8 @@ def _process_paths(proc: Path = Path("/proc")) -> list[Path]:
     return paths
 
 
-def _discover(root: Path, managed: bool = True, unreadable: list[str] | None = None) -> list[Path]:
+def _discover(root: Path, managed: bool = True, unreadable: list[str] | None = None,
+              tombstones: list[Path] | None = None) -> list[Path]:
     """Cargo targets under ``root``. ``managed`` also returns cache-only targets and Herdr-managed
     ``targets/<workspace>`` dirs (what the sweep reclaims); migration wants repository targets only.
     A subdirectory that cannot be read is skipped (and named in ``unreadable``), never the whole root."""
@@ -159,6 +160,10 @@ def _discover(root: Path, managed: bool = True, unreadable: list[str] | None = N
                     raise OSError(f"Discovery directory limit reached under {root}")
                 path = Path(entry.path)
                 if entry.stat(follow_symlinks=False).st_dev != device:
+                    continue
+                if managed_dir and TOMBSTONE.fullmatch(entry.name):
+                    if tombstones is not None:
+                        tombstones.append(path)  # a delete a sweep started and did not finish
                     continue
                 if managed_dir and _managed_workspace(path) is not None:
                     if _cargo_markers(path):
@@ -218,39 +223,72 @@ def _project(target: Path) -> Path:
 
 
 _BUSY = -1
+_SNAPSHOT_REUSE_SECONDS = 5.0
+_CARGO_LOCK_NAMES = frozenset({".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"})
+_NOT_PROFILES = frozenset({"deps", "build", "incremental", ".fingerprint", "examples"})
 
 
-def _lock_for_removal(target: Path, *, create: bool = True) -> int | None:
-    """Exclusive lock for removing a managed target (None: not a managed target, _BUSY: a build holds it).
+def _cargo_lock_files(target: Path) -> list[str]:
+    """Cargo's own lock files under ``target``: ``<profile>/`` and ``<triple>/<profile>/`` (cargo 1.75 has
+    ``.cargo-lock``; newer cargo adds ``.cargo-build-lock`` and ``.cargo-artifact-lock``)."""
+    found: list[str] = []
+    pending = [(target, 0)]
+    while pending:
+        directory, depth = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name in _CARGO_LOCK_NAMES and entry.is_file(follow_symlinks=False):
+                    found.append(entry.path)
+                elif depth < 2 and entry.name not in _NOT_PROFILES and entry.is_dir(follow_symlinks=False):
+                    pending.append((Path(entry.path), depth + 1))
+    return found
 
-    One lock object serves builds and sweeps: ``<name>.lock`` beside the target. A build holds it shared for
-    its whole life; the sweep takes it exclusively, creating it when it is missing exactly as a build does
-    (``O_CREAT`` is idempotent, so whoever comes second reuses the file and the flock decides). The file is
-    never unlinked, since another process may be about to lock it. A full disk can refuse the create: that
-    raises OSError and the caller skips this target only. A dry run (``create=False``) never creates the
-    file; without one no build holds the target (a build creates it before it starts).
+
+def _lock_for_removal(target: Path) -> list[int] | int:
+    """Exclusive, non-blocking locks on every Cargo lock file of ``target`` (_BUSY when one is held).
+
+    Cargo flocks these for every build, whether it runs through the wrapper, an IDE or a script, so a
+    build in progress is detected without any lock of ours. The descriptors are returned open and must
+    be held through the delete; a target that was never built has none. An OSError (a lock file that
+    cannot be opened) propagates, and the caller skips this target only.
     """
-    if _managed_workspace(target) is None:
-        return None
-    flags = os.O_RDWR | os.O_NOFOLLOW | (os.O_CREAT if create else 0)
+    fds: list[int] = []
     try:
-        fd = os.open(target_lock_path(target), flags, 0o600)
-    except FileNotFoundError:
-        return None
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(fd)
-        return _BUSY
+        for path in _cargo_lock_files(target):
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                continue
+            fds.append(fd)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                _release_removal_lock(fds)
+                return _BUSY
     except BaseException:
-        os.close(fd)
+        _release_removal_lock(fds)
         raise
-    return fd
+    return fds
 
 
-def _release_removal_lock(fd: int | None) -> None:
-    if fd is not None:
-        os.close(fd)  # the lock file stays: a waiting build opens it, and it costs a few bytes
+def _release_removal_lock(fds: list[int]) -> None:
+    for fd in fds:
+        os.close(fd)
+
+
+def _remove_target(target: Path) -> None:
+    """Delete ``target``. A managed target is first renamed to a tombstone (under the manager lock a build
+    takes), so a build or a second sweep sees a whole target or none; an interrupted delete leaves a
+    tombstone that the next sweep or retention run collects."""
+    if _managed_workspace(target) is not None:
+        grave = tombstone_path(target)
+        with _manager_lock(target.parent):
+            os.rename(target, grave)
+        target = grave
+    # CPython's fd-based rmtree prevents symlink substitution attacks.
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise OSError("This platform lacks symlink-safe recursive removal")
+    shutil.rmtree(target)
 
 
 def _inspect(target: Path) -> tuple[float, int]:
@@ -376,7 +414,7 @@ def run_once(
         "timestamp": datetime.now(UTC).isoformat(), "status": "ok", "dry_run": dry_run,
         "roots": [], "removed_count": 0, "removed_bytes": 0, "reclaimed_bytes": 0,
         "removed": [], "would_remove": [], "skipped": [], "errors": [], "warnings": [],
-        "reconciled": [], "pressure": False, "process_scans": 0,
+        "reconciled": [], "pressure": False, "process_scans": 0, "tombstones_removed": 0,
     }
     lock_fds = [os.open(state_dir / name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
                 for name in ("build-cleanup.lock", "build-maintenance.lock")]
@@ -470,12 +508,19 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
             roots_by_device[root.stat().st_dev] = root
             try:
                 unreadable: list[str] = []
-                targets = _discover(root, unreadable=unreadable)
+                graves: list[Path] = []
+                targets = _discover(root, unreadable=unreadable, tombstones=graves)
                 for name in unreadable[:5]:
                     _skip_root(result, Path(name), "unreadable directory skipped")
             except OSError as exc:
                 _skip_root(result, root, str(exc))
                 continue
+            for grave in graves if not result["dry_run"] else []:
+                try:
+                    shutil.rmtree(grave)
+                    result["tombstones_removed"] += 1
+                except OSError as exc:
+                    _skip_root(result, grave, f"tombstone not removed: {exc}")
             for target in targets:
                 if state_dir.is_relative_to(target):
                     raise OSError(f"Maintenance state is inside cleanup target: {target}")
@@ -498,6 +543,7 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
         # Verify process visibility before deleting anything.
         result["process_scans"] += 1
         active = _process_paths()
+        scanned_at = time.monotonic()
     except (OSError, ValueError) as exc:
         result["errors"].append(str(exc))
         return
@@ -519,7 +565,7 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
             if not _untracked(target):
                 result["skipped"].append({"path": name, "reason": "tracked or unverifiable output"})
                 continue
-            # Revalidate right before deletion; a managed target's build lock is held from here on.
+            # Revalidate right before deletion; Cargo's own locks are held from here on.
             newest, size = _inspect(target)
             if newest > cutoffs[name]:
                 result["skipped"].append({"path": name, "reason": "recent activity"})
@@ -527,39 +573,36 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
             if not _recognized(target):
                 raise OSError(f"Target no longer recognized as a Cargo output: {name}")
             try:
-                lock_fd = _lock_for_removal(target, create=not result["dry_run"])  # held through the delete
+                lock_fds = _lock_for_removal(target)  # held through the delete
             except OSError as exc:  # one target's lock trouble never ends the sweep
                 result["skipped"].append({"path": name, "reason": f"cannot lock: {exc}"})
                 continue
-            if lock_fd == _BUSY:
+            if lock_fds == _BUSY:
                 result["skipped"].append({"path": name, "reason": "build in progress"})
                 continue
             try:
                 if result["dry_run"]:  # nothing is removed, so the first scan stands
-                    _release_removal_lock(lock_fd)  # a dry run never holds a build up
-                    lock_fd = None
                     if not _skip_for_registry(state_dir, target, name, result):
                         result["would_remove"].append(name)
                     continue
-                # Re-read the lease and the ownership proof under the lock, right before removing.
+                # Re-read the lease and the ownership proof under the locks, right before removing.
                 if _skip_for_registry(state_dir, target, name, result):
                     continue
                 if not _recognized(target):
                     raise OSError(f"Target no longer recognized as a Cargo output: {name}")
-                if lock_fd is None:
-                    # No build lock covers an unmanaged target: look at the processes once more, right
-                    # before this removal (earlier removals can take minutes, so no snapshot is reused).
-                    result["process_scans"] += 1
-                    if _in_use(target, _process_paths()):
+                if _managed_workspace(target) is None:
+                    # Look at the processes once more right before removing an operator's own target;
+                    # a snapshot younger than a few seconds is as good as a new one.
+                    if time.monotonic() - scanned_at >= _SNAPSHOT_REUSE_SECONDS:
+                        result["process_scans"] += 1
+                        active, scanned_at = _process_paths(), time.monotonic()
+                    if _in_use(target, active):
                         result["skipped"].append({"path": name, "reason": "active project"})
                         continue
                 before = shutil.disk_usage(root).free
-                # CPython's fd-based rmtree prevents symlink substitution attacks.
-                if not shutil.rmtree.avoids_symlink_attacks:
-                    raise OSError("This platform lacks symlink-safe recursive removal")
-                shutil.rmtree(target)
+                _remove_target(target)
             finally:
-                _release_removal_lock(lock_fd)
+                _release_removal_lock(lock_fds)
             after = shutil.disk_usage(root).free
             result["removed_count"] += 1
             result["removed_bytes"] += size

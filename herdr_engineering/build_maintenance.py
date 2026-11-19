@@ -132,6 +132,11 @@ def command(args) -> int:
         status = state_dir / 'build-cleanup.json'
         print(status.read_text() if status.exists() else json.dumps({'status': 'never_run'}))
         return 0
+    if args.cleanup_command == 'run' and not cfg.get('enabled', True) and not args.root:
+        # `enabled` stops the background job and the guard; a sweep the operator names still runs.
+        print(json.dumps({'status': 'disabled',
+                          'message': 'build_cleanup.enabled is false (pass --root to sweep anyway)'}))
+        return 0
     roots = effective_roots(cfg, args.root)
     if not roots:
         print(json.dumps({'error': 'configure build_cleanup.roots or pass --root'}))
@@ -139,9 +144,6 @@ def command(args) -> int:
     def cleanup():
         return cleanup_cycle(cfg, args.root, state_dir, args.dry_run)
     if args.cleanup_command == 'run':
-        if not cfg.get('enabled', True):
-            print(json.dumps({'status': 'disabled', 'message': 'build_cleanup.enabled is false'}))
-            return 0
         result = cleanup()
         skipped = [w for w in result.get('warnings', []) if w.startswith('skipped root')]
         if args.root and skipped:  # a root the operator named must work; only default roots are skipped

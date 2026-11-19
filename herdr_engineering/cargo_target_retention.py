@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shutil
 import stat
 import subprocess
 import time
@@ -14,7 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from .cargo_target_migration import process_paths
-from .cargo_target_storage import TARGET_MARKER, _owned_json, target_directory
+from .cargo_target_storage import TARGET_MARKER, TOMBSTONE, _owned_json, target_directory
 
 LOCK_NAMES = {".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"}
 GIB = 1024 ** 3
@@ -174,6 +175,14 @@ def _clean_profile(profile: Path, use_time: float, cutoff: float, limit: ScanLim
         os.close(profile_fd)
 
 
+def _collect_tombstone(path: Path, report: TierReport) -> None:
+    """Finish a deletion a sweep started (a target is renamed to a tombstone before it is removed)."""
+    try:
+        shutil.rmtree(path)
+    except OSError as error:
+        report.skip(f"{path.name}: {error}")
+
+
 def sweep(cache: Path, state: Path, *, budget_bytes: int, min_idle_hours: float = 168,
           apply: bool = False, max_entries: int = 1_000_000, max_seconds: float = 20) -> TierReport:
     """Try once without interrupting builds; reclaim only recognized profile contents."""
@@ -203,8 +212,12 @@ def sweep(cache: Path, state: Path, *, budget_bytes: int, min_idle_hours: float 
         candidates: list[tuple[float, Path, float, Path]] = []
         # Complete inventory before any deletion: partial scans never evict.
         for target in sorted(_children(root, limit)):
+            if TOMBSTONE.fullmatch(target.name):
+                if apply and not target.is_symlink():
+                    _collect_tombstone(target, report)
+                continue
             if target.name.startswith(".") or target.name.endswith(".lock"):
-                continue  # manager files and the per-target build locks are not targets
+                continue  # manager files are not targets
             try:
                 if target.stat().st_dev != root.stat().st_dev:
                     raise ValueError("target mount boundary")

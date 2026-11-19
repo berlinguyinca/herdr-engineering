@@ -19,6 +19,19 @@ MARKER = "herdr-managed-cargo-host-v1"
 COORDINATED = "HERDR_CARGO_HOST_COORDINATED"
 
 
+BUILD_SUBCOMMANDS = frozenset({"build", "check", "test", "clippy", "nextest", "run",
+                               "bench", "doc", "rustc", "rustdoc", "clean", "fix", "package"})
+
+
+def path_cargo_is_wrapper(command: str) -> bool:
+    """True when ``command`` resolves to the managed cargo launcher (which guards its own builds)."""
+    found = shutil.which(command)
+    try:
+        return found is not None and MARKER.encode() in Path(found).read_bytes()[:256]
+    except OSError:
+        return False
+
+
 def cargo_subcommand(arguments: list[str]) -> str | None:
     """Identify built-ins after Cargo global options without rewriting argv."""
     values = {"--color", "--config", "-Z", "--manifest-path"}
@@ -323,11 +336,13 @@ def _select_with_reserve(config, policy: Mapping, reserve: float):
     if not policy.get("enabled", True):
         return selected, False  # cleanup is off: nothing to try
     first = select_storage(tiers, state / "sccache", 0)
+    ran = None
     try:
-        relieve(policy, state, 100 - reserve, probe=first.directory, pressure=False)
+        ran = relieve(policy, state, 100 - reserve, probe=first.directory, pressure=False)
     except Exception as error:  # noqa: BLE001 - a cleanup fault must never turn a refusal into a crash
         print(f"cargo-host: cleanup unavailable ({type(error).__name__})", file=sys.stderr)
-    return select_storage(tiers, state / "sccache", reserve), True
+    # None: no sweep ran (cooldown, no roots, a fault), so the refusal must not claim one did.
+    return select_storage(tiers, state / "sccache", reserve), ran is not None
 
 
 def _reserve_refusal(reserve: float, cleaned: bool) -> int:
@@ -350,8 +365,7 @@ def run_cargo(argv: list[str]) -> int:
     def guard(probe: Path) -> int | None:
         return None if subcommand == "clean" else _disk_guard_refusal(probe, policy)
 
-    if subcommand not in {"build", "check", "test", "clippy", "nextest", "run",
-                          "bench", "doc", "rustc", "rustdoc", "clean", "fix", "package"}:
+    if subcommand not in BUILD_SUBCOMMANDS:
         os.execvpe(str(real), command, dict(os.environ))
         return 127  # pragma: no cover
     if config is None:  # uncached builds still write to disk: the guard applies, nothing else does
@@ -365,11 +379,8 @@ def run_cargo(argv: list[str]) -> int:
     from .build_cache_policy import effective_slots
     from .build_coord import _default_slots, _default_state_dir, run_gated
 
-    def start(holding_target_lock: bool = False) -> int:
+    def start() -> int:
         if already_coordinated:
-            if holding_target_lock:  # this process holds the target's build lock: it waits, it never execs
-                from .build_metrics import run_measured
-                return run_measured(command, emit=False, env=dict(os.environ)).exit_code
             os.execvpe(str(real), command, dict(os.environ))
             return 127  # pragma: no cover
         return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
@@ -422,13 +433,13 @@ def run_cargo(argv: list[str]) -> int:
                 if removable:
                     raise ValueError("Selected external storage disappeared")
                 selected.directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-            target = prepare_target(selected.directory, workspace, build_lock=True)
+            target = prepare_target(selected.directory, workspace)
             if not compatibility_alias(_default_state_dir(), workspace, target):
                 raise ValueError("Default target changed concurrently; no automatic redirection applied")
             os.environ["CARGO_TARGET_DIR"] = str(target)
             # Incremental artifacts multiply the size of a managed target.
             os.environ.setdefault("CARGO_INCREMENTAL", "0")
-            return start(holding_target_lock=True)
+            return start()
     return guard(override if isinstance(override, Path) else Path.cwd()) or start()
 
 

@@ -213,25 +213,13 @@ def _write_marker(path: Path, payload: dict[str, object]) -> None:
         os.fsync(output.fileno())
 
 
-def target_lock_path(target: Path) -> Path:
-    """The lock beside (never inside) a managed target: builds hold it shared, a sweep exclusively."""
-    return target.parent / f"{target.name}.lock"
+TOMBSTONE = re.compile(r"\.(?P<name>[^/]+)\.deleting-[0-9a-f]{12}")
 
 
-def _hold_target_lock(target: Path) -> int:
-    """Shared lock on ``target`` for the life of the build, held by this (waiting) wrapper process.
-
-    The same ``<name>.lock`` a sweep takes exclusively; whoever comes first creates it and the flock decides.
-    A sweep that is deleting the target is waited out. The descriptor is not inheritable: cargo and any
-    daemon it starts (an sccache server, say) never hold the lock, so it ends with the build.
-    """
-    fd = os.open(target_lock_path(target), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH)
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
+def tombstone_path(target: Path) -> Path:
+    """Where a managed target is renamed to (same directory, so same filesystem) before it is deleted:
+    a half-deleted target can then never be taken for a target (it is collected as a tombstone)."""
+    return target.with_name(f".{target.name}.deleting-{uuid4().hex[:12]}")
 
 
 @contextmanager
@@ -244,13 +232,13 @@ def _manager_lock(root: Path) -> Iterator[None]:
         os.close(fd)
 
 
-def prepare_target(cache: Path, workspace: Path, *, build_lock: bool = False) -> Path:
+def prepare_target(cache: Path, workspace: Path) -> Path:
     """The workspace's managed target, created and ownership-checked.
 
-    The target's lock file is created here, beside the target (a sweep creates it the same way if it is
-    missing; neither ever deletes it). ``build_lock`` also takes its shared lock and leaves it open in this process, which
-    must stay alive until the build ends (it waits for cargo, never execs it): the sweep never deletes a
-    target that a build holds.
+    No lock of ours protects a running build: Cargo flocks ``.cargo-lock`` in the target's profile
+    directories for every build, from this wrapper, an IDE or a script alike, and the sweep honours
+    exactly those locks (and removes a target by renaming it away first, so this function sees a whole
+    target or none).
     """
     if not cache.is_dir():
         raise ValueError("Selected storage disappeared; refusing to create a mount directory")
@@ -270,32 +258,21 @@ def prepare_target(cache: Path, workspace: Path, *, build_lock: bool = False) ->
             if (root_marker.is_symlink() or not isinstance(metadata, dict)
                     or metadata.get("version") != 1 or metadata.get("owner_uid") != os.getuid()):
                 raise ValueError("Target root ownership does not match")
-    # Only a proven Herdr root gets a lock file. Waiting out a sweep happens outside the manager lock.
-    if build_lock:
-        lock_fd = _hold_target_lock(target)
-    else:
-        lock_fd = None
-        os.close(os.open(target_lock_path(target), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600))
-    try:
-        with _manager_lock(root):
-            if target.is_symlink():
-                raise ValueError("Managed target directory cannot be a symlink")
-            target.mkdir(exist_ok=True, mode=0o700)
-            marker = target / TARGET_MARKER
-            expected = {"version": 1, "workspace": str(workspace.resolve()), "owner_uid": os.getuid()}
-            if marker.exists():
-                if marker.is_symlink() or json.loads(marker.read_text()) != expected:
-                    raise ValueError("Target directory belongs to a different workspace")
-            else:
-                if any(target.iterdir()):
-                    raise ValueError("Existing target directory has no ownership marker")
-                _write_marker(marker, expected)
-            os.utime(marker, None, follow_symlinks=False)
-        return target
-    except BaseException:
-        if lock_fd is not None:
-            os.close(lock_fd)
-        raise
+    with _manager_lock(root):
+        if target.is_symlink():
+            raise ValueError("Managed target directory cannot be a symlink")
+        target.mkdir(exist_ok=True, mode=0o700)
+        marker = target / TARGET_MARKER
+        expected = {"version": 1, "workspace": str(workspace.resolve()), "owner_uid": os.getuid()}
+        if marker.exists():
+            if marker.is_symlink() or json.loads(marker.read_text()) != expected:
+                raise ValueError("Target directory belongs to a different workspace")
+        else:
+            if any(target.iterdir()):
+                raise ValueError("Existing target directory has no ownership marker")
+            _write_marker(marker, expected)
+        os.utime(marker, None, follow_symlinks=False)
+    return target
 
 
 # --- Retired shared target pool ---------------------------------------------------------------

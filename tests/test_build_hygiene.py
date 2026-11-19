@@ -21,9 +21,9 @@ import pytest
 import yaml
 
 from herdr_engineering import build_cleanup as cleanup
-from herdr_engineering import build_hygiene, disk_guard
+from herdr_engineering import build_hygiene, cargo_host, disk_guard
 from herdr_engineering.build_cache_config import validate
-from herdr_engineering.config import load_config
+from herdr_engineering.config import DEFAULTS, load_config
 from herdr_engineering.doctor import DoctorReport, _add_build_hygiene
 
 REAL_HOME = Path.home()
@@ -427,6 +427,26 @@ def test_launchd_reload_survives_the_asynchronous_bootout(tmp_path):
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True)
 
 
+def test_build_coordinate_guards_cargo_itself_when_the_wrapper_is_not_on_path(tmp_path):
+    settings = {"build_cleanup": {"enabled": True, "roots": [], "refuse_builds_percent": 0,
+                                  "refuse_builds_min_free_gib": 1e12}}
+    crate = tmp_path / "crate"
+    (crate / "src").mkdir(parents=True)
+    (crate / "Cargo.toml").write_text('[package]\nname="c"\nversion="0.1.0"\nedition="2021"\n')
+    (crate / "src/main.rs").write_text("fn main() {}\n")
+    env = {**os.environ, "HERDR_ENGINEERING_CONFIG": str(tmp_path / "c.yaml"),
+           "HERDR_ENGINEERING_STATE": str(tmp_path / "st"), "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    (tmp_path / "c.yaml").write_text(yaml.safe_dump(settings))
+    env.pop(disk_guard.OVERRIDE_ENV, None)
+    real = _real_cargo()
+    env["PATH"] = f"{real.parent}{os.pathsep}/usr/bin{os.pathsep}/bin"
+    refused = subprocess.run([sys.executable, "-m", "herdr_engineering.cli", "build-coordinate", "--",
+                              "cargo", "build", "--offline"], cwd=crate, env=env, capture_output=True,
+                             text=True, timeout=120)
+    assert refused.returncode == disk_guard.EXIT_REFUSED, refused.stderr
+    assert not (crate / "target").exists()
+
+
 def test_build_coordinate_guards_by_command_and_leaves_cargo_to_the_wrapper(tmp_path):
     settings = {"build_cleanup": {"enabled": True, "roots": [], "refuse_builds_percent": 0,
                                   "refuse_builds_min_free_gib": 1e12}}
@@ -450,47 +470,6 @@ def test_wrapper_still_guards_when_it_runs_under_build_coordinate(tmp_path):
 
 
 # --- round 4: build-held target lock, guard ordering, busy wait, scan resilience ----------------
-
-def test_a_target_a_build_holds_is_never_swept_and_is_swept_once_the_build_ends(tmp_path):
-    from herdr_engineering.cargo_target_storage import prepare_target
-    cache = tmp_path / "state/sccache"
-    cache.mkdir(parents=True)
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    target = prepare_target(cache, workspace, build_lock=True)  # a build's shared lock, still open
-    (target / "debug/.fingerprint").mkdir(parents=True)
-    (target / "debug/artifact").write_bytes(b"x" * 4096)
-    stamp = time.time() - 48 * 3600
-    for path in [*target.rglob("*"), target]:
-        os.utime(path, (stamp, stamp))
-    root = Path(os.path.realpath(target.parent))
-    busy = cleanup.run_once([root], tmp_path / "s2", high_water=1, low_water=0, min_age_hours=24)
-    assert busy["removed_count"] == 0 and target.exists()
-    assert any(item["reason"] == "build in progress" for item in busy["skipped"])
-
-
-def test_a_build_waits_for_a_sweep_that_is_deleting_its_target_then_starts_afresh(tmp_path):
-    import threading
-
-    from herdr_engineering.cargo_target_storage import prepare_target
-    cache = tmp_path / "state/sccache"
-    cache.mkdir(parents=True)
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    target = prepare_target(cache, workspace)
-    stamp = time.time() - 48 * 3600
-    os.utime(target, (stamp, stamp))
-    fd = cleanup._lock_for_removal(target)  # the sweep, midway through its delete
-    assert isinstance(fd, int) and fd >= 0
-    done = threading.Event()
-    threading.Thread(target=lambda: (prepare_target(cache, workspace, build_lock=True), done.set()),
-                     daemon=True).start()
-    assert not done.wait(0.5), "the build must wait while the sweep holds the target"
-    shutil.rmtree(target)
-    cleanup._release_removal_lock(fd)
-    assert done.wait(10), "the build starts as soon as the sweep is done"
-    assert target.is_dir() and (target / ".herdr-cargo-target.json").is_file()
-
 
 def test_an_unreadable_subdirectory_is_skipped_not_the_whole_root(root):
     blocked = root / "docker-data" / "pg"
@@ -613,9 +592,9 @@ def test_fleet_keeps_the_cleanup_job_when_roots_are_empty():
 
 # --- review round 5 -------------------------------------------------------------------------
 
-def make_managed(root: Path, name: str, age_hours: float = 48, lock: bool = True) -> Path:
+def make_managed(root: Path, name: str, age_hours: float = 48) -> Path:
     """A real managed target (``<root>/targets/<label>-<id>``) with Cargo output, idle for ``age_hours``."""
-    from herdr_engineering.cargo_target_storage import prepare_target, target_lock_path
+    from herdr_engineering.cargo_target_storage import prepare_target
     workspace = root.parent / "workspaces" / name
     workspace.mkdir(parents=True, exist_ok=True)
     (root / "sccache").mkdir(exist_ok=True)
@@ -625,27 +604,7 @@ def make_managed(root: Path, name: str, age_hours: float = 48, lock: bool = True
     stamp = time.time() - age_hours * 3600
     for path in [*target.rglob("*"), target]:
         os.utime(path, (stamp, stamp), follow_symlinks=False)
-    if not lock:
-        target_lock_path(target).unlink()  # a target created before the lock existed
     return target
-
-
-def test_prepare_target_creates_the_lock_so_a_sweep_never_has_to(tmp_path):
-    from herdr_engineering.cargo_target_storage import prepare_target, target_lock_path
-    cache = tmp_path / "sccache"
-    cache.mkdir()
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    target = prepare_target(cache, workspace)
-    assert target_lock_path(target).is_file()
-
-
-def test_a_target_without_a_lock_file_is_swept_and_the_lock_is_left_in_place(root):
-    from herdr_engineering.cargo_target_storage import target_lock_path
-    target = make_managed(root, "old", lock=False)
-    result = sweep(root)
-    assert result["removed"] == [str(target)] and not target.exists()
-    assert target_lock_path(target).is_file()  # created like a build creates it, never unlinked
 
 
 def _age(target: Path, hours: float = 48) -> None:
@@ -653,122 +612,6 @@ def _age(target: Path, hours: float = 48) -> None:
     stamp = time.time() - hours * 3600
     for path in [*target.rglob("*"), target]:
         os.utime(path, (stamp, stamp), follow_symlinks=False)
-
-
-def _spawn_build(target_args: str, hold_seconds: int = 60):
-    """A real build process: prepare the managed target with its build lock, then wait."""
-    code = ("import sys, time; from pathlib import Path; "
-            "from herdr_engineering.cargo_target_storage import prepare_target; "
-            "prepare_target(Path(sys.argv[1]), Path(sys.argv[2]), build_lock=True); "
-            f"print('building', flush=True); time.sleep({hold_seconds})")
-    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
-    proc = subprocess.Popen([sys.executable, "-c", code, *target_args.split("|")], env=env,
-                            stdout=subprocess.PIPE, text=True)
-    assert proc.stdout.readline().strip() == "building"
-    return proc
-
-
-def test_a_sweep_process_never_removes_the_target_of_a_build_process_that_has_no_lock_file_yet(root):
-    """A target made before locks existed has no lock file: the build creates it, the sweep honours it,
-    and neither deletes it (the failure: the sweep locked the directory, so the build was not excluded)."""
-    from herdr_engineering.cargo_target_storage import target_lock_path
-    target = make_managed(root, "legacy", lock=False)
-    workspace = root.parent / "workspaces/legacy"
-    build = _spawn_build(f"{root / 'sccache'}|{workspace}")
-    try:
-        assert target_lock_path(target).is_file()
-        _age(target)
-        code = ("import sys, json; from herdr_engineering import build_cleanup as c; "
-                "r = c.run_once(roots=[sys.argv[1]], state_dir=sys.argv[2], high_water=1, low_water=0, "
-                "pressure_water=0, pressure_min_age_hours=1, min_age_hours=1); "
-                "print(json.dumps({'removed': r['removed'], 'skipped': r['skipped']}))")
-        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
-        out = subprocess.run([sys.executable, "-c", code, str(root), str(root.parent / "gates")],
-                             env=env, capture_output=True, text=True, timeout=120)
-        report = json.loads(out.stdout.strip().splitlines()[-1])
-        assert report["removed"] == [] and target.is_dir(), (report, out.stderr[-500:])
-        assert any(x["path"] == str(target) and x["reason"] == "build in progress" for x in report["skipped"])
-    finally:
-        build.kill()
-        build.wait()
-    _age(target)
-    assert sweep(root)["removed"] == [str(target)]  # the build is gone: now it is swept
-    assert target_lock_path(target).is_file()
-
-
-def test_a_daemon_started_by_the_build_does_not_keep_the_target_locked(root):
-    """The lock stays in the waiting wrapper: a child that outlives it (an sccache server) never holds it."""
-    from herdr_engineering.cargo_target_storage import target_lock_path
-    target = make_managed(root, "daemonised")
-    workspace = root.parent / "workspaces/daemonised"
-    code = ("import subprocess, sys; from pathlib import Path; "
-            "from herdr_engineering.cargo_target_storage import prepare_target; "
-            "prepare_target(Path(sys.argv[1]), Path(sys.argv[2]), build_lock=True); "
-            "p = subprocess.Popen(['sleep', '60'], close_fds=False); print(p.pid, flush=True)")
-    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
-    wrapper = subprocess.Popen([sys.executable, "-c", code, str(root / "sccache"), str(workspace)],
-                               env=env, stdout=subprocess.PIPE, text=True)
-    daemon = int(wrapper.stdout.readline())
-    wrapper.wait(timeout=60)
-    _age(target)
-    try:
-        result = sweep(root)  # the wrapper has exited; only the daemon is left
-    finally:
-        os.kill(daemon, 15)
-    assert result["removed"] == [str(target)], result["skipped"]
-    assert target_lock_path(target).is_file()
-
-
-def test_a_skipped_target_keeps_its_lock_file(root):
-    from herdr_engineering.cargo_target_storage import target_lock_path
-    target = make_managed(root, "fresh", age_hours=0.0)  # recent: skipped
-    sweep(root)
-    assert target.exists() and target_lock_path(target).is_file()
-
-
-def test_lock_trouble_on_one_target_skips_it_not_the_sweep(root):
-    from herdr_engineering.cargo_target_storage import target_lock_path
-    broken = make_managed(root, "a-broken")
-    healthy = make_managed(root, "b-healthy")
-    target_lock_path(broken).unlink()
-    target_lock_path(broken).mkdir()  # a directory where the lock file belongs: opening it fails
-    result = sweep(root)
-    assert broken.exists() and not healthy.exists()
-    assert result["removed"] == [str(healthy)] and result["errors"] == []
-    assert any("cannot lock" in s["reason"] for s in result["skipped"] if s["path"] == str(broken))
-
-
-def test_dry_run_does_not_list_a_target_a_running_build_holds(root):
-    held = make_managed(root, "held")
-    free = make_managed(root, "free")
-    code = ("import sys, time; from pathlib import Path; "
-            "from herdr_engineering.cargo_target_storage import _hold_target_lock; "
-            "_hold_target_lock(Path(sys.argv[1])); print('held', flush=True); time.sleep(60)")
-    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
-    holder = subprocess.Popen([sys.executable, "-c", code, str(held)], env=env, stdout=subprocess.PIPE, text=True)
-    try:
-        assert holder.stdout.readline().strip() == "held"
-        result = sweep(root, dry_run=True)
-    finally:
-        holder.kill()
-        holder.wait()
-    assert result["would_remove"] == [str(free)]
-    assert any(s["path"] == str(held) and s["reason"] == "build in progress" for s in result["skipped"])
-
-
-def test_a_refused_foreign_root_gets_no_lock_file(tmp_path):
-    from herdr_engineering.cargo_target_storage import prepare_target
-    cache = tmp_path / "sccache"
-    cache.mkdir()
-    foreign = tmp_path / "targets"
-    foreign.mkdir()
-    (foreign / "someone-elses-data").write_text("x")
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    for build_lock in (False, True):
-        with pytest.raises(ValueError, match="not managed by Herdr"):
-            prepare_target(cache, workspace, build_lock=build_lock)
-    assert sorted(p.name for p in foreign.iterdir()) == [".target-manager.lock", "someone-elses-data"]
 
 
 def test_only_a_targets_directory_with_the_root_marker_yields_managed_targets(root):
@@ -875,22 +718,6 @@ def test_a_failed_cleanup_does_not_start_the_cooldown(tmp_path, root):
     assert disk_guard.relieve(_policy(root), good, 1) is True  # not suppressed by the failure
 
 
-def test_every_unmanaged_removal_is_checked_against_its_own_process_snapshot(root):
-    first, second = make_target(root, "a"), make_target(root, "b")
-    result = sweep(root)
-    assert sorted(result["removed"]) == sorted([str(first), str(second)])
-    assert result["process_scans"] == 3  # one before anything is deleted, then one right before each removal
-
-
-def test_a_dry_run_neither_creates_a_lock_file_nor_holds_a_build_up(root):
-    from herdr_engineering.cargo_target_storage import target_lock_path
-    target = make_managed(root, "legacy", lock=False)
-    result = sweep(root, dry_run=True)
-    assert result["would_remove"] == [str(target)]
-    assert not target_lock_path(target).exists()
-
-
-@pytest.mark.integration
 def test_a_reserve_miss_with_an_empty_build_cleanup_key_exits_75_not_a_crash(tmp_path):
     home, env = cargo_env(tmp_path)
     set_reserve(env, 99)
@@ -948,3 +775,323 @@ def test_the_guard_measures_the_tier_the_reserve_chose_not_a_full_primary(tmp_pa
     finally:
         shutil.rmtree(shm_dir.parent, ignore_errors=True)
     assert built.returncode == 0, built.stderr
+
+
+# --- review round 7: Cargo's own locks, tombstones, one guard story ----------------------------
+
+def _crate_with_slow_build(path: Path, seconds: int = 12) -> Path:
+    """A real crate whose build script sleeps, so a real ``cargo build`` stays in progress."""
+    (path / "src").mkdir(parents=True)
+    (path / "Cargo.toml").write_text('[package]\nname = "slow"\nversion = "0.1.0"\nedition = "2021"\n'
+                                     'build = "build.rs"\n')
+    (path / "build.rs").write_text(f"fn main() {{ std::thread::sleep(std::time::Duration::from_secs({seconds})); }}\n")
+    (path / "src/main.rs").write_text("fn main() {}\n")
+    git("init", "-q", cwd=path)
+    return path
+
+
+def _wait_until_cargo_holds(target: Path, timeout: float = 90) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if target.is_dir():
+            held = cleanup._lock_for_removal(target)
+            if held == cleanup._BUSY:
+                return
+            cleanup._release_removal_lock(held)
+        time.sleep(0.2)
+    raise AssertionError(f"cargo never took its lock under {target}")
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    import signal
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+
+
+def _spawn_cargo(argv: list[str], cwd: Path, env: dict) -> subprocess.Popen:
+    return subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+
+
+def _real_cargo() -> Path:
+    """A cargo that is not the herdr wrapper (an IDE or a script would run this one)."""
+    for candidate in (REAL_HOME / ".cargo/bin/cargo", "/opt/homebrew/bin/cargo", "/usr/local/bin/cargo",
+                      shutil.which("cargo") or ""):
+        path = Path(candidate) if candidate else None
+        if path and path.is_file() and not cargo_host.path_cargo_is_wrapper(str(path)):
+            return path
+    pytest.skip("a real, non-wrapper cargo is required")
+
+
+def _direct_env(**extra: str) -> dict:
+    cargo = _real_cargo()
+    env = {**os.environ, **extra}
+    env["PATH"] = f"{cargo.parent}{os.pathsep}{env['PATH']}"
+    env["CARGO_HOME"] = os.environ.get("CARGO_HOME", str(REAL_HOME / ".cargo"))
+    env.setdefault("RUSTUP_HOME", os.environ.get("RUSTUP_HOME", str(REAL_HOME / ".rustup")))
+    for key in ("RUSTC_WRAPPER", "CARGO_TARGET_DIR", "HERDR_CARGO_HOST_COORDINATED"):
+        if key not in extra:
+            env.pop(key, None)
+    return env
+
+
+@pytest.mark.integration
+def test_a_direct_cargo_build_into_a_managed_target_blocks_the_sweep(root):
+    """An IDE-style ``cargo build`` (no wrapper, no lock of ours) is protected by Cargo's own lock."""
+    target = make_managed(root, "ide")
+    crate = _crate_with_slow_build(root.parent / "workspaces/ide-crate")
+    build = _spawn_cargo([str(_real_cargo()), "build", "--offline"], crate,
+                         _direct_env(CARGO_TARGET_DIR=str(target)))
+    try:
+        _wait_until_cargo_holds(target)
+        _age(target)
+        busy = sweep(root)
+        assert busy["removed"] == [] and target.is_dir(), busy
+        assert any(x["path"] == str(target) and x["reason"] in {"build in progress", "active project"} for x in busy["skipped"]), busy
+        assert cleanup._lock_for_removal(target) == cleanup._BUSY
+    finally:
+        _stop(build)
+    _age(target)
+    assert sweep(root)["removed"] == [str(target)]  # the build is gone: swept (and its locks with it)
+
+
+@pytest.mark.integration
+def test_a_direct_cargo_build_into_an_operators_target_blocks_the_sweep(root):
+    crate = _crate_with_slow_build(root / "proj")
+    build = _spawn_cargo([str(_real_cargo()), "build", "--offline"], crate, _direct_env())
+    try:
+        _wait_until_cargo_holds(crate / "target")
+        _age(crate / "target")
+        busy = sweep(root)
+        assert busy["removed"] == [] and (crate / "target").is_dir(), busy
+        assert any(x["reason"] in {"build in progress", "active project"} for x in busy["skipped"]), busy
+        assert cleanup._lock_for_removal(crate / "target") == cleanup._BUSY
+    finally:
+        _stop(build)
+
+
+@pytest.mark.integration
+def test_a_wrapper_build_blocks_the_sweep_and_dies_with_its_pid(tmp_path):
+    """The wrapper execs cargo (no waiting parent): killing the pid it was started as ends the build and
+    its lock, and until then the sweep leaves the target alone."""
+    home, env = cargo_env(tmp_path)
+    env["HERDR_CARGO_HOST_COORDINATED"] = "1"  # as build-coordinate starts it: the exec path
+    crate = _crate_with_slow_build(tmp_path / "crate")
+    build = _spawn_cargo([str(home / ".local/bin/cargo"), "build", "--offline"], crate, env)
+    try:
+        deadline = time.monotonic() + 90
+        while not managed_targets(tmp_path) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        (target,) = managed_targets(tmp_path)
+        _wait_until_cargo_holds(target)
+        root = Path(os.path.realpath(target.parent))
+        _age(target)
+        busy = cleanup.run_once([root], tmp_path / "s2", high_water=1, low_water=0, min_age_hours=24)
+        assert busy["removed"] == [] and target.is_dir()
+        os.kill(build.pid, 9)  # not the process group: only the pid a watcher would have
+        build.wait(timeout=30)
+        free = cleanup._lock_for_removal(target)
+        assert free != cleanup._BUSY, "cargo must not outlive the pid the wrapper was started as"
+        cleanup._release_removal_lock(free)
+    finally:
+        _stop(build)
+
+
+def _hold(paths: list[Path], seconds: int = 60) -> subprocess.Popen:
+    code = ("import fcntl, sys, time, os\n"
+            "fds = []\n"
+            "for p in sys.stdin.read().split():\n"
+            "    os.makedirs(os.path.dirname(p), exist_ok=True)\n"
+            "    fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600); fcntl.flock(fd, fcntl.LOCK_EX); fds.append(fd)\n"
+            f"print('held', flush=True); time.sleep({seconds})\n")
+    # paths travel on stdin: a target named on the command line would make the sweep see an active project
+    proc = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    proc.stdin.write("\n".join(map(str, paths)) + "\n")
+    proc.stdin.close()
+    assert proc.stdout.readline().strip() == "held"
+    return proc
+
+
+@pytest.mark.parametrize("layout", [
+    [("debug", ".cargo-lock")],                                          # cargo 1.75
+    [("debug", ".cargo-build-lock")],                                    # newer cargo: the build lock alone
+    [("release", ".cargo-artifact-lock")],
+    [("aarch64-apple-darwin/debug", ".cargo-lock")],                     # --target <triple>
+    [("debug", ".cargo-lock"), ("debug", ".cargo-build-lock"), ("debug", ".cargo-artifact-lock")],
+])
+def test_any_cargo_lock_layout_keeps_the_sweep_away(root, layout):
+    managed = make_managed(root, "layout")
+    unmanaged = make_target(root, "plain")
+    targets = (managed, unmanaged)
+    holders = [_hold([target / profile / name for profile, name in layout]) for target in targets]
+    try:
+        for target in targets:
+            _age(target)
+        result = sweep(root)
+        for target in targets:
+            assert target.is_dir() and str(target) not in result["removed"], (layout, result)
+            # the open descriptor may already show as an active project; the lock itself must also say busy
+            assert any(x["path"] == str(target) and x["reason"] in {"build in progress", "active project"}
+                       for x in result["skipped"]), json.dumps(result, default=str)
+            assert cleanup._lock_for_removal(target) == cleanup._BUSY, layout
+    finally:
+        for holder in holders:
+            holder.kill()
+            holder.wait()
+    for target in targets:
+        _age(target)
+    assert sorted(sweep(root)["removed"]) == sorted(map(str, targets))  # the holders are gone
+
+
+def test_a_dry_run_lists_only_targets_no_build_holds_and_takes_no_lock_for_good(root):
+    held, free = make_managed(root, "held"), make_managed(root, "free")
+    holder = _hold([held / "debug/.cargo-lock"])
+    try:
+        result = sweep(root, dry_run=True)
+    finally:
+        holder.kill()
+        holder.wait()
+    assert result["would_remove"] == [str(free)]
+    again = cleanup._lock_for_removal(free)  # the dry run released what it took
+    assert isinstance(again, list)
+    cleanup._release_removal_lock(again)
+
+
+def test_an_unopenable_cargo_lock_skips_that_target_not_the_sweep(root):
+    broken, healthy = make_managed(root, "a-broken"), make_managed(root, "b-healthy")
+    lock = broken / "debug/.cargo-lock"
+    lock.write_text("")
+    lock.chmod(0)  # present but unreadable: this target cannot be proven idle
+    _age(broken)
+    if os.access(lock, os.R_OK):
+        pytest.skip("permissions are not enforced for this user")
+    result = sweep(root)
+    assert result["removed"] == [str(healthy)] and result["errors"] == []
+    assert any(x["path"] == str(broken) and x["reason"].startswith("cannot lock") for x in result["skipped"])
+    assert broken.is_dir()
+
+
+def _unwritable_child(target: Path) -> Path:
+    inner = target / "debug/deps/locked"
+    inner.mkdir(parents=True)
+    (inner / "x").write_text("x")
+    inner.chmod(0o500)  # rmtree cannot empty it
+    return inner
+
+
+def test_an_interrupted_delete_leaves_a_tombstone_never_a_half_target(root):
+    from herdr_engineering.cargo_target_storage import TOMBSTONE, prepare_target
+    target = make_managed(root, "half")
+    inner = _unwritable_child(target)
+    if os.access(inner, os.W_OK):
+        pytest.skip("permissions are not enforced for this user")
+    _age(target)
+    try:
+        with pytest.raises(OSError):
+            cleanup._remove_target(target)
+        assert not target.exists(), "the name is free at once: a whole target or none"
+        graves = [p for p in target.parent.iterdir() if TOMBSTONE.fullmatch(p.name)]
+        assert len(graves) == 1
+        rebuilt = prepare_target(root / "sccache", root.parent / "workspaces/half")  # no ownership error
+        assert rebuilt == target and (rebuilt / ".herdr-cargo-target.json").is_file()
+    finally:
+        for grave in target.parent.iterdir():
+            for path in [grave, *grave.rglob("*")] if grave.is_dir() else []:
+                if path.is_dir() and not path.is_symlink():
+                    path.chmod(0o700)
+    result = sweep(root)  # collects the tombstone
+    assert result["tombstones_removed"] == 1
+    assert not [p for p in target.parent.iterdir() if TOMBSTONE.fullmatch(p.name)]
+
+
+def test_retention_collects_tombstones_too(tmp_path):
+    from herdr_engineering import cargo_target_retention as retention
+    from herdr_engineering.cargo_target_storage import prepare_target, tombstone_path
+    cache = tmp_path / "state/sccache"
+    cache.mkdir(parents=True)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    target = prepare_target(cache, workspace)
+    grave = tombstone_path(target)
+    target.rename(grave)
+    (grave / "leftover").write_text("x")
+    report = retention.sweep(cache, tmp_path / "ret-state", budget_bytes=1, apply=True)
+    assert not grave.exists(), report
+
+
+def test_a_failed_sweep_does_not_start_the_cooldown(root, state_env):
+    """A sweep that returns status 'error' (here: its own state sits inside a target) stamps nothing."""
+    cache = make_target(root, age_hours=48)
+    ran = disk_guard.relieve(_policy(root), cache / "state", 1)
+    assert ran is True and not (cache / "state/disk-guard.json").exists()
+    assert cache.exists()
+
+
+def test_build_cleanup_false_means_disabled_everywhere(tmp_path):
+    from herdr_engineering import fleet
+    from herdr_engineering.config import InvalidError
+    for text, enabled in (("build_cleanup: false\n", False), ("build_cleanup: true\n", True)):
+        path = tmp_path / "c.yaml"
+        path.write_text(text)
+        section = load_config([path])["build_cleanup"]
+        assert isinstance(section, dict) and section["enabled"] is enabled
+        assert section["roots"] == DEFAULTS["build_cleanup"]["roots"]
+        assert fleet._cleanup_job_wanted(section) is enabled
+    path.write_text("build_cleanup: [1]\n")
+    with pytest.raises(InvalidError):
+        load_config([path])
+
+
+@pytest.mark.integration
+def test_a_boolean_build_cleanup_never_crashes_the_wrapper(tmp_path):
+    home, env = cargo_env(tmp_path)
+    set_reserve(env, 99)
+    path = Path(env["HERDR_ENGINEERING_CONFIG"])
+    settings = yaml.safe_load(path.read_text())
+    settings["build_cleanup"] = False
+    path.write_text(yaml.safe_dump(settings))
+    repo, _ = crate_with_worktree(tmp_path)
+    refused = build(repo, home, env)
+    assert refused.returncode == disk_guard.EXIT_REFUSED, refused.stderr
+    assert "Traceback" not in refused.stderr and "after cleaning up" not in refused.stderr
+
+
+def test_an_explicit_root_is_swept_even_when_the_background_job_is_disabled(tmp_path):
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    stale = make_target(Path(os.path.realpath(projects)), age_hours=48)
+    settings = {"build_cleanup": {"enabled": False, "high_water_percent": 1, "low_water_percent": 0}}
+    plain = run_cli(tmp_path, "build-cleanup", "run", settings=settings)
+    assert json.loads(plain.stdout)["status"] == "disabled", plain.stdout + plain.stderr  # the job stays off
+    swept = run_cli(tmp_path, "build-cleanup", "run", "--root", str(projects), settings=settings)
+    assert swept.returncode == 0, swept.stderr
+    assert json.loads(swept.stdout)["removed"] == [str(stale)] and not stale.exists()
+
+
+@pytest.mark.integration
+def test_a_refusal_inside_the_cooldown_does_not_claim_a_cleanup(tmp_path):
+    home, env = cargo_env(tmp_path)
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    stale = make_target(projects, age_hours=48)
+    set_reserve(env, 99, roots=[str(projects)])
+    stamp_dir = tmp_path / "state/build-gates"
+    stamp_dir.mkdir(parents=True)
+    (stamp_dir / "disk-guard.json").write_text(json.dumps({"triggered_at": time.time()}))  # swept moments ago
+    repo, _ = crate_with_worktree(tmp_path)
+    refused = build(repo, home, env)
+    assert refused.returncode == disk_guard.EXIT_REFUSED, refused.stderr
+    assert "after cleaning up" not in refused.stderr and stale.exists()
+
+
+def test_a_process_snapshot_is_reused_for_a_few_seconds(root, monkeypatch):
+    make_target(root, "a")
+    make_target(root, "b")
+    assert sweep(root)["process_scans"] == 1  # the second removal reuses the first snapshot
+    make_target(root, "c")
+    make_target(root, "d")
+    monkeypatch.setattr(cleanup, "_SNAPSHOT_REUSE_SECONDS", 0.0)
+    assert sweep(root)["process_scans"] == 3  # stale snapshots are taken again before each removal
