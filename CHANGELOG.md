@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Security: repo-local config can no longer set `handoff_autopilot`
+
+- `load_config` and `declared_keys` now ignore `handoff_autopilot` in the repo-local `./config/herdr-engineering.yaml` and `./herdr-engineering.yaml` (the repository being built is untrusted), exactly as `fabric_build_cache` already was, via one shared `_REPO_LOCAL_STRIPPED_KEYS` list. Set it in `~/.config/herdr-engineering/config.yaml` or `$HERDR_ENGINEERING_CONFIG`.
+
 ### Fix: automatic handoff reads the context window from the session's model
 
 - `handoff autopilot` no longer hard-codes a 200k window for Claude Code. The transcript names the model, and `handoff_autopilot.model_context_windows` (YAML; a model-name substring to its window, longest match wins, merged with the built-in `[1m]` -> 1,000,000) gives its window; the Stop hook, `check --transcript` and `record --transcript` all apply it and report `window.source: "model"`. The harness's own stated window still wins, then the model, then a declared `context_window_tokens`, and only then the 200k assumption (with escalation past it). New `transcript_model()` reads `message.model`.

@@ -306,6 +306,12 @@ def _discover_config_paths() -> list[Path]:
     return [c for c in candidates if c.exists()]
 
 
+# Sections a checkout being built must never set: policy (build-cache writes,
+# namespace, credentials; automatic handoff triggers) belongs to the machine
+# config, not to the repository an agent is working on.
+_REPO_LOCAL_STRIPPED_KEYS: tuple[str, ...] = ("fabric_build_cache", "handoff_autopilot")
+
+
 def _repo_local_paths() -> set[Path]:
     """Config files taken from the current directory (untrusted: the repo being built)."""
     cwd = Path.cwd()
@@ -349,8 +355,10 @@ def load_config(
             )
         if path in repo_local:
             # A checkout being built must never choose build-cache policy
-            # (writes, namespace, credentials): machine-local config only.
-            data.pop("fabric_build_cache", None)
+            # (writes, namespace, credentials) or handoff policy: trusted
+            # (machine-local / explicit) config only.
+            for key in _REPO_LOCAL_STRIPPED_KEYS:
+                data.pop(key, None)
         cfg = _deep_merge(cfg, data)
     validate_github(cfg.get("github"))
     cfg = _expand_env(cfg)
@@ -378,8 +386,11 @@ def declared_keys(section: str) -> set[str]:
     a default is a guess about a context window, 200000 as a declaration is a fact about one.
     """
     keys: set[str] = set()
+    untrusted = _repo_local_paths()
     for path in _discover_config_paths():
         if not path.is_file():
+            continue
+        if section in _REPO_LOCAL_STRIPPED_KEYS and path in untrusted:
             continue
         try:
             raw = _read_simple_yaml(path)
