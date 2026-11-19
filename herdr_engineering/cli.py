@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .handoff_adapters.base import Harness
 from .version import __version__
 
 # The central fleet file, alone in its own directory (deploy.sh mounts the directory).
@@ -513,6 +514,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--harness", default=None, help="skip detection and validate this name")
     p2.add_argument("--proc-root", default="/proc", help=argparse.SUPPRESS)
     p2.set_defaults(func=_cmd_handoff_harness)
+    p2 = hsub.add_parser("context", help="print how full this session's context is (always exit 0; {\"unknown\": true} when unreadable)")
+    p2.add_argument("--pane", default=None, help="pane id (default: $HERDR_PANE_ID)")
+    p2.add_argument("--harness", choices=[h.value for h in Harness], default=None,
+                    help="with --session-id: skip detection and the Herdr lookup")
+    p2.add_argument("--session-id", default=None, help="with --harness: the session whose record to read")
+    p2.add_argument("--cwd", default=None, help="working directory of the session (default: the current one)")
+    p2.add_argument("--json", action="store_true")
+    p2.set_defaults(func=_cmd_handoff_context)
     p2 = hsub.add_parser("context-hook", help="UserPromptSubmit hook body (opt-in): ask for /handoff when context is high; never fails")
     p2.add_argument("harness", help="only claude is supported; anything else is a silent no-op so a hook never fails")
     p2.set_defaults(func=_cmd_handoff_context_hook)
@@ -1498,6 +1507,40 @@ def _cmd_handoff_harness(args) -> int:
         _print_json({"ok": False, "error": str(exc), "options": list(hh.HARNESSES)})
         return 2
     _print_json(found.to_dict())
+    return 0
+
+
+def _cmd_handoff_context(args) -> int:
+    from . import handoff_harness as hh
+    from .handoff_adapters import adapter_for
+    if (args.harness is None) != (args.session_id is None):
+        _build_parser().error("handoff context: --harness and --session-id go together")
+    cwd = Path(args.cwd) if args.cwd else Path.cwd()
+    pane = args.pane or os.environ.get("HERDR_PANE_ID") or ""
+    reading, harness = None, None
+    try:
+        if args.harness is not None:
+            harness = Harness(args.harness)
+            adapter = adapter_for(harness)
+            ref = adapter.locate_session(args.session_id, cwd, pane)
+        elif pane:
+            harness = Harness(hh.detect().harness)
+            adapter = adapter_for(harness)
+            ref = adapter.locate(pane, cwd)
+        else:
+            ref = None
+        reading = adapter.read_context(ref) if ref is not None else None
+    except (hh.Undetectable, ValueError, OSError):
+        reading = None  # a reading that is unavailable must never fail a caller's script
+    if reading is None or harness is None:
+        print(json.dumps({"unknown": True}) if args.json else "unknown")
+        return 0
+    percent = round(reading.percent, 1)
+    if args.json:
+        _print_json({"harness": harness.value, "used_tokens": reading.used_tokens, "window_tokens": reading.window_tokens,
+                     "percent": percent, "source": reading.source, "window_source": reading.window_source})
+    else:
+        print(f"{harness.value}: {reading.used_tokens} of {reading.window_tokens} tokens ({percent}%)")
     return 0
 
 
