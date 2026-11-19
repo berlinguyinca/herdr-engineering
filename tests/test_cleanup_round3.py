@@ -139,6 +139,32 @@ def test_malformed_values_fail_closed_not_open(cfg: dict) -> None:
     assert run(policy)["status"] == "config_unreadable"
 
 
+# --- 5: in-use is re-checked right before each removal ---------------------------------------------
+
+def test_reaper_rechecks_in_use_per_removal(env: Env, tmp_path: Path) -> None:
+    first = env.worktree("a-first")
+    second = env.worktree("b-second")
+    pidfile = tmp_path / "holder.pid"
+    script = tmp_path / "start-holder.sh"  # a real clean filter: git runs it during the FIRST worktree's status
+    script.write_text(f"#!/bin/sh\nif [ ! -e {pidfile} ]; then (cd {second} && exec sleep 60) "
+                      f">/dev/null 2>&1 </dev/null & echo $! > {pidfile}; fi\ncat\n")
+    script.chmod(0o755)
+    git(env.repo, "config", "filter.holder.clean", str(script))
+    (env.repo / ".git" / "info").mkdir(exist_ok=True)
+    (env.repo / ".git" / "info" / "attributes").write_text("a.txt filter=holder\n")
+    (first / "a.txt").write_text("b\n")  # same size, new mtime: git must run the filter
+    try:
+        out = reap_worktrees(Policy(pr_source="git", min_idle_hours=0, ttl_days=0), extra_repos=[env.repo],
+                             extra_roots=[str(env.roots[0])], now=time.time() + DAY)
+    finally:
+        if pidfile.exists():
+            os.kill(int(pidfile.read_text()), 9)
+    rows = {Path(w["path"]).name: w for r in out["repos"] for w in r["worktrees"]}
+    assert pidfile.exists(), "the filter never ran"
+    assert rows["b-second"]["action"] == "kept" and rows["b-second"]["reason"] == "in_use"
+    assert second.exists()
+
+
 # --- 7: read-only directories are verified before anything is deleted ------------------------------
 
 def test_tmp_scope_refuses_readonly_subdir_before_deleting(tmp_path: Path) -> None:
