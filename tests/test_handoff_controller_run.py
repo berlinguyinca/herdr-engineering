@@ -13,7 +13,7 @@ import pytest
 from herdr_engineering.handoff_adapters.base import Harness, SessionRef
 from herdr_engineering.handoff_adapters.claude import ClaudeAdapter
 from herdr_engineering.handoff_controller.config import ControllerConfig, config_from_env
-from herdr_engineering.handoff_controller.drain import agent_matches
+from herdr_engineering.handoff_controller.drain import Look, agent_matches
 from herdr_engineering.handoff_controller.events import Colour, EventLog, HandoffEvent
 from herdr_engineering.handoff_controller.handoff_cli import HandoffCli
 from herdr_engineering.handoff_controller.herdr_cli import (
@@ -93,6 +93,7 @@ class World:
                          drain_attempt_s=0.2, drain_poll_s=0.05, fallback_timeout_s=30.0,
                          takeover_kwargs=kwargs or {})  # type: ignore[arg-type]
         ctl.adapters[Harness.CLAUDE] = ClaudeAdapter(home=self.tmp / "home")
+        ctl.look = lambda ref, adapter, herdr: Look("idle", True, False)  # no Herdr here: every pane is ready to take over
         return ctl
 
     def session(self, pane: str, pct: float) -> None:
@@ -153,9 +154,12 @@ def test_next_step_starts_a_chain_only_at_the_limit_and_only_when_allowed() -> N
 
 def test_next_step_waits_for_the_briefing_then_falls_back_once_the_timeout_passes() -> None:
     chain = Chain("c1", 100.0, "t", None, False)
-    rt = PaneRuntime("s1", typed=True, wait_since=100.0)
+    rt = PaneRuntime("s1", typed=True, wait_since=100.0, quiet_since=100.0)  # idle, no live subagent, since the typing
     assert next_step(chain, rt, Decision.DRAIN, 100.0 + CFG.briefing_timeout_s - 1, CFG, True) is Step.CHECK_BRIEFING
     assert next_step(chain, rt, Decision.NONE, 100.0 + CFG.briefing_timeout_s, CFG, True) is Step.FALLBACK
+    busy = PaneRuntime("s1", typed=True, wait_since=100.0)  # working or with live subagents: not before the bound
+    assert next_step(chain, busy, Decision.NONE, 100.0 + CFG.briefing_timeout_s + 1, CFG, True) is Step.CHECK_BRIEFING
+    assert next_step(chain, busy, Decision.NONE, 100.0 + CFG.drain_timeout_s, CFG, True) is Step.FALLBACK
 
 
 def test_next_step_retries_the_drain_until_the_drain_timeout_and_never_types_during_a_cooldown() -> None:

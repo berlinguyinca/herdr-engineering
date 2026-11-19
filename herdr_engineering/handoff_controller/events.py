@@ -43,14 +43,14 @@ class StuckReason(StrEnum):
 EVENT_NAMES = frozenset({
     "handoff.triggered", "handoff.drain_started", "handoff.drained", "handoff.briefing_written",
     "handoff.briefing_fallback", "handoff.wip_committed", "handoff.takeover_started", "handoff.succeeded",
-    "handoff.failed_compacted", "handoff.stuck", "handoff.skipped",
+    "handoff.failed_compacted", "handoff.stuck", "handoff.skipped", "handoff.waiting",
 })
 _TERMINAL = {
     "handoff.succeeded": Colour.GREEN,
     "handoff.failed_compacted": Colour.ORANGE,
     "handoff.stuck": Colour.RED,
 }
-_REASON_REQUIRED = frozenset({"handoff.stuck", "handoff.skipped"})
+_REASON_REQUIRED = frozenset({"handoff.stuck", "handoff.skipped", "handoff.waiting"})
 
 
 @dataclass(frozen=True)
@@ -69,6 +69,7 @@ class HandoffEvent:
     context_pct: float | None
     successor_pane_id: str | None = None  # the successor's pane; `successor_id` is only ever a handoff id
     successor_session_id: str | None = None  # the successor agent's session id, when Herdr reports one
+    subagents_live: int | None = None  # `handoff.waiting`: the subagents the registry counts as running
 
     def __post_init__(self) -> None:
         if self.event not in EVENT_NAMES:
