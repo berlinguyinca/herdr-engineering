@@ -140,9 +140,9 @@ def test_forged_session_env_var_does_not_exempt_a_live_session(tmp_path: Path, h
         stranger.kill()
         stranger.wait()
     claim_session(home, SESSION)
-    out = cleanup("tmp", session / "scratchpad", roots=[], temp_roots=[tmp_path], scratch_root=root,
-                  live_roots=[live])
-    assert out["action"] == "removed"
+    with pytest.raises(Refusal, match="scratch_protected"):  # a real ancestor session is the caller's own
+        cleanup("tmp", session / "scratchpad", roots=[], temp_roots=[tmp_path], scratch_root=root,
+                live_roots=[live])
 
 
 # --- 7: one local pass per removable worktree -------------------------------------------------------------

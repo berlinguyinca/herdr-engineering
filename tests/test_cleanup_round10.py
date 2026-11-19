@@ -38,12 +38,12 @@ def test_a_foreign_session_below_a_nested_claude_dir_keeps_the_session_rules(tmp
     assert refusal.value.code == "session_recent"
 
 
-def test_the_nested_claude_dir_and_its_session_dir_are_not_removable(tmp_path: Path) -> None:
+def test_the_nested_claude_dir_is_protected_and_its_session_dir_follows_the_session_rules(tmp_path: Path) -> None:
     session = _nested_session(tmp_path)
-    for path in (session, session.parents[1]):
+    for path, code in ((session, "session_recent"), (session.parents[1], "scratch_protected")):
         with pytest.raises(Refusal) as refusal:
             _guard_scratch(path, [Path(f"/tmp/claude-{UID}")], [], time.time())
-        assert refusal.value.code == "scratch_structure"
+        assert refusal.value.code == code
 
 
 # --- ancestry --------------------------------------------------------------------------------------------

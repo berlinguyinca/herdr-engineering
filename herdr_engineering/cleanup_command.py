@@ -165,17 +165,19 @@ def config_strings(value: Any, name: str) -> tuple[str, ...]:
 
 
 def _bases(paths: list[Path]) -> list[Path]:
-    """Each path as spelled and canonicalised (macOS ``/tmp`` is ``/private/tmp``). A
-    ``claude-<uid>`` root that is a symlink or owned by someone else is dropped with a warning:
-    it is never followed, so it can not become a deletion root."""
+    """Each path as spelled and canonicalised (macOS ``/tmp`` is ``/private/tmp``)."""
     found: list[Path] = []
     for p in paths:
-        if _untrusted_scratch(p):
-            continue
         for base in (Path(os.path.abspath(p)), Path(os.path.realpath(p))):
             if base not in found:
                 found.append(base)
     return found
+
+
+def _trusted_bases(paths: list[Path]) -> list[Path]:
+    """``_bases`` for DELETION roots: a ``claude-<uid>`` that is a symlink or foreign is dropped. The
+    scratch guard keeps using ``_bases``: a planted root can only refuse more, never allow more."""
+    return _bases([p for p in paths if not _untrusted_scratch(p)])
 
 
 def _untrusted_scratch(path: Path) -> bool:
@@ -242,13 +244,13 @@ def checked_path(path: Path | str, roots: list[Path],
     target = Path(os.path.abspath(raw))
     canonical = Path(os.path.realpath(target.parent)) / target.name  # symlinks above the roots
     for candidate in dict.fromkeys((target, canonical)):
-        for base in _bases(roots):
+        for base in _trusted_bases(roots):
             parts = relative_parts(candidate, base)
             if parts == ():
                 raise Refusal("is_root", f"{candidate} is a configured root, not removable")
             if parts:
                 return _verified(candidate, len(parts))
-        for parent in _bases(temp_worktree_parents or []):
+        for parent in _trusted_bases(temp_worktree_parents or []):
             if candidate.name.startswith(TEMP_WORKTREE_PREFIX) and relative_parts(candidate, parent) == (candidate.name,):
                 return _verified(candidate, 1)
     raise Refusal("outside_roots", f"{target} is outside the agent-owned roots")
@@ -646,95 +648,47 @@ def own_sessions(home: Path | None = None) -> frozenset[str]:
     return frozenset(found)
 
 
-_CONTAINED_DEPTH = 6  # levels below the target searched for a nested claude-<uid>
-
-
-def _nested_scratch_roots(path: Path) -> list[Path]:
-    """Every ``claude-<uid>`` directory on ``path``'s way down from a fixed temp root, at any depth
-    (``/tmp/x/claude-501``, ``/tmp/claude-501/claude-501``): Claude's session rules apply below each."""
-    from .scratch_reaper import system_temp_roots
-    wanted = f"claude-{os.getuid()}".casefold()
-    found: list[Path] = []
-    for base in _bases(list(system_temp_roots())):
-        parts = relative_parts(path, base)
-        for index, name in enumerate(parts or ()):
-            if name.casefold() == wanted:
-                found.append(path if index == len(parts or ()) - 1 else path.parents[len(parts or ()) - index - 2])
-    return found
-
-
 def _guard_scratch(path: Path, scratches: list[Path], live_roots: list[Path], now: float) -> None:
-    """Under Claude's scratch root only strictly inside a ``<session>`` dir, never the root, a
-    ``<project>`` dir or the session dir itself. ``.keep`` protects. The caller's own session
-    (see ``own_sessions``) is free to clean up after itself; any other session must pass
-    ``scratch_reaper``'s policy: not live and idle for the session TTL."""
-    from .scratch_safety import keep_ancestor
-    own = own_sessions()
-    for base in _bases([*scratches, *_nested_scratch_roots(path)]):
-        parts = relative_parts(path, base)
-        if parts is None:
-            continue
-        index = 0 if parts and _UUID.fullmatch(parts[0].lower()) else 1 if len(parts) > 1 and _UUID.fullmatch(parts[1].lower()) else None
-        if index is None or len(parts) <= index + 1:
-            raise Refusal("scratch_structure",
-                          f"{path} is the scratch root, a project or a session directory; only paths inside a session are removable")
-        if keep_ancestor(path, path.parents[len(parts) - 1]):
-            raise Refusal("keep_marker", f"{path} is under a .keep marker")
-        _session_idle(parts[index].lower(), path.parents[len(parts) - index - 2], own, live_roots, now)
-        return
-    _guard_contained_sessions(path, own, live_roots, now)
-
-
-def _session_idle(session: str, session_dir: Path, own: frozenset[str], live_roots: list[Path], now: float) -> None:
-    """Refuse unless ``session`` is the caller's own, or not live and idle for the session TTL."""
+    """One rule for ``--scope tmp``. A path TOUCHES scratch when it or an ancestor is a ``claude-<uid>``
+    directory (a symlinked or foreign one included: it only stops being a deletion root), or when
+    anything below it is (unbounded walk; any walk error refuses). A touching path is removable only
+    when it is one session ``<claude-uid>/[<project>/]<uuid>`` or inside one, with no ``claude-<uid>``
+    nested below it, the session not the caller's own, not live and idle for the session TTL. The
+    INNERMOST ``claude-<uid>`` decides. Everything else that touches scratch is ``scratch_protected``."""
     from .scratch_reaper import Policy, _live_ids
-    from .scratch_safety import inspect_tree
-    policy = Policy()
-    if session in own:
+    from .scratch_safety import inspect_tree, keep_ancestor
+    wanted = f"claude-{os.getuid()}".casefold()
+    roots = [parts for base in _bases([*scratches, *(p for p in (path, *path.parents) if p.name.casefold() == wanted)])
+             if (parts := relative_parts(path, base)) is not None]
+    nested = False
+
+    def walk_failed(error: OSError) -> None:
+        raise Refusal("scratch_protected", f"{path} cannot be searched for scratch roots: {error}")
+
+    for _dir, names, files in os.walk(path, onerror=walk_failed) if path.is_dir() else ():
+        if any(name.casefold() == wanted for name in (*names, *files)):
+            nested = True
+            break
+    if not roots and not nested:
         return
+    if nested or not roots:
+        raise Refusal("scratch_protected", f"{path} contains a scratch root or session; remove one session at a time")
+    parts = min(roots, key=len)
+    index = 0 if parts and _UUID.fullmatch(parts[0].lower()) else 1 if len(parts) > 1 and _UUID.fullmatch(parts[1].lower()) else None
+    if index is None:
+        raise Refusal("scratch_protected", f"{path} is a scratch root or a project; only one session is removable")
+    session = parts[index].lower()
+    below = len(parts) - index - 1  # levels between the session dir and the target
+    session_dir = path.parents[below - 1] if below else path
+    if session in own_sessions():
+        raise Refusal("scratch_protected", f"session {session} is the caller's own")
+    if keep_ancestor(path, path.parents[len(parts) - 1]):
+        raise Refusal("keep_marker", f"{path} is under a .keep marker")
+    policy = Policy()
     if session in _live_ids(live_roots, now - policy.live_seconds):
         raise Refusal("live_session", f"session {session} is still live")
     if inspect_tree(session_dir, accounting_only=True).newest > now - policy.session_ttl_seconds:
         raise Refusal("session_recent", f"session {session} was active within {policy.session_ttl_seconds / 3600:.0f} h")
-
-
-def _guard_contained_sessions(path: Path, own: frozenset[str], live_roots: list[Path], now: float) -> None:
-    """A target that CONTAINS a ``claude-<uid>`` directory removes every session inside it: each one
-    gets the session rules (live or recent refuses)."""
-    wanted = f"claude-{os.getuid()}".casefold()
-    stack = [(path, 0)]
-    while stack:
-        directory, depth = stack.pop()
-        try:
-            children = [e for e in os.scandir(directory) if e.is_dir(follow_symlinks=False)]
-        except OSError:
-            continue
-        for entry in children:
-            if entry.name.casefold() == wanted:
-                for sub in _session_dirs(Path(entry.path)):
-                    _session_idle(sub.name.lower(), sub, own, live_roots, now)
-            elif depth < _CONTAINED_DEPTH:
-                stack.append((Path(entry.path), depth + 1))
-
-
-def _session_dirs(root: Path) -> list[Path]:
-    """``<session>`` directories of a scratch root: ``<root>/<uuid>`` and ``<root>/<project>/<uuid>``."""
-    found: list[Path] = []
-    try:
-        for entry in os.scandir(root):
-            if not entry.is_dir(follow_symlinks=False):
-                continue
-            if _UUID.fullmatch(entry.name.lower()):
-                found.append(Path(entry.path))
-                continue
-            try:
-                found += [Path(e.path) for e in os.scandir(entry.path)
-                          if e.is_dir(follow_symlinks=False) and _UUID.fullmatch(e.name.lower())]
-            except OSError:
-                continue
-    except OSError:
-        pass
-    return found
 
 
 def _remove_tmp(path: Path, *, dry_run: bool, scratch: list[Path], live_roots: list[Path],

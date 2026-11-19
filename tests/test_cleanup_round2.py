@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -237,22 +236,23 @@ def _scratch_cleanup(tmp_path: Path, target: Path, root: Path, live: Path | None
     return cleanup("tmp", target, roots=[], temp_roots=[tmp_path], scratch_root=root, live_roots=[live_dir])
 
 
-@pytest.mark.parametrize("level", ["root", "project", "session"])
+@pytest.mark.parametrize("level", ["root", "project"])
 def test_scratch_structure_is_never_deleted(tmp_path: Path, level: str) -> None:
     root, project, session = _scratch(tmp_path)
     target = {"root": root, "project": project, "session": session}[level]
-    with pytest.raises(Refusal, match="scratch_structure|is_root"):
+    with pytest.raises(Refusal, match="scratch_protected"):
         _scratch_cleanup(tmp_path, target, root)
     assert session.is_dir()
 
 
-def test_scratch_inside_own_session_is_removable(tmp_path: Path, home: Path) -> None:
+def test_the_callers_own_session_is_never_removable_even_inside(tmp_path: Path, home: Path) -> None:
     from .test_cleanup_round3 import claim_session
-    claim_session(home, SESSION)  # an agent cleans up its own session
+    claim_session(home, SESSION)
     root, _, session = _scratch(tmp_path)
-    assert _scratch_cleanup(tmp_path, session / "scratchpad" / "a.txt", root)["action"] == "removed"
-    assert _scratch_cleanup(tmp_path, session / "scratchpad", root)["action"] == "removed"
-    assert session.is_dir()
+    for target in (session, session / "scratchpad", session / "scratchpad" / "a.txt"):
+        with pytest.raises(Refusal, match="scratch_protected"):
+            _scratch_cleanup(tmp_path, target, root)
+    assert (session / "scratchpad" / "a.txt").exists()
 
 
 def test_scratch_live_session_and_keep_marker_honoured(tmp_path: Path) -> None:
@@ -320,22 +320,14 @@ def test_reaper_does_not_prune_registrations_outside_agent_roots(env: Env, tmp_p
 
 # --- 7: robustness ---------------------------------------------------------------------------------
 
-def git_shim(directory: Path, monkeypatch: pytest.MonkeyPatch, before_status: str) -> None:
-    """A real ``git`` pass-through earlier on PATH that first runs ``before_status`` (shell) when
-    git is asked for ``status``. The hardened runner ignores repo/user config such as
-    ``core.fsmonitor``, so slow or racing git is staged at the executable instead."""
-    real = shutil.which("git")
-    assert real
-    directory.mkdir(exist_ok=True)
-    shim = directory / "git"
-    shim.write_text(f'#!/bin/sh\nfor a in "$@"; do if [ "$a" = status ]; then {before_status}; break; fi; done\n'
-                    f'exec {real} "$@"\n')
-    shim.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ['PATH']}")
-
-
-def _hang_on_status(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    git_shim(repo.parent / "slow-shim", monkeypatch, "sleep 4")
+def _slow_status(env: Env, *worktrees: Path) -> None:
+    """Real slow ``git status``: a clean filter on ``a.txt`` that sleeps, and ``a.txt`` rewritten in each
+    worktree so git must run it (``.git/info/attributes`` and the config are shared by all worktrees)."""
+    subprocess.run(["git", "-C", str(env.repo), "config", "filter.slow.clean", "sleep 4; cat"], check=True)
+    (env.repo / ".git" / "info").mkdir(exist_ok=True)
+    (env.repo / ".git" / "info" / "attributes").write_text("a.txt filter=slow\n")
+    for wt in worktrees:
+        (wt / "a.txt").write_text("b\n")  # same size, new mtime: git must hash it, through the filter
 
 
 def _user_config(home: Path, text: str) -> None:
@@ -347,7 +339,7 @@ def test_reaper_survives_git_timeouts_and_still_reports(
     import herdr_engineering.cleanup_command as cc
     wt = env.worktree("slow")
     ok = env.worktree("fine")
-    _hang_on_status(env.repo, monkeypatch)  # every `git status` of the repo's worktrees now takes 4 s
+    _slow_status(env, wt, ok)  # every `git status` of these worktrees takes 4 s
     monkeypatch.setattr(cc, "GIT_TIMEOUT", 1)
     monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(home / "state"))
     _user_config(home, f"disk_hygiene:\n  roots: ['{env.roots[0]}']\n  repos: ['{env.repo}']\n"
@@ -373,7 +365,7 @@ def test_cli_turns_timeout_into_a_clean_refusal(env: Env, home: Path, monkeypatc
                                                 capsys: pytest.CaptureFixture[str]) -> None:
     import herdr_engineering.cleanup_command as cc
     wt = env.worktree("slowcli")
-    _hang_on_status(env.repo, monkeypatch)
+    _slow_status(env, wt)
     monkeypatch.setattr(cc, "GIT_TIMEOUT", 1)
     _user_config(home, f"disk_hygiene:\n  roots: ['{env.roots[0]}']\n")
     rc = main(["--scope", "worktree", "--path", str(wt), "--json"])

@@ -93,5 +93,5 @@ def test_the_guard_covers_the_default_root_and_the_environment_root(
 def test_the_guard_checks_every_root(tmp_path: Path) -> None:
     first, second = tmp_path / "a", tmp_path / "b"
     (second / "proj").mkdir(parents=True)
-    with pytest.raises(Refusal, match="scratch_structure"):
+    with pytest.raises(Refusal, match="scratch_protected"):
         _guard_scratch(second / "proj", [first, second], [], time.time())

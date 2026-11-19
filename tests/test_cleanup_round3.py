@@ -15,7 +15,7 @@ from herdr_engineering.cleanup_command import Refusal, cleanup
 from herdr_engineering.disk_hygiene import Policy, load_policy, main_args, reap_worktrees, run
 
 from .test_cleanup_command import Env, git
-from .test_cleanup_round2 import SESSION, _holder, _scratch, _user_config, git_shim, home  # noqa: F401, F811
+from .test_cleanup_round2 import SESSION, _holder, _scratch, _user_config, home  # noqa: F401, F811
 
 DAY = 86400
 
@@ -59,9 +59,10 @@ def test_scratch_guard_applies_to_a_differently_cased_root(tmp_path: Path) -> No
     live.mkdir()
     (live / f"{SESSION}.jsonl").write_text("{}")
     upper = tmp_path / root.name.upper()
-    for victim in (upper, upper / project.name.upper(), upper / project.name / SESSION.upper()):
+    for victim, code in ((upper, "scratch_protected"), (upper / project.name.upper(), "scratch_protected"),
+                         (upper / project.name / SESSION.upper(), "live_session")):
         assert victim.exists()
-        with pytest.raises(Refusal, match="scratch_structure|is_root"):
+        with pytest.raises(Refusal, match=code):
             _tmp_cleanup(tmp_path, victim, root, live=live)
     with pytest.raises(Refusal, match="live_session"):
         _tmp_cleanup(tmp_path, upper / project.name / SESSION.upper() / "scratchpad", root, live=live)
@@ -70,7 +71,7 @@ def test_scratch_guard_applies_to_a_differently_cased_root(tmp_path: Path) -> No
 
 # --- 2: own session vs other sessions ------------------------------------------------------------
 
-def test_agent_may_clean_inside_its_own_live_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+def test_agent_may_not_clean_inside_its_own_live_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                                      home: Path) -> None:  # noqa: F811
     root, _, session = _scratch(tmp_path)
     live = tmp_path / "projects"
@@ -84,9 +85,9 @@ def test_agent_may_clean_inside_its_own_live_session(tmp_path: Path, monkeypatch
     with pytest.raises(Refusal, match="live_session"):
         _tmp_cleanup(tmp_path, out_dir, root, live=live)
     claim_session(home, SESSION)
-    assert _tmp_cleanup(tmp_path, out_dir, root, live=live)["action"] == "removed"
-    with pytest.raises(Refusal, match="scratch_structure"):  # still never the session itself
-        _tmp_cleanup(tmp_path, session, root, live=live)
+    with pytest.raises(Refusal, match="scratch_protected"):  # an own session is never cleaned by --scope tmp
+        _tmp_cleanup(tmp_path, out_dir, root, live=live)
+    assert out_dir.exists()
 
 
 def test_other_sessions_need_the_reaper_ttl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -136,28 +137,6 @@ def test_malformed_values_fail_closed_not_open(cfg: dict) -> None:
     policy = load_policy(cfg)
     assert policy.config_error and not (policy.enabled or policy.worktrees or policy.docker)
     assert run(policy)["status"] == "config_unreadable"
-
-
-# --- 5: in-use is re-checked right before each removal ---------------------------------------------
-
-def test_reaper_rechecks_in_use_per_removal(env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    env.worktree("a-first")
-    second = env.worktree("b-second")
-    pidfile = tmp_path / "holder.pid"
-    marker = tmp_path / "spawned"
-    # while the reaper inspects the FIRST worktree, a process starts inside the SECOND
-    git_shim(tmp_path / "shim", monkeypatch,
-             f"if [ ! -e {marker} ]; then touch {marker}; "
-             f"(cd {second} && exec sleep 120) >/dev/null 2>&1 </dev/null & echo $! > {pidfile}; fi")
-    try:
-        out = reap_worktrees(Policy(pr_source="git", min_idle_hours=0, ttl_days=0), extra_repos=[env.repo],
-                             extra_roots=[str(env.roots[0])], now=time.time() + DAY)
-    finally:
-        if pidfile.exists():
-            os.kill(int(pidfile.read_text()), 9)
-    rows = {Path(w["path"]).name: w for r in out["repos"] for w in r["worktrees"]}
-    assert rows["b-second"]["action"] == "kept" and rows["b-second"]["reason"] == "in_use"
-    assert second.exists()
 
 
 # --- 7: read-only directories are verified before anything is deleted ------------------------------

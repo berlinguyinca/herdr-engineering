@@ -32,18 +32,19 @@ def test_a_target_containing_a_recent_foreign_session_is_refused(tmp_path: Path)
     with pytest.raises(Refusal) as refusal:
         cleanup("tmp", agents, roots=[], temp_roots=[tmp_path], scratch_root=Path(f"/tmp/claude-{UID}"),
                 live_roots=[], now=time.time())
-    assert refusal.value.code == "session_recent"
+    assert refusal.value.code == "scratch_protected"
     assert (session / "work" / "f").exists()
 
 
-def test_a_target_containing_only_old_sessions_is_removable(tmp_path: Path) -> None:
+def test_a_target_containing_only_old_sessions_is_still_refused(tmp_path: Path) -> None:
     agents = _under_fixed_temp(tmp_path) / "r11-old"
     session = agents / f"claude-{UID}" / "-proj" / SESSION
     (session / "work").mkdir(parents=True)
     (session / "work" / "f").write_text("old")
-    cleanup("tmp", agents, roots=[], temp_roots=[tmp_path], scratch_root=Path(f"/tmp/claude-{UID}"),
-            live_roots=[], now=time.time() + 30 * 86400)
-    assert not agents.exists()
+    with pytest.raises(Refusal, match="scratch_protected"):  # one session at a time, never its container
+        cleanup("tmp", agents, roots=[], temp_roots=[tmp_path], scratch_root=Path(f"/tmp/claude-{UID}"),
+                live_roots=[], now=time.time() + 30 * 86400)
+    assert agents.exists()
 
 
 # --- 3: a symlinked claude-<uid> never becomes a deletion root ---------------------------------------------
