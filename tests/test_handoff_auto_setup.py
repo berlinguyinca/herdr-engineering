@@ -10,13 +10,15 @@ from pathlib import Path
 import pytest
 
 from herdr_engineering import handoff_auto_setup as auto_setup
-from herdr_engineering.handoff_auto_setup import HOOK_COMMAND, HOOK_MARKER, START_COMMAND, STOP_COMMAND
+from herdr_engineering.handoff_auto_setup import HOOK_MARKER, HOOKS, START_COMMAND, STOP_COMMAND
 
 REPO = str(Path(__file__).resolve().parents[1])
-ENTRY = {"hooks": [{"type": "command", "command": HOOK_COMMAND}]}
+LEGACY_COMMAND = ('[ -x "$HOME/.local/bin/herdr-eng" ] && "$HOME/.local/bin/herdr-eng" handoff context-hook claude '
+                  '|| true # herdr-handoff-auto')
+LEGACY = {"hooks": [{"type": "command", "command": LEGACY_COMMAND}]}
 START = {"hooks": [{"type": "command", "command": START_COMMAND}]}
 STOP = {"hooks": [{"type": "command", "command": STOP_COMMAND}]}
-ALL = {"UserPromptSubmit": [ENTRY], "SubagentStart": [START], "SubagentStop": [STOP]}
+ALL = {"SubagentStart": [START], "SubagentStop": [STOP]}
 
 
 def cli(home: Path, *argv: str) -> tuple[int, dict]:
@@ -31,9 +33,9 @@ def settings_path(home: Path) -> Path:
 
 
 def action(out: dict) -> str:
-    """The single action all three hook items share (fails if they differ)."""
+    """The single action all hook items share (fails if they differ)."""
     actions = {r["action"] for r in out["results"]}
-    assert len(out["results"]) in (1, 3) and len(actions) == 1, out
+    assert len(out["results"]) in (1, 2, 3) and len(actions) == 1, out
     return actions.pop()
 
 
@@ -42,8 +44,6 @@ def actions(out: dict) -> list[str]:
 
 
 def test_command_matches_documented_snippet() -> None:
-    assert HOOK_COMMAND == ('[ -x "$HOME/.local/bin/herdr-eng" ] && "$HOME/.local/bin/herdr-eng" handoff context-hook claude '
-                            '|| true # herdr-handoff-auto')
     assert HOOK_MARKER == "herdr-handoff-auto"
     assert START_COMMAND == ('[ -x "$HOME/.local/bin/herdr-eng" ] && "$HOME/.local/bin/herdr-eng" handoff subagent-hook start '
                              '|| true # herdr-handoff-auto')
@@ -60,7 +60,7 @@ def test_install_into_empty_file(tmp_path: Path) -> None:
     settings_path(tmp_path).parent.mkdir(parents=True)
     settings_path(tmp_path).write_text("")
     assert action(cli(tmp_path, "install")[1]) == "installed"
-    assert json.loads(settings_path(tmp_path).read_text())["hooks"]["UserPromptSubmit"] == [ENTRY]
+    assert json.loads(settings_path(tmp_path).read_text())["hooks"] == ALL
 
 
 def test_install_preserves_other_hooks_keys_and_order(tmp_path: Path) -> None:
@@ -73,7 +73,7 @@ def test_install_preserves_other_hooks_keys_and_order(tmp_path: Path) -> None:
     data = json.loads(text)
     assert list(data) == ["model", "hooks", "env"]
     assert data["hooks"]["SessionStart"] == [other]
-    assert data["hooks"]["UserPromptSubmit"] == [other, ENTRY]
+    assert data["hooks"]["UserPromptSubmit"] == [other]
     assert data["hooks"]["SubagentStart"] == [START] and data["hooks"]["SubagentStop"] == [STOP]
     assert data["env"] == {"A": "1"} and text.splitlines()[1].startswith("    \"")
 
@@ -97,7 +97,7 @@ def test_hand_added_identical_entry_not_duplicated(tmp_path: Path) -> None:
 def test_marked_entry_with_other_command_is_preserved(tmp_path: Path) -> None:
     custom = {"hooks": [{"type": "command", "command": f"my-own-thing # {HOOK_MARKER}"}]}
     settings_path(tmp_path).parent.mkdir(parents=True)
-    raw = json.dumps({"hooks": {"UserPromptSubmit": [custom], "SubagentStart": [custom], "SubagentStop": [custom]}}) + "\n"
+    raw = json.dumps({"hooks": {"SubagentStart": [custom], "SubagentStop": [custom]}}) + "\n"
     settings_path(tmp_path).write_text(raw)
     assert action(cli(tmp_path, "install")[1]) == "preserved"
     assert settings_path(tmp_path).read_text() == raw
@@ -106,9 +106,9 @@ def test_marked_entry_with_other_command_is_preserved(tmp_path: Path) -> None:
 def test_uninstall_removes_only_marked_entry(tmp_path: Path) -> None:
     other = {"hooks": [{"type": "command", "command": "echo hi"}]}
     settings_path(tmp_path).parent.mkdir(parents=True)
-    settings_path(tmp_path).write_text(json.dumps({"model": "m", "hooks": {"UserPromptSubmit": [other, ENTRY], "SubagentStart": [START], "SubagentStop": [other, STOP], "Stop": [other]}}, indent=2))
+    settings_path(tmp_path).write_text(json.dumps({"model": "m", "hooks": {"UserPromptSubmit": [other, LEGACY], "SubagentStart": [START], "SubagentStop": [other, STOP], "Stop": [other]}}, indent=2))
     rc, out = cli(tmp_path, "uninstall")
-    assert rc == 0 and action(out) == "removed"
+    assert rc == 0 and action(out) == "removed" and len(out["results"]) == 3
     assert json.loads(settings_path(tmp_path).read_text()) == {"model": "m", "hooks": {"UserPromptSubmit": [other], "SubagentStop": [other], "Stop": [other]}}
     assert action(cli(tmp_path, "uninstall")[1]) == "unchanged"
 
@@ -142,27 +142,28 @@ def test_dry_run_writes_nothing(tmp_path: Path) -> None:
     assert not settings_path(tmp_path).exists()
 
 
-def test_old_install_gets_the_two_new_entries(tmp_path: Path) -> None:
+def test_old_install_is_migrated_to_the_two_subagent_entries(tmp_path: Path) -> None:
     settings_path(tmp_path).parent.mkdir(parents=True)
-    settings_path(tmp_path).write_text(json.dumps({"hooks": {"UserPromptSubmit": [ENTRY]}}))
+    settings_path(tmp_path).write_text(json.dumps({"hooks": {"UserPromptSubmit": [LEGACY]}}))
     rc, out = cli(tmp_path, "check")
-    assert rc == 1 and actions(out) == ["ok", "missing", "missing"]
+    assert rc == 1 and actions(out) == ["missing", "missing", "stale"]
+    assert "herdr-eng handoff auto install" in out["results"][2]["detail"]
     rc, out = cli(tmp_path, "install")
-    assert rc == 0 and actions(out) == ["unchanged", "installed", "installed"]
+    assert rc == 0 and actions(out) == ["installed", "installed", "removed"]
     assert json.loads(settings_path(tmp_path).read_text()) == {"hooks": ALL}
-    assert actions(cli(tmp_path, "check")[1]) == ["ok", "ok", "ok"]
+    assert actions(cli(tmp_path, "check")[1]) == ["ok", "ok"]
 
 
 def test_check_missing_when_only_one_event_lacks_entry(tmp_path: Path) -> None:
     settings_path(tmp_path).parent.mkdir(parents=True)
-    settings_path(tmp_path).write_text(json.dumps({"hooks": {"UserPromptSubmit": [ENTRY], "SubagentStart": [START]}}))
+    settings_path(tmp_path).write_text(json.dumps({"hooks": {"SubagentStart": [START]}}))
     rc, out = cli(tmp_path, "check")
-    assert rc == 1 and actions(out) == ["ok", "ok", "missing"]
+    assert rc == 1 and actions(out) == ["ok", "missing"]
 
 
 def test_uninstall_removes_subagent_entries_too(tmp_path: Path) -> None:
     cli(tmp_path, "install")
-    assert actions(cli(tmp_path, "uninstall")[1]) == ["removed"] * 3
+    assert actions(cli(tmp_path, "uninstall")[1]) == ["removed"] * 2
     assert json.loads(settings_path(tmp_path).read_text()) == {}
 
 
@@ -182,8 +183,8 @@ def test_install_subagent_hooks_writes_start_and_stop_only(home: Path) -> None:
     items = auto_setup.install_subagent_hooks(home)
     assert [i.action for i in items] == ["installed", "installed"]
     assert json.loads(settings_path(home).read_text()) == {"hooks": {"SubagentStart": [START], "SubagentStop": [STOP]}}
-    assert [i.action for i in auto_setup.check(home)] == ["missing", "ok", "ok"]
-    assert {i.action for i in auto_setup.uninstall(home)} == {"removed", "unchanged"}
+    assert [i.action for i in auto_setup.check(home)] == ["ok", "ok"]
+    assert {i.action for i in auto_setup.uninstall(home)} == {"removed"}
     assert json.loads(settings_path(home).read_text()) == {}
 
 
@@ -287,3 +288,58 @@ def test_install_sh_has_the_subagent_hooks_step() -> None:
     assert "--no-subagent-hooks) WITH_SUBAGENT_HOOKS=0" in script
     assert "handoff auto install --subagents-only" in script
     assert subprocess.run(["bash", "-n", str(Path(REPO) / "scripts/install.sh")]).returncode == 0
+
+
+# --- retiring the 50% context reminder hook (UserPromptSubmit, `handoff context-hook`) ------------------------------
+def test_hooks_map_has_only_subagent_events() -> None:
+    assert set(HOOKS) == {"SubagentStart", "SubagentStop"}
+    assert not hasattr(auto_setup, "HOOK_EVENT") and not hasattr(auto_setup, "HOOK_COMMAND")
+
+
+def test_install_removes_legacy_userpromptsubmit_hook(tmp_path: Path) -> None:
+    foreign = {"matcher": "x", "hooks": [{"type": "command", "command": "echo hi"}]}
+    settings_path(tmp_path).parent.mkdir(parents=True)
+    settings_path(tmp_path).write_text(json.dumps({"model": "m", "hooks": {"UserPromptSubmit": [LEGACY, foreign]}}, indent=2))
+    rc, out = cli(tmp_path, "install")
+    assert rc == 0 and actions(out) == ["installed", "installed", "removed"]
+    assert json.loads(settings_path(tmp_path).read_text()) == {"model": "m", "hooks": {"UserPromptSubmit": [foreign], **ALL}}
+    backup = tmp_path / ".local/share/herdr-engineering/handoff/backups/settings.json.bak"
+    assert json.loads(backup.read_text())["hooks"]["UserPromptSubmit"] == [LEGACY, foreign]
+
+
+def test_legacy_migration_is_idempotent_and_writes_no_second_backup(tmp_path: Path) -> None:
+    settings_path(tmp_path).parent.mkdir(parents=True)
+    settings_path(tmp_path).write_text(json.dumps({"hooks": {"UserPromptSubmit": [LEGACY]}}))
+    cli(tmp_path, "install")
+    before = settings_path(tmp_path).read_bytes()
+    backups = tmp_path / ".local/share/herdr-engineering/handoff/backups"
+    seen = sorted(p.name for p in backups.iterdir())
+    rc, out = cli(tmp_path, "install")
+    assert rc == 0 and action(out) == "unchanged"
+    assert settings_path(tmp_path).read_bytes() == before and sorted(p.name for p in backups.iterdir()) == seen
+
+
+def test_legacy_removal_touches_only_the_marked_context_hook_command(tmp_path: Path) -> None:
+    hand_edited = {"hooks": [{"type": "command", "command": "my-reminder # herdr-handoff-auto"}]}
+    unmarked = {"hooks": [{"type": "command", "command": "herdr-eng handoff context-hook claude"}]}
+    mixed = {"hooks": [{"type": "command", "command": "echo keep"}, {"type": "command", "command": LEGACY_COMMAND}]}
+    settings_path(tmp_path).parent.mkdir(parents=True)
+    settings_path(tmp_path).write_text(json.dumps({"hooks": {"UserPromptSubmit": [hand_edited, unmarked, mixed]}}))
+    cli(tmp_path, "install")
+    kept = [hand_edited, unmarked, {"hooks": [{"type": "command", "command": "echo keep"}]}]
+    assert json.loads(settings_path(tmp_path).read_text())["hooks"]["UserPromptSubmit"] == kept
+    assert cli(tmp_path, "check")[0] == 0
+
+
+def test_subagents_only_install_also_removes_the_legacy_hook(home: Path) -> None:
+    settings_path(home).write_text(json.dumps({"hooks": {"UserPromptSubmit": [LEGACY]}}))
+    assert [i.action for i in auto_setup.install_subagent_hooks(home)] == ["installed", "installed", "removed"]
+    assert json.loads(settings_path(home).read_text()) == {"hooks": ALL}
+
+
+def test_legacy_removal_is_not_run_by_import_or_dry_run(tmp_path: Path) -> None:
+    settings_path(tmp_path).parent.mkdir(parents=True)
+    raw = json.dumps({"hooks": {"UserPromptSubmit": [LEGACY]}})
+    settings_path(tmp_path).write_text(raw)
+    assert "removed" in actions(cli(tmp_path, "install", "--dry-run")[1])
+    assert settings_path(tmp_path).read_text() == raw

@@ -528,9 +528,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--cwd", default=None, help="working directory of the session (default: the current one)")
     p2.add_argument("--json", action="store_true")
     p2.set_defaults(func=_cmd_handoff_context)
-    p2 = hsub.add_parser("context-hook", help="UserPromptSubmit hook body (opt-in): ask for /handoff when context is high; never fails")
-    p2.add_argument("harness", help="only claude is supported; anything else is a silent no-op so a hook never fails")
-    p2.set_defaults(func=_cmd_handoff_context_hook)
     p2 = hsub.add_parser("subagent-hook", help="SubagentStart/SubagentStop hook body: record running subagents per pane; never fails")
     p2.add_argument("phase", choices=("start", "stop"))
     p2.set_defaults(func=_cmd_handoff_subagent_hook)
@@ -543,7 +540,7 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="wait until no subagent is live: exit 0 when idle, 3 on timeout")
     mode.add_argument("--purge", action="store_true", help="delete the pane's registry entries (pane closed)")
     p2.set_defaults(func=_cmd_handoff_subagents, subagents_parser=p2)
-    p2 = hsub.add_parser("auto", help="install, remove or check the opt-in context-hook in ~/.claude/settings.json; off/on switch a pane")
+    p2 = hsub.add_parser("auto", help="install, remove or check the SubagentStart/SubagentStop hooks in ~/.claude/settings.json (install and uninstall also remove the retired UserPromptSubmit reminder); off/on switch a pane")
     p2.add_argument("auto_action", choices=("install", "uninstall", "check", "off", "on"))
     p2.add_argument("--pane", default=None, help="off/on: pane id (default: $HERDR_PANE_ID)")
     p2.add_argument("--home", default=None, help="override $HOME (tests)")
@@ -1512,9 +1509,14 @@ def _cmd_doctor(args) -> int:
     return doctor_main(args)
 
 
-def _cmd_handoff_context_hook(args) -> int:
-    from .handoff_context_hook import run_context_hook
-    return run_context_hook(args.harness)
+def _retired_context_hook() -> int:
+    """`handoff context-hook ...`: the retired 50% reminder. A settings.json that still names it calls it on every prompt until
+    `handoff auto install` / `workflow install` removes the entry, so it reads and drops stdin, prints nothing and exits 0."""
+    try:
+        sys.stdin.buffer.read()
+    except Exception:
+        pass
+    return 0
 
 
 def _cmd_handoff_harness(args) -> int:
@@ -6289,6 +6291,8 @@ def main(argv: list[str] | None = None) -> int:
     if communication_args[:1] == ["communications"]:
         from .communications import main as communications_main
         return communications_main(communication_args[1:])
+    if communication_args[:2] == ["handoff", "context-hook"]:
+        return _retired_context_hook()  # hidden: not a registered subcommand, so it takes any arguments
     parser = _build_parser()
     effective_argv = list(sys.argv[1:] if argv is None else argv)
     if effective_argv and effective_argv[0] == "assistant":

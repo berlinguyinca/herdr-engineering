@@ -62,4 +62,4 @@ Rules: never fabricate paths, hashes, URLs, counts or results; mark doubt in `un
 ## Notes
 
 - Models: pass only what the user requested; opencode wants `provider/model`, and `herdr-handoff` drops a bare model for opencode with a note.
-- The automatic context trigger (`herdr-eng handoff context-hook claude`) exists but is not installed by default; opt in as described in `docs/operations/handoff.md`.
+- Handing off because the context is large is the automatic handoff controller's job (`docs/operations/handoff.md`); use this skill when a person asks for a handoff.
