@@ -1,10 +1,11 @@
 // Real-behaviour test for the Pi extension that makes handoffs automatic.
 //
 // Nothing here stubs our own code. The extension is imported verbatim from
-// herdr_engineering/extension_data/herdr-handoff-autopilot.ts and every verdict from
-// real `herdr-eng` CLI in this checkout (HERDR_ENG_ARGS below is the JSON argv install.sh gives
-// pi: the venv interpreter running `herdr_engineering.cli`, so a wheel install and this
-// checkout behave alike). Policy,
+// herdr_engineering/extension_data/herdr-handoff-autopilot.ts and every verdict comes from the
+// real `herdr-eng` CLI in this checkout. `HERDR_ENG_ARGS` below is the packager override the
+// module reads - the venv interpreter plus `-m herdr_engineering.cli` - so the extension runs
+// against this working tree instead of whatever `herdr-eng` is on PATH. `scripts/install.sh`
+// sets nothing there; production resolves the CLI from PATH. Policy,
 // the per-session ledger and the prompt text are exercised through that CLI;
 // tests/test_handoff_autopilot.py covers them directly.
 //
@@ -17,7 +18,7 @@
 // default export - so tests can await a subscription without racing background work.
 
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,6 +55,7 @@ async function sandbox({ percent = 50, enabled = true } = {}) {
   );
   const ledgerPath = join(state, "herdr-engineering", "handoff-autopilot.json");
   return {
+    root,
     home,
     state,
     work,
@@ -67,6 +69,43 @@ async function sandbox({ percent = 50, enabled = true } = {}) {
       }
     },
   };
+}
+
+// The process environment the extension and the CLI read. A case points these at its own
+// sandbox for its duration and puts them back afterwards: HOME, the XDG roots and the CLI
+// override are all process-wide, so a value left set would decide where a later case's config,
+// ledger or CLI points, and a sandbox left behind is a trigger ledger in /tmp with no owner.
+const ENV_KEYS = [
+  "HOME",
+  "USERPROFILE",
+  "XDG_STATE_HOME",
+  "XDG_CONFIG_HOME",
+  "HERDR_ENG_BIN",
+  "HERDR_ENG_ARGS",
+  "HERDR_HANDOFF_AUTOPILOT",
+];
+
+async function isolated(t, config) {
+  const box = await sandbox(config);
+  const saved = new Map(ENV_KEYS.map((key) => [key, process.env[key]]));
+  t.after(async () => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(box.root, { recursive: true, force: true });
+  });
+  process.env.HOME = box.home;
+  process.env.USERPROFILE = box.home;
+  process.env.XDG_STATE_HOME = box.state;
+  process.env.XDG_CONFIG_HOME = join(box.home, ".config");
+  // The two variables the module reads, with the meaning `handoff_autopilot._cli_command()`
+  // gives them: the executable, then the arguments after it. Pointing them at this checkout's
+  // venv is what makes the CLI real instead of whatever `herdr-eng` is on PATH.
+  process.env.HERDR_ENG_BIN = python;
+  process.env.HERDR_ENG_ARGS = JSON.stringify(["-m", "herdr_engineering.cli"]);
+  delete process.env.HERDR_HANDOFF_AUTOPILOT;
+  return box;
 }
 
 // The recorded Pi host: implements only the documented surface the extension may use.
@@ -129,17 +168,8 @@ async function runTurn(box, { usage, sessionId = "s-node" }, turns = 1) {
     "function",
     "the extension must subscribe to turn_end",
   );
-  // The extension resolves the CLI and its state through the real process environment.
-  process.env.HOME = box.home;
-  process.env.USERPROFILE = box.home;
-  process.env.XDG_STATE_HOME = box.state;
-  process.env.XDG_CONFIG_HOME = join(box.home, ".config");
-  process.env.HERDR_ENG_ARGS = JSON.stringify([
-    python,
-    "-m",
-    "herdr_engineering.cli",
-  ]);
-  delete process.env.HERDR_HANDOFF_AUTOPILOT;
+  // The environment already points at the sandbox (`isolated` set it, and will undo it); that
+  // is how the extension finds its config, its ledger and the CLI it asks.
   for (let turn = 0; turn < turns; turn += 1) {
     await turnEnd({ toolResults: [], textContent: "", messages: [] }, host.ctx);
     await settle();
@@ -163,8 +193,8 @@ test(
 test(
   "a full context injects the handoff instruction once and records it",
   { skip },
-  async () => {
-    const box = await sandbox();
+  async (t) => {
+    const box = await isolated(t);
     const host = await runTurn(
       box,
       { usage: { tokensUsed: 170000, contextWindow: 200000, percent: 85 } },
@@ -202,8 +232,8 @@ test(
 test(
   "comfortable context injects nothing and records nothing",
   { skip },
-  async () => {
-    const box = await sandbox();
+  async (t) => {
+    const box = await isolated(t);
     const host = await runTurn(box, {
       usage: { tokensUsed: 20000, contextWindow: 200000, percent: 10 },
     });
@@ -212,8 +242,8 @@ test(
   },
 );
 
-test("an opted-out operator stays silent", { skip }, async () => {
-  const box = await sandbox({ enabled: false });
+test("an opted-out operator stays silent", { skip }, async (t) => {
+  const box = await isolated(t, { enabled: false });
   const host = await runTurn(box, {
     usage: { tokensUsed: 190000, contextWindow: 200000, percent: 95 },
   });
@@ -224,8 +254,8 @@ test("an opted-out operator stays silent", { skip }, async () => {
 test(
   "an unusable usage reading never breaks the session",
   { skip },
-  async () => {
-    const box = await sandbox();
+  async (t) => {
+    const box = await isolated(t);
     const host = await runTurn(box, {
       usage: { tokensUsed: 0, contextWindow: 0, percent: null },
     });
@@ -237,8 +267,8 @@ test(
 test(
   "a missing herdr-eng is reported quietly, not thrown",
   { skip },
-  async () => {
-    const box = await sandbox();
+  async (t) => {
+    const box = await isolated(t);
     const host = recordingHost({
       usage: { tokensUsed: 190000, contextWindow: 200000, percent: 95 },
     });

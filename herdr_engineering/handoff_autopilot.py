@@ -28,19 +28,27 @@ Design notes worth knowing before editing:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shlex
 import shutil
 import sys
-from collections.abc import Iterable
+import tempfile
+import time
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .config import load_config
+try:  # POSIX advisory locking; the ledger write stays unlocked where it does not exist.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
+from .config import declared_keys, load_config
 from .errors import InvalidError
 
 #: The percent of the context window at which a session is considered nearly out of
@@ -49,6 +57,11 @@ from .errors import InvalidError
 DEFAULT_CONTEXT_PERCENT = 50.0
 DEFAULT_MAX_PER_SESSION = 1
 DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
+# Assumed once usage proves the default window cannot be right. Neither harness reports its
+# context window in the transcript, so the assumption has to yield to the evidence: a session
+# that has used 250k tokens does not live in a 200k window. `handoff context-hook claude`
+# applies the same rule; the autopilot must not measure a 1M session against 200k.
+DEFAULT_LARGE_CONTEXT_WINDOW_TOKENS = 1_000_000
 DEFAULT_HARNESSES = ("pi", "claude")
 
 STATE_DIR_NAME = "herdr-engineering"
@@ -139,6 +152,10 @@ class Policy:
     max_per_session: int = DEFAULT_MAX_PER_SESSION
     harnesses: tuple[str, ...] = DEFAULT_HARNESSES
     context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
+    large_context_window_tokens: int = DEFAULT_LARGE_CONTEXT_WINDOW_TOKENS
+    # True when the operator wrote context_window_tokens themselves. The default and a declared
+    # value are otherwise indistinguishable, and they mean different things: one is a guess.
+    window_declared: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -147,6 +164,8 @@ class Policy:
             "max_per_session": self.max_per_session,
             "harnesses": list(self.harnesses),
             "context_window_tokens": self.context_window_tokens,
+            "large_context_window_tokens": self.large_context_window_tokens,
+            "window_declared": self.window_declared,
         }
 
 
@@ -178,13 +197,44 @@ def policy(config: dict[str, Any] | None = None) -> Policy:
     window = block.get("context_window_tokens", DEFAULT_CONTEXT_WINDOW_TOKENS)
     if isinstance(window, bool) or not isinstance(window, int) or window < 1000:
         window = DEFAULT_CONTEXT_WINDOW_TOKENS
+    large_window = block.get("large_context_window_tokens", DEFAULT_LARGE_CONTEXT_WINDOW_TOKENS)
+    if isinstance(large_window, bool) or not isinstance(large_window, int) or large_window < 1000:
+        large_window = DEFAULT_LARGE_CONTEXT_WINDOW_TOKENS
+    # Usage beyond the configured window escalates to this one, so it can never be smaller than
+    # the window it is supposed to replace.
+    large_window = max(large_window, int(window))
     return Policy(
         enabled=bool(enabled),
         context_percent=float(context_percent),
         max_per_session=int(max_per_session),
         harnesses=tuple(harnesses),
         context_window_tokens=int(window),
+        large_context_window_tokens=int(large_window),
+        # A merged config always contains the key, so declaredness has to come from the files.
+        window_declared=(
+            "context_window_tokens" in block
+            if config is not None
+            else "context_window_tokens" in declared_keys("handoff_autopilot")
+        ),
     )
+
+
+def window_for(
+    used_tokens: int,
+    context_window: int,
+    *,
+    large_window: int = DEFAULT_LARGE_CONTEXT_WINDOW_TOKENS,
+) -> int:
+    """The window `used_tokens` should be measured against.
+
+    A transcript says how much was used, never how much there was. Until usage contradicts the
+    assumed window, the assumption stands; past it, the window is at least as large as the
+    fallback, and never smaller than the usage itself - which keeps the percent inside 0-100
+    instead of raising InvalidError and silently disabling the trigger for that session.
+    """
+    if used_tokens <= context_window:
+        return max(1, int(context_window))
+    return max(int(large_window), int(used_tokens), 1)
 
 
 def opt_out_reason() -> str | None:
@@ -209,6 +259,7 @@ class Decision:
     percent: float | None = None
     prompt: str = ""
     threshold: float | None = None
+    window: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -220,6 +271,7 @@ class Decision:
             "threshold": self.threshold,
             "prompt": self.prompt,
             "skill": HANDOFF_SKILL if self.trigger else None,
+            "window": self.window,
         }
 
 
@@ -247,20 +299,60 @@ def prompt_text(
 
 
 def derive_percent(
-    percent: float | None, tokens: int | None, context_window: int | None, *, default_window: int
+    percent: float | None,
+    tokens: int | None,
+    context_window: int | None,
+    *,
+    default_window: int,
+    large_window: int = DEFAULT_LARGE_CONTEXT_WINDOW_TOKENS,
 ) -> float | None:
     """Percent of the window in use, or None when the harness cannot say.
 
     Pi returns `percent: null` when `tokensUsed` or `contextWindow` is 0, so tokens are the
-    fallback; a session that cannot report its size must never be handed off on a guess.
+    fallback; a session that cannot report its size must never be handed off on a guess. A
+    window the harness stated is used as stated - it knows its own size - but an assumed one
+    yields to usage through `window_for`.
     """
     if percent is not None:
         return float(percent)
-    if tokens and context_window:
+    if not tokens:
+        return None
+    if context_window:
         return float(tokens) / float(context_window) * 100.0
-    if tokens and default_window:
-        return float(tokens) / float(default_window) * 100.0
-    return None
+    window = window_for(int(tokens), int(default_window), large_window=large_window)
+    return float(tokens) / float(window) * 100.0
+
+
+def _window_report(
+    active: Policy, *, percent: float | None, context_window: int | None, tokens: int | None
+) -> dict[str, Any]:
+    """What the percentage was measured against, and how to stop guessing.
+
+    Pi states its window; a Claude Code transcript does not, so the policy window is assumed
+    until usage contradicts it. Declaring the real window is the only correct measurement on a
+    big-window model, and every answer says which of the two happened - otherwise a handoff at a
+    tenth of the real context reads like a threshold bug instead of a missing config line.
+    """
+    if percent is not None:
+        # The harness computed the percentage itself; it knows its own window.
+        return {"declared": True, "source": "harness"}
+    base = int(context_window) if context_window else int(active.context_window_tokens)
+    source = "harness" if context_window else ("config" if active.window_declared else "assumed")
+    report: dict[str, Any] = {
+        "declared": bool(context_window) or active.window_declared,
+        "source": source,
+        "window_tokens": base,
+        # What the percentage was really divided by: usage beyond the window has to move it, and
+        # an operator who declared 200k on a session using 250k should see both numbers.
+        "measured_against_tokens": window_for(
+            int(tokens or 0), base, large_window=int(active.large_context_window_tokens)
+        ),
+    }
+    if source == "assumed":
+        report["how_to_declare"] = (
+            "handoff_autopilot.context_window_tokens in ~/.config/herdr-engineering/config.yaml"
+        )
+    return report
 
 
 def decide(
@@ -308,7 +400,11 @@ def decide(
             f"are {', '.join(active_policy.harnesses)}",
         )
     used = derive_percent(
-        percent, tokens, context_window, default_window=active_policy.context_window_tokens
+        percent,
+        tokens,
+        context_window,
+        default_window=active_policy.context_window_tokens,
+        large_window=active_policy.large_context_window_tokens,
     )
     if used is None:
         return Decision(
@@ -317,11 +413,17 @@ def decide(
             f"{harness} reported no usable context usage for {session_id}; a "
             "handoff is not triggered on an unknown context size",
         )
+    window = _window_report(
+        active_policy, percent=percent, context_window=context_window, tokens=tokens
+    )
     if used < threshold:
         return Decision(
             False,
             "below_threshold",
             f"context at {used:.0f}% is below the {threshold:.0f}% handoff threshold",
+            percent=used,
+            threshold=threshold,
+            window=window,
         )
     if _context_hook_warned(session_id):
         return Decision(
@@ -355,6 +457,7 @@ def decide(
         percent=used,
         prompt=prompt_text(percent=used, threshold=threshold, harness=harness, boundary=boundary),
         threshold=threshold,
+        window=window,
     )
 
 
@@ -402,26 +505,29 @@ def record_trigger(
     if not session_id:
         raise InvalidError("session_id is required to record an automatic handoff trigger")
     path = state_path(home)
-    ledger, _ = _read_ledger(home)
-    sessions = dict(ledger["sessions"])
-    entry = dict(sessions.get(session_id) or {})
-    count = int(entry.get("count", 0)) + 1
-    now = _utc_now()
-    entry.update(
-        {
-            "count": count,
-            "first_at": entry.get("first_at", now),
-            "last_at": now,
-            "harness": harness,
-            "last_percent": float(percent) if percent is not None else None,
-            "last_boundary": boundary,
-            "handoff": HANDOFF_CLI,
-        }
-    )
-    if prompt:
-        entry["last_prompt_sha256"] = _sha256(prompt)
-    sessions[session_id] = entry
-    _write_private_json(path, {"version": 1, "sessions": sessions})
+    # The whole read-modify-write is inside the lock: releasing it before the write would leave
+    # exactly the window this lock exists to close.
+    with _ledger_lock(path):
+        ledger, _ = _read_ledger(home)
+        sessions = dict(ledger["sessions"])
+        entry = dict(sessions.get(session_id) or {})
+        count = int(entry.get("count", 0)) + 1
+        now = _utc_now()
+        entry.update(
+            {
+                "count": count,
+                "first_at": entry.get("first_at", now),
+                "last_at": now,
+                "harness": harness,
+                "last_percent": float(percent) if percent is not None else None,
+                "last_boundary": boundary,
+                "handoff": HANDOFF_CLI,
+            }
+        )
+        if prompt:
+            entry["last_prompt_sha256"] = _sha256(prompt)
+        sessions[session_id] = entry
+        _write_private_json(path, {"version": 1, "sessions": sessions})
     return entry
 
 
@@ -431,13 +537,68 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def _atomic_write(path: Path, text: str, *, mode: int = 0o644) -> None:
+    """Write a file so a crash cannot leave it half-written.
+
+    Every file this module owns is read by another process at any moment - Pi loads the
+    extension, Claude Code parses `settings.json` before each hook - so a partial write is a
+    broken harness rather than a broken cache. The temp name is unique because a fixed `.tmp`
+    name is shared by concurrent writers, and two sessions recording at once would otherwise
+    overwrite each other's temporary file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(text)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def _ledger_lock(path: Path, *, timeout: float = 5.0) -> Iterator[None]:
+    """Best-effort exclusive lock over the ledger's read-modify-write.
+
+    A Pi session and a Claude session can reach the threshold in the same second; without a
+    lock, the second one reads before the first writes and its entry is lost, which re-arms
+    that session's trigger. Failing to take the lock is not a reason to stop: losing an entry
+    is the safe direction (the session is told again), while a hook that waits forever is the
+    one outcome this module is not allowed to produce.
+    """
+    if fcntl is None:  # pragma: no cover - Windows
+        yield
+        return
+    lock_path = path.with_name(path.name + ".lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        yield
+        return
+    try:
+        deadline = timeout
+        waited = 0.0
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if waited >= deadline:
+                    break
+                time.sleep(0.02)
+                waited += 0.02
+        yield
+    finally:
+        os.close(descriptor)
+
+
 def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
-    os.chmod(path, 0o600)
+    _atomic_write(path, json.dumps(payload, indent=2, sort_keys=True) + "\n", mode=0o600)
 
 
 # ------------------------------------------------------------------- other handoffs seen
@@ -489,14 +650,13 @@ def active_handoff(
 # --------------------------------------------------------------------- Claude Code hook
 
 
-def transcript_percent(
-    path: Path | str, *, context_window: int = DEFAULT_CONTEXT_WINDOW_TOKENS
-) -> float | None:
-    """Percent of the window the last Claude Code assistant turn actually used.
+def transcript_tokens(path: Path | str) -> int | None:
+    """Prompt-side tokens the last Claude Code assistant turn used, or None if unknowable.
 
-    Read from the transcript the installed CLI writes: each assistant record carries
-    `message.usage` with `input_tokens`, `cache_creation_input_tokens` and
-    `cache_read_input_tokens`, and those three are the prompt side of the next request.
+    Each assistant record carries `message.usage` with `input_tokens`,
+    `cache_creation_input_tokens` and `cache_read_input_tokens`; those three are the prompt side
+    of the next request. The transcript is the only evidence Claude Code leaves, and it states
+    usage but never the window size, so this returns tokens and the window is decided elsewhere.
     """
     path = Path(path)
     usage: dict[str, Any] | None = None
@@ -516,13 +676,24 @@ def transcript_percent(
             usage = message["usage"]
     if usage is None:
         return None
-    tokens = sum(
+    return sum(
         int(usage.get(key, 0) or 0)
         for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
     )
-    if not context_window:
+
+
+def transcript_percent(
+    path: Path | str,
+    *,
+    context_window: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
+    large_window: int = DEFAULT_LARGE_CONTEXT_WINDOW_TOKENS,
+) -> float | None:
+    """Percent of the window the Claude Code transcript shows in use (tokens, then `window_for`)."""
+    tokens = transcript_tokens(path)
+    if tokens is None or not context_window:
         return None
-    return tokens / float(context_window) * 100.0
+    window = window_for(int(tokens), int(context_window), large_window=large_window)
+    return tokens / float(window) * 100.0
 
 
 def hook(
@@ -544,17 +715,12 @@ def hook(
         return {}
     event = str(payload.get("hook_event_name") or "Stop")
     transcript = payload.get("transcript_path")
-    try:
-        active_policy = policy()
-        window = int(active_policy.context_window_tokens)
-    except InvalidError:
-        window = DEFAULT_CONTEXT_WINDOW_TOKENS
-    percent = transcript_percent(transcript, context_window=window) if transcript else None
+    tokens = transcript_tokens(transcript) if transcript else None
     try:
         decision = decide(
             session_id=session_id,
             harness=harness,
-            percent=percent,
+            tokens=tokens,
             cwd=payload.get("cwd") or Path.cwd(),
             home=home,
             boundary=f"{harness} hook {event}",
@@ -599,6 +765,26 @@ def hook(
 # ------------------------------------------------------------- install / uninstall / status
 
 
+def _cli_args_override() -> list[str]:
+    """Arguments placed after the CLI binary, from `HERDR_ENG_ARGS` (a JSON array of strings).
+
+    `HERDR_ENG_BIN` names the executable and `HERDR_ENG_ARGS` the arguments after it - the same
+    contract the shipped Pi extension reads, so a packager who sets them gets one command line
+    in both harnesses. Nothing here is set by `scripts/install.sh`: production resolves the CLI
+    from `PATH` (`herdr-eng`) or the extension's bundled `./bin/herdr-eng`. A malformed value is
+    ignored rather than fatal, because this runs during install and a typo in an environment
+    variable must not stop a machine from being installed.
+    """
+    raw = os.environ.get("HERDR_ENG_ARGS")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return []
+    return [str(part) for part in parsed] if isinstance(parsed, list) else []
+
+
 def _cli_command() -> str:
     """The stable command line the Claude hook runs, guarded against a missing CLI.
 
@@ -609,14 +795,16 @@ def _cli_command() -> str:
     """
     arguments = ["handoff", "autopilot", "hook", "--harness", "claude", "--record", "--json"]
     override = os.environ.get("HERDR_ENG_BIN", "").strip()
+    prefix = _cli_args_override()
     if override:
         binary = override
-        prefix = [str(a) for a in json.loads(os.environ.get("HERDR_ENG_ARGS") or "[]")]
-    elif (found := shutil.which("herdr-eng")):
-        binary, prefix = found, []
+    elif found := shutil.which("herdr-eng"):
+        binary = found
     else:
         binary, prefix = sys.executable, ["-m", "herdr_engineering.cli"]
-    run = " ".join([shlex.quote(binary), *prefix, *arguments])
+    # Every part is quoted, because a venv under a path with a space is legal and the result is
+    # a line the operator's shell will execute.
+    run = " ".join([shlex.quote(binary), *(shlex.quote(part) for part in prefix), *arguments])
     return f"[ -x {shlex.quote(binary)} ] && {run} || true"
 
 
@@ -758,8 +946,7 @@ def install(*, home: Path | str | None = None, dry_run: bool = False) -> dict[st
         _item(items, "pi-extension", "unchanged", target)
     else:
         existed = target.exists()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(source)
+        _atomic_write(target, source)
         _item(
             items,
             "pi-extension",
@@ -783,8 +970,7 @@ def install(*, home: Path | str | None = None, dry_run: bool = False) -> dict[st
         )
     else:
         existed = settings_file.exists()
-        settings_file.parent.mkdir(parents=True, exist_ok=True)
-        settings_file.write_text(json.dumps(merged, indent=2) + "\n")
+        _atomic_write(settings_file, json.dumps(merged, indent=2) + "\n")
         _item(
             items,
             "claude-hook",
@@ -836,7 +1022,7 @@ def uninstall(*, home: Path | str | None = None, dry_run: bool = False) -> dict[
             "would remove " + ", ".join(changed) + " hooks",
         )
     else:
-        settings_file.write_text(json.dumps(merged, indent=2) + "\n")
+        _atomic_write(settings_file, json.dumps(merged, indent=2) + "\n")
         _item(items, "claude-hook", "removed", settings_file, "removed " + ", ".join(changed))
     return {
         "schema_version": 1,

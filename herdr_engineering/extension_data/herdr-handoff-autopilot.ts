@@ -29,40 +29,37 @@ const CLI_TIMEOUT_MS = 15_000;
 type CliResult = { ok: boolean; stdout?: string; reason?: string };
 
 /**
- * How to invoke herdr-eng, resolved the same way the build-gate extension does.
+ * How to invoke herdr-eng: `HERDR_ENG_BIN` is the executable, `HERDR_ENG_ARGS` a JSON array of
+ * arguments placed after it (the same two variables, with the same meaning, that
+ * `handoff_autopilot._cli_command()` reads, so a packager who sets them gets one command line in
+ * both harnesses). Neither is set by `scripts/install.sh`: production resolves the CLI from
+ * `PATH`, and a bundled `./bin/herdr-eng` next to the extension wins over PATH.
  *
- * `HERDR_ENG_ARGS` is a JSON argv (a venv interpreter and `-m herdr_engineering.cli`) set by
- * `scripts/install.sh`. It is parsed, never evaluated: no shell, no interpolation.
+ * The JSON array is parsed, never evaluated: no shell, no interpolation.
  */
-function cliCommand(): { bin: string; prefix: string[] } | null {
+function cliCommand(): { bin: string; prefix: string[] } {
+	const override = (process.env.HERDR_ENG_BIN ?? "").trim();
+	let prefix: string[] = [];
 	const raw = process.env.HERDR_ENG_ARGS;
 	if (raw) {
 		try {
 			const parsed: unknown = JSON.parse(raw);
-			if (
-				Array.isArray(parsed) &&
-				parsed.length > 0 &&
-				parsed.every((part): part is string => typeof part === "string") &&
-				parsed[0].length > 0
-			) {
-				const [bin, ...prefix] = parsed;
-				return { bin, prefix };
+			if (Array.isArray(parsed) && parsed.every((part): part is string => typeof part === "string")) {
+				prefix = parsed;
 			}
 		} catch {
-			// A malformed value is not a reason to stop working; fall through to PATH.
+			// A malformed value is not a reason to stop working; the CLI is still on PATH.
 		}
 	}
+	if (override) return { bin: override, prefix };
 	const bundled = new URL("./bin/herdr-eng", import.meta.url).pathname;
-	if (existsSync(bundled)) return { bin: bundled, prefix: [] };
-	return { bin: "herdr-eng", prefix: [] };
+	if (existsSync(bundled)) return { bin: bundled, prefix };
+	return { bin: "herdr-eng", prefix };
 }
 
 /** Run the CLI. It is authoritative; this extension only remembers what it was told. */
 function askCli(args: string[]): CliResult {
 	const command = cliCommand();
-	if (command === null) {
-		return { ok: false, reason: "HERDR_ENG_ARGS is not a JSON array of strings" };
-	}
 	let result: ReturnType<typeof spawnSync>;
 	try {
 		result = spawnSync(command.bin, [...command.prefix, ...args], {
@@ -256,8 +253,14 @@ export default function (pi: ExtensionAPI) {
 				warn(sessionId, "the verdict said trigger but carried no instruction", ctx);
 				return;
 			}
-			const send = pi.sendUserMessage as unknown as SilentSend;
-			const injected = await send(prompt, { deliver: false, inject: false });
+			// Called through `pi` rather than pulled out of it: a harness method that reaches for
+			// `this` throws when invoked bare, and the session would be promised an instruction
+			// it never received.
+			const injected = await (pi.sendUserMessage as unknown as SilentSend).call(
+				pi,
+				prompt,
+				{ deliver: false, inject: false },
+			);
 			if (injected === false) {
 				// Not delivered, so not recorded: the next boundary re-arms the trigger.
 				warn(sessionId, "pi refused the handoff instruction, so it was not recorded", ctx);

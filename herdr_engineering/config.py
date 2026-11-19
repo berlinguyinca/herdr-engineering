@@ -6,6 +6,7 @@ Precedence (spec 0050):
 Merging must preserve unrelated user settings (deep merge, never wholesale
 overwrite).
 """
+
 from __future__ import annotations
 
 import copy
@@ -40,12 +41,19 @@ DEFAULTS: dict[str, Any] = {
         "mode": "local_only",
         "allowed_hosts": [],
         "shared_cache": {
-            "enabled": False, "endpoint_ref": None, "namespace": "trusted-dev",
-            "writes_enabled": False, "max_total_gib": 250, "tls_required": True,
-            "credentials_file": None, "registry_file": None,
+            "enabled": False,
+            "endpoint_ref": None,
+            "namespace": "trusted-dev",
+            "writes_enabled": False,
+            "max_total_gib": 250,
+            "tls_required": True,
+            "credentials_file": None,
+            "registry_file": None,
         },
         "local": {
-            "capacity_gib": 20, "ram_scratch_gib": 0, "min_free_disk_percent": 20,
+            "capacity_gib": 20,
+            "ram_scratch_gib": 0,
+            "min_free_disk_percent": 20,
             "incremental_disabled_for_cacheable_builds": True,
             "storage_tiers": [],
             "manage_targets": False,
@@ -55,20 +63,34 @@ DEFAULTS: dict[str, Any] = {
             "target_min_idle_hours": 168,
         },
         "execution": {
-            "slurm_enabled": False, "allowed_clusters": [], "allowed_partitions": [],
-            "gpu_for_cpu_builds": False, "remote_fallback": "local", "max_build_slots": 2,
+            "slurm_enabled": False,
+            "allowed_clusters": [],
+            "allowed_partitions": [],
+            "gpu_for_cpu_builds": False,
+            "remote_fallback": "local",
+            "max_build_slots": 2,
         },
         "slurm": {
-            "enabled": False, "account": None, "allowed_partitions": [], "cpus": 8,
-            "mem_gb": 16, "time_limit_minutes": 60, "queue_wait_timeout_s": 900,
+            "enabled": False,
+            "account": None,
+            "allowed_partitions": [],
+            "cpus": 8,
+            "mem_gb": 16,
+            "time_limit_minutes": 60,
+            "queue_wait_timeout_s": 900,
         },
         "cleanup": {"dry_run": True, "min_idle_hours": 24, "max_evict_per_pass_gib": 10},
-        "eviction": {"destructive_enabled": False, "hard_cap_gib": 40,
-                     "max_entries_per_run": 5000},
+        "eviction": {"destructive_enabled": False, "hard_cap_gib": 40, "max_entries_per_run": 5000},
         "adaptive_slots": {"enabled": False, "min_slots": 1, "max_slots": 4},
         "observability": {"enabled": False, "export_existing_metrics_pipeline": False},
         # Opt-in sender of this host's builds to a control plane (`herdr-eng build-cache-report`).
-        "report": {"enabled": False, "url": None, "key_file": None, "interval_s": 60, "host_id": None},
+        "report": {
+            "enabled": False,
+            "url": None,
+            "key_file": None,
+            "interval_s": 60,
+            "host_id": None,
+        },
     },
     "herdr": {"capability_cache_ttl_seconds": 30},
     # Automatic handoffs (default on): when a session reaches this share of its context
@@ -80,7 +102,12 @@ DEFAULTS: dict[str, Any] = {
         "context_percent": 50.0,
         "max_per_session": 1,
         "harnesses": ["pi", "claude"],
+        # Assumed window when the harness does not state one (Claude Code transcripts report
+        # usage, never the window size). A Pi session's own contextWindow always wins.
         "context_window_tokens": 200000,
+        # Substituted once usage proves the assumed window cannot be right (250k used cannot fit
+        # a 200k window), so a 1M-context session is never read as 125% and silently dropped.
+        "large_context_window_tokens": 1000000,
     },
     "web": {"private_only": True, "host": "127.0.0.1", "port": 8787},
     "artifacts": {
@@ -132,8 +159,12 @@ DEFAULTS: dict[str, Any] = {
     },
     "tests": {"adapters": ["pytest", "go", "cargo", "junit", "scala"]},
     "ci": {"provider": "woodpecker", "pileated_extensions": "auto"},
-    "notifications": {"enabled": True, "minimum_severity": "notice",
-                      "quiet_hours": None, "dedupe_window_seconds": 300},
+    "notifications": {
+        "enabled": True,
+        "minimum_severity": "notice",
+        "quiet_hours": None,
+        "dedupe_window_seconds": 300,
+    },
     "security": {"allow_public_listeners": False, "persist_hidden_reasoning": False},
     # GitHub catalog (control-plane-web). organizations: allowlist of owner
     # logins (organizations and your own account); empty = every owner the
@@ -141,8 +172,11 @@ DEFAULTS: dict[str, Any] = {
     # stored catalog on the next pass.
     # sync: interval between passes and between scheduled full reads (seconds).
     # projects: read-only Projects v2 boards of the in-scope owners (off by default).
-    "github": {"organizations": [], "sync": dict(GITHUB_SYNC_DEFAULTS),
-               "projects": dict(GITHUB_PROJECTS_DEFAULTS)},
+    "github": {
+        "organizations": [],
+        "sync": dict(GITHUB_SYNC_DEFAULTS),
+        "projects": dict(GITHUB_PROJECTS_DEFAULTS),
+    },
 }
 
 
@@ -165,7 +199,8 @@ def github_sync(value: Any) -> dict[str, int]:
         raise InvalidError(
             f"github.sync.point_budget is spent once per pass: {settings['point_budget']} points every "
             f"{settings['interval']}s is {hourly:.0f} points per hour, over GitHub's {GITHUB_POINTS_PER_HOUR} "
-            "per-hour GraphQL limit; lower point_budget or raise interval")
+            "per-hour GraphQL limit; lower point_budget or raise interval"
+        )
     return settings
 
 
@@ -196,9 +231,13 @@ def github_organizations(value: Any) -> list[str]:
     """
     if value is None:
         return []
-    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
-        raise InvalidError("github.organizations must be a list of non-empty GitHub owner logins "
-                           "(organizations or your own account); leave it empty for every owner")
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise InvalidError(
+            "github.organizations must be a list of non-empty GitHub owner logins "
+            "(organizations or your own account); leave it empty for every owner"
+        )
     return sorted({item.strip().lower() for item in value})
 
 
@@ -228,10 +267,13 @@ def _expand_env(value: Any) -> Any:
     if isinstance(value, str):
         # support ${VAR:-default} and ${VAR}
         import re
+
         pattern = re.compile(r"\$\{([A-Z0-9_]+)(?::-([^}]*))?\}")
+
         def repl(m):
             name, default = m.group(1), m.group(2)
             return os.environ.get(name, default if default is not None else "")
+
         return pattern.sub(repl, value)
     if isinstance(value, dict):
         return {k: _expand_env(v) for k, v in value.items()}
@@ -266,8 +308,9 @@ def _repo_local_paths() -> set[Path]:
     return {cwd / "config" / "herdr-engineering.yaml", cwd / "herdr-engineering.yaml"}
 
 
-def load_config(paths: list[Path] | None = None, *, strict_build_cache: bool = False
-                ) -> dict[str, Any]:
+def load_config(
+    paths: list[Path] | None = None, *, strict_build_cache: bool = False
+) -> dict[str, Any]:
     """Load config by precedence. Each path may be missing (skipped).
 
     When ``paths`` is omitted, a sensible default set is discovered (machine-
@@ -277,11 +320,12 @@ def load_config(paths: list[Path] | None = None, *, strict_build_cache: bool = F
     cfg = copy.deepcopy(DEFAULTS)
     discovered = paths is None
     repo_local = _repo_local_paths() if discovered else set()
-    for path in (paths if paths is not None else _discover_config_paths()):
+    for path in paths if paths is not None else _discover_config_paths():
         if not path.exists():
             continue
         try:
             import yaml  # optional; fall back to a tiny parser
+
             data = yaml.safe_load(path.read_text()) or {}
         except ImportError:
             data = _read_simple_yaml(path)
@@ -296,7 +340,9 @@ def load_config(paths: list[Path] | None = None, *, strict_build_cache: bool = F
             logging.getLogger(__name__).warning(
                 "%s: github.* is validated but not read from this file; control-plane-web reads "
                 "github.organizations and github.sync from the central fleet config (control_plane "
-                "fleet file), so this section has no effect", path)
+                "fleet file), so this section has no effect",
+                path,
+            )
         if path in repo_local:
             # A checkout being built must never choose build-cache policy
             # (writes, namespace, credentials): machine-local config only.
@@ -305,6 +351,7 @@ def load_config(paths: list[Path] | None = None, *, strict_build_cache: bool = F
     validate_github(cfg.get("github"))
     cfg = _expand_env(cfg)
     from .build_cache_config import validate as validate_build_cache
+
     try:
         validate_build_cache(cfg.get("fabric_build_cache"))
     except InvalidError as exc:
@@ -313,9 +360,31 @@ def load_config(paths: list[Path] | None = None, *, strict_build_cache: bool = F
         # Fail closed: an invalid build-cache section disables the feature
         # instead of breaking every unrelated command.
         logging.getLogger(__name__).warning(
-            "fabric_build_cache config invalid, feature disabled: %s", exc)
+            "fabric_build_cache config invalid, feature disabled: %s", exc
+        )
         cfg["fabric_build_cache"] = copy.deepcopy(DEFAULTS["fabric_build_cache"])
     return cfg
+
+
+def declared_keys(section: str) -> set[str]:
+    """Keys the operator actually wrote for a section, never the built-in defaults.
+
+    `load_config` merges DEFAULTS, so every key is present in the merged dict and presence
+    proves nothing. Whether a value was chosen or merely defaulted does matter here: 200000 as
+    a default is a guess about a context window, 200000 as a declaration is a fact about one.
+    """
+    keys: set[str] = set()
+    for path in _discover_config_paths():
+        if not path.is_file():
+            continue
+        try:
+            raw = _read_simple_yaml(path)
+        except (OSError, ValueError):
+            continue
+        block = raw.get(section) if isinstance(raw, dict) else None
+        if isinstance(block, dict):
+            keys.update(key for key in block if isinstance(key, str))
+    return keys
 
 
 def _read_simple_yaml(path: Path) -> dict[str, Any]:

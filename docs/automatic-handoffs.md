@@ -28,7 +28,7 @@ Two other triggers write to the same `~/.claude/settings.json`, and they are sep
 
 | Trigger | Installed by | Fires on | What it does |
 |---|---|---|---|
-| `handoff autopilot install` (this page) | `install.sh`, default on | Pi `turn_end`; Claude `Stop`, `PreCompact` | tells the agent to run the handoff skill, once per session, after subagents drain |
+| `handoff autopilot install` (this page) | `install.sh`, default on | Pi `turn_end`; Claude `Stop`, `PreCompact` | tells the agent to run the handoff skill, once per session |
 | `workflow install` | `install.sh`, default on | Claude `SessionStart`, `PreCompact` | reminds the agent of the engineering defaults, and of `/handoff` before compaction; starts nothing |
 | `handoff context-hook claude` | never; paste the block into `~/.claude/settings.json` | Claude `UserPromptSubmit` | advises at half the window (default), once per session |
 
@@ -89,11 +89,32 @@ handoff_autopilot:
   context_percent: 50       # matches the agent rule "warn past 50% of context"
   max_per_session: 1        # one instruction per session; 0 is refused (it would disable it silently)
   harnesses: [pi, claude]   # what the triggers are allowed to act on
-  context_window_tokens: 200000   # fallback when a harness reports tokens but no window size
+  context_window_tokens: 200000   # what to assume when a harness reports usage but no window size
+  large_context_window_tokens: 1000000   # assumed instead once usage proves 200k impossible
 ```
 
-Read from the machine config (`~/.config/herdr-engineering/config.yaml`) and the repo-local
-`.herdr/config.yml`, exactly like every other section.
+Read from the machine config (`~/.config/herdr-engineering/config.yaml`), the repository config
+(`./config/herdr-engineering.yaml` or `./herdr-engineering.yaml`) or `$HERDR_ENGINEERING_CONFIG`,
+exactly like every other section - later ones win.
+
+**The window, and why it is sometimes an assumption.** Pi states both numbers, so the percentage
+is exact. Claude Code's transcripts record `message.usage` and the model, but never the size of
+the window in use, so `context_window_tokens` is the assumed denominator - and an assumption on a
+1M-context model would fire the trigger at 100k tokens, one fifth of the way in. Two rules keep
+that from happening:
+
+- usage beyond the assumed window proves the assumption wrong, so the measurement moves to
+  `large_context_window_tokens` (this mirrors the 1M switch the opt-in
+  `handoff context-hook claude` already makes). A session at 250k is therefore 25%, not 125% -
+  and it is still a trigger candidate rather than an unusable reading.
+- declaring the real window ends the guessing: put `context_window_tokens: 1000000` in the config
+  and every percentage is computed against it.
+
+Every answer says which of the two happened - `"window": {"declared": true, "source": "config"}`
+or `{"declared": false, "source": "assumed", "how_to_declare": ...}` - so a handoff that looks
+early can be read as a wrong assumption instead of a threshold bug. `handoff autopilot check
+--transcript <path>` reports the same window as the Stop hook, because both take tokens from the
+transcript and divide by the window rule, never a percentage the harness asserted.
 
 **Switch it off without uninstalling:**
 

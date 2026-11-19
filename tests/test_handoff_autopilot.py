@@ -22,6 +22,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -68,10 +69,23 @@ def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
             "XDG_DATA_HOME": str(home / ".local" / "share"),
         }
     )
-    env.pop("HERDR_HANDOFF_AUTOPILOT", None)
+    # Anything the developer's own machine sets would otherwise leak into the run: the opt-out,
+    # the CLI override the hook embeds, and the state and config roots that decide where files
+    # go. `install status` is the worst case - it compares what is on disk against what is
+    # configured, so a leaked path makes an absent install look present, or the reverse.
+    inherited = [
+        "HERDR_HANDOFF_AUTOPILOT",
+        "HERDR_ENG_BIN",
+        "HERDR_ENG_ARGS",
+        "HERDR_ENGINEERING_STATE",
+        "HERDR_ENGINEERING_CONFIG",
+    ]
+    for name in inherited:
+        env.pop(name, None)
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
-    monkeypatch.delenv("HERDR_HANDOFF_AUTOPILOT", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
     return {"tmp": tmp_path, "home": home, "state": state, "work": work, "env": env}
 
 
@@ -574,8 +588,19 @@ def test_pi_extension_and_cli_hand_off_without_a_human(host: dict) -> None:
     exactly one message.
     """
     node = shutil.which("node")
-    if node is None:  # pragma: no cover - CI ships node 22 for the packages suite
+    if node is None:  # pragma: no cover - CI ships node for the packages suite
         pytest.skip("node is not installed on this host")
+    # The same rule the packages suite applies, from the same probe: importing a .ts extension
+    # needs Node's native TypeScript support. Skipping here rather than failing keeps the reason
+    # identical in both suites, so a red run always means the extension is broken.
+    probe = subprocess.run(
+        [node, "-e", "process.exit(process.features.typescript ? 0 : 1)"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if probe.returncode != 0:
+        pytest.skip("node cannot import a .ts extension without native TypeScript")
     installed = _cli(["handoff", "autopilot", "install", "--json"], host["env"], host["work"])
     assert installed.returncode == 0, installed.stderr
     extension = ha.extension_path(home=host["home"])
@@ -628,10 +653,15 @@ assert.equal(ledger.sessions["s-node"].harness, "pi");
 """)
     env = dict(host["env"])
     # The same argv install.sh hands pi: interpreter first, module after.
-    env["HERDR_ENG_ARGS"] = json.dumps([sys.executable, "-m", "herdr_engineering.cli"])
+    # The CLI override, with the meaning both readers give it: the executable, then its arguments.
+    env["HERDR_ENG_BIN"] = sys.executable
+    env["HERDR_ENG_ARGS"] = json.dumps(["-m", "herdr_engineering.cli"])
     env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
     env["HERDR_TEST_PYTHON"] = sys.executable
     done = subprocess.run(
+        # No flag: the probe above proved this node strips types, and it does so by default.
+        # `--no-experimental-strip-types` would turn the opposite off and make the .ts import
+        # fail with ERR_UNKNOWN_FILE_EXTENSION, which is a broken test, not a broken extension.
         [node, str(runner)],
         capture_output=True,
         text=True,
@@ -671,7 +701,9 @@ def test_the_installer_arms_automatic_handoffs_by_default() -> None:
     # 7d screenwright, 7e the autopilot - which is last because it is the only one that reads
     # policy and can therefore report what the others left behind).
     order = [text.index(f"# --- {step}.") for step in ("7c", "7d", "7e")]
-    assert order == sorted(order), "the autopilot must install after `workflow install`, not before it"
+    assert order == sorted(order), (
+        "the autopilot must install after `workflow install`, not before it"
+    )
     # A step that can fail must not take the whole installer down with it (`set -euo pipefail`).
     step = text.split("# --- 7e.", 1)[1].split("# --- 8.", 1)[0]
     assert "|| warn" in step, "a failed trigger install must warn, not abort the installer"
@@ -690,7 +722,11 @@ def test_the_operator_doc_names_only_commands_that_exist() -> None:
     assert DOC.is_file(), "automatic handoffs need an operator-facing doc"
     text = DOC.read_text(encoding="utf-8")
     help_out = subprocess.run(
-        CLI + ["--help"], capture_output=True, text=True, timeout=120, cwd=str(Path(ha.__file__).resolve().parents[1])
+        CLI + ["--help"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(Path(ha.__file__).resolve().parents[1]),
     ).stdout
     choices = set(re.findall(r"\n\s{0,2}\{([a-z0-9,\-]+)\}", help_out))
     known: set[str] = set()
@@ -703,7 +739,9 @@ def test_the_operator_doc_names_only_commands_that_exist() -> None:
     assert not unknown, f"the doc names commands the CLI does not have: {unknown}"
     # The three verbs an operator needs must be spelled out, and the switches named exactly.
     for verb in ("status", "install", "uninstall"):
-        assert f"handoff autopilot {verb}" in text, f"the doc never mentions `handoff autopilot {verb}`"
+        assert f"handoff autopilot {verb}" in text, (
+            f"the doc never mentions `handoff autopilot {verb}`"
+        )
     assert "HERDR_HANDOFF_AUTOPILOT" in text and "handoff_autopilot" in text
 
     # Codes the doc tells an operator to expect must be codes something in this repo really answers
@@ -711,14 +749,23 @@ def test_the_operator_doc_names_only_commands_that_exist() -> None:
     # skill already use. Prose inventing a status is how an operator ends up chasing a ghost.
     root = Path(ha.__file__).resolve().parents[1]
     vocabulary = [Path(ha.__file__).read_text(encoding="utf-8")]
-    for source in (root / "docs" / "operations" / "handoff.md", root / "herdr_engineering" / "skill_data" / "handoff" / "SKILL.md"):
+    for source in (
+        root / "docs" / "operations" / "handoff.md",
+        root / "herdr_engineering" / "skill_data" / "handoff" / "SKILL.md",
+    ):
         vocabulary.append(source.read_text(encoding="utf-8"))
     coded = set(re.findall(r"`([a-z][a-z0-9_]{3,})`", text))
     interesting = {
-        word for word in coded
-        if re.search(r"(_unconfirmed|_failed$|_underway|_unpushed|_dirty|_not_ready|_unsupported|_is_full|_unavailable$|unknown_context)", word)
+        word
+        for word in coded
+        if re.search(
+            r"(_unconfirmed|_failed$|_underway|_unpushed|_dirty|_not_ready|_unsupported|_is_full|_unavailable$|unknown_context)",
+            word,
+        )
     }
-    invented = sorted(word for word in interesting if not any(word in source for source in vocabulary))
+    invented = sorted(
+        word for word in interesting if not any(word in source for source in vocabulary)
+    )
     assert not invented, f"the doc names statuses nothing in this repo produces: {invented}"
 
 
@@ -730,7 +777,9 @@ def test_the_trigger_can_be_type_checked_against_the_pi_it_runs_on() -> None:
     extension, and a script that uses it, is how that drift gets caught before install time.
     """
     root = Path(ha.__file__).resolve().parents[1]
-    tsconfig = json.loads((root / "herdr_engineering" / "extension_data" / "tsconfig.json").read_text())
+    tsconfig = json.loads(
+        (root / "herdr_engineering" / "extension_data" / "tsconfig.json").read_text()
+    )
     assert "herdr-handoff-autopilot.ts" in tsconfig["include"]
     assert tsconfig["compilerOptions"]["strict"] is True
     assert tsconfig["compilerOptions"]["noEmit"] is True
@@ -761,17 +810,24 @@ def test_the_autopilot_and_the_managed_workflow_hooks_share_settings_json(host: 
     assert ha.HOOK_MARKER in text and "herdr-workflow:managed" in text, text
 
     hooks = json.loads(text)["hooks"]
-    events = {event: [entry for group in groups for entry in group.get("hooks", [])]
-              for event, groups in hooks.items()}
-    managed = {event: commands
-               for event, entries in events.items()
-               if (commands := [c["command"] for c in entries if "herdr-workflow:managed" in c["command"]])}
-    ours = {event: commands
-            for event, entries in events.items()
-            if (commands := [c["command"] for c in entries if ha.HOOK_MARKER in c["command"]])}
+    events = {
+        event: [entry for group in groups for entry in group.get("hooks", [])]
+        for event, groups in hooks.items()
+    }
+    managed = {
+        event: commands
+        for event, entries in events.items()
+        if (commands := [c["command"] for c in entries if "herdr-workflow:managed" in c["command"]])
+    }
+    ours = {
+        event: commands
+        for event, entries in events.items()
+        if (commands := [c["command"] for c in entries if ha.HOOK_MARKER in c["command"]])
+    }
     # Whatever events upstream decides to manage, the autopilot must not disturb any of them,
     # and its own events are exactly the two that can carry an instruction.
     from herdr_engineering.workflow_hooks import EVENTS as WORKFLOW_EVENTS
+
     assert sorted(managed) == sorted(WORKFLOW_EVENTS), (sorted(managed), WORKFLOW_EVENTS)
     assert sorted(ours) == ["PreCompact", "Stop"], sorted(ours)
     # Both PreCompact hooks are still in the same event list, in the order Claude runs them.
@@ -786,7 +842,9 @@ def test_the_autopilot_and_the_managed_workflow_hooks_share_settings_json(host: 
     assert "herdr-workflow:managed" in after_text
     after = json.loads(after_text)["hooks"]
     assert json.dumps(after["SessionStart"], sort_keys=True) == before
-    assert [c["command"] for group in after["PreCompact"] for c in group.get("hooks", [])] == managed["PreCompact"]
+    assert [
+        c["command"] for group in after["PreCompact"] for c in group.get("hooks", [])
+    ] == managed["PreCompact"]
 
     # ... and the other way round: re-arming the autopilot then dropping the workflow hooks.
     assert _cli(["handoff", "autopilot", "install"], host["env"], host["work"]).returncode == 0
@@ -796,7 +854,9 @@ def test_the_autopilot_and_the_managed_workflow_hooks_share_settings_json(host: 
     assert [c["command"] for group in final["PreCompact"] for c in group.get("hooks", [])] and all(
         ha.HOOK_MARKER in c["command"] for c in final["PreCompact"][0]["hooks"]
     ), "the autopilot's PreCompact hook was taken with the workflow hooks"
-    assert any(ha.HOOK_MARKER in c["command"] for group in final["Stop"] for c in group.get("hooks", []))
+    assert any(
+        ha.HOOK_MARKER in c["command"] for group in final["Stop"] for c in group.get("hooks", [])
+    )
 
 
 def test_the_claude_hook_command_survives_a_missing_cli(host: dict) -> None:
@@ -812,8 +872,12 @@ def test_the_claude_hook_command_survives_a_missing_cli(host: dict) -> None:
     (host["home"] / ".claude").mkdir()
     assert _cli(["handoff", "autopilot", "install"], host["env"], host["work"]).returncode == 0
     settings = json.loads((host["home"] / ".claude" / "settings.json").read_text())
-    commands = [hook["command"] for group in settings["hooks"]["Stop"] for hook in group["hooks"]
-                if ha.HOOK_MARKER in hook["command"]]
+    commands = [
+        hook["command"]
+        for group in settings["hooks"]["Stop"]
+        for hook in group["hooks"]
+        if ha.HOOK_MARKER in hook["command"]
+    ]
     assert len(commands) == 1, commands
     command = commands[0]
     assert command.startswith("[ -x "), command
@@ -830,10 +894,18 @@ def test_the_claude_hook_command_survives_a_missing_cli(host: dict) -> None:
     guarded = _shell_join(replaced)
 
     # Claude Code hands the hook its event on stdin, so that is how this runs.
-    event = json.dumps({"hook_event_name": "Stop", "session_id": "s-guard",
-                        "transcript_path": "/nope.jsonl"})
-    probe = subprocess.run(["bash", "-c", guarded], input=event, capture_output=True,
-                           text=True, timeout=60, env=host["env"], cwd=str(host["work"]))
+    event = json.dumps(
+        {"hook_event_name": "Stop", "session_id": "s-guard", "transcript_path": "/nope.jsonl"}
+    )
+    probe = subprocess.run(
+        ["bash", "-c", guarded],
+        input=event,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=host["env"],
+        cwd=str(host["work"]),
+    )
     assert probe.returncode == 0, (probe.returncode, probe.stdout, probe.stderr)
     assert probe.stdout.strip() == "", probe.stdout
 
@@ -841,8 +913,15 @@ def test_the_claude_hook_command_survives_a_missing_cli(host: dict) -> None:
     # Everything after `||` belongs to the guard, so the control stops at it.
     guarded_tail = tokens.index("||")
     bare = _shell_join([missing, *tokens[6:guarded_tail]])
-    control = subprocess.run(["bash", "-c", bare], input=event, capture_output=True,
-                             text=True, timeout=60, env=host["env"], cwd=str(host["work"]))
+    control = subprocess.run(
+        ["bash", "-c", bare],
+        input=event,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=host["env"],
+        cwd=str(host["work"]),
+    )
     assert control.returncode != 0, (control.returncode, control.stdout)
 
 
@@ -861,9 +940,22 @@ def test_a_session_the_context_hook_already_warned_is_not_told_again(host: dict)
 
     def check(session: str) -> dict:
         result = _cli(
-            ["handoff", "autopilot", "check", "--harness", "claude", "--session-id", session,
-             "--tokens", "185000", "--context-window", "200000", "--json"],
-            host["env"], host["work"],
+            [
+                "handoff",
+                "autopilot",
+                "check",
+                "--harness",
+                "claude",
+                "--session-id",
+                session,
+                "--tokens",
+                "185000",
+                "--context-window",
+                "200000",
+                "--json",
+            ],
+            host["env"],
+            host["work"],
         )
         assert result.returncode == 0, result.stdout + result.stderr
         return json.loads(result.stdout)
@@ -936,6 +1028,285 @@ def test_precompact_advises_without_spending_the_trigger(host: dict) -> None:
     # The promise the systemMessage made: the next Stop is the one that tells the agent.
     stopped = run("Stop")
     assert stopped["trigger"] is True, stopped
-    assert stopped["hookSpecificOutput"]["additionalContext"].startswith("[HerdR automatic handoff]")
+    assert stopped["hookSpecificOutput"]["additionalContext"].startswith(
+        "[HerdR automatic handoff]"
+    )
     assert stopped["recorded"]["count"] == 1, stopped["recorded"]
     assert ha.read_ledger()["sessions"]["s-precompact"]["count"] == 1
+
+
+def test_usage_beyond_the_assumed_window_does_not_kill_the_trigger(host: dict) -> None:
+    """Usage past the assumed window proves the assumption wrong; it must not become an error.
+
+    Claude Code reports usage but never the window size, so 200k is an assumption. A session that
+    has used 250k tokens cannot live in a 200k window. Measured naively that is 125%, `decide`
+    rejects a percent above 100 as invalid, the hook fails open, and the session is never told -
+    silently, on every turn, for the rest of its life. The assumed window has to yield to the
+    evidence, the way `handoff context-hook claude` switches to 1M past 200k.
+    """
+    quarter_m = _cli(
+        [
+            "handoff",
+            "autopilot",
+            "check",
+            "--harness",
+            "claude",
+            "--session-id",
+            "s-1m-quarter",
+            "--tokens",
+            "250000",
+            "--json",
+        ],
+        host["env"],
+        host["work"],
+    )
+    assert quarter_m.returncode == 0, quarter_m.stderr
+    early = json.loads(quarter_m.stdout)
+    assert early["code"] != "invalid", early
+    assert early["percent"] == pytest.approx(25.0, abs=0.5), early
+    assert early["trigger"] is False, early
+    assert early["window"]["measured_against_tokens"] == 1_000_000, early
+
+    # Past even the large window the reading is capped at 100 and the hard ceiling fires,
+    # rather than the whole mechanism dropping out on an out-of-range number.
+    over = _cli(
+        [
+            "handoff",
+            "autopilot",
+            "check",
+            "--harness",
+            "claude",
+            "--session-id",
+            "s-1m-over",
+            "--tokens",
+            "1050000",
+            "--json",
+        ],
+        host["env"],
+        host["work"],
+    )
+    assert over.returncode == 0, over.stderr
+    over_dict = json.loads(over.stdout)
+    assert over_dict["trigger"] is True, over_dict
+    assert 0 <= over_dict["percent"] <= 100, over_dict
+
+
+def test_a_declared_window_is_used_instead_of_the_assumption(host: dict) -> None:
+    """An operator on a 1M-context model can say so, and the percentage follows the declaration.
+
+    The window cannot be read from a Claude transcript - verified against the transcripts on this
+    machine, which carry `message.usage` and `message.model` and no window size - so the
+    conservative default stands until it is contradicted. Declaring the real window is the only
+    correct measurement, and `check --transcript` must apply it.
+    """
+    config = Path(host["home"]) / ".config" / "herdr-engineering" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("handoff_autopilot:\n  context_window_tokens: 1000000\n")
+    hundred_k = write_transcript(
+        host["work"] / "declared.jsonl",
+        session_id="s-declared",
+        input_tokens=100_000,
+        cache_write=0,
+        cache_read=0,
+    )
+    verdict = _cli(
+        [
+            "handoff",
+            "autopilot",
+            "check",
+            "--harness",
+            "claude",
+            "--session-id",
+            "s-declared",
+            "--transcript",
+            str(hundred_k),
+            "--json",
+        ],
+        host["env"],
+        host["work"],
+    )
+    assert verdict.returncode == 0, verdict.stderr
+    declared = json.loads(verdict.stdout)
+    assert declared["trigger"] is False, declared
+    assert declared["percent"] == pytest.approx(10.0, abs=0.5), declared
+    assert declared["window"] == {
+        "declared": True,
+        "source": "config",
+        "window_tokens": 1_000_000,
+        "measured_against_tokens": 1_000_000,
+    }, declared
+
+
+def test_an_assumed_window_is_named_in_the_answer(host: dict) -> None:
+    """Without a declaration the 200k assumption stands - and says so out loud.
+
+    A handoff at a tenth of a 1M window would otherwise look like a threshold bug; the answer has
+    to name what it assumed and the one config line that stops the guessing.
+    """
+    hundred_k = write_transcript(
+        host["work"] / "assumed.jsonl",
+        session_id="s-assumed",
+        input_tokens=100_000,
+        cache_write=0,
+        cache_read=0,
+    )
+    verdict = _cli(
+        [
+            "handoff",
+            "autopilot",
+            "check",
+            "--harness",
+            "claude",
+            "--session-id",
+            "s-assumed",
+            "--transcript",
+            str(hundred_k),
+            "--json",
+        ],
+        host["env"],
+        host["work"],
+    )
+    assert verdict.returncode == 0, verdict.stderr
+    assumed = json.loads(verdict.stdout)
+    assert assumed["trigger"] is True, assumed
+    assert assumed["percent"] == pytest.approx(50.0, abs=0.5), assumed
+    assert assumed["window"] == {
+        "declared": False,
+        "source": "assumed",
+        "window_tokens": 200_000,
+        "measured_against_tokens": 200_000,
+        "how_to_declare": assumed["window"]["how_to_declare"],
+    }, assumed
+    assert "context_window_tokens" in assumed["window"]["how_to_declare"], assumed
+
+
+def test_the_claude_hook_measures_the_way_check_measures(host: dict) -> None:
+    """The hook and `check` must never disagree about the same transcript."""
+    transcript = write_transcript(
+        host["work"] / "1m-hook.jsonl",
+        session_id="s-1m-hook",
+        input_tokens=250_000,
+        cache_write=0,
+        cache_read=0,
+    )
+    done = subprocess.run(
+        CLI + ["handoff", "autopilot", "hook", "--harness", "claude", "--record", "--json"],
+        input=json.dumps(
+            {
+                "session_id": "s-1m-hook",
+                "transcript_path": str(transcript),
+                "hook_event_name": "Stop",
+                "cwd": str(host["work"]),
+            }
+        ),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=host["env"],
+        cwd=str(host["work"]),
+    )
+    assert done.returncode == 0, done.stderr
+    verdict = json.loads(done.stdout)
+    assert verdict["code"] == "below_threshold", verdict
+    assert verdict["percent"] == pytest.approx(25.0, abs=0.5), verdict
+    assert not ha.state_path().exists(), "a below-threshold session must not be recorded"
+
+
+def test_sessions_recording_at_the_same_instant_all_survive(host: dict) -> None:
+    """The ledger is written by every session on the host, so a record must not lose another's.
+
+    `record_trigger` reads, edits and writes the file. A Pi session and a Claude session crossing
+    the threshold in the same second - which is exactly what happens after a long unattended run -
+    would otherwise both read the same empty ledger and the last writer would win, silently
+    re-arming the lost session so its agent is told to hand off twice.
+    """
+    writers = 8
+    sessions = [f"s-race-{index}" for index in range(writers)]
+    command = [
+        *CLI,
+        "handoff",
+        "autopilot",
+        "record",
+        "--harness",
+        "pi",
+        "--percent",
+        "75",
+        "--json",
+    ]
+    started = threading.Barrier(writers)
+
+    def write(index: int) -> None:
+        started.wait(timeout=30)
+        subprocess.run(
+            [*command, "--session-id", sessions[index]],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=host["env"],
+            cwd=str(host["work"]),
+        )
+
+    threads = [threading.Thread(target=write, args=(index,)) for index in range(writers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+
+    ledger = json.loads(ha.state_path().read_text())
+    recorded = sorted(ledger["sessions"])
+    assert recorded == sorted(sessions), (
+        f"{writers - len(recorded)} trigger(s) lost to a concurrent write: {recorded}"
+    )
+    assert all(entry["count"] == 1 for entry in ledger["sessions"].values()), ledger
+
+
+def test_the_installed_command_quotes_every_part_of_itself(host: dict) -> None:
+    """A CLI path with a space must survive being written into settings.json.
+
+    The hook line is executed by the operator's shell. `HERDR_ENG_BIN` and `HERDR_ENG_ARGS` are
+    the packager's way to point at a venv, and a venv under a path with a space is legal, so an
+    unquoted join would make every Stop hook a shell syntax error. A malformed
+    `HERDR_ENG_ARGS` is ignored rather than fatal: it is read during install, and a typo in the
+    environment must not stop a machine from being installed.
+    """
+    (host["home"] / ".claude").mkdir()
+    env = dict(host["env"])
+    env["HERDR_ENG_BIN"] = str(host["work"] / "my bin" / "herdr-eng")
+    env["HERDR_ENG_ARGS"] = json.dumps(["-m", "herd r.cli"])
+    assert _cli(["handoff", "autopilot", "install"], env, host["work"]).returncode == 0
+    settings = json.loads((host["home"] / ".claude" / "settings.json").read_text())
+    command = [
+        hook["command"]
+        for group in settings["hooks"]["Stop"]
+        for hook in group["hooks"]
+        if ha.HOOK_MARKER in hook["command"]
+    ][0]
+
+    tokens = shlex.split(command)
+    assert tokens[2] == env["HERDR_ENG_BIN"], command
+    assert tokens[5] == env["HERDR_ENG_BIN"], command
+    assert tokens[6:8] == ["-m", "herd r.cli"], command
+    assert "my bin" not in command.replace(shlex.quote(env["HERDR_ENG_BIN"]), ""), command
+
+    # Malformed override, on a machine that has not been installed yet (the first install is
+    # idempotent, so its own command would legitimately still be there): install succeeds and
+    # the command stays a plain, runnable one instead of carrying junk through.
+    second = host["tmp"] / "home2"
+    (second / ".claude").mkdir(parents=True)
+    bad = dict(host["env"])
+    bad["HOME"] = str(second)
+    bad["USERPROFILE"] = str(second)
+    bad["XDG_CONFIG_HOME"] = str(second / ".config")
+    bad["HERDR_ENG_BIN"] = str(host["work"] / "herdr-eng")
+    bad["HERDR_ENG_ARGS"] = "{not json"
+    assert _cli(["handoff", "autopilot", "install"], bad, host["work"]).returncode == 0
+    rebuilt = json.loads((second / ".claude" / "settings.json").read_text())
+    again = [
+        hook["command"]
+        for group in rebuilt["hooks"]["Stop"]
+        for hook in group["hooks"]
+        if ha.HOOK_MARKER in hook["command"]
+    ][0]
+    assert shlex.split(again)[5:8] == [str(host["work"] / "herdr-eng"), "handoff", "autopilot"], (
+        again
+    )
