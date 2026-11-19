@@ -11,13 +11,14 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from herdr_engineering.handoff_adapters.base import Harness, SessionRef
 from herdr_engineering.handoff_controller.briefing import (
+    fallback_supported,
     headless_argv,
     headless_runner,
     run_model,
@@ -181,7 +182,7 @@ def test_fallback_fills_the_goal_only_when_missing_and_reads_fenced_json(
 
 def test_fallback_input_includes_git_status_and_pr_list(handoff: HandoffCli, tmp_path: Path, repo: Path) -> None:
     prompt_out = tmp_path / "prompt.txt"
-    big = "x" * 5000 + "TRANSCRIPT-TAIL-MARKER\n"
+    big = "x" * 5000 + "\nTRANSCRIPT-TAIL-MARKER\n"
     ref = make_ref(tmp_path, repo, transcript=big)
     write_fallback_briefing(ref, repo, tmp_path / "store", script_runner("ok", prompt_out), handoff=handoff, gh=GH,
                             transcript_tail_bytes=100)
@@ -223,11 +224,28 @@ def test_fallback_runner_timeout_gives_none(handoff: HandoffCli, tmp_path: Path,
     assert not (root / "outbox").exists() or not list((root / "outbox").glob("handoff_*.json"))
 
 
-@pytest.mark.parametrize("harness", list(Harness))
-def test_headless_argv_never_starts_an_interactive_session(harness: Harness) -> None:
-    argv = headless_argv(harness)
-    assert argv[0] == harness.value
-    assert {Harness.CLAUDE: "-p", Harness.CODEX: "exec", Harness.PI: "-p", Harness.OPENCODE: "run"}[harness] in argv
+def test_headless_argv_per_harness() -> None:
+    assert headless_argv(Harness.CLAUDE) == [
+        "claude", "-p", "--output-format", "text", "--no-session-persistence", "--setting-sources", "",
+        "--strict-mcp-config", "--disable-slash-commands", "--tools", ""]
+    assert headless_argv(Harness.PI) == [
+        "pi", "-p", "--no-session", "--no-tools", "--no-extensions", "--no-mcp", "--no-skills",
+        "--no-prompt-templates", "--no-context-files"]
+
+
+@pytest.mark.parametrize("harness", [Harness.CODEX, Harness.OPENCODE])
+def test_harness_without_a_proven_tool_off_switch_is_unsupported(harness: Harness, tmp_path: Path) -> None:
+    assert not fallback_supported(harness) and headless_argv(harness) is None
+    assert headless_runner(harness, "p", cwd=tmp_path, timeout_s=5) is None
+
+
+def test_unsupported_harness_writes_nothing_and_starts_no_process(
+        handoff: HandoffCli, tmp_path: Path, repo: Path) -> None:
+    prompt_out = tmp_path / "prompt.txt"
+    ref = SessionRef(Harness.CODEX, "p-1", repo, "s", None)
+    assert write_fallback_briefing(ref, repo, tmp_path / "store", script_runner("ok", prompt_out), handoff=handoff,
+                                   gh=GH) is None
+    assert not prompt_out.exists() and not (tmp_path / "store").exists()
 
 
 def _bin_with(tmp_path: Path, name: str, body: str) -> dict[str, str]:
@@ -247,7 +265,7 @@ def test_headless_runner_passes_the_prompt_on_stdin(tmp_path: Path) -> None:
 def test_headless_runner_missing_binary_gives_none(tmp_path: Path) -> None:
     empty = tmp_path / "empty"
     empty.mkdir()
-    assert headless_runner(Harness.CODEX, "p", cwd=tmp_path, timeout_s=5, env={"PATH": str(empty)}) is None
+    assert headless_runner(Harness.CLAUDE, "p", cwd=tmp_path, timeout_s=5, env={"PATH": str(empty)}) is None
 
 
 def test_headless_runner_timeout_gives_none(tmp_path: Path) -> None:
@@ -258,5 +276,112 @@ def test_headless_runner_timeout_gives_none(tmp_path: Path) -> None:
 
 
 def test_headless_runner_nonzero_exit_gives_none(tmp_path: Path) -> None:
-    env = _bin_with(tmp_path, "opencode", "echo partial; exit 3")
-    assert headless_runner(Harness.OPENCODE, "p", cwd=tmp_path, timeout_s=5, env=env) is None
+    env = _bin_with(tmp_path, "pi", "echo partial; exit 3")
+    assert headless_runner(Harness.PI, "p", cwd=tmp_path, timeout_s=5, env=env) is None
+
+
+def test_headless_runner_does_not_inherit_the_sessions_identity(tmp_path: Path) -> None:
+    env = _bin_with(tmp_path, "claude", "/usr/bin/env")
+    env.update({"HERDR_PANE_ID": "p-1", "HERDR_SOCKET_PATH": "s", "HERDR_HANDOFF_STORE": "x",
+                "CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_SESSION_ID": "s",
+                "CLAUDE_SESSION_ID": "s", "CODEX_THREAD_ID": "t", "CODEX_SANDBOX": "seatbelt",
+                "PI_CODING_AGENT": "true", "OPENCODE": "1", "OPENCODE_PID": "9", "OPENCODE_SESSION_ID": "s",
+                "ANTHROPIC_API_KEY": "keep-me", "HOME": "/home/keep"})
+    seen = dict(line.split("=", 1) for line in (headless_runner(
+        Harness.CLAUDE, "p", cwd=tmp_path, timeout_s=10, env=env) or "").splitlines() if "=" in line)
+    assert seen, "the stand-in model call printed nothing"
+    stripped = [k for k in seen if k.startswith("HERDR_")] + [k for k in seen if k in (
+        "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID",
+        "CODEX_SANDBOX", "PI_CODING_AGENT", "OPENCODE", "OPENCODE_PID", "OPENCODE_SESSION_ID")]
+    assert stripped == []
+    assert seen["ANTHROPIC_API_KEY"] == "keep-me" and seen["HOME"] == "/home/keep"
+
+
+def test_fallback_model_runs_in_a_fresh_empty_directory_removed_afterwards(
+        handoff: HandoffCli, tmp_path: Path, repo: Path) -> None:
+    root = tmp_path / "store"
+    seen: list[tuple[Path, list[str]]] = []
+
+    def runner(harness: Harness, prompt: str, *, cwd: Path, timeout_s: float) -> str | None:
+        seen.append((cwd, [p.name for p in cwd.iterdir()]))
+        return None
+    assert write_fallback_briefing(make_ref(tmp_path, repo), repo, root, runner, handoff=handoff, gh=GH) is None
+    cwd, listing = seen[0]
+    assert cwd.parent == root / "fallback-work" and cwd != repo and listing == []
+    assert not cwd.exists()
+
+
+def test_a_raising_runner_gives_none_and_still_removes_the_directory(
+        handoff: HandoffCli, tmp_path: Path, repo: Path) -> None:
+    root = tmp_path / "store"
+
+    def runner(harness: Harness, prompt: str, *, cwd: Path, timeout_s: float) -> str | None:
+        raise RuntimeError("boom")
+    assert write_fallback_briefing(make_ref(tmp_path, repo), repo, root, runner, handoff=handoff, gh=GH) is None
+    assert list((root / "fallback-work").iterdir()) == []
+
+
+def test_goal_starting_with_dashes_is_not_read_as_a_flag(handoff: HandoffCli, tmp_path: Path, repo: Path) -> None:
+    root = tmp_path / "store"
+
+    def runner(harness: Harness, prompt: str, *, cwd: Path, timeout_s: float) -> str | None:
+        return json.dumps({"goal": "--remaining=oops", "resume_point": "-x"})
+    found = write_fallback_briefing(make_ref(tmp_path, repo), repo, root, runner, handoff=handoff, gh=GH)
+    assert found is not None
+    assert json.loads((root / "outbox" / f"{found}.json").read_text())["context"]["goal"] == "--remaining=oops"
+
+
+def test_timeout_bounds_the_whole_call(handoff: HandoffCli, tmp_path: Path, repo: Path) -> None:
+    started = time.monotonic()
+    assert write_fallback_briefing(make_ref(tmp_path, repo), repo, tmp_path / "store",
+                                   script_runner("sleep", tmp_path / "p.txt"), handoff=handoff, gh=GH,
+                                   timeout_s=1.5) is None
+    assert time.monotonic() - started < 3.5
+
+
+def test_transcript_that_is_not_a_regular_file_is_not_read(handoff: HandoffCli, tmp_path: Path, repo: Path) -> None:
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    link = tmp_path / "link.jsonl"
+    link.symlink_to(fifo)
+    prompt_out = tmp_path / "prompt.txt"
+    ref = SessionRef(Harness.CLAUDE, "p-1", repo, "s", link)
+    started = time.monotonic()
+    assert write_fallback_briefing(ref, repo, tmp_path / "store", script_runner("ok", prompt_out), handoff=handoff,
+                                   gh=GH) is not None
+    assert time.monotonic() - started < 20
+    assert "transcript: not available" in prompt_out.read_text()
+
+
+def test_git_and_gh_stderr_text_stays_out_of_the_prompt(handoff: HandoffCli, tmp_path: Path) -> None:
+    prompt_out = tmp_path / "prompt.txt"
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    ref = SessionRef(Harness.CLAUDE, "p-1", not_a_repo, "s", None)
+    write_fallback_briefing(ref, not_a_repo, tmp_path / "store", script_runner("ok", prompt_out), handoff=handoff,
+                            gh=(sys.executable, str(FIXTURES / "gh_pr_list.py"), "bad"))
+    prompt = prompt_out.read_text()
+    assert "git status --short: not available (git failed, exit" in prompt
+    assert "not a git repository" not in prompt and "unsupported" not in prompt
+
+
+def test_the_fallback_flag_is_used_when_the_cli_offers_it(handoff: HandoffCli, tmp_path: Path, repo: Path) -> None:
+    if "--fallback" not in handoff.run(["create", "--help"], timeout_s=30).stdout:
+        pytest.skip("herdr-handoff create has no --fallback yet; the record rewrite is covered by the marked-fallback test")
+    root = tmp_path / "store"
+    found = write_fallback_briefing(make_ref(tmp_path, repo), repo, root,
+                                    script_runner("ok", tmp_path / "p.txt"), handoff=handoff, gh=GH)
+    assert found is not None
+    assert json.loads((root / "outbox" / f"{found}.json").read_text())["provenance"]["fallback"] is True
+
+
+def test_naive_since_is_rejected_and_a_non_utc_offset_is_honoured(handoff: HandoffCli, tmp_path: Path) -> None:
+    root = tmp_path / "store"
+    found = create_record(handoff, root, "p-1")
+    naive = (datetime.now(UTC) - timedelta(hours=1)).replace(tzinfo=None).isoformat()
+    assert wait_for_briefing(root, naive, "p-1", 0.2, poll_s=0.05) is None  # no zone: ambiguous, never guessed
+    plus2 = timezone(timedelta(hours=2))
+    assert wait_for_briefing(root, (datetime.now(plus2) - timedelta(hours=1)).isoformat(), "p-1", 0.2,
+                             poll_s=0.05) == found
+    assert wait_for_briefing(root, (datetime.now(plus2) + timedelta(hours=1)).isoformat(), "p-1", 0.2,
+                             poll_s=0.05) is None
