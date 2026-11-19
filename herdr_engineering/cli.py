@@ -12,6 +12,7 @@ import contextlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -535,7 +536,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--json", action="store_true")
     mode = p2.add_mutually_exclusive_group()
     mode.add_argument("--status", action="store_true", help='print {"known": bool, "live": int} instead of the entries')
-    mode.add_argument("--wait", type=float, default=None, metavar="SECONDS",
+    mode.add_argument("--wait", type=_wait_seconds, default=None, metavar="SECONDS",
                       help="wait until no subagent is live: exit 0 when idle, 3 on timeout")
     mode.add_argument("--purge", action="store_true", help="delete the pane's registry entries (pane closed)")
     p2.set_defaults(func=_cmd_handoff_subagents, subagents_parser=p2)
@@ -1648,6 +1649,16 @@ def _cmd_handoff_subagent_hook(args) -> int:
     return run_subagent_hook(args.phase)
 
 
+def _wait_seconds(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"must be a finite number of seconds >= 0, got {text!r}")
+    return value
+
+
 def _cmd_handoff_subagents(args) -> int:
     from . import handoff_subagent_registry as registry
     if not (args.status or args.wait is not None or args.purge):
@@ -1662,8 +1673,12 @@ def _cmd_handoff_subagents(args) -> int:
         else:
             print(removed)
         return 0
-    idle = True if args.wait is None else registry.wait_until_idle(pane, os.environ, args.wait)
-    state = registry.status(pane, os.environ)
+    if args.wait is None:
+        state = registry.status(pane, os.environ)
+        idle = True
+    else:
+        state = registry._wait_status(pane, os.environ, args.wait)
+        idle = state.live == 0
     if args.json:
         _print_json({"known": state.known, "live": state.live})
     else:

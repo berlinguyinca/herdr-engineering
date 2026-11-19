@@ -230,3 +230,84 @@ def test_without_pane_id_record_is_a_noop_and_status_unknown(state_env) -> None:
     assert list(TEST_ROOT.iterdir()) == []
     assert reg.status("%7", env) == reg.SubagentStatus(known=False, live=0)
     assert reg.status("", env) == reg.SubagentStatus(known=False, live=0)
+
+
+# --- status never raises; wait reports the last status seen; argparse validation -----------------------------------
+
+def _unreadable(directory: Path):
+    class _Guard:
+        def __enter__(self) -> None:
+            directory.chmod(0o000)
+
+        def __exit__(self, *exc: object) -> None:
+            directory.chmod(0o700)
+
+    return _Guard()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_status_unreadable_pane_dir_is_unknown_not_an_error(state_env) -> None:
+    reg.record("start", _payload("a1"), state_env)
+    with _unreadable(reg._pane_dir(state_env, "%7")):
+        assert reg.status("%7", state_env) == reg.SubagentStatus(known=False, live=0)
+
+
+def test_live_entries_on_a_vanished_directory_is_the_error_status_absorbs(state_env) -> None:
+    reg.record("start", _payload("a1"), state_env)
+    directory = reg._pane_dir(state_env, "%7")
+    shutil.rmtree(directory)
+    assert reg.status("%7", state_env) == reg.SubagentStatus(known=False, live=0)
+
+
+def test_wait_until_idle_survives_the_pane_dir_vanishing_mid_wait(state_env) -> None:
+    reg.record("start", _payload("a1"), state_env)
+    timer = threading.Timer(0.2, shutil.rmtree, args=(reg._pane_dir(state_env, "%7"),))
+    timer.start()
+    try:
+        assert reg.wait_until_idle("%7", state_env, timeout_s=5, poll_s=0.02) is True
+    finally:
+        timer.join()
+
+
+def test_wait_status_returns_the_last_status_seen_on_timeout(state_env) -> None:
+    reg.record("start", _payload("a1"), state_env)
+    assert reg._wait_status("%7", state_env, timeout_s=0.2, poll_s=0.05) == reg.SubagentStatus(known=True, live=1)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_purge_returns_zero_when_the_directory_could_not_be_removed(state_env) -> None:
+    reg.record("start", _payload("a1"), state_env)
+    directory = reg._pane_dir(state_env, "%7")
+    directory.chmod(0o500)
+    try:
+        assert reg.purge_pane("%7", state_env) == 0
+        assert directory.is_dir()
+    finally:
+        directory.chmod(0o700)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_cli_status_with_an_unreadable_state_dir_prints_unknown_and_exits_zero(tmp_path: Path) -> None:
+    hook(tmp_path, "start", "a1")
+    pane_dir = tmp_path / "state" / "subagents" / "_1"
+    with _unreadable(pane_dir):
+        p = cli(tmp_path, "subagents", "--status", "--json")
+        q = cli(tmp_path, "subagents", "--purge", "--json")
+    assert p.returncode == 0 and json.loads(p.stdout) == {"known": False, "live": 0} and "Traceback" not in p.stderr
+    assert q.returncode == 0 and "Traceback" not in q.stderr
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-1"])
+def test_cli_wait_rejects_non_finite_and_negative(tmp_path: Path, value: str) -> None:
+    p = cli(tmp_path, "subagents", "--wait", value)
+    assert p.returncode == 2 and "--wait" in p.stderr
+
+
+def test_cli_plain_status_and_wait_output(tmp_path: Path) -> None:
+    hook(tmp_path, "start", "a1")
+    assert cli(tmp_path, "subagents", "--status").stdout == "known=true live=1\n"
+    timed_out = cli(tmp_path, "subagents", "--wait", "0.2")
+    assert timed_out.returncode == 3 and timed_out.stdout == "known=true live=1\n"
+    hook(tmp_path, "stop", "a1")
+    idle = cli(tmp_path, "subagents", "--wait", "0.2")
+    assert idle.returncode == 0 and idle.stdout == "known=true live=0\n"
