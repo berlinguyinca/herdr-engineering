@@ -185,11 +185,22 @@ def test_the_cardinality_test_is_slow_with_an_explicit_timeout_and_runs_only_in_
     fast, slow = collected(markexpr("HERDR_PYTEST_FAST_MARKEXPR")), collected(markexpr("HERDR_PYTEST_SLOW_MARKEXPR"))
     assert any(name in t for t in slow) and not any(name in t for t in fast)
     assert fast and not (fast & slow)
-    everything = collected("not e2e and not integration")   # pyproject's own default expression
+    everything = collected("not e2e and not integration and not herdr_live")   # pyproject's own default expression
     assert fast | slow == everything                         # coverage is identical
     source = (ROOT / "tests" / "control_plane" / "test_postgres_recovery.py").read_text()
     assert re.search(r"@pytest\.mark\.slow\s+@pytest\.mark\.timeout\((\d+)\)\s+def " + name, source)
     assert int(re.search(r"mark\.timeout\((\d+)\)", source).group(1)) > 900
+
+
+def test_neither_ci_expression_collects_the_herdr_live_tests() -> None:
+    """`-m` replaces pyproject's addopts expression, so each CI expression must itself exclude the live tests."""
+    live = "tests/e2e/test_handoff_adapters_live.py"
+    for name in ("HERDR_PYTEST_FAST_MARKEXPR", "HERDR_PYTEST_SLOW_MARKEXPR"):
+        done = subprocess.run(
+            [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", "-m", markexpr(name), live],
+            capture_output=True, text=True, cwd=ROOT,
+        )
+        assert done.returncode == 5, f"{name} collected live tests:\n{done.stdout}"  # 5 = nothing collected
 
 
 def test_a_real_run_deselects_slow_tests_from_the_parallel_pass_and_runs_them_in_the_tail(tmp_path: Path) -> None:

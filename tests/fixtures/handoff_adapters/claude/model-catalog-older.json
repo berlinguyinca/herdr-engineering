@@ -1,0 +1,25 @@
+{
+ "version": 2,
+ "fetchedAt": 1795032757908,
+ "staleAt": 1795036357908,
+ "catalog": {
+  "surface": "redacted",
+  "config": {
+   "id": "redacted",
+   "models": [
+    {
+     "id": "claude-opus-4-8",
+     "runtime": {
+      "max_input_tokens": 500000
+     }
+    },
+    {
+     "id": "claude-mythos-5-1",
+     "runtime": {
+      "max_input_tokens": 500000
+     }
+    }
+   ]
+  }
+ }
+}
