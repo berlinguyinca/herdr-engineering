@@ -81,7 +81,7 @@ def _run_takeover(tmp_path: Path, handoff: HandoffCli) -> HandoffEvent:
     return takeovermod.run_takeover(
         ref, ClaudeAdapter(home=tmp_path / "home"), "handoff_" + "a" * 32, CFG, EventLog(tmp_path / "store"), handoff,
         HerdrCli("/nonexistent/herdr"), store_root=tmp_path / "store", worktree=tmp_path, push_allowed=False, env={},
-        retry_delay_s=0.0, compact_ready_timeout_s=0.1, sleep=lambda _s: None)
+        retry_delay_s=0.0, compact_ready_timeout_s=0.1, sleep=lambda _s: None, ready=lambda: True)
 
 
 # --- I1 -------------------------------------------------------------------------------------------------------------

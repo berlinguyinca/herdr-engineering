@@ -54,7 +54,7 @@ from tests.test_handoff_controller_briefing import _cli_prefix
 
 ADAPTER = adapter_for(Harness.CLAUDE)
 herdr_server = pytest.mark.herdr_server
-FAST = {"confirm_timeout_s": 15.0, "retry_delay_s": 0.0, "poll_s": 0.1, "compact_ready_timeout_s": 10.0,
+FAST = {"ready": lambda: True, "confirm_timeout_s": 15.0, "retry_delay_s": 0.0, "poll_s": 0.1, "compact_ready_timeout_s": 10.0,
         "compact_work_start_s": 5.0, "compact_work_end_s": 15.0}
 CHILD_ID = "handoff_" + "a" * 32
 
@@ -300,7 +300,7 @@ def test_success_emits_succeeded_and_closes_source_after_exit(server: IsolatedHe
                         store_root=store, worktree=work, push_allowed=True, env=server.env, **FAST)
     assert (done.event, done.colour) == ("handoff.succeeded", Colour.GREEN), done
     assert done.handoff_id == handoff_id and done.successor_id is None  # no successor handoff record was made
-    assert [e.event for e in log.read()] == ["handoff.takeover_started", "handoff.succeeded"]
+    assert [e.event for e in log.read()] == ["handoff.takeover_started"] * 2 + ["handoff.succeeded"]  # the chain's, then one attempt
     assert log.read()[-1] == done
     assert submitted(server)[0] == "/exit"  # herdr-handoff typed the exit plan into the source; the controller did not
     left = panes(server)
@@ -325,7 +325,7 @@ def test_refusal_keeps_source_and_retries_then_compacts(server: IsolatedHerdr, h
                         **{**FAST, "confirm_timeout_s": 0.5})
     assert (done.event, done.colour) == ("handoff.failed_compacted", Colour.ORANGE), done.reason
     assert done.reason and done.reason.startswith("launch_unconfirmed"), done.reason
-    assert [e.event for e in log.read()] == ["handoff.takeover_started", "handoff.takeover_started", "handoff.failed_compacted"]  # the second one marks the compaction
+    assert [e.event for e in log.read()] == ["handoff.takeover_started"] * 4 + ["handoff.failed_compacted"]  # the chain's, two attempts, the compaction marker
     document = handoff.document(store, handoff_id)
     assert document is not None and document.is_file()
     assert submitted(server)[:2] == ["/compact", pointer_text(document)]
@@ -461,7 +461,7 @@ def test_no_way_forward_is_red_with_reason(server: IsolatedHerdr, handoff: Hando
     assert (done.event, done.colour) == ("handoff.stuck", Colour.RED), done
     assert done.reason and done.reason.startswith("takeover_refused_and_compaction_failed: compaction_not_ready")
     assert "last takeover result: launch_unconfirmed" in done.reason
-    assert [e.event for e in log.read()] == ["handoff.takeover_started", "handoff.takeover_started", "handoff.stuck"]  # the second one marks the compaction
+    assert [e.event for e in log.read()] == ["handoff.takeover_started"] * 4 + ["handoff.stuck"]  # the chain's, two attempts, the compaction marker
     assert source in panes(server) and submitted(server) == []  # nothing typed, nothing closed
     assert done.successor_pane_id in panes(server) and not source_is_handed_off(log.read())
 
@@ -509,7 +509,7 @@ def test_attempts_exhausted_by_failures_end_red_without_compacting(script: str, 
     log = EventLog(tmp_path / "store")
     done = run_takeover(ref, ShortExit(0.2), CHILD_ID, ControllerConfig(max_attempts=2), log, broken, HerdrCli(),  # type: ignore[arg-type]
                         store_root=tmp_path / "store", worktree=tmp_path, push_allowed=True, env={}, confirm_timeout_s=0.1,
-                        call_margin_s=0.5, retry_delay_s=0.0, poll_s=0.1)
+                        call_margin_s=0.5, retry_delay_s=0.0, poll_s=0.1, ready=lambda: True)
     assert (done.event, done.colour) == ("handoff.stuck", Colour.RED), done
     assert done.reason and done.reason.startswith("no_briefing") and expected in done.reason, done.reason
-    assert [e.event for e in log.read()] == ["handoff.takeover_started", "handoff.stuck"]
+    assert [e.event for e in log.read()] == ["handoff.takeover_started"] * 3 + ["handoff.stuck"]  # the chain's, then one per attempt

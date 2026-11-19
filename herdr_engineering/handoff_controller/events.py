@@ -44,6 +44,7 @@ class StuckReason(StrEnum):
     MERGE_IN_PROGRESS = "merge_in_progress"  # the worktree is mid-merge and a push is allowed: nothing is committed or pushed
     PANE_GONE = "pane_gone"  # the pane closed (or holds another session) for `pane_gone_after_s` while the chain was open
     COMPACTION_STATE_UNKNOWN = "compaction_state_unknown"  # a restart found a compaction that may be running: never typed twice
+    NO_LONGER_MANAGED = "no_longer_managed"  # the pane is still listed but the switch went off, or it became a side pane, mid-chain
     INTERNAL_ERROR = "internal_error"  # finishing the chain raised three times in a row; `internal_error:<exception type>`
 
 
@@ -65,6 +66,8 @@ TERMINAL = {
     "handoff.failed_compacted": Colour.ORANGE,
     "handoff.stuck": Colour.RED,
 }
+ATTEMPT = "attempt"  # the `reason` of a `handoff.takeover_started` written before each call to herdr-handoff: attempts are counted per chain
+NOTHING_STAGEABLE = "nothing_stageable"  # the `reason` of a `handoff.wip_committed` for tracked changes that cannot be staged
 COMPACTING = "compacting"  # the `reason` of the second `handoff.takeover_started`: the attempts are over, compaction begins
 OVER_CEILING = "over_ceiling"  # the `reason` of the triggered / fallback-briefing event of a last-resort chain
 _REQUIRED_KEYS = frozenset({"event", "at", "chain_id", "pane_id", "harness"})  # every other key reads as None when absent
@@ -215,6 +218,8 @@ class Chain:
     phase: Phase = Phase.DRAINING
     triggered_wall: float = 0.0  # `triggered_at` as the log has it, before any credit mapping (the store's clock)
     compacting: bool = False  # the takeover attempts are over and compaction began: a restart must not replay them
+    attempts: int = 0  # calls to herdr-handoff takeover made so far for this chain
+    unstageable: bool = False  # the checkpoint found tracked changes it cannot stage (a dirty submodule): take over regardless
 
 
 def epoch(iso: str) -> float:
@@ -266,7 +271,9 @@ def _chain_of(mine: Sequence[HandoffEvent]) -> Chain:
                  "handoff.takeover_started" in names, epoch(mine[-1].at), over, epoch(written) if written else None,
                  (waited.reason or "", waited.subagents_live) if waited else None, phase,
                  epoch(next(e.at for e in mine if e.event == "handoff.triggered")),
-                 any(e.event == "handoff.takeover_started" and e.reason == COMPACTING for e in mine))
+                 any(e.event == "handoff.takeover_started" and e.reason == COMPACTING for e in mine),
+                 sum(e.event == "handoff.takeover_started" and e.reason == ATTEMPT for e in mine),
+                 any(e.event == "handoff.wip_committed" and e.reason == NOTHING_STAGEABLE for e in mine))
 
 
 def open_chain(events: Sequence[HandoffEvent]) -> Chain | None:
