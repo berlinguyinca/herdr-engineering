@@ -1668,7 +1668,7 @@ def _cmd_handoff_auto_switch(args) -> int:
 def _cmd_handoff_controller(args) -> int:
     from .handoff_controller import run as controller
     if args.controller_action == "status":
-        ctl = controller.build_controller(os.environ)
+        ctl = controller.build_controller(os.environ, require_binaries=False)
         print("\n".join(controller.status_lines(ctl.state_dir, ctl.log)))
         return 0
     return controller.serve(interval_s=args.interval, once=args.once)
