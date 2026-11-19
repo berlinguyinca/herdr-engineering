@@ -187,3 +187,51 @@ def test_sync_settings_default_and_override():
     from herdr_engineering.config import github_sync
     assert github_sync(None) == {"interval": 300, "full_reconcile_interval": 86400, "point_budget": 400}
     assert github_sync({"point_budget": 50})["point_budget"] == 50
+
+
+_REPO_HANDOFF = """
+    version: 1
+    handoff_autopilot:
+      context_percent: 0.1
+      enabled: false
+      context_window_tokens: 1000
+"""
+
+
+def test_repo_local_handoff_autopilot_is_ignored(tmp_path, monkeypatch):
+    from herdr_engineering.config import declared_keys
+
+    repo = tmp_path / "repo"
+    _write(repo / "config/herdr-engineering.yaml", _REPO_HANDOFF)
+    _write(repo / "herdr-engineering.yaml", _REPO_HANDOFF)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("HERDR_ENGINEERING_CONFIG", raising=False)
+    assert load_config()["handoff_autopilot"] == DEFAULTS["handoff_autopilot"]
+    assert declared_keys("handoff_autopilot") == set()
+
+
+def test_trusted_handoff_autopilot_is_honoured_despite_repo(tmp_path, monkeypatch):
+    from herdr_engineering.config import declared_keys
+
+    home = tmp_path / "home"
+    _write(home / ".config/herdr-engineering/config.yaml", """
+        version: 1
+        handoff_autopilot:
+          context_percent: 55
+    """)
+    env_cfg = _write(tmp_path / "explicit.yaml", """
+        version: 1
+        handoff_autopilot:
+          context_window_tokens: 123456
+    """)
+    repo = tmp_path / "repo"
+    _write(repo / "herdr-engineering.yaml", _REPO_HANDOFF)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("HERDR_ENGINEERING_CONFIG", str(env_cfg))
+    block = load_config()["handoff_autopilot"]
+    assert block["context_percent"] == 55
+    assert block["context_window_tokens"] == 123456
+    assert block["enabled"] == DEFAULTS["handoff_autopilot"]["enabled"]
+    assert declared_keys("handoff_autopilot") == {"context_percent", "context_window_tokens"}

@@ -17,6 +17,8 @@
 # pass (exit 124) only after HERDR_PYTEST_HANG_SECONDS (default 1800) with no output AND no CPU use anywhere in the pass. A slow but
 # live run is never killed; a wedged one (pipeline 1362 sat ~8 h with no result) fails with a clear message. There is no flat cap.
 #
+# If the xdist machinery itself breaks (workers die, pytest exit 3) the parallel pass is rerun once on HERDR_PYTEST_RERUN_WORKERS workers
+# (default 2, 0 = serial); a real test failure or a hang is never rerun. `auto` also shrinks on a loaded host (HERDR_LOADAVG_FILE).
 # Tests marked `slow` are deselected from the parallel pass and run serially in a tail pass (see pytest-parallel.sh).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -28,6 +30,7 @@ need python3; need node; need git; need flock
 . scripts/ci/ensure-fd-limit.sh; herdr_ensure_fd_limit || exit 1
 . scripts/ci/host-facts.sh; ci_host_facts || true
 . scripts/ci/pytest-parallel.sh
+. scripts/ci/pytest-rerun.sh
 herdr_pytest_parallel_load || exit 1     # a bad override fails loudly instead of silently running serial
 
 # --- dependency cache ----------------------------------------------------------------
@@ -55,7 +58,7 @@ echo "== pytest =="
 export HERDR_SKIP_DOCKER=1
 echo "pytest arguments: ${PYTEST_PARALLEL[*]:-(serial)}"
 watched() { python3 scripts/ci/run-watched.py "${HERDR_PYTEST_SOFT_SECONDS:-3600}" "${HERDR_PYTEST_HANG_SECONDS:-1800}" -- "$@"; }
-watched python -m pytest -q -m "$HERDR_PYTEST_FAST_MARKEXPR" ${PYTEST_PARALLEL[@]+"${PYTEST_PARALLEL[@]}"}
+herdr_pytest_run_fast watched "$HERDR_PYTEST_FAST_MARKEXPR"   # reruns once, on fewer workers, if xdist itself broke (scripts/ci/pytest-rerun.sh)
 echo "== pytest (slow tests, serial tail) =="
 # Tail pass: pytest-timeout (3600 s on the slow test) must be able to fire and NAME a hung test before the watchdog kills the pass,
 # so the no-progress limit here is above it (4200 s). Exit 5 (no slow tests collected) fails the gate on purpose: the slow tests

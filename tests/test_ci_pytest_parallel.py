@@ -28,6 +28,14 @@ GATE = (ROOT / "scripts" / "ci" / "unit-gates.sh").read_text()
 PYPROJECT = ROOT / "pyproject.toml"
 
 
+@pytest.fixture(autouse=True)
+def calm_host(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worker-count tests must not depend on how busy the machine running them is: point the load average at a calm file."""
+    calm = tmp_path_factory.mktemp("loadavg") / "loadavg"
+    calm.write_text("0.00 0.00 0.00 1/100 1\n")
+    monkeypatch.setenv("HERDR_LOADAVG_FILE", str(calm))
+
+
 def args_with(**env: str) -> list[str]:
     exports = "".join(f"export {k}={v}; " for k, v in env.items())
     done = subprocess.run(
@@ -215,7 +223,7 @@ def test_the_gate_runs_the_parallel_pass_then_a_serial_tail_both_under_the_watch
     assert GATE.index('"$HERDR_PYTEST_FAST_MARKEXPR"') < GATE.index('"$HERDR_PYTEST_SLOW_MARKEXPR"')
     fast_line = next(line for line in GATE.splitlines() if "HERDR_PYTEST_FAST_MARKEXPR" in line and "pytest" in line)
     slow_line = next(line for line in GATE.splitlines() if "HERDR_PYTEST_SLOW_MARKEXPR" in line and "pytest" in line)
-    assert fast_line.startswith("watched ") and "PYTEST_PARALLEL" in fast_line
+    assert fast_line.startswith("herdr_pytest_run_fast watched ")   # the helper adds PYTEST_PARALLEL and the one-shot rerun (test_ci_pytest_rerun.py)
     assert " watched python" in slow_line and "PYTEST_PARALLEL" not in slow_line
     assert "timeout" not in fast_line + slow_line           # no guessed flat cap on the run
 
@@ -772,3 +780,41 @@ def test_a_flooding_tree_cannot_hold_off_the_sigkill_after_the_grace(tmp_path: P
     began = time.monotonic()
     done = watch("1", "1", flood)
     assert done.returncode == 124 and time.monotonic() - began < 20, "the drain loop starved the SIGKILL"
+
+
+# --- a loaded host gets fewer workers (pipeline 1710: load 155 on 4 CPUs, two workers died) ------------------------------------------
+
+def loadavg(tmp_path: Path, one_minute: float) -> dict[str, str]:
+    f = tmp_path / "loadavg"
+    f.write_text(f"{one_minute:.2f} {one_minute:.2f} {one_minute:.2f} 3/900 12345\n")
+    return {"HERDR_LOADAVG_FILE": str(f)}
+
+
+def test_a_heavily_loaded_host_gets_one_worker_not_eight(tmp_path: Path) -> None:
+    assert args_with(**loadavg(tmp_path, 155.0))[:2] == ["-n", "1"]
+
+
+def test_a_calm_host_keeps_auto(tmp_path: Path) -> None:
+    assert args_with(**loadavg(tmp_path, 0.0))[:2] == ["-n", "auto"]
+
+
+@needs_two_cpus
+def test_workers_are_the_cpus_the_load_leaves_free(tmp_path: Path) -> None:
+    free = min(VISIBLE, CAP) - 1                      # leave `free` CPUs idle: that many workers, below the cap
+    assert args_with(**loadavg(tmp_path, float(VISIBLE - free)))[:2] == ["-n", str(free)]
+
+
+def test_an_explicit_worker_count_wins_over_the_load(tmp_path: Path) -> None:
+    assert args_with(HERDR_PYTEST_WORKERS="6", **loadavg(tmp_path, 155.0))[:2] == ["-n", "6"]
+
+
+def test_a_missing_or_unreadable_loadavg_means_no_load_bound(tmp_path: Path) -> None:
+    assert args_with(HERDR_LOADAVG_FILE=str(tmp_path / "nope"))[:2] == ["-n", "auto"]
+    (tmp_path / "junk").write_text("not a load\n")
+    assert args_with(HERDR_LOADAVG_FILE=str(tmp_path / "junk"))[:2] == ["-n", "auto"]
+
+
+def test_host_facts_prints_the_same_load_file_the_worker_bound_reads(tmp_path: Path) -> None:
+    done = subprocess.run(["bash", "-c", f'. "{ROOT}/scripts/ci/host-facts.sh"; ci_host_facts'], capture_output=True, text=True, cwd=ROOT,
+                          env={**os.environ, **loadavg(tmp_path, 7.25)})
+    assert "loadavg: 7.25 7.25 7.25" in done.stdout, done.stdout
