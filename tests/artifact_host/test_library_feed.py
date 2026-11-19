@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import asyncpg
 import pytest
@@ -16,7 +16,7 @@ from herdr_artifact_host.library import (
     LibraryStore,
     Source,
 )
-from tests.artifact_host.library_support import NOW, Who, artifact, feed, grant, run, share, who  # noqa: F401  (fixture)
+from tests.artifact_host.library_support import Who, artifact, feed, grant, run, share, who  # noqa: F401  (fixture)
 
 EVERYTHING = frozenset({Source.MINE, Source.ASSIGNED, Source.OPENED})
 
@@ -119,7 +119,7 @@ def test_revoked_share_stays_as_revoked_row_with_snapshot_title(
 def test_expired_share_status_expired_read_live(migrated_dsn: str, who: Who) -> None:
     async def body(store: LibraryStore, pool: asyncpg.Pool) -> None:
         a = await artifact(pool, who.you)
-        sid = await share(pool, a, who.you, audience="public", expires=NOW + timedelta(hours=1))
+        sid = await share(pool, a, who.you, audience="public", expires=datetime.now(UTC) + timedelta(hours=1))
         await store.record_claim(who.viewer, sid)
         assert (await feed(store, who.viewer)).items[0].status == ItemStatus.ACTIVE
         await pool.execute(
