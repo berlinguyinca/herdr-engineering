@@ -2,6 +2,7 @@
 import json
 import os
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -11,7 +12,9 @@ from herdr_engineering.handoff_adapters.base import ExitPlan, Harness, SessionRe
 from herdr_engineering.handoff_adapters.codex import (
     PROMPT_MARKER,
     CodexAdapter,
-    parse_ps_start,
+    _open_files,
+    parse_etime,
+    process_start,
     select_rollout,
 )
 
@@ -243,11 +246,41 @@ def test_two_candidates_in_one_cwd_mean_none_not_the_newest(tmp_path):
     assert select_rollout(Path("/work"), START, [], tmp_path) is None
 
 
-def test_a_rollout_started_before_the_process_is_ignored(tmp_path):
-    _rollout(tmp_path, "session_meta_before_start.jsonl", OTHER, mtime=START + 30)
+def test_a_resumed_session_with_an_old_start_but_a_fresh_write_is_chosen(tmp_path):
+    # `codex resume` appends to the old rollout: its session_meta start is old, its mtime is new
+    resumed = _rollout(tmp_path, "session_meta_resumed.jsonl", OTHER, mtime=START + 30)
+    assert select_rollout(Path("/work"), START, [], tmp_path) == resumed
+
+
+def test_a_rollout_last_written_before_the_process_started_is_ignored(tmp_path):
+    _rollout(tmp_path, "session_meta_work.jsonl", OTHER, mtime=START - 60)
     assert select_rollout(Path("/work"), START, [], tmp_path) is None
+
+
+def test_an_exec_rollout_in_the_same_cwd_is_ignored(tmp_path):
     wanted = _rollout(tmp_path, "session_meta_work.jsonl", SESSION)
+    _rollout(tmp_path, "session_meta_exec.jsonl", OTHER)
     assert select_rollout(Path("/work"), START, [], tmp_path) == wanted
+
+
+def test_an_exec_rollout_alone_is_none(tmp_path):
+    _rollout(tmp_path, "session_meta_exec.jsonl", OTHER)
+    assert select_rollout(Path("/work"), START, [], tmp_path) is None
+
+
+def test_the_cwd_is_compared_resolved(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    directory = tmp_path / ".codex" / "sessions" / "2026" / "11" / "19"
+    directory.mkdir(parents=True)
+    rollout = directory / f"rollout-2026-11-19T00-12-47-{SESSION}.jsonl"
+    meta = json.loads((FIXTURES / "session_meta_work.jsonl").read_text())
+    meta["payload"]["cwd"] = str(real)
+    rollout.write_text(json.dumps(meta) + "\n")
+    os.utime(rollout, (START + 30, START + 30))
+    assert select_rollout(tmp_path / "link", START, [], tmp_path) == rollout
+    assert select_rollout(Path(str(real) + "/"), START, [], tmp_path) == rollout
 
 
 def test_an_open_rollout_wins_over_two_cwd_candidates(tmp_path):
@@ -257,6 +290,26 @@ def test_an_open_rollout_wins_over_two_cwd_candidates(tmp_path):
     assert select_rollout(Path("/work"), START, [unrelated, held], tmp_path) == held
 
 
-def test_process_start_is_read_from_ps_lstart_text():
-    assert parse_ps_start("Wed Nov 18 16:12:47 2026") == time.mktime((2026, 11, 18, 16, 12, 47, 0, 0, -1))
-    assert parse_ps_start("garbage") is None
+@pytest.mark.parametrize("text,seconds", [("05:03", 303.0), ("01:05:03", 3903.0), (" 2-01:05:03 ", 176703.0), ("00:00", 0.0)])
+def test_elapsed_time_of_a_process_is_parsed(text, seconds):
+    assert parse_etime(text) == seconds
+
+
+@pytest.mark.parametrize("text", ["", "garbage", "Mi. 18 Nov. 16:20:39 2026", "1:2:3:4", "-5:00", "aa:bb"])
+def test_a_localised_or_malformed_time_is_not_a_time(text):
+    assert parse_etime(text) is None
+
+
+def test_the_start_of_this_process_is_found_under_a_non_english_locale():
+    env = {**os.environ, "LC_ALL": "de_DE.UTF-8", "LANG": "de_DE.UTF-8"}
+    started = process_start(os.getpid(), env)
+    assert started is not None
+    assert 0 <= time.time() - started < 365 * 86400
+    local = subprocess.run(["ps", "-o", "lstart=", "-p", str(os.getpid())], capture_output=True, text=True,
+                           env={**os.environ, "LC_ALL": "C", "LANG": "C"}).stdout.strip()
+    assert abs(started - time.mktime(time.strptime(local, "%a %b %d %H:%M:%S %Y"))) <= 2
+
+
+def test_open_files_are_optional(tmp_path):
+    assert _open_files(os.getpid(), {"PATH": str(tmp_path)}) == []  # no lsof on the path: none known, not an error
+    assert _open_files(2**22 + 12345, None) == []  # lsof fails for a pid that does not exist

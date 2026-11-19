@@ -105,9 +105,13 @@ def _start(harness: Harness, client: HerdrPaneClient, opened: list[str]) -> tupl
     opened.append(pane_id)
     adapter = adapter_for(harness)
 
+    replies: list[str] = []
+
     def start() -> bool:  # the pane's shell may still be starting
-        reply = _herdr("agent", "start", "probe", "--kind", harness.value, "--pane", pane_id, "--timeout", "60000")
-        return reply.get("error", {}).get("code") != "agent_pane_busy"
+        run = subprocess.run(["herdr", "agent", "start", "probe", "--kind", harness.value, "--pane", pane_id,
+                              "--timeout", "60000"], capture_output=True, text=True, timeout=120)
+        replies.append(f"exit {run.returncode}: {(run.stdout + run.stderr).strip()[:300]}")
+        return run.returncode == 0 and '"error"' not in run.stdout  # any failure retries, not only a busy pane
 
     _wait(start, 30.0, step_s=1.0)
 
@@ -121,7 +125,7 @@ def _start(harness: Harness, client: HerdrPaneClient, opened: list[str]) -> tupl
         return adapter.is_ready_for_input(_screen(client, pane_id), _status(pane_id))
 
     if not _wait(ready, _STARTUP_TIMEOUT_S, step_s=1.0):
-        pytest.fail(f"{harness.value} never showed an input-ready prompt:\n{strip_ansi(_screen(client, pane_id))[-1500:]}")
+        pytest.fail(f"{harness.value} never showed an input-ready prompt (last agent start reply: {replies[-1:]}):\n{strip_ansi(_screen(client, pane_id))[-1500:]}")
     return pane_id, adapter
 
 
