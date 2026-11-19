@@ -21,7 +21,7 @@ def _home(root: Path, catalog: str = "model-catalog.json") -> Path:
     shutil.copy(FIXTURES / "claude" / catalog, claude / "cache" / "model-catalog" / "org-x-cc.json")
     codex = home / ".codex" / "sessions" / "2026" / "11" / "13"
     codex.mkdir(parents=True)
-    shutil.copy(FIXTURES / "codex" / "main.jsonl", codex / "rollout-2026-11-13T13-45-32-01a1d6df-7c12-7671-bbf8-7c2d51d1a84b.jsonl")
+    shutil.copy(FIXTURES / "codex" / "main.jsonl", codex / "rollout-2026-11-13T13-45-32-00000000-0000-7000-8000-000000000001.jsonl")
     pi = home / ".pi" / "agent"
     (pi / "sessions" / "--work--").mkdir(parents=True)
     shutil.copy(FIXTURES / "pi" / "main.jsonl", pi / "sessions" / "--work--" / "2026-11-17T18-08-38-549Z_11111111-1111-7111-8111-111111111111.jsonl")

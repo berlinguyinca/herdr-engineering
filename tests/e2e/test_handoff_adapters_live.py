@@ -6,6 +6,10 @@ pane it opened (a pane that will not close fails the test). A harness that is no
 working directory is ``$HERDR_LIVE_CWD`` or the home directory; Claude Code and Codex ask to trust a folder they have
 not seen, so point it at one they already trust to run those two. The after-a-turn test submits exactly one trivial
 prompt per harness, in the pane the test opened; every other test types without submitting.
+
+A live run leaves one throwaway session record per harness in the user's real harness homes (``~/.claude``,
+``~/.codex``, ``~/.pi``, ``~/.local/share/opencode``), and it types into a harness dialog if one appears (only the
+update dialogs named below are dismissed; a trust or login dialog skips the test).
 """
 import json
 import os
@@ -62,7 +66,10 @@ def client() -> HerdrPaneClient:
 
 def _close(client: HerdrPaneClient, pane_id: str) -> str | None:
     """Close a pane this test opened; the problem as text when herdr fails to close it or the pane is still listed."""
-    closed = subprocess.run(["herdr", "pane", "close", pane_id], capture_output=True, text=True, timeout=120)
+    try:
+        closed = subprocess.run(["herdr", "pane", "close", pane_id], capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return f"{pane_id}: herdr pane close timed out"  # the panes after this one are still closed
     try:
         listed = {pane.get("pane_id") for pane in client.list_panes()}
     except HerdrError as error:

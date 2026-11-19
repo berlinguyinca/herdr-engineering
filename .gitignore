@@ -60,4 +60,3 @@ tests/share-fixtures/html-parquet-duckdb/vendor/extensions/
 
 # local pytest TMPDIR scratch
 .tmp/
-.herdr-test/

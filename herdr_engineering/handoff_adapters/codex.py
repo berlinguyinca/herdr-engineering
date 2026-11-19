@@ -68,6 +68,14 @@ def _session_meta(path: Path) -> tuple[str, str] | None:
         return None
 
 
+def _resolves_to(recorded_cwd: str, wanted: Path) -> bool:
+    """Whether a rollout's recorded cwd is `wanted`; a cwd that cannot be resolved (a NUL byte) matches nothing."""
+    try:
+        return Path(recorded_cwd).resolve() == wanted
+    except (ValueError, OSError, RuntimeError):
+        return False
+
+
 def select_rollout(pane_cwd: Path, process_start: float, open_paths: Sequence[Path], home: Path) -> Path | None:
     """The rollout of a Codex pane when Herdr reports no session id, or None when it cannot be told apart.
 
@@ -89,7 +97,7 @@ def select_rollout(pane_cwd: Path, process_start: float, open_paths: Sequence[Pa
         except OSError:
             continue
         meta = _session_meta(path)
-        if meta is not None and meta[1] == _INTERACTIVE_ORIGINATOR and Path(meta[0]).resolve() == wanted:
+        if meta is not None and meta[1] == _INTERACTIVE_ORIGINATOR and _resolves_to(meta[0], wanted):
             found.append(path)
     return found[0] if len(found) == 1 else None
 
@@ -126,7 +134,7 @@ def _open_files(pid: int, env: Mapping[str, str] | None) -> list[Path]:
     try:
         out = subprocess.run([lsof, "-p", str(pid), "-Fn"], capture_output=True, text=True, timeout=20,
                              env=None if env is None else dict(env)).stdout
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):  # a file name that is not UTF-8
         return []
     return [Path(line[1:]) for line in out.splitlines() if line.startswith("n/")]
 

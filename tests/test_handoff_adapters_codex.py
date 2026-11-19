@@ -19,7 +19,7 @@ from herdr_engineering.handoff_adapters.codex import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "handoff_adapters" / "codex"
-SESSION = "01a1d6df-7c12-7671-bbf8-7c2d51d1a84b"
+SESSION = "00000000-0000-7000-8000-000000000001"
 OTHER = "01a1c92e-0000-7000-8000-000000000002"
 
 
@@ -308,6 +308,22 @@ def test_the_start_of_this_process_is_found_under_a_non_english_locale():
     local = subprocess.run(["ps", "-o", "lstart=", "-p", str(os.getpid())], capture_output=True, text=True,
                            env={**os.environ, "LC_ALL": "C", "LANG": "C"}).stdout.strip()
     assert abs(started - time.mktime(time.strptime(local, "%a %b %d %H:%M:%S %Y"))) <= 2
+
+
+def test_a_rollout_whose_recorded_cwd_has_a_nul_byte_is_no_candidate(tmp_path):
+    path = _rollout(tmp_path, "session_meta_work.jsonl", SESSION)
+    path.write_text(path.read_text(encoding="utf-8").replace('"cwd": "/work"', '"cwd": "/wo\\u0000rk"'), encoding="utf-8")
+    assert "\\u0000" in path.read_text(encoding="utf-8")
+    assert select_rollout(Path("/work"), START, [], tmp_path) is None
+
+
+def test_a_non_utf8_file_name_in_lsof_output_means_no_open_files(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    lsof = bin_dir / "lsof"  # a real executable that prints what lsof prints for a file named with a lone 0xff byte
+    lsof.write_text("#!/bin/sh\nprintf 'p1\\nn/tmp/bad\\377name\\n'\n", encoding="utf-8")
+    lsof.chmod(0o755)
+    assert _open_files(os.getpid(), {"PATH": str(bin_dir)}) == []
 
 
 def test_open_files_are_optional(tmp_path):
