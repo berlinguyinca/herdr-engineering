@@ -31,14 +31,13 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import re
 import shlex
 import shutil
 import stat
 import sys
 import tempfile
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -60,8 +59,8 @@ DEFAULT_MAX_PER_SESSION = 1
 DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
 # Assumed once usage proves the default window cannot be right. Neither harness reports its
 # context window in the transcript, so the assumption has to yield to the evidence: a session
-# that has used 250k tokens does not live in a 200k window. `handoff context-hook claude`
-# applies the same rule; the autopilot must not measure a 1M session against 200k.
+# that has used 250k tokens does not live in a 200k window, so the autopilot must not
+# measure a 1M session against 200k.
 DEFAULT_LARGE_CONTEXT_WINDOW_TOKENS = 1_000_000
 DEFAULT_HARNESSES = ("pi", "claude")
 
@@ -110,7 +109,10 @@ TRIGGER_CODES = (
     "already_triggered",
     "handoff_underway",
     "harness_unsupported",
+    "herdr_controller_managed",
 )
+#: The decision code of an autopilot that stands down because the Herdr handoff controller owns the pane.
+CODE_HERDR_MANAGED = "herdr_controller_managed"
 
 
 # ------------------------------------------------------------------- paths and policy
@@ -268,15 +270,45 @@ def window_for(
     return max(int(large_window), int(used_tokens), 1)
 
 
-def opt_out_reason() -> str | None:
+def opt_out_reason(env: Mapping[str, str] | None = None) -> str | None:
     """Why the autopilot is switched off, naming the exact way to switch it back."""
-    value = os.environ.get(ENV_OPT_OUT, "").strip().lower()
+    value = (os.environ if env is None else env).get(ENV_OPT_OUT, "").strip().lower()
     if value in _FALSE:
         return (
             f"{ENV_OPT_OUT}={value} switches off automatic handoffs for this session; "
             f"unset it to restore them"
         )
     return None
+
+
+def herdr_controller_reason(env: Mapping[str, str] | None = None) -> str | None:
+    """Why the Herdr handoff controller, not this autopilot, owns this session; None when the autopilot stays in charge.
+
+    The controller owns a session when ALL hold: HERDR_PANE_ID is set and non-empty, the controller plugin is linked in Herdr
+    (or a controller is running), and the controller is not switched off for that pane (`HERDR_HANDOFF_AUTO=0` or the pane's
+    marker). The autopilot is the policy everywhere else, so a session is never left without one. Any error answers None:
+    this fails open, towards the autopilot.
+    """
+    try:
+        env = os.environ if env is None else env
+        pane_id = env.get("HERDR_PANE_ID", "").strip()
+        if not pane_id:
+            return None
+        from .handoff_controller.switch import is_enabled
+        from .handoff_controller_state import ControllerState, controller_findings
+        from .handoff_subagent_registry import state_root
+
+        if not is_enabled(pane_id, env, state_root(env)):
+            return None
+        controller, _ = controller_findings(env)
+        if controller.state not in (ControllerState.RUNNING, ControllerState.LINKED):
+            return None
+        return (
+            f"pane {pane_id} is managed by the Herdr handoff controller ({controller.detail}), which hands sessions off "
+            "at its own threshold; the autopilot stands down here and still serves sessions outside Herdr"
+        )
+    except Exception:  # fail open: a broken check must never leave a session without a policy
+        return None
 
 
 # ------------------------------------------------------------------------ the trigger
@@ -433,6 +465,7 @@ def decide(
     config: dict[str, Any] | None = None,
     ledger: dict[str, Any] | None = None,
     boundary: str = "turn_end",
+    env: Mapping[str, str] | None = None,
 ) -> Decision:
     """Whether this session should hand itself off now, and what to tell the agent."""
     try:
@@ -447,7 +480,7 @@ def decide(
     threshold = active_policy.context_percent
     if percent is not None and not 0 <= float(percent) <= 100:
         raise InvalidError("percent must be between 0 and 100")
-    reason = opt_out_reason()
+    reason = opt_out_reason(env)
     if reason is not None:
         return Decision(False, "disabled", f"automatic handoffs are off: {reason}")
     if not active_policy.enabled:
@@ -458,6 +491,9 @@ def decide(
             "machine config (~/.config/herdr-engineering/config.yaml); set it to "
             f"true, or unset {ENV_OPT_OUT} if it is exported",
         )
+    managed = herdr_controller_reason(env)
+    if managed is not None:
+        return Decision(False, CODE_HERDR_MANAGED, managed)
     if harness not in active_policy.harnesses:
         return Decision(
             False,
@@ -492,13 +528,6 @@ def decide(
             percent=used,
             threshold=threshold,
             window=window,
-        )
-    if _context_hook_warned(session_id):
-        return Decision(
-            False,
-            "already_triggered",
-            f"{session_id} was already told to hand off by `handoff context-hook claude` "
-            "(the opt-in UserPromptSubmit trigger); this session will not be told twice",
         )
     entries = (ledger if ledger is not None else read_ledger(home=home)).get("sessions", {})
     count = int((entries.get(session_id) or {}).get("count", 0))
@@ -603,6 +632,25 @@ def record_trigger(
         sessions[session_id] = entry
         _write_private_json(path, {"version": 1, "sessions": sessions})
     return entry
+
+
+def record_skip(
+    *, session_id: str, harness: str, code: str, reason: str, home: Path | str | None = None
+) -> bool:
+    """Note in the ledger why this session was not handed off by the autopilot. Written once per (session, code), never a trigger.
+
+    Returns whether the ledger was written."""
+    path = state_path(home)
+    with _ledger_lock(path):
+        ledger, _ = _read_ledger(home)
+        sessions = dict(ledger["sessions"])
+        entry = dict(sessions.get(session_id) or {})
+        if (entry.get("skipped") or {}).get("code") == code:
+            return False
+        entry.update({"harness": harness, "skipped": {"code": code, "reason": reason, "at": _utc_now()}})
+        sessions[session_id] = entry
+        _write_private_json(path, {"version": 1, "sessions": sessions})
+    return True
 
 
 def _sha256(text: str) -> str:
@@ -1038,6 +1086,11 @@ def hook(
         settled = _settle_uptake_quietly(cwd=payload.get("cwd") or Path.cwd(), home=home)
         if settled:
             out["uptake_settled"] = settled
+    if decision.code == CODE_HERDR_MANAGED:
+        if record:
+            with contextlib.suppress(Exception):  # the ledger note is visibility only; never fail the hook
+                record_skip(session_id=session_id, harness=harness, code=decision.code, reason=decision.reason, home=home)
+        return out
     if not decision.trigger:
         return out
     if event in CLAUDE_MODEL_REACHING_EVENTS:
@@ -1115,25 +1168,6 @@ def _cli_command() -> str:
     # a line the operator's shell will execute.
     run = " ".join([shlex.quote(binary), *(shlex.quote(part) for part in prefix), *arguments])
     return f"[ -x {shlex.quote(binary)} ] && {run} || true"
-
-
-def _context_hook_warned(session_id: str) -> bool:
-    """Whether the opt-in `handoff context-hook claude` trigger already told this session.
-
-    That trigger keeps its own per-session marker under `$HERDR_ENGINEERING_STATE/handoff-context`
-    (default `~/.local/share/herdr-engineering/state`), outside this module's ledger. Without this
-    check a session with both installed is told twice - once at half the window, once at the
-    configured threshold - which is the nagging `max_per_session` exists to prevent. A marker root
-    that is not a directory is read as "not warned": the decision must still be made.
-    """
-    root = os.environ.get("HERDR_ENGINEERING_STATE") or str(
-        Path.home() / ".local/share/herdr-engineering/state"
-    )
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id)[:128]
-    try:
-        return (Path(root) / "handoff-context" / f"{safe}.fired").is_file()
-    except OSError:
-        return False
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -1374,6 +1408,7 @@ def status(*, home: Path | str | None = None) -> dict[str, Any]:
     active_policy = policy()
     ledger, note = _read_ledger(home)
     flags = os.environ.get(ENV_OPT_OUT, "").strip().lower()
+    managed = herdr_controller_reason()
     out = {
         "schema_version": 1,
         "policy": active_policy.to_dict(),
@@ -1382,6 +1417,11 @@ def status(*, home: Path | str | None = None) -> dict[str, Any]:
             "opted_out": flags in _FALSE,
         },
         "installed": installed(home),
+        "herdr_controller": {
+            "managed": managed is not None,
+            "code": CODE_HERDR_MANAGED if managed is not None else None,
+            "reason": managed,
+        },
         "ledger": {"path": str(state_path(home)), "sessions": ledger["sessions"]},
         "uptake": _uptake_counts(ledger["sessions"]),
         "summary": "",
@@ -1397,6 +1437,8 @@ def status(*, home: Path | str | None = None) -> dict[str, Any]:
             f"; {counts['taken']} of {counts['told']} sessions that were told went on to create "
             "a handoff"
         )
+    if managed is not None:
+        out["summary"] = f"the autopilot stands down in this pane: {managed}"
     if note:
         out["ledger"]["note"] = note
     return out
@@ -1426,6 +1468,15 @@ def doctor_check(*, home: Path | str | None = None) -> dict[str, Any]:
     details = installed(home)
     data = {**active_policy.to_dict(), **details, "state_path": details["state_path"]}
     problems: list[str] = []
+    managed = herdr_controller_reason()
+    if managed is not None and flags not in _FALSE:
+        return {
+            "name": "handoff-autopilot",
+            "status": "ok",
+            "detail": f"the autopilot stands down in this pane ({CODE_HERDR_MANAGED}): {managed}",
+            "fix": "",
+            "data": {**data, "herdr_controller_managed": True, "code": CODE_HERDR_MANAGED},
+        }
     if flags in _FALSE:
         return {
             "name": "handoff-autopilot",
@@ -1464,7 +1515,7 @@ def doctor_check(*, home: Path | str | None = None) -> dict[str, Any]:
         "status": "ok",
         "detail": (
             f"handoffs are automatic at {active_policy.context_percent:.0f}% of the "
-            f"context window; {len(ledger['sessions'])} session(s) triggered so far"
+            f"context window; {sum(1 for e in ledger['sessions'].values() if e.get('count'))} session(s) triggered so far"
         ),
         "fix": "",
         "data": data,

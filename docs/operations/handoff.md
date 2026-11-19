@@ -316,6 +316,11 @@ panes are gone, so nothing else types a handoff order into a session. See
 [handoff-auto-triggers.md](handoff-auto-triggers.md#upgrading) for the one-time upgrade and for what a pane with the controller
 switched off gets (no automatic policy).
 
+The one other automatic policy is the [handoff autopilot](../automatic-handoffs.md#which-policy-applies-where) (50% by default,
+Pi `turn_end` and Claude `Stop`/`PreCompact`). It stands down in a Herdr pane that the controller manages (`HERDR_PANE_ID` set,
+controller plugin linked, controller not switched off for the pane) and stays the policy for sessions outside Herdr and for
+panes where the controller is switched off, so every session has exactly one policy.
+
 ### Linking and checking the controller
 
 `scripts/install.sh` links the controller plugin and the session pane plugin (`herdr-eng handoff controller link`), with an
