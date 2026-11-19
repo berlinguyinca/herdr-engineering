@@ -21,11 +21,17 @@ STOP = {"hooks": [{"type": "command", "command": STOP_COMMAND}]}
 ALL = {"SubagentStart": [START], "SubagentStop": [STOP]}
 
 
-def cli(home: Path, *argv: str) -> tuple[int, dict]:
+def cli(home: Path, *argv: str, env: dict[str, str] | None = None) -> tuple[int, dict]:
+    """The hook tests run with the controller switched off globally, so its state (and the real Herdr) stays out of them."""
     code = "import sys; from herdr_engineering import cli; sys.exit(cli.main(sys.argv[1:]))"
+    base = {"PATH": "/usr/bin:/bin", "HOME": str(home), "PYTHONPATH": REPO, "HERDR_HANDOFF_AUTO": "0"}
     p = subprocess.run([sys.executable, "-c", code, "handoff", "auto", *argv, "--home", str(home), "--json"], cwd=REPO,
-                       env={"PATH": "/usr/bin:/bin", "HOME": str(home), "PYTHONPATH": REPO}, capture_output=True, text=True, timeout=60)
+                       env={**base, **(env or {})}, capture_output=True, text=True, timeout=60)
     return p.returncode, json.loads(p.stdout)
+
+
+def hook_results(out: dict) -> list[dict]:
+    return [r for r in out["results"] if r["target"] not in ("controller", "side pane")]
 
 
 def settings_path(home: Path) -> Path:
@@ -34,13 +40,13 @@ def settings_path(home: Path) -> Path:
 
 def action(out: dict) -> str:
     """The single action all hook items share (fails if they differ)."""
-    actions = {r["action"] for r in out["results"]}
-    assert len(out["results"]) in (1, 2, 3) and len(actions) == 1, out
+    actions = {r["action"] for r in hook_results(out)}
+    assert len(hook_results(out)) in (1, 2, 3) and len(actions) == 1, out
     return actions.pop()
 
 
 def actions(out: dict) -> list[str]:
-    return [r["action"] for r in out["results"]]
+    return [r["action"] for r in hook_results(out)]
 
 
 def test_command_matches_documented_snippet() -> None:
@@ -343,3 +349,62 @@ def test_legacy_removal_is_not_run_by_import_or_dry_run(tmp_path: Path) -> None:
     settings_path(tmp_path).write_text(raw)
     assert "removed" in actions(cli(tmp_path, "install", "--dry-run")[1])
     assert settings_path(tmp_path).read_text() == raw
+
+
+# --- the controller and side pane items of `check` -------------------------------------------------------------------
+NO_HERDR = {"HERDR_BIN": "/nonexistent/herdr", "HERDR_HANDOFF_AUTO": "1"}
+
+
+def _items(out: dict) -> dict[str, dict]:
+    return {r["target"]: r for r in out["results"] if r["target"] in ("controller", "side pane")}
+
+
+def test_check_fails_with_the_fix_when_no_controller_is_linked_or_running(tmp_path: Path) -> None:
+    cli(tmp_path, "install")
+    rc, out = cli(tmp_path, "check", env={**NO_HERDR, "HERDR_ENGINEERING_STATE": str(tmp_path / "st")})
+    items = _items(out)
+    assert rc == 1 and items["controller"]["action"] == "missing"
+    assert "herdr-eng handoff controller link" in items["controller"]["detail"]
+    assert "herdr-eng handoff controller run" in items["controller"]["detail"] or "herdr-eng handoff controller link" in items["controller"]["detail"]
+    assert items["side pane"]["action"] == "skipped"
+    assert actions(out) == ["ok", "ok"]
+
+
+def test_check_passes_when_the_controller_is_switched_off_on_purpose(tmp_path: Path) -> None:
+    cli(tmp_path, "install")
+    rc, out = cli(tmp_path, "check", env={**NO_HERDR, "HERDR_HANDOFF_AUTO": "0"})
+    assert rc == 0 and _items(out)["controller"]["action"] == "ok" and "switched off" in _items(out)["controller"]["detail"]
+
+
+def test_check_passes_while_a_controller_holds_the_lock(tmp_path: Path) -> None:
+    from herdr_engineering.handoff_controller.run import ControllerLock
+    cli(tmp_path, "install")
+    lock = ControllerLock(tmp_path / "st")
+    assert lock.acquire()
+    try:
+        rc, out = cli(tmp_path, "check", env={**NO_HERDR, "HERDR_ENGINEERING_STATE": str(tmp_path / "st")})
+    finally:
+        lock.release()
+    assert rc == 0 and _items(out)["controller"]["action"] == "ok" and "running" in _items(out)["controller"]["detail"]
+
+
+def test_controller_link_without_herdr_is_skipped_and_writes_nothing(tmp_path: Path) -> None:
+    code = "import sys; from herdr_engineering import cli; sys.exit(cli.main(sys.argv[1:]))"
+    done = subprocess.run([sys.executable, "-c", code, "handoff", "controller", "link", "--herdr-bin", "/nonexistent/herdr",
+                           "--herdr-eng", "/abs/herdr-eng"], cwd=REPO, capture_output=True, text=True, timeout=60,
+                          env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "PYTHONPATH": REPO})
+    assert done.returncode == 0 and "skipped" in done.stdout and "not installed" in done.stdout
+    assert not (tmp_path / ".local").exists()
+
+
+def test_install_sh_links_the_handoff_plugins_with_an_opt_out() -> None:
+    script = (Path(REPO) / "scripts/install.sh").read_text()
+    assert 'WITH_HANDOFF_PLUGINS="${HERDR_INSTALL_HANDOFF_PLUGINS:-1}"' in script
+    assert "--no-handoff-plugins) WITH_HANDOFF_PLUGINS=0" in script
+    link = script.index("handoff controller link")
+    assert script.index("handoff auto install --subagents-only") < link           # after the hook steps
+    assert '--herdr-eng "$VENV/bin/herdr-eng"' in script                           # the absolute path the plugins run
+    assert script.rindex("handoff auto check") > link                              # the end prints the controller check
+    assert "--no-handoff-plugins" in subprocess.run(["bash", str(Path(REPO) / "scripts/install.sh"), "--help"], capture_output=True,
+                                                    text=True, timeout=30, env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"}).stdout
+    assert subprocess.run(["bash", "-n", str(Path(REPO) / "scripts/install.sh")]).returncode == 0
