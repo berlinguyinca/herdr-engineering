@@ -9,6 +9,26 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - `lock/upstreams.yaml` pins herdr-handoff to `aed3e8274e6948a774682a55d99b7cd9ef113914` (herdr-handoff#12, v0.5.0: shared handoff store, one takeover per handoff id, `takeover --direction`, `--relaunch`). `check_handoff_dependency` now also requires that `herdr-handoff takeover --help` lists `--direction` (reported as `takeover --direction`, naming 0.5.0), so `herdr-eng doctor` reports an installed 0.4.0 as too old until `scripts/install-handoff.sh` is run.
 
+### Security: repo-local config can no longer set `handoff_autopilot`
+
+- `load_config` and `declared_keys` now ignore `handoff_autopilot` in the repo-local `./config/herdr-engineering.yaml` and `./herdr-engineering.yaml` (the repository being built is untrusted), exactly as `fabric_build_cache` already was, via one shared `_REPO_LOCAL_STRIPPED_KEYS` list. Set it in `~/.config/herdr-engineering/config.yaml` or `$HERDR_ENGINEERING_CONFIG`.
+
+### Fix: automatic handoff reads the context window from the session's model
+
+- `handoff autopilot` no longer hard-codes a 200k window for Claude Code. The transcript names the model, and `handoff_autopilot.model_context_windows` (YAML; a model-name substring to its window, longest match wins, merged with the built-in `[1m]` -> 1,000,000) gives its window; the Stop hook, `check --transcript` and `record --transcript` all apply it and report `window.source: "model"`. The harness's own stated window still wins, then the model, then a declared `context_window_tokens`, and only then the 200k assumption (with escalation past it). New `transcript_model()` reads `message.model`.
+
+### Fix: unit-gates reruns the parallel pass once if xdist workers die
+
+- `scripts/ci/pytest-rerun.sh`: exit 3 or a worker-crash signature reruns the parallel pass once on 2 workers (never for test failures or hangs); `auto` workers also shrink on a loaded host.
+
+### Fix: `fleet status` and `doctor` no longer depend on the working directory
+
+- `fleet.repo_root()` no longer falls back to the cwd. It uses `HERDR_ENGINEERING_REPO`, else walks up for `ansible/inventory/hosts.yml` (or a checkout's `ansible/playbooks/fleet-status.yml`), else raises `FleetError` naming the paths searched. `fleet status` reports a missing inventory as `no inventory at <path>` on stderr and exits 2 (setup problem), distinct from exit 1 (ansible ran and hosts failed); `--json` carries `error` and `error_kind`. `fleet join`/`update` and `stage_pi_runtime` return that error in their report instead of running ansible against a nonexistent path.
+- `doctor`: the `lock` and `plugins` checks locate `lock/upstreams.yaml` from `HERDR_ENGINEERING_LOCK`, then `HERDR_ENGINEERING_REPO`, then the checkout the package was imported from, never the cwd. With no checkout (an installed copy) both report `unknown` ("not applicable: no checkout found") instead of a warning.
+- `doctor`: the `tailscale` check reads `tailscale status --json` and treats `BackendState == "Running"` as up (exit code when the output is not that JSON); the plain-text check looked for the word "tailscale", which that output never contains, so it always warned. The decision is the pure function `tailscale_running`.
+- `fleet rollout plan` and `fleet recover plan`/`run` outside a checkout print that error as JSON and exit 1 instead of a traceback.
+- `scripts/herdr-gateway-monitor.timer` triggers on `OnCalendar=*:0/5` instead of `OnBootSec=`/`OnUnitActiveSec=`. With `Persistent=true` the old unit stopped firing after a reboot whenever the user manager started later than the boot delay. Installed copies need the unit re-copied and `systemctl --user daemon-reload`.
+
 ### Fix: CI report relay failures are no longer silent
 
 - `ci_report_relay` printed only `N published, M failed`. It now writes one stderr line per failing bundle (`CI report relay: failed <bundle>: <reason>`), per unreadable source file (errno name), and for whole-run failures, plus the reader exit status on source errors. Reasons are fixed strings or errno names: no URLs, keys or bundle contents. Delivery and fail-closed identity checks are unchanged.
