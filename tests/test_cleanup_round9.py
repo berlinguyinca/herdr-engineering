@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -20,16 +21,19 @@ from herdr_engineering.scratch_reaper import default_root, system_temp_roots
 
 UID = os.getuid()
 DEFAULT = Path(os.path.realpath(f"/tmp/claude-{UID}"))
-NON_TEMP = Path(__file__).parent / "_r9_not_a_temp_dir"  # inside the checkout, never a system temp dir
 
 
 @pytest.fixture
 def non_temp() -> Path:
-    (NON_TEMP / f"claude-{UID}").mkdir(parents=True, exist_ok=True)
+    # /var/tmp is not one of the fixed system temp roots; the checkout cannot serve (CI checks out under /tmp)
+    if not os.access("/var/tmp", os.W_OK):
+        pytest.skip("needs a writable directory outside the fixed system temp roots")
+    base = Path(tempfile.mkdtemp(dir="/var/tmp", prefix="_r9_not_a_temp_dir"))
+    (base / f"claude-{UID}").mkdir()
     try:
-        yield NON_TEMP
+        yield base
     finally:
-        shutil.rmtree(NON_TEMP, ignore_errors=True)
+        shutil.rmtree(base, ignore_errors=True)
 
 
 # --- 1: TMPDIR is never a deletion root ------------------------------------------------------------------

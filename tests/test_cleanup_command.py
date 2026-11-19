@@ -176,8 +176,8 @@ def test_dotdot_escape_refused(env: Env) -> None:
 
 
 def test_foreign_owner_refused() -> None:
-    # /usr/bin is root-owned: inside a root, but not ours
-    with pytest.raises(Refusal, match="owned"):
+    # /usr/bin is root-owned: inside a root, but not ours (a host process using it is refused too)
+    with pytest.raises(Refusal, match="owned|in_use"):
         cleanup("tmp", Path("/usr/bin"), roots=[], temp_roots=[Path("/usr")], dry_run=True)
 
 

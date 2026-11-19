@@ -1441,7 +1441,7 @@ def test_env_root_problem_reports_each_rejection() -> None:
 def test_env_root_problem_rejects_dir_outside_system_temp(tmp_path: Path) -> None:
     from herdr_engineering.scratch_reaper import _env_root_problem, _under_system_temp
 
-    outside = Path.home() / ".cache"
+    outside = Path("/usr/share/herdr-outside")
     if not _under_system_temp(tmp_path):
         (tmp_path / f"claude-{os.getuid()}").mkdir()
         assert (
