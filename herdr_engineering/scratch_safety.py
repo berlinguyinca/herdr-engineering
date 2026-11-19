@@ -120,7 +120,7 @@ def inspect_tree(
     )
 
 
-def git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+def git(repo: Path, *arguments: str, timeout: float = 15) -> subprocess.CompletedProcess[str]:
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     environment.update(
         GIT_OPTIONAL_LOCKS="0",
@@ -158,7 +158,7 @@ def git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         env=environment,
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=timeout,
     )
 
 

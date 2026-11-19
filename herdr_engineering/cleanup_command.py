@@ -116,8 +116,20 @@ def configured_roots(extra: list[str] | None = None, home: Path | None = None) -
 
 
 def _git(cwd: Path, *args: str, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
-                          timeout=GIT_TIMEOUT if timeout is None else timeout, check=False)
+    """Every git call goes through the hardened ``scratch_safety.git`` runner: ``GIT_*`` stripped,
+    no user/system config, no fsmonitor or hooks, ``LC_ALL=C``. A ``GIT_DIR`` in the environment
+    or ``status.showUntrackedFiles=no`` in a config must not change what a check sees."""
+    from .scratch_safety import git as safe_git
+    return safe_git(cwd, *args, timeout=GIT_TIMEOUT if timeout is None else timeout)
+
+
+def config_strings(value: Any, name: str) -> tuple[str, ...]:
+    """A config list of strings; anything else (a scalar string would split into characters) is invalid."""
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{name} must be a list of strings")
+    return tuple(value)
 
 
 def _bases(paths: list[Path]) -> list[Path]:
@@ -205,14 +217,34 @@ def _ancestors() -> frozenset[int]:
     return frozenset(found)
 
 
-def in_use_snapshot(proc: Path = Path("/proc")) -> Snapshot:
-    """The ``scratch_safety`` process snapshot (open files, cwds, argv). Where ``ps``/``lsof``
-    are unavailable (Linux without lsof) it falls back to the open files and working directories
-    under ``proc``; with neither source it fails CLOSED: ``Refusal('in_use')``."""
-    from .scratch_safety import InspectionUnavailable, Snapshot, _comparison, process_snapshot
+def _argument_lines(ignore: frozenset[int]) -> tuple[str, ...]:
+    """Command lines of other processes (they name paths too), best effort."""
+    from .scratch_safety import _comparison
     try:
-        return process_snapshot(_ancestors())
+        listing = subprocess.run(["ps", "-ww", "-axo", "pid=,args="], capture_output=True, text=True,
+                                 timeout=15, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    lines = []
+    for line in listing.splitlines():
+        pieces = line.strip().split(None, 1)
+        if len(pieces) == 2 and pieces[0].isdigit() and int(pieces[0]) not in ignore | {os.getpid()}:
+            lines.append(_comparison(pieces[1]))
+    return tuple(lines)
+
+
+def in_use_snapshot() -> Snapshot:
+    """The ``scratch_safety`` process snapshot (open files, cwds, argv). Where ``lsof`` is
+    unavailable (Linux without it) it falls back to the open files and working directories in
+    ``/proc`` plus the ``ps`` command lines; with neither source it fails CLOSED:
+    ``Refusal('in_use')``."""
+    from .scratch_safety import InspectionUnavailable, Snapshot, _comparison, process_snapshot
+    ancestors: frozenset[int] = frozenset()
+    try:
+        ancestors = _ancestors()
+        return process_snapshot(ancestors)
     except (InspectionUnavailable, OSError, ValueError, subprocess.SubprocessError) as exc:
+        proc = Path("/proc")
         if not proc.is_dir():
             raise Refusal("in_use", f"cannot verify running processes: {exc}") from exc
         from .build_cleanup import _process_paths
@@ -220,7 +252,8 @@ def in_use_snapshot(proc: Path = Path("/proc")) -> Snapshot:
             paths = _process_paths(proc)
         except (OSError, ValueError) as inner:
             raise Refusal("in_use", f"cannot verify running processes: {inner}") from inner
-        return Snapshot(tuple(_comparison(str(p)) for p in paths), (), ())
+        return Snapshot(tuple(_comparison(str(p)) for p in paths),
+                        _argument_lines(ancestors), ())
 
 
 def _not_in_use(path: Path, snapshot: Snapshot | Refusal | None = None) -> None:
@@ -308,7 +341,7 @@ def foreign_ignored(path: Path, rebuildable: tuple[str, ...] = REBUILDABLE) -> l
     from fnmatch import fnmatchcase
 
     from .scratch_safety import inspect_tree
-    status = _git(path, "status", "--porcelain", "--ignored")
+    status = _git(path, "status", "--porcelain", "--untracked-files=normal", "--ignored=traditional")
     if status.returncode != 0:
         return ["<unknown>"]
     found = []
@@ -359,7 +392,12 @@ def worktree_local_checks(path: Path, rebuildable: tuple[str, ...] | None = None
     if reason := hidden_index_reason(path):
         raise Refusal("hidden_index_state",
                       f"{path} has skip-worktree/assume-unchanged entries whose edits git hides ({reason})")
-    extra = tuple(user_disk_hygiene_config().get("rebuildable", []) or []) if rebuildable is None else rebuildable
+    if rebuildable is None:
+        try:
+            rebuildable = config_strings(user_disk_hygiene_config().get("rebuildable"), "rebuildable")
+        except ValueError as exc:
+            raise Refusal("config_unreadable", f"disk_hygiene.{exc}") from exc
+    extra = rebuildable
     if ignored := foreign_ignored(path, (*REBUILDABLE, *extra)):
         raise Refusal("ignored_files",
                       f"{path} has ignored files that are not plain rebuildable output: {', '.join(ignored[:5])}")
@@ -369,17 +407,28 @@ def worktree_local_checks(path: Path, rebuildable: tuple[str, ...] | None = None
 def check_worktree_removable(path: Path, *, merged_ok: bool,
                              snapshot: Snapshot | Refusal | None = None,
                              rebuildable: tuple[str, ...] | None = None,
-                             pr_closed: bool | None = None) -> dict[str, Any]:
-    """``pr_closed``: the caller already looked the PR up (True = merged/closed); None looks it
-    up here when ``merged_ok``. The in-use check runs last, right before any removal."""
-    facts = worktree_local_checks(path, rebuildable)
+                             pr_head: str | None = None,
+                             prechecked: dict[str, Any] | None = None) -> dict[str, Any]:
+    """``pr_head``: the head SHA of a merged/closed PR the caller already looked up; it only
+    excuses unpushed commits when it equals the HEAD being removed NOW (None looks the PR up here
+    when ``merged_ok``). ``prechecked``: the facts from ``worktree_local_checks``; then only HEAD
+    and cleanliness are re-checked. The in-use check runs last, right before any removal."""
+    if prechecked is None:
+        facts = worktree_local_checks(path, rebuildable)
+    else:
+        facts = dict(prechecked)
+        head = _git(path, "rev-parse", "HEAD").stdout.strip()
+        if head != facts["head"]:
+            raise Refusal("changed", f"{path}: HEAD moved since it was inspected")
+        if is_dirty(path):
+            raise Refusal("dirty", f"{path} has uncommitted or untracked changes")
     if unpushed(path):
         merged = False
         if merged_ok:
-            if pr_closed is None:
+            if pr_head is None:
                 pr = gh_pr_state(path, facts["branch"], facts["head"], _origin_owner(path))
-                pr_closed = bool(pr and pr["state"] in ("MERGED", "CLOSED") and pr["head"] == facts["head"])
-            merged = patch_merged(path) or pr_closed
+                pr_head = pr["head"] if pr and pr["state"] in ("MERGED", "CLOSED") else ""
+            merged = patch_merged(path) or pr_head == facts["head"]
         if not merged:
             raise Refusal("unpushed_commits",
                           f"{path} has commits that are on no remote and not merged (unpushed)")
@@ -390,14 +439,14 @@ def check_worktree_removable(path: Path, *, merged_ok: bool,
 def remove_worktree(path: Path, *, dry_run: bool, merged_ok: bool,
                     snapshot: Snapshot | Refusal | None = None,
                     rebuildable: tuple[str, ...] | None = None,
-                    pr_closed: bool | None = None) -> dict[str, Any]:
+                    pr_head: str | None = None,
+                    prechecked: dict[str, Any] | None = None) -> dict[str, Any]:
     facts = check_worktree_removable(path, merged_ok=merged_ok, snapshot=snapshot,
-                                     rebuildable=rebuildable, pr_closed=pr_closed)
+                                     rebuildable=rebuildable, pr_head=pr_head, prechecked=prechecked)
     if not dry_run:
-        # --git-dir=<common dir> works for normal, bare and separate-git-dir repositories alike,
-        # and `worktree remove` drops its own registration: no repo-wide `worktree prune`.
-        done = subprocess.run(["git", f"--git-dir={facts['common']}", "worktree", "remove", str(path)],
-                              capture_output=True, text=True, timeout=600, check=False)
+        # Run from the common git dir: works for normal, bare and separate-git-dir repositories
+        # alike, and `worktree remove` drops its own registration (no repo-wide `worktree prune`).
+        done = _git(Path(facts["common"]), "worktree", "remove", str(path), timeout=600)
         if done.returncode != 0:
             raise Refusal("git_refused", done.stderr.strip() or "git worktree remove failed")
     return {"branch": facts["branch"]}
@@ -454,15 +503,32 @@ def _refuse_git(path: Path) -> None:
         raise Refusal("keep_marker", f"{path} contains a .keep marker")
 
 
+def own_sessions(home: Path | None = None) -> frozenset[str]:
+    """Session ids of the Claude processes this process descends from. Claude records
+    ``<pid> -> sessionId`` in ``~/.claude/sessions/<pid>.json``; the pid must be one of OUR
+    ancestors, so an environment variable (inherited, or typed by hand) never makes a session
+    "own"."""
+    directory = (home or Path.home()) / ".claude" / "sessions"
+    found: set[str] = set()
+    for pid in _ancestors():
+        try:
+            data = json.loads((directory / f"{pid}.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("pid") == pid and isinstance(data.get("sessionId"), str):
+            found.add(data["sessionId"].lower())
+    return frozenset(found)
+
+
 def _guard_scratch(path: Path, scratch: Path, live_roots: list[Path], now: float) -> None:
     """Under Claude's scratch root only strictly inside a ``<session>`` dir, never the root, a
     ``<project>`` dir or the session dir itself. ``.keep`` protects. The caller's own session
-    (``CLAUDE_CODE_SESSION_ID``) is free to clean up after itself; any other session must pass
+    (see ``own_sessions``) is free to clean up after itself; any other session must pass
     ``scratch_reaper``'s policy: not live and idle for the session TTL."""
     from .scratch_reaper import Policy, _live_ids
     from .scratch_safety import inspect_tree, keep_ancestor
     policy = Policy()
-    own = os.environ.get("CLAUDE_CODE_SESSION_ID", "").lower()
+    own = own_sessions()
     for base in _bases([scratch]):
         parts = relative_parts(path, base)
         if parts is None:
@@ -474,7 +540,7 @@ def _guard_scratch(path: Path, scratch: Path, live_roots: list[Path], now: float
         if keep_ancestor(path, path.parents[len(parts) - 1]):
             raise Refusal("keep_marker", f"{path} is under a .keep marker")
         session = parts[index].lower()
-        if session != own:
+        if session not in own:
             if session in _live_ids(live_roots, now - policy.live_seconds):
                 raise Refusal("live_session", f"session {session} is still live")
             session_dir = path.parents[len(parts) - index - 2]

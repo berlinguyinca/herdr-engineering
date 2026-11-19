@@ -37,9 +37,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,7 @@ from .cleanup_command import (
     _git,
     _origin_owner,
     checked_path,
+    config_strings,
     configured_roots,
     default_temp_worktree_parents,
     gh_pr_state,
@@ -89,7 +91,6 @@ class Policy:
     image_prune: bool = False
     rebuildable: tuple[str, ...] = ()
     config_error: str = ""
-    extra: dict[str, Any] = field(default_factory=dict)
 
 
 def _flag(value: Any, name: str) -> bool:
@@ -104,12 +105,21 @@ def _number(value: Any, name: str) -> float:
     return float(value)
 
 
-def _strings(value: Any, name: str) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError(f"{name} must be a list of strings")
-    return tuple(value)
+_strings = config_strings
+
+
+_TOP_KEYS = frozenset({"enabled", "repos", "roots", "worktree_ttl_days", "min_idle_hours", "pr_source",
+                       "worktrees", "docker", "rebuildable"})
+_SECTION_KEYS = {"worktrees": frozenset({"enabled"}),
+                 "docker": frozenset({"enabled", "min_age_hours", "builder_prune", "builder_keep_storage",
+                                      "image_prune"})}
+_STORAGE = re.compile(r"\d+(?:\.\d+)?\s*(?:[KMGT]i?B)", re.IGNORECASE)
+
+
+def _known(section: dict[str, Any], allowed: frozenset[str], where: str) -> None:
+    """A misspelled opt-out (``enable: false``) must not silently leave the job on."""
+    if unknown := sorted(str(key) for key in section.keys() - allowed):
+        raise ValueError(f"unknown key(s) in {where}: {', '.join(unknown)}")
 
 
 def _section(cfg: dict[str, Any], name: str) -> dict[str, Any]:
@@ -121,11 +131,16 @@ def _section(cfg: dict[str, Any], name: str) -> dict[str, Any]:
         return {"enabled": value}
     if not isinstance(value, dict):
         raise ValueError(f"{name} must be a mapping or true/false, got {value!r}")
+    _known(value, _SECTION_KEYS[name], name)
     return value
 
 
 def _parse_policy(cfg: dict[str, Any]) -> Policy:
+    _known(cfg, _TOP_KEYS, "disk_hygiene")
     wt, dk = _section(cfg, "worktrees"), _section(cfg, "docker")
+    storage = dk.get("builder_keep_storage", "5GB")
+    if not isinstance(storage, str) or not _STORAGE.fullmatch(storage.strip()):
+        raise ValueError(f"docker.builder_keep_storage must look like 5GB, got {storage!r}")
     off = os.environ.get("HERDR_DISK_HYGIENE", "1").strip().lower() in ("0", "false", "no", "off")
     return Policy(
         enabled=_flag(cfg.get("enabled", True), "enabled") and not off,
@@ -137,7 +152,7 @@ def _parse_policy(cfg: dict[str, Any]) -> Policy:
         repos=tuple(Path(r).expanduser() for r in _strings(cfg.get("repos"), "repos")),
         roots=_strings(cfg.get("roots"), "roots"),
         docker_min_age_hours=_number(dk.get("min_age_hours", 1), "docker.min_age_hours"),
-        builder_keep_storage=str(dk.get("builder_keep_storage", "5GB")),
+        builder_keep_storage=storage.strip(),
         builder_prune=_flag(dk.get("builder_prune", False), "docker.builder_prune"),
         image_prune=_flag(dk.get("image_prune", False), "docker.image_prune"),
         rebuildable=_strings(cfg.get("rebuildable"), "rebuildable"),
@@ -234,23 +249,28 @@ def last_activity(path: Path) -> float:
     return max(times)
 
 
-def pr_state(repo: Path, wt: Path, branch: str, source: PrSource) -> PrState:
+def pr_state(repo: Path, wt: Path, branch: str, head: str, source: PrSource) -> PrState:
     """merged | closed | open | none | unknown, from gh or from local git ancestry."""
     if not branch:
         return PrState.NONE
     if source == PrSource.GH:
-        pr = gh_pr_state(wt, branch, _git(wt, "rev-parse", "HEAD").stdout.strip(),
-                         _origin_owner(wt))
+        pr = gh_pr_state(wt, branch, head, _origin_owner(wt))
         if pr is None:
             return PrState.UNKNOWN
         return {"MERGED": PrState.MERGED, "CLOSED": PrState.CLOSED, "OPEN": PrState.OPEN,
                 "NONE": PrState.NONE}.get(pr["state"], PrState.UNKNOWN)
-    tip = _git(wt, "rev-parse", "HEAD").stdout.strip()
+    tip = head
     for ref in ("origin/HEAD", "origin/main", "origin/master"):
         base = _git(wt, "rev-parse", "--verify", "-q", ref).stdout.strip()
         if base and base != tip and _git(wt, "merge-base", "--is-ancestor", tip, base).returncode == 0:
             return PrState.MERGED
     return PrState.NONE
+
+
+def unpushed_ok(state: PrState) -> bool:
+    """Only a MERGED PR excuses commits that are on no remote. A CLOSED one may have been closed
+    to be reworked (and its branch deleted): those commits then live only here."""
+    return state is PrState.MERGED
 
 
 def reap_repo(repo: Path, policy: Policy, roots: list[Path], *, dry_run: bool, now: float,
@@ -273,8 +293,8 @@ def reap_repo(repo: Path, policy: Policy, roots: list[Path], *, dry_run: bool, n
             if idle < policy.min_idle_hours * 3600:
                 row.update(action="kept", reason="recent_activity")
                 continue
-            worktree_local_checks(path, policy.rebuildable)  # cheap refusals before any network call
-            state = pr_state(repo, path, item["branch"], policy.pr_source)
+            facts = worktree_local_checks(path, policy.rebuildable)  # cheap, before any network call
+            state = pr_state(repo, path, item["branch"], facts["head"], policy.pr_source)
             row["pr"] = state.value
             if state in (PrState.OPEN, PrState.UNKNOWN):
                 row.update(action="kept", reason=f"pr_{state}")
@@ -283,10 +303,11 @@ def reap_repo(repo: Path, policy: Policy, roots: list[Path], *, dry_run: bool, n
                 row.update(action="kept", reason="orphan_within_ttl")
                 continue
             reason = f"pr_{state}" if state is not PrState.NONE else "orphan_ttl"
-            closed = state in (PrState.MERGED, PrState.CLOSED)
-            # no shared snapshot: the process check inside remove_worktree is taken fresh, last
-            remove_worktree(path, dry_run=dry_run, merged_ok=closed, rebuildable=policy.rebuildable,
-                            pr_closed=closed)
+            merged = unpushed_ok(state)
+            # no shared snapshot: the process check inside remove_worktree is taken fresh, last.
+            # Only HEAD and cleanliness are re-checked; the PR head must still be this HEAD.
+            remove_worktree(path, dry_run=dry_run, merged_ok=merged, rebuildable=policy.rebuildable,
+                            pr_head=facts["head"] if merged else None, prechecked=facts)
             row.update(action="would_remove" if dry_run else "removed", reason=reason)
         except Refusal as exc:
             row.update(action="kept", reason=exc.code)
@@ -378,6 +399,9 @@ def main_args(args: argparse.Namespace) -> int:
         report = {"policy": {"enabled": policy.enabled, "worktrees": policy.worktrees,
                              "docker": policy.docker, "ttl_days": policy.ttl_days,
                              "pr_source": policy.pr_source}}
+        if policy.config_error:
+            report["status"] = "config_unreadable"
+            report["config_error"] = policy.config_error
     else:
         try:
             report = run(policy, only=args.only, dry_run=args.dry_run,
@@ -387,5 +411,5 @@ def main_args(args: argparse.Namespace) -> int:
         if not args.dry_run:
             _write_status(report)  # always, so the file never shows a stale "last good" report
     print(json.dumps(report, indent=None if args.json else 2, default=str))
-    return 1 if report.get("status") == "error" else 0
+    return 1 if report.get("status") in ("error", "config_unreadable") else 0
 

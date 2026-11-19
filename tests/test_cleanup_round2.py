@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -245,8 +246,9 @@ def test_scratch_structure_is_never_deleted(tmp_path: Path, level: str) -> None:
     assert session.is_dir()
 
 
-def test_scratch_inside_own_session_is_removable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION)  # an agent cleans up its own session
+def test_scratch_inside_own_session_is_removable(tmp_path: Path, home: Path) -> None:
+    from .test_cleanup_round3 import claim_session
+    claim_session(home, SESSION)  # an agent cleans up its own session
     root, _, session = _scratch(tmp_path)
     assert _scratch_cleanup(tmp_path, session / "scratchpad" / "a.txt", root)["action"] == "removed"
     assert _scratch_cleanup(tmp_path, session / "scratchpad", root)["action"] == "removed"
@@ -318,11 +320,22 @@ def test_reaper_does_not_prune_registrations_outside_agent_roots(env: Env, tmp_p
 
 # --- 7: robustness ---------------------------------------------------------------------------------
 
-def _hang_on_status(repo: Path) -> None:
-    script = repo.parent / "slow-fsmonitor.sh"
-    script.write_text("#!/bin/sh\nsleep 4\n")
-    script.chmod(0o755)
-    git(repo, "config", "core.fsmonitor", str(script))
+def git_shim(directory: Path, monkeypatch: pytest.MonkeyPatch, before_status: str) -> None:
+    """A real ``git`` pass-through earlier on PATH that first runs ``before_status`` (shell) when
+    git is asked for ``status``. The hardened runner ignores repo/user config such as
+    ``core.fsmonitor``, so slow or racing git is staged at the executable instead."""
+    real = shutil.which("git")
+    assert real
+    directory.mkdir(exist_ok=True)
+    shim = directory / "git"
+    shim.write_text(f'#!/bin/sh\nfor a in "$@"; do if [ "$a" = status ]; then {before_status}; break; fi; done\n'
+                    f'exec {real} "$@"\n')
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ['PATH']}")
+
+
+def _hang_on_status(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    git_shim(repo.parent / "slow-shim", monkeypatch, "sleep 4")
 
 
 def _user_config(home: Path, text: str) -> None:
@@ -334,7 +347,7 @@ def test_reaper_survives_git_timeouts_and_still_reports(
     import herdr_engineering.cleanup_command as cc
     wt = env.worktree("slow")
     ok = env.worktree("fine")
-    _hang_on_status(env.repo)  # every `git status` of the repo's worktrees now takes 4 s
+    _hang_on_status(env.repo, monkeypatch)  # every `git status` of the repo's worktrees now takes 4 s
     monkeypatch.setattr(cc, "GIT_TIMEOUT", 1)
     monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(home / "state"))
     _user_config(home, f"disk_hygiene:\n  roots: ['{env.roots[0]}']\n  repos: ['{env.repo}']\n"
@@ -360,7 +373,7 @@ def test_cli_turns_timeout_into_a_clean_refusal(env: Env, home: Path, monkeypatc
                                                 capsys: pytest.CaptureFixture[str]) -> None:
     import herdr_engineering.cleanup_command as cc
     wt = env.worktree("slowcli")
-    _hang_on_status(env.repo)
+    _hang_on_status(env.repo, monkeypatch)
     monkeypatch.setattr(cc, "GIT_TIMEOUT", 1)
     _user_config(home, f"disk_hygiene:\n  roots: ['{env.roots[0]}']\n")
     rc = main(["--scope", "worktree", "--path", str(wt), "--json"])
@@ -368,6 +381,7 @@ def test_cli_turns_timeout_into_a_clean_refusal(env: Env, home: Path, monkeypatc
     assert rc == 1 and out["refused"] == "timeout" and wt.exists()
 
 
+@pytest.mark.skipif(Path("/proc").is_dir(), reason="Linux falls back to the real /proc (tests/test_cleanup_round4.py)")
 def test_reaper_survives_missing_process_inspection(env: Env, tmp_path: Path,
                                                     monkeypatch: pytest.MonkeyPatch) -> None:
     git_bin = Path(subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip())

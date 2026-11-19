@@ -21,10 +21,10 @@ classifier blocks. It is not a bypass:
 | no running process has its cwd, executable or an open file inside (`ps` + `lsof`; on Linux without `lsof` the `/proc` fds and cwds are used). If neither source works the command refuses. The check runs last, right before each removal, and the reaper repeats it per worktree | worktree, target, tmp |
 | refuses repo main checkouts and non-worktrees | worktree |
 | refuses a dirty tree (uncommitted or untracked files) and skip-worktree/assume-unchanged entries (hidden edits) | worktree |
-| refuses commits that are on no remote ref; `--merged-ok` relaxes only if the commits are patch-merged into `origin/main` or `gh` reports the PR merged/closed for the same head branch, head SHA and origin owner (fork PRs and reused branch names do not match) | worktree |
+| refuses commits that are on no remote ref; `--merged-ok` relaxes only if the commits are patch-merged into `origin/main` or `gh` reports the PR MERGED for the same head branch, origin owner and a head SHA equal to the HEAD being removed (fork PRs, reused branch names and commits made after the lookup do not match). A CLOSED but unmerged PR does not excuse unpushed commits | worktree |
 | must be a Cargo `target` (build markers, sibling `Cargo.toml`), no tracked files, no active build lease (refused while one is held) | target |
 | only under temp roots (`$TMPDIR`, `/tmp`, `/tmp/claude-<uid>`); refuses anything that is, is inside or contains a git repository of any layout (normal, bare, separate git dir; detected by content, use `--scope worktree`), a `.keep` marker, and a tree with foreign-owned entries, read-only directories or special files (verified before anything is deleted) | tmp |
-| under the Claude scratch root only strictly inside a `<session>` directory (never the root, a `<project>` or the session itself; path comparison is by device/inode, so letter case does not matter on macOS). Your own session (`CLAUDE_CODE_SESSION_ID`) may clean its subpaths. Any other session must pass the `scratch_reaper` policy: no recent transcript (live) and idle for 48 h | tmp |
+| under the Claude scratch root only strictly inside a `<session>` directory (never the root, a `<project>` or the session itself; path comparison is by device/inode, so letter case does not matter on macOS). Your own session may clean its subpaths: it is recognised only when one of this process's ancestors is the Claude process recorded in `~/.claude/sessions/<pid>.json` for that session id (an environment variable proves nothing). Any other session must pass the `scratch_reaper` policy: no recent transcript (live) and idle for 48 h | tmp |
 | refuses ignored-but-present files that are not rebuildable output (`.env`, local DBs; allowed: `target`, `node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `.tox`, `*.egg-info`, `dist`, `build`, `coverage`, `.next`, `.gradle`, `.cache`, ... plus `disk_hygiene.rebuildable`), and any such directory that contains a nested git repository | worktree |
 | container must carry label `herdr.ephemeral=1` and be stopped | docker |
 
@@ -62,7 +62,8 @@ worktrees inside an agent root are ever reaped, never the user's own). It decide
 
 | Situation | Action |
 |---|---|
-| PR merged or closed, tree clean, nothing unpushed | remove worktree and the `target/` inside it |
+| PR merged (or closed with nothing unpushed), tree clean | remove worktree and the `target/` inside it |
+| PR closed, not merged, commits on no remote | keep |
 | no PR, idle longer than `worktree_ttl_days` (7), clean, fully pushed | remove |
 | PR open; PR state unknown (gh missing/offline/not GitHub) | keep |
 | activity within `min_idle_hours` (2); locked; running process; dirty; unpushed | keep |
@@ -121,3 +122,10 @@ scripts/install-disk-hygiene.sh install            # systemd user timers (Linux)
 scripts/install-disk-hygiene.sh status
 herdr-eng disk-hygiene run --dry-run --json        # preview what would be removed
 ```
+
+## Strictness and exit codes
+
+- Every git call runs through the hardened `scratch_safety.git` runner: `GIT_*` stripped, no user or system git config, no fsmonitor or hooks. A repo or user setting such as `status.showUntrackedFiles=no` cannot hide ignored files from the checks.
+- Unknown keys in `disk_hygiene`, `worktrees` or `docker` (for example `enable: false`), a non-list `rebuildable` and a malformed `docker.builder_keep_storage` fail closed: every destructive job is disabled.
+- `disk-hygiene run` and `status` exit 1 and report `config_error` when the config is unreadable or invalid.
+- Without `lsof` on Linux the process check falls back to the real `/proc` plus `ps`; with neither it refuses (`in_use`).
