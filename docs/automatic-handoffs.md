@@ -96,9 +96,10 @@ handoff_autopilot:
     sonnet-big: 500000            # add your own
 ```
 
-Read from the machine config (`~/.config/herdr-engineering/config.yaml`), the repository config
-(`./config/herdr-engineering.yaml` or `./herdr-engineering.yaml`) or `$HERDR_ENGINEERING_CONFIG`,
-exactly like every other section - later ones win.
+Read from the machine config (`~/.config/herdr-engineering/config.yaml`) or
+`$HERDR_ENGINEERING_CONFIG` only. Repository-local config files are untrusted, so a
+`handoff_autopilot` section in `./config/herdr-engineering.yaml` or `./herdr-engineering.yaml` is
+ignored; later of the two readable sources wins.
 
 **The window, and why it is sometimes an assumption.** Pi states both numbers, so the percentage
 is exact. Claude Code's transcripts record `message.usage` and the model, but never the size of
