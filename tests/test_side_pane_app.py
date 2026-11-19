@@ -348,3 +348,43 @@ def test_runner_survives_a_missing_store_and_a_gone_pane() -> None:
         assert side.send_keys(pane, ["1"])
         assert wait_for(lambda: "Goal" in screen_of(side, pane) or "no briefing" in screen_of(side, pane), 10.0)
         assert side.panes() is not None and pane in [r.pane_id for r in side.panes() or []]
+
+
+# ------------------------------------------------------------------ without a Herdr server (the binary is not there)
+def gone_app(tmp_path: Path, tab: str | None = "w1:t1", pane: str | None = "w1:p2") -> app.PaneApp:
+    return app.PaneApp(tab, pane, SideHerdr(binary=str(tmp_path / "no-herdr")), {"HERDR_ENGINEERING_STATE": str(tmp_path)},
+                       fetch_ci=None, store_root=tmp_path / "store")
+
+
+def test_refresh_without_herdr_keeps_the_screen_and_says_so(tmp_path: Path) -> None:
+    pane_app = gone_app(tmp_path)
+    pane_app.refresh(1000.0)
+    assert pane_app.snapshot.note and pane_app.snapshot.session is None
+    assert any(pane_app.screen.render(44, 12, 1000.0))
+
+
+def test_a_pane_without_a_tab_reports_it_is_outside_herdr(tmp_path: Path) -> None:
+    pane_app = gone_app(tmp_path, tab=None, pane=None)
+    assert pane_app.tick(1.0, 1000.0) and pane_app.snapshot.note
+    assert not pane_app.tick(1.5, 1000.5)  # the events schedule has not come due again
+
+
+def test_q_is_remembered_and_the_tab_keys_still_work(tmp_path: Path) -> None:
+    pane_app = gone_app(tmp_path)
+    assert pane_app.on_text("2") is True and pane_app.on_text("x") is False and not pane_app.quit_requested
+    assert pane_app.on_text("q") is False and pane_app.quit_requested
+
+
+def test_closing_removes_the_marker_and_a_quit_leaves_nothing_behind_without_sessions(tmp_path: Path) -> None:
+    root = state.state_dir({"HERDR_ENGINEERING_STATE": str(tmp_path)})
+    state.write_marker(root, state.Marker("w1:t1", "w1:p2", "t-2", None, 1, 1000.0))
+    pane_app = gone_app(tmp_path)
+    pane_app.on_text("q")
+    pane_app.close()
+    assert state.read_marker(root, "w1:t1") is None
+
+
+def test_run_without_pane_or_tab_exits_2_in_process(capsys: pytest.CaptureFixture[str]) -> None:
+    assert app.run(["--no-ci"], {"PATH": ""}) == 2
+    assert len(capsys.readouterr().err.strip().splitlines()) == 1
+    assert app.run(["--bogus"], {}) == 2

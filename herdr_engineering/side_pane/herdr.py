@@ -23,12 +23,19 @@ class PaneRow:
 
 
 @dataclass(frozen=True)
+class Rect:
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
 class Layout:
     """One tab's layout: the focused pane of that tab and the cells every pane has."""
     tab_id: str
     focused_pane_id: str | None
-    widths: Mapping[str, int]
-    heights: Mapping[str, int]
+    rects: Mapping[str, Rect]
 
 
 def _text(value: object) -> str | None:
@@ -46,26 +53,57 @@ def _row(raw: object) -> PaneRow | None:
     return PaneRow(pane, tab, terminal, raw.get("focused") is True) if pane and tab and terminal else None
 
 
+def _result(text: str) -> dict[str, object] | None:
+    """The `result` object of one `herdr ... ` JSON reply, or None when it is not one."""
+    try:
+        reply = json.loads(text)["result"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return reply if isinstance(reply, dict) else None
+
+
+def parse_panes(text: str) -> list[PaneRow] | None:
+    """The rows of a `herdr pane list` reply; one that cannot be read is skipped."""
+    reply = _result(text)
+    rows = reply.get("panes") if reply else None
+    return [row for row in map(_row, rows) if row] if isinstance(rows, list) else None
+
+
+def parse_pane(text: str) -> PaneRow | None:
+    """The row of a `herdr pane get` or `pane split` reply."""
+    reply = _result(text)
+    return _row(reply.get("pane")) if reply else None
+
+
+def parse_layout(text: str) -> Layout | None:
+    """The layout of a `herdr pane layout` reply: the focused pane of the tab and every pane's cells."""
+    reply = _result(text)
+    raw = reply.get("layout") if reply else None
+    if not isinstance(raw, dict) or not _text(raw.get("tab_id")) or not isinstance(raw.get("panes"), list):
+        return None
+    rects: dict[str, Rect] = {}
+    for entry in raw["panes"]:
+        rect = entry.get("rect") if isinstance(entry, dict) else None
+        pane = _text(entry.get("pane_id")) if isinstance(entry, dict) else None
+        cells = [_int(rect.get(k)) for k in ("x", "y", "width", "height")] if isinstance(rect, dict) else []
+        if pane and len(cells) == 4 and None not in cells:
+            rects[pane] = Rect(*cells)  # type: ignore[arg-type]
+    return Layout(str(raw["tab_id"]), _text(raw.get("focused_pane_id")), rects)
+
+
 class SideHerdr(HerdrCli):
-    def _json(self, args: list[str]) -> dict[str, object] | None:
+    def _stdout(self, args: list[str]) -> str | None:
         done = self._run(args, _QUICK_S)
-        if done is None or done.returncode != 0:
-            return None
-        try:
-            reply = json.loads(done.stdout)["result"]
-        except (ValueError, KeyError, TypeError):
-            return None
-        return reply if isinstance(reply, dict) else None
+        return done.stdout if done is not None and done.returncode == 0 else None
 
     def panes(self) -> list[PaneRow] | None:
         """Every pane Herdr lists, or None when it cannot be asked."""
-        reply = self._json(["pane", "list"])
-        rows = reply.get("panes") if reply else None
-        return [row for row in map(_row, rows) if row] if isinstance(rows, list) else None
+        text = self._stdout(["pane", "list"])
+        return parse_panes(text) if text is not None else None
 
     def pane(self, pane_id: str) -> PaneRow | None:
-        reply = self._json(["pane", "get", pane_id])
-        return _row(reply.get("pane")) if reply else None
+        text = self._stdout(["pane", "get", pane_id])
+        return parse_pane(text) if text is not None else None
 
     def tab_of(self, pane_id: str) -> str | None:
         row = self.pane(pane_id)
@@ -73,27 +111,16 @@ class SideHerdr(HerdrCli):
 
     def layout(self, pane_id: str) -> Layout | None:
         """The layout of the tab that holds `pane_id`; None when the pane or Herdr is gone."""
-        reply = self._json(["pane", "layout", "--pane", pane_id])
-        raw = reply.get("layout") if reply else None
-        if not isinstance(raw, dict) or not _text(raw.get("tab_id")) or not isinstance(raw.get("panes"), list):
-            return None
-        widths: dict[str, int] = {}
-        heights: dict[str, int] = {}
-        for entry in raw["panes"]:
-            rect = entry.get("rect") if isinstance(entry, dict) else None
-            pane, width, height = (_text(entry.get("pane_id")), _int(rect.get("width")), _int(rect.get("height"))) \
-                if isinstance(rect, dict) else (None, None, None)
-            if pane and width is not None and height is not None:
-                widths[pane], heights[pane] = width, height
-        return Layout(str(raw["tab_id"]), _text(raw.get("focused_pane_id")), widths, heights)
+        text = self._stdout(["pane", "layout", "--pane", pane_id])
+        return parse_layout(text) if text is not None else None
 
     def split(self, target: str, ratio: float, env: Mapping[str, str] | None = None) -> PaneRow | None:
         """A new pane to the right of `target`, without taking focus; `ratio` is the share `target` keeps."""
         args = ["pane", "split", target, "--direction", "right", "--ratio", f"{ratio:.4f}", "--no-focus"]
         for key, value in (env or {}).items():
             args += ["--env", f"{key}={value}"]
-        reply = self._json(args)
-        return _row(reply.get("pane")) if reply else None
+        text = self._stdout(args)
+        return parse_pane(text) if text is not None else None
 
     def run_in(self, pane_id: str, command: str) -> bool:
         """Type `command` into the pane's shell and press enter."""
@@ -113,7 +140,7 @@ class SideHerdr(HerdrCli):
             return False
         if self._run(["tab", "focus", row.tab_id], _QUICK_S) is None:
             return False
-        for _ in range(len(layout.widths) + 1):
+        for _ in range(len(layout.rects) + 1):
             current = self.layout(pane_id)
             if current is None or current.focused_pane_id == pane_id:
                 return current is not None

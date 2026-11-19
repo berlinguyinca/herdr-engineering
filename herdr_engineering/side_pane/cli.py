@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from collections.abc import Mapping
 
 from . import app
+from .placement import DEFAULT_COMMAND, Outcome, ensure
 
 _DESCRIPTION = """The session side pane: a read-only viewer of the focused session of its own Herdr tab (Summary, Handoffs, CI).
 
@@ -19,3 +22,17 @@ def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     run = ssub.add_parser("run", help="run the viewer in this pane (q closes it)")
     app.add_run_arguments(run)
     run.set_defaults(func=app.run_with)
+    again = ssub.add_parser("ensure", help="open the side pane of a tab, also after q closed it",
+                            description="Open the side pane of TAB_ID unless it has one or the tab is too narrow for it. "
+                                        "Clears the memory that q (or closing the pane) leaves, so a closed pane comes back.")
+    again.add_argument("--tab", required=True, metavar="TAB_ID", help="the Herdr tab")
+    again.add_argument("--pane", default=None, help="split this pane (default: the rightmost pane of the tab)")
+    again.add_argument("--command", default=DEFAULT_COMMAND, help=argparse.SUPPRESS)
+    again.set_defaults(func=_ensure)
+
+
+def _ensure(args: argparse.Namespace, env: Mapping[str, str] | None = None) -> int:
+    """Open the tab's side pane, also after q closed it (the dismissal is cleared). 0 when the tab has one afterwards."""
+    result = ensure(args.tab, args.pane, env=env, command=args.command, force=True)
+    print(f"side-pane {args.tab}: {result.outcome}" + (f" {result.pane_id}" if result.pane_id else ""), file=sys.stderr)
+    return 0 if result.outcome in (Outcome.CREATED, Outcome.EXISTS) else 1

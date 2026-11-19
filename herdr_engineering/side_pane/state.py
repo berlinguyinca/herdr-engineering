@@ -107,16 +107,19 @@ def _alive(pid: int) -> bool:
     return True
 
 
+def marker_live(marker: Marker, now: float) -> bool:
+    """Whether the marker's runner is alive, or has not started yet (a marker `ensure` wrote, within the startup grace)."""
+    if marker.pid is None:
+        return 0 <= now - marker.created < STARTUP_GRACE_S
+    return _alive(marker.pid)
+
+
 def is_marked(root: Path, pane: AgentPane, now: float) -> bool:
     """Whether `pane` is the live side pane of its tab: the marker names it and its runner is alive (or has not started yet)."""
     if pane.tab_id is None:
         return False
     marker = read_marker(root, pane.tab_id)
-    if marker is None or marker.pane_id != pane.pane_id:
-        return False
-    if marker.pid is None:
-        return 0 <= now - marker.created < STARTUP_GRACE_S
-    return _alive(marker.pid)
+    return marker is not None and marker.pane_id == pane.pane_id and marker_live(marker, now)
 
 
 @contextmanager
