@@ -21,7 +21,7 @@ def run_viewer_cli(env: dict[str, str], cwd: Path, *args: str) -> subprocess.Com
 
 
 def test_it_refuses_when_stdin_is_not_a_terminal(tmp_path: Path) -> None:
-    env = {"HOME": str(tmp_path), "HERDR_ENGINEERING_STATE": str(tmp_path / "state"), "HERDR_PANE_ID": "w1:p9"}
+    env = {"HOME": str(tmp_path), "PATH": str(tmp_path), "HERDR_ENGINEERING_STATE": str(tmp_path / "state"), "HERDR_PANE_ID": "w1:p9"}
     done = run_viewer_cli(env, tmp_path)
     assert done.returncode == 2 and done.stdout == ""
     assert len(done.stderr.strip().splitlines()) == 1 and "not a terminal" in done.stderr, done.stderr

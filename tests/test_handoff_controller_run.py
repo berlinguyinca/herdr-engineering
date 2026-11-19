@@ -93,6 +93,7 @@ class World:
                          drain_attempt_s=0.2, drain_poll_s=0.05, fallback_timeout_s=30.0,
                          takeover_kwargs=kwargs or {})  # type: ignore[arg-type]
         ctl.adapters[Harness.CLAUDE] = ClaudeAdapter(home=self.tmp / "home")
+        ctl.ensure_side_pane = lambda tab_id: None  # the real hook asks Herdr; these tests have none
         ctl.look = lambda ref, adapter, herdr: Look("idle", True, False)  # no Herdr here: every pane is ready to take over
         return ctl
 
