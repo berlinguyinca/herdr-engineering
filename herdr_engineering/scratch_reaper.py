@@ -188,8 +188,13 @@ def system_temp_roots() -> tuple[Path, ...]:
             value = os.confstr("CS_DARWIN_USER_TEMP_DIR")
         except (AttributeError, ValueError, OSError):
             try:
-                value = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True,
-                                       timeout=10, check=False).stdout.strip()
+                value = subprocess.run(
+                    ["getconf", "DARWIN_USER_TEMP_DIR"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                ).stdout.strip()
             except (OSError, subprocess.SubprocessError):
                 value = ""
         if value.startswith("/"):

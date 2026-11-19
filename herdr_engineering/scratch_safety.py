@@ -122,17 +122,40 @@ def inspect_tree(
 
 # Variables that would point git at another repository, index or object store. The user's own config
 # variables (GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG_NOSYSTEM) are kept: they decide what is ignored.
-_REDIRECTING_GIT_VARIABLES = frozenset({
-    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-    "GIT_PREFIX", "GIT_QUARANTINE_PATH", "GIT_REPLACE_REF_BASE", "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE",
-    "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_EXTERNAL_DIFF", "GIT_ATTR_SOURCE",
-    "GIT_ASKPASS", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_DEFAULT_HASH", "GIT_NO_REPLACE_OBJECTS",
-})
+_REDIRECTING_GIT_VARIABLES = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_PREFIX",
+        "GIT_QUARANTINE_PATH",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_GRAFT_FILE",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_ATTR_SOURCE",
+        "GIT_ASKPASS",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        "GIT_DEFAULT_HASH",
+        "GIT_NO_REPLACE_OBJECTS",
+    }
+)
 
 
 def git(repo: Path, *arguments: str, timeout: float = 15) -> subprocess.CompletedProcess[str]:
-    environment = {key: value for key, value in os.environ.items() if key not in _REDIRECTING_GIT_VARIABLES}
+    environment = {
+        key: value for key, value in os.environ.items() if key not in _REDIRECTING_GIT_VARIABLES
+    }
     environment.update(
         GIT_OPTIONAL_LOCKS="0",
         GIT_NO_LAZY_FETCH="1",
