@@ -51,6 +51,18 @@ def test_failed_chains_in_a_row_are_one_row_each_newest_last_and_capped(tmp_path
     assert len(model.rows) == 10 and model.hidden == 4
     assert [r.live for r in model.rows] == [False] * 9 + [True]
     assert model.totals.failures == 14
+    assert model.totals.sessions == 1  # fourteen failed attempts of one session: one session
+
+
+def test_a_green_chain_without_a_record_after_a_red_one_clears_the_live_red_and_the_attention(tmp_path: Path) -> None:
+    log = EventLog(tmp_path)
+    chain_events(log, 1, 60, "handoff.triggered", "handoff.stuck", reason="no_briefing")
+    assert build_model(session_ref("p-1", "s1"), tmp_path, {}, NOW).chain_attention
+    chain_events(log, 2, 10, "handoff.triggered", "handoff.succeeded")
+    model = build_model(session_ref("p-1", "s1"), tmp_path, {}, NOW)
+    assert [r.colour for r in model.rows] == [Colour.RED, Colour.GREEN] and model.rows[-1].live
+    assert not model.chain_attention and not model.attention
+    assert (model.totals.handoffs, model.totals.failures, model.totals.sessions) == (1, 1, 1)
 
 
 def test_a_green_chain_without_a_record_alone_shows_nothing(tmp_path: Path) -> None:
@@ -88,6 +100,10 @@ def test_reason_details_and_unknown_reasons() -> None:
     assert phrase("internal_error:ValueError").startswith("internal error")
     assert "(ValueError)" in phrase("internal_error:ValueError")
     assert phrase("on_main_with_changes; foo") == phrase("on_main_with_changes")
+    assert phrase("git_state_unknown:detached") == "git state unknown (detached)"
+    assert phrase("takeover_refused_and_compaction_failed:not_ready; last takeover result: exit 2") == (
+        "takeover refused, compaction failed (not ready)")
+    assert phrase("on_main_with_changes:\x1b[31m" + "x" * 80).count("x") <= 24
     odd = phrase("weird\x1b[31m reason " + "x" * 200)
     assert "\x1b" not in odd and len(odd) <= 48
 

@@ -5,6 +5,7 @@ from ..handoff_controller.events import Phase, StuckReason
 from .style import clean
 
 _CUT = 48
+_DETAIL_CUT = 24
 
 REASON_PHRASES: dict[StuckReason, str] = {
     StuckReason.TAKEOVER_REFUSED_AND_COMPACTION_FAILED: "takeover refused, compaction failed",
@@ -43,7 +44,8 @@ def phrase(reason: str) -> str:
         known = REASON_PHRASES[StuckReason(name)]
     except (ValueError, KeyError):
         return text if len(text) <= _CUT else text[:_CUT - 1] + "…"
-    return f"{known} ({detail.strip()[:24]})" if name == StuckReason.INTERNAL_ERROR.value and detail.strip() else known
+    shown = " ".join(detail.split(";")[0].replace("_", " ").split())[:_DETAIL_CUT]  # the part after the colon, as a few words
+    return f"{known} ({shown})" if shown else known
 
 
 def phase_label(phase: Phase, *, attempts: int, max_attempts: int, compacting: bool) -> str:

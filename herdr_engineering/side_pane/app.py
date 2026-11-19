@@ -6,8 +6,8 @@ replaced it. Everything slow (Herdr, the event log, CI) happens on background th
 `Snapshot`; the render path only reads the latest one, so a slow Herdr, Woodpecker or GitHub never freezes the keys.
 
 Data sources: the controller's event log and shared store; the Herdr CLI; pull requests from `gh pr list` run with the
-user's own `gh` login, for the focused session's directory and branch only (a chain spanning repositories shows the
-current repository's PRs); pipelines from Woodpecker's public reads. No Woodpecker token is ever used.
+user's own `gh` login, for the focused session's repository: its checked-out branch and every branch the chain's
+records name there (a chain spanning repositories shows the current repository's PRs only); pipelines from Woodpecker's public reads. No Woodpecker token is ever used.
 """
 from __future__ import annotations
 
@@ -306,7 +306,10 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _refusal(pane: str | None, herdr: SideHerdr) -> str | None:
     """Why this process must not become a side pane: a session pane (which a marker would hide from the controller) or no terminal."""
-    if pane and any(agent.pane_id == pane for agent in herdr.agents() or []):
+    agents = herdr.agents() if pane else []
+    if agents is None:
+        return f"side-pane run: cannot verify this pane: `herdr agent list` does not answer ({pane})"
+    if pane and any(agent.pane_id == pane for agent in agents):
         return f"side-pane run: pane {pane} hosts a managed agent session and is not a side pane; run it in a pane of its own"
     if not sys.stdin.isatty():
         return "side-pane run: stdin is not a terminal; run it in a Herdr pane"

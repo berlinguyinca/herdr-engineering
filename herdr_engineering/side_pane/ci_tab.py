@@ -17,7 +17,7 @@ from typing import Protocol
 from ..agent_ops_tui import RenderOpts
 from ..ci import PipelineView
 from ..errors import HerdrEngineeringError
-from .style import Seg, Style, duration, line
+from .style import Seg, Style, clean, duration, line
 
 
 class CiProvider(Protocol):
@@ -30,6 +30,7 @@ class CiState(StrEnum):
     PASSED = "passed"
     FAILED = "failed"
     NOT_STARTED = "not_started"  # nothing ran: shown grey, not red
+    ATTENTION = "attention"  # a check was cancelled, skipped or is in a state this pane does not know: never "ready"
     MERGED = "merged"
     UNAVAILABLE = "unavailable"  # CI could not be read
 
@@ -46,7 +47,8 @@ class CiCard:
     running: tuple[str, ...] = ()
     reason: str | None = None
     waiting: tuple[str, ...] = ()  # checks that exist and have not started: grey
-    pushed_by: tuple[int, float] | None = None  # (session number in the chain, epoch seconds) of the checkpoint push
+    other: tuple[str, ...] = ()  # checks that ended or stand in a state that is neither pass nor fail: grey, with the state named
+    committed_by: tuple[int, float, bool] | None = None  # (session number in the chain, epoch seconds, pushed) of the checkpoint commit
     stale: bool = False  # the last good read, kept while the newest one failed or timed out
 
 
@@ -93,18 +95,29 @@ def _read(repo: str, provider: CiProvider) -> list[PipelineView] | None:
 
 _FAILED_CONCLUSIONS = frozenset({"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"})
 _CONTEXT_KIND = {"SUCCESS": "passed", "FAILURE": "failed", "ERROR": "failed", "PENDING": "running", "EXPECTED": "waiting"}
+_QUEUED = frozenset({"QUEUED", "PENDING", "WAITING", "REQUESTED"})
+_STATE_CUT = 20
 _WOODPECKER = "ci/woodpecker/"
 
 
-def _kind(entry: Mapping[str, object]) -> str | None:
-    """`passed`, `failed`, `running` or `waiting` (exists, not started) for one rollup entry; None when unreadable."""
+def _kind(entry: Mapping[str, object]) -> tuple[str, str]:
+    """(kind, state) of one rollup entry: kind is `passed`, `failed`, `running`, `waiting` (exists, not started) or `other`
+    (cancelled, skipped, or a state this pane does not know); state is the raw word GitHub gave, for the chip of an `other`."""
     if _field(entry, "context"):
-        return _CONTEXT_KIND.get(_field(entry, "state") or "")
-    status = _field(entry, "status")
+        state = _field(entry, "state") or ""
+        return _CONTEXT_KIND.get(state, "other"), state
+    status = _field(entry, "status") or ""
     if status == "COMPLETED":
         conclusion = _field(entry, "conclusion") or ""
-        return "failed" if conclusion in _FAILED_CONCLUSIONS else "passed" if conclusion in ("SUCCESS", "NEUTRAL") else "waiting"
-    return "running" if status == "IN_PROGRESS" else "waiting" if status else None
+        kind = "failed" if conclusion in _FAILED_CONCLUSIONS else "passed" if conclusion in ("SUCCESS", "NEUTRAL") else "other"
+        return kind, conclusion
+    return ("running" if status == "IN_PROGRESS" else "waiting" if status in _QUEUED else "other"), status
+
+
+def _said(state: str) -> str:
+    """A raw state as a few lower-case words: `STALE`, `TIMED_OUT` -> `stale`, `timed out`; never an escape sequence."""
+    words = " ".join("".join(c if c.isalnum() else " " for c in clean(state).lower()).split())
+    return (words[:_STATE_CUT] or "unknown").strip()
 
 
 def _rollup(pull: Mapping[str, object] | None) -> list[tuple[str, str]]:
@@ -115,14 +128,14 @@ def _rollup(pull: Mapping[str, object] | None) -> list[tuple[str, str]]:
     names = [_field(e, "context") or _field(e, "name") or "" for e in entries]
     out: list[tuple[str, str]] = []
     for entry, name in zip(entries, names, strict=True):
-        kind = _kind(entry)
-        if not name or kind is None:
+        kind, raw = _kind(entry)
+        if not name:
             continue
         if name.startswith(_WOODPECKER):
             name = name.rsplit("/", 1)[-1]
         elif names.count(name) > 1 and _field(entry, "workflowName"):
             name = f"{name} ({_field(entry, 'workflowName')})"
-        out.append((name, kind))
+        out.append((f"{name} ({_said(raw)})" if kind == "other" else name, kind))
     return out
 
 
@@ -135,14 +148,17 @@ def _with_rollup(card: CiCard, checks: Sequence[tuple[str, str]]) -> CiCard:
     failed = (*card.failed, *(n for n, k in extra if k == "failed"))
     running = (*card.running, *(n for n, k in extra if k == "running"))
     waiting = tuple(n for n, k in extra if k == "waiting")
+    other = tuple(n for n, k in extra if k == "other")
     state = card.state
     if failed:
         state = CiState.FAILED
-    elif running:
+    elif running or waiting:
         state = CiState.RUNNING
+    elif other and state is not CiState.FAILED:
+        state = CiState.ATTENTION  # ready needs every known check to have passed
     elif state in (CiState.UNAVAILABLE, CiState.NOT_STARTED) and checks:
         state = CiState.PASSED if any(k == "passed" for _, k in checks) else CiState.NOT_STARTED
-    return replace(card, state=state, workflows=workflows, failed=failed, running=running, waiting=waiting,
+    return replace(card, state=state, workflows=workflows, failed=failed, running=running, waiting=waiting, other=other,
                    reason=f"{failed[0]} failed" if failed else card.reason)
 
 
@@ -189,12 +205,12 @@ def build_cards(repo: str, branches: Sequence[str], provider: CiProvider,
 
 def ci_attention(cards: Sequence[CiCard]) -> bool:
     """True when something runs or fails."""
-    return any(c.state in (CiState.RUNNING, CiState.FAILED) and not c.stale for c in cards)
+    return any(c.state in (CiState.RUNNING, CiState.FAILED, CiState.ATTENTION) and not c.stale for c in cards)
 
 
-_STYLE = {CiState.RUNNING: Style.YELLOW, CiState.PASSED: Style.GREEN, CiState.FAILED: Style.RED, CiState.NOT_STARTED: Style.GRAY,
+_STYLE = {CiState.RUNNING: Style.YELLOW, CiState.ATTENTION: Style.YELLOW, CiState.PASSED: Style.GREEN, CiState.FAILED: Style.RED, CiState.NOT_STARTED: Style.GRAY,
           CiState.MERGED: Style.GRAY, CiState.UNAVAILABLE: Style.GRAY}
-_WORD = {CiState.RUNNING: "running", CiState.PASSED: "ready", CiState.FAILED: "failing", CiState.NOT_STARTED: "not started",
+_WORD = {CiState.RUNNING: "running", CiState.ATTENTION: "needs attention", CiState.PASSED: "ready", CiState.FAILED: "failing", CiState.NOT_STARTED: "not started",
          CiState.UNAVAILABLE: "CI unavailable"}
 
 
@@ -202,7 +218,7 @@ def _chips(card: CiCard) -> list[Seg]:
     segs: list[Seg] = []
     for name in card.workflows:
         style = (Style.RED if name in card.failed else Style.YELLOW if name in card.running
-                 else Style.GRAY if name in card.waiting else Style.GREEN)
+                 else Style.GRAY if name in card.waiting or name in card.other else Style.GREEN)
         segs += [(" " if segs else "", None), (name, style)]
     return segs
 
@@ -214,8 +230,13 @@ def _counts(cards: Sequence[CiCard]) -> str:
     return f"{len(open_cards)} open · {running} running · {failing} failing"
 
 
+def _committed(committed_by: tuple[int, float, bool], now: float) -> str:
+    number, at, pushed = committed_by
+    return f"committed by #{number}, {duration(now - at)} ago" + ("" if pushed else ", not pushed")
+
+
 def lines(cards: Sequence[CiCard], width: int, opts: RenderOpts, now: float | None = None) -> list[str]:
-    """One card per open PR or branch; every merged one shares a single line. `now` (epoch seconds) dates "Pushed by"."""
+    """One card per open PR or branch; every merged one shares a single line. `now` (epoch seconds) dates "committed by"."""
     if not cards:
         return [line([("no CI to show", Style.GRAY)], width, opts)]
     out = [line([(_counts(cards), Style.BOLD)], width, opts)]
@@ -223,8 +244,8 @@ def lines(cards: Sequence[CiCard], width: int, opts: RenderOpts, now: float | No
         style = _STYLE[card.state]
         out.append(line([("● ", style), (f"{card.ref} {card.title}", Style.WHITE)], width, opts))
         out.append(line([("  ", None), (_WORD[card.state] + (" (stale)" if card.stale else ""), style)], width, opts))
-        pushed = [(f"Pushed by #{card.pushed_by[0]}, {duration(now - card.pushed_by[1])} ago", Style.GRAY)] if card.pushed_by and now is not None else []
-        for segs in (_chips(card), [(card.reason, Style.RED)] if card.reason else [], pushed):
+        made = [(_committed(card.committed_by, now), Style.GRAY)] if card.committed_by and now is not None else []
+        for segs in (_chips(card), [(card.reason, Style.RED)] if card.reason else [], made):
             if segs:
                 out.append(line([("  ", None), *segs], width, opts))
     merged = [c.ref for c in cards if c.state is CiState.MERGED]

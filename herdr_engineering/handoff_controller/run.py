@@ -221,10 +221,7 @@ def default_ensure_side_pane(tab_id: str) -> None:
     except ImportError as exc:
         _warn(f"side pane module failed to import: {type(exc).__name__}: {exc}")
         return
-    try:
-        result = module.ensure(tab_id, lock_timeout_s=0, budget_s=_ENSURE_BUDGET_S)  # never waits on the lock, bounded in time
-    except TypeError:  # a side_pane without the bounded mode
-        result = module.ensure(tab_id)
+    result = module.ensure(tab_id, lock_timeout_s=0, budget_s=_ENSURE_BUDGET_S)  # never waits on the lock, bounded in time
     outcome = str(getattr(result, "outcome", ""))
     if outcome in _RETRY_OUTCOMES:
         raise SidePaneUnavailable(f"side pane for {tab_id}: {outcome}")

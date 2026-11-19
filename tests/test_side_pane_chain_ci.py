@@ -16,7 +16,7 @@ from herdr_engineering.agent_ops_tui import RenderOpts
 from herdr_engineering.ci import WoodpeckerProvider
 from herdr_engineering.handoff_controller.events import EventLog
 from herdr_engineering.side_pane.ci_fetch import CiSchedule, CiWorker, branches_to_read
-from herdr_engineering.side_pane.ci_tab import CiCard, CiState, build_cards, lines
+from herdr_engineering.side_pane.ci_tab import CiCard, CiState, build_cards, ci_attention, lines
 from herdr_engineering.side_pane.model import build_model, chain_branches
 from tests.test_side_pane_ci import REPO, ROUTES, Served, serve
 from tests.test_side_pane_model import NOW, ago, event, session_ref, write_record
@@ -133,30 +133,83 @@ def test_the_schedule_reads_again_at_once_when_the_branches_change() -> None:
 
 # --- pushed by ---------------------------------------------------------------------------------------------------
 
-def _pushed_store(store: Path, *, with_commit: bool) -> None:
+def _pushed_store(store: Path, *, with_commit: bool, reason: str | None = None) -> None:
     write_record(store, 1, succ=2, pane="p-1", session="s1", branch="feat/a", child="p-2", child_session="s2", created=ago(300))
     write_record(store, 2, pred=1, pane="p-2", session="s2", branch="feat/b", child="p-3", child_session="s3", created=ago(150))
     log = EventLog(store)
     log.append(event("handoff.triggered", chain="c2", pane="p-2", session="s2", at=ago(160), pct=82.0))
     log.append(event("handoff.wip_committed", chain="c2", pane="p-2", session="s2", at=ago(155),
-                     commit="abc1234" if with_commit else None))
+                     commit="abc1234" if with_commit else None, reason=reason))
 
 
 def _cards() -> tuple[CiCard, ...]:
     return (CiCard("#2", "second", CiState.PASSED, (), None, "feat/b"), CiCard("#1", "first", CiState.PASSED, (), None, "feat/a"))
 
 
-def test_a_card_says_which_session_pushed_its_branch_and_when(tmp_path: Path) -> None:
-    _pushed_store(tmp_path, with_commit=True)
+def test_a_card_says_which_session_committed_on_its_branch_and_when(tmp_path: Path) -> None:
+    _pushed_store(tmp_path, with_commit=True, reason="committed")
     model = build_model(session_ref("p-3", "s3"), tmp_path, {}, NOW, _cards())
     by_branch = {c.branch: c for c in model.ci}
-    assert by_branch["feat/b"].pushed_by == (2, NOW - 155 * 60)  # session #2 of the chain, at the checkpoint's time
-    assert by_branch["feat/a"].pushed_by is None  # no checkpoint was recorded for session #1: blank, not guessed
+    assert by_branch["feat/b"].committed_by == (2, NOW - 155 * 60, True)  # session #2 of the chain, at the checkpoint's time
+    assert by_branch["feat/a"].committed_by is None  # no checkpoint was recorded for session #1: blank, not guessed
     shown = "\n".join(lines(list(model.ci), 80, RenderOpts(color=False), NOW))
-    assert "Pushed by #2, 2h 35m ago" in shown and shown.count("Pushed by") == 1
+    assert "committed by #2, 2h 35m ago" in shown and shown.count("committed by") == 1
+    assert "pushed" not in shown.lower()  # the log records the controller's checkpoint commit, not what the session pushed
 
 
-def test_pushed_by_is_left_out_when_the_event_has_no_commit(tmp_path: Path) -> None:
+@pytest.mark.parametrize("reason", ["push_failed", "push_not_allowed"])
+def test_a_checkpoint_commit_that_was_not_pushed_says_so(tmp_path: Path, reason: str) -> None:
+    _pushed_store(tmp_path, with_commit=True, reason=reason)
+    model = build_model(session_ref("p-3", "s3"), tmp_path, {}, NOW, _cards())
+    shown = "\n".join(lines(list(model.ci), 80, RenderOpts(color=False), NOW))
+    assert "committed by #2, 2h 35m ago, not pushed" in shown
+
+
+def test_committed_by_is_left_out_when_the_event_has_no_commit(tmp_path: Path) -> None:
     _pushed_store(tmp_path, with_commit=False)
     model = build_model(session_ref("p-3", "s3"), tmp_path, {}, NOW, _cards())
-    assert all(c.pushed_by is None for c in model.ci)
+    assert all(c.committed_by is None for c in model.ci)
+
+
+# --- a card is ready only when every known check passed ---------------------------------------------------------
+
+def _rolled(down: WoodpeckerProvider, *entries: dict[str, str]) -> CiCard:
+    row = {**pull(890), "statusCheckRollup": list(entries)}
+    return build_cards(REPO, [str(row["headRefName"])], down, [row])[0]
+
+
+def _run(name: str, status: str, conclusion: str = "") -> dict[str, str]:
+    return {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion, "workflowName": "CI"}
+
+
+GOOD = _run("lint", "COMPLETED", "SUCCESS")
+
+
+@pytest.mark.parametrize("conclusion", ["CANCELLED", "SKIPPED", "STALE"])
+def test_a_cancelled_or_skipped_check_is_never_ready(down: WoodpeckerProvider, conclusion: str) -> None:
+    got = _rolled(down, GOOD, _run("slow", "COMPLETED", conclusion))
+    assert got.state is CiState.ATTENTION and got.state is not CiState.PASSED
+    assert f"slow ({conclusion.lower()})" in got.workflows and ci_attention([got])
+    assert "needs attention" in "\n".join(lines([got], 80, RenderOpts(color=False)))
+
+
+@pytest.mark.parametrize("status", ["QUEUED", "PENDING", "WAITING"])
+def test_a_queued_check_makes_the_card_running_not_ready(down: WoodpeckerProvider, status: str) -> None:
+    got = _rolled(down, GOOD, _run("slow", status))
+    assert got.state is CiState.RUNNING and got.waiting == ("slow",)
+
+
+def test_an_unknown_context_state_is_a_grey_chip_with_its_state_and_not_ready(down: WoodpeckerProvider) -> None:
+    got = _rolled(down, GOOD, {"__typename": "StatusContext", "context": "ci/other", "state": "\x1b[31mWEIRD_state"})
+    assert got.state is CiState.ATTENTION and got.other == ("ci/other (weird state)",)
+    assert "ci/other (weird state)" in got.workflows
+    assert "\x1b" not in "\n".join(lines([got], 80, RenderOpts(color=False)))
+
+
+def test_every_check_passing_is_ready(down: WoodpeckerProvider) -> None:
+    assert _rolled(down, GOOD, _run("neutral", "COMPLETED", "NEUTRAL")).state is CiState.PASSED
+
+
+def test_a_failure_still_wins_over_attention_and_running(down: WoodpeckerProvider) -> None:
+    got = _rolled(down, _run("a", "COMPLETED", "CANCELLED"), _run("b", "QUEUED"), _run("c", "COMPLETED", "FAILURE"))
+    assert got.state is CiState.FAILED

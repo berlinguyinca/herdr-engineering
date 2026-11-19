@@ -143,6 +143,12 @@ def test_the_runner_registers_its_marker_in_the_state_dir_the_controller_uses(tm
 
 
 # ---------------------------------------------------------------------------------------- what the controller does with it
+def test_the_controller_hook_has_no_unbounded_fallback_call() -> None:
+    import inspect
+    source = inspect.getsource(ctlrun.default_ensure_side_pane)
+    assert "TypeError" not in source and source.count("module.ensure(") == 1 and "budget_s" in source
+
+
 def test_the_controller_raises_for_an_outcome_the_retry_logic_should_see(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("PATH", str(tmp_path))  # no herdr: ensure answers UNAVAILABLE
     monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "state"))
@@ -209,3 +215,45 @@ def test_a_session_in_a_quiet_tab_costs_few_herdr_calls(tmp_path: Path) -> None:
         assert not any(c.startswith("pane layout") for c in calls), calls  # one session: focus cannot matter
         assert sum(c.startswith("pane list") for c in calls) <= 1, calls
         assert pane
+
+
+# ------------------------------------------------------------------------------------ a half-made pane is cleaned up or kept
+def failing_run(tmp: Path, h: IsolatedHerdr, *, run_sleeps_s: float = 0.0, close_fails: bool = False) -> SideHerdr:
+    """The real herdr behind a script whose `pane run` fails (after `run_sleeps_s`), and whose `pane close` fails when asked."""
+    real = shlex.quote(str(h.cli._binary))
+    close = "exit 1" if close_fails else f'exec {real} "$@"'
+    lines = ['if [ "$1" = pane ] && [ "$2" = run ]; then sleep ' + str(run_sleeps_s) + '; exit 1; fi',
+             'if [ "$1" = pane ] && [ "$2" = close ]; then ' + close + '; fi', f'exec {real} "$@"']
+    script = executable(tmp / "herdr-failing-run", "\n".join(lines) + "\n")
+    return SideHerdr(str(script), h.env, h.root)
+
+
+@herdr_server
+def test_a_split_that_ran_out_of_time_is_closed_with_its_own_allowance_and_the_marker_cleared() -> None:
+    with isolated_herdr("sp-cleanup-ok") as h:
+        side = side_of(h)
+        _, tab = session(h, side)
+        before = panes_in(side, tab)
+        slow = failing_run(h.root, h, run_sleeps_s=2.5)
+        result = make(h, slow, tab, budget_s=2.0, lock_timeout_s=0)  # `pane run` outlives the budget: the close is outside it
+        assert result.outcome is Outcome.UNAVAILABLE
+        assert wait_for(lambda: panes_in(side, tab) == before, 10.0), panes_in(side, tab)
+        assert state.read_marker(root_of(h), tab) is None
+
+
+@herdr_server
+def test_an_unclosable_half_made_pane_keeps_its_marker_and_the_next_ensure_makes_no_second_one() -> None:
+    with isolated_herdr("sp-cleanup-kept") as h:
+        side = side_of(h)
+        _, tab = session(h, side)
+        before = panes_in(side, tab)
+        stuck = failing_run(h.root, h, close_fails=True)
+        result = make(h, stuck, tab, budget_s=5.0, lock_timeout_s=0)
+        marker = state.read_marker(root_of(h), tab)
+        now = panes_in(side, tab)
+        assert result.outcome is Outcome.UNAVAILABLE and len(now) == len(before) + 1
+        assert marker is not None and marker.pane_id in now  # kept: the pane is still there
+        again = make(h, side, tab, start_grace_s=0.0, budget_s=5.0, lock_timeout_s=0)
+        assert again.outcome is Outcome.CREATED
+        assert wait_for(lambda: len(panes_in(side, tab)) == len(before) + 1, 10.0), panes_in(side, tab)  # replaced, never doubled
+        assert marker.pane_id not in panes_in(side, tab)

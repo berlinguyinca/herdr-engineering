@@ -391,3 +391,9 @@ def test_run_without_pane_or_tab_exits_2_in_process(capsys: pytest.CaptureFixtur
     assert app.run(["--no-ci"], {"PATH": ""}) == 2
     assert len(capsys.readouterr().err.strip().splitlines()) == 1
     assert app.run(["--bogus"], {}) == 2
+
+
+def test_the_help_and_the_docstring_describe_the_whole_chains_ci_not_one_branch() -> None:
+    from herdr_engineering.side_pane import app, cli
+    for text in (cli._DESCRIPTION, app.__doc__ or ""):
+        assert "directory and\nbranch only" not in text and "directory and branch only" not in " ".join(text.split())
