@@ -266,9 +266,15 @@ def default_root() -> Path:
     return chosen
 
 
+def claude_config_dirs() -> list[Path]:
+    """Where Claude Code keeps ``projects/`` and ``sessions/``: ``$CLAUDE_CONFIG_DIR`` when set, and ``~/.claude``."""
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return [*([Path(configured)] if configured else []), Path.home() / ".claude"]
+
+
 def default_live_roots() -> list[Path]:
     return [
-        Path.home() / ".claude/projects",
+        *(config / "projects" for config in claude_config_dirs()),
         Path.home() / ".codex/sessions",
         Path.home() / ".pi/agent/sessions",
     ]

@@ -69,18 +69,24 @@ def _git_status(repo: Path) -> set[tuple[str, str]]:
     return {(field[:2], field[3:]) for field in out.split("\0") if field}
 
 
-@pytest.mark.parametrize("case", ["xdg", "default", "missing", "dev_null", "unset"])
+@pytest.mark.parametrize("case", ["xdg", "default", "missing", "dev_null", "unset", "git_config_global"])
 def test_the_ignored_set_equals_git_status_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str) -> None:
     home = tmp_path / "home"
     (home / ".config" / "git").mkdir(parents=True)
     (home / "xdg" / "git").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
     if case == "xdg":
         monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "xdg"))
         (home / "xdg" / "git" / "ignore").write_text("*.dat\n")
     elif case == "default":
         (home / ".config" / "git" / "ignore").write_text("*.dat\n")
+    elif case == "git_config_global":  # a dotfiles config with no excludesFile, over a stale ~/.gitconfig
+        (home / ".gitconfig").write_text(f"[core]\n\texcludesFile = {home}/stale-ignore\n")
+        (home / "stale-ignore").write_text("*.dat\n")
+        (home / "dotfiles").write_text("[user]\n\tname = x\n")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(home / "dotfiles"))
     elif case in ("missing", "dev_null"):
         target = "/dev/null" if case == "dev_null" else f"{home}/no-such-file"
         (home / ".gitconfig").write_text(f"[core]\n\texcludesFile = {target}\n")

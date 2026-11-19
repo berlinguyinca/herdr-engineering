@@ -626,25 +626,34 @@ def _process_started(pid: int) -> float | None:
         return None
 
 
-def own_sessions(home: Path | None = None) -> frozenset[str]:
-    """Session ids of the Claude processes this process descends from. Claude records
-    ``<pid> -> sessionId, startedAt`` in ``~/.claude/sessions/<pid>.json``; the pid must be one of
-    OUR ancestors AND the process now running under it must have started when the file says (a
-    crashed session's stale file under a recycled pid is not ours). An environment variable never
-    makes a session "own"."""
-    directory = (home or Path.home()) / ".claude" / "sessions"
+def running_sessions(*, own_only: bool = False) -> frozenset[str]:
+    """Session ids of running Claude processes. Claude records ``<pid> -> sessionId, startedAt`` in
+    ``<config dir>/sessions/<pid>.json`` (``$CLAUDE_CONFIG_DIR`` and ``~/.claude``); the process now
+    running under that pid must have started when the file says (a crashed session's stale file under a
+    recycled pid counts for nothing). ``own_only`` keeps the processes this one descends from: the
+    caller's own sessions. An environment variable never makes a session "own"."""
+    from .scratch_reaper import claude_config_dirs
+    ancestors = _ancestors() if own_only else None
     found: set[str] = set()
-    for pid in _ancestors():
+    for config in claude_config_dirs():
         try:
-            data = json.loads((directory / f"{pid}.json").read_text())
-        except (OSError, ValueError):
+            files = list((config / "sessions").glob("*.json"))
+        except OSError:
             continue
-        if not (isinstance(data, dict) and data.get("pid") == pid and isinstance(data.get("sessionId"), str)
-                and isinstance(data.get("startedAt"), int | float)):
-            continue
-        started = _process_started(pid)
-        if started is not None and abs(started - data["startedAt"] / 1000) <= _START_SLACK_SECONDS:
-            found.add(data["sessionId"].lower())
+        for file in files:
+            try:
+                data = json.loads(file.read_text())
+            except (OSError, ValueError):
+                continue
+            pid = data.get("pid") if isinstance(data, dict) else None
+            if not (isinstance(pid, int) and file.stem == str(pid) and isinstance(data.get("sessionId"), str)
+                    and isinstance(data.get("startedAt"), int | float)):
+                continue
+            if ancestors is not None and pid not in ancestors:
+                continue
+            started = _process_started(pid)
+            if started is not None and abs(started - data["startedAt"] / 1000) <= _START_SLACK_SECONDS:
+                found.add(data["sessionId"].lower())
     return frozenset(found)
 
 
@@ -680,12 +689,16 @@ def _guard_scratch(path: Path, scratches: list[Path], live_roots: list[Path], no
     session = parts[index].lower()
     below = len(parts) - index - 1  # levels between the session dir and the target
     session_dir = path.parents[below - 1] if below else path
-    if session in own_sessions():
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    if configured and not os.access(configured, os.R_OK | os.X_OK):
+        raise Refusal("scratch_protected", f"CLAUDE_CONFIG_DIR={configured} cannot be read; liveness is unknown")
+    if session in running_sessions(own_only=True):
         raise Refusal("scratch_protected", f"session {session} is the caller's own")
-    if keep_ancestor(path, path.parents[len(parts) - 1]):
+    outermost = max(len(p) for p in roots)  # the outermost root has the most parts below it
+    if keep_ancestor(path, path.parents[outermost - 1]):
         raise Refusal("keep_marker", f"{path} is under a .keep marker")
     policy = Policy()
-    if session in _live_ids(live_roots, now - policy.live_seconds):
+    if session in _live_ids(live_roots, now - policy.live_seconds) or session in running_sessions():
         raise Refusal("live_session", f"session {session} is still live")
     if inspect_tree(session_dir, accounting_only=True).newest > now - policy.session_ttl_seconds:
         raise Refusal("session_recent", f"session {session} was active within {policy.session_ttl_seconds / 3600:.0f} h")

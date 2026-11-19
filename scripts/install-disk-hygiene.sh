@@ -9,8 +9,10 @@
 # Opt out: `disk_hygiene: {enabled: false}` in ~/.config/herdr-engineering/config.yaml (the jobs
 # read exactly that file and then exit immediately), or `scripts/install-disk-hygiene.sh uninstall`.
 # HERDR_DISK_HYGIENE=0 only affects interactive runs; a shell export never reaches these jobs.
-# XDG_CONFIG_HOME is the one exception: when set at install time it is written into the unit/plist,
-# so the jobs' git reads the same global config and ignore file as the user's interactive git.
+# CARRIED lists the exceptions: each is written into the unit/plist when set at install time, so the
+# jobs read the same git config and ignore file (XDG_CONFIG_HOME, GIT_CONFIG_GLOBAL) and the same
+# Claude sessions (CLAUDE_CONFIG_DIR) as the user's own shell. Re-run the installer after changing one.
+CARRIED="XDG_CONFIG_HOME GIT_CONFIG_GLOBAL CLAUDE_CONFIG_DIR"
 # Environment: HERDR_ENG (binary, default: herdr-eng on PATH, else <repo>/.venv/bin/herdr-eng).
 set -euo pipefail
 
@@ -34,9 +36,11 @@ write() { # path, content
 }
 
 linux() {
-  local dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user" job cal xdg=""
-  [ -z "${XDG_CONFIG_HOME:-}" ] || xdg="
-Environment=\"XDG_CONFIG_HOME=${XDG_CONFIG_HOME//%/%%}\""
+  local dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user" job cal xdg="" name
+  for name in $CARRIED; do
+    [ -z "${!name:-}" ] || xdg="$xdg
+Environment=\"$name=${!name//%/%%}\""
+  done
   for job in $JOBS; do
     case "$job" in worktrees) cal='*-*-* 00/6:15:00' ;; docker) cal='*-*-* 03:30:00' ;; esac
     if [ "$ACTION" = uninstall ]; then
@@ -78,11 +82,12 @@ WantedBy=timers.target"
 
 macos() {
   local dir="${HERDR_LAUNCH_AGENT_DIR:-$HOME/Library/LaunchAgents}" job label schedule plist
-  local logs="${XDG_STATE_HOME:-$HOME/.local/state}/herdr-engineering" xdg="" value
-  if [ -n "${XDG_CONFIG_HOME:-}" ]; then
-    value="${XDG_CONFIG_HOME//&/&amp;}"; value="${value//</&lt;}"; value="${value//>/&gt;}"
-    xdg="<key>XDG_CONFIG_HOME</key><string>$value</string>"
-  fi
+  local logs="${XDG_STATE_HOME:-$HOME/.local/state}/herdr-engineering" xdg="" name value
+  for name in $CARRIED; do
+    [ -z "${!name:-}" ] && continue
+    value="${!name//&/&amp;}"; value="${value//</&lt;}"; value="${value//>/&gt;}"
+    xdg="$xdg<key>$name</key><string>$value</string>"
+  done
   for job in $JOBS; do
     label="com.herdr-engineering.disk-hygiene-$job"; plist="$dir/$label.plist"
     if [ "$ACTION" = uninstall ]; then
