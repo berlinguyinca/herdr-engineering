@@ -7,25 +7,45 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from enum import StrEnum
 
-from ..agent_ops_tui import _ASCII, RESET, RenderOpts, cell_width, fit, sgr
+from ..agent_ops_tui import _ASCII, RESET, RenderOpts, _drop, cell_width, fit, sgr
 
-Seg = tuple[str, str | None]  # text, style names joined with "+" as `agent_ops_tui.sgr` takes them
+
+class Style(StrEnum):
+    """The colours and weights a segment can have; the values are the names `agent_ops_tui.sgr` takes."""
+    BOLD = "bold"
+    DIM = "dim"
+    RED = "red"
+    GREEN = "green"
+    YELLOW = "yellow"
+    BLUE = "blue"
+    MAGENTA = "magenta"
+    CYAN = "cyan"
+    GRAY = "gray"
+    WHITE = "white"
+
+
+BOLD_CYAN = (Style.BOLD, Style.CYAN)
+BOLD_WHITE = (Style.BOLD, Style.WHITE)
+Look = Style | tuple[Style, ...] | None  # one style, several combined, or none
+Seg = tuple[str, Look]  # text and how to draw it
 _PLAIN = {**_ASCII, ord("│"): "|", ord("▶"): ">", ord("✓"): "+", ord("─"): "-"}
 _ELLIPSIS = "…"
-_ESCAPES = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]?|\x1b[ -/]*[@-~]?|\x9b[0-?]*[ -/]*[@-~]?")
+_ESCAPES = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]?|\x1b[ -/]*[@-~]?|\x9b[0-?]*[ -/]*[@-~]?|\x9d[^\x07\x9c\x1b]*(?:\x07|\x9c|\x1b\\)?")
 _BLANKS = re.compile(r"[\t\n\r\x0b\x0c]+")
-_CONTROLS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 def clean(text: str) -> str:
     """`text` without terminal escape sequences or control characters: what a record, title or reason may carry must
-    never reach the terminal as a command. The one place text is made safe: every renderer draws through `line`."""
-    return _CONTROLS.sub("", _BLANKS.sub(" ", _ESCAPES.sub("", text)))
+    never reach the terminal as a command. Line breaks and tabs become a space; the other controls, the zero-width and
+    bidi format characters and the combining marks go, the same set `cell_width` counts as nothing. The one place text is
+    made safe: `line` cleans every segment, and the wrapping and printing code calls this before it touches the text."""
+    return "".join(ch for ch in _BLANKS.sub(" ", _ESCAPES.sub("", text)) if not _drop(ch))
 
 
-def paint(text: str, style: str | None, opts: RenderOpts) -> str:
-    code = sgr(style) if opts.color and style else ""
+def paint(text: str, style: Look, opts: RenderOpts) -> str:
+    code = sgr("+".join(style) if isinstance(style, tuple) else style) if opts.color and style else ""
     return f"{code}{text}{RESET}" if code else text
 
 

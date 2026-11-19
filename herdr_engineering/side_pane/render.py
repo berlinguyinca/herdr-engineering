@@ -6,7 +6,7 @@ from enum import StrEnum
 from ..agent_ops_tui import RenderOpts
 from . import ci_tab, handoffs_tab, summary_tab
 from .model import SidePaneModel
-from .style import line
+from .style import BOLD_CYAN, Style, line
 
 
 class Tab(StrEnum):
@@ -35,7 +35,7 @@ def _bar(model: SidePaneModel, tab: Tab, width: int, opts: RenderOpts) -> str:
     segs = []
     for each in Tab:
         label = tab_label(model, each)
-        segs += [(f"[{label}]" if each is tab else f" {label} ", "bold+cyan" if each is tab else "gray")]
+        segs += [(f"[{label}]" if each is tab else f" {label} ", BOLD_CYAN if each is tab else Style.GRAY)]
     return line(segs, width, opts)
 
 
@@ -51,8 +51,8 @@ def render(model: SidePaneModel, tab: Tab, width: int, height: int, now: float, 
     """The tab bar, a rule and the tab, every line at most `width` columns and the whole at most `height` lines."""
     opts = opts or RenderOpts()
     width, height = max(width, 1), max(height, 1)
-    rule = line([("─" * width, "gray")], width, opts)
+    rule = line([("─" * width, Style.GRAY)], width, opts)
     lines = [_bar(model, tab, width, opts), rule, *_body(model, tab, width, now, opts)]
     if len(lines) > height:
-        lines = [*lines[:max(height - 1, 0)], line([("… more", "gray")], width, opts)]
+        lines = [*lines[:max(height - 1, 0)], line([("… more", Style.GRAY)], width, opts)]
     return lines[:height]

@@ -31,7 +31,7 @@ from .herdr import SideHerdr
 from .model import EMPTY, SidePaneModel, build_model
 from .render import Tab, render
 from .schedule import CI_REFRESH_S, EVENTS_REFRESH_S, Due
-from .style import clean, line
+from .style import Style, clean, line
 
 REDRAW_S = 1.0  # the viewer redraws this often so durations and "ago" keep moving between refreshes
 _KEYS = {"1": Tab.SUMMARY, "2": Tab.HANDOFFS, "3": Tab.CI}
@@ -78,9 +78,9 @@ class Screen:
             lines = render(snap.model, self.tab, width, room, now, self.opts)
         except Exception as error:  # one tab's build failing is one line in that tab; the others keep working
             bar = render(EMPTY, self.tab, width, 1, now, self.opts)
-            lines = [*bar, line([(f"error: {type(error).__name__}: {error}", "red")], width, self.opts)][:room]
+            lines = [*bar, line([(f"error: {type(error).__name__}: {error}", Style.RED)], width, self.opts)][:room]
         if room < height:
-            lines = [*lines, line([(note, "yellow")], width, self.opts)]
+            lines = [*lines, line([(note, Style.YELLOW)], width, self.opts)]
         return lines[:height]
 
 
