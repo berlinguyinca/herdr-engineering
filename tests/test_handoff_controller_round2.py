@@ -21,7 +21,7 @@ from herdr_engineering.handoff_controller import run as ctlrun
 from herdr_engineering.handoff_controller import takeover as takeovermod
 from herdr_engineering.handoff_controller import wip as wipmod
 from herdr_engineering.handoff_controller.events import Colour, EventLog, HandoffEvent
-from herdr_engineering.handoff_controller.herdr_cli import HerdrCli
+from herdr_engineering.handoff_controller.herdr_cli import AgentPane, HerdrCli
 from tests.test_handoff_controller_run import (
     CFG,
     World,
@@ -332,3 +332,57 @@ def test_commits_that_were_already_unpushed_are_recorded_when_pushing_is_not_all
     assert ctlrun._checkpoint(w.ctl, ref, "c1", w.repo, False, 85.0)
     done = [e for e in w.events() if e.event == "handoff.wip_committed"]
     assert [(e.reason, e.commit) for e in done] == [("push_not_allowed", None)]
+
+
+# --- side pane hooks ------------------------------------------------------------------------------------------------
+
+def test_a_pane_the_hook_flags_is_never_managed_even_over_the_limit(tmp_path: Path) -> None:
+    w = World(tmp_path)
+    w.session("side", 95.0)
+    w.ctl.is_side_pane = lambda pane: pane.pane_id == "side"
+    w.tick(w.pane("side", "idle"))
+    assert w.events() == [] and "side" not in w.ctl.runtime
+
+
+def test_a_hook_that_raises_skips_the_pane_for_that_tick_and_logs_one_line(tmp_path: Path,
+                                                                         capsys: pytest.CaptureFixture[str]) -> None:
+    w = World(tmp_path)
+    w.session("p1", 95.0)
+
+    def broken(pane: object) -> bool:
+        raise RuntimeError("secret")
+
+    w.ctl.is_side_pane = broken
+    w.tick(w.pane("p1", "idle"))
+    w.tick(w.pane("p1", "idle"))
+    assert w.events() == []
+    err = capsys.readouterr().err
+    assert err.count("side pane check failed") == 1 and "RuntimeError" in err and "secret" not in err
+    w.ctl.is_side_pane = lambda pane: False  # the hook works again: the pane is managed
+    w.tick(w.pane("p1", "idle"))
+    assert w.names()[0] == "handoff.triggered"
+
+
+def test_the_side_pane_is_ensured_for_each_new_session_in_a_tab_and_not_on_every_tick(tmp_path: Path) -> None:
+    w = World(tmp_path)
+    asked: list[str] = []
+    w.ctl.ensure_side_pane = asked.append
+    w.session("p1", 10.0)
+    w.session("p2", 10.0)
+    w.session("p3", 10.0)
+    w.tick(w.pane("p1", tab="t1"))
+    w.tick(w.pane("p1", tab="t1"))
+    assert asked == ["t1"]
+    w.tick(w.pane("p1", tab="t1"), w.pane("p2", tab="t1"))  # a second session in the tab
+    w.tick(w.pane("p1", tab="t1"), w.pane("p2", tab="t1"))
+    assert asked == ["t1", "t1"]
+    w.tick(w.pane("p2", tab="t1"), w.pane("p3", tab="t1"))  # p1 was replaced by a successor
+    assert asked == ["t1", "t1", "t1"]
+    w.tick(w.pane("p1", tab="t1"), w.pane("p2", tab="t1"), w.pane("p3", tab="t2"))  # one call per tab per tick
+    assert asked.count("t2") == 1
+
+
+def test_the_default_side_pane_check_is_false_while_the_package_is_missing() -> None:
+    w_pane = AgentPane("p1", "t1", "claude", "idle", None, None)
+    assert ctlrun.default_is_side_pane(w_pane) is False
+    assert ctlrun.Controller.__dataclass_fields__["is_side_pane"].default is ctlrun.default_is_side_pane

@@ -187,9 +187,9 @@ def test_a_tab_without_managed_panes_is_forgotten(tmp_path: Path) -> None:
     w = World(tmp_path)
     w.session("p1", 10.0)
     w.tick(w.pane("p1", tab="t7"))
-    assert w.ctl._tabs == {"t7"}
+    assert set(w.ctl._tabs) == {"t7"}
     w.tick()
-    assert w.ctl._tabs == set()
+    assert set(w.ctl._tabs) == set()
 
 
 # 10 -------------------------------------------------------------------------------------------------------------------

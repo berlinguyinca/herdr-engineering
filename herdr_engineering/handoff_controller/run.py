@@ -211,6 +211,21 @@ def default_ensure_side_pane(tab_id: str) -> None:
     module.ensure(tab_id)
 
 
+def default_is_side_pane(pane: AgentPane) -> bool:
+    """Whether `herdr_engineering.side_pane` (plan 4) says this pane is one of its own. False while that package, or its
+    `is_side_pane`, does not exist yet. Any other failure (a broken import inside it, an exception from the check)
+    propagates: `Controller.manages` then treats the pane as unknown and skips it for the tick, because typing a drain
+    order into a side pane viewer is the worse error. The package is imported here, not at module import (no cycle)."""
+    try:
+        module = importlib.import_module("herdr_engineering.side_pane")
+    except ModuleNotFoundError as exc:
+        if exc.name != "herdr_engineering.side_pane":
+            raise
+        return False
+    check = getattr(module, "is_side_pane", None)
+    return False if check is None else bool(check(pane))
+
+
 @dataclass
 class Controller:
     """Everything a tick needs. `locate` is the seam for tests whose Herdr cannot report a session id."""
@@ -230,7 +245,7 @@ class Controller:
     drain_poll_s: float = 2.0
     fallback_timeout_s: float = 300.0  # the fallback writer blocks the tick for up to this long
     gh: tuple[str, ...] = ("gh",)  # the command the fallback writer lists pull requests with
-    is_side_pane: IsSidePane = lambda pane: False  # the side pane module (plan 4) marks its own panes
+    is_side_pane: IsSidePane = default_is_side_pane  # the side pane module (plan 4) recognises its own panes
     ensure_side_pane: EnsureSidePane = default_ensure_side_pane  # ... and creates one per tab
     mono: Callable[[], float] | None = None  # the monotonic clock `ticks` credits time by; None: the wall clock
     ticks: TickClock | None = None  # credited time (see credit.py); None: deadlines run on the wall clock
@@ -238,7 +253,8 @@ class Controller:
     runtime: dict[str, PaneRuntime] = field(default_factory=dict)
     _refs: dict[str, tuple[tuple[str | None, str | None], SessionRef | None, float]] = field(default_factory=dict)
     adapters: dict[Harness, HarnessAdapter] = field(default_factory=dict)  # prefilled by tests that need another home
-    _tabs: set[str] = field(default_factory=set)
+    _tabs: dict[str, set[str]] = field(default_factory=dict)  # tab -> the managed panes it had when the side pane was last ensured
+    _unsure: set[str] = field(default_factory=set)  # panes whose side-pane check raised (said once)
     log_offset: int = 0  # how far into events.jsonl `_events` reaches
     _generation: int = 0  # the log's `generation` `_events` was read at
     _absent: dict[str, float] = field(default_factory=dict)  # since when (credited) a pane with an open chain is not listed
@@ -278,14 +294,22 @@ class Controller:
 
     def manages(self, pane: AgentPane) -> bool:
         """An agent of a known harness that is neither the pane this controller runs in nor a side pane."""
-        return (harness_for_agent_name(pane.name) is not None and pane.pane_id != self.env.get("HERDR_PANE_ID")
-                and not self.is_side_pane(pane))
+        if harness_for_agent_name(pane.name) is None or pane.pane_id == self.env.get("HERDR_PANE_ID"):
+            return False
+        try:
+            return not self.is_side_pane(pane)
+        except Exception as exc:  # noqa: BLE001 - unknown is not "not a side pane": the pane is left alone this tick
+            if pane.pane_id not in self._unsure:
+                self._unsure.add(pane.pane_id)
+                _warn(f"{pane.pane_id}: side pane check failed, pane skipped: {type(exc).__name__}")
+            return False
 
     def forget_gone(self, present: set[str]) -> None:
         for pane_id in [p for p in self._refs if p not in present]:
             del self._refs[pane_id]
         for pane_id in [p for p in self.runtime if p not in present]:
             del self.runtime[pane_id]
+        self._unsure &= present
 
 
 def _warn(message: str) -> None:
@@ -310,15 +334,21 @@ def _skip_once(ctl: Controller, events: Sequence[HandoffEvent], pane: AgentPane,
                                 session_id, harness, None, None, None, None, reason, None))
 
 
-def _ensure_side_pane(ctl: Controller, tab_id: str | None) -> None:
-    """The side pane (plan 4) is created on the first managed session of a tab."""
-    if tab_id is None or tab_id in ctl._tabs:
-        return
-    ctl._tabs.add(tab_id)
-    try:
-        ctl.ensure_side_pane(tab_id)
-    except Exception as exc:  # noqa: BLE001 - a side pane problem must not stop the handoffs
-        _warn(f"side pane for {tab_id}: {exc}")
+def _ensure_side_panes(ctl: Controller, panes: Sequence[AgentPane]) -> None:
+    """The side pane (plan 4) is ensured for a tab when a managed pane the tab did not have before appears in it (its first
+    session, a second one, a successor): at most one call per tab per tick, none for an unchanged tab. A tab without
+    managed panes is forgotten."""
+    now: dict[str, set[str]] = {}
+    for pane in panes:
+        if pane.tab_id and ctl.manages(pane):
+            now.setdefault(pane.tab_id, set()).add(pane.pane_id)
+    for tab_id, ids in now.items():
+        if ids - ctl._tabs.get(tab_id, set()):
+            try:
+                ctl.ensure_side_pane(tab_id)
+            except Exception as exc:  # noqa: BLE001 - a side pane problem must not stop the handoffs
+                _warn(f"side pane for {tab_id}: {exc}")
+    ctl._tabs = now
 
 
 def _restore(session_id: str | None, chain: Chain | None, credit: Callable[[float], float] = lambda t: t) -> PaneRuntime:
@@ -624,7 +654,6 @@ def _tick_pane(ctl: Controller, pane: AgentPane, events: Sequence[HandoffEvent],
         return
     harness = harness_for_agent_name(pane.name)
     assert harness is not None
-    _ensure_side_pane(ctl, pane.tab_id)
     mine = [e for e in events if e.pane_id == pane.pane_id]
     if not is_enabled(pane.pane_id, ctl.env, ctl.state_dir):
         _skip_once(ctl, mine, pane, harness, "switch_off")
@@ -679,7 +708,7 @@ def run_once(ctl: Controller, panes: Sequence[AgentPane] | None = None) -> None:
         return
     present = {p.pane_id for p in panes}
     ctl.forget_gone(present)
-    ctl._tabs &= {p.tab_id for p in panes if p.tab_id and ctl.manages(p)}  # a tab without managed panes is forgotten
+    _ensure_side_panes(ctl, panes)
     events = ctl.sync_events()
     if ctl.ticks is not None:
         ctl.ticks.tick(ctl.clock(), (ctl.mono or ctl.clock)(), _oldest_open(events))
