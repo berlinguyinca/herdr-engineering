@@ -317,14 +317,17 @@ def test_a_drain_that_never_gets_a_turn_ends_stuck_after_the_drain_timeout(tmp_p
     assert len(world.events()) == 2
 
 
-def test_over_the_ceiling_with_an_order_that_cannot_be_typed_goes_straight_to_the_last_resort(tmp_path: Path) -> None:
+def test_over_the_ceiling_a_busy_session_is_waited_for_and_then_the_last_resort_runs(tmp_path: Path) -> None:
     world = World(tmp_path)  # the fallback writer answers nothing, so the last resort has no briefing and the chain is stuck
     world.session("p1", 95.0)
     world.tick(world.pane("p1", "working"))
-    assert world.names() == ["handoff.triggered", "handoff.stuck"]
-    assert world.events()[-1].reason == "no_briefing"
+    assert world.names() == ["handoff.triggered", "handoff.waiting"]  # a working pane is not "cannot be typed"
+    world.clock[0] += CFG.drain_timeout_s + 1
     world.tick(world.pane("p1", "working"))
-    assert len(world.events()) == 2  # never a loop
+    assert world.names()[-1] == "handoff.stuck" and world.events()[-1].reason == "no_briefing"
+    count = len(world.events())
+    world.tick(world.pane("p1", "working"))
+    assert len(world.events()) == count  # never a loop
 
 
 def test_a_session_with_a_live_successor_is_not_looked_at(tmp_path: Path) -> None:

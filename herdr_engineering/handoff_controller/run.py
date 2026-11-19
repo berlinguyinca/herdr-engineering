@@ -27,7 +27,6 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from pathlib import Path
-from typing import Protocol
 
 from ..handoff_adapters import adapter_for
 from ..handoff_adapters.base import READY_STATUSES, Harness, HarnessAdapter, SessionRef
@@ -42,8 +41,10 @@ from .events import (
     TERMINAL,
     Chain,
     Colour,
+    EnsureSidePane,
     EventLog,
     HandoffEvent,
+    IsSidePane,
     StuckReason,
     epoch,
     iso,
@@ -61,6 +62,8 @@ from .takeover import run_takeover, stuck_reason
 from .trigger import Decision, decide
 from .wip import WipReason, WipResult, wip_commit
 
+__all__ = ["EnsureSidePane", "IsSidePane"]  # re-exported: they live in events.py
+
 Locator = Callable[[HarnessAdapter, AgentPane], SessionRef | None]
 _DRAIN_STUCK: dict[str, StuckReason] = {
     "blocked": StuckReason.BLOCKED, "wrong_agent": StuckReason.WRONG_AGENT, "timeout": StuckReason.DRAIN_TIMEOUT,
@@ -69,17 +72,24 @@ _DRAIN_STUCK: dict[str, StuckReason] = {
 _MAX_CHAINS = 3  # non-green chains per session before the controller gives up on it
 _MAX_FINISH_FAILURES = 3
 _FALLBACK_WORK_MAX_AGE_S = 3600.0
+_LOCK_TRIES = 4  # three pauses: another controller is assumed after about a second
+_LOCK_PAUSE_S = 0.35
 _LOCATE_RETRY_S = 30.0  # a session that could not be located is looked for again after this long (Codex's lookup forks ps/lsof)
 
 
 # --- pure decisions -------------------------------------------------------------------------------------------------
 
 def _failed_chains(events: Sequence[HandoffEvent], since: float | None = None) -> list[HandoffEvent]:
-    """The orange and red terminal events since the switch was last seen off, or toggled at `since` (turning it off and
-    on starts over, even when the controller never saw it off)."""
+    """The orange and red terminal events (not `pane_gone`) since the switch was last seen off, or toggled at `since`
+    (turning it off and on starts over, even when the controller never saw it off)."""
     start = max((i + 1 for i, e in enumerate(events) if e.event == "handoff.skipped" and e.reason == "switch_off"), default=0)
     return [e for e in events[start:] if e.event in TERMINAL and e.event != "handoff.succeeded"
-            and (since is None or epoch(e.at) > since)]
+            and not _is_pane_gone(e) and (since is None or epoch(e.at) > since)]
+
+
+def _is_pane_gone(event: HandoffEvent) -> bool:
+    """A chain that ended because its pane closed says nothing about the session: it does not count as a failure."""
+    return event.event == "handoff.stuck" and event.reason == StuckReason.PANE_GONE.value
 
 
 def gave_up(events: Sequence[HandoffEvent], cfg: ControllerConfig, since: float | None = None) -> bool:
@@ -129,11 +139,12 @@ class PaneRuntime:
     last_outcome: str | None = None  # the last drain outcome that was not `typed`
     finish_failures: int = 0  # consecutive times finishing the chain raised
     retypes: int = 0  # drain attempts that left it unknown whether the order landed
+    allow_dirty: bool = False  # the checkpoint found tracked changes it cannot stage (a dirty submodule): take over regardless
 
     def reset(self, chain_id: str | None) -> None:
         self.chain_id, self.typed, self.wait_since, self.cooldown_until = chain_id, False, 0.0, 0.0
         self.quiet_since, self.wait_state = None, None
-        self.last_outcome, self.finish_failures, self.retypes = None, 0, 0
+        self.last_outcome, self.finish_failures, self.retypes, self.allow_dirty = None, 0, 0, False
 
 
 def note_uncertain(rt: PaneRuntime, now: float, cfg: ControllerConfig) -> None:
@@ -185,14 +196,6 @@ def default_locate(adapter: HarnessAdapter, pane: AgentPane) -> SessionRef | Non
     return adapter.locate(pane.pane_id, pane.cwd) if pane.cwd else None
 
 
-class IsSidePane(Protocol):
-    def __call__(self, pane: AgentPane) -> bool: ...
-
-
-class EnsureSidePane(Protocol):
-    def __call__(self, tab_id: str) -> None: ...
-
-
 def default_ensure_side_pane(tab_id: str) -> None:
     """Create the tab's side pane through `herdr_engineering.side_pane` (plan 4). Silent only while that module itself
     does not exist yet; a failure inside it, or inside what it imports, is reported."""
@@ -238,7 +241,7 @@ class Controller:
     _tabs: set[str] = field(default_factory=set)
     log_offset: int = 0  # how far into events.jsonl `_events` reaches
     _generation: int = 0  # the log's `generation` `_events` was read at
-    _absent: dict[str, int] = field(default_factory=dict)  # consecutive ticks a pane with an open chain was not listed
+    _absent: dict[str, float] = field(default_factory=dict)  # since when (credited) a pane with an open chain is not listed
     _events: list[HandoffEvent] = field(default_factory=list)
 
     def adapter(self, harness: Harness) -> HarnessAdapter:
@@ -366,31 +369,37 @@ def _stuck(ctl: Controller, ref: SessionRef, chain_id: str, why: str, pct: float
     _emit(ctl, ref, "handoff.stuck", chain_id, reason=why, colour=Colour.RED, pct=pct)
 
 
-def _checkpoint(ctl: Controller, ref: SessionRef, chain_id: str, worktree: Path, allowed: bool, pct: float | None) -> bool:
-    """Commit the worktree's tracked changes; False when the chain ended stuck instead."""
+def _checkpoint(ctl: Controller, ref: SessionRef, chain_id: str, worktree: Path, allowed: bool,
+                pct: float | None) -> WipResult | None:
+    """Commit the worktree's tracked changes; None when the chain ended stuck instead."""
     result: WipResult = wip_commit(worktree, push_allowed=allowed)
     if result.error:
         _stuck(ctl, ref, chain_id, stuck_reason(StuckReason.GIT_STATE_UNKNOWN, result.reason.value if result.reason else None,
                                                 result.error), pct)
-        return False
+        return None
     if result.reason is WipReason.MERGE_IN_PROGRESS and allowed:  # nothing was committed; pushing is not for a half-done merge
         _stuck(ctl, ref, chain_id, stuck_reason(StuckReason.MERGE_IN_PROGRESS, None, None), pct)
-        return False
+        return None
     if result.reason in (WipReason.ON_MAIN, WipReason.DETACHED):
         changes = _has_changes(worktree)
         if changes is None:
             _stuck(ctl, ref, chain_id, StuckReason.GIT_STATE_UNKNOWN.value, pct)
-            return False
+            return None
         if changes:
             _stuck(ctl, ref, chain_id, stuck_reason(StuckReason.ON_MAIN_WITH_CHANGES, result.reason.value, None), pct)
-            return False
-    if result.committed:
-        why = result.reason.value if result.reason in (WipReason.PUSH_FAILED, WipReason.PUSH_NOT_ALLOWED) else "committed"
+            return None
+    pushing = result.reason in (WipReason.PUSH_FAILED, WipReason.PUSH_NOT_ALLOWED)
+    if result.committed or pushing:  # commits that were already there unpushed are recorded the same way
+        why = result.reason.value if pushing and result.reason else "committed"
         _emit(ctl, ref, "handoff.wip_committed", chain_id, reason=why, pct=pct, commit=result.sha)
-    return True
+    return result
 
 
-def _finish(ctl: Controller, ref: SessionRef, chain: Chain, pct: float | None, *, last_resort: bool = False) -> None:
+def _finish(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRuntime, pct: float | None, *,
+            last_resort: bool = False) -> None:
+    if chain.compacting:  # a restart found a compaction that may be running: typing the command again could run it twice
+        _stuck(ctl, ref, chain.chain_id, StuckReason.COMPACTION_STATE_UNKNOWN.value, pct)
+        return
     handoff_id = chain.handoff_id
     if handoff_id is None:  # a takeover was started but the briefing event is missing: the newest record of this pane
         handoff_id = wait_for_briefing(ctl.store_root, iso(chain.triggered_wall or chain.triggered_at), ref.pane_id, 0.0)
@@ -399,12 +408,23 @@ def _finish(ctl: Controller, ref: SessionRef, chain: Chain, pct: float | None, *
             return
     worktree = ref.cwd
     allowed = push_allowed(ctl.cfg, worktree, _common_dir(worktree) if ctl.cfg.push_allowed_repos else None)
-    if not chain.takeover_started and not _checkpoint(ctl, ref, chain.chain_id, worktree, allowed, pct):
-        return
+    if not chain.takeover_started:
+        wip = _checkpoint(ctl, ref, chain.chain_id, worktree, allowed, pct)
+        if wip is None:
+            return
+        rt.allow_dirty = wip.reason is WipReason.NOTHING_STAGEABLE  # the changes cannot be committed, so pushing cannot clean them
     cfg = replace(ctl.cfg, max_attempts=0) if last_resort else ctl.cfg  # no attempts: straight to compaction
+
+    def ready() -> bool:  # a fresh read before every call to herdr-handoff; the user may have started typing since the last one
+        why = _not_ready(ctl, ref)
+        if why is not None:
+            _wait(ctl, ref, chain, rt, why[0], why[1], pct)
+        return why is None
+
     run_takeover(ref, ctl.adapter(ref.harness), handoff_id, cfg, ctl.log, ctl.handoff, ctl.herdr,
-                 store_root=ctl.store_root, worktree=worktree, push_allowed=allowed, env=ctl.env,
-                 chain_id=chain.chain_id, context_pct=pct, sleep=ctl.sleep, resumed=chain.compacting, **ctl.takeover_kwargs)
+                 store_root=ctl.store_root, worktree=worktree, push_allowed=allowed and not rt.allow_dirty, env=ctl.env,
+                 chain_id=chain.chain_id, context_pct=pct, sleep=ctl.sleep, started=chain.takeover_started, ready=ready,
+                 **ctl.takeover_kwargs)
 
 
 def _subagents(ctl: Controller, ref: SessionRef) -> list[dict[str, object]]:
@@ -424,19 +444,26 @@ def _wait(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRuntime, reaso
         _emit(ctl, ref, "handoff.waiting", chain.chain_id, reason=reason, pct=pct, subagents_live=live)
 
 
+def _not_ready(ctl: Controller, ref: SessionRef) -> tuple[str, int] | None:
+    """None when the source is idle (or done) with an empty composer, the right agent and no live subagent, from a fresh
+    read; else the `handoff.waiting` reason and the live subagent count."""
+    live = _subagents(ctl, ref)
+    if live:
+        return "subagents", len(live)
+    return None if ctl.look(ref, ctl.adapter(ref.harness), ctl.herdr).ready else ("working", 0)
+
+
 def _finish_when_ready(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRuntime, pct: float | None,
                        now: float) -> None:
-    """Enter the takeover only when the source is idle (or done) with an empty composer, the right agent and no live
-    subagent. Until `briefing_timeout_s` after the briefing it waits; after that the chain takes the last-resort path,
-    whose compaction is typed only into a ready pane. A takeover already started, or a last-resort chain, is not held."""
-    if not chain.takeover_started and not chain.last_resort:
-        live = _subagents(ctl, ref)
-        if live or not ctl.look(ref, ctl.adapter(ref.harness), ctl.herdr).ready:
-            if now < (chain.briefing_at if chain.briefing_at is not None else chain.last_at) + ctl.cfg.briefing_timeout_s:
-                _wait(ctl, ref, chain, rt, "subagents" if live else "working", len(live), pct)
-                return
-            chain = replace(chain, last_resort=True)
-        rt.wait_state = None
+    """Enter the takeover only into a ready pane (`_not_ready`); `run_takeover` looks again before every call to
+    herdr-handoff. Until `briefing_timeout_s` after the briefing the chain waits; after that it takes the last-resort
+    path, whose compaction is typed only into a ready pane and may run with subagents live. A chain already in that
+    path, or in its compaction, is not held."""
+    if not chain.compacting and not chain.last_resort and (why := _not_ready(ctl, ref)) is not None:
+        if now < (chain.briefing_at if chain.briefing_at is not None else chain.last_at) + ctl.cfg.briefing_timeout_s:
+            _wait(ctl, ref, chain, rt, why[0], why[1], pct)
+            return
+        chain = replace(chain, last_resort=True)
     _finish_guarded(ctl, ref, chain, rt, pct)
 
 
@@ -458,7 +485,7 @@ def _finish_guarded(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRunt
     """`_finish`, except that a third failure in a row ends the chain stuck (the exception type only: its message
     could carry anything); the earlier ones are raised for the loop to report."""
     try:
-        _finish(ctl, ref, chain, pct, last_resort=chain.last_resort)
+        _finish(ctl, ref, chain, rt, pct, last_resort=chain.last_resort)
     except Exception as exc:
         rt.finish_failures += 1
         if rt.finish_failures < _MAX_FINISH_FAILURES:
@@ -466,6 +493,12 @@ def _finish_guarded(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRunt
         _stuck(ctl, ref, chain.chain_id, f"{StuckReason.INTERNAL_ERROR.value}:{type(exc).__name__}", pct)
     else:
         rt.finish_failures = 0
+
+
+def drain_is_busy(outcome: str) -> bool:
+    """A drain that ended because the pane works, waits on a dialog or has text in its composer: not a failure to type,
+    the session is waited for. The other outcomes happened with a pane that was ready."""
+    return outcome in ("blocked", "timeout", "not_ready")
 
 
 def _try_drain(ctl: Controller, pane: AgentPane, ref: SessionRef, chain_id: str, started: bool, rt: PaneRuntime,
@@ -488,6 +521,13 @@ def _try_drain(ctl: Controller, pane: AgentPane, ref: SessionRef, chain_id: str,
     elif result.outcome == "prompt_uncertain":
         note_uncertain(rt, now, ctl.cfg)
     return result.outcome
+
+
+def _last_resort(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRuntime, pct: float | None) -> None:
+    """Over the ceiling with no order typed: a fallback briefing, then compaction (typed only into a ready pane)."""
+    found = _write_fallback(ctl, ref, chain.chain_id, pct, last_resort=True)
+    if found is not None:
+        _finish_guarded(ctl, ref, replace(chain, handoff_id=found, last_resort=True), rt, pct)
 
 
 def _check_briefing(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRuntime, pct: float | None) -> str | None:
@@ -528,10 +568,11 @@ def _advance(ctl: Controller, pane: AgentPane, ref: SessionRef, rt: PaneRuntime,
                 return
             if outcome != "not_ready":  # nothing was tried: what the earlier attempt said still holds
                 rt.last_outcome = outcome
-            if decision is Decision.OVER_CEILING:  # a full context cannot wait for the order that cannot be typed
-                found = _write_fallback(ctl, ref, chain.chain_id, pct, last_resort=True)
-                if found is not None:
-                    _finish_guarded(ctl, ref, replace(chain, handoff_id=found, last_resort=True), rt, pct)
+            if decision is Decision.OVER_CEILING:
+                if drain_is_busy(outcome):  # a busy session is waited for, to the drain timeout, like one under the ceiling
+                    _wait(ctl, ref, chain, rt, "working", 0, pct)
+                else:  # the pane was ready and the order still could not be typed
+                    _last_resort(ctl, ref, chain, rt, pct)
         case LoopStep.CHECK_BRIEFING:
             if (written := _check_briefing(ctl, ref, chain, rt, pct)) is not None:
                 _finish_when_ready(ctl, ref, replace(chain, handoff_id=written, briefing_at=now), rt, pct, now)
@@ -541,14 +582,18 @@ def _advance(ctl: Controller, pane: AgentPane, ref: SessionRef, rt: PaneRuntime,
             if (written := _check_briefing(ctl, ref, chain, rt, pct)) is not None:
                 _finish_when_ready(ctl, ref, replace(chain, handoff_id=written, briefing_at=now), rt, pct, now)
                 return
-            _emit(ctl, ref, "handoff.drained", chain.chain_id, pct=pct)
+            if not any(e.event == "handoff.drained" and e.chain_id == chain.chain_id for e in events):
+                _emit(ctl, ref, "handoff.drained", chain.chain_id, pct=pct)  # said once, even when the writer fails midway
             found = _write_fallback(ctl, ref, chain.chain_id, pct)
             if found is not None:
                 _finish_when_ready(ctl, ref, replace(chain, handoff_id=found, briefing_at=ctl.now()), rt, pct, ctl.now())
         case LoopStep.FINISH:
             _finish_when_ready(ctl, ref, chain, rt, pct, now)
         case LoopStep.DRAIN_STUCK:
-            _stuck(ctl, ref, chain.chain_id, _drain_stuck_reason(pane, rt).value, pct)
+            if decision is Decision.OVER_CEILING:  # the drain timeout passed without the order typed: the last resort
+                _last_resort(ctl, ref, chain, rt, pct)
+            else:
+                _stuck(ctl, ref, chain.chain_id, _drain_stuck_reason(pane, rt).value, pct)
 
 
 def _track_quiet(ctl: Controller, pane: AgentPane, ref: SessionRef, rt: PaneRuntime, now: float) -> None:
@@ -559,12 +604,11 @@ def _track_quiet(ctl: Controller, pane: AgentPane, ref: SessionRef, rt: PaneRunt
 
 
 def _say_wait(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRuntime, pct: float | None) -> None:
-    """While the session works or subagents run: say so once per change (the quiet state says nothing)."""
+    """While the session works or subagents run: say so when the reason or the count changes (the quiet state says
+    nothing, and a flicker back to the same reason says nothing new)."""
     live = _subagents(ctl, ref)
     if rt.quiet_since is None:
         _wait(ctl, ref, chain, rt, "subagents" if live else "working", len(live), pct)
-    else:
-        rt.wait_state = None
 
 
 def _drain_stuck_reason(pane: AgentPane, rt: PaneRuntime) -> StuckReason:
@@ -612,15 +656,18 @@ def _tick_pane(ctl: Controller, pane: AgentPane, events: Sequence[HandoffEvent],
     _advance(ctl, pane, ref, rt, decide(reading, ctl.cfg), reading.percent, mine, now)
 
 
-def _newest_open(events: Sequence[HandoffEvent]) -> float | None:
-    return max((epoch(mine[-1].at) for mine in open_chain_events(events)), default=None)
+def _oldest_open(events: Sequence[HandoffEvent]) -> float | None:
+    """The wall time of the first event of the oldest open chain: the credit scale must reach back that far."""
+    return min((epoch(mine[0].at) for mine in open_chain_events(events)), default=None)
 
 
 def _absent_chains(ctl: Controller, events: Sequence[HandoffEvent], present: set[str]) -> None:
-    """Open chains of panes Herdr has not listed for two ticks in a row end red (`pane_gone`)."""
+    """Open chains of panes Herdr has not listed for `pane_gone_after_s` of credited time end red (`pane_gone`); a pane
+    that is listed again starts the count over."""
+    now = ctl.now()
     pending = {mine[-1].pane_id for mine in open_chain_events(events)} - present
-    ctl._absent = {pane_id: ctl._absent.get(pane_id, 0) + 1 for pane_id in pending}
-    _close_orphans(ctl, events, lambda e: ctl._absent.get(e.pane_id, 0) >= 2)
+    ctl._absent = {pane_id: ctl._absent.get(pane_id, now) for pane_id in pending}
+    _close_orphans(ctl, events, lambda e: now - ctl._absent.get(e.pane_id, now) >= ctl.cfg.pane_gone_after_s)
 
 
 def run_once(ctl: Controller, panes: Sequence[AgentPane] | None = None) -> None:
@@ -635,7 +682,7 @@ def run_once(ctl: Controller, panes: Sequence[AgentPane] | None = None) -> None:
     ctl._tabs &= {p.tab_id for p in panes if p.tab_id and ctl.manages(p)}  # a tab without managed panes is forgotten
     events = ctl.sync_events()
     if ctl.ticks is not None:
-        ctl.ticks.tick(ctl.clock(), (ctl.mono or ctl.clock)(), None if ctl.ticks.started else _newest_open(events))
+        ctl.ticks.tick(ctl.clock(), (ctl.mono or ctl.clock)(), _oldest_open(events))
     _absent_chains(ctl, events, present)
     for pane in panes:
         try:
@@ -660,11 +707,15 @@ class ControllerLock:
     def acquire(self) -> bool:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(fd)
-            return False
+        for attempt in range(_LOCK_TRIES):  # the controller this one replaces may be on its way out
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if attempt == _LOCK_TRIES - 1:
+                    os.close(fd)
+                    return False
+                time.sleep(_LOCK_PAUSE_S)
         os.ftruncate(fd, 0)
         os.write(fd, f"{os.getpid()}\n".encode())
         self._fd = fd
@@ -783,8 +834,8 @@ def serve(cfg: ControllerConfig | None = None, *, interval_s: float = 5.0, once:
           env: Mapping[str, str] | None = None, controller: Controller | None = None,
           bin_dirs: Sequence[Path] | None = None, stop: threading.Event | None = None, retry_s: float = 5.0) -> int:
     """Run ticks every `interval_s` until SIGTERM or SIGINT (or `stop`). A second controller exits 0 with a message; a
-    missing required program is one line on stderr and exit code 2 (also with `once`). A tick or the state directory
-    failing on the file system (OSError) is one line on stderr naming the exception type only: `once` exits 1, the loop
+    missing required program is one line on stderr and exit code 2 (also with `once`). A tick failing (any Exception) or
+    the state directory failing on the file system (OSError) is one line on stderr naming the exception type only: `once` exits 1, the loop
     waits `backoff_s` (5 s doubling to 60 s) and tries again."""
     env = os.environ if env is None else env
     try:
@@ -813,7 +864,7 @@ def serve(cfg: ControllerConfig | None = None, *, interval_s: float = 5.0, once:
             try:
                 run_once(ctl)
                 failures = 0
-            except OSError as exc:
+            except Exception as exc:  # noqa: BLE001 - whatever a tick raises is logged by type and retried; interrupts and exits still end the loop
                 failures += 1
                 print(f"herdr-eng handoff controller: tick failed: {type(exc).__name__}", file=sys.stderr, flush=True)
                 if once:

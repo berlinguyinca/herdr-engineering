@@ -10,6 +10,7 @@ class ControllerConfig:
     drain_timeout_s: float = 1800.0
     briefing_timeout_s: float = 300.0
     max_attempts: int = 3
+    pane_gone_after_s: float = 60.0  # a pane with an open chain that Herdr does not list this long ends the chain `pane_gone`
     # Pushing the session's branch before a handoff. Default: never push (a repo's own rules may forbid it, and the
     # controller cannot read them); the briefing then records the unpushed commits. A worktree is allowed to push only
     # when it, or the main checkout of its repository, is one of `push_allowed_repos` (directories); any other

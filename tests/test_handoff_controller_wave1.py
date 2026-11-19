@@ -268,5 +268,8 @@ def test_a_chain_with_a_briefing_gets_the_normal_attempts_unless_it_is_the_last_
 def test_the_over_the_ceiling_last_resort_still_needs_no_ready_pane_to_write_the_briefing(tmp_path: Path) -> None:
     w = Wave(tmp_path)
     w.session("p1", 95.0)
-    w.tick(w.pane("p1", "working"))  # the order cannot be typed over the ceiling: the last resort, as before
-    assert w.names() == ["handoff.triggered", "handoff.stuck"] and w.events()[-1].colour is Colour.RED
+    w.tick(w.pane("p1", "working"))  # busy over the ceiling: waited for, not "cannot be typed"
+    assert w.names() == ["handoff.triggered", "handoff.waiting"]
+    w.clock[0] += D + 1  # the drain timeout passed without the order typed: the last resort writes the briefing
+    w.tick(w.pane("p1", "working"))
+    assert w.names()[-1] == "handoff.stuck" and w.events()[-1].colour is Colour.RED

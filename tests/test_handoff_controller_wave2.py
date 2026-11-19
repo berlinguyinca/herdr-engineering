@@ -165,6 +165,11 @@ def test_an_open_chain_whose_pane_is_gone_ends_stuck_pane_gone_once(tmp_path: Pa
     w.session("p1", 85.0)
     _typed_chain(w, started=w.clock[0] - 10)
     w.tick()  # no panes at all
+    w.clock[0] += 30
+    w.tick()
+    assert not [e for e in w.events() if e.event == "handoff.stuck"]  # not yet a minute
+    w.clock[0] += 31
+    w.tick()
     w.tick()
     stuck = [e for e in w.events() if e.event == "handoff.stuck"]
     assert [(e.reason, e.colour, e.chain_id) for e in stuck] == [("pane_gone", Colour.RED, "c1")]
@@ -236,10 +241,10 @@ def test_a_tick_that_fails_on_the_store_is_exit_one_once_and_retried_with_backof
 
 def test_credited_time_follows_the_monotonic_clock_and_ignores_a_sleep() -> None:
     clock = creditmod.TickClock(interval_s=5.0)
-    clock.tick(1000.0, 50.0, newest_open=None)
-    clock.tick(1005.0, 55.0, newest_open=None)
+    clock.tick(1000.0, 50.0)
+    clock.tick(1005.0, 55.0)
     assert clock.now(1005.0) == pytest.approx(1005.0)
-    clock.tick(1005.0 + 10_800.0, 60.0, newest_open=None)  # three hours of sleep: the monotonic clock stood still
+    clock.tick(1005.0 + 10_800.0, 60.0)  # three hours of sleep: the monotonic clock stood still
     assert clock.now(1005.0 + 10_800.0) == pytest.approx(1010.0)
     assert clock.credited(1005.0) == pytest.approx(1005.0)  # earlier times keep their place
     assert clock.credited(1005.0 + 10_800.0) == pytest.approx(1010.0)
@@ -247,20 +252,17 @@ def test_credited_time_follows_the_monotonic_clock_and_ignores_a_sleep() -> None
 
 def test_a_tick_gap_longer_than_three_intervals_is_credited_one_interval() -> None:
     clock = creditmod.TickClock(interval_s=5.0)
-    clock.tick(1000.0, 50.0, newest_open=None)
-    clock.tick(1100.0, 150.0, newest_open=None)  # the process was stopped for 100 s
+    clock.tick(1000.0, 50.0)
+    clock.tick(1100.0, 150.0)  # the process was stopped for 100 s
     assert clock.now(1100.0) == pytest.approx(1005.0)
-    clock.tick(1112.0, 162.0, newest_open=None)  # 12 s: under three intervals, credited in full
+    clock.tick(1112.0, 162.0)  # 12 s: under three intervals, credited in full
     assert clock.now(1112.0) == pytest.approx(1017.0)
 
 
-def test_after_a_restart_the_newest_open_chain_is_at_most_one_interval_old() -> None:
+def test_after_a_restart_an_open_chain_is_as_old_as_the_wall_clock_says() -> None:
     clock = creditmod.TickClock(interval_s=5.0)
-    clock.tick(50_000.0, 1.0, newest_open=1_000.0)  # the chain's last event is 49 000 s old on the wall clock
-    assert clock.now(50_000.0) - clock.credited(1_000.0) == pytest.approx(5.0)
-    young = creditmod.TickClock(interval_s=5.0)
-    young.tick(50_000.0, 1.0, newest_open=49_998.0)
-    assert young.now(50_000.0) - young.credited(49_998.0) == pytest.approx(2.0)
+    clock.tick(50_000.0, 1.0, oldest_open=1_000.0)  # the chain's first event is 49 000 s old on the wall clock
+    assert clock.now(50_000.0) - clock.credited(1_000.0) == pytest.approx(49_000.0)
 
 
 def test_a_sleeping_machine_does_not_run_out_the_briefing_timeout(tmp_path: Path) -> None:
@@ -282,13 +284,13 @@ def test_a_sleeping_machine_does_not_run_out_the_briefing_timeout(tmp_path: Path
     assert w.names()[2:] == ["handoff.drained", "handoff.stuck"]
 
 
-def test_a_restarted_controller_credits_an_old_chain_one_interval(tmp_path: Path) -> None:
+def test_a_restarted_controller_counts_an_old_chain_by_the_wall_clock(tmp_path: Path) -> None:
     w = World(tmp_path)
     w.ctl.ticks = creditmod.TickClock(interval_s=5.0)
     w.session("p1", 85.0)
-    _typed_chain(w, started=w.clock[0] - 3 * 3600)  # the controller was down for three hours
+    _typed_chain(w, started=w.clock[0] - 3 * 3600)  # the controller was down for three hours: the bound has passed
     w.tick(w.pane("p1", "idle"))
-    assert w.names() == ["handoff.triggered", "handoff.drain_started"]
+    assert w.names()[:3] == ["handoff.triggered", "handoff.drain_started", "handoff.drained"]
 
 
 # --- I7 -------------------------------------------------------------------------------------------------------------

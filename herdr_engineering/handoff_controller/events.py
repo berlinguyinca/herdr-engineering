@@ -4,12 +4,14 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, fields
+from dataclasses import MISSING, asdict, dataclass, fields
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 
 from ..handoff_adapters.base import Harness
+from .herdr_cli import AgentPane
 
 
 class Colour(StrEnum):
@@ -40,8 +42,17 @@ class StuckReason(StrEnum):
     NO_RECORD = "no_record"  # the session's context record stayed unreadable for a whole drain timeout
     RECORD_UNREADABLE = "record_unreadable"  # the handoff record could not be read: nothing is launched or compacted on it
     MERGE_IN_PROGRESS = "merge_in_progress"  # the worktree is mid-merge and a push is allowed: nothing is committed or pushed
-    PANE_GONE = "pane_gone"  # the pane closed (or holds another session) while the chain was open
+    PANE_GONE = "pane_gone"  # the pane closed (or holds another session) for `pane_gone_after_s` while the chain was open
+    COMPACTION_STATE_UNKNOWN = "compaction_state_unknown"  # a restart found a compaction that may be running: never typed twice
     INTERNAL_ERROR = "internal_error"  # finishing the chain raised three times in a row; `internal_error:<exception type>`
+
+
+class IsSidePane(Protocol):
+    def __call__(self, pane: AgentPane) -> bool: ...
+
+
+class EnsureSidePane(Protocol):
+    def __call__(self, tab_id: str) -> None: ...
 
 
 EVENT_NAMES = frozenset({
@@ -56,6 +67,7 @@ TERMINAL = {
 }
 COMPACTING = "compacting"  # the `reason` of the second `handoff.takeover_started`: the attempts are over, compaction begins
 OVER_CEILING = "over_ceiling"  # the `reason` of the triggered / fallback-briefing event of a last-resort chain
+_REQUIRED_KEYS = frozenset({"event", "at", "chain_id", "pane_id", "harness"})  # every other key reads as None when absent
 _REASON_REQUIRED = frozenset({"handoff.stuck", "handoff.skipped", "handoff.waiting"})
 
 
@@ -94,6 +106,9 @@ class HandoffEvent:
         data = json.loads(line)
         known = {f.name for f in fields(cls)}
         data = {k: v for k, v in data.items() if k in known}  # a key a newer version added is not an error
+        for f in fields(cls):  # nor is an optional key an older version did not write
+            if f.name not in data and f.name not in _REQUIRED_KEYS:
+                data[f.name] = None if f.default is MISSING else f.default
         data["harness"] = Harness(data["harness"])
         if data["colour"] is not None:
             data["colour"] = Colour(data["colour"])
