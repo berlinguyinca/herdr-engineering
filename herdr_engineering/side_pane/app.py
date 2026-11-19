@@ -265,6 +265,26 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tab", default=None, help="follow this Herdr tab (default: the tab of $HERDR_PANE_ID)")
     parser.add_argument("--pane", default=None, help="the pane this viewer runs in (default: $HERDR_PANE_ID)")
     parser.add_argument("--no-ci", action="store_true", help="do not read CI (the CI tab stays empty)")
+    parser.add_argument("--snapshot", action="store_true",
+                        help="render one frame to stdout and exit 0, without Herdr, CI or a terminal (needs --tab or --pane)")
+    parser.add_argument("--tab-view", choices=[t.value for t in Tab], default="summary",
+                        help="with --snapshot: the tab to render (default summary)")
+    parser.add_argument("--width", type=int, default=60, help="with --snapshot: the frame width in columns (default 60)")
+    parser.add_argument("--session-pane", default=None, metavar="PANE_ID",
+                        help="with --snapshot: show the session of this pane id, read from the store (needs --session-id)")
+    parser.add_argument("--session-id", default=None, help="with --snapshot: the session id of --session-pane")
+
+
+def _snapshot(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    """One frame of the chosen tab, read from the store only: a smoke test and a way to see the pane without a terminal."""
+    ref = (SessionRef(Harness.CLAUDE, args.session_pane, Path.cwd(), args.session_id, None)
+           if args.session_pane and args.session_id else None)
+    now = time.time()
+    screen = Screen(RenderOpts(color=False))
+    screen.tab = Tab(args.tab_view)
+    screen.publish(Snapshot(build_model(ref, shared_store_root(env), env, now), ref, "" if ref else "no session in this tab"))
+    print("\n".join(screen.render(max(args.width, 1), 200, now)))
+    return 0
 
 
 def run_with(args: argparse.Namespace, env: Mapping[str, str] | None = None) -> int:
@@ -273,6 +293,8 @@ def run_with(args: argparse.Namespace, env: Mapping[str, str] | None = None) -> 
     if not pane and not args.tab:
         print(_NO_PANE, file=sys.stderr)
         return 2
+    if args.snapshot:
+        return _snapshot(args, env)
     pane_app = PaneApp(args.tab, pane, SideHerdr(env=env), env, fetch_ci=None if args.no_ci else fetch_cards)
     stop = threading.Event()
 
