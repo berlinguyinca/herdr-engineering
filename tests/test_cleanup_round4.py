@@ -153,6 +153,29 @@ def test_reaper_removes_a_clean_pushed_worktree(env: Env) -> None:
     assert not wt.exists()
 
 
+FIRE_ON = 3  # the last `git status` of the early inspection; the removal-time inspection comes after it
+
+
+def test_reaper_keeps_a_worktree_that_turns_dirty_between_the_two_inspections(env: Env, tmp_path: Path) -> None:
+    wt = env.worktree("once")
+    marker, runs = tmp_path / "ran", tmp_path / "runs"
+    script = tmp_path / "dirty-it.sh"  # a real clean filter: git runs it during `status` of the worktree
+    script.write_text(f"#!/bin/sh\necho x >> {runs}\n"
+                      f"if [ $(wc -l < {runs}) -eq {FIRE_ON} ] && [ ! -e {marker} ]; then touch {marker}; "
+                      f"echo mine > {wt}/notes.md; fi\ncat >/dev/null; echo a\n")
+    script.chmod(0o755)
+    git(env.repo, "config", "filter.dirty.clean", str(script))
+    (env.repo / ".git" / "info").mkdir(exist_ok=True)
+    (env.repo / ".git" / "info" / "attributes").write_text("a.txt filter=dirty\n")
+    (wt / "a.txt").write_text("b\n")  # same size, new mtime: git must run the filter
+    out = reap_worktrees(HygienePolicy(pr_source="git", min_idle_hours=0, ttl_days=0), extra_repos=[env.repo],
+                         extra_roots=[str(env.roots[0])], now=time.time() + DAY)
+    assert marker.exists(), "the filter never fired"
+    rows = [w for r in out["repos"] for w in r["worktrees"]]
+    assert [(w["action"], w["reason"]) for w in rows] == [("kept", "dirty")]  # caught by the removal-time pass
+    assert (wt / "notes.md").read_text() == "mine\n" and wt.is_dir()
+
+
 # --- 8: a broken config is loud ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("command", ["run", "status"])
