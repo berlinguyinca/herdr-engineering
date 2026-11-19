@@ -5,7 +5,9 @@ import json
 import shutil
 import subprocess
 from collections.abc import Mapping
+from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 
 _CALL_MARGIN_S = 5.0  # a herdr call gets its own timeout plus this much before the subprocess is abandoned
 _QUICK_CALL_S = 15.0  # herdr calls that answer from memory
@@ -17,29 +19,42 @@ class PromptResult(StrEnum):
     FAILED = "failed"
 
 
+@dataclass(frozen=True)
+class AgentInfo:
+    name: str | None  # what Herdr detected in the pane: the harness name (claude, codex, pi, opencode) or None
+    status: str | None
+
+
 class HerdrCli:
     """`binary` defaults to `herdr` on PATH; `env` replaces the environment (e.g. HERDR_SOCKET_PATH of another server)."""
 
-    def __init__(self, binary: str | None = None, env: Mapping[str, str] | None = None) -> None:
+    def __init__(self, binary: str | None = None, env: Mapping[str, str] | None = None,
+                 cwd: Path | None = None) -> None:
+        self._cwd = cwd  # a relative HERDR_SOCKET_PATH in `env` is resolved from here
         self._binary = binary or shutil.which("herdr") or "herdr"
         self._env = dict(env) if env is not None else None
 
     def _run(self, args: list[str], timeout_s: float) -> subprocess.CompletedProcess[str] | None:
         try:
             return subprocess.run([self._binary, *args], env=self._env, capture_output=True, text=True,
-                                  timeout=timeout_s, check=False)
+                                  timeout=timeout_s, check=False, cwd=self._cwd)
         except (OSError, subprocess.SubprocessError, ValueError):
             return None
 
-    def agent_status(self, pane_id: str) -> str | None:
+    def agent(self, pane_id: str) -> AgentInfo | None:
         done = self._run(["agent", "get", pane_id], _QUICK_CALL_S)
         if done is None or done.returncode != 0:
             return None
         try:
-            status = json.loads(done.stdout)["result"]["agent"]["agent_status"]
-        except (ValueError, KeyError, TypeError):
+            agent = json.loads(done.stdout)["result"]["agent"]
+            name, status = agent.get("agent"), agent["agent_status"]
+        except (ValueError, KeyError, TypeError, AttributeError):
             return None
-        return status if isinstance(status, str) else None
+        return AgentInfo(name if isinstance(name, str) else None, status if isinstance(status, str) else None)
+
+    def agent_status(self, pane_id: str) -> str | None:
+        info = self.agent(pane_id)
+        return info.status if info else None
 
     def wait_idle(self, pane_id: str, timeout_s: float) -> bool:
         """True when the agent reached idle or done within `timeout_s`."""
@@ -55,7 +70,7 @@ class HerdrCli:
 
     def prompt(self, pane_id: str, text: str) -> PromptResult:
         """Submit `text` the way Herdr does itself (bracketed paste, then Enter); Herdr refuses a blocked agent."""
-        done = self._run(["agent", "prompt", pane_id, text], _QUICK_CALL_S)
+        done = self._run(["agent", "prompt", pane_id, text], _QUICK_CALL_S)  # measured: herdr takes "-x" text as is, and rejects a `--` ("unknown option")
         if done is None:
             return PromptResult.FAILED
         try:
