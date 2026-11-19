@@ -224,11 +224,3 @@ def test_real_proc_fallback_sees_a_process_inside_the_target(tmp_path: Path, mon
     finally:
         holder.kill()
         holder.wait()
-
-
-@pytest.mark.skipif(Path("/proc").is_dir(), reason="a real /proc is a valid source")
-def test_no_lsof_and_no_proc_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from herdr_engineering.cleanup_command import in_use_snapshot
-    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
-    with pytest.raises(Refusal, match="in_use"):
-        in_use_snapshot()

@@ -23,7 +23,6 @@ rules of ``build_cleanup``.
 from __future__ import annotations
 
 import argparse
-import functools
 import json
 import os
 import re
@@ -71,16 +70,17 @@ def scratch_root() -> Path:
     return default_root()
 
 
-def default_roots(home: Path | None = None) -> list[Path]:
-    """Agent-created locations only. ``~/IdeaProjects`` and ``~/work`` hold the user's own repos."""
+def default_roots(home: Path | None = None, scratch: Path | None = None) -> list[Path]:
+    """Agent-created locations only. ``~/IdeaProjects`` and ``~/work`` hold the user's own repos.
+    ``scratch``: the one resolved scratch root (None resolves it here)."""
     home = home or Path.home()
     return [home / ".local" / "share" / "worktrees", home / ".cache" / "herdr-engineering",
-            scratch_root()]
+            scratch or scratch_root()]
 
 
-def default_temp_roots() -> list[Path]:
+def default_temp_roots(scratch: Path | None = None) -> list[Path]:
     """Where scratch files may live; ``tmp`` scope is confined to these."""
-    return [Path(tempfile.gettempdir()), Path("/tmp"), scratch_root()]
+    return [Path(tempfile.gettempdir()), Path("/tmp"), scratch or scratch_root()]
 
 
 def default_temp_worktree_parents() -> list[Path]:
@@ -120,9 +120,10 @@ def absolute_roots(value: Any, name: str = "roots") -> tuple[str, ...]:
     return roots
 
 
-def configured_roots(extra: Iterable[str] = (), home: Path | None = None) -> list[Path]:
+def configured_roots(extra: Iterable[str] = (), home: Path | None = None,
+                     scratch: Path | None = None) -> list[Path]:
     """Defaults + already validated ``extra`` roots (the caller reads and validates the config)."""
-    return [*default_roots(home), *(Path(r).expanduser() for r in extra)]
+    return [*default_roots(home, scratch), *(Path(r).expanduser() for r in extra)]
 
 
 def user_roots(home: Path | None = None) -> tuple[str, ...]:
@@ -143,20 +144,41 @@ def _git(cwd: Path, *args: str, timeout: int | None = None) -> subprocess.Comple
     return safe_git(cwd, *options, *args, timeout=GIT_TIMEOUT if timeout is None else timeout)
 
 
-@functools.lru_cache(maxsize=64)
+_EXCLUDES: dict[tuple[str, str], str] = {}
+
+
+def _has_conditional_includes(home: str) -> bool:
+    """``[includeIf]`` in the user's own global config: only then does the answer depend on the repository."""
+    for name in (".gitconfig", ".config/git/config"):
+        try:
+            if "includeif" in (Path(home) / name).read_text(errors="replace").lower():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _user_excludes_file(home: str, cwd: str) -> str:
     """``core.excludesFile`` of the user's own global git config, the one setting the hardened
-    runner keeps from it. ``--includes`` follows ``[include]``/``[includeIf]`` (dotfile managers put
-    ``core.*`` in an included file), which is why it is read from ``cwd``. Empty when unset."""
+    runner keeps from it. ``--includes`` follows ``[include]`` (dotfile managers put ``core.*`` in an
+    included file). Resolved once per home; once per repository only when ``[includeIf]`` exists.
+    A failed or timed-out lookup is not remembered. Empty when unset."""
+    where = cwd if _has_conditional_includes(home) else home
+    if (home, where) in _EXCLUDES:
+        return _EXCLUDES[home, where]
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     try:
         done = subprocess.run(["git", "config", "--global", "--includes", "--type=path", "--get",
                                "core.excludesFile"],
-                              capture_output=True, text=True, timeout=15, check=False, env=env, cwd=cwd)
+                              capture_output=True, text=True, timeout=15, check=False, env=env,
+                              cwd=where if Path(where).is_dir() else None)
     except (OSError, subprocess.SubprocessError):
         return ""
     value = done.stdout.strip() if done.returncode == 0 else ""
-    return value if value.startswith("/") else ""
+    value = value if value.startswith("/") else ""
+    if done.returncode in (0, 1):  # 1: simply not set
+        _EXCLUDES[home, where] = value
+    return value
 
 
 def config_strings(value: Any, name: str) -> tuple[str, ...]:
@@ -264,10 +286,10 @@ def _argument_lines(ignore: frozenset[int]) -> tuple[str, ...]:
         return ()
 
 
-def in_use_snapshot() -> Snapshot:
+def in_use_snapshot(proc: Path = Path("/proc")) -> Snapshot:
     """The ``scratch_safety`` process snapshot (open files, cwds, argv). Where ``lsof`` is
     unavailable (Linux without it) it falls back to the open files and working directories in
-    ``/proc`` plus the ``ps`` command lines; with neither source it fails CLOSED:
+    ``proc`` (``/proc``) plus the ``ps`` command lines; with neither source it fails CLOSED:
     ``Refusal('in_use')``."""
     from .scratch_safety import InspectionUnavailable, Snapshot, _comparison, process_snapshot
     ancestors: frozenset[int] = frozenset()
@@ -275,7 +297,6 @@ def in_use_snapshot() -> Snapshot:
         ancestors = _ancestors()
         return process_snapshot(ancestors)
     except (InspectionUnavailable, OSError, ValueError, subprocess.SubprocessError) as exc:
-        proc = Path("/proc")
         if not proc.is_dir():
             raise Refusal("in_use", f"cannot verify running processes: {exc}") from exc
         from .build_cleanup import _process_paths
@@ -367,10 +388,16 @@ REBUILDABLE = ("target", "node_modules", ".venv", "venv", "__pycache__", ".pytes
 OS_JUNK = (".DS_Store", "._*", "Thumbs.db", "desktop.ini", "Icon\r")
 
 
-def _is_junk(entry: str) -> bool:
+def _is_junk(root: Path, entry: str) -> bool:
+    """A junk-named regular file. Never a directory (``._work/`` may be a nested repository,
+    and git lists an untracked one as ``dir/``) and never a symlink."""
     from fnmatch import fnmatchcase
-    name = entry.rstrip("/").rsplit("/", 1)[-1]
-    return any(fnmatchcase(name, pattern) for pattern in OS_JUNK)
+    if entry.endswith("/") or not any(fnmatchcase(entry.rsplit("/", 1)[-1], pattern) for pattern in OS_JUNK):
+        return False
+    try:
+        return stat.S_ISREG(os.lstat(root / entry).st_mode)
+    except OSError:
+        return False
 
 
 def _status(path: Path, *flags: str) -> list[tuple[str, str]] | None:
@@ -390,15 +417,16 @@ def _status(path: Path, *flags: str) -> list[tuple[str, str]] | None:
 
 def untracked_junk(path: Path) -> list[str]:
     """Untracked OS-junk files (relative paths); ``git worktree remove`` refuses a tree holding them."""
-    return [name for code, name in _status(path, "--untracked-files=all") or [] if code == "??" and _is_junk(name)]
+    return [name for code, name in _status(path, "--untracked-files=all") or []
+            if code == "??" and _is_junk(path, name)]
 
 
 def is_dirty(path: Path) -> bool:
     entries = _status(path, "--untracked-files=all")
-    return entries is None or any(not (code == "??" and _is_junk(name)) for code, name in entries)
+    return entries is None or any(not (code == "??" and _is_junk(path, name)) for code, name in entries)
 
 
-def foreign_ignored(path: Path, rebuildable: tuple[str, ...] = REBUILDABLE) -> list[str]:
+def foreign_ignored(path: Path, rebuildable: tuple[str, ...] = REBUILDABLE, *, deep: bool = True) -> list[str]:
     """Ignored-but-present entries that are not plain rebuildable output (or OS junk).
 
     ``--ignored=matching`` lists each file by the pattern that ignored it and collapses a
@@ -406,7 +434,8 @@ def foreign_ignored(path: Path, rebuildable: tuple[str, ...] = REBUILDABLE) -> l
     entry's name is matched against the (glob) rebuildable list; a file entry's name must match on
     its own, so ``dist/prod.env`` is never "rebuildable" because of ``dist``. A matching directory
     is still looked inside: a nested repository (an editable checkout in ``.venv``, a vendored
-    clone in ``build``) or an unverifiable tree makes it foreign."""
+    clone in ``build``) or an unverifiable tree makes it foreign. ``deep=False`` judges names only
+    (no walk of those directories): a cheap early refusal, never a clearance."""
     from fnmatch import fnmatchcase
 
     from .scratch_safety import inspect_tree
@@ -418,13 +447,13 @@ def foreign_ignored(path: Path, rebuildable: tuple[str, ...] = REBUILDABLE) -> l
         if code != "!!":
             continue
         entry = raw.rstrip("/")
-        if _is_junk(entry):
+        if _is_junk(path, raw):
             continue
         if not any(fnmatchcase(entry.rsplit("/", 1)[-1], pattern) for pattern in rebuildable):
             found.append(entry)
             continue
         full = path / entry
-        if full.is_symlink() or not full.is_dir():
+        if not deep or full.is_symlink() or not full.is_dir():
             continue
         try:
             if inspect_tree(full, accounting_only=True).repositories:
@@ -453,44 +482,45 @@ def patch_merged(path: Path) -> bool:
     return False
 
 
-def _rebuildable_patterns(rebuildable: tuple[str, ...] | None) -> tuple[str, ...]:
-    """The built-in rebuildable names plus the user's extra patterns (None reads the config)."""
-    if rebuildable is None:
-        try:
-            rebuildable = config_strings(user_disk_hygiene_config().get("rebuildable"), "rebuildable")
-        except ValueError as exc:
-            raise Refusal("config_unreadable", f"disk_hygiene.{exc}") from exc
-    return (*REBUILDABLE, *rebuildable)
+def user_rebuildable() -> tuple[str, ...]:
+    """The user's extra rebuildable patterns from the config; a bad value refuses (fail closed)."""
+    try:
+        return config_strings(user_disk_hygiene_config().get("rebuildable"), "rebuildable")
+    except ValueError as exc:
+        raise Refusal("config_unreadable", f"disk_hygiene.{exc}") from exc
 
 
-def _refuse_unremovable_state(path: Path, rebuildable: tuple[str, ...] | None) -> None:
-    """Local-only refusals: dirty, hidden index state, ignored files that are not rebuildable."""
+def _refuse_unremovable_state(path: Path, rebuildable: tuple[str, ...] | None, *, deep: bool) -> None:
+    """Local-only refusals: dirty, hidden index state, ignored files that are not rebuildable.
+    ``deep=False`` skips the walk of rebuildable directories (an early, cheap refusal only)."""
     from .scratch_safety import hidden_index_reason
     if is_dirty(path):
         raise Refusal("dirty", f"{path} has uncommitted or untracked changes")
     if reason := hidden_index_reason(path):
         raise Refusal("hidden_index_state",
                       f"{path} has skip-worktree/assume-unchanged entries whose edits git hides ({reason})")
-    if ignored := foreign_ignored(path, _rebuildable_patterns(rebuildable)):
+    patterns = (*REBUILDABLE, *(user_rebuildable() if rebuildable is None else rebuildable))
+    if ignored := foreign_ignored(path, patterns, deep=deep):
         raise Refusal("ignored_files",
                       f"{path} has ignored files that are not plain rebuildable output: {', '.join(ignored[:5])}")
 
 
 def worktree_quick_facts(path: Path, rebuildable: tuple[str, ...] | None = None) -> dict[str, Any]:
-    """Facts plus every local refusal (dirty, hidden index, foreign ignored files), taken before
-    any network call so a worktree that cannot be removed never costs a PR lookup."""
+    """Facts plus the cheap local refusals (dirty, hidden index, foreign ignored names), taken
+    before any network call so a worktree that cannot be removed never costs a PR lookup. The
+    walk of rebuildable directories is left to ``settle_worktree``."""
     facts = worktree_facts(path)
-    _refuse_unremovable_state(path, rebuildable)
+    _refuse_unremovable_state(path, rebuildable, deep=False)
     return facts
 
 
 def settle_worktree(path: Path, facts: dict[str, Any], rebuildable: tuple[str, ...] | None = None) -> None:
-    """The refusals that must hold at the moment of removal, re-run after any network lookup: HEAD
-    is still the inspected one and the local state is still removable. ``rebuildable``: the user's
-    extra patterns (None reads the config here)."""
+    """The full refusals that must hold at the moment of removal, after any network lookup: HEAD is
+    still the inspected one and the local state, including the nested-repository walk, is removable.
+    ``rebuildable``: the user's extra patterns (None reads the config here)."""
     if _git(path, "rev-parse", "HEAD").stdout.strip() != facts["head"]:
         raise Refusal("changed", f"{path}: HEAD moved since it was inspected")
-    _refuse_unremovable_state(path, rebuildable)
+    _refuse_unremovable_state(path, rebuildable, deep=True)
 
 
 def check_worktree_removable(path: Path, *, merged_ok: bool,
@@ -501,18 +531,20 @@ def check_worktree_removable(path: Path, *, merged_ok: bool,
     """``prechecked``: facts from ``worktree_quick_facts`` (taken before the caller's own PR
     lookup). ``pr_head``: the head SHA of a MERGED PR the caller already looked up (None looks it
     up here when ``merged_ok``); it excuses unpushed commits only while it equals the HEAD. The
-    local checks run before any lookup and once more after it (``settle_worktree``); the in-use
-    check runs last, right before any removal."""
+    cheap local checks run before any lookup, the full ``settle_worktree`` once after it; the
+    in-use check runs last, right before any removal."""
     if rebuildable is None:
-        rebuildable = _rebuildable_patterns(None)[len(REBUILDABLE):]  # read the config once
+        rebuildable = user_rebuildable()  # read the config once
     facts = dict(prechecked) if prechecked is not None else worktree_quick_facts(path, rebuildable)
     if unpushed(path):
         merged = False
         if merged_ok:
             if pr_head is None:
                 pr = gh_pr_state(path, facts["branch"], facts["head"], _origin_owner(path))
-                pr_head = facts["head"] if pr_excuses_unpushed(pr, facts["head"]) else ""
-            merged = patch_merged(path) or pr_head == facts["head"]
+                excused = pr_excuses_unpushed(pr, facts["head"])
+            else:
+                excused = bool(facts["head"]) and pr_head == facts["head"]
+            merged = patch_merged(path) or excused
         if not merged:
             raise Refusal("unpushed_commits",
                           f"{path} has commits that are on no remote and not merged (unpushed)")
@@ -529,7 +561,7 @@ def remove_worktree(path: Path, *, dry_run: bool, merged_ok: bool,
     facts = check_worktree_removable(path, merged_ok=merged_ok, snapshot=snapshot,
                                      rebuildable=rebuildable, pr_head=pr_head, prechecked=prechecked)
     if not dry_run:
-        for name in untracked_junk(path):  # `worktree remove` refuses untracked files; this is junk
+        for name in untracked_junk(path):  # `worktree remove` refuses untracked files; these are junk files
             (path / name).unlink(missing_ok=True)
         # Run from the common git dir: works for normal, bare and separate-git-dir repositories
         # alike, and `worktree remove` drops its own registration (no repo-wide `worktree prune`).
@@ -701,7 +733,8 @@ def _cleanup(scope: Scope | str, path: Path | str | None, *, roots: list[Path], 
                 "action": "would_remove" if dry_run else "removed", **extra}
     if not path:
         raise Refusal("missing_path", f"{scope} scope needs --path")
-    temp = default_temp_roots() if temp_roots is None else temp_roots
+    scratch = scratch_root() if scratch is None else scratch
+    temp = default_temp_roots(scratch) if temp_roots is None else temp_roots
     parents = default_temp_worktree_parents() if temp_worktree_parents is None else temp_worktree_parents
     target = checked_path(path, temp if kind is Scope.TMP else roots,
                           parents if kind is Scope.WORKTREE else None)
@@ -712,7 +745,7 @@ def _cleanup(scope: Scope | str, path: Path | str | None, *, roots: list[Path], 
     else:
         from .scratch_reaper import default_live_roots
         extra = _remove_tmp(target, dry_run=dry_run,
-                            scratch=scratch_root() if scratch is None else scratch,
+                            scratch=scratch,
                             live_roots=default_live_roots() if live_roots is None else live_roots,
                             now=now)
     return {"scope": scope, "path": str(target), "dry_run": dry_run,
@@ -746,8 +779,10 @@ def main_args(args: argparse.Namespace) -> int:
         return 2
     try:
         from .build_coord import _default_state_dir
-        out = cleanup(args.scope, args.path, roots=configured_roots(user_roots()), dry_run=args.dry_run,
-                      merged_ok=args.merged_ok, state_dir=_default_state_dir())
+        scratch = scratch_root()  # resolved once: the roots, the temp roots and the guard agree
+        out = cleanup(args.scope, args.path, roots=configured_roots(user_roots(), scratch=scratch),
+                      dry_run=args.dry_run, merged_ok=args.merged_ok, state_dir=_default_state_dir(),
+                      scratch_root=scratch)
     except Refusal as exc:
         if args.json:
             print(json.dumps({"scope": args.scope, "path": args.path, "refused": exc.code,

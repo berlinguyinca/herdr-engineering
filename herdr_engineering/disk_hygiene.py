@@ -321,8 +321,9 @@ def reap_repo(repo: Path, policy: Policy, roots: list[Path], *, dry_run: bool, n
 
 def reap_worktrees(policy: Policy, *, dry_run: bool = False, extra_repos: list[Path] | None = None,
                    extra_roots: list[str] | None = None, now: float | None = None,
-                   temp_worktree_parents: list[Path] | None = None) -> dict[str, Any]:
-    roots = configured_roots([*policy.roots, *(extra_roots or [])])
+                   temp_worktree_parents: list[Path] | None = None,
+                   scratch_root: Path | None = None) -> dict[str, Any]:
+    roots = configured_roots([*policy.roots, *(extra_roots or [])], scratch=scratch_root)
     parents = default_temp_worktree_parents() if temp_worktree_parents is None else temp_worktree_parents
     repos = [*policy.repos, *(extra_repos or [])] or find_repos(roots, parents)
     now = time.time() if now is None else now

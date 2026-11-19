@@ -173,8 +173,10 @@ class Report:
 
 
 def default_root() -> Path:
-    """Claude Code's scratch root (``/tmp/claude-<uid>`` on macOS and Linux alike)."""
-    return Path(f"/tmp/claude-{os.getuid()}")
+    """Claude Code's scratch root: ``claude-<uid>`` under ``$CLAUDE_CODE_TMPDIR`` (``/tmp`` when
+    unset). Checked against Claude Code 2.1.306: it reads only that variable for the base directory;
+    ``CLAUDE_TMPDIR`` is the TMPDIR it hands to sandboxed commands, not a session root."""
+    return Path(os.environ.get("CLAUDE_CODE_TMPDIR") or "/tmp") / f"claude-{os.getuid()}"
 
 
 def default_live_roots() -> list[Path]:

@@ -206,9 +206,6 @@ def test_agent_worktree_in_agent_root_is_discovered_and_reaped(tmp_path: Path, m
     """The repo is in the user's ~/IdeaProjects (not a root); only its agent worktree is."""
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
-    # the default roots also hold Claude's scratch root (/tmp/claude-<uid>), which does not follow HOME:
-    # point it into tmp_path so the host's real scratch repos cannot join this test
-    monkeypatch.setattr("herdr_engineering.scratch_reaper.default_root", lambda: tmp_path / "scratch")
     env = Env(tmp_path, root=home / "IdeaProjects")
     agent_root = home / ".local" / "share" / "worktrees"
     agent_root.mkdir(parents=True)
@@ -218,7 +215,7 @@ def test_agent_worktree_in_agent_root_is_discovered_and_reaped(tmp_path: Path, m
     merge_into_main(env, wt)
     # no extra_repos: discovery through the worktree. No temp parents: the host's real /tmp/wt-*
     # worktrees (agent worktrees are discovered there by design) must not join this test.
-    out = reap_worktrees(policy(), now=time.time(), temp_worktree_parents=[])
+    out = reap_worktrees(policy(), now=time.time(), temp_worktree_parents=[], scratch_root=tmp_path / "scratch")
     rows = [w for r in out["repos"] for w in r["worktrees"]]
     assert [(w["action"], w["reason"]) for w in rows] == [("removed", "pr_merged")]
     assert env.repo.is_dir()
