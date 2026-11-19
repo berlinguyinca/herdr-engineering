@@ -12,6 +12,8 @@ from herdr_engineering.build_cleanup import _managed_process
 from herdr_engineering.cleanup_command import Refusal, _guard_scratch
 from herdr_engineering.scratch_reaper import default_root, system_temp_roots
 
+from .test_cleanup_round2 import home  # noqa: F401
+
 UID = os.getuid()
 SESSION = "11111111-2222-3333-4444-555555555555"
 
@@ -31,14 +33,15 @@ def _nested_session(tmp_path: Path) -> Path:
     return session
 
 
-def test_a_foreign_session_below_a_nested_claude_dir_keeps_the_session_rules(tmp_path: Path) -> None:
+def test_a_foreign_session_below_a_nested_claude_dir_keeps_the_session_rules(tmp_path: Path, home: Path) -> None:  # noqa: F811
     session = _nested_session(tmp_path)
     with pytest.raises(Refusal) as refusal:
         _guard_scratch(session / "work" / "f", [Path(f"/tmp/claude-{UID}")], [], time.time())
     assert refusal.value.code == "session_recent"
 
 
-def test_the_nested_claude_dir_is_protected_and_its_session_dir_follows_the_session_rules(tmp_path: Path) -> None:
+def test_the_nested_claude_dir_is_protected_and_its_session_dir_follows_the_session_rules(
+        tmp_path: Path, home: Path) -> None:  # noqa: F811
     session = _nested_session(tmp_path)
     for path, code in ((session, "session_recent"), (session.parents[1], "scratch_protected")):
         with pytest.raises(Refusal) as refusal:

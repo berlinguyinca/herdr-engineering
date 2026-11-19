@@ -626,16 +626,54 @@ def _process_started(pid: int) -> float | None:
         return None
 
 
-def running_sessions(*, own_only: bool = False) -> frozenset[str]:
+def _process_environment(pid: int) -> dict[str, str] | None:
+    """The environment of a same-uid process: ``/proc/<pid>/environ`` on Linux, ``ps -E`` elsewhere.
+    None when it cannot be read (macOS shows nothing for protected system binaries)."""
+    try:
+        raw = Path(f"/proc/{pid}/environ")
+        if raw.parent.is_dir():
+            pairs = raw.read_bytes().decode(errors="replace").split("\0")
+            return dict(item.split("=", 1) for item in pairs if "=" in item)
+        out = subprocess.run(["ps", "-E", "-p", str(pid), "-o", "command="], capture_output=True, text=True,
+                             timeout=15, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    tokens = dict(re.findall(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=(\S*)", out))
+    return tokens if "PATH" in tokens or "HOME" in tokens else None
+
+
+def claude_config_dirs() -> list[Path]:
+    """Every config dir a Claude account of this uid uses: the caller's, ``~/.claude`` and the
+    ``CLAUDE_CONFIG_DIR`` of each running ``claude`` process (all accounts share ``/tmp/claude-<uid>``).
+    A running ``claude`` whose environment cannot be read makes liveness unknowable: refuse."""
+    from .scratch_reaper import claude_config_dirs as callers
+    dirs = callers()
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    if configured and not os.access(configured, os.R_OK | os.X_OK):
+        raise Refusal("scratch_protected", f"CLAUDE_CONFIG_DIR={configured} cannot be read; liveness is unknown")
+    listing = subprocess.run(["ps", "-U", str(os.getuid()), "-o", "pid=,comm="], capture_output=True, text=True,
+                             timeout=15, check=False).stdout
+    for line in listing.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if not pid.isdigit() or Path(command.strip()).name != "claude":
+            continue
+        env = _process_environment(int(pid))
+        if env is None:
+            raise Refusal("live_session_unknown", f"cannot read the environment of the running claude process {pid}")
+        if configured := env.get("CLAUDE_CONFIG_DIR"):
+            dirs.append(Path(configured))
+    return list(dict.fromkeys(dirs))
+
+
+def running_sessions(dirs: list[Path], *, own_only: bool = False) -> frozenset[str]:
     """Session ids of running Claude processes. Claude records ``<pid> -> sessionId, startedAt`` in
-    ``<config dir>/sessions/<pid>.json`` (``$CLAUDE_CONFIG_DIR`` and ``~/.claude``); the process now
-    running under that pid must have started when the file says (a crashed session's stale file under a
-    recycled pid counts for nothing). ``own_only`` keeps the processes this one descends from: the
-    caller's own sessions. An environment variable never makes a session "own"."""
-    from .scratch_reaper import claude_config_dirs
+    ``<config dir>/sessions/<pid>.json``; the process now running under that pid must have started when
+    the file says (a crashed session's stale file under a recycled pid counts for nothing).
+    ``own_only`` keeps the processes this one descends from: the caller's own sessions. An environment
+    variable never makes a session "own"."""
     ancestors = _ancestors() if own_only else None
     found: set[str] = set()
-    for config in claude_config_dirs():
+    for config in dirs:
         try:
             files = list((config / "sessions").glob("*.json"))
         except OSError:
@@ -682,24 +720,28 @@ def _guard_scratch(path: Path, scratches: list[Path], live_roots: list[Path], no
         return
     if nested or not roots:
         raise Refusal("scratch_protected", f"{path} contains a scratch root or session; remove one session at a time")
+    def session_index(parts: tuple[str, ...]) -> int | None:
+        return next((i for i in (0, 1) if len(parts) > i and _UUID.fullmatch(parts[i].lower())), None)
+
     parts = min(roots, key=len)
-    index = 0 if parts and _UUID.fullmatch(parts[0].lower()) else 1 if len(parts) > 1 and _UUID.fullmatch(parts[1].lower()) else None
+    index = session_index(parts)
     if index is None:
         raise Refusal("scratch_protected", f"{path} is a scratch root or a project; only one session is removable")
     session = parts[index].lower()
     below = len(parts) - index - 1  # levels between the session dir and the target
     session_dir = path.parents[below - 1] if below else path
-    configured = os.environ.get("CLAUDE_CONFIG_DIR")
-    if configured and not os.access(configured, os.R_OK | os.X_OK):
-        raise Refusal("scratch_protected", f"CLAUDE_CONFIG_DIR={configured} cannot be read; liveness is unknown")
-    if session in running_sessions(own_only=True):
-        raise Refusal("scratch_protected", f"session {session} is the caller's own")
+    # every session between the target and the outermost claude-<uid>: the target's own and each enclosing one
+    sessions = {p[i].lower() for p in roots if (i := session_index(p)) is not None}
+    dirs = claude_config_dirs()
+    if sessions & running_sessions(dirs, own_only=True):
+        raise Refusal("scratch_protected", "the caller's own session is, or encloses, the target")
     outermost = max(len(p) for p in roots)  # the outermost root has the most parts below it
     if keep_ancestor(path, path.parents[outermost - 1]):
         raise Refusal("keep_marker", f"{path} is under a .keep marker")
     policy = Policy()
-    if session in _live_ids(live_roots, now - policy.live_seconds) or session in running_sessions():
-        raise Refusal("live_session", f"session {session} is still live")
+    live = _live_ids([*live_roots, *(d / "projects" for d in dirs)], now - policy.live_seconds) | running_sessions(dirs)
+    if sessions & live:
+        raise Refusal("live_session", f"session {', '.join(sorted(sessions & live))} is still live")
     if inspect_tree(session_dir, accounting_only=True).newest > now - policy.session_ttl_seconds:
         raise Refusal("session_recent", f"session {session} was active within {policy.session_ttl_seconds / 3600:.0f} h")
 

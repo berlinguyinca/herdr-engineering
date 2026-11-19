@@ -66,8 +66,8 @@ def test_3_a_claude_dir_nested_inside_the_own_session_is_refused(tmp_path: Path,
     (child / "tasks" / "out").write_text("live child")
     claim_session(home, OWN)
     _refused(tmp_path, own / "scratchpad", "scratch_protected", scratch_root=base / f"claude-{UID}")
-    # strictly inside the foreign nested session: the innermost claude-<uid> decides
-    _refused(tmp_path, child / "tasks", "session_recent", scratch_root=base / f"claude-{UID}")
+    # strictly inside the nested session: it is still below the caller's own session
+    _refused(tmp_path, child / "tasks", "scratch_protected", scratch_root=base / f"claude-{UID}")
 
 
 def test_4_a_claude_dir_deeper_than_six_levels_is_found(tmp_path: Path) -> None:
