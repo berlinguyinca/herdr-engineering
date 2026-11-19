@@ -5,7 +5,7 @@ import json
 import os
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, fields
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
@@ -54,6 +54,7 @@ TERMINAL = {
     "handoff.failed_compacted": Colour.ORANGE,
     "handoff.stuck": Colour.RED,
 }
+COMPACTING = "compacting"  # the `reason` of the second `handoff.takeover_started`: the attempts are over, compaction begins
 OVER_CEILING = "over_ceiling"  # the `reason` of the triggered / fallback-briefing event of a last-resort chain
 _REASON_REQUIRED = frozenset({"handoff.stuck", "handoff.skipped", "handoff.waiting"})
 
@@ -75,6 +76,7 @@ class HandoffEvent:
     successor_pane_id: str | None = None  # the successor's pane; `successor_id` is only ever a handoff id
     successor_session_id: str | None = None  # the successor agent's session id, when Herdr reports one
     subagents_live: int | None = None  # `handoff.waiting`: the subagents the registry counts as running
+    commit: str | None = None  # `handoff.wip_committed`: the checkpoint commit
 
     def __post_init__(self) -> None:
         if self.event not in EVENT_NAMES:
@@ -197,10 +199,19 @@ class Chain:
     waiting: tuple[str, int | None] | None = None  # the last `handoff.waiting` state (reason, subagents live)
     phase: Phase = Phase.DRAINING
     triggered_wall: float = 0.0  # `triggered_at` as the log has it, before any credit mapping (the store's clock)
+    compacting: bool = False  # the takeover attempts are over and compaction began: a restart must not replay them
 
 
 def epoch(iso: str) -> float:
     return datetime.fromisoformat(iso).timestamp()
+
+
+def iso(at: float) -> str:
+    return datetime.fromtimestamp(at, UTC).isoformat().replace("+00:00", "Z")
+
+
+def now_iso() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def pane_events(events: Sequence[HandoffEvent], pane_id: str, session_id: str | None) -> list[HandoffEvent]:
@@ -239,7 +250,8 @@ def _chain_of(mine: Sequence[HandoffEvent]) -> Chain:
     return Chain(mine[0].chain_id, epoch(next(e.at for e in mine if e.event == "handoff.triggered")), started, briefing,
                  "handoff.takeover_started" in names, epoch(mine[-1].at), over, epoch(written) if written else None,
                  (waited.reason or "", waited.subagents_live) if waited else None, phase,
-                 epoch(next(e.at for e in mine if e.event == "handoff.triggered")))
+                 epoch(next(e.at for e in mine if e.event == "handoff.triggered")),
+                 any(e.event == "handoff.takeover_started" and e.reason == COMPACTING for e in mine))
 
 
 def open_chain(events: Sequence[HandoffEvent]) -> Chain | None:

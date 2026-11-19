@@ -17,7 +17,6 @@ import json
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from enum import Enum, auto
 from pathlib import Path
 
@@ -25,7 +24,7 @@ from ..handoff_adapters.base import HarnessAdapter, SessionRef
 from ..handoff_subagent_gate import finish
 from .compaction import compact_with_pointer
 from .config import ControllerConfig
-from .events import Colour, EventLog, HandoffEvent, StuckReason
+from .events import COMPACTING, Colour, EventLog, HandoffEvent, StuckReason, now_iso
 from .handoff_cli import HandoffCli, HandoffCliResult
 from .herdr_cli import HerdrCli
 
@@ -132,14 +131,10 @@ def stuck_reason(head: StuckReason, detail: StuckReason | str | None, last_takeo
     return "; ".join(parts)
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
-
-
 def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg: ControllerConfig, log: EventLog,
                  handoff: HandoffCli, herdr: HerdrCli, *, store_root: Path, worktree: Path, push_allowed: bool,
                  env: Mapping[str, str], chain_id: str | None = None, predecessor_id: str | None = None,
-                 context_pct: float | None = None, confirm_timeout_s: float = 25.0, call_margin_s: float = 60.0,
+                 context_pct: float | None = None, resumed: bool = False, confirm_timeout_s: float = 25.0, call_margin_s: float = 60.0,
                  retry_delay_s: float = 2.0, compact_ready_timeout_s: float = 60.0,
                  compact_work_start_s: float = 15.0, compact_work_end_s: float = 600.0, poll_s: float = 0.5,
                  sleep: Callable[[float], None] = time.sleep,
@@ -147,14 +142,15 @@ def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg:
     """Up to `cfg.max_attempts` takeovers (each preceded by a look at the record), then compaction. The returned
     event, `handoff.succeeded`, `handoff.failed_compacted` or `handoff.stuck`, is appended to `log` exactly once, after
     `handoff.takeover_started`. `--allow-dirty-source` is passed only when `push_allowed` is False: there unpushed
-    commits are recorded by herdr-handoff and do not stop the close; where pushing is allowed they must be pushed."""
+    commits are recorded by herdr-handoff and do not stop the close; where pushing is allowed they must be pushed.
+    `resumed`: a restart found the chain already in its compaction fallback; the attempts are not replayed."""
     chain = chain_id or handoff_id
 
     def event(name: str, *, colour: Colour | None = None, reason: str | None = None,
               view: RecordView | None = None, pane: str | None = None) -> HandoffEvent:
         """`successor_id` is the record's successor handoff id; the child's pane and session ride in their own fields."""
         view = view or RecordView(None, None, None, None)
-        made = HandoffEvent(name, _now(), chain, ref.pane_id, ref.session_id, ref.harness, handoff_id, predecessor_id,
+        made = HandoffEvent(name, now_iso(), chain, ref.pane_id, ref.session_id, ref.harness, handoff_id, predecessor_id,
                             view.successor_id, colour, reason, context_pct, view.child_pane or pane,
                             view.child_session_id)
         log.append(made)
@@ -171,12 +167,13 @@ def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg:
     def stuck(why: str, view: RecordView | None = None, pane: str | None = None) -> HandoffEvent:
         return event("handoff.stuck", colour=Colour.RED, reason=why, view=view, pane=pane)
 
-    event("handoff.takeover_started")
+    if not resumed:
+        event("handoff.takeover_started")
     exit_plan = adapter.exit_plan()
     timeout_s = confirm_timeout_s + exit_plan.process_end_timeout_s + call_margin_s
     last: str | None = None
     last_pane: str | None = None
-    for attempt in range(cfg.max_attempts):
+    for attempt in range(0 if resumed else cfg.max_attempts):
         if attempt:
             sleep(retry_delay_s)
         record = handoff.inspect(store_root, handoff_id)
@@ -214,6 +211,8 @@ def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg:
     if pointer is None:
         return stuck(stuck_reason(StuckReason.NO_BRIEFING, "the briefing document could not be located", last), view,
                      pane)
+    if not resumed:
+        event("handoff.takeover_started", reason=COMPACTING, view=view, pane=pane)  # the log remembers: a restart goes on from here
     done = compact_with_pointer(ref, adapter, pointer, herdr, ready_timeout_s=compact_ready_timeout_s,
                                 work_start_timeout_s=compact_work_start_s, work_end_timeout_s=compact_work_end_s,
                                 poll_s=poll_s, sleep=sleep, clock=clock)

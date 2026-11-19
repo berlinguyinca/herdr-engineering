@@ -325,7 +325,7 @@ def test_refusal_keeps_source_and_retries_then_compacts(server: IsolatedHerdr, h
                         **{**FAST, "confirm_timeout_s": 0.5})
     assert (done.event, done.colour) == ("handoff.failed_compacted", Colour.ORANGE), done.reason
     assert done.reason and done.reason.startswith("launch_unconfirmed"), done.reason
-    assert [e.event for e in log.read()] == ["handoff.takeover_started", "handoff.failed_compacted"]
+    assert [e.event for e in log.read()] == ["handoff.takeover_started", "handoff.takeover_started", "handoff.failed_compacted"]  # the second one marks the compaction
     document = handoff.document(store, handoff_id)
     assert document is not None and document.is_file()
     assert submitted(server)[:2] == ["/compact", pointer_text(document)]
@@ -461,7 +461,7 @@ def test_no_way_forward_is_red_with_reason(server: IsolatedHerdr, handoff: Hando
     assert (done.event, done.colour) == ("handoff.stuck", Colour.RED), done
     assert done.reason and done.reason.startswith("takeover_refused_and_compaction_failed: compaction_not_ready")
     assert "last takeover result: launch_unconfirmed" in done.reason
-    assert [e.event for e in log.read()] == ["handoff.takeover_started", "handoff.stuck"]
+    assert [e.event for e in log.read()] == ["handoff.takeover_started", "handoff.takeover_started", "handoff.stuck"]  # the second one marks the compaction
     assert source in panes(server) and submitted(server) == []  # nothing typed, nothing closed
     assert done.successor_pane_id in panes(server) and not source_is_handed_off(log.read())
 

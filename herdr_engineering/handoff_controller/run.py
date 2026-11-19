@@ -25,7 +25,6 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
 from enum import Enum, auto
 from pathlib import Path
 from typing import Protocol
@@ -33,7 +32,7 @@ from typing import Protocol
 from ..handoff_adapters import adapter_for
 from ..handoff_adapters.base import READY_STATUSES, Harness, HarnessAdapter, SessionRef
 from ..handoff_subagent_gate import prepare_drain
-from ..handoff_subagent_registry import live_entries
+from ..handoff_subagent_registry import live_entries, state_root
 from .briefing import HarnessRunner, headless_runner, wait_for_briefing, write_fallback_briefing
 from .config import ControllerConfig, config_from_env
 from .credit import TickClock
@@ -47,6 +46,7 @@ from .events import (
     HandoffEvent,
     StuckReason,
     epoch,
+    iso,
     open_chain,
     open_chain_events,
     pane_events,
@@ -73,10 +73,6 @@ _LOCATE_RETRY_S = 30.0  # a session that could not be located is looked for agai
 
 
 # --- pure decisions -------------------------------------------------------------------------------------------------
-
-def _iso(at: float) -> str:
-    return datetime.fromtimestamp(at, UTC).isoformat().replace("+00:00", "Z")
-
 
 def _failed_chains(events: Sequence[HandoffEvent], since: float | None = None) -> list[HandoffEvent]:
     """The orange and red terminal events since the switch was last seen off, or toggled at `since` (turning it off and
@@ -112,7 +108,7 @@ def may_start(events: Sequence[HandoffEvent], now: float, cfg: ControllerConfig,
     return len(failed) < _MAX_CHAINS and now - credit(epoch(failed[-1].at)) >= cfg.drain_timeout_s * 2 ** (len(failed) - 1)
 
 
-class Step(Enum):
+class LoopStep(Enum):
     NONE = auto()
     DRAIN = auto()  # start the chain, or try to type the order again
     CHECK_BRIEFING = auto()  # the order is typed (or a cool-down runs): look for the briefing once
@@ -148,22 +144,22 @@ def note_uncertain(rt: PaneRuntime, now: float, cfg: ControllerConfig) -> None:
 
 
 def next_step(chain: Chain | None, rt: PaneRuntime, decision: Decision, now: float, cfg: ControllerConfig,
-              startable: bool) -> Step:
+              startable: bool) -> LoopStep:
     if chain is None:
-        return Step.DRAIN if startable and decision is not Decision.NONE else Step.NONE
+        return LoopStep.DRAIN if startable and decision is not Decision.NONE else LoopStep.NONE
     if chain.handoff_id is not None or chain.takeover_started:
-        return Step.FINISH
+        return LoopStep.FINISH
     if rt.typed:
         floor = rt.wait_since + cfg.briefing_timeout_s  # the session always gets this long to write its briefing
         quiet_done = rt.quiet_since is not None and now >= rt.quiet_since + cfg.briefing_timeout_s
         bound = max(chain.triggered_at + cfg.drain_timeout_s, floor)  # a session that keeps working is waited for this long
         full = decision is Decision.OVER_CEILING and now >= floor  # a full context cannot wait for the quiet time
-        return Step.FALLBACK if quiet_done or full or now >= bound else Step.CHECK_BRIEFING
+        return LoopStep.FALLBACK if quiet_done or full or now >= bound else LoopStep.CHECK_BRIEFING
     if now - chain.triggered_at >= cfg.drain_timeout_s:
-        return Step.DRAIN_STUCK
+        return LoopStep.DRAIN_STUCK
     if now < rt.cooldown_until:
-        return Step.CHECK_BRIEFING
-    return Step.DRAIN
+        return LoopStep.CHECK_BRIEFING
+    return LoopStep.DRAIN
 
 
 def push_allowed(cfg: ControllerConfig, worktree: Path, common_dir: Path | None) -> bool:
@@ -181,8 +177,7 @@ def drain_not_typed_reason(outcome: str) -> StuckReason:
 # --- the controller -------------------------------------------------------------------------------------------------
 
 def state_dir_for(env: Mapping[str, str]) -> Path:
-    from ..handoff_subagent_registry import _state_dir
-    return _state_dir(env).parent
+    return state_root(env)
 
 
 def default_locate(adapter: HarnessAdapter, pane: AgentPane) -> SessionRef | None:
@@ -296,9 +291,10 @@ def _warn(message: str) -> None:
 
 def _emit(ctl: Controller, ref: SessionRef, name: str, chain_id: str, *, reason: str | None = None,
           colour: Colour | None = None, pct: float | None = None, handoff_id: str | None = None,
-          subagents_live: int | None = None) -> None:
-    ctl.log.append(HandoffEvent(name, _iso(ctl.clock()), chain_id, ref.pane_id, ref.session_id, ref.harness,
-                                handoff_id, None, None, colour, reason, pct, subagents_live=subagents_live))
+          subagents_live: int | None = None, commit: str | None = None) -> None:
+    ctl.log.append(HandoffEvent(name, iso(ctl.clock()), chain_id, ref.pane_id, ref.session_id, ref.harness,
+                                handoff_id, None, None, colour, reason, pct, subagents_live=subagents_live,
+                                commit=commit))
 
 
 def _skip_once(ctl: Controller, events: Sequence[HandoffEvent], pane: AgentPane, harness: Harness, reason: str,
@@ -307,7 +303,7 @@ def _skip_once(ctl: Controller, events: Sequence[HandoffEvent], pane: AgentPane,
     last = next((e for e in reversed(events) if e.event == "handoff.skipped"), None)
     if last is not None and last.reason == reason:
         return
-    ctl.log.append(HandoffEvent("handoff.skipped", _iso(ctl.clock()), f"skipped:{pane.pane_id}", pane.pane_id,
+    ctl.log.append(HandoffEvent("handoff.skipped", iso(ctl.clock()), f"skipped:{pane.pane_id}", pane.pane_id,
                                 session_id, harness, None, None, None, None, reason, None))
 
 
@@ -347,7 +343,7 @@ def _close_orphans(ctl: Controller, events: Sequence[HandoffEvent], gone: Callab
     for mine in open_chain_events(events):
         last = mine[-1]
         if gone(last):
-            ctl.log.append(HandoffEvent("handoff.stuck", _iso(ctl.clock()), last.chain_id, last.pane_id, last.session_id,
+            ctl.log.append(HandoffEvent("handoff.stuck", iso(ctl.clock()), last.chain_id, last.pane_id, last.session_id,
                                         last.harness, last.handoff_id, None, None, Colour.RED, StuckReason.PANE_GONE.value,
                                         None))
 
@@ -389,14 +385,15 @@ def _checkpoint(ctl: Controller, ref: SessionRef, chain_id: str, worktree: Path,
             _stuck(ctl, ref, chain_id, stuck_reason(StuckReason.ON_MAIN_WITH_CHANGES, result.reason.value, None), pct)
             return False
     if result.committed:
-        _emit(ctl, ref, "handoff.wip_committed", chain_id, reason=f"sha={result.sha}", pct=pct)
+        why = result.reason.value if result.reason in (WipReason.PUSH_FAILED, WipReason.PUSH_NOT_ALLOWED) else "committed"
+        _emit(ctl, ref, "handoff.wip_committed", chain_id, reason=why, pct=pct, commit=result.sha)
     return True
 
 
 def _finish(ctl: Controller, ref: SessionRef, chain: Chain, pct: float | None, *, last_resort: bool = False) -> None:
     handoff_id = chain.handoff_id
     if handoff_id is None:  # a takeover was started but the briefing event is missing: the newest record of this pane
-        handoff_id = wait_for_briefing(ctl.store_root, _iso(chain.triggered_wall or chain.triggered_at), ref.pane_id, 0.0)
+        handoff_id = wait_for_briefing(ctl.store_root, iso(chain.triggered_wall or chain.triggered_at), ref.pane_id, 0.0)
         if handoff_id is None:
             _stuck(ctl, ref, chain.chain_id, StuckReason.NO_BRIEFING.value, pct)
             return
@@ -407,7 +404,7 @@ def _finish(ctl: Controller, ref: SessionRef, chain: Chain, pct: float | None, *
     cfg = replace(ctl.cfg, max_attempts=0) if last_resort else ctl.cfg  # no attempts: straight to compaction
     run_takeover(ref, ctl.adapter(ref.harness), handoff_id, cfg, ctl.log, ctl.handoff, ctl.herdr,
                  store_root=ctl.store_root, worktree=worktree, push_allowed=allowed, env=ctl.env,
-                 chain_id=chain.chain_id, context_pct=pct, sleep=ctl.sleep, **ctl.takeover_kwargs)
+                 chain_id=chain.chain_id, context_pct=pct, sleep=ctl.sleep, resumed=chain.compacting, **ctl.takeover_kwargs)
 
 
 def _subagents(ctl: Controller, ref: SessionRef) -> list[dict[str, object]]:
@@ -517,7 +514,7 @@ def _advance(ctl: Controller, pane: AgentPane, ref: SessionRef, rt: PaneRuntime,
     if chain is not None and rt.typed and chain.handoff_id is None and not chain.takeover_started:
         _track_quiet(ctl, pane, ref, rt, now)
     step = next_step(chain, rt, decision, now, ctl.cfg, may_start(events, now, ctl.cfg, ctl.credited, since))
-    if step is Step.NONE:
+    if step is LoopStep.NONE:
         return
     if chain is None:
         chain_id, over = uuid.uuid4().hex, decision is Decision.OVER_CEILING
@@ -525,7 +522,7 @@ def _advance(ctl: Controller, pane: AgentPane, ref: SessionRef, rt: PaneRuntime,
         chain = Chain(chain_id, now, None, None, False, now)
         rt.reset(chain_id)  # nothing of an earlier chain carries over
     match step:
-        case Step.DRAIN:
+        case LoopStep.DRAIN:
             outcome = _try_drain(ctl, pane, ref, chain.chain_id, chain.drain_started_at is not None, rt, pct)
             if outcome == "typed":
                 return
@@ -535,12 +532,12 @@ def _advance(ctl: Controller, pane: AgentPane, ref: SessionRef, rt: PaneRuntime,
                 found = _write_fallback(ctl, ref, chain.chain_id, pct, last_resort=True)
                 if found is not None:
                     _finish_guarded(ctl, ref, replace(chain, handoff_id=found, last_resort=True), rt, pct)
-        case Step.CHECK_BRIEFING:
+        case LoopStep.CHECK_BRIEFING:
             if (written := _check_briefing(ctl, ref, chain, rt, pct)) is not None:
                 _finish_when_ready(ctl, ref, replace(chain, handoff_id=written, briefing_at=now), rt, pct, now)
             elif rt.typed:
                 _say_wait(ctl, ref, chain, rt, pct)
-        case Step.FALLBACK:
+        case LoopStep.FALLBACK:
             if (written := _check_briefing(ctl, ref, chain, rt, pct)) is not None:
                 _finish_when_ready(ctl, ref, replace(chain, handoff_id=written, briefing_at=now), rt, pct, now)
                 return
@@ -548,9 +545,9 @@ def _advance(ctl: Controller, pane: AgentPane, ref: SessionRef, rt: PaneRuntime,
             found = _write_fallback(ctl, ref, chain.chain_id, pct)
             if found is not None:
                 _finish_when_ready(ctl, ref, replace(chain, handoff_id=found, briefing_at=ctl.now()), rt, pct, ctl.now())
-        case Step.FINISH:
+        case LoopStep.FINISH:
             _finish_when_ready(ctl, ref, chain, rt, pct, now)
-        case Step.DRAIN_STUCK:
+        case LoopStep.DRAIN_STUCK:
             _stuck(ctl, ref, chain.chain_id, _drain_stuck_reason(pane, rt).value, pct)
 
 
@@ -680,11 +677,19 @@ class ControllerLock:
 
 
 def lock_held(state_dir: Path) -> bool:
-    probe = ControllerLock(state_dir)
-    if probe.acquire():
-        probe.release()
+    """Whether a controller holds the lock. Read-only: a missing lock file means none (nothing is created), and the probe
+    only asks for a shared `flock` without waiting, so it never writes the pid and never keeps the lock."""
+    try:
+        fd = os.open(lock_path(state_dir), os.O_RDONLY)
+    except OSError:
         return False
-    return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)  # closing drops a lock the probe got
+    return False
 
 
 class MissingBinary(Exception):

@@ -360,16 +360,20 @@ writes one `handoff.waiting` event per wait (deduplicated), so the log shows why
 `$HERDR_ENGINEERING_STATE/handoff-controller/off/` (default state root `~/.local/share/herdr-engineering/state`). Setting
 `HERDR_HANDOFF_AUTO=0` in the controller's environment turns it off for every session. A session whose switch is off gets one
 `handoff.skipped` event (`switch_off`). The controller reads the marker on every tick, so a toggle takes effect within
-5 seconds; a toggle off and on again wholly between two ticks is not seen.
+5 seconds. A toggle off and on again wholly between two ticks is seen too: the marker file stays after `on` (its mtime is the
+time of the last toggle), and failures from before that time no longer count towards `gave_up`.
 
 ### The event log and the colours
 
 Every step is one JSON line in `events.jsonl` in the shared handoff store (below). Each line has the event name, a UTC
 time, the chain id, the pane and session, the harness, the handoff id and the predecessor and successor ids, a colour on
 terminal events, a reason, the context percent, and (on events that name a successor) `successor_pane_id` and
-`successor_session_id`. The eleven events are `handoff.triggered`, `handoff.drain_started`, `handoff.drained`,
+`successor_session_id`. `handoff.wip_committed` also carries the checkpoint `commit` (its `reason` is `committed`, or
+`push_not_allowed` or `push_failed` when the commit was not pushed). The twelve events are `handoff.triggered`, `handoff.drain_started`, `handoff.drained`,
 `handoff.briefing_written`, `handoff.briefing_fallback`, `handoff.wip_committed`, `handoff.takeover_started`,
-`handoff.succeeded`, `handoff.failed_compacted`, `handoff.stuck` and `handoff.skipped`. The last terminal event of a chain
+`handoff.succeeded`, `handoff.failed_compacted`, `handoff.stuck`, `handoff.skipped` and `handoff.waiting`. A second
+`handoff.takeover_started` with reason `compacting` marks the start of the compaction fallback: a controller restarted after
+it does not try the takeover again. The last terminal event of a chain
 decides its colour:
 
 | Colour | Event | Meaning |
