@@ -257,3 +257,23 @@ models seen in recent sessions (window and window_source as the adapter resolves
 sessions above 100% of their window:
   none
 ```
+
+## Headless fallback briefing writer
+
+When a drained session writes no briefing, `handoff_controller/briefing.py` asks the same harness for one in a headless
+call: stdin prompt, a fresh empty working directory under `<store>/fallback-work/`, every `HERDR_*` variable and the
+harness's session-identity variables removed. A harness is enabled only if its own `--help` shows how to turn every tool
+off. Only `--help` was run; no real model call was made, so the last column is what is still unverified.
+
+| Harness | Enabled | Flags | Unverified without a real call |
+| --- | --- | --- | --- |
+| claude | yes | `-p --output-format text --no-session-persistence --setting-sources "" --strict-mcp-config --disable-slash-commands --tools ""` | empty values for `--setting-sources` and `--tools` accepted, and user/project hooks dropped; prompt read from stdin |
+| pi | yes | `-p --no-session --no-tools --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files` | prompt read from stdin with no message argument; provider login still usable with `--no-extensions` |
+| codex | no | `codex exec` offers `--sandbox read-only` but no switch that disables tools | not enabled |
+| opencode | no | `opencode run` offers `--agent` and `--auto` but no command-line way to deny tools | not enabled |
+
+Stripped from the environment: `HERDR_*`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`,
+`CLAUDE_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_SANDBOX`, `CODEX_SANDBOX_NETWORK_DISABLED`, `CODEX_MANAGED_BY_NPM`,
+`PI_CODING_AGENT`, `PI_SESSION_ID`, `OPENCODE`, `OPENCODE_PID`, `OPENCODE_SESSION_ID` (the first four groups are the
+variables `handoff_harness.py` reads to detect an ancestor harness). Kept: auth and config such as `ANTHROPIC_*`,
+`OPENAI_*`, `HOME`, `PATH`.
