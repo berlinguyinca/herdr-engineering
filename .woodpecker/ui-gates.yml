@@ -6,16 +6,19 @@
 #    apt and no sudo. The step logic lives in scripts/ci/ui-gates.sh so `bash scripts/ci/ui-gates.sh` reproduces CI from a clean
 #    checkout.
 #  * the clone plugin fails invisibly on this backend: skip_clone plus a plain git checkout with the credential the agent stages.
-#  * pull_request and manual only, filtered to what can change the result, so it does not build twice for a push to a PR branch.
+#  * pull_request and manual only, so it does not build twice for a push to a PR branch.
 #
 # STATUS: the first run failed the pixel compare on all 88 pages because the exec host's fontconfig rendering settings differed from
 # the workstation's. The browser now runs under its own pinned fontconfig (tests/playwright/ui-gates-lib.mjs), so a host difference in
 # fonts or rendering settings no longer reaches a screenshot. GitHub Actions is disabled organisation-wide and is not used.
+#
+# No `when: {path: ...}` here, deliberately (the same fix unit-gates got in #719). A path-filtered pipeline is never created, so on a
+# PR that touches no UI path `ci/woodpecker/pr/ui-gates` never reported and, being required, parked the PR on "Expected" for ever.
+# The path list moved into scripts/ci/unit-gates-applicable.sh (`ui` gate); the pipeline always exists, always reports a verdict, and
+# a PR that touches no UI path pays seconds for a green that says why. A manual run always runs the gate.
 when:
   - event: manual
   - event: pull_request
-    path:
-      include: ['packages/**', 'tests/playwright/**', 'tests/visual/**', 'docs/assets/screenshots/**', 'scripts/ci/ui-gates.sh', 'scripts/ci-pipeline-freshness.sh', 'package.json', 'package-lock.json', 'herdr_engineering/control_plane/**']
 
 # Only the hive `large` pool (metabolomicsgrp/high, 16 dedicated CPUs and 64 GB per agent) runs this. The gate renders ~270 pages in
 # Chromium and a shared 4-8 CPU agent host timed out under load (pipelines 113, 115, 121, 125); network/services/woodpecker-slurm
@@ -49,8 +52,18 @@ steps:
       - 'set -eu'
       - 'bash scripts/ci-pipeline-freshness.sh'
 
+  # exit 0 = run the gate, 3 = no UI path changed, anything else = fail the pipeline. Fails open (see the script).
+  - name: applicability
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'rm -f .ci-ui-gates-not-applicable'
+      - 'rc=0; bash scripts/ci/unit-gates-applicable.sh ui || rc=$?'
+      - 'if [ "$rc" = 3 ]; then touch .ci-ui-gates-not-applicable; elif [ "$rc" != 0 ]; then exit "$rc"; fi'
+
   - name: ui-gates
     image: bash
     commands:
       - 'set -eu'
+      - 'if [ -f .ci-ui-gates-not-applicable ]; then echo "ui-gates: no UI path changed; nothing to run"; exit 0; fi'
       - 'bash scripts/ci/ui-gates.sh'

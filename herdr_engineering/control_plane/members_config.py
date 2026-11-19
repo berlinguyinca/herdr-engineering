@@ -39,7 +39,8 @@ HOST_RE: Final = re.compile(r"(?=.{1,253}\Z)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?
 
 TOP_KEYS: Final = frozenset({"enabled", "group", "session_secret", "groups_ttl", "removed_grace", "max_artifact_bytes",
                              "max_member_bytes", "max_artifacts", "share_limits", "share_creates_per_hour",
-                             "request_limits", "rate_limits", "staging", "public_host", "session_seconds", "secrets_gid"})
+                             "request_limits", "rate_limits", "staging", "public_host", "session_seconds", "secrets_gid",
+                             "member_host"})
 REQUEST_KEYS: Final = frozenset({"http_chunks_per_request", "max_publish_files", "max_message_chars",
                                  "max_upload_bytes", "result_wait_seconds"})
 RATE_KEYS: Final = frozenset({"chunks_per_minute", "writes_per_minute", "session_exchanges_per_minute"})
@@ -131,7 +132,8 @@ def _limits(raw: Mapping[str, Any], per_hour: int) -> MembersConfig:
     return MembersConfig.from_mapping(merged)
 
 
-def parse_members(raw: object, *, public_host: object = None, session_seconds: object = None) -> dict[str, Any] | None:
+def parse_members(raw: object, *, public_host: object = None, session_seconds: object = None,
+                  member_host: object = None) -> dict[str, Any] | None:
     """The validated section, or None unless ``enabled`` is exactly true.  Raises ``ValueError``.
 
     A disabled section is validated too (types, unknown keys, bounds), so a mistake shows now and not when someone
@@ -158,6 +160,10 @@ def parse_members(raw: object, *, public_host: object = None, session_seconds: o
         raise ValueError(f"{WHERE} needs control_plane.share.public_host (the member web host)")
     if host is not None and not valid_public_host(host):
         raise ValueError("control_plane.share.public_host must be a lowercase DNS name (no scheme, port or path)")
+    own = member_host if member_host is not None else raw.get("member_host")
+    if own is not None and (not valid_public_host(own) or own == host):
+        raise ValueError("control_plane.share.member_host must be a lowercase DNS name, different from "
+                         "control_plane.share.public_host (no scheme, port or path)")
     seconds = session_seconds if session_seconds is not None else raw.get("session_seconds", 14400)
     if isinstance(seconds, bool) or not isinstance(seconds, int) or not 60 <= seconds <= MAX_SESSION_SECONDS:
         raise ValueError("control_plane.share.session_seconds must be an integer, 60 to 604800")
@@ -192,4 +198,4 @@ def parse_members(raw: object, *, public_host: object = None, session_seconds: o
         raise ValueError(f"{WHERE}.secrets_gid must be a non-negative integer (the collab-public group id) or null")
     return {"secrets_gid": gid, "group": group, "groups_ttl": float(ttl), "removed_grace": float(grace), "defaults": defaults,
             "share_limits": dict(share_limits), "share_creates_per_hour": per_hour, "session_seconds": seconds,
-            "session_secret": secret, "public_host": host, "limits": limits}
+            "session_secret": secret, "public_host": host, "member_host": own, "limits": limits}

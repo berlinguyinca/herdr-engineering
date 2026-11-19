@@ -134,6 +134,21 @@ is a host-level operator job that must run `ssh`/`herdr-eng` as the user (the sa
 fabric agent has), and the control plane itself stays a container. It targets the other hosts only via
 `ssh <host> herdr-eng fleet host-apply ...` (below). macOS needs no watcher.
 
+**D12 The watcher self-updates on its own repo's merge.** When a rollout has **succeeded** and it updated
+the watcher's own herdr-engineering install (checkout fast-forwarded + new build installed + receipt), the
+loop exits with a dedicated status (75, sysexits EX_TEMPFAIL): the unit's existing `Restart=on-failure`
+(75 is not in `RestartPreventExitStatus=2 3`) restarts the service about 30 s later, and the fresh main
+process is the newly installed build, so the next pass runs the build the fleet just shipped (issue #865).
+The restart comes from systemd itself - no detached `systemctl` child is spawned, because the unit's
+cgroup cleanup (`KillMode=control-group`) would SIGTERM such a child before it queued its job, and an
+exit 0 would not restart the unit at all. It never requests a restart for a `halted`/`running` rollout
+(the fleet has not converged; the old loop is what handles the halt), for a rollout that did not change
+this host's install (`no_change`/`skipped`), in plan-only mode, or when the process is not running under
+the unit (dev runs and tests are detected via `/proc/self/cgroup` and left alone, with a log note; the
+loop keeps running the old build). The one-shot `run --apply` does not request a restart - the process
+exits anyway. Test/dev seam: `HERDR_FLEET_WATCH_RESTART_CMD` runs an injectable command; the loop still
+exits 75.
+
 ## 5. Components
 
 ```
@@ -158,8 +173,8 @@ New module layout is a package `herdr_engineering/fleet_watch/` so `fleet.py` (5
 | repo | host-apply action | health check (all must pass) |
 |---|---|---|
 | `herdr-engineering` | pre-check (D6); `fleet_update(host=<this>, revision=sha, pull_controller=<is controller>)` equivalent for a non-controller: ff-only fetch of the deployment checkout, `pip install` into the venv, converge agent; report before/after from `git rev-parse HEAD` and `herdr-eng --version` | installed revision == sha (`fleet_status` fingerprint), fabric-agent unit/launchd label active, gateway registration present, `herdr-eng fleet status` parity ok |
-| `pi-engineering` | `stage_pi_runtime(sha)` then symlink switch (D7) | release dir exists and complete, `current` -> sha, `pi --version` smoke from the new release in a throwaway cwd, no session signalled |
-| `autospec` | the existing `autospec-fleet.yml` path (ff-only checkout + `autospec-runtime-install.sh`, generation publish) | active generation receipt names sha; `autospec --version` |
+| `pi-engineering` | `stage_pi_runtime(sha)` then symlink switch (D7) | release dir exists and complete, `current` -> sha, `pi --version` smoke (launcher resolved PATH -> `~/.local/bin/pi`; a unit or non-interactive ssh PATH has no `~/.local/bin`) |
+| `autospec` | the existing `autospec-fleet.yml` path (ff-only checkout + `autospec-runtime-install.sh`, generation publish) | active generation receipt names sha; `autospec doctor` smoke (launcher resolved PATH -> `~/.autospec/bin/autospec`; the CLI has no `--version` - it exits 2) |
 | `ai-sync` / `claude-config` (phase 2) | `ai_sync_enforce` forced pull + verify; **beast is the publisher, so its step is verify-only** (the enforcer already refuses there) and the canary shifts to bender for this repo | `ai-sync verify --json` ok, feed `behind == 0` |
 
 Because Ansible is the existing convergence engine, `host-apply` for `herdr-engineering` on remote hosts
@@ -352,7 +367,9 @@ dependency"); client-rendered diagrams from untrusted strings.
   rate-limit headers (a protocol-faithful fixture server, not a mock of our code); a real `git` pair proves
   D3 (stray unpushed commit refused, ancestor accepted, force-pushed-away SHA refused); real flock contention
   with the nightly updater lock; control plane started for real and queried through `/api/v1/fleet-rollouts*`;
-  outbox replay after killing the control plane; dirty-checkout pre-check against a real dirty repo.
+  outbox replay after killing the control plane; dirty-checkout pre-check against a real dirty repo; the loop
+  requests its self-restart (D12) exactly when a rollout succeeded and updated this host's herdr-engineering
+  row (seam-observed in throwaway HOMEs, and not for halted rollouts or an unchanged local install).
 - **Smoke** (`scripts/validate.sh` target + CI): `herdr-eng fleet-watch once --dry-run` against the fixture
   server; `fleet lock verify` on a sample lock; unit-file lint (`systemd-analyze verify`) for the service.
 - **E2E**: Playwright CLI (`npx playwright test`, never MCP) loads `#/fabric-management` against a control

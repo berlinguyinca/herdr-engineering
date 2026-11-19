@@ -522,12 +522,7 @@ class SourceLedger:
             state["last_sequence"] = seq          # first arrival sets the baseline
         elif seq > last + 1:
             state["gaps"].append({"from": last + 1, "to": seq - 1, "seen_at": state["last_seen_at"]})
-            if len(state["gaps"]) > MAX_GAPS_PER_SOURCE:
-                # Collapse the two oldest into one coarse (conservative) range.
-                first, second = state["gaps"][0], state["gaps"][1]
-                state["gaps"][:2] = [{"from": first["from"], "to": second["to"],
-                                      "seen_at": second["seen_at"]}]
-                state["gaps_truncated"] = True
+            self._bound_gaps(state)
             state["last_sequence"] = seq
         elif seq == last + 1:
             state["last_sequence"] = seq
@@ -548,7 +543,17 @@ class SourceLedger:
                     if lo <= hi:
                         state["gaps"].append({"from": lo, "to": hi, "seen_at": gap["seen_at"]})
                 state["gaps"].sort(key=lambda g: g["from"])
+                SourceLedger._bound_gaps(state)   # a split can add one gap past the cap
                 return
+
+    @staticmethod
+    def _bound_gaps(state: dict) -> None:
+        if len(state["gaps"]) > MAX_GAPS_PER_SOURCE:
+            # Collapse the two oldest into one coarse (conservative) range.
+            first, second = state["gaps"][0], state["gaps"][1]
+            state["gaps"][:2] = [{"from": first["from"], "to": second["to"],
+                                  "seen_at": second["seen_at"]}]
+            state["gaps_truncated"] = True
 
     def hydrate(self, events: list[dict], *, preserve_order: bool = False) -> None:
         """Replace the ledger from durable rows without persistence callbacks.

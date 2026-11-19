@@ -1494,3 +1494,66 @@ def test_slow_calls_are_logged_by_name_and_duration_only(monkeypatch, caplog):
     text = " ".join(r.getMessage() for r in caplog.records)
     assert "spaces/list took" in text and "status 200" in text
     assert "s3cr3t" not in text and "secret-body" not in text and "token=abc" not in text
+
+
+# --------------------------------------------------------------------------------------------- open owner latency
+def _open_audits(svr):
+    return [e for e in list(svr.assistant.store.audit) if e["action"] == "rakazo.bridge.open_owner"]
+
+
+def test_open_owner_does_not_wait_for_a_contended_audit_write(make_server):
+    """The store lock is the real contention point of an audit write (it is held across the durable write and the
+    snapshot persist); hold it from here and the session must still come back, with the audit entry landing after."""
+    svr, api = make_server(bridge_section(open_owner=True))
+    store = svr.assistant.store
+    holding, release = threading.Event(), threading.Event()
+
+    def hold():
+        with store._lock:
+            holding.set()
+            release.wait(HTTP_TIMEOUT)
+
+    t = threading.Thread(target=hold, daemon=True)
+    t.start()
+    assert holding.wait(5)
+    try:
+        started = time.monotonic()
+        status, body, _ = api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "100.64.0.1"})
+        assert status == 200 and json.loads(body)["token"]
+        assert time.monotonic() - started < 2.0
+    finally:
+        release.set()
+        t.join(5)
+    deadline = time.monotonic() + 10
+    while not _open_audits(svr) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(_open_audits(svr)) == 1
+
+
+def test_open_owner_audit_lands_in_the_normal_case_and_on_close(make_server):
+    svr, api = make_server(bridge_section(open_owner=True))
+    assert api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "100.64.0.1"})[0] == 200
+    svr.rakazo.close()                                  # flushes what is queued
+    assert len(_open_audits(svr)) == 1
+
+
+def test_open_owner_audit_queue_is_bounded_and_drops_with_a_log(make_server, caplog):
+    svr, api = make_server(bridge_section(open_owner=True))
+    bridge = svr.rakazo
+    store = svr.assistant.store
+    account = bridge.accounts[0]
+    caplog.set_level(logging.WARNING)
+    with store._lock:                                   # the worker stalls on the first entry
+        for _ in range(bridge.AUDIT_QUEUE_MAX + 20):
+            bridge._audit_later(account, "rakazo.bridge.open_owner")
+        assert bridge._audit_q.qsize() <= bridge.AUDIT_QUEUE_MAX
+    assert "audit queue full" in caplog.text
+
+
+def test_slow_open_owner_log_names_the_phases(make_server, caplog, monkeypatch):
+    monkeypatch.setattr(rb, "SLOW_CALL_MS", 0)
+    svr, api = make_server(bridge_section(open_owner=True))
+    caplog.set_level(logging.INFO)
+    assert api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "100.64.0.1"})[0] == 200
+    line = next(r.getMessage() for r in caplog.records if "auth/open took" in r.getMessage())
+    assert "mint " in line and "audit " in line

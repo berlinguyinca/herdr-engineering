@@ -17,6 +17,8 @@ all:
         macos:
           hosts:
             mac: {}
+# Woodpecker runner hosts: group `ci_runners` (private inventory) gets WPCI_CI_DIR via
+# playbooks/ci-runner-env.yml; set wpci_ci_store / wpci_ci_mount in its group_vars.
 # Connection addresses/users belong in private inventory/group_vars, not this repository example.
 # e.g. ansible/inventory/host_vars/mac.yml:
 #   ansible_host: mac.<tailnet>.ts.net
