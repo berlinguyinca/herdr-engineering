@@ -973,7 +973,7 @@ def test_a_session_the_context_hook_already_warned_is_not_told_again(host: dict)
     warned = check("session-a")
     assert warned["code"] == "already_triggered", warned
     assert warned["trigger"] is False
-    assert not (host["state"] / "handoff-autopilot.json").exists(), "a warning is not a trigger"
+    assert not ha.state_path(host["home"]).exists(), "a warning is not a trigger"
 
     # Another session is still told, and an unreadable marker root never blocks the decision.
     assert check("session-b")["code"] == "context_is_full"
@@ -1408,3 +1408,61 @@ def test_the_stop_hook_uses_the_model_window(host: dict) -> None:
     )
     assert out["trigger"] is False, out
     assert out["percent"] == pytest.approx(15.0, abs=0.5), out
+
+
+def _settings_with_secret(host: dict) -> Path:
+    settings = host["home"] / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"env": {"ANTHROPIC_API_KEY": "sk-secret"}}) + "\n")
+    settings.chmod(0o600)
+    return settings
+
+
+def test_install_and_uninstall_keep_a_private_settings_file_private(host: dict) -> None:
+    settings = _settings_with_secret(host)
+    ha.install(home=host["home"])
+    assert stat.S_IMODE(settings.stat().st_mode) == 0o600
+    assert "sk-secret" in settings.read_text()
+    assert "Stop" in json.loads(settings.read_text())["hooks"]
+    ha.uninstall(home=host["home"])
+    assert stat.S_IMODE(settings.stat().st_mode) == 0o600
+    assert "sk-secret" in settings.read_text()
+
+
+def test_a_new_settings_file_is_created_private(host: dict) -> None:
+    ha.install(home=host["home"])
+    settings = host["home"] / ".claude" / "settings.json"
+    assert stat.S_IMODE(settings.stat().st_mode) == 0o600
+
+
+def test_a_symlinked_settings_file_stays_a_symlink(host: dict) -> None:
+    real = host["tmp"] / "dotfiles" / "settings.json"
+    real.parent.mkdir()
+    real.write_text(json.dumps({"env": {"K": "v"}}) + "\n")
+    real.chmod(0o600)
+    link = host["home"] / ".claude" / "settings.json"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(real)
+    ha.install(home=host["home"])
+    assert link.is_symlink() and link.resolve() == real.resolve()
+    assert "Stop" in json.loads(real.read_text())["hooks"]
+    assert stat.S_IMODE(real.stat().st_mode) == 0o600
+    ha.uninstall(home=host["home"])
+    assert link.is_symlink()
+    assert "hooks" not in json.loads(real.read_text()) or "Stop" not in json.loads(
+        real.read_text()
+    ).get("hooks", {})
+
+
+@pytest.mark.parametrize("command", [["install"], ["status"]])
+def test_an_invalid_policy_is_a_clean_error_and_install_writes_nothing(
+    host: dict, command: list[str]
+) -> None:
+    write_config(host["home"], "handoff_autopilot:\n  context_percent: 500\n")
+    result = _cli(["handoff", "autopilot", *command], host["env"], host["work"])
+    assert result.returncode != 0
+    assert "Traceback" not in result.stderr + result.stdout
+    assert "context_percent" in result.stderr + result.stdout
+    assert not (host["home"] / ".claude").exists()
+    assert not (host["home"] / ".pi").exists()
+    assert not ha.state_path(host["home"]).parent.exists()

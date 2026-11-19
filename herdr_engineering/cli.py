@@ -1614,10 +1614,14 @@ def _cmd_handoff_autopilot_manage(args) -> int:
     from . import handoff_autopilot as autopilot
 
     home = Path(args.home) if args.home else None
-    if args.autopilot_command == "install":
-        result = autopilot.install(home=home, dry_run=args.dry_run)
-    else:
-        result = autopilot.uninstall(home=home, dry_run=args.dry_run)
+    try:
+        if args.autopilot_command == "install":
+            result = autopilot.install(home=home, dry_run=args.dry_run)
+        else:
+            result = autopilot.uninstall(home=home, dry_run=args.dry_run)
+    except autopilot.InvalidError as exc:
+        _print_json({"code": "config", "message": str(exc)})
+        return 1
     _print_json(result)
     return 0
 
@@ -1626,7 +1630,11 @@ def _cmd_handoff_autopilot_status(args) -> int:
     from . import handoff_autopilot as autopilot
 
     home = Path(args.home) if args.home else None
-    _print_json(autopilot.status(home=home))
+    try:
+        _print_json(autopilot.status(home=home))
+    except autopilot.InvalidError as exc:
+        _print_json({"code": "config", "message": str(exc)})
+        return 1
     return 0  # status reports; `herdr-eng doctor` is the command that judges
 
 

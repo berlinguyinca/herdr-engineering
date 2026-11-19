@@ -19,7 +19,7 @@
 #      key via $TS_AUTH_KEY or ~/.config/herdr-engineering/tailscale-auth.key;
 #      otherwise it prints the command and continues)
 #   7. puts `herdr-eng` and `herdr-handoff` on PATH (~/.local/bin) when writable
-#   7c. arms AUTOMATIC handoffs (default on): installs the Pi extension and the Claude
+#   7e. arms AUTOMATIC handoffs (default on): installs the Pi extension and the Claude
 #       Code Stop/PreCompact hooks, so a session that reaches the context threshold hands
 #       itself off to a fresh pane instead of waiting to be asked or losing detail to a
 #       summarizer. `--no-handoff-autopilot` (or HERDR_HANDOFF_AUTOPILOT=off at runtime)

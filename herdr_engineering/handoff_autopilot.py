@@ -34,6 +34,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -584,8 +585,15 @@ def _atomic_write(path: Path, text: str, *, mode: int = 0o644) -> None:
     broken harness rather than a broken cache. The temp name is unique because a fixed `.tmp`
     name is shared by concurrent writers, and two sessions recording at once would otherwise
     overwrite each other's temporary file.
+
+    `mode` applies only to a file that does not exist yet: an existing file keeps its own
+    permissions (a 0600 `settings.json` holding secrets must not become world-readable), and a
+    symlink is written through to its target rather than replaced by a regular file.
     """
+    path = Path(os.path.realpath(path))
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        mode = stat.S_IMODE(path.stat().st_mode)
     descriptor, temp_name = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
     )
@@ -993,6 +1001,7 @@ def install(*, home: Path | str | None = None, dry_run: bool = False) -> dict[st
     a settings file it cannot read.
     """
     base = _home(home)
+    active_policy = policy()  # raises InvalidError before anything is written
     items: list[dict[str, Any]] = []
     state_dir = state_path(base).parent
     if dry_run:
@@ -1035,7 +1044,7 @@ def install(*, home: Path | str | None = None, dry_run: bool = False) -> dict[st
         )
     else:
         existed = settings_file.exists()
-        _atomic_write(settings_file, json.dumps(merged, indent=2) + "\n")
+        _atomic_write(settings_file, json.dumps(merged, indent=2) + "\n", mode=0o600)
         _item(
             items,
             "claude-hook",
@@ -1044,7 +1053,7 @@ def install(*, home: Path | str | None = None, dry_run: bool = False) -> dict[st
             "registered " + ", ".join(changed),
         )
 
-    enabled = policy().enabled
+    enabled = active_policy.enabled
     summary = (
         f"automatic handoffs are {'armed' if enabled else 'configured but disabled by policy'}: "
         f"Pi fires on turn_end, Claude Code on {'/'.join(CLAUDE_HOOK_EVENTS)}; the next "
@@ -1055,7 +1064,7 @@ def install(*, home: Path | str | None = None, dry_run: bool = False) -> dict[st
         "ok": True,
         "dry_run": dry_run,
         "items": items,
-        "policy": policy().to_dict(),
+        "policy": active_policy.to_dict(),
         "summary": summary,
     }
 
@@ -1087,7 +1096,7 @@ def uninstall(*, home: Path | str | None = None, dry_run: bool = False) -> dict[
             "would remove " + ", ".join(changed) + " hooks",
         )
     else:
-        _atomic_write(settings_file, json.dumps(merged, indent=2) + "\n")
+        _atomic_write(settings_file, json.dumps(merged, indent=2) + "\n", mode=0o600)
         _item(items, "claude-hook", "removed", settings_file, "removed " + ", ".join(changed))
     return {
         "schema_version": 1,
