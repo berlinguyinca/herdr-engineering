@@ -76,6 +76,39 @@ def _wait_for_other_sweep(state_dir: Path, seconds: float) -> None:
         os.close(fd)
 
 
+def relieve(cleanup_cfg: Mapping, state_dir: Path, at_percent: float,
+            busy_wait: float = BUSY_WAIT_SECONDS) -> bool | None:
+    """One pressure cleanup of the configured roots at ``at_percent`` usage and above.
+
+    Rate limited (a build storm must not spawn a storm of sweeps). Returns True when a sweep ran, False
+    when another sweep was already freeing space (it is waited for, at most ``busy_wait`` seconds), and
+    None when none could run (no roots, or one ran moments ago): the caller decides from a measurement.
+    """
+    from .build_cleanup import run_once
+    from .build_maintenance import effective_roots, policy_kwargs
+    now = time.time()
+    roots = effective_roots(dict(cleanup_cfg))
+    if not roots or _recently_triggered(state_dir, now):
+        return None
+    kwargs = policy_kwargs(dict(cleanup_cfg))
+    kwargs["high_water"] = max(min(kwargs["high_water"], at_percent), 1)
+    kwargs["low_water"] = min(kwargs["low_water"], kwargs["high_water"] - 1)
+    kwargs["pressure_water"] = min(kwargs["pressure_water"], at_percent)
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        result = run_once(roots=roots, state_dir=state_dir, **kwargs)
+    except OSError:
+        result = {"status": "error"}  # a full disk can fail the sweep itself: the caller decides below
+    if result.get("status") == "busy":  # another sweep is running: its result is what we need
+        _wait_for_other_sweep(state_dir, busy_wait)
+        return False
+    try:
+        _stamp(state_dir).write_text(json.dumps({"triggered_at": now}))
+    except OSError:
+        pass  # no room for the stamp: still decide from the measurement
+    return True
+
+
 def check_build_allowed(path: Path, cleanup_cfg: Mapping, state_dir: Path,
                         env: Mapping[str, str] | None = None,
                         busy_wait: float = BUSY_WAIT_SECONDS) -> GuardDecision:
@@ -84,8 +117,6 @@ def check_build_allowed(path: Path, cleanup_cfg: Mapping, state_dir: Path,
     When another sweep already holds the cleanup lock, this waits (at most ``busy_wait`` seconds) for it
     to finish and re-measures, rather than refusing while that sweep is freeing the space.
     """
-    from .build_cleanup import run_once
-    from .build_maintenance import effective_roots, policy_kwargs
     env = os.environ if env is None else env
     enabled = bool(cleanup_cfg.get("enabled", True))
     refuse_at = float(cleanup_cfg.get("refuse_builds_percent", 90))
@@ -98,30 +129,12 @@ def check_build_allowed(path: Path, cleanup_cfg: Mapping, state_dir: Path,
         return GuardDecision(True, usage)
     if env.get(OVERRIDE_ENV) == "1":
         return GuardDecision(True, usage, f"disk {usage:.1f}% full; proceeding because {OVERRIDE_ENV}=1")
-    ran = False
-    now = time.time()
-    roots = effective_roots(dict(cleanup_cfg))
-    if roots and not _recently_triggered(state_dir, now):
-        kwargs = policy_kwargs(dict(cleanup_cfg))
-        kwargs["high_water"] = max(min(kwargs["high_water"], refuse_at), 1)
-        kwargs["low_water"] = min(kwargs["low_water"], kwargs["high_water"] - 1)
-        kwargs["pressure_water"] = min(kwargs["pressure_water"], refuse_at)
-        try:
-            state_dir.mkdir(parents=True, exist_ok=True)
-            result = run_once(roots=roots, state_dir=state_dir, **kwargs)
-        except OSError:
-            result = {"status": "error"}  # a full disk can fail the sweep itself: refuse below
-        if result.get("status") == "busy":  # another sweep is running: its result is what we need
-            _wait_for_other_sweep(state_dir, busy_wait)
-        else:  # a busy sweep freed nothing and must not use the cooldown
-            ran = True
-            try:
-                _stamp(state_dir).write_text(json.dumps({"triggered_at": now}))
-            except OSError:
-                pass  # no room for the stamp: still decide from the measurement below
+    ran = relieve(cleanup_cfg, state_dir, refuse_at, busy_wait)
+    if ran is not None:
         usage, free_gib = measure(probe)
         if usage < refuse_at or free_gib >= floor_gib:
             return GuardDecision(True, usage, cleanup_ran=ran)
+    ran = bool(ran)
     return GuardDecision(
         False, usage,
         f"disk is {usage:.1f}% full with {free_gib:.1f} GiB free (limits {refuse_at:g}% / "

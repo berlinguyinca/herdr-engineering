@@ -1,7 +1,8 @@
 # Automatic Rust build-cache cleanup
 
-The Linux Herdr Engineering companion checks every 15 minutes while a local
-Herdr server belonging to the same user is running. It cleans verified Cargo
+The Linux Herdr Engineering companion checks every 15 minutes, whether or not a
+Herdr server is running (set `build_cleanup.require_herdr_server: true` to sweep
+only while a server of the same user runs). It cleans verified Cargo
 output directories under explicitly configured project roots when disk use
 reaches 85%, oldest first, stopping at 80%. Artifacts must be inactive for at
 least 24 hours. Source files, worktrees, Cargo downloads, and Rust toolchains
@@ -93,3 +94,18 @@ and has less than `refuse_builds_min_free_gib` available, a new cargo/build comm
 one pressure cleanup, run before the `min_free_disk_percent` reserve check so the check sees what it freed (at most every 10 minutes; a sweep that could not start because another one is running does not count, and the guard waits up to two minutes for that sweep and re-measures) and is refused with exit code 75 if the disk is still too full. Setting
 `build_cleanup.enabled: false` stops the sweeps (the launchd/systemd job is removed on the
 next install/`fleet update`, and `build-cleanup run` exits early) and the guard. `HERDR_DISK_GUARD_OVERRIDE=1` builds anyway.
+
+## Repo-local configuration
+
+A checkout's own `herdr-engineering.yaml` (or `config/herdr-engineering.yaml`) may set only `version`,
+`web`, `tests` and `ci`. `build_cleanup` (roots, thresholds, `enabled`), `fabric_build_cache` and every other
+section come from the machine-local config or `$HERDR_ENGINEERING_CONFIG`, so a repository being built cannot
+choose what gets deleted.
+
+## Reserve and removal locks
+
+When no storage tier keeps `min_free_disk_percent` free, the cargo wrapper runs one pressure cleanup at the
+reserve line, looks at the tiers again and exits 75 if none fits. A managed target's `<name>.lock` is created by
+the build side; the sweep never creates one (a target without a lock file is locked through its directory), and
+a target whose lock cannot be taken is skipped while the sweep goes on. Unmanaged targets are re-checked against
+a process snapshot taken at the moment of the first removal.

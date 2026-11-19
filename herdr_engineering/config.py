@@ -36,6 +36,7 @@ DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "roots": ["~/IdeaProjects", "~/work", "~/.cache"],
         "interval_seconds": 900,
+        "require_herdr_server": False,  # true: the watch loop only sweeps while a herdr server runs
         "high_water_percent": 85,
         "low_water_percent": 80,
         "min_age_hours": 24,
@@ -260,6 +261,12 @@ def _discover_config_paths() -> list[Path]:
     return [c for c in candidates if c.exists()]
 
 
+# Sections a checkout's own config may set. Everything else (build_cleanup roots and thresholds,
+# build-cache policy, credentials, endpoints, security) is machine-local only: a repo being built
+# must not choose what gets deleted or where data goes.
+REPO_LOCAL_ALLOWED = frozenset({"version", "web", "tests", "ci"})
+
+
 def _repo_local_paths() -> set[Path]:
     """Config files taken from the current directory (untrusted: the repo being built)."""
     cwd = Path.cwd()
@@ -298,9 +305,7 @@ def load_config(paths: list[Path] | None = None, *, strict_build_cache: bool = F
                 "github.organizations and github.sync from the central fleet config (control_plane "
                 "fleet file), so this section has no effect", path)
         if path in repo_local:
-            # A checkout being built must never choose build-cache policy
-            # (writes, namespace, credentials): machine-local config only.
-            data.pop("fabric_build_cache", None)
+            data = {k: v for k, v in data.items() if k in REPO_LOCAL_ALLOWED}
         cfg = _deep_merge(cfg, data)
     validate_github(cfg.get("github"))
     cfg = _expand_env(cfg)

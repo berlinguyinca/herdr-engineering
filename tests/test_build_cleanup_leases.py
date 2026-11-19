@@ -18,7 +18,7 @@ FORCE = {"high_water": 1, "low_water": 0, "min_age_hours": 24}
 
 
 @pytest.fixture(autouse=True)
-def no_proc_scan(monkeypatch):
+def no_proc_scan(monkeypatch):  # in-process sweeps only; the racing tests sweep in a real child process
     monkeypatch.setattr(cleanup, "_process_paths", lambda: [])
 
 
@@ -164,40 +164,78 @@ def test_no_registry_file_is_legacy_behavior(env):
     assert not (state / br.DB_NAME).exists()  # cleanup never creates the registry
 
 
-def test_lease_taken_between_scan_and_delete_is_rechecked(env, monkeypatch):
-    """The removal lock is taken after the first lease check and before rmtree (the
-    revalidation step). Acquire a lease at that point, wrapping the real lock function,
-    and expect the target to survive."""
+def sweep_while_racing(root, state, tmp_path, race):
+    """Run a real sweep in another process and run ``race()`` while that sweep is between its first
+    checks and its removal. A ``git`` wrapper on the sweep's PATH (it execs the real git) pauses the
+    sweep when it asks git about the target, which happens after the first lease check."""
+    import shutil
+    real_git = shutil.which("git")
+    bin_dir = tmp_path / "pause-bin"
+    bin_dir.mkdir()
+    ready, go = tmp_path / "ready", tmp_path / "go"
+    shim = bin_dir / "git"
+    shim.write_text(f"#!/bin/sh\n[ -e '{ready}' ] || {{ : > '{ready}'; while [ ! -e '{go}' ]; do sleep 0.05; done; }}\n"
+                    f"exec '{real_git}' \"$@\"\n")
+    shim.chmod(0o755)
+    code = ("import json, sys; from herdr_engineering.build_cleanup import run_once; "
+            "print(json.dumps(run_once([sys.argv[1]], sys.argv[2], high_water=1, low_water=0, min_age_hours=24)))")
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    child = subprocess.Popen([sys.executable, "-c", code, str(root), str(state)], env=env,
+                             stdout=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 120
+        while not ready.exists():
+            assert child.poll() is None and time.monotonic() < deadline, "sweep never reached its removal step"
+            time.sleep(0.05)
+        race()
+    finally:
+        go.write_text("go")
+    out, _ = child.communicate(timeout=300)
+    import json
+    return json.loads(out.splitlines()[-1])
+
+
+def test_lease_taken_between_scan_and_delete_is_rechecked(env, tmp_path):
+    """A real build registers its lease while a real sweep (another process) is between its first lease
+    check and the removal: the target must survive."""
     root, state = env
     t = project(root)
-    reg = br.Registry(state)
-    a = reg.register(repo_id="r", input_digest=None, cmd_kind="x")
-    reg.transition(a.attempt_id, "classified", "t")
-    reg.transition(a.attempt_id, "admitted", "t")
-    calls = []
-    real_lock = cleanup._lock_for_removal
 
-    def lock(target):
-        calls.append(1)
+    def race():
+        reg = br.Registry(state)
+        a = reg.register(repo_id="r", input_digest=None, cmd_kind="x")
+        reg.transition(a.attempt_id, "classified", "t")
+        reg.transition(a.attempt_id, "admitted", "t")
         reg.acquire_lease(root / "project", a.attempt_id, 300)
-        return real_lock(target)
 
-    monkeypatch.setattr(cleanup, "_lock_for_removal", lock)
-    res = sweep(root, state)
-    assert len(calls) == 1, "revalidation seam not reached"
+    res = sweep_while_racing(root, state, tmp_path, race)
     assert t.exists()
     assert reasons(res) == {"project": "active_lease"}
 
 
-def test_target_no_longer_recognized_is_never_removed(env, monkeypatch):
+def test_target_no_longer_recognized_is_never_removed(env, tmp_path):
     root, state = env
     t = project(root)
-    real_lock = cleanup._lock_for_removal
-
-    def lock(target):  # between scan and delete the project is replaced
-        (root / "project" / "Cargo.toml").unlink()
-        return real_lock(target)
-
-    monkeypatch.setattr(cleanup, "_lock_for_removal", lock)
-    res = sweep(root, state)
+    res = sweep_while_racing(root, state, tmp_path, lambda: (root / "project" / "Cargo.toml").unlink())
     assert t.exists() and res["removed"] == []
+
+
+def test_process_started_after_the_first_scan_keeps_an_unmanaged_target(env, tmp_path):
+    """The first process scan saw nothing; a real process then starts inside the target. The removal-moment
+    snapshot sees it and the target survives."""
+    root, state = env
+    t = project(root)
+    holder = []
+
+    def race():
+        holder.append(subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=t))
+
+    try:
+        res = sweep_while_racing(root, state, tmp_path, race)
+    finally:
+        for proc in holder:
+            proc.kill()
+            proc.wait()
+    assert t.exists()
+    assert reasons(res) == {"project": "active project"}

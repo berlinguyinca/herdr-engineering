@@ -921,7 +921,7 @@ def test_guard_does_not_wait_when_the_busy_wait_is_zero(root, state_env):
 def test_guard_runs_before_the_reserve_check_so_pressure_cleanup_is_reached(tmp_path):
     home, env = cargo_env(tmp_path, refuse=0)
     settings = yaml.safe_load(Path(env["HERDR_ENGINEERING_CONFIG"]).read_text())
-    settings["fabric_build_cache"]["local"]["min_free_disk_percent"] = 100  # no tier can ever meet it
+    settings["fabric_build_cache"]["local"]["min_free_disk_percent"] = 99  # no tier can ever meet it
     Path(env["HERDR_ENGINEERING_CONFIG"]).write_text(yaml.safe_dump(settings))
     repo, _ = crate_with_worktree(tmp_path)
     refused = build(repo, home, env)
@@ -970,3 +970,180 @@ def test_a_job_pointing_into_another_venv_is_replaced_not_kept(tmp_path):
     kept.chmod(0o755)
     plist.write_bytes(plistlib.dumps({"ProgramArguments": [str(kept), "build-cleanup", "run"]}))
     assert build_hygiene._job_works(plist) is True
+
+
+def test_target_override_follows_cargos_precedence(tmp_path):
+    from herdr_engineering.cargo_target_storage import target_override
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    env = {"CARGO_TARGET_DIR": "/from/env"}
+    # --target-dir beats --config beats the environment
+    assert target_override(["--target-dir", "/cli", "--config", "build.target-dir='/cfg'"], env, cwd) == Path("/cli")
+    assert target_override(["--config", "build.target-dir='/cfg'"], env, cwd) == Path("/cfg")
+    assert target_override(["--config=build.target-dir='/cfg'", "--target-dir=/cli"], env, cwd) == Path("/cli")
+    assert target_override(["--config", "extra.toml"], env, cwd) is True
+    assert target_override([], env, cwd) == Path("/from/env")
+
+
+def test_fleet_keeps_the_cleanup_job_when_roots_are_empty():
+    from herdr_engineering import fleet
+    # Empty roots still sweep the managed targets: fleet must not disable a job build-hygiene re-enables.
+    assert fleet._cleanup_job_wanted({"enabled": True, "roots": []}) is True
+    assert fleet._cleanup_job_wanted({}) is True
+    assert fleet._cleanup_job_wanted({"enabled": False, "roots": ["/x"]}) is False
+    assert fleet._hygiene_bus is build_hygiene._has_systemd_user_bus  # one helper, not a copy
+
+
+# --- review round 5 -------------------------------------------------------------------------
+
+def make_managed(root: Path, name: str, age_hours: float = 48, lock: bool = True) -> Path:
+    """A real managed target (``<root>/targets/<label>-<id>``) with Cargo output, idle for ``age_hours``."""
+    from herdr_engineering.cargo_target_storage import prepare_target, target_lock_path
+    workspace = root.parent / "workspaces" / name
+    workspace.mkdir(parents=True, exist_ok=True)
+    (root / "sccache").mkdir(exist_ok=True)
+    target = prepare_target(root / "sccache", workspace)
+    (target / "debug/.fingerprint").mkdir(parents=True)
+    (target / "debug/artifact").write_bytes(b"x" * 4096)
+    stamp = time.time() - age_hours * 3600
+    for path in [*target.rglob("*"), target]:
+        os.utime(path, (stamp, stamp), follow_symlinks=False)
+    if not lock:
+        target_lock_path(target).unlink()  # a target created before the lock existed
+    return target
+
+
+def test_prepare_target_creates_the_lock_so_a_sweep_never_has_to(tmp_path):
+    from herdr_engineering.cargo_target_storage import prepare_target, target_lock_path
+    cache = tmp_path / "sccache"
+    cache.mkdir()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    target = prepare_target(cache, workspace)
+    assert target_lock_path(target).is_file()
+
+
+def test_a_target_without_a_lock_file_is_swept_and_leaves_no_lock_behind(root):
+    from herdr_engineering.cargo_target_storage import target_lock_path
+    target = make_managed(root, "old", lock=False)
+    result = sweep(root)
+    assert result["removed"] == [str(target)] and not target.exists()
+    assert not target_lock_path(target).exists()  # the sweep never created one
+
+
+def test_a_skipped_target_keeps_its_lock_file(root):
+    from herdr_engineering.cargo_target_storage import target_lock_path
+    target = make_managed(root, "fresh", age_hours=0.0)  # recent: skipped
+    sweep(root)
+    assert target.exists() and target_lock_path(target).is_file()
+
+
+def test_lock_trouble_on_one_target_skips_it_not_the_sweep(root):
+    from herdr_engineering.cargo_target_storage import target_lock_path
+    broken = make_managed(root, "a-broken")
+    healthy = make_managed(root, "b-healthy")
+    target_lock_path(broken).unlink()
+    target_lock_path(broken).mkdir()  # a directory where the lock file belongs: opening it fails
+    result = sweep(root)
+    assert broken.exists() and not healthy.exists()
+    assert result["removed"] == [str(healthy)] and result["errors"] == []
+    assert any("cannot lock" in s["reason"] for s in result["skipped"] if s["path"] == str(broken))
+
+
+def test_dry_run_does_not_list_a_target_a_running_build_holds(root):
+    held = make_managed(root, "held")
+    free = make_managed(root, "free")
+    code = ("import sys, time; from pathlib import Path; "
+            "from herdr_engineering.cargo_target_storage import _hold_target_lock; "
+            "_hold_target_lock(Path(sys.argv[1])); print('held', flush=True); time.sleep(60)")
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    holder = subprocess.Popen([sys.executable, "-c", code, str(held)], env=env, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        result = sweep(root, dry_run=True)
+    finally:
+        holder.kill()
+        holder.wait()
+    assert result["would_remove"] == [str(free)]
+    assert any(s["path"] == str(held) and s["reason"] == "build in progress" for s in result["skipped"])
+
+
+def test_a_refused_foreign_root_gets_no_lock_file(tmp_path):
+    from herdr_engineering.cargo_target_storage import prepare_target
+    cache = tmp_path / "sccache"
+    cache.mkdir()
+    foreign = tmp_path / "targets"
+    foreign.mkdir()
+    (foreign / "someone-elses-data").write_text("x")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    for build_lock in (False, True):
+        with pytest.raises(ValueError, match="not managed by Herdr"):
+            prepare_target(cache, workspace, build_lock=build_lock)
+    assert sorted(p.name for p in foreign.iterdir()) == [".target-manager.lock", "someone-elses-data"]
+
+
+def test_discovery_only_probes_the_root_marker_in_targets_directories(root, monkeypatch):
+    (root / "a/b").mkdir(parents=True)
+    (root / "targets").mkdir()
+    probed = []
+    real = Path.is_file
+
+    def spy(self):
+        if self.name == ".herdr-target-root.json":
+            probed.append(self.parent.name)
+        return real(self)
+
+    monkeypatch.setattr(Path, "is_file", spy)
+    cleanup._discover(root)
+    assert set(probed) <= {"targets"}
+
+
+def test_a_herdr_eng_symlink_into_another_venv_is_not_a_working_job(tmp_path):
+    other = tmp_path / "old-venv"
+    (other / "bin").mkdir(parents=True)
+    (other / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    real = other / "bin/herdr-eng"
+    real.write_text("#!/bin/sh\n")
+    real.chmod(0o755)
+    link_dir = tmp_path / "local-bin"
+    link_dir.mkdir()
+    link = link_dir / "herdr-eng"
+    link.symlink_to(real)
+    assert build_hygiene._in_other_venv(link) is True
+
+
+def set_reserve(env: dict, percent: float, **cleanup_settings) -> None:
+    path = Path(env["HERDR_ENGINEERING_CONFIG"])
+    settings = yaml.safe_load(path.read_text())
+    local = settings["fabric_build_cache"]["local"]
+    local["min_free_disk_percent"] = percent
+    local["storage_tiers"] = [{"name": "primary", "directory": str(path.parent / "tier/compiler-cache")}]
+    if cleanup_settings:
+        settings.setdefault("build_cleanup", {}).update(cleanup_settings)
+    path.write_text(yaml.safe_dump(settings))
+
+
+@pytest.mark.integration
+def test_a_reserve_refusal_cleans_up_then_exits_75_never_a_crash(tmp_path):
+    home, env = cargo_env(tmp_path)  # the guard itself (90% / 50 GiB) would allow this build
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    stale = make_target(projects, age_hours=48)
+    set_reserve(env, 99, roots=[str(projects)])  # no tier can ever keep 99% free
+    repo, _ = crate_with_worktree(tmp_path)
+    refused = build(repo, home, env)
+    assert refused.returncode == disk_guard.EXIT_REFUSED, refused.stderr
+    assert "refusing to start a new build" in refused.stderr and "Traceback" not in refused.stderr
+    assert not stale.exists(), "the pressure cleanup runs before the refusal"
+
+
+@pytest.mark.integration
+def test_an_operator_owned_target_is_decided_before_and_without_the_managed_tier(tmp_path):
+    home, env = cargo_env(tmp_path)
+    set_reserve(env, 99)  # the managed tier could never be used, but this build never writes there
+    repo, _ = crate_with_worktree(tmp_path)
+    (repo / "target").mkdir()
+    built = build(repo, home, env)
+    assert built.returncode == 0, built.stderr
+    assert (repo / "target/debug/shared-demo").is_file() and not managed_targets(tmp_path)

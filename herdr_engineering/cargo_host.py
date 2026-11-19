@@ -306,6 +306,36 @@ def _disk_guard_refusal(probe: Path, policy: Mapping | None = None) -> int | Non
     return None if decision.allowed else EXIT_REFUSED
 
 
+def _select_with_reserve(config, policy: Mapping, unreserved, reserve: float):
+    """A storage tier that keeps ``reserve`` percent free. When none does, one pressure cleanup runs at
+    the reserve line (the guard's own cleanup, with its rate limit) and the tiers are looked at again."""
+    from .build_cache_location import select_storage
+    from .build_coord import _default_state_dir
+    from .disk_guard import OVERRIDE_ENV, relieve
+    state, tiers = _default_state_dir(), config.local.storage_tiers
+    selected = select_storage(tiers, state / "sccache", reserve)
+    if selected.directory is not None:
+        return selected
+    if os.environ.get(OVERRIDE_ENV) == "1":
+        print(f"cargo-host: below the {reserve:g}% free reserve; proceeding because {OVERRIDE_ENV}=1",
+              file=sys.stderr)
+        return unreserved
+    if policy.get("enabled", True):
+        try:
+            relieve(policy, state, 100 - reserve)
+        except Exception as error:  # noqa: BLE001 - a cleanup fault must never turn a refusal into a crash
+            print(f"cargo-host: pressure cleanup unavailable ({type(error).__name__})", file=sys.stderr)
+    return select_storage(tiers, state / "sccache", reserve)
+
+
+def _reserve_refusal(reserve: float) -> int:
+    from .disk_guard import EXIT_REFUSED, OVERRIDE_ENV
+    print(f"cargo-host: no storage tier keeps {reserve:g}% of its disk free, even after cleaning up: "
+          f"refusing to start a new build. Free space (herdr-eng build-cleanup run) or set {OVERRIDE_ENV}=1 "
+          "to build anyway.", file=sys.stderr)
+    return EXIT_REFUSED
+
+
 def run_cargo(argv: list[str]) -> int:
     real = _real_cargo(Path.home())
     command = [str(real), *argv]
@@ -351,32 +381,31 @@ def run_cargo(argv: list[str]) -> int:
     if config.local.manage_targets and not override:
         from .build_cache_location import select_storage
         with maintenance_lock(_default_state_dir()):
+            workspace = workspace_root(real, argv, Path.cwd())
+            old_target = workspace / "target"
+            if (old_target.exists() or old_target.is_symlink()) and not alias_owned(_default_state_dir(), workspace):
+                # An operator's own ./target (or link) is never replaced or redirected: the build writes into
+                # the repository, so that is the only filesystem measured, and it is guarded once.
+                return guard(Path(os.path.realpath(old_target))) or start()
             reserve = 0 if subcommand == "clean" else config.local.min_free_disk_percent
-            # The guard's pressure cleanup runs before the reserve check, so the check sees what it freed.
-            selected = select_storage(config.local.storage_tiers, _default_state_dir() / "sccache", 0)
-            if selected.directory is not None and reserve:
-                refused = guard(selected.directory)
-                if refused is not None:
-                    return refused
-                selected = select_storage(config.local.storage_tiers, _default_state_dir() / "sccache", reserve)
+            tiers, sccache = config.local.storage_tiers, _default_state_dir() / "sccache"
+            selected = select_storage(tiers, sccache, 0)
             if selected.directory is None:
-                raise ValueError("No writable storage tier meets the reserve; managed build was not started")
+                raise ValueError("No writable storage tier; managed build was not started")
+            # The guard's pressure cleanup runs before the reserve check, so the check sees what it freed.
+            refused = guard(selected.directory)
+            if refused is not None:
+                return refused
+            if reserve:
+                selected = _select_with_reserve(config, policy, selected, reserve)
+                if selected.directory is None:
+                    return _reserve_refusal(reserve)
             if not selected.directory.exists():
                 removable = any(tier.name == selected.name and tier.volume_uuid
                                 for tier in config.local.storage_tiers)
                 if removable:
                     raise ValueError("Selected external storage disappeared")
                 selected.directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-            workspace = workspace_root(real, argv, Path.cwd())
-            old_target = workspace / "target"
-            if (old_target.exists() or old_target.is_symlink()) and not alias_owned(_default_state_dir(), workspace):
-                # An operator's own ./target (or link) is never replaced or redirected: the build
-                # writes into the repository, so that is the filesystem the guard measures.
-                return guard(Path(os.path.realpath(old_target))) or start()
-            if not reserve:
-                refused = guard(selected.directory)
-                if refused is not None:
-                    return refused
             target = prepare_target(selected.directory, workspace, build_lock=True)
             if not compatibility_alias(_default_state_dir(), workspace, target):
                 raise ValueError("Default target changed concurrently; no automatic redirection applied")

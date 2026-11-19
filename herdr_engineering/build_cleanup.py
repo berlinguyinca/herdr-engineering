@@ -140,7 +140,8 @@ def _discover(root: Path, managed: bool = True, unreadable: list[str] | None = N
     while pending:
         directory, depth = pending.pop()
         try:
-            managed_dir = managed and (directory / ".herdr-target-root.json").is_file()
+            managed_dir = (managed and directory.name == "targets"
+                           and (directory / ".herdr-target-root.json").is_file())
             scanner = os.scandir(directory)
         except OSError:
             if directory == root:
@@ -219,26 +220,52 @@ _BUSY = -1
 
 
 def _lock_for_removal(target: Path) -> int | None:
-    """Exclusive lock on a managed target's build lock (None: not a managed target, _BUSY: a build holds it)."""
+    """Exclusive lock for removing a managed target (None: not a managed target, _BUSY: a build holds it).
+
+    A build holds its ``<name>.lock`` shared. That file is never created here (a full disk cannot
+    refuse the lock): when it is missing no build holds the target, and the target directory itself
+    is locked instead. A build that appears meanwhile creates the file, which is checked once more.
+    """
     if _managed_workspace(target) is None:
         return None
-    fd = os.open(target_lock_path(target), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(fd)
-        return _BUSY
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
+    lock_path = target_lock_path(target)
+    directory_fd = None
+    for _ in range(2):
+        try:
+            fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            if directory_fd is not None:
+                return directory_fd
+            directory_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(directory_fd)
+                return _BUSY
+            except BaseException:
+                os.close(directory_fd)
+                raise
+            continue
+        if directory_fd is not None:
+            os.close(directory_fd)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return _BUSY
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+    raise OSError(f"Cannot lock {target}: its build lock keeps appearing")
 
 
 def _release_removal_lock(target: Path, fd: int | None) -> None:
     if fd is None:
         return
     try:
-        target_lock_path(target).unlink(missing_ok=True)  # still locked: waiters re-open a fresh one
+        if not target.exists():  # a skipped target keeps its lock file: builds still use it
+            target_lock_path(target).unlink(missing_ok=True)  # still locked: waiters re-open a fresh one
     finally:
         os.close(fd)
 
@@ -351,8 +378,8 @@ def run_once(
     the allocated size of removed files. Concurrent filesystem activity can
     affect the former. Targets must be idle ``min_age_hours``; when a root's usage reaches
     ``pressure_water`` the idle floor drops to ``pressure_min_age_hours`` (never below
-    ``MIN_IDLE_HOURS``). Process, lease and slot-lock guards apply in both tiers. Dry runs fully validate eligible targets but never remove
-    them. Busy sweeps return immediately without overwriting the last report.
+    ``MIN_IDLE_HOURS``). Process, lease and build-lock guards apply in both tiers. Dry runs fully
+    validate eligible targets (a target a running build holds is not listed) but never remove them. Busy sweeps return immediately without overwriting the last report.
     """
     if not all(math.isfinite(v) for v in (high_water, low_water, min_age_hours,
                                           pressure_water, pressure_min_age_hours)):
@@ -491,6 +518,7 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
         result["errors"].append(str(exc))
         return
     seen = set()
+    fresh: list[Path] | None = None  # the removal-moment process snapshot, taken once for unmanaged targets
     for _, name, _ in sorted(candidates):
         if name in seen:
             continue
@@ -508,27 +536,40 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
             if not _untracked(target):
                 result["skipped"].append({"path": name, "reason": "tracked or unverifiable output"})
                 continue
-            # Revalidate immediately before deletion while still holding the build lock.
+            # Revalidate right before deletion; a managed target's build lock is held from here on.
             newest, size = _inspect(target)
             if newest > cutoffs[name]:
                 result["skipped"].append({"path": name, "reason": "recent activity"})
                 continue
             if not _recognized(target):
                 raise OSError(f"Target no longer recognized as a Cargo output: {name}")
-            if result["dry_run"]:  # nothing is removed, so the first scan stands
-                if not _skip_for_registry(state_dir, target, name, result):
-                    result["would_remove"].append(name)
+            try:
+                lock_fd = _lock_for_removal(target)  # held through the delete: a build waits it out
+            except OSError as exc:  # one target's lock trouble never ends the sweep
+                result["skipped"].append({"path": name, "reason": f"cannot lock: {exc}"})
                 continue
-            lock_fd = _lock_for_removal(target)  # held through the delete: a build waits it out
             if lock_fd == _BUSY:
                 result["skipped"].append({"path": name, "reason": "build in progress"})
                 continue
             try:
+                if result["dry_run"]:  # nothing is removed, so the first scan stands
+                    if not _skip_for_registry(state_dir, target, name, result):
+                        result["would_remove"].append(name)
+                    continue
                 # Re-read the lease and the ownership proof under the lock, right before removing.
                 if _skip_for_registry(state_dir, target, name, result):
                     continue
                 if not _recognized(target):
                     raise OSError(f"Target no longer recognized as a Cargo output: {name}")
+                if lock_fd is None:
+                    # No build lock covers an unmanaged target: look at the processes once more, at the
+                    # moment of removal (one snapshot for the rest of this sweep).
+                    if fresh is None:
+                        result["process_scans"] += 1
+                        fresh = _process_paths()
+                    if _in_use(target, fresh):
+                        result["skipped"].append({"path": name, "reason": "active project"})
+                        continue
                 before = shutil.disk_usage(root).free
                 # CPython's fd-based rmtree prevents symlink substitution attacks.
                 if not shutil.rmtree.avoids_symlink_attacks:

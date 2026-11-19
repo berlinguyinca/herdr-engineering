@@ -32,8 +32,9 @@ def server_running(proc_root: Path = Path('/proc')) -> bool:
 
 
 def watch(cleanup, *, interval: float, stop: threading.Event,
-          is_running=server_running, wait=None) -> None:
-    """Keep individual scan failures from taking down the companion."""
+          is_running=None, wait=None) -> None:
+    """Sweep every ``interval`` seconds (only while ``is_running()`` when given); a failed scan never stops it."""
+    is_running = is_running or (lambda: True)
     if interval <= 0:
         raise ValueError('cleanup interval must be positive')
     wait = wait or stop.wait
@@ -155,5 +156,7 @@ def command(args) -> int:
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda signum, frame: stop.set())
-    watch(cleanup, interval=float(cfg.get('interval_seconds', 900)), stop=stop)
+    # Hosts without a Herdr server still need their disks kept: the server gate is opt-in.
+    watch(cleanup, interval=float(cfg.get('interval_seconds', 900)), stop=stop,
+          is_running=server_running if cfg.get('require_herdr_server') is True else None)
     return 0

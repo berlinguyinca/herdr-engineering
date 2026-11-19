@@ -21,6 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .build_hygiene import _has_systemd_user_bus as _hygiene_bus
 from .herdr_adapter import NativeHerdrAdapter
 
 #: LaunchAgent installed by `scripts/fleet-auto-update-macos.sh`; a test holds the two together so
@@ -311,9 +312,9 @@ def _refresh_controller_handoff(root: Path, report: dict) -> None:
             "by this step (issue #799)")
 
 
-def _has_systemd_user_bus() -> bool:
-    rc, _, _ = _run(["systemctl", "--user", "show-environment"], timeout=15)
-    return rc == 0
+def _cleanup_job_wanted(cleanup: object) -> bool:
+    """Build-hygiene's rule for keeping the cleanup job: anything but an explicit ``enabled: false``."""
+    return not isinstance(cleanup, dict) or bool(cleanup.get("enabled", True))
 
 
 def _install_controller_cleanup(installer: Path, step, report: dict, have_bus: bool) -> bool:
@@ -460,14 +461,17 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
     enabled = (isinstance(cleanup, dict) and cleanup.get("enabled") is True
                and isinstance(roots, list) and bool(roots)
                and all(isinstance(path, str) and path.strip() for path in roots))
+    # The same rule build-hygiene applies: only an explicit `enabled: false` removes the job (empty roots
+    # still sweep the managed targets), so the disable below never fights the re-enable that follows.
+    job_wanted = _cleanup_job_wanted(cleanup)
     installer = root / "scripts" / "build-cleanup.sh"
     legacy_installer_ran = False
     # The systemd script cannot carry a custom state directory into its unit: build-hygiene writes that job.
     if (enabled and installer.exists() and sys.platform.startswith("linux")
             and not os.environ.get("HERDR_ENGINEERING_STATE")):
-        legacy_installer_ran = _install_controller_cleanup(installer, step, report, _has_systemd_user_bus())
+        legacy_installer_ran = _install_controller_cleanup(installer, step, report, _hygiene_bus())
 
-    elif not enabled and sys.platform.startswith("linux"):
+    elif not job_wanted and sys.platform.startswith("linux"):
         loaded, value, _ = _run(["systemctl", "--user", "show",
                                  "herdr-eng-build-cleanup.service",
                                  "-p", "LoadState", "--value"], timeout=30)

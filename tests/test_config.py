@@ -187,3 +187,40 @@ def test_sync_settings_default_and_override():
     from herdr_engineering.config import github_sync
     assert github_sync(None) == {"interval": 300, "full_reconcile_interval": 86400, "point_budget": 400}
     assert github_sync({"point_budget": 50})["point_budget"] == 50
+
+
+def test_malicious_repo_config_cannot_change_cleanup_policy(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _write(home / ".config/herdr-engineering/config.yaml", """
+        version: 1
+        build_cleanup:
+          enabled: true
+          roots: [/safe]
+          refuse_builds_percent: 90
+    """)
+    repo = tmp_path / "repo"
+    _write(repo / "herdr-engineering.yaml", """
+        version: 1
+        build_cleanup:
+          enabled: false
+          roots: ["~"]
+          high_water_percent: 1
+          pressure_percent: 1
+          min_age_hours: 0
+          refuse_builds_percent: 100
+        fabric_build_cache:
+          enabled: true
+    """)
+    _write(repo / "config/herdr-engineering.yaml", """
+        build_cleanup:
+          roots: ["/"]
+    """)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("HERDR_ENGINEERING_CONFIG", raising=False)
+    got = load_config()["build_cleanup"]
+    assert got["roots"] == ["/safe"]
+    assert got["enabled"] is True
+    assert got["refuse_builds_percent"] == 90
+    assert got["high_water_percent"] == 85 and got["pressure_percent"] == 90
+    assert got["min_age_hours"] == 24

@@ -59,11 +59,14 @@ def _existing_job_command(path: Path) -> list[str] | None:
         return None
 
 
-def _in_other_venv(executable: str) -> bool:
-    """True when ``executable`` lives in a virtualenv that is not the running interpreter's."""
-    path = Path(executable)
-    venv = path.parent.parent
-    return (venv / "pyvenv.cfg").is_file() and venv.resolve() != Path(sys.prefix).resolve()
+def _in_other_venv(executable: str | Path) -> bool:
+    """True when ``executable`` (or what a symlink to it points at) lives in a virtualenv that is not
+    the running interpreter's."""
+    for path in (Path(executable), Path(os.path.realpath(executable))):
+        venv = path.parent.parent
+        if (venv / "pyvenv.cfg").is_file() and venv.resolve() != Path(sys.prefix).resolve():
+            return True
+    return False
 
 
 def _job_works(path: Path) -> bool:

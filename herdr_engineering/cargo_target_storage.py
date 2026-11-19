@@ -136,9 +136,7 @@ def target_override(arguments: list[str], env: Mapping[str, str], cwd: Path) -> 
     """Where the caller already directs Cargo's output: the directory when it can be resolved, True when
     something overrides it but the directory is unknown (a ``--config`` file), False when nothing does."""
     arguments = arguments[:arguments.index("--")] if "--" in arguments else arguments
-    for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
-        if env.get(key):
-            return cwd / env[key]
+    config_value: Path | bool = False
     for index, arg in enumerate(arguments):
         if arg == "--target-dir" and index + 1 < len(arguments):
             return cwd / arguments[index + 1]
@@ -153,13 +151,21 @@ def target_override(arguments: list[str], env: Mapping[str, str], cwd: Path) -> 
         else:
             continue
         if "=" not in value:
-            return True  # A separately supplied config file remains authoritative.
+            config_value = config_value or True  # A separately supplied config file remains authoritative.
+            continue
         try:
             directory = tomllib.loads(value).get("build", {}).get("target-dir")
         except ValueError:
-            return True
+            config_value = config_value or True
+            continue
         if directory:
-            return cwd / directory if isinstance(directory, str) else True
+            config_value = config_value or (cwd / directory if isinstance(directory, str) else True)
+    # Cargo's precedence: --target-dir, then --config, then the environment, then config files.
+    if config_value:
+        return config_value
+    for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
+        if env.get(key):
+            return cwd / env[key]
     for directory in (cwd, *cwd.parents):
         for name in ("config", "config.toml"):
             found = _target_setting(directory / ".cargo" / name)
@@ -237,10 +243,21 @@ def _hold_target_lock(target: Path) -> int:
     raise ValueError("Cannot lock the managed target: it keeps being cleaned up")
 
 
+@contextmanager
+def _manager_lock(root: Path) -> Iterator[None]:
+    fd = os.open(root / ".target-manager.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def prepare_target(cache: Path, workspace: Path, *, build_lock: bool = False) -> Path:
     """The workspace's managed target, created and ownership-checked.
 
-    ``build_lock`` also takes the target's shared build lock and leaves it open (inheritable) so it is
+    The target's lock file is created here, beside the target, so a sweep never has to create one
+    on a full disk. ``build_lock`` also takes its shared lock and leaves it open (inheritable) so it is
     held until the build, which inherits it across exec, ends: the sweep never deletes a target that a
     build holds.
     """
@@ -251,10 +268,7 @@ def prepare_target(cache: Path, workspace: Path, *, build_lock: bool = False) ->
     if root.is_symlink():
         raise ValueError("Managed target root cannot be a symlink")
     root.mkdir(exist_ok=True, mode=0o700)  # parent must already exist on selected storage
-    lock_fd = _hold_target_lock(target) if build_lock else None
-    fd = os.open(root / ".target-manager.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with _manager_lock(root):
         root_marker = root / ".herdr-target-root.json"
         if not root_marker.exists():
             if any(not p.name.endswith(".lock") for p in root.iterdir()):
@@ -265,26 +279,32 @@ def prepare_target(cache: Path, workspace: Path, *, build_lock: bool = False) ->
             if (root_marker.is_symlink() or not isinstance(metadata, dict)
                     or metadata.get("version") != 1 or metadata.get("owner_uid") != os.getuid()):
                 raise ValueError("Target root ownership does not match")
-        if target.is_symlink():
-            raise ValueError("Managed target directory cannot be a symlink")
-        target.mkdir(exist_ok=True, mode=0o700)
-        marker = target / TARGET_MARKER
-        expected = {"version": 1, "workspace": str(workspace.resolve()), "owner_uid": os.getuid()}
-        if marker.exists():
-            if marker.is_symlink() or json.loads(marker.read_text()) != expected:
-                raise ValueError("Target directory belongs to a different workspace")
-        else:
-            if any(target.iterdir()):
-                raise ValueError("Existing target directory has no ownership marker")
-            _write_marker(marker, expected)
-        os.utime(marker, None, follow_symlinks=False)
+    # Only a proven Herdr root gets a lock file. Waiting out a sweep happens outside the manager lock.
+    if build_lock:
+        lock_fd = _hold_target_lock(target)
+    else:
+        lock_fd = None
+        os.close(os.open(target_lock_path(target), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600))
+    try:
+        with _manager_lock(root):
+            if target.is_symlink():
+                raise ValueError("Managed target directory cannot be a symlink")
+            target.mkdir(exist_ok=True, mode=0o700)
+            marker = target / TARGET_MARKER
+            expected = {"version": 1, "workspace": str(workspace.resolve()), "owner_uid": os.getuid()}
+            if marker.exists():
+                if marker.is_symlink() or json.loads(marker.read_text()) != expected:
+                    raise ValueError("Target directory belongs to a different workspace")
+            else:
+                if any(target.iterdir()):
+                    raise ValueError("Existing target directory has no ownership marker")
+                _write_marker(marker, expected)
+            os.utime(marker, None, follow_symlinks=False)
         return target
     except BaseException:
         if lock_fd is not None:
             os.close(lock_fd)
         raise
-    finally:
-        os.close(fd)
 
 
 # --- Retired shared target pool ---------------------------------------------------------------

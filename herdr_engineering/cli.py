@@ -3193,7 +3193,7 @@ def _cmd_build_coordinate(args) -> int:
     from .build_coord import BuildGate, _default_slots, _default_state_dir, run_gated
     from .build_metrics import summarize
 
-    cache_cfg = _build_cache_config()
+    cache_cfg, cleanup_policy = _build_cache_config_and_policy()
     slots = args.slots if args.slots is not None else effective_slots(
         cache_cfg, _default_slots(), _default_state_dir())
     if getattr(args, "status", False):
@@ -3238,7 +3238,7 @@ def _cmd_build_coordinate(args) -> int:
               file=sys.stderr)
     if cmd and _guarded_build(cmd):
         from .cargo_host import _disk_guard_refusal
-        refused = _disk_guard_refusal(Path.cwd())
+        refused = _disk_guard_refusal(Path.cwd(), cleanup_policy)
         if refused is not None:
             return refused
     return run_gated(cmd, slots=slots, max_load=args.max_load,

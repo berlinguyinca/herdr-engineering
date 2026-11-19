@@ -95,3 +95,27 @@ def test_manual_run_reports_error_exit_for_invalid_root(tmp_path, monkeypatch, c
     args = Namespace(cleanup_command='run', root=[str(tmp_path / 'missing')], dry_run=True)
     assert command(args) == 1
     assert 'error' in capsys.readouterr().out
+
+
+def test_watch_loop_sweeps_without_a_herdr_server(tmp_path, monkeypatch):
+    # The Linux unit runs `build-cleanup watch`: with no herdr server on the host it must still sweep.
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = tmp_path / "root"
+    root.mkdir()
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(f"build_cleanup:\n  roots: ['{root}']\n  interval_seconds: 1\n")
+    env = {"HERDR_ENGINEERING_CONFIG": str(cfg), "HERDR_ENGINEERING_STATE": str(tmp_path / "state"),
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1]), "HOME": str(tmp_path),
+           "PATH": "/usr/bin:/bin"}
+    proc = subprocess.Popen([sys.executable, "-m", "herdr_engineering.cli", "build-cleanup", "watch"],
+                            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    status = tmp_path / "state" / "build-gates" / "build-cleanup.json"
+    import time
+    deadline = time.monotonic() + 30
+    while not status.exists() and time.monotonic() < deadline:
+        time.sleep(0.2)
+    proc.terminate()
+    proc.communicate(timeout=30)
+    assert status.exists()
