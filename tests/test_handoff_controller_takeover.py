@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from herdr_engineering.handoff_adapters import adapter_for
-from herdr_engineering.handoff_adapters.base import ExitPlan, Harness, SessionRef
+from herdr_engineering.handoff_adapters.base import ExitPlan, Harness, SessionRef, TypedInput
 from herdr_engineering.handoff_controller.compaction import (
     CompactionResult,
     compact_with_pointer,
@@ -23,19 +23,32 @@ from herdr_engineering.handoff_controller.compaction import (
     pointer_text,
 )
 from herdr_engineering.handoff_controller.config import ControllerConfig
-from herdr_engineering.handoff_controller.events import Colour, EventLog, StuckReason
-from herdr_engineering.handoff_controller.handoff_cli import HandoffCli, HandoffCliResult, takeover_args
+from herdr_engineering.handoff_controller.events import (
+    Colour,
+    EventLog,
+    HandoffEvent,
+    StuckReason,
+    source_is_handed_off,
+)
+from herdr_engineering.handoff_controller.handoff_cli import (
+    HandoffCli,
+    HandoffCliResult,
+    takeover_args,
+)
+from herdr_engineering.handoff_controller.herdr_cli import HerdrCli
 from herdr_engineering.handoff_controller.takeover import (
     Action,
     Outcome,
     RecordView,
     classify,
     next_action,
+    next_after_attempts,
     record_view,
+    retry_can_help,
     run_takeover,
     stuck_reason,
-    successor_of,
 )
+from herdr_engineering.handoff_subagent_registry import record as record_subagent
 from tests.handoff_controller_herdr import IsolatedHerdr, isolated_herdr, wait_for
 from tests.test_handoff_controller_briefing import _cli_prefix
 
@@ -80,7 +93,7 @@ def test_a_fresh_record_is_launched_and_a_closed_one_is_done() -> None:
     assert next_action(closed) is Action.DONE
 
 
-@pytest.mark.parametrize("phase", ["launched", "confirmed", "unconfirmed", "source_exit_failed", "launching"])
+@pytest.mark.parametrize("phase", ["launched", "confirmed", "unconfirmed", "source_exit_failed"])
 def test_a_recorded_child_is_reused_by_running_takeover_again_never_a_second_launch(phase: str) -> None:
     view = record_view({"takeover": {"phase": phase, "child_pane": "w1:p9"}})
     assert view.child_pane == "w1:p9"
@@ -93,15 +106,58 @@ def test_a_successor_without_a_child_is_never_launched_again() -> None:
         is Action.LAUNCH
 
 
+def test_a_takeover_killed_between_placing_the_pane_and_recording_it_is_not_launched_again() -> None:
+    """herdr-handoff 0.5.0 records `launching` before it places the pane and `launched` (with `child_pane`) after: a
+    record stuck in `launching` has no child_pane, and a child may or may not exist."""
+    assert next_action(record_view({"takeover": {"phase": "launching", "source_pane": "w1:p1"}})) \
+        is Action.LAUNCH_UNKNOWN
+    assert next_after_attempts(record_view({"takeover": {"phase": "launching"}})) is Action.LAUNCH_UNKNOWN
+
+
 def test_malformed_records_read_as_absent() -> None:
     assert record_view({"takeover": "x", "target": [], "successor_id": 3}) == RecordView(None, None, None, None)
 
 
-def test_the_successor_named_is_the_record_s_then_the_session_then_the_pane() -> None:
-    both = record_view({"successor_id": CHILD_ID, "target": {"session_id": "s1"}})
-    assert successor_of(both, "p") == CHILD_ID
-    assert successor_of(record_view({"target": {"session_id": "s1"}}), "p") == "s1"
-    assert successor_of(record_view({}), "w1:p9") == "w1:p9"
+def test_only_a_confirmed_child_makes_the_handoff_a_fact() -> None:
+    def view(phase: str) -> RecordView:
+        return record_view({"takeover": {"phase": phase, "child_pane": "w1:p9"}, "target": {"session_id": "s-9"}})
+
+    assert next_after_attempts(view("confirmed")) is Action.SUCCESSOR_LIVE  # e.g. after source_dirty
+    assert next_after_attempts(view("source_exit_failed")) is Action.SUCCESSOR_LIVE
+    assert next_after_attempts(view("unconfirmed")) is Action.COMPACT  # launch_unconfirmed
+    assert next_after_attempts(view("launched")) is Action.COMPACT
+    assert next_after_attempts(view("source_closed")) is Action.DONE
+    assert next_after_attempts(record_view(None)) is Action.COMPACT  # nothing was ever launched
+    assert view("confirmed").child_session_id == "s-9"
+
+
+def test_source_dirty_is_not_retried_and_every_other_refusal_is() -> None:
+    for status in ("launch_unconfirmed", "launch_failed", "source_close_failed", "subagents_running",
+                   "source_exit_failed"):
+        assert retry_can_help(classify(_result(1, {"status": status})))
+    assert not retry_can_help(classify(_result(1, {"status": "source_dirty"})))
+    assert retry_can_help(classify(_result(124, "")))
+
+
+@pytest.mark.parametrize("harness", list(Harness))
+def test_every_adapter_types_the_slash_compact_command_and_submits_it(harness: Harness) -> None:
+    assert adapter_for(harness).compact_input() == TypedInput("/compact", ("Enter",))
+
+
+def _event(name: str, reason: str | None = None, colour: Colour | None = None, pane: str = "w1:p1") -> HandoffEvent:
+    return HandoffEvent(name, "t", "c", pane, None, Harness.CLAUDE, None, None, None, colour, reason, None)
+
+
+def test_a_source_with_a_live_successor_is_never_drained_again() -> None:
+    live = stuck_reason(StuckReason.SOURCE_NOT_CLOSED_SUCCESSOR_LIVE, "w1:p9", "source_dirty")
+    assert source_is_handed_off([_event("handoff.stuck", live, Colour.RED)])
+    assert source_is_handed_off([_event("handoff.succeeded", None, Colour.GREEN)])
+    assert not source_is_handed_off([])
+    assert not source_is_handed_off([_event("handoff.takeover_started")])
+    assert not source_is_handed_off([_event("handoff.failed_compacted", "source_dirty", Colour.ORANGE)])
+    other = stuck_reason(StuckReason.TAKEOVER_REFUSED_AND_COMPACTION_FAILED, StuckReason.BLOCKED, "source_dirty")
+    assert not source_is_handed_off([_event("handoff.stuck", other, Colour.RED)])
+    assert not source_is_handed_off([_event("handoff.stuck", StuckReason.LAUNCH_STATE_UNKNOWN.value, Colour.RED)])
 
 
 def _result(code: int, body: object, err: str = "") -> HandoffCliResult:
@@ -242,12 +298,13 @@ def test_success_emits_succeeded_and_closes_source_after_exit(server: IsolatedHe
     done = run_takeover(make_ref(source, work), ADAPTER, handoff_id, ControllerConfig(), log, handoff, server.cli,
                         store_root=store, worktree=work, push_allowed=True, env=server.env, **FAST)
     assert (done.event, done.colour) == ("handoff.succeeded", Colour.GREEN), done
-    assert done.successor_id and done.handoff_id == handoff_id
+    assert done.handoff_id == handoff_id and done.successor_id is None  # no successor handoff record was made
     assert [e.event for e in log.read()] == ["handoff.takeover_started", "handoff.succeeded"]
     assert log.read()[-1] == done
     assert submitted(server)[0] == "/exit"  # herdr-handoff typed the exit plan into the source; the controller did not
     left = panes(server)
     assert source not in left and len(left) == 1  # the source closed, exactly one successor
+    assert done.successor_pane_id == left[0] and done.successor_session_id is None
     record = json.loads((store / "outbox" / f"{handoff_id}.json").read_text())
     assert record["takeover"]["phase"] == "source_closed" and record["takeover"]["child_pane"] == left[0]
 
@@ -255,19 +312,58 @@ def test_success_emits_succeeded_and_closes_source_after_exit(server: IsolatedHe
 @herdr_server
 def test_refusal_keeps_source_and_retries_then_compacts(server: IsolatedHerdr, handoff: HandoffCli,
                                                         tmp_path: Path) -> None:
-    work, store = make_repo(tmp_path, dirty=True), tmp_path / "store"
+    """The child is launched but never confirmed (herdr-handoff is given a confirm timeout shorter than the child's
+    start-up), so nothing proves the handoff happened: the source is compacted, and the event names the child."""
+    work, store = make_repo(tmp_path, dirty=False), tmp_path / "store"
     source = start_idle(server, "FAKE_TUI_COMPACT_S=0.8")
     handoff_id = new_record(handoff, store, source, work)
     log = EventLog(store)
     done = run_takeover(make_ref(source, work), ADAPTER, handoff_id, ControllerConfig(max_attempts=2), log, handoff,
-                        server.cli, store_root=store, worktree=work, push_allowed=True, env=server.env, **FAST)
+                        server.cli, store_root=store, worktree=work, push_allowed=True, env=server.env,
+                        **{**FAST, "confirm_timeout_s": 0.5})
     assert (done.event, done.colour) == ("handoff.failed_compacted", Colour.ORANGE), done.reason
-    assert done.reason and done.reason.startswith("source_dirty"), done.reason
+    assert done.reason and done.reason.startswith("launch_unconfirmed"), done.reason
     assert [e.event for e in log.read()] == ["handoff.takeover_started", "handoff.failed_compacted"]
     document = handoff.document(store, handoff_id)
     assert document is not None and document.is_file()
-    assert submitted(server) == ["/compact", pointer_text(document)]
-    assert source in panes(server) and len(panes(server)) == 2  # the source stayed; the retry reused the one child
+    assert submitted(server)[:2] == ["/compact", pointer_text(document)]
+    (child,) = [p for p in panes(server) if p != source]  # the source stayed; the retry reused the one child
+    assert done.successor_pane_id == child and done.successor_id is None
+
+
+@herdr_server
+def test_a_confirmed_child_with_a_dirty_source_is_red_and_never_compacted(server: IsolatedHerdr, handoff: HandoffCli,
+                                                                         tmp_path: Path) -> None:
+    work, store = make_repo(tmp_path, dirty=True), tmp_path / "store"
+    source = start_idle(server)
+    handoff_id = new_record(handoff, store, source, work)
+    log = EventLog(store)
+    done = run_takeover(make_ref(source, work), ADAPTER, handoff_id, ControllerConfig(max_attempts=3), log, handoff,
+                        server.cli, store_root=store, worktree=work, push_allowed=True, env=server.env, **FAST)
+    (child,) = [p for p in panes(server) if p != source]
+    assert (done.event, done.colour) == ("handoff.stuck", Colour.RED), done
+    assert done.reason and done.reason.startswith(f"source_not_closed_successor_live: {child}"), done.reason
+    assert "last takeover result: source_dirty" in done.reason
+    assert done.successor_pane_id == child
+    assert submitted(server) == []  # no /compact, no pointer: the successor is already working
+    assert source in panes(server)  # the controller never closes the source
+    assert source_is_handed_off(log.read())
+
+
+@herdr_server
+def test_a_source_that_ignores_exit_is_retried_on_the_same_child_then_red(server: IsolatedHerdr, handoff: HandoffCli,
+                                                                        tmp_path: Path) -> None:
+    work, store = make_repo(tmp_path, dirty=False), tmp_path / "store"
+    source = start_idle(server, "FAKE_TUI_IGNORE_EXIT=1")
+    handoff_id = new_record(handoff, store, source, work)
+    done = run_takeover(make_ref(source, work), ShortExit(1.0), handoff_id, ControllerConfig(max_attempts=2),  # type: ignore[arg-type]
+                        EventLog(store), handoff, server.cli, store_root=store, worktree=work, push_allowed=True,
+                        env=server.env, **FAST)
+    (child,) = [p for p in panes(server) if p != source]  # one child, reused by the retry
+    assert (done.event, done.colour) == ("handoff.stuck", Colour.RED), done
+    assert done.reason and done.reason.startswith("source_not_closed_successor_live"), done.reason
+    assert "source_exit_failed" in done.reason and done.successor_pane_id == child
+    assert [t for t in submitted(server) if t != "/exit"] == []
 
 
 @herdr_server
@@ -285,7 +381,7 @@ def test_retry_after_crash_does_not_launch_second_child(server: IsolatedHerdr, h
                         store_root=store, worktree=work, push_allowed=True, env=server.env, **FAST)
     assert done.event == "handoff.succeeded", done
     assert panes(server) == [child]  # the source closed and no second child was launched
-    assert done.successor_id
+    assert done.successor_pane_id == child
 
 
 @herdr_server
@@ -299,7 +395,7 @@ def test_a_closed_record_is_finished_without_calling_takeover(server: IsolatedHe
     assert first.event == "handoff.succeeded"
     again = run_takeover(make_ref(source, work), ADAPTER, handoff_id, ControllerConfig(), EventLog(store), handoff,
                          server.cli, store_root=store, worktree=work, push_allowed=True, env=server.env, **FAST)
-    assert (again.event, again.successor_id) == ("handoff.succeeded", first.successor_id)
+    assert (again.event, again.successor_pane_id) == ("handoff.succeeded", first.successor_pane_id)
     assert len(panes(server)) == 1
 
 
@@ -352,15 +448,65 @@ def test_compaction_is_not_typed_into_a_blocked_agent_or_another_harness(server:
 
 @herdr_server
 def test_no_way_forward_is_red_with_reason(server: IsolatedHerdr, handoff: HandoffCli, tmp_path: Path) -> None:
-    work, store = make_repo(tmp_path, dirty=True), tmp_path / "store"
+    work, store = make_repo(tmp_path, dirty=False), tmp_path / "store"
     source = start_idle(server, "FAKE_TUI_PREFILL=half-written")
     handoff_id = new_record(handoff, store, source, work)
     log = EventLog(store)
     done = run_takeover(make_ref(source, work), ADAPTER, handoff_id, ControllerConfig(max_attempts=2), log, handoff,
                         server.cli, store_root=store, worktree=work, push_allowed=True, env=server.env,
-                        **{**FAST, "compact_ready_timeout_s": 0.6})
+                        **{**FAST, "confirm_timeout_s": 0.5, "compact_ready_timeout_s": 0.6})
     assert (done.event, done.colour) == ("handoff.stuck", Colour.RED), done
     assert done.reason and done.reason.startswith("takeover_refused_and_compaction_failed: compaction_not_ready")
-    assert "last takeover result: source_dirty" in done.reason
+    assert "last takeover result: launch_unconfirmed" in done.reason
     assert [e.event for e in log.read()] == ["handoff.takeover_started", "handoff.stuck"]
     assert source in panes(server) and submitted(server) == []  # nothing typed, nothing closed
+    assert done.successor_pane_id in panes(server) and not source_is_handed_off(log.read())
+
+
+@herdr_server
+def test_finish_runs_for_every_terminal_event_and_the_gate_registry_is_purged(
+        server: IsolatedHerdr, handoff: HandoffCli, tmp_path: Path) -> None:
+    work, store = make_repo(tmp_path, dirty=True), tmp_path / "store"
+    source = start_idle(server)
+    handoff_id = new_record(handoff, store, source, work)
+    state = {**server.env, "HERDR_ENGINEERING_STATE": str(tmp_path / "state"), "HERDR_PANE_ID": source}
+    record_subagent("start", json.dumps({"agent_id": "a1", "agent_type": "x"}), state)
+    registry = tmp_path / "state" / "subagents"
+    assert any(registry.rglob("a1"))
+    done = run_takeover(make_ref(source, work), ADAPTER, handoff_id, ControllerConfig(max_attempts=1), EventLog(store),
+                        handoff, server.cli, store_root=store, worktree=work, push_allowed=True, env=state, **FAST)
+    assert done.event == "handoff.stuck"  # a terminal event that is not a success still ends the drain
+    assert not any(registry.rglob("a1"))
+
+
+# --- no herdr server: herdr-handoff that fails or hangs ---------------------------------------------------------------
+
+class ShortExit:
+    """The claude adapter with a short wait for the source process to end (and so a short bound on one takeover call)."""
+
+    harness = Harness.CLAUDE
+
+    def __init__(self, process_end_s: float) -> None:
+        self._end = process_end_s
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(ADAPTER, name)
+
+    def exit_plan(self) -> ExitPlan:
+        return ExitPlan("/exit", ("Enter",), self._end)
+
+
+@pytest.mark.parametrize("script, expected", [
+    ("import sys,time\nif 'takeover' in sys.argv: time.sleep(30)", "exit 124"),
+    ("import sys\nif 'takeover' in sys.argv: print('boom', file=sys.stderr); sys.exit(2)", "exit 2: boom"),
+], ids=["timed_out", "failed"])
+def test_attempts_exhausted_by_failures_end_red_without_compacting(script: str, expected: str, tmp_path: Path) -> None:
+    broken = HandoffCli([sys.executable, "-c", script], env={"PATH": "/usr/bin:/bin"}, cwd=tmp_path)
+    ref = make_ref("w1:p1", tmp_path)
+    log = EventLog(tmp_path / "store")
+    done = run_takeover(ref, ShortExit(0.2), CHILD_ID, ControllerConfig(max_attempts=2), log, broken, HerdrCli(),  # type: ignore[arg-type]
+                        store_root=tmp_path / "store", worktree=tmp_path, push_allowed=True, env={}, confirm_timeout_s=0.1,
+                        call_margin_s=0.5, retry_delay_s=0.0, poll_s=0.1)
+    assert (done.event, done.colour) == ("handoff.stuck", Colour.RED), done
+    assert done.reason and done.reason.startswith("no_briefing") and expected in done.reason, done.reason
+    assert [e.event for e in log.read()] == ["handoff.takeover_started", "handoff.stuck"]

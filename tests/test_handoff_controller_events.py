@@ -144,3 +144,14 @@ def test_read_skips_a_valid_json_line_that_fails_validation(tmp_path: Path) -> N
         f.write(json.dumps(bad) + "\n")
     log.append(ev("handoff.drained"))
     assert [e.event for e in log.read()] == ["handoff.triggered", "handoff.drained"]
+
+
+def test_successor_pane_and_session_roundtrip_and_old_lines_without_them_still_read(tmp_path: Path) -> None:
+    log = EventLog(tmp_path)
+    new = ev("handoff.succeeded", colour=Colour.GREEN, successor_id="handoff_" + "b" * 32,
+             successor_pane_id="w1:p9", successor_session_id="s-9")
+    log.append(new)
+    assert log.read() == [new] and json.loads((tmp_path / "events.jsonl").read_text())["successor_pane_id"] == "w1:p9"
+    old = {k: v for k, v in json.loads(ev().to_json()).items() if k not in ("successor_pane_id", "successor_session_id")}
+    assert HandoffEvent.from_json(json.dumps(old)) == ev()
+    assert ev().successor_pane_id is None and "successor_session_id" in json.loads(ev().to_json())
