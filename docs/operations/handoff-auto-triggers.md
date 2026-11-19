@@ -32,3 +32,11 @@ Guidance if enabling any of them:
 * Keep the trigger idempotent: key by session id and skip when a handoff for the session is already `queued`.
 * Prefer a warning ("context 80% full, run /handoff") to an unattended launch; a launch opens a new agent that spends tokens.
 * Never let a hook write settings itself; an opt-in snippet belongs in the user's own config under their review.
+
+## Subagent registry hooks (installed by default)
+
+`scripts/install.sh` step 7c2 adds the managed `SubagentStart` and `SubagentStop` hooks to `~/.claude/settings.json`
+(`herdr-eng handoff auto install --subagents-only`). They record running background agents per pane so the handoff drain
+knows whether to wait. Each command is guarded `[ -x ... ] && ... || true`, so a missing binary or any failure exits 0 and
+never disturbs a session. Opt out with `--no-subagent-hooks` or `HERDR_INSTALL_SUBAGENT_HOOKS=0`; remove them with
+`herdr-eng handoff auto uninstall`. Foreign hooks are untouched. Only Claude Code emits these events.

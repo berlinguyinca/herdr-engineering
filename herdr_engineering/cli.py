@@ -543,6 +543,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("auto_action", choices=("install", "uninstall", "check"))
     p2.add_argument("--home", default=None, help="override $HOME (tests)")
     p2.add_argument("--dry-run", action="store_true", help="report what would change without writing")
+    p2.add_argument("--subagents-only", action="store_true", help="install: only the SubagentStart/SubagentStop registry hooks")
     p2.add_argument("--json", action="store_true")
     p2.set_defaults(func=_cmd_handoff_auto)
 
@@ -1629,6 +1630,8 @@ def _cmd_handoff_auto(args) -> int:
     home = Path(args.home) if args.home else None
     if args.auto_action == "check":
         items = ha.check(home)
+    elif args.auto_action == "install" and args.subagents_only:
+        items = ha.install_subagent_hooks(home, dry_run=args.dry_run)
     else:
         items = (ha.install if args.auto_action == "install" else ha.uninstall)(home, dry_run=args.dry_run)
     ok = all(i.action not in ha.FAIL_ACTIONS for i in items)
