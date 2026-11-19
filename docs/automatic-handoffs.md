@@ -30,14 +30,14 @@ Exactly one policy hands a session off, chosen per session:
 
 | Where the session runs | Policy | Threshold |
 |---|---|---|
-| A Herdr pane: `HERDR_PANE_ID` is set and non-empty, the controller plugin is linked (or a controller runs), and the controller is not switched off for that pane | the [automatic handoff controller](operations/handoff.md#automatic-handoff-controller) | 80% |
-| Anywhere else: a plain terminal, a remote shell without `HERDR_PANE_ID`, a pane whose controller is switched off (`HERDR_HANDOFF_AUTO=0` or `handoff auto off`), or a host where the controller plugin is not linked | this autopilot | `handoff_autopilot.context_percent`, 50% by default |
+| A Herdr pane: `HERDR_PANE_ID` is set and non-empty, a controller is running (its plugin being linked is not enough: it only starts when Herdr next starts), and the controller is not switched off for that pane | the [automatic handoff controller](operations/handoff.md#automatic-handoff-controller) | 80% |
+| Anywhere else: a plain terminal, a remote shell without `HERDR_PANE_ID`, a pane whose controller is switched off (`HERDR_HANDOFF_AUTO=0` or `handoff auto off`), or a host where no controller is running (plugin not linked, linked but Herdr not yet restarted, or the controller crashed) | this autopilot | `handoff_autopilot.context_percent`, 50% by default |
 
 In the first row the autopilot stands down: `check` and the hook answer code `herdr_controller_managed`
 (`trigger: false`) with the reason, `handoff autopilot status` shows it under `herdr_controller`, the
-trigger ledger notes it once per session as `skipped`, and `doctor` reports `handoff-autopilot` as `ok`.
+Claude hook (`hook --record`) notes it in the trigger ledger once per session as `skipped` (Pi sessions show it in `status` and `check --json`, not in the ledger), and `doctor` reports `handoff-autopilot` as `ok`.
 The rule fails open: if the controller state cannot be read (Herdr not answering, an unreadable switch file),
-the autopilot keeps working, so no session is ever left without a policy. Every `handoff autopilot hook`
+the autopilot keeps working, and it asks only when it would otherwise trigger, so a session below the threshold never runs `herdr plugin list`. No session is ever left without a policy. Every `handoff autopilot hook`
 path still exits 0.
 
 Other writers of `~/.claude/settings.json` are separate installs with their own markers, so installing one

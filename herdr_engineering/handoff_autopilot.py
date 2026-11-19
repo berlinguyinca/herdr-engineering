@@ -284,8 +284,8 @@ def opt_out_reason(env: Mapping[str, str] | None = None) -> str | None:
 def herdr_controller_reason(env: Mapping[str, str] | None = None) -> str | None:
     """Why the Herdr handoff controller, not this autopilot, owns this session; None when the autopilot stays in charge.
 
-    The controller owns a session when ALL hold: HERDR_PANE_ID is set and non-empty, the controller plugin is linked in Herdr
-    (or a controller is running), and the controller is not switched off for that pane (`HERDR_HANDOFF_AUTO=0` or the pane's
+    The controller owns a session when ALL hold: HERDR_PANE_ID is set and non-empty, a controller is running (holds its lock;
+    a plugin that is only linked does not act until Herdr restarts), and the controller is not switched off for that pane (`HERDR_HANDOFF_AUTO=0` or the pane's
     marker). The autopilot is the policy everywhere else, so a session is never left without one. Any error answers None:
     this fails open, towards the autopilot.
     """
@@ -301,10 +301,10 @@ def herdr_controller_reason(env: Mapping[str, str] | None = None) -> str | None:
         if not is_enabled(pane_id, env, state_root(env)):
             return None
         controller, _ = controller_findings(env)
-        if controller.state not in (ControllerState.RUNNING, ControllerState.LINKED):
+        if controller.state is not ControllerState.RUNNING:
             return None
         return (
-            f"pane {pane_id} is managed by the Herdr handoff controller ({controller.detail}), which hands sessions off "
+            f"pane {pane_id} is managed by the running Herdr handoff controller, which hands sessions off "
             "at its own threshold; the autopilot stands down here and still serves sessions outside Herdr"
         )
     except Exception:  # fail open: a broken check must never leave a session without a policy
@@ -491,9 +491,6 @@ def decide(
             "machine config (~/.config/herdr-engineering/config.yaml); set it to "
             f"true, or unset {ENV_OPT_OUT} if it is exported",
         )
-    managed = herdr_controller_reason(env)
-    if managed is not None:
-        return Decision(False, CODE_HERDR_MANAGED, managed)
     if harness not in active_policy.harnesses:
         return Decision(
             False,
@@ -529,6 +526,10 @@ def decide(
             threshold=threshold,
             window=window,
         )
+    # Asked last: it runs `herdr plugin list`, which only matters once the autopilot would otherwise trigger.
+    managed = herdr_controller_reason(env)
+    if managed is not None:
+        return Decision(False, CODE_HERDR_MANAGED, managed, percent=used, threshold=threshold, window=window)
     entries = (ledger if ledger is not None else read_ledger(home=home)).get("sessions", {})
     count = int((entries.get(session_id) or {}).get("count", 0))
     if count >= active_policy.max_per_session:

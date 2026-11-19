@@ -318,7 +318,7 @@ switched off gets (no automatic policy).
 
 The one other automatic policy is the [handoff autopilot](../automatic-handoffs.md#which-policy-applies-where) (50% by default,
 Pi `turn_end` and Claude `Stop`/`PreCompact`). It stands down in a Herdr pane that the controller manages (`HERDR_PANE_ID` set,
-controller plugin linked, controller not switched off for the pane) and stays the policy for sessions outside Herdr and for
+a controller running, controller not switched off for the pane) and stays the policy for sessions outside Herdr and for
 panes where the controller is switched off, so every session has exactly one policy.
 
 ### Linking and checking the controller
