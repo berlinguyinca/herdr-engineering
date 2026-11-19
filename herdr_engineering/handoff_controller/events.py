@@ -36,6 +36,8 @@ class StuckReason(StrEnum):
     DRAIN_TIMEOUT = "drain_timeout"  # the drain order could not be typed within the drain timeout (never idle with an empty composer)
     DRAIN_PROMPT_UNCERTAIN = "drain_prompt_uncertain"  # typing the order failed in a way that left it unknown whether it landed
     DRAIN_ORDER_TOO_LONG = "drain_order_too_long"  # the drain order exceeds the typed-input limit
+    NO_RECORD = "no_record"  # the session's context record stayed unreadable for a whole drain timeout
+    INTERNAL_ERROR = "internal_error"  # finishing the chain raised three times in a row; `internal_error:<exception type>`
 
 
 EVENT_NAMES = frozenset({
@@ -103,19 +105,39 @@ class EventLog:
             os.close(fd)
 
     def read(self, chain_id: str | None = None) -> list[HandoffEvent]:
+        """Every event, parsed from the whole file: O(size) per call. The controller loop does not use this per tick;
+        it follows the log with `read_since`."""
         try:
             lines = self._path.read_text(encoding="utf-8").splitlines()
         except FileNotFoundError:
             return []
-        events: list[HandoffEvent] = []
-        for line in lines:
-            try:
-                parsed = HandoffEvent.from_json(line)
-            except (ValueError, KeyError, TypeError):
-                continue  # mid-append, or a line that fails validation: skip it
-            if chain_id is None or parsed.chain_id == chain_id:
-                events.append(parsed)
-        return events
+        return [e for e in _parse(lines) if chain_id is None or e.chain_id == chain_id]
+
+    def read_since(self, offset: int) -> tuple[list[HandoffEvent], int]:
+        """The events appended after byte `offset` (0 the first time) and the offset to continue from. Only complete
+        lines are consumed, so an append in progress is read on the next call. The log is append-only; a file shorter
+        than `offset` is read from the start, which the caller sees as a new offset below the one it passed."""
+        try:
+            with self._path.open("rb") as f:
+                start = offset if offset <= os.fstat(f.fileno()).st_size else 0
+                f.seek(start)
+                data = f.read()
+        except FileNotFoundError:
+            return [], 0
+        cut = data.rfind(b"\n")
+        if cut < 0:
+            return [], start
+        return _parse(data[:cut].decode("utf-8", errors="replace").splitlines()), start + cut + 1
+
+
+def _parse(lines: Sequence[str]) -> list[HandoffEvent]:
+    events: list[HandoffEvent] = []
+    for line in lines:
+        try:
+            events.append(HandoffEvent.from_json(line))
+        except (ValueError, KeyError, TypeError):
+            continue  # mid-append, or a line that fails validation: skip it
+    return events
 
 
 def chain_colour(events: Sequence[HandoffEvent]) -> Colour | None:

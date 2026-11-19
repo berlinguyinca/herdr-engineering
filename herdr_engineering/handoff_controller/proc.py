@@ -12,6 +12,17 @@ NOT_RUNNABLE = 127
 _AMBIENT_GIT_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE")
 
 
+_TOOLS: dict[str, str] = {}  # program name -> absolute path, set once at controller start
+
+
+def use_tool(name: str, path: str | None) -> None:
+    """Run `name` from `path` in every later `run_group` call (None goes back to the PATH lookup)."""
+    if path is None:
+        _TOOLS.pop(name, None)
+    else:
+        _TOOLS[name] = path
+
+
 def clean_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment minus ambient git variables (a hook's GIT_DIR must not redirect us), prompts disabled."""
     env = {k: v for k, v in (os.environ if base is None else base).items() if k not in _AMBIENT_GIT_VARS}
@@ -23,6 +34,8 @@ def run_group(cmd: Sequence[str], timeout_s: float, *, env: Mapping[str, str] | 
               cwd: Path | None = None, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
     """A timeout is returncode 124 (the whole process group is killed), a command that cannot start 127."""
     argv = list(cmd)
+    if argv and argv[0] in _TOOLS:
+        argv[0] = _TOOLS[argv[0]]
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 stdin=subprocess.DEVNULL if input_text is None else subprocess.PIPE,

@@ -438,16 +438,17 @@ def test_status_lists_the_lock_and_the_last_event_of_each_chain_in_progress(tmp_
     assert lines[1].startswith("open pane p9 claude: handoff.triggered at ")
 
 
-def test_the_cli_runs_one_tick_and_prints_status(tmp_path: Path) -> None:
+def test_the_cli_refuses_to_start_without_its_programs_and_prints_status(tmp_path: Path) -> None:
     env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "HERDR_ENGINEERING_STATE": str(tmp_path / "state" / "engineering"),
-           "HERDR_HANDOFF_STORE": str(tmp_path / "store")}  # no herdr on this PATH: the tick has nothing to look at
+           "HERDR_HANDOFF_STORE": str(tmp_path / "store"), "HERDR_HANDOFF_BIN_DIRS": "", "PYTHONPATH": str(ROOT)}
+    # no `herdr` on this PATH and no extra dirs: one line on stderr, exit 2, and never a tick against a real Herdr
     run = subprocess.run([sys.executable, "-m", "herdr_engineering.cli", "handoff", "controller", "run", "--once"],
-                         env={**env, "PYTHONPATH": str(ROOT)}, cwd=ROOT, capture_output=True, text=True, timeout=60, check=False)
-    assert run.returncode == 0, run.stderr
+                         env=env, cwd=ROOT, capture_output=True, text=True, timeout=60, check=False)
+    assert run.returncode == 2 and run.stderr.count("\n") == 1 and "herdr" in run.stderr, run.stderr
     status = subprocess.run([sys.executable, "-m", "herdr_engineering.cli", "handoff", "controller", "status"],
-                            env={**env, "PYTHONPATH": str(ROOT)}, cwd=ROOT, capture_output=True, text=True, timeout=60, check=False)
+                            env=env, cwd=ROOT, capture_output=True, text=True, timeout=60, check=False)
     assert status.returncode == 0 and status.stdout.strip() == "controller: not running"
-    assert build_controller(env).store_root == tmp_path / "store"
+    assert build_controller(env, require_binaries=False).store_root == tmp_path / "store"
 
 
 def test_plugin_manifest_valid() -> None:
