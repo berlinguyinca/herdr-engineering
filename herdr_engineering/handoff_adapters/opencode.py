@@ -7,7 +7,15 @@ from collections.abc import Iterator, Mapping
 from contextlib import closing
 from pathlib import Path
 
-from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
+from .base import (
+    READY_STATUSES,
+    ContextReading,
+    ExitPlan,
+    Harness,
+    SessionRef,
+    TypedInput,
+    WindowSource,
+)
 from .herdr_session import herdr_session_id, is_safe_session_id
 from .screen import screen_rows
 from .windows import lookup_window
@@ -19,7 +27,6 @@ PROMPT_PLACEHOLDER = "Ask anything"
 PROMPT_BAR = "┃"
 BOX_BOTTOM = "╹▀"
 UPDATE_DIALOG = "Skip  Confirm"  # the "Update Available" modal: drawn over the screen, the box stays visible behind it
-_READY_STATUSES = frozenset({"idle", "done"})
 _ROWS_BELOW_BOX = 4  # non-blank rows under the box: hints, tip and the status bar (1 after a turn, 3 in a fresh session)
 _BUSY_TIMEOUT_S = 0.25  # a busy database must not hold the controller up; the next poll asks again
 _USAGE_FIELDS = ("input", "output", "reasoning")
@@ -110,18 +117,14 @@ class OpenCodeAdapter:
         return self._xdg("XDG_DATA_HOME", ".local/share") / "opencode" / "opencode.db"
 
     def locate_session(self, session_id: str | None, cwd: Path, pane_id: str) -> SessionRef | None:
-        if session_id is not None and not is_safe_session_id(session_id):
-            return None
+        if session_id is None or not is_safe_session_id(session_id):
+            return None  # no id from Herdr means unknown: a lone session in the cwd may be an older one
         # An id is matched on its own, without comparing the session's directory with cwd: a pane's cwd can differ
         # from where the session was started. That is only safe because the id comes from Herdr for this pane.
         db = self._db_path()
         try:
             with closing(connect(db)) as con:
-                if session_id is not None:
-                    found = con.execute("select id from session where id = ?", (session_id,)).fetchall()
-                else:  # no id from Herdr: only an unambiguous cwd; subagent and archived sessions are not the pane's
-                    found = con.execute("select id from session where directory = ? and parent_id is null "
-                                        "and time_archived is null", (str(cwd),)).fetchall()
+                found = con.execute("select id from session where id = ?", (session_id,)).fetchall()
         except sqlite3.Error:
             return None
         if len(found) != 1:
@@ -131,7 +134,7 @@ class OpenCodeAdapter:
     def locate(self, pane_id: str, cwd: Path) -> SessionRef | None:
         return self.locate_session(herdr_session_id(pane_id, self._env), cwd, pane_id)
 
-    def _window(self, provider: str | None, model: str | None) -> tuple[int, str]:
+    def _window(self, provider: str | None, model: str | None) -> tuple[int, WindowSource]:
         """The context window OpenCode's own configuration or cached catalogue lists, else the model table."""
         config = self._xdg("XDG_CONFIG_HOME", ".config") / "opencode" / "opencode.json"
         catalogue = self._xdg("XDG_CACHE_HOME", ".cache") / "opencode" / "models.json"
@@ -158,7 +161,7 @@ class OpenCodeAdapter:
         return TypedInput(order, ("Enter",))
 
     def is_ready_for_input(self, screen: str, agent_status: str) -> bool:
-        if agent_status not in _READY_STATUSES:
+        if agent_status not in READY_STATUSES:
             return False
         rows = [plain for _, plain in screen_rows(screen)]  # coloured, with blank rows inside the layout
         if any(UPDATE_DIALOG in row for row in rows):

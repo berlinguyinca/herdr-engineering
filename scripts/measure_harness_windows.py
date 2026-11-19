@@ -19,14 +19,19 @@ import sys
 import time
 import tomllib
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from herdr_engineering.handoff_adapters import claude, codex, opencode, pi  # noqa: E402
-from herdr_engineering.handoff_adapters.base import ContextReading, Harness, SessionRef  # noqa: E402
+from herdr_engineering.handoff_adapters.base import (  # noqa: E402
+    ContextReading,
+    Harness,
+    HarnessAdapter,
+    SessionRef,
+)
 from herdr_engineering.handoff_adapters.records import records_newest_first  # noqa: E402
 
 _WINDOW_KEY = re.compile(r"(?i)window(?!s)|context_?size|context_?limit|max_?input|max_?context")
@@ -183,8 +188,10 @@ def _readings(harness: Harness, home: Path, env: dict[str, str], files: list[Pat
         refs = [SessionRef(harness, "-", home, sid, db) for sid in ids]
     else:
         refs = [SessionRef(harness, "-", home, None, path) for path in files]
-    adapter = {Harness.CLAUDE: claude.ClaudeAdapter, Harness.CODEX: codex.CodexAdapter, Harness.PI: pi.PiAdapter,
-               Harness.OPENCODE: opencode.OpenCodeAdapter}[harness](home=home, **({"env": env} if harness is Harness.OPENCODE else {}))
+    factories: dict[Harness, Callable[..., HarnessAdapter]] = {
+        Harness.CLAUDE: claude.ClaudeAdapter, Harness.CODEX: codex.CodexAdapter, Harness.PI: pi.PiAdapter,
+        Harness.OPENCODE: opencode.OpenCodeAdapter}
+    adapter = factories[harness](home=home, **({"env": env} if harness is Harness.OPENCODE else {}))
     for ref in refs:
         try:
             reading = adapter.read_context(ref)
@@ -198,19 +205,19 @@ def _readings(harness: Harness, home: Path, env: dict[str, str], files: list[Pat
 def _model_of(harness: Harness, ref: SessionRef) -> str:
     assert ref.record_path is not None
     if harness is Harness.CLAUDE:
-        found = claude.last_usage(ref.record_path)
-        return found[1] or _FALLBACK if found else _FALLBACK
+        claude_usage = claude.last_usage(ref.record_path)
+        return claude_usage[1] or _FALLBACK if claude_usage else _FALLBACK
     if harness is Harness.CODEX:
         for record in records_newest_first(ref.record_path):
             if model := codex.turn_model(record):
                 return model
         return _FALLBACK
     if harness is Harness.PI:
-        found = pi.last_usage(ref.record_path)
-        return f"{found[1]}/{found[2]}" if found else _FALLBACK
+        pi_usage = pi.last_usage(ref.record_path)
+        return f"{pi_usage[1]}/{pi_usage[2]}" if pi_usage else _FALLBACK
     assert ref.session_id is not None
-    found = opencode.last_usage(ref.record_path, ref.session_id)
-    return f"{found[1]}/{found[2]}" if found else _FALLBACK
+    opencode_usage = opencode.last_usage(ref.record_path, ref.session_id)
+    return f"{opencode_usage[1]}/{opencode_usage[2]}" if opencode_usage else _FALLBACK
 
 
 def _models_report(harness: Harness, home: Path, env: dict[str, str], files: list[Path], cutoff: float) -> list[str]:

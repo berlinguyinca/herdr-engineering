@@ -101,16 +101,14 @@ def test_session_id_with_path_parts_is_rejected(tmp_path, bad):
     assert ClaudeAdapter(home=tmp_path).locate_session(bad, cwd, "w1:p1") is None
 
 
-def test_locate_without_herdr_on_path_falls_back_to_the_only_transcript(tmp_path):
+def test_locate_without_herdr_on_path_is_none_even_with_one_transcript(tmp_path):
     cwd = tmp_path / "work"
     empty = tmp_path / "empty-bin"
     empty.mkdir()
     adapter = ClaudeAdapter(home=tmp_path, env={"PATH": str(empty)})
     assert adapter.locate("w1:p1", cwd) is None
-    only = _install(tmp_path, cwd, "main_chain.jsonl")
-    assert adapter.locate("w1:p1", cwd).record_path == only
-    _install(tmp_path, cwd, "model_change.jsonl", OTHER)
-    assert adapter.locate("w1:p1", cwd) is None
+    _install(tmp_path, cwd, "main_chain.jsonl")
+    assert adapter.locate("w1:p1", cwd) is None  # no id from Herdr: unknown, not the lone transcript
 
 
 def test_unknown_model_uses_fallback_window_not_none(tmp_path):
@@ -130,13 +128,13 @@ def test_locate_picks_transcript_by_session_id_not_newest(tmp_path):
     assert ref == SessionRef(Harness.CLAUDE, "w1:p1", cwd, SESSION, wanted)
 
 
-def test_locate_without_session_id_needs_exactly_one_transcript(tmp_path):
+def test_locate_without_session_id_is_none_even_with_one_transcript_in_the_directory(tmp_path):
+    """A lone transcript may be an older session; without an id from Herdr the session is unknown."""
     cwd = tmp_path / "work"
     adapter = ClaudeAdapter(home=tmp_path)
     assert adapter.locate_session(None, cwd, "w1:p1") is None
-    only = _install(tmp_path, cwd, "main_chain.jsonl", SESSION)
-    ref = adapter.locate_session(None, cwd, "w1:p1")
-    assert ref is not None and ref.record_path == only and ref.session_id == SESSION
+    _install(tmp_path, cwd, "main_chain.jsonl", SESSION)
+    assert adapter.locate_session(None, cwd, "w1:p1") is None
     _install(tmp_path, cwd, "model_change.jsonl", OTHER)
     assert adapter.locate_session(None, cwd, "w1:p1") is None
 
@@ -362,3 +360,23 @@ def test_screen_after_a_turn_with_typed_text_is_not_ready():
 @pytest.mark.parametrize("status", ["working", "blocked", "unknown"])
 def test_screen_after_a_turn_is_not_ready_while_the_harness_is_busy(status):
     assert not ClaudeAdapter().is_ready_for_input(AFTER_TURN_EMPTY, status)
+
+
+# A multi-line draft whose first row is empty: the marker row is bare and the text is on the next row. Real capture
+# (claude 2.1.306, 2026-11-18): Ctrl+J in an empty composer, then "second line typed"; nothing was submitted. Redacted.
+MULTILINE = (FIXTURES / "screen_multiline.ansi").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("status", ["idle", "done"])
+def test_real_multiline_composer_with_an_empty_first_row_is_not_ready(status):
+    assert not ClaudeAdapter().is_ready_for_input(MULTILINE, status)
+
+
+def test_a_draft_after_blank_rows_is_not_ready():
+    rule = "─" * 80
+    screen = f"output\n{rule}\n{PROMPT_MARKER} \n\n\n  draft\n{rule}\n  status\n"
+    assert not ClaudeAdapter().is_ready_for_input(screen, "idle")
+
+
+def test_an_empty_composer_without_a_closing_rule_is_not_ready():
+    assert not ClaudeAdapter().is_ready_for_input(f"output\n{PROMPT_MARKER} \n  maybe a draft\n", "idle")

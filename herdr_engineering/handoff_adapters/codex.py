@@ -8,15 +8,22 @@ import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
+from .base import (
+    READY_STATUSES,
+    ContextReading,
+    ExitPlan,
+    Harness,
+    SessionRef,
+    TypedInput,
+    WindowSource,
+)
 from .herdr_session import herdr_session_id, is_safe_session_id
 from .records import records_newest_first
-from .screen import screen_rows, typed_text
+from .screen import composer_is_empty, last_marker_row, row_text, screen_rows
 from .windows import lookup_window
 
 PROMPT_MARKER = "›"  # the Codex composer row, faint "Ask Codex to do anything" after it when empty; live pane, 0.169.0, 2026-11-18
-_READY_STATUSES = frozenset({"idle", "done"})
-_LINES_BELOW_PROMPT = 4  # the status line(s) under the composer; anything more means it is not last
+_LINES_BELOW_STATUS = 2  # the hint row(s) under the status line; anything more means the composer is not last
 
 
 _INTERACTIVE_ORIGINATOR = "codex-tui"  # session_meta.originator of a TUI session; `codex exec` writes "codex_exec" (0.169.0)
@@ -132,7 +139,9 @@ def _token_count(record: object) -> tuple[int, int | None] | None:
     """
     payload = record.get("payload") if isinstance(record, dict) and record.get("type") == "event_msg" else None
     info = payload.get("info") if isinstance(payload, dict) and payload.get("type") == "token_count" else None
-    last = info.get("last_token_usage") if isinstance(info, dict) else None
+    if not isinstance(info, dict):
+        return None
+    last = info.get("last_token_usage")
     used = last.get("total_tokens") if isinstance(last, dict) else None
     if not isinstance(used, int) or used <= 0:
         return None  # no usage recorded yet; never read as 0%
@@ -164,6 +173,19 @@ def last_usage(path: Path) -> tuple[int, int | None, str | None] | None:
         elif (model := turn_model(record)) is not None:
             return found[0], None, model
     return (found[0], None, None) if found else None
+
+
+def _status_row(rows: list[tuple[str, str]], marker_index: int) -> int | None:
+    """Index of the status row that closes the composer opening at ``marker_index``, else None.
+
+    Under the composer's last row Codex draws one spacer row and then the status block (the status line and its
+    hints), which runs to the bottom of the screen. The block is the contiguous run of text rows at the bottom, and the
+    composer ends at the spacer above it. Without a spacer row the block cannot be told from composer text.
+    """
+    start = len(rows) - 1
+    while start - 1 > marker_index and row_text(rows[start - 1][0]):
+        start -= 1
+    return start if start > marker_index + 1 else None
 
 
 class CodexAdapter:
@@ -200,6 +222,7 @@ class CodexAdapter:
         if found is None:
             return None
         used, recorded, model = found
+        window_source: WindowSource
         if recorded is not None:
             window, window_source = recorded, "recorded"
         else:
@@ -210,14 +233,16 @@ class CodexAdapter:
         return TypedInput(order, ("Enter",))
 
     def is_ready_for_input(self, screen: str, agent_status: str) -> bool:
-        if agent_status not in _READY_STATUSES:
+        if agent_status not in READY_STATUSES:
             return False
         rows = screen_rows(screen)  # Herdr's screen carries colour codes; the prompt's faint suggestion is not typed text
-        for index in range(len(rows) - 1, -1, -1):
-            typed = typed_text(rows[index][0], PROMPT_MARKER)
-            if typed is not None:
-                return not typed and len(rows) - 1 - index <= _LINES_BELOW_PROMPT
-        return False
+        marker = last_marker_row(rows, PROMPT_MARKER)
+        if marker is None:
+            return False
+        index, typed = marker
+        closing = _status_row(rows, index)
+        return (closing is not None and composer_is_empty(rows, index, typed, closing)
+                and len(rows) - 1 - closing <= _LINES_BELOW_STATUS)
 
     def exit_plan(self) -> ExitPlan:
         return ExitPlan("/exit", ("Enter",), 15.0)

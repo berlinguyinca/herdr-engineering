@@ -16,6 +16,8 @@ import os
 import re
 import signal
 import socket
+import sqlite3
+import subprocess
 import sys
 import threading
 from dataclasses import dataclass
@@ -1530,8 +1532,8 @@ def _cmd_handoff_context(args) -> int:
         else:
             ref = None
         reading = adapter.read_context(ref) if ref is not None else None
-    except (hh.Undetectable, ValueError, OSError):
-        reading = None  # a reading that is unavailable must never fail a caller's script
+    except (hh.Undetectable, ValueError, OSError, sqlite3.Error, subprocess.SubprocessError):
+        reading = None  # whatever detecting, locating or reading raises, a reading that is unavailable must never fail a caller's script
     if reading is None or harness is None:
         print(json.dumps({"unknown": True}) if args.json else "unknown")
         return 0

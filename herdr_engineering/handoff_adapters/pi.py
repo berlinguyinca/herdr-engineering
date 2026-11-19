@@ -6,14 +6,21 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
-from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
+from .base import (
+    READY_STATUSES,
+    ContextReading,
+    ExitPlan,
+    Harness,
+    SessionRef,
+    TypedInput,
+    WindowSource,
+)
 from .herdr_session import herdr_agent_session, is_safe_session_id
 from .records import records_newest_first
 from .screen import screen_rows
 from .windows import lookup_window
 
 EDITOR_RULE = "─"  # Pi draws its input editor as a blank line between two rows of these; live pane, Pi 1.3.0, 2026-11-18
-_READY_STATUSES = frozenset({"idle", "done"})
 _LINES_BELOW_EDITOR = 3  # the footer rows under the closing rule; anything more means the editor is not last
 _UUID_AT_END = re.compile(r"_([0-9A-Fa-f-]{36})$")  # <timestamp>_<uuid>.jsonl
 
@@ -44,7 +51,9 @@ def _usage(record: object) -> tuple[int, str | None, str | None] | None:
     record all zeros.
     """
     message = record.get("message") if isinstance(record, dict) and record.get("type") == "message" else None
-    usage = message.get("usage") if isinstance(message, dict) and message.get("role") == "assistant" else None
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return None
+    usage = message.get("usage")
     total = usage.get("totalTokens") if isinstance(usage, dict) else None
     if not isinstance(total, int) or total <= 0:
         return None  # no usage recorded; never read as 0%
@@ -117,6 +126,7 @@ class PiAdapter:
             return None
         used, provider, model = found
         recorded = _configured_window(self._home / ".pi" / "agent" / "models.json", provider, model)
+        window_source: WindowSource
         if recorded is not None:  # Pi's own configuration for that model, not a figure written with the usage entry
             window, window_source = recorded, "recorded"
         else:
@@ -127,7 +137,7 @@ class PiAdapter:
         return TypedInput(order, ("Enter",))
 
     def is_ready_for_input(self, screen: str, agent_status: str) -> bool:
-        if agent_status not in _READY_STATUSES:
+        if agent_status not in READY_STATUSES:
             return False
         lines = [plain for _, plain in screen_rows(screen)]  # a pane screen is padded with blank rows and coloured
         for index in range(len(lines) - 1, 1, -1):

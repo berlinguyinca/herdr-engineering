@@ -283,3 +283,17 @@ def test_screen_after_a_turn_with_typed_text_is_not_ready():
 @pytest.mark.parametrize("status", ["working", "blocked", "unknown"])
 def test_screen_after_a_turn_is_not_ready_while_the_harness_is_busy(status):
     assert not PiAdapter().is_ready_for_input(AFTER_TURN_EMPTY, status)
+
+
+# Pi's editor is the rows between two rules. Real capture (pi 1.3.0, 2026-11-18): Ctrl+J in an empty editor, then
+# "second line typed"; nothing was submitted. Redacted. Pi has no marker row, so the empty-first-row hole cannot occur:
+# a single blank row between the rules is the only empty shape.
+MULTILINE = (FIXTURES / "screen_multiline.ansi").read_text(encoding="utf-8")
+
+
+def test_real_multiline_editor_with_an_empty_first_row_is_not_ready():
+    assert not PiAdapter().is_ready_for_input(MULTILINE, "idle")
+
+
+def test_an_editor_with_text_then_a_blank_last_row_is_not_ready():
+    assert not PiAdapter().is_ready_for_input(f"output\n{RULE}\ndraft\n\n{RULE}\n~ │ model\nMemory: ready\n", "idle")

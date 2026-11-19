@@ -43,14 +43,10 @@ def _dim_after(dim: bool, params: str) -> bool:
     return dim
 
 
-def typed_text(row: str, marker: str) -> str | None:
-    """The text typed after ``marker`` in a raw (coloured) row, or None when the row has no such marker.
-
-    The empty prompt of Claude Code and Codex shows a faint suggestion after the marker; that is not
-    typed text, and neither are Codex's braille animation cells. A row without colour codes
-    (plain text) cannot tell the two apart, so any text after the marker counts as typed.
-    """
-    dim, text = False, []
+def _visible(row: str) -> list[tuple[str, bool]]:
+    """(char, faint) for each char of a raw (coloured) row."""
+    dim = False
+    text: list[tuple[str, bool]] = []
     position = 0
     for match in _CSI.finditer(row):
         text.extend((char, dim) for char in row[position:match.start()])
@@ -58,9 +54,47 @@ def typed_text(row: str, marker: str) -> str | None:
             dim = _dim_after(dim, match.group(1))
         position = match.end()
     text.extend((char, dim) for char in row[position:])
-    plain = "".join(char for char, _ in text).strip()
-    if not plain.startswith(marker):
+    return text
+
+
+def _unfaint(chars: list[tuple[str, bool]]) -> str:
+    return "".join(char for char, faint in chars if not faint and ord(char) not in _BRAILLE).strip()
+
+
+def row_text(row: str) -> str:
+    """The text of a raw (coloured) row without faint runs and braille animation cells, edge spaces dropped."""
+    return _unfaint(_visible(row))
+
+
+def typed_text(row: str, marker: str) -> str | None:
+    """The text typed after ``marker`` in a raw (coloured) row, or None when the row has no such marker.
+
+    The empty prompt of Claude Code and Codex shows a faint suggestion after the marker; that is not
+    typed text, and neither are Codex's braille animation cells. A row without colour codes
+    (plain text) cannot tell the two apart, so any text after the marker counts as typed.
+    """
+    text = _visible(row)
+    joined = "".join(char for char, _ in text)
+    if not joined.strip().startswith(marker):
         return None
-    start = "".join(char for char, _ in text).index(marker) + len(marker)
-    return "".join(char for char, faint in text[start:]
-                   if not faint and ord(char) not in _BRAILLE).strip()
+    return _unfaint(text[joined.index(marker) + len(marker):])
+
+
+def last_marker_row(rows: list[tuple[str, str]], marker: str) -> tuple[int, str] | None:
+    """(index, text typed after the marker) of the last row of ``screen_rows`` that starts with ``marker``, else None."""
+    for index in range(len(rows) - 1, -1, -1):
+        typed = typed_text(rows[index][0], marker)
+        if typed is not None:
+            return index, typed
+    return None
+
+
+def composer_is_empty(rows: list[tuple[str, str]], marker_index: int, typed: str, closing_index: int) -> bool:
+    """True when nothing is typed in the composer that opens at ``marker_index`` and closes at ``closing_index``.
+
+    A multi-line draft can leave the marker row bare with its text on a following row, so every row from the marker
+    row to the closing row (the rule or status row under the composer) must be blank too; faint placeholder text and
+    braille animation cells do not count as text.
+    """
+    return (not typed and closing_index > marker_index
+            and all(not row_text(raw) for raw, _ in rows[marker_index + 1:closing_index]))

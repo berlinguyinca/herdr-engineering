@@ -11,6 +11,8 @@ TYPE_TO_SUBMIT_DELAY_S = 0.3
 
 WindowSource = Literal["recorded", "model_table", "fallback"]
 
+READY_STATUSES = frozenset({"idle", "done"})  # Herdr agent statuses in which a harness takes typed input
+
 
 class Harness(StrEnum):
     CLAUDE = "claude"
@@ -68,6 +70,8 @@ class HarnessAdapter(Protocol):
     harness: Harness
 
     def locate(self, pane_id: str, cwd: Path) -> SessionRef | None: ...
+
+    def locate_session(self, session_id: str | None, cwd: Path, pane_id: str) -> SessionRef | None: ...
 
     def read_context(self, ref: SessionRef) -> ContextReading | None: ...
 

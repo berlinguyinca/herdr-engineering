@@ -83,11 +83,25 @@ def test_pane_that_cannot_be_resolved_is_unknown_with_exit_0(tmp_path):
     assert json.loads(done.stdout) == {"unknown": True}
 
 
-@pytest.mark.parametrize("args", [
-    ["--harness", "nonsense", "--session-id", "x"],
-    ["--session-id", "x"],
-    ["--harness", "claude"],
+@pytest.mark.parametrize("args, flag", [
+    (["--harness", "nonsense", "--session-id", "x"], "--harness"),
+    (["--session-id", "x"], "--session-id"),
+    (["--harness", "claude"], "--harness"),
 ])
-def test_bad_flag_combinations_are_argparse_errors(tmp_path, args):
+def test_bad_flag_combinations_are_argparse_errors_naming_the_flag(tmp_path, args, flag):
     done = _run(tmp_path, *args)
     assert done.returncode == 2 and "usage:" in done.stderr
+    assert flag in done.stderr.split("usage:")[-1].split("error:")[-1]  # the error line, not just the usage synopsis
+
+
+@pytest.mark.parametrize("make_db", [
+    lambda db: db.write_text("this is not a database"),  # not sqlite
+    lambda db: db.mkdir(),                                # a directory where the database should be
+])
+def test_an_unreadable_database_is_unknown_with_exit_0(tmp_path, make_db):
+    db = tmp_path / ".local" / "share" / "opencode" / "opencode.db"
+    db.parent.mkdir(parents=True)
+    make_db(db)
+    done = _run(tmp_path, "--harness", "opencode", "--session-id", OPENCODE_SESSION, "--json")
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == {"unknown": True}

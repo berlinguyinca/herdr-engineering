@@ -21,7 +21,7 @@ missing. The fallback errs towards handing off early only for a model whose real
 | Corroboration (not used) | The statusline input JSON carries `context_window.context_window_size`; a cached copy written by the oh-my-claudecode HUD (`~/.claude/hud/cache/stdin.<session>.json`) shows 1,000,000 for `claude-sonnet-5-5`, which agrees with the catalogue. No `statusLine` is configured in `~/.claude/settings.json`, and the cache belongs to a third-party plugin and goes stale, so it is not read |
 | Checked, no window | `~/.claude.json` has no per-model window (`tengu_hawthorn_window`, 200000, is a feature flag with no model attached). No `[1m]` suffix appears in transcript model ids or in `requestedModel`; it is a model-setting suffix (the binary says to "append [1m] to the model name for 1M" and to set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` for a custom id), and the transcript records the bare id |
 | Compaction marker | a `system` record with `subtype: "compact_boundary"` (265 in the last 30 days); a usage entry before the latest one is stale, so there is no reading until the next reply |
-| Session id in Herdr | `herdr agent get <pane>`, `agent_session.kind == "id"`; the transcript is `<id>.jsonl` in the project directory, matched by id even when the pane cwd differs from the session directory |
+| Session id in Herdr | `herdr agent get <pane>`, `agent_session.kind == "id"`; the transcript is `<id>.jsonl` in the project directory, matched by id even when the pane cwd differs from the session directory. Without an id there is no session (`locate` returns None): the one transcript a project directory may hold can belong to an older session, and a wrong reading would trigger a false handoff |
 | Unconfirmed | (1) Whether `max_input_tokens` equals the effective window for a session whose model setting has no `[1m]`. For the 5.x models in use here it does: `claude-sonnet-5-5` sessions reached 966,904 tokens and `claude-opus-5-5` 568,085, so their window is above 200,000. For models not seen recently the catalogue (1,000,000 for `claude-opus-4-8`) and the table (200,000, from the autospec monitor) disagree, the adapter uses the smaller window unless the session's used tokens already exceed it, then the larger; nothing measures which is right. (2) Nothing measures which window a session really has for the three conflicting models below |
 
 Model ids seen in the last 30 days and how each resolves:
@@ -78,7 +78,7 @@ in `models.json` is the fix; until then they read high and a handoff comes early
 | Context size | latest assistant message `data.tokens.total` (input + output + reasoning + cache read + cache write). A reply that never completed records zeros and is skipped |
 | Window source | The database holds none (no column of `session` or `session_context_epoch`, and no field of `message.data`, names a window). OpenCode's config `~/.config/opencode/opencode.json`, `provider.<provider>.models.<model>.limit.context`, then its cached catalogue `~/.cache/opencode/models.json`, `<provider>.models.<model>.limit.context`; both `window_source='recorded'`. Else `MODEL_WINDOWS`, else 128,000 |
 | Compaction marker | an assistant message with `summary: true` and `mode: "compaction"`; after it there is no reading until the next reply |
-| Session id in Herdr | `agent_session.kind == "id"`; matched against `session.id` on its own, without comparing the session `directory` with the pane cwd. Without an id only an unambiguous top-level, unarchived session in the pane's cwd is used |
+| Session id in Herdr | `agent_session.kind == "id"`; matched against `session.id` on its own, without comparing the session `directory` with the pane cwd. Without an id there is no session (`locate` returns None; OpenCode reports no id until the first turn): the one session a cwd may hold can be an older one, and a wrong reading would trigger a false handoff |
 | Prompt, exit, compact | Prompt, exit and compact measured, see "Idle detection and exit" below. `agent_session` (kind `id`, a `ses_...` value) appears only after the first prompt, so `locate` finds no record before it |
 
 Model ids seen: `qwen3.8-27b`, `qwen3.8-27b-vision` (provider `metabolomics`), both `recorded`. Window unknown: none.
@@ -109,11 +109,19 @@ How each was used, and what was found:
   drops faint runs and Codex's braille animation cells and calls the prompt empty when nothing else follows the marker.
   Plain text (no colour codes) cannot tell a suggestion from typing, so there any text after the marker counts as typed; a caller
   must pass the ANSI screen. The suggestion text itself is not matched, because Claude Code's changes between runs.
+- **A multi-line draft can leave the marker row bare.** In a real Claude Code, Codex, Pi and OpenCode pane, a newline typed
+  into an empty composer (Ctrl+J; Alt+Enter in OpenCode) and then text gives a bare marker row with the text on the next row.
+  Claude Code and Codex used to read that as empty, so a controller would have typed into the user's draft.
+  `composer_is_empty` in `screen.py` now requires every row from the marker row to the composer's closing row to be blank:
+  the closing rule for Claude Code, the status row for Codex (found as the text block at the bottom of the screen, one spacer
+  row below the composer; with no spacer row the adapter says not ready). Pi (the editor is one blank row between two rules,
+  any text breaks that shape) and OpenCode (every `┃` input row must be bare or the placeholder) were already safe;
+  `screen_multiline.ansi` of each harness is the real capture that proves it.
 - **Pi** needed no logic change: stripping the colour codes leaves the blank-row-between-two-rules editor the adapter already matched.
 - **After a turn the screen was re-measured** (Claude Code, Codex, Pi, OpenCode, one real turn each). Claude Code, Codex and
   Pi keep their layout: Claude Code's empty composer is a bare `❯` (no suggestion) two rows above the bottom, Codex's is
   `› Ask Codex to do anything` with three rows below, Pi's editor is unchanged with two footer rows. So
-  `_LINES_BELOW_PROMPT` (4) and `_LINES_BELOW_EDITOR` hold. **OpenCode changed**: the placeholder is gone once a session has
+  the Claude Code and Codex row limits and `_LINES_BELOW_EDITOR` hold. **OpenCode changed**: the placeholder is gone once a session has
   a turn, so a placeholder-based check would never see an empty composer in a session that has had a turn. The adapter
   now finds the `╹▀` bottom edge of the prompt box (at most 4 non-blank rows below it: 3 in a fresh session, 1 after a
   turn), requires the row above it to be the agent/model row, and calls the box empty when every `┃` input row above that

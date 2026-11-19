@@ -5,15 +5,23 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
-from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput, WindowSource
+from .base import (
+    READY_STATUSES,
+    ContextReading,
+    ExitPlan,
+    Harness,
+    SessionRef,
+    TypedInput,
+    WindowSource,
+)
 from .herdr_session import herdr_session_id, is_safe_session_id
 from .records import records_newest_first
-from .screen import screen_rows, typed_text
+from .screen import composer_is_empty, last_marker_row, screen_rows
 from .windows import lookup_window, strip_date_suffix
 
 PROMPT_MARKER = "❯"  # the input box row of Claude Code between two rules, a faint suggestion after it when empty; live pane, 2.1.306, 2026-11-18
-_READY_STATUSES = frozenset({"idle", "done"})
-_LINES_BELOW_PROMPT = 4  # the closing rule and the status line(s); anything more means the box is not last
+_RULE = "─"  # the box is closed by a row of these
+_LINES_BELOW_CLOSING_RULE = 3  # the status line(s); anything more means the box is not last
 _SYNTHETIC_MODEL = "<synthetic>"  # zero-usage placeholder entries Claude Code writes for local events
 _USAGE_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")  # as handoff_context_hook
 
@@ -27,7 +35,9 @@ def _main_chain_usage(record: object) -> tuple[int, str | None] | None:
     if not isinstance(record, dict) or record.get("type") != "assistant" or record.get("isSidechain") is True:
         return None
     message = record.get("message")
-    usage = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(message, dict):
+        return None
+    usage = message.get("usage")
     if not isinstance(usage, dict) or message.get("model") == _SYNTHETIC_MODEL:
         return None
     model = message.get("model")
@@ -89,8 +99,10 @@ def _resolve_window(recorded: int | None, used: int, model: str | None) -> tuple
         return table, table_source
     if table_source == "fallback" or recorded == table:
         return recorded, "recorded"
-    smaller, larger = sorted(((recorded, "recorded"), (table, "model_table")))
-    return larger if used > smaller[0] else smaller
+    smaller, larger = sorted((recorded, table))
+    if used > smaller:
+        return larger, "recorded" if larger == recorded else "model_table"
+    return smaller, "recorded" if smaller == recorded else "model_table"
 
 
 class ClaudeAdapter:
@@ -101,16 +113,10 @@ class ClaudeAdapter:
         self._env = env  # environment for the herdr call; None inherits the process environment
 
     def locate_session(self, session_id: str | None, cwd: Path, pane_id: str) -> SessionRef | None:
-        directory = self._home / ".claude" / "projects" / _slug(cwd)
-        if session_id:
-            if not is_safe_session_id(session_id):
-                return None  # the id comes from outside; never let it leave the project directory
-            path = directory / f"{session_id}.jsonl"
-            return SessionRef(self.harness, pane_id, cwd, session_id, path) if path.is_file() else None
-        transcripts = sorted(directory.glob("*.jsonl"))
-        if len(transcripts) != 1:
-            return None
-        return SessionRef(self.harness, pane_id, cwd, transcripts[0].stem, transcripts[0])
+        if not is_safe_session_id(session_id):
+            return None  # no id from Herdr means unknown (a lone transcript may be an older session); the id comes from outside, never let it leave the project directory
+        path = self._home / ".claude" / "projects" / _slug(cwd) / f"{session_id}.jsonl"
+        return SessionRef(self.harness, pane_id, cwd, session_id, path) if path.is_file() else None
 
     def locate(self, pane_id: str, cwd: Path) -> SessionRef | None:
         return self.locate_session(herdr_session_id(pane_id, self._env), cwd, pane_id)
@@ -132,14 +138,16 @@ class ClaudeAdapter:
         return TypedInput(order, ("Enter",))
 
     def is_ready_for_input(self, screen: str, agent_status: str) -> bool:
-        if agent_status not in _READY_STATUSES:
+        if agent_status not in READY_STATUSES:
             return False
         rows = screen_rows(screen)  # Herdr's screen carries colour codes; the prompt's faint suggestion is not typed text
-        for index in range(len(rows) - 1, -1, -1):
-            typed = typed_text(rows[index][0], PROMPT_MARKER)
-            if typed is not None:
-                return not typed and len(rows) - 1 - index <= _LINES_BELOW_PROMPT
-        return False
+        marker = last_marker_row(rows, PROMPT_MARKER)
+        if marker is None:
+            return False
+        index, typed = marker
+        closing = next((i for i in range(index + 1, len(rows)) if set(rows[i][1]) == {_RULE}), None)
+        return (closing is not None and composer_is_empty(rows, index, typed, closing)
+                and len(rows) - 1 - closing <= _LINES_BELOW_CLOSING_RULE)
 
     def exit_plan(self) -> ExitPlan:
         return ExitPlan("/exit", ("Enter",), 15.0)

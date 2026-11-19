@@ -313,3 +313,22 @@ def test_the_start_of_this_process_is_found_under_a_non_english_locale():
 def test_open_files_are_optional(tmp_path):
     assert _open_files(os.getpid(), {"PATH": str(tmp_path)}) == []  # no lsof on the path: none known, not an error
     assert _open_files(2**22 + 12345, None) == []  # lsof fails for a pid that does not exist
+
+
+# A multi-line draft whose first row is empty: the marker row is bare and the text is on the next row. Real capture
+# (codex 0.169.0, 2026-11-18): Ctrl+J in an empty composer, then "second line typed"; nothing was submitted. Redacted.
+MULTILINE = (FIXTURES / "screen_multiline.ansi").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("status", ["idle", "done"])
+def test_real_multiline_composer_with_an_empty_first_row_is_not_ready(status):
+    assert not CodexAdapter().is_ready_for_input(MULTILINE, status)
+
+
+def test_a_draft_after_blank_rows_is_not_ready():
+    screen = f"output\n{PROMPT_MARKER} \n\n\n  draft\n\n  gpt-5-codex low · ~/work\n  ? for shortcuts\n"
+    assert not CodexAdapter().is_ready_for_input(screen, "idle")
+
+
+def test_a_composer_followed_at_once_by_text_and_no_spacer_row_is_not_ready():
+    assert not CodexAdapter().is_ready_for_input(f"output\n{PROMPT_MARKER} \n  draft\n  gpt-5-codex low · ~/work\n", "idle")

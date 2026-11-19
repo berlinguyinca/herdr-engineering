@@ -8,6 +8,8 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -232,14 +234,11 @@ def test_locate_session_picks_by_id_never_the_latest_session(tmp_path):
     assert adapter.locate_session("ses_missing", CWD, "w1:p1") is None
 
 
-def test_locate_session_without_id_needs_exactly_one_session_in_the_cwd(tmp_path):
+def test_locate_session_without_id_is_none_even_with_one_session_in_the_cwd(tmp_path):
+    """A lone session in the cwd may be an older one; without an id from Herdr the session is unknown."""
     db = _install(tmp_path)
     adapter = OpenCodeAdapter(home=tmp_path, env={})
-    assert adapter.locate_session(None, CWD, "w1:p1").session_id == SESSION
-    assert adapter.locate_session(None, Path("/home/user/elsewhere"), "w1:p1") is None
-    _session(db, "ses_sub", str(CWD), parent=SESSION)  # a subagent session does not count
-    _session(db, "ses_old", str(CWD), archived=5)       # nor an archived one
-    assert adapter.locate_session(None, CWD, "w1:p1").session_id == SESSION
+    assert adapter.locate_session(None, CWD, "w1:p1") is None
     _session(db, OTHER, str(CWD))
     assert adapter.locate_session(None, CWD, "w1:p1") is None
 
@@ -316,20 +315,17 @@ def test_database_is_not_left_locked_after_reads(tmp_path):
     locker.close()
 
 
-def test_locate_without_herdr_on_path_falls_back_to_the_one_session_in_the_cwd(tmp_path):
-    db = _install(tmp_path)
+def test_locate_without_herdr_on_path_is_none_even_with_one_session_in_the_cwd(tmp_path):
+    _install(tmp_path)
     empty = tmp_path / "empty-bin"
     empty.mkdir()
     adapter = OpenCodeAdapter(home=tmp_path, env={"PATH": str(empty)})  # a real environment with no herdr on PATH
-    assert adapter.locate("w1:p1", CWD) == SessionRef(Harness.OPENCODE, "w1:p1", CWD, SESSION, db)
-    _session(db, OTHER, str(CWD))
-    assert adapter.locate("w1:p1", CWD) is None  # two sessions and no id from Herdr: refuse to guess
+    assert adapter.locate("w1:p1", CWD) is None  # no id from Herdr: unknown, not the lone session in the cwd
 
 
 @pytest.mark.skipif(shutil.which("herdr") is None, reason="needs the real herdr binary")
-def test_locate_with_a_pane_herdr_does_not_know_refuses_to_guess_between_sessions(tmp_path):
-    db = _install(tmp_path)
-    _session(db, OTHER, str(CWD))
+def test_locate_with_a_pane_herdr_does_not_know_is_none(tmp_path):
+    _install(tmp_path)
     env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path)}
     assert OpenCodeAdapter(home=tmp_path, env=env).locate("w0:p0", CWD) is None
 
@@ -414,14 +410,19 @@ def test_session_id_resolves_even_when_its_directory_differs_from_the_pane_cwd(t
     assert ref == SessionRef(Harness.OPENCODE, "w1:p1", moved, SESSION, db)
 
 
-def test_relative_xdg_data_home_is_resolved_not_raised(tmp_path, monkeypatch):
+def test_relative_xdg_data_home_is_resolved_not_raised(tmp_path):
     (tmp_path / "rel" / "opencode").mkdir(parents=True)
     _build(tmp_path / "rel" / "opencode" / "opencode.db")
-    monkeypatch.chdir(tmp_path)  # a relative path is taken against the working directory
-    adapter = OpenCodeAdapter(home=tmp_path / "elsewhere", env={"XDG_DATA_HOME": "rel"})
-    ref = adapter.locate_session(SESSION, CWD, "w1:p1")
-    assert ref is not None
-    assert adapter.read_context(ref).used_tokens == 54542
+    # a relative path is taken against the working directory: run a real process whose working directory is tmp_path
+    script = ("from pathlib import Path\n"
+              "from herdr_engineering.handoff_adapters.opencode import OpenCodeAdapter\n"
+              f"adapter = OpenCodeAdapter(home=Path('elsewhere'), env={{'XDG_DATA_HOME': 'rel'}})\n"
+              f"ref = adapter.locate_session({SESSION!r}, Path('/home/user/work'), 'w1:p1')\n"
+              "print(adapter.read_context(ref).used_tokens)\n")
+    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, cwd=tmp_path, timeout=60,
+                          env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)})
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "54542"
 
 
 def test_total_of_zero_with_parts_sums_the_parts(tmp_path):
@@ -513,3 +514,12 @@ def test_update_dialog_over_the_prompt_is_not_ready(status):
     # the placeholder still shows behind the dialog, but the dialog takes the keys
     assert PROMPT_PLACEHOLDER in strip_ansi(UPDATE_DIALOG)
     assert not OpenCodeAdapter().is_ready_for_input(UPDATE_DIALOG, status)
+
+
+# Real capture (opencode 1.18.23, 2026-11-18): Alt+Enter in an empty prompt box, then "second line typed"; nothing was
+# submitted. The box grew a row and the text is below a bare `┃` row. Redacted. Every input row must be blank or the placeholder.
+MULTILINE = (FIXTURES / "screen_multiline.ansi").read_text(encoding="utf-8")
+
+
+def test_real_multiline_prompt_box_with_an_empty_first_row_is_not_ready():
+    assert not OpenCodeAdapter().is_ready_for_input(MULTILINE, "idle")

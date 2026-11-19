@@ -1,7 +1,14 @@
 """Reading coloured pane rows: the faint suggestion after a prompt marker is not typed text."""
 import pytest
 
-from herdr_engineering.handoff_adapters.screen import screen_rows, strip_ansi, typed_text
+from herdr_engineering.handoff_adapters.screen import (
+    composer_is_empty,
+    last_marker_row,
+    row_text,
+    screen_rows,
+    strip_ansi,
+    typed_text,
+)
 
 ESC = "\x1b"
 
@@ -56,3 +63,33 @@ def test_strip_ansi_removes_colon_and_private_parameter_sequences():
 def test_typed_text_survives_a_numeric_parameter_longer_than_pythons_int_limit():
     row = "\x1b[" + "9" * 5000 + "m› hello\x1b[0m"
     assert typed_text(row, "›") == "hello"
+
+
+def test_row_text_drops_faint_runs_and_braille_cells():
+    assert row_text(f"  {ESC}[2mfaint{ESC}[0m ⠁⡀ typed ") == "typed"
+    assert row_text(f"{ESC}[2mfaint{ESC}[0m") == ""
+
+
+def test_last_marker_row_is_the_lowest_row_with_the_marker():
+    rows = screen_rows(f"❯ old\nout\n❯{ESC}[2m suggestion{ESC}[0m\nfooter\n")
+    assert last_marker_row(rows, "❯") == (2, "")
+    assert last_marker_row(rows, "›") is None
+
+
+@pytest.mark.parametrize("screen, expected", [
+    ("❯ \n\n─\n", True),
+    (f"❯ {ESC}[2msuggestion{ESC}[0m\n─\n", True),
+    ("❯ \n  text\n─\n", False),  # the draft is on a row after a bare marker row
+    ("❯ \n\n\n  text\n─\n", False),
+    ("❯ text\n─\n", False),
+])
+def test_composer_is_empty_needs_every_row_up_to_the_closing_row_blank(screen, expected):
+    rows = screen_rows(screen)
+    index, typed = last_marker_row(rows, "❯")
+    closing = next(i for i in range(index + 1, len(rows)) if rows[i][1] == "─")
+    assert composer_is_empty(rows, index, typed, closing) is expected
+
+
+def test_composer_is_not_empty_when_the_closing_row_is_not_below_the_marker():
+    rows = screen_rows("─\n❯ \n")
+    assert not composer_is_empty(rows, 1, "", 0)
