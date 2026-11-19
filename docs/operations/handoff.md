@@ -49,7 +49,7 @@ planner-worker feature and keeps its name; in Pi use the skill (`/skill:handoff`
 * Transport: reuse, not fork. The skill runs `herdr-handoff create ... --from-json -` then
   `herdr-handoff takeover`; `/herdr::to*` runs the same two calls with an explicit target. The envelope is
   `schema_version` 2 (additive, `schemas/handoff-v2.schema.json` in herdr-handoff, which needs
-  herdr-handoff 0.4.0 or newer: the skill checks `herdr-handoff --version`). The handover writes the full
+  herdr-handoff 0.5.0 or newer: the skill checks `herdr-handoff --version`). The handover writes the full
   handoff as a markdown document and starts the harness with a one-line prompt telling it to read that
   absolute path first.
 * Handover, not duplication: `herdr-handoff takeover` starts the successor in the **same tab** as the
@@ -254,10 +254,10 @@ pane below it. It is on by default for every session. It is one process, `herdr-
 all sessions once every 5 seconds (`--interval` changes that; `--once` runs one tick and exits). It skips the pane it runs
 in and any side pane, and it only acts on an agent that Herdr names `claude`, `codex`, `pi` or `opencode`.
 
-This replaces the older per-harness automatic triggers. Those policies (the opt-in `context-hook`, and any Pi or
-OpenCode equivalents) are retired by plan 5 in the same release and must not run alongside the controller: two things
-typing a handoff order into one session would hand it off twice. Until plan 5 ships, do not run the controller on a
-host that has one of them installed.
+This replaces the older per-harness automatic triggers: the 50% `context-hook` and autospec's tmux context monitor for Herdr
+panes are gone, so nothing else types a handoff order into a session. See
+[handoff-auto-triggers.md](handoff-auto-triggers.md#upgrading) for the one-time upgrade and for what a pane with the controller
+switched off gets (no automatic policy).
 
 ### When it acts
 

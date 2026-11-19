@@ -1,24 +1,57 @@
-# Automatic handoff triggers (design note, opt-in, not installed)
+# Automatic handoff: one policy
 
-`/handoff` is manual only. Nothing in this repository edits any user settings, hooks or config.
-This note records how a user could opt in to automatic triggers later, and what is not verified.
+The automatic handoff controller (`herdr-eng handoff controller run`, described in
+[handoff.md](handoff.md#automatic-handoff-controller)) is the only thing that decides when a session hands off. It
+watches Claude Code, Codex, Pi and OpenCode sessions that Herdr reports and acts at 80 percent of the context window, with a per-session
+switch (`herdr-eng handoff auto off|on`) and a global one (`HERDR_HANDOFF_AUTO=0`). The `/handoff` skill stays for people who
+hand off by hand.
 
-**Superseded by the controller.** The handoff controller (`herdr-eng handoff controller run`, described in
-[handoff.md](handoff.md#automatic-handoff-controller)) triggers a handoff for all four harnesses at 80 percent of the
-context window, with a per-session switch (`herdr-eng handoff auto off|on`, or `HERDR_HANDOFF_AUTO=0`). The per-harness
-mechanisms below are retired by plan 5 in the same release and must not run alongside the controller. This note stays as the
-record of what was measured.
+Two older policies are gone:
 
-All of these would run the same two calls the skill runs (`herdr-handoff create`, then `launch`),
-or ask the agent to run `/handoff`. A hook cannot compose the briefing itself: the briefing needs
-the agent's judgement, so a hook should only *prompt* the agent or write a minimal envelope.
+* the 50 percent `UserPromptSubmit` reminder (`herdr-eng handoff context-hook claude`) and the `/handoff` text in the
+  managed `SessionStart` and `PreCompact` hooks of `herdr-eng workflow install`;
+* autospec's tmux context monitor (50 percent compact, 80 percent rollover) for sessions started from a Herdr pane.
+
+No hook of this repository asks an agent to run `/handoff` because of context size any more, and nothing in this repository
+edits user settings except the installers the user runs.
+
+## Upgrading
+
+Run both once, on each host:
+
+```
+herdr-eng handoff auto install
+herdr-eng workflow install
+```
+
+They remove the old entries from `~/.claude/settings.json` (and add the current ones), each with a backup, atomically, and
+only for a command that carries our marker (`herdr-handoff-auto` plus `handoff context-hook`, or `herdr-workflow:managed`
+plus `workflow hook PreCompact`). Foreign hooks and hand-edited entries stay. A second run changes nothing. Nothing runs this
+migration on its own; `scripts/install.sh` runs both. `herdr-eng handoff auto check` reports a still-installed old hook as
+`stale` with the command to fix it, and `herdr-eng workflow doctor` reports the old `PreCompact` entry as drift.
+
+Until you do, the old commands are harmless: `herdr-eng handoff context-hook <anything>` and `herdr-eng workflow hook PreCompact`
+are a silent no-op (they read stdin, print nothing, exit 0), so a session with the old hooks installed is not disturbed and no
+longer gets a reminder.
+
+autospec's monitor skips a session that was started from a Herdr pane (`AUTOSPEC_CONTEXT_MONITOR_SKIP_HERDR`, default on).
+The skip is keyed on `HERDR_PANE_ID` being set in the session's environment: a shell where it is unset, such as a remote shell
+that reaches a host over ssh, is not a Herdr session to the monitor and keeps the old behaviour. The consequence for a Herdr pane
+whose controller is switched off (`herdr-eng handoff auto off`, or `HERDR_HANDOFF_AUTO=0`): the monitor stays off for that pane
+too, so such a pane has no automatic policy at all and only a person's `/handoff` moves it. Outside Herdr (plain tmux) the
+monitor is unchanged.
+
+## Mechanisms measured for each harness (record)
+
+These were the options looked at before the controller; the controller does not use hooks to trigger. What is not verified is
+noted.
 
 | Harness | Mechanism | What is known | Not verified |
 | --- | --- | --- | --- |
 | Claude Code | `PreCompact` hook in `settings.json` (matcher `manual` / `auto`) | Hooks run a command with JSON on stdin (transcript path, trigger) before compaction; a hook can run `herdr-eng summary history --json --session <id>` read-only. | Whether hook stdout can inject context before compaction in the user's version. |
 | Codex | auto-compaction (`auto_compact` style settings in `config.toml`) | Codex compacts by token limit; the rollout records a `compacted` record and the context size as `last_token_usage.total_tokens` (measured, see [capabilities](handoff-harness-capabilities.md#codex)). | Any pre-compaction hook; check `codex --help` and the config reference before relying on it. |
 | OpenCode | plugin events (session compaction) | OpenCode has a plugin system with session events. | The exact event name and whether it fires before compaction. |
-| Pi | `contextHandoffTrigger` in pi-engineering | Pi already has a context-handoff trigger. | Its threshold semantics; Pi's built-in `/handoff` stays a separate planner-worker feature. |
+| Pi | `contextHandoffTrigger` in pi-engineering | Pi already has a context-handoff trigger. | Its threshold semantics; Pi's built-in `/handoff` stays a separate planner-worker feature. That trigger lives in pi-engineering, not in this repository, so this repository installs and removes nothing for Pi or OpenCode; do not run it next to the controller. |
 
 ## Context size and window (measured)
 
@@ -32,12 +65,6 @@ Settled by measurement on 2026-11-18; the field names, sources and model ids are
 * OpenCode: the database holds no window; OpenCode's config, then its cached catalogue, list `limit.context`.
 
 Still not verified, measured by Task 7: how to detect an input-ready prompt in each harness, and each harness's exit command and timeout.
-
-Guidance if enabling any of them:
-
-* Keep the trigger idempotent: key by session id and skip when a handoff for the session is already `queued`.
-* Prefer a warning ("context 80% full, run /handoff") to an unattended launch; a launch opens a new agent that spends tokens.
-* Never let a hook write settings itself; an opt-in snippet belongs in the user's own config under their review.
 
 ## Subagent registry hooks (installed by default)
 
