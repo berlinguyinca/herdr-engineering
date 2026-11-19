@@ -103,9 +103,16 @@ def test_session_start_reminder_is_short_and_covers_defaults():
     assert run_hook("SessionStart")["hookSpecificOutput"]["hookEventName"] == "SessionStart"
 
 
-def test_precompact_only_prompts_for_handoff():
+def test_session_start_says_not_to_ask_about_settled_choices():
+    ctx = run_hook("SessionStart")["hookSpecificOutput"]["additionalContext"].lower()
+    assert "do not ask the user about choices these defaults already settle" in ctx
+    assert "run /handoff yourself, without asking" in ctx
+
+
+def test_precompact_instructs_agent_to_handoff_without_asking():
     msg = run_hook("PreCompact")["systemMessage"]
-    assert "/handoff" in msg and "herdr-handoff create" not in msg
+    assert "Run /handoff yourself" in msg and "without asking" in msg
+    assert "background subagents" in msg and "herdr-handoff create" not in msg
 
 
 def test_hook_never_fails_on_bad_input():

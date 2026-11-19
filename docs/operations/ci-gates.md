@@ -8,34 +8,23 @@ checkout without touching CI.
 |---|---|---|---|---|
 | `structural-gates` | `.woodpecker/structural-gates.yml` | `scripts/ci/structural-gates.sh` | **always** | ~1.5 s |
 | `artifact-handoff` | `.woodpecker/artifact-handoff.yml` | `scripts/ci/artifact-handoff-gates.sh` | **always** | ~1 min |
-| `unit-gates` | `.woodpecker/unit-gates.yml` | `scripts/ci/unit-gates.sh` | **only when code changes** (path filter) | ~55 min |
-| `ui-gates` | `.woodpecker/ui-gates.yml` | `scripts/ci/ui-gates.sh` | **only when UI code changes** (path filter) | ~15 min |
+| `unit-gates` | `.woodpecker/unit-gates.yml` | `scripts/ci/unit-gates.sh` | **always** (`applicability` step skips in seconds when no covered path changed) | ~55 min, seconds when skipped |
+| `ui-gates` | `.woodpecker/ui-gates.yml` | `scripts/ci/ui-gates.sh` | **always** (`applicability` step skips in seconds when no UI path changed) | ~15 min, seconds when skipped |
 
 `structural-gates` is also the only pipeline that triggers on `event: push, branch: main`.
 
 ## The path filter, and the trap it sets
 
-`unit-gates` and `ui-gates` restrict their `pull_request` trigger with a `path:` include list:
+A Woodpecker `when: {path: {include: [...]}}` filter means the pipeline is never **created** on a pull request that touches none of
+those paths, so its `ci/woodpecker/pr/<name>` context never reports. GitHub waits for a required check that never reports, so a
+path-filtered check made *required* parks every unrelated pull request on *Expected - Waiting for status to be reported*.
 
-```yaml
-when:
-  - event: manual
-  - event: pull_request
-    path:
-      include: ['herdr_engineering/**', 'tests/**', 'packages/**', 'pyproject.toml', 'scripts/ci/unit-gates.sh', '.woodpecker/unit-gates.yml']
-```
-
-The intent is stated above the filter: a push to a PR branch must not build twice. The consequence is that **a documentation-only
-pull request never runs `unit-gates` at all** - it reports `artifact-handoff` and nothing else.
-
-That matters the moment a check is made *required* for merge. GitHub waits for a required check that will never be reported, so a
-path-filtered check made required would park every documentation pull request on *Expected — Waiting for status to be reported*
-with no way to satisfy it. **Only `structural-gates` and `artifact-handoff` are safe to require as things stand**, because those two
-are the only ones that report on every pull request.
-
-To require `unit-gates`, first make it always report - trigger it unconditionally and skip fast inside `scripts/ci/unit-gates.sh`
-when the diff is documentation-only. Do not solve the hang by removing the path filter alone; that makes every documentation change
-pay ~55 minutes.
+`unit-gates` (#719) and `ui-gates` no longer have a path filter. Both trigger on every `pull_request` (and `manual`) and an
+`applicability` step runs `scripts/ci/unit-gates-applicable.sh [unit|ui]`, which diffs the PR against its merge base and exits
+0 (run the gate), 3 (no covered path changed: drop `.ci-<gate>-not-applicable`; the gate step exits 0 in seconds saying why) or
+fails the pipeline. It fails open: a diff it cannot work out runs the gate. The covered paths live in that one script (the `unit` and
+`ui` cases); a manual run (read from `CI_PIPELINE_EVENT`, falling back to legacy `CI_EVENT`) always runs the gate. **All four pipelines now report on every pull request, so all four are safe to
+require.** Do not reintroduce a `path:` filter in a pipeline whose context is required.
 
 ## Why `main` is gated by `structural-gates` and not by `unit-gates`
 

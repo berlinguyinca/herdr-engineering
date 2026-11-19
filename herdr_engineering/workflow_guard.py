@@ -1,7 +1,8 @@
 """Pure decision functions for the managed ``PreToolUse`` guard hook.
 
 ``decide(payload)`` returns ``None`` (no opinion) or ``(decision, reason)`` where decision is
-``"deny"`` or ``"ask"``.  It never touches the network and fails open: any unexpected input or
+``"deny"`` or ``"ask"`` (``"ask"`` is internal: ``decide`` turns it into a deny unless the one-shot
+override token exists, because ``ask`` is not prompted in Claude Code auto permission mode).  It never touches the network and fails open: any unexpected input or
 internal error yields ``None``.  The only side effect is a short-timeout local ``git`` call to
 read the current branch / ``origin`` URL.
 """
@@ -19,16 +20,50 @@ _PROTECTED = {"main", "master"}
 _SEPARATORS = {"&&", "||", ";", "|", "&"}
 _SCRATCHPAD = re.compile(r"^/(?:private/)?tmp/claude-\d+(?:/|$)")
 _GIT_TIMEOUT_S = 1.0
+ALLOW_PUSH_ENV = "HERDR_WORKFLOW_ALLOW_PUSH"
+""" Env var overriding the one-shot push-approval token path (tests, nonstandard state dirs). """
 
 Decision = tuple[str, str]
 
 TMP_REASON = ("Writing scratch files under /tmp is not allowed. Use a gitignored project directory "
               "such as .<project>/<topic>/ instead (the Claude Code harness scratchpad under "
               "/tmp/claude-<id>/ is the only exception).")
+TOKEN_REASON = ("The push-approval token is for the human only: ask the user to run it with the `!` "
+                "prefix. Creating or editing it yourself defeats the guard.")
 MAIN_REASON = "Pushing to main/master is blocked. Push a feature branch and open a PR instead."
 HERDR_REASON = "pushing herdr-engineering needs explicit user approval"
 UNKNOWN_REASON = ("Cannot tell which repository or branch this push targets (unresolved cd). "
                   "Confirm it does not push to main/master.")
+
+
+def allow_push_path() -> str:
+    """Token file the human creates (``! touch <path>``) to approve exactly one guarded push."""
+    return os.environ.get(ALLOW_PUSH_ENV) or os.path.join(
+        os.path.expanduser("~"), ".local", "state", "herdr-engineering", "allow-push")
+
+
+def _push_denial(reason: str) -> str:
+    return (f"{reason}. Ask the user to run `! touch {allow_push_path()}` (the `!` prefix runs it in "
+            "this session), then retry the push once. The approval is one-shot. Do not create that "
+            "file yourself.")
+
+
+def _consume_token() -> bool:
+    try:
+        os.unlink(allow_push_path())
+    except OSError:
+        return False
+    return True
+
+
+def _mentions_token(command: str) -> bool:
+    path = allow_push_path()
+    home = os.path.expanduser("~")
+    forms = {path, "herdr-engineering/allow-push"}
+    if path.startswith(home + os.sep):
+        rel = path[len(home):]
+        forms |= {"~" + rel, "$HOME" + rel, "${HOME}" + rel}
+    return any(f in command for f in forms)
 
 
 def _norm(path: str, cwd: str) -> str:
@@ -38,6 +73,8 @@ def _norm(path: str, cwd: str) -> str:
 
 def check_write_path(path: str, cwd: str) -> Decision | None:
     full = _norm(path, cwd)
+    if full == _norm(allow_push_path(), cwd):
+        return "deny", TOKEN_REASON
     if full == "/private/tmp" or full.startswith("/private/tmp/"):
         full = full[len("/private"):]
     if full != "/tmp" and not full.startswith("/tmp/"):
@@ -296,7 +333,14 @@ def decide(payload: object) -> Decision | None:
             return check_write_path(path, cwd) if isinstance(path, str) and path else None
         if tool == "Bash":
             command = inp.get("command")
-            return check_bash(command, cwd) if isinstance(command, str) else None
+            if not isinstance(command, str):
+                return None
+            if _mentions_token(command):
+                return "deny", TOKEN_REASON
+            result = check_bash(command, cwd)
+            if result and result[0] == "ask":
+                return None if _consume_token() else ("deny", _push_denial(result[1]))
+            return result
     except Exception:  # a guard must fail open
         return None
     return None

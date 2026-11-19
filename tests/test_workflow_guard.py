@@ -43,6 +43,14 @@ def decision(res):
     return out["permissionDecision"] if out else None
 
 
+@pytest.fixture(autouse=True)
+def token(tmp_path, monkeypatch):
+    """The one-shot push-approval token lives under tmp_path (the guard denies /tmp on Linux CI)."""
+    path = tmp_path / "state" / "allow-push"
+    monkeypatch.setenv("HERDR_WORKFLOW_ALLOW_PUSH", str(path))
+    return path
+
+
 @pytest.fixture
 def feature(tmp_path):
     return make_repo(tmp_path / "feat", "feat/x")
@@ -145,12 +153,12 @@ def test_push_outside_a_repo_with_no_refspec_is_allowed(tmp_path):
 # ---- rule 3: herdr-engineering needs approval -----------------------------------------
 @pytest.mark.parametrize("url", ["git@github.com:berlinguyinca/herdr-engineering.git",
                                  "https://github.com/berlinguyinca/herdr-engineering"])
-def test_herdr_engineering_push_asks(url, tmp_path):
+def test_herdr_engineering_push_denied(url, tmp_path):
     repo = make_repo(tmp_path / "he", "feat/z", origin=url)
     res = bash("git push -u origin feat/z", repo)
-    assert decision(res) == "ask"
+    assert decision(res) == "deny"
     assert "herdr-engineering needs explicit user approval" in res[2]["permissionDecisionReason"]
-    assert decision(bash("git push", repo)) == "ask"
+    assert decision(bash("git push", repo)) == "deny"
 
 
 def test_herdr_engineering_push_to_main_is_denied_not_asked(tmp_path):
@@ -160,8 +168,8 @@ def test_herdr_engineering_push_to_main_is_denied_not_asked(tmp_path):
 
 def test_herdr_engineering_via_dash_c_and_chain(tmp_path, feature):
     repo = make_repo(tmp_path / "he", "feat/z", origin="git@github.com:b/herdr-engineering.git")
-    assert decision(bash(f"git -C {repo} push origin feat/z", feature)) == "ask"
-    assert decision(bash("true && git push origin feat/x", repo)) == "ask"
+    assert decision(bash(f"git -C {repo} push origin feat/z", feature)) == "deny"
+    assert decision(bash("true && git push origin feat/x", repo)) == "deny"
 
 
 def test_other_remote_feature_push_allowed(feature):
@@ -293,7 +301,7 @@ def test_multiline_message_with_unbalanced_quote_fails_open(feature):
 
 def test_head_push_to_herdr_engineering_feature_asks(tmp_path):
     repo = make_repo(tmp_path / "he", "feat/z", origin="git@github.com:b/herdr-engineering.git")
-    assert decision(bash("git push -u origin HEAD", repo)) == "ask"
+    assert decision(bash("git push -u origin HEAD", repo)) == "deny"
 
 
 # ---- shell redirections are not refspecs ------------------------------------------------
@@ -328,7 +336,7 @@ def test_ampersand_in_redirect_does_not_hide_a_second_push(on_main):
 @pytest.mark.parametrize("redir", ["2>&1", ">/dev/null", "&>log"])
 def test_herdr_engineering_ask_survives_redirect(redir, tmp_path):
     repo = make_repo(tmp_path / "he", "feat/z", origin="git@github.com:b/herdr-engineering.git")
-    assert decision(bash(f"git push origin feat/z {redir}", repo)) == "ask"
+    assert decision(bash(f"git push origin feat/z {redir}", repo)) == "deny"
 
 
 # ---- heredocs, multi-line quotes, continuations, untokenizable input --------------------
@@ -382,9 +390,9 @@ def test_untokenizable_push_to_main_denied(cmd, feature):
     assert decision(bash(cmd, feature)) == "deny"
 
 
-def test_untokenizable_herdr_engineering_push_asks(tmp_path):
+def test_untokenizable_herdr_engineering_push_denied(tmp_path):
     repo = make_repo(tmp_path / "he", "feat/z", origin="git@github.com:b/herdr-engineering.git")
-    assert decision(bash("git push origin feat/z 'unterminated", repo)) == "ask"
+    assert decision(bash("git push origin feat/z 'unterminated", repo)) == "deny"
 
 
 def test_untokenizable_non_push_and_feature_push_allowed(feature):
@@ -416,13 +424,13 @@ def test_cd_chain_and_dash_c_override(on_main, feature, tmp_path):
 
 def test_cd_to_herdr_engineering_repo_asks(tmp_path, feature):
     repo = make_repo(tmp_path / "he", "feat/z", origin="git@github.com:b/herdr-engineering.git")
-    assert decision(bash(f"cd {repo} && git push origin feat/z", feature)) == "ask"
+    assert decision(bash(f"cd {repo} && git push origin feat/z", feature)) == "deny"
 
 
 def test_unknown_cd_target_makes_bare_and_head_pushes_ask(feature, tmp_path):
     for cd in ("cd /no/such/dir", "cd -", "cd $SOMEWHERE"):
-        assert decision(bash(f"{cd} && git push", feature)) == "ask"
-        assert decision(bash(f"{cd} && git push -u origin HEAD", feature)) == "ask"
+        assert decision(bash(f"{cd} && git push", feature)) == "deny"
+        assert decision(bash(f"{cd} && git push -u origin HEAD", feature)) == "deny"
         assert decision(bash(f"{cd} && git push origin main", feature)) == "deny"
         assert decision(bash(f"{cd} && git push origin feat/x", feature)) is None
 
@@ -475,7 +483,91 @@ def test_bash_c_bare_push_on_main_denied_and_uses_effective_cwd(on_main, feature
     assert decision(bash(f"cd {on_main} && bash -c 'git push'", feature)) == "deny"
 
 
-def test_wrapped_herdr_engineering_push_asks(tmp_path):
+def test_wrapped_herdr_engineering_push_denied(tmp_path):
     repo = make_repo(tmp_path / "he", "feat/z", origin="git@github.com:b/herdr-engineering.git")
-    assert decision(bash("(env A=1 git push origin feat/z)", repo)) == "ask"
-    assert decision(bash("bash -c 'git push origin feat/z'", repo)) == "ask"
+    assert decision(bash("(env A=1 git push origin feat/z)", repo)) == "deny"
+    assert decision(bash("bash -c 'git push origin feat/z'", repo)) == "deny"
+
+
+# ---- one-shot human override for guarded pushes ----------------------------------------
+def herdr_repo(tmp_path):
+    return make_repo(tmp_path / "he", "feat/z", "git@github.com:acme/herdr-engineering.git")
+
+
+def test_guarded_push_deny_reason_tells_agent_how_to_get_approval(tmp_path, token):
+    rc, _, out = bash("git push origin feat/z", herdr_repo(tmp_path))
+    assert out["permissionDecision"] == "deny"
+    assert f"! touch {token}" in out["permissionDecisionReason"]
+
+
+def test_unknown_cwd_push_deny_reason_names_token(feature, token):
+    rc, _, out = bash("cd - && git push", feature)
+    assert out["permissionDecision"] == "deny"
+    assert f"! touch {token}" in out["permissionDecisionReason"]
+
+
+def test_token_allows_one_push_then_is_consumed(tmp_path, token):
+    repo = herdr_repo(tmp_path)
+    token.parent.mkdir(parents=True)
+    token.touch()
+    assert decision(bash("git push origin feat/z", repo)) is None
+    assert not token.exists()
+    assert decision(bash("git push origin feat/z", repo)) == "deny"
+
+
+def test_token_allows_unknown_cwd_push(feature, token):
+    token.parent.mkdir(parents=True)
+    token.touch()
+    assert decision(bash("cd - && git push", feature)) is None
+    assert not token.exists()
+
+
+def test_token_does_not_override_main_push_and_is_kept(on_main, token):
+    token.parent.mkdir(parents=True)
+    token.touch()
+    assert decision(bash("git push origin main", on_main)) == "deny"
+    assert token.exists()
+
+
+def test_token_not_consumed_by_unguarded_push(feature, token):
+    token.parent.mkdir(parents=True)
+    token.touch()
+    assert decision(bash("git push origin feat/x", feature)) is None
+    assert token.exists()
+
+
+@pytest.mark.parametrize("tool,key", [("Write", "file_path"), ("Edit", "file_path"),
+                                      ("MultiEdit", "file_path"), ("NotebookEdit", "notebook_path")])
+def test_agent_cannot_write_the_token(tool, key, token, tmp_path):
+    for path in (str(token), str(token.parent / ".." / "state" / "allow-push")):
+        res = call({"tool_name": tool, "tool_input": {key: path}, "cwd": str(tmp_path)})
+        assert decision(res) == "deny"
+        assert "push-approval token" in res[2]["permissionDecisionReason"]
+    assert not token.exists()
+
+
+def test_relative_token_write_denied(token):
+    res = call({"tool_name": "Write", "tool_input": {"file_path": "allow-push"}, "cwd": str(token.parent)})
+    assert decision(res) == "deny"
+    assert "push-approval token" in res[2]["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("fmt", ["touch {t}", "echo > {t}", "python -c \"open('{t}','w')\""])
+def test_bash_referencing_token_is_denied(fmt, token, tmp_path):
+    res = bash(fmt.format(t=token), tmp_path)
+    assert decision(res) == "deny"
+    assert "push-approval token" in res[2]["permissionDecisionReason"]
+    assert not token.exists()
+
+
+def test_bash_home_forms_of_default_token_denied(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERDR_WORKFLOW_ALLOW_PUSH")
+    for cmd in ("touch ~/.local/state/herdr-engineering/allow-push",
+                "touch $HOME/.local/state/herdr-engineering/allow-push"):
+        assert decision(bash(cmd, tmp_path)) == "deny"
+
+
+def test_unrelated_bash_and_writes_unaffected(tmp_path):
+    assert decision(bash("ls", tmp_path)) is None
+    res = call({"tool_name": "Write", "tool_input": {"file_path": "/home/dev/proj/x"}, "cwd": "/home/dev/proj"})
+    assert decision(res) is None
