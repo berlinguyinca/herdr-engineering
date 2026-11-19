@@ -32,6 +32,10 @@
 #      (SessionStart reminder, PreCompact /handoff prompt) via
 #      `herdr-eng workflow install`; opt out with --no-workflow-hooks or
 #      HERDR_INSTALL_WORKFLOW_HOOKS=0. Skipped when Claude Code is absent.
+#   (default on) step 7c2 registers the managed SubagentStart/SubagentStop hooks
+#      (the registry of running background agents per pane) via
+#      `herdr-eng handoff auto install --subagents-only`; opt out with
+#      --no-subagent-hooks or HERDR_INSTALL_SUBAGENT_HOOKS=0.
 #   (default on) step 7d installs/updates berlinguyinca/screenwright, tracking
 #      origin/main (not pinned), and links its screenwright-review skill via
 #      scripts/install-screenwright.sh; opt out with --no-screenwright or
@@ -46,10 +50,12 @@ WITH_MEMORY="${HERDR_INSTALL_MEMORY:-0}"
 BUILD_CACHE_TOOLS=1
 BUILD_CACHE_TOOLS_ONLY=0
 WITH_WORKFLOW_HOOKS="${HERDR_INSTALL_WORKFLOW_HOOKS:-1}"
+WITH_SUBAGENT_HOOKS="${HERDR_INSTALL_SUBAGENT_HOOKS:-1}"
 WITH_SCREENWRIGHT="${HERDR_INSTALL_SCREENWRIGHT:-1}"
 for arg in "$@"; do
   case "$arg" in
     --no-workflow-hooks) WITH_WORKFLOW_HOOKS=0 ;;
+    --no-subagent-hooks) WITH_SUBAGENT_HOOKS=0 ;;
     --no-screenwright) WITH_SCREENWRIGHT=0 ;;
     --with-memory) WITH_MEMORY=1 ;;
     --no-build-cache-tools) BUILD_CACHE_TOOLS=0 ;;
@@ -348,6 +354,14 @@ if [ "$WITH_WORKFLOW_HOOKS" = "1" ]; then
   "$PY" -m herdr_engineering.cli workflow install || warn "workflow hooks not installed (see above); settings.json was left untouched"
 else
   printf '\n  (workflow hooks not installed; HERDR_INSTALL_WORKFLOW_HOOKS=0 or --no-workflow-hooks)\n'
+fi
+
+# --- 7c2. managed Claude Code subagent registry hooks (default on) ----------
+if [ "$WITH_SUBAGENT_HOOKS" = "1" ]; then
+  step "7c2/8 Claude Code subagent registry hooks (managed; foreign hooks untouched)"
+  "$PY" -m herdr_engineering.cli handoff auto install --subagents-only || warn "subagent hooks not installed (see above); settings.json was left untouched"
+else
+  printf '\n  (subagent hooks not installed; HERDR_INSTALL_SUBAGENT_HOOKS=0 or --no-subagent-hooks)\n'
 fi
 
 # --- 7d. screenwright (default on; tracks origin/main, never pinned) --------
