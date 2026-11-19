@@ -310,6 +310,16 @@ it, tick by tick, up to the drain timeout (30 minutes from the trigger), and typ
 Only when that bound passes without the order typed, or when the pane was ready and typing still failed, does the
 controller take the last resort (see "Last resort").
 
+### The side pane
+
+The controller asks `herdr_engineering.side_pane` (plan 4) to create the tab's side pane when a managed session appears in a
+tab that did not have it before: the first session, a second one, or a successor that replaced a closed pane. It asks at most
+once per tab per tick and not again for an unchanged tab; the package decides whether to create one (it remembers a dismissal
+and clears it for a new session). A side pane is recognised through the package's `is_side_pane` and is never managed: no
+drain order is typed into it and no chain opens for it. If the check raises, the pane is left alone for that tick and one line
+names the exception type, because typing into a side pane viewer is the worse error. Without the package, nothing is a side pane
+and nothing is created. `herdr-eng side-pane ensure --tab` is documented with plan 4.
+
 ### The steps, in order
 
 1. `handoff.triggered`: the session reached the limit.

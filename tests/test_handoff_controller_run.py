@@ -414,7 +414,7 @@ def test_the_side_pane_hook_is_skipped_when_the_module_does_not_exist_and_asked_
     world = World(tmp_path)
     world.session("p1", 10.0)
     world.tick(world.pane("p1", tab="t7"), world.pane("p2", tab="t7"))
-    assert world.ctl._tabs == {"t7"}
+    assert set(world.ctl._tabs) == {"t7"}
 
 
 def test_a_tick_with_no_herdr_does_nothing(tmp_path: Path) -> None:
