@@ -67,6 +67,17 @@ def test_every_unit_parses(unit):
         assert (unit.parent / target).exists(), f"{unit} triggers missing {target}"
 
 
+@pytest.mark.parametrize("unit", [u for u in UNITS if u.suffix == ".timer"], ids=lambda p: str(p.relative_to(ROOT)))
+def test_persistent_timers_have_a_calendar_trigger(unit):
+    """Persistent= only applies to OnCalendar=. Combined with OnBootSec= it leaves a stamp file, and a timer
+    started after its boot delay then never fires again (herdr-gateway-monitor stopped that way after a reboot)."""
+    timer = parse_unit(unit)["Timer"]
+    if dict(timer).get("Persistent", "false").lower() in ("true", "yes", "1", "on"):
+        keys = {k for k, _ in timer}
+        assert "OnCalendar" in keys, f"{unit}: Persistent=true without OnCalendar="
+        assert not keys & {"OnBootSec", "OnStartupSec"}, f"{unit}: Persistent=true with a boot-relative trigger"
+
+
 @pytest.mark.parametrize("unit", UNITS, ids=lambda p: str(p.relative_to(ROOT)))
 def test_units_read_no_environment(unit):
     rel = str(unit.relative_to(ROOT))
