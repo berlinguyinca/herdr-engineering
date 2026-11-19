@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 from dataclasses import dataclass
 from enum import StrEnum
@@ -38,16 +39,35 @@ def _env() -> dict[str, str]:
     return env
 
 
+_TIMED_OUT = 124
+_NOT_RUNNABLE = 127
+
+
 def _git(worktree: Path, timeout_s: float, *args: str) -> subprocess.CompletedProcess[str]:
-    """Never raises: a timeout is returncode 124, a missing git or unusable directory 127."""
+    """Never raises: a timeout is returncode 124 (the whole process group is killed), a missing git 127."""
     cmd = ["git", "-C", str(worktree), *args]
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, stdin=subprocess.DEVNULL,
-                              env=_env(), check=False)
-    except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout_s}s")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                text=True, env=_env(), start_new_session=True)
     except (OSError, ValueError) as exc:
-        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
+        return subprocess.CompletedProcess(cmd, _NOT_RUNNABLE, "", str(exc))
+    try:
+        out, err = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # hooks and ssh are children of git: kill them all
+        except ProcessLookupError:
+            pass
+        try:
+            proc.communicate(timeout=5)  # reap
+        except subprocess.TimeoutExpired:
+            pass
+        return subprocess.CompletedProcess(cmd, _TIMED_OUT, "", f"timed out after {timeout_s}s")
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def _timed_out(proc: subprocess.CompletedProcess[str]) -> bool:
+    return proc.returncode == _TIMED_OUT
 
 
 def _describe(proc: subprocess.CompletedProcess[str]) -> str:
@@ -63,25 +83,51 @@ def _unpushed(worktree: Path, timeout_s: float) -> tuple[tuple[str, ...], str | 
     return tuple(proc.stdout.split()), None
 
 
-def _push(worktree: Path, branch: str, timeout_s: float) -> tuple[bool, str | None]:
-    remote = _git(worktree, timeout_s, "config", f"branch.{branch}.remote").stdout.strip()
-    merge = _git(worktree, timeout_s, "config", f"branch.{branch}.merge").stdout.strip()
+def _config(worktree: Path, timeout_s: float, key: str) -> tuple[str, str | None]:
+    """(value, error): an unset key is ("", None), a failed lookup is ("", description)."""
+    proc = _git(worktree, timeout_s, "config", "--get", key)
+    if proc.returncode == 0:
+        return proc.stdout.strip(), None
+    if proc.returncode == 1 and not proc.stdout.strip():
+        return "", None
+    return "", _describe(proc)
+
+
+def _push(worktree: Path, branch: str, timeout_s: float) -> tuple[WipReason | None, str | None]:
+    """(None, None) when pushed; otherwise why not. A failed config lookup never skips the protected-upstream check."""
+    remote, err = _config(worktree, timeout_s, f"branch.{branch}.remote")
+    if err:
+        return WipReason.GIT_ERROR, err
+    merge, err = _config(worktree, timeout_s, f"branch.{branch}.merge")
+    if err:
+        return WipReason.GIT_ERROR, err
     if remote and merge:
         target = merge.removeprefix("refs/heads/")
         if target in PROTECTED_BRANCHES:
-            return False, f"upstream {remote}/{target} is protected"
+            return WipReason.PUSH_FAILED, f"upstream {remote}/{target} is protected"
         proc = _git(worktree, timeout_s, "push", remote, f"HEAD:{target}")
     else:
         proc = _git(worktree, timeout_s, "push", "origin", branch)
-    return (True, None) if proc.returncode == 0 else (False, _describe(proc))
+    if proc.returncode == 0:
+        return None, None
+    return (WipReason.GIT_ERROR if _timed_out(proc) else WipReason.PUSH_FAILED), _describe(proc)
+
+
+def _lock_note(worktree: Path, timeout_s: float) -> str:
+    gitdir = _git(worktree, timeout_s, "rev-parse", "--git-dir")
+    if gitdir.returncode != 0:
+        return "index.lock state unknown"
+    lock = (worktree / gitdir.stdout.strip() / "index.lock")  # absolute when git prints one
+    return "index.lock exists (not removed)" if lock.exists() else "no index.lock"
 
 
 def wip_commit(worktree: Path, *, push_allowed: bool, timeout_s: float = 120.0) -> WipResult:
     """Commit tracked changes (never untracked files, never on main/master or a detached HEAD); push if allowed.
 
     `git add -u` adds tracked changes only, but anything the user already staged (new files included) is part of
-    the commit. Never raises and never forces a push: a failure is in `reason` and `error`. A failing git command
-    gives GIT_ERROR, never an empty-looking result.
+    the commit. Never raises and never forces a push: a failure is in `reason` and `error`. `reason` is None only
+    when every git call the result depends on succeeded; a failing or timed-out call gives GIT_ERROR (state
+    unknown), never an empty-looking result. A stale `.git/index.lock` is reported, never removed.
     """
     def failure(proc: subprocess.CompletedProcess[str]) -> WipResult:
         return WipResult(False, None, False, (), (), WipReason.GIT_ERROR, _describe(proc))
@@ -105,9 +151,16 @@ def wip_commit(worktree: Path, *, push_allowed: bool, timeout_s: float = 120.0) 
     committed = False
     sha: str | None = None
     if status.stdout.strip():
+        before = _git(worktree, timeout_s, "rev-parse", "HEAD")
         added = _git(worktree, timeout_s, "add", "-u")
         done = added if added.returncode != 0 else _git(worktree, timeout_s, "commit", "-q", "-m", COMMIT_MESSAGE)
+        after = _git(worktree, timeout_s, "rev-parse", "HEAD")
+        moved = after.returncode == 0 and (before.returncode != 0 or after.stdout != before.stdout)
         if done.returncode != 0:
+            if _timed_out(done):
+                error = f"{_describe(done)}; {_lock_note(worktree, timeout_s)}"
+                sha = _git(worktree, timeout_s, "rev-parse", "--short", "HEAD").stdout.strip() if moved else None
+                return WipResult(moved, sha or None, False, unpushed, untracked, WipReason.GIT_ERROR, error)
             return WipResult(False, None, False, unpushed, untracked, WipReason.COMMIT_REJECTED, _describe(done))
         committed = True
         rev = _git(worktree, timeout_s, "rev-parse", "--short", "HEAD")
@@ -121,8 +174,12 @@ def wip_commit(worktree: Path, *, push_allowed: bool, timeout_s: float = 120.0) 
         return WipResult(committed, sha, False, (), untracked)
     if not push_allowed:
         return WipResult(committed, sha, False, unpushed, untracked, WipReason.PUSH_NOT_ALLOWED)
-    pushed, push_error = _push(worktree, branch, timeout_s)
-    if not pushed:
-        return WipResult(committed, sha, False, unpushed, untracked, WipReason.PUSH_FAILED, push_error)
-    after, err = _unpushed(worktree, timeout_s)
-    return WipResult(committed, sha, True, after, untracked, None, err)
+    reason, push_error = _push(worktree, branch, timeout_s)
+    if reason is not None:
+        remaining, err = _unpushed(worktree, timeout_s)
+        return WipResult(committed, sha, False, remaining if not err else unpushed, untracked, reason,
+                         push_error if not err else f"{push_error}; {err}")
+    after_push, err = _unpushed(worktree, timeout_s)
+    if err:
+        return WipResult(committed, sha, True, (), untracked, WipReason.GIT_ERROR, err)
+    return WipResult(committed, sha, True, after_push, untracked)

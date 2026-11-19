@@ -4,9 +4,10 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-from herdr_engineering.handoff_controller.wip import WipReason, WipResult, wip_commit
+from herdr_engineering.handoff_controller.wip import WipReason, WipResult, _push, wip_commit
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -147,7 +148,8 @@ def test_slow_hook_times_out_without_raising(tmp_path: Path) -> None:
     hook.chmod(0o755)
     (work / "a.txt").write_text("two\n")
     result = wip_commit(work, push_allowed=True, timeout_s=0.5)
-    assert not result.committed and result.error and result.reason is WipReason.COMMIT_REJECTED
+    assert not result.committed and result.reason is WipReason.GIT_ERROR
+    assert result.error and "commit" in result.error and "index.lock" in result.error
 
 
 CALL = "import sys; from pathlib import Path; from herdr_engineering.handoff_controller.wip import wip_commit; print(wip_commit(Path(sys.argv[1]), push_allowed=True))"
@@ -215,3 +217,69 @@ def test_rejected_non_fast_forward_push_is_never_forced(tmp_path: Path) -> None:
     assert result.committed and not result.pushed and result.reason is WipReason.PUSH_FAILED
     assert git(tmp_path / "remote.git", "rev-parse", "feat/x") == remote_tip
     assert result.unpushed == (result.sha,)
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_timeout_kills_the_whole_process_group(tmp_path: Path) -> None:
+    work = make_repo(tmp_path)
+    pidfile = tmp_path / "child.pid"
+    hook = work / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(exist_ok=True)
+    hook.write_text(f"#!/bin/sh\nsleep 30 &\necho $! > {pidfile}\nwait\n")
+    hook.chmod(0o755)
+    (work / "a.txt").write_text("two\n")
+    wip_commit(work, push_allowed=False, timeout_s=0.5)
+    pid = int(pidfile.read_text())
+    deadline = time.monotonic() + 3
+    while alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not alive(pid)
+
+
+def test_commit_timeout_reports_head_truthfully(tmp_path: Path) -> None:
+    work = make_repo(tmp_path)
+    hook = work / ".git" / "hooks" / "post-commit"  # runs after HEAD moved
+    hook.parent.mkdir(exist_ok=True)
+    hook.write_text("#!/bin/sh\nsleep 5\n")
+    hook.chmod(0o755)
+    (work / "a.txt").write_text("two\n")
+    result = wip_commit(work, push_allowed=False, timeout_s=1.0)
+    assert result.reason is WipReason.GIT_ERROR
+    assert result.committed and result.sha == git(work, "rev-parse", "--short", "HEAD")
+
+
+def test_stale_index_lock_is_named_and_never_deleted(tmp_path: Path) -> None:
+    work = make_repo(tmp_path)
+    (work / ".git" / "index.lock").write_text("")
+    (work / "a.txt").write_text("two\n")
+    result = wip_commit(work, push_allowed=False)
+    assert result.reason is WipReason.COMMIT_REJECTED and not result.committed
+    assert (work / ".git" / "index.lock").exists()
+
+
+def test_push_timeout_is_unknown_state(tmp_path: Path) -> None:
+    work = make_repo(tmp_path)
+    hook = tmp_path / "remote.git" / "hooks" / "pre-receive"
+    hook.parent.mkdir(exist_ok=True)
+    hook.write_text("#!/bin/sh\nsleep 5\n")
+    hook.chmod(0o755)
+    (work / "a.txt").write_text("two\n")
+    result = wip_commit(work, push_allowed=True, timeout_s=1.0)
+    assert result.committed and not result.pushed
+    assert result.reason is WipReason.GIT_ERROR and result.error and "push" in result.error
+
+
+def test_failed_config_lookup_never_pushes(tmp_path: Path) -> None:
+    work = make_repo(tmp_path)
+    with (work / ".git" / "config").open("a") as f:
+        f.write("[branch \"feat/x\"\n  remote = \n")  # a corrupt section: every config read fails
+    reason, error = _push(work, "feat/x", 10.0)
+    assert reason is WipReason.GIT_ERROR and error
+    assert "feat/x" not in remote_heads(tmp_path)
