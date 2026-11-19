@@ -6,6 +6,8 @@ row (`❯` then a faint placeholder while empty), a closing rule and a status ro
 composer; on Enter moves the line into the transcript and appends it to the file named by FAKE_TUI_SUBMITTED.
 Bracketed paste (what `herdr agent prompt` sends) is understood. FAKE_TUI_PREFILL puts text in the composer at start;
 FAKE_TUI_BLOCKED starts it showing a permission dialog instead of the composer; FAKE_TUI_IGNORE_EXIT makes `/exit` a no-op.
+FAKE_TUI_START_DELAY_S (or the number in a file named `start_delay_s` beside this program) makes it wait that many
+seconds before it draws anything: a child that is slow to start.
 Like the real harnesses: arguments are an initial prompt, answered in the transcript in the program's own words
 (`Acknowledged handoff <id>, resuming now`, so a pane that merely echoes its launch command is told apart); a
 submitted `/exit` ends the program; a submitted `/compact` shows a working screen ("esc to interrupt") for
@@ -17,6 +19,7 @@ import select
 import sys
 import time
 import tty
+from pathlib import Path
 
 RULE = "─" * 60
 PLACEHOLDER = 'Try "fix lint errors"'
@@ -60,8 +63,16 @@ def submit() -> None:
         transcript.append(line)
 
 
+def start_delay() -> float:
+    try:
+        return float(os.environ.get("FAKE_TUI_START_DELAY_S") or Path(__file__).with_name("start_delay_s").read_text())
+    except (OSError, ValueError):
+        return 0.0
+
+
 def main() -> None:
     global buffer, busy_until
+    time.sleep(start_delay())
     fd = sys.stdin.fileno()
     tty.setraw(fd)
     sys.stdout.write("\x1b[?2004h")

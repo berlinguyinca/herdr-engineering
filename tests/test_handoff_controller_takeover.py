@@ -218,6 +218,7 @@ def _server() -> Iterator[IsolatedHerdr]:
 @pytest.fixture
 def server(_server: IsolatedHerdr) -> IsolatedHerdr:
     _server.submitted.unlink(missing_ok=True)
+    _server.program.with_name("start_delay_s").unlink(missing_ok=True)
     for pane in panes(_server):
         subprocess.run(["herdr", "pane", "close", pane], env=_server.env, cwd=_server.root, capture_output=True,
                        timeout=30, check=False)
@@ -316,6 +317,7 @@ def test_refusal_keeps_source_and_retries_then_compacts(server: IsolatedHerdr, h
     start-up), so nothing proves the handoff happened: the source is compacted, and the event names the child."""
     work, store = make_repo(tmp_path, dirty=False), tmp_path / "store"
     source = start_idle(server, "FAKE_TUI_COMPACT_S=0.8")
+    server.start_delay(3.0)  # the child starts slowly: the 0.5 s confirmation cannot see it
     handoff_id = new_record(handoff, store, source, work)
     log = EventLog(store)
     done = run_takeover(make_ref(source, work), ADAPTER, handoff_id, ControllerConfig(max_attempts=2), log, handoff,
@@ -450,6 +452,7 @@ def test_compaction_is_not_typed_into_a_blocked_agent_or_another_harness(server:
 def test_no_way_forward_is_red_with_reason(server: IsolatedHerdr, handoff: HandoffCli, tmp_path: Path) -> None:
     work, store = make_repo(tmp_path, dirty=False), tmp_path / "store"
     source = start_idle(server, "FAKE_TUI_PREFILL=half-written")
+    server.start_delay(3.0)  # the child starts slowly: the 0.5 s confirmation cannot see it
     handoff_id = new_record(handoff, store, source, work)
     log = EventLog(store)
     done = run_takeover(make_ref(source, work), ADAPTER, handoff_id, ControllerConfig(max_attempts=2), log, handoff,

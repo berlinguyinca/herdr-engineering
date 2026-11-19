@@ -224,14 +224,15 @@ def test_fallback_runner_timeout_gives_none(handoff: HandoffCli, tmp_path: Path,
     assert not (root / "outbox").exists() or not list((root / "outbox").glob("handoff_*.json"))
 
 
-def test_headless_argv_per_harness() -> None:
-    assert headless_argv(Harness.CLAUDE) == [
+def test_headless_argv_per_harness(tmp_path: Path) -> None:
+    no_help = {"PATH": str(tmp_path)}  # no harness on PATH: only the base flags
+    assert headless_argv(Harness.CLAUDE, no_help) == [
         "claude", "-p", "--output-format", "text", "--no-session-persistence", "--setting-sources", "",
         "--strict-mcp-config", "--disable-slash-commands", "--tools", ""]
-    assert headless_argv(Harness.PI) == [
+    assert headless_argv(Harness.PI, no_help) == [
         "pi", "-p", "--no-session", "--no-tools", "--no-extensions", "--no-mcp", "--no-skills",
         "--no-prompt-templates", "--no-context-files"]
-    assert headless_argv(Harness.CODEX) == [
+    assert headless_argv(Harness.CODEX, no_help) == [
         "codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "-"]
     assert fallback_supported(Harness.CODEX)
 

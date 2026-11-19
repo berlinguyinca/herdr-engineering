@@ -267,9 +267,9 @@ off, or (Codex) a sandbox that stops writes in an empty directory. Only `--help`
 
 | Harness | Enabled | Flags | Unverified without a real call |
 | --- | --- | --- | --- |
-| claude | yes | `-p --output-format text --no-session-persistence --setting-sources "" --strict-mcp-config --disable-slash-commands --tools ""` | empty values for `--setting-sources` and `--tools` accepted, and user/project hooks dropped; prompt read from stdin |
+| claude | yes | `-p --output-format text --no-session-persistence --setting-sources "" --strict-mcp-config --disable-slash-commands --tools ""`, plus `--safe-mode` when `claude --help` lists it | empty values for `--setting-sources` and `--tools` accepted, and user/project hooks dropped; prompt read from stdin |
 | pi | yes | `-p --no-session --no-tools --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files` | prompt read from stdin with no message argument; provider login still usable with `--no-extensions` |
-| codex | yes | `exec --sandbox read-only --skip-git-repo-check --ephemeral -` (`codex exec --help`: prompt read from stdin when absent or `-`; `--ephemeral` writes no session files) | tools stay on but the read-only sandbox stops writes and the work directory is empty; prompt read from stdin; login still usable with `--ephemeral`; no network restriction was seen in `--help` |
+| codex | yes | `exec --sandbox read-only --skip-git-repo-check --ephemeral -`, plus `--ignore-user-config --ignore-rules` when `codex exec --help` lists them (`codex exec --help`: prompt read from stdin when absent or `-`; `--ephemeral` writes no session files; `--ignore-user-config`: "Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`"; `--ignore-rules`: "Do not load user or project execpolicy `.rules` files") | tools stay on but the read-only sandbox stops writes and the work directory is empty; prompt read from stdin; login still usable with `--ephemeral`; no network restriction was seen in `--help` |
 | opencode | no | `opencode run` offers `--agent` and `--auto` but no command-line way to deny tools | not enabled |
 
 Stripped from the environment: `HERDR_*`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`,
@@ -277,3 +277,9 @@ Stripped from the environment: `HERDR_*`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`
 `PI_CODING_AGENT`, `PI_SESSION_ID`, `OPENCODE`, `OPENCODE_PID`, `OPENCODE_SESSION_ID` (the first four groups are the
 variables `handoff_harness.py` reads to detect an ancestor harness). Kept: auth and config such as `ANTHROPIC_*`,
 `OPENAI_*`, `HOME`, `PATH`.
+
+The optional flags are read from `<harness> --help` (`codex exec --help`) at run time, once per PATH; only `--help` is run. Read from the installed CLIs on 2026-11-18:
+
+- `claude --bare` is **not** used. Its help says it skips hooks, plugin sync, auto-memory, keychain reads and CLAUDE.md discovery, and that "Anthropic auth is strictly ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and keychain are never read)". A user logged in with a subscription would get no answer.
+- `claude --safe-mode` is used when listed. Its help says it starts "with all customizations (CLAUDE.md, skills, installed plugins, hooks, MCP servers, custom commands and agents, ...) disabled" and that "Auth, model selection, built-in tools and plugins, and permissions work normally"; admin-managed policy settings still apply.
+- Codex: both flags are listed, and `--ignore-user-config` keeps auth ("auth still uses `CODEX_HOME`").

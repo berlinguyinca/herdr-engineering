@@ -2,6 +2,10 @@
 
 Both inputs (the harness's compact command and the pointer text) are typed only when Herdr reports the right agent
 idle with an empty composer, the same rule as the drain order. Nothing here closes a pane.
+
+Two limits: an agent that turns `blocked` right after a failed prompt is still reported as typed (the screen cannot say
+whether the text went in); and because a takeover killed after `launched` but before confirmation counts as unconfirmed,
+compaction may run while a slow child is still starting, visible as `successor_pane_id` on the ORANGE event.
 """
 from __future__ import annotations
 

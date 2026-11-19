@@ -236,6 +236,9 @@ def test_timeout_kills_the_whole_process_group(tmp_path: Path) -> None:
     hook.chmod(0o755)
     (work / "a.txt").write_text("two\n")
     wip_commit(work, push_allowed=False, timeout_s=0.5)
+    wait_until = time.monotonic() + 5  # the hook may not have written its pid yet
+    while not (pidfile.is_file() and pidfile.read_text().strip()) and time.monotonic() < wait_until:
+        time.sleep(0.05)
     pid = int(pidfile.read_text())
     deadline = time.monotonic() + 3
     while alive(pid) and time.monotonic() < deadline:

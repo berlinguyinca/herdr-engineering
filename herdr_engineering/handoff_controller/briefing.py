@@ -11,16 +11,19 @@ own `--help` shows a way to turn every tool off, or (Codex) a sandbox that stops
 
 | Harness | Enabled | Flags | Unverified without a real call |
 | --- | --- | --- | --- |
-| claude | yes | `-p --output-format text --no-session-persistence --setting-sources "" --strict-mcp-config --disable-slash-commands --tools ""` | that an empty `--setting-sources` and `--tools` value are accepted and drop user/project hooks; prompt on stdin |
+| claude | yes | `-p --output-format text --no-session-persistence --setting-sources "" --strict-mcp-config --disable-slash-commands --tools ""`, plus `--safe-mode` when `claude --help` lists it | that an empty `--setting-sources` and `--tools` value are accepted and drop user/project hooks; prompt on stdin. `--bare` is never used: its help says Anthropic auth is then strictly `ANTHROPIC_API_KEY`/`apiKeyHelper` ("OAuth and keychain are never read"), which would break a subscription login. `--safe-mode` says "Auth, model selection, built-in tools and plugins, and permissions work normally" |
 | pi | yes | `-p --no-session --no-tools --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files` | prompt on stdin with no message argument; that `--no-extensions` leaves its provider login usable |
-| codex | yes | `exec --sandbox read-only --skip-git-repo-check --ephemeral -` (prompt on stdin: `[PROMPT]` read from stdin when absent or `-`) | that the read-only sandbox is enough: tools stay on but cannot write, and the empty work directory holds nothing to read; that `--ephemeral` leaves its login usable |
+| codex | yes | `exec --sandbox read-only --skip-git-repo-check --ephemeral -` (prompt on stdin: `[PROMPT]` read from stdin when absent or `-`), plus `--ignore-user-config --ignore-rules` when `codex exec --help` lists them (auth still uses `CODEX_HOME`) | that the read-only sandbox is enough: tools stay on but cannot write, and the empty work directory holds nothing to read; that `--ephemeral` leaves its login usable |
 | opencode | no | `opencode run` has `--agent` and `--auto` but no way to deny tools from the command line | not enabled: tools cannot be shown off |
+
+The optional flags come from running only `<harness> --help` (`codex exec --help`), once per PATH, never a model call.
 
 `wait_for_briefing` reads the store's on-disk layout (`<root>/outbox/handoff_<32 hex>.json`) rather than the CLI's
 `list`: `list` fails as a whole on one corrupt record, and the wait must skip those.
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -46,6 +49,7 @@ _FALLBACK_NOTE = ("Fallback briefing: written by a second model call from the tr
 _UNKNOWN_GOAL = "unknown — fallback writer: the session's goal could not be read from the transcript"
 _LOG = logging.getLogger(__name__)
 _CALL_S = 60.0  # one herdr-handoff or git/gh call
+_GRACE_S = 15.0  # extra time to store an answer that arrived with the budget spent
 _DB_SUFFIXES = (".db", ".sqlite", ".sqlite3")
 
 
@@ -119,10 +123,36 @@ def fallback_supported(harness: Harness) -> bool:
     return harness in _HEADLESS
 
 
-def headless_argv(harness: Harness) -> list[str] | None:
-    """Non-interactive, tool-less argv, prompt on stdin; None when the harness is not supported."""
+# Flags added only when the harness's own `--help` lists them: (help argv, flags, position in the argv to insert at).
+_OPTIONAL_FLAGS: dict[Harness, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    Harness.CLAUDE: (("claude", "--help"), ("--safe-mode",)),  # never `--bare`: it stops reading the user's OAuth login
+    Harness.CODEX: (("codex", "exec", "--help"), ("--ignore-user-config", "--ignore-rules")),
+}
+_HELP_S = 15.0
+
+
+@functools.lru_cache(maxsize=32)
+def _listed_flags(help_argv: tuple[str, ...], flags: tuple[str, ...], path: str) -> tuple[str, ...]:
+    """The `flags` that `help_argv` (a `--help` call, nothing else) mentions; none when it cannot be run. Cached per PATH."""
+    done = run_group(list(help_argv), _HELP_S, env={"PATH": path} if path else {})
+    if done.returncode != 0:
+        return ()
+    return tuple(flag for flag in flags if re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", done.stdout))
+
+
+def headless_argv(harness: Harness, env: Mapping[str, str] | None = None) -> list[str] | None:
+    """Non-interactive, tool-less argv, prompt on stdin; None when the harness is not supported. `env` (default: this
+    process's) decides which `<harness> --help` is read for the optional flags."""
     argv = _HEADLESS.get(harness)
-    return list(argv) if argv else None
+    if not argv:
+        return None
+    optional = _OPTIONAL_FLAGS.get(harness)
+    if optional is None:
+        return list(argv)
+    help_argv, flags = optional
+    extra = _listed_flags(help_argv, flags, (os.environ if env is None else env).get("PATH", ""))
+    keep = len(help_argv) - 1  # `claude`, `-p` / `codex`, `exec`: the flags go right after the command words
+    return [*argv[:keep], *extra, *argv[keep:]]
 
 
 def isolated_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -144,11 +174,12 @@ def run_model(argv: list[str], prompt: str, *, cwd: Path, timeout_s: float,
 def headless_runner(harness: Harness, prompt: str, *, cwd: Path, timeout_s: float,
                     env: Mapping[str, str] | None = None) -> str | None:
     """The production `HarnessRunner`: the session's own harness, headless, tool-less, without the session's identity."""
-    argv = headless_argv(harness)
+    clean_env = isolated_env(env)
+    argv = headless_argv(harness, clean_env)
     if argv is None:
         _LOG.warning("handoff fallback writer: %s is not supported (no way to turn its tools off)", harness.value)
         return None
-    return run_model(argv, prompt, cwd=cwd, timeout_s=timeout_s, env=isolated_env(env))
+    return run_model(argv, prompt, cwd=cwd, timeout_s=timeout_s, env=clean_env)
 
 
 def _transcript_tail(ref: SessionRef, tail_bytes: int) -> str:
@@ -161,28 +192,30 @@ def _transcript_tail(ref: SessionRef, tail_bytes: int) -> str:
         with path.open("rb") as handle:
             size = handle.seek(0, os.SEEK_END)
             start = max(0, size - tail_bytes)
-            handle.seek(start)
+            handle.seek(max(0, start - 1))  # one byte earlier: is the tail's first byte the start of a line?
             data = handle.read()
     except OSError as exc:
         return f"transcript: not available ({exc.strerror or type(exc).__name__})"
-    if start > 0:  # the first line is cut in the middle
-        data = data.partition(b"\n")[2]
+    if start > 0:
+        before, data = data[:1], data[1:]
+        if before != b"\n":  # the first line is cut in the middle
+            data = data.partition(b"\n")[2]
     return "transcript tail (the last bytes of the session record, oldest first):\n" + data.decode("utf-8", "replace")
 
 
-def _command_output(label: str, argv: list[str], cwd: Path, timeout_s: float) -> str:
+def _command_output(label: str, argv: list[str], cwd: Path, timeout_s: float, *, tool: str) -> str:
     done = run_group(argv, timeout_s, cwd=cwd)
     if done.returncode != 0:  # stderr is not quoted: it can carry paths and tokens
-        return f"{label}: not available ({Path(argv[0]).name if label.startswith('gh') else 'git'} failed, exit {done.returncode})"
+        return f"{label}: not available ({tool} failed, exit {done.returncode})"
     return f"{label}:\n{done.stdout.strip() or '(empty)'}"
 
 
 def _prompt(ref: SessionRef, worktree: Path, tail_bytes: int, gh: tuple[str, ...], call_s: Callable[[], float]) -> str:
     sections = [
         _transcript_tail(ref, tail_bytes),
-        _command_output("git status --short", ["git", "-C", str(worktree), "status", "--short"], worktree, call_s()),
-        _command_output("git log -n 20 --oneline", ["git", "-C", str(worktree), "log", "-n", "20", "--oneline"], worktree, call_s()),
-        _command_output("gh pr list", [*gh, "pr", "list", "--json", "number,title,headRefName"], worktree, call_s()),
+        _command_output("git status --short", ["git", "-C", str(worktree), "status", "--short"], worktree, call_s(), tool="git"),
+        _command_output("git log -n 20 --oneline", ["git", "-C", str(worktree), "log", "-n", "20", "--oneline"], worktree, call_s(), tool="git"),
+        _command_output("gh pr list", [*gh, "pr", "list", "--json", "number,title,headRefName"], worktree, call_s(), tool="gh"),
     ]
     return (
         "A coding-agent session ran out of context and did not write its own handoff briefing. Write it for the "
@@ -278,8 +311,10 @@ def write_fallback_briefing(ref: SessionRef, worktree: Path, store_root: Path, h
             _LOG.exception("handoff fallback writer: the harness runner raised")
             return None
         answer = _parse_answer(text) if text else None
-        if answer is None or left() <= 0:
+        if answer is None:
             return None
+        if left() <= 0:  # the answer came in as the budget ran out: spend a bounded grace on storing it
+            deadline = time.monotonic() + _GRACE_S
         spec: dict[str, object] = {key: _strings(answer.get(key)) for key in _LIST_FIELDS}
         spec["unverified"] = [_FALLBACK_NOTE, *_strings(answer.get("unverified"))]
         spec["pull_requests"] = [url for url in _strings(answer.get("pull_requests")) if url.startswith("https://")]
