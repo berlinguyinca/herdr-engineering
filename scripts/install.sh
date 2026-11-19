@@ -56,7 +56,8 @@
 #   (default on) step 7c3 links the auto-handoff controller plugin and the session
 #      side pane plugin into Herdr (`herdr-eng handoff controller link`; copies of
 #      deploy/herdr-handoff-controller-plugin and deploy/herdr-session-pane-plugin with the
-#      absolute herdr-eng path, so Herdr's short PATH does not matter). Needs herdr 0.9.1+;
+#      absolute herdr-eng path (the ~/.local/bin link when it points at this install,
+#      else this checkout's .venv binary, with a warning), so Herdr's short PATH does not matter). Needs herdr 0.9.1+;
 #      skipped otherwise. Linking does not start the controller: Herdr starts it
 #      when it next starts, or run `herdr-eng handoff controller run`. Opt out with
 #      --no-handoff-plugins or HERDR_INSTALL_HANDOFF_PLUGINS=0; without the controller
@@ -402,8 +403,12 @@ fi
 # (measured on 0.9.1), so a running Herdr needs a restart or `herdr-eng handoff controller run`. The final check says which.
 if [ "$WITH_HANDOFF_PLUGINS" = "1" ]; then
   step "7c3/8 auto-handoff controller and session side pane plugins (linked into Herdr)"
+  # --herdr-eng is this install's own binary (the checkout's .venv: install.sh installs editable, it is not a release copy); the
+  # manifests name $LINK_DIR/herdr-eng instead when that link points at it, else the venv binary with a warning.
   "$PY" -m herdr_engineering.cli handoff controller link --deploy-dir "$REPO_ROOT/deploy" --herdr-eng "$VENV/bin/herdr-eng" \
-    --herdr-bin "$HERDR_BIN" || warn "handoff plugins not linked (see above); no session is handed off automatically until: herdr-eng handoff controller link"
+    --stable-link "$LINK_DIR/herdr-eng" --editable --herdr-bin "$HERDR_BIN" || \
+    warn "handoff plugins not linked (see above); no session is handed off automatically until: herdr-eng handoff controller link"
+  printf '  The controller starts at the next Herdr start; to start it now run: herdr-eng handoff controller run\n'
 else
   printf '\n  (handoff plugins not linked; HERDR_INSTALL_HANDOFF_PLUGINS=0 or --no-handoff-plugins: no automatic handoff until: herdr-eng handoff controller link)\n'
 fi

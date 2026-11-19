@@ -318,12 +318,15 @@ switched off gets (no automatic policy).
 
 ### Linking and checking the controller
 
-`scripts/install.sh` links the controller plugin and the session pane plugin (`herdr-eng handoff controller link`), with the
-absolute path of the installed `herdr-eng` in the commands. Herdr starts the controller when Herdr next starts, so restart Herdr
-or run `herdr-eng handoff controller run` after the first install. Check with `herdr-eng handoff auto check`,
-`herdr-eng handoff controller status` or `herdr-eng doctor`. If linking was skipped (no Herdr, Herdr older than 0.9.1,
+`scripts/install.sh` links the controller plugin and the session pane plugin (`herdr-eng handoff controller link`), with an
+absolute `herdr-eng` in the commands: `~/.local/bin/herdr-eng` when it points at the checkout's `.venv/bin/herdr-eng`, else that
+`.venv` binary with a warning (details in [handoff-auto-triggers.md](handoff-auto-triggers.md#the-controller-plugins)).
+Linking does not start the controller: Herdr starts it at its next start, and `herdr-eng handoff controller run` starts it now.
+Check with `herdr-eng handoff auto check`, `herdr-eng handoff controller status` or `herdr-eng doctor`; a linked but disabled
+plugin is reported with `herdr plugin enable <id>`. If linking was skipped (no Herdr, Herdr older than 0.9.1,
 `--no-handoff-plugins`) and no controller runs, the host has no automatic policy; run `herdr-eng handoff controller link`.
-The controller needs herdr-handoff 0.5.0: release that and the pin change first (see
+`herdr-eng handoff auto uninstall` does not unlink the plugins: use `herdr plugin unlink herdr.handoff-controller` and
+`herdr plugin unlink herdr.session-pane`. The controller needs herdr-handoff 0.5.0: release that and the pin change first (see
 [handoff-auto-triggers.md](handoff-auto-triggers.md#upgrading)).
 
 ### When it acts

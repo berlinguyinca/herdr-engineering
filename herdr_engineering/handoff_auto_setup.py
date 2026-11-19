@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from .fabric_join_setup import FAIL_ACTIONS, Item, _home, _save_settings
+from .memory_install import writable_target
 from .workflow_hooks import WorkflowInstaller
 
 HOOK_MARKER = "herdr-handoff-auto"
@@ -95,7 +96,9 @@ def _remove_legacy(data: dict, target: str) -> tuple[Item, bool]:
 
 
 def _save(home: Path | None, path: Path, data: dict, text: str) -> None:
-    """Back the file up first (``settings.json.bak`` is the pristine copy and is never overwritten), then write atomically."""
+    """Back the file up first (``settings.json.bak`` is the pristine copy and is never overwritten), then write atomically.
+    A read-only settings.json or directory raises PermissionError before the backup."""
+    writable_target(path)
     if path.is_file():
         dest = _home(home) / ".local/share/herdr-engineering/handoff/backups"
         dest.mkdir(parents=True, exist_ok=True, mode=0o700)

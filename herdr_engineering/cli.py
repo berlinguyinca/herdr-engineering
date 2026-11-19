@@ -585,7 +585,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--once", action="store_true", help="run: one tick, then exit")
     p2.add_argument("--interval", type=float, default=5.0, help="run: seconds between ticks (default 5)")
     p2.add_argument("--deploy-dir", default=None, help="link: the checkout's deploy/ directory holding the two plugins")
-    p2.add_argument("--herdr-eng", default=None, help="link: absolute path the plugins run (default: the one on PATH)")
+    p2.add_argument("--herdr-eng", default=None, help="link: this install's own herdr-eng binary (default: the one on PATH)")
+    p2.add_argument("--stable-link", default=None, help="link: the herdr-eng a shell runs (default ~/.local/bin/herdr-eng); named in the "
+                                                        "manifests when it links to --herdr-eng")
+    p2.add_argument("--editable", action="store_true", help="link: say that this is a checkout (editable) install")
     p2.add_argument("--herdr-bin", default=None, help="link: the herdr binary (default: $HERDR_BIN, else herdr)")
     p2.set_defaults(func=_cmd_handoff_controller)
 
@@ -1722,17 +1725,21 @@ def _cmd_handoff_controller_link(args) -> int:
     import shutil
 
     from .fabric_join_setup import FAIL_ACTIONS
-    from .handoff_controller_state import default_deploy_dir, link_plugins
+    from .handoff_controller_state import choose_entry_point, default_deploy_dir, link_plugins
     from .handoff_subagent_registry import state_root
-    herdr_eng = args.herdr_eng or shutil.which("herdr-eng")
-    if not herdr_eng:
+    own = args.herdr_eng or shutil.which("herdr-eng")
+    if not own:
         print("herdr-eng is not on PATH; pass --herdr-eng with its absolute path", file=sys.stderr)
         return 1
     deploy = Path(args.deploy_dir) if args.deploy_dir else default_deploy_dir()
     if not deploy.is_dir():
         print(f"plugin sources not found at {deploy}; pass --deploy-dir", file=sys.stderr)
         return 1
-    items = link_plugins(deploy, str(Path(herdr_eng).absolute()), data_dir=state_root(os.environ).parent / "plugins",
+    stable = Path(args.stable_link) if args.stable_link else Path.home() / ".local" / "bin" / "herdr-eng"
+    entry = choose_entry_point(stable, Path(own).absolute(), editable=args.editable)
+    for note in entry.notes:
+        print(note)
+    items = link_plugins(deploy, entry.path, data_dir=state_root(os.environ).parent / "plugins",
                          herdr_bin=args.herdr_bin or os.environ.get("HERDR_BIN") or "herdr")
     for item in items:
         print(f"{item.action:10} {item.target}" + (f"  ({item.detail})" if item.detail else ""))

@@ -37,11 +37,21 @@ longer gets a reminder.
 ### The controller plugins
 
 `scripts/install.sh` links both Herdr plugins (`deploy/herdr-handoff-controller-plugin` and `deploy/herdr-session-pane-plugin`)
-with `herdr-eng handoff controller link`. It links a copy of each manifest whose commands name the absolute path of the installed
-`herdr-eng` (Herdr starts plugin commands with its own short PATH, which usually lacks `~/.local/bin`). A second run changes
+with `herdr-eng handoff controller link`. It links a copy of each manifest whose commands name an absolute `herdr-eng` (Herdr
+starts plugin commands with its own short PATH, which usually lacks `~/.local/bin`). `install.sh` is an editable install into the
+checkout's `.venv`, not a release copy. The manifests name `~/.local/bin/herdr-eng` when that link points at the checkout's
+`.venv/bin/herdr-eng` (the link the installer manages); if another install owns that link the installer leaves it alone, names the
+checkout's `.venv/bin/herdr-eng` and prints a warning. Either way the plugins stop working if the checkout is removed, and the
+output says so. The link command fails, linking nothing, when the chosen path is not an executable file. A second run changes
 nothing; a plugin linked from another path is relinked. It is skipped, with a message, when Herdr is missing or older than 0.9.1,
-and `--no-handoff-plugins` or `HERDR_INSTALL_HANDOFF_PLUGINS=0` opts out. Herdr starts the controller when Herdr itself next
-starts (measured on 0.9.1: linking does not run the startup command), so restart Herdr or run `herdr-eng handoff controller run`.
+and `--no-handoff-plugins` or `HERDR_INSTALL_HANDOFF_PLUGINS=0` opts out.
+
+Linking does not start the controller. Herdr starts it when Herdr itself next starts (measured on 0.9.1); to start it now run
+`herdr-eng handoff controller run`. The installer prints this sentence right after linking.
+
+To remove the plugins, `herdr-eng handoff auto uninstall` does not unlink them; run `herdr plugin unlink herdr.handoff-controller`
+and `herdr plugin unlink herdr.session-pane`. A plugin that is linked but disabled does not count; `herdr plugin enable <id>` fixes
+that and `herdr-eng handoff auto check` names the command.
 
 Check it with any of:
 
