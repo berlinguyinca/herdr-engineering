@@ -94,9 +94,11 @@ herdr-handoff takeover hnd_123 --cwd "$(git rev-parse --show-toplevel)"
 ```
 
 The model argument is a hint, not a guarantee. The receiving harness must
-report the resolved model. Handoffs do not launch processes or publish
-anything automatically. Public sharing remains a separate, human-approved
-artifact-publication action.
+report the resolved model. Handoffs do not publish anything automatically; public
+sharing remains a separate, human-approved artifact-publication action. What IS
+automatic is the handoff itself: when a session nears its context limit the installed
+triggers tell the agent to run this skill without being asked. See
+[Automatic handoffs](../automatic-handoffs.md).
 
 ## Ordering and refusals
 

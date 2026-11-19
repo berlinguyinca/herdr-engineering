@@ -67,7 +67,7 @@ timeout_method = "signal"
 
 
 [tool.setuptools.package-data]
-herdr_engineering = ["control_plane/rakazo_defaults.json", "*.mjs", "skill_data/summary/*.md", "skill_data/summary/adapters/*.md",
+herdr_engineering = ["control_plane/rakazo_defaults.json", "*.mjs", "extension_data/*.ts", "skill_data/summary/*.md", "skill_data/summary/adapters/*.md",
                      "skill_data/handoff/*.md", "skill_data/handoff/adapters/*.md",
                      "skill_data/herdr-join/*.md", "skill_data/herdr-join/adapters/*.md",
                      "control_plane/share_static/*.html", "control_plane/share_static/*.js",
