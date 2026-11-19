@@ -9,6 +9,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - `handoff autopilot` no longer hard-codes a 200k window for Claude Code. The transcript names the model, and `handoff_autopilot.model_context_windows` (YAML; a model-name substring to its window, longest match wins, merged with the built-in `[1m]` -> 1,000,000) gives its window; the Stop hook, `check --transcript` and `record --transcript` all apply it and report `window.source: "model"`. The harness's own stated window still wins, then the model, then a declared `context_window_tokens`, and only then the 200k assumption (with escalation past it). New `transcript_model()` reads `message.model`.
 
+### Fix: unit-gates reruns the parallel pass once if xdist workers die
+
+- `scripts/ci/pytest-rerun.sh`: exit 3 or a worker-crash signature reruns the parallel pass once on 2 workers (never for test failures or hangs); `auto` workers also shrink on a loaded host.
+
 ### Fix: `fleet status` and `doctor` no longer depend on the working directory
 
 - `fleet.repo_root()` no longer falls back to the cwd. It uses `HERDR_ENGINEERING_REPO`, else walks up for `ansible/inventory/hosts.yml` (or a checkout's `ansible/playbooks/fleet-status.yml`), else raises `FleetError` naming the paths searched. `fleet status` reports a missing inventory as `no inventory at <path>` on stderr and exits 2 (setup problem), distinct from exit 1 (ansible ran and hosts failed); `--json` carries `error` and `error_kind`. `fleet join`/`update` and `stage_pi_runtime` return that error in their report instead of running ansible against a nonexistent path.

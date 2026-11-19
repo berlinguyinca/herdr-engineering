@@ -760,7 +760,11 @@ def test_floor_larger_than_filesystem_is_rejected_before_data_removal(tree: Tree
 def test_real_free_space_pressure_removes_idle_output_and_reports_unmet_floor(tree: Tree) -> None:
     import shutil
 
-    floor = shutil.disk_usage(tree[0]).free + 2**30
+    # The floor is the filesystem's total capacity: accepted by the reaper (it only
+    # rejects floors above total) yet unmeetable by construction, because free space
+    # is always below total (filesystem metadata) no matter what other processes free
+    # on this shared filesystem while the sweep runs.
+    floor = shutil.disk_usage(tree[0]).total
     report = sweep(tree, replace(policy(), ttl_seconds=86400, min_free_bytes=floor), apply=True)
     assert report.removed
     assert report.status is RunStatus.PRESSURE_BLOCKED

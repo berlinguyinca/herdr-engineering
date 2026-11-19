@@ -55,6 +55,19 @@ terminal is closed. Read the server's copy of a finished run with:
 python3 scripts/ci/wp_log.py berlinguyinca/herdr-engineering <pipeline-number> --failures
 ```
 
+## Worker crashes in the parallel pytest pass
+
+On a heavily loaded host pytest-xdist workers can die ("node down: Not properly terminated") and xdist 3.8.0 then ends with an
+INTERNALERROR KeyError, pytest exit 3 (pipeline 1710, load 155 on 4 CPUs). `unit-gates.sh` handles this in two ways
+(`scripts/ci/pytest-rerun.sh`, `scripts/ci/pytest-parallel.sh`):
+
+- `auto` workers are bounded by the CPUs the 1-minute load average leaves free (never below 1; an explicit `HERDR_PYTEST_WORKERS`
+  wins; `HERDR_LOADAVG_FILE` overrides `/proc/loadavg`).
+- When the parallel pass exits 3 or its output has a worker-crash signature, it is rerun once on `HERDR_PYTEST_RERUN_WORKERS`
+  workers (default 2; `0` = serial, ~90 min) and the log says so. A genuine test failure, a watchdog hang (124) and a pass are
+  never rerun, and a rerun's result is final. A test failure whose own output happens to print a crash signature costs one more
+  run, nothing more.
+
 ## Known-flaky gates
 
 `tests/control_plane/test_assistant_hub_slack_questions.py` is timing-coupled and reddens `unit-gates` intermittently on more than
