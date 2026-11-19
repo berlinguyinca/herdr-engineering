@@ -252,6 +252,19 @@ Inspect the registry with `herdr-eng handoff subagents [--pane ID] [--json]` (de
 lists the live entries and deletes entries older than 6 hours (a subagent that never reported a stop) as stale. It
 always exits 0.
 
+Three mutually exclusive flags make the registry machine-readable for a controller; each needs a pane (`--pane ID`,
+else `$HERDR_PANE_ID`, else an argument error with exit 2):
+
+- `--status` prints `{"known": bool, "live": int}` with `--json` (else `known=true live=1`). `known` is false when no
+  hook ever fired for the pane, and true once its directory exists, even with zero live agents. Stale entries are not
+  counted.
+- `--wait SECONDS` polls until no subagent is live: exit 0 when idle (an unknown pane counts as idle; the caller decides
+  what unknown means), exit 3 on timeout. With `--json` it prints the status it last saw.
+- `--purge` deletes the pane's registry directory and prints the number of entries removed (`{"purged": N}` with
+  `--json`); run it when a pane closes so a reused pane id starts clean.
+
+Without these flags the command behaves as described above.
+
 `herdr-eng handoff context [--pane ID] [--json]` prints how full the pane's session context is (harness, used and
 window tokens, percent, source, window source), or `{"unknown": true}` when it cannot be read; it always exits 0.
 `--harness NAME --session-id ID [--cwd DIR]` reads a named session's record directly, without Herdr.

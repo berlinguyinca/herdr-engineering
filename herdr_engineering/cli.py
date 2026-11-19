@@ -12,6 +12,7 @@ import contextlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -533,13 +534,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = hsub.add_parser("subagents", help="list running subagents registered for a pane (prunes entries older than 6h)")
     p2.add_argument("--pane", default=None, help="pane id (default: $HERDR_PANE_ID)")
     p2.add_argument("--json", action="store_true")
-    p2.set_defaults(func=_cmd_handoff_subagents)
+    mode = p2.add_mutually_exclusive_group()
+    mode.add_argument("--status", action="store_true", help='print {"known": bool, "live": int} instead of the entries')
+    mode.add_argument("--wait", type=_wait_seconds, default=None, metavar="SECONDS",
+                      help="wait until no subagent is live: exit 0 when idle, 3 on timeout")
+    mode.add_argument("--purge", action="store_true", help="delete the pane's registry entries (pane closed)")
+    p2.set_defaults(func=_cmd_handoff_subagents, subagents_parser=p2)
     p2 = hsub.add_parser("auto", help="install, remove or check the opt-in context-hook in ~/.claude/settings.json")
     p2.add_argument("auto_action", choices=("install", "uninstall", "check"))
     p2.add_argument("--home", default=None, help="override $HOME (tests)")
     p2.add_argument("--dry-run", action="store_true", help="report what would change without writing")
+    p2.add_argument("--subagents-only", action="store_true", help="install: only the SubagentStart/SubagentStop registry hooks")
     p2.add_argument("--json", action="store_true")
-    p2.set_defaults(func=_cmd_handoff_auto)
+    p2.set_defaults(func=_cmd_handoff_auto, auto_parser=p2)
 
     # handoff autopilot ----------------------------------------------------
     p2 = hsub.add_parser(
@@ -1622,8 +1629,12 @@ def _cmd_handoff_context(args) -> int:
 def _cmd_handoff_auto(args) -> int:
     from . import handoff_auto_setup as ha
     home = Path(args.home) if args.home else None
+    if args.subagents_only and args.auto_action != "install":
+        args.auto_parser.error("--subagents-only only applies to the install action")
     if args.auto_action == "check":
         items = ha.check(home)
+    elif args.auto_action == "install" and args.subagents_only:
+        items = ha.install_subagent_hooks(home, dry_run=args.dry_run)
     else:
         items = (ha.install if args.auto_action == "install" else ha.uninstall)(home, dry_run=args.dry_run)
     ok = all(i.action not in ha.FAIL_ACTIONS for i in items)
@@ -1640,9 +1651,41 @@ def _cmd_handoff_subagent_hook(args) -> int:
     return run_subagent_hook(args.phase)
 
 
+def _wait_seconds(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"must be a finite number of seconds >= 0, got {text!r}")
+    return value
+
+
 def _cmd_handoff_subagents(args) -> int:
-    from .handoff_subagent_registry import run_subagents
-    return run_subagents(args.pane, as_json=args.json)
+    from . import handoff_subagent_registry as registry
+    if not (args.status or args.wait is not None or args.purge):
+        return registry.run_subagents(args.pane, as_json=args.json)
+    pane = args.pane or os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        args.subagents_parser.error("--pane is required (or set HERDR_PANE_ID)")
+    if args.purge:
+        removed = registry.purge_pane(pane, os.environ)
+        if args.json:
+            _print_json({"purged": removed})
+        else:
+            print(removed)
+        return 0
+    if args.wait is None:
+        state = registry.status(pane, os.environ)
+        idle = True
+    else:
+        state = registry.wait_status(pane, os.environ, args.wait)
+        idle = state.live == 0
+    if args.json:
+        _print_json({"known": state.known, "live": state.live})
+    else:
+        print(f"known={str(state.known).lower()} live={state.live}")
+    return 0 if idle else 3
 
 
 def _percent_arg(value: str) -> float:
