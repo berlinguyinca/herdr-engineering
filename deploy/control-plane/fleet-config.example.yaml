@@ -33,6 +33,8 @@ sections:
       #   upstream: "http://control-plane-web:8080"
       #   # operator_post_allowlist: ["POST /api/v1/attention/ack"]   # "METHOD /path"; * = one segment, trailing ** = rest
       #   #   default = the dashboard's own write actions (see control_plane/dashboard_proxy.py)
+      #   # operator_read_allowlist: ["GET /api/v1/library", "GET /api/v1/library/**"]   # GET/HEAD only; these reads get the operator key
+      #   #   default = the member artifact library (GET and HEAD, bare path and below)
       rustfs_endpoint: "http://rustfs:9000"
       minio_user: "REDACTED"        # the object store's access key (what the web reads)
       minio_password: "REDACTED"

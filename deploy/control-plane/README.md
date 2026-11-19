@@ -190,7 +190,10 @@ so with `control_plane.api_keys` on the UI and every GET return 401. The optiona
 `dashboard-proxy` compose profile runs `herdr-eng control-plane dashboard-proxy`, a
 same-origin reverse proxy for browser traffic that adds the key server-side:
 
-- GET/HEAD (static UI, JSON, SSE streamed unbuffered) use the `viewer` key.
+- GET/HEAD (static UI, JSON, SSE streamed unbuffered) use the `viewer` key, except reads
+  matching `control_plane.dashboard_proxy.operator_read_allowlist` (default: `/api/v1/library`
+  and everything under it), which use the `operator` key because the library lists members'
+  artifacts and needs that role. With no `operator_key_file` they fall back to the viewer key.
 - A write uses the `operator` key only if `METHOD /path` is in
   `control_plane.dashboard_proxy.operator_post_allowlist` (default: the dashboard's own
   write actions; `*` = one path segment, trailing `**` = the rest). Anything else is 403

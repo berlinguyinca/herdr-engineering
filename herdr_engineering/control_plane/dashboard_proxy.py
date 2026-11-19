@@ -3,7 +3,10 @@
 Browsers cannot attach ``X-API-Key`` to ``EventSource`` and the dashboard code sends no key at all, so a keyed
 control plane answers every browser request with 401. This proxy sits in front of it for BROWSER traffic only:
 
-* GET/HEAD (static UI, JSON, SSE) are sent upstream with the ``viewer`` key;
+* GET/HEAD (static UI, JSON, SSE) are sent upstream with the ``viewer`` key, except those whose ``METHOD /path``
+  matches ``operator_read_allowlist`` (default: the member artifact library, which the control plane serves to the
+  ``operator`` role only): the owner treats the tailnet browser as the operator for that data. Without an operator
+  key they fall back to the viewer key and the control plane answers as it would for a viewer;
 * a mutating request is sent with the ``operator`` key only when ``METHOD /path`` matches the configured allowlist
   (default: the dashboard's own write actions); every other mutation is refused here with 403;
 * a client-supplied ``X-API-Key`` (and ``X-Forwarded-*``) is always dropped, the browser never sees a key.
@@ -53,6 +56,12 @@ DEFAULT_OPERATOR_POST_ALLOWLIST: tuple[str, ...] = (
     "POST /api/v1/build-cache/cleanup/preview",
 )
 
+# Reads that carry the operator key (same pattern syntax). The bare path needs its own entry: a trailing ``**``
+# matches one or more segments. The library routes require the operator role because they list members' artifacts.
+DEFAULT_OPERATOR_READ_ALLOWLIST: tuple[str, ...] = (
+    "GET /api/v1/library", "GET /api/v1/library/**", "HEAD /api/v1/library", "HEAD /api/v1/library/**",
+)
+
 _MUTATING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _READING = frozenset({"GET", "HEAD"})
 _HOP_BY_HOP = frozenset({"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
@@ -62,7 +71,9 @@ _NEVER_FORWARD = frozenset({"x-api-key", "host", "content-length", "x-forwarded-
                             "x-forwarded-proto", "forwarded", "x-real-ip"})
 _MAX_BODY = 128 * 1024 * 1024
 _ALLOW_ENTRY = re.compile(r"^(POST|PUT|PATCH|DELETE) (/\S*)$")
-_SETTINGS_KEYS = frozenset({"viewer_key_file", "operator_key_file", "upstream", "operator_post_allowlist"})
+_READ_ENTRY = re.compile(r"^(GET|HEAD) (/\S*)$")
+_SETTINGS_KEYS = frozenset({"viewer_key_file", "operator_key_file", "upstream", "operator_post_allowlist",
+                            "operator_read_allowlist"})
 
 
 class ProxyConfigError(Exception):
@@ -75,6 +86,7 @@ class DashboardProxySettings:
     operator_key_file: str | None = None
     upstream: str = DEFAULT_UPSTREAM
     allowlist: tuple[str, ...] = DEFAULT_OPERATOR_POST_ALLOWLIST
+    read_allowlist: tuple[str, ...] = DEFAULT_OPERATOR_READ_ALLOWLIST
 
 
 def parse_dashboard_proxy(raw) -> DashboardProxySettings | None:
@@ -100,8 +112,12 @@ def parse_dashboard_proxy(raw) -> DashboardProxySettings | None:
     if not isinstance(allow, list) or not all(isinstance(v, str) and _ALLOW_ENTRY.match(v) for v in allow):
         raise ValueError("dashboard_proxy.operator_post_allowlist must be a list of 'METHOD /path' strings "
                          "(POST, PUT, PATCH or DELETE; * = one segment, trailing ** = the rest)")
+    read_allow = raw.get("operator_read_allowlist", list(DEFAULT_OPERATOR_READ_ALLOWLIST))
+    if not isinstance(read_allow, list) or not all(isinstance(v, str) and _READ_ENTRY.match(v) for v in read_allow):
+        raise ValueError("dashboard_proxy.operator_read_allowlist must be a list of 'METHOD /path' strings "
+                         "(GET or HEAD; * = one segment, trailing ** = the rest)")
     return DashboardProxySettings(viewer.strip(), operator.strip() if operator else None, upstream.rstrip("/"),
-                                  tuple(allow))
+                                  tuple(allow), tuple(read_allow))
 
 
 def read_key_file(path: str) -> str:
@@ -150,12 +166,14 @@ class DashboardProxy:
     """Threaded reverse proxy. ``serve()`` blocks; ``shutdown()`` stops it."""
 
     def __init__(self, upstream: str, *, viewer_key: str, operator_key: str | None,
-                 allowlist: tuple[str, ...], host: str = "0.0.0.0", port: int = 8081):
+                 allowlist: tuple[str, ...],
+                 read_allowlist: tuple[str, ...] = DEFAULT_OPERATOR_READ_ALLOWLIST, host: str = "0.0.0.0", port: int = 8081):
         parts = urlsplit(upstream)
         self._scheme, self._up_host = parts.scheme, parts.hostname
         self._up_port = parts.port or (443 if parts.scheme == "https" else 80)
         self._up_netloc = parts.netloc
         self._viewer, self._operator, self._allowlist = viewer_key, operator_key, tuple(allowlist)
+        self._read_allowlist = tuple(read_allowlist)
         self._ready = threading.Event()
         proxy = self
 
@@ -184,6 +202,8 @@ class DashboardProxy:
     def key_for(self, method: str, path: str) -> tuple[str | None, int | None, str]:
         """(key, refusal status, message): the credential the request may use, or why it is refused."""
         if method in _READING:
+            if self._operator is not None and operator_allowed(self._read_allowlist, method, path):
+                return self._operator, None, ""
             return self._viewer, None, ""
         if method in _MUTATING:
             if self._operator is None:
@@ -283,4 +303,4 @@ def build_from_settings(settings: DashboardProxySettings, host: str, port: int) 
     viewer = read_key_file(settings.viewer_key_file)
     operator = read_key_file(settings.operator_key_file) if settings.operator_key_file else None
     return DashboardProxy(settings.upstream, viewer_key=viewer, operator_key=operator,
-                          allowlist=settings.allowlist, host=host, port=port)
+                          allowlist=settings.allowlist, read_allowlist=settings.read_allowlist, host=host, port=port)

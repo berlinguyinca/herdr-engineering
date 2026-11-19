@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: dashboard proxy sends the operator key for library reads
+
+- `GET /api/v1/library` through the dashboard proxy answered `403 {"error": "read-only"}`: the library routes need the `operator` role (they list members' artifacts) and the proxy sent every read with the `viewer` key. New optional `control_plane.dashboard_proxy.operator_read_allowlist` (`'GET|HEAD /path'` entries, same `*` / trailing `**` syntax; default `DEFAULT_OPERATOR_READ_ALLOWLIST` = `/api/v1/library` and below, GET and HEAD): matching reads go upstream with the operator key, all other reads keep the viewer key. Matching uses the same normalisation as the write allowlist (dot segments, encoded slashes, `//`, a trailing slash are never matched). Without an operator key the reads fall back to the viewer key. Mutating methods in this list, and GET/HEAD in `operator_post_allowlist`, are refused at validation. The cutover runbook (section 7, check 4) now states what the code answers. Tests: `tests/control_plane/test_dashboard_proxy.py`.
+
 ### Fix: run-watched review nits from #824
 
 - `scripts/ci/run-watched.py`: `Out.write` also survives a full non-blocking stdout (EAGAIN), a closed fd and a `None` stdout (it stops forwarding and keeps draining); the process group is only signalled once the root is reaped if a live process still holds that group (a reaped pid can be reused); `has_token` no longer caches negatives (a fork child reads as its parent until it execs); CPU history is keyed by (pid, start time) so a reused pid cannot corrupt deltas; signal handlers are installed before the command is spawned; bad SOFT/HARD, a missing `--` or command print a usage error and exit 2, and an unstartable command exits 127/126 with a message instead of a traceback; a hang now stops the tree with SIGTERM, a short grace, then SIGKILL (exit still 124).

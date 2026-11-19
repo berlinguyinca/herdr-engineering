@@ -11,6 +11,7 @@ import yaml
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.dashboard_proxy import (
     DEFAULT_OPERATOR_POST_ALLOWLIST,
+    DEFAULT_OPERATOR_READ_ALLOWLIST,
     DashboardProxy,
     ProxyConfigError,
     parse_dashboard_proxy,
@@ -46,9 +47,10 @@ def cp():
     thread.join(timeout=3)
 
 
-def start_proxy(cp_port, *, operator_key=OPERATOR, allowlist=DEFAULT_OPERATOR_POST_ALLOWLIST):
+def start_proxy(cp_port, *, operator_key=OPERATOR, allowlist=DEFAULT_OPERATOR_POST_ALLOWLIST,
+                read_allowlist=DEFAULT_OPERATOR_READ_ALLOWLIST):
     px = DashboardProxy(f"http://127.0.0.1:{cp_port}", viewer_key=VIEWER, operator_key=operator_key,
-                        allowlist=allowlist, host="127.0.0.1", port=0)
+                        allowlist=allowlist, read_allowlist=read_allowlist, host="127.0.0.1", port=0)
     thread = threading.Thread(target=px.serve, daemon=True)
     thread.start()
     px.wait_until_ready()
@@ -203,11 +205,27 @@ def test_parse_defaults_and_overrides():
     assert s.allowlist == ("POST /api/v1/attention/*",) and s.upstream == "http://control-plane-web:8080"
 
 
+def test_parse_read_allowlist_default_and_custom():
+    s = parse_dashboard_proxy({"viewer_key_file": "/k/v"})
+    assert s.read_allowlist == DEFAULT_OPERATOR_READ_ALLOWLIST
+    assert "GET /api/v1/library" in s.read_allowlist and "HEAD /api/v1/library/**" in s.read_allowlist
+    s = parse_dashboard_proxy({"viewer_key_file": "/k/v", "operator_read_allowlist": ["GET /api/v1/x/*"]})
+    assert s.read_allowlist == ("GET /api/v1/x/*",)
+    assert parse_dashboard_proxy({"viewer_key_file": "/k/v", "operator_read_allowlist": []}).read_allowlist == ()
+
+
 @pytest.mark.parametrize("raw", [
     "x", {"viewer_key_file": ""}, {"operator_key_file": "/k/o"}, {"viewer_key_file": "/k", "bogus": 1},
     {"viewer_key_file": "/k", "operator_post_allowlist": ["/api/v1/x"]},
     {"viewer_key_file": "/k", "operator_post_allowlist": ["GET /api/v1/x"]},
     {"viewer_key_file": "/k", "operator_post_allowlist": [1]},
+    {"viewer_key_file": "/k", "operator_post_allowlist": ["HEAD /api/v1/x"]},
+    {"viewer_key_file": "/k", "operator_read_allowlist": ["POST /api/v1/library"]},
+    {"viewer_key_file": "/k", "operator_read_allowlist": ["DELETE /api/v1/library/**"]},
+    {"viewer_key_file": "/k", "operator_read_allowlist": ["OPTIONS /api/v1/library"]},
+    {"viewer_key_file": "/k", "operator_read_allowlist": ["/api/v1/library"]},
+    {"viewer_key_file": "/k", "operator_read_allowlist": [1]},
+    {"viewer_key_file": "/k", "operator_read_allowlist": "GET /api/v1/library"},
     {"viewer_key_file": "/k", "upstream": "ftp://x"}])
 def test_parse_rejects_bad_config(raw):
     with pytest.raises(ValueError):
@@ -278,3 +296,111 @@ def test_settings_built_from_key_files_proxy_a_real_server(cp, tmp_path):
     finally:
         px.shutdown()
         thread.join(timeout=3)
+
+
+# ------------------------------------------------- operator key for library reads
+
+class KeyRecorder:
+    """A real upstream HTTP server that records the X-API-Key of each request."""
+
+    def __init__(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        seen = self.seen = []
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def _answer(self):
+                seen.append((self.command, self.path, self.headers.get("X-API-Key")))
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+
+            do_GET = do_HEAD = _answer
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=3)
+
+
+@pytest.fixture
+def recorder():
+    rec = KeyRecorder()
+    yield rec
+    rec.stop()
+
+
+def keyed_get(rec, method, path, **kwargs):
+    px, thread = start_proxy(rec.port, **kwargs)
+    try:
+        rec.seen.clear()
+        status, _ = call(px.port, method, path)
+        return status, [k for _m, _p, k in rec.seen]
+    finally:
+        px.shutdown()
+        thread.join(timeout=3)
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+@pytest.mark.parametrize("path", ["/api/v1/library", "/api/v1/library/items",
+                                  "/api/v1/library/items/abc/content?x=1", "/api/v1/library?limit=5"])
+def test_library_reads_carry_the_operator_key(recorder, method, path):
+    assert keyed_get(recorder, method, path) == (200, [OPERATOR])
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+@pytest.mark.parametrize("path", ["/api/v1/sessions", "/api/v1/artifacts", "/api/v1/libraryx", "/api/v1/library-x/y",
+                                  "/", "/api/v1/artifact-members"])
+def test_other_reads_keep_the_viewer_key(recorder, method, path):
+    assert keyed_get(recorder, method, path) == (200, [VIEWER])
+
+
+@pytest.mark.parametrize("path", [
+    "/api/v1/library/../sessions", "/api/v1/library/%2e%2e/sessions", "/api/v1/library/%2E%2E/sessions",
+    "/api/v1/library/./../sessions", "/api/v1/library%2fitems", "/api/v1/library%2Fitems", "/api/v1/library/..%2fsessions",
+    "/api/v1/library//items", "/api/v1/library/", "/api/v1/library/%00", "/api/v1/library\\items", "/api/v1/%6cibrary/../sessions"])
+def test_tricky_library_paths_never_get_the_operator_key(recorder, path):
+    status, keys = keyed_get(recorder, "GET", path)
+    assert OPERATOR not in keys
+
+
+def test_library_read_without_operator_key_falls_back_to_the_viewer_key(recorder):
+    assert keyed_get(recorder, "GET", "/api/v1/library", operator_key=None) == (200, [VIEWER])
+
+
+def test_empty_read_allowlist_sends_the_viewer_key_for_library(recorder):
+    assert keyed_get(recorder, "GET", "/api/v1/library", read_allowlist=()) == (200, [VIEWER])
+
+
+def test_custom_read_allowlist_is_honoured(recorder):
+    allow = ("GET /api/v1/artifacts/*",)
+    assert keyed_get(recorder, "GET", "/api/v1/artifacts/a", read_allowlist=allow) == (200, [OPERATOR])
+    assert keyed_get(recorder, "GET", "/api/v1/library", read_allowlist=allow) == (200, [VIEWER])
+    assert keyed_get(recorder, "HEAD", "/api/v1/artifacts/a", read_allowlist=allow) == (200, [VIEWER])
+
+
+def test_library_post_through_the_proxy_stays_governed_by_the_post_allowlist(cp):
+    px, thread = start_proxy(cp.port, allowlist=())
+    try:
+        assert call(px.port, "POST", "/api/v1/library", body={})[0] == 403
+    finally:
+        px.shutdown()
+        thread.join(timeout=3)
+
+
+def test_library_get_through_the_proxy_reaches_the_real_route(cp, proxy):
+    # Direct with the viewer key the route is 403 (operator role); through the proxy it is past the role check.
+    assert call(cp.port, "GET", "/api/v1/library", headers={"X-API-Key": VIEWER})[0] == 403
+    assert call(proxy.port, "GET", "/api/v1/library")[0] != 403
