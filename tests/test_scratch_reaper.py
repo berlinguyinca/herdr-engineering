@@ -1385,3 +1385,97 @@ def test_unreadable_quarantine_day_does_not_stop_healthy_expiry(tree: Tree) -> N
         assert report.quarantine_bytes is None
     finally:
         day.chmod(0o700)
+
+
+def _tmp_root_dir() -> Path:
+    import tempfile
+
+    return Path(os.path.realpath(tempfile.mkdtemp(dir="/tmp", prefix="reaper-root-")))
+
+
+def test_default_root_ignores_unsafe_claude_code_tmpdir(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from herdr_engineering.scratch_reaper import default_root
+
+    name = f"claude-{os.getuid()}"
+    monkeypatch.setenv("CLAUDE_CODE_TMPDIR", "relative/dir")
+    with caplog.at_level("WARNING"):
+        assert default_root().name == name
+    assert "ignoring CLAUDE_CODE_TMPDIR" in caplog.text
+
+
+def test_default_root_honours_safe_claude_code_tmpdir(monkeypatch: pytest.MonkeyPatch) -> None:
+    import shutil
+
+    from herdr_engineering.scratch_reaper import default_root
+
+    base = _tmp_root_dir()
+    try:
+        (base / f"claude-{os.getuid()}").mkdir()
+        monkeypatch.setenv("CLAUDE_CODE_TMPDIR", str(base))
+        assert default_root() == base / f"claude-{os.getuid()}"
+    finally:
+        shutil.rmtree(base)
+
+
+def test_env_root_problem_reports_each_rejection() -> None:
+    import shutil
+
+    from herdr_engineering.scratch_reaper import _env_root_problem
+
+    base = _tmp_root_dir()
+    try:
+        assert _env_root_problem(str(base)) == "does not exist"
+        target = base / f"claude-{os.getuid()}"
+        target.write_text("x")
+        assert _env_root_problem(str(base)) == "not a real directory (symlink or file)"
+        target.unlink()
+        target.mkdir()
+        assert _env_root_problem(str(base)) is None
+        assert _env_root_problem("rel") == "not absolute"
+    finally:
+        shutil.rmtree(base)
+
+
+def test_env_root_problem_rejects_dir_outside_system_temp(tmp_path: Path) -> None:
+    from herdr_engineering.scratch_reaper import _env_root_problem, _under_system_temp
+
+    outside = Path.home() / ".cache"
+    if not _under_system_temp(tmp_path):
+        (tmp_path / f"claude-{os.getuid()}").mkdir()
+        assert (
+            _env_root_problem(str(tmp_path))
+            == "not under a system temp directory, or reached through a symlink"
+        )
+    assert not _under_system_temp(outside)
+    assert not _under_system_temp(Path("/tmp/a/../b"))
+
+
+def test_under_system_temp_rejects_symlinked_component() -> None:
+    import shutil
+
+    from herdr_engineering.scratch_reaper import _under_system_temp
+
+    base = _tmp_root_dir()
+    try:
+        real = base / "real"
+        real.mkdir()
+        (base / "link").symlink_to(real)
+        assert _under_system_temp(real)
+        assert not _under_system_temp(base / "link" / "child")
+        assert not _under_system_temp(Path("/tmp"))
+    finally:
+        shutil.rmtree(base)
+
+
+def test_claude_config_dirs_includes_configured_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from herdr_engineering.scratch_reaper import claude_config_dirs, default_live_roots
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    assert claude_config_dirs()[0] == tmp_path
+    assert tmp_path / "projects" in default_live_roots()
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    assert claude_config_dirs() == [Path.home() / ".claude"]

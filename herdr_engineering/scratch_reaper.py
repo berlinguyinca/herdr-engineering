@@ -185,7 +185,7 @@ def system_temp_roots() -> tuple[Path, ...]:
     if sys.platform == "darwin":
         value = ""
         try:
-            value = os.confstr("CS_DARWIN_USER_TEMP_DIR")
+            value = os.confstr("CS_DARWIN_USER_TEMP_DIR") or ""
         except (AttributeError, ValueError, OSError):
             try:
                 value = subprocess.run(
