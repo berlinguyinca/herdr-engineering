@@ -65,9 +65,19 @@ class Refusal(Exception):
 
 
 def scratch_root() -> Path:
-    """Claude's scratch root, resolved exactly as ``scratch_reaper`` does (``/tmp/claude-<uid>``)."""
+    """Claude's scratch root, resolved exactly as ``scratch_reaper`` does: ``claude-<uid>`` under a
+    validated ``$CLAUDE_CODE_TMPDIR``, else ``/tmp/claude-<uid>``."""
     from .scratch_reaper import default_root
     return default_root()
+
+
+def guard_roots(scratch: Path) -> list[Path]:
+    """Every location a live session may sit in: the resolved root, the default ``/tmp/claude-<uid>``
+    and the raw ``$CLAUDE_CODE_TMPDIR`` one, even when that was rejected as a deletion root."""
+    roots = [scratch, Path(f"/tmp/claude-{os.getuid()}")]
+    if base := os.environ.get("CLAUDE_CODE_TMPDIR"):
+        roots.append(Path(base) / f"claude-{os.getuid()}")
+    return list(dict.fromkeys(roots))
 
 
 def default_roots(home: Path | None = None, scratch: Path | None = None) -> list[Path]:
@@ -144,40 +154,37 @@ def _git(cwd: Path, *args: str, timeout: int | None = None) -> subprocess.Comple
     return safe_git(cwd, *options, *args, timeout=GIT_TIMEOUT if timeout is None else timeout)
 
 
-_EXCLUDES: dict[tuple[str, str], str] = {}
+_EXCLUDES: dict[str, str] = {}
 
 
-def _has_conditional_includes(home: str) -> bool:
-    """``[includeIf]`` in the user's own global config: only then does the answer depend on the repository."""
-    for name in (".gitconfig", ".config/git/config"):
-        try:
-            if "includeif" in (Path(home) / name).read_text(errors="replace").lower():
-                return True
-        except OSError:
-            continue
-    return False
+def reset_excludes_cache() -> None:
+    """Forget the resolved excludes files; called at the start of every run."""
+    _EXCLUDES.clear()
 
 
 def _user_excludes_file(home: str, cwd: str) -> str:
-    """``core.excludesFile`` of the user's own global git config, the one setting the hardened
-    runner keeps from it. ``--includes`` follows ``[include]`` (dotfile managers put ``core.*`` in an
-    included file). Resolved once per home; once per repository only when ``[includeIf]`` exists.
-    A failed or timed-out lookup is not remembered. Empty when unset."""
-    where = cwd if _has_conditional_includes(home) else home
-    if (home, where) in _EXCLUDES:
-        return _EXCLUDES[home, where]
+    """``core.excludesFile`` of the user's own global git config (``~/.gitconfig``, the XDG file and
+    everything they ``[include]``/``[includeIf]``), the one setting the hardened runner keeps from it.
+    Asked of git itself from inside the repository, so an ``includeIf`` resolves per repository, and
+    remembered per directory for the run (see ``reset_excludes_cache``). No home means no global
+    config: none, remembered. A failed or timed-out lookup is not remembered. Empty when unset."""
+    if cwd in _EXCLUDES:
+        return _EXCLUDES[cwd]
+    if not home:
+        _EXCLUDES[cwd] = ""
+        return ""
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     try:
         done = subprocess.run(["git", "config", "--global", "--includes", "--type=path", "--get",
                                "core.excludesFile"],
                               capture_output=True, text=True, timeout=15, check=False, env=env,
-                              cwd=where if Path(where).is_dir() else None)
+                              cwd=cwd if Path(cwd).is_dir() else None)
     except (OSError, subprocess.SubprocessError):
         return ""
     value = done.stdout.strip() if done.returncode == 0 else ""
     value = value if value.startswith("/") else ""
     if done.returncode in (0, 1):  # 1: simply not set
-        _EXCLUDES[home, where] = value
+        _EXCLUDES[cwd] = value
     return value
 
 
@@ -654,7 +661,7 @@ def own_sessions(home: Path | None = None) -> frozenset[str]:
     return frozenset(found)
 
 
-def _guard_scratch(path: Path, scratch: Path, live_roots: list[Path], now: float) -> None:
+def _guard_scratch(path: Path, scratches: list[Path], live_roots: list[Path], now: float) -> None:
     """Under Claude's scratch root only strictly inside a ``<session>`` dir, never the root, a
     ``<project>`` dir or the session dir itself. ``.keep`` protects. The caller's own session
     (see ``own_sessions``) is free to clean up after itself; any other session must pass
@@ -663,7 +670,7 @@ def _guard_scratch(path: Path, scratch: Path, live_roots: list[Path], now: float
     from .scratch_safety import inspect_tree, keep_ancestor
     policy = Policy()
     own = own_sessions()
-    for base in _bases([scratch]):
+    for base in _bases(scratches):
         parts = relative_parts(path, base)
         if parts is None:
             continue
@@ -684,7 +691,7 @@ def _guard_scratch(path: Path, scratch: Path, live_roots: list[Path], now: float
         return
 
 
-def _remove_tmp(path: Path, *, dry_run: bool, scratch: Path, live_roots: list[Path],
+def _remove_tmp(path: Path, *, dry_run: bool, scratch: list[Path], live_roots: list[Path],
                 now: float) -> dict[str, Any]:
     _guard_scratch(path, scratch, live_roots, now)
     _refuse_git(path)
@@ -706,6 +713,7 @@ def cleanup(scope: Scope | str, path: Path | str | None, *, roots: list[Path], d
             scratch_root: Path | None = None,
             live_roots: list[Path] | None = None, now: float | None = None) -> dict[str, Any]:
     """Remove one thing; returns a report dict or raises ``Refusal`` (never a raw timeout/OSError)."""
+    reset_excludes_cache()
     try:
         return _cleanup(scope, path, roots=roots, dry_run=dry_run, merged_ok=merged_ok,
                         state_dir=state_dir, temp_roots=temp_roots,
@@ -745,7 +753,7 @@ def _cleanup(scope: Scope | str, path: Path | str | None, *, roots: list[Path], 
     else:
         from .scratch_reaper import default_live_roots
         extra = _remove_tmp(target, dry_run=dry_run,
-                            scratch=scratch,
+                            scratch=guard_roots(scratch),
                             live_roots=default_live_roots() if live_roots is None else live_roots,
                             now=now)
     return {"scope": scope, "path": str(target), "dry_run": dry_run,

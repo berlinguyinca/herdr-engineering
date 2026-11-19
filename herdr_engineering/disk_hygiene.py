@@ -56,6 +56,7 @@ from .cleanup_command import (
     default_temp_worktree_parents,
     gh_pr_state,
     remove_worktree,
+    reset_excludes_cache,
     user_disk_hygiene_config,
     worktree_quick_facts,
 )
@@ -323,6 +324,7 @@ def reap_worktrees(policy: Policy, *, dry_run: bool = False, extra_repos: list[P
                    extra_roots: list[str] | None = None, now: float | None = None,
                    temp_worktree_parents: list[Path] | None = None,
                    scratch_root: Path | None = None) -> dict[str, Any]:
+    reset_excludes_cache()
     roots = configured_roots([*policy.roots, *(extra_roots or [])], scratch=scratch_root)
     parents = default_temp_worktree_parents() if temp_worktree_parents is None else temp_worktree_parents
     repos = [*policy.repos, *(extra_repos or [])] or find_repos(roots, parents)

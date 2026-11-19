@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import os
-import shutil
-import stat
 import subprocess
 import time
 from pathlib import Path
@@ -12,7 +10,6 @@ import pytest
 
 from herdr_engineering.cleanup_command import (
     Refusal,
-    _git,
     check_worktree_removable,
     cleanup,
     default_roots,
@@ -75,6 +72,7 @@ def test_the_scratch_root_follows_claude_code_tmpdir(tmp_path: Path, monkeypatch
     monkeypatch.delenv("CLAUDE_CODE_TMPDIR", raising=False)
     assert default_root() == Path(f"/tmp/claude-{os.getuid()}")
     monkeypatch.setenv("CLAUDE_CODE_TMPDIR", str(tmp_path))
+    (tmp_path / f"claude-{os.getuid()}").mkdir()  # only a real, user-owned directory is honoured
     assert default_root() == tmp_path / f"claude-{os.getuid()}"
 
 
@@ -116,24 +114,6 @@ def test_quick_facts_does_not_walk_rebuildable_trees_but_settle_does(env: Env, h
         settle_worktree(wt, facts, ())
     with pytest.raises(Refusal, match="ignored_files"):
         cleanup("worktree", wt, roots=env.roots)
-
-
-# --- 7: the user's excludes file is resolved once per run ----------------------------------------------------
-
-def test_the_excludes_file_is_resolved_once_for_many_worktrees(env: Env, tmp_path: Path, home: Path,  # noqa: F811
-                                                               monkeypatch: pytest.MonkeyPatch) -> None:
-    real = shutil.which("git")
-    assert real
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    log = tmp_path / "config-calls.log"
-    wrapper = bindir / "git"  # a recording pass-through to the real git
-    wrapper.write_text(f'#!/bin/sh\ncase "$*" in *"config --global"*) echo x >> {log};; esac\nexec {real} "$@"\n')
-    wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
-    for name in ("one", "two", "three"):
-        _git(env.worktree(name), "status")
-    assert len(log.read_text().splitlines()) == 1
 
 
 # --- 8: an empty head never counts as a merged PR head --------------------------------------------------------

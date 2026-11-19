@@ -10,11 +10,13 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import logging
 import math
 import os
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -172,11 +174,61 @@ class Report:
         return cast(dict[str, object], value)
 
 
+_SYSTEM_TEMP = (Path("/tmp"), Path("/private/tmp"), Path("/var/folders"), Path("/private/var/folders"))
+
+
+def _under_system_temp(candidate: Path) -> bool:
+    """Under a system temp dir with no symlinked component below it."""
+    temps = [*_SYSTEM_TEMP, Path(tempfile.gettempdir()), Path(tempfile.gettempdir()).resolve()]
+    if tmpdir := os.environ.get("TMPDIR"):
+        temps.append(Path(tmpdir))
+    for temp in temps:
+        try:
+            below = candidate.relative_to(temp)
+        except ValueError:
+            continue
+        walk = temp
+        for part in below.parts:
+            walk = walk / part
+            if walk.is_symlink():
+                return False
+        return True
+    return False
+
+
+def _env_root_problem(base: str) -> str | None:
+    """Why ``$CLAUDE_CODE_TMPDIR/claude-<uid>`` may not be a deletion root; None when it may."""
+    candidate = Path(base) / f"claude-{os.getuid()}"
+    if not candidate.is_absolute():
+        return "not absolute"
+    try:
+        info = candidate.lstat()
+    except OSError:
+        return "does not exist"
+    if not stat.S_ISDIR(info.st_mode):
+        return "not a real directory (symlink or file)"
+    if info.st_uid != os.getuid():
+        return "not owned by this user"
+    if not _under_system_temp(candidate):
+        return "not under a system temp directory, or reached through a symlink"
+    return None
+
+
 def default_root() -> Path:
     """Claude Code's scratch root: ``claude-<uid>`` under ``$CLAUDE_CODE_TMPDIR`` (``/tmp`` when
     unset). Checked against Claude Code 2.1.306: it reads only that variable for the base directory;
-    ``CLAUDE_TMPDIR`` is the TMPDIR it hands to sandboxed commands, not a session root."""
-    return Path(os.environ.get("CLAUDE_CODE_TMPDIR") or "/tmp") / f"claude-{os.getuid()}"
+    ``CLAUDE_TMPDIR`` is the TMPDIR it hands to sandboxed commands, not a session root. An environment
+    variable must never widen what may be deleted, so the variable is honoured only when the result is
+    an absolute, real (not symlinked), user-owned directory under a system temp dir; otherwise it is
+    ignored with a warning and the default ``/tmp/claude-<uid>`` applies."""
+    default = Path(f"/tmp/claude-{os.getuid()}")
+    base = os.environ.get("CLAUDE_CODE_TMPDIR")
+    if not base:
+        return default
+    if problem := _env_root_problem(base):
+        logging.getLogger(__name__).warning("ignoring CLAUDE_CODE_TMPDIR=%s: %s", base, problem)
+        return default
+    return Path(base) / f"claude-{os.getuid()}"
 
 
 def default_live_roots() -> list[Path]:

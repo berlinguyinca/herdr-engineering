@@ -67,6 +67,16 @@ def _managed_process(pid: Path, proc: Path) -> bool:
     return False
 
 
+def _gone_or_zombie(pid: Path) -> bool:
+    """Exited (not yet reaped) or vanished: holds no cwd or descriptors and its ``/proc`` entries are
+    root-owned, so it must be skipped before any ancestry walk."""
+    try:
+        state = (pid / "stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):  # no readable stat: gone mid-walk (ENOENT/ESRCH) unless the entry remains
+        return not pid.exists()
+    return state in ("Z", "X")
+
+
 def _process_paths(proc: Path = Path("/proc")) -> list[Path]:
     """Inspect visible same-user processes; hidden Herdr descendants block cleanup."""
     paths = []
@@ -75,6 +85,8 @@ def _process_paths(proc: Path = Path("/proc")) -> list[Path]:
     for pid in pids:
         try:
             if int(pid.name) == os.getpid() or pid.stat().st_uid != os.getuid():
+                continue
+            if _gone_or_zombie(pid):
                 continue
             links = [pid / "cwd", pid / "exe"]
             with os.scandir(pid / "fd") as entries:
@@ -89,6 +101,8 @@ def _process_paths(proc: Path = Path("/proc")) -> list[Path]:
         except FileNotFoundError:  # process exited during inspection
             continue
         except PermissionError:
+            if _gone_or_zombie(pid):  # became a zombie or exited since the check above
+                continue
             if _managed_process(pid, proc):
                 raise
             # Nondumpable daemons outside Herdr cannot be managed build jobs.
