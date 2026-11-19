@@ -534,3 +534,72 @@ with `herdr-eng handoff controller run`.
 * An agent that turns `blocked` right after a failed prompt is reported as typed; the screen cannot say whether the text went in.
 * Tests that need Herdr (`herdr_server`, `herdr_live`) skip in CI, so CI does not cover those paths; the decision logic is
   unit-tested without Herdr.
+
+## Session side pane
+
+The side pane is a read-only viewer that sits to the right of your sessions in a Herdr tab. It shows the focused session of
+its own tab: where the work stands, the handoff chain that led to it, and the state of its pull requests and CI. It never
+types into a session, never changes a record and never closes anything but itself.
+
+### What it shows
+
+It has three tabs, switched with `1`, `2`, `3` or `Tab`. The tab bar puts a dot after the name of a tab that needs a look
+(a handoff chain that is stuck or failed, a CI run that is running or failing).
+
+* **Summary**: the latest briefing of the chain as Goal, Done, Now and Next, and at which handoff it was written ("no briefing yet" before the first one; a fallback briefing is marked).
+* **Handoffs**: the chain as a small vertical tree, oldest session at the top, with total handoffs and total time. Each
+  row is one session. `▶` is the live session; `●` is a session that was handed off; `?` is a root whose predecessor record
+  is not in the store (the chain starts earlier than the store knows). The colour of a row is the colour of the handoff
+  that ended it: green "handed off", orange "failed, continued in compaction", red "stuck" followed by the reason from
+  the table in "Terminal outcomes and what to do". The live session carries its context gauge and what it is waiting for.
+  A line "N unreadable events" means N lines of the event log were skipped because their time could not be read.
+* **CI**: one card per pull request of the focused session's branch, with its workflows as small chips (running yellow,
+  passed green, failing red). Grey "not started" means nothing ran yet (that is not a failure); "CI unavailable" means the
+  reads failed; a card marked "(stale)" is the last good reading, kept because the latest read took longer than 90 seconds
+  or failed, and a stale card never raises the dot.
+
+### Where and when it appears
+
+There is one side pane per tab, on the right. The handoff controller creates it when it first sees a managed session in
+that tab and never manages the pane itself: the controller ignores it when it looks for sessions. A tab too narrow for it
+gets none. Opening it does not take the focus: it acts on focus only when the new pane holds it, and then it restores the
+focus to the pane you were in by pane id. If Herdr cannot restore the focus by id, the focus stays on the side pane and
+`herdr-eng side-pane ensure` prints `(focus: left_on_side_pane)`; for the first two seconds the viewer ignores `q`, so a
+stray key cannot dismiss it.
+
+### Keys, closing and reopening
+
+`1`, `2`, `3` and `Tab` switch tabs; `q` closes the pane. Nothing else does anything. To open it again run
+`herdr-eng side-pane ensure --tab TAB_ID` (the tab id is in `herdr tab list`); if the plugin is linked, the action
+"Open session side pane" does the same in the tab it is run in.
+
+### Closing is remembered
+
+Herdr has no collapse, so a closed pane is gone. A side pane that ends in any way other than `ensure` replacing it (`q`,
+closing it in Herdr, a signal, a crash) counts as closed by you for that tab. The controller does not reopen it until a new
+managed session appears in the tab. `ensure --tab` forgets this and opens it again. A pane that was started but never ran
+(its process never wrote its marker) is treated as dead and replaced, once.
+
+### What it reads, and how often
+
+It only reads. The sources are the controller's event log and the handoff records in the shared store
+(`HERDR_HANDOFF_STORE`), Herdr itself for the tab, its panes and the focused session, the session's own record for the
+context gauge, `gh pr list` for pull requests, and Woodpecker's public reads for pipelines. `gh pr list` runs with your own
+`gh` login, in the focused session's directory and for its branch. No Woodpecker token is read, used or written. Focus,
+the event log and the gauge are read every 2 seconds; CI every 90 seconds. A CI read that takes longer than 90 seconds is
+abandoned and the last good cards stay on screen, marked stale. The pane keeps at most the newest 20000 events in memory.
+
+### Known limits
+
+* The duration of the first (root) session of a chain is unknown, because its start is not recorded; it shows no time.
+* Zero-width joiners and combining marks are dropped from titles and reasons, so some emoji and accented text render
+  plainer than in the session.
+* A chain that spans repositories shows the pull requests of the focused session's repository only.
+* A pane id can be reused by Herdr after a restart, so the pane checks a terminal id, process id and start time before it
+  trusts its own marker.
+* The plugin that gives the "Open session side pane" action is not linked by `scripts/install.sh` (it has no plugin step).
+  Link it by hand with `herdr plugin link deploy/herdr-session-pane-plugin`, and put `herdr-eng` where Herdr's own
+  environment finds it. The controller opens the pane without the plugin, so only the action needs it.
+* To look at a frame without a terminal: `herdr-eng side-pane run --tab TAB_ID --snapshot --tab-view handoffs --width 60
+  --session-pane PANE_ID --session-id SESSION_ID` prints one frame and exits. With neither `--tab` nor `--pane` (and no
+  `$HERDR_PANE_ID`) it exits 2.

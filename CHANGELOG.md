@@ -13,6 +13,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - The old per-harness auto-handoff policies are retired by plan 5 in the same release; they must not run alongside the controller.
 - Not yet verified by a live run (`tests/e2e/test_handoff_controller_live.py`, opt in with `HERDR_HANDOFF_LIVE_E2E=1`): the headless flags per harness and the Herdr agent names of Codex and OpenCode. See `docs/operations/handoff.md`.
 
+### Session side pane
+
+- New `herdr_engineering/side_pane/` and `herdr-eng side-pane run|ensure`: a read-only viewer to the right of the sessions of a Herdr tab, one per tab, created by the handoff controller with the first managed session. Three tabs (Summary, Handoffs, CI; keys `1` `2` `3` `Tab`, `q` closes). It reads the controller's event log, the shared handoff store, Herdr, `gh pr list` with your own gh login and Woodpecker's public reads (no Woodpecker token).
+- Focus and dismissal: opening the pane acts on focus only when the new pane holds it and restores it by pane id (else a typed `left_on_side_pane` outcome); `q` is ignored for the first 2 seconds; a pane closed any way other than `ensure` counts as dismissed for that tab until a new managed session appears. `herdr-eng side-pane ensure --tab TAB_ID` reopens it; the plugin `deploy/herdr-session-pane-plugin/` adds an "Open session side pane" action (not linked by `scripts/install.sh`).
+- `side-pane run --snapshot --tab-view {summary,handoffs,ci} --width N` renders one frame to stdout without Herdr; `tests/test_side_pane_snapshot.py` runs it in CI against a real event log. Live check: `tests/e2e/test_side_pane_live.py` (opt in with `HERDR_HANDOFF_LIVE_E2E=1`, spends model tokens, not run in CI).
+
 ### Fix: run-watched review nits from #824
 
 - `scripts/ci/run-watched.py`: `Out.write` also survives a full non-blocking stdout (EAGAIN), a closed fd and a `None` stdout (it stops forwarding and keeps draining); the process group is only signalled once the root is reaped if a live process still holds that group (a reaped pid can be reused); `has_token` no longer caches negatives (a fork child reads as its parent until it execs); CPU history is keyed by (pid, start time) so a reused pid cannot corrupt deltas; signal handlers are installed before the command is spawned; bad SOFT/HARD, a missing `--` or command print a usage error and exit 2, and an unstartable command exits 127/126 with a message instead of a traceback; a hang now stops the tree with SIGTERM, a short grace, then SIGKILL (exit still 124).
