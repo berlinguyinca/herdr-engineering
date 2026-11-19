@@ -5,6 +5,26 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: Codex second-reviewer follow-ups from #820 (always-on-review.py)
+
+- Codex spend is counted when Codex fails: a non-zero exit, time cap or missing answer after it reported tokens logs a
+  `tier: codex` line with the priced `usage` (counts toward `daily_budget_usd`); with no tokens the line says
+  `usage_unknown: true` and no cost is invented.
+- A clean Opus approve is remembered per head in `state.json` (`opus_approved`, with the tier model) when only Codex
+  failed to run, so the retry runs Codex alone; a new head, another model or `--force` reruns Opus. Cooldown and
+  budget rules are unchanged; the entry is cleared once a verdict is posted.
+- Config: `risky: null` / `risky.codex: null` mean the defaults; non-list or non-string `risky.globs` raise a config
+  error naming the entry; a glob with a trailing `/` (`deploy/`) means `deploy/**`.
+- A failed reviewer's `why` falls back to the first 300 characters of stdout (control characters stripped) when stderr is
+  empty (claude prints its errors to stdout). A usage-limit message logs `why: usage-limit: ...`, is not a cooldown
+  strike (state `limit_sha` lets the next poll retry), and stops the poll launching more reviews of that tier in the run.
+- Review fixes: Codex has its own usage-limit bucket (a Codex limit skips only later risky PRs, before Opus; an Opus
+  limit still stops Opus for the poll; a PR stuck on a limit is polled after the others). Codex limit detection scans
+  only stderr and the `error` / `turn.failed` events, never command output. `opus_approved` also records the base sha
+  (a retarget reruns Opus). A glob of only `**` / `**/` is refused.
+- Rollback: revert this PR. The extra `state.json` keys (`opus_approved`, `limit_sha`) are ignored by older code;
+  `risky: null` then fails the old config check, so restore a mapping (or remove the key) first.
+
 ### Fix: ui-gates reports on every pull request
 
 - `.woodpecker/ui-gates.yml` drops its `path:` filter for an `applicability` step (`scripts/ci/unit-gates-applicable.sh ui`), so the `ui-gates` context can be required without blocking PRs that touch no UI path. The decision reads `CI_PIPELINE_EVENT` (what Woodpecker exports) with `CI_EVENT` as fallback, and the `ui` case also covers `pyproject.toml`, `scripts/ci/journal.sh` and `scripts/ci/cache-trust.sh`, which `ui-gates.sh` depends on.
