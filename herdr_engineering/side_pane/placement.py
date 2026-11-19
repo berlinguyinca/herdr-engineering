@@ -15,14 +15,15 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
 from ..handoff_controller.herdr_cli import AgentPane, harness_for_agent_name
-from ..handoff_controller.run import default_bin_dirs
 from . import state
 from .herdr import Layout, PaneRow, SideHerdr
 
@@ -31,6 +32,8 @@ MIN_SESSION_WIDTH = 60  # columns the session keeps at least; a narrower tab get
 LOCK_TIMEOUT_S = 10.0
 CLOSE_WAIT_S = 5.0
 DEFAULT_COMMAND = "exec herdr-eng side-pane run"
+CLEANUP_RESERVE_S = 1.0  # of a call's budget, kept for recording or removing what the work left
+CARRIED_ENV = ("HERDR_ENGINEERING_STATE", "HERDR_HANDOFF_STORE", "HOME")  # what decides the state dir and the store of the runner
 
 
 class Outcome(StrEnum):
@@ -133,16 +136,28 @@ def decide(*, rows: Sequence[PaneRow], sessions: Sequence[PaneRow], marker: stat
     return Decision(None, target=target, ratio=ratio, owner=owner, **keep)
 
 
+def _bin_dirs(env: Mapping[str, str]) -> list[Path]:
+    """Where user programs usually live (the controller's rule, restated so this package does not import the controller loop)."""
+    configured = env.get("HERDR_HANDOFF_BIN_DIRS")
+    if configured is not None:
+        return [Path(part) for part in configured.split(":") if part]
+    home = env.get("HOME") or str(Path.home())
+    return [Path(home) / ".local" / "bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin")]
+
+
 def runner_command(command: str, env: Mapping[str, str]) -> str | None:
     """The command to type into the new pane. The default one is made absolute (the pane's shell may have a short PATH):
-    `herdr-eng` is looked for on PATH, then in the controller's usual bin dirs; None when it is nowhere. A command given
-    by hand is used as it is."""
+    `herdr-eng` is looked for on PATH, then in the controller's usual bin dirs; None when it is nowhere. The variables that
+    decide the runner's state dir and store are passed explicitly (the pane's shell has Herdr's environment, not ours), so
+    the marker lands where `ensure` and the controller look. A command given by hand is used as it is."""
     if command != DEFAULT_COMMAND:
         return command
-    search = os.pathsep.join([env["PATH"] if "PATH" in env else os.environ.get("PATH", ""),
-                              *map(str, default_bin_dirs(env))])
+    search = os.pathsep.join([env["PATH"] if "PATH" in env else os.environ.get("PATH", ""), *map(str, _bin_dirs(env))])
     found = shutil.which("herdr-eng", path=search)
-    return f"exec {shlex.quote(found)} side-pane run" if found else None
+    if not found:
+        return None
+    carried = [f"{name}={env[name]}" for name in CARRIED_ENV if env.get(name)]
+    return f"exec {shlex.join(['env', *carried]) + ' ' if carried else ''}{shlex.quote(found)} side-pane run"
 
 
 def settle_focus(herdr: SideHerdr, created: str, previous: str | None) -> FocusOutcome:
@@ -161,14 +176,36 @@ def settle_focus(herdr: SideHerdr, created: str, previous: str | None) -> FocusO
     return FocusOutcome.RESTORED if landed == previous and back is not None and back.focused else FocusOutcome.UNKNOWN
 
 
+def _note(text: str) -> None:
+    print(f"herdr-eng side-pane: {text}", file=sys.stderr)
+
+
+@contextmanager
+def _within(herdr: SideHerdr, budget_s: float | None) -> Iterator[None]:
+    """Give every Herdr call in the block what is left of `budget_s` (None: no limit), keeping `CLEANUP_RESERVE_S` for cleanup."""
+    if budget_s is None:
+        yield
+        return
+    end = time.monotonic() + max(budget_s, 0.0)
+    herdr.hard_deadline = end
+    herdr.deadline = end - min(CLEANUP_RESERVE_S, budget_s / 4)
+    try:
+        yield
+    finally:
+        herdr.deadline = herdr.hard_deadline = None
+
+
 def ensure(tab_id: str, target_pane: str | None = None, herdr: SideHerdr | None = None,
            env: Mapping[str, str] | None = None, *, command: str = DEFAULT_COMMAND, force: bool = False,
-           lock_timeout_s: float = LOCK_TIMEOUT_S, start_grace_s: float = state.STARTUP_GRACE_S) -> EnsureResult:
-    """Open the side pane of `tab_id` unless it has one, the user closed it, or the tab is too narrow. Never raises."""
+           lock_timeout_s: float = LOCK_TIMEOUT_S, start_grace_s: float = state.STARTUP_GRACE_S,
+           budget_s: float | None = None) -> EnsureResult:
+    """Open the side pane of `tab_id` unless it has one, the user closed it, or the tab is too narrow. Never raises.
+    `lock_timeout_s=0` never waits for another process that is creating the pane (LOCKED). With `budget_s` the whole call
+    stays within that many seconds: every Herdr call gets what is left, and an exhausted budget is UNAVAILABLE."""
     herdr = herdr or SideHerdr()
     env = os.environ if env is None else env
     root = state.state_dir(env)
-    with state.tab_lock(root, tab_id, lock_timeout_s) as held:
+    with _within(herdr, budget_s), state.tab_lock(root, tab_id, lock_timeout_s) as held:
         if not held:
             return EnsureResult(Outcome.LOCKED)
         return _ensure_locked(root, tab_id, target_pane, herdr, command, force, env, start_grace_s)
@@ -180,6 +217,16 @@ def _sessions(herdr: SideHerdr, tab_id: str, rows: Sequence[PaneRow]) -> list[Pa
         return None
     named = {a.pane_id for a in agents if a.tab_id == tab_id and harness_for_agent_name(a.name) is not None}
     return [r for r in rows if r.pane_id in named]
+
+
+def _new_pane(herdr: SideHerdr, tab_id: str, before: Sequence[PaneRow] | None) -> PaneRow | None:
+    """The one pane that appeared in `tab_id` since `before` (a split whose reply could not be read), else None."""
+    now = herdr.panes()
+    if before is None or now is None:
+        return None
+    known = {r.pane_id for r in before}
+    new = [r for r in now if r.tab_id == tab_id and r.pane_id not in known]
+    return new[0] if len(new) == 1 else None
 
 
 def _wait_gone(herdr: SideHerdr, pane_id: str, anchor: str, timeout_s: float = CLOSE_WAIT_S) -> None:
@@ -227,8 +274,12 @@ def _ensure_locked(root: Path, tab_id: str, target_pane: str | None, herdr: Side
     before = herdr.panes()
     previous = next((r.pane_id for r in before or [] if r.focused), None)
     created = herdr.split(plan.target, plan.ratio, env={})
+    herdr.release_reserve()  # a split that happened must be recorded, whatever time is left
     if created is None:
-        return EnsureResult(Outcome.UNAVAILABLE)
+        created = _new_pane(herdr, tab_id, before)
+        if created is None:
+            _note(f"split in {tab_id} gave no readable reply and no new pane was found; nothing was closed or recorded")
+            return EnsureResult(Outcome.UNAVAILABLE)
     state.write_marker(root, state.Marker(tab_id, created.pane_id, created.terminal_id, plan.owner, None, time.time()))
     state.write_shown(root, tab_id, [s.terminal_id for s in sessions])
     if not herdr.run_in(created.pane_id, runner):

@@ -35,7 +35,7 @@ from .follow import EventFollower, choose_session
 from .herdr import PaneRow, SideHerdr
 from .model import EMPTY, SidePaneModel, build_model
 from .render import Tab, render
-from .schedule import CI_REFRESH_S, EVENTS_REFRESH_S, Due
+from .schedule import CI_REFRESH_S, EVENTS_REFRESH_S, STRUCTURE_REFRESH_S, Backoff, Due
 from .style import Style, clean, line
 
 QUIT_IGNORED_S = 2.0  # q and ctrl-c do nothing this long after the viewer starts: a pane that got the focus by accident survives a stray key
@@ -109,13 +109,17 @@ class PaneApp:
                  store_root: Path | None = None, ci_interval_s: float = CI_REFRESH_S) -> None:
         self.tab_id, self.pane_id = tab_id, pane_id
         self.screen = Screen()
-        self.quit_requested = False  # the viewer quit on a q, ctrl-c or Q (see `on_quit`)
         self._shown: frozenset[str] = frozenset()
         self._herdr, self._adapter_for = herdr, adapter_for
         self._store = store_root if store_root is not None else shared_store_root(env)
         self._state = state.state_dir(env)
         self._follower = EventFollower(self._store)
         self._events_due = Due(EVENTS_REFRESH_S)
+        self._backoff = Backoff()
+        self._rows: list[PaneRow] = []  # the pane list, read when the agents changed or STRUCTURE_REFRESH_S ago
+        self._rows_at: float | None = None
+        self._agent_sig: tuple[tuple[str, str | None, str | None], ...] = ()
+        self._last_key: object = None
         self._ci = CiWorker(fetch_ci) if fetch_ci is not None else None
         self._ci_schedule = CiSchedule(self._ci, ci_interval_s) if self._ci is not None else None
         self._previous: AgentPane | None = None
@@ -128,6 +132,7 @@ class PaneApp:
 
     def tick(self, mono: float, wall: float) -> bool:
         """Refresh when the events schedule says so; True when it did."""
+        self._events_due.interval_s = self._backoff.interval_s
         if not self._events_due.take(mono):
             return False
         self.refresh(wall)
@@ -145,7 +150,20 @@ class PaneApp:
             self.tab_id = self._herdr.tab_of(self.pane_id)
         return self.tab_id
 
-    def _focused_pane(self, tab: str, rows: list[PaneRow]) -> str | None:
+    def _pane_rows(self, agents: list[AgentPane] | None, now: float) -> list[PaneRow]:
+        """The pane list, from the last read unless the agents changed, ten seconds passed, or the last read failed."""
+        signature = tuple(sorted((a.pane_id, a.tab_id, a.name) for a in agents or []))
+        stale = self._rows_at is None or signature != self._agent_sig or not 0 <= now - self._rows_at < STRUCTURE_REFRESH_S
+        if stale:
+            rows = self._herdr.panes()
+            self._rows, self._rows_at = rows or [], now if rows is not None else None
+            self._agent_sig = signature
+        return self._rows
+
+    def _focused_pane(self, tab: str, rows: list[PaneRow], agents: list[AgentPane] | None) -> str | None:
+        sessions = [a for a in agents or [] if a.tab_id == tab and a.pane_id != self.pane_id and harness_for_agent_name(a.name)]
+        if len(sessions) < 2:
+            return None  # with one session the focus cannot change the choice
         anchor = self.pane_id
         if anchor is None:
             anchor = next((r.pane_id for r in rows if r.tab_id == tab), None)
@@ -202,10 +220,10 @@ class PaneApp:
         if not self._registered:
             self._register(tab, now)
         agents = self._herdr.agents()
-        rows = self._herdr.panes() or []
+        rows = self._pane_rows(agents, now)
         terminals = {r.pane_id: r.terminal_id for r in rows}
         self._remember_shown(tab, agents, terminals)
-        chosen = choose_session(self._focused_pane(tab, rows), agents, tab, self._previous,
+        chosen = choose_session(self._focused_pane(tab, rows, agents), agents, tab, self._previous,
                                 lambda pane: state.is_marked(self._state, pane, now, terminals.get(pane.pane_id)))
         self._previous = chosen
         if chosen is None:
@@ -221,7 +239,13 @@ class PaneApp:
             self._built = (key, build_model(ref, self._store, {}, now, cards, events))
         model = self._built[1]
         percent = self._gauge(ref)
+        self._observe(now, (chosen, key, percent))
         return Snapshot(_with_gauge(model, ref, percent) if percent is not None else model, ref, _OUT if agents is None else "")
+
+    def _observe(self, now: float, key: object) -> None:
+        """Tell the refresh schedule whether anything changed; a quiet minute slows it down."""
+        self._backoff.observe(now, changed=key != self._last_key)
+        self._last_key = key
 
     def _managed_terminals(self, tab: str, agents: list[AgentPane] | None, terminals: Mapping[str, str]) -> frozenset[str]:
         """Terminal ids of the managed sessions of `tab` (this pane excluded)."""
@@ -237,12 +261,8 @@ class PaneApp:
             state.write_shown(self._state, tab, sorted(shown))
 
     def on_text(self, text: str) -> bool:
-        """The viewer's key hook: the tab keys. Quitting is the viewer's decision (`on_quit`), not any chunk with a q in it."""
+        """The viewer's key hook: the tab keys. Quitting is the viewer's decision, not any chunk with a q in it."""
         return self.screen.key(text)
-
-    def on_quit(self) -> None:
-        """Called by the viewer as it exits on a quit key."""
-        self.quit_requested = True
 
     def close(self) -> None:
         """However the pane ends: while the marker is still this pane's (`ensure` clears it before replacing a pane), the
@@ -326,7 +346,7 @@ def run_with(args: argparse.Namespace, env: Mapping[str, str] | None = None) -> 
             pass
     try:
         return run_viewer(lambda w, h: pane_app.screen.render(w, h, time.time()), scroll=False, refresh_s=REDRAW_S,
-                          on_text=pane_app.on_text, quit_ignored_s=QUIT_IGNORED_S, lone_quit=True, on_quit=pane_app.on_quit)
+                          on_text=pane_app.on_text, quit_ignored_s=QUIT_IGNORED_S, lone_quit=True)
     finally:
         stop.set()
         pane_app.close()

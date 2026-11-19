@@ -6,10 +6,12 @@ only shape its JSON. No method raises: None or False means Herdr did not answer 
 from __future__ import annotations
 
 import json
+import subprocess
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from ..handoff_controller.herdr_cli import HerdrCli
+from ..handoff_controller.herdr_cli import HerdrCli, _text
 
 _QUICK_S = 15.0
 
@@ -36,10 +38,6 @@ class Layout:
     tab_id: str
     focused_pane_id: str | None
     rects: Mapping[str, Rect]
-
-
-def _text(value: object) -> str | None:
-    return value if isinstance(value, str) and value else None
 
 
 def _int(value: object) -> int | None:
@@ -92,6 +90,23 @@ def parse_layout(text: str) -> Layout | None:
 
 
 class SideHerdr(HerdrCli):
+    """With `deadline` set (a `time.monotonic()` value), every call gets at most the time left and an expired budget answers
+    None without starting a process; `hard_deadline` is where `release_reserve` moves it, for cleanup after the work ran out."""
+    deadline: float | None = None
+    hard_deadline: float | None = None
+
+    def _run(self, args: list[str], timeout_s: float) -> subprocess.CompletedProcess[str] | None:
+        if self.deadline is not None:
+            timeout_s = min(timeout_s, self.deadline - time.monotonic())
+            if timeout_s <= 0:
+                return None
+        return super()._run(args, timeout_s)
+
+    def release_reserve(self) -> None:
+        """Let the calls that must not be skipped (recording or removing what the work left) use the whole budget."""
+        if self.hard_deadline is not None:
+            self.deadline = self.hard_deadline
+
     def _stdout(self, args: list[str]) -> str | None:
         done = self._run(args, _QUICK_S)
         return done.stdout if done is not None and done.returncode == 0 else None
