@@ -307,7 +307,9 @@ def test_the_start_of_this_process_is_found_under_a_non_english_locale():
     assert 0 <= time.time() - started < 365 * 86400
     local = subprocess.run(["ps", "-o", "lstart=", "-p", str(os.getpid())], capture_output=True, text=True,
                            env={**os.environ, "LC_ALL": "C", "LANG": "C"}).stdout.strip()
-    assert abs(started - time.mktime(time.strptime(local, "%a %b %d %H:%M:%S %Y"))) <= 2
+    # Both readings are truncated to whole seconds (up to 2 s apart) and each ps call adds its own latency on a loaded
+    # host; a locale-dependent parse would be wrong by hours or None, so a loose bound still proves the point.
+    assert abs(started - time.mktime(time.strptime(local, "%a %b %d %H:%M:%S %Y"))) <= 10
 
 
 def test_a_rollout_whose_recorded_cwd_has_a_nul_byte_is_no_candidate(tmp_path):
