@@ -54,6 +54,6 @@ herdr_pytest_parallel_load() {
 # The one test that builds ~1.77M Postgres rows (tests/control_plane/test_postgres_recovery.py) is marked `slow`: ~5.5 minutes alone and
 # over 23 under disk contention, it must not compete with the parallel workers. The gate runs everything else in parallel and the slow
 # tests serially afterwards, so coverage is identical. `-m` on the command line REPLACES pyproject's addopts expression, so both
-# expressions repeat its `not e2e and not integration` and must be kept in step with it (tests/test_ci_pytest_parallel.py checks).
-HERDR_PYTEST_FAST_MARKEXPR='not e2e and not integration and not slow'
-HERDR_PYTEST_SLOW_MARKEXPR='slow and not e2e and not integration'
+# expressions repeat its `not e2e and not integration and not herdr_live` and must be kept in step with it (tests/test_ci_pytest_parallel.py checks).
+HERDR_PYTEST_FAST_MARKEXPR='not e2e and not integration and not herdr_live and not slow'
+HERDR_PYTEST_SLOW_MARKEXPR='slow and not e2e and not integration and not herdr_live'
