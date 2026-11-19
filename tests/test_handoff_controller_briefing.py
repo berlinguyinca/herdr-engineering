@@ -231,9 +231,12 @@ def test_headless_argv_per_harness() -> None:
     assert headless_argv(Harness.PI) == [
         "pi", "-p", "--no-session", "--no-tools", "--no-extensions", "--no-mcp", "--no-skills",
         "--no-prompt-templates", "--no-context-files"]
+    assert headless_argv(Harness.CODEX) == [
+        "codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "-"]
+    assert fallback_supported(Harness.CODEX)
 
 
-@pytest.mark.parametrize("harness", [Harness.CODEX, Harness.OPENCODE])
+@pytest.mark.parametrize("harness", [Harness.OPENCODE])
 def test_harness_without_a_proven_tool_off_switch_is_unsupported(harness: Harness, tmp_path: Path) -> None:
     assert not fallback_supported(harness) and headless_argv(harness) is None
     assert headless_runner(harness, "p", cwd=tmp_path, timeout_s=5) is None
@@ -242,7 +245,7 @@ def test_harness_without_a_proven_tool_off_switch_is_unsupported(harness: Harnes
 def test_unsupported_harness_writes_nothing_and_starts_no_process(
         handoff: HandoffCli, tmp_path: Path, repo: Path) -> None:
     prompt_out = tmp_path / "prompt.txt"
-    ref = SessionRef(Harness.CODEX, "p-1", repo, "s", None)
+    ref = SessionRef(Harness.OPENCODE, "p-1", repo, "s", None)
     assert write_fallback_briefing(ref, repo, tmp_path / "store", script_runner("ok", prompt_out), handoff=handoff,
                                    gh=GH) is None
     assert not prompt_out.exists() and not (tmp_path / "store").exists()

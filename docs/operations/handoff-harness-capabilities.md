@@ -263,13 +263,13 @@ sessions above 100% of their window:
 When a drained session writes no briefing, `handoff_controller/briefing.py` asks the same harness for one in a headless
 call: stdin prompt, a fresh empty working directory under `<store>/fallback-work/`, every `HERDR_*` variable and the
 harness's session-identity variables removed. A harness is enabled only if its own `--help` shows how to turn every tool
-off. Only `--help` was run; no real model call was made, so the last column is what is still unverified.
+off, or (Codex) a sandbox that stops writes in an empty directory. Only `--help` was run; no real model call was made, so the last column is what is still unverified.
 
 | Harness | Enabled | Flags | Unverified without a real call |
 | --- | --- | --- | --- |
 | claude | yes | `-p --output-format text --no-session-persistence --setting-sources "" --strict-mcp-config --disable-slash-commands --tools ""` | empty values for `--setting-sources` and `--tools` accepted, and user/project hooks dropped; prompt read from stdin |
 | pi | yes | `-p --no-session --no-tools --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files` | prompt read from stdin with no message argument; provider login still usable with `--no-extensions` |
-| codex | no | `codex exec` offers `--sandbox read-only` but no switch that disables tools | not enabled |
+| codex | yes | `exec --sandbox read-only --skip-git-repo-check --ephemeral -` (`codex exec --help`: prompt read from stdin when absent or `-`; `--ephemeral` writes no session files) | tools stay on but the read-only sandbox stops writes and the work directory is empty; prompt read from stdin; login still usable with `--ephemeral`; no network restriction was seen in `--help` |
 | opencode | no | `opencode run` offers `--agent` and `--auto` but no command-line way to deny tools | not enabled |
 
 Stripped from the environment: `HERDR_*`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`,

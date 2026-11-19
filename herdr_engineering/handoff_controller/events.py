@@ -31,6 +31,8 @@ class StuckReason(StrEnum):
     COMPACTION_TIMEOUT = "compaction_timeout"  # the agent went working and did not come back in time
     POINTER_TOO_LONG = "pointer_too_long"  # the pointer text exceeds the typed-input limit
     SUCCESSOR_WITHOUT_TAKEOVER = "successor_without_takeover"  # the record names a successor but no launched child
+    SOURCE_NOT_CLOSED_SUCCESSOR_LIVE = "source_not_closed_successor_live"  # the successor runs; only the close failed
+    LAUNCH_STATE_UNKNOWN = "launch_state_unknown"  # a takeover died mid-launch: a child may or may not exist
 
 
 EVENT_NAMES = frozenset({
@@ -60,6 +62,8 @@ class HandoffEvent:
     colour: Colour | None
     reason: str | None
     context_pct: float | None
+    successor_pane_id: str | None = None  # the successor's pane; `successor_id` is only ever a handoff id
+    successor_session_id: str | None = None  # the successor agent's session id, when Herdr reports one
 
     def __post_init__(self) -> None:
         if self.event not in EVENT_NAMES:
@@ -117,3 +121,12 @@ def chain_colour(events: Sequence[HandoffEvent]) -> Colour | None:
         if e.event in _TERMINAL:
             return _TERMINAL[e.event]
     return None
+
+
+def source_is_handed_off(events_for_pane: Sequence[HandoffEvent]) -> bool:
+    """True when the session in this pane has a live successor, so it must not be drained or handed off again:
+    a `handoff.succeeded`, or a `handoff.stuck` for SOURCE_NOT_CLOSED_SUCCESSOR_LIVE (only the close failed)."""
+    return any(e.event == "handoff.succeeded"
+               or (e.event == "handoff.stuck" and (e.reason or "").split(":")[0].split(";")[0]
+                   == StuckReason.SOURCE_NOT_CLOSED_SUCCESSOR_LIVE.value)
+               for e in events_for_pane)

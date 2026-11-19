@@ -75,7 +75,11 @@ def compact_with_pointer(ref: SessionRef, adapter: HarnessAdapter, pointer_path:
                          work_end_timeout_s: float = 600.0, poll_s: float = 0.5,
                          sleep: Callable[[float], None] = time.sleep,
                          clock: Callable[[], float] = time.monotonic) -> CompactionResult:
-    """Type the compact command, wait for the agent to work and come back, then type the pointer to the briefing."""
+    """Type the compact command, wait for the agent to work and come back, then type the pointer to the briefing.
+
+    The wait first needs to see the agent working (polled every `poll_s`): a compaction that finishes between two polls
+    is never seen, and ends as COMPACTION_NOT_STARTED. That is deliberate and conservative: the pointer is not typed
+    without proof that the compaction ran and finished."""
     try:
         compact = adapter.compact_input()
         pointer = adapter.drain_input(pointer_text(pointer_path))  # raises when the text exceeds the typed-input limit

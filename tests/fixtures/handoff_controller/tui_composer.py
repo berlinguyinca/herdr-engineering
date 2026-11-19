@@ -5,7 +5,7 @@ Installed under the name `claude` so Herdr's own agent detection reports it. It 
 row (`❯` then a faint placeholder while empty), a closing rule and a status row; echoes typed characters into the
 composer; on Enter moves the line into the transcript and appends it to the file named by FAKE_TUI_SUBMITTED.
 Bracketed paste (what `herdr agent prompt` sends) is understood. FAKE_TUI_PREFILL puts text in the composer at start;
-FAKE_TUI_BLOCKED starts it showing a permission dialog instead of the composer.
+FAKE_TUI_BLOCKED starts it showing a permission dialog instead of the composer; FAKE_TUI_IGNORE_EXIT makes `/exit` a no-op.
 Like the real harnesses: arguments are an initial prompt, answered in the transcript in the program's own words
 (`Acknowledged handoff <id>, resuming now`, so a pane that merely echoes its launch command is told apart); a
 submitted `/exit` ends the program; a submitted `/compact` shows a working screen ("esc to interrupt") for
@@ -50,7 +50,7 @@ def submit() -> None:
         with open(SUBMITTED, "a", encoding="utf-8") as handle:
             handle.write(buffer + "\n")
     line, buffer = buffer, ""
-    if line == "/exit":
+    if line == "/exit" and not os.environ.get("FAKE_TUI_IGNORE_EXIT"):
         sys.stdout.write("\x1b[?2004l\x1b[2J\x1b[H")
         sys.stdout.flush()
         raise SystemExit(0)

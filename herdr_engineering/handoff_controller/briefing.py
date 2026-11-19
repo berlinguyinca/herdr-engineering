@@ -7,13 +7,13 @@ stores like any other briefing.
 Isolation: the headless call is a model session with no tools, started in a fresh empty directory under
 `<store_root>/fallback-work/`, with every `HERDR_*` variable and the harness's session-identity variables removed (it
 must never look like, or act on, the Herdr pane and session it is writing about). A harness is enabled only when its
-own `--help` shows a way to turn every tool off (nothing is run to check beyond `--help`; no real model call was made):
+own `--help` shows a way to turn every tool off, or (Codex) a sandbox that stops every write in an empty directory (nothing is run to check beyond `--help`; no real model call was made):
 
 | Harness | Enabled | Flags | Unverified without a real call |
 | --- | --- | --- | --- |
 | claude | yes | `-p --output-format text --no-session-persistence --setting-sources "" --strict-mcp-config --disable-slash-commands --tools ""` | that an empty `--setting-sources` and `--tools` value are accepted and drop user/project hooks; prompt on stdin |
 | pi | yes | `-p --no-session --no-tools --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files` | prompt on stdin with no message argument; that `--no-extensions` leaves its provider login usable |
-| codex | no | `codex exec` has only a read-only sandbox, no switch that disables tools | not enabled: tools cannot be shown off |
+| codex | yes | `exec --sandbox read-only --skip-git-repo-check --ephemeral -` (prompt on stdin: `[PROMPT]` read from stdin when absent or `-`) | that the read-only sandbox is enough: tools stay on but cannot write, and the empty work directory holds nothing to read; that `--ephemeral` leaves its login usable |
 | opencode | no | `opencode run` has `--agent` and `--auto` but no way to deny tools from the command line | not enabled: tools cannot be shown off |
 
 `wait_for_briefing` reads the store's on-disk layout (`<root>/outbox/handoff_<32 hex>.json`) rather than the CLI's
@@ -101,6 +101,7 @@ class HarnessRunner(Protocol):
 _HEADLESS: dict[Harness, list[str]] = {
     Harness.CLAUDE: ["claude", "-p", "--output-format", "text", "--no-session-persistence", "--setting-sources", "",
                      "--strict-mcp-config", "--disable-slash-commands", "--tools", ""],
+    Harness.CODEX: ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "-"],
     Harness.PI: ["pi", "-p", "--no-session", "--no-tools", "--no-extensions", "--no-mcp", "--no-skills",
                  "--no-prompt-templates", "--no-context-files"],
 }

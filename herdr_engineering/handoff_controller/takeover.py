@@ -24,12 +24,16 @@ from .handoff_cli import HandoffCli, HandoffCliResult
 from .herdr_cli import HerdrCli
 
 _CLOSED_PHASES = frozenset({"source_closed", "already_closed"})
+_CONFIRMED_PHASES = frozenset({"confirmed", "source_exit_failed"})  # the child is proven live; the source stays open
 
 
 class Action(Enum):
     LAUNCH = auto()  # run `herdr-handoff takeover`: it launches, or continues the recorded move and reuses the child
     DONE = auto()  # the record says the source pane is closed
     STUCK = auto()  # a successor is recorded without a launched child: launching again could make a second one
+    LAUNCH_UNKNOWN = auto()  # a takeover died between placing the pane and recording it: a child may exist
+    SUCCESSOR_LIVE = auto()  # after the attempts: the child is confirmed live, only the close failed
+    COMPACT = auto()  # after the attempts: no confirmed child, so compaction is the last resort
 
 
 @dataclass(frozen=True)
@@ -38,6 +42,7 @@ class RecordView:
     phase: str | None
     child_pane: str | None
     child_session_id: str | None
+    child_confirmed: bool = False  # launched and confirmed by herdr-handoff, whether or not the source closed
 
 
 def record_view(record: Mapping[str, object] | None) -> RecordView:
@@ -50,8 +55,9 @@ def record_view(record: Mapping[str, object] | None) -> RecordView:
         value = source.get(key) if isinstance(source, dict) else None
         return value if isinstance(value, str) and value else None
 
-    return RecordView(text(record, "successor_id"), text(block, "phase"), text(block, "child_pane"),
-                      text(target, "session_id"))
+    phase, child = text(block, "phase"), text(block, "child_pane")
+    return RecordView(text(record, "successor_id"), phase, child, text(target, "session_id"),
+                      bool(child) and (phase in _CONFIRMED_PHASES or phase in _CLOSED_PHASES))
 
 
 def next_action(view: RecordView) -> Action:
@@ -59,14 +65,20 @@ def next_action(view: RecordView) -> Action:
     purpose: herdr-handoff reuses the child and finishes by closing the source."""
     if view.phase in _CLOSED_PHASES and view.child_pane:
         return Action.DONE
+    if view.phase == "launching" and not view.child_pane:  # killed after placing the pane, before recording it
+        return Action.LAUNCH_UNKNOWN
     if view.successor_id and not view.child_pane:
         return Action.STUCK
     return Action.LAUNCH
 
 
-def successor_of(view: RecordView, child_pane: str | None) -> str | None:
-    """The identity the terminal event names: a recorded successor handoff, else the child's session, else its pane."""
-    return view.successor_id or view.child_session_id or child_pane or view.child_pane
+def next_after_attempts(view: RecordView) -> Action:
+    """What follows when no attempt closed the source: the record decides, never the last refusal. A confirmed child
+    means the handoff happened and compacting the source would make two sessions work on one task."""
+    base = next_action(view)
+    if base is not Action.LAUNCH:
+        return base
+    return Action.SUCCESSOR_LIVE if view.child_confirmed else Action.COMPACT
 
 
 class Outcome(Enum):
@@ -80,6 +92,12 @@ class TakeoverResult:
     outcome: Outcome
     reason: str
     child_pane: str | None = None
+    status: str | None = None  # herdr-handoff's status word, when it answered with one
+
+
+def retry_can_help(result: TakeoverResult) -> bool:
+    """`source_dirty` repeats until the work is committed or pushed, which nothing here does: do not ask again."""
+    return result.status != "source_dirty"
 
 
 def classify(done: HandoffCliResult) -> TakeoverResult:
@@ -94,9 +112,10 @@ def classify(done: HandoffCliResult) -> TakeoverResult:
     status = reply["status"]
     pane = reply.get("pane_id") if isinstance(reply.get("pane_id"), str) else None
     if status == "source_closed" and reply.get("source_closed") is True and done.returncode == 0:
-        return TakeoverResult(Outcome.CLOSED, "", pane)
+        return TakeoverResult(Outcome.CLOSED, "", pane, status)
     detail = reply.get("reason")
-    return TakeoverResult(Outcome.REFUSED, f"{status}: {detail}" if isinstance(detail, str) and detail else status, pane)
+    return TakeoverResult(Outcome.REFUSED, f"{status}: {detail}" if isinstance(detail, str) and detail else status, pane,
+                          status)
 
 
 def stuck_reason(head: StuckReason, detail: StuckReason | str | None, last_takeover: str | None) -> str:
@@ -126,48 +145,66 @@ def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg:
     chain = chain_id or handoff_id
 
     def event(name: str, *, colour: Colour | None = None, reason: str | None = None,
-              successor_id: str | None = None) -> HandoffEvent:
+              view: RecordView | None = None, pane: str | None = None) -> HandoffEvent:
+        """`successor_id` is the record's successor handoff id; the child's pane and session ride in their own fields."""
+        view = view or RecordView(None, None, None, None)
         made = HandoffEvent(name, _now(), chain, ref.pane_id, ref.session_id, ref.harness, handoff_id, predecessor_id,
-                            successor_id, colour, reason, context_pct)
+                            view.successor_id, colour, reason, context_pct, view.child_pane or pane,
+                            view.child_session_id)
         log.append(made)
+        if colour is not None:  # every terminal event: the drain is over either way
+            try:
+                finish(ref.pane_id, env)
+            except Exception:  # noqa: BLE001 - cleanup must not change the outcome
+                pass
         return made
 
-    def succeeded(child_pane: str | None) -> HandoffEvent:
-        view = record_view(handoff.inspect(store_root, handoff_id))
-        made = event("handoff.succeeded", colour=Colour.GREEN, successor_id=successor_of(view, child_pane))
-        finish(ref.pane_id, env)
-        return made
+    def succeeded(view: RecordView, pane: str | None) -> HandoffEvent:
+        return event("handoff.succeeded", colour=Colour.GREEN, view=view, pane=pane)
 
-    def stuck(why: str) -> HandoffEvent:
-        return event("handoff.stuck", colour=Colour.RED, reason=why)
+    def stuck(why: str, view: RecordView | None = None, pane: str | None = None) -> HandoffEvent:
+        return event("handoff.stuck", colour=Colour.RED, reason=why, view=view, pane=pane)
 
     event("handoff.takeover_started")
     exit_plan = adapter.exit_plan()
     timeout_s = confirm_timeout_s + exit_plan.process_end_timeout_s + call_margin_s
     last: str | None = None
+    last_pane: str | None = None
     for attempt in range(cfg.max_attempts):
         if attempt:
             sleep(retry_delay_s)
         view = record_view(handoff.inspect(store_root, handoff_id))
-        match next_action(view):
-            case Action.DONE:
-                return succeeded(view.child_pane)
-            case Action.STUCK:
-                return stuck(stuck_reason(StuckReason.SUCCESSOR_WITHOUT_TAKEOVER, view.successor_id, last))
-            case Action.LAUNCH:
-                pass
+        if next_action(view) is not Action.LAUNCH:
+            break
         result = classify(handoff.takeover(store_root, handoff_id, parent_pane=ref.pane_id, worktree=worktree,
                                            exit_plan=exit_plan, allow_dirty=not push_allowed,
                                            confirm_timeout_s=confirm_timeout_s, timeout_s=timeout_s))
         if result.outcome is Outcome.CLOSED:
-            return succeeded(result.child_pane)
-        last = result.reason
+            return succeeded(record_view(handoff.inspect(store_root, handoff_id)), result.child_pane)
+        last, last_pane = result.reason, result.child_pane or last_pane
+        if not retry_can_help(result):
+            break
+    view = record_view(handoff.inspect(store_root, handoff_id))
+    pane = view.child_pane or last_pane
+    match next_after_attempts(view):
+        case Action.DONE:
+            return succeeded(view, pane)
+        case Action.STUCK:
+            return stuck(stuck_reason(StuckReason.SUCCESSOR_WITHOUT_TAKEOVER, view.successor_id, last), view, pane)
+        case Action.LAUNCH_UNKNOWN:
+            return stuck(stuck_reason(StuckReason.LAUNCH_STATE_UNKNOWN, "a takeover ended before recording its pane",
+                                      last), view, pane)
+        case Action.SUCCESSOR_LIVE:
+            return stuck(stuck_reason(StuckReason.SOURCE_NOT_CLOSED_SUCCESSOR_LIVE, pane, last), view, pane)
+        case _:
+            pass
     pointer = handoff.document(store_root, handoff_id)
     if pointer is None:
-        return stuck(stuck_reason(StuckReason.NO_BRIEFING, "the briefing document could not be located", last))
+        return stuck(stuck_reason(StuckReason.NO_BRIEFING, "the briefing document could not be located", last), view,
+                     pane)
     done = compact_with_pointer(ref, adapter, pointer, herdr, ready_timeout_s=compact_ready_timeout_s,
                                 work_start_timeout_s=compact_work_start_s, work_end_timeout_s=compact_work_end_s,
                                 poll_s=poll_s, sleep=sleep, clock=clock)
     if done:
-        return event("handoff.failed_compacted", colour=Colour.ORANGE, reason=last)
-    return stuck(stuck_reason(StuckReason.TAKEOVER_REFUSED_AND_COMPACTION_FAILED, done.reason, last))
+        return event("handoff.failed_compacted", colour=Colour.ORANGE, reason=last, view=view, pane=pane)
+    return stuck(stuck_reason(StuckReason.TAKEOVER_REFUSED_AND_COMPACTION_FAILED, done.reason, last), view, pane)
