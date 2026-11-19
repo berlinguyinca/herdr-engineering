@@ -91,6 +91,9 @@ handoff_autopilot:
   harnesses: [pi, claude]   # what the triggers are allowed to act on
   context_window_tokens: 200000   # what to assume when a harness reports usage but no window size
   large_context_window_tokens: 1000000   # assumed instead once usage proves 200k impossible
+  model_context_windows:          # window by model name (substring, longest wins); merged with the default
+    "[1m]": 1000000               # built in: a `[1m]` model has a 1M window
+    sonnet-big: 500000            # add your own
 ```
 
 Read from the machine config (`~/.config/herdr-engineering/config.yaml`), the repository config
@@ -100,9 +103,12 @@ exactly like every other section - later ones win.
 **The window, and why it is sometimes an assumption.** Pi states both numbers, so the percentage
 is exact. Claude Code's transcripts record `message.usage` and the model, but never the size of
 the window in use, so `context_window_tokens` is the assumed denominator - and an assumption on a
-1M-context model would fire the trigger at 100k tokens, one fifth of the way in. Two rules keep
+1M-context model would fire the trigger at 100k tokens, one fifth of the way in. Three rules keep
 that from happening:
 
+- the window is read from the model the transcript names: `model_context_windows` (YAML only, no
+  environment variable) maps a model-name substring to its window, and a `[1m]` model is 1M out of
+  the box. The answer reports `"source": "model"` and the model it matched.
 - usage beyond the assumed window proves the assumption wrong, so the measurement moves to
   `large_context_window_tokens` (this mirrors the 1M switch the opt-in
   `handoff context-hook claude` already makes). A session at 250k is therefore 25%, not 125% -

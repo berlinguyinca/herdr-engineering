@@ -108,6 +108,10 @@ DEFAULTS: dict[str, Any] = {
         # Substituted once usage proves the assumed window cannot be right (250k used cannot fit
         # a 200k window), so a 1M-context session is never read as 125% and silently dropped.
         "large_context_window_tokens": 1000000,
+        # Window by model name (substring, case-insensitive, longest wins), used when the harness
+        # states none: the transcript names the model, so the window is read, not guessed. Add
+        # your own models here; this mapping is merged with, not replaced by, the defaults.
+        "model_context_windows": {"[1m]": 1000000},
     },
     "web": {"private_only": True, "host": "127.0.0.1", "port": 8787},
     "artifacts": {

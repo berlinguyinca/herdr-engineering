@@ -2642,6 +2642,14 @@ def _autopilot_transcript_tokens(args) -> int | None:
     return autopilot.transcript_tokens(transcript) if transcript else None
 
 
+def _autopilot_transcript_model(args) -> str | None:
+    """The model a Claude Code transcript names, so `check`/`record` pick the same window."""
+    from . import handoff_autopilot as autopilot
+
+    transcript = getattr(args, "transcript", None)
+    return autopilot.transcript_model(transcript) if transcript else None
+
+
 def _cmd_handoff_autopilot_check(args) -> int:
     from . import handoff_autopilot as autopilot
 
@@ -2649,6 +2657,7 @@ def _cmd_handoff_autopilot_check(args) -> int:
     measured = _autopilot_transcript_tokens(args)
     if measured is not None:
         kwargs["tokens"] = measured
+        kwargs["model"] = _autopilot_transcript_model(args)
     _print_json(autopilot.decide(**kwargs).to_dict())
     return 0
 
@@ -2671,7 +2680,8 @@ def _cmd_handoff_autopilot_record(args) -> int:
         kwargs["percent"] = autopilot.derive_percent(
             None,
             kwargs["tokens"],
-            kwargs["context_window"],
+            kwargs["context_window"]
+            or autopilot.model_window(_autopilot_transcript_model(args), active.model_windows),
             default_window=active.context_window_tokens,
             large_window=active.large_context_window_tokens,
         )

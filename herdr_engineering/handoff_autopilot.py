@@ -156,6 +156,10 @@ class Policy:
     # True when the operator wrote context_window_tokens themselves. The default and a declared
     # value are otherwise indistinguishable, and they mean different things: one is a guess.
     window_declared: bool = False
+    # Substring of a model name -> its context window, from `model_context_windows` in the YAML
+    # config. The model is the one thing a Claude Code transcript does state, so this is how the
+    # window is read from the session instead of guessed.
+    model_windows: tuple[tuple[str, int], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -166,6 +170,7 @@ class Policy:
             "context_window_tokens": self.context_window_tokens,
             "large_context_window_tokens": self.large_context_window_tokens,
             "window_declared": self.window_declared,
+            "model_context_windows": dict(self.model_windows),
         }
 
 
@@ -203,6 +208,12 @@ def policy(config: dict[str, Any] | None = None) -> Policy:
     # Usage beyond the configured window escalates to this one, so it can never be smaller than
     # the window it is supposed to replace.
     large_window = max(large_window, int(window))
+    raw_models = block.get("model_context_windows", {})
+    model_windows = tuple(
+        (str(name).lower(), int(tokens))
+        for name, tokens in (raw_models.items() if isinstance(raw_models, dict) else ())
+        if name and isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 1000
+    )
     return Policy(
         enabled=bool(enabled),
         context_percent=float(context_percent),
@@ -210,6 +221,7 @@ def policy(config: dict[str, Any] | None = None) -> Policy:
         harnesses=tuple(harnesses),
         context_window_tokens=int(window),
         large_context_window_tokens=int(large_window),
+        model_windows=model_windows,
         # A merged config always contains the key, so declaredness has to come from the files.
         window_declared=(
             "context_window_tokens" in block
@@ -217,6 +229,17 @@ def policy(config: dict[str, Any] | None = None) -> Policy:
             else "context_window_tokens" in declared_keys("handoff_autopilot")
         ),
     )
+
+
+def model_window(model: str | None, windows: tuple[tuple[str, int], ...]) -> int | None:
+    """The window the configured `model_context_windows` map gives `model`, longest match first."""
+    if not model:
+        return None
+    name = model.lower()
+    for pattern, tokens in sorted(windows, key=lambda item: -len(item[0])):
+        if pattern in name:
+            return tokens
+    return None
 
 
 def window_for(
@@ -324,7 +347,12 @@ def derive_percent(
 
 
 def _window_report(
-    active: Policy, *, percent: float | None, context_window: int | None, tokens: int | None
+    active: Policy,
+    *,
+    percent: float | None,
+    context_window: int | None,
+    tokens: int | None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """What the percentage was measured against, and how to stop guessing.
 
@@ -336,10 +364,16 @@ def _window_report(
     if percent is not None:
         # The harness computed the percentage itself; it knows its own window.
         return {"declared": True, "source": "harness"}
-    base = int(context_window) if context_window else int(active.context_window_tokens)
-    source = "harness" if context_window else ("config" if active.window_declared else "assumed")
+    from_model = None if context_window else model_window(model, active.model_windows)
+    base = int(context_window or from_model or active.context_window_tokens)
+    if context_window:
+        source = "harness"
+    elif from_model:
+        source = "model"
+    else:
+        source = "config" if active.window_declared else "assumed"
     report: dict[str, Any] = {
-        "declared": bool(context_window) or active.window_declared,
+        "declared": bool(context_window or from_model) or active.window_declared,
         "source": source,
         "window_tokens": base,
         # What the percentage was really divided by: usage beyond the window has to move it, and
@@ -348,6 +382,8 @@ def _window_report(
             int(tokens or 0), base, large_window=int(active.large_context_window_tokens)
         ),
     }
+    if source == "model":
+        report["model"] = model
     if source == "assumed":
         report["how_to_declare"] = (
             "handoff_autopilot.context_window_tokens in ~/.config/herdr-engineering/config.yaml"
@@ -362,6 +398,7 @@ def decide(
     percent: float | None = None,
     tokens: int | None = None,
     context_window: int | None = None,
+    model: str | None = None,
     cwd: Path | str | None = None,
     home: Path | str | None = None,
     config: dict[str, Any] | None = None,
@@ -399,10 +436,12 @@ def decide(
             f"{harness} has no installed automatic trigger yet; supported harnesses "
             f"are {', '.join(active_policy.harnesses)}",
         )
+    # The harness's own statement wins; failing that, the window the session's model implies.
+    stated_window = context_window or model_window(model, active_policy.model_windows)
     used = derive_percent(
         percent,
         tokens,
-        context_window,
+        stated_window,
         default_window=active_policy.context_window_tokens,
         large_window=active_policy.large_context_window_tokens,
     )
@@ -414,7 +453,7 @@ def decide(
             "handoff is not triggered on an unknown context size",
         )
     window = _window_report(
-        active_policy, percent=percent, context_window=context_window, tokens=tokens
+        active_policy, percent=percent, context_window=context_window, tokens=tokens, model=model
     )
     if used < threshold:
         return Decision(
@@ -682,6 +721,31 @@ def transcript_tokens(path: Path | str) -> int | None:
     )
 
 
+def transcript_model(path: Path | str) -> str | None:
+    """The model the last Claude Code assistant record names, or None.
+
+    The transcript never states the window size but does name the model, and the model decides
+    the window (a `[1m]` model has 1M). Both `message.model` and a record-level `model` are read.
+    """
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return None
+    model: str | None = None
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("type") != "assistant":
+            continue
+        message = record.get("message")
+        named = (message.get("model") if isinstance(message, dict) else None) or record.get("model")
+        if isinstance(named, str) and named:
+            model = named
+    return model
+
+
 def transcript_percent(
     path: Path | str,
     *,
@@ -721,6 +785,7 @@ def hook(
             session_id=session_id,
             harness=harness,
             tokens=tokens,
+            model=transcript_model(transcript) if transcript else None,
             cwd=payload.get("cwd") or Path.cwd(),
             home=home,
             boundary=f"{harness} hook {event}",

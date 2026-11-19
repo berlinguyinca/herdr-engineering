@@ -96,7 +96,13 @@ def write_config(home: Path, body: str) -> Path:
 
 
 def write_transcript(
-    path: Path, *, session_id: str, input_tokens: int, cache_read: int, cache_write: int = 0
+    path: Path,
+    *,
+    session_id: str,
+    input_tokens: int,
+    cache_read: int,
+    cache_write: int = 0,
+    model: str = "claude-opus-4-5",
 ) -> Path:
     """A Claude Code transcript in the shape the installed CLI actually writes."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,9 +111,9 @@ def write_transcript(
         {
             "type": "assistant",
             "sessionId": session_id,
-            "model": "claude-opus-4-5",
             "message": {
                 "role": "assistant",
+                "model": model,
                 "content": [{"type": "text", "text": "done"}],
                 "usage": {
                     "input_tokens": input_tokens,
@@ -1317,3 +1323,88 @@ def test_the_installed_command_quotes_every_part_of_itself(host: dict) -> None:
     assert shlex.split(again)[5:8] == [str(host["work"] / "herdr-eng"), "handoff", "autopilot"], (
         again
     )
+
+
+def _check_transcript(host: dict, name: str, model: str, tokens: int) -> dict:
+    transcript = write_transcript(
+        host["work"] / f"{name}.jsonl",
+        session_id=f"s-{name}",
+        input_tokens=tokens,
+        cache_write=0,
+        cache_read=0,
+        model=model,
+    )
+    verdict = _cli(
+        [
+            "handoff",
+            "autopilot",
+            "check",
+            "--harness",
+            "claude",
+            "--session-id",
+            f"s-{name}",
+            "--transcript",
+            str(transcript),
+            "--json",
+        ],
+        host["env"],
+        host["work"],
+    )
+    assert verdict.returncode == 0, verdict.stderr
+    return json.loads(verdict.stdout)
+
+
+def test_the_window_comes_from_the_model_the_transcript_names(host: dict) -> None:
+    """A `[1m]` model is measured against 1M at 100k tokens, not against an assumed 200k."""
+    answer = _check_transcript(host, "model-1m", "claude-opus-4-5[1m]", 100_000)
+    assert answer["percent"] == pytest.approx(10.0, abs=0.5), answer
+    assert answer["window"]["source"] == "model", answer
+    assert answer["window"]["window_tokens"] == 1_000_000, answer
+    assert answer["window"]["model"] == "claude-opus-4-5[1m]", answer
+
+
+def test_a_yaml_model_window_map_overrides_and_extends_the_builtin(host: dict) -> None:
+    config = Path(host["home"]) / ".config" / "herdr-engineering" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("handoff_autopilot:\n  model_context_windows:\n    sonnet-big: 500000\n")
+    answer = _check_transcript(host, "model-yaml", "claude-sonnet-big-1", 100_000)
+    assert answer["percent"] == pytest.approx(20.0, abs=0.5), answer
+    assert answer["window"]["source"] == "model", answer
+    assert answer["window"]["window_tokens"] == 500_000, answer
+
+
+def test_an_unknown_model_still_falls_back_to_the_assumption(host: dict) -> None:
+    answer = _check_transcript(host, "model-plain", "claude-opus-4-5", 100_000)
+    assert answer["percent"] == pytest.approx(50.0, abs=0.5), answer
+    assert answer["window"]["source"] == "assumed", answer
+
+
+def test_transcript_model_reads_the_last_assistant_model(host: dict) -> None:
+    transcript = write_transcript(
+        host["work"] / "m.jsonl", session_id="s-m", input_tokens=1, cache_read=0, model="x[1m]"
+    )
+    assert ha.transcript_model(transcript) == "x[1m]"
+    assert ha.transcript_model(host["work"] / "missing.jsonl") is None
+
+
+def test_the_stop_hook_uses_the_model_window(host: dict) -> None:
+    transcript = write_transcript(
+        host["work"] / "hook.jsonl",
+        session_id="s-hook-1m",
+        input_tokens=150_000,
+        cache_read=0,
+        model="claude-opus-4-5[1m]",
+    )
+    out = ha.hook(
+        "claude",
+        json.dumps(
+            {
+                "session_id": "s-hook-1m",
+                "hook_event_name": "Stop",
+                "transcript_path": str(transcript),
+                "cwd": str(host["work"]),
+            }
+        ),
+    )
+    assert out["trigger"] is False, out
+    assert out["percent"] == pytest.approx(15.0, abs=0.5), out
