@@ -25,12 +25,14 @@ from .memory_install import (
     ClaudeHooksUnit,
     _atomic_write,
     _diff,
+    _dump_json,
 )
 from .workflow_guard import MATCHER as GUARD_MATCHER
 from .workflow_guard import decide
 
 MARKER = "herdr-workflow:managed"
-EVENTS = ("SessionStart", "PreCompact", "PreToolUse")
+EVENTS = ("SessionStart", "PreToolUse")
+RETIRED_EVENTS = ("PreCompact",)  # installed by older versions; install removes only our managed command
 
 REMINDER = """Engineering defaults (herdr-engineering managed hook):
 - Delegate multi-file changes, refactors, debugging, reviews and research to sonnet subagents; do trivial work directly.
@@ -38,17 +40,53 @@ REMINDER = """Engineering defaults (herdr-engineering managed hook):
 - Ship via branch -> PR -> review -> CI green -> ready; never commit to main.
 - Use real dependencies in tests; no mocks, stubs or fakes.
 - Never push herdr-engineering. Keep nothing under /tmp.
-- CI is Woodpecker (ci.metabolomics.us) where the repo uses it.
-- Context getting long? /handoff moves the work to a fresh Herdr pane on the same harness."""
-
-PRECOMPACT_MESSAGE = ("Context is about to be compacted. Consider /handoff first: it moves the work to a "
-                      "fresh Herdr pane on the same harness with a self-sufficient briefing. "
-                      "This is a reminder only; nothing was started.")
+- CI is Woodpecker (ci.metabolomics.us) where the repo uses it."""
 
 
 class _WorkflowHooksUnit(ClaudeHooksUnit):
     marker = MARKER
     matchers = {"PreToolUse": GUARD_MATCHER}
+
+    def _is_retired(self, hook, event: str) -> bool:
+        command = hook.get("command") if isinstance(hook, dict) else None
+        return isinstance(command, str) and self.marker in command and f"workflow hook {event}" in command
+
+    def _retired_present(self, data: dict) -> bool:
+        hooks = data.get("hooks", {})
+        return any(self._is_retired(h, ev) for ev in RETIRED_EVENTS if isinstance(hooks.get(ev), list)
+                   for e in hooks[ev] if isinstance(e, dict) and isinstance(e.get("hooks"), list) for h in e["hooks"])
+
+    def _drop_retired(self, data: dict) -> None:
+        """Remove our retired command from the retired events; any other hook, even in the same entry, stays."""
+        hooks = data.get("hooks", {})
+        for ev in RETIRED_EVENTS:
+            if not isinstance(hooks.get(ev), list):
+                continue
+            kept = []
+            for e in hooks[ev]:
+                if isinstance(e, dict) and isinstance(e.get("hooks"), list) and any(self._is_retired(h, ev) for h in e["hooks"]):
+                    rest = [h for h in e["hooks"] if not self._is_retired(h, ev)]
+                    if rest:
+                        kept.append({**e, "hooks": rest})
+                else:
+                    kept.append(e)
+            if kept:
+                hooks[ev] = kept
+            else:
+                del hooks[ev]
+        if not hooks:
+            data.pop("hooks", None)
+
+    def state(self, text):
+        state = super().state(text)
+        if state == INVALID:
+            return state
+        return STALE if self._retired_present(self._load(text)) else state
+
+    def install(self, text):
+        data = self._load(text)
+        self._drop_retired(data)
+        return super().install(_dump_json(data, text))
 
 
 def _hook_command(command: list[str], event: str) -> str:
@@ -162,8 +200,6 @@ def run_hook(event: str, stdin: IO[str], stdout: IO[str]) -> int:
                                           "permissionDecisionReason": verdict[1]}}
         elif event == "SessionStart":
             out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": REMINDER}}
-        elif event == "PreCompact":
-            out = {"systemMessage": PRECOMPACT_MESSAGE}
         else:
             return 0
         stdout.write(json.dumps(out) + "\n")
