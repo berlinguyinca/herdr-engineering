@@ -93,3 +93,11 @@ def test_an_intermediate_key_that_is_a_plain_word_is_masked(tmp_path):
     assert "acmeproject" not in out and "tengu_secret_flag" not in out
     assert "*.contextWindow [5]" in out and "*.windowDays [7]" in out
     assert "providers.metabolomics" not in out and "provider.metabolomics" not in out
+
+
+def test_an_intermediate_key_that_contains_window_or_context_size_is_masked(tmp_path):
+    home = _home(tmp_path)
+    (home / ".claude.json").write_text(json.dumps({"acme-window-corp": {"contextWindow": 5}, "model_context_size_x": {"windowDays": 7}}))
+    out = _run(home)
+    assert "acme-window-corp" not in out and "model_context_size_x" not in out
+    assert "*.contextWindow [5]" in out and "*.windowDays [7]" in out

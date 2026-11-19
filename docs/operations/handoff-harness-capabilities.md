@@ -22,7 +22,7 @@ missing. The fallback errs towards handing off early only for a model whose real
 | Checked, no window | `~/.claude.json` has no per-model window (`tengu_hawthorn_window`, 200000, is a feature flag with no model attached). No `[1m]` suffix appears in transcript model ids or in `requestedModel`; it is a model-setting suffix (the binary says to "append [1m] to the model name for 1M" and to set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` for a custom id), and the transcript records the bare id |
 | Compaction marker | a `system` record with `subtype: "compact_boundary"` (265 in the last 30 days); a usage entry before the latest one is stale, so there is no reading until the next reply |
 | Session id in Herdr | `herdr agent get <pane>`, `agent_session.kind == "id"`; the transcript is `<id>.jsonl` in the project directory, matched by id even when the pane cwd differs from the session directory |
-| Unconfirmed | (1) Whether `max_input_tokens` equals the effective window for a session whose model setting has no `[1m]`. For the 5.x models in use here it does: `claude-sonnet-5-5` sessions reached 966,904 tokens and `claude-opus-5-5` 568,085, so their window is above 200,000. For models not seen recently the catalogue (1,000,000 for `claude-opus-4-8`) and the table (200,000, from the autospec monitor) disagree; the table entry is kept and nothing measures it. (2) Nothing measures which window a session really has for the three conflicting models below |
+| Unconfirmed | (1) Whether `max_input_tokens` equals the effective window for a session whose model setting has no `[1m]`. For the 5.x models in use here it does: `claude-sonnet-5-5` sessions reached 966,904 tokens and `claude-opus-5-5` 568,085, so their window is above 200,000. For models not seen recently the catalogue (1,000,000 for `claude-opus-4-8`) and the table (200,000, from the autospec monitor) disagree, the adapter uses the smaller window unless the session's used tokens already exceed it, then the larger; nothing measures which is right. (2) Nothing measures which window a session really has for the three conflicting models below |
 
 Model ids seen in the last 30 days and how each resolves:
 
@@ -192,44 +192,43 @@ Code, Codex and Pi in a fresh pane and for OpenCode after a turn; `/compact` was
 where a window or model limit is recorded:
   transcript ~/.claude/projects/*/<session>.jsonl: none found
   model catalogue ~/.claude/cache/model-catalog/*-cc.json: catalog.config.models[].runtime.max_input_tokens [200000, 1000000]
-  global config ~/.claude.json: cachedGrowthBookFeatures.tengu_flint_harbor_prompt.windowDays [30]; cachedGrowthBookFeatures.tengu_hawthorn_window [200000]
+  global config ~/.claude.json: cachedGrowthBookFeatures.*.windowDays [30]; cachedGrowthBookFeatures.tengu_hawthorn_window [200000]
   statusLine in ~/.claude/settings.json: not configured
-  statusline input cache ~/.claude/hud/cache/stdin.*.json: context_window; context_window.context_window_size [1000000]
+  statusline input cache ~/.claude/hud/cache/stdin.*.json: *.context_window_size [1000000]
 models seen in recent sessions (window and window_source as the adapter resolves them):
-  claude-fable-5-1  window=1000000  window_source=recorded  sessions=1
-  claude-fable-5-2  window=1000000  window_source=recorded  sessions=2
+  claude-fable-5-2  window=1000000  window_source=recorded  sessions=5
   claude-opus-4-5-20251101  window=200000  window_source=model_table  sessions=3
   claude-opus-5  window=1000000  window_source=recorded  sessions=1
   claude-opus-5-5  window=1000000  window_source=recorded  sessions=133
   claude-sonnet-4-5-20250929  window=200000  window_source=model_table  sessions=1
-  claude-sonnet-5-5  window=1000000  window_source=recorded  sessions=54
+  claude-sonnet-5-5  window=1000000  window_source=recorded  sessions=52
 sessions above 100% of their window:
   none
 
 == codex (last 30 days) ==
 where a window or model limit is recorded:
-  rollout ~/.codex/sessions/Y/M/D/rollout-*.jsonl: payload.context_window; payload.context_window.window_id; payload.info.model_context_window [828400]; payload.model_context_window [828400]; payload.rate_limits.primary.window_minutes [10080]; payload.state.context_window_guidance
+  rollout ~/.codex/sessions/Y/M/D/rollout-*.jsonl: payload.*.window_id; payload.info.model_context_window [828400]; payload.model_context_window [828400]; payload.rate_limits.primary.window_minutes [10080]; payload.state.context_window_guidance
   config ~/.codex/config.toml: model_context_window [1000000]
 models seen in recent sessions (window and window_source as the adapter resolves them):
-  gpt-6-astra  window=828400  window_source=recorded  sessions=12
-  gpt-6.1-sol  window=828400  window_source=recorded  sessions=188
+  gpt-6-astra  window=828400  window_source=recorded  sessions=27
+  gpt-6.1-sol  window=828400  window_source=recorded  sessions=173
 sessions above 100% of their window:
   none
 
 == pi (last 30 days) ==
 where a window or model limit is recorded:
   session ~/.pi/agent/sessions/*/<ts>_<uuid>.jsonl: none found
-  models ~/.pi/agent/models.json: providers.metabolomics.models[].contextWindow [131072, 262144]
+  models ~/.pi/agent/models.json: providers.*.models[].contextWindow [131072, 262144]
   model store ~/.pi/agent/models-store.json: [].models[].contextWindow [128000, 200000, 272000, 1000000]
 models seen in recent sessions (window and window_source as the adapter resolves them):
   metabolomics/deepseek_v4  window=262144  window_source=recorded  sessions=4
   metabolomics/qwen3.8-27b  window=262144  window_source=recorded  sessions=8
-  metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl  window=128000  window_source=fallback  sessions=7
+  metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl  window=128000  window_source=fallback  sessions=5
   metabolomics/qwen3.8-27b-text  window=128000  window_source=fallback  sessions=2
   metabolomics/qwen3.8-flash  window=262144  window_source=recorded  sessions=14
   metabolomics/qwen3.8-flash-text  window=128000  window_source=fallback  sessions=1
   metabolomics/qwen3.8-flash-vision  window=262144  window_source=recorded  sessions=4
-  metabolomics/qwen3.8-flash_next  window=131072  window_source=recorded  sessions=137
+  metabolomics/qwen3.8-flash_next  window=131072  window_source=recorded  sessions=139
   metabolomics/qwen3.8-flash_next-modality-text-quant-w3a8  window=128000  window_source=fallback  sessions=3
   metabolomics/qwen3.8-flash_next-text  window=131072  window_source=recorded  sessions=4
   metabolomics/qwen3.8-vision  window=262144  window_source=recorded  sessions=1
@@ -237,16 +236,15 @@ sessions above 100% of their window:
   OVER 100%: metabolomics/qwen3.8-27b-text used=231644 window=128000 window_source=fallback
   OVER 100%: metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl used=154018 window=128000 window_source=fallback
   OVER 100%: metabolomics/qwen3.8-flash-text used=193802 window=128000 window_source=fallback
-  OVER 100%: metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl used=140785 window=128000 window_source=fallback
 
 == opencode (last 30 days) ==
 where a window or model limit is recorded:
   database ~/.local/share/opencode/opencode.db, message.data: none found
   database columns of session, session_context_epoch: none found
-  config ~/.config/opencode/opencode.json: provider.metabolomics.models.*.limit.context [65536, 131072]
-  model catalogue ~/.cache/opencode/models.json: [].models.*.limit.context 203 values, 0..99999999
+  config ~/.config/opencode/opencode.json: provider.*.models.*.limit.context [65536, 131072]
+  model catalogue ~/.cache/opencode/models.json: [].models.*.limit.context 204 values, 0..99999999
 models seen in recent sessions (window and window_source as the adapter resolves them):
-  metabolomics/qwen3.8-27b  window=131072  window_source=recorded  sessions=1
+  metabolomics/qwen3.8-27b  window=131072  window_source=recorded  sessions=3
   metabolomics/qwen3.8-27b-vision  window=65536  window_source=recorded  sessions=1
 sessions above 100% of their window:
   none

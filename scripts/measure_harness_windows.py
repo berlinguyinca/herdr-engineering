@@ -43,13 +43,14 @@ _FALLBACK = "-"
 def _field_paths(value: object, found: dict[str, set[int]], path: str = "") -> None:
     """Collect the key paths whose last key looks like a window or limit, with the integers seen there.
 
-    A key that is not a known field name or a window-like leaf (a model id, uuid, project path, provider or flag
-    name), or that names a model, is shown as "*", so no id or path is printed. A `context` key counts only inside a `limit` object (OpenCode's limit.context).
+    A key that is not a known field name or a window-like leaf key (a model id, uuid, project path, provider or flag
+    name, or any non-leaf key that merely contains "window"), or that names a model, is shown as "*", so no id or path is printed. A `context` key counts only inside a `limit` object (OpenCode's limit.context).
     """
     if isinstance(value, dict):
         for key, child in value.items():
+            leaf = not isinstance(child, (dict, list))  # only a leaf may be shown for what its name contains
             plain = (isinstance(key, str) and not path.endswith("models") and not re.search(r"[^A-Za-z_]", key)
-                     and (key in _KNOWN_KEYS or bool(_WINDOW_KEY.search(key)) or key == "context"))
+                     and (key in _KNOWN_KEYS or (leaf and (bool(_WINDOW_KEY.search(key)) or key == "context"))))
             name = key if plain else "*"
             if name in _SCHEMA_KEYS:
                 continue
