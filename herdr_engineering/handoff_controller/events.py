@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
@@ -37,6 +38,9 @@ class StuckReason(StrEnum):
     DRAIN_PROMPT_UNCERTAIN = "drain_prompt_uncertain"  # typing the order failed in a way that left it unknown whether it landed
     DRAIN_ORDER_TOO_LONG = "drain_order_too_long"  # the drain order exceeds the typed-input limit
     NO_RECORD = "no_record"  # the session's context record stayed unreadable for a whole drain timeout
+    RECORD_UNREADABLE = "record_unreadable"  # the handoff record could not be read: nothing is launched or compacted on it
+    MERGE_IN_PROGRESS = "merge_in_progress"  # the worktree is mid-merge and a push is allowed: nothing is committed or pushed
+    PANE_GONE = "pane_gone"  # the pane closed (or holds another session) while the chain was open
     INTERNAL_ERROR = "internal_error"  # finishing the chain raised three times in a row; `internal_error:<exception type>`
 
 
@@ -45,11 +49,12 @@ EVENT_NAMES = frozenset({
     "handoff.briefing_fallback", "handoff.wip_committed", "handoff.takeover_started", "handoff.succeeded",
     "handoff.failed_compacted", "handoff.stuck", "handoff.skipped", "handoff.waiting",
 })
-_TERMINAL = {
+TERMINAL = {
     "handoff.succeeded": Colour.GREEN,
     "handoff.failed_compacted": Colour.ORANGE,
     "handoff.stuck": Colour.RED,
 }
+OVER_CEILING = "over_ceiling"  # the `reason` of the triggered / fallback-briefing event of a last-resort chain
 _REASON_REQUIRED = frozenset({"handoff.stuck", "handoff.skipped", "handoff.waiting"})
 
 
@@ -74,8 +79,8 @@ class HandoffEvent:
     def __post_init__(self) -> None:
         if self.event not in EVENT_NAMES:
             raise ValueError(f"unknown handoff event name: {self.event!r}")
-        if self.colour != _TERMINAL.get(self.event):  # terminal events carry their colour, all others none
-            raise ValueError(f"{self.event} must have colour {_TERMINAL.get(self.event)!r}, got {self.colour!r}")
+        if self.colour != TERMINAL.get(self.event):  # terminal events carry their colour, all others none
+            raise ValueError(f"{self.event} must have colour {TERMINAL.get(self.event)!r}, got {self.colour!r}")
         if self.event in _REASON_REQUIRED and not self.reason:
             raise ValueError(f"{self.event} requires a reason")
 
@@ -85,6 +90,8 @@ class HandoffEvent:
     @classmethod
     def from_json(cls, line: str) -> HandoffEvent:
         data = json.loads(line)
+        known = {f.name for f in fields(cls)}
+        data = {k: v for k, v in data.items() if k in known}  # a key a newer version added is not an error
         data["harness"] = Harness(data["harness"])
         if data["colour"] is not None:
             data["colour"] = Colour(data["colour"])
@@ -94,6 +101,8 @@ class HandoffEvent:
 class EventLog:
     def __init__(self, store_root: Path) -> None:
         self._path = store_root / "events.jsonl"
+        self.generation = 0  # counts how often `read_since` found the file replaced; a follower rebuilds when it changes
+        self._inode: int | None = None
 
     def append(self, e: HandoffEvent) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -115,12 +124,18 @@ class EventLog:
         return [e for e in _parse(lines) if chain_id is None or e.chain_id == chain_id]
 
     def read_since(self, offset: int) -> tuple[list[HandoffEvent], int]:
-        """The events appended after byte `offset` (0 the first time) and the offset to continue from. Only complete
-        lines are consumed, so an append in progress is read on the next call. The log is append-only; a file shorter
-        than `offset` is read from the start, which the caller sees as a new offset below the one it passed."""
+        """The poller API: the events appended after byte `offset` (0 the first time) and the offset to continue from.
+        Only complete lines are consumed, so an append in progress is read on the next call. The log is append-only; a
+        file that is shorter than `offset`, or has another inode than the one last read, was replaced: it is read from
+        the start and `generation` goes up, which tells the caller to drop what it kept."""
         try:
             with self._path.open("rb") as f:
-                start = offset if offset <= os.fstat(f.fileno()).st_size else 0
+                stat = os.fstat(f.fileno())
+                replaced = (self._inode is not None and stat.st_ino != self._inode) or offset > stat.st_size
+                if replaced:
+                    self.generation += 1
+                self._inode = stat.st_ino
+                start = 0 if replaced else offset
                 f.seek(start)
                 data = f.read()
         except FileNotFoundError:
@@ -144,8 +159,8 @@ def _parse(lines: Sequence[str]) -> list[HandoffEvent]:
 def chain_colour(events: Sequence[HandoffEvent]) -> Colour | None:
     """Colour of the last terminal event; None when the chain has none."""
     for e in reversed(events):
-        if e.event in _TERMINAL:
-            return _TERMINAL[e.event]
+        if e.event in TERMINAL:
+            return TERMINAL[e.event]
     return None
 
 
@@ -156,3 +171,88 @@ def source_is_handed_off(events_for_pane: Sequence[HandoffEvent]) -> bool:
                or (e.event == "handoff.stuck" and (e.reason or "").split(":")[0].split(";")[0]
                    == StuckReason.SOURCE_NOT_CLOSED_SUCCESSOR_LIVE.value)
                for e in events_for_pane)
+
+
+class Phase(StrEnum):
+    DRAINING = "draining"  # triggered; the order is being typed, or was typed and the briefing is awaited
+    WAITING = "waiting"  # the session still works or has subagents running (`handoff.waiting`)
+    BRIEFING = "briefing"  # a briefing exists; the checkpoint and takeover follow
+    TAKEOVER = "takeover"
+    DONE_GREEN = "done_green"
+    DONE_ORANGE = "done_orange"
+    DONE_RED = "done_red"
+
+
+@dataclass(frozen=True)
+class Chain:
+    """What the event log says about one chain of a pane."""
+    chain_id: str
+    triggered_at: float
+    drain_started_at: str | None  # the order was (or may have been) typed from here on
+    handoff_id: str | None  # the briefing, written by the session or by the fallback writer
+    takeover_started: bool
+    last_at: float = 0.0  # the time of the chain's latest event: progress
+    last_resort: bool = False  # its fallback briefing was written because the order could not be typed over the ceiling
+    briefing_at: float | None = None  # when its briefing was written or found
+    waiting: tuple[str, int | None] | None = None  # the last `handoff.waiting` state (reason, subagents live)
+    phase: Phase = Phase.DRAINING
+    triggered_wall: float = 0.0  # `triggered_at` as the log has it, before any credit mapping (the store's clock)
+
+
+def epoch(iso: str) -> float:
+    return datetime.fromisoformat(iso).timestamp()
+
+
+def pane_events(events: Sequence[HandoffEvent], pane_id: str, session_id: str | None) -> list[HandoffEvent]:
+    """The events of this pane's current session; a reused pane id with another session sees none of the old ones."""
+    return [e for e in events if e.pane_id == pane_id and (e.session_id is None or session_id is None or e.session_id == session_id)]
+
+
+def _by_chain(events: Sequence[HandoffEvent]) -> list[list[HandoffEvent]]:
+    by_chain: dict[str, list[HandoffEvent]] = {}
+    for e in events:
+        if e.event != "handoff.skipped":
+            by_chain.setdefault(e.chain_id, []).append(e)
+    return [mine for mine in by_chain.values() if any(e.event == "handoff.triggered" for e in mine)]
+
+
+def _is_open(mine: Sequence[HandoffEvent]) -> bool:
+    return not any(e.event in TERMINAL for e in mine)
+
+
+def _chain_of(mine: Sequence[HandoffEvent]) -> Chain:
+    names = {e.event for e in mine}
+    started = next((e.at for e in mine if e.event == "handoff.drain_started"), None)
+    briefing = next((e.handoff_id for e in mine if e.event in ("handoff.briefing_written", "handoff.briefing_fallback")), None)
+    over = any(e.reason == OVER_CEILING for e in mine if e.event == "handoff.briefing_fallback")
+    written = next((e.at for e in mine if e.event in ("handoff.briefing_written", "handoff.briefing_fallback")), None)
+    waited = next((e for e in reversed(mine) if e.event == "handoff.waiting"), None)
+    end = next((e for e in reversed(mine) if e.event in TERMINAL), None)
+    if end is not None:
+        phase = {Colour.GREEN: Phase.DONE_GREEN, Colour.ORANGE: Phase.DONE_ORANGE, Colour.RED: Phase.DONE_RED}[TERMINAL[end.event]]
+    elif "handoff.takeover_started" in names:
+        phase = Phase.TAKEOVER
+    elif briefing is not None:
+        phase = Phase.BRIEFING
+    else:
+        phase = Phase.WAITING if waited is not None else Phase.DRAINING
+    return Chain(mine[0].chain_id, epoch(next(e.at for e in mine if e.event == "handoff.triggered")), started, briefing,
+                 "handoff.takeover_started" in names, epoch(mine[-1].at), over, epoch(written) if written else None,
+                 (waited.reason or "", waited.subagents_live) if waited else None, phase,
+                 epoch(next(e.at for e in mine if e.event == "handoff.triggered")))
+
+
+def open_chain(events: Sequence[HandoffEvent]) -> Chain | None:
+    """The last chain that was triggered and has no terminal event yet."""
+    return next((_chain_of(mine) for mine in reversed(_by_chain(events)) if _is_open(mine)), None)
+
+
+def last_chain(events: Sequence[HandoffEvent]) -> Chain | None:
+    """The last chain that was triggered, finished or not."""
+    chains = _by_chain(events)
+    return _chain_of(chains[-1]) if chains else None
+
+
+def open_chain_events(events: Sequence[HandoffEvent]) -> list[list[HandoffEvent]]:
+    """The events of every chain that was triggered and has no terminal event yet."""
+    return [mine for mine in _by_chain(events) if _is_open(mine)]

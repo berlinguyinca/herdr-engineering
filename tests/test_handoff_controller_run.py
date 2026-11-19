@@ -368,7 +368,8 @@ def test_a_briefing_the_session_wrote_is_picked_up_and_a_dirty_main_stops_the_ch
 
 
 def test_a_worktree_whose_git_state_is_unknown_stops_the_chain(tmp_path: Path) -> None:
-    world = World(tmp_path)  # world.repo is not a git repository
+    world = World(tmp_path)
+    (world.repo / ".git").write_text("not a gitfile\n")  # a repository git cannot read (a directory with no repository at all is not an error)
     world.session("p1", 85.0)
     _typed_chain(world, started=world.clock[0] - 10)
     _briefing_record(world.store, "p1", "2999-01-01T00:00:00Z")

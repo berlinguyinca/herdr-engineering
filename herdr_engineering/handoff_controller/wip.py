@@ -19,6 +19,7 @@ class WipReason(StrEnum):
     PUSH_FAILED = "push_failed"
     PUSH_NOT_ALLOWED = "push_not_allowed"  # committed, or commits unpushed, and the caller did not allow a push
     GIT_ERROR = "git_error"  # a git command failed: the state is unknown, see `error`
+    MERGE_IN_PROGRESS = "merge_in_progress"  # a merge, cherry-pick, revert or rebase is unfinished: nothing staged
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class WipResult:
 
 
 _TIMED_OUT = TIMED_OUT
+_UNFINISHED = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply")
 
 
 def _git(worktree: Path, timeout_s: float, *args: str) -> subprocess.CompletedProcess[str]:
@@ -95,6 +97,15 @@ def _lock_note(worktree: Path, timeout_s: float) -> str:
     return "index.lock exists (not removed)" if lock.exists() else "no index.lock"
 
 
+def _unfinished(worktree: Path, timeout_s: float) -> bool | None:
+    """True while a merge, cherry-pick, revert or rebase is unfinished or an index entry is unmerged; None when git cannot say."""
+    gitdir = _git(worktree, timeout_s, "rev-parse", "--absolute-git-dir")
+    unmerged = _git(worktree, timeout_s, "ls-files", "-u")
+    if gitdir.returncode != 0 or unmerged.returncode != 0:
+        return None
+    return bool(unmerged.stdout.strip()) or any((Path(gitdir.stdout.strip()) / name).exists() for name in _UNFINISHED)
+
+
 def wip_commit(worktree: Path, *, push_allowed: bool, timeout_s: float = 120.0) -> WipResult:
     """Commit tracked changes (never untracked files, never on main/master or a detached HEAD); push if allowed.
 
@@ -108,6 +119,8 @@ def wip_commit(worktree: Path, *, push_allowed: bool, timeout_s: float = 120.0) 
 
     head = _git(worktree, timeout_s, "symbolic-ref", "--short", "-q", "HEAD")
     if head.returncode not in (0, 1):  # 1 with -q: HEAD is detached
+        if "not a git repository" in head.stderr:  # no repository: nothing to commit, nothing to push
+            return WipResult(False, None, False, ())
         return failure(head)
     branch = head.stdout.strip()
     others = _git(worktree, timeout_s, "ls-files", "--others", "--exclude-standard", "-z")
@@ -122,6 +135,11 @@ def wip_commit(worktree: Path, *, push_allowed: bool, timeout_s: float = 120.0) 
     status = _git(worktree, timeout_s, "status", "--porcelain", "--untracked-files=no")
     if status.returncode != 0:
         return failure(status)
+    unfinished = _unfinished(worktree, timeout_s)
+    if unfinished is None:
+        return WipResult(False, None, False, unpushed, untracked, WipReason.GIT_ERROR, "git rev-parse/ls-files failed")
+    if unfinished:  # `git add -u` would stage conflicted files and commit them with their markers
+        return WipResult(False, None, False, unpushed, untracked, WipReason.MERGE_IN_PROGRESS)
     committed = False
     sha: str | None = None
     if status.stdout.strip():
