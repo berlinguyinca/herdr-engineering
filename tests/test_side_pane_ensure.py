@@ -589,8 +589,11 @@ def test_ensure_is_unavailable_without_herdr_and_leaves_no_marker(tmp_path: Path
     assert done.outcome is Outcome.UNAVAILABLE and state.read_marker(state.state_dir(env), "w1:t1") is None
 
 
-def test_ensure_command_exits_1_and_says_why_when_nothing_opens(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_ensure_command_exits_1_and_says_why_when_nothing_opens(tmp_path: Path, capsys: pytest.CaptureFixture[str],
+                                                              monkeypatch: pytest.MonkeyPatch) -> None:
     import argparse
+
+    monkeypatch.setenv("PATH", str(tmp_path))  # `ensure` builds its Herdr client from os.environ: there is no `herdr` on it
 
     from herdr_engineering.side_pane import cli as side_cli
 

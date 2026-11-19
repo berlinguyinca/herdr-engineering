@@ -526,7 +526,7 @@ def test_attempts_exhausted_by_failures_end_red_without_compacting(script: str, 
     broken = HandoffCli([sys.executable, "-c", script], env={"PATH": "/usr/bin:/bin"}, cwd=tmp_path)
     ref = make_ref("w1:p1", tmp_path)
     log = EventLog(tmp_path / "store")
-    done = run_takeover(ref, ShortExit(0.2), CHILD_ID, ControllerConfig(max_attempts=2), log, broken, HerdrCli(),  # type: ignore[arg-type]
+    done = run_takeover(ref, ShortExit(0.2), CHILD_ID, ControllerConfig(max_attempts=2), log, broken, HerdrCli("/nonexistent/herdr"),  # type: ignore[arg-type]
                         store_root=tmp_path / "store", worktree=tmp_path, push_allowed=True, env={}, confirm_timeout_s=0.1,
                         call_margin_s=0.5, retry_delay_s=0.0, poll_s=0.1, ready=lambda: True)
     assert (done.event, done.colour) == ("handoff.stuck", Colour.RED), done
