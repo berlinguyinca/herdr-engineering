@@ -1,0 +1,241 @@
+{
+ "branch": "main",
+ "changed_files": [
+  "CHANGELOG.md",
+  "docs/operations/ci-gates.md",
+  "scripts/ci/host-facts.sh",
+  "scripts/ci/pytest-parallel.sh",
+  "scripts/ci/pytest-rerun.sh",
+  "scripts/ci/unit-gates.sh",
+  "tests/test_ci_pytest_parallel.py",
+  "tests/test_ci_pytest_rerun.py"
+ ],
+ "commit": "a9d4a3085c61556f151524074af2b12a41b79dfa",
+ "created": 1795064162,
+ "deploy_task": "",
+ "deploy_to": "",
+ "errors": null,
+ "event": "pull_request",
+ "event_reason": [
+  ""
+ ],
+ "finished": 0,
+ "forge_url": "https://github.com/berlinguyinca/herdr-engineering/pull/888",
+ "id": 16559,
+ "number": 1751,
+ "parent": 0,
+ "ref": "refs/pull/888/merge",
+ "refspec": "fix/unit-gates-worker-crash-rerun:main",
+ "rerun_count": 0,
+ "reviewed": 0,
+ "started": 1795064186,
+ "status": "running",
+ "timestamp": 0,
+ "title": "fix(ci): rerun the parallel pytest pass once when xdist workers die",
+ "updated": 1795064186,
+ "version": "3.20.1",
+ "workflows": [
+  {
+   "agent_id": 12852,
+   "children": [
+    {
+     "exit_code": 0,
+     "finished": 1795064285,
+     "id": 55638,
+     "name": "checkout",
+     "pid": 5,
+     "pipeline_id": 16559,
+     "ppid": 1,
+     "started": 1795064213,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S2JT8A5PDGXG9D0QRNSN6J"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795064315,
+     "id": 55639,
+     "name": "artifact-handoff-contracts",
+     "pid": 6,
+     "pipeline_id": 16559,
+     "ppid": 1,
+     "started": 1795064285,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S2JT8B39XM7QKGCNN7Z2KB"
+    }
+   ],
+   "finished": 1795064315,
+   "id": 12744,
+   "name": "artifact-handoff",
+   "pid": 1,
+   "pipeline_id": 16559,
+   "started": 1795064212,
+   "state": "success"
+  },
+  {
+   "agent_id": 12853,
+   "children": [
+    {
+     "exit_code": 0,
+     "finished": 1795064222,
+     "id": 55640,
+     "name": "checkout",
+     "pid": 7,
+     "pipeline_id": 16559,
+     "ppid": 2,
+     "started": 1795064214,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S2JT8CCJWVVEJWNY9JH05V"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795064228,
+     "id": 55641,
+     "name": "structural-gates",
+     "pid": 8,
+     "pipeline_id": 16559,
+     "ppid": 2,
+     "started": 1795064222,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S2JT8CCJWVVEJWNYC648ZK"
+    }
+   ],
+   "finished": 1795064228,
+   "id": 12745,
+   "name": "structural-gates",
+   "pid": 2,
+   "pipeline_id": 16559,
+   "started": 1795064213,
+   "state": "success"
+  },
+  {
+   "agent_id": 12854,
+   "children": [
+    {
+     "exit_code": 0,
+     "finished": 1795064222,
+     "id": 55642,
+     "name": "checkout",
+     "pid": 9,
+     "pipeline_id": 16559,
+     "ppid": 3,
+     "started": 1795064214,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S2JT8EYFY1M5FP6VC4G9BB"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795064223,
+     "id": 55643,
+     "name": "freshness",
+     "pid": 10,
+     "pipeline_id": 16559,
+     "ppid": 3,
+     "started": 1795064222,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S2JT8EYFY1M5FP6VNTATKN"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795064223,
+     "id": 55644,
+     "name": "applicability",
+     "pid": 11,
+     "pipeline_id": 16559,
+     "ppid": 3,
+     "started": 1795064223,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S2JT8EYFY1M5FP6WM4V42H"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795064223,
+     "id": 55645,
+     "name": "ui-gates",
+     "pid": 12,
+     "pipeline_id": 16559,
+     "ppid": 3,
+     "started": 1795064223,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S2JT8EYFY1M5FP6Z6VS33X"
+    }
+   ],
+   "finished": 1795064223,
+   "id": 12746,
+   "name": "ui-gates",
+   "pid": 3,
+   "pipeline_id": 16559,
+   "started": 1795064213,
+   "state": "success"
+  },
+  {
+   "agent_id": 12851,
+   "children": [
+    {
+     "exit_code": 0,
+     "finished": 1795064194,
+     "id": 55646,
+     "name": "checkout",
+     "pid": 13,
+     "pipeline_id": 16559,
+     "ppid": 4,
+     "started": 1795064187,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S2JT8GH583A0Y4FBGCPTSY"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795064195,
+     "id": 55647,
+     "name": "freshness",
+     "pid": 14,
+     "pipeline_id": 16559,
+     "ppid": 4,
+     "started": 1795064194,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S2JT8GH583A0Y4FDNPN3CA"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795064195,
+     "id": 55648,
+     "name": "applicability",
+     "pid": 15,
+     "pipeline_id": 16559,
+     "ppid": 4,
+     "started": 1795064195,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S2JT8GH583A0Y4FETSVN4D"
+    },
+    {
+     "exit_code": 0,
+     "id": 55649,
+     "name": "unit-gates",
+     "pid": 16,
+     "pipeline_id": 16559,
+     "ppid": 4,
+     "started": 1795064195,
+     "state": "running",
+     "type": "commands",
+     "uuid": "01M7S2JT8GH583A0Y4FFARNT0E"
+    }
+   ],
+   "id": 12747,
+   "name": "unit-gates",
+   "pid": 4,
+   "pipeline_id": 16559,
+   "started": 1795064186,
+   "state": "running"
+  }
+ ]
+}

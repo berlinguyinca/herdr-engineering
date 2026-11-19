@@ -4,12 +4,20 @@ Pure and read-only. Inputs are the handoff controller's event log and the shared
 herdr-handoff); nothing is written and nothing is asked of Herdr. The chain is joined by `predecessor_id` /
 `successor_id` of the records (the same join `HandoffRegistry.chain` makes server-side from its own database, which a
 local pane does not have). Colours and reasons come from the event log, as the controller wrote them.
+
+Scope. A chain is scoped by the session and pane ids of its records, never by repository: the session's own records
+are found by their source or target session id (pane id when no session id is known), then the chain is walked back
+through `predecessor_id` to its root and forward through the records that name each record as predecessor. Records of
+other repositories in the same store are never reached, because no predecessor link joins them to this chain. When
+two records name the same predecessor, the one created last (by its own `created_at`, then by its id; never by file
+name) continues the chain and the other is shown as a root of its own, flagged `?`. Events whose time cannot be read
+are skipped and counted in `unreadable`.
 """
 from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ..handoff_adapters.base import Harness, SessionRef
@@ -78,6 +86,7 @@ class SidePaneModel:
     chain_attention: bool = False
     ci: tuple[CiCard, ...] = ()
     built_at: float = 0.0  # the clock the durations were measured at; a later render adds what has passed
+    unreadable: int = 0  # events skipped because their time cannot be read
 
     @property
     def attention(self) -> bool:
@@ -167,16 +176,19 @@ def _chain_records(records: Mapping[str, _Record], session: SessionRef) -> tuple
             if _is_session(session, r.source_pane, r.source_session) or _is_session(session, r.target_pane, r.target_session)]
     if not mine:
         return [], False
+    successor: dict[str, _Record] = {}
+    for r in sorted(records.values(), key=lambda r: (r.created or 0.0, r.id)):  # the last created wins, not the last file
+        if r.predecessor:
+            successor[r.predecessor] = r
     current = max(mine, key=lambda r: r.created or 0.0)
     back = [current]
-    while current.predecessor in records and records[current.predecessor] not in back:
+    while current.predecessor in records and successor.get(current.predecessor) is current and records[current.predecessor] not in back:
         current = records[current.predecessor]
         back.append(current)
     chain = back[::-1]
-    successor = {r.predecessor: r for r in records.values() if r.predecessor}
     while chain[-1].id in successor and successor[chain[-1].id] not in chain:
         chain.append(successor[chain[-1].id])
-    return chain, chain[0].predecessor is not None and chain[0].predecessor not in records
+    return chain, chain[0].predecessor is not None and (chain[0].predecessor not in records or successor.get(chain[0].predecessor) is not chain[0])
 
 
 def _outcome(record: _Record, has_next: bool, events: Sequence[HandoffEvent]) -> tuple[Colour | None, str | None, float | None]:
@@ -269,6 +281,18 @@ def _totals(all_nodes: Sequence[_Node], now: float) -> Totals:
                   sum(known) if known else None)
 
 
+def _readable(events: Sequence[HandoffEvent]) -> tuple[list[HandoffEvent], int]:
+    """The events whose time parses, and how many did not."""
+    good: list[HandoffEvent] = []
+    for event in events:
+        try:
+            epoch(event.at)
+        except (ValueError, OverflowError):
+            continue
+        good.append(event)
+    return good, len(events) - len(good)
+
+
 def build_model(session: SessionRef | None, store_root: Path | None, env: Mapping[str, str], now: float,
                 ci: Sequence[CiCard] = (), events: Sequence[HandoffEvent] | None = None) -> SidePaneModel:
     """The model for `session`; the empty model when there is none. `store_root` defaults to the shared store; `ci` are
@@ -278,16 +302,16 @@ def build_model(session: SessionRef | None, store_root: Path | None, env: Mappin
     if session is None:
         return EMPTY
     root = store_root if store_root is not None else shared_store_root(env)
-    events = EventLog(root).read() if events is None else events
+    events, unreadable = _readable(EventLog(root).read() if events is None else events)
     chain, dangling = _chain_records(load_records(root), session)
     if chain:
         nodes = _nodes(chain, events, session)
     elif open_chain(pane_events(events, session.pane_id, session.session_id)) is not None:
         nodes = [_Node(None, session.pane_id, session.session_id, session.harness, "", None)]  # draining, no record yet
     else:
-        return SidePaneModel(ci=tuple(ci), built_at=now)
+        return SidePaneModel(ci=tuple(ci), built_at=now, unreadable=unreadable)
     rows, attention = _rows(nodes, events, now, dangling)
     hidden = max(len(rows) - CHAIN_MAX, 0)
-    shown = [ChainRow(**{**r.__dict__, "depth": r.depth - hidden}) for r in rows[hidden:]]
+    shown = [replace(r, depth=r.depth - hidden) for r in rows[hidden:]]
     return SidePaneModel(tuple(shown), _totals(nodes, now), _summary(chain[-1]) if chain else None, hidden,
-                         attention, tuple(ci), now)
+                         attention, tuple(ci), now, unreadable)

@@ -15,7 +15,7 @@ from typing import Protocol
 from ..agent_ops_tui import RenderOpts
 from ..ci import PipelineView
 from ..errors import HerdrEngineeringError
-from .style import Seg, line
+from .style import Seg, Style, line
 
 
 class CiProvider(Protocol):
@@ -61,7 +61,8 @@ def _pull_for(branch: str, pulls: Sequence[Mapping[str, object]]) -> Mapping[str
 
 
 def _newest(pipelines: Sequence[PipelineView], branch: str, number: object) -> PipelineView | None:
-    mine = [p for p in pipelines if p.branch == branch or (number is not None and p.ref == f"refs/pull/{number}/head")]
+    pull_refs = {f"refs/pull/{number}/head", f"refs/pull/{number}/merge"} if number is not None else set()
+    mine = [p for p in pipelines if p.branch == branch or p.ref in pull_refs]
     return max(mine, key=lambda p: p.run_number, default=None)
 
 
@@ -111,8 +112,9 @@ def build_cards(repo: str, branches: Sequence[str], provider: CiProvider,
     cards = []
     for branch, pull in pairs:
         if branch in merged and pull:
-            cards.append(CiCard(f"#{pull.get('number')}", _field(pull, "title") or branch, CiState.MERGED, (),
-                                _field(pull, "url"), branch))
+            number = pull.get("number")
+            cards.append(CiCard(f"#{number}" if number is not None else branch, _field(pull, "title") or branch, CiState.MERGED,
+                                (), _field(pull, "url"), branch))
         else:
             cards.append(_card(branch, pull, pipelines, repo, provider))
     return tuple(cards)
@@ -123,8 +125,8 @@ def ci_attention(cards: Sequence[CiCard]) -> bool:
     return any(c.state in (CiState.RUNNING, CiState.FAILED) for c in cards)
 
 
-_STYLE = {CiState.RUNNING: "yellow", CiState.PASSED: "green", CiState.FAILED: "red", CiState.NOT_STARTED: "gray",
-          CiState.MERGED: "gray", CiState.UNAVAILABLE: "gray"}
+_STYLE = {CiState.RUNNING: Style.YELLOW, CiState.PASSED: Style.GREEN, CiState.FAILED: Style.RED, CiState.NOT_STARTED: Style.GRAY,
+          CiState.MERGED: Style.GRAY, CiState.UNAVAILABLE: Style.GRAY}
 _WORD = {CiState.RUNNING: "running", CiState.PASSED: "ready", CiState.FAILED: "failing", CiState.NOT_STARTED: "not started",
          CiState.UNAVAILABLE: "CI unavailable"}
 
@@ -132,7 +134,7 @@ _WORD = {CiState.RUNNING: "running", CiState.PASSED: "ready", CiState.FAILED: "f
 def _chips(card: CiCard) -> list[Seg]:
     segs: list[Seg] = []
     for name in card.workflows:
-        style = "red" if name in card.failed else "yellow" if name in card.running else "green"
+        style = Style.RED if name in card.failed else Style.YELLOW if name in card.running else Style.GREEN
         segs += [(" " if segs else "", None), (name, style)]
     return segs
 
@@ -147,16 +149,16 @@ def _counts(cards: Sequence[CiCard]) -> str:
 def lines(cards: Sequence[CiCard], width: int, opts: RenderOpts) -> list[str]:
     """One card per open PR or branch; every merged one shares a single line."""
     if not cards:
-        return [line([("no CI to show", "gray")], width, opts)]
-    out = [line([(_counts(cards), "bold")], width, opts)]
+        return [line([("no CI to show", Style.GRAY)], width, opts)]
+    out = [line([(_counts(cards), Style.BOLD)], width, opts)]
     for card in (c for c in cards if c.state is not CiState.MERGED):
         style = _STYLE[card.state]
-        out.append(line([("● ", style), (f"{card.ref} {card.title}", "white")], width, opts))
+        out.append(line([("● ", style), (f"{card.ref} {card.title}", Style.WHITE)], width, opts))
         out.append(line([("  ", None), (_WORD[card.state], style)], width, opts))
-        for segs in (_chips(card), [(card.reason, "red")] if card.reason else []):
+        for segs in (_chips(card), [(card.reason, Style.RED)] if card.reason else []):
             if segs:
                 out.append(line([("  ", None), *segs], width, opts))
     merged = [c.ref for c in cards if c.state is CiState.MERGED]
     if merged:
-        out.append(line([("merged: ", "gray"), (" ".join(merged), "gray")], width, opts))
+        out.append(line([("merged: ", Style.GRAY), (" ".join(merged), Style.GRAY)], width, opts))
     return out

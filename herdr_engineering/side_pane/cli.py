@@ -7,6 +7,7 @@ from collections.abc import Mapping
 
 from . import app
 from .placement import DEFAULT_COMMAND, Outcome, ensure
+from .style import clean
 
 _DESCRIPTION = """The session side pane: a read-only viewer of the focused session of its own Herdr tab (Summary, Handoffs, CI).
 
@@ -34,5 +35,5 @@ def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
 def _ensure(args: argparse.Namespace, env: Mapping[str, str] | None = None) -> int:
     """Open the tab's side pane, also after q closed it (the dismissal is cleared). 0 when the tab has one afterwards."""
     result = ensure(args.tab, args.pane, env=env, command=args.command, force=True)
-    print(f"side-pane {args.tab}: {result.outcome}" + (f" {result.pane_id}" if result.pane_id else ""), file=sys.stderr)
+    print(clean(f"side-pane {args.tab}: {result.outcome}" + (f" {result.pane_id}" if result.pane_id else "")), file=sys.stderr)
     return 0 if result.outcome in (Outcome.CREATED, Outcome.EXISTS) else 1

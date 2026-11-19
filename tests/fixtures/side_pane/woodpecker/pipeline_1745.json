@@ -1,0 +1,237 @@
+{
+ "branch": "main",
+ "changed_files": [
+  "herdr_engineering/scratch_reaper.py",
+  "tests/test_scratch_reaper.py"
+ ],
+ "commit": "a22abffbbff48d31e0aad5f4cdc2d11346ab5e18",
+ "created": 1795062005,
+ "deploy_task": "",
+ "deploy_to": "",
+ "errors": null,
+ "event": "pull_request",
+ "event_reason": [
+  ""
+ ],
+ "finished": 1795063047,
+ "forge_url": "https://github.com/berlinguyinca/herdr-engineering/pull/889",
+ "id": 16547,
+ "number": 1745,
+ "parent": 0,
+ "ref": "refs/pull/889/merge",
+ "refspec": "fix/scratch-reaper-cargo-1-100:main",
+ "rerun_count": 0,
+ "reviewed": 0,
+ "started": 1795062017,
+ "status": "failure",
+ "timestamp": 0,
+ "title": "fix(scratch-reaper): recognise cargo 1.100 build-dir layout",
+ "updated": 1795063047,
+ "version": "3.20.1",
+ "workflows": [
+  {
+   "agent_id": 12837,
+   "children": [
+    {
+     "exit_code": 0,
+     "finished": 1795062050,
+     "id": 55592,
+     "name": "checkout",
+     "pid": 5,
+     "pipeline_id": 16547,
+     "ppid": 1,
+     "started": 1795062045,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S0H0K8WCKSTFAHQD5HHF3X"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795062081,
+     "id": 55593,
+     "name": "artifact-handoff-contracts",
+     "pid": 6,
+     "pipeline_id": 16547,
+     "ppid": 1,
+     "started": 1795062050,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S0H0K98CHS2AKS4ZARCJTY"
+    }
+   ],
+   "finished": 1795062082,
+   "id": 12727,
+   "name": "artifact-handoff",
+   "pid": 1,
+   "pipeline_id": 16547,
+   "started": 1795062044,
+   "state": "success"
+  },
+  {
+   "agent_id": 12838,
+   "children": [
+    {
+     "exit_code": 0,
+     "finished": 1795062127,
+     "id": 55594,
+     "name": "checkout",
+     "pid": 7,
+     "pipeline_id": 16547,
+     "ppid": 2,
+     "started": 1795062052,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S0H0KBBC78005RB1AK4RCY"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795062133,
+     "id": 55595,
+     "name": "structural-gates",
+     "pid": 8,
+     "pipeline_id": 16547,
+     "ppid": 2,
+     "started": 1795062127,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S0H0KBBC78005RB246KX5H"
+    }
+   ],
+   "finished": 1795062133,
+   "id": 12728,
+   "name": "structural-gates",
+   "pid": 2,
+   "pipeline_id": 16547,
+   "started": 1795062051,
+   "state": "success"
+  },
+  {
+   "agent_id": 12839,
+   "children": [
+    {
+     "exit_code": 0,
+     "finished": 1795062125,
+     "id": 55596,
+     "name": "checkout",
+     "pid": 9,
+     "pipeline_id": 16547,
+     "ppid": 3,
+     "started": 1795062054,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S0H0KCRXGQCR87KXXY6D3F"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795062126,
+     "id": 55597,
+     "name": "freshness",
+     "pid": 10,
+     "pipeline_id": 16547,
+     "ppid": 3,
+     "started": 1795062125,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S0H0KCRXGQCR87M1W2KTAD"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795062126,
+     "id": 55598,
+     "name": "applicability",
+     "pid": 11,
+     "pipeline_id": 16547,
+     "ppid": 3,
+     "started": 1795062126,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S0H0KDP358YKQMR63ED0B1"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795062126,
+     "id": 55599,
+     "name": "ui-gates",
+     "pid": 12,
+     "pipeline_id": 16547,
+     "ppid": 3,
+     "started": 1795062126,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S0H0KDP358YKQMR6W88B1Z"
+    }
+   ],
+   "finished": 1795062126,
+   "id": 12729,
+   "name": "ui-gates",
+   "pid": 3,
+   "pipeline_id": 16547,
+   "started": 1795062053,
+   "state": "success"
+  },
+  {
+   "agent_id": 12836,
+   "children": [
+    {
+     "exit_code": 0,
+     "finished": 1795062101,
+     "id": 55600,
+     "name": "checkout",
+     "pid": 13,
+     "pipeline_id": 16547,
+     "ppid": 4,
+     "started": 1795062018,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S0H0KE8ATBCBKBCRGAEH5C"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795062105,
+     "id": 55601,
+     "name": "freshness",
+     "pid": 14,
+     "pipeline_id": 16547,
+     "ppid": 4,
+     "started": 1795062101,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S0H0KE8ATBCBKBCS01KB8Q"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795062106,
+     "id": 55602,
+     "name": "applicability",
+     "pid": 15,
+     "pipeline_id": 16547,
+     "ppid": 4,
+     "started": 1795062105,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7S0H0KE8ATBCBKBCT7ZE4MY"
+    },
+    {
+     "exit_code": 1,
+     "finished": 1795063047,
+     "id": 55603,
+     "name": "unit-gates",
+     "pid": 16,
+     "pipeline_id": 16547,
+     "ppid": 4,
+     "started": 1795062106,
+     "state": "failure",
+     "type": "commands",
+     "uuid": "01M7S0H0KE8ATBCBKBCVXD41V1"
+    }
+   ],
+   "finished": 1795063047,
+   "id": 12730,
+   "name": "unit-gates",
+   "pid": 4,
+   "pipeline_id": 16547,
+   "started": 1795062017,
+   "state": "failure"
+  }
+ ]
+}

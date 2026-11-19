@@ -1,0 +1,37 @@
+{
+ "active": true,
+ "allow_deploy": false,
+ "allow_pr": true,
+ "approval_allowed_users": null,
+ "cancel_previous_pipeline_events": [
+  "pull_request"
+ ],
+ "config_extension_endpoint": "",
+ "config_extension_exclusive": false,
+ "config_extension_netrc": false,
+ "config_file": "",
+ "default_branch": "main",
+ "forge_id": 1,
+ "forge_remote_id": "1386194979",
+ "forge_url": "https://github.com/berlinguyinca/herdr-engineering",
+ "full_name": "berlinguyinca/herdr-engineering",
+ "id": 120,
+ "name": "herdr-engineering",
+ "netrc_trusted": null,
+ "org_id": 1,
+ "owner": "berlinguyinca",
+ "pr_enabled": true,
+ "private": false,
+ "registry_extension_endpoint": "",
+ "registry_extension_netrc": false,
+ "require_approval": "forks",
+ "secret_extension_endpoint": "",
+ "secret_extension_netrc": false,
+ "timeout": 120,
+ "trusted": {
+  "network": false,
+  "security": false,
+  "volumes": false
+ },
+ "visibility": "public"
+}

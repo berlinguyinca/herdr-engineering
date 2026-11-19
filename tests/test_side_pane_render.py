@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from herdr_engineering.agent_ops_tui import RenderOpts, sgr, visible_width
+from herdr_engineering.agent_ops_tui import RESET, RenderOpts, sgr, visible_width
 from herdr_engineering.side_pane.ci_tab import CiCard, CiState
 from herdr_engineering.side_pane.model import SidePaneModel, build_model
 from herdr_engineering.side_pane.render import Tab, render, tab_label
@@ -67,7 +67,8 @@ def text(lines: list[str]) -> str:
 def test_handoffs_tree_glyphs_and_colour_codes(tmp_path: Path) -> None:
     lines = render(failure_model(tmp_path), Tab.HANDOFFS, 60, 40, NOW, COLOUR)
     body = text(lines)
-    assert "●" in body and "▶" in body and "│" in body
+    assert "●" in body and "│" in body and "▶" not in body  # the stuck live session is not drawn as running
+    assert "▶" in text(render(rich_model(tmp_path / "live"), Tab.HANDOFFS, 60, 40, NOW, PLAIN))
     orange_line = next(line for line in lines if "failed, continued in compaction: takeover refused" in line)
     red_line = next(line for line in lines if "stuck: on_main_with_changes" in line)
     assert sgr("yellow") in orange_line and sgr("red") in red_line
@@ -171,11 +172,14 @@ def test_ci_tab_one_line_for_merged(tmp_path: Path) -> None:
 
 
 def test_ci_not_started_is_grey_and_never_red(tmp_path: Path) -> None:
-    lines = render(rich_model(tmp_path), Tab.CI, 60, 60, NOW, COLOUR)
-    started = next(line for line in lines if line.strip().startswith(sgr("gray") + "not started") or "not started" in line)
-    assert sgr("gray") in started and sgr("red") not in started
-    unavailable = next(line for line in lines if "CI unavailable" in line)
-    assert sgr("gray") in unavailable and sgr("red") not in unavailable
+    model = rich_model(tmp_path)
+    assert [c.state for c in model.ci].count(CiState.NOT_STARTED) == 1
+    assert [c.state for c in model.ci].count(CiState.UNAVAILABLE) == 1
+    lines = render(model, Tab.CI, 60, 60, NOW, COLOUR)
+    gray = sgr("gray")
+    assert f"  {gray}not started{RESET}" in lines
+    assert f"  {gray}CI unavailable{RESET}" in lines
+    assert not any(sgr("red") in line for line in lines if "not started" in line or "CI unavailable" in line)
 
 
 def test_summary_marks_a_fallback_briefing(tmp_path: Path) -> None:
