@@ -23,7 +23,7 @@ from herdr_engineering.handoff_controller.herdr_cli import AgentPane
 from herdr_engineering.pane_viewer import run_viewer
 from herdr_engineering.side_pane import app, state
 from herdr_engineering.side_pane import placement as placing
-from herdr_engineering.side_pane.ci_fetch import CiWorker
+from herdr_engineering.side_pane.ci_fetch import Chain, CiWorker
 from herdr_engineering.side_pane.ci_tab import CiCard, CiState, build_cards, lines
 from herdr_engineering.side_pane.follow import EventFollower
 from herdr_engineering.side_pane.herdr import Layout, PaneRow, Rect, SideHerdr
@@ -288,7 +288,7 @@ def test_a_ci_read_past_its_deadline_frees_the_worker_and_shows_the_last_good_ca
     release, third = threading.Event(), threading.Event()
     calls: list[int] = []
 
-    def fetch(cwd: Path) -> tuple[CiCard, ...]:  # scheduling seam: the first read is good, the second hangs, the third is good
+    def fetch(cwd: Path, chain: Chain = ()) -> tuple[CiCard, ...]:  # scheduling seam: the first read is good, the second hangs, the third is good
         calls.append(1)
         if len(calls) == 2:
             release.wait(20)
@@ -320,7 +320,7 @@ def test_a_ci_read_past_its_deadline_frees_the_worker_and_shows_the_last_good_ca
 def test_a_failed_read_keeps_the_last_good_cards_stale_too() -> None:
     results: list[tuple[CiCard, ...] | Exception] = [(GOOD,), OSError("network down")]
 
-    def fetch(cwd: Path) -> tuple[CiCard, ...]:
+    def fetch(cwd: Path, chain: Chain = ()) -> tuple[CiCard, ...]:
         outcome = results.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
@@ -346,7 +346,7 @@ def test_stale_cards_say_so_and_do_not_raise_the_attention_dot() -> None:
 
 def test_a_worker_reads_real_pipelines_from_a_local_server_that_serves_the_recorded_json(woodpecker: Served) -> None:  # noqa: F811
     provider, seen = woodpecker
-    worker = CiWorker(lambda cwd: build_cards(REPO, ["main"], provider, PULLS), clock=time.time)
+    worker = CiWorker(lambda cwd, chain=(): build_cards(REPO, ["main"], provider, PULLS), clock=time.time)
     worker.request(Path("/w"))
     assert wait_for(lambda: worker.latest() is not None, 10.0)
     latest = worker.latest()
