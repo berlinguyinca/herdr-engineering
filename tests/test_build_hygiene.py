@@ -25,9 +25,9 @@ from herdr_engineering import build_hygiene, cargo_host, disk_guard
 from herdr_engineering.build_cache_config import validate
 from herdr_engineering.config import DEFAULTS, load_config
 from herdr_engineering.doctor import DoctorReport, _add_build_hygiene
+from tests.real_cargo import build as real_build
 
 REAL_HOME = Path.home()
-CACHEDIR_TAG = "Signature: 8a477f597d28d172789f06886806bc55\n# Cargo target\n"
 
 
 def make_target(root: Path, name: str = "project", age_hours: float = 48) -> Path:
@@ -37,10 +37,7 @@ def make_target(root: Path, name: str = "project", age_hours: float = 48) -> Pat
     (project / "Cargo.toml").write_text('[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n')
     (project / "src").mkdir()
     (project / "src/main.rs").write_text("fn main() {}\n")
-    cache = project / "target"
-    (cache / "debug/.fingerprint").mkdir(parents=True)
-    (cache / "debug/artifact").write_bytes(b"x" * 4096)
-    (cache / "CACHEDIR.TAG").write_text(CACHEDIR_TAG)  # newer cargo refuses to clean a directory without it
+    cache = real_build(project, project / "target")  # a real build: cargo writes the tag and the fingerprints
     stamp = time.time() - age_hours * 3600
     for path in [*cache.rglob("*"), cache]:
         os.utime(path, (stamp, stamp))
@@ -49,26 +46,23 @@ def make_target(root: Path, name: str = "project", age_hours: float = 48) -> Pat
 
 def make_pool_target(slot: Path, age_hours: float = 48) -> Path:
     """A cache-only Cargo target (no manifest beside it), as the shared pool and admission dir are."""
-    cache = slot / "target"
-    (cache / "debug/.fingerprint").mkdir(parents=True)
-    (cache / "CACHEDIR.TAG").write_text(CACHEDIR_TAG)
-    (cache / "debug/artifact").write_bytes(b"x" * 4096)
+    slot.mkdir(parents=True, exist_ok=True)
+    elsewhere = slot.parent / f".crate-{slot.name}"
+    (elsewhere / "src").mkdir(parents=True)
+    (elsewhere / "Cargo.toml").write_text('[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n')
+    (elsewhere / "src/main.rs").write_text("fn main() {}\n")
+    cache = real_build(elsewhere, slot / "target")  # cargo makes the tag that proves a cache-only target
     stamp = time.time() - age_hours * 3600
     for path in [*cache.rglob("*"), cache]:
         os.utime(path, (stamp, stamp))
     return cache
 
 
-def idle_host():
-    """A process census of a host running no cargo (other sessions' cargo is not this test's)."""
-    return [], []
-
-
 def sweep(root: Path, **kwargs):
     usage = cleanup._usage(root)  # relative to what the filesystem shows, not an assumed 1%
     if usage <= 0:
         pytest.skip("the filesystem reports no usage at all")
-    base = {"high_water": usage / 2, "low_water": 0, "min_age_hours": 24, "processes": idle_host}
+    base = {"high_water": usage / 2, "low_water": 0, "min_age_hours": 24}
     return cleanup.run_once([root], root.parent / "state", **{**base, **kwargs})
 
 
@@ -175,19 +169,19 @@ def state_env(tmp_path, monkeypatch):
 
 def test_guard_allows_builds_below_the_limit_without_cleaning(root, state_env):
     cache = make_target(root, age_hours=5)
-    decision = disk_guard.check_build_allowed(root, guard_policy(root, 100), state_env, env={}, processes=idle_host)
+    decision = disk_guard.check_build_allowed(root, guard_policy(root, 100), state_env, env={})
     assert decision.allowed and not decision.cleanup_ran and cache.exists()
 
 
 def test_guard_refuses_clearly_after_running_one_pressure_cleanup(root, state_env):
     cache = make_target(root, age_hours=5)
-    decision = disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={}, processes=idle_host)
+    decision = disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={})
     assert not decision.allowed and decision.cleanup_ran
     assert "refusing to start a new build" in decision.message
     assert disk_guard.OVERRIDE_ENV in decision.message
     assert not cache.exists()  # the pressure cleanup reclaimed the idle target
     later = make_target(root, "later", age_hours=5)
-    again = disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={}, processes=idle_host)
+    again = disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={})
     assert not again.allowed and not again.cleanup_ran and later.exists()  # triggered once
 
 
@@ -487,7 +481,7 @@ def test_guard_waits_for_a_sweep_already_freeing_space_before_deciding(root, sta
     fcntl.flock(held, fcntl.LOCK_EX)
     threading.Timer(1.0, lambda: (fcntl.flock(held, fcntl.LOCK_UN), os.close(held))).start()
     started = time.monotonic()
-    decision = disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={}, busy_wait=15, processes=idle_host)
+    decision = disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={}, busy_wait=15)
     assert time.monotonic() - started >= 0.8  # it waited for the other sweep, then re-measured
     assert not decision.allowed
 
@@ -498,7 +492,7 @@ def test_guard_does_not_wait_when_the_busy_wait_is_zero(root, state_env):
     fcntl.flock(held, fcntl.LOCK_EX)
     try:
         started = time.monotonic()
-        disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={}, busy_wait=0, processes=idle_host)
+        disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={}, busy_wait=0)
         assert time.monotonic() - started < 5
     finally:
         os.close(held)
@@ -594,10 +588,7 @@ def make_managed(root: Path, name: str, age_hours: float = 48) -> Path:
     (workspace / "Cargo.toml").write_text('[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n')
     (workspace / "src/main.rs").write_text("fn main() {}\n")
     (root / "sccache").mkdir(exist_ok=True)
-    target = prepare_target(root / "sccache", workspace)
-    (target / "debug/.fingerprint").mkdir(parents=True)
-    (target / "debug/artifact").write_bytes(b"x" * 4096)
-    (target / "CACHEDIR.TAG").write_text(CACHEDIR_TAG)
+    target = real_build(workspace, prepare_target(root / "sccache", workspace))  # a real build into the managed dir
     stamp = time.time() - age_hours * 3600
     for path in [*target.rglob("*"), target]:
         os.utime(path, (stamp, stamp), follow_symlinks=False)
@@ -656,8 +647,6 @@ def test_a_reserve_refusal_cleans_up_then_exits_75_never_a_crash(tmp_path):
     refused = build(repo, home, env)
     assert refused.returncode == disk_guard.EXIT_REFUSED, refused.stderr
     assert "refusing to start a new build" in refused.stderr and "Traceback" not in refused.stderr
-    # What the cleanup may delete depends on the cargo processes this host runs: the in-process guard
-    # tests decide that with an idle census. Here the refusal must name the cleanup it ran.
 
 
 @pytest.mark.integration
@@ -692,28 +681,28 @@ def test_a_reserve_cleanup_is_not_pressure_mode(root, state_env):
     """The reserve line (here 1%) must not make the short idle floor apply: only ``pressure_percent`` does."""
     recent = make_target(root, "recent", age_hours=3)
     old = make_target(root, "old", age_hours=48)
-    ran = disk_guard.relieve(_policy(root), state_env, 1, pressure=False, processes=idle_host)
+    ran = disk_guard.relieve(_policy(root), state_env, 1, pressure=False)
     assert ran is True and recent.exists() and not old.exists()
     shutil.rmtree(state_env)
-    ran = disk_guard.relieve(_policy(root), state_env, 1, pressure=True, processes=idle_host)  # the guard's refusal line
+    ran = disk_guard.relieve(_policy(root), state_env, 1, pressure=True)  # the guard's refusal line
     assert ran is True and not recent.exists()
 
 
 def test_a_cleanup_only_touches_roots_on_the_filesystem_under_pressure(root, state_env):
     old = make_target(root, "old", age_hours=48)
     elsewhere = os.stat(root).st_dev + 1  # a different filesystem than the root's
-    result = cleanup.run_once([root], state_env, high_water=1, low_water=0, processes=idle_host, only_device=elsewhere)
+    result = cleanup.run_once([root], state_env, high_water=1, low_water=0, only_device=elsewhere)
     assert result["roots"] == [] and old.exists()
-    result = cleanup.run_once([root], state_env, high_water=1, low_water=0, processes=idle_host, only_device=os.stat(root).st_dev)
+    result = cleanup.run_once([root], state_env, high_water=1, low_water=0, only_device=os.stat(root).st_dev)
     assert result["removed"] == [str(old)]
 
 
 def test_a_failed_cleanup_does_not_start_the_cooldown(tmp_path, root):
     blocker = tmp_path / "not-a-directory"
     blocker.write_text("x")
-    assert disk_guard.relieve(_policy(root), blocker / "state", 1, processes=idle_host) is None  # the sweep itself cannot start
+    assert disk_guard.relieve(_policy(root), blocker / "state", 1) is None  # the sweep itself cannot start
     good = tmp_path / "state"
-    assert disk_guard.relieve(_policy(root), good, 1, processes=idle_host) is not None  # not suppressed by the failure
+    assert disk_guard.relieve(_policy(root), good, 1) is not None  # not suppressed by the failure
 
 
 def test_a_reserve_miss_with_an_empty_build_cleanup_key_exits_75_not_a_crash(tmp_path):
@@ -815,7 +804,7 @@ def test_a_swept_managed_target_is_not_swept_again_and_its_alias_never_dangles(r
     alias = root.parent / "workspaces/alias/target"
     alias.symlink_to(target)
     assert sweep(root)["removed"] == [str(target)]
-    assert alias.is_dir() and os.listdir(alias) == [".herdr-cargo-target.json"]
+    assert alias.is_dir() and sorted(os.listdir(alias)) == sorted([".herdr-cargo-target.json", "CACHEDIR.TAG"])
     again = sweep(root)
     assert again["removed"] == [] and not again["errors"]
 
@@ -838,14 +827,14 @@ def test_a_failed_sweep_backs_off_briefly_and_says_why(root, state_env):
     the reason, so a permanent cause is not retried by every build start; it retries after two minutes."""
     cache = make_target(root, age_hours=48)
     state = cache / "state"
-    assert disk_guard.relieve(_policy(root), state, 1, processes=idle_host) is False
+    assert disk_guard.relieve(_policy(root), state, 1) is False
     stamp = json.loads((state / "disk-guard.json").read_text())
     assert "Maintenance state is inside cleanup target" in stamp["aborted"]
     assert disk_guard.last_abort(state) == stamp["aborted"]
-    assert disk_guard.relieve(_policy(root), state, 1, processes=idle_host) is None  # backing off
+    assert disk_guard.relieve(_policy(root), state, 1) is None  # backing off
     stamp["triggered_at"] -= 130  # past the two minutes, well inside the ten of a normal sweep
     (state / "disk-guard.json").write_text(json.dumps(stamp))
-    assert disk_guard.relieve(_policy(root), state, 1, processes=idle_host) is False  # tried again
+    assert disk_guard.relieve(_policy(root), state, 1) is False  # tried again
     assert cache.exists()
 
 
@@ -854,7 +843,7 @@ def test_a_refusal_names_why_the_last_cleanup_could_not_run(root, monkeypatch):
     state = cache / "state"
     monkeypatch.setattr(disk_guard, "measure", lambda path: (99.0, 1.0))
     monkeypatch.setattr(cleanup, "_usage", lambda path: 99.0)  # a tmpfs root can really sit at 0%
-    decision = disk_guard.check_build_allowed(root, _policy(root, high_water=1), state, env={}, processes=idle_host)
+    decision = disk_guard.check_build_allowed(root, _policy(root, high_water=1), state, env={})
     assert not decision.allowed and "could not run: Maintenance state is inside cleanup target" in decision.message
 
 
@@ -865,10 +854,10 @@ def test_a_target_that_always_errors_does_not_disable_the_cooldown(root, state_e
     (bad / "debug/link").symlink_to(bad / "debug/artifact")
     _age(bad)
     good = make_managed(root, "good")
-    assert disk_guard.relieve(_policy(root), state_env, 1, processes=idle_host) is True  # the good target went
-    assert not good.exists() or os.listdir(good) == [".herdr-cargo-target.json"]
+    assert disk_guard.relieve(_policy(root), state_env, 1) is True  # the good target went
+    assert not good.exists() or sorted(os.listdir(good)) == sorted([".herdr-cargo-target.json", "CACHEDIR.TAG"])
     assert (state_env / "disk-guard.json").exists()
-    assert disk_guard.relieve(_policy(root), state_env, 1, processes=idle_host) is None  # inside the cooldown
+    assert disk_guard.relieve(_policy(root), state_env, 1) is None  # inside the cooldown
 
 
 def test_a_boolean_build_cleanup_keeps_what_an_earlier_source_set(tmp_path):
@@ -940,6 +929,6 @@ def test_a_refusal_inside_the_cooldown_does_not_claim_a_cleanup(tmp_path):
 
 def test_the_reserve_refusal_does_not_claim_a_cleanup_that_removed_nothing(root, state_env):
     make_target(root, "fresh", age_hours=1)  # too young to remove
-    ran = disk_guard.relieve(_policy(root), state_env, 1, processes=idle_host)
+    ran = disk_guard.relieve(_policy(root), state_env, 1)
     assert ran is False  # a sweep ran, nothing was removed: nothing to claim
 

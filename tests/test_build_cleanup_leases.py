@@ -1,7 +1,6 @@
 """Spec 05: cleanup honors registry leases. Real sqlite registry, real child owner.
 
-``_process_paths`` is neutralised (like in test_build_cleanup.py) so only the lease
-guard decides; thresholds are forced through the real policy parameters.
+Thresholds are forced through the real policy parameters; targets are built by a real cargo.
 """
 import os
 import subprocess
@@ -13,6 +12,7 @@ import pytest
 
 from herdr_engineering import build_cleanup as cleanup
 from herdr_engineering import build_registry as br
+from tests.real_cargo import build
 
 
 def force(root: Path) -> dict:
@@ -24,11 +24,6 @@ def force(root: Path) -> dict:
     return {"high_water": usage / 2, "low_water": 0.0, "min_age_hours": 24}
 
 
-@pytest.fixture(autouse=True)
-def no_proc_scan(monkeypatch):  # in-process sweeps only; the racing tests sweep in a real child process
-    monkeypatch.setattr(cleanup, "_process_paths", lambda: [])
-
-
 def project(root: Path, name="project", age=48) -> Path:
     p = root / name
     p.mkdir(parents=True)
@@ -36,19 +31,15 @@ def project(root: Path, name="project", age=48) -> Path:
     (p / "Cargo.toml").write_text('[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n')
     (p / "src").mkdir()
     (p / "src/main.rs").write_text("fn main() {}\n")
-    t = p / "target"
-    t.mkdir()
-    (t / ".rustc_info.json").write_text("{}")
-    (t / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n# cargo cache dir tag\n")
-    (t / "artifact").write_bytes(b"x" * 4096)
+    t = build(p, p / "target")  # a real build: cargo writes the tag and the fingerprints
     stamp = time.time() - age * 3600
-    for path in [*t.iterdir(), t]:
+    for path in [*t.rglob("*"), t]:
         os.utime(path, (stamp, stamp))
     return t
 
 
 def sweep(root, state, **kw):
-    return cleanup.run_once([root], state, **{**force(root), "processes": lambda: ([], []), **kw})
+    return cleanup.run_once([root], state, **{**force(root), **kw})
 
 
 def reasons(res):
@@ -188,8 +179,7 @@ def paused(target):  # our own sync point: the first target is past its first ch
     return original(target)
 
 c._untracked = paused
-print(json.dumps(c.run_once([root], state, high_water=float(high), low_water=0.0, min_age_hours=24,
-                              processes=lambda: ([], []))))
+print(json.dumps(c.run_once([root], state, high_water=float(high), low_water=0.0, min_age_hours=24)))
 """
 
 

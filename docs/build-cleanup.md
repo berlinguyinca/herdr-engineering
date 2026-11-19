@@ -45,7 +45,7 @@ and protects a running build through the build's managed target instead (below).
 participants must use the same `HERDR_ENGINEERING_STATE` location.
 
 Running inside a Herdr terminal alone does not acquire this lock. Instead the sweep refuses
-to clean idle targets while any cargo-family process runs for this user (see "What the job deletes").
+to clean an idle target while a process of this user uses it (see "What the job deletes").
 Already running builds from before the upgrade are covered the same way.
 
 The companion does not remove worktrees or retained evidence. Cache deletion
@@ -85,26 +85,28 @@ A sweep takes `build-cleanup.lock` exclusively (one sweep at a time) and `build-
 The default-on job is narrow. It deletes exactly two kinds of target and nothing else:
 
 1. **Orphaned targets.** A Herdr-managed target (`<root>/targets/<label>-<id>`) whose owning worktree path no longer
-   exists, provided the directory that held the worktree still exists (a missing volume proves nothing). Nothing
-   can be building into it. The decision is made again under the manager lock, so a worktree recreated at the same
-   path is prepared afresh by its next build. Removed with a plain recursive delete, at any age.
+   exists: `lstat` of the workspace must raise "not found" and its parent directory must be listable. Any other error
+   (permission denied, a missing volume) is not an orphan. Nothing can be building into it. The decision is made
+   again under the manager lock, then the directory is renamed to `targets/.trash-<name>-<pid>` and deleted after the
+   lock is released; a later run removes any `.trash-*` leftover of an interrupted delete.
 2. **Idle targets with a workspace**, past the idle floor (`min_age_hours`, or `pressure_min_age_hours` at or above
-   `pressure_percent`), and only while **no cargo-family process runs anywhere for this user**: `cargo`, `rustc`,
-   `rustdoc`, `rust-analyzer`, `cargo-nextest` and any other `cargo-*`, or any process whose executable, working
-   directory or open file is inside a target directory (a test binary run from `target/`). One process snapshot is
-   taken before deciding. If any such process exists, every non-orphaned target is skipped for that pass; a
-   process list that cannot be read fails closed (the pass is `aborted` with an error). The delete is
+   `pressure_percent`), and only while no process of this user is using that target or its workspace W: a process
+   whose cwd, executable, open file or (Linux) memory mapping is under the target or W, or a cargo-family process
+   (`cargo`, `rustc`, `rustdoc`, `rust-analyzer`, `cargo-*`) whose `CARGO_TARGET_DIR` or `--target-dir` is the
+   target. A cargo working elsewhere does not block. The process scan is taken fresh right before each candidate is
+   cleaned; a scan that fails closes the pass (`aborted`, with an error), and the refusal message names what blocked
+   a target (`blocked` in the run result). The delete is
    `cargo clean --manifest-path <workspace>/Cargo.toml --target-dir <dir>`, so Cargo does its own locking.
-   A managed target is cleaned under the manager lock, and its directory and ownership marker are put back
-   afterwards, so a workspace `./target` alias never dangles.
+   A managed target is cleaned under the manager lock, and its directory, ownership marker and standard
+   `CACHEDIR.TAG` are put back in a `finally`, however `cargo clean` ends (even a timeout), so a workspace
+   `./target` alias never dangles. `prepare_target` writes the tag for new and existing managed targets, since newer
+   cargo refuses to clean a directory without one.
 
 Everything else is left alone: targets a lease covers, targets with files tracked by git or anything foreign inside
 (links, special files, other owners), and cache-only directories without a workspace to clean through (the old
-shared pool). A target whose `cargo clean` fails is kept and named in `skipped`. Because the check is host-wide, a
-long-running `rust-analyzer` or a build in another worktree keeps idle targets until it ends; that is the price of
-having no per-target race to get wrong.
+shared pool). A target whose `cargo clean` fails is kept and named in `skipped`.
 
-Targets a build lease covers, and every target while a cargo-family process runs, are
+Targets a build lease covers, and every target a live process uses, are
 never cleaned in any tier (only orphaned targets are, since nothing can build into them). When the build's filesystem is at or above `refuse_builds_percent`
 and has less than `refuse_builds_min_free_gib` available, a new cargo/build command
 (`build-coordinate` guards rustc, make, cmake, ninja, tsc and `go build|install|generate`, never `go test`/scripts; cargo is guarded by the wrapper, also under `build-coordinate`, for build, check, test, nextest, bench, run and the like, but not `cargo clean`) triggers

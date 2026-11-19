@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from herdr_engineering.build_cleanup import _managed_process, _process_paths
+from herdr_engineering.build_cleanup import _managed_process, _scan
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs a real Linux /proc")
@@ -29,7 +29,7 @@ def test_a_zombie_under_a_herdr_named_parent_does_not_fail_the_scan(tmp_path: Pa
                 break
             time.sleep(0.05)
         assert state == "Z"
-        _process_paths()  # must skip the zombie, not raise
+        _scan()  # must skip the zombie, not raise
     finally:
         parent.kill()
         parent.wait()
@@ -55,7 +55,7 @@ def test_a_zombie_leader_with_a_live_thread_still_counts_its_cwd(tmp_path: Path)
                 break
             time.sleep(0.05)
         assert state == "Z"  # leader exited, the other thread still runs
-        assert target in {p.resolve() for p in _process_paths()}
+        assert target in {hold[3].resolve() for hold in _scan()}
     finally:
         proc.kill()
         proc.wait()

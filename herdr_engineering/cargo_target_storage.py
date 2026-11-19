@@ -223,6 +223,19 @@ def _manager_lock(root: Path) -> Iterator[None]:
         os.close(fd)
 
 
+CACHEDIR_TAG = ("Signature: 8a477f597d28d172789f06886806bc55\n"
+                "# This file is a cache directory tag created by Herdr, as cargo does.\n"
+                "# For information about cache directory tags see https://bford.info/cachedir/\n")
+
+
+def write_cachedir_tag(target: Path) -> None:
+    """Give a managed target the ``CACHEDIR.TAG`` cargo checks before ``cargo clean`` (cargo writes it
+    only when it creates the directory itself, and the manager creates it first)."""
+    tag = target / "CACHEDIR.TAG"
+    if not os.path.lexists(tag):
+        tag.write_text(CACHEDIR_TAG)
+
+
 def prepare_target(cache: Path, workspace: Path) -> Path:
     """The workspace's managed target, created and ownership-checked, under the manager lock.
 
@@ -260,6 +273,7 @@ def prepare_target(cache: Path, workspace: Path) -> Path:
             if any(target.iterdir()):
                 raise ValueError("Existing target directory has no ownership marker")
             _write_marker(marker, expected)
+        write_cachedir_tag(target)  # new targets get one, and ones made before this existed are backfilled
         os.utime(marker, None, follow_symlinks=False)
     return target
 

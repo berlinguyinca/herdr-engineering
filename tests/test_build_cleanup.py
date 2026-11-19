@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from herdr_engineering import build_cleanup as cleanup
+from tests.real_cargo import build
 
 Usage = namedtuple("Usage", "total used free")
 
@@ -18,7 +19,6 @@ Usage = namedtuple("Usage", "total used free")
 def workspace(tmp_path, monkeypatch):
     root = tmp_path / "projects"
     root.mkdir()
-    monkeypatch.setattr(cleanup, "_process_paths", lambda: [])
     monkeypatch.setattr(cleanup.shutil, "disk_usage", lambda _: Usage(1000, 900, 100))
     return root
 
@@ -30,20 +30,15 @@ def target(root, name="project", age=48):
     (project / "Cargo.toml").write_text('[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n')
     (project / "src").mkdir()
     (project / "src/main.rs").write_text("fn main() {}\n")
-    cache = project / "target"
-    cache.mkdir()
-    (cache / ".rustc_info.json").write_text("{}")
-    (cache / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n# cargo cache dir tag\n")
-    (cache / "artifact").write_bytes(b"x" * 4096)
+    cache = build(project, project / "target")  # a real build: cargo writes the tag and the fingerprints
     stamp = time.time() - age * 3600
-    for path in [*cache.iterdir(), cache]:
+    for path in [*cache.rglob("*"), cache]:
         os.utime(path, (stamp, stamp))
     return cache
 
 
 def run(root, **kwargs):
-    """A sweep that sees an idle host: the real cargo-family processes of other sessions are not the test's."""
-    return cleanup.run_once([root], root.parent / "state", **{"processes": lambda: ([], []), **kwargs})
+    return cleanup.run_once([root], root.parent / "state", **kwargs)
 
 
 def test_removes_only_old_verified_outputs_and_writes_status(workspace):
@@ -93,8 +88,15 @@ def test_nested_recent_artifact_protects_old_directory(workspace):
     assert cache.exists()
 
 
+def _old_artifact(cache):
+    (cache / "artifact").write_text("output")
+    stamp = time.time() - 48 * 3600
+    os.utime(cache / "artifact", (stamp, stamp))
+
+
 def test_tracked_output_is_never_deleted(workspace):
     cache = target(workspace)
+    _old_artifact(cache)
     subprocess.run(["git", "-C", str(cache.parent), "add", "target/artifact"], check=True)
     assert run(workspace)["removed_count"] == 0
     assert cache.exists()
@@ -175,6 +177,11 @@ def test_nested_source_manifest_is_preserved(workspace):
     assert cache.exists()
 
 
+def _paths(proc):
+    """The files the scan says processes use (their cwd, executable, descriptors and mappings)."""
+    return [hold[3] for hold in cleanup._scan(proc) if hold[2] == "uses"]
+
+
 def test_proc_reads_cwd_executable_and_open_files(tmp_path):
     proc = tmp_path / "proc"
     pid = proc / "99999999"
@@ -182,7 +189,7 @@ def test_proc_reads_cwd_executable_and_open_files(tmp_path):
     for link, value in [("cwd", "/project"), ("exe", "/binary"),
                         ("fd/0", "/project/target/output"), ("fd/1", "socket:[123]")]:
         (pid / link).symlink_to(value)
-    paths = cleanup._process_paths(proc)
+    paths = _paths(proc)
     assert set(paths) == {Path("/project"), Path("/binary"), Path("/project/target/output")}
 
 
@@ -191,7 +198,7 @@ def test_missing_proc_falls_back_to_lsof_or_fails_closed(tmp_path, monkeypatch):
     empty.mkdir()
     monkeypatch.setenv("PATH", str(empty))  # a real host without lsof
     with pytest.raises(OSError):
-        cleanup._process_paths(tmp_path / "no-proc")
+        _paths(tmp_path / "no-proc")
 
 
 def test_discovery_does_not_enter_other_filesystems(workspace, monkeypatch):
@@ -230,6 +237,7 @@ def test_discovery_does_not_enter_other_filesystems(workspace, monkeypatch):
 
 def test_mount_inside_target_is_preserved(workspace, monkeypatch):
     cache = target(workspace)
+    _old_artifact(cache)
     original = Path.lstat
 
     def metadata(path, **kwargs):
@@ -283,14 +291,14 @@ def test_inaccessible_managed_build_aborts_inspection(hidden_proc):
     proc, child, _, _ = hidden_proc
     assert cleanup._managed_process(child, proc)
     with pytest.raises(PermissionError):
-        cleanup._process_paths(proc)
+        _paths(proc)
 
 
 def test_inaccessible_unmanaged_daemon_does_not_block_inspection(hidden_proc):
     proc, child, parent, binary = hidden_proc
     (parent / "cmdline").write_bytes(b"systemd\0--user\0")
     assert not cleanup._managed_process(child, proc)
-    assert cleanup._process_paths(proc) == [binary]
+    assert _paths(proc) == [binary]
 
 
 def test_managed_ancestry_walks_multiple_generations(hidden_proc):
@@ -308,7 +316,7 @@ def test_unknown_ancestry_fails_closed(hidden_proc):
     (parent / "cmdline").write_bytes(b"systemd\0--user\0")
     (parent / "status").unlink()
     with pytest.raises(OSError, match="ancestry changed"):
-        cleanup._process_paths(proc)
+        _paths(proc)
 
 
 def test_unverified_herdr_executable_fails_closed(hidden_proc):
@@ -318,7 +326,7 @@ def test_unverified_herdr_executable_fails_closed(hidden_proc):
     (parent / "exe").unlink()
     (parent / "exe").symlink_to(other)
     with pytest.raises(OSError, match="Unverifiable Herdr"):
-        cleanup._process_paths(proc)
+        _paths(proc)
 
 
 def test_ancestry_cycle_fails_closed(hidden_proc):
@@ -326,7 +334,7 @@ def test_ancestry_cycle_fails_closed(hidden_proc):
     (parent / "cmdline").write_bytes(b"bash\0")
     (parent / "status").write_text(f"PPid:\t{child.name}\n")
     with pytest.raises(OSError, match="Unverifiable process ancestry"):
-        cleanup._process_paths(proc)
+        _paths(proc)
 
 
 def test_any_verified_herdr_ancestor_is_conservatively_protected(hidden_proc):
@@ -340,4 +348,4 @@ def test_herdr_global_options_do_not_hide_managed_ancestry(hidden_proc):
     (parent / "cmdline").write_bytes(os.fsencode(binary) + b"\0--session\0abc\0server\0")
     assert cleanup._managed_process(child, proc)
     with pytest.raises(PermissionError):
-        cleanup._process_paths(proc)
+        _paths(proc)
