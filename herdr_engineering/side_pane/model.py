@@ -270,13 +270,15 @@ def _totals(all_nodes: Sequence[_Node], now: float) -> Totals:
 
 
 def build_model(session: SessionRef | None, store_root: Path | None, env: Mapping[str, str], now: float,
-                ci: Sequence[CiCard] = ()) -> SidePaneModel:
+                ci: Sequence[CiCard] = (), events: Sequence[HandoffEvent] | None = None) -> SidePaneModel:
     """The model for `session`; the empty model when there is none. `store_root` defaults to the shared store; `ci` are
-    the cards `ci_tab.build_cards` made (fetching them is the caller's job: it is the only part that uses the network)."""
+    the cards `ci_tab.build_cards` made (fetching them is the caller's job: it is the only part that uses the network).
+    `events` are the event log's events when the caller already holds them (a running pane reads the log incrementally);
+    without them the whole log is read."""
     if session is None:
         return EMPTY
     root = store_root if store_root is not None else shared_store_root(env)
-    events = EventLog(root).read()
+    events = EventLog(root).read() if events is None else events
     chain, dangling = _chain_records(load_records(root), session)
     if chain:
         nodes = _nodes(chain, events, session)
