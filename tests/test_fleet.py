@@ -1,5 +1,6 @@
 """Tests for the one-command fleet onboarding (herdr_engineering/fleet.py)."""
 import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -672,3 +673,17 @@ def test_cli_fleet_status_exit_codes(tmp_path, monkeypatch, capsys):
     rc = cli.main(["fleet", "status"])
     assert rc == 1
     assert "no inventory" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv", [
+    ["fleet", "rollout", "plan", "--pi-revision", "a" * 40],
+    ["fleet", "recover", "plan"],
+])
+def test_cli_fleet_planning_outside_a_checkout_reports_the_missing_inventory(argv, tmp_path, monkeypatch, capsys):
+    from herdr_engineering import cli
+    monkeypatch.delenv("HERDR_ENGINEERING_REPO", raising=False)
+    monkeypatch.delenv("HERDR_PI_RECOVERY_INVENTORY", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(argv) == 1
+    assert "no inventory at" in json.loads(capsys.readouterr().out)["error"]

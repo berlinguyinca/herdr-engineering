@@ -1,10 +1,11 @@
 # Runs the gateway monitor every 5 minutes.
+# Calendar-based on purpose: Persistent= only applies to OnCalendar=. With OnBootSec= it left a stamp file,
+# and a timer started after the boot delay had passed then never fired again.
 [Unit]
 Description=Run herdr-gateway-monitor every 5 minutes
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
+OnCalendar=*:0/5
 Persistent=true
 
 [Install]
