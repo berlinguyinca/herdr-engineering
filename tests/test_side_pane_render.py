@@ -70,7 +70,7 @@ def test_handoffs_tree_glyphs_and_colour_codes(tmp_path: Path) -> None:
     assert "●" in body and "│" in body and "▶" not in body  # the stuck live session is not drawn as running
     assert "▶" in text(render(rich_model(tmp_path / "live"), Tab.HANDOFFS, 60, 40, NOW, PLAIN))
     orange_line = next(line for line in lines if "failed, continued in compaction: takeover refused" in line)
-    red_line = next(line for line in lines if "stuck: on_main_with_changes" in line)
+    red_line = next(line for line in lines if "stuck: uncommitted work on main" in line)
     assert sgr("yellow") in orange_line and sgr("red") in red_line
     assert next(line for line in lines if "#1 fix the thing" in line).startswith(sgr("yellow"))  # orange node
     assert sgr("bold+white") in next(line for line in lines if "#2 fix it again" in line)  # the live one is highlighted
