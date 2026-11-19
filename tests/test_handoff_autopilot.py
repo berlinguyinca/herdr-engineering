@@ -22,7 +22,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 import pytest
@@ -1233,24 +1232,32 @@ def test_sessions_recording_at_the_same_instant_all_survive(host: dict) -> None:
         "75",
         "--json",
     ]
-    started = threading.Barrier(writers)
-
-    def write(index: int) -> None:
-        started.wait(timeout=30)
-        subprocess.run(
-            [*command, "--session-id", sessions[index]],
-            capture_output=True,
+    # Started with Popen rather than a Barrier inside threads: a barrier raises
+    # BrokenBarrierError when the host is saturated, the thread dies with the exception swallowed,
+    # and the assertion below would then blame the ledger for records that were never attempted.
+    # Eight processes already running at once is the race; a recorder that fails is reported as
+    # itself instead of masquerading as a lost write.
+    processes = [
+        subprocess.Popen(
+            [*command, "--session-id", session_id],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=120,
             env=host["env"],
             cwd=str(host["work"]),
         )
-
-    threads = [threading.Thread(target=write, args=(index,)) for index in range(writers)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=120)
+        for session_id in sessions
+    ]
+    failures = []
+    for session_id, process in zip(sessions, processes, strict=True):
+        try:
+            stdout, stderr = process.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            failures.append((session_id, process.returncode, (stderr or stdout)[-400:]))
+    assert not failures, f"recorders failed: {failures}"
 
     ledger = json.loads(ha.state_path().read_text())
     recorded = sorted(ledger["sessions"])
