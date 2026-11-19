@@ -294,7 +294,7 @@ def reap_repo(repo: Path, policy: Policy, roots: list[Path], *, dry_run: bool, n
             if idle < policy.min_idle_hours * 3600:
                 row.update(action="kept", reason="recent_activity")
                 continue
-            facts = worktree_quick_facts(path)  # cheap, before any network call
+            facts = worktree_quick_facts(path, policy.rebuildable)  # every local refusal, before any network call
             state = pr_state(repo, path, item["branch"], facts["head"], policy.pr_source)
             row["pr"] = state.value
             if state in (PrState.OPEN, PrState.UNKNOWN):
@@ -306,7 +306,7 @@ def reap_repo(repo: Path, policy: Policy, roots: list[Path], *, dry_run: bool, n
             reason = f"pr_{state}" if state is not PrState.NONE else "orphan_ttl"
             merged = unpushed_ok(state)
             # no shared snapshot: the process check inside remove_worktree is taken fresh, last.
-            # Only HEAD and cleanliness are re-checked; the PR head must still be this HEAD.
+            # HEAD and the local state are re-checked after the lookup; the PR head must still be this HEAD.
             remove_worktree(path, dry_run=dry_run, merged_ok=merged, rebuildable=policy.rebuildable,
                             pr_head=facts["head"] if merged else None, prechecked=facts)
             row.update(action="would_remove" if dry_run else "removed", reason=reason)

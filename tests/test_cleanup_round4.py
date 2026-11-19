@@ -147,7 +147,7 @@ def test_forged_session_env_var_does_not_exempt_a_live_session(tmp_path: Path, h
 
 # --- 7: one local pass per removable worktree -------------------------------------------------------------
 
-def test_reaper_inspects_a_removable_worktree_once(env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reaper_inspects_a_removable_worktree_before_the_lookup_and_at_removal(env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     env.worktree("once")
     real = shutil.which("git")
     assert real
@@ -164,7 +164,8 @@ def test_reaper_inspects_a_removable_worktree_once(env: Env, tmp_path: Path, mon
     out = reap_worktrees(HygienePolicy(pr_source="git", min_idle_hours=0, ttl_days=0), extra_repos=[env.repo],
                          extra_roots=[str(env.roots[0])], now=time.time() + DAY)
     assert [w["action"] for r in out["repos"] for w in r["worktrees"]] == ["removed"]
-    assert sum("--ignored" in line for line in log.read_text().splitlines()) == 1
+    # once before any PR lookup (a refusal must not cost a network call), once at removal time
+    assert sum("--ignored" in line for line in log.read_text().splitlines()) == 2
 
 
 # --- 8: a broken config is loud ---------------------------------------------------------------------------

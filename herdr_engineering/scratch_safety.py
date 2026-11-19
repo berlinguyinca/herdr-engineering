@@ -129,7 +129,7 @@ def git(repo: Path, *arguments: str, timeout: float = 15) -> subprocess.Complete
         GIT_NO_LAZY_FETCH="1",
         LC_ALL="C",
     )
-    return subprocess.run(
+    done = subprocess.run(
         [
             "git",
             "--no-pager",
@@ -157,8 +157,15 @@ def git(repo: Path, *arguments: str, timeout: float = 15) -> subprocess.Complete
         ],
         env=environment,
         capture_output=True,
-        text=True,
         timeout=timeout,
+    )
+    # Bytes, decoded without universal-newline translation: a file name holding "\r" (Finder's
+    # `Icon\r`) must come back exact, and a name that is not valid UTF-8 must not raise.
+    return subprocess.CompletedProcess(
+        done.args,
+        done.returncode,
+        done.stdout.decode("utf-8", "surrogateescape"),
+        done.stderr.decode("utf-8", "surrogateescape"),
     )
 
 

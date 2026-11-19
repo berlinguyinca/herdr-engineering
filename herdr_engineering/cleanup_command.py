@@ -138,19 +138,21 @@ def _git(cwd: Path, *args: str, timeout: int | None = None) -> subprocess.Comple
     no user/system config, no fsmonitor or hooks, ``LC_ALL=C``. A ``GIT_DIR`` in the environment
     or ``status.showUntrackedFiles=no`` in a config must not change what a check sees."""
     from .scratch_safety import git as safe_git
-    excludes = _user_excludes_file(os.environ.get("HOME", ""))
+    excludes = _user_excludes_file(os.environ.get("HOME", ""), str(cwd))
     options = ("-c", f"core.excludesFile={excludes}") if excludes else ()
     return safe_git(cwd, *options, *args, timeout=GIT_TIMEOUT if timeout is None else timeout)
 
 
-@functools.lru_cache(maxsize=8)
-def _user_excludes_file(home: str) -> str:
-    """``core.excludesFile`` of the user's own global git config (``.DS_Store``, ``.idea/``...),
-    the one setting the hardened runner keeps from it. Read once per home; empty when unset."""
+@functools.lru_cache(maxsize=64)
+def _user_excludes_file(home: str, cwd: str) -> str:
+    """``core.excludesFile`` of the user's own global git config, the one setting the hardened
+    runner keeps from it. ``--includes`` follows ``[include]``/``[includeIf]`` (dotfile managers put
+    ``core.*`` in an included file), which is why it is read from ``cwd``. Empty when unset."""
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     try:
-        done = subprocess.run(["git", "config", "--global", "--type=path", "--get", "core.excludesFile"],
-                              capture_output=True, text=True, timeout=15, check=False, env=env)
+        done = subprocess.run(["git", "config", "--global", "--includes", "--type=path", "--get",
+                               "core.excludesFile"],
+                              capture_output=True, text=True, timeout=15, check=False, env=env, cwd=cwd)
     except (OSError, subprocess.SubprocessError):
         return ""
     value = done.stdout.strip() if done.returncode == 0 else ""
@@ -310,6 +312,12 @@ def select_pr(prs: list[dict[str, Any]], branch: str, head: str, owner: str) -> 
     return {"state": str(mine[0].get("state", "")).upper(), "head": str(mine[0].get("headRefOid", ""))}
 
 
+def pr_excuses_unpushed(pr: dict[str, str] | None, head: str) -> bool:
+    """Only a MERGED PR whose head is still this HEAD excuses commits that are on no remote.
+    None (gh unknown), NONE, OPEN and CLOSED (maybe closed to be reworked) never do."""
+    return pr is not None and pr["state"] == "MERGED" and bool(head) and pr["head"] == head
+
+
 def gh_pr_state(repo: Path, branch: str, head: str, owner: str) -> dict[str, str] | None:
     """PR for exactly this branch, head SHA and origin owner from a real ``gh`` call.
 
@@ -355,40 +363,68 @@ REBUILDABLE = ("target", "node_modules", ".venv", "venv", "__pycache__", ".pytes
                "coverage", ".coverage", "htmlcov", ".gradle", ".next", ".turbo", ".cache")
 
 
+# OS-generated files nobody wrote: disposable whether untracked or ignored, and never "dirty".
+OS_JUNK = (".DS_Store", "._*", "Thumbs.db", "desktop.ini", "Icon\r")
+
+
+def _is_junk(entry: str) -> bool:
+    from fnmatch import fnmatchcase
+    name = entry.rstrip("/").rsplit("/", 1)[-1]
+    return any(fnmatchcase(name, pattern) for pattern in OS_JUNK)
+
+
+def _status(path: Path, *flags: str) -> list[tuple[str, str]] | None:
+    """``git status --porcelain -z`` as (code, path) pairs: names are never quoted. None: failed."""
+    out = _git(path, "status", "--porcelain", "-z", *flags)
+    if out.returncode != 0:
+        return None
+    fields = out.stdout.split("\0")
+    entries: list[tuple[str, str]] = []
+    index = 0
+    while index < len(fields) and fields[index]:
+        code, name = fields[index][:2], fields[index][3:]
+        entries.append((code, name))
+        index += 2 if code[0] in "RC" else 1  # a rename/copy carries its source as the next field
+    return entries
+
+
+def untracked_junk(path: Path) -> list[str]:
+    """Untracked OS-junk files (relative paths); ``git worktree remove`` refuses a tree holding them."""
+    return [name for code, name in _status(path, "--untracked-files=all") or [] if code == "??" and _is_junk(name)]
+
+
 def is_dirty(path: Path) -> bool:
-    status = _git(path, "status", "--porcelain", "--untracked-files=all")
-    return status.returncode != 0 or bool(status.stdout.strip())
+    entries = _status(path, "--untracked-files=all")
+    return entries is None or any(not (code == "??" and _is_junk(name)) for code, name in entries)
 
 
 def foreign_ignored(path: Path, rebuildable: tuple[str, ...] = REBUILDABLE) -> list[str]:
-    """Ignored-but-present entries that are not plain rebuildable output.
+    """Ignored-but-present entries that are not plain rebuildable output (or OS junk).
 
     ``--ignored=matching`` lists each file by the pattern that ignored it and collapses a
     directory to one ``dir/`` entry only when the directory itself is ignored. A directory
-    entry's name is matched against the (glob) rebuildable list (and ``git check-ignore``
-    confirms the directory is itself ignored); a file entry's name must match on its own, so
-    ``dist/prod.env`` is never "rebuildable" because of ``dist``. A matching directory is still
-    looked inside: a nested repository (an editable checkout in ``.venv``, a vendored clone in
-    ``build``) or an unverifiable tree makes it foreign."""
+    entry's name is matched against the (glob) rebuildable list; a file entry's name must match on
+    its own, so ``dist/prod.env`` is never "rebuildable" because of ``dist``. A matching directory
+    is still looked inside: a nested repository (an editable checkout in ``.venv``, a vendored
+    clone in ``build``) or an unverifiable tree makes it foreign."""
     from fnmatch import fnmatchcase
 
     from .scratch_safety import inspect_tree
-    status = _git(path, "status", "--porcelain", "--untracked-files=normal", "--ignored=matching")
-    if status.returncode != 0:
+    entries = _status(path, "--untracked-files=normal", "--ignored=matching")
+    if entries is None:
         return ["<unknown>"]
     found = []
-    for line in status.stdout.splitlines():
-        if not line.startswith("!! "):
+    for code, raw in entries:
+        if code != "!!":
             continue
-        entry = line[3:].rstrip("/")
+        entry = raw.rstrip("/")
+        if _is_junk(entry):
+            continue
         if not any(fnmatchcase(entry.rsplit("/", 1)[-1], pattern) for pattern in rebuildable):
             found.append(entry)
             continue
         full = path / entry
         if full.is_symlink() or not full.is_dir():
-            continue
-        if _git(path, "check-ignore", "--no-index", "-q", f"{entry}/").returncode != 0:
-            found.append(entry)  # collapsed, but not ignored as a directory: judge its files
             continue
         try:
             if inspect_tree(full, accounting_only=True).repositories:
@@ -417,34 +453,44 @@ def patch_merged(path: Path) -> bool:
     return False
 
 
-def worktree_quick_facts(path: Path) -> dict[str, Any]:
-    """Facts plus the cheapest refusal (dirty), before any network call."""
-    facts = worktree_facts(path)
-    if is_dirty(path):
-        raise Refusal("dirty", f"{path} has uncommitted or untracked changes")
-    return facts
-
-
-def settle_worktree(path: Path, facts: dict[str, Any], rebuildable: tuple[str, ...] | None = None) -> None:
-    """The refusals that must hold at the moment of removal: HEAD is still the inspected one,
-    clean, no hidden index state, no ignored file that is not rebuildable output. ``rebuildable``:
-    the user's extra patterns (None reads the config here)."""
-    from .scratch_safety import hidden_index_reason
-    if _git(path, "rev-parse", "HEAD").stdout.strip() != facts["head"]:
-        raise Refusal("changed", f"{path}: HEAD moved since it was inspected")
-    if is_dirty(path):
-        raise Refusal("dirty", f"{path} has uncommitted or untracked changes")
-    if reason := hidden_index_reason(path):
-        raise Refusal("hidden_index_state",
-                      f"{path} has skip-worktree/assume-unchanged entries whose edits git hides ({reason})")
+def _rebuildable_patterns(rebuildable: tuple[str, ...] | None) -> tuple[str, ...]:
+    """The built-in rebuildable names plus the user's extra patterns (None reads the config)."""
     if rebuildable is None:
         try:
             rebuildable = config_strings(user_disk_hygiene_config().get("rebuildable"), "rebuildable")
         except ValueError as exc:
             raise Refusal("config_unreadable", f"disk_hygiene.{exc}") from exc
-    if ignored := foreign_ignored(path, (*REBUILDABLE, *rebuildable)):
+    return (*REBUILDABLE, *rebuildable)
+
+
+def _refuse_unremovable_state(path: Path, rebuildable: tuple[str, ...] | None) -> None:
+    """Local-only refusals: dirty, hidden index state, ignored files that are not rebuildable."""
+    from .scratch_safety import hidden_index_reason
+    if is_dirty(path):
+        raise Refusal("dirty", f"{path} has uncommitted or untracked changes")
+    if reason := hidden_index_reason(path):
+        raise Refusal("hidden_index_state",
+                      f"{path} has skip-worktree/assume-unchanged entries whose edits git hides ({reason})")
+    if ignored := foreign_ignored(path, _rebuildable_patterns(rebuildable)):
         raise Refusal("ignored_files",
                       f"{path} has ignored files that are not plain rebuildable output: {', '.join(ignored[:5])}")
+
+
+def worktree_quick_facts(path: Path, rebuildable: tuple[str, ...] | None = None) -> dict[str, Any]:
+    """Facts plus every local refusal (dirty, hidden index, foreign ignored files), taken before
+    any network call so a worktree that cannot be removed never costs a PR lookup."""
+    facts = worktree_facts(path)
+    _refuse_unremovable_state(path, rebuildable)
+    return facts
+
+
+def settle_worktree(path: Path, facts: dict[str, Any], rebuildable: tuple[str, ...] | None = None) -> None:
+    """The refusals that must hold at the moment of removal, re-run after any network lookup: HEAD
+    is still the inspected one and the local state is still removable. ``rebuildable``: the user's
+    extra patterns (None reads the config here)."""
+    if _git(path, "rev-parse", "HEAD").stdout.strip() != facts["head"]:
+        raise Refusal("changed", f"{path}: HEAD moved since it was inspected")
+    _refuse_unremovable_state(path, rebuildable)
 
 
 def check_worktree_removable(path: Path, *, merged_ok: bool,
@@ -455,15 +501,17 @@ def check_worktree_removable(path: Path, *, merged_ok: bool,
     """``prechecked``: facts from ``worktree_quick_facts`` (taken before the caller's own PR
     lookup). ``pr_head``: the head SHA of a MERGED PR the caller already looked up (None looks it
     up here when ``merged_ok``); it excuses unpushed commits only while it equals the HEAD. The
-    full ``settle_worktree`` checks run once, AFTER any network lookup, and the in-use check runs
-    last, right before any removal."""
-    facts = dict(prechecked) if prechecked is not None else worktree_quick_facts(path)
+    local checks run before any lookup and once more after it (``settle_worktree``); the in-use
+    check runs last, right before any removal."""
+    if rebuildable is None:
+        rebuildable = _rebuildable_patterns(None)[len(REBUILDABLE):]  # read the config once
+    facts = dict(prechecked) if prechecked is not None else worktree_quick_facts(path, rebuildable)
     if unpushed(path):
         merged = False
         if merged_ok:
             if pr_head is None:
                 pr = gh_pr_state(path, facts["branch"], facts["head"], _origin_owner(path))
-                pr_head = pr["head"] if pr and pr["state"] == "MERGED" else ""
+                pr_head = facts["head"] if pr_excuses_unpushed(pr, facts["head"]) else ""
             merged = patch_merged(path) or pr_head == facts["head"]
         if not merged:
             raise Refusal("unpushed_commits",
@@ -481,6 +529,8 @@ def remove_worktree(path: Path, *, dry_run: bool, merged_ok: bool,
     facts = check_worktree_removable(path, merged_ok=merged_ok, snapshot=snapshot,
                                      rebuildable=rebuildable, pr_head=pr_head, prechecked=prechecked)
     if not dry_run:
+        for name in untracked_junk(path):  # `worktree remove` refuses untracked files; this is junk
+            (path / name).unlink(missing_ok=True)
         # Run from the common git dir: works for normal, bare and separate-git-dir repositories
         # alike, and `worktree remove` drops its own registration (no repo-wide `worktree prune`).
         done = _git(Path(facts["common"]), "worktree", "remove", str(path), timeout=600)
