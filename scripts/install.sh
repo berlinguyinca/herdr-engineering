@@ -357,6 +357,7 @@ else
 fi
 
 # --- 7c2. managed Claude Code subagent registry hooks (default on) ----------
+# Skips (writes nothing) when Claude Code is absent: `claude` not on PATH and no ~/.claude, the same gate as 7c.
 if [ "$WITH_SUBAGENT_HOOKS" = "1" ]; then
   step "7c2/8 Claude Code subagent registry hooks (managed; foreign hooks untouched)"
   "$PY" -m herdr_engineering.cli handoff auto install --subagents-only || warn "subagent hooks not installed (see above); settings.json was left untouched"

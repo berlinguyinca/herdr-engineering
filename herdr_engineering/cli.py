@@ -546,7 +546,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--dry-run", action="store_true", help="report what would change without writing")
     p2.add_argument("--subagents-only", action="store_true", help="install: only the SubagentStart/SubagentStop registry hooks")
     p2.add_argument("--json", action="store_true")
-    p2.set_defaults(func=_cmd_handoff_auto)
+    p2.set_defaults(func=_cmd_handoff_auto, auto_parser=p2)
 
     # summary --------------------------------------------------------------
     p = sub.add_parser("summary", help="/summary skill: install, verify, remove, read session history")
@@ -1556,6 +1556,8 @@ def _cmd_handoff_context(args) -> int:
 def _cmd_handoff_auto(args) -> int:
     from . import handoff_auto_setup as ha
     home = Path(args.home) if args.home else None
+    if args.subagents_only and args.auto_action != "install":
+        args.auto_parser.error("--subagents-only only applies to the install action")
     if args.auto_action == "check":
         items = ha.check(home)
     elif args.auto_action == "install" and args.subagents_only:
@@ -1604,7 +1606,7 @@ def _cmd_handoff_subagents(args) -> int:
         state = registry.status(pane, os.environ)
         idle = True
     else:
-        state = registry._wait_status(pane, os.environ, args.wait)
+        state = registry.wait_status(pane, os.environ, args.wait)
         idle = state.live == 0
     if args.json:
         _print_json({"known": state.known, "live": state.live})
