@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
-from herdr_engineering.handoff_controller.wip import WipResult, wip_commit
+from herdr_engineering.handoff_controller.wip import WipReason, WipResult, wip_commit
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -61,6 +62,7 @@ def test_push_not_allowed_records_unpushed_sha(tmp_path: Path) -> None:
     result = wip_commit(work, push_allowed=False)
     assert result.committed and not result.pushed
     assert result.unpushed == (result.sha,)
+    assert result.reason is WipReason.PUSH_NOT_ALLOWED
     assert "feat/x" not in remote_heads(tmp_path)
 
 
@@ -72,13 +74,15 @@ def test_never_commits_on_main(tmp_path: Path) -> None:
     assert not result.committed and not result.pushed and result.sha is None
     assert git(work, "rev-parse", "HEAD") == head
     assert git(work, "status", "--porcelain") == "M a.txt"
+    assert result.reason is WipReason.ON_MAIN
 
 
 def test_detached_head_is_treated_like_main(tmp_path: Path) -> None:
     work = make_repo(tmp_path)
     git(work, "checkout", "-q", "--detach")
     (work / "a.txt").write_text("two\n")
-    assert not wip_commit(work, push_allowed=True).committed
+    result = wip_commit(work, push_allowed=True)
+    assert not result.committed and result.reason is WipReason.DETACHED
 
 
 def test_untracked_files_not_committed(tmp_path: Path) -> None:
@@ -103,6 +107,7 @@ def test_failed_push_is_reported_not_raised(tmp_path: Path) -> None:
     (work / "a.txt").write_text("two\n")
     result = wip_commit(work, push_allowed=True)
     assert result.committed and not result.pushed and result.unpushed == (result.sha,)
+    assert result.reason is WipReason.PUSH_FAILED and result.error
 
 
 def test_pushes_to_differently_named_upstream(tmp_path: Path) -> None:
@@ -124,3 +129,89 @@ def test_rejecting_hook_reports_not_committed(tmp_path: Path) -> None:
     (work / "a.txt").write_text("two\n")
     result = wip_commit(work, push_allowed=True)
     assert not result.committed and not result.pushed
+    assert result.reason is WipReason.COMMIT_REJECTED and result.error
+
+
+def test_clean_and_pushed_have_no_reason(tmp_path: Path) -> None:
+    work = make_repo(tmp_path)
+    assert wip_commit(work, push_allowed=True).reason is None
+    (work / "a.txt").write_text("two\n")
+    assert wip_commit(work, push_allowed=True).reason is None
+
+
+def test_slow_hook_times_out_without_raising(tmp_path: Path) -> None:
+    work = make_repo(tmp_path)
+    hook = work / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(exist_ok=True)
+    hook.write_text("#!/bin/sh\nsleep 5\n")
+    hook.chmod(0o755)
+    (work / "a.txt").write_text("two\n")
+    result = wip_commit(work, push_allowed=True, timeout_s=0.5)
+    assert not result.committed and result.error and result.reason is WipReason.COMMIT_REJECTED
+
+
+CALL = "import sys; from pathlib import Path; from herdr_engineering.handoff_controller.wip import wip_commit; print(wip_commit(Path(sys.argv[1]), push_allowed=True))"
+
+
+def run_wip(work: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, "-c", CALL, str(work)], cwd=Path(__file__).resolve().parents[1],
+                          env={"PYTHONPATH": str(Path(__file__).resolve().parents[1]), **env}, capture_output=True,
+                          text=True, timeout=60)
+
+
+def test_missing_git_does_not_raise(tmp_path: Path) -> None:
+    work = make_repo(tmp_path)
+    done = run_wip(work, {"PATH": str(tmp_path / "empty")})
+    assert done.returncode == 0, done.stderr
+    assert "GIT_ERROR" in done.stdout or "git_error" in done.stdout
+
+
+def test_git_failure_is_an_error_not_a_clean_tree(tmp_path: Path) -> None:
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    result = wip_commit(not_a_repo, push_allowed=True)
+    assert result.reason is WipReason.GIT_ERROR and result.error and not result.committed and not result.pushed
+
+
+def test_ambient_git_dir_is_ignored(tmp_path: Path) -> None:
+    work = make_repo(tmp_path)
+    (work / "a.txt").write_text("two\n")
+    done = run_wip(work, {"PATH": os.environ["PATH"], "GIT_DIR": str(tmp_path / "bogus"), "GIT_WORK_TREE": str(tmp_path / "bogus")})
+    assert done.returncode == 0 and "committed=True" in done.stdout, done.stdout + done.stderr
+
+
+def test_non_ascii_untracked_name_is_not_quoted(tmp_path: Path) -> None:
+    work = make_repo(tmp_path)
+    (work / "h\u00e9llo \u4e16.txt").write_text("n\n")
+    assert wip_commit(work, push_allowed=True).untracked == ("h\u00e9llo \u4e16.txt",)
+
+
+def test_upstream_main_is_never_pushed(tmp_path: Path) -> None:
+    work = make_repo(tmp_path)
+    git(work, "branch", "--set-upstream-to=origin/main")
+    (work / "a.txt").write_text("two\n")
+    before = git(tmp_path / "remote.git", "rev-parse", "main")
+    result = wip_commit(work, push_allowed=True)
+    assert result.committed and not result.pushed
+    assert git(tmp_path / "remote.git", "rev-parse", "main") == before
+
+
+def test_rejected_non_fast_forward_push_is_never_forced(tmp_path: Path) -> None:
+    work = make_repo(tmp_path)
+    git(work, "push", "-q", "origin", "feat/x")
+    git(work, "branch", "--set-upstream-to=origin/feat/x")
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", "-b", "feat/x", str(tmp_path / "remote.git"), str(other)], check=True)
+    git(other, "config", "user.name", "T")
+    git(other, "config", "user.email", "t@example.com")
+    (other / "b.txt").write_text("b\n")
+    git(other, "add", "b.txt")
+    git(other, "commit", "-q", "-m", "remote-only")
+    git(other, "push", "-q", "origin", "feat/x")
+    remote_tip = git(tmp_path / "remote.git", "rev-parse", "feat/x")
+    git(work, "reset", "-q", "--soft", "HEAD")  # local branch is behind: a different commit on top of the old tip
+    (work / "a.txt").write_text("two\n")
+    result = wip_commit(work, push_allowed=True)
+    assert result.committed and not result.pushed and result.reason is WipReason.PUSH_FAILED
+    assert git(tmp_path / "remote.git", "rev-parse", "feat/x") == remote_tip
+    assert result.unpushed == (result.sha,)

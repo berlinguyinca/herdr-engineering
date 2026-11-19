@@ -1628,12 +1628,12 @@ def _cmd_handoff_context(args) -> int:
 
 
 def _cmd_handoff_auto(args) -> int:
+    if args.subagents_only and args.auto_action != "install":
+        args.auto_parser.error("--subagents-only only applies to the install action")
     if args.auto_action in ("off", "on"):
         return _cmd_handoff_auto_switch(args)
     from . import handoff_auto_setup as ha
     home = Path(args.home) if args.home else None
-    if args.subagents_only and args.auto_action != "install":
-        args.auto_parser.error("--subagents-only only applies to the install action")
     if args.auto_action == "check":
         items = ha.check(home)
     elif args.auto_action == "install" and args.subagents_only:
@@ -1655,8 +1655,6 @@ def _cmd_handoff_auto_switch(args) -> int:
     pane = args.pane or os.environ.get("HERDR_PANE_ID")
     if not pane:
         args.auto_parser.error("--pane is required when $HERDR_PANE_ID is not set")
-    if args.subagents_only:
-        args.auto_parser.error("--subagents-only only applies to the install action")
     set_enabled(pane, args.auto_action == "on", _state_dir(os.environ).parent)
     print(f"auto-handoff {args.auto_action} for pane {pane}")
     return 0
