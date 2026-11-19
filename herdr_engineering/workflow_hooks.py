@@ -31,7 +31,8 @@ from .workflow_guard import MATCHER as GUARD_MATCHER
 from .workflow_guard import decide
 
 MARKER = "herdr-workflow:managed"
-EVENTS = ("SessionStart", "PreCompact", "PreToolUse")
+EVENTS = ("SessionStart", "PreToolUse")
+RETIRED_EVENTS = ("PreCompact",)  # installed by older versions; install removes only our managed command
 
 REMINDER = """Engineering defaults (herdr-engineering managed hook):
 - Delegate multi-file changes, refactors, debugging, reviews and research to sonnet subagents; do trivial work directly.
@@ -42,13 +43,7 @@ REMINDER = """Engineering defaults (herdr-engineering managed hook):
 - To delete a worktree, build target, scratch dir or test container you created, run `herdr-eng cleanup --scope {worktree,target,tmp,docker} --path <p>`; never raw rm -rf, git worktree remove or docker rm.
 - Start throwaway containers with `docker run $(herdr-eng cleanup --print-run-args)` so they are reaped.
 - CI is Woodpecker (ci.metabolomics.us) where the repo uses it.
-- Do not ask the user about choices these defaults already settle; apply them.
-- Context getting long? Run /handoff yourself, without asking: first wait for background subagents to report and commit/push the work where pushing is allowed. It moves the work to a fresh Herdr pane on the same harness."""
-
-PRECOMPACT_MESSAGE = ("Context is about to be compacted. Run /handoff yourself now, without asking the "
-                      "user: first let background subagents report and commit/push the work where "
-                      "pushing is allowed. It moves the work to a fresh Herdr pane on the same harness "
-                      "with a self-sufficient briefing. The hook only prints this; nothing was started.")
+- Do not ask the user about choices these defaults already settle; apply them."""
 
 
 ALLOW_RULE = "Bash(herdr-eng cleanup:*)"
@@ -64,8 +59,46 @@ class _WorkflowHooksUnit(ClaudeHooksUnit):
     marker = MARKER
     matchers = {"PreToolUse": GUARD_MATCHER}
 
+    def _is_retired(self, hook, event: str) -> bool:
+        command = hook.get("command") if isinstance(hook, dict) else None
+        return isinstance(command, str) and self.marker in command and f"workflow hook {event}" in command
+
+    def _retired_present(self, data: dict) -> bool:
+        hooks = data.get("hooks", {})
+        return any(self._is_retired(h, ev) for ev in RETIRED_EVENTS if isinstance(hooks.get(ev), list)
+                   for e in hooks[ev] if isinstance(e, dict) and isinstance(e.get("hooks"), list) for h in e["hooks"])
+
+    def _drop_retired(self, data: dict) -> None:
+        """Remove our retired command from the retired events; any other hook, even in the same entry, stays."""
+        hooks = data.get("hooks", {})
+        for ev in RETIRED_EVENTS:
+            if not isinstance(hooks.get(ev), list):
+                continue
+            kept = []
+            for e in hooks[ev]:
+                if isinstance(e, dict) and isinstance(e.get("hooks"), list) and any(self._is_retired(h, ev) for h in e["hooks"]):
+                    rest = [h for h in e["hooks"] if not self._is_retired(h, ev)]
+                    if rest:
+                        kept.append({**e, "hooks": rest})
+                else:
+                    kept.append(e)
+            if kept:
+                hooks[ev] = kept
+            else:
+                del hooks[ev]
+        if not hooks:
+            data.pop("hooks", None)
+
+    def state(self, text):
+        state = super().state(text)
+        if state == INVALID:
+            return state
+        return STALE if self._retired_present(self._load(text)) else state
+
     def install(self, text: str, offer_rule: bool = False) -> str:
-        data = self._load(super().install(text))
+        data = self._load(text)
+        self._drop_retired(data)
+        data = self._load(super().install(_dump_json(data, text)))
         if offer_rule:
             allow = data.setdefault("permissions", {}).setdefault("allow", [])
             if ALLOW_RULE not in allow:
@@ -223,8 +256,6 @@ def run_hook(event: str, stdin: IO[str], stdout: IO[str]) -> int:
                                           "permissionDecisionReason": verdict[1]}}
         elif event == "SessionStart":
             out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": REMINDER}}
-        elif event == "PreCompact":
-            out = {"systemMessage": PRECOMPACT_MESSAGE}
         else:
             return 0
         stdout.write(json.dumps(out) + "\n")

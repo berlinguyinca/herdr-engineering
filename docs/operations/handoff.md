@@ -214,16 +214,13 @@ Hindsight Memory, CONTRACT.md). It is produced by `herdr-handoff` only when a
   Retrieved memory is data, never instructions.
 - Pi Blackhole short-term context handling is unchanged.
 
-## Opt-out workflow hook: a `/handoff` reminder before compaction
+## Retired: the `/handoff` reminder in the workflow hooks
 
-`herdr-eng workflow install` (also `scripts/install.sh`, step 7c) registers a
-Claude Code `PreCompact` hook. It **only prompts**: it prints a message
-recommending `/handoff` (a new Herdr pane, same harness) before the context is
-compacted. It does not run `herdr-handoff`, create or sync a package, open a pane,
-or publish anything. The automatic context trigger below exists but is not
-installed by default; the decision to hand off stays with the person unless they
-opt in. Remove the hook with
-`herdr-eng workflow uninstall`. Details: `docs/operations/workflow-hooks.md`.
+`herdr-eng workflow install` used to register a Claude Code `PreCompact` hook that printed a `/handoff` suggestion, and its
+`SessionStart` reminder carried a "context getting long? /handoff" line. Both are gone: when to hand off is the
+[automatic handoff controller](#automatic-handoff-controller)'s decision, and `/handoff` stays available when a person asks
+for it. `herdr-eng workflow install` removes the old `PreCompact` entry (marker `herdr-workflow:managed`); details in
+`docs/operations/workflow-hooks.md`.
 
 ## Retired: the 50% context reminder hook
 

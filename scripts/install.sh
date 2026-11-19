@@ -34,7 +34,7 @@
 #      opencode) via `herdr-eng memory install`; harnesses that are not
 #      installed are skipped and foreign config is reported, never overwritten.
 #   (default on) step 7c registers the managed Claude Code workflow hooks
-#      (SessionStart reminder, PreCompact /handoff prompt) via
+#      (SessionStart reminder, PreToolUse guard) via
 #      `herdr-eng workflow install`; opt out with --no-workflow-hooks or
 #      HERDR_INSTALL_WORKFLOW_HOOKS=0. Skipped when Claude Code is absent.
 #   (default on) step 7c2 registers the managed SubagentStart/SubagentStop hooks
