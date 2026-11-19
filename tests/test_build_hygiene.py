@@ -1,4 +1,4 @@
-"""Disk hygiene defaults: pressure cleanup, shared target pool, build guard, install and doctor.
+"""Disk hygiene defaults: pressure cleanup, one managed target per worktree, build guard, install and doctor.
 
 Real filesystems, real git repositories, real processes and a real Cargo; no mocks. Pressure is
 produced by thresholds against the real measured usage (0% is always exceeded, 100% never is).
@@ -21,7 +21,6 @@ import yaml
 from herdr_engineering import build_cleanup as cleanup
 from herdr_engineering import build_hygiene, disk_guard
 from herdr_engineering.build_cache_config import validate
-from herdr_engineering.cargo_target_storage import acquire_shared_target, repo_identity, slot_name
 from herdr_engineering.config import load_config
 from herdr_engineering.doctor import DoctorReport, _add_build_hygiene
 
@@ -86,7 +85,7 @@ def test_build_cleanup_and_cargo_host_are_on_by_default():
     assert cleanup_cfg["pressure_percent"] == 90 and cleanup_cfg["pressure_min_age_hours"] == 2
     cache = validate(config["fabric_build_cache"])
     assert cache.enabled and cache.local.manage_targets
-    assert cache.local.target_mode == "shared" and cache.local.target_pool_size == 2
+    assert cache.local.manage_targets
 
 
 def test_explicit_opt_out_is_honoured(tmp_path):
@@ -165,47 +164,12 @@ def test_cache_only_directory_without_cachedir_tag_is_not_recognised(root):
     assert cache.exists()
 
 
-# --- C. shared target pool -----------------------------------------------------------------
+# --- C. helpers -----------------------------------------------------------------------------
 
 def git(*args, cwd):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
                    env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
-
-
-def test_worktrees_of_one_repo_share_an_identity_and_other_repos_do_not(tmp_path):
-    repo, other = tmp_path / "repo", tmp_path / "other"
-    for path in (repo, other):
-        path.mkdir()
-        git("init", "-q", cwd=path)
-        git("commit", "-q", "--allow-empty", "-m", "init", cwd=path)
-    git("worktree", "add", "-q", str(tmp_path / "wt"), "-b", "feature", cwd=repo)
-    assert repo_identity(repo) == repo_identity(tmp_path / "wt")
-    assert repo_identity(repo) != repo_identity(other)
-
-
-def test_pool_reuses_slot_zero_then_spills_when_it_is_busy(tmp_path):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    first, fd0 = acquire_shared_target(tmp_path / "pool", "repo", "tc", 2, workspace)
-    second, fd1 = acquire_shared_target(tmp_path / "pool", "repo", "tc", 2, workspace)
-    assert first.parent.name.endswith("-0") and second.parent.name.endswith("-1")
-    os.close(fd0)
-    os.close(fd1)
-    again, fd2 = acquire_shared_target(tmp_path / "pool", "repo", "tc", 2, workspace)
-    os.close(fd2)
-    assert again == first
-
-
-def test_pool_falls_back_to_a_stable_slot_when_all_are_busy(tmp_path):
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    held = [acquire_shared_target(tmp_path / "pool", "repo", "tc", 2, workspace) for _ in range(2)]
-    third, fd = acquire_shared_target(tmp_path / "pool", "repo", "tc", 2, workspace)
-    assert third in {path for path, _ in held}
-    for _, handle in held:
-        os.close(handle)
-    os.close(fd)
 
 
 # --- D. disk-budget guard ------------------------------------------------------------------
@@ -293,43 +257,39 @@ def build(cwd: Path, home: Path, env: dict):
                           capture_output=True, text=True, timeout=180)
 
 
+def managed_targets(tmp_path: Path) -> list[Path]:
+    return sorted(p for p in (tmp_path / "state/build-gates/targets").glob("*-*") if p.is_dir())
+
+
 @pytest.mark.integration
-def test_default_install_gives_each_worktree_an_incremental_free_pool_target(tmp_path):
+def test_default_install_gives_each_worktree_its_own_incremental_free_target(tmp_path):
     home, env = cargo_env(tmp_path)
     repo, worktree = crate_with_worktree(tmp_path)
     for cwd in (repo, worktree):
         result = build(cwd, home, env)
         assert result.returncode == 0, result.stderr
-    pool = tmp_path / "state/build-gates/shared-targets"
-    slots = [p for p in pool.glob("*/*") if p.is_dir()]
-    assert len(slots) == 2 and all(slot.name.endswith("-0") for slot in slots)
-    for slot in slots:
-        debug = slot / "target/debug"
+    targets = managed_targets(tmp_path)
+    assert len(targets) == 2
+    for target in targets:
+        debug = target / "debug"
         assert (debug / "shared-demo").is_file()
         # CARGO_INCREMENTAL=0 applied by the wrapper: no incremental artifacts (cargo may keep an empty dir)
         assert not any((debug / "incremental").rglob("*"))
-    # ./target stays usable: a managed alias to the slot the last build there used
-    for checkout in (repo, worktree):
+    assert not (tmp_path / "state/build-gates/shared-targets").exists()  # no slot pool any more
+    for checkout in (repo, worktree):  # ./target stays usable: a managed alias to the worktree's own target
         assert (checkout / "target").is_symlink()
         assert (checkout / "target/debug/shared-demo").is_file()
-        assert (checkout / "target").resolve() in {(slot / "target").resolve() for slot in slots}
+        assert (checkout / "target").resolve() in {target.resolve() for target in targets}
+    assert (repo / "target").resolve() != (worktree / "target").resolve()
 
 
 @pytest.mark.integration
-def test_concurrent_build_spills_to_the_second_pool_slot(tmp_path):
+def test_concurrent_builds_of_one_worktree_share_its_single_target(tmp_path):
     home, env = cargo_env(tmp_path)
     repo, _ = crate_with_worktree(tmp_path)
-    pool = tmp_path / "state/build-gates/shared-targets"
-    from herdr_engineering.cargo_target_storage import toolchain_identity
-    toolchain = subprocess.run([shutil.which("cargo"), "-vV"], cwd=repo, env=env, capture_output=True,
-                               text=True, check=True).stdout
-    _, held = acquire_shared_target(pool, repo_identity(repo), toolchain_identity(toolchain), 2, repo)
-    try:
-        result = build(repo, home, env)
-    finally:
-        os.close(held)
-    assert result.returncode == 0, result.stderr
-    assert (pool / repo_identity(repo) / slot_name(toolchain_identity(toolchain), repo, 1) / "target/debug/shared-demo").is_file()
+    for _ in range(2):
+        assert build(repo, home, env).returncode == 0
+    assert len(managed_targets(tmp_path)) == 1
 
 
 @pytest.mark.integration
@@ -339,7 +299,7 @@ def test_explicit_cargo_target_dir_is_respected(tmp_path):
     repo, _ = crate_with_worktree(tmp_path)
     assert build(repo, home, env).returncode == 0
     assert (explicit / "debug/shared-demo").is_file()
-    assert not (tmp_path / "state/build-gates/shared-targets").exists()
+    assert not managed_targets(tmp_path)
 
 
 @pytest.mark.integration
@@ -402,24 +362,6 @@ def test_install_by_default_installs_job_and_cargo_launcher_and_doctor_sees_them
 
 
 @pytest.mark.integration
-def test_shared_alias_follows_the_slot_of_the_last_build(tmp_path):
-    home, env = cargo_env(tmp_path)
-    repo, _ = crate_with_worktree(tmp_path)
-    assert build(repo, home, env).returncode == 0
-    pool = tmp_path / "state/build-gates/shared-targets"
-    from herdr_engineering.cargo_target_storage import toolchain_identity
-    toolchain = subprocess.run([shutil.which("cargo"), "-vV"], cwd=repo, env=env, capture_output=True,
-                               text=True, check=True).stdout
-    _, held = acquire_shared_target(pool, repo_identity(repo), toolchain_identity(toolchain), 2, repo)
-    try:
-        assert build(repo, home, env).returncode == 0
-    finally:
-        os.close(held)
-    slot_one = pool / repo_identity(repo) / slot_name(toolchain_identity(toolchain), repo, 1) / "target"
-    assert (repo / "target").resolve() == slot_one.resolve()
-
-
-@pytest.mark.integration
 def test_unmanaged_target_directory_is_left_alone(tmp_path):
     home, env = cargo_env(tmp_path)
     repo, _ = crate_with_worktree(tmp_path)
@@ -429,44 +371,20 @@ def test_unmanaged_target_directory_is_left_alone(tmp_path):
     assert result.returncode == 0, result.stderr
     assert (repo / "target/keep.txt").read_text() == "mine" and not (repo / "target").is_symlink()
     assert (repo / "target/debug/shared-demo").is_file()
-    assert not (tmp_path / "state/build-gates/shared-targets").exists()
+    assert not managed_targets(tmp_path)
 
 
 @pytest.mark.integration
-def test_cargo_clean_cleans_the_shared_slot_and_creates_no_per_workspace_target(tmp_path):
+def test_cargo_clean_cleans_only_its_own_worktree_target(tmp_path):
     home, env = cargo_env(tmp_path)
     repo, worktree = crate_with_worktree(tmp_path)
-    assert build(repo, home, env).returncode == 0
-    slot = next(p for p in (tmp_path / "state/build-gates/shared-targets").glob("*/*") if p.is_dir())
-    assert (slot / "target/debug/shared-demo").is_file()
-    other = subprocess.run([str(home / ".local/bin/cargo"), "clean"], cwd=worktree, env=env,
-                           capture_output=True, text=True, timeout=120)
-    assert other.returncode == 0, other.stderr
-    assert (slot / "target/debug/shared-demo").is_file()  # another worktree's clean never touches it
+    for cwd in (repo, worktree):
+        assert build(cwd, home, env).returncode == 0
+    mine, theirs = ((cwd / "target").resolve() for cwd in (repo, worktree))
     cleaned = subprocess.run([str(home / ".local/bin/cargo"), "clean"], cwd=repo, env=env,
                              capture_output=True, text=True, timeout=120)
     assert cleaned.returncode == 0, cleaned.stderr
-    assert not (slot / "target/debug").exists()
-    assert not (tmp_path / "state/build-gates/targets").exists()  # no per-workspace managed target
-    assert not (worktree / "target").exists()  # clean created no alias for a worktree that never built
-
-
-@pytest.mark.integration
-def test_cargo_clean_skips_a_slot_a_build_holds(tmp_path):
-    home, env = cargo_env(tmp_path)
-    repo, _ = crate_with_worktree(tmp_path)
-    assert build(repo, home, env).returncode == 0
-    pool = tmp_path / "state/build-gates/shared-targets"
-    slot = next(p for p in pool.glob("*/*") if p.is_dir())
-    fd = os.open(slot / ".herdr-slot.lock", os.O_RDWR)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    try:
-        cleaned = subprocess.run([str(home / ".local/bin/cargo"), "clean"], cwd=repo, env=env,
-                                 capture_output=True, text=True, timeout=120)
-    finally:
-        os.close(fd)
-    assert cleaned.returncode != 0 and "busy" in cleaned.stderr
-    assert (slot / "target/debug/shared-demo").is_file()
+    assert not (mine / "debug").exists() and (theirs / "debug/shared-demo").is_file()
 
 
 # --- review round 1 fixes -------------------------------------------------------------------
@@ -529,8 +447,15 @@ def test_install_writes_a_runnable_job_command_and_keeps_a_working_job(tmp_path)
     build_hygiene.install_cleanup_job(working, Path(sys.executable), platform="darwin", activate=False)
     job = working / "Library/LaunchAgents" / f"{build_hygiene.LAUNCHD_LABEL}.plist"
     before = job.read_bytes()
-    again = build_hygiene.install(working, fallback, platform="darwin", activate=False, config=config)
-    assert "kept" in again["build_cleanup"] and job.read_bytes() == before
+    build_hygiene.install(working, fallback, platform="darwin", activate=False, config=config)
+    assert plistlib.loads(job.read_bytes())["ProgramArguments"][:1] == [sys.executable]
+    assert job.read_bytes() == before  # same command and interval: byte-identical rewrite
+    # A changed interval is applied even though the working command is kept.
+    faster = {**config, "build_cleanup": {"enabled": True, "interval_seconds": 120}}
+    build_hygiene.install(working, fallback, platform="darwin", activate=False, config=faster)
+    refreshed = plistlib.loads(job.read_bytes())
+    assert refreshed["StartInterval"] == 120 and refreshed["ProgramArguments"][:1] == [sys.executable]
+    assert "-m" not in refreshed["ProgramArguments"]
 
 
 def test_systemd_unit_quotes_every_argument_of_the_command(tmp_path):
@@ -583,8 +508,8 @@ def test_build_cleanup_run_exits_early_when_disabled(tmp_path, root):
 def test_guard_busy_sweep_does_not_use_up_the_cooldown(root, state_env):
     cache = make_target(root, age_hours=5)
     state_env.mkdir(parents=True)
-    fd = os.open(state_env / "build-maintenance.lock", os.O_RDWR | os.O_CREAT, 0o600)
-    fcntl.flock(fd, fcntl.LOCK_SH)  # another gated build is running
+    fd = os.open(state_env / "build-cleanup.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)  # another sweep is running
     try:
         busy = disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={})
     finally:
@@ -649,21 +574,6 @@ def test_real_cargo_respects_a_valid_recorded_install(tmp_path):
 
 
 # --- review round 2 fixes -------------------------------------------------------------------
-
-def test_each_worktree_owns_its_pool_slots_and_never_shares_artifacts(tmp_path):
-    first_ws, second_ws = tmp_path / "a", tmp_path / "b"
-    first_ws.mkdir()
-    second_ws.mkdir()
-    pool = tmp_path / "pool"
-    first, fd = acquire_shared_target(pool, "repo", "tc", 2, first_ws)
-    os.close(fd)
-    second, fd = acquire_shared_target(pool, "repo", "tc", 2, second_ws)
-    os.close(fd)
-    again, fd = acquire_shared_target(pool, "repo", "tc", 2, first_ws)
-    os.close(fd)
-    assert first.parent != second.parent  # idle slot of another worktree is never reused
-    assert again == first  # a worktree gets its own last slot back
-
 
 @pytest.mark.integration
 def test_two_worktrees_build_into_separate_targets_and_keep_their_own_binaries(tmp_path):
@@ -769,43 +679,78 @@ def test_dry_run_scans_processes_once_not_per_candidate(root):
     assert len(result["would_remove"]) == 3 and result["process_scans"] == 1
 
 
-def test_explicit_roots_are_not_resolved_so_the_canonical_root_guard_applies(tmp_path, root):
+def test_explicit_roots_are_not_resolved_and_a_non_canonical_one_is_skipped_with_a_reason(tmp_path, root):
     from herdr_engineering.build_maintenance import effective_roots
     link = tmp_path / "link"
     link.symlink_to(root)
     assert effective_roots({}, [str(link)]) == [link]
-    result = cleanup.run_once([link], tmp_path / "state", high_water=1, low_water=0)
-    assert result["status"] == "error" and "canonical" in result["errors"][0]
+    cache = make_target(root, "victim")
+    result = cleanup.run_once([link, root], tmp_path / "state", high_water=1, low_water=0, min_age_hours=24)
+    assert result["status"] == "warning" and not result["errors"]
+    assert any(f"skipped root {link}" in warning and "canonical" in warning for warning in result["warnings"])
+    assert str(cache) in result["removed"] and not cache.exists()  # the good root is still swept
 
 
-def test_toolchain_identity_is_cached_between_builds(tmp_path, monkeypatch):
-    from herdr_engineering.cargo_target_storage import cached_toolchain_identity
-    cargo = REAL_HOME / ".cargo/bin/cargo"
-    if not cargo.is_file():
-        pytest.skip("rustup's cargo is required")
-    monkeypatch.setenv("RUSTUP_HOME", os.environ.get("RUSTUP_HOME", str(REAL_HOME / ".rustup")))
-    monkeypatch.setenv("CARGO_HOME", str(REAL_HOME / ".cargo"))
+def test_a_missing_default_root_does_not_abort_the_sweep(tmp_path, root):
+    cache = make_target(root, "victim")
+    missing = tmp_path / "gone" / "targets"
+    result = cleanup.run_once([missing, root], tmp_path / "state", high_water=1, low_water=0, min_age_hours=24)
+    assert not result["errors"] and any(f"skipped root {missing}" in w for w in result["warnings"])
+    assert not cache.exists()
+
+
+def lock_state(tmp_path: Path, name: str, mode: int) -> int:
     state = tmp_path / "state"
-    state.mkdir()
-    first = cached_toolchain_identity(Path(cargo), [], tmp_path, state)
-    entries = list(state.glob("toolchain-*.json"))
-    assert len(entries) == 1
-    entries[0].write_text(json.dumps({"identity": "cached-marker"}))
-    assert cached_toolchain_identity(Path(cargo), [], tmp_path, state) == "cached-marker"
-    entries[0].unlink()
-    assert cached_toolchain_identity(Path(cargo), [], tmp_path, state) == first
+    state.mkdir(exist_ok=True)
+    fd = os.open(state / name, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, mode)
+    return fd
 
 
-def test_target_mode_is_an_enum_and_rejects_unknown_values():
-    from herdr_engineering.build_cache_config import TargetMode
-    from herdr_engineering.errors import InvalidError
-    section = load_config([])["fabric_build_cache"]
-    assert validate(section).local.target_mode is TargetMode.SHARED
-    section["local"]["target_mode"] = "per_workspace"
-    assert validate(section).local.target_mode is TargetMode.PER_WORKSPACE
-    section["local"]["target_mode"] = "bogus"
-    with pytest.raises(InvalidError):
-        validate(section)
+def test_a_sweep_runs_while_a_build_holds_the_maintenance_lock_shared(tmp_path, root):
+    """The guard runs inside builds (build-coordinate holds LOCK_SH for the whole build)."""
+    cache = make_target(root, "victim")
+    fd = lock_state(tmp_path, "build-maintenance.lock", fcntl.LOCK_SH)
+    try:
+        result = cleanup.run_once([root], tmp_path / "state", high_water=1, low_water=0, min_age_hours=24)
+    finally:
+        os.close(fd)
+    assert result["status"] != "busy" and not cache.exists()
+
+
+def test_a_sweep_yields_to_exclusive_maintenance_and_to_another_sweep(tmp_path, root):
+    cache = make_target(root, "victim")
+    for name in ("build-maintenance.lock", "build-cleanup.lock"):
+        fd = lock_state(tmp_path, name, fcntl.LOCK_EX)
+        try:
+            result = cleanup.run_once([root], tmp_path / "state", high_water=1, low_water=0, min_age_hours=24)
+        finally:
+            os.close(fd)
+        assert result["status"] == "busy" and cache.exists(), name
+
+
+def test_a_volume_tier_is_resolved_through_its_mount_never_against_the_cwd(tmp_path, monkeypatch):
+    from herdr_engineering.build_maintenance import effective_roots
+    decoy = tmp_path / "cwd"
+    (decoy / "herdr-build/targets").mkdir(parents=True)
+    monkeypatch.chdir(decoy)
+    config = tmp_path / "tiers.yaml"
+    config.write_text(yaml.safe_dump({"fabric_build_cache": {"local": {"storage_tiers": [
+        {"name": "ext", "directory": "herdr-build/compiler-cache",
+         "volume_uuid": "11111111-2222-3333-4444-555555555555"}]}}}))
+    monkeypatch.setenv("HERDR_ENGINEERING_CONFIG", str(config))
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "estate"))
+    assert os.path.realpath(decoy / "herdr-build/targets") not in {str(p) for p in effective_roots({"roots": []})}
+
+
+def test_a_legacy_shared_pool_is_still_swept_when_idle_and_migration_ignores_it(tmp_path):
+    from herdr_engineering.build_cleanup import _discover
+    pool = tmp_path / "state/build-gates/shared-targets"
+    cache = make_pool_target(pool / "repo-1" / "tc-0")
+    root = Path(os.path.realpath(pool))
+    assert cache in _discover(root) and _discover(root, managed=False) == []
+    assert cleanup.run_once([root], tmp_path / "s2", high_water=1, low_water=0,
+                            min_age_hours=24, pressure_water=0)["removed_count"] == 1
 
 
 def test_build_hygiene_install_exits_nonzero_when_a_step_fails(tmp_path):

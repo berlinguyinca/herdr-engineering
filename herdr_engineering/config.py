@@ -60,8 +60,6 @@ DEFAULTS: dict[str, Any] = {
             "incremental_disabled_for_cacheable_builds": True,
             "storage_tiers": [],
             "manage_targets": True,
-            "target_mode": "shared",
-            "target_pool_size": 2,
             "target_retention_enabled": False,
             "target_internal_gib": 32,
             "target_external_gib": 256,

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import re
@@ -11,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 
 from .errors import InvalidError
@@ -289,31 +289,28 @@ def enable_retention(config_path: Path, *, schedule: bool = True) -> dict[str, o
             "min_idle_hours": config.local.target_min_idle_hours}
 
 
-def _build_output_probe(config, argv: list[str]) -> Path:
-    """A path on the filesystem the build is going to write to (nearest existing ancestor is measured)."""
-    from .build_coord import _default_state_dir
-    from .cargo_target_storage import target_override
+def _explicit_target_dir(argv: list[str], env: Mapping[str, str]) -> Path | None:
+    """The target directory the caller chose (``--target-dir`` or the environment), if any."""
+    arguments = argv[:argv.index("--")] if "--" in argv else argv
+    for index, arg in enumerate(arguments):
+        if arg == "--target-dir" and index + 1 < len(arguments):
+            return Path(arguments[index + 1])
+        if arg.startswith("--target-dir="):
+            return Path(arg.split("=", 1)[1])
     for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
-        if os.environ.get(key):
-            return Path(os.environ[key])
-    if config.local.manage_targets and not target_override(argv, os.environ, Path.cwd()):
-        try:
-            from .build_cache_location import select_storage
-            selected = select_storage(config.local.storage_tiers, _default_state_dir() / "sccache",
-                                      config.local.min_free_disk_percent)
-        except Exception:  # noqa: BLE001 - measuring is best effort
-            return _default_state_dir()
-        return selected.directory or _default_state_dir()
-    return Path.cwd()
+        if env.get(key):
+            return Path(env[key])
+    return None
 
 
-def _disk_guard_refusal(probe: Path) -> int | None:
+def _disk_guard_refusal(probe: Path, policy: Mapping | None = None) -> int | None:
     """Exit code when the disk-budget guard refuses a new build, else None. Never blocks on faults."""
     from .build_coord import _default_state_dir
-    from .config import load_config
     from .disk_guard import EXIT_REFUSED, check_build_allowed
     try:
-        policy = load_config().get("build_cleanup", {})
+        if policy is None:
+            from .config import load_config
+            policy = load_config().get("build_cleanup", {})
         decision = check_build_allowed(probe, policy, _default_state_dir())
     except Exception as error:  # noqa: BLE001 - a guard fault must never stop a build
         print(f"cargo-host: disk guard unavailable ({type(error).__name__})", file=sys.stderr)
@@ -321,29 +318,6 @@ def _disk_guard_refusal(probe: Path) -> int | None:
     if decision.message:
         print(f"cargo-host: {decision.message}", file=sys.stderr)
     return None if decision.allowed else EXIT_REFUSED
-
-
-def _clean_shared_slots(real: Path, argv: list[str], repo_pool: Path, toolchain_id: str,
-                        workspace: Path) -> int:
-    """``cargo clean`` for every idle pool slot this worktree owns (a busy slot is never touched)."""
-    from .cargo_target_storage import SLOT_LOCK, slot_name
-    status = 0
-    for slot in sorted(repo_pool.glob(slot_name(toolchain_id, workspace, 0).removesuffix("0") + "*")):
-        if not (slot / "target").is_dir():
-            continue
-        fd = os.open(slot / SLOT_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                print(f"cargo-host: skipped busy target {slot / 'target'}", file=sys.stderr)
-                status = status or 1
-                continue
-            result = subprocess.run([str(real), *argv], env={**os.environ, "CARGO_TARGET_DIR": str(slot / "target")})
-            status = status or result.returncode
-        finally:
-            os.close(fd)
-    return status
 
 
 def run_cargo(argv: list[str]) -> int:
@@ -359,80 +333,57 @@ def run_cargo(argv: list[str]) -> int:
         return 127  # pragma: no cover
     from .build_cache_policy import effective_slots
     from .build_coord import _default_slots, _default_state_dir, run_gated
-    if subcommand != "clean":
-        refused = _disk_guard_refusal(_build_output_probe(config, argv))
-        if refused is not None:
-            return refused
-    if config.local.manage_targets:
-        from .build_cache_config import TargetMode
+    from .config import load_config
+    policy = load_config().get("build_cleanup", {})
+
+    def guard(probe: Path) -> int | None:
+        return None if subcommand == "clean" else _disk_guard_refusal(probe, policy)
+
+    def start() -> int:
+        if already_coordinated:
+            os.execvpe(str(real), command, dict(os.environ))
+            return 127  # pragma: no cover
+        return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
+                         record=True, cache_config=config, max_load=1.5)
+
+    from .cargo_target_storage import (
+        alias_owned,
+        compatibility_alias,
+        maintenance_lock,
+        prepare_target,
+        target_override,
+        workspace_root,
+    )
+    if config.local.manage_targets and not target_override(argv, os.environ, Path.cwd()):
         from .build_cache_location import select_storage
-        from .cargo_target_storage import (
-            acquire_shared_target,
-            alias_owned,
-            cached_toolchain_identity,
-            compatibility_alias,
-            maintenance_lock,
-            prepare_target,
-            repo_identity,
-            shared_targets_root,
-            target_override,
-            workspace_root,
-        )
-        # Managed builds never pay for incremental artifacts (they multiply target size).
-        os.environ.setdefault("CARGO_INCREMENTAL", "0")
-        if not target_override(argv, os.environ, Path.cwd()):
-            with maintenance_lock(_default_state_dir()):
-                selected = select_storage(config.local.storage_tiers, _default_state_dir() / "sccache",
-                                          0 if subcommand == "clean" else config.local.min_free_disk_percent)
-                if selected.directory is None:
-                    raise ValueError("No writable storage tier meets the reserve; managed build was not started")
-                if not selected.directory.exists():
-                    removable = any(tier.name == selected.name and tier.volume_uuid
-                                    for tier in config.local.storage_tiers)
-                    if removable:
-                        raise ValueError("Selected external storage disappeared")
-                    selected.directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-                workspace = workspace_root(real, argv, Path.cwd())
-                old_target = workspace / "target"
-                if (old_target.exists() or old_target.is_symlink()) and not alias_owned(_default_state_dir(), workspace):
-                    # An operator's own ./target (or link) is never replaced or redirected.
-                    if already_coordinated:
-                        os.execvpe(str(real), command, dict(os.environ))
-                        return 127  # pragma: no cover
-                    return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
-                                     record=True, cache_config=config, max_load=1.5)
-                if config.local.target_mode is TargetMode.SHARED:
-                    # Pooled targets per repo+toolchain; every worktree owns its slots, so branches never
-                    # overwrite each other's artifacts.
-                    toolchain_id = cached_toolchain_identity(real, argv, Path.cwd(), _default_state_dir())
-                    shared_root = shared_targets_root(selected.directory.parent)
-                    repo_id = repo_identity(workspace)
-                    if subcommand == "clean":
-                        return _clean_shared_slots(real, argv, shared_root / repo_id, toolchain_id, workspace)
-                    target, _slot_lock = acquire_shared_target(
-                        shared_root, repo_id, toolchain_id, config.local.target_pool_size, workspace)
-                    # Keep ./target usable: it points at the slot of the most recent build here.
-                    compatibility_alias(_default_state_dir(), workspace, target)
-                    os.environ["CARGO_TARGET_DIR"] = str(target)
-                    if already_coordinated:
-                        os.execvpe(str(real), command, dict(os.environ))
-                        return 127  # pragma: no cover
-                    return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
-                                     record=True, cache_config=config, max_load=1.5)
-                target = prepare_target(selected.directory, workspace)
-                if not compatibility_alias(_default_state_dir(), workspace, target):
-                    raise ValueError("Default target changed concurrently; no automatic redirection applied")
-                os.environ["CARGO_TARGET_DIR"] = str(target)
-                if already_coordinated:
-                    os.execvpe(str(real), command, dict(os.environ))
-                    return 127  # pragma: no cover
-                return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
-                                 record=True, cache_config=config, max_load=1.5)
-    if already_coordinated:
-        os.execvpe(str(real), command, dict(os.environ))
-        return 127  # pragma: no cover
-    return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
-                     record=True, cache_config=config, max_load=1.5)
+        with maintenance_lock(_default_state_dir()):
+            selected = select_storage(config.local.storage_tiers, _default_state_dir() / "sccache",
+                                      0 if subcommand == "clean" else config.local.min_free_disk_percent)
+            if selected.directory is None:
+                raise ValueError("No writable storage tier meets the reserve; managed build was not started")
+            if not selected.directory.exists():
+                removable = any(tier.name == selected.name and tier.volume_uuid
+                                for tier in config.local.storage_tiers)
+                if removable:
+                    raise ValueError("Selected external storage disappeared")
+                selected.directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+            workspace = workspace_root(real, argv, Path.cwd())
+            old_target = workspace / "target"
+            if (old_target.exists() or old_target.is_symlink()) and not alias_owned(_default_state_dir(), workspace):
+                # An operator's own ./target (or link) is never replaced or redirected: the build
+                # writes into the repository, so that is the filesystem the guard measures.
+                return guard(workspace) or start()
+            refused = guard(selected.directory)
+            if refused is not None:
+                return refused
+            target = prepare_target(selected.directory, workspace)
+            if not compatibility_alias(_default_state_dir(), workspace, target):
+                raise ValueError("Default target changed concurrently; no automatic redirection applied")
+            os.environ["CARGO_TARGET_DIR"] = str(target)
+            # Incremental artifacts multiply the size of a managed target.
+            os.environ.setdefault("CARGO_INCREMENTAL", "0")
+            return start()
+    return guard(_explicit_target_dir(argv, os.environ) or Path.cwd()) or start()
 
 
 def run_rustc(argv: list[str]) -> int:

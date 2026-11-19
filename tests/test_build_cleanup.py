@@ -108,15 +108,18 @@ def test_symlink_target_and_symlink_inside_target_are_preserved(workspace):
     assert external.read_text() == "keep"
 
 
-def test_shared_build_lock_blocks_cleanup(workspace):
-    cache = target(workspace)
+def test_exclusive_maintenance_lock_blocks_cleanup_but_a_running_build_does_not(workspace):
+    cache = target(workspace, "idle")
     state = workspace.parent / "state"
     state.mkdir()
     with (state / "build-maintenance.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_SH)
+        fcntl.flock(lock, fcntl.LOCK_EX)
         result = run(workspace)
     assert result["status"] == "busy"
     assert cache.exists()
+    with (state / "build-maintenance.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)  # a running build: the per-target checks protect it
+        assert run(workspace)["status"] != "busy"
 
 
 @pytest.mark.parametrize("relative", ["target/artifact", "src/main.rs", "target"])
@@ -171,10 +174,11 @@ def test_unverifiable_non_git_project_is_preserved(workspace):
     assert cache.exists()
 
 
-def test_discovery_limit_aborts_without_removing(workspace, monkeypatch):
+def test_discovery_limit_skips_the_root_with_a_reason_without_removing(workspace, monkeypatch):
     cache = target(workspace)
     monkeypatch.setattr(cleanup, "_MAX_ENTRIES", 1)
-    assert run(workspace)["errors"]
+    result = run(workspace)
+    assert result["status"] == "warning" and any("limit" in warning for warning in result["warnings"])
     assert cache.exists()
 
 
@@ -197,9 +201,9 @@ def test_proc_reads_cwd_executable_and_open_files(tmp_path):
 
 
 def test_missing_proc_falls_back_to_lsof_or_fails_closed(tmp_path, monkeypatch):
-    def no_lsof(*args, **kwargs):
-        raise FileNotFoundError("lsof")
-    monkeypatch.setattr(cleanup.subprocess, "run", no_lsof)
+    empty = tmp_path / "empty-bin"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))  # a real host without lsof
     with pytest.raises(OSError):
         cleanup._process_paths(tmp_path / "no-proc")
 

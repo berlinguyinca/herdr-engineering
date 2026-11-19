@@ -119,18 +119,17 @@ Reclamation takes Cargo's native profile lock exclusively and preserves profile 
 
 These are **soft retention budgets**, not active-build quotas. If everything is recent, busy or uncertain, the report shows pressure and exclusions instead of deleting it. Estimated reclaimed allocation can differ from physical free-space gain because of hardlinks and APFS sharing. Growth compares successful inventory samples; an unavailable/busy tier has no current usage measurement. The existing free-disk admission reserve remains in effect.
 
-## Defaults: managed shared targets
+## Defaults: one managed target per worktree
 
 `fabric_build_cache` and `local.manage_targets` are on by default and `scripts/install.sh`
-/ `fleet update` install the wrapper. Builds of one repo and toolchain use
-a pool of `local.target_pool_size` (default 2) `CARGO_TARGET_DIR` slots per worktree (a slot is owned by one worktree, so worktrees never share final artifacts), one flock per slot
-(`local.target_mode: per_workspace` restores one target per workspace). An explicit
-`CARGO_TARGET_DIR` wins, and `CARGO_INCREMENTAL=0` is the default for managed builds.
-`./target` keeps working: it becomes a managed symlink to the pool slot used by the most
-recent build in that worktree (slots vary when builds overlap, so re-read it after a build);
-a real `./target` directory or foreign link is never replaced, and that workspace then keeps
-building into its own `./target`. `cargo clean` cleans this worktree's idle slots for the repo+toolchain
-(a slot a build holds is skipped and reported).
+/ `fleet update` install the wrapper. Every worktree gets one managed `CARGO_TARGET_DIR`
+(`<tier>/../targets/<label>-<id>`), so worktrees never share final artifacts and there are no
+slots, slot locks or toolchain cache. An explicit `CARGO_TARGET_DIR` wins, and `CARGO_INCREMENTAL=0`
+is the default for managed builds only. `./target` keeps working: it is a managed symlink to the
+worktree's target; a real `./target` directory or foreign link is never replaced, and that workspace
+then keeps building into its own `./target` (the guard measures that filesystem). `cargo clean`
+cleans this worktree's target only. Hosts upgraded from the slot pool keep their old
+`build-gates/shared-targets/<repo>/<slot>/target` directories until the cleanup sweep removes them when idle.
 The wrapper refuses new builds when the filesystem the build writes to is at least
 `build_cleanup.refuse_builds_percent` used **and** has less than
 `build_cleanup.refuse_builds_min_free_gib` (default 50) available (exit 75), after one

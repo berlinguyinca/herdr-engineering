@@ -1,8 +1,11 @@
 """Conservative, pressure-driven cleanup of idle Cargo output directories.
 
-Build-coordinate commands share ``build-maintenance.lock`` with this module. Cleanup holds
-it exclusively for discovery, validation and removal. Linux process inspection
-also protects workspaces used by visible commands outside the build gate.
+Sweeps exclude each other with ``build-cleanup.lock`` (exclusive) and take
+``build-maintenance.lock`` shared, which only excludes the destructive maintenance jobs
+(retention, migration, cache eviction) and never a running build, so the disk guard can sweep
+from inside ``build-coordinate``. Running builds are protected per target: recent activity,
+build leases, and open files / working directories of visible processes (rescanned right before
+each removal).
 Inaccessible Herdr descendants or unknown ancestry always preserve files. Only current-user Cargo ``target``
 directories inside explicit roots are eligible; no symlinks are followed.
 
@@ -18,6 +21,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import math
 import os
 import shutil
@@ -30,6 +34,7 @@ from pathlib import Path
 
 from .cargo_target_storage import SLOT_LOCK, TARGET_MARKER
 
+log = logging.getLogger(__name__)
 _PRUNE = {".git", "node_modules", ".venv", "venv", ".cache", "__pycache__"}
 _MAX_ENTRIES = 500_000
 _MAX_DEPTH = 6
@@ -122,13 +127,16 @@ def _process_paths(proc: Path = Path("/proc")) -> list[Path]:
     return paths
 
 
-def _discover(root: Path) -> list[Path]:
+def _discover(root: Path, managed: bool = True) -> list[Path]:
+    """Cargo targets under ``root``. ``managed`` also returns cache-only targets and Herdr-managed
+    ``targets/<workspace>`` dirs (what the sweep reclaims); migration wants repository targets only."""
     pending = [(root, 0)]
     device = root.stat().st_dev
     found = []
     count = 0
     while pending:
         directory, depth = pending.pop()
+        managed_dir = managed and (directory / ".herdr-target-root.json").is_file()
         with os.scandir(directory) as entries:
             for entry in entries:
                 if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
@@ -139,13 +147,13 @@ def _discover(root: Path) -> list[Path]:
                 path = Path(entry.path)
                 if entry.stat(follow_symlinks=False).st_dev != device:
                     continue
-                if _legacy_workspace(path) is not None:
+                if managed_dir and _legacy_workspace(path) is not None:
                     if _cargo_markers(path):
                         found.append(path)
                     continue
                 if entry.name == "target":
                     if _cargo_markers(path) and ((directory / "Cargo.toml").is_file()
-                                                 or _cache_only_target(path)):
+                                                 or (managed and _cache_only_target(path))):
                         found.append(path)
                     continue
                 if entry.name in _PRUNE:
@@ -337,11 +345,12 @@ def run_once(
         "removed": [], "would_remove": [], "skipped": [], "errors": [], "warnings": [],
         "reconciled": [], "pressure": False, "process_scans": 0,
     }
-    lock_fd = os.open(state_dir / "build-maintenance.lock",
-                      os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    lock_fds = [os.open(state_dir / name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+                for name in ("build-cleanup.lock", "build-maintenance.lock")]
     try:
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock_fds[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock_fds[1], fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
             result["status"] = "busy"
             return result
@@ -359,7 +368,8 @@ def run_once(
                        removed_count=result["removed_count"], removed_bytes=result["removed_bytes"])
         return result
     finally:
-        os.close(lock_fd)
+        for fd in lock_fds:
+            os.close(fd)
 
 
 def _reconcile_registry(state_dir: Path, result: dict) -> None:
@@ -390,6 +400,13 @@ def _skip_for_registry(state_dir: Path, target: Path, name: str, result: dict) -
     return True
 
 
+def _skip_root(result: dict, root: Path, reason: str) -> None:
+    """One bad root never stops the sweep of the others (the managed pools come last)."""
+    note = f"skipped root {root}: {reason}"
+    log.warning("build cleanup %s", note)
+    result["warnings"].append(note)
+
+
 def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
            pressure_water=90, pressure_min_age_hours=2):
     roots_by_device = {}
@@ -399,8 +416,13 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
     try:
         for raw in roots:
             root = Path(raw).expanduser().absolute()
-            if root != root.resolve(strict=True) or not root.is_dir() or root == Path("/"):
-                raise OSError(f"Root must be a canonical project directory: {root}")
+            try:
+                canonical = root == root.resolve(strict=True) and root.is_dir() and root != Path("/")
+            except OSError:
+                canonical = False
+            if not canonical:
+                _skip_root(result, root, "not a canonical project directory")
+                continue
             result["roots"].append(str(root))
             usage = _usage(root)
             if usage < high_water:
@@ -411,7 +433,12 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
             if under_pressure:
                 result["pressure"] = True
             roots_by_device[root.stat().st_dev] = root
-            for target in _discover(root):
+            try:
+                targets = _discover(root)
+            except OSError as exc:
+                _skip_root(result, root, str(exc))
+                continue
+            for target in targets:
                 if state_dir.is_relative_to(target):
                     raise OSError(f"Maintenance state is inside cleanup target: {target}")
                 if target.stat().st_dev != root.stat().st_dev:

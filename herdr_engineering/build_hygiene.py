@@ -223,12 +223,12 @@ def install(home: Path, herdr_eng: Command | None = None, *, platform: str | Non
         job = _plist_path(home) if platform == "darwin" else _unit_path(home)
         try:
             if len(_argv(herdr_eng)) > 1 and _job_works(job):
-                # Never replace a working job with the `python -m` fallback.
-                result["build_cleanup"] = {"job": str(job), "kept": "existing job has a working executable"}
-            else:
-                result["build_cleanup"] = install_cleanup_job(
-                    home, herdr_eng, platform=platform,
-                    interval_seconds=int(cleanup.get("interval_seconds", 900)), activate=activate)
+                # Never replace a working executable with the `python -m` fallback, but still
+                # rewrite and reload the job so a changed interval or an unloaded job is fixed.
+                herdr_eng = (_existing_job_command(job) or [])[:-2]
+            result["build_cleanup"] = install_cleanup_job(
+                home, herdr_eng, platform=platform,
+                interval_seconds=int(cleanup.get("interval_seconds", 900)), activate=activate)
         except (OSError, subprocess.SubprocessError) as error:
             result["build_cleanup"] = {"error": f"{type(error).__name__}: {error}"}
     else:

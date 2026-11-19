@@ -58,19 +58,36 @@ def policy_kwargs(cfg: dict) -> dict:
     }
 
 
-def _managed_output_dirs() -> list[Path]:
-    """Existing shared pools and per-workspace target folders of the state dir and every storage tier."""
+def _tier_bases() -> list[Path]:
+    """Parent directory of every enrolled storage tier's cache dir (managed targets live beside it).
+
+    A ``volume_uuid`` tier's directory is relative to its mount, exactly as the build resolves it.
+    """
     from .build_cache_config import validate
+    from .build_cache_location import mounted_volume
+    from .config import load_config
+    section = load_config().get("fabric_build_cache")
+    bases = []
+    for tier in validate(section).local.storage_tiers if section else ():
+        if tier.volume_uuid:
+            mount = mounted_volume(tier.volume_uuid)
+            if mount is not None:
+                bases.append((mount / tier.directory).parent)
+        else:
+            bases.append(Path(tier.directory).expanduser().parent)
+    return bases
+
+
+def _managed_output_dirs() -> list[Path]:
+    """Existing legacy pools and per-workspace target folders of the state dir and every storage tier."""
     from .build_coord import _default_state_dir
     from .cargo_target_storage import shared_targets_root
     bases = [_default_state_dir()]
     try:
-        from .config import load_config
-        section = load_config().get("fabric_build_cache")
-        if section:
-            bases += [Path(tier.directory).expanduser().parent for tier in validate(section).local.storage_tiers]
-    except Exception:  # noqa: BLE001 - a config problem must not stop the sweep of the default pool
-        pass
+        bases += _tier_bases()
+    except Exception:  # noqa: BLE001 - a config problem must not stop the sweep of the default dirs
+        log.warning("build cleanup: storage tiers unreadable; sweeping the default state dir only",
+                    exc_info=True)
     found = []
     for base in bases:
         for path in (shared_targets_root(base), base / "targets"):
@@ -81,10 +98,10 @@ def _managed_output_dirs() -> list[Path]:
 
 
 def effective_roots(cfg: dict, explicit: list[str] | None = None) -> list[Path]:
-    """Configured roots (or explicit ones) plus every managed target pool that exists right now.
+    """Configured roots (or explicit ones) plus every managed target folder that exists right now.
 
     Explicit and configured roots are returned as given (only ``~`` expanded) so the sweep's
-    canonical-root check still sees a symlinked root; managed pools are resolved because they
+    canonical-root check still sees a symlinked root; managed folders are resolved because they
     are derived from state locations. Recomputed by the watcher on every cycle, so a pool created
     after it started is picked up.
     """
@@ -125,6 +142,10 @@ def command(args) -> int:
             print(json.dumps({'status': 'disabled', 'message': 'build_cleanup.enabled is false'}))
             return 0
         result = cleanup()
+        skipped = [w for w in result.get('warnings', []) if w.startswith('skipped root')]
+        if args.root and skipped:  # a root the operator named must work; only default roots are skipped
+            result['status'] = 'error'
+            result['errors'] = [*result.get('errors', []), *skipped]
         print(json.dumps(result, indent=2, sort_keys=True))
         return 1 if result.get('status') == 'error' else 0
     if not cfg.get('enabled', True):

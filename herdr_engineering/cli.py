@@ -3250,7 +3250,7 @@ def _cmd_build_coordinate(args) -> int:
 
 # Commands whose output size the disk-budget guard protects here. Cargo is left out on purpose: the
 # managed cargo wrapper guards it against the filesystem its target really lands on, also when it runs
-# under build-coordinate. Tests and scripts are never refused.
+# under build-coordinate. Scripts are never refused; the cargo wrapper also guards test, nextest, bench and run.
 _GUARDED_BUILD_COMMANDS = frozenset({"rustc", "make", "cmake", "ninja", "tsc"})
 _GUARDED_GO_SUBCOMMANDS = frozenset({"build", "install", "generate"})
 
