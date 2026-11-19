@@ -15,6 +15,7 @@ import pytest
 
 from herdr_engineering.handoff_adapters.base import ExitPlan, Harness, SessionRef, TypedInput
 from herdr_engineering.handoff_adapters.opencode import PROMPT_PLACEHOLDER, OpenCodeAdapter
+from herdr_engineering.handoff_adapters.screen import strip_ansi
 
 FIXTURES = Path(__file__).parent / "fixtures" / "handoff_adapters" / "opencode"
 SESSION = "ses_fixture0001"
@@ -343,16 +344,11 @@ def test_compact_and_exit_commands():
     assert adapter.exit_plan() == ExitPlan("/exit", ("Enter",), 15.0)
 
 
-def test_ready_requires_status_and_the_placeholder_at_the_bottom():
+def test_ready_requires_the_prompt_box_to_be_the_last_thing_on_screen():
     adapter = OpenCodeAdapter()
-    screen = f"transcript\n\n  ┃  {PROMPT_PLACEHOLDER} \"Fix a TODO in the codebase\"\n  ┃  Build  gemma4:26b\n" + "\n" * 20
-    assert adapter.is_ready_for_input(screen, "idle")
-    assert adapter.is_ready_for_input(screen, "done")
-    assert not adapter.is_ready_for_input(screen, "working")
-    assert not adapter.is_ready_for_input(screen, "blocked")
-    assert not adapter.is_ready_for_input("transcript\n  ┃  half typed order\n", "idle")
-    scrolled_up = f"  ┃  {PROMPT_PLACEHOLDER}\n" + "output line\n" * 30  # an old placeholder far above live output
-    assert not adapter.is_ready_for_input(scrolled_up, "idle")
+    assert not adapter.is_ready_for_input(REAL_EMPTY + "output line\n" * 30, "idle")  # the box scrolled up under live output
+    assert not adapter.is_ready_for_input("", "idle")
+    assert not adapter.is_ready_for_input("transcript\n  ┃  half typed order\n", "idle")  # no box bottom edge
 
 
 def test_harness_and_registry():
@@ -488,3 +484,32 @@ def test_real_screen_with_typed_text_is_not_ready():
 @pytest.mark.parametrize("status", ["working", "blocked", "unknown"])
 def test_real_empty_screen_is_not_ready_while_the_harness_is_busy(status):
     assert not OpenCodeAdapter().is_ready_for_input(REAL_EMPTY, status)
+
+
+# screens captured after one real turn in the same pane (the composer is empty again, the footer rows can differ), 2026-11-18, redacted
+AFTER_TURN_EMPTY = (FIXTURES / "screen_after_turn_empty.ansi").read_text(encoding="utf-8")
+AFTER_TURN_TYPED = (FIXTURES / "screen_after_turn_typed.ansi").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("status", ["idle", "done"])
+def test_screen_after_a_turn_with_an_empty_prompt_is_ready(status):
+    assert OpenCodeAdapter().is_ready_for_input(AFTER_TURN_EMPTY, status)
+
+
+def test_screen_after_a_turn_with_typed_text_is_not_ready():
+    assert not OpenCodeAdapter().is_ready_for_input(AFTER_TURN_TYPED, "idle")
+
+
+@pytest.mark.parametrize("status", ["working", "blocked", "unknown"])
+def test_screen_after_a_turn_is_not_ready_while_the_harness_is_busy(status):
+    assert not OpenCodeAdapter().is_ready_for_input(AFTER_TURN_EMPTY, status)
+
+
+UPDATE_DIALOG = (FIXTURES / "screen_update_dialog.ansi").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("status", ["idle", "done"])
+def test_update_dialog_over_the_prompt_is_not_ready(status):
+    # the placeholder still shows behind the dialog, but the dialog takes the keys
+    assert PROMPT_PLACEHOLDER in strip_ansi(UPDATE_DIALOG)
+    assert not OpenCodeAdapter().is_ready_for_input(UPDATE_DIALOG, status)

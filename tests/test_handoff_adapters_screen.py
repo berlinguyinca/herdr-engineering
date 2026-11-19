@@ -33,3 +33,21 @@ def test_typed_text_after_the_marker(row, expected):
 def test_typed_text_is_none_without_the_marker():
     assert typed_text("output ❯ not a prompt", "❯") is None
     assert typed_text("", "❯") is None
+
+
+@pytest.mark.parametrize("row, expected", [
+    (f"❯ {ESC}[?25mtyped", "typed"),  # a private-parameter sequence ending in m is not SGR: ignored, never an int() error
+    (f"❯ {ESC}[?1;2mtyped", "typed"),
+    (f"❯ {ESC}[>4;2mtyped", "typed"),
+    (f"❯ {ESC}[38:2::1:2:3mtyped{ESC}[0m", "typed"),  # colon form of a colour: its 2 is not "faint", and the sequence is not text
+    (f"❯ {ESC}[38:5:2mtyped{ESC}[0m", "typed"),
+    (f"❯ {ESC}[2m{ESC}[38:2::1:2:3mfaint{ESC}[0m", ""),  # a colour does not end the faint run
+    (f"❯ {ESC}[4:3mtyped{ESC}[0m", "typed"),  # curly underline sub-parameter
+    (f"❯ {ESC}[2:5mfaint{ESC}[0m", ""),
+])
+def test_typed_text_survives_sequences_that_are_not_plain_semicolon_sgr(row, expected):
+    assert typed_text(row, "❯") == expected
+
+
+def test_strip_ansi_removes_colon_and_private_parameter_sequences():
+    assert strip_ansi(f"{ESC}[38:2::1:2:3ma{ESC}[?25mb{ESC}[>4;2mc") == "abc"

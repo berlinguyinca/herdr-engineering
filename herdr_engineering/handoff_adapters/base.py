@@ -50,12 +50,14 @@ class ExitPlan:
     text: str | None
     keys: tuple[str, ...]
     process_end_timeout_s: float
+    submit_delay_s: float = TYPE_TO_SUBMIT_DELAY_S  # pause between typing `text` and sending `keys`; see send_typed
 
 
 @dataclass(frozen=True)
 class TypedInput:
     text: str
     submit_keys: tuple[str, ...]
+    submit_delay_s: float = TYPE_TO_SUBMIT_DELAY_S  # pause between typing `text` and sending `submit_keys`; see send_typed
 
     def __post_init__(self) -> None:
         if len(self.text.encode()) > MAX_TYPED_BYTES:

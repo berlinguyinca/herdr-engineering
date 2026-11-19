@@ -6,7 +6,9 @@ import pytest
 from herdr_engineering.handoff_adapters import adapter_for
 from herdr_engineering.handoff_adapters.base import (
     MAX_TYPED_BYTES,
+    TYPE_TO_SUBMIT_DELAY_S,
     ContextReading,
+    ExitPlan,
     Harness,
     TypedInput,
 )
@@ -94,3 +96,34 @@ def test_every_claude_model_seen_in_recent_transcripts_resolves_to_a_1m_window(m
 @pytest.mark.parametrize("model,window", [("claude-opus-4-5-20251101", 200_000), ("claude-sonnet-4-5-20250929", 200_000)])
 def test_a_dated_model_id_resolves_to_its_undated_entry(model, window):
     assert lookup_window(model) == (window, "model_table")
+
+
+def test_submit_delay_defaults_to_the_measured_pause():
+    assert TypedInput("x", ("Enter",)).submit_delay_s == TYPE_TO_SUBMIT_DELAY_S
+    assert ExitPlan("/exit", ("Enter",), 15.0).submit_delay_s == TYPE_TO_SUBMIT_DELAY_S
+    assert TypedInput("x", ("Enter",), 0.0).submit_delay_s == 0.0
+
+
+@pytest.mark.parametrize("harness", list(Harness))
+def test_every_adapter_input_carries_the_submit_delay(harness):
+    adapter = adapter_for(harness)
+    assert adapter.drain_input("x").submit_delay_s == TYPE_TO_SUBMIT_DELAY_S
+    assert adapter.compact_input().submit_delay_s == TYPE_TO_SUBMIT_DELAY_S
+    assert adapter.exit_plan().submit_delay_s == TYPE_TO_SUBMIT_DELAY_S
+
+
+_HOSTILE_SCREENS = [
+    "\x1b[?25m❯ x\n\x1b[?1;2m›\x1b[>4;2m y",
+    "❯ \x1b[38:2::1:2:3mx\x1b[0m\n" * 6,
+    "\x1b[" + "9" * 400 + "m❯\x1b[;;;m\x1b[2;38;2m",
+    "\x1b[\x1b[m\x1b\x1b[2",
+    "┃\n╹▀\n┃\x00\ufffd\n",
+    "",
+    "\n\n",
+]
+
+
+@pytest.mark.parametrize("harness", list(Harness))
+@pytest.mark.parametrize("screen", _HOSTILE_SCREENS)
+def test_is_ready_for_input_never_raises_on_any_screen_bytes(harness, screen):
+    assert adapter_for(harness).is_ready_for_input(screen, "idle") in (True, False)

@@ -79,7 +79,7 @@ in `models.json` is the fix; until then they read high and a handoff comes early
 | Window source | The database holds none (no column of `session` or `session_context_epoch`, and no field of `message.data`, names a window). OpenCode's config `~/.config/opencode/opencode.json`, `provider.<provider>.models.<model>.limit.context`, then its cached catalogue `~/.cache/opencode/models.json`, `<provider>.models.<model>.limit.context`; both `window_source='recorded'`. Else `MODEL_WINDOWS`, else 128,000 |
 | Compaction marker | an assistant message with `summary: true` and `mode: "compaction"`; after it there is no reading until the next reply |
 | Session id in Herdr | `agent_session.kind == "id"`; matched against `session.id` on its own, without comparing the session `directory` with the pane cwd. Without an id only an unambiguous top-level, unarchived session in the pane's cwd is used |
-| Prompt, exit, compact | Prompt and exit measured, `/compact` still unconfirmed live, see "Idle detection and exit" below. `agent_session` is absent for a fresh pane, so `locate` finds no record until Herdr reports one |
+| Prompt, exit, compact | Prompt, exit and compact measured, see "Idle detection and exit" below. `agent_session` (kind `id`, a `ses_...` value) appears only after the first prompt, so `locate` finds no record before it |
 
 Model ids seen: `qwen3.8-27b`, `qwen3.8-27b-vision` (provider `metabolomics`), both `recorded`. Window unknown: none.
 
@@ -87,17 +87,20 @@ Model ids seen: `qwen3.8-27b`, `qwen3.8-27b-vision` (provider `metabolomics`), b
 
 Measured on 2026-11-18 in real Herdr 0.9.1 panes, each opened with `herdr pane split --no-focus` and closed afterwards,
 by `tests/e2e/test_handoff_adapters_live.py` (`pytest tests/e2e/test_handoff_adapters_live.py -m herdr_live -v -s`).
-Nothing was submitted to any harness: the tests need an empty composer and typed-but-unsubmitted text. The screen
-the adapters read is what `HerdrPaneClient.read_visible` returns, `--format ansi`, which carries colour codes in
-every row; `herdr_engineering/handoff_adapters/screen.py` reads it. Screens captured from the same panes, redacted,
-are the fixtures `tests/fixtures/handoff_adapters/<harness>/screen_{empty,typed}.ansi`.
+Every test types without submitting, except `test_one_turn_then_idle_detection_and_session_kind`, which submits exactly
+one trivial prompt ("Reply with the single word ok.") per harness in the pane the test opened and then checks the screen
+a handoff would really face (the first measurement was a fresh pane with no session). The screen the adapters read is what
+`HerdrPaneClient.read_visible` returns, `--format ansi`, which carries colour codes in every row;
+`herdr_engineering/handoff_adapters/screen.py` reads it. Screens captured from the same panes, redacted, are the fixtures
+`tests/fixtures/handoff_adapters/<harness>/screen_{empty,typed,after_turn_empty,after_turn_typed}.ansi`, and
+`opencode/screen_update_dialog.ansi`.
 
-| Harness | Version | Empty prompt as measured | Exit (measured) | Seconds to process end | Compact | `agent_session` before a prompt |
-| --- | --- | --- | --- | --- | --- | --- |
-| Claude Code | 2.1.306 | row `❯` + no-break space, then a faint (SGR 2) suggestion such as `Try "fix lint errors"`, between two rules | `/exit` + `Enter`; measured | 0.4 to 1.1 | `/compact` + `Enter`; slash menu lists "/compact  Free up context by summarizing the conversation so far", not submitted | kind `id` |
-| Codex | 0.169.0 | row `›` (bold), a braille animation cell, a faint `Ask Codex to do anything`, more braille cells; typed text replaces the faint part | `/exit` + `Enter`; measured | 0.5 to 0.7 | `/compact` + `Enter`; slash menu lists "/compact  summarize conversation to prevent hitting the context limit", not submitted | none reported |
-| Pi | 1.3.0 | a blank row between two rows of `─`, with the footer below; typed text sits on the middle row | `/quit` + `Enter`; measured | 0.2 to 0.7 | `/compact` + `Enter`; slash menu lists "compact  Manually compact the session context" (shown without the slash), not submitted | kind `path` |
-| OpenCode | 1.18.23 | row `┃  Ask anything... "<example>"` in the prompt box; the example text changes | `/exit` + `Enter`; measured | 0.4 to 0.6 | `/compact` + `Enter`: **unconfirmed live**, a pane without a session does not list it in the slash menu, and none was started; present in the binary's command list (alias `/summarize`) | none reported |
+| Harness | Version | Empty prompt as measured | Exit (measured) | Seconds to process end | Compact | `agent_session` before a prompt | `agent_session` after a turn |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Claude Code | 2.1.306 | row `❯` + no-break space, then a faint (SGR 2) suggestion such as `Try "fix lint errors"`, between two rules | `/exit` + `Enter`; measured | 0.4 to 1.2 | `/compact` + `Enter`; slash menu lists "/compact  Free up context by summarizing the conversation so far", not submitted | kind `id` | kind `id` |
+| Codex | 0.169.0 | row `›` (bold), a braille animation cell, a faint `Ask Codex to do anything`, more braille cells; typed text replaces the faint part | `/exit` + `Enter`; measured | 0.5 to 0.7 | `/compact` + `Enter`; slash menu lists "/compact  summarize conversation to prevent hitting the context limit", not submitted | none reported | none reported (see below) |
+| Pi | 1.3.0 | a blank row between two rows of `─`, with the footer below; typed text sits on the middle row | `/quit` + `Enter`; measured | 0.2 to 0.7 | `/compact` + `Enter`; slash menu lists "compact  Manually compact the session context" (shown without the slash), not submitted | kind `path` | kind `path` |
+| OpenCode | 1.18.23 | prompt box of `┃` rows ending in a `┃  Build · <model>` row and a `╹▀▀▀` edge; a fresh session shows `Ask anything... "<example>"` in it (the example changes), after a turn the empty box is bare `┃` rows | `/exit` + `Enter`; measured | 0.4 to 0.6 | `/compact` + `Enter`; measured: a session-less pane does NOT list it, after a turn the slash menu lists "/compact  Compact session" (typed, not run) | none reported | kind `id`, value `ses_...` |
 
 How each was used, and what was found:
 
@@ -107,35 +110,51 @@ How each was used, and what was found:
   Plain text (no colour codes) cannot tell a suggestion from typing, so there any text after the marker counts as typed; a caller
   must pass the ANSI screen. The suggestion text itself is not matched, because Claude Code's changes between runs.
 - **Pi** needed no logic change: stripping the colour codes leaves the blank-row-between-two-rules editor the adapter already matched.
-- **OpenCode** leaves blank rows inside its layout, so the placeholder is 7th from the last non-blank row but 18th from the
-  last row; the adapter now counts non-blank rows. `agent_status` is `idle` while OpenCode is still "Loading plugins...", so
-  status alone does not mean ready; the placeholder does.
+- **After a turn the screen was re-measured** (Claude Code, Codex, Pi, OpenCode, one real turn each). Claude Code, Codex and
+  Pi keep their layout: Claude Code's empty composer is a bare `❯` (no suggestion) two rows above the bottom, Codex's is
+  `› Ask Codex to do anything` with three rows below, Pi's editor is unchanged with two footer rows. So
+  `_LINES_BELOW_PROMPT` (4) and `_LINES_BELOW_EDITOR` hold. **OpenCode changed**: the placeholder is gone once a session has
+  a turn, so a placeholder-based check would never see an empty composer in a session that has had a turn. The adapter
+  now finds the `╹▀` bottom edge of the prompt box (at most 4 non-blank rows below it: 3 in a fresh session, 1 after a
+  turn), requires the row above it to be the agent/model row, and calls the box empty when every `┃` input row above that
+  is bare or starts with the placeholder. `agent_status` is `idle` while OpenCode is still "Loading plugins...", so
+  status alone does not mean ready.
 - **Modal dialogs in front of the prompt.** Codex ("Update available", `enter continue · esc skip`) and OpenCode ("Update
   Available", `Skip  Confirm`) put an update dialog over the prompt at start; Escape dismisses both without changing
-  configuration, and the live test does that. OpenCode's placeholder stays visible behind its dialog, so `is_ready_for_input`
-  is True while the dialog still takes the keys; the adapter does not detect that. Claude Code and Codex stop at a trust
+  configuration, and the live test does that. OpenCode's box and placeholder stay visible behind its dialog, so the adapter
+  returns False while a `Skip  Confirm` row is on screen (real capture, fixture `opencode/screen_update_dialog.ansi`).
+  **Codex's dialog is not covered by a test**: its real capture was lost when the same-named file was overwritten, and the
+  dialog did not come back, because one earlier run of the measurement sent Enter into it and Codex recorded that update as
+  dismissed (`dismissed_version` 0.170.0 in `~/.codex/version.json`); it will return with the next Codex release. The screen
+  as read before that (full-screen, a `› 1. Update now` selection row, `2. Skip`, `3. Skip until next version`,
+  `enter continue · esc skip`) puts non-blank text after the `›` marker, so the existing rule should answer False, but that is
+  unverified. Treat Codex's update dialog as unhandled until a capture exists. Claude Code and Codex stop at a trust
   dialog for a folder they have not seen; saving the trust decision changes user config, so the live test skips instead
   (`HERDR_LIVE_CWD` points it at a trusted folder).
 - **Pause between text and Enter.** Codex ignored an `Enter` sent in the same instant as `/exit` (the text stayed in the
   composer, 0 of 3 runs) and obeyed it after 0.1 s (3 of 3 runs at 0.1, 0.3 and 0.6 s). `base.TYPE_TO_SUBMIT_DELAY_S`
-  (0.3 s) is the pause a sender must put between typing and the submit keys; the other three harnesses were not tried without it and get it too. The slash menu does not need an extra Enter: with it open, one `Enter` runs `/exit`, `/quit` and `/compact`
-  (the last only observed as typed text, not run).
+  (0.3 s) is the pause a sender must put between typing and the submit keys; the other three harnesses were not tried without it and get it too. The pause is data on `TypedInput.submit_delay_s` and
+  `ExitPlan.submit_delay_s` (default `TYPE_TO_SUBMIT_DELAY_S`), and `handoff_adapters.send.send_typed(client, pane_id, typed)`
+  types the text, waits it, then sends the submit keys; every sender must use that helper, and the live tests do. The slash
+  menu does not need an extra Enter: with it open, one `Enter` runs `/exit` and `/quit` (`/compact` was only typed, never run).
 - **Process end** is when every foreground process of the pane is a shell, from `herdr pane process-info`. The harnesses end in
   at most 1.1 s including the 0.3 s pause; `ExitPlan.process_end_timeout_s` stays 15 s as margin. Claude Code's process name
   is its version (`2.1.306`), so do not match it by name.
 - **Codex `/exit` disconnects, it does not stop work.** Its screen reads "Disconnected from this task. Any running work
   continues." (Codex 0.169.0 runs turns in a local background server). That is harmless when the session is idle, which
   the handoff requires before exiting, but `/exit` on a working Codex would leave the turn running.
-- **`herdr agent get` `agent_session`.** Claude: `{kind: "id"}`, the conversation id, present at once. Pi: `{kind: "path"}`, the
-  record file, present at once. Codex and OpenCode: no `agent_session` at all in a fresh idle pane, although Herdr's Codex
-  (hook v8) and OpenCode (plugin v12) integrations are installed and `herdr agent get` reports `agent: codex` /
-  `opencode`. Whether one appears after the first prompt, and its kind and value, was **not observed**: that needs a submitted
-  prompt, which this measurement does not do. So whether Codex's value equals the rollout filename id is **unconfirmed**. Codex's
-  own `/status` shows a session id (an id of the same shape as the one in a rollout file name; `codex resume <id>` on exit prints one), but no rollout file exists for it until a prompt is submitted. `locate` returns `None` for a pane with
-  no `agent_session`, which is what the adapters now do.
+- **`herdr agent get` `agent_session`**, measured before a prompt and after one turn. Claude: `{kind: "id"}`, the conversation
+  id, from the start and after. Pi: `{kind: "path"}`, the record file, from the start and after. OpenCode: none before a
+  prompt, `{kind: "id", value: "ses_..."}` after the first one; `OpenCodeAdapter.locate_session` matches that value against
+  `session.id`, so `locate` works for it once a turn exists. **Codex: none, before a prompt and after a turn**, although its
+  hook integration (v8) is "current" and the turn wrote a rollout file; so `agent_session` is never a rollout id for Codex
+  and "does the value equal the rollout filename id" has no answer from Herdr. `CodexAdapter.locate` returns `None` for such a
+  pane (it never falls back to the newest rollout), so Codex context cannot be read in a Herdr pane until Herdr reports a
+  session for it or the controller supplies the id another way. Codex's own `/status` shows a session id of the same shape as
+  the one in a rollout file name, and `codex resume <id>` on exit prints one; it was not compared with a rollout.
 
-Evidence for the compact and exit commands is the harness's own slash menu (and, for exit, running it); `/compact` was never
-run in a live session.
+Evidence for the compact command is the harness's own slash menu after the command was typed (never submitted), for Claude
+Code, Codex and Pi in a fresh pane and for OpenCode after a turn; `/compact` was never run in a live session. Exit was run.
 
 ## Rules the adapters implement beyond the original plan
 

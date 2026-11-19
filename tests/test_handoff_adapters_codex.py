@@ -186,3 +186,22 @@ def test_real_screen_with_typed_text_is_not_ready():
 @pytest.mark.parametrize("status", ["working", "blocked", "unknown"])
 def test_real_empty_screen_is_not_ready_while_the_harness_is_busy(status):
     assert not CodexAdapter().is_ready_for_input(REAL_EMPTY, status)
+
+
+# screens captured after one real turn in the same pane (the composer is empty again, the footer rows can differ), 2026-11-18, redacted
+AFTER_TURN_EMPTY = (FIXTURES / "screen_after_turn_empty.ansi").read_text(encoding="utf-8")
+AFTER_TURN_TYPED = (FIXTURES / "screen_after_turn_typed.ansi").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("status", ["idle", "done"])
+def test_screen_after_a_turn_with_an_empty_prompt_is_ready(status):
+    assert CodexAdapter().is_ready_for_input(AFTER_TURN_EMPTY, status)
+
+
+def test_screen_after_a_turn_with_typed_text_is_not_ready():
+    assert not CodexAdapter().is_ready_for_input(AFTER_TURN_TYPED, "idle")
+
+
+@pytest.mark.parametrize("status", ["working", "blocked", "unknown"])
+def test_screen_after_a_turn_is_not_ready_while_the_harness_is_busy(status):
+    assert not CodexAdapter().is_ready_for_input(AFTER_TURN_EMPTY, status)

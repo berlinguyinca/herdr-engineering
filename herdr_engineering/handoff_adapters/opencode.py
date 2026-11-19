@@ -12,10 +12,15 @@ from .herdr_session import herdr_session_id, is_safe_session_id
 from .screen import screen_rows
 from .windows import lookup_window
 
-# the empty prompt's placeholder, `Ask anything... "<example>"`; measured in a live pane (OpenCode 1.18.23, 2026-11-18)
+# The prompt box (OpenCode 1.18.23, live panes, 2026-11-18): rows starting with PROMPT_BAR, the last of them naming the
+# agent and model, closed by a BOX_BOTTOM row. A fresh session's empty box shows the placeholder `Ask anything... "<example>"`
+# in it; after a turn the empty box is bare PROMPT_BAR rows.
 PROMPT_PLACEHOLDER = "Ask anything"
+PROMPT_BAR = "┃"
+BOX_BOTTOM = "╹▀"
+UPDATE_DIALOG = "Skip  Confirm"  # the "Update Available" modal: drawn over the screen, the box stays visible behind it
 _READY_STATUSES = frozenset({"idle", "done"})
-_LINES_AT_BOTTOM = 8  # non-blank rows: the prompt box (placeholder is its 7th from last), hints and footer; higher up is old output
+_ROWS_BELOW_BOX = 4  # non-blank rows under the box: hints, tip and the status bar (1 after a turn, 3 in a fresh session)
 _BUSY_TIMEOUT_S = 0.25  # a busy database must not hold the controller up; the next poll asks again
 _USAGE_FIELDS = ("input", "output", "reasoning")
 
@@ -155,14 +160,26 @@ class OpenCodeAdapter:
     def is_ready_for_input(self, screen: str, agent_status: str) -> bool:
         if agent_status not in _READY_STATUSES:
             return False
-        lines = [plain for _, plain in screen_rows(screen) if plain]  # coloured, and OpenCode leaves blank rows inside its layout
-        return any(PROMPT_PLACEHOLDER in line for line in lines[-_LINES_AT_BOTTOM:])
+        rows = [plain for _, plain in screen_rows(screen)]  # coloured, with blank rows inside the layout
+        if any(UPDATE_DIALOG in row for row in rows):
+            return False  # a modal has the keys, whatever the box behind it shows
+        bottom = next((i for i in range(len(rows) - 1, -1, -1) if rows[i].startswith(BOX_BOTTOM)), None)
+        if bottom is None or bottom == 0 or sum(1 for row in rows[bottom + 1:] if row) > _ROWS_BELOW_BOX:
+            return False
+        if not rows[bottom - 1].startswith(PROMPT_BAR) or rows[bottom - 1] == PROMPT_BAR:
+            return False  # the row above the bottom edge names the agent and model
+        inputs: list[str] = []
+        for row in reversed(rows[:bottom - 1]):  # the box's input rows: contiguous, up to the first row without the bar
+            if not row.startswith(PROMPT_BAR):
+                break
+            inputs.append(row[len(PROMPT_BAR):].strip())
+        return bool(inputs) and all(not text or text.startswith(PROMPT_PLACEHOLDER) for text in inputs)
 
     def exit_plan(self) -> ExitPlan:
         # measured in a live pane (OpenCode 1.18.23, 2026-11-18): /exit then Enter ended the process in 0.4 s; the 15 s is margin
         return ExitPlan("/exit", ("Enter",), 15.0)
 
     def compact_input(self) -> TypedInput:
-        # still unconfirmed live: the slash menu of a session-less pane does not list /compact (it is in the binary's
-        # command list, alias /summarize), and no session was started to see it
+        # measured live (OpenCode 1.18.23, 2026-11-18): once a session exists the slash menu lists `/compact  Compact session`
+        # (typed, not run); a session-less pane does not list it
         return TypedInput("/compact", ("Enter",))
