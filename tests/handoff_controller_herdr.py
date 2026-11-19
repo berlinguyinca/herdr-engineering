@@ -25,7 +25,6 @@ from herdr_engineering.handoff_controller.herdr_cli import HerdrCli
 
 SCRIPT = Path(__file__).parent / "fixtures" / "handoff_controller" / "tui_composer.py"
 REPO_ROOT = Path(__file__).resolve().parents[1]
-_SOCKET_LIMIT = 100  # sun_path is 104 bytes on macOS, 108 on Linux; the server adds a `-client.sock` sibling
 
 
 @dataclass(frozen=True)
@@ -39,6 +38,10 @@ class IsolatedHerdr:
     def _herdr(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["herdr", *args], env=self.env, cwd=self.root, capture_output=True, text=True,
                               timeout=30, check=True)
+
+    def start_delay(self, seconds: float) -> None:
+        """Programs started from now on wait `seconds` before drawing (the fixture reads `start_delay_s` beside itself)."""
+        self.program.with_name("start_delay_s").write_text(str(seconds))
 
     def start(self, *, extra_env: str = "") -> str:
         """Open a workspace running the fixture program as `claude`; the pane id. `extra_env` is `NAME=value ...` for the program."""
@@ -58,9 +61,13 @@ def wait_for(until: Callable[[], bool], timeout_s: float, step_s: float = 0.1) -
     return until()
 
 
-def _our_program_pids(program: Path) -> list[int]:
-    """Processes whose command line runs our own copy of the fixture program (its path is unique to this server)."""
-    found = subprocess.run(["pgrep", "-f", str(program)], capture_output=True, text=True, check=False)
+def _our_program_pids(program: Path, env: Mapping[str, str] | None = None) -> list[int]:
+    """Processes whose command line runs our own copy of the fixture program (its path is unique to this server);
+    none when `pgrep` is not installed."""
+    try:
+        found = subprocess.run(["pgrep", "-f", str(program)], capture_output=True, text=True, check=False, env=env)
+    except FileNotFoundError:
+        return []
     return [int(pid) for pid in found.stdout.split() if int(pid) != os.getpid()]
 
 
@@ -70,10 +77,11 @@ def _teardown(herdr: str, env: Mapping[str, str], root: Path, server: subprocess
         server.wait(timeout=10)
     except subprocess.TimeoutExpired:
         pass
-    try:
-        os.killpg(server.pid, signal.SIGKILL)  # the group this fixture started, nothing else
-    except (ProcessLookupError, PermissionError):
-        pass
+    if server.poll() is None:  # a dead server's group id may already belong to someone else
+        try:
+            os.killpg(server.pid, signal.SIGKILL)  # the group this fixture started, nothing else
+        except (ProcessLookupError, PermissionError):
+            pass
     for pid in _our_program_pids(program):  # panes run in sessions of their own
         try:
             os.kill(pid, signal.SIGKILL)

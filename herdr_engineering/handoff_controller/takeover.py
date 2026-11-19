@@ -4,6 +4,12 @@ herdr-handoff does the work (launch the same harness in a pane below, wait for p
 to exit, close the source pane) and records every step in the handoff record, so a rerun for the same handoff id
 continues from the record: it reuses the recorded child pane and never launches a second one. The controller only
 decides whether to call it again and what the chain's terminal event is. It never closes a pane itself.
+
+Two limits to know when reading an event:
+- A takeover killed after the child was launched but before it was confirmed counts as unconfirmed, so the last-resort
+  compaction may run while a slow child is still starting. This shows as `successor_pane_id` on the ORANGE event.
+- An agent that turns `blocked` right after a failed prompt is still reported as typed: the screen shows a dialog, not
+  whether the text went in.
 """
 from __future__ import annotations
 
