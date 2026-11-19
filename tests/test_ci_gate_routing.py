@@ -70,8 +70,9 @@ def change(repo: Path, path: str, branch: str = "feature") -> str:
 
 
 def applicability(repo: Path, sha: str, event: str = "pull_request", base: str = "main",
-                  gate: str | None = None) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "CI_EVENT": event, "CI_COMMIT_SHA": sha, "CI_TARGET_BRANCH": "main",
+                  gate: str | None = None, event_var: str = "CI_PIPELINE_EVENT") -> subprocess.CompletedProcess[str]:
+    base_env = {k: v for k, v in os.environ.items() if not k.startswith("CI_")}  # a runner's CI_* must not leak in
+    env = {**base_env, event_var: event, "CI_COMMIT_SHA": sha, "CI_TARGET_BRANCH": "main",
            "HERDR_APPLICABILITY_BASE": base}
     args = ["bash", str(APPLICABLE), *([gate] if gate else [])]
     return subprocess.run(args, cwd=repo, env=env, capture_output=True, text=True)
@@ -317,6 +318,33 @@ def test_ui_gates_manual_and_push_events_always_run(repo):
         assert applicability(repo, sha, event=event, gate="ui").returncode == 0
 
 
+@pytest.mark.parametrize("gate", ["unit", "ui"])
+@pytest.mark.parametrize("event", ["manual", "push"])
+def test_woodpecker_event_variable_manual_and_push_always_run(repo, gate, event):
+    """Woodpecker exports CI_PIPELINE_EVENT and no CI_EVENT; reading only CI_EVENT turned a manual run green without running."""
+    sha = change(repo, "docs/whatever.md")
+    result = applicability(repo, sha, event=event, gate=gate)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "always runs the suite" in result.stdout
+
+
+@pytest.mark.parametrize("gate", ["unit", "ui"])
+def test_woodpecker_event_variable_pull_request_can_still_skip(repo, gate):
+    result = applicability(repo, change(repo, "docs/whatever.md"), event="pull_request", gate=gate)
+    assert result.returncode == 3, (result.stdout, result.stderr)
+
+
+def test_legacy_ci_event_variable_is_still_honoured(repo):
+    sha = change(repo, "docs/whatever.md")
+    assert applicability(repo, sha, event="manual", gate="ui", event_var="CI_EVENT").returncode == 0
+
+
+@pytest.mark.parametrize("path", ["pyproject.toml", "scripts/ci/journal.sh", "scripts/ci/cache-trust.sh"])
+def test_ui_gates_dependencies_route_to_run(repo, path):
+    result = applicability(repo, change(repo, path), gate="ui")
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+
 def test_ui_gates_unresolvable_base_fails_open(repo):
     result = applicability(repo, git(repo, "rev-parse", "HEAD"), base="origin/no-such-branch", gate="ui")
     assert result.returncode == 0 and "fail open" in result.stderr
@@ -339,7 +367,15 @@ def test_ui_gates_is_no_longer_path_filtered():
 def test_ui_gates_skip_is_reported_rather_than_silently_absent():
     steps = {s["name"]: s for s in yaml.safe_load(UI_GATES_YML)["steps"]}
     assert list(steps) == ["checkout", "freshness", "applicability", "ui-gates"]
-    assert "unit-gates-applicable.sh ui" in UI_GATES_YML
-    assert ".ci-ui-gates-not-applicable" in UI_GATES_YML
-    assert "nothing to run" in UI_GATES_YML, "a skipped run must say why, in the log"
-    assert "bash scripts/ci/ui-gates.sh" in UI_GATES_YML
+    applicability_cmds = steps["applicability"]["commands"]
+    assert "rc=0; bash scripts/ci/unit-gates-applicable.sh ui || rc=$?" in applicability_cmds
+    # the marker is touched only on rc 3; any other non-zero rc fails the step instead of skipping
+    decision = next(c for c in applicability_cmds if c.startswith("if ["))
+    assert 'if [ "$rc" = 3 ]; then touch .ci-ui-gates-not-applicable;' in decision
+    assert 'elif [ "$rc" != 0 ]; then exit "$rc"; fi' in decision
+    assert [c for c in applicability_cmds if "touch" in c] == [decision]
+    gate_cmds = steps["ui-gates"]["commands"]
+    guard = next(c for c in gate_cmds if c.startswith("if ["))
+    assert gate_cmds.index(guard) < gate_cmds.index("bash scripts/ci/ui-gates.sh")
+    assert "[ -f .ci-ui-gates-not-applicable ]" in guard
+    assert "nothing to run" in guard and guard.rstrip().endswith("exit 0; fi")

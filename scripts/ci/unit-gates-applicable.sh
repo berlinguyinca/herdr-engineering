@@ -48,7 +48,10 @@ scripts/ci-pipeline-freshness.sh
 package.json
 package-lock.json
 .woodpecker/ui-gates.yml
-scripts/ci/unit-gates-applicable.sh'
+scripts/ci/unit-gates-applicable.sh
+pyproject.toml
+scripts/ci/journal.sh
+scripts/ci/cache-trust.sh'
     ;;
   *) echo "applicability: unknown gate '${gate}' (expected unit or ui)" >&2; exit 2 ;;
 esac
@@ -70,9 +73,11 @@ herdr_covered_path() {
 
 # Only a pull request can be "not applicable": a push to main is the thing main-cron-gates.sh exists to prove, and a manual run is
 # someone asking for the suite by name. With no CI environment at all (a local run) the same question is asked against origin/main.
-case "${CI_EVENT:-}" in
+# Woodpecker exports CI_PIPELINE_EVENT (CI_EVENT is the legacy name); read both, like ci-pipeline-freshness.sh and cache-trust.sh.
+event="${CI_PIPELINE_EVENT:-${CI_EVENT:-}}"
+case "$event" in
   pull_request|'') ;;
-  *) echo "${label} applicability: event '${CI_EVENT}' always runs the suite"; exit 0 ;;
+  *) echo "${label} applicability: event '${event}' always runs the suite"; exit 0 ;;
 esac
 
 base_ref="${HERDR_APPLICABILITY_BASE:-origin/${CI_TARGET_BRANCH:-main}}"
