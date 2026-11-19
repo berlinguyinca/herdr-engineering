@@ -225,68 +225,31 @@ installed by default; the decision to hand off stays with the person unless they
 opt in. Remove the hook with
 `herdr-eng workflow uninstall`. Details: `docs/operations/workflow-hooks.md`.
 
-## Opt-in automatic trigger: hand off when the context fills up
+## Retired: the 50% context reminder hook
 
-`herdr-eng handoff context-hook claude` is a Claude Code `UserPromptSubmit` hook
-body. It is **not installed by default**. When the session's context usage reaches
-the threshold it injects an instruction (`hookSpecificOutput.additionalContext`)
-telling the agent to finish or record running subagents and run the `/handoff`
-skill now, which hands over to a successor pane and closes this one. The hook
-cannot write the handoff itself; it only injects the instruction. Each `session_id` has a
-marker file recording the context size (tokens) at the last reminder; an ignored instruction is
-repeated only after usage grows another 10 points. Markers older than 30 days are
-pruned (marker files under `$HERDR_ENGINEERING_STATE/handoff-context`,
-default `~/.local/share/herdr-engineering/state/handoff-context`).
+`herdr-eng handoff context-hook claude` used to be an opt-in Claude Code `UserPromptSubmit` hook that asked the agent to
+run `/handoff` at 50% of the window. The [automatic handoff controller](#automatic-handoff-controller) replaced it, and its
+module, thresholds (`HERDR_HANDOFF_CONTEXT_THRESHOLD`, `HERDR_HANDOFF_CONTEXT_MAX_TOKENS`) and marker files are gone.
+`HERDR_HANDOFF_AUTO=0` is still honoured: it is now the controller's global off switch.
 
-Context used is read from the last assistant message in the transcript:
-`input_tokens + cache_read_input_tokens + cache_creation_input_tokens`. Below the
-threshold, with a missing transcript, bad input or any error, it prints nothing and
-exits 0, so it never blocks a prompt.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `HERDR_HANDOFF_CONTEXT_THRESHOLD` | `0.50` | fraction of the window that triggers the instruction |
-| `HERDR_HANDOFF_CONTEXT_MAX_TOKENS` | `200000`, or `1000000` once usage exceeds 200000 | context window size; setting the variable disables the inference |
-| `HERDR_HANDOFF_AUTO` | unset | `0` disables the hook |
-
-The transcript does not name the context window, so the hook assumes 200000 tokens and
-switches to 1000000 once usage proves a 200000 window cannot be right. A 1M-token
-session below 200000 tokens is therefore measured against 200000 and is reminded
-early; set `HERDR_HANDOFF_CONTEXT_MAX_TOKENS=1000000` to measure it exactly.
-
-To opt in, run:
+A `settings.json` that still has the old entry keeps working: the command is a hidden no-op that reads and discards
+stdin, prints nothing and exits 0 for any arguments. Remove the entry with `herdr-eng handoff auto install` (or
+`uninstall`), which deletes only a command that carries the marker `herdr-handoff-auto` and `handoff context-hook`;
+a foreign hook, or a hand-edited entry with another command, stays. `herdr-eng handoff auto check` reports a still-installed
+one as `stale` with that command to run.
 
 ```bash
 herdr-eng handoff auto install     # idempotent; also: uninstall | check [--dry-run] [--json]
 herdr-eng handoff auto off|on [--pane ID]   # per-pane switch for automatic handoff (default pane: $HERDR_PANE_ID)
 ```
 
-`install` appends one `UserPromptSubmit` entry (plus the `SubagentStart` and `SubagentStop` entries described in the next section), each carrying the marker `herdr-handoff-auto`
-to `~/.claude/settings.json`, keeping every other hook and key, and writes atomically.
-An entry already present with that marker (even one you added by hand) is left as is
-(`unchanged`, or `preserved` if its command differs), so it never duplicates; the result has one item per event, and a settings file that only has the older `UserPromptSubmit` entry gets the two new ones added. If
-`settings.json` is not valid JSON the command reports `refused` and does not touch the
-file. `uninstall` removes only hooks carrying the marker. `check` reports `ok` or
-`missing` per event (exit 1 if any of the three is missing).
-
-Manual alternative: add this to `~/.claude/settings.json` yourself:
-
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "[ -x \"$HOME/.local/bin/herdr-eng\" ] && \"$HOME/.local/bin/herdr-eng\" handoff context-hook claude || true # herdr-handoff-auto"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+`install` appends the `SubagentStart` and `SubagentStop` entries described in the next section, each carrying the marker
+`herdr-handoff-auto`, to `~/.claude/settings.json`, keeping every other hook and key, and writes atomically after backing the
+file up to `~/.local/share/herdr-engineering/handoff/backups/` (`settings.json.bak` is the pristine copy and is never
+overwritten). An entry already present with that marker (even one you added by hand) is left as is (`unchanged`, or
+`preserved` if its command differs), so it never duplicates. If `settings.json` is not valid JSON the command reports
+`refused` and does not touch the file. `uninstall` removes only hooks carrying the marker. `check` reports `ok` or
+`missing` per event (exit 1 if either is missing, or the retired hook is still there). Nothing runs this migration by itself.
 
 ## Running-subagent registry
 
@@ -325,7 +288,7 @@ Without these flags the command behaves as described above.
 window tokens, percent, source, window source), or `{"unknown": true}` when it cannot be read; it always exits 0.
 `--harness NAME --session-id ID [--cwd DIR]` reads a named session's record directly, without Herdr.
 
-`herdr-eng handoff auto install` installs these two hooks together with the `UserPromptSubmit` one. Manual
+`herdr-eng handoff auto install` installs these two hooks. Manual
 alternative, merged into `~/.claude/settings.json`:
 
 ```json

@@ -77,4 +77,4 @@ working - report it, never `--allow-dirty-source` it away. Policy and opt-out:
 
 - Models: pass only what the user requested; opencode wants `provider/model`, and `herdr-handoff` drops a bare model for opencode with a note.
 - Automatic handoffs are installed by default (`scripts/install.sh` step 7e, after the workflow hooks in 7c): the Pi extension fires at `turn_end`, the Claude Code hooks at `Stop` and `PreCompact`, and all of them ask `herdr-eng handoff autopilot` what to do. Policy and opt-out: `docs/automatic-handoffs.md`; the check is `handoff-autopilot` in `herdr-eng doctor`.
-- `herdr-eng handoff context-hook claude` is the older, opt-in Claude `UserPromptSubmit` trigger. It is not installed by default; opt in as described in `docs/operations/handoff.md`.
+- Handing off because the context is large is the automatic handoff controller's job (`docs/operations/handoff.md`); use this skill when a person asks for a handoff.
