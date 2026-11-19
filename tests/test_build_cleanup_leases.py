@@ -33,10 +33,13 @@ def project(root: Path, name="project", age=48) -> Path:
     p = root / name
     p.mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(p)], check=True)
-    (p / "Cargo.toml").write_text('[package]\nname = "fixture"\nversion = "0.1.0"\n')
+    (p / "Cargo.toml").write_text('[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n')
+    (p / "src").mkdir()
+    (p / "src/main.rs").write_text("fn main() {}\n")
     t = p / "target"
     t.mkdir()
     (t / ".rustc_info.json").write_text("{}")
+    (t / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n# cargo cache dir tag\n")
     (t / "artifact").write_bytes(b"x" * 4096)
     stamp = time.time() - age * 3600
     for path in [*t.iterdir(), t]:
@@ -45,7 +48,7 @@ def project(root: Path, name="project", age=48) -> Path:
 
 
 def sweep(root, state, **kw):
-    return cleanup.run_once([root], state, **{**force(root), **kw})
+    return cleanup.run_once([root], state, **{**force(root), "processes": lambda: ([], []), **kw})
 
 
 def reasons(res):
@@ -175,7 +178,6 @@ _RACING_CHILD = """
 import json, os, sys, time
 import herdr_engineering.build_cleanup as c
 root, state, ready, go, high = sys.argv[1:6]
-c._SNAPSHOT_REUSE_SECONDS = 0.0
 original = c._untracked
 
 def paused(target):  # our own sync point: the first target is past its first checks, nothing is removed yet
@@ -186,7 +188,8 @@ def paused(target):  # our own sync point: the first target is past its first ch
     return original(target)
 
 c._untracked = paused
-print(json.dumps(c.run_once([root], state, high_water=float(high), low_water=0.0, min_age_hours=24)))
+print(json.dumps(c.run_once([root], state, high_water=float(high), low_water=0.0, min_age_hours=24,
+                              processes=lambda: ([], []))))
 """
 
 
@@ -234,59 +237,3 @@ def test_target_no_longer_recognized_is_never_removed(env, tmp_path):
     t = project(root)
     res = sweep_while_racing(root, state, tmp_path, lambda: (root / "project" / "Cargo.toml").unlink())
     assert t.exists() and res["removed"] == []
-
-
-def test_process_started_after_the_first_scan_keeps_an_unmanaged_target(env, tmp_path):
-    """The first process scan saw nothing; a real process then starts inside the target. The removal-moment
-    snapshot sees it and the target survives (the sweep child runs with the snapshot-reuse window at zero:
-    a snapshot younger than the window would stand)."""
-    root, state = env
-    t = project(root)
-    holder = []
-
-    def race():
-        holder.append(subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=t))
-
-    try:
-        res = sweep_while_racing(root, state, tmp_path, race)
-    finally:
-        for proc in holder:
-            proc.kill()
-            proc.wait()
-    assert t.exists()
-    assert reasons(res) == {"project": "active project"}
-
-
-def test_process_started_after_the_first_scan_keeps_a_managed_target_too(env, tmp_path):
-    """Cargo releases its locks while a test or run binary executes, so a managed target gets the same
-    removal-moment process look as an operator's. The sweep stops after its first scan; a process then
-    starts in the second target, which only the rescan right before its removal can still see."""
-    from herdr_engineering.cargo_target_storage import prepare_target
-    root, state = env
-    (root / "sccache").mkdir()
-    targets = []
-    for index, hours in enumerate((72, 48)):  # the oldest goes first
-        workspace = tmp_path / f"workspaces/w{index}"
-        workspace.mkdir(parents=True)
-        target = prepare_target(root / "sccache", workspace)
-        (target / "debug/.fingerprint").mkdir(parents=True)
-        (target / "debug/artifact").write_bytes(b"x" * 4096)
-        stamp = time.time() - hours * 3600
-        for path in [*target.rglob("*"), target]:
-            os.utime(path, (stamp, stamp), follow_symlinks=False)
-        targets.append(target)
-    first, second = targets
-    holder = []
-
-    def race():
-        holder.append(subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=second))
-
-    try:
-        res = sweep_while_racing(root, state, tmp_path, race)
-    finally:
-        for proc in holder:
-            proc.kill()
-            proc.wait()
-    assert (second / "debug/artifact").exists() and not (first / "debug/artifact").exists(), res
-    assert any(s["path"] == str(second) and s["reason"] == "active project" for s in res["skipped"]), res
-    assert res["process_scans"] >= 2, res  # the first scan, then one right before the first removal

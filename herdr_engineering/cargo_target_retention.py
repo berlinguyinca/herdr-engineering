@@ -14,14 +14,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from .cargo_target_migration import process_paths
-from .cargo_target_storage import (
-    TARGET_MARKER,
-    TOMBSTONE,
-    _owned_json,
-    claim_tombstone,
-    remove_tree,
-    target_directory,
-)
+from .cargo_target_storage import TARGET_MARKER, _owned_json, target_directory
 
 LOCK_NAMES = {".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"}
 GIB = 1024 ** 3
@@ -181,39 +174,9 @@ def _clean_profile(profile: Path, use_time: float, cutoff: float, limit: ScanLim
         os.close(profile_fd)
 
 
-def _collect_tombstone(path: Path, report: TierReport, deadline: float) -> bool:
-    """Finish a deletion a sweep started: claim the tombstone (an atomic rename, so a concurrent sweep
-    never deletes the same one) and delete it until ``deadline``. False when time ran out."""
-    claimed = claim_tombstone(path)
-    if claimed is None:
-        return True
-    try:
-        return remove_tree(claimed, deadline)
-    except OSError as error:
-        report.skip(f"{path.name}: {error}")
-        return True
-
-
 def sweep(cache: Path, state: Path, *, budget_bytes: int, min_idle_hours: float = 168,
           apply: bool = False, max_entries: int = 1_000_000, max_seconds: float = 20) -> TierReport:
-    """Try once without interrupting builds; reclaim only recognized profile contents.
-
-    Tombstones (targets a sweep emptied) are collected after the exclusive maintenance lock is released:
-    they are detached already, and a big delete must not hold up every wrapper build.
-    """
-    graves: list[Path] = []
-    report = _sweep_locked(cache, state, graves, budget_bytes=budget_bytes, min_idle_hours=min_idle_hours,
-                           apply=apply, max_entries=max_entries, max_seconds=max_seconds)
-    deadline = time.monotonic() + max_seconds
-    for grave in graves:
-        if time.monotonic() >= deadline or not _collect_tombstone(grave, report, deadline):
-            report.skip("tombstones left for the next run (time bound)")
-            break
-    return report
-
-
-def _sweep_locked(cache: Path, state: Path, graves: list[Path], *, budget_bytes: int,
-                  min_idle_hours: float, apply: bool, max_entries: int, max_seconds: float) -> TierReport:
+    """Try once without interrupting builds; reclaim only recognized profile contents."""
     report = TierReport(root=str(cache.parent / "targets"), budget_bytes=budget_bytes)
     if (budget_bytes <= 0 or min_idle_hours < 24 or max_seconds <= 0
             or not all(math.isfinite(value) for value in (min_idle_hours, max_seconds))):
@@ -240,12 +203,8 @@ def _sweep_locked(cache: Path, state: Path, graves: list[Path], *, budget_bytes:
         candidates: list[tuple[float, Path, float, Path]] = []
         # Complete inventory before any deletion: partial scans never evict.
         for target in sorted(_children(root, limit)):
-            if TOMBSTONE.fullmatch(target.name):
-                if apply and not target.is_symlink():
-                    graves.append(target)  # collected after the exclusive lock is released
+            if target.name.startswith("."):
                 continue
-            if target.name.startswith(".") or target.name.endswith(".lock"):
-                continue  # manager files are not targets
             try:
                 if target.stat().st_dev != root.stat().st_dev:
                     raise ValueError("target mount boundary")
