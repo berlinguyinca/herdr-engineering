@@ -110,7 +110,7 @@ def status(pane_id: str, env: Mapping[str, str], now: float | None = None) -> Su
         return SubagentStatus(known=False, live=0)
 
 
-def _wait_status(pane_id: str, env: Mapping[str, str], timeout_s: float, poll_s: float = 2.0) -> SubagentStatus:
+def wait_status(pane_id: str, env: Mapping[str, str], timeout_s: float, poll_s: float = 2.0) -> SubagentStatus:
     """The status that ended the wait: the idle one, or the last one seen when ``timeout_s`` ran out."""
     deadline = time.monotonic() + timeout_s
     while True:
@@ -126,7 +126,7 @@ def _wait_status(pane_id: str, env: Mapping[str, str], timeout_s: float, poll_s:
 def wait_until_idle(pane_id: str, env: Mapping[str, str], timeout_s: float, poll_s: float = 2.0) -> bool:
     """True when no live subagent remains before ``timeout_s``. An unknown pane (``known=False``) returns True at
     once: nothing is recorded to wait for, and the caller decides what "unknown" means."""
-    return _wait_status(pane_id, env, timeout_s, poll_s).live == 0
+    return wait_status(pane_id, env, timeout_s, poll_s).live == 0
 
 
 def purge_pane(pane_id: str, env: Mapping[str, str]) -> int:

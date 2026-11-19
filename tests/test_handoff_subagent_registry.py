@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -122,7 +123,7 @@ TEST_ROOT = Path(REPO) / ".herdr-test" / "subagents"
 
 
 @pytest.fixture
-def state_env() -> object:
+def state_env() -> Iterator[dict[str, str]]:
     shutil.rmtree(TEST_ROOT, ignore_errors=True)
     TEST_ROOT.mkdir(parents=True)
     yield {"HERDR_ENGINEERING_STATE": str(TEST_ROOT), "HERDR_PANE_ID": "%7"}
@@ -271,7 +272,7 @@ def test_wait_until_idle_survives_the_pane_dir_vanishing_mid_wait(state_env) -> 
 
 def test_wait_status_returns_the_last_status_seen_on_timeout(state_env) -> None:
     reg.record("start", _payload("a1"), state_env)
-    assert reg._wait_status("%7", state_env, timeout_s=0.2, poll_s=0.05) == reg.SubagentStatus(known=True, live=1)
+    assert reg.wait_status("%7", state_env, timeout_s=0.2, poll_s=0.05) == reg.SubagentStatus(known=True, live=1)
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")

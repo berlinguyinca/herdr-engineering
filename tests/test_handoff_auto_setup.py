@@ -173,7 +173,7 @@ TEST_HOME = Path(REPO) / ".herdr-test" / "home"
 @pytest.fixture
 def home():
     shutil.rmtree(TEST_HOME, ignore_errors=True)
-    TEST_HOME.mkdir(parents=True)
+    (TEST_HOME / ".claude").mkdir(parents=True)  # Claude Code is present on this host
     yield TEST_HOME
     shutil.rmtree(TEST_HOME, ignore_errors=True)
 
@@ -187,6 +187,34 @@ def test_install_subagent_hooks_writes_start_and_stop_only(home: Path) -> None:
     assert json.loads(settings_path(home).read_text()) == {}
 
 
+NO_CLAUDE_PATH = "/nonexistent-herdr-test-bin"
+
+
+def test_install_subagent_hooks_skips_and_writes_nothing_without_claude_code(tmp_path: Path) -> None:
+    items = auto_setup.install_subagent_hooks(tmp_path, path=NO_CLAUDE_PATH)
+    assert [i.action for i in items] == ["skipped"]
+    assert not (tmp_path / ".claude").exists()
+
+
+def test_install_subagent_hooks_installs_when_claude_is_on_path(tmp_path: Path) -> None:
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "claude"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    assert [i.action for i in auto_setup.install_subagent_hooks(home, path=str(bindir))] == ["installed", "installed"]
+
+
+@pytest.mark.parametrize("action", ["uninstall", "check"])
+def test_cli_subagents_only_is_an_argparse_error_for_other_actions(tmp_path: Path, action: str) -> None:
+    code = "import sys; from herdr_engineering import cli; sys.exit(cli.main(sys.argv[1:]))"
+    p = subprocess.run([sys.executable, "-c", code, "handoff", "auto", action, "--subagents-only", "--home", str(tmp_path)], cwd=REPO,
+                       env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "PYTHONPATH": REPO}, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 2 and "--subagents-only" in p.stderr
+
+
 def test_second_install_is_noop(home: Path) -> None:
     auto_setup.install_subagent_hooks(home)
     before = settings_path(home).read_bytes()
@@ -196,7 +224,7 @@ def test_second_install_is_noop(home: Path) -> None:
 
 def test_foreign_hooks_untouched(home: Path) -> None:
     other = {"matcher": "x", "hooks": [{"type": "command", "command": "echo hi"}]}
-    settings_path(home).parent.mkdir(parents=True)
+    settings_path(home).parent.mkdir(parents=True, exist_ok=True)
     settings_path(home).write_text(json.dumps({"model": "m", "hooks": {"SubagentStart": [other], "Stop": [other]}}, indent=2))
     auto_setup.install_subagent_hooks(home)
     data = json.loads(settings_path(home).read_text())
@@ -206,7 +234,7 @@ def test_foreign_hooks_untouched(home: Path) -> None:
 
 
 def test_invalid_json_not_rewritten(home: Path) -> None:
-    settings_path(home).parent.mkdir(parents=True)
+    settings_path(home).parent.mkdir(parents=True, exist_ok=True)
     raw = b'{"hooks": {oops'
     settings_path(home).write_bytes(raw)
     assert [i.action for i in auto_setup.install_subagent_hooks(home)] == ["refused"]

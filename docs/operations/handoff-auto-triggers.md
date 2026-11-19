@@ -38,7 +38,8 @@ Guidance if enabling any of them:
 `scripts/install.sh` step 7c2 adds the managed `SubagentStart` and `SubagentStop` hooks to `~/.claude/settings.json`
 (`herdr-eng handoff auto install --subagents-only`). They record running background agents per pane so the handoff drain
 knows whether to wait. Each command is guarded `[ -x ... ] && ... || true`, so a missing binary or any failure exits 0 and
-never disturbs a session. Opt out with `--no-subagent-hooks` or `HERDR_INSTALL_SUBAGENT_HOOKS=0`; remove them with
+never disturbs a session. The step is skipped, and `settings.json` is not created, on a host without Claude Code (no `claude`
+on `PATH` and no `~/.claude`), the same gate as the workflow hooks. Opt out with `--no-subagent-hooks` or `HERDR_INSTALL_SUBAGENT_HOOKS=0`; remove them with
 `herdr-eng handoff auto uninstall`. Foreign hooks are untouched. Only Claude Code emits these events.
 
 ### Live check

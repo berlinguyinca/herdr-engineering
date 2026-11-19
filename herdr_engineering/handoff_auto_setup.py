@@ -7,9 +7,11 @@ Unparseable or unexpectedly shaped settings are never overwritten: the result is
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 from .fabric_join_setup import FAIL_ACTIONS, Item, _home, _save_settings
+from .workflow_hooks import WorkflowInstaller
 
 HOOK_MARKER = "herdr-handoff-auto"
 HOOK_EVENT = "UserPromptSubmit"
@@ -106,8 +108,14 @@ def install(home: Path | None = None, *, dry_run: bool = False) -> list[Item]:
     return _install_events(HOOKS, home, dry_run)
 
 
-def install_subagent_hooks(home: Path | None = None, *, dry_run: bool = False) -> list[Item]:
-    """Install only ``SubagentStart`` / ``SubagentStop`` (the registry hooks the installer adds by default)."""
+def install_subagent_hooks(home: Path | None = None, *, dry_run: bool = False, path: str | None = None) -> list[Item]:
+    """Install only ``SubagentStart`` / ``SubagentStop`` (the registry hooks the installer adds by default).
+
+    Gated like the workflow hooks (``WorkflowInstaller._claude_present``: ``claude`` on ``path`` (default ``$PATH``) or ``~/.claude``
+    exists): without Claude Code a single ``skipped`` item is returned and nothing is written.
+    """
+    if not WorkflowInstaller(home, which=lambda name: shutil.which(name, path=path))._claude_present():
+        return [Item(str(_home(home) / SETTINGS_REL), "skipped", "Claude Code is not installed on this host")]
     return _install_events({e: HOOKS[e] for e in SUBAGENT_EVENTS}, home, dry_run)
 
 

@@ -8,6 +8,10 @@ pane off the one it runs in (``--no-focus``), starts interactive Claude there, s
 background agent that sleeps about 20 seconds, and polls ``herdr-eng handoff subagents --pane <id> --status --json``
 until ``live == 1`` and then until ``live == 0``. Every pane it opened is closed afterwards, even on failure. The
 pane's working directory is ``$HERDR_LIVE_CWD`` or the home directory; point it at a folder Claude already trusts.
+
+Side effects, stated up front: it reads the real ``~/.claude/settings.json`` (read only) and the real registry state
+directory (``$HERDR_ENGINEERING_STATE`` or ``~/.local/share/herdr-engineering/state``; it purges the entries of the panes
+it opened), creates one real Claude session and spends tokens on one prompt.
 """
 import json
 import os
@@ -37,9 +41,23 @@ _PROMPT = ("Run exactly one background agent (the Agent tool with run_in_backgro
            "`sleep 20` in the shell and then reply done. Do nothing else and start no other agent.")
 
 
+def _herdr_raw(*args: str) -> str:
+    return subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=120).stdout
+
+
 def _herdr(*args: str) -> dict:
-    out = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=120).stdout
+    out = _herdr_raw(*args)
     return json.loads(out) if out.strip().startswith("{") else {}
+
+
+def _registry_listing() -> str:
+    """The registry state directory contents, so a pane id mismatch between the hook and the split reply shows up."""
+    root = Path(os.environ.get("HERDR_ENGINEERING_STATE") or Path.home() / ".local/share/herdr-engineering/state") / "subagents"
+    try:
+        entries = sorted(str(path.relative_to(root)) for path in root.rglob("*"))
+    except OSError as error:
+        return f"{root}: unreadable ({error})"
+    return f"{root}: {entries}"
 
 
 def _wait(until: Callable[[], bool], timeout_s: float, step_s: float = 0.5) -> bool:
@@ -101,6 +119,8 @@ def opened(client: HerdrPaneClient) -> Iterator[list[str]]:
     try:
         yield panes
     finally:
+        for pane_id in panes:  # a reused pane id must not inherit this run's state
+            subprocess.run(["herdr-eng", "handoff", "subagents", "--pane", pane_id, "--purge"], capture_output=True, text=True, timeout=60)
         problems = [problem for pane_id in panes if (problem := _close(client, pane_id))]
         if problems:
             pytest.fail("pane(s) left open: " + "; ".join(problems), pytrace=False)
@@ -117,17 +137,23 @@ def _status(pane_id: str) -> dict:
 
 def test_a_real_background_agent_is_registered_then_released(client: HerdrPaneClient, opened: list[str]) -> None:
     cwd = os.environ.get("HERDR_LIVE_CWD") or str(Path.home())
-    split = _herdr("pane", "split", os.environ["HERDR_PANE_ID"], "--direction", "down", "--no-focus", "--cwd", cwd)
-    pane_id = split["result"]["pane"]["pane_id"]
+    before = {pane.get("pane_id") for pane in client.list_panes()}
+    raw_split = _herdr_raw("pane", "split", os.environ["HERDR_PANE_ID"], "--direction", "down", "--no-focus", "--cwd", cwd)
+    try:
+        pane_id = json.loads(raw_split)["result"]["pane"]["pane_id"]
+    except (ValueError, KeyError, TypeError):
+        pane_id = None
+    if not isinstance(pane_id, str) or not pane_id:
+        opened.extend(str(p) for p in {pane.get("pane_id") for pane in client.list_panes()} - before if p)  # whatever the split did open
+        pytest.fail(f"the split reply carried no pane id; raw reply: {raw_split!r}", pytrace=False)
     opened.append(pane_id)
     adapter = adapter_for(Harness.CLAUDE)
 
-    def start() -> bool:  # the pane's shell may still be starting
-        run = subprocess.run(["herdr", "agent", "start", "probe", "--kind", "claude", "--pane", pane_id,
+    # Start Claude exactly once; a retry could launch a second Claude in the same pane. Readiness is waited for below.
+    started = subprocess.run(["herdr", "agent", "start", "probe", "--kind", "claude", "--pane", pane_id,
                               "--timeout", "60000"], capture_output=True, text=True, timeout=120)
-        return run.returncode == 0 and '"error"' not in run.stdout
-
-    _wait(start, 30.0, step_s=1.0)
+    assert started.returncode == 0 and '"error"' not in started.stdout, \
+        f"herdr agent start failed (exit {started.returncode}): {(started.stdout + started.stderr).strip()[:300]}"
 
     def screen() -> str:
         return strip_ansi(client.read_visible(pane_id))
@@ -149,6 +175,6 @@ def test_a_real_background_agent_is_registered_then_released(client: HerdrPaneCl
             return seen[-1].get("live") == count
         return check
 
-    assert _wait(live_is(1), _APPEAR_TIMEOUT_S), f"no live subagent registered; last status {seen[-1:]}:\n{screen()[-1500:]}"
-    assert _wait(live_is(0), _FINISH_TIMEOUT_S), f"the subagent was never released; last status {seen[-1:]}:\n{screen()[-1500:]}"
+    assert _wait(live_is(1), _APPEAR_TIMEOUT_S), f"no live subagent registered; last status {seen[-1:]}; registry {_registry_listing()} (pane {pane_id}):\n{screen()[-1500:]}"
+    assert _wait(live_is(0), _FINISH_TIMEOUT_S), f"the subagent was never released; last status {seen[-1:]}; registry {_registry_listing()} (pane {pane_id}):\n{screen()[-1500:]}"
     assert seen[-1] == {"known": True, "live": 0}, f"released but not known; last status {seen[-1]}"
