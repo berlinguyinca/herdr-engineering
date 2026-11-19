@@ -232,9 +232,14 @@ def test_a_real_cargo_build_into_a_target_keeps_that_target_only(root, how):
     other = local_target(root, "other")  # idle and unrelated: cleaned while the build runs
     build = _slow_build(crate(root.parent / "workspaces/slow", 25), busy, how)
     try:
-        _age(busy, 48)
-        held = sweep(root)
-        assert held["removed"] == [str(other)] and busy.exists(), held
+        for _ in range(40):  # the running build may still be writing: that is "recent activity", try again
+            _age(busy, 48)
+            held = sweep(root)
+            if held["blocked"] or busy.exists() is False:
+                break
+            time.sleep(0.25)
+        assert held["removed"] in ([str(other)], []) and busy.exists(), held
+        assert held["blocked"], held
         reason = next(item["reason"] for item in held["skipped"] if item["path"] == str(busy))
         assert reason.startswith("cargo (pid ") and ("builds into" in reason or "uses" in reason), reason
         assert held["blocked"] == [{"path": str(busy), "reason": reason}]
@@ -581,3 +586,144 @@ def test_pressure_cleans_the_idle_set_and_still_refuses_when_that_is_not_enough(
     idle = local_target(root, hours=5)
     decision = disk_guard.check_build_allowed(root, _policy(root), tmp_path / "gstate", env={})
     assert not decision.allowed and decision.cleanup_ran and not idle.exists()
+
+
+# --- round 12: identity, not spelling; one bad leftover; ownership outside the deleted tree ---------------
+
+def _case_insensitive(directory: Path) -> bool:
+    probe = directory / "CaseProbe"
+    probe.mkdir()
+    return (directory / "caseprobe").exists()
+
+
+@pytest.mark.integration
+def test_a_root_spelled_in_another_case_still_sees_the_process_using_its_target(tmp_path):
+    """On a case-insensitive disk ``~/work`` and ``~/Work`` are one folder; lsof reports the on-disk spelling."""
+    if not _case_insensitive(tmp_path):
+        pytest.skip("needs a case-insensitive filesystem")
+    real = Path(os.path.realpath(tmp_path)) / "Work"
+    real.mkdir()
+    target = local_target(real, "app")
+    proc = _program(target / "debug/deps", "napper", cwd=target.parent)
+    _age(target, 48)
+    try:
+        result = sweep(real.parent / "work")  # the root as the operator typed it
+        assert result["removed"] == [] and target.exists(), result
+        assert result["blocked"] and "napper" in result["blocked"][0]["reason"], result
+    finally:
+        _stop(proc)
+
+
+def test_a_process_path_through_a_symlink_is_the_same_directory(root, tmp_path):
+    """The busy check compares what the paths are (device and inode), never how they are spelled."""
+    target = local_target(root)
+    alias = tmp_path / "alias"
+    alias.symlink_to(target.parent, target_is_directory=True)
+    holds = [(4242, "napper", "uses", alias / "target/debug/deps/napper")]
+    assert cleanup._busy_reason(holds, target) is not None
+    assert cleanup._busy_reason([(4242, "napper", "uses", tmp_path / "elsewhere/bin")], target) is None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_a_trash_leftover_that_cannot_be_deleted_only_skips_itself(root):
+    orphan, workspace = managed_target(root, "orphan", hours=0.01)
+    shutil.rmtree(workspace)
+    stuck = orphan.parent / ".trash-old-123"
+    (stuck / "debug/readonly").mkdir(parents=True)
+    (stuck / "debug/readonly/file").write_bytes(b"x")
+    (stuck / "debug/readonly").chmod(0o500)  # rmtree cannot empty it
+    try:
+        result = sweep(root)
+        assert result["removed"] == [str(orphan)] and not orphan.exists(), result  # the rest still gets cleaned
+        assert [item for item in result["skipped"] if item["path"] == str(stuck)], result
+        assert not any("skipped root" in warning for warning in result["warnings"]), result
+    finally:
+        (stuck / "debug/readonly").chmod(0o700)
+
+
+def test_a_managed_target_without_its_marker_is_still_owned_and_prepares_again(root):
+    target, workspace = managed_target(root, "markerless")
+    (target / TARGET_MARKER).unlink()  # what a killed ``cargo clean`` can leave
+    assert cleanup._managed_workspace(target) == workspace.resolve()
+    assert prepare_target(root / "sccache", workspace) == target
+    assert (target / TARGET_MARKER).is_file()
+    _build(workspace, target)  # and the next build works
+
+
+def test_a_directory_nobody_owns_is_still_refused(root):
+    workspace = crate(root.parent / "workspaces/stranger")
+    (root / "sccache").mkdir(exist_ok=True)
+    stranger = prepare_target(root / "sccache", workspace)
+    (stranger / TARGET_MARKER).unlink()
+    for record in (stranger.parent / ".owners").glob("*"):
+        record.unlink()
+    (stranger / "file").write_text("not ours")
+    with pytest.raises(ValueError, match="no ownership marker"):
+        prepare_target(root / "sccache", workspace)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_a_clean_killed_in_the_middle_leaves_a_target_the_next_build_can_use(root):
+    target, workspace = managed_target(root, "killed")
+    for index in range(80):
+        directory = target / ("a", "m", "z")[index % 3] / f"d{index}"
+        directory.mkdir(parents=True)
+        for number in range(200):
+            (directory / f"f{number}").write_bytes(b"x")
+    marker = target / TARGET_MARKER
+    pid = os.fork()
+    if pid == 0:
+        os.setsid()  # the sweep and its cargo share one group, so one SIGKILL stops both
+        cleanup._cargo_clean(target)
+        os._exit(0)
+    try:
+        _wait_for(lambda: not marker.exists() or sum(1 for _ in target.iterdir()) < 5, "cargo to start deleting")
+    finally:
+        os.killpg(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    assert prepare_target(root / "sccache", workspace) == target
+    assert marker.is_file()
+    _build(workspace, target)
+
+
+def _shared_build_dir(workspace: Path, shared: Path) -> None:
+    (workspace / ".cargo").mkdir()
+    (workspace / ".cargo/config.toml").write_text(f'[build]\nbuild-dir = "{shared}"\n')
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("how", ["config", "env"])
+def test_cleaning_one_target_never_deletes_a_shared_build_dir(root, tmp_path, monkeypatch, how):
+    shared = tmp_path / "shared-build-dir"
+    first = local_target(root, "first", hours=0.01)
+    other_ws = crate(root / "other")
+    if how == "env":
+        monkeypatch.setenv("CARGO_BUILD_BUILD_DIR", str(shared))
+    else:
+        _shared_build_dir(first.parent, shared)
+        _shared_build_dir(other_ws, shared)
+    _build(first.parent, first)
+    _build(other_ws, other_ws / "target")  # the other workspace's intermediates live in the shared dir
+    assert any(shared.rglob("*")), "cargo did not use the shared build-dir; this cargo is too old for the test"
+    survivors = sorted(path.relative_to(shared) for path in shared.rglob("*"))
+    _age(first, 48)
+    result = sweep(root, min_age_hours=24)
+    assert str(first) in result["removed"], result
+    assert sorted(path.relative_to(shared) for path in shared.rglob("*")) == survivors
+
+
+@pytest.mark.integration
+def test_an_orphan_that_a_live_cargo_builds_into_is_kept(root):
+    """The worktree was moved, not deleted: a cargo still told to build into the old managed target."""
+    target, workspace = managed_target(root, "moved", hours=0.01)
+    moved = workspace.parent / "moved-away"
+    workspace.rename(moved)
+    build = _slow_build(crate(root.parent / "workspaces/runner", 25), target)
+    try:
+        result = sweep(root)
+        assert result["removed"] == [] and target.exists(), result
+        assert result["blocked"] and result["blocked"][0]["reason"].startswith("cargo (pid "), result
+    finally:
+        _stop(build)
+    assert sweep(root)["removed"] == [str(target)]  # nothing uses it any more: now it is an orphan to remove

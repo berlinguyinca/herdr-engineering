@@ -86,9 +86,11 @@ The default-on job is narrow. It deletes exactly two kinds of target and nothing
 
 1. **Orphaned targets.** A Herdr-managed target (`<root>/targets/<label>-<id>`) whose owning worktree path no longer
    exists: `lstat` of the workspace must raise "not found" and its parent directory must be listable. Any other error
-   (permission denied, a missing volume) is not an orphan. Nothing can be building into it. The decision is made
-   again under the manager lock, then the directory is renamed to `targets/.trash-<name>-<pid>` and deleted after the
-   lock is released; a later run removes any `.trash-*` leftover of an interrupted delete.
+   (permission denied, a missing volume) is not an orphan. A worktree that was moved rather than deleted may still
+   have a build running, so an orphan gets the same per-target process scan as an idle target and stays while a process
+   uses it or is told to build into it. The decision is made again under the manager lock, then the directory is renamed to `targets/.trash-<name>-<pid>` and deleted after the
+   lock is released; a later run removes any `.trash-*` leftover of an interrupted delete. A leftover that cannot be
+   deleted is named in `skipped` and the rest of the root keeps sweeping.
 2. **Idle targets with a workspace**, past the idle floor (`min_age_hours`, or `pressure_min_age_hours` at or above
    `pressure_percent`), and only while no process of this user is using that target or its workspace W: a process
    whose cwd, executable, open file or (Linux) memory mapping is under the target or W, or a cargo-family process
@@ -101,6 +103,14 @@ The default-on job is narrow. It deletes exactly two kinds of target and nothing
    `CACHEDIR.TAG` are put back in a `finally`, however `cargo clean` ends (even a timeout), so a workspace
    `./target` alias never dangles. `prepare_target` writes the tag for new and existing managed targets, since newer
    cargo refuses to clean a directory without one.
+   Paths are compared by identity, never by spelling: the busy check stats each process path and its ancestors and
+   compares (device, inode) with the target and the workspace, so a root typed as `~/work` for `~/Work`, a symlink
+   or a bind mount still matches. Ownership is also recorded outside the target, in
+   `targets/.owners/<name>.json` (written by `prepare_target`, backfilled for older targets), so a `cargo clean`
+   killed by SIGKILL after it removed the marker leaves a directory the manager still owns: the next
+   `prepare_target` re-creates the marker. A directory with neither marker nor record is still refused.
+   `cargo clean` runs with `--config build.build-dir=<target>` and without `CARGO_BUILD_BUILD_DIR`, so a shared
+   `build.build-dir` of other workspaces is never deleted.
 
 Everything else is left alone: targets a lease covers, targets with files tracked by git or anything foreign inside
 (links, special files, other owners), and cache-only directories without a workspace to clean through (the old

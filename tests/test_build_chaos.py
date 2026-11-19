@@ -208,12 +208,6 @@ def _cargo_project(root: Path, name="project", age_h=48) -> Path:
     return t
 
 
-@pytest.fixture(autouse=True)
-def _no_proc_scan(monkeypatch):
-    # Same neutralisation as test_build_cleanup*.py: only registry/lock guards decide here.
-    monkeypatch.setattr(cleanup, "_process_paths", lambda: [])
-
-
 def _wait_for(cond, timeout=15.0, step=0.05):
     end = time.monotonic() + timeout
     while time.monotonic() < end:

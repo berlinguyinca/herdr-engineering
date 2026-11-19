@@ -6,8 +6,9 @@ never a running build, so the disk guard can sweep from inside ``build-coordinat
 
 What a sweep deletes, and nothing else:
 
-1. An orphaned target: a Herdr-managed target whose owning worktree path no longer exists. Nothing can be
-   building into it. The decision is made again under the manager lock, so a worktree recreated at the
+1. An orphaned target: a Herdr-managed target whose owning worktree path no longer exists and which no
+   process uses or is told to build into (the same per-target scan as for an idle target: a worktree that
+   was moved, not deleted, may still have a build running). The decision is made again under the manager lock, so a worktree recreated at the
    same path is prepared afresh by the build and never loses its target. Only a not-found workspace whose
    parent lists counts; the target is renamed to ``.trash-*`` and deleted after the lock is released.
 2. An idle target (no change for the idle floor, 24 h, or ``pressure_min_age_hours`` under pressure) whose
@@ -15,7 +16,8 @@ What a sweep deletes, and nothing else:
    executable, an open file or (Linux) a mapping is under either, or it is cargo-family with
    ``CARGO_TARGET_DIR`` or ``--target-dir`` naming the target. The scan is taken fresh right before each
    clean and fails closed. The delete is ``cargo clean --target-dir <dir>`` run for the workspace's
-   manifest, so Cargo does its own locking.
+   manifest, with ``build.build-dir`` pinned to the target (a shared build-dir is never deleted), so Cargo does
+its own locking. Busy checks compare (device, inode), never path spelling.
 
 Targets are skipped when a build lease covers them, when git tracks files in them, or when anything inside
 looks foreign (links, special files, other owners). Only current-user Cargo ``target`` directories inside
@@ -43,7 +45,13 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .cargo_target_storage import TARGET_MARKER, _manager_lock, write_cachedir_tag
+from .cargo_target_storage import (
+    TARGET_MARKER,
+    _manager_lock,
+    owner_record,
+    read_owner,
+    write_cachedir_tag,
+)
 from .disk_guard import measure
 
 log = logging.getLogger(__name__)
@@ -330,6 +338,8 @@ def _discover(root: Path, managed: bool = True, unreadable: list[str] | None = N
                     if trash is not None:
                         trash.append(path)
                     continue
+                if managed_dir and entry.name == ".owners":
+                    continue  # the manager's ownership records, not a target
                 if managed_dir and _managed_workspace(path) is not None:
                     if _cargo_markers(path):
                         found.append(path)
@@ -367,14 +377,18 @@ def _cache_only_target(target: Path) -> bool:
 
 def _managed_workspace(path: Path) -> Path | None:
     """Workspace of a per-worktree managed target (``targets/<label>-<id>``), proven by the manager's
-    root marker and the target's own marker."""
+    root marker and the target's own marker, or, when a killed ``cargo clean`` took the marker, the
+    manager's ownership record kept outside the target."""
     try:
         root_marker, marker = path.parent / ".herdr-target-root.json", path / TARGET_MARKER
-        if root_marker.is_symlink() or marker.is_symlink() or not root_marker.is_file() or not marker.is_file():
+        if root_marker.is_symlink() or marker.is_symlink() or not root_marker.is_file():
             return None
         if json.loads(root_marker.read_text()).get("owner_uid") != os.getuid():
             return None
-        data = json.loads(marker.read_text())
+        if marker.is_file():
+            data = json.loads(marker.read_text())
+        else:
+            data = read_owner(path.parent, path.name) or {}
         if data.get("owner_uid") != os.getuid() or not isinstance(data.get("workspace"), str):
             return None
         return Path(data["workspace"])
@@ -390,15 +404,40 @@ def _project(target: Path) -> Path:
 _CLEAN_SECONDS = 900  # one ``cargo clean`` may take this long
 
 
+def _chain(path: Path) -> set[tuple[int, int]]:
+    """(device, inode) of ``path`` and of every ancestor that exists. Two spellings of one directory (case,
+    symlinks, bind mounts) give the same identity, which a string comparison would miss."""
+    found: set[tuple[int, int]] = set()
+    for item in (path, *path.parents):
+        try:
+            info = os.stat(item)
+        except OSError:
+            continue
+        found.add((info.st_dev, info.st_ino))
+    return found
+
+
+def _identity(path: Path) -> tuple[int, int] | None:
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
 def _busy_reason(holds: list[Hold], target: Path) -> str | None:
     """Why ``target`` must not be cleaned right now, or None. Busy: a process of this user has its cwd,
     executable, an open file or a mapping inside the target or its workspace, or a cargo-family process
-    was told to build into the target. Processes elsewhere on the host do not matter."""
-    workspace = _project(target)
+    was told to build into the target. Paths are compared by identity (device and inode of the path and
+    its ancestors), never by spelling. Processes elsewhere on the host do not matter."""
+    mine = {ident for ident in (_identity(target), _identity(_project(target))) if ident}
+    target_id = _identity(target)
+    target_chain = _chain(target)
     for pid, name, how, path in holds:
-        if how == "uses" and (path.is_relative_to(target) or path.is_relative_to(workspace)):
+        chain = _chain(path)
+        if how == "uses" and chain & mine:
             return f"{name} (pid {pid}) uses {path}"
-        if how == "builds into" and (path.is_relative_to(target) or target.is_relative_to(path)):
+        if how == "builds into" and ((target_id and target_id in chain) or (_identity(path) in target_chain)):
             return f"{name} (pid {pid}) builds into {path}"
     return None
 
@@ -442,6 +481,7 @@ def _remove_orphan(target: Path) -> bool:
         if os.path.lexists(trash):
             shutil.rmtree(trash)
         os.rename(target, trash)
+        owner_record(target.parent, target.name).unlink(missing_ok=True)
     shutil.rmtree(trash)
     return True
 
@@ -460,9 +500,11 @@ def _cargo_clean(target: Path, timeout: float = _CLEAN_SECONDS) -> str | None:
         proxy = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo") / "bin/cargo"
         cargo = proxy if proxy.is_file() and os.access(proxy, os.X_OK) else resolve_real_cargo(Path.home())
         env = {**os.environ, "CARGO_NET_OFFLINE": "true", "RUSTUP_AUTO_INSTALL": "0"}
-        for key in ("RUSTC_WRAPPER", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
+        for key in ("RUSTC_WRAPPER", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"):
             env.pop(key, None)
-        argv = [str(cargo), "clean", "--manifest-path", str(manifest), "--target-dir", str(target)]
+        # build-dir is pinned to the target too: a shared build-dir (config or environment) is never deleted
+        argv = [str(cargo), "clean", "--manifest-path", str(manifest), "--target-dir", str(target),
+                "--config", f"build.build-dir={json.dumps(str(target))}"]
         if managed is None:
             done = subprocess.run(argv, cwd=workspace, env=env, capture_output=True, text=True,
                                   timeout=timeout, check=False)
@@ -701,7 +743,10 @@ def _candidates(roots, state_dir, result, high_water, min_age_hours, pressure_wa
             trash: list[Path] = []
             targets = _discover(root, unreadable=unreadable, trash=trash)
             for leftover in trash if not result["dry_run"] else []:
-                shutil.rmtree(leftover)  # nothing can be using it: it was renamed out of reach
+                try:
+                    shutil.rmtree(leftover)  # nothing can be using it: it was renamed out of reach
+                except OSError as exc:  # one stuck leftover skips itself; the rest of the root still sweeps
+                    result["skipped"].append({"path": str(leftover), "reason": f"cannot delete: {exc}"})
             for name in unreadable[:5]:
                 _skip_root(result, Path(name), "unreadable directory skipped")
         except OSError as exc:
@@ -748,6 +793,8 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
                 continue
             before = shutil.disk_usage(root).free
             if _orphaned(target):
+                if _blocked_by_process(target, name, result):
+                    continue  # moved, not deleted: something still builds into it
                 if result["dry_run"]:
                     result["would_remove"].append(name)
                     continue
@@ -765,6 +812,29 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
         result["removed"].append(name)
 
 
+def _blocked_by_process(target: Path, name: str, result: dict) -> bool:
+    """A fresh process scan right before deleting ``target`` (idle or orphan): True when it must stay, with
+    the reason in ``skipped`` and ``blocked``. A scan that cannot be read fails closed."""
+    result["process_scans"] += 1
+    busy = None
+    for attempt in range(6):  # a process mid-exec is unreadable for a moment
+        try:
+            busy = _busy_reason(_scan(), target)
+            break
+        except (OSError, ValueError) as exc:  # still unreadable after retries: fail closed, this target stays
+            busy = f"process list unreadable: {exc}"
+            if attempt < 5:
+                time.sleep(0.25)
+    if busy is None:
+        return False
+    if busy.startswith("process list unreadable"):
+        result["errors"].append(busy)
+        result["aborted"] = True
+    result["blocked"].append({"path": name, "reason": busy})
+    result["skipped"].append({"path": name, "reason": busy})
+    return True
+
+
 def _clean_idle(target: Path, name: str, cutoff: float, state_dir: Path, result: dict) -> bool:
     """Clean one idle target through cargo; True when it went. Otherwise the reason is in ``skipped``."""
     def skip(reason: str) -> bool:
@@ -780,22 +850,8 @@ def _clean_idle(target: Path, name: str, cutoff: float, state_dir: Path, result:
         raise OSError(f"Target no longer recognized as a Cargo output: {name}")
     if _skip_for_registry(state_dir, target, name, result):  # read last: a lease taken meanwhile still counts
         return False
-    result["process_scans"] += 1
-    busy = None
-    for attempt in range(6):  # a fresh look right before this clean; a process mid-exec is unreadable for a moment
-        try:
-            busy = _busy_reason(_scan(), target)
-            break
-        except (OSError, ValueError) as exc:  # still unreadable after retries: fail closed, this target stays
-            busy = f"process list unreadable: {exc}"
-            if attempt < 5:
-                time.sleep(0.25)
-    if busy is not None and busy.startswith("process list unreadable"):
-        result["errors"].append(busy)
-        result["aborted"] = True
-    if busy is not None:
-        result["blocked"].append({"path": name, "reason": busy})
-        return skip(busy)
+    if _blocked_by_process(target, name, result):
+        return False
     if result["dry_run"]:
         result["would_remove"].append(name)
         return False

@@ -166,20 +166,20 @@ def test_no_registry_file_is_legacy_behavior(env):
 
 
 _RACING_CHILD = """
-import json, os, sys, time
+import json, sys
 import herdr_engineering.build_cleanup as c
-root, state, ready, go, high = sys.argv[1:6]
-original = c._untracked
-
-def paused(target):  # our own sync point: the first target is past its first checks, nothing is removed yet
-    if not os.path.exists(ready):
-        open(ready, "w").close()
-        while not os.path.exists(go):
-            time.sleep(0.02)
-    return original(target)
-
-c._untracked = paused
+root, state, high = sys.argv[1:4]
 print(json.dumps(c.run_once([root], state, high_water=float(high), low_water=0.0, min_age_hours=24)))
+"""
+
+# A ``git`` first on the sweep's PATH: its first call (the sweep's check that the target is untracked) waits
+# for our signal and then runs the real git. The sweep is real and unmodified; only the wait is ours.
+_GIT_GATE = """#!/bin/sh
+if [ ! -e "{ready}" ]; then
+  : > "{ready}"
+  while [ ! -e "{go}" ]; do sleep 0.02; done
+fi
+exec "{git}" "$@"
 """
 
 
@@ -188,9 +188,15 @@ def sweep_while_racing(root, state, tmp_path, race):
     checks and its removal. The sweep stops at a sync point of ours (not inside a timeout-bounded
     subprocess) and goes on when ``race`` has run; every wait is for a signal, never for a fixed time."""
     import json
+    import shutil
     ready, go = tmp_path / "ready", tmp_path / "go"
-    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
-    child = subprocess.Popen([sys.executable, "-c", _RACING_CHILD, str(root), str(state), str(ready), str(go),
+    shim = tmp_path / "gate-bin"
+    shim.mkdir()
+    (shim / "git").write_text(_GIT_GATE.format(ready=ready, go=go, git=shutil.which("git")))
+    (shim / "git").chmod(0o755)
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+           "PATH": f"{shim}{os.pathsep}{os.environ['PATH']}"}
+    child = subprocess.Popen([sys.executable, "-c", _RACING_CHILD, str(root), str(state),
                               str(force(root)["high_water"])], env=env, stdout=subprocess.PIPE, text=True)
     try:
         deadline = time.monotonic() + 300

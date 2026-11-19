@@ -838,12 +838,13 @@ def test_a_failed_sweep_backs_off_briefly_and_says_why(root, state_env):
     assert cache.exists()
 
 
-def test_a_refusal_names_why_the_last_cleanup_could_not_run(root, monkeypatch):
+def test_a_refusal_names_why_the_last_cleanup_could_not_run(root):
     cache = make_target(root, age_hours=48)
     state = cache / "state"
-    monkeypatch.setattr(disk_guard, "measure", lambda path: (99.0, 1.0))
-    monkeypatch.setattr(cleanup, "_usage", lambda path: 99.0)  # a tmpfs root can really sit at 0%
-    decision = disk_guard.check_build_allowed(root, _policy(root, high_water=1), state, env={})
+    used, _ = disk_guard.measure(root)  # thresholds placed relative to what this disk really shows
+    policy = _policy(root, high_water=max(0.0, used - 1), refuse_builds_percent=max(0.0, used - 1),
+                     refuse_builds_min_free_gib=1e12)
+    decision = disk_guard.check_build_allowed(root, policy, state, env={})
     assert not decision.allowed and "could not run: Maintenance state is inside cleanup target" in decision.message
 
 

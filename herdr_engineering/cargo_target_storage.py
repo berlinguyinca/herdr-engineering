@@ -26,6 +26,28 @@ def _owned_json(path: Path) -> dict[str, object] | None:
         return None
 
 
+def owner_record(root: Path, name: str) -> Path:
+    """The ownership record of managed target ``name``, kept beside the targets, never inside one: a
+    ``cargo clean`` (or a kill in its middle) cannot take it away."""
+    return root / ".owners" / f"{name}.json"
+
+
+def read_owner(root: Path, name: str) -> dict[str, object] | None:
+    return _owned_json(owner_record(root, name))
+
+
+def _write_owner(root: Path, name: str, payload: dict[str, object]) -> None:
+    record = owner_record(root, name)
+    record.parent.mkdir(exist_ok=True, mode=0o700)
+    temporary = record.with_name(f".{name}.{os.getpid()}.tmp")
+    with open(temporary, "w") as output:
+        json.dump(payload, output, sort_keys=True)
+        output.write("\n")
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, record)
+
+
 def _alias_record(state: Path, workspace: Path) -> Path:
     key = hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
     return state / "target-aliases" / f"{key}.json"
@@ -270,9 +292,12 @@ def prepare_target(cache: Path, workspace: Path) -> Path:
             if marker.is_symlink() or json.loads(marker.read_text()) != expected:
                 raise ValueError("Target directory belongs to a different workspace")
         else:
-            if any(target.iterdir()):
+            # a directory a killed ``cargo clean`` left without its marker is still ours when the record says so
+            if any(target.iterdir()) and read_owner(root, target.name) != expected:
                 raise ValueError("Existing target directory has no ownership marker")
             _write_marker(marker, expected)
+        if read_owner(root, target.name) != expected:
+            _write_owner(root, target.name, expected)
         write_cachedir_tag(target)  # new targets get one, and ones made before this existed are backfilled
         os.utime(marker, None, follow_symlinks=False)
     return target
