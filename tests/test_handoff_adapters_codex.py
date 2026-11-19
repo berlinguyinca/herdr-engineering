@@ -1,12 +1,19 @@
 """Codex adapter, against real (redacted) rollout lines laid out as Codex lays them out (sessions/Y/M/D)."""
 import json
+import os
 import shutil
+import time
 from pathlib import Path
 
 import pytest
 
 from herdr_engineering.handoff_adapters.base import ExitPlan, Harness, SessionRef, TypedInput
-from herdr_engineering.handoff_adapters.codex import PROMPT_MARKER, CodexAdapter
+from herdr_engineering.handoff_adapters.codex import (
+    PROMPT_MARKER,
+    CodexAdapter,
+    parse_ps_start,
+    select_rollout,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "handoff_adapters" / "codex"
 SESSION = "01a1d6df-7c12-7671-bbf8-7c2d51d1a84b"
@@ -205,3 +212,51 @@ def test_screen_after_a_turn_with_typed_text_is_not_ready():
 @pytest.mark.parametrize("status", ["working", "blocked", "unknown"])
 def test_screen_after_a_turn_is_not_ready_while_the_harness_is_busy(status):
     assert not CodexAdapter().is_ready_for_input(AFTER_TURN_EMPTY, status)
+
+
+# Rollout selection when Herdr reports no session id. Fixtures are real session_meta lines (redacted): the first record
+# of a rollout carries the session cwd and its start time.
+START = 1_795_047_167.0  # 2026-11-19T00:12:47Z, the pane process's start (whole seconds)
+
+
+def _rollout(home: Path, fixture: str, session: str, mtime: float = START + 30) -> Path:
+    path = _install(home, fixture, session, "2026/11/19")
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_one_rollout_in_the_pane_cwd_started_after_the_process_is_selected(tmp_path):
+    wanted = _rollout(tmp_path, "session_meta_work.jsonl", SESSION)
+    _rollout(tmp_path, "session_meta_other_cwd.jsonl", OTHER)
+    assert select_rollout(Path("/work"), START, [], tmp_path) == wanted
+
+
+def test_no_rollout_for_the_cwd_means_none(tmp_path):
+    _rollout(tmp_path, "session_meta_other_cwd.jsonl", OTHER)
+    assert select_rollout(Path("/work"), START, [], tmp_path) is None
+    assert select_rollout(Path("/work"), START, [], tmp_path / "empty") is None
+
+
+def test_two_candidates_in_one_cwd_mean_none_not_the_newest(tmp_path):
+    _rollout(tmp_path, "session_meta_work.jsonl", SESSION)
+    _rollout(tmp_path, "session_meta_work.jsonl", OTHER, mtime=START + 90)
+    assert select_rollout(Path("/work"), START, [], tmp_path) is None
+
+
+def test_a_rollout_started_before_the_process_is_ignored(tmp_path):
+    _rollout(tmp_path, "session_meta_before_start.jsonl", OTHER, mtime=START + 30)
+    assert select_rollout(Path("/work"), START, [], tmp_path) is None
+    wanted = _rollout(tmp_path, "session_meta_work.jsonl", SESSION)
+    assert select_rollout(Path("/work"), START, [], tmp_path) == wanted
+
+
+def test_an_open_rollout_wins_over_two_cwd_candidates(tmp_path):
+    held = _rollout(tmp_path, "session_meta_work.jsonl", SESSION)
+    _rollout(tmp_path, "session_meta_work.jsonl", OTHER)
+    unrelated = tmp_path / ".codex" / "state_5.sqlite"
+    assert select_rollout(Path("/work"), START, [unrelated, held], tmp_path) == held
+
+
+def test_process_start_is_read_from_ps_lstart_text():
+    assert parse_ps_start("Wed Nov 18 16:12:47 2026") == time.mktime((2026, 11, 18, 16, 12, 47, 0, 0, -1))
+    assert parse_ps_start("garbage") is None

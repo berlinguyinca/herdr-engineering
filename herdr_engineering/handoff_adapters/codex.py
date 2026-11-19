@@ -1,6 +1,11 @@
 """Codex adapter: context from the session rollout, drain and exit by typing into the pane."""
+import json
+import re
+import shutil
+import subprocess
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 
 from .base import ContextReading, ExitPlan, Harness, SessionRef, TypedInput
@@ -12,6 +17,75 @@ from .windows import lookup_window
 PROMPT_MARKER = "›"  # the Codex composer row, faint "Ask Codex to do anything" after it when empty; live pane, 0.169.0, 2026-11-18
 _READY_STATUSES = frozenset({"idle", "done"})
 _LINES_BELOW_PROMPT = 4  # the status line(s) under the composer; anything more means it is not last
+
+
+_ROLLOUT_NAME = re.compile(r"rollout-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-(?P<id>.+)\.jsonl")
+
+
+def parse_ps_start(text: str) -> float | None:
+    """Epoch seconds of a `ps -o lstart=` value such as `Wed Nov 18 16:12:47 2026` (local time), else None."""
+    try:
+        return time.mktime(time.strptime(text.strip(), "%a %b %d %H:%M:%S %Y"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _session_start(path: Path) -> tuple[str, float] | None:
+    """(cwd, start epoch) from the session_meta record that opens a rollout, else None."""
+    try:
+        with path.open(encoding="utf-8") as handle:
+            payload = json.loads(handle.readline()).get("payload")
+        cwd, stamp = payload.get("cwd"), payload.get("timestamp")
+        return (cwd, datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()) if isinstance(cwd, str) else None
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def select_rollout(pane_cwd: Path, process_start: float, open_paths: Sequence[Path], home: Path) -> Path | None:
+    """The rollout of a Codex pane when Herdr reports no session id, or None when it cannot be told apart.
+
+    A rollout the pane's process holds open is the answer. Otherwise it is the only rollout whose recorded
+    cwd is the pane cwd and which started no earlier than the process. Zero or several candidates give None;
+    the newest file is never guessed.
+    """
+    root = home / ".codex" / "sessions"
+    held = {p for p in open_paths if _ROLLOUT_NAME.fullmatch(p.name) and root in p.parents}
+    if held:
+        return next(iter(held)) if len(held) == 1 else None
+    found = []
+    for path in sorted(root.glob("*/*/*/rollout-*.jsonl")):
+        try:
+            if path.stat().st_mtime < process_start:
+                continue  # last written before the process existed; cannot be its session
+        except OSError:
+            continue
+        meta = _session_start(path)
+        if meta is not None and meta[0] == str(pane_cwd) and meta[1] >= process_start:
+            found.append(path)
+    return found[0] if len(found) == 1 else None
+
+
+def _process_signals(pane_id: str, env: Mapping[str, str] | None) -> tuple[float, list[Path]] | None:
+    """(start time, open file paths) of the pane's one foreground `codex` process, else None."""
+    path = None if env is None else env.get("PATH", "")
+    herdr, ps, lsof = shutil.which("herdr", path=path), shutil.which("ps", path=path), shutil.which("lsof", path=path)
+    if not (herdr and ps and lsof):
+        return None
+    run_env = None if env is None else dict(env)
+    try:
+        info = subprocess.run([herdr, "pane", "process-info", "--pane", pane_id], capture_output=True, text=True,
+                              timeout=10, env=run_env)
+        procs = [p for p in json.loads(info.stdout)["result"]["process_info"]["foreground_processes"]
+                 if p.get("name") == "codex" and isinstance(p.get("pid"), int)]
+        if len(procs) != 1:
+            return None
+        pid = str(procs[0]["pid"])
+        started = parse_ps_start(subprocess.run([ps, "-o", "lstart=", "-p", pid], capture_output=True, text=True,
+                                                timeout=10, env=run_env).stdout)
+        held = subprocess.run([lsof, "-p", pid, "-Fn"], capture_output=True, text=True, timeout=20, env=run_env).stdout
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return (started, [Path(line[1:]) for line in held.splitlines() if line.startswith("n/")]) if started else None
 
 
 def _token_count(record: object) -> tuple[int, int | None] | None:
@@ -72,7 +146,13 @@ class CodexAdapter:
         return SessionRef(self.harness, pane_id, cwd, session_id, matches[0])
 
     def locate(self, pane_id: str, cwd: Path) -> SessionRef | None:
-        return self.locate_session(herdr_session_id(pane_id, self._env), cwd, pane_id)
+        session_id = herdr_session_id(pane_id, self._env)
+        if session_id is not None:
+            return self.locate_session(session_id, cwd, pane_id)  # Herdr's id wins
+        signals = _process_signals(pane_id, self._env)  # Herdr reports no id for Codex; see the capabilities doc
+        rollout = select_rollout(cwd, signals[0], signals[1], self._home) if signals else None
+        named = _ROLLOUT_NAME.fullmatch(rollout.name) if rollout else None
+        return self.locate_session(named["id"], cwd, pane_id) if named else None
 
     def read_context(self, ref: SessionRef) -> ContextReading | None:
         if ref.record_path is None:

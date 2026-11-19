@@ -116,6 +116,7 @@ _HOSTILE_SCREENS = [
     "\x1b[?25m❯ x\n\x1b[?1;2m›\x1b[>4;2m y",
     "❯ \x1b[38:2::1:2:3mx\x1b[0m\n" * 6,
     "\x1b[" + "9" * 400 + "m❯\x1b[;;;m\x1b[2;38;2m",
+    "\x1b[" + "9" * 5000 + "m❯ x\x1b[0m",  # longer than Python's int-string limit
     "\x1b[\x1b[m\x1b\x1b[2",
     "┃\n╹▀\n┃\x00\ufffd\n",
     "",

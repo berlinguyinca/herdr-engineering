@@ -51,3 +51,8 @@ def test_typed_text_survives_sequences_that_are_not_plain_semicolon_sgr(row, exp
 
 def test_strip_ansi_removes_colon_and_private_parameter_sequences():
     assert strip_ansi(f"{ESC}[38:2::1:2:3ma{ESC}[?25mb{ESC}[>4;2mc") == "abc"
+
+
+def test_typed_text_survives_a_numeric_parameter_longer_than_pythons_int_limit():
+    row = "\x1b[" + "9" * 5000 + "m› hello\x1b[0m"
+    assert typed_text(row, "›") == "hello"

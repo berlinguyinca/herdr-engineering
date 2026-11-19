@@ -29,7 +29,7 @@ def _dim_after(dim: bool, params: str) -> bool:
     index = 0
     while index < len(parts):
         head = parts[index].split(":")[0]  # a colon-joined parameter is one code with sub-parameters
-        code = int(head) if head.isascii() and head.isdigit() else 0 if head == "" else -1
+        code = int(head) if head.isascii() and head.isdigit() and len(head) <= 9 else 0 if head == "" else -1  # longer is no SGR code, and would pass Python's int-string limit
         if code in (38, 48, 58):
             if ":" not in parts[index]:
                 following = parts[index + 1] if index + 1 < len(parts) else ""

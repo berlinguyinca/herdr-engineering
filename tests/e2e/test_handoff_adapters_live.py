@@ -203,6 +203,11 @@ def test_one_turn_then_idle_detection_and_session_kind(harness: Harness, client:
     session = herdr_agent_session(pane_id, None)
     print(f"MEASURED {harness.value} agent_session after a turn: kind={session[0] if session else None}")
     assert (session[0] if session else None) == _SESSION_KIND_AFTER_A_TURN[harness]
+    if harness is Harness.CODEX:  # Herdr names no session, so the rollout is found from the process and the cwd
+        ref = adapter.locate(pane_id, Path(os.environ.get("HERDR_LIVE_CWD") or str(Path.home())))
+        assert ref is not None and ref.record_path is not None, "no rollout found for the Codex pane"
+        assert _TURN_PROMPT in ref.record_path.read_text(encoding="utf-8"), "the rollout is not this pane's session"
+        assert adapter.read_context(ref) is not None
     client.send_text(pane_id, "typed but never submitted")
     assert _wait(lambda: "typed but never" in strip_ansi(_screen(client, pane_id)), 10.0)
     assert not adapter.is_ready_for_input(_screen(client, pane_id), "idle")

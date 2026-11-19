@@ -147,10 +147,21 @@ How each was used, and what was found:
   id, from the start and after. Pi: `{kind: "path"}`, the record file, from the start and after. OpenCode: none before a
   prompt, `{kind: "id", value: "ses_..."}` after the first one; `OpenCodeAdapter.locate_session` matches that value against
   `session.id`, so `locate` works for it once a turn exists. **Codex: none, before a prompt and after a turn**, although its
-  hook integration (v8) is "current" and the turn wrote a rollout file; so `agent_session` is never a rollout id for Codex
-  and "does the value equal the rollout filename id" has no answer from Herdr. `CodexAdapter.locate` returns `None` for such a
-  pane (it never falls back to the newest rollout), so Codex context cannot be read in a Herdr pane until Herdr reports a
-  session for it or the controller supplies the id another way. Codex's own `/status` shows a session id of the same shape as
+  hook integration (v8) is "current" and the turn wrote a rollout file; so `agent_session` is never a rollout id for Codex.
+  **How `CodexAdapter.locate` finds the rollout anyway** (measured on Codex 0.169.0, one real turn in a pane, 2026-11-18).
+  `herdr pane process-info` gives one foreground process named `codex` with its pid, cwd and an argv that is only the binary
+  path; no start time. `ps -o lstart= -p <pid>` gives the start time to the second. The session id is in neither the argv nor
+  the environment. `lsof -p <pid>` shows the sqlite state and log files and **no rollout**: Codex runs turns in a shared
+  background server (`app-server`), and that one process holds a rollout open, not the pane's process. So there is no direct
+  signal. The rule is: Herdr's id when it reports one; otherwise a rollout the pane's process holds open (none in practice,
+  kept for a Codex that does); otherwise the single rollout under `~/.codex/sessions` whose first record (`session_meta`)
+  has `cwd` equal to the pane cwd and a start time not before the process start, and whose file was written after the process
+  started. Zero or several candidates give `None`; the newest file is never chosen. Measured: the rollout's start was within
+  one second after the process start. **Limit:** two Codex sessions started in the same cwd after the same process start
+  (or a second session in that cwd started later while the first is still live) cannot be told apart, so `locate` returns `None`
+  for them. The live test (`test_one_turn_then_idle_detection_and_session_kind[codex]`) asserts the located rollout holds the
+  test's own prompt and gives a reading; it fails if another Codex session was started in the same cwd meanwhile. The Codex
+  update dialog stays unhandled (see above). Codex's own `/status` shows a session id of the same shape as
   the one in a rollout file name, and `codex resume <id>` on exit prints one; it was not compared with a rollout.
 
 Evidence for the compact command is the harness's own slash menu after the command was typed (never submitted), for Claude
