@@ -2018,7 +2018,7 @@ def _cmd_fleet_update(args) -> int:
 def _cmd_fleet_recover(args) -> int:
     from pathlib import Path
 
-    from .fleet import repo_root
+    from .fleet import FleetError, repo_root
     from .fleet_rollout import inventory_targets
     from .pi_recovery import RecoveryStore, apply_recovery, create_plan
 
@@ -2041,7 +2041,7 @@ def _cmd_fleet_recover(args) -> int:
         else:
             from .pi_recovery_verification import verify_recovery
             report = verify_recovery(store, args.id, progress=lambda event: print(event, file=sys.stderr, flush=True))
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError, FleetError) as exc:
         _print_json({"error": str(exc)})
         return 1
     _print_json(report)
@@ -2051,7 +2051,7 @@ def _cmd_fleet_recover(args) -> int:
 def _cmd_fleet_rollout(args) -> int:
     from pathlib import Path
 
-    from .fleet import repo_root
+    from .fleet import FleetError, repo_root
     from .fleet_rollout import (
         RolloutStore,
         apply_rollout,
@@ -2074,7 +2074,7 @@ def _cmd_fleet_rollout(args) -> int:
             report = retire_identityless(store, args.id, settled_by=args.settled_by)
         else:
             report = store.read(args.id)
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError, FleetError) as exc:
         _print_json({"error": str(exc)})
         return 1
     _print_json(report)
@@ -2137,6 +2137,11 @@ def _cmd_fleet_drift(args) -> int:
 def _cmd_fleet_status(args) -> int:
     from .fleet import fleet_status
     status = fleet_status()
+    if status.get("error_kind"):   # ansible never ran: a setup problem (exit 2), not hosts that failed (exit 1)
+        if args.json:
+            _print_json(status)
+        print(f"fleet status: {status['error']}", file=sys.stderr)
+        return 2
     if args.json:
         _print_json(status)
     else:

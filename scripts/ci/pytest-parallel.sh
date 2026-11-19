@@ -20,6 +20,20 @@ herdr_cpu_quota() {
   python3 "$(dirname "${BASH_SOURCE[0]}")/cpu-quota.py" "${HERDR_CGROUP_ROOT:-/sys/fs/cgroup}" "${HERDR_PROC_CGROUP:-/proc/self/cgroup}"
 }
 
+# The load average file (HERDR_LOADAVG_FILE overrides /proc/loadavg for tests; scripts/ci/host-facts.sh prints the same file).
+herdr_loadavg_file() { echo "${HERDR_LOADAVG_FILE:-/proc/loadavg}"; }
+
+# The CPUs the host's 1-minute load average leaves free, as a whole number >= 1, or nothing when the file is unreadable. Pipeline 1710
+# started 8 workers on a host with load 155 on 4 CPUs; two of them died. It only ever lowers `auto` (an explicit
+# HERDR_PYTEST_WORKERS wins) and never below 1.
+herdr_free_cpus() {
+  local load cpus
+  load="$(cut -d' ' -f1 "$(herdr_loadavg_file)" 2>/dev/null)" || return 0
+  case "$load" in ''|*[!0-9.]*|*.*.*) return 0 ;; esac
+  cpus="$(python3 -c 'import os; print(len(os.sched_getaffinity(0)))')"
+  awk -v l="$load" -v c="$cpus" 'BEGIN { f = c - int(l); print (f < 1 ? 1 : f) }'
+}
+
 herdr_pytest_parallel_args() {
   local workers="${HERDR_PYTEST_WORKERS:-auto}" cap="${HERDR_PYTEST_MAXPROCESSES:-8}"
   case "$workers" in
@@ -33,6 +47,12 @@ herdr_pytest_parallel_args() {
     # A quota below both the cap and the visible cores is the real budget; otherwise `auto` is right as before.
     if [ -n "$quota" ] && [ "$quota" -lt "$cap" ] && [ "$quota" -lt "$(python3 -c 'import os; print(len(os.sched_getaffinity(0)))')" ]; then
       workers="$quota"
+    fi
+    # Then the CPUs the host's current load leaves free: only ever lower, never below 1.
+    local free; free="$(herdr_free_cpus)"
+    if [ -n "$free" ] && [ "$free" -lt "$cap" ] && [ "$free" -lt "$(python3 -c 'import os; print(len(os.sched_getaffinity(0)))')" ] \
+       && { [ "$workers" = auto ] || [ "$free" -lt "$workers" ]; }; then
+      workers="$free"
     fi
   fi
   printf '%s\n' -n "$workers" "--maxprocesses=$cap" --dist=loadfile
