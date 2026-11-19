@@ -84,7 +84,7 @@ def test_a_retry_after_a_refusal_looks_at_the_session_again(tmp_path: Path) -> N
         retry_delay_s=0.0, compact_ready_timeout_s=0.1, sleep=lambda _s: None, ready=ready)
     assert done is None and calls.read_text().split().count("takeover") == 1 and len(looks) == 2
     names = [e.event for e in EventLog(tmp_path / "store").read()]
-    assert names == ["handoff.takeover_started"]  # no terminal event: the chain goes on
+    assert names == ["handoff.takeover_started"] * 2  # the chain's and the one attempt; no terminal event: the chain goes on
 
 
 def test_a_takeover_resumed_after_a_restart_is_gated_too(tmp_path: Path) -> None:
@@ -152,7 +152,8 @@ def test_the_loop_goes_on_to_the_takeover_with_the_dirty_source_allowed_when_not
     _git(w.repo, "push", "-q", "origin", "feat/x")
     (w.repo / "vendor" / "a.txt").write_text("changed again\n")
     w.tick(w.pane("p1", "idle"))
-    assert w.names()[-1] == "handoff.succeeded" and "handoff.wip_committed" not in w.names()
+    assert w.names()[-1] == "handoff.succeeded"
+    assert [e.reason for e in w.events() if e.event == "handoff.wip_committed"] == ["nothing_stageable"]
     assert "--allow-dirty-source" in calls.read_text()  # even though pushing is allowed here
 
 

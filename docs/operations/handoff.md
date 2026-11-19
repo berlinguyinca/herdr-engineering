@@ -339,7 +339,8 @@ and nothing is created. `herdr-eng side-pane ensure --tab` is documented with pl
    rather than guessing. If the status shows tracked changes but `git add -u` stages none (a dirty submodule), nothing is
    committed (`NOTHING_STAGEABLE`) and the takeover goes on with `--allow-dirty-source`.
 6. `handoff.takeover_started`: `herdr-handoff takeover` launches the same harness in a pane below the source, waits for proof
-   that it is live, asks the source session to exit, and closes the source pane. It is tried up to 3 times; a rerun for the
+   that it is live, asks the source session to exit, and closes the source pane. It is tried up to 3 times per chain (each call is counted in the log as a `handoff.takeover_started` with reason `attempt`, so
+   a restart or a pane that keeps going busy never raises the number); a rerun for the
    same handoff reuses the recorded child pane and never launches a second one. Before every call to `herdr-handoff takeover` (the first,
    each retry, and one resumed after a restart) the controller reads the session afresh: idle or done, an empty input, the
    right agent and no live subagents. If it is not ready, no call is made and the chain keeps waiting (`handoff.waiting`) for
@@ -423,6 +424,7 @@ red or orange outcome the source session keeps running.
 | `git_state_unknown` | a git command failed or timed out, so the state of the work is unknown | inspect the repository (for example a leftover `.git/index.lock`, which the controller never deletes) |
 | `record_unreadable` | `herdr-handoff inspect` could not read the record | check the record with `herdr-handoff inspect`; run `/handoff` yourself |
 | `pane_gone` | the pane of an open chain was not listed, or held another session, for 60 seconds of credited time (`pane_gone_after_s`) | look at what replaced it; start a handoff by hand if work remains. It does not count towards `gave_up` |
+| `no_longer_managed` | the pane is still listed but the switch went off, or it became a side pane, while the chain was open | none; turn the switch on to start over. It does not count towards `gave_up` |
 | `compaction_state_unknown` | a controller restarted while a compaction had begun and no end was recorded | look at the pane; the controller never types `/compact` a second time |
 | `merge_in_progress` | a merge, cherry-pick, revert or rebase is unfinished, so nothing was committed | finish or abort it. Where pushing is not allowed the controller goes on without committing (`--allow-dirty-source`); where it is allowed the chain stops |
 | `on_main_with_changes` | the session is on main, master or a detached head with uncommitted or unpushed work | move the work to a feature branch; the controller will not commit on main |
@@ -525,7 +527,8 @@ with `herdr-eng handoff controller run`.
 * Between the controller's last check and `herdr-handoff` typing the exit text (the successor split, launch and confirmation:
   up to about 25 seconds) a session that starts a turn, or a user who starts typing, is not protected. `herdr-handoff`
   types the exit text only when Herdr reports an agent, not when it is idle. The follow-up is a herdr-handoff 0.5.1 change.
-* The fallback writer runs inside the loop and can block every session's tick for up to 5 minutes.
+* The fallback writer runs inside the loop and can block every session's tick for up to 5 minutes, and so can the compaction
+  path (up to 735 seconds, see above): while one pane's chain is in either, no other pane is looked at.
 * A takeover killed after the child was launched but before it was confirmed counts as unconfirmed, so the last-resort
   compaction can run while a slow child is still starting; the `successor_pane_id` on the orange event shows it.
 * An agent that turns `blocked` right after a failed prompt is reported as typed; the screen cannot say whether the text went in.

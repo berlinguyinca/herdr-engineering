@@ -71,6 +71,7 @@ _DRAIN_STUCK: dict[str, StuckReason] = {
 }
 _MAX_CHAINS = 3  # non-green chains per session before the controller gives up on it
 _MAX_FINISH_FAILURES = 3
+_MAX_ENSURE_FAILURES = 3  # consecutive failed calls for one tab before the side pane is left alone
 _FALLBACK_WORK_MAX_AGE_S = 3600.0
 _LOCK_TRIES = 4  # three pauses: another controller is assumed after about a second
 _LOCK_PAUSE_S = 0.35
@@ -88,8 +89,9 @@ def _failed_chains(events: Sequence[HandoffEvent], since: float | None = None) -
 
 
 def _is_pane_gone(event: HandoffEvent) -> bool:
-    """A chain that ended because its pane closed says nothing about the session: it does not count as a failure."""
-    return event.event == "handoff.stuck" and event.reason == StuckReason.PANE_GONE.value
+    """A chain that ended because its pane closed, or left the controller's care, says nothing about the session: it does
+    not count as a failure."""
+    return event.event == "handoff.stuck" and event.reason in (StuckReason.PANE_GONE.value, StuckReason.NO_LONGER_MANAGED.value)
 
 
 def gave_up(events: Sequence[HandoffEvent], cfg: ControllerConfig, since: float | None = None) -> bool:
@@ -139,12 +141,11 @@ class PaneRuntime:
     last_outcome: str | None = None  # the last drain outcome that was not `typed`
     finish_failures: int = 0  # consecutive times finishing the chain raised
     retypes: int = 0  # drain attempts that left it unknown whether the order landed
-    allow_dirty: bool = False  # the checkpoint found tracked changes it cannot stage (a dirty submodule): take over regardless
 
     def reset(self, chain_id: str | None) -> None:
         self.chain_id, self.typed, self.wait_since, self.cooldown_until = chain_id, False, 0.0, 0.0
         self.quiet_since, self.wait_state = None, None
-        self.last_outcome, self.finish_failures, self.retypes, self.allow_dirty = None, 0, 0, False
+        self.last_outcome, self.finish_failures, self.retypes = None, 0, 0
 
 
 def note_uncertain(rt: PaneRuntime, now: float, cfg: ControllerConfig) -> None:
@@ -255,6 +256,8 @@ class Controller:
     adapters: dict[Harness, HarnessAdapter] = field(default_factory=dict)  # prefilled by tests that need another home
     _tabs: dict[str, set[str]] = field(default_factory=dict)  # tab -> the managed panes it had when the side pane was last ensured
     _unsure: set[str] = field(default_factory=set)  # panes whose side-pane check raised (said once)
+    _sides: dict[str, bool | None] = field(default_factory=dict)  # this tick's side-pane verdicts (None: the check raised)
+    _tab_failures: dict[str, int] = field(default_factory=dict)  # tab -> consecutive failed calls to `ensure_side_pane`
     log_offset: int = 0  # how far into events.jsonl `_events` reaches
     _generation: int = 0  # the log's `generation` `_events` was read at
     _absent: dict[str, float] = field(default_factory=dict)  # since when (credited) a pane with an open chain is not listed
@@ -296,13 +299,20 @@ class Controller:
         """An agent of a known harness that is neither the pane this controller runs in nor a side pane."""
         if harness_for_agent_name(pane.name) is None or pane.pane_id == self.env.get("HERDR_PANE_ID"):
             return False
-        try:
-            return not self.is_side_pane(pane)
-        except Exception as exc:  # noqa: BLE001 - unknown is not "not a side pane": the pane is left alone this tick
-            if pane.pane_id not in self._unsure:
-                self._unsure.add(pane.pane_id)
-                _warn(f"{pane.pane_id}: side pane check failed, pane skipped: {type(exc).__name__}")
-            return False
+        return self.side_pane_verdict(pane) is False
+
+    def side_pane_verdict(self, pane: AgentPane) -> bool | None:
+        """Whether the pane is a side pane, asked once per pane per tick; None when the check raised: unknown is not
+        "not a side pane", the pane is left alone this tick."""
+        if pane.pane_id not in self._sides:
+            try:
+                self._sides[pane.pane_id] = bool(self.is_side_pane(pane))
+            except Exception as exc:  # noqa: BLE001
+                self._sides[pane.pane_id] = None
+                if pane.pane_id not in self._unsure:
+                    self._unsure.add(pane.pane_id)
+                    _warn(f"{pane.pane_id}: side pane check failed, pane skipped: {type(exc).__name__}")
+        return self._sides[pane.pane_id]
 
     def forget_gone(self, present: set[str]) -> None:
         for pane_id in [p for p in self._refs if p not in present]:
@@ -336,19 +346,31 @@ def _skip_once(ctl: Controller, events: Sequence[HandoffEvent], pane: AgentPane,
 
 def _ensure_side_panes(ctl: Controller, panes: Sequence[AgentPane]) -> None:
     """The side pane (plan 4) is ensured for a tab when a managed pane the tab did not have before appears in it (its first
-    session, a second one, a successor): at most one call per tab per tick, none for an unchanged tab. A tab without
-    managed panes is forgotten."""
+    session, a second one, a successor): at most one call per tab per tick, none for an unchanged tab. A call that raised
+    is tried again on the next tick; after `_MAX_ENSURE_FAILURES` in a row it is said once and left until another pane
+    appears. A tab without managed panes is forgotten."""
     now: dict[str, set[str]] = {}
     for pane in panes:
         if pane.tab_id and ctl.manages(pane):
             now.setdefault(pane.tab_id, set()).add(pane.pane_id)
+    done: dict[str, set[str]] = {}
     for tab_id, ids in now.items():
-        if ids - ctl._tabs.get(tab_id, set()):
-            try:
-                ctl.ensure_side_pane(tab_id)
-            except Exception as exc:  # noqa: BLE001 - a side pane problem must not stop the handoffs
+        done[tab_id] = ctl._tabs.get(tab_id, set())
+        if not ids - done[tab_id]:
+            continue
+        try:
+            ctl.ensure_side_pane(tab_id)
+        except Exception as exc:  # noqa: BLE001 - a side pane problem must not stop the handoffs
+            ctl._tab_failures[tab_id] = ctl._tab_failures.get(tab_id, 0) + 1
+            if ctl._tab_failures[tab_id] >= _MAX_ENSURE_FAILURES:
                 _warn(f"side pane for {tab_id}: {exc}")
-    ctl._tabs = now
+                done[tab_id] = ids
+                ctl._tab_failures[tab_id] = 0
+        else:
+            done[tab_id] = ids
+            ctl._tab_failures[tab_id] = 0
+    ctl._tab_failures = {t: n for t, n in ctl._tab_failures.items() if t in now}
+    ctl._tabs = done
 
 
 def _restore(session_id: str | None, chain: Chain | None, credit: Callable[[float], float] = lambda t: t) -> PaneRuntime:
@@ -371,13 +393,15 @@ def _open(ctl: Controller, events: Sequence[HandoffEvent]) -> Chain | None:
                    briefing_at=None if chain.briefing_at is None else c(chain.briefing_at))
 
 
-def _close_orphans(ctl: Controller, events: Sequence[HandoffEvent], gone: Callable[[HandoffEvent], bool]) -> None:
-    """A chain whose pane is gone, or holds another session, never finishes: it ends red once (`pane_gone`)."""
+def _close_orphans(ctl: Controller, events: Sequence[HandoffEvent], gone: Callable[[HandoffEvent], bool],
+                   why: StuckReason = StuckReason.PANE_GONE) -> None:
+    """A chain whose pane is gone, holds another session, or is no longer managed never finishes: it ends red once
+    (`pane_gone`, or `no_longer_managed`)."""
     for mine in open_chain_events(events):
         last = mine[-1]
         if gone(last):
             ctl.log.append(HandoffEvent("handoff.stuck", iso(ctl.clock()), last.chain_id, last.pane_id, last.session_id,
-                                        last.harness, last.handoff_id, None, None, Colour.RED, StuckReason.PANE_GONE.value,
+                                        last.harness, last.handoff_id, None, None, Colour.RED, why.value,
                                         None))
 
 
@@ -419,8 +443,8 @@ def _checkpoint(ctl: Controller, ref: SessionRef, chain_id: str, worktree: Path,
             _stuck(ctl, ref, chain_id, stuck_reason(StuckReason.ON_MAIN_WITH_CHANGES, result.reason.value, None), pct)
             return None
     pushing = result.reason in (WipReason.PUSH_FAILED, WipReason.PUSH_NOT_ALLOWED)
-    if result.committed or pushing:  # commits that were already there unpushed are recorded the same way
-        why = result.reason.value if pushing and result.reason else "committed"
+    if result.committed or pushing or result.reason is WipReason.NOTHING_STAGEABLE:  # unpushed commits are recorded the same way
+        why = result.reason.value if (pushing or result.reason is WipReason.NOTHING_STAGEABLE) and result.reason else "committed"
         _emit(ctl, ref, "handoff.wip_committed", chain_id, reason=why, pct=pct, commit=result.sha)
     return result
 
@@ -438,11 +462,13 @@ def _finish(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRuntime, pct
             return
     worktree = ref.cwd
     allowed = push_allowed(ctl.cfg, worktree, _common_dir(worktree) if ctl.cfg.push_allowed_repos else None)
+    wip: WipResult | None = None
     if not chain.takeover_started:
         wip = _checkpoint(ctl, ref, chain.chain_id, worktree, allowed, pct)
         if wip is None:
             return
-        rt.allow_dirty = wip.reason is WipReason.NOTHING_STAGEABLE  # the changes cannot be committed, so pushing cannot clean them
+    unstageable = chain.unstageable or (not chain.takeover_started and wip is not None
+                                        and wip.reason is WipReason.NOTHING_STAGEABLE)  # the log remembers it across a restart
     cfg = replace(ctl.cfg, max_attempts=0) if last_resort else ctl.cfg  # no attempts: straight to compaction
 
     def ready() -> bool:  # a fresh read before every call to herdr-handoff; the user may have started typing since the last one
@@ -452,8 +478,9 @@ def _finish(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRuntime, pct
         return why is None
 
     run_takeover(ref, ctl.adapter(ref.harness), handoff_id, cfg, ctl.log, ctl.handoff, ctl.herdr,
-                 store_root=ctl.store_root, worktree=worktree, push_allowed=allowed and not rt.allow_dirty, env=ctl.env,
+                 store_root=ctl.store_root, worktree=worktree, push_allowed=allowed and not unstageable, env=ctl.env,
                  chain_id=chain.chain_id, context_pct=pct, sleep=ctl.sleep, started=chain.takeover_started, ready=ready,
+                 attempts_made=chain.attempts,
                  **ctl.takeover_kwargs)
 
 
@@ -489,8 +516,16 @@ def _finish_when_ready(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneR
     herdr-handoff. Until `briefing_timeout_s` after the briefing the chain waits; after that it takes the last-resort
     path, whose compaction is typed only into a ready pane and may run with subagents live. A chain already in that
     path, or in its compaction, is not held."""
-    if not chain.compacting and not chain.last_resort and (why := _not_ready(ctl, ref)) is not None:
+    why = None
+    if not chain.compacting and not chain.last_resort:
+        try:
+            why = _not_ready(ctl, ref)
+        except Exception as exc:  # a read that keeps failing ends the chain like any other failure to finish it
+            _count_failure(ctl, ref, chain, rt, pct, exc)
+            return
+    if why is not None:
         if now < (chain.briefing_at if chain.briefing_at is not None else chain.last_at) + ctl.cfg.briefing_timeout_s:
+            rt.finish_failures = 0
             _wait(ctl, ref, chain, rt, why[0], why[1], pct)
             return
         chain = replace(chain, last_resort=True)
@@ -517,12 +552,19 @@ def _finish_guarded(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRunt
     try:
         _finish(ctl, ref, chain, rt, pct, last_resort=chain.last_resort)
     except Exception as exc:
-        rt.finish_failures += 1
-        if rt.finish_failures < _MAX_FINISH_FAILURES:
-            raise
-        _stuck(ctl, ref, chain.chain_id, f"{StuckReason.INTERNAL_ERROR.value}:{type(exc).__name__}", pct)
+        _count_failure(ctl, ref, chain, rt, pct, exc)
     else:
         rt.finish_failures = 0
+
+
+def _count_failure(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRuntime, pct: float | None,
+                   exc: Exception) -> None:
+    """One more failure to finish the chain (reading the pane included): raised for the loop to report, except the
+    third in a row, which ends the chain stuck."""
+    rt.finish_failures += 1
+    if rt.finish_failures < _MAX_FINISH_FAILURES:
+        raise exc
+    _stuck(ctl, ref, chain.chain_id, f"{StuckReason.INTERNAL_ERROR.value}:{type(exc).__name__}", pct)
 
 
 def drain_is_busy(outcome: str) -> bool:
@@ -649,13 +691,22 @@ def _drain_stuck_reason(pane: AgentPane, rt: PaneRuntime) -> StuckReason:
     return StuckReason.BLOCKED if pane.status == "blocked" else StuckReason.DRAIN_TIMEOUT
 
 
+def _end_unmanaged(ctl: Controller, events: Sequence[HandoffEvent], pane: AgentPane) -> None:
+    """The chain open on a pane that is listed but no longer the controller's ends red once (`no_longer_managed`); it
+    is not a failure of the session."""
+    _close_orphans(ctl, events, lambda e: e.pane_id == pane.pane_id, StuckReason.NO_LONGER_MANAGED)
+
+
 def _tick_pane(ctl: Controller, pane: AgentPane, events: Sequence[HandoffEvent], now: float) -> None:
-    if not ctl.manages(pane):
-        return
     harness = harness_for_agent_name(pane.name)
+    if not ctl.manages(pane):
+        if harness is not None and ctl.side_pane_verdict(pane) is True:  # it became a side pane: its chain cannot go on
+            _end_unmanaged(ctl, events, pane)
+        return
     assert harness is not None
     mine = [e for e in events if e.pane_id == pane.pane_id]
     if not is_enabled(pane.pane_id, ctl.env, ctl.state_dir):
+        _end_unmanaged(ctl, events, pane)  # the switch went off mid-chain
         _skip_once(ctl, mine, pane, harness, "switch_off")
         return
     ref = ctl.ref_for(pane, harness, now)
@@ -708,6 +759,7 @@ def run_once(ctl: Controller, panes: Sequence[AgentPane] | None = None) -> None:
         return
     present = {p.pane_id for p in panes}
     ctl.forget_gone(present)
+    ctl._sides.clear()  # the side-pane check runs once per pane per tick
     _ensure_side_panes(ctl, panes)
     events = ctl.sync_events()
     if ctl.ticks is not None:

@@ -24,7 +24,7 @@ from ..handoff_adapters.base import HarnessAdapter, SessionRef
 from ..handoff_subagent_gate import finish
 from .compaction import compact_with_pointer
 from .config import ControllerConfig
-from .events import COMPACTING, Colour, EventLog, HandoffEvent, StuckReason, now_iso
+from .events import ATTEMPT, COMPACTING, Colour, EventLog, HandoffEvent, StuckReason, now_iso
 from .handoff_cli import HandoffCli, HandoffCliResult
 from .herdr_cli import HerdrCli
 
@@ -133,9 +133,9 @@ def stuck_reason(head: StuckReason, detail: StuckReason | str | None, last_takeo
 
 def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg: ControllerConfig, log: EventLog,
                  handoff: HandoffCli, herdr: HerdrCli, *, store_root: Path, worktree: Path, push_allowed: bool,
-                 env: Mapping[str, str], chain_id: str | None = None, predecessor_id: str | None = None,
+                 env: Mapping[str, str], ready: Callable[[], bool], attempts_made: int = 0, chain_id: str | None = None, predecessor_id: str | None = None,
                  context_pct: float | None = None, started: bool = False, confirm_timeout_s: float = 25.0, call_margin_s: float = 60.0,
-                 retry_delay_s: float = 2.0, ready: Callable[[], bool] | None = None, compact_ready_timeout_s: float = 60.0,
+                 retry_delay_s: float = 2.0, compact_ready_timeout_s: float = 60.0,
                  compact_work_start_s: float = 15.0, compact_work_end_s: float = 600.0, poll_s: float = 0.5,
                  sleep: Callable[[float], None] = time.sleep,
                  clock: Callable[[], float] = time.monotonic) -> HandoffEvent | None:
@@ -145,7 +145,8 @@ def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg:
     commits are recorded by herdr-handoff and do not stop the close; where pushing is allowed they must be pushed.
     `started`: the chain's `handoff.takeover_started` is already in the log.
     `ready` is asked right before every call to herdr-handoff, after the look at the record; when it says no, nothing is
-    called and None is returned with no terminal event: the chain goes on waiting, and the next call starts over."""
+    called and None is returned with no terminal event: the chain goes on waiting, and the next call starts over.
+    `attempts_made`: the calls the log already counts for this chain; only the rest of `cfg.max_attempts` is made."""
     chain = chain_id or handoff_id
 
     def event(name: str, *, colour: Colour | None = None, reason: str | None = None,
@@ -175,7 +176,7 @@ def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg:
     timeout_s = confirm_timeout_s + exit_plan.process_end_timeout_s + call_margin_s
     last: str | None = None
     last_pane: str | None = None
-    for attempt in range(cfg.max_attempts):
+    for attempt in range(max(cfg.max_attempts - attempts_made, 0)):
         if attempt:
             sleep(retry_delay_s)
         record = handoff.inspect(store_root, handoff_id)
@@ -184,8 +185,9 @@ def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg:
         view = record_view(record)
         if next_action(view) is not Action.LAUNCH:
             break
-        if ready is not None and not ready():
+        if not ready():
             return None
+        event("handoff.takeover_started", reason=ATTEMPT)  # counted in the log: a later call never exceeds `max_attempts`
         result = classify(handoff.takeover(store_root, handoff_id, parent_pane=ref.pane_id, worktree=worktree,
                                            exit_plan=exit_plan, allow_dirty=not push_allowed,
                                            confirm_timeout_s=confirm_timeout_s, timeout_s=timeout_s))
