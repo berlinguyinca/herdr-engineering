@@ -40,6 +40,14 @@
 #      origin/main (not pinned), and links its screenwright-review skill via
 #      scripts/install-screenwright.sh; opt out with --no-screenwright or
 #      HERDR_INSTALL_SCREENWRIGHT=0. Non-fatal; dirty/non-main checkouts are skipped.
+#   (default on) step 7c3 links the auto-handoff controller plugin and the session
+#      side pane plugin into Herdr (`herdr-eng handoff controller link`; copies of
+#      deploy/herdr-handoff-controller-plugin and deploy/herdr-session-pane-plugin with the
+#      absolute herdr-eng path, so Herdr's short PATH does not matter). Needs herdr 0.9.1+;
+#      skipped otherwise. Linking does not start the controller: Herdr starts it
+#      when it next starts, or run `herdr-eng handoff controller run`. Opt out with
+#      --no-handoff-plugins or HERDR_INSTALL_HANDOFF_PLUGINS=0; without the controller
+#      no session is handed off automatically (`herdr-eng handoff auto check` says so).
 #
 # Re-running produces no unexpected changes. No secrets are written anywhere.
 #
@@ -52,15 +60,17 @@ BUILD_CACHE_TOOLS_ONLY=0
 WITH_WORKFLOW_HOOKS="${HERDR_INSTALL_WORKFLOW_HOOKS:-1}"
 WITH_SUBAGENT_HOOKS="${HERDR_INSTALL_SUBAGENT_HOOKS:-1}"
 WITH_SCREENWRIGHT="${HERDR_INSTALL_SCREENWRIGHT:-1}"
+WITH_HANDOFF_PLUGINS="${HERDR_INSTALL_HANDOFF_PLUGINS:-1}"
 for arg in "$@"; do
   case "$arg" in
     --no-workflow-hooks) WITH_WORKFLOW_HOOKS=0 ;;
     --no-subagent-hooks) WITH_SUBAGENT_HOOKS=0 ;;
     --no-screenwright) WITH_SCREENWRIGHT=0 ;;
+    --no-handoff-plugins) WITH_HANDOFF_PLUGINS=0 ;;
     --with-memory) WITH_MEMORY=1 ;;
     --no-build-cache-tools) BUILD_CACHE_TOOLS=0 ;;
     --build-cache-tools-only) BUILD_CACHE_TOOLS_ONLY=1 ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
     *) printf 'unknown option: %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
@@ -365,6 +375,17 @@ else
   printf '\n  (subagent hooks not installed; HERDR_INSTALL_SUBAGENT_HOOKS=0 or --no-subagent-hooks)\n'
 fi
 
+# --- 7c3. auto-handoff controller + session side pane plugins (default on) ---
+# Linking registers the plugins; Herdr starts the controller's [[startup]] command only when the Herdr server next starts
+# (measured on 0.9.1), so a running Herdr needs a restart or `herdr-eng handoff controller run`. The final check says which.
+if [ "$WITH_HANDOFF_PLUGINS" = "1" ]; then
+  step "7c3/8 auto-handoff controller and session side pane plugins (linked into Herdr)"
+  "$PY" -m herdr_engineering.cli handoff controller link --deploy-dir "$REPO_ROOT/deploy" --herdr-eng "$VENV/bin/herdr-eng" \
+    --herdr-bin "$HERDR_BIN" || warn "handoff plugins not linked (see above); no session is handed off automatically until: herdr-eng handoff controller link"
+else
+  printf '\n  (handoff plugins not linked; HERDR_INSTALL_HANDOFF_PLUGINS=0 or --no-handoff-plugins: no automatic handoff until: herdr-eng handoff controller link)\n'
+fi
+
 # --- 7d. screenwright (default on; tracks origin/main, never pinned) --------
 if [ "$WITH_SCREENWRIGHT" = "1" ]; then
   step "7d/8 screenwright (latest origin/main; skill linked into the harnesses)"
@@ -376,6 +397,10 @@ fi
 # --- 8. doctor ------------------------------------------------------------
 step "8/8 running herdr-eng doctor"
 "$PY" -m herdr_engineering.cli doctor || warn "doctor reported warnings (see above)"
+
+step "auto-handoff policy (controller and side pane)"
+HERDR_BIN="$HERDR_BIN" "$PY" -m herdr_engineering.cli handoff auto check || \
+  warn "NO AUTOMATIC HANDOFF POLICY is active yet (see the lines above): link the controller with 'herdr-eng handoff controller link', then restart Herdr or run 'herdr-eng handoff controller run'"
 
 step "Done."
 cat <<EOF

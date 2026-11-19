@@ -174,6 +174,14 @@ def run_doctor(config: dict[str, Any] | None = None,
                handoff.detail, {"missing_harnesses": handoff.missing_harnesses,
                                 "executable": handoff.executable})
 
+    # the automatic-handoff controller: without a linked plugin or a running controller no session is handed off at all
+    from .handoff_controller_state import controller_findings
+    controller, side_pane = controller_findings(os.environ, herdr_bin=herdr_bin)
+    for name, finding in (("handoff_controller", controller), ("handoff_side_pane", side_pane)):
+        ok = finding.state.value in ("running", "switched_off", "linked")
+        report.add(name, "ok" if ok else ("fail" if strict and finding.blocking else "warn"),
+                   finding.detail + (f"; fix: {finding.fix}" if finding.fix else ""), {"state": finding.state.value})
+
     # herdr-memory managed adapters (only when opted in; never fake healthy)
     try:
         from .memory_install import MemoryInstaller

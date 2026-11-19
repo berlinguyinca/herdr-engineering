@@ -549,9 +549,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--json", action="store_true")
     p2.set_defaults(func=_cmd_handoff_auto, auto_parser=p2)
     p2 = hsub.add_parser("controller", help="the auto-handoff controller: run it, or show whether it runs and its chains")
-    p2.add_argument("controller_action", choices=("run", "status"))
+    p2.add_argument("controller_action", choices=("run", "status", "link"))
     p2.add_argument("--once", action="store_true", help="run: one tick, then exit")
     p2.add_argument("--interval", type=float, default=5.0, help="run: seconds between ticks (default 5)")
+    p2.add_argument("--deploy-dir", default=None, help="link: the checkout's deploy/ directory holding the two plugins")
+    p2.add_argument("--herdr-eng", default=None, help="link: absolute path the plugins run (default: the one on PATH)")
+    p2.add_argument("--herdr-bin", default=None, help="link: the herdr binary (default: $HERDR_BIN, else herdr)")
     p2.set_defaults(func=_cmd_handoff_controller)
 
     # summary --------------------------------------------------------------
@@ -1572,7 +1575,8 @@ def _cmd_handoff_auto(args) -> int:
     from . import handoff_auto_setup as ha
     home = Path(args.home) if args.home else None
     if args.auto_action == "check":
-        items = ha.check(home)
+        from .handoff_controller_state import check_items
+        items = [*ha.check(home), *check_items()]
     elif args.auto_action == "install" and args.subagents_only:
         items = ha.install_subagent_hooks(home, dry_run=args.dry_run)
     else:
@@ -1598,12 +1602,36 @@ def _cmd_handoff_auto_switch(args) -> int:
 
 
 def _cmd_handoff_controller(args) -> int:
+    if args.controller_action == "link":
+        return _cmd_handoff_controller_link(args)
     from .handoff_controller import run as controller
     if args.controller_action == "status":
         ctl = controller.build_controller(os.environ, require_binaries=False)
         print("\n".join(controller.status_lines(ctl.state_dir, ctl.log)))
         return 0
     return controller.serve(interval_s=args.interval, once=args.once)
+
+
+def _cmd_handoff_controller_link(args) -> int:
+    """Link the controller and session pane plugins into Herdr (idempotent). Exit 1 only when a link failed; a skip is exit 0."""
+    import shutil
+
+    from .fabric_join_setup import FAIL_ACTIONS
+    from .handoff_controller_state import default_deploy_dir, link_plugins
+    from .handoff_subagent_registry import state_root
+    herdr_eng = args.herdr_eng or shutil.which("herdr-eng")
+    if not herdr_eng:
+        print("herdr-eng is not on PATH; pass --herdr-eng with its absolute path", file=sys.stderr)
+        return 1
+    deploy = Path(args.deploy_dir) if args.deploy_dir else default_deploy_dir()
+    if not deploy.is_dir():
+        print(f"plugin sources not found at {deploy}; pass --deploy-dir", file=sys.stderr)
+        return 1
+    items = link_plugins(deploy, str(Path(herdr_eng).absolute()), data_dir=state_root(os.environ).parent / "plugins",
+                         herdr_bin=args.herdr_bin or os.environ.get("HERDR_BIN") or "herdr")
+    for item in items:
+        print(f"{item.action:10} {item.target}" + (f"  ({item.detail})" if item.detail else ""))
+    return 0 if all(i.action not in FAIL_ACTIONS for i in items) else 1
 
 
 def _cmd_handoff_subagent_hook(args) -> int:
