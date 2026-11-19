@@ -6,7 +6,6 @@ import json
 import math
 import os
 import re
-import shutil
 import stat
 import subprocess
 import time
@@ -15,7 +14,14 @@ from enum import StrEnum
 from pathlib import Path
 
 from .cargo_target_migration import process_paths
-from .cargo_target_storage import TARGET_MARKER, TOMBSTONE, _owned_json, target_directory
+from .cargo_target_storage import (
+    TARGET_MARKER,
+    TOMBSTONE,
+    _owned_json,
+    claim_tombstone,
+    remove_tree,
+    target_directory,
+)
 
 LOCK_NAMES = {".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"}
 GIB = 1024 ** 3
@@ -175,12 +181,17 @@ def _clean_profile(profile: Path, use_time: float, cutoff: float, limit: ScanLim
         os.close(profile_fd)
 
 
-def _collect_tombstone(path: Path, report: TierReport) -> None:
-    """Finish a deletion a sweep started (a target is renamed to a tombstone before it is removed)."""
+def _collect_tombstone(path: Path, report: TierReport, deadline: float) -> bool:
+    """Finish a deletion a sweep started: claim the tombstone (an atomic rename, so a concurrent sweep
+    never deletes the same one) and delete it until ``deadline``. False when time ran out."""
+    claimed = claim_tombstone(path)
+    if claimed is None:
+        return True
     try:
-        shutil.rmtree(path)
+        return remove_tree(claimed, deadline)
     except OSError as error:
         report.skip(f"{path.name}: {error}")
+        return True
 
 
 def sweep(cache: Path, state: Path, *, budget_bytes: int, min_idle_hours: float = 168,
@@ -195,10 +206,9 @@ def sweep(cache: Path, state: Path, *, budget_bytes: int, min_idle_hours: float 
                            apply=apply, max_entries=max_entries, max_seconds=max_seconds)
     deadline = time.monotonic() + max_seconds
     for grave in graves:
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= deadline or not _collect_tombstone(grave, report, deadline):
             report.skip("tombstones left for the next run (time bound)")
             break
-        _collect_tombstone(grave, report)
     return report
 
 

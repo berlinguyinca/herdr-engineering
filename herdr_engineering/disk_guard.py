@@ -24,6 +24,7 @@ from pathlib import Path
 OVERRIDE_ENV = "HERDR_DISK_GUARD_OVERRIDE"
 EXIT_REFUSED = 75  # EX_TEMPFAIL: retry after space is freed or with the override
 _COOLDOWN_SECONDS = 600
+_ABORT_COOLDOWN_SECONDS = 120  # a sweep that failed as a whole backs off briefly: its cause may persist
 DEFAULT_MIN_FREE_GIB = 50.0
 BUSY_WAIT_SECONDS = 120.0  # longest wait for another sweep that is already freeing space
 
@@ -55,11 +56,27 @@ def _stamp(state_dir: Path) -> Path:
     return state_dir / "disk-guard.json"
 
 
-def _recently_triggered(state_dir: Path, now: float) -> bool:
+def _read_stamp(state_dir: Path) -> dict:
     try:
-        return now - float(json.loads(_stamp(state_dir).read_text())["triggered_at"]) < _COOLDOWN_SECONDS
-    except (OSError, ValueError, KeyError, TypeError):
+        data = json.loads(_stamp(state_dir).read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _recently_triggered(state_dir: Path, now: float) -> bool:
+    stamp = _read_stamp(state_dir)
+    try:
+        cooldown = _ABORT_COOLDOWN_SECONDS if stamp.get("aborted") else _COOLDOWN_SECONDS
+        return now - float(stamp["triggered_at"]) < cooldown
+    except (KeyError, ValueError, TypeError):
         return False
+
+
+def last_abort(state_dir: Path) -> str:
+    """Why the last sweep failed as a whole ('' when it did not)."""
+    reason = _read_stamp(state_dir).get("aborted")
+    return reason if isinstance(reason, str) else ""
 
 
 def _wait_for_other_sweep(state_dir: Path, seconds: float) -> None:
@@ -92,7 +109,8 @@ def relieve(cleanup_cfg: Mapping, state_dir: Path, at_percent: float,
     reserve) only the configured ``pressure_percent`` does, so a reserve at 80% never cleans like 90%.
 
     Rate limited (a build storm must not spawn a storm of sweeps). Returns True when a sweep ran and removed
-    something, False when it removed nothing (or failed as a whole, which starts no cooldown) or another
+    something, False when it removed nothing (a sweep that failed as a whole starts a short, 2 minute
+    cooldown and its reason goes into the refusal) or another
     sweep was already freeing space (it is waited for, at most ``busy_wait`` seconds), and
     None when none could run (no roots, or one ran moments ago): the caller decides from a measurement.
     """
@@ -117,10 +135,11 @@ def relieve(cleanup_cfg: Mapping, state_dir: Path, at_percent: float,
         _wait_for_other_sweep(state_dir, busy_wait)
         return False
     removed = bool(result.get("removed_count") or result.get("tombstones_removed"))
-    if result.get("aborted"):
-        return removed  # the sweep itself failed (an lsof fault): retrying soon may work, no cooldown
+    stamp: dict[str, object] = {"triggered_at": now}
+    if result.get("aborted"):  # the sweep itself failed: back off briefly (a persistent cause must not
+        stamp["aborted"] = str((result.get("errors") or ["unknown"])[0])[:300]  # become a sweep storm)
     try:
-        _stamp(state_dir).write_text(json.dumps({"triggered_at": now}))
+        _stamp(state_dir).write_text(json.dumps(stamp))
     except OSError:
         pass  # no room for the stamp: still decide from the measurement
     return removed
@@ -150,9 +169,11 @@ def check_build_allowed(path: Path, cleanup_cfg: Mapping, state_dir: Path,
         if usage < refuse_at or free_gib >= floor_gib:
             return GuardDecision(True, usage, cleanup_ran=ran)
     ran = bool(ran)
+    aborted = last_abort(state_dir)
     return GuardDecision(
         False, usage,
         f"disk is {usage:.1f}% full with {free_gib:.1f} GiB free (limits {refuse_at:g}% / "
         f"{floor_gib:g} GiB): refusing to start a new build. "
-        f"Free space (herdr-eng build-cleanup run) or set {OVERRIDE_ENV}=1 to build anyway.",
+        + (f"The last cleanup could not run: {aborted}. " if aborted else "")
+        + f"Free space (herdr-eng build-cleanup run) or set {OVERRIDE_ENV}=1 to build anyway.",
         cleanup_ran=ran)

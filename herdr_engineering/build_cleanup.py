@@ -4,10 +4,18 @@ Sweeps exclude each other with ``build-cleanup.lock`` (exclusive) and take
 ``build-maintenance.lock`` shared, which only excludes the destructive maintenance jobs
 (retention, migration, cache eviction) and never a running build, so the disk guard can sweep
 from inside ``build-coordinate``. Running builds are protected per target: recent activity,
-build leases, open files / working directories of visible processes, and the managed target's
-build lock (``targets/<name>.lock``): a build holds it shared from before cargo starts until it
-ends, and the sweep takes it exclusively (non-blocking) right before deleting and keeps it until
-the delete is done, so a build never starts into a directory that is being removed.
+build leases, and open files / working directories of visible processes. Cargo's own file locks
+(``.cargo-lock``, ``.cargo-build-lock``, ``.cargo-artifact-lock`` in ``<profile>/`` and
+``<triple>/<profile>/``) are taken exclusively and non-blocking right before deleting and held
+through the delete; every build holds them (wrapper, IDE or script alike). Cargo drops them while a
+test or run binary executes, so the processes are looked at again under those locks, right before the
+removal (a snapshot that is still fresh is reused).
+
+A managed target is never deleted as a directory: its contents move into a tombstone
+``.<name>.deleting-<id>.claimed-<pid>`` beside it, everything except the target's ownership marker and
+Cargo's lock files, which stay where they are (a cargo waiting on a lock holds it on the real path and
+resumes into a valid, empty target). The tombstone is claimed by renaming, so the sweep and retention
+never delete the same one; an interrupted delete leaves it for the next run.
 Inaccessible Herdr descendants or unknown ancestry always preserve files. Only current-user Cargo ``target``
 directories inside explicit roots are eligible; no symlinks are followed.
 
@@ -16,7 +24,7 @@ project directory is related (equal, inside or containing, by path prefix) to th
 scope of an unexpired build lease is preserved (``active_lease``). The lease is
 re-read right before deletion. A registry that exists but cannot be read makes the
 whole pass fail closed (``registry_unreadable``). Leases only ever ADD protection:
-the flock and /proc defences above are unchanged, and no registry file means
+the lock and process defences above are unchanged, and no registry file means
 exactly the legacy behaviour.
 """
 from __future__ import annotations
@@ -34,7 +42,14 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .cargo_target_storage import TARGET_MARKER, TOMBSTONE, _manager_lock, tombstone_path
+from .cargo_target_storage import (
+    TARGET_MARKER,
+    TOMBSTONE,
+    _manager_lock,
+    claim_tombstone,
+    remove_tree,
+    tombstone_path,
+)
 from .disk_guard import measure
 
 log = logging.getLogger(__name__)
@@ -50,32 +65,97 @@ def _managed_process(pid: Path, proc: Path) -> bool:
 
     Outside Herdr's tree, inaccessible daemon state is outside the build safety
     contract. Unknown ancestry raises instead of treating a process as outside.
+    A process that has exited is not managed; an ancestor that exits mid-walk is retried once
+    from a fresh ``PPid`` (the child was reparented).
     """
+    for attempt in (0, 1):
+        try:
+            return _ancestry_is_herdr(pid, proc)
+        except (FileNotFoundError, ProcessLookupError) as exc:
+            if not pid.exists():
+                return False  # the process itself exited
+            if attempt:
+                raise OSError(f"Process ancestry changed while inspecting {pid}") from exc
+    return False
+
+
+def _ancestry_is_herdr(pid: Path, proc: Path) -> bool:
     seen = set()
     current = pid
     while current.name != "0":
         if current.name in seen or len(seen) >= 256:
             raise OSError(f"Unverifiable process ancestry at {pid}")
         seen.add(current.name)
-        try:
-            metadata = current.stat()
-            argv = (current / "cmdline").read_bytes().split(b"\0")
-            if (metadata.st_uid == os.getuid() and argv and argv[0]
-                    and Path(os.fsdecode(argv[0])).name == "herdr"
-                    ):
-                executable = (current / "exe").resolve(strict=True)
-                if executable.name == "herdr":
-                    return True
-                raise OSError(f"Unverifiable Herdr executable at {current}")
-            parents = [line.split()[1]
-                       for line in (current / "status").read_text().splitlines()
-                       if line.startswith("PPid:")]
-        except FileNotFoundError as exc:
-            raise OSError(f"Process ancestry changed while inspecting {pid}") from exc
+        metadata = current.stat()
+        argv = (current / "cmdline").read_bytes().split(b"\0")
+        if (metadata.st_uid == os.getuid() and argv and argv[0]
+                and Path(os.fsdecode(argv[0])).name == "herdr"
+                ):
+            executable = (current / "exe").resolve(strict=True)
+            if executable.name == "herdr":
+                return True
+            raise OSError(f"Unverifiable Herdr executable at {current}")
+        parents = [line.split()[1]
+                   for line in (current / "status").read_text().splitlines()
+                   if line.startswith("PPid:")]
         if len(parents) != 1 or not parents[0].isdigit():
             raise OSError(f"Unverifiable process parent at {current}")
         current = proc / parents[0]
     return False
+
+
+def _state(pid: Path) -> str:
+    """``/proc/<pid>/stat`` state letter; ``""`` when the process is gone (ENOENT/ESRCH mid-walk).
+    An entry without a readable ``stat`` that still exists counts as live."""
+    try:
+        return (pid / "stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return "R" if pid.exists() else ""
+
+
+def _threads(pid: Path) -> int:
+    try:
+        for line in (pid / "status").read_text().splitlines():
+            if line.startswith("Threads:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 2  # unknown: assume threads, so a zombie is inspected rather than skipped
+
+
+def _gone_or_zombie(pid: Path) -> bool:
+    """True only when the process holds nothing: it vanished, or it is a zombie (``Z``/``X``) whose
+    thread group has no other thread. A leader that exited while other threads still run stays ``Z``,
+    but those threads keep its cwd and descriptors (readable under ``task/<tid>``): not skippable."""
+    state = _state(pid)
+    if state == "":
+        return True
+    return state in ("Z", "X") and _threads(pid) <= 1
+
+
+def _holders(pid: Path) -> list[Path]:
+    """The ``/proc`` directories whose cwd/exe/fd describe this process: itself, or for a zombie
+    leader the live threads under ``task/``."""
+    if _state(pid) not in ("Z", "X"):
+        return [pid]
+    try:
+        tasks = [pid / "task" / name for name in os.listdir(pid / "task") if name != pid.name]
+    except FileNotFoundError:
+        return []
+    return [task for task in tasks if _state(task) not in ("", "Z", "X")]
+
+
+def _links(holder: Path) -> list[Path]:
+    links = [holder / "cwd", holder / "exe"]
+    with os.scandir(holder / "fd") as entries:
+        links.extend(Path(entry.path) for entry in entries)
+    return links
+
+
+def _reuse_window(scan_seconds: float) -> float:
+    """How long a process snapshot stays good: a few seconds, or as long as a slow scan took (an lsof
+    on a busy host must not run again for every candidate while builds wait on the sweep's locks)."""
+    return max(_SNAPSHOT_REUSE_SECONDS, scan_seconds if scan_seconds > _SLOW_SCAN_SECONDS else 0.0)
 
 
 def _lsof_paths() -> list[Path]:
@@ -110,19 +190,30 @@ def _process_paths(proc: Path = Path("/proc")) -> list[Path]:
         try:
             if int(pid.name) == os.getpid() or pid.stat().st_uid != os.getuid():
                 continue
-            links = [pid / "cwd", pid / "exe"]
-            with os.scandir(pid / "fd") as entries:
-                links.extend(Path(entry.path) for entry in entries)
+            if _gone_or_zombie(pid):
+                continue
+            links = []
+            for holder in _holders(pid):
+                try:
+                    links.extend(_links(holder))
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                except PermissionError as exc:
+                    if holder != pid:  # a live thread of a zombie leader that cannot be read: unverifiable
+                        raise OSError(f"Cannot inspect thread {holder}") from exc
+                    raise
             for link in links:
                 try:
                     value = os.readlink(link)
-                except FileNotFoundError:  # descriptor closed / process exited
+                except (FileNotFoundError, ProcessLookupError):  # descriptor closed / process exited
                     continue
                 if value.startswith("/"):
                     paths.append(Path(value.removesuffix(" (deleted)")))
-        except FileNotFoundError:  # process exited during inspection
+        except (FileNotFoundError, ProcessLookupError):  # process exited during inspection
             continue
         except PermissionError:
+            if _gone_or_zombie(pid):  # became a zombie or exited since the check above
+                continue
             if _managed_process(pid, proc):
                 raise
             # Nondumpable daemons outside Herdr cannot be managed build jobs.
@@ -224,6 +315,9 @@ def _project(target: Path) -> Path:
 
 _BUSY = -1
 _SNAPSHOT_REUSE_SECONDS = 5.0
+_SLOW_SCAN_SECONDS = 1.0  # a scan slower than this keeps its snapshot as long as the scan took
+_TOMBSTONE_SECONDS = 120.0  # time a sweep spends collecting leftover tombstones, per root
+_DELETE_SECONDS = 600.0  # time one target's tombstone may take to delete; the rest waits for the next run
 _CARGO_LOCK_NAMES = frozenset({".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"})
 _NOT_PROFILES = frozenset({"deps", "build", "incremental", ".fingerprint", "examples"})
 
@@ -272,35 +366,54 @@ def _lock_for_removal(target: Path) -> list[int] | int:
 
 
 def _release_removal_lock(fds: list[int]) -> None:
-    for fd in fds:
-        os.close(fd)
+    """Close the lock descriptors (idempotent: the list is emptied)."""
+    while fds:
+        os.close(fds.pop())
 
 
-def _remove_target(target: Path) -> None:
-    """Delete ``target``. A managed target keeps its directory and ownership marker: under the manager lock
-    its contents move into a tombstone beside it, so ``./target`` never dangles and a cargo that was waiting
-    on the locks resumes into a valid, empty managed target. An interrupted delete leaves the tombstone,
-    which the next sweep or retention run collects."""
-    if _managed_workspace(target) is not None:
-        grave = tombstone_path(target)
-        with _manager_lock(target.parent):
-            grave.mkdir(mode=0o700)
-            for entry in os.listdir(target):
-                if entry != TARGET_MARKER:
-                    os.rename(target / entry, grave / entry)
-        target = grave
-    # CPython's fd-based rmtree prevents symlink substitution attacks.
-    if not shutil.rmtree.avoids_symlink_attacks:
-        raise OSError("This platform lacks symlink-safe recursive removal")
-    shutil.rmtree(target)
+def _preserved(target: Path) -> tuple[set[str], set[str]]:
+    """Cargo's lock files under ``target`` and the directories that lead to them: these stay in place."""
+    locks = set(_cargo_lock_files(target))
+    return locks, {str(parent) for lock in locks for parent in Path(lock).parents if parent != target
+                   and parent.is_relative_to(target)}
 
 
-def _is_emptied(target: Path) -> bool:
-    """A managed target that holds nothing but its ownership marker."""
-    try:
-        return os.listdir(target) == [TARGET_MARKER] and _managed_workspace(target) is not None
-    except OSError:
-        return False
+def _move_contents(source: Path, grave: Path, locks: set[str], keep_dirs: set[str]) -> None:
+    for name in os.listdir(source):
+        entry = source / name
+        if str(entry) in locks:
+            continue
+        if str(entry) in keep_dirs:
+            (grave / name).mkdir(mode=0o700)
+            _move_contents(entry, grave / name, locks, keep_dirs)
+        else:
+            os.rename(entry, grave / name)
+
+
+def _remove_target(target: Path, held: list[int] | None = None, seconds: float | None = None) -> bool:
+    """Delete ``target``; True when it is all gone.
+
+    A managed target keeps its directory, its ownership marker and Cargo's lock files: under the manager
+    lock the rest of its contents move into a tombstone beside it, so ``./target`` never dangles and a
+    cargo that was waiting on a lock holds it on the real path and resumes into a valid, empty managed
+    target. ``held`` (the sweep's Cargo locks) is released right after the move, before the slow delete.
+    The delete stops after ``seconds``; what is left stays in the tombstone for the next run.
+    """
+    if _managed_workspace(target) is None:
+        # CPython's fd-based rmtree prevents symlink substitution attacks.
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise OSError("This platform lacks symlink-safe recursive removal")
+        shutil.rmtree(target)
+        return True
+    grave = tombstone_path(target, claimed=True)
+    with _manager_lock(target.parent):
+        grave.mkdir(mode=0o700)
+        locks, keep_dirs = _preserved(target)
+        locks.add(str(target / TARGET_MARKER))
+        _move_contents(target, grave, locks, keep_dirs)
+    if held is not None:
+        _release_removal_lock(held)
+    return remove_tree(grave, None if seconds is None else time.monotonic() + seconds)
 
 
 def _inspect(target: Path) -> tuple[float, int]:
@@ -527,10 +640,19 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
             except OSError as exc:
                 _skip_root(result, root, str(exc))
                 continue
+            deadline = time.monotonic() + _TOMBSTONE_SECONDS
             for grave in graves if not result["dry_run"] else []:
+                if time.monotonic() >= deadline:
+                    _skip_root(result, root, "tombstones left for the next run (time bound)")
+                    break
+                claimed = claim_tombstone(grave)  # atomic: retention never deletes the same one
+                if claimed is None:
+                    continue
                 try:
-                    shutil.rmtree(grave)
-                    result["tombstones_removed"] += 1
+                    if remove_tree(claimed, deadline):
+                        result["tombstones_removed"] += 1
+                    else:
+                        _skip_root(result, root, "tombstones left for the next run (time bound)")
                 except OSError as exc:
                     _skip_root(result, grave, f"tombstone not removed: {exc}")
             for target in targets:
@@ -547,8 +669,6 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
                     continue
                 if newest > cutoff:
                     result["skipped"].append({"path": str(target), "reason": "recent activity"})
-                elif _is_emptied(target):
-                    continue  # a managed target a sweep already emptied: nothing to reclaim
                 else:
                     candidates.append((newest, str(target), size))
                     cutoffs[str(target)] = cutoff
@@ -556,8 +676,10 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
             return
         # Verify process visibility before deleting anything.
         result["process_scans"] += 1
+        started = time.monotonic()
         active = _process_paths()
         scanned_at = time.monotonic()
+        window = _reuse_window(scanned_at - started)
     except (OSError, ValueError) as exc:
         result["errors"].append(str(exc))
         result["aborted"] = True  # the sweep itself failed (process scan, discovery): nothing was judged
@@ -608,14 +730,18 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
                 # Look at the processes once more right before removing. Cargo releases its locks while a
                 # test or run binary executes out of the target, so the locks alone are not enough. A
                 # snapshot younger than a few seconds is as good as a new one.
-                if time.monotonic() - scanned_at >= _SNAPSHOT_REUSE_SECONDS:
+                if time.monotonic() - scanned_at >= window:
                     result["process_scans"] += 1
-                    active, scanned_at = _process_paths(), time.monotonic()
+                    started = time.monotonic()
+                    active = _process_paths()
+                    scanned_at = time.monotonic()
+                    window = _reuse_window(scanned_at - started)
                 if _in_use(target, active):
                     result["skipped"].append({"path": name, "reason": "active project"})
                     continue
                 before = shutil.disk_usage(root).free
-                _remove_target(target)
+                if not _remove_target(target, lock_fds, _DELETE_SECONDS):
+                    result["warnings"].append(f"{name}: delete continues in the next run (time bound)")
             finally:
                 _release_removal_lock(lock_fds)
             after = shutil.disk_usage(root).free

@@ -116,7 +116,8 @@ When no storage tier keeps `min_free_disk_percent` free, the cargo wrapper runs 
 the filesystem that missed the reserve and applying only the configured `pressure_percent` rules, looks at the tiers
 again and exits 75 if none fits (the message says "even after cleaning up" only when a cleanup ran; with
 `build_cleanup.enabled: false` none does). The guard's own refusal still runs the sweep in pressure mode.
-A sweep that failed as a whole (for example the process scan) does not start the 10-minute cooldown; a
+A sweep that failed as a whole (for example the process scan) starts a 2-minute back-off (not the 10-minute
+cooldown) and its reason is named in the refusal; a
 per-target fault is reported and skipped and the sweep still counts as completed. The refusal says "even after
 cleaning up" only when the cleanup actually removed something.
 
@@ -134,10 +135,14 @@ managed or not, is also checked against a process snapshot right before its remo
 5 seconds is reused rather than taken again).
 
 A managed target directory never disappears. Under the manager lock its contents move into a tombstone
-`.<name>.deleting-<id>` beside it and the directory keeps its ownership marker, so `./target` never dangles, and a
-cargo that was waiting on the sweep's locks resumes into a valid, empty managed target. The tombstone is deleted
-afterwards; an interrupted delete leaves it for the next sweep. Retention collects tombstones only after it has
-released the exclusive maintenance lock, and stops starting new ones after its time bound.
+`.<name>.deleting-<id>.claimed-<pid>` beside it. The directory keeps its ownership marker and Cargo's lock files
+(`.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock`), which are never moved: `./target` never dangles, a
+cargo that was waiting on a lock holds it on the real path and resumes into a valid, empty managed target, and a
+second cargo serializes behind it. The sweep's locks are released before the slow delete. A tombstone is claimed by
+renaming (`.claimed-<pid>`), so the sweep and retention never delete the same one; a claim whose process died is
+taken over. Deletes stop at a time bound and continue on the next run. Retention collects tombstones only after it
+has released the exclusive maintenance lock. A process snapshot that took longer than a second is reused for as
+long as it took, so a slow `lsof` does not run again for every candidate.
 
 `build_cleanup: false` means `enabled: false` with the default thresholds (a bool is accepted everywhere; any other
 non-mapping value is a configuration error). `herdr-eng build-cleanup run --root PATH` sweeps the named root even when

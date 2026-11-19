@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import tomllib
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -213,13 +214,80 @@ def _write_marker(path: Path, payload: dict[str, object]) -> None:
         os.fsync(output.fileno())
 
 
-TOMBSTONE = re.compile(r"\.(?P<name>[^/]+)\.deleting-[0-9a-f]{12}")
+TOMBSTONE = re.compile(r"\.(?P<name>[^/]+?)\.deleting-[0-9a-f]{12}(?:\.claimed-(?P<pid>[0-9]+))?")
 
 
-def tombstone_path(target: Path) -> Path:
-    """Where a managed target is renamed to (same directory, so same filesystem) before it is deleted:
-    a half-deleted target can then never be taken for a target (it is collected as a tombstone)."""
-    return target.with_name(f".{target.name}.deleting-{uuid4().hex[:12]}")
+def tombstone_path(target: Path, claimed: bool = False) -> Path:
+    """Where a managed target's contents go (same directory, so same filesystem) before they are deleted:
+    a half-deleted target can then never be taken for a target (it is collected as a tombstone).
+    ``claimed`` names it for this process from the start, so nothing else collects it."""
+    grave = target.with_name(f".{target.name}.deleting-{uuid4().hex[:12]}")
+    return grave.with_name(f"{grave.name}.claimed-{os.getpid()}") if claimed else grave
+
+
+def claim_tombstone(grave: Path) -> Path | None:
+    """Atomically take a tombstone for this process by renaming it to ``<name>.claimed-<pid>``.
+
+    None when someone else holds it (a live process claimed it, or it is gone). A claim of a dead
+    process is taken over, so a crashed deleter never strands a tombstone.
+    """
+    match = TOMBSTONE.fullmatch(grave.name)
+    if match is None:
+        return None
+    holder = match.group("pid")
+    if holder is not None:
+        if int(holder) == os.getpid():
+            return grave
+        try:
+            os.kill(int(holder), 0)
+            return None  # its deleter is alive
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return None
+    base = grave.name.split(".claimed-")[0]
+    claimed = grave.with_name(f"{base}.claimed-{os.getpid()}")
+    try:
+        os.rename(grave, claimed)
+    except FileNotFoundError:
+        return None
+    return claimed
+
+
+def _empty_directory(fd: int, deadline: float | None) -> bool:
+    with os.scandir(fd) as entries:
+        children = [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in entries]
+    for name, is_dir in children:
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        if not is_dir:
+            os.unlink(name, dir_fd=fd)
+            continue
+        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        try:
+            finished = _empty_directory(child, deadline)
+        finally:
+            os.close(child)
+        if not finished:
+            return False
+        os.rmdir(name, dir_fd=fd)
+    return True
+
+
+def remove_tree(path: Path, deadline: float | None = None) -> bool:
+    """Delete ``path`` (symlink-safe, descriptor based) until ``deadline`` (``time.monotonic``).
+
+    True when it is gone; False when time ran out first (what is left is a smaller tree, so a later run
+    simply continues). OSError propagates.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        finished = _empty_directory(fd, deadline)
+    finally:
+        os.close(fd)
+    if finished:
+        os.rmdir(path)
+    return finished
 
 
 @contextmanager
@@ -237,8 +305,9 @@ def prepare_target(cache: Path, workspace: Path) -> Path:
 
     No lock of ours protects a running build: Cargo flocks ``.cargo-lock`` in the target's profile
     directories for every build, from this wrapper, an IDE or a script alike, and the sweep honours
-    exactly those locks (and removes a target by renaming it away first, so this function sees a whole
-    target or none).
+    exactly those locks. A sweep never moves a lock file or the target's marker (it moves the rest of the
+    contents into a tombstone), so a cargo waiting on a lock holds it on the real path and this function
+    always sees a whole, owned target.
     """
     if not cache.is_dir():
         raise ValueError("Selected storage disappeared; refusing to create a mount directory")

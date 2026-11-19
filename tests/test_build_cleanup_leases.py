@@ -14,7 +14,14 @@ import pytest
 from herdr_engineering import build_cleanup as cleanup
 from herdr_engineering import build_registry as br
 
-FORCE = {"high_water": 1, "low_water": 0, "min_age_hours": 24}
+
+def force(root: Path) -> dict:
+    """Thresholds relative to what the filesystem under ``root`` really shows, so a nearly empty tmpfs
+    still triggers a sweep (``high_water=1`` would assume at least 1% used)."""
+    usage = cleanup._usage(root)
+    if usage <= 0:
+        pytest.skip("the filesystem reports no usage at all")
+    return {"high_water": usage / 2, "low_water": 0.0, "min_age_hours": 24}
 
 
 @pytest.fixture(autouse=True)
@@ -38,7 +45,7 @@ def project(root: Path, name="project", age=48) -> Path:
 
 
 def sweep(root, state, **kw):
-    return cleanup.run_once([root], state, **{**FORCE, **kw})
+    return cleanup.run_once([root], state, **{**force(root), **kw})
 
 
 def reasons(res):
@@ -164,35 +171,43 @@ def test_no_registry_file_is_legacy_behavior(env):
     assert not (state / br.DB_NAME).exists()  # cleanup never creates the registry
 
 
+_RACING_CHILD = """
+import json, os, sys, time
+import herdr_engineering.build_cleanup as c
+root, state, ready, go, high = sys.argv[1:6]
+c._SNAPSHOT_REUSE_SECONDS = 0.0
+original = c._untracked
+
+def paused(target):  # our own sync point: the first target is past its first checks, nothing is removed yet
+    if not os.path.exists(ready):
+        open(ready, "w").close()
+        while not os.path.exists(go):
+            time.sleep(0.02)
+    return original(target)
+
+c._untracked = paused
+print(json.dumps(c.run_once([root], state, high_water=float(high), low_water=0.0, min_age_hours=24)))
+"""
+
+
 def sweep_while_racing(root, state, tmp_path, race):
     """Run a real sweep in another process and run ``race()`` while that sweep is between its first
-    checks and its removal. A ``git`` wrapper on the sweep's PATH (it execs the real git) pauses the
-    sweep when it asks git about the target, which happens after the first lease check."""
-    import shutil
-    real_git = shutil.which("git")
-    bin_dir = tmp_path / "pause-bin"
-    bin_dir.mkdir()
+    checks and its removal. The sweep stops at a sync point of ours (not inside a timeout-bounded
+    subprocess) and goes on when ``race`` has run; every wait is for a signal, never for a fixed time."""
+    import json
     ready, go = tmp_path / "ready", tmp_path / "go"
-    shim = bin_dir / "git"
-    shim.write_text(f"#!/bin/sh\n[ -e '{ready}' ] || {{ : > '{ready}'; while [ ! -e '{go}' ]; do sleep 0.05; done; }}\n"
-                    f"exec '{real_git}' \"$@\"\n")
-    shim.chmod(0o755)
-    code = ("import json, sys; import herdr_engineering.build_cleanup as c; c._SNAPSHOT_REUSE_SECONDS = 0.0; "
-            "run_once = c.run_once; print(json.dumps(run_once([sys.argv[1]], sys.argv[2], high_water=1, low_water=0, min_age_hours=24)))")
-    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
-           "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
-    child = subprocess.Popen([sys.executable, "-c", code, str(root), str(state)], env=env,
-                             stdout=subprocess.PIPE, text=True)
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    child = subprocess.Popen([sys.executable, "-c", _RACING_CHILD, str(root), str(state), str(ready), str(go),
+                              str(force(root)["high_water"])], env=env, stdout=subprocess.PIPE, text=True)
     try:
-        deadline = time.monotonic() + 120
+        deadline = time.monotonic() + 300
         while not ready.exists():
             assert child.poll() is None and time.monotonic() < deadline, "sweep never reached its removal step"
-            time.sleep(0.05)
+            time.sleep(0.02)
         race()
     finally:
         go.write_text("go")
     out, _ = child.communicate(timeout=300)
-    import json
     return json.loads(out.splitlines()[-1])
 
 
@@ -244,9 +259,9 @@ def test_process_started_after_the_first_scan_keeps_an_unmanaged_target(env, tmp
 
 def test_process_started_after_the_first_scan_keeps_a_managed_target_too(env, tmp_path):
     """Cargo releases its locks while a test or run binary executes, so a managed target gets the same
-    removal-moment process look as an operator's. The sweep child (snapshot-reuse window at 0) is held up
-    at the manager lock of the first removal; a process then starts in the second target."""
-    from herdr_engineering.cargo_target_storage import _manager_lock, prepare_target
+    removal-moment process look as an operator's. The sweep stops after its first scan; a process then
+    starts in the second target, which only the rescan right before its removal can still see."""
+    from herdr_engineering.cargo_target_storage import prepare_target
     root, state = env
     (root / "sccache").mkdir()
     targets = []
@@ -261,28 +276,17 @@ def test_process_started_after_the_first_scan_keeps_a_managed_target_too(env, tm
             os.utime(path, (stamp, stamp), follow_symlinks=False)
         targets.append(target)
     first, second = targets
-    code = ("import json, sys; import herdr_engineering.build_cleanup as c; c._SNAPSHOT_REUSE_SECONDS = 0.0; "
-            "print(json.dumps(c.run_once([sys.argv[1]], sys.argv[2], high_water=1, low_water=0, "
-            "min_age_hours=24)))")
-    env_vars = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
-    holder = None
-    with _manager_lock(first.parent):
-        child = subprocess.Popen([sys.executable, "-c", code, str(root), str(state)], env=env_vars,
-                                 stdout=subprocess.PIPE, text=True)
-        try:
-            time.sleep(8)  # the child has taken its first snapshot and waits to remove the first target
-            holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=second)
-            time.sleep(2)  # let it exist before the sweep looks
-        except BaseException:
-            child.kill()
-            raise
+    holder = []
+
+    def race():
+        holder.append(subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=second))
+
     try:
-        out, _ = child.communicate(timeout=300)
+        res = sweep_while_racing(root, state, tmp_path, race)
     finally:
-        if holder:
-            holder.kill()
-            holder.wait()
-    import json
-    res = json.loads(out.splitlines()[-1])
-    assert (second / "debug/artifact").exists(), res
-    assert any(s["path"] == str(second) and s["reason"] == "active project" for s in res["skipped"]), json.dumps(res)
+        for proc in holder:
+            proc.kill()
+            proc.wait()
+    assert (second / "debug/artifact").exists() and not (first / "debug/artifact").exists(), res
+    assert any(s["path"] == str(second) and s["reason"] == "active project" for s in res["skipped"]), res
+    assert res["process_scans"] >= 2, res  # the first scan, then one right before the first removal

@@ -57,7 +57,10 @@ def make_pool_target(slot: Path, age_hours: float = 48) -> Path:
 
 
 def sweep(root: Path, **kwargs):
-    base = {"high_water": 1, "low_water": 0, "min_age_hours": 24}
+    usage = cleanup._usage(root)  # relative to what the filesystem shows, not an assumed 1%
+    if usage <= 0:
+        pytest.skip("the filesystem reports no usage at all")
+    base = {"high_water": usage / 2, "low_water": 0, "min_age_hours": 24}
     return cleanup.run_once([root], root.parent / "state", **{**base, **kwargs})
 
 
@@ -1027,6 +1030,7 @@ def test_a_build_blocked_on_the_sweeps_locks_resumes_into_a_valid_target(root):
     _age(target)
     held = cleanup._lock_for_removal(target)
     assert isinstance(held, list) and held
+    inodes = {name: (target / "debug" / name).stat().st_ino for name in cleanup._CARGO_LOCK_NAMES}
     log = root.parent / "second-build.log"
     with log.open("w") as sink:
         build = subprocess.Popen([str(_real_cargo()), "build", "--offline"], cwd=crate,
@@ -1037,8 +1041,8 @@ def test_a_build_blocked_on_the_sweeps_locks_resumes_into_a_valid_target(root):
         while "waiting for file lock" not in log.read_text() and time.monotonic() < deadline:
             assert build.poll() is None, log.read_text()
             time.sleep(0.2)
-        cleanup._remove_target(target)
-        cleanup._release_removal_lock(held)
+        cleanup._remove_target(target, held)
+        assert {name: (target / "debug" / name).stat().st_ino for name in inodes} == inodes  # never moved
         assert build.wait(timeout=120) == 0, log.read_text()
     finally:
         _stop(build)
@@ -1075,12 +1079,29 @@ def test_retention_collects_tombstones_too(tmp_path):
     assert not grave.exists(), report
 
 
-def test_a_failed_sweep_does_not_start_the_cooldown(root, state_env):
-    """A sweep that returns status 'error' (here: its own state sits inside a target) stamps nothing."""
+def test_a_failed_sweep_backs_off_briefly_and_says_why(root, state_env):
+    """A sweep that failed as a whole (here: its own state sits inside a target) stamps a short cooldown with
+    the reason, so a permanent cause is not retried by every build start; it retries after two minutes."""
     cache = make_target(root, age_hours=48)
-    ran = disk_guard.relieve(_policy(root), cache / "state", 1)
-    assert ran is False and not (cache / "state/disk-guard.json").exists()
+    state = cache / "state"
+    assert disk_guard.relieve(_policy(root), state, 1) is False
+    stamp = json.loads((state / "disk-guard.json").read_text())
+    assert "Maintenance state is inside cleanup target" in stamp["aborted"]
+    assert disk_guard.last_abort(state) == stamp["aborted"]
+    assert disk_guard.relieve(_policy(root), state, 1) is None  # backing off
+    stamp["triggered_at"] -= 130  # past the two minutes, well inside the ten of a normal sweep
+    (state / "disk-guard.json").write_text(json.dumps(stamp))
+    assert disk_guard.relieve(_policy(root), state, 1) is False  # tried again
     assert cache.exists()
+
+
+def test_a_refusal_names_why_the_last_cleanup_could_not_run(root, monkeypatch):
+    cache = make_target(root, age_hours=48)
+    state = cache / "state"
+    monkeypatch.setattr(disk_guard, "measure", lambda path: (99.0, 1.0))
+    monkeypatch.setattr(cleanup, "_usage", lambda path: 99.0)  # a tmpfs root can really sit at 0%
+    decision = disk_guard.check_build_allowed(root, _policy(root, high_water=1), state, env={})
+    assert not decision.allowed and "could not run: Maintenance state is inside cleanup target" in decision.message
 
 
 def test_a_target_that_always_errors_does_not_disable_the_cooldown(root, state_env):
@@ -1175,3 +1196,98 @@ def test_a_process_snapshot_is_reused_for_a_few_seconds(root, monkeypatch):
     make_target(root, "d")
     monkeypatch.setattr(cleanup, "_SNAPSHOT_REUSE_SECONDS", 0.0)
     assert sweep(root)["process_scans"] == 3  # stale snapshots are taken again before each removal
+
+
+@pytest.mark.integration
+def test_a_second_cargo_serializes_behind_the_one_that_waited_on_the_sweep(root):
+    """The sweep never moves a lock file, so the cargo that waited holds the lock on the real path and a
+    cargo that starts after it must wait for it (two cargos in one target would corrupt it)."""
+    target = make_managed(root, "serial")
+    crate = _crate_with_slow_build(root.parent / "workspaces/serial-crate", seconds=5)
+    for name in cleanup._CARGO_LOCK_NAMES:
+        (target / "debug" / name).write_text("")
+    _age(target)
+    held = cleanup._lock_for_removal(target)
+    assert isinstance(held, list) and held
+    logs = [root.parent / "first.log", root.parent / "second.log"]
+    procs = []
+
+    def start(log):
+        with log.open("w") as sink:
+            procs.append(subprocess.Popen([str(_real_cargo()), "build", "--offline"], cwd=crate,
+                                          env=_direct_env(CARGO_TARGET_DIR=str(target)), stdout=sink,
+                                          stderr=sink, start_new_session=True))
+
+    def wait_for(log, text, proc):
+        deadline = time.monotonic() + 90
+        while text not in log.read_text() and time.monotonic() < deadline:
+            assert proc.poll() is None, log.read_text()
+            time.sleep(0.1)
+        assert text in log.read_text(), log.read_text()
+
+    try:
+        start(logs[0])
+        wait_for(logs[0], "waiting for file lock", procs[0])
+        cleanup._remove_target(target, held)
+        wait_for(logs[0], "Compiling slow", procs[0])  # the first cargo owns the lock and is building
+        start(logs[1])
+        wait_for(logs[1], "waiting for file lock", procs[1])
+        assert procs[0].poll() is None  # still building: the second one had to wait
+        assert procs[0].wait(timeout=120) == 0 and procs[1].wait(timeout=120) == 0
+    finally:
+        for proc in procs:
+            _stop(proc)
+
+
+def test_a_slow_process_scan_is_reused_as_long_as_it_took():
+    assert cleanup._reuse_window(0.05) == cleanup._SNAPSHOT_REUSE_SECONDS
+    assert cleanup._reuse_window(8.0) == 8.0  # an lsof that slow must not run again for every candidate
+
+
+def test_a_tombstone_is_claimed_atomically_and_a_live_claim_is_respected(root):
+    from herdr_engineering.cargo_target_storage import TOMBSTONE, claim_tombstone
+    grave = root / ".w.deleting-0123456789ab"
+    grave.mkdir()
+    mine = claim_tombstone(grave)
+    assert mine is not None and mine.name == f".w.deleting-0123456789ab.claimed-{os.getpid()}" and mine.is_dir()
+    assert TOMBSTONE.fullmatch(mine.name) and claim_tombstone(grave) is None  # gone from its old name
+    assert claim_tombstone(mine) == mine
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    other = root / f".x.deleting-0123456789ab.claimed-{sleeper.pid}"
+    other.mkdir()
+    try:
+        assert claim_tombstone(other) is None and other.exists()  # its deleter is alive
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+    taken = claim_tombstone(other)  # its deleter is dead now
+    assert taken is not None and taken.name.endswith(f".claimed-{os.getpid()}") and not other.exists()
+
+
+def test_a_delete_stops_at_its_time_bound_and_continues_later(root, tmp_path):
+    from herdr_engineering.cargo_target_storage import remove_tree
+    tree = root / "big"
+    for index in range(20):
+        (tree / f"d{index}").mkdir(parents=True)
+        (tree / f"d{index}/f").write_text("x")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep")
+    (tree / "d0/link").symlink_to(outside)
+    assert remove_tree(tree, time.monotonic() - 1) is False and tree.exists()
+    assert remove_tree(tree) is True and not tree.exists()
+    assert outside.read_text() == "keep"  # a symlink is removed, never followed
+
+
+def test_retention_leaves_a_tombstone_that_a_live_sweep_has_claimed(root):
+    from herdr_engineering.cargo_target_retention import TierReport, _collect_tombstone
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    grave = root / f".w.deleting-0123456789ab.claimed-{sleeper.pid}"
+    grave.mkdir()
+    (grave / "f").write_text("x")
+    try:
+        report = TierReport(root=str(root), budget_bytes=1)
+        assert _collect_tombstone(grave, report, time.monotonic() + 60) is True
+        assert (grave / "f").exists() and not report.skipped  # not deleted under its owner, no warning
+    finally:
+        sleeper.kill()
+        sleeper.wait()
