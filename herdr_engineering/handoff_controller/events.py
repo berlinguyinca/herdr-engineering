@@ -17,6 +17,22 @@ class Colour(StrEnum):
     RED = "red"  # stuck
 
 
+class StuckReason(StrEnum):
+    """Why a chain ended red; the `reason` of `handoff.stuck`."""
+    TAKEOVER_REFUSED_AND_COMPACTION_FAILED = "takeover_refused_and_compaction_failed"
+    BLOCKED = "blocked"  # the session waits on a dialog
+    WRONG_AGENT = "wrong_agent"  # the pane runs another harness than the session's
+    GIT_STATE_UNKNOWN = "git_state_unknown"
+    ON_MAIN_WITH_CHANGES = "on_main_with_changes"
+    NO_BRIEFING = "no_briefing"
+    NO_COMPACT_COMMAND = "no_compact_command"  # the harness's adapter has no compact command
+    COMPACTION_NOT_READY = "compaction_not_ready"  # never idle with an empty composer, so nothing could be typed
+    COMPACTION_NOT_STARTED = "compaction_not_started"  # the compact command was typed and the agent never went working
+    COMPACTION_TIMEOUT = "compaction_timeout"  # the agent went working and did not come back in time
+    POINTER_TOO_LONG = "pointer_too_long"  # the pointer text exceeds the typed-input limit
+    SUCCESSOR_WITHOUT_TAKEOVER = "successor_without_takeover"  # the record names a successor but no launched child
+
+
 EVENT_NAMES = frozenset({
     "handoff.triggered", "handoff.drain_started", "handoff.drained", "handoff.briefing_written",
     "handoff.briefing_fallback", "handoff.wip_committed", "handoff.takeover_started", "handoff.succeeded",

@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -83,3 +83,13 @@ class HerdrCli:
         if isinstance(error, dict) and error.get("code") == "agent_blocked":
             return PromptResult.BLOCKED
         return PromptResult.SENT if done.returncode == 0 and "result" in reply else PromptResult.FAILED
+
+    def send_text(self, pane_id: str, text: str) -> bool:
+        """Type `text` into the pane verbatim, without submitting it."""
+        done = self._run(["pane", "send-text", pane_id, text], _QUICK_CALL_S)
+        return done is not None and done.returncode == 0
+
+    def send_keys(self, pane_id: str, keys: Sequence[str]) -> bool:
+        """Press `keys` (Herdr's lowercase names, e.g. enter) in the pane."""
+        done = self._run(["pane", "send-keys", pane_id, *keys], _QUICK_CALL_S)
+        return done is not None and done.returncode == 0
