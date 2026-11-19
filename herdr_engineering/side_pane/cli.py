@@ -6,14 +6,19 @@ import sys
 from collections.abc import Mapping
 
 from . import app
-from .placement import DEFAULT_COMMAND, Outcome, ensure
+from .placement import DEFAULT_COMMAND, EnsureResult, Outcome, ensure
 from .style import clean
 
 _DESCRIPTION = """The session side pane: a read-only viewer of the focused session of its own Herdr tab (Summary, Handoffs, CI).
 
-Keys: 1, 2, 3 or Tab switch tabs; q closes the pane. Herdr has no collapse: q closes the pane and remembers that you
-did, so it is not reopened until a new managed session appears in the tab. `herdr-eng side-pane ensure --tab TAB_ID`
-opens it again and clears that memory."""
+Keys: 1, 2, 3 or Tab switch tabs; q closes the pane (q is ignored for the first 2 seconds). Herdr has no collapse: a pane
+that ends any way other than `ensure` replacing it (q, closing it in Herdr, a signal, a crash) counts as closed by you, so
+it is not reopened until a new managed session appears in the tab. `herdr-eng side-pane ensure --tab TAB_ID` opens it
+again and clears that memory.
+
+Pull requests on the CI tab come from `gh pr list` run with your own gh login, for the focused session's directory and
+branch only (a chain spanning repositories shows the current repository's PRs). Pipelines come from Woodpecker's public
+reads; no Woodpecker token is ever used."""
 
 
 def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -35,5 +40,14 @@ def register(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
 def _ensure(args: argparse.Namespace, env: Mapping[str, str] | None = None) -> int:
     """Open the tab's side pane, also after q closed it (the dismissal is cleared). 0 when the tab has one afterwards."""
     result = ensure(args.tab, args.pane, env=env, command=args.command, force=True)
-    print(clean(f"side-pane {args.tab}: {result.outcome}" + (f" {result.pane_id}" if result.pane_id else "")), file=sys.stderr)
+    print(clean(describe(result, args.tab)), file=sys.stderr)
     return 0 if result.outcome in (Outcome.CREATED, Outcome.EXISTS) else 1
+
+
+def describe(result: EnsureResult, tab: str) -> str:
+    text = f"side-pane {tab}: {result.outcome}" + (f" {result.pane_id}" if result.pane_id else "")
+    if result.focus is not None:
+        text += f" (focus: {result.focus})"
+    if result.outcome is Outcome.RUNNER_MISSING:
+        text += ": `herdr-eng` was not found on PATH or in ~/.local/bin, /opt/homebrew/bin, /usr/local/bin"
+    return text

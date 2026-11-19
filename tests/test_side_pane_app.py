@@ -24,6 +24,7 @@ from herdr_engineering.side_pane.model import EMPTY, SidePaneModel, build_model
 from herdr_engineering.side_pane.render import Tab
 from herdr_engineering.side_pane.schedule import CI_REFRESH_S
 from tests.handoff_controller_herdr import IsolatedHerdr, isolated_herdr, wait_for
+from tests.side_pane_support import focus_pane
 from tests.test_side_pane_model import (
     NOW,
     ago,
@@ -258,9 +259,9 @@ def test_runner_renders_three_tabs_and_switches_on_keys() -> None:
         assert wait_for(lambda: "no CI to show" in screen_of(side, pane) or "CI off" in screen_of(side, pane), 10.0)
         assert side.send_keys(pane, ["tab"])  # wraps to Summary
         assert wait_for(lambda: "Goal" in screen_of(side, pane), 10.0)
-        assert side.send_keys(pane, ["x"])  # no other actions: nothing changes, nothing crashes
-        time.sleep(0.5)
-        assert "Goal" in screen_of(side, pane)
+        assert side.send_keys(pane, ["x"])  # no other actions: nothing changes, nothing crashes ...
+        assert side.send_keys(pane, ["2"])  # ... and the next key is still handled, so "x" was read and ignored
+        assert wait_for(lambda: "#1 ship the filter" in screen_of(side, pane), 10.0)
         marker = state.read_marker(side_state(h), "w1:t1")
         assert marker is not None and marker.pane_id == pane and marker.pid is not None  # the pane registers itself
 
@@ -273,8 +274,11 @@ def test_q_closes_the_pane_and_records_the_dismissal() -> None:
         pane = open_side_pane(side, session)
         assert wait_for(lambda: state.read_marker(side_state(h), "w1:t1") is not None
                         and state.read_marker(side_state(h), "w1:t1").pid is not None, 30.0)  # type: ignore[union-attr]
-        assert side.send_keys(pane, ["q"])
-        assert wait_for(lambda: pane not in [r.pane_id for r in side.panes() or []], 20.0), "the pane did not exit"
+        def quit_pressed() -> bool:  # the viewer ignores q for its first two seconds, so keep asking
+            side.send_keys(pane, ["q"])
+            return pane not in [r.pane_id for r in side.panes() or []]
+
+        assert wait_for(quit_pressed, 30.0, 0.5), "the pane did not exit"
         assert state.read_marker(side_state(h), "w1:t1") is None
         terminal = next(r.terminal_id for r in side.panes() or [] if r.pane_id == session)
         assert terminal in state.read_dismissed(side_state(h), "w1:t1")
@@ -294,10 +298,10 @@ def test_each_pane_follows_its_own_tabs_focus_with_no_cross_talk() -> None:
         pane_a, pane_b = open_side_pane(side, a1), open_side_pane(side, b1)
         assert wait_for(lambda: "goal of B one" in screen_of(side, pane_b), 30.0), screen_of(side, pane_b)
         assert wait_for(lambda: "goal of A" in screen_of(side, pane_a), 30.0)
-        side.focus_pane(a2)
+        focus_pane(side, a2)
         assert wait_for(lambda: "goal of A two" in screen_of(side, pane_a), 15.0), screen_of(side, pane_a)
         assert "goal of B one" in screen_of(side, pane_b) and "goal of A" not in screen_of(side, pane_b)  # no cross-talk
-        side.focus_pane(a1)
+        focus_pane(side, a1)
         assert wait_for(lambda: "goal of A one" in screen_of(side, pane_a), 15.0)
         assert "goal of B one" in screen_of(side, pane_b)
 
@@ -324,7 +328,7 @@ def test_refresh_reads_the_live_context_gauge_through_the_adapter() -> None:
                                                   "cache_creation_input_tokens": 0}}}) + "\n")
         pane_app = app.PaneApp(side.tab_of(live), None, side, {"HOME": str(home_of(h))}, fetch_ci=None,
                                adapter_for=lambda harness: ClaudeAdapter(home=claude_home, env=h.env))
-        assert side.focus_pane(live)
+        assert focus_pane(side, live)
         pane_app.refresh(time.time())
         assert pane_app.snapshot.session is not None and pane_app.snapshot.session.pane_id == live
         pane_app.screen.key("2")
@@ -344,9 +348,9 @@ def test_runner_survives_a_missing_store_and_a_gone_pane() -> None:
         assert wait_for(lambda: "no handoffs" in screen_of(side, pane), 10.0)
         assert side.close(session)  # the followed session's pane disappears
         assert wait_for(lambda: pane in [r.pane_id for r in side.panes() or []], 5.0)
-        time.sleep(3.0)  # a few refreshes later the runner still answers keys
-        assert side.send_keys(pane, ["1"])
-        assert wait_for(lambda: "Goal" in screen_of(side, pane) or "no briefing" in screen_of(side, pane), 10.0)
+        assert wait_for(lambda: "no session in this tab" in screen_of(side, pane), 20.0)  # a refresh noticed it is gone
+        assert side.send_keys(pane, ["1"])  # and the runner still answers keys
+        assert wait_for(lambda: "no session in this tab" in screen_of(side, pane) or "Goal" in screen_of(side, pane), 10.0)
         assert side.panes() is not None and pane in [r.pane_id for r in side.panes() or []]
 
 
@@ -369,17 +373,17 @@ def test_a_pane_without_a_tab_reports_it_is_outside_herdr(tmp_path: Path) -> Non
     assert not pane_app.tick(1.5, 1000.5)  # the events schedule has not come due again
 
 
-def test_q_is_remembered_and_the_tab_keys_still_work(tmp_path: Path) -> None:
+def test_the_tab_keys_work_and_q_is_left_to_the_viewer(tmp_path: Path) -> None:
     pane_app = gone_app(tmp_path)
     assert pane_app.on_text("2") is True and pane_app.on_text("x") is False and not pane_app.quit_requested
-    assert pane_app.on_text("q") is False and pane_app.quit_requested
+    assert pane_app.on_text("q") is False and not pane_app.quit_requested  # only on_quit, called as the viewer exits, sets it
 
 
 def test_closing_removes_the_marker_and_a_quit_leaves_nothing_behind_without_sessions(tmp_path: Path) -> None:
     root = state.state_dir({"HERDR_ENGINEERING_STATE": str(tmp_path)})
     state.write_marker(root, state.Marker("w1:t1", "w1:p2", "t-2", None, 1, 1000.0))
     pane_app = gone_app(tmp_path)
-    pane_app.on_text("q")
+    pane_app.on_quit()
     pane_app.close()
     assert state.read_marker(root, "w1:t1") is None
 

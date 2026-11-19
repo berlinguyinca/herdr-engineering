@@ -1,7 +1,12 @@
 """Reading CI for the CI tab off the render path: one background read at a time, never an exception, tokenless.
 
-The branch and the remote come from `git` in the session's directory, the pull requests from `gh pr list` (a failure
-only means no pull request is known), the pipelines from `WoodpeckerProvider`'s public reads, which send no credential.
+The branch and the remote come from `git` in the session's directory, the pull requests from `gh pr list` run with the
+user's own `gh` login (their CLI session; a failure only means no pull request is known), the pipelines from
+`WoodpeckerProvider`'s public reads, which send no credential. No Woodpecker token is ever used. PRs are listed for the
+focused session's directory and branch only, so a chain that spans repositories shows the current repository's PRs.
+
+A read that runs past `CI_DEADLINE_S` is given up: the worker is free again, the tab shows "CI unavailable" and keeps the
+last good cards, marked stale.
 """
 from __future__ import annotations
 
@@ -11,13 +16,14 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ..ci import WoodpeckerProvider
 from .ci_tab import CiCard, CiState, build_cards
 
 _GIT_S = 10.0
+CI_DEADLINE_S = 90.0  # a read (git, gh and Woodpecker together) that takes longer is abandoned
 _REMOTE = re.compile(r"^(?:[\w.+-]+://(?:[^/@]+@)?[^/:]+(?::\d+)?/|[\w.-]+@[^:/]+:)([^/]+/[^/]+?)(?:\.git)?/?$")
 
 
@@ -59,32 +65,53 @@ class CiResult:
 
 
 class CiWorker:
-    """Runs `fetch` on a thread, one read at a time. `request` returns at once; `latest` is the last finished read."""
+    """Runs `fetch` on a thread, one read at a time. `request` returns at once; `latest` is the last finished read.
+    A read still running `deadline_s` after it started is abandoned: its late result is ignored."""
 
-    def __init__(self, fetch: Callable[[Path], tuple[CiCard, ...]], clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, fetch: Callable[[Path], tuple[CiCard, ...]], clock: Callable[[], float] = time.time,
+                 deadline_s: float = CI_DEADLINE_S) -> None:
         self._fetch = fetch
         self._clock = clock
+        self._deadline_s = deadline_s
         self._lock = threading.Lock()
         self._running = False
+        self._token = 0
+        self._started = 0.0
         self._latest: CiResult | None = None
+        self._good: CiResult | None = None
 
     def request(self, cwd: Path) -> bool:
-        """Start a read of `cwd` unless one is running; True when one was started."""
+        """Start a read of `cwd` unless one is running within its deadline; True when one was started."""
         with self._lock:
             if self._running:
-                return False
-            self._running = True
-        threading.Thread(target=self._read, args=(cwd,), daemon=True, name="side-pane-ci").start()
+                if self._clock() - self._started < self._deadline_s:
+                    return False
+                self._publish(cwd, TimeoutError(f"timed out after {self._deadline_s:g}s"))
+            self._running, self._started = True, self._clock()
+            self._token += 1
+            token = self._token
+        threading.Thread(target=self._read, args=(cwd, token), daemon=True, name="side-pane-ci").start()
         return True
 
-    def _read(self, cwd: Path) -> None:
+    def _publish(self, cwd: Path, error: Exception) -> None:
+        """Called with the lock held: the result of a failed or abandoned read, keeping the last good cards stale."""
+        card = CiCard("CI", "CI unavailable", CiState.UNAVAILABLE, (), None)
+        kept = tuple(replace(c, stale=True) for c in self._good.cards) if self._good is not None and self._good.cwd == cwd else ()
+        self._latest = CiResult(cwd, (card, *kept), f"{type(error).__name__}: {error}", self._clock())
+
+    def _read(self, cwd: Path, token: int) -> None:
         try:
-            result = CiResult(cwd, self._fetch(cwd), None, self._clock())
-        except Exception as error:  # a read must never end the pane: whatever failed shows as "CI unavailable"
-            card = CiCard("CI", "CI unavailable", CiState.UNAVAILABLE, (), None)
-            result = CiResult(cwd, (card,), f"{type(error).__name__}: {error}", self._clock())
+            cards, error = self._fetch(cwd), None
+        except Exception as caught:  # a read must never end the pane: whatever failed shows as "CI unavailable"
+            cards, error = (), caught
         with self._lock:
-            self._latest, self._running = result, False
+            if token != self._token:
+                return  # abandoned past its deadline: a newer read owns the result
+            if error is None:
+                self._latest = self._good = CiResult(cwd, cards, None, self._clock())
+            else:
+                self._publish(cwd, error)
+            self._running = False
 
     def latest(self) -> CiResult | None:
         with self._lock:

@@ -4,10 +4,17 @@
 not reopened until a new managed session appears in the tab (the dismissal lives in `state`, beside the marker);
 `force` (the `side-pane ensure` command) reopens it. A pane is recognised by the marker its runner registers, not by
 its title.
+
+Focus: the pane is split with `--no-focus`. Herdr has no focus-by-id, so afterwards `settle_focus` acts only when a fresh
+read shows the NEW pane holds the focus, and then makes at most one directional call, only when the new pane's left
+neighbour is the pane that had the focus. It never switches tabs and never walks through other panes; when it cannot
+restore the focus it says so with a `FocusOutcome`.
 """
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -15,12 +22,14 @@ from enum import StrEnum
 from pathlib import Path
 
 from ..handoff_controller.herdr_cli import AgentPane, harness_for_agent_name
+from ..handoff_controller.run import default_bin_dirs
 from . import state
 from .herdr import Layout, PaneRow, SideHerdr
 
 SIDE_WIDTH = 40  # columns the side pane gets
 MIN_SESSION_WIDTH = 60  # columns the session keeps at least; a narrower tab gets no side pane
 LOCK_TIMEOUT_S = 10.0
+CLOSE_WAIT_S = 5.0
 DEFAULT_COMMAND = "exec herdr-eng side-pane run"
 
 
@@ -32,12 +41,22 @@ class Outcome(StrEnum):
     NO_SESSION = "no_session"  # no managed session in the tab
     UNAVAILABLE = "unavailable"  # Herdr did not answer or refused
     LOCKED = "locked"  # another process is creating the pane
+    RUNNER_MISSING = "runner_missing"  # `herdr-eng` cannot be found, so no pane was created
+
+
+class FocusOutcome(StrEnum):
+    """What happened to the focus when a pane was created."""
+    UNCHANGED = "unchanged"  # the new pane did not take the focus
+    RESTORED = "restored"  # it took the focus and one directional call gave it back
+    LEFT_ON_SIDE_PANE = "left_on_side_pane"  # it took the focus and Herdr cannot give it back by id: left as it is
+    UNKNOWN = "unknown"  # Herdr did not answer, or the call did not give the focus back
 
 
 @dataclass(frozen=True)
 class EnsureResult:
     outcome: Outcome
     pane_id: str | None = None
+    focus: FocusOutcome | None = None  # set when a pane was created
 
 
 def pick_target(layout: Layout) -> str | None:
@@ -74,29 +93,37 @@ class Decision:
     target: str | None = None  # CREATED: split this pane ...
     ratio: float | None = None  # ... leaving it this share
     owner: str | None = None  # terminal of the target, recorded in the marker
+    close_pane: str | None = None  # the marker's own pane row, which no live runner holds: close it first
 
 
 def decide(*, rows: Sequence[PaneRow], sessions: Sequence[PaneRow], marker: state.Marker | None, dismissed: frozenset[str],
-           layout: Layout | None, target_pane: str | None, now: float, force: bool) -> Decision:
-    """`rows` are the tab's panes and `sessions` those that run a managed agent. A marker that is not live is stale; when
-    its pane is gone and the session it was opened beside is still there, the user closed the pane (dismissal), otherwise
-    Herdr restarted. A dismissal holds while every session in the tab was there when it was made; `force` ignores it."""
-    stale, remembered = False, ()
+           layout: Layout | None, target_pane: str | None, now: float, force: bool,
+           shown: frozenset[str] = frozenset(), grace_s: float = state.STARTUP_GRACE_S) -> Decision:
+    """`rows` are the tab's panes and `sessions` those that run a managed agent. A marker that is not live is stale.
+    Its pane row, when it is still there and the marker proves `ensure` made it (same terminal id), is closed before a new
+    one is made. When there is no pane of ours but there was one for these sessions (`shown`), or its runner started and
+    then died, the user ended it (dismissal); otherwise Herdr restarted. A dismissal holds while every session in the tab
+    was there when it was made; `force` ignores it."""
+    stale, remembered, close = False, (), None
+    row = None
     if marker is not None:
         row = next((r for r in rows if r.pane_id == marker.pane_id and r.terminal_id == marker.terminal_id), None)
-        if row is not None and state.marker_live(marker, now):
+        if row is not None and state.marker_live(marker, now, grace_s):
             return Decision(Outcome.EXISTS, row.pane_id)
         stale = True
-        if row is None and marker.session_terminal in {s.terminal_id for s in sessions}:
-            remembered = tuple(s.terminal_id for s in sessions)
+        close = row.pane_id if row is not None else None
+    if (row is None or marker is None or marker.pid is not None) and shown:
+        remembered = tuple(sorted(shown))
     if not sessions:
-        return Decision(Outcome.NO_SESSION, stale_marker=stale)
+        return Decision(Outcome.NO_SESSION, stale_marker=stale, close_pane=close)
     terminals = [s.terminal_id for s in sessions]
     if not force and is_dismissed(dismissed | frozenset(remembered), terminals):
-        return Decision(Outcome.DISMISSED, stale_marker=stale, dismiss=remembered)
+        return Decision(Outcome.DISMISSED, stale_marker=stale, dismiss=remembered, close_pane=close)
+    if close is not None:  # the layout still holds the pane that is about to go: decide again once it is closed
+        return Decision(None, stale_marker=stale, dismiss=remembered, clear_dismissed=True, close_pane=close)
     target = target_pane or (pick_target(layout) if layout else None)
     rect = layout.rects.get(target) if layout and target else None
-    keep = dict(stale_marker=stale, dismiss=remembered, clear_dismissed=True)
+    keep = dict(stale_marker=stale, dismiss=remembered, clear_dismissed=True, close_pane=close)
     if rect is None:
         return Decision(Outcome.UNAVAILABLE, **keep)
     ratio = split_ratio(rect.width)
@@ -106,16 +133,45 @@ def decide(*, rows: Sequence[PaneRow], sessions: Sequence[PaneRow], marker: stat
     return Decision(None, target=target, ratio=ratio, owner=owner, **keep)
 
 
+def runner_command(command: str, env: Mapping[str, str]) -> str | None:
+    """The command to type into the new pane. The default one is made absolute (the pane's shell may have a short PATH):
+    `herdr-eng` is looked for on PATH, then in the controller's usual bin dirs; None when it is nowhere. A command given
+    by hand is used as it is."""
+    if command != DEFAULT_COMMAND:
+        return command
+    search = os.pathsep.join([env["PATH"] if "PATH" in env else os.environ.get("PATH", ""),
+                              *map(str, default_bin_dirs(env))])
+    found = shutil.which("herdr-eng", path=search)
+    return f"exec {shlex.quote(found)} side-pane run" if found else None
+
+
+def settle_focus(herdr: SideHerdr, created: str, previous: str | None) -> FocusOutcome:
+    """After a split with `--no-focus`: act only if the new pane holds the focus. Herdr gives the focus back by direction
+    only, so with exactly one call, and only when the new pane's left neighbour is `previous` (the pane that had it).
+    Nothing walks through other panes and no tab is switched; otherwise the outcome says where the focus was left."""
+    row = herdr.pane(created)
+    if row is None:
+        return FocusOutcome.UNKNOWN
+    if not row.focused:
+        return FocusOutcome.UNCHANGED
+    if previous is None or herdr.neighbor(created, "left") != previous:
+        return FocusOutcome.LEFT_ON_SIDE_PANE
+    landed = herdr.focus_toward(created, "left")
+    back = herdr.pane(previous)
+    return FocusOutcome.RESTORED if landed == previous and back is not None and back.focused else FocusOutcome.UNKNOWN
+
+
 def ensure(tab_id: str, target_pane: str | None = None, herdr: SideHerdr | None = None,
            env: Mapping[str, str] | None = None, *, command: str = DEFAULT_COMMAND, force: bool = False,
-           lock_timeout_s: float = LOCK_TIMEOUT_S) -> EnsureResult:
+           lock_timeout_s: float = LOCK_TIMEOUT_S, start_grace_s: float = state.STARTUP_GRACE_S) -> EnsureResult:
     """Open the side pane of `tab_id` unless it has one, the user closed it, or the tab is too narrow. Never raises."""
     herdr = herdr or SideHerdr()
-    root = state.state_dir(os.environ if env is None else env)
+    env = os.environ if env is None else env
+    root = state.state_dir(env)
     with state.tab_lock(root, tab_id, lock_timeout_s) as held:
         if not held:
             return EnsureResult(Outcome.LOCKED)
-        return _ensure_locked(root, tab_id, target_pane, herdr, command, force)
+        return _ensure_locked(root, tab_id, target_pane, herdr, command, force, env, start_grace_s)
 
 
 def _sessions(herdr: SideHerdr, tab_id: str, rows: Sequence[PaneRow]) -> list[PaneRow] | None:
@@ -126,33 +182,57 @@ def _sessions(herdr: SideHerdr, tab_id: str, rows: Sequence[PaneRow]) -> list[Pa
     return [r for r in rows if r.pane_id in named]
 
 
-def _ensure_locked(root: Path, tab_id: str, target_pane: str | None, herdr: SideHerdr, command: str, force: bool) -> EnsureResult:
+def _wait_gone(herdr: SideHerdr, pane_id: str, anchor: str, timeout_s: float = CLOSE_WAIT_S) -> None:
+    """Closing is asynchronous in Herdr: wait until the pane is in neither the pane list nor the layout of `anchor`'s tab,
+    so the next layout read is the new one."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        rows, layout = herdr.panes(), herdr.layout(anchor)
+        if rows is None or layout is None or (all(r.pane_id != pane_id for r in rows) and pane_id not in layout.rects):
+            return
+        time.sleep(0.05)
+
+
+def _ensure_locked(root: Path, tab_id: str, target_pane: str | None, herdr: SideHerdr, command: str, force: bool,
+                   env: Mapping[str, str], grace_s: float) -> EnsureResult:
     now = time.time()
     rows = herdr.panes()
     in_tab = [r for r in rows if r.tab_id == tab_id] if rows is not None else []
     sessions = _sessions(herdr, tab_id, in_tab) if rows is not None else None
-    if sessions is None:
+    if sessions is None or rows is None:
         return EnsureResult(Outcome.UNAVAILABLE)
+    if rows:
+        state.prune(root, {r.tab_id for r in rows} | {tab_id})  # tabs Herdr no longer lists
     layout = herdr.layout(target_pane or sessions[0].pane_id) if sessions else None
     plan = decide(rows=in_tab, sessions=sessions, marker=state.read_marker(root, tab_id), dismissed=state.read_dismissed(root, tab_id),
-                  layout=layout, target_pane=target_pane, now=now, force=force)
+                  layout=layout, target_pane=target_pane, now=now, force=force, shown=state.read_shown(root, tab_id),
+                  grace_s=grace_s)
+    runner = runner_command(command, env) if plan.outcome is None else command
+    if runner is None:
+        return EnsureResult(Outcome.RUNNER_MISSING)  # nothing is created, closed or recorded
     if plan.stale_marker:
-        state.clear_marker(root, tab_id)
+        state.clear_marker(root, tab_id)  # first: the closed runner must not read its own marker and record a dismissal
     if plan.dismiss:
         state.dismiss(root, tab_id, list(plan.dismiss))
+    if plan.close_pane:
+        if not herdr.close(plan.close_pane):
+            return EnsureResult(Outcome.UNAVAILABLE)
+        _wait_gone(herdr, plan.close_pane, sessions[0].pane_id if sessions else plan.close_pane)
+        if plan.outcome is None:  # a pane that never started was in the way: look again, and make exactly one
+            return _ensure_locked(root, tab_id, target_pane, herdr, command, True, env, grace_s)
     if plan.clear_dismissed:
         state.clear_dismissed(root, tab_id)
     if plan.outcome is not None or plan.target is None or plan.ratio is None:
         return EnsureResult(plan.outcome or Outcome.UNAVAILABLE, plan.pane_id)
+    before = herdr.panes()
+    previous = next((r.pane_id for r in before or [] if r.focused), None)
     created = herdr.split(plan.target, plan.ratio, env={})
     if created is None:
         return EnsureResult(Outcome.UNAVAILABLE)
-    state.write_marker(root, state.Marker(tab_id, created.pane_id, created.terminal_id, plan.owner, None, now))
-    if not herdr.run_in(created.pane_id, command):
+    state.write_marker(root, state.Marker(tab_id, created.pane_id, created.terminal_id, plan.owner, None, time.time()))
+    state.write_shown(root, tab_id, [s.terminal_id for s in sessions])
+    if not herdr.run_in(created.pane_id, runner):
         herdr.close(created.pane_id)
         state.clear_marker(root, tab_id)
         return EnsureResult(Outcome.UNAVAILABLE)
-    after = herdr.layout(plan.target)
-    if layout and layout.focused_pane_id and after is not None and after.focused_pane_id != layout.focused_pane_id:
-        herdr.focus_pane(layout.focused_pane_id)  # splitting must not take focus from the session
-    return EnsureResult(Outcome.CREATED, created.pane_id)
+    return EnsureResult(Outcome.CREATED, created.pane_id, settle_focus(herdr, created.pane_id, previous))
