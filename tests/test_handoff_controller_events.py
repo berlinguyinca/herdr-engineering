@@ -133,3 +133,14 @@ def test_stuck_and_skipped_require_a_reason() -> None:
             with pytest.raises(ValueError):
                 ev(name, colour=colour, reason=reason)
     ev("handoff.skipped", reason="no usage yet")
+
+
+def test_read_skips_a_valid_json_line_that_fails_validation(tmp_path: Path) -> None:
+    log = EventLog(tmp_path)
+    log.append(ev())
+    bad = json.loads(ev("handoff.succeeded", colour=Colour.GREEN).to_json())
+    bad["colour"] = None  # a terminal event without its colour
+    with (tmp_path / "events.jsonl").open("a") as f:
+        f.write(json.dumps(bad) + "\n")
+    log.append(ev("handoff.drained"))
+    assert [e.event for e in log.read()] == ["handoff.triggered", "handoff.drained"]

@@ -1,7 +1,6 @@
 """Drain typing: the pure decision, and the real thing against a real isolated Herdr server and a composer-shaped program."""
 from __future__ import annotations
 
-import stat
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -16,8 +15,8 @@ from herdr_engineering.handoff_controller.drain import (
     Step,
     agent_matches,
     drain,
+    failed_prompt_outcome,
     next_step,
-    prompt_reached_pane,
     timeout_outcome,
 )
 from herdr_engineering.handoff_controller.herdr_cli import HerdrCli, PromptResult
@@ -123,7 +122,9 @@ def test_does_not_type_when_blocked(server: IsolatedHerdr) -> None:
     pane = pane_in_state(server, "blocked", extra_env="FAKE_TUI_BLOCKED=1")
     done = drain(ref(pane), ADAPTER, GATE, server.cli, ControllerConfig(drain_timeout_s=0.5), poll_s=POLL_S)
     assert done.outcome == "blocked"
+    time.sleep(0.3)
     assert submitted(server) == []
+    assert GATE.order_text[:40] not in server.cli.read_visible(pane)  # the refused order never reached the composer
 
 
 @herdr_server
@@ -140,24 +141,6 @@ def test_order_is_the_gate_text(server: IsolatedHerdr) -> None:
     assert drain(ref(pane), ADAPTER, GATE, server.cli, ControllerConfig(drain_timeout_s=10.0), poll_s=POLL_S).outcome == "typed"
     assert wait_for(lambda: submitted(server) == [GATE.order_text], 5.0), submitted(server)
     assert GATE.order_text[:40] in server.cli.read_visible(pane)
-
-
-# --- a failed prompt may still have reached the pane ---------------------------------------------------------------
-
-ORDER = GATE.order_text
-
-
-def test_failed_prompt_with_a_working_agent_counts_as_typed() -> None:
-    assert prompt_reached_pane("working", "", ORDER)
-
-
-def test_failed_prompt_with_the_order_on_screen_counts_as_typed() -> None:
-    assert prompt_reached_pane("idle", f"> {ORDER[:40]}\n", ORDER)
-
-
-def test_failed_prompt_with_an_idle_empty_screen_did_not_reach_the_pane() -> None:
-    assert not prompt_reached_pane("idle", "> \n", ORDER)
-    assert not prompt_reached_pane(None, "", ORDER)
 
 
 # --- the blocked flag, the wrong pane, the hot loop ---------------------------------------------------------------
@@ -198,46 +181,26 @@ def test_an_order_starting_with_a_dash_is_typed_as_text(server: IsolatedHerdr) -
     assert wait_for(lambda: submitted(server) == ["--hand off now"], 5.0), submitted(server)
 
 
-def herdr_script(tmp_path: Path, *, status: str, prompt_reply: str = "", wait_ok: bool = False) -> tuple[HerdrCli, Path]:
-    """A real executable that speaks herdr's CLI protocol for one pane, and logs every call: a herdr whose `agent wait`
-    fails at once and whose `agent prompt` is refused cannot be provoked from a real server."""
-    log = tmp_path / "calls.log"
-    screen = Path(__file__).parent / "fixtures" / "handoff_adapters" / "claude" / "screen_empty.ansi"
-    script = tmp_path / "herdr"
-    script.write_text(f"""#!/bin/sh
-echo "$2" >> {log}
-case "$2" in
-  get) echo '{{"result":{{"agent":{{"agent":"claude","agent_status":"{status}"}}}}}}' ;;
-  read) cat {screen} ;;
-  prompt) echo '{prompt_reply}'; exit 1 ;;
-  wait) exit {0 if wait_ok else 1} ;;
-esac
-""")
-    script.chmod(script.stat().st_mode | stat.S_IEXEC)
-    return HerdrCli(str(script), {}), log
-
-
-def calls(log: Path, verb: str) -> int:
-    return log.read_text().split().count(verb) if log.exists() else 0
-
-
-def test_a_quickly_failing_wait_does_not_spin_the_loop(tmp_path: Path) -> None:
-    herdr, log = herdr_script(tmp_path, status="working")
+def test_a_failing_herdr_does_not_spin_the_loop(tmp_path: Path) -> None:
+    """The failure path is real (no such binary); the clock is virtual so the count of rounds is exact."""
+    now = [0.0]
     slept: list[float] = []
 
     def sleep(seconds: float) -> None:
         slept.append(seconds)
-        time.sleep(seconds)
+        now[0] += seconds
 
-    done = drain(ref("w1:p1"), ADAPTER, GATE, herdr, ControllerConfig(drain_timeout_s=0.5), poll_s=0.1, sleep=sleep)
+    done = drain(ref("w1:p1"), ADAPTER, GATE, HerdrCli(str(tmp_path / "none"), {}),
+                 ControllerConfig(drain_timeout_s=1.0), poll_s=0.1, sleep=sleep, clock=lambda: now[0])
     assert done.outcome == "timeout"
-    assert slept, "the loop must pause between failed waits"
-    assert calls(log, "get") <= 8, calls(log, "get")  # 0.5 s at 0.1 s per round, with margin; a hot loop makes dozens
+    assert 1 <= len(slept) <= 11, len(slept)  # 1 s at 0.1 s per round; a hot loop would never advance the clock
 
 
-def test_a_refused_prompt_is_not_typed_and_the_drain_keeps_waiting(tmp_path: Path) -> None:
-    herdr, log = herdr_script(tmp_path, status="idle",
-                              prompt_reply='{"error":{"code":"agent_blocked","message":"blocked"}}')
-    done = drain(ref("w1:p1"), ADAPTER, GATE, herdr, ControllerConfig(drain_timeout_s=0.6), poll_s=0.1)
-    assert done.outcome == "timeout"
-    assert calls(log, "prompt") >= 2  # it tried again after the refusal instead of reporting typed
+@pytest.mark.parametrize("status", ["working", "blocked"])
+def test_after_a_failed_prompt_a_busy_agent_means_it_landed(status: str) -> None:
+    assert failed_prompt_outcome(status) == "typed"
+
+
+@pytest.mark.parametrize("status", ["idle", "done", "unknown", None])
+def test_after_a_failed_prompt_anything_else_is_uncertain(status: str | None) -> None:
+    assert failed_prompt_outcome(status) is None

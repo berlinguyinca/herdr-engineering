@@ -89,7 +89,7 @@ class EventLog:
             try:
                 parsed = HandoffEvent.from_json(line)
             except (ValueError, KeyError, TypeError):
-                continue  # a writer may be mid-append; skip the unparsable line
+                continue  # mid-append, or a line that fails validation: skip it
             if chain_id is None or parsed.chain_id == chain_id:
                 events.append(parsed)
         return events
