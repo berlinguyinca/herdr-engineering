@@ -59,9 +59,18 @@ def _existing_job_command(path: Path) -> list[str] | None:
         return None
 
 
+def _in_other_venv(executable: str) -> bool:
+    """True when ``executable`` lives in a virtualenv that is not the running interpreter's."""
+    path = Path(executable)
+    venv = path.parent.parent
+    return (venv / "pyvenv.cfg").is_file() and venv.resolve() != Path(sys.prefix).resolve()
+
+
 def _job_works(path: Path) -> bool:
+    """The job's executable exists and is not a leftover from another (older) virtualenv."""
     command = _existing_job_command(path)
-    return bool(command) and Path(command[0]).is_file() and os.access(command[0], os.X_OK)
+    return (bool(command) and Path(command[0]).is_file() and os.access(command[0], os.X_OK)
+            and not _in_other_venv(command[0]))
 
 
 def launchd_plist(herdr_eng: Command, interval_seconds: int, environment: dict[str, str] | None = None) -> bytes:

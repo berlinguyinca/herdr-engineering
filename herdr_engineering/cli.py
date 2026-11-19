@@ -3238,7 +3238,7 @@ def _cmd_build_coordinate(args) -> int:
               file=sys.stderr)
     if cmd and _guarded_build(cmd):
         from .cargo_host import _disk_guard_refusal
-        refused = _disk_guard_refusal(Path(os.environ.get("CARGO_TARGET_DIR") or Path.cwd()))
+        refused = _disk_guard_refusal(Path.cwd())
         if refused is not None:
             return refused
     return run_gated(cmd, slots=slots, max_load=args.max_load,
@@ -3270,20 +3270,31 @@ def _is_gate_command(cmd: list[str]) -> bool:
         and cmd[1] == "build-coordinate")
 
 
-def _build_cache_config():
-    """Effective ``fabric_build_cache`` config, or None when absent/disabled/invalid.
+def _build_cache_config_and_policy():
+    """(effective ``fabric_build_cache`` config or None, ``build_cleanup`` policy), from one config load.
 
-    A config problem must never block a build: it just runs uncached.
+    A config problem must never block a build: the cache config is then None (it runs uncached) and
+    the policy falls back to the non-strict load, so the disk guard still applies.
     """
     from .build_cache_config import validate
     from .config import load_config
     try:
-        section = load_config(strict_build_cache=True).get("fabric_build_cache")
+        loaded = load_config(strict_build_cache=True)
+        section = loaded.get("fabric_build_cache")
         cfg = validate(section) if section else None
     except Exception as exc:  # noqa: BLE001
         print(f"build-coordinate: build cache config ignored: {exc}", file=sys.stderr)
-        return None
-    return cfg if cfg is not None and cfg.enabled else None
+        try:
+            loaded = load_config()
+        except Exception:  # noqa: BLE001
+            loaded = {}
+        return None, loaded.get("build_cleanup", {})
+    return (cfg if cfg is not None and cfg.enabled else None), loaded.get("build_cleanup", {})
+
+
+def _build_cache_config():
+    """Effective ``fabric_build_cache`` config, or None when absent/disabled/invalid."""
+    return _build_cache_config_and_policy()[0]
 
 
 def _cmd_build_cache_inventory(args) -> int:

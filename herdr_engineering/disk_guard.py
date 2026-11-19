@@ -12,6 +12,7 @@ guard too.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import time
@@ -23,6 +24,7 @@ OVERRIDE_ENV = "HERDR_DISK_GUARD_OVERRIDE"
 EXIT_REFUSED = 75  # EX_TEMPFAIL: retry after space is freed or with the override
 _COOLDOWN_SECONDS = 600
 DEFAULT_MIN_FREE_GIB = 50.0
+BUSY_WAIT_SECONDS = 120.0  # longest wait for another sweep that is already freeing space
 
 
 @dataclass(frozen=True)
@@ -54,9 +56,34 @@ def _recently_triggered(state_dir: Path, now: float) -> bool:
         return False
 
 
+def _wait_for_other_sweep(state_dir: Path, seconds: float) -> None:
+    """Block (bounded) until the sweep that holds ``build-cleanup.lock`` finishes."""
+    try:
+        fd = os.open(state_dir / "build-cleanup.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return
+    try:
+        deadline = time.monotonic() + seconds
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return
+                time.sleep(0.2)
+    finally:
+        os.close(fd)
+
+
 def check_build_allowed(path: Path, cleanup_cfg: Mapping, state_dir: Path,
-                        env: Mapping[str, str] | None = None) -> GuardDecision:
-    """Decide whether a build whose output lands on ``path``'s filesystem may start."""
+                        env: Mapping[str, str] | None = None,
+                        busy_wait: float = BUSY_WAIT_SECONDS) -> GuardDecision:
+    """Decide whether a build whose output lands on ``path``'s filesystem may start.
+
+    When another sweep already holds the cleanup lock, this waits (at most ``busy_wait`` seconds) for it
+    to finish and re-measures, rather than refusing while that sweep is freeing the space.
+    """
     from .build_cleanup import run_once
     from .build_maintenance import effective_roots, policy_kwargs
     env = os.environ if env is None else env
@@ -84,7 +111,9 @@ def check_build_allowed(path: Path, cleanup_cfg: Mapping, state_dir: Path,
             result = run_once(roots=roots, state_dir=state_dir, **kwargs)
         except OSError:
             result = {"status": "error"}  # a full disk can fail the sweep itself: refuse below
-        if result.get("status") != "busy":  # a busy sweep freed nothing and must not use the cooldown
+        if result.get("status") == "busy":  # another sweep is running: its result is what we need
+            _wait_for_other_sweep(state_dir, busy_wait)
+        else:  # a busy sweep freed nothing and must not use the cooldown
             ran = True
             try:
                 _stamp(state_dir).write_text(json.dumps({"triggered_at": now}))

@@ -203,8 +203,8 @@ def sweep(cache: Path, state: Path, *, budget_bytes: int, min_idle_hours: float 
         candidates: list[tuple[float, Path, float, Path]] = []
         # Complete inventory before any deletion: partial scans never evict.
         for target in sorted(_children(root, limit)):
-            if target.name.startswith("."):
-                continue
+            if target.name.startswith(".") or target.name.endswith(".lock"):
+                continue  # manager files and the per-target build locks are not targets
             try:
                 if target.stat().st_dev != root.stat().st_dev:
                     raise ValueError("target mount boundary")

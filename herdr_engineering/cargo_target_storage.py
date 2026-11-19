@@ -114,22 +114,37 @@ def maintenance_lock(state: Path, *, exclusive: bool = False) -> Iterator[None]:
         os.close(fd)
 
 
-def _target_setting(path: Path) -> bool:
+def _target_setting(path: Path) -> Path | bool:
+    """The ``build.target-dir`` a Cargo config sets (relative to the config's project), True when it
+    overrides something unreadable or unresolvable, False when it sets nothing."""
     try:
         config = tomllib.loads(path.read_text())
     except FileNotFoundError:
         return False
     except (OSError, ValueError):
         return True  # Unknown configuration is never overridden.
-    return bool(config.get("include") or config.get("build", {}).get("target-dir"))
-
-
-def target_override(arguments: list[str], env: Mapping[str, str], cwd: Path) -> bool:
-    arguments = arguments[:arguments.index("--")] if "--" in arguments else arguments
-    if any(env.get(key) for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR")):
+    if config.get("include"):
         return True
+    value = config.get("build", {}).get("target-dir")
+    if not value:
+        return False
+    return Path(value) if isinstance(value, str) and Path(value).is_absolute() else (
+        path.parent.parent / value if isinstance(value, str) and path.parent.name == ".cargo" else True)
+
+
+def target_override(arguments: list[str], env: Mapping[str, str], cwd: Path) -> Path | bool:
+    """Where the caller already directs Cargo's output: the directory when it can be resolved, True when
+    something overrides it but the directory is unknown (a ``--config`` file), False when nothing does."""
+    arguments = arguments[:arguments.index("--")] if "--" in arguments else arguments
+    for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
+        if env.get(key):
+            return cwd / env[key]
     for index, arg in enumerate(arguments):
-        if arg == "--target-dir" or arg.startswith("--target-dir="):
+        if arg == "--target-dir" and index + 1 < len(arguments):
+            return cwd / arguments[index + 1]
+        if arg.startswith("--target-dir="):
+            return cwd / arg.split("=", 1)[1]
+        if arg == "--target-dir":
             return True
         if arg == "--config" and index + 1 < len(arguments):
             value = arguments[index + 1]
@@ -140,15 +155,22 @@ def target_override(arguments: list[str], env: Mapping[str, str], cwd: Path) -> 
         if "=" not in value:
             return True  # A separately supplied config file remains authoritative.
         try:
-            if tomllib.loads(value).get("build", {}).get("target-dir"):
-                return True
+            directory = tomllib.loads(value).get("build", {}).get("target-dir")
         except ValueError:
             return True
+        if directory:
+            return cwd / directory if isinstance(directory, str) else True
     for directory in (cwd, *cwd.parents):
-        if any(_target_setting(directory / ".cargo" / name) for name in ("config", "config.toml")):
-            return True
+        for name in ("config", "config.toml"):
+            found = _target_setting(directory / ".cargo" / name)
+            if found:
+                return found
     home = Path(env.get("CARGO_HOME", str(Path.home() / ".cargo")))
-    return any(_target_setting(home / name) for name in ("config", "config.toml"))
+    for name in ("config", "config.toml"):
+        found = _target_setting(home / name)
+        if found:
+            return found
+    return False
 
 
 def workspace_root(real_cargo: Path, arguments: list[str], cwd: Path) -> Path:
@@ -185,7 +207,43 @@ def _write_marker(path: Path, payload: dict[str, object]) -> None:
         os.fsync(output.fileno())
 
 
-def prepare_target(cache: Path, workspace: Path) -> Path:
+def target_lock_path(target: Path) -> Path:
+    """The lock beside (never inside) a managed target: builds hold it shared, a sweep exclusively."""
+    return target.parent / f"{target.name}.lock"
+
+
+def _hold_target_lock(target: Path) -> int:
+    """Shared, inheritable lock on ``target`` for the life of the build (and its exec'd children).
+
+    Waits out a sweep that is deleting the target. The sweep unlinks the lock when it is done, so the
+    path is re-checked against the descriptor and the lock re-opened when it was replaced.
+    """
+    path = target_lock_path(target)
+    for _ in range(20):
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            try:
+                same = os.stat(path).st_ino == os.fstat(fd).st_ino
+            except FileNotFoundError:
+                same = False
+            if same:
+                os.set_inheritable(fd, True)
+                return fd
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
+    raise ValueError("Cannot lock the managed target: it keeps being cleaned up")
+
+
+def prepare_target(cache: Path, workspace: Path, *, build_lock: bool = False) -> Path:
+    """The workspace's managed target, created and ownership-checked.
+
+    ``build_lock`` also takes the target's shared build lock and leaves it open (inheritable) so it is
+    held until the build, which inherits it across exec, ends: the sweep never deletes a target that a
+    build holds.
+    """
     if not cache.is_dir():
         raise ValueError("Selected storage disappeared; refusing to create a mount directory")
     target = target_directory(cache, workspace)
@@ -193,12 +251,13 @@ def prepare_target(cache: Path, workspace: Path) -> Path:
     if root.is_symlink():
         raise ValueError("Managed target root cannot be a symlink")
     root.mkdir(exist_ok=True, mode=0o700)  # parent must already exist on selected storage
+    lock_fd = _hold_target_lock(target) if build_lock else None
     fd = os.open(root / ".target-manager.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         root_marker = root / ".herdr-target-root.json"
         if not root_marker.exists():
-            if any(p.name != ".target-manager.lock" for p in root.iterdir()):
+            if any(not p.name.endswith(".lock") for p in root.iterdir()):
                 raise ValueError("Existing target root is not managed by Herdr")
             _write_marker(root_marker, {"version": 1, "owner_uid": os.getuid()})
         else:
@@ -220,18 +279,21 @@ def prepare_target(cache: Path, workspace: Path) -> Path:
             _write_marker(marker, expected)
         os.utime(marker, None, follow_symlinks=False)
         return target
+    except BaseException:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        raise
     finally:
         os.close(fd)
 
 
-# --- Legacy shared target pool ----------------------------------------------------------------
+# --- Retired shared target pool ---------------------------------------------------------------
 # The pool (``shared-targets/<repo-id>/<slot>/target``) is gone: every worktree has one managed
 # target. Hosts that already filled a pool keep it swept by build-cleanup until it is idle.
-SLOT_LOCK = ".herdr-slot.lock"
 
 
 def shared_targets_root(state: Path | None = None) -> Path:
-    """Directory of a legacy shared target pool (swept, never written)."""
+    """Directory of a retired shared target pool (swept, never written)."""
     if state is None:
         from .build_coord import _default_state_dir
         state = _default_state_dir()

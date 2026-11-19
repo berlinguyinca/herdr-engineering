@@ -134,4 +134,6 @@ The wrapper refuses new builds when the filesystem the build writes to is at lea
 `build_cleanup.refuse_builds_percent` used **and** has less than
 `build_cleanup.refuse_builds_min_free_gib` (default 50) available (exit 75), after one
 cleanup attempt, unless `HERDR_DISK_GUARD_OVERRIDE=1`; `build_cleanup.enabled: false`
-turns the guard off. Opt out with `fabric_build_cache: {enabled: false}`.
+turns the guard off. The guard also covers builds that run uncached (cache disabled or its
+config invalid) and measures the directory the build really writes to: the resolved
+`target-dir` (flag, environment or Cargo config), or where an operator's own `./target` link points. Opt out with `fabric_build_cache: {enabled: false}`.

@@ -165,9 +165,9 @@ def test_no_registry_file_is_legacy_behavior(env):
 
 
 def test_lease_taken_between_scan_and_delete_is_rechecked(env, monkeypatch):
-    """The 2nd ``_process_paths`` call happens after the first lease check and before
-    rmtree (the existing revalidation step). Acquire a lease there, from the same
-    seam the legacy tests already patch, and expect the target to survive."""
+    """The removal lock is taken after the first lease check and before rmtree (the
+    revalidation step). Acquire a lease at that point, wrapping the real lock function,
+    and expect the target to survive."""
     root, state = env
     t = project(root)
     reg = br.Registry(state)
@@ -175,16 +175,16 @@ def test_lease_taken_between_scan_and_delete_is_rechecked(env, monkeypatch):
     reg.transition(a.attempt_id, "classified", "t")
     reg.transition(a.attempt_id, "admitted", "t")
     calls = []
+    real_lock = cleanup._lock_for_removal
 
-    def scan():
+    def lock(target):
         calls.append(1)
-        if len(calls) == 2:
-            reg.acquire_lease(root / "project", a.attempt_id, 300)
-        return []
+        reg.acquire_lease(root / "project", a.attempt_id, 300)
+        return real_lock(target)
 
-    monkeypatch.setattr(cleanup, "_process_paths", scan)
+    monkeypatch.setattr(cleanup, "_lock_for_removal", lock)
     res = sweep(root, state)
-    assert len(calls) == 2, "revalidation seam not reached"
+    assert len(calls) == 1, "revalidation seam not reached"
     assert t.exists()
     assert reasons(res) == {"project": "active_lease"}
 
@@ -192,14 +192,12 @@ def test_lease_taken_between_scan_and_delete_is_rechecked(env, monkeypatch):
 def test_target_no_longer_recognized_is_never_removed(env, monkeypatch):
     root, state = env
     t = project(root)
-    calls = []
+    real_lock = cleanup._lock_for_removal
 
-    def scan():
-        calls.append(1)
-        if len(calls) == 2:  # between scan and delete the project is replaced
-            (root / "project" / "Cargo.toml").unlink()
-        return []
+    def lock(target):  # between scan and delete the project is replaced
+        (root / "project" / "Cargo.toml").unlink()
+        return real_lock(target)
 
-    monkeypatch.setattr(cleanup, "_process_paths", scan)
+    monkeypatch.setattr(cleanup, "_lock_for_removal", lock)
     res = sweep(root, state)
     assert t.exists() and res["removed"] == []

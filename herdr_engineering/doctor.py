@@ -278,7 +278,7 @@ def _add_build_hygiene(report: DoctorReport, config: dict[str, Any]) -> None:
                    "cargo-host enabled but the managed cargo launcher is not installed; "
                    "fix: herdr-eng build-hygiene install")
     else:
-        report.add("cargo_host", "ok", "managed cargo launcher installed (shared targets, incremental off)")
+        report.add("cargo_host", "ok", "managed cargo launcher installed (one managed target per worktree, incremental off)")
 
 
 def _adopted_plugins(lock_path: str) -> list[str]:

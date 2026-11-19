@@ -316,13 +316,17 @@ def _has_systemd_user_bus() -> bool:
     return rc == 0
 
 
-def _install_controller_cleanup(installer: Path, step, report: dict, have_bus: bool) -> None:
-    """Run the systemd cleanup installer; never fatal (a controller without a user bus just skips it)."""
+def _install_controller_cleanup(installer: Path, step, report: dict, have_bus: bool) -> bool:
+    """Run the systemd cleanup installer; never fatal (a controller without a user bus just skips it).
+
+    True only when the installer ran and succeeded, so the caller leaves the job to it only then.
+    """
     if not have_bus:
         report["steps"]["controller_cleanup"] = {"ok": True, "rc": 0, "skipped": "no systemd user bus",
                                                   "stderr": None}
-        return
-    step("controller_cleanup", ["bash", str(installer)], 120)  # failure is recorded in the report
+        return False
+    ok, _ = step("controller_cleanup", ["bash", str(installer)], 120)  # failure is recorded in the report
+    return bool(ok)
 
 
 def _build_hygiene_command(*, legacy_installer_ran: bool) -> list[str]:
@@ -457,9 +461,11 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                and isinstance(roots, list) and bool(roots)
                and all(isinstance(path, str) and path.strip() for path in roots))
     installer = root / "scripts" / "build-cleanup.sh"
-    legacy_installer_ran = enabled and installer.exists() and sys.platform.startswith("linux")
-    if legacy_installer_ran:
-        _install_controller_cleanup(installer, step, report, _has_systemd_user_bus())
+    legacy_installer_ran = False
+    # The systemd script cannot carry a custom state directory into its unit: build-hygiene writes that job.
+    if (enabled and installer.exists() and sys.platform.startswith("linux")
+            and not os.environ.get("HERDR_ENGINEERING_STATE")):
+        legacy_installer_ran = _install_controller_cleanup(installer, step, report, _has_systemd_user_bus())
 
     elif not enabled and sys.platform.startswith("linux"):
         loaded, value, _ = _run(["systemctl", "--user", "show",

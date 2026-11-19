@@ -79,7 +79,7 @@ def _tier_bases() -> list[Path]:
 
 
 def _managed_output_dirs() -> list[Path]:
-    """Existing legacy pools and per-workspace target folders of the state dir and every storage tier."""
+    """Retired shared pools and per-workspace target folders of the state dir and every storage tier."""
     from .build_coord import _default_state_dir
     from .cargo_target_storage import shared_targets_root
     bases = [_default_state_dir()]

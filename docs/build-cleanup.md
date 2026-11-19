@@ -38,8 +38,9 @@ A dry run inspects and reports candidates without deleting artifacts.
 
 Builds run through `herdr-eng build-coordinate -- COMMAND` hold a shared host
 maintenance lock, including when the concurrency limit is bypassed on timeout.
-Cleanup requires the exclusive lock, so it skips the pass when any coordinated
-build is running and blocks new coordinated builds until deletion ends. All
+Retention, migration and cache eviction require the exclusive side, so they skip
+their pass while any coordinated build runs. The cleanup sweep takes the shared side
+and protects a running build through the build's managed target instead (below). All
 participants must use the same `HERDR_ENGINEERING_STATE` location.
 
 Running inside a Herdr terminal alone does not acquire this lock. The Pi extension
@@ -83,13 +84,12 @@ build_cleanup:
   refuse_builds_min_free_gib: 50  # ... only when less than this is also available
 ```
 
-A sweep takes `build-cleanup.lock` exclusively (one sweep at a time) and `build-maintenance.lock` shared, so it never waits for or blocks a running build (the guard runs inside builds) and only yields to the exclusive maintenance jobs. A root that is missing or not canonical is skipped with a logged reason; it never aborts the sweep.
+A sweep takes `build-cleanup.lock` exclusively (one sweep at a time) and `build-maintenance.lock` shared, so it never waits for a running build (the guard runs inside builds) and only yields to the exclusive maintenance jobs. A running build is protected per target: the wrapper holds a shared lock on `targets/<name>.lock` from before cargo starts until the build ends, and the sweep takes it exclusively (non-blocking) right before deleting and keeps it through the delete. A target whose lock is held is skipped (`build in progress`); a build that starts during a delete waits for it and then starts on a fresh target. A subdirectory a sweep cannot read is skipped with a warning; the rest of its root is still swept. A root that is missing or not canonical is skipped with a logged reason; it never aborts the sweep.
 
-Targets still in use (live process, build lease, open file, held legacy pool-slot lock) are
+Targets still in use (live process, build lease, open file, held build lock) are
 never removed in any tier. When the build's filesystem is at or above `refuse_builds_percent`
 and has less than `refuse_builds_min_free_gib` available, a new cargo/build command
 (`build-coordinate` guards rustc, make, cmake, ninja, tsc and `go build|install|generate`, never `go test`/scripts; cargo is guarded by the wrapper, also under `build-coordinate`, for build, check, test, nextest, bench, run and the like, but not `cargo clean`) triggers
-one pressure cleanup (at most every 10 minutes; a sweep that found a build running does not
-count) and is refused with exit code 75 if the disk is still too full. Setting
+one pressure cleanup, run before the `min_free_disk_percent` reserve check so the check sees what it freed (at most every 10 minutes; a sweep that could not start because another one is running does not count, and the guard waits up to two minutes for that sweep and re-measures) and is refused with exit code 75 if the disk is still too full. Setting
 `build_cleanup.enabled: false` stops the sweeps (the launchd/systemd job is removed on the
 next install/`fleet update`, and `build-cleanup run` exits early) and the guard. `HERDR_DISK_GUARD_OVERRIDE=1` builds anyway.

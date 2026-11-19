@@ -289,20 +289,6 @@ def enable_retention(config_path: Path, *, schedule: bool = True) -> dict[str, o
             "min_idle_hours": config.local.target_min_idle_hours}
 
 
-def _explicit_target_dir(argv: list[str], env: Mapping[str, str]) -> Path | None:
-    """The target directory the caller chose (``--target-dir`` or the environment), if any."""
-    arguments = argv[:argv.index("--")] if "--" in argv else argv
-    for index, arg in enumerate(arguments):
-        if arg == "--target-dir" and index + 1 < len(arguments):
-            return Path(arguments[index + 1])
-        if arg.startswith("--target-dir="):
-            return Path(arg.split("=", 1)[1])
-    for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
-        if env.get(key):
-            return Path(env[key])
-    return None
-
-
 def _disk_guard_refusal(probe: Path, policy: Mapping | None = None) -> int | None:
     """Exit code when the disk-budget guard refuses a new build, else None. Never blocks on faults."""
     from .build_coord import _default_state_dir
@@ -324,20 +310,27 @@ def run_cargo(argv: list[str]) -> int:
     real = _real_cargo(Path.home())
     command = [str(real), *argv]
     subcommand = cargo_subcommand(argv)
-    from .cli import _build_cache_config
-    config = _build_cache_config()
+    from .cli import _build_cache_config_and_policy
+    config, policy = _build_cache_config_and_policy()
     already_coordinated = os.environ.get(COORDINATED) == "1"
-    if (config is None or subcommand not in {"build", "check", "test", "clippy", "nextest", "run",
-                                            "bench", "doc", "rustc", "rustdoc", "clean", "fix", "package"}):
+
+    def guard(probe: Path) -> int | None:
+        return None if subcommand == "clean" else _disk_guard_refusal(probe, policy)
+
+    if subcommand not in {"build", "check", "test", "clippy", "nextest", "run",
+                          "bench", "doc", "rustc", "rustdoc", "clean", "fix", "package"}:
+        os.execvpe(str(real), command, dict(os.environ))
+        return 127  # pragma: no cover
+    if config is None:  # uncached builds still write to disk: the guard applies, nothing else does
+        from .cargo_target_storage import target_override
+        where = target_override(argv, os.environ, Path.cwd())
+        refused = guard(where if isinstance(where, Path) else Path.cwd())
+        if refused is not None:
+            return refused
         os.execvpe(str(real), command, dict(os.environ))
         return 127  # pragma: no cover
     from .build_cache_policy import effective_slots
     from .build_coord import _default_slots, _default_state_dir, run_gated
-    from .config import load_config
-    policy = load_config().get("build_cleanup", {})
-
-    def guard(probe: Path) -> int | None:
-        return None if subcommand == "clean" else _disk_guard_refusal(probe, policy)
 
     def start() -> int:
         if already_coordinated:
@@ -354,11 +347,18 @@ def run_cargo(argv: list[str]) -> int:
         target_override,
         workspace_root,
     )
-    if config.local.manage_targets and not target_override(argv, os.environ, Path.cwd()):
+    override = target_override(argv, os.environ, Path.cwd())
+    if config.local.manage_targets and not override:
         from .build_cache_location import select_storage
         with maintenance_lock(_default_state_dir()):
-            selected = select_storage(config.local.storage_tiers, _default_state_dir() / "sccache",
-                                      0 if subcommand == "clean" else config.local.min_free_disk_percent)
+            reserve = 0 if subcommand == "clean" else config.local.min_free_disk_percent
+            # The guard's pressure cleanup runs before the reserve check, so the check sees what it freed.
+            selected = select_storage(config.local.storage_tiers, _default_state_dir() / "sccache", 0)
+            if selected.directory is not None and reserve:
+                refused = guard(selected.directory)
+                if refused is not None:
+                    return refused
+                selected = select_storage(config.local.storage_tiers, _default_state_dir() / "sccache", reserve)
             if selected.directory is None:
                 raise ValueError("No writable storage tier meets the reserve; managed build was not started")
             if not selected.directory.exists():
@@ -372,18 +372,19 @@ def run_cargo(argv: list[str]) -> int:
             if (old_target.exists() or old_target.is_symlink()) and not alias_owned(_default_state_dir(), workspace):
                 # An operator's own ./target (or link) is never replaced or redirected: the build
                 # writes into the repository, so that is the filesystem the guard measures.
-                return guard(workspace) or start()
-            refused = guard(selected.directory)
-            if refused is not None:
-                return refused
-            target = prepare_target(selected.directory, workspace)
+                return guard(Path(os.path.realpath(old_target))) or start()
+            if not reserve:
+                refused = guard(selected.directory)
+                if refused is not None:
+                    return refused
+            target = prepare_target(selected.directory, workspace, build_lock=True)
             if not compatibility_alias(_default_state_dir(), workspace, target):
                 raise ValueError("Default target changed concurrently; no automatic redirection applied")
             os.environ["CARGO_TARGET_DIR"] = str(target)
             # Incremental artifacts multiply the size of a managed target.
             os.environ.setdefault("CARGO_INCREMENTAL", "0")
             return start()
-    return guard(_explicit_target_dir(argv, os.environ) or Path.cwd()) or start()
+    return guard(override if isinstance(override, Path) else Path.cwd()) or start()
 
 
 def run_rustc(argv: list[str]) -> int:

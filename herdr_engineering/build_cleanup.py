@@ -4,8 +4,10 @@ Sweeps exclude each other with ``build-cleanup.lock`` (exclusive) and take
 ``build-maintenance.lock`` shared, which only excludes the destructive maintenance jobs
 (retention, migration, cache eviction) and never a running build, so the disk guard can sweep
 from inside ``build-coordinate``. Running builds are protected per target: recent activity,
-build leases, and open files / working directories of visible processes (rescanned right before
-each removal).
+build leases, open files / working directories of visible processes, and the managed target's
+build lock (``targets/<name>.lock``): a build holds it shared from before cargo starts until it
+ends, and the sweep takes it exclusively (non-blocking) right before deleting and keeps it until
+the delete is done, so a build never starts into a directory that is being removed.
 Inaccessible Herdr descendants or unknown ancestry always preserve files. Only current-user Cargo ``target``
 directories inside explicit roots are eligible; no symlinks are followed.
 
@@ -32,7 +34,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .cargo_target_storage import SLOT_LOCK, TARGET_MARKER
+from .cargo_target_storage import TARGET_MARKER, target_lock_path
 
 log = logging.getLogger(__name__)
 _PRUNE = {".git", "node_modules", ".venv", "venv", ".cache", "__pycache__"}
@@ -127,17 +129,26 @@ def _process_paths(proc: Path = Path("/proc")) -> list[Path]:
     return paths
 
 
-def _discover(root: Path, managed: bool = True) -> list[Path]:
+def _discover(root: Path, managed: bool = True, unreadable: list[str] | None = None) -> list[Path]:
     """Cargo targets under ``root``. ``managed`` also returns cache-only targets and Herdr-managed
-    ``targets/<workspace>`` dirs (what the sweep reclaims); migration wants repository targets only."""
+    ``targets/<workspace>`` dirs (what the sweep reclaims); migration wants repository targets only.
+    A subdirectory that cannot be read is skipped (and named in ``unreadable``), never the whole root."""
     pending = [(root, 0)]
     device = root.stat().st_dev
     found = []
     count = 0
     while pending:
         directory, depth = pending.pop()
-        managed_dir = managed and (directory / ".herdr-target-root.json").is_file()
-        with os.scandir(directory) as entries:
+        try:
+            managed_dir = managed and (directory / ".herdr-target-root.json").is_file()
+            scanner = os.scandir(directory)
+        except OSError:
+            if directory == root:
+                raise
+            if unreadable is not None:
+                unreadable.append(str(directory))
+            continue
+        with scanner as entries:
             for entry in entries:
                 if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
                     continue
@@ -147,7 +158,7 @@ def _discover(root: Path, managed: bool = True) -> list[Path]:
                 path = Path(entry.path)
                 if entry.stat(follow_symlinks=False).st_dev != device:
                     continue
-                if managed_dir and _legacy_workspace(path) is not None:
+                if managed_dir and _managed_workspace(path) is not None:
                     if _cargo_markers(path):
                         found.append(path)
                     continue
@@ -182,9 +193,9 @@ def _cache_only_target(target: Path) -> bool:
         return False
 
 
-def _legacy_workspace(path: Path) -> Path | None:
-    """Workspace of a per-workspace managed target (``targets/<label-hash>``, written before the
-    shared pool became the default), proven by the manager's root marker and the target's own marker."""
+def _managed_workspace(path: Path) -> Path | None:
+    """Workspace of a per-worktree managed target (``targets/<label>-<id>``), proven by the manager's
+    root marker and the target's own marker."""
     try:
         root_marker, marker = path.parent / ".herdr-target-root.json", path / TARGET_MARKER
         if root_marker.is_symlink() or marker.is_symlink() or not root_marker.is_file() or not marker.is_file():
@@ -201,22 +212,35 @@ def _legacy_workspace(path: Path) -> Path | None:
 
 def _project(target: Path) -> Path:
     """Directory whose activity keeps a target alive: its manifest directory, or the owning workspace."""
-    return _legacy_workspace(target) or target.parent
+    return _managed_workspace(target) or target.parent
 
 
-def _slot_busy(target: Path) -> bool:
-    """True while a cargo wrapper holds the shared-pool slot lock beside this target."""
-    lock = target.parent / SLOT_LOCK
-    if not lock.is_file() or lock.is_symlink():
-        return False
-    fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
+_BUSY = -1
+
+
+def _lock_for_removal(target: Path) -> int | None:
+    """Exclusive lock on a managed target's build lock (None: not a managed target, _BUSY: a build holds it)."""
+    if _managed_workspace(target) is None:
+        return None
+    fd = os.open(target_lock_path(target), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        return True
+        os.close(fd)
+        return _BUSY
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _release_removal_lock(target: Path, fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        target_lock_path(target).unlink(missing_ok=True)  # still locked: waiters re-open a fresh one
     finally:
         os.close(fd)
-    return False
 
 
 def _inspect(target: Path) -> tuple[float, int]:
@@ -250,7 +274,7 @@ def _inspect(target: Path) -> tuple[float, int]:
 
 def _untracked(target: Path) -> bool:
     """Git must verify the entire target is untracked, including nested files."""
-    if _legacy_workspace(target) is not None:
+    if _managed_workspace(target) is not None:
         return True  # lives in the state directory, not in a repository
     cache_only = not (target.parent / "Cargo.toml").is_file()
     if cache_only and subprocess.run(
@@ -266,7 +290,7 @@ def _untracked(target: Path) -> bool:
 
 def _recognized(target: Path) -> bool:
     """Same recognition rule as discovery: a Cargo ``target`` with build markers."""
-    if _legacy_workspace(target) is not None:
+    if _managed_workspace(target) is not None:
         return _cargo_markers(target)
     return (target.name == "target" and _cargo_markers(target)
             and ((target.parent / "Cargo.toml").is_file() or _cache_only_target(target)))
@@ -434,7 +458,10 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
                 result["pressure"] = True
             roots_by_device[root.stat().st_dev] = root
             try:
-                targets = _discover(root)
+                unreadable: list[str] = []
+                targets = _discover(root, unreadable=unreadable)
+                for name in unreadable[:5]:
+                    _skip_root(result, Path(name), "unreadable directory skipped")
             except OSError as exc:
                 _skip_root(result, root, str(exc))
                 continue
@@ -486,29 +513,29 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
             if newest > cutoffs[name]:
                 result["skipped"].append({"path": name, "reason": "recent activity"})
                 continue
-            if _slot_busy(target):
-                result["skipped"].append({"path": name, "reason": "build in progress"})
-                continue
             if not _recognized(target):
                 raise OSError(f"Target no longer recognized as a Cargo output: {name}")
             if result["dry_run"]:  # nothing is removed, so the first scan stands
                 if not _skip_for_registry(state_dir, target, name, result):
                     result["would_remove"].append(name)
                 continue
-            result["process_scans"] += 1  # fresh scan, right before the only destructive step
-            active = _process_paths()
-            if _in_use(target, active):
-                result["skipped"].append({"path": name, "reason": "active project"})
+            lock_fd = _lock_for_removal(target)  # held through the delete: a build waits it out
+            if lock_fd == _BUSY:
+                result["skipped"].append({"path": name, "reason": "build in progress"})
                 continue
-            if not _recognized(target):
-                raise OSError(f"Target no longer recognized as a Cargo output: {name}")
-            if _skip_for_registry(state_dir, target, name, result):
-                continue  # lease re-read after the last scan, before any removal
-            before = shutil.disk_usage(root).free
-            # CPython's fd-based rmtree prevents symlink substitution attacks.
-            if not shutil.rmtree.avoids_symlink_attacks:
-                raise OSError("This platform lacks symlink-safe recursive removal")
-            shutil.rmtree(target)
+            try:
+                # Re-read the lease and the ownership proof under the lock, right before removing.
+                if _skip_for_registry(state_dir, target, name, result):
+                    continue
+                if not _recognized(target):
+                    raise OSError(f"Target no longer recognized as a Cargo output: {name}")
+                before = shutil.disk_usage(root).free
+                # CPython's fd-based rmtree prevents symlink substitution attacks.
+                if not shutil.rmtree.avoids_symlink_attacks:
+                    raise OSError("This platform lacks symlink-safe recursive removal")
+                shutil.rmtree(target)
+            finally:
+                _release_removal_lock(target, lock_fd)
             after = shutil.disk_usage(root).free
             result["removed_count"] += 1
             result["removed_bytes"] += size
