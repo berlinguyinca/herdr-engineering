@@ -102,6 +102,10 @@ class SideHerdr(HerdrCli):
                 return None
         return super()._run(args, timeout_s)
 
+    def allow(self, seconds: float) -> None:
+        """Give the calls that follow `seconds` of their own, whatever the budget did: cleanup of what the work left behind."""
+        self.deadline = self.hard_deadline = time.monotonic() + seconds
+
     def release_reserve(self) -> None:
         """Let the calls that must not be skipped (recording or removing what the work left) use the whole budget."""
         if self.hard_deadline is not None:

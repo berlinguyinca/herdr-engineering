@@ -237,8 +237,10 @@ def _waiting_label(events: Sequence[HandoffEvent]) -> str | None:
 
 
 def _event_nodes(mine: Sequence[HandoffEvent], session: SessionRef) -> list[_Node]:
-    """One node per chain of the session that the event log knows and no record shows: open ones and red or orange ones.
-    The session is the same in all of them (a chain that did not succeed leaves it running), so the last is the live one."""
+    """One node per chain of the session that the event log knows and no record shows: open ones, red or orange ones (failed
+    attempts of the one live session) and green ones. The session is the same in all failed attempts (a chain that did not
+    succeed leaves it running), so the last node is the live one: a green chain after a red one clears the red live state.
+    Green chains alone show nothing: there is no failure to put right."""
     groups: dict[str, list[HandoffEvent]] = {}
     for e in mine:
         if e.event != "handoff.skipped":
@@ -248,11 +250,11 @@ def _event_nodes(mine: Sequence[HandoffEvent], session: SessionRef) -> list[_Nod
         chain = last_chain(group)
         end = next((e for e in reversed(group) if e.event in TERMINAL), None)
         colour = TERMINAL[end.event] if end is not None else None
-        if chain is None or colour is Colour.GREEN:
+        if chain is None:
             continue
         nodes.append(_Node(None, session.pane_id, session.session_id, session.harness, "", None, colour,
-                           end.reason if end is not None else None))
-    return nodes
+                           end.reason if end is not None else None, attempt=colour is not Colour.GREEN))
+    return nodes if any(n.attempt for n in nodes) else []
 
 
 def _with_latest_failure(nodes: list[_Node], mine: Sequence[HandoffEvent]) -> list[_Node]:
@@ -278,6 +280,7 @@ class _Node:
     colour: Colour | None = None
     reason: str | None = None
     end: float | None = None
+    attempt: bool = False  # a failed or open attempt of the live session, not a session of its own
 
 
 def _nodes(chain: Sequence[_Record], events: Sequence[HandoffEvent], session: SessionRef) -> list[_Node]:
@@ -320,7 +323,8 @@ def _totals(all_nodes: Sequence[_Node], now: float) -> Totals:
     colours = [n.colour for n in all_nodes]
     known = [(now if i == len(all_nodes) - 1 else n.end) - n.start for i, n in enumerate(all_nodes)
              if n.start is not None and (i == len(all_nodes) - 1 or n.end is not None)]
-    return Totals(colours.count(Colour.GREEN), colours.count(Colour.ORANGE), colours.count(Colour.RED), len(all_nodes),
+    sessions = max(sum(not n.attempt for n in all_nodes), 1)  # failed attempts count in `failures`, not as sessions
+    return Totals(colours.count(Colour.GREEN), colours.count(Colour.ORANGE), colours.count(Colour.RED), sessions,
                   sum(known) if known else None)
 
 
@@ -342,17 +346,22 @@ def chain_branches(session: SessionRef, store_root: Path) -> tuple[tuple[str | N
     return tuple(dict.fromkeys((r.repo, r.branch) for r in chain if r.branch))
 
 
-def _pushed_by(nodes: Sequence[_Node], events: Sequence[HandoffEvent]) -> dict[str, tuple[int, float]]:
-    """branch -> (session number, time) of the last checkpoint commit a session of the chain made on it. A session whose
-    record names no branch, or that made no checkpoint commit, adds nothing: it is not guessed."""
-    found: dict[str, tuple[int, float]] = {}
+_NOT_PUSHED = frozenset({"push_failed", "push_not_allowed"})  # the `reason` of a checkpoint commit that did not reach the remote
+
+
+def _committed_by(nodes: Sequence[_Node], events: Sequence[HandoffEvent]) -> dict[str, tuple[int, float, bool]]:
+    """branch -> (session number, time, pushed) of the last checkpoint commit a session of the chain made on it. The log
+    records the controller's checkpoint commit (and whether its push was refused or failed), not pushes the session made
+    itself. A session whose record names no branch, or that made no checkpoint commit, adds nothing: it is not guessed."""
+    found: dict[str, tuple[int, float, bool]] = {}
     for number, node in enumerate(nodes, start=1):
         if node.record is None or not node.record.branch or node.pane is None:
             continue
-        stamps = [epoch(e.at) for e in pane_events(events, node.pane, node.session_id)
-                  if e.event == "handoff.wip_committed" and e.commit]
-        if stamps:
-            found[node.record.branch] = (number, max(stamps))
+        commits = [(epoch(e.at), e.reason not in _NOT_PUSHED) for e in pane_events(events, node.pane, node.session_id)
+                   if e.event == "handoff.wip_committed" and e.commit]
+        if commits:
+            at, pushed = max(commits, key=lambda c: c[0])
+            found[node.record.branch] = (number, at, pushed)
     return found
 
 
@@ -374,8 +383,8 @@ def build_model(session: SessionRef | None, store_root: Path | None, env: Mappin
         nodes = _event_nodes(mine, session)  # no record yet: the event log alone
         if not nodes:
             return SidePaneModel(ci=tuple(ci), built_at=now, unreadable=unreadable)
-    pushed = _pushed_by(nodes, events)
-    ci = [replace(c, pushed_by=pushed[c.branch]) if c.branch in pushed else c for c in ci]
+    committed = _committed_by(nodes, events)
+    ci = [replace(c, committed_by=committed[c.branch]) if c.branch in committed else c for c in ci]
     rows, attention = _rows(nodes, events, now, dangling)
     hidden = max(len(rows) - CHAIN_MAX, 0)
     shown = [replace(r, depth=r.depth - hidden) for r in rows[hidden:]]

@@ -548,7 +548,10 @@ It has three tabs, switched with `1`, `2`, `3` or `Tab`. The tab bar puts a dot 
 
 * **Summary**: the latest briefing of the chain as Goal, Done, Now and Next, and at which handoff it was written ("no briefing yet" before the first one; a fallback briefing is marked).
 * **Handoffs**: the chain as a small vertical tree, oldest session at the top, with total handoffs and total time. Each
-  row is one session. `▶` is the live session; `●` is a session that was handed off; `?` is a root whose predecessor record
+  row is one session, or a failed attempt of the live session (a chain that ended stuck or failed and left the session
+  running, with no record of its own). The totals count sessions, not chains: "N sessions" does not count failed
+  attempts, which are counted in the failures only (14 failed chains of one session are 1 session and 14 failures). A
+  green chain with no record after a red one is shown too, and clears the red live state and the tab's dot. `▶` is the live session; `●` is a session that was handed off; `?` is a root whose predecessor record
   is not in the store (the chain starts earlier than the store knows). The colour of a row is the colour of the handoff
   that ended it: green "handed off", orange "failed, continued in compaction", red "stuck" followed by the reason from
   the table in "Terminal outcomes and what to do". The live session carries its context gauge and what it is waiting for.
@@ -558,11 +561,16 @@ It has three tabs, switched with `1`, `2`, `3` or `Tab`. The tab bar puts a dot 
   main and master never do). One `gh pr list --json number,title,headRefName,state,mergedAt,url,statusCheckRollup` per
   refresh serves all of them. Each check of a pull request's rollup is one chip, named as the rollup names it (GitHub
   Actions jobs, GitGuardian, review bots, Woodpecker contexts): running yellow, passed green, failing red, and grey for a
-  check that exists but has not started. Woodpecker's public per-workflow chips are kept and the matching rollup contexts
+  check that exists but has not started, or that was cancelled, skipped or is in a state this pane does not know (the chip
+  names the state, for instance "slow (cancelled)"). A card is "ready" only when every known check passed: a queued or
+  pending check makes it "running", and a cancelled, skipped or unknown one makes it "needs attention" (yellow, with the
+  dot), never "ready". Woodpecker's public per-workflow chips are kept and the matching rollup contexts
   are not shown twice. A required check that never reported is not shown, because GitHub does not list it. The line under
   a failing card names the first failing check ("unit-gates failed"); the rollup carries no description. A line
-  "Pushed by #N, 2h 05m ago" names the session of the chain that made a `handoff.wip_committed` checkpoint commit on that
-  card's branch (from the event log and the record's branch); it is left out when either is not recorded. Grey "not
+  "committed by #N, 2h 05m ago" names the session of the chain whose `handoff.wip_committed` event carries a checkpoint
+  commit on that card's branch (from the event log and the record's branch); it is left out when either is not recorded,
+  and ends ", not pushed" when the event's reason says the push failed or is not allowed. The event log records the
+  controller's checkpoint commit, not pushes the session made itself, so the line never says "pushed by". Grey "not
   started" on a card means nothing ran yet (that is not a failure); "CI unavailable" means the reads failed; a card marked
   "(stale)" is the last good reading, kept because the latest read took longer than 90 seconds or failed, and a stale card
   never raises the dot.
@@ -587,7 +595,8 @@ compact", "compaction never started", "compaction took too long", "briefing poin
 takeover", "successor live, old pane not closed", "successor launch state unknown", "session never idle to take the
 order", "unsure the order was typed", "handoff order too long to type", "session record unreadable", "handoff record
 unreadable", "merge in progress, nothing committed", "pane closed mid-handoff", "compaction state unknown", "no longer
-managed", "internal error". An unknown reason is shown as written, cut at 48 characters.
+managed", "internal error". A short cleaned detail of the reason is kept in brackets ("git state unknown (detached)", "takeover
+refused, compaction failed (not ready)"), cut at 24 characters and then to the row width. An unknown reason is shown as written, cut at 48 characters.
 
 A chain that has an event log but no record yet (its first handoff did not finish) still shows a row for the session, built
 from the event log alone: its colour and reason are the chain's, and it has no title because there is no briefing.
@@ -600,6 +609,17 @@ gets none. Opening it does not take the focus: it acts on focus only when the ne
 focus to the pane you were in with one directional focus call (Herdr 0.9 can only move focus to a neighbour, not to a pane id). If that call does not land, the focus stays on the side pane and
 `herdr-eng side-pane ensure` prints `(focus: left_on_side_pane)`; for the first two seconds the viewer ignores `q`, so a
 stray key cannot dismiss it.
+
+The controller's call into `ensure` is non-blocking: it never waits on the tab's lock and takes at most 5 seconds, and
+there is no second, unbounded call. If the pane cannot be made (Herdr does not answer, the lock is held, `herdr-eng` is not
+found) the controller tries again on later ticks, three times in a row; after three failures it stops asking for that tab
+until a new managed pane appears in it. When the 5 seconds run out after the split, the half-made pane is closed with an
+allowance of 2 seconds of its own; the marker is cleared only if that close worked, so a pane that could not be closed
+keeps its marker and the next `ensure` adopts or replaces it (never a second pane).
+
+`side-pane run` refuses to start (exit 2, one line) in a pane that hosts a managed agent, when stdin is not a terminal, and
+when `herdr agent list` does not answer ("cannot verify this pane"), because a marker written from a session pane would
+hide it from the controller.
 
 ### Keys, closing and reopening
 

@@ -33,6 +33,7 @@ LOCK_TIMEOUT_S = 10.0
 CLOSE_WAIT_S = 5.0
 DEFAULT_COMMAND = "exec herdr-eng side-pane run"
 CLEANUP_RESERVE_S = 1.0  # of a call's budget, kept for recording or removing what the work left
+CLEANUP_S = 2.0  # what closing a half-made pane may take on top of the budget, when the budget is spent
 CARRIED_ENV = ("HERDR_ENGINEERING_STATE", "HERDR_HANDOFF_STORE", "HOME")  # what decides the state dir and the store of the runner
 
 
@@ -184,7 +185,10 @@ def _note(text: str) -> None:
 def _within(herdr: SideHerdr, budget_s: float | None) -> Iterator[None]:
     """Give every Herdr call in the block what is left of `budget_s` (None: no limit), keeping `CLEANUP_RESERVE_S` for cleanup."""
     if budget_s is None:
-        yield
+        try:
+            yield
+        finally:
+            herdr.deadline = herdr.hard_deadline = None  # a cleanup allowance does not outlive the call
         return
     end = time.monotonic() + max(budget_s, 0.0)
     herdr.hard_deadline = end
@@ -276,6 +280,7 @@ def _ensure_locked(root: Path, tab_id: str, target_pane: str | None, herdr: Side
     created = herdr.split(plan.target, plan.ratio, env={})
     herdr.release_reserve()  # a split that happened must be recorded, whatever time is left
     if created is None:
+        herdr.allow(CLEANUP_S)  # a split whose reply was lost still made a pane: finding it is not skipped for time
         created = _new_pane(herdr, tab_id, before)
         if created is None:
             _note(f"split in {tab_id} gave no readable reply and no new pane was found; nothing was closed or recorded")
@@ -283,7 +288,10 @@ def _ensure_locked(root: Path, tab_id: str, target_pane: str | None, herdr: Side
     state.write_marker(root, state.Marker(tab_id, created.pane_id, created.terminal_id, plan.owner, None, time.time()))
     state.write_shown(root, tab_id, [s.terminal_id for s in sessions])
     if not herdr.run_in(created.pane_id, runner):
-        herdr.close(created.pane_id)
-        state.clear_marker(root, tab_id)
+        herdr.allow(CLEANUP_S)  # the budget may be spent: closing the half-made pane has an allowance of its own
+        if herdr.close(created.pane_id):
+            state.clear_marker(root, tab_id)
+        else:  # still there: the marker stays, so the next `ensure` adopts or replaces this pane and never adds a second
+            _note(f"the new pane {created.pane_id} in {tab_id} could not be closed; its marker is kept")
         return EnsureResult(Outcome.UNAVAILABLE)
     return EnsureResult(Outcome.CREATED, created.pane_id, settle_focus(herdr, created.pane_id, previous))

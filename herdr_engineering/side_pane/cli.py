@@ -16,8 +16,9 @@ that ends any way other than `ensure` replacing it (q, closing it in Herdr, a si
 it is not reopened until a new managed session appears in the tab. `herdr-eng side-pane ensure --tab TAB_ID` opens it
 again and clears that memory.
 
-Pull requests on the CI tab come from `gh pr list` run with your own gh login, for the focused session's directory and
-branch only (a chain spanning repositories shows the current repository's PRs). Pipelines come from Woodpecker's public
+Pull requests on the CI tab come from `gh pr list` run with your own gh login, for the focused session's repository: its
+checked-out branch and every branch the chain's records name there (a chain spanning repositories shows the current
+repository's PRs only). Pipelines come from Woodpecker's public
 reads; no Woodpecker token is ever used."""
 
 

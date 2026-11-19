@@ -20,12 +20,24 @@ def run_viewer_cli(env: dict[str, str], cwd: Path, *args: str) -> subprocess.Com
                           capture_output=True, text=True, timeout=60, check=False)
 
 
-def test_it_refuses_when_stdin_is_not_a_terminal(tmp_path: Path) -> None:
+def test_it_refuses_when_herdr_does_not_answer_about_the_pane(tmp_path: Path) -> None:
     env = {"HOME": str(tmp_path), "PATH": str(tmp_path), "HERDR_ENGINEERING_STATE": str(tmp_path / "state"), "HERDR_PANE_ID": "w1:p9"}
-    done = run_viewer_cli(env, tmp_path)
+    done = run_viewer_cli(env, tmp_path)  # no `herdr` on PATH: `agent list` cannot answer
     assert done.returncode == 2 and done.stdout == ""
-    assert len(done.stderr.strip().splitlines()) == 1 and "not a terminal" in done.stderr, done.stderr
+    assert len(done.stderr.strip().splitlines()) == 1 and "cannot verify this pane" in done.stderr, done.stderr
     assert not (tmp_path / "state").exists(), "a marker was registered"
+
+
+@herdr_server
+def test_it_refuses_when_stdin_is_not_a_terminal(tmp_path: Path) -> None:
+    with isolated_herdr("sp-refuse-tty") as h:
+        side = side_of(h)
+        _, tab = session(h, side)
+        env = {**h.env, "HOME": str(h.root / "home")}
+        done = run_viewer_cli(env, h.root, "--pane", "w1:p9", "--tab", tab)  # a pane that hosts no agent: answered, then no terminal
+        assert done.returncode == 2 and done.stdout == ""
+        assert len(done.stderr.strip().splitlines()) == 1 and "not a terminal" in done.stderr, done.stderr
+        assert not list((h.root / "home").rglob("*.marker.json"))
 
 
 @herdr_server
