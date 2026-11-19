@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import shutil
@@ -35,9 +36,6 @@ from collections.abc import Iterable
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-
-from . import scratch_safety
-from .scratch_safety import expand_home
 
 if TYPE_CHECKING:
     from .scratch_safety import Snapshot
@@ -86,7 +84,7 @@ def guard_roots(scratch: Path) -> list[Path]:
 def default_roots(home: Path | None = None, scratch: Path | None = None) -> list[Path]:
     """Agent-created locations only. ``~/IdeaProjects`` and ``~/work`` hold the user's own repos.
     ``scratch``: the one resolved scratch root (None resolves it here)."""
-    home = home or scratch_safety.user_home()
+    home = home or Path.home()
     return [home / ".local" / "share" / "worktrees", home / ".cache" / "herdr-engineering",
             scratch or scratch_root()]
 
@@ -103,7 +101,7 @@ def default_temp_worktree_parents() -> list[Path]:
 
 
 def user_config_path(home: Path | None = None) -> Path:
-    return (home or scratch_safety.user_home()) / ".config" / "herdr-engineering" / "config.yaml"
+    return (home or Path.home()) / ".config" / "herdr-engineering" / "config.yaml"
 
 
 def user_disk_hygiene_config(home: Path | None = None) -> dict[str, Any]:
@@ -129,7 +127,7 @@ def absolute_roots(value: Any, name: str = "roots") -> tuple[str, ...]:
     resolve against whatever the current directory happens to be; a scalar would split into
     characters. Both are invalid."""
     roots = config_strings(value, name)
-    if bad := [r for r in roots if not r.strip() or not expand_home(r).is_absolute()]:
+    if bad := [r for r in roots if not r.strip() or not Path(r).expanduser().is_absolute()]:
         raise ValueError(f"{name} must be absolute paths, got {bad[0]!r}")
     return roots
 
@@ -137,7 +135,7 @@ def absolute_roots(value: Any, name: str = "roots") -> tuple[str, ...]:
 def configured_roots(extra: Iterable[str] = (), home: Path | None = None,
                      scratch: Path | None = None) -> list[Path]:
     """Defaults + already validated ``extra`` roots (the caller reads and validates the config)."""
-    return [*default_roots(home, scratch), *(expand_home(r) for r in extra)]
+    return [*default_roots(home, scratch), *(Path(r).expanduser() for r in extra)]
 
 
 def user_roots(home: Path | None = None) -> tuple[str, ...]:
@@ -150,122 +148,11 @@ def user_roots(home: Path | None = None) -> tuple[str, ...]:
 
 def _git(cwd: Path, *args: str, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
     """Every git call goes through the hardened ``scratch_safety.git`` runner: ``GIT_*`` stripped,
-    no user/system config, no fsmonitor or hooks, ``LC_ALL=C``. A ``GIT_DIR`` in the environment
-    or ``status.showUntrackedFiles=no`` in a config must not change what a check sees. Commands that
-    judge untracked files (``status``, ``worktree remove``) get the excludes file explicitly (see
-    ``_user_excludes_file``) so git never looks one up from ``$HOME``/``$XDG_CONFIG_HOME`` itself."""
+    no fsmonitor or hooks, ``LC_ALL=C``. Repository-controlled config (a cloned repo is untrusted)
+    cannot change what a check sees; the user's own ``HOME``/``XDG_CONFIG_HOME`` and global config
+    apply, so ignored and untracked files are classified exactly as the user's ``git status`` does."""
     from .scratch_safety import git as safe_git
-    options: tuple[str, ...] = ()
-    if args[0] == "status" or args[:2] == ("worktree", "remove"):  # the commands that judge untracked files
-        options = ("-c", f"core.excludesFile={_user_excludes_file(str(scratch_safety.user_home()), str(cwd))}")
-    return safe_git(cwd, *options, *args, timeout=GIT_TIMEOUT if timeout is None else timeout)
-
-
-_EXCLUDES: dict[str, str] = {}
-_HOME_EXCLUDES: dict[str, tuple[str, bool]] = {}
-
-
-def reset_excludes_cache() -> None:
-    """Forget the resolved excludes files; called at the start of every run."""
-    _EXCLUDES.clear()
-    _HOME_EXCLUDES.clear()
-
-
-def _config_get(home: str, cwd: str | None, *args: str) -> subprocess.CompletedProcess[str] | None:
-    """``git config`` as the user's git sees it: ``GIT_*`` stripped, no system config, and ``HOME`` and
-    ``XDG_CONFIG_HOME`` pinned to the account's real home (never the caller's environment). None on failure."""
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    env.update(GIT_CONFIG_NOSYSTEM="1", HOME=home, XDG_CONFIG_HOME=str(Path(home) / ".config"))
-    try:
-        return subprocess.run(["git", "config", "--includes", *args], capture_output=True, text=True,
-                              timeout=15, check=False, env=env, cwd=cwd)
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
-def _unresolved(why: str) -> Refusal:
-    return Refusal("excludes_unresolved", f"core.excludesFile {why}; refusing to judge cleanliness without it")
-
-
-def _usable_excludes(value: str) -> str:
-    """An absolute path to an existing file, or ``Refusal('excludes_unresolved')``. Unset is ``""``."""
-    if not value:
-        return ""
-    if not value.startswith("/"):
-        raise _unresolved(f"is {value!r}, which is not an absolute path")
-    if not Path(value).is_file():
-        raise _unresolved(f"points at {value}, which is not an existing file")
-    return value
-
-
-def _home_excludes(home: str) -> tuple[str, bool]:
-    """Per home, once per run: the global ``core.excludesFile`` as written (not yet validated) and
-    whether the global chain holds any ``[includeIf]`` (which makes the answer depend on the
-    repository). A failed lookup raises ``Refusal('excludes_unresolved')``."""
-    if home in _HOME_EXCLUDES:
-        return _HOME_EXCLUDES[home]
-    where = home if Path(home).is_dir() else None
-    value = _config_get(home, where, "--global", "--type=path", "--get", "core.excludesFile")
-    conditional = _config_get(home, where, "--global", "--name-only", "--get-regexp", r"^includeif\.")
-    if value is None or conditional is None or value.returncode not in (0, 1) or conditional.returncode not in (0, 1):
-        raise _unresolved("could not be looked up in the global git config")
-    result = (value.stdout.strip() if value.returncode == 0 else "", conditional.returncode == 0)
-    _HOME_EXCLUDES[home] = result
-    return result
-
-
-def _repo_config_may_matter(cwd: str) -> bool:
-    """Whether the repository's own config could set ``core.excludesFile`` (or include a file that
-    does). Conservative: any doubt says yes. Plain file reads, no process."""
-    here = Path(cwd)
-    try:
-        for directory in (here, *here.parents):
-            dot = directory / ".git"
-            if dot.is_file():
-                gitdir = (directory / dot.read_text().removeprefix("gitdir:").strip()).resolve()
-            elif dot.is_dir():
-                gitdir = dot
-            elif directory == here and (here / "HEAD").is_file() and (here / "config").is_file():
-                gitdir = here  # a bare repository or a common git dir
-            else:
-                continue
-            common = gitdir
-            if (gitdir / "commondir").is_file():
-                common = (gitdir / (gitdir / "commondir").read_text().strip()).resolve()
-            text = ""
-            for name in (common / "config", gitdir / "config.worktree"):
-                if name.is_file():
-                    text += name.read_text(errors="replace").lower()
-            return "excludesfile" in text or "[include" in text
-    except (OSError, ValueError):
-        return True
-    return False
-
-
-def _user_excludes_file(home: str, cwd: str) -> str:
-    """The excludes file git must use, as the user's own git resolves ``core.excludesFile``
-    (``~/.gitconfig``, ``~/.config/git/config`` and everything they ``[include]``/``[includeIf]``;
-    ``HOME`` and ``XDG_CONFIG_HOME`` are the account's real ones), the one setting the hardened runner
-    keeps. The home answer is asked once per run. Only when the global chain has an ``[includeIf]`` or
-    the repository's own config mentions ``excludesFile``/``include`` is git asked from inside the
-    repository (its local value outranks the global one, as in the user's git); that answer is cached
-    per directory. Unset resolves to the real ``~/.config/git/ignore`` (or ``/dev/null``). A value that
-    is not an absolute existing file, or a lookup that fails, raises ``Refusal('excludes_unresolved')``:
-    never a silent fallback to some other ignore file."""
-    if cwd in _EXCLUDES:
-        return _EXCLUDES[cwd]
-    value, conditional = _home_excludes(home)
-    if conditional or _repo_config_may_matter(cwd):
-        done = _config_get(home, cwd if Path(cwd).is_dir() else None, "--type=path", "--get", "core.excludesFile")
-        if done is None or done.returncode not in (0, 1):
-            raise _unresolved("could not be looked up in the repository's git config")
-        value = done.stdout.strip() if done.returncode == 0 else ""
-    value = _usable_excludes(value)
-    if not value:
-        default = Path(home) / ".config" / "git" / "ignore"
-        value = str(default) if default.is_file() else "/dev/null"
-    _EXCLUDES[cwd] = value
-    return value
+    return safe_git(cwd, *args, timeout=GIT_TIMEOUT if timeout is None else timeout)
 
 
 def config_strings(value: Any, name: str) -> tuple[str, ...]:
@@ -278,13 +165,31 @@ def config_strings(value: Any, name: str) -> tuple[str, ...]:
 
 
 def _bases(paths: list[Path]) -> list[Path]:
-    """Each path as spelled and canonicalised (macOS ``/tmp`` is ``/private/tmp``)."""
+    """Each path as spelled and canonicalised (macOS ``/tmp`` is ``/private/tmp``). A
+    ``claude-<uid>`` root that is a symlink or owned by someone else is dropped with a warning:
+    it is never followed, so it can not become a deletion root."""
     found: list[Path] = []
     for p in paths:
+        if _untrusted_scratch(p):
+            continue
         for base in (Path(os.path.abspath(p)), Path(os.path.realpath(p))):
             if base not in found:
                 found.append(base)
     return found
+
+
+def _untrusted_scratch(path: Path) -> bool:
+    """A ``claude-<uid>`` directory that is a symlink or not ours (another local user can plant one)."""
+    if path.name.casefold() != f"claude-{os.getuid()}":
+        return False
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+        logging.getLogger(__name__).warning("ignoring %s: a symlink or not owned by this user", path)
+        return True
+    return False
 
 
 def relative_parts(path: Path, base: Path) -> tuple[str, ...] | None:
@@ -329,7 +234,7 @@ def checked_path(path: Path | str, roots: list[Path],
     """Return the absolute path, or raise ``Refusal``. Never follows a symlink.
 
     ``temp_worktree_parents``: ``<parent>/wt-*`` children are acceptable too (worktree scope)."""
-    raw = expand_home(path)
+    raw = Path(path).expanduser()
     if ".." in raw.parts:
         raise Refusal("outside_roots", f"{raw}: '..' is not allowed")
     if not raw.is_absolute():
@@ -725,7 +630,7 @@ def own_sessions(home: Path | None = None) -> frozenset[str]:
     OUR ancestors AND the process now running under it must have started when the file says (a
     crashed session's stale file under a recycled pid is not ours). An environment variable never
     makes a session "own"."""
-    directory = (home or scratch_safety.user_home()) / ".claude" / "sessions"
+    directory = (home or Path.home()) / ".claude" / "sessions"
     found: set[str] = set()
     for pid in _ancestors():
         try:
@@ -739,6 +644,9 @@ def own_sessions(home: Path | None = None) -> frozenset[str]:
         if started is not None and abs(started - data["startedAt"] / 1000) <= _START_SLACK_SECONDS:
             found.add(data["sessionId"].lower())
     return frozenset(found)
+
+
+_CONTAINED_DEPTH = 6  # levels below the target searched for a nested claude-<uid>
 
 
 def _nested_scratch_roots(path: Path) -> list[Path]:
@@ -760,9 +668,7 @@ def _guard_scratch(path: Path, scratches: list[Path], live_roots: list[Path], no
     ``<project>`` dir or the session dir itself. ``.keep`` protects. The caller's own session
     (see ``own_sessions``) is free to clean up after itself; any other session must pass
     ``scratch_reaper``'s policy: not live and idle for the session TTL."""
-    from .scratch_reaper import Policy, _live_ids
-    from .scratch_safety import inspect_tree, keep_ancestor
-    policy = Policy()
+    from .scratch_safety import keep_ancestor
     own = own_sessions()
     for base in _bases([*scratches, *_nested_scratch_roots(path)]):
         parts = relative_parts(path, base)
@@ -774,15 +680,61 @@ def _guard_scratch(path: Path, scratches: list[Path], live_roots: list[Path], no
                           f"{path} is the scratch root, a project or a session directory; only paths inside a session are removable")
         if keep_ancestor(path, path.parents[len(parts) - 1]):
             raise Refusal("keep_marker", f"{path} is under a .keep marker")
-        session = parts[index].lower()
-        if session not in own:
-            if session in _live_ids(live_roots, now - policy.live_seconds):
-                raise Refusal("live_session", f"session {session} is still live")
-            session_dir = path.parents[len(parts) - index - 2]
-            if inspect_tree(session_dir, accounting_only=True).newest > now - policy.session_ttl_seconds:
-                raise Refusal("session_recent",
-                              f"session {session} was active within {policy.session_ttl_seconds / 3600:.0f} h")
+        _session_idle(parts[index].lower(), path.parents[len(parts) - index - 2], own, live_roots, now)
         return
+    _guard_contained_sessions(path, own, live_roots, now)
+
+
+def _session_idle(session: str, session_dir: Path, own: frozenset[str], live_roots: list[Path], now: float) -> None:
+    """Refuse unless ``session`` is the caller's own, or not live and idle for the session TTL."""
+    from .scratch_reaper import Policy, _live_ids
+    from .scratch_safety import inspect_tree
+    policy = Policy()
+    if session in own:
+        return
+    if session in _live_ids(live_roots, now - policy.live_seconds):
+        raise Refusal("live_session", f"session {session} is still live")
+    if inspect_tree(session_dir, accounting_only=True).newest > now - policy.session_ttl_seconds:
+        raise Refusal("session_recent", f"session {session} was active within {policy.session_ttl_seconds / 3600:.0f} h")
+
+
+def _guard_contained_sessions(path: Path, own: frozenset[str], live_roots: list[Path], now: float) -> None:
+    """A target that CONTAINS a ``claude-<uid>`` directory removes every session inside it: each one
+    gets the session rules (live or recent refuses)."""
+    wanted = f"claude-{os.getuid()}".casefold()
+    stack = [(path, 0)]
+    while stack:
+        directory, depth = stack.pop()
+        try:
+            children = [e for e in os.scandir(directory) if e.is_dir(follow_symlinks=False)]
+        except OSError:
+            continue
+        for entry in children:
+            if entry.name.casefold() == wanted:
+                for sub in _session_dirs(Path(entry.path)):
+                    _session_idle(sub.name.lower(), sub, own, live_roots, now)
+            elif depth < _CONTAINED_DEPTH:
+                stack.append((Path(entry.path), depth + 1))
+
+
+def _session_dirs(root: Path) -> list[Path]:
+    """``<session>`` directories of a scratch root: ``<root>/<uuid>`` and ``<root>/<project>/<uuid>``."""
+    found: list[Path] = []
+    try:
+        for entry in os.scandir(root):
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            if _UUID.fullmatch(entry.name.lower()):
+                found.append(Path(entry.path))
+                continue
+            try:
+                found += [Path(e.path) for e in os.scandir(entry.path)
+                          if e.is_dir(follow_symlinks=False) and _UUID.fullmatch(e.name.lower())]
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return found
 
 
 def _remove_tmp(path: Path, *, dry_run: bool, scratch: list[Path], live_roots: list[Path],
@@ -807,7 +759,6 @@ def cleanup(scope: Scope | str, path: Path | str | None, *, roots: list[Path], d
             scratch_root: Path | None = None,
             live_roots: list[Path] | None = None, now: float | None = None) -> dict[str, Any]:
     """Remove one thing; returns a report dict or raises ``Refusal`` (never a raw timeout/OSError)."""
-    reset_excludes_cache()
     try:
         return _cleanup(scope, path, roots=roots, dry_run=dry_run, merged_ok=merged_ok,
                         state_dir=state_dir, temp_roots=temp_roots,

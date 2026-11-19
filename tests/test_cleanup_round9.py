@@ -12,11 +12,9 @@ import pytest
 
 from herdr_engineering.build_cleanup import _managed_process, _process_paths
 from herdr_engineering.cleanup_command import (
-    _user_excludes_file,
     default_temp_roots,
     guard_roots,
     is_dirty,
-    reset_excludes_cache,
 )
 from herdr_engineering.scratch_reaper import default_root, system_temp_roots
 
@@ -117,13 +115,10 @@ def test_a_local_excludes_file_outranks_the_global_one(tmp_path: Path, monkeypat
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     (repo / "build").mkdir()
     (repo / "build" / "x").write_text("unversioned work")
-    reset_excludes_cache()
     assert not is_dirty(repo)  # the global file ignores build/
     (home / "local-ignore").write_text("")
     subprocess.run(["git", "-C", str(repo), "config", "core.excludesFile", str(home / "local-ignore")], check=True)
-    reset_excludes_cache()
     assert is_dirty(repo)  # the repo's own, narrower file wins, as in the user's git
-    assert _user_excludes_file(str(home), str(repo)) in ("", str(home / "local-ignore"))
 
 
 # --- 8: no warning for a root the run does not use -----------------------------------------------------------

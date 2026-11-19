@@ -56,11 +56,9 @@ from .cleanup_command import (
     default_temp_worktree_parents,
     gh_pr_state,
     remove_worktree,
-    reset_excludes_cache,
     user_disk_hygiene_config,
     worktree_quick_facts,
 )
-from .scratch_safety import expand_home
 
 _DISCOVERY_DEPTH = 2
 
@@ -152,7 +150,7 @@ def _parse_policy(cfg: dict[str, Any]) -> Policy:
         ttl_days=_number(cfg.get("worktree_ttl_days", 7), "worktree_ttl_days"),
         min_idle_hours=_number(cfg.get("min_idle_hours", 2), "min_idle_hours"),
         pr_source=PrSource(cfg.get("pr_source", "gh")),
-        repos=tuple(expand_home(r) for r in _strings(cfg.get("repos"), "repos")),
+        repos=tuple(Path(r).expanduser() for r in _strings(cfg.get("repos"), "repos")),
         roots=absolute_roots(cfg.get("roots")),
         docker_min_age_hours=_number(dk.get("min_age_hours", 1), "docker.min_age_hours"),
         builder_keep_storage=storage.strip(),
@@ -325,7 +323,6 @@ def reap_worktrees(policy: Policy, *, dry_run: bool = False, extra_repos: list[P
                    extra_roots: list[str] | None = None, now: float | None = None,
                    temp_worktree_parents: list[Path] | None = None,
                    scratch_root: Path | None = None) -> dict[str, Any]:
-    reset_excludes_cache()
     roots = configured_roots([*policy.roots, *(extra_roots or [])], scratch=scratch_root)
     parents = default_temp_worktree_parents() if temp_worktree_parents is None else temp_worktree_parents
     repos = [*policy.repos, *(extra_repos or [])] or find_repos(roots, parents)
@@ -410,7 +407,7 @@ def main_args(args: argparse.Namespace) -> int:
     else:
         try:
             report = run(policy, only=args.only, dry_run=args.dry_run,
-                         extra_repos=[expand_home(r) for r in args.repo])
+                         extra_repos=[Path(r).expanduser() for r in args.repo])
         except (Refusal, OSError, subprocess.SubprocessError) as exc:
             report = {"status": "error", "reason": str(exc)}
         if not args.dry_run:

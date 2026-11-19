@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import functools
 import os
-import pwd
 import re
 import stat
 import subprocess
@@ -13,25 +11,6 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-
-
-@functools.cache
-def user_home() -> Path:
-    """The account's home directory from the password database, resolved once. ``$HOME`` is an
-    environment variable like any other and must never decide where config, sessions or deletion
-    roots are read from."""
-    return Path(pwd.getpwuid(os.getuid()).pw_dir)
-
-
-def expand_home(value: str | Path) -> Path:
-    """``~`` and ``~/...`` against ``user_home()``; every other spelling is returned unchanged."""
-    text = str(value)
-    if text == "~":
-        return user_home()
-    if text.startswith("~/"):
-        return user_home() / text[2:]
-    return Path(text)
-
 
 _COMPILERS = {
     "cargo",
@@ -145,8 +124,6 @@ def git(repo: Path, *arguments: str, timeout: float = 15) -> subprocess.Complete
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     environment.update(
         GIT_OPTIONAL_LOCKS="0",
-        GIT_CONFIG_NOSYSTEM="1",
-        GIT_CONFIG_GLOBAL="/dev/null",
         GIT_NO_LAZY_FETCH="1",
         LC_ALL="C",
     )

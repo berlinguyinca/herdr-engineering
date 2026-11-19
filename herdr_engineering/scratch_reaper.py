@@ -32,12 +32,10 @@ from pathlib import Path
 from typing import NoReturn, cast
 from xml.parsers.expat import ExpatError
 
-from . import scratch_safety
 from .scratch_safety import (
     InspectionUnavailable,
     Snapshot,
     TreeInfo,
-    expand_home,
     inspect_tree,
     keep_ancestor,
     open_parent,
@@ -270,9 +268,9 @@ def default_root() -> Path:
 
 def default_live_roots() -> list[Path]:
     return [
-        scratch_safety.user_home() / ".claude/projects",
-        scratch_safety.user_home() / ".codex/sessions",
-        scratch_safety.user_home() / ".pi/agent/sessions",
+        Path.home() / ".claude/projects",
+        Path.home() / ".codex/sessions",
+        Path.home() / ".pi/agent/sessions",
     ]
 
 
@@ -930,7 +928,7 @@ def run_once(
 ) -> Report:
     started = time.monotonic()
     policy.validate()
-    root, quarantine, state_dir = (expand_home(p).absolute() for p in (root, quarantine, state_dir))
+    root, quarantine, state_dir = (p.expanduser().absolute() for p in (root, quarantine, state_dir))
     if root.is_symlink() or root.name != f"claude-{os.getuid()}":
         raise ValueError("managed root must be the current user's real claude-UID directory")
     if quarantine.is_symlink() or state_dir.is_symlink():
@@ -953,12 +951,12 @@ def run_once(
         gate_state
         or Path(
             os.environ.get(
-                "HERDR_ENGINEERING_STATE", str(scratch_safety.user_home() / ".local/state/herdr-engineering")
+                "HERDR_ENGINEERING_STATE", str(Path.home() / ".local/state/herdr-engineering")
             )
         )
         / "build-gates"
     )
-    gate = expand_home(gate).resolve()
+    gate = gate.expanduser().resolve()
     if any(
         gate == managed or gate.is_relative_to(managed) or managed.is_relative_to(gate)
         for managed in (root, quarantine)
@@ -1101,10 +1099,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=None)
     parser.add_argument(
-        "--quarantine", type=Path, default=scratch_safety.user_home() / ".local/state/scratch-reaper/quarantine"
+        "--quarantine", type=Path, default=Path.home() / ".local/state/scratch-reaper/quarantine"
     )
     parser.add_argument(
-        "--state-dir", type=Path, default=scratch_safety.user_home() / ".local/state/scratch-reaper"
+        "--state-dir", type=Path, default=Path.home() / ".local/state/scratch-reaper"
     )
     parser.add_argument("--gate-state-dir", type=Path)
     parser.add_argument("--apply", action="store_true")
@@ -1122,7 +1120,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.status:
-            path = expand_home(args.state_dir) / "status.json"
+            path = args.state_dir.expanduser() / "status.json"
             print(json.dumps(_small_json(path) if path.exists() else {"status": "never_run"}))
             return 0
         policy = Policy(

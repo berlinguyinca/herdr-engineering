@@ -1,12 +1,9 @@
 import copy
 import gc
-import os
-from pathlib import Path
 
 import pytest
 
 from herdr_engineering import host_config as hc
-from herdr_engineering import scratch_safety
 
 
 @pytest.fixture
@@ -62,22 +59,3 @@ def fake_host_config(monkeypatch):
 def pytest_addoption(parser):
     parser.addoption("--allow-fabric-http-skip", action="store_true", default=False,
                      help="skip (instead of fail) the Fabric HTTP tests on a host with no non-loopback address")
-
-
-_ACCOUNT_HOME = scratch_safety.user_home
-
-
-@pytest.fixture(autouse=True)
-def _throwaway_home_follows_home_env(monkeypatch):
-    """Production resolves the home from the password database and never from ``$HOME``. Most tests
-    want a throwaway home, so here (and only here) ``user_home`` follows the test's ``HOME``. A test
-    that needs the real behaviour asks for ``account_home``."""
-    monkeypatch.setattr(scratch_safety, "user_home",
-                        lambda: Path(os.environ["HOME"]) if os.environ.get("HOME") else _ACCOUNT_HOME())
-
-
-@pytest.fixture
-def account_home(monkeypatch):
-    """The password-database home, with the production ``user_home`` back in place."""
-    monkeypatch.setattr(scratch_safety, "user_home", _ACCOUNT_HOME)
-    return _ACCOUNT_HOME()
