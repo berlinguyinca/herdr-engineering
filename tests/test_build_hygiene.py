@@ -6,12 +6,14 @@ produced by thresholds against the real measured usage (0% is always exceeded, 1
 from __future__ import annotations
 
 import fcntl
+import inspect
 import json
 import os
 import plistlib
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -391,388 +393,6 @@ def run_cli(tmp_path: Path, *args: str, settings: dict | None = None, extra_env:
                           capture_output=True, text=True, timeout=120)
 
 
-def test_fleet_cleanup_installer_failure_is_recorded_not_fatal(tmp_path):
-    from herdr_engineering import fleet
-    installer = tmp_path / "build-cleanup.sh"
-    installer.write_text("#!/bin/sh\nexit 3\n")
-    report: dict = {"steps": {}}
-
-    def step(name, cmd, timeout):
-        rc, _, err = fleet._run(cmd, timeout=timeout)
-        report["steps"][name] = {"ok": rc == 0, "rc": rc, "stderr": err.strip() or None}
-        return rc == 0, ""
-
-    assert fleet._install_controller_cleanup(installer, step, report, have_bus=True) is False  # must not raise
-    assert report["steps"]["controller_cleanup"]["ok"] is False
-    assert report["steps"]["controller_cleanup"]["rc"] == 3
-
-
-def test_fleet_cleanup_installer_is_skipped_without_a_systemd_user_bus(tmp_path):
-    from herdr_engineering import fleet
-    installer = tmp_path / "build-cleanup.sh"
-    ran = tmp_path / "ran"
-    installer.write_text(f"#!/bin/sh\ntouch {ran}\n")
-    report: dict = {"steps": {}}
-
-    def step(name, cmd, timeout):  # the real runner: it would run the installer if asked to
-        rc, _, err = fleet._run(cmd, timeout=timeout)
-        report["steps"][name] = {"ok": rc == 0, "rc": rc, "stderr": err.strip() or None}
-        return rc == 0, ""
-
-    assert fleet._install_controller_cleanup(installer, step, report, have_bus=False) is False
-    assert report["steps"]["controller_cleanup"]["skipped"] == "no systemd user bus"
-    assert not ran.exists()
-
-
-def test_job_command_is_the_venv_binary_or_python_dash_m_never_a_module_path():
-    command = build_hygiene.default_command()
-    assert command[0] == sys.executable or (Path(command[0]).name == "herdr-eng"
-                                            and Path(command[0]).parent == Path(sys.executable).parent)
-    if command[0] == sys.executable:
-        assert command[1:] == ["-m", "herdr_engineering.cli"]
-    assert not any(part.endswith(".py") for part in command)
-
-
-def test_install_writes_a_runnable_job_command_and_keeps_a_working_job(tmp_path):
-    fallback = [sys.executable, "-m", "herdr_engineering.cli"]
-    config = {"build_cleanup": {"enabled": True}, "fabric_build_cache": {"enabled": False}}
-    result = build_hygiene.install(tmp_path, fallback, platform="darwin", activate=False, config=config)
-    plist = plistlib.loads(Path(result["build_cleanup"]["job"]).read_bytes())
-    assert plist["ProgramArguments"] == [*fallback, "build-cleanup", "run"]
-    # A working job with a real binary is not replaced by the `-m` fallback.
-    working = tmp_path / "second"
-    build_hygiene.install_cleanup_job(working, Path(sys.executable), platform="darwin", activate=False)
-    job = working / "Library/LaunchAgents" / f"{build_hygiene.LAUNCHD_LABEL}.plist"
-    before = job.read_bytes()
-    build_hygiene.install(working, fallback, platform="darwin", activate=False, config=config)
-    assert plistlib.loads(job.read_bytes())["ProgramArguments"][:1] == [sys.executable]
-    assert job.read_bytes() == before  # same command and interval: byte-identical rewrite
-    # A changed interval is applied even though the working command is kept.
-    faster = {**config, "build_cleanup": {"enabled": True, "interval_seconds": 120}}
-    build_hygiene.install(working, fallback, platform="darwin", activate=False, config=faster)
-    refreshed = plistlib.loads(job.read_bytes())
-    assert refreshed["StartInterval"] == 120 and refreshed["ProgramArguments"][:1] == [sys.executable]
-    assert "-m" not in refreshed["ProgramArguments"]
-
-
-def test_systemd_unit_quotes_every_argument_of_the_command(tmp_path):
-    result = build_hygiene.install_cleanup_job(
-        tmp_path, [sys.executable, "-m", "herdr_engineering.cli"], platform="linux", activate=False)
-    text = Path(result["job"]).read_text()
-    assert f'ExecStart="{sys.executable}" "-m" "herdr_engineering.cli" build-cleanup watch' in text
-
-
-def test_jobs_pin_the_state_and_config_the_builds_use(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "custom-state"))
-    monkeypatch.setenv("HERDR_ENGINEERING_CONFIG", str(tmp_path / "custom.yaml"))
-    (tmp_path / "custom-state").mkdir()
-    mac = build_hygiene.install_cleanup_job(tmp_path / "mac", Path("/opt/herdr-eng"), platform="darwin",
-                                           activate=False)
-    environment = plistlib.loads(Path(mac["job"]).read_bytes())["EnvironmentVariables"]
-    assert environment["HERDR_ENGINEERING_STATE"] == str((tmp_path / "custom-state").resolve())
-    assert environment["HERDR_ENGINEERING_CONFIG"] == str(tmp_path / "custom.yaml")
-    linux = build_hygiene.install_cleanup_job(tmp_path / "lin", Path("/opt/herdr-eng"), platform="linux",
-                                             activate=False)
-    text = Path(linux["job"]).read_text()
-    assert f'Environment="HERDR_ENGINEERING_STATE={(tmp_path / "custom-state").resolve()}"' in text
-    assert f'Environment="HERDR_ENGINEERING_CONFIG={tmp_path / "custom.yaml"}"' in text
-
-
-@pytest.mark.parametrize("platform", ["darwin", "linux"])
-def test_opt_out_removes_an_installed_job(tmp_path, platform):
-    installed = build_hygiene.install_cleanup_job(tmp_path, Path("/opt/herdr-eng"), platform=platform,
-                                                 activate=False)
-    assert Path(installed["job"]).is_file()
-    config = {"build_cleanup": {"enabled": False}, "fabric_build_cache": {"enabled": False}}
-    result = build_hygiene.install(tmp_path, Path("/opt/herdr-eng"), platform=platform, activate=False,
-                                  config=config)
-    assert result["build_cleanup"]["removed"] == installed["job"]
-    assert not Path(installed["job"]).exists()
-
-
-def test_build_cleanup_run_exits_early_when_disabled(tmp_path, root):
-    cache = make_target(root)
-    refused = run_cli(tmp_path, "build-cleanup", "run", "--root", str(root),
-                      settings={"build_cleanup": {"enabled": False, "high_water_percent": 1,
-                                                  "low_water_percent": 0}})
-    assert refused.returncode == 0 and json.loads(refused.stdout)["status"] == "disabled"
-    assert cache.exists()
-    swept = run_cli(tmp_path, "build-cleanup", "run", "--root", str(root),
-                    settings={"build_cleanup": {"high_water_percent": 1, "low_water_percent": 0}})
-    assert swept.returncode == 0 and not cache.exists()
-
-
-def test_guard_busy_sweep_does_not_use_up_the_cooldown(root, state_env):
-    cache = make_target(root, age_hours=5)
-    state_env.mkdir(parents=True)
-    fd = os.open(state_env / "build-cleanup.lock", os.O_RDWR | os.O_CREAT, 0o600)
-    fcntl.flock(fd, fcntl.LOCK_EX)  # another sweep is running
-    try:
-        busy = disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={})
-    finally:
-        os.close(fd)
-    assert not busy.allowed and not busy.cleanup_ran and cache.exists()
-    assert not (state_env / "disk-guard.json").exists()
-    later = disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={})
-    assert not later.allowed and later.cleanup_ran and not cache.exists()
-
-
-def test_guard_still_refuses_when_the_cooldown_stamp_cannot_be_written(root, state_env):
-    cache = make_target(root, age_hours=5)
-    state_env.mkdir(parents=True)
-    (state_env / "disk-guard.json").mkdir()  # an unwritable stamp, as on a full disk
-    decision = disk_guard.check_build_allowed(root, guard_policy(root, 0), state_env, env={})
-    assert not decision.allowed and decision.cleanup_ran and not cache.exists()
-    assert disk_guard.OVERRIDE_ENV in decision.message
-
-
-def test_guard_does_not_refuse_a_disk_with_ample_free_space(root, state_env):
-    policy = {**guard_policy(root, 0), "refuse_builds_min_free_gib": 0}
-    decision = disk_guard.check_build_allowed(root, policy, state_env, env={})
-    assert decision.allowed and not decision.cleanup_ran
-
-
-def test_guard_is_off_when_build_cleanup_is_disabled(root, state_env):
-    policy = {**guard_policy(root, 0), "enabled": False}
-    assert disk_guard.check_build_allowed(root, policy, state_env, env={}).allowed
-
-
-def test_guard_measures_the_nearest_existing_ancestor_of_the_build_output(root, state_env):
-    decision = disk_guard.check_build_allowed(root / "not/yet/created", guard_policy(root, 101),
-                                              state_env, env={})
-    assert decision.allowed and 0 <= decision.usage_percent <= 100
-    percent, free_gib = disk_guard.measure(root)
-    assert 0 <= percent <= 100 and free_gib > 0
-
-
-def test_real_cargo_prefers_the_rustup_proxy_over_path(tmp_path):
-    proxy_dir = tmp_path / "home/.cargo/bin"
-    distro = tmp_path / "usr/bin"
-    proxy_dir.mkdir(parents=True)
-    distro.mkdir(parents=True)
-    binary = Path(shutil.which("true"))
-    shutil.copy(binary, proxy_dir / "cargo")
-    shutil.copy(binary, distro / "cargo")
-    resolved = build_hygiene.resolve_real_cargo(tmp_path / "home", path_env=str(distro))
-    assert resolved == proxy_dir / "cargo"
-
-
-def test_real_cargo_respects_a_valid_recorded_install(tmp_path):
-    home = tmp_path / "home"
-    (home / ".cargo/bin").mkdir(parents=True)
-    recorded = tmp_path / "recorded/cargo"
-    recorded.parent.mkdir()
-    shutil.copy(shutil.which("true"), recorded)
-    shutil.copy(shutil.which("true"), home / ".cargo/bin/cargo")
-    from herdr_engineering.cargo_host import host_root
-    (host_root(home)).mkdir(parents=True)
-    (host_root(home) / "install.json").write_text(json.dumps({"real_cargo": str(recorded)}))
-    assert build_hygiene.resolve_real_cargo(home, path_env="") == recorded
-
-
-# --- review round 2 fixes -------------------------------------------------------------------
-
-@pytest.mark.integration
-def test_two_worktrees_build_into_separate_targets_and_keep_their_own_binaries(tmp_path):
-    home, env = cargo_env(tmp_path)
-    repo, worktree = crate_with_worktree(tmp_path)
-    assert build(repo, home, env).returncode == 0
-    binary = (repo / "target/debug/shared-demo").resolve()
-    before = binary.stat().st_mtime_ns
-    (worktree / "src/main.rs").write_text('fn main() { println!("other branch"); }\n')
-    assert build(worktree, home, env).returncode == 0
-    assert (repo / "target").resolve() != (worktree / "target").resolve()
-    assert (repo / "target/debug/shared-demo").resolve() == binary
-    assert binary.stat().st_mtime_ns == before  # the other branch's build did not overwrite it
-    assert subprocess.run([str(binary)], capture_output=True, text=True).stdout == ""
-
-
-def test_guard_and_sweep_measure_usage_the_same_way(root):
-    assert cleanup._usage(root) == pytest.approx(disk_guard.measure(root)[0], abs=0.5)
-
-
-def test_each_cleanup_cycle_picks_up_a_pool_created_after_the_watcher_started(tmp_path, root, monkeypatch):
-    from herdr_engineering.build_maintenance import cleanup_cycle
-    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "wstate"))
-    cfg = {"roots": [str(root)], "high_water_percent": 100.0, "low_water_percent": 0}
-    state = tmp_path / "wstate/build-gates"
-    state.mkdir(parents=True)
-    pool = state / "shared-targets"
-    assert cleanup_cycle(cfg, None, state)["roots"] == [str(root)]
-    pool.mkdir()
-    assert os.path.realpath(pool) in cleanup_cycle(cfg, None, state)["roots"]
-
-
-def test_pools_and_legacy_targets_on_an_enrolled_tier_are_swept_roots(tmp_path, monkeypatch):
-    from herdr_engineering.build_maintenance import effective_roots
-    volume = tmp_path / "vol/herdr-build"
-    (volume / "shared-targets").mkdir(parents=True)
-    (volume / "targets").mkdir()
-    config = tmp_path / "tiers.yaml"
-    config.write_text(yaml.safe_dump({"fabric_build_cache": {"local": {"storage_tiers": [
-        {"name": "ext", "directory": str(volume / "compiler-cache")}]}}}))
-    monkeypatch.setenv("HERDR_ENGINEERING_CONFIG", str(config))
-    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "estate"))
-    roots = {str(path) for path in effective_roots({"roots": []})}
-    assert os.path.realpath(volume / "shared-targets") in roots
-    assert os.path.realpath(volume / "targets") in roots
-
-
-def make_managed_target(targets: Path, name: str = "app-1234", age_hours: float = 48) -> Path:
-    """A per-worktree managed target (``targets/<label>-<id>``) with the markers that prove it is ours."""
-    targets.mkdir(parents=True, exist_ok=True)
-    (targets / ".herdr-target-root.json").write_text(json.dumps({"version": 1, "owner_uid": os.getuid()}))
-    target = targets / name
-    (target / "debug/.fingerprint").mkdir(parents=True)
-    (target / "debug/artifact").write_bytes(b"x" * 4096)
-    (target / ".herdr-cargo-target.json").write_text(json.dumps(
-        {"version": 1, "workspace": str(targets.parent / "ws"), "owner_uid": os.getuid()}))
-    stamp = time.time() - age_hours * 3600
-    for path in [*target.rglob("*"), target]:
-        os.utime(path, (stamp, stamp))
-    return target
-
-
-def test_orphaned_per_workspace_targets_are_reclaimed_when_idle(tmp_path):
-    targets = tmp_path / "state/targets"
-    target = make_managed_target(targets)
-    recent = make_managed_target(targets, "fresh-5678", age_hours=0)
-    result = cleanup.run_once([Path(os.path.realpath(targets))], tmp_path / "state2", high_water=1,
-                              low_water=0, min_age_hours=24)
-    assert str(Path(os.path.realpath(target))) in result["removed"] and not target.exists()
-    assert recent.exists()
-
-
-def test_unmarked_directories_under_a_targets_folder_are_not_removed(tmp_path):
-    targets = tmp_path / "state/targets"
-    target = make_managed_target(targets)
-    (target / ".herdr-cargo-target.json").unlink()
-    cleanup.run_once([Path(os.path.realpath(targets))], tmp_path / "state2", high_water=1,
-                     low_water=0, min_age_hours=24)
-    assert target.exists()
-
-
-def test_tracked_cache_only_target_in_a_repository_is_never_removed(root):
-    repo = root / "tools"
-    fixture = repo / "tests/fixtures/ws/target"
-    (fixture / "debug/.fingerprint").mkdir(parents=True)
-    (fixture / "CACHEDIR.TAG").write_text(CACHEDIR_TAG)
-    (fixture / ".rustc_info.json").write_text("{}")
-    git("init", "-q", cwd=repo)
-    git("add", ".", cwd=repo)
-    git("commit", "-q", "-m", "fixture", cwd=repo)
-    stamp = time.time() - 48 * 3600
-    for path in [*fixture.rglob("*"), fixture]:
-        os.utime(path, (stamp, stamp))
-    result = sweep(root)
-    assert fixture.exists() and not result["removed"]
-    assert any(item["reason"] == "tracked or unverifiable output" for item in result["skipped"])
-
-
-def test_dry_run_scans_processes_once_not_per_candidate(root):
-    for name in ("one", "two", "three"):
-        make_target(root, name)
-    result = sweep(root, dry_run=True)
-    assert len(result["would_remove"]) == 3 and result["process_scans"] == 1
-
-
-def test_explicit_roots_are_not_resolved_and_a_non_canonical_one_is_skipped_with_a_reason(tmp_path, root):
-    from herdr_engineering.build_maintenance import effective_roots
-    link = tmp_path / "link"
-    link.symlink_to(root)
-    assert effective_roots({}, [str(link)]) == [link]
-    cache = make_target(root, "victim")
-    result = cleanup.run_once([link, root], tmp_path / "state", high_water=1, low_water=0, min_age_hours=24)
-    assert result["status"] == "warning" and not result["errors"]
-    assert any(f"skipped root {link}" in warning and "canonical" in warning for warning in result["warnings"])
-    assert str(cache) in result["removed"] and not cache.exists()  # the good root is still swept
-
-
-def test_a_missing_default_root_does_not_abort_the_sweep(tmp_path, root):
-    cache = make_target(root, "victim")
-    missing = tmp_path / "gone" / "targets"
-    result = cleanup.run_once([missing, root], tmp_path / "state", high_water=1, low_water=0, min_age_hours=24)
-    assert not result["errors"] and any(f"skipped root {missing}" in w for w in result["warnings"])
-    assert not cache.exists()
-
-
-def lock_state(tmp_path: Path, name: str, mode: int) -> int:
-    state = tmp_path / "state"
-    state.mkdir(exist_ok=True)
-    fd = os.open(state / name, os.O_CREAT | os.O_RDWR, 0o600)
-    fcntl.flock(fd, mode)
-    return fd
-
-
-def test_a_sweep_runs_while_a_build_holds_the_maintenance_lock_shared(tmp_path, root):
-    """The guard runs inside builds (build-coordinate holds LOCK_SH for the whole build)."""
-    cache = make_target(root, "victim")
-    fd = lock_state(tmp_path, "build-maintenance.lock", fcntl.LOCK_SH)
-    try:
-        result = cleanup.run_once([root], tmp_path / "state", high_water=1, low_water=0, min_age_hours=24)
-    finally:
-        os.close(fd)
-    assert result["status"] != "busy" and not cache.exists()
-
-
-def test_a_sweep_yields_to_exclusive_maintenance_and_to_another_sweep(tmp_path, root):
-    cache = make_target(root, "victim")
-    for name in ("build-maintenance.lock", "build-cleanup.lock"):
-        fd = lock_state(tmp_path, name, fcntl.LOCK_EX)
-        try:
-            result = cleanup.run_once([root], tmp_path / "state", high_water=1, low_water=0, min_age_hours=24)
-        finally:
-            os.close(fd)
-        assert result["status"] == "busy" and cache.exists(), name
-
-
-def test_a_volume_tier_is_resolved_through_its_mount_never_against_the_cwd(tmp_path, monkeypatch):
-    from herdr_engineering.build_maintenance import effective_roots
-    decoy = tmp_path / "cwd"
-    (decoy / "herdr-build/targets").mkdir(parents=True)
-    monkeypatch.chdir(decoy)
-    config = tmp_path / "tiers.yaml"
-    config.write_text(yaml.safe_dump({"fabric_build_cache": {"local": {"storage_tiers": [
-        {"name": "ext", "directory": "herdr-build/compiler-cache",
-         "volume_uuid": "11111111-2222-3333-4444-555555555555"}]}}}))
-    monkeypatch.setenv("HERDR_ENGINEERING_CONFIG", str(config))
-    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "estate"))
-    assert os.path.realpath(decoy / "herdr-build/targets") not in {str(p) for p in effective_roots({"roots": []})}
-
-
-def test_a_legacy_shared_pool_is_still_swept_when_idle_and_migration_ignores_it(tmp_path):
-    from herdr_engineering.build_cleanup import _discover
-    pool = tmp_path / "state/build-gates/shared-targets"
-    cache = make_pool_target(pool / "repo-1" / "tc-0")
-    root = Path(os.path.realpath(pool))
-    assert cache in _discover(root) and _discover(root, managed=False) == []
-    assert cleanup.run_once([root], tmp_path / "s2", high_water=1, low_water=0,
-                            min_age_hours=24, pressure_water=0)["removed_count"] == 1
-
-
-def test_build_hygiene_install_exits_nonzero_when_a_step_fails(tmp_path):
-    home = tmp_path / "home"
-    home.mkdir()
-    config = tmp_path / "c.yaml"
-    config.write_text(yaml.safe_dump({}))
-    env = {"HOME": str(home), "PATH": str(tmp_path / "empty"), "HERDR_ENGINEERING_CONFIG": str(config),
-           "HERDR_ENGINEERING_STATE": str(tmp_path / "s"),
-           "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
-    result = subprocess.run([sys.executable, "-m", "herdr_engineering.cli", "build-hygiene", "install",
-                             "--no-activate"], env=env, capture_output=True, text=True, timeout=120)
-    assert json.loads(result.stdout)["cargo_host"]["error"]
-    assert result.returncode != 0
-
-
-def test_systemd_install_without_a_user_bus_writes_the_unit_and_does_not_fail(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "no-runtime-dir"))
-    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
-    result = build_hygiene.install_cleanup_job(tmp_path, [sys.executable, "-m", "herdr_engineering.cli"],
-                                               platform="linux", activate=True)
-    assert result["activated"] is False and "user bus" in result["skipped"]
-    assert Path(result["job"]).is_file()
-
-
 def test_systemd_unit_lives_under_xdg_config_home_for_the_real_home(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     assert build_hygiene._unit_path(Path.home()) == tmp_path / "xdg/systemd/user" / build_hygiene.SYSTEMD_UNIT
@@ -780,17 +400,11 @@ def test_systemd_unit_lives_under_xdg_config_home_for_the_real_home(tmp_path, mo
         tmp_path / "other/.config/systemd/user" / build_hygiene.SYSTEMD_UNIT)
 
 
-def test_install_can_leave_the_cleanup_job_to_the_controller_step(tmp_path):
-    result = build_hygiene.install(tmp_path, [sys.executable, "-m", "x"], platform="linux", activate=False,
-                                   config={"fabric_build_cache": {"enabled": False}}, skip_cleanup_job=True)
-    assert "installed by the controller" in result["build_cleanup"]["skipped"]
-    assert not build_hygiene._unit_path(tmp_path).exists()
-
-
-def test_fleet_runs_a_single_cleanup_installer_per_platform():
+def test_fleet_update_leaves_the_cleanup_job_to_build_hygiene_alone():
+    """One installer writes the job (the old systemd script resolved herdr-eng blindly, stale venv included)."""
     from herdr_engineering import fleet
-    assert "--skip-cleanup-job" in fleet._build_hygiene_command(legacy_installer_ran=True)
-    assert "--skip-cleanup-job" not in fleet._build_hygiene_command(legacy_installer_ran=False)
+    assert not hasattr(fleet, "_install_controller_cleanup")
+    assert "--skip-cleanup-job" not in inspect.getsource(fleet) and "build-cleanup.sh" not in inspect.getsource(fleet)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="launchd")
@@ -873,7 +487,7 @@ def test_a_build_waits_for_a_sweep_that_is_deleting_its_target_then_starts_afres
                      daemon=True).start()
     assert not done.wait(0.5), "the build must wait while the sweep holds the target"
     shutil.rmtree(target)
-    cleanup._release_removal_lock(target, fd)
+    cleanup._release_removal_lock(fd)
     assert done.wait(10), "the build starts as soon as the sweep is done"
     assert target.is_dir() and (target / ".herdr-cargo-target.json").is_file()
 
@@ -982,6 +596,9 @@ def test_target_override_follows_cargos_precedence(tmp_path):
     assert target_override(["--config", "build.target-dir='/cfg'"], env, cwd) == Path("/cfg")
     assert target_override(["--config=build.target-dir='/cfg'", "--target-dir=/cli"], env, cwd) == Path("/cli")
     assert target_override(["--config", "extra.toml"], env, cwd) is True
+    # repeated --config values merge left to right: the last one that sets the directory wins
+    assert target_override(["--config", "build.target-dir='/a'", "--config", "build.target-dir='/b'"],
+                           env, cwd) == Path("/b")
     assert target_override([], env, cwd) == Path("/from/env")
 
 
@@ -991,7 +608,7 @@ def test_fleet_keeps_the_cleanup_job_when_roots_are_empty():
     assert fleet._cleanup_job_wanted({"enabled": True, "roots": []}) is True
     assert fleet._cleanup_job_wanted({}) is True
     assert fleet._cleanup_job_wanted({"enabled": False, "roots": ["/x"]}) is False
-    assert fleet._hygiene_bus is build_hygiene._has_systemd_user_bus  # one helper, not a copy
+    assert not hasattr(fleet, "_has_systemd_user_bus")  # the one bus probe lives in build_hygiene
 
 
 # --- review round 5 -------------------------------------------------------------------------
@@ -1023,12 +640,83 @@ def test_prepare_target_creates_the_lock_so_a_sweep_never_has_to(tmp_path):
     assert target_lock_path(target).is_file()
 
 
-def test_a_target_without_a_lock_file_is_swept_and_leaves_no_lock_behind(root):
+def test_a_target_without_a_lock_file_is_swept_and_the_lock_is_left_in_place(root):
     from herdr_engineering.cargo_target_storage import target_lock_path
     target = make_managed(root, "old", lock=False)
     result = sweep(root)
     assert result["removed"] == [str(target)] and not target.exists()
-    assert not target_lock_path(target).exists()  # the sweep never created one
+    assert target_lock_path(target).is_file()  # created like a build creates it, never unlinked
+
+
+def _age(target: Path, hours: float = 48) -> None:
+    """Make the target look idle again (a build touches its marker when it starts)."""
+    stamp = time.time() - hours * 3600
+    for path in [*target.rglob("*"), target]:
+        os.utime(path, (stamp, stamp), follow_symlinks=False)
+
+
+def _spawn_build(target_args: str, hold_seconds: int = 60):
+    """A real build process: prepare the managed target with its build lock, then wait."""
+    code = ("import sys, time; from pathlib import Path; "
+            "from herdr_engineering.cargo_target_storage import prepare_target; "
+            "prepare_target(Path(sys.argv[1]), Path(sys.argv[2]), build_lock=True); "
+            f"print('building', flush=True); time.sleep({hold_seconds})")
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    proc = subprocess.Popen([sys.executable, "-c", code, *target_args.split("|")], env=env,
+                            stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "building"
+    return proc
+
+
+def test_a_sweep_process_never_removes_the_target_of_a_build_process_that_has_no_lock_file_yet(root):
+    """A target made before locks existed has no lock file: the build creates it, the sweep honours it,
+    and neither deletes it (the failure: the sweep locked the directory, so the build was not excluded)."""
+    from herdr_engineering.cargo_target_storage import target_lock_path
+    target = make_managed(root, "legacy", lock=False)
+    workspace = root.parent / "workspaces/legacy"
+    build = _spawn_build(f"{root / 'sccache'}|{workspace}")
+    try:
+        assert target_lock_path(target).is_file()
+        _age(target)
+        code = ("import sys, json; from herdr_engineering import build_cleanup as c; "
+                "r = c.run_once(roots=[sys.argv[1]], state_dir=sys.argv[2], high_water=1, low_water=0, "
+                "pressure_water=0, pressure_min_age_hours=1, min_age_hours=1); "
+                "print(json.dumps({'removed': r['removed'], 'skipped': r['skipped']}))")
+        env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+        out = subprocess.run([sys.executable, "-c", code, str(root), str(root.parent / "gates")],
+                             env=env, capture_output=True, text=True, timeout=120)
+        report = json.loads(out.stdout.strip().splitlines()[-1])
+        assert report["removed"] == [] and target.is_dir(), (report, out.stderr[-500:])
+        assert any(x["path"] == str(target) and x["reason"] == "build in progress" for x in report["skipped"])
+    finally:
+        build.kill()
+        build.wait()
+    _age(target)
+    assert sweep(root)["removed"] == [str(target)]  # the build is gone: now it is swept
+    assert target_lock_path(target).is_file()
+
+
+def test_a_daemon_started_by_the_build_does_not_keep_the_target_locked(root):
+    """The lock stays in the waiting wrapper: a child that outlives it (an sccache server) never holds it."""
+    from herdr_engineering.cargo_target_storage import target_lock_path
+    target = make_managed(root, "daemonised")
+    workspace = root.parent / "workspaces/daemonised"
+    code = ("import subprocess, sys; from pathlib import Path; "
+            "from herdr_engineering.cargo_target_storage import prepare_target; "
+            "prepare_target(Path(sys.argv[1]), Path(sys.argv[2]), build_lock=True); "
+            "p = subprocess.Popen(['sleep', '60'], close_fds=False); print(p.pid, flush=True)")
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    wrapper = subprocess.Popen([sys.executable, "-c", code, str(root / "sccache"), str(workspace)],
+                               env=env, stdout=subprocess.PIPE, text=True)
+    daemon = int(wrapper.stdout.readline())
+    wrapper.wait(timeout=60)
+    _age(target)
+    try:
+        result = sweep(root)  # the wrapper has exited; only the daemon is left
+    finally:
+        os.kill(daemon, 15)
+    assert result["removed"] == [str(target)], result["skipped"]
+    assert target_lock_path(target).is_file()
 
 
 def test_a_skipped_target_keeps_its_lock_file(root):
@@ -1083,20 +771,13 @@ def test_a_refused_foreign_root_gets_no_lock_file(tmp_path):
     assert sorted(p.name for p in foreign.iterdir()) == [".target-manager.lock", "someone-elses-data"]
 
 
-def test_discovery_only_probes_the_root_marker_in_targets_directories(root, monkeypatch):
-    (root / "a/b").mkdir(parents=True)
-    (root / "targets").mkdir()
-    probed = []
-    real = Path.is_file
-
-    def spy(self):
-        if self.name == ".herdr-target-root.json":
-            probed.append(self.parent.name)
-        return real(self)
-
-    monkeypatch.setattr(Path, "is_file", spy)
-    cleanup._discover(root)
-    assert set(probed) <= {"targets"}
+def test_only_a_targets_directory_with_the_root_marker_yields_managed_targets(root):
+    """A root marker proves ownership of the ``targets`` directory it sits in, nowhere else."""
+    target = make_managed(root, "app")
+    assert cleanup._discover(root) == [target]
+    elsewhere = root / "somewhere-else"
+    target.parent.rename(elsewhere)  # same marker, same child, but not a ``targets`` directory
+    assert cleanup._discover(root) == []
 
 
 def test_a_herdr_eng_symlink_into_another_venv_is_not_a_working_job(tmp_path):
@@ -1147,3 +828,123 @@ def test_an_operator_owned_target_is_decided_before_and_without_the_managed_tier
     built = build(repo, home, env)
     assert built.returncode == 0, built.stderr
     assert (repo / "target/debug/shared-demo").is_file() and not managed_targets(tmp_path)
+
+
+# --- review round 6 -------------------------------------------------------------------------
+
+def _policy(root: Path, **extra) -> dict:
+    return {"enabled": True, "roots": [str(root)], "pressure_percent": 100, **extra}
+
+
+def test_the_reserve_check_and_the_sweep_use_the_one_df_figure(root):
+    """select_storage's reserve rule and the cleanup's usage are the same measurement."""
+    from herdr_engineering.build_cache_location import StorageTier, select_storage
+    used, _ = disk_guard.measure(root)
+    assert cleanup._usage(root) == pytest.approx(used, abs=0.5)
+    tier = (StorageTier("t", str(root / "cache")),)
+    keeps = select_storage(tier, root / "x", (100 - used) - 1)
+    misses = select_storage(tier, root / "x", (100 - used) + 1)
+    assert keeps.directory is not None and misses.directory is None
+
+
+def test_a_reserve_cleanup_is_not_pressure_mode(root, state_env):
+    """The reserve line (here 1%) must not make the short idle floor apply: only ``pressure_percent`` does."""
+    recent = make_target(root, "recent", age_hours=3)
+    old = make_target(root, "old", age_hours=48)
+    ran = disk_guard.relieve(_policy(root), state_env, 1, pressure=False)
+    assert ran is True and recent.exists() and not old.exists()
+    shutil.rmtree(state_env)
+    ran = disk_guard.relieve(_policy(root), state_env, 1, pressure=True)  # the guard's refusal line
+    assert ran is True and not recent.exists()
+
+
+def test_a_cleanup_only_touches_roots_on_the_filesystem_under_pressure(root, state_env):
+    old = make_target(root, "old", age_hours=48)
+    elsewhere = os.stat(root).st_dev + 1  # a different filesystem than the root's
+    result = cleanup.run_once([root], state_env, high_water=1, low_water=0, only_device=elsewhere)
+    assert result["roots"] == [] and old.exists()
+    result = cleanup.run_once([root], state_env, high_water=1, low_water=0, only_device=os.stat(root).st_dev)
+    assert result["removed"] == [str(old)]
+
+
+def test_a_failed_cleanup_does_not_start_the_cooldown(tmp_path, root):
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("x")
+    assert disk_guard.relieve(_policy(root), blocker / "state", 1) is None  # the sweep itself cannot start
+    good = tmp_path / "state"
+    assert disk_guard.relieve(_policy(root), good, 1) is True  # not suppressed by the failure
+
+
+def test_every_unmanaged_removal_is_checked_against_its_own_process_snapshot(root):
+    first, second = make_target(root, "a"), make_target(root, "b")
+    result = sweep(root)
+    assert sorted(result["removed"]) == sorted([str(first), str(second)])
+    assert result["process_scans"] == 3  # one before anything is deleted, then one right before each removal
+
+
+def test_a_dry_run_neither_creates_a_lock_file_nor_holds_a_build_up(root):
+    from herdr_engineering.cargo_target_storage import target_lock_path
+    target = make_managed(root, "legacy", lock=False)
+    result = sweep(root, dry_run=True)
+    assert result["would_remove"] == [str(target)]
+    assert not target_lock_path(target).exists()
+
+
+@pytest.mark.integration
+def test_a_reserve_miss_with_an_empty_build_cleanup_key_exits_75_not_a_crash(tmp_path):
+    home, env = cargo_env(tmp_path)
+    set_reserve(env, 99)
+    path = Path(env["HERDR_ENGINEERING_CONFIG"])
+    path.write_text(path.read_text() + "build_cleanup:\n")  # YAML null: no value
+    repo, _ = crate_with_worktree(tmp_path)
+    refused = build(repo, home, env)
+    assert refused.returncode == disk_guard.EXIT_REFUSED, refused.stderr
+    assert "Traceback" not in refused.stderr and "AttributeError" not in refused.stderr
+
+
+@pytest.mark.integration
+def test_a_reserve_refusal_with_cleanup_disabled_does_not_claim_a_cleanup(tmp_path):
+    home, env = cargo_env(tmp_path)
+    set_reserve(env, 99, enabled=False)
+    repo, _ = crate_with_worktree(tmp_path)
+    refused = build(repo, home, env)
+    assert refused.returncode == disk_guard.EXIT_REFUSED, refused.stderr
+    assert "refusing to start a new build" in refused.stderr and "after cleaning up" not in refused.stderr
+
+
+def _other_filesystem_dir() -> Path | None:
+    """A writable directory on a different filesystem than the temp directory (tmpfs on Linux)."""
+    shm = Path("/dev/shm")
+    if shm.is_dir() and os.access(shm, os.W_OK) and os.stat(shm).st_dev != os.stat(Path.cwd()).st_dev:
+        return shm
+    return None
+
+
+@pytest.mark.integration
+def test_the_guard_measures_the_tier_the_reserve_chose_not_a_full_primary(tmp_path):
+    """Tiers [full, roomy]: the build goes to the roomy tier, so a full primary must not refuse it."""
+    other = _other_filesystem_dir()
+    if other is None:
+        pytest.skip("needs a second filesystem (tmpfs at /dev/shm)")
+    home, env = cargo_env(tmp_path)
+    base_used, _ = disk_guard.measure(tmp_path)
+    shm_used, _ = disk_guard.measure(other)
+    if shm_used >= base_used - 2:
+        pytest.skip("the temp filesystem is not fuller than tmpfs here")
+    path = Path(env["HERDR_ENGINEERING_CONFIG"])
+    settings = yaml.safe_load(path.read_text())
+    local = settings["fabric_build_cache"]["local"]
+    shm_dir = Path(tempfile.mkdtemp(dir=other)) / "compiler-cache"
+    local["storage_tiers"] = [{"name": "primary", "directory": str(tmp_path / "tier/compiler-cache")},
+                              {"name": "roomy", "directory": str(shm_dir)}]
+    local["min_free_disk_percent"] = (100 - base_used + 100 - shm_used) / 2  # the primary misses it, tmpfs meets it
+    # a guard that refuses anything on the primary's filesystem but nothing on tmpfs
+    settings["build_cleanup"] = {"refuse_builds_percent": (base_used + shm_used) / 2,
+                                 "refuse_builds_min_free_gib": 1e12, "enabled": False}
+    path.write_text(yaml.safe_dump(settings))
+    repo, _ = crate_with_worktree(tmp_path)
+    try:
+        built = build(repo, home, env)
+    finally:
+        shutil.rmtree(shm_dir.parent, ignore_errors=True)
+    assert built.returncode == 0, built.stderr

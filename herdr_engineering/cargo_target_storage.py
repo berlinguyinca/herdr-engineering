@@ -151,15 +151,15 @@ def target_override(arguments: list[str], env: Mapping[str, str], cwd: Path) -> 
         else:
             continue
         if "=" not in value:
-            config_value = config_value or True  # A separately supplied config file remains authoritative.
+            config_value = True  # A separately supplied config file may set it, and the last one wins.
             continue
         try:
             directory = tomllib.loads(value).get("build", {}).get("target-dir")
         except ValueError:
-            config_value = config_value or True
+            config_value = True
             continue
         if directory:
-            config_value = config_value or (cwd / directory if isinstance(directory, str) else True)
+            config_value = cwd / directory if isinstance(directory, str) else True  # repeated --config: the last wins
     # Cargo's precedence: --target-dir, then --config, then the environment, then config files.
     if config_value:
         return config_value
@@ -219,28 +219,19 @@ def target_lock_path(target: Path) -> Path:
 
 
 def _hold_target_lock(target: Path) -> int:
-    """Shared, inheritable lock on ``target`` for the life of the build (and its exec'd children).
+    """Shared lock on ``target`` for the life of the build, held by this (waiting) wrapper process.
 
-    Waits out a sweep that is deleting the target. The sweep unlinks the lock when it is done, so the
-    path is re-checked against the descriptor and the lock re-opened when it was replaced.
+    The same ``<name>.lock`` a sweep takes exclusively; whoever comes first creates it and the flock decides.
+    A sweep that is deleting the target is waited out. The descriptor is not inheritable: cargo and any
+    daemon it starts (an sccache server, say) never hold the lock, so it ends with the build.
     """
-    path = target_lock_path(target)
-    for _ in range(20):
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH)
-            try:
-                same = os.stat(path).st_ino == os.fstat(fd).st_ino
-            except FileNotFoundError:
-                same = False
-            if same:
-                os.set_inheritable(fd, True)
-                return fd
-        except BaseException:
-            os.close(fd)
-            raise
+    fd = os.open(target_lock_path(target), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+    except BaseException:
         os.close(fd)
-    raise ValueError("Cannot lock the managed target: it keeps being cleaned up")
+        raise
+    return fd
 
 
 @contextmanager
@@ -256,10 +247,10 @@ def _manager_lock(root: Path) -> Iterator[None]:
 def prepare_target(cache: Path, workspace: Path, *, build_lock: bool = False) -> Path:
     """The workspace's managed target, created and ownership-checked.
 
-    The target's lock file is created here, beside the target, so a sweep never has to create one
-    on a full disk. ``build_lock`` also takes its shared lock and leaves it open (inheritable) so it is
-    held until the build, which inherits it across exec, ends: the sweep never deletes a target that a
-    build holds.
+    The target's lock file is created here, beside the target (a sweep creates it the same way if it is
+    missing; neither ever deletes it). ``build_lock`` also takes its shared lock and leaves it open in this process, which
+    must stay alive until the build ends (it waits for cargo, never execs it): the sweep never deletes a
+    target that a build holds.
     """
     if not cache.is_dir():
         raise ValueError("Selected storage disappeared; refusing to create a mount directory")

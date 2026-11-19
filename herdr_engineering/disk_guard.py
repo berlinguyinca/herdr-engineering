@@ -15,6 +15,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -37,12 +38,17 @@ class GuardDecision:
 
 def measure(path: Path) -> tuple[float, float]:
     """(percent used, GiB available to the user) as ``df`` reports them (reserved blocks are not free)."""
-    stat = os.statvfs(path)
-    used = (stat.f_blocks - stat.f_bfree) * stat.f_frsize
-    avail = stat.f_bavail * stat.f_frsize
-    if used + avail <= 0:
+    usage = shutil.disk_usage(path)  # used = blocks - bfree, free = bavail: the figures ``df`` prints
+    if usage.used + usage.free <= 0:
         raise OSError(f"Cannot measure filesystem at {path}")
-    return 100 * used / (used + avail), avail / 2**30
+    return 100 * usage.used / (usage.used + usage.free), usage.free / 2**30
+
+
+def _existing(path: Path) -> Path:
+    """The closest existing ancestor of ``path`` (a directory a build will create is measured where it lands)."""
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return path
 
 
 def _stamp(state_dir: Path) -> Path:
@@ -77,8 +83,13 @@ def _wait_for_other_sweep(state_dir: Path, seconds: float) -> None:
 
 
 def relieve(cleanup_cfg: Mapping, state_dir: Path, at_percent: float,
-            busy_wait: float = BUSY_WAIT_SECONDS) -> bool | None:
-    """One pressure cleanup of the configured roots at ``at_percent`` usage and above.
+            busy_wait: float = BUSY_WAIT_SECONDS, *, probe: Path | None = None,
+            pressure: bool = True) -> bool | None:
+    """One cleanup of the configured roots at ``at_percent`` usage and above.
+
+    ``probe`` limits it to roots on that path's filesystem, the one under pressure. ``pressure`` (the
+    guard's refusal line) lets the short idle floor apply from ``at_percent``; without it (the free-space
+    reserve) only the configured ``pressure_percent`` does, so a reserve at 80% never cleans like 90%.
 
     Rate limited (a build storm must not spawn a storm of sweeps). Returns True when a sweep ran, False
     when another sweep was already freeing space (it is waited for, at most ``busy_wait`` seconds), and
@@ -93,12 +104,14 @@ def relieve(cleanup_cfg: Mapping, state_dir: Path, at_percent: float,
     kwargs = policy_kwargs(dict(cleanup_cfg))
     kwargs["high_water"] = max(min(kwargs["high_water"], at_percent), 1)
     kwargs["low_water"] = min(kwargs["low_water"], kwargs["high_water"] - 1)
-    kwargs["pressure_water"] = min(kwargs["pressure_water"], at_percent)
+    if pressure:
+        kwargs["pressure_water"] = min(kwargs["pressure_water"], at_percent)
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
-        result = run_once(roots=roots, state_dir=state_dir, **kwargs)
+        device = os.stat(_existing(probe)).st_dev if probe is not None else None
+        result = run_once(roots=roots, state_dir=state_dir, only_device=device, **kwargs)
     except OSError:
-        result = {"status": "error"}  # a full disk can fail the sweep itself: the caller decides below
+        return None  # a full disk can fail the sweep itself: nothing ran, so no cooldown starts
     if result.get("status") == "busy":  # another sweep is running: its result is what we need
         _wait_for_other_sweep(state_dir, busy_wait)
         return False
@@ -121,15 +134,13 @@ def check_build_allowed(path: Path, cleanup_cfg: Mapping, state_dir: Path,
     enabled = bool(cleanup_cfg.get("enabled", True))
     refuse_at = float(cleanup_cfg.get("refuse_builds_percent", 90))
     floor_gib = float(cleanup_cfg.get("refuse_builds_min_free_gib", DEFAULT_MIN_FREE_GIB))
-    probe = path
-    while not probe.exists() and probe != probe.parent:
-        probe = probe.parent
+    probe = _existing(path)
     usage, free_gib = measure(probe)
     if not enabled or usage < refuse_at or free_gib >= floor_gib:
         return GuardDecision(True, usage)
     if env.get(OVERRIDE_ENV) == "1":
         return GuardDecision(True, usage, f"disk {usage:.1f}% full; proceeding because {OVERRIDE_ENV}=1")
-    ran = relieve(cleanup_cfg, state_dir, refuse_at, busy_wait)
+    ran = relieve(cleanup_cfg, state_dir, refuse_at, busy_wait, probe=probe)
     if ran is not None:
         usage, free_gib = measure(probe)
         if usage < refuse_at or free_gib >= floor_gib:

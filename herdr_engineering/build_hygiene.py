@@ -217,11 +217,8 @@ def resolve_real_cargo(home: Path, path_env: str | None = None) -> Path:
 
 
 def install(home: Path, herdr_eng: Command | None = None, *, platform: str | None = None,
-            activate: bool = True, config: dict[str, Any] | None = None,
-            skip_cleanup_job: bool = False) -> dict[str, Any]:
+            activate: bool = True, config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Install the cleanup job and cargo launcher unless the config opts out. Never raises.
-
-    ``skip_cleanup_job`` leaves the job to another installer (the controller's systemd script).
     """
     from .config import load_config
     platform = platform or ("darwin" if sys.platform == "darwin" else "linux")
@@ -229,9 +226,7 @@ def install(home: Path, herdr_eng: Command | None = None, *, platform: str | Non
     herdr_eng = herdr_eng if herdr_eng is not None else default_command()
     result: dict[str, Any] = {}
     cleanup = config.get("build_cleanup") or {}
-    if skip_cleanup_job:
-        result["build_cleanup"] = {"skipped": "installed by the controller cleanup step"}
-    elif cleanup.get("enabled", True):
+    if cleanup.get("enabled", True):
         job = _plist_path(home) if platform == "darwin" else _unit_path(home)
         try:
             if len(_argv(herdr_eng)) > 1 and _job_works(job):
@@ -309,12 +304,10 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="herdr-eng build-hygiene")
     parser.add_argument("action", choices=["install", "status"])
     parser.add_argument("--no-activate", action="store_true")
-    parser.add_argument("--skip-cleanup-job", action="store_true",
-                        help="the cleanup job is installed by another step (controller systemd script)")
     args = parser.parse_args(argv)
     home = Path.home()
     if args.action == "install":
-        result = install(home, activate=not args.no_activate, skip_cleanup_job=args.skip_cleanup_job)
+        result = install(home, activate=not args.no_activate)
         print(json.dumps(result, indent=2))
         return 1 if any("error" in part for part in result.values()) else 0
     print(json.dumps(status(home, load_config(), _default_state_dir()), indent=2))

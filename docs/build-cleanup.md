@@ -97,15 +97,29 @@ next install/`fleet update`, and `build-cleanup run` exits early) and the guard.
 
 ## Repo-local configuration
 
-A checkout's own `herdr-engineering.yaml` (or `config/herdr-engineering.yaml`) may set only `version`,
-`web`, `tests` and `ci`. `build_cleanup` (roots, thresholds, `enabled`), `fabric_build_cache` and every other
-section come from the machine-local config or `$HERDR_ENGINEERING_CONFIG`, so a repository being built cannot
-choose what gets deleted.
+A checkout's own `herdr-engineering.yaml` (or `config/herdr-engineering.yaml`) is untrusted input. Only these
+keys are read from it: `version`, `web.port`, `tests.adapters`, `ci.provider` and `ci.pileated_extensions`. Everything
+else (`build_cleanup`, `fabric_build_cache`, `ci.base_url`, `web.host`, ...) is ignored, and one warning per file names the
+ignored keys. A repository being built therefore cannot choose what is deleted, where CI credentials are sent or
+which address the web UI listens on. The machine config and an explicit `$HERDR_ENGINEERING_CONFIG` are machine
+config and are trusted in full, even when the file sits inside the checkout.
+
+## How full a disk is
+
+One df-style function (`disk_guard.measure`: used / (used + available), as `df` shows it) answers "how full"
+everywhere: the `min_free_disk_percent` reserve, the guard's trigger and the sweep's stop target. The guard measures
+the tier the build will use (picked the way `select_storage` picks it), not the first tier.
 
 ## Reserve and removal locks
 
-When no storage tier keeps `min_free_disk_percent` free, the cargo wrapper runs one pressure cleanup at the
-reserve line, looks at the tiers again and exits 75 if none fits. A managed target's `<name>.lock` is created by
-the build side; the sweep never creates one (a target without a lock file is locked through its directory), and
-a target whose lock cannot be taken is skipped while the sweep goes on. Unmanaged targets are re-checked against
-a process snapshot taken at the moment of the first removal.
+When no storage tier keeps `min_free_disk_percent` free, the cargo wrapper runs one cleanup, limited to the roots on
+the filesystem that missed the reserve and applying only the configured `pressure_percent` rules, looks at the tiers
+again and exits 75 if none fits (the message says "even after cleaning up" only when a cleanup ran; with
+`build_cleanup.enabled: false` none does). The guard's own refusal still runs the sweep in pressure mode.
+A failed sweep does not start the 10-minute cooldown.
+
+A managed target has one lock file, `<name>.lock`, beside it. Builds and the sweep both create it if it is missing
+(the sweep skips that target on a full disk), neither ever deletes it, and the build holds a shared lock for as
+long as its wrapper process lives (the lock is close-on-exec and kept by the wrapper, which waits for cargo, so a
+daemon cargo starts does not keep the target locked). The sweep takes it exclusively without waiting and skips the target when held. A dry run takes no lock
+file and creates none. Unmanaged targets are checked against a fresh process snapshot right before each removal.

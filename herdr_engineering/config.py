@@ -218,6 +218,8 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     """Recursively merge override into base, preserving unrelated base keys."""
     result = copy.deepcopy(base)
     for key, value in override.items():
+        if value is None and isinstance(result.get(key), dict):
+            continue  # an empty ``section:`` key adds nothing; it must not erase the defaults
         if isinstance(value, dict) and isinstance(result.get(key), dict):
             result[key] = _deep_merge(result[key], value)
         else:
@@ -241,36 +243,69 @@ def _expand_env(value: Any) -> Any:
     return value
 
 
-def _discover_config_paths() -> list[Path]:
-    """Default config discovery, in increasing precedence (later overrides).
+def _discover_config_sources() -> list[tuple[Path, bool]]:
+    """Default config discovery, in increasing precedence (later overrides), as ``(path, trusted)``.
 
     1. machine-local: ``~/.config/herdr-engineering/config.yaml``
        (written by ``scripts/install.sh``; per-host settings)
     2. repository:     ``./config/herdr-engineering.yaml`` or ``./herdr-engineering.yaml``
-    3. explicit env:   ``$HERDR_ENGINEERING_CONFIG`` (highest)
+       (untrusted: it is whatever checkout the command runs in)
+    3. explicit env:   ``$HERDR_ENGINEERING_CONFIG`` (highest; the operator chose it, so it is machine config
+       even when it names a file inside the current directory)
     """
     home = Path.home()
     candidates = [
-        home / ".config" / "herdr-engineering" / "config.yaml",
-        Path.cwd() / "config" / "herdr-engineering.yaml",
-        Path.cwd() / "herdr-engineering.yaml",
+        (home / ".config" / "herdr-engineering" / "config.yaml", True),
+        (Path.cwd() / "config" / "herdr-engineering.yaml", False),
+        (Path.cwd() / "herdr-engineering.yaml", False),
     ]
     env = os.environ.get("HERDR_ENGINEERING_CONFIG")
     if env:
-        candidates.append(Path(env))
-    return [c for c in candidates if c.exists()]
+        candidates.append((Path(env), True))
+    return [(c, trusted) for c, trusted in candidates if c.exists()]
 
 
-# Sections a checkout's own config may set. Everything else (build_cleanup roots and thresholds,
-# build-cache policy, credentials, endpoints, security) is machine-local only: a repo being built
-# must not choose what gets deleted or where data goes.
-REPO_LOCAL_ALLOWED = frozenset({"version", "web", "tests", "ci"})
+def _discover_config_paths() -> list[Path]:
+    return [path for path, _ in _discover_config_sources()]
 
 
-def _repo_local_paths() -> set[Path]:
-    """Config files taken from the current directory (untrusted: the repo being built)."""
-    cwd = Path.cwd()
-    return {cwd / "config" / "herdr-engineering.yaml", cwd / "herdr-engineering.yaml"}
+# What a checkout's own config may set: only keys that are harmless coming from untrusted input. Every
+# other section and key (build_cleanup roots and thresholds, build-cache policy, credentials, endpoints
+# such as ci.base_url, listeners such as web.host, security) is machine-local only: a repo being built
+# must not choose what gets deleted, where a token is sent, or what the host listens on.
+REPO_LOCAL_ALLOWED: dict[str, frozenset[str] | None] = {
+    "version": None,  # scalar
+    "web": frozenset({"port"}),
+    "tests": frozenset({"adapters"}),
+    "ci": frozenset({"provider", "pileated_extensions"}),
+}
+_warned_repo_local: set[tuple[str, tuple[str, ...]]] = set()
+
+
+def _filter_repo_local(path: Path, data: dict[str, Any]) -> dict[str, Any]:
+    """Keep only the allowed keys of an untrusted repo-local config; warn once, naming what was ignored."""
+    kept: dict[str, Any] = {}
+    ignored: list[str] = []
+    for key, value in data.items():
+        if key not in REPO_LOCAL_ALLOWED:
+            ignored.append(key)
+        elif REPO_LOCAL_ALLOWED[key] is None:
+            kept[key] = value
+        elif isinstance(value, dict):
+            allowed = REPO_LOCAL_ALLOWED[key]
+            kept[key] = {k: v for k, v in value.items() if k in allowed}
+            ignored.extend(f"{key}.{k}" for k in value if k not in allowed)
+        else:
+            ignored.append(key)
+    names = tuple(sorted(ignored))
+    if names and (str(path), names) not in _warned_repo_local:
+        _warned_repo_local.add((str(path), names))
+        logging.getLogger(__name__).warning(
+            "%s: ignoring %s; a repository's own config may only set %s. Put the rest in "
+            "~/.config/herdr-engineering/config.yaml or $HERDR_ENGINEERING_CONFIG.",
+            path, ", ".join(names), ", ".join(sorted(
+                k if v is None else f"{k}.{{{','.join(sorted(v))}}}" for k, v in REPO_LOCAL_ALLOWED.items())))
+    return kept
 
 
 def load_config(paths: list[Path] | None = None, *, strict_build_cache: bool = False
@@ -282,9 +317,8 @@ def load_config(paths: list[Path] | None = None, *, strict_build_cache: bool = F
     file written by the installer is actually used.
     """
     cfg = copy.deepcopy(DEFAULTS)
-    discovered = paths is None
-    repo_local = _repo_local_paths() if discovered else set()
-    for path in (paths if paths is not None else _discover_config_paths()):
+    sources = ([(path, True) for path in paths] if paths is not None else _discover_config_sources())
+    for path, trusted in sources:
         if not path.exists():
             continue
         try:
@@ -304,8 +338,8 @@ def load_config(paths: list[Path] | None = None, *, strict_build_cache: bool = F
                 "%s: github.* is validated but not read from this file; control-plane-web reads "
                 "github.organizations and github.sync from the central fleet config (control_plane "
                 "fleet file), so this section has no effect", path)
-        if path in repo_local:
-            data = {k: v for k, v in data.items() if k in REPO_LOCAL_ALLOWED}
+        if not trusted:
+            data = _filter_repo_local(path, data)
         cfg = _deep_merge(cfg, data)
     validate_github(cfg.get("github"))
     cfg = _expand_env(cfg)

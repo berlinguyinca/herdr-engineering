@@ -306,31 +306,34 @@ def _disk_guard_refusal(probe: Path, policy: Mapping | None = None) -> int | Non
     return None if decision.allowed else EXIT_REFUSED
 
 
-def _select_with_reserve(config, policy: Mapping, unreserved, reserve: float):
-    """A storage tier that keeps ``reserve`` percent free. When none does, one pressure cleanup runs at
-    the reserve line (the guard's own cleanup, with its rate limit) and the tiers are looked at again."""
+def _select_with_reserve(config, policy: Mapping, reserve: float):
+    """The first storage tier that keeps ``reserve`` percent free (the guard then measures this very tier).
+
+    When none does, one cleanup runs at the reserve line, on the filesystem of the tier that would
+    otherwise have been used (the guard's own cleanup, with its rate limit), and the tiers are looked at
+    again. Returns ``(selection, cleaned)``.
+    """
     from .build_cache_location import select_storage
     from .build_coord import _default_state_dir
-    from .disk_guard import OVERRIDE_ENV, relieve
+    from .disk_guard import relieve
     state, tiers = _default_state_dir(), config.local.storage_tiers
     selected = select_storage(tiers, state / "sccache", reserve)
     if selected.directory is not None:
-        return selected
-    if os.environ.get(OVERRIDE_ENV) == "1":
-        print(f"cargo-host: below the {reserve:g}% free reserve; proceeding because {OVERRIDE_ENV}=1",
-              file=sys.stderr)
-        return unreserved
-    if policy.get("enabled", True):
-        try:
-            relieve(policy, state, 100 - reserve)
-        except Exception as error:  # noqa: BLE001 - a cleanup fault must never turn a refusal into a crash
-            print(f"cargo-host: pressure cleanup unavailable ({type(error).__name__})", file=sys.stderr)
-    return select_storage(tiers, state / "sccache", reserve)
+        return selected, False
+    if not policy.get("enabled", True):
+        return selected, False  # cleanup is off: nothing to try
+    first = select_storage(tiers, state / "sccache", 0)
+    try:
+        relieve(policy, state, 100 - reserve, probe=first.directory, pressure=False)
+    except Exception as error:  # noqa: BLE001 - a cleanup fault must never turn a refusal into a crash
+        print(f"cargo-host: cleanup unavailable ({type(error).__name__})", file=sys.stderr)
+    return select_storage(tiers, state / "sccache", reserve), True
 
 
-def _reserve_refusal(reserve: float) -> int:
+def _reserve_refusal(reserve: float, cleaned: bool) -> int:
     from .disk_guard import EXIT_REFUSED, OVERRIDE_ENV
-    print(f"cargo-host: no storage tier keeps {reserve:g}% of its disk free, even after cleaning up: "
+    after = ", even after cleaning up" if cleaned else ""
+    print(f"cargo-host: no storage tier keeps {reserve:g}% of its disk free{after}: "
           f"refusing to start a new build. Free space (herdr-eng build-cleanup run) or set {OVERRIDE_ENV}=1 "
           "to build anyway.", file=sys.stderr)
     return EXIT_REFUSED
@@ -362,8 +365,11 @@ def run_cargo(argv: list[str]) -> int:
     from .build_cache_policy import effective_slots
     from .build_coord import _default_slots, _default_state_dir, run_gated
 
-    def start() -> int:
+    def start(holding_target_lock: bool = False) -> int:
         if already_coordinated:
+            if holding_target_lock:  # this process holds the target's build lock: it waits, it never execs
+                from .build_metrics import run_measured
+                return run_measured(command, emit=False, env=dict(os.environ)).exit_code
             os.execvpe(str(real), command, dict(os.environ))
             return 127  # pragma: no cover
         return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
@@ -380,6 +386,7 @@ def run_cargo(argv: list[str]) -> int:
     override = target_override(argv, os.environ, Path.cwd())
     if config.local.manage_targets and not override:
         from .build_cache_location import select_storage
+        from .disk_guard import OVERRIDE_ENV
         with maintenance_lock(_default_state_dir()):
             workspace = workspace_root(real, argv, Path.cwd())
             old_target = workspace / "target"
@@ -392,14 +399,23 @@ def run_cargo(argv: list[str]) -> int:
             selected = select_storage(tiers, sccache, 0)
             if selected.directory is None:
                 raise ValueError("No writable storage tier; managed build was not started")
-            # The guard's pressure cleanup runs before the reserve check, so the check sees what it freed.
+            if reserve:
+                # The tier is chosen first (cleaning up once when none keeps the reserve), then the guard
+                # measures that very tier: a full primary never refuses a build a lower tier can take.
+                if os.environ.get(OVERRIDE_ENV) == "1":
+                    chosen, cleaned = select_storage(tiers, sccache, reserve), False
+                    if chosen.directory is None:
+                        print(f"cargo-host: below the {reserve:g}% free reserve; proceeding because "
+                              f"{OVERRIDE_ENV}=1", file=sys.stderr)
+                        chosen = selected
+                else:
+                    chosen, cleaned = _select_with_reserve(config, policy, reserve)
+                    if chosen.directory is None:
+                        return _reserve_refusal(reserve, cleaned)
+                selected = chosen
             refused = guard(selected.directory)
             if refused is not None:
                 return refused
-            if reserve:
-                selected = _select_with_reserve(config, policy, selected, reserve)
-                if selected.directory is None:
-                    return _reserve_refusal(reserve)
             if not selected.directory.exists():
                 removable = any(tier.name == selected.name and tier.volume_uuid
                                 for tier in config.local.storage_tiers)
@@ -412,7 +428,7 @@ def run_cargo(argv: list[str]) -> int:
             os.environ["CARGO_TARGET_DIR"] = str(target)
             # Incremental artifacts multiply the size of a managed target.
             os.environ.setdefault("CARGO_INCREMENTAL", "0")
-            return start()
+            return start(holding_target_lock=True)
     return guard(override if isinstance(override, Path) else Path.cwd()) or start()
 
 

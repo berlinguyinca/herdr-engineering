@@ -21,7 +21,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .build_hygiene import _has_systemd_user_bus as _hygiene_bus
 from .herdr_adapter import NativeHerdrAdapter
 
 #: LaunchAgent installed by `scripts/fleet-auto-update-macos.sh`; a test holds the two together so
@@ -317,25 +316,6 @@ def _cleanup_job_wanted(cleanup: object) -> bool:
     return not isinstance(cleanup, dict) or bool(cleanup.get("enabled", True))
 
 
-def _install_controller_cleanup(installer: Path, step, report: dict, have_bus: bool) -> bool:
-    """Run the systemd cleanup installer; never fatal (a controller without a user bus just skips it).
-
-    True only when the installer ran and succeeded, so the caller leaves the job to it only then.
-    """
-    if not have_bus:
-        report["steps"]["controller_cleanup"] = {"ok": True, "rc": 0, "skipped": "no systemd user bus",
-                                                  "stderr": None}
-        return False
-    ok, _ = step("controller_cleanup", ["bash", str(installer)], 120)  # failure is recorded in the report
-    return bool(ok)
-
-
-def _build_hygiene_command(*, legacy_installer_ran: bool) -> list[str]:
-    """``build-hygiene install`` for the controller; the cleanup job is left to the systemd script when it ran."""
-    command = [sys.executable, "-m", "herdr_engineering.cli", "build-hygiene", "install"]
-    return [*command, "--skip-cleanup-job"] if legacy_installer_ran else command
-
-
 def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                  inventory: Path | None = None, pull_controller: bool = True,
                  reinstall_local: bool = True, revision: str | None = None,
@@ -457,21 +437,10 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
 
     from .config import load_config
     cleanup = load_config().get("build_cleanup", {})
-    roots = cleanup.get("roots", []) if isinstance(cleanup, dict) else []
-    enabled = (isinstance(cleanup, dict) and cleanup.get("enabled") is True
-               and isinstance(roots, list) and bool(roots)
-               and all(isinstance(path, str) and path.strip() for path in roots))
     # The same rule build-hygiene applies: only an explicit `enabled: false` removes the job (empty roots
     # still sweep the managed targets), so the disable below never fights the re-enable that follows.
     job_wanted = _cleanup_job_wanted(cleanup)
-    installer = root / "scripts" / "build-cleanup.sh"
-    legacy_installer_ran = False
-    # The systemd script cannot carry a custom state directory into its unit: build-hygiene writes that job.
-    if (enabled and installer.exists() and sys.platform.startswith("linux")
-            and not os.environ.get("HERDR_ENGINEERING_STATE")):
-        legacy_installer_ran = _install_controller_cleanup(installer, step, report, _hygiene_bus())
-
-    elif not job_wanted and sys.platform.startswith("linux"):
+    if not job_wanted and sys.platform.startswith("linux"):
         loaded, value, _ = _run(["systemctl", "--user", "show",
                                  "herdr-eng-build-cleanup.service",
                                  "-p", "LoadState", "--value"], timeout=30)
@@ -481,9 +450,10 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
             if not ok:
                 return report
 
-    # Disk hygiene is on by default: the cleanup job (launchd on macOS) and the managed cargo
-    # launcher. Non-fatal - `herdr-eng doctor` reports a host where it is missing.
-    step("controller_build_hygiene", _build_hygiene_command(legacy_installer_ran=legacy_installer_ran), 120)
+    # Disk hygiene is on by default: the cleanup job (systemd on Linux, launchd on macOS) and the managed
+    # cargo launcher, all written by build-hygiene (it resolves the herdr-eng executable and skips a stale
+    # virtualenv's; the old systemd script did neither). Non-fatal - `herdr-eng doctor` reports a gap.
+    step("controller_build_hygiene", [sys.executable, "-m", "herdr_engineering.cli", "build-hygiene", "install"], 120)
 
     # Refresh whichever unattended updater the controller actually has loaded - the installer
     # holds the unit/plist templates, so a schedule or working-directory change reaches a host

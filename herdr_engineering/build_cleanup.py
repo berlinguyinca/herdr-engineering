@@ -35,6 +35,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .cargo_target_storage import TARGET_MARKER, target_lock_path
+from .disk_guard import measure
 
 log = logging.getLogger(__name__)
 _PRUNE = {".git", "node_modules", ".venv", "venv", ".cache", "__pycache__"}
@@ -219,55 +220,37 @@ def _project(target: Path) -> Path:
 _BUSY = -1
 
 
-def _lock_for_removal(target: Path) -> int | None:
+def _lock_for_removal(target: Path, *, create: bool = True) -> int | None:
     """Exclusive lock for removing a managed target (None: not a managed target, _BUSY: a build holds it).
 
-    A build holds its ``<name>.lock`` shared. That file is never created here (a full disk cannot
-    refuse the lock): when it is missing no build holds the target, and the target directory itself
-    is locked instead. A build that appears meanwhile creates the file, which is checked once more.
+    One lock object serves builds and sweeps: ``<name>.lock`` beside the target. A build holds it shared for
+    its whole life; the sweep takes it exclusively, creating it when it is missing exactly as a build does
+    (``O_CREAT`` is idempotent, so whoever comes second reuses the file and the flock decides). The file is
+    never unlinked, since another process may be about to lock it. A full disk can refuse the create: that
+    raises OSError and the caller skips this target only. A dry run (``create=False``) never creates the
+    file; without one no build holds the target (a build creates it before it starts).
     """
     if _managed_workspace(target) is None:
         return None
-    lock_path = target_lock_path(target)
-    directory_fd = None
-    for _ in range(2):
-        try:
-            fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
-        except FileNotFoundError:
-            if directory_fd is not None:
-                return directory_fd
-            directory_fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                os.close(directory_fd)
-                return _BUSY
-            except BaseException:
-                os.close(directory_fd)
-                raise
-            continue
-        if directory_fd is not None:
-            os.close(directory_fd)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(fd)
-            return _BUSY
-        except BaseException:
-            os.close(fd)
-            raise
-        return fd
-    raise OSError(f"Cannot lock {target}: its build lock keeps appearing")
-
-
-def _release_removal_lock(target: Path, fd: int | None) -> None:
-    if fd is None:
-        return
+    flags = os.O_RDWR | os.O_NOFOLLOW | (os.O_CREAT if create else 0)
     try:
-        if not target.exists():  # a skipped target keeps its lock file: builds still use it
-            target_lock_path(target).unlink(missing_ok=True)  # still locked: waiters re-open a fresh one
-    finally:
+        fd = os.open(target_lock_path(target), flags, 0o600)
+    except FileNotFoundError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
         os.close(fd)
+        return _BUSY
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _release_removal_lock(fd: int | None) -> None:
+    if fd is not None:
+        os.close(fd)  # the lock file stays: a waiting build opens it, and it costs a few bytes
 
 
 def _inspect(target: Path) -> tuple[float, int]:
@@ -348,11 +331,8 @@ def _in_use(target: Path, active: list[Path]) -> bool:
 
 
 def _usage(path: Path) -> float:
-    usage = shutil.disk_usage(path)
-    if usage.used + usage.free <= 0:
-        raise OSError(f"Cannot measure filesystem at {path}")
-    # Same figure as ``df`` and the disk guard: reserved blocks count as neither used nor available.
-    return 100 * usage.used / (usage.used + usage.free)
+    """Percent used, by the one measurement every disk decision shares (``df``; see ``disk_guard.measure``)."""
+    return measure(path)[0]
 
 
 def _write_status(state_dir: Path, result: dict) -> None:
@@ -370,6 +350,7 @@ def run_once(
     roots: list[str | Path], state_dir: str | Path, dry_run: bool = False,
     high_water: float = 85, low_water: float = 80, min_age_hours: float = 24,
     pressure_water: float = 90, pressure_min_age_hours: float = 2,
+    only_device: int | None = None,
 ) -> dict:
     """Run one bounded sweep and atomically save its inspectable status.
 
@@ -380,6 +361,7 @@ def run_once(
     ``pressure_water`` the idle floor drops to ``pressure_min_age_hours`` (never below
     ``MIN_IDLE_HOURS``). Process, lease and build-lock guards apply in both tiers. Dry runs fully
     validate eligible targets (a target a running build holds is not listed) but never remove them. Busy sweeps return immediately without overwriting the last report.
+    ``only_device`` limits the sweep to roots on that filesystem (the one under pressure).
     """
     if not all(math.isfinite(v) for v in (high_water, low_water, min_age_hours,
                                           pressure_water, pressure_min_age_hours)):
@@ -407,7 +389,7 @@ def run_once(
             return result
         _reconcile_registry(state_dir, result)
         _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
-               pressure_water, pressure_min_age_hours)
+               pressure_water, pressure_min_age_hours, only_device)
         if result["warnings"]:
             result["status"] = "warning"
         if result["errors"]:
@@ -459,7 +441,7 @@ def _skip_root(result: dict, root: Path, reason: str) -> None:
 
 
 def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
-           pressure_water=90, pressure_min_age_hours=2):
+           pressure_water=90, pressure_min_age_hours=2, only_device=None):
     roots_by_device = {}
     candidates = []
     cutoffs: dict[str, float] = {}
@@ -474,6 +456,8 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
             if not canonical:
                 _skip_root(result, root, "not a canonical project directory")
                 continue
+            if only_device is not None and root.stat().st_dev != only_device:
+                continue  # deleting there cannot relieve the filesystem under pressure
             result["roots"].append(str(root))
             usage = _usage(root)
             if usage < high_water:
@@ -518,7 +502,6 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
         result["errors"].append(str(exc))
         return
     seen = set()
-    fresh: list[Path] | None = None  # the removal-moment process snapshot, taken once for unmanaged targets
     for _, name, _ in sorted(candidates):
         if name in seen:
             continue
@@ -544,7 +527,7 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
             if not _recognized(target):
                 raise OSError(f"Target no longer recognized as a Cargo output: {name}")
             try:
-                lock_fd = _lock_for_removal(target)  # held through the delete: a build waits it out
+                lock_fd = _lock_for_removal(target, create=not result["dry_run"])  # held through the delete
             except OSError as exc:  # one target's lock trouble never ends the sweep
                 result["skipped"].append({"path": name, "reason": f"cannot lock: {exc}"})
                 continue
@@ -553,6 +536,8 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
                 continue
             try:
                 if result["dry_run"]:  # nothing is removed, so the first scan stands
+                    _release_removal_lock(lock_fd)  # a dry run never holds a build up
+                    lock_fd = None
                     if not _skip_for_registry(state_dir, target, name, result):
                         result["would_remove"].append(name)
                     continue
@@ -562,12 +547,10 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
                 if not _recognized(target):
                     raise OSError(f"Target no longer recognized as a Cargo output: {name}")
                 if lock_fd is None:
-                    # No build lock covers an unmanaged target: look at the processes once more, at the
-                    # moment of removal (one snapshot for the rest of this sweep).
-                    if fresh is None:
-                        result["process_scans"] += 1
-                        fresh = _process_paths()
-                    if _in_use(target, fresh):
+                    # No build lock covers an unmanaged target: look at the processes once more, right
+                    # before this removal (earlier removals can take minutes, so no snapshot is reused).
+                    result["process_scans"] += 1
+                    if _in_use(target, _process_paths()):
                         result["skipped"].append({"path": name, "reason": "active project"})
                         continue
                 before = shutil.disk_usage(root).free
@@ -576,7 +559,7 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
                     raise OSError("This platform lacks symlink-safe recursive removal")
                 shutil.rmtree(target)
             finally:
-                _release_removal_lock(target, lock_fd)
+                _release_removal_lock(lock_fd)
             after = shutil.disk_usage(root).free
             result["removed_count"] += 1
             result["removed_bytes"] += size
