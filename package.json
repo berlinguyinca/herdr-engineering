@@ -12,7 +12,8 @@
     "test:ui-gates": "node --test --test-concurrency=1 tests/playwright/ui-gates-*.test.mjs tests/visual/*.test.mjs",
     "ui-gates:baselines:update": "node tests/playwright/visual-baselines.mjs update",
     "ui-gates:baselines:check": "node tests/playwright/visual-baselines.mjs check",
-    "typecheck:pi-build-gate": "tsc -p deploy/pi-build-gate/tsconfig.json"
+    "typecheck:pi-build-gate": "tsc -p deploy/pi-build-gate/tsconfig.json",
+    "typecheck:handoff-autopilot": "tsc -p herdr_engineering/extension_data/tsconfig.json"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.5.0",
