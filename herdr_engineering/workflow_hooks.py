@@ -39,11 +39,13 @@ REMINDER = """Engineering defaults (herdr-engineering managed hook):
 - Use real dependencies in tests; no mocks, stubs or fakes.
 - Never push herdr-engineering. Keep nothing under /tmp.
 - CI is Woodpecker (ci.metabolomics.us) where the repo uses it.
-- Context getting long? /handoff moves the work to a fresh Herdr pane on the same harness."""
+- Do not ask the user about choices these defaults already settle; apply them.
+- Context getting long? Run /handoff yourself, without asking: first wait for background subagents to report and commit/push the work where pushing is allowed. It moves the work to a fresh Herdr pane on the same harness."""
 
-PRECOMPACT_MESSAGE = ("Context is about to be compacted. Consider /handoff first: it moves the work to a "
-                      "fresh Herdr pane on the same harness with a self-sufficient briefing. "
-                      "This is a reminder only; nothing was started.")
+PRECOMPACT_MESSAGE = ("Context is about to be compacted. Run /handoff yourself now, without asking the "
+                      "user: first let background subagents report and commit/push the work where "
+                      "pushing is allowed. It moves the work to a fresh Herdr pane on the same harness "
+                      "with a self-sufficient briefing. The hook only prints this; nothing was started.")
 
 
 class _WorkflowHooksUnit(ClaudeHooksUnit):
