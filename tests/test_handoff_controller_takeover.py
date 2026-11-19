@@ -500,8 +500,8 @@ class ShortExit:
 
 
 @pytest.mark.parametrize("script, expected", [
-    ("import sys,time\nif 'takeover' in sys.argv: time.sleep(30)", "exit 124"),
-    ("import sys\nif 'takeover' in sys.argv: print('boom', file=sys.stderr); sys.exit(2)", "exit 2: boom"),
+    ("import sys,time\nif 'inspect' in sys.argv: print('{}')\nif 'takeover' in sys.argv: time.sleep(30)", "exit 124"),
+    ("import sys\nif 'inspect' in sys.argv: print('{}')\nif 'takeover' in sys.argv: print('boom', file=sys.stderr); sys.exit(2)", "exit 2: boom"),
 ], ids=["timed_out", "failed"])
 def test_attempts_exhausted_by_failures_end_red_without_compacting(script: str, expected: str, tmp_path: Path) -> None:
     broken = HandoffCli([sys.executable, "-c", script], env={"PATH": "/usr/bin:/bin"}, cwd=tmp_path)

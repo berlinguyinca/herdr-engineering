@@ -179,7 +179,10 @@ def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg:
     for attempt in range(cfg.max_attempts):
         if attempt:
             sleep(retry_delay_s)
-        view = record_view(handoff.inspect(store_root, handoff_id))
+        record = handoff.inspect(store_root, handoff_id)
+        if record is None:  # an unreadable record says nothing: never launch, never compact on it
+            return stuck(StuckReason.RECORD_UNREADABLE.value)
+        view = record_view(record)
         if next_action(view) is not Action.LAUNCH:
             break
         result = classify(handoff.takeover(store_root, handoff_id, parent_pane=ref.pane_id, worktree=worktree,
@@ -190,7 +193,10 @@ def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg:
         last, last_pane = result.reason, result.child_pane or last_pane
         if not retry_can_help(result):
             break
-    view = record_view(handoff.inspect(store_root, handoff_id))
+    record = handoff.inspect(store_root, handoff_id)
+    if record is None:
+        return stuck(stuck_reason(StuckReason.RECORD_UNREADABLE, None, last), pane=last_pane)
+    view = record_view(record)
     pane = view.child_pane or last_pane
     match next_after_attempts(view):
         case Action.DONE:

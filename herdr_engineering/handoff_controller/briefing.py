@@ -23,7 +23,6 @@ The optional flags come from running only `<harness> --help` (`codex exec --help
 """
 from __future__ import annotations
 
-import functools
 import json
 import logging
 import os
@@ -131,18 +130,24 @@ _OPTIONAL_FLAGS: dict[Harness, tuple[tuple[str, ...], tuple[str, ...]]] = {
 _HELP_S = 15.0
 
 
-@functools.lru_cache(maxsize=32)
-def _listed_flags(help_argv: tuple[str, ...], flags: tuple[str, ...], path: str) -> tuple[str, ...]:
-    """The `flags` that `help_argv` (a `--help` call, nothing else) mentions; none when it cannot be run. Cached per PATH."""
-    done = run_group(list(help_argv), _HELP_S, env={"PATH": path} if path else {})
-    if done.returncode != 0:
-        return ()
-    return tuple(flag for flag in flags if re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", done.stdout))
+_HELP_TEXTS: dict[tuple[tuple[str, ...], str], str] = {}  # successful `--help` outputs, per command and PATH
+
+
+def _help_text(help_argv: tuple[str, ...], path: str) -> str | None:
+    """What `help_argv` prints, remembered once it worked; a failed call is never remembered, so a later call asks again."""
+    key = (help_argv, path)
+    if key not in _HELP_TEXTS:
+        done = run_group(list(help_argv), _HELP_S, env={"PATH": path} if path else {})
+        if done.returncode != 0:
+            return None
+        _HELP_TEXTS[key] = done.stdout
+    return _HELP_TEXTS[key]
 
 
 def headless_argv(harness: Harness, env: Mapping[str, str] | None = None) -> list[str] | None:
-    """Non-interactive, tool-less argv, prompt on stdin; None when the harness is not supported. `env` (default: this
-    process's) decides which `<harness> --help` is read for the optional flags."""
+    """Non-interactive, tool-less argv, prompt on stdin; None when the harness is not supported, or (for a harness whose
+    flags are read from its `--help`) when that call failed: it is not remembered, so the next call asks again. `env`
+    (default: this process's) decides which `<harness> --help` is read for the optional flags."""
     argv = _HEADLESS.get(harness)
     if not argv:
         return None
@@ -150,7 +155,10 @@ def headless_argv(harness: Harness, env: Mapping[str, str] | None = None) -> lis
     if optional is None:
         return list(argv)
     help_argv, flags = optional
-    extra = _listed_flags(help_argv, flags, (os.environ if env is None else env).get("PATH", ""))
+    text = _help_text(help_argv, (os.environ if env is None else env).get("PATH", ""))
+    if text is None:
+        return None
+    extra = [flag for flag in flags if re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", text)]
     keep = len(help_argv) - 1  # `claude`, `-p` / `codex`, `exec`: the flags go right after the command words
     return [*argv[:keep], *extra, *argv[keep:]]
 

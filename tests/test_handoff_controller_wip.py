@@ -171,6 +171,7 @@ def test_missing_git_does_not_raise(tmp_path: Path) -> None:
 def test_git_failure_is_an_error_not_a_clean_tree(tmp_path: Path) -> None:
     not_a_repo = tmp_path / "plain"
     not_a_repo.mkdir()
+    (not_a_repo / ".git").write_text("not a gitfile\n")  # a repository git cannot read; a plain directory has nothing to commit
     result = wip_commit(not_a_repo, push_allowed=True)
     assert result.reason is WipReason.GIT_ERROR and result.error and not result.committed and not result.pushed
 
