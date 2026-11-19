@@ -354,6 +354,7 @@ def test_busy_check_sees_cwd_and_open_files(env: Env, mode: str) -> None:
     assert cleanup("tmp", scratch, roots=env.roots, temp_roots=env.roots)["action"] == "removed"
 
 
+@pytest.mark.skipif(Path("/proc").is_dir(), reason="a real /proc is a valid source (tests/test_cleanup_round4.py)")
 def test_busy_check_fails_closed_without_lsof(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from herdr_engineering.cleanup_command import in_use_snapshot
     monkeypatch.setenv("PATH", str(tmp_path))  # no ps/lsof on PATH
