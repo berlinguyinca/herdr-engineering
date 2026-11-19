@@ -275,6 +275,15 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session-id", default=None, help="with --snapshot: the session id of --session-pane")
 
 
+def _refusal(pane: str | None, herdr: SideHerdr) -> str | None:
+    """Why this process must not become a side pane: a session pane (which a marker would hide from the controller) or no terminal."""
+    if pane and any(agent.pane_id == pane for agent in herdr.agents() or []):
+        return f"side-pane run: pane {pane} hosts a managed agent session and is not a side pane; run it in a pane of its own"
+    if not sys.stdin.isatty():
+        return "side-pane run: stdin is not a terminal; run it in a Herdr pane"
+    return None
+
+
 def _snapshot(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     """One frame of the chosen tab, read from the store only: a smoke test and a way to see the pane without a terminal."""
     ref = (SessionRef(Harness.CLAUDE, args.session_pane, Path.cwd(), args.session_id, None)
@@ -295,7 +304,12 @@ def run_with(args: argparse.Namespace, env: Mapping[str, str] | None = None) -> 
         return 2
     if args.snapshot:
         return _snapshot(args, env)
-    pane_app = PaneApp(args.tab, pane, SideHerdr(env=env), env, fetch_ci=None if args.no_ci else fetch_cards)
+    herdr = SideHerdr(env=env)
+    refusal = _refusal(pane, herdr)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
+    pane_app = PaneApp(args.tab, pane, herdr, env, fetch_ci=None if args.no_ci else fetch_cards)
     stop = threading.Event()
 
     def poll() -> None:

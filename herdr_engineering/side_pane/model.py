@@ -21,22 +21,27 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ..handoff_adapters.base import Harness, SessionRef
+from ..handoff_controller.config import ControllerConfig
 from ..handoff_controller.events import (
     TERMINAL,
     Colour,
     EventLog,
     HandoffEvent,
+    Phase,
     chain_colour,
     epoch,
+    last_chain,
     open_chain,
     pane_events,
 )
 from ..handoff_controller.store import shared_store_root
 from ..handoff_controller.takeover import record_view
 from .ci_tab import CiCard, ci_attention
+from .reasons import phase_label
 
 CHAIN_MAX = 10  # rows shown; earlier sessions are only counted
 _TITLE_WORDS = 6
+_MAX_ATTEMPTS = ControllerConfig().max_attempts
 
 
 @dataclass(frozen=True)
@@ -217,13 +222,47 @@ def _harness(name: str | None, fallback: Harness) -> Harness:
 
 
 def _waiting_label(events: Sequence[HandoffEvent]) -> str | None:
+    """What the live session's open chain is doing, in words; None when it has no open chain."""
     chain = open_chain(events)
-    if chain is None or chain.waiting is None:
+    if chain is None:
         return None
-    reason, live = chain.waiting
-    if reason == "subagents" and live:
-        return f"waiting for {live} subagent{'' if live == 1 else 's'}"
-    return "waiting for the session to finish"
+    if chain.waiting is not None and chain.phase in (Phase.DRAINING, Phase.WAITING):
+        reason, live = chain.waiting
+        if reason == "subagents" and live:
+            return f"waiting for {live} subagent{'' if live == 1 else 's'}"
+        return "waiting for the session to finish"
+    return phase_label(chain.phase, attempts=chain.attempts, max_attempts=_MAX_ATTEMPTS, compacting=chain.compacting)
+
+
+def _event_nodes(mine: Sequence[HandoffEvent], session: SessionRef) -> list[_Node]:
+    """One node per chain of the session that the event log knows and no record shows: open ones and red or orange ones.
+    The session is the same in all of them (a chain that did not succeed leaves it running), so the last is the live one."""
+    groups: dict[str, list[HandoffEvent]] = {}
+    for e in mine:
+        if e.event != "handoff.skipped":
+            groups.setdefault(e.chain_id, []).append(e)
+    nodes: list[_Node] = []
+    for group in groups.values():
+        chain = last_chain(group)
+        end = next((e for e in reversed(group) if e.event in TERMINAL), None)
+        colour = TERMINAL[end.event] if end is not None else None
+        if chain is None or colour is Colour.GREEN:
+            continue
+        nodes.append(_Node(None, session.pane_id, session.session_id, session.harness, "", None, colour,
+                           end.reason if end is not None else None))
+    return nodes
+
+
+def _with_latest_failure(nodes: list[_Node], mine: Sequence[HandoffEvent]) -> list[_Node]:
+    """The live node of a chain that has records, when its own latest chain ended red or orange before any record."""
+    chain = last_chain(mine)
+    live = nodes[-1]
+    if live.colour is not None or chain is None or chain.handoff_id is not None:
+        return nodes
+    end = next((e for e in reversed(mine) if e.chain_id == chain.chain_id and e.event in TERMINAL), None)
+    if end is None or TERMINAL[end.event] is Colour.GREEN:
+        return nodes
+    return [*nodes[:-1], replace(live, colour=TERMINAL[end.event], reason=end.reason)]
 
 
 @dataclass(frozen=True)
@@ -306,12 +345,13 @@ def build_model(session: SessionRef | None, store_root: Path | None, env: Mappin
     root = store_root if store_root is not None else shared_store_root(env)
     events, unreadable = _readable(EventLog(root).read() if events is None else events)
     chain, dangling = _chain_records(load_records(root), session)
+    mine = pane_events(events, session.pane_id, session.session_id)
     if chain:
-        nodes = _nodes(chain, events, session)
-    elif open_chain(pane_events(events, session.pane_id, session.session_id)) is not None:
-        nodes = [_Node(None, session.pane_id, session.session_id, session.harness, "", None)]  # draining, no record yet
+        nodes = _with_latest_failure(_nodes(chain, events, session), mine)
     else:
-        return SidePaneModel(ci=tuple(ci), built_at=now, unreadable=unreadable)
+        nodes = _event_nodes(mine, session)  # no record yet: the event log alone
+        if not nodes:
+            return SidePaneModel(ci=tuple(ci), built_at=now, unreadable=unreadable)
     rows, attention = _rows(nodes, events, now, dangling)
     hidden = max(len(rows) - CHAIN_MAX, 0)
     shown = [replace(r, depth=r.depth - hidden) for r in rows[hidden:]]

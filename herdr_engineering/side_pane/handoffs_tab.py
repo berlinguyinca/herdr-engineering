@@ -4,6 +4,7 @@ from __future__ import annotations
 from ..agent_ops_tui import RenderOpts, context_bar, ctx_level_style
 from ..handoff_controller.events import Colour
 from .model import ChainRow, SidePaneModel
+from .reasons import phrase
 from .style import BOLD_WHITE, Seg, Style, duration, line
 
 _COLOUR = {Colour.GREEN: Style.GREEN, Colour.ORANGE: Style.YELLOW, Colour.RED: Style.RED}  # yellow is the 256-colour orange
@@ -33,7 +34,7 @@ def _detail(row: ChainRow, grown_s: float, opts: RenderOpts) -> list[Seg]:
 def _extra(row: ChainRow) -> list[Seg]:
     """The status line under a node: what the handoff came to, or what the live session waits for."""
     if row.colour in (Colour.ORANGE, Colour.RED):
-        reason = f": {row.reason}" if row.reason else ""
+        reason = f": {phrase(row.reason)}" if row.reason else ""
         return [(f"{_OUTCOME[row.colour]}{reason}", _COLOUR[row.colour])]
     if row.live and row.label != row.title:
         return [(f"… {row.label}", Style.YELLOW)]
