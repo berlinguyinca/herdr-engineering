@@ -43,7 +43,7 @@ Rules: never fabricate paths, hashes, URLs, counts or results; mark doubt in `un
 
 ## 4. Create and hand over
 
-1. Check the CLI: `herdr-handoff --version` must print `0.4.0` or newer (older versions lack the flags below, and pre-0.3.0 cannot close a replaced pane at all). If it is missing or older, stop and tell the user to update herdr-handoff; do not fall back to a thinner briefing silently.
+1. Check the CLI: `herdr-handoff --version` must print `0.5.0` or newer (older versions lack the flags below, and pre-0.3.0 cannot close a replaced pane at all). If it is missing or older, stop and tell the user to update herdr-handoff; do not fall back to a thinner briefing silently.
 2. Create, passing the JSON on stdin through a quoted heredoc:
    `herdr-handoff create --goal "<goal>" --source-harness <source> --target-harness <target> --from-json - <<'HANDOFF_EOF'` ... `HANDOFF_EOF`
    Add `--model <id>` only if the user asked for a model. The command prints the queued envelope; take `handoff_id` from it. A validation error means fix the briefing and retry.
