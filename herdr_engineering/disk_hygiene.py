@@ -39,7 +39,8 @@ import json
 import os
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -51,12 +52,25 @@ from .cleanup_command import (
     configured_roots,
     default_temp_worktree_parents,
     gh_pr_state,
-    in_use_snapshot,
     remove_worktree,
     user_disk_hygiene_config,
+    worktree_local_checks,
 )
 
 _DISCOVERY_DEPTH = 2
+
+
+class PrSource(StrEnum):
+    GH = "gh"
+    GIT = "git"  # offline: local ancestry only
+
+
+class PrState(StrEnum):
+    MERGED = "merged"
+    CLOSED = "closed"
+    OPEN = "open"
+    NONE = "none"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -66,39 +80,80 @@ class Policy:
     docker: bool = True
     ttl_days: float = 7.0
     min_idle_hours: float = 2.0
-    pr_source: str = "gh"
+    pr_source: PrSource = PrSource.GH
     repos: tuple[Path, ...] = ()
     roots: tuple[str, ...] = ()
     docker_min_age_hours: float = 1.0
     builder_keep_storage: str = "5GB"
     builder_prune: bool = False
     image_prune: bool = False
+    rebuildable: tuple[str, ...] = ()
     config_error: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-def load_policy(cfg: dict[str, Any] | None = None) -> Policy:
-    if cfg is None:
-        try:
-            cfg = user_disk_hygiene_config()  # user-level file only
-        except Refusal as exc:  # unreadable: fail CLOSED, the destructive jobs do not run
-            return Policy(enabled=False, worktrees=False, docker=False, config_error=exc.message)
-    wt, dk = cfg.get("worktrees") or {}, cfg.get("docker") or {}
+def _flag(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false, got {value!r}")
+    return value
+
+
+def _number(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(f"{name} must be a non-negative number, got {value!r}")
+    return float(value)
+
+
+def _strings(value: Any, name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{name} must be a list of strings")
+    return tuple(value)
+
+
+def _section(cfg: dict[str, Any], name: str) -> dict[str, Any]:
+    """``docker: false`` is an opt-out; ``docker: {enabled: false}`` too; anything else odd fails."""
+    value = cfg.get(name)
+    if value is None:
+        return {}
+    if isinstance(value, bool):
+        return {"enabled": value}
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be a mapping or true/false, got {value!r}")
+    return value
+
+
+def _parse_policy(cfg: dict[str, Any]) -> Policy:
+    wt, dk = _section(cfg, "worktrees"), _section(cfg, "docker")
     off = os.environ.get("HERDR_DISK_HYGIENE", "1").strip().lower() in ("0", "false", "no", "off")
     return Policy(
-        enabled=bool(cfg.get("enabled", True)) and not off,
-        worktrees=bool(wt.get("enabled", True)),
-        docker=bool(dk.get("enabled", True)),
-        ttl_days=float(cfg.get("worktree_ttl_days", 7)),
-        min_idle_hours=float(cfg.get("min_idle_hours", 2)),
-        pr_source=str(cfg.get("pr_source", "gh")),
-        repos=tuple(Path(r).expanduser() for r in cfg.get("repos", [])),
-        roots=tuple(str(r) for r in cfg.get("roots", [])),
-        docker_min_age_hours=float(dk.get("min_age_hours", 1)),
+        enabled=_flag(cfg.get("enabled", True), "enabled") and not off,
+        worktrees=_flag(wt.get("enabled", True), "worktrees.enabled"),
+        docker=_flag(dk.get("enabled", True), "docker.enabled"),
+        ttl_days=_number(cfg.get("worktree_ttl_days", 7), "worktree_ttl_days"),
+        min_idle_hours=_number(cfg.get("min_idle_hours", 2), "min_idle_hours"),
+        pr_source=PrSource(cfg.get("pr_source", "gh")),
+        repos=tuple(Path(r).expanduser() for r in _strings(cfg.get("repos"), "repos")),
+        roots=_strings(cfg.get("roots"), "roots"),
+        docker_min_age_hours=_number(dk.get("min_age_hours", 1), "docker.min_age_hours"),
         builder_keep_storage=str(dk.get("builder_keep_storage", "5GB")),
-        builder_prune=bool(dk.get("builder_prune", False)),
-        image_prune=bool(dk.get("image_prune", False)),
+        builder_prune=_flag(dk.get("builder_prune", False), "docker.builder_prune"),
+        image_prune=_flag(dk.get("image_prune", False), "docker.image_prune"),
+        rebuildable=_strings(cfg.get("rebuildable"), "rebuildable"),
     )
+
+
+def load_policy(cfg: dict[str, Any] | None = None) -> Policy:
+    """Strictly typed. Any unreadable or malformed value fails CLOSED (``config_error`` set, every
+    destructive job off) instead of reading a broken opt-out as "enabled"."""
+    try:
+        return _parse_policy(user_disk_hygiene_config() if cfg is None else cfg)
+    except Refusal as exc:
+        message = exc.message
+    except (ValueError, TypeError, AttributeError) as exc:
+        message = f"disk_hygiene config is invalid: {exc}"
+    return Policy(enabled=False, worktrees=False, docker=False, config_error=message)
 
 
 def _repo_handle(common: Path) -> Path:
@@ -179,27 +234,27 @@ def last_activity(path: Path) -> float:
     return max(times)
 
 
-def pr_state(repo: Path, wt: Path, branch: str, source: str) -> str:
+def pr_state(repo: Path, wt: Path, branch: str, source: PrSource) -> PrState:
     """merged | closed | open | none | unknown, from gh or from local git ancestry."""
     if not branch:
-        return "none"
-    if source == "gh":
+        return PrState.NONE
+    if source == PrSource.GH:
         pr = gh_pr_state(wt, branch, _git(wt, "rev-parse", "HEAD").stdout.strip(),
                          _origin_owner(wt))
         if pr is None:
-            return "unknown"
-        return {"MERGED": "merged", "CLOSED": "closed", "OPEN": "open", "NONE": "none"}.get(
-            pr["state"], "unknown")
+            return PrState.UNKNOWN
+        return {"MERGED": PrState.MERGED, "CLOSED": PrState.CLOSED, "OPEN": PrState.OPEN,
+                "NONE": PrState.NONE}.get(pr["state"], PrState.UNKNOWN)
     tip = _git(wt, "rev-parse", "HEAD").stdout.strip()
     for ref in ("origin/HEAD", "origin/main", "origin/master"):
         base = _git(wt, "rev-parse", "--verify", "-q", ref).stdout.strip()
         if base and base != tip and _git(wt, "merge-base", "--is-ancestor", tip, base).returncode == 0:
-            return "merged"
-    return "none"
+            return PrState.MERGED
+    return PrState.NONE
 
 
 def reap_repo(repo: Path, policy: Policy, roots: list[Path], *, dry_run: bool, now: float,
-              snapshot: Any, temp_worktree_parents: list[Path] | None = None) -> dict[str, Any]:
+              temp_worktree_parents: list[Path] | None = None) -> dict[str, Any]:
     result: dict[str, Any] = {"repo": str(repo), "worktrees": []}
     entries = list_worktrees(repo)
     for item in entries[1:]:  # the first entry is the main checkout
@@ -218,17 +273,20 @@ def reap_repo(repo: Path, policy: Policy, roots: list[Path], *, dry_run: bool, n
             if idle < policy.min_idle_hours * 3600:
                 row.update(action="kept", reason="recent_activity")
                 continue
+            worktree_local_checks(path, policy.rebuildable)  # cheap refusals before any network call
             state = pr_state(repo, path, item["branch"], policy.pr_source)
-            row["pr"] = state
-            if state in ("open", "unknown"):
+            row["pr"] = state.value
+            if state in (PrState.OPEN, PrState.UNKNOWN):
                 row.update(action="kept", reason=f"pr_{state}")
                 continue
-            if state == "none" and idle < policy.ttl_days * 86400:
+            if state is PrState.NONE and idle < policy.ttl_days * 86400:
                 row.update(action="kept", reason="orphan_within_ttl")
                 continue
-            reason = f"pr_{state}" if state != "none" else "orphan_ttl"
-            remove_worktree(path, dry_run=dry_run, merged_ok=state in ("merged", "closed"),
-                            snapshot=snapshot)
+            reason = f"pr_{state}" if state is not PrState.NONE else "orphan_ttl"
+            closed = state in (PrState.MERGED, PrState.CLOSED)
+            # no shared snapshot: the process check inside remove_worktree is taken fresh, last
+            remove_worktree(path, dry_run=dry_run, merged_ok=closed, rebuildable=policy.rebuildable,
+                            pr_closed=closed)
             row.update(action="would_remove" if dry_run else "removed", reason=reason)
         except Refusal as exc:
             row.update(action="kept", reason=exc.code)
@@ -245,18 +303,12 @@ def reap_worktrees(policy: Policy, *, dry_run: bool = False, extra_repos: list[P
     roots = configured_roots([*policy.roots, *(extra_roots or [])])
     parents = default_temp_worktree_parents() if temp_worktree_parents is None else temp_worktree_parents
     repos = [*policy.repos, *(extra_repos or [])] or find_repos(roots, parents)
-    snapshot: Any = None
-    if repos:
-        try:
-            snapshot = in_use_snapshot()
-        except Refusal as exc:  # fail closed: nothing is removed, but the run still reports
-            snapshot = exc
     now = time.time() if now is None else now
     report: dict[str, Any] = {"job": "worktrees", "dry_run": dry_run, "repos": []}
     for repo in repos:
         try:
             report["repos"].append(reap_repo(Path(repo), policy, roots, dry_run=dry_run, now=now,
-                                             snapshot=snapshot, temp_worktree_parents=parents))
+                                             temp_worktree_parents=parents))
         except (Refusal, OSError, subprocess.SubprocessError) as exc:
             report["repos"].append({"repo": str(repo), "worktrees": [], "error": str(exc)})
     rows = [w for r in report["repos"] for w in r["worktrees"]]
@@ -310,15 +362,17 @@ def register(sub: Any) -> None:
         cp.add_argument("--json", action="store_true")
         cp.add_argument("--repo", action="append", default=[], help="repository main checkout (repeatable)")
         cp.add_argument("--ttl-days", type=float)
-        cp.add_argument("--pr-source", choices=("gh", "git"))
+        cp.add_argument("--pr-source", choices=[s.value for s in PrSource])
         cp.set_defaults(func=main_args)
 
 
 def main_args(args: argparse.Namespace) -> int:
     policy = load_policy()
-    overrides = {k: v for k, v in (("ttl_days", args.ttl_days), ("pr_source", args.pr_source)) if v}
+    overrides = {k: v for k, v in (("ttl_days", args.ttl_days), ("pr_source", args.pr_source))
+                 if v is not None}
     if overrides:
-        from dataclasses import replace
+        if "pr_source" in overrides:
+            overrides["pr_source"] = PrSource(overrides["pr_source"])
         policy = replace(policy, **overrides)
     if args.disk_hygiene_command == "status":
         report = {"policy": {"enabled": policy.enabled, "worktrees": policy.worktrees,

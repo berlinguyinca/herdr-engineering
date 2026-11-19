@@ -18,17 +18,19 @@ classifier blocks. It is not a bypass:
 | path is inside an agent-owned root and is not the root itself | all path scopes |
 | no `..`; no symlink anywhere below the root; inner symlinks are never followed | all path scopes |
 | entry is owned by the current uid | all path scopes |
-| no running process has its cwd, executable or an open file inside; if that cannot be verified (lsof/proc failure or timeout) the command refuses | worktree, target, tmp |
+| no running process has its cwd, executable or an open file inside (`ps` + `lsof`; on Linux without `lsof` the `/proc` fds and cwds are used). If neither source works the command refuses. The check runs last, right before each removal, and the reaper repeats it per worktree | worktree, target, tmp |
 | refuses repo main checkouts and non-worktrees | worktree |
-| refuses a dirty tree (uncommitted or untracked files) | worktree |
+| refuses a dirty tree (uncommitted or untracked files) and skip-worktree/assume-unchanged entries (hidden edits) | worktree |
 | refuses commits that are on no remote ref; `--merged-ok` relaxes only if the commits are patch-merged into `origin/main` or `gh` reports the PR merged/closed for the same head branch, head SHA and origin owner (fork PRs and reused branch names do not match) | worktree |
 | must be a Cargo `target` (build markers, sibling `Cargo.toml`), no tracked files, no active build lease (refused while one is held) | target |
-| only under temp roots (`$TMPDIR`, `/tmp`, `$TMPDIR/claude-<uid>`); refuses a git repo/worktree or any directory containing a `.git` entry (use `--scope worktree`) | tmp |
-| refuses ignored-but-present files that are not rebuildable output (`.env`, local DBs; allowed: `target`, `node_modules`, `.venv`, `__pycache__`, plus `disk_hygiene.rebuildable`) | worktree |
+| only under temp roots (`$TMPDIR`, `/tmp`, `/tmp/claude-<uid>`); refuses anything that is, is inside or contains a git repository of any layout (normal, bare, separate git dir; detected by content, use `--scope worktree`), a `.keep` marker, and a tree with foreign-owned entries, read-only directories or special files (verified before anything is deleted) | tmp |
+| under the Claude scratch root only strictly inside a `<session>` directory (never the root, a `<project>` or the session itself; path comparison is by device/inode, so letter case does not matter on macOS). Your own session (`CLAUDE_CODE_SESSION_ID`) may clean its subpaths. Any other session must pass the `scratch_reaper` policy: no recent transcript (live) and idle for 48 h | tmp |
+| refuses ignored-but-present files that are not rebuildable output (`.env`, local DBs; allowed: `target`, `node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `.tox`, `*.egg-info`, `dist`, `build`, `coverage`, `.next`, `.gradle`, `.cache`, ... plus `disk_hygiene.rebuildable`), and any such directory that contains a nested git repository | worktree |
 | container must carry label `herdr.ephemeral=1` and be stopped | docker |
 
 Default roots (agent-created locations only): `~/.local/share/worktrees`,
-`~/.cache/herdr-engineering`, `$TMPDIR/claude-<uid>`. `~/IdeaProjects` and `~/work` are the user's
+`~/.cache/herdr-engineering`, `/tmp/claude-<uid>`. For `--scope worktree`, autospec's `/tmp/wt-*`
+directories are roots too. `~/IdeaProjects` and `~/work` are the user's
 own repos and are not roots. There is no `--root` flag and no env var: extra roots come only from
 `disk_hygiene.roots` in the user config `~/.config/herdr-engineering/config.yaml`; repo-local
 config (`./herdr-engineering.yaml`, `./config/...`) is never read for this. Exit codes: 0 done,
@@ -45,7 +47,7 @@ into `~/.claude/settings.json`:
 
 The rule is exactly `Bash(herdr-eng cleanup:*)`. If you remove it, that is respected: it does not
 count as drift and `workflow repair`/re-install never re-adds it (only uninstall + install does).
-Hosts that installed the hooks earlier must add the rule by hand. The same install adds one line to the SessionStart "Engineering defaults" reminder telling agents
+`workflow install`/`repair` on a host that installed the hooks earlier offers the rule once too (an "offered" marker records it). The same install adds one line to the SessionStart "Engineering defaults" reminder telling agents
 to use `herdr-eng cleanup` and `docker run $(herdr-eng cleanup --print-run-args)`. For pi, codex and
 opencode, add the equivalent allow entry for the command prefix `herdr-eng cleanup`.
 
@@ -64,11 +66,11 @@ worktrees inside an agent root are ever reaped, never the user's own). It decide
 | no PR, idle longer than `worktree_ttl_days` (7), clean, fully pushed | remove |
 | PR open; PR state unknown (gh missing/offline/not GitHub) | keep |
 | activity within `min_idle_hours` (2); locked; running process; dirty; unpushed | keep |
-| registration whose directory is gone | `git worktree prune` |
+| registration whose directory is gone | reported as kept (`missing_directory`); never pruned (the volume may be unmounted) |
 
 PR state comes from `gh pr list --head <branch> --state all`, matched on head branch, head SHA == the worktree HEAD and head repo owner == origin owner (otherwise no PR: the TTL path); a gh failure keeps the worktree; `pr_source: git` uses local ancestry
 into `origin/main` for offline hosts. The removal itself is the `cleanup --scope worktree` code, so
-the reaper cannot do what the command refuses. A `CARGO_TARGET_DIR` outside the worktree is not
+the reaper cannot do what the command refuses. The reaper checks the cheap local facts (dirty, hidden index, ignored files) before any network PR lookup, never runs a repo-wide `git worktree prune` (git drops the registration of the worktree it removes), and uses `--git-dir=<common dir>` so bare and separate-git-dir repositories work. Pass `--ttl-days 0` to treat every idle orphan as expired. A `CARGO_TARGET_DIR` outside the worktree is not
 touched here; use `herdr-eng build-cleanup`.
 
 ## 3. Docker sweep (nightly 03:30)
@@ -103,8 +105,10 @@ disk_hygiene:            # every key optional; default is on
   pr_source: gh          # gh | git
   worktrees: {enabled: true}
   docker: {enabled: true, min_age_hours: 1, builder_prune: false, builder_keep_storage: 5GB, image_prune: false}
-  rebuildable: []        # extra ignored dir names a worktree may hold (default target, node_modules, .venv, __pycache__)
+  rebuildable: []        # extra ignored dir name patterns a worktree may hold (on top of the built-in list above)
 ```
+
+The config is parsed strictly: opt-outs must be real booleans (`docker: false` and `docker: {enabled: false}` both work; `"false"` or a malformed value does not). An unreadable file or any invalid value disables the destructive jobs and reports status `config_unreadable` instead of reading it as "enabled"; `pr_source` must be `gh` or `git`.
 
 Opt out: `enabled: false` in the user config file (the timers read exactly that file; `HERDR_DISK_HYGIENE=0` only affects interactive runs, a shell export never reaches launchd/systemd), `scripts/install.sh --no-disk-hygiene` /
 `HERDR_INSTALL_DISK_HYGIENE=0`, or `scripts/install-disk-hygiene.sh uninstall`. The last JSON report

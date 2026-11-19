@@ -64,7 +64,7 @@ class _WorkflowHooksUnit(ClaudeHooksUnit):
     marker = MARKER
     matchers = {"PreToolUse": GUARD_MATCHER}
 
-    def install(self, text, offer_rule=False):
+    def install(self, text: str, offer_rule: bool = False) -> str:
         data = self._load(super().install(text))
         if offer_rule:
             allow = data.setdefault("permissions", {}).setdefault("allow", [])
@@ -72,7 +72,7 @@ class _WorkflowHooksUnit(ClaudeHooksUnit):
                 allow.append(ALLOW_RULE)
         return _dump_json(data, text)
 
-    def offer(self, text):
+    def offer(self, text: str) -> str:
         """``text`` with the allow rule added when absent (hooks untouched)."""
         data = self._load(text)
         allow = data.setdefault("permissions", {}).setdefault("allow", [])
@@ -80,7 +80,7 @@ class _WorkflowHooksUnit(ClaudeHooksUnit):
             allow.append(ALLOW_RULE)
         return _dump_json(data, text)
 
-    def remove(self, text):
+    def remove(self, text: str) -> str:
         data = self._load(super().remove(text))
         permissions = data.get("permissions", {})
         if ALLOW_RULE in permissions.get("allow", []):

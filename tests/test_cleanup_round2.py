@@ -245,7 +245,8 @@ def test_scratch_structure_is_never_deleted(tmp_path: Path, level: str) -> None:
     assert session.is_dir()
 
 
-def test_scratch_inside_a_session_is_removable(tmp_path: Path) -> None:
+def test_scratch_inside_own_session_is_removable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SESSION)  # an agent cleans up its own session
     root, _, session = _scratch(tmp_path)
     assert _scratch_cleanup(tmp_path, session / "scratchpad" / "a.txt", root)["action"] == "removed"
     assert _scratch_cleanup(tmp_path, session / "scratchpad", root)["action"] == "removed"
