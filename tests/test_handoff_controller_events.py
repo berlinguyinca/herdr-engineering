@@ -31,7 +31,7 @@ def test_ceiling_is_limit_plus_12() -> None:
 
 def test_event_roundtrip_jsonl(tmp_path: Path) -> None:
     log = EventLog(tmp_path / "store")
-    first = ev(colour=Colour.GREEN, reason="ok", handoff_id="h1")
+    first = ev("handoff.succeeded", colour=Colour.GREEN, reason="ok", handoff_id="h1")
     log.append(first)
     log.append(ev("handoff.drained"))
     assert log.read() == [first, ev("handoff.drained")]
@@ -91,16 +91,45 @@ def test_chain_colour_orange_after_failed_compacted() -> None:
 
 
 def test_chain_colour_red_after_stuck_then_none_if_no_terminal() -> None:
-    assert chain_colour([ev(), ev("handoff.stuck", colour=Colour.RED)]) == Colour.RED
+    assert chain_colour([ev(), ev("handoff.stuck", colour=Colour.RED, reason="r")]) == Colour.RED
     assert chain_colour([ev(), ev("handoff.drained")]) is None
     assert chain_colour([]) is None
 
 
 def test_chain_colour_last_terminal_wins() -> None:
-    events = [ev("handoff.stuck"), ev("handoff.triggered"), ev("handoff.succeeded")]
+    events = [ev("handoff.stuck", colour=Colour.RED, reason="r"), ev("handoff.triggered"), ev("handoff.succeeded", colour=Colour.GREEN)]
     assert chain_colour(events) == Colour.GREEN
 
 
 def test_unknown_event_name_rejected() -> None:
     with pytest.raises(ValueError):
         ev("handoff.bogus")
+
+
+def test_large_event_is_written_whole(tmp_path: Path) -> None:
+    log = EventLog(tmp_path)
+    big = ev(reason="x" * 2_000_000)
+    log.append(big)
+    assert log.read() == [big]
+
+
+def test_terminal_events_require_their_colour() -> None:
+    ev("handoff.succeeded", colour=Colour.GREEN)
+    ev("handoff.failed_compacted", colour=Colour.ORANGE)
+    ev("handoff.stuck", colour=Colour.RED, reason="r")
+    for name, wrong in (("handoff.succeeded", Colour.RED), ("handoff.failed_compacted", None), ("handoff.stuck", Colour.GREEN)):
+        with pytest.raises(ValueError):
+            ev(name, colour=wrong, reason="r")
+
+
+def test_non_terminal_events_have_no_colour() -> None:
+    with pytest.raises(ValueError):
+        ev("handoff.drained", colour=Colour.GREEN)
+
+
+def test_stuck_and_skipped_require_a_reason() -> None:
+    for name, colour in (("handoff.stuck", Colour.RED), ("handoff.skipped", None)):
+        for reason in (None, ""):
+            with pytest.raises(ValueError):
+                ev(name, colour=colour, reason=reason)
+    ev("handoff.skipped", reason="no usage yet")

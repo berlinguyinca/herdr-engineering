@@ -38,6 +38,11 @@ def next_step(status: str | None, screen_ready: bool) -> Step:
     return Step.TYPE if screen_ready else Step.CHECK
 
 
+def prompt_reached_pane(status: str | None, screen: str, order_text: str) -> bool:
+    """After a failed `herdr agent prompt`: did the order land anyway? Then it must not be typed a second time."""
+    return status == "working" or order_text[:40] in screen
+
+
 def drain(ref: SessionRef, adapter: HarnessAdapter, gate: SubagentGate, herdr: HerdrCli, cfg: ControllerConfig,
           *, poll_s: float = 2.0) -> DrainResult:
     start = time.monotonic()
@@ -51,22 +56,33 @@ def drain(ref: SessionRef, adapter: HarnessAdapter, gate: SubagentGate, herdr: H
     except ValueError:
         return result("too_long")
 
-    def ready_now() -> tuple[str | None, bool]:
+    def ready_now() -> tuple[str | None, bool, str]:
         status = herdr.agent_status(ref.pane_id)
         screen = herdr.read_visible(ref.pane_id) if status in READY_STATUSES else ""
-        return status, status in READY_STATUSES and adapter.is_ready_for_input(screen, status or "")
+        return status, status in READY_STATUSES and adapter.is_ready_for_input(screen, status or ""), screen
+
+    attempted = False  # a prompt that failed may still have reached the pane
 
     blocked = False
     while (remaining := deadline - time.monotonic()) > 0:
-        status, screen_ready = ready_now()
+        status, screen_ready, _ = ready_now()
         blocked = status == "blocked"
         step = next_step(status, screen_ready)
         if step is Step.WAIT and status is not None:  # no status at all (herdr unreachable) backs off below instead of spinning
             herdr.wait_idle(ref.pane_id, min(remaining, poll_s))  # returns early when it goes idle; times out while blocked
             continue
         if step is Step.TYPE:
-            status, screen_ready = ready_now()  # re-read just before typing: the user may have started typing
-            if next_step(status, screen_ready) is Step.TYPE and herdr.prompt(ref.pane_id, gate.order_text) is PromptResult.SENT:
+            status, screen_ready, screen = ready_now()  # re-read just before typing: the user may have started typing
+            if attempted and prompt_reached_pane(status, screen, gate.order_text):
                 return result("typed")
+            if next_step(status, screen_ready) is Step.TYPE:
+                sent = herdr.prompt(ref.pane_id, gate.order_text)
+                if sent is PromptResult.SENT:
+                    return result("typed")
+                if sent is PromptResult.FAILED:
+                    attempted = True
+                    status, _, screen = ready_now()
+                    if prompt_reached_pane(status, screen, gate.order_text):
+                        return result("typed")
         time.sleep(max(0.0, min(poll_s, deadline - time.monotonic())))
     return result("blocked" if blocked else "timeout")

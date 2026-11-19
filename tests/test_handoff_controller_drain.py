@@ -11,7 +11,7 @@ from herdr_engineering.handoff_adapters import adapter_for
 from herdr_engineering.handoff_adapters.base import Harness, SessionRef
 from herdr_engineering.handoff_adapters.drain import drain_order
 from herdr_engineering.handoff_controller.config import ControllerConfig
-from herdr_engineering.handoff_controller.drain import Step, drain, next_step
+from herdr_engineering.handoff_controller.drain import Step, drain, next_step, prompt_reached_pane
 from herdr_engineering.handoff_controller.herdr_cli import HerdrCli, PromptResult
 from herdr_engineering.handoff_subagent_gate import SubagentGate
 from tests.handoff_controller_herdr import IsolatedHerdr, isolated_herdr, wait_for
@@ -124,3 +124,21 @@ def test_order_is_the_gate_text(server: IsolatedHerdr) -> None:
     assert drain(ref(pane), ADAPTER, GATE, server.cli, ControllerConfig(drain_timeout_s=10.0), poll_s=POLL_S).outcome == "typed"
     assert wait_for(lambda: submitted(server) == [GATE.order_text], 5.0), submitted(server)
     assert GATE.order_text[:40] in server.cli.read_visible(pane)
+
+
+# --- a failed prompt may still have reached the pane ---------------------------------------------------------------
+
+ORDER = GATE.order_text
+
+
+def test_failed_prompt_with_a_working_agent_counts_as_typed() -> None:
+    assert prompt_reached_pane("working", "", ORDER)
+
+
+def test_failed_prompt_with_the_order_on_screen_counts_as_typed() -> None:
+    assert prompt_reached_pane("idle", f"> {ORDER[:40]}\n", ORDER)
+
+
+def test_failed_prompt_with_an_idle_empty_screen_did_not_reach_the_pane() -> None:
+    assert not prompt_reached_pane("idle", "> \n", ORDER)
+    assert not prompt_reached_pane(None, "", ORDER)
