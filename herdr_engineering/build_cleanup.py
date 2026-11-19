@@ -277,18 +277,30 @@ def _release_removal_lock(fds: list[int]) -> None:
 
 
 def _remove_target(target: Path) -> None:
-    """Delete ``target``. A managed target is first renamed to a tombstone (under the manager lock a build
-    takes), so a build or a second sweep sees a whole target or none; an interrupted delete leaves a
-    tombstone that the next sweep or retention run collects."""
+    """Delete ``target``. A managed target keeps its directory and ownership marker: under the manager lock
+    its contents move into a tombstone beside it, so ``./target`` never dangles and a cargo that was waiting
+    on the locks resumes into a valid, empty managed target. An interrupted delete leaves the tombstone,
+    which the next sweep or retention run collects."""
     if _managed_workspace(target) is not None:
         grave = tombstone_path(target)
         with _manager_lock(target.parent):
-            os.rename(target, grave)
+            grave.mkdir(mode=0o700)
+            for entry in os.listdir(target):
+                if entry != TARGET_MARKER:
+                    os.rename(target / entry, grave / entry)
         target = grave
     # CPython's fd-based rmtree prevents symlink substitution attacks.
     if not shutil.rmtree.avoids_symlink_attacks:
         raise OSError("This platform lacks symlink-safe recursive removal")
     shutil.rmtree(target)
+
+
+def _is_emptied(target: Path) -> bool:
+    """A managed target that holds nothing but its ownership marker."""
+    try:
+        return os.listdir(target) == [TARGET_MARKER] and _managed_workspace(target) is not None
+    except OSError:
+        return False
 
 
 def _inspect(target: Path) -> tuple[float, int]:
@@ -414,7 +426,7 @@ def run_once(
         "timestamp": datetime.now(UTC).isoformat(), "status": "ok", "dry_run": dry_run,
         "roots": [], "removed_count": 0, "removed_bytes": 0, "reclaimed_bytes": 0,
         "removed": [], "would_remove": [], "skipped": [], "errors": [], "warnings": [],
-        "reconciled": [], "pressure": False, "process_scans": 0, "tombstones_removed": 0,
+        "reconciled": [], "pressure": False, "process_scans": 0, "tombstones_removed": 0, "aborted": False,
     }
     lock_fds = [os.open(state_dir / name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
                 for name in ("build-cleanup.lock", "build-maintenance.lock")]
@@ -535,6 +547,8 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
                     continue
                 if newest > cutoff:
                     result["skipped"].append({"path": str(target), "reason": "recent activity"})
+                elif _is_emptied(target):
+                    continue  # a managed target a sweep already emptied: nothing to reclaim
                 else:
                     candidates.append((newest, str(target), size))
                     cutoffs[str(target)] = cutoff
@@ -546,6 +560,7 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
         scanned_at = time.monotonic()
     except (OSError, ValueError) as exc:
         result["errors"].append(str(exc))
+        result["aborted"] = True  # the sweep itself failed (process scan, discovery): nothing was judged
         return
     seen = set()
     for _, name, _ in sorted(candidates):
@@ -590,15 +605,15 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
                     continue
                 if not _recognized(target):
                     raise OSError(f"Target no longer recognized as a Cargo output: {name}")
-                if _managed_workspace(target) is None:
-                    # Look at the processes once more right before removing an operator's own target;
-                    # a snapshot younger than a few seconds is as good as a new one.
-                    if time.monotonic() - scanned_at >= _SNAPSHOT_REUSE_SECONDS:
-                        result["process_scans"] += 1
-                        active, scanned_at = _process_paths(), time.monotonic()
-                    if _in_use(target, active):
-                        result["skipped"].append({"path": name, "reason": "active project"})
-                        continue
+                # Look at the processes once more right before removing. Cargo releases its locks while a
+                # test or run binary executes out of the target, so the locks alone are not enough. A
+                # snapshot younger than a few seconds is as good as a new one.
+                if time.monotonic() - scanned_at >= _SNAPSHOT_REUSE_SECONDS:
+                    result["process_scans"] += 1
+                    active, scanned_at = _process_paths(), time.monotonic()
+                if _in_use(target, active):
+                    result["skipped"].append({"path": name, "reason": "active project"})
+                    continue
                 before = shutil.disk_usage(root).free
                 _remove_target(target)
             finally:

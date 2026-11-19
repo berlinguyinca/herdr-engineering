@@ -91,8 +91,9 @@ def relieve(cleanup_cfg: Mapping, state_dir: Path, at_percent: float,
     guard's refusal line) lets the short idle floor apply from ``at_percent``; without it (the free-space
     reserve) only the configured ``pressure_percent`` does, so a reserve at 80% never cleans like 90%.
 
-    Rate limited (a build storm must not spawn a storm of sweeps). Returns True when a sweep ran, False
-    when another sweep was already freeing space (it is waited for, at most ``busy_wait`` seconds), and
+    Rate limited (a build storm must not spawn a storm of sweeps). Returns True when a sweep ran and removed
+    something, False when it removed nothing (or failed as a whole, which starts no cooldown) or another
+    sweep was already freeing space (it is waited for, at most ``busy_wait`` seconds), and
     None when none could run (no roots, or one ran moments ago): the caller decides from a measurement.
     """
     from .build_cleanup import run_once
@@ -115,13 +116,14 @@ def relieve(cleanup_cfg: Mapping, state_dir: Path, at_percent: float,
     if result.get("status") == "busy":  # another sweep is running: its result is what we need
         _wait_for_other_sweep(state_dir, busy_wait)
         return False
-    if result.get("status") == "error":
-        return True  # the sweep ran but failed (a lsof or registry fault): retrying soon may work
+    removed = bool(result.get("removed_count") or result.get("tombstones_removed"))
+    if result.get("aborted"):
+        return removed  # the sweep itself failed (an lsof fault): retrying soon may work, no cooldown
     try:
         _stamp(state_dir).write_text(json.dumps({"triggered_at": now}))
     except OSError:
         pass  # no room for the stamp: still decide from the measurement
-    return True
+    return removed
 
 
 def check_build_allowed(path: Path, cleanup_cfg: Mapping, state_dir: Path,

@@ -715,7 +715,7 @@ def test_a_failed_cleanup_does_not_start_the_cooldown(tmp_path, root):
     blocker.write_text("x")
     assert disk_guard.relieve(_policy(root), blocker / "state", 1) is None  # the sweep itself cannot start
     good = tmp_path / "state"
-    assert disk_guard.relieve(_policy(root), good, 1) is True  # not suppressed by the failure
+    assert disk_guard.relieve(_policy(root), good, 1) is not None  # not suppressed by the failure
 
 
 def test_a_reserve_miss_with_an_empty_build_cleanup_key_exits_75_not_a_crash(tmp_path):
@@ -982,7 +982,7 @@ def _unwritable_child(target: Path) -> Path:
     return inner
 
 
-def test_an_interrupted_delete_leaves_a_tombstone_never_a_half_target(root):
+def test_an_interrupted_delete_keeps_the_target_directory_and_leaves_a_tombstone(root):
     from herdr_engineering.cargo_target_storage import TOMBSTONE, prepare_target
     target = make_managed(root, "half")
     inner = _unwritable_child(target)
@@ -992,11 +992,10 @@ def test_an_interrupted_delete_leaves_a_tombstone_never_a_half_target(root):
     try:
         with pytest.raises(OSError):
             cleanup._remove_target(target)
-        assert not target.exists(), "the name is free at once: a whole target or none"
+        assert os.listdir(target) == [".herdr-cargo-target.json"], "the directory and its marker stay"
         graves = [p for p in target.parent.iterdir() if TOMBSTONE.fullmatch(p.name)]
         assert len(graves) == 1
-        rebuilt = prepare_target(root / "sccache", root.parent / "workspaces/half")  # no ownership error
-        assert rebuilt == target and (rebuilt / ".herdr-cargo-target.json").is_file()
+        assert prepare_target(root / "sccache", root.parent / "workspaces/half") == target  # no ownership error
     finally:
         for grave in target.parent.iterdir():
             for path in [grave, *grave.rglob("*")] if grave.is_dir() else []:
@@ -1005,6 +1004,60 @@ def test_an_interrupted_delete_leaves_a_tombstone_never_a_half_target(root):
     result = sweep(root)  # collects the tombstone
     assert result["tombstones_removed"] == 1
     assert not [p for p in target.parent.iterdir() if TOMBSTONE.fullmatch(p.name)]
+
+
+def test_a_swept_managed_target_is_not_swept_again_and_its_alias_never_dangles(root):
+    target = make_managed(root, "alias")
+    alias = root.parent / "workspaces/alias/target"
+    alias.symlink_to(target)
+    assert sweep(root)["removed"] == [str(target)]
+    assert alias.is_dir() and os.listdir(alias) == [".herdr-cargo-target.json"]
+    again = sweep(root)
+    assert again["removed"] == [] and again["tombstones_removed"] == 0 and not again["errors"]
+
+
+@pytest.mark.integration
+def test_a_build_blocked_on_the_sweeps_locks_resumes_into_a_valid_target(root):
+    """Cargo waits on the locks the sweep holds; the sweep empties the target; cargo then builds into the
+    same, still owned directory (it used to recreate ``debug`` with no marker)."""
+    target = make_managed(root, "resume")
+    crate = _crate_with_slow_build(root.parent / "workspaces/resume-crate", seconds=1)
+    for name in cleanup._CARGO_LOCK_NAMES:  # the locks cargo will wait on (it opens them if present)
+        (target / "debug" / name).write_text("")
+    _age(target)
+    held = cleanup._lock_for_removal(target)
+    assert isinstance(held, list) and held
+    log = root.parent / "second-build.log"
+    with log.open("w") as sink:
+        build = subprocess.Popen([str(_real_cargo()), "build", "--offline"], cwd=crate,
+                                 env=_direct_env(CARGO_TARGET_DIR=str(target)), stdout=sink, stderr=sink,
+                                 start_new_session=True)
+    try:
+        deadline = time.monotonic() + 60
+        while "waiting for file lock" not in log.read_text() and time.monotonic() < deadline:
+            assert build.poll() is None, log.read_text()
+            time.sleep(0.2)
+        cleanup._remove_target(target)
+        cleanup._release_removal_lock(held)
+        assert build.wait(timeout=120) == 0, log.read_text()
+    finally:
+        _stop(build)
+    assert (target / ".herdr-cargo-target.json").is_file() and (target / "debug/slow").is_file()
+    from herdr_engineering.cargo_target_storage import prepare_target
+    assert prepare_target(root / "sccache", root.parent / "workspaces/resume") == target
+
+
+@pytest.mark.integration
+def test_a_plain_cargo_builds_through_the_alias_after_a_sweep(root):
+    target = make_managed(root, "plain")
+    crate = _crate_with_slow_build(root.parent / "workspaces/plain", seconds=0)
+    (crate / "target").symlink_to(target)
+    _age(target)
+    assert sweep(root)["removed"] == [str(target)]
+    built = subprocess.run([str(_real_cargo()), "build", "--offline"], cwd=crate,
+                           env=_direct_env(), capture_output=True, text=True, timeout=180)
+    assert built.returncode == 0, built.stderr
+    assert (target / "debug/slow").is_file() and (target / ".herdr-cargo-target.json").is_file()
 
 
 def test_retention_collects_tombstones_too(tmp_path):
@@ -1026,8 +1079,29 @@ def test_a_failed_sweep_does_not_start_the_cooldown(root, state_env):
     """A sweep that returns status 'error' (here: its own state sits inside a target) stamps nothing."""
     cache = make_target(root, age_hours=48)
     ran = disk_guard.relieve(_policy(root), cache / "state", 1)
-    assert ran is True and not (cache / "state/disk-guard.json").exists()
+    assert ran is False and not (cache / "state/disk-guard.json").exists()
     assert cache.exists()
+
+
+def test_a_target_that_always_errors_does_not_disable_the_cooldown(root, state_env):
+    """A per-target fault (a symlink inside one target) is reported and skipped: the sweep still counts as
+    completed, so the guard does not run a full sweep at every build start."""
+    bad = make_target(root, "bad")
+    (bad / "debug/link").symlink_to(bad / "debug/artifact")
+    _age(bad)
+    good = make_managed(root, "good")
+    assert disk_guard.relieve(_policy(root), state_env, 1) is True  # the good target went
+    assert not good.exists() or os.listdir(good) == [".herdr-cargo-target.json"]
+    assert (state_env / "disk-guard.json").exists()
+    assert disk_guard.relieve(_policy(root), state_env, 1) is None  # inside the cooldown
+
+
+def test_a_boolean_build_cleanup_keeps_what_an_earlier_source_set(tmp_path):
+    first, second = tmp_path / "a.yaml", tmp_path / "b.yaml"
+    first.write_text("build_cleanup:\n  roots: [/x]\n  min_age_hours: 72\n")
+    second.write_text("build_cleanup: false\n")
+    section = load_config([first, second])["build_cleanup"]
+    assert section["enabled"] is False and section["roots"] == ["/x"] and section["min_age_hours"] == 72
 
 
 def test_build_cleanup_false_means_disabled_everywhere(tmp_path):
@@ -1085,6 +1159,12 @@ def test_a_refusal_inside_the_cooldown_does_not_claim_a_cleanup(tmp_path):
     refused = build(repo, home, env)
     assert refused.returncode == disk_guard.EXIT_REFUSED, refused.stderr
     assert "after cleaning up" not in refused.stderr and stale.exists()
+
+
+def test_the_reserve_refusal_does_not_claim_a_cleanup_that_removed_nothing(root, state_env):
+    make_target(root, "fresh", age_hours=1)  # too young to remove
+    ran = disk_guard.relieve(_policy(root), state_env, 1)
+    assert ran is False  # a sweep ran, nothing was removed: nothing to claim
 
 
 def test_a_process_snapshot_is_reused_for_a_few_seconds(root, monkeypatch):

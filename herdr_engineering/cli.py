@@ -3238,7 +3238,12 @@ def _cmd_build_coordinate(args) -> int:
               file=sys.stderr)
     if cmd and _guarded_build(cmd):
         from .cargo_host import _disk_guard_refusal
-        refused = _disk_guard_refusal(Path.cwd(), cleanup_policy)
+        probe = Path.cwd()
+        if os.path.basename(cmd[0]) == "cargo":  # measure where cargo's output really lands
+            from .cargo_target_storage import target_override
+            where = target_override(cmd[1:], os.environ, probe)
+            probe = where if isinstance(where, Path) else probe
+        refused = _disk_guard_refusal(probe, cleanup_policy)
         if refused is not None:
             return refused
     return run_gated(cmd, slots=slots, max_load=args.max_load,

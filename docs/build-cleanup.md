@@ -116,7 +116,9 @@ When no storage tier keeps `min_free_disk_percent` free, the cargo wrapper runs 
 the filesystem that missed the reserve and applying only the configured `pressure_percent` rules, looks at the tiers
 again and exits 75 if none fits (the message says "even after cleaning up" only when a cleanup ran; with
 `build_cleanup.enabled: false` none does). The guard's own refusal still runs the sweep in pressure mode.
-A failed sweep does not start the 10-minute cooldown.
+A sweep that failed as a whole (for example the process scan) does not start the 10-minute cooldown; a
+per-target fault is reported and skipped and the sweep still counts as completed. The refusal says "even after
+cleaning up" only when the cleanup actually removed something.
 
 A running build is detected through Cargo's own locks, so it does not matter how the build was started (the
 wrapper, `build-coordinate`, an IDE, a script). Cargo flocks `<profile>/.cargo-lock` (1.75), and newer versions also
@@ -127,12 +129,19 @@ target only (`cannot lock`). There is no lock file of ours: the wrapper execs ca
 orphaned. What remains is the instant between a build starting and cargo taking its first lock, which the marker
 touch (recent activity) and the pressure age floor cover. A dry run takes the locks only to look and releases them.
 
-A managed target is renamed to a tombstone `.<name>.deleting-<id>` in the same `targets/` directory (under the
-manager lock) before it is deleted, so a build always finds a whole target or none; an interrupted delete leaves the
-tombstone, which the next sweep and the retention report collect. Unmanaged targets are checked against a process
-snapshot right before each removal; a snapshot younger than about 5 seconds is reused rather than taken again.
+Cargo releases its locks while a test or run binary executes, so the locks alone are not enough: every target,
+managed or not, is also checked against a process snapshot right before its removal (a snapshot younger than about
+5 seconds is reused rather than taken again).
+
+A managed target directory never disappears. Under the manager lock its contents move into a tombstone
+`.<name>.deleting-<id>` beside it and the directory keeps its ownership marker, so `./target` never dangles, and a
+cargo that was waiting on the sweep's locks resumes into a valid, empty managed target. The tombstone is deleted
+afterwards; an interrupted delete leaves it for the next sweep. Retention collects tombstones only after it has
+released the exclusive maintenance lock, and stops starting new ones after its time bound.
 
 `build_cleanup: false` means `enabled: false` with the default thresholds (a bool is accepted everywhere; any other
 non-mapping value is a configuration error). `herdr-eng build-cleanup run --root PATH` sweeps the named root even when
 `enabled` is false; without `--root` a disabled job reports `disabled`. `build-coordinate -- cargo build` guards
-cargo itself whenever the `cargo` on PATH is not the herdr wrapper, so an IDE-style run is refused the same way.
+cargo itself whenever the `cargo` on PATH is not the herdr wrapper (measuring the filesystem of its target
+directory), so an IDE-style run is refused the same way. The `true`/`false` shorthand is merged into what earlier
+config sources set.

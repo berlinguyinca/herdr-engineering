@@ -240,3 +240,49 @@ def test_process_started_after_the_first_scan_keeps_an_unmanaged_target(env, tmp
             proc.wait()
     assert t.exists()
     assert reasons(res) == {"project": "active project"}
+
+
+def test_process_started_after_the_first_scan_keeps_a_managed_target_too(env, tmp_path):
+    """Cargo releases its locks while a test or run binary executes, so a managed target gets the same
+    removal-moment process look as an operator's. The sweep child (snapshot-reuse window at 0) is held up
+    at the manager lock of the first removal; a process then starts in the second target."""
+    from herdr_engineering.cargo_target_storage import _manager_lock, prepare_target
+    root, state = env
+    (root / "sccache").mkdir()
+    targets = []
+    for index, hours in enumerate((72, 48)):  # the oldest goes first
+        workspace = tmp_path / f"workspaces/w{index}"
+        workspace.mkdir(parents=True)
+        target = prepare_target(root / "sccache", workspace)
+        (target / "debug/.fingerprint").mkdir(parents=True)
+        (target / "debug/artifact").write_bytes(b"x" * 4096)
+        stamp = time.time() - hours * 3600
+        for path in [*target.rglob("*"), target]:
+            os.utime(path, (stamp, stamp), follow_symlinks=False)
+        targets.append(target)
+    first, second = targets
+    code = ("import json, sys; import herdr_engineering.build_cleanup as c; c._SNAPSHOT_REUSE_SECONDS = 0.0; "
+            "print(json.dumps(c.run_once([sys.argv[1]], sys.argv[2], high_water=1, low_water=0, "
+            "min_age_hours=24)))")
+    env_vars = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    holder = None
+    with _manager_lock(first.parent):
+        child = subprocess.Popen([sys.executable, "-c", code, str(root), str(state)], env=env_vars,
+                                 stdout=subprocess.PIPE, text=True)
+        try:
+            time.sleep(8)  # the child has taken its first snapshot and waits to remove the first target
+            holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=second)
+            time.sleep(2)  # let it exist before the sweep looks
+        except BaseException:
+            child.kill()
+            raise
+    try:
+        out, _ = child.communicate(timeout=300)
+    finally:
+        if holder:
+            holder.kill()
+            holder.wait()
+    import json
+    res = json.loads(out.splitlines()[-1])
+    assert (second / "debug/artifact").exists(), res
+    assert any(s["path"] == str(second) and s["reason"] == "active project" for s in res["skipped"]), json.dumps(res)

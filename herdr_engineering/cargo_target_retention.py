@@ -185,7 +185,25 @@ def _collect_tombstone(path: Path, report: TierReport) -> None:
 
 def sweep(cache: Path, state: Path, *, budget_bytes: int, min_idle_hours: float = 168,
           apply: bool = False, max_entries: int = 1_000_000, max_seconds: float = 20) -> TierReport:
-    """Try once without interrupting builds; reclaim only recognized profile contents."""
+    """Try once without interrupting builds; reclaim only recognized profile contents.
+
+    Tombstones (targets a sweep emptied) are collected after the exclusive maintenance lock is released:
+    they are detached already, and a big delete must not hold up every wrapper build.
+    """
+    graves: list[Path] = []
+    report = _sweep_locked(cache, state, graves, budget_bytes=budget_bytes, min_idle_hours=min_idle_hours,
+                           apply=apply, max_entries=max_entries, max_seconds=max_seconds)
+    deadline = time.monotonic() + max_seconds
+    for grave in graves:
+        if time.monotonic() >= deadline:
+            report.skip("tombstones left for the next run (time bound)")
+            break
+        _collect_tombstone(grave, report)
+    return report
+
+
+def _sweep_locked(cache: Path, state: Path, graves: list[Path], *, budget_bytes: int,
+                  min_idle_hours: float, apply: bool, max_entries: int, max_seconds: float) -> TierReport:
     report = TierReport(root=str(cache.parent / "targets"), budget_bytes=budget_bytes)
     if (budget_bytes <= 0 or min_idle_hours < 24 or max_seconds <= 0
             or not all(math.isfinite(value) for value in (min_idle_hours, max_seconds))):
@@ -214,7 +232,7 @@ def sweep(cache: Path, state: Path, *, budget_bytes: int, min_idle_hours: float 
         for target in sorted(_children(root, limit)):
             if TOMBSTONE.fullmatch(target.name):
                 if apply and not target.is_symlink():
-                    _collect_tombstone(target, report)
+                    graves.append(target)  # collected after the exclusive lock is released
                 continue
             if target.name.startswith(".") or target.name.endswith(".lock"):
                 continue  # manager files are not targets

@@ -23,13 +23,19 @@ BUILD_SUBCOMMANDS = frozenset({"build", "check", "test", "clippy", "nextest", "r
                                "bench", "doc", "rustc", "rustdoc", "clean", "fix", "package"})
 
 
+def has_marker(path: Path) -> bool:
+    """True when the file starts with the managed-launcher marker (only its first 256 bytes are read)."""
+    try:
+        with path.open("rb") as handle:
+            return MARKER.encode() in handle.read(256)
+    except OSError:
+        return False
+
+
 def path_cargo_is_wrapper(command: str) -> bool:
     """True when ``command`` resolves to the managed cargo launcher (which guards its own builds)."""
     found = shutil.which(command)
-    try:
-        return found is not None and MARKER.encode() in Path(found).read_bytes()[:256]
-    except OSError:
-        return False
+    return found is not None and has_marker(Path(found))
 
 
 def cargo_subcommand(arguments: list[str]) -> str | None:
@@ -119,17 +125,13 @@ def install(home: Path, real_cargo: Path, python: Path) -> dict[str, str]:
     compiler = root / "rustc-cache"
     manifest = root / "install.json"
     real_cargo = Path(os.path.abspath(real_cargo))
-    if launcher.exists() and not launcher.is_symlink() and MARKER not in launcher.read_text()[:256]:
+    if launcher.exists() and not launcher.is_symlink() and not has_marker(launcher):
         raise ValueError(f"Existing Cargo launcher is not ours: {launcher}")
     if launcher.is_symlink() or real_cargo.resolve() == launcher.resolve():
         raise ValueError("Cargo launcher would replace a symlink or recurse")
     # A caller installing an isolated/new home may discover this user's already
     # managed Cargo on PATH. Capture its real executable, not another launcher.
-    try:
-        with real_cargo.open("rb") as executable:
-            managed = MARKER.encode() in executable.read(256)
-    except OSError:
-        managed = False
+    managed = has_marker(real_cargo)
     if managed:
         existing_home = real_cargo.resolve().parents[2]
         original = json.loads((host_root(existing_home) / "install.json").read_text())
@@ -341,8 +343,8 @@ def _select_with_reserve(config, policy: Mapping, reserve: float):
         ran = relieve(policy, state, 100 - reserve, probe=first.directory, pressure=False)
     except Exception as error:  # noqa: BLE001 - a cleanup fault must never turn a refusal into a crash
         print(f"cargo-host: cleanup unavailable ({type(error).__name__})", file=sys.stderr)
-    # None: no sweep ran (cooldown, no roots, a fault), so the refusal must not claim one did.
-    return select_storage(tiers, state / "sccache", reserve), ran is not None
+    # Only a sweep that removed something is a cleanup the refusal may claim.
+    return select_storage(tiers, state / "sccache", reserve), bool(ran)
 
 
 def _reserve_refusal(reserve: float, cleaned: bool) -> int:
