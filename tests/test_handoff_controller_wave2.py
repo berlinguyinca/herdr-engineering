@@ -357,21 +357,74 @@ def test_the_side_pane_callables_are_injected_and_a_missing_module_is_the_only_s
     assert ctlrun.default_ensure_side_pane.__name__ == "default_ensure_side_pane"
 
 
-def test_the_default_side_pane_hook_reports_a_module_that_fails_to_import(tmp_path: Path,
-                                                                       monkeypatch: pytest.MonkeyPatch,
-                                                                       capsys: pytest.CaptureFixture[str]) -> None:
-    ctlrun.default_ensure_side_pane("t1")  # herdr_engineering.side_pane does not exist (yet): nothing to say
-    assert capsys.readouterr().err == ""
-    # The broken module lives outside the checkout and is found through this process's package path only: a file written
-    # into the source tree would be imported by every parallel test worker for as long as it existed.
-    (tmp_path / "side_pane.py").write_text("import a_module_that_is_not_installed\n")
-    monkeypatch.setattr(herdr_engineering, "__path__", [str(tmp_path), *herdr_engineering.__path__])
-    importlib.invalidate_caches()
+_HOOK_PROBE = """
+import importlib.abc, importlib.machinery, sys, types
+from herdr_engineering.handoff_controller import run as ctlrun
+from herdr_engineering.handoff_controller.herdr_cli import AgentPane
+
+mode = sys.argv[1]
+pane = AgentPane("p1", "t1", "claude", "idle", None, None)
+if mode == "absent":  # the import of the package answers ModuleNotFoundError with the package's own name
+    sys.modules["herdr_engineering.side_pane"] = None
     try:
+        importlib.import_module("herdr_engineering.side_pane")
+    except ModuleNotFoundError as exc:
+        assert exc.name == "herdr_engineering.side_pane", exc.name
+elif mode == "no-callables":  # a package that imports but has neither `ensure` nor `is_side_pane`
+    sys.modules["herdr_engineering.side_pane"] = types.ModuleType("herdr_engineering.side_pane")
+elif mode == "broken":  # the package's import fails because of another module
+    class Finder(importlib.abc.MetaPathFinder):
+        def find_spec(self, name, path, target=None):
+            if name == "herdr_engineering.side_pane":
+                raise ModuleNotFoundError("No module named 'a_module_that_is_not_installed'", name="a_module_that_is_not_installed")
+    sys.modules.pop("herdr_engineering.side_pane", None)
+    sys.meta_path.insert(0, Finder())
+try:
+    print("check", ctlrun.default_is_side_pane(pane))
+except Exception as exc:
+    print("check raised", type(exc).__name__)
+try:
+    ctlrun.default_ensure_side_pane("t1")
+    print("ensure returned")
+except Exception as exc:
+    print("ensure raised", type(exc).__name__)
+"""
+
+
+def _hook_probe(tmp_path: Path, mode: str) -> subprocess.CompletedProcess[str]:
+    """The default hooks in a fresh interpreter whose PATH holds no `herdr` and whose state is under `tmp_path`: nothing of
+    the developer's Herdr or of the source tree is touched."""
+    env = {"PATH": str(tmp_path), "HOME": str(tmp_path), "HERDR_ENGINEERING_STATE": str(tmp_path / "state"),
+           "PYTHONPATH": str(ROOT), "PYTHONDONTWRITEBYTECODE": "1"}
+    return subprocess.run([sys.executable, "-c", _HOOK_PROBE, mode], env=env, capture_output=True, text=True, timeout=60,
+                          check=False, cwd=tmp_path)
+
+
+def test_a_missing_side_pane_package_is_silent(tmp_path: Path) -> None:
+    done = _hook_probe(tmp_path, "absent")
+    assert done.returncode == 0, done.stderr
+    assert "check False" in done.stdout and "ensure returned" in done.stdout and done.stderr == ""
+
+
+def test_a_side_pane_package_without_the_callables_is_not_a_side_pane(tmp_path: Path) -> None:
+    done = _hook_probe(tmp_path, "no-callables")
+    assert done.returncode == 0, done.stderr
+    assert "check False" in done.stdout and "ensure raised AttributeError" in done.stdout  # the tick's failure count sees it
+
+
+def test_a_side_pane_package_that_fails_to_import_is_reported_not_swallowed(tmp_path: Path) -> None:
+    done = _hook_probe(tmp_path, "broken")
+    assert done.returncode == 0, done.stderr
+    assert "check raised ModuleNotFoundError" in done.stdout  # `manages` then skips the pane for the tick
+    assert "ensure returned" in done.stdout and "side pane" in done.stderr and "a_module_that_is_not_installed" in done.stderr
+
+
+def test_the_default_ensure_without_herdr_raises_the_retryable_outcome(tmp_path: Path,
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path))  # no `herdr`: the real ensure answers UNAVAILABLE
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "state"))
+    with pytest.raises(ctlrun.SidePaneUnavailable):
         ctlrun.default_ensure_side_pane("t1")
-    finally:
-        sys.modules.pop("herdr_engineering.side_pane", None)
-    assert "side pane" in capsys.readouterr().err
 
 
 # --- I10 ------------------------------------------------------------------------------------------------------------
