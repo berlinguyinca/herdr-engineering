@@ -55,6 +55,8 @@ class ChainRow:
     title: str = ""  # a few words of the session's goal
     duration_s: float | None = None  # None when its start is not recorded (the root session)
     context_pct: float | None = None  # the latest reading in the event log; only the live row has one
+    pane: str | None = None  # the Herdr pane and session id of the row's session, to match the focused one
+    session_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -265,7 +267,7 @@ def _rows(nodes: Sequence[_Node], events: Sequence[HandoffEvent], now: float, da
         duration = end - node.start if node.start is not None and end is not None else None
         rows.append(ChainRow(node.record.id if node.record else None, n, node.harness, node.colour,
                              waiting if is_live and waiting else node.title, node.reason, dangling and n == 0,
-                             n + 1, is_live, node.title, duration, gauge if is_live else None))
+                             n + 1, is_live, node.title, duration, gauge if is_live else None, node.pane, node.session_id))
     return rows, open_now or live.colour in (Colour.RED, Colour.ORANGE)
 
 

@@ -131,26 +131,17 @@ class SideHerdr(HerdrCli):
         done = self._run(["pane", "close", pane_id], _QUICK_S)
         return done is not None and done.returncode == 0
 
-    def focus_pane(self, pane_id: str) -> bool:
-        """Focus `pane_id`: its tab first, then the pane (Herdr only moves pane focus by direction, so this walks the
-        layout from the tab's focused pane)."""
-        row = self.pane(pane_id)
-        layout = self.layout(pane_id) if row else None
-        if row is None or layout is None:
-            return False
-        if self._run(["tab", "focus", row.tab_id], _QUICK_S) is None:
-            return False
-        for _ in range(len(layout.rects) + 1):
-            current = self.layout(pane_id)
-            if current is None or current.focused_pane_id == pane_id:
-                return current is not None
-            for direction in ("left", "right", "up", "down"):
-                done = self._run(["pane", "focus", "--pane", current.focused_pane_id or pane_id, "--direction", direction],
-                                 _QUICK_S)
-                if done is not None and done.returncode == 0 and self._focused(pane_id):
-                    return True
-        return self._focused(pane_id)
+    def neighbor(self, pane_id: str, direction: str) -> str | None:
+        """The pane next to `pane_id` in `direction` (left, right, up, down), or None."""
+        text = self._stdout(["pane", "neighbor", "--pane", pane_id, "--direction", direction])
+        reply = _result(text) if text is not None else None
+        found = reply.get("neighbor") if reply else None
+        return _text(found.get("neighbor_pane_id")) if isinstance(found, dict) else None
 
-    def _focused(self, pane_id: str) -> bool:
-        layout = self.layout(pane_id)
-        return layout is not None and layout.focused_pane_id == pane_id
+    def focus_toward(self, pane_id: str, direction: str) -> str | None:
+        """Move the focus one pane from `pane_id` in `direction` (Herdr has no focus-by-id); the pane that holds it
+        afterwards, or None when Herdr refused. This is the only focus call, and only `placement.settle_focus` uses it."""
+        text = self._stdout(["pane", "focus", "--pane", pane_id, "--direction", direction])
+        reply = _result(text) if text is not None else None
+        found = reply.get("focus") if reply else None
+        return _text(found.get("focused_pane_id")) if isinstance(found, dict) else None

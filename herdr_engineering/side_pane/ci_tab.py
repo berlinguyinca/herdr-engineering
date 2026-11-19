@@ -43,6 +43,7 @@ class CiCard:
     failed: tuple[str, ...] = ()
     running: tuple[str, ...] = ()
     reason: str | None = None
+    stale: bool = False  # the last good read, kept while the newest one failed or timed out
 
 
 _STATE = {"running": CiState.RUNNING, "pending": CiState.RUNNING, "blocked": CiState.RUNNING,
@@ -122,7 +123,7 @@ def build_cards(repo: str, branches: Sequence[str], provider: CiProvider,
 
 def ci_attention(cards: Sequence[CiCard]) -> bool:
     """True when something runs or fails."""
-    return any(c.state in (CiState.RUNNING, CiState.FAILED) for c in cards)
+    return any(c.state in (CiState.RUNNING, CiState.FAILED) and not c.stale for c in cards)
 
 
 _STYLE = {CiState.RUNNING: Style.YELLOW, CiState.PASSED: Style.GREEN, CiState.FAILED: Style.RED, CiState.NOT_STARTED: Style.GRAY,
@@ -154,7 +155,7 @@ def lines(cards: Sequence[CiCard], width: int, opts: RenderOpts) -> list[str]:
     for card in (c for c in cards if c.state is not CiState.MERGED):
         style = _STYLE[card.state]
         out.append(line([("● ", style), (f"{card.ref} {card.title}", Style.WHITE)], width, opts))
-        out.append(line([("  ", None), (_WORD[card.state], style)], width, opts))
+        out.append(line([("  ", None), (_WORD[card.state] + (" (stale)" if card.stale else ""), style)], width, opts))
         for segs in (_chips(card), [(card.reason, Style.RED)] if card.reason else []):
             if segs:
                 out.append(line([("  ", None), *segs], width, opts))

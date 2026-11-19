@@ -13,3 +13,12 @@ title = "Session"
 description = "Summary, handoff chain and CI of the focused session (1/2/3 or Tab switch, q closes the pane)"
 placement = "split"
 command = ["herdr-eng", "side-pane", "run"]
+
+# Opens (or reopens) the side pane of the tab the action runs in. Herdr passes the tab as $HERDR_TAB_ID; `herdr-eng` is
+# looked up on the server's PATH, so install it where Herdr sees it (see docs/operations/handoff.md).
+[[actions]]
+id = "open"
+title = "Open session side pane"
+description = "Open the session side pane of this tab, also after it was closed"
+contexts = ["tab", "pane"]
+command = ["sh", "-c", "exec herdr-eng side-pane ensure --tab \"$HERDR_TAB_ID\""]
