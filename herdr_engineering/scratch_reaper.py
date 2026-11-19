@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import functools
 import json
 import logging
 import math
@@ -18,6 +19,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -174,25 +176,45 @@ class Report:
         return cast(dict[str, object], value)
 
 
-_SYSTEM_TEMP = (Path("/tmp"), Path("/private/tmp"), Path("/var/folders"), Path("/private/var/folders"))
+@functools.lru_cache(maxsize=1)
+def system_temp_roots() -> tuple[Path, ...]:
+    """The fixed system temp directories: ``/tmp``, ``/private/tmp`` and, on macOS, the per-user
+    ``/var/folders/...`` dir. Never ``$TMPDIR`` or ``tempfile.gettempdir()``: an environment variable
+    must not decide what may be deleted."""
+    roots = [Path("/tmp"), Path("/private/tmp")]
+    if sys.platform == "darwin":
+        value = ""
+        try:
+            value = os.confstr("CS_DARWIN_USER_TEMP_DIR")
+        except (AttributeError, ValueError, OSError):
+            try:
+                value = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True,
+                                       timeout=10, check=False).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                value = ""
+        if value.startswith("/"):
+            roots.append(Path(value))
+    return tuple(roots)
 
 
 def _under_system_temp(candidate: Path) -> bool:
-    """Under a system temp dir with no symlinked component below it."""
-    temps = [*_SYSTEM_TEMP, Path(tempfile.gettempdir()), Path(tempfile.gettempdir()).resolve()]
-    if tmpdir := os.environ.get("TMPDIR"):
-        temps.append(Path(tmpdir))
-    for temp in temps:
-        try:
-            below = candidate.relative_to(temp)
-        except ValueError:
+    """Strictly inside a fixed system temp dir, judged on the fully resolved path (``..`` and symlinks
+    collapsed) and reached without a symlinked component below that temp dir."""
+    if ".." in candidate.parts:
+        return False
+    real = Path(os.path.realpath(candidate))
+    for temp in system_temp_roots():
+        resolved = Path(os.path.realpath(temp))
+        if real == resolved or not real.is_relative_to(resolved):
             continue
-        walk = temp
-        for part in below.parts:
-            walk = walk / part
-            if walk.is_symlink():
-                return False
-        return True
+        for base in (temp, resolved):
+            if candidate.is_relative_to(base) and candidate != base:
+                walk = base
+                for part in candidate.relative_to(base).parts:
+                    walk = walk / part
+                    if walk.is_symlink():
+                        return False
+                return True
     return False
 
 
@@ -1062,7 +1084,7 @@ def run_once(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=default_root())
+    parser.add_argument("--root", type=Path, default=None)
     parser.add_argument(
         "--quarantine", type=Path, default=Path.home() / ".local/state/scratch-reaper/quarantine"
     )
@@ -1099,7 +1121,7 @@ def main(argv: list[str] | None = None) -> int:
             args.live_minutes * 60,
         )
         report = run_once(
-            args.root,
+            args.root or default_root(),
             args.quarantine,
             args.state_dir,
             policy,

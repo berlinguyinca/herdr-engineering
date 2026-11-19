@@ -39,42 +39,91 @@ def _managed_process(pid: Path, proc: Path) -> bool:
 
     Outside Herdr's tree, inaccessible daemon state is outside the build safety
     contract. Unknown ancestry raises instead of treating a process as outside.
+    A process that has exited is not managed; an ancestor that exits mid-walk is retried once
+    from a fresh ``PPid`` (the child was reparented).
     """
+    for attempt in (0, 1):
+        try:
+            return _ancestry_is_herdr(pid, proc)
+        except (FileNotFoundError, ProcessLookupError) as exc:
+            if not pid.exists():
+                return False  # the process itself exited
+            if attempt:
+                raise OSError(f"Process ancestry changed while inspecting {pid}") from exc
+    return False
+
+
+def _ancestry_is_herdr(pid: Path, proc: Path) -> bool:
     seen = set()
     current = pid
     while current.name != "0":
         if current.name in seen or len(seen) >= 256:
             raise OSError(f"Unverifiable process ancestry at {pid}")
         seen.add(current.name)
-        try:
-            metadata = current.stat()
-            argv = (current / "cmdline").read_bytes().split(b"\0")
-            if (metadata.st_uid == os.getuid() and argv and argv[0]
-                    and Path(os.fsdecode(argv[0])).name == "herdr"
-                    ):
-                executable = (current / "exe").resolve(strict=True)
-                if executable.name == "herdr":
-                    return True
-                raise OSError(f"Unverifiable Herdr executable at {current}")
-            parents = [line.split()[1]
-                       for line in (current / "status").read_text().splitlines()
-                       if line.startswith("PPid:")]
-        except FileNotFoundError as exc:
-            raise OSError(f"Process ancestry changed while inspecting {pid}") from exc
+        metadata = current.stat()
+        argv = (current / "cmdline").read_bytes().split(b"\0")
+        if (metadata.st_uid == os.getuid() and argv and argv[0]
+                and Path(os.fsdecode(argv[0])).name == "herdr"
+                ):
+            executable = (current / "exe").resolve(strict=True)
+            if executable.name == "herdr":
+                return True
+            raise OSError(f"Unverifiable Herdr executable at {current}")
+        parents = [line.split()[1]
+                   for line in (current / "status").read_text().splitlines()
+                   if line.startswith("PPid:")]
         if len(parents) != 1 or not parents[0].isdigit():
             raise OSError(f"Unverifiable process parent at {current}")
         current = proc / parents[0]
     return False
 
 
-def _gone_or_zombie(pid: Path) -> bool:
-    """Exited (not yet reaped) or vanished: holds no cwd or descriptors and its ``/proc`` entries are
-    root-owned, so it must be skipped before any ancestry walk."""
+def _state(pid: Path) -> str:
+    """``/proc/<pid>/stat`` state letter; ``""`` when the process is gone (ENOENT/ESRCH mid-walk).
+    An entry without a readable ``stat`` that still exists counts as live."""
     try:
-        state = (pid / "stat").read_text().rsplit(")", 1)[1].split()[0]
-    except (OSError, IndexError):  # no readable stat: gone mid-walk (ENOENT/ESRCH) unless the entry remains
-        return not pid.exists()
-    return state in ("Z", "X")
+        return (pid / "stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return "R" if pid.exists() else ""
+
+
+def _threads(pid: Path) -> int:
+    try:
+        for line in (pid / "status").read_text().splitlines():
+            if line.startswith("Threads:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 2  # unknown: assume threads, so a zombie is inspected rather than skipped
+
+
+def _gone_or_zombie(pid: Path) -> bool:
+    """True only when the process holds nothing: it vanished, or it is a zombie (``Z``/``X``) whose
+    thread group has no other thread. A leader that exited while other threads still run stays ``Z``,
+    but those threads keep its cwd and descriptors (readable under ``task/<tid>``): not skippable."""
+    state = _state(pid)
+    if state == "":
+        return True
+    return state in ("Z", "X") and _threads(pid) <= 1
+
+
+def _holders(pid: Path) -> list[Path]:
+    """The ``/proc`` directories whose cwd/exe/fd describe this process: itself, or for a zombie
+    leader the live threads under ``task/``."""
+    if _state(pid) not in ("Z", "X"):
+        return [pid]
+    try:
+        tasks = [pid / "task" / name for name in os.listdir(pid / "task") if name != pid.name]
+    except FileNotFoundError:
+        return []
+    return [task for task in tasks if _state(task) not in ("", "Z", "X")]
+
+
+def _links(holder: Path) -> list[Path]:
+    links = [holder / "cwd", holder / "exe"]
+    with os.scandir(holder / "fd") as entries:
+        links.extend(Path(entry.path) for entry in entries)
+    return links
 
 
 def _process_paths(proc: Path = Path("/proc")) -> list[Path]:
@@ -88,17 +137,24 @@ def _process_paths(proc: Path = Path("/proc")) -> list[Path]:
                 continue
             if _gone_or_zombie(pid):
                 continue
-            links = [pid / "cwd", pid / "exe"]
-            with os.scandir(pid / "fd") as entries:
-                links.extend(Path(entry.path) for entry in entries)
+            links = []
+            for holder in _holders(pid):
+                try:
+                    links.extend(_links(holder))
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                except PermissionError as exc:
+                    if holder != pid:  # a live thread of a zombie leader that cannot be read: unverifiable
+                        raise OSError(f"Cannot inspect thread {holder}") from exc
+                    raise
             for link in links:
                 try:
                     value = os.readlink(link)
-                except FileNotFoundError:  # descriptor closed / process exited
+                except (FileNotFoundError, ProcessLookupError):  # descriptor closed / process exited
                     continue
                 if value.startswith("/"):
                     paths.append(Path(value.removesuffix(" (deleted)")))
-        except FileNotFoundError:  # process exited during inspection
+        except (FileNotFoundError, ProcessLookupError):  # process exited during inspection
             continue
         except PermissionError:
             if _gone_or_zombie(pid):  # became a zombie or exited since the check above

@@ -30,7 +30,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from collections.abc import Iterable
 from enum import StrEnum
@@ -72,9 +71,10 @@ def scratch_root() -> Path:
 
 
 def guard_roots(scratch: Path) -> list[Path]:
-    """Every location a live session may sit in: the resolved root, the default ``/tmp/claude-<uid>``
-    and the raw ``$CLAUDE_CODE_TMPDIR`` one, even when that was rejected as a deletion root."""
-    roots = [scratch, Path(f"/tmp/claude-{os.getuid()}")]
+    """Every location a live session may sit in: the resolved root, ``claude-<uid>`` under every fixed
+    temp root, and the raw ``$CLAUDE_CODE_TMPDIR`` one even when it was rejected as a deletion root."""
+    from .scratch_reaper import system_temp_roots
+    roots = [scratch, *(temp / f"claude-{os.getuid()}" for temp in system_temp_roots())]
     if base := os.environ.get("CLAUDE_CODE_TMPDIR"):
         roots.append(Path(base) / f"claude-{os.getuid()}")
     return list(dict.fromkeys(roots))
@@ -90,7 +90,8 @@ def default_roots(home: Path | None = None, scratch: Path | None = None) -> list
 
 def default_temp_roots(scratch: Path | None = None) -> list[Path]:
     """Where scratch files may live; ``tmp`` scope is confined to these."""
-    return [Path(tempfile.gettempdir()), Path("/tmp"), scratch or scratch_root()]
+    from .scratch_reaper import system_temp_roots
+    return [*system_temp_roots(), scratch or scratch_root()]
 
 
 def default_temp_worktree_parents() -> list[Path]:
@@ -155,36 +156,93 @@ def _git(cwd: Path, *args: str, timeout: int | None = None) -> subprocess.Comple
 
 
 _EXCLUDES: dict[str, str] = {}
+_HOME_EXCLUDES: dict[str, tuple[str, bool]] = {}
 
 
 def reset_excludes_cache() -> None:
     """Forget the resolved excludes files; called at the start of every run."""
     _EXCLUDES.clear()
+    _HOME_EXCLUDES.clear()
+
+
+def _config_get(cwd: str | None, *args: str) -> subprocess.CompletedProcess[str] | None:
+    """``git config`` as the user's git sees it (``GIT_*`` stripped, no system config). None on failure."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    try:
+        return subprocess.run(["git", "config", "--includes", *args], capture_output=True, text=True,
+                              timeout=15, check=False, env=env, cwd=cwd)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _home_excludes(home: str) -> tuple[str, bool] | None:
+    """Per home, once per run: the global ``core.excludesFile`` and whether the global chain holds any
+    ``[includeIf]`` (which makes the answer depend on the repository). None when git failed."""
+    if home in _HOME_EXCLUDES:
+        return _HOME_EXCLUDES[home]
+    where = home if Path(home).is_dir() else None
+    value = _config_get(where, "--global", "--type=path", "--get", "core.excludesFile")
+    conditional = _config_get(where, "--global", "--name-only", "--get-regexp", r"^includeif\.")
+    if value is None or conditional is None or value.returncode not in (0, 1) or conditional.returncode not in (0, 1):
+        return None
+    path = value.stdout.strip() if value.returncode == 0 else ""
+    result = (path if path.startswith("/") else "", conditional.returncode == 0)
+    _HOME_EXCLUDES[home] = result
+    return result
+
+
+def _repo_config_may_matter(cwd: str) -> bool:
+    """Whether the repository's own config could set ``core.excludesFile`` (or include a file that
+    does). Conservative: any doubt says yes. Plain file reads, no process."""
+    here = Path(cwd)
+    try:
+        for directory in (here, *here.parents):
+            dot = directory / ".git"
+            if dot.is_file():
+                gitdir = (directory / dot.read_text().removeprefix("gitdir:").strip()).resolve()
+            elif dot.is_dir():
+                gitdir = dot
+            elif directory == here and (here / "HEAD").is_file() and (here / "config").is_file():
+                gitdir = here  # a bare repository or a common git dir
+            else:
+                continue
+            common = gitdir
+            if (gitdir / "commondir").is_file():
+                common = (gitdir / (gitdir / "commondir").read_text().strip()).resolve()
+            text = ""
+            for name in (common / "config", gitdir / "config.worktree"):
+                if name.is_file():
+                    text += name.read_text(errors="replace").lower()
+            return "excludesfile" in text or "[include" in text
+    except (OSError, ValueError):
+        return True
+    return False
 
 
 def _user_excludes_file(home: str, cwd: str) -> str:
-    """``core.excludesFile`` of the user's own global git config (``~/.gitconfig``, the XDG file and
-    everything they ``[include]``/``[includeIf]``), the one setting the hardened runner keeps from it.
-    Asked of git itself from inside the repository, so an ``includeIf`` resolves per repository, and
-    remembered per directory for the run (see ``reset_excludes_cache``). No home means no global
-    config: none, remembered. A failed or timed-out lookup is not remembered. Empty when unset."""
+    """``core.excludesFile`` as the user's own git resolves it (``~/.gitconfig``, the XDG file and
+    everything they ``[include]``/``[includeIf]``), the one setting the hardened runner keeps. The home
+    answer is asked once per run. Only when the global chain has an ``[includeIf]`` or the repository's
+    own config mentions ``excludesFile``/``include`` is git asked from inside the repository (its local
+    value outranks the global one, as in the user's git); that answer is cached per directory. No home
+    means none. A failed lookup is not remembered. Empty when unset."""
     if cwd in _EXCLUDES:
         return _EXCLUDES[cwd]
     if not home:
         _EXCLUDES[cwd] = ""
         return ""
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    try:
-        done = subprocess.run(["git", "config", "--global", "--includes", "--type=path", "--get",
-                               "core.excludesFile"],
-                              capture_output=True, text=True, timeout=15, check=False, env=env,
-                              cwd=cwd if Path(cwd).is_dir() else None)
-    except (OSError, subprocess.SubprocessError):
+    base = _home_excludes(home)
+    if base is None:
         return ""
-    value = done.stdout.strip() if done.returncode == 0 else ""
-    value = value if value.startswith("/") else ""
-    if done.returncode in (0, 1):  # 1: simply not set
-        _EXCLUDES[cwd] = value
+    value, conditional = base
+    if conditional or _repo_config_may_matter(cwd):
+        done = _config_get(cwd if Path(cwd).is_dir() else None, "--type=path", "--get", "core.excludesFile")
+        if done is None or done.returncode not in (0, 1):
+            return ""
+        out = done.stdout.strip() if done.returncode == 0 else ""
+        value = out if out.startswith("/") else ""
+    _EXCLUDES[cwd] = value
     return value
 
 
