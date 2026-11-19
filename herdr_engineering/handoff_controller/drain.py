@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from ..handoff_adapters.base import READY_STATUSES, Harness, HarnessAdapter, SessionRef
 from ..handoff_subagent_gate import SubagentGate
@@ -55,6 +55,21 @@ def agent_matches(name: str | None, harness: Harness) -> bool:
     return harness_for_agent_name(name) is harness
 
 
+class Look(NamedTuple):
+    status: str | None
+    ready: bool  # idle or done, the right agent, and an empty composer on the visible screen
+    wrong_agent: bool  # a different harness runs in the pane
+
+
+def look(ref: SessionRef, adapter: HarnessAdapter, herdr: HerdrCli) -> Look:
+    """One reading of the pane, shared by the drain, the compaction and the takeover gate."""
+    info = herdr.agent(ref.pane_id)
+    status = info.status if info else None
+    screen = herdr.read_visible(ref.pane_id) if status in READY_STATUSES else ""
+    wrong = info is not None and not agent_matches(info.name, ref.harness)
+    return Look(status, status in READY_STATUSES and not wrong and adapter.is_ready_for_input(screen, status or ""), wrong)
+
+
 def timeout_outcome(last_status: str | None, wrong_agent: bool) -> Outcome:
     """What a drain that ran out of time reports, from the last thing it saw."""
     if last_status == "blocked":
@@ -76,27 +91,18 @@ def drain(ref: SessionRef, adapter: HarnessAdapter, gate: SubagentGate, herdr: H
     except ValueError:
         return result("too_long")
 
-    def look() -> tuple[str | None, bool, bool, str]:
-        """(status, ready to type into, a different harness runs in the pane, screen)"""
-        info = herdr.agent(ref.pane_id)
-        status = info.status if info else None
-        screen = herdr.read_visible(ref.pane_id) if status in READY_STATUSES else ""
-        wrong = info is not None and not agent_matches(info.name, ref.harness)
-        ready = status in READY_STATUSES and not wrong and adapter.is_ready_for_input(screen, status or "")
-        return status, ready, wrong, screen
-
     last_status: str | None = None
     wrong_agent = False
     while (remaining := deadline - clock()) > 0:
         began = clock()
-        last_status, screen_ready, wrong_agent, _ = look()
+        last_status, screen_ready, wrong_agent = look(ref, adapter, herdr)
         step = next_step(last_status, screen_ready)
         if step is Step.WAIT and last_status is not None:  # no status at all (herdr unreachable) backs off below instead of spinning
             if not herdr.wait_idle(ref.pane_id, min(remaining, poll_s)):  # returns early when it goes idle; times out while blocked
                 sleep(max(0.0, min(poll_s - (clock() - began), deadline - clock())))  # a quick failure (pane gone) must not spin
             continue
         if step is Step.TYPE:
-            last_status, screen_ready, wrong_agent, _ = look()  # re-read just before typing: the user may have started typing
+            last_status, screen_ready, wrong_agent = look(ref, adapter, herdr)  # re-read just before typing: the user may have started typing
             if next_step(last_status, screen_ready) is Step.TYPE:
                 sent = herdr.prompt(ref.pane_id, order)
                 if sent is PromptResult.SENT:

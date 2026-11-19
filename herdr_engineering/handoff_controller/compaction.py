@@ -14,8 +14,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..handoff_adapters.base import READY_STATUSES, HarnessAdapter, SessionRef, TypedInput
-from .drain import Step, agent_matches, next_step, timeout_outcome
+from ..handoff_adapters.base import HarnessAdapter, SessionRef, TypedInput
+from .drain import Step, look, next_step, timeout_outcome
 from .events import StuckReason
 from .herdr_cli import HerdrCli
 
@@ -56,15 +56,9 @@ def _wait_ready(ref: SessionRef, adapter: HarnessAdapter, herdr: HerdrCli, timeo
                 sleep: Callable[[float], None], clock: Callable[[], float]) -> StuckReason | None:
     """None once the pane is idle with an empty composer (checked twice in a row), else why not within `timeout_s`."""
     deadline = clock() + timeout_s
-    last_status: str | None = None
-    wrong = False
     streak = 0
     while True:
-        info = herdr.agent(ref.pane_id)
-        last_status = info.status if info else None
-        wrong = info is not None and not agent_matches(info.name, ref.harness)
-        screen = herdr.read_visible(ref.pane_id) if last_status in READY_STATUSES else ""
-        ready = last_status in READY_STATUSES and not wrong and adapter.is_ready_for_input(screen, last_status or "")
+        last_status, ready, wrong = look(ref, adapter, herdr)
         streak = streak + 1 if next_step(last_status, ready) is Step.TYPE else 0
         if streak >= 2:
             return None

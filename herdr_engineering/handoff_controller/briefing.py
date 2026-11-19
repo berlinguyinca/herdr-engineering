@@ -32,7 +32,7 @@ import shutil
 import stat
 import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
@@ -210,13 +210,28 @@ def _command_output(label: str, argv: list[str], cwd: Path, timeout_s: float, *,
     return f"{label}:\n{done.stdout.strip() or '(empty)'}"
 
 
-def _prompt(ref: SessionRef, worktree: Path, tail_bytes: int, gh: tuple[str, ...], call_s: Callable[[], float]) -> str:
+def _subagent_lines(subagents: Sequence[Mapping[str, object]], worktree: Path) -> list[str]:
+    """One line per subagent the registry says still runs. The registry records the agent's id and type, not its
+    worktree or branch, so the line says where to look."""
+    return [f"Subagent still running when this briefing was written: {entry.get('agent_type') or 'unknown type'} "
+            f"(id {entry.get('agent_id')}). Its worktree and branch are not recorded: check `git worktree list` and "
+            f"`git branch -a` in {worktree} before taking over, and do not repeat its work."
+            for entry in subagents]
+
+
+def _prompt(ref: SessionRef, worktree: Path, tail_bytes: int, gh: tuple[str, ...], call_s: Callable[[], float],
+            subagents: Sequence[str] = ()) -> str:
     sections = [
         _transcript_tail(ref, tail_bytes),
         _command_output("git status --short", ["git", "-C", str(worktree), "status", "--short"], worktree, call_s(), tool="git"),
         _command_output("git log -n 20 --oneline", ["git", "-C", str(worktree), "log", "-n", "20", "--oneline"], worktree, call_s(), tool="git"),
         _command_output("gh pr list", [*gh, "pr", "list", "--json", "number,title,headRefName"], worktree, call_s(), tool="gh"),
     ]
+    if subagents:
+        sections.append(_command_output("git worktree list", ["git", "-C", str(worktree), "worktree", "list"], worktree,
+                                        call_s(), tool="git"))
+        sections.append("subagents still running (they were not finished; list them under \"unverified\"):\n"
+                        + "\n".join(subagents))
     return (
         "A coding-agent session ran out of context and did not write its own handoff briefing. Write it for the "
         "agent that takes over, using only the evidence below. Do not invent facts: put anything you cannot "
@@ -279,10 +294,12 @@ def _mark_fallback(store_root: Path, handoff_id: str) -> bool:
 
 def write_fallback_briefing(ref: SessionRef, worktree: Path, store_root: Path, harness_runner: HarnessRunner, *,
                             handoff: HandoffCli | None = None, gh: tuple[str, ...] = ("gh",),
-                            transcript_tail_bytes: int = 200_000, timeout_s: float = 300.0) -> str | None:
+                            transcript_tail_bytes: int = 200_000, timeout_s: float = 300.0,
+                            subagents: Sequence[Mapping[str, object]] = ()) -> str | None:
     """Ask the session's own harness, headlessly, to write the briefing; the new `handoff_<hex>`, or None on any failure
     (unsupported harness, no answer, unparsable answer, `herdr-handoff` refusing it). `timeout_s` bounds the whole call,
-    each step getting what is left. A missing transcript or `gh` is noted in the prompt."""
+    each step getting what is left. A missing transcript or `gh` is noted in the prompt. `subagents` (registry entries of
+    the ones still running) are listed in the briefing's `unverified` field and in the prompt."""
     if not fallback_supported(ref.harness):
         _LOG.warning("handoff fallback writer: %s is not supported", ref.harness.value)
         return None
@@ -302,7 +319,8 @@ def write_fallback_briefing(ref: SessionRef, worktree: Path, store_root: Path, h
     except OSError:
         return None
     try:
-        prompt = _prompt(ref, worktree, transcript_tail_bytes, gh, call_s)
+        running = _subagent_lines(subagents, worktree)
+        prompt = _prompt(ref, worktree, transcript_tail_bytes, gh, call_s, running)
         if left() <= 0:
             return None
         try:
@@ -316,7 +334,7 @@ def write_fallback_briefing(ref: SessionRef, worktree: Path, store_root: Path, h
         if left() <= 0:  # the answer came in as the budget ran out: spend a bounded grace on storing it
             deadline = time.monotonic() + _GRACE_S
         spec: dict[str, object] = {key: _strings(answer.get(key)) for key in _LIST_FIELDS}
-        spec["unverified"] = [_FALLBACK_NOTE, *_strings(answer.get("unverified"))]
+        spec["unverified"] = [_FALLBACK_NOTE, *running, *_strings(answer.get("unverified"))]
         spec["pull_requests"] = [url for url in _strings(answer.get("pull_requests")) if url.startswith("https://")]
         if isinstance(answer.get("resume_point"), str):
             spec["resume_point"] = answer["resume_point"]

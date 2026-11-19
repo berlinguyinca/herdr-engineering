@@ -6,6 +6,11 @@ few seconds per tick, and the briefing is looked for once per tick (`wait_for_br
 chain needs to continue after a restart is in `events.jsonl` and the store; the in-memory `PaneRuntime` only holds what
 cannot be told from them (the order was typed in this process, a cool-down). What each tick does is decided by the pure
 functions `open_chain`, `may_start` and `next_step`.
+
+A session that is still working is never acted on. After the order is typed the briefing timeout counts only the time
+the session is idle (or done) with no live subagent; until then the chain waits (`handoff.waiting`, once per change),
+bounded by `drain_timeout_s` from the trigger. The takeover is entered only into a ready pane (`_finish_when_ready`);
+past `briefing_timeout_s` of waiting for that, the chain takes the last-resort path, which types only into a ready pane.
 """
 from __future__ import annotations
 
@@ -27,9 +32,10 @@ from pathlib import Path
 from ..handoff_adapters import adapter_for
 from ..handoff_adapters.base import READY_STATUSES, Harness, HarnessAdapter, SessionRef
 from ..handoff_subagent_gate import prepare_drain
+from ..handoff_subagent_registry import live_entries
 from .briefing import HarnessRunner, headless_runner, wait_for_briefing, write_fallback_briefing
 from .config import ControllerConfig, config_from_env
-from .drain import DrainResult, drain
+from .drain import DrainResult, Look, drain, look
 from .events import Colour, EventLog, HandoffEvent, StuckReason, source_is_handed_off
 from .handoff_cli import HandoffCli
 from .herdr_cli import AgentPane, HerdrCli, harness_for_agent_name
@@ -72,7 +78,9 @@ class Chain:
     handoff_id: str | None  # the briefing, written by the session or by the fallback writer
     takeover_started: bool
     last_at: float = 0.0  # the time of the chain's latest event: progress
-    last_resort: bool = False  # triggered, or its fallback briefing written, over the ceiling: compaction, no attempts
+    last_resort: bool = False  # its fallback briefing was written because the order could not be typed over the ceiling
+    briefing_at: float | None = None  # when its briefing was written or found
+    waiting: tuple[str, int | None] | None = None  # the last `handoff.waiting` state (reason, subagents live)
 
 
 def pane_events(events: Sequence[HandoffEvent], pane_id: str, session_id: str | None) -> list[HandoffEvent]:
@@ -92,9 +100,13 @@ def open_chain(events: Sequence[HandoffEvent]) -> Chain | None:
             continue
         started = next((e.at for e in mine if e.event == "handoff.drain_started"), None)
         briefing = next((e.handoff_id for e in mine if e.event in ("handoff.briefing_written", "handoff.briefing_fallback")), None)
-        over = any(e.reason == OVER_CEILING for e in mine if e.event in ("handoff.triggered", "handoff.briefing_fallback"))
+        over = any(e.reason == OVER_CEILING for e in mine if e.event == "handoff.briefing_fallback")
+        written = next((e.at for e in mine if e.event in ("handoff.briefing_written", "handoff.briefing_fallback")), None)
+        waited = next((e for e in reversed(mine) if e.event == "handoff.waiting"), None)
         return Chain(chain_id, _epoch(next(e.at for e in mine if e.event == "handoff.triggered")), started, briefing,
-                     "handoff.takeover_started" in names, _epoch(mine[-1].at), over)
+                     "handoff.takeover_started" in names, _epoch(mine[-1].at), over,
+                     _epoch(written) if written else None,
+                     (waited.reason or "", waited.subagents_live) if waited else None)
     return None
 
 
@@ -137,11 +149,14 @@ class PaneRuntime:
     typed: bool = False  # the order was typed, or may have been: never type it again
     wait_since: float = 0.0  # when the briefing wait began
     cooldown_until: float = 0.0  # after an uncertain prompt: no new order before this
+    quiet_since: float | None = None  # since when the session is idle with no live subagent, after the order was typed
+    wait_state: tuple[str, int | None] | None = None  # the `handoff.waiting` state last said
     last_outcome: str | None = None  # the last drain outcome that was not `typed`
     finish_failures: int = 0  # consecutive times finishing the chain raised
 
     def reset(self, chain_id: str | None) -> None:
         self.chain_id, self.typed, self.wait_since, self.cooldown_until = chain_id, False, 0.0, 0.0
+        self.quiet_since, self.wait_state = None, None
         self.last_outcome, self.finish_failures = None, 0
 
 
@@ -152,7 +167,11 @@ def next_step(chain: Chain | None, rt: PaneRuntime, decision: Decision, now: flo
     if chain.handoff_id is not None or chain.takeover_started:
         return Step.FINISH
     if rt.typed:
-        return Step.FALLBACK if now >= rt.wait_since + cfg.briefing_timeout_s else Step.CHECK_BRIEFING
+        floor = rt.wait_since + cfg.briefing_timeout_s  # the session always gets this long to write its briefing
+        quiet_done = rt.quiet_since is not None and now >= rt.quiet_since + cfg.briefing_timeout_s
+        bound = max(chain.triggered_at + cfg.drain_timeout_s, floor)  # a session that keeps working is waited for this long
+        full = decision is Decision.OVER_CEILING and now >= floor  # a full context cannot wait for the quiet time
+        return Step.FALLBACK if quiet_done or full or now >= bound else Step.CHECK_BRIEFING
     if now - chain.triggered_at >= cfg.drain_timeout_s:
         return Step.DRAIN_STUCK
     if now < rt.cooldown_until:
@@ -195,6 +214,7 @@ class Controller:
     handoff: HandoffCli
     log: EventLog
     locate: Locator = default_locate
+    look: Callable[[SessionRef, HarnessAdapter, HerdrCli], Look] = look  # one reading of a pane; the seam of tests without a Herdr
     clock: Callable[[], float] = time.time
     sleep: Callable[[float], None] = time.sleep
     harness_runner: HarnessRunner = headless_runner
@@ -252,9 +272,10 @@ def _warn(message: str) -> None:
 
 
 def _emit(ctl: Controller, ref: SessionRef, name: str, chain_id: str, *, reason: str | None = None,
-          colour: Colour | None = None, pct: float | None = None, handoff_id: str | None = None) -> None:
+          colour: Colour | None = None, pct: float | None = None, handoff_id: str | None = None,
+          subagents_live: int | None = None) -> None:
     ctl.log.append(HandoffEvent(name, _iso(ctl.clock()), chain_id, ref.pane_id, ref.session_id, ref.harness,
-                                handoff_id, None, None, colour, reason, pct))
+                                handoff_id, None, None, colour, reason, pct, subagents_live=subagents_live))
 
 
 def _skip_once(ctl: Controller, events: Sequence[HandoffEvent], pane: AgentPane, harness: Harness, reason: str,
@@ -287,6 +308,8 @@ def _restore(session_id: str | None, chain: Chain | None) -> PaneRuntime:
     rt = PaneRuntime(session_id, chain.chain_id if chain else None)
     if chain is not None and chain.drain_started_at is not None:
         rt.typed, rt.wait_since = True, _epoch(chain.drain_started_at)
+    if chain is not None:
+        rt.wait_state = chain.waiting  # what was already said is not said again
     return rt
 
 
@@ -345,11 +368,45 @@ def _finish(ctl: Controller, ref: SessionRef, chain: Chain, pct: float | None, *
                  chain_id=chain.chain_id, context_pct=pct, sleep=ctl.sleep, **ctl.takeover_kwargs)
 
 
+def _subagents(ctl: Controller, ref: SessionRef) -> list[dict[str, object]]:
+    """The subagents the registry says still run in the pane; only Claude Code emits the hooks, so only it has any."""
+    if ref.harness is not Harness.CLAUDE:
+        return []
+    try:
+        return live_entries(ctl.env, ref.pane_id)
+    except OSError:
+        return []
+
+
+def _wait(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRuntime, reason: str, live: int, pct: float | None) -> None:
+    """`handoff.waiting` when the wait state differs from the one last said, never otherwise."""
+    if rt.wait_state != (reason, live):
+        rt.wait_state = (reason, live)
+        _emit(ctl, ref, "handoff.waiting", chain.chain_id, reason=reason, pct=pct, subagents_live=live)
+
+
+def _finish_when_ready(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRuntime, pct: float | None,
+                       now: float) -> None:
+    """Enter the takeover only when the source is idle (or done) with an empty composer, the right agent and no live
+    subagent. Until `briefing_timeout_s` after the briefing it waits; after that the chain takes the last-resort path,
+    whose compaction is typed only into a ready pane. A takeover already started, or a last-resort chain, is not held."""
+    if not chain.takeover_started and not chain.last_resort:
+        live = _subagents(ctl, ref)
+        if live or not ctl.look(ref, ctl.adapter(ref.harness), ctl.herdr).ready:
+            if now < (chain.briefing_at if chain.briefing_at is not None else chain.last_at) + ctl.cfg.briefing_timeout_s:
+                _wait(ctl, ref, chain, rt, "subagents" if live else "working", len(live), pct)
+                return
+            chain = replace(chain, last_resort=True)
+        rt.wait_state = None
+    _finish_guarded(ctl, ref, chain, rt, pct)
+
+
 def _write_fallback(ctl: Controller, ref: SessionRef, chain_id: str, pct: float | None, *,
                     last_resort: bool = False) -> str | None:
-    """The fallback briefing (it may block the tick for `fallback_timeout_s`); None, with the stuck event, when none."""
+    """The fallback briefing (it may block the tick for `fallback_timeout_s`); None, with the stuck event, when none.
+    The subagents still running are listed in it."""
     found = write_fallback_briefing(ref, ref.cwd, ctl.store_root, ctl.harness_runner, handoff=ctl.handoff,
-                                    gh=ctl.gh, timeout_s=ctl.fallback_timeout_s)
+                                    gh=ctl.gh, timeout_s=ctl.fallback_timeout_s, subagents=_subagents(ctl, ref))
     if found is None:
         _stuck(ctl, ref, chain_id, StuckReason.NO_BRIEFING.value, pct)
         return None
@@ -411,13 +468,15 @@ def _advance(ctl: Controller, pane: AgentPane, ref: SessionRef, rt: PaneRuntime,
     if chain is None and gave_up(events, ctl.cfg):
         _skip_once(ctl, events, pane, ref.harness, "gave_up", ref.session_id)
         return
+    if chain is not None and rt.typed and chain.handoff_id is None and not chain.takeover_started:
+        _track_quiet(ctl, pane, ref, rt, now)
     step = next_step(chain, rt, decision, now, ctl.cfg, may_start(events, now, ctl.cfg))
     if step is Step.NONE:
         return
     if chain is None:
         chain_id, over = uuid.uuid4().hex, decision is Decision.OVER_CEILING
         _emit(ctl, ref, "handoff.triggered", chain_id, pct=pct, reason=OVER_CEILING if over else None)
-        chain = Chain(chain_id, now, None, None, False, now, over)
+        chain = Chain(chain_id, now, None, None, False, now)
         rt.reset(chain_id)  # nothing of an earlier chain carries over
     match step:
         case Step.DRAIN:
@@ -425,25 +484,43 @@ def _advance(ctl: Controller, pane: AgentPane, ref: SessionRef, rt: PaneRuntime,
             if outcome == "typed":
                 return
             rt.last_outcome = outcome
-            if decision is Decision.OVER_CEILING or chain.last_resort:  # a full context cannot wait for the order
+            if decision is Decision.OVER_CEILING:  # a full context cannot wait for the order that cannot be typed
                 found = _write_fallback(ctl, ref, chain.chain_id, pct, last_resort=True)
                 if found is not None:
                     _finish_guarded(ctl, ref, replace(chain, handoff_id=found, last_resort=True), rt, pct)
         case Step.CHECK_BRIEFING:
             if (written := _check_briefing(ctl, ref, chain, rt, pct)) is not None:
-                _finish_guarded(ctl, ref, replace(chain, handoff_id=written), rt, pct)
+                _finish_when_ready(ctl, ref, replace(chain, handoff_id=written, briefing_at=now), rt, pct, now)
+            elif rt.typed:
+                _say_wait(ctl, ref, chain, rt, pct)
         case Step.FALLBACK:
             if (written := _check_briefing(ctl, ref, chain, rt, pct)) is not None:
-                _finish_guarded(ctl, ref, replace(chain, handoff_id=written), rt, pct)
+                _finish_when_ready(ctl, ref, replace(chain, handoff_id=written, briefing_at=now), rt, pct, now)
                 return
             _emit(ctl, ref, "handoff.drained", chain.chain_id, pct=pct)
-            found = _write_fallback(ctl, ref, chain.chain_id, pct, last_resort=chain.last_resort)
+            found = _write_fallback(ctl, ref, chain.chain_id, pct)
             if found is not None:
-                _finish_guarded(ctl, ref, replace(chain, handoff_id=found), rt, pct)
+                _finish_when_ready(ctl, ref, replace(chain, handoff_id=found, briefing_at=ctl.clock()), rt, pct, ctl.clock())
         case Step.FINISH:
-            _finish_guarded(ctl, ref, chain, rt, pct)
+            _finish_when_ready(ctl, ref, chain, rt, pct, now)
         case Step.DRAIN_STUCK:
             _stuck(ctl, ref, chain.chain_id, _drain_stuck_reason(pane, rt).value, pct)
+
+
+def _track_quiet(ctl: Controller, pane: AgentPane, ref: SessionRef, rt: PaneRuntime, now: float) -> None:
+    """After the order was typed the briefing timeout counts only the time the session is idle (or done) with no live
+    subagent; anything else starts the count over."""
+    rt.quiet_since = (rt.quiet_since if rt.quiet_since is not None else now) \
+        if pane.status in READY_STATUSES and not _subagents(ctl, ref) else None
+
+
+def _say_wait(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRuntime, pct: float | None) -> None:
+    """While the session works or subagents run: say so once per change (the quiet state says nothing)."""
+    live = _subagents(ctl, ref)
+    if rt.quiet_since is None:
+        _wait(ctl, ref, chain, rt, "subagents" if live else "working", len(live), pct)
+    else:
+        rt.wait_state = None
 
 
 def _drain_stuck_reason(pane: AgentPane, rt: PaneRuntime) -> StuckReason:

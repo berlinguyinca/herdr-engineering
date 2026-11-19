@@ -99,7 +99,7 @@ def test_a_chain_triggered_over_the_ceiling_says_so_in_the_log(tmp_path: Path) -
     first = w.events()[0]
     assert first.event == "handoff.triggered" and first.reason == "over_ceiling"
     chain = open_chain([_event("handoff.triggered", 1.0, chain="x", reason="over_ceiling")])
-    assert chain is not None and chain.last_resort
+    assert chain is not None and not chain.last_resort  # only the fallback written over the ceiling makes it the last resort
     chain = open_chain([_event("handoff.triggered", 1.0, chain="x"),
                         _event("handoff.briefing_fallback", 2.0, chain="x", handoff_id="h", reason="over_ceiling")])
     assert chain is not None and chain.last_resort
