@@ -25,6 +25,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Rollback: revert this PR. The extra `state.json` keys (`opus_approved`, `limit_sha`) are ignored by older code;
   `risky: null` then fails the old config check, so restore a mapping (or remove the key) first.
 
+### Fix: ui-gates reports on every pull request
+
+- `.woodpecker/ui-gates.yml` drops its `path:` filter for an `applicability` step (`scripts/ci/unit-gates-applicable.sh ui`), so the `ui-gates` context can be required without blocking PRs that touch no UI path. The decision reads `CI_PIPELINE_EVENT` (what Woodpecker exports) with `CI_EVENT` as fallback, and the `ui` case also covers `pyproject.toml`, `scripts/ci/journal.sh` and `scripts/ci/cache-trust.sh`, which `ui-gates.sh` depends on.
+
 ### Fix: run-watched review nits from #824
 
 - `scripts/ci/run-watched.py`: `Out.write` also survives a full non-blocking stdout (EAGAIN), a closed fd and a `None` stdout (it stops forwarding and keeps draining); the process group is only signalled once the root is reaped if a live process still holds that group (a reaped pid can be reused); `has_token` no longer caches negatives (a fork child reads as its parent until it execs); CPU history is keyed by (pid, start time) so a reused pid cannot corrupt deltas; signal handlers are installed before the command is spawned; bad SOFT/HARD, a missing `--` or command print a usage error and exit 2, and an unstartable command exits 127/126 with a message instead of a traceback; a hang now stops the tree with SIGTERM, a short grace, then SIGKILL (exit still 124).
