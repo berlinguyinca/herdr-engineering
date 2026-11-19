@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from herdr_engineering import fleet
 from herdr_engineering.fleet import LAUNCHD_LABEL
 
@@ -609,3 +611,64 @@ def test_env_included_in_the_environment_extends_it(tmp_path):
     rc, out, err = _run(['sh', '-c', 'printf %s "$PATH"'], env={'HERDR_HANDOFF_PYTHON': 'x'})
     assert rc == 0, err
     assert out == os.environ['PATH']
+
+
+# --- repo_root: no silent cwd fallback; status tells "no inventory" from "hosts failed" -----------------
+
+def test_repo_root_finds_checkout_from_a_subdirectory(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERDR_ENGINEERING_REPO", raising=False)
+    (tmp_path / "ansible" / "inventory").mkdir(parents=True)
+    (tmp_path / "ansible" / "inventory" / "hosts.yml").write_text("all: {}\n")
+    sub = tmp_path / "a" / "b"
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+    assert fleet.repo_root() == tmp_path
+
+
+def test_repo_root_accepts_a_checkout_without_private_inventory(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERDR_ENGINEERING_REPO", raising=False)
+    (tmp_path / "ansible" / "playbooks").mkdir(parents=True)
+    (tmp_path / "ansible" / "playbooks" / "fleet-status.yml").write_text("[]\n")
+    monkeypatch.chdir(tmp_path)
+    assert fleet.repo_root() == tmp_path
+
+
+def test_repo_root_outside_a_checkout_raises_naming_what_was_searched(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERDR_ENGINEERING_REPO", raising=False)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(fleet.FleetError) as exc:
+        fleet.repo_root()
+    assert str(tmp_path / "ansible" / "inventory" / "hosts.yml") in str(exc.value)
+    assert "HERDR_ENGINEERING_REPO" in str(exc.value)
+
+
+def test_fleet_status_without_inventory_is_an_error_not_a_host_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(tmp_path))
+    status = fleet.fleet_status()
+    assert status["error_kind"] == "no_inventory"
+    assert status["error"] == f"no inventory at {tmp_path / 'ansible' / 'inventory' / 'hosts.yml'}"
+    assert status["hosts"] == []
+
+
+def test_fleet_status_outside_a_checkout_reports_no_checkout(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERDR_ENGINEERING_REPO", raising=False)
+    monkeypatch.chdir(tmp_path)
+    status = fleet.fleet_status()
+    assert status["error_kind"] == "no_inventory"
+    assert str(tmp_path / "ansible" / "inventory" / "hosts.yml") in status["error"]
+
+
+def test_cli_fleet_status_exit_codes(tmp_path, monkeypatch, capsys):
+    from herdr_engineering import cli
+    monkeypatch.delenv("HERDR_ENGINEERING_REPO", raising=False)
+    monkeypatch.chdir(tmp_path)
+    rc = cli.main(["fleet", "status"])
+    assert rc == 2
+    assert "no inventory at" in capsys.readouterr().err
+    # inventory present but the playbook run itself fails (no playbook / no ansible here): hosts-failed, rc=1
+    (tmp_path / "ansible" / "inventory").mkdir(parents=True)
+    (tmp_path / "ansible" / "inventory" / "hosts.yml").write_text("all: {}\n")
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(tmp_path))
+    rc = cli.main(["fleet", "status"])
+    assert rc == 1
+    assert "no inventory" not in capsys.readouterr().err

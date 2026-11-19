@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: `fleet status` and `doctor` no longer depend on the working directory
+
+- `fleet.repo_root()` no longer falls back to the cwd. It uses `HERDR_ENGINEERING_REPO`, else walks up for `ansible/inventory/hosts.yml` (or a checkout's `ansible/playbooks/fleet-status.yml`), else raises `FleetError` naming the paths searched. `fleet status` reports a missing inventory as `no inventory at <path>` on stderr and exits 2 (setup problem), distinct from exit 1 (ansible ran and hosts failed); `--json` carries `error` and `error_kind`. `fleet join`/`update` and `stage_pi_runtime` return that error in their report instead of running ansible against a nonexistent path.
+- `doctor`: the `lock` and `plugins` checks locate `lock/upstreams.yaml` from `HERDR_ENGINEERING_LOCK`, then `HERDR_ENGINEERING_REPO`, then the checkout the package was imported from, never the cwd. With no checkout (an installed copy) both report `unknown` ("not applicable: no checkout found") instead of a warning.
+- `doctor`: the `tailscale` check reads `tailscale status --json` and treats `BackendState == "Running"` as up (exit code when the output is not that JSON); the plain-text check looked for the word "tailscale", which that output never contains, so it always warned. The decision is the pure function `tailscale_running`.
+
 ### Fix: ui-gates reports on every pull request
 
 - `.woodpecker/ui-gates.yml` drops its `path:` filter for an `applicability` step (`scripts/ci/unit-gates-applicable.sh ui`), so the `ui-gates` context can be required without blocking PRs that touch no UI path. The decision reads `CI_PIPELINE_EVENT` (what Woodpecker exports) with `CI_EVENT` as fallback, and the `ui` case also covers `pyproject.toml`, `scripts/ci/journal.sh` and `scripts/ci/cache-trust.sh`, which `ui-gates.sh` depends on.

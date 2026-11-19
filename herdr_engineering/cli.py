@@ -2092,6 +2092,11 @@ def _cmd_fleet_drift(args) -> int:
 def _cmd_fleet_status(args) -> int:
     from .fleet import fleet_status
     status = fleet_status()
+    if status.get("error_kind"):   # ansible never ran: a setup problem (exit 2), not hosts that failed (exit 1)
+        if args.json:
+            _print_json(status)
+        print(f"fleet status: {status['error']}", file=sys.stderr)
+        return 2
     if args.json:
         _print_json(status)
     else:
