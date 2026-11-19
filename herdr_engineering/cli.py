@@ -734,7 +734,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     "(same port as HTTP; issue one with `devfabric ca issue`)")
     p2.add_argument("--tls-key", default=None, help="private key for --tls-cert")
     p2.add_argument("--acme-domain", default=None, help="serve a publicly trusted Let's Encrypt certificate for this "
-                    "name and *.name (e.g. local.example.com); also the default --url-base")
+                    "name and *.name (e.g. local.metabolomics.us); also the default --url-base")
     p2.add_argument("--url-alias", action="append", default=[],
                     help="extra name the fabric answers to when resolving URLs (repeatable; dev.lan is added "
                          "automatically when a private CA exists)")
