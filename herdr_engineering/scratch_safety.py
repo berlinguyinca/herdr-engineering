@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import functools
 import os
+import pwd
 import re
 import stat
 import subprocess
@@ -11,6 +13,25 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+
+
+@functools.cache
+def user_home() -> Path:
+    """The account's home directory from the password database, resolved once. ``$HOME`` is an
+    environment variable like any other and must never decide where config, sessions or deletion
+    roots are read from."""
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def expand_home(value: str | Path) -> Path:
+    """``~`` and ``~/...`` against ``user_home()``; every other spelling is returned unchanged."""
+    text = str(value)
+    if text == "~":
+        return user_home()
+    if text.startswith("~/"):
+        return user_home() / text[2:]
+    return Path(text)
+
 
 _COMPILERS = {
     "cargo",

@@ -23,7 +23,7 @@ from herdr_engineering.cleanup_command import (
 from herdr_engineering.scratch_reaper import default_root
 
 UID = os.getuid()
-DEFAULT = Path(f"/tmp/claude-{UID}")
+DEFAULT = Path(os.path.realpath(f"/tmp/claude-{UID}"))
 
 
 # --- 1 + 7: a zombie (exited, not reaped) must not fail the /proc scan --------------------------------------
@@ -113,12 +113,13 @@ def test_excludes_file_is_per_repo_through_an_includeif_in_an_included_file(
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     work, other = _repo(tmp_path / "work" / "r1"), _repo(tmp_path / "other" / "r2")
+    (home / "work-ignore").write_text("x\n")
     (home / "work.cfg").write_text(f"[core]\n\texcludesFile = {home}/work-ignore\n")
     (home / "inc.cfg").write_text(f'[includeIf "gitdir:{tmp_path}/work/"]\n\tpath = {home}/work.cfg\n')
     (home / ".gitconfig").write_text(f"[include]\n\tpath = {home}/inc.cfg\n")
     reset_excludes_cache()
     assert _user_excludes_file(str(home), str(work)) == f"{home}/work-ignore"
-    assert _user_excludes_file(str(home), str(other)) == ""
+    assert _user_excludes_file(str(home), str(other)) == "/dev/null"
 
 
 def test_the_xdg_global_config_is_honoured_and_reset_forgets(
@@ -126,18 +127,20 @@ def test_the_xdg_global_config_is_honoured_and_reset_forgets(
     home = tmp_path / "home"
     (home / "xdg" / "git").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "xdg"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "xdg"))  # a caller's variable is not consulted
+    (home / ".config" / "git").mkdir(parents=True)
     repo = _repo(tmp_path / "r")
-    (home / "xdg" / "git" / "config").write_text(f"[core]\n\texcludesFile = {home}/x-ignore\n")
+    (home / "x-ignore").write_text("x\n")
+    (home / ".config" / "git" / "config").write_text(f"[core]\n\texcludesFile = {home}/x-ignore\n")
     reset_excludes_cache()
     assert _user_excludes_file(str(home), str(repo)) == f"{home}/x-ignore"
-    (home / "xdg" / "git" / "config").write_text("")
+    (home / ".config" / "git" / "config").write_text("")
     assert _user_excludes_file(str(home), str(repo)) == f"{home}/x-ignore"  # once per run
     reset_excludes_cache()
-    assert _user_excludes_file(str(home), str(repo)) == ""
+    assert _user_excludes_file(str(home), str(repo)) == "/dev/null"
 
 
-def test_an_unset_home_resolves_to_none_without_error(tmp_path: Path) -> None:
+def test_no_excludes_anywhere_resolves_to_dev_null(tmp_path: Path) -> None:
     reset_excludes_cache()
-    assert _user_excludes_file("", str(_repo(tmp_path / "r"))) == ""
-    assert _user_excludes_file("", str(tmp_path / "r")) == ""
+    assert _user_excludes_file(str(tmp_path), str(_repo(tmp_path / "r"))) == "/dev/null"
+    assert _user_excludes_file(str(tmp_path), str(tmp_path / "r")) == "/dev/null"

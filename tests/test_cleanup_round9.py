@@ -21,7 +21,7 @@ from herdr_engineering.cleanup_command import (
 from herdr_engineering.scratch_reaper import default_root, system_temp_roots
 
 UID = os.getuid()
-DEFAULT = Path(f"/tmp/claude-{UID}")
+DEFAULT = Path(os.path.realpath(f"/tmp/claude-{UID}"))
 NON_TEMP = Path(__file__).parent / "_r9_not_a_temp_dir"  # inside the checkout, never a system temp dir
 
 

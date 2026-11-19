@@ -70,10 +70,10 @@ def test_a_junk_named_symlink_is_not_junk(env: Env, home: Path) -> None:  # noqa
 
 def test_the_scratch_root_follows_claude_code_tmpdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CLAUDE_CODE_TMPDIR", raising=False)
-    assert default_root() == Path(f"/tmp/claude-{os.getuid()}")
+    assert default_root() == Path(os.path.realpath(f"/tmp/claude-{os.getuid()}"))
     monkeypatch.setenv("CLAUDE_CODE_TMPDIR", str(tmp_path))
     (tmp_path / f"claude-{os.getuid()}").mkdir()  # only a real, user-owned directory is honoured
-    assert default_root() == tmp_path / f"claude-{os.getuid()}"
+    assert default_root() == Path(os.path.realpath(tmp_path)) / f"claude-{os.getuid()}"
 
 
 def test_roots_and_temp_roots_take_the_scratch_root_as_a_parameter(tmp_path: Path) -> None:

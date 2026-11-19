@@ -39,17 +39,25 @@ def _managed_process(pid: Path, proc: Path) -> bool:
 
     Outside Herdr's tree, inaccessible daemon state is outside the build safety
     contract. Unknown ancestry raises instead of treating a process as outside.
-    A process that has exited is not managed; an ancestor that exits mid-walk is retried once
-    from a fresh ``PPid`` (the child was reparented).
+    A starting process that has itself exited is not managed. When an ANCESTOR exits mid-walk the
+    walk is repeated once from a fresh ``PPid``, and only a positive answer is trusted: a retry that
+    finds no Herdr (the child was reparented to init or a subreaper) cannot tell an unmanaged process
+    from one Herdr just orphaned, so it raises like any other unverifiable ancestry.
     """
-    for attempt in (0, 1):
+    vanished = False
+    for _attempt in (0, 1):
         try:
-            return _ancestry_is_herdr(pid, proc)
+            if _ancestry_is_herdr(pid, proc):
+                return True
+            if not vanished:
+                return False
+            raise OSError(f"Process ancestry changed while inspecting {pid}")
         except (FileNotFoundError, ProcessLookupError) as exc:
             if not pid.exists():
                 return False  # the process itself exited
-            if attempt:
+            if vanished:
                 raise OSError(f"Process ancestry changed while inspecting {pid}") from exc
+            vanished = True
     return False
 
 

@@ -218,7 +218,7 @@ def test_skip_worktree_edits_refuse_removal(env: Env, flag: str) -> None:
 # --- 4: Claude scratch root ------------------------------------------------------------------------
 
 def test_default_roots_use_the_scratch_reapers_claude_root(tmp_path: Path) -> None:
-    expected = Path(f"/tmp/claude-{UID}")
+    expected = Path(os.path.realpath(f"/tmp/claude-{UID}"))
     assert expected in default_roots(tmp_path)
     assert expected in default_temp_roots()
 

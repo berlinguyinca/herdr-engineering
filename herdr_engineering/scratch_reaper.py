@@ -32,10 +32,12 @@ from pathlib import Path
 from typing import NoReturn, cast
 from xml.parsers.expat import ExpatError
 
+from . import scratch_safety
 from .scratch_safety import (
     InspectionUnavailable,
     Snapshot,
     TreeInfo,
+    expand_home,
     inspect_tree,
     keep_ancestor,
     open_parent,
@@ -242,22 +244,35 @@ def default_root() -> Path:
     ``CLAUDE_TMPDIR`` is the TMPDIR it hands to sandboxed commands, not a session root. An environment
     variable must never widen what may be deleted, so the variable is honoured only when the result is
     an absolute, real (not symlinked), user-owned directory under a system temp dir; otherwise it is
-    ignored with a warning and the default ``/tmp/claude-<uid>`` applies."""
-    default = Path(f"/tmp/claude-{os.getuid()}")
+    ignored with a warning and the default ``/tmp/claude-<uid>`` applies.
+
+    The result is the validated REAL path (symlinks above it collapsed); callers use exactly that and
+    never re-derive a spelling from the environment, so what was checked is what gets deleted. The
+    default is resolved only when it exists as a real directory of this user; otherwise it stays as
+    spelled (a symlink or foreign directory there is never followed)."""
+    name = f"claude-{os.getuid()}"
+    default = Path("/tmp") / name
     base = os.environ.get("CLAUDE_CODE_TMPDIR")
-    if not base:
-        return default
-    if problem := _env_root_problem(base):
-        logging.getLogger(__name__).warning("ignoring CLAUDE_CODE_TMPDIR=%s: %s", base, problem)
-        return default
-    return Path(base) / f"claude-{os.getuid()}"
+    chosen = default
+    if base:
+        if problem := _env_root_problem(base):
+            logging.getLogger(__name__).warning("ignoring CLAUDE_CODE_TMPDIR=%s: %s", base, problem)
+        else:
+            chosen = Path(base) / name
+    try:
+        info = chosen.lstat()
+    except OSError:
+        return chosen
+    if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid():
+        return Path(os.path.realpath(chosen))
+    return chosen
 
 
 def default_live_roots() -> list[Path]:
     return [
-        Path.home() / ".claude/projects",
-        Path.home() / ".codex/sessions",
-        Path.home() / ".pi/agent/sessions",
+        scratch_safety.user_home() / ".claude/projects",
+        scratch_safety.user_home() / ".codex/sessions",
+        scratch_safety.user_home() / ".pi/agent/sessions",
     ]
 
 
@@ -915,7 +930,7 @@ def run_once(
 ) -> Report:
     started = time.monotonic()
     policy.validate()
-    root, quarantine, state_dir = (p.expanduser().absolute() for p in (root, quarantine, state_dir))
+    root, quarantine, state_dir = (expand_home(p).absolute() for p in (root, quarantine, state_dir))
     if root.is_symlink() or root.name != f"claude-{os.getuid()}":
         raise ValueError("managed root must be the current user's real claude-UID directory")
     if quarantine.is_symlink() or state_dir.is_symlink():
@@ -938,12 +953,12 @@ def run_once(
         gate_state
         or Path(
             os.environ.get(
-                "HERDR_ENGINEERING_STATE", str(Path.home() / ".local/state/herdr-engineering")
+                "HERDR_ENGINEERING_STATE", str(scratch_safety.user_home() / ".local/state/herdr-engineering")
             )
         )
         / "build-gates"
     )
-    gate = gate.expanduser().resolve()
+    gate = expand_home(gate).resolve()
     if any(
         gate == managed or gate.is_relative_to(managed) or managed.is_relative_to(gate)
         for managed in (root, quarantine)
@@ -1086,10 +1101,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=None)
     parser.add_argument(
-        "--quarantine", type=Path, default=Path.home() / ".local/state/scratch-reaper/quarantine"
+        "--quarantine", type=Path, default=scratch_safety.user_home() / ".local/state/scratch-reaper/quarantine"
     )
     parser.add_argument(
-        "--state-dir", type=Path, default=Path.home() / ".local/state/scratch-reaper"
+        "--state-dir", type=Path, default=scratch_safety.user_home() / ".local/state/scratch-reaper"
     )
     parser.add_argument("--gate-state-dir", type=Path)
     parser.add_argument("--apply", action="store_true")
@@ -1107,7 +1122,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.status:
-            path = args.state_dir.expanduser() / "status.json"
+            path = expand_home(args.state_dir) / "status.json"
             print(json.dumps(_small_json(path) if path.exists() else {"status": "never_run"}))
             return 0
         policy = Policy(
