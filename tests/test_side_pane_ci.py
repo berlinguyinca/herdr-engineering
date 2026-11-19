@@ -36,7 +36,7 @@ def woodpecker() -> Iterator[tuple[WoodpeckerProvider, list[str]]]:
             self.wfile.write(body)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
     yield WoodpeckerProvider(base_url=base, token=None, allow_loopback_http=True), seen
     server.shutdown()

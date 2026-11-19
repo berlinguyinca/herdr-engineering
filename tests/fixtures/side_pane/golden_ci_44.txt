@@ -1,0 +1,15 @@
+ Summary  Handoffs ● [CI ●]
+────────────────────────────────────────────
+4 open · 1 running · 1 failing
+● #44 box size + Copy as CSS
+  running
+  woodpecker verify
+● #45 compare/live-edit controls
+  failing
+  woodpecker unit-gates
+  unit-gates failed
+● #46 never pushed to CI
+  not started
+● #47 CI is down
+  CI unavailable
+merged: #39 #41

@@ -25,6 +25,7 @@ from ..handoff_controller.events import (
 )
 from ..handoff_controller.store import shared_store_root
 from ..handoff_controller.takeover import record_view
+from .ci_tab import CiCard, ci_attention
 
 CHAIN_MAX = 10  # rows shown; earlier sessions are only counted
 _TITLE_WORDS = 6
@@ -75,10 +76,13 @@ class SidePaneModel:
     summary: Summary | None = None
     hidden: int = 0  # earlier sessions of the chain that `rows` leaves out
     chain_attention: bool = False
+    ci: tuple[CiCard, ...] = ()
+    built_at: float = 0.0  # the clock the durations were measured at; a later render adds what has passed
 
     @property
     def attention(self) -> bool:
-        return self.chain_attention
+        """Something runs or fails: a chain that is not settled, or a CI card that runs or fails."""
+        return self.chain_attention or ci_attention(self.ci)
 
 
 EMPTY = SidePaneModel()
@@ -265,8 +269,10 @@ def _totals(all_nodes: Sequence[_Node], now: float) -> Totals:
                   sum(known) if known else None)
 
 
-def build_model(session: SessionRef | None, store_root: Path | None, env: Mapping[str, str], now: float) -> SidePaneModel:
-    """The model for `session`; the empty model when there is none. `store_root` defaults to the shared store."""
+def build_model(session: SessionRef | None, store_root: Path | None, env: Mapping[str, str], now: float,
+                ci: Sequence[CiCard] = ()) -> SidePaneModel:
+    """The model for `session`; the empty model when there is none. `store_root` defaults to the shared store; `ci` are
+    the cards `ci_tab.build_cards` made (fetching them is the caller's job: it is the only part that uses the network)."""
     if session is None:
         return EMPTY
     root = store_root if store_root is not None else shared_store_root(env)
@@ -277,9 +283,9 @@ def build_model(session: SessionRef | None, store_root: Path | None, env: Mappin
     elif open_chain(pane_events(events, session.pane_id, session.session_id)) is not None:
         nodes = [_Node(None, session.pane_id, session.session_id, session.harness, "", None)]  # draining, no record yet
     else:
-        return EMPTY
+        return SidePaneModel(ci=tuple(ci), built_at=now)
     rows, attention = _rows(nodes, events, now, dangling)
     hidden = max(len(rows) - CHAIN_MAX, 0)
     shown = [ChainRow(**{**r.__dict__, "depth": r.depth - hidden}) for r in rows[hidden:]]
     return SidePaneModel(tuple(shown), _totals(nodes, now), _summary(chain[-1]) if chain else None, hidden,
-                         attention)
+                         attention, tuple(ci), now)
