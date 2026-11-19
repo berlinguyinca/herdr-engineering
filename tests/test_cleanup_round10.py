@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,7 @@ from herdr_engineering.scratch_reaper import default_root, system_temp_roots
 from .test_cleanup_round2 import home  # noqa: F401
 
 UID = os.getuid()
-SESSION = "11111111-2222-3333-4444-555555555555"
+SESSION = str(uuid.uuid4())  # unique per run: a literal id would be found in a real transcript
 
 
 # --- 3: any claude-<uid> component under a fixed temp root is guarded -------------------------------------

@@ -137,3 +137,51 @@ def test_2_an_enclosing_own_session_protects_a_nested_old_session(tmp_path: Path
         cleanup("tmp", inner / "w", roots=[], temp_roots=[tmp_path], scratch_root=base / f"claude-{UID}",
                 dry_run=True, now=time.time() + 5 * DAY)
     assert refusal.value.code == "scratch_protected"
+
+
+def _other_account_is_live(tmp_path: Path, home: Path, running: list[subprocess.Popen[bytes]],  # noqa: F811
+                           env: dict[str, str], config: Path, tag: str) -> None:
+    base = _fixed(tmp_path) / tag
+    session = _old(base, base / f"claude-{UID}" / "-proj" / OTHER)
+    proc = _start(tmp_path, running, env)
+    _record(config, proc, OTHER)
+    _refused(tmp_path, session, "live_session")
+    proc.kill()
+    proc.wait()
+    assert _clean(tmp_path, session)["action"] == "would_remove"
+
+
+def test_15_1_a_config_dir_with_spaces_is_read_exactly(
+        tmp_path: Path, home: Path, running: list[subprocess.Popen[bytes]],  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    work = home / "Library" / "Application Support" / "Claude Work"
+    _other_account_is_live(tmp_path, home, running, {**os.environ, "CLAUDE_CONFIG_DIR": str(work)}, work, "s")
+
+
+def test_15_2_a_different_home_without_a_config_dir_is_searched(
+        tmp_path: Path, home: Path, running: list[subprocess.Popen[bytes]],  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    alt = home / "accounts" / "work"
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"} | {"HOME": str(alt)}
+    _other_account_is_live(tmp_path, home, running, env, alt / ".claude", "h")
+
+
+def test_15_3_an_enclosing_session_inside_its_resumable_window_protects_an_idle_nested_one(
+        tmp_path: Path, home: Path) -> None:  # noqa: F811
+    from herdr_engineering.scratch_reaper import Policy
+    from herdr_engineering.scratch_safety import inspect_tree
+    base = _fixed(tmp_path) / "t"
+    outer = base / f"claude-{UID}" / "-proj" / OWN
+    inner = outer / "scratchpad" / "child" / f"claude-{UID}" / "-p" / OTHER
+    (inner / "w").mkdir(parents=True)
+    (inner / "w" / "result.md").write_text("child output")
+    idle = inspect_tree(inner, accounting_only=True).newest
+    time.sleep(2.5)  # the enclosing session is touched after the nested one went idle (ctime cannot be backdated)
+    (outer / "scratchpad" / "notes.md").write_text("kept for resume")
+    now = idle + Policy().session_ttl_seconds + 1  # the nested session is 48 h idle; the outer one is not
+    with pytest.raises(Refusal) as refusal:
+        cleanup("tmp", inner / "w", roots=[], temp_roots=[tmp_path], scratch_root=base / f"claude-{UID}",
+                dry_run=True, now=now)
+    assert refusal.value.code == "session_recent"

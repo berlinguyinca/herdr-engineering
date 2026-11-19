@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -15,8 +16,8 @@ from .test_cleanup_round2 import home  # noqa: F401
 from .test_cleanup_round3 import claim_session
 
 UID = os.getuid()
-OWN = "11111111-2222-3333-4444-555555555555"
-OTHER = "66666666-7777-8888-9999-000000000000"
+OWN = str(uuid.uuid4())  # unique per run: running claude processes of this uid are searched, so a literal id could be found in a real transcript
+OTHER = str(uuid.uuid4())
 
 
 def _fixed(tmp_path: Path) -> Path:

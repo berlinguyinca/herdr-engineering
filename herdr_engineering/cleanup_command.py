@@ -26,6 +26,7 @@ import argparse
 import json
 import logging
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -627,19 +628,49 @@ def _process_started(pid: int) -> float | None:
 
 
 def _process_environment(pid: int) -> dict[str, str] | None:
-    """The environment of a same-uid process: ``/proc/<pid>/environ`` on Linux, ``ps -E`` elsewhere.
-    None when it cannot be read (macOS shows nothing for protected system binaries)."""
+    """The exact environment of a same-uid process, or None when it cannot be read or parsed.
+    Linux: NUL-split ``/proc/<pid>/environ``. macOS: ``sysctl KERN_PROCARGS2`` (argc, exec path, argv,
+    envp, all NUL-separated); SIP-protected binaries expose no envp, which reads as unreadable."""
     try:
-        raw = Path(f"/proc/{pid}/environ")
-        if raw.parent.is_dir():
-            pairs = raw.read_bytes().decode(errors="replace").split("\0")
-            return dict(item.split("=", 1) for item in pairs if "=" in item)
-        out = subprocess.run(["ps", "-E", "-p", str(pid), "-o", "command="], capture_output=True, text=True,
-                             timeout=15, check=False).stdout
-    except (OSError, subprocess.SubprocessError):
+        if sys.platform == "darwin":
+            pairs = _procargs2_environment(pid)
+        else:
+            pairs = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except (OSError, ValueError):
         return None
-    tokens = dict(re.findall(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=(\S*)", out))
-    return tokens if "PATH" in tokens or "HOME" in tokens else None
+    env = dict(item.decode(errors="surrogateescape").split("=", 1) for item in pairs if b"=" in item)
+    return env or None
+
+
+def _procargs2_environment(pid: int) -> list[bytes]:
+    import ctypes
+    import ctypes.util
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, pid
+    size = ctypes.c_size_t(0)
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+        raise OSError(ctypes.get_errno(), "sysctl KERN_PROCARGS2")
+    buffer = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        raise OSError(ctypes.get_errno(), "sysctl KERN_PROCARGS2")
+    raw = buffer.raw[: size.value]
+    argc = int.from_bytes(raw[:4], sys.byteorder)
+    rest = raw[4:].split(b"\0")  # exec path, padding NULs, argv..., envp...
+    position = 1
+    while position < len(rest) and rest[position] == b"":
+        position += 1
+    position += argc
+    if position > len(rest):
+        raise ValueError("truncated KERN_PROCARGS2")
+    return [item for item in rest[position:] if item]
+
+
+def _config_dir_of(env: dict[str, str]) -> Path:
+    """The config dir a Claude process uses: its CLAUDE_CONFIG_DIR, else its own HOME, else the passwd home."""
+    if configured := env.get("CLAUDE_CONFIG_DIR"):
+        return Path(configured)
+    home = env.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
+    return Path(home) / ".claude"
 
 
 def claude_config_dirs() -> list[Path]:
@@ -660,8 +691,7 @@ def claude_config_dirs() -> list[Path]:
         env = _process_environment(int(pid))
         if env is None:
             raise Refusal("live_session_unknown", f"cannot read the environment of the running claude process {pid}")
-        if configured := env.get("CLAUDE_CONFIG_DIR"):
-            dirs.append(Path(configured))
+        dirs.append(_config_dir_of(env))
     return list(dict.fromkeys(dirs))
 
 
@@ -727,9 +757,6 @@ def _guard_scratch(path: Path, scratches: list[Path], live_roots: list[Path], no
     index = session_index(parts)
     if index is None:
         raise Refusal("scratch_protected", f"{path} is a scratch root or a project; only one session is removable")
-    session = parts[index].lower()
-    below = len(parts) - index - 1  # levels between the session dir and the target
-    session_dir = path.parents[below - 1] if below else path
     # every session between the target and the outermost claude-<uid>: the target's own and each enclosing one
     sessions = {p[i].lower() for p in roots if (i := session_index(p)) is not None}
     dirs = claude_config_dirs()
@@ -742,8 +769,13 @@ def _guard_scratch(path: Path, scratches: list[Path], live_roots: list[Path], no
     live = _live_ids([*live_roots, *(d / "projects" for d in dirs)], now - policy.live_seconds) | running_sessions(dirs)
     if sessions & live:
         raise Refusal("live_session", f"session {', '.join(sorted(sessions & live))} is still live")
-    if inspect_tree(session_dir, accounting_only=True).newest > now - policy.session_ttl_seconds:
-        raise Refusal("session_recent", f"session {session} was active within {policy.session_ttl_seconds / 3600:.0f} h")
+    for parts in sorted(roots, key=len):  # the target's own session, then each enclosing one
+        i = session_index(parts)
+        if i is None:
+            continue
+        below = len(parts) - i - 1
+        if inspect_tree(path.parents[below - 1] if below else path, accounting_only=True).newest > now - policy.session_ttl_seconds:
+            raise Refusal("session_recent", f"session {parts[i].lower()} was active within {policy.session_ttl_seconds / 3600:.0f} h")
 
 
 def _remove_tmp(path: Path, *, dry_run: bool, scratch: list[Path], live_roots: list[Path],
