@@ -252,6 +252,10 @@ Inspect the registry with `herdr-eng handoff subagents [--pane ID] [--json]` (de
 lists the live entries and deletes entries older than 6 hours (a subagent that never reported a stop) as stale. It
 always exits 0.
 
+`herdr-eng handoff context [--pane ID] [--json]` prints how full the pane's session context is (harness, used and
+window tokens, percent, source, window source), or `{"unknown": true}` when it cannot be read; it always exits 0.
+`--harness NAME --session-id ID [--cwd DIR]` reads a named session's record directly, without Herdr.
+
 `herdr-eng handoff auto install` installs these two hooks together with the `UserPromptSubmit` one. Manual
 alternative, merged into `~/.claude/settings.json`:
 

@@ -207,7 +207,7 @@ def test_revoked_share_stays_as_revoked_row_with_snapshot_title(dsn):
 def test_expired_share_status_expired_read_live(dsn):
     async def body(store, pool):
         a = await artifact(pool, YOU_P)
-        sid = await share(pool, a, audience="public", expires=NOW + timedelta(hours=1))
+        sid = await share(pool, a, audience="public", expires=datetime.now(UTC) + timedelta(hours=1))
         await store.record_claim(ME, sid)
         assert (await feed(store)).items[0].status == "active"
         await pool.execute(

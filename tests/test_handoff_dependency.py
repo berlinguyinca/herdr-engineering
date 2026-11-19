@@ -40,14 +40,14 @@ def _skills_tree(root: Path) -> Path:
 
 
 def _fake_cli(tmp_path: Path, *, version: str, commands: tuple[str, ...],
-              style: str = "argparse") -> str:
+              style: str = "argparse", takeover_flags: tuple[str, ...] = ("--direction",)) -> str:
     """A real executable that answers --version/--help the way a herdr-handoff release does.
 
     `argparse` is the shape the shipped CLI actually prints (one brace group on the usage line);
     `listed` is a hand-written help that spells the commands out one per line, so both spellings get
     exercised.
     """
-    path = tmp_path / f"herdr-handoff-{version}-{style}"
+    path = tmp_path / f"herdr-handoff-{version}-{style}-{'-'.join(takeover_flags) or 'noflags'}"
     choices = ",".join(commands)
     if style == "argparse":
         help_text = (f"usage: herdr-handoff [-h] [--version] [--root ROOT]\n"
@@ -59,8 +59,12 @@ def _fake_cli(tmp_path: Path, *, version: str, commands: tuple[str, ...],
     else:
         help_text = "usage: herdr-handoff <command>\n\ncommands:\n" + "".join(
             f"  {command} [--id X]   description\n" for command in commands)
+    takeover_help = ("usage: herdr-handoff takeover [-h] --id ID "
+                     + " ".join(f"[{flag} X]" for flag in takeover_flags) + "\n")
     path.write_text("#!/usr/bin/env python3\nimport sys\n"
                     f"HELP = {help_text!r}\n"
+                    f"TAKEOVER_HELP = {takeover_help!r}\n"
+                    "if \"takeover\" in sys.argv and \"--help\" in sys.argv: print(TAKEOVER_HELP, end=\"\"), sys.exit(0)\n"
                     f"if \"--version\" in sys.argv: print({version!r})\n"
                     "elif \"--help\" in sys.argv: print(HELP, end=\"\"), sys.exit(0)\n")
     path.chmod(0o755)
@@ -79,7 +83,7 @@ def test_the_cli_is_checked_for_the_commands_we_actually_call(tmp_path):
                                      executable=_fake_cli(tmp_path, version="0.3.0", commands=REQUIRED))
     assert result.status == "ok", result.detail
     assert result.version == "0.3.0"
-    assert set(result.capabilities) == set(REQUIRED)
+    assert set(REQUIRED) <= set(result.capabilities)
     assert all(result.capabilities.values())
 
 
@@ -94,6 +98,27 @@ def test_a_cli_without_takeover_is_reported_as_the_gap_it_is(tmp_path):
     assert "takeover" in result.detail and "confirm" in result.detail
     assert "0.2.0" in result.detail
     assert result.capabilities["takeover"] is False
+
+
+def test_a_cli_whose_takeover_lacks_direction_is_reported_as_older_than_0_5_0(tmp_path):
+    # `takeover --direction` is the herdr-handoff 0.5.0 marker; 0.4.0 has every command and no such flag.
+    tree = _skills_tree(tmp_path)
+    result = check_handoff_dependency(skill_root=tree,
+                                     executable=_fake_cli(tmp_path, version="0.4.0", commands=CLI_COMMANDS,
+                                                          takeover_flags=("--keep-source",)))
+    assert result.status == "fail"
+    assert "takeover --direction" in result.detail and "0.5.0" in result.detail
+    assert "0.4.0" in result.detail
+    assert result.capabilities["takeover --direction"] is False
+    assert result.capabilities["takeover"] is True
+
+
+def test_a_cli_whose_takeover_lists_direction_satisfies_the_0_5_0_requirement(tmp_path):
+    tree = _skills_tree(tmp_path)
+    result = check_handoff_dependency(skill_root=tree,
+                                     executable=_fake_cli(tmp_path, version="0.5.0", commands=CLI_COMMANDS))
+    assert result.status == "ok", result.detail
+    assert result.capabilities["takeover --direction"] is True
 
 
 def test_the_capability_probe_does_not_invent_commands(tmp_path):
