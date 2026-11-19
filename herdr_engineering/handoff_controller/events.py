@@ -33,6 +33,9 @@ class StuckReason(StrEnum):
     SUCCESSOR_WITHOUT_TAKEOVER = "successor_without_takeover"  # the record names a successor but no launched child
     SOURCE_NOT_CLOSED_SUCCESSOR_LIVE = "source_not_closed_successor_live"  # the successor runs; only the close failed
     LAUNCH_STATE_UNKNOWN = "launch_state_unknown"  # a takeover died mid-launch: a child may or may not exist
+    DRAIN_TIMEOUT = "drain_timeout"  # the drain order could not be typed within the drain timeout (never idle with an empty composer)
+    DRAIN_PROMPT_UNCERTAIN = "drain_prompt_uncertain"  # typing the order failed in a way that left it unknown whether it landed
+    DRAIN_ORDER_TOO_LONG = "drain_order_too_long"  # the drain order exceeds the typed-input limit
 
 
 EVENT_NAMES = frozenset({

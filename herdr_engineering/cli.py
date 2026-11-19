@@ -548,6 +548,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--subagents-only", action="store_true", help="install: only the SubagentStart/SubagentStop registry hooks")
     p2.add_argument("--json", action="store_true")
     p2.set_defaults(func=_cmd_handoff_auto, auto_parser=p2)
+    p2 = hsub.add_parser("controller", help="the auto-handoff controller: run it, or show whether it runs and its chains")
+    p2.add_argument("controller_action", choices=("run", "status"))
+    p2.add_argument("--once", action="store_true", help="run: one tick, then exit")
+    p2.add_argument("--interval", type=float, default=5.0, help="run: seconds between ticks (default 5)")
+    p2.set_defaults(func=_cmd_handoff_controller)
 
     # summary --------------------------------------------------------------
     p = sub.add_parser("summary", help="/summary skill: install, verify, remove, read session history")
@@ -1585,6 +1590,15 @@ def _cmd_handoff_auto_switch(args) -> int:
     set_enabled(pane, args.auto_action == "on", _state_dir(os.environ).parent)
     print(f"auto-handoff {args.auto_action} for pane {pane}")
     return 0
+
+
+def _cmd_handoff_controller(args) -> int:
+    from .handoff_controller import run as controller
+    if args.controller_action == "status":
+        ctl = controller.build_controller(os.environ)
+        print("\n".join(controller.status_lines(ctl.state_dir, ctl.log)))
+        return 0
+    return controller.serve(interval_s=args.interval, once=args.once)
 
 
 def _cmd_handoff_subagent_hook(args) -> int:

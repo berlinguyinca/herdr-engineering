@@ -14,7 +14,7 @@ from typing import Literal
 from ..handoff_adapters.base import READY_STATUSES, Harness, HarnessAdapter, SessionRef
 from ..handoff_subagent_gate import SubagentGate
 from .config import ControllerConfig
-from .herdr_cli import HerdrCli, PromptResult
+from .herdr_cli import HerdrCli, PromptResult, harness_for_agent_name
 
 
 class Step(Enum):
@@ -51,8 +51,8 @@ def failed_prompt_outcome(status: str | None) -> Outcome | None:
 
 
 def agent_matches(name: str | None, harness: Harness) -> bool:
-    """Herdr names a pane's agent after its harness (`claude`, `codex`, `pi`, `opencode`)."""
-    return name == harness.value
+    """Herdr names a pane's agent after its harness; the mapping lives in `herdr_cli.harness_for_agent_name`."""
+    return harness_for_agent_name(name) is harness
 
 
 def timeout_outcome(last_status: str | None, wrong_agent: bool) -> Outcome:
