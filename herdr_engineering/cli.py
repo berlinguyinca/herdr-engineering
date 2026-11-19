@@ -533,7 +533,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = hsub.add_parser("subagents", help="list running subagents registered for a pane (prunes entries older than 6h)")
     p2.add_argument("--pane", default=None, help="pane id (default: $HERDR_PANE_ID)")
     p2.add_argument("--json", action="store_true")
-    p2.set_defaults(func=_cmd_handoff_subagents)
+    mode = p2.add_mutually_exclusive_group()
+    mode.add_argument("--status", action="store_true", help='print {"known": bool, "live": int} instead of the entries')
+    mode.add_argument("--wait", type=float, default=None, metavar="SECONDS",
+                      help="wait until no subagent is live: exit 0 when idle, 3 on timeout")
+    mode.add_argument("--purge", action="store_true", help="delete the pane's registry entries (pane closed)")
+    p2.set_defaults(func=_cmd_handoff_subagents, subagents_parser=p2)
     p2 = hsub.add_parser("auto", help="install, remove or check the opt-in context-hook in ~/.claude/settings.json")
     p2.add_argument("auto_action", choices=("install", "uninstall", "check"))
     p2.add_argument("--home", default=None, help="override $HOME (tests)")
@@ -1568,8 +1573,26 @@ def _cmd_handoff_subagent_hook(args) -> int:
 
 
 def _cmd_handoff_subagents(args) -> int:
-    from .handoff_subagent_registry import run_subagents
-    return run_subagents(args.pane, as_json=args.json)
+    from . import handoff_subagent_registry as registry
+    if not (args.status or args.wait is not None or args.purge):
+        return registry.run_subagents(args.pane, as_json=args.json)
+    pane = args.pane or os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        args.subagents_parser.error("--pane is required (or set HERDR_PANE_ID)")
+    if args.purge:
+        removed = registry.purge_pane(pane, os.environ)
+        if args.json:
+            _print_json({"purged": removed})
+        else:
+            print(removed)
+        return 0
+    idle = True if args.wait is None else registry.wait_until_idle(pane, os.environ, args.wait)
+    state = registry.status(pane, os.environ)
+    if args.json:
+        _print_json({"known": state.known, "live": state.live})
+    else:
+        print(f"known={str(state.known).lower()} live={state.live}")
+    return 0 if idle else 3
 
 
 def _cmd_summary_manage(args) -> int:
