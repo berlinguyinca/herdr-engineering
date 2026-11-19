@@ -189,7 +189,7 @@ def test_agent_session_kinds_id_and_path_are_accepted_and_others_rejected():
 def test_one_malformed_models_json_entry_does_not_hide_a_valid_match(tmp_path):
     path = _install(tmp_path, "main.jsonl")
     (tmp_path / ".pi" / "agent" / "models.json").write_text(
-        '{"providers":{"metabolomics":{"models":[{"contextWindow":5},"junk",{"id":"qwen3.8-flash_next"},'
+        '{"providers":{"example":{"models":[{"contextWindow":5},"junk",{"id":"qwen3.8-flash_next"},'
         '{"id":"qwen3.8-flash_next","contextWindow":65536}]}}}')
     reading = PiAdapter(home=tmp_path).read_context(_ref(path))
     assert reading is not None and (reading.window_tokens, reading.window_source) == (65_536, "recorded")
@@ -216,9 +216,9 @@ def test_drain_compact_and_exit_inputs():
 
 RULE = EDITOR_RULE * 80
 # the idle bottom of a real Pi pane (herdr pane read): output, rule, empty editor line, rule, footer
-IDLE_SCREEN = f" Both done.\n\n{RULE}\n\n{RULE}\n~ │ metabolomics/qwen3.8-flash_next\nMemory: idle\n"
+IDLE_SCREEN = f" Both done.\n\n{RULE}\n\n{RULE}\n~ │ example/qwen3.8-flash_next\nMemory: idle\n"
 WORKING_SCREEN = (" Current activity: Waiting for model · Esc to cancel\n"
-                  f"{EDITOR_RULE * 2} ⠏ Working · retry in 42s {RULE}\n\n{RULE}\n~ │ metabolomics/qwen3.8-flash-vision\n")
+                  f"{EDITOR_RULE * 2} ⠏ Working · retry in 42s {RULE}\n\n{RULE}\n~ │ example/qwen3.8-flash-vision\n")
 
 
 @pytest.mark.parametrize("status", ["idle", "done"])
@@ -240,8 +240,8 @@ def test_ready_ignores_blank_padding_below_the_screen():
 
 
 def test_read_context_window_matches_recorded_field(tmp_path):
-    reading = _read(tmp_path, "main.jsonl")  # provider metabolomics, model qwen3.8-flash_next
-    entries = json.loads((FIXTURES / "models.json").read_text())["providers"]["metabolomics"]["models"]
+    reading = _read(tmp_path, "main.jsonl")  # provider example, model qwen3.8-flash_next
+    entries = json.loads((FIXTURES / "models.json").read_text())["providers"]["example"]["models"]
     assert reading is not None
     assert reading.window_tokens == next(e["contextWindow"] for e in entries if e["id"] == "qwen3.8-flash_next")
     assert reading.window_source == "recorded"

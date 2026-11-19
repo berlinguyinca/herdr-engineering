@@ -52,10 +52,10 @@ def test_prints_a_section_per_harness_with_sources_models_and_the_over_100_check
     assert "payload.info.model_context_window [828400]" in out
     assert "providers.*.models[].contextWindow" in out
     assert "limit.context" in out
-    assert "  claude-opus-4-8  window=200000  window_source=model_table  sessions=1" in out  # catalogue 1000000 vs table 200000: the smaller
-    assert "  gpt-6.1-sol  window=828400  window_source=recorded  sessions=1" in out
-    assert "  metabolomics/qwen3.8-flash_next  window=131072  window_source=recorded  sessions=1" in out
-    assert re.search(r"  ollama/gemma4:26b  window=131072  window_source=recorded  sessions=1", out)
+    assert "  claude-opus-4-8  window=200000  window_source=model_table\n" in out  # catalogue 1000000 vs table 200000: the smaller
+    assert "  gpt-6.1-sol  window=828400  window_source=recorded\n" in out
+    assert "  */qwen3.8-flash_next  window=131072  window_source=recorded\n" in out
+    assert re.search(r"  \*/gemma4:26b  window=131072  window_source=recorded\n", out)
     assert out.count("sessions above 100% of their window:\n  none") == 4
 
 
@@ -92,7 +92,7 @@ def test_an_intermediate_key_that_is_a_plain_word_is_masked(tmp_path):
     out = _run(home)
     assert "acmeproject" not in out and "tengu_secret_flag" not in out
     assert "*.contextWindow [5]" in out and "*.windowDays [7]" in out
-    assert "providers.metabolomics" not in out and "provider.metabolomics" not in out
+    assert "providers.example" not in out and "provider.example" not in out
 
 
 def test_an_intermediate_key_that_contains_window_or_context_size_is_masked(tmp_path):
@@ -101,3 +101,10 @@ def test_an_intermediate_key_that_contains_window_or_context_size_is_masked(tmp_
     out = _run(home)
     assert "acme-window-corp" not in out and "model_context_size_x" not in out
     assert "*.contextWindow [5]" in out and "*.windowDays [7]" in out
+
+
+def test_prints_no_provider_name_and_no_session_count_in_the_models_lines(tmp_path):
+    out = _run(_home(tmp_path))
+    assert "ollama" not in out and "example/" not in out
+    assert "sessions=" not in out
+    assert "  */qwen3.8-flash_next  window=131072" in out

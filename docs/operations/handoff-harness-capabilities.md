@@ -81,7 +81,7 @@ in `models.json` is the fix; until then they read high and a handoff comes early
 | Session id in Herdr | `agent_session.kind == "id"`; matched against `session.id` on its own, without comparing the session `directory` with the pane cwd. Without an id there is no session (`locate` returns None; OpenCode reports no id until the first turn): the one session a cwd may hold can be an older one, and a wrong reading would trigger a false handoff |
 | Prompt, exit, compact | Prompt, exit and compact measured, see "Idle detection and exit" below. `agent_session` (kind `id`, a `ses_...` value) appears only after the first prompt, so `locate` finds no record before it |
 
-Model ids seen: `qwen3.8-27b`, `qwen3.8-27b-vision` (provider `metabolomics`), both `recorded`. Window unknown: none.
+Model ids seen: `qwen3.8-27b`, `qwen3.8-27b-vision` (provider `example`), both `recorded`. Window unknown: none.
 
 ## Idle detection and exit
 
@@ -193,7 +193,7 @@ Code, Codex and Pi in a fresh pane and for OpenCode after a turn; `/compact` was
 
 ## Script output
 
-`python3 scripts/measure_harness_windows.py`, run on 2026-11-18 (home paths shortened to `~` by the script):
+`python3 scripts/measure_harness_windows.py`, run on 2026-11-18 (home paths shortened to `~`, provider names shown as `*` and no session counts, by the script):
 
 ```
 == claude (last 30 days) ==
@@ -204,12 +204,12 @@ where a window or model limit is recorded:
   statusLine in ~/.claude/settings.json: not configured
   statusline input cache ~/.claude/hud/cache/stdin.*.json: *.context_window_size [1000000]
 models seen in recent sessions (window and window_source as the adapter resolves them):
-  claude-fable-5-2  window=1000000  window_source=recorded  sessions=5
-  claude-opus-4-5-20251101  window=200000  window_source=model_table  sessions=3
-  claude-opus-5  window=1000000  window_source=recorded  sessions=1
-  claude-opus-5-5  window=1000000  window_source=recorded  sessions=133
-  claude-sonnet-4-5-20250929  window=200000  window_source=model_table  sessions=1
-  claude-sonnet-5-5  window=1000000  window_source=recorded  sessions=52
+  claude-fable-5-2  window=1000000  window_source=recorded
+  claude-opus-4-5-20251101  window=200000  window_source=model_table
+  claude-opus-5  window=1000000  window_source=recorded
+  claude-opus-5-5  window=1000000  window_source=recorded
+  claude-sonnet-4-5-20250929  window=200000  window_source=model_table
+  claude-sonnet-5-5  window=1000000  window_source=recorded
 sessions above 100% of their window:
   none
 
@@ -218,8 +218,8 @@ where a window or model limit is recorded:
   rollout ~/.codex/sessions/Y/M/D/rollout-*.jsonl: payload.*.window_id; payload.info.model_context_window [828400]; payload.model_context_window [828400]; payload.rate_limits.primary.window_minutes [10080]; payload.state.context_window_guidance
   config ~/.codex/config.toml: model_context_window [1000000]
 models seen in recent sessions (window and window_source as the adapter resolves them):
-  gpt-6-astra  window=828400  window_source=recorded  sessions=27
-  gpt-6.1-sol  window=828400  window_source=recorded  sessions=173
+  gpt-6-astra  window=828400  window_source=recorded
+  gpt-6.1-sol  window=828400  window_source=recorded
 sessions above 100% of their window:
   none
 
@@ -229,21 +229,21 @@ where a window or model limit is recorded:
   models ~/.pi/agent/models.json: providers.*.models[].contextWindow [131072, 262144]
   model store ~/.pi/agent/models-store.json: [].models[].contextWindow [128000, 200000, 272000, 1000000]
 models seen in recent sessions (window and window_source as the adapter resolves them):
-  metabolomics/deepseek_v4  window=262144  window_source=recorded  sessions=4
-  metabolomics/qwen3.8-27b  window=262144  window_source=recorded  sessions=8
-  metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl  window=128000  window_source=fallback  sessions=5
-  metabolomics/qwen3.8-27b-text  window=128000  window_source=fallback  sessions=2
-  metabolomics/qwen3.8-flash  window=262144  window_source=recorded  sessions=14
-  metabolomics/qwen3.8-flash-text  window=128000  window_source=fallback  sessions=1
-  metabolomics/qwen3.8-flash-vision  window=262144  window_source=recorded  sessions=4
-  metabolomics/qwen3.8-flash_next  window=131072  window_source=recorded  sessions=139
-  metabolomics/qwen3.8-flash_next-modality-text-quant-w3a8  window=128000  window_source=fallback  sessions=3
-  metabolomics/qwen3.8-flash_next-text  window=131072  window_source=recorded  sessions=4
-  metabolomics/qwen3.8-vision  window=262144  window_source=recorded  sessions=1
+  */deepseek_v4  window=262144  window_source=recorded
+  */qwen3.8-27b  window=262144  window_source=recorded
+  */qwen3.8-27b-modality-vision-quant-q8_k_xl  window=128000  window_source=fallback
+  */qwen3.8-27b-text  window=128000  window_source=fallback
+  */qwen3.8-flash  window=262144  window_source=recorded
+  */qwen3.8-flash-text  window=128000  window_source=fallback
+  */qwen3.8-flash-vision  window=262144  window_source=recorded
+  */qwen3.8-flash_next  window=131072  window_source=recorded
+  */qwen3.8-flash_next-modality-text-quant-w3a8  window=128000  window_source=fallback
+  */qwen3.8-flash_next-text  window=131072  window_source=recorded
+  */qwen3.8-vision  window=262144  window_source=recorded
 sessions above 100% of their window:
-  OVER 100%: metabolomics/qwen3.8-27b-text used=231644 window=128000 window_source=fallback
-  OVER 100%: metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl used=154018 window=128000 window_source=fallback
-  OVER 100%: metabolomics/qwen3.8-flash-text used=193802 window=128000 window_source=fallback
+  OVER 100%: */qwen3.8-27b-text used=231644 window=128000 window_source=fallback
+  OVER 100%: */qwen3.8-27b-modality-vision-quant-q8_k_xl used=154018 window=128000 window_source=fallback
+  OVER 100%: */qwen3.8-flash-text used=193802 window=128000 window_source=fallback
 
 == opencode (last 30 days) ==
 where a window or model limit is recorded:
@@ -252,8 +252,8 @@ where a window or model limit is recorded:
   config ~/.config/opencode/opencode.json: provider.*.models.*.limit.context [65536, 131072]
   model catalogue ~/.cache/opencode/models.json: [].models.*.limit.context 204 values, 0..99999999
 models seen in recent sessions (window and window_source as the adapter resolves them):
-  metabolomics/qwen3.8-27b  window=131072  window_source=recorded  sessions=3
-  metabolomics/qwen3.8-27b-vision  window=65536  window_source=recorded  sessions=1
+  */qwen3.8-27b  window=131072  window_source=recorded
+  */qwen3.8-27b-vision  window=65536  window_source=recorded
 sessions above 100% of their window:
   none
 ```

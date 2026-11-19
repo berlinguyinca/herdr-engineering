@@ -3,7 +3,7 @@
 
 Read-only. Per harness it prints where a window or model limit appears (file kind and field name, or an
 explicit "none found"), then the distinct model ids seen in recent sessions with the window each resolves to
-and its window_source, then any session whose latest reading is above 100% of its resolved window (a signal
+and its window_source (no session counts, and provider names shown as "*"), then any session whose latest reading is above 100% of its resolved window (a signal
 that the window is wrong). It prints no message text, file contents, user names or absolute home paths: only
 field names, model ids, numbers and globs shortened with "~".
 
@@ -18,7 +18,6 @@ import sqlite3
 import sys
 import time
 import tomllib
-from collections import defaultdict
 from collections.abc import Callable, Iterator
 from contextlib import closing
 from pathlib import Path
@@ -202,6 +201,11 @@ def _readings(harness: Harness, home: Path, env: dict[str, str], files: list[Pat
             yield model, reading
 
 
+def _masked_model(model: str) -> str:
+    """*/model: the provider name is not printed, it can identify the owner's gateway."""
+    return f"*/{model}"
+
+
 def _model_of(harness: Harness, ref: SessionRef) -> str:
     assert ref.record_path is not None
     if harness is Harness.CLAUDE:
@@ -214,24 +218,22 @@ def _model_of(harness: Harness, ref: SessionRef) -> str:
         return _FALLBACK
     if harness is Harness.PI:
         pi_usage = pi.last_usage(ref.record_path)
-        return f"{pi_usage[1]}/{pi_usage[2]}" if pi_usage else _FALLBACK
+        return _masked_model(pi_usage[2]) if pi_usage else _FALLBACK
     assert ref.session_id is not None
     opencode_usage = opencode.last_usage(ref.record_path, ref.session_id)
-    return f"{opencode_usage[1]}/{opencode_usage[2]}" if opencode_usage else _FALLBACK
+    return _masked_model(opencode_usage[2]) if opencode_usage else _FALLBACK
 
 
 def _models_report(harness: Harness, home: Path, env: dict[str, str], files: list[Path], cutoff: float) -> list[str]:
     latest: dict[str, ContextReading] = {}
-    count: dict[str, int] = defaultdict(int)
     over: list[str] = []
     for model, reading in _readings(harness, home, env, files, cutoff):
         latest.setdefault(model, reading)  # newest session first
-        count[model] += 1
         if reading.percent > 100:
             over.append(f"  OVER 100%: {model} used={reading.used_tokens} window={reading.window_tokens} "
                         f"window_source={reading.window_source}")
     lines = ["models seen in recent sessions (window and window_source as the adapter resolves them):"]
-    lines += [f"  {model}  window={r.window_tokens}  window_source={r.window_source}  sessions={count[model]}"
+    lines += [f"  {model}  window={r.window_tokens}  window_source={r.window_source}"
               for model, r in sorted(latest.items())] or ["  none (no recent session with usage)"]
     lines.append("sessions above 100% of their window:")
     lines += over or ["  none"]
