@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Chore: pin herdr-handoff 0.5.0
+
+- `lock/upstreams.yaml` pins herdr-handoff to `aed3e8274e6948a774682a55d99b7cd9ef113914` (herdr-handoff#12, v0.5.0: shared handoff store, one takeover per handoff id, `takeover --direction`, `--relaunch`). `check_handoff_dependency` now also requires that `herdr-handoff takeover --help` lists `--direction` (reported as `takeover --direction`, naming 0.5.0), so `herdr-eng doctor` reports an installed 0.4.0 as too old until `scripts/install-handoff.sh` is run.
+
 ### Security: repo-local config can no longer set `handoff_autopilot`
 
 - `load_config` and `declared_keys` now ignore `handoff_autopilot` in the repo-local `./config/herdr-engineering.yaml` and `./herdr-engineering.yaml` (the repository being built is untrusted), exactly as `fabric_build_cache` already was, via one shared `_REPO_LOCAL_STRIPPED_KEYS` list. Set it in `~/.config/herdr-engineering/config.yaml` or `$HERDR_ENGINEERING_CONFIG`.
