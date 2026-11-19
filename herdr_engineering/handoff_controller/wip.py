@@ -1,16 +1,15 @@
 """Checkpoint a worktree before handoff: commit tracked changes on a feature branch, push when allowed."""
 from __future__ import annotations
 
-import os
-import signal
 import subprocess
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from .proc import TIMED_OUT, run_group
+
 PROTECTED_BRANCHES = frozenset({"main", "master"})
 COMMIT_MESSAGE = "wip: auto-handoff checkpoint"
-_AMBIENT_GIT_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE")
 
 
 class WipReason(StrEnum):
@@ -33,37 +32,12 @@ class WipResult:
     error: str | None = None  # set when `reason` is a failure; treat the repository state as unknown for GIT_ERROR
 
 
-def _env() -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k not in _AMBIENT_GIT_VARS}
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    return env
-
-
-_TIMED_OUT = 124
-_NOT_RUNNABLE = 127
+_TIMED_OUT = TIMED_OUT
 
 
 def _git(worktree: Path, timeout_s: float, *args: str) -> subprocess.CompletedProcess[str]:
     """Never raises: a timeout is returncode 124 (the whole process group is killed), a missing git 127."""
-    cmd = ["git", "-C", str(worktree), *args]
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                                text=True, env=_env(), start_new_session=True)
-    except (OSError, ValueError) as exc:
-        return subprocess.CompletedProcess(cmd, _NOT_RUNNABLE, "", str(exc))
-    try:
-        out, err = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)  # hooks and ssh are children of git: kill them all
-        except ProcessLookupError:
-            pass
-        try:
-            proc.communicate(timeout=5)  # reap
-        except subprocess.TimeoutExpired:
-            pass
-        return subprocess.CompletedProcess(cmd, _TIMED_OUT, "", f"timed out after {timeout_s}s")
-    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    return run_group(["git", "-C", str(worktree), *args], timeout_s)
 
 
 def _timed_out(proc: subprocess.CompletedProcess[str]) -> bool:
