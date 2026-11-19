@@ -122,6 +122,8 @@ class _Record:
     fallback: bool
     created: float | None
     updated: float | None
+    repo: str | None = None  # the workspace the record names
+    branch: str | None = None
 
 
 def _text(data: object, key: str) -> str | None:
@@ -155,7 +157,7 @@ def _record(raw: object) -> _Record | None:
         view.child_confirmed, _text(context, "goal") or "", _texts(context, "completed"),
         _text(context, "resume_point") or "", _texts(context, "remaining") + _texts(context, "next_commands"),
         isinstance(provenance, dict) and provenance.get("fallback") is True, _time(raw, "created_at"),
-        _time(raw, "updated_at"))
+        _time(raw, "updated_at"), _text(raw.get("workspace"), "repo"), _text(raw.get("workspace"), "branch"))
 
 
 def load_records(store_root: Path) -> dict[str, _Record]:
@@ -334,6 +336,26 @@ def _readable(events: Sequence[HandoffEvent]) -> tuple[list[HandoffEvent], int]:
     return good, len(events) - len(good)
 
 
+def chain_branches(session: SessionRef, store_root: Path) -> tuple[tuple[str | None, str], ...]:
+    """(repository or None, branch) of every record of the session's chain that names a branch, oldest first, once each."""
+    chain, _ = _chain_records(load_records(store_root), session)
+    return tuple(dict.fromkeys((r.repo, r.branch) for r in chain if r.branch))
+
+
+def _pushed_by(nodes: Sequence[_Node], events: Sequence[HandoffEvent]) -> dict[str, tuple[int, float]]:
+    """branch -> (session number, time) of the last checkpoint commit a session of the chain made on it. A session whose
+    record names no branch, or that made no checkpoint commit, adds nothing: it is not guessed."""
+    found: dict[str, tuple[int, float]] = {}
+    for number, node in enumerate(nodes, start=1):
+        if node.record is None or not node.record.branch or node.pane is None:
+            continue
+        stamps = [epoch(e.at) for e in pane_events(events, node.pane, node.session_id)
+                  if e.event == "handoff.wip_committed" and e.commit]
+        if stamps:
+            found[node.record.branch] = (number, max(stamps))
+    return found
+
+
 def build_model(session: SessionRef | None, store_root: Path | None, env: Mapping[str, str], now: float,
                 ci: Sequence[CiCard] = (), events: Sequence[HandoffEvent] | None = None) -> SidePaneModel:
     """The model for `session`; the empty model when there is none. `store_root` defaults to the shared store; `ci` are
@@ -352,8 +374,11 @@ def build_model(session: SessionRef | None, store_root: Path | None, env: Mappin
         nodes = _event_nodes(mine, session)  # no record yet: the event log alone
         if not nodes:
             return SidePaneModel(ci=tuple(ci), built_at=now, unreadable=unreadable)
+    pushed = _pushed_by(nodes, events)
+    ci = [replace(c, pushed_by=pushed[c.branch]) if c.branch in pushed else c for c in ci]
     rows, attention = _rows(nodes, events, now, dangling)
     hidden = max(len(rows) - CHAIN_MAX, 0)
     shown = [replace(r, depth=r.depth - hidden) for r in rows[hidden:]]
     return SidePaneModel(tuple(shown), _totals(nodes, now), _summary(chain[-1]) if chain else None, hidden,
                          attention, tuple(ci), now, unreadable)
+

@@ -29,11 +29,11 @@ from ..handoff_controller.herdr_cli import AgentPane, harness_for_agent_name
 from ..handoff_controller.store import shared_store_root
 from ..pane_viewer import run_viewer
 from . import state
-from .ci_fetch import CiSchedule, CiWorker, fetch_cards
+from .ci_fetch import Chain, CiSchedule, CiWorker, fetch_cards
 from .ci_tab import CiCard
 from .follow import EventFollower, choose_session
 from .herdr import PaneRow, SideHerdr
-from .model import EMPTY, SidePaneModel, build_model
+from .model import EMPTY, SidePaneModel, build_model, chain_branches
 from .render import Tab, render
 from .schedule import CI_REFRESH_S, EVENTS_REFRESH_S, STRUCTURE_REFRESH_S, Backoff, Due
 from .style import Style, clean, line
@@ -104,7 +104,7 @@ class PaneApp:
     """Follows the focused session of one tab and publishes what the screen shows. Nothing here raises out of `refresh`."""
 
     def __init__(self, tab_id: str | None, pane_id: str | None, herdr: SideHerdr, env: Mapping[str, str], *,
-                 fetch_ci: Callable[[Path], tuple[CiCard, ...]] | None = fetch_cards,
+                 fetch_ci: Callable[[Path, Chain], tuple[CiCard, ...]] | None = fetch_cards,
                  adapter_for: Callable[[Harness], HarnessAdapter] = default_adapter_for,
                  store_root: Path | None = None, ci_interval_s: float = CI_REFRESH_S) -> None:
         self.tab_id, self.pane_id = tab_id, pane_id
@@ -120,6 +120,8 @@ class PaneApp:
         self._rows_at: float | None = None
         self._agent_sig: tuple[tuple[str, str | None, str | None], ...] = ()
         self._last_key: object = None
+        self._chain_key: object = None
+        self._chain_found: Chain = ()
         self._ci = CiWorker(fetch_ci) if fetch_ci is not None else None
         self._ci_schedule = CiSchedule(self._ci, ci_interval_s) if self._ci is not None else None
         self._previous: AgentPane | None = None
@@ -199,10 +201,17 @@ class PaneApp:
             return None
         return reading.percent if reading is not None else None
 
+    def _chain(self, ref: SessionRef) -> Chain:
+        """The branches the session's chain names, re-read from the store only when its outbox changed."""
+        key = (ref.pane_id, ref.session_id, self._outbox_stamp())
+        if self._chain_key != key:
+            self._chain_key, self._chain_found = key, chain_branches(ref, self._store)
+        return self._chain_found
+
     def _ci_cards(self, ref: SessionRef) -> tuple[CiCard, ...]:
         if self._ci is None or self._ci_schedule is None:
             return ()
-        self._ci_schedule.maybe_request(ref.cwd, time.monotonic())
+        self._ci_schedule.maybe_request(ref.cwd, time.monotonic(), self._chain(ref))
         result = self._ci.latest()
         return result.cards if result is not None and result.cwd == ref.cwd else ()
 

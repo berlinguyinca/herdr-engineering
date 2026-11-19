@@ -26,7 +26,8 @@ def hid(n: int) -> str:
 def write_record(store: Path, n: int, *, pred: int | None = None, succ: int | None = None, pane: str, session: str,
                  goal: str = "a goal", created: str | None = None, updated: str | None = None, child: str | None = None,
                  child_session: str | None = None, phase: str | None = None, fallback: bool = False,
-                 harness: str = "claude", predecessor_id: str | None = None, **context: list[str] | str) -> str:
+                 harness: str = "claude", predecessor_id: str | None = None, branch: str | None = None,
+                 repo: str | None = None, **context: list[str] | str) -> str:
     record = copy.deepcopy(ROOT_RECORD)
     record["handoff_id"] = hid(n)
     record["predecessor_id"] = predecessor_id if predecessor_id is not None else (hid(pred) if pred else None)
@@ -34,6 +35,7 @@ def write_record(store: Path, n: int, *, pred: int | None = None, succ: int | No
     record["source"] = {**record["source"], "pane_id": pane, "session_id": session, "harness": harness}
     record["context"] = {**record["context"], "goal": goal, **context}
     record["provenance"] = {"fallback": True} if fallback else {}
+    record["workspace"] = {**record.get("workspace", {}), **({"branch": branch} if branch else {}), **({"repo": repo} if repo else {})}
     record["created_at"] = created or ago(10)
     record["updated_at"] = updated or created or ago(10)
     if child:
@@ -45,11 +47,12 @@ def write_record(store: Path, n: int, *, pred: int | None = None, succ: int | No
 
 
 def event(name: str, *, chain: str, pane: str, session: str | None, at: str, handoff: int | None = None,
-          reason: str | None = None, pct: float | None = None, live: int | None = None) -> HandoffEvent:
+          reason: str | None = None, pct: float | None = None, live: int | None = None,
+          commit: str | None = None) -> HandoffEvent:
     colour = {"handoff.succeeded": Colour.GREEN, "handoff.failed_compacted": Colour.ORANGE,
               "handoff.stuck": Colour.RED}.get(name)
     return HandoffEvent(name, at, chain, pane, session, Harness.CLAUDE, hid(handoff) if handoff else None, None, None,
-                        colour, reason, pct, subagents_live=live)
+                        colour, reason, pct, subagents_live=live, commit=commit)
 
 
 def session_ref(pane: str, session: str | None) -> SessionRef:

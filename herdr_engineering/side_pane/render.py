@@ -44,7 +44,7 @@ def _body(model: SidePaneModel, tab: Tab, width: int, now: float, opts: RenderOp
         return summary_tab.lines(model, width, opts)
     if tab is Tab.HANDOFFS:
         return handoffs_tab.lines(model, width, now, opts)
-    return ci_tab.lines(model.ci, width, opts)
+    return ci_tab.lines(model.ci, width, opts, now)
 
 
 def render(model: SidePaneModel, tab: Tab, width: int, height: int, now: float, opts: RenderOpts | None = None) -> list[str]:

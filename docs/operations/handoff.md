@@ -618,17 +618,51 @@ It has three tabs, switched with `1`, `2`, `3` or `Tab`. The tab bar puts a dot 
   that ended it: green "handed off", orange "failed, continued in compaction", red "stuck" followed by the reason from
   the table in "Terminal outcomes and what to do". The live session carries its context gauge and what it is waiting for.
   A line "N unreadable events" means N lines of the event log were skipped because their time could not be read.
-* **CI**: one card per pull request of the focused session's branch, with its workflows as small chips (running yellow,
-  passed green, failing red). Grey "not started" means nothing ran yet (that is not a failure); "CI unavailable" means the
-  reads failed; a card marked "(stale)" is the last good reading, kept because the latest read took longer than 90 seconds
-  or failed, and a stale card never raises the dot.
+* **CI**: one card per pull request or branch of the whole chain, not only of the branch checked out: every branch that a
+  record of the chain names in the session's repository gets a card (a record that names no repository counts as this one;
+  main and master never do). One `gh pr list --json number,title,headRefName,state,mergedAt,url,statusCheckRollup` per
+  refresh serves all of them. Each check of a pull request's rollup is one chip, named as the rollup names it (GitHub
+  Actions jobs, GitGuardian, review bots, Woodpecker contexts): running yellow, passed green, failing red, and grey for a
+  check that exists but has not started. Woodpecker's public per-workflow chips are kept and the matching rollup contexts
+  are not shown twice. A required check that never reported is not shown, because GitHub does not list it. The line under
+  a failing card names the first failing check ("unit-gates failed"); the rollup carries no description. A line
+  "Pushed by #N, 2h 05m ago" names the session of the chain that made a `handoff.wip_committed` checkpoint commit on that
+  card's branch (from the event log and the record's branch); it is left out when either is not recorded. Grey "not
+  started" on a card means nothing ran yet (that is not a failure); "CI unavailable" means the reads failed; a card marked
+  "(stale)" is the last good reading, kept because the latest read took longer than 90 seconds or failed, and a stale card
+  never raises the dot.
+
+#### Phase labels and reasons
+
+The live row says what the chain is doing; a red row says why in plain words (the controller's reason names are in "Terminal
+outcomes and what to do").
+
+| The row says | Meaning |
+| --- | --- |
+| asking the session to hand off | the order is being typed, or the session is busy |
+| waiting for N subagents / waiting for the session to finish | the drain waits for the session to go idle |
+| briefing written, preparing takeover | the record exists, the successor is not started |
+| taking over (attempt N of M) | the successor is being started |
+| compacting (last resort) | the handoff failed and the session is compacted in place |
+| handed off / continued in compaction / stuck | the chain's end (green, orange, red) |
+
+Reason phrases: "takeover refused, compaction failed", "session waits on a dialog", "pane runs another harness", "git state
+unknown", "uncommitted work on main", "no briefing was written", "harness has no compact command", "session never ready to
+compact", "compaction never started", "compaction took too long", "briefing pointer too long", "successor without a
+takeover", "successor live, old pane not closed", "successor launch state unknown", "session never idle to take the
+order", "unsure the order was typed", "handoff order too long to type", "session record unreadable", "handoff record
+unreadable", "merge in progress, nothing committed", "pane closed mid-handoff", "compaction state unknown", "no longer
+managed", "internal error". An unknown reason is shown as written, cut at 48 characters.
+
+A chain that has an event log but no record yet (its first handoff did not finish) still shows a row for the session, built
+from the event log alone: its colour and reason are the chain's, and it has no title because there is no briefing.
 
 ### Where and when it appears
 
 There is one side pane per tab, on the right. The handoff controller creates it when it first sees a managed session in
 that tab and never manages the pane itself: the controller ignores it when it looks for sessions. A tab too narrow for it
 gets none. Opening it does not take the focus: it acts on focus only when the new pane holds it, and then it restores the
-focus to the pane you were in by pane id. If Herdr cannot restore the focus by id, the focus stays on the side pane and
+focus to the pane you were in with one directional focus call (Herdr 0.9 can only move focus to a neighbour, not to a pane id). If that call does not land, the focus stays on the side pane and
 `herdr-eng side-pane ensure` prints `(focus: left_on_side_pane)`; for the first two seconds the viewer ignores `q`, so a
 stray key cannot dismiss it.
 
@@ -650,16 +684,21 @@ managed session appears in the tab. `ensure --tab` forgets this and opens it aga
 It only reads. The sources are the controller's event log and the handoff records in the shared store
 (`HERDR_HANDOFF_STORE`), Herdr itself for the tab, its panes and the focused session, the session's own record for the
 context gauge, `gh pr list` for pull requests, and Woodpecker's public reads for pipelines. `gh pr list` runs with your own
-`gh` login, in the focused session's directory and for its branch. No Woodpecker token is read, used or written. Focus,
-the event log and the gauge are read every 2 seconds; CI every 90 seconds. A CI read that takes longer than 90 seconds is
+`gh` login, in the focused session's directory, once per CI refresh, for the whole chain's branches. No Woodpecker token is
+read, used or written. Focus, the event log and the gauge are read every 2 seconds; CI every 90 seconds. A CI read that takes longer than 90 seconds is
 abandoned and the last good cards stay on screen, marked stale. The pane keeps at most the newest 20000 events in memory.
+
+Load on Herdr and the machine, for a tab with one session: one `herdr agent list` per refresh (30 a minute at the 2 second
+rate, 12 a minute once nothing has changed for a minute and the rate slows to 5 seconds), one `herdr pane list` at most
+every 10 seconds or when the agents change (about 6 a minute), no pane layout read, and at most one `ps` per refresh. With
+two or more sessions in the tab each refresh adds one `herdr pane layout` to find the focused one.
 
 ### Known limits
 
 * The duration of the first (root) session of a chain is unknown, because its start is not recorded; it shows no time.
 * Zero-width joiners and combining marks are dropped from titles and reasons, so some emoji and accented text render
   plainer than in the session.
-* A chain that spans repositories shows the pull requests of the focused session's repository only.
+* A chain that spans repositories shows the cards of the focused session's repository only; `gh pr list` reads the newest 100 pull requests of it.
 * A pane id can be reused by Herdr after a restart, so the pane checks a terminal id, process id and start time before it
   trusts its own marker.
 * The plugin that gives the "Open session side pane" action is not linked by `scripts/install.sh` (it has no plugin step).

@@ -17,7 +17,7 @@ from herdr_engineering.agent_ops_tui import visible_width
 from herdr_engineering.handoff_adapters.claude import ClaudeAdapter
 from herdr_engineering.handoff_controller.events import EventLog
 from herdr_engineering.side_pane import app, state
-from herdr_engineering.side_pane.ci_fetch import CiSchedule, CiWorker, repo_slug
+from herdr_engineering.side_pane.ci_fetch import Chain, CiSchedule, CiWorker, repo_slug
 from herdr_engineering.side_pane.ci_tab import CiCard, CiState
 from herdr_engineering.side_pane.herdr import SideHerdr
 from herdr_engineering.side_pane.model import EMPTY, SidePaneModel, build_model
@@ -147,7 +147,7 @@ def test_a_slow_ci_read_never_blocks_the_caller() -> None:
     release = threading.Event()
     card = CiCard("#1", "t", CiState.PASSED, (), None)
 
-    def slow(cwd: Path) -> tuple[CiCard, ...]:
+    def slow(cwd: Path, chain: Chain = ()) -> tuple[CiCard, ...]:
         release.wait(10)
         return (card,)
 
@@ -164,7 +164,7 @@ def test_a_slow_ci_read_never_blocks_the_caller() -> None:
 
 
 def test_a_failing_ci_read_becomes_a_typed_unavailable_result() -> None:
-    def boom(cwd: Path) -> tuple[CiCard, ...]:
+    def boom(cwd: Path, chain: Chain = ()) -> tuple[CiCard, ...]:
         raise OSError("network down")
 
     worker = CiWorker(boom, clock=time.monotonic)
@@ -177,7 +177,7 @@ def test_a_failing_ci_read_becomes_a_typed_unavailable_result() -> None:
 
 def test_ci_is_refreshed_no_faster_than_the_schedule() -> None:
     calls: list[float] = []
-    worker = CiWorker(lambda cwd: calls.append(1.0) or (), clock=time.monotonic)  # type: ignore[func-returns-value]
+    worker = CiWorker(lambda cwd, chain=(): calls.append(1.0) or (), clock=time.monotonic)  # type: ignore[func-returns-value]
     scheduler = CiSchedule(worker, interval_s=60.0)
     assert scheduler.maybe_request(Path("/w"), now=0.0)
     assert wait_for(lambda: len(calls) == 1, 5.0)
