@@ -20,6 +20,7 @@ class WipReason(StrEnum):
     PUSH_NOT_ALLOWED = "push_not_allowed"  # committed, or commits unpushed, and the caller did not allow a push
     GIT_ERROR = "git_error"  # a git command failed: the state is unknown, see `error`
     MERGE_IN_PROGRESS = "merge_in_progress"  # a merge, cherry-pick, revert or rebase is unfinished: nothing staged
+    NOTHING_STAGEABLE = "nothing_stageable"  # tracked changes the status shows, but `git add -u` stages none (a dirty submodule)
 
 
 @dataclass(frozen=True)
@@ -145,6 +146,12 @@ def wip_commit(worktree: Path, *, push_allowed: bool, timeout_s: float = 120.0) 
     if status.stdout.strip():
         before = _git(worktree, timeout_s, "rev-parse", "HEAD")
         added = _git(worktree, timeout_s, "add", "-u")
+        if added.returncode == 0:
+            staged = _git(worktree, timeout_s, "diff", "--cached", "--quiet")  # 0: nothing staged, 1: something is
+            if staged.returncode == 0:
+                return WipResult(False, None, False, unpushed, untracked, WipReason.NOTHING_STAGEABLE)
+            if staged.returncode != 1:
+                return failure(staged)
         done = added if added.returncode != 0 else _git(worktree, timeout_s, "commit", "-q", "-m", COMMIT_MESSAGE)
         after = _git(worktree, timeout_s, "rev-parse", "HEAD")
         moved = after.returncode == 0 and (before.returncode != 0 or after.stdout != before.stdout)

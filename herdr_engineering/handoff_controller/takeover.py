@@ -134,16 +134,18 @@ def stuck_reason(head: StuckReason, detail: StuckReason | str | None, last_takeo
 def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg: ControllerConfig, log: EventLog,
                  handoff: HandoffCli, herdr: HerdrCli, *, store_root: Path, worktree: Path, push_allowed: bool,
                  env: Mapping[str, str], chain_id: str | None = None, predecessor_id: str | None = None,
-                 context_pct: float | None = None, resumed: bool = False, confirm_timeout_s: float = 25.0, call_margin_s: float = 60.0,
-                 retry_delay_s: float = 2.0, compact_ready_timeout_s: float = 60.0,
+                 context_pct: float | None = None, started: bool = False, confirm_timeout_s: float = 25.0, call_margin_s: float = 60.0,
+                 retry_delay_s: float = 2.0, ready: Callable[[], bool] | None = None, compact_ready_timeout_s: float = 60.0,
                  compact_work_start_s: float = 15.0, compact_work_end_s: float = 600.0, poll_s: float = 0.5,
                  sleep: Callable[[float], None] = time.sleep,
-                 clock: Callable[[], float] = time.monotonic) -> HandoffEvent:
+                 clock: Callable[[], float] = time.monotonic) -> HandoffEvent | None:
     """Up to `cfg.max_attempts` takeovers (each preceded by a look at the record), then compaction. The returned
     event, `handoff.succeeded`, `handoff.failed_compacted` or `handoff.stuck`, is appended to `log` exactly once, after
     `handoff.takeover_started`. `--allow-dirty-source` is passed only when `push_allowed` is False: there unpushed
     commits are recorded by herdr-handoff and do not stop the close; where pushing is allowed they must be pushed.
-    `resumed`: a restart found the chain already in its compaction fallback; the attempts are not replayed."""
+    `started`: the chain's `handoff.takeover_started` is already in the log.
+    `ready` is asked right before every call to herdr-handoff, after the look at the record; when it says no, nothing is
+    called and None is returned with no terminal event: the chain goes on waiting, and the next call starts over."""
     chain = chain_id or handoff_id
 
     def event(name: str, *, colour: Colour | None = None, reason: str | None = None,
@@ -167,13 +169,13 @@ def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg:
     def stuck(why: str, view: RecordView | None = None, pane: str | None = None) -> HandoffEvent:
         return event("handoff.stuck", colour=Colour.RED, reason=why, view=view, pane=pane)
 
-    if not resumed:
+    if not started:
         event("handoff.takeover_started")
     exit_plan = adapter.exit_plan()
     timeout_s = confirm_timeout_s + exit_plan.process_end_timeout_s + call_margin_s
     last: str | None = None
     last_pane: str | None = None
-    for attempt in range(0 if resumed else cfg.max_attempts):
+    for attempt in range(cfg.max_attempts):
         if attempt:
             sleep(retry_delay_s)
         record = handoff.inspect(store_root, handoff_id)
@@ -182,6 +184,8 @@ def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg:
         view = record_view(record)
         if next_action(view) is not Action.LAUNCH:
             break
+        if ready is not None and not ready():
+            return None
         result = classify(handoff.takeover(store_root, handoff_id, parent_pane=ref.pane_id, worktree=worktree,
                                            exit_plan=exit_plan, allow_dirty=not push_allowed,
                                            confirm_timeout_s=confirm_timeout_s, timeout_s=timeout_s))
@@ -211,8 +215,7 @@ def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg:
     if pointer is None:
         return stuck(stuck_reason(StuckReason.NO_BRIEFING, "the briefing document could not be located", last), view,
                      pane)
-    if not resumed:
-        event("handoff.takeover_started", reason=COMPACTING, view=view, pane=pane)  # the log remembers: a restart goes on from here
+    event("handoff.takeover_started", reason=COMPACTING, view=view, pane=pane)  # the log remembers: a restart ends stuck, never retypes
     done = compact_with_pointer(ref, adapter, pointer, herdr, ready_timeout_s=compact_ready_timeout_s,
                                 work_start_timeout_s=compact_work_start_s, work_end_timeout_s=compact_work_end_s,
                                 poll_s=poll_s, sleep=sleep, clock=clock)
