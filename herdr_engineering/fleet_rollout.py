@@ -187,6 +187,142 @@ def create_rollout(store, revision, targets, *, inventory):
     return plan
 
 
+# --- #844: one pinned target, one resumable rollout, bounded state ------------
+
+PI_ROLLOUT_PIN_ENV = "HERDR_PI_ROLLOUT_REVISION"
+
+
+def default_pin_path() -> Path:
+    """Where the pinned Pi revision lives: one 40-hex line, next to the deployment pointer."""
+    return Path.home() / ".config" / "herdr-engineering" / "pi-rollout-revision"
+
+
+def read_pin(path: Path | None = None) -> str | None:
+    """The pinned Pi revision: the env override, then the pin file; None when unpinned.
+
+    An invalid pin fails closed: rolling out a mangled revision is worse than no rollout.
+    """
+    env = os.environ.get(PI_ROLLOUT_PIN_ENV, "").strip()
+    if env:
+        if not SHA.fullmatch(env):
+            raise ValueError(
+                f"{PI_ROLLOUT_PIN_ENV} must be a full lowercase 40-character commit SHA"
+            )
+        return env
+    pin_file = Path(path) if path else default_pin_path()
+    try:
+        revision = pin_file.read_text().strip()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"cannot read pi rollout pin {pin_file}: {exc.strerror or exc}") from exc
+    if not SHA.fullmatch(revision):
+        raise ValueError(
+            f"pi rollout pin {pin_file} must hold a full lowercase 40-character commit SHA"
+        )
+    return revision
+
+
+def write_pin(revision: str, path: Path | None = None) -> Path:
+    if not SHA.fullmatch(revision):
+        raise ValueError("pi rollout pin must be a full lowercase 40-character commit SHA")
+    pin_file = Path(path) if path else default_pin_path()
+    pin_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=pin_file.parent, prefix=".pin-")
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(revision + "\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, pin_file)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return pin_file
+
+
+def resolve_plan_revision(explicit: str | None = None, pin: Path | None = None) -> str:
+    """The plan's target: an explicit SHA wins, then the pin, else fail closed."""
+    if explicit:
+        if not SHA.fullmatch(explicit):
+            raise ValueError("pi-revision must be a full lowercase 40-character commit SHA")
+        return explicit
+    pinned = read_pin(pin)
+    if pinned is None:
+        raise ValueError(
+            "no --pi-revision given and no pinned pi revision "
+            f"(write {default_pin_path()} to pin one)"
+        )
+    return pinned
+
+
+def list_rollouts(store) -> list:
+    """Every stored plan, validated. A corrupt record fails closed: the directory is the record."""
+    if not store.root.exists():
+        return []
+    return [
+        store.read(entry.stem)
+        for entry in sorted(store.root.iterdir())
+        if entry.is_file() and re.fullmatch(r"[0-9a-f]{32}\.json", entry.name)
+    ]
+
+
+def latest_unfinished(store):
+    """The newest plan that has not settled (complete/abandoned), or None.
+
+    The selector the unattended driver uses to resume instead of minting: a rollout is
+    durable state, so the next attempt must continue it rather than start a parallel one (#844).
+    """
+    unfinished = [
+        plan
+        for plan in list_rollouts(store)
+        if plan.get("status") not in ("complete", "abandoned")
+    ]
+    if not unfinished:
+        return None
+    return max(unfinished, key=lambda plan: (plan.get("createdAt", ""), plan["id"]))
+
+
+def abandon_rollout(store, rollout_id, *, reason: str = "abandoned by operator"):
+    """Settle a rollout the operator no longer wants; settled plans are prunable and invisible."""
+    with store.lock():
+        plan = store.read(rollout_id)
+        if plan.get("status") == "complete":
+            raise ValueError("a complete rollout cannot be abandoned")
+        if plan.get("status") == "abandoned":
+            raise ValueError("rollout is already abandoned")
+        plan["status"] = "abandoned"
+        plan["abandonedAt"] = datetime.now(UTC).isoformat()
+        plan["abandonReason"] = reason[:500]
+        store.write(plan)
+    return plan
+
+
+def prune_settled(store, *, older_than_days: int = 30, now=None) -> list:
+    """Delete settled (complete/abandoned) plans older than the horizon; return what left.
+
+    Unsettled plans are never touched: a blocked rollout may be the operator's next action,
+    and only a deliberate abandon marks it done. A settled record whose settle time is
+    unreadable is kept, never guessed.
+    """
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(days=older_than_days)
+    pruned = []
+    for plan in list_rollouts(store):
+        if plan.get("status") not in ("complete", "abandoned"):
+            continue
+        settled = (plan.get("runner") or {}).get("lastPassAt") or plan.get("createdAt")
+        try:
+            when = datetime.fromisoformat(settled)
+        except (TypeError, ValueError):
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        if when < cutoff:
+            (store.root / (plan["id"] + ".json")).unlink()
+            pruned.append({"id": plan["id"], "status": plan["status"], "settledAt": settled})
+    return pruned
+
+
 def _stderr_diagnostic(stderr):
     # Extract only known diagnostic categories, never echo arbitrary remote logs.
     # Even unexpected secret-bearing stderr therefore stays out of durable state.
@@ -661,9 +797,18 @@ def _operation(plan, state, key, action, fields, transport, target, root, save):
 
 
 def _retryable_skip(receipt):
+    """A skip the next pass can retry instead of an operator-level block.
+
+    The Pi runtime reports not-yet as `status: busy` (runtime_not_ready, mission planning
+    or recovering, custody changed, no local resumable controller - orchestrator.ts /
+    runtimeMaintenance.ts) and the interactive session being busy as the
+    `INTERACTIVE_BUSY` code. Both are time, not attention: retrying with a fresh
+    operation is the only thing that can converge them (#844).
+    """
     result = receipt.get("result") or {}
     return receipt["status"] == "skipped" and (
-        result.get("status") == "busy" or result.get("code") == "STALE_MISSION_FENCE"
+        result.get("status") == "busy"
+        or result.get("code") in ("STALE_MISSION_FENCE", "INTERACTIVE_BUSY")
     )
 
 
@@ -757,6 +902,13 @@ def _session(plan, state, transport, target, root, save):
         else:
             state["status"] = "bootstrap_required"
             state["error"] = "Runtime activated, but stable Host still needs the selected release"
+            # A hot reload never changes hostCommit, so no pass can fix this: record the
+            # operator-facing step in durable state, not just the report (#844).
+            state["nextStep"] = (
+                f"restart the stable Pi Host on {target['host']} so it loads release "
+                f"{plan['revision']} (e.g. `herdr` restart / new terminal on that host), "
+                "then resume this rollout"
+            )
             return
     if not isinstance(missions, list) or any(not isinstance(m, dict) for m in missions):
         raise ValueError("missing owned mission inventory after activation")

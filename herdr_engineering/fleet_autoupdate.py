@@ -35,6 +35,10 @@ ENTRY_PATH_ZERO = _entry.PATH_ZERO
 SKIP_PREVIEW_FILES = 8
 STATE_NAME = "fleet-auto-update.json"
 
+#: Bounded passes per nightly run: unreachable hosts keep retrying on later days (the
+#: rollout state is durable), so a short drain window fits the timer's budget (#844).
+PI_ROLLOUT_MAX_PASSES = 3
+
 
 class SkipUpdate(RuntimeError):
     """A precondition the operator must resolve; reported as a skip, not a failure."""
@@ -218,7 +222,60 @@ def run_update() -> dict:
             )
         # fleet_update performs the origin/main fast-forward, installation,
         # service convergence and status verification, failing on any error.
-        return fleet_update()
+        result = fleet_update()
+        if result.get("ok"):
+            result["pi_rollout"] = pi_rollout_step(root)
+        else:
+            result["pi_rollout"] = {"status": "skipped", "reason": "controller update not ok"}
+        return result
+
+
+def pi_rollout_step(root: Path, *, store=None) -> dict:
+    """Drain the fleet's Pi runtime rollout toward the pinned revision (#844).
+
+    The step resumes the newest unfinished rollout instead of minting a parallel one,
+    and only ever targets the pinned revision: plans for other revisions are the
+    operator's to settle (abandon) or finish. Skips (no pin, mismatched unfinished
+    plan) are normal, recorded outcomes; only store/transport errors raise and turn
+    the run red.
+    """
+    from . import fleet_rollout
+
+    store = store or fleet_rollout.RolloutStore()
+    pin = fleet_rollout.read_pin()
+    if pin is None:
+        return {
+            "status": "skipped",
+            "reason": (
+                "no pinned pi revision (write ~/.config/herdr-engineering/"
+                "pi-rollout-revision to enable unattended Pi runtime rollouts)"
+            ),
+        }
+    plan = fleet_rollout.latest_unfinished(store)
+    if plan is not None and plan["revision"] != pin:
+        return {
+            "status": "skipped",
+            "id": plan["id"],
+            "reason": (
+                f"unfinished rollout {plan['id']} targets {plan['revision'][:12]}; pin is "
+                f"{pin[:12]} - abandon it or settle it before the pinned revision can drain"
+            ),
+        }
+    if plan is None:
+        inventory = root / "ansible" / "inventory" / "hosts.yml"
+        plan = fleet_rollout.create_rollout(
+            store, pin, fleet_rollout.inventory_targets(inventory, None), inventory=inventory
+        )
+    report = fleet_rollout.run_rollout(
+        store, plan["id"], interval_seconds=30, max_passes=PI_ROLLOUT_MAX_PASSES
+    )
+    pruned = fleet_rollout.prune_settled(store)
+    return {
+        "status": report.get("status"),
+        "runner": (report.get("runner") or {}).get("status"),
+        "id": plan["id"],
+        "pruned": [entry["id"] for entry in pruned],
+    }
 
 
 def failure_reason(report: dict) -> str | None:
@@ -261,13 +318,16 @@ def main() -> int:
         if detail:
             report["detail"] = detail
         record_run("skipped", reason=str(exc), detail=detail or None)
-    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         report = {"ok": False, "error": str(exc)}
         record_run("failed", reason=str(exc), detail=runner or None)
     else:
+        detail = dict(runner) if runner else None
+        if "pi_rollout" in report:
+            detail = {**(detail or {}), "pi_rollout": report["pi_rollout"]}
         record_run("updated" if report.get("ok") else "failed",
                    reason=failure_reason(report), revision=report.get("revision"),
-                   detail=runner or None)
+                   detail=detail)
     print(json.dumps(report, sort_keys=True))
     return 0 if report.get("ok") else 1
 

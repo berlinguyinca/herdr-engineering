@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: Pi fleet rollouts converge - pinned target, resumable drain, bounded state (#844)
+
+- **Pin the target**: `~/.config/herdr-engineering/pi-rollout-revision` (one 40-hex SHA; `HERDR_PI_ROLLOUT_REVISION` overrides) is now the canonical Pi runtime revision. `fleet rollout plan` falls back to it when `--pi-revision` is omitted and fails closed without one; an invalid pin is a failure, never a fallback.
+- **Resume, don't re-mint**: new `fleet rollout latest` selector returns the newest unsettled plan (never `complete`/`abandoned`); the daily controller (`fleet_autoupdate`) now drains it after each successful controller update with a bounded pass window (`max_passes=3`) and mints a plan only when nothing unfinished exists - and only for the pinned revision. A mismatched unfinished plan is reported, not resumed: settle it with the new `fleet rollout abandon --id ... [--reason ...]` (refused for complete rollouts) or finish it.
+- **Transient classification**: resume skips with `INTERACTIVE_BUSY` (a busy interactive session) now retry with a fresh operation instead of blocking the rollout forever; the Pi runtime's other not-yet conditions already report `busy` and were retried once a driver ran the passes. `bootstrap_required` sessions record a durable operator-facing `nextStep` (restart the stable Pi Host on that host so it loads the selected release).
+- **Bound the state**: `fleet rollout prune [--older-than-days N]` (default 30) deletes settled records, judged by last pass or creation time; unsettled records are never touched. The daily driver prunes after each drain, and its pi-step result is recorded in the unattended run state so a skipped or blocked drain is visible without the journal.
+
 ### Chore: pin herdr-handoff 0.5.0
 
 - `lock/upstreams.yaml` pins herdr-handoff to `aed3e8274e6948a774682a55d99b7cd9ef113914` (herdr-handoff#12, v0.5.0: shared handoff store, one takeover per handoff id, `takeover --direction`, `--relaunch`). `check_handoff_dependency` now also requires that `herdr-handoff takeover --help` lists `--direction` (reported as `takeover --direction`, naming 0.5.0), so `herdr-eng doctor` reports an installed 0.4.0 as too old until `scripts/install-handoff.sh` is run.

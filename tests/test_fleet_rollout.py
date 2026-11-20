@@ -2149,3 +2149,227 @@ def test_revived_session_restarts_maintenance_instead_of_reusing_old_receipts(
             "lastStatus": old["status"],
         }
     ]
+
+
+# --- #844: convergence -------------------------------------------------------
+
+
+def test_interactive_busy_resume_skip_retries_next_pass(tmp_path):
+    """A busy interactive session is a not-yet, not an operator blocker: the next pass
+    re-issues the resume with a fresh operation instead of parking the rollout blocked."""
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    original = wire.maintenance
+    attempts = []
+
+    def interactive_busy_once(target, root, instance, request):
+        if request["action"] == "resume":
+            attempts.append(request["operationId"])
+            if len(attempts) == 1:
+                return {
+                    "maintenance": {
+                        "operationId": request["operationId"],
+                        "action": "resume",
+                        "status": "skipped",
+                        "result": {
+                            "status": "skipped",
+                            "code": "INTERACTIVE_BUSY",
+                            "reason": "interactive session is busy or idle state is unknown",
+                            "missionId": "M1",
+                        },
+                    }
+                }
+        return original(target, root, instance, request)
+
+    wire.maintenance = interactive_busy_once
+    first = apply(store, plan, wire)
+    state = first["hosts"]["bender"]["sessions"]["bender-conversation"]
+    assert state["status"] in ("pending", "awaiting_progress")
+    assert state["status"] != "blocked"
+    second = apply(store, plan, wire)
+    assert len(attempts) == 2 and attempts[0] != attempts[1]
+    assert (
+        second["hosts"]["bender"]["sessions"]["bender-conversation"]["status"]
+        == "awaiting_progress"
+    )
+
+
+def test_bootstrap_required_records_operator_next_step(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.rows["bender"]["reply"]["data"]["runtime"]["hostCommit"] = "b" * 40
+    result = apply(store, plan, wire)
+    state = result["hosts"]["bender"]["sessions"]["bender-conversation"]
+    assert state["status"] == "bootstrap_required"
+    next_step = state.get("nextStep", "")
+    assert "bender" in next_step
+    assert SHA in next_step
+    # The next step survives in durable state, not just in the report.
+    reread = store.read(plan["id"])
+    assert (
+        reread["hosts"]["bender"]["sessions"]["bender-conversation"]["nextStep"] == next_step
+    )
+
+
+def _make_plan(store, revision, *, status, created_at, hosts=("bender",)):
+    from herdr_engineering.fleet_rollout import create_rollout
+
+    plan = create_rollout(
+        store,
+        revision,
+        [{"host": h, "sshTarget": h, "port": 22, "local": False} for h in hosts],
+        inventory=store.root.parent / "inventory.yml",
+    )
+    if status != "planned" or created_at:
+        plan = store.read(plan["id"])
+        plan["status"] = status
+        if created_at:
+            plan["createdAt"] = created_at
+        store.write(plan)
+    return plan
+
+
+def test_latest_unfinished_prefers_newest_and_skips_settled(tmp_path):
+    from herdr_engineering.fleet_rollout import RolloutStore, latest_unfinished, list_rollouts
+
+    store = RolloutStore(tmp_path / "state")
+    assert latest_unfinished(store) is None  # no state directory at all
+    rev_a = "1" * 40
+    rev_b = "2" * 40
+    old_complete = _make_plan(store, rev_a, status="complete", created_at="2026-11-01T00:00:00+00:00")
+    old_abandoned = _make_plan(store, rev_a, status="abandoned", created_at="2026-11-05T00:00:00+00:00")
+    newer = _make_plan(store, rev_b, status="pending", created_at="2026-11-10T00:00:00+00:00")
+    assert latest_unfinished(store)["id"] == newer["id"]
+    other = _make_plan(store, store.read(newer["id"])["revision"], status="abandoned",
+                       created_at="2026-11-11T00:00:00+00:00")
+    assert latest_unfinished(store)["id"] == newer["id"]
+    plan = store.read(newer["id"])
+    plan["status"] = "complete"
+    store.write(plan)
+    assert latest_unfinished(store) is None
+    assert {old_complete["id"], old_abandoned["id"], newer["id"], other["id"]} == {
+        p["id"] for p in list_rollouts(store)
+    }
+
+
+def test_latest_unfinished_tie_breaks_deterministically_and_fails_closed(tmp_path):
+    from herdr_engineering.fleet_rollout import RolloutStore, latest_unfinished
+
+    store = RolloutStore(tmp_path / "state")
+    a = _make_plan(store, "3" * 40, status="planned", created_at="2026-11-10T00:00:00+00:00")
+    b = _make_plan(store, "4" * 40, status="planned", created_at="2026-11-10T00:00:00+00:00")
+    first = latest_unfinished(store)
+    second = latest_unfinished(store)
+    assert first["id"] == second["id"]
+    assert first["id"] == max(a["id"], b["id"])
+    (store.root / ("f" * 32 + ".json")).write_text("not json")
+    try:
+        with pytest.raises(ValueError):
+            latest_unfinished(store)
+    finally:
+        (store.root / ("f" * 32 + ".json")).unlink()
+
+
+def test_pin_roundtrip_env_override_and_rejects_bad_values(tmp_path, monkeypatch):
+    from herdr_engineering.fleet_rollout import read_pin, write_pin
+
+    pin = tmp_path / "pin"
+    assert read_pin(pin) is None
+    write_pin(SHA, pin)
+    assert read_pin(pin) == SHA
+    assert (pin).stat().st_mode & 0o777 == 0o600
+    for bad in ("abc", "B" * 40, SHA + "0"):
+        with pytest.raises(ValueError):
+            write_pin(bad, pin)
+        assert read_pin(pin) == SHA  # a rejected write never clobbers the pin
+        pin.write_text(bad + "\n")
+        with pytest.raises(ValueError):
+            read_pin(pin)  # an invalid on-disk pin fails closed too
+        write_pin(SHA, pin)
+    other = "5" * 40
+    write_pin(other, pin)
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", SHA)
+    assert read_pin(pin) == SHA  # the env pin outranks the file
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", "not-a-sha")
+    try:
+        with pytest.raises(ValueError):
+            read_pin(pin)
+    finally:
+        monkeypatch.delenv("HERDR_PI_ROLLOUT_REVISION")
+    assert read_pin(pin) == other
+
+
+def test_resolve_plan_revision_prefers_explicit_then_pin(tmp_path, monkeypatch):
+    from herdr_engineering.fleet_rollout import resolve_plan_revision
+
+    pin = tmp_path / "pin"
+    try:
+        with pytest.raises(ValueError):
+            resolve_plan_revision(None, pin)
+    except ValueError as exc:
+        assert "pi-rollout-revision" in str(exc)
+    other = "6" * 40
+    write = __import__("herdr_engineering.fleet_rollout", fromlist=["write_pin"]).write_pin
+    write(other, pin)
+    assert resolve_plan_revision(None, pin) == other
+    assert resolve_plan_revision(SHA, pin) == SHA
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", "7" * 40)
+    assert resolve_plan_revision(None, pin) == "7" * 40
+    try:
+        with pytest.raises(ValueError):
+            resolve_plan_revision("bad", pin)
+    finally:
+        monkeypatch.delenv("HERDR_PI_ROLLOUT_REVISION")
+
+
+def test_abandon_settles_and_complete_cannot_be_abandoned(tmp_path):
+    from herdr_engineering.fleet_rollout import RolloutStore, abandon_rollout, latest_unfinished
+
+    store = RolloutStore(tmp_path / "state")
+    plan = _make_plan(store, "8" * 40, status="pending", created_at="2026-11-01T00:00:00+00:00")
+    abandoned = abandon_rollout(store, plan["id"], reason="superseded by pinned revision")
+    assert abandoned["status"] == "abandoned"
+    assert abandoned["abandonReason"] == "superseded by pinned revision"
+    assert "abandonedAt" in abandoned
+    assert latest_unfinished(store) is None
+    with pytest.raises(ValueError):
+        abandon_rollout(store, plan["id"])
+    done = _make_plan(store, "9" * 40, status="complete", created_at="2026-11-02T00:00:00+00:00")
+    with pytest.raises(ValueError):
+        abandon_rollout(store, done["id"])
+
+
+def test_prune_settled_deletes_only_old_settled_records(tmp_path):
+    from herdr_engineering.fleet_rollout import RolloutStore, list_rollouts, prune_settled
+
+    store = RolloutStore(tmp_path / "state")
+    old_complete = _make_plan(store, "a" * 39 + "b", status="complete",
+                              created_at="2026-10-01T00:00:00+00:00")
+    recent_complete = _make_plan(store, "a" * 39 + "c", status="complete",
+                                 created_at="2026-11-15T00:00:00+00:00")
+    old_pending = _make_plan(store, "a" * 39 + "d", status="pending",
+                             created_at="2026-10-01T00:00:00+00:00")
+    # A recently passed runner keeps an old plan alive.
+    old_runner = _make_plan(store, "a" * 39 + "e", status="complete",
+                            created_at="2026-10-01T00:00:00+00:00")
+    plan = store.read(old_runner["id"])
+    plan["runner"] = {"status": "complete", "lastPassAt": "2026-11-16T00:00:00+00:00"}
+    store.write(plan)
+    from datetime import UTC, datetime
+
+    pruned = prune_settled(store, older_than_days=30, now=datetime(2026, 11, 17, tzinfo=UTC))
+    assert [p["id"] for p in pruned] == [old_complete["id"]]
+    remaining = {p["id"] for p in list_rollouts(store)}
+    assert remaining == {recent_complete["id"], old_pending["id"], old_runner["id"]}
+    assert not (store.root / (old_complete["id"] + ".json")).exists()
+
+
+def test_rollout_convergence_commands_are_registered():
+    from herdr_engineering.cli import _build_parser
+
+    parser = _build_parser()
+    assert parser.parse_args(["fleet", "rollout", "latest"]).rollout_command == "latest"
+    assert parser.parse_args(["fleet", "rollout", "abandon", "--id", "1" * 32]).rollout_command == "abandon"
+    assert parser.parse_args(["fleet", "rollout", "prune", "--older-than-days", "7"]).older_than_days == 7
+    # --pi-revision is optional: the pin is the fallback target.
+    assert parser.parse_args(["fleet", "rollout", "plan"]).pi_revision is None

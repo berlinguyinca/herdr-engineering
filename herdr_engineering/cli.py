@@ -439,14 +439,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pr = fsub.add_parser("rollout", help="durable Pi runtime update and mission recovery")
     rsub = pr.add_subparsers(dest="rollout_command", required=True)
-    for action in ("plan", "apply", "run", "status"):
+    for action in ("plan", "apply", "run", "status", "latest"):
         rp = rsub.add_parser(action)
         rp.add_argument("--state", default=None, help="private rollout state directory")
         if action == "plan":
-            rp.add_argument("--pi-revision", required=True, help="full immutable Pi commit SHA")
+            rp.add_argument("--pi-revision", default=None,
+                            help="full immutable Pi commit SHA; defaults to the pinned "
+                                 "revision (~/.config/herdr-engineering/pi-rollout-revision)")
             rp.add_argument("--host", default=None)
             rp.add_argument("--inventory", default=None)
-        else:
+        elif action != "latest":
             rp.add_argument("--id", required=True, help="rollout ID printed by plan")
         if action == "run":
             rp.add_argument("--interval-seconds", type=int, default=30, help="initial retry interval, 1..3600 (backoff caps at max(interval, 300))")
@@ -466,6 +468,25 @@ def _build_parser() -> argparse.ArgumentParser:
         default="operator",
         help="who is settling the registration; recorded per session in the report",
     )
+    rp.set_defaults(func=_cmd_fleet_rollout)
+
+    rp = rsub.add_parser(
+        "abandon",
+        help="settle a rollout the operator no longer wants (e.g. it targets an unpinned "
+        "revision); the record stays until pruned, and the newest unfinished selector "
+        "moves on",
+    )
+    rp.add_argument("--state", default=None, help="private rollout state directory")
+    rp.add_argument("--id", required=True, help="rollout ID printed by plan")
+    rp.add_argument("--reason", default="abandoned by operator", help="why; recorded in the plan")
+    rp.set_defaults(func=_cmd_fleet_rollout)
+
+    rp = rsub.add_parser(
+        "prune",
+        help="delete settled (complete/abandoned) rollout records older than the horizon",
+    )
+    rp.add_argument("--state", default=None, help="private rollout state directory")
+    rp.add_argument("--older-than-days", type=int, default=30, help="settle horizon (default 30)")
     rp.set_defaults(func=_cmd_fleet_rollout)
 
     # artifacts ------------------------------------------------------------
