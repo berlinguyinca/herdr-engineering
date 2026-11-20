@@ -21,9 +21,11 @@ its own locking. Busy checks compare (device, inode), never path spelling. On Li
    from the kernel (the /proc cwd, exe and fd links, the maps dev:inode columns), so a process in another mount
    namespace (a devcontainer, a rootless container) is seen. The scan runs in a child with a deadline
    (``HERDR_BUSY_CHECK_SECONDS``, default 120): on timeout the sweep stops, reports "busy check timed out"
-   and releases its lock. Every uid's process is scanned where /proc lets us read it. Limit: where it does
-   not (``hidepid``, macOS without root, where ``lsof`` lists only this user's files) a target used by
-   another uid's process is NOT detected.
+   and releases its lock. Limit, stated plainly: without root (or CAP_SYS_PTRACE) the kernel's ptrace check makes
+   another uid's cwd, exe, fd and maps unreadable (``hidepid`` or not), so only this user's processes, and those
+   in user namespaces this user owns (rootless containers), are detected. Root services, ``sudo``-run binaries
+   and rootful containers running as a different uid are NOT; neither on macOS, where ``lsof`` lists only this
+   user's files. Such a process, and this user's own non-dumpable ones (``sudo -i``, ``ping``), is skipped.
 
 Targets are skipped when a build lease covers them, when git tracks files in them, or when anything inside
 looks foreign (links, special files, other owners). Only current-user Cargo ``target`` directories inside
@@ -44,6 +46,7 @@ import logging
 import math
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -323,6 +326,17 @@ def _scan(proc: Path = Path("/proc")) -> list[Hold]:
         except PermissionError:
             if _gone_or_zombie(pid):  # became a zombie or exited since the check above
                 continue
+            try:
+                # a non-dumpable process keeps its /proc/<pid> owner but its ``fd`` entry turns root-owned
+                foreign = pid.stat().st_uid != os.getuid()
+                try:
+                    foreign = foreign or (pid / "fd").stat().st_uid != os.getuid()
+                except PermissionError:
+                    pass  # not even stat-able: unverifiable, handled as this user's own below
+            except OSError:
+                continue  # exited meanwhile
+            if foreign:
+                continue  # another user's process, or this user's non-dumpable one (``sudo``, ``ping``): root-owned
             if _managed_process(pid, proc):
                 raise
             # Nondumpable daemons outside Herdr cannot be managed build jobs.
@@ -505,35 +519,61 @@ def _busy_reason(holds: list[Hold], target: Path) -> str | None:
     return None
 
 
-_BUSY_CHILD = "import sys; from herdr_engineering import build_cleanup as c; c._busy_child(sys.argv[1])"
+_BUSY_CHILD = "import sys; from herdr_engineering import build_cleanup as c; c._busy_child(sys.argv[1], int(sys.argv[2]))"
 _BUSY_SECONDS = 120.0  # the scan of a normal host takes a second; ``HERDR_BUSY_CHECK_SECONDS`` overrides
 
 
-def _busy_child(target: str) -> None:
-    try:
-        print(json.dumps({"busy": _busy_reason(_scan(), Path(target))}))
+def _busy_child(target: str, sweeper: int) -> None:
+    try:  # the sweeper that asked is not a holder: it may be run from inside the project it sweeps
+        holds = [hold for hold in _scan() if hold[0] != sweeper]
+        print(json.dumps({"busy": _busy_reason(holds, Path(target))}))
     except (OSError, ValueError) as exc:
         print(json.dumps({"error": str(exc)}))
 
 
+def _busy_deadline() -> float:
+    raw = os.environ.get("HERDR_BUSY_CHECK_SECONDS")
+    if not raw:
+        return _BUSY_SECONDS
+    try:
+        seconds = float(raw)
+    except ValueError:
+        seconds = math.nan
+    if not math.isfinite(seconds) or seconds <= 0:
+        log.warning("ignoring HERDR_BUSY_CHECK_SECONDS=%r (not a positive number); using %g", raw, _BUSY_SECONDS)
+        return _BUSY_SECONDS
+    return seconds
+
+
 def _busy_check(target: Path) -> str | None:
     """``_busy_reason`` over a fresh process scan, run in a child with a deadline so that a stat that hangs
-    (a dead NFS or sshfs mount a process sits on) can never hang the sweep or a build's disk guard. A child
-    that does not answer in time is killed and left (it may be unkillable); the caller fails closed."""
-    seconds = float(os.environ.get("HERDR_BUSY_CHECK_SECONDS") or _BUSY_SECONDS)
+    (a dead NFS or sshfs mount a process sits on) can never hang the sweep or a build's disk guard. The child
+    runs from ``/`` without the script directory on its path (the sweeper's cwd is a user workspace). One that
+    does not answer in time, or any other failure here, gets its whole process group killed (``lsof``
+    included) and is left unwaited if it is stuck in the kernel; the caller fails closed."""
+    seconds = _busy_deadline()
     root = str(Path(__file__).resolve().parent.parent)
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [root, os.environ.get("PYTHONPATH")]))}
-    child = subprocess.Popen([sys.executable, "-c", _BUSY_CHILD, str(target)], stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, text=True, env=env, start_new_session=True)
+    child = subprocess.Popen([sys.executable, "-P", "-c", _BUSY_CHILD, str(target), str(os.getpid())],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env, cwd="/",
+                             start_new_session=True)
+    answered = False
     try:
-        out, _ = child.communicate(timeout=seconds)
-    except subprocess.TimeoutExpired as exc:
-        child.kill()
         try:
-            child.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            pass  # stuck in the kernel: abandoned, never waited for
-        raise TimeoutError(f"busy check timed out after {seconds:g} s") from exc
+            out, _ = child.communicate(timeout=seconds)
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"busy check timed out after {seconds:g} s") from exc
+        answered = True
+    finally:
+        if not answered:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass  # stuck in the kernel: abandoned, never waited for
     try:
         answer = json.loads(out.splitlines()[-1])
     except (IndexError, ValueError) as exc:
@@ -957,9 +997,11 @@ def _clean_idle(target: Path, name: str, cutoff: float, state_dir: Path, result:
         return skip("recent activity")
     if not _recognized(target):
         raise OSError(f"Target no longer recognized as a Cargo output: {name}")
+    if _skip_for_registry(state_dir, target, name, result):  # cheap: a leased target needs no scan
+        return False
     if _blocked_by_process(target, name, result):
         return False
-    if _skip_for_registry(state_dir, target, name, result):  # read last: a lease taken during the scan counts
+    if _skip_for_registry(state_dir, target, name, result):  # read again: a lease taken during the scan counts
         return False
     if result["dry_run"]:
         result["would_remove"].append(name)

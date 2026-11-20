@@ -107,9 +107,12 @@ The default-on job is narrow. It deletes exactly two kinds of target and nothing
    columns of `maps`), so a process in another mount namespace (devcontainer, rootless container) is seen even
    though its path does not exist here. The scan runs in a child process with a deadline
    (`HERDR_BUSY_CHECK_SECONDS`, default 120 s) so a dead NFS/sshfs mount cannot hang a sweep or a build's guard;
-   on timeout nothing is cleaned, the sweep reports "busy check timed out" and releases its lock. Processes of
-   every uid are scanned where `/proc` is readable. Where it is not (`hidepid`, macOS without root) a target
-   used by another user's process is not detected; do not share targets across users.
+   on timeout nothing is cleaned, the sweep reports "busy check timed out" and releases its lock. What can be
+   seen is limited by the kernel, not by a setting: without root (or `CAP_SYS_PTRACE`) another uid's cwd, exe,
+   fd and maps are unreadable even without `hidepid`, so only this user's processes and processes in user
+   namespaces this user owns (rootless containers) are detected. Root services (a systemd unit running
+   `target/release/svc`), `sudo`-run binaries and rootful containers with a different uid are **not** detected,
+   nor are any other user's processes on macOS. Do not run such processes from a managed target.
    Paths are compared by identity, never by spelling: the busy check stats each process path and its ancestors and
    compares (device, inode) with the target and the workspace, so a root typed as `~/work` for `~/Work`, a symlink
    or a bind mount still matches. Ownership is also recorded outside the target, in

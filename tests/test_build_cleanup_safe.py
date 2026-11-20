@@ -731,20 +731,47 @@ def test_an_orphan_that_a_live_cargo_builds_into_is_kept(root):
 
 # --- round 13: identity from the kernel, a bounded busy check, a markerless target that is still cleanable --
 
-def _in_another_mount_namespace(source: Path, tmp_path: Path) -> tuple[subprocess.Popen, Path]:
-    """A real process (``bwrap`` mount namespace) whose cwd is ``source`` bound at a path that does not exist
-    on this host, as in a devcontainer or a rootless container under the same uid."""
+_HOLDS = {  # how the process in the other namespace holds the bound tree, and the path it then holds
+    "target": ("target", "", None),
+    "workspace": ("workspace", "", None),
+    "cwd below the bind root": ("workspace", "src", None),
+    "open descriptor": ("target", "", "exec sleep 120 < {inside}/CACHEDIR.TAG"),
+    "mapped file": ("target", "", None),
+    "executable": ("target", "", None),
+}
+
+
+def _in_another_mount_namespace(kind: str, target: Path, tmp_path: Path) -> tuple[subprocess.Popen, Path]:
+    """A real process (``bwrap`` mount namespace, as a devcontainer or rootless container would be) that holds
+    part of ``target``'s tree through a path that does not exist on this host. ``kind`` picks the way it holds
+    it: cwd (at the bind root or below it), an open descriptor, a mapping whose descriptor is closed, or its
+    own executable. Returns the process and the path it sees (what ``_scan`` reports)."""
     if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
         pytest.skip("needs Linux and bubblewrap")
+    source_name, below, shell = _HOLDS[kind]
+    source = target if source_name == "target" else target.parent
     view = tmp_path / "ns-view"
     view.mkdir()
     inside = view / "workspace"
+    held = inside / below if below else inside
+    command = ["sleep", "120"]
+    chdir = held
+    if shell:
+        command, chdir, held = ["sh", "-c", shell.format(inside=inside)], Path("/"), inside / "CACHEDIR.TAG"
+    elif kind == "mapped file":
+        mapped = inside / "CACHEDIR.TAG"
+        command = [sys.executable, "-c", f"import mmap, time; f = open({str(mapped)!r}, 'rb'); "
+                   "m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ); f.close(); time.sleep(120)"]
+        chdir, held = Path("/"), mapped
+    elif kind == "executable":
+        shutil.copy(shutil.which("sleep"), target / "debug" / "napper")
+        command, chdir, held = [str(inside / "debug" / "napper"), "120"], Path("/"), inside / "debug" / "napper"
     proc = subprocess.Popen(
         ["bwrap", "--die-with-parent", "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-         "--tmpfs", str(view), "--bind", str(source), str(inside), "--chdir", str(inside), "sleep", "120"],
+         "--tmpfs", str(view), "--bind", str(source), str(inside), "--chdir", str(chdir), *command],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
     try:
-        _wait_for(lambda: proc.poll() is not None or any(hold[3] == inside for hold in cleanup._scan()),
+        _wait_for(lambda: proc.poll() is not None or any(hold[3] == held for hold in cleanup._scan()),
                   "the namespaced process to be seen")
         if proc.poll() is not None:
             pytest.skip(f"cannot create a mount namespace here: {proc.stderr.read().decode().strip()}")
@@ -752,19 +779,19 @@ def _in_another_mount_namespace(source: Path, tmp_path: Path) -> tuple[subproces
         _stop(proc)
         raise
     assert not inside.exists(), "the namespaced path must not exist in this namespace"
-    return proc, inside
+    return proc, held
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("what", ["target", "workspace"])
-def test_a_process_in_another_mount_namespace_keeps_the_target(root, tmp_path, what):
+@pytest.mark.parametrize("kind", list(_HOLDS))
+def test_a_process_in_another_mount_namespace_keeps_the_target(root, tmp_path, kind):
     target = local_target(root)
-    proc, inside = _in_another_mount_namespace(target if what == "target" else target.parent, tmp_path)
+    proc, held = _in_another_mount_namespace(kind, target, tmp_path)
     try:
         _age(target, 48)
         result = sweep(root)
         assert result["removed"] == [] and target.exists(), result
-        assert result["blocked"] and f"uses {inside}" in result["blocked"][0]["reason"], result
+        assert result["blocked"] and f"uses {held}" in result["blocked"][0]["reason"], result
     finally:
         _stop(proc)
     _age(target, 48)
@@ -792,3 +819,87 @@ def test_an_idle_markerless_managed_target_is_cleaned_and_its_marker_restored(ro
     assert sweep(root)["removed"] == [str(target)]
     assert (target / TARGET_MARKER).is_file() and (target / "CACHEDIR.TAG").is_file()
     assert prepare_target(root / "sccache", workspace) == target
+
+
+# --- round 14: non-dumpable processes, the child's cwd and exclusions, the deadline, leases first ----------
+
+_NON_DUMPABLE = "import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); time.sleep(120)"
+
+
+@pytest.mark.integration
+def test_a_non_dumpable_process_under_herdr_does_not_abort_the_scan(root, tmp_path):
+    """The user's own non-dumpable processes (``sudo -i``, ``ping``) show as root-owned and refuse
+    ``fd/``. One that descends from a process named herdr must be skipped, not turn into a failed sweep."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("needs /proc")
+    herdr = tmp_path / "herdr"
+    shutil.copy(shutil.which("sh"), herdr)  # a real process named herdr, as the ancestry check looks for
+    target = local_target(root)
+    proc = subprocess.Popen([str(herdr), "-c", f"{sys.executable} -c '{_NON_DUMPABLE}'; true"],
+                            start_new_session=True)
+    try:
+        _wait_for(lambda: _refuses_fd_listing(proc.pid), "the non-dumpable child to refuse fd/")
+        cleanup._scan()  # must not raise
+        _age(target, 48)
+        result = sweep(root)
+        assert not result["aborted"] and result["removed"] == [str(target)], result
+    finally:
+        _stop(proc)
+
+
+def _refuses_fd_listing(parent: int) -> bool:
+    """True once a child of ``parent`` exists whose ``fd`` directory this very user cannot list."""
+    try:
+        children = Path(f"/proc/{parent}/task/{parent}/children").read_text().split()
+    except OSError:
+        return False
+    for child in children:
+        try:
+            os.listdir(f"/proc/{child}/fd")
+        except PermissionError:
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def test_the_busy_check_child_does_not_import_from_the_sweepers_directory(root, tmp_path, monkeypatch):
+    target = local_target(root)
+    shadow = tmp_path / "shadow"
+    shadow.mkdir()
+    (shadow / "json.py").write_text("raise RuntimeError('imported from the sweeper cwd')\n")
+    monkeypatch.chdir(shadow)
+    assert cleanup._busy_check(target) is None
+
+
+def test_the_sweeper_itself_never_counts_as_a_holder(root, tmp_path):
+    """A sweep started from a project directory (``herdr-eng build-hygiene run``, the cargo wrapper) has its
+    cwd in the workspace; that must not make the workspace busy."""
+    target = local_target(root)
+    code = ("import sys; from pathlib import Path; from herdr_engineering import build_cleanup as c; "
+            "print(c._busy_check(Path(sys.argv[1])))")
+    out = subprocess.run([sys.executable, "-c", code, str(target)], cwd=target.parent, capture_output=True,
+                         text=True, check=True, env={**os.environ, "PYTHONPATH": str(Path(cleanup.__file__).parent.parent)})
+    assert out.stdout.strip() == "None", out
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-1", "0", "abc"])
+def test_a_nonsense_busy_check_deadline_falls_back_to_the_default(root, monkeypatch, value, caplog):
+    target = local_target(root)
+    monkeypatch.setenv("HERDR_BUSY_CHECK_SECONDS", value)
+    result = sweep(root)
+    assert not result["aborted"] and result["removed"] == [str(target)], result
+    assert "HERDR_BUSY_CHECK_SECONDS" in caplog.text
+
+
+def _busy_children() -> list[str]:
+    listing = subprocess.run(["ps", "-ww", "-o", "pid=,ppid=,args=", "-A"], capture_output=True, text=True).stdout
+    return [line for line in listing.splitlines()
+            if "_busy_child" in line and f" {os.getpid()} " in f" {line.split()[1]} "]
+
+
+def test_a_timed_out_busy_check_leaves_no_child_behind(root, monkeypatch):
+    local_target(root)
+    monkeypatch.setenv("HERDR_BUSY_CHECK_SECONDS", "0.001")
+    sweep(root)
+    _wait_for(lambda: not _busy_children(), "the busy-check child to be gone", 10)

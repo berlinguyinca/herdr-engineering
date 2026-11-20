@@ -174,7 +174,7 @@ print(json.dumps(c.run_once([root], state, high_water=float(high), low_water=0.0
 
 def _busy_check_running(sweeper: subprocess.Popen) -> bool:
     """True while the sweep's own child (the process scan of the busy check) exists: a real process that
-    runs after the sweep's lease check and before it removes anything."""
+    runs between the sweep's first lease check and its re-read of the lease, before it removes anything."""
     out = subprocess.run(["ps", "-ww", "-o", "pid=,ppid=,args=", "-A"], capture_output=True, text=True).stdout
     return any(f" {sweeper.pid} " in f" {line.split(None, 2)[1]} " and "_busy_child" in line
                for line in out.splitlines() if len(line.split(None, 2)) == 3)
@@ -220,8 +220,22 @@ def test_lease_taken_between_scan_and_delete_is_rechecked(env, tmp_path):
     assert reasons(res) == {"project": "active_lease"}
 
 
-def test_target_no_longer_recognized_is_never_removed(env, tmp_path):
+def test_a_workspace_that_vanishes_during_the_scan_is_never_cleaned(env, tmp_path):
     root, state = env
     t = project(root)
     res = sweep_while_racing(root, state, tmp_path, lambda: (root / "project" / "Cargo.toml").unlink())
     assert t.exists() and res["removed"] == []
+
+
+def test_a_leased_target_is_skipped_without_a_scan_and_does_not_abort_the_sweep(env, monkeypatch):
+    root, state = env
+    t = project(root)
+    owner, _reg, _a, _lease = hold_lease(state, root / "project")
+    monkeypatch.setenv("HERDR_BUSY_CHECK_SECONDS", "0.001")  # any scan would time out and abort
+    try:
+        res = sweep(root, state)
+    finally:
+        owner.kill()
+        owner.wait()
+    assert t.exists() and reasons(res) == {"project": "active_lease"}, res
+    assert not res["aborted"] and res["process_scans"] == 0, res
