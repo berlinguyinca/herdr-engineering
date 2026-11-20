@@ -3,6 +3,12 @@
 `/handoff` is manual only. Nothing in this repository edits any user settings, hooks or config.
 This note records how a user could opt in to automatic triggers later, and what is not verified.
 
+**Superseded by the controller.** The handoff controller (`herdr-eng handoff controller run`, described in
+[handoff.md](handoff.md#automatic-handoff-controller)) triggers a handoff for all four harnesses at 80 percent of the
+context window, with a per-session switch (`herdr-eng handoff auto off|on`, or `HERDR_HANDOFF_AUTO=0`). The per-harness
+mechanisms below are retired by plan 5 in the same release and must not run alongside the controller. This note stays as the
+record of what was measured.
+
 All of these would run the same two calls the skill runs (`herdr-handoff create`, then `launch`),
 or ask the agent to run `/handoff`. A hook cannot compose the briefing itself: the briefing needs
 the agent's judgement, so a hook should only *prompt* the agent or write a minimal envelope.

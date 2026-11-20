@@ -545,13 +545,19 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="wait until no subagent is live: exit 0 when idle, 3 on timeout")
     mode.add_argument("--purge", action="store_true", help="delete the pane's registry entries (pane closed)")
     p2.set_defaults(func=_cmd_handoff_subagents, subagents_parser=p2)
-    p2 = hsub.add_parser("auto", help="install, remove or check the opt-in context-hook in ~/.claude/settings.json")
-    p2.add_argument("auto_action", choices=("install", "uninstall", "check"))
+    p2 = hsub.add_parser("auto", help="install, remove or check the opt-in context-hook in ~/.claude/settings.json; off/on switch a pane")
+    p2.add_argument("auto_action", choices=("install", "uninstall", "check", "off", "on"))
+    p2.add_argument("--pane", default=None, help="off/on: pane id (default: $HERDR_PANE_ID)")
     p2.add_argument("--home", default=None, help="override $HOME (tests)")
     p2.add_argument("--dry-run", action="store_true", help="report what would change without writing")
     p2.add_argument("--subagents-only", action="store_true", help="install: only the SubagentStart/SubagentStop registry hooks")
     p2.add_argument("--json", action="store_true")
     p2.set_defaults(func=_cmd_handoff_auto, auto_parser=p2)
+    p2 = hsub.add_parser("controller", help="the auto-handoff controller: run it, or show whether it runs and its chains")
+    p2.add_argument("controller_action", choices=("run", "status"))
+    p2.add_argument("--once", action="store_true", help="run: one tick, then exit")
+    p2.add_argument("--interval", type=float, default=5.0, help="run: seconds between ticks (default 5)")
+    p2.set_defaults(func=_cmd_handoff_controller)
 
     # handoff autopilot ----------------------------------------------------
     p2 = hsub.add_parser(
@@ -1632,10 +1638,12 @@ def _cmd_handoff_context(args) -> int:
 
 
 def _cmd_handoff_auto(args) -> int:
-    from . import handoff_auto_setup as ha
-    home = Path(args.home) if args.home else None
     if args.subagents_only and args.auto_action != "install":
         args.auto_parser.error("--subagents-only only applies to the install action")
+    if args.auto_action in ("off", "on"):
+        return _cmd_handoff_auto_switch(args)
+    from . import handoff_auto_setup as ha
+    home = Path(args.home) if args.home else None
     if args.auto_action == "check":
         items = ha.check(home)
     elif args.auto_action == "install" and args.subagents_only:
@@ -1649,6 +1657,26 @@ def _cmd_handoff_auto(args) -> int:
         for item in items:
             print(f"{item.action:10} {item.target}" + (f"  ({item.detail})" if item.detail else ""))
     return 0 if ok else 1
+
+
+def _cmd_handoff_auto_switch(args) -> int:
+    from .handoff_controller.switch import set_enabled
+    from .handoff_subagent_registry import state_root
+    pane = args.pane or os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        args.auto_parser.error("--pane is required when $HERDR_PANE_ID is not set")
+    set_enabled(pane, args.auto_action == "on", state_root(os.environ))
+    print(f"auto-handoff {args.auto_action} for pane {pane}")
+    return 0
+
+
+def _cmd_handoff_controller(args) -> int:
+    from .handoff_controller import run as controller
+    if args.controller_action == "status":
+        ctl = controller.build_controller(os.environ, require_binaries=False)
+        print("\n".join(controller.status_lines(ctl.state_dir, ctl.log)))
+        return 0
+    return controller.serve(interval_s=args.interval, once=args.once)
 
 
 def _cmd_handoff_subagent_hook(args) -> int:
