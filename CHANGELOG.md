@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### CI: PR runs test PR + main, and main gets its own full run
+
+- New `scripts/ci/integrate-main.sh`, run after `checkout` in `unit-gates`, `ui-gates`, `artifact-handoff` and `structural-gates`: on a `pull_request` event it merges current `origin/main` into the PR head (throwaway identity, conflict aborts and names the files, other events no-op), so a green PR run means "PR + main" once branch protection `strict` is off. `ui-gates` and `artifact-handoff` now fetch full history for the merge; the ui-gates stale-base notice stays silent when main is already merged.
+- New `.woodpecker/unit-gates-main.yml`: the full unit gates on every push to main (`hive-heavy`, concurrency group `unit-gates-main`). `scripts/ci-pipeline-freshness.sh` exits a superseded main run with "superseded by newer push" before install work; PR and cron behaviour is unchanged. A green run records its commit via `main-cron-gates.sh --record-green` so the cron skips it.
+- `.gitattributes`: `CHANGELOG.md merge=union` (local merges only, not GitHub's merge button). See "Merge gating" in `docs/ci-and-reviews.md`.
+
 ### Chore: pin herdr-handoff 0.5.0
 
 - `lock/upstreams.yaml` pins herdr-handoff to `aed3e8274e6948a774682a55d99b7cd9ef113914` (herdr-handoff#12, v0.5.0: shared handoff store, one takeover per handoff id, `takeover --direction`, `--relaunch`). `check_handoff_dependency` now also requires that `herdr-handoff takeover --help` lists `--direction` (reported as `takeover --direction`, naming 0.5.0), so `herdr-eng doctor` reports an installed 0.4.0 as too old until `scripts/install-handoff.sh` is run.

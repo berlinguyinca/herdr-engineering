@@ -20,6 +20,23 @@ Plannotator owns the review UI and decisions. HerdR retains review subjects, imm
 
 The host launcher and exact usage are documented alongside the implementation. A missing/expired launcher heartbeat means the runtime is stale, not that a reviewer has stopped thinking. A changes-requested decision is a review outcome; it is not an execution failure or an approval for a different revision.
 
+## Merge gating: PR plus main, and main's own run
+
+Branch protection `strict` ("branch must be up to date") is removed. It forced a rebase and a fresh ~45-minute run after every other merge. The two guarantees it gave are now made by CI itself:
+
+- **A pull request run tests PR + current main.** Woodpecker checks out only the PR head, so each PR pipeline (`unit-gates`, `ui-gates`, `artifact-handoff`, `structural-gates`) runs `scripts/ci/integrate-main.sh` right after `checkout` (after the `freshness` guard). On a `pull_request` event it fetches `origin/main` and merges it into the checked-out head with a throwaway identity; if main is already contained it does nothing; on a conflict it aborts, names the conflicting files and fails with "rebase or merge main into your branch". Push, cron and manual runs skip it. `CI_COMMIT_SHA` is never rewritten, so the freshness guard and the applicability diff (`git merge-base`, so it still sees exactly the PR's changes) behave as before. The merge is throwaway; what lands on main is still GitHub's squash of the PR.
+- **Every push to main runs the full suite.** `.woodpecker/unit-gates-main.yml` (event `push`, branch `main`, cluster `hive-heavy`, concurrency group `unit-gates-main`, limit 1) runs `scripts/ci/unit-gates.sh` on the commit as pushed. A green run also records its commit for the 4-hourly cron (`scripts/ci/main-cron-gates.sh --record-green`), so the cron does not prove it again. The context is not a required check.
+
+Merges are made with `gh pr merge --auto --squash`: GitHub merges when the required checks are green, without an up-to-date branch.
+
+### A "superseded by newer push" failure on main
+
+Pushes to main queue (limit 1). When a queued run starts, `scripts/ci-pipeline-freshness.sh` compares its commit with `git ls-remote origin refs/heads/main`. If main has moved, the run exits 1 with `superseded by newer push` before any install work, because the newer push has its own pipeline. This red does not mean main is broken. The review gate's main verification (`main_pipeline: push`, `herdr_engineering/review_gate/main_verify.py`) judges only the newest main head, so a superseded run for an older head is ignored and never pages; only a red run on the current head does.
+
+### CHANGELOG merges
+
+`.gitattributes` sets `CHANGELOG.md merge=union`, so two branches that add different bullets under `## [Unreleased]` merge with both lines kept. The union driver applies to local merges, including the CI integrate step; it does not apply to GitHub's server-side merge button, which can still report a conflict.
+
 ## Verification boundaries
 
 Automated contract tests verify denied permissions, correct action HTTP methods, log decoding/redaction, snapshot failure retention, single-flight progress, durable receipt replay and native UI outcomes. Live validation uses read-only CI calls. Retry/cancel are never fired simply to test connectivity, and test plan approval is not approval of product code.

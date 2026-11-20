@@ -366,7 +366,7 @@ def test_ui_gates_is_no_longer_path_filtered():
 
 def test_ui_gates_skip_is_reported_rather_than_silently_absent():
     steps = {s["name"]: s for s in yaml.safe_load(UI_GATES_YML)["steps"]}
-    assert list(steps) == ["checkout", "freshness", "applicability", "ui-gates"]
+    assert list(steps) == ["checkout", "freshness", "integrate-main", "applicability", "ui-gates"]
     applicability_cmds = steps["applicability"]["commands"]
     assert "rc=0; bash scripts/ci/unit-gates-applicable.sh ui || rc=$?" in applicability_cmds
     # the marker is touched only on rc 3; any other non-zero rc fails the step instead of skipping

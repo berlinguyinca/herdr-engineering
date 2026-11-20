@@ -21,6 +21,18 @@ state_dir="${HERDR_CI_STATE:-/home/wohlgemuth/woodpecker/ci/state/herdr}"
 memo="${state_dir}/main-unit-gates-green.txt"
 head_sha="$(git rev-parse HEAD)"
 
+# `--record-green`: .woodpecker/unit-gates-main.yml runs the full suite on every push to main and calls this after it passed, so a
+# commit proven by its push run is not proven a second time by the next cron tick. Records only; never runs the suite.
+if [ "${1:-}" = "--record-green" ]; then
+  if mkdir -p "$state_dir" 2>/dev/null && [ -w "$state_dir" ]; then
+    printf '%s\n' "$head_sha" > "${memo}.tmp" && mv -f "${memo}.tmp" "$memo"
+    echo "main-cron: recorded ${head_sha:0:12} as proven green by its push run"
+  else
+    echo "main-cron: memo path ${state_dir} is not writable; not recording (the cron will re-prove this commit)" >&2
+  fi
+  exit 0
+fi
+
 if [ -f "$memo" ] && [ "$(cat "$memo" 2>/dev/null)" = "$head_sha" ]; then
   echo "main-cron: ${head_sha:0:12} is already proven green; nothing to do"
   exit 0

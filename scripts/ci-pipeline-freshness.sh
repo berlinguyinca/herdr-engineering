@@ -23,7 +23,28 @@
 # newest on its branch.
 set -eu
 
-[ "${CI_PIPELINE_EVENT:-${CI_EVENT:-}}" = "pull_request" ] || exit 0
+event="${CI_PIPELINE_EVENT:-${CI_EVENT:-}}"
+
+# A push to main is superseded the same way: .woodpecker/unit-gates-main.yml queues one run at a time (concurrency group
+# unit-gates-main), and a run whose commit is no longer the head of origin/main exits 1 here, before any install work, with
+# "superseded by newer push". The newer push has its own pipeline, and the review gate judges only main's newest head, so a
+# superseded red is never the verdict on main. Pushes to any other branch, cron and manual runs always run.
+if [ "$event" = "push" ] && [ "${CI_COMMIT_BRANCH:-}" = "main" ]; then
+  commit="${CI_COMMIT_SHA:-}"
+  [ -n "$commit" ] || exit 0
+  head="$(git ls-remote origin refs/heads/main 2>/dev/null | awk '{print $1}' || true)"
+  if [ -z "$head" ]; then
+    echo "freshness guard: could not read the head of refs/heads/main; running the pipeline" >&2
+    exit 0
+  fi
+  if [ "$head" != "$commit" ]; then
+    echo "superseded by newer push: commit ${commit} is no longer the head of refs/heads/main (now ${head}); the newer pipeline runs the gate"
+    exit 1
+  fi
+  exit 0
+fi
+
+[ "$event" = "pull_request" ] || exit 0
 
 pr="${CI_COMMIT_PULL_REQUEST:-}"
 branch="${CI_COMMIT_SOURCE_BRANCH:-}"
