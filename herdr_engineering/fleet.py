@@ -41,17 +41,28 @@ except Exception:  # pragma: no cover - best effort; inventory is optional
         return []
 
 
+class FleetError(Exception):
+    pass
+
+
 def repo_root() -> Path:
-    """Locate the herdr-engineering checkout that holds the ansible fleet."""
+    """Locate the herdr-engineering checkout that holds the ansible fleet.
+
+    HERDR_ENGINEERING_REPO wins; otherwise walk up from the cwd for the private inventory
+    (`ansible/inventory/hosts.yml`) or, failing that, the tracked playbooks of a checkout without one.
+    Raises FleetError naming what was searched; the cwd is never assumed to be a checkout.
+    """
     env = os.environ.get("HERDR_ENGINEERING_REPO")
     if env:
         return Path(env)
-    # walk up from cwd looking for ansible/inventory/hosts.yml
     cwd = Path.cwd()
-    for p in [cwd, *cwd.parents]:
-        if (p / "ansible" / "inventory" / "hosts.yml").exists():
-            return p
-    return cwd
+    for marker in (Path("ansible/inventory/hosts.yml"), Path("ansible/playbooks/fleet-status.yml")):
+        for p in [cwd, *cwd.parents]:
+            if (p / marker).exists():
+                return p
+    raise FleetError(f"no inventory at {cwd / 'ansible' / 'inventory' / 'hosts.yml'} (searched {cwd} and its "
+                     "parents for ansible/inventory/hosts.yml and ansible/playbooks/fleet-status.yml); "
+                     "run from a herdr-engineering checkout or set HERDR_ENGINEERING_REPO")
 
 
 def _run(cmd: list[str], timeout: int = 600, env: dict[str, str] | None = None) -> tuple[int, str, str]:
@@ -70,10 +81,6 @@ def _run(cmd: list[str], timeout: int = 600, env: dict[str, str] | None = None) 
     except OSError as exc:
         return 127, "", str(exc)
     return proc.returncode, proc.stdout, proc.stderr
-
-
-class FleetError(Exception):
-    pass
 
 
 def _expected_hosts(inventory: Path, host: str | None) -> list[str]:
@@ -205,7 +212,11 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
     """
     report: dict = {"target": ssh_target, "label": label or ssh_target,
                     "steps": {}, "registered": False, "ok": False}
-    root = repo_root()
+    try:
+        root = repo_root()
+    except FleetError as exc:
+        report["errors"] = [str(exc)]
+        return report
     inv = inventory or (root / "ansible" / "inventory" / "hosts.yml")
     hv_dir = host_vars_dir or (root / "ansible" / "inventory" / "host_vars")
     host = label or ssh_target
@@ -325,9 +336,13 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
 
     Returns a JSON-serializable report.
     """
-    root = repo_root()
-    inv = inventory or (root / "ansible" / "inventory" / "hosts.yml")
     report: dict = {"target": host or "all inventory hosts", "steps": {}, "ok": False}
+    try:
+        root = repo_root()
+    except FleetError as exc:
+        report["error"] = str(exc)
+        return report
+    inv = inventory or (root / "ansible" / "inventory" / "hosts.yml")
     from .control_plane.agent_rules_config import AgentRulesConfigError
     try:   # before anything is pulled or deployed: a broken pin must stop the run, not be skipped
         rules_vars = _playbook_vars(fleet_config)
@@ -497,11 +512,21 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
     return report
 
 
+def _status_error(message: str, kind: str) -> dict:
+    """A status that never ran ansible: distinct from hosts that failed (rc set, hosts possibly empty)."""
+    return {"rc": None, "hosts": [], "stderr": None, "error": message, "error_kind": kind}
+
+
 def fleet_status(*, inventory: Path | None = None, host: str | None = None) -> dict:
     """Read-only per-host version/registration fingerprint."""
-    root = repo_root()
+    try:
+        root = repo_root()
+    except FleetError as exc:
+        return _status_error(str(exc), "no_inventory")
     inv = inventory or (root / "ansible" / "inventory" / "hosts.yml")
     playbook = root / "ansible" / "playbooks" / "fleet-status.yml"
+    if not inv.is_file():
+        return _status_error(f"no inventory at {inv}", "no_inventory")
     cmd = ["ansible-playbook", "-i", str(inv), str(playbook)]
     if host:
         cmd += ["-l", host]
@@ -573,9 +598,12 @@ def _summary_state(parts: list[str], root: Path) -> str:
 
 def stage_pi_runtime(revision: str, *, host: str, inventory: Path | None = None) -> dict:
     """Install/register a pinned Pi package; never reload or restart live sessions."""
-    root = repo_root()
-    inv = inventory or root / "ansible" / "inventory" / "hosts.yml"
     report: dict = {"ok": False, "revision": revision, "host": host}
+    try:
+        root = repo_root()
+    except FleetError as exc:
+        return {**report, "error": str(exc)}
+    inv = inventory or root / "ansible" / "inventory" / "hosts.yml"
     if not _is_revision(revision):
         return {**report, "error": "Pi revision must be a full immutable commit ID"}
     try:

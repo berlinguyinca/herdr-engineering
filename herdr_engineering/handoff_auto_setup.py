@@ -7,9 +7,11 @@ Unparseable or unexpectedly shaped settings are never overwritten: the result is
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 from .fabric_join_setup import FAIL_ACTIONS, Item, _home, _save_settings
+from .workflow_hooks import WorkflowInstaller
 
 HOOK_MARKER = "herdr-handoff-auto"
 HOOK_EVENT = "UserPromptSubmit"
@@ -19,9 +21,10 @@ _BIN = '[ -x "$HOME/.local/bin/herdr-eng" ] && "$HOME/.local/bin/herdr-eng"'
 START_COMMAND = f"{_BIN} handoff subagent-hook start || true # {HOOK_MARKER}"
 STOP_COMMAND = f"{_BIN} handoff subagent-hook stop || true # {HOOK_MARKER}"
 HOOKS: dict[str, str] = {HOOK_EVENT: HOOK_COMMAND, "SubagentStart": START_COMMAND, "SubagentStop": STOP_COMMAND}
+SUBAGENT_EVENTS = ("SubagentStart", "SubagentStop")
 SETTINGS_REL = Path(".claude/settings.json")
 __all__ = ["FAIL_ACTIONS", "HOOKS", "HOOK_COMMAND", "HOOK_EVENT", "HOOK_MARKER", "START_COMMAND", "STOP_COMMAND", "check", "install",
-           "uninstall"]
+           "install_subagent_hooks", "uninstall"]
 
 
 class _Unusable(Exception):
@@ -88,17 +91,32 @@ def _uninstall_one(data: dict, event: str, target: str) -> tuple[Item, bool]:
     return Item(target, "removed", f"{event} handoff hook"), True
 
 
-def install(home: Path | None = None, *, dry_run: bool = False) -> list[Item]:
-    """One Item per hook event, in HOOKS order; a single ``refused`` Item when settings.json is unusable."""
+def _install_events(events: dict[str, str], home: Path | None, dry_run: bool) -> list[Item]:
     path = _home(home) / SETTINGS_REL
     try:
         data, text = _load(path)
     except _Unusable as exc:
         return [Item(str(path), "refused", str(exc))]
-    results = [_install_one(data, event, command, str(path)) for event, command in HOOKS.items()]
+    results = [_install_one(data, event, command, str(path)) for event, command in events.items()]
     if any(changed for _, changed in results) and not dry_run:
         _save_settings(path, data, text)
     return [item for item, _ in results]
+
+
+def install(home: Path | None = None, *, dry_run: bool = False) -> list[Item]:
+    """One Item per hook event, in HOOKS order; a single ``refused`` Item when settings.json is unusable."""
+    return _install_events(HOOKS, home, dry_run)
+
+
+def install_subagent_hooks(home: Path | None = None, *, dry_run: bool = False, path: str | None = None) -> list[Item]:
+    """Install only ``SubagentStart`` / ``SubagentStop`` (the registry hooks the installer adds by default).
+
+    Gated like the workflow hooks (``WorkflowInstaller._claude_present``: ``claude`` on ``path`` (default ``$PATH``) or ``~/.claude``
+    exists): without Claude Code a single ``skipped`` item is returned and nothing is written.
+    """
+    if not WorkflowInstaller(home, which=lambda name: shutil.which(name, path=path))._claude_present():
+        return [Item(str(_home(home) / SETTINGS_REL), "skipped", "Claude Code is not installed on this host")]
+    return _install_events({e: HOOKS[e] for e in SUBAGENT_EVENTS}, home, dry_run)
 
 
 def uninstall(home: Path | None = None, *, dry_run: bool = False) -> list[Item]:

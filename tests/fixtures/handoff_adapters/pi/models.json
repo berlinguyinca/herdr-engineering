@@ -1,0 +1,1 @@
+{"providers":{"example":{"models":[{"id":"deepseek_v4","contextWindow":262144},{"id":"qwen3.8","contextWindow":131072},{"id":"qwen3.8-flash_next","contextWindow":131072}]}}}

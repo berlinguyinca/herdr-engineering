@@ -268,3 +268,11 @@ def test_a_share_deploy_without_a_member_host_has_no_unbound_variable(env):
     _sd._live_cert(env, MCP, _sd.SHARE_HOST)
     r = _sd._ds.deploy(env)
     assert r.returncode == 0 and "unbound variable" not in r.stderr, r.stdout + r.stderr
+
+
+def test_share_member_host_is_refused_when_the_artifact_host_is_enabled(tmp_path):
+    # the dedicated host owns the member web: share.member_host would be silently ignored, so it is refused
+    central = _md._central(tmp_path, share={"enabled": False, "public_host": HOST, "member_host": MEMBER},
+                           extra={"artifact_host": {"enabled": True}})
+    with pytest.raises(FleetConfigError, match=r"control_plane\.artifact_host\.member_host"):
+        fcc.collab_values(load_fleet_config(central))

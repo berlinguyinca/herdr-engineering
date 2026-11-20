@@ -46,12 +46,13 @@ def test_watch_is_quiet_when_nothing_is_paused(caplog):
 def test_gc_timer_logs_only_long_collections(caplog):
     caplog.set_level(logging.WARNING, logger=stall_watch.__name__)
     slow, quick = stall_watch.GcTimer(threshold=0), stall_watch.GcTimer(threshold=3600)
-    gc.callbacks.extend([slow, quick])
+    # A serve test earlier in the same worker leaves its own GcTimer on gc.callbacks; isolate so only these two log.
+    others = gc.callbacks[:]
+    gc.callbacks[:] = [slow, quick]
     try:
         gc.collect()
     finally:
-        gc.callbacks.remove(slow)
-        gc.callbacks.remove(quick)
+        gc.callbacks[:] = others
     assert any("gc pause" in r.message and "generation=2" in r.message for r in caplog.records)
     assert quick.longest >= 0 and len([r for r in caplog.records]) == 1
 
