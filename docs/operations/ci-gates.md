@@ -77,12 +77,13 @@ INTERNALERROR KeyError, pytest exit 3 (pipeline 1710, load 155 on 4 CPUs). `unit
   reran). More than `HERDR_PYTEST_RETRY_MAX` (25, must be a number) failures are not retried; `HERDR_PYTEST_RETRY=0` disables the
   retry. A crash rerun's result is final. A pass that failed at session level (coverage floor, `INTERNALERROR`) is not retried:
   rerunning files cannot fix it and a green retry must not hide it. Only the fast pass has a retry: a slow tail run on its own
-  (once it is a separate step) gets none. **Follow-up**: publish `pytest-retried.jsonl` as a pipeline artifact (a `.woodpecker/`
+  (once it is a separate step) gets none. **Limits**: only the files of failed tests are rerun, so pollution coming from a test in ANOTHER file can still make a retry pass green (the chronic counter then warns); session-level detection is a grep of the pass's log, so a conftest `pytest_sessionfinish` that sets `exitstatus` is not covered; `HERDR_PYTEST_RETRY_MAX` counts failed test ids, not files; pseudo ids such as an xdist `gw1` are never retried (nothing left means the failure stands). **Follow-up**: publish `pytest-retried.jsonl` as a pipeline artifact (a `.woodpecker/`
   change, outside this file set).
 - **Chronic flakes.** A test that needed a retry in `HERDR_PYTEST_CHRONIC_RUNS` (3) distinct runs within `HERDR_PYTEST_CHRONIC_DAYS`
   (14) days prints a loud `CHRONIC FLAKE` warning and carries `chronic_runs` in its `RETRIED-JSONL` row (a retry must not hide a flake
-  forever); it fails the gate only with `HERDR_PYTEST_CHRONIC_FAIL=1`, so it cannot fail an unrelated PR by default. The counter is `pytest-retried-history.jsonl` in `HERDR_CI_STATE` (default `/home/wohlgemuth/woodpecker/ci/state/herdr`, the
-  `main-cron-gates.sh` state dir; override the file with `HERDR_PYTEST_RETRY_HISTORY`). If that directory cannot be written the counter is
+  forever); it fails the gate only with `HERDR_PYTEST_CHRONIC_FAIL=1`, so it cannot fail an unrelated PR by default. The counter is on only for `push`/`cron` pipelines (others log `RETRY HISTORY: off (untrusted event)` and touch nothing). It is
+  `pytest-retried-history.jsonl` in `HERDR_CI_STATE` or the file `HERDR_PYTEST_RETRY_HISTORY` (explicit paths may be created); the default
+  `/home/wohlgemuth/woodpecker/ci/state/herdr` (the `main-cron-gates.sh` state dir) is used only if it already exists. Updates run under `flock`. If that directory cannot be written the counter is
   off for the run, with a `RETRY HISTORY:` note in the log, and the gate is not failed for it.
 
 ### Quarantining a known-flaky test

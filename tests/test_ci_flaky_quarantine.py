@@ -29,7 +29,7 @@ SOON = (dt.date.today() + dt.timedelta(days=30)).isoformat()      # inside the 9
 
 
 def sh(script: str, cwd: Path, **env: str) -> subprocess.CompletedProcess[str]:
-    env = {"HERDR_CI_STATE": str(cwd / "ci-state"), **env}          # never touch the real CI state dir from a test
+    env = {"HERDR_CI_STATE": str(cwd / "ci-state"), "CI_PIPELINE_EVENT": "push", **env}          # never touch the real CI state dir from a test
     return subprocess.run(
         ["bash", "-c", f'. "{CI / "pytest-parallel.sh"}"; . "{CI / "pytest-rerun.sh"}"; {script}'],
         capture_output=True, text=True, cwd=cwd, timeout=300,
@@ -202,6 +202,65 @@ def test_a_rerun_of_the_same_pipeline_counts_once_and_old_history_ages_out(tmp_p
     done, _ = run_fast(proj, workers="", CI_PIPELINE_NUMBER="9")
     assert done.returncode == 0, done.stdout           # two ancient runs do not count, so this is the first recent one
     assert len((state / "pytest-retried-history.jsonl").read_text().splitlines()) == 1
+
+
+def test_an_untrusted_event_neither_reads_nor_writes_the_history(tmp_path: Path) -> None:
+    proj = make_project(tmp_path, {"test_flaky.py": FLAKY_ONCE})
+    for event in ("pull_request", "manual", ""):
+        done, rows = run_fast(proj, workers="", CI_PIPELINE_EVENT=event)
+        assert done.returncode == 0 and len(rows) == 1 and "RETRY HISTORY: off (untrusted event)" in done.stdout, (event, done.stdout)
+        assert not (proj / "ci-state").exists(), event
+        (proj / "failed-once").unlink()
+
+
+def test_a_trusted_event_writes_the_history(tmp_path: Path) -> None:
+    proj = make_project(tmp_path, {"test_flaky.py": FLAKY_ONCE})
+    for event in ("push", "cron"):
+        (proj / "failed-once").unlink(missing_ok=True)
+        run_fast(proj, workers="", CI_PIPELINE_EVENT=event, CI_PIPELINE_NUMBER=event)
+    assert len((proj / "ci-state" / "pytest-retried-history.jsonl").read_text().splitlines()) == 2
+
+
+def test_concurrent_writers_lose_no_rows(tmp_path: Path) -> None:
+    history = tmp_path / "h.jsonl"
+    code = ("import sys, datetime as dt; sys.path.insert(0, sys.argv[1]); import herdr_flaky_plugin as p\n"
+            "for i in range(40): p.chronic(sys.argv[2], [f'a::t{sys.argv[3]}_{i}'], dt.datetime.now(dt.UTC), f'{sys.argv[3]}-{i}')\n")
+    procs = [subprocess.Popen([sys.executable, "-c", code, str(CI), str(history), str(n)]) for n in range(4)]
+    assert [p.wait(120) for p in procs] == [0, 0, 0, 0]
+    assert len(history.read_text().splitlines()) == 160
+
+
+def test_the_default_state_dir_is_used_only_when_it_exists_and_never_created(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    default = tmp_path / "woodpecker" / "state"
+    monkeypatch.setattr(plugin, "DEFAULT_STATE_DIR", default)
+    for var in ("HERDR_CI_STATE", "HERDR_PYTEST_RETRY_HISTORY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("CI_PIPELINE_EVENT", "push")
+    assert plugin.resolve_history() == ("", "off (no CI state dir on this machine)")
+    assert not default.exists() and not default.parent.exists()
+    default.mkdir(parents=True)
+    assert plugin.resolve_history()[0] == str(default / plugin.HISTORY_NAME)
+
+
+def test_an_xdist_pseudo_id_is_never_a_retry_argument(tmp_path: Path) -> None:
+    (tmp_path / "test_real.py").write_text("")
+    first = tmp_path / "first.json"
+    first.write_text(json.dumps({"failed": [{"nodeid": "gw1", "summary": "crashed"}, {"nodeid": "test_real.py::test_x", "summary": "s"},
+                                            {"nodeid": "test_real.py", "summary": "collect"}], "passed": []}))
+    done = subprocess.run([sys.executable, str(PLUGIN), "files", str(first)], capture_output=True, cwd=tmp_path, timeout=60)
+    assert done.stdout == b"test_real.py\0"
+    first.write_text(json.dumps({"failed": [{"nodeid": "gw1", "summary": "crashed"}], "passed": []}))
+    done = subprocess.run([sys.executable, str(PLUGIN), "files", str(first)], capture_output=True, cwd=tmp_path, timeout=60)
+    assert done.stdout == b""                                                 # nothing left: the shell then fails safe
+
+
+def test_runs_without_ci_variables_get_a_unique_dedupe_key(tmp_path: Path) -> None:
+    proj = make_project(tmp_path, {"test_flaky.py": FLAKY_ONCE})
+    for _ in range(2):
+        (proj / "failed-once").unlink(missing_ok=True)
+        run_fast(proj, workers="", CI_PIPELINE_NUMBER="", CI_COMMIT_SHA="")
+    runs = [json.loads(x)["run"] for x in (proj / "ci-state" / "pytest-retried-history.jsonl").read_text().splitlines()]
+    assert len(set(runs)) == 2, runs
 
 
 def test_an_unwritable_history_location_turns_the_counter_off_with_a_note_but_does_not_fail(tmp_path: Path) -> None:

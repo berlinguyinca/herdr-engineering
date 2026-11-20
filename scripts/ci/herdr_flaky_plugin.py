@@ -34,6 +34,7 @@ import datetime as dt
 import json
 import os
 import sys
+import time
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -249,16 +250,57 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+TRUSTED_EVENTS = ("push", "cron")
+DEFAULT_STATE_DIR = Path("/home/wohlgemuth/woodpecker/ci/state/herdr")
+HISTORY_NAME = "pytest-retried-history.jsonl"
+
+
+def resolve_history() -> tuple[str, str]:
+    """(history file, note): '' when the counter is off. Only push/cron pipelines run reviewed code, so a pull_request, manual or local run
+    never reads or writes the shared history. The file is HERDR_PYTEST_RETRY_HISTORY, else HERDR_CI_STATE/<name> (both explicit, parent dirs
+    may be created), else the default CI state dir ONLY when it already exists: a dev machine never gets one created."""
+    event = os.environ.get("CI_PIPELINE_EVENT") or os.environ.get("CI_EVENT") or ""
+    if event not in TRUSTED_EVENTS:
+        return "", "off (untrusted event)"
+    explicit = os.environ.get("HERDR_PYTEST_RETRY_HISTORY")
+    if explicit:
+        return explicit, ""
+    state = os.environ.get("HERDR_CI_STATE")
+    if state:
+        return str(Path(state) / HISTORY_NAME), ""
+    if DEFAULT_STATE_DIR.is_dir():
+        return str(DEFAULT_STATE_DIR / HISTORY_NAME), ""
+    return "", "off (no CI state dir on this machine)"
+
+
+def _locked_update(history: Path, update: Any) -> Any:
+    """Run ``update()`` holding an exclusive flock on HISTORY.lock; without flock (no fcntl, unsupported fs) it runs unlocked."""
+    try:
+        import fcntl
+        history.parent.mkdir(parents=True, exist_ok=True)
+        handle = (history.parent / (history.name + ".lock")).open("a")
+    except (ImportError, OSError):
+        return update()
+    with handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        except OSError:
+            return update()
+        return update()
+
+
 def chronic(history: str, retried: list[str], stamp: dt.datetime, run: str) -> tuple[list[tuple[str, int]], str]:
-    """Record this run's retried tests in the JSON-lines HISTORY and return [(nodeid, distinct runs inside the window)] for those at or above
-    the threshold, plus a note ('' when fine). A history that cannot be read or written never fails the gate: the counter is just off."""
+    """Record this run's retried tests in the JSON-lines HISTORY (read-modify-write under flock) and return [(nodeid, distinct runs inside
+    the window)] for those at or above the threshold, plus a note ('' when fine). An unusable history never fails the gate."""
     if not history or not retried:
         return [], ""
     days, limit = _env_int("HERDR_PYTEST_CHRONIC_DAYS", 14), _env_int("HERDR_PYTEST_CHRONIC_RUNS", 3)
     cutoff = stamp - dt.timedelta(days=days)
-    rows: list[dict[str, str]] = []
-    try:
-        for line in Path(history).read_text(encoding="utf-8").splitlines() if Path(history).exists() else []:
+    path = Path(history)
+
+    def update() -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        for line in path.read_text(encoding="utf-8").splitlines() if path.exists() else []:
             try:
                 row = json.loads(line)
                 if isinstance(row, dict) and dt.datetime.fromisoformat(row["at"]) >= cutoff and row["run"] != run:
@@ -266,15 +308,21 @@ def chronic(history: str, retried: list[str], stamp: dt.datetime, run: str) -> t
             except (ValueError, KeyError, TypeError):
                 continue
         rows += [{"nodeid": n, "at": stamp.isoformat(timespec="seconds"), "run": run} for n in retried]
-        Path(history).parent.mkdir(parents=True, exist_ok=True)
-        Path(history).write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        tmp.replace(path)
+        return rows
+
+    try:
+        rows = _locked_update(path, update)
     except OSError as exc:
         return [], f"retry history {history} is not usable ({exc}); the chronic-flake counter is OFF for this run"
     counts = {n: len({r["run"] for r in rows if r["nodeid"] == n}) for n in retried}
     return [(n, c) for n, c in counts.items() if c >= limit], ""
 
 
-def settle(first: str, second: str, out: str, history: str = "") -> int:
+def settle(first: str, second: str, out: str, history: str | None = None) -> int:
     """Print the retry verdict, write the passed-on-retry tests to ``out``; exit 1 for anything that is not a clean pass on retry."""
     before, _ = _read(first)
     again, passed = _read(second)
@@ -287,8 +335,14 @@ def settle(first: str, second: str, out: str, history: str = "") -> int:
     now = dt.datetime.now(dt.UTC)
     stamp = now.isoformat(timespec="seconds")
     context = {k: os.environ[v] for k, v in (("pipeline", "CI_PIPELINE_NUMBER"), ("commit", "CI_COMMIT_SHA")) if os.environ.get(v)}
-    run = context.get("pipeline") or context.get("commit") or stamp
-    chronic_ids, note = chronic(history, [d["nodeid"] for d in retried], now, run)
+    run = context.get("pipeline") or context.get("commit") or f"{os.getpid()}-{time.time_ns()}"
+    if history is None:
+        history, note = resolve_history()
+        note = f"RETRY HISTORY: {note}" if note and retried else ""
+    else:
+        note = ""
+    chronic_ids, note2 = chronic(history, [d["nodeid"] for d in retried], now, run)
+    note = note or note2
     runs_by_id = dict(chronic_ids)
     lines = [json.dumps({"nodeid": d["nodeid"], "first_failure": d.get("summary", ""), "at": stamp, **context,
                          **({"chronic_runs": runs_by_id[d["nodeid"]]} if d["nodeid"] in runs_by_id else {})}) for d in retried]
@@ -304,7 +358,7 @@ def settle(first: str, second: str, out: str, history: str = "") -> int:
     for d in new_failures:
         print(f"FAILED ON RETRY: {d['nodeid']} passed in the fast pass but failed when its file reran; first-pass failures in that file may be pollution")
     if note:
-        print(f"RETRY HISTORY: {note}")
+        print(note if note.startswith("RETRY HISTORY") else f"RETRY HISTORY: {note}")
     chronic_fails = os.environ.get("HERDR_PYTEST_CHRONIC_FAIL") == "1"
     for nodeid, runs in chronic_ids:
         print(f"CHRONIC FLAKE: {nodeid} needed a retry in {runs} runs within {_env_int('HERDR_PYTEST_CHRONIC_DAYS', 14)} days; "
@@ -320,7 +374,9 @@ def main(argv: list[str]) -> int:
         sys.stdout.write("".join(d["nodeid"] + "\0" for d in _read(argv[2])[0]))
         return 0
     if len(argv) == 3 and argv[1] == "files":
-        sys.stdout.write("".join(f + "\0" for f in dict.fromkeys(d["nodeid"].split("::")[0] for d in _read(argv[2])[0])))
+        # an xdist pseudo id ('gw1', a crashed worker) names no test file: it is dropped, never handed to pytest as an argument
+        paths = dict.fromkeys(d["nodeid"].split("::")[0] for d in _read(argv[2])[0] if "::" in d["nodeid"] or Path(d["nodeid"]).is_file())
+        sys.stdout.write("".join(f + "\0" for f in paths))
         return 0
     if len(argv) in (5, 6) and argv[1] == "settle":
         return settle(*argv[2:])

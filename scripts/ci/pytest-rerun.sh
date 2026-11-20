@@ -15,8 +15,10 @@
 # JSON lines, rewritten each run, empty when nothing was retried). Everything else fails the gate: a test failing again, a retried test
 # that was skipped or did not run (only a recorded PASS counts), a test that fails on the retry that passed in the fast pass. A test needing
 # a retry in HERDR_PYTEST_CHRONIC_RUNS (3) distinct runs within HERDR_PYTEST_CHRONIC_DAYS (14) days is a CHRONIC flake: a loud CHRONIC FLAKE warning and a
-# chronic_runs field in its JSONL row; it fails the gate only with HERDR_PYTEST_CHRONIC_FAIL=1 (fix it, or quarantine it with an issue); the counter lives in HERDR_PYTEST_RETRY_HISTORY, default pytest-retried-history.jsonl in
-# HERDR_CI_STATE (the main-cron-gates.sh state dir), and is simply off, with a note in the log, when that dir cannot be written.
+# chronic_runs field in its JSONL row; it fails the gate only with HERDR_PYTEST_CHRONIC_FAIL=1 (fix it, or quarantine it with an issue); the counter is only on for push/cron events (a pull_request, manual or local run reads and writes nothing:
+# 'RETRY HISTORY: off (untrusted event)'), lives in HERDR_PYTEST_RETRY_HISTORY or HERDR_CI_STATE/pytest-retried-history.jsonl (explicit paths
+# may be created; the default main-cron-gates.sh state dir is used only if it already exists), is updated under flock, and is simply off,
+# with a note in the log, when it cannot be written.
 # HERDR_PYTEST_RETRY=0 disables the retry; more than HERDR_PYTEST_RETRY_MAX (default 25) failures are a broken change, not flakes, and
 # are not retried. Not retried either: a pass whose failure is session-level (a coverage floor, an INTERNALERROR): rerunning some files
 # cannot fix it, and a green retry must not paper over it. Only the fast pass has a retry: a slow tail run separately gets none. Known
@@ -52,7 +54,7 @@ herdr_pytest_session_failure() {  # the failure is the session's, not a test's (
 herdr_pytest_run_fast() {
   local runner="$1" markexpr="$2" log status words word restore="" crash_rerun="" failed_file ids_file
   local retried_file="${HERDR_PYTEST_RETRIED_FILE-pytest-retried.jsonl}" plugin="$HERDR_PYTEST_PLUGIN_DIR/herdr_flaky_plugin.py"
-  local retry_max="${HERDR_PYTEST_RETRY_MAX-25}" history="${HERDR_PYTEST_RETRY_HISTORY-${HERDR_CI_STATE:-/home/wohlgemuth/woodpecker/ci/state/herdr}/pytest-retried-history.jsonl}"
+  local retry_max="${HERDR_PYTEST_RETRY_MAX-25}"
   local -a args=() ids=() files=()
   case "$retry_max" in ''|*[!0-9]*) echo "HERDR_PYTEST_RETRY_MAX must be a number, got '$retry_max'" >&2; return 1 ;; esac
   case "$-" in *e*) restore=1 ;; esac
@@ -76,6 +78,8 @@ herdr_pytest_run_fast() {
     while IFS= read -r -d '' word; do files+=("$word"); done < <(python "$plugin" files "$failed_file")
     if herdr_pytest_session_failure "$log"; then
       echo "== pytest: the pass failed at session level (coverage floor or internal error), not only in tests; nothing is retried (the failure stands) =="
+    elif [ "${#ids[@]}" -gt 0 ] && [ "${#files[@]}" -eq 0 ]; then
+      echo "== pytest: the failed ids (${ids[*]}) name no test file (an xdist worker crash?); nothing safe to retry, the failure stands =="
     elif [ "${#ids[@]}" -eq 0 ]; then
       echo "== pytest: the pass failed but no failed test ids were recorded; not retrying (the failure stands) =="
     elif [ "${#ids[@]}" -gt "$retry_max" ]; then
@@ -88,7 +92,7 @@ herdr_pytest_run_fast() {
       status=$?
       # 0 only when the retry passed AND settle is satisfied: a failure the retry could not attribute (a hang, an internal error) or
       # a retried test that did not actually pass (skipped) can never come out as a pass.
-      python "$plugin" settle "$failed_file" "$ids_file" "${retried_file:-/dev/null}" "$history" || [ "$status" -ne 0 ] || status=1
+      python "$plugin" settle "$failed_file" "$ids_file" "${retried_file:-/dev/null}" || [ "$status" -ne 0 ] || status=1
       rm -f "$ids_file"
     fi
   fi
