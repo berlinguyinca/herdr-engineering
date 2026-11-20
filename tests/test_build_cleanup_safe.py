@@ -619,9 +619,9 @@ def test_a_process_path_through_a_symlink_is_the_same_directory(root, tmp_path):
     target = local_target(root)
     alias = tmp_path / "alias"
     alias.symlink_to(target.parent, target_is_directory=True)
-    holds = [(4242, "napper", "uses", alias / "target/debug/deps/napper")]
+    holds = [(4242, "napper", "uses", alias / "target/debug/deps/napper", frozenset())]
     assert cleanup._busy_reason(holds, target) is not None
-    assert cleanup._busy_reason([(4242, "napper", "uses", tmp_path / "elsewhere/bin")], target) is None
+    assert cleanup._busy_reason([(4242, "napper", "uses", tmp_path / "elsewhere/bin", frozenset())], target) is None
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
@@ -727,3 +727,68 @@ def test_an_orphan_that_a_live_cargo_builds_into_is_kept(root):
     finally:
         _stop(build)
     assert sweep(root)["removed"] == [str(target)]  # nothing uses it any more: now it is an orphan to remove
+
+
+# --- round 13: identity from the kernel, a bounded busy check, a markerless target that is still cleanable --
+
+def _in_another_mount_namespace(source: Path, tmp_path: Path) -> tuple[subprocess.Popen, Path]:
+    """A real process (``bwrap`` mount namespace) whose cwd is ``source`` bound at a path that does not exist
+    on this host, as in a devcontainer or a rootless container under the same uid."""
+    if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
+        pytest.skip("needs Linux and bubblewrap")
+    view = tmp_path / "ns-view"
+    view.mkdir()
+    inside = view / "workspace"
+    proc = subprocess.Popen(
+        ["bwrap", "--die-with-parent", "--bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+         "--tmpfs", str(view), "--bind", str(source), str(inside), "--chdir", str(inside), "sleep", "120"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        _wait_for(lambda: proc.poll() is not None or any(hold[3] == inside for hold in cleanup._scan()),
+                  "the namespaced process to be seen")
+        if proc.poll() is not None:
+            pytest.skip(f"cannot create a mount namespace here: {proc.stderr.read().decode().strip()}")
+    except BaseException:
+        _stop(proc)
+        raise
+    assert not inside.exists(), "the namespaced path must not exist in this namespace"
+    return proc, inside
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("what", ["target", "workspace"])
+def test_a_process_in_another_mount_namespace_keeps_the_target(root, tmp_path, what):
+    target = local_target(root)
+    proc, inside = _in_another_mount_namespace(target if what == "target" else target.parent, tmp_path)
+    try:
+        _age(target, 48)
+        result = sweep(root)
+        assert result["removed"] == [] and target.exists(), result
+        assert result["blocked"] and f"uses {inside}" in result["blocked"][0]["reason"], result
+    finally:
+        _stop(proc)
+    _age(target, 48)
+    assert sweep(root)["removed"] == [str(target)]
+
+
+def test_a_busy_check_that_cannot_finish_in_time_fails_closed_and_frees_the_lock(root, monkeypatch):
+    """The scan stats files of arbitrary processes, which a dead network mount can block: it runs in a child
+    with a deadline. (A hung mount cannot be made without privileges; a deadline nothing can meet is real.)"""
+    target = local_target(root)
+    monkeypatch.setenv("HERDR_BUSY_CHECK_SECONDS", "0.001")
+    started = time.monotonic()
+    held = sweep(root)
+    assert time.monotonic() - started < 30
+    assert held["removed"] == [] and target.exists() and held["aborted"], held
+    assert any("busy check timed out" in error for error in held["errors"]), held
+    monkeypatch.delenv("HERDR_BUSY_CHECK_SECONDS")
+    assert sweep(root)["removed"] == [str(target)]  # the lock was released, the next sweep is fine
+
+
+def test_an_idle_markerless_managed_target_is_cleaned_and_its_marker_restored(root):
+    target, workspace = managed_target(root, "mless")
+    (target / TARGET_MARKER).unlink()  # what a killed ``cargo clean`` leaves, the owner record still there
+    _age(target, 48)
+    assert sweep(root)["removed"] == [str(target)]
+    assert (target / TARGET_MARKER).is_file() and (target / "CACHEDIR.TAG").is_file()
+    assert prepare_target(root / "sccache", workspace) == target

@@ -103,6 +103,13 @@ The default-on job is narrow. It deletes exactly two kinds of target and nothing
    `CACHEDIR.TAG` are put back in a `finally`, however `cargo clean` ends (even a timeout), so a workspace
    `./target` alias never dangles. `prepare_target` writes the tag for new and existing managed targets, since newer
    cargo refuses to clean a directory without one.
+   On Linux the identity comes from the kernel (the `/proc/<pid>/cwd`, `exe` and `fd/*` links and the dev:inode
+   columns of `maps`), so a process in another mount namespace (devcontainer, rootless container) is seen even
+   though its path does not exist here. The scan runs in a child process with a deadline
+   (`HERDR_BUSY_CHECK_SECONDS`, default 120 s) so a dead NFS/sshfs mount cannot hang a sweep or a build's guard;
+   on timeout nothing is cleaned, the sweep reports "busy check timed out" and releases its lock. Processes of
+   every uid are scanned where `/proc` is readable. Where it is not (`hidepid`, macOS without root) a target
+   used by another user's process is not detected; do not share targets across users.
    Paths are compared by identity, never by spelling: the busy check stats each process path and its ancestors and
    compares (device, inode) with the target and the workspace, so a root typed as `~/work` for `~/Work`, a symlink
    or a bind mount still matches. Ownership is also recorded outside the target, in

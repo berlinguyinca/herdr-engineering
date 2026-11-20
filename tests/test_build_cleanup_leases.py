@@ -172,40 +172,32 @@ root, state, high = sys.argv[1:4]
 print(json.dumps(c.run_once([root], state, high_water=float(high), low_water=0.0, min_age_hours=24)))
 """
 
-# A ``git`` first on the sweep's PATH: its first call (the sweep's check that the target is untracked) waits
-# for our signal and then runs the real git. The sweep is real and unmodified; only the wait is ours.
-_GIT_GATE = """#!/bin/sh
-if [ ! -e "{ready}" ]; then
-  : > "{ready}"
-  while [ ! -e "{go}" ]; do sleep 0.02; done
-fi
-exec "{git}" "$@"
-"""
+def _busy_check_running(sweeper: subprocess.Popen) -> bool:
+    """True while the sweep's own child (the process scan of the busy check) exists: a real process that
+    runs after the sweep's lease check and before it removes anything."""
+    out = subprocess.run(["ps", "-ww", "-o", "pid=,ppid=,args=", "-A"], capture_output=True, text=True).stdout
+    return any(f" {sweeper.pid} " in f" {line.split(None, 2)[1]} " and "_busy_child" in line
+               for line in out.splitlines() if len(line.split(None, 2)) == 3)
 
 
 def sweep_while_racing(root, state, tmp_path, race):
     """Run a real sweep in another process and run ``race()`` while that sweep is between its first
-    checks and its removal. The sweep stops at a sync point of ours (not inside a timeout-bounded
-    subprocess) and goes on when ``race`` has run; every wait is for a signal, never for a fixed time."""
+    checks and its removal. The sync point is real: the sweep starts a child process to scan the host
+    for busy targets (after its lease check, before it removes anything), and we act once that child
+    exists. No fake on PATH, no fixed sleeps."""
     import json
-    import shutil
-    ready, go = tmp_path / "ready", tmp_path / "go"
-    shim = tmp_path / "gate-bin"
-    shim.mkdir()
-    (shim / "git").write_text(_GIT_GATE.format(ready=ready, go=go, git=shutil.which("git")))
-    (shim / "git").chmod(0o755)
-    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
-           "PATH": f"{shim}{os.pathsep}{os.environ['PATH']}"}
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
     child = subprocess.Popen([sys.executable, "-c", _RACING_CHILD, str(root), str(state),
                               str(force(root)["high_water"])], env=env, stdout=subprocess.PIPE, text=True)
     try:
         deadline = time.monotonic() + 300
-        while not ready.exists():
-            assert child.poll() is None and time.monotonic() < deadline, "sweep never reached its removal step"
-            time.sleep(0.02)
+        while not _busy_check_running(child):
+            assert child.poll() is None and time.monotonic() < deadline, "sweep never reached its busy check"
+            time.sleep(0.002)
         race()
-    finally:
-        go.write_text("go")
+    except BaseException:
+        child.kill()
+        raise
     out, _ = child.communicate(timeout=300)
     return json.loads(out.splitlines()[-1])
 
