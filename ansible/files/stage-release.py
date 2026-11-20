@@ -62,12 +62,15 @@ def compute_digest(release):
     Two stagings of one commit produce the same digest; any in-place edit changes it."""
     release = Path(release)
     entries = []
-    for path in release.rglob('*'):
-        relative = path.relative_to(release)
-        if relative.parts and relative.parts[0] in DIGEST_EXCLUDED:
-            continue
-        if path.is_file() and not path.is_symlink():
-            entries.append(relative)
+    for current, dirnames, filenames in os.walk(release):
+        if Path(current) == release:
+            # Prune the excluded top-level trees so complete()/converged() do not
+            # stat tens of thousands of node_modules files on every call.
+            dirnames[:] = [name for name in dirnames if name not in DIGEST_EXCLUDED]
+        for name in filenames:
+            path = Path(current) / name
+            if path.is_file() and not path.is_symlink():
+                entries.append(path.relative_to(release))
     digest = hashlib.sha256()
     for relative in sorted(entries, key=lambda item: item.as_posix()):
         digest.update(relative.as_posix().encode('utf-8'))
@@ -222,9 +225,28 @@ def _stage(home, revision, kind, repository, runner):
             runner([str(venv / 'bin/python'), '-m', 'pip', 'install', '--quiet', '--upgrade', str(release)])
             verify_herdr_distribution(home, release, runner)
         verify_checkout(release, revision, runner)
-        result = {'revision': revision, 'sourceRoot': str(release),
-                  'artifactDigest': compute_digest(release), 'patches': []}
-        atomic_json(receipt, result)
+        # An already-attested release is never silently re-baselined. Re-staging a
+        # release whose receipt records a digest must verify the on-disk content
+        # against that receipt -- gitignored drift passes `git status` but not the
+        # digest -- and refuse drift instead of blessing it as the new baseline
+        # (the 599c06d0 laundering path). A verified release keeps its receipt and
+        # patch ledger untouched; only a first (or pre-digest) staging mints one.
+        prior = None
+        if receipt.exists():
+            try:
+                candidate = json.loads(receipt.read_text())
+                if isinstance(candidate, dict) and candidate.get('artifactDigest'):
+                    prior = candidate
+            except ValueError:
+                prior = None
+        if prior is not None:
+            if verify_artifact(release, prior) == 'drift':
+                raise RuntimeError('Managed release content drifted from its receipt; refusing overwrite')
+            result = prior
+        else:
+            result = {'revision': revision, 'sourceRoot': str(release),
+                      'artifactDigest': compute_digest(release), 'patches': []}
+            atomic_json(receipt, result)
         if pending_settings:
             settings, before, value = pending_settings
             settings.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

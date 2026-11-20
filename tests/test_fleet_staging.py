@@ -348,3 +348,94 @@ def test_record_patch_appends_ledger_entry_and_keeps_verification_honest(reposit
     # A further undocumented edit drifts again.
     target.write_text('{"name":"pi-engineering-runtime","hotpatch":683,"sneaky":true}')
     assert stage.verify_artifact(release, receipt) == 'drift'
+
+
+@pytest.fixture
+def ignoring_repository(tmp_path):
+    # An upstream whose .gitignore hides a build-output directory: edits there are
+    # invisible to `git status` but are part of the artifact the digest proves.
+    repo = tmp_path / 'upstream-ignored'
+    repo.mkdir()
+    subprocess.run(['git', 'init', '-b', 'main', str(repo)], check=True, capture_output=True)
+    for key, value in [('user.name', 'Test'), ('user.email', 'test@example.test')]:
+        subprocess.run(['git', '-C', str(repo), 'config', key, value], check=True)
+    (repo / 'package.json').write_text(json.dumps({'name': 'pi-engineering-runtime'}))
+    (repo / 'package-lock.json').write_text('{}')
+    (repo / '.gitignore').write_text('node_modules/\ngenerated/\n')
+    subprocess.run(['git', '-C', str(repo), 'add', 'package.json', 'package-lock.json', '.gitignore'],
+                   check=True)
+    subprocess.run(['git', '-C', str(repo), 'commit', '-m', 'initial'], check=True, capture_output=True)
+    sha = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+    return repo, sha
+
+
+def test_restaging_a_drifted_release_is_refused_not_re_baselined(ignoring_repository, tmp_path):
+    # The laundering path: a gitignored file changes, git status stays clean, so
+    # verify_checkout passes. A re-stage must NOT recompute the digest from the
+    # drifted content and bless it -- it must refuse and preserve the receipt.
+    stage = module()
+    repo, sha = ignoring_repository
+    home = tmp_path / 'home'
+    result = stage.stage_pi(home, sha, repository=str(repo), runner=install_ok)
+    release = Path(result['sourceRoot'])
+    receipt_path = release.parents[1] / 'receipts' / (sha + '.json')
+    trusted = json.loads(receipt_path.read_text())
+    # A gitignored build artifact appears/drifts in place (git status cannot see it).
+    (release / 'generated').mkdir(exist_ok=True)
+    (release / 'generated' / 'out.js').write_text('TAMPERED')
+    assert subprocess.check_output(['git', '-C', str(release), 'status', '--porcelain'], text=True) == ''
+    with pytest.raises(RuntimeError, match='drift'):
+        stage.stage_pi(home, sha, repository=str(repo), runner=install_ok)
+    # The trusted receipt is preserved, not overwritten with the tampered digest.
+    assert json.loads(receipt_path.read_text()) == trusted
+    assert stage.describe_pi(home, runner=install_ok) is None
+
+
+def test_restaging_a_recorded_patch_release_preserves_the_ledger(ignoring_repository, tmp_path):
+    # A gitignored change with a ledger entry that explains it verifies; a re-stage
+    # must reuse the existing receipt (ledger intact), never reset patches to [].
+    stage = module()
+    repo, sha = ignoring_repository
+    home = tmp_path / 'home'
+    result = stage.stage_pi(home, sha, repository=str(repo), runner=install_ok)
+    release = Path(result['sourceRoot'])
+    root = release.parents[1]
+    before = stage.compute_digest(release)
+    (release / 'generated').mkdir(exist_ok=True)
+    (release / 'generated' / 'out.js').write_text('patched')
+    after = stage.compute_digest(release)
+    stage.record_patch(root, sha, path='generated/out.js', before=before, after=after,
+                       actor='operator', reason='documented hotpatch')
+    patched = json.loads((root / 'receipts' / (sha + '.json')).read_text())
+    again = stage.stage_pi(home, sha, repository=str(repo), runner=install_ok)
+    assert json.loads((root / 'receipts' / (sha + '.json')).read_text()) == patched
+    assert again['patches'] == patched['patches'] and again['artifactDigest'] == patched['artifactDigest']
+
+
+def test_describe_refuses_a_gitignored_drift(ignoring_repository, tmp_path):
+    # describe's new verify_artifact gate: content the digest catches but git does not.
+    stage = module()
+    repo, sha = ignoring_repository
+    home = tmp_path / 'home'
+    result = stage.stage_pi(home, sha, repository=str(repo), runner=install_ok)
+    assert stage.describe_pi(home, runner=install_ok) == result
+    (Path(result['sourceRoot']) / 'generated').mkdir(exist_ok=True)
+    (Path(result['sourceRoot']) / 'generated' / 'out.js').write_text('TAMPERED')
+    assert stage.describe_pi(home, runner=install_ok) is None
+
+
+def test_stage_release_and_host_apply_digest_contracts_agree(repository, tmp_path):
+    # Cross-unit parity: a receipt written by stage-release.py must be accepted by
+    # host_apply's independent copy of the digest contract, and both must see the
+    # same drift. If the two deployment units diverge, this fails.
+    from herdr_engineering.fleet_watch import host_apply
+    stage = module()
+    repo, sha = repository
+    home = tmp_path / 'home'
+    result = stage.stage_pi(home, sha, repository=str(repo), runner=install_ok)
+    release = Path(result['sourceRoot'])
+    receipt = json.loads((release.parents[1] / 'receipts' / (sha + '.json')).read_text())
+    assert receipt['artifactDigest'] == host_apply._artifact_digest(release)
+    assert host_apply.receipt_status(release, receipt) == 'verified'
+    (release / 'package.json').write_text('{"name":"pi-engineering-runtime","edited":true}')
+    assert host_apply.receipt_status(release, receipt) == 'drift'

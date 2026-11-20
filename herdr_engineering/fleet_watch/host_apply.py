@@ -509,14 +509,21 @@ _DIGEST_EXCLUDED = {".git", "node_modules"}
 
 
 def _artifact_digest(release: Path) -> str:
-    entries = [p for p in release.rglob("*")
-               if p.is_file() and not p.is_symlink()
-               and p.relative_to(release).parts[0] not in _DIGEST_EXCLUDED]
+    entries: list[Path] = []
+    for current, dirnames, filenames in os.walk(release):
+        if Path(current) == release:
+            # Prune excluded top-level trees so complete()/converged()/checks() do
+            # not walk tens of thousands of node_modules files on every call.
+            dirnames[:] = [name for name in dirnames if name not in _DIGEST_EXCLUDED]
+        for name in filenames:
+            path = Path(current) / name
+            if path.is_file() and not path.is_symlink():
+                entries.append(path.relative_to(release))
     digest = hashlib.sha256()
-    for path in sorted(entries, key=lambda p: p.relative_to(release).as_posix()):
-        digest.update(path.relative_to(release).as_posix().encode("utf-8"))
+    for relative in sorted(entries, key=lambda item: item.as_posix()):
+        digest.update(relative.as_posix().encode("utf-8"))
         digest.update(b"\x00")
-        digest.update(path.read_bytes())
+        digest.update((release / relative).read_bytes())
     return "sha256:" + digest.hexdigest()
 
 
