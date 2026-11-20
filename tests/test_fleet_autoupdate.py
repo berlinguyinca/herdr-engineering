@@ -478,6 +478,26 @@ def test_daily_unit_skips_pi_step_when_controller_update_not_ok(checkout, capsys
     assert recorded["detail"]["pi_rollout"]["status"] == "skipped"
 
 
+def test_daily_unit_skips_when_another_driver_holds_the_rollout_lock(checkout, monkeypatch, capsys):
+    """Lock contention from a concurrent `fleet rollout run` is time, not a failure (#844)."""
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", PIN)
+    plan = {"id": PLAN_ID, "revision": PIN, "status": "pending"}
+    with patch.object(fleet_rollout, "latest_unfinished", return_value=plan), \
+         patch.object(fleet_rollout, "run_rollout",
+                      side_effect=BlockingIOError(11, "Resource temporarily unavailable")), \
+         patch.object(fleet_autoupdate, "fleet_update",
+                      return_value={"ok": True, "revision": "d" * 40, "steps": {}}):
+        assert fleet_autoupdate.main() == 0  # the run stays green
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["pi_rollout"]["status"] == "skipped"
+    assert "holds the lock" in out["pi_rollout"]["reason"]
+    recorded = fleet_autoupdate.read_state()
+    assert recorded["outcome"] == "updated"
+
+
 def test_daily_unit_keeps_controller_update_when_rollout_drain_errors(checkout, monkeypatch, capsys):
     """A drain error goes red but never discards the successful controller update (#844)."""
     from herdr_engineering import fleet_autoupdate, fleet_rollout

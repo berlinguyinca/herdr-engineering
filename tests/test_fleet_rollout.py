@@ -2429,6 +2429,10 @@ def test_rollout_convergence_handlers_are_wired(tmp_path, monkeypatch, capsys):
     from herdr_engineering.fleet_rollout import RolloutStore
 
     monkeypatch.delenv("HERDR_PI_ROLLOUT_REVISION", raising=False)
+    # Point HOME at a pin-less temp dir: read_pin() otherwise falls back to the real
+    # ~/.config/herdr-engineering/pi-rollout-revision, making the fail-closed plan
+    # assertion host-dependent (a pinned controller would plan and exit 0).
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     state = str(tmp_path / "state")
     store = RolloutStore(tmp_path / "state")
 

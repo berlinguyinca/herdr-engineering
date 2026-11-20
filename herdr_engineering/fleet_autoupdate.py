@@ -260,6 +260,15 @@ def pi_rollout_step(root: Path, *, store=None) -> dict:
         }
     try:
         return _drain_pinned_rollout(root, store, pin)
+    except BlockingIOError:
+        # Another rollout driver already holds the lock - typically an operator's
+        # `fleet rollout run --id X`, which keeps the runner lock while hosts stay
+        # unreachable (possibly for days). That contention is time, not a failure:
+        # skip this pass and keep the run green so the unit does not go red nightly.
+        return {
+            "status": "skipped",
+            "reason": "another rollout driver holds the lock; skipping this pass",
+        }
     except (OSError, ValueError, RuntimeError) as exc:
         return {"status": "error", "error": str(exc)}
 
