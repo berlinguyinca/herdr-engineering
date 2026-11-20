@@ -32,3 +32,28 @@ Guidance if enabling any of them:
 * Keep the trigger idempotent: key by session id and skip when a handoff for the session is already `queued`.
 * Prefer a warning ("context 80% full, run /handoff") to an unattended launch; a launch opens a new agent that spends tokens.
 * Never let a hook write settings itself; an opt-in snippet belongs in the user's own config under their review.
+
+## Subagent registry hooks (installed by default)
+
+`scripts/install.sh` step 7c2 adds the managed `SubagentStart` and `SubagentStop` hooks to `~/.claude/settings.json`
+(`herdr-eng handoff auto install --subagents-only`). They record running background agents per pane so the handoff drain
+knows whether to wait. Each command is guarded `[ -x ... ] && ... || true`, so a missing binary or any failure exits 0 and
+never disturbs a session. The step is skipped, and `settings.json` is not created, on a host without Claude Code (no `claude`
+on `PATH` and no `~/.claude`), the same gate as the workflow hooks. Opt out with `--no-subagent-hooks` or `HERDR_INSTALL_SUBAGENT_HOOKS=0`; remove them with
+`herdr-eng handoff auto uninstall`. Foreign hooks are untouched. Only Claude Code emits these events.
+
+### Live check
+
+`tests/e2e/test_subagent_registry_live.py` (marker `herdr_live`, off by default) starts interactive Claude in a pane it
+splits off, asks it for one background agent that sleeps about 20 seconds, and polls
+`herdr-eng handoff subagents --pane <id> --status --json` until `live == 1`, then `live == 0`. It skips unless a Herdr
+socket and `HERDR_PANE_ID` are present, `claude` and `herdr-eng` are installed, and the managed hooks (marker
+`herdr-handoff-auto`) are already in `~/.claude/settings.json`; it only reads that file. After installing the hooks, run it
+from a Herdr pane, with `HERDR_LIVE_CWD` set to a folder Claude already trusts:
+
+```
+pytest tests/e2e/test_subagent_registry_live.py -m herdr_live -v
+```
+
+Observed hook payload keys: to be recorded after the first live run (not yet measured; the registry reads `agent_id` and
+`agent_type` and ignores anything else).
