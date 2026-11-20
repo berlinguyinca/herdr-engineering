@@ -118,8 +118,9 @@ The default-on job is narrow. It deletes exactly two kinds of target and nothing
    never by cwd, open files or mappings. Matched: an absolute path in any argument (also the value after any `=`,
    an entry of a `:` list, or a glued `-L/x`) inside the target or the workspace; and, because a relative path
    cannot be resolved without the cwd, a program started by a relative path (`./target/release/server`) or a
-   process name (`comm`) that equals the name of a regular file anywhere in the target (this errs toward keeping
-   the target). Other relative arguments are not looked at. `sudo -i` and setuid-root binaries run with euid 0
+   process name (`comm`, which the kernel cuts at 15 characters, so a file whose first 15 characters equal it also
+   matches) that equals the name of a regular file anywhere in the target (this errs toward keeping the target;
+   a title containing whitespace, such as `sshd-session: user@pts/3`, is not a name and is ignored). Other relative arguments are not looked at. `sudo -i` and setuid-root binaries run with euid 0
    and count as another uid's process.
    Paths are compared by identity, never by spelling: the busy check stats each process path and its ancestors and
    compares (device, inode) with the target and the workspace, so a root typed as `~/work` for `~/Work`, a symlink

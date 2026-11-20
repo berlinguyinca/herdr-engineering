@@ -1065,7 +1065,39 @@ def test_a_busy_check_whose_child_dies_without_an_answer_fails_closed(root, tmp_
     assert result["removed"] == []
 
 
-@pytest.mark.skip(reason="an unstat-able fd/ under a user-owned /proc/<pid> cannot be produced for real: the "
-                         "kernel gives /proc/<pid> mode 0555, so only the mode-0 stand-in above reaches that branch")
-def test_an_fd_that_cannot_be_stat_ed_still_fails_closed_under_herdr():
-    raise AssertionError
+# Not tested: an ``fd/`` that cannot be stat'ed under a user-owned ``/proc/<pid>`` (it must still fail closed
+# under herdr). The kernel gives ``/proc/<pid>`` mode 0555, so it cannot be produced for real; only the mode-0
+# stand-in in ``test_an_unverifiable_process_fails_the_scan_closed`` reaches that branch.
+
+
+def test_cmdline_paths_keep_a_path_with_a_colon():
+    assert "/abs/a:b/t" in cleanup._cmdline_paths(["--dir=/abs/a:b/t"])
+    assert "/abs/a:b/t" in cleanup._cmdline_paths(["/abs/a:b/t"])
+    assert "/abs/a:b" in cleanup._cmdline_paths(["-L/abs/a:b"])
+
+
+def test_cmdline_paths_of_an_argument_full_of_equals_signs_is_linear():
+    started = time.monotonic()
+    assert "/x" in cleanup._cmdline_paths(["=" * 100_000 + "/x"])
+    assert time.monotonic() - started < 1, "splitting an argument of many ``=`` must not be quadratic"
+
+
+def _proc_dir(base: Path, comm: str, argv: list[str]) -> Path:
+    """A real directory shaped like ``/proc/<pid>``: the two world-readable files the fallback reads."""
+    pid = base / "4242"
+    pid.mkdir(parents=True)
+    (pid / "comm").write_text(comm + "\n")
+    (pid / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+    return pid
+
+
+def test_cmdline_holds_tell_the_comm_from_the_argv0_basename(tmp_path):
+    held = lambda pid: {(how, path.name) for _n, _c, how, path, _i in cleanup._cmdline_holds(pid, 1) if how == "named"}  # noqa: E731
+    assert held(_proc_dir(tmp_path / "a", "server", ["./target/x/runner"])) == {("named", "server"), ("named", "runner")}
+    assert held(_proc_dir(tmp_path / "b", "server", ["/opt/bin/server"])) == {("named", "server")}  # absolute: comm only
+    assert held(_proc_dir(tmp_path / "c", "ping", ["ping", "-c", "1"])) == {("named", "ping")}
+
+
+def test_a_rewritten_process_title_is_not_a_name(tmp_path):
+    pid = _proc_dir(tmp_path, "sshd-session: u", ["sshd-session: user@pts/3"])
+    assert [h for h in cleanup._cmdline_holds(pid, 1) if h[2] == "named"] == []
