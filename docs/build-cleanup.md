@@ -114,9 +114,13 @@ The default-on job is narrow. It deletes exactly two kinds of target and nothing
    `target/release/svc`), `sudo`-run binaries and rootful containers with a different uid are **not** detected,
    nor are any other user's processes on macOS. Do not run such processes from a managed target.
    This user's own non-dumpable processes (`ping`, file-capability binaries, anything that calls
-   `prctl(PR_SET_DUMPABLE, 0)`) have a root-owned `fd/`; they are detected **only through their command line**: a
-   program path or an absolute argument inside the target or the workspace keeps it, while cwd, open files and
-   mappings are not seen. `sudo -i` and setuid-root binaries run with euid 0 and count as another uid's process.
+   `prctl(PR_SET_DUMPABLE, 0)`) have a root-owned `fd/`; they are detected **only through their command line**,
+   never by cwd, open files or mappings. Matched: an absolute path in any argument (also the value after any `=`,
+   an entry of a `:` list, or a glued `-L/x`) inside the target or the workspace; and, because a relative path
+   cannot be resolved without the cwd, a program started by a relative path (`./target/release/server`) or a
+   process name (`comm`) that equals the name of a regular file anywhere in the target (this errs toward keeping
+   the target). Other relative arguments are not looked at. `sudo -i` and setuid-root binaries run with euid 0
+   and count as another uid's process.
    Paths are compared by identity, never by spelling: the busy check stats each process path and its ancestors and
    compares (device, inode) with the target and the workspace, so a root typed as `~/work` for `~/Work`, a symlink
    or a bind mount still matches. Ownership is also recorded outside the target, in

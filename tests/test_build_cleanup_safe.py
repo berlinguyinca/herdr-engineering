@@ -913,7 +913,9 @@ def _alive(pid: int) -> bool:
 
 def test_a_timed_out_busy_check_kills_its_whole_process_group(root, tmp_path, monkeypatch):
     """The scan child starts a real grandchild (through a ``sitecustomize`` on its path, as ``lsof`` is one on
-    macOS) and then hangs. After the deadline both must be gone: killing only the direct child leaves it."""
+    macOS) and then hangs. After the deadline both must be gone: killing only the direct child leaves it.
+    The ``sitecustomize`` is a test seam that makes the child hang at interpreter start, so ``_busy_child``
+    itself never runs: it stands in for a slow ``lsof`` and is not a substitute for any production code path."""
     local_target(root)
     hook = tmp_path / "hook"
     hook.mkdir()
@@ -947,7 +949,7 @@ def test_a_non_dumpable_process_running_a_binary_from_the_target_keeps_the_targe
     env = {**os.environ, "PYTHONHOME": sys.base_prefix, "PYTHONPATH": ""}
     proc = subprocess.Popen([str(napper), "-S", "-c", _NON_DUMPABLE], env=env, start_new_session=True)
     try:
-        _wait_for(lambda: _refuses_fd_listing(os.getpid()) or _refuses_fd(proc.pid), "napper to refuse fd/")
+        _wait_for(lambda: _refuses_fd(proc.pid), "napper to refuse fd/")
         _age(target, 48)
         result = sweep(root)
         assert result["removed"] == [] and target.exists(), result
@@ -980,7 +982,7 @@ def test_a_clean_that_finds_no_ownership_record_keeps_the_target_and_says_why(ro
                              env={**os.environ, "PYTHONPATH": str(Path(cleanup.__file__).parent.parent)})
     try:
         assert child.stdout.readline().strip() == "ready"
-        time.sleep(2)  # the child is past its workspace lookup and waits for the lock we hold
+        _wait_for(lambda: _waits_for_lock(child.pid), "the child to wait for the manager lock")
         (target / TARGET_MARKER).unlink()
         cleanup.owner_record(target.parent, target.name).unlink()
     finally:
@@ -988,3 +990,82 @@ def test_a_clean_that_finds_no_ownership_record_keeps_the_target_and_says_why(ro
     out, _ = child.communicate(timeout=120)
     assert "ownership" in out, out
     assert not (target / TARGET_MARKER).exists() and (target / "debug").exists()
+
+
+def _waits_for_lock(pid: int) -> bool:
+    """True once ``pid`` is blocked in flock (Linux: ``/proc/locks`` lists a waiter as ``->``). Without
+    ``/proc/locks`` (macOS) nothing real can be observed, so the caller is simply given time."""
+    try:
+        for line in Path("/proc/locks").read_text().splitlines():
+            fields = line.split()
+            if "->" in fields and str(pid) in fields[fields.index("->"):][:7]:
+                return True
+        return False
+    except OSError:
+        time.sleep(2)  # no /proc/locks (macOS): the best a real process offers
+        return True
+
+
+def test_cmdline_paths_read_every_value_short_option_and_list_entry():
+    assert "/abs/t" in cleanup._cmdline_paths(["--define=k=/abs/t"])
+    assert "/abs/t" in cleanup._cmdline_paths(["-L/abs/t"])
+    assert {"/a", "/b"} <= cleanup._cmdline_paths(["--path=/a:/b"])
+    assert cleanup._cmdline_paths(["-c", "1", "relative/x", "--n=3", "-v"]) == set()
+
+
+@pytest.mark.integration
+def test_a_non_dumpable_process_run_by_a_relative_path_keeps_the_target(root, tmp_path):
+    """``./target/debug/server`` after a ``setcap``: the cwd is unreadable and no absolute path is on the
+    command line, but the program's name is a regular file of the target."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("needs /proc")
+    target = local_target(root)
+    server = target / "debug" / "server"
+    shutil.copy(sys.executable, server)
+    env = {**os.environ, "PYTHONHOME": sys.base_prefix, "PYTHONPATH": ""}
+    proc = subprocess.Popen([f"./{target.name}/debug/server", "-S", "-c", _NON_DUMPABLE], env=env,
+                            cwd=target.parent, start_new_session=True)
+    try:
+        _wait_for(lambda: _refuses_fd(proc.pid), "server to refuse fd/")
+        _age(target, 48)
+        result = sweep(root)
+        assert result["removed"] == [] and target.exists(), result
+        assert result["blocked"] and f"is named like {server}" in result["blocked"][0]["reason"], result
+    finally:
+        _stop(proc)
+    _age(target, 48)
+    assert sweep(root)["removed"] == [str(target)]
+
+
+@pytest.mark.integration
+def test_the_documented_limit_a_non_dumpable_cwd_in_the_target_is_not_seen(root):
+    """Pins the limit stated in the docs: cwd and open files of a non-dumpable process are unreadable, so one
+    that sits in the target without naming it on its command line does not keep the target."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("needs /proc")
+    target = local_target(root)
+    proc = subprocess.Popen([sys.executable, "-c", _NON_DUMPABLE], cwd=target / "debug", start_new_session=True)
+    try:
+        _wait_for(lambda: _refuses_fd(proc.pid), "the process to refuse fd/")
+        _age(target, 48)
+        assert sweep(root)["removed"] == [str(target)]
+    finally:
+        _stop(proc)
+
+
+def test_a_busy_check_whose_child_dies_without_an_answer_fails_closed(root, tmp_path, monkeypatch):
+    """The child exits non-zero for real (a ``sitecustomize`` that exits), the non-timeout failure path."""
+    local_target(root)
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text("import sys\nsys.exit(3)\n")
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(hook), os.environ.get("PYTHONPATH")])))
+    result = sweep(root)
+    assert result["aborted"] and any("no answer" in error for error in result["errors"]), result
+    assert result["removed"] == []
+
+
+@pytest.mark.skip(reason="an unstat-able fd/ under a user-owned /proc/<pid> cannot be produced for real: the "
+                         "kernel gives /proc/<pid> mode 0555, so only the mode-0 stand-in above reaches that branch")
+def test_an_fd_that_cannot_be_stat_ed_still_fails_closed_under_herdr():
+    raise AssertionError

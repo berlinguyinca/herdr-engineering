@@ -27,8 +27,10 @@ its own locking. Busy checks compare (device, inode), never path spelling. On Li
    and rootful containers running as a different uid are NOT; neither on macOS, where ``lsof`` lists only this
    user's files. Such a process is skipped: ``sudo -i`` and setuid-root binaries (euid 0) by their root-owned
    ``/proc/<pid>``. This user's own non-dumpable processes (``ping``, file-capability binaries, ``prctl``) have a
-   root-owned ``fd/``; they are detected ONLY through their command line (the program path or an absolute
-   argument inside the target or the workspace), not by cwd, open files or mappings.
+   root-owned ``fd/``; they are detected ONLY through their command line, not by cwd, open files or mappings:
+   an absolute path in any argument (also after ``=``, in a ``:`` list, or glued as ``-L/x``) inside the target
+   or the workspace, or a program started by a relative path (``./target/release/x``) or a ``comm`` that is the
+   name of a regular file in the target. Other relative arguments are not looked at.
 
 Targets are skipped when a build lease covers them, when git tracks files in them, or when anything inside
 looks foreign (links, special files, other owners). Only current-user Cargo ``target`` directories inside
@@ -48,6 +50,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import signal
 import stat
@@ -354,16 +357,50 @@ def _scan(proc: Path = Path("/proc")) -> list[Hold]:
     return holds
 
 
+def _cmdline_paths(argv: list[str]) -> set[str]:
+    """Absolute paths an argument spells: the argument itself, the value after any ``=``, the entries of a
+    ``:`` list, and the path of a short option glued to it (``-L/abs``)."""
+    found: set[str] = set()
+    for arg in argv:
+        spellings = [arg] + [arg[i + 1:] for i, char in enumerate(arg) if char == "="]
+        for spelling in spellings:
+            for piece in spelling.split(":"):
+                if piece.startswith("/"):
+                    found.add(piece)
+                elif re.match(r"-[A-Za-z]/", piece):
+                    found.add(piece[2:])
+    return found
+
+
 def _cmdline_holds(pid: Path, number: int) -> list[Hold]:
-    """What a non-dumpable process of this user still gives away: absolute paths on its command line (the
-    program, or an argument such as ``--target-dir=/x``). ``ping`` and ``sudo`` name nothing of a target."""
+    """What a non-dumpable process of this user still gives away on its command line: absolute paths (the
+    program, ``--target-dir=/x``, ``-L/x``, ``a=b=/x``, ``/a:/b``). A relative program path (``./target/x``)
+    cannot be resolved without its cwd, so its basename, and the process's ``comm``, are held as names: a
+    regular file of that name in the target keeps it. Other relative arguments are not looked at. ``ping``
+    and ``sudo`` name nothing of a target."""
     try:
-        name = (pid / "comm").read_text().strip()
+        comm = (pid / "comm").read_text().strip()
         argv = [os.fsdecode(a) for a in (pid / "cmdline").read_bytes().split(b"\0") if a]
     except OSError:
         return []  # unreadable or gone: skipped
-    paths = {item for arg in argv for item in (arg, arg.split("=", 1)[-1]) if item.startswith("/")}
-    return [(number, name, "uses", Path(item), _NO_IDS) for item in sorted(paths)]
+    if not argv:
+        return []
+    holds: list[Hold] = [(number, comm, "uses", Path(item), _NO_IDS) for item in sorted(_cmdline_paths(argv))]
+    names = {comm} | ({os.path.basename(argv[0])} if not argv[0].startswith("/") else set())
+    holds.extend((number, comm, "named", Path(name), _NO_IDS) for name in sorted(names) if name)
+    return holds
+
+
+def _names_a_file_in(target: Path, names: set[str]) -> Path | None:
+    """A regular file inside ``target`` whose name is one of ``names`` (or whose first 15 characters are:
+    ``comm`` is cut there)."""
+    for directory, _dirs, files in os.walk(target):  # walk() never follows links to directories
+        for name in files:
+            if name in names or name[:15] in names:
+                path = Path(directory, name)
+                if path.is_file() and not path.is_symlink():
+                    return path
+    return None
 
 
 def _proc_claims(pid: Path, number: int, name: str) -> list[Hold]:
@@ -533,7 +570,11 @@ def _busy_reason(holds: list[Hold], target: Path) -> str | None:
     target_id = _identity(target)
     target_chain = _chain(target)
     for pid, name, how, path, ids in holds:
-        if how == "uses":
+        if how == "named":
+            found = _names_a_file_in(target, {path.name})
+            if found is not None:
+                return f"{name} (pid {pid}) is named like {found}"
+        elif how == "uses":
             if (ids | _chain(path)) & inside:
                 return f"{name} (pid {pid}) uses {path}"
         elif (target_id and target_id in _chain(path)) or (_identity(path) in target_chain):
