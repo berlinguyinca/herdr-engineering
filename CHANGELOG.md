@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Perf: unit gate no longer collapses to one worker on busy shared nodes; slow tail runs alongside the fast pass
+
+- `scripts/ci/pytest-parallel.sh`: the load-average bound introduced in #888 (`workers = cpus - int(loadavg)`) gave `-n 1` on shared hive nodes where other tenants' load was 28 on 16 CPUs (19 of 101 measured runs took 104-120 minutes against 15-22 with 8 workers). Load now only shaves workers down to a floor of half the CPUs, at least 4 (never above the CPUs); the cgroup CPU-quota cap (#830) is unchanged and still limits workers for genuinely small budgets. The default `--maxprocesses` follows the usable cores (8 to 12) instead of a fixed 8; `HERDR_PYTEST_WORKERS` / `HERDR_PYTEST_MAXPROCESSES` still override.
+- `scripts/ci/unit-gates.sh`: the serial `slow` tail runs concurrently with the fast xdist pass (one niced process, `[slow]`-prefixed output, own watchdog, no shared cache/port/tmp), failing the gate if either pass fails; `HERDR_PYTEST_SLOW_CONCURRENT=0` restores the serial order. Both passes print `--durations=40` and a per-test-file / per-worker time summary (`scripts/ci/pytest-plugins/pytest_file_times.py`) to measure `loadfile` imbalance.
+- `.woodpecker/main-cron.yml`: `labels: {cluster: hive-heavy}` (cron runs had landed on 4-CPU nodes) and a `concurrency` limit of 1 so cron runs never overlap.
+
 ### Chore: pin herdr-handoff 0.5.0
 
 - `lock/upstreams.yaml` pins herdr-handoff to `aed3e8274e6948a774682a55d99b7cd9ef113914` (herdr-handoff#12, v0.5.0: shared handoff store, one takeover per handoff id, `takeover --direction`, `--relaunch`). `check_handoff_dependency` now also requires that `herdr-handoff takeover --help` lists `--direction` (reported as `takeover --direction`, naming 0.5.0), so `herdr-eng doctor` reports an installed 0.4.0 as too old until `scripts/install-handoff.sh` is run.
