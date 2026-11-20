@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: unit-gates retries only the failed tests once, has a flaky quarantine, and four load/disk-sensitive tests are deterministic
+
+- `scripts/ci/pytest-rerun.sh`: after a failing fast pass, only the failed/errored tests are rerun once (serially, by exact node id). A test failing twice is a real failure and still fails the gate (`FAILED TWICE`); a test passing on retry is logged as `RETRIED: <id> ... first failure: <summary>` and listed in `pytest-retried.jsonl` for tracking. `HERDR_PYTEST_RETRY=0` disables it, `HERDR_PYTEST_RETRY_MAX` (25) caps it.
+- New `@pytest.mark.flaky(reason, issue, expires)` marker and `tests/flaky-quarantine.toml` (`scripts/ci/herdr_flaky_plugin.py`): a quarantined test still runs and is reported but cannot fail the gate; reason, issue and expiry are mandatory, enforced by `tests/test_ci_flaky_quarantine.py`, and an expired entry stops quarantining.
+- Tests: the huge-blob starvation test floods a bounded, paced number of connections and compares against a measured baseline with a 5 s floor instead of a fixed 1.0 s (it failed at 1.09 s and exhausted file descriptors); `test_liveness_window_and_clamp` no longer depends on approval and revocation being more than 1 ms apart; `test_build_chaos` pins `min_free_disk_percent: 0` so it does not depend on the free space of the host (3 tests failed on a 99%-full disk).
+
 ### Chore: pin herdr-handoff 0.5.0
 
 - `lock/upstreams.yaml` pins herdr-handoff to `aed3e8274e6948a774682a55d99b7cd9ef113914` (herdr-handoff#12, v0.5.0: shared handoff store, one takeover per handoff id, `takeover --direction`, `--relaunch`). `check_handoff_dependency` now also requires that `herdr-handoff takeover --help` lists `--direction` (reported as `takeover --direction`, naming 0.5.0), so `herdr-eng doctor` reports an installed 0.4.0 as too old until `scripts/install-handoff.sh` is run.

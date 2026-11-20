@@ -67,6 +67,22 @@ INTERNALERROR KeyError, pytest exit 3 (pipeline 1710, load 155 on 4 CPUs). `unit
   workers (default 2; `0` = serial, ~90 min) and the log says so. A genuine test failure, a watchdog hang (124) and a pass are
   never rerun, and a rerun's result is final. A test failure whose own output happens to print a crash signature costs one more
   run, nothing more.
+- When the fast pass fails with ordinary test failures (exit 1, no crash signature), **only the failed and errored tests** are run once
+  more, serially, by exact node id. A test that fails both times is a real failure and the gate still fails (`FAILED TWICE (real
+  failure)`). A test that passes on the retry is logged as `RETRIED: <id> ... first failure: <original summary>` and appended to
+  the machine-readable `pytest-retried.jsonl` (`HERDR_PYTEST_RETRIED_FILE`; one JSON object per line: `nodeid`, `first_failure`, `at`,
+  `pipeline`, `commit`; rewritten each run, empty when nothing was retried) so flakes can be counted and fixed. More than
+  `HERDR_PYTEST_RETRY_MAX` (25) failures are not retried; `HERDR_PYTEST_RETRY=0` disables the retry. A crash rerun's result is final.
+
+### Quarantining a known-flaky test
+
+A quarantined test **still runs and is reported** (a `QUARANTINED flaky tests` section in the pytest output) but a failure of it does
+not fail the gate. Declare it either on the test, `@pytest.mark.flaky(reason="...", issue="#873", expires="2026-12-31")`, or in
+`tests/flaky-quarantine.toml` (`[[quarantine]]` with `nodeid`, `reason`, `issue`, `expires`; a node id also covers every
+parametrisation). All three of reason (15+ characters), issue (`#N` or a URL) and an ISO expiry date are required:
+`tests/test_ci_flaky_quarantine.py` fails the structural gate for an incomplete entry or marker, and an incomplete one never quarantines.
+Past its expiry date an entry stops quarantining and the test fails the gate again, so fix it or renew the date deliberately.
+The plugin is `scripts/ci/herdr_flaky_plugin.py`.
 
 ## Known-flaky gates
 

@@ -138,10 +138,12 @@ def test_a_worker_that_always_dies_reruns_once_and_still_fails(tmp_path: Path) -
     assert runs == 2 and done.returncode != 0, done.stdout + done.stderr
 
 
-def test_a_genuine_test_failure_is_not_rerun(tmp_path: Path) -> None:
+def test_a_genuine_failure_is_retried_once_by_itself_and_still_fails_the_pass(tmp_path: Path) -> None:
     done, runs = run_pass(project(tmp_path, "def test_two():\n    assert 1 == 2\n"))
-    assert runs == 1 and done.returncode == 1, done.stdout + done.stderr
-    assert "rerunning" not in done.stdout + done.stderr
+    out = done.stdout + done.stderr
+    assert runs == 2 and done.returncode == 1, out                 # a deterministic failure is NOT masked by the retry
+    assert "FAILED TWICE (real failure): test_b.py::test_two" in out, out
+    assert "rerunning the parallel pytest pass once" not in out    # that message is the xdist-crash rerun, a different mechanism
 
 
 def test_a_passing_pass_runs_once(tmp_path: Path) -> None:
@@ -157,7 +159,9 @@ def test_a_hang_killed_by_the_real_watchdog_is_not_rerun(tmp_path: Path) -> None
 
 def test_a_serial_pass_has_no_xdist_to_blame_and_is_not_rerun(tmp_path: Path) -> None:
     done, runs = run_pass(project(tmp_path, "import sys\ndef test_two():\n    sys.exit(3)\n"), workers="")
-    assert runs == 1 and done.returncode != 0, done.stdout + done.stderr
+    out = done.stdout + done.stderr
+    # the failing test gets the one-test retry (a different mechanism) but never the xdist-crash rerun of the whole pass
+    assert runs == 2 and done.returncode != 0 and "rerunning the parallel pytest pass once" not in out, out
 
 
 def test_the_serial_rerun_option_runs_without_xdist(tmp_path: Path) -> None:
