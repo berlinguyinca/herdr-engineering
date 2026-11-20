@@ -2273,6 +2273,7 @@ def test_latest_unfinished_tie_breaks_deterministically_and_fails_closed(tmp_pat
 def test_pin_roundtrip_env_override_and_rejects_bad_values(tmp_path, monkeypatch):
     from herdr_engineering.fleet_rollout import read_pin, write_pin
 
+    monkeypatch.delenv("HERDR_PI_ROLLOUT_REVISION", raising=False)
     pin = tmp_path / "pin"
     assert read_pin(pin) is None
     write_pin(SHA, pin)
@@ -2302,12 +2303,10 @@ def test_pin_roundtrip_env_override_and_rejects_bad_values(tmp_path, monkeypatch
 def test_resolve_plan_revision_prefers_explicit_then_pin(tmp_path, monkeypatch):
     from herdr_engineering.fleet_rollout import resolve_plan_revision
 
+    monkeypatch.delenv("HERDR_PI_ROLLOUT_REVISION", raising=False)
     pin = tmp_path / "pin"
-    try:
-        with pytest.raises(ValueError):
-            resolve_plan_revision(None, pin)
-    except ValueError as exc:
-        assert "pi-rollout-revision" in str(exc)
+    with pytest.raises(ValueError, match="pi-rollout-revision"):
+        resolve_plan_revision(None, pin)
     other = "6" * 40
     write = __import__("herdr_engineering.fleet_rollout", fromlist=["write_pin"]).write_pin
     write(other, pin)
@@ -2315,11 +2314,8 @@ def test_resolve_plan_revision_prefers_explicit_then_pin(tmp_path, monkeypatch):
     assert resolve_plan_revision(SHA, pin) == SHA
     monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", "7" * 40)
     assert resolve_plan_revision(None, pin) == "7" * 40
-    try:
-        with pytest.raises(ValueError):
-            resolve_plan_revision("bad", pin)
-    finally:
-        monkeypatch.delenv("HERDR_PI_ROLLOUT_REVISION")
+    with pytest.raises(ValueError, match="40-character commit SHA"):
+        resolve_plan_revision("bad", pin)
 
 
 def test_abandon_settles_and_complete_cannot_be_abandoned(tmp_path):
@@ -2337,6 +2333,52 @@ def test_abandon_settles_and_complete_cannot_be_abandoned(tmp_path):
     done = _make_plan(store, "9" * 40, status="complete", created_at="2026-11-02T00:00:00+00:00")
     with pytest.raises(ValueError):
         abandon_rollout(store, done["id"])
+
+
+def test_apply_and_run_refuse_an_abandoned_plan(tmp_path):
+    """An abandoned plan is settled; reconciling it would silently un-abandon it."""
+    from herdr_engineering.fleet_rollout import (
+        RolloutStore,
+        abandon_rollout,
+        apply_rollout,
+        run_rollout,
+    )
+
+    store = RolloutStore(tmp_path / "state")
+    plan = _make_plan(store, "8" * 40, status="pending", created_at="2026-11-01T00:00:00+00:00")
+    abandon_rollout(store, plan["id"], reason="superseded")
+    with pytest.raises(ValueError, match="abandoned"):
+        apply_rollout(store, plan["id"])
+    with pytest.raises(ValueError, match="abandoned"):
+        run_rollout(store, plan["id"], max_passes=1)
+    assert store.read(plan["id"])["status"] == "abandoned"  # still settled, never reopened
+
+
+def test_prune_judges_abandoned_plans_by_abandoned_time(tmp_path):
+    """A freshly abandoned but old plan keeps its audit window; abandonedAt wins (#844)."""
+    from datetime import UTC, datetime
+
+    from herdr_engineering.fleet_rollout import (
+        RolloutStore,
+        abandon_rollout,
+        list_rollouts,
+        prune_settled,
+    )
+
+    store = RolloutStore(tmp_path / "state")
+    plan = _make_plan(store, "8" * 40, status="pending", created_at="2026-09-01T00:00:00+00:00")
+    # Abandoned today, even though created two months ago.
+    abandon_rollout(store, plan["id"], reason="superseded")
+    settled = store.read(plan["id"])
+    settled["abandonedAt"] = "2026-11-16T00:00:00+00:00"
+    store.write(settled)
+    pruned = prune_settled(store, older_than_days=30, now=datetime(2026, 11, 17, tzinfo=UTC))
+    assert pruned == []  # abandonedAt is within the horizon, so the record stays
+    assert {p["id"] for p in list_rollouts(store)} == {plan["id"]}
+    # Past the horizon measured from abandonedAt, it is finally pruned.
+    pruned = prune_settled(store, older_than_days=30, now=datetime(2026, 12, 20, tzinfo=UTC))
+    assert [p["id"] for p in pruned] == [plan["id"]]
+    assert list_rollouts(store) == []
 
 
 def test_prune_settled_deletes_only_old_settled_records(tmp_path):
@@ -2373,3 +2415,50 @@ def test_rollout_convergence_commands_are_registered():
     assert parser.parse_args(["fleet", "rollout", "prune", "--older-than-days", "7"]).older_than_days == 7
     # --pi-revision is optional: the pin is the fallback target.
     assert parser.parse_args(["fleet", "rollout", "plan"]).pi_revision is None
+
+
+def test_rollout_convergence_handlers_are_wired(tmp_path, monkeypatch, capsys):
+    """The new subcommands must reach their functions, not fall through to store.read (#844).
+
+    Parsing alone proved nothing: the handler dispatched only plan/apply/run and sent
+    latest/abandon/prune to `store.read(args.id)`, which crashed or no-op'd.
+    """
+    import json as _json
+
+    from herdr_engineering.cli import _build_parser, _cmd_fleet_rollout
+    from herdr_engineering.fleet_rollout import RolloutStore
+
+    monkeypatch.delenv("HERDR_PI_ROLLOUT_REVISION", raising=False)
+    state = str(tmp_path / "state")
+    store = RolloutStore(tmp_path / "state")
+
+    def run(*argv):
+        code = _cmd_fleet_rollout(_build_parser().parse_args(["fleet", "rollout", *argv]))
+        return code, _json.loads(capsys.readouterr().out)
+
+    # latest: no unfinished rollout -> a clean "none" outcome, not an AttributeError.
+    code, out = run("latest", "--state", state)
+    assert code == 0 and out["status"] == "none"
+
+    # plan without --pi-revision and no pin -> fails closed with the pin hint, no traceback.
+    code, out = run("plan", "--state", state)
+    assert code == 1 and "pi-rollout-revision" in out["error"]
+
+    # A real unfinished plan is then found by latest, abandoned, and pruned.
+    plan = _make_plan(store, "3" * 40, status="pending",
+                      created_at="2026-10-01T00:00:00+00:00")
+    code, out = run("latest", "--state", state)
+    assert code == 0 and out["id"] == plan["id"]
+
+    code, out = run("abandon", "--id", plan["id"], "--reason", "superseded", "--state", state)
+    assert code == 0 and out["status"] == "abandoned" and out["abandonReason"] == "superseded"
+
+    code, out = run("latest", "--state", state)
+    assert code == 0 and out["status"] == "none"  # abandoned no longer counts as unfinished
+
+    # The horizon protects a freshly-abandoned record...
+    code, out = run("prune", "--older-than-days", "30", "--state", state)
+    assert code == 0 and out["pruned"] == []
+    # ...and the prune handler really deletes once past it (older-than-days 0).
+    code, out = run("prune", "--older-than-days", "0", "--state", state)
+    assert code == 0 and out["pruned"][0]["id"] == plan["id"]

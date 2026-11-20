@@ -95,9 +95,21 @@ def _target(target):
         _identifier(target["session"])
 
 
+def _default_rollout_root() -> Path:
+    """Rollout state lives under XDG_STATE_HOME, like the fleet-auto-update state.
+
+    Honouring the same env var the unattended driver already uses (fleet_autoupdate)
+    keeps the two in one place and lets a test redirect both with one setenv instead
+    of silently writing to the operator's real ~/.local/state (#844).
+    """
+    base = os.environ.get("XDG_STATE_HOME", "").strip()
+    root = Path(base) if base else Path.home() / ".local" / "state"
+    return root / "herdr-engineering" / "rollouts"
+
+
 class RolloutStore:
     def __init__(self, root: Path | None = None):
-        self.root = root or Path.home() / ".local/state/herdr-engineering/rollouts"
+        self.root = root or _default_rollout_root()
 
     def _directory(self):
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -307,19 +319,27 @@ def prune_settled(store, *, older_than_days: int = 30, now=None) -> list:
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(days=older_than_days)
     pruned = []
-    for plan in list_rollouts(store):
-        if plan.get("status") not in ("complete", "abandoned"):
-            continue
-        settled = (plan.get("runner") or {}).get("lastPassAt") or plan.get("createdAt")
-        try:
-            when = datetime.fromisoformat(settled)
-        except (TypeError, ValueError):
-            continue
-        if when.tzinfo is None:
-            when = when.replace(tzinfo=UTC)
-        if when < cutoff:
-            (store.root / (plan["id"] + ".json")).unlink()
-            pruned.append({"id": plan["id"], "status": plan["status"], "settledAt": settled})
+    with store.lock():
+        for plan in list_rollouts(store):
+            if plan.get("status") not in ("complete", "abandoned"):
+                continue
+            # An abandoned plan's audit window starts when it was abandoned, not when it
+            # was created: judging it by createdAt would delete a freshly-abandoned old
+            # plan on the very next prune and lose its abandonReason.
+            settled = (
+                plan.get("abandonedAt")
+                or (plan.get("runner") or {}).get("lastPassAt")
+                or plan.get("createdAt")
+            )
+            try:
+                when = datetime.fromisoformat(settled)
+            except (TypeError, ValueError):
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=UTC)
+            if when < cutoff:
+                (store.root / (plan["id"] + ".json")).unlink(missing_ok=True)
+                pruned.append({"id": plan["id"], "status": plan["status"], "settledAt": settled})
     return pruned
 
 
@@ -1039,6 +1059,8 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
     stage = stage or fleet.stage_pi_runtime
     with store.lock():
         plan = store.read(rollout_id)
+        if plan.get("status") == "abandoned":
+            raise ValueError("rollout is abandoned; plan a fresh one for the pinned revision")
 
         def save():
             store.write(plan)
@@ -1533,6 +1555,8 @@ def run_rollout(
 
     with store.lock(runner_id=rollout_id):
         plan = store.read(rollout_id)
+        if plan.get("status") == "abandoned":
+            raise ValueError("rollout is abandoned; plan a fresh one for the pinned revision")
         passes = 0
         try:
             previous = plan.get("runner", {})

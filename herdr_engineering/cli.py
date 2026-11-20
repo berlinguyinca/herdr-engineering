@@ -2338,9 +2338,13 @@ def _cmd_fleet_rollout(args) -> int:
     from .fleet import FleetError, repo_root
     from .fleet_rollout import (
         RolloutStore,
+        abandon_rollout,
         apply_rollout,
         create_rollout,
         inventory_targets,
+        latest_unfinished,
+        prune_settled,
+        resolve_plan_revision,
         retire_identityless,
         run_rollout,
     )
@@ -2348,14 +2352,22 @@ def _cmd_fleet_rollout(args) -> int:
     store = RolloutStore(Path(args.state) if args.state else None)
     try:
         if args.rollout_command == "plan":
+            revision = resolve_plan_revision(args.pi_revision)
             inventory = Path(args.inventory) if args.inventory else repo_root() / "ansible/inventory/hosts.yml"
-            report = create_rollout(store, args.pi_revision, inventory_targets(inventory, args.host), inventory=inventory)
+            report = create_rollout(store, revision, inventory_targets(inventory, args.host), inventory=inventory)
         elif args.rollout_command == "apply":
             report = apply_rollout(store, args.id)
         elif args.rollout_command == "run":
             report = run_rollout(store, args.id, interval_seconds=args.interval_seconds, max_passes=args.max_passes, max_unchanged_online_passes=args.max_unchanged_online_passes)
         elif args.rollout_command == "retire-identityless":
             report = retire_identityless(store, args.id, settled_by=args.settled_by)
+        elif args.rollout_command == "latest":
+            plan = latest_unfinished(store)
+            report = plan if plan is not None else {"status": "none", "reason": "no unfinished rollout"}
+        elif args.rollout_command == "abandon":
+            report = abandon_rollout(store, args.id, reason=args.reason)
+        elif args.rollout_command == "prune":
+            report = {"pruned": prune_settled(store, older_than_days=args.older_than_days)}
         else:
             report = store.read(args.id)
     except (OSError, ValueError, RuntimeError, FleetError) as exc:

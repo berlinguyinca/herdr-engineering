@@ -478,6 +478,27 @@ def test_daily_unit_skips_pi_step_when_controller_update_not_ok(checkout, capsys
     assert recorded["detail"]["pi_rollout"]["status"] == "skipped"
 
 
+def test_daily_unit_keeps_controller_update_when_rollout_drain_errors(checkout, monkeypatch, capsys):
+    """A drain error goes red but never discards the successful controller update (#844)."""
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", PIN)
+    with patch.object(fleet_rollout, "latest_unfinished",
+                      side_effect=ValueError("corrupt rollout record")), \
+         patch.object(fleet_autoupdate, "fleet_update",
+                      return_value={"ok": True, "revision": "d" * 40, "steps": {}}):
+        assert fleet_autoupdate.main() == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False  # the drain error turns the run red
+    assert out["revision"] == "d" * 40  # ...but the controller update is preserved
+    assert out["pi_rollout"]["status"] == "error"
+    assert "corrupt rollout record" in out["pi_rollout"]["error"]
+    recorded = fleet_autoupdate.read_state()
+    assert recorded["outcome"] == "failed"
+    assert recorded["revision"] == "d" * 40
+    assert "pi rollout step failed" in recorded["reason"]
+
+
 def test_daily_unit_fails_closed_on_broken_pin(checkout, monkeypatch, capsys):
     from herdr_engineering import fleet_autoupdate, fleet_rollout
 

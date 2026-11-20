@@ -225,6 +225,12 @@ def run_update() -> dict:
         result = fleet_update()
         if result.get("ok"):
             result["pi_rollout"] = pi_rollout_step(root)
+            # The controller update already succeeded; its revision stays in `result`.
+            # A drain that could not even run (corrupt record, transport error) is still
+            # a real failure, so the run stays red and failure_reason names it - but the
+            # successful controller update is no longer discarded (#844).
+            if result["pi_rollout"].get("status") == "error":
+                result["ok"] = False
         else:
             result["pi_rollout"] = {"status": "skipped", "reason": "controller update not ok"}
         return result
@@ -236,13 +242,14 @@ def pi_rollout_step(root: Path, *, store=None) -> dict:
     The step resumes the newest unfinished rollout instead of minting a parallel one,
     and only ever targets the pinned revision: plans for other revisions are the
     operator's to settle (abandon) or finish. Skips (no pin, mismatched unfinished
-    plan) are normal, recorded outcomes; only store/transport errors raise and turn
-    the run red.
+    plan) are normal, recorded outcomes. A mangled pin fails closed (raises). A drain
+    that cannot run (corrupt record, transport error) is reported as status="error" so
+    the run goes red without discarding the controller update that already succeeded.
     """
     from . import fleet_rollout
 
     store = store or fleet_rollout.RolloutStore()
-    pin = fleet_rollout.read_pin()
+    pin = fleet_rollout.read_pin()  # a mangled pin fails closed, before any drain work
     if pin is None:
         return {
             "status": "skipped",
@@ -251,6 +258,15 @@ def pi_rollout_step(root: Path, *, store=None) -> dict:
                 "pi-rollout-revision to enable unattended Pi runtime rollouts)"
             ),
         }
+    try:
+        return _drain_pinned_rollout(root, store, pin)
+    except (OSError, ValueError, RuntimeError) as exc:
+        return {"status": "error", "error": str(exc)}
+
+
+def _drain_pinned_rollout(root: Path, store, pin: str) -> dict:
+    from . import fleet_rollout
+
     plan = fleet_rollout.latest_unfinished(store)
     if plan is not None and plan["revision"] != pin:
         return {
@@ -292,6 +308,9 @@ def failure_reason(report: dict) -> str | None:
     if error:
         return str(error)
     if not report.get("ok"):
+        rollout = report.get("pi_rollout") or {}
+        if rollout.get("status") == "error" and rollout.get("error"):
+            return f"pi rollout step failed: {rollout['error']}"
         parity = (report.get("steps") or {}).get("revision_parity") or {}
         for key in ("missing_hosts", "mismatched_hosts", "invalid_hosts",
                     "unexpected_hosts", "duplicate_hosts"):
