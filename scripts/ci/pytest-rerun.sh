@@ -60,10 +60,13 @@ herdr_pytest_run_gate() {
   local fast_runner="$1" slow_runner="$2" fast_expr="$3" slow_expr="$4" restore="" fast=0 slow=0 pid="" statusf
   case "$-" in *e*) restore=1 ;; esac
   set +e
+  # nice, and ionice -c3 (idle I/O class) where the host has it: the tail must never slow the workers' CPU or disk; no ionice = silently just nice.
+  local slow_nice="nice -n 5"
+  command -v ionice >/dev/null 2>&1 && ionice -c3 true >/dev/null 2>&1 && slow_nice="ionice -c3 nice -n 5"
   statusf="$(mktemp "${TMPDIR:-/tmp}/herdr-pytest-slow.XXXXXX")"
   if [ "${HERDR_PYTEST_SLOW_CONCURRENT:-1}" != 0 ]; then
     echo "== pytest (slow tests: serial tail, running alongside the fast pass; its lines start with [slow]) =="
-    ( "$slow_runner" nice -n 5 python -m pytest -q -p no:cacheprovider -m "$slow_expr" ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"}
+    ( "$slow_runner" $slow_nice python -m pytest -q -p no:cacheprovider -m "$slow_expr" ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"}
       echo $? >"$statusf" ) 2>&1 | sed -u 's/^/[slow] /' &
     pid=$!
   fi

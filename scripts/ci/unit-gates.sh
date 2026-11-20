@@ -9,7 +9,7 @@
 # with the common 1,024 soft limit dies about a third of the way through with no summary at all. See scripts/ci/ensure-fd-limit.sh.
 #
 # pytest runs in parallel under pytest-xdist (serial it took ~90 minutes), `--dist=loadfile` so a file's tests share a worker.
-# Overrides: HERDR_PYTEST_WORKERS=<n>|auto|0 (0 = serial), HERDR_PYTEST_MAXPROCESSES=<cap, default the usable cores within 8..12>, HERDR_PYTEST_SLOW_CONCURRENT=0 (slow tail after, not beside, the fast pass). See
+# Overrides: HERDR_PYTEST_WORKERS=<n>|auto|0 (0 = serial), HERDR_PYTEST_MAXPROCESSES=<cap, default 8>, HERDR_PYTEST_SLOW_CONCURRENT=0 (slow tail after, not beside, the fast pass). See
 # scripts/ci/pytest-parallel.sh. The descriptor limit is per process, so each worker leaks only its share of the ~3,000.
 #
 # Hang protection (user rule: timeouts only kill hangs). Each pytest pass runs under scripts/ci/run-watched.py (a copy of the shared

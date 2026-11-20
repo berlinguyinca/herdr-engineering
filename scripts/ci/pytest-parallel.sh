@@ -4,7 +4,7 @@
 # minutes; running it across workers is what makes the gate affordable. Everything here is overridable because the CPU count of the
 # CI exec host is not known in advance:
 #   HERDR_PYTEST_WORKERS       worker count; `auto` (default) = one per CPU, `0` = plain serial run, as before xdist.
-#   HERDR_PYTEST_MAXPROCESSES  ceiling on the worker count (default: the usable cores, at least 8 and at most 12; xdist applies it to `auto` and to an
+#   HERDR_PYTEST_MAXPROCESSES  ceiling on the worker count (default 8, empty = default; xdist applies it to `auto` and to an
 #                              explicit `-n N` alike): a 100+ core host must not start 100 workers that each
 #                              import the package, bind loopback servers and hold ~3,000 leaked descriptors
 #                              apiece (see ensure-fd-limit.sh).
@@ -42,18 +42,8 @@ herdr_free_cpus() {
     print (f < floor ? floor : f) }'
 }
 
-# The default ceiling on the worker count: the cores this job can really use (visible cores, or a smaller cgroup quota), at least 8
-# and at most 12. HERDR_PYTEST_MAXPROCESSES overrides it.
-herdr_default_maxprocesses() {
-  local cpus quota avail
-  cpus="$(herdr_visible_cpus)"; quota="$(herdr_cpu_quota 2>/dev/null || true)"; avail="$cpus"
-  [ -n "$quota" ] && [ "$quota" -lt "$avail" ] && avail="$quota"
-  awk -v a="$avail" 'BEGIN { print (a < 8 ? 8 : (a > 12 ? 12 : a)) }'
-}
-
 herdr_pytest_parallel_args() {
-  local workers="${HERDR_PYTEST_WORKERS:-auto}" cap="${HERDR_PYTEST_MAXPROCESSES:-}"
-  [ -n "${HERDR_PYTEST_MAXPROCESSES+x}" ] || cap="$(herdr_default_maxprocesses)"
+  local workers="${HERDR_PYTEST_WORKERS:-auto}" cap="${HERDR_PYTEST_MAXPROCESSES:-8}"   # empty means the default; 12 is not the default until a 12-worker run is measured
   case "$workers" in
     0) return 0 ;;
     auto) ;;

@@ -393,7 +393,7 @@ def test_a_closed_reader_does_not_kill_or_hang_the_run() -> None:
 
 
 VISIBLE = len(os.sched_getaffinity(0))
-CAP = min(12, max(8, VISIBLE))   # the default ceiling follows the visible cores: 8 up to 12
+CAP = 8
 # Quotas are chosen relative to the CPUs this test process may use, so the tests hold on any host (and under `taskset -c 0-1`).
 Q = min(VISIBLE, CAP) - 1          # the largest quota that must shrink the worker count
 needs_two_cpus = pytest.mark.skipif(Q < 1, reason="needs at least 2 visible CPUs to show a quota below them")
@@ -472,7 +472,7 @@ def test_no_cgroup_files_means_auto(tmp_path: Path) -> None:
 def test_the_scaling_really_reaches_pytest_as_a_worker_count(tmp_path: Path) -> None:
     """End to end for one case: the exact words the gate passes are `-n <Q>`, and xdist accepts them."""
     env = cg(tmp_path, v2={"job": f"{Q * 100000} 100000"}, proc="0::/job")
-    assert args_with(**env) == ["-n", str(Q), f"--maxprocesses={max(8, Q)}", "--dist=loadfile"]
+    assert args_with(**env) == ["-n", str(Q), f"--maxprocesses={CAP}", "--dist=loadfile"]
 
 
 @needs_two_cpus
@@ -806,8 +806,8 @@ needs_16_cpus = pytest.mark.skipif(VISIBLE < 16, reason="needs 16 visible CPUs")
 @needs_16_cpus
 def test_a_heavily_loaded_16_cpu_host_no_longer_collapses_to_one_worker(tmp_path: Path) -> None:
     """Other tenants' load (28 on 16 CPUs, shared hive nodes) gave `-n 1` and 104-120 minute gates against 15-22 with 8 workers."""
-    assert args_with(16, **loadavg(tmp_path, 28.0))[:2] == ["-n", "8"]
-    assert args_with(16, **loadavg(tmp_path, 155.0))[:2] == ["-n", "8"]
+    assert args_with(16, **loadavg(tmp_path, 28.0))[:2] == ["-n", "auto"]
+    assert args_with(16, **loadavg(tmp_path, 155.0))[:2] == ["-n", "auto"]
 
 
 def test_a_calm_host_keeps_auto(tmp_path: Path) -> None:
@@ -816,8 +816,8 @@ def test_a_calm_host_keeps_auto(tmp_path: Path) -> None:
 
 @needs_16_cpus
 def test_load_only_shaves_down_to_the_floor_of_half_the_cpus_and_at_least_four(tmp_path: Path) -> None:
-    assert args_with(16, **loadavg(tmp_path, 6.0))[:2] == ["-n", "10"]       # free CPUs still count above the floor
-    assert args_with(16, **loadavg(tmp_path, 10.0))[:2] == ["-n", "8"]       # floor = 16 // 2
+    assert args_with(16, **loadavg(tmp_path, 6.0), HERDR_PYTEST_MAXPROCESSES="12")[:2] == ["-n", "10"]       # free CPUs still count above the floor
+    assert args_with(16, **loadavg(tmp_path, 10.0), HERDR_PYTEST_MAXPROCESSES="12")[:2] == ["-n", "8"]       # floor = 16 // 2
     assert args_with(8, **loadavg(tmp_path, 100.0))[:2] == ["-n", "4"]       # floor = max(4, 8 // 2)
     assert args_with(6, **loadavg(tmp_path, 100.0))[:2] == ["-n", "4"]       # never fewer than 4 from load alone
     assert args_with(2, **loadavg(tmp_path, 100.0))[:2] == ["-n", "auto"]    # a 2-CPU host cannot go below its own cores
@@ -830,15 +830,12 @@ def test_a_small_cgroup_quota_still_caps_workers_whatever_the_load(tmp_path: Pat
     assert args_with(16, **env, **loadavg(tmp_path, 155.0))[:2] == ["-n", "2"]
 
 
-@needs_16_cpus
-def test_the_default_cap_follows_the_available_cores_up_to_twelve(tmp_path: Path) -> None:
-    assert "--maxprocesses=12" in args_with(16)
-    assert "--maxprocesses=12" in args_with(24) or VISIBLE < 24
-    assert "--maxprocesses=8" in args_with(8)
-    assert "--maxprocesses=8" in args_with(4)
-    quota = cg(tmp_path, v2={"job": "1000000 100000"}, proc="0::/job")        # a 10-CPU quota on 16 visible CPUs
-    assert "--maxprocesses=10" in args_with(16, **quota)
+def test_the_default_cap_stays_eight_until_a_twelve_worker_run_is_measured(tmp_path: Path) -> None:
+    for cpus in (4, 8, 16, 24):
+        assert "--maxprocesses=8" in args_with(cpus) or cpus > VISIBLE
     assert "--maxprocesses=5" in args_with(16, HERDR_PYTEST_MAXPROCESSES="5")  # the override still wins
+    assert "--maxprocesses=12" in args_with(16, HERDR_PYTEST_MAXPROCESSES="12")
+    assert "--maxprocesses=8" in args_with(16, HERDR_PYTEST_MAXPROCESSES="")   # empty means the default again
 
 
 def test_an_explicit_worker_count_wins_over_the_load(tmp_path: Path) -> None:

@@ -94,9 +94,34 @@ def test_a_tail_that_collects_nothing_fails_the_gate_on_purpose(tmp_path: Path) 
     assert done.returncode == 5, done.stdout + done.stderr         # exit 5 = nothing collected, the existing intent
 
 
-def test_both_failing_reports_the_fast_status_first(tmp_path: Path) -> None:
-    proj = project(tmp_path, fast_body="assert False", slow_body="assert False")
+def test_both_failing_returns_the_fast_status_not_the_tails(tmp_path: Path) -> None:
+    proj = project(tmp_path, fast_body="assert False")          # fast exits 1 ...
+    (proj / "test_slow.py").write_text("def test_not_slow():\n    pass\n")   # ... the tail collects nothing and exits 5
     assert gate(proj).returncode == 1
+
+
+def test_a_killed_tail_with_no_status_fails_closed(tmp_path: Path) -> None:
+    proj = project(tmp_path)
+    done = sh(f'{PRELUDE}killed() {{ kill -9 $BASHPID; }}\nherdr_pytest_run_gate plain killed "{FAST}" "{SLOW}"', proj)
+    assert done.returncode == 1, done.stdout + done.stderr
+
+
+def test_the_tail_runs_idle_io_class_where_ionice_exists_and_still_runs_without_it(tmp_path: Path) -> None:
+    proj = project(tmp_path)
+    probe = f'{PRELUDE}slowrunner() {{ echo "cmd=$*"; "$@"; }}\nherdr_pytest_run_gate plain slowrunner "{FAST}" "{SLOW}"'
+    has = subprocess.run("command -v ionice >/dev/null && ionice -c3 true", shell=True).returncode == 0
+    out = sh(probe, proj).stdout
+    assert ("ionice -c3 nice -n 5 python" in out) == has and "nice -n 5 python" in out
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    for tool in ("bash", "nice", "sed", "cat", "mktemp", "rm", "tee", "grep", "sleep", "date", "env", "dirname"):
+        found = subprocess.run(["bash", "-c", f"command -v {tool}"], capture_output=True, text=True).stdout.strip()
+        if found:
+            (bare / tool).symlink_to(found)
+    (bare / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (bare / "python").chmod(0o755)
+    done = sh(probe, proj, PATH=f"{bare}")
+    assert done.returncode == 0 and "ionice" not in done.stdout, done.stdout + done.stderr
 
 
 def test_the_tail_runs_under_its_own_watchdog_hang_limit(tmp_path: Path) -> None:
@@ -135,6 +160,9 @@ def test_the_gate_uses_the_concurrent_helper_with_both_passes_under_the_watchdog
     assert '"$HERDR_PYTEST_FAST_MARKEXPR"' in line and '"$HERDR_PYTEST_SLOW_MARKEXPR"' in line
     assert 'HERDR_PYTEST_HANG_SECONDS="${HERDR_PYTEST_SLOW_HANG_SECONDS:-4200}"' in GATE
     assert "timeout" not in line
+    helper = RERUN.read_text()
+    tail = [ln for ln in helper.splitlines() if '"$slow_runner"' in ln and "-m" in ln]
+    assert tail and all("python -m pytest" in ln for ln in tail), "the tail must use `python -m pytest`, never bare `pytest`"
 
 
 def test_the_slow_tests_own_database_and_tmp_dirs_cannot_collide_with_the_workers() -> None:
