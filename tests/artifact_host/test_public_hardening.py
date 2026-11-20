@@ -9,6 +9,7 @@ import http.client
 import json
 import os
 import socket
+import statistics
 import threading
 import time
 import zlib
@@ -750,9 +751,11 @@ def huge_share(host: Host):
     return host.seed_share({"index.html": b"<html><body>x</body></html>", "big.bin": data})
 
 
-FLOOD_CONNECTIONS_PER_THREAD = 60
-STARVATION_FLOOR_S = 5.0
-STARVATION_FACTOR = 50.0
+FLOOD_THREADS = 4
+FLOOD_PAUSE_S = 0.03  # tuned: the unmutated server stays at ~0.01 s per GET, a server hashing big blobs inline reaches 1.3 s, 5 s, 12 s, then times out
+FLOOD_MAX_IN_FLIGHT = 24  # caps the sockets the flood holds open at once, so a long flood cannot exhaust file descriptors (pipeline 1781)
+STARVATION_FLOOR_S = 2.5
+STARVATION_FACTOR = 25.0
 
 
 def _timed_gets(host: Host, path: str, count: int) -> list[float]:
@@ -778,34 +781,38 @@ def test_a_connect_get_close_flood_of_a_huge_blob_does_not_starve_small_requests
 ) -> None:
     s = huge_share(host)
     big, small = f"/s/{s.token}/f/big.bin", f"/s/{s.token}/f/index.html"
-    baseline = _timed_gets(host, small, 5)
+    _timed_gets(host, small, 2)  # warm-up: first requests pay for imports, caches and thread starts
+    baseline = statistics.median(_timed_gets(host, small, 7))
     stop = threading.Event()
+    in_flight = threading.Semaphore(FLOOD_MAX_IN_FLIGHT)
 
     def hammer() -> None:
-        # Bounded and paced: an unbounded tight loop exhausted the runner's file descriptors (pipeline 1781), which is a different
-        # failure from the one this test is about (hashing starving the event loop).
-        for _ in range(FLOOD_CONNECTIONS_PER_THREAD):
-            if stop.is_set():
-                return
-            fire_and_close(host, big)
-            stop.wait(0.005)
+        # Time-bounded, not count-bounded: it runs until the measurement is over, so the timed GETs really happen during the flood
+        # (a fixed count finished in 0.36 s and the test timed the backlog draining instead). The semaphore bounds open sockets.
+        while not stop.is_set():
+            with in_flight:
+                fire_and_close(host, big)
+            stop.wait(FLOOD_PAUSE_S)
 
-    threads = [threading.Thread(target=hammer, daemon=True) for _ in range(8)]
+    threads = [threading.Thread(target=hammer, daemon=True) for _ in range(FLOOD_THREADS)]
     for t in threads:
         t.start()
     try:
         time.sleep(0.5)  # the flood is in full swing
-        slowest = max(_timed_gets(host, small, 15))
-        # Starvation is a tiny GET queued behind the whole hash pass, i.e. seconds to never (host.get gives up after 15 s). A
-        # fixed 1.0 s failed at 1.09 s on a loaded runner (pipelines 1776, 1781), so the bound scales with how slow a tiny GET
-        # is on this very host right now, and never drops below a floor that load alone cannot reach.
-        bound = max(STARVATION_FLOOR_S, STARVATION_FACTOR * max(baseline))
-        assert slowest < bound, (
-            f"a tiny GET took {slowest:.2f}s (bound {bound:.2f}s, idle baseline {max(baseline):.3f}s) while a huge blob was hammered"
-        )
+        assert all(t.is_alive() for t in threads), "the flood died before the measurement began"
+        timed = _timed_gets(host, small, 15)
         health_start = time.monotonic()
         assert host.health_get("/healthz").status == 200
-        assert time.monotonic() - health_start < 1.0
+        health = time.monotonic() - health_start
+        assert all(t.is_alive() for t in threads), "the flood ended before the measurement did: it timed a drained backlog"
+        # Starvation is a tiny GET queued behind whole hash passes: seconds to never (host.get gives up after 15 s). A fixed 1.0 s
+        # failed at 1.09 s on a loaded runner (pipelines 1776, 1781), so the bound scales with the MEDIAN idle latency measured on
+        # this host just now and never drops below a floor that load alone does not reach.
+        bound = max(STARVATION_FLOOR_S, STARVATION_FACTOR * baseline)
+        assert max(timed) < bound, (
+            f"a tiny GET took {max(timed):.2f}s (bound {bound:.2f}s, idle median {baseline:.3f}s) while a huge blob was hammered"
+        )
+        assert health < bound, f"/healthz took {health:.2f}s (bound {bound:.2f}s) during the flood"
     finally:
         stop.set()
         for t in threads:

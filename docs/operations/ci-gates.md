@@ -67,19 +67,32 @@ INTERNALERROR KeyError, pytest exit 3 (pipeline 1710, load 155 on 4 CPUs). `unit
   workers (default 2; `0` = serial, ~90 min) and the log says so. A genuine test failure, a watchdog hang (124) and a pass are
   never rerun, and a rerun's result is final. A test failure whose own output happens to print a crash signature costs one more
   run, nothing more.
-- When the fast pass fails with ordinary test failures (exit 1, no crash signature), **only the failed and errored tests** are run once
-  more, serially, by exact node id. A test that fails both times is a real failure and the gate still fails (`FAILED TWICE (real
-  failure)`). A test that passes on the retry is logged as `RETRIED: <id> ... first failure: <original summary>` and appended to
-  the machine-readable `pytest-retried.jsonl` (`HERDR_PYTEST_RETRIED_FILE`; one JSON object per line: `nodeid`, `first_failure`, `at`,
-  `pipeline`, `commit`; rewritten each run, empty when nothing was retried) so flakes can be counted and fixed. More than
-  `HERDR_PYTEST_RETRY_MAX` (25) failures are not retried; `HERDR_PYTEST_RETRY=0` disables the retry. A crash rerun's result is final.
+- When the fast pass fails with ordinary test failures (exit 1, no crash signature), the **test files of the failed and errored tests**
+  are run once more, serially and whole (so a test polluted by an earlier test of its own module fails again instead of passing
+  alone). A failed test that **passes** on the retry (a recorded pass: a skip or a test that did not run does not count) is logged as
+  `RETRIED: <id> ... first failure: <original summary>`, repeated as `RETRIED-JSONL {...}` log lines (the log is the archive until the
+  pipeline publishes the file) and written to `pytest-retried.jsonl` (`HERDR_PYTEST_RETRIED_FILE`; one JSON object per line: `nodeid`,
+  `first_failure`, `at`, `pipeline`, `commit`; rewritten each run, empty when nothing was retried). Everything else fails the gate:
+  `FAILED TWICE (real failure)`, `NOT PASSED ON RETRY`, `FAILED ON RETRY` (a test that passed in the fast pass failed when its file
+  reran). More than `HERDR_PYTEST_RETRY_MAX` (25, must be a number) failures are not retried; `HERDR_PYTEST_RETRY=0` disables the
+  retry. A crash rerun's result is final. A pass that failed at session level (coverage floor, `INTERNALERROR`) is not retried:
+  rerunning files cannot fix it and a green retry must not hide it. Only the fast pass has a retry: a slow tail run on its own
+  (once it is a separate step) gets none. **Follow-up**: publish `pytest-retried.jsonl` as a pipeline artifact (a `.woodpecker/`
+  change, outside this file set).
+- **Chronic flakes.** A test that needed a retry in `HERDR_PYTEST_CHRONIC_RUNS` (3) distinct runs within `HERDR_PYTEST_CHRONIC_DAYS`
+  (14) days prints `CHRONIC FLAKE` and **fails the gate** until it is fixed or quarantined with an issue (a retry must not hide a flake
+  forever). The counter is `pytest-retried-history.jsonl` in `HERDR_CI_STATE` (default `/home/wohlgemuth/woodpecker/ci/state/herdr`, the
+  `main-cron-gates.sh` state dir; override the file with `HERDR_PYTEST_RETRY_HISTORY`). If that directory cannot be written the counter is
+  off for the run, with a `RETRY HISTORY:` note in the log, and the gate is not failed for it.
 
 ### Quarantining a known-flaky test
 
 A quarantined test **still runs and is reported** (a `QUARANTINED flaky tests` section in the pytest output) but a failure of it does
-not fail the gate. Declare it either on the test, `@pytest.mark.flaky(reason="...", issue="#873", expires="2026-12-31")`, or in
+not fail the gate. Declare it either on the test, `@pytest.mark.quarantine_flaky(reason="...", issue="#873", expires="2026-12-31")`, or in
 `tests/flaky-quarantine.toml` (`[[quarantine]]` with `nodeid`, `reason`, `issue`, `expires`; a node id also covers every
-parametrisation). All three of reason (15+ characters), issue (`#N` or a URL) and an ISO expiry date are required:
+parametrisation). All three of reason (15+ characters), issue (`#N` or a URL) and an ISO expiry date at most 90 days away are required. The marker is
+`quarantine_flaky` (not `flaky`, which pytest-rerunfailures and the `flaky` plugin own) and goes on the test **function** only: a
+module-level `pytestmark` or a class decorator would hide a whole file, so it never quarantines and the structural test fails:
 `tests/test_ci_flaky_quarantine.py` fails the structural gate for an incomplete entry or marker, and an incomplete one never quarantines.
 Past its expiry date an entry stops quarantining and the test fails the gate again, so fix it or renew the date deliberately.
 The plugin is `scripts/ci/herdr_flaky_plugin.py`.

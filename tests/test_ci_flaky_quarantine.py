@@ -9,6 +9,7 @@ Everything runs real pytest (xdist included) in real temporary projects; nothing
 from __future__ import annotations
 
 import ast
+import datetime as dt
 import json
 import os
 import subprocess
@@ -24,8 +25,11 @@ LIST = ROOT / "tests" / "flaky-quarantine.toml"
 sys.path.insert(0, str(CI))
 import herdr_flaky_plugin as plugin  # noqa: E402  (the module under test, imported by path)
 
+SOON = (dt.date.today() + dt.timedelta(days=30)).isoformat()      # inside the 90-day quarantine horizon
+
 
 def sh(script: str, cwd: Path, **env: str) -> subprocess.CompletedProcess[str]:
+    env = {"HERDR_CI_STATE": str(cwd / "ci-state"), **env}          # never touch the real CI state dir from a test
     return subprocess.run(
         ["bash", "-c", f'. "{CI / "pytest-parallel.sh"}"; . "{CI / "pytest-rerun.sh"}"; {script}'],
         capture_output=True, text=True, cwd=cwd, timeout=300,
@@ -35,7 +39,7 @@ def sh(script: str, cwd: Path, **env: str) -> subprocess.CompletedProcess[str]:
 
 def make_project(tmp_path: Path, files: dict[str, str]) -> Path:
     proj = tmp_path / "proj"
-    proj.mkdir()
+    proj.mkdir(parents=True)
     (proj / "pytest.ini").write_text("[pytest]\n")
     for name, body in files.items():
         (proj / name).write_text(body)
@@ -72,7 +76,7 @@ def test_a_flaky_test_is_retried_alone_reported_loudly_and_listed_for_tracking(t
     out = done.stdout + done.stderr
     assert done.returncode == 0, out
     assert "RETRIED: test_flaky.py::test_flaky" in out and "timing blip: took 1.09s" in out, out   # original summary is in the log
-    assert "retrying ONLY those once" in out, out
+    assert "retrying their 1 test file(s) once" in out, out
     assert (proj / "test_ok.py.runs").read_text() == "x", "the passing neighbour must not be rerun"
     assert [r["nodeid"] for r in rows] == ["test_flaky.py::test_flaky"]
     assert "timing blip" in rows[0]["first_failure"] and rows[0]["pipeline"] == "1776" and rows[0]["at"]
@@ -129,6 +133,89 @@ def test_a_failure_in_the_retry_that_is_a_hang_or_error_never_comes_out_as_a_pas
     assert done.returncode != 0, done.stdout + done.stderr
 
 
+def test_the_retry_reruns_the_whole_file_so_same_module_pollution_still_fails(tmp_path: Path) -> None:
+    # test_a leaves module state behind; test_b asserts it is absent. Run alone, test_b passes: a node-id-only retry would call it a flake.
+    body = ("STATE = []\n"
+            "def test_a():\n    STATE.append('leak')\n"
+            "def test_b():\n    assert not STATE, 'state leaked from test_a'\n")
+    proj = make_project(tmp_path, {"test_pollution.py": body})
+    alone = subprocess.run([sys.executable, "-m", "pytest", "-q", "test_pollution.py::test_b"], cwd=proj, capture_output=True, text=True)
+    assert alone.returncode == 0, alone.stdout                  # the premise: in isolation it passes
+    done, rows = run_fast(proj, workers="")
+    assert done.returncode != 0 and "FAILED TWICE (real failure): test_pollution.py::test_b" in done.stdout, done.stdout
+    assert rows == []
+
+
+def test_a_retried_test_that_is_skipped_on_retry_is_not_called_passed(tmp_path: Path) -> None:
+    body = ("import os, pytest\nMARK = __file__ + '.m'\n"
+            "def test_flaky():\n    if not os.path.exists(MARK):\n        open(MARK, 'w').close()\n        assert False, 'blip'\n"
+            "    pytest.skip('now skipped')\n")
+    done, rows = run_fast(make_project(tmp_path, {"test_skip.py": body}), workers="")
+    out = done.stdout + done.stderr
+    assert done.returncode != 0 and "NOT PASSED ON RETRY: test_skip.py::test_flaky" in out and "PASSED on retry" not in out, out
+    assert rows == []
+
+
+def test_a_test_that_passed_first_and_fails_when_its_file_reruns_fails_the_gate(tmp_path: Path) -> None:
+    body = ("import os\nMARK = __file__ + '.m'\n"
+            "def test_late():\n    assert not os.path.exists(MARK), 'only fails on the rerun'\n"
+            "def test_flaky():\n    if not os.path.exists(MARK):\n        open(MARK, 'w').close()\n        assert False\n")
+    done, _ = run_fast(make_project(tmp_path, {"test_new.py": body}), workers="")
+    assert done.returncode != 0 and "FAILED ON RETRY: test_new.py::test_late" in done.stdout + done.stderr, done.stdout
+
+
+def test_the_archive_is_in_the_log_as_jsonl_lines(tmp_path: Path) -> None:
+    done, rows = run_fast(make_project(tmp_path, {"test_flaky.py": FLAKY_ONCE}), workers="")
+    lines = [x for x in done.stdout.splitlines() if x.startswith("RETRIED-JSONL ")]
+    assert len(lines) == 1 and json.loads(lines[0].split(" ", 1)[1]) == rows[0]
+
+
+def test_the_same_test_retried_in_three_runs_is_a_chronic_flake_that_fails_the_gate(tmp_path: Path) -> None:
+    proj = make_project(tmp_path, {"test_flaky.py": FLAKY_ONCE})
+    outcomes = []
+    for pipeline in ("101", "102", "103"):
+        (proj / "failed-once").unlink(missing_ok=True)
+        done, _ = run_fast(proj, workers="", CI_PIPELINE_NUMBER=pipeline)
+        outcomes.append((done.returncode, "CHRONIC FLAKE: test_flaky.py::test_flaky" in done.stdout))
+    assert outcomes == [(0, False), (0, False), (1, True)], outcomes
+    history = [json.loads(x) for x in (proj / "ci-state" / "pytest-retried-history.jsonl").read_text().splitlines()]
+    assert [h["run"] for h in history] == ["101", "102", "103"]
+
+
+def test_a_rerun_of_the_same_pipeline_counts_once_and_old_history_ages_out(tmp_path: Path) -> None:
+    proj = make_project(tmp_path, {"test_flaky.py": FLAKY_ONCE})
+    state = proj / "ci-state"
+    state.mkdir()
+    old = {"nodeid": "test_flaky.py::test_flaky", "at": "2020-01-01T00:00:00+00:00", "run": "1"}
+    (state / "pytest-retried-history.jsonl").write_text(json.dumps(old) + "\n" + json.dumps({**old, "run": "2"}) + "\n")
+    done, _ = run_fast(proj, workers="", CI_PIPELINE_NUMBER="9")
+    assert done.returncode == 0, done.stdout           # two ancient runs do not count, so this is the first recent one
+    assert len((state / "pytest-retried-history.jsonl").read_text().splitlines()) == 1
+
+
+def test_an_unwritable_history_location_turns_the_counter_off_with_a_note_but_does_not_fail(tmp_path: Path) -> None:
+    proj = make_project(tmp_path, {"test_flaky.py": FLAKY_ONCE})
+    blocker = proj / "not-a-dir"
+    blocker.write_text("")
+    done, rows = run_fast(proj, workers="", HERDR_PYTEST_RETRY_HISTORY=str(blocker / "h.jsonl"))
+    assert done.returncode == 0 and len(rows) == 1 and "chronic-flake counter is OFF" in done.stdout, done.stdout
+
+
+def test_a_session_level_failure_is_not_retried(tmp_path: Path) -> None:
+    # a failing test AND a session-level failure (the coverage floor): rerunning the file would come out green and hide the floor
+    proj = make_project(tmp_path, {"test_flaky.py": FLAKY_ONCE})
+    (proj / "pytest.ini").write_text("[pytest]\n")
+    shim = proj / "conftest.py"
+    shim.write_text("def pytest_terminal_summary(terminalreporter):\n    terminalreporter.write_line('FAIL Required test coverage of 80% not reached. Total coverage: 12.00%')\n")
+    done, rows = run_fast(proj, workers="")
+    assert done.returncode == 1 and rows == [] and "failed at session level" in done.stdout, done.stdout
+
+
+def test_a_non_numeric_retry_cap_is_rejected_like_the_rerun_workers(tmp_path: Path) -> None:
+    done, _ = run_fast(make_project(tmp_path, {"test_ok.py": COUNTED}), workers="", HERDR_PYTEST_RETRY_MAX="lots")
+    assert done.returncode == 1 and "HERDR_PYTEST_RETRY_MAX must be a number" in done.stderr
+
+
 # --- the quarantine -----------------------------------------------------------------------------------------------------------
 
 def pytest_run(proj: Path, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
@@ -140,9 +227,9 @@ def pytest_run(proj: Path, *args: str, **env: str) -> subprocess.CompletedProces
 REASON = "waits on the wall clock, fails about one run in twenty on a loaded host"
 
 
-def marked(reason: str = REASON, issue: str = "#873", expires: str = "2099-01-01") -> str:
+def marked(reason: str = REASON, issue: str = "#873", expires: str = SOON) -> str:
     kw = ", ".join(f"{k}={v!r}" for k, v in (("reason", reason), ("issue", issue), ("expires", expires)) if v is not None)
-    return f"import pytest\n@pytest.mark.flaky({kw})\ndef test_wobbly():\n    assert False, 'wobbled'\n"
+    return f"import pytest\n@pytest.mark.quarantine_flaky({kw})\ndef test_wobbly():\n    assert False, 'wobbled'\n"
 
 
 def test_a_quarantined_test_still_runs_and_is_reported_but_does_not_fail_the_run(tmp_path: Path) -> None:
@@ -179,7 +266,7 @@ def write_list(proj: Path, body: str) -> Path:
     return path
 
 
-ENTRY = 'nodeid = "test_w.py::test_wobbly"\nreason = "{r}"\nissue = "#873"\nexpires = "2099-01-01"\n'
+ENTRY = 'nodeid = "test_w.py::test_wobbly"\nreason = "{r}"\nissue = "#873"\nexpires = "'+SOON+'"\n'
 
 
 def test_the_list_quarantines_by_node_id_including_every_parametrisation(tmp_path: Path) -> None:
@@ -209,11 +296,17 @@ def test_a_quarantined_failure_is_not_retried_and_not_counted_as_a_failure_by_th
 def test_every_entry_of_the_real_quarantine_list_has_a_reason_an_issue_an_expiry_and_a_real_test() -> None:
     entries = plugin.load_entries(LIST)
     problems = plugin.entry_problems(entries)
-    for entry in entries:
-        path = str(entry.get("nodeid", "")).split("::")[0]
-        if not (ROOT / path).is_file():
-            problems.append(f"{entry.get('nodeid')}: no such test file (stale entry; delete it)")
+    problems += [p for e in entries if isinstance(e.get("nodeid"), str) and (p := plugin.missing_test(ROOT, e["nodeid"]))]
     assert not problems, "flaky quarantine entries are incomplete:\n" + "\n".join(problems)
+
+
+def test_an_entry_naming_a_test_that_does_not_exist_is_caught(tmp_path: Path) -> None:
+    (tmp_path / "test_real.py").write_text("class TestK:\n    def test_method(self):\n        pass\n\ndef test_here():\n    pass\n")
+    assert plugin.missing_test(tmp_path, "test_real.py::test_here") is None
+    assert plugin.missing_test(tmp_path, "test_real.py::test_here[a b]") is None            # a parametrised id still names the function
+    assert plugin.missing_test(tmp_path, "test_real.py::TestK::test_method") is None
+    assert "no test named 'test_renamed'" in (plugin.missing_test(tmp_path, "test_real.py::test_renamed") or "")
+    assert "no such test file" in (plugin.missing_test(tmp_path, "test_gone.py::test_here") or "")
 
 
 def _flaky_marker_keywords() -> list[tuple[str, dict[str, object]]]:
@@ -224,20 +317,72 @@ def _flaky_marker_keywords() -> list[tuple[str, dict[str, object]]]:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             target = node.func if isinstance(node, ast.Call) else node
-            if isinstance(target, ast.Attribute) and target.attr == "flaky" and ast.unparse(target).endswith("mark.flaky"):
+            if isinstance(target, ast.Attribute) and target.attr == "quarantine_flaky" and ast.unparse(target).endswith("mark.quarantine_flaky"):
                 kws = {k.arg: ast.literal_eval(k.value) for k in node.keywords if k.arg and isinstance(k.value, ast.Constant)} \
                     if isinstance(node, ast.Call) else {}
                 found.append((f"{path.relative_to(ROOT)}:{node.lineno}", kws))
     return found
 
 
-def test_every_flaky_marker_in_the_suite_names_a_reason_an_issue_and_an_expiry() -> None:
+def _hiding_declarations(paths: list[Path] | None = None) -> list[str]:
+    """A quarantine at module or class level: ``pytestmark = ...quarantine_flaky...`` or a class decorator, both of which hide whole files."""
+    found = []
+    for path in paths if paths is not None else sorted((ROOT / "tests").rglob("*.py")):
+        if path == Path(__file__):
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path))):
+            targets = [t.id for t in getattr(node, "targets", []) if isinstance(t, ast.Name)] or (
+                [node.target.id] if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) else [])
+            if "pytestmark" in targets and "quarantine_flaky" in ast.unparse(node):
+                found.append(f"{path.name}:{node.lineno}: pytestmark")
+            if isinstance(node, ast.ClassDef) and any("quarantine_flaky" in ast.unparse(d) for d in node.decorator_list):
+                found.append(f"{path.name}:{node.lineno}: class decorator")
+    return found
+
+
+def test_every_quarantine_marker_in_the_suite_names_a_reason_an_issue_and_an_expiry() -> None:
     bad = [f"{where}: {p}" for where, kws in _flaky_marker_keywords() for p in plugin.field_problems(kws)]
-    assert not bad, "pytest.mark.flaky without its required keywords:\n" + "\n".join(bad)
+    assert not bad, "pytest.mark.quarantine_flaky without its required keywords:\n" + "\n".join(bad)
+
+
+def test_no_quarantine_marker_in_the_suite_sits_on_a_module_or_a_class() -> None:
+    assert not _hiding_declarations(), "quarantine goes on test functions only:\n" + "\n".join(_hiding_declarations())
+
+
+def test_the_structural_scan_really_sees_module_and_class_level_markers(tmp_path: Path) -> None:
+    (tmp_path / "m.py").write_text("import pytest\npytestmark = pytest.mark.quarantine_flaky(reason='x')\n")
+    (tmp_path / "k.py").write_text("import pytest\n@pytest.mark.quarantine_flaky(reason='x')\nclass TestA:\n    pass\n")
+    (tmp_path / "f.py").write_text("import pytest\n@pytest.mark.quarantine_flaky(reason='x')\ndef test_a():\n    pass\n")
+    found = _hiding_declarations([tmp_path / "m.py", tmp_path / "k.py", tmp_path / "f.py"])
+    assert sorted(found) == ["k.py:3: class decorator", "m.py:2: pytestmark"], found
+
+
+def test_a_module_or_class_level_marker_never_quarantines_and_says_why(tmp_path: Path) -> None:
+    kw = f"reason={REASON!r}, issue='#873', expires={SOON!r}"
+    module = f"import pytest\npytestmark = pytest.mark.quarantine_flaky({kw})\ndef test_a():\n    assert False\n"
+    klass = f"import pytest\n@pytest.mark.quarantine_flaky({kw})\nclass TestA:\n    def test_a(self):\n        assert False\n"
+    for name, body in (("module", module), ("class", klass)):
+        done = pytest_run(make_project(tmp_path / name, {"test_w.py": body}))
+        assert done.returncode == 1 and "module/class-level quarantine_flaky" in done.stdout, (name, done.stdout)
+
+
+def test_a_marker_on_a_method_function_still_quarantines(tmp_path: Path) -> None:
+    kw = f"reason={REASON!r}, issue='#873', expires={SOON!r}"
+    body = f"import pytest\nclass TestA:\n    @pytest.mark.quarantine_flaky({kw})\n    def test_a(self):\n        assert False\n"
+    assert pytest_run(make_project(tmp_path, {"test_w.py": body})).returncode == 0
+
+
+def test_an_expiry_beyond_the_horizon_does_not_quarantine_and_the_structural_check_flags_it(tmp_path: Path) -> None:
+    far = (dt.date.today() + dt.timedelta(days=plugin.MAX_HORIZON_DAYS + 30)).isoformat()
+    done = pytest_run(make_project(tmp_path, {"test_w.py": marked(expires=far)}))
+    assert done.returncode == 1 and "more than 90 days away" in done.stdout, done.stdout
+    edge = (dt.date.today() + dt.timedelta(days=plugin.MAX_HORIZON_DAYS)).isoformat()
+    assert pytest_run(make_project(tmp_path / "edge", {"test_w.py": marked(expires=edge)})).returncode == 0
+    assert any("90 days" in p for p in plugin.field_problems({"reason": REASON, "issue": "#1", "expires": "2099-01-01"}))
 
 
 def test_the_structural_check_really_catches_an_entry_without_a_reason(tmp_path: Path) -> None:
-    lst = write_list(tmp_path, '[[quarantine]]\nnodeid = "tests/test_x.py::test_y"\nissue = "#1"\nexpires = "2099-01-01"\n')
+    lst = write_list(tmp_path, '[[quarantine]]\nnodeid = "tests/test_x.py::test_y"\nissue = "#1"\nexpires = "'+SOON+'"\n')
     assert any("missing required 'reason'" in p for p in plugin.entry_problems(plugin.load_entries(lst)))
     lst = write_list(tmp_path, '[[quarantine]]\nnodeid = "tests/test_x.py::test_y"\nreason = "ok"\nissue = "#1"\nexpires = "soon"\n')
     problems = plugin.entry_problems(plugin.load_entries(lst))
@@ -251,4 +396,4 @@ def test_the_marker_is_registered_so_strict_markers_accept_it(tmp_path: Path) ->
 
 def test_the_repo_conftest_registers_the_marker_for_a_plain_pytest_run() -> None:
     done = subprocess.run([sys.executable, "-m", "pytest", "--markers", "-p", "no:cacheprovider"], capture_output=True, text=True, cwd=ROOT, timeout=300)
-    assert "@pytest.mark.flaky(reason, issue, expires)" in done.stdout, done.stdout + done.stderr
+    assert "@pytest.mark.quarantine_flaky(reason, issue, expires)" in done.stdout, done.stdout + done.stderr

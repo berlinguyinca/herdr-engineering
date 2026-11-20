@@ -4,23 +4,31 @@ Quarantine (never hides a test, only stops a *failing* one from failing the gate
   A quarantined test STILL RUNS and is reported (``QUARANTINED`` section of the terminal summary). It is marked non-strict xfail, so
   a failure is an XFAIL and a pass is an XPASS; neither fails the gate. Two ways in, both need a reason, an issue and an expiry:
 
-    @pytest.mark.flaky(reason="why it is flaky and what was measured", issue="#873", expires="2026-12-31")
+    @pytest.mark.quarantine_flaky(reason="why it is flaky and what was measured", issue="#873", expires="2026-12-31")
 
     tests/flaky-quarantine.toml     [[quarantine]] nodeid = "tests/test_x.py::test_y"   (all parametrisations of test_y match too)
                                                    reason = "..."  issue = "#873"  expires = "2026-12-31"
 
   An entry past its ``expires`` date stops quarantining: the test fails the gate again until someone fixes it or consciously renews the
-  date. A marker or entry missing a field never quarantines (the test keeps failing loudly) and tests/test_ci_flaky_quarantine.py fails.
+  date, and ``expires`` may be at most MAX_HORIZON_DAYS (90) days away, so a quarantine cannot become permanent by writing 2099. A marker or
+  entry missing a field never quarantines (the test keeps failing loudly) and tests/test_ci_flaky_quarantine.py fails. The marker is named
+  ``quarantine_flaky`` (not ``flaky``) so it cannot collide with the ``flaky`` / pytest-rerunfailures plugins, and it works on a test
+  FUNCTION only: a module-level ``pytestmark`` or a class decorator would hide every test in the file, so it never quarantines and the
+  structural test fails.
 
 Retry support
-  With ``HERDR_PYTEST_FAILED_FILE`` set, the pytest controller writes the failed/errored tests as JSON ``[{"nodeid", "summary"}]``.
-  ``python herdr_flaky_plugin.py ids FILE`` prints the node ids NUL-separated and ``... settle FIRST SECOND OUT`` compares the first pass
-  with the retry pass: tests failing in both are real failures, tests that passed on retry are logged as ``RETRIED`` and written to OUT
-  (JSON lines) so they can be tracked. scripts/ci/pytest-rerun.sh drives both.
+  With ``HERDR_PYTEST_FAILED_FILE`` set, the pytest controller writes JSON ``{"failed": [{"nodeid", "summary"}], "passed": [nodeid]}``.
+  ``python herdr_flaky_plugin.py ids FILE`` / ``files FILE`` print the failed node ids / their test files NUL-separated (the retry reruns
+  those whole FILES, so same-module pollution still reproduces) and ``... settle FIRST SECOND OUT [HISTORY]`` compares the first pass with
+  the retry: a test counts as RETRIED only when the retry recorded a real PASS for it (a skip or a test that did not run does not), tests
+  failing again are real failures, and a test RETRIED in HERDR_PYTEST_CHRONIC_RUNS (3) distinct runs inside HERDR_PYTEST_CHRONIC_DAYS (14)
+  days (HISTORY, a JSON-lines file under the CI state dir) is a CHRONIC flake: it fails the gate until fixed or quarantined with an issue.
+  scripts/ci/pytest-rerun.sh drives all of it.
 """
 
 from __future__ import annotations
 
+import ast
 import datetime as dt
 import json
 import os
@@ -34,6 +42,8 @@ ENV_FAILED_FILE = "HERDR_PYTEST_FAILED_FILE"
 ENV_TODAY = "HERDR_FLAKY_TODAY"  # tests only: pretend it is this ISO date
 REQUIRED_FIELDS = ("reason", "issue", "expires")
 MIN_REASON_CHARS = 15
+MARKER = "quarantine_flaky"
+MAX_HORIZON_DAYS = 90
 QUARANTINE_PREFIX = "QUARANTINED flaky"
 DEFAULT_LIST = Path("tests") / "flaky-quarantine.toml"
 
@@ -61,9 +71,12 @@ def field_problems(fields: dict[str, Any]) -> list[str]:
         expires = expires.isoformat()
     if isinstance(expires, str) and expires.strip():
         try:
-            dt.date.fromisoformat(expires.strip())
+            until = dt.date.fromisoformat(expires.strip())
         except ValueError:
             problems.append("'expires' must be an ISO date (YYYY-MM-DD)")
+        else:
+            if until > today() + dt.timedelta(days=MAX_HORIZON_DAYS):
+                problems.append(f"'expires' is more than {MAX_HORIZON_DAYS} days away; quarantine in short steps and renew consciously")
     return problems
 
 
@@ -122,8 +135,8 @@ class FlakyPlugin:
     def pytest_configure(self, config: Any) -> None:
         config.addinivalue_line(
             "markers",
-            "flaky(reason, issue, expires): quarantine a known-flaky test. It still runs and is reported but a failure does not fail the "
-            "gate; all three keywords are required (see scripts/ci/herdr_flaky_plugin.py). Expired or incomplete: not quarantined.",
+            f"{MARKER}(reason, issue, expires): quarantine a known-flaky test FUNCTION. It still runs and is reported but a failure does not "
+            "fail the gate; all three keywords are required (see scripts/ci/herdr_flaky_plugin.py). Expired or incomplete: not quarantined.",
         )
         try:
             self.entries = load_entries(quarantine_path(Path(str(config.rootpath))))
@@ -131,9 +144,11 @@ class FlakyPlugin:
             self.skipped.append(f"quarantine list unreadable: {exc}")
 
     def _declaration(self, item: Any) -> dict[str, Any] | None:
-        marker = item.get_closest_marker("flaky")
+        marker = item.get_closest_marker(MARKER)
         if marker is not None:
-            return {**marker.kwargs, "source": "marker"}
+            if any(m.name == MARKER for m in item.own_markers):
+                return {**marker.kwargs, "source": "marker"}
+            self.skipped.append(f"{item.nodeid}: quarantine not applied (a module/class-level {MARKER} would hide every test in it; mark the test function)")
         for entry in self.entries:
             if isinstance(entry.get("nodeid"), str) and matches(item.nodeid, entry["nodeid"]):
                 return {**entry, "source": "list"}
@@ -168,11 +183,16 @@ class FlakyPlugin:
         if not target or hasattr(session.config, "workerinput"):
             return
         reporter = session.config.pluginmanager.get_plugin("terminalreporter")
-        seen: dict[str, str] = {}
+        stats = reporter.stats if reporter else {}
+        failed: dict[str, str] = {}
         for kind in ("failed", "error"):
-            for report in (reporter.stats.get(kind, []) if reporter else []):
-                seen.setdefault(report.nodeid, summarise(report))
-        Path(target).write_text(json.dumps([{"nodeid": n, "summary": s} for n, s in seen.items()]), encoding="utf-8")
+            for report in stats.get(kind, []):
+                failed.setdefault(report.nodeid, summarise(report))
+        # a real PASS only: a skip, a deselection or a test that never ran is none of these (a setup/teardown error is in ``failed``)
+        passed = sorted(({r.nodeid for r in stats.get("passed", []) if getattr(r, "when", "call") == "call"}
+                         | {r.nodeid for r in stats.get("xpassed", [])}) - set(failed))
+        Path(target).write_text(json.dumps({"failed": [{"nodeid": n, "summary": t} for n, t in failed.items()], "passed": passed}),
+                                encoding="utf-8")
 
 
 def summarise(report: Any) -> str:
@@ -192,40 +212,114 @@ def register(config: Any) -> None:
         config.pluginmanager.register(FlakyPlugin(), "herdr-flaky-quarantine")
 
 
+def missing_test(root: Path, nodeid: str) -> str | None:
+    """Why ``nodeid`` ('path.py::[Class::]test_name[params]') names no real test, or None when the file defines that function."""
+    path, _, rest = nodeid.partition("::")
+    file = root / path
+    if not file.is_file():
+        return f"{nodeid}: no such test file (stale entry; delete it)"
+    name = rest.split("::")[-1].split("[")[0]
+    try:
+        tree = ast.parse(file.read_text(encoding="utf-8"), filename=str(file))
+    except SyntaxError as exc:
+        return f"{nodeid}: {path} does not parse: {exc}"
+    if not any(isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef) and n.name == name for n in ast.walk(tree)):
+        return f"{nodeid}: {path} defines no test named '{name}' (renamed or deleted; update or delete the entry)"
+    return None
+
+
 # --- shell helpers (scripts/ci/pytest-rerun.sh) ------------------------------------------------------------------------------
 
-def _load(path: str) -> list[dict[str, str]]:
+def _read(path: str) -> tuple[list[dict[str, str]], set[str]]:
+    """(failed [{nodeid, summary}], passed node ids) of a pass file; tolerates a missing or unreadable file and the old list format."""
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return []
-    return [d for d in data if isinstance(d, dict) and isinstance(d.get("nodeid"), str)]
+        return [], set()
+    failed, passed = (data.get("failed", []), data.get("passed", [])) if isinstance(data, dict) else (data, [])
+    return ([d for d in failed if isinstance(d, dict) and isinstance(d.get("nodeid"), str)],
+            {p for p in passed if isinstance(p, str)})
 
 
-def settle(first: str, second: str, out: str) -> int:
-    """Print the retry verdict, write the passed-on-retry tests to ``out``; exit 1 when any test failed in both passes."""
-    before, after = _load(first), {d["nodeid"] for d in _load(second)}
-    retried = [d for d in before if d["nodeid"] not in after]
-    real = [d for d in before if d["nodeid"] in after]
-    stamp = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+def chronic(history: str, retried: list[str], stamp: dt.datetime, run: str) -> tuple[list[tuple[str, int]], str]:
+    """Record this run's retried tests in the JSON-lines HISTORY and return [(nodeid, distinct runs inside the window)] for those at or above
+    the threshold, plus a note ('' when fine). A history that cannot be read or written never fails the gate: the counter is just off."""
+    if not history or not retried:
+        return [], ""
+    days, limit = _env_int("HERDR_PYTEST_CHRONIC_DAYS", 14), _env_int("HERDR_PYTEST_CHRONIC_RUNS", 3)
+    cutoff = stamp - dt.timedelta(days=days)
+    rows: list[dict[str, str]] = []
+    try:
+        for line in Path(history).read_text(encoding="utf-8").splitlines() if Path(history).exists() else []:
+            try:
+                row = json.loads(line)
+                if isinstance(row, dict) and dt.datetime.fromisoformat(row["at"]) >= cutoff and row["run"] != run:
+                    rows.append(row)
+            except (ValueError, KeyError, TypeError):
+                continue
+        rows += [{"nodeid": n, "at": stamp.isoformat(timespec="seconds"), "run": run} for n in retried]
+        Path(history).parent.mkdir(parents=True, exist_ok=True)
+        Path(history).write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    except OSError as exc:
+        return [], f"retry history {history} is not usable ({exc}); the chronic-flake counter is OFF for this run"
+    counts = {n: len({r["run"] for r in rows if r["nodeid"] == n}) for n in retried}
+    return [(n, c) for n, c in counts.items() if c >= limit], ""
+
+
+def settle(first: str, second: str, out: str, history: str = "") -> int:
+    """Print the retry verdict, write the passed-on-retry tests to ``out``; exit 1 for anything that is not a clean pass on retry."""
+    before, _ = _read(first)
+    again, passed = _read(second)
+    failed_again = {d["nodeid"]: d for d in again}
+    first_ids = {d["nodeid"] for d in before}
+    retried = [d for d in before if d["nodeid"] in passed and d["nodeid"] not in failed_again]
+    real = [d for d in before if d["nodeid"] in failed_again]
+    unresolved = [d for d in before if d["nodeid"] not in passed and d["nodeid"] not in failed_again]
+    new_failures = [d for n, d in failed_again.items() if n not in first_ids]
+    now = dt.datetime.now(dt.UTC)
+    stamp = now.isoformat(timespec="seconds")
     context = {k: os.environ[v] for k, v in (("pipeline", "CI_PIPELINE_NUMBER"), ("commit", "CI_COMMIT_SHA")) if os.environ.get(v)}
     lines = [json.dumps({"nodeid": d["nodeid"], "first_failure": d.get("summary", ""), "at": stamp, **context}) for d in retried]
     Path(out).write_text("".join(line + "\n" for line in lines), encoding="utf-8")
     for d in retried:
         print(f"RETRIED: {d['nodeid']} failed in the first pass and PASSED on retry (flaky, tracked in {out}); first failure: {d.get('summary', '')}")
+    for line in lines:  # the log is the archive until the pipeline publishes the file: every record is in it verbatim
+        print(f"RETRIED-JSONL {line}")
     for d in real:
         print(f"FAILED TWICE (real failure): {d['nodeid']}; first failure: {d.get('summary', '')}")
-    print(f"== retry verdict: {len(retried)} passed on retry (RETRIED), {len(real)} failed again (real failures) ==")
-    return 1 if real else 0
+    for d in unresolved:
+        print(f"NOT PASSED ON RETRY: {d['nodeid']} did not record a pass on retry (skipped, deselected or never ran); first failure: {d.get('summary', '')}")
+    for d in new_failures:
+        print(f"FAILED ON RETRY: {d['nodeid']} passed in the fast pass but failed when its file reran; first-pass failures in that file may be pollution")
+    run = context.get("pipeline") or context.get("commit") or stamp
+    chronic_ids, note = chronic(history, [d["nodeid"] for d in retried], now, run)
+    if note:
+        print(f"RETRY HISTORY: {note}")
+    for nodeid, runs in chronic_ids:
+        print(f"CHRONIC FLAKE: {nodeid} needed a retry in {runs} runs within {_env_int('HERDR_PYTEST_CHRONIC_DAYS', 14)} days; "
+              "fix it or quarantine it with an issue (@pytest.mark.quarantine_flaky); the gate fails until then")
+    print(f"== retry verdict: {len(retried)} passed on retry (RETRIED), {len(real)} failed again, {len(unresolved)} not passed, "
+          f"{len(new_failures)} new failures, {len(chronic_ids)} chronic ==")
+    return 1 if real or unresolved or new_failures or chronic_ids else 0
 
 
 def main(argv: list[str]) -> int:
     if len(argv) == 3 and argv[1] == "ids":
-        sys.stdout.write("".join(d["nodeid"] + "\0" for d in _load(argv[2])))
+        sys.stdout.write("".join(d["nodeid"] + "\0" for d in _read(argv[2])[0]))
         return 0
-    if len(argv) == 5 and argv[1] == "settle":
-        return settle(argv[2], argv[3], argv[4])
-    print("usage: herdr_flaky_plugin.py ids FILE | settle FIRST SECOND OUT", file=sys.stderr)
+    if len(argv) == 3 and argv[1] == "files":
+        sys.stdout.write("".join(f + "\0" for f in dict.fromkeys(d["nodeid"].split("::")[0] for d in _read(argv[2])[0])))
+        return 0
+    if len(argv) in (5, 6) and argv[1] == "settle":
+        return settle(*argv[2:])
+    print("usage: herdr_flaky_plugin.py ids FILE | files FILE | settle FIRST SECOND OUT [HISTORY]", file=sys.stderr)
     return 2
 
 
