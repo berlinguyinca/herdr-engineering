@@ -273,25 +273,30 @@ def test_receipt_records_deterministic_artifact_digest(repository, tmp_path):
     two = stage.stage_pi(tmp_path / 'home-b', sha, repository=str(repo), runner=install_ok)
     # The digest proves the staged content, not just the recorded commit.
     assert one['artifactDigest'].startswith('sha256:')
-    # Two independent stagings of one commit must agree: the digest is content,
-    # order-independent, and free of install-specific noise (node_modules, .git).
+    # Two independent stagings of one commit must agree: the digest is the tracked
+    # tree, free of install-specific noise (node_modules, build output, .git).
     assert one['artifactDigest'] == two['artifactDigest']
     release = Path(one['sourceRoot'])
-    assert one['artifactDigest'] == stage.compute_digest(release)
+    assert one['artifactDigest'] == stage.compute_digest(release, install_ok)
     # A receipt also carries an (initially empty) patch ledger.
     assert one['patches'] == []
 
 
-def test_artifact_digest_ignores_git_and_node_modules(repository, tmp_path):
+def test_artifact_digest_covers_only_tracked_content(repository, tmp_path):
+    # The artifact is the git-tracked tree: install/build output that git does not
+    # track (node_modules, a setuptools build/ tree, __pycache__) is not the
+    # artifact and must not move the digest, or every re-stage would false-drift.
     stage = module()
     repo, sha = repository
     result = stage.stage_pi(tmp_path / 'home', sha, repository=str(repo), runner=install_ok)
     release = Path(result['sourceRoot'])
-    baseline = stage.compute_digest(release)
-    # node_modules is install-owned and .git is VCS metadata; neither is the artifact.
+    baseline = stage.compute_digest(release, install_ok)
     (release / 'node_modules' / 'injected.js').write_text('side effect')
-    (release / '.git' / 'injected').write_text('tamper')
-    assert stage.compute_digest(release) == baseline
+    (release / 'build').mkdir(exist_ok=True)
+    (release / 'build' / 'lib.py').write_text('compiled output')
+    (release / '__pycache__').mkdir(exist_ok=True)
+    (release / '__pycache__' / 'm.pyc').write_text('bytecode')
+    assert stage.compute_digest(release, install_ok) == baseline
 
 
 def test_artifact_digest_changes_when_a_tracked_file_is_edited(repository, tmp_path):
@@ -299,21 +304,21 @@ def test_artifact_digest_changes_when_a_tracked_file_is_edited(repository, tmp_p
     repo, sha = repository
     result = stage.stage_pi(tmp_path / 'home', sha, repository=str(repo), runner=install_ok)
     release = Path(result['sourceRoot'])
-    baseline = stage.compute_digest(release)
+    baseline = stage.compute_digest(release, install_ok)
     (release / 'package.json').write_text('{"name":"pi-engineering-runtime","edited":true}')
-    assert stage.compute_digest(release) != baseline
+    assert stage.compute_digest(release, install_ok) != baseline
 
 
 def test_verify_artifact_reports_drift_when_digest_disagrees_and_no_patches(repository, tmp_path):
-    # The exact 599c06d0 incident shape: artifact changed, patch ledger empty.
+    # The exact 599c06d0 incident shape: a tracked file changed, patch ledger empty.
     stage = module()
     repo, sha = repository
     result = stage.stage_pi(tmp_path / 'home', sha, repository=str(repo), runner=install_ok)
     release = Path(result['sourceRoot'])
     receipt = json.loads((release.parents[1] / 'receipts' / (sha + '.json')).read_text())
-    assert stage.verify_artifact(release, receipt) == 'verified'
+    assert stage.verify_artifact(release, receipt, install_ok) == 'verified'
     (release / 'package.json').write_text('{"name":"pi-engineering-runtime","hotpatch":true}')
-    assert stage.verify_artifact(release, receipt) == 'drift'
+    assert stage.verify_artifact(release, receipt, install_ok) == 'drift'
 
 
 def test_verify_artifact_reports_unknown_for_pre_digest_receipt(repository, tmp_path):
@@ -322,7 +327,22 @@ def test_verify_artifact_reports_unknown_for_pre_digest_receipt(repository, tmp_
     repo, sha = repository
     result = stage.stage_pi(tmp_path / 'home', sha, repository=str(repo), runner=install_ok)
     release = Path(result['sourceRoot'])
-    assert stage.verify_artifact(release, {'revision': sha, 'sourceRoot': str(release)}) == 'unknown'
+    assert stage.verify_artifact(release, {'revision': sha, 'sourceRoot': str(release)}, install_ok) == 'unknown'
+
+
+def test_verify_artifact_rejects_a_broken_patch_chain(repository, tmp_path):
+    # A ledger only explains drift if it chains from the recorded digest; a patch
+    # whose beforeDigest does not continue the chain is not an explanation.
+    stage = module()
+    repo, sha = repository
+    result = stage.stage_pi(tmp_path / 'home', sha, repository=str(repo), runner=install_ok)
+    release = Path(result['sourceRoot'])
+    (release / 'package.json').write_text('{"name":"pi-engineering-runtime","edited":true}')
+    current = stage.compute_digest(release, install_ok)
+    forged = {'revision': sha, 'sourceRoot': str(release), 'artifactDigest': result['artifactDigest'],
+              'patches': [{'path': 'package.json', 'beforeDigest': 'sha256:unrelated',
+                           'afterDigest': current, 'appliedAt': 'x', 'actor': 'x', 'reason': 'x'}]}
+    assert stage.verify_artifact(release, forged, install_ok) == 'drift'
 
 
 def test_record_patch_appends_ledger_entry_and_keeps_verification_honest(repository, tmp_path):
@@ -332,9 +352,9 @@ def test_record_patch_appends_ledger_entry_and_keeps_verification_honest(reposit
     release = Path(result['sourceRoot'])
     root = release.parents[1]
     target = release / 'package.json'
-    before = stage.compute_digest(release)
+    before = stage.compute_digest(release, install_ok)
     target.write_text('{"name":"pi-engineering-runtime","hotpatch":683}')
-    after = stage.compute_digest(release)
+    after = stage.compute_digest(release, install_ok)
     entry = stage.record_patch(root, sha, path='package.json', before=before, after=after,
                                actor='operator', reason='pi#683 hotpatch')
     assert entry['path'] == 'package.json'
@@ -344,84 +364,43 @@ def test_record_patch_appends_ledger_entry_and_keeps_verification_honest(reposit
     receipt = json.loads((root / 'receipts' / (sha + '.json')).read_text())
     assert receipt['patches'] == [entry]
     # A recorded patch chain that explains the current content verifies.
-    assert stage.verify_artifact(release, receipt) == 'verified'
+    assert stage.verify_artifact(release, receipt, install_ok) == 'verified'
     # A further undocumented edit drifts again.
     target.write_text('{"name":"pi-engineering-runtime","hotpatch":683,"sneaky":true}')
-    assert stage.verify_artifact(release, receipt) == 'drift'
+    assert stage.verify_artifact(release, receipt, install_ok) == 'drift'
 
 
-@pytest.fixture
-def ignoring_repository(tmp_path):
-    # An upstream whose .gitignore hides a build-output directory: edits there are
-    # invisible to `git status` but are part of the artifact the digest proves.
-    repo = tmp_path / 'upstream-ignored'
+def test_restaging_is_stable_when_untracked_build_output_appears(tmp_path):
+    # The herdr false-drift guard: a pip/setuptools in-tree build writes build/ and
+    # *.egg-info/ into the release on every install. The real repo gitignores them,
+    # so they are neither `git status` dirty nor in the tracked digest -- a converge
+    # must report no change, not drift.
+    stage = module()
+    repo = tmp_path / 'upstream-build'
     repo.mkdir()
     subprocess.run(['git', 'init', '-b', 'main', str(repo)], check=True, capture_output=True)
     for key, value in [('user.name', 'Test'), ('user.email', 'test@example.test')]:
         subprocess.run(['git', '-C', str(repo), 'config', key, value], check=True)
     (repo / 'package.json').write_text(json.dumps({'name': 'pi-engineering-runtime'}))
     (repo / 'package-lock.json').write_text('{}')
-    (repo / '.gitignore').write_text('node_modules/\ngenerated/\n')
-    subprocess.run(['git', '-C', str(repo), 'add', 'package.json', 'package-lock.json', '.gitignore'],
-                   check=True)
+    (repo / '.gitignore').write_text('node_modules/\nbuild/\n*.egg-info/\n__pycache__/\n')
+    subprocess.run(['git', '-C', str(repo), 'add', 'package.json', 'package-lock.json', '.gitignore'], check=True)
     subprocess.run(['git', '-C', str(repo), 'commit', '-m', 'initial'], check=True, capture_output=True)
     sha = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
-    return repo, sha
-
-
-def test_restaging_a_drifted_release_is_refused_not_re_baselined(ignoring_repository, tmp_path):
-    # The laundering path: a gitignored file changes, git status stays clean, so
-    # verify_checkout passes. A re-stage must NOT recompute the digest from the
-    # drifted content and bless it -- it must refuse and preserve the receipt.
-    stage = module()
-    repo, sha = ignoring_repository
     home = tmp_path / 'home'
-    result = stage.stage_pi(home, sha, repository=str(repo), runner=install_ok)
-    release = Path(result['sourceRoot'])
-    receipt_path = release.parents[1] / 'receipts' / (sha + '.json')
-    trusted = json.loads(receipt_path.read_text())
-    # A gitignored build artifact appears/drifts in place (git status cannot see it).
-    (release / 'generated').mkdir(exist_ok=True)
-    (release / 'generated' / 'out.js').write_text('TAMPERED')
+    (home / '.pi/agent').mkdir(parents=True)
+    first, changed = stage.stage_or_reuse(home, sha, 'pi', str(repo), install_ok)
+    assert changed is True
+    release = Path(first['sourceRoot'])
+    (release / 'build').mkdir(exist_ok=True)
+    (release / 'build' / 'out.py').write_text('setuptools build output')
+    (release / 'pkg.egg-info').mkdir(exist_ok=True)
+    (release / 'pkg.egg-info' / 'PKG-INFO').write_text('Metadata')
+    # git status must stay clean (the outputs are gitignored), and the digest unchanged.
     assert subprocess.check_output(['git', '-C', str(release), 'status', '--porcelain'], text=True) == ''
-    with pytest.raises(RuntimeError, match='drift'):
-        stage.stage_pi(home, sha, repository=str(repo), runner=install_ok)
-    # The trusted receipt is preserved, not overwritten with the tampered digest.
-    assert json.loads(receipt_path.read_text()) == trusted
-    assert stage.describe_pi(home, runner=install_ok) is None
-
-
-def test_restaging_a_recorded_patch_release_preserves_the_ledger(ignoring_repository, tmp_path):
-    # A gitignored change with a ledger entry that explains it verifies; a re-stage
-    # must reuse the existing receipt (ledger intact), never reset patches to [].
-    stage = module()
-    repo, sha = ignoring_repository
-    home = tmp_path / 'home'
-    result = stage.stage_pi(home, sha, repository=str(repo), runner=install_ok)
-    release = Path(result['sourceRoot'])
-    root = release.parents[1]
-    before = stage.compute_digest(release)
-    (release / 'generated').mkdir(exist_ok=True)
-    (release / 'generated' / 'out.js').write_text('patched')
-    after = stage.compute_digest(release)
-    stage.record_patch(root, sha, path='generated/out.js', before=before, after=after,
-                       actor='operator', reason='documented hotpatch')
-    patched = json.loads((root / 'receipts' / (sha + '.json')).read_text())
-    again = stage.stage_pi(home, sha, repository=str(repo), runner=install_ok)
-    assert json.loads((root / 'receipts' / (sha + '.json')).read_text()) == patched
-    assert again['patches'] == patched['patches'] and again['artifactDigest'] == patched['artifactDigest']
-
-
-def test_describe_refuses_a_gitignored_drift(ignoring_repository, tmp_path):
-    # describe's new verify_artifact gate: content the digest catches but git does not.
-    stage = module()
-    repo, sha = ignoring_repository
-    home = tmp_path / 'home'
-    result = stage.stage_pi(home, sha, repository=str(repo), runner=install_ok)
-    assert stage.describe_pi(home, runner=install_ok) == result
-    (Path(result['sourceRoot']) / 'generated').mkdir(exist_ok=True)
-    (Path(result['sourceRoot']) / 'generated' / 'out.js').write_text('TAMPERED')
-    assert stage.describe_pi(home, runner=install_ok) is None
+    again, changed = stage.stage_or_reuse(home, sha, 'pi', str(repo), install_ok)
+    assert changed is False and again == first
+    assert stage.describe_pi(home, runner=install_ok) == first
 
 
 def test_stage_release_and_host_apply_digest_contracts_agree(repository, tmp_path):

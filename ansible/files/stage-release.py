@@ -18,10 +18,6 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Content that is install-owned (node_modules) or VCS metadata (.git) is not the
-# artifact a release name denotes, so it is excluded from the content digest.
-DIGEST_EXCLUDED = {'.git', 'node_modules'}
-
 REPOSITORIES = {
     'pi': 'https://github.com/berlinguyinca/pi-engineering.git',
     'herdr': 'https://github.com/berlinguyinca/herdr-engineering.git',
@@ -55,31 +51,25 @@ def validate_revision(revision):
         raise RuntimeError('Release staging supports Linux and macOS only')
 
 
-def compute_digest(release):
-    """sha256 over sorted ``relpath + NUL + bytes`` for every regular file under
-    ``release`` except install-owned/VCS trees. Order-independent and
-    rename-sensitive, so it proves the staged content, not the recorded commit.
-    Two stagings of one commit produce the same digest; any in-place edit changes it."""
+def compute_digest(release, runner):
+    """sha256 over sorted ``relpath + NUL + bytes`` for every git-tracked file in
+    ``release`` (``git ls-files``). The artifact a release name denotes is its
+    tracked tree at that revision, so install/build output -- node_modules, the
+    setuptools ``build/`` and ``*.egg-info/`` trees, ``__pycache__`` -- is
+    untracked and never enters the digest. That makes the digest deterministic
+    across two stagings of one commit (a converge/re-stage reproduces it exactly)
+    while any in-place edit to a tracked file (the 599c06d0 shape) changes it."""
     release = Path(release)
-    entries = []
-    for current, dirnames, filenames in os.walk(release):
-        if Path(current) == release:
-            # Prune the excluded top-level trees so complete()/converged() do not
-            # stat tens of thousands of node_modules files on every call.
-            dirnames[:] = [name for name in dirnames if name not in DIGEST_EXCLUDED]
-        for name in filenames:
-            path = Path(current) / name
-            if path.is_file() and not path.is_symlink():
-                entries.append(path.relative_to(release))
+    listing = runner(['git', '-C', str(release), 'ls-files', '-z'])
     digest = hashlib.sha256()
-    for relative in sorted(entries, key=lambda item: item.as_posix()):
-        digest.update(relative.as_posix().encode('utf-8'))
+    for relative in sorted(part for part in listing.split('\x00') if part):
+        digest.update(relative.encode('utf-8'))
         digest.update(b'\x00')
         digest.update((release / relative).read_bytes())
     return 'sha256:' + digest.hexdigest()
 
 
-def verify_artifact(release, receipt):
+def verify_artifact(release, receipt, runner):
     """Classify a staged release against its receipt by content, not by HEAD.
 
     ``verified`` -- current content matches the receipt's digest, or a recorded
@@ -90,7 +80,7 @@ def verify_artifact(release, receipt):
     recorded = receipt.get('artifactDigest')
     if not recorded:
         return 'unknown'
-    current = compute_digest(release)
+    current = compute_digest(release, runner)
     if current == recorded:
         return 'verified'
     expected = recorded
@@ -224,29 +214,15 @@ def _stage(home, revision, kind, repository, runner):
                 runner(['python3', '-m', 'venv', str(venv)])
             runner([str(venv / 'bin/python'), '-m', 'pip', 'install', '--quiet', '--upgrade', str(release)])
             verify_herdr_distribution(home, release, runner)
+        # verify_checkout ran inside checkout() before any install step and runs
+        # again here: the tree is clean, so its tracked content equals the commit's
+        # and the digest is reproduced exactly. A re-stage therefore cannot launder
+        # drift -- an in-place edit to a tracked file is `git status` dirty and was
+        # already refused above, before the venv/node_modules were touched.
         verify_checkout(release, revision, runner)
-        # An already-attested release is never silently re-baselined. Re-staging a
-        # release whose receipt records a digest must verify the on-disk content
-        # against that receipt -- gitignored drift passes `git status` but not the
-        # digest -- and refuse drift instead of blessing it as the new baseline
-        # (the 599c06d0 laundering path). A verified release keeps its receipt and
-        # patch ledger untouched; only a first (or pre-digest) staging mints one.
-        prior = None
-        if receipt.exists():
-            try:
-                candidate = json.loads(receipt.read_text())
-                if isinstance(candidate, dict) and candidate.get('artifactDigest'):
-                    prior = candidate
-            except ValueError:
-                prior = None
-        if prior is not None:
-            if verify_artifact(release, prior) == 'drift':
-                raise RuntimeError('Managed release content drifted from its receipt; refusing overwrite')
-            result = prior
-        else:
-            result = {'revision': revision, 'sourceRoot': str(release),
-                      'artifactDigest': compute_digest(release), 'patches': []}
-            atomic_json(receipt, result)
+        result = {'revision': revision, 'sourceRoot': str(release),
+                  'artifactDigest': compute_digest(release, runner), 'patches': []}
+        atomic_json(receipt, result)
         if pending_settings:
             settings, before, value = pending_settings
             settings.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -294,7 +270,7 @@ def describe(home, kind, runner=run):
             return None
         # Verify by content: a drifted artifact is not the release it claims to be.
         # A pre-#881 receipt (unknown) stays reusable but is surfaced by callers.
-        if verify_artifact(release, receipt) == 'drift':
+        if verify_artifact(release, receipt, runner) == 'drift':
             return None
         if kind == 'pi':
             packages = json.loads((home / '.pi/agent/settings.json').read_text()).get('packages', [])
@@ -304,7 +280,7 @@ def describe(home, kind, runner=run):
         else:
             verify_herdr_distribution(home, release, runner)
         return result
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, subprocess.SubprocessError):
         return None
 
 

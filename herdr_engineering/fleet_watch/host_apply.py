@@ -503,27 +503,20 @@ class Autospec:
 # #881: a release receipt must prove the content it names, not merely exist. The
 # digest contract matches ansible/files/stage-release.py (a standalone, stdlib-only
 # script pushed to hosts); it is duplicated here rather than imported because the two
-# live in different deployment units. sha256 over sorted relpath + NUL + bytes,
-# excluding install-owned (node_modules) and VCS (.git) trees.
-_DIGEST_EXCLUDED = {".git", "node_modules"}
+# live in different deployment units. sha256 over sorted relpath + NUL + bytes for
+# every git-tracked file -- the artifact a release name denotes is its tracked tree,
+# so install/build output (node_modules, setuptools build/ + *.egg-info, __pycache__)
+# is untracked and never enters the digest, keeping it deterministic across stagings.
 
 
 def _artifact_digest(release: Path) -> str:
-    entries: list[Path] = []
-    for current, dirnames, filenames in os.walk(release):
-        if Path(current) == release:
-            # Prune excluded top-level trees so complete()/converged()/checks() do
-            # not walk tens of thousands of node_modules files on every call.
-            dirnames[:] = [name for name in dirnames if name not in _DIGEST_EXCLUDED]
-        for name in filenames:
-            path = Path(current) / name
-            if path.is_file() and not path.is_symlink():
-                entries.append(path.relative_to(release))
+    listing = subprocess.run(["git", "-C", str(release), "ls-files", "-z"],
+                             check=True, capture_output=True, timeout=120).stdout
     digest = hashlib.sha256()
-    for relative in sorted(entries, key=lambda item: item.as_posix()):
-        digest.update(relative.as_posix().encode("utf-8"))
+    for raw in sorted(part for part in listing.split(b"\x00") if part):
+        digest.update(raw)
         digest.update(b"\x00")
-        digest.update((release / relative).read_bytes())
+        digest.update((release / os.fsdecode(raw)).read_bytes())
     return "sha256:" + digest.hexdigest()
 
 
@@ -570,12 +563,19 @@ class Pi:
             return False
         # Existence is not integrity (#881): a receipt that records a digest is checked
         # against the on-disk content, so an in-place edit reads as incomplete, not clean.
-        # A pre-#881 receipt has no digest (unknown) and stays reusable.
+        # A pre-#881 receipt has no digest (unknown) and stays reusable. Any failure to
+        # read the receipt or hash the tree (unreadable JSON, a non-dict receipt, a file
+        # that vanished mid-walk, git missing) is a release we cannot attest: incomplete,
+        # never an exception out of converged()/apply()/checks().
         try:
             data = json.loads(receipt.read_text())
-        except (OSError, ValueError):
+            if not isinstance(data, dict):
+                raise ValueError("receipt is not an object")
+            status = receipt_status(release, data)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            ctx.note(f"release {sha} receipt could not be verified: {type(exc).__name__}")
             return False
-        if receipt_status(release, data) == "drift":
+        if status == "drift":
             ctx.note(f"release {sha} content does not match its receipt digest")
             return False
         return True

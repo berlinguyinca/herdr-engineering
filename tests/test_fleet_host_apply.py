@@ -644,33 +644,36 @@ def test_pi_incomplete_stage_is_failed(world):
     assert not (world.home / ".local/share/herdr-engineering/pi/current").exists()
 
 
-def _pi_artifact_digest(release: Path) -> str:
-    # The #881 content digest contract: sha256 over sorted relpath + NUL + bytes,
-    # excluding install-owned (node_modules) and VCS (.git) trees.
-    digest = hashlib.sha256()
-    files = [p for p in sorted(release.rglob("*"), key=lambda p: p.relative_to(release).as_posix())
-             if p.is_file() and not p.is_symlink()
-             and p.relative_to(release).parts[0] not in {".git", "node_modules"}]
-    for path in files:
-        digest.update(path.relative_to(release).as_posix().encode())
-        digest.update(b"\x00")
-        digest.update(path.read_bytes())
-    return "sha256:" + digest.hexdigest()
+def _git_release(release: Path) -> None:
+    # A staged release is a detached git checkout; the #881 digest is over its
+    # tracked tree (`git ls-files`), so the test release must be a real repo.
+    subprocess.run(["git", "init", "-q", "-b", "main", str(release)], check=True)
+    for key, value in (("user.name", "Test"), ("user.email", "t@test.test")):
+        subprocess.run(["git", "-C", str(release), "config", key, value], check=True)
+    (release / ".gitignore").write_text("node_modules/\n")
+    subprocess.run(["git", "-C", str(release), "add", "package.json", ".gitignore"], check=True)
+    subprocess.run(["git", "-C", str(release), "commit", "-qm", "release"], check=True,
+                   env={**os.environ, "GIT_AUTHOR_DATE": "2020-01-01T00:00:00", "GIT_COMMITTER_DATE": "2020-01-01T00:00:00"})
 
 
 def test_pi_complete_consults_the_artifact_digest(world):
     # A receipt that records a digest must be checked against the content: an
-    # in-place edit (the 599c06d0 shape) makes the release incomplete, not clean.
+    # in-place edit to a tracked file (the 599c06d0 shape) makes the release
+    # incomplete, not clean. node_modules is untracked, so the digest ignores it.
     release = make_release(world, PI_SHAS[0])
+    (release / "package.json").write_text('{"name":"pi-engineering-runtime"}')
+    _git_release(release)
     root = world.home / ".local/share/herdr-engineering/pi"
     receipt = root / "receipts" / f"{PI_SHAS[0]}.json"
     receipt.write_text(json.dumps({"revision": PI_SHAS[0], "sourceRoot": str(release),
-                                   "artifactDigest": _pi_artifact_digest(release), "patches": []}))
+                                   "artifactDigest": host_apply._artifact_digest(release), "patches": []}))
     ctx = host_apply.Context(RID, "pi-engineering", PI_SHAS[0], "bender", env={"HOME": str(world.home)})
     pi = host_apply.Pi()
     assert pi.complete(ctx, PI_SHAS[0]) is True
+    (release / "node_modules" / "dep.js").write_text("untracked install output")
+    assert pi.complete(ctx, PI_SHAS[0]) is True            # install output is not the artifact
     (release / "package.json").write_text('{"name":"pi-engineering-runtime","hotpatch":true}')
-    assert pi.complete(ctx, PI_SHAS[0]) is False
+    assert pi.complete(ctx, PI_SHAS[0]) is False           # a tracked edit is drift
 
 
 def test_pi_complete_tolerates_pre_digest_receipt(world):
@@ -680,6 +683,21 @@ def test_pi_complete_tolerates_pre_digest_receipt(world):
     assert host_apply.Pi().complete(ctx, PI_SHAS[0]) is True
     (release / "package.json").write_text('{"name":"pi-engineering-runtime","edited":true}')
     assert host_apply.Pi().complete(ctx, PI_SHAS[0]) is True
+
+
+def test_pi_complete_is_incomplete_when_a_digest_receipt_cannot_be_verified(world):
+    # An unreadable/non-dict receipt, or a release that is not a checkout, is a
+    # release we cannot attest: incomplete, never an exception out of complete().
+    release = make_release(world, PI_SHAS[0])
+    root = world.home / ".local/share/herdr-engineering/pi"
+    ctx = host_apply.Context(RID, "pi-engineering", PI_SHAS[0], "bender", env={"HOME": str(world.home)})
+    (root / "receipts" / f"{PI_SHAS[0]}.json").write_text("[not an object]")
+    assert host_apply.Pi().complete(ctx, PI_SHAS[0]) is False
+    # A digest-bearing receipt over a non-git release cannot be hashed -> incomplete.
+    (root / "receipts" / f"{PI_SHAS[0]}.json").write_text(json.dumps(
+        {"revision": PI_SHAS[0], "sourceRoot": str(release),
+         "artifactDigest": "sha256:" + "0" * 64, "patches": []}))
+    assert host_apply.Pi().complete(ctx, PI_SHAS[0]) is False
 
 
 def test_pi_refuses_to_replace_a_real_current_directory(world):
