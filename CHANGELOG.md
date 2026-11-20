@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Chore: pin herdr-handoff 0.5.1
+
+- `lock/upstreams.yaml` pins herdr-handoff to `a035dcab040b3288c10f15abfdb52620f4bc37ac` (herdr-handoff#13, v0.5.1). `herdr-handoff confirm` now closes the source pane when `takeover` gave up waiting (its `--confirm-timeout`) and the successor confirms afterwards, through the same close gate as takeover (unpushed commits, a dirty worktree or another tab refuse). It never closes after `--keep-source`, for a 0.5.0-written record, with no source pane recorded, or while a takeover holds the lock. Its JSON gains `close` (`source_closed`, `already_closed`, `refused`, `not_attempted`), `source_closed`, `reason` and `source_closed_at`, and it exits 0 whenever the confirmation is recorded. 0.5.1 adds no CLI flag, so `check_handoff_dependency` is unchanged (it still names 0.5.0 as the minimum). The handoff skill and operations docs now describe a late `confirm` closing the source.
+
 ### Chore: pin herdr-handoff 0.5.0
 
 - `lock/upstreams.yaml` pins herdr-handoff to `aed3e8274e6948a774682a55d99b7cd9ef113914` (herdr-handoff#12, v0.5.0: shared handoff store, one takeover per handoff id, `takeover --direction`, `--relaunch`). `check_handoff_dependency` now also requires that `herdr-handoff takeover --help` lists `--direction` (reported as `takeover --direction`, naming 0.5.0), so `herdr-eng doctor` reports an installed 0.4.0 as too old until `scripts/install-handoff.sh` is run.
