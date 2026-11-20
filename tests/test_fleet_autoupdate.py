@@ -14,8 +14,9 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path, monkeypatch):
-    """An unattended-update test must never record into the developer's real state dir."""
+    """An unattended-update test must never read or record the developer's real state."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))  # never read the real pin file
 
 
 @pytest.fixture
@@ -442,6 +443,8 @@ def test_daily_unit_mints_plan_for_pin_when_nothing_unfinished(checkout, monkeyp
     monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", PIN)
     started = []
     with patch.object(fleet_rollout, "latest_unfinished", return_value=None), \
+         patch.object(fleet_rollout, "list_rollouts", return_value=[]), \
+         patch.object(fleet_rollout, "prune_settled", return_value=[]), \
          patch.object(fleet_rollout, "run_rollout",
                       side_effect=lambda store, rollout_id, **kw: started.append(rollout_id)
                       or {"id": rollout_id, "status": "pending", "runner": {"status": "running"}}) as run, \
@@ -512,7 +515,7 @@ def test_daily_unit_keeps_controller_update_when_rollout_drain_errors(checkout, 
     assert out["ok"] is False  # the drain error turns the run red
     assert out["revision"] == "d" * 40  # ...but the controller update is preserved
     assert out["pi_rollout"]["status"] == "error"
-    assert "corrupt rollout record" in out["pi_rollout"]["error"]
+    assert "corrupt rollout record" in out["pi_rollout"]["reason"]
     recorded = fleet_autoupdate.read_state()
     assert recorded["outcome"] == "failed"
     assert recorded["revision"] == "d" * 40
@@ -520,15 +523,67 @@ def test_daily_unit_keeps_controller_update_when_rollout_drain_errors(checkout, 
 
 
 def test_daily_unit_fails_closed_on_broken_pin(checkout, monkeypatch, capsys):
+    """A mangled pin drains nothing; the run goes red but the update's revision survives."""
     from herdr_engineering import fleet_autoupdate, fleet_rollout
 
     monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", "not-a-sha")
     with patch.object(fleet_rollout, "read_pin",
                       side_effect=ValueError("HERDR_PI_ROLLOUT_REVISION must be a full lowercase 40-character commit SHA")):
-        with patch.object(fleet_autoupdate, "fleet_update", return_value={"ok": True, "steps": {}}):
+        with patch.object(fleet_autoupdate, "fleet_update",
+                          return_value={"ok": True, "revision": "d" * 40, "steps": {}}):
             assert fleet_autoupdate.main() == 1
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is False
-    assert "pi-rollout-revision" in out["error"] or "40-character" in out["error"]
+    assert out["revision"] == "d" * 40  # the controller update is preserved, not discarded
+    assert out["pi_rollout"]["status"] == "error"
+    assert "40-character" in out["pi_rollout"]["reason"]
     recorded = fleet_autoupdate.read_state()
     assert recorded["outcome"] == "failed"
+    assert recorded["revision"] == "d" * 40
+    assert "pi rollout step failed" in recorded["reason"]
+
+
+@pytest.mark.parametrize("settled_status", ["complete", "abandoned"])
+def test_daily_unit_never_remints_a_settled_pinned_revision(checkout, monkeypatch, capsys,
+                                                            settled_status):
+    """Night 2 after convergence must be a reported skip, not a nightly re-rollout (#844)."""
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", PIN)
+    settled = {"id": PLAN_ID, "revision": PIN, "status": settled_status,
+               "createdAt": "2026-11-01T00:00:00+00:00"}
+    with patch.object(fleet_rollout, "latest_unfinished", return_value=None), \
+         patch.object(fleet_rollout, "list_rollouts", return_value=[settled]), \
+         patch.object(fleet_rollout, "run_rollout") as run, \
+         patch.object(fleet_rollout, "create_rollout") as create, \
+         patch.object(fleet_rollout, "prune_settled") as prune:
+        with patch.object(fleet_autoupdate, "fleet_update", return_value={"ok": True, "steps": {}}):
+            assert fleet_autoupdate.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["pi_rollout"]["status"] == "skipped"
+    assert out["pi_rollout"]["id"] == PLAN_ID
+    assert settled_status in out["pi_rollout"]["reason"]
+    run.assert_not_called()
+    create.assert_not_called()
+    prune.assert_not_called()  # nothing drained, nothing to prune
+
+
+def test_daily_unit_keeps_drain_result_when_prune_is_locked(checkout, monkeypatch, capsys):
+    """A busy rollout lock at prune time must not discard the pass that just succeeded."""
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", PIN)
+    plan = {"id": PLAN_ID, "revision": PIN, "status": "complete"}
+    with patch.object(fleet_rollout, "latest_unfinished", return_value=plan), \
+         patch.object(fleet_rollout, "run_rollout",
+                      return_value={"id": PLAN_ID, "status": "complete",
+                                    "runner": {"status": "complete"}}), \
+         patch.object(fleet_rollout, "prune_settled",
+                      side_effect=BlockingIOError("another rollout driver holds the lock")):
+        with patch.object(fleet_autoupdate, "fleet_update", return_value={"ok": True, "steps": {}}):
+            assert fleet_autoupdate.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["pi_rollout"]["status"] == "complete"
+    assert "lock" in out["pi_rollout"]["prunedError"]

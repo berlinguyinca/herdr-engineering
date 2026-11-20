@@ -231,6 +231,10 @@ def run_update() -> dict:
             # successful controller update is no longer discarded (#844).
             if result["pi_rollout"].get("status") == "error":
                 result["ok"] = False
+                result["error"] = (
+                    "pi rollout step failed: " + (result["pi_rollout"].get("reason")
+                                                  or "unknown error")
+                )
         else:
             result["pi_rollout"] = {"status": "skipped", "reason": "controller update not ok"}
         return result
@@ -242,14 +246,19 @@ def pi_rollout_step(root: Path, *, store=None) -> dict:
     The step resumes the newest unfinished rollout instead of minting a parallel one,
     and only ever targets the pinned revision: plans for other revisions are the
     operator's to settle (abandon) or finish. Skips (no pin, mismatched unfinished
-    plan) are normal, recorded outcomes. A mangled pin fails closed (raises). A drain
-    that cannot run (corrupt record, transport error) is reported as status="error" so
-    the run goes red without discarding the controller update that already succeeded.
+    plan, pinned revision already settled, another driver holding the lock) are
+    normal, recorded outcomes that keep the run green. Errors - a malformed pin, a
+    corrupt record, a transport failure - are reported as status="error": the run
+    goes red, but the controller update that already succeeded keeps its report and
+    revision (#844).
     """
     from . import fleet_rollout
 
-    store = store or fleet_rollout.RolloutStore()
-    pin = fleet_rollout.read_pin()  # a mangled pin fails closed, before any drain work
+    try:
+        store = store or fleet_rollout.RolloutStore()
+        pin = fleet_rollout.read_pin()  # a mangled pin fails closed, before any drain work
+    except (OSError, ValueError, RuntimeError) as exc:
+        return {"status": "error", "reason": str(exc)}
     if pin is None:
         return {
             "status": "skipped",
@@ -270,7 +279,7 @@ def pi_rollout_step(root: Path, *, store=None) -> dict:
             "reason": "another rollout driver holds the lock; skipping this pass",
         }
     except (OSError, ValueError, RuntimeError) as exc:
-        return {"status": "error", "error": str(exc)}
+        return {"status": "error", "reason": str(exc)}
 
 
 def _drain_pinned_rollout(root: Path, store, pin: str) -> dict:
@@ -287,6 +296,22 @@ def _drain_pinned_rollout(root: Path, store, pin: str) -> dict:
             ),
         }
     if plan is None:
+        # Nothing unfinished anywhere. Minting is only correct when the pin has never
+        # been rolled out: a settled plan for the pin means converged (complete) or
+        # deliberately retired (abandoned) - re-minting nightly would re-stage the
+        # fleet forever and write a fresh record every night (#844).
+        settled_for_pin = [p for p in fleet_rollout.list_rollouts(store)
+                           if p["revision"] == pin]
+        if settled_for_pin:
+            newest = max(settled_for_pin, key=lambda p: (p.get("createdAt", ""), p["id"]))
+            return {
+                "status": "skipped",
+                "id": newest["id"],
+                "reason": (
+                    f"pinned revision {pin[:12]} is already {newest['status']} "
+                    f"(rollout {newest['id']}) - plan a new revision to roll out again"
+                ),
+            }
         inventory = root / "ansible" / "inventory" / "hosts.yml"
         plan = fleet_rollout.create_rollout(
             store, pin, fleet_rollout.inventory_targets(inventory, None), inventory=inventory
@@ -294,13 +319,19 @@ def _drain_pinned_rollout(root: Path, store, pin: str) -> dict:
     report = fleet_rollout.run_rollout(
         store, plan["id"], interval_seconds=30, max_passes=PI_ROLLOUT_MAX_PASSES
     )
-    pruned = fleet_rollout.prune_settled(store)
-    return {
+    result = {
         "status": report.get("status"),
         "runner": (report.get("runner") or {}).get("status"),
         "id": plan["id"],
-        "pruned": [entry["id"] for entry in pruned],
     }
+    try:
+        result["pruned"] = [entry["id"] for entry in fleet_rollout.prune_settled(store)]
+    except BlockingIOError:
+        # The drain already happened; a busy store lock must not discard its report.
+        result["prunedError"] = "another rollout driver holds the lock; prune deferred"
+    except (OSError, ValueError, RuntimeError) as exc:
+        result["prunedError"] = str(exc)
+    return result
 
 
 def failure_reason(report: dict) -> str | None:

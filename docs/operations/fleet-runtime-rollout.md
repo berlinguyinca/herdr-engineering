@@ -134,18 +134,28 @@ not settled (`complete` or `abandoned`), or `{"id": null}`. The daily controller
 (`herdr-eng-fleet-update.timer` -> `herdr_engineering.fleet_autoupdate`) runs this
 selector after each successful controller update: with a pin it resumes the newest
 unfinished rollout with a bounded pass window (`--max-passes 3`, 30-second
-interval) and only mints a new plan when nothing unfinished exists. A plan whose
-revision does not match the pin is skipped and reported in the run record - the
-operator settles it with `fleet rollout abandon --id ROLLOUT_ID --reason ...`
+interval), and mints a new plan only when nothing unfinished exists **and** the
+pinned revision has never been rolled out - once a plan for the pin settles, later
+nights report a skip instead of re-staging the converged fleet, and an abandoned
+plan for the pin is respected as the operator's decision to retire it. A plan
+whose revision does not match the pin is skipped and reported in the run record -
+the operator settles it with `fleet rollout abandon --id ROLLOUT_ID --reason ...`
 (settling a `complete` rollout is refused) or finishes it. The result of the pi
 step is recorded in the unattended run state next to the controller update, so a
-permanently skipped or blocked drain is visible without reading the journal.
+permanently skipped or blocked drain is visible without reading the journal. The
+step's own failures - a malformed pin file, an unreadable store, a rollout lock
+held by an operator command - are recorded as `pi_rollout.status: error` (or
+`prunedError` beside a completed drain) and never undo a successful controller
+update: the run's pass/fail verdict belongs to the controller update.
 
-**Bound the state.** `fleet rollout prune [--older-than-days N]` (default 30) deletes
+**Bound the state.** `fleet rollout prune [--older-than-days N]` (default 30,
+bounded to 0-3650: a negative horizon would delete every settled record) deletes
 settled records - `complete` or `abandoned`, judged by their last pass or creation
 time - so the state directory reflects current intent. Unsettled records are never
 touched: a blocked rollout may still be the operator's next action, and only a
-deliberate `abandon` marks it done. The daily driver prunes after each drain.
+deliberate `abandon` marks it done - and like `apply` and `run`, `retire-identityless`
+refuses an abandoned rollout rather than silently reopening it. The daily driver
+prunes after each drain.
 
 ## What completion proves
 

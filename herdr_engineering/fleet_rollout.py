@@ -269,8 +269,7 @@ def resolve_plan_revision(explicit: str | None = None, pin: Path | None = None) 
 
 def list_rollouts(store) -> list:
     """Every stored plan, validated. A corrupt record fails closed: the directory is the record."""
-    if not store.root.exists():
-        return []
+    store._directory()  # the same privacy/ownership check the write paths demand
     return [
         store.read(entry.stem)
         for entry in sorted(store.root.iterdir())
@@ -314,8 +313,11 @@ def prune_settled(store, *, older_than_days: int = 30, now=None) -> list:
 
     Unsettled plans are never touched: a blocked rollout may be the operator's next action,
     and only a deliberate abandon marks it done. A settled record whose settle time is
-    unreadable is kept, never guessed.
+    unreadable is kept, never guessed. The horizon is bounded: a negative one would delete
+    every settled record (losing the abandon audit trail), and an absurd one overflows.
     """
+    if not 0 <= older_than_days <= 3650:
+        raise ValueError("prune horizon must be between 0 and 3650 days")
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(days=older_than_days)
     pruned = []
@@ -1060,6 +1062,8 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
     with store.lock():
         plan = store.read(rollout_id)
         if plan.get("status") == "abandoned":
+            # Abandon is the operator's settle decision; acting anyway would reopen the
+            # rollout without the selector ever seeing it (#844).
             raise ValueError("rollout is abandoned; plan a fresh one for the pinned revision")
 
         def save():
@@ -1323,9 +1327,14 @@ def retire_identityless(store, rollout_id, *, settled_by="operator"):
     Only sessions blocked on a *missing* identity are retired. An ambiguous or conflicting one
     stays blocked -- that is a real disagreement, not a stale husk. A retired session is picked
     back up automatically by the next pass if its identity ever resolves.
+
+    A settled rollout is settled: like apply and run, retiring refuses an abandoned plan
+    rather than silently reopening it and handing it back to the nightly driver.
     """
     with store.lock():
         plan = store.read(rollout_id)
+        if plan.get("status") == "abandoned":
+            raise ValueError("an abandoned rollout is settled; it cannot be retired")
         retired, still_blocked = [], []
         for host, host_state in (plan.get("hosts") or {}).items():
             sessions = host_state.get("sessions") or {}

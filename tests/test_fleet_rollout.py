@@ -2466,3 +2466,42 @@ def test_rollout_convergence_handlers_are_wired(tmp_path, monkeypatch, capsys):
     # ...and the prune handler really deletes once past it (older-than-days 0).
     code, out = run("prune", "--older-than-days", "0", "--state", state)
     assert code == 0 and out["pruned"][0]["id"] == plan["id"]
+
+
+def test_prune_horizon_is_bounded(tmp_path):
+    """A negative horizon would delete every settled record; a huge one would overflow."""
+    from herdr_engineering.fleet_rollout import RolloutStore, prune_settled
+
+    store = RolloutStore(tmp_path / "state")
+    for bad in (-1, 3651, 10**9):
+        with pytest.raises(ValueError):
+            prune_settled(store, older_than_days=bad)
+
+
+def test_retire_identityless_refuses_abandoned_rollout(tmp_path):
+    """An abandoned rollout is settled; retiring identities must not reopen it."""
+    from herdr_engineering.fleet_rollout import RolloutStore, abandon_rollout, retire_identityless
+
+    store = RolloutStore(tmp_path / "state")
+    plan = _make_plan(store, "1" * 40, status="pending", created_at="2026-11-01T00:00:00+00:00")
+    abandon_rollout(store, plan["id"], reason="superseded")
+    with pytest.raises(ValueError, match="abandoned"):
+        retire_identityless(store, plan["id"])
+
+
+def test_apply_and_run_refuse_abandoned_rollouts(tmp_path):
+    """Abandoned means settled: no action entry point may silently reopen the rollout."""
+    from herdr_engineering.fleet_rollout import (
+        RolloutStore,
+        abandon_rollout,
+        apply_rollout,
+        run_rollout,
+    )
+
+    store = RolloutStore(tmp_path / "state")
+    plan = _make_plan(store, "1" * 40, status="pending", created_at="2026-11-01T00:00:00+00:00")
+    abandon_rollout(store, plan["id"], reason="superseded")
+    for action in (apply_rollout, run_rollout):
+        with pytest.raises(ValueError, match="abandoned"):
+            action(store, plan["id"])
+    assert store.read(plan["id"])["status"] == "abandoned"  # untouched
