@@ -25,7 +25,10 @@ its own locking. Busy checks compare (device, inode), never path spelling. On Li
    another uid's cwd, exe, fd and maps unreadable (``hidepid`` or not), so only this user's processes, and those
    in user namespaces this user owns (rootless containers), are detected. Root services, ``sudo``-run binaries
    and rootful containers running as a different uid are NOT; neither on macOS, where ``lsof`` lists only this
-   user's files. Such a process, and this user's own non-dumpable ones (``sudo -i``, ``ping``), is skipped.
+   user's files. Such a process is skipped: ``sudo -i`` and setuid-root binaries (euid 0) by their root-owned
+   ``/proc/<pid>``. This user's own non-dumpable processes (``ping``, file-capability binaries, ``prctl``) have a
+   root-owned ``fd/``; they are detected ONLY through their command line (the program path or an absolute
+   argument inside the target or the workspace), not by cwd, open files or mappings.
 
 Targets are skipped when a build lease covers them, when git tracks files in them, or when anything inside
 looks foreign (links, special files, other owners). Only current-user Cargo ``target`` directories inside
@@ -327,21 +330,40 @@ def _scan(proc: Path = Path("/proc")) -> list[Hold]:
             if _gone_or_zombie(pid):  # became a zombie or exited since the check above
                 continue
             try:
-                # a non-dumpable process keeps its /proc/<pid> owner but its ``fd`` entry turns root-owned
+                # An owner other than us (``sudo -i``, a setuid-root binary: euid 0) shows in ``/proc/<pid>``.
+                # This user's own non-dumpable process (``ping``, file capabilities, ``prctl``) keeps that
+                # owner, but its ``fd`` entry turns root-owned.
                 foreign = pid.stat().st_uid != os.getuid()
-                try:
-                    foreign = foreign or (pid / "fd").stat().st_uid != os.getuid()
-                except PermissionError:
-                    pass  # not even stat-able: unverifiable, handled as this user's own below
+                hidden = False
+                if not foreign:
+                    try:
+                        hidden = (pid / "fd").stat().st_uid != os.getuid()
+                    except PermissionError:
+                        pass  # not even stat-able: unverifiable, handled as this user's own below
             except OSError:
                 continue  # exited meanwhile
             if foreign:
-                continue  # another user's process, or this user's non-dumpable one (``sudo``, ``ping``): root-owned
+                continue  # another user's process: nothing of it can be read
+            if hidden:  # cwd, exe and fds are closed to us, the command line is not
+                holds.extend(_cmdline_holds(pid, int(pid.name)))
+                continue
             if _managed_process(pid, proc):
                 raise
             # Nondumpable daemons outside Herdr cannot be managed build jobs.
             continue
     return holds
+
+
+def _cmdline_holds(pid: Path, number: int) -> list[Hold]:
+    """What a non-dumpable process of this user still gives away: absolute paths on its command line (the
+    program, or an argument such as ``--target-dir=/x``). ``ping`` and ``sudo`` name nothing of a target."""
+    try:
+        name = (pid / "comm").read_text().strip()
+        argv = [os.fsdecode(a) for a in (pid / "cmdline").read_bytes().split(b"\0") if a]
+    except OSError:
+        return []  # unreadable or gone: skipped
+    paths = {item for arg in argv for item in (arg, arg.split("=", 1)[-1]) if item.startswith("/")}
+    return [(number, name, "uses", Path(item), _NO_IDS) for item in sorted(paths)]
 
 
 def _proc_claims(pid: Path, number: int, name: str) -> list[Hold]:
@@ -565,7 +587,7 @@ def _busy_check(target: Path) -> str | None:
             raise TimeoutError(f"busy check timed out after {seconds:g} s") from exc
         answered = True
     finally:
-        if not answered:
+        if not answered and child.returncode is None:
             try:
                 os.killpg(child.pid, signal.SIGKILL)
             except OSError:
@@ -655,7 +677,10 @@ def _cargo_clean(target: Path, timeout: float = _CLEAN_SECONDS) -> str | None:
                 if marker.exists():
                     identity = marker.read_bytes()
                 else:  # a killed clean took it earlier: the manager's own record says what it was
-                    identity = (json.dumps(read_owner(target.parent, target.name), sort_keys=True) + "\n").encode()
+                    owner = read_owner(target.parent, target.name)
+                    if owner is None:
+                        return "no ownership record to restore the marker from"
+                    identity = (json.dumps(owner, sort_keys=True) + "\n").encode()
                 write_cachedir_tag(target)  # newer cargo refuses to clean a directory without one
                 try:
                     done = subprocess.run(argv, cwd=workspace, env=env, capture_output=True, text=True,

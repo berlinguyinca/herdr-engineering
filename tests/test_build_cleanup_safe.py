@@ -828,8 +828,9 @@ _NON_DUMPABLE = "import ctypes, time; ctypes.CDLL(None).prctl(4, 0, 0, 0, 0); ti
 
 @pytest.mark.integration
 def test_a_non_dumpable_process_under_herdr_does_not_abort_the_scan(root, tmp_path):
-    """The user's own non-dumpable processes (``sudo -i``, ``ping``) show as root-owned and refuse
-    ``fd/``. One that descends from a process named herdr must be skipped, not turn into a failed sweep."""
+    """This user's non-dumpable processes (``ping``, file-capability execs) keep their ``/proc/<pid>`` owner
+    but have a root-owned ``fd/`` that refuses listing. One that descends from a process named herdr and
+    names nothing of the target on its command line must be skipped, not turn into a failed sweep."""
     if not sys.platform.startswith("linux"):
         pytest.skip("needs /proc")
     herdr = tmp_path / "herdr"
@@ -892,14 +893,98 @@ def test_a_nonsense_busy_check_deadline_falls_back_to_the_default(root, monkeypa
     assert "HERDR_BUSY_CHECK_SECONDS" in caplog.text
 
 
-def _busy_children() -> list[str]:
-    listing = subprocess.run(["ps", "-ww", "-o", "pid=,ppid=,args=", "-A"], capture_output=True, text=True).stdout
-    return [line for line in listing.splitlines()
-            if "_busy_child" in line and f" {os.getpid()} " in f" {line.split()[1]} "]
+_GRANDCHILD_HOOK = """
+import os, subprocess, time
+grandchild = subprocess.Popen(["sleep", "300"])
+with open(os.environ["HERDR_TEST_GRANDCHILD_PIDFILE"], "w") as pidfile:
+    pidfile.write(str(grandchild.pid))
+time.sleep(600)  # a scan that never finishes
+"""
 
 
-def test_a_timed_out_busy_check_leaves_no_child_behind(root, monkeypatch):
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    listing = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+    return bool(listing.strip()) and not listing.strip().startswith("Z")
+
+
+def test_a_timed_out_busy_check_kills_its_whole_process_group(root, tmp_path, monkeypatch):
+    """The scan child starts a real grandchild (through a ``sitecustomize`` on its path, as ``lsof`` is one on
+    macOS) and then hangs. After the deadline both must be gone: killing only the direct child leaves it."""
     local_target(root)
-    monkeypatch.setenv("HERDR_BUSY_CHECK_SECONDS", "0.001")
-    sweep(root)
-    _wait_for(lambda: not _busy_children(), "the busy-check child to be gone", 10)
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_GRANDCHILD_HOOK)
+    pidfile = tmp_path / "grandchild.pid"
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(hook), os.environ.get("PYTHONPATH")])))
+    monkeypatch.setenv("HERDR_TEST_GRANDCHILD_PIDFILE", str(pidfile))
+    monkeypatch.setenv("HERDR_BUSY_CHECK_SECONDS", "4")
+    result = sweep(root)
+    assert result["aborted"] and any("timed out" in error for error in result["errors"]), result
+    assert pidfile.exists(), "the hung scan never started its grandchild"
+    grandchild = int(pidfile.read_text())
+    try:
+        _wait_for(lambda: not _alive(grandchild), "the grandchild to be gone", 10)
+    finally:
+        try:
+            os.kill(grandchild, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+@pytest.mark.integration
+def test_a_non_dumpable_process_running_a_binary_from_the_target_keeps_the_target(root, tmp_path):
+    """Its cwd, exe and fds are unreadable, but its command line is not: a program path inside the target
+    (or any absolute argument inside the target or workspace) still marks the target busy."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("needs /proc")
+    target = local_target(root)
+    napper = target / "debug" / "napper"
+    shutil.copy(sys.executable, napper)  # a real binary placed in the target that makes itself non-dumpable
+    env = {**os.environ, "PYTHONHOME": sys.base_prefix, "PYTHONPATH": ""}
+    proc = subprocess.Popen([str(napper), "-S", "-c", _NON_DUMPABLE], env=env, start_new_session=True)
+    try:
+        _wait_for(lambda: _refuses_fd_listing(os.getpid()) or _refuses_fd(proc.pid), "napper to refuse fd/")
+        _age(target, 48)
+        result = sweep(root)
+        assert result["removed"] == [] and target.exists(), result
+        assert result["blocked"] and f"uses {napper}" in result["blocked"][0]["reason"], result
+    finally:
+        _stop(proc)
+    _age(target, 48)
+    assert sweep(root)["removed"] == [str(target)]
+
+
+def _refuses_fd(pid: int) -> bool:
+    try:
+        os.listdir(f"/proc/{pid}/fd")
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def test_a_clean_that_finds_no_ownership_record_keeps_the_target_and_says_why(root):
+    """The marker and the owner record vanish after ``_cargo_clean`` decided the target is managed, while it
+    waits for the manager lock (a ``cargo clean`` killed meanwhile, then the record lost): the identity to put
+    back is unknown, so nothing is cleaned and no ``null`` marker is written."""
+    target, _workspace = managed_target(root, "noowner")
+    lock = _wait_blocked_on(target.parent / ".target-manager.lock")
+    code = ("import sys; from pathlib import Path; from herdr_engineering import build_cleanup as c; "
+            "print('ready', flush=True); print(c._cargo_clean(Path(sys.argv[1])))")
+    child = subprocess.Popen([sys.executable, "-c", code, str(target)], stdout=subprocess.PIPE, text=True,
+                             env={**os.environ, "PYTHONPATH": str(Path(cleanup.__file__).parent.parent)})
+    try:
+        assert child.stdout.readline().strip() == "ready"
+        time.sleep(2)  # the child is past its workspace lookup and waits for the lock we hold
+        (target / TARGET_MARKER).unlink()
+        cleanup.owner_record(target.parent, target.name).unlink()
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    out, _ = child.communicate(timeout=120)
+    assert "ownership" in out, out
+    assert not (target / TARGET_MARKER).exists() and (target / "debug").exists()
