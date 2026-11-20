@@ -54,5 +54,5 @@ else
   echo "integrate-main: merging ${target} into this pull request failed without a file conflict:" >&2
   printf '%s\n' "$out" | sed 's/^/integrate-main: /' >&2
 fi
-echo "integrate-main: rebase or merge main into your branch, resolve the conflicts and push." >&2
+echo "integrate-main: rebase or merge ${target} into your branch, resolve the conflicts and push." >&2
 exit 1

@@ -29,9 +29,13 @@ Branch protection `strict` ("branch must be up to date") is removed. It forced a
 
 Merges are made with `gh pr merge --auto --squash`: GitHub merges when the required checks are green, without an up-to-date branch.
 
-### A "superseded by newer push" failure on main
+### A "superseded by newer push" run on main
 
-Pushes to main queue (limit 1). When a queued run starts, `scripts/ci-pipeline-freshness.sh` compares its commit with `git ls-remote origin refs/heads/main`. If main has moved, the run exits 1 with `superseded by newer push` before any install work, because the newer push has its own pipeline. This red does not mean main is broken. The review gate's main verification (`main_pipeline: push`, `herdr_engineering/review_gate/main_verify.py`) judges only the newest main head, so a superseded run for an older head is ignored and never pages; only a red run on the current head does.
+Pushes to main queue (limit 1). When a queued run starts, `scripts/ci-pipeline-freshness.sh` compares its commit with `git ls-remote origin refs/heads/main`. If main has moved, the run prints `superseded by newer push`, writes `.ci-main-superseded` and exits 0, so the pipeline ends green and no false critical "CI failed - herdr-engineering main" appears while the newer head's run (~45 min) is in progress. The `unit-gates` step sees the marker, skips, and never runs `--record-green`: a green superseded run does not mean its commit was tested, and the 4-hourly cron still proves it if needed. Only the newest head's run carries a verdict. A superseded pull-request run is unchanged and still fails (exit 1) so the newer PR pipeline is the one that counts.
+
+### Pull requests opened before this landed
+
+Woodpecker reads the pipeline YAML from the PR head, so an open PR forked before the `integrate-main` step existed has no such step and tests only itself. Rebase or merge main into every such PR before branch protection `strict` is turned off.
 
 ### CHANGELOG merges
 

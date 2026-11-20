@@ -90,6 +90,11 @@ def applicability(repo: Path, sha: str, event: str = "pull_request", base: str =
     "deploy/control-plane/deploy.sh",        # the deploy scripts the suite exercises
     "pyproject.toml",                        # dependency and pytest config
     ".woodpecker/unit-gates.yml",            # the routing config
+    ".woodpecker/unit-gates-main.yml",
+    ".woodpecker/structural-gates.yml",
+    ".woodpecker/artifact-handoff.yml",
+    "scripts/ci-pipeline-freshness.sh",      # not under scripts/ci/
+    "scripts/ci/integrate-main.sh",
 ])
 def test_a_change_that_can_affect_the_suite_runs_it(repo, path):
     result = applicability(repo, change(repo, path))

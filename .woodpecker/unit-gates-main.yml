@@ -8,8 +8,9 @@
 #   - no integrate-main and no applicability step: main is tested exactly as pushed and is never "not applicable";
 #   - concurrency group `unit-gates-main` with limit 1: pushes queue instead of running side by side;
 #   - the freshness step (scripts/ci-pipeline-freshness.sh) compares CI_COMMIT_SHA with `git ls-remote origin refs/heads/main`. A
-#     run whose commit is no longer main's head exits 1 with "superseded by newer push" before any install work; the newer push's
-#     pipeline carries the verdict. A red "superseded" pipeline therefore never means main is broken (see docs/ci-and-reviews.md).
+#     run whose commit is no longer main's head prints "superseded by newer push", writes .ci-main-superseded and exits 0 (a red
+#     pipeline would raise a false "CI failed - main"); the unit-gates step then skips and never records green. The newer push's
+#     pipeline carries the verdict (see docs/ci-and-reviews.md).
 # A green run records its commit for the 4-hourly cron (main-cron.yml) so the cron does not prove the same commit twice.
 #
 # This context is deliberately NOT a required check; making it one is a separate admin step.
@@ -39,7 +40,7 @@ steps:
       - 'git checkout -q FETCH_HEAD'
       - 'git --no-pager log --oneline -1'
 
-  # A superseded push stops here (exit 1) before any install work.
+  # A superseded push is marked here (exit 0); unit-gates then skips.
   - name: freshness
     image: bash
     commands:
@@ -50,5 +51,6 @@ steps:
     image: bash
     commands:
       - 'set -eu'
+      - 'if [ -f .ci-main-superseded ]; then echo "unit-gates: superseded by a newer push to main; nothing to run, nothing recorded"; exit 0; fi'
       - 'bash scripts/ci/unit-gates.sh'
       - 'bash scripts/ci/main-cron-gates.sh --record-green'

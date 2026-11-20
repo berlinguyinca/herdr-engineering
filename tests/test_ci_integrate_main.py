@@ -157,6 +157,19 @@ def test_conflict_aborts_names_files_and_exits_1(origin):
     assert git(ws, "status", "--porcelain") == ""
 
 
+def test_conflict_message_names_the_actual_target_branch(origin):
+    seed = origin["seed"]
+    git(seed, "checkout", "-q", "-b", "release", "main")
+    commit(seed, "a.txt", "release side\n", "release moves")
+    git(seed, "push", "-q", "origin", "release")
+    head = pr_branch(origin, "a.txt", "pr side\n")
+    ws = workspace(origin, head)
+    r = run(INTEGRATE, ws, **pr_env(head, CI_COMMIT_TARGET_BRANCH="release"))
+    out = r.stdout + r.stderr
+    assert r.returncode == 1
+    assert "rebase or merge release into your branch" in out and "merge main" not in out
+
+
 def test_shallow_checkout_is_deepened_so_the_merge_can_find_a_base(origin):
     pr_branch(origin, "b.txt", "b\n")
     git(origin["seed"], "checkout", "-q", "feat")
@@ -259,13 +272,55 @@ def test_main_push_pipeline_runs_the_full_suite():
 
 # ------------------------------------------------------------------ superseded main push --------------------------------------------
 
-def test_superseded_main_push_pipeline_exits_1(origin):
+SUPERSEDED_MARKER = ".ci-main-superseded"
+
+
+def test_superseded_main_push_pipeline_exits_0_with_a_marker(origin):
+    """Exit 0, not 1: a red superseded run on main would page 'CI failed - main' until the newer head's run finishes."""
     old = git(origin["seed"], "rev-parse", "main")
     new = main_moves(origin, "c.txt", "c\n")
     ws = workspace(origin, old)
     r = run(FRESHNESS, ws, CI_PIPELINE_EVENT="push", CI_COMMIT_SHA=old, CI_COMMIT_BRANCH="main")
-    assert r.returncode == 1
+    assert r.returncode == 0, r.stdout + r.stderr
     assert "superseded by newer push" in r.stdout and new in r.stdout
+    assert (ws / SUPERSEDED_MARKER).exists()
+
+
+def test_current_main_push_leaves_no_marker_and_clears_a_stale_one(origin):
+    head = git(origin["seed"], "rev-parse", "main")
+    ws = workspace(origin, head)
+    (ws / SUPERSEDED_MARKER).write_text("stale")
+    assert run(FRESHNESS, ws, CI_PIPELINE_EVENT="push", CI_COMMIT_SHA=head, CI_COMMIT_BRANCH="main").returncode == 0
+    assert not (ws / SUPERSEDED_MARKER).exists()
+
+
+def test_superseded_pull_request_still_exits_1_without_a_marker(origin):
+    old = git(origin["seed"], "rev-parse", "main")
+    ws = workspace(origin, old)
+    git(origin["seed"], "checkout", "-q", "-b", "feat2", "main")
+    new = commit(origin["seed"], "z.txt", "z\n", "newer")
+    git(origin["seed"], "push", "-q", "origin", "feat2")
+    r = run(FRESHNESS, ws, CI_PIPELINE_EVENT="pull_request", CI_COMMIT_SHA=old, CI_COMMIT_SOURCE_BRANCH="feat2", CI_COMMIT_BRANCH="main")
+    assert r.returncode == 1 and new in r.stdout
+    assert not (ws / SUPERSEDED_MARKER).exists()
+
+
+def test_unit_gates_main_skips_and_never_records_green_on_the_marker(tmp_path):
+    steps_by_name = {s["name"]: s for s in steps("unit-gates-main.yml")}
+    for marked, expect_run in ((True, False), (False, True)):
+        root = tmp_path / f"ws{marked}"
+        (root / "scripts" / "ci").mkdir(parents=True)
+        log = tmp_path / f"log{marked}"
+        for name in ("unit-gates.sh", "main-cron-gates.sh"):
+            (root / "scripts" / "ci" / name).write_text(f'#!/bin/bash\necho "{name} $*" >> "{log}"\n')
+        if marked:
+            (root / SUPERSEDED_MARKER).write_text("x")
+        script = "\n".join(steps_by_name["unit-gates"]["commands"])
+        r = subprocess.run(["bash", "-c", script], cwd=root, capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        ran = log.read_text() if log.exists() else ""
+        assert ("unit-gates.sh" in ran) is expect_run
+        assert ("--record-green" in ran) is expect_run, "a superseded run must never record green"
 
 
 def test_current_main_push_pipeline_runs(origin):
