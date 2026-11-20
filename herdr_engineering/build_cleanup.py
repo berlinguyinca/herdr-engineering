@@ -299,8 +299,13 @@ def _ps_claims() -> list[Hold]:
     return claims
 
 
-def _scan(proc: Path = Path("/proc")) -> list[Hold]:
-    """Everything this user's other processes hold or are building into, from one look at the host."""
+def _scan(proc: Path = Path("/proc"), *, paths_only: bool = False) -> list[Hold]:
+    """Everything this user's other processes hold or are building into, from one look at the host.
+
+    ``paths_only`` (the cleanup command's view) reads only the link targets: no ``stat`` of a link or its
+    ancestors and no ``maps``, which can block on a hung network mount, and a hidden (non-dumpable) process
+    that descends from Herdr raises, so the caller refuses as ``in_use``. The sweep keeps identities and
+    never aborts on a hidden process."""
     if not proc.is_dir():
         return _lsof_holds() + _ps_claims()
     holds: list[Hold] = []
@@ -322,10 +327,12 @@ def _scan(proc: Path = Path("/proc")) -> list[Hold]:
                 try:
                     for link in _links(holder):
                         try:
-                            values.append((os.readlink(link), _link_ids(link, link.name == "cwd")))
+                            values.append((os.readlink(link),
+                                           _NO_IDS if paths_only else _link_ids(link, link.name == "cwd")))
                         except (FileNotFoundError, ProcessLookupError):  # descriptor closed / process exited
                             continue
-                    values.extend(_mapped(holder))
+                    if not paths_only:
+                        values.extend(_mapped(holder))
                 except (FileNotFoundError, ProcessLookupError):
                     continue
                 except PermissionError as exc:
@@ -334,7 +341,7 @@ def _scan(proc: Path = Path("/proc")) -> list[Hold]:
                     raise
             holds.extend((number, name, "uses", Path(v.removesuffix(" (deleted)")), ids)
                          for v, ids in values if v.startswith("/"))
-            if _cargo_family(name):
+            if _cargo_family(name) and not paths_only:
                 holds.extend(_proc_claims(pid, number, name))
         except (FileNotFoundError, ProcessLookupError):  # process exited during inspection
             continue
@@ -357,6 +364,8 @@ def _scan(proc: Path = Path("/proc")) -> list[Hold]:
             if foreign:
                 continue  # another user's process: nothing of it can be read
             if hidden:  # cwd, exe and fds are closed to us, the command line is not
+                if paths_only and _managed_process(pid, proc):
+                    raise
                 holds.extend(_cmdline_holds(pid, int(pid.name)))
                 continue
             if _managed_process(pid, proc):
@@ -369,7 +378,7 @@ def _scan(proc: Path = Path("/proc")) -> list[Hold]:
 def _process_paths(proc: Path = Path("/proc")) -> list[Path]:
     """Every path another process holds (cwd, executable, open file, mapping), for ``cleanup_command``'s
     /proc fallback. The same scan as the sweep, so both see one set of processes."""
-    return [hold[3] for hold in _scan(proc)]
+    return [hold[3] for hold in _scan(proc, paths_only=True)]
 
 
 def _cmdline_paths(argv: list[str]) -> set[str]:

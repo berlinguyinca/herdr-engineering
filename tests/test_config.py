@@ -333,3 +333,19 @@ def test_trusted_handoff_autopilot_is_honoured_despite_repo(tmp_path, monkeypatc
     assert block["context_window_tokens"] == 123456
     assert block["enabled"] == DEFAULTS["handoff_autopilot"]["enabled"]
     assert declared_keys("handoff_autopilot") == {"context_percent", "context_window_tokens"}
+
+
+def test_declared_keys_applies_the_repo_local_allowlist_per_key(tmp_path, monkeypatch):
+    from herdr_engineering.config import declared_keys
+
+    repo = tmp_path / "repo"
+    _write(repo / "herdr-engineering.yaml", """
+        version: 1
+        web:
+          host: 0.0.0.0
+          port: 9123
+    """)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("HERDR_ENGINEERING_CONFIG", raising=False)
+    assert declared_keys("web") == {"port"}

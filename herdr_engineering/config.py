@@ -448,13 +448,14 @@ def declared_keys(section: str) -> set[str]:
             continue
         if not trusted and section not in REPO_LOCAL_ALLOWED:
             continue
+        allowed = None if trusted else REPO_LOCAL_ALLOWED[section]
         try:
             raw = _read_simple_yaml(path)
         except (OSError, ValueError):
             continue
         block = raw.get(section) if isinstance(raw, dict) else None
         if isinstance(block, dict):
-            keys.update(key for key in block if isinstance(key, str))
+            keys.update(key for key in block if isinstance(key, str) and (allowed is None or key in allowed))
     return keys
 
 

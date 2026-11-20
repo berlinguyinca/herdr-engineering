@@ -28,7 +28,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Security: repo-local config can no longer set `handoff_autopilot`
 
-- `load_config` and `declared_keys` now ignore `handoff_autopilot` in the repo-local `./config/herdr-engineering.yaml` and `./herdr-engineering.yaml` (the repository being built is untrusted), exactly as `fabric_build_cache` already was, via one shared `_REPO_LOCAL_STRIPPED_KEYS` list. Set it in `~/.config/herdr-engineering/config.yaml` or `$HERDR_ENGINEERING_CONFIG`.
+- `load_config` and `declared_keys` now ignore `handoff_autopilot` in the repo-local `./config/herdr-engineering.yaml` and `./herdr-engineering.yaml` (the repository being built is untrusted), exactly as `fabric_build_cache` already was, because neither is in the `REPO_LOCAL_ALLOWED` allowlist (a repository's own config may only set the keys listed there). Set it in `~/.config/herdr-engineering/config.yaml` or `$HERDR_ENGINEERING_CONFIG`.
 
 ### Fix: automatic handoff reads the context window from the session's model
 
