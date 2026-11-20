@@ -80,8 +80,8 @@ INTERNALERROR KeyError, pytest exit 3 (pipeline 1710, load 155 on 4 CPUs). `unit
   (once it is a separate step) gets none. **Follow-up**: publish `pytest-retried.jsonl` as a pipeline artifact (a `.woodpecker/`
   change, outside this file set).
 - **Chronic flakes.** A test that needed a retry in `HERDR_PYTEST_CHRONIC_RUNS` (3) distinct runs within `HERDR_PYTEST_CHRONIC_DAYS`
-  (14) days prints `CHRONIC FLAKE` and **fails the gate** until it is fixed or quarantined with an issue (a retry must not hide a flake
-  forever). The counter is `pytest-retried-history.jsonl` in `HERDR_CI_STATE` (default `/home/wohlgemuth/woodpecker/ci/state/herdr`, the
+  (14) days prints a loud `CHRONIC FLAKE` warning and carries `chronic_runs` in its `RETRIED-JSONL` row (a retry must not hide a flake
+  forever); it fails the gate only with `HERDR_PYTEST_CHRONIC_FAIL=1`, so it cannot fail an unrelated PR by default. The counter is `pytest-retried-history.jsonl` in `HERDR_CI_STATE` (default `/home/wohlgemuth/woodpecker/ci/state/herdr`, the
   `main-cron-gates.sh` state dir; override the file with `HERDR_PYTEST_RETRY_HISTORY`). If that directory cannot be written the counter is
   off for the run, with a `RETRY HISTORY:` note in the log, and the gate is not failed for it.
 

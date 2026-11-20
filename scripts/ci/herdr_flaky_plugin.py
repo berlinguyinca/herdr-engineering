@@ -22,7 +22,8 @@ Retry support
   those whole FILES, so same-module pollution still reproduces) and ``... settle FIRST SECOND OUT [HISTORY]`` compares the first pass with
   the retry: a test counts as RETRIED only when the retry recorded a real PASS for it (a skip or a test that did not run does not), tests
   failing again are real failures, and a test RETRIED in HERDR_PYTEST_CHRONIC_RUNS (3) distinct runs inside HERDR_PYTEST_CHRONIC_DAYS (14)
-  days (HISTORY, a JSON-lines file under the CI state dir) is a CHRONIC flake: it fails the gate until fixed or quarantined with an issue.
+  days (HISTORY, a JSON-lines file under the CI state dir) is a CHRONIC flake: a loud warning (and ``chronic_runs`` in its JSONL row), failing
+  the gate only with HERDR_PYTEST_CHRONIC_FAIL=1.
   scripts/ci/pytest-rerun.sh drives all of it.
 """
 
@@ -286,7 +287,11 @@ def settle(first: str, second: str, out: str, history: str = "") -> int:
     now = dt.datetime.now(dt.UTC)
     stamp = now.isoformat(timespec="seconds")
     context = {k: os.environ[v] for k, v in (("pipeline", "CI_PIPELINE_NUMBER"), ("commit", "CI_COMMIT_SHA")) if os.environ.get(v)}
-    lines = [json.dumps({"nodeid": d["nodeid"], "first_failure": d.get("summary", ""), "at": stamp, **context}) for d in retried]
+    run = context.get("pipeline") or context.get("commit") or stamp
+    chronic_ids, note = chronic(history, [d["nodeid"] for d in retried], now, run)
+    runs_by_id = dict(chronic_ids)
+    lines = [json.dumps({"nodeid": d["nodeid"], "first_failure": d.get("summary", ""), "at": stamp, **context,
+                         **({"chronic_runs": runs_by_id[d["nodeid"]]} if d["nodeid"] in runs_by_id else {})}) for d in retried]
     Path(out).write_text("".join(line + "\n" for line in lines), encoding="utf-8")
     for d in retried:
         print(f"RETRIED: {d['nodeid']} failed in the first pass and PASSED on retry (flaky, tracked in {out}); first failure: {d.get('summary', '')}")
@@ -298,16 +303,16 @@ def settle(first: str, second: str, out: str, history: str = "") -> int:
         print(f"NOT PASSED ON RETRY: {d['nodeid']} did not record a pass on retry (skipped, deselected or never ran); first failure: {d.get('summary', '')}")
     for d in new_failures:
         print(f"FAILED ON RETRY: {d['nodeid']} passed in the fast pass but failed when its file reran; first-pass failures in that file may be pollution")
-    run = context.get("pipeline") or context.get("commit") or stamp
-    chronic_ids, note = chronic(history, [d["nodeid"] for d in retried], now, run)
     if note:
         print(f"RETRY HISTORY: {note}")
+    chronic_fails = os.environ.get("HERDR_PYTEST_CHRONIC_FAIL") == "1"
     for nodeid, runs in chronic_ids:
         print(f"CHRONIC FLAKE: {nodeid} needed a retry in {runs} runs within {_env_int('HERDR_PYTEST_CHRONIC_DAYS', 14)} days; "
-              "fix it or quarantine it with an issue (@pytest.mark.quarantine_flaky); the gate fails until then")
+              "fix it or quarantine it with an issue (@pytest.mark.quarantine_flaky)"
+              + ("; the gate fails until then" if chronic_fails else " (warning only; HERDR_PYTEST_CHRONIC_FAIL=1 makes it fail the gate)"))
     print(f"== retry verdict: {len(retried)} passed on retry (RETRIED), {len(real)} failed again, {len(unresolved)} not passed, "
           f"{len(new_failures)} new failures, {len(chronic_ids)} chronic ==")
-    return 1 if real or unresolved or new_failures or chronic_ids else 0
+    return 1 if real or unresolved or new_failures or (chronic_ids and chronic_fails) else 0
 
 
 def main(argv: list[str]) -> int:

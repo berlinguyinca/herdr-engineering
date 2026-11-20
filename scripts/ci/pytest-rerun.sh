@@ -14,8 +14,8 @@
 # failure: <summary>", repeated as "RETRIED-JSONL {...}" lines and written to HERDR_PYTEST_RETRIED_FILE (default pytest-retried.jsonl;
 # JSON lines, rewritten each run, empty when nothing was retried). Everything else fails the gate: a test failing again, a retried test
 # that was skipped or did not run (only a recorded PASS counts), a test that fails on the retry that passed in the fast pass. A test needing
-# a retry in HERDR_PYTEST_CHRONIC_RUNS (3) distinct runs within HERDR_PYTEST_CHRONIC_DAYS (14) days is a CHRONIC flake and fails the gate
-# (fix it, or quarantine it with an issue); the counter lives in HERDR_PYTEST_RETRY_HISTORY, default pytest-retried-history.jsonl in
+# a retry in HERDR_PYTEST_CHRONIC_RUNS (3) distinct runs within HERDR_PYTEST_CHRONIC_DAYS (14) days is a CHRONIC flake: a loud CHRONIC FLAKE warning and a
+# chronic_runs field in its JSONL row; it fails the gate only with HERDR_PYTEST_CHRONIC_FAIL=1 (fix it, or quarantine it with an issue); the counter lives in HERDR_PYTEST_RETRY_HISTORY, default pytest-retried-history.jsonl in
 # HERDR_CI_STATE (the main-cron-gates.sh state dir), and is simply off, with a note in the log, when that dir cannot be written.
 # HERDR_PYTEST_RETRY=0 disables the retry; more than HERDR_PYTEST_RETRY_MAX (default 25) failures are a broken change, not flakes, and
 # are not retried. Not retried either: a pass whose failure is session-level (a coverage floor, an INTERNALERROR): rerunning some files

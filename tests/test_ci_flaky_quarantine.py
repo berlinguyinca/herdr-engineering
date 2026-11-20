@@ -170,16 +170,27 @@ def test_the_archive_is_in_the_log_as_jsonl_lines(tmp_path: Path) -> None:
     assert len(lines) == 1 and json.loads(lines[0].split(" ", 1)[1]) == rows[0]
 
 
-def test_the_same_test_retried_in_three_runs_is_a_chronic_flake_that_fails_the_gate(tmp_path: Path) -> None:
-    proj = make_project(tmp_path, {"test_flaky.py": FLAKY_ONCE})
+def _three_runs(proj: Path, **env: str) -> list[tuple[int, bool]]:
     outcomes = []
     for pipeline in ("101", "102", "103"):
         (proj / "failed-once").unlink(missing_ok=True)
-        done, _ = run_fast(proj, workers="", CI_PIPELINE_NUMBER=pipeline)
+        done, rows = run_fast(proj, workers="", CI_PIPELINE_NUMBER=pipeline, **env)
         outcomes.append((done.returncode, "CHRONIC FLAKE: test_flaky.py::test_flaky" in done.stdout))
-    assert outcomes == [(0, False), (0, False), (1, True)], outcomes
+        if pipeline == "103":
+            assert ("chronic_runs" in rows[0]) is outcomes[-1][1] and (rows[0].get("chronic_runs", 3) == 3)
+    return outcomes
+
+
+def test_the_same_test_retried_in_three_runs_is_a_chronic_flake_warning_that_does_not_fail_the_gate(tmp_path: Path) -> None:
+    proj = make_project(tmp_path, {"test_flaky.py": FLAKY_ONCE})
+    assert _three_runs(proj) == [(0, False), (0, False), (0, True)]
     history = [json.loads(x) for x in (proj / "ci-state" / "pytest-retried-history.jsonl").read_text().splitlines()]
     assert [h["run"] for h in history] == ["101", "102", "103"]
+
+
+def test_the_chronic_flake_fails_the_gate_only_when_asked(tmp_path: Path) -> None:
+    proj = make_project(tmp_path, {"test_flaky.py": FLAKY_ONCE})
+    assert _three_runs(proj, HERDR_PYTEST_CHRONIC_FAIL="1") == [(0, False), (0, False), (1, True)]
 
 
 def test_a_rerun_of_the_same_pipeline_counts_once_and_old_history_ages_out(tmp_path: Path) -> None:
