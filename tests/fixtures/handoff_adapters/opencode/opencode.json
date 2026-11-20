@@ -1,0 +1,1 @@
+{"provider": {"ollama": {"models": {"gemma4:26b": {"limit": {"context": 131072, "output": 32768}}}}}}

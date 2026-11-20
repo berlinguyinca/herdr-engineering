@@ -5,6 +5,51 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Chore: pin herdr-handoff 0.5.0
+
+- `lock/upstreams.yaml` pins herdr-handoff to `aed3e8274e6948a774682a55d99b7cd9ef113914` (herdr-handoff#12, v0.5.0: shared handoff store, one takeover per handoff id, `takeover --direction`, `--relaunch`). `check_handoff_dependency` now also requires that `herdr-handoff takeover --help` lists `--direction` (reported as `takeover --direction`, naming 0.5.0), so `herdr-eng doctor` reports an installed 0.4.0 as too old until `scripts/install-handoff.sh` is run.
+
+### Security: repo-local config can no longer set `handoff_autopilot`
+
+- `load_config` and `declared_keys` now ignore `handoff_autopilot` in the repo-local `./config/herdr-engineering.yaml` and `./herdr-engineering.yaml` (the repository being built is untrusted), exactly as `fabric_build_cache` already was, via one shared `_REPO_LOCAL_STRIPPED_KEYS` list. Set it in `~/.config/herdr-engineering/config.yaml` or `$HERDR_ENGINEERING_CONFIG`.
+
+### Fix: automatic handoff reads the context window from the session's model
+
+- `handoff autopilot` no longer hard-codes a 200k window for Claude Code. The transcript names the model, and `handoff_autopilot.model_context_windows` (YAML; a model-name substring to its window, longest match wins, merged with the built-in `[1m]` -> 1,000,000) gives its window; the Stop hook, `check --transcript` and `record --transcript` all apply it and report `window.source: "model"`. The harness's own stated window still wins, then the model, then a declared `context_window_tokens`, and only then the 200k assumption (with escalation past it). New `transcript_model()` reads `message.model`.
+
+### Fix: unit-gates reruns the parallel pass once if xdist workers die
+
+- `scripts/ci/pytest-rerun.sh`: exit 3 or a worker-crash signature reruns the parallel pass once on 2 workers (never for test failures or hangs); `auto` workers also shrink on a loaded host.
+
+### Fix: `fleet status` and `doctor` no longer depend on the working directory
+
+- `fleet.repo_root()` no longer falls back to the cwd. It uses `HERDR_ENGINEERING_REPO`, else walks up for `ansible/inventory/hosts.yml` (or a checkout's `ansible/playbooks/fleet-status.yml`), else raises `FleetError` naming the paths searched. `fleet status` reports a missing inventory as `no inventory at <path>` on stderr and exits 2 (setup problem), distinct from exit 1 (ansible ran and hosts failed); `--json` carries `error` and `error_kind`. `fleet join`/`update` and `stage_pi_runtime` return that error in their report instead of running ansible against a nonexistent path.
+- `doctor`: the `lock` and `plugins` checks locate `lock/upstreams.yaml` from `HERDR_ENGINEERING_LOCK`, then `HERDR_ENGINEERING_REPO`, then the checkout the package was imported from, never the cwd. With no checkout (an installed copy) both report `unknown` ("not applicable: no checkout found") instead of a warning.
+- `doctor`: the `tailscale` check reads `tailscale status --json` and treats `BackendState == "Running"` as up (exit code when the output is not that JSON); the plain-text check looked for the word "tailscale", which that output never contains, so it always warned. The decision is the pure function `tailscale_running`.
+- `fleet rollout plan` and `fleet recover plan`/`run` outside a checkout print that error as JSON and exit 1 instead of a traceback.
+- `scripts/herdr-gateway-monitor.timer` triggers on `OnCalendar=*:0/5` instead of `OnBootSec=`/`OnUnitActiveSec=`. With `Persistent=true` the old unit stopped firing after a reboot whenever the user manager started later than the boot delay. Installed copies need the unit re-copied and `systemctl --user daemon-reload`.
+
+### Fix: CI report relay failures are no longer silent
+
+- `ci_report_relay` printed only `N published, M failed`. It now writes one stderr line per failing bundle (`CI report relay: failed <bundle>: <reason>`), per unreadable source file (errno name), and for whole-run failures, plus the reader exit status on source errors. Reasons are fixed strings or errno names: no URLs, keys or bundle contents. Delivery and fail-closed identity checks are unchanged.
+
+### Workflow hooks: hand off automatically on long context
+- The `PreCompact` message and the `SessionStart` reminder now tell the agent to run `/handoff` itself, without asking the user, after background subagents have reported and work is committed/pushed where allowed (previously a suggestion). The reminder also says not to ask the user about choices the defaults already settle. The hooks still only print text.
+
+### Fix: workflow guard denies guarded pushes, with a one-shot human override
+- `ask` is not prompted in Claude Code auto permission mode, so the herdr-engineering push rule (and the unknown-cwd push rule) did nothing. `herdr_engineering/workflow_guard.py` now returns `deny` for both; the reason tells the agent to ask the user to run `! touch ~/.local/state/herdr-engineering/allow-push` and retry. If that token file exists, the next guarded push is allowed and the file is deleted (one-shot; `HERDR_WORKFLOW_ALLOW_PUSH` overrides the path). Main/master push denial is unchanged and never consumes the token; the guard still fails open on internal error.
+- `Write`/`Edit`/`MultiEdit`/`NotebookEdit` on the token path, and `Bash` commands mentioning it, are denied so the agent cannot approve itself. A speed bump, not a security boundary (substring check). See `docs/operations/workflow-hooks.md`.
+
+### Fix: ui-gates reports on every pull request
+
+- `.woodpecker/ui-gates.yml` drops its `path:` filter for an `applicability` step (`scripts/ci/unit-gates-applicable.sh ui`), so the `ui-gates` context can be required without blocking PRs that touch no UI path. The decision reads `CI_PIPELINE_EVENT` (what Woodpecker exports) with `CI_EVENT` as fallback, and the `ui` case also covers `pyproject.toml`, `scripts/ci/journal.sh` and `scripts/ci/cache-trust.sh`, which `ui-gates.sh` depends on.
+
+### Fix: run-watched review nits from #824
+
+- `scripts/ci/run-watched.py`: `Out.write` also survives a full non-blocking stdout (EAGAIN), a closed fd and a `None` stdout (it stops forwarding and keeps draining); the process group is only signalled once the root is reaped if a live process still holds that group (a reaped pid can be reused); `has_token` no longer caches negatives (a fork child reads as its parent until it execs); CPU history is keyed by (pid, start time) so a reused pid cannot corrupt deltas; signal handlers are installed before the command is spawned; bad SOFT/HARD, a missing `--` or command print a usage error and exit 2, and an unstartable command exits 127/126 with a message instead of a traceback; a hang now stops the tree with SIGTERM, a short grace, then SIGKILL (exit still 124).
+- Output forwarding waits for a slow reader instead of dropping the rest of the log (stdout is made blocking at startup, EAGAIN retries once writable); only EPIPE/EBADF/closed stdout stop forwarding, with one stderr notice (a reader that stops reading without closing still blocks the writer; that predates this change). The pipe is drained during the kill grace (bounded), so SIGTERM-handler cleanup output is kept. `HERDR_WATCHED_ORPHAN_GRACE` is validated before the spawn.
+- Tests: a `pidfiles` fixture kills leaked daemons and removes pidfiles on teardown.
+
 ### Memory client pin: 0.1.8 → 0.1.10
 
 - `PINNED_REVISION`/`PINNED_CLIENT_VERSION` and `lock/upstreams.yaml` move to `eb1338a4067d4e17910a9f651fc7c08551f5b8a9` (client `0.1.10`, contract v1 unchanged). Three commits ahead of the previous pin: `f3a20ba` makes recall/documents degrade to empty on a never-written bank and adds `provision` plus per-bank `bank:<id>` doctor checks (herdr-memory#18, closes #17); `66eb463` bumps to 0.1.9 and adds the repo's first CI plus the version-parity test that guards the two-builds-one-version-string incident (herdr-memory#19); `eb1338a` gives every queued operation a terminal attempt record and surfaces vanished rows as `status.lost` / doctor `lost` (herdr-memory#20, closes #4). Every host in the fleet was already running 0.1.10, so `memory doctor` reported `package_revision` and `client_version` drift on each one; this reconciles the pin with what is deployed rather than pulling anything new in, the same shape as the 0.1.7 → 0.1.8 bump. Verified against the upstream tree at that revision (`pyproject.toml` → `version = "0.1.10"`, `herdr_memory/__init__.py` → `__version__ = '0.1.10'`), not from a tag or a version string in a log. `tests/test_memory_install.py::test_pin_matches_lock` fails on a partial bump. Because the pin is part of the managed-block marker, hosts need `herdr-eng memory upgrade` after this ships.

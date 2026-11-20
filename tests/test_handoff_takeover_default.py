@@ -41,6 +41,8 @@ def test_the_lock_pin_names_the_revision_that_hands_off_by_default():
     assert re.fullmatch(r"[0-9a-f]{40}", entry["revision"]), "the pin must be a full commit sha"
     note = entry["note"]
     assert "v0.4.0" in note and "herdr-handoff#7" in note, note
+    assert "v0.5.0" in note and "herdr-handoff#12" in note, note
+    assert entry["revision"] == "aed3e8274e6948a774682a55d99b7cd9ef113914", "the 0.5.0 squash merge"
     # The guard is part of what the pin buys: a host told only "takeover exists" cannot know a pane may
     # now refuse to close because of the work it holds.
     assert "source_dirty" in note and "--keep-source" in note, note

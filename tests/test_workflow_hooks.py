@@ -103,9 +103,16 @@ def test_session_start_reminder_is_short_and_covers_defaults():
     assert run_hook("SessionStart")["hookSpecificOutput"]["hookEventName"] == "SessionStart"
 
 
-def test_precompact_only_prompts_for_handoff():
+def test_session_start_says_not_to_ask_about_settled_choices():
+    ctx = run_hook("SessionStart")["hookSpecificOutput"]["additionalContext"].lower()
+    assert "do not ask the user about choices these defaults already settle" in ctx
+    assert "run /handoff yourself, without asking" in ctx
+
+
+def test_precompact_instructs_agent_to_handoff_without_asking():
     msg = run_hook("PreCompact")["systemMessage"]
-    assert "/handoff" in msg and "herdr-handoff create" not in msg
+    assert "Run /handoff yourself" in msg and "without asking" in msg
+    assert "background subagents" in msg and "herdr-handoff create" not in msg
 
 
 def test_hook_never_fails_on_bad_input():
@@ -158,3 +165,39 @@ def test_generated_command_with_missing_executable_is_silent_noop(home):
     cmds = _hook_commands(home, ["/nonexistent/python", "-m", "herdr_engineering.cli"])
     done = subprocess.run(["sh", "-c", cmds["SessionStart"]], input="{}", capture_output=True, text=True, timeout=60)
     assert done.returncode == 0 and done.stdout == ""
+
+
+def test_install_adds_cleanup_allow_rule_and_reminder_mentions_command(home):
+    settings(home).write_text(json.dumps({"permissions": {"allow": ["Bash(ls:*)"]}}))
+    inst(home).install()
+    assert json.loads(settings(home).read_text())["permissions"]["allow"] == [
+        "Bash(ls:*)", "Bash(herdr-eng cleanup:*)"]
+    assert inst(home).install().action == "noop"
+    ctx = run_hook("SessionStart")["hookSpecificOutput"]["additionalContext"]
+    assert "herdr-eng cleanup" in ctx and "--print-run-args" in ctx
+    inst(home).uninstall()
+    assert json.loads(settings(home).read_text()) == {"permissions": {"allow": ["Bash(ls:*)"]}}
+
+
+def test_installed_rule_is_exactly_the_cleanup_command(home):
+    inst(home).install()
+    assert json.loads(settings(home).read_text())["permissions"]["allow"] == ["Bash(herdr-eng cleanup:*)"]
+
+
+def test_removed_allow_rule_is_not_drift_and_never_re_added(home):
+    inst(home).install()
+    data = json.loads(settings(home).read_text())
+    del data["permissions"]
+    settings(home).write_text(json.dumps(data, indent=2))
+    before = settings(home).read_bytes()
+    assert inst(home).status().state == "current"
+    assert inst(home).install().action == "noop"
+    assert inst(home).repair().action == "noop"
+    assert settings(home).read_bytes() == before
+    # a genuine hook drift is repaired, still without resurrecting the permission
+    data["hooks"]["SessionStart"][0]["hooks"][0]["command"] = "tampered # " + wh.MARKER
+    settings(home).write_text(json.dumps(data, indent=2))
+    assert inst(home).status().state == "stale"
+    inst(home).repair()
+    assert inst(home).status().state == "current"
+    assert "permissions" not in json.loads(settings(home).read_text())

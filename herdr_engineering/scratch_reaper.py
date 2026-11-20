@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import functools
 import json
+import logging
 import math
 import os
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -170,6 +174,115 @@ class Report:
                 value[key] = value[key][: len(value[key]) // 2]
             value["details_truncated"] = True
         return cast(dict[str, object], value)
+
+
+@functools.lru_cache(maxsize=1)
+def system_temp_roots() -> tuple[Path, ...]:
+    """The fixed system temp directories: ``/tmp``, ``/private/tmp`` and, on macOS, the per-user
+    ``/var/folders/...`` dir. Never ``$TMPDIR`` or ``tempfile.gettempdir()``: an environment variable
+    must not decide what may be deleted."""
+    roots = [Path("/tmp"), Path("/private/tmp")]
+    if sys.platform == "darwin":
+        value = ""
+        try:
+            value = os.confstr("CS_DARWIN_USER_TEMP_DIR") or ""
+        except (AttributeError, ValueError, OSError):
+            try:
+                value = subprocess.run(
+                    ["getconf", "DARWIN_USER_TEMP_DIR"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                ).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                value = ""
+        if value.startswith("/"):
+            roots.append(Path(value))
+    return tuple(roots)
+
+
+def _under_system_temp(candidate: Path) -> bool:
+    """Strictly inside a fixed system temp dir, judged on the fully resolved path (``..`` and symlinks
+    collapsed) and reached without a symlinked component below that temp dir."""
+    if ".." in candidate.parts:
+        return False
+    real = Path(os.path.realpath(candidate))
+    for temp in system_temp_roots():
+        resolved = Path(os.path.realpath(temp))
+        if real == resolved or not real.is_relative_to(resolved):
+            continue
+        for base in (temp, resolved):
+            if candidate.is_relative_to(base) and candidate != base:
+                walk = base
+                for part in candidate.relative_to(base).parts:
+                    walk = walk / part
+                    if walk.is_symlink():
+                        return False
+                return True
+    return False
+
+
+def _env_root_problem(base: str) -> str | None:
+    """Why ``$CLAUDE_CODE_TMPDIR/claude-<uid>`` may not be a deletion root; None when it may."""
+    candidate = Path(base) / f"claude-{os.getuid()}"
+    if not candidate.is_absolute():
+        return "not absolute"
+    try:
+        info = candidate.lstat()
+    except OSError:
+        return "does not exist"
+    if not stat.S_ISDIR(info.st_mode):
+        return "not a real directory (symlink or file)"
+    if info.st_uid != os.getuid():
+        return "not owned by this user"
+    if not _under_system_temp(candidate):
+        return "not under a system temp directory, or reached through a symlink"
+    return None
+
+
+def default_root() -> Path:
+    """Claude Code's scratch root: ``claude-<uid>`` under ``$CLAUDE_CODE_TMPDIR`` (``/tmp`` when
+    unset). Checked against Claude Code 2.1.306: it reads only that variable for the base directory;
+    ``CLAUDE_TMPDIR`` is the TMPDIR it hands to sandboxed commands, not a session root. An environment
+    variable must never widen what may be deleted, so the variable is honoured only when the result is
+    an absolute, real (not symlinked), user-owned directory under a system temp dir; otherwise it is
+    ignored with a warning and the default ``/tmp/claude-<uid>`` applies.
+
+    The result is the validated REAL path (symlinks above it collapsed); callers use exactly that and
+    never re-derive a spelling from the environment, so what was checked is what gets deleted. The
+    default is resolved only when it exists as a real directory of this user; otherwise it stays as
+    spelled (a symlink or foreign directory there is never followed)."""
+    name = f"claude-{os.getuid()}"
+    default = Path("/tmp") / name
+    base = os.environ.get("CLAUDE_CODE_TMPDIR")
+    chosen = default
+    if base:
+        if problem := _env_root_problem(base):
+            logging.getLogger(__name__).warning("ignoring CLAUDE_CODE_TMPDIR=%s: %s", base, problem)
+        else:
+            chosen = Path(base) / name
+    try:
+        info = chosen.lstat()
+    except OSError:
+        return chosen
+    if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid():
+        return Path(os.path.realpath(chosen))
+    return chosen
+
+
+def claude_config_dirs() -> list[Path]:
+    """Where Claude Code keeps ``projects/`` and ``sessions/``: ``$CLAUDE_CONFIG_DIR`` when set, and ``~/.claude``."""
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return [*([Path(configured)] if configured else []), Path.home() / ".claude"]
+
+
+def default_live_roots() -> list[Path]:
+    return [
+        *(config / "projects" for config in claude_config_dirs()),
+        Path.home() / ".codex/sessions",
+        Path.home() / ".pi/agent/sessions",
+    ]
 
 
 def _small_json(path: Path) -> dict[str, object]:
@@ -942,11 +1055,7 @@ def run_once(
                 remaining -= candidate.allocated_bytes
                 if candidate.quarantine and qbytes is not None:
                     qbytes -= candidate.allocated_bytes
-        defaults = [
-            Path.home() / ".claude/projects",
-            Path.home() / ".codex/sessions",
-            Path.home() / ".pi/agent/sessions",
-        ]
+        defaults = default_live_roots()
         _general(
             root,
             quarantine,
@@ -999,7 +1108,7 @@ def run_once(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path(f"/tmp/claude-{os.getuid()}"))
+    parser.add_argument("--root", type=Path, default=None)
     parser.add_argument(
         "--quarantine", type=Path, default=Path.home() / ".local/state/scratch-reaper/quarantine"
     )
@@ -1036,7 +1145,7 @@ def main(argv: list[str] | None = None) -> int:
             args.live_minutes * 60,
         )
         report = run_once(
-            args.root,
+            args.root or default_root(),
             args.quarantine,
             args.state_dir,
             policy,
