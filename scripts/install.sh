@@ -45,6 +45,10 @@
 #      origin/main (not pinned), and links its screenwright-review skill via
 #      scripts/install-screenwright.sh; opt out with --no-screenwright or
 #      HERDR_INSTALL_SCREENWRIGHT=0. Non-fatal; dirty/non-main checkouts are skipped.
+#   (default on) step 7e installs the disk-hygiene jobs (worktree reaper every 6 h, docker sweep
+#      nightly; systemd user timers on Linux, LaunchAgents on macOS) via
+#      scripts/install-disk-hygiene.sh; opt out with --no-disk-hygiene or
+#      HERDR_INSTALL_DISK_HYGIENE=0. Non-fatal. See docs/disk-hygiene.md.
 #
 # Re-running produces no unexpected changes. No secrets are written anywhere.
 #
@@ -61,11 +65,13 @@ WITH_SCREENWRIGHT="${HERDR_INSTALL_SCREENWRIGHT:-1}"
 # never something they have to ask for, so arming the triggers is the expected state of an
 # installed machine. Opt out with --no-handoff-autopilot (or the runtime env var).
 HANDOFF_AUTOPILOT="${HERDR_INSTALL_HANDOFF_AUTOPILOT:-1}"
+WITH_DISK_HYGIENE="${HERDR_INSTALL_DISK_HYGIENE:-1}"
 for arg in "$@"; do
   case "$arg" in
     --no-workflow-hooks) WITH_WORKFLOW_HOOKS=0 ;;
     --no-subagent-hooks) WITH_SUBAGENT_HOOKS=0 ;;
     --no-screenwright) WITH_SCREENWRIGHT=0 ;;
+    --no-disk-hygiene) WITH_DISK_HYGIENE=0 ;;
     --with-memory) WITH_MEMORY=1 ;;
     --no-build-cache-tools) BUILD_CACHE_TOOLS=0 ;;
     --build-cache-tools-only) BUILD_CACHE_TOOLS_ONLY=1 ;;
@@ -393,6 +399,14 @@ if [ "$HANDOFF_AUTOPILOT" = "1" ]; then
     || warn "automatic handoff triggers are not fully installed (see above); handoffs will still work when asked for"
 else
   printf '\n  (automatic handoffs not armed; handoffs will have to be asked for. Re-run without --no-handoff-autopilot)\n'
+fi
+
+# --- 7f. disk hygiene jobs (default on) --------------------------------------
+if [ "$WITH_DISK_HYGIENE" = "1" ]; then
+  step "7f/8 disk hygiene (worktree reaper + docker sweep timers)"
+  HERDR_ENG="$VENV/bin/herdr-eng" bash "$REPO_ROOT/scripts/install-disk-hygiene.sh" install || warn "disk-hygiene timers not installed (see above); the rest of the install is unaffected"
+else
+  printf '\n  (disk-hygiene timers not installed; HERDR_INSTALL_DISK_HYGIENE=0 or --no-disk-hygiene)\n'
 fi
 
 # --- 8. doctor ------------------------------------------------------------

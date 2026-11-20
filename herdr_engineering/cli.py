@@ -61,6 +61,11 @@ def _build_parser() -> argparse.ArgumentParser:
         cp.add_argument("--dry-run", action="store_true")
         cp.set_defaults(func=_cmd_build_cleanup)
 
+    from .cleanup_command import register as register_cleanup_command
+    register_cleanup_command(sub)
+    from .disk_hygiene import register as register_disk_hygiene
+    register_disk_hygiene(sub)
+
     from .build_cache_report_cli import register as register_build_cache_report
     register_build_cache_report(sub)
 
