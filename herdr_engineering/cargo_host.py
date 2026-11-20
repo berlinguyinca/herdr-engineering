@@ -426,16 +426,19 @@ def run_cargo(argv: list[str]) -> int:
                     if chosen.directory is None:
                         return _reserve_refusal(reserve, cleaned)
                 selected = chosen
-            refused = guard(selected.directory)
+            directory = selected.directory
+            if directory is None:
+                raise ValueError("No writable storage tier; managed build was not started")
+            refused = guard(directory)
             if refused is not None:
                 return refused
-            if not selected.directory.exists():
+            if not directory.exists():
                 removable = any(tier.name == selected.name and tier.volume_uuid
                                 for tier in config.local.storage_tiers)
                 if removable:
                     raise ValueError("Selected external storage disappeared")
-                selected.directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-            target = prepare_target(selected.directory, workspace)
+                directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+            target = prepare_target(directory, workspace)
             if not compatibility_alias(_default_state_dir(), workspace, target):
                 raise ValueError("Default target changed concurrently; no automatic redirection applied")
             os.environ["CARGO_TARGET_DIR"] = str(target)
