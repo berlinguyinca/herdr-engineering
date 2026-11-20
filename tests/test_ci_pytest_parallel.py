@@ -829,3 +829,27 @@ def test_host_facts_prints_the_same_load_file_the_worker_bound_reads(tmp_path: P
     done = subprocess.run(["bash", "-c", f'. "{ROOT}/scripts/ci/host-facts.sh"; ci_host_facts'], capture_output=True, text=True, cwd=ROOT,
                           env={**os.environ, **loadavg(tmp_path, 7.25)})
     assert "loadavg: 7.25 7.25 7.25" in done.stdout, done.stdout
+
+
+# --- a Slurm allocation is the job's own CPUs: node-wide load from other jobs must not shrink it (pipeline 1804: `-n 1`, ~2 h) ----------
+
+@pytest.mark.skipif(min(VISIBLE, CAP) < 5, reason="needs more than 4 visible CPUs and a cap above 4")
+def test_a_slurm_allocation_ignores_the_node_wide_load_average(tmp_path: Path) -> None:
+    assert args_with(SLURM_CPUS_PER_TASK="4", **loadavg(tmp_path, 155.0))[:2] == ["-n", "4"]
+
+
+def test_a_slurm_allocation_at_or_above_the_cap_keeps_auto_under_load(tmp_path: Path) -> None:
+    assert args_with(SLURM_CPUS_PER_TASK="64", **loadavg(tmp_path, 155.0))[:2] == ["-n", "auto"]
+
+
+def test_without_a_slurm_allocation_the_load_bound_still_applies(tmp_path: Path) -> None:
+    assert args_with(**loadavg(tmp_path, 155.0))[:2] == ["-n", "1"]
+
+
+def test_a_junk_slurm_value_is_ignored_and_the_load_bound_applies(tmp_path: Path) -> None:
+    assert args_with(SLURM_CPUS_PER_TASK="x", **loadavg(tmp_path, 155.0))[:2] == ["-n", "1"]
+
+
+@pytest.mark.skipif(min(VISIBLE, CAP) < 3, reason="needs more than 2 visible CPUs and a cap above 2")
+def test_the_slurm_allocation_still_lowers_workers_below_the_cap_on_a_calm_node() -> None:
+    assert args_with(SLURM_CPUS_PER_TASK="2")[:2] == ["-n", "2"]

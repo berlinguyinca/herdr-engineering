@@ -48,8 +48,20 @@ herdr_pytest_parallel_args() {
     if [ -n "$quota" ] && [ "$quota" -lt "$cap" ] && [ "$quota" -lt "$(python3 -c 'import os; print(len(os.sched_getaffinity(0)))')" ]; then
       workers="$quota"
     fi
-    # Then the CPUs the host's current load leaves free: only ever lower, never below 1.
-    local free; free="$(herdr_free_cpus)"
+    # A Slurm allocation (SLURM_CPUS_PER_TASK) is this job's own CPUs: the 1-minute load average is node-wide, so on a shared node it
+    # counts other jobs' CPUs (and our own earlier steps) and used to collapse `auto` to `-n 1` (pipeline 1804: ~2 h, killed at 99%).
+    # With an allocation the budget is the allocation, and the load bound is skipped.
+    local slurm="${SLURM_CPUS_PER_TASK:-}" free=""
+    case "$slurm" in ''|*[!0-9]*|0) slurm="" ;; esac
+    if [ -n "$slurm" ]; then
+      if [ "$slurm" -lt "$cap" ] && [ "$slurm" -lt "$(python3 -c 'import os; print(len(os.sched_getaffinity(0)))')" ] \
+         && { [ "$workers" = auto ] || [ "$slurm" -lt "$workers" ]; }; then
+        workers="$slurm"
+      fi
+    else
+      # Then the CPUs the host's current load leaves free: only ever lower, never below 1.
+      free="$(herdr_free_cpus)"
+    fi
     if [ -n "$free" ] && [ "$free" -lt "$cap" ] && [ "$free" -lt "$(python3 -c 'import os; print(len(os.sched_getaffinity(0)))')" ] \
        && { [ "$workers" = auto ] || [ "$free" -lt "$workers" ]; }; then
       workers="$free"
