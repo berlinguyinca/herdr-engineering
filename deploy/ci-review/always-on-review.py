@@ -2922,6 +2922,7 @@ def main(argv: list[str] | None = None) -> int:
     global _CLEANED
     _CLEANED = False                                    # once per invocation
     register_env_tokens()
+    register_gh_secret()                                # the sweep has no wrapper: the operator's own gh login too
     ap = argparse.ArgumentParser(prog="always-on-review.py", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("poll")

@@ -26,7 +26,7 @@ SCRIPT = ROOT / "deploy/ci-review/always-on-review.py"
 REPO = "acme/widget"
 GATES = ["ci/woodpecker/pr/lint", "verify", "GitGuardian Security Checks"]
 WHEN_PRESENT = "ci/woodpecker/pr/ui-gates"
-GH_TOKEN = "gho_FAKEGHAUTHTOKEN0123456789"
+GH_TOKEN = "plainfakeghauthtoken0123456789"
 SECRET = "sk-PIKEY-0123456789abcdefSECRET"
 
 
@@ -77,7 +77,7 @@ elif argv[:2] == ["pr", "list"]:
 elif argv[:2] == ["repo", "view"]:
     out(st.get("repos", {}).get(argv[2], {"isArchived": False, "isFork": False}))
 elif argv[:2] == ["auth", "token"]:
-    sys.stdout.write("gho_FAKEGHAUTHTOKEN0123456789\n")
+    sys.stdout.write("plainfakeghauthtoken0123456789\n")
 elif argv[:2] == ["api", "user"]:
     out({"login": "operator"})
 elif argv[0] == "api":
@@ -580,6 +580,17 @@ def test_a_claude_reviewer_cannot_smuggle_the_github_token_into_a_comment(env):
     state = json.dumps(env.gh_state())
     assert "leaked" in state and token not in state
     assert token not in (env.tmp / "state/reviews.jsonl").read_text()
+
+
+def test_the_operators_gh_auth_token_is_redacted_on_every_backend_without_the_wrapper(env, monkeypatch):
+    gh_tok = "plainfakeghauthtoken0123456789"            # what the stand-in gh prints for `gh auth token`
+    monkeypatch.delenv("GH_TOKEN")                         # the timer sweep has no wrapper and no GH_TOKEN
+    env.mod.ai.REDACT.discard(gh_tok)
+    env.config(post=True)
+    env.reviewer("claude", answer=block(why=f"leaked {gh_tok}"))
+    assert env.review("tier2", post=True) == 0
+    state = json.dumps(env.gh_state())
+    assert "leaked" in state and gh_tok not in state
 
 
 def test_a_failed_authenticated_fetch_names_the_git_subcommand(env, tmp_path):

@@ -173,8 +173,19 @@ def test_the_token_file_is_checked_and_read_through_one_descriptor():
 
 
 def test_a_token_file_swapped_after_the_check_is_not_read(host):
-    # the path is replaced by a world-readable file after the open: the opened (0600) one is what counts
-    assert host.run()[0] == 0 and host.calls()[0]["gh_token"] == TOKEN
+    """A `stat` shim on PATH replaces the token file with another (0600) one right after reporting its mode. The token
+    must still be the one that was opened and checked: reading by path would return the impostor."""
+    impostor = host.tmp / "impostor.token"
+    impostor.write_text("ghp_IMPOSTOR\n")
+    impostor.chmod(0o600)
+    real = shutil.which("stat")
+    shim = host.bin / "stat"
+    shim.write_text(f'#!/bin/sh\n{real} "$@" || exit $?\ncase "$*" in *%a*) mv -f {impostor} {host.token_file};; esac\n')
+    shim.chmod(0o755)
+    rc, out = host.run()
+    assert rc == 0, out
+    assert host.token_file.read_text().strip() == "ghp_IMPOSTOR", "the swap really happened"
+    assert host.calls()[0]["gh_token"] == TOKEN and "IMPOSTOR" not in out
 
 
 def test_a_missing_token_file_fails_the_step_with_instructions(host):
