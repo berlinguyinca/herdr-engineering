@@ -641,7 +641,7 @@ def _inventory(target: Path) -> set[Ident]:
     return found
 
 
-def _busy_reason(holds: list[Hold], target: Path) -> str | None:
+def _busy_reason(holds: list[Hold], target: Path, quick: bool = False) -> str | None:
     """Why ``target`` must not be cleaned right now, or None. Busy: a process has its cwd, executable, an
     open file or a mapping inside the target or its workspace, or a cargo-family process was told to build
     into the target. What is compared is identity ((device, inode) from the kernel where the scan has it,
@@ -649,13 +649,17 @@ def _busy_reason(holds: list[Hold], target: Path) -> str | None:
     A hold of kind ``named`` (a non-dumpable process known only by a relative program path or its ``comm``)
     is busy when a regular file of that name, or of that 15-character prefix, is anywhere in the target.
 
+    ``quick`` leaves out the two whole-target walks (``_inventory`` and ``_files_named``): what it finds is
+    certainly busy, what it does not find may still be (the full check decides). It lets a target that is in
+    use be turned away without a walk.
+
     This stats files of arbitrary processes; on a dead network mount that can block, so the sweep runs it
     in a child process with a deadline (``_busy_check``)."""
     mine = {ident for ident in (_identity(target), _identity(_project(target))) if ident}
-    inside = mine | _inventory(target)
+    inside = mine if quick else mine | _inventory(target)
     target_id = _identity(target)
     target_chain = _chain(target)
-    files = _files_named(target, {path.name for _p, _n, how, path, _i in holds if how == "named"})
+    files = {} if quick else _files_named(target, {path.name for _p, _n, how, path, _i in holds if how == "named"})
     for pid, name, how, path, ids in holds:
         if how == "named":
             if path.name in files:
@@ -669,14 +673,14 @@ def _busy_reason(holds: list[Hold], target: Path) -> str | None:
 
 
 _BUSY_CHILD = ("import sys; from herdr_engineering import build_cleanup as c; "
-               "c._busy_child(sys.argv[1], int(sys.argv[2]))")
+               "c._busy_child(sys.argv[1], int(sys.argv[2]), sys.argv[3] == 'quick')")
 _BUSY_SECONDS = 120.0  # the scan of a normal host takes a second; ``HERDR_BUSY_CHECK_SECONDS`` overrides
 
 
-def _busy_child(target: str, sweeper: int) -> None:
+def _busy_child(target: str, sweeper: int, quick: bool = False) -> None:
     try:  # the sweeper that asked is not a holder: it may be run from inside the project it sweeps
         holds = [hold for hold in _scan() if hold[0] != sweeper]
-        print(json.dumps({"busy": _busy_reason(holds, Path(target))}))
+        print(json.dumps({"busy": _busy_reason(holds, Path(target), quick)}))
     except (OSError, ValueError) as exc:
         print(json.dumps({"error": str(exc)}))
 
@@ -723,6 +727,18 @@ def _reap() -> None:
     _ABANDONED[:] = [child for child in _ABANDONED if child.poll() is None]
 
 
+def _kill(child: subprocess.Popen) -> None:
+    """Kill the child's whole process group; one stuck in the kernel is kept in ``_ABANDONED``, never waited for."""
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        child.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        _ABANDONED.append(child)  # stuck in the kernel: reaped by a later call
+
+
 def _run_child(code: str, args: Sequence[str], seconds: float, what: str, stdin: str | None = None) -> str:
     """Run ``python -P -c code args`` from ``/`` with a deadline and return what it printed. A fresh
     interpreter, not a fork: it inherits no file descriptor (so never the sweep's locks, however long it
@@ -742,27 +758,27 @@ def _run_child(code: str, args: Sequence[str], seconds: float, what: str, stdin:
             out, _ = child.communicate(stdin, timeout=seconds)
         except subprocess.TimeoutExpired as exc:
             partial = exc.stdout or ""
-            raise ChildTimeout(f"{what} timed out after {seconds:g} s",
-                               partial.decode(errors="replace") if isinstance(partial, bytes) else partial) from exc
+            if isinstance(partial, bytes):
+                partial = partial.decode(errors="replace")
+            _kill(child)
+            try:  # what the child wrote in its last moments is still in the pipe: keep it (the pipe is at EOF now)
+                partial = child.communicate(timeout=1)[0] or partial
+            except (subprocess.TimeoutExpired, ValueError, OSError):
+                pass
+            raise ChildTimeout(f"{what} timed out after {seconds:g} s", partial) from exc
         answered = True
     finally:
-        if not answered and child.returncode is None:
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            try:
-                child.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                _ABANDONED.append(child)  # stuck in the kernel: reaped by a later call
+        if not answered and child.returncode is None and child not in _ABANDONED:
+            _kill(child)
     return out
 
 
-def _busy_check(target: Path) -> str | None:
+def _busy_check(target: Path, quick: bool = False) -> str | None:
     """``_busy_reason`` over a fresh process scan, run in a child with a deadline so that a stat that hangs
     (a dead NFS or sshfs mount a process sits on) can never hang the sweep or a build's disk guard. The child
     runs from ``/`` without the script directory on its path (the sweeper's cwd is a user workspace)."""
-    out = _run_child(_BUSY_CHILD, [str(target), str(os.getpid())], _busy_deadline(), "busy check")
+    out = _run_child(_BUSY_CHILD, [str(target), str(os.getpid()), "quick" if quick else "full"], _busy_deadline(),
+                     "busy check")
     try:
         answer = json.loads(out.splitlines()[-1])
     except (IndexError, ValueError) as exc:
@@ -816,6 +832,16 @@ def _remove_orphan(target: Path) -> bool:
     return True
 
 
+_NO_WORKSPACE = "no workspace to clean through"
+
+
+def _cleanable(target: Path) -> bool:
+    """``cargo clean`` needs the manifest of the workspace beside the target (or the managed one). A cache-only
+    target (a shared pool, ``CARGO_TARGET_DIR``) has none: it is never cleaned, so never walked for it."""
+    manifest = (_managed_workspace(target) or target.parent) / "Cargo.toml"
+    return manifest.is_file() and not manifest.is_symlink()
+
+
 def _cargo_clean(target: Path, timeout: float = _CLEAN_SECONDS) -> str | None:
     """``cargo clean`` for the target's workspace (None on success, else why not). Cargo takes its own
     locks; a managed target is cleaned under the manager lock, so a build that starts meanwhile waits in
@@ -824,8 +850,8 @@ def _cargo_clean(target: Path, timeout: float = _CLEAN_SECONDS) -> str | None:
     managed = _managed_workspace(target)
     workspace = managed or target.parent
     manifest = workspace / "Cargo.toml"
-    if not manifest.is_file() or manifest.is_symlink():
-        return "no workspace to clean through"
+    if not _cleanable(target):
+        return _NO_WORKSPACE
     try:
         proxy = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo") / "bin/cargo"
         cargo = proxy if proxy.is_file() and os.access(proxy, os.X_OK) else resolve_real_cargo(Path.home())
@@ -980,7 +1006,7 @@ def _measure(target: Path, cap: int | None, full: bool, cap_cutoff: float | None
     if size <= cap:
         return {"newest": 0.0, "size": size, "over": False}
     newest = _shallow_newest(target)
-    if cap_cutoff is not None and newest <= cap_cutoff:
+    if cap_cutoff is not None and newest <= cap_cutoff and _cleanable(target):  # one that is never cleaned needs no guard
         _guard(target, deadline)
     return {"newest": newest, "size": size, "over": True}
 
@@ -1021,10 +1047,11 @@ def _survey(spec: dict):
 
 def _survey_child() -> None:
     """Entry of the survey process: the spec on stdin, one JSON line per result on stdout."""
-    global _MAX_ENTRIES
+    global _MAX_ENTRIES, _MAX_DEPTH
     try:
         spec = json.load(sys.stdin)
         _MAX_ENTRIES = spec["max_entries"]
+        _MAX_DEPTH = spec["max_depth"]
         for item in _survey(spec):
             print(json.dumps(item), flush=True)
         print(json.dumps({"done": True}), flush=True)
@@ -1303,7 +1330,7 @@ def _run_survey(spec: dict, root: Path, result: dict) -> dict:
     not finish raises (OSError, TimeoutError included); one cut off while measuring keeps the rows it had, with
     a warning."""
     seconds = _survey_deadline()
-    spec = {**spec, "seconds": seconds, "max_entries": _MAX_ENTRIES}
+    spec = {**spec, "seconds": seconds, "max_entries": _MAX_ENTRIES, "max_depth": _MAX_DEPTH}
     cut_off: ChildTimeout | None = None
     try:
         out = _run_child(_SURVEY_CHILD, [], seconds, "survey", json.dumps(spec))
@@ -1468,17 +1495,20 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
         result["reasons"].setdefault(name, reason)
 
 
-def _blocked_by_process(target: Path, name: str, result: dict) -> bool:
+def _blocked_by_process(target: Path, name: str, result: dict, quick: bool = False) -> bool:
     """A fresh process scan right before deleting ``target`` (idle or orphan): True when it must stay, with
-    the reason in ``skipped`` and ``blocked``. A scan that cannot be read fails closed."""
+    the reason in ``skipped`` and ``blocked``. A scan that cannot be read fails closed: the sweep stops. One
+    that does not finish in time (a stat that hangs under this target) fails closed for this target only, with
+    a warning; the others are still judged."""
     result["process_scans"] += 1
     busy = None
     for attempt in range(6):  # a process mid-exec is unreadable for a moment
         try:
-            busy = _busy_check(target)
+            busy = _busy_check(target, quick)
             break
-        except TimeoutError as exc:  # a hung stat will hang again: no retries, fail closed
-            busy = f"process list unreadable: {exc}"
+        except TimeoutError as exc:  # a hung stat will hang again: no retries, this target stays
+            busy = f"busy check timed out: {exc}"
+            _warn_once(result, f"{name} kept: {exc}")
             break
         except (OSError, ValueError) as exc:  # still unreadable after retries: fail closed, this target stays
             busy = f"process list unreadable: {exc}"
@@ -1501,6 +1531,8 @@ def _clean_idle(target: Path, name: str, cutoff: float, state_dir: Path, result:
         result["skipped"].append({"path": name, "reason": reason})
         return False
 
+    if not _cleanable(target):  # before any walk: nothing below can make it cleanable
+        return skip(_NO_WORKSPACE)
     if not _untracked(target):
         return skip("tracked or unverifiable output")
     # revalidate right before deleting (a target past the size cap is judged by its bookkeeping, as in the survey)
@@ -1510,6 +1542,8 @@ def _clean_idle(target: Path, name: str, cutoff: float, state_dir: Path, result:
     if not _recognized(target):
         raise OSError(f"Target no longer recognized as a Cargo output: {name}")
     if _skip_for_registry(state_dir, target, name, result):  # cheap: a leased target needs no scan
+        return False
+    if _blocked_by_process(target, name, result, quick=True):  # in use: turned away before the walks below
         return False
     if reason == "size_cap":  # the survey checked the content too, but not just now: the whole of it, again
         try:

@@ -164,11 +164,11 @@ def test_a_killed_child_that_exits_later_is_reaped_at_the_next_call():
 
 
 def test_both_locks_are_free_while_a_survey_runs_past_its_deadline(env, monkeypatch):
-    """``run_once`` with a survey that hangs: it gives up at the deadline, reports, and its locks are free."""
+    """``run_once`` with the real survey child and a real deadline it cannot meet: the sweep gives up at the
+    deadline, reports, and its locks are free."""
     import fcntl
     root, state = env
-    monkeypatch.setattr(cleanup, "_SURVEY_CHILD", "import time; time.sleep(120)")
-    monkeypatch.setenv("HERDR_SURVEY_SECONDS", "1.5")
+    monkeypatch.setenv("HERDR_SURVEY_SECONDS", "0.01")  # shorter than the child's own start
     project(root)
     result = sweep(root, state, max_target_bytes=SMALL)
     assert result["removed_count"] == 0
@@ -181,26 +181,54 @@ def test_both_locks_are_free_while_a_survey_runs_past_its_deadline(env, monkeypa
             os.close(fd)
 
 
-def test_a_survey_cut_off_after_discovery_keeps_the_rows_it_had(tmp_path, monkeypatch):
+def _bulk_workspaces(root: Path, count: int, files: int) -> None:
+    """``count`` real, old Cargo targets (manifest, fingerprints, ``files`` files each): what the survey's
+    content guard has to walk entry by entry."""
+    for index in range(count):
+        workspace = root / f"w{index:02d}"
+        deps = workspace / "target" / "debug" / "deps"
+        deps.mkdir(parents=True)
+        (workspace / "Cargo.toml").write_text('[package]\nname = "bulk"\nversion = "0.1.0"\nedition = "2021"\n')
+        (workspace / "target" / ".rustc_info.json").write_text("{}")
+        (workspace / "target" / "debug" / ".fingerprint").mkdir()
+        for number in range(files):
+            (deps / f"f{number}.o").write_bytes(b"x")
+        for path in [*(workspace / "target").rglob("*"), workspace / "target"]:
+            _old(path)
+
+
+def test_a_survey_cut_off_after_discovery_keeps_the_rows_it_had(tmp_path):
+    """The real survey child over many real targets, cut off by a real deadline (half of what the whole
+    survey takes) after it listed them and measured some."""
     root = tmp_path / "root"
-    target = project(root)
-    rows = [{"found": {"targets": [str(target), str(target) + "2"], "unreadable": [], "trash": [], "notes": []}},
-            {"row": {"path": str(target), "newest": 1.0, "size": 5, "over": True}}]
-    code = "import time\n" + "".join(f"print({json.dumps(json.dumps(line))}, flush=True)\n" for line in rows) \
-        + "time.sleep(120)\n"
-    monkeypatch.setattr(cleanup, "_SURVEY_CHILD", code)
-    monkeypatch.setenv("HERDR_SURVEY_SECONDS", "2")
-    result = {"warnings": []}
-    survey = cleanup._run_survey(_spec(root), root, result)
-    assert [row["path"] for row in survey["rows"]] == [str(target)] and not survey["done"]
-    assert any("1 of 2 targets" in warning for warning in result["warnings"])
+    _bulk_workspaces(root, 30, 2500)
+    spec = _spec(root, cap_cutoff=time.time() + 3600)  # every target is idle: each gets the content guard
+    began = time.monotonic()
+    full = cleanup._run_survey(spec, root, {"warnings": []})
+    took = time.monotonic() - began
+    assert len(full["rows"]) == 30 and full["done"]
+    os.environ["HERDR_SURVEY_SECONDS"] = f"{took / 2:.3f}"
+    try:
+        result = {"warnings": []}
+        survey = cleanup._run_survey(spec, root, result)
+    finally:
+        del os.environ["HERDR_SURVEY_SECONDS"]
+    assert 0 < len(survey["rows"]) < 30 and not survey["done"], (took, len(survey["rows"]))
+    assert any(f"{len(survey['rows'])} of 30 targets" in warning for warning in result["warnings"])
 
 
 def test_a_survey_cut_off_before_discovery_ended_raises(tmp_path, monkeypatch):
-    monkeypatch.setattr(cleanup, "_SURVEY_CHILD", "import time; time.sleep(120)")
-    monkeypatch.setenv("HERDR_SURVEY_SECONDS", "1")
+    project(tmp_path / "root")
+    monkeypatch.setenv("HERDR_SURVEY_SECONDS", "0.01")
     with pytest.raises(TimeoutError):
-        cleanup._run_survey(_spec(tmp_path), tmp_path, {"warnings": []})
+        cleanup._run_survey(_spec(tmp_path / "root"), tmp_path / "root", {"warnings": []})
+
+
+def test_what_a_child_wrote_just_before_the_deadline_is_kept():
+    code = "import time\nfor n in range(5):\n    print(n, flush=True)\ntime.sleep(120)\n"
+    with pytest.raises(cleanup.ChildTimeout) as caught:
+        cleanup._run_child(code, [], 2, "writer")
+    assert caught.value.output.split() == ["0", "1", "2", "3", "4"]
 
 
 def test_the_partial_survey_output_is_parsed_up_to_the_cut():
@@ -349,3 +377,85 @@ def test_a_fresh_file_in_tmp_or_doc_of_a_huge_target_is_recent_activity(env):
     result = sweep(root, state, max_target_bytes=SMALL)
     assert result["removed_count"] == 0 and (target / "debug").exists()
 
+
+
+# --- round 3: one slow busy check skips that target only ---------------------------------------
+
+_SLOW_FOR_ONE_TARGET = """
+import os, sys, time
+if sys.argv[1:2] == [os.environ["HERDR_TEST_SLOW_TARGET"]]:
+    time.sleep(600)  # this target's process scan never finishes (a stat on a dead mount under it)
+"""
+
+
+def test_a_busy_check_that_times_out_skips_that_target_and_the_sweep_goes_on(env, tmp_path, monkeypatch):
+    """The first target's scan child hangs (a ``sitecustomize`` that only does so for that target's path: a
+    stand-in for a dead mount under it, not for any production code). It is kept with a warning, never
+    cleaned; the second, idle target is still judged and cleaned, and the sweep does not abort."""
+    root, state = env
+    slow = project(root, "slow", age=72)  # oldest: judged first
+    fast = project(root, "fast", age=48)
+    hook = tmp_path / "hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_SLOW_FOR_ONE_TARGET)
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(hook), os.environ.get("PYTHONPATH")])))
+    monkeypatch.setenv("HERDR_TEST_SLOW_TARGET", str(slow))
+    monkeypatch.setenv("HERDR_BUSY_CHECK_SECONDS", "4")
+    result = sweep(root, state, max_target_bytes=SMALL)
+    assert (slow / "debug").exists(), "a target whose busy check timed out must never be cleaned"
+    assert result["removed"] == [str(fast)], result
+    assert not result["aborted"], result
+    assert any("timed out" in w and str(slow) in w for w in result["warnings"]), result["warnings"]
+    assert any(s["path"] == str(slow) and "timed out" in s["reason"] for s in result["skipped"]), result
+
+
+# --- round 3: work not done for a target that cannot be cleaned ------------------------------------
+
+def test_a_cache_only_target_over_the_cap_is_skipped_before_any_scan(env):
+    root, state = env
+    target = project(root)
+    (target.parent / "Cargo.toml").unlink()  # CACHEDIR.TAG and fingerprints, no manifest beside it
+    result = sweep(root, state, max_target_bytes=SMALL)
+    assert result["removed_count"] == 0 and target.exists()
+    assert result["process_scans"] == 0, "a target that is never cleaned must not be scanned for"
+    assert {"path": str(target), "reason": cleanup._NO_WORKSPACE} in result["skipped"]
+
+
+def test_a_target_in_use_is_turned_away_by_the_scan_alone(env):
+    root, state = env
+    target = project(root)
+    proc = subprocess.Popen(["sleep", "300"], cwd=target.parent / "src")
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not cleanup._busy_check(target, quick=True):
+            time.sleep(0.2)
+        result = sweep(root, state, max_target_bytes=SMALL)
+    finally:
+        proc.kill()
+        proc.wait()
+    assert result["removed_count"] == 0 and (target / "debug").exists()
+    assert result["process_scans"] == 1 and "sleep" in result["blocked"][0]["reason"], result
+
+
+def test_the_clean_time_guard_stops_a_target_that_changed_after_the_survey(env):
+    """The survey saw a clean target; before the clean something foreign appeared deep inside. Without the
+    guard of ``_clean_idle`` the real ``cargo clean`` would run."""
+    root, state = env
+    target = project(root)
+    deep = target / "debug" / "deeper" / "still" / "further" / "down"
+    deep.mkdir(parents=True)
+    (deep / "link").symlink_to("/etc")
+    result = {"skipped": [], "warnings": [], "errors": [], "blocked": [], "process_scans": 0, "dry_run": False,
+              "would_remove": [], "reasons": {}}
+    assert cleanup._clean_idle(target, str(target), time.time(), state, result, "size_cap") is False
+    assert (target / "debug").exists()
+    assert result["skipped"] and "content check failed" in result["skipped"][0]["reason"]
+    assert result["process_scans"] == 1  # only the cheap pre-check ran; the guard stopped it before the full scan
+
+
+def test_a_tiny_positive_cap_is_the_default_with_a_warning(caplog):
+    maintenance._WARNED.clear()
+    with caplog.at_level("WARNING"):
+        assert maintenance.policy_kwargs({"max_target_gb": 1e-10})["max_target_bytes"] == 50 * 1024**3
+    assert len([m for m in caplog.messages if "max_target_gb" in m]) == 1
+    assert maintenance.policy_kwargs({"max_target_gb": 0})["max_target_bytes"] is None

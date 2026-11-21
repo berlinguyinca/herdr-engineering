@@ -5,7 +5,7 @@ default) checks every 15 minutes, whether or not a Herdr server is running (set 
 true` to sweep only while a server of the same user runs). It cleans verified Cargo output directories under the
 project roots (`~`, `~/work`, `~/IdeaProjects` and `~/.cache` by default) when disk use reaches 85%, oldest first,
 stopping at 80%, and any target over `max_target_gb` that has been idle for `size_cap_idle_hours` (default 2) at
-every check, whatever the disk use. Under pressure, artifacts must be inactive for at least 24 hours (`min_age_hours`).
+every check, whatever the disk use. Under pressure, artifacts must be inactive for at least 24 hours (`min_age_hours`), or 2 hours (`pressure_min_age_hours`) at `pressure_percent`; a target over the size cap needs only `size_cap_idle_hours`, whatever the pressure.
 Source files, worktrees, Cargo downloads, and Rust toolchains are retained.
 
 Add to `~/.config/herdr-engineering/config.yaml`:
@@ -96,7 +96,8 @@ The default-on job is narrow. It deletes exactly two kinds of target and nothing
    whose cwd, executable, open file or (Linux) memory mapping is under the target or W, or a cargo-family process
    (`cargo`, `rustc`, `rustdoc`, `rust-analyzer`, `cargo-*`) whose `CARGO_TARGET_DIR` or `--target-dir` is the
    target. A cargo working elsewhere does not block. The process scan is taken fresh right before each candidate is
-   cleaned; a scan that fails closes the pass (`aborted`, with an error), and the refusal message names what blocked
+   cleaned; a scan that fails closes the pass (`aborted`, with an error; one that only runs out of time keeps that target and
+   goes on, see below), and the refusal message names what blocked
    a target (`blocked` in the run result). The delete is
    `cargo clean --manifest-path <workspace>/Cargo.toml --target-dir <dir>`, so Cargo does its own locking.
    A managed target is cleaned under the manager lock, and its directory, ownership marker and standard
@@ -107,7 +108,8 @@ The default-on job is narrow. It deletes exactly two kinds of target and nothing
    columns of `maps`), so a process in another mount namespace (devcontainer, rootless container) is seen even
    though its path does not exist here. The scan runs in a child process with a deadline
    (`HERDR_BUSY_CHECK_SECONDS`, default 120 s) so a dead NFS/sshfs mount cannot hang a sweep or a build's guard;
-   on timeout nothing is cleaned, the sweep reports "busy check timed out" and releases its lock. What can be
+   on timeout that target is not cleaned, it is kept with a warning ("busy check timed out") and the sweep goes on with the
+   other targets (a size-cap or pressure cleanup of those is not held up by one slow target). What can be
    seen is limited by the kernel, not by a setting: without root (or `CAP_SYS_PTRACE`) another uid's cwd, exe,
    fd and maps are unreadable even without `hidepid`, so only this user's processes and processes in user
    namespaces this user owns (rootless containers) are detected. Root services (a systemd unit running
@@ -188,8 +190,9 @@ build_cleanup:
 below 1) is cleaned by the 15-minute sweep, whatever the disk usage (below `high_water_percent` too). The cap is
 enforced by that sweep alone: nothing runs after a build, `build-coordinate` and the cargo wrapper behave exactly as
 without a cap, and a target is never cleaned from inside a build. A target is therefore over the cap for up to
-`size_cap_idle_hours` plus one sweep interval after its last build; under disk pressure the pressure rules (24 h,
-2 h at `pressure_percent`) apply instead. It uses exactly the path of the pressure sweep: a verified Cargo target,
+`size_cap_idle_hours` plus one sweep interval after its last build. Disk pressure does not change that floor: a
+target over the cap is cleaned after `size_cap_idle_hours` also when the disk is only above `high_water_percent`
+(the 24 h and 2 h rules apply to the targets that are not over the cap). It uses exactly the path of the pressure sweep: a verified Cargo target,
 the idle floor, git-untracked, leases, the per-target process scan, the sweep lock, and `cargo clean`. The sweep
 result lists it in `reasons` as `size_cap` (`pressure` and `orphan` are the other values). A target that goes over
 the cap while a build runs, or whose project is not in git, is kept. Why: a disk reached 100% from stale
@@ -201,8 +204,9 @@ Cargo's bookkeeping instead of every file: the target, its profile directories (
 (`tmp`, `doc`, `package`, ...) to the same depth. So a target of millions of files is judged as cheaply as it is
 proven large. The limit: a write that changes no directory mtime (a file rewritten in place, or anything deeper
 than the fourth level, for example a scratch file under `build/<crate>/out/a/b/`) is not seen by the idle time;
-the process scan and the leases protect a running build. Only under disk pressure is the whole target walked for
-its idle time. A target that cannot be decided is reported as a warning (`size cap undecided`), never as a clean pass.
+the process scan and the leases protect a running build. Under disk pressure the survey walks the whole target for its idle time
+(a walk that passes the entry limit falls back to the bookkeeping); the revalidation right before a clean of a
+`size_cap` target always uses the bookkeeping. A target that cannot be decided is reported as a warning (`size cap undecided`), never as a clean pass.
 
 **Content guard.** A target over the cap that is idle enough to be cleaned must first pass the full foreign-content
 guard over ALL of its content, not only the part the size walk saw: nothing of another owner or filesystem, no
@@ -240,8 +244,17 @@ walks the home directory: with no cache for `~`, the explicit non-home roots are
 nearest git repository is `$HOME` itself, or that is outside any repository, is not cleaned. Setting `roots`
 replaces the default.
 
-The busy check (`_inventory`) still walks the whole target once to learn which files a process could hold; for a
-very large target this is the slowest step of a pass and is bounded by `HERDR_BUSY_CHECK_SECONDS`.
+The full busy check walks the whole target (`_inventory`, and on Linux `_files_named` too whenever a non-dumpable
+process is known only by name) to learn which files a process could hold; for a very large target this is the
+slowest step of a pass and is bounded by `HERDR_BUSY_CHECK_SECONDS`, per target. A target that cannot be cleaned is
+not walked for it: one without a manifest beside it (a cache-only target, for example under `~/.cache`) is skipped
+before any walk, and one in use by a process (cwd, executable, open file, mapping) is turned away by a scan that
+walks nothing, before the guard and the full check. A target that stays in use costs one content walk in the survey
+per sweep.
+
+Known limit: the clean-time checks of a `size_cap` target (the bookkeeping, the content guard) run in the sweep
+process, which holds the sweep locks. A mount that appears inside a target after the survey and hangs a `stat`
+would hold them until it recovers; the survey itself, where a hang is far more likely, is killed at its deadline.
 
 `scripts/install.sh` (step 7g) installs and enables the cleanup service or timer by default; `--no-build-hygiene` or
 `HERDR_INSTALL_BUILD_HYGIENE=0` opts out.

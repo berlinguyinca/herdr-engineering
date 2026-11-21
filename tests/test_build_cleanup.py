@@ -181,7 +181,7 @@ def test_nested_source_manifest_is_preserved(workspace):
 
 def _paths(proc):
     """The files the scan says processes use (their cwd, executable, descriptors and mappings)."""
-    return [hold[3] for hold in cleanup._scan(proc) if hold[2] in ("uses", "cwd")]
+    return [hold[3] for hold in cleanup._scan(proc) if hold[2] == "uses"]
 
 
 def test_proc_reads_cwd_executable_and_open_files(tmp_path):
@@ -203,66 +203,48 @@ def test_missing_proc_falls_back_to_lsof_or_fails_closed(tmp_path, monkeypatch):
         _paths(tmp_path / "no-proc")
 
 
-def test_discovery_does_not_enter_other_filesystems(workspace, monkeypatch):
-    cache = target(workspace, "mounted")
-    safe = target(workspace, "local")
-    original = cleanup.os.scandir
-
-    class ForeignEntry:
-        def __init__(self, entry):
-            self.entry = entry
-
-        def __getattr__(self, name):
-            return getattr(self.entry, name)
-
-        def stat(self, **kwargs):
-            fields = list(self.entry.stat(**kwargs))
-            fields[2] += 1  # st_dev
-            return os.stat_result(fields)
-
-    class Entries:
-        def __enter__(self):
-            self.iterator = original(workspace)
-            return iter(ForeignEntry(entry) if entry.name == "mounted" else entry
-                        for entry in self.iterator)
-
-        def __exit__(self, *_):
-            self.iterator.close()
-
-    def scandir(path):
-        return Entries() if path == workspace else original(path)
-
-    monkeypatch.setattr(cleanup.os, "scandir", scandir)
-    # discovery runs in a child process now, which a patch here cannot reach: ask it directly
-    assert cleanup._discover(workspace) == [safe]
-    assert cache.exists()
+def _other_filesystem() -> Path | None:
+    """A writable directory on a real filesystem other than the temp directory's (``/dev/shm`` on Linux)."""
+    shm = Path("/dev/shm")
+    return shm if shm.is_dir() and os.access(shm, os.W_OK) else None
 
 
-def test_mount_inside_target_is_preserved(workspace, monkeypatch):
+def test_a_target_on_another_filesystem_is_not_measured_by_the_survey(tmp_path):
+    other = _other_filesystem()
+    if other is None or other.stat().st_dev == tmp_path.stat().st_dev:
+        pytest.skip("needs a second real filesystem")
+    home = other / f"herdr-test-{os.getpid()}"
+    home.mkdir()
+    try:
+        foreign = target(home, "mounted")
+        root = tmp_path / "root"
+        root.mkdir()
+        spec = {"root": str(root), "cap": 1, "full": False, "cap_cutoff": None, "exclude": [],
+                "targets": [str(foreign)], "seconds": 60, "max_entries": 500_000, "max_depth": 6}
+        rows = cleanup._parse_survey(cleanup._run_child(cleanup._SURVEY_CHILD, [], 60, "survey",
+                                                        json.dumps(spec)))["rows"]
+        assert rows == [{"path": str(foreign), "foreign_device": True}]
+    finally:
+        cleanup.shutil.rmtree(home, ignore_errors=True)
+
+
+def test_an_entry_of_another_filesystem_inside_a_target_is_refused(workspace):
+    """``/dev`` is a real directory of another filesystem (and owner): met inside a target it is a mount."""
     cache = target(workspace)
-    _old_artifact(cache)
-    original = Path.lstat
-
-    def metadata(path, **kwargs):
-        result = original(path, **kwargs)
-        if path == cache / "artifact":
-            fields = list(result)
-            fields[2] += 1  # st_dev
-            return os.stat_result(fields)
-        return result
-
-    monkeypatch.setattr(Path, "lstat", metadata)
-    with pytest.raises(OSError, match="mount"):  # the sweep runs this check in a child process
-        cleanup._inspect(cache)
-    assert cache.exists()
+    with pytest.raises(OSError, match="mount"):
+        cleanup._check_entry("dev", os.lstat("/dev"), cache.lstat().st_dev, cache)
 
 
-def test_deep_source_tree_does_not_block_shallow_cache(workspace, monkeypatch):
-    cache = target(workspace)
+def test_the_depth_limit_reaches_the_survey_and_a_deep_source_tree_does_not_block_a_shallow_cache(
+        workspace, monkeypatch):
+    shallow = target(workspace)
     (workspace / "source/one/two/three").mkdir(parents=True)
-    monkeypatch.setattr(cleanup, "_MAX_DEPTH", 2)
+    (workspace / "a/b/c/d").mkdir(parents=True)
+    deep = target(workspace / "a/b/c/d", "deep")
+    monkeypatch.setattr(cleanup, "_MAX_DEPTH", 2)  # forwarded to the child that does the discovery
     assert run(workspace)["removed_count"] == 1
-    assert not cache.exists()
+    assert not shallow.exists()
+    assert deep.exists(), "a target deeper than the limit must not be found: the limit never reached the child"
 
 
 @pytest.fixture

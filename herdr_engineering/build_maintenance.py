@@ -73,6 +73,20 @@ def _checked(cfg: dict, key: str, default: float, minimum: float) -> float:
     return float(number)
 
 
+def _max_target_bytes(cfg: dict) -> int | None:
+    """The cap in bytes; 0 switches it off. A positive value too small to be one byte is a typo, not "off":
+    it is the default, with the same one warning."""
+    gb = _checked(cfg, 'max_target_gb', _DEFAULT_MAX_TARGET_GB, 0)
+    if gb > 0 and int(gb * 1024 ** 3) == 0:
+        value = cfg.get('max_target_gb')
+        if ('max_target_gb', repr(value)) not in _WARNED:
+            _WARNED.add(('max_target_gb', repr(value)))
+            log.warning('ignoring build_cleanup.max_target_gb=%r (under one byte); using %g',
+                        value, _DEFAULT_MAX_TARGET_GB)
+        gb = _DEFAULT_MAX_TARGET_GB
+    return int(gb * 1024 ** 3) or None
+
+
 def policy_kwargs(cfg: dict) -> dict:
     """``run_once`` policy values from a ``build_cleanup`` config block (defaults match config.DEFAULTS)."""
     from .build_cleanup import MIN_IDLE_HOURS
@@ -83,7 +97,7 @@ def policy_kwargs(cfg: dict) -> dict:
         "pressure_water": float(cfg.get('pressure_percent', 90)),
         "pressure_min_age_hours": float(cfg.get('pressure_min_age_hours', 2)),
         # 0 switches the per-target cap off
-        "max_target_bytes": int(_checked(cfg, 'max_target_gb', _DEFAULT_MAX_TARGET_GB, 0) * 1024 ** 3) or None,
+        "max_target_bytes": _max_target_bytes(cfg),
         "size_cap_idle_hours": _checked(cfg, 'size_cap_idle_hours', _DEFAULT_SIZE_CAP_IDLE_HOURS, MIN_IDLE_HOURS),
     }
 

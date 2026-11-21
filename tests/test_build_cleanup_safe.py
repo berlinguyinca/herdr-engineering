@@ -798,7 +798,7 @@ def test_a_process_in_another_mount_namespace_keeps_the_target(root, tmp_path, k
     assert sweep(root)["removed"] == [str(target)]
 
 
-def test_a_busy_check_that_cannot_finish_in_time_fails_closed_and_frees_the_lock(root, monkeypatch):
+def test_a_busy_check_that_cannot_finish_in_time_keeps_the_target_and_frees_the_lock(root, monkeypatch):
     """The scan stats files of arbitrary processes, which a dead network mount can block: it runs in a child
     with a deadline. (A hung mount cannot be made without privileges; a deadline nothing can meet is real.)"""
     target = local_target(root)
@@ -806,8 +806,8 @@ def test_a_busy_check_that_cannot_finish_in_time_fails_closed_and_frees_the_lock
     started = time.monotonic()
     held = sweep(root)
     assert time.monotonic() - started < 30
-    assert held["removed"] == [] and target.exists() and held["aborted"], held
-    assert any("busy check timed out" in error for error in held["errors"]), held
+    assert held["removed"] == [] and target.exists() and not held["aborted"], held  # this target only is kept
+    assert any("busy check timed out" in warning for warning in held["warnings"]), held
     monkeypatch.delenv("HERDR_BUSY_CHECK_SECONDS")
     assert sweep(root)["removed"] == [str(target)]  # the lock was released, the next sweep is fine
 
