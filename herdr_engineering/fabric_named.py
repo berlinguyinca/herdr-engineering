@@ -12,6 +12,7 @@ guessed: the older lease keeps the name and the newer one falls back to its auto
 """
 from __future__ import annotations
 
+import errno
 import logging
 import re
 import socket
@@ -24,6 +25,41 @@ log = logging.getLogger("herdr.fabric.named")
 
 _LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,40}[a-z0-9])?$")
 _RESERVED = frozenset({"www", "api", "gateway", "control", "admin", "localhost"})
+
+
+# accept() errors that mean "this listener is gone": the loop must end. Everything else (EMFILE, ENFILE, ENOBUFS,
+# ENOMEM, ECONNABORTED, EPROTO, EPERM from a firewall, ...) is transient: the listener is fine, so keep it served.
+_LISTENER_GONE = frozenset({errno.EBADF, errno.EINVAL, errno.ENOTSOCK})
+_BACKOFF_START, _BACKOFF_MAX, _LOG_EVERY = 0.1, 1.0, 30.0
+
+
+class AcceptBackoff:
+    """Per-loop policy for accept() failures: fatal for a closed listener, else back off and warn (rate-limited)."""
+
+    def __init__(self, what: str) -> None:
+        self.what = what
+        self._delay = _BACKOFF_START
+        self._last_log = float("-inf")
+        self._suppressed = 0
+
+    def fatal(self, exc: OSError) -> bool:
+        return exc.errno in _LISTENER_GONE
+
+    def delay_for(self, exc: OSError) -> float:
+        """Seconds to wait before the next accept(); logs at most once per _LOG_EVERY seconds."""
+        now = time.monotonic()
+        if now - self._last_log >= _LOG_EVERY:
+            extra = f" ({self._suppressed} more since the last warning)" if self._suppressed else ""
+            log.warning("accept failed on %s, backing off: %s%s", self.what, exc, extra)
+            self._last_log, self._suppressed = now, 0
+        else:
+            self._suppressed += 1
+        delay = self._delay
+        self._delay = min(self._delay * 2, _BACKOFF_MAX)
+        return delay
+
+    def ok(self) -> None:
+        self._delay = _BACKOFF_START
 
 
 def _slug(text: str) -> str:
@@ -134,11 +170,26 @@ class NamedFront:
         self.port = port
         self.bind_hosts = [h for h in (bind_hosts or router._bind_hosts) if h]
         self._listeners: list[socket.socket] = []
+        self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
+        self._names_key: tuple | None = None
+        self._names_val: dict[str, str] = {}
 
     def name_of(self, lease_id: str) -> str | None:
-        names = assign_names(self.leases_fn())
-        return names.get(lease_id)
+        return self._names(self.leases_fn()).get(lease_id)
+
+    def _names(self, leases: list[dict[str, Any]]) -> dict[str, str]:
+        """assign_names, memoised on the fields it reads (the lease set rarely changes between connections)."""
+        key = tuple((str(lz.get("id")), lz.get("created_at"), lz.get("label"), lz.get("state"),
+                     lz.get("origin_port"), lz.get("target_machine_id"), lz.get("target_port"),
+                     (lz.get("target") or {}).get("machine_id"), (lz.get("target") or {}).get("port"))
+                    for lz in leases)
+        cached_key, cached = self._names_key, self._names_val
+        if key == cached_key:
+            return cached
+        names = assign_names(leases)
+        self._names_key, self._names_val = key, names
+        return names
 
     def host_of(self, lease_id: str) -> str | None:
         n = self.name_of(lease_id)
@@ -158,10 +209,15 @@ class NamedFront:
         if "." in label:
             return None
         leases = [lz for lz in self.leases_fn() if lz.get("state") in (None, "active")]
+        names = self._names(leases)
         for lz in leases:
-            if assign_names(leases).get(str(lz["id"])) == label:
+            if names.get(str(lz["id"])) == label:
                 return lz
         return None
+
+    def healthy(self) -> bool:
+        """False once any accept thread has died: a bound port nobody accepts on is an outage, not a degraded mode."""
+        return self._stop.is_set() or all(t.is_alive() for t in self._threads)
 
     def start(self) -> None:
         for host in self.bind_hosts:
@@ -176,7 +232,9 @@ class NamedFront:
                 self.stop()
                 raise OSError(f"named front cannot bind {host}:{self.port}: {exc}") from exc
             self._listeners.append(s)
-            threading.Thread(target=self._accept, args=(s,), daemon=True, name=f"named-front-{host}").start()
+            t = threading.Thread(target=self._accept, args=(s, host), daemon=True, name=f"named-front-{host}")
+            self._threads.append(t)
+            t.start()
 
     def stop(self) -> None:
         self._stop.set()
@@ -187,14 +245,19 @@ class NamedFront:
                 pass
         self._listeners = []
 
-    def _accept(self, listener: socket.socket) -> None:
+    def _accept(self, listener: socket.socket, host: str = "") -> None:
+        policy = AcceptBackoff(f"named front {host}:{self.port}")
         while not self._stop.is_set():
             try:
                 client, _ = listener.accept()
             except TimeoutError:
                 continue
-            except OSError:
-                break
+            except OSError as exc:
+                if policy.fatal(exc):
+                    break
+                self._stop.wait(policy.delay_for(exc))
+                continue
+            policy.ok()
             threading.Thread(target=self._handle, args=(client,), daemon=True).start()
 
     def _handle(self, client: socket.socket) -> None:

@@ -47,11 +47,13 @@ phase() {   # phase NAME BUDGET_SECONDS COMMAND...
   return "$rc"
 }
 
-# Woodpecker checks out the PR head commit, not a merge with main, so this run measures the branch as forked. If main has since changed
+# Woodpecker checks out the PR head commit, not a merge with main; on a pull request scripts/ci/integrate-main.sh merges main in first, so
+# there this notice is moot and stays silent. On a manual run of a stale branch, the run measures the branch as forked. If main has since changed
 # what runs here (a fix to the harness), a red or slow run may only mean "stale branch": say so, and say which files (merge main into
 # the branch and push to re-run; Woodpecker does not re-run a pipeline when only main moves). Non-fatal; skipped when history is short.
 stale_base_notice() {
   local fork files
+  git merge-base --is-ancestor refs/remotes/origin/main HEAD 2>/dev/null && return 0   # main already merged in (integrate-main.sh)
   git fetch -q --no-tags --depth=200 origin main 2>/dev/null || return 0
   fork=$(git merge-base HEAD FETCH_HEAD 2>/dev/null) || return 0
   files=$(git diff --name-only "$fork" FETCH_HEAD -- .woodpecker scripts/ci tests/playwright/ui-gates-lib.mjs tests/visual package.json 2>/dev/null) || return 0

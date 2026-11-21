@@ -73,6 +73,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("arguments", nargs=argparse.REMAINDER)
     p.set_defaults(func=_cmd_cargo_host)
 
+    p = sub.add_parser("build-hygiene", help="install or inspect default disk hygiene (cleanup job, cargo wrapper)")
+    p.add_argument("arguments", nargs=argparse.REMAINDER)
+    p.set_defaults(func=_cmd_build_hygiene)
+
     from .open_client import register_parser
     register_parser(sub)
 
@@ -3514,6 +3518,11 @@ def _cmd_dev_gateway(args) -> int:
     return 0
 
 
+def _cmd_build_hygiene(args) -> int:
+    from .build_hygiene import main
+    return main(args.arguments)
+
+
 def _cmd_cargo_host(args) -> int:
     from .cargo_host import main
     return main(args.arguments)
@@ -3530,7 +3539,7 @@ def _cmd_build_coordinate(args) -> int:
     from .build_coord import BuildGate, _default_slots, _default_state_dir, run_gated
     from .build_metrics import summarize
 
-    cache_cfg = _build_cache_config()
+    cache_cfg, cleanup_policy = _build_cache_config_and_policy()
     slots = args.slots if args.slots is not None else effective_slots(
         cache_cfg, _default_slots(), _default_state_dir())
     if getattr(args, "status", False):
@@ -3573,11 +3582,40 @@ def _cmd_build_coordinate(args) -> int:
     if getattr(args, "trace_session", None) and trace is None:
         print("build-coordinate: --trace-session ignored (not a plain non-secret id)",
               file=sys.stderr)
+    if cmd and _guarded_build(cmd):
+        from .cargo_host import _disk_guard_refusal
+        probe = Path.cwd()
+        if os.path.basename(cmd[0]) == "cargo":  # measure where cargo's output really lands
+            from .cargo_target_storage import target_override
+            where = target_override(cmd[1:], os.environ, probe)
+            probe = where if isinstance(where, Path) else probe
+        refused = _disk_guard_refusal(probe, cleanup_policy)
+        if refused is not None:
+            return refused
     return run_gated(cmd, slots=slots, max_load=args.max_load,
                      wait_seconds=args.wait, json_out=args.json,
                      bypass_on_timeout=args.bypass_on_timeout,
                      record=getattr(args, "record", False),
                      cache_config=cache_cfg, trace=trace)
+
+
+# Commands whose output size the disk-budget guard protects here. Cargo is guarded here only when the
+# cargo on PATH is not the managed wrapper: the wrapper guards it against the filesystem its target really
+# lands on, also under build-coordinate. Scripts are never refused.
+_GUARDED_BUILD_COMMANDS = frozenset({"rustc", "make", "cmake", "ninja", "tsc"})
+_GUARDED_GO_SUBCOMMANDS = frozenset({"build", "install", "generate"})
+
+
+def _guarded_build(cmd: list[str]) -> bool:
+    name = os.path.basename(cmd[0])
+    if name == "cargo":
+        from .cargo_host import BUILD_SUBCOMMANDS, cargo_subcommand, path_cargo_is_wrapper
+        subcommand = cargo_subcommand(cmd[1:])
+        return (subcommand in BUILD_SUBCOMMANDS and subcommand != "clean"
+                and not path_cargo_is_wrapper(cmd[0]))
+    if name == "go":
+        return len(cmd) > 1 and cmd[1] in _GUARDED_GO_SUBCOMMANDS
+    return name in _GUARDED_BUILD_COMMANDS
 
 
 def _is_gate_command(cmd: list[str]) -> bool:
@@ -3588,20 +3626,31 @@ def _is_gate_command(cmd: list[str]) -> bool:
         and cmd[1] == "build-coordinate")
 
 
-def _build_cache_config():
-    """Effective ``fabric_build_cache`` config, or None when absent/disabled/invalid.
+def _build_cache_config_and_policy():
+    """(effective ``fabric_build_cache`` config or None, ``build_cleanup`` policy), from one config load.
 
-    A config problem must never block a build: it just runs uncached.
+    A config problem must never block a build: the cache config is then None (it runs uncached) and
+    the policy falls back to the non-strict load, so the disk guard still applies.
     """
     from .build_cache_config import validate
     from .config import load_config
     try:
-        section = load_config(strict_build_cache=True).get("fabric_build_cache")
+        loaded = load_config(strict_build_cache=True)
+        section = loaded.get("fabric_build_cache")
         cfg = validate(section) if section else None
     except Exception as exc:  # noqa: BLE001
         print(f"build-coordinate: build cache config ignored: {exc}", file=sys.stderr)
-        return None
-    return cfg if cfg is not None and cfg.enabled else None
+        try:
+            loaded = load_config()
+        except Exception:  # noqa: BLE001
+            loaded = {}
+        return None, loaded.get("build_cleanup", {})
+    return (cfg if cfg is not None and cfg.enabled else None), loaded.get("build_cleanup", {})
+
+
+def _build_cache_config():
+    """Effective ``fabric_build_cache`` config, or None when absent/disabled/invalid."""
+    return _build_cache_config_and_policy()[0]
 
 
 def _cmd_build_cache_inventory(args) -> int:

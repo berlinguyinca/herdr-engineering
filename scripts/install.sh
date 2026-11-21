@@ -49,6 +49,10 @@
 #      nightly; systemd user timers on Linux, LaunchAgents on macOS) via
 #      scripts/install-disk-hygiene.sh; opt out with --no-disk-hygiene or
 #      HERDR_INSTALL_DISK_HYGIENE=0. Non-fatal. See docs/disk-hygiene.md.
+#   (default on) step 7g installs the build-cleanup timer (systemd user unit on Linux,
+#      launchd agent on macOS) and the managed cargo launcher via
+#      `herdr-eng build-hygiene install`; opt out with --no-build-hygiene or
+#      HERDR_INSTALL_BUILD_HYGIENE=0 (or build_cleanup.enabled: false in config). Non-fatal.
 #
 # Re-running produces no unexpected changes. No secrets are written anywhere.
 #
@@ -66,17 +70,19 @@ WITH_SCREENWRIGHT="${HERDR_INSTALL_SCREENWRIGHT:-1}"
 # installed machine. Opt out with --no-handoff-autopilot (or the runtime env var).
 HANDOFF_AUTOPILOT="${HERDR_INSTALL_HANDOFF_AUTOPILOT:-1}"
 WITH_DISK_HYGIENE="${HERDR_INSTALL_DISK_HYGIENE:-1}"
+WITH_BUILD_HYGIENE="${HERDR_INSTALL_BUILD_HYGIENE:-1}"
 for arg in "$@"; do
   case "$arg" in
     --no-workflow-hooks) WITH_WORKFLOW_HOOKS=0 ;;
     --no-subagent-hooks) WITH_SUBAGENT_HOOKS=0 ;;
     --no-screenwright) WITH_SCREENWRIGHT=0 ;;
+    --no-build-hygiene) WITH_BUILD_HYGIENE=0 ;;
     --no-disk-hygiene) WITH_DISK_HYGIENE=0 ;;
     --with-memory) WITH_MEMORY=1 ;;
     --no-build-cache-tools) BUILD_CACHE_TOOLS=0 ;;
     --build-cache-tools-only) BUILD_CACHE_TOOLS_ONLY=1 ;;
     --no-handoff-autopilot) HANDOFF_AUTOPILOT=0 ;;
-    -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
     *) printf 'unknown option: %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
@@ -407,6 +413,14 @@ if [ "$WITH_DISK_HYGIENE" = "1" ]; then
   HERDR_ENG="$VENV/bin/herdr-eng" bash "$REPO_ROOT/scripts/install-disk-hygiene.sh" install || warn "disk-hygiene timers not installed (see above); the rest of the install is unaffected"
 else
   printf '\n  (disk-hygiene timers not installed; HERDR_INSTALL_DISK_HYGIENE=0 or --no-disk-hygiene)\n'
+fi
+
+# --- 7g. build hygiene (default on): build-cleanup timer + managed cargo launcher -------
+if [ "$WITH_BUILD_HYGIENE" = "1" ]; then
+  step "7g/8 build hygiene (build-cleanup timer, managed cargo launcher; non-fatal)"
+  "$PY" -m herdr_engineering.cli build-hygiene install || warn "build hygiene not installed (see above); opt out with build_cleanup.enabled: false"
+else
+  printf '\n  (build hygiene not installed; HERDR_INSTALL_BUILD_HYGIENE=0 or --no-build-hygiene)\n'
 fi
 
 # --- 8. doctor ------------------------------------------------------------

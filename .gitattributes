@@ -2,3 +2,6 @@
 # Screenshot baselines (docs/operations/ui-gates.md, "Baseline policy"): binary, never diffed as text or normalised; total size is capped by the gate.
 docs/assets/screenshots/*.png binary
 tests/playwright/fonts/*.ttf binary
+
+# CHANGELOG bullets collide on every concurrent PR; union keeps both sides. Applies to local merges (including scripts/ci/integrate-main.sh), not GitHub's server-side merge button.
+CHANGELOG.md merge=union
