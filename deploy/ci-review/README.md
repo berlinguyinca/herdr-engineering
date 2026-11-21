@@ -1,6 +1,6 @@
 # ci-review: the `Independent AI review` status
 
-> As of 2026-11-13 the required status is `Opus agent review`, posted by a Claude session; this script's status is advisory. See `docs/operations/independent-ai-review.md`.
+> As of 2026-11-13 the required status is `Opus agent review`, posted by `always-on-review.py` (per PR through Woodpecker, `.woodpecker/opus-review.yaml` and `scripts/ci/opus-review.sh`, with the timer as an hourly backup sweep); this script's status is advisory. See `docs/operations/independent-ai-review.md` and `docs/operations/per-pr-opus-review.md`.
 
 The repository ruleset used to require a commit status named exactly `Independent AI review`. `ai-review.py` posts it.
 Before this script, the operator posted it by hand. Operator guide: `docs/operations/independent-ai-review.md`.
@@ -173,6 +173,15 @@ Backends (`tiers.<t>.backend`, settings under `backends.<name>`):
 - `reviews.jsonl`: each completed review line has `downgraded`, `passes` (name, duration_s, cost_usd, turns when the backend reports them), `checked_items`, and `findings`: up to 20 of `file, line, severity, category, why, evidence, how_it_fails`, each text field cut at 600 chars and passed through `redact()`.
 - Replay: `always-on-review.py replay --corpus DIR --tier tier1|tier2 --config YAML [--limit N] [--out FILE]` checks out each case's head in a detached worktree, runs the tier read-only and posts nothing (no gh client is built; posting functions refuse inside replay). The corpus is one JSON per case: `{repo, pr, head_sha, base_sha?, source: opus|human|revert|follow-up-fix, notes, ground_truth: [{id, file, line|null, category, summary, severity, confirmed?}], known_false_claims?}`. Scoring: FOUND (same file and line within 10, or two shared keywords), PARTIAL (file only), MISSED; a blocking finding matching no ground truth is FALSE_BLOCKER_CANDIDATE (unconfirmed), one matching a known false claim is FALSE_BLOCKER. The report gives per-case and aggregate recall, false-blocker rate, per-category recall, cost and duration. `replay compare a.json b.json` compares two runs.
 - Intended corpus: thousands of PRs across the org's repos. Replay is resumable (cases already scored in `--out` are skipped; failed and skipped ones are retried, and a case whose head or ground truth changed is scored again) and runs one case at a time (a lock refuses a second replay). `corpus build --repo OWNER/NAME --since YYYY-MM-DD --out DIR` derives cases from merged PRs with read-only `gh` calls (reverts, follow-up fixes, review comments). Only thread-root comments by humans, or by logins listed in `replay.reviewers` (pass `--config`), and not by the PR author, count; the case is pinned to the commit most comments were made on (`original_commit_id`) and only those comments keep their line; its ground truth is `confirmed: false` and is not scored until confirmed.
+
+### One command, every repo
+
+`review --repo OWNER/NAME` works for any repository the `gh` login can read. The worktree comes from the clone that
+belongs to that repo: a `clones: [{repo, path}]` entry, else `clone:` if its `origin` is that repo (or is not a
+github.com URL, as before), else a bare clone the script creates itself under `state_dir/clones/OWNER__NAME.git` from
+`clone_url` (default `https://github.com/{repo}.git`, using the `gh auth git-credential` helper). Locks, state, cooldowns
+and `reviews.jsonl` are keyed by `OWNER/NAME#N`. Enrollment (`repos:`, the backfill cutoff) only matters to `poll`; a
+`review` of a named PR needs none.
 
 ### Choosing a pi model or alias
 

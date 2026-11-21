@@ -7,7 +7,7 @@
 # It is DRY-RUN until the config says `post: true`: this ExecStart passes --post, so editing the config is the switch.
 # Remove --post here to keep it dry no matter what the config says.
 [Unit]
-Description=Always-on review of open pull requests (Open-weight pre-review, Opus agent review)
+Description=Backup sweep: always-on review of open pull request heads the per-PR pipeline missed (Open-weight pre-review, Opus agent review)
 After=network-online.target
 Wants=network-online.target
 

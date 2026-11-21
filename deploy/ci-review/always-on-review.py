@@ -38,6 +38,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -85,7 +86,10 @@ DEFAULTS: dict = {
                                         # are left alone; True restores reviewing every open PR of a newly listed repo
     "max_comments_per_hour": None,      # None = no cap; else PR comments this script posts per rolling hour
     "post": False,                      # with the --post flag, the second of the two keys that allow any posting
-    "clone": "",                        # a clone the claude/pi backends create read-only worktrees from
+    "clone": "",                        # a clone the claude/pi backends create read-only worktrees from (for the repo its
+                                        # origin names; any other repo gets `clones` or a managed clone, see clone_for_review)
+    "clones": [],                       # [{repo: OWNER/NAME, path: DIR}]: the clone to use for that repo
+    "clone_url": "https://github.com/{repo}.git",   # where a managed bare clone (state_dir/clones/) is made from
     "gates": {"wait_for_green": False,  # true: tier 2 waits until the gates below are green on the head; false: reviews at once
               "required": [], "when_present": []},   # with wait_for_green: required must be success; when_present only if it exists
     "poll": {"max_per_run": 5, "pending_stale_minutes": 120, "cooldown_failures": 3, "cooldown_minutes": 60},
@@ -245,6 +249,14 @@ def _check_passes_and_replay(cfg: dict) -> None:
         names.append(x["name"])
     if len(set(names)) != len(names):
         raise Refused("config: tiers.tier2.passes names must differ")
+    cl = cfg["clones"]
+    if not isinstance(cl, list) or any(
+            not isinstance(c, dict) or sorted(c) != ["path", "repo"] or not isinstance(c["repo"], str)
+            or not ai.REPO_RE.fullmatch(c["repo"]) or not isinstance(c["path"], str) or not c["path"] for c in cl):
+        raise Refused("config: clones must be a list of {repo: OWNER/NAME, path: DIR}")
+    cu = cfg["clone_url"]
+    if not isinstance(cu, str) or cu.count("{repo}") != 1 or any(ch in cu for ch in " \t\n\r") or "@" in cu.split("{repo}")[0]:
+        raise Refused("config: clone_url must be a URL with exactly one {repo} and no credentials")
     rv = cfg["replay"]["reviewers"]
     if not isinstance(rv, list) or not all(isinstance(x, str) and x for x in rv):
         raise Refused("config: replay.reviewers must be a list of logins")
@@ -1405,7 +1417,7 @@ def _run_tier1(cfg, gh, pr, repo, n, sha, tier, state, key, started, post_on) ->
         raise ReviewFailed("the diff is empty")
     req = ReviewRequest(repo, n, sha, str(pr.get("title", "")), str(pr.get("body") or ""), "", diff or "",
                         sorted(f.path for f in files))
-    with Worktree(cfg, n, sha, str(pr.get("baseRefName", "main"))) as wt:
+    with Worktree(cfg, n, sha, str(pr.get("baseRefName", "main")), repo=repo) as wt:
         if diff is None:
             req.diff = local_diff(wt)
             req.files = sorted(f.path for f in ai.parse_diff(req.diff))
@@ -1598,8 +1610,13 @@ def make_backend(cfg: dict, tier: dict) -> Backend:
 
 # ---------------- git worktree ----------------
 
-def git(args: list[str], cwd: Path | str) -> str:
-    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, timeout=300, env=child_env())
+def git(args: list[str], cwd: Path | str, auth: bool = False) -> str:
+    """Run git with the scrubbed environment. `auth=True` (only for the fetch of a PR's refs, never for the reviewer)
+    also passes the GitHub token the credential helper `gh auth git-credential` needs on a host without a gh login."""
+    env = child_env()
+    if auth:
+        env.update({k: os.environ[k] for k in ("GH_TOKEN", "GITHUB_TOKEN") if k in os.environ})
+    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, timeout=300, env=env)
     if p.returncode != 0:
         raise ReviewFailed(f"git {args[0]} failed: {ai.redact(p.stderr.decode('utf-8', 'replace')[-200:])}")
     return p.stdout.decode("utf-8", "replace").strip()
@@ -1621,18 +1638,72 @@ def is_git_clone(path: Path) -> bool:
     return git_dir == root if bare else (root / ".git").exists()
 
 
+GITHUB_ORIGIN_RE = re.compile(r"(?:https?://(?:[^/@]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)"
+                              r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?")
+
+
+def origin_repo(clone: Path) -> str:
+    """OWNER/NAME of the GitHub repository the clone's `origin` names, read raw from its config (url rewrites such as
+    insteadOf are not applied), or "" when origin is missing or is not a github.com URL."""
+    p = subprocess.run(["git", "config", "--get", "remote.origin.url"], cwd=clone, capture_output=True, timeout=60,
+                       env=child_env())
+    m = GITHUB_ORIGIN_RE.fullmatch(p.stdout.decode("utf-8", "replace").strip()) if p.returncode == 0 else None
+    return m.group(1) if m else ""
+
+
+def managed_clone(cfg: dict, repo: str) -> Path:
+    """The bare clone this script keeps for `repo` under state_dir/clones/, created on first use from `clone_url` with
+    the gh credential helper (so a private repo works with the host's gh login or GH_TOKEN). Created under a lock, so a
+    timer sweep and a CI-triggered review never both clone it."""
+    root = ai.expand(cfg["state_dir"]) / "clones"
+    path = root / (repo.replace("/", "__") + ".git")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(root / (path.name + ".lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        if not is_git_clone(path):
+            shutil.rmtree(path, ignore_errors=True)
+            git(["clone", "--bare", "--quiet", "--no-tags", "-c", "credential.helper=!gh auth git-credential",
+                 cfg["clone_url"].replace("{repo}", repo), str(path)], root, auth=True)
+            git(["config", "credential.helper", "!gh auth git-credential"], path)
+    return path
+
+
+def clone_for_review(cfg: dict, repo: str) -> Path:
+    """The clone a review of `repo` takes its worktree from, so one installed command and one config serve every repo:
+    a `clones` entry for the repo; else `clone` unless its origin names a different GitHub repo (an origin that is not
+    a github.com URL, such as a local path, is trusted as before); else a managed bare clone of the repo."""
+    for c in cfg["clones"]:
+        if c["repo"].lower() == repo.lower():
+            path = ai.expand(c["path"])
+            if not is_git_clone(path):
+                raise Refused(f"config: the clones entry for {repo} is not a git clone")
+            return path
+    if cfg["clone"]:
+        path = ai.expand(cfg["clone"])
+        if not is_git_clone(path):
+            raise Refused("config: clone must name a git clone, bare or not (the claude and pi backends need one)")
+        named = origin_repo(path)
+        if not named or named.lower() == repo.lower():
+            return path
+    return managed_clone(cfg, repo)
+
+
 class Worktree:
     """A fresh detached worktree of exactly the pinned head, read-only fetched, removed afterwards."""
 
-    def __init__(self, cfg: dict, pr: int, sha: str, base_ref: str, base_sha: str = "", replay: bool = False):
+    def __init__(self, cfg: dict, pr: int, sha: str, base_ref: str, base_sha: str = "", replay: bool = False,
+                 repo: str = ""):
         """replay=True is for the replay harness: the head need only be reachable from refs/pull/N/head (a PR's older
         head, not its latest), `base_sha` (if given) fixes the base, and the fetched refs have their own names."""
-        clone = cfg["clone"]
-        if not clone or not is_git_clone(ai.expand(clone)):
-            raise Refused("config: clone must name a git clone, bare or not (the claude and pi backends need one)")
+        if repo:                                        # a live review: the clone that belongs to this repository
+            clone = clone_for_review(cfg, repo)
+        else:                                           # replay resolves its clone itself (clone_for)
+            clone = cfg["clone"]
+            if not clone or not is_git_clone(ai.expand(clone)):
+                raise Refused("config: clone must name a git clone, bare or not (the claude and pi backends need one)")
         if not BASE_RE.fullmatch(base_ref):
             raise ReviewFailed("the PR's base ref is not a plain branch name")
-        self.clone, self.pr, self.sha, self.base_ref = ai.expand(clone), pr, sha, base_ref
+        self.clone, self.pr, self.sha, self.base_ref = ai.expand(str(clone)), pr, sha, base_ref
         self.path = ai.expand(cfg["state_dir"]) / "worktrees" / f"pr{pr}-{sha[:12]}-{secrets.token_hex(3)}"
         self.base_sha, self.replay, self.want_base = "", replay, base_sha
         self.pr_ref, self.base_ref_name = f"refs/herdr-review/{'replay-' if replay else ''}pr-{pr}", \
@@ -1652,20 +1723,20 @@ class Worktree:
     def _enter(self) -> Worktree:
         ref = self.pr_ref
         if self.replay:
-            git(["fetch", "--no-tags", "--quiet", "origin", f"+refs/pull/{self.pr}/head:{ref}"], self.clone)
+            git(["fetch", "--no-tags", "--quiet", "origin", f"+refs/pull/{self.pr}/head:{ref}"], self.clone, auth=True)
             git(["cat-file", "-e", f"{self.sha}^{{commit}}"], self.clone)          # an older head of the PR is fine
             if self.want_base:
                 git(["cat-file", "-e", f"{self.want_base}^{{commit}}"], self.clone)
                 self.base_sha = git(["merge-base", self.sha, self.want_base], self.clone)
             else:
                 git(["fetch", "--no-tags", "--quiet", "origin", f"+refs/heads/{self.base_ref}:{self.base_ref_name}"],
-                    self.clone)
+                    self.clone, auth=True)
                 self.base_sha = git(["merge-base", self.sha, self.base_ref_name], self.clone)
             if self.base_sha == self.sha:
                 raise ReviewFailed("the case has an empty diff (the head is already in the base); give base_sha")
         else:
             git(["fetch", "--no-tags", "--quiet", "origin", f"+refs/pull/{self.pr}/head:{ref}",
-                 f"+refs/heads/{self.base_ref}:{self.base_ref_name}"], self.clone)
+                 f"+refs/heads/{self.base_ref}:{self.base_ref_name}"], self.clone, auth=True)
             if git(["rev-parse", ref], self.clone) != self.sha:
                 raise HeadMoved("the fetched PR head is not the pinned SHA")
             self.base_sha = git(["merge-base", self.sha, self.base_ref_name], self.clone)
@@ -2035,7 +2106,7 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
         req.candidates = tuple(t1["candidates"])
     codex: tuple[Verdict, dict, str, int] | None = None
     if backend.needs_worktree or diff is None or risky:
-        with Worktree(cfg, n, sha, str(pr.get("baseRefName", "main"))) as wt:
+        with Worktree(cfg, n, sha, str(pr.get("baseRefName", "main")), repo=repo) as wt:
             if diff is None:
                 req.diff = local_diff(wt)
                 files = ai.parse_diff(req.diff)

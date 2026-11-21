@@ -2,18 +2,23 @@
 
 ## Current requirement (2026-11-13): `Opus agent review`
 
-Ruleset 25691548 on the default branch now requires a commit status named exactly `Opus agent review` (no strict
-flag). A Claude session posts it only after an Opus subagent has reviewed that exact head:
+Ruleset 25691548 on the default branch now requires a commit status named exactly `Opus agent review`. The review
+automation posts it, on the exact head SHA it reviewed, and nothing else should: `always-on-review.py review ... --post`
+runs `claude` with the Opus model against that head and posts `pending`, then `success` or `failure`.
 
-```bash
-gh api repos/berlinguyinca/herdr-engineering/statuses/<full head sha> \
-    -f state=success -f context="Opus agent review" -f description="<what was reviewed>"
-```
+- **Per PR, through Woodpecker (the normal path).** `.woodpecker/opus-review.yaml` runs the review for every
+  `pull_request` event (opened, synchronized, reopened) of any enrolled repo. Setup, the YAML other repos copy and
+  fork safety: `docs/operations/per-pr-opus-review.md`.
+- **Hourly backup sweep.** `deploy/ci-review/herdr-always-on-review.{service,timer}` polls open PRs once an hour and
+  reviews any head that has no terminal status. It only catches a missed webhook or a lost pipeline; it is not the
+  trigger. A head with a terminal status is never reviewed twice, so the two paths do not duplicate work.
+
+Never post the status by hand: a hand-posted `success` is a review nobody did.
 
 - The ruleset is still named "Independent AI review" in the GitHub UI, although the context it requires is now `Opus agent review`.
-- Anyone with push access can post the `Opus agent review` status, so it is a convention, not an enforced identity.
-- If a push changes the head, re-review the fix commit with an Opus subagent. Any push makes the status stale, and
-  it must be re-posted on the new head.
+- Anyone with push access can post a commit status, so the identity of the poster is a convention, not enforced. The
+  token that the automation uses is the `opus_review_github_token` Woodpecker secret.
+- Any push moves the head and makes the status stale. The new `synchronize` event starts a review of the new head.
 - The `Independent AI review` check below (`deploy/ci-review/ai-review.py`, a deepseek or qwen model) is **no
   longer required**. The script and timer remain, but their status is advisory.
 - Trade-off: the old rule that the reviewer be a different model family from the author no longer holds, because
@@ -51,7 +56,7 @@ Requirements:
 To see which models can be used, list them with `GET {baseUrl}/models`, and set `reviewer.model` to one of the
 exact ids.
 
-For unattended runs, install the example user units `deploy/ci-review/herdr-ai-review.{service,timer}`
+For unattended runs of this advisory script, install the example user units `deploy/ci-review/herdr-ai-review.{service,timer}`
 (`systemctl --user enable --now herdr-ai-review.timer`, and `loginctl enable-linger`). `poll` is idempotent: a
 head that already has a terminal status is not reviewed again. Re-run a head by hand with `review`; it posts a
 new status and updates the existing comment.
