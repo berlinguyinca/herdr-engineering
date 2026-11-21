@@ -47,20 +47,26 @@ class GcTimer:
 
 
 class StallWatch(threading.Thread):
-    def __init__(self, stall: float = STALL_SECONDS, tick: float = TICK_SECONDS):
+    def __init__(self, stall: float = STALL_SECONDS, tick: float = TICK_SECONDS,
+                 clock=time.monotonic):
         super().__init__(name="herdr-stall-watch", daemon=True)
-        self.stall, self.tick = stall, tick
+        self.stall, self.tick, self._clock = stall, tick, clock
         self._stop_event = threading.Event()
+        # What the watch actually measured, in seconds of lateness, one entry per pause it reported. The web
+        # process can surface it and a test can assert on it: "did the watchdog see a pause" is bookkeeping,
+        # not something to infer from how long a helper thread happened to sleep on a loaded host.
+        self.pauses: list[float] = []
 
     def stop(self) -> None:
         self._stop_event.set()
 
     def run(self) -> None:
         while not self._stop_event.is_set():
-            before = time.monotonic()
+            before = self._clock()
             self._stop_event.wait(self.tick)
-            late = time.monotonic() - before - self.tick
+            late = self._clock() - before - self.tick
             if late >= self.stall and not self._stop_event.is_set():
+                self.pauses.append(late)
                 log.warning("process paused %.1fs (tick %.2fs); %s; threads on resume:\n%s",
                             late + self.tick, self.tick, gc_state(), self.threads())
 
