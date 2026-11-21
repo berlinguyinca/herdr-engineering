@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from herdr_engineering.ci_report_relay import Outcomes, Relay, read_source, validate_bundle
-from herdr_engineering.control_plane.ci_monitor import REMOVED_RUN_ERRORS
+from herdr_engineering.control_plane.ci_monitor import REMOVED_RUN_ERRORS, RUN_REMOVED_ERROR
 
 REVISION = 'a' * 40
 NAME = f'42-{REVISION}-hive-slurm.json'
@@ -368,15 +368,12 @@ def test_main_logs_the_reason_when_the_whole_run_fails(tmp_path, capsys):
 
 
 # Provider run removed/pruned: a permanent skip, distinct from mismatch and transient errors.
-REMOVED_TEXT = 'This Woodpecker resource is unavailable or has been removed.'
-REMOVED = {'available': False, 'status': 'unavailable', 'error': REMOVED_TEXT}
-NOT_FOUND = {'available': False, 'error': 'Pipeline was not found.'}
+REMOVED = {'available': False, 'status': 'unavailable', 'error': RUN_REMOVED_ERROR}
 
 
-@pytest.mark.parametrize('answer', [REMOVED, NOT_FOUND])
-def test_removed_run_is_skipped_checkpointed_and_not_retried(tmp_path, capsys, answer):
+def test_removed_run_is_skipped_checkpointed_and_not_retried(tmp_path, capsys):
     source = _source_with_one_bundle(tmp_path)
-    with control_plane(pipeline=answer) as (url, received):
+    with control_plane(pipeline=REMOVED) as (url, received):
         relay = Relay(url, tmp_path / 'state', allow_open=True)
         assert relay.process_source(str(source)) == Outcomes(0, 0, 1)
         assert received == []
@@ -392,12 +389,69 @@ def test_removed_run_is_skipped_checkpointed_and_not_retried(tmp_path, capsys, a
         assert again.process_source(str(source)) == Outcomes(0, 0, 0)
 
 
-def test_the_relay_recognises_the_control_planes_real_removed_run_texts():
-    from herdr_engineering.ci import CIProviderError
-    from herdr_engineering.control_plane.ci_monitor import _error
+class _WoodpeckerStandIn:
+    """Provider transport that answers by path with a real HTTP status, as urllib raises it."""
 
-    assert _error(CIProviderError('not_found', 404))[1] in REMOVED_RUN_ERRORS
-    assert REMOVED_TEXT in REMOVED_RUN_ERRORS and NOT_FOUND['error'] in REMOVED_RUN_ERRORS
+    def __init__(self, statuses):
+        self.statuses = statuses
+
+    def urlopen(self, req, timeout=10):
+        import io
+        import urllib.error
+        import urllib.parse
+
+        path = urllib.parse.urlparse(req.full_url).path
+        status = self.statuses.get(path, 404)
+        if status != 200:
+            raise urllib.error.HTTPError(req.full_url, status, 'x', {}, io.BytesIO(b''))
+        body = {'number': 42, 'commit': REVISION, 'branch': 'main'} if path.endswith('/42') else {'id': 116}
+        return io.BytesIO(json.dumps(body).encode())
+
+
+def _detail_as_the_control_plane_answers(statuses):
+    from herdr_engineering.ci import WoodpeckerProvider
+    from herdr_engineering.control_plane.ci_monitor import CIMonitor
+
+    provider = WoodpeckerProvider(base_url='https://ci.example', token='tok', client=_WoodpeckerStandIn(statuses))
+    return CIMonitor(provider_factory=lambda: provider).detail('116', 42)
+
+
+def test_run_level_404_with_a_reachable_repository_is_the_removed_run_answer():
+    answer = _detail_as_the_control_plane_answers({'/api/repos/116': 200})
+    assert answer['available'] is False and answer['error'] in REMOVED_RUN_ERRORS
+
+
+@pytest.mark.parametrize('statuses', [
+    {},                              # repository 404 too: deleted, re-created, wrong base URL or proxy path
+    {'/api/repos/116': 401},         # the token is rejected
+    {'/api/repos/116': 403},         # the token lost access
+    {'/api/repos/116': 500},         # the repository cannot be confirmed
+])
+def test_repo_level_auth_or_endpoint_404_is_not_the_removed_run_answer(statuses):
+    answer = _detail_as_the_control_plane_answers(statuses)
+    assert answer['available'] is False and answer['error'] not in REMOVED_RUN_ERRORS
+
+
+def test_repository_lookup_miss_is_not_the_removed_run_answer():
+    from herdr_engineering.ci import WoodpeckerProvider
+    from herdr_engineering.control_plane.ci_monitor import CIMonitor
+
+    provider = WoodpeckerProvider(base_url='https://ci.example', token='tok',
+                                  client=_WoodpeckerStandIn({'/api/user/repos': 200}))
+    answer = CIMonitor(provider_factory=lambda: provider).detail('org/missing', 42)
+    assert answer['available'] is False and answer['error'] not in REMOVED_RUN_ERRORS
+
+
+@pytest.mark.parametrize('answer', [
+    {'available': False, 'status': 'unavailable', 'error': 'This Woodpecker resource is unavailable or has been removed.'},
+    {'available': False, 'error': 'Pipeline was not found.'},
+])
+def test_generic_not_found_texts_fail_and_are_not_skipped(tmp_path, answer):
+    source = _source_with_one_bundle(tmp_path)
+    with control_plane(pipeline=answer) as (url, received):
+        relay = Relay(url, tmp_path / 'state', allow_open=True)
+        assert relay.process_source(str(source)) == Outcomes(0, 1, 0)
+    assert relay.checkpoints == {} and received == []
 
 
 def test_existing_run_with_identity_mismatch_still_fails_closed(tmp_path, capsys):

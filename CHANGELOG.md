@@ -7,7 +7,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Fix: CI report relay skips bundles whose provider run was removed
 
-- A bundle whose Woodpecker run the control plane reports as removed (`Pipeline was not found.` or `This Woodpecker resource is unavailable or has been removed.`) is a permanent skip: it is never published, is recorded in the checkpoint as `state: skipped` (`reason`, `skipped_at`), logs `CI report relay: skipped <bundle>: provider run removed`, and is not re-read on later passes. The summary line is now `N published, M failed, K skipped` and the exit status is 1 only for failures. A run that exists with a mismatched identity, HTTP errors, timeouts, auth errors and malformed responses still fail closed and stay retriable.
+- A bundle whose Woodpecker run the control plane reports as removed (`This Woodpecker run was not found; it was removed or pruned.`, which the provider raises as `run_not_found` only when the pipeline GET returns 404 and the repository GET still succeeds) is a permanent skip: it is never published, is recorded in the checkpoint as `state: skipped` (`reason`, `skipped_at`), logs `CI report relay: skipped <bundle>: provider run removed`, and is not re-read on later passes. The summary line is now `N published, M failed, K skipped` and the exit status is 1 only for failures. A 404 that is repository-level, auth-level, endpoint-level or unconfirmed (deleted or re-created repository, lost token access, wrong base URL, proxy 404, repository lookup miss) keeps the generic `not_found` answer and stays a retriable failure. A run that exists with a mismatched identity, HTTP errors, timeouts, auth errors and malformed responses still fail closed and stay retriable.
 
 ### Chore: pin herdr-handoff 0.5.1
 

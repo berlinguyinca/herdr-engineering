@@ -29,11 +29,14 @@ def _provider():
     return WoodpeckerProvider()
 
 
-# The detail endpoint's two answers for a provider run that no longer exists. The CI report relay
-# treats exactly these as a permanent skip; every other unavailable answer stays retriable.
+# The detail endpoint's answer for a run the provider confirmed is gone: the pipeline GET returned 404
+# while the repository itself was reachable (reason 'run_not_found'). The CI report relay treats exactly
+# this as a permanent skip. Every other unavailable answer, including the generic 'not_found' text for
+# repository-, auth- or endpoint-level 404s, stays a retriable failure.
 PIPELINE_NOT_FOUND_ERROR = 'Pipeline was not found.'
 RESOURCE_REMOVED_ERROR = 'This Woodpecker resource is unavailable or has been removed.'
-REMOVED_RUN_ERRORS = frozenset({PIPELINE_NOT_FOUND_ERROR, RESOURCE_REMOVED_ERROR})
+RUN_REMOVED_ERROR = 'This Woodpecker run was not found; it was removed or pruned.'
+REMOVED_RUN_ERRORS = frozenset({RUN_REMOVED_ERROR})
 
 
 def _error(exc):
@@ -48,6 +51,7 @@ def _error(exc):
         'timeout': 'Woodpecker did not respond before the read timeout. Retrying automatically.',
         'rate_limited': 'Woodpecker is limiting requests. Retrying automatically.',
         'not_found': RESOURCE_REMOVED_ERROR,
+        'run_not_found': RUN_REMOVED_ERROR,
     }
     return 'unavailable', messages.get(reason, 'Woodpecker could not be read. Check connection and provider configuration.')
 
