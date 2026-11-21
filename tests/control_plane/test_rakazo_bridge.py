@@ -222,7 +222,7 @@ def test_the_open_owner_session_is_off_unless_configured(srv):
 
 def test_open_owner_gives_the_first_operator_a_session_from_loopback_or_the_tailnet(make_server):
     _, api = make_server(bridge_section(open_owner=True))
-    for ip in ("127.0.0.1", "::1", "100.104.39.6", "100.64.0.1", "fd7a:115c:a1e0::1", "::ffff:100.64.1.1"):
+    for ip in ("127.0.0.1", "::1", "100.64.8.6", "100.64.0.1", "fd7a:115c:a1e0::1", "::ffff:100.64.1.1"):
         status, body, hdrs = api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": ip})
         assert status == 200, (ip, body)
         token = json.loads(body)["token"]
@@ -414,11 +414,11 @@ def test_100_failures_from_one_address_do_not_block_a_correct_sign_in_from_anoth
 
 
 def test_client_address_trusts_forwarded_for_only_from_loopback_or_configured_proxies():
-    cfg = rb.rakazo_bridge_config(bridge_section(trusted_proxies=["172.18.0.0/16", "100.104.39.6"]))
+    cfg = rb.rakazo_bridge_config(bridge_section(trusted_proxies=["172.18.0.0/16", "100.64.8.6"]))
     bridge = rb.RakazoBridge(cfg, assistant=None, version="x")
     assert bridge.client_address("127.0.0.1", "100.64.0.9") == "100.64.0.9"
     assert bridge.client_address("172.18.0.1", "9.9.9.9, 100.64.0.9") == "100.64.0.9"      # the last (the gateway's) entry
-    assert bridge.client_address("100.104.39.6", "100.64.0.9") == "100.64.0.9"
+    assert bridge.client_address("100.64.8.6", "100.64.0.9") == "100.64.0.9"
     assert bridge.client_address("100.64.0.77", "1.2.3.4") == "100.64.0.77"              # an ordinary device cannot choose
     assert bridge.client_address("172.19.0.1", "1.2.3.4") == "172.19.0.1"
     assert bridge.client_address("127.0.0.1", "not-an-ip") == "127.0.0.1"                # junk never becomes a key

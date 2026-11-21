@@ -80,7 +80,7 @@ unit-tested; only live convergence/validation is pending.
       (systemd user unit, `--host 127.0.0.1 --port 8787`, loopback only) +
       `loginctl enable-linger`, installed via `scripts/web-serve.sh`; verified
       active and serving HTTP 200 on `127.0.0.1:8787`. `tailscale serve --bg
-      8787` maps `https://bender.tail0c50da.ts.net/` → `127.0.0.1:8787` —
+      8787` maps `https://bender.<tailnet>.ts.net/` → `127.0.0.1:8787` —
       **live, verified 2026-10-05**: HTTP 200 from bender, from beast, and
       from mac over the tailnet; loopback remains the only bind. (The serve
       feature was enabled once on the tailnet admin console; `sudo tailscale
@@ -88,14 +88,14 @@ unit-tested; only live convergence/validation is pending.
       serve config.) Other fleet hosts use the stable URL or an SSH tunnel —
       no public listener. Ansible block in `ansible/playbooks/site.yml`
       (gated by `herdr_engineering_gateway_host`). Note: the macOS host was
-      renamed on the tailnet `mac` → `gerts-macbook-pro` (2026-10-05); its
+      renamed on the tailnet `mac` → `operator-laptop` (2026-10-05); its
       `ansible_host` was updated accordingly (inventory label stays `mac`).
 - [ ] iPhone/iPad-sized layouts can navigate agents, activity, files, browser,
       tests and CI **via the stable tailnet URL
-      `https://bender.tail0c50da.ts.net`** (or an SSH tunnel). **BLOCKED_EXTERNAL** —
+      `https://bender.<tailnet>.ts.net`** (or an SSH tunnel). **BLOCKED_EXTERNAL** —
       responsive UI + persistent gateway deployment implemented and
       tailnet-verified from three hosts; device validation requires a tailnet
-      device (phone/iPad) opening `https://bender.tail0c50da.ts.net`.
+      device (phone/iPad) opening `https://bender.<tailnet>.ts.net`.
 - [ ] Reconnect restores the selected machine/session without killing work.
       **BLOCKED_EXTERNAL** — live tailnet validation.
 - [x] Terminal input/control is permission-aware and does not expose public
@@ -149,8 +149,8 @@ unit-tested; only live convergence/validation is pending.
       **Live-verified** single-host drill: lease external port 18000 →
       `curl http://127.0.0.1:18000/` → HTTP 200 (dev-fabric-demo).
 - [x] Same `dev:<port>` address is reachable over the tailnet. **Live-verified** —
-      forwarder bound to `100.104.39.6:18000` (bender's tailnet IP, private,
-      not public); `curl http://100.104.39.6:18000/` → HTTP 200. The remaining
+      forwarder bound to `100.64.8.6:18000` (bender's tailnet IP, private,
+      not public); `curl http://100.64.8.6:18000/` → HTTP 200. The remaining
       step is a human opening that address on an actual phone/iPad (the same
       phone/iPad tailnet UI path also serves the private web UI via the stable
       `https://<gateway-magicdns>` URL — see the Web/mobile rows above).
@@ -169,8 +169,8 @@ unit-tested; only live convergence/validation is pending.
       every lease a stable fleet-wide address on the `dev` service name.
       **Live-verified on bender**: `herdr-eng devfabric gateway` (control
       :29999 on tailnet+loopback) → `register --host auto` →
-      `curl http://bender.tail0c50da.ts.net:18000/` and
-      `curl http://100.104.39.6:18000/` both → HTTP 200, proxied to the app.
+      `curl http://bender.<tailnet>.ts.net:18000/` and
+      `curl http://100.64.8.6:18000/` both → HTTP 200, proxied to the app.
 - [x] **Zero-manual auto-registration (agent).** A per-host agent (systemd
       user unit, deployed by Ansible on every fleet host) detects web services
       that start locally and registers them with the gateway automatically —
@@ -179,7 +179,7 @@ unit-tested; only live convergence/validation is pending.
       services are closed. A noise filter registers only *dev* web services
       (not system daemons / debug endpoints). **Live-verified on beast**:
       `python3 -m http.server 5678` on beast → agent auto-registered it →
-      `curl http://bender.tail0c50da.ts.net:18007/` → HTTP 200 (beast page),
+      `curl http://bender.<tailnet>.ts.net:18007/` → HTTP 200 (beast page),
       and the lease surfaced with a clickable URL in the gateway host's web
       UI — no manual `register` step.
 - [x] **Cross-host routing.** Router binds each leased port on the gateway's
@@ -263,7 +263,7 @@ unit-tested; only live convergence/validation is pending.
       plugin policy (including the "nothing enabled" state).
 - [x] Linux validation passes. This workstation is Linux; all 108 tests pass.
 - [x] macOS validation passes. **Live-verified** (2026-09-24): the fleet host
-      `mac` (tailnet 100.84.185.100) was converged by the real playbook over
+      `mac` (tailnet 100.64.8.100) was converged by the real playbook over
       SSH and a second run was idempotent (`changed=0`); herdr/pi/brew tools
       verified present on the machine afterwards. Note: the host was renamed
       `macbook-m4` → `mac` to match the real tailnet name.

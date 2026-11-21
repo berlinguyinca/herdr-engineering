@@ -14,7 +14,7 @@
 
 - Light theme only. Tokens: background #f7f7f8, surface #ffffff, border #d9d9e3, text #353740, text-secondary #6e6e80, accent #10a37f, radius 8px, Inter with system fallback. No dark mode on the public side.
 - Strict CSP stays: no CDN, no external requests. Fonts and CSS are same-origin.
-- The dashboard stays Tailscale-only (`bender.tail0c50da.ts.net:9447`) and is never routed publicly.
+- The dashboard stays Tailscale-only (`bender.<tailnet>.ts.net:9447`) and is never routed publicly.
 - Folders are personal and per member, many-to-many, and never change visibility, copy content, or re-share.
 - Agent-pushed artifacts are created Pending, visible only to their owner; max 25 Pending per member, further pushes refused with a clear message; no expiry; only the owner accepts or discards; Pending counts toward member limits. Human web creation skips Pending.
 - Expired or revoked rows show title, sharer and date only, no content, no open action. Claim snapshots title and sharer; expiry and revocation are read live.

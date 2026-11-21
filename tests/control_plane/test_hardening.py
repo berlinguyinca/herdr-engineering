@@ -198,7 +198,7 @@ def test_loopback_host_detection():
     assert _is_loopback("::1")
     assert not _is_loopback("0.0.0.0")
     assert not _is_loopback("10.0.0.5")
-    assert not _is_loopback("100.104.39.6")
+    assert not _is_loopback("100.64.8.6")
 
 
 # -------------------------------------------------------- rate limiting

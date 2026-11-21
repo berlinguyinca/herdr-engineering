@@ -34,7 +34,7 @@ def runtime(tmp_path):
     networks = []
 
     def inspect():
-        return networks, [], web, [], [{"addr_info": [{"local": "100.104.39.6", "family": "inet"}]}]
+        return networks, [], web, [], [{"addr_info": [{"local": "100.64.8.6", "family": "inet"}]}]
 
     def execute(args):
         events.append(args)
@@ -90,7 +90,7 @@ def runtime(tmp_path):
 
 def test_first_activation_grants_only_after_compose_and_profile(runtime):
     tx, events, rules, networks, web, attach = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     tx.before("forward")
     assert not rules
     attach()
@@ -108,7 +108,7 @@ def test_first_activation_grants_only_after_compose_and_profile(runtime):
 
 def test_disabled_initially_has_no_root_or_network_effect(runtime):
     tx, events, *_ = runtime
-    tx.snapshot(enabled=False, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=False, cidr=policy.CIDR, destination="100.64.8.6/32")
     tx.before("forward")
     tx.after("forward")
     tx.commit("forward")
@@ -117,7 +117,7 @@ def test_disabled_initially_has_no_root_or_network_effect(runtime):
 
 def test_failed_forward_revokes_before_rollback_membership_and_clears_profile(runtime):
     tx, events, rules, networks, web, attach = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     tx.before("forward")
     attach()
     tx.after("forward")
@@ -136,7 +136,7 @@ def test_failed_forward_revokes_before_rollback_membership_and_clears_profile(ru
 
 def test_root_delete_failure_prevents_abandoning_network(runtime, monkeypatch):
     tx, events, rules, networks, web, attach = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     tx.before("forward")
     attach()
     tx.after("forward")
@@ -150,7 +150,7 @@ def test_root_delete_failure_prevents_abandoning_network(runtime, monkeypatch):
 
 def test_foreign_member_blocks_grant_and_network_removal(runtime):
     tx, events, rules, networks, web, attach = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     tx.before("forward")
     attach()
     networks[0]["Containers"]["f" * 64] = {"Name": "share-public"}
@@ -164,7 +164,7 @@ def test_foreign_member_blocks_grant_and_network_removal(runtime):
 
 def test_write_ahead_receipt_survives_interruption_and_recovery_revokes_only(runtime):
     tx, events, rules, networks, web, attach = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     tx.before("forward")
     attach()
     tx.after("forward")
@@ -193,12 +193,12 @@ def test_executor_requires_same_existing_rollout_lock(runtime, tmp_path):
     tx.lock_path = tmp_path / "different-lock"
     tx.lock_path.write_text("")
     with pytest.raises(ValueError):
-        tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+        tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
 
 
 def test_tampered_rule_argv_is_never_executed(runtime):
     tx, events, *_ = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     path = tx.attempt / "candidate.json"
     record = json.loads(path.read_text())
     record["ufw_allow"] = ["ufw", "allow", "from", "172.16.0.0/12"]
@@ -211,7 +211,7 @@ def test_tampered_rule_argv_is_never_executed(runtime):
 
 def test_prior_enabled_selector_and_profile_restore_as_one_transition(runtime):
     tx, events, rules, networks, web, attach = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     tx.before("forward")
     attach()
     tx.after("forward")
@@ -225,7 +225,7 @@ def test_prior_enabled_selector_and_profile_restore_as_one_transition(runtime):
         execute=tx.execute,
         inspect=tx.inspect,
     )
-    later.snapshot(enabled=False, cidr=policy.CIDR, destination="100.104.39.6/32")
+    later.snapshot(enabled=False, cidr=policy.CIDR, destination="100.64.8.6/32")
     later.before("forward")
     assert not rules
     events.append(["compose", "disabled"])
@@ -255,11 +255,11 @@ def test_prior_enabled_selector_and_profile_restore_as_one_transition(runtime):
 
 def test_foreign_existing_rule_is_not_adopted_or_deleted(runtime):
     tx, events, rules, networks, web, attach = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     tx.before("forward")
     attach()
     rules.append(
-        "ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.104.39.6 port 443 comment foreign"
+        "ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.64.8.6 port 443 comment foreign"
     )
     with pytest.raises(ValueError):
         tx.after("forward")
@@ -273,7 +273,7 @@ def test_competing_rollout_lock_cannot_mutate_receipts_or_root(runtime):
     tx.lock_fd = other
     try:
         with pytest.raises(BlockingIOError):
-            tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+            tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
         assert events == []
         assert not tx.attempt.exists()
     finally:
@@ -283,7 +283,7 @@ def test_competing_rollout_lock_cannot_mutate_receipts_or_root(runtime):
 
 def test_gateway_reassignment_refuses_grant_without_root(runtime):
     tx, events, rules, networks, web, attach = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     tx.before("forward")
     attach()
     inspect = tx.inspect
@@ -297,7 +297,7 @@ def test_gateway_reassignment_refuses_grant_without_root(runtime):
 
 def test_partial_root_add_failure_is_revoked_with_receipt_preserved(runtime):
     tx, events, rules, networks, web, attach = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     tx.before("forward")
     attach()
     execute = tx.execute
@@ -366,14 +366,14 @@ def test_readonly_root_capability_preflight_refuses_before_receipts(runtime, fai
 
     tx.execute = execute
     with pytest.raises((ValueError, OSError, RuntimeError)):
-        tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+        tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     assert not tx.attempt.exists()
     assert all("allow" not in args and "delete" not in args for args in events)
 
 
 def test_inactive_firewall_still_allows_disable_and_removes_persisted_rule(runtime):
     tx, events, rules, networks, web, attach = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     tx.before("forward")
     attach()
     tx.after("forward")
@@ -406,7 +406,7 @@ def test_inactive_firewall_still_allows_disable_and_removes_persisted_rule(runti
 
 def test_inactive_recovery_revokes_and_never_regrants(runtime):
     tx, events, rules, networks, web, attach = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     tx.before("forward")
     attach()
     tx.after("forward")
@@ -428,7 +428,7 @@ def test_inactive_recovery_revokes_and_never_regrants(runtime):
 
 def test_after_requires_its_own_saved_pending_transition(runtime):
     tx, events, rules, networks, web, attach = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     attach()
     events.clear()
     with pytest.raises(ValueError):
@@ -438,7 +438,7 @@ def test_after_requires_its_own_saved_pending_transition(runtime):
 
 def test_before_never_overwrites_another_attempts_journal(runtime):
     tx, events, *_ = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     foreign = {
         "attempt": str(tx.attempt.parent.parent / "attempt-other/web-egress"),
         "direction": "forward",
@@ -453,7 +453,7 @@ def test_before_never_overwrites_another_attempts_journal(runtime):
 
 def test_prune_rechecks_bridge_and_cidr_before_removing_empty_owned_network(runtime):
     tx, events, rules, networks, web, attach = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     tx.before("forward")
     attach()
     tx.after("forward")
@@ -469,10 +469,10 @@ def test_prune_rechecks_bridge_and_cidr_before_removing_empty_owned_network(runt
 def test_preexisting_unowned_rule_refuses_before_snapshot_or_compose(runtime):
     tx, events, rules, *_ = runtime
     rules.append(
-        "ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.104.39.6 port 443 comment foreign"
+        "ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.64.8.6 port 443 comment foreign"
     )
     with pytest.raises(ValueError):
-        tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+        tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     assert not tx.attempt.exists()
     assert not any("delete" in command or "allow" in command for command in events)
 
@@ -481,7 +481,7 @@ def test_approved_policy_for_repeat_deploy_preserves_full_committed_selection(ru
     from herdr_engineering.web_egress_runtime import approved_policy
 
     tx, events, rules, networks, web, attach = runtime
-    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.104.39.6/32")
+    tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
     tx.before("forward")
     attach()
     tx.after("forward")
@@ -512,7 +512,7 @@ def test_activation_change_compares_policy_not_container_or_network_ids():
 
     from herdr_engineering.web_egress_runtime import activation_changed, make_record
 
-    record = make_record("172.31.252.0/29", "100.104.39.6/32", "a" * 32)
+    record = make_record("172.31.252.0/29", "100.64.8.6/32", "a" * 32)
     record.update(network_id="c" * 64, rule_may_exist=True)
     recreated = deepcopy(record)
     recreated.update(network_id="d" * 64, rule_may_exist=False)
@@ -521,7 +521,7 @@ def test_activation_change_compares_policy_not_container_or_network_ids():
     assert activation_changed(record, {"enabled": False}) is False
     changed = make_record("172.31.252.0/29", "100.71.1.7/32", "a" * 32)
     assert activation_changed(record, changed) is True
-    changed = make_record("172.30.254.0/29", "100.104.39.6/32", "a" * 32)
+    changed = make_record("172.30.254.0/29", "100.64.8.6/32", "a" * 32)
     assert activation_changed(record, changed) is True
 
 
@@ -530,7 +530,7 @@ def test_auto_policy_refuses_partial_or_interrupted_approval(runtime, fault):
     from herdr_engineering.web_egress_runtime import approved_policy, make_record
 
     tx, *_ = runtime
-    record = make_record("172.31.252.0/29", "100.104.39.6/32", "a" * 32)
+    record = make_record("172.31.252.0/29", "100.64.8.6/32", "a" * 32)
     record.update(network_id="c" * 64, rule_may_exist=True)
     if fault == "missing-id":
         record["network_id"] = None
