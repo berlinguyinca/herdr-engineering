@@ -19,7 +19,7 @@ cov() {   # cov NAME RCFILE [pytest args...]: run pytest under RCFILE, then enfo
 }
 
 # Installed-wheel acceptance artifacts the scratch and communications tests look for.
-python3 -m build --wheel -q
+python3 -m build --wheel
 wheel="$(ls -1 "$PWD"/dist/herdr_engineering-*.whl | tail -n 1)"
 export HERDR_SCRATCH_TEST_WHEEL="$wheel" HERDR_COMMUNICATION_TEST_WHEEL="$wheel"
 
