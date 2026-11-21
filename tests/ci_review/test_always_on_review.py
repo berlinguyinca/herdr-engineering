@@ -194,6 +194,10 @@ class Env:
         self.reviewer("claude", answer=APPROVE)
         self.reviewer("pi", answer=APPROVE)
         self.reviewer("codex", answer=APPROVE)
+        # hermetic: nothing from the runner's own session (Woodpecker CI_*, XDG_*, gh/git logins) may leak in
+        for name in [n for n in os.environ if n.startswith(("CI_", "XDG_", "GH_", "GITHUB_", "WOODPECKER_", "OPUS_REVIEW_"))
+                     or n in ("CI", "ANTHROPIC_API_KEY", "GIT_CONFIG_GLOBAL", "GIT_ASKPASS")]:
+            monkeypatch.delenv(name)
         monkeypatch.setenv("HOME", str(self.home))
         monkeypatch.setenv("PATH", f"{self.bin}:{os.environ['PATH']}")
         monkeypatch.setenv("GH_TOKEN", "ghp_NOTFORREVIEWERS")

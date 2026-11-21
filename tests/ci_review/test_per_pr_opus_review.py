@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import pwd
 import shutil
 import stat
 import subprocess
@@ -317,14 +316,13 @@ def test_a_home_replaced_by_the_local_backend_is_not_trusted(host, tmp_path):
 
 
 def test_without_an_override_the_home_comes_from_the_passwd_entry(host, tmp_path):
+    """Hermetic: the passwd answer is the test host's (getent stand-in), whatever account runs the tests."""
     isolated = tmp_path / "isolated-home"
     isolated.mkdir()
-    real = pwd.getpwuid(os.getuid()).pw_dir
-    if (Path(real) / ".config/herdr-engineering/always-on-review.yaml").exists():
-        pytest.skip("this account has a real config")
+    host.config.unlink()
     p = subprocess.run(["bash", str(host.installed)], env=host.env(HOME=str(isolated)), capture_output=True, text=True,
                        timeout=60)
-    assert p.returncode == 2 and f"{real}/.config/herdr-engineering/always-on-review.yaml" in p.stderr
+    assert p.returncode == 2 and f"{host.home}/.config/herdr-engineering/always-on-review.yaml" in p.stderr
     assert str(isolated) not in p.stderr and host.calls() == []
 
 
@@ -408,3 +406,11 @@ WOODPECKER_CLI = next((c for c in (shutil.which("woodpecker-cli"), "/tmp/claude-
 def test_woodpecker_cli_lints_the_workflow_clean():
     p = subprocess.run([WOODPECKER_CLI, "lint", "--strict", str(WORKFLOW)], capture_output=True, text=True, timeout=60)
     assert p.returncode == 0, p.stdout + p.stderr
+
+
+def test_the_host_environment_is_only_path_home_and_the_ci_variables_the_test_sets(host, monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "ambient-gh")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/ambient/xdg")
+    monkeypatch.setenv("OPUS_REVIEW_GITHUB_TOKEN", "ambient-secret")
+    assert set(host.env()) == {"PATH", "HOME", "CI_PIPELINE_EVENT", "CI_REPO", "CI_COMMIT_PULL_REQUEST"}
+    assert host.env()["HOME"] == str(host.home)
