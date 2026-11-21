@@ -44,7 +44,10 @@ DEFAULTS: dict[str, Any] = {
         "high_water_percent": 85,
         "low_water_percent": 80,
         "min_age_hours": 24,
-        "max_target_gb": 50,  # an idle target over this is cleaned on every sweep, whatever the disk usage; 0: off
+        # A target over this size is cleaned by the sweep (every 15 minutes, whatever the disk usage) once it has
+        # been idle for size_cap_idle_hours, never from inside a build; 0: no cap.
+        "max_target_gb": 50,
+        "size_cap_idle_hours": 2,
         "pressure_percent": 90,
         "pressure_min_age_hours": 2,
         "refuse_builds_percent": 90,

@@ -1,12 +1,10 @@
 # ruff: noqa: F811
-"""Round 1 review fixes of the size cap: huge targets, a pass that really cleans (invoking shell, cargo wrapper),
-signals, rebuild churn, bounded and cached discovery, git and status-file semantics, config validation.
-Real cargo builds, real files and processes; the only constants overridden are the module's own limits."""
+"""Round 1 review fixes of the size cap that remain: huge targets, bounded and cached discovery, git
+semantics, config validation. Real cargo builds, real files and processes; the only constants overridden are
+the module's own limits."""
 import json
 import os
-import signal
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -17,15 +15,10 @@ from herdr_engineering import build_maintenance as maintenance
 from tests.test_build_cleanup_size_cap import (  # noqa: F401  (env is a fixture)
     HUGE,
     SMALL,
-    _coordinate,
-    _crate,
     env,
     project,
     sweep,
 )
-
-REPO = Path(__file__).resolve().parent.parent
-TINY_GB = 0.000001
 
 
 def _old(path: Path, hours=48) -> None:
@@ -80,229 +73,7 @@ def test_a_fresh_file_in_a_huge_target_is_recent_activity(env, monkeypatch):
     assert {"path": str(target), "reason": "recent activity"} in result["skipped"]
 
 
-# --- H2: the pass must really clean ----------------------------------------------------------
-
-def _through_sh(tmp_path, workspace, target, cap_gb, preamble=""):
-    """``build-coordinate`` started by a shell that stays alive with its cwd in the workspace."""
-    from tests.real_cargo import cargo
-    config = tmp_path / "config.yaml"
-    config.write_text(f"build_cleanup:\n  max_target_gb: {cap_gb}\nfabric_build_cache:\n  enabled: false\n")
-    env_ = {**os.environ, "HERDR_ENGINEERING_CONFIG": str(config),
-            "HERDR_ENGINEERING_STATE": str(tmp_path / "state"),
-            "PATH": f"{cargo().parent}{os.pathsep}{os.environ['PATH']}",
-            "HERDR_DISK_GUARD_OVERRIDE": "1", "PYTHONPATH": str(REPO)}
-    env_.pop("RUSTC_WRAPPER", None)
-    script = (f'cd "$1"; {preamble} "{sys.executable}" -m herdr_engineering.cli build-coordinate -- '
-              f'cargo build --offline --target-dir "$2"; code=$?; true; exit $code')
-    return subprocess.run(["/bin/sh", "-c", script, "sh", str(workspace), str(target)], env=env_,
-                          capture_output=True, text=True, check=False)
-
-
-def test_the_invoking_shell_with_its_cwd_in_the_workspace_does_not_block_the_pass(tmp_path):
-    workspace = _crate(tmp_path)
-    done = _through_sh(tmp_path, workspace, workspace / "target", TINY_GB)
-    assert done.returncode == 0, done.stderr
-    assert not (workspace / "target/debug").exists(), done.stderr
-
-
-def test_an_ancestor_with_a_file_open_in_the_target_still_blocks_the_pass(tmp_path):
-    workspace = _crate(tmp_path)
-    target = workspace / "target"
-    assert _coordinate(tmp_path, workspace, target, cap_gb=50).returncode == 0
-    held = next((target / "debug/.fingerprint").rglob("invoked.timestamp"))
-    done = _through_sh(tmp_path, workspace, target, TINY_GB, preamble=f'exec 3< "{held}";')
-    assert done.returncode == 0, done.stderr
-    assert (target / "debug").exists()
-    assert "pass blocked" in done.stderr, done.stderr  # the reason is visible at WARNING
-
-
-def test_a_process_that_is_not_an_ancestor_still_blocks_by_cwd(tmp_path):
-    from herdr_engineering.build_cleanup import after_build_size_cap
-    workspace = _crate(tmp_path)
-    target = workspace / "target"
-    assert _coordinate(tmp_path, workspace, target, cap_gb=50).returncode == 0
-    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=workspace)
-    try:
-        outcome = after_build_size_cap(["cargo", "build", "--target-dir", str(target)], workspace,
-                                       {"max_target_gb": TINY_GB}, tmp_path / "state")
-    finally:
-        holder.kill()
-        holder.wait()
-    assert outcome["removed"] == [] and (target / "debug").exists()
-
-
-def test_ancestors_are_the_parent_chain(tmp_path):
-    chain = cleanup._ancestors()
-    assert os.getpid() in chain and os.getppid() in chain
-
-
-def _wrapper_env(tmp_path, cap_gb, cache):
-    from herdr_engineering.cargo_host import install
-    from tests.real_cargo import cargo
-    home = tmp_path / "home"
-    install(home, cargo(), Path(sys.executable))
-    config = tmp_path / "config.yaml"
-    cache_cfg = ("fabric_build_cache:\n  enabled: true\n  local:\n    capacity_gib: 1\n"
-                 "    min_free_disk_percent: 0\n" if cache else "fabric_build_cache:\n  enabled: false\n")
-    config.write_text(f"build_cleanup:\n  max_target_gb: {cap_gb}\n{cache_cfg}")
-    env_ = {**os.environ, "HOME": str(home), "CARGO_HOME": str(home / ".cargo"),
-            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
-            "HERDR_ENGINEERING_CONFIG": str(config), "HERDR_ENGINEERING_STATE": str(tmp_path / "state"),
-            "HERDR_DISK_GUARD_OVERRIDE": "1", "PYTHONPATH": str(REPO),
-            "PATH": os.pathsep.join([str(home / ".local/bin"), str(cargo().parent), os.environ["PATH"]])}
-    for key in ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_TARGET_DIR", "HERDR_CARGO_HOST_COORDINATED"):
-        env_.pop(key, None)
-    return home, env_
-
-
-@pytest.mark.parametrize("cache", [False, True])
-def test_the_cargo_wrapper_cleans_an_oversized_target_after_the_build(tmp_path, cache):
-    import shutil
-    if cache and not shutil.which("sccache"):
-        pytest.skip("sccache is required for the cached wrapper path")
-    home, env_ = _wrapper_env(tmp_path, TINY_GB, cache)
-    workspace = _crate(tmp_path)
-    target = workspace / "target"
-    done = subprocess.run([str(home / ".local/bin/cargo"), "build", "--offline", "--target-dir", str(target)],
-                          cwd=workspace, env=env_, capture_output=True, text=True, timeout=300, check=False)
-    assert done.returncode == 0, done.stderr
-    assert not (target / "debug").exists(), done.stderr
-    assert (workspace / "Cargo.toml").exists()
-
-
-def test_the_cargo_wrapper_keeps_the_exit_code_and_does_not_clean_after_a_failed_build(tmp_path):
-    home, env_ = _wrapper_env(tmp_path, TINY_GB, False)
-    workspace = _crate(tmp_path)
-    target = workspace / "target"
-    assert _coordinate(tmp_path, workspace, target, cap_gb=50).returncode == 0
-    (workspace / "src/main.rs").write_text("fn main() { not rust }\n")
-    done = subprocess.run([str(home / ".local/bin/cargo"), "build", "--offline", "--target-dir", str(target)],
-                          cwd=workspace, env=env_, capture_output=True, text=True, timeout=300, check=False)
-    assert done.returncode == 101, done.stderr
-    assert (target / "debug").exists()
-
-
-# --- M1 / L2: signals -----------------------------------------------------------------------
-
-_COUNTER = ("import os, signal, sys, time\n"
-            "log = sys.argv[1]\n"
-            "def note(n, f):\n"
-            "    open(log, 'a').write('x')\n"
-            "signal.signal(signal.SIGINT, note)\n"
-            "signal.signal(signal.SIGTERM, note)\n"
-            "open(log + '.up', 'w').write('1')\n"
-            "end = time.time() + 2.5\n"
-            "while time.time() < end:\n"
-            "    time.sleep(0.05)\n")
-_PARENT = ("import sys\n"
-           "from herdr_engineering.build_coord import _run_child\n"
-           "sys.exit(_run_child([sys.executable, '-c', sys.argv[2], sys.argv[1]], None))\n")
-
-
-def _start_parent(tmp_path):
-    log = tmp_path / "deliveries"
-    proc = subprocess.Popen([sys.executable, "-c", _PARENT, str(log), _COUNTER], cwd=REPO, env={
-        **os.environ, "PYTHONPATH": str(REPO)}, start_new_session=True)
-    deadline = time.time() + 30
-    while not Path(f"{log}.up").exists() and time.time() < deadline:
-        time.sleep(0.05)
-    assert Path(f"{log}.up").exists()
-    return proc, log
-
-
-def test_one_ctrl_c_to_the_process_group_reaches_the_child_once(tmp_path):
-    proc, log = _start_parent(tmp_path)
-    os.killpg(proc.pid, signal.SIGINT)  # what a terminal does: the whole foreground group
-    proc.wait(timeout=30)
-    assert log.read_text() == "x"
-    assert proc.returncode == 0  # the child handled it and ended normally
-
-
-def test_sigterm_to_the_parent_is_forwarded_once_and_the_parent_dies_by_it(tmp_path):
-    log = tmp_path / "deliveries"
-    victim = ("import os, signal, sys, time\n"
-              "open(sys.argv[1] + '.up', 'w').write('1')\n"
-              "time.sleep(60)\n")
-    proc = subprocess.Popen([sys.executable, "-c", _PARENT, str(log), victim], cwd=REPO,
-                            env={**os.environ, "PYTHONPATH": str(REPO)})
-    deadline = time.time() + 30
-    while not Path(f"{log}.up").exists() and time.time() < deadline:
-        time.sleep(0.05)
-    proc.send_signal(signal.SIGTERM)
-    proc.wait(timeout=30)
-    assert proc.returncode == -signal.SIGTERM  # a death by signal, as the exec model gave
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux only")
-def test_a_killed_parent_does_not_leave_the_build_running(tmp_path):
-    log = tmp_path / "deliveries"
-    victim = ("import os, sys, time\n"
-              "open(sys.argv[1] + '.up', 'w').write(str(os.getpid()))\n"
-              "time.sleep(60)\n")
-    proc = subprocess.Popen([sys.executable, "-c", _PARENT, str(log), victim], cwd=REPO,
-                            env={**os.environ, "PYTHONPATH": str(REPO)})
-    deadline = time.time() + 30
-    while not Path(f"{log}.up").exists() and time.time() < deadline:
-        time.sleep(0.05)
-    child = int(Path(f"{log}.up").read_text())
-    proc.kill()
-    proc.wait()
-    for _ in range(100):
-        try:
-            os.kill(child, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.1)
-    os.kill(child, signal.SIGKILL)
-    pytest.fail("the build outlived its killed parent")
-
-
-# --- M2: no churn ---------------------------------------------------------------------------
-
-CAP_CFG = {"max_target_gb": TINY_GB}
-
-
-def _after(cmd_target, workspace, state, code=0):
-    return cleanup.finish_build(["cargo", "build", "--target-dir", str(cmd_target)], workspace, CAP_CFG, state, code)
-
-
-def test_a_failed_or_signalled_build_is_never_followed_by_a_clean(env):
-    root, state = env
-    mine = project(root, "mine", age=0)
-    for code in (101, 130, 143):
-        _after(mine, mine.parent, state, code)
-        assert (mine / "debug").exists()
-
-
-def test_a_target_is_cleaned_at_most_once_a_day_and_the_repeat_is_warned_about(env, caplog):
-    from tests.real_cargo import build
-    root, state = env
-    mine = project(root, "mine", age=0)
-    _after(mine, mine.parent, state)
-    assert not (mine / "debug").exists()
-    build(mine.parent, mine)  # the next build, as big as before
-    _after(mine, mine.parent, state)
-    assert (mine / "debug").exists()  # inside the 24 h window: left alone
-    record = state / "build-cleanup-after-build.json"
-    data = json.loads(record.read_text())
-    data[str(mine)] = [time.time() - 25 * 3600]
-    record.write_text(json.dumps(data))
-    with caplog.at_level("WARNING"):
-        _after(mine, mine.parent, state)
-    assert not (mine / "debug").exists()
-    assert any("max_target_gb" in message for message in caplog.messages), caplog.messages
-
-
 # --- M3 / M4: bounded and cached discovery ---------------------------------------------------
-
-def test_a_blocked_child_is_killed_at_the_deadline(tmp_path):
-    fifo = tmp_path / "pipe"
-    os.mkfifo(fifo)
-    began = time.time()
-    with pytest.raises(TimeoutError):
-        cleanup._in_child(lambda: os.close(os.open(fifo, os.O_RDONLY)), 1.0)  # blocks: no writer, ever
-    assert time.time() - began < 10
-
 
 def test_the_discovery_limit_keeps_what_was_found(tmp_path, monkeypatch):
     target = project(tmp_path, "p")
@@ -399,21 +170,6 @@ def test_inherited_git_variables_do_not_hide_tracked_output(env, monkeypatch, tm
     monkeypatch.setenv("GIT_DIR", str(other / ".git"))
     monkeypatch.setenv("GIT_WORK_TREE", str(other))
     assert not cleanup._untracked(target)
-
-
-# --- L3: status files ------------------------------------------------------------------------
-
-def test_a_one_target_pass_leaves_the_sweep_report_alone(env):
-    root, state = env
-    mine = project(root, "mine", age=0)
-    state.mkdir()
-    report = state / "build-cleanup.json"
-    report.write_text(json.dumps({"timestamp": "2020-01-01T00:00:00+00:00", "status": "ok"}))
-    outcome = cleanup.after_build_size_cap(["cargo", "build", "--target-dir", str(mine)], mine.parent,
-                                           CAP_CFG, state)
-    assert outcome["removed"] == [str(mine)]
-    assert json.loads(report.read_text())["timestamp"] == "2020-01-01T00:00:00+00:00"
-    assert json.loads((state / "build-cleanup-last-build.json").read_text())["removed"] == [str(mine)]
 
 
 # --- L4: configuration -----------------------------------------------------------------------

@@ -1,7 +1,6 @@
 """Per-target size cap: an idle Cargo target over ``max_target_gb`` is cleaned on every sweep, whatever the
 disk pressure, through the same safety path as the pressure sweep. Real cargo builds, real files, real
 processes and a real registry; thresholds go through the real policy parameters."""
-import json
 import os
 import subprocess
 import sys
@@ -130,40 +129,14 @@ def test_an_active_lease_keeps_an_oversized_target(env):
     assert {"path": str(target), "reason": "active_lease"} in result["skipped"]
 
 
-def test_only_targets_limits_the_pass_to_those_targets(env):
-    root, state = env
-    first = project(root, "first")
-    second = project(root, "second")
-    result = cleanup.run_once([first.parent], state, **NO_PRESSURE, max_target_bytes=SMALL,
-                              only_targets=[first])
-    assert result["removed"] == [str(first)]
-    assert (second / "debug").exists()
-
-
-def test_only_targets_ignores_a_directory_that_is_not_a_cargo_target(env):
-    root, state = env
-    plain = root / "plain" / "target"
-    plain.mkdir(parents=True)
-    (plain / "data").write_bytes(b"x" * 100)
-    result = cleanup.run_once([plain.parent], state, **NO_PRESSURE, max_target_bytes=SMALL,
-                              only_targets=[plain])
-    assert result["removed_count"] == 0 and (plain / "data").exists()
-
-
-def test_a_just_built_target_can_be_capped_with_a_zero_idle_floor(env):
-    root, state = env
-    target = project(root, age=0)
-    result = cleanup.run_once([target.parent], state, **NO_PRESSURE, max_target_bytes=SMALL,
-                              only_targets=[target], size_cap_min_age_hours=0)
-    assert result["removed"] == [str(target)]
-
-
 def test_a_negative_cap_or_idle_floor_is_rejected(env):
     root, state = env
     with pytest.raises(ValueError):
         sweep(root, state, max_target_bytes=-1)
     with pytest.raises(ValueError):
-        sweep(root, state, max_target_bytes=SMALL, size_cap_min_age_hours=-1)
+        sweep(root, state, max_target_bytes=SMALL, size_cap_idle_hours=0)
+    with pytest.raises(ValueError):
+        sweep(root, state, max_target_bytes=SMALL, size_cap_idle_hours=float("nan"))
 
 
 def test_policy_converts_gigabytes_and_zero_disables_the_cap():
@@ -217,139 +190,3 @@ def test_default_roots_are_the_home_directory(tmp_path, monkeypatch):
     assert home in roots
     assert DEFAULTS["build_cleanup"]["max_target_gb"] == 50
     assert maintenance.effective_roots(DEFAULTS["build_cleanup"], [str(tmp_path)])[0] == tmp_path
-
-
-# --- after a build ------------------------------------------------------------------------------
-
-def test_after_build_cleans_only_that_builds_oversized_target(env, monkeypatch):
-    root, state = env
-    mine = project(root, "mine", age=0)
-    other = project(root, "other", age=48)
-    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(state))
-    outcome = cleanup.after_build_size_cap(["cargo", "build", "--target-dir", str(mine)], mine.parent,
-                                           {"max_target_gb": 0.000001}, state)
-    assert outcome["removed"] == [str(mine)]
-    assert (other / "debug").exists()
-
-
-def test_after_build_leaves_a_target_under_the_cap(env):
-    root, state = env
-    mine = project(root, "mine", age=0)
-    outcome = cleanup.after_build_size_cap(["cargo", "build", "--target-dir", str(mine)], mine.parent,
-                                           {"max_target_gb": 50}, state)
-    assert outcome["removed"] == [] and (mine / "debug").exists()
-
-
-def test_after_build_is_a_no_op_when_disabled_or_for_other_commands(env):
-    root, state = env
-    mine = project(root, "mine", age=0)
-    cfg = {"max_target_gb": 0.000001}
-    assert cleanup.after_build_size_cap(["cargo", "build", "--target-dir", str(mine)], mine.parent,
-                                        {**cfg, "enabled": False}, state) is None
-    assert cleanup.after_build_size_cap(["cargo", "clean"], mine.parent, cfg, state) is None
-    assert cleanup.after_build_size_cap(["make"], mine.parent, cfg, state) is None
-    assert (mine / "debug").exists()
-
-
-def test_after_build_skips_a_target_another_build_still_holds(env):
-    root, state = env
-    mine = project(root, "mine", age=0)
-    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=mine.parent)
-    try:
-        outcome = cleanup.after_build_size_cap(["cargo", "build", "--target-dir", str(mine)], mine.parent,
-                                               {"max_target_gb": 0.000001}, state)
-    finally:
-        holder.kill()
-        holder.wait()
-    assert outcome["removed"] == [] and (mine / "debug").exists()
-
-
-def test_after_build_never_raises(env):
-    root, state = env
-    mine = project(root, "mine", age=0)
-    unusable = mine.parent / "Cargo.toml"  # a file where the state directory should be
-    outcome = cleanup.after_build_size_cap(["cargo", "build", "--target-dir", str(mine)], mine.parent,
-                                           {"max_target_gb": 0.000001}, unusable)
-    assert outcome is None or outcome.get("errors")
-    assert (mine / "debug").exists()
-
-
-# --- through ``herdr-eng build-coordinate`` -----------------------------------------------------
-
-def _coordinate(tmp_path, workspace, target, cap_gb, wait=True):
-    from tests.real_cargo import cargo
-    config = tmp_path / "config.yaml"
-    config.write_text(f"build_cleanup:\n  max_target_gb: {cap_gb}\nfabric_build_cache:\n  enabled: false\n")
-    env = {**os.environ, "HERDR_ENGINEERING_CONFIG": str(config),
-           "HERDR_ENGINEERING_STATE": str(tmp_path / "state"),
-           "PATH": f"{cargo().parent}{os.pathsep}{os.environ['PATH']}",
-           "HERDR_DISK_GUARD_OVERRIDE": "1", "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
-    env.pop("RUSTC_WRAPPER", None)
-    argv = [sys.executable, "-m", "herdr_engineering.cli", "build-coordinate", "--", "cargo", "build",
-            "--offline", "--target-dir", str(target)]
-    if not wait:
-        return subprocess.Popen(argv, cwd=workspace, env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True)
-    return subprocess.run(argv, cwd=workspace, env=env, capture_output=True, text=True, check=False)
-
-
-def _crate(tmp_path):
-    workspace = tmp_path / "crate"
-    (workspace / "src").mkdir(parents=True)
-    subprocess.run(["git", "init", "-q", str(workspace)], check=True)  # a project outside git is never cleaned
-    (workspace / "Cargo.toml").write_text('[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n')
-    (workspace / "src/main.rs").write_text("fn main() {}\n")
-    return workspace
-
-
-def test_build_coordinate_cleans_an_oversized_target_after_the_build_and_keeps_the_exit_code(tmp_path):
-    workspace = _crate(tmp_path)
-    target = workspace / "target"
-    done = _coordinate(tmp_path, workspace, target, cap_gb=0.000001)
-    assert done.returncode == 0, done.stderr
-    assert "size cap pass" not in done.stderr, done.stderr
-    assert not (target / "debug").exists()
-    assert (workspace / "Cargo.toml").exists()
-
-
-def test_build_coordinate_keeps_a_target_under_the_cap(tmp_path):
-    workspace = _crate(tmp_path)
-    target = workspace / "target"
-    done = _coordinate(tmp_path, workspace, target, cap_gb=50)
-    assert done.returncode == 0, done.stderr
-    assert (target / "debug").exists()
-
-
-def test_build_coordinate_keeps_the_exit_code_of_a_failing_build_and_does_not_cap_after_it(tmp_path):
-    workspace = _crate(tmp_path)
-    target = workspace / "target"
-    assert _coordinate(tmp_path, workspace, target, cap_gb=0.000001).returncode == 0
-    (workspace / "src/main.rs").write_text("fn main() { this does not compile }\n")
-    done = _coordinate(tmp_path, workspace, target, cap_gb=0.000001)
-    assert done.returncode == 101, done.stderr
-    assert "size cap pass" not in done.stderr
-    assert (target / "debug").exists()  # a failed build is not followed by a clean
-
-
-def test_build_coordinate_forwards_sigterm_to_the_build_and_reports_the_signal(tmp_path):
-    import signal
-    workspace = _crate(tmp_path)
-    started = tmp_path / "started"
-    (workspace / "build.rs").write_text(
-        f'fn main() {{ std::fs::write({json.dumps(str(started))}, "x").unwrap(); '
-        'std::thread::sleep(std::time::Duration::from_secs(120)); }\n')
-    proc = _coordinate(tmp_path, workspace, workspace / "target", cap_gb=50, wait=False)
-    try:
-        deadline = time.time() + 120
-        while not started.exists() and time.time() < deadline and proc.poll() is None:
-            time.sleep(0.1)
-        assert started.exists(), proc.communicate()
-        began = time.time()
-        proc.send_signal(signal.SIGTERM)
-        proc.wait(timeout=60)
-        assert time.time() - began < 60
-        assert proc.returncode == -signal.SIGTERM  # a death by the signal, as an exec'd build would have
-    finally:
-        proc.kill()
-        proc.wait()
-        subprocess.run(["pkill", "-f", str(started.parent)], check=False)

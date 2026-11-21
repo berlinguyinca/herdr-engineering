@@ -67,7 +67,7 @@ security:
   allow_public_listeners: false
   persist_hidden_reasoning: false
 
-# Optional Linux companion: scripts/build-cleanup.sh installs the user service.
+# On by default (systemd user unit on Linux, launchd job on macOS); scripts/build-cleanup.sh installs it by hand.
 # Default roots: ~, ~/work, ~/IdeaProjects, ~/.cache (set `roots` to replace them).
 build_cleanup:
   enabled: true
@@ -76,7 +76,8 @@ build_cleanup:
   high_water_percent: 85
   low_water_percent: 80
   min_age_hours: 24
-  max_target_gb: 50  # an idle target over this is cleaned on every sweep; 0 = off
+  max_target_gb: 50  # a target over this, idle for size_cap_idle_hours, is cleaned by the sweep; 0 = off
+  size_cap_idle_hours: 2  # minimum 1
 
 # Fabric build cache (spec 02). Everything is OFF by default; invalid values fail
 # closed at load (unknown keys, "false" strings, URLs, embedded secrets are errors).

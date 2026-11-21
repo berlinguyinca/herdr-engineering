@@ -3559,20 +3559,11 @@ def _cmd_build_coordinate(args) -> int:
         refused = _disk_guard_refusal(probe, cleanup_policy)
         if refused is not None:
             return refused
-    # A cargo build under a size cap stays a plain child (not exec'd, nothing recorded) so the target can be checked once the
-    # build has ended and its lease is released; the pass never changes the build's exit code.
-    from .build_cleanup import finish_build, size_cap_applies
-    capped = bool(cmd) and size_cap_applies(cmd, cleanup_policy)
-    code = run_gated(cmd, slots=slots, max_load=args.max_load,
+    return run_gated(cmd, slots=slots, max_load=args.max_load,
                      wait_seconds=args.wait, json_out=args.json,
                      bypass_on_timeout=args.bypass_on_timeout,
                      record=getattr(args, "record", False),
-                     cache_config=cache_cfg, trace=trace, stay=capped)
-    if capped:
-        import logging
-        logging.basicConfig(level=logging.WARNING, format="build-coordinate: %(message)s")  # to stderr
-        finish_build(cmd, Path.cwd(), cleanup_policy, _default_state_dir(), code)
-    return code
+                     cache_config=cache_cfg, trace=trace)
 
 
 # Commands whose output size the disk-budget guard protects here. Cargo is guarded here only when the

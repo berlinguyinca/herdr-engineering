@@ -50,11 +50,14 @@ def watch(cleanup, *, interval: float, stop: threading.Event,
 
 
 _DEFAULT_MAX_TARGET_GB = 50.0
+_DEFAULT_SIZE_CAP_IDLE_HOURS = 2.0
+_WARNED: set[tuple[str, str]] = set()  # bad values already reported by this process (the watcher loops forever)
 
 
-def _max_target_gb(cfg: dict) -> float:
-    """``max_target_gb``: a finite number >= 0 (not a bool); anything else is the default, with a warning."""
-    value = cfg.get('max_target_gb', _DEFAULT_MAX_TARGET_GB)
+def _checked(cfg: dict, key: str, default: float, minimum: float) -> float:
+    """``build_cleanup.<key>``: a finite number >= ``minimum`` (not a bool, not null); anything else is the
+    documented default, with one warning per process and value."""
+    value = cfg.get(key, default)
     number = value
     if isinstance(value, str):  # YAML reads 1e-06 (no dot) as a string
         try:
@@ -62,15 +65,17 @@ def _max_target_gb(cfg: dict) -> float:
         except ValueError:
             number = None
     if (isinstance(number, bool) or not isinstance(number, (int, float))
-            or not math.isfinite(number) or number < 0):
-        log.warning('ignoring build_cleanup.max_target_gb=%r (not a number >= 0); using %g',
-                    value, _DEFAULT_MAX_TARGET_GB)
-        return _DEFAULT_MAX_TARGET_GB
+            or not math.isfinite(number) or number < minimum):
+        if (key, repr(value)) not in _WARNED:
+            _WARNED.add((key, repr(value)))
+            log.warning('ignoring build_cleanup.%s=%r (not a number >= %g); using %g', key, value, minimum, default)
+        return default
     return float(number)
 
 
 def policy_kwargs(cfg: dict) -> dict:
     """``run_once`` policy values from a ``build_cleanup`` config block (defaults match config.DEFAULTS)."""
+    from .build_cleanup import MIN_IDLE_HOURS
     return {
         "high_water": float(cfg.get('high_water_percent', 85)),
         "low_water": float(cfg.get('low_water_percent', 80)),
@@ -78,7 +83,8 @@ def policy_kwargs(cfg: dict) -> dict:
         "pressure_water": float(cfg.get('pressure_percent', 90)),
         "pressure_min_age_hours": float(cfg.get('pressure_min_age_hours', 2)),
         # 0 switches the per-target cap off
-        "max_target_bytes": int(_max_target_gb(cfg) * 1024 ** 3) or None,
+        "max_target_bytes": int(_checked(cfg, 'max_target_gb', _DEFAULT_MAX_TARGET_GB, 0) * 1024 ** 3) or None,
+        "size_cap_idle_hours": _checked(cfg, 'size_cap_idle_hours', _DEFAULT_SIZE_CAP_IDLE_HOURS, MIN_IDLE_HOURS),
     }
 
 
@@ -135,13 +141,12 @@ def effective_roots(cfg: dict, explicit: list[str] | None = None) -> list[Path]:
         # Default roots may not exist on every host (e.g. no ~/work); explicit ones must.
         paths = [path for path in paths if path.is_dir()]
         paths += [path for path in _managed_output_dirs() if path not in paths]
-    seen, unique = set(), []
-    for path in paths:  # a root named twice (or through a link) is swept once
+    chosen: dict[str, Path] = {}
+    for path in paths:  # a root named twice (or through a link) is swept once, by its canonical spelling
         key = os.path.realpath(path)
-        if key not in seen:
-            seen.add(key)
-            unique.append(path)
-    return unique
+        if key not in chosen or (str(path) == key and str(chosen[key]) != key):
+            chosen[key] = path
+    return list(chosen.values())
 
 
 def cleanup_cycle(cfg: dict, explicit: list[str] | None, state_dir: Path, dry_run: bool = False,

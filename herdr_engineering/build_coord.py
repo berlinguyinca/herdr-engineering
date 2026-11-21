@@ -28,11 +28,9 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import socket
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -245,72 +243,11 @@ def _prestart_sccache_server(env: dict[str, str] | None) -> None:
         pass
 
 
-def _die_with_parent() -> None:  # pragma: no cover - runs in the child between fork and exec
-    """Linux: the child gets SIGKILL when this process dies, so a killed coordinator leaves no build behind."""
-    if sys.platform == "linux":
-        try:
-            import ctypes
-            ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
-        except (OSError, AttributeError):
-            pass
-
-
-def _run_child(cmd: list[str], slot_fd: int | None) -> int:
-    """Run ``cmd`` as a child with this process's environment and return its exit code.
-
-    Signals go the way they would had this process been replaced by the build (``exec``): a terminal's
-    Ctrl-C reaches the whole foreground group, so the child already gets SIGINT and this process only ignores
-    it (a no-op handler, not SIG_IGN, which the child would inherit); SIGTERM and SIGHUP, sent to this process
-    alone, are forwarded once. Handlers are in place before the child starts, so no signal falls in the gap.
-    A child that dies by a signal makes this process die by the same one. The slot is freed once the child is
-    reaped."""
-    main = threading.current_thread() is threading.main_thread()
-    child: subprocess.Popen | None = None
-    pending: list[int] = []
-
-    def forward(signum: int, _frame: object) -> None:
-        if child is None:
-            pending.append(signum)
-        elif child.poll() is None:
-            child.send_signal(signum)
-
-    previous = {}
-    if main:
-        previous[signal.SIGINT] = signal.signal(signal.SIGINT, lambda _signum, _frame: None)
-        for number in (signal.SIGTERM, signal.SIGHUP):
-            previous[number] = signal.signal(number, forward)
-    try:
-        child = subprocess.Popen(cmd, close_fds=False, preexec_fn=_die_with_parent
-                                 if sys.platform == "linux" else None)  # OSError: the caller maps it to 127
-        for signum in pending:
-            child.send_signal(signum)
-        status = child.wait()
-    finally:
-        for number, handler in previous.items():
-            signal.signal(number, handler)
-        if slot_fd is not None:
-            try:
-                os.close(slot_fd)
-            except OSError:
-                pass
-    if status < 0 and main:
-        try:
-            signal.signal(-status, signal.SIG_DFL)
-        except (OSError, ValueError):  # SIGKILL: nothing to reset
-            pass
-        os.kill(os.getpid(), -status)  # the same death as exec would have given
-        time.sleep(1)  # pragma: no cover - the signal is delivered at once
-    return 128 - status if status < 0 else status
-
-
 def _launch(cmd: list[str], record: bool, slot: int | None, state_dir: Path,
             slot_fd: int | None = None, env: dict[str, str] | None = None,
             cache: dict | None = None,
-            trace: dict[str, str] | None = None, stay: bool = False) -> int:
-    """exec ``cmd`` (default), or with ``record`` run it measured and return its code. ``stay`` runs it as a
-    plain child (no metrics, no registry) so the caller can act after it: the locks stay held until it ends."""
-    if stay and not record:
-        return _run_child(cmd, slot_fd)
+            trace: dict[str, str] | None = None) -> int:
+    """exec ``cmd`` (default) or, with ``record``, run it measured and return its code."""
     if not record:
         os.execvp(cmd[0], cmd)
         raise AssertionError("unreachable")  # pragma: no cover
@@ -334,7 +271,7 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
               bypass_on_timeout: bool = False, record: bool = False,
               child_env: dict[str, str] | None = None,
               cache: dict | None = None,
-              trace: dict[str, str] | None = None, stay: bool = False) -> int:
+              trace: dict[str, str] | None = None) -> int:
     """Run ``cmd`` under the per-host build gate.
 
     This is the entry point for ``herdr-eng build-coordinate``. It acquires a
@@ -381,7 +318,7 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
             print(f"build-coordinate: {exc}; running ungated (bypass-on-timeout)",
                   file=sys.stderr)
             try:
-                return _launch(cmd, record, None, gate.dir, None, child_env, cache, trace, stay)
+                return _launch(cmd, record, None, gate.dir, None, child_env, cache, trace)
             except OSError as e:
                 if json_out:
                     print(json.dumps({"error": f"could not exec {cmd[0]}: {e}"},
@@ -402,7 +339,7 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
     try:
         # Default: replaces this process; flock held by fd. With ``record`` the
         # parent stays alive holding every lock fd until the child exits.
-        return _launch(cmd, record, _slot, gate.dir, fd, child_env, cache, trace, stay)
+        return _launch(cmd, record, _slot, gate.dir, fd, child_env, cache, trace)
     except OSError as exc:
         if fd is not None and not record:  # record mode already closed it
             try:
@@ -476,7 +413,7 @@ def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5
               state_dir: Path | None = None,
               bypass_on_timeout: bool = False, record: bool = False,
               cache_config: BuildCacheConfig | None = None,
-              trace: dict[str, str] | None = None, stay: bool = False) -> int:
+              trace: dict[str, str] | None = None) -> int:
     """Hold a maintenance read lock for the entire build, even on slot bypass.
 
     Retention, migration and cache eviction take the exclusive side of this lock; the cleanup sweep takes
@@ -511,7 +448,7 @@ def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5
         return _run_gated(cmd, slots=slots, max_load=max_load,
                           wait_seconds=wait_seconds, json_out=json_out,
                           state_dir=state_dir, bypass_on_timeout=bypass_on_timeout,
-                          record=record, child_env=child_env, cache=cache, trace=trace, stay=stay)
+                          record=record, child_env=child_env, cache=cache, trace=trace)
     finally:
         if maintenance_fd is not None:
             os.close(maintenance_fd)

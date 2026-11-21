@@ -1,19 +1,19 @@
 # Automatic Rust build-cache cleanup
 
-The Linux Herdr Engineering companion checks every 15 minutes, whether or not a
-Herdr server is running (set `build_cleanup.require_herdr_server: true` to sweep
-only while a server of the same user runs). It cleans verified Cargo
-output directories under the project roots (the home directory by default) when disk use
-reaches 85%, oldest first, stopping at 80%, and any idle target over `max_target_gb` at every check. Artifacts must be inactive for at
-least 24 hours. Source files, worktrees, Cargo downloads, and Rust toolchains
-are retained.
+The Herdr Engineering cleanup job (a systemd user service on Linux, a launchd interval job on macOS; both on by
+default) checks every 15 minutes, whether or not a Herdr server is running (set `build_cleanup.require_herdr_server:
+true` to sweep only while a server of the same user runs). It cleans verified Cargo output directories under the
+project roots (`~`, `~/work`, `~/IdeaProjects` and `~/.cache` by default) when disk use reaches 85%, oldest first,
+stopping at 80%, and any target over `max_target_gb` that has been idle for `size_cap_idle_hours` (default 2) at
+every check, whatever the disk use. Under pressure, artifacts must be inactive for at least 24 hours (`min_age_hours`).
+Source files, worktrees, Cargo downloads, and Rust toolchains are retained.
 
 Add to `~/.config/herdr-engineering/config.yaml`:
 
 ```yaml
 build_cleanup:
   enabled: true
-  roots: [~/IdeaProjects]
+  roots: [~/IdeaProjects]   # replaces the default roots (~, ~/work, ~/IdeaProjects, ~/.cache)
   interval_seconds: 900
   high_water_percent: 85
   low_water_percent: 80
@@ -176,53 +176,72 @@ cargo itself whenever the `cargo` on PATH is not the herdr wrapper (measuring th
 directory), so an IDE-style run is refused the same way. The `true`/`false` shorthand is merged into what earlier
 config sources set.
 
-## Size cap, home-wide discovery and the after-build pass
+## Size cap and home-wide discovery
 
 ```yaml
 build_cleanup:
-  max_target_gb: 50   # 0 turns the cap off
+  max_target_gb: 50        # 0 turns the cap off
+  size_cap_idle_hours: 2   # how long an over-cap target must have been idle; minimum 1
 ```
 
-**Size cap.** An idle target larger than `max_target_gb` is cleaned on every sweep, whatever the disk usage
-(below `high_water_percent` too). It uses exactly the path of the pressure sweep: a verified Cargo target, the idle
-floor (`min_age_hours`), git-untracked, leases, the per-target process scan, the sweep lock, and `cargo clean`. The
-sweep result lists it in `reasons` as `size_cap` (`pressure` and `orphan` are the other values). A target that goes
-over the cap while a build runs, or whose project is not in git, is kept. Why: a disk reached 100% from stale
+**Size cap.** A target larger than `max_target_gb` that has been idle for `size_cap_idle_hours` (default 2, not
+below 1) is cleaned by the 15-minute sweep, whatever the disk usage (below `high_water_percent` too). The cap is
+enforced by that sweep alone: nothing runs after a build, `build-coordinate` and the cargo wrapper behave exactly as
+without a cap, and a target is never cleaned from inside a build. A target is therefore over the cap for up to
+`size_cap_idle_hours` plus one sweep interval after its last build; under disk pressure the pressure rules (24 h,
+2 h at `pressure_percent`) apply instead. It uses exactly the path of the pressure sweep: a verified Cargo target,
+the idle floor, git-untracked, leases, the per-target process scan, the sweep lock, and `cargo clean`. The sweep
+result lists it in `reasons` as `size_cap` (`pressure` and `orphan` are the other values). A target that goes over
+the cap while a build runs, or whose project is not in git, is kept. Why: a disk reached 100% from stale
 `target/debug` copies that no pressure rule had touched.
 
 **Huge targets.** The size check stops walking once the target passes the cap, and the idle time is judged from
-Cargo's bookkeeping (profile directories, `.fingerprint`, `build`, `incremental`) instead of every file, so a target
-of millions of files is judged as cheaply as it is proven large. Only under disk pressure is the whole target
-walked. A target that cannot be decided is reported as a warning (`size cap undecided`), never as a clean pass.
-`max_target_gb` must be a number >= 0 (a numeric string such as YAML's `1e-06` is accepted; anything else, and
-booleans, fall back to 50 with a warning).
+Cargo's bookkeeping instead of every file: the target, its profile directories (also under a target triple),
+`.fingerprint`, `build` and `incremental` down to the fingerprint files, and every other top-level directory
+(`tmp`, `doc`, `package`, ...) to the same depth. So a target of millions of files is judged as cheaply as it is
+proven large. The limit: a write that changes no directory mtime (a file rewritten in place, or anything deeper
+than the fourth level, for example a scratch file under `build/<crate>/out/a/b/`) is not seen by the idle time;
+the process scan and the leases protect a running build. Only under disk pressure is the whole target walked for
+its idle time. A target that cannot be decided is reported as a warning (`size cap undecided`), never as a clean pass.
 
-**Default discovery.** With `roots` unset the sweep searches `~`, `~/work`, `~/IdeaProjects` and `~/.cache` (roots
-inside another root are walked once, on their own). This widens the earlier narrowed contract of "explicit roots
-only"; it does so at the user's explicit request, because the user has dozens of Rust projects and cannot list them
-all. The walk under `~` is bounded (depth 6, 500,000 directories; past that it keeps what it found and warns),
-never follows symlinks, never stats into a mount point, and does not enter dot directories (`~/.cargo`,
-`~/.rustup`, `~/.local/share/Trash`, ...), `Library` or `node_modules`; a directory is a target only when the usual
-verification accepts it (a `Cargo.toml` beside it and Cargo's markers). Discovery and size checks of a root run in a
-child with a deadline (`HERDR_SURVEY_SECONDS`, 600): a root that does not answer is skipped with a warning. The
-watcher reuses each root's target list for 6 hours (`build-cleanup-targets.json`); the disk guard before a build
-uses that list and never walks the home directory. A project whose nearest git repository is `$HOME` itself is not
-cleaned. Setting `roots` replaces the default, and a root you name is searched as named (the exclusions apply only
-to `~`).
+**Content guard.** A target over the cap that is idle enough to be cleaned must first pass the full foreign-content
+guard over ALL of its content, not only the part the size walk saw: nothing of another owner or filesystem, no
+symlink, no special file, no nested `Cargo.toml` or `.git`. It is a streaming `lstat` walk with no entry limit that
+stops at the first violation (the target stays, with a warning). It runs inside the survey deadline; a target too
+large to walk in time is not cleaned and gets a warning (`content check ... did not finish in time`). The guard is
+repeated right before the process scan. Whatever vanishes during the walk (a build running) is not a violation.
 
-**After a build.** When `herdr-eng build-coordinate -- cargo <build|check|test|...>` or the cargo wrapper finishes
-successfully, it checks that build's target (the `--target-dir` or `CARGO_TARGET_DIR` it was given, else the
-workspace `target` and its Herdr-managed target). A failed or signalled build is not followed by a pass. If that
-target is over the cap, a size-cap pass for that target alone runs after the build's lease and the wrapper's locks
-are released; another build holding the target, or any process using it, keeps it. The shell that started the
-build and its ancestors do not count as holders for their working directory alone (an open file of theirs in the
-target still does); a blocked pass logs the reason at WARNING. The idle floor of this pass is 0, because the target
-was written a moment ago. A target is cleaned at most once in 24 hours; when it is capped again within a week a
-warning suggests a higher `max_target_gb`. The pass never fails the build; a problem is logged on stderr and the
-build's exit code is kept. For this the cargo command runs as a plain child instead of being exec'd; no metrics are
-recorded for it. Ctrl-C reaches the child through the terminal's process group (this process ignores it), SIGTERM
-and SIGHUP are forwarded once, a child that dies by a signal makes this process die by it, and on Linux the child
-is killed if this process is. The pass writes `build-cleanup-last-build.json`, never `build-cleanup.json`.
+`max_target_gb` must be a number >= 0 and `size_cap_idle_hours` a number >= 1 (a numeric string such as YAML's
+`1e-06` is accepted; anything else, `false` and `null` included, falls back to the default, 50 and 2, with one
+warning per process).
+
+**Default discovery.** With `roots` unset the sweep searches `~`, `~/work`, `~/IdeaProjects` and `~/.cache` (a root
+inside another root is walked once, on its own; a root named twice or through a link is swept once, by its real
+path). This widens the earlier narrowed contract of "explicit roots only"; it does so at the user's explicit
+request, because the user has dozens of Rust projects and cannot list them all. The walk of every root is bounded
+(depth 6, 500,000 directories; past that it keeps what it found and warns), never follows symlinks, and does not
+enter `.git`, `node_modules`, `.venv`, `venv`, `.cache` or `__pycache__`; under `~` it also skips dot directories
+(`~/.cargo`, `~/.rustup`, `~/.local/share/Trash`, ...) and `Library` (a root you name, such as `~/.cache`, is
+searched as named). A directory is a target only when the usual verification accepts it (a `Cargo.toml` beside it
+and Cargo's markers). On Linux the walk never stats into a mount point (`/proc/self/mountinfo`); on macOS there is no
+such list and the deadline below is the only protection against a dead network mount.
+
+Discovery and size checks of a root run in a separate interpreter (`python -P`, cwd `/`, no inherited file
+descriptor, its own process group) with a deadline (`HERDR_SURVEY_SECONDS`, 600 per root): it never holds the sweep's
+locks, and one that does not answer is killed with its group (one stuck in the kernel is reaped at the next call). A
+root whose discovery did not finish is skipped with a warning and the others still sweep; a survey cut off while it
+measured keeps the targets it had finished, with a warning that names how many were examined.
+
+The watcher reuses each root's target list for 6 hours (`build-cleanup-targets.json`, best effort: a disk too full
+to write it, or the report, is a warning and the sweep goes on). A malformed cache entry is ignored with a warning;
+a cached target that no longer exists is dropped silently. The disk guard before a build uses the cache and never
+walks the home directory: with no cache for `~`, the explicit non-home roots are still swept, `~` is reported as
+`skipped` ("home directory not searched") and the refusal message says so ("Not searched: ..."). A project whose
+nearest git repository is `$HOME` itself, or that is outside any repository, is not cleaned. Setting `roots`
+replaces the default.
+
+The busy check (`_inventory`) still walks the whole target once to learn which files a process could hold; for a
+very large target this is the slowest step of a pass and is bounded by `HERDR_BUSY_CHECK_SECONDS`.
 
 `scripts/install.sh` (step 7g) installs and enables the cleanup service or timer by default; `--no-build-hygiene` or
 `HERDR_INSTALL_BUILD_HYGIENE=0` opts out.

@@ -233,8 +233,9 @@ def test_discovery_does_not_enter_other_filesystems(workspace, monkeypatch):
         return Entries() if path == workspace else original(path)
 
     monkeypatch.setattr(cleanup.os, "scandir", scandir)
-    assert run(workspace)["removed_count"] == 1
-    assert cache.exists() and not safe.exists()
+    # discovery runs in a child process now, which a patch here cannot reach: ask it directly
+    assert cleanup._discover(workspace) == [safe]
+    assert cache.exists()
 
 
 def test_mount_inside_target_is_preserved(workspace, monkeypatch):
@@ -251,10 +252,9 @@ def test_mount_inside_target_is_preserved(workspace, monkeypatch):
         return result
 
     monkeypatch.setattr(Path, "lstat", metadata)
-    result = run(workspace)
-    assert result["removed_count"] == 0
+    with pytest.raises(OSError, match="mount"):  # the sweep runs this check in a child process
+        cleanup._inspect(cache)
     assert cache.exists()
-    assert any("mount" in item["reason"] for item in result["skipped"])
 
 
 def test_deep_source_tree_does_not_block_shallow_cache(workspace, monkeypatch):
