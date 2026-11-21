@@ -7,7 +7,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from herdr_engineering.ci_report_relay import Outcomes, Relay, read_source, validate_bundle
-from herdr_engineering.control_plane.ci_monitor import REMOVED_RUN_ERRORS, RUN_REMOVED_ERROR
+from herdr_engineering.control_plane.ci_monitor import (
+    REMOVED_RUN_ERRORS,
+    RESOURCE_REMOVED_ERROR,
+    RUN_REMOVED_ERROR,
+)
 
 REVISION = 'a' * 40
 NAME = f'42-{REVISION}-hive-slurm.json'
@@ -424,7 +428,13 @@ class _WoodpeckerStandIn:
         status = self.statuses.get(path, 404)
         if status != 200:
             raise urllib.error.HTTPError(req.full_url, status, 'x', {}, io.BytesIO(b''))
-        body = {'number': 42, 'commit': REVISION, 'branch': 'main'} if path.endswith('/42') else {'id': 116}
+        if path.endswith('/42'):
+            body = {'number': 42, 'commit': REVISION, 'branch': 'main'}
+        elif path == '/api/user/repos':
+            # A well-formed repository list that does not hold the requested repository.
+            body = [{'id': 7, 'full_name': 'org/other', 'owner': 'org', 'name': 'other'}]
+        else:
+            body = {'id': 116}
         return io.BytesIO(json.dumps(body).encode())
 
 
@@ -450,6 +460,9 @@ def test_run_level_404_with_a_reachable_repository_is_the_removed_run_answer():
 def test_repo_level_auth_or_endpoint_404_is_not_the_removed_run_answer(statuses):
     answer = _detail_as_the_control_plane_answers(statuses)
     assert answer['available'] is False and answer['error'] not in REMOVED_RUN_ERRORS
+    if not statuses:
+        # The repository 404 keeps the generic not_found answer, not a run-removed one.
+        assert answer['error'] == RESOURCE_REMOVED_ERROR
 
 
 def test_repository_lookup_miss_is_not_the_removed_run_answer():
@@ -459,7 +472,9 @@ def test_repository_lookup_miss_is_not_the_removed_run_answer():
     provider = WoodpeckerProvider(base_url='https://ci.example', token='tok',
                                   client=_WoodpeckerStandIn({'/api/user/repos': 200}))
     answer = CIMonitor(provider_factory=lambda: provider).detail('org/missing', 42)
-    assert answer['available'] is False and answer['error'] not in REMOVED_RUN_ERRORS
+    # A real lookup miss raises not_found (generic answer), not invalid_response.
+    assert answer['available'] is False and answer['error'] == RESOURCE_REMOVED_ERROR
+    assert answer['error'] not in REMOVED_RUN_ERRORS
 
 
 @pytest.mark.parametrize('answer', [
