@@ -10,12 +10,32 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 
 from .errors import InvalidError
 
 MARKER = "herdr-managed-cargo-host-v1"
 COORDINATED = "HERDR_CARGO_HOST_COORDINATED"
+
+
+BUILD_SUBCOMMANDS = frozenset({"build", "check", "test", "clippy", "nextest", "run",
+                               "bench", "doc", "rustc", "rustdoc", "clean", "fix", "package"})
+
+
+def has_marker(path: Path) -> bool:
+    """True when the file starts with the managed-launcher marker (only its first 256 bytes are read)."""
+    try:
+        with path.open("rb") as handle:
+            return MARKER.encode() in handle.read(256)
+    except OSError:
+        return False
+
+
+def path_cargo_is_wrapper(command: str) -> bool:
+    """True when ``command`` resolves to the managed cargo launcher (which guards its own builds)."""
+    found = shutil.which(command)
+    return found is not None and has_marker(Path(found))
 
 
 def cargo_subcommand(arguments: list[str]) -> str | None:
@@ -105,17 +125,13 @@ def install(home: Path, real_cargo: Path, python: Path) -> dict[str, str]:
     compiler = root / "rustc-cache"
     manifest = root / "install.json"
     real_cargo = Path(os.path.abspath(real_cargo))
-    if launcher.exists() and not launcher.is_symlink() and MARKER not in launcher.read_text()[:256]:
+    if launcher.exists() and not launcher.is_symlink() and not has_marker(launcher):
         raise ValueError(f"Existing Cargo launcher is not ours: {launcher}")
     if launcher.is_symlink() or real_cargo.resolve() == launcher.resolve():
         raise ValueError("Cargo launcher would replace a symlink or recurse")
     # A caller installing an isolated/new home may discover this user's already
     # managed Cargo on PATH. Capture its real executable, not another launcher.
-    try:
-        with real_cargo.open("rb") as executable:
-            managed = MARKER.encode() in executable.read(256)
-    except OSError:
-        managed = False
+    managed = has_marker(real_cargo)
     if managed:
         existing_home = real_cargo.resolve().parents[2]
         original = json.loads((host_root(existing_home) / "install.json").read_text())
@@ -288,63 +304,148 @@ def enable_retention(config_path: Path, *, schedule: bool = True) -> dict[str, o
             "min_idle_hours": config.local.target_min_idle_hours}
 
 
+def _disk_guard_refusal(probe: Path, policy: Mapping | None = None) -> int | None:
+    """Exit code when the disk-budget guard refuses a new build, else None. Never blocks on faults."""
+    from .build_coord import _default_state_dir
+    from .disk_guard import EXIT_REFUSED, check_build_allowed
+    try:
+        if policy is None:
+            from .config import load_config
+            policy = load_config().get("build_cleanup", {})
+        decision = check_build_allowed(probe, policy, _default_state_dir())
+    except Exception as error:  # noqa: BLE001 - a guard fault must never stop a build
+        print(f"cargo-host: disk guard unavailable ({type(error).__name__})", file=sys.stderr)
+        return None
+    if decision.message:
+        print(f"cargo-host: {decision.message}", file=sys.stderr)
+    return None if decision.allowed else EXIT_REFUSED
+
+
+def _select_with_reserve(config, policy: Mapping, reserve: float):
+    """The first storage tier that keeps ``reserve`` percent free (the guard then measures this very tier).
+
+    When none does, one cleanup runs at the reserve line, on the filesystem of the tier that would
+    otherwise have been used (the guard's own cleanup, with its rate limit), and the tiers are looked at
+    again. Returns ``(selection, cleaned)``.
+    """
+    from .build_cache_location import select_storage
+    from .build_coord import _default_state_dir
+    from .disk_guard import relieve
+    state, tiers = _default_state_dir(), config.local.storage_tiers
+    selected = select_storage(tiers, state / "sccache", reserve)
+    if selected.directory is not None:
+        return selected, False
+    if not policy.get("enabled", True):
+        return selected, False  # cleanup is off: nothing to try
+    first = select_storage(tiers, state / "sccache", 0)
+    ran = None
+    try:
+        ran = relieve(policy, state, 100 - reserve, probe=first.directory, pressure=False)
+    except Exception as error:  # noqa: BLE001 - a cleanup fault must never turn a refusal into a crash
+        print(f"cargo-host: cleanup unavailable ({type(error).__name__})", file=sys.stderr)
+    # Only a sweep that removed something is a cleanup the refusal may claim.
+    return select_storage(tiers, state / "sccache", reserve), bool(ran)
+
+
+def _reserve_refusal(reserve: float, cleaned: bool) -> int:
+    from .disk_guard import EXIT_REFUSED, OVERRIDE_ENV
+    after = ", even after cleaning up" if cleaned else ""
+    print(f"cargo-host: no storage tier keeps {reserve:g}% of its disk free{after}: "
+          f"refusing to start a new build. Free space (herdr-eng build-cleanup run) or set {OVERRIDE_ENV}=1 "
+          "to build anyway.", file=sys.stderr)
+    return EXIT_REFUSED
+
+
 def run_cargo(argv: list[str]) -> int:
     real = _real_cargo(Path.home())
     command = [str(real), *argv]
     subcommand = cargo_subcommand(argv)
-    from .cli import _build_cache_config
-    config = _build_cache_config()
+    from .cli import _build_cache_config_and_policy
+    config, policy = _build_cache_config_and_policy()
     already_coordinated = os.environ.get(COORDINATED) == "1"
-    if (config is None or subcommand not in {"build", "check", "test", "clippy", "nextest", "run",
-                                            "bench", "doc", "rustc", "rustdoc", "clean", "fix", "package"}):
+
+    def guard(probe: Path) -> int | None:
+        return None if subcommand == "clean" else _disk_guard_refusal(probe, policy)
+
+    if subcommand not in BUILD_SUBCOMMANDS:
+        os.execvpe(str(real), command, dict(os.environ))
+        return 127  # pragma: no cover
+    if config is None:  # uncached builds still write to disk: the guard applies, nothing else does
+        from .cargo_target_storage import target_override
+        where = target_override(argv, os.environ, Path.cwd())
+        refused = guard(where if isinstance(where, Path) else Path.cwd())
+        if refused is not None:
+            return refused
         os.execvpe(str(real), command, dict(os.environ))
         return 127  # pragma: no cover
     from .build_cache_policy import effective_slots
     from .build_coord import _default_slots, _default_state_dir, run_gated
-    if config.local.manage_targets:
+
+    def start() -> int:
+        if already_coordinated:
+            os.execvpe(str(real), command, dict(os.environ))
+            return 127  # pragma: no cover
+        return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
+                         record=True, cache_config=config, max_load=1.5)
+
+    from .cargo_target_storage import (
+        alias_owned,
+        compatibility_alias,
+        maintenance_lock,
+        prepare_target,
+        target_override,
+        workspace_root,
+    )
+    override = target_override(argv, os.environ, Path.cwd())
+    if config.local.manage_targets and not override:
         from .build_cache_location import select_storage
-        from .cargo_target_storage import (
-            alias_owned,
-            compatibility_alias,
-            maintenance_lock,
-            prepare_target,
-            target_override,
-            workspace_root,
-        )
-        if not target_override(argv, os.environ, Path.cwd()):
-            with maintenance_lock(_default_state_dir()):
-                selected = select_storage(config.local.storage_tiers, _default_state_dir() / "sccache",
-                                          0 if subcommand == "clean" else config.local.min_free_disk_percent)
-                if selected.directory is None:
-                    raise ValueError("No writable storage tier meets the reserve; managed build was not started")
-                if not selected.directory.exists():
-                    removable = any(tier.name == selected.name and tier.volume_uuid
-                                    for tier in config.local.storage_tiers)
-                    if removable:
-                        raise ValueError("Selected external storage disappeared")
-                    selected.directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-                workspace = workspace_root(real, argv, Path.cwd())
-                old_target = workspace / "target"
-                if (old_target.exists() or old_target.is_symlink()) and not alias_owned(_default_state_dir(), workspace):
-                    if already_coordinated:
-                        os.execvpe(str(real), command, dict(os.environ))
-                        return 127  # pragma: no cover
-                    return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
-                                     record=True, cache_config=config, max_load=1.5)
-                target = prepare_target(selected.directory, workspace)
-                if not compatibility_alias(_default_state_dir(), workspace, target):
-                    raise ValueError("Default target changed concurrently; no automatic redirection applied")
-                os.environ["CARGO_TARGET_DIR"] = str(target)
-                if already_coordinated:
-                    os.execvpe(str(real), command, dict(os.environ))
-                    return 127  # pragma: no cover
-                return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
-                                 record=True, cache_config=config, max_load=1.5)
-    if already_coordinated:
-        os.execvpe(str(real), command, dict(os.environ))
-        return 127  # pragma: no cover
-    return run_gated(command, slots=effective_slots(config, _default_slots(), _default_state_dir()),
-                     record=True, cache_config=config, max_load=1.5)
+        from .disk_guard import OVERRIDE_ENV
+        with maintenance_lock(_default_state_dir()):
+            workspace = workspace_root(real, argv, Path.cwd())
+            old_target = workspace / "target"
+            if (old_target.exists() or old_target.is_symlink()) and not alias_owned(_default_state_dir(), workspace):
+                # An operator's own ./target (or link) is never replaced or redirected: the build writes into
+                # the repository, so that is the only filesystem measured, and it is guarded once.
+                return guard(Path(os.path.realpath(old_target))) or start()
+            reserve = 0 if subcommand == "clean" else config.local.min_free_disk_percent
+            tiers, sccache = config.local.storage_tiers, _default_state_dir() / "sccache"
+            selected = select_storage(tiers, sccache, 0)
+            if selected.directory is None:
+                raise ValueError("No writable storage tier; managed build was not started")
+            if reserve:
+                # The tier is chosen first (cleaning up once when none keeps the reserve), then the guard
+                # measures that very tier: a full primary never refuses a build a lower tier can take.
+                if os.environ.get(OVERRIDE_ENV) == "1":
+                    chosen, cleaned = select_storage(tiers, sccache, reserve), False
+                    if chosen.directory is None:
+                        print(f"cargo-host: below the {reserve:g}% free reserve; proceeding because "
+                              f"{OVERRIDE_ENV}=1", file=sys.stderr)
+                        chosen = selected
+                else:
+                    chosen, cleaned = _select_with_reserve(config, policy, reserve)
+                    if chosen.directory is None:
+                        return _reserve_refusal(reserve, cleaned)
+                selected = chosen
+            directory = selected.directory
+            if directory is None:
+                raise ValueError("No writable storage tier; managed build was not started")
+            refused = guard(directory)
+            if refused is not None:
+                return refused
+            if not directory.exists():
+                removable = any(tier.name == selected.name and tier.volume_uuid
+                                for tier in config.local.storage_tiers)
+                if removable:
+                    raise ValueError("Selected external storage disappeared")
+                directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+            target = prepare_target(directory, workspace)
+            if not compatibility_alias(_default_state_dir(), workspace, target):
+                raise ValueError("Default target changed concurrently; no automatic redirection applied")
+            os.environ["CARGO_TARGET_DIR"] = str(target)
+            # Incremental artifacts multiply the size of a managed target.
+            os.environ.setdefault("CARGO_INCREMENTAL", "0")
+            return start()
+    return guard(override if isinstance(override, Path) else Path.cwd()) or start()
 
 
 def run_rustc(argv: list[str]) -> int:

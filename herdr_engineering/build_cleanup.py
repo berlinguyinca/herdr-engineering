@@ -1,37 +1,81 @@
-"""Conservative, pressure-driven cleanup of idle Cargo output directories.
+"""Conservative cleanup of Cargo output directories, narrow by design.
 
-Build-coordinate commands share ``build-maintenance.lock`` with this module. Cleanup holds
-it exclusively for discovery, validation and removal. Linux process inspection
-also protects workspaces used by visible commands outside the build gate.
-Inaccessible Herdr descendants or unknown ancestry always preserve files. Only current-user Cargo ``target``
-directories inside explicit roots are eligible; no symlinks are followed.
+Sweeps exclude each other with ``build-cleanup.lock`` (exclusive) and take ``build-maintenance.lock``
+shared, which only excludes the destructive maintenance jobs (retention, migration, cache eviction) and
+never a running build, so the disk guard can sweep from inside ``build-coordinate``.
+
+What a sweep deletes, and nothing else:
+
+1. An orphaned target: a Herdr-managed target whose owning worktree path no longer exists and which no
+   process uses or is told to build into (the same per-target scan as for an idle target: a worktree that
+   was moved, not deleted, may still have a build running). The decision is made again under the manager lock, so a worktree recreated at the
+   same path is prepared afresh by the build and never loses its target. Only a not-found workspace whose
+   parent lists counts; the target is renamed to ``.trash-*`` and deleted after the lock is released.
+2. An idle target (no change for the idle floor, 24 h, or ``pressure_min_age_hours`` under pressure) whose
+   workspace exists, and only when no process uses the target or its workspace: its cwd,
+   executable, an open file or (Linux) a mapping is under either, or it is cargo-family with
+   ``CARGO_TARGET_DIR`` or ``--target-dir`` naming the target. The scan is taken fresh right before each
+   clean and fails closed. The delete is ``cargo clean --target-dir <dir>`` run for the workspace's
+   manifest, with ``build.build-dir`` pinned to the target (a shared build-dir is never deleted), so Cargo does
+its own locking. Busy checks compare (device, inode), never path spelling. On Linux the identity is read
+   from the kernel (the /proc cwd, exe and fd links, the maps dev:inode columns), so a process in another mount
+   namespace (a devcontainer, a rootless container) is seen. The scan runs in a child with a deadline
+   (``HERDR_BUSY_CHECK_SECONDS``, default 120): on timeout the sweep stops, reports "busy check timed out"
+   and releases its lock. Limit, stated plainly: without root (or CAP_SYS_PTRACE) the kernel's ptrace check makes
+   another uid's cwd, exe, fd and maps unreadable (``hidepid`` or not), so only this user's processes, and those
+   in user namespaces this user owns (rootless containers), are detected. Root services, ``sudo``-run binaries
+   and rootful containers running as a different uid are NOT; neither on macOS, where ``lsof`` lists only this
+   user's files. Such a process is skipped: ``sudo -i`` and setuid-root binaries (euid 0) by their root-owned
+   ``/proc/<pid>``. This user's own non-dumpable processes (``ping``, file-capability binaries, ``prctl``) have a
+   root-owned ``fd/``; they are detected ONLY through their command line, not by cwd, open files or mappings:
+   an absolute path in any argument (also after ``=``, in a ``:`` list, or glued as ``-L/x``) inside the target
+   or the workspace, or a program started by a relative path (``./target/release/x``) or a ``comm`` (cut at 15 characters)
+   that is the name of a regular file in the target; a title with whitespace is not a name. Other relative
+   arguments are not looked at.
+
+Targets are skipped when a build lease covers them, when git tracks files in them, or when anything inside
+looks foreign (links, special files, other owners). Only current-user Cargo ``target`` directories inside
+explicit roots are eligible; no symlinks are followed. A target without a workspace to clean through (a
+cache-only directory) is left alone.
 
 When ``build-registry.db`` exists in the state directory (spec 05), a target whose
 project directory is related (equal, inside or containing, by path prefix) to the
 scope of an unexpired build lease is preserved (``active_lease``). The lease is
 re-read right before deletion. A registry that exists but cannot be read makes the
-whole pass fail closed (``registry_unreadable``). Leases only ever ADD protection:
-the flock and /proc defences above are unchanged, and no registry file means
-exactly the legacy behaviour.
+whole pass fail closed (``registry_unreadable``). Leases only ever ADD protection.
 """
 from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import math
 import os
+import re
 import shutil
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .cargo_target_storage import (
+    TARGET_MARKER,
+    _manager_lock,
+    owner_record,
+    read_owner,
+    write_cachedir_tag,
+)
+from .disk_guard import measure
+
+log = logging.getLogger(__name__)
 _PRUNE = {".git", "node_modules", ".venv", "venv", ".cache", "__pycache__"}
 _MAX_ENTRIES = 500_000
 _MAX_DEPTH = 6
-
+MIN_IDLE_HOURS = 1
 
 
 def _managed_process(pid: Path, proc: Path) -> bool:
@@ -134,54 +178,296 @@ def _links(holder: Path) -> list[Path]:
     return links
 
 
-def _process_paths(proc: Path = Path("/proc")) -> list[Path]:
-    """Inspect visible same-user processes; hidden Herdr descendants block cleanup."""
-    paths = []
+_CARGO_NAMES = frozenset({"cargo", "rustc", "rustdoc", "rustfmt", "rust-analyzer", "clippy-driver"})
+_TARGET_ENV = ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR")
+# (pid, process name, how, path): "uses" is a cwd, executable, open file or mapping; "builds into" is the
+# target directory a cargo-family process was told to write (its environment or ``--target-dir``).
+# The fifth field is the identity the kernel gives the thing held, (st_dev, st_ino) of it and, for a cwd, of
+# its ancestors: read through /proc magic links and the maps columns, so it is right in any mount namespace
+# (a container's /workspaces/x is a path that does not exist here). Empty where only a path is known.
+Ident = tuple[int, int]
+Hold = tuple[int, str, str, Path, frozenset[Ident]]
+_NO_IDS: frozenset[Ident] = frozenset()
+
+
+def _cargo_family(name: str) -> bool:
+    return name in _CARGO_NAMES or name.startswith("cargo-")
+
+
+def _mapped(holder: Path) -> list[tuple[str, frozenset[Ident]]]:
+    """Files a process has mapped (``/proc/<pid>/maps``) with the device and inode that file lists: a library
+    loaded from a target stays in use after its descriptor is closed."""
+    found = []
+    for line in (holder / "maps").read_text(errors="replace").splitlines():
+        fields = line.split(None, 5)
+        if len(fields) == 6 and fields[5].startswith("/"):
+            ids = _NO_IDS
+            try:
+                major, minor = fields[3].split(":")
+                if int(fields[4]) != 0:
+                    ids = frozenset({(os.makedev(int(major, 16), int(minor, 16)), int(fields[4]))})
+            except ValueError:
+                pass
+            found.append((fields[5], ids))
+    return found
+
+
+def _link_ids(link: Path, directory: bool = False) -> frozenset[Ident]:
+    """(device, inode) of what a /proc magic link points at (and, for a cwd, of every ancestor in that
+    process's own mount): the kernel resolves the link, whatever the process's mount namespace spells."""
+    found: list[Ident] = []
+    try:
+        info = os.stat(link)
+        found.append((info.st_dev, info.st_ino))
+        step = str(link)
+        while directory and len(found) < 64:
+            step += "/.."
+            info = os.stat(step)
+            if (info.st_dev, info.st_ino) == found[-1]:
+                break
+            found.append((info.st_dev, info.st_ino))
+    except OSError:
+        pass
+    return frozenset(found)
+
+
+def _argv_target_dirs(argv: list[str]) -> list[str]:
+    found = []
+    for index, arg in enumerate(argv):
+        if arg == "--target-dir" and index + 1 < len(argv):
+            found.append(argv[index + 1])
+        elif arg.startswith("--target-dir="):
+            found.append(arg.split("=", 1)[1])
+    return found
+
+
+def _lsof_holds() -> list[Hold]:
+    """Open files, cwds, executables and mappings of this user's processes where /proc is absent (macOS).
+
+    Fails closed: if lsof cannot run, cleanup must not guess that nothing is in use.
+    """
+    try:
+        result = subprocess.run(["lsof", "-w", "-n", "-P", "-u", str(os.getuid()), "-Fpcn"],
+                                capture_output=True, text=True, timeout=120, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise OSError(f"Cannot inspect running processes: {exc}") from exc
+    if result.returncode > 1 or (result.returncode == 1 and not result.stdout):
+        raise OSError("Cannot inspect running processes: lsof failed")
+    holds: list[Hold] = []
+    pid, name = 0, ""
+    for line in result.stdout.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid, name = int(line[1:]), ""
+        elif line.startswith("c"):
+            name = line[1:]
+        elif line.startswith("n/") and pid != os.getpid():  # like the /proc scan, ignore this process
+            holds.append((pid, name, "uses", Path(line[1:]), _NO_IDS))
+    return holds
+
+
+def _ps(columns: str, *flags: str) -> list[tuple[int, str]]:
+    """``ps`` rows (pid, rest of the line) of this user; a ``ps`` that cannot run is an OSError."""
+    try:
+        listing = subprocess.run(["ps", *flags, "-U", str(os.getuid()), "-o", columns],
+                                 capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise OSError(f"Cannot list running processes: {exc}") from exc
+    if listing.returncode != 0:
+        raise OSError("Cannot list running processes: ps failed")
+    rows = []
+    for line in listing.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) != os.getpid():
+            rows.append((int(parts[0]), parts[1].strip()))
+    return rows
+
+
+def _ps_claims() -> list[Hold]:
+    """Target directories that cargo-family processes were told to build into, where /proc is absent: the
+    environment and arguments ``ps -E`` shows (best effort on macOS; a value with spaces is cut short)."""
+    names = {pid: Path(rest.split(None, 1)[1]).name for pid, rest in _ps("pid=,stat=,comm=")
+             if len(rest.split(None, 1)) == 2 and not rest.startswith(("Z", "X"))}
+    claims: list[Hold] = []
+    for pid, text in _ps("pid=,command=", "-ww", "-E"):
+        name = names.get(pid, "")
+        if not _cargo_family(name):
+            continue
+        tokens = text.split()
+        values = [t.split("=", 1)[1] for t in tokens if t.split("=", 1)[0] in _TARGET_ENV and "=" in t]
+        claims.extend((pid, name, "builds into", Path(v), _NO_IDS) for v in values + _argv_target_dirs(tokens)
+                      if v.startswith("/"))
+    return claims
+
+
+def _scan(proc: Path = Path("/proc"), *, paths_only: bool = False) -> list[Hold]:
+    """Everything this user's other processes hold or are building into, from one look at the host.
+
+    ``paths_only`` (the cleanup command's view) reads only the link targets: no ``stat`` of a link or its
+    ancestors and no ``maps``, which can block on a hung network mount, and a hidden (non-dumpable) process
+    that descends from Herdr raises, so the caller refuses as ``in_use``. The sweep keeps identities and
+    never aborts on a hidden process."""
+    if not proc.is_dir():
+        return _lsof_holds() + _ps_claims()
+    holds: list[Hold] = []
     with os.scandir(proc) as entries:
         pids = [Path(entry.path) for entry in entries if entry.name.isdigit()]
     for pid in pids:
         try:
-            if int(pid.name) == os.getpid() or pid.stat().st_uid != os.getuid():
-                continue
+            if int(pid.name) == os.getpid():
+                continue  # every uid: what another user's process holds shows only where /proc lets us read
             if _gone_or_zombie(pid):
                 continue
-            links = []
+            number = int(pid.name)
+            try:
+                name = (pid / "comm").read_text().strip()
+            except OSError:
+                name = ""
+            values: list[tuple[str, frozenset[Ident]]] = []
             for holder in _holders(pid):
                 try:
-                    links.extend(_links(holder))
+                    for link in _links(holder):
+                        try:
+                            values.append((os.readlink(link),
+                                           _NO_IDS if paths_only else _link_ids(link, link.name == "cwd")))
+                        except (FileNotFoundError, ProcessLookupError):  # descriptor closed / process exited
+                            continue
+                    if not paths_only:
+                        values.extend(_mapped(holder))
                 except (FileNotFoundError, ProcessLookupError):
                     continue
                 except PermissionError as exc:
                     if holder != pid:  # a live thread of a zombie leader that cannot be read: unverifiable
                         raise OSError(f"Cannot inspect thread {holder}") from exc
                     raise
-            for link in links:
-                try:
-                    value = os.readlink(link)
-                except (FileNotFoundError, ProcessLookupError):  # descriptor closed / process exited
-                    continue
-                if value.startswith("/"):
-                    paths.append(Path(value.removesuffix(" (deleted)")))
+            holds.extend((number, name, "uses", Path(v.removesuffix(" (deleted)")), ids)
+                         for v, ids in values if v.startswith("/"))
+            if _cargo_family(name) and not paths_only:
+                holds.extend(_proc_claims(pid, number, name))
         except (FileNotFoundError, ProcessLookupError):  # process exited during inspection
             continue
         except PermissionError:
             if _gone_or_zombie(pid):  # became a zombie or exited since the check above
                 continue
+            try:
+                # An owner other than us (``sudo -i``, a setuid-root binary: euid 0) shows in ``/proc/<pid>``.
+                # This user's own non-dumpable process (``ping``, file capabilities, ``prctl``) keeps that
+                # owner, but its ``fd`` entry turns root-owned.
+                foreign = pid.stat().st_uid != os.getuid()
+                hidden = False
+                if not foreign:
+                    try:
+                        hidden = (pid / "fd").stat().st_uid != os.getuid()
+                    except PermissionError:
+                        pass  # not even stat-able: unverifiable, handled as this user's own below
+            except OSError:
+                continue  # exited meanwhile
+            if foreign:
+                continue  # another user's process: nothing of it can be read
+            if hidden:  # cwd, exe and fds are closed to us, the command line is not
+                if paths_only and _managed_process(pid, proc):
+                    raise
+                holds.extend(_cmdline_holds(pid, int(pid.name)))
+                continue
             if _managed_process(pid, proc):
                 raise
             # Nondumpable daemons outside Herdr cannot be managed build jobs.
             continue
-    return paths
+    return holds
 
 
-def _discover(root: Path) -> list[Path]:
+def _process_paths(proc: Path = Path("/proc")) -> list[Path]:
+    """Every path another process holds (cwd, executable, open file, mapping), for ``cleanup_command``'s
+    /proc fallback. The same scan as the sweep, so both see one set of processes."""
+    return [hold[3] for hold in _scan(proc, paths_only=True)]
+
+
+def _cmdline_paths(argv: list[str]) -> set[str]:
+    """Absolute paths an argument spells: the argument itself, each ``=`` separated value and everything
+    after the first ``=`` (kept whole, so a path with ``:`` or ``=`` in it is caught), the entries of a ``:``
+    list, and the path of a short option glued to it (``-L/abs``). Linear in the length of the argument."""
+    found: set[str] = set()
+    for arg in argv:
+        spellings = {arg, arg.partition("=")[2], *arg.split("=")[1:]}
+        for spelling in spellings:
+            for piece in {spelling, *spelling.split(":")}:
+                if piece.startswith("/"):
+                    found.add(piece)
+                elif re.match(r"-[A-Za-z]/", piece):
+                    found.add(piece[2:])
+    return found
+
+
+def _cmdline_holds(pid: Path, number: int) -> list[Hold]:
+    """What a non-dumpable process of this user still gives away on its command line: absolute paths (the
+    program, ``--target-dir=/x``, ``-L/x``, ``a=b=/x``, ``/a:/b``). A relative program path (``./target/x``)
+    cannot be resolved without its cwd, so its basename, and the process's ``comm``, are held as names: a
+    regular file of that name in the target keeps it. Other relative arguments are not looked at. ``ping``
+    and ``sudo`` name nothing of a target."""
+    try:
+        comm = (pid / "comm").read_text().strip()
+        argv = [os.fsdecode(a) for a in (pid / "cmdline").read_bytes().split(b"\0") if a]
+    except OSError:
+        return []  # unreadable or gone: skipped
+    if not argv:
+        return []
+    holds: list[Hold] = [(number, comm, "uses", Path(item), _NO_IDS) for item in sorted(_cmdline_paths(argv))]
+    names = {comm}
+    if not argv[0].startswith("/"):
+        names.add(os.path.basename(argv[0]))
+    # a rewritten title (``sshd-session: user@pts/3``) is not the name of a file
+    holds.extend((number, comm, "named", Path(name), _NO_IDS) for name in sorted(names)
+                 if name and not re.search(r"\s", name) and not (name != comm and re.search(r"\s", argv[0])))
+    return holds
+
+
+def _files_named(target: Path, names: set[str]) -> dict[str, Path]:
+    """One walk of ``target``: for each of ``names`` a regular file of that name (or whose first 15
+    characters are it: ``comm`` is cut there)."""
+    found: dict[str, Path] = {}
+    for directory, _dirs, files in os.walk(target):  # walk() never follows links to directories
+        for name in files:
+            for key in {name, name[:15]} & names:
+                path = Path(directory, name)
+                if key not in found and path.is_file() and not path.is_symlink():
+                    found[key] = path
+        if len(found) == len(names):
+            break
+    return found
+
+
+def _proc_claims(pid: Path, number: int, name: str) -> list[Hold]:
+    """Target directories a cargo-family process builds into: ``CARGO_TARGET_DIR`` and ``--target-dir``."""
+    cwd = os.readlink(pid / "cwd")
+    environ = (pid / "environ").read_bytes().split(b"\0")
+    argv = [os.fsdecode(a) for a in (pid / "cmdline").read_bytes().split(b"\0")]
+    pairs = [os.fsdecode(e).split("=", 1) for e in environ if b"=" in e]
+    values = [value for key, value in pairs if key in _TARGET_ENV]
+    return [(number, name, "builds into", Path(os.path.join(cwd, v)), _NO_IDS) for v in values + _argv_target_dirs(argv)]
+
+
+def _discover(root: Path, managed: bool = True, unreadable: list[str] | None = None,
+              trash: list[Path] | None = None) -> list[Path]:
+    """Cargo targets under ``root``. ``managed`` also returns cache-only targets and Herdr-managed
+    ``targets/<workspace>`` dirs (what the sweep reclaims); migration wants repository targets only.
+    A subdirectory that cannot be read is skipped (and named in ``unreadable``), never the whole root.
+    Leftovers of an interrupted orphan removal (``targets/.trash-*``) are listed in ``trash``, never as targets."""
     pending = [(root, 0)]
     device = root.stat().st_dev
     found = []
     count = 0
     while pending:
         directory, depth = pending.pop()
-        with os.scandir(directory) as entries:
+        try:
+            managed_dir = (managed and directory.name == "targets"
+                           and (directory / ".herdr-target-root.json").is_file())
+            scanner = os.scandir(directory)
+        except OSError:
+            if directory == root:
+                raise
+            if unreadable is not None:
+                unreadable.append(str(directory))
+            continue
+        with scanner as entries:
             for entry in entries:
                 if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
                     continue
@@ -191,10 +477,19 @@ def _discover(root: Path) -> list[Path]:
                 path = Path(entry.path)
                 if entry.stat(follow_symlinks=False).st_dev != device:
                     continue
+                if managed_dir and entry.name.startswith(".trash-"):
+                    if trash is not None:
+                        trash.append(path)
+                    continue
+                if managed_dir and entry.name == ".owners":
+                    continue  # the manager's ownership records, not a target
+                if managed_dir and _managed_workspace(path) is not None:
+                    if _cargo_markers(path):
+                        found.append(path)
+                    continue
                 if entry.name == "target":
-                    markers = [path / ".rustc_info.json", path / "debug/.fingerprint",
-                               path / "release/.fingerprint"]
-                    if (directory / "Cargo.toml").is_file() and any(p.exists() for p in markers):
+                    if _cargo_markers(path) and ((directory / "Cargo.toml").is_file()
+                                                 or (managed and _cache_only_target(path))):
                         found.append(path)
                     continue
                 if entry.name in _PRUNE:
@@ -203,6 +498,279 @@ def _discover(root: Path) -> list[Path]:
                     continue  # deeper directories are outside this bounded sweep
                 pending.append((path, depth + 1))
     return found
+
+
+_CACHEDIR_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
+
+
+def _cargo_markers(target: Path) -> bool:
+    return any((target / m).exists() for m in
+               (".rustc_info.json", "debug/.fingerprint", "release/.fingerprint"))
+
+
+def _cache_only_target(target: Path) -> bool:
+    """A Cargo target not beside a manifest (shared pool, CARGO_TARGET_DIR) proven by CACHEDIR.TAG."""
+    tag = target / "CACHEDIR.TAG"
+    try:
+        return (not tag.is_symlink() and tag.is_file()
+                and tag.read_bytes()[:128].find(_CACHEDIR_SIGNATURE) >= 0)
+    except OSError:
+        return False
+
+
+def _managed_workspace(path: Path) -> Path | None:
+    """Workspace of a per-worktree managed target (``targets/<label>-<id>``), proven by the manager's
+    root marker and the target's own marker, or, when a killed ``cargo clean`` took the marker, the
+    manager's ownership record kept outside the target."""
+    try:
+        root_marker, marker = path.parent / ".herdr-target-root.json", path / TARGET_MARKER
+        if root_marker.is_symlink() or marker.is_symlink() or not root_marker.is_file():
+            return None
+        if json.loads(root_marker.read_text()).get("owner_uid") != os.getuid():
+            return None
+        if marker.is_file():
+            data = json.loads(marker.read_text())
+        else:
+            data = read_owner(path.parent, path.name) or {}
+        if data.get("owner_uid") != os.getuid() or not isinstance(data.get("workspace"), str):
+            return None
+        return Path(data["workspace"])
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _project(target: Path) -> Path:
+    """Directory whose activity keeps a target alive: its manifest directory, or the owning workspace."""
+    return _managed_workspace(target) or target.parent
+
+
+_CLEAN_SECONDS = 900  # one ``cargo clean`` may take this long
+
+
+def _chain(path: Path) -> set[Ident]:
+    """(device, inode) of ``path`` and of every ancestor that exists. Two spellings of one directory (case,
+    symlinks, bind mounts) give the same identity, which a string comparison would miss."""
+    found: set[Ident] = set()
+    for item in (path, *path.parents):
+        try:
+            info = os.stat(item)
+        except OSError:
+            continue
+        found.add((info.st_dev, info.st_ino))
+    return found
+
+
+def _identity(path: Path) -> Ident | None:
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def _inventory(target: Path) -> set[Ident]:
+    """(device, inode) of everything inside ``target``: what a process in another mount namespace, which
+    spells the path its own way, can be told apart by."""
+    found: set[Ident] = set()
+    pending = [target]
+    while pending:
+        try:
+            with os.scandir(pending.pop()) as entries:
+                for entry in entries:
+                    info = entry.stat(follow_symlinks=False)
+                    found.add((info.st_dev, info.st_ino))
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(Path(entry.path))
+        except OSError:
+            continue  # vanished or unreadable: whatever is there cannot be matched, nor deleted by cargo
+    own = _identity(target)
+    if own:
+        found.add(own)
+    return found
+
+
+def _busy_reason(holds: list[Hold], target: Path) -> str | None:
+    """Why ``target`` must not be cleaned right now, or None. Busy: a process has its cwd, executable, an
+    open file or a mapping inside the target or its workspace, or a cargo-family process was told to build
+    into the target. What is compared is identity ((device, inode) from the kernel where the scan has it,
+    else of the path and its ancestors), never the spelling of a path. Processes elsewhere do not matter.
+    A hold of kind ``named`` (a non-dumpable process known only by a relative program path or its ``comm``)
+    is busy when a regular file of that name, or of that 15-character prefix, is anywhere in the target.
+
+    This stats files of arbitrary processes; on a dead network mount that can block, so the sweep runs it
+    in a child process with a deadline (``_busy_check``)."""
+    mine = {ident for ident in (_identity(target), _identity(_project(target))) if ident}
+    inside = mine | _inventory(target)
+    target_id = _identity(target)
+    target_chain = _chain(target)
+    files = _files_named(target, {path.name for _p, _n, how, path, _i in holds if how == "named"})
+    for pid, name, how, path, ids in holds:
+        if how == "named":
+            if path.name in files:
+                return f"{name} (pid {pid}) is named like {files[path.name]}"
+        elif how == "uses":
+            if (ids | _chain(path)) & inside:
+                return f"{name} (pid {pid}) uses {path}"
+        elif (target_id and target_id in _chain(path)) or (_identity(path) in target_chain):
+            return f"{name} (pid {pid}) builds into {path}"
+    return None
+
+
+_BUSY_CHILD = "import sys; from herdr_engineering import build_cleanup as c; c._busy_child(sys.argv[1], int(sys.argv[2]))"
+_BUSY_SECONDS = 120.0  # the scan of a normal host takes a second; ``HERDR_BUSY_CHECK_SECONDS`` overrides
+
+
+def _busy_child(target: str, sweeper: int) -> None:
+    try:  # the sweeper that asked is not a holder: it may be run from inside the project it sweeps
+        holds = [hold for hold in _scan() if hold[0] != sweeper]
+        print(json.dumps({"busy": _busy_reason(holds, Path(target))}))
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"error": str(exc)}))
+
+
+def _busy_deadline() -> float:
+    raw = os.environ.get("HERDR_BUSY_CHECK_SECONDS")
+    if not raw:
+        return _BUSY_SECONDS
+    try:
+        seconds = float(raw)
+    except ValueError:
+        seconds = math.nan
+    if not math.isfinite(seconds) or seconds <= 0:
+        log.warning("ignoring HERDR_BUSY_CHECK_SECONDS=%r (not a positive number); using %g", raw, _BUSY_SECONDS)
+        return _BUSY_SECONDS
+    return seconds
+
+
+def _busy_check(target: Path) -> str | None:
+    """``_busy_reason`` over a fresh process scan, run in a child with a deadline so that a stat that hangs
+    (a dead NFS or sshfs mount a process sits on) can never hang the sweep or a build's disk guard. The child
+    runs from ``/`` without the script directory on its path (the sweeper's cwd is a user workspace). One that
+    does not answer in time, or any other failure here, gets its whole process group killed (``lsof``
+    included) and is left unwaited if it is stuck in the kernel; the caller fails closed."""
+    seconds = _busy_deadline()
+    root = str(Path(__file__).resolve().parent.parent)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [root, os.environ.get("PYTHONPATH")]))}
+    child = subprocess.Popen([sys.executable, "-P", "-c", _BUSY_CHILD, str(target), str(os.getpid())],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env, cwd="/",
+                             start_new_session=True)
+    answered = False
+    try:
+        try:
+            out, _ = child.communicate(timeout=seconds)
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"busy check timed out after {seconds:g} s") from exc
+        answered = True
+    finally:
+        if not answered and child.returncode is None:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass  # stuck in the kernel: abandoned, never waited for
+    try:
+        answer = json.loads(out.splitlines()[-1])
+    except (IndexError, ValueError) as exc:
+        raise OSError("busy check gave no answer") from exc
+    if "error" in answer:
+        raise OSError(answer["error"])
+    return answer["busy"]
+
+
+def _orphaned(target: Path) -> bool:
+    """True when the managed target's worktree is provably gone: ``lstat`` of its recorded absolute path says
+    it does not exist (and nothing else: a permission error says nothing) while the directory that held it
+    can be listed (a missing parent may be an unmounted volume, not a deletion)."""
+    workspace = _managed_workspace(target)
+    if workspace is None or not workspace.is_absolute():
+        return False
+    try:
+        os.lstat(workspace)
+        return False
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    try:
+        with os.scandir(workspace.parent) as entries:
+            next(entries, None)
+    except OSError:
+        return False
+    return True
+
+
+def _remove_orphan(target: Path) -> bool:
+    """Delete an orphaned managed target, deciding again under the manager lock (False: not an orphan).
+
+    The decision and one atomic rename to ``targets/.trash-<name>-<pid>`` happen under the lock; the slow
+    ``rmtree`` runs after it. A removal that stops part-way leaves only that trash directory, which the
+    next sweep's discovery removes: nothing can be using it.
+    """
+    # CPython's fd-based rmtree prevents symlink substitution attacks.
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise OSError("This platform lacks symlink-safe recursive removal")
+    trash = target.parent / f".trash-{target.name}-{os.getpid()}"
+    with _manager_lock(target.parent):
+        if not _orphaned(target):
+            return False
+        if os.path.lexists(trash):
+            shutil.rmtree(trash)
+        os.rename(target, trash)
+        owner_record(target.parent, target.name).unlink(missing_ok=True)
+    shutil.rmtree(trash)
+    return True
+
+
+def _cargo_clean(target: Path, timeout: float = _CLEAN_SECONDS) -> str | None:
+    """``cargo clean`` for the target's workspace (None on success, else why not). Cargo takes its own
+    locks; a managed target is cleaned under the manager lock, so a build that starts meanwhile waits in
+    ``prepare_target`` and then finds a freshly prepared target."""
+    from .build_hygiene import resolve_real_cargo
+    managed = _managed_workspace(target)
+    workspace = managed or target.parent
+    manifest = workspace / "Cargo.toml"
+    if not manifest.is_file() or manifest.is_symlink():
+        return "no workspace to clean through"
+    try:
+        proxy = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo") / "bin/cargo"
+        cargo = proxy if proxy.is_file() and os.access(proxy, os.X_OK) else resolve_real_cargo(Path.home())
+        env = {**os.environ, "CARGO_NET_OFFLINE": "true", "RUSTUP_AUTO_INSTALL": "0"}
+        for key in ("RUSTC_WRAPPER", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"):
+            env.pop(key, None)
+        # build-dir is pinned to the target too: a shared build-dir (config or environment) is never deleted
+        argv = [str(cargo), "clean", "--manifest-path", str(manifest), "--target-dir", str(target),
+                "--config", f"build.build-dir={json.dumps(str(target))}"]
+        if managed is None:
+            done = subprocess.run(argv, cwd=workspace, env=env, capture_output=True, text=True,
+                                  timeout=timeout, check=False)
+        else:
+            with _manager_lock(target.parent):
+                marker = target / TARGET_MARKER
+                if marker.exists():
+                    identity = marker.read_bytes()
+                else:  # a killed clean took it earlier: the manager's own record says what it was
+                    owner = read_owner(target.parent, target.name)
+                    if owner is None:
+                        return "no ownership record to restore the marker from"
+                    identity = (json.dumps(owner, sort_keys=True) + "\n").encode()
+                write_cachedir_tag(target)  # newer cargo refuses to clean a directory without one
+                try:
+                    done = subprocess.run(argv, cwd=workspace, env=env, capture_output=True, text=True,
+                                          timeout=timeout, check=False)
+                finally:  # however cargo ended (timeout, signal, error), the directory stays a managed one
+                    if not os.path.lexists(target):  # a workspace alias must not be left dangling
+                        target.mkdir(mode=0o700)
+                    if not os.path.lexists(marker):
+                        marker.write_bytes(identity)
+                    write_cachedir_tag(target)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return f"cargo clean could not run: {exc}"
+    if done.returncode != 0:
+        return f"cargo clean failed: {(done.stderr or done.stdout).strip().splitlines()[-1:] or ['?']}"
+    return None
 
 
 def _inspect(target: Path) -> tuple[float, int]:
@@ -236,8 +804,15 @@ def _inspect(target: Path) -> tuple[float, int]:
 
 def _untracked(target: Path) -> bool:
     """Git must verify the entire target is untracked, including nested files."""
+    if _managed_workspace(target) is not None:
+        return True  # lives in the state directory, not in a repository
+    cache_only = not (target.parent / "Cargo.toml").is_file()
+    if cache_only and subprocess.run(
+            ["git", "-C", str(target.parent), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, timeout=30, check=False).returncode != 0:
+        return True  # cache-only directory (verified by CACHEDIR.TAG) outside any repository
     result = subprocess.run(
-        ["git", "-C", str(target.parent), "ls-files", "--", "target"],
+        ["git", "-C", str(target.parent), "ls-files", "--", target.name],
         capture_output=True, timeout=30, check=False,
     )
     return result.returncode == 0 and not result.stdout
@@ -245,9 +820,10 @@ def _untracked(target: Path) -> bool:
 
 def _recognized(target: Path) -> bool:
     """Same recognition rule as discovery: a Cargo ``target`` with build markers."""
-    return (target.name == "target" and (target.parent / "Cargo.toml").is_file()
-            and any((target / m).exists() for m in
-                    (".rustc_info.json", "debug/.fingerprint", "release/.fingerprint")))
+    if _managed_workspace(target) is not None:
+        return _cargo_markers(target)
+    return (target.name == "target" and _cargo_markers(target)
+            and ((target.parent / "Cargo.toml").is_file() or _cache_only_target(target)))
 
 
 def _lease_block(state_dir: Path, target: Path) -> str | None:
@@ -259,7 +835,7 @@ def _lease_block(state_dir: Path, target: Path) -> str | None:
         scopes = active_scopes(state_dir)
     except RegistryError:
         return "registry_unreadable"
-    project = target.parent
+    project = _project(target)
     for raw in scopes:
         if not raw.startswith("/"):
             continue  # named scopes do not describe a path
@@ -270,11 +846,8 @@ def _lease_block(state_dir: Path, target: Path) -> str | None:
 
 
 def _usage(path: Path) -> float:
-    usage = shutil.disk_usage(path)
-    if usage.total <= 0:
-        raise OSError(f"Cannot measure filesystem at {path}")
-    # Use available space (rather than used) so reserved blocks count as unavailable.
-    return 100 * (usage.total - usage.free) / usage.total
+    """Percent used, by the one measurement every disk decision shares (``df``; see ``disk_guard.measure``)."""
+    return measure(path)[0]
 
 
 def _write_status(state_dir: Path, result: dict) -> None:
@@ -291,37 +864,49 @@ def _write_status(state_dir: Path, result: dict) -> None:
 def run_once(
     roots: list[str | Path], state_dir: str | Path, dry_run: bool = False,
     high_water: float = 85, low_water: float = 80, min_age_hours: float = 24,
+    pressure_water: float = 90, pressure_min_age_hours: float = 2,
+    only_device: int | None = None,
 ) -> dict:
     """Run one bounded sweep and atomically save its inspectable status.
 
     ``state_dir`` must be the same build-gates directory used by ``run_gated``.
     ``reclaimed_bytes`` measures observed free-space gain; ``removed_bytes`` is
     the allocated size of removed files. Concurrent filesystem activity can
-    affect the former. Dry runs fully validate eligible targets but never remove
-    them. Busy sweeps return immediately without overwriting the last report.
+    affect the former. Targets must be idle ``min_age_hours``; when a root's usage reaches
+    ``pressure_water`` the idle floor drops to ``pressure_min_age_hours`` (never below
+    ``MIN_IDLE_HOURS``). Orphaned managed targets go at any age; every other target needs the idle floor
+    and no process of this user inside it or its workspace (see the module docstring). Lease and git guards apply in both
+    tiers. Dry runs fully validate eligible targets but never remove them. Busy sweeps return immediately
+    without overwriting the last report. ``only_device`` limits the sweep to roots on that filesystem (the
+    one under pressure).
     """
-    if not all(math.isfinite(v) for v in (high_water, low_water, min_age_hours)):
+    if not all(math.isfinite(v) for v in (high_water, low_water, min_age_hours,
+                                          pressure_water, pressure_min_age_hours)):
         raise ValueError("Cleanup policy values must be finite")
-    if not 0 <= low_water < high_water <= 100 or min_age_hours < 24:
-        raise ValueError("Require 0 <= low_water < high_water <= 100 and min_age_hours >= 24")
+    if not 0 <= low_water < high_water <= 100 or not 0 <= pressure_water <= 100:
+        raise ValueError("Require 0 <= low_water < high_water <= 100 and 0 <= pressure_water <= 100")
+    if min_age_hours < MIN_IDLE_HOURS or pressure_min_age_hours < MIN_IDLE_HOURS:
+        raise ValueError(f"Idle floors must be at least {MIN_IDLE_HOURS} hour(s)")
     state_dir = Path(state_dir).expanduser().absolute()
     state_dir.mkdir(parents=True, exist_ok=True)
     result = {
         "timestamp": datetime.now(UTC).isoformat(), "status": "ok", "dry_run": dry_run,
         "roots": [], "removed_count": 0, "removed_bytes": 0, "reclaimed_bytes": 0,
         "removed": [], "would_remove": [], "skipped": [], "errors": [], "warnings": [],
-        "reconciled": [],
+        "reconciled": [], "pressure": False, "process_scans": 0, "aborted": False, "blocked": [],
     }
-    lock_fd = os.open(state_dir / "build-maintenance.lock",
-                      os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    lock_fds = [os.open(state_dir / name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+                for name in ("build-cleanup.lock", "build-maintenance.lock")]
     try:
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock_fds[0], fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock_fds[1], fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
             result["status"] = "busy"
             return result
         _reconcile_registry(state_dir, result)
-        _sweep(roots, state_dir, result, high_water, low_water, min_age_hours)
+        _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
+               pressure_water, pressure_min_age_hours, only_device)
         if result["warnings"]:
             result["status"] = "warning"
         if result["errors"]:
@@ -333,7 +918,8 @@ def run_once(
                        removed_count=result["removed_count"], removed_bytes=result["removed_bytes"])
         return result
     finally:
-        os.close(lock_fd)
+        for fd in lock_fds:
+            os.close(fd)
 
 
 def _reconcile_registry(state_dir: Path, result: dict) -> None:
@@ -364,44 +950,85 @@ def _skip_for_registry(state_dir: Path, target: Path, name: str, result: dict) -
     return True
 
 
-def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours):
-    roots_by_device = {}
-    candidates = []
-    cutoff = time.time() - min_age_hours * 3600
-    try:
-        for raw in roots:
-            root = Path(raw).expanduser().absolute()
-            if root != root.resolve(strict=True) or not root.is_dir() or root == Path("/"):
-                raise OSError(f"Root must be a canonical project directory: {root}")
-            result["roots"].append(str(root))
-            if _usage(root) < high_water:
-                continue
-            roots_by_device[root.stat().st_dev] = root
-            for target in _discover(root):
-                if state_dir.is_relative_to(target):
-                    raise OSError(f"Maintenance state is inside cleanup target: {target}")
-                if target.stat().st_dev != root.stat().st_dev:
-                    result["skipped"].append({"path": str(target), "reason": "different filesystem"})
-                    continue
+def _skip_root(result: dict, root: Path, reason: str) -> None:
+    """One bad root never stops the sweep of the others (the managed pools come last)."""
+    note = f"skipped root {root}: {reason}"
+    log.warning("build cleanup %s", note)
+    result["warnings"].append(note)
+
+
+def _candidates(roots, state_dir, result, high_water, min_age_hours, pressure_water, pressure_min_age_hours,
+                only_device):
+    """Targets on the roots that are over ``high_water``: (newest mtime, path, size, idle cutoff) each, and
+    the root they live on by device. Leftovers of an interrupted orphan removal are removed here."""
+    candidates, roots_by_device = [], {}
+    now = time.time()
+    for raw in roots:
+        root = Path(raw).expanduser().absolute()
+        try:
+            canonical = root == root.resolve(strict=True) and root.is_dir() and root != Path("/")
+        except OSError:
+            canonical = False
+        if not canonical:
+            _skip_root(result, root, "not a canonical project directory")
+            continue
+        if only_device is not None and root.stat().st_dev != only_device:
+            continue  # deleting there cannot relieve the filesystem under pressure
+        result["roots"].append(str(root))
+        usage = _usage(root)
+        if usage < high_water:
+            continue
+        under_pressure = usage >= pressure_water
+        cutoff = now - (min(min_age_hours, pressure_min_age_hours) if under_pressure else min_age_hours) * 3600
+        result["pressure"] = result["pressure"] or under_pressure
+        roots_by_device[root.stat().st_dev] = root
+        try:
+            unreadable: list[str] = []
+            trash: list[Path] = []
+            targets = _discover(root, unreadable=unreadable, trash=trash)
+            for leftover in trash if not result["dry_run"] else []:
                 try:
-                    newest, size = _inspect(target)
-                except OSError as exc:
-                    result["skipped"].append({"path": str(target), "reason": str(exc)})
-                    result["errors"].append(str(exc))
-                    continue
-                if newest > cutoff:
-                    result["skipped"].append({"path": str(target), "reason": "recent activity"})
-                else:
-                    candidates.append((newest, str(target), size))
-        if not candidates:
-            return
-        # Verify process visibility before deleting anything.
-        active = _process_paths()
+                    shutil.rmtree(leftover)  # nothing can be using it: it was renamed out of reach
+                except OSError as exc:  # one stuck leftover skips itself; the rest of the root still sweeps
+                    result["skipped"].append({"path": str(leftover), "reason": f"cannot delete: {exc}"})
+            for name in unreadable[:5]:
+                _skip_root(result, Path(name), "unreadable directory skipped")
+        except OSError as exc:
+            _skip_root(result, root, str(exc))
+            continue
+        for target in targets:
+            if state_dir.is_relative_to(target):
+                raise OSError(f"Maintenance state is inside cleanup target: {target}")
+            if target.stat().st_dev != root.stat().st_dev:
+                result["skipped"].append({"path": str(target), "reason": "different filesystem"})
+                continue
+            try:
+                newest, size = _inspect(target)
+            except OSError as exc:
+                result["skipped"].append({"path": str(target), "reason": str(exc)})
+                result["errors"].append(str(exc))
+                continue
+            if newest > cutoff and not _orphaned(target):
+                result["skipped"].append({"path": str(target), "reason": "recent activity"})
+            else:
+                candidates.append((newest, str(target), size, cutoff))
+    return candidates, roots_by_device
+
+
+def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
+           pressure_water=90, pressure_min_age_hours=2, only_device=None):
+    try:
+        candidates, roots_by_device = _candidates(
+            roots, state_dir, result, high_water, min_age_hours, pressure_water, pressure_min_age_hours,
+            only_device)
     except (OSError, ValueError) as exc:
         result["errors"].append(str(exc))
+        result["aborted"] = True  # the sweep itself failed (discovery): nothing was judged
         return
     seen = set()
-    for _, name, _ in sorted(candidates):
+    for _, name, size, cutoff in sorted(candidates):
+        if result["aborted"]:
+            break  # a failed busy check stops the sweep: nothing more is judged on a host we cannot read
         if name in seen:
             continue
         seen.add(name)
@@ -410,40 +1037,74 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours):
             root = roots_by_device[target.stat().st_dev]
             if _usage(root) <= low_water:
                 continue
-            if any(path.is_relative_to(target.parent) for path in active):
-                result["skipped"].append({"path": name, "reason": "active project"})
-                continue
-            if _skip_for_registry(state_dir, target, name, result):
-                continue
-            if not _untracked(target):
-                result["skipped"].append({"path": name, "reason": "tracked or unverifiable output"})
-                continue
-            # Revalidate immediately before deletion while still holding the build lock.
-            newest, size = _inspect(target)
-            if newest > cutoff:
-                result["skipped"].append({"path": name, "reason": "recent activity"})
-                continue
-            active = _process_paths()
-            if any(path.is_relative_to(target.parent) for path in active):
-                result["skipped"].append({"path": name, "reason": "active project"})
-                continue
-            if _skip_for_registry(state_dir, target, name, result):
-                continue  # lease re-read after the last scan, before any removal
-            if not _recognized(target):
-                raise OSError(f"Target no longer recognized as a Cargo output: {name}")
-            if result["dry_run"]:
-                result["would_remove"].append(name)
-                continue
             before = shutil.disk_usage(root).free
-            # CPython's fd-based rmtree prevents symlink substitution attacks.
-            if not shutil.rmtree.avoids_symlink_attacks:
-                raise OSError("This platform lacks symlink-safe recursive removal")
-            shutil.rmtree(target)
-            after = shutil.disk_usage(root).free
-            result["removed_count"] += 1
-            result["removed_bytes"] += size
-            result["reclaimed_bytes"] += max(0, after - before)
-            result["removed"].append(name)
+            if _orphaned(target):
+                if _blocked_by_process(target, name, result):
+                    continue  # moved, not deleted: something still builds into it
+                if result["dry_run"]:
+                    result["would_remove"].append(name)
+                    continue
+                if not _remove_orphan(target):
+                    result["skipped"].append({"path": name, "reason": "worktree is back"})
+                    continue
+            elif not _clean_idle(target, name, cutoff, state_dir, result):
+                continue
         except (OSError, subprocess.SubprocessError) as exc:
             result["errors"].append(f"{name}: {exc}")
             break  # unknown state is a reason to stop, never to broaden deletion
+        result["removed_count"] += 1
+        result["removed_bytes"] += size
+        result["reclaimed_bytes"] += max(0, shutil.disk_usage(root).free - before)
+        result["removed"].append(name)
+
+
+def _blocked_by_process(target: Path, name: str, result: dict) -> bool:
+    """A fresh process scan right before deleting ``target`` (idle or orphan): True when it must stay, with
+    the reason in ``skipped`` and ``blocked``. A scan that cannot be read fails closed."""
+    result["process_scans"] += 1
+    busy = None
+    for attempt in range(6):  # a process mid-exec is unreadable for a moment
+        try:
+            busy = _busy_check(target)
+            break
+        except TimeoutError as exc:  # a hung stat will hang again: no retries, fail closed
+            busy = f"process list unreadable: {exc}"
+            break
+        except (OSError, ValueError) as exc:  # still unreadable after retries: fail closed, this target stays
+            busy = f"process list unreadable: {exc}"
+            if attempt < 5:
+                time.sleep(0.25)
+    if busy is None:
+        return False
+    if busy.startswith("process list unreadable"):
+        result["errors"].append(busy)
+        result["aborted"] = True
+    result["blocked"].append({"path": name, "reason": busy})
+    result["skipped"].append({"path": name, "reason": busy})
+    return True
+
+
+def _clean_idle(target: Path, name: str, cutoff: float, state_dir: Path, result: dict) -> bool:
+    """Clean one idle target through cargo; True when it went. Otherwise the reason is in ``skipped``."""
+    def skip(reason: str) -> bool:
+        result["skipped"].append({"path": name, "reason": reason})
+        return False
+
+    if not _untracked(target):
+        return skip("tracked or unverifiable output")
+    newest, _ = _inspect(target)  # revalidate right before deleting
+    if newest > cutoff:
+        return skip("recent activity")
+    if not _recognized(target):
+        raise OSError(f"Target no longer recognized as a Cargo output: {name}")
+    if _skip_for_registry(state_dir, target, name, result):  # cheap: a leased target needs no scan
+        return False
+    if _blocked_by_process(target, name, result):
+        return False
+    if _skip_for_registry(state_dir, target, name, result):  # read again: a lease taken during the scan counts
+        return False
+    if result["dry_run"]:
+        result["would_remove"].append(name)
+        return False
+    reason = _cargo_clean(target)
+    return skip(reason) if reason else True

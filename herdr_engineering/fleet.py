@@ -322,6 +322,11 @@ def _refresh_controller_handoff(root: Path, report: dict) -> None:
             "by this step (issue #799)")
 
 
+def _cleanup_job_wanted(cleanup: object) -> bool:
+    """Build-hygiene's rule for keeping the cleanup job: anything but an explicit ``enabled: false``."""
+    return not isinstance(cleanup, dict) or bool(cleanup.get("enabled", True))
+
+
 def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                  inventory: Path | None = None, pull_controller: bool = True,
                  reinstall_local: bool = True, revision: str | None = None,
@@ -447,17 +452,10 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
 
     from .config import load_config
     cleanup = load_config().get("build_cleanup", {})
-    roots = cleanup.get("roots", []) if isinstance(cleanup, dict) else []
-    enabled = (isinstance(cleanup, dict) and cleanup.get("enabled") is True
-               and isinstance(roots, list) and bool(roots)
-               and all(isinstance(path, str) and path.strip() for path in roots))
-    installer = root / "scripts" / "build-cleanup.sh"
-    if enabled and installer.exists():
-        ok, _ = step("controller_cleanup", ["bash", str(installer)], 120)
-        if not ok:
-            return report
-
-    elif not enabled and sys.platform.startswith("linux"):
+    # The same rule build-hygiene applies: only an explicit `enabled: false` removes the job (empty roots
+    # still sweep the managed targets), so the disable below never fights the re-enable that follows.
+    job_wanted = _cleanup_job_wanted(cleanup)
+    if not job_wanted and sys.platform.startswith("linux"):
         loaded, value, _ = _run(["systemctl", "--user", "show",
                                  "herdr-eng-build-cleanup.service",
                                  "-p", "LoadState", "--value"], timeout=30)
@@ -466,6 +464,11 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                          "--now", "herdr-eng-build-cleanup.service"], 120)
             if not ok:
                 return report
+
+    # Disk hygiene is on by default: the cleanup job (systemd on Linux, launchd on macOS) and the managed
+    # cargo launcher, all written by build-hygiene (it resolves the herdr-eng executable and skips a stale
+    # virtualenv's; the old systemd script did neither). Non-fatal - `herdr-eng doctor` reports a gap.
+    step("controller_build_hygiene", [sys.executable, "-m", "herdr_engineering.cli", "build-hygiene", "install"], 120)
 
     # Refresh whichever unattended updater the controller actually has loaded - the installer
     # holds the unit/plist templates, so a schedule or working-directory change reaches a host

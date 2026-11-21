@@ -72,7 +72,9 @@ cd herdr-engineering && scripts/install.sh
 ```
 
 Machine-local config now auto-discovered by the CLI (`~/.config/herdr-engineering/config.yaml`),
-overridden by repo `config/herdr-engineering.yaml`, then `$HERDR_ENGINEERING_CONFIG`.
+overridden by the repo's `config/herdr-engineering.yaml` for only `web.port`, `tests.adapters`,
+`ci.provider` and `ci.pileated_extensions` (a checkout is untrusted input; every other key is ignored
+with a one-time warning naming it), then `$HERDR_ENGINEERING_CONFIG` (machine config, all keys).
 
 ## What exists (verified, not assumed)
 

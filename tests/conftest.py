@@ -64,6 +64,12 @@ def pytest_addoption(parser):
                      help="skip (instead of fail) the Fabric HTTP tests on a host with no non-loopback address")
 
 
+@pytest.fixture(autouse=True)
+def _disk_guard_override_by_default(monkeypatch):
+    """A nearly full dev disk must not refuse builds in unrelated tests; guard tests unset this."""
+    monkeypatch.setenv("HERDR_DISK_GUARD_OVERRIDE", "1")
+
+
 def _flaky_plugin():
     """The quarantine / failed-test-list plugin of the unit gate (scripts/ci/herdr_flaky_plugin.py), loaded by path so a plain
     ``pytest`` run quarantines exactly like the gate does. The gate also passes ``-p herdr_flaky_plugin``; one registration wins."""
