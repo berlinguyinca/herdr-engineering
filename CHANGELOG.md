@@ -7,7 +7,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Agent rules: push work branches and open PRs autonomously
 
-- `AGENTS.md` and the managed `SessionStart` reminder no longer require an explicit per-message ask before pushing herdr-engineering or opening a PR. Agents push their own work branches and open PRs themselves; pushing `main` directly and force-pushing someone else's branch stay forbidden.
+- `AGENTS.md` and the managed `SessionStart` reminder no longer require an explicit per-message ask before pushing herdr-engineering or opening a PR. Agents push their own work branches and open PRs themselves; pushing `main` and force-pushing or pushing someone else's branch stay forbidden (the reminder says so). The managed `PreToolUse` guard matches: a plain herdr-engineering push of a non-main branch is allowed, while force/destructive pushes (`-f`, `--force*`, `--mirror`, `--delete`/`-d`, `--prune`, `+` or `:branch` refspecs) still need the one-shot human token, including in the untokenizable-command fallback. Push to main/master stays denied.
 
 ### Fix: Pi fleet rollouts converge - pinned target, resumable drain, bounded state (#844)
 
