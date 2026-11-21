@@ -443,14 +443,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pr = fsub.add_parser("rollout", help="durable Pi runtime update and mission recovery")
     rsub = pr.add_subparsers(dest="rollout_command", required=True)
-    for action in ("plan", "apply", "run", "status"):
+    for action in ("plan", "apply", "run", "status", "latest"):
         rp = rsub.add_parser(action)
         rp.add_argument("--state", default=None, help="private rollout state directory")
         if action == "plan":
-            rp.add_argument("--pi-revision", required=True, help="full immutable Pi commit SHA")
+            rp.add_argument("--pi-revision", default=None,
+                            help="full immutable Pi commit SHA; defaults to the pinned "
+                                 "revision (~/.config/herdr-engineering/pi-rollout-revision)")
             rp.add_argument("--host", default=None)
             rp.add_argument("--inventory", default=None)
-        else:
+        elif action != "latest":
             rp.add_argument("--id", required=True, help="rollout ID printed by plan")
         if action == "run":
             rp.add_argument("--interval-seconds", type=int, default=30, help="initial retry interval, 1..3600 (backoff caps at max(interval, 300))")
@@ -470,6 +472,25 @@ def _build_parser() -> argparse.ArgumentParser:
         default="operator",
         help="who is settling the registration; recorded per session in the report",
     )
+    rp.set_defaults(func=_cmd_fleet_rollout)
+
+    rp = rsub.add_parser(
+        "abandon",
+        help="settle a rollout the operator no longer wants (e.g. it targets an unpinned "
+        "revision); the record stays until pruned, and the newest unfinished selector "
+        "moves on",
+    )
+    rp.add_argument("--state", default=None, help="private rollout state directory")
+    rp.add_argument("--id", required=True, help="rollout ID printed by plan")
+    rp.add_argument("--reason", default="abandoned by operator", help="why; recorded in the plan")
+    rp.set_defaults(func=_cmd_fleet_rollout)
+
+    rp = rsub.add_parser(
+        "prune",
+        help="delete settled (complete/abandoned) rollout records older than the horizon",
+    )
+    rp.add_argument("--state", default=None, help="private rollout state directory")
+    rp.add_argument("--older-than-days", type=int, default=30, help="settle horizon (default 30)")
     rp.set_defaults(func=_cmd_fleet_rollout)
 
     # artifacts ------------------------------------------------------------
@@ -2321,9 +2342,13 @@ def _cmd_fleet_rollout(args) -> int:
     from .fleet import FleetError, repo_root
     from .fleet_rollout import (
         RolloutStore,
+        abandon_rollout,
         apply_rollout,
         create_rollout,
         inventory_targets,
+        latest_unfinished,
+        prune_settled,
+        resolve_plan_revision,
         retire_identityless,
         run_rollout,
     )
@@ -2331,14 +2356,22 @@ def _cmd_fleet_rollout(args) -> int:
     store = RolloutStore(Path(args.state) if args.state else None)
     try:
         if args.rollout_command == "plan":
+            revision = resolve_plan_revision(args.pi_revision)
             inventory = Path(args.inventory) if args.inventory else repo_root() / "ansible/inventory/hosts.yml"
-            report = create_rollout(store, args.pi_revision, inventory_targets(inventory, args.host), inventory=inventory)
+            report = create_rollout(store, revision, inventory_targets(inventory, args.host), inventory=inventory)
         elif args.rollout_command == "apply":
             report = apply_rollout(store, args.id)
         elif args.rollout_command == "run":
             report = run_rollout(store, args.id, interval_seconds=args.interval_seconds, max_passes=args.max_passes, max_unchanged_online_passes=args.max_unchanged_online_passes)
         elif args.rollout_command == "retire-identityless":
             report = retire_identityless(store, args.id, settled_by=args.settled_by)
+        elif args.rollout_command == "latest":
+            plan = latest_unfinished(store)
+            report = plan if plan is not None else {"status": "none", "reason": "no unfinished rollout"}
+        elif args.rollout_command == "abandon":
+            report = abandon_rollout(store, args.id, reason=args.reason)
+        elif args.rollout_command == "prune":
+            report = {"pruned": prune_settled(store, older_than_days=args.older_than_days)}
         else:
             report = store.read(args.id)
     except (OSError, ValueError, RuntimeError, FleetError) as exc:

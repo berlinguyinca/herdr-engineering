@@ -62,5 +62,6 @@ tests/share-fixtures/html-parquet-duckdb/vendor/extensions/
 # local pytest TMPDIR scratch
 .tmp/
 .herdr-test/
+.venv-test/
 pytest-retried.jsonl
 .coverage-local/
