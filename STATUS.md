@@ -56,7 +56,7 @@ collection warnings. Real command + live-fleet snapshots are captured under
 | 0150 Unified engineering UX | COMPLETE | `web.py` navigation surfaces |
 | 0160 Attention/notifications/review | COMPLETE | `attention.py`, `herdr-eng attention`, attention tests |
 | 0170 Observability/security/update/rollback | COMPLETE | `observability.py`, `doctor.py`, listener tests |
-| 0180 Fleet validation/release/docs | COMPLETE (docs/repo/CI); live fleet `BLOCKED_EXTERNAL` | README, `.github/workflows/ci.yml`, `scripts/`, acceptance matrix |
+| 0180 Fleet validation/release/docs | COMPLETE (docs/repo/CI); live fleet `BLOCKED_EXTERNAL` | README, `.woodpecker/`, `scripts/`, acceptance matrix |
 
 ## One-shot installer
 
