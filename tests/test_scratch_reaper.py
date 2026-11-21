@@ -605,6 +605,28 @@ def test_cargo_recognition_is_revalidated_before_removal(tree: Tree) -> None:
     assert (candidate.path / "unique.txt").exists()
 
 
+@pytest.mark.parametrize("mode", ["debug", "release"])
+def test_cargo_new_build_dir_layout_is_recognized(tree: Tree, mode: str) -> None:
+    """cargo >= 1.99 writes no .rustc_info.json and no <mode>/.fingerprint."""
+    package = tree[1] / "rust-new-layout"
+    hashed = package / f"target/{mode}/build/fixture/35a34e20b22d7daa"
+    hashed.mkdir(parents=True)
+    (package / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="0.1.0"\n')
+    (package / f"target/{mode}/.cargo-lock").write_text("")
+    (hashed / "libfixture.rmeta").write_bytes(b"rmeta")
+    report = sweep(tree, policy(), apply=True)
+    assert package / "target" in paths(report.removed)
+
+
+def test_target_without_cargo_markers_is_not_recognized(tree: Tree) -> None:
+    from herdr_engineering.scratch_reaper import _discover
+
+    package = tree[1] / "rust-unmarked"
+    (package / "target/debug/build").mkdir(parents=True)
+    (package / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="0.1.0"\n')
+    assert not any(c.path == package / "target" for c in _discover(tree[0]))
+
+
 @pytest.mark.integration
 def test_native_cargo_output_is_removed_while_dirty_source_and_cli_evidence_survive(
     tmp_path: Path,
