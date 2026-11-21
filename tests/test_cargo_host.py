@@ -379,15 +379,30 @@ def test_install_rolls_back_published_files_when_a_later_write_fails(tmp_path: P
     assert not (home / ".local/bin/cargo").exists() and not (home / ".zshenv").exists()
 
 
+@pytest.fixture
+def isolated_host(tmp_path: Path, monkeypatch) -> Path:
+    """HOME, XDG, the config file and the state dir all inside tmp_path: an in-process sweep or load_config()
+    can never read or clean the operator's real configuration or storage tiers."""
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    cwd = tmp_path / "isolated-cwd"
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HERDR_ENGINEERING_CONFIG", str(tmp_path / "absent-config.yaml"))
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "state"))
+    monkeypatch.chdir(cwd)
+    return home
+
+
 def _tier_config(tmp_path: Path, **local: object):
     return validate({"enabled": True, "local": {
         "storage_tiers": [{"name": "internal", "directory": str(tmp_path / "cache")}], **local}})
 
 
-def test_disk_guard_prints_the_override_notice_and_allows_the_build(tmp_path: Path, monkeypatch, capsys):
+def test_disk_guard_prints_the_override_notice_and_allows_the_build(tmp_path: Path, monkeypatch, isolated_host, capsys):
     from herdr_engineering.cargo_host import _disk_guard_refusal
     from herdr_engineering.disk_guard import EXIT_REFUSED, OVERRIDE_ENV
-    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "state"))
     full = {"enabled": True, "refuse_builds_percent": 0, "refuse_builds_min_free_gib": 10**9,
             "roots": [str(tmp_path)]}
     monkeypatch.setenv(OVERRIDE_ENV, "1")
@@ -400,19 +415,28 @@ def test_disk_guard_prints_the_override_notice_and_allows_the_build(tmp_path: Pa
     assert capsys.readouterr().err == ""
 
 
-def test_disk_guard_fault_never_blocks_a_build(tmp_path: Path, monkeypatch, capsys):
+def test_disk_guard_fault_never_blocks_a_build(tmp_path: Path, monkeypatch, isolated_host, capsys):
     from herdr_engineering.cargo_host import _disk_guard_refusal
-    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "state"))
+    from herdr_engineering.disk_guard import OVERRIDE_ENV
+    # The conftest override would make any "allowed" result vacuous: remove it so only the fault path can allow.
+    monkeypatch.delenv(OVERRIDE_ENV, raising=False)
+    # A malformed policy makes the guard itself fail; the build proceeds and the fault is reported.
     assert _disk_guard_refusal(tmp_path, {"refuse_builds_percent": "not-a-number"}) is None
-    assert "disk guard unavailable (ValueError)" in capsys.readouterr().err
-    # Without a policy argument the configured one is loaded (hermetic: no config means defaults).
-    monkeypatch.setenv("HERDR_ENGINEERING_CONFIG", str(tmp_path / "absent.yaml"))
-    assert _disk_guard_refusal(tmp_path) is None  # a fresh temp filesystem is nowhere near full
+    err = capsys.readouterr().err
+    assert "disk guard unavailable (ValueError)" in err and "refusing to start a new build" not in err
+    # Control: a valid policy that cannot be met does refuse with the override unset, so the None above
+    # came from the fault handling and not from the guard being disabled.
+    unmeetable = {"enabled": True, "refuse_builds_percent": 0, "refuse_builds_min_free_gib": 10**9,
+                  "roots": [str(tmp_path)]}
+    assert _disk_guard_refusal(tmp_path, unmeetable) is not None
+    # Without a policy argument the (absent, isolated) configuration yields the defaults; no assertion on the
+    # real disk's fullness is made here.
+    capsys.readouterr()
+    _disk_guard_refusal(tmp_path)
 
 
-def test_reserve_selection_uses_first_tier_then_one_cleanup_then_reports(tmp_path: Path, monkeypatch):
+def test_reserve_selection_uses_first_tier_then_one_cleanup_then_reports(tmp_path: Path, monkeypatch, isolated_host):
     from herdr_engineering.cargo_host import _select_with_reserve
-    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "state"))
     (tmp_path / "cache").mkdir()
     config = _tier_config(tmp_path)
     selected, cleaned = _select_with_reserve(config, {"enabled": True}, 0)
@@ -437,17 +461,18 @@ def test_reserve_refusal_message_names_the_override(capsys):
     assert _reserve_refusal(12.5, False) == EXIT_REFUSED
     plain = capsys.readouterr().err
     assert "keeps 12.5% of its disk free: refusing" in plain and "even after" not in plain
+    assert OVERRIDE_ENV in plain
     assert _reserve_refusal(12.5, True) == EXIT_REFUSED
-    assert "even after cleaning up" in capsys.readouterr().err and OVERRIDE_ENV in plain
+    cleaned = capsys.readouterr().err
+    assert "even after cleaning up" in cleaned and OVERRIDE_ENV in cleaned
 
 
 def _write_config(path: Path, **local: object) -> None:
     path.write_text(yaml.safe_dump({"fabric_build_cache": {"enabled": True, "local": local}}))
 
 
-def test_enable_targets_validates_registers_and_is_repeatable(tmp_path: Path, monkeypatch):
+def test_enable_targets_validates_registers_and_is_repeatable(tmp_path: Path, monkeypatch, isolated_host):
     from herdr_engineering.cargo_host import enable_targets
-    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "state"))
     config = tmp_path / "config.yaml"
     config.write_text("fabric_build_cache:\n  enabled: false\n")
     with pytest.raises(ValueError, match="Enable fabric_build_cache"):
@@ -464,9 +489,8 @@ def test_enable_targets_validates_registers_and_is_repeatable(tmp_path: Path, mo
     assert "manage_targets" not in backup.read_text()
 
 
-def test_enable_retention_requires_managed_targets_and_keeps_first_backup(tmp_path: Path, monkeypatch):
+def test_enable_retention_requires_managed_targets_and_keeps_first_backup(tmp_path: Path, monkeypatch, isolated_host):
     from herdr_engineering.cargo_host import enable_retention
-    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "state"))
     config = tmp_path / "config.yaml"
     _write_config(config, min_free_disk_percent=0, manage_targets=False)
     with pytest.raises(ValueError, match="managed Cargo targets"):
