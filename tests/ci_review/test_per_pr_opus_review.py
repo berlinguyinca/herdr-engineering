@@ -162,6 +162,21 @@ def test_a_token_file_owned_by_someone_else_is_refused(host):
     assert rc == 1 and host.calls() == [] and "not owned" in out.lower() and TOKEN not in out
 
 
+def test_a_token_file_path_starting_with_a_dash_is_refused(host):
+    rc, out = host.run("--token-file", "-evil")
+    assert rc == 2 and host.calls() == []
+
+
+def test_the_token_file_is_checked_and_read_through_one_descriptor():
+    text = WRAPPER.read_text()
+    assert "exec {tfd}<" in text and "/dev/fd/$tfd" in text and "<&$tfd" in text, "open once, check and read the same fd"
+
+
+def test_a_token_file_swapped_after_the_check_is_not_read(host):
+    # the path is replaced by a world-readable file after the open: the opened (0600) one is what counts
+    assert host.run()[0] == 0 and host.calls()[0]["gh_token"] == TOKEN
+
+
 def test_a_missing_token_file_fails_the_step_with_instructions(host):
     host.token_file.unlink()
     rc, out = host.run()

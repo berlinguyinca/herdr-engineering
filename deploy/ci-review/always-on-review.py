@@ -998,6 +998,14 @@ def register_pi_secret(model: str) -> None:
         pass
 
 
+def register_env_tokens() -> None:
+    """GH_TOKEN / GITHUB_TOKEN join the redaction set at startup, whichever backend runs: the wrapper's token file
+    value arrives as GH_TOKEN, and a claude or codex reviewer that was prompt-injected could echo it. Never raises."""
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        if len(os.environ.get(name, "")) >= 8:
+            ai.REDACT.add(os.environ[name])
+
+
 def register_gh_secret() -> None:
     """Best effort: the operator's `gh auth token` and any GH_TOKEN / GITHUB_TOKEN value join the redaction set (pi can
     read ~/.config/gh). Never raises."""
@@ -1647,7 +1655,8 @@ def git(args: list[str], cwd: Path | str, auth: bool = False) -> str:
         args = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", *args]
     p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, timeout=300, env=env)
     if p.returncode != 0:
-        raise ReviewFailed(f"git {args[0]} failed: {ai.redact(p.stderr.decode('utf-8', 'replace')[-200:])}")
+        sub = next((a for i, a in enumerate(args) if not a.startswith("-") and (i == 0 or args[i - 1] != "-c")), "?")
+        raise ReviewFailed(f"git {sub} failed: {ai.redact(p.stderr.decode('utf-8', 'replace')[-200:])}")
     return p.stdout.decode("utf-8", "replace").strip()
 
 
@@ -2912,6 +2921,7 @@ def show_command(cfg: dict, tier_name: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     global _CLEANED
     _CLEANED = False                                    # once per invocation
+    register_env_tokens()
     ap = argparse.ArgumentParser(prog="always-on-review.py", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("poll")

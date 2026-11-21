@@ -91,7 +91,9 @@ Nothing here is automated, and no secret value belongs in any file or log.
    (read and write) and Pull requests (read and write); Contents read if the repos are private. The wrapper reads it
    into memory only (never an argument, never logged, whitespace stripped) and refuses the file, exit 1, if it is
    missing (the step fails with these instructions, it does not skip), empty, not owned by the user the agent runs as,
-   or readable by group or others (it must be mode 0600). To use another path, pass `--token-file FILE` in the
+   or readable by group or others (it must be mode 0600). The wrapper opens the file once and checks and reads
+   through that one descriptor, so it cannot be swapped between the check and the read. A path starting with `-` is
+   refused. To use another path, pass `--token-file FILE` in the
    command or set `OPUS_REVIEW_TOKEN_FILE` in the agent's environment. The Claude login and the pi key already live on
    the host.
 4. **Set the repo options** for every enrolled repo (see fork safety below): require approval for pull requests (and
@@ -151,10 +153,20 @@ replace `.woodpecker/opus-review.yaml` (or any workflow) with anything. The toke
 - The wrapper's check is only a safety net: `gh pr view --jq .isCrossRepository` must print exactly `false`. `true` ends
   the step without a review, anything else (an error, a different answer) fails the step. It cannot stop a malicious
   workflow, which does not call the wrapper.
-- Inside a review the reviewer runs read-only tools: the claude tier has `Read`, `Grep` and `Glob` only (no shell); the
-  pi tier has `read,grep,find,ls` and has no file sandbox, so it needs `backends.pi.wrapper` to be sandboxed (see the
-  README). The diff and PR text are untrusted prompt input. The reviewer's environment is scrubbed: no `GH_TOKEN`, no API
-  keys. Only the wrapper, `gh` and the PR fetch see the token.
+- Inside a review the reviewer runs read-only tools, but **the token file is not hidden from it**. The claude tier is
+  confined to `Read`, `Grep` and `Glob` on the worktree (no shell). The pi tier reads files with no sandbox unless
+  `backends.pi.wrapper` provides one, and codex `--sandbox read-only` can still read the whole filesystem. All of them
+  run as the agent's user, and the token is a persistent file in that user's home. The diff and PR text are untrusted
+  prompt input, so a prompt injection in a diff could make a reviewer read
+  `~/.config/herdr-engineering/opus-review.token` and emit it, encoded, in a finding. What reduces this: the
+  reviewer's environment is scrubbed (no `GH_TOKEN`, no API keys), the token is registered for redaction at startup
+  (plain text only: an encoded copy is not caught), and the token's scope is only commit statuses and PR comments on the
+  enrolled repos. Treat it as a low-value, rotatable credential, and give pi a sandbox wrapper that hides `~/.config`.
+- **Register the agent with an owner scope.** An agent registered server-wide serves every repo on the Woodpecker
+  server, and anyone who can activate a repo there can add `labels: review-host: "true"` and run on this host. Register
+  it as a user- or org-scoped agent (or confirm the server is closed to other users).
+- **No log masking, no tracing.** Woodpecker masks only its own secrets in logs, and this token is not one. Nothing may
+  run the wrapper with `set -x` or `bash -x`, and the wrapper itself never prints the token.
 - The wrapper uses the token only from the token file; an ambient `GH_TOKEN` or `GITHUB_TOKEN` on the agent is unset
   and never used.
 
@@ -183,8 +195,9 @@ replace `.woodpecker/opus-review.yaml` (or any workflow) with anything. The toke
   pass `--config FILE`.
 - **Exit 4 while a sweep holds the PR lock.** If the hourly sweep (or another run) is reviewing the same PR, the
   pipeline's review exits 4 (the PR lock is never waited for, only the host slot) and the wrapper turns that into exit
-  0. That review is then done by the sweep that held the lock, so the status still arrives; if it fails there, the next
-  sweep retries.
+  0. The sweep reviews the head it pinned when it started. If the pipeline was for a newer head, the sweep ends with the
+  head moved and nothing posted for the new head, which then waits for the next hourly sweep (up to an hour). If the
+  pipeline was for the same head, the sweep's review covers it; if that fails, the next sweep retries.
 - **Cleanup.** The first review that will actually run in an invocation removes leftover worktrees and
   `refs/herdr-review/*`; it runs `git worktree prune` only in the managed clones, never in your own `clone:`, and a
   no-op run (draft, already reviewed) cleans nothing. Fetches into your own `clone:` also reset inherited credential

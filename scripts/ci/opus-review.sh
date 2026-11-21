@@ -25,6 +25,7 @@
 # timeout) and posts the status on the PR head SHA. Review exit 3 (head moved) and 4 (nothing to do, or the head is
 # already reviewed) become 0; the cases behind a 4 are listed in the docs. 1 (failed) and 2 (refused) are kept.
 set -euo pipefail
+set +x   # never trace this script: Woodpecker's log masking no longer covers a token that comes from a file
 
 say() { printf 'opus-review: %s\n' "$*" >&2; }
 here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
@@ -68,19 +69,23 @@ unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME XDG_CACHE_HOME USERPROFILE
 # into this shell's memory only: never printed, never put on a command line. An ambient GitHub token is never used.
 unset OPUS_REVIEW_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN
 [ -n "$token_file" ] || token_file="$home/.config/herdr-engineering/opus-review.token"
+case "$token_file" in -*) say "token file path may not start with '-': $token_file"; exit 2 ;; esac
 if [ ! -f "$token_file" ]; then
   say "token file missing: $token_file"
   say "create it as $(id -un): install -m 600 /dev/null '$token_file' && \$EDITOR '$token_file'  (one line: a fine-grained PAT with commit statuses + pull requests write on the enrolled repos)"
   exit 1
 fi
-[ "$(stat -Lc %u "$token_file")" = "$(id -u)" ] \
+# Open once; check and read through the same descriptor, so the file cannot be swapped between the check and the read.
+exec {tfd}< "$token_file" || { say "cannot open token file $token_file"; exit 1; }
+[ "$(stat -Lc %u "/dev/fd/$tfd")" = "$(id -u)" ] \
   || { say "token file $token_file is not owned by $(id -un) (the user the agent runs as); refusing it"; exit 1; }
-mode=$(stat -Lc %a "$token_file")
+mode=$(stat -Lc %a "/dev/fd/$tfd")
 if [ $(( 8#$mode & 8#077 )) -ne 0 ]; then
   say "token file $token_file has mode $mode; it must be 0600 (no group or other access): chmod 600 '$token_file'"
   exit 1
 fi
-token=$(tr -d '[:space:]' < "$token_file") || { say "cannot read token file $token_file"; exit 1; }
+token=$(tr -d '[:space:]' <&$tfd) || { say "cannot read token file $token_file"; exit 1; }
+exec {tfd}<&-
 [ -n "$token" ] || { say "token file $token_file is empty"; exit 1; }
 export GH_TOKEN=$token         # reaches gh and the review script, as their credential; nothing prints it
 

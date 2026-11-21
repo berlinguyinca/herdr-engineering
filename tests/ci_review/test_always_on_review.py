@@ -571,6 +571,22 @@ def test_a_pi_reviewer_cannot_smuggle_the_provider_key_into_a_comment(env):
     assert SECRET not in (env.tmp / "state/reviews.jsonl").read_text()
 
 
+def test_a_claude_reviewer_cannot_smuggle_the_github_token_into_a_comment(env):
+    token = os.environ["GH_TOKEN"]
+    env.mod.ai.REDACT.discard(token)                      # a fresh process: only startup registration may add it
+    env.config(post=True)
+    env.reviewer("claude", answer=block(why=f"leaked {token}"))
+    assert env.review("tier2", post=True) == 0
+    state = json.dumps(env.gh_state())
+    assert "leaked" in state and token not in state
+    assert token not in (env.tmp / "state/reviews.jsonl").read_text()
+
+
+def test_a_failed_authenticated_fetch_names_the_git_subcommand(env, tmp_path):
+    with pytest.raises(env.mod.ReviewFailed, match=r"git fetch failed"):
+        env.mod.git(["fetch", "--quiet", str(tmp_path / "does-not-exist.git")], env.clone, auth=True)
+
+
 def test_poll_survives_an_unexpected_error_in_one_review(env):
     st = env.gh_state()
     st["prs"]["8"] = dict(st["prs"]["7"])
