@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import signal
 import threading
@@ -48,14 +49,56 @@ def watch(cleanup, *, interval: float, stop: threading.Event,
         wait(interval)
 
 
+_DEFAULT_MAX_TARGET_GB = 50.0
+_DEFAULT_SIZE_CAP_IDLE_HOURS = 2.0
+_WARNED: set[tuple[str, str]] = set()  # bad values already reported by this process (the watcher loops forever)
+
+
+def _checked(cfg: dict, key: str, default: float, minimum: float) -> float:
+    """``build_cleanup.<key>``: a finite number >= ``minimum`` (not a bool, not null); anything else is the
+    documented default, with one warning per process and value."""
+    value = cfg.get(key, default)
+    number = value
+    if isinstance(value, str):  # YAML reads 1e-06 (no dot) as a string
+        try:
+            number = float(value)
+        except ValueError:
+            number = None
+    if (isinstance(number, bool) or not isinstance(number, (int, float))
+            or not math.isfinite(number) or number < minimum):
+        if (key, repr(value)) not in _WARNED:
+            _WARNED.add((key, repr(value)))
+            log.warning('ignoring build_cleanup.%s=%r (not a number >= %g); using %g', key, value, minimum, default)
+        return default
+    return float(number)
+
+
+def _max_target_bytes(cfg: dict) -> int | None:
+    """The cap in bytes; 0 switches it off. A positive value too small to be one byte is a typo, not "off":
+    it is the default, with the same one warning."""
+    gb = _checked(cfg, 'max_target_gb', _DEFAULT_MAX_TARGET_GB, 0)
+    if gb > 0 and int(gb * 1024 ** 3) == 0:
+        value = cfg.get('max_target_gb')
+        if ('max_target_gb', repr(value)) not in _WARNED:
+            _WARNED.add(('max_target_gb', repr(value)))
+            log.warning('ignoring build_cleanup.max_target_gb=%r (under one byte); using %g',
+                        value, _DEFAULT_MAX_TARGET_GB)
+        gb = _DEFAULT_MAX_TARGET_GB
+    return int(gb * 1024 ** 3) or None
+
+
 def policy_kwargs(cfg: dict) -> dict:
     """``run_once`` policy values from a ``build_cleanup`` config block (defaults match config.DEFAULTS)."""
+    from .build_cleanup import MIN_IDLE_HOURS
     return {
         "high_water": float(cfg.get('high_water_percent', 85)),
         "low_water": float(cfg.get('low_water_percent', 80)),
         "min_age_hours": float(cfg.get('min_age_hours', 24)),
         "pressure_water": float(cfg.get('pressure_percent', 90)),
         "pressure_min_age_hours": float(cfg.get('pressure_min_age_hours', 2)),
+        # 0 switches the per-target cap off
+        "max_target_bytes": _max_target_bytes(cfg),
+        "size_cap_idle_hours": _checked(cfg, 'size_cap_idle_hours', _DEFAULT_SIZE_CAP_IDLE_HOURS, MIN_IDLE_HOURS),
     }
 
 
@@ -112,14 +155,21 @@ def effective_roots(cfg: dict, explicit: list[str] | None = None) -> list[Path]:
         # Default roots may not exist on every host (e.g. no ~/work); explicit ones must.
         paths = [path for path in paths if path.is_dir()]
         paths += [path for path in _managed_output_dirs() if path not in paths]
-    return paths
+    chosen: dict[str, Path] = {}
+    for path in paths:  # a root named twice (or through a link) is swept once, by its canonical spelling
+        key = os.path.realpath(path)
+        if key not in chosen or (str(path) == key and str(chosen[key]) != key):
+            chosen[key] = path
+    return list(chosen.values())
 
 
-def cleanup_cycle(cfg: dict, explicit: list[str] | None, state_dir: Path, dry_run: bool = False) -> dict:
-    """One sweep. Roots are re-evaluated every cycle: pools appear after the watcher has started."""
+def cleanup_cycle(cfg: dict, explicit: list[str] | None, state_dir: Path, dry_run: bool = False,
+                  cached: bool = False) -> dict:
+    """One sweep. Roots are re-evaluated every cycle: pools appear after the watcher has started.
+    ``cached`` (the watcher) reuses each root's target list for a few hours instead of walking again."""
     from .build_cleanup import run_once
     return run_once(roots=effective_roots(cfg, explicit), state_dir=state_dir, dry_run=dry_run,
-                    **policy_kwargs(cfg))
+                    discovery='cached' if cached else 'walk', **policy_kwargs(cfg))
 
 
 def command(args) -> int:
@@ -141,8 +191,8 @@ def command(args) -> int:
     if not roots:
         print(json.dumps({'error': 'configure build_cleanup.roots or pass --root'}))
         return 2
-    def cleanup():
-        return cleanup_cycle(cfg, args.root, state_dir, args.dry_run)
+    def cleanup(cached: bool = False):
+        return cleanup_cycle(cfg, args.root, state_dir, args.dry_run, cached)
     if args.cleanup_command == 'run':
         result = cleanup()
         skipped = [w for w in result.get('warnings', []) if w.startswith('skipped root')]
@@ -159,6 +209,6 @@ def command(args) -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda signum, frame: stop.set())
     # Hosts without a Herdr server still need their disks kept: the server gate is opt-in.
-    watch(cleanup, interval=float(cfg.get('interval_seconds', 900)), stop=stop,
+    watch(lambda: cleanup(cached=True), interval=float(cfg.get('interval_seconds', 900)), stop=stop,
           is_running=server_running if cfg.get('require_herdr_server') is True else None)
     return 0

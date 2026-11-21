@@ -1,10 +1,12 @@
+# Backup sweep only. The `Opus agent review` status is triggered per PR by .woodpecker/opus-review.yaml
+# (docs/operations/per-pr-opus-review.md); this timer only catches heads whose webhook or pipeline was missed.
 [Unit]
-Description=Look for pull request heads that need an always-on review every five minutes
+Description=Hourly backup sweep for pull request heads the per-PR Woodpecker review missed
 
 [Timer]
 OnBootSec=3min
-OnUnitActiveSec=5min
-RandomizedDelaySec=30s
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
 Unit=herdr-always-on-review.service
 
 [Install]

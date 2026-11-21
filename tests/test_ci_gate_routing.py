@@ -390,3 +390,54 @@ def test_ui_gates_skip_is_reported_rather_than_silently_absent():
     assert gate_cmds.index(guard) < gate_cmds.index("bash scripts/ci/ui-gates.sh")
     assert "[ -f .ci-ui-gates-not-applicable ]" in guard
     assert "nothing to run" in guard and guard.rstrip().endswith("exit 0; fi")
+
+
+# ------------------------------------------------------------------ ui-gates: the covered list cannot drift from what the gate uses ----
+
+import re  # noqa: E402  (kept next to the tests that use it)
+
+
+def _ui_covered(path: str) -> bool:
+    """Ask the real script's own matcher, not a copy of its list."""
+    script = (
+        f'path="$1"; set -- ui; src="$(sed -n "/^gate=/,/^label=/p" {APPLICABLE})"; eval "$src"; path="$path"; '
+        f'eval "$(sed -n "/^herdr_covered_path()/,/^}}/p" {APPLICABLE})"; herdr_covered_path'
+    )
+    return subprocess.run(["bash", "-c", script, "x", path], capture_output=True).returncode == 0
+
+
+def _tracked(*patterns: str) -> list[str]:
+    out = subprocess.run(["git", "ls-files", "--", *patterns], cwd=ROOT, capture_output=True, text=True, check=True)
+    return [p for p in out.stdout.splitlines() if p]
+
+
+def test_ui_gate_covered_helper_agrees_with_the_script():
+    assert _ui_covered("packages/app.js") and not _ui_covered("CHANGELOG.md")
+
+
+def test_every_ui_source_tree_and_root_ui_config_is_covered():
+    """New UI sources (web client, static member/share pages, browser-test configs) must trigger the gate."""
+    must_cover = _tracked(
+        "packages", "tests/playwright", "tests/visual", "docs/assets/screenshots",
+        "herdr_artifact_host/member_static", "herdr_artifact_host/share_static", "schemas",
+        "playwright*.config.*", "eslint*.config.*", "tsconfig*.json", "package.json", "package-lock.json",
+    )
+    assert must_cover, "the tracked-file query found nothing; the test would pass vacuously"
+    missed = [p for p in must_cover if not _ui_covered(p)]
+    assert not missed, f"UI paths the gate ignores (add them to the `ui` list in unit-gates-applicable.sh): {missed[:10]}"
+
+
+def test_every_file_ui_gates_sh_runs_or_sources_is_covered():
+    script = (ROOT / "scripts" / "ci" / "ui-gates.sh").read_text()
+    sourced = [f"scripts/ci/{m}" for m in re.findall(r'\. "\$\(dirname "\$0"\)/([\w.-]+\.sh)"', script)]
+    assert sourced, "expected ui-gates.sh to source helper scripts"
+    pkg = (ROOT / "package.json").read_text()
+    referenced = re.findall(r"(?:tests|packages)/[\w./*!()-]+", pkg.split('"test:ui-gates"')[1].split("\n")[0])
+    referenced += re.findall(r"node (tests/[\w./-]+)", pkg)
+    missed = [p for p in sourced + referenced + ["scripts/ci/ui-gates.sh"] if not _ui_covered(p.split("*")[0].split("!")[0] or p)]
+    assert not missed, f"the gate runs these but a change to them would skip it: {missed}"
+
+
+def test_ui_gates_workflow_files_are_covered():
+    for path in (".woodpecker/ui-gates.yml", "scripts/ci/unit-gates-applicable.sh", "scripts/ci/ui-gates.sh"):
+        assert _ui_covered(path), path
