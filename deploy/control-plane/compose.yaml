@@ -567,6 +567,11 @@ services:
     image: herdr-engineering:0.1.0
     container_name: herdr-fabric-gateway
     restart: unless-stopped
+    # One listening socket per leased port per bind host: the default 1024 fds ran out (EMFILE) and killed the 443 front.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 524288
     network_mode: host
     volumes:
       - ../fabric-stack/config.yaml:/app/config.yaml:ro
