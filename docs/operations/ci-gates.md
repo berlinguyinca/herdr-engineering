@@ -23,7 +23,7 @@ path-filtered check made *required* parks every unrelated pull request on *Expec
 `applicability` step runs `scripts/ci/unit-gates-applicable.sh [unit|ui]`, which diffs the PR against its merge base and exits
 0 (run the gate), 3 (no covered path changed: drop `.ci-<gate>-not-applicable`; the gate step exits 0 in seconds saying why) or
 fails the pipeline. It fails open: a diff it cannot work out runs the gate. The covered paths live in that one script (the `unit` and
-`ui` cases); a manual run (read from `CI_PIPELINE_EVENT`, falling back to legacy `CI_EVENT`) always runs the gate. **All four pipelines now report on every pull request, so all four are safe to
+`ui` cases); a manual run (read from `CI_PIPELINE_EVENT`, falling back to legacy `CI_EVENT`) always runs the gate. The `ui` list is locked by `tests/test_ci_gate_routing.py`: every tracked UI source tree (web client, member/share static pages, schemas, browser-test configs) and every script the gate runs must be matched by it, so a new UI directory fails that test until it is listed. **All four pipelines now report on every pull request, so all four are safe to
 require.** Do not reintroduce a `path:` filter in a pipeline whose context is required.
 
 ## Why `main` is gated by `structural-gates` and not by `unit-gates`

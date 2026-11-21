@@ -418,3 +418,42 @@ def test_stage_release_and_host_apply_digest_contracts_agree(repository, tmp_pat
     assert host_apply.receipt_status(release, receipt) == 'verified'
     (release / 'package.json').write_text('{"name":"pi-engineering-runtime","edited":true}')
     assert host_apply.receipt_status(release, receipt) == 'drift'
+
+
+def _commit(repo, message):
+    subprocess.run(['git', '-C', str(repo), 'add', '-A'], check=True)
+    subprocess.run(['git', '-C', str(repo), 'commit', '-m', message], check=True, capture_output=True)
+    return subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+
+
+def test_digest_handles_tracked_symlink_to_directory(repository, tmp_path):
+    # skills/handoff is a tracked symlink to a directory; read_bytes() on it raised
+    # IsADirectoryError and aborted staging of every release that contained one.
+    stage = module()
+    repo, _ = repository
+    (repo / 'shared').mkdir()
+    (repo / 'shared' / 'SKILL.md').write_text('one')
+    (repo / 'skills').mkdir()
+    (repo / 'skills' / 'handoff').symlink_to('../shared')
+    sha = _commit(repo, 'dir symlink')
+    result = stage.stage_pi(tmp_path / 'home', sha, repository=str(repo), runner=install_ok)
+    release = Path(result['sourceRoot'])
+    assert (release / 'skills' / 'handoff').is_dir()
+    assert result['artifactDigest'] == stage.compute_digest(release, install_ok)
+
+
+def test_digest_covers_symlink_target_and_survives_dangling_links(repository, tmp_path):
+    stage = module()
+    repo, _ = repository
+    (repo / 'a').mkdir()
+    (repo / 'b').mkdir()
+    (repo / 'link').symlink_to('a')
+    (repo / 'dangling').symlink_to('missing-target')
+    sha = _commit(repo, 'links')
+    result = stage.stage_pi(tmp_path / 'home', sha, repository=str(repo), runner=install_ok)
+    release = Path(result['sourceRoot'])
+    baseline = stage.compute_digest(release, install_ok)
+    (release / 'link').unlink()
+    (release / 'link').symlink_to('b')
+    # Retargeting a tracked link is an in-place edit of the artifact: it must drift.
+    assert stage.compute_digest(release, install_ok) != baseline

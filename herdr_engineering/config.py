@@ -35,12 +35,20 @@ DEFAULTS: dict[str, Any] = {
     # unless HERDR_DISK_GUARD_OVERRIDE=1 is set. ``enabled: false`` disables the guard too.
     "build_cleanup": {
         "enabled": True,
-        "roots": ["~/IdeaProjects", "~/work", "~/.cache"],
+        # Every Rust project of the user: the home directory (bounded depth; dot directories such as ~/.cargo
+        # and ~/.rustup, node_modules and symlinks are not entered), the usual project directories (swept on
+        # their own, not twice) and ~/.cache (cache-only targets there are found and reported,
+        # but never cleaned: with no manifest beside them there is no workspace to clean through).
+        "roots": ["~", "~/work", "~/IdeaProjects", "~/.cache"],
         "interval_seconds": 900,
         "require_herdr_server": False,  # true: the watch loop only sweeps while a herdr server runs
         "high_water_percent": 85,
         "low_water_percent": 80,
         "min_age_hours": 24,
+        # A target over this size is cleaned by the sweep (every 15 minutes, whatever the disk usage) once it has
+        # been idle for size_cap_idle_hours, never from inside a build; 0: no cap.
+        "max_target_gb": 50,
+        "size_cap_idle_hours": 2,
         "pressure_percent": 90,
         "pressure_min_age_hours": 2,
         "refuse_builds_percent": 90,
