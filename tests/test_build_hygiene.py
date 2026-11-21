@@ -90,7 +90,7 @@ def test_build_cleanup_and_cargo_host_are_on_by_default():
     config = load_config([])
     cleanup_cfg = config["build_cleanup"]
     assert cleanup_cfg["enabled"] is True
-    assert cleanup_cfg["roots"] == ["~/IdeaProjects", "~/work", "~/.cache"]
+    assert cleanup_cfg["roots"] == ["~", "~/work", "~/IdeaProjects", "~/.cache"]
     assert cleanup_cfg["pressure_percent"] == 90 and cleanup_cfg["pressure_min_age_hours"] == 2
     cache = validate(config["fabric_build_cache"])
     assert cache.enabled and cache.local.manage_targets
@@ -103,7 +103,7 @@ def test_explicit_opt_out_is_honoured(tmp_path):
                                     "fabric_build_cache": {"enabled": False}}))
     config = load_config([path])
     assert config["build_cleanup"]["enabled"] is False
-    assert config["build_cleanup"]["roots"] == ["~/IdeaProjects", "~/work", "~/.cache"]
+    assert config["build_cleanup"]["roots"] == ["~", "~/work", "~/IdeaProjects", "~/.cache"]
     assert validate(config["fabric_build_cache"]).enabled is False
 
 
