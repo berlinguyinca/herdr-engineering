@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -387,6 +388,25 @@ def test_removed_run_is_skipped_checkpointed_and_not_retried(tmp_path, capsys):
         again = Relay(url, tmp_path / 'state', allow_open=True)
         assert NAME in again.checkpoints
         assert again.process_source(str(source)) == Outcomes(0, 0, 0)
+
+
+def test_touched_skipped_bundle_stays_skipped_and_is_never_marked_published(tmp_path):
+    source = _source_with_one_bundle(tmp_path)
+    with control_plane(pipeline=REMOVED) as (url, received):
+        relay = Relay(url, tmp_path / 'state', allow_open=True)
+        assert relay.process_source(str(source)) == Outcomes(0, 0, 1)
+        before = relay.checkpoints[NAME]['mtime_ns']
+        # Same content, new mtime (touch, rsync without -t, re-copy) must not rewrite the row as delivered.
+        os.utime(source / NAME, ns=(before + 10**9, before + 10**9))
+        again = Relay(url, tmp_path / 'state', allow_open=True)
+        assert again.process_source(str(source)) == Outcomes(0, 0, 0)
+        assert received == []
+        row = again.checkpoints[NAME]
+        assert row['mtime_ns'] == before + 10**9
+        assert row['state'] == 'skipped' and row['reason'] == 'provider_run_removed'
+        assert 'acknowledged_at' not in row
+        reloaded = Relay(url, tmp_path / 'state', allow_open=True).checkpoints[NAME]
+        assert reloaded['state'] == 'skipped' and 'acknowledged_at' not in reloaded
 
 
 class _WoodpeckerStandIn:

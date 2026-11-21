@@ -424,7 +424,9 @@ class Relay:
         previous = self.checkpoints.get(name, {})
         if previous.get('sha256') == digest:
             if previous.get('mtime_ns') != mtime_ns:
-                self._checkpoint(name, digest, len(raw), mtime_ns)
+                # Keep a skipped row skipped: an mtime-only change must not record a delivery.
+                self._checkpoint(name, digest, len(raw), mtime_ns,
+                                 skipped=previous.get('state') == 'skipped')
             return False
         query = urllib.parse.urlencode({'repository': 116, 'number': value['run_number']})
         observed = self._request(self.endpoint.removesuffix('/reports') + '/pipeline?' + query)
