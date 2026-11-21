@@ -4,7 +4,7 @@
 # minutes; running it across workers is what makes the gate affordable. Everything here is overridable because the CPU count of the
 # CI exec host is not known in advance:
 #   HERDR_PYTEST_WORKERS       worker count; `auto` (default) = one per CPU, `0` = plain serial run, as before xdist.
-#   HERDR_PYTEST_MAXPROCESSES  ceiling on the worker count (default 8; xdist applies it to `auto` and to an
+#   HERDR_PYTEST_MAXPROCESSES  ceiling on the worker count (default 8, empty = default; xdist applies it to `auto` and to an
 #                              explicit `-n N` alike): a 100+ core host must not start 100 workers that each
 #                              import the package, bind loopback servers and hold ~3,000 leaked descriptors
 #                              apiece (see ensure-fd-limit.sh).
@@ -23,19 +23,27 @@ herdr_cpu_quota() {
 # The load average file (HERDR_LOADAVG_FILE overrides /proc/loadavg for tests; scripts/ci/host-facts.sh prints the same file).
 herdr_loadavg_file() { echo "${HERDR_LOADAVG_FILE:-/proc/loadavg}"; }
 
-# The CPUs the host's 1-minute load average leaves free, as a whole number >= 1, or nothing when the file is unreadable. Pipeline 1710
-# started 8 workers on a host with load 155 on 4 CPUs; two of them died. It only ever lowers `auto` (an explicit
-# HERDR_PYTEST_WORKERS wins) and never below 1.
+# The CPUs this process may use (the affinity mask; `taskset` in tests narrows it for real).
+herdr_visible_cpus() { python3 -c 'import os; print(len(os.sched_getaffinity(0)))'; }
+
+# The CPUs the host's 1-minute load average leaves free, as a whole number, or nothing when the file is unreadable. Pipeline 1710
+# started 8 workers on a host with load 155 on 4 CPUs; two of them died (#888). But the load of a shared node is mostly OTHER tenants'
+# and says little about what this job can get: load 28 on 16 CPUs gave `-n 1` and 104-120 minute gates against 15-22 minutes with 8
+# workers. So load only shaves workers down to a FLOOR of half the CPUs and at least 4 (never above the CPUs themselves); a genuinely
+# small budget is the cgroup quota's job (herdr_cpu_quota), not the load average's. It only ever lowers `auto`; an explicit
+# HERDR_PYTEST_WORKERS wins.
 herdr_free_cpus() {
   local load cpus
   load="$(cut -d' ' -f1 "$(herdr_loadavg_file)" 2>/dev/null)" || return 0
   case "$load" in ''|*[!0-9.]*|*.*.*) return 0 ;; esac
-  cpus="$(python3 -c 'import os; print(len(os.sched_getaffinity(0)))')"
-  awk -v l="$load" -v c="$cpus" 'BEGIN { f = c - int(l); print (f < 1 ? 1 : f) }'
+  cpus="$(herdr_visible_cpus)"
+  awk -v l="$load" -v c="$cpus" 'BEGIN {
+    f = c - int(l); floor = int(c / 2); if (floor < 4) floor = 4; if (floor > c) floor = c
+    print (f < floor ? floor : f) }'
 }
 
 herdr_pytest_parallel_args() {
-  local workers="${HERDR_PYTEST_WORKERS:-auto}" cap="${HERDR_PYTEST_MAXPROCESSES:-8}"
+  local workers="${HERDR_PYTEST_WORKERS:-auto}" cap="${HERDR_PYTEST_MAXPROCESSES:-8}"   # empty means the default; 12 is not the default until a 12-worker run is measured
   case "$workers" in
     0) return 0 ;;
     auto) ;;
@@ -43,19 +51,29 @@ herdr_pytest_parallel_args() {
   esac
   case "$cap" in ''|*[!0-9]*|0) echo "HERDR_PYTEST_MAXPROCESSES must be a positive number, got '$cap'" >&2; return 1 ;; esac
   if [ "$workers" = auto ]; then
+    local cpus; cpus="$(herdr_visible_cpus)"
     local quota; quota="$(herdr_cpu_quota 2>/dev/null || true)"
-    # A quota below both the cap and the visible cores is the real budget; otherwise `auto` is right as before.
-    if [ -n "$quota" ] && [ "$quota" -lt "$cap" ] && [ "$quota" -lt "$(python3 -c 'import os; print(len(os.sched_getaffinity(0)))')" ]; then
-      workers="$quota"
+    # A quota below the visible cores is the real budget; otherwise `auto` is right as before.
+    if [ -n "$quota" ] && [ "$quota" -lt "$cpus" ]; then
+      workers="$quota"; [ "$workers" -le "$cap" ] || workers="$cap"
     fi
-    # Then the CPUs the host's current load leaves free: only ever lower, never below 1.
+    # Then the CPUs the host's current load leaves free, never below the floor above: only ever lower.
     local free; free="$(herdr_free_cpus)"
-    if [ -n "$free" ] && [ "$free" -lt "$cap" ] && [ "$free" -lt "$(python3 -c 'import os; print(len(os.sched_getaffinity(0)))')" ] \
+    if [ -n "$free" ] && [ "$free" -lt "$cap" ] && [ "$free" -lt "$cpus" ] \
        && { [ "$workers" = auto ] || [ "$free" -lt "$workers" ]; }; then
       workers="$free"
     fi
   fi
   printf '%s\n' -n "$workers" "--maxprocesses=$cap" --dist=loadfile
+}
+
+# Fills the global array PYTEST_REPORT (read as ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"}) with the arguments that make a pass report where
+# its time went: the 40 slowest tests (`--durations=40`) and, from the scripts/ci/pytest-plugins/pytest_file_times.py plugin, a per-test-file
+# and per-xdist-worker total, which shows `--dist=loadfile` imbalance (one slow file keeping one worker busy while the rest idle).
+PYTEST_REPORT=()
+herdr_pytest_report_load() {
+  PYTEST_REPORT=(--durations=40 -p pytest_file_times)
+  export PYTHONPATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pytest-plugins${PYTHONPATH:+:$PYTHONPATH}"
 }
 
 # Fills the global array PYTEST_PARALLEL with those arguments (empty for a serial run) and fails if an override is invalid. Read it
