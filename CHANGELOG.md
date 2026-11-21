@@ -220,6 +220,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `wpci-agent-prune`: a null or non-object queue response, a null `agent_id` in a queue task, or a non-list agents response now exits 1 with the normal `abort: API error` line instead of a traceback. The unreachable "more candidates than agents" abort is removed (candidates are a subset of the agents listed). README documents that after a >24h Woodpecker outage up to `--max-deletions` live agents per run may be removed (they re-register) and how to lower the cap.
 - `collab-fabric-firewall.sh --check`: a missing iptables binary is exit 3 with a clear message (was folded into 2, "need root"); one chain absent plus the other unreadable reports absent (1). `deploy.sh` treats 3 like absent (the strong WARNING). `--install`/`--remove` unchanged apart from the message. Exit-code list in `docs/operations/fabric-trust.md` updated.
 
+### Chore: scrub private infrastructure identifiers from tracked files
+
+- Tailscale IPs, the tailnet name, and a personal hostname in docs, tests, examples and help text are now documentation placeholders (100.64.8.x, <tailnet>, operator-laptop). Git history still contains the old values; a history rewrite has not been done (owner decision). deploy/fabric-stack/config.yaml keeps the live tailnet name because the deployment mounts it.
+
+- scripts/ci/main-cron-gates.sh no longer defaults HERDR_CI_STATE to a personal home path and now fails (exit 2) when it is unset, rather than guessing a non-persistent directory. .woodpecker/main-cron.yml sets it to $${WPCI_CI_DIR}/state/herdr; the runner must export WPCI_CI_DIR as the in-container mount of the shared CI store (the runner WPCI_CI_MOUNT).
+- New ansible/playbooks/ci-runner-env.yml provisions that runner side: a systemd drop-in for the Woodpecker agent exporting WPCI_CI_DIR (WOODPECKER_ENVIRONMENT) and mounting the shared CI store at it (WOODPECKER_BACKEND_DOCKER_VOLUMES). Paths come from private inventory vars `wpci_ci_store` / `wpci_ci_mount` on group `ci_runners`; none are committed.
+
 ### Fix: deploy.sh no longer warns that the fabric firewall is missing when it merely cannot read it
 
 - `collab-fabric-firewall.sh --check` run as the non-root deploy user exits 2 (cannot read), which `deploy.sh` treated like absent rules and always printed the install WARNING. Exit 1 (absent) keeps the WARNING; exit 2 now prints a one-line NOTE (verify with `sudo <script> --check`, noting if `herdr-collab-fabric-firewall.service` is enabled). Never fails the deploy. Docs in `docs/operations/fabric-trust.md` updated.
@@ -616,7 +623,7 @@ Key files must be mode 0600 and are refused otherwise; the key is never printed.
 - New routes `POST/GET /api/v1/assistant-team-briefs` and `GET /api/v1/assistant-references/<id>`, and `herdr-eng assistant brief-offer|brief-list|brief-reference`; `rooms queue` shows the brief card. No migration. Flag off changes nothing (pinned). Not built: web UI, automatic inbox scanning, external actions, `direct`. Roll back the flag, not the image (references are lost on an image rollback). See `docs/operations/team-rooms.md`; threat model section 3.8.
 
 ### Fix: the fabric agent forwarder no longer breaks SigV4-signed requests
-- `AgentForwarder` rewrote `Host:` to `127.0.0.1:<port>`, which invalidates AWS SigV4 (the signature covers Host), so rustfs/MinIO answered `SignatureDoesNotMatch` on the tailnet address. SigV4-signed requests (Authorization header or presigned query) are now forwarded byte-for-byte; unsigned requests behave as before. Takes effect when the operator restarts the agent (`systemctl --user restart herdr-eng-fabric-agent.service`). Proven with a throwaway forwarder on the tailnet IP: aws-cli list/put/get/delete and sccache cold+warm via `http://100.104.39.6:<port>`.
+- `AgentForwarder` rewrote `Host:` to `127.0.0.1:<port>`, which invalidates AWS SigV4 (the signature covers Host), so rustfs/MinIO answered `SignatureDoesNotMatch` on the tailnet address. SigV4-signed requests (Authorization header or presigned query) are now forwarded byte-for-byte; unsigned requests behave as before. Takes effect when the operator restarts the agent (`systemctl --user restart herdr-eng-fabric-agent.service`). Proven with a throwaway forwarder on the tailnet IP: aws-cli list/put/get/delete and sccache cold+warm via `http://100.64.8.6:<port>`.
 
 ### Fabric build cache: the shared tier works against the herdr rustfs server
 - `herdr-eng build-cache-rustfs-provision` (dry-run default, `--apply`): additive, idempotent creation of bucket `herdr-build-cache` (hard quota), read/write and read-only users with bucket-limited policies, and 0600 credential/registry files. Admin credential from the central fleet config, never echoed; MinIO client runs in the container with a private removed config dir; never touches `herdr-artifacts`; no delete path.
@@ -1414,7 +1421,7 @@ Key files must be mode 0600 and are refused otherwise; the key is never printed.
   owning machine, and a probe loop that renews healthy leases, expires dead
   ones (TTL), and releases their ports. Every lease gets a stable fleet-wide
   address `http://<gateway-magicdns>:<port>` (e.g.
-  `http://bender.tail0c50da.ts.net:18000`) reachable from any tailnet device.
+  `http://bender.<tailnet>.ts.net:18000`) reachable from any tailnet device.
 - `HERDR_ENGINEERING_FABRIC_URL` / `fabric.gateway_url` config: registrar
   commands route through the gateway automatically and degrade to local mode
   with an explicit warning when it is unreachable.

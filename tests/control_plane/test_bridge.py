@@ -114,7 +114,7 @@ def test_load_into_reconstructs_entities_from_event_log():
     events = [
         _row(event_id="e1", sequence=0, event_type="host.registered",
              entity_type="host", entity_id="bender",
-             payload='{"host_name": "bender", "tailnet_ip": "100.104.39.6"}',
+             payload='{"host_name": "bender", "tailnet_ip": "100.64.8.6"}',
              source_timestamp=ts, ingest_timestamp=ts, schema_version=1),
         _row(event_id="e2", sequence=0, event_type="mission.started",
              entity_type="mission", entity_id="MSN-1",
@@ -136,7 +136,7 @@ def test_load_into_reconstructs_entities_from_event_log():
     assert counts["sessions"] == 1
     assert counts["artifacts"] == 1
     h = repo.get_host("bender")
-    assert h["host_name"] == "bender" and h["tailnet_ip"] == "100.104.39.6"
+    assert h["host_name"] == "bender" and h["tailnet_ip"] == "100.64.8.6"
     m = repo.get_mission("MSN-1")
     assert m["title"] == "Reconstructed" and m["stage"] == "active"
     assert m["cwd"] == "/work/msn1"

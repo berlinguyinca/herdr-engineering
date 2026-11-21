@@ -26,7 +26,7 @@ Explicitly selecting `deploy/control-plane/compose.web-egress.yaml` would keep
 The proposed UFW permission is **host INPUT**, matching all of interface, source
 CIDR, an explicitly configured private gateway IPv4 `/32`, TCP and port 443.
 There is **no repository gateway-address default**. For example, the Bender
-canary used `100.104.39.6/32`; other hosts must supply their own assigned address.
+canary used `100.64.8.6/32`; other hosts must supply their own assigned address.
 Preflight reads `ip -j -4 address show` and refuses a nonlocal destination, a
 public/multicast/loopback address, or a noncanonical/non-/32 value. RFC1918 and
 100.64.0.0/10 unicast addresses are accepted only when locally assigned, preserving
@@ -85,7 +85,7 @@ containers and the now-empty test network. No canary resources remain.
 | Check | Original default | New default |
 | --- | --- | --- |
 | Gateway | 172.16.4.1 | 172.31.252.1 |
-| Source toward 100.104.39.6 | 172.16.4.7 | 172.31.252.2 |
+| Source toward 100.64.8.6 | 172.16.4.7 | 172.31.252.2 |
 | Docker/external DNS | Resolved | Resolved |
 | Postgres TCP | Connected | Connected |
 | Object-store health | HTTP 200 | HTTP 200 |

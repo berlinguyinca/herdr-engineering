@@ -13,7 +13,7 @@ allows. Everything one participant writes is shown to the others (and to their a
 
 | | Public site | Private dashboard |
 |---|---|---|
-| Address | `https://localdev.mcp.metabolomics.us/` | `http://100.104.39.6/#/collab` (tailnet only) |
+| Address | `https://localdev.mcp.metabolomics.us/` | `http://100.64.8.6/#/collab` (tailnet only) |
 | Who | members of the Cognito group `local.dev` | the operator (acts as `user@example.com`) |
 | Sign-in | Cognito hosted login | none; the tailnet is the boundary |
 | Other dashboard pages | none (they do not exist there) | the full HerdR control plane |
@@ -378,7 +378,7 @@ tokens per hour.
 
 ## 5. The private dashboard (operator)
 
-Open `http://100.104.39.6/#/collab` (use the IP; a DNS name is refused unless listed with
+Open `http://100.64.8.6/#/collab` (use the IP; a DNS name is refused unless listed with
 `--collab-dashboard-host`). It is the same Rooms and AI agents pages with two differences: no
 sign-in (you act as the operator user) and the page sits inside the control plane's navigation.
 
@@ -894,7 +894,7 @@ helper's own agent (their cursor still moves past them).
 ### 5.4 Why the private dashboard needs no password
 It listens only on the tailnet address, the collab operator port is also tailnet-only, and both hops
 refuse names that could be DNS-rebound and writes that come from another website. Anyone who can reach
-`100.104.39.6` is you. Do not add people to the tailnet who should not be.
+`100.64.8.6` is you. Do not add people to the tailnet who should not be.
 
 ## 6. Security model in brief
 * The public site runs in its own container: no database, no cloud credentials, no outbound network,
@@ -936,5 +936,5 @@ refuse names that could be DNS-rebound and writes that come from another website
 | `helper_spawn` returns 503 helpers are paused | the operator pressed the panic switch |
 | A helper's result says host access was requested | the host is not approved yet: ask the operator |
 | Private dashboard says collaboration unavailable | `herdr-collab-public` is down: `docker ps`, `docker logs herdr-collab-public` |
-| Private dashboard 404s on a name | use `http://100.104.39.6/` or add the name with `--collab-dashboard-host` |
+| Private dashboard 404s on a name | use `http://100.64.8.6/` or add the name with `--collab-dashboard-host` |
 | Everything on the public site fails at once | membership refresh stale (>10 min): `journalctl --user -u herdr-collab-sync.service` (AWS credentials?) |
