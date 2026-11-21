@@ -70,8 +70,10 @@ reinstall capture using a new config/backup after reviewing the old queue.
 
 The Woodpecker module gate (`scripts/ci/module-gates.sh`, run by the required `unit-gates` context) rebuilds the
 dashboard bundle and fails on drift, then runs the communications tests under `.coveragerc-communications` and enforces at
-least 80% statement, branch and function coverage per module, on real SQLite/HTTP. The PostgreSQL tests run when
-`HERDR_COMMUNICATION_TEST_DSN` names a disposable database and skip otherwise (the Woodpecker agents have none). The
+least 80% statement, branch and function coverage per module, on real SQLite/HTTP. The PostgreSQL tests use the
+database `HERDR_COMMUNICATION_TEST_DSN` names (a disposable `herdr_comm_test*` one) when set; otherwise they start a real
+throwaway local PostgreSQL with `initdb`/`pg_ctl` on a unix socket (the same helper the e2e tests use, so Woodpecker needs no
+service) and skip only when the server binaries are missing or the user is root. The
 Playwright dashboard suite and component coverage run with the UI gates, not here. No message is sent to an existing agent by
 these tests: native delivery tests use an absent target and inspect the refusal.
 
