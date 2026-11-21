@@ -39,7 +39,7 @@ def calm_host(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.Monk
 def args_with(**env: str) -> list[str]:
     exports = "".join(f"export {k}={v}; " for k, v in env.items())
     done = subprocess.run(
-        ["bash", "-c", f'unset HERDR_PYTEST_WORKERS HERDR_PYTEST_MAXPROCESSES; {exports}. "{HELPER}"; herdr_pytest_parallel_args'],
+        ["bash", "-c", f'unset HERDR_PYTEST_WORKERS HERDR_PYTEST_MAXPROCESSES SLURM_CPUS_PER_TASK; {exports}. "{HELPER}"; herdr_pytest_parallel_args'],
         capture_output=True, text=True, cwd=ROOT,
     )
     assert done.returncode == 0, done.stderr
