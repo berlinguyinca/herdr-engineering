@@ -1339,7 +1339,7 @@ def test_rollback_to_a_checkout_without_the_fabric_overlay_drops_the_sidecar_ser
     after = log[log.index(files[0]):]
     assert not any(ln.startswith("docker compose") and "fabric-whois" in ln for ln in after)
     assert "docker stop herdr-collab-fabric-whois" in after                       # the orphan sidecar is stopped
-    assert "all of: control-plane-web control-plane-worker llm-proxy collab-public collab-edge)" in r.stderr
+    assert "all of: control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web collab-public collab-edge)" in r.stderr
 
 
 def test_rollback_to_a_checkout_with_the_fabric_overlay_keeps_the_sidecar(env):
@@ -1875,7 +1875,7 @@ def test_changed_slice_recreates_collab_public_exactly_once_and_reloads_the_edge
     assert len(ups) == 1 and "--force-recreate collab-public" in ups[0]
     rest = [ln for ln in env["log"].read_text().splitlines()
             if ln.startswith("docker compose") and " up " in ln and ln not in ups]
-    assert len(rest) == 1 and rest[0].endswith("control-plane-web control-plane-worker llm-proxy collab-edge")
+    assert len(rest) == 1 and rest[0].endswith("control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web collab-edge")
     assert "docker exec herdr-collab-edge nginx -s reload" in env["log"].read_text()
 
 
