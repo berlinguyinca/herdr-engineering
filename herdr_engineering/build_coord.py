@@ -28,9 +28,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -243,11 +245,36 @@ def _prestart_sccache_server(env: dict[str, str] | None) -> None:
         pass
 
 
+def _run_child(cmd: list[str], slot_fd: int | None) -> int:
+    """Run ``cmd`` as a child with this process's environment, forwarding SIGINT/SIGTERM to it; return its exit
+    code (128 + signal when it was killed, as a shell reports it). The slot is freed once it is reaped."""
+    child = subprocess.Popen(cmd, close_fds=False)  # OSError: the caller maps it to 127
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        for number in (signal.SIGINT, signal.SIGTERM):
+            previous[number] = signal.signal(number, lambda signum, _frame: child.poll() is None
+                                             and child.send_signal(signum))
+    try:
+        status = child.wait()
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+        if slot_fd is not None:
+            try:
+                os.close(slot_fd)
+            except OSError:
+                pass
+    return 128 - status if status < 0 else status
+
+
 def _launch(cmd: list[str], record: bool, slot: int | None, state_dir: Path,
             slot_fd: int | None = None, env: dict[str, str] | None = None,
             cache: dict | None = None,
-            trace: dict[str, str] | None = None) -> int:
-    """exec ``cmd`` (default) or, with ``record``, run it measured and return its code."""
+            trace: dict[str, str] | None = None, stay: bool = False) -> int:
+    """exec ``cmd`` (default), or with ``record`` run it measured and return its code. ``stay`` runs it as a
+    plain child (no metrics, no registry) so the caller can act after it: the locks stay held until it ends."""
+    if stay and not record:
+        return _run_child(cmd, slot_fd)
     if not record:
         os.execvp(cmd[0], cmd)
         raise AssertionError("unreachable")  # pragma: no cover
@@ -271,7 +298,7 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
               bypass_on_timeout: bool = False, record: bool = False,
               child_env: dict[str, str] | None = None,
               cache: dict | None = None,
-              trace: dict[str, str] | None = None) -> int:
+              trace: dict[str, str] | None = None, stay: bool = False) -> int:
     """Run ``cmd`` under the per-host build gate.
 
     This is the entry point for ``herdr-eng build-coordinate``. It acquires a
@@ -318,7 +345,7 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
             print(f"build-coordinate: {exc}; running ungated (bypass-on-timeout)",
                   file=sys.stderr)
             try:
-                return _launch(cmd, record, None, gate.dir, None, child_env, cache, trace)
+                return _launch(cmd, record, None, gate.dir, None, child_env, cache, trace, stay)
             except OSError as e:
                 if json_out:
                     print(json.dumps({"error": f"could not exec {cmd[0]}: {e}"},
@@ -339,7 +366,7 @@ def _run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.
     try:
         # Default: replaces this process; flock held by fd. With ``record`` the
         # parent stays alive holding every lock fd until the child exits.
-        return _launch(cmd, record, _slot, gate.dir, fd, child_env, cache, trace)
+        return _launch(cmd, record, _slot, gate.dir, fd, child_env, cache, trace, stay)
     except OSError as exc:
         if fd is not None and not record:  # record mode already closed it
             try:
@@ -413,7 +440,7 @@ def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5
               state_dir: Path | None = None,
               bypass_on_timeout: bool = False, record: bool = False,
               cache_config: BuildCacheConfig | None = None,
-              trace: dict[str, str] | None = None) -> int:
+              trace: dict[str, str] | None = None, stay: bool = False) -> int:
     """Hold a maintenance read lock for the entire build, even on slot bypass.
 
     Retention, migration and cache eviction take the exclusive side of this lock; the cleanup sweep takes
@@ -448,7 +475,7 @@ def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5
         return _run_gated(cmd, slots=slots, max_load=max_load,
                           wait_seconds=wait_seconds, json_out=json_out,
                           state_dir=state_dir, bypass_on_timeout=bypass_on_timeout,
-                          record=record, child_env=child_env, cache=cache, trace=trace)
+                          record=record, child_env=child_env, cache=cache, trace=trace, stay=stay)
     finally:
         if maintenance_fd is not None:
             os.close(maintenance_fd)

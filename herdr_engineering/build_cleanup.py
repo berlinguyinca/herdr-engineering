@@ -33,6 +33,11 @@ its own locking. Busy checks compare (device, inode), never path spelling. On Li
    that is the name of a regular file in the target; a title with whitespace is not a name. Other relative
    arguments are not looked at.
 
+3. An idle target over the per-target size cap (``max_target_bytes``, ``build_cleanup.max_target_gb``),
+   on every sweep and whatever the disk usage (reason ``size_cap``). It goes through exactly the path of
+   (2): idle floor, process scan, lease, git and ``cargo clean``. ``after_build_size_cap`` runs this pass
+   for the target of one finished build.
+
 Targets are skipped when a build lease covers them, when git tracks files in them, or when anything inside
 looks foreign (links, special files, other owners). Only current-user Cargo ``target`` directories inside
 explicit roots are eligible; no symlinks are followed. A target without a workspace to clean through (a
@@ -445,6 +450,18 @@ def _proc_claims(pid: Path, number: int, name: str) -> list[Hold]:
     return [(number, name, "builds into", Path(os.path.join(cwd, v)), _NO_IDS) for v in values + _argv_target_dirs(argv)]
 
 
+_HOME_SKIP = {"Library"}  # beyond the hidden directories: macOS application data is not a project tree
+
+
+def _is_home(root: Path) -> bool:
+    """True for the user's home directory: as a root it is searched with the exclusions above (a configured
+    ``~/.cache`` or ``~/.cargo/...`` root is searched as named)."""
+    try:
+        return root.samefile(Path.home())
+    except OSError:
+        return False
+
+
 def _discover(root: Path, managed: bool = True, unreadable: list[str] | None = None,
               trash: list[Path] | None = None) -> list[Path]:
     """Cargo targets under ``root``. ``managed`` also returns cache-only targets and Herdr-managed
@@ -455,6 +472,7 @@ def _discover(root: Path, managed: bool = True, unreadable: list[str] | None = N
     device = root.stat().st_dev
     found = []
     count = 0
+    home_root = _is_home(root)
     while pending:
         directory, depth = pending.pop()
         try:
@@ -494,6 +512,8 @@ def _discover(root: Path, managed: bool = True, unreadable: list[str] | None = N
                     continue
                 if entry.name in _PRUNE:
                     continue
+                if home_root and (entry.name.startswith(".") or entry.name in _HOME_SKIP):
+                    continue  # ~/.cargo, ~/.rustup, the trash and other dot directories are never entered
                 if depth >= _MAX_DEPTH:
                     continue  # deeper directories are outside this bounded sweep
                 pending.append((path, depth + 1))
@@ -866,6 +886,8 @@ def run_once(
     high_water: float = 85, low_water: float = 80, min_age_hours: float = 24,
     pressure_water: float = 90, pressure_min_age_hours: float = 2,
     only_device: int | None = None,
+    max_target_bytes: int | None = None, size_cap_min_age_hours: float | None = None,
+    only_targets: list[Path] | None = None,
 ) -> dict:
     """Run one bounded sweep and atomically save its inspectable status.
 
@@ -879,10 +901,21 @@ def run_once(
     tiers. Dry runs fully validate eligible targets but never remove them. Busy sweeps return immediately
     without overwriting the last report. ``only_device`` limits the sweep to roots on that filesystem (the
     one under pressure).
+
+    ``max_target_bytes`` (None: no cap) also cleans an idle target larger than that, on every sweep and below
+    ``high_water`` too (``reasons[path] == "size_cap"``), through the same checks. Such a target needs
+    ``size_cap_min_age_hours`` of idle time (default ``min_age_hours``; the after-build pass uses 0, because
+    its target was written a moment ago: the process scan and the leases then decide). ``only_targets``
+    limits the pass to those targets, found under ``roots`` without a discovery walk.
     """
     if not all(math.isfinite(v) for v in (high_water, low_water, min_age_hours,
                                           pressure_water, pressure_min_age_hours)):
         raise ValueError("Cleanup policy values must be finite")
+    if max_target_bytes is not None and max_target_bytes < 0:
+        raise ValueError("max_target_bytes must not be negative")
+    if size_cap_min_age_hours is not None and not (
+            math.isfinite(size_cap_min_age_hours) and size_cap_min_age_hours >= 0):
+        raise ValueError("size_cap_min_age_hours must be a finite number, 0 or more")
     if not 0 <= low_water < high_water <= 100 or not 0 <= pressure_water <= 100:
         raise ValueError("Require 0 <= low_water < high_water <= 100 and 0 <= pressure_water <= 100")
     if min_age_hours < MIN_IDLE_HOURS or pressure_min_age_hours < MIN_IDLE_HOURS:
@@ -893,7 +926,7 @@ def run_once(
         "timestamp": datetime.now(UTC).isoformat(), "status": "ok", "dry_run": dry_run,
         "roots": [], "removed_count": 0, "removed_bytes": 0, "reclaimed_bytes": 0,
         "removed": [], "would_remove": [], "skipped": [], "errors": [], "warnings": [],
-        "reconciled": [], "pressure": False, "process_scans": 0, "aborted": False, "blocked": [],
+        "reconciled": [], "reasons": {}, "pressure": False, "process_scans": 0, "aborted": False, "blocked": [],
     }
     lock_fds = [os.open(state_dir / name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
                 for name in ("build-cleanup.lock", "build-maintenance.lock")]
@@ -905,13 +938,16 @@ def run_once(
             result["status"] = "busy"
             return result
         _reconcile_registry(state_dir, result)
+        cap = None if max_target_bytes is None else (max_target_bytes, min_age_hours if
+                                                     size_cap_min_age_hours is None else size_cap_min_age_hours)
         _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
-               pressure_water, pressure_min_age_hours, only_device)
+               pressure_water, pressure_min_age_hours, only_device, cap, only_targets)
         if result["warnings"]:
             result["status"] = "warning"
         if result["errors"]:
             result["status"] = "error"
-        _write_status(state_dir, result)
+        if only_targets is None or result["removed"] or result["errors"]:
+            _write_status(state_dir, result)  # a one-target pass must not replace the last full report
         if not dry_run:
             from .build_metrics import emit_event
             emit_event(state_dir, "cleanup_completed", kind="cleanup", status=result["status"],
@@ -958,9 +994,10 @@ def _skip_root(result: dict, root: Path, reason: str) -> None:
 
 
 def _candidates(roots, state_dir, result, high_water, min_age_hours, pressure_water, pressure_min_age_hours,
-                only_device):
-    """Targets on the roots that are over ``high_water``: (newest mtime, path, size, idle cutoff) each, and
-    the root they live on by device. Leftovers of an interrupted orphan removal are removed here."""
+                only_device, cap=None, only_targets=None):
+    """Targets to consider: (newest mtime, path, size, idle cutoff, reason) each, and the root they live on
+    by device. All of a root's targets when it is over ``high_water`` (reason ``pressure``); below it, only
+    those over the size ``cap`` (reason ``size_cap``; the cap wins when both apply). Leftovers of an interrupted orphan removal are removed here."""
     candidates, roots_by_device = [], {}
     now = time.time()
     for raw in roots:
@@ -976,7 +1013,8 @@ def _candidates(roots, state_dir, result, high_water, min_age_hours, pressure_wa
             continue  # deleting there cannot relieve the filesystem under pressure
         result["roots"].append(str(root))
         usage = _usage(root)
-        if usage < high_water:
+        pressured = usage >= high_water
+        if not pressured and cap is None:
             continue
         under_pressure = usage >= pressure_water
         cutoff = now - (min(min_age_hours, pressure_min_age_hours) if under_pressure else min_age_hours) * 3600
@@ -985,7 +1023,10 @@ def _candidates(roots, state_dir, result, high_water, min_age_hours, pressure_wa
         try:
             unreadable: list[str] = []
             trash: list[Path] = []
-            targets = _discover(root, unreadable=unreadable, trash=trash)
+            if only_targets is not None:
+                targets = [t for t in only_targets if t.parent == root and _recognized(t)]
+            else:
+                targets = _discover(root, unreadable=unreadable, trash=trash)
             for leftover in trash if not result["dry_run"] else []:
                 try:
                     shutil.rmtree(leftover)  # nothing can be using it: it was renamed out of reach
@@ -1006,27 +1047,34 @@ def _candidates(roots, state_dir, result, high_water, min_age_hours, pressure_wa
                 newest, size = _inspect(target)
             except OSError as exc:
                 result["skipped"].append({"path": str(target), "reason": str(exc)})
-                result["errors"].append(str(exc))
+                if pressured:  # below high water this is a size look only: a target that cannot be read stays
+                    result["errors"].append(str(exc))
                 continue
-            if newest > cutoff and not _orphaned(target):
+            over_cap = cap is not None and size > cap[0]
+            if not pressured and not over_cap:
+                continue
+            reason = "size_cap" if over_cap else "pressure"
+            # the smaller idle time of the reasons that apply (a larger cutoff admits more targets)
+            target_cutoff = max(cutoff if pressured else 0.0, now - cap[1] * 3600 if over_cap else 0.0)
+            if newest > target_cutoff and not _orphaned(target):
                 result["skipped"].append({"path": str(target), "reason": "recent activity"})
             else:
-                candidates.append((newest, str(target), size, cutoff))
+                candidates.append((newest, str(target), size, target_cutoff, reason))
     return candidates, roots_by_device
 
 
 def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
-           pressure_water=90, pressure_min_age_hours=2, only_device=None):
+           pressure_water=90, pressure_min_age_hours=2, only_device=None, cap=None, only_targets=None):
     try:
         candidates, roots_by_device = _candidates(
             roots, state_dir, result, high_water, min_age_hours, pressure_water, pressure_min_age_hours,
-            only_device)
+            only_device, cap, only_targets)
     except (OSError, ValueError) as exc:
         result["errors"].append(str(exc))
         result["aborted"] = True  # the sweep itself failed (discovery): nothing was judged
         return
     seen = set()
-    for _, name, size, cutoff in sorted(candidates):
+    for _, name, size, cutoff, reason in sorted(candidates):
         if result["aborted"]:
             break  # a failed busy check stops the sweep: nothing more is judged on a host we cannot read
         if name in seen:
@@ -1035,19 +1083,21 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
         target = Path(name)
         try:
             root = roots_by_device[target.stat().st_dev]
-            if _usage(root) <= low_water:
-                continue
+            if reason == "pressure" and _usage(root) <= low_water:
+                continue  # the pressure sweep stops at low water; a target over the cap goes regardless
             before = shutil.disk_usage(root).free
             if _orphaned(target):
                 if _blocked_by_process(target, name, result):
                     continue  # moved, not deleted: something still builds into it
                 if result["dry_run"]:
                     result["would_remove"].append(name)
+                    result["reasons"][name] = "orphan"
                     continue
                 if not _remove_orphan(target):
                     result["skipped"].append({"path": name, "reason": "worktree is back"})
                     continue
-            elif not _clean_idle(target, name, cutoff, state_dir, result):
+                result["reasons"][name] = "orphan"
+            elif not _clean_idle(target, name, cutoff, state_dir, result, reason):
                 continue
         except (OSError, subprocess.SubprocessError) as exc:
             result["errors"].append(f"{name}: {exc}")
@@ -1056,6 +1106,7 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
         result["removed_bytes"] += size
         result["reclaimed_bytes"] += max(0, shutil.disk_usage(root).free - before)
         result["removed"].append(name)
+        result["reasons"].setdefault(name, reason)
 
 
 def _blocked_by_process(target: Path, name: str, result: dict) -> bool:
@@ -1084,7 +1135,8 @@ def _blocked_by_process(target: Path, name: str, result: dict) -> bool:
     return True
 
 
-def _clean_idle(target: Path, name: str, cutoff: float, state_dir: Path, result: dict) -> bool:
+def _clean_idle(target: Path, name: str, cutoff: float, state_dir: Path, result: dict,
+                reason: str = "pressure") -> bool:
     """Clean one idle target through cargo; True when it went. Otherwise the reason is in ``skipped``."""
     def skip(reason: str) -> bool:
         result["skipped"].append({"path": name, "reason": reason})
@@ -1105,6 +1157,58 @@ def _clean_idle(target: Path, name: str, cutoff: float, state_dir: Path, result:
         return False
     if result["dry_run"]:
         result["would_remove"].append(name)
+        result["reasons"][name] = reason
         return False
-    reason = _cargo_clean(target)
-    return skip(reason) if reason else True
+    failure = _cargo_clean(target)
+    return skip(failure) if failure else True
+
+
+def _build_targets(cmd: list[str], cwd: Path) -> list[Path]:
+    """Directories a finished ``cargo`` build may have written: where the command directs its output, or
+    the workspace's ``target`` and its Herdr-managed target (which the cargo wrapper picks, out of sight)."""
+    from .build_hygiene import resolve_real_cargo
+    from .cargo_target_storage import target_directory, target_override, workspace_root
+    override = target_override(cmd[1:], os.environ, cwd)
+    if isinstance(override, Path):
+        return [override]
+    if override:
+        return []  # directed to a place only a config file names: not guessed
+    workspace = workspace_root(resolve_real_cargo(Path.home()), cmd[1:], cwd)
+    from .build_maintenance import _managed_output_dirs
+    managed = [target_directory(root.parent / "cache", workspace) for root in _managed_output_dirs()
+               if root.name == "targets"]
+    return [workspace / "target", *managed]
+
+
+def after_build_size_cap(cmd: list[str], cwd: Path, cfg: dict, state_dir: Path) -> dict | None:
+    """Size-cap pass for the target of one finished ``cargo`` build (the result of ``run_once``), or None when
+    nothing applies: cleanup or the cap is off, the command is not a cargo build, or it has no target.
+
+    Called after the build's lease is released. Only the build's own target is looked at, and it goes only if
+    it is over the cap and no other build or process holds it (the lease and process checks of every sweep).
+    The idle floor is 0, as the target was written a moment ago. Never raises: a failure is logged and the
+    build's exit code is untouched."""
+    try:
+        from .build_maintenance import policy_kwargs
+        from .cargo_host import BUILD_SUBCOMMANDS, cargo_subcommand
+        policy = policy_kwargs(cfg)
+        if (not cfg.get("enabled", True) or policy["max_target_bytes"] is None
+                or os.path.basename(cmd[0]) != "cargo"):
+            return None
+        subcommand = cargo_subcommand(cmd[1:])
+        if subcommand not in BUILD_SUBCOMMANDS or subcommand == "clean":
+            return None
+        targets = [t for t in _build_targets(cmd, cwd) if t.is_dir() and not t.is_symlink()]
+        removed: dict = {"removed": [], "errors": [], "skipped": []}
+        for target in targets:
+            result = run_once([target.parent], state_dir, **{**policy, "size_cap_min_age_hours": 0,
+                                                             "high_water": 100, "low_water": 0},
+                              only_targets=[target])
+            for key in removed:
+                removed[key].extend(result.get(key, []))
+            if result.get("status") == "busy":
+                log.info("build cleanup: size cap pass skipped, another sweep runs: %s", target)
+        return removed if targets else None
+    except Exception as exc:  # noqa: BLE001 - a cleanup problem must never fail the build
+        log.warning("build cleanup: size cap pass after the build failed: %s: %s", type(exc).__name__, exc)
+        return None

@@ -3,8 +3,8 @@
 The Linux Herdr Engineering companion checks every 15 minutes, whether or not a
 Herdr server is running (set `build_cleanup.require_herdr_server: true` to sweep
 only while a server of the same user runs). It cleans verified Cargo
-output directories under explicitly configured project roots when disk use
-reaches 85%, oldest first, stopping at 80%. Artifacts must be inactive for at
+output directories under the project roots (the home directory by default) when disk use
+reaches 85%, oldest first, stopping at 80%, and any idle target over `max_target_gb` at every check. Artifacts must be inactive for at
 least 24 hours. Source files, worktrees, Cargo downloads, and Rust toolchains
 are retained.
 
@@ -64,7 +64,7 @@ with `scripts/fleet-auto-update.sh`; see [fleet lifecycle](operations/fleet-life
 
 ## Defaults, pressure mode and the disk guard
 
-Cleanup is on by default (roots `~/IdeaProjects`, `~/work`, `~/.cache`; roots that do
+Cleanup is on by default (roots `~` and `~/.cache`; roots that do
 not exist are skipped; the managed `targets/` dirs and the legacy `shared-targets` slot pools of the state dir and of every mounted enrolled storage tier (a `volume_uuid` tier is resolved through its mount) are added automatically and re-evaluated every cycle). Opt out
 with `build_cleanup: {enabled: false}`. `scripts/install.sh` and `fleet update` install
 the job; `herdr-eng build-hygiene install|status` does it by hand (systemd user unit on
@@ -175,3 +175,36 @@ non-mapping value is a configuration error). `herdr-eng build-cleanup run --root
 cargo itself whenever the `cargo` on PATH is not the herdr wrapper (measuring the filesystem of its target
 directory), so an IDE-style run is refused the same way. The `true`/`false` shorthand is merged into what earlier
 config sources set.
+
+## Size cap, home-wide discovery and the after-build pass
+
+```yaml
+build_cleanup:
+  max_target_gb: 50   # 0 turns the cap off
+```
+
+**Size cap.** An idle target larger than `max_target_gb` is cleaned on every sweep, whatever the disk usage
+(below `high_water_percent` too). It uses exactly the path of the pressure sweep: a verified Cargo target, the idle
+floor (`min_age_hours`), git-untracked, leases, the per-target process scan, the sweep lock, and `cargo clean`. The
+sweep result lists it in `reasons` as `size_cap` (`pressure` and `orphan` are the other values). A target that goes
+over the cap while a build runs, or whose project is not in git, is kept. Why: a disk reached 100% from stale
+`target/debug` copies that no pressure rule had touched.
+
+**Default discovery.** With `roots` unset the sweep searches the home directory (and `~/.cache`). This widens the
+earlier narrowed contract of "explicit roots only"; it does so at the user's explicit request, because the user has
+dozens of Rust projects and cannot list them all. The walk under `~` is bounded (depth 6), never follows symlinks, and
+does not enter dot directories (`~/.cargo`, `~/.rustup`, `~/.local/share/Trash`, ...), `Library` or `node_modules`; a
+directory is a target only when the usual verification accepts it (a `Cargo.toml` beside it and Cargo's markers).
+Setting `roots` replaces the default, and a root you name is searched as named (the exclusions apply only to `~`).
+
+**After a build.** When `herdr-eng build-coordinate -- cargo <build|check|test|...>` finishes, it checks that
+build's target (the `--target-dir` or `CARGO_TARGET_DIR` it was given, else the workspace `target` and its
+Herdr-managed target). If that target is over the cap, a size-cap pass for that target alone runs after the build's lease
+is released; another build holding the target, or any process using it, keeps it. The idle floor of this pass is 0:
+the target was written a moment ago, so any idle floor would always skip it, and the lease and process checks
+decide instead. It never fails the build; a problem is logged on stderr and the build's exit code (128 + signal if it
+was killed) is kept. For this the cargo command runs as a plain child instead of being exec'd; no metrics are
+recorded for it, and SIGINT and SIGTERM are forwarded to it.
+
+`scripts/install.sh` (step 7g) installs and enables the cleanup service or timer by default; `--no-build-hygiene` or
+`HERDR_INSTALL_BUILD_HYGIENE=0` opts out.

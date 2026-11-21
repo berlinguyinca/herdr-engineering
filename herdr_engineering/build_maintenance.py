@@ -56,6 +56,8 @@ def policy_kwargs(cfg: dict) -> dict:
         "min_age_hours": float(cfg.get('min_age_hours', 24)),
         "pressure_water": float(cfg.get('pressure_percent', 90)),
         "pressure_min_age_hours": float(cfg.get('pressure_min_age_hours', 2)),
+        # 0 switches the per-target cap off
+        "max_target_bytes": int(float(cfg.get('max_target_gb', 50)) * 1024 ** 3) or None,
     }
 
 

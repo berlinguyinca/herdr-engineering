@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Per-target size cap, home-wide discovery and an after-build pass
+
+- New `build_cleanup.max_target_gb` (default 50, 0 turns it off): an idle Cargo target over the cap is cleaned on every sweep, also below `high_water_percent`. It goes through the same checks as the pressure sweep (verified target, idle floor, git-untracked, leases, per-target process scan, the lock, `cargo clean`). The sweep result names it `size_cap` in the new `reasons` map. Why: on 2026-11-20 beast's disk hit 100% with two checkouts holding 821 GB and 521 GB of stale `target/debug`; the old cleanup acted only at 85% and only under configured roots, and the service was never installed.
+- Default roots are now `~` and `~/.cache` instead of `~/IdeaProjects`, `~/work`, `~/.cache`. **This widens the earlier narrowed "explicit roots only" contract, at the user's explicit request** ("we have dozens of rust projects"). Under the home directory the walk is bounded (depth 6), never follows symlinks and does not enter dot directories (`~/.cargo`, `~/.rustup`, `~/.local/share/Trash`), `Library` or `node_modules`; a directory counts only when the existing verification accepts it (`Cargo.toml` beside it, Cargo's markers). A project outside git is still never cleaned. Explicit `roots` override the default, and a root you name is searched as named.
+- `herdr-eng build-coordinate -- cargo ...` checks the build's own target once the build has ended and its lease is released, and runs a size-cap pass for that target only (idle floor 0, because it was just written; leases and the process scan still protect it). It never fails the build: errors are logged to stderr and the exit code (128 + signal for a signal) is the build's. The command runs as a plain child instead of being exec'd (no metrics or registry recording is added; SIGINT and SIGTERM are forwarded).
+- `scripts/install.sh` step 7g already installs and enables the cleanup unit by default (opt out with `--no-build-hygiene`); no change.
+
 ### Disk hygiene on by default: pressure cleanup, one managed cargo target per worktree, disk-budget guard
 
 - `build_cleanup` is now enabled by default with roots `~/IdeaProjects`, `~/work`, `~/.cache` (missing roots are skipped; the managed `targets/` dirs, any legacy slot pool and the `~/.cache/inferweave-native-admission/target` cache are covered). Opt out with `build_cleanup: {enabled: false}`. `scripts/install.sh` (step 7f, `--no-build-hygiene`), `fleet update` and `herdr-eng build-hygiene install` install the timer (systemd user unit on Linux, launchd interval job on macOS) and the cargo wrapper. The macOS sweep inspects processes with `lsof` (fail closed) because there is no `/proc`.
