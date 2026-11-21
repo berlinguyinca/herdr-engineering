@@ -1,6 +1,6 @@
 # ci-review: the `Independent AI review` status
 
-> As of 2026-11-13 the required status is `Opus agent review`, posted by `always-on-review.py` (per PR through Woodpecker, `.woodpecker/opus-review.yaml` and `scripts/ci/opus-review.sh`, with the timer as an hourly backup sweep); this script's status is advisory. See `docs/operations/independent-ai-review.md` and `docs/operations/per-pr-opus-review.md`.
+> As of 2026-11-13 the required status is `Opus agent review`, posted by `always-on-review.py` (per PR through Woodpecker, `.woodpecker/opus-review.yaml` and `scripts/ci/opus-review.sh`, with the timer as an hourly backup sweep; the status token is a 0600 host file, not a Woodpecker secret); this script's status is advisory. See `docs/operations/independent-ai-review.md` and `docs/operations/per-pr-opus-review.md`.
 
 The repository ruleset used to require a commit status named exactly `Independent AI review`. `ai-review.py` posts it.
 Before this script, the operator posted it by hand. Operator guide: `docs/operations/independent-ai-review.md`.

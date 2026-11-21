@@ -3,9 +3,12 @@
 # per-repo .woodpecker/opus-review.yaml, so the logic lives here and not in every repository. Operator guide:
 # docs/operations/per-pr-opus-review.md.
 #
-#   herdr-opus-review [--config FILE] [--home DIR] [--lock-wait SECONDS]
+#   herdr-opus-review [--config FILE] [--home DIR] [--lock-wait SECONDS] [--token-file FILE]
 #
-# Reads CI_PIPELINE_EVENT, CI_REPO, CI_COMMIT_PULL_REQUEST and the secret OPUS_REVIEW_GITHUB_TOKEN, which Woodpecker sets.
+# Reads CI_PIPELINE_EVENT, CI_REPO and CI_COMMIT_PULL_REQUEST, which Woodpecker sets. The GitHub status token is NOT a
+# Woodpecker secret (a missing secret fails every pipeline of the repo at compile time): it is read from a host file,
+# default <real home>/.config/herdr-engineering/opus-review.token, overridable with --token-file or the agent's
+# OPUS_REVIEW_TOKEN_FILE. The file must be owned by the running user with no group/other permissions (mode 0600).
 #
 # Install (once, as the user that owns the Claude login):
 #   sudo ln -s <checkout>/scripts/ci/opus-review.sh /usr/local/bin/herdr-opus-review
@@ -29,11 +32,13 @@ script="$here/../../deploy/ci-review/always-on-review.py"
 home=""
 config=""
 lock_wait=1800
+token_file=${OPUS_REVIEW_TOKEN_FILE:-}
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) [ $# -ge 2 ] || { say "--config needs a file"; exit 2; }; config=$2; shift 2 ;;
     --home) [ $# -ge 2 ] || { say "--home needs a directory"; exit 2; }; home=$2; shift 2 ;;
     --lock-wait) [ $# -ge 2 ] || { say "--lock-wait needs seconds"; exit 2; }; lock_wait=$2; shift 2 ;;
+    --token-file) [ $# -ge 2 ] || { say "--token-file needs a file"; exit 2; }; token_file=$2; shift 2 ;;
     *) say "unknown argument: $1"; exit 2 ;;
   esac
 done
@@ -59,11 +64,25 @@ unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME XDG_CACHE_HOME USERPROFILE
 [ -r "$script" ] || { say "review script not found next to this install: $script"; exit 2; }
 [ -r "$config" ] || { say "config not readable: $config"; exit 2; }
 
-# The one credential: the status token. An ambient GitHub token on the agent is never used instead of it.
-token=${OPUS_REVIEW_GITHUB_TOKEN:-}
+# The one credential: the status token, from a host file (never a Woodpecker secret, never the environment). It is read
+# into this shell's memory only: never printed, never put on a command line. An ambient GitHub token is never used.
 unset OPUS_REVIEW_GITHUB_TOKEN GH_TOKEN GITHUB_TOKEN
-[ -n "$token" ] || { say "OPUS_REVIEW_GITHUB_TOKEN is empty; the secret is not configured for this event"; exit 1; }
-export GH_TOKEN=$token
+[ -n "$token_file" ] || token_file="$home/.config/herdr-engineering/opus-review.token"
+if [ ! -f "$token_file" ]; then
+  say "token file missing: $token_file"
+  say "create it as $(id -un): install -m 600 /dev/null '$token_file' && \$EDITOR '$token_file'  (one line: a fine-grained PAT with commit statuses + pull requests write on the enrolled repos)"
+  exit 1
+fi
+[ "$(stat -Lc %u "$token_file")" = "$(id -u)" ] \
+  || { say "token file $token_file is not owned by $(id -un) (the user the agent runs as); refusing it"; exit 1; }
+mode=$(stat -Lc %a "$token_file")
+if [ $(( 8#$mode & 8#077 )) -ne 0 ]; then
+  say "token file $token_file has mode $mode; it must be 0600 (no group or other access): chmod 600 '$token_file'"
+  exit 1
+fi
+token=$(tr -d '[:space:]' < "$token_file") || { say "cannot read token file $token_file"; exit 1; }
+[ -n "$token" ] || { say "token file $token_file is empty"; exit 1; }
+export GH_TOKEN=$token         # reaches gh and the review script, as their credential; nothing prints it
 
 # A PR whose head is in a fork is not reviewed here: the token must not sit next to code from outside the repository.
 # Only the exact answer `false` continues. This is a safety net, not the control: see the fork section of the docs.

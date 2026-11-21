@@ -29,9 +29,6 @@ skip_clone: true
 steps:
   - name: opus-review
     image: bash
-    environment:
-      OPUS_REVIEW_GITHUB_TOKEN:
-        from_secret: opus_review_github_token
     commands:
       - /usr/local/bin/herdr-opus-review
 ```
@@ -42,7 +39,7 @@ Why each line:
   are not a push: a title or label change and, importantly, **a draft marked ready for review**, which does not match
   `event: pull_request`. It is included because a draft head is skipped by the review and nothing else would trigger it
   again. The cost is a short pipeline per metadata edit; the review exits at once when the head already has a terminal
-  status. The secret must therefore be allowed for both events (step 3).
+  status.
 - `labels: review-host` pins it to the review host's agent, never the hive-heavy pool (that is for the test suites).
 - `concurrency` limit 1 queues reviews in the repo. The review script also takes a host-wide lock, so reviews of
   different repos, and the hourly sweep, never run together (they share one Claude login and one model slot).
@@ -82,10 +79,21 @@ Nothing here is automated, and no secret value belongs in any file or log.
    With `!review-host=true` the server (`server/scheduler/filter.go`, `requiredLabelsMissing`, in 3.20.1) hands the agent a
    workflow only if it carries `review-host: "true"`; a workflow without that label never reaches it. The agent must
    not carry `cluster=hive-heavy`. Restart it, then check the agent list shows the label.
-3. **Add the secret `opus_review_github_token`** in Woodpecker at user or global scope, allowed for the events
-   `pull_request` and `pull_request_metadata` only. Its value is a GitHub token that can write commit statuses and PR
-   comments on the enrolled repos (fine-grained: Commit statuses RW, Pull requests RW, Contents R). It is the only
-   secret this pipeline uses: the Claude login and the pi key already live on the host.
+3. **Create the token file** (no Woodpecker secret on purpose: a secret that does not exist is a compile error that
+   fails every pipeline of the repo, and the workflow must stay harmless before the host is ready). As the agent's user:
+
+   ```bash
+   install -m 600 /dev/null ~/.config/herdr-engineering/opus-review.token
+   $EDITOR ~/.config/herdr-engineering/opus-review.token     # one line: the token
+   ```
+
+   The token is a **fine-grained personal access token limited to the enrolled repositories** with Commit statuses
+   (read and write) and Pull requests (read and write); Contents read if the repos are private. The wrapper reads it
+   into memory only (never an argument, never logged, whitespace stripped) and refuses the file, exit 1, if it is
+   missing (the step fails with these instructions, it does not skip), empty, not owned by the user the agent runs as,
+   or readable by group or others (it must be mode 0600). To use another path, pass `--token-file FILE` in the
+   command or set `OPUS_REVIEW_TOKEN_FILE` in the agent's environment. The Claude login and the pi key already live on
+   the host.
 4. **Set the repo options** for every enrolled repo (see fork safety below): require approval for pull requests (and
    list the trusted authors, see fork safety), and set the pipeline timeout (repo settings) generously. The host-slot
    wait (`--lock-wait`, default 1800 s) applies **per tier**, and `review --tier all` runs two tiers, so the worst case
@@ -106,8 +114,8 @@ Nothing here is automated, and no secret value belongs in any file or log.
 
 - Agent label: create a throwaway workflow without `labels:` in a test repo and confirm it is never picked up by this
   agent (the agent log shows no task), while `opus-review` is. Also `woodpecker-cli lint --strict .woodpecker/opus-review.yaml`.
-- On the host, with a throwaway token in the environment of the command, not on any command line:
-  `CI_PIPELINE_EVENT=pull_request CI_REPO=<owner/repo> CI_COMMIT_PULL_REQUEST=<n> OPUS_REVIEW_GITHUB_TOKEN=... /usr/local/bin/herdr-opus-review`
+- On the host, as the agent's user, with the token file in place:
+  `CI_PIPELINE_EVENT=pull_request CI_REPO=<owner/repo> CI_COMMIT_PULL_REQUEST=<n> /usr/local/bin/herdr-opus-review`
   (with `post: false` in the config it is a dry run: it writes `reviews.jsonl` and posts nothing). Run it with
   `HOME=/nonexistent` too: it must still find the config.
 - Open a test PR in an enrolled repo. Within a minute the `opus-review` workflow starts on the review host and the PR
@@ -119,12 +127,10 @@ Nothing here is automated, and no secret value belongs in any file or log.
 
 ## (c) Fork safety: read this before enrolling a repo
 
-Woodpecker 3.20.1 does **not** keep the secret from fork pull requests. A secret is filtered by event (and by plugin
-image), nothing more. A pull request from a fork gets the secret and runs **its own copy of the workflow file** on the
-review host, in the agent's user account, once it is approved to run. That is arbitrary code from the fork's author,
-next to the status token, the `gh` login and the Claude login. The pipeline does not check out the PR, but a PR can
-replace `.woodpecker/opus-review.yaml` (or any workflow) with anything. (A missing secret is a compile error, not an
-empty value, so there is no "no token for forks" fallback either.)
+Woodpecker 3.20.1 does **not** keep fork pull requests away from the review host. A pull request from a fork runs
+**its own copy of the workflow file** on the review host, in the agent's user account, once it is approved to run. That
+is arbitrary code from the fork's author, next to the status token file, the `gh` login and the Claude login. The pipeline does not check out the PR, but a PR can
+replace `.woodpecker/opus-review.yaml` (or any workflow) with anything. The token is a file on the host, so there is nothing to withhold from such a run.
 
 - **The real control** is the repo setting **require approval for all pull requests** (not just first-time or fork
   contributors), set for each enrolled repo. Nothing runs on the review host until a maintainer approves that PR's
@@ -133,7 +139,10 @@ empty value, so there is no "no token for forks" fallback either.)
   automatic review and merging. Set the repo option `approval_allowed_users` to the owner and the bot accounts whose
   PRs may run unattended (Woodpecker checks the PR author, so a push to a trusted author's PR does not need a click).
   PRs by any author not on the list, forks included, still need an approval.
-- **Approving a pull request's pipeline approves its code on the review host, with the token.** For a PR from a fork that
+- **Approving a pull request's pipeline approves its code on the review host, with the token.** The token is a file on
+  that host, and the approved workflow runs there as the agent's user, so **a fork PR you approve can read the token
+  file** (and the `gh` and Claude logins). That is why the token must be a fine-grained PAT limited to commit statuses
+  and PR comments on the enrolled repositories only. For a PR from a fork that
   means arbitrary code from outside the organization. Approve a fork PR only after reading its changes to `.woodpecker/`
   and treating it as if you had run it yourself. Prefer not to approve fork PRs on enrolled repos at all.
 - Pull requests from branches of the repo itself are trusted to the extent their authors have push access: they can
@@ -146,8 +155,8 @@ empty value, so there is no "no token for forks" fallback either.)
   pi tier has `read,grep,find,ls` and has no file sandbox, so it needs `backends.pi.wrapper` to be sandboxed (see the
   README). The diff and PR text are untrusted prompt input. The reviewer's environment is scrubbed: no `GH_TOKEN`, no API
   keys. Only the wrapper, `gh` and the PR fetch see the token.
-- The wrapper uses the token only from `opus_review_github_token`; an ambient `GH_TOKEN` or `GITHUB_TOKEN` on the agent
-  is unset and never used.
+- The wrapper uses the token only from the token file; an ambient `GH_TOKEN` or `GITHUB_TOKEN` on the agent is unset
+  and never used.
 
 ## Behavior to know
 

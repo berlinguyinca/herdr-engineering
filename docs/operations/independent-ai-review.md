@@ -17,7 +17,7 @@ Never post the status by hand: a hand-posted `success` is a review nobody did.
 
 - The ruleset is still named "Independent AI review" in the GitHub UI, although the context it requires is now `Opus agent review`.
 - Anyone with push access can post a commit status, so the identity of the poster is a convention, not enforced. The
-  token that the automation uses is the `opus_review_github_token` Woodpecker secret.
+  token that the automation uses is the host token file `~/.config/herdr-engineering/opus-review.token` (see `per-pr-opus-review.md`).
 - Any push moves the head and makes the status stale. The new `synchronize` event starts a review of the new head.
 - The `Independent AI review` check below (`deploy/ci-review/ai-review.py`, a deepseek or qwen model) is **no
   longer required**. The script and timer remain, but their status is advisory.

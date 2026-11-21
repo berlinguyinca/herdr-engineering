@@ -68,6 +68,9 @@ class Host:
         (self.home / ".config/herdr-engineering").mkdir(parents=True)
         self.config = self.home / ".config/herdr-engineering/always-on-review.yaml"
         self.config.write_text("post: true\n")
+        self.token_file = self.home / ".config/herdr-engineering/opus-review.token"
+        self.token_file.write_text(TOKEN + "\n")
+        self.token_file.chmod(0o600)
         self.set_review()
         self.set_gh()
         # the installed command is a symlink to the script, as the operator steps say
@@ -83,7 +86,7 @@ class Host:
 
     def env(self, **over):
         e = {"PATH": f"{self.bin}:{os.environ['PATH']}", "HOME": str(self.home), "CI_PIPELINE_EVENT": "pull_request",
-             "CI_REPO": "berlinguyinca/other-repo", "CI_COMMIT_PULL_REQUEST": "42", "OPUS_REVIEW_GITHUB_TOKEN": TOKEN}
+             "CI_REPO": "berlinguyinca/other-repo", "CI_COMMIT_PULL_REQUEST": "42"}
         e.update(over)
         return {k: v for k, v in e.items() if v is not None}
 
@@ -122,12 +125,63 @@ def test_it_reviews_the_pr_of_ci_repo_and_posts(host):
                             "--host-lock-wait", "1800", "--post"]
 
 
-def test_the_secret_becomes_gh_token_for_the_review_and_nothing_else_carries_it(host):
-    rc, out = host.run(GITHUB_TOKEN="ghp_AMBIENT")
+def test_the_token_file_becomes_gh_token_for_the_review_and_nothing_else_carries_it(host):
+    rc, out = host.run(GITHUB_TOKEN="ghp_AMBIENT", OPUS_REVIEW_GITHUB_TOKEN="ghp_FROMENV")
     assert rc == 0, out
     [call] = host.calls()
     assert call["gh_token"] == TOKEN and call["secret_var"] is None and call["github_token"] is None
-    assert TOKEN not in out
+    assert TOKEN not in out and "ghp_FROMENV" not in out
+    argvs = json.dumps([call["argv"]] + [json.loads(x)["argv"] for x in (host.bin / "gh.log").read_text().splitlines()])
+    assert TOKEN not in argvs
+
+
+def test_whitespace_around_the_token_is_stripped(host):
+    host.token_file.write_text(f"  {TOKEN} \r\n\n")
+    assert host.run()[0] == 0
+    assert host.calls()[0]["gh_token"] == TOKEN
+
+
+def test_a_group_or_world_readable_token_file_is_refused(host):
+    for mode in (0o640, 0o604, 0o644, 0o660, 0o666):
+        host.token_file.chmod(mode)
+        rc, out = host.run()
+        assert rc == 1 and host.calls() == [] and "0600" in out and TOKEN not in out, (oct(mode), out)
+
+
+def test_a_token_file_owned_by_someone_else_is_refused(host):
+    if os.getuid() == 0:
+        pytest.skip("cannot construct a foreign owner check as root")
+    other = host.tmp / "other.token"
+    other.write_text(TOKEN)
+    other.chmod(0o600)
+    fake = host.bin / "stat"                      # stands in at the process boundary: reports another owner
+    real = shutil.which("stat")
+    fake.write_text(f'#!/bin/sh\nout=$({real} "$@") || exit $?\ncase "$*" in *%u*) echo 0;; *) echo "$out";; esac\n')
+    fake.chmod(0o755)
+    rc, out = host.run()
+    assert rc == 1 and host.calls() == [] and "not owned" in out.lower() and TOKEN not in out
+
+
+def test_a_missing_token_file_fails_the_step_with_instructions(host):
+    host.token_file.unlink()
+    rc, out = host.run()
+    assert rc == 1 and host.calls() == [] and "install -m 600" in out and str(host.token_file) in out
+
+
+def test_an_empty_token_file_is_an_error(host):
+    host.token_file.write_text(" \n\t\n")
+    rc, out = host.run()
+    assert rc == 1 and host.calls() == [] and "empty" in out.lower()
+
+
+def test_the_token_file_path_can_be_set_by_flag_or_agent_env(host):
+    elsewhere = host.tmp / "elsewhere.token"
+    elsewhere.write_text("ghp_ELSEWHERE\n")
+    elsewhere.chmod(0o600)
+    host.token_file.unlink()
+    assert host.run("--token-file", str(elsewhere))[0] == 0
+    assert host.calls()[-1]["gh_token"] == "ghp_ELSEWHERE"
+    assert host.run(OPUS_REVIEW_TOKEN_FILE=str(elsewhere))[0] == 0
 
 
 def test_the_fork_check_uses_the_token_and_the_pr(host):
@@ -150,10 +204,10 @@ def test_when_the_fork_question_cannot_be_answered_nothing_is_reviewed(host):
     assert rc != 0 and host.calls() == []
 
 
-def test_an_empty_token_is_an_error_and_an_ambient_token_is_never_used(host):
-    rc, out = host.run(OPUS_REVIEW_GITHUB_TOKEN=None, GH_TOKEN="ghp_AMBIENT", GITHUB_TOKEN="ghp_AMBIENT2")
-    assert rc == 1 and host.calls() == [] and "empty" in out.lower()
-    assert host.run(OPUS_REVIEW_GITHUB_TOKEN="")[0] == 1 and host.calls() == []
+def test_an_ambient_github_token_is_never_used_instead_of_the_file(host):
+    host.token_file.unlink()
+    rc, out = host.run(GH_TOKEN="ghp_AMBIENT", GITHUB_TOKEN="ghp_AMBIENT2")
+    assert rc == 1 and host.calls() == []
 
 
 @pytest.mark.parametrize("answer", ["", "maybe", "True", "null", "false\ntrue", "{}"])
@@ -247,7 +301,7 @@ def test_the_script_is_found_next_to_the_install_not_in_the_working_directory(ho
     cwd.mkdir()
     (cwd / "deploy/ci-review").mkdir(parents=True)
     (cwd / "deploy/ci-review/always-on-review.py").write_text("raise SystemExit(99)\n")
-    p = subprocess.run(["bash", str(host.installed)], cwd=cwd, env=host.env(), capture_output=True, text=True, timeout=60)
+    p = subprocess.run(["bash", str(host.installed), "--token-file", str(host.token_file)], cwd=cwd, env=host.env(), capture_output=True, text=True, timeout=60)
     assert p.returncode == 0 and len(host.calls()) == 1
 
 
@@ -281,11 +335,9 @@ def test_it_is_one_step_that_calls_the_installed_wrapper_and_checks_nothing_out(
     assert not any("git " in c or "checkout" in c for c in step["commands"]), "never fetch or run the PR's code"
 
 
-def test_the_only_secret_is_the_github_status_token(wf):
+def test_the_workflow_references_no_secret_so_a_missing_one_cannot_break_pipelines(wf):
     text = WORKFLOW.read_text()
-    assert text.count("from_secret") == 1
-    [step] = wf["steps"]
-    assert step["environment"] == {"OPUS_REVIEW_GITHUB_TOKEN": {"from_secret": "opus_review_github_token"}}
+    assert "from_secret" not in text and "secrets" not in wf["steps"][0] and "environment" not in wf["steps"][0]
     assert "ghp_" not in text and "gho_" not in text
 
 
