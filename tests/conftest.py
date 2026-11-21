@@ -1,5 +1,8 @@
 import copy
 import gc
+import importlib.util
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -65,3 +68,19 @@ def pytest_addoption(parser):
 def _disk_guard_override_by_default(monkeypatch):
     """A nearly full dev disk must not refuse builds in unrelated tests; guard tests unset this."""
     monkeypatch.setenv("HERDR_DISK_GUARD_OVERRIDE", "1")
+
+
+def _flaky_plugin():
+    """The quarantine / failed-test-list plugin of the unit gate (scripts/ci/herdr_flaky_plugin.py), loaded by path so a plain
+    ``pytest`` run quarantines exactly like the gate does. The gate also passes ``-p herdr_flaky_plugin``; one registration wins."""
+    path = Path(__file__).resolve().parents[1] / "scripts" / "ci" / "herdr_flaky_plugin.py"
+    spec = importlib.util.spec_from_file_location("herdr_flaky_plugin", path)
+    module = sys.modules.get("herdr_flaky_plugin") or importlib.util.module_from_spec(spec)
+    if "herdr_flaky_plugin" not in sys.modules:
+        sys.modules["herdr_flaky_plugin"] = module
+        spec.loader.exec_module(module)
+    return module
+
+
+def pytest_configure(config):
+    _flaky_plugin().register(config)
