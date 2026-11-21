@@ -185,7 +185,7 @@ def test_dashboard_proxy_refuses_dns_rebound_host(stack):
 
 def test_dashboard_proxy_still_serves_ip_literal_host_and_same_origin(stack):
     s, _ = _dash(stack, "POST", "/api/v1/collab/projects", {"name": "ok"},
-                 headers={"Host": "100.104.39.6", "Origin": "http://100.104.39.6",
+                 headers={"Host": "100.64.8.6", "Origin": "http://100.64.8.6",
                           "Content-Type": "application/json"})
     assert s == 201
     s, _ = _dash(stack, "GET", "/api/v1/collab/rooms", headers={"Host": "[::1]:80"})

@@ -10,7 +10,7 @@ A per-host forwarder gives each machine its own ports, but the *unified* view
 required by spec 0110 needs:
 
 1. **One stable name** — the fleet's `dev` logical service (a Tailscale
-   MagicDNS name, e.g. `bender.tail0c50da.ts.net`), independent of where the
+   MagicDNS name, e.g. `bender.<tailnet>.ts.net`), independent of where the
    app runs.
 2. **Cross-host routing** — a lease registered by `beast` must be reachable
    through the gateway's address, not beast's.
@@ -42,7 +42,7 @@ close|list`).
                  │                   loopback + tailnet, byte-proxy to target_host:port      │
                  └───────────────────────────────────────────────────────────────────────────┘
   client (any tailnet device, incl. phone/iPad)
-      curl http://bender.tail0c50da.ts.net:18000   ──►  router :18000  ──►  beast:5678 (app)
+      curl http://bender.<tailnet>.ts.net:18000   ──►  router :18000  ──►  beast:5678 (app)
 ```
 
 - **Control API** — `FabricGateway` exposes a small HTTP control plane
@@ -159,7 +159,7 @@ herdr-eng devfabric agent            # foreground loop (Ctrl-C to stop)
 herdr-eng devfabric agent --once     # one scan cycle (cron / smoke test)
 
 # point commands at the gateway: fabric.url in fleet-config.yaml, or
-# fabric.gateway_url: http://bender.tail0c50da.ts.net:29999 in config.yaml
+# fabric.gateway_url: http://bender.<tailnet>.ts.net:29999 in config.yaml
 herdr-eng devfabric list
 
 # stop the gateway (leases survive in the store and are re-bound on restart)
