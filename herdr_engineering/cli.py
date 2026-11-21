@@ -3696,7 +3696,7 @@ def _cmd_dev_agent(args) -> int:
 
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
-    from .fabric_agent import AgentConfig, FabricAgent, parse_agent_binaries
+    from .fabric_agent import AgentConfig, FabricAgent, parse_agent_binaries, parse_deny_processes
     from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
 
     logging.basicConfig(level=logging.INFO,
@@ -3737,6 +3737,7 @@ def _cmd_dev_agent(args) -> int:
         "agent_exclude_ports", []))
     try:
         agent_binaries = parse_agent_binaries(fabric_cfg.get("agent_binaries"))
+        deny_processes = parse_deny_processes(fabric_cfg.get("agent_deny_processes"))
     except ValueError as exc:
         _print_json({"code": "config", "message": str(exc)})
         return 1
@@ -3760,6 +3761,8 @@ def _cmd_dev_agent(args) -> int:
             host_report_interval=float(fabric_cfg.get("host_report_interval", 30.0)),
             host_slow_interval=float(fabric_cfg.get("host_slow_interval", 3600.0)),
             agent_binaries=agent_binaries,
+            deny_processes=deny_processes,
+            orphan_grace=float(fabric_cfg.get("agent_orphan_grace_seconds", 60.0)),
         ))
     if args.once:
         summary = agent.scan_once()
