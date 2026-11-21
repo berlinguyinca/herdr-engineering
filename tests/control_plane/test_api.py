@@ -8,6 +8,7 @@ import pytest
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
+from herdr_engineering.version import __version__
 
 
 class Client:
@@ -56,7 +57,7 @@ def test_health_reports_deployment_context(server):
     h = json.loads(body)
     # an in-memory repo reports source=memory + image version/commit
     assert h["source"] == "memory"
-    assert h["version"] == "0.1.0"
+    assert h["version"] == __version__
     assert h["commit"] == "dev"
     assert "missions" in h and "timestamp" in h
 

@@ -2,6 +2,7 @@
 on PATH (nothing real is ever built, started or contacted)."""
 import json
 import os
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -376,12 +377,20 @@ def test_compose_runs_every_app_service_on_the_deploy_tag():
     assert collab["services"]["collab-public"]["image"] == "herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}"
 
 
+def test_deploy_rolls_the_gateway_and_herdr_web_with_the_app_services():
+    text = (ROOT / "deploy/control-plane/deploy.sh").read_text()
+    rolled = re.search(r"^APP_SERVICES=\(([^)]*)\)", text, re.M).group(1).split()
+    assert "fabric-gateway" in rolled and "herdr-web" in rolled
+    # health checks look the container up by name; the gateway's differs from its service name
+    assert "fabric-gateway) echo herdr-fabric-gateway" in text
+
+
 def test_deploy_recreates_web_worker_and_proxy_on_one_tag(env):
     env["env"]["FAIL_COMPOSE"] = "1"
     deploy(env)
     log = env["log"].read_text().splitlines()
     up = [ln for ln in log if ln.startswith("docker compose") and " up " in ln]
-    assert up and up[0].endswith("up -d --no-deps --no-build control-plane-web control-plane-worker llm-proxy")
+    assert up and up[0].endswith("up -d --no-deps --no-build control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web")
     sha = _head()
     assert any(ln.startswith("composeenv ") and f" tag={sha} " in ln for ln in log)
     assert any(ln.startswith("docker build") and f"herdr-engineering:{sha}" in ln for ln in log)
@@ -1330,7 +1339,7 @@ def test_rollback_to_a_checkout_without_the_fabric_overlay_drops_the_sidecar_ser
     after = log[log.index(files[0]):]
     assert not any(ln.startswith("docker compose") and "fabric-whois" in ln for ln in after)
     assert "docker stop herdr-collab-fabric-whois" in after                       # the orphan sidecar is stopped
-    assert "all of: control-plane-web control-plane-worker llm-proxy collab-public collab-edge)" in r.stderr
+    assert "all of: control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web collab-public collab-edge)" in r.stderr
 
 
 def test_rollback_to_a_checkout_with_the_fabric_overlay_keeps_the_sidecar(env):
@@ -1866,7 +1875,7 @@ def test_changed_slice_recreates_collab_public_exactly_once_and_reloads_the_edge
     assert len(ups) == 1 and "--force-recreate collab-public" in ups[0]
     rest = [ln for ln in env["log"].read_text().splitlines()
             if ln.startswith("docker compose") and " up " in ln and ln not in ups]
-    assert len(rest) == 1 and rest[0].endswith("control-plane-web control-plane-worker llm-proxy collab-edge")
+    assert len(rest) == 1 and rest[0].endswith("control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web collab-edge")
     assert "docker exec herdr-collab-edge nginx -s reload" in env["log"].read_text()
 
 
