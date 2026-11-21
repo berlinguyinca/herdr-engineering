@@ -204,8 +204,65 @@ def test_the_aggregate_keeps_the_one_required_context_name_and_waits_for_every_s
     assert d["depends_on"] == [f"unit-gates-shard-{i}" for i in range(1, SHARDS + 1)]
     assert {"event": "pull_request"} in d["when"]
     assert not [t for t in d["when"] if "path" in t or "include" in t], "a path filter would make the required context never report"
-    assert "runs_on" not in d, "default: skipped (not green) when any shard failed"
+    assert d["runs_on"] == ["success", "failure"], "must run after a red shard too, or the required context stays pending forever"
     assert len(d["steps"]) == 1
+
+
+def run_aggregate(states: dict[str, str] | None, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    """Run the aggregate's real step against a real local HTTP server serving the Woodpecker pipeline JSON (None = nothing listening)."""
+    import http.server
+    import json
+    import threading
+
+    script = doc("unit-gates.yml")["steps"][0]["commands"][0]
+    port = 1
+    server = None
+    if states is not None:
+        body = json.dumps({"workflows": [{"name": n, "state": st} for n, st in states.items()]}).encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                assert self.path == "/api/repos/120/pipelines/7"
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a: object) -> None:
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        env = {**os.environ, "CI_SYSTEM_URL": f"http://127.0.0.1:{port}", "CI_REPO_ID": "120", "CI_PIPELINE_NUMBER": "7"}
+        return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, cwd=tmp_path)
+    finally:
+        if server:
+            server.shutdown()
+
+
+GREEN = {f"unit-gates-shard-{i}": "success" for i in range(1, SHARDS + 1)}
+
+
+def test_the_aggregate_passes_only_when_every_shard_succeeded(tmp_path: Path) -> None:
+    out = run_aggregate({**GREEN, "ui-gates": "failure"}, tmp_path)
+    assert out.returncode == 0, out.stderr
+
+
+@pytest.mark.parametrize("state", ["failure", "killed", "error", "skipped", "running", "pending"])
+def test_the_aggregate_fails_when_any_shard_is_not_green(state: str, tmp_path: Path) -> None:
+    out = run_aggregate({**GREEN, "unit-gates-shard-2": state}, tmp_path)
+    assert out.returncode != 0 and "unit-gates-shard-2" in out.stderr
+
+
+def test_the_aggregate_fails_when_a_shard_is_missing(tmp_path: Path) -> None:
+    out = run_aggregate({k: v for k, v in GREEN.items() if k != "unit-gates-shard-3"}, tmp_path)
+    assert out.returncode != 0 and "missing" in out.stderr
+
+
+def test_the_aggregate_fails_closed_when_the_api_is_unreachable(tmp_path: Path) -> None:
+    out = run_aggregate(None, tmp_path)
+    assert out.returncode != 0 and "failing closed" in out.stderr
 
 
 # ------------------------------------------------------------------ the mid-run freshness re-check -----------------------------------

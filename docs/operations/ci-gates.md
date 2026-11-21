@@ -22,9 +22,10 @@ shard by `sha256(path)`, so the split needs no shared state and a new test file 
 client (node) tests have one owner each (the slow tail follows its file, client tests run in shard 1). `tests/test_ci_unit_shards.py`
 proves the shards partition the real suite (no test dropped, none twice) and that exactly one shard owns the slow tail.
 
-`.woodpecker/unit-gates.yml` stays as the **aggregate**: it `depends_on` the three shards and has one trivial step. Woodpecker names the
-status context after the workflow file, so `ci/woodpecker/pr/unit-gates` (the required check) is unchanged and only reports success when
-every shard succeeded; with a failed shard it never runs. The shards also report their own `ci/woodpecker/pr/unit-gates-shard-N`
+`.woodpecker/unit-gates.yml` stays as the **aggregate**: it `depends_on` the three shards and has one step. Woodpecker names the
+status context after the workflow file, so `ci/woodpecker/pr/unit-gates` (the required check) is unchanged. It runs after the shards
+whatever their result (`runs_on: [success, failure]`) and reads their states from the Woodpecker API: success only when every shard
+succeeded, red otherwise (and red if the API cannot be read). Without `runs_on` a red shard left the context `pending` forever. The shards also report their own `ci/woodpecker/pr/unit-gates-shard-N`
 contexts (informational, not required). To change the shard count, add or remove a shard file, update `depends_on` in the aggregate and
 the `/N` in each shard's `HERDR_UNIT_SHARD`, and `SHARDS` in the test. Coverage is not enforced in this gate (no `--cov` anywhere), so
 there is nothing to combine. `unit-gates-main.yml` (push to main) stays a single unsharded run.
