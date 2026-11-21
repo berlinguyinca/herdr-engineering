@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+import herdr_engineering
 from herdr_engineering.handoff_adapters.base import Harness, SessionRef
 from herdr_engineering.handoff_adapters.claude import ClaudeAdapter
 from herdr_engineering.handoff_controller import briefing as briefingmod
@@ -361,14 +362,14 @@ def test_the_default_side_pane_hook_reports_a_module_that_fails_to_import(tmp_pa
                                                                        capsys: pytest.CaptureFixture[str]) -> None:
     ctlrun.default_ensure_side_pane("t1")  # herdr_engineering.side_pane does not exist (yet): nothing to say
     assert capsys.readouterr().err == ""
-    broken = ROOT / "herdr_engineering" / "side_pane.py"
-    assert not broken.exists()
-    broken.write_text("import a_module_that_is_not_installed\n")
+    # The broken module lives outside the checkout and is found through this process's package path only: a file written
+    # into the source tree would be imported by every parallel test worker for as long as it existed.
+    (tmp_path / "side_pane.py").write_text("import a_module_that_is_not_installed\n")
+    monkeypatch.setattr(herdr_engineering, "__path__", [str(tmp_path), *herdr_engineering.__path__])
     importlib.invalidate_caches()
     try:
         ctlrun.default_ensure_side_pane("t1")
     finally:
-        broken.unlink()
         sys.modules.pop("herdr_engineering.side_pane", None)
     assert "side pane" in capsys.readouterr().err
 

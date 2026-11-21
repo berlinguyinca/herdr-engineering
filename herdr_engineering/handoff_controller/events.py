@@ -126,7 +126,7 @@ class EventLog:
 
     def append(self, e: HandoffEvent) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self._path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        fd = os.open(self._path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)  # owner only: a reason can quote git stderr
         try:
             data = memoryview((e.to_json() + "\n").encode("utf-8"))
             while data:  # normally one write, so a line is not interleaved with another writer's

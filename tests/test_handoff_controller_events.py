@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -36,6 +37,12 @@ def test_event_roundtrip_jsonl(tmp_path: Path) -> None:
     log.append(ev("handoff.drained"))
     assert log.read() == [first, ev("handoff.drained")]
     assert len((tmp_path / "store" / "events.jsonl").read_text().splitlines()) == 2
+
+
+def test_the_log_is_readable_by_its_owner_only(tmp_path: Path) -> None:
+    # A `handoff.stuck` reason can carry the first stderr line of a failed git push, which may name a remote URL.
+    EventLog(tmp_path / "store").append(ev())
+    assert stat.S_IMODE((tmp_path / "store" / "events.jsonl").stat().st_mode) == 0o600
 
 
 WRITER = """

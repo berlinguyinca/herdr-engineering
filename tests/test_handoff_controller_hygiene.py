@@ -23,6 +23,14 @@ from tests.test_handoff_controller_briefing import GH, handoff, make_ref, repo, 
 COMPOSER = Path(__file__).parent / "fixtures" / "handoff_controller" / "tui_composer.py"
 
 
+def _readable(fd: int, timeout_s: float) -> bool:
+    """Whether `fd` has input within the timeout. `poll`, not `select`: a loaded test worker holds descriptors past
+    1023, which `select` refuses."""
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    return bool(poller.poll(timeout_s * 1000))
+
+
 def fake_cli(directory: Path, name: str, help_text: str) -> Path:
     """A real executable that prints `help_text` for `--help` and records every argv it is started with."""
     directory.mkdir(parents=True, exist_ok=True)
@@ -109,9 +117,9 @@ def test_the_composer_fixture_waits_for_its_start_delay_before_drawing(tmp_path:
     child = subprocess.Popen([sys.executable, str(COMPOSER)], stdin=slave, stdout=slave, env=env, close_fds=True)
     os.close(slave)
     try:
-        early = select.select([master], [], [], 0.8)[0]
+        early = _readable(master, 0.8)
         assert not early, "the fixture drew before its start delay"
-        assert select.select([master], [], [], 6.0)[0], "the fixture never drew"
+        assert _readable(master, 6.0), "the fixture never drew"
         assert "❯" in os.read(master, 8192).decode("utf-8", "replace")
     finally:
         child.kill()
@@ -127,8 +135,8 @@ def test_the_composer_fixture_reads_a_start_delay_file_beside_the_program(tmp_pa
     child = subprocess.Popen([sys.executable, str(program)], stdin=slave, stdout=slave, close_fds=True)
     os.close(slave)
     try:
-        assert not select.select([master], [], [], 0.8)[0]
-        assert select.select([master], [], [], 6.0)[0]
+        assert not _readable(master, 0.8)
+        assert _readable(master, 6.0)
     finally:
         child.kill()
         child.wait()
