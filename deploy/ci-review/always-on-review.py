@@ -2922,7 +2922,6 @@ def main(argv: list[str] | None = None) -> int:
     global _CLEANED
     _CLEANED = False                                    # once per invocation
     register_env_tokens()
-    register_gh_secret()                                # the sweep has no wrapper: the operator's own gh login too
     ap = argparse.ArgumentParser(prog="always-on-review.py", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("poll")
@@ -2956,6 +2955,8 @@ def main(argv: list[str] | None = None) -> int:
     for x in (p, r):
         x.add_argument("--post", action="store_true", help="allow posting (also needs `post: true` in the config)")
     a = ap.parse_args(argv)
+    if a.cmd in ("poll", "review"):
+        register_gh_secret()                            # the sweep has no wrapper: the operator's own gh login too
     try:
         if a.cmd == "corpus":
             return corpus_build(a.repo, a.since, Path(a.out), frozenset(load_config(a.config)["replay"]["reviewers"]))
