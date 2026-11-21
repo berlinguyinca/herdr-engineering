@@ -20,8 +20,8 @@ runs the service.
 | Service | Image | Role |
 |---|---|---|
 | `coredns` | `coredns/coredns:1.11.4` | Private nameserver for the shared `dev.lan` domain (Option B split-DNS). |
-| `fabric-gateway` | `herdr-engineering:0.1.0` (built) | The `dev:<port>` front door (spec 0110 #3): control API + per-port router + probe loop. |
-| `herdr-web` | `herdr-engineering:0.1.0` (built) | Private web/mobile control surface (spec 0060), loopback-only, tailnet-only via `tailscale serve`. |
+| `fabric-gateway` | `herdr-engineering:${HERDR_CP_IMAGE_TAG}` (built) | The `dev:<port>` front door (spec 0110 #3): control API + per-port router + probe loop. |
+| `herdr-web` | `herdr-engineering:${HERDR_CP_IMAGE_TAG}` (built) | Private web/mobile control surface (spec 0060), loopback-only, tailnet-only via `tailscale serve`. |
 
 The per-host **auto-registration agent** is intentionally *not* containerized:
 it must see host listeners via `ss`/`lsof`, so it stays a host service on
