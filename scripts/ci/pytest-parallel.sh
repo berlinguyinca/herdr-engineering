@@ -8,6 +8,8 @@
 #                              explicit `-n N` alike): a 100+ core host must not start 100 workers that each
 #                              import the package, bind loopback servers and hold ~3,000 leaked descriptors
 #                              apiece (see ensure-fd-limit.sh).
+#   SLURM_CPUS_PER_TASK        a Slurm allocation is this job's own CPUs: it lowers the worker count and replaces the node-wide
+#                              loadavg bound (HERDR_LOADAVG_FILE), which on a shared node counts other jobs' CPUs.
 # --dist=loadfile keeps every test of a file on one worker, because the suite's fixtures and module state are written per file. It
 # does NOT honour `xdist_group` marks (only --dist=loadgroup does), so files still run concurrently with each other: a test that
 # cannot share a machine with other files (fixed port, shared path) must use an OS-assigned port or a per-test tmp path instead.

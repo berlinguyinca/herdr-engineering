@@ -36,10 +36,17 @@ def calm_host(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.Monk
     monkeypatch.setenv("HERDR_LOADAVG_FILE", str(calm))
 
 
+@pytest.fixture(autouse=True)
+def outside_slurm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hive CI steps run inside a Slurm allocation (SLURM_CPUS_PER_TASK=16, pipeline 1826): no helper may inherit it. Tests that
+    want an allocation set it explicitly."""
+    monkeypatch.delenv("SLURM_CPUS_PER_TASK", raising=False)
+
+
 def args_with(**env: str) -> list[str]:
     exports = "".join(f"export {k}={v}; " for k, v in env.items())
     done = subprocess.run(
-        ["bash", "-c", f'unset HERDR_PYTEST_WORKERS HERDR_PYTEST_MAXPROCESSES SLURM_CPUS_PER_TASK; {exports}. "{HELPER}"; herdr_pytest_parallel_args'],
+        ["bash", "-c", f'unset HERDR_PYTEST_WORKERS HERDR_PYTEST_MAXPROCESSES; {exports}. "{HELPER}"; herdr_pytest_parallel_args'],
         capture_output=True, text=True, cwd=ROOT,
     )
     assert done.returncode == 0, done.stderr
@@ -835,11 +842,23 @@ def test_host_facts_prints_the_same_load_file_the_worker_bound_reads(tmp_path: P
 
 @pytest.mark.skipif(min(VISIBLE, CAP) < 5, reason="needs more than 4 visible CPUs and a cap above 4")
 def test_a_slurm_allocation_ignores_the_node_wide_load_average(tmp_path: Path) -> None:
-    assert args_with(SLURM_CPUS_PER_TASK="4", **loadavg(tmp_path, 155.0))[:2] == ["-n", "4"]
+    no_quota = cg(tmp_path, v2={"j": "max 100000"}, proc="0::/j")
+    assert args_with(SLURM_CPUS_PER_TASK="4", **no_quota, **loadavg(tmp_path, 155.0))[:2] == ["-n", "4"]
 
 
 def test_a_slurm_allocation_at_or_above_the_cap_keeps_auto_under_load(tmp_path: Path) -> None:
-    assert args_with(SLURM_CPUS_PER_TASK="64", **loadavg(tmp_path, 155.0))[:2] == ["-n", "auto"]
+    no_quota = cg(tmp_path, v2={"j": "max 100000"}, proc="0::/j")
+    assert args_with(SLURM_CPUS_PER_TASK="64", **no_quota, **loadavg(tmp_path, 155.0))[:2] == ["-n", "auto"]
+
+
+@needs_two_cpus
+def test_a_cgroup_quota_below_the_slurm_allocation_still_wins(tmp_path: Path) -> None:
+    quota = cg(tmp_path, v2={"j": "100000 100000"}, proc="0::/j")         # one CPU of quota inside a 64-CPU allocation
+    assert args_with(SLURM_CPUS_PER_TASK="64", **quota, **loadavg(tmp_path, 155.0))[:2] == ["-n", "1"]
+
+
+def test_a_zero_slurm_allocation_is_ignored_and_the_load_bound_applies(tmp_path: Path) -> None:
+    assert args_with(SLURM_CPUS_PER_TASK="0", **loadavg(tmp_path, 155.0))[:2] == ["-n", "1"]
 
 
 def test_without_a_slurm_allocation_the_load_bound_still_applies(tmp_path: Path) -> None:
