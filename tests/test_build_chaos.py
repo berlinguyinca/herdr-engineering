@@ -188,7 +188,9 @@ def _shared_section(tmp: Path, port: int, *, use_ssl: bool = True) -> dict:
         """))
     creds = _private(tmp / "reg/creds.yaml",
                      f"access_key_id: AKIACHAOS0000\nsecret_access_key: '{SECRET}'\n")
-    return {"enabled": True, "mode": "shared_cache",
+    # min_free_disk_percent 0: the cache is refused ("low_free_disk") on a host whose disk is nearly full, which made these tests
+    # depend on the free space of whatever machine ran them (a 99%-full workstation failed 3 of them; test_cargo_host does the same).
+    return {"enabled": True, "mode": "shared_cache", "local": {"min_free_disk_percent": 0},
             "shared_cache": {"enabled": True, "endpoint_ref": "build-cache",
                              "registry_file": str(reg), "credentials_file": str(creds)}}
 
