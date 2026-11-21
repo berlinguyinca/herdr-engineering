@@ -30,8 +30,42 @@ if [ -x node_modules/.bin/tsc ]; then
 else
   echo "module gate: communications: node_modules missing, skipping the bundle drift check" >&2
 fi
-cov communications .coveragerc-communications -m 'not e2e' \
-  tests/test_communications.py tests/control_plane/test_communications.py tests/control_plane/test_communications_postgres.py
+# The native-CLI tests need the real pinned HerdR binary (sha256-checked, as the retired workflow did) and a running server. The
+# server is isolated: its own HERDR_HOME and a socket private to this run, so no test can reach a real agent.
+herdr_sha=2a02fed16beb651ef006e1d43f048f652ca4dc58ad053cd2d44450563d5c54b7
+if [ "$(uname -m)" = x86_64 ]; then
+  herdr_dir="$PWD/.superpowers/herdr-native"
+  mkdir -p "$herdr_dir"
+  if ! echo "$herdr_sha  $herdr_dir/herdr" | sha256sum -c --status - 2>/dev/null; then
+    curl -fsSL --retry 3 https://github.com/herdrdev/herdr/releases/download/v0.9.1/herdr-linux-x86_64 -o "$herdr_dir/herdr"
+    echo "$herdr_sha  $herdr_dir/herdr" | sha256sum -c -
+  fi
+  chmod +x "$herdr_dir/herdr"
+  runtime_base="${XDG_RUNTIME_DIR:-}"
+  [ -n "$runtime_base" ] && [ -d "$runtime_base" ] && [ -w "$runtime_base" ] || runtime_base="$PWD/.superpowers"
+  herdr_run="$(mktemp -d "$runtime_base/hmg.XXXXXX")"
+  # HERDR_HOME alone does not isolate: the server reads and rewrites $XDG_CONFIG_HOME/herdr/session.json (restoring the real
+  # user's agents), so the server and the tests get a private HOME and XDG dirs; only HERDR_SOCKET_PATH is shared with them.
+  herdr_home="$herdr_run/h"
+  mkdir -p "$herdr_home"
+  herdr_env=(HOME="$herdr_home" XDG_CONFIG_HOME="$herdr_home/.config" XDG_STATE_HOME="$herdr_home/.local/state"
+    XDG_DATA_HOME="$herdr_home/.local/share" XDG_CACHE_HOME="$herdr_home/.cache" HERDR_SOCKET_PATH="$herdr_run/s.sock")
+  export PATH="$herdr_dir:$PATH"
+  env "${herdr_env[@]}" "$herdr_dir/herdr" server > "$herdr_run/server.log" 2>&1 &
+  herdr_pid=$!
+  trap 'kill "$herdr_pid" 2>/dev/null || true; wait "$herdr_pid" 2>/dev/null || true; rm -rf -- "$herdr_run"' EXIT
+  for _ in $(seq 1 20); do env "${herdr_env[@]}" herdr agent list >/dev/null 2>&1 && break; sleep 0.5; done
+  env "${herdr_env[@]}" herdr agent list >/dev/null || { cat "$herdr_run/server.log" >&2; exit 1; }
+  # The isolated server must start empty; a non-empty list means it reached a real session.
+  [ "$(env "${herdr_env[@]}" herdr agent list | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["result"]["agents"]))')" = 0 ] \
+    || { echo "module gate: isolated HerdR server is not empty; refusing to run native-CLI tests" >&2; exit 1; }
+else
+  echo "module gate: NOTICE $(uname -m) has no pinned HerdR binary: native-CLI communications tests will skip" >&2
+  herdr_env=()
+fi
+# env needs at least one assignment when herdr_env is empty; PATH is a harmless one.
+env PATH="$PATH" "${herdr_env[@]}" bash -c "$(declare -f cov); cov communications .coveragerc-communications -m 'not e2e' \
+  tests/test_communications.py tests/control_plane/test_communications.py tests/control_plane/test_communications_postgres.py"
 
 # build-metrics, Linux leg: coverage is measured the way the workflow did, with `coverage run`, so subprocess patching applies.
 echo "== module gate: build-metrics =="
