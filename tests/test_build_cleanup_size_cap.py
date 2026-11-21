@@ -320,7 +320,7 @@ def test_build_coordinate_keeps_a_target_under_the_cap(tmp_path):
     assert (target / "debug").exists()
 
 
-def test_build_coordinate_keeps_the_exit_code_of_a_failing_build_and_still_caps(tmp_path):
+def test_build_coordinate_keeps_the_exit_code_of_a_failing_build_and_does_not_cap_after_it(tmp_path):
     workspace = _crate(tmp_path)
     target = workspace / "target"
     assert _coordinate(tmp_path, workspace, target, cap_gb=0.000001).returncode == 0
@@ -328,6 +328,7 @@ def test_build_coordinate_keeps_the_exit_code_of_a_failing_build_and_still_caps(
     done = _coordinate(tmp_path, workspace, target, cap_gb=0.000001)
     assert done.returncode == 101, done.stderr
     assert "size cap pass" not in done.stderr
+    assert (target / "debug").exists()  # a failed build is not followed by a clean
 
 
 def test_build_coordinate_forwards_sigterm_to_the_build_and_reports_the_signal(tmp_path):
@@ -347,7 +348,7 @@ def test_build_coordinate_forwards_sigterm_to_the_build_and_reports_the_signal(t
         proc.send_signal(signal.SIGTERM)
         proc.wait(timeout=60)
         assert time.time() - began < 60
-        assert proc.returncode not in (0, None)
+        assert proc.returncode == -signal.SIGTERM  # a death by the signal, as an exec'd build would have
     finally:
         proc.kill()
         proc.wait()

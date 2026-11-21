@@ -3561,7 +3561,8 @@ def _cmd_build_coordinate(args) -> int:
             return refused
     # A cargo build under a size cap stays a plain child (not exec'd, nothing recorded) so the target can be checked once the
     # build has ended and its lease is released; the pass never changes the build's exit code.
-    capped = bool(cmd) and _size_cap_applies(cmd, cleanup_policy)
+    from .build_cleanup import finish_build, size_cap_applies
+    capped = bool(cmd) and size_cap_applies(cmd, cleanup_policy)
     code = run_gated(cmd, slots=slots, max_load=args.max_load,
                      wait_seconds=args.wait, json_out=args.json,
                      bypass_on_timeout=args.bypass_on_timeout,
@@ -3570,20 +3571,8 @@ def _cmd_build_coordinate(args) -> int:
     if capped:
         import logging
         logging.basicConfig(level=logging.WARNING, format="build-coordinate: %(message)s")  # to stderr
-        from .build_cleanup import after_build_size_cap
-        after_build_size_cap(cmd, Path.cwd(), cleanup_policy, _default_state_dir())
+        finish_build(cmd, Path.cwd(), cleanup_policy, _default_state_dir(), code)
     return code
-
-
-def _size_cap_applies(cmd: list[str], cleanup_policy: dict) -> bool:
-    """True for a cargo build/check/test/... run while ``build_cleanup`` is enabled with a size cap."""
-    from .cargo_host import BUILD_SUBCOMMANDS, cargo_subcommand
-    try:
-        return (bool(cleanup_policy.get("enabled", True)) and float(cleanup_policy.get("max_target_gb", 50)) > 0
-                and os.path.basename(cmd[0]) == "cargo"
-                and cargo_subcommand(cmd[1:]) in BUILD_SUBCOMMANDS - {"clean"})
-    except (TypeError, ValueError):
-        return False
 
 
 # Commands whose output size the disk-budget guard protects here. Cargo is guarded here only when the

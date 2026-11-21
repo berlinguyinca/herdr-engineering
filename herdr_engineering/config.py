@@ -36,8 +36,9 @@ DEFAULTS: dict[str, Any] = {
     "build_cleanup": {
         "enabled": True,
         # Every Rust project of the user: the home directory (bounded depth; dot directories such as ~/.cargo
-        # and ~/.rustup, node_modules and symlinks are not entered) plus ~/.cache for cache-only targets.
-        "roots": ["~", "~/.cache"],
+        # and ~/.rustup, node_modules and symlinks are not entered), the usual project directories (swept on
+        # their own, not twice) and ~/.cache for cache-only targets.
+        "roots": ["~", "~/work", "~/IdeaProjects", "~/.cache"],
         "interval_seconds": 900,
         "require_herdr_server": False,  # true: the watch loop only sweeps while a herdr server runs
         "high_water_percent": 85,

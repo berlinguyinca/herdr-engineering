@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import signal
 import threading
@@ -48,6 +49,26 @@ def watch(cleanup, *, interval: float, stop: threading.Event,
         wait(interval)
 
 
+_DEFAULT_MAX_TARGET_GB = 50.0
+
+
+def _max_target_gb(cfg: dict) -> float:
+    """``max_target_gb``: a finite number >= 0 (not a bool); anything else is the default, with a warning."""
+    value = cfg.get('max_target_gb', _DEFAULT_MAX_TARGET_GB)
+    number = value
+    if isinstance(value, str):  # YAML reads 1e-06 (no dot) as a string
+        try:
+            number = float(value)
+        except ValueError:
+            number = None
+    if (isinstance(number, bool) or not isinstance(number, (int, float))
+            or not math.isfinite(number) or number < 0):
+        log.warning('ignoring build_cleanup.max_target_gb=%r (not a number >= 0); using %g',
+                    value, _DEFAULT_MAX_TARGET_GB)
+        return _DEFAULT_MAX_TARGET_GB
+    return float(number)
+
+
 def policy_kwargs(cfg: dict) -> dict:
     """``run_once`` policy values from a ``build_cleanup`` config block (defaults match config.DEFAULTS)."""
     return {
@@ -57,7 +78,7 @@ def policy_kwargs(cfg: dict) -> dict:
         "pressure_water": float(cfg.get('pressure_percent', 90)),
         "pressure_min_age_hours": float(cfg.get('pressure_min_age_hours', 2)),
         # 0 switches the per-target cap off
-        "max_target_bytes": int(float(cfg.get('max_target_gb', 50)) * 1024 ** 3) or None,
+        "max_target_bytes": int(_max_target_gb(cfg) * 1024 ** 3) or None,
     }
 
 
@@ -114,14 +135,22 @@ def effective_roots(cfg: dict, explicit: list[str] | None = None) -> list[Path]:
         # Default roots may not exist on every host (e.g. no ~/work); explicit ones must.
         paths = [path for path in paths if path.is_dir()]
         paths += [path for path in _managed_output_dirs() if path not in paths]
-    return paths
+    seen, unique = set(), []
+    for path in paths:  # a root named twice (or through a link) is swept once
+        key = os.path.realpath(path)
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
 
 
-def cleanup_cycle(cfg: dict, explicit: list[str] | None, state_dir: Path, dry_run: bool = False) -> dict:
-    """One sweep. Roots are re-evaluated every cycle: pools appear after the watcher has started."""
+def cleanup_cycle(cfg: dict, explicit: list[str] | None, state_dir: Path, dry_run: bool = False,
+                  cached: bool = False) -> dict:
+    """One sweep. Roots are re-evaluated every cycle: pools appear after the watcher has started.
+    ``cached`` (the watcher) reuses each root's target list for a few hours instead of walking again."""
     from .build_cleanup import run_once
     return run_once(roots=effective_roots(cfg, explicit), state_dir=state_dir, dry_run=dry_run,
-                    **policy_kwargs(cfg))
+                    discovery='cached' if cached else 'walk', **policy_kwargs(cfg))
 
 
 def command(args) -> int:
@@ -143,8 +172,8 @@ def command(args) -> int:
     if not roots:
         print(json.dumps({'error': 'configure build_cleanup.roots or pass --root'}))
         return 2
-    def cleanup():
-        return cleanup_cycle(cfg, args.root, state_dir, args.dry_run)
+    def cleanup(cached: bool = False):
+        return cleanup_cycle(cfg, args.root, state_dir, args.dry_run, cached)
     if args.cleanup_command == 'run':
         result = cleanup()
         skipped = [w for w in result.get('warnings', []) if w.startswith('skipped root')]
@@ -161,6 +190,6 @@ def command(args) -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda signum, frame: stop.set())
     # Hosts without a Herdr server still need their disks kept: the server gate is opt-in.
-    watch(cleanup, interval=float(cfg.get('interval_seconds', 900)), stop=stop,
+    watch(lambda: cleanup(cached=True), interval=float(cfg.get('interval_seconds', 900)), stop=stop,
           is_running=server_running if cfg.get('require_herdr_server') is True else None)
     return 0

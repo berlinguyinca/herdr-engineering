@@ -134,7 +134,7 @@ def relieve(cleanup_cfg: Mapping, state_dir: Path, at_percent: float,
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         device = os.stat(_existing(probe)).st_dev if probe is not None else None
-        result = run_once(roots=roots, state_dir=state_dir, only_device=device, **kwargs)
+        result = run_once(roots=roots, state_dir=state_dir, only_device=device, discovery="cache_only", **kwargs)
     except OSError:
         return None  # a full disk can fail the sweep itself: nothing ran, so no cooldown starts
     if result.get("status") == "busy":  # another sweep is running: its result is what we need

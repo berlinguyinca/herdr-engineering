@@ -357,6 +357,23 @@ def _reserve_refusal(reserve: float, cleaned: bool) -> int:
 
 
 def run_cargo(argv: list[str]) -> int:
+    """The cargo wrapper. A build under a size cap is not exec'd: it runs as a child so the target can be
+    checked once it has ended, after every lock of this wrapper is released. The pass never changes the exit
+    code, and a build that ended in failure or by a signal is not followed by one."""
+    from .build_cleanup import finish_build, size_cap_applies
+    from .cli import _build_cache_config_and_policy
+    _, policy = _build_cache_config_and_policy()
+    stay = os.environ.get(COORDINATED) != "1" and size_cap_applies(["cargo", *argv], policy)
+    code = _run_cargo(argv, stay)
+    if stay:
+        import logging
+        logging.basicConfig(level=logging.WARNING, format="cargo-host: %(message)s")  # to stderr
+        from .build_coord import _default_state_dir
+        finish_build(["cargo", *argv], Path.cwd(), policy, _default_state_dir(), code)
+    return code
+
+
+def _run_cargo(argv: list[str], stay: bool) -> int:
     real = _real_cargo(Path.home())
     command = [str(real), *argv]
     subcommand = cargo_subcommand(argv)
@@ -376,6 +393,9 @@ def run_cargo(argv: list[str]) -> int:
         refused = guard(where if isinstance(where, Path) else Path.cwd())
         if refused is not None:
             return refused
+        if stay:
+            from .build_coord import _run_child
+            return _run_child(command, None)
         os.execvpe(str(real), command, dict(os.environ))
         return 127  # pragma: no cover
     from .build_cache_policy import effective_slots

@@ -68,10 +68,10 @@ security:
   persist_hidden_reasoning: false
 
 # Optional Linux companion: scripts/build-cleanup.sh installs the user service.
-# Only runs while a same-user local `herdr server` exists. Explicit roots required.
+# Default roots: ~, ~/work, ~/IdeaProjects, ~/.cache (set `roots` to replace them).
 build_cleanup:
-  enabled: false
-  roots: []  # e.g. [~/IdeaProjects]
+  enabled: true
+  # roots: [~, ~/work, ~/IdeaProjects, ~/.cache]  # the default; list your own to replace it
   interval_seconds: 900
   high_water_percent: 85
   low_water_percent: 80

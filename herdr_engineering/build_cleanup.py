@@ -57,6 +57,7 @@ import logging
 import math
 import os
 import re
+import select
 import shutil
 import signal
 import stat
@@ -64,6 +65,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -185,7 +187,8 @@ def _links(holder: Path) -> list[Path]:
 
 _CARGO_NAMES = frozenset({"cargo", "rustc", "rustdoc", "rustfmt", "rust-analyzer", "clippy-driver"})
 _TARGET_ENV = ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR")
-# (pid, process name, how, path): "uses" is a cwd, executable, open file or mapping; "builds into" is the
+# (pid, process name, how, path): "uses" is an executable, open file or mapping, "cwd" a working directory
+# (which counts like "uses", but the invoker of a pass may be excused for it); "builds into" is the
 # target directory a cargo-family process was told to write (its environment or ``--target-dir``).
 # The fifth field is the identity the kernel gives the thing held, (st_dev, st_ino) of it and, for a cwd, of
 # its ancestors: read through /proc magic links and the maps columns, so it is right in any mount namespace
@@ -252,21 +255,23 @@ def _lsof_holds() -> list[Hold]:
     Fails closed: if lsof cannot run, cleanup must not guess that nothing is in use.
     """
     try:
-        result = subprocess.run(["lsof", "-w", "-n", "-P", "-u", str(os.getuid()), "-Fpcn"],
+        result = subprocess.run(["lsof", "-w", "-n", "-P", "-u", str(os.getuid()), "-Fpcfn"],
                                 capture_output=True, text=True, timeout=120, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         raise OSError(f"Cannot inspect running processes: {exc}") from exc
     if result.returncode > 1 or (result.returncode == 1 and not result.stdout):
         raise OSError("Cannot inspect running processes: lsof failed")
     holds: list[Hold] = []
-    pid, name = 0, ""
+    pid, name, descriptor = 0, "", ""
     for line in result.stdout.splitlines():
         if line.startswith("p") and line[1:].isdigit():
             pid, name = int(line[1:]), ""
         elif line.startswith("c"):
             name = line[1:]
+        elif line.startswith("f"):
+            descriptor = line[1:]
         elif line.startswith("n/") and pid != os.getpid():  # like the /proc scan, ignore this process
-            holds.append((pid, name, "uses", Path(line[1:]), _NO_IDS))
+            holds.append((pid, name, "cwd" if descriptor == "cwd" else "uses", Path(line[1:]), _NO_IDS))
     return holds
 
 
@@ -327,25 +332,26 @@ def _scan(proc: Path = Path("/proc"), *, paths_only: bool = False) -> list[Hold]
                 name = (pid / "comm").read_text().strip()
             except OSError:
                 name = ""
-            values: list[tuple[str, frozenset[Ident]]] = []
+            values: list[tuple[str, frozenset[Ident], str]] = []
             for holder in _holders(pid):
                 try:
                     for link in _links(holder):
                         try:
                             values.append((os.readlink(link),
-                                           _NO_IDS if paths_only else _link_ids(link, link.name == "cwd")))
+                                           _NO_IDS if paths_only else _link_ids(link, link.name == "cwd"),
+                                           "cwd" if link.name == "cwd" else "uses"))
                         except (FileNotFoundError, ProcessLookupError):  # descriptor closed / process exited
                             continue
                     if not paths_only:
-                        values.extend(_mapped(holder))
+                        values.extend((v, ids, "uses") for v, ids in _mapped(holder))
                 except (FileNotFoundError, ProcessLookupError):
                     continue
                 except PermissionError as exc:
                     if holder != pid:  # a live thread of a zombie leader that cannot be read: unverifiable
                         raise OSError(f"Cannot inspect thread {holder}") from exc
                     raise
-            holds.extend((number, name, "uses", Path(v.removesuffix(" (deleted)")), ids)
-                         for v, ids in values if v.startswith("/"))
+            holds.extend((number, name, how, Path(v.removesuffix(" (deleted)")), ids)
+                         for v, ids, how in values if v.startswith("/"))
             if _cargo_family(name) and not paths_only:
                 holds.extend(_proc_claims(pid, number, name))
         except (FileNotFoundError, ProcessLookupError):  # process exited during inspection
@@ -462,17 +468,37 @@ def _is_home(root: Path) -> bool:
         return False
 
 
+def _mount_points() -> frozenset[str]:
+    """Mount points of this host (Linux), so that a mount is passed by its name and never stat'ed: a stat on
+    a dead network mount blocks. Elsewhere the deadline of the survey child is the protection."""
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return frozenset()
+    found = set()
+    for line in lines:
+        fields = line.split()
+        if len(fields) > 4:
+            found.add(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4]))
+    return frozenset(found)
+
+
 def _discover(root: Path, managed: bool = True, unreadable: list[str] | None = None,
-              trash: list[Path] | None = None) -> list[Path]:
+              trash: list[Path] | None = None, notes: list[str] | None = None,
+              exclude: frozenset[Path] = frozenset()) -> list[Path]:
     """Cargo targets under ``root``. ``managed`` also returns cache-only targets and Herdr-managed
     ``targets/<workspace>`` dirs (what the sweep reclaims); migration wants repository targets only.
     A subdirectory that cannot be read is skipped (and named in ``unreadable``), never the whole root.
-    Leftovers of an interrupted orphan removal (``targets/.trash-*``) are listed in ``trash``, never as targets."""
+    Leftovers of an interrupted orphan removal (``targets/.trash-*``) are listed in ``trash``, never as targets.
+    Only directories that are entered count against the limit; past it the walk goes no deeper and says so in
+    ``notes``, keeping what it found. Mount points and ``exclude`` (other roots, walked on their own) are not
+    entered; a directory is stat'ed only when it is about to be entered or kept."""
     pending = [(root, 0)]
     device = root.stat().st_dev
     found = []
     count = 0
     home_root = _is_home(root)
+    mounts = _mount_points() - {str(root)}
     while pending:
         directory, depth = pending.pop()
         try:
@@ -489,33 +515,41 @@ def _discover(root: Path, managed: bool = True, unreadable: list[str] | None = N
             for entry in entries:
                 if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
                     continue
-                count += 1
-                if count > _MAX_ENTRIES:
-                    raise OSError(f"Discovery directory limit reached under {root}")
                 path = Path(entry.path)
-                if entry.stat(follow_symlinks=False).st_dev != device:
+                if entry.path in mounts or path in exclude:
                     continue
+
+                def local(entry=entry) -> bool:
+                    return entry.stat(follow_symlinks=False).st_dev == device
                 if managed_dir and entry.name.startswith(".trash-"):
-                    if trash is not None:
+                    if trash is not None and local():
                         trash.append(path)
                     continue
                 if managed_dir and entry.name == ".owners":
                     continue  # the manager's ownership records, not a target
                 if managed_dir and _managed_workspace(path) is not None:
-                    if _cargo_markers(path):
+                    if local() and _cargo_markers(path):
                         found.append(path)
                     continue
                 if entry.name == "target":
-                    if _cargo_markers(path) and ((directory / "Cargo.toml").is_file()
-                                                 or (managed and _cache_only_target(path))):
+                    if local() and _cargo_markers(path) and (
+                            (directory / "Cargo.toml").is_file() or (managed and _cache_only_target(path))):
                         found.append(path)
                     continue
                 if entry.name in _PRUNE:
                     continue
                 if home_root and (entry.name.startswith(".") or entry.name in _HOME_SKIP):
                     continue  # ~/.cargo, ~/.rustup, the trash and other dot directories are never entered
-                if depth >= _MAX_DEPTH:
+                if depth >= _MAX_DEPTH or not local():
                     continue  # deeper directories are outside this bounded sweep
+                count += 1
+                if count > _MAX_ENTRIES:
+                    note = f"Discovery directory limit reached under {root}; kept what was found"
+                    if notes is None:
+                        raise OSError(note)
+                    if note not in notes:
+                        notes.append(note)
+                    continue
                 pending.append((path, depth + 1))
     return found
 
@@ -628,7 +662,7 @@ def _busy_reason(holds: list[Hold], target: Path) -> str | None:
         if how == "named":
             if path.name in files:
                 return f"{name} (pid {pid}) is named like {files[path.name]}"
-        elif how == "uses":
+        elif how in ("uses", "cwd"):
             if (ids | _chain(path)) & inside:
                 return f"{name} (pid {pid}) uses {path}"
         elif (target_id and target_id in _chain(path)) or (_identity(path) in target_chain):
@@ -636,33 +670,123 @@ def _busy_reason(holds: list[Hold], target: Path) -> str | None:
     return None
 
 
-_BUSY_CHILD = "import sys; from herdr_engineering import build_cleanup as c; c._busy_child(sys.argv[1], int(sys.argv[2]))"
+_BUSY_CHILD = ("import sys; from herdr_engineering import build_cleanup as c; "
+               "c._busy_child(sys.argv[1], int(sys.argv[2]), [int(p) for p in sys.argv[3].split(',') if p])")
 _BUSY_SECONDS = 120.0  # the scan of a normal host takes a second; ``HERDR_BUSY_CHECK_SECONDS`` overrides
 
 
-def _busy_child(target: str, sweeper: int) -> None:
-    try:  # the sweeper that asked is not a holder: it may be run from inside the project it sweeps
-        holds = [hold for hold in _scan() if hold[0] != sweeper]
+def _busy_child(target: str, sweeper: int, excused: Sequence[int] = ()) -> None:
+    """The sweeper that asked is not a holder (it may be run from inside the project it sweeps), and neither
+    are ``excused`` processes (the invoker's ancestors) for their working directory alone: an open file or a
+    mapping of theirs inside the target still counts."""
+    try:
+        holds = [hold for hold in _scan() if hold[0] != sweeper and not (hold[2] == "cwd" and hold[0] in excused)]
         print(json.dumps({"busy": _busy_reason(holds, Path(target))}))
     except (OSError, ValueError) as exc:
         print(json.dumps({"error": str(exc)}))
 
 
-def _busy_deadline() -> float:
-    raw = os.environ.get("HERDR_BUSY_CHECK_SECONDS")
+def _deadline(name: str, default: float) -> float:
+    raw = os.environ.get(name)
     if not raw:
-        return _BUSY_SECONDS
+        return default
     try:
         seconds = float(raw)
     except ValueError:
         seconds = math.nan
     if not math.isfinite(seconds) or seconds <= 0:
-        log.warning("ignoring HERDR_BUSY_CHECK_SECONDS=%r (not a positive number); using %g", raw, _BUSY_SECONDS)
-        return _BUSY_SECONDS
+        log.warning("ignoring %s=%r (not a positive number); using %g", name, raw, default)
+        return default
     return seconds
 
 
-def _busy_check(target: Path) -> str | None:
+def _busy_deadline() -> float:
+    return _deadline("HERDR_BUSY_CHECK_SECONDS", _BUSY_SECONDS)
+
+
+_SURVEY_SECONDS = 600.0  # discovery and size checks of one root; ``HERDR_SURVEY_SECONDS`` overrides
+
+
+def _survey_deadline() -> float:
+    return _deadline("HERDR_SURVEY_SECONDS", _SURVEY_SECONDS)
+
+
+def _ancestors() -> frozenset[int]:
+    """This process and every process above it (its shell, the terminal, the agent that started it)."""
+    chain, pid = {os.getpid()}, os.getppid()
+    while pid > 1 and pid not in chain and len(chain) < 64:
+        chain.add(pid)
+        try:
+            try:  # Linux: the parent is the second field after the command name
+                pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+            except (OSError, IndexError):
+                pid = int(subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
+                                         timeout=10, check=False).stdout.strip() or 0)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            break
+    return frozenset(chain)
+
+
+def _in_child(work: Callable[[], object], seconds: float) -> object:
+    """``work()`` in a forked child with a deadline: its JSON-able result, or ``OSError`` for what it raised.
+    A child that does not answer (a stat on a dead network mount blocks in the kernel, unkillable) has its
+    whole process group killed and is never waited for, so the sweep that asked can fail closed and let go
+    of its locks. Forked, not spawned, so that it sees the same module state; it only touches the file system."""
+    reader, writer = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - runs in the child
+        code = 0
+        try:
+            os.setsid()
+            os.close(reader)
+            try:
+                payload = json.dumps({"ok": work()})
+            except BaseException as exc:  # noqa: BLE001 - whatever it was, the parent hears of it
+                payload = json.dumps({"error": f"{exc}" or type(exc).__name__})
+            data = payload.encode()
+            while data:
+                data = data[os.write(writer, data):]
+        except BaseException:  # noqa: BLE001
+            code = 1
+        finally:
+            os._exit(code)
+    os.close(writer)
+    deadline, chunks, answered = time.monotonic() + seconds, [], False
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([reader], [], [], left)[0]:
+                raise TimeoutError(f"survey timed out after {seconds:g} s")
+            chunk = os.read(reader, 1 << 16)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        answered = True
+    finally:
+        os.close(reader)
+        if not answered:
+            for kill in (lambda: os.killpg(pid, signal.SIGKILL), lambda: os.kill(pid, signal.SIGKILL)):
+                try:
+                    kill()
+                except OSError:
+                    continue
+        for _ in range(20 if answered else 1):
+            try:
+                if os.waitpid(pid, os.WNOHANG)[0]:
+                    break
+            except ChildProcessError:
+                break
+            time.sleep(0.1 if answered else 0)
+    try:
+        answer = json.loads(b"".join(chunks))
+    except ValueError as exc:
+        raise OSError("survey child gave no answer") from exc
+    if "error" in answer:
+        raise OSError(answer["error"])
+    return answer["ok"]
+
+
+def _busy_check(target: Path, excused: Sequence[int] = ()) -> str | None:
     """``_busy_reason`` over a fresh process scan, run in a child with a deadline so that a stat that hangs
     (a dead NFS or sshfs mount a process sits on) can never hang the sweep or a build's disk guard. The child
     runs from ``/`` without the script directory on its path (the sweeper's cwd is a user workspace). One that
@@ -671,7 +795,8 @@ def _busy_check(target: Path) -> str | None:
     seconds = _busy_deadline()
     root = str(Path(__file__).resolve().parent.parent)
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [root, os.environ.get("PYTHONPATH")]))}
-    child = subprocess.Popen([sys.executable, "-P", "-c", _BUSY_CHILD, str(target), str(os.getpid())],
+    child = subprocess.Popen([sys.executable, "-P", "-c", _BUSY_CHILD, str(target), str(os.getpid()),
+                              ",".join(map(str, excused))],
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env, cwd="/",
                              start_new_session=True)
     answered = False
@@ -793,8 +918,9 @@ def _cargo_clean(target: Path, timeout: float = _CLEAN_SECONDS) -> str | None:
     return None
 
 
-def _inspect(target: Path) -> tuple[float, int]:
-    """Return newest mtime and allocated size, rejecting links and nested sources."""
+def _inspect(target: Path, stop_at: int | None = None) -> tuple[float, int]:
+    """Return newest mtime and allocated size, rejecting links and nested sources. With ``stop_at`` the walk
+    ends as soon as the size passes it (the size is then only a lower bound, and the mtime partial)."""
     device = target.lstat().st_dev
     pending = [target]
     newest = 0.0
@@ -816,25 +942,130 @@ def _inspect(target: Path) -> tuple[float, int]:
             raise OSError(f"Source or repository marker inside {target}")
         newest = max(newest, metadata.st_mtime)
         size += metadata.st_blocks * 512
+        if stop_at is not None and size > stop_at:
+            break
         if stat.S_ISDIR(metadata.st_mode):
             with os.scandir(path) as entries:
                 pending.extend(Path(entry.path) for entry in entries)
     return newest, size
 
 
+_SHALLOW_DEPTH = 4  # target / profile / .fingerprint | build | incremental / <unit> / files
+_NOT_LISTED = {"deps", "examples"}  # the bulk of a profile: only the directory itself is looked at
+
+
+def _shallow_newest(target: Path) -> float:
+    """Newest mtime of Cargo's bookkeeping instead of every file: the target, its profile directories, and
+    what ``.fingerprint``, ``build`` and ``incremental`` hold, down to the fingerprint files (``invoked.timestamp``
+    is touched by every build). ``deps`` is not listed, but its own mtime moves whenever a file is created or
+    replaced in it, which a build always does. Costs a few entries per crate, however large the target is."""
+    newest, count = 0.0, 0
+    pending = [(target, 0)]
+    while pending:
+        path, depth = pending.pop()
+        info = path.lstat()
+        count += 1
+        if count > _MAX_ENTRIES:
+            raise OSError(f"Inspection entry limit reached at {target}")
+        newest = max(newest, info.st_mtime)
+        if stat.S_ISDIR(info.st_mode) and depth < _SHALLOW_DEPTH and not (depth == 2 and path.name in _NOT_LISTED):
+            with os.scandir(path) as entries:
+                pending.extend((Path(entry.path), depth + 1) for entry in entries)
+    return newest
+
+
+def _measure(target: Path, cap: int | None, full: bool) -> dict:
+    """What the sweep needs to know of one target: newest mtime, size and whether it is over ``cap``.
+    ``full`` (disk pressure) walks everything, as before. Otherwise only the cap is being decided: the walk
+    stops once the size passes it, and the idle time then comes from ``_shallow_newest``, so a target of
+    millions of files is judged as cheaply as it is proven large. A target that cannot be decided raises."""
+    if full:
+        try:
+            newest, size = _inspect(target)
+            return {"newest": newest, "size": size, "over": cap is not None and size > cap}
+        except OSError:
+            if cap is None:
+                raise
+    assert cap is not None
+    _, size = _inspect(target, stop_at=cap)
+    if size <= cap:
+        return {"newest": 0.0, "size": size, "over": False}
+    return {"newest": _shallow_newest(target), "size": size, "over": True}
+
+
+def _survey(spec: dict) -> dict:
+    """Discovery of a root (or the known ``targets``) and the measurement of each target, in one pass that
+    ``_in_child`` bounds in time: ``{"rows": [...], "unreadable": [...], "trash": [...], "notes": [...]}``."""
+    root, cap, full = Path(spec["root"]), spec["cap"], spec["full"]
+    unreadable: list[str] = []
+    trash: list[Path] = []
+    notes: list[str] = []
+    if spec["targets"] is not None:
+        targets = [Path(t) for t in spec["targets"] if _recognized(Path(t))]
+    else:
+        targets = _discover(root, unreadable=unreadable, trash=trash, notes=notes,
+                            exclude=frozenset(Path(p) for p in spec["exclude"]))
+    device = root.stat().st_dev
+    rows = []
+    for target in targets:
+        row: dict = {"path": str(target)}
+        try:
+            if target.stat().st_dev != device:
+                row["foreign_device"] = True
+            else:
+                row.update(_measure(target, cap, full))
+        except OSError as exc:
+            row["error"] = str(exc)
+        rows.append(row)
+    return {"rows": rows, "unreadable": unreadable, "trash": [str(t) for t in trash], "notes": notes}
+
+
+_DISCOVERY_REFRESH = 6 * 3600  # a cached target list is walked afresh after this long
+
+
+def _cache_file(state_dir: Path) -> Path:
+    return state_dir / "build-cleanup-targets.json"
+
+
+def _load_cache(state_dir: Path) -> dict:
+    try:
+        data = json.loads(_cache_file(state_dir).read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _store_cache(state_dir: Path, root: Path, targets: list[str]) -> None:
+    data = _load_cache(state_dir)
+    data[str(root)] = {"at": time.time(), "targets": targets}
+    _write_json(state_dir, _cache_file(state_dir).name, data)
+
+
+def _git(directory: Path, *args: str) -> subprocess.CompletedProcess:
+    """``git -C directory ...`` in a clean environment: ``GIT_DIR``, ``GIT_INDEX_FILE`` and the rest, inherited
+    from a hook or a wrapper script, would point git at some other repository."""
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    return subprocess.run(["git", "-C", str(directory), *args], capture_output=True, timeout=30, check=False,
+                          env=clean)
+
+
 def _untracked(target: Path) -> bool:
-    """Git must verify the entire target is untracked, including nested files."""
+    """Git must verify the entire target is untracked, including nested files, in the nearest repository
+    that holds the workspace. A work tree rooted at the home directory (``git init ~`` for dotfiles) is no
+    project repository: it says nothing about a project inside it, which is then left alone like one outside
+    git."""
     if _managed_workspace(target) is not None:
         return True  # lives in the state directory, not in a repository
     cache_only = not (target.parent / "Cargo.toml").is_file()
-    if cache_only and subprocess.run(
-            ["git", "-C", str(target.parent), "rev-parse", "--is-inside-work-tree"],
-            capture_output=True, timeout=30, check=False).returncode != 0:
-        return True  # cache-only directory (verified by CACHEDIR.TAG) outside any repository
-    result = subprocess.run(
-        ["git", "-C", str(target.parent), "ls-files", "--", target.name],
-        capture_output=True, timeout=30, check=False,
-    )
+    top = _git(target.parent, "rev-parse", "--show-toplevel")
+    if top.returncode != 0:
+        return cache_only  # outside any repository: only a cache-only directory (CACHEDIR.TAG) may go
+    try:
+        if Path(os.fsdecode(top.stdout.strip())).resolve() == Path.home().resolve():
+            return False
+    except OSError:
+        return False
+    result = _git(target.parent, "ls-files", "--", target.name)
     return result.returncode == 0 and not result.stdout
 
 
@@ -870,15 +1101,19 @@ def _usage(path: Path) -> float:
     return measure(path)[0]
 
 
-def _write_status(state_dir: Path, result: dict) -> None:
-    fd, name = tempfile.mkstemp(prefix=".build-cleanup-", dir=state_dir)
+def _write_json(state_dir: Path, name: str, data: dict) -> None:
+    fd, tmp = tempfile.mkstemp(prefix=".build-cleanup-", dir=state_dir)
     try:
         with os.fdopen(fd, "w") as stream:
-            json.dump(result, stream, indent=2)
+            json.dump(data, stream, indent=2)
             stream.write("\n")
-        os.replace(name, state_dir / "build-cleanup.json")
+        os.replace(tmp, state_dir / name)
     finally:
-        Path(name).unlink(missing_ok=True)
+        Path(tmp).unlink(missing_ok=True)
+
+
+def _write_status(state_dir: Path, result: dict, name: str = "build-cleanup.json") -> None:
+    _write_json(state_dir, name, result)
 
 
 def run_once(
@@ -887,7 +1122,7 @@ def run_once(
     pressure_water: float = 90, pressure_min_age_hours: float = 2,
     only_device: int | None = None,
     max_target_bytes: int | None = None, size_cap_min_age_hours: float | None = None,
-    only_targets: list[Path] | None = None,
+    only_targets: list[Path] | None = None, invoker: Sequence[int] = (), discovery: str = "walk",
 ) -> dict:
     """Run one bounded sweep and atomically save its inspectable status.
 
@@ -906,7 +1141,15 @@ def run_once(
     ``high_water`` too (``reasons[path] == "size_cap"``), through the same checks. Such a target needs
     ``size_cap_min_age_hours`` of idle time (default ``min_age_hours``; the after-build pass uses 0, because
     its target was written a moment ago: the process scan and the leases then decide). ``only_targets``
-    limits the pass to those targets, found under ``roots`` without a discovery walk.
+    limits the pass to those targets, found under ``roots`` without a discovery walk, and its report goes to
+    ``build-cleanup-last-build.json``, never over the sweep's ``build-cleanup.json`` (whose timestamp says when
+    the periodic sweep last ran). ``invoker``: processes (the caller and its ancestors) whose working
+    directory alone does not keep a target busy.
+
+    ``discovery``: ``walk`` looks for targets afresh; ``cached`` reuses each root's list of targets
+    for 6 hours; ``cache_only`` (the disk guard before a build) never walks the home directory, and uses what
+    a sweep found before. The discovery and the size checks of a root run in a child with a deadline
+    (``HERDR_SURVEY_SECONDS``, default 600): a root that does not answer is skipped with a warning.
     """
     if not all(math.isfinite(v) for v in (high_water, low_water, min_age_hours,
                                           pressure_water, pressure_min_age_hours)):
@@ -916,6 +1159,8 @@ def run_once(
     if size_cap_min_age_hours is not None and not (
             math.isfinite(size_cap_min_age_hours) and size_cap_min_age_hours >= 0):
         raise ValueError("size_cap_min_age_hours must be a finite number, 0 or more")
+    if discovery not in ("walk", "cached", "cache_only"):
+        raise ValueError("discovery must be walk, cached or cache_only")
     if not 0 <= low_water < high_water <= 100 or not 0 <= pressure_water <= 100:
         raise ValueError("Require 0 <= low_water < high_water <= 100 and 0 <= pressure_water <= 100")
     if min_age_hours < MIN_IDLE_HOURS or pressure_min_age_hours < MIN_IDLE_HOURS:
@@ -941,14 +1186,14 @@ def run_once(
         cap = None if max_target_bytes is None else (max_target_bytes, min_age_hours if
                                                      size_cap_min_age_hours is None else size_cap_min_age_hours)
         _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
-               pressure_water, pressure_min_age_hours, only_device, cap, only_targets)
+               pressure_water, pressure_min_age_hours, only_device, cap, only_targets, tuple(invoker), discovery)
         if result["warnings"]:
             result["status"] = "warning"
         if result["errors"]:
             result["status"] = "error"
-        if only_targets is None or result["removed"] or result["errors"]:
-            _write_status(state_dir, result)  # a one-target pass must not replace the last full report
-        if not dry_run:
+        _write_status(state_dir, result, "build-cleanup.json" if only_targets is None
+                      else "build-cleanup-last-build.json")  # a one-target pass is not the last full report
+        if not dry_run and only_targets is None:
             from .build_metrics import emit_event
             emit_event(state_dir, "cleanup_completed", kind="cleanup", status=result["status"],
                        removed_count=result["removed_count"], removed_bytes=result["removed_bytes"])
@@ -993,22 +1238,39 @@ def _skip_root(result: dict, root: Path, reason: str) -> None:
     result["warnings"].append(note)
 
 
+def _survey_root(root: Path, state_dir: Path, result: dict, spec: dict, discovery: str) -> dict | None:
+    """The survey of one root (``_survey`` in a child with a deadline), using the cached target list where
+    ``discovery`` allows; None when the root is not to be looked at now."""
+    cached = _load_cache(state_dir).get(str(root)) if spec["targets"] is None else None
+    if cached and isinstance(cached.get("targets"), list) and (
+            discovery == "cache_only" or (discovery == "cached" and time.time() - cached.get("at", 0) < _DISCOVERY_REFRESH)):
+        spec = {**spec, "targets": cached["targets"]}
+    elif discovery == "cache_only" and spec["targets"] is None and _is_home(root):
+        return None  # before a build the home directory is not walked
+    survey = _in_child(lambda: _survey(spec), _survey_deadline())
+    if spec["targets"] is None:
+        _store_cache(state_dir, root, [row["path"] for row in survey["rows"]])
+    return survey  # type: ignore[return-value]
+
+
 def _candidates(roots, state_dir, result, high_water, min_age_hours, pressure_water, pressure_min_age_hours,
-                only_device, cap=None, only_targets=None):
+                only_device, cap=None, only_targets=None, discovery="walk"):
     """Targets to consider: (newest mtime, path, size, idle cutoff, reason) each, and the root they live on
     by device. All of a root's targets when it is over ``high_water`` (reason ``pressure``); below it, only
     those over the size ``cap`` (reason ``size_cap``; the cap wins when both apply). Leftovers of an interrupted orphan removal are removed here."""
     candidates, roots_by_device = [], {}
     now = time.time()
+    canonical_roots = []
     for raw in roots:
         root = Path(raw).expanduser().absolute()
         try:
-            canonical = root == root.resolve(strict=True) and root.is_dir() and root != Path("/")
+            if root == root.resolve(strict=True) and root.is_dir() and root != Path("/"):
+                canonical_roots.append(root)
+                continue
         except OSError:
-            canonical = False
-        if not canonical:
-            _skip_root(result, root, "not a canonical project directory")
-            continue
+            pass
+        _skip_root(result, root, "not a canonical project directory")
+    for root in canonical_roots:
         if only_device is not None and root.stat().st_dev != only_device:
             continue  # deleting there cannot relieve the filesystem under pressure
         result["roots"].append(str(root))
@@ -1020,37 +1282,40 @@ def _candidates(roots, state_dir, result, high_water, min_age_hours, pressure_wa
         cutoff = now - (min(min_age_hours, pressure_min_age_hours) if under_pressure else min_age_hours) * 3600
         result["pressure"] = result["pressure"] or under_pressure
         roots_by_device[root.stat().st_dev] = root
+        spec = {"root": str(root), "cap": None if cap is None else cap[0], "full": pressured,
+                "exclude": [str(other) for other in canonical_roots if other != root and other.is_relative_to(root)],
+                "targets": None if only_targets is None else [str(t) for t in only_targets if t.parent == root]}
         try:
-            unreadable: list[str] = []
-            trash: list[Path] = []
-            if only_targets is not None:
-                targets = [t for t in only_targets if t.parent == root and _recognized(t)]
-            else:
-                targets = _discover(root, unreadable=unreadable, trash=trash)
-            for leftover in trash if not result["dry_run"] else []:
-                try:
-                    shutil.rmtree(leftover)  # nothing can be using it: it was renamed out of reach
-                except OSError as exc:  # one stuck leftover skips itself; the rest of the root still sweeps
-                    result["skipped"].append({"path": str(leftover), "reason": f"cannot delete: {exc}"})
-            for name in unreadable[:5]:
-                _skip_root(result, Path(name), "unreadable directory skipped")
-        except OSError as exc:
+            survey = _survey_root(root, state_dir, result, spec, discovery)
+        except OSError as exc:  # also a root that did not answer in time: skipped, the others still sweep
             _skip_root(result, root, str(exc))
             continue
-        for target in targets:
+        if survey is None:
+            continue
+        for note in survey["notes"]:
+            _skip_root(result, root, note)
+        for leftover in [Path(t) for t in survey["trash"]] if not result["dry_run"] else []:
+            try:
+                shutil.rmtree(leftover)  # nothing can be using it: it was renamed out of reach
+            except OSError as exc:  # one stuck leftover skips itself; the rest of the root still sweeps
+                result["skipped"].append({"path": str(leftover), "reason": f"cannot delete: {exc}"})
+        for name in survey["unreadable"][:5]:
+            _skip_root(result, Path(name), "unreadable directory skipped")
+        for row in survey["rows"]:
+            target = Path(row["path"])
             if state_dir.is_relative_to(target):
                 raise OSError(f"Maintenance state is inside cleanup target: {target}")
-            if target.stat().st_dev != root.stat().st_dev:
+            if row.get("foreign_device"):
                 result["skipped"].append({"path": str(target), "reason": "different filesystem"})
                 continue
-            try:
-                newest, size = _inspect(target)
-            except OSError as exc:
-                result["skipped"].append({"path": str(target), "reason": str(exc)})
-                if pressured:  # below high water this is a size look only: a target that cannot be read stays
-                    result["errors"].append(str(exc))
+            if "error" in row:
+                result["skipped"].append({"path": str(target), "reason": row["error"]})
+                if pressured:  # below high water this is a size look only: it is a warning, never a silent ok
+                    result["errors"].append(row["error"])
+                else:
+                    result["warnings"].append(f"size cap undecided for {target}: {row['error']}")
                 continue
-            over_cap = cap is not None and size > cap[0]
+            newest, size, over_cap = row["newest"], row["size"], row["over"]
             if not pressured and not over_cap:
                 continue
             reason = "size_cap" if over_cap else "pressure"
@@ -1064,11 +1329,12 @@ def _candidates(roots, state_dir, result, high_water, min_age_hours, pressure_wa
 
 
 def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
-           pressure_water=90, pressure_min_age_hours=2, only_device=None, cap=None, only_targets=None):
+           pressure_water=90, pressure_min_age_hours=2, only_device=None, cap=None, only_targets=None,
+           invoker=(), discovery="walk"):
     try:
         candidates, roots_by_device = _candidates(
             roots, state_dir, result, high_water, min_age_hours, pressure_water, pressure_min_age_hours,
-            only_device, cap, only_targets)
+            only_device, cap, only_targets, discovery)
     except (OSError, ValueError) as exc:
         result["errors"].append(str(exc))
         result["aborted"] = True  # the sweep itself failed (discovery): nothing was judged
@@ -1087,7 +1353,7 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
                 continue  # the pressure sweep stops at low water; a target over the cap goes regardless
             before = shutil.disk_usage(root).free
             if _orphaned(target):
-                if _blocked_by_process(target, name, result):
+                if _blocked_by_process(target, name, result, invoker):
                     continue  # moved, not deleted: something still builds into it
                 if result["dry_run"]:
                     result["would_remove"].append(name)
@@ -1097,7 +1363,7 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
                     result["skipped"].append({"path": name, "reason": "worktree is back"})
                     continue
                 result["reasons"][name] = "orphan"
-            elif not _clean_idle(target, name, cutoff, state_dir, result, reason):
+            elif not _clean_idle(target, name, cutoff, state_dir, result, reason, invoker):
                 continue
         except (OSError, subprocess.SubprocessError) as exc:
             result["errors"].append(f"{name}: {exc}")
@@ -1109,14 +1375,14 @@ def _sweep(roots, state_dir, result, high_water, low_water, min_age_hours,
         result["reasons"].setdefault(name, reason)
 
 
-def _blocked_by_process(target: Path, name: str, result: dict) -> bool:
+def _blocked_by_process(target: Path, name: str, result: dict, invoker: Sequence[int] = ()) -> bool:
     """A fresh process scan right before deleting ``target`` (idle or orphan): True when it must stay, with
     the reason in ``skipped`` and ``blocked``. A scan that cannot be read fails closed."""
     result["process_scans"] += 1
     busy = None
     for attempt in range(6):  # a process mid-exec is unreadable for a moment
         try:
-            busy = _busy_check(target)
+            busy = _busy_check(target, invoker)
             break
         except TimeoutError as exc:  # a hung stat will hang again: no retries, fail closed
             busy = f"process list unreadable: {exc}"
@@ -1136,7 +1402,7 @@ def _blocked_by_process(target: Path, name: str, result: dict) -> bool:
 
 
 def _clean_idle(target: Path, name: str, cutoff: float, state_dir: Path, result: dict,
-                reason: str = "pressure") -> bool:
+                reason: str = "pressure", invoker: Sequence[int] = ()) -> bool:
     """Clean one idle target through cargo; True when it went. Otherwise the reason is in ``skipped``."""
     def skip(reason: str) -> bool:
         result["skipped"].append({"path": name, "reason": reason})
@@ -1144,14 +1410,15 @@ def _clean_idle(target: Path, name: str, cutoff: float, state_dir: Path, result:
 
     if not _untracked(target):
         return skip("tracked or unverifiable output")
-    newest, _ = _inspect(target)  # revalidate right before deleting
+    # revalidate right before deleting (a target past the size cap is judged by its bookkeeping, as in the survey)
+    newest = _shallow_newest(target) if reason == "size_cap" else _inspect(target)[0]
     if newest > cutoff:
         return skip("recent activity")
     if not _recognized(target):
         raise OSError(f"Target no longer recognized as a Cargo output: {name}")
     if _skip_for_registry(state_dir, target, name, result):  # cheap: a leased target needs no scan
         return False
-    if _blocked_by_process(target, name, result):
+    if _blocked_by_process(target, name, result, invoker):
         return False
     if _skip_for_registry(state_dir, target, name, result):  # read again: a lease taken during the scan counts
         return False
@@ -1180,34 +1447,89 @@ def _build_targets(cmd: list[str], cwd: Path) -> list[Path]:
     return [workspace / "target", *managed]
 
 
+_AFTER_BUILD_WINDOW = 24 * 3600  # one clean per target per day: a project that is always over the cap is not churned
+_AFTER_BUILD_MEMORY = 7 * 24 * 3600  # how long cleans are remembered for the "capped again" warning
+
+
+def size_cap_applies(cmd: list[str], cfg: dict) -> bool:
+    """True for a cargo build/check/test/... while ``build_cleanup`` is enabled with a size cap."""
+    try:
+        from .build_maintenance import policy_kwargs
+        from .cargo_host import BUILD_SUBCOMMANDS, cargo_subcommand
+        return (bool(cmd) and bool(cfg.get("enabled", True)) and policy_kwargs(cfg)["max_target_bytes"] is not None
+                and os.path.basename(cmd[0]) == "cargo"
+                and cargo_subcommand(cmd[1:]) in BUILD_SUBCOMMANDS - {"clean"})
+    except Exception:  # noqa: BLE001 - a malformed command or policy: no cap pass
+        return False
+
+
+def _after_build_record(state_dir: Path) -> dict:
+    try:
+        data = json.loads((state_dir / "build-cleanup-after-build.json").read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def finish_build(cmd: list[str], cwd: Path, cfg: dict, state_dir: Path, code: int) -> dict | None:
+    """The size-cap pass after a build that ended with exit status ``code``: only a build that succeeded is
+    followed by one (a failed or interrupted build leaves the target for the next attempt to reuse).
+    Never raises, for any caller."""
+    if code != 0:
+        return None
+    try:
+        return after_build_size_cap(cmd, cwd, cfg, state_dir)
+    except KeyboardInterrupt:  # Ctrl-C during the pass: the build's result stands, the locks are released
+        log.warning("build cleanup: size cap pass interrupted")
+        return None
+
+
 def after_build_size_cap(cmd: list[str], cwd: Path, cfg: dict, state_dir: Path) -> dict | None:
     """Size-cap pass for the target of one finished ``cargo`` build (the result of ``run_once``), or None when
     nothing applies: cleanup or the cap is off, the command is not a cargo build, or it has no target.
 
     Called after the build's lease is released. Only the build's own target is looked at, and it goes only if
-    it is over the cap and no other build or process holds it (the lease and process checks of every sweep).
-    The idle floor is 0, as the target was written a moment ago. Never raises: a failure is logged and the
-    build's exit code is untouched."""
+    it is over the cap and no other build or process holds it (the lease and process checks of every sweep;
+    the invoking shell and its ancestors do not hold it by their working directory alone). The idle floor is
+    0, as the target was written a moment ago. A target is cleaned at most once in 24 hours, and cleaned
+    again within a week gets a warning to raise ``max_target_gb``. A pass that is blocked says why at WARNING.
+    Never raises: a failure is logged and the build's exit code is untouched."""
     try:
         from .build_maintenance import policy_kwargs
-        from .cargo_host import BUILD_SUBCOMMANDS, cargo_subcommand
         policy = policy_kwargs(cfg)
-        if (not cfg.get("enabled", True) or policy["max_target_bytes"] is None
-                or os.path.basename(cmd[0]) != "cargo"):
-            return None
-        subcommand = cargo_subcommand(cmd[1:])
-        if subcommand not in BUILD_SUBCOMMANDS or subcommand == "clean":
+        if not size_cap_applies(cmd, cfg):
             return None
         targets = [t for t in _build_targets(cmd, cwd) if t.is_dir() and not t.is_symlink()]
         removed: dict = {"removed": [], "errors": [], "skipped": []}
+        record = _after_build_record(state_dir)
+        now = time.time()
+        invoker = _ancestors()
         for target in targets:
+            history = [t for t in record.get(str(target), []) if isinstance(t, (int, float))
+                       and now - t < _AFTER_BUILD_MEMORY]
+            if history and now - max(history) < _AFTER_BUILD_WINDOW:
+                log.info("build cleanup: size cap pass skipped, %s was cleaned less than a day ago", target)
+                continue
             result = run_once([target.parent], state_dir, **{**policy, "size_cap_min_age_hours": 0,
                                                              "high_water": 100, "low_water": 0},
-                              only_targets=[target])
+                              only_targets=[target], invoker=sorted(invoker))
             for key in removed:
                 removed[key].extend(result.get(key, []))
             if result.get("status") == "busy":
                 log.info("build cleanup: size cap pass skipped, another sweep runs: %s", target)
+            for blocked in result.get("blocked", []):
+                log.warning("build cleanup: size cap pass blocked for %s: %s", blocked["path"], blocked["reason"])
+            for warning in result.get("warnings", []):
+                log.warning("build cleanup: %s", warning)
+            if str(target) in result.get("removed", []):
+                if history:
+                    log.warning("build cleanup: %s went over max_target_gb again after being cleaned; "
+                                "a higher max_target_gb would keep its build cache", target)
+                record[str(target)] = [*history, now]
+                try:
+                    _write_json(state_dir, "build-cleanup-after-build.json", record)
+                except OSError as exc:
+                    log.warning("build cleanup: cannot record the clean of %s: %s", target, exc)
         return removed if targets else None
     except Exception as exc:  # noqa: BLE001 - a cleanup problem must never fail the build
         log.warning("build cleanup: size cap pass after the build failed: %s: %s", type(exc).__name__, exc)

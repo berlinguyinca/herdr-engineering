@@ -64,7 +64,7 @@ with `scripts/fleet-auto-update.sh`; see [fleet lifecycle](operations/fleet-life
 
 ## Defaults, pressure mode and the disk guard
 
-Cleanup is on by default (roots `~` and `~/.cache`; roots that do
+Cleanup is on by default (roots `~`, `~/work`, `~/IdeaProjects` and `~/.cache`, each swept once even when nested or linked; roots that do
 not exist are skipped; the managed `targets/` dirs and the legacy `shared-targets` slot pools of the state dir and of every mounted enrolled storage tier (a `volume_uuid` tier is resolved through its mount) are added automatically and re-evaluated every cycle). Opt out
 with `build_cleanup: {enabled: false}`. `scripts/install.sh` and `fleet update` install
 the job; `herdr-eng build-hygiene install|status` does it by hand (systemd user unit on
@@ -190,21 +190,39 @@ sweep result lists it in `reasons` as `size_cap` (`pressure` and `orphan` are th
 over the cap while a build runs, or whose project is not in git, is kept. Why: a disk reached 100% from stale
 `target/debug` copies that no pressure rule had touched.
 
-**Default discovery.** With `roots` unset the sweep searches the home directory (and `~/.cache`). This widens the
-earlier narrowed contract of "explicit roots only"; it does so at the user's explicit request, because the user has
-dozens of Rust projects and cannot list them all. The walk under `~` is bounded (depth 6), never follows symlinks, and
-does not enter dot directories (`~/.cargo`, `~/.rustup`, `~/.local/share/Trash`, ...), `Library` or `node_modules`; a
-directory is a target only when the usual verification accepts it (a `Cargo.toml` beside it and Cargo's markers).
-Setting `roots` replaces the default, and a root you name is searched as named (the exclusions apply only to `~`).
+**Huge targets.** The size check stops walking once the target passes the cap, and the idle time is judged from
+Cargo's bookkeeping (profile directories, `.fingerprint`, `build`, `incremental`) instead of every file, so a target
+of millions of files is judged as cheaply as it is proven large. Only under disk pressure is the whole target
+walked. A target that cannot be decided is reported as a warning (`size cap undecided`), never as a clean pass.
+`max_target_gb` must be a number >= 0 (a numeric string such as YAML's `1e-06` is accepted; anything else, and
+booleans, fall back to 50 with a warning).
 
-**After a build.** When `herdr-eng build-coordinate -- cargo <build|check|test|...>` finishes, it checks that
-build's target (the `--target-dir` or `CARGO_TARGET_DIR` it was given, else the workspace `target` and its
-Herdr-managed target). If that target is over the cap, a size-cap pass for that target alone runs after the build's lease
-is released; another build holding the target, or any process using it, keeps it. The idle floor of this pass is 0:
-the target was written a moment ago, so any idle floor would always skip it, and the lease and process checks
-decide instead. It never fails the build; a problem is logged on stderr and the build's exit code (128 + signal if it
-was killed) is kept. For this the cargo command runs as a plain child instead of being exec'd; no metrics are
-recorded for it, and SIGINT and SIGTERM are forwarded to it.
+**Default discovery.** With `roots` unset the sweep searches `~`, `~/work`, `~/IdeaProjects` and `~/.cache` (roots
+inside another root are walked once, on their own). This widens the earlier narrowed contract of "explicit roots
+only"; it does so at the user's explicit request, because the user has dozens of Rust projects and cannot list them
+all. The walk under `~` is bounded (depth 6, 500,000 directories; past that it keeps what it found and warns),
+never follows symlinks, never stats into a mount point, and does not enter dot directories (`~/.cargo`,
+`~/.rustup`, `~/.local/share/Trash`, ...), `Library` or `node_modules`; a directory is a target only when the usual
+verification accepts it (a `Cargo.toml` beside it and Cargo's markers). Discovery and size checks of a root run in a
+child with a deadline (`HERDR_SURVEY_SECONDS`, 600): a root that does not answer is skipped with a warning. The
+watcher reuses each root's target list for 6 hours (`build-cleanup-targets.json`); the disk guard before a build
+uses that list and never walks the home directory. A project whose nearest git repository is `$HOME` itself is not
+cleaned. Setting `roots` replaces the default, and a root you name is searched as named (the exclusions apply only
+to `~`).
+
+**After a build.** When `herdr-eng build-coordinate -- cargo <build|check|test|...>` or the cargo wrapper finishes
+successfully, it checks that build's target (the `--target-dir` or `CARGO_TARGET_DIR` it was given, else the
+workspace `target` and its Herdr-managed target). A failed or signalled build is not followed by a pass. If that
+target is over the cap, a size-cap pass for that target alone runs after the build's lease and the wrapper's locks
+are released; another build holding the target, or any process using it, keeps it. The shell that started the
+build and its ancestors do not count as holders for their working directory alone (an open file of theirs in the
+target still does); a blocked pass logs the reason at WARNING. The idle floor of this pass is 0, because the target
+was written a moment ago. A target is cleaned at most once in 24 hours; when it is capped again within a week a
+warning suggests a higher `max_target_gb`. The pass never fails the build; a problem is logged on stderr and the
+build's exit code is kept. For this the cargo command runs as a plain child instead of being exec'd; no metrics are
+recorded for it. Ctrl-C reaches the child through the terminal's process group (this process ignores it), SIGTERM
+and SIGHUP are forwarded once, a child that dies by a signal makes this process die by it, and on Linux the child
+is killed if this process is. The pass writes `build-cleanup-last-build.json`, never `build-cleanup.json`.
 
 `scripts/install.sh` (step 7g) installs and enables the cleanup service or timer by default; `--no-build-hygiene` or
 `HERDR_INSTALL_BUILD_HYGIENE=0` opts out.

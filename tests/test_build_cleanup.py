@@ -166,7 +166,9 @@ def test_discovery_limit_skips_the_root_with_a_reason_without_removing(workspace
     cache = target(workspace)
     monkeypatch.setattr(cleanup, "_MAX_ENTRIES", 1)
     result = run(workspace)
-    assert result["status"] == "warning" and any("limit" in warning for warning in result["warnings"])
+    # discovery keeps what it found and warns; the target itself exceeds the inspection limit: reported, kept
+    assert result["status"] != "ok" and any("limit" in warning for warning in result["warnings"])
+    assert result["removed_count"] == 0 and any("limit" in error for error in result["errors"])
     assert cache.exists()
 
 
@@ -179,7 +181,7 @@ def test_nested_source_manifest_is_preserved(workspace):
 
 def _paths(proc):
     """The files the scan says processes use (their cwd, executable, descriptors and mappings)."""
-    return [hold[3] for hold in cleanup._scan(proc) if hold[2] == "uses"]
+    return [hold[3] for hold in cleanup._scan(proc) if hold[2] in ("uses", "cwd")]
 
 
 def test_proc_reads_cwd_executable_and_open_files(tmp_path):

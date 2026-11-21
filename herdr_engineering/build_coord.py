@@ -245,16 +245,45 @@ def _prestart_sccache_server(env: dict[str, str] | None) -> None:
         pass
 
 
+def _die_with_parent() -> None:  # pragma: no cover - runs in the child between fork and exec
+    """Linux: the child gets SIGKILL when this process dies, so a killed coordinator leaves no build behind."""
+    if sys.platform == "linux":
+        try:
+            import ctypes
+            ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+        except (OSError, AttributeError):
+            pass
+
+
 def _run_child(cmd: list[str], slot_fd: int | None) -> int:
-    """Run ``cmd`` as a child with this process's environment, forwarding SIGINT/SIGTERM to it; return its exit
-    code (128 + signal when it was killed, as a shell reports it). The slot is freed once it is reaped."""
-    child = subprocess.Popen(cmd, close_fds=False)  # OSError: the caller maps it to 127
+    """Run ``cmd`` as a child with this process's environment and return its exit code.
+
+    Signals go the way they would had this process been replaced by the build (``exec``): a terminal's
+    Ctrl-C reaches the whole foreground group, so the child already gets SIGINT and this process only ignores
+    it (a no-op handler, not SIG_IGN, which the child would inherit); SIGTERM and SIGHUP, sent to this process
+    alone, are forwarded once. Handlers are in place before the child starts, so no signal falls in the gap.
+    A child that dies by a signal makes this process die by the same one. The slot is freed once the child is
+    reaped."""
+    main = threading.current_thread() is threading.main_thread()
+    child: subprocess.Popen | None = None
+    pending: list[int] = []
+
+    def forward(signum: int, _frame: object) -> None:
+        if child is None:
+            pending.append(signum)
+        elif child.poll() is None:
+            child.send_signal(signum)
+
     previous = {}
-    if threading.current_thread() is threading.main_thread():
-        for number in (signal.SIGINT, signal.SIGTERM):
-            previous[number] = signal.signal(number, lambda signum, _frame: child.poll() is None
-                                             and child.send_signal(signum))
+    if main:
+        previous[signal.SIGINT] = signal.signal(signal.SIGINT, lambda _signum, _frame: None)
+        for number in (signal.SIGTERM, signal.SIGHUP):
+            previous[number] = signal.signal(number, forward)
     try:
+        child = subprocess.Popen(cmd, close_fds=False, preexec_fn=_die_with_parent
+                                 if sys.platform == "linux" else None)  # OSError: the caller maps it to 127
+        for signum in pending:
+            child.send_signal(signum)
         status = child.wait()
     finally:
         for number, handler in previous.items():
@@ -264,6 +293,13 @@ def _run_child(cmd: list[str], slot_fd: int | None) -> int:
                 os.close(slot_fd)
             except OSError:
                 pass
+    if status < 0 and main:
+        try:
+            signal.signal(-status, signal.SIG_DFL)
+        except (OSError, ValueError):  # SIGKILL: nothing to reset
+            pass
+        os.kill(os.getpid(), -status)  # the same death as exec would have given
+        time.sleep(1)  # pragma: no cover - the signal is delivered at once
     return 128 - status if status < 0 else status
 
 
