@@ -65,6 +65,9 @@ class Host:
         (self.bin / "gh").write_text(FAKE_GH)
         (self.bin / "gh").chmod(0o755)
         self.home = tmp / "home"
+        # passwd lookups answer with this host's home, whoever runs the tests (the real user's home has no config)
+        (self.bin / "getent").write_text(f'#!/bin/sh\necho "agent:x:1000:1000::{self.home}:/bin/sh"\n')
+        (self.bin / "getent").chmod(0o755)
         (self.home / ".config/herdr-engineering").mkdir(parents=True)
         self.config = self.home / ".config/herdr-engineering/always-on-review.yaml"
         self.config.write_text("post: true\n")
@@ -160,6 +163,18 @@ def test_a_token_file_owned_by_someone_else_is_refused(host):
     fake.chmod(0o755)
     rc, out = host.run()
     assert rc == 1 and host.calls() == [] and "not owned" in out.lower() and TOKEN not in out
+
+
+def test_the_default_config_and_token_come_from_the_passwd_home_not_the_isolated_home(host, tmp_path):
+    """The local backend runs the step with HOME=/tmp/woodpecker-home-N: nothing may be looked up there."""
+    iso = tmp_path / "woodpecker-home-25844226"
+    iso.mkdir()
+    p = subprocess.run(["bash", str(host.installed)], env=host.env(HOME=str(iso)), capture_output=True, text=True,
+                       timeout=60)
+    assert p.returncode == 0, p.stderr
+    [call] = host.calls()
+    assert call["argv"][call["argv"].index("--config") + 1] == str(host.config) and call["gh_token"] == TOKEN
+    assert str(iso) not in p.stderr
 
 
 def test_a_token_file_path_starting_with_a_dash_is_refused(host):
