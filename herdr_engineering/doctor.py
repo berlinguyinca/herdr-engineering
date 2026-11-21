@@ -248,6 +248,7 @@ def run_doctor(config: dict[str, Any] | None = None,
         report.add("memory_hindsight", "warn", f"memory backend checks failed: {type(exc).__name__}")
 
     _add_build_cache_toolchain(report)
+    _add_build_hygiene(report, config or {})
 
     # external providers
     ci_offline = not (config or {}).get("ci", {}).get("provider")
@@ -292,6 +293,44 @@ def _add_build_cache_toolchain(report: DoctorReport) -> None:
     report.add("build_cache_python_deps", "warn" if absent else "ok",
                f"missing python modules: {', '.join(absent)}; fix: pip install -e ." if absent
                else "python deps import (PyYAML)")
+
+
+def _add_build_hygiene(report: DoctorReport, config: dict[str, Any]) -> None:
+    """Disk pressure plus whether the cleanup job and cargo wrapper are installed/enabled."""
+    from pathlib import Path
+
+    from .build_coord import _default_state_dir
+    from .build_hygiene import status
+    try:
+        merged = config if config.get("build_cleanup") else load_config()
+        info = status(Path.home(), merged, _default_state_dir())
+    except Exception as exc:  # doctor must never crash on an optional section
+        report.add("build_hygiene", "warn", f"disk hygiene check failed: {type(exc).__name__}")
+        return
+    usage = info["usage_percent"]
+    level = "fail" if usage >= 97 else "warn" if usage >= info["pressure_percent"] else "ok"
+    report.add("disk_pressure", level,
+               f"disk {usage}% used (pressure {info['pressure_percent']:g}%, builds refused at "
+               f"{info['refuse_builds_percent']:g}%)", info)
+    if not info["build_cleanup_enabled"]:
+        report.add("build_cleanup", "warn", "build cleanup disabled by config (build_cleanup.enabled: false)")
+    elif not info["build_cleanup_job_installed"]:
+        report.add("build_cleanup", "warn",
+                   "build cleanup enabled but its timer is not installed; fix: herdr-eng build-hygiene install")
+    elif info.get("build_cleanup_job_loaded") is False:
+        report.add("build_cleanup", "warn",
+                   "build cleanup job is written but not loaded in launchd; fix: herdr-eng build-hygiene install")
+    else:
+        report.add("build_cleanup", "ok",
+                   f"build cleanup job installed; last run {info['build_cleanup_last_run'] or 'never'}")
+    if not info["cargo_host_enabled"]:
+        report.add("cargo_host", "warn", "cargo-host / managed targets disabled by config")
+    elif not info["cargo_host_installed"]:
+        report.add("cargo_host", "warn",
+                   "cargo-host enabled but the managed cargo launcher is not installed; "
+                   "fix: herdr-eng build-hygiene install")
+    else:
+        report.add("cargo_host", "ok", "managed cargo launcher installed (one managed target per worktree, incremental off)")
 
 
 def _adopted_plugins(lock_path: str) -> list[str]:

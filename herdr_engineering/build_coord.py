@@ -416,8 +416,9 @@ def run_gated(cmd: list[str], *, slots: int | None = None, max_load: float = 1.5
               trace: dict[str, str] | None = None) -> int:
     """Hold a maintenance read lock for the entire build, even on slot bypass.
 
-    Cleanup takes the exclusive side of this lock. The inheritable descriptor
-    survives exec just like the build slot; kernel teardown releases both.
+    Retention, migration and cache eviction take the exclusive side of this lock; the cleanup sweep takes
+    it shared and protects a running build through the managed target's own lock instead. The inheritable
+    descriptor survives exec just like the build slot; kernel teardown releases both.
     """
     child_env, cache = None, None
     if cache_config is not None and cmd:
