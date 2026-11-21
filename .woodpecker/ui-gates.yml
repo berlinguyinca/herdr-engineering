@@ -42,7 +42,7 @@ steps:
       - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
       - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
       - 'git remote add origin "https://github.com/${CI_REPO}.git"'
-      - 'git fetch --no-tags --depth=200 origin "$CI_COMMIT_SHA"   # enough history for the stale-base notice in ui-gates.sh to find the fork point'
+      - 'git fetch --no-tags origin "$CI_COMMIT_SHA"   # full history: integrate-main.sh needs a merge base with main'
       - 'git checkout -q FETCH_HEAD'
       - 'git --no-pager log --oneline -1'
 
@@ -51,6 +51,12 @@ steps:
     commands:
       - 'set -eu'
       - 'bash scripts/ci-pipeline-freshness.sh'
+
+  - name: integrate-main
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'bash scripts/ci/integrate-main.sh'
 
   # exit 0 = run the gate, 3 = no UI path changed, anything else = fail the pipeline. Fails open (see the script).
   - name: applicability
