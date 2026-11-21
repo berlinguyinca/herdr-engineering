@@ -155,6 +155,14 @@ DEFAULTS: dict[str, Any] = {
         # services on ports in [agent_web_port_min, agent_ephemeral_min) that
         # are not in agent_exclude_ports (well-known daemons are also skipped).
         "agent_exclude_ports": [],
+        # Process-name fragments never auto-leased (null = built-in list of
+        # test/dev servers: vitest, jest, playwright, vite, next-server, ...).
+        "agent_deny_processes": None,
+        # Release a forwarded lease once its loopback app has been down this long.
+        "agent_orphan_grace_seconds": 60,
+        # Backstop: release a watcher lease this old (a live app re-registers on
+        # the next scan, i.e. a refresh). 0 disables. Default 24h.
+        "agent_lease_max_age_seconds": 86400,
         "agent_web_port_min": 1024,
         "agent_ephemeral_min": 32768,
         # The auto-registration agent reports every discovered service to this

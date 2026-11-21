@@ -1213,3 +1213,235 @@ def test_signed_chunked_put_and_keepalive_framing_survive():
     finally:
         fwd.stop()
         srv.close()
+
+
+# -- lease flood: ephemeral test servers and orphaned forwarders ------------
+
+def _spawn_listener(tmp_path, name: str):
+    """A real HTTP listener; the scanner is fed ``name`` as its process (a real
+    process title is not portable)."""
+    return _http_target(tmp_path)
+
+
+def test_default_process_denylist_names_test_servers():
+    names = fa.DEFAULT_DENY_PROCESSES
+    for needed in ("vitest", "jest", "playwright", "vite", "next-server"):
+        assert needed in names
+    assert fa.process_denied("node (vitest 12", names)
+    assert fa.process_denied("next-server (v14.2.3)", names)
+    assert fa.process_denied("Playwright", names)
+    assert not fa.process_denied("node", names)
+    assert not fa.process_denied(None, names)
+    assert not fa.process_denied("uvicorn", names)
+
+
+def test_scan_does_not_lease_denylisted_test_server(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _spawn_listener(tmp_path, "node (vitest 3")
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node (vitest 3"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        assert gw.leases == {}
+        assert str(port) not in _store(tmp_path)
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_denylist_is_configurable(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _spawn_listener(tmp_path, "myrunner")
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "myrunner"}))
+    agent = _agent(tmp_path, gw, deny_processes=("myrunner",))
+    try:
+        agent.scan_once()
+        assert gw.leases == {}
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_scan_releases_existing_denylisted_lease(tmp_path, monkeypatch):
+    import json as _json
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    (tmp_path / "fabric-agent.json").write_text(_json.dumps({
+        str(port): {"lease_id": "lease_old", "label": f"x (port {port})",
+                    "external_port": 18001, "url": "http://dev.lan:18001",
+                    "process": "node (vitest 1", "last_hb": 0.0},
+    }))
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node (vitest 1"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        assert "lease_old" in gw.closed
+        assert str(port) not in _store(tmp_path)
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_scan_releases_forwarded_lease_when_origin_is_gone(tmp_path, monkeypatch):
+    """The leak: the agent's own same-port forwarder keeps the port listening
+    after the loopback app dies, so 'port not in listeners' never fires. The
+    lease must be released once the ORIGIN stops answering."""
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)  # loopback-only app
+    # The scan keeps reporting the port: in production the agent's own forwarder
+    # (bound on the tailnet IP) holds it open.
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    # 127.0.0.2 stands in for the tailnet IP: the app on 127.0.0.1 is not
+    # reachable there, so the agent puts a forwarder in front of it.
+    agent = _agent(tmp_path, gw, tailnet_ip="127.0.0.2", orphan_grace=0.0)
+    try:
+        agent.scan_once()
+        entry = _store(tmp_path)[str(port)]
+        assert entry["fwd_port"] is not None
+        agent.scan_once()  # origin alive: lease kept
+        assert str(port) in _store(tmp_path)
+        server.shutdown()
+        server.server_close()
+        agent.scan_once()
+        assert str(port) not in _store(tmp_path)
+        assert entry["lease_id"] in gw.closed
+    finally:
+        agent.stop()
+        gw.stop()
+
+
+def test_orphan_grace_delays_release(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, tailnet_ip="127.0.0.2", orphan_grace=3600.0)
+    try:
+        agent.scan_once()
+        server.shutdown()
+        server.server_close()
+        agent.scan_once()
+        assert str(port) in _store(tmp_path)  # within grace: kept
+    finally:
+        agent.stop()
+        gw.stop()
+
+
+# -- watcher lease max age (backstop) ---------------------------------------
+
+def _seed_store(tmp_path, port: int, registered_at: float | None) -> None:
+    entry = {"lease_id": "lease_old", "label": f"x (port {port})",
+             "external_port": 18001, "url": "http://dev.lan:18001",
+             "process": "node", "last_hb": 0.0}
+    if registered_at is not None:
+        entry["registered_at"] = registered_at
+    (tmp_path / "fabric-agent.json").write_text(json.dumps({str(port): entry}))
+
+
+def test_registered_lease_records_registration_time(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        before = time.time()
+        agent.scan_once()
+        assert before <= _store(tmp_path)[str(port)]["registered_at"] <= time.time()
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_lease_past_max_age_is_refreshed_while_app_is_live(tmp_path, monkeypatch):
+    """Backstop: an over-age watcher lease is released; a genuinely live app is
+    simply re-registered by the same scan (new lease), not banned."""
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    _seed_store(tmp_path, port, registered_at=time.time() - 7200)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, lease_max_age=3600.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" in gw.closed
+        entry = _store(tmp_path)[str(port)]
+        assert entry["lease_id"] != "lease_old"
+        assert time.time() - entry["registered_at"] < 60
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_lease_past_max_age_stays_released_when_app_is_gone(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    _seed_store(tmp_path, 59999, registered_at=time.time() - 7200)
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({}))
+    agent = _agent(tmp_path, gw, lease_max_age=3600.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" in gw.closed
+        assert _store(tmp_path) == {}
+    finally:
+        agent.stop()
+        gw.stop()
+
+
+def test_lease_within_max_age_is_kept(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    _seed_store(tmp_path, port, registered_at=time.time() - 10)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, lease_max_age=3600.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" not in gw.closed
+        assert _store(tmp_path)[str(port)]["lease_id"] == "lease_old"
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_max_age_zero_disables_the_backstop(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    _seed_store(tmp_path, port, registered_at=1.0)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, lease_max_age=0.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" not in gw.closed
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_legacy_entry_without_registration_time_is_stamped_not_released(
+        tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    _seed_store(tmp_path, port, registered_at=None)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, lease_max_age=3600.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" not in gw.closed
+        assert _store(tmp_path)[str(port)]["registered_at"] > 0
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
