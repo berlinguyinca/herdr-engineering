@@ -113,7 +113,8 @@ def gate(proj: Path, shard: str | None, **env: str) -> subprocess.CompletedProce
     script = (f'set -uo pipefail; {exports}. "{PARALLEL}"; . "{RERUN}"; herdr_pytest_parallel_load; herdr_pytest_shard_load || exit 9; '
               f'herdr_pytest_run_gate env env "{{FAST}}" "{{SLOW}}"; echo "gate-status=$?"').replace("{FAST}", "not slow").replace("{SLOW}", "slow")
     return subprocess.run(["bash", "-c", script], cwd=proj, capture_output=True, text=True, timeout=300,
-                          env={**os.environ, "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
+                          env={**{k: v for k, v in os.environ.items() if k != "HERDR_UNIT_SHARD"},   # a shard's own CI env must not leak into the inner run
+                               "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
                                "HERDR_PYTEST_WORKERS": "2", "HERDR_PYTEST_RETRY": "0", "HERDR_PYTEST_RETRIED_FILE": "", **env})
 
 
