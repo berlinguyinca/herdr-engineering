@@ -34,6 +34,7 @@ from typing import Any
 
 from .devfabric import DevServiceRegistry, proxy_pair, route_and_pipe
 from .errors import ConflictError, UnreachableError
+from .fabric_named import AcceptBackoff
 
 _FABRIC_TOKEN_FILE = os.path.join("~", ".config", "herdr-engineering", "fabric-token")
 
@@ -193,6 +194,7 @@ class GatewayRouter:
     def _accept_loop(self, listener: socket.socket, port: int,
                      target_host: str, target_port: int,
                      routes: list | None = None, rewrite: str | None = None) -> None:
+        policy = AcceptBackoff(f"port {port}")
         while True:
             try:
                 client, _addr = listener.accept()
@@ -201,8 +203,15 @@ class GatewayRouter:
                     if port not in self._listeners:
                         break
                 continue
-            except OSError:
-                break
+            except OSError as exc:
+                if policy.fatal(exc):
+                    break
+                with self._lock:
+                    if port not in self._listeners:
+                        break
+                time.sleep(policy.delay_for(exc))
+                continue
+            policy.ok()
             threading.Thread(target=self._proxy_one,
                              args=(client, target_host, target_port, routes, rewrite, port),
                              daemon=True).start()
@@ -825,7 +834,9 @@ def _make_handler(gateway: FabricGateway):
                 return
             if self.path == "/healthz":
                 lo, hi = gateway.registry.port_range()
-                self._send(200, {"ok": True, "bound_ports": gateway.router.bound_ports(),
+                front = gateway.named_front
+                ok = front is None or front.healthy()   # a dead named accept thread: Docker must see it
+                self._send(200 if ok else 503, {"ok": ok, "bound_ports": gateway.router.bound_ports(),
                                  "url_base": gateway.url_base, "url_aliases": list(gateway.url_aliases),
                                  "named_domain": gateway.named_domain if gateway.named_front else None, "role": gateway.role,
                                  "epoch": gateway.epoch, "node_id": gateway.node_id,
