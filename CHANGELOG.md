@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Agent rules: push work branches and open PRs autonomously
+
+- `AGENTS.md` and the managed `SessionStart` reminder no longer require an explicit per-message ask before pushing herdr-engineering or opening a PR. Agents push their own work branches and open PRs themselves; pushing `main` directly and force-pushing someone else's branch stay forbidden.
+
 ### Fix: Pi fleet rollouts converge - pinned target, resumable drain, bounded state (#844)
 
 - **Pin the target**: `~/.config/herdr-engineering/pi-rollout-revision` (one 40-hex SHA; `HERDR_PI_ROLLOUT_REVISION` overrides) is now the canonical Pi runtime revision. `fleet rollout plan` falls back to it when `--pi-revision` is omitted and fails closed without one; an invalid pin is a failure, never a fallback.

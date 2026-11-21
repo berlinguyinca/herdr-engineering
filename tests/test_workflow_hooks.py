@@ -98,7 +98,7 @@ def run_hook(event, stdin="{}"):
 def test_session_start_reminder_is_short_and_covers_defaults():
     ctx = run_hook("SessionStart")["hookSpecificOutput"]["additionalContext"]
     assert len(ctx.splitlines()) <= 15
-    for needle in ("sonnet", "verify", "never push herdr-engineering", "/tmp", "woodpecker", "/handoff"):
+    for needle in ("sonnet", "verify", "never push main", "/tmp", "woodpecker", "/handoff"):
         assert needle in ctx.lower()
     assert run_hook("SessionStart")["hookSpecificOutput"]["hookEventName"] == "SessionStart"
 

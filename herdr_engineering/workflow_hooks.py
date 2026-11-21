@@ -38,7 +38,7 @@ REMINDER = """Engineering defaults (herdr-engineering managed hook):
 - Verify claims with command output before saying work is done.
 - Ship via branch -> PR -> review -> CI green -> ready; never commit to main.
 - Use real dependencies in tests; no mocks, stubs or fakes.
-- Never push herdr-engineering. Keep nothing under /tmp.
+- Push work branches and open PRs yourself; never push main. Keep nothing under /tmp.
 - To delete a worktree, build target, scratch dir or test container you created, run `herdr-eng cleanup --scope {worktree,target,tmp,docker} --path <p>`; never raw rm -rf, git worktree remove or docker rm.
 - Start throwaway containers with `docker run $(herdr-eng cleanup --print-run-args)` so they are reaped.
 - CI is Woodpecker (ci.metabolomics.us) where the repo uses it.

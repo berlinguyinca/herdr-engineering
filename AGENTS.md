@@ -3,7 +3,7 @@
 Repo-specific rules. They add to the global rules in `~/.agent-rules/AGENTS.md` and override them where they conflict.
 
 ## Pushing
-- Never push this repository, and never open a PR from it, unless the user explicitly asks in that message. Approval for one branch does not extend to another.
+- Push your work branches and open PRs from them autonomously; no per-push approval is needed. Never push to `main` directly, and never force-push a branch someone else owns.
 - Never commit to `main`. Work on a branch in a worktree under `~/.local/share/worktrees/`.
 - If a plain `git push` would target a differently named upstream, push `HEAD:<remote-branch>` explicitly.
 
