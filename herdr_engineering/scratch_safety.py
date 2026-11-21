@@ -120,16 +120,48 @@ def inspect_tree(
     )
 
 
-def git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+# Variables that would point git at another repository, index or object store. The user's own config
+# variables (GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG_NOSYSTEM) are kept: they decide what is ignored.
+_REDIRECTING_GIT_VARIABLES = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_PREFIX",
+        "GIT_QUARANTINE_PATH",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_GRAFT_FILE",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_ATTR_SOURCE",
+        "GIT_ASKPASS",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        "GIT_DEFAULT_HASH",
+        "GIT_NO_REPLACE_OBJECTS",
+    }
+)
+
+
+def git(repo: Path, *arguments: str, timeout: float = 15) -> subprocess.CompletedProcess[str]:
+    environment = {
+        key: value for key, value in os.environ.items() if key not in _REDIRECTING_GIT_VARIABLES
+    }
     environment.update(
         GIT_OPTIONAL_LOCKS="0",
-        GIT_CONFIG_NOSYSTEM="1",
-        GIT_CONFIG_GLOBAL="/dev/null",
         GIT_NO_LAZY_FETCH="1",
         LC_ALL="C",
     )
-    return subprocess.run(
+    done = subprocess.run(
         [
             "git",
             "--no-pager",
@@ -157,9 +189,28 @@ def git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         ],
         env=environment,
         capture_output=True,
-        text=True,
-        timeout=15,
+        timeout=timeout,
     )
+    # Bytes, decoded without universal-newline translation: a file name holding "\r" (Finder's
+    # `Icon\r`) must come back exact, and a name that is not valid UTF-8 must not raise.
+    return subprocess.CompletedProcess(
+        done.args,
+        done.returncode,
+        done.stdout.decode("utf-8", "surrogateescape"),
+        done.stderr.decode("utf-8", "surrogateescape"),
+    )
+
+
+def hidden_index_reason(repo: Path) -> str | None:
+    """skip-worktree / assume-unchanged entries hide edits from ``git status`` and from removal."""
+    index = git(repo, "ls-files", "-v", "-z")
+    if index.returncode:
+        return "repository_unverifiable"
+    if any(
+        entry[:1].islower() or entry.startswith("S ") for entry in index.stdout.split("\0") if entry
+    ):
+        return "repository_hidden_index_state"
+    return None
 
 
 def repository_reason(repo: Path) -> str | None:
@@ -178,13 +229,8 @@ def repository_reason(repo: Path) -> str | None:
     top = git(repo, "rev-parse", "--show-toplevel")
     if top.returncode or Path(top.stdout.strip()).resolve() != repo.resolve():
         return "repository_unverifiable"
-    index = git(repo, "ls-files", "-v", "-z")
-    if index.returncode:
-        return "repository_unverifiable"
-    if any(
-        entry[:1].islower() or entry.startswith("S ") for entry in index.stdout.split("\0") if entry
-    ):
-        return "repository_hidden_index_state"
+    if reason := hidden_index_reason(repo):
+        return reason
     checks = [
         ("dirty_repository", ("status", "--porcelain", "--untracked-files=all", "--ignored")),
         (
@@ -280,31 +326,42 @@ def _comparison(value: str) -> str:
     return unicodedata.normalize("NFC", value).casefold()
 
 
-def process_snapshot() -> Snapshot:
+def process_snapshot(ignore_arguments_of: frozenset[int] = frozenset()) -> Snapshot:
+    """``ignore_arguments_of``: pids (the caller's own ancestors) whose command line is not a
+    reference; their open files and cwd still count."""
     try:
-        return _process_snapshot()
+        return _process_snapshot(ignore_arguments_of)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         raise InspectionUnavailable("process visibility is unavailable; cleanup blocked") from error
 
 
-def _process_snapshot() -> Snapshot:
+def process_listing() -> list[tuple[int, str]]:
+    """``(pid, command line)`` of every other process; raises ``OSError`` when ``ps`` is unusable."""
     listing = subprocess.run(
         ["ps", "-ww", "-axo", "pid=,args="], capture_output=True, text=True, timeout=15
     )
     if listing.returncode or len(listing.stdout) > 32 * 2**20:
         raise OSError("process argument inspection failed")
+    own = os.getpid()
+    rows: list[tuple[int, str]] = []
+    for line in listing.stdout.splitlines():
+        pieces = line.strip().split(None, 1)
+        if len(pieces) == 2 and pieces[0].isdigit() and int(pieces[0]) != own:
+            rows.append((int(pieces[0]), pieces[1]))
+    return rows
+
+
+def _process_snapshot(ignore_arguments_of: frozenset[int] = frozenset()) -> Snapshot:
     arguments: list[str] = []
     commands: dict[int, str] = {}
     compilers: set[int] = set()
     own = os.getpid()
-    for line in listing.stdout.splitlines():
-        pieces = line.strip().split(None, 1)
-        if len(pieces) != 2 or not pieces[0].isdigit() or int(pieces[0]) == own:
-            continue
-        arguments.append(_comparison(pieces[1]))
-        commands[int(pieces[0])] = _comparison(pieces[1])
-        if Path(pieces[1].split()[0]).name in _COMPILERS:
-            compilers.add(int(pieces[0]))
+    for pid, command in process_listing():
+        if pid not in ignore_arguments_of:
+            arguments.append(_comparison(command))
+            commands[pid] = _comparison(command)
+        if Path(command.split()[0]).name in _COMPILERS:
+            compilers.add(pid)
     result = subprocess.run(
         ["lsof", "-nP", "-w", "-a", "-u", str(os.getuid()), "-F0pcnft"],
         capture_output=True,

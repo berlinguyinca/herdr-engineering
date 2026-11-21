@@ -33,7 +33,15 @@ deploy/
 lock/'
     COVERED_FILES='pyproject.toml
 .woodpecker/unit-gates.yml
-.woodpecker/main-cron.yml'
+.woodpecker/unit-gates-shard-1.yml
+.woodpecker/unit-gates-shard-2.yml
+.woodpecker/unit-gates-shard-3.yml
+.woodpecker/main-cron.yml
+.woodpecker/unit-gates-main.yml
+.woodpecker/structural-gates.yml
+.woodpecker/artifact-handoff.yml
+scripts/ci-pipeline-freshness.sh
+scripts/ci/integrate-main.sh'
     ;;
   ui)
     # Anything that can change the browser gates' result: the old `when: path: include` list of ui-gates.yml, plus the routing
@@ -42,8 +50,15 @@ lock/'
 tests/playwright/
 tests/visual/
 docs/assets/screenshots/
-herdr_engineering/control_plane/'
+herdr_engineering/control_plane/
+herdr_artifact_host/member_static/
+herdr_artifact_host/share_static/
+schemas/
+playwright.'
     COVERED_FILES='scripts/ci/ui-gates.sh
+eslint.communications.config.mjs
+eslint.scratch.config.mjs
+tsconfig.communications.json
 scripts/ci-pipeline-freshness.sh
 package.json
 package-lock.json

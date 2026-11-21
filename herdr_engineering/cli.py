@@ -61,12 +61,21 @@ def _build_parser() -> argparse.ArgumentParser:
         cp.add_argument("--dry-run", action="store_true")
         cp.set_defaults(func=_cmd_build_cleanup)
 
+    from .cleanup_command import register as register_cleanup_command
+    register_cleanup_command(sub)
+    from .disk_hygiene import register as register_disk_hygiene
+    register_disk_hygiene(sub)
+
     from .build_cache_report_cli import register as register_build_cache_report
     register_build_cache_report(sub)
 
     p = sub.add_parser("cargo-host", help="install or inspect harness-neutral Cargo caching")
     p.add_argument("arguments", nargs=argparse.REMAINDER)
     p.set_defaults(func=_cmd_cargo_host)
+
+    p = sub.add_parser("build-hygiene", help="install or inspect default disk hygiene (cleanup job, cargo wrapper)")
+    p.add_argument("arguments", nargs=argparse.REMAINDER)
+    p.set_defaults(func=_cmd_build_hygiene)
 
     from .open_client import register_parser
     register_parser(sub)
@@ -434,14 +443,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pr = fsub.add_parser("rollout", help="durable Pi runtime update and mission recovery")
     rsub = pr.add_subparsers(dest="rollout_command", required=True)
-    for action in ("plan", "apply", "run", "status"):
+    for action in ("plan", "apply", "run", "status", "latest"):
         rp = rsub.add_parser(action)
         rp.add_argument("--state", default=None, help="private rollout state directory")
         if action == "plan":
-            rp.add_argument("--pi-revision", required=True, help="full immutable Pi commit SHA")
+            rp.add_argument("--pi-revision", default=None,
+                            help="full immutable Pi commit SHA; defaults to the pinned "
+                                 "revision (~/.config/herdr-engineering/pi-rollout-revision)")
             rp.add_argument("--host", default=None)
             rp.add_argument("--inventory", default=None)
-        else:
+        elif action != "latest":
             rp.add_argument("--id", required=True, help="rollout ID printed by plan")
         if action == "run":
             rp.add_argument("--interval-seconds", type=int, default=30, help="initial retry interval, 1..3600 (backoff caps at max(interval, 300))")
@@ -461,6 +472,25 @@ def _build_parser() -> argparse.ArgumentParser:
         default="operator",
         help="who is settling the registration; recorded per session in the report",
     )
+    rp.set_defaults(func=_cmd_fleet_rollout)
+
+    rp = rsub.add_parser(
+        "abandon",
+        help="settle a rollout the operator no longer wants (e.g. it targets an unpinned "
+        "revision); the record stays until pruned, and the newest unfinished selector "
+        "moves on",
+    )
+    rp.add_argument("--state", default=None, help="private rollout state directory")
+    rp.add_argument("--id", required=True, help="rollout ID printed by plan")
+    rp.add_argument("--reason", default="abandoned by operator", help="why; recorded in the plan")
+    rp.set_defaults(func=_cmd_fleet_rollout)
+
+    rp = rsub.add_parser(
+        "prune",
+        help="delete settled (complete/abandoned) rollout records older than the horizon",
+    )
+    rp.add_argument("--state", default=None, help="private rollout state directory")
+    rp.add_argument("--older-than-days", type=int, default=30, help="settle horizon (default 30)")
     rp.set_defaults(func=_cmd_fleet_rollout)
 
     # artifacts ------------------------------------------------------------
@@ -2340,9 +2370,13 @@ def _cmd_fleet_rollout(args) -> int:
     from .fleet import FleetError, repo_root
     from .fleet_rollout import (
         RolloutStore,
+        abandon_rollout,
         apply_rollout,
         create_rollout,
         inventory_targets,
+        latest_unfinished,
+        prune_settled,
+        resolve_plan_revision,
         retire_identityless,
         run_rollout,
     )
@@ -2350,14 +2384,22 @@ def _cmd_fleet_rollout(args) -> int:
     store = RolloutStore(Path(args.state) if args.state else None)
     try:
         if args.rollout_command == "plan":
+            revision = resolve_plan_revision(args.pi_revision)
             inventory = Path(args.inventory) if args.inventory else repo_root() / "ansible/inventory/hosts.yml"
-            report = create_rollout(store, args.pi_revision, inventory_targets(inventory, args.host), inventory=inventory)
+            report = create_rollout(store, revision, inventory_targets(inventory, args.host), inventory=inventory)
         elif args.rollout_command == "apply":
             report = apply_rollout(store, args.id)
         elif args.rollout_command == "run":
             report = run_rollout(store, args.id, interval_seconds=args.interval_seconds, max_passes=args.max_passes, max_unchanged_online_passes=args.max_unchanged_online_passes)
         elif args.rollout_command == "retire-identityless":
             report = retire_identityless(store, args.id, settled_by=args.settled_by)
+        elif args.rollout_command == "latest":
+            plan = latest_unfinished(store)
+            report = plan if plan is not None else {"status": "none", "reason": "no unfinished rollout"}
+        elif args.rollout_command == "abandon":
+            report = abandon_rollout(store, args.id, reason=args.reason)
+        elif args.rollout_command == "prune":
+            report = {"pruned": prune_settled(store, older_than_days=args.older_than_days)}
         else:
             report = store.read(args.id)
     except (OSError, ValueError, RuntimeError, FleetError) as exc:
@@ -3504,6 +3546,11 @@ def _cmd_dev_gateway(args) -> int:
     return 0
 
 
+def _cmd_build_hygiene(args) -> int:
+    from .build_hygiene import main
+    return main(args.arguments)
+
+
 def _cmd_cargo_host(args) -> int:
     from .cargo_host import main
     return main(args.arguments)
@@ -3520,7 +3567,7 @@ def _cmd_build_coordinate(args) -> int:
     from .build_coord import BuildGate, _default_slots, _default_state_dir, run_gated
     from .build_metrics import summarize
 
-    cache_cfg = _build_cache_config()
+    cache_cfg, cleanup_policy = _build_cache_config_and_policy()
     slots = args.slots if args.slots is not None else effective_slots(
         cache_cfg, _default_slots(), _default_state_dir())
     if getattr(args, "status", False):
@@ -3563,11 +3610,40 @@ def _cmd_build_coordinate(args) -> int:
     if getattr(args, "trace_session", None) and trace is None:
         print("build-coordinate: --trace-session ignored (not a plain non-secret id)",
               file=sys.stderr)
+    if cmd and _guarded_build(cmd):
+        from .cargo_host import _disk_guard_refusal
+        probe = Path.cwd()
+        if os.path.basename(cmd[0]) == "cargo":  # measure where cargo's output really lands
+            from .cargo_target_storage import target_override
+            where = target_override(cmd[1:], os.environ, probe)
+            probe = where if isinstance(where, Path) else probe
+        refused = _disk_guard_refusal(probe, cleanup_policy)
+        if refused is not None:
+            return refused
     return run_gated(cmd, slots=slots, max_load=args.max_load,
                      wait_seconds=args.wait, json_out=args.json,
                      bypass_on_timeout=args.bypass_on_timeout,
                      record=getattr(args, "record", False),
                      cache_config=cache_cfg, trace=trace)
+
+
+# Commands whose output size the disk-budget guard protects here. Cargo is guarded here only when the
+# cargo on PATH is not the managed wrapper: the wrapper guards it against the filesystem its target really
+# lands on, also under build-coordinate. Scripts are never refused.
+_GUARDED_BUILD_COMMANDS = frozenset({"rustc", "make", "cmake", "ninja", "tsc"})
+_GUARDED_GO_SUBCOMMANDS = frozenset({"build", "install", "generate"})
+
+
+def _guarded_build(cmd: list[str]) -> bool:
+    name = os.path.basename(cmd[0])
+    if name == "cargo":
+        from .cargo_host import BUILD_SUBCOMMANDS, cargo_subcommand, path_cargo_is_wrapper
+        subcommand = cargo_subcommand(cmd[1:])
+        return (subcommand in BUILD_SUBCOMMANDS and subcommand != "clean"
+                and not path_cargo_is_wrapper(cmd[0]))
+    if name == "go":
+        return len(cmd) > 1 and cmd[1] in _GUARDED_GO_SUBCOMMANDS
+    return name in _GUARDED_BUILD_COMMANDS
 
 
 def _is_gate_command(cmd: list[str]) -> bool:
@@ -3578,20 +3654,31 @@ def _is_gate_command(cmd: list[str]) -> bool:
         and cmd[1] == "build-coordinate")
 
 
-def _build_cache_config():
-    """Effective ``fabric_build_cache`` config, or None when absent/disabled/invalid.
+def _build_cache_config_and_policy():
+    """(effective ``fabric_build_cache`` config or None, ``build_cleanup`` policy), from one config load.
 
-    A config problem must never block a build: it just runs uncached.
+    A config problem must never block a build: the cache config is then None (it runs uncached) and
+    the policy falls back to the non-strict load, so the disk guard still applies.
     """
     from .build_cache_config import validate
     from .config import load_config
     try:
-        section = load_config(strict_build_cache=True).get("fabric_build_cache")
+        loaded = load_config(strict_build_cache=True)
+        section = loaded.get("fabric_build_cache")
         cfg = validate(section) if section else None
     except Exception as exc:  # noqa: BLE001
         print(f"build-coordinate: build cache config ignored: {exc}", file=sys.stderr)
-        return None
-    return cfg if cfg is not None and cfg.enabled else None
+        try:
+            loaded = load_config()
+        except Exception:  # noqa: BLE001
+            loaded = {}
+        return None, loaded.get("build_cleanup", {})
+    return (cfg if cfg is not None and cfg.enabled else None), loaded.get("build_cleanup", {})
+
+
+def _build_cache_config():
+    """Effective ``fabric_build_cache`` config, or None when absent/disabled/invalid."""
+    return _build_cache_config_and_policy()[0]
 
 
 def _cmd_build_cache_inventory(args) -> int:

@@ -17,6 +17,15 @@
 when:
   - event: cron
 
+# The full suite needs the 16-CPU hive-heavy pool (same label as unit-gates.yml); without a label cron runs landed on 4-CPU overflow
+# nodes. One cron at a time: a slow run must not overlap the next schedule tick and pile up agents.
+labels:
+  cluster: hive-heavy
+
+concurrency:
+  limit: 1
+  group: "${CI_WORKFLOW_NAME}-main-cron"
+
 skip_clone: true
 
 steps:

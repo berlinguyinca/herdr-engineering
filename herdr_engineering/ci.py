@@ -178,6 +178,7 @@ class CIProviderError(UnreachableError):
             "permission": "CI account lacks permission for this resource.",
             "rate_limited": "CI request rate limit reached; retry later.",
             "not_found": "CI resource was not found.",
+            "run_not_found": "CI run was not found; the repository is reachable.",
             "timeout": "CI request timed out.",
             "redirect": "CI redirected the API request; check the configured endpoint and proxy access.",
             "invalid_response": "CI returned an invalid API response.",
@@ -471,7 +472,18 @@ class WoodpeckerProvider:
             return None
         rid = self._repo_id(repository)
         number = _positive_id(number)
-        data = self._get(f"/api/repos/{rid}/pipelines/{number}")
+        try:
+            data = self._get(f"/api/repos/{rid}/pipelines/{number}")
+        except CIProviderError as exc:
+            if exc.reason != "not_found":
+                raise
+            # A 404 names the run only if the repository itself answers; otherwise (deleted or re-created
+            # repo, lost access, wrong base URL, proxy) it stays the generic, retriable not_found.
+            try:
+                self._get(f"/api/repos/{rid}")
+            except CIProviderError:
+                raise exc from None
+            raise CIProviderError("run_not_found", exc.status_code) from None
         if not isinstance(data, dict):
             raise CIProviderError("invalid_response")
         tasks = []

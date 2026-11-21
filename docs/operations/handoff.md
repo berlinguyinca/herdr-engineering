@@ -119,6 +119,12 @@ path and not the upstream checkout:
   of starting a second pane, and closes the source now that git reports it clean.
 * `status: launch_unconfirmed` or `launch_failed` — the close was refused and both panes remain up;
   nothing was destroyed. Report it rather than re-running the command to force it.
+* Takeover gave up waiting (`--confirm-timeout`) — since herdr-handoff 0.5.1 the successor's later
+  `herdr-handoff confirm` closes the source through the same gate (unpushed commits, a dirty worktree or
+  another tab refuse). Its JSON reports `close` (`source_closed`, `already_closed`, `refused`,
+  `not_attempted`), `source_closed`, `reason` and `source_closed_at`, and it exits 0 whenever the
+  confirmation is recorded. It never closes after `--keep-source`, for a 0.5.0-written record, with no
+  source pane recorded, or while a takeover holds the lock.
 * `status: source_close_failed` — the handoff completed and herdr refused the close; report it.
 
 Untracked files (`.claude/`, `.venv/`, build output) do not refuse a close: they appear in almost every

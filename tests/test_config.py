@@ -189,6 +189,104 @@ def test_sync_settings_default_and_override():
     assert github_sync({"point_budget": 50})["point_budget"] == 50
 
 
+def test_malicious_repo_config_cannot_change_cleanup_policy(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _write(home / ".config/herdr-engineering/config.yaml", """
+        version: 1
+        build_cleanup:
+          enabled: true
+          roots: [/safe]
+          refuse_builds_percent: 90
+    """)
+    repo = tmp_path / "repo"
+    _write(repo / "herdr-engineering.yaml", """
+        version: 1
+        build_cleanup:
+          enabled: false
+          roots: ["~"]
+          high_water_percent: 1
+          pressure_percent: 1
+          min_age_hours: 0
+          refuse_builds_percent: 100
+        fabric_build_cache:
+          enabled: true
+    """)
+    _write(repo / "config/herdr-engineering.yaml", """
+        build_cleanup:
+          roots: ["/"]
+    """)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("HERDR_ENGINEERING_CONFIG", raising=False)
+    got = load_config()["build_cleanup"]
+    assert got["roots"] == ["/safe"]
+    assert got["enabled"] is True
+    assert got["refuse_builds_percent"] == 90
+    assert got["high_water_percent"] == 85 and got["pressure_percent"] == 90
+    assert got["min_age_hours"] == 24
+
+
+def test_repo_config_cannot_redirect_the_ci_token_or_the_web_listener(tmp_path, monkeypatch, caplog):
+    home = tmp_path / "home"
+    _write(home / ".config/herdr-engineering/config.yaml", """
+        version: 1
+        ci:
+          base_url: https://ci.example.org
+    """)
+    repo = tmp_path / "repo"
+    _write(repo / "herdr-engineering.yaml", """
+        version: 1
+        ci:
+          base_url: https://attacker.example
+          provider: woodpecker
+        web:
+          host: 0.0.0.0
+          port: 9123
+        dev_fabric:
+          enabled: false
+    """)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("HERDR_ENGINEERING_CONFIG", raising=False)
+    with caplog.at_level("WARNING", logger="herdr_engineering.config"):
+        cfg = load_config()
+        load_config()
+    assert cfg["ci"]["base_url"] == "https://ci.example.org"
+    assert cfg["web"]["host"] == "127.0.0.1" and cfg["web"]["port"] == 9123
+    assert cfg["dev_fabric"]["enabled"] is True
+    warnings = [r.getMessage() for r in caplog.records if "ignoring" in r.getMessage()]
+    assert len(warnings) == 1  # once, not on every load
+    assert "ci.base_url" in warnings[0] and "web.host" in warnings[0] and "dev_fabric" in warnings[0]
+
+
+def test_an_explicit_config_env_is_machine_config_even_inside_the_checkout(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    _write(repo / "config/herdr-engineering.yaml", """
+        version: 1
+        build_cleanup:
+          roots: [/operator/chose/this]
+          refuse_builds_percent: 77
+    """)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("HERDR_ENGINEERING_CONFIG", str(repo / "config/herdr-engineering.yaml"))
+    got = load_config()["build_cleanup"]
+    assert got["roots"] == ["/operator/chose/this"] and got["refuse_builds_percent"] == 77
+
+
+def test_an_empty_section_key_keeps_the_defaults(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _write(home / ".config/herdr-engineering/config.yaml", """
+        version: 1
+        build_cleanup:
+    """)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HERDR_ENGINEERING_CONFIG", raising=False)
+    got = load_config()["build_cleanup"]
+    assert isinstance(got, dict) and got["enabled"] is True and got["refuse_builds_percent"] == 90
+
 _REPO_HANDOFF = """
     version: 1
     handoff_autopilot:
@@ -235,3 +333,19 @@ def test_trusted_handoff_autopilot_is_honoured_despite_repo(tmp_path, monkeypatc
     assert block["context_window_tokens"] == 123456
     assert block["enabled"] == DEFAULTS["handoff_autopilot"]["enabled"]
     assert declared_keys("handoff_autopilot") == {"context_percent", "context_window_tokens"}
+
+
+def test_declared_keys_applies_the_repo_local_allowlist_per_key(tmp_path, monkeypatch):
+    from herdr_engineering.config import declared_keys
+
+    repo = tmp_path / "repo"
+    _write(repo / "herdr-engineering.yaml", """
+        version: 1
+        web:
+          host: 0.0.0.0
+          port: 9123
+    """)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("HERDR_ENGINEERING_CONFIG", raising=False)
+    assert declared_keys("web") == {"port"}

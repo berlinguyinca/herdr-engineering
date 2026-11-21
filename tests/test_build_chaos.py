@@ -188,7 +188,9 @@ def _shared_section(tmp: Path, port: int, *, use_ssl: bool = True) -> dict:
         """))
     creds = _private(tmp / "reg/creds.yaml",
                      f"access_key_id: AKIACHAOS0000\nsecret_access_key: '{SECRET}'\n")
-    return {"enabled": True, "mode": "shared_cache",
+    # min_free_disk_percent 0: the cache is refused ("low_free_disk") on a host whose disk is nearly full, which made these tests
+    # depend on the free space of whatever machine ran them (a 99%-full workstation failed 3 of them; test_cargo_host does the same).
+    return {"enabled": True, "mode": "shared_cache", "local": {"min_free_disk_percent": 0},
             "shared_cache": {"enabled": True, "endpoint_ref": "build-cache",
                              "registry_file": str(reg), "credentials_file": str(creds)}}
 
@@ -206,12 +208,6 @@ def _cargo_project(root: Path, name="project", age_h=48) -> Path:
     for path in [*t.iterdir(), t]:
         os.utime(path, (stamp, stamp))
     return t
-
-
-@pytest.fixture(autouse=True)
-def _no_proc_scan(monkeypatch):
-    # Same neutralisation as test_build_cleanup*.py: only registry/lock guards decide here.
-    monkeypatch.setattr(cleanup, "_process_paths", lambda: [])
 
 
 def _wait_for(cond, timeout=15.0, step=0.05):
@@ -627,9 +623,10 @@ def test_sigkilled_record_wrapper_lease_expiry_reconcile_cleanup_and_fencing(tmp
         assert child != wrapper.pid and scope == str(work.resolve())
         assert br.active_scopes(gates) == [scope]
 
-        # (a) lease live + maintenance lock held by the build: cleanup/eviction refuse, delete nothing
+        # (a) lease live + maintenance lock held by the build: eviction refuses; a sweep shares the lock,
+        # so it runs, and the live lease keeps it from deleting anything
         res = cleanup.run_once([root], gates, **FORCE)
-        assert res["status"] == "busy" and res["removed"] == [] and target.exists()
+        assert res["status"] != "error" and res["removed"] == [] and target.exists()
         ev = policy.run_eviction(_evict_cfg(), gates, apply=True)
         assert ev["status"] == "busy"
 
@@ -637,7 +634,8 @@ def test_sigkilled_record_wrapper_lease_expiry_reconcile_cleanup_and_fencing(tmp
         os.kill(wrapper.pid, signal.SIGKILL)
         assert wrapper.wait(timeout=10) == -signal.SIGKILL
         assert br.pid_alive(child)
-        assert cleanup.run_once([root], gates, **FORCE)["status"] == "busy"
+        res = cleanup.run_once([root], gates, **FORCE)
+        assert res["status"] != "error" and res["removed"] == [] and target.exists()
 
         # (c) lease expires (time travel only on the READER's clock); owner still alive -> untouched
         later = lambda: time.time() + 3600  # noqa: E731
@@ -849,9 +847,11 @@ def test_rollback_rehearsal_returns_to_legacy_exec_path(tmp_path):
     on_status = _cli(["--status", "--json"], on_state, tmp_path, cfg=cfg_on, bin_=bin_)
     assert on_status.returncode == 0 and "slot_suggestion" in json.loads(on_status.stdout)
 
-    # --- legacy baseline: no config at all
+    # --- legacy baseline: the section is on by default now, so the operator opts out explicitly
     base_state = tmp_path / "base"
-    rb = _cli(["--max-load", "0", "--", "cargo", "build", "3"], base_state, tmp_path, bin_=bin_)
+    cfg_base = _write_cfg(tmp_path / "base.yaml", {"enabled": False})
+    rb = _cli(["--max-load", "0", "--", "cargo", "build", "3"], base_state, tmp_path,
+              cfg=cfg_base, bin_=bin_)
     assert rb.returncode == 3
     legacy = _tree(base_state / "build-gates")
     assert not {"builds.jsonl", "build-registry.db", "sccache"} & legacy
@@ -860,7 +860,7 @@ def test_rollback_rehearsal_returns_to_legacy_exec_path(tmp_path):
     # --- rollback variants: flag flipped off, section removed, section commented to {}
     off_section = {**section, "enabled": False}
     variants = {"flag_off": _write_cfg(tmp_path / "off.yaml", off_section),
-                "section_removed": _write_cfg(tmp_path / "gone.yaml", None)}
+                "section_disabled": _write_cfg(tmp_path / "gone.yaml", {"enabled": False})}
     for name, cfg in variants.items():
         state = tmp_path / f"rb-{name}"
         seen = tmp_path / f"seen-{name}.env"
