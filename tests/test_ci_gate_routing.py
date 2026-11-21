@@ -90,6 +90,11 @@ def applicability(repo: Path, sha: str, event: str = "pull_request", base: str =
     "deploy/control-plane/deploy.sh",        # the deploy scripts the suite exercises
     "pyproject.toml",                        # dependency and pytest config
     ".woodpecker/unit-gates.yml",            # the routing config
+    ".woodpecker/unit-gates-main.yml",
+    ".woodpecker/structural-gates.yml",
+    ".woodpecker/artifact-handoff.yml",
+    "scripts/ci-pipeline-freshness.sh",      # not under scripts/ci/
+    "scripts/ci/integrate-main.sh",
 ])
 def test_a_change_that_can_affect_the_suite_runs_it(repo, path):
     result = applicability(repo, change(repo, path))
@@ -372,7 +377,7 @@ def test_ui_gates_is_no_longer_path_filtered():
 
 def test_ui_gates_skip_is_reported_rather_than_silently_absent():
     steps = {s["name"]: s for s in yaml.safe_load(UI_GATES_YML)["steps"]}
-    assert list(steps) == ["checkout", "freshness", "applicability", "ui-gates"]
+    assert list(steps) == ["checkout", "freshness", "integrate-main", "applicability", "ui-gates"]
     applicability_cmds = steps["applicability"]["commands"]
     assert "rc=0; bash scripts/ci/unit-gates-applicable.sh ui || rc=$?" in applicability_cmds
     # the marker is touched only on rc 3; any other non-zero rc fails the step instead of skipping

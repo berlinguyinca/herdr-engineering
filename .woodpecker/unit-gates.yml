@@ -4,6 +4,9 @@
 # credential, pull_request and manual only (a push to a PR branch must not build twice). The step logic lives in the script so
 # `bash scripts/ci/unit-gates.sh` reproduces CI from a clean checkout. The browser (Playwright) suites stay in ui-gates.yml.
 #
+# On a pull request, the integrate-main step merges current main into the PR head before the gates run, so green means "PR + main".
+# The push-to-main run of the same suite is unit-gates-main.yml.
+#
 # Whole suites, not scoped subsets; nothing is deselected. Green on the hive exec host (Python 3.13) once the host-dependent
 # tests were made host-independent. Still timing-sensitive under load: test_ci_api.py's telemetry race and a few fabric tests.
 # To use the larger hive pool, add `labels: {cluster: hive}` (queues are long, 10+ minutes).
@@ -50,6 +53,12 @@ steps:
     commands:
       - 'set -eu'
       - 'bash scripts/ci-pipeline-freshness.sh'
+
+  - name: integrate-main
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'bash scripts/ci/integrate-main.sh'
 
   # exit 0 = run the suite, 3 = nothing covered changed, anything else = fail the pipeline. It fails open: a guard that cannot
   # work out the diff runs the suite rather than handing back a green it did not earn.
