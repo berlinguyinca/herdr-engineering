@@ -2,6 +2,7 @@
 on PATH (nothing real is ever built, started or contacted)."""
 import json
 import os
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -376,12 +377,20 @@ def test_compose_runs_every_app_service_on_the_deploy_tag():
     assert collab["services"]["collab-public"]["image"] == "herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}"
 
 
+def test_deploy_rolls_the_gateway_and_herdr_web_with_the_app_services():
+    text = (ROOT / "deploy/control-plane/deploy.sh").read_text()
+    rolled = re.search(r"^APP_SERVICES=\(([^)]*)\)", text, re.M).group(1).split()
+    assert "fabric-gateway" in rolled and "herdr-web" in rolled
+    # health checks look the container up by name; the gateway's differs from its service name
+    assert "fabric-gateway) echo herdr-fabric-gateway" in text
+
+
 def test_deploy_recreates_web_worker_and_proxy_on_one_tag(env):
     env["env"]["FAIL_COMPOSE"] = "1"
     deploy(env)
     log = env["log"].read_text().splitlines()
     up = [ln for ln in log if ln.startswith("docker compose") and " up " in ln]
-    assert up and up[0].endswith("up -d --no-deps --no-build control-plane-web control-plane-worker llm-proxy")
+    assert up and up[0].endswith("up -d --no-deps --no-build control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web")
     sha = _head()
     assert any(ln.startswith("composeenv ") and f" tag={sha} " in ln for ln in log)
     assert any(ln.startswith("docker build") and f"herdr-engineering:{sha}" in ln for ln in log)
