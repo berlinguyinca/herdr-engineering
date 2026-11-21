@@ -170,7 +170,7 @@ class SnapshotWriter:
         ``hydrate`` replays in (receive time, per-session sequence) order, not fabric-sequence order. Pages are in
         fabric-sequence order, so feeding them one by one (``hydrate_delta``) is exactly a full replay only while each
         page's order keys do not precede what earlier pages consumed. The first page that does (``SnapshotStale``)
-        abandons the streaming pass and replays the whole log in one ``hydrate``, as before."""
+        abandons the streaming pass for :meth:`_replay_in_order`."""
         self._shadow = shadow = self._make_store()
         fetched = 0
         try:
@@ -180,9 +180,7 @@ class SnapshotWriter:
         except SnapshotStale as exc:
             log.warning("inspector snapshot rebuild is out of replay order across pages (%s); replaying the log in one pass", exc)
             self._shadow = shadow = self._make_store()
-            events = await self._fetch(conn, -1)
-            await asyncio.to_thread(shadow.hydrate, events)
-            fetched = len(events)
+            fetched = await self._replay_in_order(conn, shadow)
         covered = await conn.fetchval(f"SELECT count(*) FROM fabric_events WHERE {_VALID} AND sequence <= $1 "
                                       "AND ingest_timestamp < now() - make_interval(secs => $2)",
                                       shadow.replay_watermark, self.settle)
@@ -191,6 +189,43 @@ class SnapshotWriter:
             self._shadow = None
             return "rebuild did not match the stored log; nothing written"
         return await self._write(conn, shadow, fetched)
+
+    async def _replay_in_order(self, conn, shadow: InspectorStore) -> int:
+        """Replay the whole log in exact replay order with bounded memory: one pass that reads only each row's order key
+        (about 80 bytes a row, instead of the row), a sort of those keys, then the rows fetched ``_PAGE`` at a time in
+        key order. Ties on the key keep fabric-sequence order, as in the one-shot hydrate. Returns the rows replayed."""
+        keys: list[tuple] = []
+        last = -1
+        while True:
+            page = await conn.fetch(
+                "SELECT sequence, source_timestamp, ingest_timestamp, "
+                "CASE WHEN jsonb_typeof(payload->'_received_at') = 'number' THEN payload->>'_received_at' END AS ra, "
+                "CASE WHEN jsonb_typeof(payload->'_sequence') = 'number' THEN payload->>'_sequence' END AS sq "
+                f"FROM fabric_events WHERE {_VALID} AND sequence > $1 "
+                "AND ingest_timestamp < now() - make_interval(secs => $2) ORDER BY sequence LIMIT $3",
+                last, self.settle, _PAGE)
+            for r in page:
+                probe = {"sequence": int(r["sequence"]), "source_timestamp": r["source_timestamp"],
+                         "ingest_timestamp": r["ingest_timestamp"],
+                         "payload": {"_received_at": float(r["ra"]) if r["ra"] is not None else None,
+                                     "_sequence": float(r["sq"]) if r["sq"] is not None else None}}
+                recv, seq = shadow._replay_order(probe)
+                keys.append((recv, seq, probe["sequence"]))
+            if len(page) < _PAGE:
+                break
+            last = int(page[-1]["sequence"])
+        keys.sort()
+        replayed = 0
+        for lo in range(0, len(keys), _PAGE):
+            wanted = [k[2] for k in keys[lo:lo + _PAGE]]
+            rows = await conn.fetch(f"SELECT {_COLUMNS} FROM fabric_events WHERE {_VALID} AND sequence = ANY($1::bigint[])",
+                                    wanted)
+            streams, _ = _rebuild_events([dict(r) for r in rows])
+            by_seq = {e["sequence"]: e for stream in streams.values() for e in stream}
+            batch = [by_seq[q] for q in wanted if q in by_seq]
+            await asyncio.to_thread(shadow.hydrate, batch)
+            replayed += len(batch)
+        return replayed
 
     async def _row_pages(self, conn, after: int):
         """Raw inspector rows newer than ``after``, ``_PAGE`` rows at a time, in fabric-sequence order."""

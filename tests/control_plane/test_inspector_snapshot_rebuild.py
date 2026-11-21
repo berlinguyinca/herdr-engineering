@@ -140,3 +140,75 @@ def test_rebuild_with_rows_out_of_replay_order_across_pages_still_equals_the_ful
     assert outcome.startswith("written")
     reference = full_replay(rows, ingest)
     assert canon(writer._shadow.export_state()) == canon(reference.export_state())
+
+
+class Clock:
+    """A strictly increasing fake clock for the live store that writes the journal."""
+
+    def __init__(self):
+        self.now = T0
+
+    def __call__(self):
+        self.now += 0.01
+        return self.now
+
+
+async def _insert_journal(conn, journal, start):
+    for i, ev in enumerate(journal[start:], start=start):
+        stamp = datetime.fromtimestamp(ev["payload"].get("_received_at", T0), UTC)
+        await conn.execute(INSERT, f"jid-{i}", i + 1, ev["event_type"], ev["entity_id"], json.dumps(ev["payload"]),
+                           datetime.fromisoformat(ev["source_timestamp"]), stamp)
+
+
+def _tool(call, phase, **extra):
+    return {"events": [{"kind": "tool", "call_id": call, "tool": "bash", "phase": phase, **extra}]}
+
+
+def _late_update_journal(trigger):
+    """A long-running tool whose last update is held back while other sessions keep journaling; ``trigger`` releases it."""
+    journal: list[dict] = []
+    live = InspectorStore(limits=LIMITS, persist=journal.append, clock=Clock())
+    live.ingest("sA", _tool("c1", "start", args_preview="make"))
+    live.ingest("sA", _tool("c1", "update", output="partial output"))
+    for i in range(30):
+        live.ingest("sB", {"events": [{"kind": "message", "role": "user", "text": f"hello {i}"}]})
+    cut = len(journal)
+    trigger(live)
+    return journal, cut
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("trigger", [
+    lambda live: live.ingest("sA", _tool("c1", "end")),                          # end row that does not carry the output
+    lambda live: live.ingest("sA", {"events": [{"kind": "lifecycle", "phase": "interrupted"}]}),
+    lambda live: [live.ingest("sA", {"events": [{"kind": "message", "role": "user", "text": f"m{i}"}]}) for i in range(30)],
+], ids=["end", "lifecycle", "ring-eviction"])
+def test_a_deferred_tool_update_written_after_the_cursor_does_not_force_a_rebuild(tmp_path, caplog, trigger):
+    asyncpg = pytest.importorskip("asyncpg")
+    journal, cut = _late_update_journal(trigger)
+    assert len(journal) > cut + 1                       # the held update was journaled with the row that released it
+    fabric = tmp_path / "fabric.sql"
+    fabric.write_text(FABRIC)
+    with private_postgres(fabric, MIGRATIONS / "0030_inspector_snapshots.sql", INDEX_MIGRATION) as dsn:
+        if dsn is None:
+            pytest.skip("no postgres binaries")
+
+        async def scenario():
+            conn = await asyncpg.connect(dsn)
+            try:
+                await _insert_journal(conn, journal[:cut], 0)
+                writer = snap.SnapshotWriter(make_store, interval=0, settle=-10**9)
+                await writer.tick(conn)
+                shadow = writer._shadow
+                await _insert_journal(conn, journal, cut)
+                with caplog.at_level("WARNING"):
+                    await writer.tick(conn)
+                return writer, shadow
+            finally:
+                await conn.close()
+
+        writer, first_shadow = asyncio.run(scenario())
+    assert "restarts from the full log" not in caplog.text and writer._shadow is first_shadow
+    full = make_store()
+    full.hydrate([{**e, "sequence": i + 1, "ingest_timestamp": None} for i, e in enumerate(journal)])
+    assert canon(writer._shadow.export_state()) == canon(full.export_state())
