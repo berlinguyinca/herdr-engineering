@@ -222,7 +222,7 @@ class _Session:
                  "dropped_ring", "client_dropped", "seen", "capabilities",
                  "assoc", "models", "usage_totals", "usage_latest", "last_event",
                  "last_ingest", "ended", "prefs", "tools", "tests", "subs",
-                 "evicted_to", "tool_pending", "tool_carry")
+                 "evicted_to", "tool_pending", "tool_carry", "last_durable")
 
     def __init__(self, session_id: str):
         self.session_id = session_id
@@ -251,6 +251,7 @@ class _Session:
         # Journal suppression (journal_suppression.py): per live call_id, the latest tool update not yet journaled, and what
         # the journaled rows of the call already established. Process-local; never part of a snapshot.
         self.tool_pending: dict[str, dict] = {}
+        self.last_durable: tuple[float, int, int] | None = None   # (_received_at, _sequence, ingest number) last journaled
         self.tool_carry: dict[str, dict] = {}
 
 
@@ -322,6 +323,7 @@ class InspectorStore:
         self._replay_key: tuple | None = None
         self._replay_watermark = -1
         self._replay_count = 0
+        self._ingest_n = 0      # counts ingest() calls, so a flush can tell whether the row that caused it was just journaled
 
     def export_checkpoint(self) -> dict:
         """Explicit JSON state; indexes encode references, never duplicate entries.
@@ -556,6 +558,7 @@ class InspectorStore:
                 raise TypeError("admission must be a private AdmissionContext")
             if admission.entity_id != session_id:
                 raise ValueError("admission session mismatch")
+        self._ingest_n += 1
         events = payload.get("events") if isinstance(payload, dict) else None
         if events is None:
             events = [payload]
@@ -888,6 +891,7 @@ class InspectorStore:
                         "event_id": base["event_id"], "kind": kind, "sensitive": flagged,
                         **flags, "_received_at": self._clock(), "_sequence": sess.rev},
         }
+        sess.last_durable = (durable["payload"]["_received_at"], durable["payload"]["_sequence"], self._ingest_n)
         if kind == "tool" and self._journal.inspector_tool_updates:
             if not self._defer_tool_update(sess, durable):
                 self._write_durable(sess, durable)
@@ -953,6 +957,7 @@ class InspectorStore:
             del sess.tool_pending[cid]                      # the end row replays to the same entry
             return False
         del sess.tool_pending[cid]
+        self._stamp_held(held, p["_received_at"], p["_sequence"])      # replays in the slot it is written in
         self._write_durable(sess, held)                     # before the row that follows it
         return False
 
@@ -969,9 +974,19 @@ class InspectorStore:
             return False
         return all(not update.get(k) or carry[k] or end.get(k) for k in ("sensitive", "redacted", "truncated"))
 
+    @staticmethod
+    def _stamp_held(held: dict, received_at: float, sequence: int) -> None:
+        """Give a held-back update the replay key of the moment it is journaled. It was stamped when the update arrived,
+        possibly long before other sessions' rows; written late with that old key it orders before a snapshot cursor that
+        has since moved on, and every such row forced a full snapshot rebuild. Replay order for the call is unchanged
+        (the update still replays after its start row and before the row that released it); only its place among
+        unrelated rows of the same session between those two moves."""
+        held["payload"]["_received_at"], held["payload"]["_sequence"] = received_at, sequence
+
     def _flush_tool_updates(self, sess: _Session, *, safe: bool = False) -> None:
         pending, sess.tool_pending = sess.tool_pending, {}
         for held in pending.values():
+            self._stamp_held(held, self._clock(), sess.rev)     # the lifecycle row that follows is stamped later or equal
             self._write_durable(sess, held, safe=safe)
 
     def _repeats_zero_usage(self, sess: _Session, data: dict) -> bool:
@@ -1112,6 +1127,11 @@ class InspectorStore:
             cid = old["data"]["call_id"]
             held = sess.tool_pending.pop(cid, None)
             if held is not None:
+                last = sess.last_durable
+                if last is not None and last[2] == self._ingest_n:     # the row that evicted it was just journaled: replay before it
+                    self._stamp_held(held, last[0] - 1e-6, last[1])
+                else:
+                    self._stamp_held(held, self._clock(), sess.rev)
                 self._write_durable(sess, held, safe=True)      # a call leaving the ring keeps its last update
             sess.tool_carry.pop(cid, None)
             del sess.tools[cid]
