@@ -605,6 +605,17 @@ def test_cargo_recognition_is_revalidated_before_removal(tree: Tree) -> None:
     assert (candidate.path / "unique.txt").exists()
 
 
+def test_cargo_new_build_dir_layout_is_recognized_without_rustc_info(tree: Tree) -> None:
+    """Cargo 1.100 moved fingerprints to build/<package>/<hash>/fingerprint."""
+    from herdr_engineering.scratch_reaper import Kind, _discover
+
+    package = tree[1] / "rust-package"
+    (package / "target/debug/build/fixture/0123456789abcdef/fingerprint").mkdir(parents=True)
+    (package / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="0.1.0"\n')
+    found = [c for c in _discover(tree[0]) if c.path == package / "target"]
+    assert [c.kind for c in found] == [Kind.CARGO]
+
+
 @pytest.mark.integration
 def test_native_cargo_output_is_removed_while_dirty_source_and_cli_evidence_survive(
     tmp_path: Path,

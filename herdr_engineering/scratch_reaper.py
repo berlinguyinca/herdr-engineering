@@ -343,6 +343,34 @@ def _swift_declared(path: Path) -> bool:
     return False
 
 
+def _cargo_fingerprint_dir(profile: Path) -> bool:
+    """Cargo keeps fingerprints in `.fingerprint` (<= 1.99) or, with the new build-dir
+    layout (1.100+), in `build/<package>/<hash>/fingerprint`."""
+    if (profile / ".fingerprint").is_dir():
+        return True
+    try:
+        with os.scandir(profile / "build") as packages:
+            for package in packages:
+                if not package.is_dir(follow_symlinks=False):
+                    continue
+                with os.scandir(package.path) as units:
+                    if any(
+                        (Path(unit.path) / "fingerprint").is_dir()
+                        for unit in units
+                        if unit.is_dir(follow_symlinks=False)
+                    ):
+                        return True
+    except OSError:
+        return False
+    return False
+
+
+def _cargo_markers(path: Path) -> bool:
+    return (path / ".rustc_info.json").is_file() or any(
+        _cargo_fingerprint_dir(path / mode) for mode in ("debug", "release")
+    )
+
+
 def _recognized(path: Path) -> tuple[Kind, list[Path], Path | None] | None:
     source = _derived_source(path)
     if source is not None:
@@ -354,9 +382,7 @@ def _recognized(path: Path) -> tuple[Kind, list[Path], Path | None] | None:
         if components:
             return Kind.XCODE, components, source
     if path.name == "target" and (path.parent / "Cargo.toml").is_file():
-        if (path / ".rustc_info.json").is_file() or any(
-            (path / mode / ".fingerprint").is_dir() for mode in ("debug", "release")
-        ):
+        if _cargo_markers(path):
             return Kind.CARGO, [path], path.parent
     if _swift_state(path) and _swift_declared(path):
         components = [
@@ -502,10 +528,7 @@ def _has_edits(value: object) -> bool:
 
 def _format_reason(candidate: Candidate, path: Path) -> str | None:
     if candidate.kind is Kind.CARGO:
-        markers = (path / ".rustc_info.json").is_file() or any(
-            (path / mode / ".fingerprint").is_dir() for mode in ("debug", "release")
-        )
-        if not (candidate.path.parent / "Cargo.toml").is_file() or not markers:
+        if not (candidate.path.parent / "Cargo.toml").is_file() or not _cargo_markers(path):
             return "changed_format"
     elif candidate.kind is Kind.SWIFT:
         if not _swift_state(candidate.anchor) or not _swift_declared(candidate.anchor):
