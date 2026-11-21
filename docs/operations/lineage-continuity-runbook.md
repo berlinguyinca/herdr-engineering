@@ -348,3 +348,4 @@ Operator steps (run by you, on the host that will anchor, ideally NOT the contro
    `systemctl start herdr-audit-anchor.service` once and check the journal, then `systemctl start herdr-audit-verify.service`
    (expect `ok`), then `systemctl enable --now herdr-audit-anchor.timer herdr-audit-verify.timer`.
 7. Roll back: `systemctl disable --now` both timers. The anchor file is evidence; keep it (removing it needs `chattr -a`).
+
