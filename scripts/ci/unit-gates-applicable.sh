@@ -50,8 +50,15 @@ scripts/ci/integrate-main.sh'
 tests/playwright/
 tests/visual/
 docs/assets/screenshots/
-herdr_engineering/control_plane/'
+herdr_engineering/control_plane/
+herdr_artifact_host/member_static/
+herdr_artifact_host/share_static/
+schemas/
+playwright.'
     COVERED_FILES='scripts/ci/ui-gates.sh
+eslint.communications.config.mjs
+eslint.scratch.config.mjs
+tsconfig.communications.json
 scripts/ci-pipeline-freshness.sh
 package.json
 package-lock.json

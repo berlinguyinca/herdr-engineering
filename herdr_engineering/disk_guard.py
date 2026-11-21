@@ -85,6 +85,12 @@ def last_blocked(state_dir: Path) -> str:
     return reason if isinstance(reason, str) else ""
 
 
+def last_unsearched(state_dir: Path) -> str:
+    """Why the last sweep did not look at the home directory ('' when it did)."""
+    reason = _read_stamp(state_dir).get("unsearched")
+    return reason if isinstance(reason, str) else ""
+
+
 def _wait_for_other_sweep(state_dir: Path, seconds: float) -> None:
     """Block (bounded) until the sweep that holds ``build-cleanup.lock`` finishes."""
     try:
@@ -134,7 +140,7 @@ def relieve(cleanup_cfg: Mapping, state_dir: Path, at_percent: float,
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         device = os.stat(_existing(probe)).st_dev if probe is not None else None
-        result = run_once(roots=roots, state_dir=state_dir, only_device=device, **kwargs)
+        result = run_once(roots=roots, state_dir=state_dir, only_device=device, discovery="cache_only", **kwargs)
     except OSError:
         return None  # a full disk can fail the sweep itself: nothing ran, so no cooldown starts
     if result.get("status") == "busy":  # another sweep is running: its result is what we need
@@ -144,6 +150,9 @@ def relieve(cleanup_cfg: Mapping, state_dir: Path, at_percent: float,
     stamp: dict[str, object] = {"triggered_at": now}
     if result.get("aborted"):  # the sweep itself failed: back off briefly (a persistent cause must not
         stamp["aborted"] = str((result.get("errors") or ["unknown"])[0])[:300]  # become a sweep storm)
+    unsearched = [item for item in result.get("skipped") or [] if str(item.get("reason", "")).startswith("home directory not searched")]
+    if unsearched:  # the refusal says why the home projects were not looked at
+        stamp["unsearched"] = unsearched[0]["reason"]
     blocked = result.get("blocked") or []
     if blocked:  # why the cleanup could not free what it found, for the refusal message
         stamp["blocked"] = f"{blocked[0]['path']}: {blocked[0]['reason']}"[:600]
@@ -185,5 +194,6 @@ def check_build_allowed(path: Path, cleanup_cfg: Mapping, state_dir: Path,
         f"{floor_gib:g} GiB): refusing to start a new build. "
         + (f"The last cleanup could not run: {aborted}. " if aborted else "")
         + (f"The last cleanup left a target alone, in use ({last_blocked(state_dir)}). " if last_blocked(state_dir) else "")
+        + (f"Not searched: {last_unsearched(state_dir)}. " if last_unsearched(state_dir) else "")
         + f"Free space (herdr-eng build-cleanup run) or set {OVERRIDE_ENV}=1 to build anyway.",
         cleanup_ran=ran)
