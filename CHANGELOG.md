@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### CI: ui-gates covered-path list widened and locked by structural tests
+
+- `ui-gates` already always reports (no `when: path`, `applicability` step, #719/#901 pattern), so the required `ci/woodpecker/pr/ui-gates` context cannot hang; what was left was drift. The `ui` list in `scripts/ci/unit-gates-applicable.sh` now also covers `herdr_artifact_host/member_static/`, `herdr_artifact_host/share_static/`, `schemas/`, the root `playwright.*` configs, `eslint.*.config.mjs` and `tsconfig.communications.json`, so a change to those runs the heavy Playwright steps instead of getting a skip-green.
+- `tests/test_ci_gate_routing.py` asks the real script's matcher (no copy of the list) whether every tracked UI source, root browser-test config, helper script sourced by `ui-gates.sh` and file named by the `test:ui-gates` npm script is covered, so adding a UI tree without listing it fails the structural test. `docs/operations/ci-gates.md` states the rule.
 ### Per-target size cap and home-wide discovery
 
 - New `build_cleanup.max_target_gb` (default 50, 0 turns it off) and `build_cleanup.size_cap_idle_hours` (default 2, minimum 1): a Cargo target over the cap that has been idle that long is cleaned by the 15-minute sweep, also below `high_water_percent`. The cap is enforced by the sweep alone: no pass runs after a build, and `build-coordinate` and the cargo wrapper are unchanged. It goes through the same checks as the pressure sweep (verified target, git-untracked, leases, per-target process scan, the lock, `cargo clean`); the sweep result names it `size_cap` in the new `reasons` map. Why: on 2026-11-20 beast's disk hit 100% with two checkouts holding 821 GB and 521 GB of stale `target/debug`; the old cleanup acted only at 85% and only under configured roots, and the service was never installed.
