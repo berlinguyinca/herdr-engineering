@@ -29,7 +29,7 @@ def git(cwd: Path, *args: str) -> str:
     return out.stdout.strip()
 
 
-@pytest.mark.parametrize("name", ["unit-gates.yml", "ui-gates.yml"])
+@pytest.mark.parametrize("name", ["unit-gates-shard-1.yml", "unit-gates-shard-2.yml", "unit-gates-shard-3.yml", "ui-gates.yml"])
 def test_concurrency_group_uses_woodpecker_variables(name: str) -> None:
     text = (ROOT / ".woodpecker" / name).read_text()
     group = yaml.safe_load(text)["concurrency"]["group"]
