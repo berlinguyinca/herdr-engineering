@@ -17,6 +17,11 @@ HARNESS_DIRS = ("codex", "claude", "pi", "opencode")
 # satisfies an existence check and cannot honour a takeover close.
 CLI_COMMANDS = ("create", "launch", "takeover", "confirm")
 
+# `takeover --direction` arrived in herdr-handoff 0.5.0 and 0.4.0 has no other marker: it offers every
+# command above.  Checked in `takeover --help` and reported under this key beside the commands.
+TAKEOVER_DIRECTION = "takeover --direction"
+REQUIRED_CAPABILITIES = (*CLI_COMMANDS, TAKEOVER_DIRECTION)
+
 
 @dataclass(frozen=True)
 class HandoffDependencyResult:
@@ -69,14 +74,24 @@ def _probe_cli(path: str) -> tuple[str, dict[str, bool], str]:
     lines = shown.stdout.strip().splitlines()
     if not lines and not help_text.strip():
         return "", {}, "0"
-    return lines[0] if lines else "", {
-        command: _advertises(help_text, command) for command in CLI_COMMANDS}, ""
+    capabilities = {command: _advertises(help_text, command) for command in CLI_COMMANDS}
+    capabilities[TAKEOVER_DIRECTION] = capabilities["takeover"] and _takeover_offers_direction(path)
+    return lines[0] if lines else "", capabilities, ""
+
+
+def _takeover_offers_direction(path: str) -> bool:
+    try:
+        shown = subprocess.run([path, "takeover", "--help"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return shown.returncode == 0 and re.search(
+        r"(?<![\w-])--direction(?![\w-])", shown.stdout + shown.stderr) is not None
 
 
 
 def check_handoff_dependency(*, skill_root: Path | None = None,
                              executable: str | None = "auto",
-                             required_commands: Sequence[str] = CLI_COMMANDS
+                             required_commands: Sequence[str] = REQUIRED_CAPABILITIES
                              ) -> HandoffDependencyResult:
     root = Path(skill_root or Path.home() / ".codex" / "skills" / ".." / "..").expanduser()
     if skill_root is None:
@@ -109,6 +124,8 @@ def check_handoff_dependency(*, skill_root: Path | None = None,
         if absent:
             problems.append(f"CLI: {resolved} ({version or 'version unknown'}) does not provide "
                             + ", ".join(absent)
+                            + (" (herdr-handoff 0.5.0 or newer is needed)"
+                               if TAKEOVER_DIRECTION in absent else "")
                             + " - refresh the pinned dependency with scripts/install-handoff.sh")
     if problems:
         return HandoffDependencyResult("fail", "; ".join(problems), [], resolved, version, capabilities)

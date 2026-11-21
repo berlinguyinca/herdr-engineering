@@ -238,6 +238,10 @@ class MemberSettings:
     directory_snapshot: Callable[[], DirectorySnapshot | None] = lambda: (
         None
     )  # housekeeping's evidence
+    # Optional own origin for the member UI; requests arriving on that Host get it in place of ``public_origin``.
+    member_host: str | None = None
+    member_origin: str | None = None
+    member_page_csp: str = ""
 
 
 def synced_lookup(directory: SyncedDirectory, required: bool) -> Callable[[str], list[str] | None]:
@@ -1687,6 +1691,19 @@ class MemberSurface:
             settings.limits.session_exchanges_global_per_minute, now, max_keys=1
         )
 
+    def on_member_host(self, request: web.Request) -> bool:
+        """True when the request names the dedicated member host (exactly one Host header)."""
+        member = self.s.member_host
+        if member is None:
+            return False
+        hosts = request.headers.getall("Host", [])
+        # exact as sent (nginx forwards $http_host unchanged), like member_web.py: no case folding on the member origin
+        return len(hosts) == 1 and hosts[0].strip() in (member, member + ":443")
+
+    def _origin(self, request: web.Request) -> str:
+        member = self.s.member_origin
+        return member if member and self.on_member_host(request) else self.s.public_origin
+
     @staticmethod
     def owns(raw_path: str) -> bool:
         path = raw_path.split("?", 1)[0]
@@ -1741,16 +1758,16 @@ class MemberSurface:
             raise MemberError(405, "method_not_allowed", "method not allowed")
         if method not in ("GET", "HEAD"):
             origins = request.headers.getall("Origin", [])
-            if len(origins) != 1 or origins[0] != self.s.public_origin:
+            if len(origins) != 1 or origins[0] != self._origin(request):
                 raise MemberError(403, "forbidden", "forbidden")
         if method in ("GET", "HEAD") and path in self.s.assets:
-            return self._static(path)
+            return self._static(request, path)
         segs = path.strip("/").split("/")
         if segs[:2] != ["api", "member"] or any(s in ("", ".", "..") for s in segs):
             return self.not_found()
         rest = segs[2:]
         if method == "GET" and rest == ["config"]:
-            return self._config()
+            return self._config(request)
         if method == "POST" and rest == ["session"]:
             return await self._session(request)
         actor = await self._authenticate(request)
@@ -1758,7 +1775,7 @@ class MemberSurface:
 
     # -- public routes
 
-    def _static(self, path: str) -> web.Response:
+    def _static(self, request: web.Request, path: str) -> web.Response:
         body, ctype = self.s.assets[path]
         headers = {
             "Content-Type": ctype,
@@ -1769,18 +1786,22 @@ class MemberSurface:
             "Server": "herdr-share",
         }
         if ctype == _HTML:
-            headers["Content-Security-Policy"] = self.s.page_csp
+            on_member = self._origin(request) != self.s.public_origin
+            headers["Content-Security-Policy"] = (
+                self.s.member_page_csp if on_member else self.s.page_csp
+            )
         return web.Response(status=200, body=body, headers=headers)
 
-    def _config(self) -> web.Response:
+    def _config(self, request: web.Request) -> web.Response:
         s = self.s
+        origin = self._origin(request)
         return self._json(
             200,
             {
                 "cognito_domain": s.cognito_origin,
                 "client_id": s.client_id,
-                "redirect_uri": f"{s.public_origin}/my/callback",
-                "logout_uri": f"{s.public_origin}/",
+                "redirect_uri": f"{origin}/my/callback",
+                "logout_uri": f"{origin}/",
                 "chunk_bytes": CHUNK_BYTES,
                 "max_upload_bytes": MAX_UPLOAD_BYTES,
                 "run_chunks": MAX_UPLOAD_BYTES // CHUNK_BYTES,
@@ -2329,6 +2350,7 @@ def build_member_settings(
     member_static: Path,
     share_static: Path,
     limits: MemberLimits,
+    member_host: str | None = None,
 ) -> MemberSettings:
     directory = SyncedDirectory(str(sync_dir), group)
     authenticator = CognitoAuthenticator(
@@ -2356,15 +2378,19 @@ def build_member_settings(
         ),
     }
     assets = {url: (path.read_bytes(), ctype) for url, (path, ctype) in files.items()}
-    scripts = " ".join(f"{public_origin}{u}" for u in assets if u.endswith(".js"))
-    styles = " ".join(f"{public_origin}{u}" for u in assets if u.endswith(".css"))
     # Exact files, never 'self': the same origin serves member-uploaded bundles (/s/<token>/f/x.js), which a bare
     # 'self' would let an HTML-injection bug load as a script and drive this API.
-    csp = (
-        f"default-src 'none'; script-src {scripts}; style-src {styles}; img-src data:; font-src 'self'; "
-        f"connect-src {public_origin}/api/member/ {cognito_origin}; frame-src 'none'; object-src 'none'; "
-        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-    )
+    def page_csp(origin: str) -> str:
+        scripts = " ".join(f"{origin}{u}" for u in assets if u.endswith(".js"))
+        styles = " ".join(f"{origin}{u}" for u in assets if u.endswith(".css"))
+        return (
+            f"default-src 'none'; script-src {scripts}; style-src {styles}; img-src data:; font-src 'self'; "
+            f"connect-src {origin}/api/member/ {cognito_origin}; frame-src 'none'; object-src 'none'; "
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+        )
+
+    member_origin = f"https://{member_host}" if member_host else None
+    csp = page_csp(public_origin)
     return MemberSettings(
         authenticator=authenticator,
         secret=secret,
@@ -2375,6 +2401,9 @@ def build_member_settings(
         group=group,
         assets=assets,
         page_csp=csp,
+        member_host=member_host,
+        member_origin=member_origin,
+        member_page_csp=page_csp(member_origin) if member_origin else "",
         limits=limits,
         claim_fallback=not sync_required,
         directory_present=lambda: (Path(sync_dir) / "members.json").is_file(),

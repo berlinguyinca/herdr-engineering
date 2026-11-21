@@ -21,6 +21,7 @@ import queue
 import re
 import secrets
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -211,6 +212,14 @@ class _DaemonThreadingServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._request_slots.release()
+
+    def handle_error(self, request, client_address):
+        # A client that resets or abandons its connection is routine (agents restart, proxies time out); the
+        # stdlib would print a full traceback to stderr each time. Real handler bugs keep their traceback.
+        if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            log.debug("client %s went away: %s", client_address[0], type(sys.exc_info()[1]).__name__)
+            return
+        super().handle_error(request, client_address)
 
 
 class _DaemonThreadingServerV6(_DaemonThreadingServer):
@@ -2766,6 +2775,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             except ValueError:
                 return self._deny(400, "bad length")
             headers = {k.lower(): v for k, v in self.headers.items()}
+            if len(self.headers.get_all("X-Forwarded-For") or []) > 1:
+                return self._deny(400, "ambiguous forwarded-for chain")   # never guess a client: a loopback proxy would win
             if length < 0 or length > server.rakazo.body_limit(self.path, headers):
                 self.close_connection = True              # the unread body would otherwise be parsed as the next request
                 return self._deny(413, "body too large")
@@ -4329,6 +4340,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     if "actor" in body:
                         return self._json({"error": "actor is derived from authentication"}, 400)
                     return self._json(server.handoffs.transition(parts[4], state, actor))
+            if resource == "agent-ops":
+                return self._agent_ops_dismiss(parts[4:])
             if resource == "inspector" and len(parts) == 5 and parts[4] == "preferences":
                 return self._inspector_set_prefs(None)
             if (resource == "sessions" and len(parts) == 7 and parts[5] == "inspector"
@@ -6052,6 +6065,31 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             except ValueError:
                 return self._json({"error": "limit must be an integer"}, 400)
             return self._json(service.events(viewer, principal, cursor, min(max(limit, 1), PAGE_MAX)))
+
+        def _agent_ops_dismiss(self, sub):
+            """``POST /api/v1/agent-ops/dismiss`` (operator role, enforced before routing): drop an agent or session from
+            the map by recording a durable ``session.dismissed`` event. A newer event of that agent revives it."""
+            if not getattr(server, "agent_ops_enabled", False) or sub != ["dismiss"]:
+                return self._json({"error": "not found"}, 404)
+            from .envelope import _OPS_ID_RE
+            body = self._read_json()
+            if not isinstance(body, dict):
+                return self._json({"error": "body must be a JSON object"}, 400)
+            ids = {}
+            for name in ("agent_id", "session_id"):
+                value = body.get(name)
+                if value is not None and not (isinstance(value, str) and _OPS_ID_RE.fullmatch(value)):
+                    return self._json({"error": f"{name} must match [A-Za-z0-9._:@-]{{1,160}}"}, 400)
+                ids[name] = value
+            reason = body.get("reason")
+            if not ids["agent_id"] and not ids["session_id"]:
+                return self._json({"error": "agent_id or session_id is required"}, 400)
+            if reason is not None and not (isinstance(reason, str) and 0 < len(reason) <= 200):
+                return self._json({"error": "reason must be a string of at most 200 characters"}, 400)
+            out = server.agent_ops.dismiss(server.ingest, self._principal(), ids["agent_id"], ids["session_id"], reason)
+            if out is None:
+                return self._json({"error": "not found"}, 404)
+            return self._json(out)
 
         def _agent_ops_stream(self, service, principal, operator, cursor):
             """SSE with cursor resume (``?cursor=`` or ``Last-Event-ID``). Access is re-evaluated on every tick (a revoked

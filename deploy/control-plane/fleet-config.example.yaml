@@ -16,8 +16,8 @@ sections:
       # {} = open on the tailnet (the default `fleet config init` writes; the web port is
       # bound to the tailnet interface and runs --allow-open).
       # Keyed mode: adding entries here (key: role, roles viewer | operator | ingest | agent)
-      # gates every route but /api/v1/health and the host endpoints. The llm-proxy and the
-      # emit hook do not send keys yet (401 until they do). The browser dashboard works only
+      # gates every route but /api/v1/health and the host endpoints. The llm-proxy
+      # (HERDR_CP_CLIENT_KEY_FILE) and the emit hook (ingest.api_key / agent.api_key) send keys once configured (401 until then). The browser dashboard works only
       # behind the dashboard proxy (dashboard_proxy below). Put the ingest key in
       # ingest.api_key and the agent key in agent.api_key.
       api_keys: {}
@@ -196,6 +196,10 @@ sections:
       #   public_url: "https://artifacts.example.test/"   # required when enabled: a bare lowercase https origin on a
       #                                    # host other than collab.public_url's; links are <it>/s/<token>/ and the web
       #                                    # client needs <it>/s/callback as an allowed callback + logout URL
+      #   member_host: "my.artifacts.example.test"   # optional own origin for the member web UI (needs
+      #                                    # collab.members.enabled); a DNS name other than public_url's host, named by
+      #                                    # the edge certificate; the Cognito web client needs
+      #                                    # https://my.artifacts.example.test/my/callback (callback) and its / (logout)
       #   signing_secret: "REDACTED"       # >= 32 bytes; generate locally, never commit or print it:
       #                                    #   openssl rand -hex 32   (paste the output here)
       #   session_seconds: 14400           # lab session lifetime cap; also never past the share's expiry NOR the
@@ -222,6 +226,8 @@ sections:
       #   enabled: false
       #   public_host: "artifacts.example.test"      # lowercase DNS name; must have a certificate on the edge
       #   mcp_public_hosts: ["mcp.example.test"]     # hosts allowed on /mcp/artifacts
+      #   member_host: "my.artifacts.example.test"   # OPTIONAL own origin for the member web UI (/, /my/, /api/member/);
+      #                                              # needs DNS + a certificate that includes it; public_host keeps serving it too
       #   session_secret: "REDACTED"                 # >= 32 bytes, never equal to claim_key (openssl rand -hex 32)
       #   claim_key: "REDACTED"                      # >= 32 bytes
       #   db_password: "REDACTED"                    # >= 16 chars; changing it re-keys all three db roles on the next deploy

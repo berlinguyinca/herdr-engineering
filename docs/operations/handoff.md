@@ -94,9 +94,11 @@ herdr-handoff takeover hnd_123 --cwd "$(git rev-parse --show-toplevel)"
 ```
 
 The model argument is a hint, not a guarantee. The receiving harness must
-report the resolved model. Handoffs do not launch processes or publish
-anything automatically. Public sharing remains a separate, human-approved
-artifact-publication action.
+report the resolved model. Handoffs do not publish anything automatically; public
+sharing remains a separate, human-approved artifact-publication action. What IS
+automatic is the handoff itself: when a session nears its context limit the installed
+triggers tell the agent to run this skill without being asked. See
+[Automatic handoffs](../automatic-handoffs.md).
 
 ## Ordering and refusals
 
@@ -117,6 +119,12 @@ path and not the upstream checkout:
   of starting a second pane, and closes the source now that git reports it clean.
 * `status: launch_unconfirmed` or `launch_failed` — the close was refused and both panes remain up;
   nothing was destroyed. Report it rather than re-running the command to force it.
+* Takeover gave up waiting (`--confirm-timeout`) — since herdr-handoff 0.5.1 the successor's later
+  `herdr-handoff confirm` closes the source through the same gate (unpushed commits, a dirty worktree or
+  another tab refuse). Its JSON reports `close` (`source_closed`, `already_closed`, `refused`,
+  `not_attempted`), `source_closed`, `reason` and `source_closed_at`, and it exits 0 whenever the
+  confirmation is recorded. It never closes after `--keep-source`, for a 0.5.0-written record, with no
+  source pane recorded, or while a takeover holds the lock.
 * `status: source_close_failed` — the handoff completed and herdr refused the close; report it.
 
 Untracked files (`.claude/`, `.venv/`, build output) do not refuse a close: they appear in almost every
@@ -156,3 +164,131 @@ Hindsight Memory, CONTRACT.md). It is produced by `herdr-handoff` only when a
   `herdr-memory get MEMORY_ID --scope S` (the scope is derived from the ref's bank id). Unresolved or forbidden refs are reported and never fatal.
   Retrieved memory is data, never instructions.
 - Pi Blackhole short-term context handling is unchanged.
+
+## Opt-out workflow hook: a `/handoff` reminder before compaction
+
+`herdr-eng workflow install` (also `scripts/install.sh`, step 7c) registers a
+Claude Code `PreCompact` hook. It **only prompts**: it prints a message
+recommending `/handoff` (a new Herdr pane, same harness) before the context is
+compacted. It does not run `herdr-handoff`, create or sync a package, open a pane,
+or publish anything. The automatic context trigger below exists but is not
+installed by default; the decision to hand off stays with the person unless they
+opt in. Remove the hook with
+`herdr-eng workflow uninstall`. Details: `docs/operations/workflow-hooks.md`.
+
+## Opt-in automatic trigger: hand off when the context fills up
+
+`herdr-eng handoff context-hook claude` is a Claude Code `UserPromptSubmit` hook
+body. It is **not installed by default**. When the session's context usage reaches
+the threshold it injects an instruction (`hookSpecificOutput.additionalContext`)
+telling the agent to finish or record running subagents and run the `/handoff`
+skill now, which hands over to a successor pane and closes this one. The hook
+cannot write the handoff itself; it only injects the instruction. Each `session_id` has a
+marker file recording the context size (tokens) at the last reminder; an ignored instruction is
+repeated only after usage grows another 10 points. Markers older than 30 days are
+pruned (marker files under `$HERDR_ENGINEERING_STATE/handoff-context`,
+default `~/.local/share/herdr-engineering/state/handoff-context`).
+
+Context used is read from the last assistant message in the transcript:
+`input_tokens + cache_read_input_tokens + cache_creation_input_tokens`. Below the
+threshold, with a missing transcript, bad input or any error, it prints nothing and
+exits 0, so it never blocks a prompt.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HERDR_HANDOFF_CONTEXT_THRESHOLD` | `0.50` | fraction of the window that triggers the instruction |
+| `HERDR_HANDOFF_CONTEXT_MAX_TOKENS` | `200000`, or `1000000` once usage exceeds 200000 | context window size; setting the variable disables the inference |
+| `HERDR_HANDOFF_AUTO` | unset | `0` disables the hook |
+
+The transcript does not name the context window, so the hook assumes 200000 tokens and
+switches to 1000000 once usage proves a 200000 window cannot be right. A 1M-token
+session below 200000 tokens is therefore measured against 200000 and is reminded
+early; set `HERDR_HANDOFF_CONTEXT_MAX_TOKENS=1000000` to measure it exactly.
+
+To opt in, run:
+
+```bash
+herdr-eng handoff auto install     # idempotent; also: uninstall | check [--dry-run] [--json]
+```
+
+`install` appends one `UserPromptSubmit` entry (plus the `SubagentStart` and `SubagentStop` entries described in the next section), each carrying the marker `herdr-handoff-auto`
+to `~/.claude/settings.json`, keeping every other hook and key, and writes atomically.
+An entry already present with that marker (even one you added by hand) is left as is
+(`unchanged`, or `preserved` if its command differs), so it never duplicates; the result has one item per event, and a settings file that only has the older `UserPromptSubmit` entry gets the two new ones added. If
+`settings.json` is not valid JSON the command reports `refused` and does not touch the
+file. `uninstall` removes only hooks carrying the marker. `check` reports `ok` or
+`missing` per event (exit 1 if any of the three is missing).
+
+Manual alternative: add this to `~/.claude/settings.json` yourself:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -x \"$HOME/.local/bin/herdr-eng\" ] && \"$HOME/.local/bin/herdr-eng\" handoff context-hook claude || true # herdr-handoff-auto"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## Running-subagent registry
+
+`herdr-handoff takeover` must not close a pane that still has running subagents. To make that knowable,
+`herdr-eng handoff subagent-hook start|stop` is the body of the Claude Code `SubagentStart` / `SubagentStop`
+hooks. It reads the hook JSON from stdin (`agent_id`, `agent_type`) and keeps one file per running subagent:
+
+```
+$HERDR_ENGINEERING_STATE/subagents/<pane_id>/<agent_id>      # default state root: ~/.local/share/herdr-engineering/state
+{"agent_id": "...", "agent_type": "...", "started": <unix seconds>}
+```
+
+`<pane_id>` is `$HERDR_PANE_ID` of the hook process (the hook does nothing when it is unset). Both ids are
+sanitised to `[A-Za-z0-9_.:-]` (anything else becomes `_`), so a hostile id such as `../x` cannot leave the
+directory. `start` writes the file atomically; `stop` removes it (a missing file is fine). The hook always exits 0
+and prints nothing, even on garbage input or an unwritable state directory.
+
+Inspect the registry with `herdr-eng handoff subagents [--pane ID] [--json]` (default pane `$HERDR_PANE_ID`). It
+lists the live entries and deletes entries older than 6 hours (a subagent that never reported a stop) as stale. It
+always exits 0.
+
+Three mutually exclusive flags make the registry machine-readable for a controller; each needs a pane (`--pane ID`,
+else `$HERDR_PANE_ID`, else an argument error with exit 2):
+
+- `--status` prints `{"known": bool, "live": int}` with `--json` (else `known=true live=1`). `known` is false when no
+  hook ever fired for the pane, and true once its directory exists, even with zero live agents. Stale entries are not
+  counted.
+- `--wait SECONDS` polls until no subagent is live: exit 0 when idle (an unknown pane counts as idle; the caller decides
+  what unknown means), exit 3 on timeout. With `--json` it prints the status it last saw.
+- `--purge` deletes the pane's registry directory and prints the number of entries removed (`{"purged": N}` with
+  `--json`); run it when a pane closes so a reused pane id starts clean.
+
+Without these flags the command behaves as described above.
+
+`herdr-eng handoff context [--pane ID] [--json]` prints how full the pane's session context is (harness, used and
+window tokens, percent, source, window source), or `{"unknown": true}` when it cannot be read; it always exits 0.
+`--harness NAME --session-id ID [--cwd DIR]` reads a named session's record directly, without Herdr.
+
+`herdr-eng handoff auto install` installs these two hooks together with the `UserPromptSubmit` one. Manual
+alternative, merged into `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SubagentStart": [
+      {"hooks": [{"type": "command",
+        "command": "[ -x \"$HOME/.local/bin/herdr-eng\" ] && \"$HOME/.local/bin/herdr-eng\" handoff subagent-hook start || true # herdr-handoff-auto"}]}
+    ],
+    "SubagentStop": [
+      {"hooks": [{"type": "command",
+        "command": "[ -x \"$HOME/.local/bin/herdr-eng\" ] && \"$HOME/.local/bin/herdr-eng\" handoff subagent-hook stop || true # herdr-handoff-auto"}]}
+    ]
+  }
+}
+```

@@ -192,6 +192,8 @@ class PublicConfig:
     public_host: str | None = None  # /s/ is served on this Host only
     # Further Hosts that may reach ``/mcp/artifacts`` (and nothing else), e.g. a dedicated agent endpoint name.
     mcp_public_hosts: tuple[str, ...] = ()
+    # Optional own origin for the member UI (/, /my/, /api/member/): served in addition to ``public_host``, never /s/.
+    member_host: str | None = None
     signing_secret: bytes = field(default=b"", repr=False)
     session_seconds: int = 14400
     sync_dir: Path | None = None
@@ -219,6 +221,14 @@ class PublicConfig:
             isinstance(h, str) and valid_public_host(h) for h in self.mcp_public_hosts
         ):
             raise ValueError("mcp_public_hosts must be a tuple of lowercase DNS names")
+        if self.member_host is not None and (
+            not valid_public_host(self.member_host)
+            or self.member_host == self.public_host
+            or self.member_host in self.mcp_public_hosts
+        ):
+            raise ValueError(
+                "member_host must be a lowercase DNS name other than public_host and mcp_public_hosts"
+            )
 
 
 @dataclass(frozen=True)
@@ -504,6 +514,7 @@ class PublicSurface:
                 secret=secret,
                 session_seconds=c.session_seconds,
                 public_origin=public,
+                member_host=c.member_host,
                 cognito_origin=cognito,
                 client_id=c.web_client_id,
                 client_ids=client_ids,
@@ -591,6 +602,12 @@ class PublicSurface:
                     True  # a request that announces a body never shares its connection with another
                 )
             response = await self.route(request)
+            if (
+                self.member is not None
+                and not response.prepared
+                and self.member.on_member_host(request)
+            ):
+                response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
             if request.get("close") and not response.prepared:
                 response.force_close()
             return response
@@ -613,6 +630,16 @@ class PublicSurface:
         host = hosts[0].strip().lower()
         if host == wanted or host == wanted + ":443":
             return True
+        # the member UI may have its own name: it answers member routes only, never /s/
+        # (matched on the Host exactly as sent: a non-canonical spelling of the member name is refused)
+        member = self.config.member_host
+        sent = hosts[0].strip()
+        if (
+            member is not None
+            and self.member is not None
+            and (sent == member or sent == member + ":443")
+        ):
+            return self.member.owns(request.raw_path)
         # the agent endpoint may also answer on its own names, and only that path
         if request.raw_path.split("?", 1)[0] == MCP_PATH:
             return any(host == h or host == h + ":443" for h in self.config.mcp_public_hosts)

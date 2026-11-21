@@ -861,9 +861,18 @@ def docker_ok() -> None:
         pytest.skip(reason)
 
 
+@pytest.mark.parametrize("member_host", [None, "my.artifacts.example.test"])
 def test_nginx_accepts_the_rendered_edge_conf(
-    docker_ok: None, tmp_path: Path, rendered_edge: str
+    docker_ok: None, tmp_path: Path, rendered_edge: str, member_host: str | None
 ) -> None:
+    if member_host:
+        rendered_edge = fcc.render_edge_conf(
+            (EDGE_DIR / "nginx.conf").read_text(encoding="utf-8"),
+            share=False,
+            artifact_host=HOST,
+            snippets_dir=EDGE_DIR,
+            member_host=member_host,
+        )
     if shutil.which("openssl") is None:
         pytest.fail("openssl is required for this test") if _STRICT else pytest.skip(
             "openssl is not installed"
@@ -1546,3 +1555,86 @@ def test_member_api_allows_delete_only_on_the_routes_the_app_defines(rendered_ed
     block = _locations(_server_block(rendered_edge, HOST))["/api/member/"]
     assert "if ($member_method_ok = 0) { return 404; }" in _code(block)
     assert "client_max_body_size 1m;" in _code(block) and "limit_req zone=member_req" in block
+
+
+# ------------------------------------------------------------------------------------------ member_host (own origin)
+
+MEMBER_HOST = "my.artifacts.example.test"
+
+
+def test_member_host_is_off_by_default_and_the_slice_omits_it(tmp_path: Path) -> None:
+    _, data = _render(tmp_path)
+    assert "member_host" not in data["public"]
+    assert host_config.parse(data["public"]).member_host == ""
+
+
+def test_member_host_reaches_the_public_slice_and_the_hosts_own_parser(tmp_path: Path) -> None:
+    _, data = _render(tmp_path, member_host=MEMBER_HOST)
+    assert data["public"]["member_host"] == MEMBER_HOST
+    cfg = host_config.parse(data["public"])
+    assert cfg.member_host == MEMBER_HOST and cfg.member_url == f"https://{MEMBER_HOST}"
+    assert "member_host" not in data["internal"] and "member_host" not in data["migrate"]
+
+
+@pytest.mark.parametrize("bad", [HOST, MCP_HOST, "My.Example.Test", "https://my.example.test", "10.0.0.1", 7])
+def test_a_bad_member_host_is_refused_naming_the_key(tmp_path: Path, bad: object) -> None:
+    central = _central(tmp_path, host_section=_host_section(member_host=bad))
+    with pytest.raises(FleetConfigError, match="member_host"):
+        fcc.render_artifact_host(load_fleet_config(central), tmp_path / "x")
+    assert not (tmp_path / "x").exists()
+
+
+def _edge(**kw: object) -> str:
+    template = (EDGE_DIR / "nginx.conf").read_text(encoding="utf-8")
+    return fcc.render_edge_conf(template, share=False, artifact_host=HOST, snippets_dir=EDGE_DIR, **kw)
+
+
+def test_the_edge_has_no_member_server_unless_member_host_is_set(rendered_edge: str) -> None:
+    assert _edge() == rendered_edge
+    assert "@member_host@" not in rendered_edge and "server_name my." not in rendered_edge
+
+
+def test_the_member_server_routes_the_member_ui_only_and_never_shares() -> None:
+    conf = _edge(member_host=MEMBER_HOST)
+    assert "@member_host@" not in conf and conf.count("server_name ") == _edge().count("server_name ") + 1
+    block = _server_block(conf, MEMBER_HOST)
+    locs = _locations(block)
+    assert set(locs) == {"/api/member/", "= /", "/my/", "~ ^/(healthz|internal)(/|$)", "/"}
+    assert locs["/"].strip() == "return 404;"
+    assert set(re.findall(r"proxy_pass (\S+);", block)) == {
+        "http://artifact_host_member",
+        "http://artifact_host_upload",
+    }
+    assert "/s/" not in _code(block) and "artifact_host_share" not in block and "/mcp/" not in block
+    assert "listen 8443 ssl proxy_protocol;" in block and "access_log off;" in block
+    assert block.count("X-Frame-Options") >= 3 and "Strict-Transport-Security" in block
+    # the same limits and upload size as the artifact host's own member locations
+    main = _locations(_server_block(conf, HOST))
+    for name in ("/api/member/", "= /", "/my/"):
+        for line in re.findall(r"(limit_req zone=\S+ burst=\d+ nodelay;|limit_conn \S+ \d+;|client_max_body_size \S+;)", main[name]):
+            assert line in locs[name], (name, line)
+    for path in ("/s/abc/", "/mcp/artifacts", "/anything"):
+        assert (_select(locs, path) or "").strip() == "return 404;", path
+
+
+def test_the_member_host_must_differ_from_the_artifact_and_mcp_hosts() -> None:
+    with pytest.raises(FleetConfigError, match="member_host"):
+        _edge(member_host=MCP_HOST, mcp_hosts=[MCP_HOST])
+    with pytest.raises(FleetConfigError, match="member_host"):
+        _edge(member_host=HOST)
+    with pytest.raises(FleetConfigError, match="member_host"):
+        _edge(member_host="Bad_Host")
+
+
+
+def test_the_edge_refuses_a_member_host_that_is_an_mcp_host_even_with_the_slices_unrendered(tmp_path: Path) -> None:
+    central = _central(tmp_path, host_section=_host_section(member_host=MCP_HOST))
+    with pytest.raises(FleetConfigError, match="member_host"):
+        fcc.render_edge(load_fleet_config(central), EDGE_DIR / "nginx.conf", tmp_path / "edge.conf")
+
+
+@pytest.mark.parametrize("bad", ["a.example.test", {"a": 1}, [7]])
+def test_render_edge_refuses_a_malformed_mcp_public_hosts(tmp_path: Path, bad: object) -> None:
+    central = _central(tmp_path, host_section=_host_section(mcp_public_hosts=bad))
+    with pytest.raises(FleetConfigError, match="mcp_public_hosts"):
+        fcc.render_edge(load_fleet_config(central), EDGE_DIR / "nginx.conf", tmp_path / "nginx.conf")

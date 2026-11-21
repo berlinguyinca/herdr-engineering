@@ -41,6 +41,9 @@ def test_the_lock_pin_names_the_revision_that_hands_off_by_default():
     assert re.fullmatch(r"[0-9a-f]{40}", entry["revision"]), "the pin must be a full commit sha"
     note = entry["note"]
     assert "v0.4.0" in note and "herdr-handoff#7" in note, note
+    assert "v0.5.0" in note and "herdr-handoff#12" in note, note
+    assert "v0.5.1" in note and "herdr-handoff#13" in note, note
+    assert entry["revision"] == "a035dcab040b3288c10f15abfdb52620f4bc37ac", "the 0.5.1 squash merge"
     # The guard is part of what the pin buys: a host told only "takeover exists" cannot know a pane may
     # now refuse to close because of the work it holds.
     assert "source_dirty" in note and "--keep-source" in note, note
@@ -135,3 +138,13 @@ def test_flags_the_skill_types_for_takeover_exist_in_the_installed_cli():
             assert not unknown, (
                 f"the {surface} types {unknown}; takeover offers {sorted(advertised)}"
             )
+
+
+def test_the_skill_finishes_or_hands_over_running_subagents_before_the_close():
+    """Closing the pane kills this session's subagents; the skill must not close under running work."""
+    text = _skill().lower()
+    assert "subagent" in text, "the skill must address subagents that are still running"
+    assert "before the close" in text or "before running `herdr-handoff takeover`" in text
+    assert "--keep-source" in text and "still running" in text, (
+        "the skill must say to keep the source when work is still running"
+    )

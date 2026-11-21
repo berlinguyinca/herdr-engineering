@@ -9,9 +9,132 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - A bundle whose Woodpecker run the control plane reports as removed (`Pipeline was not found.` or `This Woodpecker resource is unavailable or has been removed.`) is a permanent skip: it is never published, is recorded in the checkpoint as `state: skipped` (`reason`, `skipped_at`), logs `CI report relay: skipped <bundle>: provider run removed`, and is not re-read on later passes. The summary line is now `N published, M failed, K skipped` and the exit status is 1 only for failures. A run that exists with a mismatched identity, HTTP errors, timeouts, auth errors and malformed responses still fail closed and stay retriable.
 
+### Chore: pin herdr-handoff 0.5.1
+
+- `lock/upstreams.yaml` pins herdr-handoff to `a035dcab040b3288c10f15abfdb52620f4bc37ac` (herdr-handoff#13, v0.5.1). `herdr-handoff confirm` now closes the source pane when `takeover` gave up waiting (its `--confirm-timeout`) and the successor confirms afterwards, through the same close gate as takeover (unpushed commits, a dirty worktree or another tab refuse). It never closes after `--keep-source`, for a 0.5.0-written record, with no source pane recorded, or while a takeover holds the lock. Its JSON gains `close` (`source_closed`, `already_closed`, `refused`, `not_attempted`), `source_closed`, `reason` and `source_closed_at`, and it exits 0 whenever the confirmation is recorded. 0.5.1 adds no CLI flag, so `check_handoff_dependency` is unchanged (it still names 0.5.0 as the minimum). The handoff skill and operations docs now describe a late `confirm` closing the source.
+
+### Chore: pin herdr-handoff 0.5.0
+
+- `lock/upstreams.yaml` pins herdr-handoff to `aed3e8274e6948a774682a55d99b7cd9ef113914` (herdr-handoff#12, v0.5.0: shared handoff store, one takeover per handoff id, `takeover --direction`, `--relaunch`). `check_handoff_dependency` now also requires that `herdr-handoff takeover --help` lists `--direction` (reported as `takeover --direction`, naming 0.5.0), so `herdr-eng doctor` reports an installed 0.4.0 as too old until `scripts/install-handoff.sh` is run.
+
+### Security: repo-local config can no longer set `handoff_autopilot`
+
+- `load_config` and `declared_keys` now ignore `handoff_autopilot` in the repo-local `./config/herdr-engineering.yaml` and `./herdr-engineering.yaml` (the repository being built is untrusted), exactly as `fabric_build_cache` already was, via one shared `_REPO_LOCAL_STRIPPED_KEYS` list. Set it in `~/.config/herdr-engineering/config.yaml` or `$HERDR_ENGINEERING_CONFIG`.
+
+### Fix: automatic handoff reads the context window from the session's model
+
+- `handoff autopilot` no longer hard-codes a 200k window for Claude Code. The transcript names the model, and `handoff_autopilot.model_context_windows` (YAML; a model-name substring to its window, longest match wins, merged with the built-in `[1m]` -> 1,000,000) gives its window; the Stop hook, `check --transcript` and `record --transcript` all apply it and report `window.source: "model"`. The harness's own stated window still wins, then the model, then a declared `context_window_tokens`, and only then the 200k assumption (with escalation past it). New `transcript_model()` reads `message.model`.
+
+### Fix: unit-gates reruns the parallel pass once if xdist workers die
+
+- `scripts/ci/pytest-rerun.sh`: exit 3 or a worker-crash signature reruns the parallel pass once on 2 workers (never for test failures or hangs); `auto` workers also shrink on a loaded host.
+
+### Fix: `fleet status` and `doctor` no longer depend on the working directory
+
+- `fleet.repo_root()` no longer falls back to the cwd. It uses `HERDR_ENGINEERING_REPO`, else walks up for `ansible/inventory/hosts.yml` (or a checkout's `ansible/playbooks/fleet-status.yml`), else raises `FleetError` naming the paths searched. `fleet status` reports a missing inventory as `no inventory at <path>` on stderr and exits 2 (setup problem), distinct from exit 1 (ansible ran and hosts failed); `--json` carries `error` and `error_kind`. `fleet join`/`update` and `stage_pi_runtime` return that error in their report instead of running ansible against a nonexistent path.
+- `doctor`: the `lock` and `plugins` checks locate `lock/upstreams.yaml` from `HERDR_ENGINEERING_LOCK`, then `HERDR_ENGINEERING_REPO`, then the checkout the package was imported from, never the cwd. With no checkout (an installed copy) both report `unknown` ("not applicable: no checkout found") instead of a warning.
+- `doctor`: the `tailscale` check reads `tailscale status --json` and treats `BackendState == "Running"` as up (exit code when the output is not that JSON); the plain-text check looked for the word "tailscale", which that output never contains, so it always warned. The decision is the pure function `tailscale_running`.
+- `fleet rollout plan` and `fleet recover plan`/`run` outside a checkout print that error as JSON and exit 1 instead of a traceback.
+- `scripts/herdr-gateway-monitor.timer` triggers on `OnCalendar=*:0/5` instead of `OnBootSec=`/`OnUnitActiveSec=`. With `Persistent=true` the old unit stopped firing after a reboot whenever the user manager started later than the boot delay. Installed copies need the unit re-copied and `systemctl --user daemon-reload`.
+
 ### Fix: CI report relay failures are no longer silent
 
 - `ci_report_relay` printed only `N published, M failed`. It now writes one stderr line per failing bundle (`CI report relay: failed <bundle>: <reason>`), per unreadable source file (errno name), and for whole-run failures, plus the reader exit status on source errors. Reasons are fixed strings or errno names: no URLs, keys or bundle contents. Delivery and fail-closed identity checks are unchanged.
+
+### Workflow hooks: hand off automatically on long context
+- The `PreCompact` message and the `SessionStart` reminder now tell the agent to run `/handoff` itself, without asking the user, after background subagents have reported and work is committed/pushed where allowed (previously a suggestion). The reminder also says not to ask the user about choices the defaults already settle. The hooks still only print text.
+
+### Fix: workflow guard denies guarded pushes, with a one-shot human override
+- `ask` is not prompted in Claude Code auto permission mode, so the herdr-engineering push rule (and the unknown-cwd push rule) did nothing. `herdr_engineering/workflow_guard.py` now returns `deny` for both; the reason tells the agent to ask the user to run `! touch ~/.local/state/herdr-engineering/allow-push` and retry. If that token file exists, the next guarded push is allowed and the file is deleted (one-shot; `HERDR_WORKFLOW_ALLOW_PUSH` overrides the path). Main/master push denial is unchanged and never consumes the token; the guard still fails open on internal error.
+- `Write`/`Edit`/`MultiEdit`/`NotebookEdit` on the token path, and `Bash` commands mentioning it, are denied so the agent cannot approve itself. A speed bump, not a security boundary (substring check). See `docs/operations/workflow-hooks.md`.
+
+### Fix: ui-gates reports on every pull request
+
+- `.woodpecker/ui-gates.yml` drops its `path:` filter for an `applicability` step (`scripts/ci/unit-gates-applicable.sh ui`), so the `ui-gates` context can be required without blocking PRs that touch no UI path. The decision reads `CI_PIPELINE_EVENT` (what Woodpecker exports) with `CI_EVENT` as fallback, and the `ui` case also covers `pyproject.toml`, `scripts/ci/journal.sh` and `scripts/ci/cache-trust.sh`, which `ui-gates.sh` depends on.
+
+### Fix: run-watched review nits from #824
+
+- `scripts/ci/run-watched.py`: `Out.write` also survives a full non-blocking stdout (EAGAIN), a closed fd and a `None` stdout (it stops forwarding and keeps draining); the process group is only signalled once the root is reaped if a live process still holds that group (a reaped pid can be reused); `has_token` no longer caches negatives (a fork child reads as its parent until it execs); CPU history is keyed by (pid, start time) so a reused pid cannot corrupt deltas; signal handlers are installed before the command is spawned; bad SOFT/HARD, a missing `--` or command print a usage error and exit 2, and an unstartable command exits 127/126 with a message instead of a traceback; a hang now stops the tree with SIGTERM, a short grace, then SIGKILL (exit still 124).
+- Output forwarding waits for a slow reader instead of dropping the rest of the log (stdout is made blocking at startup, EAGAIN retries once writable); only EPIPE/EBADF/closed stdout stop forwarding, with one stderr notice (a reader that stops reading without closing still blocks the writer; that predates this change). The pipe is drained during the kill grace (bounded), so SIGTERM-handler cleanup output is kept. `HERDR_WATCHED_ORPHAN_GRACE` is validated before the spawn.
+- Tests: a `pidfiles` fixture kills leaked daemons and removes pidfiles on teardown.
+
+### Memory client pin: 0.1.8 → 0.1.10
+
+- `PINNED_REVISION`/`PINNED_CLIENT_VERSION` and `lock/upstreams.yaml` move to `eb1338a4067d4e17910a9f651fc7c08551f5b8a9` (client `0.1.10`, contract v1 unchanged). Three commits ahead of the previous pin: `f3a20ba` makes recall/documents degrade to empty on a never-written bank and adds `provision` plus per-bank `bank:<id>` doctor checks (herdr-memory#18, closes #17); `66eb463` bumps to 0.1.9 and adds the repo's first CI plus the version-parity test that guards the two-builds-one-version-string incident (herdr-memory#19); `eb1338a` gives every queued operation a terminal attempt record and surfaces vanished rows as `status.lost` / doctor `lost` (herdr-memory#20, closes #4). Every host in the fleet was already running 0.1.10, so `memory doctor` reported `package_revision` and `client_version` drift on each one; this reconciles the pin with what is deployed rather than pulling anything new in, the same shape as the 0.1.7 → 0.1.8 bump. Verified against the upstream tree at that revision (`pyproject.toml` → `version = "0.1.10"`, `herdr_memory/__init__.py` → `__version__ = '0.1.10'`), not from a tag or a version string in a log. `tests/test_memory_install.py::test_pin_matches_lock` fails on a partial bump. Because the pin is part of the managed-block marker, hosts need `herdr-eng memory upgrade` after this ships.
+
+### Fix: fleet watcher review follow-ups (orphaned children, lock edge cases), on top of the self-restart
+
+- SIGTERM and the hard-limit exit 70 now stop an in-flight local `host-apply`: the watcher sends it SIGTERM first (5 s grace), host-apply kills the commands it started (they run in their own sessions, which a group kill of host-apply would miss), then SIGKILL. A grandchild that deliberately leaves its session is still left to the systemd cgroup (`KillMode` default `control-group`), which kills the whole unit on stop. The hard-limit exit never releases the registry lock before `os._exit(70)`. Both SIGTERM handlers (the loop's and host-apply's) are one-shot, so a second SIGTERM cannot cut the cleanup short, and the watcher's final SIGKILL of the child group always runs. host-apply holds a SIGTERM that arrives while it is spawning a command until the command's handle exists, so a signal landing between `Popen` returning and the handle being bound no longer orphans the command (a SIGTERM held during a spawn that then fails still exits 143), and an `OSError` while reading a started command kills its group before propagating. A signal landing inside `Popen` itself (between `fork` and its return) can still orphan a command; that narrow window is left to the unit's cgroup.
+- A CRLF `fleet.lock.yaml` can be pinned (it was always refused as changed-since-read) and keeps its line endings; same-second lock backups no longer overwrite each other; an interrupted write no longer strands `<lock>.tmp`; a failed backup copy removes its empty `.bak` file.
+- `herdr-eng fleet lock verify` no longer creates the watcher state directory or lock file when it does not exist.
+- Audit of the #865 self-restart (no code change needed): a freshly started loop does not restart again while the succeeded rollout is still the latest saved one (the decision is taken only in the pass that ran the rollout), and unreadable or corrupt state means no restart and no crash. Real-process tests pin both.
+- Tests: exact event tails instead of `in types[-2:]`, SIGTERM must exit 0. Operator doc: restart-mid-rollout safety, symlinked-lock backup location. Supersedes #825 (its own restart-token mechanism is dropped in favour of #865).
+### Claude Code: blocking `PreToolUse` guard in the managed workflow hooks
+
+- `herdr-eng workflow install|repair` now also registers a `PreToolUse` hook (matcher `Bash|Write|Edit|MultiEdit|NotebookEdit`, same `herdr-workflow:managed` marker and guard) that denies `Write`/`Edit`/`MultiEdit`/`NotebookEdit` under `/tmp` and `/private/tmp` (the harness scratchpad `/tmp/claude-<digits>/` is allowed), denies `git push` to `main`/`master` (explicit refspec, `HEAD`/`@`, or a bare push from a repo on that branch; it parses the whole command, follows `cd` and `git -C`, sees through subshells, keywords, `env`/`time`/`sudo` and `bash -c`, ignores redirections and heredoc bodies, asks when the target directory is unknown, and denies a plain `main`/`master` push it cannot tokenize), and asks before any other push from a repo whose `origin` contains `herdr-engineering`. It fails open and uses no network. Existing installs show as drift in `workflow doctor` until `workflow repair`. `ClaudeHooksUnit` gained an optional per-event `matchers` map. See `docs/operations/workflow-hooks.md`.
+
+### Quieter client disconnects; fallback timeout no longer caps the body read
+
+- Control-plane listeners (`_DaemonThreadingServer`) no longer print a stdlib traceback for `ConnectionResetError`, `BrokenPipeError` or `ConnectionAbortedError` (about 6,700 resets and 100 broken pipes per day in `herdr-cp-web`); they log at debug. Any other handler exception still logs its traceback.
+- llm-proxy: the 10 s fallback-attempt timeout covered the whole upstream socket, so when a fabric answer arrived but no fallback was taken, a body slower than 10 s failed as `TimeoutError`. The socket is widened to the 600 s upstream timeout once headers arrive. Both values are now module constants (`FALLBACK_ATTEMPT_TIMEOUT_SECONDS`, `UPSTREAM_TIMEOUT_SECONDS`).
+
+### Tier-1 ensemble checked by Opus, poll scope, Muse serve unit (always-on-review)
+
+- `tiers.tier1.reviewers` (new, default empty = unchanged behavior): several open-weight reviewers run in parallel per PR head, `backend: gateway` (e.g. qwen3.8-27b) or the new generic `backend: openai` (base_url, model, `api_key_file`; llama.cpp such as Muse-Glimmer-30B on 127.0.0.1:28931, requests serialized per server). They reuse the eval's system prompt, prompt (diff + touched files, 60k cap) and JSON findings parsing. Tier 1 stays advisory: no status, no comment. A down reviewer is recorded and skipped.
+- Tier 2 (Opus, `claude -p`) receives the deduped union (file + nearby line + title similarity) and answers `tier1_checks` (confirm or reject plus a one-line reason per finding) and may add findings. Only one comment per head SHA is posted, by tier 2: confirmed, Opus-only, rejected (collapsed in `<details>`), and which models found each. Tier 1 empty: Opus still runs normally.
+- New scope keys (documented in `always-on-review.example.yaml`): `skip_archived` (true), `skip_forks` (false), `skip_drafts` (true), `only_prs_updated_after`, `backfill` (false), `max_comments_per_hour` (unset).
+- BEHAVIOR CHANGE: a repo polled for the first time is enrolled at that moment and only PRs updated after it are reviewed (previously every open PR was). A repo the existing state.json already has review keys for (an upgraded deployment) is grandfathered with no cutoff, so its in-progress PRs stay in scope. Archived repos are now skipped by default. `backfill: true` and `skip_archived: false` restore the old behavior.
+- `deploy/ci-review/herdr-muse-serve.sh` and `herdr-muse-serve.service`: example llama.cpp server-cuda-b11804 for Muse (not installed by anything).
+- Rollback: delete `tiers.tier1.reviewers` (tier 1 and tier 2 behave as before), set `backfill: true` and `skip_archived: false`; or revert the PR. State keys added to state.json (`repo:*.enrolled_at`, `_comments`) are ignored by older versions.
+
+### Fix: control-plane-web can reach the fabric whois sidecar for the phone bridge
+
+- `tailnet_open_owner` failed closed on the live host because `herdr-cp-web` had no whois socket. `compose.collab-fabric.yaml` now mounts the sidecar's socket directory **read-only** at `/run/fabric-whois` in `control-plane-web` (only when that overlay is layered). Set `rakazo_bridge.whois_socket: /run/fabric-whois/whois.sock`. No other service, capability or network changes; the sidecar keeps its hardening. See `docs/operations/shepherd-discovery.md`.
+
+### Fix: fleet-watch host-apply smoke checks resolve the launcher and use `autospec doctor`
+
+- The rollout's first live pass (2026-11-17) halted on `beast/autospec` and would never converge: the autospec health smoke ran bare `autospec --version`, and (a) the autospec CLI has **no** `--version` flag (it exits 2 with `unknown autospec command`), and (b) neither a systemd unit's PATH nor a non-interactive ssh shell's PATH contains `~/.autospec/bin`, so bare `autospec` was not found at all. `pi` had the same PATH gap (`~/.local/bin` missing on the Linux ssh/service PATHs).
+- The host-apply adapters now resolve the launcher as **PATH (the host env) -> the stable install location -> the bare name** (`autospec`: `~/.autospec/bin/autospec`; `pi`: `~/.local/bin/pi`), and the autospec smoke is **`autospec doctor`** (read-only, fast, exits 0 on a working install) instead of the nonexistent `--version`. The `HERDR_FLEET_AUTOSPEC_SMOKE_CMD` / `HERDR_FLEET_PI_SMOKE_CMD` seams are unchanged; a launcher that is nowhere still fails closed (`version_smoke` failed -> `health_failed` -> the rollout halts, nothing half-applied).
+- Spec: the health-check table in `docs/specs/herdr-fleet-rollout-watcher-20261104/spec.md` now names the resolved launchers and `autospec doctor`.
+
+### Fix: fleet-sync provisions the herdr-engineering deployment checkout the rollout rows require
+
+- Second latent blocker found while converging the same first rollout: the herdr-engineering row resolves its DEPLOYMENT checkout from `$HERDR_ENGINEERING_REPO` or `~/.config/herdr-engineering/deployment-checkout` (non-interactive ssh has no profile env), and **nothing provisioned either** - the 2026-11-17 rollout would have failed closed with `no deployment checkout` on beast, bender, and macbook-pro alike (masked: it had already halted on the autospec row). The fleet-checkout clone existed on beast only.
+- New `ansible/tasks/fleet-deployment-checkout.yml` (fleet-sync, before the watcher unit): clones the dedicated deployment checkout (`~/.local/share/herdr-engineering/fleet-checkout`, overridable per host with `fleet_deployment_checkout:`), ff's it to `main` (`update: true`, `force: false` - a dirty checkout fails loudly instead of being touched), and writes the one-line 0600 pointer file. It deliberately does NOT reuse `herdr_engineering_checkout` (fabric-agent.yml's set_fact repurposes that variable to the immutable per-revision release dirs, which are pinned to a sha and not on main - the D6 gate refuses them).
+- Docs: `docs/operations/fleet-rollout-watcher.md` now lists the per-host deployment-checkout prerequisite. Structural tests: `tests/test_ansible_fleet_deployment_checkout.py` (task shape, ordering before the watcher unit, pinned repo/ff-only/main, pointer file path+mode, variable trap).
+
+### Fleet watch: the watcher self-restarts after a herdr-engineering self-update
+
+- After a fleet-watch rollout **succeeded** and updated the watcher's own herdr-engineering install, `herdr-eng fleet-watch loop --enable-rollouts` now exits with status 75; the unit's existing `Restart=on-failure` (75 is not in `RestartPreventExitStatus=2 3`) restarts the service on the newly installed build, so the fleet runs the build it just shipped (issue #865; spec D12 in `docs/specs/herdr-fleet-rollout-watcher-20261104/spec.md`). The restart comes from systemd itself - no detached `systemctl` child, which the unit's cgroup cleanup would race (review of #867), and an exit 0 would not restart the unit. It never requests a restart for a halted or running rollout, for a rollout that left this host's install unchanged, in plan-only mode, or when not running under the unit (dev runs and tests, detected via `/proc/self/cgroup` - the loop keeps running). `HERDR_FLEET_WATCH_RESTART_CMD` runs an injectable command for tests and dev; the loop still exits 75. See `docs/operations/fleet-rollout-watcher.md`.
+
+### Shepherd tailnet discovery (zero-typing onboarding)
+
+- New unauthenticated `GET /.well-known/herdr-shepherd` on the rakazo bridge: `{name, bridge_url, api_version, auth_modes, tailnet}`, no secrets. `tailnet` is true only when the real socket peer is identified by tailnet whois (fabric-trust `TailscaleWhois`); `X-Forwarded-For` counts only from `trusted_proxies`; whois errors fail closed.
+- New `control_plane.rakazo_bridge` YAML keys: `tailnet_open_owner` (default off: whois-identified tailnet callers get the single-operator session from `POST /api/auth/open`, app Origin still required), `public_url`, `name`, `whois_socket`. `open_owner` and password sign-in are unchanged.
+- Security hardening: tagged devices and this host's own addresses are refused; optional `tailnet_open_owner_users` allowlist; IPv4-mapped proxies and peers are unwrapped everywhere; whois decides whenever `tailnet_open_owner` is on (even with `open_owner`); repeated `X-Forwarded-For` headers are refused; whois errors cached 2 s with single-flight lookups; `bridge_url` only for tailnet callers.
+- Docs: `docs/operations/shepherd-discovery.md`, `docs/operations/shepherd-onboarding-contract.md` (app-side probe order).
+
+### Install: screenwright is installed and kept at the latest origin/main
+
+- New `scripts/install-screenwright.sh` (wired into `scripts/install.sh` as step 7d, default on, non-fatal; `--no-screenwright` or `HERDR_INSTALL_SCREENWRIGHT=0` opts out) clones `berlinguyinca/screenwright` to `~/.local/share/herdr-engineering/screenwright`, fast-forwards it to `origin/main` on every run, runs `npm install` when HEAD moved, and calls the repo's own `ensure-install.sh` to link `screenwright-review` into the four harnesses. A dirty or non-main checkout is skipped with a message (exit 0). Prints `screenwright=<short sha> changed=<bool>`. `HERDR_SCREENWRIGHT_REF` pins instead of tracking. `lock/upstreams.yaml` records it as `revision: "tracking origin/main"`. See `docs/operations/screenwright.md`.
+
+### Fix: inspector readers no longer wait on a durable write
+
+- `InspectorStore.ingest` held the store-wide lock across the durable sink write. The sink serialises every write behind one asyncpg connection and a write lock, so under an ingest burst the lock holder waited behind unrelated writes and every reader (`agents/list` via `phone_digest`, `health`, `has_session`, `newest_seq`) waited with it; `agents/list` took up to 30 s on bender on 2026-11-17. The durable write now runs with the store lock released; ingest writers, `sweep`, `set_prefs` and checkpoint restore are serialised by a separate ingest lock (order: ingest lock, store lock, sink lock) and a reader sees the state from before an event until that event is durable, as before.
+- Measured on bender (py-spy, 2300 samples over 100 s): readers blocked on the inspector lock in 10% of samples, the lock holder blocked on the sink write lock in 4%.
+
+### Claude Code: the default engineering workflow registers itself as managed hooks
+- New `herdr-eng workflow plan|install|status|doctor|repair|uninstall` (and `scripts/install.sh` step 7c, on by default; `--no-workflow-hooks` or `HERDR_INSTALL_WORKFLOW_HOOKS=0` opts out) writes two hooks into `~/.claude/settings.json`, marked `herdr-workflow:managed`: `SessionStart` prints a short engineering-defaults reminder (sonnet delegation, evidence before claims, branch -> PR -> CI, real deps, never push herdr-engineering, nothing under /tmp, Woodpecker CI, `/handoff`), and `PreCompact` prints a reminder to run `/handoff` first. Both only print, always exit 0, and are guarded by `[ -x <python> ] && ... || true`, where the command is `<installing python> -m herdr_engineering.cli` (not `herdr-eng` from `PATH`). The hooks never run `herdr-handoff`.
+- Reuses the herdr-memory `ClaudeHooksUnit` with its own marker (`marker` class attribute), so foreign hooks and the herdr-memory hooks are untouched, writes are atomic and backed up (the first backup is kept pristine), a second run is a no-op, and invalid JSON is never rewritten. See `docs/operations/workflow-hooks.md` and `docs/operations/handoff.md`.
+
+### Fix: `/api/auth/open` no longer waits on the audit write
+
+- The open-owner sign-in queued its audit entry synchronously: `audit_record` holds the assistant store lock across the durable write and a full snapshot persist, so any contention there (a stall of 70.6 s was seen on 2026-11-17 against a normal 1.3 s) stalled the phone's first launch past its 8 s timeout. The entry now goes to a bounded background queue (256, drop-and-log on overflow, flushed on `RakazoBridge.close`); password sign-in and sign-out still audit inline. Rate limit and tailnet/origin checks are unchanged.
+- The slow-call line for `auth/open` (and password sign-in) now ends with per-phase timings, e.g. `auth/open took 1275 ms (status 200, mint 1200 ms, audit 0 ms)`.
+
+### Fix: `control-plane checkpoint` names the reason for any ValueError
+
+- The CLI JSON error carried a `reason` only for `CheckpointInvalid`; any other `ValueError` (for example `invalid projection checkpoint schema`) printed just its type and stage, so a failing deploy prewarm was undiagnosable. It now prints `reason` for a `CheckpointInvalid` at any stage and for any other `ValueError` once the connection is open (migration, index preparation, materialization), redacted through the worker's `_safe_message` (URLs and DSNs become `<url>`, at most 500 characters). The `projection restore rejected; complete replay required` warning carries the same safe message. Exit code and `ok: false` are unchanged; `configuration` and `database_connection` stage errors (a malformed DSN can be quoted without `://`) and other exception types still print only name and stage.
 
 ### Fix: phone Assistants tab lists only online agent bots
 
@@ -163,6 +286,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Test fix: cargo target-storage CLI test no longer depends on ambient CARGO_TARGET_DIR
 
 - `test_target_management_cli_enable_and_migration_safety` inherited the host environment; a CI agent exporting `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR` made the migrator report "Explicit target setting remains authoritative" instead of "same filesystem". The test now drops those two variables from the child environment and separately asserts the explicit-override verdict. No production code changed.
+
+### Rakazo default assistant: review fixes
+- Bots: every bot-meta read-modify-write (archive, restore, set-computer, mark-unread, sections, default flag) runs under one reentrant lock, so clearing the default can no longer drop `archivedAt`. Archiving clears `isDefault`; `bots/update` with `isDefault: true` on an archived bot returns 409. Tests: `tests/control_plane/test_rakazo_bots.py`.
 
 ### Inspector snapshot boot: used on the complete-replay fallback, strictly validated
 

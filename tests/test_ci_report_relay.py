@@ -474,3 +474,20 @@ def test_summary_line_counts_skips_and_only_failures_fail_the_run():
     assert Outcomes(0, 0, 4).exit_status() == 0
     assert Outcomes(3, 0, 1).exit_status() == 0
     assert Outcomes(0, 1, 4).exit_status() == 1
+
+
+GOOD_NAME = '3062-' + 'a' * 40 + '-hive-slurm.json'
+
+
+@pytest.mark.parametrize('bad', [None, 'oops', 7, {'a': 'b'}, [None], [1], ['xy'], [['only-one']], [[GOOD_NAME, 5]],
+                                 [[5, 'EIO']], [['../etc/passwd', 'EIO']], [[GOOD_NAME, 'bad code!']],
+                                 [[GOOD_NAME, 'EIO', 'extra']]])
+def test_malformed_read_errors_are_dropped_not_raised(bad):
+    from herdr_engineering.ci_report_relay import _read_errors
+    assert _read_errors({'read_errors': bad}) == []
+
+
+def test_well_formed_read_errors_survive_next_to_malformed_rows():
+    from herdr_engineering.ci_report_relay import _read_errors
+    rows = [None, [GOOD_NAME, 'EACCES'], ['junk'], (GOOD_NAME, 'EIO')]
+    assert _read_errors({'read_errors': rows}) == [(GOOD_NAME, 'EACCES'), (GOOD_NAME, 'EIO')]

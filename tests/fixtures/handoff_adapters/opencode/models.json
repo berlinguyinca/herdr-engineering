@@ -1,0 +1,1 @@
+{"ollama": {"id": "ollama", "models": {"qwen3.5": {"id": "qwen3.5", "limit": {"context": 262144, "output": 32768}}, "gemma4:26b": {"id": "gemma4:26b", "limit": {"context": 99999, "output": 8192}}}}}
