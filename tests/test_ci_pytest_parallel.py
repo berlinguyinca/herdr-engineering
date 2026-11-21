@@ -36,10 +36,18 @@ def calm_host(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.Monk
     monkeypatch.setenv("HERDR_LOADAVG_FILE", str(calm))
 
 
-def args_with(**env: str) -> list[str]:
+def args_with(cpus: int | None = None, **env: str) -> list[str]:
+    """The helper's arguments; `cpus` restricts the real CPU affinity (taskset) so a 4/8/16-CPU host is simulated without a fake."""
     exports = "".join(f"export {k}={v}; " for k, v in env.items())
+    pin: list[str] = []
+    if cpus:
+        # Pin to the first `cpus` of the CPUs this process may really use: a Slurm cpuset need not contain CPUs 0..N-1.
+        allowed = sorted(os.sched_getaffinity(0))
+        if len(allowed) < cpus:
+            pytest.skip(f"needs {cpus} allowed CPUs to simulate a {cpus}-CPU host; this process may use only {len(allowed)}")
+        pin = ["taskset", "-c", ",".join(str(c) for c in allowed[:cpus])]
     done = subprocess.run(
-        ["bash", "-c", f'unset HERDR_PYTEST_WORKERS HERDR_PYTEST_MAXPROCESSES; {exports}. "{HELPER}"; herdr_pytest_parallel_args'],
+        [*pin, "bash", "-c", f'unset HERDR_PYTEST_WORKERS HERDR_PYTEST_MAXPROCESSES; {exports}. "{HELPER}"; herdr_pytest_parallel_args'],
         capture_output=True, text=True, cwd=ROOT,
     )
     assert done.returncode == 0, done.stderr
@@ -105,7 +113,7 @@ def test_the_loader_fails_on_a_bad_override() -> None:
 def test_the_gate_uses_the_helper_and_still_raises_the_fd_limit_first() -> None:
     assert "pytest-parallel.sh" in GATE and "herdr_pytest_parallel_load" in GATE
     assert GATE.index("herdr_ensure_fd_limit") < GATE.index("herdr_pytest_parallel_load")
-    assert "python -m pytest" in GATE  # bare `pytest` imports another editable checkout
+    assert "python -m pytest" in (ROOT / "scripts" / "ci" / "pytest-rerun.sh").read_text()  # bare `pytest` imports another editable checkout
 
 
 def test_xdist_is_a_pinned_dev_dependency() -> None:
@@ -229,14 +237,12 @@ def test_a_real_run_deselects_slow_tests_from_the_parallel_pass_and_runs_them_in
     assert "[gw" not in tail and "created: " not in tail   # serial: no xdist worker
 
 
-def test_the_gate_runs_the_parallel_pass_then_a_serial_tail_both_under_the_watchdog() -> None:
+def test_the_gate_runs_the_parallel_pass_and_a_serial_tail_both_under_the_watchdog() -> None:
+    """The tail now runs alongside the fast pass: the wiring and behaviour are tested in tests/test_ci_pytest_slow_tail.py."""
     assert "run-watched.py" in GATE and WATCHER.exists()
-    assert GATE.index('"$HERDR_PYTEST_FAST_MARKEXPR"') < GATE.index('"$HERDR_PYTEST_SLOW_MARKEXPR"')
-    fast_line = next(line for line in GATE.splitlines() if "HERDR_PYTEST_FAST_MARKEXPR" in line and "pytest" in line)
-    slow_line = next(line for line in GATE.splitlines() if "HERDR_PYTEST_SLOW_MARKEXPR" in line and "pytest" in line)
-    assert fast_line.startswith("herdr_pytest_run_fast watched ")   # the helper adds PYTEST_PARALLEL and the one-shot rerun (test_ci_pytest_rerun.py)
-    assert " watched python" in slow_line and "PYTEST_PARALLEL" not in slow_line
-    assert "timeout" not in fast_line + slow_line           # no guessed flat cap on the run
+    line = next(ln for ln in GATE.splitlines() if ln.startswith("herdr_pytest_run_gate"))
+    assert line.startswith("herdr_pytest_run_gate watched watched_slow ")
+    assert "PYTEST_PARALLEL" not in line and "timeout" not in line         # no guessed flat cap on the run
 
 
 def watch(soft: str, hard: str, script: str, **env: str) -> subprocess.CompletedProcess[str]:
@@ -801,18 +807,44 @@ def loadavg(tmp_path: Path, one_minute: float) -> dict[str, str]:
     return {"HERDR_LOADAVG_FILE": str(f)}
 
 
-def test_a_heavily_loaded_host_gets_one_worker_not_eight(tmp_path: Path) -> None:
-    assert args_with(**loadavg(tmp_path, 155.0))[:2] == ["-n", "1"]
+needs_16_cpus = pytest.mark.skipif(VISIBLE < 16, reason="needs 16 visible CPUs")
+
+
+@needs_16_cpus
+def test_a_heavily_loaded_16_cpu_host_no_longer_collapses_to_one_worker(tmp_path: Path) -> None:
+    """Other tenants' load (28 on 16 CPUs, shared hive nodes) gave `-n 1` and 104-120 minute gates against 15-22 with 8 workers."""
+    assert args_with(16, **loadavg(tmp_path, 28.0))[:2] == ["-n", "auto"]
+    assert args_with(16, **loadavg(tmp_path, 155.0))[:2] == ["-n", "auto"]
 
 
 def test_a_calm_host_keeps_auto(tmp_path: Path) -> None:
     assert args_with(**loadavg(tmp_path, 0.0))[:2] == ["-n", "auto"]
 
 
-@needs_two_cpus
-def test_workers_are_the_cpus_the_load_leaves_free(tmp_path: Path) -> None:
-    free = min(VISIBLE, CAP) - 1                      # leave `free` CPUs idle: that many workers, below the cap
-    assert args_with(**loadavg(tmp_path, float(VISIBLE - free)))[:2] == ["-n", str(free)]
+@needs_16_cpus
+def test_load_only_shaves_down_to_the_floor_of_half_the_cpus_and_at_least_four(tmp_path: Path) -> None:
+    assert args_with(16, **loadavg(tmp_path, 6.0), HERDR_PYTEST_MAXPROCESSES="12")[:2] == ["-n", "10"]       # free CPUs still count above the floor
+    assert args_with(16, **loadavg(tmp_path, 10.0), HERDR_PYTEST_MAXPROCESSES="12")[:2] == ["-n", "8"]       # floor = 16 // 2
+    assert args_with(8, **loadavg(tmp_path, 100.0))[:2] == ["-n", "4"]       # floor = max(4, 8 // 2)
+    assert args_with(6, **loadavg(tmp_path, 100.0))[:2] == ["-n", "4"]       # never fewer than 4 from load alone
+    assert args_with(2, **loadavg(tmp_path, 100.0))[:2] == ["-n", "auto"]    # a 2-CPU host cannot go below its own cores
+
+
+@needs_16_cpus
+def test_a_small_cgroup_quota_still_caps_workers_whatever_the_load(tmp_path: Path) -> None:
+    env = cg(tmp_path, v2={"job": "200000 100000"}, proc="0::/job")           # 2 CPUs on a 16-CPU view: the quota is below the floor
+    assert args_with(16, **env, **loadavg(tmp_path, 0.0))[:2] == ["-n", "2"]
+    assert args_with(16, **env, **loadavg(tmp_path, 155.0))[:2] == ["-n", "2"]
+
+
+@needs_16_cpus
+def test_the_default_cap_stays_eight_until_a_twelve_worker_run_is_measured(tmp_path: Path) -> None:
+    for cpus in (4, 8, 16, 24):
+        if cpus <= VISIBLE:
+            assert "--maxprocesses=8" in args_with(cpus)
+    assert "--maxprocesses=5" in args_with(16, HERDR_PYTEST_MAXPROCESSES="5")  # the override still wins
+    assert "--maxprocesses=12" in args_with(16, HERDR_PYTEST_MAXPROCESSES="12")
+    assert "--maxprocesses=8" in args_with(16, HERDR_PYTEST_MAXPROCESSES="")   # empty means the default again
 
 
 def test_an_explicit_worker_count_wins_over_the_load(tmp_path: Path) -> None:
