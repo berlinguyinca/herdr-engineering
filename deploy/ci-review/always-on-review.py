@@ -1641,6 +1641,10 @@ def git(args: list[str], cwd: Path | str, auth: bool = False) -> str:
     env = child_env()
     if auth:
         env.update({k: os.environ[k] for k in ("GH_TOKEN", "GITHUB_TOKEN") if k in os.environ})
+    if auth and args[:1] == ["fetch"]:
+        # reset any helper from the user's global/system config (a `store` helper would persist the token in
+        # the operator's own clone), then name the gh helper
+        args = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", *args]
     p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, timeout=300, env=env)
     if p.returncode != 0:
         raise ReviewFailed(f"git {args[0]} failed: {ai.redact(p.stderr.decode('utf-8', 'replace')[-200:])}")
@@ -1977,7 +1981,9 @@ def clean_stale(cfg: dict) -> None:
         for clone in clones:
             if not is_git_clone(clone):
                 continue
-            subprocess.run(["git", "worktree", "prune"], cwd=clone, capture_output=True, timeout=120, env=child_env())
+            if clone.parent == state / "clones":        # only the managed clones: never touch the operator's own
+                subprocess.run(["git", "worktree", "prune"], cwd=clone, capture_output=True, timeout=120,
+                               env=child_env())
             refs = subprocess.run(["git", "for-each-ref", "--format=%(refname)", "refs/herdr-review"], cwd=clone,
                                   capture_output=True, timeout=120, env=child_env()).stdout.decode().split()
             for r in refs:
@@ -1985,6 +1991,17 @@ def clean_stale(cfg: dict) -> None:
                                env=child_env())
     finally:
         replay.close()
+
+
+_CLEANED = False
+
+
+def clean_stale_once(cfg: dict) -> None:
+    """clean_stale at most once per process (a `review --tier all` runs two tiers under the same slot)."""
+    global _CLEANED
+    if not _CLEANED:
+        _CLEANED = True
+        clean_stale(cfg)
 
 
 def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, force: bool = False) -> int:
@@ -2007,7 +2024,6 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
             raise ReviewFailed(f"waited {cfg['host_lock_wait_s']:.0f}s for the host's review slot; giving up")
         ai.say(f"{repo}#{n}: another review holds this host's slot; skipped")
         return SKIPPED
-    clean_stale(cfg)
     post_on = post_allowed(cfg, post_flag)
     gh = ai.Gh(dry_run=not post_on)
     state, key, started, sha = State(cfg), f"{repo}#{n}#{tier_name}", time.monotonic(), ""
@@ -2040,6 +2056,7 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
             ai.say(f"{key} @ {sha[:12]}: {tier_name} daily budget exhausted (${spent:.2f} of ${budget:.2f} spent today, "
                    "UTC); review skipped, status unchanged")
             return SKIPPED
+        clean_stale_once(cfg)                           # only a run that will review; no-op runs leave things alone
         backend = None if ensemble else make_backend(cfg, tier)
         try:
             if ensemble:
@@ -2893,6 +2910,8 @@ def show_command(cfg: dict, tier_name: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _CLEANED
+    _CLEANED = False                                    # once per invocation
     ap = argparse.ArgumentParser(prog="always-on-review.py", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("poll")

@@ -86,12 +86,14 @@ Nothing here is automated, and no secret value belongs in any file or log.
    `pull_request` and `pull_request_metadata` only. Its value is a GitHub token that can write commit statuses and PR
    comments on the enrolled repos (fine-grained: Commit statuses RW, Pull requests RW, Contents R). It is the only
    secret this pipeline uses: the Claude login and the pi key already live on the host.
-4. **Set the repo options** for every enrolled repo (see fork safety below): require approval for **all** pull
-   requests, and set the pipeline timeout (repo settings) to at least the wrapper's lock wait plus the tier time caps:
-   default 1800 s wait + `tiers.tier1.time_cap_s` 900 + `tiers.tier2.time_cap_s` 3600 = 6300 s, so **at least 110 minutes,
-   120 recommended**. Woodpecker's default timeout is shorter and would cancel a long review.
-   Lower the wrapper's `--lock-wait` (it is passed to `review --host-lock-wait`) if you lower the timeout; the wait must
-   always stay below it.
+4. **Set the repo options** for every enrolled repo (see fork safety below): require approval for pull requests (and
+   list the trusted authors, see fork safety), and set the pipeline timeout (repo settings) generously. The host-slot
+   wait (`--lock-wait`, default 1800 s) applies **per tier**, and `review --tier all` runs two tiers, so the worst case
+   is a wait of 1800 s for tier 1, then 900 s of tier 1 (`tiers.tier1.time_cap_s`), a wait of 1800 s for tier 2, then
+   3600 s of tier 2 (`tiers.tier2.time_cap_s`): 2 x 1800 + 900 + 3600 = 8100 s = 135 minutes, plus a Codex reviewer's
+   cap if one is enabled. Set the timeout to **at least 150 minutes**. A repo already at 720 minutes (the
+   herdr-engineering setting) is fine. Lower `--lock-wait` if you lower the timeout; twice the wait plus the tier caps
+   must always stay below it.
 5. **Enroll a repo**: activate it in Woodpecker (webhook), copy the YAML above into `.woodpecker/opus-review.yaml`, and
    make `Opus agent review` a required status in its ruleset when ready. Nothing else per repo: the review creates its
    own bare clone under `state_dir/clones/` on first use (or set `clones:` in the config).
@@ -127,6 +129,10 @@ empty value, so there is no "no token for forks" fallback either.)
 - **The real control** is the repo setting **require approval for all pull requests** (not just first-time or fork
   contributors), set for each enrolled repo. Nothing runs on the review host until a maintainer approves that PR's
   pipeline.
+  With that setting every push and every metadata edit (a pipeline per event) waits for a click, which conflicts with
+  automatic review and merging. Set the repo option `approval_allowed_users` to the owner and the bot accounts whose
+  PRs may run unattended (Woodpecker checks the PR author, so a push to a trusted author's PR does not need a click).
+  PRs by any author not on the list, forks included, still need an approval.
 - **Approving a pull request's pipeline approves its code on the review host, with the token.** For a PR from a fork that
   means arbitrary code from outside the organization. Approve a fork PR only after reading its changes to `.woodpecker/`
   and treating it as if you had run it yourself. Prefer not to approve fork PRs on enrolled repos at all.
@@ -162,6 +168,18 @@ empty value, so there is no "no token for forks" fallback either.)
   one clone directory; the managed clones are one per repo. Managed clone names are case-sensitive on disk
   (`Owner__Name.git`); use one spelling of the repo name in enrollment.
 - **Draft PRs** are skipped until marked ready, which arrives as `pull_request_metadata` (included in the YAML above).
+
+- **Environment the wrapper sets.** It overrides HOME with the real home from passwd and unsets the `XDG_*` variables,
+  so a custom `XDG_CONFIG_HOME` is ignored: put the config at `~/.config/herdr-engineering/always-on-review.yaml`, or
+  pass `--config FILE`.
+- **Exit 4 while a sweep holds the PR lock.** If the hourly sweep (or another run) is reviewing the same PR, the
+  pipeline's review exits 4 (the PR lock is never waited for, only the host slot) and the wrapper turns that into exit
+  0. That review is then done by the sweep that held the lock, so the status still arrives; if it fails there, the next
+  sweep retries.
+- **Cleanup.** The first review that will actually run in an invocation removes leftover worktrees and
+  `refs/herdr-review/*`; it runs `git worktree prune` only in the managed clones, never in your own `clone:`, and a
+  no-op run (draft, already reviewed) cleans nothing. Fetches into your own `clone:` also reset inherited credential
+  helpers, so a global `store` helper cannot save the token there.
 
 ## When it does not post
 

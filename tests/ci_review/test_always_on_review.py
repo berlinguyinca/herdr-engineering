@@ -1234,8 +1234,54 @@ def test_stale_worktrees_and_refs_of_a_killed_review_are_removed(env, tmp_path):
     assert str(stale) in "\n".join(env.worktrees())
     assert env.review("tier2") == 0
     assert not stale.exists()
-    assert str(stale) not in "\n".join(env.worktrees())
     assert sh("git", "for-each-ref", "refs/herdr-review", cwd=env.clone) == ""
+
+
+def test_stale_cleanup_never_prunes_the_operators_own_clone(env, tmp_path):
+    mine = tmp_path / "my-own-worktree"
+    sh("git", "worktree", "add", "--detach", "-q", str(mine), env.head, cwd=env.clone)
+    shutil.rmtree(mine)                                  # the operator's record is now "prunable"
+    assert env.review("tier2") == 0
+    assert str(mine) in "\n".join(env.worktrees())       # git worktree prune must not run in `clone:`
+
+
+def test_stale_cleanup_prunes_the_managed_clones(env, tmp_path):
+    origin, head, diff = _second_repo(tmp_path)
+    _name_clone_as_github(env)
+    _point_gh_at(env, head, diff)
+    env.config(extra=f"clone_url: file://{tmp_path}/{{repo}}.git\n", wait=False)
+    assert _review_gadget(env) == 0
+    managed = tmp_path / "state" / "clones" / "acme__gadget.git"
+    gone = tmp_path / "gone-worktree"
+    sh("git", "worktree", "add", "--detach", "-q", str(gone), head, cwd=managed)
+    shutil.rmtree(gone)
+    assert env.run("review", "--repo", "acme/gadget", "--pr", "7", "--tier", "tier2", "--force") == 0
+    assert str(gone) not in sh("git", "worktree", "list", cwd=managed)
+
+
+def test_a_review_that_exits_early_does_not_clean(env, tmp_path):
+    stale = tmp_path / "state" / "worktrees" / "pr9-deadbeef-abc"
+    stale.mkdir(parents=True)
+    sh("git", "update-ref", "refs/herdr-review/pr-9", env.head, cwd=env.clone)
+    st = env.gh_state()
+    st["prs"]["7"]["draft"] = True                       # a no-op run: nothing will be reviewed
+    env.write_gh(st)
+    assert env.review("tier2") == 4
+    assert stale.exists()
+    assert sh("git", "for-each-ref", "refs/herdr-review", cwd=env.clone) != ""
+
+
+def test_fetches_into_the_operators_clone_reset_inherited_credential_helpers(env, tmp_path):
+    log = tmp_path / "git-args.log"
+    real = shutil.which("git")
+    wrapper = env.bin / "git"
+    wrapper.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {log}\nexec {real} "$@"\n')
+    wrapper.chmod(0o755)
+    assert env.review("tier2") == 0
+    fetches = [x for x in log.read_text().splitlines() if " fetch " in f" {x} "]
+    assert fetches and all(x.startswith("-c credential.helper= -c credential.helper=!gh auth git-credential ")
+                           for x in fetches)
+
 
 
 # ---------------- a reviewer never outlives the process that started it ----------------
